@@ -80,6 +80,7 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_KEEP_AT_ONCE", Test),
     ("PONDRA_KEEP_PARQUET", Test),
     ("PONDRA_KMS_COMMAND", Node),
+    ("PONDRA_LATE_ROWS", Test),
     ("PONDRA_LAUNCHER", Node),
     ("PONDRA_LEARN", Node),
     ("PONDRA_LEARN_MS", Node),

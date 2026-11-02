@@ -51,8 +51,7 @@ const ROW: &str = "__late_row";
 const FILE: &str = "__late_file";
 
 fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PONDRA_LATE_ROWS").map_or(true, |v| v != "0"))
+    crate::env::get("PONDRA_LATE_ROWS").as_deref() != Some("0")
 }
 
 /// Puts a `LateRowsExec` in place of each wide top-N (a merge of the partitions' top-Ns, or one).
