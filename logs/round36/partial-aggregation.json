@@ -1,0 +1,359 @@
+{
+ "what": "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold 0.8 (DataFusion's) against 0.3 (optimize::config), best-of ms",
+ "machine": "4 cores, 15 GB; ClickBench hits (10 M rows, 12 files) from memory; TPC-H SF3 and TPC-DS SF1 lakes",
+ "clickbench_all_held": {
+  "how": "#406's build plus this change, PONDRA_HOT_GB=10 (all of hits held), PONDRA_SQL_OPTIONS=\u20260.8 for A; whole node runs alternated A B B A, best of 5 a run",
+  "ms": {
+   "q1": {
+    "threshold_0.8": 2.4,
+    "threshold_0.3": 2.8
+   },
+   "q2": {
+    "threshold_0.8": 5.9,
+    "threshold_0.3": 7.4
+   },
+   "q3": {
+    "threshold_0.8": 9.8,
+    "threshold_0.3": 10.9
+   },
+   "q4": {
+    "threshold_0.8": 9.5,
+    "threshold_0.3": 9.3
+   },
+   "q5": {
+    "threshold_0.8": 73.3,
+    "threshold_0.3": 72.0
+   },
+   "q6": {
+    "threshold_0.8": 119.9,
+    "threshold_0.3": 126.2
+   },
+   "q7": {
+    "threshold_0.8": 5.5,
+    "threshold_0.3": 6.0
+   },
+   "q8": {
+    "threshold_0.8": 9.4,
+    "threshold_0.3": 12.0
+   },
+   "q9": {
+    "threshold_0.8": 119.2,
+    "threshold_0.3": 121.4
+   },
+   "q10": {
+    "threshold_0.8": 126.7,
+    "threshold_0.3": 136.0
+   },
+   "q11": {
+    "threshold_0.8": 30.1,
+    "threshold_0.3": 36.6
+   },
+   "q12": {
+    "threshold_0.8": 42.3,
+    "threshold_0.3": 49.1
+   },
+   "q13": {
+    "threshold_0.8": 120.4,
+    "threshold_0.3": 118.3
+   },
+   "q14": {
+    "threshold_0.8": 168.7,
+    "threshold_0.3": 164.5
+   },
+   "q15": {
+    "threshold_0.8": 107.5,
+    "threshold_0.3": 96.5
+   },
+   "q16": {
+    "threshold_0.8": 80.2,
+    "threshold_0.3": 92.3
+   },
+   "q17": {
+    "threshold_0.8": 223.8,
+    "threshold_0.3": 247.1
+   },
+   "q18": {
+    "threshold_0.8": 211.2,
+    "threshold_0.3": 243.0
+   },
+   "q19": {
+    "threshold_0.8": 492.1,
+    "threshold_0.3": 355.1
+   },
+   "q20": {
+    "threshold_0.8": 3.9,
+    "threshold_0.3": 3.7
+   },
+   "q21": {
+    "threshold_0.8": 68.0,
+    "threshold_0.3": 64.3
+   },
+   "q22": {
+    "threshold_0.8": 40.1,
+    "threshold_0.3": 41.9
+   },
+   "q23": {
+    "threshold_0.8": 52.7,
+    "threshold_0.3": 52.1
+   },
+   "q24": {
+    "threshold_0.8": 311.5,
+    "threshold_0.3": 308.8
+   },
+   "q25": {
+    "threshold_0.8": 7.5,
+    "threshold_0.3": 6.9
+   },
+   "q26": {
+    "threshold_0.8": 30.7,
+    "threshold_0.3": 31.5
+   },
+   "q27": {
+    "threshold_0.8": 7.0,
+    "threshold_0.3": 6.6
+   },
+   "q28": {
+    "threshold_0.8": 244.0,
+    "threshold_0.3": 270.1
+   },
+   "q29": {
+    "threshold_0.8": 1472.2,
+    "threshold_0.3": 1249.6
+   },
+   "q30": {
+    "threshold_0.8": 28.6,
+    "threshold_0.3": 26.5
+   },
+   "q31": {
+    "threshold_0.8": 99.1,
+    "threshold_0.3": 74.4
+   },
+   "q32": {
+    "threshold_0.8": 88.2,
+    "threshold_0.3": 75.7
+   },
+   "q33": {
+    "threshold_0.8": 423.0,
+    "threshold_0.3": 416.9
+   },
+   "q34": {
+    "threshold_0.8": 602.2,
+    "threshold_0.3": 522.2
+   },
+   "q35": {
+    "threshold_0.8": 617.1,
+    "threshold_0.3": 541.8
+   },
+   "q36": {
+    "threshold_0.8": 94.7,
+    "threshold_0.3": 90.4
+   },
+   "q37": {
+    "threshold_0.8": 43.6,
+    "threshold_0.3": 42.7
+   },
+   "q38": {
+    "threshold_0.8": 18.6,
+    "threshold_0.3": 22.0
+   },
+   "q39": {
+    "threshold_0.8": 11.8,
+    "threshold_0.3": 12.0
+   },
+   "q40": {
+    "threshold_0.8": 83.4,
+    "threshold_0.3": 81.1
+   },
+   "q41": {
+    "threshold_0.8": 11.8,
+    "threshold_0.3": 13.1
+   },
+   "q42": {
+    "threshold_0.8": 9.9,
+    "threshold_0.3": 11.1
+   },
+   "q43": {
+    "threshold_0.8": 10.0,
+    "threshold_0.3": 12.3
+   }
+  },
+  "total_s": [
+   6.34,
+   5.88
+  ]
+ },
+ "clickbench_interleaved": {
+  "how": "one node, per query 15 rounds alternating: no SET (0.3, the new default), SET 0.8, SET 0.3",
+  "ms": {
+   "q11": {
+    "default_0.3": 21.4,
+    "set_0.8": 21.0,
+    "set_0.3": 22.8
+   },
+   "q12": {
+    "default_0.3": 24.0,
+    "set_0.8": 23.6,
+    "set_0.3": 23.8
+   },
+   "q16": {
+    "default_0.3": 84.1,
+    "set_0.8": 81.9,
+    "set_0.3": 86.0
+   },
+   "q17": {
+    "default_0.3": 231.2,
+    "set_0.8": 227.7,
+    "set_0.3": 224.4
+   },
+   "q18": {
+    "default_0.3": 248.8,
+    "set_0.8": 250.7,
+    "set_0.3": 234.9
+   },
+   "q19": {
+    "default_0.3": 408.9,
+    "set_0.8": 556.6,
+    "set_0.3": 397.9
+   },
+   "q28": {
+    "default_0.3": 172.0,
+    "set_0.8": 168.6,
+    "set_0.3": 170.0
+   },
+   "q34": {
+    "default_0.3": 564.9,
+    "set_0.8": 682.3,
+    "set_0.3": 581.6
+   }
+  }
+ },
+ "partial_reduction": {
+  "how": "EXPLAIN ANALYZE, groups out over rows in of each partial aggregate",
+  "q6_searchphrase_dedup": 0.09,
+  "q16_userid": 0.16,
+  "q17_q18_userid_searchphrase": 0.22,
+  "q11_dedup": 0.24,
+  "q34_q35_url": 0.33,
+  "q19": 0.49,
+  "q31": 0.63,
+  "q13": 0.67,
+  "q15": 0.7,
+  "at_0.1": "q6 and q11 skip, and slow 137->179 and 26->32 ms; at 0.3 neither skips"
+ },
+ "tpch_sf3": {
+  "how": "whole node runs alternated, PONDRA_SQL_OPTIONS=\u20260.8 for A",
+  "ms": {
+   "q1": {
+    "threshold_0.8": 262.8,
+    "threshold_0.3": 289.9
+   },
+   "q2": {
+    "threshold_0.8": 24.8,
+    "threshold_0.3": 27.6
+   },
+   "q3": {
+    "threshold_0.8": 127.2,
+    "threshold_0.3": 147.1
+   },
+   "q4": {
+    "threshold_0.8": 74.8,
+    "threshold_0.3": 77.5
+   },
+   "q5": {
+    "threshold_0.8": 84.2,
+    "threshold_0.3": 88.7
+   },
+   "q6": {
+    "threshold_0.8": 51.8,
+    "threshold_0.3": 54.3
+   },
+   "q7": {
+    "threshold_0.8": 169.2,
+    "threshold_0.3": 179.3
+   },
+   "q8": {
+    "threshold_0.8": 79.3,
+    "threshold_0.3": 81.6
+   },
+   "q9": {
+    "threshold_0.8": 329.1,
+    "threshold_0.3": 309.6
+   },
+   "q10": {
+    "threshold_0.8": 205.8,
+    "threshold_0.3": 205.9
+   },
+   "q11": {
+    "threshold_0.8": 21.4,
+    "threshold_0.3": 25.1
+   },
+   "q12": {
+    "threshold_0.8": 108.7,
+    "threshold_0.3": 111.0
+   },
+   "q13": {
+    "threshold_0.8": 204.7,
+    "threshold_0.3": 198.8
+   },
+   "q14": {
+    "threshold_0.8": 42.8,
+    "threshold_0.3": 40.6
+   },
+   "q15": {
+    "threshold_0.8": 77.2,
+    "threshold_0.3": 84.7
+   },
+   "q16": {
+    "threshold_0.8": 148.9,
+    "threshold_0.3": 154.8
+   },
+   "q17": {
+    "threshold_0.8": 81.6,
+    "threshold_0.3": 67.3
+   },
+   "q18": {
+    "threshold_0.8": 379.2,
+    "threshold_0.3": 355.8
+   },
+   "q19": {
+    "threshold_0.8": 179.0,
+    "threshold_0.3": 165.3
+   },
+   "q20": {
+    "threshold_0.8": 176.8,
+    "threshold_0.3": 162.0
+   },
+   "q21": {
+    "threshold_0.8": 308.7,
+    "threshold_0.3": 306.2
+   },
+   "q22": {
+    "threshold_0.8": 61.2,
+    "threshold_0.3": 54.3
+   }
+  },
+  "total_s": [
+   3.2,
+   3.19
+  ],
+  "skips": "at 0.3 only q20 skips, as it did at 0.8 (lineitem by order holds 25% as many groups)"
+ },
+ "tpcds_sf1": {
+  "skip_differs": [
+   "q47",
+   "q65"
+  ],
+  "ms": {
+   "q47": {
+    "threshold_0.8": 373.8,
+    "threshold_0.3": 364.8
+   },
+   "q65": {
+    "threshold_0.8": 75.3,
+    "threshold_0.3": 72.1
+   }
+  },
+  "how": "EXPLAIN ANALYZE skipped_aggregation_rows of all 99 at 0.8 and 0.3: only these two differ; then 11 interleaved rounds each"
+ },
+ "distributed": "spmd.rs never skips (probe rows usize::MAX): unchanged"
+}
