@@ -302,6 +302,11 @@ A new release replaces the binary. The lake stays where it is, and the node open
 The images and the chart are not in GitHub's registry yet: build the image as the
 [deploy guide](/pondra/guides/deploy/) says, and use your own tag.
 
+A release candidate, such as 0.80.0-rc.1, comes only when you ask for it: `pip install --pre pondra` (or
+`'pondra==0.80.0rc1'`), `npm install pondra@next`, `PONDRA_VERSION=0.80.0-rc.1` before the installer, or the
+image tag `0.80.0-rc.1`. The installers, `pip install -U`, `npm install pondra@latest` and the image's
+`latest` stay on the release.
+
 - **Helm** replaces one pod at a time, and each node drains before it stops: the rolling upgrade
   above, with nothing more to do.
 - **Compose:** restart one node at a time, such as `docker compose up -d --no-deps node2`, so the

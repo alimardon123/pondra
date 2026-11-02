@@ -52,14 +52,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
-      - name: The images (X.Y.Z, X.Y, latest; -python beside each), signed
+      - name: The images (X.Y.Z, X.Y, latest; a release candidate X.Y.Z-rc.N alone; -python beside each), signed
         run: |
           v=${GITHUB_REF_NAME#v} image=ghcr.io/${GITHUB_REPOSITORY,,}
           for target in pondra python; do
             s=$([ $target = python ] && echo -python || true)
+            tags=(-t $image:$v$s)
+            case $v in *-*) ;; *) tags+=(-t $image:${v%.*}$s -t $image:latest$s) ;; esac # (a candidate never moves latest or X.Y)
             docker buildx build -f deploy/docker/Dockerfile --platform linux/amd64,linux/arm64 --target $target \
               --provenance=mode=max --sbom=true --push --metadata-file meta-$target.json \
-              -t $image:$v$s -t $image:${v%.*}$s -t $image:latest$s ctx
+              "${tags[@]}" ctx
             cosign sign --yes "$image@$(jq -r '."containerimage.digest"' meta-$target.json)"
           done
       - name: The chart (oci://ghcr.io/<owner>/charts/pondra)
