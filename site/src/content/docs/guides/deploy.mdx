@@ -339,6 +339,58 @@ readers:
 While there are readers, a second service, `pondra-read`, reaches the nodes and the readers together.
 Point dashboards and BI tools at it for reads; a reader refuses writes, so writers keep to `pondra`.
 
+Readers can run on other machines than the nodes. `readers.nodeSelector`, `readers.tolerations`,
+`readers.affinity` and `readers.priorityClassName` place them; each one left empty takes the top-level
+value of the same name, which places the nodes. A reader never leads or votes, and no node sends it a
+part of its own queries, so readers can go on Spot (preemptible) machines while the nodes stay on
+on-demand ones. A reader taken back fails only the queries it was running; sent again, they go to
+another reader or node.
+
+```yaml norun
+nodeSelector: {karpenter.sh/capacity-type: on-demand}
+readers:
+  autoscaling: {enabled: true}
+  nodeSelector: {karpenter.sh/capacity-type: spot}
+```
+
+### Karpenter and YuniKorn
+
+**A machine for each node.** By default the nodes go on different machines where they can
+(`antiAffinity: preferred`), so a cluster of one machine, such as kind, still starts. With
+`antiAffinity: required`, two nodes never share a machine: losing one machine never loses two of a
+write's `ackReplicas` copies, and a node waits until a machine of its own is free. An `affinity` you
+give replaces this rule.
+
+**Karpenter.** Consolidation that moves busy pods to pack machines tighter
+(`consolidationPolicy: WhenEmptyOrUnderutilized`) would also move a node, which costs a change of leader
+and a node catching up. Keep it off the nodes, and leave readers free to move:
+
+```yaml norun
+podAnnotations:
+  karpenter.sh/do-not-disrupt: "true"     # the nodes stay where they are
+readers:
+  podAnnotations:
+    karpenter.sh/do-not-disrupt: "false"  # readers may be moved
+```
+
+`readers.podAnnotations` go over the top-level `podAnnotations`, and a key in both takes the readers'
+value. The PodDisruptionBudget (`maxUnavailable: 1`) still lets a drain take one node at a time.
+
+**YuniKorn.** Where YuniKorn's admission controller hands every pod to YuniKorn, three settings keep
+Pondra safe beside batch jobs:
+
+- Set `antiAffinity: required`. YuniKorn enforces required rules but may not honour a preferred one,
+  and its `binpacking` order would put two nodes on one machine.
+- Give Pondra a queue of its own (through `podLabels` or `podAnnotations`), with `guaranteed` at least
+  its pods' requests and `preemption.policy: fence`. Otherwise a batch queue below its own guarantee can
+  take Pondra's pods, and each one taken costs a change of leader and the queries it was running. A
+  PodDisruptionBudget does not hold a scheduler's preemption back.
+- Make the queue's `max` at least the nodes' and readers' requests, plus one more node's for a rolling
+  update, or some nodes stay Pending.
+
+Where workloads opt in to YuniKorn instead, leave Pondra on the default scheduler, which suits
+long-lived nodes.
+
 ### Check it and watch it
 
 ```bash norun
@@ -362,6 +414,8 @@ pod's `GET /metrics` (every `podMonitor.interval`, `30s` by default) with the re
 | `resources` | `{}` | CPU and memory of a node |
 | `podDisruptionBudget.enabled`, `.maxUnavailable` | `true`, `1` | one node away at a time (with more than one node) |
 | `terminationGracePeriodSeconds` | `60` | the time a stopping node has to hand the lead on |
+| `nodeSelector`, `tolerations`, `affinity`, `priorityClassName` | empty | where the nodes run, and readers too unless their own `readers.*` value is given |
+| `antiAffinity` | `preferred` | the nodes on different machines where they can be, or `required`: always ([Karpenter and YuniKorn](#karpenter-and-yunikorn)) |
 | `extraArgs`, `extraEnv`, `extraEnvFrom`, `extraVolumes`, `extraVolumeMounts` | `[]` | more `pondra serve` flags, variables and volumes, such as `[--tier-secs, "5", --publish, "delta,iceberg"]` |
 
 The pods run as user 65532 with a read-only root filesystem and every capability dropped. Uninstalling

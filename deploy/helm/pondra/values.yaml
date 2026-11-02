@@ -85,6 +85,15 @@ readers:
     minReplicas: 1
     maxReplicas: 10
     targetCPUUtilizationPercentage: 70
+  # Where readers run, each left empty to take the top-level value of the same name. Readers never lead
+  # or vote, and no other node sends them a part of its queries, so they can go on Spot (preemptible)
+  # machines while the nodes stay on on-demand ones: a reader taken back stops only its own queries.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+  # More annotations for readers' pods, over the top-level `podAnnotations` (a key in both takes this value).
+  podAnnotations: {}
 
 # Each node's /data: a bucket lake's SSD tier and replica files, or (one node, no sharedStorage)
 # the lake itself.
@@ -142,7 +151,13 @@ podLabels: {}
 priorityClassName: ""
 nodeSelector: {}
 tolerations: []
-affinity: {}              # (default: nodes on different machines where possible)
+affinity: {}              # (default: nodes on different machines, as `antiAffinity` says)
+# The default affinity's rule, unless `affinity` is given: "preferred" puts the nodes on different machines
+# where it can (a one-machine cluster, such as kind, still starts); "required" never puts two on one
+# machine, so one machine lost never takes two of a write's `ackReplicas` copies, and a node waits for a
+# machine of its own. Give "required" on a scheduler that packs pods (YuniKorn, Volcano), which may not
+# honour a preferred rule.
+antiAffinity: preferred
 topologySpreadConstraints: []
 podSecurityContext:
   runAsNonRoot: true
