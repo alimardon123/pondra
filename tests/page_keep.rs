@@ -1,5 +1,6 @@
 //! A `CREATE TABLE … AS FROM 'f.parquet'` on a page keeps the file's row groups (`keep_load`): the table's files are the file's
-//! own column chunks, Snappy, with no Arrow schema and the source's row groups, and its answers are a written table's. A
+//! own pages, recompressed in our LZ4, with no Arrow schema, the source's row groups and the rows' system columns, and its
+//! answers are a written table's. A
 //! `WHERE` makes the same copy as a written table (never kept), and DELETE works on a kept table as on a written one.
 //! `cargo test --test page_keep`.
 #![cfg(feature = "server")]
@@ -100,8 +101,8 @@ async fn steps() {
         assert_eq!(k.lines().skip(1).collect::<Vec<_>>(), w.lines().skip(1).collect::<Vec<_>>(), "step 2: {q}");
     }
 
-    // 3. The kept files are the file's own column chunks: Snappy, the source's three row groups, no Arrow schema, and ids 1..4 by
-    // place. The written table's are LZ4 (our codec) as it always was.
+    // 3. The kept files are the file's own pages, recompressed from Snappy in our LZ4: the source's three row groups, no Arrow
+    // schema, ids 1..4 by place and the system columns' after them, as a written file's.
     let kept = files_of(&store, "data/k").await;
     let written = files_of(&store, "data/w").await;
     assert!(!kept.is_empty(), "step 3: k has files");
@@ -113,10 +114,10 @@ async fn steps() {
         let keys: Vec<String> = md.file_metadata().key_value_metadata().map(|kv| kv.iter().map(|k| k.key.clone()).collect()).unwrap_or_default();
         assert!(!keys.iter().any(|k| k == "ARROW:schema"), "step 3: no Arrow schema in a kept footer: {keys:?}");
         let ids: Vec<i32> = md.file_metadata().schema_descr().root_schema().get_fields().iter().map(|f| f.get_basic_info().id()).collect();
-        assert_eq!(ids, [1, 2, 3, 4], "step 3: our field ids by place");
+        assert_eq!(ids, [1, 2, 3, 4, 1_000_001, 1_000_002, 1_000_003, 1_000_004], "step 3: our field ids by place, then the system columns'");
         for rg in md.row_groups() {
             for c in rg.columns() {
-                assert_eq!(c.compression(), datafusion::parquet::basic::Compression::SNAPPY, "step 3: the file's codec is kept");
+                assert_eq!(c.compression(), datafusion::parquet::basic::Compression::LZ4_RAW, "step 3: every page in our codec");
             }
         }
     }

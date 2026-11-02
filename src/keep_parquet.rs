@@ -1,5 +1,7 @@
 //! A Parquet file kept as it was written (designs/l2-load-keeps-parquet.md, K1): its row groups' column chunks are
-//! copied, undecoded, into files of ours, which take our footer. `plan` cuts a file's row groups into kept files, or
+//! copied, undecoded, into files of ours, which take our footer. A chunk in another codec than ours has each page
+//! recompressed in ours (`squeeze`): its values, levels, encodings and dictionary stay as the source wrote them, and it
+//! reads as fast as a written file's (a Snappy chunk decodes slower than an LZ4 one: TPC-H from files ran 22% slower). `plan` cuts a file's row groups into kept files, or
 //! says why the file isn't kept (in words; the file is then written as today, and no error reaches the user). `copy`
 //! writes one cut as one file. `keep` does both for a whole file in memory, for the tests.
 
@@ -7,12 +9,12 @@ use crate::adopt::same;
 use crate::text::{CREATED, NAMES, ROW_ID, UPDATED};
 use anyhow::{ensure, Context, Result};
 use bytes::{Buf, Bytes};
-use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::parquet::arrow::parquet_to_arrow_schema;
 use datafusion::parquet::basic::{ColumnOrder, Compression, Encoding, LogicalType, Repetition, SortOrder, TimeUnit, Type as Physical};
 use datafusion::parquet::data_type::Int64Type;
 use datafusion::parquet::schema::types::ColumnPath;
-use datafusion::parquet::column::page::PageReader;
+use datafusion::parquet::column::page::{CompressedPage, Page, PageReader, PageWriter};
 use datafusion::parquet::column::writer::ColumnCloseResult;
 use datafusion::parquet::errors::ParquetError;
 use datafusion::parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
@@ -22,7 +24,8 @@ use datafusion::parquet::file::properties::{EnabledStatistics, WriterProperties}
 use datafusion::parquet::file::reader::{ChunkReader, Length};
 use datafusion::parquet::file::serialized_reader::SerializedPageReader;
 use datafusion::parquet::file::statistics::Statistics;
-use datafusion::parquet::file::writer::SerializedFileWriter;
+use datafusion::parquet::file::page_index::offset_index::{OffsetIndexMetaData, PageLocation};
+use datafusion::parquet::file::writer::{SerializedFileWriter, SerializedPageWriter, TrackedWrite};
 use datafusion::parquet::schema::types::{ColumnDescPtr, SchemaDescriptor, Type as Node, TypePtr};
 use std::ops::Range;
 use std::sync::Arc;
@@ -84,45 +87,70 @@ pub(crate) fn plan(md: &ParquetMetaData, table: &Schema, limits: &Limits) -> Res
         if !same(got, want) {
             return Err(format!("column {} is {got} in the file and {want} in the table", f.name()));
         }
+        if matches!(descr.column(i).physical_type(), Physical::FIXED_LEN_BYTE_ARRAY | Physical::BYTE_ARRAY) && matches!(want, DataType::Decimal128(p, _) if *p <= 18) {
+            return Err(format!("column {} is a decimal the file holds as bytes, which reads slower than the integers a written file holds", f.name()));
+        }
     }
+    let to = crate::tier::codec();
     let budget = limits.file.saturating_sub(room(limits.file)) as u64;
     let mut spans = Vec::with_capacity(md.num_row_groups());
     for (g, rg) in md.row_groups().iter().enumerate() {
         if rg.total_byte_size() as u64 > limits.group as u64 {
             return Err(format!("row group {g} is {} bytes uncompressed, over the {} a row group may be", rg.total_byte_size(), limits.group));
         }
-        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        let (mut lo, mut hi, mut size) = (u64::MAX, 0u64, 0u64);
         for (c, chunk) in rg.columns().iter().enumerate() {
             let name = fields[c].name();
             let codec = chunk.compression();
             if !matches!(codec, Compression::UNCOMPRESSED | Compression::SNAPPY | Compression::GZIP(_) | Compression::BROTLI(_) | Compression::ZSTD(_) | Compression::LZ4_RAW) {
                 return Err(format!("column {name} in row group {g} is {codec:?}, a codec that isn't kept"));
             }
+            if !in_codec(chunk, to) && !squeezes(to) {
+                return Err(format!("column {name} in row group {g} is {codec:?}, and kept files are {to:?}, which a page isn't recompressed into here"));
+            }
             let (a, b) = chunk_bytes(chunk).map_err(|why| format!("column {name} in row group {g} {why}"))?;
-            (lo, hi) = (lo.min(a), hi.max(b));
+            (lo, hi, size) = (lo.min(a), hi.max(b), size + kept_size(chunk, to));
         }
-        if hi - lo > budget {
-            return Err(format!("row group {g} is {} bytes in the file, more than a kept file holds ({budget})", hi - lo));
+        if size > budget {
+            return Err(format!("row group {g} comes to about {size} bytes, more than a kept file holds ({budget})"));
         }
-        spans.push((lo, hi));
+        spans.push((lo, hi, size));
     }
     let mut cuts = Vec::new();
     let mut g = 0;
     while g < spans.len() {
         let first = g;
-        let (mut lo, mut hi) = spans[g];
+        let (mut lo, mut hi, mut size) = spans[g];
         g += 1;
-        while g < spans.len() {
-            let (a, b) = (lo.min(spans[g].0), hi.max(spans[g].1));
-            if b - a > budget {
-                break;
-            }
-            (lo, hi) = (a, b);
+        while g < spans.len() && size + spans[g].2 <= budget {
+            (lo, hi, size) = (lo.min(spans[g].0), hi.max(spans[g].1), size + spans[g].2);
             g += 1;
         }
         cuts.push(Cut { groups: first..g, bytes: lo..hi });
     }
     Ok(cuts)
+}
+
+/// Whether a chunk is in codec `to` already: copied as it is.
+fn in_codec(c: &ColumnChunkMetaData, to: Compression) -> bool { std::mem::discriminant(&c.compression()) == std::mem::discriminant(&to) }
+
+/// Whether a page is recompressed into `to` here (`squeeze`): LZ4_RAW (ours by default) or none. A kept file in another
+/// codec (`PONDRA_CODEC`) takes only chunks already in it.
+fn squeezes(to: Compression) -> bool { matches!(to, Compression::LZ4_RAW | Compression::UNCOMPRESSED) }
+
+/// About the bytes a chunk takes in a kept file: its own, or once recompressed in `to`, at most its uncompressed bytes
+/// (LZ4 squeezes a little less than Snappy, and much less than ZSTD, GZIP or Brotli).
+fn kept_size(c: &ColumnChunkMetaData, to: Compression) -> u64 {
+    let (packed, whole) = (c.compressed_size().max(0) as u64, c.uncompressed_size().max(0) as u64);
+    if in_codec(c, to) {
+        return packed;
+    }
+    let grown = match c.compression() {
+        Compression::UNCOMPRESSED => packed,
+        Compression::SNAPPY | Compression::LZ4_RAW => packed + packed / 8,
+        _ => packed * 2,
+    };
+    if to == Compression::UNCOMPRESSED { whole } else { grown.min(whole + whole / 64 + 4096) }
 }
 
 /// A chunk's bytes in the source, or why they can't be copied as they are: a chunk in another file, or whose first
@@ -172,7 +200,8 @@ pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes
             .build()?;
         ours.push(Arc::new(field));
     }
-    let mut props = WriterProperties::builder().set_compression(crate::tier::codec());
+    let to = crate::tier::codec();
+    let mut props = WriterProperties::builder().set_compression(to);
     if md.offset_index().is_none() {
         // (a file's chunks all have an offset index or none do: a source with none, the system columns with none, and
         // ranges per chunk, not per page, which would ask for one)
@@ -200,8 +229,13 @@ pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes
         let rg = md.row_group(g);
         let mut out = w.next_row_group()?;
         for (i, chunk) in rg.columns().iter().enumerate() {
-            SerializedPageReader::new(reader.clone(), chunk, rg.num_rows() as usize, None)?.peek_next_page()?;
-            out.append_column(reader.as_ref(), column_close(md, g, i, chunk, our_descr.column(i))?)?;
+            if in_codec(chunk, to) {
+                SerializedPageReader::new(reader.clone(), chunk, rg.num_rows() as usize, None)?.peek_next_page()?;
+                out.append_column(reader.as_ref(), column_close(md, g, i, chunk, our_descr.column(i), None)?)?;
+            } else {
+                let (bytes, moved) = squeeze(md, g, i, chunk, reader.clone(), to)?;
+                out.append_column(&bytes, column_close(md, g, i, chunk, our_descr.column(i), Some(moved))?)?;
+            }
         }
         if let Some(s) = sys {
             let n = rg.num_rows() as usize;
@@ -218,8 +252,10 @@ pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes
     }
     let footer = w.finish()?;
     let bytes = std::mem::take(w.inner_mut());
-    // (the system columns: ids of a few bits each, versions and times one value a column, squeezed by the codec)
-    let cap = len + room(len) + if sys.is_some() { rows as usize / 4 + (64 << 10) } else { 0 };
+    // (recompressed chunks: about `kept_size`; the system columns: ids of a few bits each, versions and times one value a
+    // column, squeezed by the codec)
+    let size = (cut.groups.clone().flat_map(|g| md.row_group(g).columns().iter().map(|c| kept_size(c, to))).sum::<u64>() as usize).max(len);
+    let cap = size + size / 8 + room(size) + if sys.is_some() { rows as usize / 4 + (64 << 10) } else { 0 };
     ensure!(bytes.len() <= cap, "the kept file is {} bytes, over the {cap} its {len} bytes leave room for", bytes.len());
     Ok(Kept { bytes: Bytes::from(bytes), footer, rows })
 }
@@ -248,22 +284,100 @@ pub(crate) fn keep(file: Bytes, table: &Schema, limits: &Limits) -> Result<Resul
     Ok(Ok(kept))
 }
 
+/// A chunk's pages as `squeeze` wrote them: their codec, sizes and offsets (from 0, in its own bytes) and offset index.
+struct Moved {
+    codec: Compression,
+    compressed: i64,
+    uncompressed: i64,
+    data_page: i64,
+    dictionary_page: Option<i64>,
+    offset_index: Option<OffsetIndexMetaData>,
+}
+
+/// One chunk's pages, decompressed and compressed again in `to` (LZ4_RAW or none), each written as it was otherwise:
+/// its values, levels, encoding, NULL and row counts and statistics as the source has them. The chunk's bytes from
+/// offset 0, and where its pages are in them; the offset index the source's, at the new offsets.
+fn squeeze(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaData, reader: Arc<Piece>, to: Compression) -> Result<(Bytes, Moved)> {
+    let pack = |raw: &[u8]| -> Result<Bytes> {
+        Ok(match to {
+            Compression::UNCOMPRESSED => Bytes::copy_from_slice(raw),
+            _ => {
+                let mut out = vec![0u8; lz4_flex::block::get_maximum_output_size(raw.len())];
+                let n = lz4_flex::block::compress_into(raw, &mut out).map_err(|e| anyhow::anyhow!("LZ4: {e}"))?;
+                out.truncate(n);
+                Bytes::from(out)
+            }
+        })
+    };
+    let mut pages = SerializedPageReader::new(reader, src, md.row_group(g).num_rows() as usize, None)?;
+    let mut sink = TrackedWrite::new(Vec::with_capacity(src.compressed_size().max(0) as usize + (64 << 10)));
+    let mut specs = Vec::new();
+    {
+        let mut w = SerializedPageWriter::new(&mut sink);
+        while let Some(page) = pages.get_next_page()? {
+            let whole = page.buffer().len();
+            let page = match page {
+                Page::DictionaryPage { buf, num_values, encoding, is_sorted } => Page::DictionaryPage { buf: pack(&buf)?, num_values, encoding, is_sorted },
+                Page::DataPage { buf, num_values, encoding, def_level_encoding, rep_level_encoding, statistics } => {
+                    Page::DataPage { buf: pack(&buf)?, num_values, encoding, def_level_encoding, rep_level_encoding, statistics }
+                }
+                Page::DataPageV2 { buf, num_values, encoding, num_nulls, num_rows, def_levels_byte_len, rep_levels_byte_len, is_compressed: _, statistics } => {
+                    // (a v2 page's levels are never compressed: only its values)
+                    let levels = (def_levels_byte_len + rep_levels_byte_len) as usize;
+                    ensure!(levels <= buf.len(), "a page's levels run past it");
+                    let mut out = buf[..levels].to_vec();
+                    out.extend_from_slice(&pack(&buf[levels..])?);
+                    Page::DataPageV2 { buf: out.into(), num_values, encoding, num_nulls, num_rows, def_levels_byte_len, rep_levels_byte_len, is_compressed: to != Compression::UNCOMPRESSED, statistics }
+                }
+            };
+            let dictionary = matches!(page, Page::DictionaryPage { .. });
+            specs.push((dictionary, w.write_page(CompressedPage::new(page, whole))?));
+        }
+        w.close()?;
+    }
+    let bytes = Bytes::from(sink.into_inner()?);
+    let data: Vec<_> = specs.iter().filter(|(d, _)| !d).map(|(_, s)| s).collect();
+    let first = data.first().context("a chunk with no data page")?;
+    let offset_index = match md.offset_index().and_then(|oi| oi.get(g)).and_then(|row| row.get(i)) {
+        Some(was) => {
+            ensure!(was.page_locations.len() == data.len(), "the offset index has {} pages, the chunk {}", was.page_locations.len(), data.len());
+            let page_locations = was.page_locations.iter().zip(&data).map(|(p, s)| PageLocation { offset: s.offset as i64, compressed_page_size: s.bytes_written as i32, first_row_index: p.first_row_index }).collect();
+            Some(OffsetIndexMetaData { page_locations, unencoded_byte_array_data_bytes: was.unencoded_byte_array_data_bytes.clone() })
+        }
+        None => None,
+    };
+    let moved = Moved {
+        codec: to,
+        compressed: bytes.len() as i64,
+        uncompressed: specs.iter().map(|(_, s)| s.uncompressed_size as i64).sum(),
+        data_page: first.offset as i64,
+        dictionary_page: specs.first().filter(|(d, _)| *d).map(|(_, s)| s.offset as i64),
+        offset_index,
+    };
+    Ok((bytes, moved))
+}
+
 /// The close result of a source chunk: its metadata under our descriptor, its statistics only where they are trusted
 /// (`trusted`), else their NULL count alone; its column index only with trusted statistics; its offset index always.
-fn column_close(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaData, ours: ColumnDescPtr) -> Result<ColumnCloseResult> {
+/// `moved`: its pages as `squeeze` wrote them, else where the source has them.
+fn column_close(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaData, ours: ColumnDescPtr, moved: Option<Moved>) -> Result<ColumnCloseResult> {
     let (stats, column_index) = match src.statistics() {
         Some(s) if trusted(md, i, s) => (Some(s.clone()), md.column_index().and_then(|ci| ci.get(g)).and_then(|row| row.get(i)).cloned()),
         Some(s) => (nulls_only(s), None),
         None => (None, None),
     };
-    let mut b = ColumnChunkMetaData::builder(ours)
-        .set_compression_codec(src.compression_codec())
-        .set_encodings_mask(*src.encodings_mask())
-        .set_total_compressed_size(src.compressed_size())
-        .set_total_uncompressed_size(src.uncompressed_size())
-        .set_num_values(src.num_values())
-        .set_data_page_offset(src.data_page_offset())
-        .set_dictionary_page_offset(src.dictionary_page_offset())
+    let mut b = ColumnChunkMetaData::builder(ours).set_encodings_mask(*src.encodings_mask()).set_num_values(src.num_values());
+    let (offset_index, total) = match moved {
+        Some(m) => {
+            b = b.set_compression(m.codec).set_total_compressed_size(m.compressed).set_total_uncompressed_size(m.uncompressed).set_data_page_offset(m.data_page).set_dictionary_page_offset(m.dictionary_page);
+            (m.offset_index, m.compressed as u64)
+        }
+        None => {
+            b = b.set_compression_codec(src.compression_codec()).set_total_compressed_size(src.compressed_size()).set_total_uncompressed_size(src.uncompressed_size()).set_data_page_offset(src.data_page_offset()).set_dictionary_page_offset(src.dictionary_page_offset());
+            (md.offset_index().and_then(|oi| oi.get(g)).and_then(|row| row.get(i)).cloned(), src.compressed_size() as u64)
+        }
+    };
+    b = b
         .set_unencoded_byte_array_data_bytes(src.unencoded_byte_array_data_bytes())
         .set_repetition_level_histogram(src.repetition_level_histogram().cloned())
         .set_definition_level_histogram(src.definition_level_histogram().cloned());
@@ -276,12 +390,12 @@ fn column_close(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaD
         b = b.set_page_encoding_stats_mask(*m);
     }
     Ok(ColumnCloseResult {
-        bytes_written: src.compressed_size() as u64,
+        bytes_written: total,
         rows_written: md.row_group(g).num_rows() as u64,
         metadata: b.build()?,
         bloom_filter: None,
         column_index,
-        offset_index: md.offset_index().and_then(|oi| oi.get(g)).and_then(|row| row.get(i)).cloned(),
+        offset_index,
     })
 }
 
@@ -563,28 +677,64 @@ mod tests {
         assert_same_rows(&kept[0].bytes, &file);
     }
 
-    /// pyarrow 26's file (tests/fixtures/parquet/pyarrow-26.parquet: 1200 rows in three row groups, Snappy, dictionary
-    /// pages, page indexes, an ARROW:schema, field ids 7, 3, 9, and a string and a decimal column): another writer's,
-    /// kept, and read back as the source's rows.
+    /// pyarrow's files. Its decimals are bytes (FIXED_LEN_BYTE_ARRAY), which read slower than the integers a written file
+    /// holds: not kept. Without them, one in Snappy with dictionary pages, v1 pages and page indexes, and one in ZSTD with
+    /// v2 pages and none: kept, every page recompressed in our LZ4_RAW (`squeeze`), and the rows, values, encodings,
+    /// statistics and page index as the source's; a read that skips pages by the offset index reads the same rows.
     #[test]
-    fn a_pyarrow_file_is_kept() {
+    fn pyarrow_files_are_kept_in_our_codec() {
+        use datafusion::parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
         let file = Bytes::from_static(include_bytes!("../tests/fixtures/parquet/pyarrow-26.parquet"));
         let schema = Schema::new(vec![
             Field::new("k", DataType::Int64, true),
             Field::new("name", DataType::Utf8, true),
             Field::new("amount", DataType::Decimal128(12, 2), true),
         ]);
-        let source = footer_of(&file);
-        assert_eq!(source.num_row_groups(), 3);
-        assert!(matches!(source.row_group(0).column(0).compression(), Compression::SNAPPY));
-        assert!(source.row_group(0).column(1).dictionary_page_offset().is_some(), "a dictionary page");
-        assert!(source.column_index().is_some(), "page indexes");
+        let why = keep(file, &schema, &limits()).unwrap().unwrap_err();
+        assert!(why.contains("decimal the file holds as bytes"), "{why}");
 
-        let kept = keep(file.clone(), &schema, &limits()).unwrap().unwrap();
-        assert_eq!(kept.len(), 1);
-        check_kept(&kept[0], &limits());
-        assert_eq!(kept[0].rows, 1200);
-        assert_same_rows(&kept[0].bytes, &file);
+        let schema = Schema::new(vec![Field::new("k", DataType::Int64, true), Field::new("name", DataType::Utf8, true), Field::new("amount", DataType::Float64, true)]);
+        let some = |file: &Bytes| -> Vec<datafusion::arrow::array::ArrayData> {
+            let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
+            let selection = RowSelection::from(vec![RowSelector::skip(500), RowSelector::select(20), RowSelector::skip(600), RowSelector::select(3)]);
+            let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file.clone(), options).unwrap().with_row_selection(selection).build().unwrap();
+            let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+            let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+            batch.columns().iter().map(|c| cast(c, &match c.data_type() {
+                DataType::Utf8View => DataType::Utf8,
+                t => t.clone(),
+            }).unwrap().to_data()).collect()
+        };
+        let fixtures: [(&str, &[u8]); 2] = [("v1", include_bytes!("../tests/fixtures/parquet/pyarrow-26-v1.parquet")), ("v2", include_bytes!("../tests/fixtures/parquet/pyarrow-26-v2.parquet"))];
+        for (name, bytes) in fixtures {
+            let file = Bytes::from_static(bytes);
+            let source = footer_of(&file);
+            assert_eq!(source.num_row_groups(), 3, "{name}");
+            assert_eq!(source.offset_index().is_some(), name == "v1", "{name}: page indexes");
+            let kept = keep(file.clone(), &schema, &limits()).unwrap().unwrap();
+            assert_eq!(kept.len(), 1, "{name}");
+            check_kept(&kept[0], &limits());
+            assert_eq!(kept[0].rows, 1200);
+            assert_same_rows(&kept[0].bytes, &file);
+            let got = footer_of(&kept[0].bytes);
+            assert_eq!(got.offset_index().is_some(), source.offset_index().is_some(), "{name}: an offset index as the source's");
+            for g in 0..3 {
+                for c in 0..3 {
+                    let (a, b) = (source.row_group(g).column(c), got.row_group(g).column(c));
+                    assert_eq!(b.compression(), Compression::LZ4_RAW, "{name} row group {g} column {c}");
+                    assert_eq!((a.num_values(), a.encodings().collect::<Vec<_>>()), (b.num_values(), b.encodings().collect::<Vec<_>>()));
+                    assert_eq!(a.dictionary_page_offset().is_some(), b.dictionary_page_offset().is_some());
+                    let (x, y) = (a.statistics().unwrap(), b.statistics().unwrap());
+                    assert_eq!((x.min_bytes_opt(), x.max_bytes_opt(), x.null_count_opt()), (y.min_bytes_opt(), y.max_bytes_opt(), y.null_count_opt()));
+                    if let (Some(was), Some(now)) = (source.offset_index(), got.offset_index()) {
+                        let (was, now) = (&was[g][c].page_locations, &now[g][c].page_locations);
+                        assert!(c != 0 || was.len() > 1, "{name}: pages to skip");
+                        assert_eq!(was.iter().map(|p| p.first_row_index).collect::<Vec<_>>(), now.iter().map(|p| p.first_row_index).collect::<Vec<_>>());
+                    }
+                }
+            }
+            assert_eq!(some(&kept[0].bytes), some(&file), "{name}: rows read by the offset index");
+        }
     }
 
     /// The same file made again through `append_column`, with the string chunk's statistics replaced by deprecated

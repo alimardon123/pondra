@@ -27862,8 +27862,8 @@ def all_tests():
 
 def kept():
     """CREATE TABLE … AS FROM 'f.parquet' keeps the file's row groups (keep_load, K2), on two nodes of a folder lake, the CTAS
-    through the follower (`/cluster/files`). Kept: the table's files are the file's own column chunks (Snappy, no ARROW:schema,
-    field ids 1..n by place, the source's three row groups), a glob of three files is three kept files, and its answers are a
+    through the follower (`/cluster/files`). Kept: the table's files are the file's own pages, recompressed from Snappy in our LZ4
+    (no ARROW:schema, field ids 1..n by place and the system columns', the source's three row groups), a glob of three files is three kept files, and its answers are a
     written table's (`w`, a WHERE, is written as today): every row, counts, sums, one version and distinct row ids; then DELETE,
     UPDATE and MERGE (an upsert and a delete) on each; a compaction of nine small kept files keeps their row ids; RENAMEs read by
     name, field ids 7, 3, 9 notwithstanding; a source's sorting_columns are not the table's order; a CLONE. Not kept, and the same
@@ -27917,8 +27917,8 @@ def kept():
     q(f"CREATE TABLE k AS FROM '{f}'", B)  # (through the follower)
     q(f"CREATE TABLE w AS SELECT * FROM '{f}' WHERE true", B)  # (a WHERE: written as today)
     kept_files = data(lake, "k")
-    checks["k's files are the file's own column chunks (Snappy) and the system columns as ours, no Arrow schema, a written file's field ids, the source's three row groups"] = bool(kept_files) \
-        and all(props(p)["codecs"] == {"SNAPPY"} and props(p)["sys_codecs"] <= OURS and not props(p)["arrow"] and props(p)["ids"] == WITH_SYS for p in kept_files) \
+    checks["k's files are the file's own pages recompressed in our LZ4, the system columns as ours, no Arrow schema, a written file's field ids, the source's three row groups"] = bool(kept_files) \
+        and all(props(p)["codecs"] <= OURS and props(p)["sys_codecs"] <= OURS and not props(p)["arrow"] and props(p)["ids"] == WITH_SYS for p in kept_files) \
         and all(props(p)["ids"] == WITH_SYS for p in data(lake, "w")) \
         and sum(props(p)["groups"] for p in kept_files) == 3 and sum(props(p)["rows"] for p in kept_files) == 3000
     checks["w's files are written as always (LZ4_RAW)"] = bool(data(lake, "w")) and all(props(p)["codecs"] <= OURS for p in data(lake, "w"))
@@ -27926,12 +27926,12 @@ def kept():
     checks["counts, distinct row ids, one version, sums: as w's"] = q(summary.format("k")) == q(summary.format("w")) and q(summary.format("k"))[0]["ids"] == 3000
 
     q(f"CREATE TABLE g AS FROM '{d}/part-*.parquet'", B)
-    checks["a glob of three files: three kept files, the rows of all three, as w's"] = len(data(lake, "g")) == 3 and all(props(p)["codecs"] == {"SNAPPY"} for p in data(lake, "g")) \
+    checks["a glob of three files: three kept files, the rows of all three, as w's"] = len(data(lake, "g")) == 3 and all(props(p)["codecs"] <= OURS and props(p)["groups"] == 2 for p in data(lake, "g")) \
         and q(summary.format("g")) == q(summary.format("w"))
 
     q(f"CREATE TABLE k_off AS FROM '{f}'", OFF)  # (a node that keeps nothing: the same table, written as before)
-    checks["PONDRA_KEEP_PARQUET=0 writes the same table as before: LZ4_RAW, the same answers"] = bool(data(lake_off, "k_off")) \
-        and all(props(p)["codecs"] <= OURS for p in data(lake_off, "k_off")) and q(summary.format("k_off"), OFF) == q(summary.format("k"))
+    checks["PONDRA_KEEP_PARQUET=0 writes the same table as before: LZ4_RAW, its own row groups, the same answers"] = bool(data(lake_off, "k_off")) \
+        and all(props(p)["codecs"] <= OURS for p in data(lake_off, "k_off")) and all(props(p)["groups"] == 1 for p in data(lake_off, "k_off")) and q(summary.format("k_off"), OFF) == q(summary.format("k"))
 
     for t in ("k", "w"):
         q(f"DELETE FROM {t} WHERE id % 10 = 3")
