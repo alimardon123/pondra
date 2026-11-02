@@ -163,6 +163,13 @@ pub(crate) enum Cmd {
         /// node ends, however it ends (a node `connect()` starts beside a Python or JavaScript program, the shell).
         #[arg(long)]
         stop_with_stdin: bool,
+        /// End, as on SIGTERM, once nobody has used this node for this many seconds and it has
+        /// nothing left to tier (also PONDRA_IDLE_EXIT_SECS): no HTTP or Flight request on its way,
+        /// no Postgres or Kafka connection open, no run. A platform that starts it again on the next
+        /// request (Cloud Run, Fly, Knative, a systemd socket) then bills only while there is work.
+        /// A lake with tasks on a schedule keeps its leader up: they run only while a node does.
+        #[arg(long, value_name = "SECS")]
+        idle_exit: Option<f64>,
         /// Run Python functions and procedures (`LANGUAGE python`) with this Python, which has the
         /// `pondra` package and pyarrow (`auto`: the first found), on warm workers beside the node,
         /// gone after a minute idle. A routine runs any code on this machine, so only an admin
@@ -416,7 +423,7 @@ async fn run() -> anyhow::Result<()> {
         return shell::run(&lake).await;
     };
     match cmd {
-        Cmd::Serve { path, dir, databases, default, addr, advertise, reader, serve_store, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, tls_cert, tls_key, tls_ca, attach: attached, attach_found, stop_with_stdin, python } => {
+        Cmd::Serve { path, dir, databases, default, addr, advertise, reader, serve_store, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, tls_cert, tls_key, tls_ca, attach: attached, attach_found, stop_with_stdin, idle_exit, python } => {
             // The flags that are settings (`env.rs`) are given to the process at once, before anything
             // reads them; its children get them too (a folder of lakes' databases, `pondra lead`).
             let mut given: Vec<(&str, String)> = [("PONDRA_TLS_CERT", tls_cert), ("PONDRA_TLS_KEY", tls_key), ("PONDRA_TLS_CA", tls_ca)]
@@ -463,6 +470,7 @@ async fn run() -> anyhow::Result<()> {
             };
             if many {
                 anyhow::ensure!(!serving, "--serve-store serves one lake's store: serve a lake (--lake), not a folder of them");
+                anyhow::ensure!(idle_exit.is_none() && env::secs("PONDRA_IDLE_EXIT_SECS", 0.0).is_zero(), "{dir} holds several lakes, served as databases, and each database's node already stops once idle (PONDRA_DATABASE_IDLE_SECS): --idle-exit is for one lake's node");
                 let one = [(flight.is_some(), "--flight"), (kafka.is_some(), "--kafka"), (kafka_advertise.is_some(), "--kafka-advertise"), (!attached.is_empty(), "--attach"), (advertise.is_some(), "--advertise"), (attach_found.is_some(), "--attach-found")];
                 if let Some((_, flag)) = one.iter().find(|(given, _)| *given) {
                     anyhow::bail!("{dir} holds several lakes, served as databases; {flag} is one lake's (serve that lake: pondra serve {dir}/<name> {flag} …)");
@@ -514,6 +522,7 @@ async fn run() -> anyhow::Result<()> {
                 ("PONDRA_REPLICAS", if ack == "replicated" { replicas.max(1) } else { 1 }.to_string()),
             ]);
             given.extend(cache_dir.map(|d| ("PONDRA_CACHE_DIR", d)));
+            given.extend(idle_exit.map(|s| ("PONDRA_IDLE_EXIT_SECS", s.to_string())));
             env::give(given)?;
             tls::init()?; // (a certificate that can't be read: said now)
             anyhow::ensure!(python.is_none() || auth.on() || !on_network, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
@@ -524,6 +533,10 @@ async fn run() -> anyhow::Result<()> {
             // (a pinned future, not a task: `Node::stop` ends every task a node started, and a moved node
             // starts again, so the selects below poll this one alone)
             let mut stop = Box::pin(stopped(stop_with_stdin));
+            // (`--idle-exit`: once nobody has used the node for that long and it has nothing left to do, it stops as on
+            // SIGTERM: `idle.rs`)
+            let quiet = env::secs("PONDRA_IDLE_EXIT_SECS", 0.0);
+            let mut idle = Box::pin(crate::idle::ended(quiet.as_secs_f64()));
             let mut moves = node::mover(); // (a lake moving to another place: `memory::set_location`)
             let mut options = node::Options { dir, listen: addr, advertise, start: node::Start { reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, python, auth }, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest: None };
             loop {
@@ -549,7 +562,7 @@ async fn run() -> anyhow::Result<()> {
                         served?;
                         break;
                     }
-                    _ = &mut stop => {
+                    _ = async { tokio::select! { _ = &mut stop => {}, _ = &mut idle => eprintln!("nobody has used this node for {quiet:?} and it has nothing left to do: it stops (--idle-exit)") } } => {
                         tokio::select! { _ = drain::drain() => {}, _ = stopped(false) => drain::hurry() }
                         node.stop().await;
                         crate::memory::leave();

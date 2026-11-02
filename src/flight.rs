@@ -80,7 +80,7 @@ impl tower::Service<http::Request<tonic::body::Body>> for Gate {
     fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> { std::task::Poll::Ready(Ok(())) }
 
     fn call(&mut self, mut req: http::Request<tonic::body::Body>) -> Self::Future {
-        let (app, mut inner) = (self.app.clone(), self.inner.clone());
+        let (app, mut inner, used) = (self.app.clone(), self.inner.clone(), crate::idle::Use::new()); // (a call is a use of the node until its answer is sent: `idle.rs`)
         Box::pin(async move {
             let header = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
             let peer = req.extensions().get::<crate::tls::Peer>().copied();
@@ -95,7 +95,8 @@ impl tower::Service<http::Request<tonic::body::Body>> for Gate {
                 req = req.map(|body| tonic::body::Body::new(http_body_util::Limited::new(body, 64 << 10)));
             }
             req.extensions_mut().insert(who);
-            tower::Service::call(&mut inner, req).await
+            let answer = tower::Service::call(&mut inner, req).await;
+            Ok(answer?.map(|body| tonic::body::Body::new(crate::idle::kept(body, used))))
         })
     }
 }

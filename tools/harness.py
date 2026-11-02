@@ -2349,6 +2349,70 @@ def serverless_guest(port):
     return checks, times
 
 
+def serverless_idle(port):
+    """`pondra serve --idle-exit SECS` (designs/serverless-lake.md): a node that ends itself once nobody has used it for SECS
+    and it has nothing left to do, so a platform that starts it on the next request bills only while there is work."""
+    import psycopg
+    lake, checks = new_lake(), {}
+
+    def ended(node, within):
+        try:
+            node.p.wait(timeout=within)
+        except subprocess.TimeoutExpired:
+            return None
+        return node.p.returncode
+
+    def idle(**flags):
+        return Node(lake, port, idle_exit=2, tier_secs=1, **flags).start()
+
+    # a. rows written, then nobody: it ends by itself, as on SIGTERM (exit 0), once its rows are tiered
+    node = idle()
+    sql(port, "CREATE TABLE t (k BIGINT, v TEXT)")
+    sql(port, "INSERT INTO t SELECT x, 'v' || x FROM generate_series(1, 5000) AS g(x)")
+    t = time.time()
+    code = ended(node, 30)
+    checks["a used, then nobody for 2 s: it ends by itself (exit 0), saying why"] = code == 0 and "it stops (--idle-exit)" in open(node.log).read()
+    quiet_s = round(time.time() - t, 2)
+    # b. the next start leads at once (the term was given back), and finds every row tiered (nothing was left in the log)
+    t = time.time()
+    plain = Node(lake, port + 1).start()
+    stats = call(plain.port, "GET", "/stats")
+    checks["b the next node leads at once and finds the rows tiered"] = (time.time() - t < 10 and "pondra leader" in open(plain.log).read()
+                                                                        and stats.get("untiered_rows") == 0
+                                                                        and sql(plain.port, "SELECT count(*) AS n FROM t") == [{"n": 5000}])
+    # c. a task on a schedule keeps the leader up (it runs only while a node does), said once; suspended, the node ends
+    sql(plain.port, "CREATE TASK hourly SCHEDULE '1 hour' AS SELECT 1")
+    plain.p.send_signal(signal.SIGTERM)
+    plain.p.wait(timeout=60)
+    node = idle()
+    up = ended(node, 6) is None
+    said = "tasks on a schedule (task hourly)" in open(node.log).read()
+    sql(port, "ALTER TASK hourly SUSPEND")
+    checks["c a task on a schedule keeps it up, said; suspended, it ends"] = up and said and ended(node, 30) == 0
+    # d. an open Postgres connection keeps it up, though it sends nothing; closed, the node ends
+    node = idle(pg=f"127.0.0.1:{port + 2}")
+    conn = psycopg.connect(f"host=127.0.0.1 port={port + 2} user=pondra dbname=lake", autocommit=True)
+    conn.execute("SELECT 1")
+    held = ended(node, 6) is None
+    conn.close()
+    checks["d an open Postgres connection keeps it up; closed, it ends"] = held and ended(node, 30) == 0
+    # e. an answer that goes on (a watch of a table) is a use for as long as it streams; its client gone, the node ends
+    node = idle()
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    c.request("GET", "/watch/t")
+    first = c.getresponse().status
+    held = ended(node, 6) is None
+    c.close()
+    checks["e a watch keeps it up while it streams; its client gone, it ends"] = first == 200 and held and ended(node, 30) == 0
+    # f. a folder of lakes refuses it: each database's node already stops once idle (PONDRA_DATABASE_IDLE_SECS)
+    folder = tempfile.mkdtemp(prefix="pondra-lakes-")
+    subprocess.run([BIN, "sql", "--dir", os.path.join(folder, "one"), "CREATE TABLE x (a INT)"], capture_output=True, timeout=120)
+    p = subprocess.run([BIN, "serve", "--lakes", folder, "--addr", f"127.0.0.1:{port + 3}", "--idle-exit", "2"], capture_output=True, text=True, timeout=60)
+    checks["f a folder of lakes refuses it, saying each database's node already stops"] = p.returncode != 0 and "PONDRA_DATABASE_IDLE_SECS" in p.stderr
+    shutil.rmtree(folder, ignore_errors=True)
+    return checks, {"quiet_to_exit_s": quiet_s}
+
+
 def serverless():
     """Writes from any machine with the binary, with and without a running node."""
     import pyarrow as pa, pyarrow.parquet as pq
@@ -2426,6 +2490,7 @@ def serverless():
     node2_leads = leads(node2)
     node2.kill()
     guest_checks, guest_times = serverless_guest(A.port + 3)  # (`pondra sql` as a guest node: its own lakes, one assertion each)
+    idle_checks, idle_times = serverless_idle(A.port + 10)  # (`--idle-exit`: a node that ends itself when nobody uses it)
     # 34 one-off writers, each a term of its own that lets go (invariant 434): more than 32, so a prune must run, and the lake
     # keeps 16 to 32 term records, the newest of them the last claim's, and alive and left hold nothing below the oldest one
     # kept. Every row reads back.
@@ -2445,12 +2510,13 @@ def serverless():
     # 8000 rows, the leader started here adds 1000 more, the writer that couldn't reach it 1000 and the next one
     # elsewhere 1000: 11000.
     ok = (n == {"n": 11000, "ids": 1000} and '"duplicate":true' in once[1] and node_leads and node2_leads and node_start_s < 10
-          and after_kill_s < 10 and live_kept and other_machine_leads and all(guest_checks.values()) and oneoff_ok)
+          and after_kill_s < 10 and live_kept and other_machine_leads and all(guest_checks.values()) and oneoff_ok and all(idle_checks.values()))
     print(json.dumps({"serverless": {"alone_s": alone_s, "retry": once, "four_at_once": together, "node_start_s": node_start_s, "node_leads": node_leads,
                                      "via_node_s": via_node_s, "after_leader_killed_s": after_kill_s, "unreached_s": unreached_s, "live_leader_kept": live_kept,
                                      "other_machine_after_kill_s": other_after_s, "other_machine_leads": other_machine_leads,
                                      "unreached_err": unreached.stderr[-400:] if not live_kept else "", "other_err": other_after.stderr[-400:] if not other_machine_leads else "",
-                                     "rows": n, "guest": guest_checks, "guest_times": guest_times, "one_off": oneoff, "one_off_ok": oneoff_ok, "ok": ok}}))
+                                     "rows": n, "guest": guest_checks, "guest_times": guest_times, "one_off": oneoff, "one_off_ok": oneoff_ok,
+                                     "idle_exit": idle_checks, "idle_exit_times": idle_times, "ok": ok}}))
     if not ok:
         sys.exit(1)
     return (f"INSERT from a process with no server: {alone_s}s alone, 4 at once, retries once; a node on the idle lake leads "

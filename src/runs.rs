@@ -82,7 +82,7 @@ struct Line {
 
 /// A call being logged: its line, written as it starts and again as it ends; one dropped before it
 /// ended (its caller went, its task's time ran out) ends as `stopped`, never `running` for good.
-pub struct Run(Option<(App, Line)>);
+pub struct Run(Option<(App, Line)>, #[allow(dead_code)] crate::idle::Use); // (a run is a use of its node: `idle.rs`)
 
 impl Drop for Run {
     fn drop(&mut self) {
@@ -104,7 +104,7 @@ impl Run {
         let caller = CALLER.try_with(|c| c.clone()).unwrap_or_else(|_| format!("{role:?}").to_lowercase());
         let line = Line { id: id.unwrap_or_else(new_id), routine: routine.into(), caller, node: app.members.me().to_string(), job: job.map(String::from), args: cut(args), started: now_ms(), ended: None, status: "running", notices: None, error: None };
         log(app, line.clone(), None);
-        Run(Some((app.clone(), line)))
+        Run(Some((app.clone(), line)), crate::idle::Use::new())
     }
 
     /// The call's line, ended; the answer says when it is in the log (a task waits for it before

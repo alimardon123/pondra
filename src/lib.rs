@@ -159,6 +159,7 @@ mod rules;
 #[cfg(feature = "doors")] mod console;
 #[cfg(feature = "doors")] mod dbserver;
 #[cfg(feature = "lake")] mod drain;
+#[cfg(feature = "lake")] mod idle;
 #[cfg(feature = "lake")] mod log;
 #[cfg(feature = "lake")] mod manifest;
 #[cfg(feature = "lake")] pub mod memory;
