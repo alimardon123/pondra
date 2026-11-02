@@ -48,7 +48,8 @@ struct Watch {
     next: Instant,         // not queried again before this
     every: Duration,
     session: Option<String>, // its temporary tables' session (`temp.rs`)
-    who: crate::auth::Principal, // whose it is: each answer as its grants are then
+    who: crate::auth::Principal, // whose it is: each answer as its sign-in and grants are then
+    header: Option<String>,      // (its `Authorization`, to sign it in again for each answer)
     temps: u64,              // their changes when it last looked
     tag: String,             // what its lines start with: `"id":…,` when it shares a connection
     _open: Open,             // (counted in /stats while its client listens)
@@ -70,8 +71,11 @@ impl Drop for Open {
     fn drop(&mut self) { OPEN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); }
 }
 
+/// The answers end once the caller may no longer have them: its sign-in revoked, expired, or no longer a reader, checked
+/// every 5 s (`server::until_revoked`) whether or not they change; each answer is as its sign-in and grants are then (`lines`).
 pub async fn live(State(app): State<App>, Query(p): Query<Params>, headers: axum::http::HeaderMap, body: bytes::Bytes) -> Response {
     let every = Duration::from_millis(p.every_ms.unwrap_or(100).max(10));
+    let revoked = crate::server::until_revoked(app.clone(), crate::auth::operator(), header(&headers), |p| p.role >= crate::auth::Role::Read);
     let kind = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
     if let Ok(Many { queries }) = serde_json::from_slice::<Many>(&body) {
         let mut all = Vec::with_capacity(queries.len());
@@ -88,10 +92,10 @@ pub async fn live(State(app): State<App>, Query(p): Query<Params>, headers: axum
                 Err(e) => futures::stream::once(async move { Ok(error(e, &tag)) }).boxed(),
             });
         }
-        return ([("content-type", "application/x-ndjson")], Body::from_stream(crate::drain::endless(futures::stream::select_all(all)))).into_response();
+        return ([("content-type", "application/x-ndjson")], Body::from_stream(crate::drain::endless(futures::stream::select_all(all).take_until(revoked)))).into_response();
     }
     match watch(&app, &headers, p.sql.as_deref(), &kind, &body, every, String::new()).await {
-        Ok(w) => ([("content-type", "application/x-ndjson")], Body::from_stream(crate::drain::endless(lines(w)))).into_response(),
+        Ok(w) => ([("content-type", "application/x-ndjson")], Body::from_stream(crate::drain::endless(lines(w).take_until(revoked)))).into_response(),
         Err(e) => (axum::http::StatusCode::BAD_REQUEST, crate::ext::said(&e)).into_response(),
     }
 }
@@ -108,7 +112,8 @@ async fn watch(app: &App, headers: &axum::http::HeaderMap, sql: Option<&str>, ki
         let sql = crate::routines::prepare(&app.lake, &req.sql, &req.params, &req.views).await?;
         anyhow::ensure!(crate::routines::split(&sql).len() == 1 && crate::write::parse(&sql).is_none(), "a live query is one query");
         let (tables, others) = reads(app, &sql).await?;
-        anyhow::Ok(Watch { seen: app.lake.visible(), app: app.clone(), sql, tables, others, print: None, answer: None, next: Instant::now(), every, session, who: crate::auth::current().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::Admin)), temps: 0, tag, _open: Open::new() })
+        let who = crate::auth::current().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::Admin));
+        anyhow::Ok(Watch { seen: app.lake.visible(), app: app.clone(), sql, tables, others, print: None, answer: None, next: Instant::now(), every, session, who, header: header(headers), temps: 0, tag, _open: Open::new() })
     })
     .await
 }
@@ -138,9 +143,12 @@ fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::
                 continue; // (commits to other tables)
             }
             (w.print, w.next) = (Some(print), Instant::now() + w.every);
-            let who = match w.who.access.is_some() { // (a user's grants as they are now: revoked, the answers end)
-                true => crate::users::principal(&w.app.lake, &w.who.name).await.unwrap_or_else(|_| crate::auth::Principal { name: w.who.name.clone(), role: crate::auth::Role::None, access: Some(Default::default()), door: "http", from: None, operator: false }), // (gone: nothing)
-                false => w.who.clone(),
+            // (its sign-in and grants as they are now, a superuser's too: dropped, made no superuser, a grant taken back, a
+            // password changed, and the answer is refused, which ends them: 11-02 audit H3. The nodes' own and an open
+            // node's caller, signed in by nothing, stay as they came)
+            let who = match (&w.header, w.who.operator) {
+                (Some(h), false) => crate::users::who(&w.app.lake, &w.app.auth, Some(h)).await.map(|p| p.at(w.who.door, w.who.from)).unwrap_or_else(|| crate::auth::Principal { name: w.who.name.clone(), role: crate::auth::Role::None, access: Some(Default::default()), door: w.who.door, from: w.who.from, operator: false }), // (gone: nothing)
+                _ => w.who.clone(),
             };
             let rows = crate::temp::SESSION.scope(w.session.clone(), crate::auth::WHO.scope(who, w.app.query(&w.sql, None))).await.and_then(|b| crate::answer::render(&b, None, crate::pages::keep));
             let rows = match rows {
@@ -157,6 +165,8 @@ fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::
         }
     })
 }
+
+fn header(headers: &axum::http::HeaderMap) -> Option<String> { headers.get("authorization").and_then(|v| v.to_str().ok()).map(String::from) }
 
 fn error(e: anyhow::Error, tag: &str) -> bytes::Bytes { format!("{{{tag}\"error\":{}}}\n", serde_json::Value::from(crate::ext::said(&e))).into() }
 
