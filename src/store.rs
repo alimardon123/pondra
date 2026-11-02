@@ -329,6 +329,7 @@ impl TableMeta {
             checks: self.checks.clone(),
             mapped: self.mapped(),
             order: self.sql_order(),
+            planned: Default::default(),
         })
     }
 
