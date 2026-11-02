@@ -639,6 +639,7 @@ impl Table {
         let schema = crate::answer::schema(&fields)?;
         Ok(Table {
             schema,
+            order: columns.iter().map(|c: &crate::rules::Column| c.name.clone()).collect(),
             columns,
             key: d.key.clone(),
             key_checked: d.keyed(),

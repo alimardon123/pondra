@@ -28,7 +28,7 @@ impl Host for Lake {
         let mut out = HashMap::new();
         for n in tables {
             if let Some(m) = self.cat.meta(&crate::store::table_key(&n)).await? {
-                out.insert(n, m.logical_columns().into_iter().map(|(c, _)| c).chain(crate::text::NAMES.map(String::from)).collect());
+                out.insert(n, m.sql_order().into_iter().chain(crate::text::NAMES.map(String::from)).collect()); // (SQL's order, as `*` reads them)
             }
         }
         Ok(out)
@@ -150,5 +150,5 @@ async fn relation(lake: &Lake, name: &str) -> Option<Relation<Lake>> {
 /// A table's columns as SQL sees them, in order, without an upsert table's delete markers, each with the type the port names it
 /// by. `sql_types` is keyed by the stored name.
 fn typed_columns(m: &TableMeta) -> impl Iterator<Item = (&str, Option<Ty>)> + '_ {
-    m.live().filter(|(_, n, _)| !m.marker(n)).map(|(s, n, _)| (n, m.sql_types.get(s).and_then(|t| Ty::of(t))))
+    m.in_order().into_iter().map(|(s, _)| (s.as_str(), m.name_of(s))).filter(|(_, n)| !m.marker(n)).map(|(s, n)| (n, m.sql_types.get(s).and_then(|t| Ty::of(t))))
 }

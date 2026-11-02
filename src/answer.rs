@@ -446,6 +446,24 @@ pub fn renamed(df: DataFrame, name_of: impl Fn(&str) -> String, shown: impl Fn(&
     df.select(keep)
 }
 
+/// `df` with the columns `order` names in that order, in the places they hold among its columns (a table's columns in SQL's
+/// order, `TableMeta::sql_order`); the others (the system columns) where they are.
+pub fn reordered(df: DataFrame, order: &[String]) -> datafusion::error::Result<DataFrame> {
+    let names: Vec<String> = df.schema().fields().iter().map(|f| f.name().clone()).collect();
+    let mut next = order.iter().filter(|c| names.contains(c));
+    let list: Vec<Expr> = names.iter().map(|n| if order.contains(n) { next.next().unwrap_or(n) } else { n }).map(|n| ident(n)).collect();
+    df.select(list)
+}
+
+/// `b` with its columns as `reordered` puts a frame's: those `order` names in that order, in the places they hold.
+pub fn batch_reordered(b: &RecordBatch, order: &[String]) -> datafusion::error::Result<RecordBatch> {
+    let schema = b.schema();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let mut next = order.iter().filter_map(|c| names.iter().position(|n| n == c));
+    let picks: Vec<usize> = names.iter().enumerate().map(|(i, n)| if order.iter().any(|c| c == n) { next.next().unwrap_or(i) } else { i }).collect();
+    Ok(b.project(&picks)?)
+}
+
 /// A column's type by name: Arrow's own (`Utf8`, `Int64`, `Timestamp(Microsecond, None)`,
 /// `Binary`), `T[]` for a list of T (`Float32[]`: an embedding), and `VARIANT`/`JSON` for
 /// semi-structured text, which is stored as a string and read with `json_get(…)`, `->` and `->>`.

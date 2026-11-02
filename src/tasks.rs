@@ -65,7 +65,7 @@ pub async fn run_all(lake: &Lake, members: &dyn Members, log: &Log) -> Result<()
             if rows.iter().all(|b| b.num_rows() == 0) {
                 continue; // nothing new for this task: no run, no commit
             }
-            let batch = crate::query::cast_as(&run(lake, &task, s as u32, rows).await?, &target_schema(lake, &task).await?)?;
+            let batch = target_rows(lake, &task, &run(lake, &task, s as u32, rows).await?).await?;
             SHARD_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let src = Src { producer, seq: hwm, prev: Some(done) }; // output + progress, if progress is still `done`
             runs.push(log.append(task.target.clone(), src, batch));
@@ -86,8 +86,15 @@ async fn run(lake: &Lake, task: &Task, shard: u32, mut rows: Vec<RecordBatch>) -
     over(lake, &task.source, rows, &task.sql).await
 }
 
-async fn target_schema(lake: &Lake, task: &Task) -> Result<datafusion::arrow::datatypes::SchemaRef> {
-    schema(&lake.cat.get::<TableMeta>(&table_key(&task.target)).await?.context("no target table")?.logical_columns())
+/// A run's rows as its target's: by position, in SQL's order (`TableMeta::sql_columns`), then in the order the target's
+/// columns are stored, which the log keeps.
+async fn target_rows(lake: &Lake, task: &Task, rows: &RecordBatch) -> Result<RecordBatch> {
+    let meta = lake.cat.get::<TableMeta>(&table_key(&task.target)).await?.context("no target table")?;
+    let batch = crate::query::cast_as(rows, &schema(&meta.sql_columns())?)?;
+    match meta.shown.is_empty() {
+        true => Ok(batch),
+        false => crate::rules::fit::conform(&batch, &schema(&meta.logical_columns())?), // (by name)
+    }
 }
 
 /// Register a task (leader only): its SQL must plan, and the target table is created from the

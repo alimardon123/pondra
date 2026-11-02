@@ -649,7 +649,7 @@ impl Backend {
         let meta = self.app.lake.cat.meta(&crate::store::table_key(&p.copy.table)).await.map_err(err)?.ok_or_else(|| err(anyhow::anyhow!("no table {}", p.copy.table)))?;
         let rules = meta.rules().map_err(err)?;
         let table = rules.schema.clone(); // (SQL's names: ADR-022)
-        let given: Vec<String> = if p.copy.columns.is_empty() { table.fields().iter().map(|f| f.name().clone()).filter(|c| c != "_deleted").collect() } else { p.copy.columns.clone() }; // (as `SELECT *` shows it)
+        let given: Vec<String> = if p.copy.columns.is_empty() { rules.order.iter().filter(|c| *c != "_deleted").cloned().collect() } else { p.copy.columns.clone() }; // (as `SELECT *` shows it)
         let schema = Arc::new(Schema::new(given.iter().map(|c| table.field_with_name(c).cloned()).collect::<Result<Vec<_>, _>>().map_err(|e| err(e.into()))?));
         let null = p.copy.null.clone().unwrap_or(if csv { String::new() } else { "\\N".into() });
         let delimiter = p.copy.delimiter.unwrap_or(if csv { ',' } else { '\t' }) as u8;

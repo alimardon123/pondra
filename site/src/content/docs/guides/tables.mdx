@@ -282,6 +282,30 @@ SELECT * FROM readings ORDER BY sensor;
 +--------+------------+------+
 ```
 
+A column can go anywhere among the others. `ADD COLUMN … FIRST` or `AFTER b` adds one there, and
+`ALTER COLUMN c FIRST` or `AFTER b` moves one. Only the order SQL lists the columns in changes, so the rows
+stay as they are, and `SELECT *`, `SHOW CREATE`, an `INSERT` without a column list, `COPY` and Delta and
+Iceberg readers all list the new order.
+
+```sql
+ALTER TABLE readings ALTER COLUMN unit AFTER sensor;
+ALTER TABLE readings ADD COLUMN site VARCHAR FIRST;
+INSERT INTO readings VALUES ('north', 's4', 'C', 22);
+SELECT * FROM readings WHERE sensor = 's4';
+```
+
+```text
++-------+--------+------+---------+
+| site  | sensor | unit | celsius |
++-------+--------+------+---------+
+| north | s4     | C    | 22      |
++-------+--------+------+---------+
+```
+
+A view that reads the table with a `*` lists the new order too. A move is refused while a materialized
+view reads the table with a `*`, because its rows keep the order they were made in: name the columns in
+its query first.
+
 `CLUSTER BY` changes how files are sorted, `SET` changes a table's options (`publish`, `retention`),
 and on keyed tables `TTL` and `SEQUENCE BY` change too. Files written from then on follow them.
 

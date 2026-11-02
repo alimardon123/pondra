@@ -112,6 +112,12 @@ pub struct TableMeta {
     /// Columns dropped (their stored names): older files still hold them; nothing reads them again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dropped: Vec<String>,
+    /// The order SQL lists the columns in, by stored name (`ALTER COLUMN c AFTER b`, `ADD COLUMN … FIRST`); the columns
+    /// it leaves out follow in their stored order, so a column added later comes last. Empty: as stored. Storage keeps
+    /// `columns`' order (a file's field ids are places in it), and so does everything under SQL: this is SQL's order only,
+    /// for `SELECT *`, an INSERT without a column list, `SHOW CREATE` and the catalogs (`in_order`, `sql_order`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shown: Vec<String>,
     /// Where its files, manifests and Delta and Iceberg copies are: `data/{folder}/`. None: its
     /// name, as for every table before round 26; a renamed table keeps the folder it had
     /// (`ALTER TABLE … RENAME TO`, ADR-030).
@@ -212,6 +218,21 @@ impl TableMeta {
     /// Has any column been renamed or dropped (ADR-022)? If not, SQL sees `columns` as stored.
     pub fn mapped(&self) -> bool { !self.names.is_empty() || !self.dropped.is_empty() }
 
+    /// This entry's live columns (under the names it keeps them by: stored, or SQL's in `logical()`'s) in SQL's order
+    /// (`shown`, then the others as stored). Without `shown`, `columns` as they are, dropped ones out.
+    pub fn in_order(&self) -> Vec<&(String, String)> {
+        let first = self.shown.iter().filter_map(|s| self.columns.iter().find(|(c, _)| c == s));
+        let rest = self.columns.iter().filter(|(c, _)| !self.shown.contains(c));
+        first.chain(rest).filter(|(c, _)| !self.dropped.contains(c)).collect()
+    }
+
+    /// The live columns' SQL names in SQL's order (`_deleted` among them, if the table has it): what `SELECT *` lists, and
+    /// what an INSERT without a column list fills, first to last (`write::implicit`).
+    pub fn sql_order(&self) -> Vec<String> { self.in_order().into_iter().map(|(c, _)| self.name_of(c).to_string()).collect() }
+
+    /// SQL's columns (`logical_columns`) in SQL's order (`in_order`): what `SELECT *` and RETURNING * answer.
+    pub fn sql_columns(&self) -> Vec<(String, String)> { self.in_order().into_iter().map(|(c, t)| (self.name_of(c).to_string(), t.clone())).collect() }
+
     /// A stored column's name in SQL.
     pub fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.names.get(stored).map_or(stored, String::as_str) }
 
@@ -254,6 +275,7 @@ impl TableMeta {
             sql_types: self.in_sql(&self.sql_types),
             names: BTreeMap::new(),
             dropped: vec![],
+            shown: self.in_sql_list(&self.shown),
             ..self.clone()
         }
     }
@@ -306,6 +328,7 @@ impl TableMeta {
                 .collect(),
             checks: self.checks.clone(),
             mapped: self.mapped(),
+            order: self.sql_order(),
         })
     }
 
@@ -319,12 +342,14 @@ impl TableMeta {
         Ok(self.rules.0.get_or_init(|| t).clone())
     }
 
-    /// The table as its readers see it, to describe it (listings, `pg_catalog`, MCP): `logical`, but
-    /// a view that finishes its answers (`finish.rs`) shows the columns it answers, not its partial ones.
+    /// The table as its readers see it, to describe it (listings, `pg_catalog`, MCP): `logical`, its columns in SQL's order
+    /// (`sql_columns`), but a view that finishes its answers (`finish.rs`) shows the columns it answers, not its partial ones.
+    /// Only to describe: its `columns` aren't the stored order once a column moved.
     pub fn described(&self) -> TableMeta {
         match &self.finish {
             Some(f) => TableMeta { columns: f.columns.clone(), merge: BTreeMap::new(), ..self.logical() },
-            None => self.logical(),
+            None if self.shown.is_empty() => self.logical(),
+            None => TableMeta { columns: self.sql_columns(), shown: vec![], ..self.logical() },
         }
     }
 

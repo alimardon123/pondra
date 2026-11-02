@@ -134,7 +134,7 @@ pub fn inserted(t: &Table, table: &str, names: &[String], query: &str) -> Result
     use super::fit::implicit;
     use super::rows::{defaulted, rows_width, says_default};
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
-    let columns: Vec<String> = t.columns.iter().map(|c| c.name.clone()).filter(|c| c != "_deleted").collect();
+    let columns: Vec<String> = t.order.iter().filter(|c| *c != "_deleted").cloned().collect(); // (SQL's order)
     let width = rows_width(query);
     if names.is_empty() {
         // (a query that says DEFAULT somewhere is read as the named one is, below; one that doesn't, as a positional one)
@@ -167,7 +167,7 @@ mod tests {
     /// A table of plain columns, the ones in `always` ALWAYS identities (the schema is not what these check).
     fn table(names: &[&str], always: &[&str]) -> Table {
         let column = |n: &&str| Column { name: n.to_string(), stored: n.to_string(), not_null: false, default: None, always: always.contains(n), held: None, labels: None };
-        Table { schema: Arc::new(Schema::empty()), columns: names.iter().map(column).collect(), key: vec![], key_checked: false, unique: vec![], checks: vec![], mapped: false }
+        Table { schema: Arc::new(Schema::empty()), columns: names.iter().map(column).collect(), key: vec![], key_checked: false, unique: vec![], checks: vec![], mapped: false, order: names.iter().map(|n| n.to_string()).collect() }
     }
 
     fn ints(v: &[Option<i64>]) -> ArrayRef {
