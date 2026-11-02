@@ -1647,7 +1647,7 @@ pub fn first_table(sql: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exhausted, frugally, keep, retrying, Facts, FactsMemo, Tail};
+    use super::{exhausted, frugally, keep, retrying, Facts, FactsMemo, Tail, TAILS};
     use crate::store::TableMeta;
     use datafusion::common::DataFusionError;
     use datafusion::prelude::SessionContext;
