@@ -127,24 +127,42 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
         }
     }
     let ctx = crate::query::session(lake, &query, "").await?; // (made once: a try that runs out of memory retries on a copy of it)
+    let stopped = std::sync::Mutex::new(HashSet::new()); // (the writes of the tries stopped: `write_of`)
     let rows = crate::query::frugally(&ctx, |ctx| {
-        let (query, target, kept) = (&query, &target, &kept);
+        let (query, target, kept, stopped) = (&query, &target, &kept, &stopped);
         async move {
             if crate::query::retrying(&ctx) && target.folder() {
-                // (what the first try wrote goes, as after a spread COPY that failed)
-                undo(lake, &target.to, kept).await?;
+                // (what the first try wrote goes, as after a spread COPY that failed, once a file it was putting has landed)
+                tokio::time::sleep(SETTLE).await;
+                let gone = undo(lake, &target.to, kept).await?;
+                stopped.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(gone.iter().filter_map(write_of));
             }
             write(crate::engine::sql(&ctx, query).await?, target).await
         }
     }).await?;
+    // A file of a stopped try that landed after its undo goes too (audit 11-02 L2: its rows were there twice).
+    let stopped = stopped.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !stopped.is_empty() {
+        let late = listed(lake, to).await?.into_iter().filter(|p| !kept.contains(p) && write_of(p).is_some_and(|w| stopped.contains(&w))).collect();
+        delete(lake, to, late).await?;
+    }
     Ok(serde_json::json!({"copied": rows, "to": to}))
 }
 
+/// How long a try stopped while it wrote is given for a file it was putting to land, before what it wrote is deleted.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The write a file of a folder belongs to: DataFusion names each `{write}_{n}.{extension}`, `write` random for each try.
+fn write_of(p: &object_store_df::path::Path) -> Option<String> {
+    p.filename().and_then(|f| f.split_once('_')).map(|(w, _)| w.to_string())
+}
+
 /// Deletes what is listed under `to` now except `kept` (what the folder held before the statement, and keeps): what
-/// an attempt that failed wrote.
-async fn undo(lake: &Lake, to: &str, kept: &HashSet<object_store_df::path::Path>) -> Result<()> {
-    let written = listed(lake, to).await?.into_iter().filter(|p| !kept.contains(p)).collect();
-    delete(lake, to, written).await
+/// an attempt that failed wrote. Says what it deleted.
+async fn undo(lake: &Lake, to: &str, kept: &HashSet<object_store_df::path::Path>) -> Result<Vec<object_store_df::path::Path>> {
+    let written: Vec<_> = listed(lake, to).await?.into_iter().filter(|p| !kept.contains(p)).collect();
+    delete(lake, to, written.clone()).await?;
+    Ok(written)
 }
 
 /// The files under a folder (none if it isn't there).
