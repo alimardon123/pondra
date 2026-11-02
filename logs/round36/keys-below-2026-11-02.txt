@@ -1,0 +1,64 @@
+# KeysExec (keys_below.rs) A/B, in-process SF1, 4 cores; A = main 50b49ad, B = this branch; tools: two worker processes taking turns per run (/tmp/l1/exp/abpair.py), median wall ms, median CPU ms
+
+## TPC-DS, the 20 queries with a KeysExec, 41 runs each
+q01 A 20.8 B 21.0 ratio 1.010 cpu 44/43
+q02 A 55.8 B 53.8 ratio 0.963 cpu 143/136
+q04 A 576.8 B 577.7 ratio 1.001 cpu 2041/2057
+q08 A 36.2 B 38.0 ratio 1.051 cpu 53/56
+q11 A 329.6 B 334.4 ratio 1.015 cpu 1154/1169
+q31 A 53.6 B 57.3 ratio 1.068 cpu 124/130
+q38 A 41.2 B 40.2 ratio 0.974 cpu 113/110
+q39 A 74.3 B 71.1 ratio 0.957 cpu 209/208
+q46 A 48.5 B 49.4 ratio 1.019 cpu 91/92
+q54 A 28.4 B 28.9 ratio 1.016 cpu 45/46
+q58 A 52.8 B 51.1 ratio 0.966 cpu 126/122
+q59 A 127.6 B 89.7 ratio 0.703 cpu 383/238
+q64 A 189.9 B 191.5 ratio 1.008 cpu 349/347
+q65 A 57.8 B 59.1 ratio 1.024 cpu 172/176
+q74 A 113.3 B 121.4 ratio 1.072 cpu 325/339
+q75 A 148.1 B 146.1 ratio 0.986 cpu 383/382
+q77 A 39.5 B 42.2 ratio 1.069 cpu 66/70
+q79 A 36.4 B 37.9 ratio 1.041 cpu 67/70
+q83 A 25.3 B 25.1 ratio 0.993 cpu 35/35
+q87 A 41.7 B 45.8 ratio 1.098 cpu 114/120
+TOTAL A 2097.7 B 2081.6 ratio 0.992
+
+## TPC-H, 21 runs each (q15 runs a view: same plan, checked apart)
+q1 A 124.5 B 134.6 ratio 1.082 cpu 389/406
+q2 A 17.6 B 17.2 ratio 0.979 cpu 29/30
+q3 A 53.4 B 54.2 ratio 1.016 cpu 120/121
+q4 A 34.1 B 34.8 ratio 1.021 cpu 103/104
+q5 A 42.7 B 42.0 ratio 0.984 cpu 91/94
+q6 A 27.1 B 26.8 ratio 0.989 cpu 79/78
+q7 A 68.7 B 69.5 ratio 1.011 cpu 146/149
+q8 A 37.2 B 37.3 ratio 1.002 cpu 68/71
+q9 A 124.1 B 125.3 ratio 1.010 cpu 300/306
+q10 A 96.2 B 91.6 ratio 0.953 cpu 225/218
+q11 A 14.1 B 14.6 ratio 1.035 cpu 23/24
+q12 A 52.9 B 50.6 ratio 0.955 cpu 133/132
+q13 A 69.9 B 66.3 ratio 0.949 cpu 214/218
+q14 A 21.6 B 21.2 ratio 0.983 cpu 43/43
+q16 A 51.2 B 52.2 ratio 1.019 cpu 85/88
+q17 A 28.6 B 27.6 ratio 0.965 cpu 58/59
+q18 A 116.2 B 111.1 ratio 0.956 cpu 377/366
+q19 A 98.3 B 100.0 ratio 1.017 cpu 232/239
+q20 A 71.0 B 36.7 ratio 0.517 cpu 231/104
+q21 A 114.7 B 114.8 ratio 1.001 cpu 272/262
+q22 A 21.7 B 19.4 ratio 0.896 cpu 36/33
+TOTAL A 1285.5 B 1247.8 ratio 0.971
+
+## Suspects, 81 runs, and A/A (main against main) for the noise band
+q87 A 45.8 B 45.5 ratio 0.992 cpu 121/119
+q31 A 56.9 B 57.2 ratio 1.005 cpu 127/129
+q74 A 109.5 B 112.3 ratio 1.025 cpu 309/314
+q77 A 37.2 B 37.2 ratio 1.001 cpu 62/63
+q08 A 36.6 B 36.9 ratio 1.007 cpu 53/54
+q79 A 34.8 B 35.9 ratio 1.034 cpu 63/67
+A/A: q87 1.016, q31 1.027, q74 0.984, q77 1.005, q08 1.015, q79 1.013
+
+## q79, q65, q01 at 161 runs, both orders (B second, then B first)
+B second: q79 1.051, q65 1.038, q01 1.019
+B first:  q79 1.024, q65 1.008, q01 1.005 (inverted: keys3 37.4/main 36.5, 55.8/55.3, 21.4/21.3)
+
+## Answers
+TPC-DS: all 99 digests equal (dsinproc.py), no errors. TPC-H plans: only q20's changes.

@@ -118,7 +118,8 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           ADR-056, ADR-059):
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
-          counts in the query memory: invariant 414); round 35 served.rs (a lake's store over HTTP:
+          counts in the query memory: invariant 414); keys_below.rs (a join's keys cut the rows an aggregate under it
+          groups: invariant 437); round 35 served.rs (a lake's store over HTTP:
           pondra://host:port, ADR-072 §8, invariant 299); replace.rs (CREATE OR REPLACE TABLE: a staged table filled, then put
           in the old one's place in one commit: invariant 425); round 36 statement.rs (one statement's
           path behind every door: a door reads its wire into a request and writes the answer back in
@@ -3054,6 +3055,21 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    0.8-1.2 s now (`logs/round36/median-3-groups-2gb.json`). `cargo test --lib held:: median::`; `harness.py scale`
    (its medians: 72 M values past a 0.5 GB pool still answer on the retry, no try stopped by the watch).
 ## Tests: run these before and after any change
+
+437. **A join's keys cut the rows an aggregate on its probe side groups** (`keys_below.rs`). A hash join's dynamic
+   filter (its build side's key ranges and hash table) passes down through an aggregate on grouping columns, since it
+   only drops whole groups, but a scan of hot columns takes no row filter (`hot::HotSource`), so nothing below took it
+   and the join never built it: TPC-H q20 grouped 909,000 lineitems into 543,000 groups for a semi join that kept
+   5,830. `KeysBelow` puts a `KeysExec` under each grouping aggregate reached from a probe side through projections,
+   exchanges and filters, just before `FilterPushdown(Post)`; it takes the dynamic filters that come down to it and
+   that nothing below filters rows by, and they still go on down for a Parquet scan. `KeysUnused` takes away one no
+   filter came down to, so other plans stay as they were. Until the build is in the filter is `true` and rows pass.
+   Each filter, once it has checked 32,768 rows, stops if it kept more than half (a store key that every row has, a
+   semi join below that already cut the rows), and the others go on. In-process at SF1 against main, interleaved:
+   q20 71.0 -> 36.7 ms (CPU 231 -> 104 ms; DuckDB 2.0 31 ms), TPC-DS q59 127.6 -> 89.7 ms, TPC-H 0.97x and TPC-DS's
+   20 queries with one 0.99x in all, none slower past the A/A band; of TPC-H only q20's plan changes, and TPC-DS's 99
+   answers are the same (`logs/round36/keys-below-2026-11-02.txt`). Not on a spread query's slices.
+   `cargo test --lib keys_below::`
 
 ```bash
 cargo build --release

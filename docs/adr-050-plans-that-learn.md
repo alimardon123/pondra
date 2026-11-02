@@ -18,7 +18,7 @@ Numbers in the examples are made up to show the shape.
 | Plans kept | `pondra.history.plan`: the plan that ran, with its metrics, for a statement over 1 s that ran on one node. A spread one keeps its trace (each node's share), not a plan. A fast one keeps nothing of its plan | `history::planned`, `server.rs` |
 | Learned | each query's last three times, here and spread, in one node's memory (4,096 queries): gone at a restart, and each node learns alone | `guard.rs` |
 | Estimates | row counts, column ranges and distinct-count sketches from the catalog. They are bounds, so the join order needs a 2× margin to overrule the order written, and nothing a run shows ever corrects them | `optimize::JoinOrder` |
-| Adapting while it runs | dynamic filters (a join's build side and a top-N's bound filter the scans as they go, hot batches skipped: invariant 203); a hot key shared out between shuffle steps (`skew.rs`, Spark's adaptive skew join); a query out of memory run again with sort-merge joins; scalar subqueries answered before what uses them | several |
+| Adapting while it runs | dynamic filters (a join's build side and a top-N's bound filter the scans as they go, hot batches skipped: invariant 203; a join's keys also cut the rows an aggregate under it groups, each filter stopping once it keeps most rows: invariant 437); a hot key shared out between shuffle steps (`skew.rs`, Spark's adaptive skew join); a query out of memory run again with sort-merge joins; scalar subqueries answered before what uses them | several |
 
 ### Why a plan can look wrong today
 

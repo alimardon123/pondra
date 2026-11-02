@@ -1152,6 +1152,9 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     rules.push(Arc::new(crate::held::LeanSorts)); // (a sort of strings hands up its own rows' strings: `held::LeanExec`)
     rules.push(Arc::new(crate::held::HeldValues)); // (after the exchanges: its pair goes around the aggregate, above them)
     rules.push(Arc::new(crate::held::Windows)); // (last: nothing after it moves a window)
+    let post = rules.iter().position(|r| r.name() == "FilterPushdown(Post)").unwrap_or(rules.len());
+    rules.insert(post + 1, Arc::new(crate::keys_below::KeysUnused)); // (a `KeysExec` no filter came down to goes again)
+    rules.insert(post, Arc::new(crate::keys_below::KeysBelow)); // (just before: the joins' dynamic filters come down to it)
     rules
 }
 
