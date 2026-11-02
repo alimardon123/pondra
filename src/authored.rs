@@ -41,14 +41,18 @@ tokio::task_local! {
 
 /// `f`, run for the statement `sql` as it was sent: a script's statement as it reads there, before its macros are read
 /// in (`script.rs`).
-pub async fn sent<T>(sql: &str, f: impl std::future::Future<Output = T>) -> T { SENT.scope(Arc::from(sql), f).await }
+/// (`f` goes to the heap at once: a statement's future is large, and a door's worker thread has a fixed stack)
+pub fn sent<T>(sql: &str, f: impl std::future::Future<Output = T>) -> impl std::future::Future<Output = T> { SENT.scope(Arc::from(sql), Box::pin(f)) }
 
 /// `sent`, unless what runs is already a statement as it was sent (a script's, whose statements a door runs one by one
 /// once their macros are read in: `audit::statement`).
-pub async fn door<T>(sql: &str, f: impl std::future::Future<Output = T>) -> T {
-    match SENT.try_with(|_| ()) {
-        Ok(()) => f.await,
-        Err(_) => sent(sql, f).await,
+pub fn door<T>(sql: &str, f: impl std::future::Future<Output = T>) -> impl std::future::Future<Output = T> {
+    let (sql, f): (Arc<str>, _) = (Arc::from(sql), Box::pin(f));
+    async move {
+        match SENT.try_with(|_| ()) {
+            Ok(()) => f.await,
+            Err(_) => SENT.scope(sql, f).await,
+        }
     }
 }
 
