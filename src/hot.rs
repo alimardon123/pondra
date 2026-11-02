@@ -71,7 +71,7 @@ struct State {
     used: usize,
     busy: HashSet<String>,           // files being loaded
     once: std::collections::VecDeque<String>, // files a scan read once (the next read loads them)
-    need: HashMap<String, usize>,    // a lake in memory's files that didn't fit: the bytes they decode to, so no try decodes them again
+    need: HashMap<String, usize>,    // files that didn't fit: the bytes they decode to, so no read decodes them again until that much is free
 }
 
 struct Col {
@@ -216,13 +216,7 @@ impl Hot {
         let fields: Vec<FieldRef> = {
             let mut s = self.state.lock().unwrap();
             let missing: Vec<FieldRef> = fields.into_iter().filter(|f| !s.cols.contains_key(&(key.clone(), f.name().clone()))).collect();
-            // (a lake in memory guesses nothing: its file is decoded and fits or not, and a file that didn't fit
-            // waits for the room its decoded size needs, not a guess of it: `need`)
-            let need = match memory {
-                true => s.need.get(&key).copied().unwrap_or(0),
-                false => guess,
-            };
-            if missing.is_empty() || s.busy.contains(&key) || !(memory || s.twice(&key)) || !s.room(need, room) {
+            if missing.is_empty() || s.busy.contains(&key) || !s.tries(&key, guess, memory, room) {
                 return false;
             }
             s.busy.insert(key.clone());
@@ -242,14 +236,10 @@ impl Hot {
             let sizes: Vec<usize> = arrays.iter().map(|a| size(a)).collect();
             let bytes: usize = sizes.iter().sum();
             if !s.room(bytes, room) {
-                if memory {
-                    s.need.insert(key.clone(), bytes); // (the next scan waits for this much room before it decodes the file again)
-                }
+                s.need.insert(key.clone(), bytes); // (the next scan waits for this much room before it decodes the file again)
                 return;
             }
-            if memory {
-                s.need.remove(&key);
-            }
+            s.need.remove(&key);
             s.rows.insert(key.clone(), Arc::new(rows));
             for (((f, arrays), ranges), bytes) in fields.iter().zip(arrays).zip(ranges).zip(sizes) {
                 s.used += bytes;
@@ -350,6 +340,15 @@ fn cut_batches(arrays: &[ArrayRef]) -> Option<Vec<ArrayRef>> {
 }
 
 impl State {
+    /// Should a scan of this file decode it into the cache? Not on a lake's first read of it (a lake in memory: its first
+    /// too), and only when there is room for it: for a file that didn't fit before, the room its decoded size took, not a
+    /// guess of it (`need`), so a cache with no room for it doesn't decode it on every read and throw it away (a lake in
+    /// memory guesses nothing: its file is decoded and fits or not).
+    fn tries(&mut self, key: &str, guess: usize, memory: bool, room: usize) -> bool {
+        let need = self.need.get(key).copied().unwrap_or(if memory { 0 } else { guess });
+        (memory || self.twice(key)) && self.room(need, room)
+    }
+
     /// Has a scan read this file before? (The first read only notes it: data read once isn't worth
     /// decoding twice.)
     fn twice(&mut self, path: &str) -> bool {
@@ -1138,6 +1137,23 @@ mod tests {
 
     fn names_and_types(fields: Vec<FieldRef>) -> Vec<(String, DataType)> {
         fields.iter().map(|f| (f.name().to_string(), f.data_type().clone())).collect()
+    }
+
+    /// A file whose columns didn't fit isn't decoded again while the room it took isn't free (L3, 11-02: a whole-table
+    /// fetch of SF5's lineitem took 70% more server CPU once the cache filled, decoding the files it had no room for on every
+    /// read), in a lake on disk or in memory; once there is room, it is.
+    #[test]
+    fn a_file_that_didnt_fit_isnt_decoded_again_until_its_room_is_free() {
+        for memory in [false, true] {
+            let mut s = State::default();
+            if !memory {
+                assert!(!s.tries("f", 10, memory, 100), "the first read only notes the file");
+            }
+            assert!(s.tries("f", 10, memory, 100), "then a guess that fits is tried");
+            s.need.insert("f".into(), 150); // (its load found it decodes to 150)
+            assert!(!s.tries("f", 10, memory, 100), "memory {memory}: no room for 150, so no decode");
+            assert!(s.tries("f", 10, memory, 200), "memory {memory}: room for it now");
+        }
     }
 
     #[test]
