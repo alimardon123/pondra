@@ -4046,6 +4046,10 @@ def schemas():
     after_restart = until(lambda: _try(lambda: n("warehouse.stock", 2)), 3, 15)  # (within a second of starting)
     ran = subprocess.run([BIN, "sql", "--dir", lake, "SELECT count(*) AS n FROM warehouse.stock"], capture_output=True, text=True, timeout=120)
     cli = ran.stdout or f"(no answer, exit {ran.returncode}) {ran.stderr[-2000:]}"  # (why, when it fails: main's 86fd48d once printed nothing)
+    if "| 3 |" not in cli:  # (what that `pondra sql` saw, when it fails: its start's steps, and the tables called stock it lists)
+        seen = subprocess.run([BIN, "sql", "--dir", lake, "SELECT table_catalog, table_schema, table_name FROM information_schema.tables WHERE table_name = 'stock'"],
+                              capture_output=True, text=True, timeout=120, env={**os.environ, "PONDRA_TRACE_START": "1"})
+        print(f"schemas: pondra sql of warehouse.stock failed; the stock tables it lists, now: {seen.stdout or seen.returncode} {seen.stderr[-3000:]}", file=sys.stderr, flush=True)
     listed = {r["catalog_name"] for r in q("SELECT DISTINCT catalog_name FROM information_schema.schemata")}
     # DuckDB's FROM-first (`FROM t` is SELECT * FROM t): alone, as a subquery, as a view's query;
     # a change to an attached lake's table says which lake and where it runs (ADR-024)

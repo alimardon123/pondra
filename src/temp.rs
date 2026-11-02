@@ -465,7 +465,7 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
         None => query.to_string(),
     };
     let ctx = crate::query::session(&app.lake, &query, "").await?;
-    let ctx = if files { ctx.enable_url_table() } else { ctx };
+    let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
     let rows = crate::write::rows(&app.lake, &ctx, &rules, name, &query, crate::rules::How::Load).await?; // (Load: its key is checked over all its rows, `check_key`: R6)
     let n = rows.rows().num_rows();
     apply(s, name, HashSet::new(), vec![rows])?;

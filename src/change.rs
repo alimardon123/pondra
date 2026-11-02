@@ -480,7 +480,7 @@ tokio::task_local! {
 /// `__pondra_proposed`, registered as `query::SENT`'s tables are.
 async fn session(lake: &Lake, sql: &str, upto: u64) -> Result<datafusion::prelude::SessionContext> {
     let ctx = crate::query::session_at(lake, sql, "", Some(upto)).await?;
-    let ctx = if FILES.try_with(|f| *f).unwrap_or(false) { ctx.enable_url_table() } else { ctx };
+    let ctx = if FILES.try_with(|f| *f).unwrap_or(false) { crate::engine::with_files(ctx) } else { ctx };
     if let Ok(rows) = PROPOSED.try_with(|r| r.clone()) {
         ctx.deregister_table(PROPOSED_TABLE)?;
         ctx.register_table(PROPOSED_TABLE, Arc::new(datafusion::datasource::MemTable::try_new(rows.schema(), vec![vec![(*rows).clone()]])?))?;
@@ -1074,7 +1074,7 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
         if here {
             let read = format!("SELECT * FROM {k}");
             let ctx = crate::query::session(query, &read, "").await?;
-            let ctx = if files { ctx.enable_url_table() } else { ctx };
+            let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
             let batches = ctx.sql(&crate::sys::planned(&read)?).await?.collect().await.with_context(|| format!("reading {k} for the change"))?;
             let alias = if rows_of_call { None } else { name.0.last().and_then(|p| p.as_ident()).map(|i| i.value.clone()) }; // (a table's name stays its rows' name)
             let as_sent = format!("__sent_{}", sent.len() + 1);
