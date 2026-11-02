@@ -120,7 +120,7 @@ fn ddl_touches(d: &Ddl) -> Vec<Touch> {
         Ddl::DropTable { name, .. } | Ddl::Undrop { name } | Ddl::Clone { name, .. } | Ddl::CreateView { name, .. } | Ddl::CreateExternal { name, .. }
         | Ddl::CreateMaterialized { name, .. } | Ddl::DropView { name, .. } | Ddl::Attach { name, .. } | Ddl::Detach { name, .. } | Ddl::CreateRoutine { name, .. }
         | Ddl::DropRoutine { name, .. } | Ddl::CreateSecret { name, .. } | Ddl::AttachOutside { name, .. } | Ddl::DropSecret { name, .. } | Ddl::CreateTask { name, .. }
-        | Ddl::DropTask { name, .. } | Ddl::AlterTask { name, .. } | Ddl::DetachView { name } | Ddl::ViewFacts { view: name, .. }
+        | Ddl::DropTask { name, .. } | Ddl::AlterTask { name, .. } | Ddl::DetachView { name } | Ddl::ViewFacts { view: name, .. } | Ddl::PlaceViewColumn { view: name, .. }
         | Ddl::FetchExtension { name, .. } | Ddl::InstallExtension { name, .. } | Ddl::UninstallExtension { name, .. } => object(name),
         Ddl::AlterColumn { table, .. } | Ddl::Constraint { table, .. } => object(table),
         Ddl::RenameTable { name, to } => vec![Touch::Object(name.clone()), Touch::Object(to.clone())],
