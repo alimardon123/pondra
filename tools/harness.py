@@ -9943,6 +9943,113 @@ def vieworder():
         node.kill()
     ok = all(checks.values())
     print(json.dumps({"vieworder": checks, "refused": refused, "ok": ok}, indent=1, default=str))
+
+
+def viewtext():
+    """A view's query as written (L6, Alimardon 11-02: people document views in their SQL): `CREATE VIEW` and `CREATE
+    MATERIALIZED VIEW` keep their `--` and `/* … */` comments and line breaks, `SHOW CREATE` gives them as written (over
+    HTTP and from the Postgres port; on a second node; after a restart), and a column moved (`ALTER … ALTER COLUMN c
+    FIRST`) takes its comments along, `ORDER BY 2` renumbered, a materialized view's rows kept. Made again another way, a
+    view shows its new text (or its query as it reads); one whose text can't be kept (a list of column names) says so
+    and shows its query as it reads. A string holding `--` is no comment; a view calling a macro keeps its text too."""
+    import psycopg
+    lake = new_lake()
+    nodes = [Node(lake, A.port, tier_secs=0.3, pg=f"127.0.0.1:{A.port + 10}").start(), Node(lake, A.port + 1, tier_secs=0.3).start()]
+    q = lambda s, port=A.port: sql(port, s)
+    names = lambda t, port=A.port: [r["column_name"] for r in q(f"DESCRIBE {t}", port)]
+    rows = lambda t, cols, port=A.port: sorted(tuple(r.get(c) for c in cols) for r in q(f"SELECT * FROM {t}", port))
+    shown = lambda kind, v, port=A.port: q(f"SHOW CREATE {kind} {v}", port)[0]["definition"]
+    line = lambda text, part: next((l for l in text.split("\n") if part in l), None)
+    checks, info = {}, {}
+
+    q("CREATE TABLE s (g BIGINT, x BIGINT, y BIGINT)")
+    q("INSERT INTO s VALUES (1, 10, 100), (1, 11, 110), (2, 20, 200)")
+    # A plain view, as written
+    doc = "-- each g's mean x\nSELECT g,          -- the group\n       avg(x) AS ax /* the mean */\nFROM s\nGROUP BY g"
+    made = q("CREATE VIEW doc AS\n" + doc)
+    checks["SHOW CREATE VIEW gives its query as written: its comments and line breaks"] = shown("VIEW", "doc") == "CREATE VIEW doc AS\n" + doc + ";" and "notice" not in str(made)
+    checks["the second node gives the same"] = until(lambda: shown("VIEW", "doc", A.port + 1), "CREATE VIEW doc AS\n" + doc + ";", 10) == "CREATE VIEW doc AS\n" + doc + ";"
+    before = rows("doc", ["g", "ax"])
+    moved = q("ALTER VIEW doc ALTER COLUMN ax FIRST")
+    after = shown("VIEW", "doc")
+    info["doc, ax moved first"] = after
+    g_line = line(after, "-- the group") or ""
+    checks["a column moved takes its comments along: ax with /* the mean */, g with -- the group, the first line kept"] = "notice" not in str(moved) \
+        and after.index("avg(x) AS ax") < after.index("-- the group") and "/* the mean */" in (line(after, "AS ax") or "") and g_line.strip().startswith("g") \
+        and "-- each g's mean x" in after and after.endswith("GROUP BY g;")
+    checks["… and the view answers as before, ax first"] = names("doc") == ["ax", "g"] and rows("doc", ["g", "ax"]) == before
+    q("DROP VIEW doc")
+    q(after)
+    checks["what SHOW CREATE gives makes the same view again, with its comments"] = shown("VIEW", "doc") == after and names("doc") == ["ax", "g"]
+    o = "SELECT g /* group */, x -- the x\nFROM s ORDER BY 2 DESC"
+    q("CREATE VIEW o AS " + o)
+    q("ALTER VIEW o ALTER COLUMN x FIRST")
+    o_after = shown("VIEW", "o")
+    info["o, x moved first"] = o_after
+    checks["ORDER BY 2 is renumbered (ORDER BY 1 DESC), each item keeping its comment"] = "ORDER BY 1 DESC" in o_after and "SELECT x, -- the x\n" in o_after \
+        and "g /* group */" in o_after and o_after.index("-- the x") < o_after.index("g /* group */") and names("o") == ["x", "g"]
+    # A materialized view, as written, its rows kept through a move
+    mm = "-- totals per g\nSELECT g,\n  sum(x) AS sx, -- the sum\n  count(*) AS n -- how many\nFROM s\nGROUP BY g"
+    q("CREATE MATERIALIZED VIEW mm AS\n" + mm)
+    checks["SHOW CREATE MATERIALIZED VIEW gives its query as written"] = shown("MATERIALIZED VIEW", "mm") == "CREATE MATERIALIZED VIEW mm AS\n" + mm + ";"
+    ids = lambda t: sorted(r["_row_id"] for r in q(f"SELECT _row_id FROM {t}"))
+    mm_ids = ids("mm")
+    mm_moved = q("ALTER MATERIALIZED VIEW mm ALTER COLUMN n FIRST")
+    mm_after = shown("MATERIALIZED VIEW", "mm")
+    info["mm, n moved first"] = mm_after
+    checks["moved, its comments go along (n with -- how many, sx with -- the sum) and its rows stay"] = "notice" not in str(mm_moved) \
+        and "-- how many" in (line(mm_after, "AS n") or "") and "-- the sum" in (line(mm_after, "AS sx") or "") and "-- totals per g" in mm_after \
+        and mm_after.index("count(*) AS n") < mm_after.index("sum(x) AS sx") and names("mm") == ["n", "g", "sx"] and ids("mm") == mm_ids
+    q("INSERT INTO s VALUES (3, 30, 300)")
+    checks["… and new rows land in the right columns"] = until(lambda: rows("mm", ["n", "g", "sx"]), [(1, 2, 20), (1, 3, 30), (2, 1, 21)], 20) == [(1, 2, 20), (1, 3, 30), (2, 1, 21)]
+    checks["the second node gives the moved text"] = until(lambda: shown("MATERIALIZED VIEW", "mm", A.port + 1), mm_after, 10) == mm_after
+    mm_ids = ids("mm")
+    replaced = q("CREATE OR REPLACE MATERIALIZED VIEW mm AS\nSELECT g, -- first now\n  sum(x) AS sx,\n  count(*) AS n\nFROM s\nGROUP BY g")
+    checks["CREATE OR REPLACE in another order keeps its rows and shows its own text"] = "kept" in str(replaced) and ids("mm") == mm_ids \
+        and shown("MATERIALIZED VIEW", "mm") == "CREATE MATERIALIZED VIEW mm AS\nSELECT g, -- first now\n  sum(x) AS sx,\n  count(*) AS n\nFROM s\nGROUP BY g;"
+    # The Postgres port keeps it too
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pgp:
+        pgp.execute("CREATE VIEW pv AS\n/* from the port */\nSELECT x -- just x\nFROM s")
+    checks["a view made over the Postgres port keeps its text"] = shown("VIEW", "pv") == "CREATE VIEW pv AS\n/* from the port */\nSELECT x -- just x\nFROM s;"
+    # Made again another way, it shows its new text, or its query as it reads
+    q("CREATE OR REPLACE VIEW pv AS SELECT x FROM s")
+    plain = shown("VIEW", "pv")
+    q("CREATE OR REPLACE VIEW pv AS SELECT x, -- new\n  y FROM s")
+    checks["CREATE OR REPLACE shows its own text: none of the old comments"] = "--" not in plain and "/*" not in plain and shown("VIEW", "pv") == "CREATE VIEW pv AS\nSELECT x, -- new\n  y FROM s;"
+    cl = q("CREATE VIEW cl (a, b) AS SELECT g, x -- not kept\nFROM s")
+    cl_shown = shown("VIEW", "cl")
+    info["cl"] = [cl, cl_shown]
+    checks["a view naming its columns can't keep it: the answer says so, and SHOW CREATE gives its query as it reads"] = "comments" in str(cl.get("notice", "")) \
+        and "not kept" not in cl_shown and names("cl") == ["a", "b"]
+    # Strings, macros, scripts
+    q("CREATE VIEW sq AS SELECT '-- no comment /* here */' AS t, 1 AS one /* real */")
+    q("ALTER VIEW sq ALTER COLUMN one FIRST")
+    sq = shown("VIEW", "sq")
+    info["sq"] = sq
+    checks["a string holding -- and /* is no comment; the real one moves with its item"] = "1 AS one /* real */," in sq and "'-- no comment /* here */' AS t" in sq \
+        and sq.index("1 AS one") < sq.index("AS t") and [list(r.values()) for r in q("SELECT * FROM sq")] == [[1, "-- no comment /* here */"]]
+    q("CREATE MACRO twice(a) AS a * 2")
+    q("CREATE VIEW mac AS SELECT twice(x) AS t -- doubled\nFROM s")
+    info["mac"], info["pv"] = shown("VIEW", "mac"), shown("VIEW", "pv")
+    checks["a view calling a macro keeps its text"] = shown("VIEW", "mac") == "CREATE VIEW mac AS\nSELECT twice(x) AS t -- doubled\nFROM s;"
+    mac_mv = q("CREATE MATERIALIZED VIEW mac_mv AS SELECT twice(x) AS t -- doubled\nFROM s")
+    info["mac_mv"] = [mac_mv, shown("MATERIALIZED VIEW", "mac_mv")]
+    checks["a materialized view calling a macro keeps the macro's body as it is now: the answer says its comments aren't kept"] = \
+        "comments" in str(mac_mv.get("notice", "")) and "--" not in shown("MATERIALIZED VIEW", "mac_mv")
+    script = _raises_text(lambda: q("CREATE VIEW a1 AS SELECT 1 AS one -- the first\n; CREATE VIEW a2 AS SELECT 2 AS two /* the second */"))
+    info["script"] = script
+    checks["a script making two views keeps each one's own text"] = bool(script) or (shown("VIEW", "a1") == "CREATE VIEW a1 AS\nSELECT 1 AS one -- the first\n;"
+                                                                              and shown("VIEW", "a2") == "CREATE VIEW a2 AS\nSELECT 2 AS two /* the second */;")
+    # After a restart, as it was
+    seen = {v: shown(k, v) for k, v in [("VIEW", "doc"), ("VIEW", "o"), ("MATERIALIZED VIEW", "mm"), ("VIEW", "pv")]}
+    for node in nodes:
+        node.kill()
+    nodes = [Node(lake, A.port, tier_secs=0.3).start()]
+    checks["after a restart: each shown as it was"] = all(shown(k, v) == seen[v] for k, v in [("VIEW", "doc"), ("VIEW", "o"), ("MATERIALIZED VIEW", "mm"), ("VIEW", "pv")])
+    for node in nodes:
+        node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"viewtext": checks, "info": info, "ok": ok}, indent=1, default=str))
     if not ok:
         sys.exit(1)
     return f"view column order: {len(checks)} checks pass (views, materialized views of four kinds, two nodes, a restart)"
@@ -28564,7 +28671,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns", "recursive", "extensions", "synced"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "viewtext", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns", "recursive", "extensions", "synced"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -28577,7 +28684,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "viewtext": viewtext, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

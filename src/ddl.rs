@@ -59,6 +59,9 @@ pub struct StoredView {
     /// A view's key facts, NOT ENFORCED (ADR-065 §2): its own, so a rename, a drop and a clone take them along.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facts: Vec<crate::constraints::Constraint>,
+    /// Its query as its author wrote it, comments kept, while `sql` is still that query (`authored.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored: Option<crate::authored::Authored>,
 }
 
 /// Another lake, attached in SQL (`ATTACH 'dir' AS name`): every node attaches it.
@@ -248,9 +251,9 @@ pub enum Ddl {
     DropTable { name: String, if_exists: bool, #[serde(default)] purge: bool, #[serde(default, skip_serializing_if = "Option::is_none")] made_by: Option<String> }, // (PURGE: not kept to be undropped)
     Undrop { name: String },                                                   // UNDROP TABLE (ADR-043)
     Clone { name: String, from: String },                                      // CREATE TABLE c CLONE t: t's files, none copied (ADR-043)
-    CreateView { name: String, sql: String, replace: bool, #[serde(default)] facts: Option<Vec<crate::constraints::Constraint>> }, // (None: as before, or kept through OR REPLACE: `facts.rs`)
+    CreateView { name: String, sql: String, replace: bool, #[serde(default)] facts: Option<Vec<crate::constraints::Constraint>>, #[serde(default, skip_serializing_if = "Option::is_none")] text: Option<String> }, // (None: as before, or kept through OR REPLACE: `facts.rs`; `text`: its query as written, `authored.rs`)
     CreateExternal { name: String, sql: String, replace: bool, if_not_exists: bool }, // DataFusion's CREATE EXTERNAL TABLE: a view of files (`ext::external`)
-    CreateMaterialized { name: String, sql: String, options: std::collections::BTreeMap<String, String> }, // (`views::options`)
+    CreateMaterialized { name: String, sql: String, options: std::collections::BTreeMap<String, String>, #[serde(default, skip_serializing_if = "Option::is_none")] text: Option<String> }, // (`views::options`; `text`: its query as written, `authored.rs`)
     DropView { name: String, if_exists: bool },
     Attach { name: String, dir: String, #[serde(default, skip_serializing_if = "std::ops::Not::not")] read_only: bool, #[serde(default, skip_serializing_if = "Option::is_none")] endpoint: Option<String> }, // (READ_ONLY and ENDPOINT: a lake on another server, ADR-058)
     Detach { name: String, if_exists: bool },
@@ -368,9 +371,9 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::DropTable { name, if_exists, purge, made_by } => Ddl::DropTable { name: here(name), if_exists, purge, made_by },
         Ddl::Undrop { name } => Ddl::Undrop { name: here(name) },
         Ddl::Clone { name, from } => Ddl::Clone { name: here(name), from: here(from) },
-        Ddl::CreateView { name, sql, replace, facts } => Ddl::CreateView { name: here(name), sql, replace, facts },
+        Ddl::CreateView { name, sql, replace, facts, text } => Ddl::CreateView { name: here(name), sql, replace, facts, text },
         Ddl::CreateExternal { name, sql, replace, if_not_exists } => Ddl::CreateExternal { name: here(name), sql, replace, if_not_exists },
-        Ddl::CreateMaterialized { name, sql, options } => Ddl::CreateMaterialized { name: here(name), sql, options },
+        Ddl::CreateMaterialized { name, sql, options, text } => Ddl::CreateMaterialized { name: here(name), sql, options, text },
         Ddl::DropView { name, if_exists } => Ddl::DropView { name: here(name), if_exists },
         Ddl::RenameTable { name, to } => Ddl::RenameTable { name: here(name), to },
         Ddl::Swap { name, with } => Ddl::Swap { name: here(name), with: here(with) },
@@ -399,8 +402,8 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         }
         Ddl::Replacing { name, then } => {
             let here = new_name(lake, &name).await?;
-            if let Ddl::CreateMaterialized { sql, options, .. } = &*then {
-                if let Some(kept) = reordered_in_place(lake, &here, sql, options).await? {
+            if let Ddl::CreateMaterialized { sql, options, text, .. } = &*then {
+                if let Some(kept) = reordered_in_place(lake, &here, sql, options, text.clone()).await? {
                     return Ok(kept); // (only its columns' order changes: its rows stay)
                 }
             }
@@ -470,7 +473,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::DropTable { name, if_exists, purge, made_by } => drop_table(lake, &name, if_exists, purge, made_by.as_deref()).await,
         Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?).await,
         Ddl::Clone { name, from } => clone(lake, &new_name(lake, &name).await?, &from).await,
-        Ddl::CreateView { name, sql, replace, facts } => create_view(lake, &name, sql, replace, false, facts).await,
+        Ddl::CreateView { name, sql, replace, facts, text } => create_view(lake, &name, sql, replace, false, facts, text).await,
         Ddl::CreateExternal { name, sql, replace, if_not_exists } => {
             let name = new_name(lake, &name).await?;
             let taken = lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_some()
@@ -479,9 +482,9 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
                 return Ok(j!({"table": name, "unchanged": true}));
             }
             ensure!(replace || !taken, "{name} already exists (CREATE OR REPLACE EXTERNAL TABLE, or IF NOT EXISTS)");
-            create_view(lake, &name, sql, replace, true, None).await
+            create_view(lake, &name, sql, replace, true, None, None).await
         }
-        Ddl::CreateMaterialized { name, sql, mut options } => {
+        Ddl::CreateMaterialized { name, sql, mut options, text } => {
             let name = new_name(lake, &name).await?;
             let facts = crate::facts::taken(&mut options)?; // (ALTER VIEW's facts in its list: `facts.rs`)
             ensure!(lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "{name} is a (stored) view");
@@ -500,6 +503,10 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             ensure!(!crate::seq::calls(&sql), "a materialized view can't call nextval or setval: its rows are worked out again as its tables change, and would be numbered again (number the rows where they are written: an identity column, or DEFAULT nextval('s'))");
             ensure!(outside.is_empty(), "a materialized view follows the rows its tables take in, and files outside the lake take none: read them into a table (CREATE TABLE … AS, INSERT … SELECT) and follow that, or make a stored view (CREATE VIEW)");
             crate::views::create(lake, &name, &sql, crate::views::options(&options)?).await?;
+            let unwritten = match text {
+                Some(text) => !written_as(lake, &name, &text, &sql).await? && crate::authored::commented(&text), // (its query as written, comments kept: `authored.rs`)
+                None => false,
+            };
             crate::views::forget(lake); // (the sequencer holds flushes to it from its next commit)
             if let Err(e) = crate::facts::materialized(lake, &name, facts).await {
                 drop_view(lake, &name, true).await?; // (refused: nothing made)
@@ -508,6 +515,8 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             let mut out = j!({"view": name, "materialized": true});
             if let Some(n) = lake.cat.get::<TableMeta>(&table_key(&name)).await?.and_then(|m| crate::delta::left_out(&name, &m)) {
                 out["notice"] = n.into();
+            } else if unwritten {
+                out["notice"] = crate::authored::UNKEPT.into();
             }
             Ok(out)
         }
@@ -982,7 +991,7 @@ pub async fn settle(lake: &Lake, d: &Ddl) -> Result<()> {
 
 /// `CREATE VIEW` (and CREATE EXTERNAL TABLE's view of files): a query by name, planned once here
 /// to be sure it can be, and kept as written.
-async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, external: bool, facts: Option<Vec<crate::constraints::Constraint>>) -> Result<Value> {
+async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, external: bool, facts: Option<Vec<crate::constraints::Constraint>>, text: Option<String>) -> Result<Value> {
     let name = new_name(lake, name).await?;
     unclaimed(lake, &name).await?;
     ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_none(), "{name} is a table");
@@ -997,10 +1006,16 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
     let planned = crate::sys::planned(&expanded)?;
     let df = crate::engine::sql(&crate::query::session(lake, &planned, "").await?, &planned).await.context(if external { "reading its files" } else { "the view's query" })?; // (it plans)
     let facts = crate::facts::settled(lake, &name, &sql, df.schema(), facts, replace).await?; // (its key facts: `facts.rs`)
-    lake.cat.commit(vec![(query_key(&name), json(&StoredView { sql, external, facts }))], &[]).await?;
-    Ok(match external {
-        true => j!({"table": name, "files": true}),
-        false => j!({"view": name}),
+    let (authored, unkept) = match text {
+        Some(text) if crate::authored::proved(lake, &text, &sql, false).await => (Some(crate::authored::Authored { text, of: sql.clone() }), false),
+        Some(text) => (None, crate::authored::commented(&text)),
+        None => (None, false),
+    };
+    lake.cat.commit(vec![(query_key(&name), json(&StoredView { sql, external, facts, authored }))], &[]).await?;
+    Ok(match (external, unkept) {
+        (true, _) => j!({"table": name, "files": true}),
+        (false, false) => j!({"view": name}),
+        (false, true) => j!({"view": name, "notice": crate::authored::UNKEPT}),
     })
 }
 
@@ -1657,8 +1672,35 @@ async fn place_view_column(lake: &Lake, name: &str, column: &str, place: &Place)
     if !readers.is_empty() {
         return Err(crate::rules::alter::read_by_position(name, column, &readers));
     }
-    lake.cat.commit(vec![(query_key(name), json(&StoredView { sql, ..before }))], &[]).await?;
-    Ok(j!({"view": name, "altered": {"column": column, "place": place.sql()}}))
+    let (authored, notice) = authored_moved(lake, &before.authored, &before.sql, &order, &sql, false).await;
+    lake.cat.commit(vec![(query_key(name), json(&StoredView { sql, authored, ..before }))], &[]).await?;
+    let mut out = j!({"view": name, "altered": {"column": column, "place": place.sql()}});
+    if let Some(n) = notice {
+        out["notice"] = n.into();
+    }
+    Ok(out)
+}
+
+/// A view's query as written (`authored.rs`) with its columns moved as its query's were, proved again over the moved
+/// query `now`; and what to tell when it couldn't be (its query is then shown as it reads).
+async fn authored_moved(lake: &Lake, was: &Option<crate::authored::Authored>, query: &str, order: &[usize], now: &str, materialized: bool) -> (Option<crate::authored::Authored>, Option<&'static str>) {
+    let Some(text) = crate::authored::Authored::of(was, query) else { return (None, None) };
+    match crate::authored::moved(text, order) {
+        Some(t) if crate::authored::proved(lake, &t, now, materialized).await => (Some(crate::authored::Authored { text: t, of: now.to_string() }), None),
+        _ => (None, Some(crate::authored::UNMOVED)),
+    }
+}
+
+/// A materialized view's query as its author wrote it, kept once it is proved to be the query the view keeps (`authored.rs`).
+async fn written_as(lake: &Lake, name: &str, text: &str, sql: &str) -> Result<bool> {
+    let key = crate::views::view_key(name);
+    let Some(mut v) = lake.cat.get::<crate::views::View>(&key).await? else { return Ok(false) };
+    if v.query() != sql || !crate::authored::proved(lake, text, sql, true).await {
+        return Ok(false);
+    }
+    v.authored = Some(crate::authored::Authored { text: text.to_string(), of: sql.to_string() });
+    lake.cat.commit(vec![(key, json(&v))], &[]).await?;
+    Ok(true)
 }
 
 /// What a finishing SELECT (`finish.rs`) answers over partial rows of schema `partial`: its columns' names and types.
@@ -1689,8 +1731,12 @@ async fn place_materialized_column(lake: &Lake, name: &str, column: &str, place:
     let names: Vec<String> = was.iter().map(|(c, ..)| c.clone()).collect();
     let Some(order) = view_places(name, &names, column, place)? else { return Ok(j!({"view": name, "unchanged": true})) };
     let written = crate::rules::alter::moved(v.query(), &order).map_err(|why| crate::rules::alter::cant_move(name, column, &why, MATERIALIZED))?;
-    reorder_materialized(lake, name, v, m, &was, &order, written, column).await?;
-    Ok(j!({"view": name, "altered": {"column": column, "place": place.sql()}}))
+    let notice = reorder_materialized(lake, name, v, m, &was, &order, written, column, None).await?;
+    let mut out = j!({"view": name, "altered": {"column": column, "place": place.sql()}});
+    if let Some(n) = notice {
+        out["notice"] = n.into();
+    }
+    Ok(out)
 }
 
 const MATERIALIZED: &str = "MATERIALIZED VIEW";
@@ -1722,9 +1768,11 @@ async fn movable(lake: &Lake, name: &str, column: &str) -> Result<(crate::views:
 /// and the query it runs and writes them by kept. Reads list them so: its table's `shown`, as a table's (`place_column`),
 /// or, for one whose answers are finished as they are read (avg, HAVING: `finish.rs`), its finishing SELECT moved, proved
 /// over no rows. `written` (its query with its columns in that order) is what SHOW CREATE gives after (`View::written`),
-/// proved to plan to them. What reads it by position refuses it, as for a table (`by_position`).
+/// proved to plan to them. What reads it by position refuses it, as for a table (`by_position`). Its query as its author
+/// wrote it (`authored.rs`) is `text` when it is made again (CREATE OR REPLACE: its statement's, empty when it has none),
+/// else its own moved too; the answer's notice says when its comments couldn't be kept.
 #[allow(clippy::too_many_arguments)]
-async fn reorder_materialized(lake: &Lake, name: &str, mut v: crate::views::View, mut m: TableMeta, was: &[(String, datafusion::arrow::datatypes::DataType, bool)], order: &[usize], written: String, column: &str) -> Result<()> {
+async fn reorder_materialized(lake: &Lake, name: &str, mut v: crate::views::View, mut m: TableMeta, was: &[(String, datafusion::arrow::datatypes::DataType, bool)], order: &[usize], written: String, column: &str, text: Option<String>) -> Result<Option<&'static str>> {
     let names: Vec<String> = was.iter().map(|(c, ..)| c.clone()).collect();
     let now = view_outputs(lake, &written).await.map_err(|e| crate::rules::alter::cant_move(name, column, &format!("moved, its query doesn't plan ({e:#})"), MATERIALIZED))?;
     let want: Vec<_> = order.iter().map(|&i| was[i].clone()).collect();
@@ -1752,18 +1800,26 @@ async fn reorder_materialized(lake: &Lake, name: &str, mut v: crate::views::View
     if !readers.is_empty() {
         return Err(crate::rules::alter::read_by_position(name, column, &readers));
     }
+    let (query, authored) = (v.query().to_string(), v.authored.take());
     v.written = Some(written).filter(|w| *w != v.sql || v.written.is_some());
+    // (its query as written: the statement's own when it is made again (CREATE OR REPLACE), else its columns moved too)
+    let (authored, notice) = match text {
+        Some(t) if crate::authored::proved(lake, &t, v.query(), true).await => (Some(crate::authored::Authored { text: t, of: v.query().to_string() }), None),
+        Some(t) => (None, crate::authored::commented(&t).then_some(crate::authored::UNKEPT)),
+        None => authored_moved(lake, &authored, &query, order, v.query(), true).await,
+    };
+    v.authored = authored;
     lake.cat.commit(vec![(crate::views::view_key(name), json(&v)), (table_key(name), json(&m))], &[]).await?;
     if !m.publish.is_empty() {
         crate::delta::publish_all(lake).await?; // (other engines list its columns in the new order too)
     }
-    Ok(())
+    Ok(notice)
 }
 
 /// `CREATE OR REPLACE MATERIALIZED VIEW v AS …` of the very query it has, with its columns in another order, and the same
 /// options and key facts: its rows are kept and its columns move (`reorder_materialized`), as with ALTER … ALTER COLUMN.
 /// None: anything else differs, or it can't move so (EMIT FINAL, sessions, …), and it is made again from its tables.
-async fn reordered_in_place(lake: &Lake, name: &str, sql: &str, options: &std::collections::BTreeMap<String, String>) -> Result<Option<Value>> {
+async fn reordered_in_place(lake: &Lake, name: &str, sql: &str, options: &std::collections::BTreeMap<String, String>, text: Option<String>) -> Result<Option<Value>> {
     if lake.cat.get::<Value>(&crate::views::view_key(name)).await?.is_none() {
         return Ok(None);
     }
@@ -1792,8 +1848,13 @@ async fn reordered_in_place(lake: &Lake, name: &str, sql: &str, options: &std::c
         return Ok(None);
     }
     let first = order.iter().enumerate().find(|(i, &p)| *i != p).map_or(names[0].clone(), |(i, _)| now[i].0.clone());
-    reorder_materialized(lake, name, v, m, &was, &order, written, &first).await?;
-    Ok(Some(j!({"view": name, "materialized": true, "rows": "kept, its columns in the new order"})))
+    // (made again, it is its statement's text that is kept, or none: not its old one moved)
+    let notice = reorder_materialized(lake, name, v, m, &was, &order, written, &first, Some(text.unwrap_or_default())).await?;
+    let mut out = j!({"view": name, "materialized": true, "rows": "kept, its columns in the new order"});
+    if let Some(n) = notice {
+        out["notice"] = n.into();
+    }
+    Ok(Some(out))
 }
 
 /// What reads `name`'s columns by position and keeps what it read, so that moving one would break it: a materialized

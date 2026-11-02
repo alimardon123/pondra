@@ -92,6 +92,7 @@ mod rules;
 #[cfg(feature = "lake")] mod adopt;
 #[cfg(feature = "lake")] mod app;
 #[cfg(feature = "lake")] mod audit;
+#[cfg(feature = "lake")] mod authored;
 #[cfg(feature = "lake")] mod ai;
 #[cfg(feature = "lake")] mod avro;
 #[cfg(feature = "lake")] mod backup;

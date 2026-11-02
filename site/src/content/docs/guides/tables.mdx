@@ -307,19 +307,29 @@ view reads the table with a `*`, because its rows keep the order they were made 
 its query first.
 
 Views take the same words. `ALTER VIEW v ALTER COLUMN c FIRST` writes the view's query with its columns
-in the new order, and `ALTER MATERIALIZED VIEW` does the same and keeps the view's rows. `SHOW CREATE`
-gives the query as it now reads:
+in the new order, and `ALTER MATERIALIZED VIEW` does the same and keeps the view's rows. Each column
+takes its comments along, and `SHOW CREATE` gives the query as it now reads:
 
 ```sql
 CREATE MATERIALIZED VIEW per_site AS
-  SELECT site, avg(celsius) AS mean, count(*) AS n FROM readings GROUP BY site;
+-- each site's readings
+SELECT site,
+       avg(celsius) AS mean, -- in °C
+       count(*) AS n
+FROM readings
+GROUP BY site;
 ALTER MATERIALIZED VIEW per_site ALTER COLUMN n AFTER site;
 SHOW CREATE MATERIALIZED VIEW per_site;
 ```
 
 ```text
 CREATE MATERIALIZED VIEW per_site AS
-SELECT site, count(*) AS n, avg(celsius) AS mean FROM readings GROUP BY site
+-- each site's readings
+SELECT site,
+       count(*) AS n,
+       avg(celsius) AS mean -- in °C
+FROM readings
+GROUP BY site;
 ```
 
 `CLUSTER BY` changes how files are sorted, `SET` changes a table's options (`publish`, `retention`),
@@ -378,6 +388,10 @@ spreads over a cluster like any query. A view can read other views.
 CREATE VIEW big_orders AS SELECT * FROM orders WHERE amount > 5;
 SELECT * FROM big_orders;
 ```
+
+A view keeps its query as you wrote it, with its comments and line breaks, so notes written in it stay
+with it: `SHOW CREATE VIEW` gives them back, and so does `SHOW CREATE MATERIALIZED VIEW`. Comments are
+`-- to the end of the line` or `/* … */`, which may span lines.
 
 `CREATE OR REPLACE VIEW` changes a view, and `ALTER VIEW … RENAME TO` renames it. A materialized view,
 which is kept up to date as rows arrive, is in [Views kept current](/pondra/guides/views/).

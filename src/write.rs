@@ -823,7 +823,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
                 }).collect(),
                 _ => Default::default(),
             };
-            let made = Ddl::CreateMaterialized { name: object(&v.name), sql: view_sql(&v), options };
+            let sql = view_sql(&v);
+            let text = crate::authored::candidate(&object(&v.name), true, &sql); // (its query as written: `authored.rs`)
+            let made = Ddl::CreateMaterialized { name: object(&v.name), sql, options, text };
             Stmt::Ddl(vec![match (v.or_replace, v.if_not_exists) {
                 (true, true) => return Some(Stmt::Invalid("CREATE OR REPLACE … IF NOT EXISTS: one or the other".into())),
                 (true, false) => Ddl::Replacing { name: object(&v.name), then: Box::new(made) },
@@ -833,7 +835,11 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         }
         Statement::CreateView(v) if v.or_replace && v.if_not_exists => Stmt::Invalid("CREATE OR REPLACE VIEW … IF NOT EXISTS: one or the other".into()),
         Statement::CreateView(v) if v.temporary => Stmt::TempView(object(&v.name), view_sql(&v), v.or_replace, v.if_not_exists), // (the session's: `temp.rs`)
-        Statement::CreateView(v) => Stmt::Ddl(vec![unless(v.if_not_exists, &object(&v.name), "relation", Ddl::CreateView { name: object(&v.name), sql: view_sql(&v), replace: v.or_replace, facts: None })]),
+        Statement::CreateView(v) => {
+            let (name, sql) = (object(&v.name), view_sql(&v));
+            let text = crate::authored::candidate(&name, false, &sql); // (its query as written: `authored.rs`)
+            Stmt::Ddl(vec![unless(v.if_not_exists, &name, "relation", Ddl::CreateView { name: name.clone(), sql, replace: v.or_replace, facts: None, text })])
+        }
         Statement::AttachDatabase { schema_name, database_file_name: ast::Expr::Value(v), .. } => match &v.value {
             ast::Value::SingleQuotedString(dir) | ast::Value::DoubleQuotedString(dir) => Stmt::Ddl(vec![Ddl::Attach { name: ident(&schema_name), dir: dir.clone(), read_only: false, endpoint: None }]),
             _ => return None,
