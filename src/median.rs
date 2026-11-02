@@ -5,7 +5,7 @@
 //! of 60 M values in 3 groups passed a node's 1 GB line before its 512 MB pool refused it). In chunks nothing held is
 //! copied or freed until the answer, and what the pool counts is what is held; the answer picks each group's middle from
 //! the few values between two sampled bounds (`picked`), not from a copy of all its values in one array. The answer is
-//! DataFusion's. Any other use of the median is DataFusion's.
+//! DataFusion's, for every type DataFusion's groups take (integers, floats, decimals). Any other use of the median is DataFusion's.
 
 use datafusion::arrow::array::{Array, ArrayRef, ArrowNativeTypeOp, AsArray, BooleanArray, ListArray, PrimitiveArray, PrimitiveBuilder};
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -51,25 +51,41 @@ impl AggregateUDFImpl for ChunkedMedian {
     }
 
     fn create_groups_accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn GroupsAccumulator>> {
-        let data_type = args.expr_fields[0].data_type().clone();
-        macro_rules! chunked {
-            ($t:ty) => {
-                Ok(Box::new(Chunked::<$t> { data_type, groups: vec![], held: 0 }))
-            };
-        }
-        match data_type {
-            DataType::Float32 => chunked!(types::Float32Type),
-            DataType::Float64 => chunked!(types::Float64Type),
-            DataType::Decimal32(..) => chunked!(types::Decimal32Type),
-            DataType::Decimal64(..) => chunked!(types::Decimal64Type),
-            DataType::Decimal128(..) => chunked!(types::Decimal128Type),
-            DataType::Decimal256(..) => chunked!(types::Decimal256Type),
-            _ => self.0.create_groups_accumulator(args),
+        match chunked(args.expr_fields[0].data_type()) {
+            Some(chunked) => Ok(chunked),
+            None => self.0.create_groups_accumulator(args),
         }
     }
 
     fn documentation(&self) -> Option<&Documentation> {
         self.0.documentation()
+    }
+}
+
+/// The chunked accumulator for values of `data_type`: each type DataFusion's median takes in groups.
+fn chunked(data_type: &DataType) -> Option<Box<dyn GroupsAccumulator>> {
+    macro_rules! chunked {
+        ($t:ty) => {
+            Some(Box::new(Chunked::<$t> { data_type: data_type.clone(), groups: vec![], held: 0 }))
+        };
+    }
+    match data_type {
+        DataType::Int8 => chunked!(types::Int8Type),
+        DataType::Int16 => chunked!(types::Int16Type),
+        DataType::Int32 => chunked!(types::Int32Type),
+        DataType::Int64 => chunked!(types::Int64Type),
+        DataType::UInt8 => chunked!(types::UInt8Type),
+        DataType::UInt16 => chunked!(types::UInt16Type),
+        DataType::UInt32 => chunked!(types::UInt32Type),
+        DataType::UInt64 => chunked!(types::UInt64Type),
+        DataType::Float16 => chunked!(types::Float16Type),
+        DataType::Float32 => chunked!(types::Float32Type),
+        DataType::Float64 => chunked!(types::Float64Type),
+        DataType::Decimal32(..) => chunked!(types::Decimal32Type),
+        DataType::Decimal64(..) => chunked!(types::Decimal64Type),
+        DataType::Decimal128(..) => chunked!(types::Decimal128Type),
+        DataType::Decimal256(..) => chunked!(types::Decimal256Type),
+        _ => None,
     }
 }
 
@@ -351,6 +367,26 @@ mod tests {
             let got = picked::<types::Float64Type>(group(&values));
             assert_eq!(got.map(f64::to_bits), want.map(f64::to_bits), "{what}");
         }
+    }
+
+    #[test]
+    fn integers_are_held_in_chunks_and_answer_as_datafusions_median() -> Result<()> {
+        // 11-02 audit M1: a BIGINT median, the commonest, went to DataFusion's doubling array.
+        for t in [DataType::Int8, DataType::Int16, DataType::Int32, DataType::Int64, DataType::UInt8, DataType::UInt16, DataType::UInt32, DataType::UInt64] {
+            assert!(chunked(&t).is_some(), "{t}");
+        }
+        assert!(chunked(&DataType::Utf8).is_none());
+        // One group of three chunks and a bit, an even count: the mean of the two middle values, truncated as DataFusion's.
+        let n = 3 * CHUNK as i64 + 11;
+        let values: ArrayRef = Arc::new(datafusion::arrow::array::Int64Array::from_iter_values((0..n).map(|i| (i * 7919) % n - n / 3)));
+        let mut acc = chunked(&DataType::Int64).unwrap();
+        acc.update_batch(&[values.clone()], &vec![0; n as usize], None, 1)?;
+        let mut all: Vec<i64> = values.as_primitive::<types::Int64Type>().values().to_vec();
+        let want = middle::<types::Int64Type>(&mut all);
+        assert_eq!(acc.evaluate(EmitTo::All)?.as_primitive::<types::Int64Type>().value(0), want.unwrap());
+        assert_eq!(middle::<types::Int64Type>(&mut [-3, 0]), Some(-1));
+        assert_eq!(middle::<types::UInt64Type>(&mut [u64::MAX, u64::MAX - 2]), Some(u64::MAX - 1));
+        Ok(())
     }
 
     #[test]
