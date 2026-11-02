@@ -324,6 +324,13 @@ impl Node {
             }
             if streamed {
                 cluster::mirror(lake.clone(), cluster.leader.addr.clone(), addr.clone(), replica);
+                if !lives {
+                    // (a guest synced the lakes attached in SQL once, in `start_app`, from a view that skips the WAL, and
+                    // syncs no more: an ATTACH its leader made in the last few seconds wasn't there yet, and `pondra sql`
+                    // found no such table until the leader's next checkpoint. Once it holds what its leader had: again.)
+                    let _ = lake.caught_up().await;
+                    ddl::sync(&lake, false).await?;
+                }
             }
         }
         if lives {
