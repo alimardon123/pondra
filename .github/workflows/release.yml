@@ -115,6 +115,7 @@ jobs:
         with:
           body_path: .github/release.md
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }} # (v0.80.0-rc.1: never "latest", so install.sh and install.ps1 keep the release)
           files: |
             dist/*
             install.sh

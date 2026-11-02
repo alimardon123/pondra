@@ -9,11 +9,14 @@
 #   bash tools/npm_publish.sh --dry-run
 set -eo pipefail
 publish() {
-  local file=$1 v; shift
+  local file=$1 v tag=(); shift
   v=$(tar -xzOf "$file" package/package.json | node -p 'const p = JSON.parse(require("fs").readFileSync(0)); p.name + "@" + p.version')
+  # (a release candidate, 0.80.0-rc.1, goes under the tag `next`: `npm install pondra` keeps the release, and
+  # `npm install pondra@next` takes the candidate. npm refuses a pre-release with no tag)
+  case ${v##*@} in *-*) tag=(--tag next) ;; esac
   if npm view "$v" version > /dev/null 2>&1; then echo "$v is published already"
-  else npm publish "$file" --access public "$@"; fi
+  else npm publish "$file" --access public "${tag[@]}" "$@"; fi
 }
 # (./dist/…, not dist/…: npm reads `dist/x.tgz` as the GitHub repository "dist/x.tgz", and refuses it)
-for p in ./dist/pondra-*-*.tgz; do publish "$p" "$@"; done
+for p in ./dist/pondra-[a-z]*-*.tgz; do publish "$p" "$@"; done # (pondra-linux-x64-…: a platform starts with a letter, a version with a digit)
 publish ./dist/pondra-[0-9]*.tgz "$@"

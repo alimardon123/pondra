@@ -17,7 +17,7 @@ esbuild's pattern: `pondra` holds the JavaScript client and depends, optionally,
 `pondra-<platform>` packages that each hold the launcher and the library side by side, so npm installs
 only the one that fits. No build tools beyond Python and npm.
 """
-import argparse, base64, concurrent.futures, hashlib, json, os, shutil, subprocess, sys, tarfile, tempfile, zipfile
+import argparse, base64, concurrent.futures, hashlib, json, os, re, shutil, subprocess, sys, tarfile, tempfile, zipfile
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 # platform -> (wheel tags, npm os, npm cpu)
@@ -34,6 +34,17 @@ def version():
     for line in open(os.path.join(ROOT, "Cargo.toml")):
         if line.startswith("version"):
             return line.split('"')[1]
+
+
+def python_version(v):
+    """Cargo's version as Python writes it (PEP 440): a release candidate 0.80.0-rc.1 is 0.80.0rc1, which pip
+    installs only when asked for (`pip install pondra==0.80.0rc1`, or `--pre`). A wheel's file name splits on `-`,
+    so the semver form would make a name PyPI refuses."""
+    m = re.fullmatch(r"(\d+\.\d+\.\d+)(?:-(alpha|a|beta|b|rc)\.?(\d+))?", v)
+    if not m:
+        raise SystemExit(f"Cargo.toml's version {v} has no Python form: X.Y.Z, or X.Y.Z-rc.N (alpha.N, beta.N)")
+    base, pre, n = m.groups()
+    return base + ({"alpha": "a", "a": "a", "beta": "b", "b": "b", "rc": "rc"}[pre] + n if pre else "")
 
 
 LICENSES = ["LICENSE-APACHE", "LICENSE-MIT"]  # (MIT OR Apache-2.0, at the user's choice)
@@ -53,7 +64,7 @@ def entry_points():
 
 
 def wheel(lib, launcher, platform, out):
-    v, tags = version(), PLATFORMS[platform][0]
+    v, tags = python_version(version()), PLATFORMS[platform][0]
     name = f"pondra-{v}-py3-none-{tags}.whl"
     exe = "pondra.exe" if platform.startswith("windows") else "pondra"
     readme = open(os.path.join(ROOT, "python", "README.md"), encoding="utf-8").read()  # (PyPI's page: short, its own)
