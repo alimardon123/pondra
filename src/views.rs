@@ -255,6 +255,10 @@ pub struct Options {
     pub refresh: Option<Refresh>,
     /// `lag = '1 minute'`: a view that runs its query again runs at most once a lag.
     pub lag_secs: Option<u64>,
+    /// The plain views (`CREATE VIEW`) its query reads, written in (`create` finds them): what the view keeps as `View::from`.
+    pub from: Vec<String>,
+    /// Its query as written, when that differs from the one it runs (`create` sets it): what a plain view keeps as `View::written`.
+    pub written: Option<String>,
 }
 
 /// How a view is kept current, when asked for: from each write's rows in its commit, refused if it
@@ -323,7 +327,7 @@ pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<Option
     };
     let lag_secs = time("lag")?.filter(|&s| s > 0);
     ensure!(lag_secs.is_none() || refresh != Some(Refresh::Incremental), "lag spaces out the runs of a view that runs its query again: an incremental view is current in each write's commit");
-    Ok(Options { emit, sessions, join, expect, history, delete_when: kv.get("delete_when").cloned(), once, lateness_secs, idle_secs, keep: None, refresh, lag_secs })
+    Ok(Options { emit, sessions, join, expect, history, delete_when: kv.get("delete_when").cloned(), once, lateness_secs, idle_secs, keep: None, refresh, lag_secs, from: vec![], written: None })
 }
 /// `CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…) [ON VIOLATION DROP ROW | FAIL], …) AS …`:
 /// the statement without its expectations, and them (`EXPECT (…)` too, Databricks' word; a column
@@ -469,6 +473,7 @@ pub(crate) async fn replaced(lake: &Lake, table: &str) -> Result<Option<String>>
 /// that text. A recursive CTE stays as written (a view can't follow one), and so does a query that isn't one SELECT; a
 /// write in a WITH (`WITH m AS (DELETE … RETURNING *)`), which runs once, is refused (0A000). A query with a
 /// MATCH_RECOGNIZE stays as written too: `pattern.rs` reads its input as written (a CTE, or a subquery it refuses by name).
+#[cfg(test)] // (the tests' way in: `create` takes `writing_in`'s plain views too)
 pub(crate) async fn written_in(lake: &Lake, sql: &str) -> Result<String> { Ok(writing_in(lake, sql).await?.0) }
 
 /// `written_in`, with the plain views written in, by their names in the catalog (each once, in order).
@@ -578,8 +583,10 @@ pub(crate) async fn followed(lake: &Lake, table: &str) -> Result<String> {
 
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
-pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
+pub async fn create(lake: &Lake, name: &str, sql: &str, mut o: Options) -> Result<()> {
     let (written_in, from) = writing_in(lake, sql).await?; // (its CTEs and the plain views it reads, as subqueries: a view follows a table)
+    o.from = from.clone(); // (made with what `as_written` sets after it, so the view is whole in its first commit)
+    o.written = (written_in != sql).then(|| sql.to_string());
     Box::pin(made(lake, name, &written_in, sql, o)).await?;
     if written_in != sql {
         as_written(lake, name, sql, from).await?;
@@ -612,11 +619,11 @@ pub(crate) async fn made_from(lake: &Lake, name: &str) -> Result<Vec<String>> {
 }
 
 /// `create`'s view, of its query with its CTEs and plain views written in (`sql`); `as_written` is the query as written.
-async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o: Options) -> Result<()> {
+pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o: Options) -> Result<()> {
     if o.once {
         return crate::once::create(lake, name, sql, o).await; // (`EMIT FINAL`)
     }
-    let Options { mut emit, sessions, join, expect, history, delete_when, keep, refresh, lag_secs, .. } = o;
+    let Options { mut emit, sessions, join, expect, history, delete_when, keep, refresh, lag_secs, from, written: query_written, .. } = o;
     // (a history view's deletes: a column of its rows saying which versions end their key)
     let wrapped;
     let sql = match &delete_when {
@@ -662,13 +669,13 @@ async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o: Options) 
     if let Some(s) = sessions {
         ensure!(emit.is_none() && join.is_none(), "a view emits windows or sessions, or joins streams: one of them");
         ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: sessions are cut from rows, so make {name} from {source}'s own source");
-        return create_sessions(lake, name, sql, source, &src, s).await;
+        return create_sessions(lake, name, sql, source, &src, s, from).await;
     }
     if let Some(j) = join {
         ensure!(emit.is_none(), "a view emits windows or joins streams, not both");
         ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: streams are joined row by row, so make {name} from {source}'s own source");
         ensure!(refresh.is_none() && lag_secs.is_none(), "a stream join pairs rows as they arrive: not by key or with a lag");
-        return create_join(lake, name, sql, source, j).await;
+        return create_join(lake, name, sql, source, j, from, query_written).await;
     }
     let planned = crate::sys::planned(sql)?;
     let ctx = session(lake, &planned, "").await?;
@@ -680,7 +687,7 @@ async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o: Options) 
     // Its query run again (ADR-056, ADR-059) when asked, or when the rows alone can't keep it: by
     // key when it can be (`median`, …), else whole (`ORDER BY … LIMIT`, a window, `now()`, …).
     let plain = emit.is_none() && keep.is_none() && history.is_none() && expect.is_empty();
-    let rerun = |how: crate::rerun::How, why: Option<String>| crate::rerun::create(lake, name, written, &source, &src, upstream.as_ref(), &plan, how, why, lag_secs);
+    let rerun = |how: crate::rerun::How, why: Option<String>| crate::rerun::create(lake, name, written, &source, &src, upstream.as_ref(), &plan, how, why, lag_secs, from.clone(), query_written.clone());
     let whole = |why: String| rerun(crate::rerun::How::Full, Some(format!("{why}: the whole query is run again")));
     if let Some(how) = refresh.filter(|r| *r != Refresh::Incremental) {
         ensure!(plain, "a view that runs its query again writes its rows as it works them out: not with windows, EMIT FINAL, history or expectations");
@@ -813,8 +820,12 @@ async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o: Options) 
         }
     }
     let fill = Some(Fill { id: uuid::Uuid::new_v4().to_string(), upto: None }); // (from the rows already there)
-    let written = finish.is_some().then(|| written.to_string());
-    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep, written, rerun: None, matches: None, from: vec![] })));
+    // (a plain view keeps its query as written, as `as_written` sets it; a view that finishes its answers as it reads them keeps the whole query)
+    let written = match query_written {
+        Some(w) if keep.is_none() => Some(w),
+        _ => finish.is_some().then(|| written.to_string()),
+    };
+    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep, written, rerun: None, matches: None, from })));
     lake.cat.commit(puts, &[]).await
 }
 
@@ -929,7 +940,7 @@ fn expected(view: &str, v: &View, rows: RecordBatch, filling: bool) -> Result<(R
 
 /// A session view: the SQL runs over each closed session's rows, grouped by session too, so its
 /// table gets the SQL's columns and `session_start`, `session_end`.
-async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src: &TableMeta, mut s: Sessions) -> Result<()> {
+async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src: &TableMeta, mut s: Sessions, from: Vec<String>) -> Result<()> {
     ensure!(timestamp(src, &s.time), "sessions: {} is not a timestamp column of {source}", s.time);
     ensure!(s.gap_secs > 0, "sessions: the gap must be at least a second");
     let with = sessionized(sql)?;
@@ -950,7 +961,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
     let sql_types = crate::write::query_types(lake, &with, &names).await;
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), sql_types, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None, from: vec![] };
+    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None, from };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
 
@@ -1003,6 +1014,8 @@ fn event_time(plan: &LogicalPlan, window: &str) -> Option<String> {
 pub(crate) struct Failures {
     pub(crate) failures: u32,
     error: Option<String>,
+    /// When the failures in a row began.
+    since: Option<datafusion::common::instant::Instant>,
 }
 
 impl Failures {
@@ -1010,14 +1023,20 @@ impl Failures {
     /// error is logged when it is new, not at every try.
     pub(crate) fn note(&mut self, what: &str, error: Option<String>) {
         match error {
-            None => (self.failures, self.error) = (0, None),
+            None => (self.failures, self.error, self.since) = (0, None, None),
             Some(e) => {
                 if self.error.as_ref() != Some(&e) {
                     eprintln!("{what}: {e}");
                 }
                 (self.failures, self.error) = (self.failures + 1, Some(e));
+                self.since.get_or_insert_with(datafusion::common::instant::Instant::now);
             }
         }
+    }
+
+    /// Whether its runs have kept failing for longer than `hold` (two in a row at least).
+    pub(crate) fn failing_longer_than(&self, hold: std::time::Duration) -> bool {
+        self.failures >= 2 && self.since.is_some_and(|t| t.elapsed() > hold)
     }
 
     /// The last error, once two runs in a row failed (one may be passing).
@@ -1101,6 +1120,15 @@ impl Drop for Turn {
 fn failing_of(key: &(String, String), of: &str) -> Option<String> {
     RUNS.lock().unwrap().get(key).filter(|run| run.of == of).and_then(|run| run.failed.failing())
 }
+
+/// Whether `view`'s runs (as `failing`) have kept failing for longer than `hold`.
+fn failing_longer_than(lake: &Lake, view: &str, of: &str, hold: std::time::Duration) -> bool {
+    RUNS.lock().unwrap().get(&(lake.url.clone(), view.to_string())).is_some_and(|run| run.of == of && run.failed.failing_longer_than(hold))
+}
+
+/// How long a filling that keeps failing holds its keyed source's tiering back (`fill_end`): failures that pass, such as a
+/// 53200 or a timeout, are tried again within it, and its source's log grows meanwhile.
+const FILL_HOLD: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Which view of its name `v` is: the id it was made with (its rerun's first, as rerun's runs know it by: `rerun::turn`;
 /// else its pattern's or its fill's), else its query (a session view, a stream join, a view made before Pondra 0.21: none
@@ -1601,15 +1629,17 @@ pub async fn filling(lake: &Lake, table: &str) -> Result<Option<String>> {
 /// files hold one row per key, as of the last commit folded in, so a key's rows folded from both
 /// sides of that end read as after it, and the filling lacked the ones before (a rollup of a GROUP
 /// BY view, made while rows streamed in, came out short whenever a tiering round ran between the
-/// commit that set its end and its filling). A filling that keeps failing holds nothing back: the
-/// log would grow until backpressure stopped every writer. Its table is tiered on, and once it
-/// works the filling refuses a source folded past its end (`fill_one`).
+/// commit that set its end and its filling). A filling that fails holds it back too, as its tries
+/// go on (audit 11-02 M12: two failures that passed, a 53200 or a timeout, let the source be folded
+/// past its end, and the view could never be filled). One that keeps failing for `FILL_HOLD` holds
+/// nothing back: the log would grow until backpressure stopped every writer. Its table is tiered
+/// on, and once it works the filling refuses a source folded past its end (`fill_one`).
 pub async fn fill_end(lake: &Lake, table: &str) -> Result<Option<(String, u64)>> {
     let mut end: Option<(String, u64)> = None;
     for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
         let Some(upto) = v.fill.as_ref().and_then(|f| f.upto) else { continue }; // (one whose end isn't set: it is set past every commit there is)
         let name = &key[2..];
-        if v.source == table && end.as_ref().is_none_or(|e| upto < e.1) && failing(lake, name, identity(&v)).is_none() && lake.cat.get::<u64>(&producer_key(&format!("fill:{name}"))).await?.is_none() {
+        if v.source == table && end.as_ref().is_none_or(|e| upto < e.1) && !failing_longer_than(lake, name, identity(&v), FILL_HOLD) && lake.cat.get::<u64>(&producer_key(&format!("fill:{name}"))).await?.is_none() {
             end = Some((name.to_string(), upto));
         }
     }
@@ -1833,7 +1863,7 @@ fn top_aggregate(plan: &LogicalPlan) -> Option<&LogicalPlan> {
 
 /// A stream join view: its two tables (both of this lake, append tables), its columns from the
 /// query, and where it starts (rows written from now on, paired with whatever the other side has).
-async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: Join) -> Result<()> {
+async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: Join, from: Vec<String>, written: Option<String>) -> Result<()> {
     use datafusion::common::tree_node::TreeNode;
     let planned = crate::sys::planned(sql)?;
     let ctx = session(lake, &planned, "").await?;
@@ -1872,7 +1902,7 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
     let sql_types = crate::write::query_types(lake, sql, &names).await;
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: now, sql_types, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None, from: vec![] };
+    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written, rerun: None, matches: None, from };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await
 }
 
@@ -2110,8 +2140,14 @@ mod tests {
         assert_eq!(f.failing(), None, "one failure is not yet failing");
         f.note("emission of v", Some("boom".into()));
         assert_eq!(f.failing().as_deref(), Some("boom"));
+        assert!(!f.failing_longer_than(FILL_HOLD), "two failures just now: a filling's source is still held");
+        f.since = datafusion::common::instant::Instant::now().checked_sub(FILL_HOLD + std::time::Duration::from_secs(1));
+        assert!(f.failing_longer_than(FILL_HOLD), "failing past the hold: held no longer");
+        f.note("emission of v", Some("boom".into()));
+        assert!(f.failing_longer_than(FILL_HOLD), "a failure in a row keeps when the failures began");
         f.note("emission of v", None);
         assert_eq!(f.failing(), None, "a run that works ends it");
+        assert!(!f.failing_longer_than(FILL_HOLD));
     }
 
     #[tokio::test]

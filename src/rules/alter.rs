@@ -143,6 +143,93 @@ pub fn read_by_position(table: &str, column: &str, readers: &[String]) -> anyhow
     crate::codes::coded("0A000", format!("{column} can't move while {who} {verb} {table}'s columns by position (a `*`, or a task's rows into it), keeping them in the order they were: name the columns in its query (CREATE OR REPLACE MATERIALIZED VIEW … AS SELECT a, b, …), then move it"))
 }
 
+/// Why `column` of view `name` (`kind`: VIEW or MATERIALIZED VIEW) can't move in its query, and the way that always
+/// works: the view made again with its columns listed in the order wanted.
+pub fn cant_move(name: &str, column: &str, why: &str, kind: &str) -> anyhow::Error {
+    let again = if kind == "VIEW" { "" } else { " (its rows worked out again)" };
+    crate::codes::coded("0A000", format!("{column} can't move in {name}'s query: {why}. CREATE OR REPLACE {kind} {name} AS … with its columns in the order you want{again}"))
+}
+
+/// A view's query with its outputs in a new order (`ALTER VIEW v ALTER COLUMN c AFTER b`): `order[i]` is the place, in
+/// the outputs as they are, of the one that comes `i`-th. Each SELECT list is put in that order (every branch of a
+/// UNION, INTERSECT or EXCEPT, and every row of a VALUES, so their columns still pair up), and what names an output by
+/// its place follows it (`ORDER BY 2`, `GROUP BY 1`); a `SELECT *` of one subquery moves that subquery's outputs and its
+/// alias's names. Nothing else in the query changes. Err: why this query can't be moved so (its outputs come from a
+/// table's `*`, a branch matched BY NAME, an ORDER BY ALL, …), for the caller to say with the way round it. The caller
+/// proves the result (`ddl::place_view_column`: it plans to the same columns, in the new order).
+pub fn moved(sql: &str, order: &[usize]) -> Result<String, String> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    let mut q = Parser::new(&GenericDialect {}).try_with_sql(sql).and_then(|mut p| p.parse_query()).map_err(|e| format!("its query doesn't read back ({e})"))?;
+    query(&mut q, order)?;
+    return Ok(q.to_string());
+
+    fn query(q: &mut ast::Query, order: &[usize]) -> Result<(), String> {
+        body(&mut q.body, order)?;
+        // (`ORDER BY ALL` is read as a column `all` here, and made positions as the query runs: `friendly::order_by_all`)
+        let all = |e: &ast::Expr| matches!(e, ast::Expr::Identifier(i) if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("all"));
+        match q.order_by.as_mut().map(|o| &mut o.kind) {
+            Some(ast::OrderByKind::All(_)) => Err("its ORDER BY ALL sorts by the columns in their order: write them out (ORDER BY a, b, …)".into()),
+            Some(ast::OrderByKind::Expressions(by)) if matches!(by.as_slice(), [b] if all(&b.expr)) => Err("its ORDER BY ALL sorts by the columns in their order: write them out (ORDER BY a, b, …)".into()),
+            Some(ast::OrderByKind::Expressions(by)) => by.iter_mut().try_for_each(|b| place(&mut b.expr, order)),
+            None => Ok(()),
+        }
+    }
+    fn body(b: &mut ast::SetExpr, order: &[usize]) -> Result<(), String> {
+        use ast::SetQuantifier as Q;
+        match b {
+            ast::SetExpr::Select(s) => select(s, order),
+            ast::SetExpr::Query(q) => query(q, order),
+            ast::SetExpr::SetOperation { set_quantifier: Q::ByName | Q::AllByName | Q::DistinctByName, .. } => Err("its branches are matched BY NAME, in the first one's order".into()),
+            ast::SetExpr::SetOperation { left, right, .. } => body(left, order).and_then(|_| body(right, order)),
+            ast::SetExpr::Values(v) => v.rows.iter_mut().try_for_each(|r| put(&mut r.content, order)),
+            _ => Err("its query isn't a SELECT".into()),
+        }
+    }
+    fn select(s: &mut ast::Select, order: &[usize]) -> Result<(), String> {
+        let star = |i: &ast::SelectItem| matches!(i, ast::SelectItem::Wildcard(_) | ast::SelectItem::QualifiedWildcard(..));
+        if s.exclude.is_some() || s.projection.iter().any(|i| matches!(i, ast::SelectItem::ExprWithAliases { .. })) {
+            return Err("its SELECT list doesn't name one column an item".into());
+        }
+        if s.projection.iter().any(star) {
+            // (`SELECT * FROM (subquery) [AS] x [(names)]`: the subquery's outputs are its outputs, as it lists them)
+            let plain = |o: &ast::WildcardAdditionalOptions| o.opt_ilike.is_none() && o.opt_exclude.is_none() && o.opt_except.is_none() && o.opt_replace.is_none() && o.opt_rename.is_none();
+            let one = matches!(s.projection.as_slice(), [ast::SelectItem::Wildcard(o)] if plain(o)) && s.from.len() == 1 && s.from[0].joins.is_empty();
+            let Some(ast::TableFactor::Derived { subquery, alias, .. }) = s.from.first_mut().map(|f| &mut f.relation).filter(|_| one) else {
+                return Err("its `*` lists the columns of what it reads, in their order".into());
+            };
+            query(subquery, order)?;
+            if let Some(a) = alias.as_mut().filter(|a| !a.columns.is_empty()) {
+                put(&mut a.columns, order)?;
+            }
+        } else {
+            put(&mut s.projection, order)?;
+        }
+        match &mut s.group_by {
+            ast::GroupByExpr::Expressions(by, _) => by.iter_mut().try_for_each(|e| place(e, order)),
+            ast::GroupByExpr::All(_) => Ok(()), // (every column that isn't an aggregate: the same set in any order)
+        }
+    }
+    /// `items` in `order`: as many as there are outputs, or it isn't one item a column.
+    fn put<T: Clone>(items: &mut Vec<T>, order: &[usize]) -> Result<(), String> {
+        if items.len() != order.len() {
+            return Err("its SELECT list doesn't name one column an item".into());
+        }
+        *items = order.iter().map(|&i| items[i].clone()).collect();
+        Ok(())
+    }
+    /// An output named by its place (`ORDER BY 2`): the place it has now.
+    fn place(e: &mut ast::Expr, order: &[usize]) -> Result<(), String> {
+        if let ast::Expr::Value(v) = e {
+            if let ast::Value::Number(n, _) = &mut v.value {
+                if let Some(was) = n.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).filter(|&n| n < order.len()) {
+                    *n = (order.iter().position(|&i| i == was).expect("a permutation") + 1).to_string();
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -168,6 +255,29 @@ mod tests {
         assert!(check_reads("abs(t.m) < 3", "m"));
         assert!(!check_reads("nm > 0", "m"));
         assert!(!check_reads("'m' <> name", "m"));
+    }
+
+    #[test]
+    fn a_views_outputs_move_with_what_names_them_by_place() {
+        use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+        let read = |sql: &str| Parser::new(&GenericDialect {}).try_with_sql(sql).and_then(|mut p| p.parse_query()).unwrap().to_string();
+        for (sql, order, want) in [
+            ("SELECT a, b AS x, c + 1 FROM t", vec![2, 0, 1], "SELECT c + 1, a, b AS x FROM t"),
+            ("SELECT a, b, count(*) FROM t GROUP BY 1, 2 ORDER BY 3 DESC, 1 LIMIT 5", vec![2, 0, 1], "SELECT count(*), a, b FROM t GROUP BY 2, 3 ORDER BY 1 DESC, 2 LIMIT 5"),
+            ("SELECT a, b FROM t UNION ALL SELECT c, d FROM u ORDER BY 2", vec![1, 0], "SELECT b, a FROM t UNION ALL SELECT d, c FROM u ORDER BY 1"),
+            ("SELECT a, b FROM t EXCEPT (SELECT c, d FROM u)", vec![1, 0], "SELECT b, a FROM t EXCEPT (SELECT d, c FROM u)"),
+            ("VALUES (1, 'x'), (2, 'y')", vec![1, 0], "VALUES ('x', 1), ('y', 2)"),
+            ("SELECT * FROM (VALUES (1, 'x')) AS v (n, s)", vec![1, 0], "SELECT * FROM (VALUES ('x', 1)) AS v (s, n)"),
+            ("SELECT * FROM (SELECT a, b FROM t ORDER BY 1) AS s", vec![1, 0], "SELECT * FROM (SELECT b, a FROM t ORDER BY 2) AS s"),
+            ("WITH w AS (SELECT * FROM t) SELECT a, b FROM w GROUP BY ALL", vec![1, 0], "WITH w AS (SELECT * FROM t) SELECT b, a FROM w GROUP BY ALL"),
+            ("SELECT a, b FROM t ORDER BY a + 1, 9", vec![1, 0], "SELECT b, a FROM t ORDER BY a + 1, 9"),
+        ] {
+            assert_eq!(moved(sql, &order).as_deref(), Ok(read(want).as_str()), "{sql}");
+        }
+        for sql in ["SELECT * FROM t", "SELECT a, * FROM t", "SELECT t.* FROM t", "SELECT a, b FROM t ORDER BY ALL", "SELECT a, b FROM t ORDER BY ALL DESC LIMIT 2", "SELECT * FROM (SELECT a, b FROM t ORDER BY all) s", "SELECT a, b FROM t UNION BY NAME SELECT b, a FROM u",
+            "SELECT * EXCLUDE (c) FROM (SELECT a, b, c FROM t) s", "SELECT * FROM (SELECT a FROM t) x JOIN (SELECT b FROM u) y ON true", "SELECT a FROM t", "INSERT INTO t VALUES (1, 2)"] {
+            assert!(moved(sql, &[1, 0]).is_err(), "{sql}");
+        }
     }
 
     #[test]

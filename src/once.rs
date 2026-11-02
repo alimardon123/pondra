@@ -72,7 +72,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     let (select, mut stmt) = select(sql)?;
     if let Some((time, gap_secs, rest)) = session(&select, &mut stmt)? {
         let s = Sessions { time, gap_secs, lateness_secs: o.lateness_secs, keys: vec![], idle_secs: o.idle_secs };
-        return Box::pin(crate::views::create(lake, name, &rest, Options { sessions: Some(s), ..Default::default() })).await;
+        return Box::pin(crate::views::made(lake, name, &rest, &rest, Options { sessions: Some(s), from: o.from.clone(), ..Default::default() })).await; // (its `from` in its one commit: `create` won't write it again)
     }
     if let Some(v) = lake.cat.get::<View>(&crate::views::view_key(&open(name))).await? {
         ensure!(v.once.is_some(), "view {name} already exists");
@@ -83,7 +83,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?.logical();
     let (column, time, bucket) = window(&select, &src)?;
     let once = Once { into: name.to_string(), column, time, bucket, lateness_secs: o.lateness_secs, idle_secs: o.idle_secs };
-    Box::pin(crate::views::create(lake, &open(name), sql, Options { keep: Some(once), ..Default::default() })).await
+    Box::pin(crate::views::made(lake, &open(name), sql, sql, Options { keep: Some(once), from: o.from.clone(), ..Default::default() })).await // (its `from` in its one commit: `create` won't write it again)
 }
 
 /// The query's one SELECT, parsed.

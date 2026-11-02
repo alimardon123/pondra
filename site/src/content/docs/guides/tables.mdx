@@ -306,6 +306,22 @@ A view that reads the table with a `*` lists the new order too. A move is refuse
 view reads the table with a `*`, because its rows keep the order they were made in: name the columns in
 its query first.
 
+Views take the same words. `ALTER VIEW v ALTER COLUMN c FIRST` writes the view's query with its columns
+in the new order, and `ALTER MATERIALIZED VIEW` does the same and keeps the view's rows. `SHOW CREATE`
+gives the query as it now reads:
+
+```sql
+CREATE MATERIALIZED VIEW per_site AS
+  SELECT site, avg(celsius) AS mean, count(*) AS n FROM readings GROUP BY site;
+ALTER MATERIALIZED VIEW per_site ALTER COLUMN n AFTER site;
+SHOW CREATE MATERIALIZED VIEW per_site;
+```
+
+```text
+CREATE MATERIALIZED VIEW per_site AS
+SELECT site, count(*) AS n, avg(celsius) AS mean FROM readings GROUP BY site
+```
+
 `CLUSTER BY` changes how files are sorted, `SET` changes a table's options (`publish`, `retention`),
 and on keyed tables `TTL` and `SEQUENCE BY` change too. Files written from then on follow them.
 

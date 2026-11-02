@@ -135,7 +135,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
             inner: open.inner.clone(),
             outer: open.outer.clone(),
         }),
-        from: vec![],
+        from: o.from.clone(),
     };
     let mut puts = vec![
         (table_key(name), json(&view_meta)),

@@ -87,8 +87,8 @@ pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, 
 async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job: &str, replace: bool) -> Result<Value> {
     let app = format!("pondra:{job}");
     let log = read_delta::replay(lake, root, None).await?;
-    if log.txns.contains(&app) {
-        return Ok(json!({"duplicate": true}));
+    if let Some(&v) = log.txns.get(&app) {
+        return delta_duplicate(lake, root, &app, v).await;
     }
     delta_writable(root, &log)?;
     let (columns, partitions, mapped) = read_delta::schema(root, &log.metadata)?;
@@ -118,6 +118,7 @@ async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job:
     let keep: Vec<usize> = (0..target.len()).filter(|i| !partition_at.contains(i)).collect();
     let written = write_files(lake, root, "", df, Arc::new(Schema::new(file_fields)), &keep, &parts).await?;
     let rows: u64 = written.iter().map(|w| w.rows).sum();
+    let bytes: u64 = written.iter().map(|w| w.bytes).sum();
     let now = crate::log::now_ms();
     let adds: Vec<Value> = written.iter().map(|w| json!({"add": {
         "path": uri_escape(&w.path), "partitionValues": w.values, "size": w.bytes, "modificationTime": now, "dataChange": true, "stats": delta_stats(w).to_string(),
@@ -127,7 +128,8 @@ async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job:
     loop {
         let mode = if replace { "Overwrite" } else { "Append" };
         let mut info = json!({"timestamp": now, "operation": "WRITE", "operationParameters": {"mode": mode, "partitionBy": serde_json::to_string(&partitions)?},
-                              "isBlindAppend": !replace, "engineInfo": format!("Pondra/{}", env!("CARGO_PKG_VERSION")), "txnId": uuid::Uuid::new_v4().to_string()});
+                              "isBlindAppend": !replace, "engineInfo": format!("Pondra/{}", env!("CARGO_PKG_VERSION")), "txnId": uuid::Uuid::new_v4().to_string(),
+                              "operationMetrics": {"numFiles": written.len().to_string(), "numOutputRows": rows.to_string(), "numOutputBytes": bytes.to_string()}});
         if last.metadata["configuration"]["delta.enableInCommitTimestamps"].as_str() == Some("true") {
             info["inCommitTimestamp"] = json!(now.max(previous_ict(lake, root, version - 1).await? + 1)); // (its commits' times only grow)
         }
@@ -146,8 +148,8 @@ async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job:
             false => {
                 // Another writer took this version: after it, unless it changed what we wrote for.
                 let newer = read_delta::replay(lake, root, None).await?;
-                if newer.txns.contains(&app) {
-                    return Ok(json!({"duplicate": true}));
+                if let Some(&v) = newer.txns.get(&app) {
+                    return delta_duplicate(lake, root, &app, v).await;
                 }
                 ensure!(newer.metadata["schemaString"] == last.metadata["schemaString"] && newer.metadata["partitionColumns"] == last.metadata["partitionColumns"] && newer.protocol == last.protocol,
                         "{root}: the table's schema or protocol changed while this INSERT wrote: run it again");
@@ -156,6 +158,31 @@ async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job:
             }
         }
     }
+}
+
+/// The answer to a job whose commit is in the log at `version`: its rows as that commit wrote them, so a retry's `COPY n` is
+/// the rows its committed try wrote. A checkpoint names a txn's version only as the checkpoint's own, so the commit there is
+/// read only if it holds this job's txn; `rows` is left out (not 0) when it can't be read.
+async fn delta_duplicate(lake: &Lake, root: &str, app: &str, version: u64) -> Result<Value> {
+    let actions = read_delta::commit_at(lake, root, version).await?.unwrap_or_default();
+    let rows = actions.iter().any(|a| a["txn"]["appId"].as_str() == Some(app)).then(|| commit_rows(&actions)).flatten();
+    Ok(match rows {
+        Some(rows) => json!({"rows": rows, "version": version, "duplicate": true}),
+        None => json!({"version": version, "duplicate": true}),
+    })
+}
+
+/// A commit's rows: its commitInfo's `operationMetrics.numOutputRows` (Delta writes it as text), else the sum of its adds'
+/// `stats.numRecords` (stats is JSON text). None if neither is there.
+fn commit_rows(actions: &[Value]) -> Option<u64> {
+    let info = actions.iter().find_map(|a| a.get("commitInfo"));
+    let written = info.and_then(|i| i["operationMetrics"]["numOutputRows"].as_str()?.parse::<u64>().ok());
+    written.or_else(|| {
+        actions.iter().filter_map(|a| a.get("add")).map(|add| {
+            let stats: Value = serde_json::from_str(add["stats"].as_str()?).ok()?;
+            stats["numRecords"].as_u64()
+        }).sum::<Option<u64>>()
+    })
 }
 
 /// Refuse a table whose writers must do what isn't done here.
@@ -379,8 +406,8 @@ pub async fn iceberg(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion:
 async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::prelude::DataFrame, job: &str, replace: bool, mut at: String, mut meta: Value) -> Result<Value> {
     let url = spec.urls[0].trim_end_matches('/');
     let rest = spec.options.contains_key("namespace");
-    if done(&meta, job) {
-        return Ok(json!({"duplicate": true}));
+    if let Some(s) = done(&meta, job) {
+        return Ok(iceberg_duplicate(s));
     }
     let format = meta["format-version"].as_i64().unwrap_or(1);
     ensure!(format == 2, "{url}: Iceberg format v{format} tables aren't written yet (v2 are)");
@@ -480,14 +507,23 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
         }
         // Another writer committed first: on top of theirs (our files stay; the lists are new).
         (at, meta, _) = crate::read_iceberg::current(lake, url, &spec.options).await?;
-        if done(&meta, job) {
-            return Ok(json!({"duplicate": true}));
+        if let Some(s) = done(&meta, job) {
+            return Ok(iceberg_duplicate(s));
         }
     }
 }
 
-/// Has this job's snapshot been committed?
-fn done(meta: &Value, job: &str) -> bool { meta["snapshots"].as_array().into_iter().flatten().any(|s| s["summary"]["pondra.job"].as_str() == Some(job)) }
+/// The snapshot this job's commit made, if it is committed.
+fn done<'a>(meta: &'a Value, job: &str) -> Option<&'a Value> { meta["snapshots"].as_array().into_iter().flatten().find(|s| s["summary"]["pondra.job"].as_str() == Some(job)) }
+
+/// The answer to a job whose snapshot is committed: the snapshot, and the rows it added (its summary's `added-records`).
+fn iceberg_duplicate(s: &Value) -> Value {
+    let mut out = json!({"snapshot": s["snapshot-id"], "duplicate": true});
+    if let Some(rows) = s["summary"]["added-records"].as_str().and_then(|r| r.parse::<u64>().ok()) {
+        out["rows"] = json!(rows);
+    }
+    out
+}
 
 fn push(v: &mut Value, key: &str, item: Value) {
     match v[key].as_array_mut() {

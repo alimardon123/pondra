@@ -482,11 +482,11 @@ impl App {
             return crate::ddl::settle(&self.lake, d).await;
         }
         let tasks = async {
+            // (a failing turn backs off as a node's view runs do, 1 s doubling to 30 s, and its error is logged once)
+            let mut failed = crate::views::Failures::default();
             loop {
-                if let Err(e) = self.keep_views().await {
-                    eprintln!("keeping views failed: {e:#}");
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                failed.note("keeping views", self.keep_views().await.err().map(|e| format!("{e:#}")));
+                tokio::time::sleep(failed.backoff().max(std::time::Duration::from_millis(20))).await;
             }
         };
         tokio::select! {

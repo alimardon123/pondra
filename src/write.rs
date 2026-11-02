@@ -984,13 +984,19 @@ fn place(p: &ast::MySQLColumnPosition) -> crate::ddl::Place {
 }
 
 /// `ALTER TABLE t ALTER [COLUMN] c FIRST | AFTER b` (Databricks' and MySQL's words; sqlparser has none): where SQL lists
-/// `c` (`ddl::place_column`). None: not this statement.
+/// `c` (`ddl::place_column`); the same of a view and a materialized view (`ddl::place_view_column`). None: not this statement.
 fn placed(sql: &str) -> Option<Stmt> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
     let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
-    if !p.parse_keywords(&[Keyword::ALTER, Keyword::TABLE]) {
+    if !p.parse_keyword(Keyword::ALTER) {
         return None;
     }
+    let view = match () {
+        _ if p.parse_keyword(Keyword::TABLE) => None,
+        _ if p.parse_keyword(Keyword::VIEW) => Some(false),
+        _ if p.parse_keywords(&[Keyword::MATERIALIZED, Keyword::VIEW]) => Some(true),
+        _ => return None,
+    };
     let table = p.parse_object_name(false).ok()?;
     if !p.parse_keyword(Keyword::ALTER) {
         return None;
@@ -1002,7 +1008,11 @@ fn placed(sql: &str) -> Option<Stmt> {
         _ => crate::ddl::Place::After(ident(&p.parse_identifier().ok()?)),
     };
     while p.consume_token(&Token::SemiColon) {}
-    (p.peek_token().token == Token::EOF).then(|| Stmt::Ddl(vec![crate::ddl::Ddl::AlterColumn { table: object(&table), column: ident(&column), change: crate::ddl::Change::Place(place) }]))
+    let ddl = match view {
+        None => crate::ddl::Ddl::AlterColumn { table: object(&table), column: ident(&column), change: crate::ddl::Change::Place(place) },
+        Some(materialized) => crate::ddl::Ddl::PlaceViewColumn { view: object(&table), column: ident(&column), place, materialized },
+    };
+    (p.peek_token().token == Token::EOF).then(|| Stmt::Ddl(vec![ddl]))
 }
 
 /// `ALTER TABLE t ADD COLUMN c TYPE`: the table's definition with the new column at the end, sent
