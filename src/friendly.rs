@@ -91,9 +91,21 @@ pub fn text(sql: &str) -> Result<Cow<'_, str>> {
     }
     let mut s = statements(sql)?.unwrap_or_else(|| sql.to_string());
     s = comprehensions(&s)?;
-    for pass in [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias] {
-        if let Some(t) = Tokens::of(&s) {
-            s = t.edit(pass(&t)?);
+    // (each pass reads the text as the passes before it left it, tokenized again only after one of them changed it: a
+    // `top` that is only a word in a string costs one tokenize, audit 11-02 L13)
+    let passes = [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias];
+    let mut next = 0;
+    while next < passes.len() {
+        let Some(t) = Tokens::of(&s) else { break };
+        let mut edited = None;
+        while edited.is_none() && next < passes.len() {
+            let edits = passes[next](&t)?;
+            next += 1;
+            edited = (!edits.is_empty()).then(|| t.edit(edits));
+        }
+        match edited {
+            Some(e) => s = e,
+            None => break,
         }
     }
     Ok(Cow::Owned(s))
