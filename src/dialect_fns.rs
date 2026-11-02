@@ -16,6 +16,7 @@
 //! Server's `FORMAT(value, 'pattern')`, which Postgres's `format` takes the other way round.
 use crate::friendly::{part_word, quote};
 use anyhow::Result;
+use std::sync::LazyLock;
 use datafusion::sql::sqlparser::ast::{Expr, Value, ValueWithSpan};
 
 /// Other databases' functions Pondra doesn't have, as (name, whose, what to write). `call` refuses each by name, and
@@ -44,6 +45,11 @@ pub fn call(name: &str, a: &[&Expr]) -> Result<Option<String>> {
         return Err(crate::codes::coded("42883", format!("{} is {whose}'s: write {ours}", name.to_uppercase())));
     }
     let epoch = |x: &Expr| format!("date_part('epoch', {x})");
+    // (a moment as whole microseconds since 1970, exactly: its minute's epoch is a whole number a Float64 holds, and
+    // the microseconds within the minute an integer; `epoch(x) * 1000000` is a Float64 one step of which is 0.24 µs)
+    let micros = |x: &str| format!("(CAST(date_part('epoch', date_trunc('minute', {x})) AS BIGINT) * 1000000 + CAST(date_part('microsecond', {x}) AS BIGINT))");
+    // (BigQuery's WEEK is WEEK(SUNDAY): the Sunday on or before, at midnight)
+    let sunday = |x: &Expr| format!("date_trunc('day', {x}) - CAST(date_part('dow', {x}) AS BIGINT) * INTERVAL '1 day'");
     Ok(Some(match (name, a.len()) {
         ("iff" | "iif", 3) => format!("CASE WHEN {} THEN {} ELSE {} END", a[0], a[1], a[2]),
         ("zeroifnull", 1) => format!("coalesce({}, 0)", a[0]),
@@ -67,7 +73,13 @@ pub fn call(name: &str, a: &[&Expr]) -> Result<Option<String>> {
             None => return Ok(None),
             Some("weekday" | "dw") => format!("CAST(date_part('dow', {}) + 1 AS INT)", a[1]), // (1 is Sunday, as SQL Server's default)
             Some("dayofyear" | "dy") => format!("CAST(date_part('doy', {}) AS INT)", a[1]),
+            Some("isowk" | "isoww" | "iso_week") => format!("CAST(date_part('week', {}) AS INT)", a[1]),
             Some(_) => match part_word(a[0], name)? {
+                // (SQL Server's weeks start on Sunday, 1 January in week 1; ISO's, `date_part('week')`, on Monday)
+                Some("week") => format!("CAST((CAST(date_part('doy', {0}) AS BIGINT) + CAST(date_part('dow', date_trunc('year', {0})) AS BIGINT) + 6) / 7 AS INT)", a[1]),
+                // (the milliseconds or microseconds within the second; `date_part`'s count the seconds too)
+                Some("millisecond") => format!("CAST(CAST(date_part('millisecond', {}) AS BIGINT) % 1000 AS INT)", a[1]),
+                Some("microsecond") => format!("CAST(CAST(date_part('microsecond', {}) AS BIGINT) % 1000000 AS INT)", a[1]),
                 Some(p) => format!("CAST(date_part('{p}', {}) AS INT)", a[1]),
                 None => return Ok(None),
             },
@@ -81,10 +93,19 @@ pub fn call(name: &str, a: &[&Expr]) -> Result<Option<String>> {
             let (chrono, time) = mysql_format(f)?;
             format!("{}({}, {})", if time { "to_timestamp" } else { "to_date" }, a[0], quote(&chrono))
         }
-        // (a format with a `%` is MySQL's, else Spark's; a column of formats is DataFusion's. A format with no code in it
-        // (only literal text, as `'''Q'''`) is that text, not Pondra's `to_char` template, where Q is a quarter)
+        // (`date_format` is DataFusion's own name for `to_char`, with chrono's codes: a format with `%` is MySQL's only when
+        // it holds MySQL's `%i` (minutes), which chrono hasn't; one with a code the two read apart is refused, and one with
+        // only codes they share is DataFusion's, as written. With no `%` it is Spark's; a column of formats is DataFusion's.
+        // A format with no code in it (only literal text, as `'''Q'''`) is that text, not Pondra's `to_char` template, where
+        // Q is a quarter)
         ("date_format", 2) => {
             let Some(f) = string(a[1]) else { return Ok(None) };
+            if f.contains('%') && !mysqls(f) {
+                return match apart(f) {
+                    Some(k) => Err(crate::codes::coded("22023", format!("date_format(ts, '{f}'): %{k} is one thing in MySQL's DATE_FORMAT and another in DataFusion's date_format (chrono's codes), so it isn't guessed: write strftime(ts, '…') with DuckDB's codes (%M the minutes, %B a month's name, %S the seconds, %A a weekday's name)"))),
+                    None => Ok(None),
+                };
+            }
             let chrono = if f.contains('%') { mysql_format(f)?.0 } else { java_format(f)? };
             if chrono.contains('%') {
                 format!("to_char({}, {})", a[0], quote(&chrono))
@@ -93,39 +114,50 @@ pub fn call(name: &str, a: &[&Expr]) -> Result<Option<String>> {
             }
         }
         // (SQL Server's FORMAT(value, pattern): a value first, a pattern second, where Postgres's format reads the pattern first)
-        ("format", 2) => match (string(a[0]), string(a[1])) {
-            (None, Some(p)) => return Err(crate::codes::coded("0A000", format!("FORMAT(value, '{p}') is SQL Server's (Postgres's format takes its pattern first): write strftime(ts, '%Y-%m-%d') or to_char(ts, 'YYYY-MM-DD') for a date, printf('%.2f', x) for a number"))),
+        // (only a pattern as SQL Server writes one, `'yyyy-MM-dd'` or `'N2'`, after a value that is no text of any kind:
+        // `format(E'%s\n', 'x')` and `format(pattern_col, 'x')` are Postgres's)
+        ("format", 2) => match (texts(a[0]), string(a[1])) {
+            (false, Some(p)) if dotnet(p) => return Err(crate::codes::coded("0A000", format!("FORMAT(value, '{p}') is SQL Server's (Postgres's format takes its pattern first): write strftime(ts, '%Y-%m-%d') or to_char(ts, 'YYYY-MM-DD') for a date, printf('%.2f', x) for a number"))),
             _ => return Ok(None),
         },
         ("timestampdiff", 3) => {
             return Err(crate::codes::coded("42883", format!("TIMESTAMPDIFF counts whole units in MySQL and part boundaries in Snowflake, so it isn't taken: date_diff('{}', {}, {}) counts the boundaries, as DuckDB does", a[0].to_string().to_lowercase(), a[1], a[2])));
         }
         ("countif", 1) => format!("count(CASE WHEN {} THEN 1 END)", a[0]),
-        ("safe_divide", 2) => format!("({}) / nullif({}, 0)", a[0], a[1]),
+        // (BigQuery divides integers into a FLOAT64, where Postgres's `/` keeps whole numbers)
+        ("safe_divide", 2) => format!("CAST({} AS DOUBLE) / nullif({}, 0)", a[0], a[1]),
         ("date", 1) => format!("CAST({} AS DATE)", a[0]),
         ("date", 3) => format!("make_date({}, {}, {})", a[0], a[1], a[2]),
         // (BigQuery's order, the part a word after the value; `date_trunc('month', d)` is Pondra's own)
         ("date_trunc", 2) if string(a[0]).is_none() => match bare_part(a[1]) {
-            Some(p) => format!("CAST(date_trunc('{p}', {}) AS DATE)", a[0]),
+            Some("week") => format!("CAST({} AS DATE)", sunday(a[0])),
+            Some(p) => format!("CAST(date_trunc('{}', {}) AS DATE)", iso(p), a[0]),
             None => return Ok(None),
         },
         ("timestamp_trunc" | "datetime_trunc", 2) => match bare_part(a[1]) {
-            Some(p) => format!("date_trunc('{p}', {})", a[0]),
+            Some("week") => sunday(a[0]),
+            Some(p) => format!("date_trunc('{}', {})", iso(p), a[0]),
             None => return Ok(None),
         },
-        // (BigQuery's: the whole parts from `b` to `a`, a day or shorter)
+        // (BigQuery's, a day or shorter: TIMESTAMP_DIFF the whole parts from `b` to `a` (a DAY is 24 hours),
+        // DATETIME_DIFF the part's boundaries crossed (559 days from 2008-12-25 15:30 to 2010-07-07 10:20), each in
+        // whole microseconds)
         ("timestamp_diff" | "datetime_diff", 3) => {
             let Some(p) = bare_part(a[2]) else { return Ok(None) };
             let scale = match p {
-                "day" => " / 86400",
-                "hour" => " / 3600",
-                "minute" => " / 60",
-                "second" => "",
-                "millisecond" => " * 1000",
-                "microsecond" => " * 1000000",
+                "day" => " / 86400000000",
+                "hour" => " / 3600000000",
+                "minute" => " / 60000000",
+                "second" => " / 1000000",
+                "millisecond" => " / 1000",
+                "microsecond" => "",
                 _ => return Ok(None),
             };
-            format!("CAST(trunc(({} - {}){scale}) AS BIGINT)", epoch(a[0]), epoch(a[1]))
+            let at = |x: &Expr| match name {
+                "datetime_diff" => micros(&format!("date_trunc('{p}', {x})")),
+                _ => micros(&x.to_string()),
+            };
+            format!("(({} - {}){scale})", at(a[0]), at(a[1]))
         }
         ("format_date" | "format_timestamp" | "format_datetime", 2) => format!("to_char({}, {})", a[1], a[0]),
         ("parse_date", 2) => format!("to_date({}, {})", a[1], a[0]),
@@ -152,6 +184,39 @@ fn word(e: &Expr) -> Option<String> {
     }
 }
 
+/// Is `e` text written in any of SQL's ways (`'…'`, `E'…'`, `$$…$$`, `N'…'`)?
+fn texts(e: &Expr) -> bool { matches!(e, Expr::Value(ValueWithSpan { value: v, .. }) if v.clone().into_string().is_some()) }
+
+/// Does `p` look like a pattern of .NET's, as SQL Server's FORMAT takes: a standard one (`N2`, `C`, `X`; a lower-case
+/// letter alone, as `'x'`, is a value as likely), or one made of a date's or a number's placeholders (`yyyy-MM-dd`,
+/// `#,##0.00`)?
+fn dotnet(p: &str) -> bool {
+    static STANDARD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^(?:[CDEFGNPRX]\d{0,2}|[cdefgnprx]\d{1,2})$").expect("a regex"));
+    static CUSTOM: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"yy|MM|dd|HH|hh|mm|ss|#|0[.,]0").expect("a regex"));
+    !p.contains('%') && (STANDARD.is_match(p) || CUSTOM.is_match(p))
+}
+
+/// The codes of a `%` format (`%%` is a `%`).
+fn codes(f: &str) -> impl Iterator<Item = char> + '_ {
+    let mut chars = f.chars();
+    std::iter::from_fn(move || loop {
+        match chars.next()? {
+            '%' => return chars.next(),
+            _ => continue,
+        }
+    })
+}
+
+/// Does a `%` format hold MySQL's own `%i` (its minutes), which chrono hasn't?
+fn mysqls(f: &str) -> bool { codes(f).any(|k| k == 'i') }
+
+/// A code a `%` format holds that MySQL's DATE_FORMAT and chrono read apart (`%M` a month's name or the minutes, `%s`
+/// the seconds or the epoch, …), if any.
+fn apart(f: &str) -> Option<char> { codes(f).find(|k| "MshWceklxvfDVXu".contains(*k)) }
+
+/// The part `date_trunc` takes for one of BigQuery's: ISOWEEK is ISO's week, from Monday.
+fn iso(p: &str) -> &str { if p == "isoweek" { "week" } else { p } }
+
 /// A part written as BigQuery writes it, a whole bare word (`MONTH`; not `m` or `d`, which may be a column's name).
 fn bare_part(e: &Expr) -> Option<&'static str> {
     Some(match word(e)?.as_str() {
@@ -159,6 +224,7 @@ fn bare_part(e: &Expr) -> Option<&'static str> {
         "quarter" => "quarter",
         "month" => "month",
         "week" => "week",
+        "isoweek" => "isoweek",
         "day" => "day",
         "hour" => "hour",
         "minute" => "minute",
@@ -205,7 +271,7 @@ fn mysql_format(f: &str) -> Result<(String, bool)> {
             'a' => ("%a", false),
             'j' => ("%j", false),
             'U' => ("%U", false),
-            'u' => ("%W", false),
+            'u' => return Err(crate::codes::coded("22023", "MySQL's %u (weeks from Monday, week 1 the first with four days of the year, days before it week 0) isn't taken: write %v for ISO's week, with %x its year")),
             'v' => ("%V", false),
             'x' => ("%G", false),
             'w' => ("%w", false),
@@ -320,8 +386,12 @@ mod tests {
         assert_eq!(said("date_format(ts, fmt)"), None); // (a column of formats is DataFusion's)
         let refusal = try_said("date_format(ts, 'G')").unwrap_err();
         assert!(crate::codes::of(&refusal) == "22023" && refusal.to_string().contains("pattern letter G"), "{refusal:#}");
-        let refusal = try_said("DATE_FORMAT(ts, '%D')").unwrap_err();
+        let refusal = try_said("DATE_FORMAT(ts, '%D %i')").unwrap_err();
         assert!(crate::codes::of(&refusal) == "22023" && refusal.to_string().contains("MySQL's %D"), "{refusal:#}");
+        // (without MySQL's %i: a code the two read apart is refused, codes they share are DataFusion's as written)
+        let refusal = try_said("date_format(ts, '%Y %M')").unwrap_err();
+        assert!(crate::codes::of(&refusal) == "22023" && refusal.to_string().contains("%M is one thing"), "{refusal:#}");
+        assert_eq!(said("date_format(ts, '%Y-%m-%d %H:%S')"), None);
     }
 
     #[test]
@@ -330,6 +400,9 @@ mod tests {
         let refusal = try_said("format(ts, 'yyyy')").unwrap_err();
         assert!(crate::codes::of(&refusal) == "0A000" && refusal.to_string().contains("FORMAT(value, 'yyyy') is SQL Server's"), "{refusal:#}");
         assert_eq!(said("format('%s', x)"), None);
+        assert_eq!(said("format(E'%s\\n', 'x')"), None); // (Postgres's: its pattern an escaped string, or a column of them)
+        assert_eq!(said("format(pattern, 'x')"), None);
+        assert!(try_said("FORMAT(amount, 'N2')").is_err() && try_said("FORMAT(d, 'dd/MM/yyyy')").is_err());
         // (a name of OURS is refused by name, with what to write, whatever its arguments)
         let refusal = try_said("PARSE_JSON(p)").unwrap_err();
         assert!(crate::codes::of(&refusal) == "42883" && refusal.to_string().contains("PARSE_JSON is Snowflake's") && refusal.to_string().contains("payload->>'a'"), "{refusal:#}");
@@ -356,8 +429,18 @@ mod tests {
         assert_eq!(said("date_trunc(unit, d)"), None); // (a column of parts, and `d` a column)
         assert_eq!(said("datepart('month', d)"), None); // (Pondra's own)
         assert_eq!(said("FROM_UNIXTIME(n)"), None); // (Pondra's own)
-        assert_eq!(said("TIMESTAMP_DIFF(a, b, HOUR)").unwrap(), "CAST(trunc((date_part('epoch', a) - date_part('epoch', b)) / 3600) AS BIGINT)");
+        let us = |x: &str| format!("(CAST(date_part('epoch', date_trunc('minute', {x})) AS BIGINT) * 1000000 + CAST(date_part('microsecond', {x}) AS BIGINT))");
+        assert_eq!(said("TIMESTAMP_DIFF(a, b, HOUR)").unwrap(), format!("(({} - {}) / 3600000000)", us("a"), us("b")));
+        assert_eq!(said("TIMESTAMP_DIFF(a, b, MICROSECOND)").unwrap(), format!("(({} - {}))", us("a"), us("b")));
+        assert_eq!(said("DATETIME_DIFF(a, b, DAY)").unwrap(), format!("(({} - {}) / 86400000000)", us("date_trunc('day', a)"), us("date_trunc('day', b)")));
         assert_eq!(said("TIMESTAMP_DIFF(a, b, MONTH)"), None);
+        assert_eq!(said("SAFE_DIVIDE(clicks, views)").unwrap(), "CAST(clicks AS DOUBLE) / nullif(views, 0)");
+        assert_eq!(said("DATEPART(week, d)").unwrap(), "CAST((CAST(date_part('doy', d) AS BIGINT) + CAST(date_part('dow', date_trunc('year', d)) AS BIGINT) + 6) / 7 AS INT)");
+        assert_eq!(said("DATEPART(isowk, d)").unwrap(), "CAST(date_part('week', d) AS INT)");
+        assert_eq!(said("DATEPART(ms, d)").unwrap(), "CAST(CAST(date_part('millisecond', d) AS BIGINT) % 1000 AS INT)");
+        assert_eq!(said("TIMESTAMP_TRUNC(ts, WEEK)").unwrap(), "date_trunc('day', ts) - CAST(date_part('dow', ts) AS BIGINT) * INTERVAL '1 day'");
+        assert_eq!(said("DATE_TRUNC(d, ISOWEEK)").unwrap(), "CAST(date_trunc('week', d) AS DATE)");
+        assert_eq!(crate::codes::of(&try_said("DATE_FORMAT(d, '%u')").unwrap_err()), "22023");
         assert_eq!(said("COUNTIF(s = 'paid')").unwrap(), "count(CASE WHEN s = 'paid' THEN 1 END)");
         assert!(call("timestampdiff", &[&Expr::Identifier("hour".into()), &Expr::Identifier("a".into()), &Expr::Identifier("b".into())]).unwrap_err().to_string().contains("date_diff('hour', a, b)"));
     }

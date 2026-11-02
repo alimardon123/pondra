@@ -554,7 +554,8 @@ pub(crate) fn is_query(body: &str) -> bool {
 
 pub(crate) struct Expander<'a> {
     pub(crate) name: &'a str, // (this lake's name: three-part names)
-    pub(crate) all: &'a HashMap<String, Routine>,
+    pub(crate) all: &'a HashMap<String, Routine>, // (what this text calls: a statement's own, the session's temporary functions too)
+    pub(crate) lake: &'a HashMap<String, Routine>, // (the lake's own: what a lake function's body calls, `front::Routines`)
     pub(crate) views: &'a HashMap<String, String>, // (a request's own: `FROM name` is its query)
     pub(crate) outside: &'a [(String, crate::ext_names::Attached)], // other engines' tables attached (`ext.rs`)
     pub(crate) depth: usize,
@@ -693,7 +694,9 @@ impl<'a> Expander<'a> {
             }
             ControlFlow::<()>::Continue(())
         });
-        if let ControlFlow::Break(e) = crate::walk::visit_mut(&mut body, &mut Expander { depth: self.depth + 1, scopes: self.scopes.clone(), ..*self }) {
+        // (a lake function's body calls the lake's functions, whatever the session made: one of its own calls its own too)
+        let all = if std::ptr::eq(self.all, self.lake) || self.lake.get(name) == Some(r) { self.lake } else { self.all };
+        if let ControlFlow::Break(e) = crate::walk::visit_mut(&mut body, &mut Expander { all, depth: self.depth + 1, scopes: self.scopes.clone(), ..*self }) {
             return Err(e);
         }
         // (a body calling functions several times grows as theirs do: four calls, ten deep, are a
