@@ -223,7 +223,13 @@ pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes
     let root: TypePtr = Arc::new(Node::group_type_builder("schema").with_fields(ours).build()?);
     let our_descr = SchemaDescriptor::new(root.clone());
     let reader = Arc::new(Piece { from: cut.bytes.start, bytes: piece });
-    let mut w = SerializedFileWriter::new(Vec::with_capacity(len + (1 << 20)), root, Arc::new(props.build()))?;
+    // (recompressed chunks: about `kept_size`; the system columns: ids of a few bits each, versions and times one value a
+    // column, squeezed by the codec)
+    let size = (cut.groups.clone().flat_map(|g| md.row_group(g).columns().iter().map(|c| kept_size(c, to))).sum::<u64>() as usize).max(len);
+    let all: usize = cut.groups.clone().map(|g| md.row_group(g).num_rows() as usize).sum();
+    let sys_room = if sys.is_some() { all / 4 + (64 << 10) } else { 0 };
+    let cap = size + size / 8 + room(size) + sys_room;
+    let mut w = SerializedFileWriter::new(Vec::with_capacity(size + room(size) + sys_room), root, Arc::new(props.build()))?;
     let mut rows = 0u64;
     for g in cut.groups.clone() {
         let rg = md.row_group(g);
@@ -252,12 +258,19 @@ pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes
     }
     let footer = w.finish()?;
     let bytes = std::mem::take(w.inner_mut());
-    // (recompressed chunks: about `kept_size`; the system columns: ids of a few bits each, versions and times one value a
-    // column, squeezed by the codec)
-    let size = (cut.groups.clone().flat_map(|g| md.row_group(g).columns().iter().map(|c| kept_size(c, to))).sum::<u64>() as usize).max(len);
-    let cap = size + size / 8 + room(size) + if sys.is_some() { rows as usize / 4 + (64 << 10) } else { 0 };
     ensure!(bytes.len() <= cap, "the kept file is {} bytes, over the {cap} its {len} bytes leave room for", bytes.len());
-    Ok(Kept { bytes: Bytes::from(bytes), footer, rows })
+    Ok(Kept { bytes: Bytes::from(fit(bytes)), footer, rows })
+}
+
+/// A file's bytes in an allocation of their own size. A buffer that grew past its first guess holds up to twice its
+/// bytes, and a lake in memory keeps a file's `Bytes` as they come, allocation and all: a page's wasm32 memory, whose
+/// 4 GB the pages it never touched count toward too. (TPC-H SF1's Snappy cuts come out 1.3 to 1.8 MB bigger in LZ4
+/// with their system columns: past the old guess of their own size and 1 MB, so each buffer doubled.)
+fn fit(mut bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.capacity() - bytes.len() > bytes.len() / 64 {
+        bytes.shrink_to_fit();
+    }
+    bytes
 }
 
 /// Every cut of a whole file that `plan` allows, copied (tests, and a file already in memory). `Ok(Err(why))` when the
@@ -310,7 +323,7 @@ fn squeeze(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaData, 
         })
     };
     let mut pages = SerializedPageReader::new(reader, src, md.row_group(g).num_rows() as usize, None)?;
-    let mut sink = TrackedWrite::new(Vec::with_capacity(src.compressed_size().max(0) as usize + (64 << 10)));
+    let mut sink = TrackedWrite::new(Vec::with_capacity(kept_size(src, to) as usize + (64 << 10)));
     let mut specs = Vec::new();
     {
         let mut w = SerializedPageWriter::new(&mut sink);
@@ -609,6 +622,20 @@ mod tests {
                 assert!(rg.column(c).statistics().is_some_and(|s| s.min_bytes_opt().is_some()), "column {c}'s range");
             }
         }
+    }
+
+    #[test]
+    fn a_kept_file_holds_no_more_memory_than_its_bytes() {
+        // (a buffer that grew past its guess: twice its bytes, until `fit`)
+        let mut grown = Vec::with_capacity(1000);
+        grown.extend(std::iter::repeat_n(7u8, 1001));
+        assert!(grown.capacity() >= 2000);
+        let fitted = fit(grown);
+        assert_eq!((fitted.len(), fitted.capacity()), (1001, 1001));
+        // (a little slack is left alone: no copy for it)
+        let mut close = Vec::with_capacity(1010);
+        close.extend(std::iter::repeat_n(7u8, 1000));
+        assert_eq!(fit(close).capacity(), 1010);
     }
 
     /// A source with no offset index (pyarrow's default): its kept file has none either, the system columns' included
