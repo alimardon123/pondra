@@ -72,15 +72,21 @@ async fn attempt(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str,
     if listed.files.iter().any(|f| !f.part.is_empty() || f.outside.is_some()) {
         return Ok(Err("a file in a folder of partitions, or another engine's".into()));
     }
-    // Every file planned from its footer before any is copied.
+    // Every file planned from its footer before any is copied, in cuts (a kept file each) of a share of the whole, so the
+    // copies keep every core busy: a load of one 230 MB file in two cuts used two cores. A share is at most `FILE_BYTES`
+    // and at least `SHARE_FLOOR`; a file whose row groups don't fit a share's file is cut at `FILE_BYTES`.
     let schema = answer::schema(&meta.columns)?;
+    let at_once = copies(target);
+    let total: u64 = listed.files.iter().map(|f| f.bytes).sum();
+    let share = usize::try_from(total / at_once as u64).unwrap_or(usize::MAX).clamp(SHARE_FLOOR, tier::FILE_BYTES);
     let limits = Limits { file: tier::FILE_BYTES, group: tier::ROW_GROUP_BYTES };
+    let shared = Limits { file: share, ..limits };
     let mut jobs = vec![];
     for f in &listed.files {
         let (store, location) = ext::store(query, &f.path).await?;
         let object = ObjectMeta { location: location.clone(), last_modified: Default::default(), size: f.bytes, e_tag: None, version: None };
         let md = DFParquetMetadata::new(store.as_ref(), &object).with_page_index_policy(Some(PageIndexPolicy::Optional)).fetch_metadata().await.with_context(|| format!("{}: its Parquet footer", f.path))?;
-        let cuts = match keep_parquet::plan(&md, &schema, &limits) {
+        let cuts = match keep_parquet::plan(&md, &schema, &shared).or_else(|_| keep_parquet::plan(&md, &schema, &limits)) {
             Ok(cuts) => cuts,
             Err(why) => return Ok(Err(why)),
         };
@@ -97,11 +103,25 @@ async fn attempt(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str,
         next += j.cut.groups.clone().map(|g| j.md.row_group(g).num_rows() as u64).sum::<u64>();
         Sys { first, version: stamp.version as i64, at_us: (stamp.ms * 1000) as i64 }
     }).collect();
-    // Then each cut is copied, at most two at a time, in order.
+    // Then each cut is copied, `at_once` at a time, in order.
     let folder = meta.folder(table).to_string();
-    let files = futures::stream::iter(jobs.into_iter().zip(sys)).map(|(cut, sys)| copy_one(target, &folder, schema.clone(), cut, sys)).buffered(2).try_collect::<Vec<DataFile>>().await?;
+    let files = futures::stream::iter(jobs.into_iter().zip(sys)).map(|(cut, sys)| copy_one(target, &folder, schema.clone(), cut, sys)).buffered(at_once).try_collect::<Vec<DataFile>>().await?;
     let columns = meta.live().map(|(s, _, t)| Ok((s.to_string(), answer::dtype(t)?.to_string()))).collect::<Result<Vec<_>>>()?;
     Ok(Ok(Files::new(table, job, columns, files)))
+}
+
+/// The smallest share of a load a cut is made (`attempt`): a file of a few row groups is one cut.
+const SHARE_FLOOR: usize = 32 << 20;
+
+/// How many cuts are copied at once: one a core, each holding its piece of the source and the file kept of it (up to
+/// `FILE_BYTES` each, as both are), within a quarter of the query memory, and at least two (`PONDRA_KEEP_AT_ONCE` for a
+/// test: the copies' speed against their number).
+fn copies(target: &Lake) -> usize {
+    if let Some(n) = crate::env::parse::<usize>("PONDRA_KEEP_AT_ONCE") {
+        return n.max(1);
+    }
+    let (_, memory) = target.memory();
+    crate::env::cores().min(memory / (8 * tier::FILE_BYTES)).max(2)
 }
 
 /// The name of the file a query is a bare scan of (`SELECT * FROM "ext:…"`, as `front::expand` writes `FROM 'f'`):
