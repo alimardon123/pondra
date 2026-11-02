@@ -107,14 +107,14 @@ UNINSTALL hello;
 ```
 
 Only an admin installs an extension, and only on a node started with
-`PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true`, since 1.0 checks no signatures; a node runs one only when it
+`PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true`, since Pondra checks no signatures yet; a node runs one only when it
 was started with it too. The lake keeps the file, so a cluster, a branch and a backup all carry it, and
 each node checks the file's hash as it loads it. A function name that another function already has is
 refused (`42723`). The full rules are in the [SQL reference](/pondra/sql/statements/).
 
 ## Logs and the clock
 
-An extension reaches only what Pondra offers it, and Pondra 1.0 offers two things:
+An extension reaches only what Pondra offers it, and Pondra 0.80 offers two things:
 
 ```rust
 pondra_extension::log("took the slow path");   // a line in the node's log, with the extension's name
@@ -143,7 +143,7 @@ A node runs at most one extension call per core at once. Further calls wait thei
 thread of its own, so the node's other queries go on while slow calls run.
 
 <Aside>
-Not in 1.0: aggregates, network and secrets, an index of published extensions with signatures, and
+Not in 0.80: aggregates, network and secrets, an index of published extensions with signatures, and
 extensions in the browser page (which refuses `INSTALL` by name). See the
 [roadmap](https://github.com/alimardon123/pondra/blob/main/docs/roadmap.md).
 </Aside>

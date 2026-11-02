@@ -3,6 +3,11 @@
 **Date:** 2026-10-11 (one month to 1.0; the 2026-10-03 plan of rounds is in git) · **Status:** the
 month is the owner's (2026-10-11), the lanes my plan for it; the decisions at the end are his.
 
+**0.80, not 1.0, on 11-11** (the owner, 2026-11-02): the release the month was building ships as 0.80.0, its
+candidate on 11-06 as 0.80.0-rc.1, with the same freeze and dates, so a clean 1.0 has room to mature. 1.0 follows
+the from-scratch redesign, once every row below is proven; until then no release promises compatibility (the
+stability page's 1.x promises start at 1.0). "After 1.0" below still means after 1.0.
+
 **The bar** (the owner, 2026-10-03): reach 1.0 faster and more productively, with everything before
 it high quality, stable, workable, fully featured and true to the design principles (AGENTS.md).
 So from here: no new surface unless a bar below needs it, every round leaves every angle better
@@ -63,9 +68,9 @@ is `designs/one-month-to-1-0.md` in the project's files). Rounds 17 to 34 are re
 |---|---|
 | Wednesdays (10-14, 10-21, 10-28) | 0.34.0, 0.35.0, 0.36.0: whatever is green on main |
 | **10-31** | **Feature freeze**: fixes, reviews, measurements and docs only from here |
-| 11-01 to 11-06 | The 1.0 review, once every feature works (above all one core with its forms and APIs: ADR-072), from scratch (the owner, 10-16): architecture, design, security and the code reviewed again, and simplified so the parts work together: modular, flexible, one reusable part in every place over copies, easy to add, swap or remove for maintainers and customers alike, still one small binary; every door tried as a new user would; the docs finished; the console's last fixes |
-| 11-06 | 1.0.0-rc.1, then the 24-hour soak on R2, the cluster bench, the gates and the upgrade check |
-| **11-11** | **1.0.0** |
+| 11-01 to 11-06 | The review, once every feature works (above all one core with its forms and APIs: ADR-072), from scratch (the owner, 10-16): architecture, design, security and the code reviewed again, and simplified so the parts work together: modular, flexible, one reusable part in every place over copies, easy to add, swap or remove for maintainers and customers alike, still one small binary; every door tried as a new user would; the docs finished; the console's last fixes |
+| 11-06 | 0.80.0-rc.1, then the 24-hour soak on R2, the cluster bench, the gates and the upgrade check |
+| **11-11** | **0.80.0** (planned as 1.0.0 until 11-02) |
 
 | Lane | Thread | By the freeze |
 |---|---|---|
@@ -170,7 +175,7 @@ The IDs other documents cite. Done items are gone from this list (their ADRs and
    (`tools/cloud/gcp.sh up 6 --local-ssd`; the Google Cloud trial caps at 8 CPUs and the run needs
    52). Without them "Scales out" is proven on GitHub's runners over the internet only.
 2. **Publishing, by 11-01:** Homebrew, winget and signing wait on the owner's accounts and
-   certificates (ADR-041 §9); without them they follow 1.0 in 1.0.1.
+   certificates (ADR-041 §9); without them they follow 0.80 in 0.80.1.
 3. **CI's capacity:** two pull requests' runs at once today; nine lanes need four.
 4. **An `INSERT` of a key that exists:** it replaces the row today (an upsert, as Fluss and Paimon
    do). My recommendation: keep it, and add `WITH (on_duplicate = 'error')` for Postgres's

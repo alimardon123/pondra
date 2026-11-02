@@ -110,7 +110,7 @@ jobs:
             rm -rf repo
           done
       - name: winget (a pull request to microsoft/winget-pkgs, from the token's own fork; a release, not a candidate)
-        if: env.HAS_WINGET_TOKEN == 'true' && !contains(github.ref_name, '-') # (v1.0.0-rc.1 goes to our own tap and bucket only: winget's reviewers take releases)
+        if: env.HAS_WINGET_TOKEN == 'true' && !contains(github.ref_name, '-') # (v0.80.0-rc.1 goes to our own tap and bucket only: winget's reviewers take releases)
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
         run: |

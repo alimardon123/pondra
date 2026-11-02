@@ -71,6 +71,8 @@ with main's:
 The check runs from now, and reports until the freeze (10-31): eight lanes adding names at once would
 otherwise all edit one file. At the freeze the file is written with `--promise`, and from then on it
 fails as above. Until 1.0, a name changed on purpose updates the file in its own pull request.
+The 11-11 release is 0.80.0, not 1.0.0 (the owner, 2026-11-02), so the file is promised at 1.0's freeze,
+after the redesign, not at 0.80's; until then it reports.
 
 ### 4. How something changes after 1.0
 
