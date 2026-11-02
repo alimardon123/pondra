@@ -10471,13 +10471,18 @@ def _lake_keys():
         except Exception:
             return None  # (restarting to rejoin: a moment)
     led = until(lambda: any(role(A.port + i) == "leader" for i in (1, 2)), True, 40)
+    # (the new leader seals them once it has heard which formats its nodes know, 15 s at most, and the other looks for them
+    # every 10 s: the writes come after both, or they went through with the old key and the logs were read too soon)
+    said = lambda what: sum(what in open(f.log).read() for f in pair)
+    sealed_new = until(lambda: said("made new (the ones in the clear"), 1, 90)
+    took_new = until(lambda: said("took the lake's new keys from the bucket"), 1, 30)
     wrote = [until(lambda i=i: as_(A.port + i, basic, "INSERT INTO t VALUES (%d)" % (i + 10)), {"rows": 1}, 60) for i in (1, 2)]
     logs = [open(f.log).read() for f in pair]
     for f in pair:
         f.kill()
-    info["followers"] = {"joined": joined, "a follower took over": led, "wrote after": wrote, "logs": [l[-300:] for l in logs]}
+    info["followers"] = {"joined": joined, "a follower took over": led, "sealed, taken": [sealed_new, took_new], "wrote after": wrote, "logs": [l[-300:] for l in logs]}
     checks["followers that knew the lake's keys in the clear: the one that takes over seals new ones, and the other takes them from the bucket and writes through it"] = \
-        joined == [{"rows": 1}] * 2 and led is True and wrote == [{"rows": 1}] * 2 \
+        joined == [{"rows": 1}] * 2 and led is True and sealed_new == 1 and took_new == 1 and wrote == [{"rows": 1}] * 2 \
         and sum("made new (the ones in the clear" in l for l in logs) == 1 and sum("took the lake's new keys from the bucket" in l for l in logs) == 1
     return checks, info
 

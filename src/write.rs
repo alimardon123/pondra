@@ -1502,17 +1502,21 @@ pub async fn seen_here(app: &crate::app::App) {
         return; // (a joined page's member: its node keeps the records, and answers its writes once its own view holds them)
     }
     let leader = &app.members.leader().addr;
-    let ask = |path: &'static str| async move { crate::dial::call(leader, crate::dial::Call::get(path).timeout(std::time::Duration::from_secs(2))).await?.json::<u64>().await };
+    let ask = |path: &'static str| async move { crate::dial::call(leader, crate::dial::Call::get(path).timeout(std::time::Duration::from_secs(2))).await };
     let cap = std::time::Duration::from_secs(5);
-    match ask("/cluster/committed").await {
-        Ok(c) => {
-            holds(&app.lake, c, cap).await;
-        }
-        Err(_) => {
-            let Ok(upto) = ask("/cluster/visible").await else { return };
+    let Ok(r) = ask("/cluster/committed").await else { return };
+    match r.status {
+        404 => {
+            // (a leader older than this release: its log's end, which a table's commit doesn't move)
+            let Ok(upto) = async { ask("/cluster/visible").await?.checked()?.json::<u64>().await }.await else { return };
             let deadline = datafusion::common::instant::Instant::now() + cap;
             while app.lake.visible() < upto && datafusion::common::instant::Instant::now() < deadline {
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        }
+        _ => {
+            if let Ok(c) = async { r.checked()?.json::<u64>().await }.await {
+                holds(&app.lake, c, cap).await;
             }
         }
     }

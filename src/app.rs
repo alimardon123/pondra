@@ -105,7 +105,9 @@ impl App {
         if self.auth.on() || self.auth.network() || self.auth.owned() {
             return false;
         }
-        let _ = self.lake.caught_up().await; // (still catching up after 10 s: its own catalog decides)
+        if self.lake.caught_up().await.is_err() {
+            return false; // (still catching up after 10 s: its catalog may lack its leader's users, so it is never open on its word)
+        }
         if crate::users::signed(&self.lake).await {
             return false; // (served with tokens once: a node started without them answers no one, `users::signed`)
         }

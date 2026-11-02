@@ -447,11 +447,17 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
             async move { http().get(&url).timeout(Duration::from_secs(2)).send().await?.error_for_status()?.json::<u64>().await }
         };
         let upto = loop {
-            if let Ok(c) = ask("/cluster/committed").await {
-                break Some((true, c));
-            }
-            if let Ok(upto) = ask("/cluster/visible").await {
-                break Some((false, upto));
+            // (only a leader that has no such route is asked for its log's end: one that refused this node, before it had
+            // the nodes' key, would have passed it at once with a catalog that lacked the leader's users, and the node
+            // was open to anyone. CI's run 41359432087, attempt 2)
+            match ask("/cluster/committed").await {
+                Ok(c) => break Some((true, c)),
+                Err(e) if e.status() == Some(reqwest::StatusCode::NOT_FOUND) => {
+                    if let Ok(upto) = ask("/cluster/visible").await {
+                        break Some((false, upto));
+                    }
+                }
+                Err(_) => {}
             }
             if since.elapsed() < Duration::from_secs(30) {
                 tokio::time::sleep(Duration::from_millis(200)).await;
