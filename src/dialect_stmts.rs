@@ -11,7 +11,9 @@
 //!   `ALTER TABLE t CHANGE / MODIFY …` (Pondra's `ALTER COLUMN c TYPE …`, `ALTER COLUMN c AFTER b`), and `DATABASE()`,
 //!   `USER()` and their kind; BigQuery's `DECLARE x TYPE DEFAULT v`;
 //! - SQL Server's `OUTPUT inserted.…`, which would otherwise run with the clause left out, and `OPTION (…)`;
-//! - Snowflake's `CREATE STREAM … ON TABLE` and `FLATTEN(INPUT => …)`.
+//! - Snowflake's `CREATE STREAM … ON TABLE` and `FLATTEN(INPUT => …)`;
+//! - DuckDB's and SQLite's `PRAGMA …`, CockroachDB's `UPSERT INTO`, and Postgres's `CREATE EXTENSION` (Pondra's
+//!   INSTALL and LOAD).
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 use regex::Regex;
@@ -40,7 +42,7 @@ fn refusal(sql: &str) -> Option<String> {
             r"|\bdelete\s+\w+\s+from\b|\bupdate\b[^;]*\bjoin\b[^;]*\bset\b|\balter\s+table\b[^;]*\b(?:change|modify)\b|\b(?:cross|outer)\s+apply\b",
             r"|\]\s*\.|\.\s*\[|\[dbo\]|\b(?:from|join|into|update|table)\s+\[",
             r"|\boutput\s+(?:inserted|deleted)\s*\.|\bflatten\s*\(\s*input\b|\b(?:database|schema|user|current_user|session_user|system_user)\s*\(\s*\)",
-            r"|\breplace\s+into\b|\boption\s*\(|\bcreate\s+(?:or\s+replace\s+)?stream\b"))
+            r"|\breplace\s+into\b|\boption\s*\(|\bcreate\s+(?:or\s+replace\s+)?stream\b|\bpragma\b|\bupsert\b|\bcreate\s+extension\b"))
             .expect("a regex")
     });
     if !LOOK.is_match(sql) {
@@ -49,6 +51,60 @@ fn refusal(sql: &str) -> Option<String> {
     let tokens = Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?;
     let tokens: Vec<Token> = tokens.into_iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
     tokens.split(|t| *t == Token::SemiColon).find_map(statement)
+}
+
+/// Where a statement starts: DuckDB's and SQLite's `PRAGMA …` (`PRAGMA table_info('t')` is `DESCRIBE t`; a setting is
+/// SET and SHOW), CockroachDB's `UPSERT INTO t …` (Pondra's two upserts: a plain INSERT of a key that is there is
+/// refused, so neither is read in its place) and Postgres's `CREATE EXTENSION [IF NOT EXISTS] name …` (Pondra's INSTALL
+/// and LOAD, `extension.rs`, or the functions built in for the extensions most scripts ask for).
+fn start(s: &[Token], first: &str) -> Option<String> {
+    let w = |i: usize| word(s.get(i));
+    match first {
+        "PRAGMA" => {
+            let name = match s.get(1) {
+                Some(Token::Word(n)) => n.value.to_lowercase(),
+                _ => String::new(),
+            };
+            // (the table between the parentheses, as written: `'orders'` or `sales.orders`)
+            let table = match (s.get(2), s.iter().position(|t| *t == Token::RParen)) {
+                (Some(Token::LParen), Some(close)) if close > 3 || (close == 3 && s.len() > 3) => match &s[3..close] {
+                    [Token::SingleQuotedString(q)] => q.clone(),
+                    inner => inner.iter().map(|t| t.to_string()).collect(),
+                },
+                _ => "t".to_string(),
+            };
+            let ours = match name.as_str() {
+                "table_info" | "show" => format!("DESCRIBE {table}"),
+                "show_tables" | "show_tables_expanded" => "SHOW TABLES".to_string(),
+                "database_list" | "show_databases" => "SHOW DATABASES".to_string(),
+                "version" => "SELECT version()".to_string(),
+                _ => format!("SET {0} = … to change a setting, SHOW {0} to read it", if name.is_empty() { "name" } else { &name }),
+            };
+            Some(format!("PRAGMA {name} is DuckDB's and SQLite's: write {ours}"))
+        }
+        "UPSERT" => {
+            let name = match (w(1).as_deref(), s.get(2)) {
+                (Some("INTO"), Some(Token::Word(t))) => t.to_string(),
+                _ => "t".to_string(),
+            };
+            Some(format!("UPSERT is CockroachDB's: write INSERT OR REPLACE INTO {name} …, or INSERT INTO {name} … ON CONFLICT (key) DO UPDATE SET …"))
+        }
+        "CREATE" if w(1).as_deref() == Some("EXTENSION") => {
+            let at = if w(2).as_deref() == Some("IF") { 5 } else { 2 }; // (IF NOT EXISTS)
+            let name = match s.get(at) {
+                Some(Token::Word(n)) => n.value.clone(),
+                _ => "name".to_string(),
+            };
+            let ours = match name.to_lowercase().as_str() {
+                "uuid-ossp" => "gen_random_uuid() is built in".to_string(),
+                "pgcrypto" => "gen_random_uuid(), digest(text, 'sha256'), sha256() and md5() are built in".to_string(),
+                "plpgsql" => "a procedure's body is Pondra's own SQL script (CREATE PROCEDURE … AS BEGIN … END), with nothing to install".to_string(),
+                _ => format!("a Pondra extension is installed from its file, INSTALL {name} FROM 'path or URL', then LOAD {name}"),
+            };
+            Some(format!("CREATE EXTENSION {name} is Postgres's: {ours}"))
+        }
+        _ => None,
+    }
 }
 
 /// The word `t` is, upper-cased, when it is one and not quoted.
@@ -77,6 +133,9 @@ fn statement(s: &[Token]) -> Option<String> {
     let w = |i: usize| word(s.get(i));
     let is = |i: usize, x: &str| w(i).as_deref() == Some(x);
     let first = w(0).unwrap_or_default();
+    if let Some(why) = start(s, &first) {
+        return Some(why);
+    }
     let mut depth = 0i32; // (how deep in parentheses token `i` is)
     // (anywhere in it: SQL Server's APPLY, OUTPUT, OPTION and quoting of names; Snowflake's FLATTEN; MySQL's DATABASE()
     // and USER(). `t FOR SYSTEM_TIME AS OF …` is Pondra's: `past_names.rs`)
@@ -113,7 +172,17 @@ fn statement(s: &[Token]) -> Option<String> {
                 return Some(format!("{}() is MySQL's: write {ours}", w(i).unwrap_or_default()));
             }
         }
-        if let (Token::LBracket, Some(Token::Word(n)), Some(Token::RBracket)) = (t, s.get(i + 1), s.get(i + 2)) {
+        // (`items[i].sku` is a subscript: after a name, `)` or `]`, a `[` is one; after a word that starts what follows
+        // it, a name SQL Server quotes)
+        const BEFORE_A_NAME: &[&str] = &["SELECT", "FROM", "JOIN", "WHERE", "ON", "AND", "OR", "NOT", "BY", "AS", "WHEN", "THEN", "ELSE", "CASE", "IN", "INTO",
+            "UPDATE", "TABLE", "SET", "HAVING", "DISTINCT", "ALL", "RETURNING", "VALUES", "LIKE", "ILIKE", "IS", "BETWEEN", "USING", "WITH", "RETURN", "EXISTS",
+            "UNION", "EXCEPT", "INTERSECT", "LIMIT", "OFFSET", "TOP", "DELETE", "INSERT", "MERGE", "VIEW", "INDEX", "APPLY", "OUTPUT", "EXEC", "EXECUTE"];
+        let subscript = i > 0 && match &s[i - 1] {
+            Token::RParen | Token::RBracket => true,
+            Token::Word(w) => w.quote_style.is_some() || !BEFORE_A_NAME.contains(&w.value.to_uppercase().as_str()),
+            _ => false,
+        };
+        if let (Token::LBracket, Some(Token::Word(n)), Some(Token::RBracket), false) = (t, s.get(i + 1), s.get(i + 2), subscript) {
             let dotted = s.get(i + 3) == Some(&Token::Period) || (i > 0 && s[i - 1] == Token::Period);
             let named = i > 0 && matches!(word(s.get(i - 1)).as_deref(), Some("FROM" | "JOIN" | "INTO" | "UPDATE" | "TABLE"));
             if n.quote_style.is_none() && (dotted || named || n.value.eq_ignore_ascii_case("dbo")) {
@@ -227,6 +296,25 @@ mod tests {
     }
 
     #[test]
+    fn pragma_upsert_and_create_extension_are_refused_with_pondras_statements() {
+        let said = |sql: &str| refusal(sql).unwrap_or_else(|| panic!("{sql}: not refused"));
+        let e = refused("PRAGMA table_info('orders')").unwrap_err();
+        assert!(crate::codes::of(&e) == "0A000" && e.to_string() == "PRAGMA table_info is DuckDB's and SQLite's: write DESCRIBE orders", "{e:#}");
+        assert!(said("-- columns\npragma show(sales.orders)").contains("write DESCRIBE sales.orders"));
+        assert!(said("SELECT 1; PRAGMA show_tables").contains("write SHOW TABLES"));
+        assert!(said("PRAGMA threads = 4").contains("write SET threads = … to change a setting, SHOW threads to read it"));
+        assert_eq!(said("UPSERT INTO orders VALUES (5, 'new')"), "UPSERT is CockroachDB's: write INSERT OR REPLACE INTO orders …, or INSERT INTO orders … ON CONFLICT (key) DO UPDATE SET …");
+        assert!(said("SELECT 1; upsert into t values (1)").starts_with("UPSERT is CockroachDB's"));
+        assert!(said("CREATE EXTENSION IF NOT EXISTS pg_trgm").contains("CREATE EXTENSION pg_trgm is Postgres's: a Pondra extension is installed from its file, INSTALL pg_trgm FROM 'path or URL', then LOAD pg_trgm"));
+        assert!(said(r#"create extension "uuid-ossp""#).contains("CREATE EXTENSION uuid-ossp is Postgres's: gen_random_uuid() is built in"));
+        assert!(said("SELECT 1; CREATE EXTENSION pgcrypto WITH SCHEMA public").contains("digest(text, 'sha256')"));
+        // (a column, a string or a comment called so is no statement)
+        for sql in ["SELECT pragma FROM t -- pragma", "SELECT 'PRAGMA x'", "SELECT upsert FROM t", "SELECT 'create extension x'"] {
+            assert_eq!(refusal(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
     fn pondras_own_statements_are_left_as_they_are() {
         for sql in [
             "DESCRIBE customers", "DESC customers", "EXPLAIN VERBOSE SELECT 1", "EXPLAIN FORMAT tree SELECT 1", "SHOW TABLES", "CREATE OR REPLACE VIEW v AS SELECT 1", "CREATE OR ALTER TABLE t (a INT)",
@@ -237,6 +325,7 @@ mod tests {
             "INSERT OR REPLACE INTO t VALUES (1)", "CREATE OR REPLACE MACRO m(x) AS x + 1", "CREATE TEMP TABLE t (a INT)", "CREATE TEMP VIEW v AS SELECT 1", "CREATE TEMP MACRO m(x) AS x + 1", "CREATE OR REPLACE TEMPORARY FUNCTION f(x INT) RETURN x", "ALTER TABLE t ADD COLUMN after INT",
             "ALTER TABLE t ADD COLUMN first INT", "ALTER TABLE t ADD COLUMN channel VARCHAR(20) AFTER note", "ALTER TABLE t ADD c INT FIRST", "ALTER TABLE t ALTER COLUMN c AFTER b",
             "ALTER TABLE t ALTER c FIRST", "SELECT current_user, current_database(), current_schema()", "CREATE FUNCTION user() AS 1", "SELECT flatten([[1], [2]])",
+            "SELECT items[i].sku FROM t", "SELECT (l)[k].x, m[j].y FROM t", "ALTER TABLE t ADD a INT, ADD COLUMN after TEXT",
             "SELECT * FROM orders AT (TIMESTAMP => now())", "SELECT count(*) FROM past FOR SYSTEM_TIME AS OF (now())", "SELECT * FROM t FOR UPDATE", "CREATE TABLE t (a INT) WITH (option = 'x')", "INSERT INTO t (output) VALUES (1) RETURNING output",
         ] {
             assert_eq!(refusal(sql), None, "{sql}");

@@ -7917,6 +7917,17 @@ def _temps_functions(checks, port, db, other):
     got["dropped"] = [rows("SELECT tag(1) AS t"), rows("SELECT tag(1) AS t", other)]
     checks["a temporary function is used before the lake's of its name, for its session only (the result cache keeps them apart); DROP takes the session's"] = \
         got["lake first"] == [{"t": "lake"}] and got["shadow"] == [[{"t": "mine"}], [{"t": "lake"}]] and got["dropped"] == [[{"t": "lake"}], [{"t": "lake"}]]
+    # (11-02 audit H1: a lake view calling the lake's `disc` read by a session with a `disc` of its own was worked out
+    # with the session's body, and kept for every other reader)
+    db.sql("CREATE MACRO disc(x) AS x - 1")
+    db.sql("CREATE MACRO price(x) AS disc(x) * 10")
+    db.sql("CREATE VIEW priced AS SELECT disc(id) AS d, price(id) AS p FROM orders WHERE id = 3")
+    db.sql("CREATE TEMP MACRO disc(x) AS 0")
+    got["stored"] = [rows("SELECT d, p FROM priced"), rows("SELECT price(3) AS p, disc(3) AS d"), rows("SELECT d, p FROM priced", other)]
+    for s_ in ("DROP FUNCTION disc", "DROP VIEW priced", "DROP FUNCTION price", "DROP FUNCTION disc"):  # (the session's disc, then the lake's)
+        db.sql(s_)
+    checks["a temporary function never changes a stored view or a lake function's body, for its session or another: only the statement's own text calls it"] = \
+        got["stored"] == [[{"d": 2, "p": 20}], [{"p": 20, "d": 0}], [{"d": 2, "p": 20}]]
     q = b"SELECT count(*) AS n, sum(cents(amount)) AS s FROM orders"
     got["spread"] = [call(port, "POST", f"/sql?spread={s}", q, headers={"x-pondra-session": db.session}) for s in (0, 1)]
     checks["a query calling one spreads over three nodes with the same answer (its body is in its place)"] = \
@@ -24505,6 +24516,15 @@ def friendly():
             "SELECT id, CAST(ts AS DATE) AS a, make_date(2026, 3, k + 1) AS b, CAST(date_trunc('month', d) AS DATE) AS c, date_trunc('hour', ts) AS h, date_sub('hour', TIMESTAMP '2026-01-01 00:00:00', ts) AS dh, "
             "date_sub('minute', ts, TIMESTAMP '2026-01-01 00:10:30') AS dm, strftime(d, '%Y/%m') AS f, CAST(strptime('20260301', '%Y%m%d') AS DATE) AS p, CAST(floor(epoch(ts)) AS BIGINT) AS u, "
             "make_timestamp(CAST(1700000000 + id AS BIGINT) * 1000000) AS s FROM (SELECT *, make_date(2024, 1 + id % 12, 1 + id % 28) AS d FROM t WHERE id < 60 OR id % 97 = 0) sub"),
+        # (audit 11-02 H4-H6: integers, sub-second steps and Sunday weeks, where the first pairs agreed either way)
+        "BigQuery's SAFE_DIVIDE of integers (a FLOAT64), TIMESTAMP_DIFF in exact milliseconds and microseconds, DATETIME_DIFF (boundaries), DATE_TRUNC(d, WEEK) (Sunday)": (
+            "SELECT id, SAFE_DIVIDE(id, k) AS r, TIMESTAMP_DIFF(ts + INTERVAL '7 milliseconds', ts, MILLISECOND) AS ms, TIMESTAMP_DIFF(ts + INTERVAL '123457 microseconds', ts, MICROSECOND) AS us, "
+            "TIMESTAMP_DIFF(ts, ts + INTERVAL '1500 milliseconds', SECOND) AS back, DATETIME_DIFF(ts, TIMESTAMP '2025-12-31 23:59:30', MINUTE) AS dm, "
+            "DATETIME_DIFF(TIMESTAMP '2010-07-07 10:20:00', TIMESTAMP '2008-12-25 15:30:00', DAY) AS dd, DATE_TRUNC(d, WEEK) AS w, DATE_TRUNC(d, ISOWEEK) AS iw "
+            "FROM (SELECT *, make_date(2024, 1 + id % 12, 1 + id % 28) AS d FROM t WHERE id < 60 OR id % 97 = 0) sub",
+            "SELECT id, CASE WHEN k = 0 THEN NULL ELSE id / k END AS r, 7 AS ms, 123457 AS us, -1 AS back, date_diff('minute', TIMESTAMP '2025-12-31 23:59:30', ts) AS dm, "
+            "559 AS dd, d - CAST(dayofweek(d) AS INTEGER) AS w, CAST(date_trunc('week', d) AS DATE) AS iw "
+            "FROM (SELECT *, make_date(2024, 1 + id % 12, 1 + id % 28) AS d FROM t WHERE id < 60 OR id % 97 = 0) sub"),
         # (a LATERAL correlated by equalities, as a join: `lateral_join.rs`. The ORDER BY keys are never NULL: DuckDB puts
         # NULLs last in a DESC and Pondra first, so `n` is left out. The same text for both)
         "LEFT JOIN LATERAL … ON true, LIMIT 2 with a WHERE and a tie-breaker (the top two per key)": (
@@ -24573,6 +24593,18 @@ def friendly():
     except Exception as e:
         checks["DuckDB's DATETIME, UBIGINT, BLOB, LOGICAL, UINTEGER, INT1, BPCHAR, TIMESTAMP_MS, SHORT, LONG: a table == DuckDB's, and a function's types"] = False
         failed["duckdb types"] = str(e)[:400]
+    # (SQL Server's DATEPART: weeks from Sunday with 1 January in week 1, ISO's as isowk, and the milliseconds or
+    # microseconds within the second; MySQL's %u is refused, as chrono has no code for it: audit 11-02 H6)
+    try:
+        _, got = ours("SELECT DATEPART(week, DATE '2026-01-04') AS a, DATEPART(week, DATE '2027-01-01') AS b, DATEPART(wk, DATE '2026-12-31') AS c, "
+                      "DATEPART(isowk, DATE '2027-01-01') AS d, DATEPART(ms, TIMESTAMP '2026-01-01 00:00:12.123') AS e, DATEPART(mcs, TIMESTAMP '2026-01-01 00:00:12.123456') AS f, "
+                      "DATEPART(week, DATE '2026-01-03') AS g, DATEPART(week, DATE '2023-01-01') AS h")
+        checks["SQL Server's DATEPART(week) from Sunday (2026-01-04 is 2, 2027-01-01 is 1), isowk ISO's, ms and mcs within the second"] = got == [(2, 1, 53, 53, 123, 123456, 1, 1)]
+        if got != [(2, 1, 53, 53, 123, 123456, 1, 1)]:
+            failed["datepart"] = got
+    except Exception as e:
+        checks["SQL Server's DATEPART(week) from Sunday (2026-01-04 is 2, 2027-01-01 is 1), isowk ISO's, ms and mcs within the second"] = False
+        failed["datepart"] = str(e)[:400]
     c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
     c.request("POST", "/sql", b"SELECT date_diff('m', ts, ts) AS d FROM t")
     r = c.getresponse()
@@ -24589,7 +24621,7 @@ def friendly():
     # (11-01 audit L1, M6, M7: each refusal with its SQLSTATE, never XX000)
     coded = {"SELECT TOP 10 PERCENT id FROM t": "0A000", "SELECT id FROM t FETCH FIRST 10 PERCENT ROWS ONLY": "0A000", "SELECT TOP 2 id FROM t LIMIT 3": "42601",
              "SELECT string_agg(g, ',' ORDER BY id) WITHIN GROUP (ORDER BY id) AS s FROM t": "42601", "SELECT DATEDIFF(week, ts, ts) AS w FROM t": "22023",
-             "SELECT strftime(ts, '%F') AS f FROM t": "22023", "UPSERT INTO t VALUES (1)": "0A000",
+             "SELECT strftime(ts, '%F') AS f FROM t": "22023", "UPSERT INTO t VALUES (1)": "0A000", "SELECT DATE_FORMAT(ts, '%Y %u') AS f FROM t": "22023",
              # (other databases' statements for what Pondra writes otherwise: `dialect_stmts.rs`)
              "SET NOCOUNT ON": "0A000", "SELECT [o].[id] FROM [dbo].[t] AS [o]": "0A000", "UPDATE t JOIN q ON t.k = q.k SET x = 1": "0A000",
              "DECLARE @n INT = 5": "0A000", "SELECT t.id FROM t CROSS APPLY (SELECT p FROM q WHERE q.k = t.k) AS x": "0A000", "EXPLAIN EXTENDED SELECT 1": "0A000",
@@ -24615,6 +24647,17 @@ def friendly():
     checks["the Postgres port refuses SQL Server's SET NOCOUNT ON by name too, 0A000"] = port_refusal is not None and port_refusal[0] == "0A000" and "SET NOCOUNT is SQL Server's" in port_refusal[1]
     if not checks[list(checks)[-1]]:
         failed["port refusal"] = port_refusal
+    # (11-02 audit M13: a UBIGINT went out as INT8, and 2^63 and above as NULL)
+    try:
+        with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pc:
+            ub = pc.execute("SELECT CAST(18446744073709551615 AS UBIGINT) AS u, CAST(7 AS UBIGINT) AS s").fetchall()
+            ub_bin = pc.execute("SELECT CAST(9223372036854775808 AS UBIGINT) AS u", binary=True).fetchall()
+    except Exception as e:
+        ub, ub_bin = str(e)[:300], None
+    checks["the Postgres port sends a UBIGINT whole, as a numeric (2^64 - 1 too, text and binary)"] = \
+        ub == [(decimal.Decimal(18446744073709551615), decimal.Decimal(7))] and ub_bin == [(decimal.Decimal(9223372036854775808),)]
+    if not checks[list(checks)[-1]]:
+        failed["ubigint"] = [ub, ub_bin]
     # Postgres's current_user, session_user and current_role at every door: who is asking (a request's principal, the
     # port's user), each a column named as Postgres names it; N'…' is a string
     try:

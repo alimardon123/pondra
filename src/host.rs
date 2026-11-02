@@ -2,7 +2,6 @@
 
 use crate::ext_names::Attached;
 use crate::front::{Host, Own, Relation};
-use crate::expander::Routine;
 use crate::measures::Definition;
 use crate::pg_trace::Ty;
 use crate::store::{Lake, TableMeta};
@@ -20,7 +19,10 @@ impl Host for Lake {
     // which the compiler reports as a cycle (E0391). `own` below is the same pass.)
     fn own(&self, sql: &str) -> impl Future<Output = Result<Own>> + Send { own(self, sql) }
 
-    async fn routines(&self) -> Result<Arc<HashMap<String, Routine>>> { Ok(crate::temp::routines(crate::routines::listed(self).await?)) } // (the session's temporary ones over the lake's)
+    async fn routines(&self) -> Result<crate::front::Routines> {
+        let lake = crate::routines::listed(self).await?;
+        Ok(crate::front::Routines { own: crate::temp::routines(lake.clone()), lake }) // (the session's temporary ones over the lake's, for the statement's own text)
+    }
 
     async fn attached(&self) -> Result<Vec<(String, Attached)>> { crate::ext::attached(self).await }
 

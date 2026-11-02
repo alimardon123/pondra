@@ -60,8 +60,9 @@ the view was made.
 
 `CREATE TEMP FUNCTION` (or DuckDB's `CREATE TEMP MACRO`) makes a SQL function that is the session's
 own: a Postgres connection's, or a Python or JavaScript client's until `close()`. Nobody else sees
-it, it is used before the lake's function of the same name, and it ends with the session, as a
-[temporary table](/pondra/sql/statements/#views) does. `DROP FUNCTION` drops it.
+it, it is used before the lake's function of the same name in the statements the session sends,
+and it ends with the session, as a [temporary table](/pondra/sql/statements/#views) does.
+`DROP FUNCTION` drops it.
 
 ```sql
 CREATE TEMP FUNCTION cents(x DOUBLE) RETURNS BIGINT RETURN round(x * 100)::BIGINT;
@@ -70,7 +71,9 @@ SELECT item, cents(price) AS cents FROM sales ORDER BY id;
 
 It is put in its calls' places like any SQL function, so a query that calls it still spreads over the
 nodes. A stored view or a lake function can't call one, since its other readers don't have it
-(a `CREATE TEMP VIEW` can). A Python function is the lake's: `TEMP … LANGUAGE python` is refused.
+(a `CREATE TEMP VIEW` can), and one named as a lake function never changes them: a view or a lake
+function that calls the lake's `disc` calls the lake's, whoever reads it. A Python function is the
+lake's: `TEMP … LANGUAGE python` is refused.
 
 ## Python functions
 

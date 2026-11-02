@@ -874,7 +874,8 @@ pub(crate) fn pg_type(t: &DataType, format: FieldFormat) -> (Type, DataType) {
         DataType::Int8 | DataType::Int16 | DataType::UInt8 => (Type::INT2, DataType::Int16),
         DataType::Int32 | DataType::UInt16 => (Type::INT4, DataType::Int32),
         DataType::UInt32 => (Type::OID, DataType::UInt32), // (the catalog's oids: `pg_catalog.rs`)
-        DataType::Int64 | DataType::UInt64 => (Type::INT8, DataType::Int64),
+        DataType::Int64 => (Type::INT8, DataType::Int64),
+        DataType::UInt64 => (Type::NUMERIC, DataType::Decimal128(20, 0)), // (UBIGINT: every value, 2^63 and above too; INT8 sent those as NULL)
         DataType::Float32 => (Type::FLOAT4, DataType::Float32),
         DataType::Float64 => (Type::FLOAT8, DataType::Float64),
         DataType::Decimal128(..) => (Type::NUMERIC, t.clone()), // (`Numeric`: text or binary)
@@ -895,7 +896,7 @@ pub(crate) fn pg_type(t: &DataType, format: FieldFormat) -> (Type, DataType) {
                 DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => (Type::TEXT_ARRAY, of(DataType::Utf8)),
                 DataType::Int8 | DataType::Int16 | DataType::UInt8 => (Type::INT2_ARRAY, of(DataType::Int16)),
                 DataType::Int32 | DataType::UInt16 => (Type::INT4_ARRAY, of(DataType::Int32)),
-                DataType::Int64 | DataType::UInt64 => (Type::INT8_ARRAY, of(DataType::Int64)),
+                DataType::Int64 => (Type::INT8_ARRAY, of(DataType::Int64)), // (a UBIGINT[] as text, below: INT8 can't hold its values)
                 DataType::UInt32 => (Type::OID_ARRAY, of(DataType::UInt32)),
                 DataType::Float16 | DataType::Float32 => (Type::FLOAT4_ARRAY, of(DataType::Float32)),
                 DataType::Float64 => (Type::FLOAT8_ARRAY, of(DataType::Float64)),

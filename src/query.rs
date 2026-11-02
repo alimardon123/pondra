@@ -1309,7 +1309,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)
     let mut temps = crate::temp::views(sql); // (the session's own: over the lake's of the same name)
     for (_, v) in temps.iter_mut() {
-        let expanded = crate::routines::expand_stored(lake, v).await?; // (read as a stored view is: the door's rewrites, with the tables' types now; the text was kept as written)
+        let expanded = crate::routines::expand_temp_view(lake, v).await?; // (read as a stored view is: the door's rewrites, with the tables' types now; the text was kept as written)
         *v = expanded;
     }
     let seen = temps.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
