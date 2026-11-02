@@ -46,6 +46,10 @@ concurrency:
   group: build-${{ github.event.pull_request.number || ((github.event_name == 'push' || inputs.mode == 'main') && 'main') || (github.ref == 'refs/heads/train' && format('train-{0}', github.sha)) || github.run_id }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/train' }}
 
+# The token each job gets reads the code, and no more (11-02 audit L5): a job that needs more says so (`plan`, `red`).
+permissions:
+  contents: read
+
 jobs:
   # What this run builds. A push to main whose code a pull request's run already built and tested
   # on every platform (the merge changed nothing in it: the branch was up to date with main)
@@ -379,17 +383,19 @@ jobs:
         run: python tools/startup_order.py check --bin "$BIN" --lib "$(dirname "$BIN")/libpondra_lib.so" --most-mb 31
       # Signed before it is packaged, so every package holds the signed binary: with the certificates' secrets
       # (ADR-041 §8), a step that says so and does nothing until they are set (signed binaries come after 1.0)
-      # (a pull request's run, or the train's, never gets them: its tools/sign.py is the PR's; signing in a job of its own is after 1.0)
+      # (only a run of main's own code gets them, a push's or one started by hand on main: a pull request's run, the train's,
+      # or one started by hand on another branch never does, as its tools/sign.py is that branch's (11-02 audit L5); signing in
+      # a job of its own is after 1.0)
       - name: Signed (macOS, Windows), when the certificates are set
         if: startsWith(matrix.platform, 'macos') || startsWith(matrix.platform, 'windows')
         env:
-          APPLE_CERTIFICATE: ${{ needs.plan.outputs.event != 'pull_request' && secrets.APPLE_CERTIFICATE || '' }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ needs.plan.outputs.event != 'pull_request' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
-          APPLE_API_KEY: ${{ needs.plan.outputs.event != 'pull_request' && secrets.APPLE_API_KEY || '' }}
-          APPLE_API_KEY_ID: ${{ needs.plan.outputs.event != 'pull_request' && secrets.APPLE_API_KEY_ID || '' }}
-          APPLE_API_ISSUER: ${{ needs.plan.outputs.event != 'pull_request' && secrets.APPLE_API_ISSUER || '' }}
-          WINDOWS_CERTIFICATE: ${{ needs.plan.outputs.event != 'pull_request' && secrets.WINDOWS_CERTIFICATE || '' }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ needs.plan.outputs.event != 'pull_request' && secrets.WINDOWS_CERTIFICATE_PASSWORD || '' }}
+          APPLE_CERTIFICATE: ${{ github.ref == 'refs/heads/main' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ github.ref == 'refs/heads/main' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_API_KEY: ${{ github.ref == 'refs/heads/main' && secrets.APPLE_API_KEY || '' }}
+          APPLE_API_KEY_ID: ${{ github.ref == 'refs/heads/main' && secrets.APPLE_API_KEY_ID || '' }}
+          APPLE_API_ISSUER: ${{ github.ref == 'refs/heads/main' && secrets.APPLE_API_ISSUER || '' }}
+          WINDOWS_CERTIFICATE: ${{ github.ref == 'refs/heads/main' && secrets.WINDOWS_CERTIFICATE || '' }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ github.ref == 'refs/heads/main' && secrets.WINDOWS_CERTIFICATE_PASSWORD || '' }}
         run: python tools/sign.py "$BIN"
       # The pip and npm packages and the installers' archive, installed and tried as on a user's
       # machine: packaging that breaks on an OS (npm is npm.cmd on Windows) shows on a push.

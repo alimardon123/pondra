@@ -458,6 +458,22 @@ export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1
 sudo -E pondra service install --name edge --lake s3://my-bucket/lake --addr 10.0.0.1:8080
 ```
 
+## Linux's network after a pause
+
+Linux shrinks a connection's sending window once it has sat idle for longer than its retransmission
+timeout (200 ms or more), so the first large answer after a pause, and the first exchange between two
+nodes after one, start slowly again. On a node's machine, turn that off, now and at every boot:
+
+```bash norun
+sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+echo 'net.ipv4.tcp_slow_start_after_idle = 0' | sudo tee /etc/sysctl.d/90-pondra.conf
+```
+
+In a container the setting is the container's own network's: `docker run --sysctl
+net.ipv4.tcp_slow_start_after_idle=0 …`, or `sysctls:` in Compose. On Kubernetes it goes in the pod's
+`securityContext.sysctls`, and isn't among the sysctls Kubernetes counts as safe, so the kubelet must
+allow it (`--allowed-unsafe-sysctls`).
+
 ## Homebrew, winget and Scoop
 
 <Aside type="caution">
