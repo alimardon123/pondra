@@ -172,6 +172,7 @@ The IDs other documents cite. Done items are gone from this list (their ADRs and
 | B4, B5 | A browser Pondra; a local table joined with a lake's, the lake's part on a node | L2 |
 | C1, C2, C3 | 1 → 3 → 6 machines; SF100 against Spark; all of Nexmark against Flink (done on one machine: `logs/round34/nexmark-10m-flink.json`) | L1 |
 | C4 | The 24-hour soak on R2 | L7 |
+| C5 | Two more engines beside ours on the same hardware, after the freeze (the owner, 2026-11-02): open-source ClickHouse on ClickBench's 43 queries, with DuckDB's and ours; Arroyo on Nexmark's 20, with Flink's. ClickHouse Cloud, with the cost row in dollars, in 1.1 | L1 |
 | D2 | Random queries: one node == three == DuckDB, 100,000 of them (done: `random_sql.py`) | done (L6 keeps it) |
 | E2 | BI tools checked (Power BI Desktop, Tableau, DBeaver, Metabase, Superset, Grafana) | L3 |
 | E12 | Sharing (ADR-046, proposed) | after 1.0 |
