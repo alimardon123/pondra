@@ -114,6 +114,7 @@ pub fn router(app: App) -> Router {
         .merge(crate::sharing::routes()) // (recipients sign in there with their own tokens: `sharing.rs`)
         .layer(axum::extract::DefaultBodyLimit::max(1 << 30)) // batches up to 1 GiB
         .layer(middleware::from_fn_with_state(app.clone(), guard))
+        .layer(middleware::from_fn(used))
         .layer(middleware::from_fn_with_state(Arc::new(crate::origins::ORIGINS.clone()), crate::origins::door)) // (outermost: a preflight is answered before guard, and guard's refusals carry the headers)
         .with_state(app)
 }
@@ -240,6 +241,16 @@ async fn routines_shown(State(app): State<App>) -> Result<Json<Value>, E> {
         r.body.clear();
     }
     Ok(Json(j!(hidden)))
+}
+
+/// A request is a use of the node until its answer has been sent (`idle.rs`: `--idle-exit`), but for the ones a cluster
+/// sends all the time and the health checks.
+async fn used(req: Request, next: Next) -> Response {
+    if crate::idle::background(req.uri().path()) {
+        return next.run(req).await;
+    }
+    let used = crate::idle::Use::new();
+    next.run(req).await.map(|body| axum::body::Body::new(crate::idle::kept(body, used)))
 }
 
 /// Who asks (see `auth.rs`, `users.rs`): a token, a user's token, session or password; the

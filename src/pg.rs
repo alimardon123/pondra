@@ -56,7 +56,9 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
         let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), me: me.clone() });
         let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: cancels.clone() };
         let pg = Arc::new(Pg(backend, Arc::new(startup), cancel.clone()));
+        let used = crate::idle::Use::new(); // (an open connection is a use of the node: `idle.rs`)
         crate::panics::task(async move {
+            let _used = used;
             let _ = socket.set_nodelay(true);
             let _ = pgwire::tokio::process_socket(socket, tls, pg).await;
             crate::temp::end(&session);

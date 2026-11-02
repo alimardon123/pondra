@@ -107,8 +107,11 @@ pub async fn serve(app: App, addr: String, advertise: String) -> Result<()> {
         if crate::drain::draining() {
             continue; // (a node stopping takes no new client: the socket closes, and the client tries another broker)
         }
-        let (app, me) = (app.clone(), me.clone());
-        crate::panics::task(async move { conn(app, me, socket).await.map_err(|e| eprintln!("kafka client: {e:#}")) });
+        let (app, me, used) = (app.clone(), me.clone(), crate::idle::Use::new()); // (an open connection is a use of the node: `idle.rs`)
+        crate::panics::task(async move {
+            let _used = used;
+            conn(app, me, socket).await.map_err(|e| eprintln!("kafka client: {e:#}"))
+        });
     }
     Ok(())
 }

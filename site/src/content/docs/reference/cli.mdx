@@ -124,6 +124,7 @@ anything that starts a node unattended.
 | `--serve-store` | off | serve this lake's store to nodes on other machines, which open it as `pondra://host:port`. Needs an admin token, the same on every node; this node leads the lake. A folder or `:memory:` only |
 | `--python PYTHON` | none | run Python functions and procedures (`LANGUAGE python`) with this Python, which has the `pondra` package and pyarrow. `auto` takes the first one found. Routines run on warm workers beside the node, gone after a minute idle |
 | `--stop-with-stdin` | off | stop, as on Ctrl-C, when standard input closes: when the program that started the node ends, however it ends |
+| `--idle-exit SECS` | off | stop, as on SIGTERM, once nobody has used the node for SECS and it has nothing left to tier (also `PONDRA_IDLE_EXIT_SECS`): [a node that runs only while used](/pondra/guides/deploy/#a-node-that-runs-only-while-used) |
 
 <Aside type="caution">
 A Python routine runs any code on the machine. `--python` is refused unless you set tokens (only

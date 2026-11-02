@@ -571,3 +571,30 @@ of running a node stops it this way and waits a while for it:
 A stopped node that starts again follows the new leader. Compose and the chart restart a node that
 stops on its own, and so do the system managers; for `docker run`, add `--restart unless-stopped`, as
 the examples above do.
+
+## A node that runs only while used
+
+`pondra serve --idle-exit SECS` stops the node, as SIGTERM does, once nobody has used it for SECS and it
+has nothing left to tier. Run it where the platform starts it again on the next request, and the
+machine is billed only while there is work: Cloud Run with its minimum instances at 0, Fly Machines with
+`auto_stop_machines` and `auto_start_machines`, Knative, or a systemd socket in front of it. A leader
+gives its term back as it stops, so the next start leads at once.
+
+```bash norun
+pondra serve --lake s3://my-bucket/lake --addr 0.0.0.0:8080 --idle-exit 300
+```
+
+These count as use: an HTTP or Flight request until its answer has been sent (a watch or a live query
+for as long as it streams), an open Postgres or Kafka connection, even one that sends nothing, and a
+run of a procedure or task. A cluster's own calls between nodes and the health checks (`/healthz`,
+`/ready`, `/stats`, `/metrics`) don't count. A leader also waits until its log is tiered, so other
+engines see every row once it has stopped.
+
+A lake with a task on a schedule keeps its leader up, since tasks run only while a node does. The node
+says so once in its log. Suspend the task (`ALTER TASK … SUSPEND`) and run it from the platform's own
+scheduler with `pondra sql --dir LAKE "EXECUTE TASK name"`, or keep a node running.
+
+Don't give `--idle-exit` to a node that `pondra service`, Compose or the chart runs: they start a node
+that stops again at once. A [folder of lakes](/pondra/guides/server/) refuses it, because each
+database's node already stops once idle (`PONDRA_DATABASE_IDLE_SECS`). The same setting is
+`PONDRA_IDLE_EXIT_SECS` in the environment.

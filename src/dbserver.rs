@@ -179,6 +179,7 @@ impl Server {
         for v in ["PONDRA_TLS_CERT", "PONDRA_TLS_KEY", "PONDRA_TLS_CA"] {
             cmd.env_remove(v); // (a database's node listens on this machine only: TLS is the server's)
         }
+        cmd.env_remove("PONDRA_IDLE_EXIT_SECS"); // (the server stops an idle database's node: `reap`)
         cmd.env(crate::tls::CLIENT_KEY, client_key()); // (its `x-pondra-client` is taken only with it)
         cmd.env("PONDRA_SERVER_URL", format!("http://{}", self.addr)).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).kill_on_drop(true);
         let mut child = cmd.spawn().context("starting a database's node")?;
