@@ -3791,7 +3791,7 @@ Known limits, in the order they matter:
     tables it would have made, Spark's function library, EXPLAIN's text (Pondra plans its own
     way), number literals typed DECIMAL (as Postgres and DuckDB do), strings read as `Utf8View`.
 
-Good next moves: `docs/roadmap.md` (2026-10-11) is one month to 1.0 (11-11), at the owner's bar
+Good next moves: `docs/roadmap.md` (2026-10-11) is one month to the 11-11 release (0.80.0 since the owner's 11-02 call; 1.0 follows the redesign), at the owner's bar
 ("high quality, stable, workable, fully featured"): nine lanes side by side, each a thread that owns
 its files (engine and proof; in-process and the browser; the Postgres port; sources and outside
 catalogs; measures, the ontology and AI; SQL; durability and shipping; the console; the docs), a
