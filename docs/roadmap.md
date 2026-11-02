@@ -105,6 +105,14 @@ Depth by evidence, then the platform on top, each a part behind a small surface 
   each stage's output to object storage, so a node lost mid-shuffle costs one stage, not the job; Ballista's shuffle-file
   retry is the reference), a `LIMIT` in a subquery,
   order-keeping shuffles, hot keys on both sides, keyed compaction by key range.
+- **F, commits on a local folder** (`reviews/writes-vs-postgres-2026-11-02.md`; the flush of each write, added 10-31,
+  stays): the folder's log appended to one file it keeps open and flushed once a commit (`fdatasync`), as Postgres's
+  WAL is, instead of a new file a commit (three changes to the folder and two flushes each); buckets keep one object a
+  flush. Then group commit: a transaction's COMMIT, and an autocommitted UPDATE or DELETE, checks and queues its flush
+  under the lake's lock and waits for it outside, so commits of different rows share one flush, as plain INSERTs share
+  one in the sequencer already. A check reads only what is visible, so it also checks the commits still in flight: their
+  keys, and their tables' UNIQUE values (ADR-057). pgbench at scale 1 gains nothing from it (every transaction updates
+  the one branch row and holds its lock through its flush, as in Postgres): measured at a scale of one branch a client.
 - **I1:** extensions (ADR-075, accepted; replaces ADR-031 and ADR-035 §6): one `INSTALL` line,
   WebAssembly components built once for every version and form. Before 1.0 (the owner, 10-31;
   `designs/extensions-before-1-0.md`): `INSTALL name FROM` a file or URL, scalar and table functions in
