@@ -297,7 +297,7 @@ CASES = [
     ("sqlserver", "SELECT id, amount FROM orders ORDER BY id OFFSET 2 ROWS FETCH NEXT 3 ROWS ONLY"),
     ("sqlserver", "SELECT [o].[id], [c].[name] FROM [dbo].[orders] AS [o] INNER JOIN [dbo].[customers] AS [c] ON [c].[id] = [o].[customer_id]", ("0A000", "[o] is SQL Server's quoting of a name")),
     ("sqlserver", "SELECT c.name, x.id FROM customers AS c CROSS APPLY (SELECT TOP 1 o.id FROM orders AS o WHERE o.customer_id = c.id ORDER BY o.amount DESC) AS x", ("0A000", "CROSS APPLY is SQL Server's: write CROSS JOIN LATERAL")),
-    ("sqlserver", "SELECT * FROM (SELECT customer_id, status, amount FROM orders) AS src PIVOT (SUM(amount) FOR status IN ([paid], [shipped])) AS p"),
+    ("sqlserver", "SELECT * FROM (SELECT customer_id, status, amount FROM orders) AS src PIVOT (SUM(amount) FOR status IN ([paid], [shipped])) AS p", ("0A000", "is SQL Server's: write the values themselves, IN ('paid', …)")),
     ("sqlserver", "SELECT status, customer_id, SUM(amount) AS total FROM orders GROUP BY ROLLUP (status, customer_id)"),
     ("sqlserver", "WITH nums AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < 5) SELECT n FROM nums OPTION (MAXRECURSION 10)", ("0A000", "OPTION (MAXRECURSION …) is SQL Server's")),
     ("sqlserver", "SELECT id, status FROM orders WITH (NOLOCK) WHERE status = 'paid'"),

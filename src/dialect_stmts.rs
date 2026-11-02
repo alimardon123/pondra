@@ -6,7 +6,7 @@
 //! - Snowflake's and Spark's `DESCRIBE TABLE t`; Spark's `EXPLAIN EXTENDED`, Snowflake's `EXPLAIN USING TEXT`, MySQL's
 //!   `EXPLAIN FORMAT=JSON`; MySQL's, Snowflake's and Spark's `SHOW TABLES LIKE … / IN … / FROM …`;
 //! - SQL Server's `CREATE [NON]CLUSTERED INDEX`, `SET NOCOUNT ON` and its kind, `DECLARE @x`,
-//!   `CROSS APPLY` and `OUTER APPLY`, and `[name]` quoting;
+//!   `CROSS APPLY` and `OUTER APPLY`, and `[name]` quoting (also of a `PIVOT`'s values, `IN ([paid], …)`);
 //! - MySQL's `SET @x = …`, `PREPARE p FROM '…'`, `DELETE t FROM t JOIN …`, `UPDATE t JOIN … SET …`, `REPLACE INTO`,
 //!   `ALTER TABLE t CHANGE / MODIFY …` (Pondra's `ALTER COLUMN c TYPE …`, `ALTER COLUMN c AFTER b`), and `DATABASE()`,
 //!   `USER()` and their kind; BigQuery's `DECLARE x TYPE DEFAULT v`;
@@ -42,7 +42,7 @@ fn refusal(sql: &str) -> Option<String> {
             r"|\bdelete\s+\w+\s+from\b|\bupdate\b[^;]*\bjoin\b[^;]*\bset\b|\balter\s+table\b[^;]*\b(?:change|modify)\b|\b(?:cross|outer)\s+apply\b",
             r"|\]\s*\.|\.\s*\[|\[dbo\]|\b(?:from|join|into|update|table)\s+\[",
             r"|\boutput\s+(?:inserted|deleted)\s*\.|\bflatten\s*\(\s*input\b|\b(?:database|schema|user|current_user|session_user|system_user)\s*\(\s*\)",
-            r"|\breplace\s+into\b|\boption\s*\(|\bcreate\s+(?:or\s+replace\s+)?stream\b|\bpragma\b|\bupsert\b|\bcreate\s+extension\b"))
+            r"|\breplace\s+into\b|\boption\s*\(|\bcreate\s+(?:or\s+replace\s+)?stream\b|\bpragma\b|\bupsert\b|\bcreate\s+extension\b|\b(?:un)?pivot\b[^;]*\bin\s*\(\s*\["))
             .expect("a regex")
     });
     if !LOOK.is_match(sql) {
@@ -137,13 +137,42 @@ fn statement(s: &[Token]) -> Option<String> {
         return Some(why);
     }
     let mut depth = 0i32; // (how deep in parentheses token `i` is)
+    // (the depth just inside a `PIVOT (` or `UNPIVOT (`, with which, and just inside its `IN (`)
+    let (mut pivot, mut listed): (Option<(i32, bool)>, Option<i32>) = (None, None);
     // (anywhere in it: SQL Server's APPLY, OUTPUT, OPTION and quoting of names; Snowflake's FLATTEN; MySQL's DATABASE()
     // and USER(). `t FOR SYSTEM_TIME AS OF …` is Pondra's: `past_names.rs`)
     for (i, t) in s.iter().enumerate() {
         match t {
             Token::LParen => depth += 1,
-            Token::RParen => depth -= 1,
+            Token::RParen => {
+                depth -= 1;
+                pivot = pivot.filter(|(d, _)| depth >= *d);
+                listed = listed.filter(|d| depth >= *d);
+            }
             _ => {}
+        }
+        if (is(i, "PIVOT") || is(i, "UNPIVOT")) && s.get(i + 1) == Some(&Token::LParen) {
+            pivot = Some((depth + 1, is(i, "PIVOT")));
+        }
+        if pivot.is_some_and(|(d, _)| d == depth) && is(i, "IN") && s.get(i + 1) == Some(&Token::LParen) {
+            listed = Some(depth + 1);
+        }
+        // (SQL Server's `PIVOT (… FOR status IN ([paid], [shipped]))` names the values, and `UNPIVOT (… IN ([a], [b]))` the
+        // columns, in its quoting: here `[paid]` would be a list of a column)
+        if let (Some(d), Some((_, values)), Token::LBracket, Some(Token::RBracket)) = (listed, pivot, t, s.get(i + 2)) {
+            let bare = match s.get(i + 1) {
+                Some(Token::Word(n)) if n.quote_style.is_none() => Some((n.value.clone(), format!("'{}'", n.value))),
+                Some(Token::Number(n, _)) => Some((n.clone(), n.clone())),
+                _ => None,
+            };
+            let starts = s.get(i.wrapping_sub(1)) == Some(&Token::LParen); // (the list's first: not `m[k]`, nor `([1, 2], [3])`)
+            if let (true, true, Some((bare, value))) = (d == depth, starts, bare) {
+                return Some(if values {
+                    format!("PIVOT (… IN ([{bare}], …)) is SQL Server's: write the values themselves, IN ({value}, …)")
+                } else {
+                    format!("[{bare}] is SQL Server's quoting of a name: write \"{bare}\" (or the name alone)")
+                });
+            }
         }
         if (is(i, "CROSS") || is(i, "OUTER")) && is(i + 1, "APPLY") {
             return Some(format!("{} APPLY is SQL Server's: write CROSS JOIN LATERAL (SELECT …) AS x for CROSS APPLY, and LEFT JOIN LATERAL (SELECT …) AS x ON true for OUTER APPLY", w(i).unwrap_or_default()));
@@ -283,6 +312,10 @@ mod tests {
         assert!(said("ALTER TABLE s.t MODIFY note TEXT").contains("ALTER TABLE s.t ALTER COLUMN c TYPE type"));
         assert!(said("SELECT c.name, x.id FROM customers AS c CROSS APPLY (SELECT TOP 1 o.id FROM orders AS o) AS x").starts_with("CROSS APPLY is SQL Server's: write CROSS JOIN LATERAL"));
         assert!(said("SELECT [o].[id] FROM [dbo].[orders] AS [o]").starts_with("[o] is SQL Server's quoting of a name: write \"o\""));
+        let pivot = "SELECT * FROM (SELECT customer_id, status, amount FROM orders) AS src PIVOT (SUM(amount) FOR status IN ([paid], [shipped])) AS p";
+        assert_eq!(said(pivot), "PIVOT (… IN ([paid], …)) is SQL Server's: write the values themselves, IN ('paid', …)");
+        assert_eq!(said("SELECT * FROM s PIVOT (sum(n) FOR y IN ([2024], [2025])) p"), "PIVOT (… IN ([2024], …)) is SQL Server's: write the values themselves, IN (2024, …)");
+        assert!(said("SELECT * FROM s UNPIVOT (v FOR c IN ([amount], [qty])) u").starts_with("[amount] is SQL Server's quoting of a name: write \"amount\""));
         assert!(said("SELECT 1; SET NOCOUNT ON").starts_with("SET NOCOUNT"), "any statement of a script");
         assert_eq!(said("REPLACE INTO t_case_401 (id, note) VALUES (1, 'refund')"), "REPLACE INTO is MySQL's: write INSERT OR REPLACE INTO t_case_401 …, or INSERT INTO t_case_401 … ON CONFLICT (key) DO UPDATE SET …");
         assert!(said("INSERT INTO t (a, b) OUTPUT inserted.id, inserted.b VALUES (3, N'x')").starts_with("OUTPUT inserted.… is SQL Server's: end the statement with RETURNING"));
@@ -327,6 +360,8 @@ mod tests {
             "ALTER TABLE t ALTER c FIRST", "SELECT current_user, current_database(), current_schema()", "CREATE FUNCTION user() AS 1", "SELECT flatten([[1], [2]])",
             "SELECT items[i].sku FROM t", "SELECT (l)[k].x, m[j].y FROM t", "ALTER TABLE t ADD a INT, ADD COLUMN after TEXT",
             "SELECT * FROM orders AT (TIMESTAMP => now())", "SELECT count(*) FROM past FOR SYSTEM_TIME AS OF (now())", "SELECT * FROM t FOR UPDATE", "CREATE TABLE t (a INT) WITH (option = 'x')", "INSERT INTO t (output) VALUES (1) RETURNING output",
+            "SELECT * FROM s PIVOT (sum(n) FOR status IN ('paid', 'shipped')) p", "SELECT * FROM s PIVOT (sum(n) FOR l IN ([1, 2], [3])) p", "SELECT * FROM s UNPIVOT (v FOR c IN (a, b)) u",
+            "SELECT * FROM s PIVOT (sum(n) FOR k IN (m[k])) p", "SELECT [x] IN ([x]) FROM t",
         ] {
             assert_eq!(refusal(sql), None, "{sql}");
         }
