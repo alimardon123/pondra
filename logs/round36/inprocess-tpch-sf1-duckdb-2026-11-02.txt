@@ -1,0 +1,29 @@
+In-process TPC-H SF1 against DuckDB 2.0.0, both from memory, one 4-core machine (2026-11-02, L1).
+Pondra main 5bef730 (dist build), pondra.connect(None), the 8 tables loaded with CREATE TABLE AS from Parquet; DuckDB 2.0.0 in-memory, the same CREATE TABLE AS.
+Each engine: every query twice, a 2-4 s settle (the hot columns' loads finish), then each query 11 times; the median of runs 3-11.
+21 queries (q15, a view, left out). Columns: query, Pondra wall ms, Pondra process CPU ms, DuckDB wall ms, DuckDB CPU ms, Pondra/DuckDB wall.
+
+q1     127.5   385.8    84.8   308.7  1.50x
+q2      21.2    34.5    21.6    35.8  0.98x
+q3      67.1   150.0    39.0   101.7  1.72x
+q4      37.7   116.1    28.9    78.8  1.30x
+q5      45.6   102.1    40.4   115.9  1.13x
+q6      29.5    92.4    15.1    47.6  1.95x
+q7      86.9   188.5    44.2   111.6  1.97x
+q8      48.2    85.4    40.3   101.0  1.20x
+q9     148.6   378.7   112.2   303.2  1.32x
+q10    100.2   242.5    90.1   255.8  1.11x
+q11     16.7    26.1    12.1    25.1  1.38x
+q12     51.9   135.8    36.0   111.7  1.44x
+q13     65.7   224.5    85.1   250.7  0.77x
+q14     20.5    46.0    31.8    74.4  0.64x
+q16     47.9    84.0    47.0   103.7  1.02x
+q17     29.4    65.3    33.2    94.0  0.89x
+q18    107.8   372.9    73.4   245.2  1.47x
+q19     84.9   210.3    61.9   181.3  1.37x
+q20     32.2    87.9    37.1   105.0  0.87x
+q21    118.3   284.0    74.5   225.5  1.59x
+q22     20.2    35.1    43.4    72.1  0.47x
+all     1308    3348    1052    2949  1.24x
+
+Harness: /tmp/l1/exp/cpurep.py (Pondra) and duckrep.py (DuckDB), one engine at a time, nothing else running.
