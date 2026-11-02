@@ -1005,8 +1005,8 @@ async fn create_task(State(app): State<App>, Path(name): Path<String>, body: Str
 /// window of column `w` once, final, to `{name}_final`; `?session=ts&gap_secs=30&lateness_secs=5`
 /// makes it a session view (`views.rs`): `CREATE MATERIALIZED VIEW … WITH (…)` in SQL.
 async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(options): Query<std::collections::BTreeMap<String, String>>, sql: String) -> Result<Json<Value>, E> {
-    let sql = crate::routines::expand(&app.lake, &sql).await?; // (as they are now: ADR-023)
-    let d = crate::ddl::Ddl::CreateMaterialized { name, sql, options };
+    let (text, sql) = (Some(sql.clone()), crate::routines::expand(&app.lake, &sql).await?); // (as they are now: ADR-023; as written, if it reads so: `authored.rs`)
+    let d = crate::ddl::Ddl::CreateMaterialized { name, sql, options, text };
     let out = {
         let _guard = app.lock.lock().await;
         crate::ddl::apply(&app.lake, d.clone()).await?

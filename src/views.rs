@@ -67,6 +67,9 @@ pub struct View {
     /// can't be replaced or dropped (`made_from`), or it would go on with their old query.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub from: Vec<String>,
+    /// Its query as its author wrote it, comments and line breaks kept (`authored.rs`): `SHOW CREATE` gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored: Option<crate::authored::Authored>,
 }
 
 /// A view that keeps each group once, when it's over (`EMIT FINAL`). Its GROUP BY has one
@@ -825,7 +828,7 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
         Some(w) if keep.is_none() => Some(w),
         _ => finish.is_some().then(|| written.to_string()),
     };
-    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep, written, rerun: None, matches: None, from })));
+    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep, written, rerun: None, matches: None, from, authored: None })));
     lake.cat.commit(puts, &[]).await
 }
 
@@ -961,7 +964,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
     let sql_types = crate::write::query_types(lake, &with, &names).await;
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), sql_types, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None, from };
+    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None, from, authored: None };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
 
@@ -1902,7 +1905,7 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
     let sql_types = crate::write::query_types(lake, sql, &names).await;
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: now, sql_types, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written, rerun: None, matches: None, from };
+    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written, rerun: None, matches: None, from, authored: None };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await
 }
 
@@ -2093,7 +2096,7 @@ mod tests {
     async fn a_views_ctes_and_plain_views_are_written_in() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-written-in-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
-        let view = |sql: &str| json(&crate::ddl::StoredView { sql: sql.into(), external: false, facts: vec![] });
+        let view = |sql: &str| json(&crate::ddl::StoredView { sql: sql.into(), external: false, facts: vec![], authored: None });
         lake.cat.commit(vec![(crate::ddl::query_key("vx"), view("SELECT x FROM a WHERE x > 1")), (crate::ddl::query_key("vy"), view("SELECT x FROM vx"))], &[]).await?;
         let w = |sql: &'static str| written_in(&lake, sql);
         assert_eq!(w("SELECT x FROM a").await?, "SELECT x FROM a");

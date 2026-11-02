@@ -248,13 +248,13 @@ fn schemas(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
 fn relations(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
     Box::pin(async move {
         let mut views = HashMap::new();
-        let mut facts = HashMap::new(); // (a stored view's key facts, shown in its definition: ADR-065 §2)
+        let mut facts = HashMap::new(); // (a stored view's key facts, shown in its definition: ADR-065 §2, and its query as written)
         for (name, l) in lakes(lake).await {
             for (k, v) in l.cat.scan::<crate::views::View>("v/", "v0").await? {
                 views.insert((name.clone(), k[2..].to_string()), v);
             }
             for (k, v) in l.cat.scan::<crate::ddl::StoredView>("q/", "q0").await? {
-                facts.insert((name.clone(), k[2..].to_string()), v.facts);
+                facts.insert((name.clone(), k[2..].to_string()), (v.facts, v.authored));
             }
         }
         let here = crate::ddl::lake_name(lake);
@@ -270,8 +270,8 @@ fn relations(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
             let def = match o.kind {
                 "table" => o.meta.as_ref().map(|m| table_sql(&named, m)),
                 "view" => o.sql.as_ref().map(|s| {
-                    let kept = facts.get(&(o.lake.clone(), local.clone())).map_or(&[][..], |f: &Vec<crate::constraints::Constraint>| f.as_slice());
-                    format!("CREATE VIEW {named}{} AS\n{s}", crate::facts::in_list(kept))
+                    let (kept, authored) = facts.get(&(o.lake.clone(), local.clone())).map_or((&[][..], None), |(f, a)| (f.as_slice(), crate::authored::Authored::of(a, s)));
+                    format!("CREATE VIEW {named}{} AS\n{}", crate::facts::in_list(kept), authored.unwrap_or(s))
                 }),
                 "materialized view" => crate::views::code_for_caller(|| views.get(&(o.lake.clone(), local.clone())).or_else(|| views.get(&(o.lake.clone(), crate::once::open(&local)))).map(|v| materialized_sql(&named, v, o.meta.as_ref()))).flatten(),
                 _ => None, // (an external table's statement isn't kept as written; a window view's `_final` table is made with it)
@@ -643,7 +643,8 @@ pub(crate) fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<
         with.extend(b.lag_secs.map(|s| format!("lag = '{s} seconds'")));
     }
     let with = if with.is_empty() { String::new() } else { format!(" WITH ({})", with.join(", ")) };
-    format!("CREATE MATERIALIZED VIEW {name}{list}{with} AS\n{}", crate::views::shown(v.query()))
+    let query = crate::authored::Authored::of(&v.authored, v.query()).map_or_else(|| crate::views::shown(v.query()), str::to_string); // (as written: `authored.rs`)
+    format!("CREATE MATERIALIZED VIEW {name}{list}{with} AS\n{query}")
 }
 
 /// `CREATE FUNCTION`, `CREATE MACRO` or `CREATE PROCEDURE`, in the form it was made in.

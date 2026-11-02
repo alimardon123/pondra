@@ -763,8 +763,14 @@ impl<'a> Runner<'a> {
         row.columns().iter().map(|c| text_of(c.as_ref())).collect()
     }
 
-    /// A plain statement, as `routines::one` runs one; a `DECLARE` in a block is the block's.
+    /// A plain statement, as `routines::one` runs one; a `DECLARE` in a block is the block's. It is run as it reads here,
+    /// before its macros are read in (`prepare`): a view made keeps its comments (`authored.rs`).
     async fn plain(&mut self, s: &str, path: &str) -> Result<()> {
+        let sent = s.to_string();
+        crate::authored::sent(&sent, self.plain_as_sent(s, path)).await
+    }
+
+    async fn plain_as_sent(&mut self, s: &str, path: &str) -> Result<()> {
         let s = self.ready(s).await?;
         let job = self.job.as_ref().map(|j| if path.is_empty() { j.clone() } else { format!("{j}:{path}") });
         let s = match crate::vars::change(&s) {

@@ -631,7 +631,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &Tabl
     let (columns, sql_types) = table_columns(lake, sql, &ctx, plan).await?;
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), sql_types, ..Default::default() };
     let r = Rerun { id: uuid::Uuid::new_v4().to_string(), keys, full, reason, asked, lag_secs, joins };
-    let view = View { source: source.into(), sql: sql.into(), emit: None, sessions: None, ids: false, join: None, fill: None, expect: vec![], once: None, written, rerun: Some(r), matches: None, from };
+    let view = View { source: source.into(), sql: sql.into(), emit: None, sessions: None, ids: false, join: None, fill: None, expect: vec![], once: None, written, rerun: Some(r), matches: None, from, authored: None };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (crate::views::view_key(name), json(&view))], &[]).await
 }
 
