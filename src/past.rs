@@ -116,6 +116,9 @@ async fn when(lake: &Lake, spec: &Spec) -> Result<At> {
         _ => (format!("SELECT CAST(({}) AS TIMESTAMP)", spec.expr), DataType::Timestamp(TimeUnit::Microsecond, None)),
     };
     let what = || format!("{} AT ({} => {})", spec.table, spec.at.to_uppercase(), spec.expr);
+    // (as the rest of its query is read: other databases' functions, `DATEADD(hour, -1, GETDATE())`, `friendly.rs`. Its
+    // routines were written in where it was written, `expander.rs`)
+    let sql = crate::front::expand(lake, &sql, &std::collections::HashMap::new()).await.with_context(what)?;
     let b = lake.session().sql(&sql).await.with_context(what)?.collect().await.with_context(what)?;
     let v = b.first().filter(|b| b.num_rows() == 1).map(|b| datafusion::arrow::compute::cast(b.column(0), &ty)).transpose()?.filter(|c| c.is_valid(0));
     let v = v.ok_or_else(|| anyhow!("{}: one value, not null", what()))?;

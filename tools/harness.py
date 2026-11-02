@@ -16131,10 +16131,11 @@ def objects():
     first = q("SELECT max(_version) AS v FROM past")[0]["v"]
     q("INSERT INTO past VALUES (2), (3)")
     then = [q(f"SELECT count(*) AS n FROM {w}") for w in (f"past VERSION AS OF {first}", f"past VERSION AS OF ({first})",
-                                                          "past TIMESTAMP AS OF (now())", "past FOR SYSTEM_TIME AS OF (now())", "past FOR SYSTEM_TIME AS OF now()")]
+                                                          "past TIMESTAMP AS OF (now())", "past FOR SYSTEM_TIME AS OF (now())", "past FOR SYSTEM_TIME AS OF now()",
+                                                          "past AT (TIMESTAMP => DATEADD(hour, 1, GETDATE()))", "past FOR SYSTEM_TIME AS OF date_add(now(), INTERVAL 1 HOUR)")]
     joined = q(f"SELECT count(*) AS n FROM past n JOIN past VERSION AS OF {first} w ON n.a = w.a")
-    checks["VERSION AS OF, TIMESTAMP AS OF, FOR SYSTEM_TIME AS OF: a table's past, as AT (…) reads it"] = \
-        then == [[{"n": 1}], [{"n": 1}], [{"n": 3}], [{"n": 3}], [{"n": 3}]] and joined == [{"n": 1}]
+    checks["VERSION AS OF, TIMESTAMP AS OF, FOR SYSTEM_TIME AS OF: a table's past, as AT (…) reads it; its moment read as any query (DATEADD, GETDATE)"] = \
+        then == [[{"n": 1}], [{"n": 1}], [{"n": 3}], [{"n": 3}], [{"n": 3}], [{"n": 3}], [{"n": 3}]] and joined == [{"n": 1}]
     refreshed = http("REFRESH MATERIALIZED VIEW w")
     not_one = [http(f"REFRESH MATERIALIZED VIEW {t}")[0] for t in ("orders", "eu")]  # (eu is a table since its DETACH)
     analyzed = [http(s)[0] for s in ("ANALYZE", "ANALYZE orders")]
