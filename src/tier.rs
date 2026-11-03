@@ -1149,7 +1149,31 @@ pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBa
     }
     let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
     let (mut files, mut open) = (vec![], None::<Encoding>);
-    while let Some(b) = stream.next().await.transpose()? {
+    // (the next batch is worked out while the last one is encoded: a stream of one partition, `range()` or a VALUES, ran its
+    // query and its encoding one after the other on one core. The same batches go to the same files, in the same order.)
+    let mut writing = None;
+    loop {
+        let (written, next): (Option<Encoding>, _) = match writing.take() {
+            Some(write) => {
+                let write = std::pin::pin!(write);
+                match futures::future::select(write, stream.next()).await {
+                    // (an encode that fails drops the stream at once)
+                    futures::future::Either::Left((written, next)) => (Some(written?), next.await),
+                    // (a stream that fails waits for the encode under way, so nothing of the statement runs on after it)
+                    futures::future::Either::Right((next, write)) => (Some(write.await?), next),
+                }
+            }
+            None => (None, stream.next().await),
+        };
+        // (a stream that failed: the file the last batch went to is dropped, never put)
+        let next = next.transpose()?;
+        if let Some(file) = written {
+            match file.rows >= max_rows || file.bytes() >= FILE_BYTES {
+                true => files.push(file.put(lake, table, meta.as_ref()).await?),
+                false => open = Some(file),
+            }
+        }
+        let Some(b) = next else { break };
         if b.num_rows() == 0 {
             continue;
         }
@@ -1161,11 +1185,7 @@ pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBa
                 Encoding::new(meta.as_ref(), &b, keys, stats, hot)?
             }
         };
-        let file = blocking(move || file.write(&b).map(|_| file)).await?;
-        match file.rows >= max_rows || file.bytes() >= FILE_BYTES {
-            true => files.push(file.put(lake, table, meta.as_ref()).await?),
-            false => open = Some(file),
-        }
+        writing = Some(blocking(move || file.write(&b).map(|_| file)));
     }
     if let Some(file) = open {
         files.push(file.put(lake, table, meta.as_ref()).await?);
@@ -1248,5 +1268,48 @@ mod tests {
         }
         assert!(!entry.stats.contains_key("long"));
         assert_eq!(entry.nulls, Some(vec!["i".to_string()]));
+    }
+
+    /// A streamed write's batches go to its files in order, each file put once it holds `max_rows`, while the next batch
+    /// is worked out as one is encoded. A stream that fails is the write's error, once the encode under way is done, and
+    /// the file it was filling is never put (those put before it are in no version: the statement fails).
+    #[tokio::test]
+    async fn a_streamed_write_keeps_its_order_and_ends_at_a_failed_stream() -> Result<()> {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = |k: i64| RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from_iter_values(k * 1000..k * 1000 + 1000)) as ArrayRef]).unwrap();
+        let stream = |fail: bool| -> SendableRecordBatchStream {
+            let mut items: Vec<datafusion::error::Result<RecordBatch>> = (0..10).map(|k| Ok(batch(k))).collect();
+            if fail {
+                items.push(Err(datafusion::error::DataFusionError::Execution("the query stopped".into())));
+            }
+            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), futures::stream::iter(items)))
+        };
+        let dir = std::env::temp_dir().join(format!("pondra-streamed-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let files = write_stream(&lake, "t", stream(false), 2500, &[], true, None).await?;
+        assert_eq!(files.iter().map(|f| f.rows).collect::<Vec<_>>(), [3000, 3000, 3000, 1000]);
+        for (k, f) in files.iter().enumerate() {
+            let (lo, hi) = (k as i64 * 3000, (k as i64 * 3000 + 2999).min(9999));
+            assert_eq!(f.stats.get("id"), Some(&(lo.to_string(), hi.to_string())), "file {k}");
+        }
+        let parquet = |d: &std::path::Path| walk(d).into_iter().filter(|p| p.extension().is_some_and(|e| e == "parquet")).count();
+        let before = parquet(&dir);
+        assert_eq!(before, 4);
+        let Err(err) = write_stream(&lake, "u", stream(true), 2500, &[], true, None).await else { panic!("the stream's error") };
+        assert!(format!("{err:#}").contains("the query stopped"), "{err:#}");
+        assert_eq!(parquet(&dir), before + 3, "the files filled before the error are put; the one under way is not");
+        lake.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    fn walk(d: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = vec![];
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() { out.extend(walk(&p)) } else { out.push(p) }
+        }
+        out
     }
 }
