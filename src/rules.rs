@@ -258,7 +258,10 @@ pub fn checks(t: &Table, name: &str, rows: &RecordBatch, sql_names: bool, base: 
         for ((check, condition), planned) in ordered.into_iter().zip(plans) {
             let bad = match planned {
                 Some(p) => fit::refused(&p, &all, condition)?,
-                None => fit::breaking(base, &all, condition)?,
+                None => match fit::plan(base, &all.schema(), condition)? {
+                    (_, false) if written() => continue, // (asked when its statement wrote the row: `committing`)
+                    (p, _) => fit::refused(&p, &all, condition)?,
+                },
             };
             if (0..bad.len()).any(|i| bad.value(i) && !marker(i)) {
                 return Err(anyhow::Error::new(crate::codes::Violation(format!("new row for relation \"{name}\" violates check constraint \"{check}\": CHECK ({condition})"), "23514")));
@@ -267,6 +270,19 @@ pub fn checks(t: &Table, name: &str, rows: &RecordBatch, sql_names: bool, base: 
     }
     Ok(())
 }
+
+tokio::task_local! {
+    static WRITTEN: ();
+}
+
+/// `f`, a COMMIT writing rows its transaction's statements shaped (`shape`), whose CHECKs met each row as its statement wrote it:
+/// a CHECK whose answer can change (one calling `now()`) isn't asked again with the commit's time, as Postgres asks a CHECK
+/// only when a row is written. (`CHECK (until > now())` and `INSERT … now() + '2 s'`, committed 3 s later, was refused.) The
+/// others are asked again, as before: their answer is the same.
+pub async fn committing<F: Future>(f: F) -> F::Output { WRITTEN.scope((), f).await }
+
+/// Are the rows being checked ones a transaction's statements shaped (`committing`)?
+fn written() -> bool { WRITTEN.try_with(|_| ()).is_ok() }
 
 /// A write's rows as the table holds them, once checked (`typed::as_held`, then `checks`): what the bulk INSERT's stream runs
 /// on each batch, and what a log or a commit runs again on rows already shaped. Rows that break nothing come back as they
@@ -584,6 +600,17 @@ mod tests {
         checks(&t, "s.t", &row(1), true, &SessionContext::new()).unwrap();
         let err = checks(&t, "s.t", &row(i64::MAX / 2), true, &SessionContext::new()).err().expect("a time to come breaks it");
         assert_eq!(crate::codes::of(&err), "23514");
+    }
+
+    #[tokio::test]
+    async fn a_commit_asks_again_only_the_checks_whose_answer_cant_change() {
+        let t = table(&[], vec![(plain("a"), DataType::Int64), (plain("b"), DataType::Int64)], &[("a_pos", "a > 0"), ("b_past", "b < extract(epoch from now())")]);
+        let row = |a: i64, b: i64| batch(vec![("a", ints(&[Some(a)])), ("b", ints(&[Some(b)]))]);
+        let base = SessionContext::new();
+        assert!(checks(&t, "s.t", &row(1, i64::MAX / 2), true, &base).is_err(), "a statement asks now()'s CHECK");
+        committing(async { checks(&t, "s.t", &row(1, i64::MAX / 2), true, &base) }).await.expect("a commit doesn't ask it again");
+        let err = committing(async { checks(&t, "s.t", &row(-1, 1), true, &base) }).await.err().expect("a commit asks a CHECK whose answer is the same");
+        assert!(crate::codes::words(&err).contains("\"a_pos\""), "{}", crate::codes::words(&err));
     }
 
     #[tokio::test]

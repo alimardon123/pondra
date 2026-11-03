@@ -236,27 +236,31 @@ fn plan_id(plan: &Arc<dyn ExecutionPlan>) -> String {
     format!("{:016x}", fnv(text.as_bytes()))
 }
 
-/// A statement as the same statement asked again: its literals `?` (a list of them one `?`), its
-/// words lower-cased, its comments and spacing left out; a short hash of that. One query's runs,
-/// whatever values they were asked with (Postgres's queryid, Snowflake's query hash).
-pub fn fingerprint(sql: &str) -> Option<String> {
+/// A statement's fingerprint and its shape. The fingerprint is the statement as the same statement asked again: its literals
+/// `?` (a list of them one `?`), its words lower-cased, its comments and spacing left out; a short hash of that. One query's
+/// runs, whatever values they were asked with (Postgres's queryid, Snowflake's query hash). The shape is the fingerprint's
+/// words before hashing with its strings kept as written (a string can name a relation: `FROM 'a.parquet'` reads that
+/// file) and each number `?` (a number names none): statements of one shape differ only in their numbers.
+fn prints(sql: &str) -> Option<(String, String)> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
     let tokens = Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?;
-    let mut words: Vec<String> = vec![];
+    let (mut words, mut shape): (Vec<String>, Vec<String>) = (vec![], vec![]);
     for t in tokens {
-        let word = match t {
+        let (word, written) = match &t {
             Token::Whitespace(_) => continue,
-            Token::Number(..) | Token::SingleQuotedString(_) | Token::NationalStringLiteral(_) | Token::EscapedStringLiteral(_) | Token::HexStringLiteral(_) | Token::DollarQuotedString(_) | Token::SingleQuotedByteStringLiteral(_) | Token::DoubleQuotedByteStringLiteral(_) => "?".to_string(),
-            Token::Word(w) if w.quote_style.is_none() => w.value.to_lowercase(),
-            t => t.to_string(),
+            Token::Number(..) => ("?".to_string(), None),
+            Token::SingleQuotedString(_) | Token::NationalStringLiteral(_) | Token::EscapedStringLiteral(_) | Token::HexStringLiteral(_) | Token::DollarQuotedString(_) | Token::SingleQuotedByteStringLiteral(_) | Token::DoubleQuotedByteStringLiteral(_) => ("?".to_string(), Some(t.to_string())),
+            Token::Word(w) if w.quote_style.is_none() => (w.value.to_lowercase(), None),
+            t => (t.to_string(), None),
         };
+        shape.push(written.unwrap_or_else(|| word.clone()));
         if word == "?" && words.len() >= 2 && words[words.len() - 1] == "," && words[words.len() - 2] == "?" {
             words.pop(); // (`IN (1, 2, 3)` and `IN (1, 2)` are one query)
             continue;
         }
         words.push(word);
     }
-    Some(format!("{:016x}", fnv(words.join(" ").as_bytes())))
+    Some((format!("{:016x}", fnv(words.join(" ").as_bytes())), shape.join(" ")))
 }
 
 /// FNV-1a: a hash that is the same in every build and on every machine, so fingerprints and plan
@@ -416,6 +420,7 @@ fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
     let text = |f: &dyn Fn(&Line) -> Option<String>| Arc::new(lines.iter().map(f).collect::<StringArray>()) as ArrayRef;
     let int = |f: &dyn Fn(&Line) -> Option<i64>| Arc::new(lines.iter().map(f).collect::<Int64Array>()) as ArrayRef;
     let node = app.members.me().to_string();
+    let prints: Vec<Option<(String, String)>> = lines.iter().map(|l| (l.class != "skipped").then(|| prints(&l.sql)).flatten()).collect();
     let arrays = vec![
         Arc::new(lines.iter().map(|l| Some(l.at as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef,
         text(&|l| Some(l.id.clone())),
@@ -433,11 +438,11 @@ fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
         int(&|l| l.note.nodes.map(|n| n as i64)),
         text(&|l| l.note.plan.clone()),
         text(&|l| (!l.note.trace.is_empty()).then(|| serde_json::to_string(&l.note.trace).unwrap_or_default())),
-        text(&|l| (l.class != "skipped").then(|| fingerprint(&l.sql)).flatten()),
+        Arc::new(prints.iter().map(|p| p.as_ref().map(|(print, _)| print.as_str())).collect::<StringArray>()) as ArrayRef,
         text(&|l| l.note.plan_id.clone()),
         int(&|l| l.note.version.map(|v| v as i64)),
     ];
-    let [reads, writes] = touched(app, lines);
+    let [reads, writes] = touched(app, lines, &prints);
     let local = |n: &String| crate::ddl::local(&app.lake, n).unwrap_or_else(|| n.clone());
     let learned = text(&|l| (!l.note.learned.is_empty()).then(|| {
         let facts: Vec<_> = l.note.learned.iter().map(|f| crate::learned::Fact { object: local(&f.object), ..f.clone() }).collect();
@@ -455,10 +460,10 @@ fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
 /// The tables and views each statement read, and the tables it changed, as this lake names them
 /// (another lake's as `lake.schema.t`): every relation it names but an INSERT's or a CREATE TABLE …
 /// AS's own; and the table an INSERT, UPDATE, DELETE, MERGE or CREATE TABLE … AS writes.
-fn touched(app: &App, lines: &[Line]) -> [ArrayRef; 2] {
+fn touched(app: &App, lines: &[Line], prints: &[Option<(String, String)>]) -> [ArrayRef; 2] {
     let (mut reads, mut writes) = (ListBuilder::new(StringBuilder::new()), ListBuilder::new(StringBuilder::new()));
     let local = |n: &String| crate::ddl::local(&app.lake, n).unwrap_or_else(|| n.clone());
-    for l in lines {
+    for (l, print) in lines.iter().zip(prints) {
         let w = if matches!(l.class, "write" | "ddl") {
             l.note.wrote.clone().unwrap_or_else(|| Wrote::of(crate::write::parse(&l.sql).as_ref())) // (the door's parse, else this one)
         } else {
@@ -466,7 +471,7 @@ fn touched(app: &App, lines: &[Line]) -> [ArrayRef; 2] {
         };
         let target = w.table.as_ref().map(local);
         let pure = w.pure;
-        match crate::text::control(&l.sql).is_none().then(|| relations(&l.sql)).flatten() { // (BEGIN, COMMIT and the like name none: no parse)
+        match crate::text::control(&l.sql).is_none().then(|| relations_by(print.as_ref().map(|(_, shape)| shape.as_str()), &l.sql)).flatten() { // (BEGIN, COMMIT and the like name none: no parse)
             Some(names) => {
                 names.iter().map(local).filter(|n| !(pure && Some(n) == target.as_ref())).for_each(|n| reads.values().append_value(n));
                 reads.append(true);
@@ -482,6 +487,21 @@ fn touched(app: &App, lines: &[Line]) -> [ArrayRef; 2] {
         }
     }
     [Arc::new(reads.finish()), Arc::new(writes.finish())]
+}
+
+/// `relations`, kept by the statement's shape (`prints`): statements of one shape name the same relations (a shape keeps
+/// every name and every string as written), so a statement run again with other numbers isn't parsed again. Without a
+/// shape, or with a long one, parsed.
+fn relations_by(shape: Option<&str>, sql: &str) -> Option<Vec<String>> {
+    type Seen = lru::LruCache<String, Option<Vec<String>>>;
+    crate::per_node!(static SEEN: Mutex<Seen> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(1024).expect("non-zero"))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+    let Some(shape) = shape.filter(|s| s.len() <= 4096) else { return relations(sql) }; // (1,024 kept shapes: at most 4 MB)
+    if let Some(r) = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get(shape) {
+        return r.clone();
+    }
+    let r = relations(sql);
+    SEEN.lock().unwrap_or_else(|e| e.into_inner()).put(shape.to_string(), r.clone());
+    r
 }
 
 /// Every relation one statement names, anywhere in it, once each, CTE names left out (as
@@ -618,6 +638,29 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{Int64Array, RecordBatch};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn a_statements_relations_are_kept_by_its_shape() {
+        let shape = |sql: &str| prints(sql).map(|(_, shape)| shape);
+        let fingerprint = |sql: &str| prints(sql).map(|(print, _)| print);
+        let (a, b) = ("SELECT * FROM t JOIN s.u ON t.k = u.k WHERE t.v = 1", "select * from T join s.u on t.k = u.k where t.v = 22");
+        assert_eq!(shape(a), shape(b), "the same statement but for its numbers");
+        assert_eq!(relations_by(shape(a).as_deref(), a), Some(vec!["t".to_string(), "s.u".to_string()]));
+        assert_eq!(relations_by(shape(b).as_deref(), b), relations(b), "kept, and the same as parsed");
+        // (a string can name what's read: one fingerprint, two shapes)
+        let (f, g) = ("SELECT * FROM 'a.parquet' WHERE v = 1", "SELECT * FROM 'b.parquet' WHERE v = 2");
+        assert_eq!(fingerprint(f), fingerprint(g));
+        assert_ne!(shape(f), shape(g));
+        assert_eq!(relations_by(shape(f).as_deref(), f), relations(f));
+        assert_eq!(relations_by(shape(g).as_deref(), g), relations(g));
+        assert_ne!(relations(f), relations(g), "{:?}", relations(f));
+        let quoted = "SELECT * FROM \"T\" WHERE v = 1";
+        assert_ne!(shape(quoted), shape("SELECT * FROM t WHERE v = 1"), "a quoted name is another statement");
+        assert_eq!(relations_by(shape(quoted).as_deref(), quoted), Some(vec!["T".to_string()]));
+        assert_eq!(relations_by(None, "SELECT 1"), None);
+        // (the fingerprint is the one it was: lists of values one `?`, strings `?`)
+        assert_eq!(fingerprint("SELECT * FROM t WHERE k IN (1, 2, 3) AND n = 'x'"), fingerprint("select * from t where k in (4, 5) and n = 'y'"));
+    }
     use datafusion::parquet::arrow::ArrowWriter;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::prelude::SessionContext;
