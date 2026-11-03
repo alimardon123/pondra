@@ -1,0 +1,17 @@
+A float IN list's zero answers as `=` does (zeros_in.rs, ZerosIn). Found by the nightly random_sql.py --seed 20261102
+(L7's #447) on main fe66217: Postgres and DuckDB answer true, Pondra false.
+
+Before (main 5bef730's library, in-process), a table f(a DOUBLE) with rows -0.0, 0.0, 2.0:
+  SELECT CAST('-0.0' AS DOUBLE) IN (0.0)                          -> true  (a one-item list is planned as =)
+  SELECT CAST('-0.0' AS DOUBLE) IN (1.0, 0.0)                     -> false (wrong)
+  SELECT -(a) IN (2.0, 0.0) FROM (VALUES (0.0::DOUBLE)) v(a)      -> false (wrong)
+  a IN (0.0, 2.0, 3.0, ..., 9.0) for a = -0.0                     -> false (wrong)
+  a = 0.0, a = -0.0 for a = -0.0                                   -> true, true (DataFusion's comparisons make the zeros one)
+  JOIN ON f.a = g.b (0.0), IN (SELECT b FROM g), GROUP BY a        -> -0.0 and 0.0 taken as one (right)
+
+DataFusion 55's IN-list sets for floats (in_list::primitive_filter, branchless_filter) compare bits.
+
+After: cargo test --lib zeros_in:: (a_zero_is_in_a_list_holding_the_other_zero) over -0.0, 0.0, 2.0, NULL, 1.5:
+IN, NOT IN, -a IN, a long list, a = 0.0 OR a = 2.0 (made an IN list by the simplifier), a literal -0.0 in the list,
+NOT IN with a NULL, and a list with no zero (left as it is), each Postgres's answer and its column's name unchanged;
+WHERE -a IN (2.0, 0.0) keeps both zeros.
