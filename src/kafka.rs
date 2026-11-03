@@ -31,7 +31,7 @@ use bytes::{BufMut, Bytes};
 use datafusion::arrow::array::{new_null_array, Array, ArrayRef, AsArray, BinaryArray, BooleanArray, StringArray, TimestampMillisecondArray};
 use datafusion::arrow::compute::{cast, concat_batches};
 use datafusion::arrow::datatypes::{DataType, Schema};
-use datafusion::arrow::{json as arrow_json, record_batch::RecordBatch};
+use datafusion::arrow::record_batch::RecordBatch;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use serde_json::Value;
@@ -1035,12 +1035,7 @@ async fn read(app: &App, table: &str, meta: &TableMeta, offset: u64, visible: u6
 
 /// Rows as (key, value): the value a JSON row (null for a delete), the key the key columns.
 fn records(meta: &TableMeta, rows: &RecordBatch) -> Result<Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>> {
-    let lines = |b: &RecordBatch| -> Result<Vec<Vec<u8>>> {
-        let mut w = arrow_json::LineDelimitedWriter::new(Vec::new());
-        w.write(b)?;
-        w.finish()?;
-        Ok(w.into_inner().split(|&c| c == b'\n').take(b.num_rows()).map(<[u8]>::to_vec).collect())
-    };
+    let lines = crate::answer::json_each;
     let pick = |cols: &[&str]| -> Result<RecordBatch> { Ok(rows.project(&cols.iter().map(|c| rows.schema().index_of(c)).collect::<Result<Vec<_>, _>>()?)?) };
     let shown: Vec<&str> = meta.columns.iter().map(|(c, _)| c.as_str()).filter(|c| *c != "_deleted").collect();
     let values = lines(&pick(&shown)?)?;

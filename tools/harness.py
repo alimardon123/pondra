@@ -12047,6 +12047,8 @@ def guarded():
         "erin: Kafka tombstone": tombstone("stock", "erin", "erin-password-1", {"id": 3}),
         "fay: /append marked _deleted": ask(P, json.dumps({"id": 2, "_deleted": True}), path="/append/stock", auth=fay),
         "fay: Kafka tombstone": tombstone("stock", "fay", "fay-password-1", {"id": 3}),
+        "dave: Iceberg create table": ask(P, json.dumps({"name": "by_dave", "schema": {"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "id", "required": False, "type": "long"}]}}),
+                                          path="/v1/namespaces/default/tables", auth=dave),
     }
     info["S11"] = {"published": published, **{k: str(v)[:300] for k, v in said.items()}}
     appended = said["dave: an append table's /append, DoPut and produce"]
@@ -12060,6 +12062,10 @@ def guarded():
         and said["fay: Kafka tombstone"] == ["None"] and said["fay: Iceberg DELETE"] == "ok" \
         and until(lambda: ask(P, "SELECT id, amount FROM stock ORDER BY id", auth=boss), [{"id": 1, "amount": 9.0}], 15) == [{"id": 1, "amount": 9.0}] \
         and until(lambda: ask(P, "SELECT count(*) AS n FROM ice", auth=boss), [{"n": 3}], 15) == [{"n": 3}]
+    made = said["dave: Iceberg create table"]
+    checks["a user's table made through the Iceberg REST catalog: 403 ForbiddenException (making tables is an admin's), nothing made"] = \
+        refused(made) and '"type":"ForbiddenException"' in made.replace(" ", "") and "this user may not change the lake" in made \
+        and "by_dave" not in str(ask(P, "SELECT name FROM pondra.tables", auth=boss))
     # (the REST catalog's listing shows a user only the tables it may read, as SQL's listings do: S27)
     lister = lambda u: load_catalog(f"ls_{u}", type="rest", uri=f"http://127.0.0.1:{P}", token=ask(P, f"CREATE TOKEN ls_{u} FOR USER {u}", auth=boss)["token"])
     listed = {u: sorted(".".join(t) for t in lister(u).list_tables("default")) for u in ("boss", "bob")}

@@ -115,7 +115,7 @@ async fn create_namespace(axum::extract::State(app): axum::extract::State<crate:
     let [s] = &parts[..] else {
         return Err(bad(format!("namespace {}: a schema of this database is one part; an attached database's schemas are made by its own nodes", parts.join("."))));
     };
-    as_caller(&app, role, &format!("CREATE SCHEMA {}", quoted(s))).await?;
+    as_caller(&app, role, &format!("CREATE SCHEMA {}", quoted(s)), false).await?;
     Ok(axum::Json(json!({"namespace": parts, "properties": {}})))
 }
 
@@ -126,7 +126,7 @@ async fn drop_namespace(axum::extract::State(app): axum::extract::State<crate::a
     if !std::sync::Arc::ptr_eq(&lake, &app.lake) {
         return Err(bad(format!("namespace {} is {}'s, an attached database: its schemas are dropped by its own nodes", parts.join("."), parts[0])));
     }
-    as_caller(&app, role, &format!("DROP SCHEMA {}", quoted(&schema))).await?;
+    as_caller(&app, role, &format!("DROP SCHEMA {}", quoted(&schema)), true).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -155,10 +155,11 @@ fn sql_name(app: &crate::app::App, parts: &[String], lake: &std::sync::Arc<Lake>
     }
 }
 
-/// A statement for the catalog's table changes, run as the caller (DDL: an admin's).
-async fn as_caller(app: &crate::app::App, role: crate::auth::Role, sql: &str) -> Result<(), Refusal> {
+/// A statement for the catalog's table changes, run as the caller (DDL: an admin's). `drops_namespace`: the namespace DELETE route, whose
+/// 2BP01 is a namespace that isn't empty.
+async fn as_caller(app: &crate::app::App, role: crate::auth::Role, sql: &str, drops_namespace: bool) -> Result<(), Refusal> {
     let who = crate::routines::Who { role, files: false, depth: 0 };
-    Box::pin(crate::routines::one(app, sql, who, None)).await.map(|_| ()).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), sql.starts_with("DROP SCHEMA")))
+    Box::pin(crate::routines::one(app, sql, who, None)).await.map(|_| ()).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), drops_namespace))
 }
 
 /// An error as the Iceberg REST catalog answers it: its exception by the error's SQLSTATE (`codes::kind`), the message as
@@ -186,7 +187,7 @@ async fn create(axum::extract::State(app): axum::extract::State<crate::app::App>
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the table: {e}")))?;
     let table = asked["name"].as_str().filter(|n| !n.is_empty()).ok_or_else(|| bad("a table without its name".into()))?;
     let sql = create_sql(&sql_name(&app, &parts, &lake, &schema, table), &asked).map_err(|e| bad(crate::ext::said(&e)))?;
-    as_caller(&app, role, &sql).await?;
+    as_caller(&app, role, &sql, false).await?;
     let name = crate::text::join(&schema, table);
     for _ in 0..600 {
         if let Ok(v) = loaded(&lake, &name).await {
@@ -347,7 +348,7 @@ fn schema_sql(name: &str, meta: &Value, asked: &Value) -> Result<Vec<String>> {
 async fn drop_table(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>) -> Result<axum::http::StatusCode, Refusal> {
     let (parts, lake, schema) = space(&app, &ns).await?;
     loaded(&lake, &crate::text::join(&schema, &table)).await.map_err(|_| missing(&format!("table {}.{table}", parts.join(".")), "NoSuchTableException"))?;
-    as_caller(&app, role, &format!("DROP TABLE {}", sql_name(&app, &parts, &lake, &schema, &table))).await?;
+    as_caller(&app, role, &format!("DROP TABLE {}", sql_name(&app, &parts, &lake, &schema, &table)), false).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -363,7 +364,7 @@ async fn rename(axum::extract::State(app): axum::extract::State<crate::app::App>
     }
     loaded(&lake, &crate::text::join(&schema, name)).await.map_err(|_| missing(&format!("table {}.{name}", parts.join(".")), "NoSuchTableException"))?;
     let sql = format!("ALTER TABLE {} RENAME TO \"{}\"", sql_name(&app, &parts, &lake, &schema, name), new.replace('"', "\"\""));
-    as_caller(&app, role, &sql).await?;
+    as_caller(&app, role, &sql, false).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -404,7 +405,7 @@ async fn update(axum::extract::State(app): axum::extract::State<crate::app::App>
         };
         sql.extend(properties_sql(&target, &updates));
         for s in &sql {
-            as_caller(&app, role, s).await?;
+            as_caller(&app, role, s, false).await?;
         }
         let version = current["metadata"]["last-sequence-number"].as_u64().unwrap_or(0);
         for _ in 0..200 {

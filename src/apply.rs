@@ -1316,13 +1316,7 @@ pub async fn table(lake: &Lake) -> Result<datafusion::arrow::array::RecordBatch>
 // ---------------------------------------------------------------- CALL plan(…), CALL apply(…)
 
 /// The first `n` rows as JSON objects.
-pub(crate) fn rows_json(rows: &[datafusion::arrow::array::RecordBatch], n: usize) -> Result<Vec<Value>> {
-    let mut w = datafusion::arrow::json::ArrayWriter::new(Vec::new());
-    w.write_batches(&rows.iter().collect::<Vec<_>>())?;
-    w.finish()?;
-    let all: Vec<Value> = serde_json::from_slice(&w.into_inner()).unwrap_or_default();
-    Ok(all.into_iter().take(n).collect())
-}
+pub(crate) fn rows_json(rows: &[datafusion::arrow::array::RecordBatch], n: usize) -> Result<Vec<Value>> { crate::answer::json_values(rows, n) }
 
 /// Pondra's own procedures for a project kept in the workspace (`capture` is one only to refuse it by name).
 pub fn is_own(name: &str) -> bool { matches!(name.to_ascii_lowercase().as_str(), "plan" | "apply" | "status" | "capture" | "pondra.plan" | "pondra.apply" | "pondra.status" | "pondra.capture") }

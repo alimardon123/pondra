@@ -16,7 +16,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use datafusion::arrow::{json::ArrayWriter, record_batch::RecordBatch};
+use datafusion::arrow::record_batch::RecordBatch;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -359,23 +359,7 @@ async fn changes(app: &App, table: &str, after: Option<u64>) -> Result<Value> {
 }
 
 /// Every row as a JSON object.
-fn all_rows(batches: &[RecordBatch]) -> Result<Value> {
-    let mut w = ArrayWriter::new(Vec::new());
-    batches.iter().try_for_each(|b| w.write(b))?;
-    w.finish()?;
-    let out = w.into_inner();
-    Ok(if out.is_empty() { json!([]) } else { serde_json::from_slice(&out)? })
-}
+fn all_rows(batches: &[RecordBatch]) -> Result<Value> { Ok(Value::Array(crate::answer::json_values(batches, usize::MAX)?)) }
 
 /// The first `ROWS` rows as JSON objects.
-fn rows(batches: &[RecordBatch]) -> Result<Value> {
-    let (mut left, mut w) = (ROWS, ArrayWriter::new(Vec::new()));
-    for b in batches {
-        let n = left.min(b.num_rows());
-        w.write(&b.slice(0, n))?;
-        left -= n;
-    }
-    w.finish()?;
-    let out = w.into_inner();
-    Ok(if out.is_empty() { json!([]) } else { serde_json::from_slice(&out)? })
-}
+fn rows(batches: &[RecordBatch]) -> Result<Value> { Ok(Value::Array(crate::answer::json_values(batches, ROWS)?)) }
