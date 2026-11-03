@@ -786,7 +786,8 @@ async fn keyed(lake: &Lake, name: &str, meta: &TableMeta, c: &mut Commit) -> Res
     let logical = meta.logical();
     let schema = crate::answer::schema(&logical.columns)?;
     let names: Vec<&str> = meta.key.iter().map(|k| meta.name_of(k)).collect();
-    let ids: std::collections::BTreeSet<i64> = meta.key.iter().filter_map(|k| meta.columns.iter().position(|(c, _)| c == k)).map(|i| i as i64 + 1).collect();
+    let list = meta.column_list();
+    let ids: std::collections::BTreeSet<i64> = meta.key.iter().filter_map(|k| list.of_stored(k)).map(|c| c.id as i64).collect();
     let ctx = lake.session();
     let mut gone = vec![]; // (the keys it deletes, under their SQL names)
     for (f, by) in &c.equality {

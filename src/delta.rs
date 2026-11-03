@@ -486,8 +486,9 @@ pub(crate) struct Range {
 /// DROP COLUMN, a later column's Iceberg field id must not land on another column's.
 /// A column whose type doesn't parse is left out: its files then publish no ranges for it, and the table is still published.
 pub(crate) fn columns(meta: &TableMeta) -> Vec<Column> {
-    let published = meta.columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c) && !meta.marker(c));
-    published.filter_map(|(i, (c, t))| Some(Column { i, name: c.clone(), t: crate::answer::dtype(t).ok()? })).collect()
+    let list = meta.column_list();
+    let published = list.stored_order().filter(|c| !meta.marker(&c.stored));
+    published.filter_map(|c| Some(Column { i: c.id as usize - 1, name: c.stored.clone(), t: crate::answer::dtype(&c.dtype).ok()? })).collect()
 }
 
 /// A file's ranges, for the columns `cols` has a range for in the file's statistics. Both open

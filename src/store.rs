@@ -220,8 +220,9 @@ impl TableMeta {
     }
 
     /// Its columns as one list (`column.rs`): each with its id, SQL's name and its stored one, in SQL's order (as
-    /// `in_order`), the dropped ones last and marked. Made from the entry's fields each time it is asked: `cols` keeps it
-    /// once for an entry read from the catalog.
+    /// `in_order`), the dropped ones marked. Made from the entry's fields each time it is asked: `cols` keeps it once for
+    /// an entry read from the catalog. Of the entry as stored only: `logical()`'s copy has left out the dropped columns
+    /// and taken SQL's names, so its places are no longer ids.
     pub fn column_list(&self) -> crate::column::Columns {
         crate::column::Columns::new(&self.columns, |c| self.name_of(c), |c| self.is_dropped(c), &self.shown)
     }
