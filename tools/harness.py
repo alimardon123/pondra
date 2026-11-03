@@ -10866,14 +10866,27 @@ def users():
     checks["Flight's GetFlightInfo of a table refuses a user granted only some columns (no column names), and serves one it may read"] = \
         "permission denied" in str(infos[0]) and "text" in infos[1]
     # Revoked and dropped: at once, on the leader and a follower
+    ann_pg = psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=ann password=ann-password-1 dbname=lake", connect_timeout=10, autocommit=True)  # (open across the REVOKE and the DROP)
+    def ann_said(q):
+        try:
+            return ann_pg.execute(q).fetchall()
+        except Exception as e:
+            return f"ERROR {e}"
+    ann_before = ann_said("SELECT item FROM sales.orders ORDER BY id")
     as_(A.port, boss, "REVOKE SELECT (item) ON sales.orders FROM analyst")
     revoked = [until(lambda: "permission denied" in str(as_(port, ann, "SELECT item FROM sales.orders")), True, 10) for port in (A.port, A.port + 1)]
     still = as_(A.port, ann, "SELECT id FROM sales.orders ORDER BY id")
     as_(A.port, boss, "REVOKE analyst FROM ann")
     no_role = until(lambda: "permission denied" in str(as_(A.port + 1, ann, "SELECT id FROM sales.orders")), True, 10)
     grants = as_(A.port, boss, "SELECT grantee, privilege, on_name, columns FROM pondra.grants ORDER BY grantee, privilege, on_name")
+    ann_revoked = until(lambda: "permission denied" in str(ann_said("SELECT item FROM sales.orders ORDER BY id")), True, 15)
     as_(A.port, boss, "DROP USER ann")
     gone = [until(lambda: str(as_(port, ann, "SELECT 1 AS x")).startswith("ERROR 401"), True, 10) for port in (A.port, A.port + 1)]
+    ann_last = []  # (what its open connection is told, up to the first error: FATAL, then closed)
+    until(lambda: ann_last.append(str(ann_said("SELECT 1 AS x"))) or ann_last[-1].startswith("ERROR"), True, 15)
+    checks["a Postgres connection open across them: a REVOKE reaches its next statement, a DROP USER ends it (FATAL, its sign-in checked again every 5 s)"] = \
+        isinstance(ann_before, list) and ("tea",) in ann_before and ann_revoked is True and "signed out" in ann_last[-1] and ann_pg.closed \
+        or {"before": ann_before, "revoked": ann_revoked, "last": ann_last[-3:]}
     checks["revoked (a column, a role) and dropped: at once on the leader and a follower; pondra.grants says what stands"] = revoked == [True, True] and still == [{"id": 1}, {"id": 2}] \
         and no_role is True and gone == [True, True] and {"grantee": "analyst", "privilege": "SELECT", "on_name": "sales.orders", "columns": "id, amount"} in grants
     # W50: a user granted a view (and a materialized view) alone is shown their names, columns and rows, not their queries,
