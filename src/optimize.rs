@@ -94,6 +94,8 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     rules.insert(0, Arc::new(crate::frugal::MiddleRows));
     let pushed = rules.iter().position(|r| r.name() == "push_down_filter").unwrap_or(0);
     rules.insert(pushed, Arc::new(ValuesRight)); // (just before: the filter pushdown merges one column's comparisons)
+    let simplified = rules.iter().position(|r| r.name() == "simplify_expressions").unwrap_or(0);
+    rules.insert(simplified, Arc::new(DecimalIdentities)); // (just before: the simplifier's `x * 0` and `x % 1` of a DECIMAL)
     rules.push(Arc::new(ScaledLiterals)); // (after the simplifier folds a literal's cast)
     rules.push(Arc::new(crate::zeros_in::ZerosIn)); // (after the simplifier, which makes ORed `=`s of a column one IN list)
     rules.push(Arc::new(crate::multiply::Products)); // (a DECIMAL product in native integers when its values are small)
@@ -868,6 +870,73 @@ fn cheap_first(e: &Expr, schema: &DFSchema) -> Expr {
         }
         Expr::BinaryExpr(b) if b.op == Operator::Or => disjunction(split_binary(e, Operator::Or).into_iter().map(|p| cheap_first(p, schema))).expect("at least two"),
         _ => e.clone(),
+    }
+}
+
+/// A DECIMAL `x * 0` and `x % 1` of a column that can't be NULL, done just before DataFusion's simplifier, which does them
+/// wrongly. DataFusion 55.1 makes `x * 0` the zero as written, of the zero's type and not the product's, so a CASE or
+/// COALESCE around it was refused, its branches' types apart (`zero-times-decimal`, found by `tools/random_sql.py`). It
+/// makes `x % 1` zero, which a DECIMAL's fraction isn't: `3.50 % 1` was 0, not 0.50. Here `x * 0` is the zero of the
+/// product's type, and `x % 1` is written `x % -1`, the same remainder (its sign is the dividend's), which DataFusion
+/// leaves. The zero or one is any constant that folds to one (`0`, `0.0`, `CAST(0 AS DECIMAL(5, 2))`, `1.0 - 1.0`).
+#[derive(Debug)]
+struct DecimalIdentities;
+
+impl OptimizerRule for DecimalIdentities {
+    fn name(&self) -> &str {
+        "pondra_decimal_identities"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        rewrite_typed(plan, with_a_constant, decimal_identity)
+    }
+}
+
+/// A product with a constant on one side, or a remainder by a constant: the only expressions `DecimalIdentities` looks at.
+fn with_a_constant(e: &Expr) -> bool {
+    let Expr::BinaryExpr(b) = e else { return false };
+    match b.op {
+        Operator::Multiply => !b.left.any_column_refs() || !b.right.any_column_refs(),
+        Operator::Modulo => !b.right.any_column_refs(),
+        _ => false,
+    }
+}
+
+/// `e` as `DecimalIdentities` writes it, or None: not a DECIMAL result, a side that can be NULL (DataFusion then leaves it
+/// too), or a constant that isn't the zero or the one.
+fn decimal_identity(e: &Expr, schema: &DFSchema) -> Option<Expr> {
+    let Expr::BinaryExpr(b) = e else { return None };
+    let t = e.get_type(schema).ok()?;
+    if !matches!(t, DataType::Decimal128(..) | DataType::Decimal256(..)) {
+        return None;
+    }
+    let never_null = |x: &Expr| x.nullable(schema).is_ok_and(|n| !n);
+    // (the constant's value, folded as the simplifier folds it; rare: a DECIMAL result with a side that can't be NULL)
+    let value = |x: &Expr| -> Option<ScalarValue> {
+        if x.any_column_refs() || x.is_volatile() {
+            return None;
+        }
+        let simplifier = datafusion::optimizer::simplify_expressions::ExprSimplifier::new(datafusion::logical_expr::simplify::SimplifyContext::builder().build());
+        match simplifier.simplify(x.clone()).ok()? {
+            Expr::Literal(v, _) if !v.is_null() => Some(v),
+            _ => None,
+        }
+    };
+    let zero = |x: &Expr| value(x).is_some_and(|v| ScalarValue::new_zero(&v.data_type()).is_ok_and(|z| z == v));
+    match b.op {
+        Operator::Multiply if (never_null(&b.left) && zero(&b.right)) || (never_null(&b.right) && zero(&b.left)) => Some(Expr::Literal(ScalarValue::new_zero(&t).ok()?, None)),
+        Operator::Modulo if never_null(&b.left) => {
+            let one = value(&b.right)?;
+            if ScalarValue::new_one(&one.data_type()).ok()? != one {
+                return None;
+            }
+            Some(Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(b.left.clone(), Operator::Modulo, Box::new(Expr::Literal(one.arithmetic_negate().ok()?, None)))))
+        }
+        _ => None,
     }
 }
 
@@ -2710,6 +2779,44 @@ mod tests {
             }
         }
         text
+    }
+
+    /// A DECIMAL `x * 0` and `x % 1` of a column that can't be NULL (`DecimalIdentities`): the product is the zero of its
+    /// own type, so a COALESCE or CASE around it plans, and the remainder is the fraction, with the dividend's sign. Without
+    /// the rule DataFusion refuses the first and gives 0 for the second. A column that can be NULL, and an INT, are left.
+    #[tokio::test]
+    async fn a_decimal_times_zero_and_its_remainder_by_one() {
+        use datafusion::arrow::array::{ArrayRef, Decimal128Array, Int32Array, RecordBatch};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let d: ArrayRef = Arc::new(Decimal128Array::from(vec![350i128, -325, 200]).with_precision_and_scale(10, 2).unwrap());
+        let n: ArrayRef = Arc::new(Decimal128Array::from(vec![Some(125i128), None, Some(200)]).with_precision_and_scale(10, 2).unwrap());
+        let k: ArrayRef = Arc::new(Int32Array::from(vec![7, -3, 0]));
+        let fields = vec![Field::new("d", DataType::Decimal128(10, 2), false), Field::new("n", DataType::Decimal128(10, 2), true), Field::new("k", DataType::Int32, false)];
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![d, n, k]).unwrap();
+        let (ctx, plain) = (session(), session_without(Some("pondra_decimal_identities")));
+        ctx.register_batch("v", batch.clone()).unwrap();
+        plain.register_batch("v", batch).unwrap();
+        // (DataFusion's answers, without the rule)
+        assert!(plain.sql("SELECT COALESCE(NULL, d * 0) FROM v").await.unwrap().collect().await.is_err(), "refused, without the rule");
+        assert_eq!(answer(&plain, "SELECT d % 1 FROM v").await.1[0], [Some("0.00".to_string())], "DataFusion's 3.50 % 1");
+        let text = |rows: &[&[Option<&str>]]| rows.iter().map(|r| r.iter().map(|c| c.map(str::to_string)).collect::<Vec<_>>()).collect::<Vec<_>>();
+        for (q, want) in [
+            ("SELECT COALESCE(NULL, d * 0) FROM v", text(&[&[Some("0.00")], &[Some("0.00")], &[Some("0.00")]])),
+            ("SELECT COALESCE(NULL, 0.0 * d) FROM v", text(&[&[Some("0.000")], &[Some("0.000")], &[Some("0.000")]])),
+            ("SELECT COALESCE(NULL, d * (1.0 - 1.0)) FROM v", text(&[&[Some("0.000")], &[Some("0.000")], &[Some("0.000")]])),
+            ("SELECT CASE WHEN k > 0 THEN d * CAST(0 AS DECIMAL(5, 2)) ELSE d END FROM v", text(&[&[Some("0.0000")], &[Some("-3.2500")], &[Some("2.0000")]])),
+            ("SELECT d % 1 FROM v", text(&[&[Some("0.50")], &[Some("-0.25")], &[Some("0.00")]])),
+            ("SELECT COALESCE(NULL, d % 1.0) FROM v", text(&[&[Some("0.50")], &[Some("-0.25")], &[Some("0.00")]])),
+            ("SELECT n * 0, n % 1 FROM v", text(&[&[Some("0.00"), Some("0.25")], &[None, None], &[Some("0.00"), Some("0.00")]])),
+            ("SELECT k * 0, k % 1, d * 2 FROM v", text(&[&[Some("0"), Some("0"), Some("7.00")], &[Some("0"), Some("0"), Some("-6.50")], &[Some("0"), Some("0"), Some("4.00")]])),
+        ] {
+            assert_eq!(answer(&ctx, q).await.1, want, "{q}");
+        }
+        // (a column keeps its name, and the product its type)
+        for q in ["SELECT d % 1 FROM v", "SELECT n * 0, n % 1 FROM v"] {
+            assert_eq!(answer(&ctx, q).await.0, answer(&plain, q).await.0, "{q}");
+        }
+        assert_eq!(answer(&ctx, "SELECT d * 0.0 AS z FROM v").await.0, ["z: Decimal128(12, 3)"]);
     }
 
     /// A comparison written value first is merged with the column's others as the same comparison (`ValuesRight`): without
