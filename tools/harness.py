@@ -12074,10 +12074,26 @@ def guarded():
             return f"ERROR {type(e).__name__}: {e}"
     kafka_before = fetched()
     live_sql = json.dumps({"sql": "SELECT count(*) AS n FROM stock"}).encode()
-    h3 = {"watch": {}, "live, dropped": {}, "live, no superuser": {}}
+    def follow(auth, out):
+        """Flight's DoGet {"table": "stock"} (it follows) as a user, read as a stream, as `open_log` reads one: the bytes read
+        (its rows and its `{"after": N}` marks), and when and how it ended (11-03 H1)."""
+        try:
+            reader = fl.FlightClient(f"grpc://127.0.0.1:{P + 40}").do_get(fl.Ticket(json.dumps({"table": "stock"}).encode()),
+                                                                          options=fl.FlightCallOptions(headers=[(b"authorization", auth.encode())], timeout=60))
+            out["status"] = 200
+            while True:
+                chunk = reader.read_chunk()
+                out["bytes"] = out.get("bytes", 0) + (chunk.data.nbytes if chunk.data is not None else 0) + (chunk.app_metadata.size if chunk.app_metadata else 0)
+        except StopIteration:
+            out["ended"] = time.monotonic()
+        except Exception as e:
+            out["ended"] = time.monotonic()
+            out["error"] = f"{type(e).__name__}: {e}"
+    h3 = {"watch": {}, "live, dropped": {}, "live, no superuser": {}, "flight follow": {}}
     for name, auth, path, method, body in (("watch", hana, "/watch/stock", "GET", None), ("live, dropped", ivo, "/live", "POST", live_sql),
                                            ("live, no superuser", jon, "/live", "POST", live_sql)):
         threading.Thread(target=open_log, args=(P, auth, h3[name], path, method, body), daemon=True).start()
+    threading.Thread(target=follow, args=(hana, h3["flight follow"]), daemon=True).start()
     time.sleep(1)
     ask(P, "INSERT INTO stock VALUES (11, 1.0)", auth=boss)  # (a new row: /watch sends it, the live queries a new count)
     h3_flowing = until(lambda: all(s.get("status") == 200 and s.get("bytes", 0) > 0 for s in h3.values()), True, 20)
@@ -12094,6 +12110,8 @@ def guarded():
     checks["/watch, a live query and a Kafka consumer end when their sign-in may no longer have them: REVOKE, DROP USER and NOSUPERUSER end each within 12 s, and the consumer's next fetch is refused (11-02 H3)"] = \
         h3_flowing is True and not any(str(x).startswith("ERROR") for x in h3_said) and set(h3_ended) == set(h3) \
         and all(v <= 12 for v in h3_ended.values()) and isinstance(kafka_before, int) and kafka_before >= 1 and kafka_after == "refused"
+    checks["Flight's follow stream ends when its sign-in may no longer read the table: REVOKE ends it within 12 s, telling the client to sign in again (11-03 H1)"] = \
+        h3_flowing is True and h3_ended.get("flight follow", 99) <= 12 and "sign in again" in h3["flight follow"].get("error", "")
     # M8: a joined page's own statements are written by its node, as the sign-in's (`POST /cluster/records`, page_records.rs): a
     # superuser's sign-in only (never the nodes' key, nor a user with grants), at most 256 lines, under the node's own class and
     # words, and kept as a history row whatever the audit classes say. Node a's classes here have no read (`role,ddl,function,write`).

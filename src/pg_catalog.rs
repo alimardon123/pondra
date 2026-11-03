@@ -305,8 +305,8 @@ async fn log_rows(lake: &Lake, metas: &[(String, TableMeta)]) -> Result<BTreeMap
     if from >= to || to - from > FAR {
         return Ok(out);
     }
-    let segs = lake.cat.scan::<crate::store::Segment>(&crate::store::seg_key(from + 1), &crate::store::seg_key(to + 1)).await?;
-    let numbered: Vec<(u64, &crate::store::Segment)> = segs.iter().filter_map(|(k, s)| Some((k[2..].parse().ok()?, s))).collect();
+    let segs = lake.cat.segments(&crate::store::seg_key(from + 1), &crate::store::seg_key(to + 1)).await?;
+    let numbered: Vec<(u64, &crate::store::Segment)> = segs.iter().filter_map(|(k, s)| Some((k[2..].parse().ok()?, s.as_ref()))).collect();
     for (k, m) in shown {
         let n: u64 = numbered.iter().filter(|(at, _)| *at > m.tiered).map(|(_, s)| s.rows_of(&k[2..])).sum();
         if n > 0 {

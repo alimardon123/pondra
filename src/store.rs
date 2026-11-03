@@ -1610,9 +1610,9 @@ impl Lake {
         let Some(disk) = &self.disk else { return Ok(()) };
         let tables = self.cat.scan::<TableMeta>("t/", "t0").await?;
         let tiered = tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(0);
-        for (_, seg) in self.cat.scan::<Segment>(&seg_key(tiered + 1), "s0").await? {
+        for (_, seg) in self.cat.segments(&seg_key(tiered + 1), "s0").await? {
             if !seg.path.is_empty() {
-                disk.fetch_later(seg.path);
+                disk.fetch_later(seg.path.clone());
             }
         }
         let mut budget = disk.max / 2;
@@ -1923,44 +1923,15 @@ impl Lake {
         Ok(())
     }
 
-    /// The rows of `table` in log segment `n`, decoded once and then served from memory
-    /// (segments never change, so the cache never goes stale).
-    /// The log's segments after `after`, to the newest, each decoded once per node (a segment
-    /// never changes once committed), the list kept whole from where it was first asked for: a
-    /// key lookup reads only what was committed since the last one, however long the log tail.
+    /// The log's segments after `after`, to the newest visible, by number (`Catalog::segments`, so each is
+    /// parsed once a node). A key lookup asks only for what was committed since its last one (`serve::Tail`).
     pub async fn segments_after(&self, after: u64) -> Result<Vec<(u64, Arc<Segment>)>> {
-        struct Known {
-            start: u64, // every segment from here…
-            whole: u64, // …to here is in `segs`
-            segs: BTreeMap<u64, Arc<Segment>>,
-        }
-        crate::per_node!(static KNOWN: Mutex<std::collections::HashMap<String, Known>> = Default::default());
         let now = self.visible();
-        let from = match KNOWN.lock().unwrap().get(&self.url) {
-            Some(k) if k.start <= after + 1 && k.whole >= after => k.whole + 1, // (only what is new)
-            _ => after + 1,
-        };
-        let raw = if from <= now { self.cat.scan_raw(&seg_key(from), "s0").await? } else { BTreeMap::new() };
-        let mut all = KNOWN.lock().unwrap();
-        let k = all.entry(self.url.clone()).or_insert(Known { start: from, whole: from - 1, segs: BTreeMap::new() });
-        if from < k.start || from > k.whole + 1 {
-            *k = Known { start: from, whole: from - 1, segs: BTreeMap::new() }; // (asked from further back: begun again there)
+        if after >= now {
+            return Ok(vec![]);
         }
-        for (key, v) in raw {
-            let n = key[2..].parse::<u64>()?;
-            if n <= now && !k.segs.contains_key(&n) {
-                k.segs.insert(n, Arc::new(serde_json::from_slice::<Segment>(&v)?));
-            }
-        }
-        k.whole = k.whole.max(now);
-        while k.segs.len() > 200_000 {
-            let Some((first, _)) = k.segs.pop_first() else { break };
-            k.start = first + 1; // (the oldest go: asked for again, they are read again)
-        }
-        let mut out: Vec<(u64, Arc<Segment>)> = k.segs.range(after + 1..).map(|(n, s)| (*n, s.clone())).collect();
-        drop(all);
-        out.retain(|(n, _)| *n <= now);
-        Ok(out)
+        let segs = self.cat.segments(&seg_key(after + 1), &seg_key(now + 1)).await?;
+        segs.into_iter().map(|(k, s)| Ok((k[2..].parse::<u64>()?, s))).collect()
     }
 
     pub async fn segment_rows(&self, n: u64, seg: &Segment, table: &str) -> Result<Rows> {
@@ -2029,24 +2000,35 @@ impl Lake {
 }
 
 /// Catalog entries as parsed, by key, each with the raw bytes it was parsed from: tables' entries
-/// (`Catalog::parsed`) and log segments' (`Catalog::segments`). Bounded by count and by those bytes: an
-/// entry of 128 files' statistics is large, and every query fills the cache, so the least recently used
-/// go first.
+/// (`Catalog::parsed`) and log segments' (`Catalog::segments`). Bounded by count and by bytes, the raw ones
+/// and their parsed form's (`charge`): an entry of 128 files' statistics is large, and every query fills the
+/// cache, so the least recently used go first.
 struct Parsed<T> {
     by_key: lru::LruCache<String, (Bytes, Arc<T>)>, // (unbounded: `put` trims it)
-    bytes: usize,                                   // the raw bytes the entries hold
+    bytes: usize,                                   // what the entries are charged (`charge`)
     count: usize,                                   // the most entries kept
+    most: usize,                                    // the most bytes charged
+    charge: fn(usize) -> usize,                     // an entry's bytes, raw and parsed, by its raw length
 }
 
 const PARSED_COUNT: usize = 256;
 const PARSED_BYTES: usize = 16 << 20;
 /// The most segment entries kept parsed: more than a tiering round leaves untiered at a few thousand
-/// commits a second (`tier_secs`, 10 s), at ~200 bytes an entry. Past it a pass over every untiered
-/// segment parses each again, as it did before this cache.
+/// commits a second (`tier_secs`, 10 s). Past it a pass over every untiered segment parses each again,
+/// as it did before this cache.
 const SEGMENTS_COUNT: usize = 65_536;
+/// The most bytes they are charged, ~1 KB each for the common entry (`segment_charge`).
+const SEGMENTS_BYTES: usize = 64 << 20;
+
+/// A segment entry's bytes, raw and parsed, by its raw length: parsed, an entry of one table's part is
+/// ~750 bytes for ~80 raw (a map's node is 544), of ten tables ~1,700 for ~400 (measured with a counting
+/// allocator, 11-03). This charges a little more than either.
+fn segment_charge(raw: usize) -> usize { 640 + 4 * raw }
 
 impl<T> Parsed<T> {
-    fn new(count: usize) -> Self { Parsed { by_key: lru::LruCache::unbounded(), bytes: 0, count } }
+    fn new(count: usize, most: usize, charge: fn(usize) -> usize) -> Self {
+        Parsed { by_key: lru::LruCache::unbounded(), bytes: 0, count, most, charge }
+    }
 
     /// The entry parsed from these bytes, if it was parsed from bytes that are these.
     fn get(&mut self, key: &str, raw: &Bytes) -> Option<Arc<T>> {
@@ -2054,19 +2036,19 @@ impl<T> Parsed<T> {
         same_bytes(held, raw).then(|| m.clone())
     }
 
-    /// Keeps `m`, parsed from `raw`, unless `raw` alone is larger than the byte bound.
+    /// Keeps `m`, parsed from `raw`, unless it alone is charged more than the byte bound.
     fn put(&mut self, key: &str, raw: &Bytes, m: &Arc<T>) {
         if let Some((old, _)) = self.by_key.pop(key) {
-            self.bytes -= old.len();
+            self.bytes -= (self.charge)(old.len());
         }
-        if raw.len() > PARSED_BYTES {
+        if (self.charge)(raw.len()) > self.most {
             return;
         }
         self.by_key.put(key.to_string(), (raw.clone(), m.clone()));
-        self.bytes += raw.len();
-        while self.by_key.len() > self.count || self.bytes > PARSED_BYTES {
+        self.bytes += (self.charge)(raw.len());
+        while self.by_key.len() > self.count || self.bytes > self.most {
             let Some((_, (old, _))) = self.by_key.pop_lru() else { break };
-            self.bytes -= old.len();
+            self.bytes -= (self.charge)(old.len());
         }
     }
 }
@@ -2464,7 +2446,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Mutex::new(Parsed::new(PARSED_COUNT)), segs: Mutex::new(Parsed::new(SEGMENTS_COUNT)), frozen: Default::default(), closing: Default::default() }
+        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw)), segs: Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge)), frozen: Default::default(), closing: Default::default() }
     }
 
     /// What the catalog's block caches hold, in bytes.
@@ -2822,13 +2804,16 @@ impl Catalog {
 
     /// The log's segment entries with keys in [from, to) (`seg_key`), as `scan` gives them, each parsed once
     /// while its bytes stay the same: a committed segment never changes, and the tier loop (every second), a
-    /// table's log tail at each query and the change feed read every untiered one again each time.
+    /// table's log tail at each query, key lookups, Kafka fetches, the change feed and live queries read the
+    /// same ones again. Every reader of the log's segments reads them here: one cache, one parse each.
     pub async fn segments(&self, from: &str, to: &str) -> Result<Vec<(String, Arc<Segment>)>> {
         self.segments_of(self.scan_raw(from, to).await?)
     }
 
-    /// `segments` over entries already read.
+    /// `segments` over entries already read. A pass over more entries than the cache keeps (a sweep of the
+    /// whole log) parses those it hasn't without keeping them, so it doesn't push out the log tail's.
     fn segments_of(&self, raw: BTreeMap<String, Bytes>) -> Result<Vec<(String, Arc<Segment>)>> {
+        let keep = raw.len() <= SEGMENTS_COUNT;
         raw.into_iter()
             .map(|(k, v)| {
                 let hit = self.segs.lock().unwrap().get(&k, &v);
@@ -2836,7 +2821,9 @@ impl Catalog {
                     Some(seg) => seg,
                     None => {
                         let seg = Arc::new(serde_json::from_slice::<Segment>(&v)?);
-                        self.segs.lock().unwrap().put(&k, &v, &seg);
+                        if keep {
+                            self.segs.lock().unwrap().put(&k, &v, &seg);
+                        }
                         seg
                     }
                 };
@@ -3436,8 +3423,9 @@ mod tests {
     }
 
     /// A log segment's entry is parsed once for its bytes (`Catalog::segments`): a second pass over the same
-    /// entries, in other buffers, gives the same parses; changed bytes a new one; bad bytes an error; and the
-    /// count bound holds. Prints what a pass over 5,000 entries costs parsed and kept.
+    /// entries, in other buffers, gives the same parses; changed bytes a new one; bad bytes an error; each entry
+    /// is charged its parsed form too, within the bounds; and a sweep bigger than the cache leaves it as it was.
+    /// Prints what a pass over 5,000 entries costs parsed and kept.
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_segment_entry_is_parsed_once_per_version() -> Result<()> {
@@ -3464,7 +3452,20 @@ mod tests {
         let changed = cat.segments_of([(seg_key(42), seg(42, 3)?)].into_iter().collect())?;
         assert!(!Arc::ptr_eq(&changed[0].1, &second[41].1) && changed[0].1.parts["pgbench_history"] == vec![(42, 300, 3)], "changed bytes: a new parse");
         assert!(cat.segments_of([(seg_key(7), Bytes::from_static(b"not a segment"))].into_iter().collect()).is_err(), "bytes that aren't a segment are an error");
-        assert!(cat.segs.lock().unwrap().by_key.len() <= SEGMENTS_COUNT, "the count bound holds");
+        {
+            let held = cat.segs.lock().unwrap();
+            assert_eq!(held.bytes, held.by_key.iter().map(|(_, (raw, _))| segment_charge(raw.len())).sum::<usize>(), "each entry charged raw and parsed");
+            assert!(held.by_key.len() <= SEGMENTS_COUNT && held.bytes <= SEGMENTS_BYTES, "the bounds hold");
+        }
+        // A sweep of more entries than the cache keeps parses the ones it hasn't without keeping them: the tail's stay.
+        let sweep: BTreeMap<String, Bytes> = (1..=SEGMENTS_COUNT as u64 + 1).map(|n| Ok((seg_key(n), seg(n, 2)?))).collect::<Result<_>>()?;
+        let swept = cat.segments_of(sweep)?;
+        assert_eq!(swept.len(), SEGMENTS_COUNT + 1);
+        assert!(Arc::ptr_eq(&swept[0].1, &second[0].1), "a kept entry is a hit");
+        let held = cat.segs.lock().unwrap();
+        assert_eq!(held.by_key.len(), 5000, "nothing of the sweep's own kept");
+        assert!(held.by_key.peek(&seg_key(1)).is_some() && held.by_key.peek(&seg_key(60_000)).is_none());
+        drop(held);
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

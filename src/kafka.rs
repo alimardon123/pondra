@@ -760,7 +760,7 @@ async fn list_offsets(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
 /// looks at a window of them at a time: the first window holding a segment is where it starts.
 async fn first_segment(app: &App) -> Result<u64> {
     const WINDOW: u64 = 4096;
-    let first = |from: u64| async move { anyhow::Ok(app.lake.cat.scan::<Segment>(&seg_key(from), &seg_key(from + WINDOW)).await?.first().map(|(k, _)| k[2..].parse::<u64>()).transpose()?) };
+    let first = |from: u64| async move { anyhow::Ok(app.lake.cat.scan_raw(&seg_key(from), &seg_key(from + WINDOW)).await?.keys().next().map(|k| k[2..].parse::<u64>()).transpose()?) }; // (keys only: nothing parsed)
     let (mut lo, mut hi) = (0, app.lake.visible() + 1); // the answer is in [lo, hi]
     while lo < hi {
         let mid = (lo + hi) / 2;
@@ -904,7 +904,7 @@ async fn read(app: &App, table: &str, meta: &TableMeta, offset: u64, visible: u6
     let s = schema(&meta.columns)?;
     'fetch: while out.is_empty() && at <= visible {
         let upto = visible.min(at + 4095); // (segments without this table are skipped, 4,096 at a time)
-        for (key, seg) in app.lake.cat.scan::<Segment>(&seg_key(at), &seg_key(upto + 1)).await? {
+        for (key, seg) in app.lake.cat.segments(&seg_key(at), &seg_key(upto + 1)).await? {
             let n: u64 = key[2..].parse()?;
             let held = seg.rows_of(table);
             if crate::log::ord(n, held) <= offset || out.len() >= limit {
