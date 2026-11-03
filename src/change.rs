@@ -39,6 +39,7 @@ pub struct Merge {
 pub struct Upsert {
     pub columns: Vec<String>,                               // none: the table's, in order
     pub query: String,                                      // the rows
+    pub row: Option<usize>, // its one row's width, when `query` is one row of VALUES that reads nothing but itself (`rules::rows::constant_width`)
     pub on: Vec<String>,                                    // none: the table's key
     pub update: Option<(Vec<(String, String)>, Option<String>)>, // DO UPDATE's column = expression, WHERE (None: DO NOTHING)
 }
@@ -309,7 +310,7 @@ impl Merge {
     /// it always has. Its conditions: a table `txn::point_table` takes, no ttl (a table with a TTL takes no key fast path: SQL
     /// answers its upsert), with the ids a change keeps, no enforced UNIQUE, and no sign-in with limited access (a
     /// point read gives up for those too); a conflict target that is the key; one row of values that read no table
-    /// (`rules::rows::constant_row`: the row is worked out before the key's lock); a row the table's columns and no system
+    /// (`Upsert::row`, from `rules::rows::constant_width`: the row is worked out before the key's lock); a row the table's columns and no system
     /// name, with the key in it, as wide as the statement's columns; and a SET of columns the table has, but not the key,
     /// `_deleted` or a system name. INSERT OR REPLACE's empty SET is every given column but the key's, as its rows give
     /// them; a SET that is empty then is DO NOTHING.
@@ -323,18 +324,18 @@ impl Merge {
         if !crate::txn::point_table(name, stored) || stored.ttl.is_some() || !stored.ids || crate::constraints::checked(stored) || crate::auth::limited().is_some() {
             return None;
         }
-        if !crate::rules::rows::constant_row(&u.query) || !self.on_key(stored) {
+        let width = u.row?;
+        if !self.on_key(stored) {
             return None;
         }
-        let width = crate::rules::rows::rows_width(&u.query);
         let given: Vec<String> = match u.columns.is_empty() {
             true => {
                 let columns: Vec<String> = stored.sql_order().into_iter().filter(|c| c != "_deleted").collect(); // (SQL's order)
-                crate::write::implicit(&columns, width).to_vec()
+                crate::write::implicit(&columns, Some(width)).to_vec()
             }
             false => u.columns.clone(),
         };
-        if width != Some(given.len()) || !given.iter().all(|c| plain(c.as_str())) || !distinct(&given) || !stored.key.iter().all(|k| given.contains(k)) {
+        if width != given.len() || !given.iter().all(|c| plain(c.as_str())) || !distinct(&given) || !stored.key.iter().all(|k| given.contains(k)) {
             return None;
         }
         let update = match &u.update {
@@ -1217,7 +1218,7 @@ mod tests {
     #[test]
     fn an_upsert_is_on_the_key_when_it_conflicts_on_the_key() {
         let k = table(&["id"], &["id", "v"]);
-        let upsert = |on: &[&str]| Upsert { columns: vec![], query: "SELECT 1 AS id, 'a' AS v".into(), on: on.iter().map(|c| c.to_string()).collect(), update: None };
+        let upsert = |on: &[&str]| Upsert { columns: vec![], query: "SELECT 1 AS id, 'a' AS v".into(), row: None, on: on.iter().map(|c| c.to_string()).collect(), update: None };
         assert!(upsert_of("k".into(), upsert(&[]), String::new()).on_key(&k), "no conflict target: the key");
         assert!(upsert_of("k".into(), upsert(&["id"]), String::new()).on_key(&k));
         assert!(!upsert_of("k".into(), upsert(&["v"]), String::new()).on_key(&k), "another column");

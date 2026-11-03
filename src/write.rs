@@ -727,7 +727,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
                 (ast::SqliteOnConflict::Replace, None) => Some((vec![], None)), // (an empty SET: every column the rows give, `Upsert::merge`)
                 (other, None) => return Some(Stmt::Invalid(format!("INSERT {other}: Pondra takes INSERT OR IGNORE and INSERT OR REPLACE, or ON CONFLICT (…) DO …"))),
             };
-            let upsert = crate::change::Upsert { columns: columns.iter().map(object).collect(), query: q.to_string(), on: vec![], update };
+            let upsert = crate::change::Upsert { columns: columns.iter().map(object).collect(), row: crate::rules::rows::constant_width(&q), query: q.to_string(), on: vec![], update };
             Stmt::Merge(Box::new(crate::change::upsert_of(object(&t), upsert, text)))
         }
         Statement::Insert(ast::Insert { table: ast::TableObject::TableName(t), source: Some(q), columns, on: Some(on), .. }) => match on {
@@ -744,7 +744,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
                         _ => None,
                     }).collect::<Option<Vec<_>>>()?, u.selection.map(|w| w.to_string()))),
                 };
-                let upsert = crate::change::Upsert { columns: columns.iter().map(object).collect(), query: q.to_string(), on, update };
+                let upsert = crate::change::Upsert { columns: columns.iter().map(object).collect(), row: crate::rules::rows::constant_width(&q), query: q.to_string(), on, update };
                 Stmt::Merge(Box::new(crate::change::upsert_of(object(&t), upsert, text)))
             }
             _ => Stmt::Invalid("ON DUPLICATE KEY UPDATE is MySQL's: write INSERT … ON CONFLICT (…) DO UPDATE SET …, or MERGE".into()),
