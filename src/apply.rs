@@ -201,7 +201,7 @@ impl Project {
     }
 }
 
-/// A file under `objects/` that comes in 1.1, which 1.0 refuses by name (`project`): YAML (a pipeline or a dashboard) and
+/// A file under `objects/` that comes in 1.1, which 0.80 refuses by name (`project`): YAML (a pipeline or a dashboard) and
 /// Python (a pipeline). Its words, or None. The gatherers list one by its name with no text, so it is never skipped
 /// silently, and a project that holds one doesn't change meaning when 1.1 reads it.
 pub(crate) fn later_object(path: &str) -> Option<&'static str> {

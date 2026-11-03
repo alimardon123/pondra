@@ -775,7 +775,7 @@ fn files(dir: &Path) -> Result<BTreeMap<String, String>> {
         }
         Ok(())
     }
-    walk(dir, &dir.join("objects"), true, true, &mut out)?; // (the only walk that lists what 1.0 refuses: under objects/)
+    walk(dir, &dir.join("objects"), true, true, &mut out)?; // (the only walk that lists what 0.80 refuses: under objects/)
     walk(dir, &dir.join("migrations"), false, false, &mut out)?;
     walk(dir, &dir.join("seeds"), false, false, &mut out)?;
     walk(dir, &dir.join("tests"), false, false, &mut out)?;

@@ -1,4 +1,4 @@
-//! The statements 1.1 brings, refused by name in 1.0 at every door and form (ADR-072): pipelines, dashboards, the grants on
+//! The statements 1.1 brings, refused by name in 0.80 at every door and form (ADR-072): pipelines, dashboards, the grants on
 //! them, and `GRANT EXECUTE`; and connections (1.1, one object for every outside place), shown the `ATTACH` and the secret 1.0 writes. One list, read at the front (`front::expand`, which every node door and the
 //! page pass through), so a word added here is refused at every door in the same words. A pipeline's STEP, PARALLEL and
 //! WAIT FOR are refused where a statement starts: here, and in a script before any of it runs (`script.rs`, with its

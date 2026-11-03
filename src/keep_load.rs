@@ -20,6 +20,7 @@ use bytes::Bytes;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatchReader;
 use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
+use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::parquet::arrow::ProjectionMask;
 use datafusion::parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
@@ -114,15 +115,18 @@ async fn attempt(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str,
 const SHARE_FLOOR: usize = 32 << 20;
 
 /// How many cuts are copied at once: one a core, each holding its piece of the source and the file kept of it (up to
-/// `FILE_BYTES` each, as both are), within a quarter of the query memory, and at least two (`PONDRA_KEEP_AT_ONCE` for a
-/// test: the copies' speed against their number).
+/// `FILE_BYTES` each, as both are, and reserved from the query memory: `copy_one`), within a quarter of the query memory
+/// free now, and at least two (`PONDRA_KEEP_AT_ONCE` for a test: the copies' speed against their number).
 fn copies(target: &Lake) -> usize {
     if let Some(n) = crate::env::parse::<usize>("PONDRA_KEEP_AT_ONCE") {
         return n.max(1);
     }
-    let (_, memory) = target.memory();
-    crate::env::cores().min(memory / (8 * tier::FILE_BYTES)).max(2)
+    let (reserved, memory) = target.memory();
+    at_once(crate::env::cores(), memory.saturating_sub(reserved))
 }
+
+/// `copies` on this many cores with this much query memory free.
+fn at_once(cores: usize, free: usize) -> usize { cores.min(free / (8 * tier::FILE_BYTES)).max(2) }
 
 /// The name of the file a query is a bare scan of (`SELECT * FROM "ext:…"`, as `front::expand` writes `FROM 'f'`):
 /// None for any other query, one this parser doesn't read included.
@@ -142,6 +146,10 @@ struct Job {
 /// One cut read by range (never the whole file), copied, read back, and put as one of the table's files in `folder`.
 async fn copy_one(target: &Lake, folder: &str, schema: Arc<Schema>, job: Job, sys: Sys) -> Result<DataFile> {
     let Job { store, location, md, cut } = job;
+    // (its piece and the file kept of it, reserved while they are held, so the pool counts them as it admits other work:
+    // 11-03 audit M11)
+    let mut held = MemoryConsumer::new("a Parquet load's copy").register(&target.rt.memory_pool);
+    held.grow(2 * (cut.bytes.end - cut.bytes.start) as usize);
     let piece = store.get_range(&location, cut.bytes.clone()).await?;
     let (bytes, file) = tier::blocking(move || {
         let kept = keep_parquet::copy(&md, &schema, &cut, piece, Some(sys))?;
@@ -199,6 +207,17 @@ mod tests {
         assert_eq!(bare_scan("SELECT * FROM t"), None, "a table");
         assert_eq!(bare_scan("SELECT * FROM \"abc\""), None, "a quoted name that isn't a file");
         assert_eq!(bare_scan("SELECT ( FROM"), None, "a query this parser doesn't read");
+    }
+
+    /// A load copies a cut a core within a quarter of the query memory free now, two at least (11-03 audit M11: other
+    /// work's memory leaves the copies less room, and each copy's is reserved).
+    #[test]
+    fn copies_at_once_fit_the_free_query_memory() {
+        let f = tier::FILE_BYTES;
+        assert_eq!(at_once(16, 64 * f), 8);
+        assert_eq!(at_once(4, 64 * f), 4, "a core each");
+        assert_eq!(at_once(16, 24 * f), 3, "a quarter of what is free");
+        assert_eq!(at_once(16, 0), 2, "two at least");
     }
 
     /// The entry a written file of these rows gets, and the same entry read back from the bytes of a copy of it:
