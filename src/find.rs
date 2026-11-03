@@ -4,7 +4,7 @@
 //! added there is found as soon as its lister yields it.
 
 use crate::text::{join, PUBLIC};
-use crate::objects::{expect_sql, ident, kind, lakes, list, list_sql, name_sql, sql_type, Object, KINDS, PARTS, PATTERNS};
+use crate::objects::{expect_sql, ident, kind, lakes, list, list_sql, name_sql, sql_type, Object, PARTS, PATTERNS, all_kinds};
 use crate::store::{table_key, Lake};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::prelude::SessionContext;
@@ -273,7 +273,7 @@ fn fields(list: &[(&'static str, Option<&str>)]) -> Vec<(&'static str, String)> 
 
 /// Every kind, part and pattern, each as a concept of its own: found by its name, its `also` and its line.
 fn concepts() -> Vec<Candidate> {
-    let entries = KINDS.iter().map(|k| ("object", k.name, k.also, k.about))
+    let entries = all_kinds().map(|k| ("object", k.name, k.also, k.about))
         .chain(PARTS.iter().map(|p| ("part", p.name, p.also, p.about)))
         .chain(PATTERNS.iter().map(|p| ("pattern", p.name, p.also, p.about)));
     entries.map(|(is, name, also, about)| {

@@ -4,7 +4,7 @@
 //! view) is Pondra's SQL as everywhere else. What it turns: `"text"` (a string in Spark),
 //! `a DIV b`, `<=>`, `!`, `RLIKE`, `LATERAL VIEW [OUTER] explode(…)` and `explode` itself, and the
 //! functions both have with Spark's answers (`floor` a BIGINT, `substring`, `round`, …): Spark's
-//! own, registered in every session as `spark_floor`, … (`engine::spark`), so DataFusion's answers
+//! own, registered in every session as `spark_floor`, … (`SPARK`), so DataFusion's answers
 //! never change outside it (invariant 190). A cast to an integer cuts its fraction toward zero, as Spark
 //! does (`pondra_truncate`: Pondra's own casts round it). Backticks are names in Pondra's SQL too.
 use anyhow::{bail, ensure, Context, Result};
@@ -13,6 +13,9 @@ use datafusion::sql::sqlparser::dialect::{GenericDialect, SparkSqlDialect};
 use datafusion::sql::sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
+
+mod functions;
+pub use functions::{spark_functions, SPARK};
 
 /// Does this SQL name `spark_sql`? (A word match: `inline` parses only what does.)
 pub fn mentions(sql: &str) -> bool {
@@ -94,7 +97,7 @@ pub fn query(text: &str) -> Result<ast::Query> {
     let mut stmts = Parser::parse_sql(&SparkSqlDialect {}, text).context("Spark SQL")?;
     ensure!(stmts.len() == 1, "spark_sql takes one query, not {}", stmts.len());
     let ast::Statement::Query(mut q) = stmts.remove(0) else { bail!("spark_sql takes a query (SELECT, WITH, VALUES): other statements are Pondra's SQL") };
-    let mut t = Turn { names: &crate::engine::spark_functions().names };
+    let mut t = Turn { names: &spark_functions().names };
     if let ControlFlow::Break(e) = crate::walk::visit_mut(&mut q, &mut t) {
         return Err(e);
     }

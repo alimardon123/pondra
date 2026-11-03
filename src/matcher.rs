@@ -1783,6 +1783,19 @@ fn evaluator_of(all: bool, open: bool, planner: &Arc<Planner>, stop: &Option<Arc
     Ok(evaluator)
 }
 
+/// MATCH_RECOGNIZE's matcher in every session, after the function sets before it in the build's list (`crate::built_in`),
+/// so a DEFINE sees theirs.
+pub static MATCH_RECOGNIZE: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "match_recognize",
+    requires: &["engine"],
+    register: |r| {
+        r.section_mut::<crate::engine::Functions>().add("match_recognize", |ctx| {
+            register(&ctx);
+            ctx
+        })
+    },
+};
+
 /// Registers `pondra_match`, `pondra_matches`, `pondra_open` and `pondra_nav` with a session (`engine::session`, for every form). A DEFINE's
 /// glue is planned against the session as it stands here, so it sees the functions registered before this call and no later
 /// one. A lake's statement that reads a pattern registers it again, last (`query::session_at`), so its DEFINEs see the AI,
@@ -2897,7 +2910,7 @@ mod tests {
     #[tokio::test]
     async fn a_define_sees_the_ai_functions_the_node_registers() -> Result<()> {
         // The matcher registered after the AI functions, as `query::session_at` does, so the glue plans cosine_similarity
-        let ctx = crate::store::functions(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        let ctx = crate::engine::session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
         crate::matcher::register(&ctx);
         let sql = crate::pattern::rewritten(
             "WITH t(day, emb) AS (VALUES (1, [1.0, 0.0]), (2, [0.9, 0.1])) SELECT day, sym FROM t MATCH_RECOGNIZE (ORDER BY day \

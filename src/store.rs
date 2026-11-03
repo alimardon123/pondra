@@ -1404,17 +1404,6 @@ impl ObjectStore for ReadOnly {
     async fn copy_opts(&self, _: &Path, to: &Path, _: object_store::CopyOptions) -> object_store::Result<()> { Err(refused(&self.1, &to.to_string())) }
 }
 
-/// A session with every function a query's session has but what needs a lake: the engine's (`engine::session`, with
-/// Postgres's JSON operators and functions), and the node's own. A node's sessions start from it (`Lake::made`), and so do
-/// the expressions a table keeps (`defaults.rs`: CHECK, DEFAULT and expectations), so a condition planned in a query plans
-/// there too.
-pub(crate) fn functions(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
-    let ctx = crate::engine::session(config, rt);
-    crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
-    crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
-    ctx
-}
-
 /// How often a reader polls the bucket for newer manifests and WAL: a node's, and the CLI's.
 pub const READER_POLL: Duration = Duration::from_millis(250);
 
@@ -1766,13 +1755,13 @@ impl Lake {
         ctx
     }
 
-    /// A session made from nothing, with everything every query's session has: the engine's (`engine::session`) and
-    /// the node's own functions. On a page every plan it makes runs its partitions in the page's task, as the page's own
+    /// A session made from nothing, with everything every query's session has: every function set in the registry
+    /// (`engine::session`). On a page every plan it makes runs its partitions in the page's task, as the page's own
     /// session's do (`in_task::planned`): a page has no runtime to start a partition's task on, and a plan of one
     /// partition still merges more than one below it. Plans made by hand from it (`fresh.rs`) are planned by it too.
     fn made(&self, partitions: usize) -> SessionContext {
         let config = SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::text::PUBLIC);
-        let ctx = functions(config, self.rt.clone());
+        let ctx = crate::engine::session(config, self.rt.clone());
         #[cfg(target_arch = "wasm32")]
         let ctx = crate::in_task::planned(ctx);
         ctx

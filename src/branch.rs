@@ -6,7 +6,7 @@
 //! prod keeps every file that was live when the branch was made, for as long as its pin is there
 //! (`pn/`: `tier::expire`, the orphan sweep); a branch of a branch pins every lake it reads.
 use crate::ddl::Ddl;
-use crate::objects::{OnClone, KINDS};
+use crate::objects::{all_kinds, OnClone};
 use crate::store::{json, table_key, Lake, TableMeta};
 use crate::views::View;
 use crate::write::Request;
@@ -632,7 +632,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     // recipient, with their comments: a branch hands nothing to another company), and the catalog's
     // own keys, which no kind has)
     let mut deny: Vec<String> = ["z/", "x/", "i/", "dt/", "jt/", "pn/", "fd/", "s/", "d/"].iter().map(|p| p.to_string()).collect();
-    for k in KINDS.iter().filter(|k| k.on_clone == OnClone::Leave) {
+    for k in all_kinds().filter(|k| k.on_clone == OnClone::Leave) {
         deny.push(k.prefix.to_string());
         deny.push(format!("cm/{}/", k.family));
     }
