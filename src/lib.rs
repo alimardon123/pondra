@@ -11,6 +11,8 @@ extern crate pondra_tokio_web as tokio;
 // rewrites that need no lake.
 pub mod finish;
 pub mod env;
+// The one place a feature says what it adds (designs/redesign/redesign.md §6): `built_in` below lists the build's extensions.
+pub mod registry;
 pub mod reset;
 pub mod fsum;
 pub mod avg;
@@ -24,7 +26,6 @@ pub mod in_task;
 #[cfg(feature = "lake")] pub mod page; // (a page is a member on the core's lake, one per module)
 pub mod request_body;
 pub mod text;
-pub mod registry;
 // The one walk of the SQL tree (every module's walks go through it: `walk.rs`).
 mod walk;
 // The statements 1.1 brings, refused by name in every form (`page.rs` and the node read the same list).
