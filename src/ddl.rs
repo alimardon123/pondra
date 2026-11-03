@@ -191,10 +191,14 @@ pub async fn resolve(lake: &Lake, name: &str) -> Result<(Option<Arc<Lake>>, Stri
 
 /// The lake attached as `l`. One the catalog lists that this node hasn't attached yet (made a
 /// moment ago on another node: `CREATE DATABASE`, `ATTACH`) is waited for, as the node attaches it
-/// within a second (`sync`).
+/// within a second (`sync`); one `sync` never attaches (`openable`) is refused at once, saying why.
 async fn attached(lake: &Lake, l: &str) -> Result<Option<Arc<Lake>>> {
     let here = || lake.attached.read().unwrap().iter().find(|(n, _)| n == l).map(|(_, o)| o.clone());
-    if here().is_none() && lake.cat.get_raw(&attachment_key(l)).await?.is_some() {
+    if here().is_some() {
+        return Ok(here());
+    }
+    if let Some(a) = lake.cat.get::<Attachment>(&attachment_key(l)).await? {
+        openable(&lake.url, &a.dir)?; // (said to whoever named it, not only once on the node's log: 11-03 audit L4)
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             if here().is_some() {

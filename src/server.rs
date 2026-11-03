@@ -639,11 +639,14 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
     let revoked = until_revoked(app.clone(), operator, header, move |p| p.role >= need && p.access.is_none());
     let cat = &app.lake.cat;
     let streamed = operator.then(|| crate::format::Streamed::to(crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
+    // (a joined page's tab, which says no format as the nodes' own client does (`cluster::http`), is a use of the node while it
+    // follows, as its other requests are; the nodes' streams never end while a cluster runs, so they aren't: `idle.rs`, 11-03 audit M7)
+    let page = (!headers.contains_key("x-pondra-format")).then(crate::idle::Use::new);
     let start = Frame::Start { term: app.members.leader().n, replicated: cat.replicas > 1 };
     let (recent, rx) = cat.subscribe();
     let live = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.ok().map(|f| (f, rx)) }); // a lagging follower reconnects
     let frames = futures::stream::iter([start].into_iter().chain(recent)).chain(live).map(move |f| {
-        let _ = &streamed;
+        let _ = (&streamed, &page);
         Ok::<_, std::io::Error>(for_caller(f, operator).encode())
     });
     Body::from_stream(crate::drain::endless(frames.take_until(revoked))).into_response() // (the node's door closing ends it too: `drain::endless`)
