@@ -356,7 +356,7 @@ async fn schema_in(lake: &Lake, db: &str, s: &str) -> Result<()> {
 fn parse_text(sql: &str) -> Option<Vec<Statement>> {
     let sql = crate::past_names::syntax(sql);
     let sql = crate::friendly::text(&sql).ok()?;
-    Parser::parse_sql(&GenericDialect {}, &sql).ok()
+    crate::parsed::generic(&sql).ok()
 }
 
 /// A name's parts, one place for one name: the family's own, when the name is one part.
