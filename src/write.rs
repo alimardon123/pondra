@@ -1896,7 +1896,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         _ => {}
     }
     let stored = lake.cat.meta(&table_key(&table)).await?; // (a plain INSERT's routing reads it as stored)
-    let meta = stored.as_ref().map(|m| m.logical()); // (rows under SQL's names: the log keeps them stored, `log::pack`)
+    let meta = stored.as_ref().map(|m| m.logical_ref()); // (rows under SQL's names: the log keeps them stored, `log::pack`)
     // A keyed table's UPDATE or DELETE outside a transaction is a transaction of its own (ADR-067 §7): it locks the keys
     // it changes, so a change worked out from a snapshot can't overwrite a commit that landed meanwhile. Its producer is
     // the job, so a retry of it is a duplicate. A MERGE gets here only when `changes` took it as a one-row upsert of one
@@ -2505,7 +2505,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
         return Ok(Some(Request::Change(sql, job.into(), sent)));
     }
     let stored = target.cat.meta(&table_key(table)).await?; // (as parsed once a version: `rules` is the memo)
-    let meta = stored.as_ref().map(|m| m.logical());
+    let meta = stored.as_ref().map(|m| m.logical_ref());
     let log = meta.as_ref().is_some_and(|m| through_log(m, stmt));
     match (meta, stmt) {
         (Some(m), _) if log => {
