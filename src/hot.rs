@@ -56,6 +56,8 @@ use std::time::Duration;
 
 const IDLE: Duration = Duration::from_secs(60); // unread this long: may make room for others
 const BATCH: usize = 8192;
+/// The most files `need` and `once` remember (paths): past it one is let go of, and is decoded again if read.
+const NEED: usize = 1 << 16;
 
 pub struct Hot {
     max: usize,
@@ -164,6 +166,11 @@ impl Hot {
             return;
         }
         let mut s = self.state.lock().unwrap();
+        if !s.need.is_empty() {
+            // (a file that didn't fit was never held, so it is let go of here whether or not any file was)
+            let replaced: HashSet<&str> = replaced.iter().map(|(p, _)| p.as_str()).collect();
+            s.need.retain(|k, _| !replaced.contains(base(k)));
+        }
         // (held as its path, or as `path#…` without its deleted rows: `key`)
         let held = |rows: &BTreeMap<String, Arc<Vec<usize>>>, p: &str| rows.range(p.to_string()..).next().is_some_and(|(k, _)| base(k) == p);
         let gone: HashSet<&str> = replaced.iter().map(|(p, _)| p.as_str()).filter(|p| held(&s.rows, p)).collect();
@@ -177,7 +184,6 @@ impl Hot {
             keep
         });
         s.rows.retain(|k, _| !gone.contains(base(k)));
-        s.need.retain(|k, _| !gone.contains(base(k)));
         s.used = s.used.saturating_sub(freed);
     }
 
@@ -236,7 +242,7 @@ impl Hot {
             let sizes: Vec<usize> = arrays.iter().map(|a| size(a)).collect();
             let bytes: usize = sizes.iter().sum();
             if !s.room(bytes, room) {
-                s.need.insert(key.clone(), bytes); // (the next scan waits for this much room before it decodes the file again)
+                s.needs(key.clone(), bytes); // (the next scan waits for this much room before it decodes the file again)
                 return;
             }
             s.need.remove(&key);
@@ -349,6 +355,17 @@ impl State {
         (memory || self.twice(key)) && self.room(need, room)
     }
 
+    /// Notes that `key` decodes to `bytes`, which didn't fit (`need`). Bounded as `once` is: past [`NEED`] files one noted
+    /// before is let go of, and is decoded again if it is read.
+    fn needs(&mut self, key: String, bytes: usize) {
+        if self.need.len() >= NEED && !self.need.contains_key(&key) {
+            if let Some(any) = self.need.keys().next().cloned() {
+                self.need.remove(&any);
+            }
+        }
+        self.need.insert(key, bytes);
+    }
+
     /// Has a scan read this file before? (The first read only notes it: data read once isn't worth
     /// decoding twice.)
     fn twice(&mut self, path: &str) -> bool {
@@ -356,7 +373,7 @@ impl State {
             return true;
         }
         self.once.push_back(path.to_string());
-        if self.once.len() > 1 << 16 {
+        if self.once.len() > NEED {
             self.once.pop_front();
         }
         false
@@ -1154,6 +1171,21 @@ mod tests {
             assert!(!s.tries("f", 10, memory, 100), "memory {memory}: no room for 150, so no decode");
             assert!(s.tries("f", 10, memory, 200), "memory {memory}: room for it now");
         }
+    }
+
+    /// A file that didn't fit was never held, so a commit that replaced it lets go of what was noted for it all the same
+    /// (11-03 audit M3: in a lake on disk such entries stayed for the node's life), with or without its deleted rows.
+    #[test]
+    fn a_replaced_file_that_didnt_fit_is_let_go_of() {
+        let hot = Hot { max: 1 << 30, memory: false, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
+        let noted = ["data/t/a.parquet", "data/t/a.parquet#2", "data/t/b.parquet"];
+        hot.state.lock().unwrap().need.extend(noted.map(|k| (k.to_string(), 150)));
+        hot.forget(&[("data/t/a.parquet".to_string(), 1)]);
+        assert_eq!(hot.state.lock().unwrap().need.keys().collect::<Vec<_>>(), ["data/t/b.parquet"]);
+        let mut s = State::default();
+        (0..NEED + 10).for_each(|i| s.needs(format!("data/t/{i}.parquet"), 150));
+        s.needs("data/t/0.parquet".into(), 160);
+        assert_eq!(s.need.len(), NEED, "bounded");
     }
 
     #[test]
