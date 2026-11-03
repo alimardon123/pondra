@@ -10180,6 +10180,25 @@ def movereaders():
     model.append((11, 110, 1100))
     checks["ALTER VIEW nv ALTER COLUMN x FIRST: m_nv reading it with `*` follows, rows kept and landing"] = isinstance(nv, dict) and "m_nv" in str(nv.get("readers")) \
         and names("nv") == ["x", "g"] and names("m_nv") == ["x", "g"] and info["m_nv"] == {} and landed() == {}
+    # Made after a move (11-03 audit H5): a task copying the moved table with a `*` (its target made from it, in the new
+    # order) and a materialized view over it. Each run read the table in its stored order, so each value went into the
+    # other column.
+    q("CREATE TABLE w (a BIGINT, b BIGINT)")
+    q("ALTER TABLE w ALTER COLUMN b FIRST")
+    q("CREATE TABLE wr (a BIGINT, b BIGINT)")  # (a rename and a move: the name map and the order both)
+    q("ALTER TABLE wr RENAME COLUMN b TO c")
+    q("ALTER TABLE wr ALTER COLUMN c FIRST")
+    for src, k, m in [("w", "kw", "mw"), ("wr", "kwr", "mwr")]:
+        call(A.port, "POST", f"/tasks/{k}", json.dumps({"source": src, "target": f"{src}_copy", "sql": f"SELECT * FROM {src}"}).encode())
+        q(f"CREATE MATERIALIZED VIEW {m} AS SELECT * FROM {src}")
+    q("INSERT INTO w (a, b) VALUES (1, 10), (2, 20)")
+    q("INSERT INTO wr (a, c) VALUES (1, 10), (2, 20)")
+    w_rows = lambda t, two: sorted((r.get("a"), r.get(two)) for r in q(f"SELECT * FROM {t}"))
+    after = {t: ("b" if t.endswith("w") or t.startswith("w_") else "c") for t in ["w", "w_copy", "mw", "wr", "wr_copy", "mwr"]}
+    info["made_after"] = {t: until(lambda: w_rows(t, two), [(1, 10), (2, 20)], 20) for t, two in after.items()}
+    info["made_after_names"] = {t: names(t) for t in after}
+    checks["made after a move (and after a rename and a move): a task copying the table with a `*`, and a materialized view over it: each value in its own column"] = \
+        info["made_after"] == {t: [(1, 10), (2, 20)] for t in after} and info["made_after_names"] == {t: [two, "a"] for t, two in after.items()}
     # After a restart, as it was
     order = {m: names(m) for m in cols}
     for node in nodes:
@@ -25158,6 +25177,9 @@ def friendly():
         "DuckDB's JSONPath after ->> and -> (j->>'$.a.b', j->'$.s'): a path, not a key named $.a.b": (
             "SELECT id, j->>'$.a.b' AS b, j->>'$.s' AS s, j->'$.s' AS a, get_json_object(j, '$.a.b') AS g FROM t WHERE id < 50",
             "SELECT id, j->>'$.a.b' AS b, j->>'$.s' AS s, CAST(j->'$.s' AS VARCHAR) AS a, json_extract_string(j, '$.a.b') AS g FROM t WHERE id < 50"),
+        "a call written another database's way keeps its place inside an operator (11-03 audit H4: 8 / SAFE_DIVIDE(a, b) was 8 / a / b)": (
+            "SELECT id, SAFE_DIVIDE(10, 100) / SAFE_DIVIDE(5, 100) AS r, 8 / SAFE_DIVIDE(id + 1, 2) AS s FROM t WHERE id < 20",
+            "SELECT id, 2.0 AS r, 16 / (id + 1) AS s FROM t WHERE id < 20"),
         "BigQuery's COUNTIF and SAFE_DIVIDE (NULL by zero)": (
             "SELECT k, COUNTIF(x > 100) AS c, SAFE_DIVIDE(sum(x), sum(k)) AS r FROM t GROUP BY k",
             "SELECT k, count(*) FILTER (WHERE x > 100) AS c, CASE WHEN sum(k) = 0 THEN NULL ELSE sum(x) / sum(k) END AS r FROM t GROUP BY k"),
