@@ -4,7 +4,7 @@
 month is the owner's (2026-10-11), the lanes my plan for it; the decisions at the end are his.
 
 **0.80, not 1.0, on 11-11** (the owner, 2026-11-02): the release the month was building ships as 0.80.0, its
-candidate on 11-06 as 0.80.0-rc.1, with the same freeze and dates, so a clean 1.0 has room to mature. 1.0 follows
+candidate on 11-06 as 0.80.0-rc.1, on the same dates, so a clean 1.0 has room to mature. 1.0 follows
 the from-scratch redesign, once every row below is proven; until then no release promises compatibility (the
 stability page's 1.x promises start at 1.0). "After 1.0" below still means after 1.0.
 
@@ -67,8 +67,9 @@ is `designs/one-month-to-1-0.md` in the project's files). Rounds 17 to 34 are re
 | Date | |
 |---|---|
 | Wednesdays (10-14, 10-21, 10-28) | 0.34.0, 0.35.0, 0.36.0: whatever is green on main |
-| **10-31** | **Feature freeze**: fixes, reviews, measurements and docs only from here |
-| 11-01 to 11-06 | The review, once every feature works (above all one core with its forms and APIs: ADR-072), from scratch (the owner, 10-16): architecture, design, security and the code reviewed again, and simplified so the parts work together: modular, flexible, one reusable part in every place over copies, easy to add, swap or remove for maintainers and customers alike, still one small binary; every door tried as a new user would; the docs finished; the console's last fixes |
+| 10-31 to 11-03 | Features kept landing as they fit by rc.1, High fixes first (the owner, 10-31: the freeze waited for his call) |
+| **11-03** | **Feature freeze** (the owner, 11-03 10:25 UTC): until 0.80.0 only wrong-answer fixes and rc.1 blockers merge (AGENTS.md, "Under the freeze"); work in flight is kept as a patch in the project's files |
+| 11-03 on | The review, once every feature works (above all one core with its forms and APIs: ADR-072), from scratch (the owner, 10-16): architecture, design, security and the code reviewed again, and simplified so the parts work together: modular, flexible, one reusable part in every place over copies, easy to add, swap or remove for maintainers and customers alike, still one small binary; every door tried as a new user would; the docs finished; the console's last fixes |
 | 11-06 | 0.80.0-rc.1, then the 24-hour soak on R2, the cluster bench, the gates and the upgrade check |
 | **11-11** | **0.80.0** (planned as 1.0.0 until 11-02) |
 
