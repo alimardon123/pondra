@@ -24,6 +24,8 @@ pub trait Extension: Sync {
     fn requires(&self) -> &'static [&'static str] {
         &[]
     }
+    /// Adds its entries, and does nothing else: it reads no setting (a setting is read through the registry being built,
+    /// so a read here would wait on itself) and starts nothing.
     fn register(&self, r: &mut Registry);
 }
 
