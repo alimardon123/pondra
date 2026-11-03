@@ -764,8 +764,8 @@ impl Json {
 }
 
 /// A table's log as Flight data, from segment `after`: each commit's rows (just `columns`), then
-/// a message with `{"after": N}`.
-async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option<Vec<String>>, follow: bool) -> Result<Out<FlightData>, Status> {
+/// a message with `{"after": N}`. Once `revoked` resolves (`server::until_revoked`), the stream ends with 28000.
+async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option<Vec<String>>, follow: bool, revoked: impl std::future::Future<Output = ()> + Send + 'static) -> Result<Out<FlightData>, Status> {
     let meta = app.lake.cat.meta(&table_key(&table)).await.map_err(status)?.ok_or_else(|| refused("42P01", format!("no table {table}")))?;
     let full = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
     let pick: Vec<usize> = match &columns {
@@ -804,8 +804,17 @@ async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option
             }
         }
     });
-    Ok(Box::pin(first.chain(chunks.flatten())))
+    // (ended for its sign-in, the client is told why: a stream that just stops reads as the node's going away)
+    let (ended, why) = tokio::sync::oneshot::channel();
+    let revoked = async move {
+        revoked.await;
+        let _ = ended.send(());
+    };
+    let told = futures::stream::once(why).filter_map(|r| async move { r.ok().map(|()| Err(refused("28000", REVOKED))) }); // (the stream done first: nothing)
+    Ok(Box::pin(first.chain(chunks.flatten()).take_until(revoked).chain(told)))
 }
+
+const REVOKED: &str = "this stream's sign-in no longer holds, or may no longer read the table's rows (a grant taken back, its user dropped, its session expired): sign in again";
 
 /// The server's answers to `GetSqlInfo`.
 static INFO: LazyLock<SqlInfoData> = LazyLock::new(|| {
@@ -1152,8 +1161,15 @@ impl FlightService for Door {
                     Ok(Response::new(answered(None, Box::pin(async move { query(&app, &sql, who).await })).await?))
                 }
                 (None, Some(table)) => {
-                    crate::auth::check_all(&crate::auth::catalog_name(&table)).map_err(denied)?; // (a stream of rows: every column, as `/watch` needs)
-                    Ok(Response::new(log_stream(app.clone(), table, json.after, json.columns, json.follow).await?))
+                    let name = crate::auth::catalog_name(&table);
+                    crate::auth::check_all(&name).map_err(denied)?; // (a stream of rows: every column, as `/watch` needs)
+                    // (the rows come after this call's scope has ended: its sign-in is checked again, and the table's whole rows
+                    // with it, so a REVOKE, a DROP USER or a session's end stops them within 5 s, as at `/watch`: 11-03 audit H1)
+                    let header = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
+                    let revoked = crate::server::until_revoked(app.clone(), crate::auth::operator(), header, move |p| {
+                        p.role >= Role::Read && crate::auth::WHO.sync_scope(p.clone(), || crate::auth::check_all(&name)).is_ok()
+                    });
+                    Ok(Response::new(log_stream(app.clone(), table, json.after, json.columns, json.follow, revoked).await?))
                 }
                 _ => Err(refused("22023", "{\"sql\": …} or {\"table\": …}")),
             }

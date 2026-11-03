@@ -1754,7 +1754,9 @@ async fn write_changes(lake: &Lake, seq: &crate::log::Sequencer, c: Commit) -> R
             mine.extend(reads.keys.keys().filter(|k| is_on(k.as_slice())).cloned());
         }
         conflicts(lake, name, &meta, &reads, &mine).await?;
-        let (p, _) = crate::change::appends(lake, seq, name, &stored, old, new, &format!("txn:{}:{name}", c.job.as_ref().unwrap_or(&c.id)), true, false).await?; // (a plain INSERT's key is new at COMMIT too: `constraints.rs`)
+        let producer = format!("txn:{}:{name}", c.job.as_ref().unwrap_or(&c.id));
+        // (a plain INSERT's key is new at COMMIT too: `constraints.rs`; the rows' CHECKs met them as each statement wrote them)
+        let (p, _) = crate::rules::committing(crate::change::appends(lake, seq, name, &stored, old, new, &producer, true, false)).await?;
         pending.extend(p);
     }
     if pending.is_empty() {

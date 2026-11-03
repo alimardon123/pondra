@@ -33,14 +33,14 @@ use std::sync::Arc;
 ///   instead of shuffling both sides by key.
 pub fn config(mut config: SessionConfig) -> SessionConfig {
     let user = crate::env::get("PONDRA_SQL_OPTIONS").unwrap_or_default();
-    let defaults = "datafusion.sql_parser.parse_float_as_decimal=true,\
+    let defaults = format!("datafusion.sql_parser.parse_float_as_decimal=true,\
         datafusion.execution.time_zone=+00:00,\
         datafusion.optimizer.hash_join_single_partition_threshold=33554432,\
         datafusion.optimizer.hash_join_single_partition_threshold_rows=1048576,\
         datafusion.execution.perfect_hash_join_small_build_threshold=262144,\
         datafusion.execution.skip_physical_aggregate_schema_check=true,\
         datafusion.execution.spill_compression=lz4_frame,\
-        datafusion.execution.skip_partial_aggregation_probe_ratio_threshold=0.3";
+        datafusion.execution.skip_partial_aggregation_probe_ratio_threshold={SKIP_PARTIAL}");
     // (the perfect hash join's: a join on one integer key whose build side's keys span under 262,144
     // values looks them up in an array of that span, at most 1 MB, however few they are; DataFusion's
     // 1,024 kept TPC-H q17's 204 parts, spread over 200,000 keys, in a hash table, and its 6 M probes
@@ -52,12 +52,13 @@ pub fn config(mut config: SessionConfig) -> SessionConfig {
     // none ran slower (join building 60 M rows 15.1 s to 10.9 s, the median 25.8 s to 22.4 s), and the full sort of 60 M
     // rows by a string reached its merge instead of its 8 GB spill limit; zstd spilled less again but sorted 43% slower.
     // `datafusion.execution.spill_compression=uncompressed` in PONDRA_SQL_OPTIONS turns it off)
-    // (a partial GROUP BY whose first 100,000 rows of a partition hold more than 30% as many groups, not 80%, hands its
+    // (`SKIP_PARTIAL`: a partial GROUP BY whose first 100,000 rows of a partition hold more than 30% as many groups, not 80%, hands its
     // rows on as they are, for the final one to group: grouping them twice cost more than it saved. ClickBench from
     // memory: GROUP BY URL 602 to 522 ms, (UserID, minute, SearchPhrase) 492 to 355, (SearchEngineID, ClientIP) 99 to 74, all 43
     // 6.34 to 5.88 s. A dedup of SearchPhrase, which holds 9% as many groups, still groups first: skipped at 10% it took
     // 179 ms, not 137. TPC-H's partial aggregates hold fewer (lineitem by order 25%) and run as they did; of TPC-DS's 99,
-    // q47 and q65 skip now, 2-4% faster. `logs/round36/partial-aggregation.json`)
+    // q47 and q65 skip now, 2-4% faster. `logs/round36/partial-aggregation.json`. A spread query's stages keep DataFusion's
+    // 80%, `spmd::stage_ctx`)
     for (k, v) in defaults.split(',').chain(user.split(',')).filter_map(|kv| kv.trim().split_once('=')) {
         config = config.set_str(k, v);
     }
@@ -67,6 +68,16 @@ pub fn config(mut config: SessionConfig) -> SessionConfig {
     let config = config.set_str("datafusion.execution.spill_compression", "uncompressed");
     config
 }
+
+/// Is `plan` a spread query's slice (`spmd`: its exchanges between nodes)? The rules that change a plan's shape leave
+/// those alone: every node must plan a slice the same way.
+pub(crate) fn spread(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
+    plan.exists(|p| Ok(matches!(p.name(), "ShareExec" | "WholeExec")))
+}
+
+/// How many groups, as a share of a partition's first 100,000 rows, a partial GROUP BY on one node holds before it hands
+/// its rows on as they are (`config`).
+pub const SKIP_PARTIAL: f64 = 0.3;
 
 /// DataFusion's rules, with Pondra's placed where they work best.
 pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
@@ -944,7 +955,8 @@ fn decimal_identity(e: &Expr, schema: &DFSchema) -> Option<Expr> {
 /// each filter, just before DataFusion's filter pushdown. Its merging of one column's comparisons (`simplify_predicates`)
 /// read the operator as if the column came first: `s = 'b' AND 'b' = s` was FALSE (two equalities that differ), and of
 /// `s <= 'b' AND 'b' > s` it kept `s <= 'b'` (the two bounds tie, and only `<` written column first won the tie), so 'b'
-/// was in. Found by `tools/random_sql.py` (11-03). The same comparison either way round, so no answer changes.
+/// was in. Found by `tools/random_sql.py` (11-03). A join's ON too (11-03 audit H6). The same comparison either way round,
+/// so no answer changes.
 #[derive(Debug)]
 struct ValuesRight;
 
@@ -958,20 +970,35 @@ impl OptimizerRule for ValuesRight {
     }
 
     fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
-        let LogicalPlan::Filter(mut f) = plan else { return Ok(Transformed::no(plan)) };
-        let swapped = std::mem::replace(&mut f.predicate, Expr::Literal(ScalarValue::Null, None)).transform_up(|e| match e {
-            Expr::BinaryExpr(b) if matches!(*b.left, Expr::Literal(..)) && matches!(*b.right, Expr::Column(_)) => {
-                match b.op.swap().filter(|op| matches!(op, Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq)) {
-                    Some(op) => Ok(Transformed::yes(Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(b.right, op, b.left)))),
-                    None => Ok(Transformed::no(Expr::BinaryExpr(b))),
-                }
+        match plan {
+            LogicalPlan::Filter(mut f) => {
+                let t = values_right(std::mem::replace(&mut f.predicate, Expr::Literal(ScalarValue::Null, None)))?;
+                f.predicate = t.data;
+                Ok(Transformed::new_transformed(LogicalPlan::Filter(f), t.transformed))
             }
-            e => Ok(Transformed::no(e)),
-        })?;
-        let changed = swapped.transformed;
-        f.predicate = swapped.data;
-        Ok(if changed { Transformed::yes(LogicalPlan::Filter(f)) } else { Transformed::no(LogicalPlan::Filter(f)) })
+            // (a join's ON: the pushdown moves its one-sided comparisons into a filter on that side and merges them there,
+            // in the same pass)
+            LogicalPlan::Join(mut j) if j.filter.is_some() => {
+                let t = values_right(j.filter.take().expect("a filter"))?;
+                j.filter = Some(t.data);
+                Ok(Transformed::new_transformed(LogicalPlan::Join(j), t.transformed))
+            }
+            plan => Ok(Transformed::no(plan)),
+        }
     }
+}
+
+/// `e` with each `value op column` in it written `column op' value`.
+fn values_right(e: Expr) -> Result<Transformed<Expr>> {
+    e.transform_up(|e| match e {
+        Expr::BinaryExpr(b) if matches!(*b.left, Expr::Literal(..)) && matches!(*b.right, Expr::Column(_)) => {
+            match b.op.swap().filter(|op| matches!(op, Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq)) {
+                Some(op) => Ok(Transformed::yes(Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(b.right, op, b.left)))),
+                None => Ok(Transformed::no(Expr::BinaryExpr(b))),
+            }
+        }
+        e => Ok(Transformed::no(e)),
+    })
 }
 
 /// `x IN (a, b)` whose list isn't all values (`c1`, `CASE WHEN c1 < 0 THEN … END`, `NULL`, `NULL +
@@ -1194,7 +1221,7 @@ impl PhysicalOptimizerRule for EarlyProbes {
             return Ok(plan); // (no runtime to read ahead on: a page in a browser has one thread, and BufferExec spawns)
         }
         use datafusion::physical_plan::buffer::BufferExec;
-        if plan.exists(|p| Ok(matches!(p.name(), "ShareExec" | "WholeExec")))? {
+        if spread(&plan)? {
             return Ok(plan);
         }
         let every = config.execution.hash_join_buffering_capacity; // (the user's: every join, this far ahead)
@@ -1596,7 +1623,8 @@ fn is_right_deep(e: &Arc<dyn PhysicalExpr>) -> bool {
 #[derive(Debug)]
 struct WideTopN;
 
-const WIDE: usize = 16;
+/// The fewest columns a scan has for its top-N to read them late (`late_rows`).
+pub(crate) const WIDE: usize = 16;
 
 impl PhysicalOptimizerRule for WideTopN {
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
@@ -1682,7 +1710,7 @@ impl PhysicalOptimizerRule for SharedBuilds {
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::physical_plan::aggregates::AggregateMode;
         let most = config.optimizer.hash_join_single_partition_threshold_rows;
-        if most == 0 || plan.exists(|p| Ok(matches!(p.name(), "ShareExec" | "WholeExec")))? {
+        if most == 0 || spread(&plan)? {
             return Ok(plan); // (with no threshold every join already hashes both sides)
         }
         plan.transform_down(|p| {
@@ -2819,8 +2847,9 @@ mod tests {
         assert_eq!(answer(&ctx, "SELECT d * 0.0 AS z FROM v").await.0, ["z: Decimal128(12, 3)"]);
     }
 
-    /// A comparison written value first is merged with the column's others as the same comparison (`ValuesRight`): without
-    /// the rule, DataFusion's filter pushdown made `s = 'b' AND 'b' = s` FALSE and let 'b' into `s <= 'b' AND 'b' > s`. (The
+    /// A comparison written value first is merged with the column's others as the same comparison (`ValuesRight`), in a
+    /// WHERE and a join's ON: without the rule, DataFusion's filter pushdown made `s = 'b' AND 'b' = s` FALSE and let 'b'
+    /// into `s <= 'b' AND 'b' > s`. (The
     /// simplifier writes `'b' = s` column first itself where the value is a literal as written; a lake's text is a
     /// Utf8View, so 'b' is a cast until it is folded, and stays first.)
     #[tokio::test]
@@ -2845,6 +2874,12 @@ mod tests {
             ("t >= true AND true = t", "2"),
         ] {
             assert_eq!(first(&ctx, &count(w)).await, want, "{w}");
+        }
+        // (a join's ON too: the pushdown moves a LEFT JOIN's comparisons of its right side into a filter there, 11-03 audit H6)
+        let joined = |on: &str| format!("SELECT count(b.s) FROM v AS a LEFT JOIN v AS b ON a.s = b.s AND {on}");
+        assert_eq!(first(&plain, &joined("b.s = 'b' AND 'b' = b.s")).await, "0", "DataFusion's answer, without the rule");
+        for (on, want) in [("b.s = 'b' AND 'b' = b.s", "4"), ("b.s <= 'b' AND 'b' > b.s", "1"), ("'b' > b.s AND b.s <= 'b'", "1")] {
+            assert_eq!(first(&ctx, &joined(on)).await, want, "{on}");
         }
     }
 

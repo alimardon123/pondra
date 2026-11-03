@@ -82,6 +82,9 @@ impl ReplicaLog {
         Ok(Some(st.run))
     }
 
+    /// Do we hold copies of changes not in the bucket yet? (`idle.rs`: a follower holding them doesn't end itself.)
+    pub fn holds(&self) -> bool { !self.st.lock().unwrap().held.is_empty() }
+
     /// Changes up to `id` are in the bucket: drop our copies.
     pub fn prune(&self, id: u64) {
         let mut st = self.st.lock().unwrap();

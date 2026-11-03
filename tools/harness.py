@@ -2404,6 +2404,15 @@ def serverless_idle(port):
     held = ended(node, 6) is None
     c.close()
     checks["e a watch keeps it up while it streams; its client gone, it ends"] = first == 200 and held and ended(node, 30) == 0
+    # g. a joined page's follow of the commit stream is a use while it streams, though the nodes' own follows aren't (a page says
+    # no format, as the nodes' own client does); its tab gone, the node ends (11-03 audit M7)
+    node = idle()
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    c.request("GET", "/cluster/log")
+    first = c.getresponse().status
+    held = ended(node, 6) is None
+    c.close()
+    checks["g a joined page's follow of the commit stream keeps it up; its tab gone, it ends"] = first == 200 and held and ended(node, 30) == 0
     # f. a folder of lakes refuses it: each database's node already stops once idle (PONDRA_DATABASE_IDLE_SECS)
     folder = tempfile.mkdtemp(prefix="pondra-lakes-")
     subprocess.run([BIN, "sql", "--dir", os.path.join(folder, "one"), "CREATE TABLE x (a INT)"], capture_output=True, timeout=120)
@@ -10171,6 +10180,25 @@ def movereaders():
     model.append((11, 110, 1100))
     checks["ALTER VIEW nv ALTER COLUMN x FIRST: m_nv reading it with `*` follows, rows kept and landing"] = isinstance(nv, dict) and "m_nv" in str(nv.get("readers")) \
         and names("nv") == ["x", "g"] and names("m_nv") == ["x", "g"] and info["m_nv"] == {} and landed() == {}
+    # Made after a move (11-03 audit H5): a task copying the moved table with a `*` (its target made from it, in the new
+    # order) and a materialized view over it. Each run read the table in its stored order, so each value went into the
+    # other column.
+    q("CREATE TABLE w (a BIGINT, b BIGINT)")
+    q("ALTER TABLE w ALTER COLUMN b FIRST")
+    q("CREATE TABLE wr (a BIGINT, b BIGINT)")  # (a rename and a move: the name map and the order both)
+    q("ALTER TABLE wr RENAME COLUMN b TO c")
+    q("ALTER TABLE wr ALTER COLUMN c FIRST")
+    for src, k, m in [("w", "kw", "mw"), ("wr", "kwr", "mwr")]:
+        call(A.port, "POST", f"/tasks/{k}", json.dumps({"source": src, "target": f"{src}_copy", "sql": f"SELECT * FROM {src}"}).encode())
+        q(f"CREATE MATERIALIZED VIEW {m} AS SELECT * FROM {src}")
+    q("INSERT INTO w (a, b) VALUES (1, 10), (2, 20)")
+    q("INSERT INTO wr (a, c) VALUES (1, 10), (2, 20)")
+    w_rows = lambda t, two: sorted((r.get("a"), r.get(two)) for r in q(f"SELECT * FROM {t}"))
+    after = {t: ("b" if t.endswith("w") or t.startswith("w_") else "c") for t in ["w", "w_copy", "mw", "wr", "wr_copy", "mwr"]}
+    info["made_after"] = {t: until(lambda: w_rows(t, two), [(1, 10), (2, 20)], 20) for t, two in after.items()}
+    info["made_after_names"] = {t: names(t) for t in after}
+    checks["made after a move (and after a rename and a move): a task copying the table with a `*`, and a materialized view over it: each value in its own column"] = \
+        info["made_after"] == {t: [(1, 10), (2, 20)] for t in after} and info["made_after_names"] == {t: [two, "a"] for t, two in after.items()}
     # After a restart, as it was
     order = {m: names(m) for m in cols}
     for node in nodes:
@@ -10866,14 +10894,27 @@ def users():
     checks["Flight's GetFlightInfo of a table refuses a user granted only some columns (no column names), and serves one it may read"] = \
         "permission denied" in str(infos[0]) and "text" in infos[1]
     # Revoked and dropped: at once, on the leader and a follower
+    ann_pg = psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=ann password=ann-password-1 dbname=lake", connect_timeout=10, autocommit=True)  # (open across the REVOKE and the DROP)
+    def ann_said(q):
+        try:
+            return ann_pg.execute(q).fetchall()
+        except Exception as e:
+            return f"ERROR {e}"
+    ann_before = ann_said("SELECT item FROM sales.orders ORDER BY id")
     as_(A.port, boss, "REVOKE SELECT (item) ON sales.orders FROM analyst")
     revoked = [until(lambda: "permission denied" in str(as_(port, ann, "SELECT item FROM sales.orders")), True, 10) for port in (A.port, A.port + 1)]
     still = as_(A.port, ann, "SELECT id FROM sales.orders ORDER BY id")
     as_(A.port, boss, "REVOKE analyst FROM ann")
     no_role = until(lambda: "permission denied" in str(as_(A.port + 1, ann, "SELECT id FROM sales.orders")), True, 10)
     grants = as_(A.port, boss, "SELECT grantee, privilege, on_name, columns FROM pondra.grants ORDER BY grantee, privilege, on_name")
+    ann_revoked = until(lambda: "permission denied" in str(ann_said("SELECT item FROM sales.orders ORDER BY id")), True, 15)
     as_(A.port, boss, "DROP USER ann")
     gone = [until(lambda: str(as_(port, ann, "SELECT 1 AS x")).startswith("ERROR 401"), True, 10) for port in (A.port, A.port + 1)]
+    ann_last = []  # (what its open connection is told, up to the first error: FATAL, then closed)
+    until(lambda: ann_last.append(str(ann_said("SELECT 1 AS x"))) or ann_last[-1].startswith("ERROR"), True, 15)
+    checks["a Postgres connection open across them: a REVOKE reaches its next statement, a DROP USER ends it (FATAL, its sign-in checked again every 5 s)"] = \
+        isinstance(ann_before, list) and ("tea",) in ann_before and ann_revoked is True and "signed out" in ann_last[-1] and ann_pg.closed \
+        or {"before": ann_before, "revoked": ann_revoked, "last": ann_last[-3:]}
     checks["revoked (a column, a role) and dropped: at once on the leader and a follower; pondra.grants says what stands"] = revoked == [True, True] and still == [{"id": 1}, {"id": 2}] \
         and no_role is True and gone == [True, True] and {"grantee": "analyst", "privilege": "SELECT", "on_name": "sales.orders", "columns": "id, amount"} in grants
     # W50: a user granted a view (and a materialized view) alone is shown their names, columns and rows, not their queries,
@@ -12055,10 +12096,26 @@ def guarded():
             return f"ERROR {type(e).__name__}: {e}"
     kafka_before = fetched()
     live_sql = json.dumps({"sql": "SELECT count(*) AS n FROM stock"}).encode()
-    h3 = {"watch": {}, "live, dropped": {}, "live, no superuser": {}}
+    def follow(auth, out):
+        """Flight's DoGet {"table": "stock"} (it follows) as a user, read as a stream, as `open_log` reads one: the bytes read
+        (its rows and its `{"after": N}` marks), and when and how it ended (11-03 H1)."""
+        try:
+            reader = fl.FlightClient(f"grpc://127.0.0.1:{P + 40}").do_get(fl.Ticket(json.dumps({"table": "stock"}).encode()),
+                                                                          options=fl.FlightCallOptions(headers=[(b"authorization", auth.encode())], timeout=60))
+            out["status"] = 200
+            while True:
+                chunk = reader.read_chunk()
+                out["bytes"] = out.get("bytes", 0) + (chunk.data.nbytes if chunk.data is not None else 0) + (chunk.app_metadata.size if chunk.app_metadata else 0)
+        except StopIteration:
+            out["ended"] = time.monotonic()
+        except Exception as e:
+            out["ended"] = time.monotonic()
+            out["error"] = f"{type(e).__name__}: {e}"
+    h3 = {"watch": {}, "live, dropped": {}, "live, no superuser": {}, "flight follow": {}}
     for name, auth, path, method, body in (("watch", hana, "/watch/stock", "GET", None), ("live, dropped", ivo, "/live", "POST", live_sql),
                                            ("live, no superuser", jon, "/live", "POST", live_sql)):
         threading.Thread(target=open_log, args=(P, auth, h3[name], path, method, body), daemon=True).start()
+    threading.Thread(target=follow, args=(hana, h3["flight follow"]), daemon=True).start()
     time.sleep(1)
     ask(P, "INSERT INTO stock VALUES (11, 1.0)", auth=boss)  # (a new row: /watch sends it, the live queries a new count)
     h3_flowing = until(lambda: all(s.get("status") == 200 and s.get("bytes", 0) > 0 for s in h3.values()), True, 20)
@@ -12075,6 +12132,8 @@ def guarded():
     checks["/watch, a live query and a Kafka consumer end when their sign-in may no longer have them: REVOKE, DROP USER and NOSUPERUSER end each within 12 s, and the consumer's next fetch is refused (11-02 H3)"] = \
         h3_flowing is True and not any(str(x).startswith("ERROR") for x in h3_said) and set(h3_ended) == set(h3) \
         and all(v <= 12 for v in h3_ended.values()) and isinstance(kafka_before, int) and kafka_before >= 1 and kafka_after == "refused"
+    checks["Flight's follow stream ends when its sign-in may no longer read the table: REVOKE ends it within 12 s, telling the client to sign in again (11-03 H1)"] = \
+        h3_flowing is True and h3_ended.get("flight follow", 99) <= 12 and "sign in again" in h3["flight follow"].get("error", "")
     # M8: a joined page's own statements are written by its node, as the sign-in's (`POST /cluster/records`, page_records.rs): a
     # superuser's sign-in only (never the nodes' key, nor a user with grants), at most 256 lines, under the node's own class and
     # words, and kept as a history row whatever the audit classes say. Node a's classes here have no read (`role,ddl,function,write`).
@@ -12383,6 +12442,23 @@ def served():
     checks["a database in a bucket attaches no node's lake or folder (ATTACH, the owner's, a raw Attach with the admin token): refused saying --attach; nothing dials the node named; a bucket's lake attaches (11-02 M4)"] = \
         all(str(r).startswith("ERROR") and "--attach" in str(r) for r in refused_m4) and heard == [] \
         and not str(m4["owner: a bucket's lake"]).startswith("ERROR") and "other" in str(m4["attached"]) and "far" not in str(m4["attached"])
+    # 11-03 L4: a catalog in a bucket that names a folder all the same (written by a release before M4, or by whoever may write
+    # the bucket: here a folder's lake that attached a folder, copied into the bucket) is refused at once to whoever names it,
+    # saying why, not after 5 s a name as "no lake"
+    far_dir, home_dir = mk(), mk()
+    subprocess.run([BIN, "sql", "--dir", far_dir, "CREATE TABLE z (a INT)"], capture_output=True, timeout=120)
+    subprocess.run([BIN, "sql", "--dir", home_dir, f"ATTACH '{far_dir}' AS far"], capture_output=True, timeout=120)
+    for d, _, fs in os.walk(home_dir):
+        for f in fs:
+            s3.upload_file(os.path.join(d, f), "m4lakes", "copied/" + os.path.relpath(os.path.join(d, f), home_dir))
+    l4 = {}
+    for q in ("INSERT INTO far.z VALUES (1)", "INSERT INTO far.public.z VALUES (1)"):
+        t = time.monotonic()
+        p = subprocess.run([BIN, "sql", "--dir", "s3://m4lakes/copied", q], capture_output=True, text=True, timeout=120, env={**os.environ, **benv})
+        l4[q] = {"s": round(time.monotonic() - t, 1), "said": (p.stdout + p.stderr).strip().splitlines()[-1:]}
+    info["L4"] = l4
+    checks["a statement naming a lake the bucket's catalog attaches but no node opens is refused at once, saying --attach (11-03 L4)"] = \
+        all(v["s"] < 5 and "--attach" in str(v["said"]) for v in l4.values())
     for n in (A_node, B_node, C_node, M, E, D, X, BK):
         n.kill()
     ok = all(checks.values())
@@ -25114,6 +25190,9 @@ def friendly():
         "DuckDB's JSONPath after ->> and -> (j->>'$.a.b', j->'$.s'): a path, not a key named $.a.b": (
             "SELECT id, j->>'$.a.b' AS b, j->>'$.s' AS s, j->'$.s' AS a, get_json_object(j, '$.a.b') AS g FROM t WHERE id < 50",
             "SELECT id, j->>'$.a.b' AS b, j->>'$.s' AS s, CAST(j->'$.s' AS VARCHAR) AS a, json_extract_string(j, '$.a.b') AS g FROM t WHERE id < 50"),
+        "a call written another database's way keeps its place inside an operator (11-03 audit H4: 8 / SAFE_DIVIDE(a, b) was 8 / a / b)": (
+            "SELECT id, SAFE_DIVIDE(10, 100) / SAFE_DIVIDE(5, 100) AS r, 8 / SAFE_DIVIDE(id + 1, 2) AS s FROM t WHERE id < 20",
+            "SELECT id, 2.0 AS r, 16 / (id + 1) AS s FROM t WHERE id < 20"),
         "BigQuery's COUNTIF and SAFE_DIVIDE (NULL by zero)": (
             "SELECT k, COUNTIF(x > 100) AS c, SAFE_DIVIDE(sum(x), sum(k)) AS r FROM t GROUP BY k",
             "SELECT k, count(*) FILTER (WHERE x > 100) AS c, CASE WHEN sum(k) = 0 THEN NULL ELSE sum(x) / sum(k) END AS r FROM t GROUP BY k"),

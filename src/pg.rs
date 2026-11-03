@@ -53,7 +53,7 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
         let tls = tls.clone();
         // A connection is a session: its temporary tables end with it (`temp.rs`).
         let session = format!("pg-{}", uuid::Uuid::new_v4().simple());
-        let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), me: me.clone() });
+        let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), again: Default::default(), me: me.clone() });
         let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: cancels.clone() };
         let pg = Arc::new(Pg(backend, Arc::new(startup), cancel.clone()));
         let used = crate::idle::Use::new(); // (an open connection is a use of the node: `idle.rs`)
@@ -75,8 +75,25 @@ struct Backend {
     parser: Arc<Parser>,
     session: String,
     who: std::sync::Mutex<Option<crate::auth::Principal>>, // (whoever signed in)
+    again: std::sync::Mutex<Option<(Again, std::time::Instant)>>, // (how that sign-in is checked again, and when it last was: `signed`)
     me: std::sync::Weak<Backend>,                          // (a statement runs on the queries' runtime: `told`)
 }
+
+/// How a connection's sign-in is checked again (`Backend::signed`). Postgres checks a role's privileges at every statement, so
+/// a REVOKE, a DROP USER, NOLOGIN, a new password, or a revoked or expired token reaches a connection already open, as it
+/// reaches HTTP's next request and a stream's next check (`server::until_revoked`). None: the nodes' own tokens and an open
+/// lake's anyone, which `until_revoked` never ends either.
+#[derive(Clone)]
+enum Again {
+    /// A user signed in by its password: its role and grants read again; ended once it no longer signs in or its password is
+    /// another.
+    User { user: String, verifier: Option<crate::users::Verifier> },
+    /// A token as the password (a user's `pt_`, an identity provider's): signed in with again.
+    Token { user: String, token: String },
+}
+
+/// How often a connection's sign-in is checked again: as `server::until_revoked` checks a stream's.
+const AGAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl PgWireServerHandlers for Pg {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> { self.0.clone() }
@@ -169,7 +186,8 @@ impl Startup {
             None => format!("{user} signs in with a token from the identity provider ({discovery})"),
             Some(token) => match crate::users::sign_in(&app.lake, &app.auth, &user, &token).await {
                 Some(who) => {
-                    *self.backend.who.lock().unwrap() = Some(who.at("postgres", from));
+                    let again = Again::Token { user: user.clone(), token: token.to_string() };
+                    self.backend.signed_in(who.at("postgres", from), Some(again));
                     return finish(client, &self.cancels).await;
                 }
                 None => {
@@ -213,7 +231,7 @@ impl StartupHandler for Startup {
                 pgwire::api::auth::protocol_negotiation(client, startup).await?;
                 pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
                 if app.open().await {
-                    *self.backend.who.lock().unwrap() = Some(crate::auth::Principal::of(crate::auth::Role::Admin).at("postgres", Some(client.socket_addr())));
+                    self.backend.signed_in(crate::auth::Principal::of(crate::auth::Role::Admin).at("postgres", Some(client.socket_addr())), None);
                     return finish(client, &self.cancels).await;
                 }
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
@@ -258,7 +276,11 @@ impl StartupHandler for Startup {
                     }
                     return Err(wrong(&user).await);
                 };
-                *self.backend.who.lock().unwrap() = Some(who.at("postgres", Some(client.socket_addr())));
+                let again = match token {
+                    true => Again::Token { user: user.clone(), token: password.clone() },
+                    false => Again::User { verifier: crate::users::verifier(&app.lake, &user).await, user: user.clone() },
+                };
+                self.backend.signed_in(who.at("postgres", Some(client.socket_addr())), Some(again));
                 return finish(client, &self.cancels).await;
             }
             PgWireFrontendMessage::PasswordMessageFamily(m) => {
@@ -299,7 +321,8 @@ impl StartupHandler for Startup {
                             false => crate::users::principal(&app.lake, &user).await.ok(),
                         };
                         let Some(who) = who else { return Err(wrong(&user).await) };
-                        *self.backend.who.lock().unwrap() = Some(who.at("postgres", Some(client.socket_addr())));
+                        let again = Again::User { verifier: crate::users::verifier(&app.lake, &user).await, user: user.clone() };
+                        self.backend.signed_in(who.at("postgres", Some(client.socket_addr())), Some(again));
                         client.send(PgWireBackendMessage::Authentication(Authentication::SASLFinal(reply.into_bytes().into()))).await?;
                         return finish(client, &self.cancels).await;
                     }
@@ -521,8 +544,9 @@ impl Backend {
         let t0 = std::time::Instant::now();
         let me = self.me.upgrade().expect("its connection holds it");
         let (u, q, f) = (user.to_string(), sql.to_string(), format.clone());
+        let who = self.signed().await?;
         let run = async move {
-            let (session, who) = (Some(me.session.clone()), me.who());
+            let session = Some(me.session.clone());
             crate::routines::with_notices(crate::temp::SESSION.scope(session, crate::auth::WHO.scope(who, me.caught(&u, &q, &f)))).await
         };
         let (out, heard) = crate::panics::work(true, Box::pin(run)).await.unwrap_or_else(|m| (Err(user_error(anyhow::anyhow!(m))), vec![])); // (stoppable for memory: `oom.rs`)
@@ -553,6 +577,56 @@ impl Backend {
 
     /// Whoever signed in on this connection (nobody, before).
     fn who(&self) -> crate::auth::Principal { self.who.lock().unwrap().clone().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None)) }
+
+    /// Signed in as `who`, checked again as `again` says (the nodes' own and an open lake's anyone: never).
+    fn signed_in(&self, who: crate::auth::Principal, again: Option<Again>) {
+        let again = again.filter(|_| !who.operator);
+        *self.who.lock().unwrap() = Some(who);
+        *self.again.lock().unwrap() = again.map(|a| (a, std::time::Instant::now()));
+    }
+
+    /// Whoever signed in, as a statement runs: `who`, its sign-in checked again at most every `AGAIN`, with its role and grants
+    /// as they are now. One that no longer signs in ends the connection (FATAL 28000), as Postgres ends a session whose role
+    /// can't go on.
+    async fn signed(&self) -> PgWireResult<crate::auth::Principal> {
+        let due = match self.again.lock().unwrap().as_mut() {
+            Some((again, at)) if at.elapsed() >= AGAIN => {
+                *at = std::time::Instant::now();
+                Some(again.clone())
+            }
+            _ => None,
+        };
+        let Some(again) = due else { return Ok(self.who()) };
+        Box::pin(self.signed_again(again)).await // (boxed: a statement's future doesn't carry a sign-in's)
+    }
+
+    /// `signed`'s check, due: whoever `again` signs in now, kept as who this connection is.
+    async fn signed_again(&self, again: Again) -> PgWireResult<crate::auth::Principal> {
+        let (lake, auth, was) = (&self.app.lake, &self.app.auth, self.who());
+        let now = match &again {
+            Again::Token { user, token } => match crate::users::sign_in(lake, auth, user, token).await {
+                Some(p) => Ok(p),
+                None => Err(crate::sso::why(lake, token).await.unwrap_or_else(|| "its token was revoked or has expired".into())),
+            },
+            Again::User { user, verifier } => match crate::users::verifier(lake, user).await {
+                v if v == *verifier => crate::users::principal(lake, user).await.map_err(|e| format!("{e:#}")),
+                None => Err("it can't sign in any more (dropped, or NOLOGIN)".into()),
+                Some(_) => Err("its password was changed".into()),
+            },
+        };
+        match now {
+            Ok(p) => {
+                let p = p.at(was.door, was.from);
+                *self.who.lock().unwrap() = Some(p.clone());
+                Ok(p)
+            }
+            Err(why) => {
+                *self.who.lock().unwrap() = None;
+                crate::audit::refused(&self.app, &was.name, "postgres", was.from, "sign in again", &why).await;
+                Err(fatal(format!("user \"{}\" is signed out: {why}", was.name)))
+            }
+        }
+    }
 
     /// A statement pgwire cancelled (a cancel request, psql's Ctrl-C), or one the node stopped for memory
     /// (`oom.rs`), is dropped before it reaches `caught`, which would fail its transaction: here it does,
@@ -1477,7 +1551,7 @@ impl SimpleQueryHandler for Backend {
         let mut out = vec![];
         for q in crate::routines::split(query).iter().map(|q| q.trim()) {
             out.push(match Copy::of(q) {
-                Some(Ok(c)) if !c.to => crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.who(), self.copy_in(client, &user, c))).await?,
+                Some(Ok(c)) if !c.to => crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.signed().await?, self.copy_in(client, &user, c))).await?,
                 _ => self.told(client, &user, q, &Format::UnifiedText).await?,
             });
         }
@@ -1574,7 +1648,7 @@ impl ExtendedQueryHandler for Backend {
         let user = client.metadata().get("user").cloned().unwrap_or_default();
         let statement = &portal.statement.statement;
         if let Some(Ok(c)) = Copy::of(&statement.sql).filter(|c| c.as_ref().is_ok_and(|c| !c.to)) {
-            return crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.who(), self.copy_in(client, &user, c))).await;
+            return crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.signed().await?, self.copy_in(client, &user, c))).await;
         }
         let inferred = crate::temp::SESSION.scope(Some(self.session.clone()), self.types(statement)).await;
         let out = self.told(client, &user, &bind(portal, inferred)?, &portal.result_column_format).await?;

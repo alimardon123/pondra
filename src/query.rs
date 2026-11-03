@@ -1404,7 +1404,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         ctx.register_catalog(ns, catalog);
     }
     if crate::runs::mentioned(&text) && default.schema("pondra").is_none() {
-        // (`pondra.runs`, `pondra.routines`, `pondra.tasks`; a lake's own schema called pondra is one made before 1.0, which wins as it did: 1.0 refuses a new one, 42939)
+        // (`pondra.runs`, `pondra.routines`, `pondra.tasks`; a lake's own schema called pondra is one made before 0.80, which wins as it did: 0.80 refuses a new one, 42939)
         use datafusion::catalog::SchemaProvider;
         let system = Arc::new(MemorySchemaProvider::new());
         for (name, table) in crate::runs::tables(lake).await?.into_iter().chain(crate::users::tables(lake).await?).chain(crate::objects::tables(lake, &text).await?).chain(crate::copy::tables(lake, &text).await?) {
@@ -1613,9 +1613,11 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
 /// Run `sql` with table `source` standing for just `rows` (new rows of a streaming source); every
 /// other table it mentions is read from the lake as usual.
 pub async fn over(lake: &Lake, source: &str, rows: Vec<RecordBatch>, sql: &str) -> Result<RecordBatch> {
-    let meta: TableMeta = lake.cat.get::<TableMeta>(&table_key(source)).await?.ok_or_else(|| anyhow::anyhow!("no table {source}"))?.logical(); // (rows under SQL's names)
+    let meta: TableMeta = lake.cat.get::<TableMeta>(&table_key(source)).await?.ok_or_else(|| anyhow::anyhow!("no table {source}"))?;
     let sql = crate::sys::planned(sql)?;
-    let (out, batches) = crate::fresh::run(lake, source, schema(&meta.columns)?, &rows, &sql, "", Ok).await?; // (its plan kept, when it reads the rows alone)
+    // (rows under SQL's names, in SQL's order: a `*` lists them as it did when the task or view was planned, after a column
+    // moved too; what read them before a move reads them by name since, `ddl::keep_readers`)
+    let (out, batches) = crate::fresh::run(lake, source, schema(&meta.sql_columns())?, &rows, &sql, "", Ok).await?; // (its plan kept, when it reads the rows alone)
     Ok(datafusion::arrow::compute::concat_batches(&out, &batches)?)
 }
 

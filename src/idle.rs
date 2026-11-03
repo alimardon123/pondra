@@ -4,10 +4,13 @@
 //! term back at once, so the next start leads straight away.
 //!
 //! What counts as use, each held as a [`Use`] while it lasts: an HTTP request until its answer has been sent (a live
-//! query's or a watch's for as long as it streams), but not the cluster's own calls or the health checks
-//! (`drain::still_taken`), which never end while a cluster runs; a Postgres, Kafka or Flight connection while it is
-//! open; a run of a procedure or task. What is left to do, on the node that leads: rows in the log not yet tiered, and a
-//! task on a schedule that isn't suspended, which runs only while a node does (said once, and the node stays up).
+//! query's or a watch's for as long as it streams, and a joined page's follow of the commit stream), but not the cluster's
+//! own calls or the health checks (`drain::still_taken`), which never end while a cluster runs; a Postgres, Kafka or
+//! Flight connection while it is open; a run of a procedure or task. What is left to do, on the node that leads: rows in
+//! the log not yet tiered, and a task on a schedule that isn't suspended, which runs only while a node does (said once,
+//! and the node stays up); on a follower, under `--ack replicated`, the copies of the leader's commits it holds that
+//! aren't in the bucket yet (`replica.rs`: a start-on-request platform's disk may not outlive the process).
+use crate::replica::ReplicaLog;
 use crate::store::Lake;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -18,8 +21,9 @@ use std::time::Duration;
 crate::per_node!(static USING: RwLock<Arc<AtomicUsize>> = RwLock::default());
 // When the last use began or ended (`log::now_ms`); 0 until the first.
 crate::per_node!(static LAST: AtomicU64 = AtomicU64::new(0));
-// What the node that serves holds, to see what it has left to do: its lake, and whether it leads.
-crate::per_node!(static NODE: Mutex<Option<(Weak<Lake>, bool)>> = Mutex::new(None));
+// What the node that serves holds, to see what it has left to do: its lake, whether it leads, and a follower's copies of the
+// leader's commits (`--ack replicated`).
+crate::per_node!(static NODE: Mutex<Option<(Weak<Lake>, bool, Option<Weak<ReplicaLog>>)>> = Mutex::new(None));
 // Whether the wait for scheduled tasks was said (once a node).
 crate::per_node!(static SAID: AtomicBool = AtomicBool::new(false));
 
@@ -52,11 +56,14 @@ pub fn kept<B: axum::body::HttpBody>(body: B, used: Use) -> impl axum::body::Htt
 }
 
 /// The requests that aren't a use: the ones a cluster sends all the time (a follower's beat, its feed of the
-/// leader's commits) and the health checks, which never stop while a node runs.
+/// leader's commits, which a joined page's follow of it is, though: `server::feed`) and the health checks, which never
+/// stop while a node runs.
 pub fn background(path: &str) -> bool { matches!(path, "/cluster/beat" | "/cluster/log" | "/healthz" | "/ready" | "/stats" | "/metrics") }
 
 /// The node serving now (`node::keep`): what [`ended`] looks at for work left.
-pub fn serving(lake: &Arc<Lake>, leads: bool) { *NODE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Arc::downgrade(lake), leads)); }
+pub fn serving(lake: &Arc<Lake>, leads: bool, replica: Option<&Arc<ReplicaLog>>) {
+    *NODE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Arc::downgrade(lake), leads, replica.map(Arc::downgrade)));
+}
 
 /// Resolves once the node has had no use for `secs` and has nothing left to do; never when `secs` is 0. Counted from the
 /// call (the process's start) or the last use, whichever came later.
@@ -82,10 +89,10 @@ pub async fn ended(secs: f64) {
 /// Has the node that serves something left to do (see the module's note)? A node not yet serving has: it starts.
 async fn left() -> bool {
     let node = NODE.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let Some((lake, leads)) = node else { return true };
+    let Some((lake, leads, replica)) = node else { return true };
     let Some(lake) = lake.upgrade() else { return true };
     if !leads {
-        return false;
+        return replica.and_then(|r| r.upgrade()).is_some_and(|r| r.holds()); // (pruned once the leader's flush is in the bucket)
     }
     if lake.backlog.load(SeqCst) > 0 {
         return true; // (tiered first: another look next time)

@@ -177,6 +177,16 @@ def project_check(bin, work, port, checks):
         and rows("prod", "SELECT count(*) FROM sales.big") == [(10,)] and rows("prod", "SELECT count(channel) FROM sales.orders") == [(0,)]
     if not checks["a column added and a view changed: ADD COLUMN, the view replaced"]:
         checks["(added: the plan, big, a row)"] = [plan, rows("prod", "SELECT count(*) FROM sales.big"), refused("prod", "SELECT channel FROM sales.orders")]
+    # A column moved outside an apply (11-03 audit M8): the table compared in SQL's order, as SHOW CREATE gives it, and the
+    # plan moves it back into the project's (it was refused as a migration, and a project declaring the moved order passed)
+    q("prod", "ALTER TABLE sales.orders ALTER COLUMN channel FIRST")
+    plan = pondra("plan", "prod")
+    pondra("apply", "prod")
+    order = [r["column_name"] for r in q("prod", "DESCRIBE sales.orders")][:3]
+    checks["a column moved outside an apply: the plan moves it back into the project's order"] = "ALTER COLUMN id FIRST" in plan \
+        and "ALTER COLUMN amount AFTER id" in plan and order == ["id", "amount", "channel"] and "nothing to change" in pondra("plan", "prod")
+    if not checks["a column moved outside an apply: the plan moves it back into the project's order"]:
+        checks["(moved: the plan, the order)"] = [plan, order]
     q("prod", "CREATE OR REPLACE VIEW sales.big AS SELECT * FROM sales.orders")
     plan = pondra("plan", "prod")
     pondra("apply", "prod")

@@ -201,7 +201,7 @@ impl Project {
     }
 }
 
-/// A file under `objects/` that comes in 1.1, which 1.0 refuses by name (`project`): YAML (a pipeline or a dashboard) and
+/// A file under `objects/` that comes in 1.1, which 0.80 refuses by name (`project`): YAML (a pipeline or a dashboard) and
 /// Python (a pipeline). Its words, or None. The gatherers list one by its name with no text, so it is never skipped
 /// silently, and a project that holds one doesn't change meaning when 1.1 reads it.
 pub(crate) fn later_object(path: &str) -> Option<&'static str> {
@@ -943,7 +943,26 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<St
         false => (pairs(&spec["columns"]), spec.clone()),
     };
     let declared: Vec<(String, String, String)> = columns.iter().filter(|(n, _)| n != "_deleted").map(|(n, t)| Ok((n.clone(), crate::answer::type_name(&crate::answer::dtype(t)?), sql_type(t)))).collect::<Result<_>>()?;
-    let have: Vec<&(String, String)> = m.columns.iter().filter(|(c, _)| !crate::text::NAMES.contains(&c.as_str()) && c != "_deleted").collect();
+    // (in SQL's order, as SHOW CREATE and an export give the table: 11-03 audit M8)
+    let mut have: Vec<(String, String)> = m.sql_columns().into_iter().filter(|(c, _)| !crate::text::NAMES.contains(&c.as_str()) && c != "_deleted").collect();
+    // (the same columns in another order: moved into the project's, each after the one before it)
+    let mut moves = vec![];
+    if declared.len() >= have.len() {
+        let (mut is, mut wanted): (Vec<&String>, Vec<&String>) = (have.iter().map(|(c, _)| c).collect(), declared[..have.len()].iter().map(|(c, ..)| c).collect());
+        let order = wanted.clone();
+        (is.sort(), wanted.sort());
+        if is == wanted {
+            let from = have.iter().zip(&order).position(|((a, _), b)| a != *b).unwrap_or(have.len());
+            for i in from..have.len() {
+                moves.push(match i {
+                    0 => format!("ALTER TABLE {} ALTER COLUMN {} FIRST", quoted(&d.name), ident(order[0])),
+                    _ => format!("ALTER TABLE {} ALTER COLUMN {} AFTER {}", quoted(&d.name), ident(order[i]), ident(order[i - 1])),
+                });
+            }
+            let by: Vec<String> = order.iter().map(|c| c.to_string()).collect();
+            have.sort_by_key(|(c, _)| by.iter().position(|o| o == c));
+        }
+    }
     let names = |v: &mut dyn Iterator<Item = &String>| v.cloned().collect::<Vec<_>>().join(", ");
     // (ALTER TABLE … RENAME, DROP and ALTER COLUMN are refused while views read the table: a
     // migration drops them first, and the apply makes them again after it)
@@ -952,7 +971,7 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<St
     ensure!(declared.len() >= have.len() && have.iter().zip(&declared).all(|((a, _), (b, ..))| a == b),
         "its columns are ({}) here and ({}) in the project: a column renamed, dropped or moved is a migration's (ALTER TABLE {} RENAME COLUMN … TO …, DROP COLUMN …{first})",
         names(&mut have.iter().map(|(c, _)| c)), names(&mut declared.iter().map(|(c, ..)| c)), quoted(&d.name));
-    let mut sql = vec![];
+    let mut sql = moves;
     for ((c, old), (_, new, written)) in have.iter().zip(&declared) {
         if old != new {
             let widens = crate::ddl::widens(&crate::answer::dtype(old)?, &crate::answer::dtype(new)?);

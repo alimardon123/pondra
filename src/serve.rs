@@ -169,7 +169,8 @@ fn pointable(meta: &TableMeta) -> bool {
 /// The key `filter` names: `<key> = <value> [AND …]`, each of `meta`'s key columns once and no other column. Its values in
 /// key order (None: a parameter, whose number the map gives). None: any other condition.
 fn key_of(meta: &TableMeta, filter: &datafusion::sql::sqlparser::ast::Expr) -> Option<(Vec<Option<String>>, HashMap<String, usize>)> {
-    use datafusion::sql::sqlparser::ast::{BinaryOperator, Expr, Value};
+    use datafusion::sql::sqlparser::ast::{BinaryOperator, DollarQuotedString, Expr, Value};
+    let text = |c: &str| meta.columns.iter().any(|(n, t)| n == c && t.contains("Utf8"));
     let (mut eqs, mut params) = (vec![], HashMap::new());
     let mut stack = vec![filter];
     while let Some(e) = stack.pop() {
@@ -181,10 +182,13 @@ fn key_of(meta: &TableMeta, filter: &datafusion::sql::sqlparser::ast::Expr) -> O
                         params.insert(c.value.clone(), p.trim_start_matches('$').parse::<usize>().unwrap_or(0));
                         eqs.push((c.value.clone(), None));
                     }
-                    Value::Null => return None,
-                    // (a string's value, as written: `'O''Brien'` is `O'Brien`, not the text it was typed as)
-                    Value::SingleQuotedString(s) => eqs.push((c.value.clone(), Some(s.clone()))),
-                    v => eqs.push((c.value.clone(), Some(v.to_string().trim_matches('\'').to_string()))),
+                    // (a string's value, not the text it was typed as: `'O''Brien'`, `E'O\'Brien'`, `$$O'Brien$$` and
+                    // `N'O''Brien'` are all `O'Brien`)
+                    Value::SingleQuotedString(s) | Value::EscapedStringLiteral(s) | Value::NationalStringLiteral(s) | Value::DollarQuotedString(DollarQuotedString { value: s, .. }) => eqs.push((c.value.clone(), Some(s.clone()))),
+                    // (a number for a text key is compared as SQL converts the two: SQL answers it)
+                    Value::Number(n, false) if !text(&c.value) => eqs.push((c.value.clone(), Some(n.clone()))),
+                    Value::Boolean(b) => eqs.push((c.value.clone(), Some(b.to_string()))),
+                    _ => return None, // (NULL, X'…', b'…', U&'…' and the like: SQL answers them)
                 },
                 _ => return None,
             },
@@ -496,6 +500,15 @@ mod tests {
         for other in ["a = 1", "a = 1 AND b = 'x' AND v = 3", "a = 1 AND a = 2", "a = 1 OR b = 'x'", "a > 1 AND b = 'x'", "a = NULL AND b = 'x'", "a = $1 AND b = 'x'", "a = 1 AND b = 'x' x", "a = -1 AND b = 'x'", ""] {
             assert_eq!(key(other), None, "{other}");
         }
+        // (a string written any way Postgres takes is its value; a form not taken here is SQL's to answer)
+        for spelled in ["b = E'O\\'Brien' AND a = 2", "b = $$O'Brien$$ AND a = 2", "b = $q$O'Brien$q$ AND a = 2", "b = N'O''Brien' AND a = 2"] {
+            assert_eq!(key(spelled), k("2", "O'Brien"), "{spelled}");
+        }
+        assert_eq!(key("b = E'a\\tb' AND a = 2"), k("2", "a\tb"), "an escape as the character it stands for");
+        for other in ["a = 1 AND b = X'61'", "a = 1 AND b = 5", "a = 1.5L AND b = 'x'", "a = 1 AND b = U&'x'"] {
+            assert_eq!(key(other), None, "{other}");
+        }
+        assert_eq!(key("a = true AND b = 'x'"), k("true", "x"), "a boolean as before (its key's type converts it or SQL answers)");
         let uuid = TableMeta { columns: vec![("u".into(), "Utf8".into())], key: vec!["u".into()], sql_types: [("u".to_string(), "uuid".to_string())].into(), ..Default::default() };
         assert_eq!(key_where(&uuid, "u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'"), Some(vec!["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11".to_string()]), "a uuid as the column holds it");
         let ttl = TableMeta { ttl: Some(("v".into(), 60)), ..meta.clone() };
