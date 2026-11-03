@@ -103,7 +103,7 @@ pub(crate) type Known = HashMap<String, Option<Cols>>;
 /// column is held as its column says (`rules::shape`). Whether it changed anything.
 pub async fn rewrite<H: Host>(host: &H, stmt: &mut Statement) -> anyhow::Result<bool> {
     let asks = |e: &Expr| matches!(e, Expr::Function(f) if object(&f.name) == "pg_typeof");
-    let spelled = |e: &Expr| string(e).is_some_and(|s| !crate::text::is_uuid(s) && crate::pg_casts::uuid_of(s).is_ok());
+    let spelled = |e: &Expr| string(e).is_some_and(|s| !crate::text::is_uuid(s) && crate::pg_casts::uuid_spelled(s).is_some());
     // (a string compared by equality, `doc = '…'`, `'…' <> doc`, `doc IN ('…')`, `CASE doc WHEN '…'`: each is read as the
     // column it is compared with reads it, `comparison`)
     let compares_string = |e: &Expr| match e {
@@ -157,7 +157,7 @@ fn rewritten(known: &Known, stmt: &mut Statement) -> anyhow::Result<bool> {
             let place = at(e);
             let to = match asked.iter().find(|(p, _)| *p == place) {
                 Some((_, ty)) => Some(ty.name().to_string()),
-                None if compared.contains(&place) => string(e).and_then(|s| crate::pg_casts::uuid_of(s).ok()),
+                None if compared.contains(&place) => string(e).and_then(crate::pg_casts::uuid_spelled),
                 None => jsonb.iter().find(|(p, _)| *p == place).map(|(_, text)| text.clone()),
             };
             if let Some(to) = to.filter(|to| string(e) != Some(to.as_str())) {

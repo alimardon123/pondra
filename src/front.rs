@@ -109,7 +109,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
     static LEADING_FROM: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*from\b").expect("a regex"));
-    let parsed = Parser::parse_sql(&GenericDialect {}, sql).or_else(|e| match LEADING_FROM.is_match(sql) {
+    let parsed = crate::parsed::generic(sql).or_else(|e| match LEADING_FROM.is_match(sql) { // (parsed once for the front's looks: `parsed.rs`)
         true => Parser::parse_sql(&GenericDialect {}, &format!("SELECT * {sql}")),
         false => Err(e),
     });

@@ -291,7 +291,7 @@ pub fn names_a_type(sql: &str) -> bool {
     static STRING: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"'((?:[^']|'')*)'").expect("a regex"));
     let read_as_jsonb = |written: &str| {
         let v = if written.contains("''") { std::borrow::Cow::Owned(written.replace("''", "'")) } else { std::borrow::Cow::Borrowed(written) };
-        v.trim_start().starts_with(['{', '[']) || crate::pg_json_make::jsonb_text(&v).is_ok_and(|text| text != v.as_ref())
+        v.trim_start().starts_with(['{', '[']) || crate::pg_json_make::jsonb_text_if(&v).is_some_and(|text| text != v.as_ref())
     };
     let compared = COMPARED.captures_iter(sql).any(|c| match c.get(3) {
         Some(list) => STRING.captures_iter(list.as_str()).any(|s| read_as_jsonb(&s[1])),

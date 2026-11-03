@@ -478,7 +478,7 @@ pub fn unless(if_not_exists: bool, name: &str, kind: &str, d: crate::ddl::Ddl) -
 
 /// A write statement, or None for a query.
 pub fn parse(sql: &str) -> Option<Stmt> {
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    use datafusion::sql::sqlparser::parser::Parser;
     use crate::ddl::{Change, Ddl};
     let where_ = |e: &Option<ast::Expr>| e.as_ref().map(|e| e.to_string());
     let alter = |a: &ast::AlterTable, c: &ast::Ident, change: Change| Stmt::Ddl(vec![Ddl::AlterColumn { table: object(&a.name), column: ident(c), change }]);
@@ -692,7 +692,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Ok(sql) => sql,
         Err(e) => return Some(Stmt::of_error(&e, format!("{e:#}"))),
     };
-    let parsed = Parser::parse_sql(&GenericDialect {}, sql).or_else(|e| crate::settings::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (DuckDB's STRUCT(a INT), …: the session's dialect)
+    let parsed = crate::parsed::generic(sql).or_else(|e| crate::settings::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (parsed once for the front's looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
     let parsed = match parsed {
         Ok(mut s) => s.pop()?,
         Err(_) => return None,
