@@ -314,6 +314,9 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     crate::store::trace("the sequencer");
     python::init(s.python.clone());
     let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone() };
+    if let Some(ledger) = lake.ledger() {
+        ledger.charge("answers", Arc::downgrade(&app.results) as std::sync::Weak<dyn crate::ledger::Charged>); // (the remembered answers: `/metrics`' `cache_bytes`)
+    }
     crate::constraints::share_lock(&app.lake, app.lock.clone()); // a checked append of this lake takes this lock (`constraints::leader`); the Log is reachable only through the App
     learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
     // (a lake served with tokens is not one a node may make a first user of: an accidental node with none must

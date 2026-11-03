@@ -136,7 +136,6 @@ metrics -> app
 metrics -> budget
 metrics -> hot
 metrics -> jemalloc
-metrics -> query
 metrics -> spill
 metrics -> store
 objects -> auth

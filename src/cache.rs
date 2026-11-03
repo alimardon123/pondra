@@ -18,7 +18,7 @@ use object_store_df::{
     CopyOptions, Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
 };
-use crate::ledger::ByteLru;
+use crate::ledger::{ByteLru, Charged};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -164,6 +164,13 @@ impl std::fmt::Debug for Disk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Disk({:?})", self.dir) }
 }
 
+/// The bucket's byte ranges held in memory, the least recently used given back first.
+impl Charged for CachedStore {
+    fn held(&self) -> usize { self.cache.held() }
+
+    fn give_back(&self, bytes: usize) -> usize { self.cache.give_back(bytes) }
+}
+
 impl CachedStore {
     pub fn new(inner: Arc<dyn object_store::ObjectStore>, max_bytes: usize, disk: Option<(Arc<Disk>, String)>, prefix: &str) -> Self {
         let id = uuid::Uuid::new_v4().simple().to_string();
@@ -178,8 +185,6 @@ impl CachedStore {
     }
 
     /// The bytes of objects' ranges held in memory now (at most `max_bytes`).
-    pub fn held(&self) -> usize { self.cache.lock().unwrap().bytes() }
-
     fn saw(&self, m: &ObjectMeta) { saw(&self.id, &self.lakes.read().unwrap(), m) }
 
     /// An object outside the lakes: a byte range of the version last listed, from memory or
