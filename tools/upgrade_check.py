@@ -622,7 +622,7 @@ def until(what, secs, step=0.5):
 
 # ---------------------------------------------------------------- the lake's format
 
-LISTS = 6  # this build's format: every table's columns kept as one list (`format::LISTS`), which a lake moves to by itself
+LISTS = 6  # this build's format: every table's columns kept as one list (`format::LISTS`): a new lake starts there, an older one moves there by itself
 
 
 def format_check(new_bin, work, port, old=None):
@@ -635,7 +635,7 @@ def format_check(new_bin, work, port, old=None):
     lake, later = os.path.join(work, "format-lake"), {"PONDRA_TEST_FORMAT": str(LISTS + 1), **unsealed}
     fmt = lambda n: n.get("/stats", timeout=5)["format"]
     first = Node(new_bin, lake, port, work, env=unsealed, token=False).start()  # makes the lake
-    checks["a lake this build makes has the mark (format 1) from the start"] = until(lambda: fmt(first) == 1, 3, step=0.1)
+    checks["a lake this build makes starts at its tables' column lists (format 6)"] = until(lambda: fmt(first) == LISTS, 3, step=0.1)
     first.q("CREATE TABLE t (x INT)")
     first.q("INSERT INTO t VALUES (1), (2)")
     first.stop()
@@ -643,7 +643,7 @@ def format_check(new_bin, work, port, old=None):
     b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False).start()  # follows, and knows format 6
     time.sleep(22)  # (the leader's first two looks: it must not go past what the follower knows)
     info["with a node of each"] = {"leader's": fmt(a), "follower's": fmt(b), "releases": a.get("/stats")["releases"]}
-    checks["a lake moves on by itself to its tables' column lists (format 6) once every node knows them, and only to the newest format every node knows"] = fmt(a) == LISTS and fmt(b) == LISTS
+    checks["a lake moves on only to the newest format every node knows"] = fmt(a) == LISTS and fmt(b) == LISTS
     checks["…and reads as it did"] = a.q("SELECT count(*) AS n FROM t") == [{"n": 2}] and b.q("SELECT count(*) AS n FROM t") == [{"n": 2}]
     b.stop()
     checks["…and on again once the node that didn't know the next one has gone"] = until(lambda: fmt(a) == LISTS + 1, 40)

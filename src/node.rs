@@ -515,7 +515,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         if lake.cat.replicas > 1 {
             replica::members(lake.clone(), app.members.clone());
         }
-        format::raise(lake.clone(), app.members.clone(), app.lock.clone()); // (once every node knows this build's format: ADR-039)
+        format::raise(lake.clone(), app.members.clone()); // (once every node knows this build's format: ADR-039)
     }
     if !leader {
         if lives {

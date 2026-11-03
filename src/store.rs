@@ -145,41 +145,173 @@ impl Made {
 
 /// One column of a table as its entry stores it from lake format 6 (redesign 1b, piece 6b): its id (its Parquet field id,
 /// its stored place + 1) and every fact about it, where before format 6 each fact was a map of its own by stored name.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+/// Written as `[name, type]`, then `"not null"` and `"dropped"` when they hold, then an object of the facts that aren't
+/// at their default (`Facts`), so the list is no bigger than format 5's fields (`entry_size`).
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Col {
     pub id: u32,
     /// The name SQL knows it by.
     pub name: String,
     /// The name its files and the log hold it under, when it was renamed (otherwise `name`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stored: Option<String>,
     /// Its Arrow type, as text.
-    #[serde(rename = "type")]
     pub dtype: String,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dropped: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub not_null: bool,
     /// `DEFAULT expr`, the SQL expression.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<crate::seq::Identity>,
     /// The type a text column is held as (uuid, json, varchar(n): `types.rs`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held: Option<String>,
     /// An enum column's labels and type.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<crate::types::Enum>,
 }
 
 /// A table's columns as its entry stores them from lake format 6: every column, dropped ones too, in field-id order, and
-/// SQL's order of them by id when it isn't the stored one (before format 6, `shown`).
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+/// SQL's order of them by id when it isn't the stored one (before format 6, `shown`). Written as `[columns]`, or
+/// `[columns, order]` when a column was moved; a column's id only where it isn't its place + 1.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Stored {
     pub columns: Vec<Col>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub order: Vec<u32>,
+}
+
+const NOT_NULL: &str = "not null";
+const DROPPED: &str = "dropped";
+
+/// A column's facts past its name, type and flags, as its entry writes them: each left out at its default (the id too,
+/// where it is the column's place + 1). (A missing one reads as None: no `default`, which would ask `Default` of each.)
+#[derive(Serialize, Deserialize)]
+struct Facts<S, I, E> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stored: Option<S>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default: Option<S>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<I>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    held: Option<S>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<E>,
+}
+
+/// A column at its place in the list, for writing: its id is written only when it isn't `place`.
+struct At<'a>(&'a Col, u32);
+
+impl Serialize for At<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let (c, place) = (self.0, self.1);
+        let facts = Facts { id: (c.id != place).then_some(c.id), stored: c.stored.as_ref(), default: c.default.as_ref(), identity: c.identity.as_ref(), held: c.held.as_ref(), labels: c.labels.as_ref() };
+        let any = facts.id.is_some() || c.stored.is_some() || c.default.is_some() || c.identity.is_some() || c.held.is_some() || c.labels.is_some();
+        let mut seq = s.serialize_seq(Some(2 + c.not_null as usize + c.dropped as usize + any as usize))?;
+        seq.serialize_element(&c.name)?;
+        seq.serialize_element(&c.dtype)?;
+        if c.not_null {
+            seq.serialize_element(NOT_NULL)?;
+        }
+        if c.dropped {
+            seq.serialize_element(DROPPED)?;
+        }
+        if any {
+            seq.serialize_element(&facts)?;
+        }
+        seq.end()
+    }
+}
+
+impl Serialize for Stored {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        struct Cols<'a>(&'a [Col]);
+        impl Serialize for Cols<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> { s.collect_seq(self.0.iter().zip(1..).map(|(c, place)| At(c, place))) }
+        }
+        let mut seq = s.serialize_seq(Some(1 + !self.order.is_empty() as usize))?;
+        seq.serialize_element(&Cols(&self.columns))?;
+        if !self.order.is_empty() {
+            seq.serialize_element(&self.order)?;
+        }
+        seq.end()
+    }
+}
+
+/// What follows a column's name and type: a flag, or its facts.
+enum Rest {
+    NotNull,
+    Dropped,
+    Facts(Facts<String, crate::seq::Identity, crate::types::Enum>),
+}
+
+impl<'de> Deserialize<'de> for Rest {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Rest, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Rest;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "\"{NOT_NULL}\", \"{DROPPED}\" or a column's facts") }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Rest, E> {
+                match v {
+                    NOT_NULL => Ok(Rest::NotNull),
+                    DROPPED => Ok(Rest::Dropped),
+                    _ => Err(E::unknown_variant(v, &[NOT_NULL, DROPPED])),
+                }
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, m: M) -> std::result::Result<Rest, M::Error> { Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(m)).map(Rest::Facts) }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl<'de> Deserialize<'de> for Col {
+    /// A column as `At` writes it, its id 0 when the list gives it none (`Stored` gives it its place's).
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Col, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Col;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("a column: [name, type, flags…, facts]") }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Col, A::Error> {
+                use serde::de::Error;
+                let name = seq.next_element::<String>()?.ok_or_else(|| A::Error::invalid_length(0, &self))?;
+                let dtype = seq.next_element::<String>()?.ok_or_else(|| A::Error::invalid_length(1, &self))?;
+                let mut c = Col { name, dtype, ..Default::default() };
+                while let Some(r) = seq.next_element::<Rest>()? {
+                    match r {
+                        Rest::NotNull => c.not_null = true,
+                        Rest::Dropped => c.dropped = true,
+                        Rest::Facts(f) => {
+                            c.id = f.id.unwrap_or_default();
+                            (c.stored, c.default, c.identity, c.held, c.labels) = (f.stored, f.default, f.identity, f.held, f.labels);
+                        }
+                    }
+                }
+                Ok(c)
+            }
+        }
+        d.deserialize_seq(V)
+    }
+}
+
+impl<'de> Deserialize<'de> for Stored {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Stored, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Stored;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("a table's columns: [columns] or [columns, order]") }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Stored, A::Error> {
+                let mut columns: Vec<Col> = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let order = seq.next_element()?.unwrap_or_default();
+                for (c, place) in columns.iter_mut().zip(1..) {
+                    if c.id == 0 {
+                        c.id = place;
+                    }
+                }
+                Ok(Stored { columns, order })
+            }
+        }
+        d.deserialize_seq(V)
+    }
 }
 
 impl Stored {
@@ -4301,27 +4433,26 @@ mod tests {
         assert!((*a).clone().column_memo.get().is_none(), "a clone's memo is empty");
     }
 
-    /// What decoding an entry and making its column list cost (redesign 1b, piece 6b's before and after): a wide table
-    /// (500 columns, renames, drops, a move, per-column facts and 200 files) and 2,000 small random ones. A measure, not a
-    /// check: `cargo test --release --lib entry_parse_time -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn entry_parse_time() {
-        let wide = {
-            let mut m = TableMeta::with_columns((0..500).map(|i| (format!("column_{i}"), if i % 3 == 0 { "Int64" } else { "Utf8" }.to_string())).collect());
-            for i in (0..500).step_by(10) {
-                m.o_names.insert(format!("column_{i}"), format!("renamed_{i}"));
-            }
-            m.o_dropped = (5..500).step_by(25).map(|i| format!("column_{i}")).collect();
-            m.o_shown = ["column_499", "column_1", "column_2"].map(String::from).to_vec();
-            m.o_not_null = (0..100).map(|i| format!("column_{i}")).collect();
-            m.o_defaults = (100..150).map(|i| (format!("column_{i}"), "'x'".to_string())).collect();
-            m.o_sql_types = (200..230).map(|i| (format!("column_{i}"), "uuid".to_string())).collect();
-            m.key = vec!["column_0".into()];
-            m.files = (0..200).map(|i| crate::data_file::DataFile { path: format!("data/t/{i:08}.parquet"), rows: 1000, bytes: 1 << 20, ..Default::default() }).collect();
-            json(&m)
-        };
-        let small: Vec<Vec<u8>> = (0..2000u64)
+    /// The parse and size measures' wide entry: 500 columns, renames, drops, a moved order, NOT NULLs, defaults, held
+    /// types and 200 files.
+    fn wide_entry() -> TableMeta {
+        let mut m = TableMeta::with_columns((0..500).map(|i| (format!("column_{i}"), if i % 3 == 0 { "Int64" } else { "Utf8" }.to_string())).collect());
+        for i in (0..500).step_by(10) {
+            m.o_names.insert(format!("column_{i}"), format!("renamed_{i}"));
+        }
+        m.o_dropped = (5..500).step_by(25).map(|i| format!("column_{i}")).collect();
+        m.o_shown = ["column_499", "column_1", "column_2"].map(String::from).to_vec();
+        m.o_not_null = (0..100).map(|i| format!("column_{i}")).collect();
+        m.o_defaults = (100..150).map(|i| (format!("column_{i}"), "'x'".to_string())).collect();
+        m.o_sql_types = (200..230).map(|i| (format!("column_{i}"), "uuid".to_string())).collect();
+        m.key = vec!["column_0".into()];
+        m.files = (0..200).map(|i| crate::data_file::DataFile { path: format!("data/t/{i:08}.parquet"), rows: 1000, bytes: 1 << 20, ..Default::default() }).collect();
+        m
+    }
+
+    /// Their 2,000 small entries: 1 to 8 columns, some renamed, some with a column dropped.
+    fn small_entries() -> Vec<TableMeta> {
+        (0..2000u64)
             .map(|i| {
                 let n = 1 + (i % 8) as usize;
                 let mut m = TableMeta::with_columns((0..n).map(|c| (format!("c{c}"), "Int64".to_string())).collect());
@@ -4331,9 +4462,31 @@ mod tests {
                 if i % 5 == 0 && n > 1 {
                     m.o_dropped.push(format!("c{}", n - 1));
                 }
-                json(&m)
+                m
             })
-            .collect();
+            .collect()
+    }
+
+    /// Format 6's list is no bigger than format 5's fields: the wide entry at or under its 35,088 bytes, and the small
+    /// ones at or under their 269 bytes on average (the redesign thread's gate for 6b).
+    #[test]
+    fn entry_size() {
+        let (wide, small) = (wide_entry(), small_entries());
+        let avg = |ts: &[TableMeta], listed: bool| ts.iter().map(|t| json(&t.clone().shaped(listed)).len()).sum::<usize>() / ts.len();
+        let (w5, w6) = (json(&wide).len(), json(&wide.clone().shaped(true)).len());
+        let (s5, s6) = (avg(&small, false), avg(&small, true));
+        println!("wide: {w5} bytes in format 5's fields, {w6} as format 6's list; small: {s5} and {s6} on average");
+        assert!(w5 == 35_088 && s5 == 269, "the measures' entries changed: wide {w5}, small {s5}");
+        assert!(w6 <= w5 && s6 <= s5, "format 6's list is bigger: wide {w6}, small {s6}");
+    }
+
+    /// What decoding an entry and making its column list cost (redesign 1b, piece 6b's before and after): a wide table
+    /// (500 columns, renames, drops, a move, per-column facts and 200 files) and 2,000 small random ones. A measure, not a
+    /// check: `cargo test --release --lib entry_parse_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn entry_parse_time() {
+        let (wide, small) = (json(&wide_entry()), small_entries().iter().map(json).collect::<Vec<_>>());
         let time = |what: &str, raws: &[&[u8]], rounds: u32| {
             let best = (0..5)
                 .map(|_| {

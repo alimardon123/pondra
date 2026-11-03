@@ -32,9 +32,10 @@ use std::time::Duration;
 /// piece 6b), which a node from before can't read (`LISTS`).
 pub const FORMAT: u32 = 6;
 
-/// The format whose tables keep their columns as one list (`store::Stored`). The leader raises a lake to it by itself once
-/// every node knows it (`raise`), in one commit that rewrites every table's entry so (`lists`): ADR-039's migration in the
-/// commit that sets its format. From then on an entry is written so wherever it was made (`Catalog::write`).
+/// The format whose tables keep their columns as one list (`store::Stored`). A lake moves to it by itself: its leader raises
+/// it once every node knows it (`raise`), and a form that leads its lake alone as it opens (`alone`). The commit sets the
+/// format alone: each table's entry becomes its list at its next write (`Catalog::write`), and an entry still in format
+/// 5's shape reads as it always did, as every format-5 lake's do.
 pub const LISTS: u32 = 6;
 
 /// The format every lake gets without asking: the mark itself (`raise`).
@@ -101,11 +102,9 @@ pub async fn check(cat: &Catalog, url: &str, writer: bool) -> Result<u32> {
 async fn set(lake: &Lake, to: u32) -> Result<()> {
     static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _one = ONE.lock().await;
-    let before = of(&lake.cat).await?.format;
-    if before >= to {
+    if of(&lake.cat).await?.format >= to {
         return Ok(());
     }
-    anyhow::ensure!(before >= LISTS || to < LISTS, "format {to} comes after the tables' column lists (format {LISTS}), which the lake's leader writes first, once every node knows it");
     let stamp = Stamp { format: to, by: VERSION.into() };
     lake.cat.commit(vec![(KEY.into(), serde_json::to_vec(&stamp).expect("json"))], &[]).await?;
     crate::node::say(format!("the lake is format {to} now (Pondra {VERSION})"));
@@ -181,13 +180,13 @@ impl Drop for Streamed {
 /// has said what it knows, then looks every 10 s. A lake this process made has the mark at once,
 /// and every node knows this build's format until one says otherwise: no node older than it has
 /// read it. A migration, when a format needs one, goes in the commit that sets it.
-pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>, lock: Arc<tokio::sync::Mutex<()>>) {
+pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>) {
     use std::sync::atomic::Ordering::Relaxed;
     crate::panics::spawn(async move {
         let mut marked = false;
         if MADE.load(Relaxed) {
             READY.store(known() + 2, Relaxed);
-            marked = set(&lake, BASE).await.map_err(|e| eprintln!("the lake's format: {e:#}")).is_ok();
+            marked = set(&lake, first()).await.map_err(|e| eprintln!("the lake's format: {e:#}")).is_ok();
         } else {
             READY.store(1, Relaxed); // (looking: `require` waits for it)
         }
@@ -205,7 +204,7 @@ pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>, lock: Arc<tokio::sync::
                 marked = done.map_err(|e| eprintln!("the lake's format: {e:#}")).is_ok();
             }
             if ready >= LISTS {
-                if let Err(e) = lists(&lake, &lock).await {
+                if let Err(e) = set(&lake, LISTS).await {
                     eprintln!("the tables' column lists (format {LISTS}): {e:#}");
                 }
             }
@@ -218,29 +217,18 @@ pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>, lock: Arc<tokio::sync::
     });
 }
 
-/// Leader: format 6 (`LISTS`), in one commit with every table's entry rewritten as its column list. Under the lake's lock,
-/// which every writer of an entry takes (`App::lock`), so no change to one is lost between this read and the commit.
-/// Returns how many entries it rewrote and their bytes.
-pub async fn lists(lake: &Lake, lock: &tokio::sync::Mutex<()>) -> Result<(usize, usize)> {
-    if of(&lake.cat).await?.format >= LISTS {
-        return Ok((0, 0)); // (the leader's every look after: no lock taken)
+/// The format a lake this build makes starts at: its tables' column lists (`LISTS`) at once, since no release older than
+/// this build has read it (the mark alone, `BASE`, for a test posing as a build from before them).
+fn first() -> u32 { if known() >= LISTS { LISTS } else { BASE } }
+
+/// A form that leads its lake alone, with no leader's loop (`pondra sql`, a program's node, in a folder or in memory): the
+/// lake moves to this build's tables' column lists (`LISTS`) as it opens, in one small commit. Nobody else leads it, so
+/// it has no node to wait for; a node of a release before that starts on the lake later is refused by name (`check`).
+pub async fn alone(lake: &Lake) -> Result<()> {
+    if known() >= LISTS {
+        set(lake, LISTS).await?;
     }
-    let _guard = lock.lock().await;
-    if of(&lake.cat).await?.format >= LISTS {
-        return Ok((0, 0));
-    }
-    let t0 = std::time::Instant::now();
-    let mut puts: Vec<(String, Vec<u8>)> = vec![];
-    for (k, t) in lake.cat.scan::<crate::store::TableMeta>("t/", "t0").await? {
-        if !t.listed() {
-            puts.push((k, crate::store::json(&t.shaped(true))));
-        }
-    }
-    let (n, bytes) = (puts.len(), puts.iter().map(|(_, v)| v.len()).sum::<usize>());
-    puts.push((KEY.into(), serde_json::to_vec(&Stamp { format: LISTS, by: VERSION.into() })?));
-    lake.cat.commit(puts, &[]).await?;
-    crate::node::say(format!("the lake is format {LISTS} now (Pondra {VERSION}): {n} tables keep their columns as one list ({bytes} bytes, {:.1} s)", t0.elapsed().as_secs_f64()));
-    Ok((n, bytes))
+    Ok(())
 }
 
 /// A node that isn't the leader: stop if the lake moves past what this build knows. (It can't,
@@ -264,10 +252,10 @@ mod tests {
     use super::*;
     use crate::store::{json, table_key, TableMeta};
 
-    /// A lake of format 5 with `tables` tables in format 5's shape, raised to format 6 (`lists`): how many entries the
-    /// raise rewrote, their bytes and its seconds. Every entry is then its list, answering as before, and an entry made
-    /// in format 5's shape after it is written as its list too (`Catalog::write`).
-    async fn raised(tables: usize) -> Result<(usize, usize, f64)> {
+    /// Format 6 is one small commit: a format-5 lake's entries stay in their shape and answer as before, and each becomes
+    /// its list at its next write (`Catalog::write`), as does an entry made in format 5's shape after it.
+    #[tokio::test]
+    async fn format_6_turns_each_entry_into_its_list_at_its_next_write() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-lists-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().expect("a path"), true, false).await?;
         lake.cat.commit(vec![(KEY.into(), serde_json::to_vec(&Stamp { format: 5, by: "0.80.0".into() })?)], &[]).await?;
@@ -280,38 +268,27 @@ mod tests {
             t.set_order(vec!["c7".into()]);
             t
         };
-        for from in (0..tables).step_by(1000) {
-            lake.cat.commit((from..tables.min(from + 1000)).map(|i| (table_key(&format!("t{i}")), json(&entry(i)))).collect(), &[]).await?;
-        }
+        lake.cat.commit((0..300).map(|i| (table_key(&format!("t{i}")), json(&entry(i)))).collect(), &[]).await?;
+        let shapes = |raw: &std::collections::BTreeMap<String, bytes::Bytes>| raw.values().filter(|v| v.starts_with(br#"{"list":"#)).count();
         let at5 = lake.cat.scan_raw("t/", "t0").await?;
-        assert!(at5.len() == tables && at5.values().all(|v| v.starts_with(br#"{"columns":"#)), "below format 6, each as 0.80 wrote it");
-        let t0 = std::time::Instant::now();
-        let (n, bytes) = lists(&lake, &tokio::sync::Mutex::new(())).await?;
-        let secs = t0.elapsed().as_secs_f64();
-        assert_eq!((n, of(&lake.cat).await?.format), (tables, LISTS));
-        for (k, v) in lake.cat.scan_raw("t/", "t0").await? {
-            assert!(v.starts_with(br#"{"list":"#), "{k}: its list");
-            let (t, was): (TableMeta, TableMeta) = (serde_json::from_slice(&v)?, entry(k[3..].parse().expect("a number")));
-            assert_eq!((t.sql_columns(), t.column_list(), json(&t.logical())), (was.sql_columns(), was.column_list(), json(&was.logical())), "{k}: as before");
+        assert!(at5.len() == 300 && at5.values().all(|v| v.starts_with(br#"{"columns":"#)), "below format 6, each as 0.80 wrote it");
+        set(&lake, LISTS).await?;
+        assert_eq!(of(&lake.cat).await?.format, LISTS);
+        let raised = lake.cat.scan_raw("t/", "t0").await?;
+        assert_eq!(shapes(&raised), 0, "the raise sets the format alone");
+        let again = |k: &str| -> Result<TableMeta> { Ok(serde_json::from_slice(&raised[k])?) };
+        let mut t7 = again(&table_key("t7"))?;
+        t7.set_not_null("c4", true); // (a write of an entry read in format 5's shape, after the raise)
+        lake.cat.commit(vec![(table_key("t7"), json(&t7)), (table_key("made"), json(&entry(0)))], &[]).await?;
+        let after = lake.cat.scan_raw("t/", "t0").await?;
+        assert_eq!(shapes(&after), 2, "the entry written, and the one made: each its list");
+        assert!(after[&table_key("t7")].starts_with(br#"{"list":"#) && after[&table_key("made")].starts_with(br#"{"list":"#));
+        for (k, v) in &after {
+            let (t, was): (TableMeta, TableMeta) = (serde_json::from_slice(v)?, if k == &table_key("t7") { t7.clone() } else { entry(k[3..].parse().unwrap_or(0)) });
+            assert_eq!((t.sql_columns(), t.column_list(), json(&t.logical().shaped(true))), (was.sql_columns(), was.column_list(), json(&was.logical().shaped(true))), "{k}: as before");
         }
-        assert_eq!(lists(&lake, &tokio::sync::Mutex::new(())).await?, (0, 0), "once");
-        lake.cat.commit(vec![(table_key("made"), json(&entry(0)))], &[]).await?;
-        assert!(lake.cat.scan_raw("t/made", "t/made\u{1}").await?.values().all(|v| v.starts_with(br#"{"list":"#)), "a new entry: its list");
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
-        Ok((n, bytes, secs))
-    }
-
-    /// Format 6's raise rewrites every table's entry as its list, in the commit that sets it.
-    #[tokio::test]
-    async fn format_6_keeps_every_tables_columns_as_one_list() -> Result<()> { raised(300).await.map(|_| ()) }
-
-    /// The raise's commit on 10,000 tables: its size and time (`cargo test --release -- --ignored --nocapture`).
-    #[tokio::test]
-    #[ignore]
-    async fn the_raise_of_10000_tables() -> Result<()> {
-        let (n, bytes, secs) = raised(10_000).await?;
-        println!("format 6's raise: {n} entries rewritten, {bytes} bytes in one commit, {secs:.2} s");
         Ok(())
     }
 }
