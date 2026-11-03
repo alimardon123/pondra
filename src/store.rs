@@ -3978,6 +3978,54 @@ mod tests {
         assert!((*a).clone().column_memo.get().is_none(), "a clone's memo is empty");
     }
 
+    /// What decoding an entry and making its column list cost (redesign 1b, piece 6b's before and after): a wide table
+    /// (500 columns, renames, drops, a move, per-column facts and 200 files) and 2,000 small random ones. A measure, not a
+    /// check: `cargo test --release --lib entry_parse_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn entry_parse_time() {
+        let wide = {
+            let mut m = TableMeta { columns: (0..500).map(|i| (format!("column_{i}"), if i % 3 == 0 { "Int64" } else { "Utf8" }.to_string())).collect(), ..Default::default() };
+            for i in (0..500).step_by(10) {
+                m.names.insert(format!("column_{i}"), format!("renamed_{i}"));
+            }
+            m.dropped = (5..500).step_by(25).map(|i| format!("column_{i}")).collect();
+            m.shown = ["column_499", "column_1", "column_2"].map(String::from).to_vec();
+            m.not_null = (0..100).map(|i| format!("column_{i}")).collect();
+            m.defaults = (100..150).map(|i| (format!("column_{i}"), "'x'".to_string())).collect();
+            m.sql_types = (200..230).map(|i| (format!("column_{i}"), "uuid".to_string())).collect();
+            m.key = vec!["column_0".into()];
+            m.files = (0..200).map(|i| crate::data_file::DataFile { path: format!("data/t/{i:08}.parquet"), rows: 1000, bytes: 1 << 20, ..Default::default() }).collect();
+            json(&m)
+        };
+        let small: Vec<Vec<u8>> = (0..2000u64)
+            .map(|i| {
+                let n = 1 + (i % 8) as usize;
+                let mut m = TableMeta { columns: (0..n).map(|c| (format!("c{c}"), "Int64".to_string())).collect(), ..Default::default() };
+                if i % 3 == 0 {
+                    m.names.insert("c0".into(), "r0".into());
+                }
+                if i % 5 == 0 && n > 1 {
+                    m.dropped.push(format!("c{}", n - 1));
+                }
+                json(&m)
+            })
+            .collect();
+        let time = |what: &str, raws: &[&[u8]], rounds: u32| {
+            let t = std::time::Instant::now();
+            for _ in 0..rounds {
+                for r in raws {
+                    let m: TableMeta = serde_json::from_slice(r).unwrap();
+                    std::hint::black_box(m.column_list().len());
+                }
+            }
+            let each = t.elapsed().as_nanos() as f64 / (rounds as f64 * raws.len() as f64);
+            println!("{what}: {:.1} µs an entry, decoded and listed ({} bytes)", each / 1000.0, raws.iter().map(|r| r.len()).sum::<usize>() / raws.len());
+        };
+        time("wide (500 columns, 200 files)", &[&wide], 2000);
+        time("small (2,000 random)", &small.iter().map(Vec::as_slice).collect::<Vec<_>>(), 20);
+    }
+
     /// The column edits (piece 6a) leave the entry as the field edits they replace did, over random sequences of ADD,
     /// RENAME, DROP, a type, a held type, a default, NOT NULL and a move: the same record, byte for byte.
     #[test]
