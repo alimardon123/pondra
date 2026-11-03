@@ -12,11 +12,17 @@
 //! both zeros. A list with no zero is left as it is: the only floats with different bits that `=` calls equal are
 //! the two zeros. A list whose value is volatile (`random()`) is also left as it is, since the value would be worked
 //! out twice.
+//!
+//! A float CASE's operand and NULLIF compared bits too (`random_sql.py`'s same run, L6): `CASE x WHEN 0.0 THEN …` missed
+//! a -0.0, and NULLIF(x, 0) gave a -0.0 back where it meant NULL, so `y / NULLIF(x, 0)` divided by it. Over a float,
+//! `CASE x WHEN a THEN r …` becomes `CASE WHEN x = a THEN r …`, what SQL defines it as, and NULLIF(x, y) becomes
+//! `CASE WHEN x = y THEN NULL ELSE x END`: each `=` is DataFusion's, which makes the zeros one, and a value given back
+//! keeps its sign. A volatile operand is left as it is, for the same reason.
 
 use datafusion::common::{DFSchema, Result, ScalarValue};
 use datafusion::common::tree_node::Transformed;
-use datafusion::logical_expr::expr::InList;
-use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::logical_expr::expr::{Case, InList};
+use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan};
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 
 /// Takes a float IN list's zero out as an `=` (the module's doc).
@@ -48,15 +54,39 @@ fn zero(e: &Expr) -> bool {
 }
 
 fn looks(e: &Expr) -> bool {
-    matches!(e, Expr::InList(i) if i.list.iter().any(zero) && !i.expr.is_volatile())
+    match e {
+        Expr::InList(i) => i.list.iter().any(zero) && !i.expr.is_volatile(),
+        Expr::Case(Case { expr: Some(x), .. }) => !x.is_volatile(),
+        Expr::ScalarFunction(f) => f.func.name() == "nullif" && f.args.len() == 2 && !f.args[0].is_volatile(),
+        _ => false,
+    }
 }
 
-/// `x IN (…, 0.0, …)` as `x IN (…) OR x = 0.0`; NOT IN as `x NOT IN (…) AND x <> 0.0`.
-fn split(e: &Expr, _: &DFSchema) -> Option<Expr> {
-    let Expr::InList(i) = e else { return None };
+fn float(e: &Expr, schema: &DFSchema) -> bool {
+    e.get_type(schema).is_ok_and(|t| t.is_floating())
+}
+
+/// `x IN (…, 0.0, …)` as `x IN (…) OR x = 0.0`; NOT IN as `x NOT IN (…) AND x <> 0.0`. A float's `CASE x WHEN a` as `CASE
+/// WHEN x = a`, and its NULLIF(x, y) as `CASE WHEN x = y THEN NULL ELSE x END`.
+fn split(e: &Expr, schema: &DFSchema) -> Option<Expr> {
     if !looks(e) {
         return None;
     }
+    let i = match e {
+        Expr::InList(i) => i,
+        Expr::Case(Case { expr: Some(x), when_then_expr, else_expr }) if float(x, schema) => {
+            let whens = when_then_expr.iter().map(|(w, then)| (Box::new((**x).clone().eq((**w).clone())), then.clone())).collect();
+            return Some(Expr::Case(Case::new(None, whens, else_expr.clone())));
+        }
+        Expr::ScalarFunction(f) if f.func.name() == "nullif" && float(&f.args[0], schema) => {
+            let (x, y) = (f.args[0].clone(), f.args[1].clone());
+            let t = x.get_type(schema).ok()?;
+            let y = if y.get_type(schema).ok()? == t { y } else { datafusion::logical_expr::cast(y, t.clone()) };
+            let null = Expr::Literal(ScalarValue::try_from(&t).ok()?, None); // (a NULL of x's type: the CASE's branches agree)
+            return Some(Expr::Case(Case::new(None, vec![(Box::new(x.clone().eq(y)), Box::new(null))], Some(Box::new(x)))));
+        }
+        _ => return None,
+    };
     let (zeros, rest): (Vec<&Expr>, Vec<&Expr>) = i.list.iter().partition(|l| zero(l));
     let x = (*i.expr).clone();
     let one = if i.negated { x.not_eq(zeros[0].clone()) } else { x.eq(zeros[0].clone()) };
@@ -126,5 +156,33 @@ mod tests {
         }
         let kept = ctx.sql("SELECT count(*) AS n FROM t WHERE -a IN (2.0, 0.0)").await.unwrap().collect().await.unwrap();
         assert_eq!(kept[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0), 2, "a filter keeps both zeros");
+    }
+
+    /// A float CASE's operand and NULLIF take the two zeros as one, as `=` does (Postgres's answers, over -0.0, 0.0, 2.0,
+    /// NULL and 1.5), keep the name they had, and give a value back with its sign.
+    #[tokio::test]
+    async fn a_case_and_nullif_take_the_zeros_as_one() {
+        let (ctx, plain) = (session(true), session(false));
+        let (t, f, n) = (Some(true), Some(false), None);
+        let case = "CASE a WHEN 0.0 THEN true ELSE false END";
+        assert_ne!(answers(&plain, case).await.1, vec![t, t, f, f, f], "DataFusion's answer, without the rule");
+        for (p, want) in [
+            (case, vec![t, t, f, f, f]),
+            ("CASE -a WHEN 0.0 THEN true WHEN -2.0 THEN false END", vec![t, t, f, n, n]),
+            ("CASE a WHEN CAST(i - i AS DOUBLE) THEN true ELSE false END", vec![t, t, f, f, f]),
+            ("nullif(a, 0.0) IS NULL", vec![t, t, f, t, f]),
+            ("nullif(0.0, a) IS NULL", vec![t, t, f, f, f]),
+            ("nullif(a, 0) IS NULL", vec![t, t, f, t, f]),
+            ("nullif(a, 2.0) IS NULL", vec![f, f, t, t, f]),
+        ] {
+            let (name, got) = answers(&ctx, p).await;
+            assert_eq!(got, want, "{p}");
+            assert_eq!(name, answers(&plain, p).await.0, "{p}: the column's name");
+        }
+        for sql in ["SELECT CAST(nullif(a, 2.0) AS VARCHAR) FROM t WHERE i = 1", "SELECT CAST(CASE a WHEN 0.0 THEN a END AS VARCHAR) FROM t WHERE i = 1"] {
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            let text = datafusion::arrow::util::display::array_value_to_string(batches[0].column(0), 0).unwrap();
+            assert_eq!(text, "-0.0", "{sql}: the value as it was");
+        }
     }
 }

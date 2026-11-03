@@ -120,7 +120,7 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
           counts in the query memory: invariant 414); keys_below.rs (a join's keys cut the rows an aggregate under it
           groups: invariant 437); or_ranges.rs (an OR of ranges of one column that meet as one
-          range: invariant 438); zeros_in.rs (a float IN list's zero answers as `=` does: invariant 448); round 35 served.rs (a lake's store over HTTP:
+          range: invariant 438); zeros_in.rs (a float IN list's zero, a CASE's and NULLIF's, answer as `=` does: invariant 448); round 35 served.rs (a lake's store over HTTP:
           pondra://host:port, ADR-072 §8, invariant 299); replace.rs (CREATE OR REPLACE TABLE: a staged table filled, then put
           in the old one's place in one commit: invariant 425); round 36 statement.rs (one statement's
           path behind every door: a door reads its wire into a request and writes the answer back in
@@ -3089,7 +3089,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    them), nor did `a = 0.0 OR a = 2.0`, which the simplifier makes an IN list. `ZerosIn`, after the simplifier, takes
    the zero out as an `=`: `x IN (2.0) OR x = 0.0`, `x NOT IN (2.0) AND x <> 0.0` (an IN list is the OR of its `=`s,
    NULLs alike). Lists with no zero, and lists over a volatile value, are left as they are; joins, IN of a subquery and
-   GROUP BY already took the zeros as one. `cargo test --lib zeros_in::`
+   GROUP BY already took the zeros as one. A float's `CASE x WHEN a` is `CASE WHEN x = a` there too, and its NULLIF(x, y)
+   is `CASE WHEN x = y THEN NULL ELSE x END`: both compared bits (`CASE x WHEN 0.0` missed a -0.0, NULLIF(-0.0, 0) wasn't
+   NULL), and a value they give back keeps its sign. Not yet: a window's peers (rank() over -0.0 and 0.0).
+   `cargo test --lib zeros_in::`
+
+450. **A comparison written value first is the same comparison to the filter pushdown** (`optimize::ValuesRight`).
+   DataFusion's filter pushdown merges one column's comparisons (`simplify_predicates`) as if the column came first:
+   `s = 'b' AND 'b' = s` was FALSE, and `s <= 'b' AND 'b' > s` kept `s <= 'b'`, letting 'b' in (`random_sql.py --seed
+   20261102`). Its simplifier swaps a literal as written itself, but not one that is a cast until folded (a lake's text
+   is Utf8View, so `'b'` is) or a folded expression (`('ab' = 'b') > t`). `ValuesRight`, just before the pushdown,
+   writes each filter's `value op column` as `column op' value`. `cargo test --lib optimize::tests::a_value_written_first`
 
 ```bash
 cargo build --release

@@ -92,6 +92,8 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     rules.insert(0, Arc::new(crate::frugal::WholePartition));
     #[cfg(feature = "lake")] // (a node's only, as WholePartition is)
     rules.insert(0, Arc::new(crate::frugal::MiddleRows));
+    let pushed = rules.iter().position(|r| r.name() == "push_down_filter").unwrap_or(0);
+    rules.insert(pushed, Arc::new(ValuesRight)); // (just before: the filter pushdown merges one column's comparisons)
     rules.push(Arc::new(ScaledLiterals)); // (after the simplifier folds a literal's cast)
     rules.push(Arc::new(crate::zeros_in::ZerosIn)); // (after the simplifier, which makes ORed `=`s of a column one IN list)
     rules.push(Arc::new(crate::multiply::Products)); // (a DECIMAL product in native integers when its values are small)
@@ -866,6 +868,40 @@ fn cheap_first(e: &Expr, schema: &DFSchema) -> Expr {
         }
         Expr::BinaryExpr(b) if b.op == Operator::Or => disjunction(split_binary(e, Operator::Or).into_iter().map(|p| cheap_first(p, schema))).expect("at least two"),
         _ => e.clone(),
+    }
+}
+
+/// A comparison of a value with a column written value first (`5 > x`, `'b' = s`) as the column's (`x < 5`, `s = 'b'`), in
+/// each filter, just before DataFusion's filter pushdown. Its merging of one column's comparisons (`simplify_predicates`)
+/// read the operator as if the column came first: `s = 'b' AND 'b' = s` was FALSE (two equalities that differ), and of
+/// `s <= 'b' AND 'b' > s` it kept `s <= 'b'` (the two bounds tie, and only `<` written column first won the tie), so 'b'
+/// was in. Found by `tools/random_sql.py` (11-03). The same comparison either way round, so no answer changes.
+#[derive(Debug)]
+struct ValuesRight;
+
+impl OptimizerRule for ValuesRight {
+    fn name(&self) -> &str {
+        "pondra_values_right"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::Filter(mut f) = plan else { return Ok(Transformed::no(plan)) };
+        let swapped = std::mem::replace(&mut f.predicate, Expr::Literal(ScalarValue::Null, None)).transform_up(|e| match e {
+            Expr::BinaryExpr(b) if matches!(*b.left, Expr::Literal(..)) && matches!(*b.right, Expr::Column(_)) => {
+                match b.op.swap().filter(|op| matches!(op, Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq)) {
+                    Some(op) => Ok(Transformed::yes(Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(b.right, op, b.left)))),
+                    None => Ok(Transformed::no(Expr::BinaryExpr(b))),
+                }
+            }
+            e => Ok(Transformed::no(e)),
+        })?;
+        let changed = swapped.transformed;
+        f.predicate = swapped.data;
+        Ok(if changed { Transformed::yes(LogicalPlan::Filter(f)) } else { Transformed::no(LogicalPlan::Filter(f)) })
     }
 }
 
@@ -2674,6 +2710,35 @@ mod tests {
             }
         }
         text
+    }
+
+    /// A comparison written value first is merged with the column's others as the same comparison (`ValuesRight`): without
+    /// the rule, DataFusion's filter pushdown made `s = 'b' AND 'b' = s` FALSE and let 'b' into `s <= 'b' AND 'b' > s`. (The
+    /// simplifier writes `'b' = s` column first itself where the value is a literal as written; a lake's text is a
+    /// Utf8View, so 'b' is a cast until it is folded, and stays first.)
+    #[tokio::test]
+    async fn a_value_written_first_is_the_same_comparison() {
+        use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringViewArray};
+        let s: ArrayRef = Arc::new(StringViewArray::from(vec![Some("a"), Some("b"), Some("b"), Some("c"), None]));
+        let t: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true), Some(false), Some(false), None, Some(true)]));
+        let batch = RecordBatch::try_from_iter(vec![("s", s), ("t", t)]).unwrap();
+        let (ctx, plain) = (session(), session_without(Some("pondra_values_right")));
+        ctx.register_batch("v", batch.clone()).unwrap();
+        plain.register_batch("v", batch).unwrap();
+        let count = |w: &str| format!("SELECT count(*) FROM v WHERE {w}");
+        assert_eq!(first(&plain, &count("s = 'b' AND 'b' = s")).await, "0", "DataFusion's answer, without the rule");
+        for (w, want) in [
+            ("s = 'b' AND 'b' = s", "2"),
+            ("s <= 'b' AND 'b' > s", "1"),
+            ("'b' > s AND s <= 'b'", "1"),
+            ("s >= 'b' AND 'b' < s", "1"),
+            ("NOT (s <> 'b' OR 'b' <> s)", "2"),
+            ("s > 'a' AND 'c' >= s AND 'b' <= s", "3"),
+            ("NOT (t > false) AND (('ab' = 'b') > t)", "0"),
+            ("t >= true AND true = t", "2"),
+        ] {
+            assert_eq!(first(&ctx, &count(w)).await, want, "{w}");
+        }
     }
 
     /// A DECIMAL literal takes its column's scale (`ScaledLiterals`): every answer, type and output name
