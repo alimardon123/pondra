@@ -27,14 +27,19 @@ pub(crate) fn value(meta: &TableMeta, column: &str, text: &str) -> String {
     }
 }
 
-/// The rows of a query that is only `VALUES` (no ORDER BY), parsed.
-pub(crate) fn plain_values(query: &str) -> Option<ast::Values> {
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
-    let q = Parser::new(&GenericDialect {}).try_with_sql(query).ok()?.parse_query().ok()?;
-    match (*q.body, &q.order_by) {
+/// The rows of a parsed query that is only `VALUES` (no ORDER BY). `plain_values` asks this of a query's text, once parsed.
+fn values_of(q: &ast::Query) -> Option<&ast::Values> {
+    match (q.body.as_ref(), &q.order_by) {
         (ast::SetExpr::Values(v), None) => Some(v),
         _ => None,
     }
+}
+
+/// The rows of a query's text that is only `VALUES` (no ORDER BY): the text is parsed, then `values_of` asks the parse.
+pub(crate) fn plain_values(query: &str) -> Option<ast::Values> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    let q = Parser::new(&GenericDialect {}).try_with_sql(query).ok()?.parse_query().ok()?;
+    values_of(&q).cloned()
 }
 
 /// A query that is one row of `VALUES`: its rows can't hold a key twice (`change::merge` asks nothing more of them).
@@ -47,7 +52,7 @@ pub(crate) fn one_row(query: &str) -> bool { plain_values(query).is_some_and(|v|
 /// None for any other query. `write::parse` asks it once, of the statement it parsed (`change::Upsert::row`).
 pub(crate) fn constant_width(q: &ast::Query) -> Option<usize> {
     const TIME: [&str; 6] = ["now", "current_timestamp", "current_date", "current_time", "localtimestamp", "localtime"];
-    let (ast::SetExpr::Values(v), None) = (q.body.as_ref(), &q.order_by) else { return None };
+    let v = values_of(q)?;
     let [row] = v.rows.as_slice() else { return None };
     let reads = crate::walk::visit_expressions(v, |e| match e {
         ast::Expr::Subquery(_) | ast::Expr::Exists { .. } | ast::Expr::InSubquery { .. } => std::ops::ControlFlow::Break(()),
@@ -57,16 +62,21 @@ pub(crate) fn constant_width(q: &ast::Query) -> Option<usize> {
     reads.is_continue().then_some(row.len())
 }
 
-/// The width of a query's rows, when the query fixes it: a plain `VALUES` whose rows share one width, or a query whose
-/// body is a SELECT (the leftmost of a set operation) with no `*`, `t.*` or `COLUMNS(…)` among its items. None for any
-/// other query, which takes the table's columns as they come.
+/// The width of a parsed query's rows, when the query fixes it: a plain `VALUES` whose rows share one width, or a query
+/// whose body is a SELECT (the leftmost of a set operation) with no `*`, `t.*` or `COLUMNS(…)` among its items. None for
+/// any other query, which takes the table's columns as they come.
+pub(crate) fn query_width(q: &ast::Query) -> Option<usize> {
+    match q.body.as_ref() {
+        ast::SetExpr::Values(_) if q.order_by.is_some() => None, // (`VALUES … ORDER BY` isn't plain: `values_of` says so too)
+        body => body_width(body),
+    }
+}
+
+/// The width of a query's rows, from its text: the text is parsed, then `query_width` asks the parse (see there for the rule).
 pub(crate) fn rows_width(query: &str) -> Option<usize> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
     let q = Parser::new(&GenericDialect {}).try_with_sql(query).ok()?.parse_query().ok()?;
-    match q.body.as_ref() {
-        ast::SetExpr::Values(_) if q.order_by.is_some() => None, // (`VALUES … ORDER BY` isn't plain: `plain_values` says so too)
-        body => body_width(body),
-    }
+    query_width(&q)
 }
 
 fn body_width(body: &ast::SetExpr) -> Option<usize> {
@@ -123,9 +133,9 @@ pub fn rows_for(table: &str, columns: &[String], names: &[String], query: &str, 
         return Err(crate::codes::coded("42701", format!("column \"{n}\" specified more than once (INSERT INTO {table})")));
     }
     let at = |c: &String| names.iter().position(|n| n == c);
-    Parser::new(&GenericDialect {}).try_with_sql(query)?.parse_query()?; // (what's wrong with it, said)
+    let parsed = Parser::new(&GenericDialect {}).try_with_sql(query)?.parse_query()?; // (what's wrong with it, said)
     let q = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
-    if let Some(v) = plain_values(query) {
+    if let Some(v) = values_of(&parsed) {
         let mut rows = vec![];
         for r in &v.rows {
             if r.len() != names.len() {
@@ -146,7 +156,7 @@ pub fn rows_for(table: &str, columns: &[String], names: &[String], query: &str, 
         });
     }
     // A query of another width is refused as Postgres words it, not as the alias list below says it (DataFusion's error).
-    if let Some(w) = rows_width(query).filter(|&w| w != names.len()) {
+    if let Some(w) = query_width(&parsed).filter(|&w| w != names.len()) {
         return Err(width_refused(table, names.len(), w));
     }
     let list = columns.iter().map(|c| match at(c) {
