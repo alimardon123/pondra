@@ -48,7 +48,7 @@ def prepare():
         sh("git", "-C", DF, "submodule", "update", "--init", "--depth", "1", "testing", "parquet-testing")
     if not os.path.exists(os.path.join(TPCH, "lineitem.parquet")):
         os.makedirs(TPCH, exist_ok=True)
-        sh("tpchgen-cli", "-s", "1", "--format", "parquet", "--output-dir", TPCH)
+        sh("tpchgen-cli", "parquet", "-s", "1", "--output-dir", TPCH)  # (3.0's form: it took --format away)
     if not os.path.exists(os.path.join(TPCH + "-bench", "lineitem.parquet")):
         sh(sys.executable, os.path.join(HERE, "bench", "singlenode.py"), "prepare", "--data", TPCH)
 
