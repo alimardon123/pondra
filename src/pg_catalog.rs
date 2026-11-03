@@ -52,9 +52,9 @@ fn names_catalog(sql: &str) -> bool {
         return false; // (most queries: no tokens made)
     }
     // (the words themselves, not inside a string or a comment)
-    use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
-    let Ok(tokens) = Tokenizer::new(&datafusion::sql::sqlparser::dialect::GenericDialect {}, sql).tokenize() else { return true };
-    let t: Vec<&Token> = tokens.iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
+    use datafusion::sql::sqlparser::tokenizer::Token;
+    let Some(tokens) = crate::text::tokens(sql) else { return true };
+    let t = tokens.solid_refs();
     let word = |t: &Token, w: &str| matches!(t, Token::Word(x) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w));
     t.windows(3).any(|w| word(w[0], "pg_catalog") && *w[1] == Token::Period && matches!(w[2], Token::Word(_)))
         || t.windows(2).any(|w| (word(w[0], "from") || word(w[0], "join")) && CATALOG.iter().any(|(n, _)| word(w[1], n)))

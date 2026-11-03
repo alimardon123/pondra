@@ -401,6 +401,9 @@ impl Tokens {
         (0..self.toks.len()).filter(|&i| !matches!(self.toks[i], Token::Whitespace(_))).map(|i| Solid { token: &self.toks[i], start: self.start[i], end: self.end[i] }).collect()
     }
 
+    /// The tokens `solid` gives, without their places.
+    pub(crate) fn solid_refs(&self) -> Vec<&Token> { self.toks.iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect() }
+
     /// The tokens `solid` gives, copied, for a look that keeps them.
     pub(crate) fn solid_tokens(&self) -> Vec<Token> { self.toks.iter().filter(|t| !matches!(t, Token::Whitespace(_))).cloned().collect() }
 

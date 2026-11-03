@@ -17,7 +17,7 @@ use crate::codes::coded;
 #[cfg(feature = "lake")]
 use anyhow::Context;
 use anyhow::Result;
-use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
+use datafusion::sql::sqlparser::tokenizer::Token;
 #[cfg(feature = "lake")]
 use std::sync::Arc;
 
@@ -105,8 +105,7 @@ fn read_sql(sql: &str) -> Option<Ask> {
     if !matches!(crate::text::head(sql).as_str(), "install" | "force" | "load" | "uninstall") {
         return None;
     }
-    let tokens = Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?;
-    read(&tokens)
+    read(&crate::text::tokens(sql)?.toks)
 }
 
 /// The statement the tokens are, or None when they are not one of these: `[FORCE] INSTALL name [FROM repo | 'file or URL']

@@ -169,16 +169,15 @@ impl W {
 
 impl Words {
     pub(crate) fn of(sql: &str) -> Option<Words> {
-        use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
-        let tokens = Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?;
+        use datafusion::sql::sqlparser::tokenizer::Token;
+        let tokens = crate::text::tokens(sql)?;
         let mut out = vec![];
-        for t in tokens {
+        for t in tokens.solid_refs() {
             out.push(match t {
-                Token::Whitespace(_) => continue,
-                Token::Word(w) if w.quote_style.is_some() => W::Word(w.value, true),
+                Token::Word(w) if w.quote_style.is_some() => W::Word(w.value.clone(), true),
                 Token::Word(w) => W::Word(w.value.to_lowercase(), false),
-                Token::SingleQuotedString(s) => W::Str(s),
-                Token::Number(n, _) => W::Num(n),
+                Token::SingleQuotedString(s) => W::Str(s.clone()),
+                Token::Number(n, _) => W::Num(n.clone()),
                 Token::Comma => W::Sym(','),
                 Token::LParen => W::Sym('('),
                 Token::RParen => W::Sym(')'),
