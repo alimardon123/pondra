@@ -772,6 +772,15 @@ fn as_jsonb(texts: ArrayRef) -> Result<ArrayRef> {
     })
 }
 
+/// `jsonb_text`, or None where `json` isn't JSON (or nests past `MAX_DEPTH`): what a look at a statement's strings asks
+/// (`text::names_a_type`), which makes no error to drop.
+pub(crate) fn jsonb_text_if(json: &str) -> Option<String> {
+    depth_check(json).ok()?;
+    let mut out = String::new();
+    write(&mut out, &read_whole(json)?)?;
+    Some(out)
+}
+
 /// `json` (JSON text) as jsonb writes it: an object's keys sorted by length, then bytes, its last duplicate kept;
 /// numbers as Postgres's `numeric` prints them; `, ` and `: ` between members. A text that isn't JSON is 22P02, and
 /// one nested past `MAX_DEPTH` is 54001.
@@ -1159,6 +1168,15 @@ mod tests {
         assert_eq!(jsonb_text(" [] ").unwrap(), "[]");
         assert_eq!(jsonb_text(" 1.5 ").unwrap(), "1.5");
         assert_eq!(jsonb_text("\t\"x\"\n").unwrap(), r#""x""#);
+    }
+
+    /// The look that makes no error answers as `jsonb_text` does: its text, or None where `jsonb_text` refuses.
+    #[test]
+    fn jsonb_text_if_is_jsonb_text_without_its_error() {
+        let deep = format!("{}{}", "[".repeat(MAX_DEPTH + 1), "]".repeat(MAX_DEPTH + 1));
+        for json in [r#"{"b":1,"a":2}"#, " [1.0, {\"b\":null}] ", "1.5", "\"x\"", "x", "", "{", "[1,]", "1 2", "'a'", "2024-01-01", deep.as_str()] {
+            assert_eq!(jsonb_text_if(json), jsonb_text(json).ok(), "{json:.40}");
+        }
     }
 
     #[test]

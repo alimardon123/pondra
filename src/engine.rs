@@ -366,11 +366,12 @@ pub async fn sql_checked(ctx: &SessionContext, sql: &str, may: impl Fn(&LogicalP
 /// lock across the run, takes the two apart. Planning makes no change; a DDL statement takes effect when it runs.
 pub async fn planned(ctx: &SessionContext, sql: &str) -> anyhow::Result<LogicalPlan> {
     use datafusion::config::Dialect;
-    let generic = matches!(ctx.state().config().options().sql_parser.dialect, Dialect::Generic);
+    let state = ctx.state(); // (one copy of the session's state: each is a clone of all of it, ~80K instructions a query)
+    let generic = matches!(state.config().options().sql_parser.dialect, Dialect::Generic);
     // (a MATCH_RECOGNIZE's measure named like an input's column: DataFusion's duplicate field, said as the refusal: `pattern::reworded`)
     Ok(match crate::friendly::lambdas(sql).filter(|_| generic) {
-        Some(stmt) => ctx.state().statement_to_plan(stmt).await.map_err(|e| crate::pattern::reworded(e, sql))?,
-        None => ctx.state().create_logical_plan(sql).await.map_err(|e| crate::pattern::reworded(e, sql))?,
+        Some(stmt) => state.statement_to_plan(stmt).await.map_err(|e| crate::pattern::reworded(e, sql))?,
+        None => state.create_logical_plan(sql).await.map_err(|e| crate::pattern::reworded(e, sql))?,
     })
 }
 

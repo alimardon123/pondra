@@ -36,6 +36,7 @@ mod asof;
 mod explain;
 mod multiply;
 mod sparksql;
+mod parsed;
 mod past_names;
 mod diff;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's passes; a page calls them from step 4)

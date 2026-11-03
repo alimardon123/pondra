@@ -221,7 +221,7 @@ pub(crate) fn named_apart(sql: &str) -> Option<String> {
             ControlFlow::Continue(())
         }
     }
-    let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let mut stmts = crate::parsed::generic(sql).ok()?; // (parsed once for the front's looks: `parsed.rs`)
     let mut names = Names(false, 0);
     for s in stmts.iter_mut().filter(|s| !matches!(s, Statement::CreateMacro { .. })) {
         let _ = crate::walk::visit_mut(s, &mut names);

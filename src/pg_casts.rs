@@ -16,10 +16,13 @@ pub(crate) fn quoted(labels: &[String]) -> String { labels.iter().map(|l| format
 /// Any spelling of a uuid Postgres takes (upper case, braces, no hyphens), written the one way;
 /// refused as Postgres refuses it (22P02).
 pub fn uuid_of(s: &str) -> Result<String> {
-    match uuid::Uuid::try_parse(s) {
-        Ok(u) => Ok(u.hyphenated().to_string()),
-        Err(_) => Err(crate::codes::coded("22P02", format!("invalid input syntax for type uuid: \"{s}\""))),
-    }
+    uuid_spelled(s).ok_or_else(|| crate::codes::coded("22P02", format!("invalid input syntax for type uuid: \"{s}\"")))
+}
+
+/// `uuid_of`'s uuid, or None where `s` spells none: what a look at a statement's strings asks (`pg_trace::rewrite`), which
+/// makes no error to drop (with `RUST_BACKTRACE` set, each took a backtrace: 0.3 ms a TPC-H query).
+pub fn uuid_spelled(s: &str) -> Option<String> {
+    uuid::Uuid::try_parse(s).ok().map(|u| u.hyphenated().to_string())
 }
 
 pub(crate) struct Casts {
@@ -325,5 +328,14 @@ mod tests {
     async fn jsonb_is_written_as_postgres_prints_it_and_json_as_it_was_written() {
         assert_eq!(one(r#"SELECT pondra_jsonb('{"b":1,"a":2}')"#).await, r#"{"a": 2, "b": 1}"#);
         assert_eq!(one(r#"SELECT pondra_json('{"b":1,"a":2}')"#).await, r#"{"b":1,"a":2}"#);
+    }
+
+    /// The look that makes no error answers as `uuid_of` does: the uuid written the one way, or None where it refuses.
+    #[test]
+    fn uuid_spelled_is_uuid_of_without_its_error() {
+        for s in ["A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11", "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}", "a0eebc999c0b4ef8bb6d6bb9bd380a11", "x", "", "a0eebc99-9c0b"] {
+            assert_eq!(uuid_spelled(s), uuid_of(s).ok(), "{s}");
+        }
+        assert_eq!(uuid_spelled("A0EEBC999C0B4EF8BB6D6BB9BD380A11").as_deref(), Some("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"));
     }
 }
