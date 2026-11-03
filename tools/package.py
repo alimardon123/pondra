@@ -70,7 +70,7 @@ def wheel(lib, launcher, platform, out):
     readme = open(os.path.join(ROOT, "python", "README.md"), encoding="utf-8").read()  # (PyPI's page: short, its own)
     meta = "\n".join([
         "Metadata-Version: 2.4", "Name: pondra", f"Version: {v}",
-        "Summary: Pondra, a streamhouse in one binary: the engine, in this process or beside it, and a Python client", "Author: Alimardon",
+        "Summary: Pondra, a Streamhouse in one binary: the engine, in this process or beside it, and a Python client", "Author: Alimardon",
         "License-Expression: MIT OR Apache-2.0", "License-File: LICENSE-APACHE", "License-File: LICENSE-MIT",
         "Project-URL: Documentation, https://alimardon123.github.io/pondra/", "Project-URL: Repository, https://github.com/alimardon123/pondra",
         "Keywords: lakehouse,streaming,sql,dataframe,iceberg,delta,kafka,datafusion",
