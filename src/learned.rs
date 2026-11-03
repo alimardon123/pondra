@@ -506,14 +506,14 @@ crate::per_node!(static RUNS: Mutex<lru::LruCache<u64, Runs>> = Mutex::new(lru::
 /// `EXPLAIN` of it is it (it shows the plan its next run gets); and whether it is an `EXPLAIN` that
 /// runs nothing.
 fn key(sql: &str) -> (u64, bool) {
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
+    use datafusion::sql::sqlparser::tokenizer::Token;
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else {
+    let Some(tokens) = crate::text::tokens(sql) else {
         sql.hash(&mut h);
         return (h.finish(), false);
     };
-    let mut words = tokens.iter().filter(|t| !matches!(t, Token::Whitespace(_))).peekable();
+    let mut words = tokens.solid_refs().into_iter().peekable();
     let (mut explain, mut analyze) = (false, false);
     while let Some(Token::Word(w)) = words.peek() {
         match w.value.to_ascii_uppercase().as_str() {

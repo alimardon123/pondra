@@ -9,7 +9,7 @@
 //! function is looked for anywhere in a statement, but only one that spells `advisory` or `pg_notify` is tokenised.
 
 use crate::text::contains_ci;
-use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
+use datafusion::sql::sqlparser::tokenizer::Token;
 
 /// What a table's `USING x` says, where a table is made; `{}` is the format named.
 const USING: &str = "CREATE TABLE … USING {}: tables kept in another format come with extensions (1.2); Pondra keeps its tables in its own lake, published as Delta or Iceberg with WITH (publish = …)";
@@ -122,7 +122,7 @@ fn type_kept(sql: &str, head: &str) -> Option<String> {
     if !typed && !using {
         return None;
     }
-    let tokens = tokens_of(sql)?;
+    let tokens = crate::text::tokens(sql)?.solid_tokens();
     if let Some(format) = table_using(&tokens) {
         return Some(USING.replace("{}", &format));
     }
@@ -137,7 +137,7 @@ fn function_kept(sql: &str) -> Option<String> {
     if !contains_ci(sql, "advisory") && !contains_ci(sql, "pg_notify") {
         return None;
     }
-    let tokens = tokens_of(sql)?;
+    let tokens = crate::text::tokens(sql)?.solid_tokens();
     tokens.windows(2).find_map(|w| match (&w[0], &w[1]) {
         (Token::Word(word), Token::LParen) if word.quote_style.is_none() => {
             let name = word.value.to_lowercase();
@@ -151,11 +151,6 @@ fn function_kept(sql: &str) -> Option<String> {
         }
         _ => None,
     })
-}
-
-/// The tokens of `sql` without its whitespace, so a word's neighbours are the next tokens. None when the tokeniser refuses it.
-fn tokens_of(sql: &str) -> Option<Vec<Token>> {
-    Some(Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?.into_iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect())
 }
 
 /// The format a `CREATE TABLE … USING x` names (`x`): a USING in the table's header, which ends at an AS, a SELECT or a VALUES

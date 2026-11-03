@@ -14,7 +14,7 @@ use datafusion::sql::sqlparser::{
     dialect::GenericDialect,
     keywords::RESERVED_FOR_COLUMN_ALIAS,
     parser::Parser,
-    tokenizer::{Location, Token, TokenWithSpan, Tokenizer},
+    tokenizer::Token,
 };
 use std::{borrow::Cow, collections::{HashMap, HashSet}, ops::ControlFlow, sync::{Arc, LazyLock}};
 
@@ -57,10 +57,8 @@ pub fn text(sql: &str) -> Cow<'_, str> {
     if !sql.as_bytes().windows(7).any(|w| w.eq_ignore_ascii_case(b"measure")) {
         return Cow::Borrowed(sql);
     }
-    let dialect = GenericDialect {};
-    let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize_with_location() else { return Cow::Borrowed(sql) };
-    let words: Vec<&TokenWithSpan> = tokens.iter().filter(|t| !matches!(t.token, Token::Whitespace(_))).collect();
-    let edits: Vec<(usize, usize, String)> = words.windows(3).filter_map(|w| measure_edit(sql, w)).collect();
+    let Some(tokens) = crate::text::tokens(sql) else { return Cow::Borrowed(sql) };
+    let edits: Vec<(usize, usize, String)> = tokens.solid().windows(3).filter_map(measure_edit).collect();
     if edits.is_empty() {
         return Cow::Borrowed(sql);
     }
@@ -75,31 +73,23 @@ pub fn text(sql: &str) -> Cow<'_, str> {
 }
 
 /// The edit (byte range and text) for an `AS MEASURE name` whose three tokens are `words`, if it is one.
-fn measure_edit(sql: &str, words: &[&TokenWithSpan]) -> Option<(usize, usize, String)> {
+fn measure_edit(words: &[crate::text::Solid]) -> Option<(usize, usize, String)> {
     let [a, m, n] = words else { return None };
     if !plain(a, "as") || !plain(m, "measure") {
         return None;
     }
-    let name = match &n.token {
+    let name = match n.token {
         Token::Word(w) if w.quote_style.is_some() => w.value.clone(),
         Token::Word(w) if !listed_in(ENDS_A_NAME, &w.value.to_lowercase()) => w.value.to_lowercase(),
         _ => return None,
     };
-    let (start, end) = (offset(sql, &m.span.start)?, offset(sql, &n.span.end)?); // (a span's end is just past its token)
+    let (start, end) = (m.start, n.end);
     Some((start, end, format!("\"{MARK}{}\"", name.replace('"', "\"\""))))
 }
 
 /// Whether a token is the unquoted word `w`, in any case.
-fn plain(t: &TokenWithSpan, w: &str) -> bool {
+fn plain(t: &crate::text::Solid, w: &str) -> bool {
     matches!(&t.token, Token::Word(x) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w))
-}
-
-/// The byte offset of a 1-based line and column (sqlparser counts columns in characters), or the
-/// text's end when the column is just past its last character.
-fn offset(sql: &str, at: &Location) -> Option<usize> {
-    let line_start: usize = sql.split_inclusive('\n').take((at.line as usize).checked_sub(1)?).map(str::len).sum();
-    let line = sql.get(line_start..)?;
-    line.char_indices().map(|(i, _)| i).chain([line.len()]).nth((at.column as usize).checked_sub(1)?).map(|i| line_start + i)
 }
 
 /// The reverse, for showing a stored view: `AS "pondra_measure:name"` reads `AS MEASURE name`.

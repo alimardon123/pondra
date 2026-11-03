@@ -1,0 +1,7 @@
+# The shipped program's budget per platform (tools/size_check.py; designs/redesign/redesign.md §10): its bytes as it
+# ships (the dist profile, stripped) and its download (gzip level 6). A change that needs more raises a number here in
+# the same pull request, with a line saying why and what the bytes buy.
+#
+# 11-03, at 20c2732: the program 156,330,304 bytes, its download 56,123,799 (main's linux-x64 build, run 41626771333).
+# Each budget leaves about 2% for growth before someone has to say why.
+linux-x64 159500000 57300000

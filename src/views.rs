@@ -336,12 +336,13 @@ pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<Option
 /// the statement without its expectations, and them (`EXPECT (…)` too, Databricks' word; a column
 /// named in the list stays). None: no such list.
 pub fn constraints(sql: &str) -> Result<Option<(String, Vec<Expect>)>> {
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
+    use datafusion::sql::sqlparser::tokenizer::Token;
     let head = sql.trim_start().chars().take(64).collect::<String>().to_uppercase();
     if !head.starts_with("CREATE") || !head.contains("MATERIALIZED") {
         return Ok(None); // (every other statement, as fast as before)
     }
-    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else { return Ok(None) };
+    let Some(tokens) = crate::text::tokens(sql) else { return Ok(None) };
+    let tokens = &tokens.toks;
     let solid: Vec<usize> = (0..tokens.len()).filter(|&i| !matches!(tokens[i], Token::Whitespace(_))).collect();
     let word = |i: usize| match solid.get(i).map(|&j| &tokens[j]) {
         Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_uppercase(),
