@@ -34,8 +34,8 @@
   (`%b`): `SELECT %s` and an INSERT of each into a column of its type, read back, give Postgres
   16's values and type codes, and `SELECT 70 + %s` with a Decimal gives the same. What Pondra
   can't match is checked by name, as what it does: a bare parameter's result has no uuid, json or
-  jsonb type of its own (a text of the text sent), and a json or jsonb column holds text; a uuid
-  column stores and answers a uuid (2950), as Postgres 16 does. A float8, infinities and
+  jsonb type of its own (a text of the text sent); a uuid, json or jsonb column stores and answers
+  its type (2950, 114, 3802), as Postgres 16 does. A float8, infinities and
   NaN included, is a float8 again, and `5 - $1` subtracts a negative one. A TIME and an INTERVAL print
   as Postgres prints them.
 
@@ -593,8 +593,8 @@ def param_cases():
     """(name, the value psycopg 3 sends, the column it is written to, what Pondra answers to a SELECT,
     what it answers for a value stored and read back). Where those are None, Pondra answers as
     Postgres 16 does. Where not, it is a named difference, held to exactly: a bare parameter isn't
-    traced to a type, and Pondra has no json or jsonb type of its own, so such a value comes back as
-    a text (25) of the text it was sent. A uuid column answers a uuid (2950), as Postgres does."""
+    traced to a type, so a uuid, json or jsonb one comes back as a text (25) of the text it was sent.
+    A uuid, json or jsonb column answers its type (2950, 114, 3802), as Postgres does."""
     from psycopg.types.json import Json, Jsonb
     utc = dt.timezone.utc
     as_text = lambda s: ("value", s, 25)
@@ -609,8 +609,8 @@ def param_cases():
         ("timestamptz", dt.datetime(2020, 1, 1, 12, 0, tzinfo=utc), "TIMESTAMPTZ", None, None),
         ("interval", dt.timedelta(days=1, seconds=3, microseconds=4), "INTERVAL", None, None),
         ("uuid", uuid.UUID("12345678-1234-5678-1234-567812345678"), "UUID", as_text("12345678-1234-5678-1234-567812345678"), None),
-        ("json", Json({"a": [1, 2]}), "JSON", as_text(js), as_text(js)),
-        ("jsonb", Jsonb({"a": [1, 2]}), "JSONB", as_text(js), as_text(js)),
+        ("json", Json({"a": [1, 2]}), "JSON", as_text(js), None),
+        ("jsonb", Jsonb({"a": [1, 2]}), "JSONB", as_text(js), None),
         ("text", "it's", "TEXT", None, None),
         ("boolean", True, "BOOLEAN", None, None),
         ("double precision", 2.5, "DOUBLE PRECISION", None, None),
