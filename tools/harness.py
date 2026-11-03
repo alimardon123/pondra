@@ -12099,17 +12099,17 @@ def guarded():
     m8["a read, with the read class off"] = records(boss, [line("SELECT 1 AS m8q")])
     info["M8"] = {k: list(v) for k, v in m8.items()}
     audited = until(lambda: ask(P, "SELECT \"user\", door, class, outcome FROM pondra.audit WHERE statement = 'CREATE TABLE m8 (a INT)'", auth=boss),
-                    [{"user": "boss", "door": "page", "class": "ddl", "outcome": "ok"}], 20)
-    recorded_read = until(lambda: ask(P, "SELECT \"user\", door, class FROM pondra.history WHERE door = 'page' AND statement = 'SELECT 1 AS m8q'", auth=boss),
-                          [{"user": "boss", "door": "page", "class": "read"}], 20)
+                    [{"user": "boss", "door": "page-reported", "class": "ddl", "outcome": "ok"}], 20)
+    recorded_read = until(lambda: ask(P, "SELECT \"user\", door, class FROM pondra.history WHERE door = 'page-reported' AND statement = 'SELECT 1 AS m8q'", auth=boss),
+                          [{"user": "boss", "door": "page-reported", "class": "read"}], 20)
     info["M8"]["audit"] = audited
     info["M8"]["history of a read"] = recorded_read
-    checks["M8: a superuser's joined page sends its lines: an audit line of class ddl as the sign-in (boss, door page, the node's class, whatever the page said of them); a read with the read class off is a history row only (no audit line); the same lines with the nodes' key, a user with grants or 257 lines are 403, 403 and 413"] = \
-        m8["superuser"][0] == 200 and audited == [{"user": "boss", "door": "page", "class": "ddl", "outcome": "ok"}] \
+    checks["M8: a superuser's joined page sends its lines: an audit line of class ddl as the sign-in (boss, door page-reported, the node's class, whatever the page said of them); a read with the read class off is a history row only (no audit line); the same lines with the nodes' key, a user with grants or 257 lines are 403, 403 and 413"] = \
+        m8["superuser"][0] == 200 and audited == [{"user": "boss", "door": "page-reported", "class": "ddl", "outcome": "ok"}] \
         and ask(P, "SELECT count(*) AS n FROM pondra.audit WHERE \"user\" = 'mallory'", auth=boss) == [{"n": 0}] \
         and m8["the nodes' key"][0] == 403 and m8["a user with grants"][0] == 403 and m8["257 lines"][0] == 413 \
         and ask(P, "SELECT count(*) AS n FROM pondra.audit WHERE statement = 'CREATE TABLE m8k (a INT)' OR statement = 'CREATE TABLE m8g (a INT)'", auth=boss) == [{"n": 0}] \
-        and m8["a read, with the read class off"][0] == 200 and recorded_read == [{"user": "boss", "door": "page", "class": "read"}] \
+        and m8["a read, with the read class off"][0] == 200 and recorded_read == [{"user": "boss", "door": "page-reported", "class": "read"}] \
         and ask(P, "SELECT count(*) AS n FROM pondra.audit WHERE statement = 'SELECT 1 AS m8q'", auth=boss) == [{"n": 0}]
     a.kill(), b.kill()
     # A write token: rows into tables that are there, in the log and their folders; never the lake's records
