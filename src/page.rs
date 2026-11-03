@@ -48,7 +48,10 @@ const WRITE_TO_NODE: &str = "a page sends its node queries, and the query of a C
 const FILE_BESIDE_NODE: &str = "a query a page sends its node names the page's tables and the node's, not the page's files: make the file a table first (CREATE TABLE t AS FROM 'file')";
 /// The 0A000 words of a statement that names a tab's file (a blob: URL) where its node would run it (`part_of`, `joined_part`):
 /// the page alone reads a blob, so the way to keep its rows is a table loaded from it.
-const BLOB_ON_PAGE: &str = "a tab's file (a blob: URL) is read by the page alone, so no statement its node runs may name one: load it with INSERT INTO t SELECT … FROM read_csv('blob:…') (with no RETURNING), then read t";
+const BLOB_ON_PAGE: &str = "a tab's file (a blob: URL) is read by the page alone, so no statement its node runs may name one: load it with INSERT INTO t SELECT … FROM read_csv('blob:…') (with no RETURNING or ON CONFLICT), then read t";
+/// `BLOB_ON_PAGE`'s words for a page whose join is no superuser's: only a superuser's page stages a file's rows (`own_insert`), so
+/// the load those words name is not this page's to make (11-02 audit M8).
+const BLOB_NOT_SUPERUSER: &str = "a tab's file (a blob: URL) is read by the page alone, and only a page joined by a superuser loads one into a table (INSERT INTO t SELECT … FROM read_csv('blob:…')): load the file through a client of the node";
 
 /// Whether a file name (`ext:…`, as `routines::expand` names it) reads only blob URLs: every URL of its spec is one, so the file is a
 /// tab's own, which the page may stage (`own_insert`).
@@ -1095,7 +1098,10 @@ async fn joined_part(lake: &crate::store::Lake, sql: &str, format_query: String,
     }
     if crate::statement::is_write(&expanded) || crate::seq::calls(&expanded) {
         if crate::ext_names::names(&expanded).iter().any(|n| names_blob(n)) {
-            return Err(blob_refused()); // (a write the node runs, or a call of nextval, may not name a tab's file: `BLOB_ON_PAGE`)
+            return Err(match superuser {
+                true => blob_refused(), // (a write the node runs, or a call of nextval, may not name a tab's file: `BLOB_ON_PAGE`)
+                false => crate::codes::coded("0A000", BLOB_NOT_SUPERUSER),
+            });
         }
         return Ok(Routed::Node(Part::Query { sent: bound, names: BTreeSet::new(), format: format_query }));
     }
@@ -1111,8 +1117,8 @@ async fn joined_part(lake: &crate::store::Lake, sql: &str, format_query: String,
 /// computes its rows and stages them; its node checks and writes them, keys, UNIQUE, identity and defaults included
 /// (`write::run_listed`). A table the node holds, a file, or an INSERT that is not one of these is the node's.
 async fn own_insert(lake: &crate::store::Lake, expanded: &str) -> anyhow::Result<bool> {
-    if crate::seq::calls(expanded) {
-        return Ok(false);
+    if crate::seq::calls(expanded) || !crate::write::stages(expanded) {
+        return Ok(false); // (a sequence's call, and an INSERT the lake would not stage, such as an upsert: the node's whole)
     }
     let state = lake.session().state();
     let Ok(statement) = parsed(&state, expanded) else { return Ok(false) };
@@ -1425,6 +1431,11 @@ mod tests {
             ("INSERT INTO u SELECT value FROM range(2)", "own"),
             ("INSERT INTO i (a) SELECT value FROM range(2)", "own"), // (its identity is the node's: `nextval` runs there, not on the page)
             ("INSERT INTO k VALUES (1)", "node"),
+            // (an upsert is a MERGE the lake never stages, so it is the node's: 11-02 audit M6)
+            ("INSERT INTO k SELECT value FROM range(2) ON CONFLICT (a) DO NOTHING", "node"),
+            ("INSERT INTO k SELECT value FROM range(2) ON CONFLICT (a) DO UPDATE SET a = excluded.a", "node"),
+            ("INSERT OR IGNORE INTO k SELECT value FROM range(2)", "node"),
+            ("INSERT OR REPLACE INTO k SELECT value FROM range(2)", "node"),
             ("INSERT INTO t VALUES (1) RETURNING a", "node"),
             ("INSERT INTO t DEFAULT VALUES", "node"),
             ("INSERT INTO t SELECT a FROM k", "own"),
@@ -1442,6 +1453,15 @@ mod tests {
         // (a join by a user who is no superuser: no INSERT is the page's, and every write goes whole to the node)
         for sql in ["INSERT INTO t VALUES (1)", "INSERT INTO t SELECT value, 'x' FROM range(3)"] {
             assert_eq!(kind(&routed(sql, false).await), "node", "{sql}, not as a superuser");
+        }
+        // (a tab's file in a write the node runs is refused by name; a page joined by a user who is no superuser is told that only a
+        // superuser's page loads one, not to load it as it just tried: 11-02 audit M8)
+        let load = "INSERT INTO t SELECT * FROM read_csv('blob:http://localhost/0b4d2c9e-1111-4000-8000-000000000000')";
+        for (superuser, says) in [(true, "with no RETURNING or ON CONFLICT"), (false, "only a page joined by a superuser")] {
+            let sql = if superuser { "INSERT INTO k SELECT * FROM read_csv('blob:http://localhost/0b4d2c9e-1111-4000-8000-000000000000') ON CONFLICT DO NOTHING" } else { load };
+            let e = crate::statement::scoped(Some(SESSION.to_string()), None, Box::pin(joined_part(lake, sql, String::new(), superuser))).await.err().expect("a tab's file the node would read is refused");
+            assert_eq!(crate::codes::of(&e), "0A000", "{sql}: {e:#}");
+            assert!(format!("{e:#}").contains(says), "{sql}: {e:#}");
         }
         let refused = crate::statement::scoped(Some(SESSION.to_string()), None, Box::pin(joined_part(lake, "BEGIN", String::new(), true))).await.err().expect("a transaction is refused");
         assert_eq!(crate::codes::of(&refused), "0A000");

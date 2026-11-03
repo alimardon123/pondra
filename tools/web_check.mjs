@@ -1731,6 +1731,15 @@ async function joinChecks(target, a, b) {
   if (keyIns) judge(`joined: ${keySql}`, keyIns, { sqlstate: '23505', error: true });
   const keyCount = await ask('joined: SELECT count(*) FROM keyed after the refused key', 'POST', '/sql?format=csv', undefined, 'SELECT count(*) FROM keyed', 'joined');
   if (keyCount) judge('joined: SELECT count(*) FROM keyed after the refused key', keyCount, { status: 200, sqlstate: null, out: 'count(*)\n1\n' });
+  // (c3b) An upsert is the node's whole, never staged (11-02 audit M6): ON CONFLICT DO NOTHING keeps the row, OR REPLACE replaces it.
+  const upsertSql = "INSERT INTO keyed (k, v) SELECT 1 AS k, 'again' AS v ON CONFLICT (k) DO NOTHING";
+  const upserted = await ask(`joined: ${upsertSql}`, 'POST', '/sql', undefined, upsertSql, 'joined');
+  if (upserted) judge(`joined: ${upsertSql}`, upserted, { status: 200, sqlstate: null });
+  const replaceSql = "INSERT OR REPLACE INTO keyed (k, v) SELECT 1, 'replaced'";
+  const replaced = await ask(`joined: ${replaceSql}`, 'POST', '/sql', undefined, replaceSql, 'joined');
+  if (replaced) judge(`joined: ${replaceSql}`, replaced, { status: 200, sqlstate: null });
+  const upsertedRows = await ask('joined: SELECT k, v FROM keyed after the upserts', 'POST', '/sql?format=csv', undefined, 'SELECT k, v FROM keyed ORDER BY k', 'joined');
+  if (upsertedRows) judge('joined: SELECT k, v FROM keyed after the upserts', upsertedRows, { status: 200, sqlstate: null, out: 'k,v\n1,replaced\n' });
 
   // (c4) A tab's own file (a blob made in the joined page's tab) loaded into a lake table: the page stages its rows and its node
   // writes them, so A's count is right at once; an UPDATE from the same file is refused by the page's words (`BLOB_ON_PAGE`).

@@ -1959,6 +1959,12 @@ const STAGE_TRIES: usize = 5;
 
 /// The INSERT a joined page stages (`run_listed`): a plain INSERT whose query isn't VALUES (the node's log takes those), with the
 /// columns it names (none: the table's first ones, as many as the query's width).
+/// Whether `sql` is an INSERT a joined page stages (`stage_insert`): one predicate for the page's routing (`page::own_insert`) and
+/// `run_listed`. An upsert (ON CONFLICT, OR IGNORE, OR REPLACE) parses to a MERGE, which is never staged: the node runs it.
+pub fn stages(sql: &str) -> bool {
+    parse(sql).as_ref().is_some_and(|s| staging(s).is_some())
+}
+
 fn staging(stmt: &Stmt) -> Option<(&str, &[String], &str)> {
     match stmt {
         Stmt::Insert(t, q) if crate::rules::rows::plain_values(q).is_none() => Some((t.as_str(), &[] as &[String], q.as_str())),
