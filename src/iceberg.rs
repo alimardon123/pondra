@@ -99,14 +99,16 @@ pub struct Layout {
 
 impl Layout {
     pub fn of(meta: &TableMeta) -> Layout {
-        let at = |c: &str| meta.columns.iter().position(|(n, _)| n == c);
+        // (a column's place: its id - 1, so `all()[i]` is the column)
+        let list = meta.column_list();
+        let at = |c: &str| list.of_stored(c).map(|c| c.id as usize - 1);
         let partition = meta.partition.as_deref().and_then(|p| {
             let (transform, col) = match p.split_once('(') {
                 Some((f, c)) => (f.trim().to_string(), c.trim_end_matches(')').trim()),
                 None => ("identity".to_string(), p.trim()),
             };
             let i = at(col)?;
-            let t = crate::answer::dtype(&meta.columns[i].1).ok()?;
+            let t = crate::answer::dtype(&list.all()[i].dtype).ok()?;
             let time = matches!(t, DataType::Date32 | DataType::Timestamp(TimeUnit::Microsecond, _));
             let fits = match transform.as_str() {
                 "identity" => time || matches!(t, DataType::Int32 | DataType::Int64 | DataType::Utf8 | DataType::Boolean),
@@ -115,8 +117,8 @@ impl Layout {
             fits.then_some((i, transform, t))
         });
         let name = partition.as_ref().map_or(String::new(), |(i, t, _)| match t.as_str() {
-            "identity" => meta.name_of(&meta.columns[*i].0).to_string(),
-            t => format!("{}_{t}", meta.name_of(&meta.columns[*i].0)),
+            "identity" => list.all()[*i].name.clone(),
+            t => format!("{}_{t}", list.all()[*i].name),
         });
         let sort = (meta.cluster.len() == 1 && meta.key.is_empty()).then(|| at(&meta.cluster[0])).flatten();
         Layout { partition, name, sort, keys: meta.key.iter().filter_map(|k| at(k)).collect() }
@@ -415,13 +417,14 @@ async fn listed(lake: &Lake, path: &str) -> Result<Vec<(String, (u64, i64))>> {
 /// The table metadata file (format v2): its layout (`Layout`), the snapshots kept.
 #[allow(clippy::too_many_arguments)]
 fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Value, layout: &Layout, meta: &TableMeta, snapshots: &[(Value, String)]) -> Value {
-    let columns = &meta.columns;
+    let list = meta.column_list();
+    let n = list.all().len() as u32;
     // A list's elements need a mapping of their own: arrow-rs writes them as `item` (parquet-mr as `element`).
     // (a renamed column by both names: Pondra's files keep the stored one, other writers write SQL's)
-    let known = |c: &String| if meta.name_of(c) == c { json!([c]) } else { json!([meta.name_of(c), c]) };
-    let mut names: Vec<Value> = columns.iter().enumerate().map(|(i, (c, t))| match t.ends_with("[]") {
-        true => json!({"field-id": i + 1, "names": known(c), "fields": [{"field-id": columns.len() + i + 1, "names": ["item", "element"]}]}),
-        false => json!({"field-id": i + 1, "names": known(c)}),
+    let known = |c: &crate::column::Column| if c.name == c.stored { json!([c.stored]) } else { json!([c.name, c.stored]) };
+    let mut names: Vec<Value> = list.all().iter().map(|c| match c.dtype.ends_with("[]") {
+        true => json!({"field-id": c.id, "names": known(c), "fields": [{"field-id": n + c.id, "names": ["item", "element"]}]}),
+        false => json!({"field-id": c.id, "names": known(c)}),
     }).collect();
     // The files also hold the rows' system columns (`sys.rs`), which the schema leaves out: named
     // too (ids of their own, never the schema's), so a reader that maps a file's every column by
@@ -431,7 +434,7 @@ fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Va
     let current = &snapshots[snapshots.len() - 1].0["snapshot-id"];
     json!({
         "format-version": 2, "table-uuid": uuid, "location": lake.full(&format!("data/{folder}")),
-        "last-sequence-number": v, "last-updated-ms": now, "last-column-id": 2 * columns.len(), // (list elements take ids after the columns')
+        "last-sequence-number": v, "last-updated-ms": now, "last-column-id": 2 * n, // (list elements take ids after the columns')
         "current-schema-id": 0, "schemas": [schema],
         "default-spec-id": layout.partition.is_some() as i32, "last-partition-id": if layout.partition.is_some() { 1000 } else { 999 },
         "partition-specs": std::iter::once(json!({"spec-id": 0, "fields": []})).chain(layout.partition.as_ref().map(|_| json!({"spec-id": 1, "fields": layout.spec()}))).collect::<Vec<_>>(),
@@ -467,7 +470,7 @@ pub fn carries(t: &str) -> bool {
 /// with its place among the stored columns as its id and the name SQL knows it by (a renamed
 /// column keeps its id; a dropped one leaves the schema, its id unused again: ADR-022).
 fn fields(meta: &TableMeta) -> Option<Vec<Value>> {
-    let columns = &meta.columns;
+    let list = meta.column_list();
     let iceberg = |t: &str| -> Option<String> {
         Some(match t {
             "Int64" => "long".into(),
@@ -484,16 +487,14 @@ fn fields(meta: &TableMeta) -> Option<Vec<Value>> {
             },
         })
     };
-    let n = columns.len();
+    let n = list.all().len() as u32;
     // A list column (an embedding, say) needs an id for its elements too: they follow the columns'.
-    let kind = |i: usize, t: &String| match t.strip_suffix("[]") {
-        Some(item) => Some(json!({"type": "list", "element-id": n + i + 1, "element": iceberg(item)?, "element-required": false})),
+    let kind = |id: u32, t: &str| match t.strip_suffix("[]") {
+        Some(item) => Some(json!({"type": "list", "element-id": n + id, "element": iceberg(item)?, "element-required": false})),
         None => Some(Value::String(iceberg(t)?)),
     };
-    let mut live: Vec<(usize, &(String, String))> = columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c) && !meta.marker(c)).collect();
-    let order = meta.in_order(); // (listed in SQL's order: a field is known by its id, wherever it is listed)
-    live.sort_by_key(|(_, (c, _))| order.iter().position(|(s, _)| s == c));
-    live.into_iter().map(|(i, (c, t))| Some(json!({"id": i + 1, "name": meta.name_of(c), "required": meta.key.contains(c), "type": kind(i, t)?}))).collect() // (a key: identifier fields are required)
+    // (listed in SQL's order: a field is known by its id, wherever it is listed; a key's are required, as identifier fields)
+    list.sql().filter(|c| !meta.marker(&c.stored)).map(|c| Some(json!({"id": c.id, "name": c.name, "required": meta.key.contains(&c.stored), "type": kind(c.id, &c.dtype)?}))).collect()
 }
 
 // ---------------------------------------------------------------- Avro, just what manifests need
@@ -1110,4 +1111,31 @@ async fn up_to_date(lake: &Lake, table: &str, nodes: &[String], me: &str, retain
     }
     crate::tier::purge(lake, table, nodes, me, retain_ms, true).await?;
     crate::delta::publish_all(lake).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A table renamed one column of, dropped another and moved a third: its stored places + 1 (`Column.id`).
+    fn moved() -> TableMeta {
+        TableMeta {
+            columns: vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into()), ("c".into(), "Int64".into()), ("d".into(), "Utf8".into())],
+            names: [("b".to_string(), "bee".to_string())].into(),
+            dropped: vec!["c".into()],
+            shown: vec!["d".into()],
+            ..Default::default()
+        }
+    }
+
+    /// A field's id is its column's (`Column.id`) whatever its name or its place in SQL's order, the fields listed in
+    /// that order; a dropped column leaves the schema, its id unused again; a partition's source is its column's id.
+    #[test]
+    fn a_fields_id_is_its_columns_id() {
+        let f = fields(&moved()).unwrap();
+        let got: Vec<(u64, &str)> = f.iter().map(|f| (f["id"].as_u64().unwrap(), f["name"].as_str().unwrap())).collect();
+        assert_eq!(got, [(4, "d"), (1, "a"), (2, "bee")]);
+        let layout = Layout::of(&TableMeta { partition: Some("b".into()), ..moved() });
+        assert_eq!((layout.spec()[0]["source-id"].as_u64(), layout.name.as_str()), (Some(2), "bee"));
+    }
 }

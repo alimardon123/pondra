@@ -1119,14 +1119,15 @@ impl Encoding {
 /// Readers that match a file's columns to the table's by id (Polars' `scan_iceberg`) need them.
 fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::SchemaRef) -> datafusion::arrow::datatypes::SchemaRef {
     use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY as ID;
-    // (a table an INSERT makes: its columns will be these, in this order)
-    let columns: Vec<String> = match meta {
-        Some(m) => m.columns.iter().map(|(c, _)| c.clone()).collect(),
-        None => schema.fields().iter().map(|f| f.name().clone()).filter(|c| !crate::text::NAMES.contains(&c.as_str())).collect(),
-    };
-    let id = |name: &str| match columns.iter().position(|c| c == name) {
-        Some(i) => Some(i + 1),
-        None => crate::text::NAMES.iter().position(|c| *c == name).map(|i| 1_000_001 + i),
+    // (a table's: its column list's ids; a table an INSERT makes: its columns will be these, in this order)
+    let list = meta.map(|m| m.column_list());
+    let made: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).filter(|c| !crate::text::NAMES.contains(&c.as_str())).collect();
+    let id = |name: &str| {
+        let own = match &list {
+            Some(l) => l.of_stored(name).map(|c| c.id as usize),
+            None => made.iter().position(|c| c == name).map(|i| i + 1),
+        };
+        own.or_else(|| crate::text::NAMES.iter().position(|c| *c == name).map(|i| 1_000_001 + i))
     };
     let fields: Vec<_> = schema.fields().iter().map(|f| match id(f.name()) {
         Some(i) => {
