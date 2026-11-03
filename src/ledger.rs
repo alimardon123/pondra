@@ -4,6 +4,8 @@
 //!   loop that drops the least recently used past a bound) was written by hand about ten times, each with its own total to
 //!   get right; they all use this one now, so a bound is set, read and later reclaimed in one way.
 //! - `Ledger`, the one line for query memory, and `LakePool`, a lake's share of it as DataFusion's `MemoryPool`.
+//! - `Charged`, a cache the ledger counts: what it holds, and memory it gives back when the node needs it. The lakes on a
+//!   line charge their caches to it, so the node's memory watch takes memory back from all of them in one way.
 
 use datafusion::common::human_readable_size;
 use datafusion::error::{DataFusionError, Result};
@@ -11,7 +13,7 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError, Weak};
 
 /// A map that keeps its most recently used entries within a byte bound, and within a count bound when one is set. Each
 /// entry is charged the bytes its `put` says, fixed for as long as it is kept, so the total never drifts from what the
@@ -59,6 +61,19 @@ impl<K: Hash + Eq, V> ByteLru<K, V> {
     pub fn set_most(&mut self, most: usize) -> Vec<(K, V)> {
         self.most = most;
         self.trim()
+    }
+
+    /// Lets go of the least recently used entries until `bytes` have left, `entries` of them have, or none is left, and
+    /// returns them: memory the node needs back (`Charged::give_back`). The bound stays, so the cache fills again as it is
+    /// read.
+    pub fn shed(&mut self, bytes: usize, entries: usize) -> Vec<(K, V)> {
+        let (mut freed, mut left) = (0, vec![]);
+        while freed < bytes && left.len() < entries {
+            let Some((k, (v, b))) = self.map.pop_lru() else { break };
+            (self.bytes, freed) = (self.bytes - b, freed + b);
+            left.push((k, v));
+        }
+        left
     }
 
     fn trim(&mut self) -> Vec<(K, V)> {
@@ -149,6 +164,70 @@ impl<K: Hash + Eq, V> std::fmt::Debug for ByteLru<K, V> {
     }
 }
 
+// ---------------------------------------------------------------- what the caches hold
+
+/// A cache the ledger counts (`Ledger::charge`): what it holds, and memory it gives back when the node needs it. A
+/// `ByteLru` cache gives back its least recently used entries. A cache with rules of its own (the log's decoded rows,
+/// SlateDB's blocks, DataFusion's footers and statistics) says what it holds and keeps it: `give_back`'s default.
+pub trait Charged: Send + Sync {
+    /// The bytes it holds now.
+    fn held(&self) -> usize;
+
+    /// Lets go of about `bytes`, its least useful entries first, and says how many bytes went.
+    fn give_back(&self, bytes: usize) -> usize {
+        let _ = bytes;
+        0
+    }
+}
+
+impl<K: Hash + Eq + Send, V: Send> Charged for Mutex<ByteLru<K, V>> {
+    fn held(&self) -> usize { self.lock().unwrap_or_else(PoisonError::into_inner).bytes() }
+
+    fn give_back(&self, bytes: usize) -> usize { give_back_from(self, |c| c, bytes) }
+}
+
+/// The entries `give_back_from` takes at once: a reader that comes meanwhile waits for this many at most.
+const AT_ONCE: usize = 64;
+
+/// Takes about `bytes` back from the `ByteLru` that `lru` finds in what `cache` guards, and says how many bytes went. It
+/// takes [`AT_ONCE`] entries at a time, each time only while no reader holds the cache, and lets go of them after letting
+/// go of the lock: a lookup never waits for the values to be freed, nor for a whole cache to be emptied. (It runs on the
+/// memory watch's turn, `oom.rs`, never on a reader's path; a cache a reader holds now is asked again at its next look.)
+pub fn give_back_from<T, K: Hash + Eq, V>(cache: &Mutex<T>, lru: impl Fn(&mut T) -> &mut ByteLru<K, V>, bytes: usize) -> usize {
+    let mut freed = 0;
+    while freed < bytes {
+        let gone = {
+            let mut guard = match cache.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => break,
+            };
+            let c = lru(&mut guard);
+            let before = c.bytes;
+            let gone = c.shed(bytes - freed, AT_ONCE);
+            freed += before - c.bytes;
+            gone
+        };
+        if gone.is_empty() {
+            break;
+        }
+        drop(gone); // (big values are let go of after the lock is)
+    }
+    freed
+}
+
+/// Takes about `bytes` back from `caches`, each in turn, and says how many bytes came back.
+pub fn take_back<'a>(caches: impl IntoIterator<Item = &'a dyn Charged>, bytes: usize) -> usize {
+    let mut freed = 0;
+    for c in caches {
+        if freed >= bytes {
+            break;
+        }
+        freed += c.give_back(bytes - freed);
+    }
+    freed
+}
+
 // ---------------------------------------------------------------- the line
 
 /// The node's one line for query memory, which every lake it opens shares. Each lake's queries run on a `LakePool`: DataFusion's
@@ -166,10 +245,11 @@ pub struct Ledger {
     line: usize,
     reserved: AtomicUsize, // every lake's reservations together
     busy: AtomicUsize,     // lakes with a memory consumer registered now
+    caches: Mutex<Vec<(&'static str, Weak<dyn Charged>)>>, // what the node keeps on this line, by name (`charge`), in the order they give back
 }
 
 impl Ledger {
-    pub fn new(line: usize) -> Arc<Ledger> { Arc::new(Ledger { line, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0) }) }
+    pub fn new(line: usize) -> Arc<Ledger> { Arc::new(Ledger { line, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0), caches: Default::default() }) }
 
     /// A new lake's pool on this line.
     pub fn pool(self: &Arc<Self>) -> Arc<LakePool> { Arc::new(LakePool { ledger: self.clone(), part: Default::default() }) }
@@ -181,6 +261,44 @@ impl Ledger {
 
     /// A lake's share now: the line over the lakes running queries, at least one.
     pub fn share(&self) -> usize { self.line / self.busy.load(Relaxed).max(1) }
+
+    /// Counts `cache` on this line, under `name`, for as long as it lives: `/metrics`' `cache_bytes` reads it by that name,
+    /// and the node's memory watch takes memory back from it before it stops a query (`oom.rs`). Caches give back in the
+    /// order they were charged, so a lake's go in the order it lists them. A cache is charged once, though several lakes
+    /// keep it (the ranges of a bucket two lakes are in, the node's planning facts).
+    pub fn charge(&self, name: &'static str, cache: Weak<dyn Charged>) {
+        let mut caches = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
+        caches.retain(|(_, c)| c.strong_count() > 0);
+        if !caches.iter().any(|(_, c)| Weak::ptr_eq(c, &cache)) {
+            caches.push((name, cache));
+        }
+    }
+
+    /// The caches still alive, for the caller to hold a moment (a closed lake's go here).
+    fn charged(&self) -> Vec<(&'static str, Arc<dyn Charged>)> {
+        let mut caches = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
+        caches.retain(|(_, c)| c.strong_count() > 0);
+        caches.iter().filter_map(|(name, c)| Some((*name, c.upgrade()?))).collect()
+    }
+
+    /// What the caches on this line hold now.
+    pub fn held(&self) -> usize { self.charged().iter().map(|(_, c)| c.held()).sum() }
+
+    /// What the caches on this line hold now by name, each name once (two lakes' tails are one line), in the order the
+    /// names were first charged.
+    pub fn held_by_name(&self) -> Vec<(&'static str, usize)> {
+        let mut by_name: Vec<(&'static str, usize)> = vec![];
+        for (name, c) in self.charged() {
+            match by_name.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, held)) => *held += c.held(),
+                None => by_name.push((name, c.held())),
+            }
+        }
+        by_name
+    }
+
+    /// Takes about `bytes` back from the caches on this line, in the order they were charged, and says how many came back.
+    pub fn give_back(&self, bytes: usize) -> usize { take_back(self.charged().iter().map(|(_, c)| &**c), bytes) }
 }
 
 /// One lake's pool of query memory: `FairSpillPool`'s rules over the lake's share of its ledger's line (`Ledger`).
@@ -434,5 +552,50 @@ mod tests {
         drop((b1, b_held));
         assert_eq!((ledger.busy.load(Relaxed), limit(&a)), (1, Some(100)));
         assert!(a_held.try_grow(50).is_ok());
+    }
+
+    #[test]
+    fn shed_lets_the_least_recently_used_go_until_enough_has_and_keeps_the_bound() {
+        let mut c = ByteLru::new(100);
+        for (k, b) in [("a", 10), ("b", 20), ("c", 30)] {
+            assert!(c.put(k, 0u32, b).is_empty());
+        }
+        let _ = c.get("a");
+        let gone: Vec<&str> = c.shed(25, 10).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(gone, ["b", "c"], "the least recently used first, until 25 bytes have gone");
+        assert_eq!((keys(&c), c.bytes(), c.most()), (vec!["a"], 10, 100));
+        assert!(c.put("b", 0, 20).is_empty());
+        assert_eq!(c.shed(1000, 1).len(), 1, "and no more entries than it is asked for");
+        assert_eq!((keys(&c), c.bytes()), (vec!["b"], 20));
+        assert!(c.shed(1000, 10).len() == 1 && c.is_empty() && c.bytes() == 0);
+        assert!(c.put("d", 0, 100).is_empty(), "it fills again to its bound");
+    }
+
+    #[test]
+    fn a_line_takes_memory_back_from_its_caches_in_turn_and_forgets_the_dropped_ones() {
+        let ledger = Ledger::new(1000);
+        let cache = |bytes: &[usize]| {
+            let c = Arc::new(Mutex::new(ByteLru::new(1000)));
+            for (i, &b) in bytes.iter().enumerate() {
+                let _ = c.lock().unwrap().put(i, (), b);
+            }
+            c
+        };
+        let (first, second, third) = (cache(&[100, 100]), cache(&[50, 50]), cache(&[70]));
+        for (name, c) in [("first", &first), ("second", &second), ("first", &third)] {
+            let c: Arc<dyn Charged> = c.clone();
+            ledger.charge(name, Arc::downgrade(&c));
+            ledger.charge(name, Arc::downgrade(&c)); // (charged once, however many lakes keep it)
+        }
+        assert_eq!((ledger.held(), ledger.held_by_name()), (370, vec![("first", 270), ("second", 100)]));
+        assert_eq!(ledger.give_back(250), 250, "the first cache's entries, the least recently used first, then the second's");
+        assert_eq!((first.held(), second.held(), third.held()), (0, 50, 70));
+        let held = third.lock().unwrap();
+        assert_eq!(ledger.give_back(1000), 50, "a cache a reader holds now is skipped, and asked again at the next look");
+        drop(held);
+        drop(second);
+        assert_eq!(ledger.held(), 70, "a dropped cache is let go of");
+        assert_eq!(ledger.give_back(1000), 70);
+        assert_eq!((ledger.held(), ledger.caches.lock().unwrap().len()), (0, 2));
     }
 }

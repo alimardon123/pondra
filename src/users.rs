@@ -387,7 +387,7 @@ fn grant(w: &mut Words, grant: bool) -> Result<Change> {
     } else if w.is("secret") {
         On::Secret(w.name()?)
     } else if w.is("database") {
-        database = Some(w.name()?.trim_matches('"').to_lowercase()); // (checked to be this one where it runs: `apply`)
+        database = Some(crate::text::database(&w.name()?)); // (checked to be this one where it runs: `apply`)
         On::Lake
     } else if w.is("all") {
         w.expect("tables")?;

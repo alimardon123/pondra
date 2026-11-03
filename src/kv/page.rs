@@ -454,8 +454,10 @@ impl Kv for Log {
     async fn close(&self) -> Result<(), Error> {
         Ok(())
     }
+}
 
-    fn cached(&self) -> usize {
+impl crate::ledger::Charged for Log {
+    fn held(&self) -> usize {
         self.keys.lock().unwrap_or_else(PoisonError::into_inner).iter().map(|(key, value)| key.len() + value.len()).sum()
     }
 }
@@ -512,7 +514,7 @@ mod tests {
         kv.write(&[pair("e", "5")], &["e".to_string()]).await.unwrap();
         assert_eq!(kv.get("e", false).await.unwrap(), None, "a key put and deleted in one batch ends deleted");
         // (a, b and d are left: each key and value is one byte)
-        assert_eq!(kv.cached(), 3 * 2);
+        assert_eq!(crate::ledger::Charged::held(&kv), 3 * 2);
     }
 
     #[tokio::test]

@@ -2639,6 +2639,12 @@ def clients():
         and tool("r-tok", "query", sql="SELECT count(*) AS n FROM docs")["rows"] == [{"n": 3}] and tool("r-tok", "write", sql="DELETE FROM docs") is None \
         and wrote == {"rows": 1} and tool("w-tok", "write", sql="INSERT INTO docs VALUES (4, 'trucks', [0.0, 0.1, 0.9])", job="mcp-1") == {"duplicate": True} \
         and len(feed["rows"]) == 5 and any(r.get("_deleted") for r in feed["rows"]) and feed["position"] > 0
+    # MCP's rows are put in its answer as written, so a value reads as HTTP sends it (parsed back, a DECIMAL kept only a double's digits)
+    exact = "SELECT CAST('99999999999999.9999' AS DECIMAL(18,4)) AS d, CAST('0.10' AS DECIMAL(5,2)) AS small, 9007199254740993 AS big"
+    as_mcp = mcp("r-tok", "tools/call", {"name": "query", "arguments": {"sql": exact}})["content"][0]["text"]
+    as_http = urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/sql", data=exact.encode(), headers={"authorization": "Bearer r-tok"})).read().decode()
+    checks["MCP's rows read as HTTP's, byte for byte: a DECIMAL's every digit (99999999999999.9999, 0.10), not a double's"] = \
+        as_mcp == '{"rows":' + as_http + ',"total_rows":1}' and '"d":99999999999999.9999' in as_mcp and '"small":0.10' in as_mcp
     # Raw MCP calls, with the status and headers: (status, headers, the JSON answer or its text)
     def mcp_raw(token, method, params=None, sid=None, verb="POST", port=None):
         headers = {"content-type": "application/json", "authorization": f"Bearer {token}"}
@@ -2834,6 +2840,16 @@ def kafka():
     p.produce("rounds", value=json.dumps({"v": 2.5}))
     assert p.flush(30) == 0
     checks["a JSON value's 2.5 into an INT column is 3, as SQL writes it"] = sql_("SELECT v FROM rounds") == [{"v": 3}]
+    # A value its column can't hold (22xxx) is a bad record, said at once, not a timeout the producer sends again until
+    # its delivery timeout: text into a BIGINT, past a SMALLINT, past a DECIMAL(5,2); a good record after them goes in.
+    sql_("CREATE TABLE narrow (n BIGINT, s SMALLINT, d DECIMAL(5,2))")
+    told, t = [], time.time()
+    q = ck.Producer({**sasl("writer", "w-tok"), "message.timeout.ms": 20000})
+    for v in ({"n": "abc"}, {"s": 70000}, {"d": 12345.678}, {"n": 1, "s": 2, "d": 3.25}):
+        q.produce("narrow", value=json.dumps(v), on_delivery=lambda e, m: told.append(e and e.code()))
+        q.flush(30)
+    checks["a value its column can't hold (22xxx) is a bad record, said at once, not retried"] = \
+        (told, time.time() - t < 10, sql_("SELECT n, s, d FROM narrow")) == ([ck.KafkaError.INVALID_RECORD] * 3 + [None], True, [{"n": 1, "s": 2, "d": 3.25}])
     # Debezium's own encodings, as 2.7 sends a Postgres row with its defaults (Kafka Connect's schema beside it):
     # NUMERIC(10,2) as Decimal bytes, NUMERIC as VariableScaleDecimal, TIMESTAMP(3) and TIME(3) in ms, TIME in µs,
     # BYTEA in base64. Before, the decimal was refused and the times landed in 1970 and near midnight.
