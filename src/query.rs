@@ -1340,7 +1340,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             let view = table_view(lake, &ctx, name, &meta, touched || named_sys, upto).await?;
             let mut t = named(&ctx, view, &meta, names_deleted(&text))?;
             if touched {
-                t = crate::txn::overlaid(&ctx, name, &meta.logical().key, t, crate::sys::mentioned(&text))?;
+                t = crate::txn::overlaid(&ctx, name, &meta.sql_key(), t, crate::sys::mentioned(&text))?;
             }
             if let Some(h) = &meta.history {
                 t = crate::views::history_view(&ctx, t, h, crate::sys::mentioned(&text)).await?; // (each version's __start_at and __end_at, as it is read)

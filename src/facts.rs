@@ -430,7 +430,7 @@ async fn join_keys(lake: &Lake, query: &ast::Query) -> Result<HashMap<String, Ve
         let owner: &Lake = other.as_deref().unwrap_or(lake);
         let mut found = Vec::new();
         if let Some(meta) = owner.cat.get::<TableMeta>(&table_key(&local)).await? {
-            let meta = meta.logical();
+            let meta = meta.logical_ref();
             if !meta.key.is_empty() {
                 found.push(meta.key.clone());
             }
