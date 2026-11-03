@@ -132,14 +132,7 @@ fn compare(term: &Arc<dyn PhysicalExpr>) -> Option<(Column, Operator, ScalarValu
         return Some((c.clone(), *b.op(), v.value().clone()));
     }
     let (v, c) = (b.left().downcast_ref::<Literal>()?, b.right().downcast_ref::<Column>()?);
-    let flipped = match b.op() {
-        Operator::Lt => Operator::Gt,
-        Operator::LtEq => Operator::GtEq,
-        Operator::Gt => Operator::Lt,
-        Operator::GtEq => Operator::LtEq,
-        op => *op,
-    };
-    Some((c.clone(), flipped, v.value().clone()))
+    Some((c.clone(), b.op().swap()?, v.value().clone()))
 }
 
 /// Whether a column's values order as the comparison kernels order them.

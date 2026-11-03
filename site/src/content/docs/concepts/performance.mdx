@@ -57,7 +57,7 @@ machine's memory, the default since 11-01, ClickBench from memory took 6.99 s
 ([`logs/round36/`](https://github.com/alimardon123/pondra/tree/main/logs/round36)). Since round 35, a
 join's keys cut the rows its probe side groups (TPC-H q20 71 ms to 37 ms), an OR of ranges of one
 column is one range (q19 106 ms to 91 ms), and a partial `GROUP BY` hands its rows on sooner
-(ClickBench from memory 0.93 of the time), each measured against the build before it on the same
+(ClickBench from memory 0.93 of the time; on one node, a spread query's nodes group first as before), each measured against the build before it on the same
 machine.
 
 ### Round 32: TPC-H, ClickBench and TPC-DS against DuckDB 1.5 and 2.0's preview

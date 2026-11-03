@@ -169,7 +169,7 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
         }
     });
     let mine_now = cut.children()[0].clone();
-    let ours = timed("its share", me, drain(&mine_now, ctx.task_ctx(), &id, "here"));
+    let ours = timed("its share", me, drain(&mine_now, stage_ctx(&ctx), &id, "here"));
     let tail = async {
         let (after, upto) = tail.parts[0].tail.expect("tail");
         match upto > after { true => timed("the log tail", me, stage(lake, &tail)).await.map(|(_, parts)| parts), false => Ok(vec![]) } // no log tail: nothing to do
@@ -414,7 +414,21 @@ pub async fn stage(lake: &Lake, s: &Slice) -> Result<(String, Vec<Spill>)> {
     }
     let (ctx, plan) = plan(lake, s).await?;
     let cut = find_cut(&plan).context("no single-stage plan")?;
-    Ok((String::new(), drain(&cut.children()[0].clone(), ctx.task_ctx(), &s.job(), "out").await?))
+    Ok((String::new(), drain(&cut.children()[0].clone(), stage_ctx(&ctx), &s.job(), "out").await?))
+}
+
+/// The task context a stage runs with: what it hands on goes to other nodes, so a partial GROUP BY there hands its rows on
+/// as they are only past DataFusion's own 80% as many groups as rows, not the 30% a query on one node takes
+/// (`optimize::SKIP_PARTIAL`), where rows not grouped would cross the network as up to 3.3 times as many rows as groups
+/// (11-03 audit M4: #410 measured one node only). A share the user set (`PONDRA_SQL_OPTIONS`) stays theirs.
+fn stage_ctx(ctx: &SessionContext) -> Arc<datafusion::execution::TaskContext> {
+    let task = datafusion::execution::TaskContext::from(ctx);
+    let mut config = task.session_config().clone();
+    let e = &mut config.options_mut().execution;
+    if e.skip_partial_aggregation_probe_ratio_threshold == crate::optimize::SKIP_PARTIAL {
+        e.skip_partial_aggregation_probe_ratio_threshold = 0.8;
+    }
+    Arc::new(task.with_session_config(config))
 }
 
 /// Every partition of `plan` run into a bucket of its own: what this node passes on, held in
@@ -1265,7 +1279,7 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
     // write over them (the step's number with an `r` after it).
     let tag = format!("{}{}", sh.step, if sh.again { "r" } else { "" });
     if last {
-        let out = drain(&top, job.ctx.task_ctx(), &sh.id, &format!("out-{tag}")).await?;
+        let out = drain(&top, stage_ctx(&job.ctx), &sh.id, &format!("out-{tag}")).await?;
         fails_once(sh, "PONDRA_DEBUG_FAIL_STEP")?;
         job.done.store(true, std::sync::atomic::Ordering::Relaxed); // (the sweep frees its scratch shortly)
         return Ok((job.shape.clone(), out));
@@ -1274,12 +1288,12 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
     // bucket past 64 MB goes to this node's disk as it is filled, so a shuffle isn't bounded by memory.
     let x = &job.exchanges[sh.step];
     let made = match x.plan.output_partitioning().clone() {
-        _ if x.whole => vec![drain(&top, job.ctx.task_ctx(), &sh.id, &format!("{tag}-all")).await?; sh.nodes.len()], // (every node, every partition)
-        Partitioning::Hash(exprs, parts) => scatter(&top, job.ctx.task_ctx(), &sh.id, &tag, exprs, sh.nodes.len(), parts, x.own.then_some(sh.me)).await?,
+        _ if x.whole => vec![drain(&top, stage_ctx(&job.ctx), &sh.id, &format!("{tag}-all")).await?; sh.nodes.len()], // (every node, every partition)
+        Partitioning::Hash(exprs, parts) => scatter(&top, stage_ctx(&job.ctx), &sh.id, &tag, exprs, sh.nodes.len(), parts, x.own.then_some(sh.me)).await?,
         _ => {
             // An all-gather (`everywhere`): every node is sent all of what this one has.
             let mut all = Spill::new(crate::spill::dir(&sh.id)?, format!("{tag}-gathered"));
-            for part in drain(&top, job.ctx.task_ctx(), &sh.id, &format!("{tag}-all")).await? {
+            for part in drain(&top, stage_ctx(&job.ctx), &sh.id, &format!("{tag}-all")).await? {
                 all.absorb(part)?;
             }
             vec![vec![all]; sh.nodes.len()]
@@ -1636,5 +1650,23 @@ impl ExecutionPlan for ShareExec {
     }
     fn handle_child_pushdown_result(&self, _: datafusion::physical_plan::filter_pushdown::FilterPushdownPhase, result: datafusion::physical_plan::filter_pushdown::ChildPushdownResult, _: &datafusion::common::config::ConfigOptions) -> datafusion::error::Result<datafusion::physical_plan::filter_pushdown::FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         Ok(datafusion::physical_plan::filter_pushdown::FilterPushdownPropagation::if_all(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::prelude::SessionConfig;
+
+    /// A stage hands its rows on ungrouped only past DataFusion's 80% as many groups, a query on one node past 30%, and a
+    /// share the user set stays theirs (11-03 audit M4).
+    #[test]
+    fn a_stage_groups_its_rows_before_it_hands_them_on() {
+        let share = |t: &datafusion::execution::TaskContext| t.session_config().options().execution.skip_partial_aggregation_probe_ratio_threshold;
+        let one = SessionContext::new_with_config(crate::optimize::config(SessionConfig::new()));
+        assert_eq!(share(&one.task_ctx()), crate::optimize::SKIP_PARTIAL);
+        assert_eq!(share(&stage_ctx(&one)), 0.8);
+        let set = crate::optimize::config(SessionConfig::new()).set_str("datafusion.execution.skip_partial_aggregation_probe_ratio_threshold", "0.5");
+        assert_eq!(share(&stage_ctx(&SessionContext::new_with_config(set))), 0.5);
     }
 }

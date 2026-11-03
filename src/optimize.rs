@@ -33,14 +33,14 @@ use std::sync::Arc;
 ///   instead of shuffling both sides by key.
 pub fn config(mut config: SessionConfig) -> SessionConfig {
     let user = crate::env::get("PONDRA_SQL_OPTIONS").unwrap_or_default();
-    let defaults = "datafusion.sql_parser.parse_float_as_decimal=true,\
+    let defaults = format!("datafusion.sql_parser.parse_float_as_decimal=true,\
         datafusion.execution.time_zone=+00:00,\
         datafusion.optimizer.hash_join_single_partition_threshold=33554432,\
         datafusion.optimizer.hash_join_single_partition_threshold_rows=1048576,\
         datafusion.execution.perfect_hash_join_small_build_threshold=262144,\
         datafusion.execution.skip_physical_aggregate_schema_check=true,\
         datafusion.execution.spill_compression=lz4_frame,\
-        datafusion.execution.skip_partial_aggregation_probe_ratio_threshold=0.3";
+        datafusion.execution.skip_partial_aggregation_probe_ratio_threshold={SKIP_PARTIAL}");
     // (the perfect hash join's: a join on one integer key whose build side's keys span under 262,144
     // values looks them up in an array of that span, at most 1 MB, however few they are; DataFusion's
     // 1,024 kept TPC-H q17's 204 parts, spread over 200,000 keys, in a hash table, and its 6 M probes
@@ -52,12 +52,13 @@ pub fn config(mut config: SessionConfig) -> SessionConfig {
     // none ran slower (join building 60 M rows 15.1 s to 10.9 s, the median 25.8 s to 22.4 s), and the full sort of 60 M
     // rows by a string reached its merge instead of its 8 GB spill limit; zstd spilled less again but sorted 43% slower.
     // `datafusion.execution.spill_compression=uncompressed` in PONDRA_SQL_OPTIONS turns it off)
-    // (a partial GROUP BY whose first 100,000 rows of a partition hold more than 30% as many groups, not 80%, hands its
+    // (`SKIP_PARTIAL`: a partial GROUP BY whose first 100,000 rows of a partition hold more than 30% as many groups, not 80%, hands its
     // rows on as they are, for the final one to group: grouping them twice cost more than it saved. ClickBench from
     // memory: GROUP BY URL 602 to 522 ms, (UserID, minute, SearchPhrase) 492 to 355, (SearchEngineID, ClientIP) 99 to 74, all 43
     // 6.34 to 5.88 s. A dedup of SearchPhrase, which holds 9% as many groups, still groups first: skipped at 10% it took
     // 179 ms, not 137. TPC-H's partial aggregates hold fewer (lineitem by order 25%) and run as they did; of TPC-DS's 99,
-    // q47 and q65 skip now, 2-4% faster. `logs/round36/partial-aggregation.json`)
+    // q47 and q65 skip now, 2-4% faster. `logs/round36/partial-aggregation.json`. A spread query's stages keep DataFusion's
+    // 80%, `spmd::stage_ctx`)
     for (k, v) in defaults.split(',').chain(user.split(',')).filter_map(|kv| kv.trim().split_once('=')) {
         config = config.set_str(k, v);
     }
@@ -67,6 +68,16 @@ pub fn config(mut config: SessionConfig) -> SessionConfig {
     let config = config.set_str("datafusion.execution.spill_compression", "uncompressed");
     config
 }
+
+/// Is `plan` a spread query's slice (`spmd`: its exchanges between nodes)? The rules that change a plan's shape leave
+/// those alone: every node must plan a slice the same way.
+pub(crate) fn spread(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
+    plan.exists(|p| Ok(matches!(p.name(), "ShareExec" | "WholeExec")))
+}
+
+/// How many groups, as a share of a partition's first 100,000 rows, a partial GROUP BY on one node holds before it hands
+/// its rows on as they are (`config`).
+pub const SKIP_PARTIAL: f64 = 0.3;
 
 /// DataFusion's rules, with Pondra's placed where they work best.
 pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
@@ -1210,7 +1221,7 @@ impl PhysicalOptimizerRule for EarlyProbes {
             return Ok(plan); // (no runtime to read ahead on: a page in a browser has one thread, and BufferExec spawns)
         }
         use datafusion::physical_plan::buffer::BufferExec;
-        if plan.exists(|p| Ok(matches!(p.name(), "ShareExec" | "WholeExec")))? {
+        if spread(&plan)? {
             return Ok(plan);
         }
         let every = config.execution.hash_join_buffering_capacity; // (the user's: every join, this far ahead)
@@ -1612,7 +1623,8 @@ fn is_right_deep(e: &Arc<dyn PhysicalExpr>) -> bool {
 #[derive(Debug)]
 struct WideTopN;
 
-const WIDE: usize = 16;
+/// The fewest columns a scan has for its top-N to read them late (`late_rows`).
+pub(crate) const WIDE: usize = 16;
 
 impl PhysicalOptimizerRule for WideTopN {
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
@@ -1698,7 +1710,7 @@ impl PhysicalOptimizerRule for SharedBuilds {
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::physical_plan::aggregates::AggregateMode;
         let most = config.optimizer.hash_join_single_partition_threshold_rows;
-        if most == 0 || plan.exists(|p| Ok(matches!(p.name(), "ShareExec" | "WholeExec")))? {
+        if most == 0 || spread(&plan)? {
             return Ok(plan); // (with no threshold every join already hashes both sides)
         }
         plan.transform_down(|p| {
