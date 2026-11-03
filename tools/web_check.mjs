@@ -696,8 +696,11 @@ async function spillWorkerChecks() {
     const estimate = await tab.evaluate(storageEstimate);
     report.spill_worker = { estimate };
 
-    // The main thread: the same settings, its sort refused and the next query answered.
+    // The main thread: the same settings, its sort refused and the next query answered. A spill file a crashed Worker left is
+    // removed by this page's open, though the page keeps no spill file of its own (11-02 audit L7).
     const main = await tab.evaluate(async (sql) => {
+      const folder = await (await navigator.storage.getDirectory()).getDirectoryHandle('.pondra-spill', { create: true });
+      await folder.getFileHandle('left-by-a-crashed-worker', { create: true });
       const page = new window.Page({ memory_max_gb: 1, memory_gb: 0.1 });
       const ask = async (text) => {
         const a = await page.request('POST', '/sql?format=csv', {}, text);
@@ -707,8 +710,20 @@ async function spillWorkerChecks() {
       const after = await ask('SELECT 1 AS n');
       await page.close();
       page.free();
-      return { past, after };
+      // (the sweep runs in the background of the page's open: the folder is read again for up to 5 s until it is gone)
+      let left = [];
+      for (const until = Date.now() + 5000; ; await new Promise((r) => setTimeout(r, 100))) {
+        left = [];
+        for await (const [name] of folder.entries()) left.push(name);
+        if (left.length === 0 || Date.now() > until) break;
+      }
+      return { past, after, left };
     }, WORKER_QUERIES[0][1]);
+    if (main.left.length === 0) passed++;
+    else {
+      failed.push("spill worker: the main thread's page removes a crashed Worker's spill file");
+      console.error(`spill worker: the folder still holds ${JSON.stringify(main.left)} after the main thread's page opened`);
+    }
     judge('spill worker: a sort past its pool on the main thread', asJudged(main.past), { status: 503, sqlstate: '53200', says: 'Worker' });
     judge("spill worker: the main thread's next query", asJudged(main.after), { status: 200, sqlstate: null, out: 'n\n1\n' });
     report.spill_worker.main_thread = main.past.text;
@@ -1607,6 +1622,7 @@ const JOIN_AS_BOSS = [
   'CREATE TABLE w4 (id BIGINT, name TEXT, amount DOUBLE, at TIMESTAMP)', // (the blob check's table: a tab's file loaded into it)
   'CREATE TABLE w4big (id BIGINT, name TEXT, amount DOUBLE, at TIMESTAMP)', // (the 100 MB check's table: the joined page loads its CSV into it)
   'CREATE TABLE w4self (id BIGINT, name TEXT, amount DOUBLE, at TIMESTAMP)', // (the same CSV, loaded by B itself: the nodes' own load)
+  'CREATE TABLE spans (id BIGINT, d INTERVAL)', // (the staged INTERVAL check's table: staged as its text, cast back by the node)
 ];
 const BOSS_BASIC = `Basic ${Buffer.from('boss:boss-password-1').toString('base64')}`;
 // What the page's objects and a node's catalog never name: the secret, its value, and the superuser.
@@ -1740,6 +1756,20 @@ async function joinChecks(target, a, b) {
   if (replaced) judge(`joined: ${replaceSql}`, replaced, { status: 200, sqlstate: null });
   const upsertedRows = await ask('joined: SELECT k, v FROM keyed after the upserts', 'POST', '/sql?format=csv', undefined, 'SELECT k, v FROM keyed ORDER BY k', 'joined');
   if (upsertedRows) judge('joined: SELECT k, v FROM keyed after the upserts', upsertedRows, { status: 200, sqlstate: null, out: 'k,v\n1,replaced\n' });
+  // (c3c) A staged INSERT is the node's INSERT (11-02 audit M7, L6): an INTERVAL is staged as its text and the node casts it back
+  // exactly; a width the columns don't take, and a column the table doesn't have, are refused in the words any INSERT says them with.
+  const spanSql = "INSERT INTO spans SELECT 1, INTERVAL '1 month -2 days 3.000000004 seconds'";
+  const spanIns = await ask(`joined: ${spanSql}`, 'POST', '/sql', undefined, spanSql, 'joined');
+  if (spanIns) judge(`joined: ${spanSql}`, spanIns, { status: 200, sqlstate: null });
+  const spanRead = "SELECT count(*) AS n FROM spans WHERE d = INTERVAL '1 month -2 days 3.000000004 seconds'";
+  const spanRows = await ask(`joined: ${spanRead}`, 'POST', '/sql?format=csv', undefined, spanRead, 'joined');
+  if (spanRows) judge(`joined: ${spanRead}`, spanRows, { status: 200, sqlstate: null, out: 'n\n1\n' });
+  const wideSql = "INSERT INTO keyed (k) SELECT 2, 'x'";
+  const wide = await ask(`joined: ${wideSql}`, 'POST', '/sql', undefined, wideSql, 'joined');
+  if (wide) judge(`joined: ${wideSql}`, wide, { sqlstate: '42601', error: true, says: 'INSERT has more expressions than target columns' });
+  const nopeSql = "INSERT INTO keyed (k, nope) SELECT 2, 'x'";
+  const nope = await ask(`joined: ${nopeSql}`, 'POST', '/sql', undefined, nopeSql, 'joined');
+  if (nope) judge(`joined: ${nopeSql}`, nope, { sqlstate: '42703', error: true, says: 'column "nope" of relation "keyed" does not exist' });
 
   // (c4) A tab's own file (a blob made in the joined page's tab) loaded into a lake table: the page stages its rows and its node
   // writes them, so A's count is right at once; an UPDATE from the same file is refused by the page's words (`BLOB_ON_PAGE`).
@@ -1756,21 +1786,21 @@ async function joinChecks(target, a, b) {
   await target.revoke('joined', blobUrl);
 
   // (c4b) M8: the page's read of its own lake (w4 is the page's to read: the page runs it there and keeps no records) is written by
-  // its node B as the sign-in's: boss's name, the door `page`, in B's audit log (its read class is on: `joinRun`) and in
+  // its node B as the sign-in's: boss's name, the door `page-reported` (what the page says it ran), in B's audit log (its read class is on: `joinRun`) and in
   // pondra.history, each within 5 s. The page's row is a line the page sent, not one its own lake wrote.
   const pageRead = 'SELECT count(*) FROM w4';
   const counted3 = await ask(`joined: ${pageRead}`, 'POST', '/sql?format=csv', undefined, pageRead, 'joined');
   if (counted3) judge(`joined: ${pageRead}`, counted3, { status: 200, sqlstate: null, out: 'count(*)\n3\n' });
-  const pageRow = 'boss,page,SELECT count(*) FROM w4';
-  if (await untilRow(b, `SELECT "user", door, statement FROM pondra.audit WHERE door = 'page'`, pageRow, 5000)) passed++;
+  const pageRow = 'boss,page-reported,SELECT count(*) FROM w4';
+  if (await untilRow(b, `SELECT "user", door, statement FROM pondra.audit WHERE door = 'page-reported'`, pageRow, 5000)) passed++;
   else {
-    failed.push("B: the page's read is in its audit log as boss, door page, within 5 s");
-    console.error("B: the page's read is in its audit log as boss, door page, within 5 s: no such line");
+    failed.push("B: the page's read is in its audit log as boss, door page-reported, within 5 s");
+    console.error("B: the page's read is in its audit log as boss, door page-reported, within 5 s: no such line");
   }
-  if (await untilRow(b, `SELECT "user", door, statement FROM pondra.history WHERE door = 'page'`, pageRow, 5000)) passed++;
+  if (await untilRow(b, `SELECT "user", door, statement FROM pondra.history WHERE door = 'page-reported'`, pageRow, 5000)) passed++;
   else {
-    failed.push("B: the page's read is in pondra.history as boss, door page, within 5 s");
-    console.error("B: the page's read is in pondra.history as boss, door page, within 5 s: no such row");
+    failed.push("B: the page's read is in pondra.history as boss, door page-reported, within 5 s");
+    console.error("B: the page's read is in pondra.history as boss, door page-reported, within 5 s: no such row");
   }
 
   // (c5) The 100 MB check (W4b): the joined page loads a generated 100 MB CSV, and the nodes' CPU is measured around it.

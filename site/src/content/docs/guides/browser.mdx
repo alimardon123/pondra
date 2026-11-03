@@ -149,6 +149,37 @@ before sending anything. `CREATE TABLE copy AS SELECT * FROM sales` makes a page
 - The node must name the page's origin in [`PONDRA_WEB_ORIGINS`](/pondra/reference/environment/).
 - Give the page the token of the person using it, never a shared one, since whoever runs the page can read it.
 
+## A page in a node's lake
+
+`Page.join(url, session)` opens a node's own lake in the page. The page reads every table there itself, and sends each
+write to the node:
+
+```js norun
+const login = await fetch('https://pondra.example.com/login', {
+  method: 'POST',
+  body: JSON.stringify({ user: 'ana', password }),
+});
+const { token: session } = await login.json(); // (a ps_ session)
+const page = await Page.join('https://pondra.example.com', session);
+console.log(await sql('SELECT region, count(*) FROM orders GROUP BY region'));
+```
+
+- **Reads run on the page.** It follows the lake's commits as they happen, so a query sees each write within the
+  stream's delay, with no polling. It reads the lake's files through the node, so the page holds no bucket
+  credentials and the bucket needs no CORS.
+- **Writes go to the node** as the node's own statements, under the page's sign-in. Each one comes back to the page on
+  the stream. When a superuser's page runs `INSERT INTO t SELECT …`, the page works out the rows and hands them to the node
+  as files, which the node checks and writes.
+- **It joins with an admin's session** from the node's `POST /login` (a `ps_` one), never a token. The page holds no key
+  of the lake's or the nodes', and never the lake's secrets, users or shares. `https` is required, except to
+  `localhost`. `url` is the node's origin, with no path. `node` and `token` in the options are refused.
+- **A transaction is refused** by name, since the page holds none of the node's.
+- **A tab's own file** (a `blob:` URL from `URL.createObjectURL`) is read by the page alone, as
+  `read_csv('blob:…')`, never by its bare name. A page joined by a superuser loads one into a table with
+  `INSERT INTO t SELECT … FROM read_csv('blob:…')`. Any other user loads the file through a client of the node.
+- The node must name the page's origin in [`PONDRA_WEB_ORIGINS`](/pondra/reference/environment/).
+- A joined page never leads, serves or takes work, so closing its tab changes nothing in the cluster.
+
 ## Memory and settings
 
 A page stops the query that grows it past its memory line with `53200`, rather than let the tab crash. The line
@@ -165,6 +196,25 @@ const page = new Page({ memory_max_gb: 1, web_send_mb: 16 });
 
 Settings belong to the module, not to one page. The first page given any fixes them, and a later page given
 other values is refused by name.
+
+### Bigger than memory, in a Worker
+
+A page in a dedicated Worker spills to the site's private file system (OPFS), as a node spills to its disk. A sort,
+an aggregate or a join that grows past the page's memory line then writes to one spill file and reads it back, so
+the query finishes rather than stopping with `53200`. A page on the main thread can't spill, because the browser
+gives the file handle it needs only to a Worker:
+
+```js norun
+// worker.js, started with new Worker('./worker.js', { type: 'module' })
+import init, { Page } from './pondra_web.js';
+
+await init();
+const page = new Page({ spill_gb: 2 });
+```
+
+The spill file takes at most `spill_gb`. Without that setting, it takes half of the space the site has free, so that a
+kept page's tables keep the other half. A query that needs more is refused with `53100`. The file is
+`.pondra-spill/<id>` in the site's folder, and the next page removes any file that a closed tab left there.
 
 ## In Node
 
