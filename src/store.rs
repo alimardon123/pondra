@@ -348,6 +348,94 @@ impl TableMeta {
         l.iter().filter(|c| !self.dropped.contains(c)).map(|c| self.name_of(c).to_string()).collect()
     }
 
+    // The edits to a table's columns: the one way DDL changes them (redesign 1b, piece 6a). Each names a column by its
+    // stored name and keeps the entry's fields as they always were, so the record doesn't change. Format 6 (piece 6b)
+    // makes the list the record behind these same edits.
+
+    /// ADD COLUMN `name`: stored under its name, or `name~2`, `name~3`… when an older column (renamed or dropped) is
+    /// stored under that, since files are never rewritten. Last in stored order, and in SQL's unless `set_order` puts it
+    /// elsewhere. Returns its stored name.
+    pub fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<crate::types::Enum>) -> String {
+        let taken = |s: &str| self.columns.iter().any(|(n, _)| n == s);
+        let stored = (1..).map(|i| if i == 1 { name.to_string() } else { format!("{name}~{i}") }).find(|s| !taken(s)).expect("a free name");
+        if stored != name {
+            self.names.insert(stored.clone(), name.to_string());
+        }
+        if let Some(e) = labels {
+            self.enums.insert(stored.clone(), e); // (ALTER TABLE … ADD COLUMN c mood)
+        }
+        if let Some(t) = held {
+            self.sql_types.insert(stored.clone(), t); // (ALTER TABLE … ADD COLUMN c UUID)
+        }
+        self.columns.push((stored.clone(), dtype.to_string()));
+        stored
+    }
+
+    /// RENAME COLUMN: the column stored as `stored` is `to` in SQL from now on (its files keep the stored name).
+    pub fn rename_column(&mut self, stored: &str, to: &str) {
+        match to == stored {
+            true => self.names.remove(stored),
+            false => self.names.insert(stored.to_string(), to.to_string()),
+        };
+    }
+
+    /// DROP COLUMN: marked dropped, kept in the list (older files still hold it). The table facts that name it (its
+    /// clustering, merge, constraints, checks) are the caller's.
+    pub fn drop_column(&mut self, stored: &str) {
+        self.names.remove(stored);
+        self.dropped.push(stored.to_string());
+    }
+
+    /// ALTER COLUMN … TYPE that widens it: its Arrow type from now on.
+    pub fn retype_column(&mut self, stored: &str, dtype: String) {
+        if let Some(c) = self.columns.iter_mut().find(|(c, _)| c == stored) {
+            c.1 = dtype;
+        }
+    }
+
+    /// The type a text column is held as (a uuid, JSON, a length: `types.rs`), or none: as text, its enum gone too.
+    pub fn hold_column(&mut self, stored: &str, held: Option<String>) {
+        match held {
+            Some(t) => _ = self.sql_types.insert(stored.to_string(), t),
+            None => {
+                self.sql_types.remove(stored);
+                self.enums.remove(stored);
+            }
+        }
+    }
+
+    /// SQL's order of the live columns, by stored name: kept only when it isn't the stored order (or its start), so a
+    /// table whose columns are back in stored order keeps nothing and pays nothing (`moved`).
+    pub fn set_order(&mut self, stored: Vec<String>) {
+        let as_stored: Vec<&str> = self.live().map(|(s, _, _)| s).filter(|s| *s != "_deleted").collect();
+        self.shown = match as_stored.starts_with(&stored.iter().map(String::as_str).collect::<Vec<_>>()) {
+            true => vec![],
+            false => stored,
+        };
+    }
+
+    /// SET or DROP DEFAULT.
+    pub fn set_default(&mut self, stored: &str, expr: Option<String>) {
+        match expr {
+            Some(e) => _ = self.defaults.insert(stored.to_string(), e),
+            None => _ = self.defaults.remove(stored),
+        }
+    }
+
+    /// SET or DROP NOT NULL.
+    pub fn set_not_null(&mut self, stored: &str, not_null: bool) {
+        self.not_null.retain(|c| c != stored);
+        if not_null {
+            self.not_null.push(stored.to_string());
+        }
+    }
+
+    /// The table of `of`'s replaced rows (`sys::deleted`) takes its columns: the same list, `_old_version` after it.
+    pub fn follow_columns(&mut self, of: &TableMeta) {
+        self.columns = of.columns.iter().cloned().chain([("_old_version".to_string(), "Int64".to_string())]).collect();
+        (self.names, self.dropped) = (of.names.clone(), of.dropped.clone());
+    }
+
     /// The table a write's rules see (`rules::Table`), made from the rule fields alone: never `files` or the
     /// statistics. Each column SQL sees (`live`, the one mapping of stored names to SQL's) takes its rules by its
     /// stored name, as the entry keeps them.
@@ -3910,6 +3998,124 @@ mod tests {
         assert!(Arc::ptr_eq(&a.cols(), &a.cols()), "made once per parse");
         assert_eq!(*a.cols(), a.column_list());
         assert!((*a).clone().column_memo.get().is_none(), "a clone's memo is empty");
+    }
+
+    /// The column edits (piece 6a) leave the entry as the field edits they replace did, over random sequences of ADD,
+    /// RENAME, DROP, a type, a held type, a default, NOT NULL and a move: the same record, byte for byte.
+    #[test]
+    fn the_column_edits_leave_the_entry_as_the_field_edits_did() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n.max(1)
+        };
+        for _ in 0..500 {
+            let (mut a, mut b) = (TableMeta::default(), TableMeta::default());
+            for _ in 0..12 {
+                let live: Vec<String> = a.live().map(|(s, _, _)| s.to_string()).collect();
+                let pick = |i: u64| live.get(i as usize).cloned();
+                match next(8) {
+                    0 => {
+                        // (ADD COLUMN: as write.rs did it)
+                        let name = format!("c{}", next(4));
+                        if a.live().any(|(_, n, _)| n == name) {
+                            continue;
+                        }
+                        let held = (next(3) == 0).then(|| "uuid".to_string());
+                        a.add_column(&name, "Utf8", held.clone(), None);
+                        let taken = |s: &str| b.columns.iter().any(|(n, _)| n == s);
+                        let s = (1..).map(|i| if i == 1 { name.clone() } else { format!("{name}~{i}") }).find(|s| !taken(s)).unwrap();
+                        if s != name {
+                            b.names.insert(s.clone(), name.clone());
+                        }
+                        if let Some(t) = held {
+                            b.sql_types.insert(s.clone(), t);
+                        }
+                        b.columns.push((s, "Utf8".into()));
+                    }
+                    1 => {
+                        let (Some(s), to) = (pick(next(live.len() as u64)), format!("r{}", next(4))) else { continue };
+                        if a.live().any(|(_, n, _)| n == to) {
+                            continue;
+                        }
+                        a.rename_column(&s, &to);
+                        match to == s {
+                            true => b.names.remove(&s),
+                            false => b.names.insert(s.clone(), to),
+                        };
+                    }
+                    2 => {
+                        let Some(s) = pick(next(live.len() as u64)).filter(|_| live.len() > 1) else { continue };
+                        a.drop_column(&s);
+                        b.names.remove(&s);
+                        b.dropped.push(s);
+                    }
+                    3 => {
+                        let Some(s) = pick(next(live.len() as u64)) else { continue };
+                        a.retype_column(&s, "LargeUtf8".into());
+                        let at = b.columns.iter().position(|(c, _)| *c == s).unwrap();
+                        b.columns[at].1 = "LargeUtf8".into();
+                    }
+                    4 => {
+                        let Some(s) = pick(next(live.len() as u64)) else { continue };
+                        match next(2) {
+                            0 => {
+                                a.hold_column(&s, Some("varchar(9)".into()));
+                                b.sql_types.insert(s, "varchar(9)".into());
+                            }
+                            _ => {
+                                a.hold_column(&s, None);
+                                b.sql_types.remove(&s);
+                                b.enums.remove(&s);
+                            }
+                        }
+                    }
+                    5 => {
+                        let Some(s) = pick(next(live.len() as u64)) else { continue };
+                        match next(2) {
+                            0 => {
+                                a.set_default(&s, Some("'x'".into()));
+                                b.defaults.insert(s, "'x'".into());
+                            }
+                            _ => {
+                                a.set_default(&s, None);
+                                b.defaults.remove(&s);
+                            }
+                        }
+                    }
+                    6 => {
+                        // (SET NOT NULL only on a column that isn't: defaults.rs refuses the rest by the rows it finds)
+                        let Some(s) = pick(next(live.len() as u64)) else { continue };
+                        match b.not_null.contains(&s) {
+                            false => {
+                                a.set_not_null(&s, true);
+                                b.not_null.push(s);
+                            }
+                            true => {
+                                a.set_not_null(&s, false);
+                                b.not_null.retain(|c| *c != s);
+                            }
+                        }
+                    }
+                    _ => {
+                        // (a move: every live column in a random order, as ddl.rs's `place_column` gives it)
+                        let mut order = live.clone();
+                        for i in (1..order.len()).rev() {
+                            order.swap(i, next(i as u64 + 1) as usize);
+                        }
+                        a.set_order(order.clone());
+                        b.shown = if order == live { vec![] } else { order };
+                    }
+                }
+                assert_eq!(json(&a), json(&b), "{:?}", a.columns);
+            }
+            let mut d = TableMeta::default();
+            d.follow_columns(&a);
+            assert_eq!(d.columns.last().map(|(c, _)| c.as_str()), Some("_old_version"));
+            assert_eq!((d.names.clone(), d.dropped.clone(), d.columns.len()), (a.names.clone(), a.dropped.clone(), a.columns.len() + 1));
+        }
     }
 
     /// `past_ttl` keeps out what `ttl_sql` does: a timestamp older than the TTL's seconds, a NULL, a row without the column.

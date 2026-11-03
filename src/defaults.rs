@@ -90,17 +90,17 @@ pub async fn alter(lake: &Lake, table: &str, column: &str, change: Change) -> Re
     ensure!(!m.identity.contains_key(&stored), "{column} is an identity column: its values come from its sequence, not a DEFAULT or NULL");
     match change {
         Change::Default(None) => {
-            m.defaults.remove(&stored); // (none there is no error)
+            m.set_default(&stored, None); // (none there is no error)
         }
         Change::Default(Some(expr)) => {
             let sql_type = m.columns.iter().find(|(c, _)| *c == stored).map(|(_, t)| t.clone()).unwrap_or_default();
             validate(column, &sql_type, &expr).await?;
             crate::seq::named_exist(lake, &expr).await?; // (DEFAULT nextval('s'): s is there)
-            m.defaults.insert(stored.clone(), expr);
+            m.set_default(&stored, Some(expr));
         }
         Change::NotNull(false) => {
             ensure!(!m.key.contains(&stored), "{column} is {table}'s key: a key is never NULL");
-            m.not_null.retain(|c| *c != stored);
+            m.set_not_null(&stored, false);
         }
         Change::NotNull(true) => return set_not_null(lake, table, column, &stored, m).await,
         _ => unreachable!("alter_column sends only defaults and NOT NULL here (ddl.rs)"),
@@ -114,7 +114,7 @@ pub async fn alter(lake: &Lake, table: &str, column: &str, change: Change) -> Re
 /// rows there are counted, and a NULL among them puts the entry back and refuses.
 async fn set_not_null(lake: &Lake, table: &str, column: &str, stored: &str, mut m: TableMeta) -> Result<Value> {
     let (key, before) = (crate::store::table_key(table), m.clone());
-    m.not_null.push(stored.to_string());
+    m.set_not_null(stored, true);
     lake.cat.commit(vec![(key.clone(), crate::store::json(&m))], &[]).await?;
     if let Some(to) = lake.to.get() {
         to.block().await?; // (a flush through the sequencer: those before it are in)
