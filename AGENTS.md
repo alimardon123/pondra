@@ -2511,9 +2511,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 
 371. **What 1.0 keeps is a file the build checks** (`docs/surface.json`, `tools/surface.py` in
    `build.yml`'s suite; ADR-068). The command line, HTTP routes, SQL functions and system tables,
-   SQLSTATEs, kinds, metrics and the clients' names are read from the build. Until the freeze the
-   check reports. From `--write --promise` on, a name added fails until the file lists it, and a
-   name gone fails, unless it was deprecated and the release is a new major.
+   SQLSTATEs, kinds, metrics and the clients' names are read from the build. Until 1.0 the check
+   reports (0.80.0 promises no compatibility: the owner, 11-02). From `--write --promise` on, a
+   name added fails until the file lists it, and a name gone fails, unless it was deprecated and
+   the release is a new major.
 
 372. **An open node answers no page from another site, and no name rebound to it**
    (`auth::cross_site`, in `server::guard` and the folder server's `plain`). With no token and no
@@ -3880,8 +3881,20 @@ Good next moves: `docs/roadmap.md` (2026-10-11) is one month to the 11-11 releas
 ("high quality, stable, workable, fully featured"): nine lanes side by side, each a thread that owns
 its files (engine and proof; in-process and the browser; the Postgres port; sources and outside
 catalogs; measures, the ontology and AI; SQL; durability and shipping; the console; the docs), a
-feature freeze on 10-31, a review week, then a release candidate under the soak. Edit only your
-lane's files (the project's `designs/one-month-to-1-0.md` lists them and each lane's numbers).
+feature freeze (the owner called it on 11-03), the from-scratch review, then a release candidate
+under the soak. Edit only your lane's files (the project's `designs/one-month-to-1-0.md` lists
+them and each lane's numbers).
+
+**Under the freeze** (the owner, 11-03 10:25 UTC, until 0.80.0 ships on 11-11), only these merge:
+- a fix for a wrong answer, lost or exposed data, or a crash or hang;
+- an rc.1 blocker: a gate, the soak or the upgrade check failing, or the release itself (the
+  version, the release notes, the installers, the upgrade guide).
+
+Nothing else merges, however small: no feature, speed work, refactor or new spelling. Keep work in
+flight as a patch under the project's `<lane>-wip/` folder, with a line on where it stands. A fix's
+PR says which of the two kinds it is, and it still proves that no other answer changes and no
+query is slower. The from-scratch redesign (`designs/one-state-every-format.md`) is planned beside
+the freeze; its code lands after 0.80.0.
 
 ## Conventions
 
