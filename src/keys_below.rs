@@ -211,7 +211,7 @@ pub struct KeysBelow;
 
 impl PhysicalOptimizerRule for KeysBelow {
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
-        if !config.optimizer.enable_join_dynamic_filter_pushdown || spread(&plan)? {
+        if !config.optimizer.enable_join_dynamic_filter_pushdown || crate::optimize::spread(&plan)? {
             return Ok(plan);
         }
         plan.transform_up(|p| {
@@ -300,11 +300,6 @@ impl PhysicalOptimizerRule for KeysUnused {
     fn schema_check(&self) -> bool {
         true
     }
-}
-
-/// A spread query's slices (`EarlyProbes` leaves them alone too).
-fn spread(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
-    plan.exists(|p| Ok(matches!(p.name(), "ShareExec" | "WholeExec")))
 }
 
 #[cfg(test)]

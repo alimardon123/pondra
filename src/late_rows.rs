@@ -41,8 +41,7 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// The fewest columns a scan has for its top-N to read them late (as `optimize::WideTopN`'s).
-const WIDE: usize = 16;
+use crate::optimize::WIDE; // (the fewest columns a scan has for its top-N to read them late)
 /// The most rows a top-N keeps for them to be read again one by one: each costs a page of every column.
 const MOST: usize = 100;
 /// The files read at once for the rows: each holds a page of every column while it is read.
