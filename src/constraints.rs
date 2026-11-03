@@ -149,7 +149,7 @@ pub async fn key_check_over(lake: &Lake, table: &str, meta: &TableMeta, new: &Re
 /// keys as a table of their own, so the files' key ranges prune. Returns the first key held, as Postgres's
 /// DETAIL writes it.
 pub async fn held(lake: &Lake, table: &str, meta: &TableMeta, keys: &RecordBatch) -> Result<Option<String>> {
-    let point = meta.ids && meta.order.is_none() && keys.num_rows() <= 1000 && meta.key.iter().all(|k| meta.columns.iter().any(|(c, t)| c == k && is_point_type(t)));
+    let point = meta.ids && meta.order.is_none() && keys.num_rows() <= 1000 && meta.key.iter().all(|k| meta.columns().iter().any(|(c, t)| c == k && is_point_type(t)));
     if point {
         for i in 0..keys.num_rows() {
             let values = keys.columns().iter().map(|c| datafusion::arrow::util::display::array_value_to_string(c, i)).collect::<std::result::Result<Vec<_>, _>>()?;
@@ -488,12 +488,7 @@ mod tests {
     #[tokio::test]
     async fn a_key_shape_found_once_is_not_looked_for_again() -> Result<()> {
         let (dir, lake) = fresh().await?;
-        let meta = TableMeta {
-            columns: vec![("id".into(), "Int64".into()), ("v".into(), "Utf8".into())],
-            key: vec!["id".into()],
-            ids: true,
-            ..Default::default()
-        };
+        let meta = { let mut entry = TableMeta::with_columns(vec![("id".into(), "Int64".into()), ("v".into(), "Utf8".into())]); entry.key = vec!["id".into()]; entry.ids = true; entry };
         let rows = |ids: Vec<i64>| -> Result<RecordBatch> {
             let n = ids.len();
             let v: ArrayRef = Arc::new(StringArray::from(vec!["x"; n]));

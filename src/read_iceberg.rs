@@ -117,7 +117,7 @@ pub async fn resolve_metadata(lake: &Lake, url: &str, at: &str, meta: &Value, op
     let location = meta["location"].as_str().unwrap_or_default().trim_end_matches('/').to_string();
     let moved = options.get("allow_moved_paths").is_some_and(|v| v == "true");
     let place = |p: &str| if moved && !location.is_empty() && p.starts_with(&location) { format!("{url}{}", &p[location.len()..]) } else { p.to_string() };
-    let mut out = TableMeta { columns: columns.iter().map(|(n, _, t)| (n.clone(), crate::answer::type_name(t))).collect(), ..Default::default() };
+    let mut out = TableMeta::with_columns(columns.iter().map(|(n, _, t)| (n.clone(), crate::answer::type_name(t))).collect());
     out.outside = Some(crate::scan::Table { field_ids: columns.iter().map(|(n, id, _)| (n.clone(), *id)).collect(), name_mapping: meta["properties"]["schema.name-mapping.default"].as_str().map(str::to_string) });
     let Some(snapshot) = snapshot(meta, options)? else { return Ok(out) }; // (no snapshot yet: no rows)
     // (the manifest list and the manifests are named by the table's metadata, wherever it likes: each is the caller's to

@@ -86,7 +86,7 @@ async fn shown_as_stored(lake: &Lake, name: &str, m: &TableMeta, sql: &[String],
     ensure!(sorted.0 == sorted.1, "{name}'s columns in SQL's order name each of its columns once: {}", sql.join(", "));
     let mut then = m.clone();
     then.set_order(stored);
-    let shown = then.shown.clone();
+    let shown = then.shown().to_vec();
     let was: Vec<(String, String)> = m.star().into_iter().filter(|(c, _)| !added.contains(c)).collect();
     let now = then.star();
     if now == was {
@@ -193,7 +193,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 i.sequence = crate::seq::owned(lake, owner, c, [vec![crate::seq::Opt::As(as_type.into())], i.declared.clone()].concat()).await?;
                 defaults.insert(c.clone(), crate::rules::create::identity_default(&i.sequence));
             }
-            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, sql_types, folder, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), made_by, ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
+            { let mut entry = TableMeta::made(crate::store::Made { columns, not_null, defaults, identity, enums, sql_types, ..Default::default() }); entry.key = key; entry.merge = merge; entry.publish = publish.unwrap_or_else(default_publish); entry.cluster = cluster.unwrap_or_default(); entry.ttl = ttl; entry.partition = partition; entry.order = order; entry.checks = checks; entry.constraints = constraints; entry.folder = folder; entry.tiered = lake.visible(); entry.made = Some((lake.visible(), crate::log::now_ms())); entry.made_by = made_by; entry.ids = true; entry.properties = properties.unwrap_or_default(); entry.retention_secs = retention; entry }
         }
         Some(mut m) => {
             // (a CREATE TABLE … AS SELECT's definition is sent again only under the job that made the table: the same
@@ -207,8 +207,8 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             ensure!(partition.is_none() || partition == l.partition, "{name}'s partition_by can't change");
             // Sent again: columns may only grow at the end (ALTER TABLE … ADD COLUMN; a re-sent
             // original definition is fine), and `publish` may change.
-            let (old, new) = (l.columns.len(), columns.len());
-            ensure!(columns[..new.min(old)] == l.columns[..new.min(old)], "{name} exists with other columns (only new ones can be added, at the end)");
+            let (old, new) = (l.columns().len(), columns.len());
+            ensure!(columns[..new.min(old)] == l.columns()[..new.min(old)], "{name} exists with other columns (only new ones can be added, at the end)");
             let republish = publish.as_ref().is_some_and(|p| *p != m.publish);
             // (Delta and Iceberg name a table's files under its folder; a clone lists others': ADR-043)
             ensure!(!republish || m.shares.is_empty() || publish.as_ref().is_some_and(|p| p.is_empty()), "{name} is a clone, whose files are partly another table's: it can't be published (CREATE TABLE … AS SELECT * FROM {name} copies it)");
@@ -1033,17 +1033,17 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
     let table = stmt.table();
     let m: TableMeta = (*lake.table_meta(&table).await?).clone().logical(); // (as SQL names it)
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
-    let mut spec = j!({"columns": m.columns, "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": m.not_null, "defaults": m.defaults, "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds"))});
+    let mut spec = j!({"columns": m.columns(), "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": m.not_null(), "defaults": m.defaults(), "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds"))});
     match stmt {
         Stmt::AddColumn(_, column, sql_type, if_not_exists, place) => {
-            if m.columns.iter().any(|(c, _)| c == column) {
+            if m.columns().iter().any(|(c, _)| c == column) {
                 ensure!(*if_not_exists, crate::rules::alter::has_column(&table, column));
                 return Ok(None);
             }
             if let Some(place) = place {
                 // (where SQL lists it, sent with it: one commit, `create_table`'s `shown`)
                 if let crate::ddl::Place::After(b) = place {
-                    ensure!(m.columns.iter().any(|(c, _)| c == b) && b != "_deleted", crate::rules::alter::no_column(&table, b));
+                    ensure!(m.columns().iter().any(|(c, _)| c == b) && b != "_deleted", crate::rules::alter::no_column(&table, b));
                 }
                 let order: Vec<String> = m.sql_names();
                 spec["shown"] = j!(place.put(&order, column).map_err(|e| crate::codes::coded("42P10", e))?);
@@ -1060,7 +1060,7 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
             };
             let sql_type = if enumerated.is_some() || held.is_some() { "VARCHAR" } else { sql_type }; // (an enum, a uuid or a VARCHAR(n) column holds text)
             ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
-            let mut columns = m.columns.clone();
+            let mut columns = m.columns().to_vec();
             columns.push((column.to_string(), crate::answer::type_name(ctx.table("t").await?.schema().field(0).data_type())));
             spec["columns"] = j!(columns);
             if let Some(e) = enumerated {
@@ -1097,16 +1097,16 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
     let q = |c: &str| format!("\"{c}\"");
     // (a changed row keeps its `_row_id` and `_created_at`: `sys.rs`)
     let select = |pick: &dyn Fn(&str) -> String, table: &str, cond: &Option<String>| {
-        let cols = meta.columns.iter().map(|(c, _)| format!("{} AS {}", pick(c), q(c))).collect::<Vec<_>>().join(", ");
+        let cols = meta.columns().iter().map(|(c, _)| format!("{} AS {}", pick(c), q(c))).collect::<Vec<_>>().join(", ");
         format!("SELECT {cols}, \"_row_id\", \"_created_at\" FROM {} {}", sql_name(table), cond.as_ref().map(|w| format!("WHERE {w}")).unwrap_or_default())
     };
-    let deletes = meta.columns.iter().any(|(c, _)| c == "_deleted");
+    let deletes = meta.columns().iter().any(|(c, _)| c == "_deleted");
     ensure!(matches!(stmt, Stmt::Insert(..)) || !meta.key.is_empty(), "UPDATE and DELETE need a keyed table (append tables only take INSERTs)");
     match stmt {
         Stmt::Insert(_, query) => Ok(query.clone()),
         Stmt::Update(t, set, cond) => {
             if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", "merge tables combine rows per key: INSERT into them instead of UPDATE")); }
-            ensure!(set.iter().all(|(c, _)| !meta.key.contains(c) && meta.columns.iter().any(|(n, _)| n == c)), "UPDATE sets existing non-key columns");
+            ensure!(set.iter().all(|(c, _)| !meta.key.contains(c) && meta.columns().iter().any(|(n, _)| n == c)), "UPDATE sets existing non-key columns");
             let pick = |c: &str| match set.iter().find(|(s, _)| s == c) {
                 Some((_, e)) => format!("({})", crate::rules::rows::value(meta, c, e)),
                 None => q(c), // (`_deleted` too: an updated row keeps its own, as `change::select_as` does)
@@ -1138,7 +1138,7 @@ pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, na
     let order = crate::rules::rows::row_columns(meta.sql_order(), names); // (SQL's order: what a row without a column list gives, first to last)
     let names = if names.is_empty() { implicit(&order, crate::rules::rows::rows_width(query)) } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: the columns its rows give)
     let default = |c: &str| crate::rules::rows::default_sql(meta, c);
-    if meta.defaults.values().any(|d| crate::seq::calls(d)) && crate::rules::rows::plain_values(query).is_some() {
+    if meta.defaults().values().any(|d| crate::seq::calls(d)) && crate::rules::rows::plain_values(query).is_some() {
         // (`nextval` in rows of VALUES: taken here, in the rows' order: `seq::taken`)
         let used = std::cell::RefCell::new(vec![]);
         crate::rules::rows::rows_for(table, &columns, names, query, &|c| default(c).inspect(|d| used.borrow_mut().push(d.clone())))?;
@@ -1386,7 +1386,7 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
     let null = || datafusion::prelude::lit(datafusion::scalar::ScalarValue::Null);
     // (a column the query leaves out: its DEFAULT, else NULL)
     let default = |stored: &str| -> Result<Expr> {
-        match meta.as_ref().and_then(|m| m.defaults.get(stored)) {
+        match meta.as_ref().and_then(|m| m.defaults().get(stored)) {
             Some(e) => Ok(ctx.parse_sql_expr(e, df.schema())?),
             None => Ok(null()),
         }
@@ -1457,7 +1457,7 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
     if lake.cat.get::<u64>(&producer_key(&format!("job:{}", f.job))).await?.is_some() {
         return Ok(j!({"duplicate": true})); // the same job finished concurrently
     }
-    let new = TableMeta { columns: f.columns.clone(), publish: default_publish(), ids: true, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), ..Default::default() }; // (a table `POST /insert/{t}` makes starts at the log's end, as CREATE TABLE's does; SQL's INSERT needs one already: `is_there`)
+    let new = { let mut entry = TableMeta::with_columns(f.columns.clone()); entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry.made = Some((lake.visible(), crate::log::now_ms())); entry }; // (a table `POST /insert/{t}` makes starts at the log's end, as CREATE TABLE's does; SQL's INSERT needs one already: `is_there`)
     let meta = lake.cat.get::<TableMeta>(&table_key(&f.table)).await?.unwrap_or_else(|| new.clone());
     // Types as the lake stores them, so a writer may name them its own way (`Utf8View`, `VARIANT`).
     let types = |c: &[(String, String)]| c.iter().map(|(_, t)| crate::answer::dtype(t).map(|t| crate::answer::type_name(&t)).unwrap_or_else(|_| t.clone())).collect::<Vec<_>>();
@@ -2134,7 +2134,7 @@ pub(crate) async fn identity(lake: &Lake, stmt: &Stmt) -> Result<()> {
     // (a name not in a lake here, say an outside catalog's table: its own path takes it)
     let Ok((other, name)) = crate::ddl::resolve(lake, &table).await else { return Ok(()) };
     let Some(meta) = other.as_deref().unwrap_or(lake).cat.meta(&table_key(&name)).await? else { return Ok(()) }; // (as parsed once a version: `rules` is the memo)
-    if !meta.identity.values().any(|i| i.always) {
+    if !meta.identity().values().any(|i| i.always) {
         return Ok(());
     }
     let t = meta.rules()?;
@@ -2733,16 +2733,7 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("pondra-shaped-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
-        let meta = TableMeta {
-            columns: vec![("id".into(), "Int64".into()), ("n".into(), "Int32".into()), ("j".into(), "Utf8".into()), ("d".into(), "Utf8".into())],
-            key: vec!["id".into()],
-            not_null: vec!["id".into(), "n".into()],
-            checks: vec![("t_n_check".into(), "n >= 0".into())],
-            defaults: [("d".to_string(), "'x'".to_string())].into(),
-            sql_types: [("j".to_string(), "jsonb".to_string())].into(),
-            ids: true,
-            ..Default::default()
-        };
+        let meta = { let mut entry = TableMeta::made(crate::store::Made { columns: vec![("id".into(), "Int64".into()), ("n".into(), "Int32".into()), ("j".into(), "Utf8".into()), ("d".into(), "Utf8".into())], not_null: vec!["id".into(), "n".into()], defaults: [("d".to_string(), "'x'".to_string())].into(), sql_types: [("j".to_string(), "jsonb".to_string())].into(), ..Default::default() }); entry.key = vec!["id".into()]; entry.checks = vec![("t_n_check".into(), "n >= 0".into())]; entry.ids = true; entry };
         let t = Arc::new(meta.to_rules()?);
         let one = of(&lake, &t, r#"VALUES (1, 5, '{"b":1,"a":2}')"#, How::Insert).await?;
         assert_eq!(one.rows().num_rows(), 1);

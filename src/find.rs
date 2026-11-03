@@ -107,7 +107,7 @@ async fn stored_parts(l: &Lake, o: &Object, partial: Option<&HashSet<String>>) -
     let d = meta.described();
     let comments = column_comments(l, &local).await?;
     let mut out = vec![];
-    for (name, ty) in &d.columns {
+    for (name, ty) in d.columns() {
         if d.marker(name) {
             continue; // (a keyed table's `_deleted` is the table's own, not a column)
         }

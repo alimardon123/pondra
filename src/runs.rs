@@ -53,7 +53,7 @@ fn columns() -> Vec<(String, String)> {
 pub async fn create_log(lake: &Lake) -> Result<serde_json::Value> {
     if lake.cat.get::<TableMeta>(&table_key(TABLE)).await?.is_none() {
         let days: u64 = crate::env::value("PONDRA_RUNS_DAYS");
-        let meta = TableMeta { columns: columns(), key: vec!["id".into()], ttl: Some(("started".into(), days * 86400)), tiered: lake.visible(), ids: true, ..Default::default() };
+        let meta = { let mut entry = TableMeta::with_columns(columns()); entry.key = vec!["id".into()]; entry.ttl = Some(("started".into(), days * 86400)); entry.tiered = lake.visible(); entry.ids = true; entry };
         lake.cat.commit(vec![(table_key(TABLE), json(&meta))], &[]).await?;
     }
     Ok(serde_json::json!({"table": "pondra.runs"}))

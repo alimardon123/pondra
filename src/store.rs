@@ -54,10 +54,25 @@ impl std::fmt::Display for Changed {
 }
 impl std::error::Error for Changed {}
 
+/// A table's columns as it is made (`TableMeta::made`): the entry keeps them as its own, so a writer outside store.rs
+/// hands them over here, or edits them through the column edits (`TableMeta::add_column` and the rest). By stored name.
+#[derive(Default)]
+pub struct Made {
+    pub columns: Vec<(String, String)>,
+    pub names: BTreeMap<String, String>,
+    pub dropped: Vec<String>,
+    pub shown: Vec<String>,
+    pub not_null: Vec<String>,
+    pub defaults: BTreeMap<String, String>,
+    pub identity: BTreeMap<String, crate::seq::Identity>,
+    pub enums: BTreeMap<String, crate::types::Enum>,
+    pub sql_types: BTreeMap<String, String>,
+}
+
 /// A table: columns, the Parquet files already tiered, and the last log segment they cover.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct TableMeta {
-    pub columns: Vec<(String, String)>, // (name, Arrow type such as "Int64" or "Utf8")
+    columns: Vec<(String, String)>, // (name, Arrow type such as "Int64" or "Utf8")
     #[serde(default)]
     pub key: Vec<String>, // primary key: non-empty = upsert table (latest row per key wins)
     #[serde(default)]
@@ -108,16 +123,16 @@ pub struct TableMeta {
     /// Columns renamed since they were first written: the name in the files and the log (what
     /// `columns` says) -> the name SQL knows it by. Files are never rewritten for a rename.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub names: BTreeMap<String, String>,
+    names: BTreeMap<String, String>,
     /// Columns dropped (their stored names): older files still hold them; nothing reads them again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dropped: Vec<String>,
+    dropped: Vec<String>,
     /// The order SQL lists the columns in, by stored name (`ALTER COLUMN c AFTER b`, `ADD COLUMN … FIRST`); the columns
     /// it leaves out follow in their stored order, so a column added later comes last. Empty: as stored. Storage keeps
     /// `columns`' order (a file's field ids are places in it), and so does everything under SQL: this is SQL's order only,
     /// for `SELECT *`, an INSERT without a column list, `SHOW CREATE` and the catalogs (`in_order`, `sql_order`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub shown: Vec<String>,
+    shown: Vec<String>,
     /// Where its files, manifests and Delta and Iceberg copies are: `data/{folder}/`. None: its
     /// name, as for every table before round 26; a renamed table keeps the folder it had
     /// (`ALTER TABLE … RENAME TO`, ADR-030).
@@ -126,11 +141,11 @@ pub struct TableMeta {
     /// Columns a write must give a value (`NOT NULL`; a key's columns are too, for tables made
     /// from round 26 on), by stored name (`defaults.rs`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub not_null: Vec<String>,
+    not_null: Vec<String>,
     /// A column's value when a write leaves it out (`DEFAULT expr`): stored name -> the SQL
     /// expression, worked out for each row as it is written (`defaults.rs`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub defaults: BTreeMap<String, String>,
+    defaults: BTreeMap<String, String>,
     /// `CHECK` constraints (ADR-036 §3): (name, condition over the columns by their SQL names),
     /// which every row written must not make false (`defaults.rs`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -138,7 +153,7 @@ pub struct TableMeta {
     /// Identity columns (by stored name): each numbered by a sequence it owns, which its default
     /// calls (`seq.rs`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub identity: BTreeMap<String, crate::seq::Identity>,
+    identity: BTreeMap<String, crate::seq::Identity>,
     /// UNIQUE, and PRIMARY KEY and FOREIGN KEY said NOT ENFORCED, by stored column names
     /// (`constraints.rs`, ADR-057): an enforced UNIQUE has every write checked on the leader.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -146,11 +161,11 @@ pub struct TableMeta {
     /// Enum columns, by stored name: their labels, and the type they are of (`types.rs`). Every
     /// door refuses a value its column's labels don't list.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub enums: BTreeMap<String, crate::types::Enum>,
+    enums: BTreeMap<String, crate::types::Enum>,
     /// Columns that hold text but are of another SQL type, by stored name: "uuid", "json", "jsonb", "varchar(n)"
     /// (`types.rs`). Every door refuses a value that isn't one of the type's, written its one way.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub sql_types: BTreeMap<String, String>,
+    sql_types: BTreeMap<String, String>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ext: Option<crate::ext_names::Spec>,
@@ -206,6 +221,51 @@ impl TableMeta {
     /// Is this column an upsert table's delete markers (`_deleted`)? Others never see it: published,
     /// its rows are positions (`tier::shadow`), and Iceberg keeps the name for its own.
     pub fn marker(&self, column: &str) -> bool { column == "_deleted" && !self.key.is_empty() }
+
+    // The column fields are this file's own (redesign 1b, piece 6b): a reader outside it reads them through these, and
+    // a writer through the column edits below (`add_column` and the rest), so the entry can keep them in either shape.
+
+    /// Every column the entry keeps, dropped ones too, as (stored name, Arrow type text), in stored order: a file's
+    /// schema. SQL's view of them is `sql_columns`, `star` or the list (`cols`).
+    pub fn columns(&self) -> &[(String, String)] { &self.columns }
+    /// The stored columns, taken out of an entry made for the purpose (`described`, `with_sys`).
+    pub fn into_columns(self) -> Vec<(String, String)> { self.columns }
+
+    /// Renamed columns: stored name to SQL's (`name_of` for one).
+    pub fn names(&self) -> &BTreeMap<String, String> { &self.names }
+
+    /// Dropped columns, by stored name (`is_dropped` for one).
+    pub fn dropped(&self) -> &[String] { &self.dropped }
+
+    /// SQL's order of the live columns by stored name when it isn't the stored one (`set_order`), else empty: what
+    /// `moved`, `sql_order` and the list read.
+    pub fn shown(&self) -> &[String] { &self.shown }
+
+    /// The NOT NULL columns, by stored name.
+    pub fn not_null(&self) -> &[String] { &self.not_null }
+
+    /// Each column's DEFAULT, by stored name.
+    pub fn defaults(&self) -> &BTreeMap<String, String> { &self.defaults }
+
+    /// The identity columns, by stored name.
+    pub fn identity(&self) -> &BTreeMap<String, crate::seq::Identity> { &self.identity }
+
+    /// The enum columns, by stored name.
+    pub fn enums(&self) -> &BTreeMap<String, crate::types::Enum> { &self.enums }
+
+    /// The types text columns are held as (uuid, JSON, a length: `types.rs`), by stored name.
+    pub fn sql_types(&self) -> &BTreeMap<String, String> { &self.sql_types }
+
+    /// An entry with these columns (stored name, Arrow type text) in stored order and nothing else: a table being made,
+    /// or a test's. The rest is set on it as on any entry (its fields, and the column edits).
+    pub fn with_columns(columns: Vec<(String, String)>) -> TableMeta { TableMeta { columns, ..Default::default() } }
+
+    /// An entry with these columns and their facts, and nothing else: a table being made (`Made`'s fields, by stored
+    /// name). The rest is set on it as on any entry.
+    pub fn made(c: Made) -> TableMeta {
+        let Made { columns, names, dropped, shown, not_null, defaults, identity, enums, sql_types } = c;
+        TableMeta { columns, names, dropped, shown, not_null, defaults, identity, enums, sql_types, ..Default::default() }
+    }
 
     /// Is this column (by the names its entry uses) a uuid, held as text (`types.rs`)?
     pub fn uuid(&self, column: &str) -> bool { self.sql_types.get(column).is_some_and(|t| t == "uuid") }
@@ -429,6 +489,16 @@ impl TableMeta {
             self.not_null.push(stored.to_string());
         }
     }
+
+    /// An enum type changed (ALTER TYPE … ADD VALUE or RENAME, `types.rs`): every column of this table of that type
+    /// takes it, in the same commit.
+    pub fn edit_enums(&mut self, of: &str, mut f: impl FnMut(&mut crate::types::Enum)) {
+        self.enums.values_mut().filter(|e| e.of.as_deref() == Some(of)).for_each(&mut f);
+    }
+
+    /// Columns kept as they are named (a system table's, `sys::with_sys`'s system columns), after the others: no
+    /// renamed or dropped column is stored under these names.
+    pub fn append_columns(&mut self, more: impl IntoIterator<Item = (String, String)>) { self.columns.extend(more); }
 
     /// The table of `of`'s replaced rows (`sys::deleted`) takes its columns: the same list, `_old_version` after it.
     pub fn follow_columns(&mut self, of: &TableMeta) {
@@ -4065,6 +4135,54 @@ mod tests {
         assert!(Arc::ptr_eq(&a.cols(), &a.cols()), "made once per parse");
         assert_eq!(*a.cols(), a.column_list());
         assert!((*a).clone().column_memo.get().is_none(), "a clone's memo is empty");
+    }
+
+    /// What decoding an entry and making its column list cost (redesign 1b, piece 6b's before and after): a wide table
+    /// (500 columns, renames, drops, a move, per-column facts and 200 files) and 2,000 small random ones. A measure, not a
+    /// check: `cargo test --release --lib entry_parse_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn entry_parse_time() {
+        let wide = {
+            let mut m = TableMeta { columns: (0..500).map(|i| (format!("column_{i}"), if i % 3 == 0 { "Int64" } else { "Utf8" }.to_string())).collect(), ..Default::default() };
+            for i in (0..500).step_by(10) {
+                m.names.insert(format!("column_{i}"), format!("renamed_{i}"));
+            }
+            m.dropped = (5..500).step_by(25).map(|i| format!("column_{i}")).collect();
+            m.shown = ["column_499", "column_1", "column_2"].map(String::from).to_vec();
+            m.not_null = (0..100).map(|i| format!("column_{i}")).collect();
+            m.defaults = (100..150).map(|i| (format!("column_{i}"), "'x'".to_string())).collect();
+            m.sql_types = (200..230).map(|i| (format!("column_{i}"), "uuid".to_string())).collect();
+            m.key = vec!["column_0".into()];
+            m.files = (0..200).map(|i| crate::data_file::DataFile { path: format!("data/t/{i:08}.parquet"), rows: 1000, bytes: 1 << 20, ..Default::default() }).collect();
+            json(&m)
+        };
+        let small: Vec<Vec<u8>> = (0..2000u64)
+            .map(|i| {
+                let n = 1 + (i % 8) as usize;
+                let mut m = TableMeta { columns: (0..n).map(|c| (format!("c{c}"), "Int64".to_string())).collect(), ..Default::default() };
+                if i % 3 == 0 {
+                    m.names.insert("c0".into(), "r0".into());
+                }
+                if i % 5 == 0 && n > 1 {
+                    m.dropped.push(format!("c{}", n - 1));
+                }
+                json(&m)
+            })
+            .collect();
+        let time = |what: &str, raws: &[&[u8]], rounds: u32| {
+            let t = std::time::Instant::now();
+            for _ in 0..rounds {
+                for r in raws {
+                    let m: TableMeta = serde_json::from_slice(r).unwrap();
+                    std::hint::black_box(m.column_list().len());
+                }
+            }
+            let each = t.elapsed().as_nanos() as f64 / (rounds as f64 * raws.len() as f64);
+            println!("{what}: {:.1} µs an entry, decoded and listed ({} bytes)", each / 1000.0, raws.iter().map(|r| r.len()).sum::<usize>() / raws.len());
+        };
+        time("wide (500 columns, 200 files)", &[&wide], 2000);
+        time("small (2,000 random)", &small.iter().map(Vec::as_slice).collect::<Vec<_>>(), 20);
     }
 
     /// The column edits (piece 6a) leave the entry as the field edits they replace did, over random sequences of ADD,

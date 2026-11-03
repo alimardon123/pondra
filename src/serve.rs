@@ -42,7 +42,7 @@ impl Groups {
 /// The newest row of `key` (comma-separated values, in key order) in upsert table `meta`, if it
 /// exists, isn't deleted and isn't past the table's TTL. Table metadata first, then the log: one consistent snapshot.
 pub async fn lookup(lake: &Lake, table: &str, meta: &TableMeta, key: &str) -> Result<Option<RecordBatch>> {
-    let types: HashMap<&str, &str> = meta.columns.iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
+    let types: HashMap<&str, &str> = meta.columns().iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
     let keys: Vec<(&str, ScalarValue)> = meta.key.iter().zip(key.split(',')).map(|(c, v)| {
         Ok((c.as_str(), ScalarValue::try_from_string(v.to_string(), &types[c.as_str()].parse()?)?))
     }).collect::<Result<_>>()?;
@@ -72,17 +72,17 @@ pub struct Point {
 impl Point {
     /// Its answer's columns.
     pub fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> {
-        let types: HashMap<&str, &str> = self.meta.columns.iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
+        let types: HashMap<&str, &str> = self.meta.columns().iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
         crate::answer::schema(&self.names.iter().map(|n| (n.clone(), types[n.as_str()].to_string())).collect::<Vec<_>>())
     }
 
     /// Which types its columns are (`pg_types`: a uuid, json or jsonb): its table's own, by name.
-    pub fn types(&self) -> Vec<Option<crate::pg_types::Ty>> { self.names.iter().map(|n| self.meta.sql_types.get(n).and_then(|t| crate::pg_types::Ty::of(t))).collect() }
+    pub fn types(&self) -> Vec<Option<crate::pg_types::Ty>> { self.names.iter().map(|n| self.meta.sql_types().get(n).and_then(|t| crate::pg_types::Ty::of(t))).collect() }
 
     /// Its parameters' types (`$1`…, in order), as the key columns they stand for.
     pub fn parameters(&self, sql: &str) -> Vec<datafusion::arrow::datatypes::DataType> {
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
-        let types: HashMap<&str, &str> = self.meta.columns.iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
+        let types: HashMap<&str, &str> = self.meta.columns().iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
         let mut out = vec![datafusion::arrow::datatypes::DataType::Utf8; n];
         for (k, v) in self.meta.key.iter().zip(&self.key) {
             if v.is_none() {
@@ -152,9 +152,9 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
     }
     let Some((key, params)) = key_of(&meta, filter) else { return Ok(None) };
     let names: Vec<String> = match s.projection.as_slice() {
-        [SelectItem::Wildcard(_)] => meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect(), // (as `SELECT *` shows it)
+        [SelectItem::Wildcard(_)] => meta.columns().iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect(), // (as `SELECT *` shows it)
         items => items.iter().map(|i| match i {
-            SelectItem::UnnamedExpr(Expr::Identifier(c)) if meta.columns.iter().any(|(n, _)| *n == c.value) => Some(c.value.clone()),
+            SelectItem::UnnamedExpr(Expr::Identifier(c)) if meta.columns().iter().any(|(n, _)| *n == c.value) => Some(c.value.clone()),
             _ => None,
         }).collect::<Option<_>>().unwrap_or_default(),
     };
@@ -174,7 +174,7 @@ fn pointable(meta: &TableMeta) -> bool {
 /// key order (None: a parameter, whose number the map gives). None: any other condition.
 fn key_of(meta: &TableMeta, filter: &datafusion::sql::sqlparser::ast::Expr) -> Option<(Vec<Option<String>>, HashMap<String, usize>)> {
     use datafusion::sql::sqlparser::ast::{BinaryOperator, DollarQuotedString, Expr, Value};
-    let text = |c: &str| meta.columns.iter().any(|(n, t)| n == c && t.contains("Utf8"));
+    let text = |c: &str| meta.columns().iter().any(|(n, t)| n == c && t.contains("Utf8"));
     let (mut eqs, mut params) = (vec![], HashMap::new());
     let mut stack = vec![filter];
     while let Some(e) = stack.pop() {
@@ -334,7 +334,7 @@ async fn newest_in_log(lake: &Lake, table: &str, meta: &TableMeta, keys: &[(&str
 pub async fn lookup_versioned(lake: &Lake, table: &str, meta: &TableMeta, key: &[String]) -> Result<Option<(RecordBatch, u64, Option<i64>)>> {
     use datafusion::arrow::array::AsArray;
     use datafusion::arrow::datatypes::{DataType, Int64Type, TimeUnit, TimestampMicrosecondType};
-    let types: HashMap<&str, &str> = meta.columns.iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
+    let types: HashMap<&str, &str> = meta.columns().iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
     let keys: Vec<(&str, ScalarValue)> = meta.key.iter().zip(key).map(|(c, v)| Ok((c.as_str(), ScalarValue::try_from_string(v.to_string(), &types[c.as_str()].parse()?)?))).collect::<Result<_>>()?;
     anyhow::ensure!(keys.len() == meta.key.len(), "the key of {table} has {} parts", meta.key.len());
     let created = |r: &RecordBatch| -> Result<Option<i64>> {
@@ -479,11 +479,7 @@ mod tests {
 
     #[test]
     fn a_writes_where_names_its_key_as_a_lookup_does() {
-        let meta = TableMeta {
-            columns: vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into()), ("v".into(), "Int64".into()), ("u".into(), "Utf8".into())],
-            key: vec!["a".into(), "b".into()],
-            ..Default::default()
-        };
+        let meta = { let mut entry = TableMeta::with_columns(vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into()), ("v".into(), "Int64".into()), ("u".into(), "Utf8".into())]); entry.key = vec!["a".into(), "b".into()]; entry };
         let key = |cond: &str| key_where(&meta, cond);
         let k = |a: &str, b: &str| Some(vec![a.to_string(), b.to_string()]);
         assert_eq!(key("a = 1 AND b = 'x'"), k("1", "x"));
@@ -501,9 +497,9 @@ mod tests {
             assert_eq!(key(other), None, "{other}");
         }
         assert_eq!(key("a = true AND b = 'x'"), k("true", "x"), "a boolean as before (its key's type converts it or SQL answers)");
-        let uuid = TableMeta { columns: vec![("u".into(), "Utf8".into())], key: vec!["u".into()], sql_types: [("u".to_string(), "uuid".to_string())].into(), ..Default::default() };
+        let uuid = { let mut entry = TableMeta::made(crate::store::Made { columns: vec![("u".into(), "Utf8".into())], sql_types: [("u".to_string(), "uuid".to_string())].into(), ..Default::default() }); entry.key = vec!["u".into()]; entry };
         assert_eq!(key_where(&uuid, "u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'"), Some(vec!["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11".to_string()]), "a uuid as the column holds it");
-        let ttl = TableMeta { ttl: Some(("v".into(), 60)), ..meta.clone() };
+        let ttl = { let mut entry = meta.clone(); entry.ttl = Some(("v".into(), 60)); entry };
         assert_eq!(key_where(&ttl, "a = 1 AND b = 'x'"), None, "a TTL's table: SQL answers it");
     }
 }
