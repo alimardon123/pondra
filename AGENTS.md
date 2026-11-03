@@ -3904,6 +3904,14 @@ takes which step or part. Each step passes its own gate before the next starts, 
 releasable after each. Work parked at the freeze (patches under the project's
 `<lane>-wip/`) is redone on the redesigned layout, never landed as it is.
 
+**A new SQL feature joins the random queries and gets a deep-nesting test before it merges into
+main** (the owner, 11-03). Its pull request names both:
+- **The fuzz:** `tools/random_sql.py` makes it among its other forms, so the nightly run checks it
+  inside big queries from then on. A feature DuckDB has is matched against DuckDB. One it lacks
+  (`json()`, `files()`, a macro, an AI, http or media function) must answer as it does on its own.
+- **The test:** the feature deep inside a query, answering as it does alone: under many CTE layers,
+  in subqueries, on either side of joins, and as the source of COPY and MERGE.
+
 ## Conventions
 
 - Comments explain *why*, in plain English; the code shows *what*. Keep functions small.
