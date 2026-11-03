@@ -3094,7 +3094,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    NULL), and a value they give back keeps its sign. Not yet: a window's peers (rank() over -0.0 and 0.0).
    `cargo test --lib zeros_in::`
 
-450. **A comparison written value first is the same comparison to the filter pushdown** (`optimize::ValuesRight`).
+451. **A comparison written value first is the same comparison to the filter pushdown** (`optimize::ValuesRight`).
    DataFusion's filter pushdown merges one column's comparisons (`simplify_predicates`) as if the column came first:
    `s = 'b' AND 'b' = s` was FALSE, and `s <= 'b' AND 'b' > s` kept `s <= 'b'`, letting 'b' in (`random_sql.py --seed
    20261102`). Its simplifier swaps a literal as written itself, but not one that is a cast until folded (a lake's text
