@@ -17,7 +17,7 @@ checked against the limits:
 
 Against the simulator (`sim_r2.py --zero --key-writes-per-sec 1`: R2's one write a second to a key)
 by default. `--real` runs against the bucket the environment names (AWS_ENDPOINT, PONDRA_BUCKET and
-the keys; `.github/workflows/limits-r2.yml` runs it nightly on R2). The JSON is printed at the end
+the keys; `.github/workflows/limits-r2.yml` runs it on R2 on Sundays). The JSON is printed at the end
 (and written with `--out`); exit 1 when a check fails.
 
   limits_check.py [--real] [--minutes 5] [--port 9700] [--out FILE] [--keep]

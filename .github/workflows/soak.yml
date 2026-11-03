@@ -13,7 +13,8 @@
 # storage r2 puts the lake in the bucket of cluster-bench.yml's secrets (R2_*). Mind the free tier:
 # each commit is about one object write (durable acknowledgements), so rate / batch commits a second
 # is about that many writes a second: 500 / 20 is 25 a second, 90,000 an hour; 500 / 200, a day's,
-# 2.5 a second (R2's free tier is a million a month). The timeline says what the run made
+# 2.5 a second (R2's free tier is a million a month). With tiering and the catalog, a day's load made
+# 7 writes a second in all on 10-31, about 600,000 in the day. The timeline says what the run made
 # (`object_writes_per_s`).
 name: soak
 
