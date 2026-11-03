@@ -74,6 +74,7 @@ mod pg_trace;
 pub mod pg_bytea;
 mod optimize;
 mod or_ranges;
+mod zeros_in;
 mod held;
 mod keys_below;
 mod late_rows;

@@ -120,7 +120,7 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
           counts in the query memory: invariant 414); keys_below.rs (a join's keys cut the rows an aggregate under it
           groups: invariant 437); or_ranges.rs (an OR of ranges of one column that meet as one
-          range: invariant 438); round 35 served.rs (a lake's store over HTTP:
+          range: invariant 438); zeros_in.rs (a float IN list's zero answers as `=` does: invariant NNN); round 35 served.rs (a lake's store over HTTP:
           pondra://host:port, ADR-072 §8, invariant 299); replace.rs (CREATE OR REPLACE TABLE: a staged table filled, then put
           in the old one's place in one commit: invariant 425); round 36 statement.rs (one statement's
           path behind every door: a door reads its wire into a request and writes the answer back in
@@ -3082,6 +3082,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    both orders: q19 106-110 -> 91-92 ms, TPC-DS q13 80-90 -> 75-80, q48 91-118 -> 90-99, q85 107-125 -> 103-109;
    only those plans change, and the answers are the same (`logs/round36/or-ranges-2026-11-02.txt`).
    `cargo test --lib or_ranges::`
+
+NNN. **A float IN list answers as its `=`s do: -0.0 is IN a list holding 0.0** (`zeros_in.rs`). DataFusion's comparisons
+   make the two zeros one, but the set an IN list of floats is checked against compares bits, so `-(c0 + c1) IN (2.0,
+   0.0)` kept no row where the sum was 0.0 (`random_sql.py --seed 20261102`, the nightly; Postgres and DuckDB keep
+   them), nor did `a = 0.0 OR a = 2.0`, which the simplifier makes an IN list. `ZerosIn`, after the simplifier, takes
+   the zero out as an `=`: `x IN (2.0) OR x = 0.0`, `x NOT IN (2.0) AND x <> 0.0` (an IN list is the OR of its `=`s,
+   NULLs alike). Lists with no zero, and lists over a volatile value, are left as they are; joins, IN of a subquery and
+   GROUP BY already took the zeros as one. `cargo test --lib zeros_in::`
 
 ```bash
 cargo build --release

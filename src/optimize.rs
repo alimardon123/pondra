@@ -93,6 +93,7 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     #[cfg(feature = "lake")] // (a node's only, as WholePartition is)
     rules.insert(0, Arc::new(crate::frugal::MiddleRows));
     rules.push(Arc::new(ScaledLiterals)); // (after the simplifier folds a literal's cast)
+    rules.push(Arc::new(crate::zeros_in::ZerosIn)); // (after the simplifier, which makes ORed `=`s of a column one IN list)
     rules.push(Arc::new(crate::multiply::Products)); // (a DECIMAL product in native integers when its values are small)
     rules.push(Arc::new(CheapFirst));
     rules.push(Arc::new(AsyncBelow)); // (last: after COUNT(DISTINCT) became a GROUP BY)
