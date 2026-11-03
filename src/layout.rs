@@ -16,7 +16,8 @@
 use crate::write::{cluster_names, partition_text};
 use crate::text::ident;
 use anyhow::{bail, ensure, Result};
-use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, parser::Parser, tokenizer::{Location, Token, TokenWithSpan, Tokenizer}};
+use crate::text::Solid;
+use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, parser::Parser, tokenizer::Token};
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
@@ -38,9 +39,9 @@ pub fn clauses(sql: &str) -> Result<Cow<'_, str>> {
     if !CREATE.is_match(sql) || !WORDS.is_match(sql) {
         return Ok(Cow::Borrowed(sql));
     }
-    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize_with_location() else { return Ok(Cow::Borrowed(sql)) };
-    let solid: Vec<&TokenWithSpan> = tokens.iter().filter(|t| !matches!(t.token, Token::Whitespace(_))).collect();
-    let text = Text::new(sql);
+    let Some(tokens) = crate::text::tokens(sql) else { return Ok(Cow::Borrowed(sql)) };
+    let solid = tokens.solid();
+    let text = Text { sql };
     let word = |k: usize| match solid.get(k).map(|t| &t.token) {
         Some(Token::Word(w)) if w.quote_style.is_none() => Some(w.value.to_uppercase()),
         _ => None,
@@ -73,7 +74,7 @@ pub fn clauses(sql: &str) -> Result<Cow<'_, str>> {
                 let Some(Token::Word(f)) = solid.get(k + 1).map(|t| &t.token) else { continue };
                 let c = if c.quote_style.is_some() { c.value.clone() } else { c.value.to_lowercase() };
                 merge.push(format!("{c}:{}", f.value.to_lowercase()));
-                cut.push((text.end(solid[k - 1]), text.end(solid[k + 1]))); // (` MERGE sum`)
+                cut.push((solid[k - 1].end, solid[k + 1].end)); // (` MERGE sum`)
             }
         }
         head = close;
@@ -126,7 +127,7 @@ pub fn clauses(sql: &str) -> Result<Cow<'_, str>> {
             "TTL" => add("ttl", ttl(&expr(body(1))?)?)?,
             _ => kept_with.extend(entries(&solid, *k + 1, &text)),
         }
-        cut.push((text.start(solid[*k]), if stop > *k { text.end(solid[stop - 1]) } else { text.start(solid[*k]) }));
+        cut.push((solid[*k].start, if stop > *k { solid[stop - 1].end } else { solid[*k].start }));
     }
     if !merge.is_empty() {
         add("merge", merge.join(", "))?;
@@ -139,7 +140,7 @@ pub fn clauses(sql: &str) -> Result<Cow<'_, str>> {
         ensure!(!options.iter().any(|(n, _)| *n == name), "CREATE TABLE: {name} is given twice, as a clause and in WITH (…)");
     }
     // Put together: the head with MERGE taken out, one WITH, then what's left (the query).
-    let after = text.end(solid[head]);
+    let after = solid[head].end;
     let keep = |from: usize, to: usize| -> String {
         let mut s = String::new();
         let mut at = from;
@@ -229,7 +230,7 @@ fn exprs(text: &str) -> Result<Vec<ast::Expr>> {
 fn quoted(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
 
 /// A `WITH (a = 1, b = '…')` list's entries, as written.
-fn entries(solid: &[&TokenWithSpan], open: usize, text: &Text) -> Vec<String> {
+fn entries(solid: &[Solid], open: usize, text: &Text) -> Vec<String> {
     let Some(close) = closing(solid, open) else { return vec![] };
     let (mut depth, mut first, mut out) = (0, open + 1, vec![]);
     for k in open + 1..=close {
@@ -249,7 +250,7 @@ fn entries(solid: &[&TokenWithSpan], open: usize, text: &Text) -> Vec<String> {
 }
 
 /// The `)` that closes the `(` at `open`.
-fn closing(solid: &[&TokenWithSpan], open: usize) -> Option<usize> {
+fn closing(solid: &[Solid], open: usize) -> Option<usize> {
     let mut depth = 0;
     (open..solid.len()).find(|&k| {
         depth += match solid[k].token {
@@ -261,25 +262,13 @@ fn closing(solid: &[&TokenWithSpan], open: usize) -> Option<usize> {
     })
 }
 
-/// Byte offsets of tokens in the text they came from.
+/// The text tokens came from, for what was written between two of them.
 struct Text<'a> {
     sql: &'a str,
-    lines: Vec<usize>,
 }
 
 impl<'a> Text<'a> {
-    fn new(sql: &'a str) -> Self { Text { sql, lines: std::iter::once(0).chain(sql.match_indices('\n').map(|(i, _)| i + 1)).collect() } }
-
-    fn byte(&self, l: &Location) -> usize {
-        let start = self.lines.get((l.line.max(1) - 1) as usize).copied().unwrap_or(self.sql.len());
-        self.sql[start..].char_indices().nth((l.column.max(1) - 1) as usize).map_or(self.sql.len(), |(i, _)| start + i)
-    }
-
-    fn start(&self, t: &TokenWithSpan) -> usize { self.byte(&t.span.start) }
-
-    fn end(&self, t: &TokenWithSpan) -> usize { self.byte(&t.span.end) }
-
-    fn between(&self, a: &TokenWithSpan, b: &TokenWithSpan) -> &'a str { &self.sql[self.start(a)..self.end(b).max(self.start(a))] }
+    fn between(&self, a: Solid, b: Solid) -> &'a str { &self.sql[a.start..b.end.max(a.start)] }
 }
 
 #[cfg(test)]
