@@ -19,7 +19,7 @@
 use crate::expander::grouped; // (a call written as an expression: in parentheses inside an operator)
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::sql::sqlparser::ast::*;
-use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::{Token, Tokenizer}};
+use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -112,31 +112,22 @@ pub fn text(sql: &str) -> Result<Cow<'_, str>> {
     Ok(Cow::Owned(s))
 }
 
-/// The tokens of a text, with where each starts, so edits keep the rest of it as written.
+/// A text and its tokens (`text::tokens`, shared with every other look at the statement), so edits keep the rest of it
+/// as written.
 struct Tokens<'a> {
     sql: &'a str,
-    toks: Vec<Token>,
-    at: Vec<usize>,
+    t: std::sync::Arc<crate::text::Tokens>,
+}
+
+impl std::ops::Deref for Tokens<'_> {
+    type Target = crate::text::Tokens; // (`toks`, `start`, `next`, `word`)
+    fn deref(&self) -> &Self::Target { &self.t }
 }
 
 impl<'a> Tokens<'a> {
-    fn of(sql: &'a str) -> Option<Self> {
-        let spans = Tokenizer::new(&GenericDialect {}, sql).tokenize_with_location().ok()?;
-        let lines: Vec<usize> = std::iter::once(0).chain(sql.match_indices('\n').map(|(i, _)| i + 1)).collect();
-        let at = spans.iter().map(|t| {
-            let start = lines.get(t.span.start.line.saturating_sub(1) as usize).copied().unwrap_or(sql.len());
-            sql[start..].char_indices().nth(t.span.start.column.saturating_sub(1) as usize).map_or(sql.len(), |(i, _)| start + i)
-        });
-        let at: Vec<usize> = at.collect();
-        Some(Tokens { sql, toks: spans.into_iter().map(|t| t.token).collect(), at })
-    }
-    fn end(&self, i: usize) -> usize { self.at.get(i + 1).copied().unwrap_or(self.sql.len()) }
-    fn span(&self, from: usize, to: usize) -> &'a str { &self.sql[self.at.get(from).copied().unwrap_or(self.sql.len())..self.at.get(to).copied().unwrap_or(self.sql.len())] }
-    /// The next token after `i` that isn't whitespace.
-    fn next(&self, i: usize) -> usize {
-        (i + 1..self.toks.len()).find(|&j| !matches!(self.toks[j], Token::Whitespace(_))).unwrap_or(self.toks.len())
-    }
-    fn word(&self, i: usize, k: Keyword) -> bool { matches!(self.toks.get(i), Some(Token::Word(w)) if w.keyword == k && w.quote_style.is_none()) }
+    fn of(sql: &'a str) -> Option<Self> { Some(Tokens { sql, t: crate::text::tokens(sql)? }) }
+    fn end(&self, i: usize) -> usize { self.t.end.get(i).copied().unwrap_or(self.sql.len()) }
+    fn span(&self, from: usize, to: usize) -> &'a str { &self.sql[self.start.get(from).copied().unwrap_or(self.sql.len())..self.start.get(to).copied().unwrap_or(self.sql.len())] }
     fn edit(&self, mut edits: Vec<(usize, usize, String)>) -> String {
         let mut out = self.sql.to_string();
         edits.sort_by_key(|e| std::cmp::Reverse(e.0));
@@ -171,7 +162,7 @@ fn lambda_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
             continue;
         }
         let params = if params.len() == 1 { params[0].clone() } else { format!("({})", params.join(", ")) };
-        edits.push((t.at[i], t.end(j), format!("{params} ->")));
+        edits.push((t.start[i], t.end(j), format!("{params} ->")));
     }
     Ok(edits)
 }
@@ -207,7 +198,7 @@ fn comprehensions(sql: &str) -> Result<String> {
             None => format!("({list})"),
         };
         let done = format!("array_transform({list}, {var} -> ({}))", body.trim());
-        return Ok(format!("{}{done}{}", &sql[..t.at[i]], comprehensions(&sql[t.end(close)..])?));
+        return Ok(format!("{}{done}{}", &sql[..t.start[i]], comprehensions(&sql[t.end(close)..])?));
     }
     Ok(sql.to_string())
 }
@@ -241,9 +232,9 @@ fn asof_on(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
         });
         let Some(on) = on.filter(|&k| t.word(k, Keyword::ON)) else { continue };
         if left {
-            edits.push((t.end(i), t.at[j], " ".into()));
+            edits.push((t.end(i), t.start[j], " ".into()));
         }
-        edits.push((t.at[on], t.at[on], format!("MATCH_CONDITION ({}) ", if left { "pondra_duckdb_asof_left" } else { "pondra_duckdb_asof" })));
+        edits.push((t.start[on], t.start[on], format!("MATCH_CONDITION ({}) ", if left { "pondra_duckdb_asof_left" } else { "pondra_duckdb_asof" })));
     }
     Ok(edits)
 }
@@ -270,8 +261,8 @@ fn using_sample(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
         let end = end.unwrap_or(t.toks.len());
         let spec = quote(t.span(from, end).trim());
         match t.word(end, Keyword::WHERE) {
-            true => edits.push((t.at[i], t.at.get(t.next(end)).copied().unwrap_or(t.sql.len()), format!("WHERE pondra_sample({spec}) AND "))),
-            false => edits.push((t.at[i], t.at.get(end).copied().unwrap_or(t.sql.len()), format!("WHERE pondra_sample({spec}) "))),
+            true => edits.push((t.start[i], t.start.get(t.next(end)).copied().unwrap_or(t.sql.len()), format!("WHERE pondra_sample({spec}) AND "))),
+            false => edits.push((t.start[i], t.start.get(end).copied().unwrap_or(t.sql.len()), format!("WHERE pondra_sample({spec}) "))),
         }
     }
     Ok(edits)
@@ -298,7 +289,7 @@ fn lock_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
         } else {
             continue;
         };
-        edits.push((t.at[i], t.end(ids[len - 1]), with.to_string()));
+        edits.push((t.start[i], t.end(ids[len - 1]), with.to_string()));
     }
     Ok(edits)
 }
@@ -315,7 +306,7 @@ fn at_at_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
             continue;
         }
         if name.eq_ignore_ascii_case("version") {
-            edits.push((t.at[i], t.end(i), "version()".to_string()));
+            edits.push((t.start[i], t.end(i), "version()".to_string()));
         } else {
             let lower = name.to_lowercase();
             return Err(crate::codes::coded("0A000", format!("@@{name} is SQL Server's: Pondra's settings are SHOW {lower} / current_setting('{lower}')")));
@@ -344,7 +335,7 @@ fn property_keys(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
                 last += 2;
             }
             if dotted && matches!(t.toks.get(last), Some(Token::Word(w)) if w.quote_style.is_none()) && t.toks.get(t.next(last)) == Some(&Token::Eq) {
-                edits.push((t.at[first], t.end(last), format!("'{}'", t.span(first, last + 1))));
+                edits.push((t.start[first], t.end(last), format!("'{}'", t.span(first, last + 1))));
             }
             let mut depth = 0;
             at = last;
@@ -383,7 +374,7 @@ fn top_alias(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
         });
         let sql_server = after_select && matches!(after, Some(Token::Number(..)) | Some(Token::LParen));
         if !sql_server {
-            edits.push((t.at[i], t.end(i), "\"top\"".to_string()));
+            edits.push((t.start[i], t.end(i), "\"top\"".to_string()));
         }
     }
     Ok(edits)

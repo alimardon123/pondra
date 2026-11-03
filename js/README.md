@@ -2,7 +2,7 @@
 
 # Pondra
 
-**A streamhouse in one binary.** Streaming ingest, a lakehouse in your folder or bucket, and SQL
+**A Streamhouse in one binary.** Streaming ingest, a lakehouse in your folder or bucket, and SQL
 that spreads over as many nodes as you start. No JVM, no Postgres, no ZooKeeper, no Kafka to run:
 the bucket is the only state.
 

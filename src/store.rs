@@ -214,8 +214,10 @@ impl TableMeta {
     pub fn mapped(&self) -> bool { !self.names.is_empty() || !self.dropped.is_empty() }
 
     /// This entry's live columns (under the names it keeps them by: stored, or SQL's in `logical()`'s) in SQL's order
-    /// (`shown`, then the others as stored). Without `shown`, `columns` as they are, dropped ones out.
-    pub fn in_order(&self) -> Vec<&(String, String)> {
+    /// (`shown`, then the others as stored). Without `shown`, `columns` as they are, dropped ones out. Kept to this file:
+    /// a reader takes the order from `sql_order`, `sql_columns`, `star`, `sql_names` or the list (`cols`), never works it
+    /// out (redesign 1b).
+    fn in_order(&self) -> Vec<&(String, String)> {
         crate::column::sql_places(&self.columns, |c| self.is_dropped(c), &self.shown).into_iter().map(|i| &self.columns[i]).collect()
     }
 
@@ -256,6 +258,14 @@ impl TableMeta {
 
     /// SQL's columns (`logical_columns`) in SQL's order (`in_order`): what `SELECT *` and RETURNING * answer.
     pub fn sql_columns(&self) -> Vec<(String, String)> { self.in_order().into_iter().map(|(c, t)| (self.name_of(c).to_string(), t.clone())).collect() }
+
+    /// What `SELECT *` lists: `sql_columns` without a keyed table's delete markers (`marker`). What SHOW CREATE writes and
+    /// what a view's `*` reads (`ddl::keep_readers`).
+    pub fn star(&self) -> Vec<(String, String)> { self.sql_columns().into_iter().filter(|(c, _)| !self.marker(c)).collect() }
+
+    /// `sql_order` without `_deleted` (a keyed table's or not): what an INSERT without a column list fills, first to last
+    /// (`write::implicit`), and what `ALTER COLUMN … FIRST | AFTER` places a column among.
+    pub fn sql_names(&self) -> Vec<String> { self.sql_order().into_iter().filter(|c| c != "_deleted").collect() }
 
     /// A stored column's name in SQL.
     pub fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.names.get(stored).map_or(stored, String::as_str) }
@@ -1422,17 +1432,6 @@ impl ObjectStore for ReadOnly {
     async fn copy_opts(&self, _: &Path, to: &Path, _: object_store::CopyOptions) -> object_store::Result<()> { Err(refused(&self.1, &to.to_string())) }
 }
 
-/// A session with every function a query's session has but what needs a lake: the engine's (`engine::session`, with
-/// Postgres's JSON operators and functions), and the node's own. A node's sessions start from it (`Lake::made`), and so do
-/// the expressions a table keeps (`defaults.rs`: CHECK, DEFAULT and expectations), so a condition planned in a query plans
-/// there too.
-pub(crate) fn functions(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
-    let ctx = crate::engine::session(config, rt);
-    crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
-    crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
-    ctx
-}
-
 /// How often a reader polls the bucket for newer manifests and WAL: a node's, and the CLI's.
 pub const READER_POLL: Duration = Duration::from_millis(250);
 
@@ -1789,13 +1788,13 @@ impl Lake {
         ctx
     }
 
-    /// A session made from nothing, with everything every query's session has: the engine's (`engine::session`) and
-    /// the node's own functions. On a page every plan it makes runs its partitions in the page's task, as the page's own
+    /// A session made from nothing, with everything every query's session has: every function set in the registry
+    /// (`engine::session`). On a page every plan it makes runs its partitions in the page's task, as the page's own
     /// session's do (`in_task::planned`): a page has no runtime to start a partition's task on, and a plan of one
     /// partition still merges more than one below it. Plans made by hand from it (`fresh.rs`) are planned by it too.
     fn made(&self, partitions: usize) -> SessionContext {
         let config = SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::text::PUBLIC);
-        let ctx = functions(config, self.rt.clone());
+        let ctx = crate::engine::session(config, self.rt.clone());
         #[cfg(target_arch = "wasm32")]
         let ctx = crate::in_task::planned(ctx);
         ctx
@@ -3901,7 +3900,8 @@ mod tests {
 
     /// The one column list (redesign step 1b) agrees with the order the entry's own fields gave before it, for any mix
     /// of renames, drops and moves: SQL's order, ids as stored places + 1, a renamed column's stored name kept, and
-    /// dropped columns marked, last. `cols()` makes it once per parse, and a clone's memo is empty.
+    /// dropped columns marked, last. `star` and `sql_names` are the list's, a keyed table's markers out, and the same of
+    /// `logical()`'s copy. `cols()` makes it once per parse, and a clone's memo is empty.
     #[test]
     fn the_column_list_is_the_entrys_columns_in_sqls_order() {
         // (the order as `in_order` made it before the list: `shown`'s columns, then the rest as stored, the dropped out)
@@ -3927,6 +3927,15 @@ mod tests {
                     _ => {}
                 }
             }
+            // (delete markers: a keyed table's, or a column of that name in a table without a key)
+            let keyed = next(3) == 0;
+            if keyed || next(4) == 0 {
+                m.columns.push(("_deleted".into(), "Boolean".into()));
+            }
+            if keyed {
+                m.key = vec!["c0".into()];
+            }
+            let n = m.columns.len();
             // (`shown`: some of the columns, each once, in any order, dropped ones among them)
             let mut shown: Vec<String> = (0..n).filter(|_| next(2) == 0).map(|i| format!("c{i}")).collect();
             for i in (1..shown.len()).rev() {
@@ -3939,6 +3948,11 @@ mod tests {
             assert_eq!(m.sql_order(), sql);
             let stored: Vec<String> = list.stored_order().map(|c| c.name.clone()).collect();
             assert_eq!(m.moved(), sql != stored, "moved: SQL's order isn't the stored one");
+            let star: Vec<(String, String)> = list.sql().filter(|c| !m.marker(&c.stored)).map(|c| (c.name.clone(), c.dtype.clone())).collect();
+            assert_eq!(m.star(), star, "what `SELECT *` lists");
+            assert_eq!(m.sql_names(), sql.iter().filter(|c| *c != "_deleted").cloned().collect::<Vec<_>>());
+            let l = m.logical();
+            assert_eq!((l.star(), l.sql_names(), l.sql_order()), (m.star(), m.sql_names(), m.sql_order()), "the same of the logical copy");
             for c in list.all() {
                 assert_eq!(m.columns[c.id as usize - 1].0, c.stored, "an id is a stored place + 1");
                 assert_eq!((c.name.as_str(), c.dropped), (m.name_of(&c.stored), m.dropped.contains(&c.stored)));

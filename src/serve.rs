@@ -231,13 +231,7 @@ pub fn key_where(meta: &TableMeta, cond: &str) -> Option<Vec<String>> {
 pub async fn point_sql(lake: &Lake, sql: &str) -> Result<Option<Vec<u8>>> {
     let Some(p) = point(lake, sql).await? else { return Ok(None) };
     let Some(row) = p.rows(lake).await? else { return Ok(None) };
-    if row.num_rows() == 0 {
-        return Ok(Some(b"[]".to_vec()));
-    }
-    let mut w = datafusion::arrow::json::ArrayWriter::new(Vec::new());
-    w.write_batches(&[&row])?;
-    w.finish()?;
-    Ok(Some(w.into_inner()))
+    Ok(Some(crate::answer::json([&row])?))
 }
 
 /// The log tail's rows of one table by the hash of their key, each hash to its newest row

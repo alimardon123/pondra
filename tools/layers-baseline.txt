@@ -52,12 +52,8 @@ delta -> write_outside
 dial -> ext
 dial -> store
 dial -> users
-engine -> matcher
 engine -> pattern
 engine -> pg_bytea
-engine -> pg_casts
-engine -> pg_functions
-engine -> pg_json
 engine -> pg_json_make
 extension -> crypto
 facts -> measures
@@ -258,7 +254,6 @@ sso_flow -> tls
 statement -> pg_catalog
 statement -> python
 store -> adopt
-store -> ai
 store -> audit
 store -> auth
 store -> backup

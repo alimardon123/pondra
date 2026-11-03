@@ -143,14 +143,14 @@ async fn relation(lake: &Lake, name: &str) -> Option<Relation<Lake>> {
             let l = m.described();
             return Some(Relation::Columns(l.columns.iter().filter(|(c, _)| !l.marker(c)).map(|(c, _)| (c.clone(), l.sql_types.get(c).and_then(|t| Ty::of(t)))).collect()));
         }
-        return Some(Relation::Columns(typed_columns(&m).map(|(c, t)| (c.to_string(), t)).collect()));
+        return Some(Relation::Columns(typed_columns(&m)));
     }
     let view = lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(&local)).await.ok()??;
     Some(Relation::View { sql: view.sql, lake: other })
 }
 
 /// A table's columns as SQL sees them, in order, without an upsert table's delete markers, each with the type the port names it
-/// by. `sql_types` is keyed by the stored name.
-fn typed_columns(m: &TableMeta) -> impl Iterator<Item = (&str, Option<Ty>)> + '_ {
-    m.in_order().into_iter().map(|(s, _)| (s.as_str(), m.name_of(s))).filter(|(_, n)| !m.marker(n)).map(|(s, n)| (n, m.sql_types.get(s).and_then(|t| Ty::of(t))))
+/// by: from its column list (`sql_types` is keyed by the stored name).
+fn typed_columns(m: &Arc<TableMeta>) -> Vec<(String, Option<Ty>)> {
+    m.cols().sql().filter(|c| !m.marker(&c.stored)).map(|c| (c.name.clone(), m.sql_types.get(&c.stored).and_then(|t| Ty::of(t)))).collect()
 }

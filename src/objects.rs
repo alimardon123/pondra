@@ -5,7 +5,8 @@
 //! project's files run again and again). `GET /kinds` and `pondra.kinds` say what kinds there are:
 //! parts (`PARTS`) and patterns (`PATTERNS`) are listed beside the kinds, and `pondra.kinds` lists all three.
 //!
-//! A new kind is an entry in `KINDS`, and its family's lister in `FAMILIES`: nothing else needs
+//! A new kind is an entry in the registry's kinds section (`Kinds`: ours are `CORE_KINDS`, added by the `catalog`
+//! extension), and its family's lister in `FAMILIES`: nothing else needs
 //! editing for it to be listed, described and shown. Comments are kept apart (`cm/{family}/{name}`,
 //! `cm/column/{table}/{stored column}`, a view's column by its name), and follow a rename or go with a drop (`follow`, from
 //! `ddl::apply`).
@@ -92,7 +93,8 @@ const ROWS: &[&str] = &["SELECT", "INSERT", "UPDATE", "DELETE"];
 /// A project's refusal for shares and recipients (apply.rs says it): each environment's, so a
 /// partner's token never reaches dev.
 const SHARES_PROJECT: &str = "shares and recipients are each environment's: prod's never reach its branches, so a partner's token never reaches dev; make and grant them in the database (CREATE SHARE …)";
-pub static KINDS: &[Kind] = &[
+/// The kinds of the core, which the `catalog` extension adds to the registry (`CATALOG`).
+static CORE_KINDS: &[Kind] = &[
     Kind { name: "schema", family: "schema", verbs: &["CREATE", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "ns/", privileges: &["SELECT", "INSERT", "UPDATE", "DELETE", "CLONE"], on_clone: OnClone::Copy, project: None, order: 1, secret: false, about: "a namespace for a database's objects, named `schema.name`", also: &["namespace", "dataset"] },
     Kind { name: "table", family: "relation", verbs: &["CREATE", "CREATE OR ALTER", "CREATE OR REPLACE", "ALTER", "DROP", "UNDROP", "CLONE", "COMMENT ON", "SHOW CREATE"], prefix: "t/", privileges: ROWS, on_clone: OnClone::Pin, project: None, order: 5, secret: false, about: "rows in the lake's files and log, queried and changed with SQL", also: &["relation"] },
     Kind { name: "view", family: "relation", verbs: RELATION, prefix: "q/", privileges: READ, on_clone: OnClone::Copy, project: None, order: 7, secret: false, about: "a stored query with a name, run where it is used", also: &["virtual table"] },
@@ -136,7 +138,39 @@ pub static PATTERNS: &[Pattern] = &[
     Pattern { name: "history view", lists: "pondra.tables", about: "a materialized view keeping every version of each row", also: &["SCD type 2", "slowly changing dimension"] },
 ];
 
-pub fn kind(name: &str) -> Option<&'static Kind> { KINDS.iter().find(|k| k.name == name) }
+/// The registry's section of kinds (designs/redesign/redesign.md §6): every kind of object, whichever extension adds it.
+#[derive(Default)]
+pub struct Kinds(pub Vec<&'static Kind>);
+impl crate::registry::Section for Kinds {
+    const NAME: &'static str = "kinds";
+}
+impl Kinds {
+    /// One more kind: its name is its own, and a prefix is shared only within a family (a table and an external table
+    /// are both `relation`s; a view and an external table are both `q/`).
+    pub fn add(&mut self, k: &'static Kind) {
+        assert!(self.0.iter().all(|o| o.name != k.name), "two kinds are named {}", k.name);
+        self.0.push(k);
+    }
+}
+
+/// The extension that adds the core's kinds.
+pub static CATALOG: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "catalog",
+    requires: &[],
+    register: |r| {
+        let kinds = r.section_mut::<Kinds>();
+        for k in CORE_KINDS {
+            kinds.add(k);
+        }
+    },
+};
+
+/// Every kind of object this build knows, in the order they were added.
+pub fn all_kinds() -> impl Iterator<Item = &'static Kind> + Clone {
+    crate::registry::get().section::<Kinds>().0.iter().copied()
+}
+
+pub fn kind(name: &str) -> Option<&'static Kind> { all_kinds().find(|k| k.name == name) }
 
 /// The catalog's own prefixes a page's reader reads, beside the kinds': the segments that name each commit's files and
 /// log (`store::seg_key`), and the inline data of the small ones (`store::data_key`), which every query reads.
@@ -154,18 +188,18 @@ const READER_KEYS: &[&str] = &["c", "n", "b", "format"];
 const NODE_ONLY: &[&str] = &["a/"];
 
 /// What a page may hold, and so what `/cluster/log` and `/cluster/kv` answer to a caller that isn't an operator: the
-/// prefixes of the kinds a reader's catalog reads, derived from `KINDS`, and the catalog's own keys above. A prefix that
+/// prefixes of the kinds a reader's catalog reads, derived from the kinds (`all_kinds`), and the catalog's own keys above. A prefix that
 /// several kinds share is readable only when none of them is secret or left behind by a clone: `u/` holds users (secret)
 /// and roles (not), so it is out. Comments follow their family. Everything else is refused: the lake's keys (`z/`), the
 /// secrets (`e/`), a branch's pins and bases (`pn/`, `bs`) and the rest of the catalog's own bookkeeping.
 #[cfg(feature = "doors")] // (the node's `/cluster/log` and `/cluster/kv` read it)
 pub fn readable(key: &str) -> bool {
-    let may = |k: &Kind| KINDS.iter().filter(|o| o.prefix == k.prefix).all(|o| !o.secret && o.on_clone != OnClone::Leave);
+    let may = |k: &Kind| all_kinds().filter(|o| o.prefix == k.prefix).all(|o| !o.secret && o.on_clone != OnClone::Leave);
     if let Some(family) = key.strip_prefix("cm/") {
         let family = family.split('/').next().unwrap_or_default();
-        return KINDS.iter().any(|k| k.family == family) && KINDS.iter().filter(|k| k.family == family).all(may);
+        return all_kinds().any(|k| k.family == family) && all_kinds().filter(|k| k.family == family).all(may);
     }
-    let kind = KINDS.iter().any(|k| key.starts_with(k.prefix) && may(k) && !NODE_ONLY.contains(&k.prefix));
+    let kind = all_kinds().any(|k| key.starts_with(k.prefix) && may(k) && !NODE_ONLY.contains(&k.prefix));
     kind || READER_PREFIXES.iter().any(|p| key.starts_with(p)) || READER_KEYS.contains(&key)
 }
 
@@ -277,7 +311,7 @@ fn relations(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
                 _ => None, // (an external table's statement isn't kept as written; a window view's `_final` table is made with it)
             };
             let def = def.filter(|_| !partial);
-            let kind = KINDS.iter().find(|k| k.name == o.kind).map_or("table", |k| k.name);
+            let kind = all_kinds().find(|k| k.name == o.kind).map_or("table", |k| k.name);
             Object::new(kind, &o.lake, &local, def)
         }).collect())
     })
@@ -558,9 +592,11 @@ pub(crate) fn sql_type(t: &str) -> String {
     crate::answer::dtype(t).map_or_else(|_| t.to_string(), |d| of(&d))
 }
 
-/// `CREATE TABLE`, its layout as clauses (`layout.rs`): what makes the table again, without rows.
+/// `CREATE TABLE`, its layout as clauses (`layout.rs`): what makes the table again, without rows. Under SQL's names, for
+/// an entry as stored too (`ddl::alike` compares two).
 pub(crate) fn table_sql(name: &str, m: &TableMeta) -> String {
-    let mut parts: Vec<String> = m.in_order().into_iter().filter(|(c, _)| !m.marker(c)).map(|(c, t)| { // (SQL's order; a keyed table's `_deleted` is its own)
+    let m = &*m.logical_ref();
+    let mut parts: Vec<String> = m.star().iter().map(|(c, t)| { // (SQL's order; a keyed table's `_deleted` is its own)
         let merge = m.merge.get(c).map(|f| format!(" MERGE {f}")).unwrap_or_default();
         let null = if m.not_null.contains(c) && !m.key.contains(c) && !m.identity.contains_key(c) { " NOT NULL" } else { "" };
         let default = match m.identity.get(c) {
@@ -757,7 +793,7 @@ pub enum Op {
 
 /// The kind words a statement names (`materialized view`, `column`, …), longest first.
 static KIND_WORDS: LazyLock<String> = LazyLock::new(|| {
-    let mut words: Vec<&str> = KINDS.iter().map(|k| k.name).chain(["column"]).collect();
+    let mut words: Vec<&str> = all_kinds().map(|k| k.name).chain(["column"]).collect();
     words.sort_by_key(|w| std::cmp::Reverse(w.len()));
     words.iter().map(|w| w.replace(' ', r"\s+")).collect::<Vec<_>>().join("|")
 });
@@ -963,7 +999,7 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
     let strings = |v: &Value| -> Vec<String> { serde_json::from_value(v.clone()).unwrap_or_default() };
     // (a keyed table's `_deleted` is its own, wherever it is: never in a definition)
     let columns: Vec<(String, String)> = pairs(&s["columns"]).into_iter().filter(|(c, _)| !old.marker(c)).collect();
-    let was: Vec<&(String, String)> = old.in_order().into_iter().filter(|(c, _)| !old.marker(c)).collect(); // (SQL's order, as SHOW CREATE gives it)
+    let was = old.star(); // (SQL's order, as SHOW CREATE gives it)
     // What can't be brought along: a column taken away, moved or renamed; another key or merge.
     for (i, (c, _)) in was.iter().enumerate() {
         match columns.iter().position(|(n, _)| n == c) {
@@ -1162,7 +1198,7 @@ pub async fn tables(lake: &Lake, text: &str) -> Result<Vec<(&'static str, Arc<dy
 /// One row per kind, then per part, then per pattern: what `pondra.kinds` and `GET /kinds` list. A
 /// column that doesn't apply to a row is null (a part has no statements; a pattern no family).
 fn rows() -> Vec<Value> {
-    let objects = KINDS.iter().map(|k| j!({"kind": k.name, "is": "object", "family": k.family, "inside": null, "statements": k.verbs, "privileges": k.privileges,
+    let objects = all_kinds().map(|k| j!({"kind": k.name, "is": "object", "family": k.family, "inside": null, "statements": k.verbs, "privileges": k.privileges,
         "on_clone": k.on_clone.word(), "in_project": k.project.is_none(), "undrop": k.verbs.contains(&"UNDROP"), "secret": k.secret, "lists": null, "about": k.about, "also": k.also}));
     let parts = PARTS.iter().map(|p| j!({"kind": p.name, "is": "part", "family": null, "inside": p.inside, "statements": null, "privileges": null, "on_clone": null,
         "in_project": null, "undrop": null, "secret": null, "lists": null, "about": p.about, "also": p.also}));
@@ -1232,17 +1268,17 @@ mod tests {
 
     #[test]
     fn one_word_one_meaning() {
-        let names: Vec<String> = KINDS.iter().map(|k| k.name).chain(PARTS.iter().map(|p| p.name)).chain(PATTERNS.iter().map(|p| p.name)).map(|n| n.to_lowercase()).collect();
+        let names: Vec<String> = all_kinds().map(|k| k.name).chain(PARTS.iter().map(|p| p.name)).chain(PATTERNS.iter().map(|p| p.name)).map(|n| n.to_lowercase()).collect();
         let mut unique = names.clone();
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), names.len(), "a name is used twice: {names:?}");
         assert!(PARTS.iter().all(|p| p.inside.iter().all(|i| kind(i).is_some())), "a part sits inside a name that isn't a kind");
-        assert!(KINDS.iter().all(|k| !k.prefix.is_empty() && k.prefix.ends_with('/') && !k.about.is_empty()), "a kind lacks its prefix or its line");
-        let mut leave: Vec<&str> = KINDS.iter().filter(|k| k.on_clone == OnClone::Leave).map(|k| k.name).collect();
+        assert!(all_kinds().all(|k| !k.prefix.is_empty() && k.prefix.ends_with('/') && !k.about.is_empty()), "a kind lacks its prefix or its line");
+        let mut leave: Vec<&str> = all_kinds().filter(|k| k.on_clone == OnClone::Leave).map(|k| k.name).collect();
         leave.sort();
         assert_eq!(leave, ["recipient", "secret", "share"]);
-        assert_eq!(kinds().as_array().map(Vec::len), Some(KINDS.len() + PARTS.len() + PATTERNS.len()));
+        assert_eq!(kinds().as_array().map(Vec::len), Some(all_kinds().count() + PARTS.len() + PATTERNS.len()));
     }
 
     /// What a page may hold (`readable`): the tables, segments, inline data and catalog keys a reader reads, and the
