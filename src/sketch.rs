@@ -30,15 +30,23 @@ impl Sketches {
     }
 
     pub fn add(&mut self, b: &RecordBatch) {
+        let mut hashes = vec![]; // (one buffer for the batch's columns)
         for (i, _, regs) in &mut self.0 {
             let c = b.column(*i);
-            let mut hashes = vec![0u64; c.len()];
+            hashes.clear();
+            hashes.resize(c.len(), 0u64);
             if datafusion::common::hash_utils::create_hashes_with_hasher([c], &datafusion::common::hash_utils::HLL_RANDOM_STATE, &mut hashes).is_err() {
                 continue;
             }
-            for h in hashes.into_iter().enumerate().filter(|(row, _)| c.is_valid(*row)).map(|(_, h)| h) {
+            let mut put = |h: u64| {
                 let (at, rest) = ((h >> (64 - P)) as usize, h << P);
                 regs[at] = regs[at].max((rest.leading_zeros() + 1).min(64 - P + 1) as u8);
+            };
+            // (a null counts for nothing; a column with none is read without asking each row, as `is_valid` does through the
+            // array: a fifth of a file's sketching)
+            match c.nulls().filter(|n| n.null_count() > 0) {
+                None => hashes.iter().for_each(|&h| put(h)),
+                Some(nulls) => hashes.iter().zip(nulls.iter()).filter(|(_, valid)| *valid).for_each(|(&h, _)| put(h)),
             }
         }
     }
@@ -143,4 +151,54 @@ pub fn statistics(schema: &SchemaRef, batches: &[RecordBatch]) -> Statistics {
         }
     }
     stats
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::Field;
+    use std::sync::Arc;
+
+    fn sketched(values: Vec<Option<i64>>) -> String {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let mut s = Sketches::new(&schema);
+        for chunk in values.chunks(1000) {
+            s.add(&RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(chunk.to_vec()))]).unwrap());
+        }
+        s.done().remove("k").unwrap()
+    }
+
+    /// A null counts for nothing: a column's registers with nulls among its values are those of its values alone, and a
+    /// column of a few thousand different values counts about that many.
+    #[test]
+    fn a_sketch_counts_a_columns_values_and_never_its_nulls() {
+        let values: Vec<Option<i64>> = (0..5000).map(Some).collect();
+        let with_nulls: Vec<Option<i64>> = (0..5000).flat_map(|v| [Some(v), None]).collect();
+        assert_eq!(sketched(with_nulls), sketched(values.clone()));
+        let n = count(&registers(&sketched(values)).unwrap());
+        assert!((4500..5500).contains(&n), "{n}");
+        assert_eq!(count(&registers(&sketched(vec![None; 3000])).unwrap()), 0);
+    }
+
+    /// The registers of a sliced column with nulls (its bitmap at an offset) are those of asking each row `is_valid`, the
+    /// way it was read before.
+    #[test]
+    fn a_sliced_columns_sketch_is_its_rows_asked_one_by_one() {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let whole = Int64Array::from((0..10_000).map(|v| (v % 7 != 0).then_some(v * 31)).collect::<Vec<_>>());
+        for (at, len) in [(3, 5000), (1001, 777), (0, 10_000), (9_999, 1)] {
+            let c: ArrayRef = Arc::new(whole.slice(at, len));
+            let mut s = Sketches::new(&schema);
+            s.add(&RecordBatch::try_new(schema.clone(), vec![c.clone()]).unwrap());
+            let mut hashes = vec![0u64; c.len()];
+            datafusion::common::hash_utils::create_hashes_with_hasher([&c], &datafusion::common::hash_utils::HLL_RANDOM_STATE, &mut hashes).unwrap();
+            let mut regs = [0u8; M];
+            for h in hashes.into_iter().enumerate().filter(|(row, _)| c.is_valid(*row)).map(|(_, h)| h) {
+                let (at, rest) = ((h >> (64 - P)) as usize, h << P);
+                regs[at] = regs[at].max((rest.leading_zeros() + 1).min(64 - P + 1) as u8);
+            }
+            assert_eq!(s.0[0].2, regs, "slice at {at}, {len} rows");
+        }
+    }
 }
