@@ -427,16 +427,15 @@ const MAPPING_ID: &str = "delta.columnMapping.id";
 /// sees, under SQL's names, each with its id (its place among the stored columns) and the name
 /// the files hold it under — Delta's column mapping, by name.
 fn table_schema(meta: &TableMeta, mapped: bool) -> Option<String> {
-    // (listed in SQL's order, `TableMeta::in_order`: a reader finds a column by its name, or by its physical name when mapped)
-    let order = meta.in_order();
+    // (listed in SQL's order, the column list's: a reader finds a column by its name, or by its physical name when mapped)
+    let list = meta.column_list();
+    let live: Vec<&crate::column::Column> = list.sql().filter(|c| !meta.marker(&c.stored)).collect();
     if !mapped {
-        return schema_string(&order.into_iter().filter(|(c, _)| !meta.marker(c)).cloned().collect::<Vec<_>>());
+        return schema_string(&live.iter().map(|c| (c.stored.clone(), c.dtype.clone())).collect::<Vec<_>>());
     }
-    let mut live: Vec<(usize, &str, &str)> = meta.columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c) && !meta.marker(c)).map(|(i, (c, t))| (i + 1, c.as_str(), t.as_str())).collect();
-    live.sort_by_key(|(_, c, _)| order.iter().position(|(s, _)| s == c));
-    let mut schema: Value = serde_json::from_str(&schema_string(&live.iter().map(|(_, c, t)| (meta.name_of(c).to_string(), t.to_string())).collect::<Vec<_>>())?).ok()?;
-    for (f, (id, stored, _)) in schema["fields"].as_array_mut()?.iter_mut().zip(&live) {
-        f["metadata"] = json!({(MAPPING_ID): id, "delta.columnMapping.physicalName": stored});
+    let mut schema: Value = serde_json::from_str(&schema_string(&live.iter().map(|c| (c.name.clone(), c.dtype.clone())).collect::<Vec<_>>())?).ok()?;
+    for (f, c) in schema["fields"].as_array_mut()?.iter_mut().zip(&live) {
+        f["metadata"] = json!({(MAPPING_ID): c.id, "delta.columnMapping.physicalName": c.stored});
     }
     Some(schema.to_string())
 }
@@ -487,8 +486,9 @@ pub(crate) struct Range {
 /// DROP COLUMN, a later column's Iceberg field id must not land on another column's.
 /// A column whose type doesn't parse is left out: its files then publish no ranges for it, and the table is still published.
 pub(crate) fn columns(meta: &TableMeta) -> Vec<Column> {
-    let published = meta.columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c) && !meta.marker(c));
-    published.filter_map(|(i, (c, t))| Some(Column { i, name: c.clone(), t: crate::answer::dtype(t).ok()? })).collect()
+    let list = meta.column_list();
+    let published = list.stored_order().filter(|c| !meta.marker(&c.stored));
+    published.filter_map(|c| Some(Column { i: c.id as usize - 1, name: c.stored.clone(), t: crate::answer::dtype(&c.dtype).ok()? })).collect()
 }
 
 /// A file's ranges, for the columns `cols` has a range for in the file's statistics. Both open
@@ -567,4 +567,25 @@ fn checkpoint_schema() -> Arc<Schema> {
             st("deletionVector", vec![s("storageType"), s("pathOrInlineDv"), i("offset", DataType::Int32), i("sizeInBytes", DataType::Int32), i("cardinality", DataType::Int64)])]),
         st("remove", vec![s("path"), i("deletionTimestamp", DataType::Int64), i("dataChange", DataType::Boolean)]),
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mapped by name, a field carries its column's id (`Column.id`) and the name the files hold it under, listed in
+    /// SQL's order; a dropped column leaves the schema.
+    #[test]
+    fn a_mapped_fields_id_is_its_columns_id() {
+        let meta = TableMeta {
+            columns: vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into()), ("c".into(), "Int64".into()), ("d".into(), "Utf8".into())],
+            names: [("b".to_string(), "bee".to_string())].into(),
+            dropped: vec!["c".into()],
+            shown: vec!["d".into()],
+            ..Default::default()
+        };
+        let s: Value = serde_json::from_str(&table_schema(&meta, true).unwrap()).unwrap();
+        let got: Vec<(u64, &str, &str)> = s["fields"].as_array().unwrap().iter().map(|f| (f["metadata"][MAPPING_ID].as_u64().unwrap(), f["name"].as_str().unwrap(), f["metadata"]["delta.columnMapping.physicalName"].as_str().unwrap())).collect();
+        assert_eq!(got, [(4, "d", "d"), (1, "a", "a"), (2, "bee", "b")]);
+    }
 }

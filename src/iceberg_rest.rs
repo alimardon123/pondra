@@ -158,15 +158,21 @@ fn sql_name(app: &crate::app::App, parts: &[String], lake: &std::sync::Arc<Lake>
 /// A statement for the catalog's table changes, run as the caller (DDL: an admin's).
 async fn as_caller(app: &crate::app::App, role: crate::auth::Role, sql: &str) -> Result<(), Refusal> {
     let who = crate::routines::Who { role, files: false, depth: 0 };
-    Box::pin(crate::routines::one(app, sql, who, None)).await.map(|_| ()).map_err(|e| {
-        let (raw, words) = (format!("{e:#}"), crate::ext::said(&e)); // (the kind by the engine's words, the message as said)
-        match () {
-            _ if raw.contains("may not") => refused(403, "ForbiddenException", words),
-            _ if raw.contains("already exists") => refused(409, "AlreadyExistsException", words),
-            _ if raw.contains("isn't empty") => refused(409, "NamespaceNotEmptyException", words),
-            _ => bad(words),
-        }
-    })
+    Box::pin(crate::routines::one(app, sql, who, None)).await.map(|_| ()).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), sql.starts_with("DROP SCHEMA")))
+}
+
+/// An error as the Iceberg REST catalog answers it: its exception by the error's SQLSTATE (`codes::kind`), the message as
+/// said. Something still depending on it is a namespace that isn't empty when the namespace is what's dropped.
+fn exception(code: &str, words: String, drops_namespace: bool) -> Refusal {
+    use crate::codes::Kind;
+    match (crate::codes::kind(code), code) {
+        (Kind::Denied, _) => refused(403, "ForbiddenException", words),
+        (Kind::Exists, _) => refused(409, "AlreadyExistsException", words),
+        (_, "2BP01") if drops_namespace => refused(409, "NamespaceNotEmptyException", words),
+        (_, "3F000") => refused(404, "NoSuchNamespaceException", words),
+        (_, "42P01") => refused(404, "NoSuchTableException", words),
+        _ => bad(words),
+    }
 }
 
 /// `POST /v1/namespaces/{ns}/tables`: a table made through the catalog (ADR-029 §8), as `CREATE
