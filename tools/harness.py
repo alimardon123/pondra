@@ -2840,6 +2840,16 @@ def kafka():
     p.produce("rounds", value=json.dumps({"v": 2.5}))
     assert p.flush(30) == 0
     checks["a JSON value's 2.5 into an INT column is 3, as SQL writes it"] = sql_("SELECT v FROM rounds") == [{"v": 3}]
+    # A value its column can't hold (22xxx) is a bad record, said at once, not a timeout the producer sends again until
+    # its delivery timeout: text into a BIGINT, past a SMALLINT, past a DECIMAL(5,2); a good record after them goes in.
+    sql_("CREATE TABLE narrow (n BIGINT, s SMALLINT, d DECIMAL(5,2))")
+    told, t = [], time.time()
+    q = ck.Producer({**sasl("writer", "w-tok"), "message.timeout.ms": 20000})
+    for v in ({"n": "abc"}, {"s": 70000}, {"d": 12345.678}, {"n": 1, "s": 2, "d": 3.25}):
+        q.produce("narrow", value=json.dumps(v), on_delivery=lambda e, m: told.append(e and e.code()))
+        q.flush(30)
+    checks["a value its column can't hold (22xxx) is a bad record, said at once, not retried"] = \
+        (told, time.time() - t < 10, sql_("SELECT n, s, d FROM narrow")) == ([ck.KafkaError.INVALID_RECORD] * 3 + [None], True, [{"n": 1, "s": 2, "d": 3.25}])
     # Debezium's own encodings, as 2.7 sends a Postgres row with its defaults (Kafka Connect's schema beside it):
     # NUMERIC(10,2) as Decimal bytes, NUMERIC as VariableScaleDecimal, TIMESTAMP(3) and TIME(3) in ms, TIME in µs,
     # BYTEA in base64. Before, the decimal was refused and the times landed in 1970 and near midnight.

@@ -88,6 +88,7 @@ const PASSWORD_PLAIN: &str = "a password crosses only TLS from another machine: 
 const INVALID_RECORD: i16 = 87;
 const POLICY_VIOLATION: i16 = 44;
 const REQUEST_TIMED_OUT: i16 = 7; // (retried; "possibly written": an idempotent producer's retry applies once)
+const MESSAGE_TOO_LARGE: i16 = 10; // (not retried)
 
 /// How this node appears to clients.
 struct Broker {
@@ -547,16 +548,21 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
     .boxed()
 }
 
-/// A write's failure, as Kafka says it: a row refused (a CHECK, NOT NULL, a view's expectation) is
-/// a bad record, which a producer doesn't send again; a topic renamed or dropped as it was sent is
-/// unknown; anything else — the leader moving, the bucket out of reach — passes, so it's a timeout,
-/// which a producer retries (an idempotent one's retry is applied once). Said as a policy
-/// violation, a failover failed the producer's records.
+/// A write's failure, as Kafka says it, by its kind (`codes::kind`, the one table every door reads): a record that can
+/// never go in (a value its column can't hold, a CHECK, NOT NULL, a duplicate key, something not supported) is a bad
+/// record, which a producer doesn't send again; a table or schema dropped or renamed as it was sent is an unknown topic;
+/// not allowed is not allowed; past a limit is too large. Anything that may pass on its own (busy, catching up,
+/// stopping, the bucket or the leader silent, a fault) is a timeout, which a producer retries (an idempotent one's retry
+/// is applied once), so only a record that can't succeed is given up on.
 fn failed(e: &anyhow::Error) -> Outcome {
-    let error = match crate::codes::of(e) {
-        c if c.starts_with("23") => INVALID_RECORD,
-        "42P01" => UNKNOWN_TOPIC,
-        _ => REQUEST_TIMED_OUT,
+    use crate::codes::Kind::*;
+    let code = crate::codes::of(e);
+    let error = match crate::codes::kind(code) {
+        Missing if matches!(code, "42P01" | "3F000" | "3D000") => UNKNOWN_TOPIC,
+        Invalid | Refused | Exists | Missing | Unsupported => INVALID_RECORD,
+        SignIn | Denied => TOPIC_AUTHORIZATION_FAILED,
+        TooBig => MESSAGE_TOO_LARGE,
+        Retry | State | Busy | Exhausted | Timeout | Unavailable | Internal => REQUEST_TIMED_OUT,
     };
     (error, -1, Some(crate::ext::said(e)))
 }
@@ -1528,6 +1534,23 @@ async fn offset_fetch(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_write_s_error_is_retried_only_when_it_may_pass() {
+        // (a value its column can't hold was a timeout: the producer sent it again until its delivery timeout, 5 min)
+        let cases = [
+            ("22P02", INVALID_RECORD), ("22003", INVALID_RECORD), ("23502", INVALID_RECORD), ("23514", INVALID_RECORD),
+            ("23505", INVALID_RECORD), ("0A000", INVALID_RECORD), ("42703", INVALID_RECORD), ("42P01", UNKNOWN_TOPIC),
+            ("3F000", UNKNOWN_TOPIC), ("42501", TOPIC_AUTHORIZATION_FAILED), ("54000", MESSAGE_TOO_LARGE),
+            ("40001", REQUEST_TIMED_OUT), ("53300", REQUEST_TIMED_OUT), ("53100", REQUEST_TIMED_OUT), ("57014", REQUEST_TIMED_OUT),
+            ("58030", REQUEST_TIMED_OUT), ("08006", REQUEST_TIMED_OUT), ("55P03", REQUEST_TIMED_OUT), ("XX000", REQUEST_TIMED_OUT),
+        ];
+        for (code, want) in cases {
+            let (got, offset, said) = failed(&crate::codes::coded(code, "why"));
+            assert_eq!((code, got, offset), (code, want, -1));
+            assert!(said.unwrap().contains("why"), "{code}");
+        }
+    }
 
     #[test]
     fn a_batch_decompresses_within_bounds() {
