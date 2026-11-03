@@ -466,7 +466,7 @@ fn touched(app: &App, lines: &[Line]) -> [ArrayRef; 2] {
         };
         let target = w.table.as_ref().map(local);
         let pure = w.pure;
-        match relations(&l.sql) {
+        match crate::text::control(&l.sql).is_none().then(|| relations(&l.sql)).flatten() { // (BEGIN, COMMIT and the like name none: no parse)
             Some(names) => {
                 names.iter().map(local).filter(|n| !(pure && Some(n) == target.as_ref())).for_each(|n| reads.values().append_value(n));
                 reads.append(true);
