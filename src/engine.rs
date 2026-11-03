@@ -108,6 +108,7 @@ fn own(mut ctx: SessionContext) -> SessionContext {
     crate::avg::register(&ctx); // avg(DECIMAL): rounded at its last place
     crate::string_agg::register(&ctx); // string_agg: one group's string held to a share of the query memory
     crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
+    crate::dialect_fns::register(&ctx); // safe_divide(a, b): BigQuery's, typed by its arguments
     crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
     crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
     // `pg_bytea` gives Postgres's bytea functions, `byte_length` among them (DataFusion's other byte functions, sha256

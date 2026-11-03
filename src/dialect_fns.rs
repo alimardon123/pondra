@@ -5,8 +5,10 @@
 //! - MySQL's `CURDATE()`, `UNIX_TIMESTAMP([ts])`, `STR_TO_DATE(s, '%m/%d/%Y')`, `DATE_FORMAT(ts, '%Y-%m-%d %H:%i')` (its
 //!   `FROM_UNIXTIME(n)` is Pondra's own);
 //! - Spark's `date_format(ts, 'yyyy-MM-dd HH:mm')`, Java's letters (a `%` in the format is MySQL's, as above);
-//! - BigQuery's `COUNTIF`, `SAFE_DIVIDE`, `DATE(ts)`, `DATE_TRUNC(d, MONTH)`, `TIMESTAMP_TRUNC(ts, HOUR)`,
+//! - BigQuery's `COUNTIF`, `DATE(ts)`, `DATE_TRUNC(d, MONTH)`, `TIMESTAMP_TRUNC(ts, HOUR)`,
 //!   `TIMESTAMP_DIFF(a, b, HOUR)`, `FORMAT_DATE(fmt, d)`, `PARSE_DATE(fmt, s)`, `UNIX_SECONDS(ts)`, `TIMESTAMP_SECONDS(n)`.
+//!
+//! BigQuery's `SAFE_DIVIDE(a, b)` answers in a type its arguments decide, so it is a function of its own (`register`).
 //!
 //! A name Pondra already has keeps its own meaning where its arguments say so: `decode(bytes, 'hex')`, `date_trunc('month',
 //! ts)`. MySQL's `TIMESTAMPDIFF` counts whole units and Snowflake's counts part boundaries, so it is refused by name with
@@ -124,8 +126,6 @@ pub fn call(name: &str, a: &[&Expr]) -> Result<Option<String>> {
             return Err(crate::codes::coded("42883", format!("TIMESTAMPDIFF counts whole units in MySQL and part boundaries in Snowflake, so it isn't taken: date_diff('{}', {}, {}) counts the boundaries, as DuckDB does", a[0].to_string().to_lowercase(), a[1], a[2])));
         }
         ("countif", 1) => format!("count(CASE WHEN {} THEN 1 END)", a[0]),
-        // (BigQuery divides integers into a FLOAT64, where Postgres's `/` keeps whole numbers)
-        ("safe_divide", 2) => format!("CAST({} AS DOUBLE) / nullif({}, 0)", a[0], a[1]),
         ("date", 1) => format!("CAST({} AS DATE)", a[0]),
         ("date", 3) => format!("make_date({}, {}, {})", a[0], a[1], a[2]),
         // (BigQuery's order, the part a word after the value; `date_trunc('month', d)` is Pondra's own)
@@ -355,6 +355,61 @@ fn java_field(c: char, n: usize) -> Result<&'static str> {
     })
 }
 
+/// BigQuery's `SAFE_DIVIDE(a, b)`, a function in every session: `a / b`, NULL where `b` is 0 (either zero). It answers
+/// in the type BigQuery does, so it is typed by its arguments, which text alone doesn't know: two integers divide into a
+/// DOUBLE (BigQuery's FLOAT64, where Postgres's `/` keeps whole numbers), and anything else as `/` does, so a NUMERIC
+/// stays a NUMERIC (11-03 audit L8: it went through DOUBLE). The same cast, zero check and division in every plan
+/// and every expression planned alone (a CHECK, a DEFAULT).
+pub fn register(ctx: &datafusion::prelude::SessionContext) {
+    ctx.register_udf(divide::SAFE_DIVIDE.clone());
+}
+
+mod divide {
+    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::compute::{kernels::numeric::div, nullif};
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::common::{exec_err, Result, ScalarValue};
+    use datafusion::logical_expr::type_coercion::binary::BinaryTypeCoercer;
+    use datafusion::logical_expr::{ColumnarValue, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
+    use datafusion::physical_expr_common::datum::{apply, apply_cmp};
+    use std::sync::LazyLock;
+
+    pub(super) static SAFE_DIVIDE: LazyLock<ScalarUDF> = LazyLock::new(|| ScalarUDF::new_from_impl(SafeDivide(Signature::any(2, Volatility::Immutable))));
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct SafeDivide(Signature);
+
+    /// What `a` and `b` are cast to before dividing: `/`'s own types, but two integers (or NULLs) as DOUBLEs.
+    fn halves(a: &DataType, b: &DataType) -> Result<(DataType, DataType)> {
+        let whole = |t: &DataType| t.is_integer() || t.is_null();
+        let a = if whole(a) && whole(b) { &DataType::Float64 } else { a };
+        BinaryTypeCoercer::new(a, &Operator::Divide, b).get_input_types()
+    }
+
+    impl ScalarUDFImpl for SafeDivide {
+        fn name(&self) -> &str { "safe_divide" }
+        fn signature(&self) -> &Signature { &self.0 }
+        fn return_type(&self, args: &[DataType]) -> Result<DataType> {
+            let [a, b] = args else { return exec_err!("safe_divide takes two values") };
+            let (a, b) = halves(a, b)?;
+            BinaryTypeCoercer::new(&a, &Operator::Divide, &b).get_result_type()
+        }
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            let [a, b] = &args.args[..] else { return exec_err!("safe_divide takes two values") };
+            let (to_a, to_b) = halves(&a.data_type(), &b.data_type())?;
+            let (a, b) = (a.cast_to(&to_a, None)?, b.cast_to(&to_b, None)?);
+            // (`=`'s comparison, which takes -0.0 as 0 too, where arrow's kernels compare bits)
+            let zero = apply_cmp(Operator::Eq, &b, &ColumnarValue::Scalar(ScalarValue::new_zero(&to_b)?))?;
+            let b = match (b, zero) {
+                (ColumnarValue::Array(b), ColumnarValue::Array(zero)) => ColumnarValue::Array(nullif(&b, zero.as_boolean())?),
+                (ColumnarValue::Scalar(_), ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)))) => ColumnarValue::Scalar(ScalarValue::try_from(&to_b)?),
+                (b, _) => b,
+            };
+            apply(&a, &b, div)?.cast_to(args.return_field.data_type(), None) // (the type `/` gives: no change)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,7 +489,7 @@ mod tests {
         assert_eq!(said("TIMESTAMP_DIFF(a, b, MICROSECOND)").unwrap(), format!("(({} - {}))", us("a"), us("b")));
         assert_eq!(said("DATETIME_DIFF(a, b, DAY)").unwrap(), format!("(({} - {}) / 86400000000)", us("date_trunc('day', a)"), us("date_trunc('day', b)")));
         assert_eq!(said("TIMESTAMP_DIFF(a, b, MONTH)"), None);
-        assert_eq!(said("SAFE_DIVIDE(clicks, views)").unwrap(), "CAST(clicks AS DOUBLE) / nullif(views, 0)");
+        assert_eq!(said("SAFE_DIVIDE(clicks, views)"), None); // (a function of its own, typed by its arguments: `register`)
         assert_eq!(said("DATEPART(week, d)").unwrap(), "CAST((CAST(date_part('doy', d) AS BIGINT) + CAST(date_part('dow', date_trunc('year', d)) AS BIGINT) + 6) / 7 AS INT)");
         assert_eq!(said("DATEPART(isowk, d)").unwrap(), "CAST(date_part('week', d) AS INT)");
         assert_eq!(said("DATEPART(ms, d)").unwrap(), "CAST(CAST(date_part('millisecond', d) AS BIGINT) % 1000 AS INT)");
@@ -443,5 +498,42 @@ mod tests {
         assert_eq!(crate::codes::of(&try_said("DATE_FORMAT(d, '%u')").unwrap_err()), "22023");
         assert_eq!(said("COUNTIF(s = 'paid')").unwrap(), "count(CASE WHEN s = 'paid' THEN 1 END)");
         assert!(call("timestampdiff", &[&Expr::Identifier("hour".into()), &Expr::Identifier("a".into()), &Expr::Identifier("b".into())]).unwrap_err().to_string().contains("date_diff('hour', a, b)"));
+    }
+
+    #[tokio::test]
+    async fn safe_divide_answers_in_the_type_its_arguments_say() {
+        // (11-03 audit L8: a NUMERIC went through DOUBLE. Each row: what is divided, the type its answer must be, and
+        // whether two integers' DOUBLE is meant; the answer's type and text are `/`'s, NULL where `b` is either zero;
+        // once over literals, folded, and once over a table's columns)
+        let ctx = datafusion::prelude::SessionContext::new();
+        register(&ctx);
+        let rows = [
+            ("7, 2", "Float64", true),
+            ("CAST(7 AS SMALLINT), CAST(0 AS BIGINT)", "Float64", true),
+            ("NULL, 2", "Float64", true),
+            ("CAST(7 AS DECIMAL(10, 2)), 2", "Decimal128(", false),
+            ("CAST(1 AS DECIMAL(10, 2)), CAST(3 AS DECIMAL(10, 2))", "Decimal128(", false),
+            ("CAST(1 AS DECIMAL(10, 2)), CAST(0 AS DECIMAL(10, 2))", "Decimal128(", false),
+            ("CAST(1.5 AS DOUBLE), CAST('-0.0' AS DOUBLE)", "Float64", false),
+            ("CAST(1.5 AS DOUBLE), 3", "Float64", false),
+        ];
+        let answer = |sql: String| {
+            let ctx = ctx.clone();
+            async move {
+                let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+                let column = batches[0].column(0).clone();
+                let text = datafusion::arrow::util::display::ArrayFormatter::try_new(column.as_ref(), &Default::default()).unwrap().value(0).to_string();
+                (column.data_type().to_string(), text)
+            }
+        };
+        for (args, typed, whole) in rows {
+            let divided = if whole { "CAST(a AS DOUBLE) / b" } else { "a / b" };
+            for from in [format!("(SELECT {args}) AS t(a, b)"), format!("(VALUES ({args})) AS t(a, b)")] {
+                let ours = answer(format!("SELECT safe_divide(a, b) AS r FROM {from}")).await;
+                let theirs = answer(format!("SELECT CASE WHEN b = 0 THEN NULL ELSE {divided} END AS r FROM {from}")).await;
+                assert_eq!(ours, theirs, "{args}");
+                assert!(ours.0.starts_with(typed), "{args}: {}", ours.0);
+            }
+        }
     }
 }
