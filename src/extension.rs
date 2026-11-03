@@ -296,7 +296,7 @@ pub async fn fetch(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl) -
 /// The file's bytes: a path on this machine (`std::fs`), or a URL read through the store its secret makes, as `read_parquet`
 /// reads one. The check every read makes comes first (`ext::check_url`: a path on the server's disk is the node's owner's, and a
 /// URL needs a secret that covers it). A file over `max` is refused before it is read whole.
-/// Unsigned is every extension in 1.0: a node installs or runs one only when its admin starts it with
+/// Unsigned is every extension in 0.80: a node installs or runs one only when its admin starts it with
 /// `PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true`. Asked of each node as it loads a part (`part`), not only at INSTALL: a record
 /// another node installed, a backup restored or a branch copied is run only where its admin allowed it (audit 11-01 H1).
 #[cfg(feature = "lake")]
