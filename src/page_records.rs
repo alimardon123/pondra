@@ -1,6 +1,6 @@
 //! A joined page's own statements, recorded by its node (audit 11-01 M8). A page that joined a node keeps no records of its own:
 //! what it runs on its lake (its reads of the lake, and the INSERTs it stages) leaves its lines on the node it joined, under the
-//! sign-in's name, as the door `page`, from the request's address. `history::ended` hands each statement to `add`; a sender
+//! sign-in's name, as the door `page-reported` (`REPORTED`), from the request's address. `history::ended` hands each statement to `add`; a sender
 //! started with the page's member (`node::open_joined`, `run`) posts what waits to `POST /cluster/records` once a second, and
 //! `node::Paged::close` posts what is left once (`flush`). The node writes each line as its own (`record`): its audit line when
 //! the class is written there, and its history row.
@@ -71,11 +71,17 @@ fn line(sql: &str, outcome: &str, error: Option<String>, took: Duration) -> Line
 pub struct Buffer {
     lines: VecDeque<Line>,
     dropped: u64,
+    /// The sign-in no longer reaches the node (`Sent::Ended`: a 401 or 403, as a page whose user is no superuser has at its first
+    /// batch): nothing is kept from then on, since nothing will send it (11-02 audit M9).
+    ended: bool,
 }
 
 impl Buffer {
-    /// Keeps a line; past `MAX_LINES` the oldest go, counted.
+    /// Keeps a line; past `MAX_LINES` the oldest go, counted. Once the sender has ended, nothing is kept.
     pub fn push(&mut self, line: Line) {
+        if self.ended {
+            return;
+        }
         self.lines.push_back(line);
         while self.lines.len() > MAX_LINES {
             self.lines.pop_front();
@@ -166,7 +172,11 @@ async fn sweep() -> bool {
                 buffer().give_back(batch);
                 return true;
             }
-            Sent::Ended => return false,
+            Sent::Ended => {
+                let mut b = buffer();
+                (b.ended, b.lines, b.dropped) = (true, VecDeque::new(), 0);
+                return false;
+            }
         }
     }
 }
@@ -204,9 +214,13 @@ pub fn refusal(who: &Principal, token: Option<&str>) -> Option<&'static str> {
     None
 }
 
-/// The principal a page's lines are written as: the sign-in's name and its address, as the door `page`.
+/// The door a joined page's lines are written as: they are what the page says it ran, which no node saw run (a changed page, or
+/// any superuser's sign-in calling `/cluster/records`, may leave lines out or send lines for statements that never ran).
+pub const REPORTED: &str = "page-reported";
+
+/// The principal a page's lines are written as: the sign-in's name and its address, as the door `REPORTED`.
 fn as_page(who: &Principal) -> Principal {
-    who.clone().at("page", who.from)
+    who.clone().at(REPORTED, who.from)
 }
 
 /// Lines recorded a minute for one sign-in's page: when the minute began, the lines recorded, the lines past `CAP` and the
@@ -254,8 +268,8 @@ impl Cap {
         let m = self.minutes.entry(user.to_string()).or_insert(Minute { since: now, ..Default::default() });
         let take = lines.min(CAP.saturating_sub(m.recorded));
         m.recorded += take;
-        m.capped += lines - take;
-        m.lost += lost;
+        m.capped = m.capped.saturating_add(lines - take);
+        m.lost = m.lost.saturating_add(lost); // (the page's own count: a sender's u64 that wraps nothing here)
         Admit { take, ended }
     }
 }
@@ -291,10 +305,10 @@ fn recorded(line: Line) -> Recorded {
 }
 
 /// Writes a batch a joined page sent (`POST /cluster/records`, a superuser's sign-in, `refusal`): each statement as its own audit
-/// line (when its class is written here, or it was refused) and its history row, under `who`'s name as the door `page`.
+/// line (when its class is written here, or it was refused) and its history row, under `who`'s name as the door `REPORTED`.
 /// Lines past the sign-in's `CAP` a minute are not written; the minutes that ended with lines not written are noted by the node.
 pub async fn record(app: &App, who: &Principal, batch: Batch) {
-    let admit = COUNTS.lock().unwrap_or_else(|e| e.into_inner()).admit(&who.name, crate::log::now_ms(), batch.lines.len(), batch.dropped as usize);
+    let admit = COUNTS.lock().unwrap_or_else(|e| e.into_inner()).admit(&who.name, crate::log::now_ms(), batch.lines.len(), usize::try_from(batch.dropped).unwrap_or(usize::MAX));
     for e in admit.ended {
         if e.capped > 0 {
             audit::page_note(app, format!("{} statements of {}'s page were not recorded (more than {CAP} a minute)", e.capped, e.user));
@@ -379,11 +393,11 @@ mod tests {
     }
 
     #[test]
-    fn a_page_writes_as_the_sign_ins_name_and_the_door_page_from_its_address() {
+    fn a_page_writes_as_the_sign_ins_name_and_the_door_page_reported_from_its_address() {
         let from: SocketAddr = "203.0.113.9:4000".parse().unwrap();
         let boss = Principal { name: "boss".into(), ..Principal::of(Role::Admin) }.at("http", Some(from));
         let page = as_page(&boss);
-        assert_eq!((page.name.as_str(), page.door, page.from), ("boss", "page", Some(from)));
+        assert_eq!((page.name.as_str(), page.door, page.from), ("boss", "page-reported", Some(from)), "marked as what the page says it ran");
         assert_eq!(page.role, Role::Admin);
     }
 
@@ -419,5 +433,23 @@ mod tests {
         assert_eq!(lost.take, 0);
         let after = cap.admit("ann", 61_000, 0, 0);
         assert_eq!(after.ended, vec![Ended { user: "boss".into(), capped: 0, lost: 7 }], "boss's minute ends with the 7 the page dropped");
+    }
+
+    #[test]
+    fn a_count_of_lines_the_page_dropped_never_wraps() {
+        let mut cap = Cap::default();
+        cap.admit("boss", 1_000, 0, usize::MAX);
+        cap.admit("boss", 1_000, 0, usize::MAX); // (the page's own count, sent twice: 11-02 audit M9)
+        assert_eq!(cap.admit("ann", 61_000, 0, 0).ended, vec![Ended { user: "boss".into(), capped: 0, lost: usize::MAX }]);
+    }
+
+    #[test]
+    fn a_buffer_whose_sender_ended_keeps_nothing() {
+        let mut b = Buffer::default();
+        b.ended = true; // (as `sweep` leaves it at a 401 or 403: a page whose user is no superuser)
+        for _ in 0..10 {
+            b.push(Line { statement: "SELECT 1".into(), outcome: "ok".into(), error: None, ms: 0 });
+        }
+        assert!(b.take().is_none(), "nothing kept: nothing will send it");
     }
 }

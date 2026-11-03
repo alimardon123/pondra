@@ -650,7 +650,7 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
 }
 
 /// `POST /cluster/records`: a joined page's own statements, which this node writes as its own (`page_records::record`), under the
-/// sign-in's name, as the door `page`. Only a superuser's own sign-in sends them (`page_records::refusal`: never the nodes' key, a
+/// sign-in's name, as the door `page-reported` (`page_records::REPORTED`). Only a superuser's own sign-in sends them (`page_records::refusal`: never the nodes' key, a
 /// user with grants, or a procedure's lent token); a batch past `BATCH_LINES` lines is 413.
 async fn records(State(app): State<App>, headers: axum::http::HeaderMap, Json(batch): Json<crate::page_records::Batch>) -> Response {
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer "));
@@ -927,7 +927,9 @@ async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<J
     ensure!(!app.members.reader(), "read-only node");
     let who = crate::auth::current().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None));
     let Some(slug) = crate::auth::slug(&who) else { return Err(crate::codes::coded("42501", "a staged INSERT is a user's: its sign-in has no name to stage under").into()) };
-    ensure!(crate::auth::staged_job(job), "a staged INSERT's job is letters, digits and hyphens, 64 at most");
+    if !crate::auth::staged_job(job) {
+        return Err(crate::codes::coded("22023", "a staged INSERT's job is letters, digits and hyphens, 64 at most").into()); // (invalid_parameter_value)
+    }
     crate::auth::check_rows(name)?; // (its INSERT grant, as SQL's)
     let Staged { columns, files } = serde_json::from_str(body)?;
     if files > crate::write::STAGED_FILES_MOST {
@@ -942,11 +944,7 @@ async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<J
     if !there.is_empty() && (there.len() as u64 != files || there.iter().enumerate().any(|(i, &n)| n != i as u64)) {
         return Err(crate::codes::coded("55000", format!("the page staged {files} files for this INSERT and {} are here: it is sent again whole", there.len())).into());
     }
-    let meta = app.lake.table_meta(name).await?;
-    let live: Vec<&str> = meta.live().map(|(_, logical, _)| logical).collect();
-    if let Some(c) = columns.iter().find(|c| !live.contains(&c.as_str())) {
-        return Err(crate::codes::coded("42703", format!("{name} has no column {c}")).into());
-    }
+    // (a column it doesn't have, or names twice, is refused by `whole_rows` as any INSERT's is, before the files are read)
     let picks: Vec<String> = columns.iter().enumerate().map(|(i, c)| format!("c{i} AS \"{}\"", c.replace('"', "\"\""))).collect();
     let url = format!("{}/stage/{slug}/{job}/*.parquet", app.lake.url.trim_end_matches('/')).replace('\'', "''");
     let stmt = crate::write::Stmt::InsertInto(name.to_string(), columns, format!("SELECT {} FROM '{url}'", picks.join(", ")));

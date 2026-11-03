@@ -158,20 +158,18 @@ as a service.
 **Where DuckDB is stronger:**
 
 - It is the reference for single-machine SQL, with a mature ecosystem and extensions.
-- With the data in memory, on 4 cores (Pondra 0.32), DuckDB 1.5's own format was about 15% ahead on
-  TPC-H SF1 (1.05 s against Pondra's 1.24 s), and its 2.0 preview more (0.92 s). On ClickBench 2.0's
-  preview was ahead (6.22 s against 6.58 s) and 1.5 behind (7.18 s).
+- It is faster on one machine. On 4 cores (10-31, DuckDB 2.0.0), its own tables answer TPC-H SF1
+  in 0.81 s against Pondra's 0.99 s from memory, and the 10 million rows of ClickBench in 6.50 s
+  against 7.79 s. Over Parquet files it takes 1.55 s against 2.04 s and 9.96 s against 11.03 s
+  ([Performance](/pondra/concepts/performance/)).
 - It is small, about 20 MB for its command line, against 118 MB for Pondra's one binary (its
   server, every door, TLS and Python's bridge included).
 
 **Where Pondra fits:**
 
-- Reading Parquet on 4 cores (Pondra 0.32), Pondra was level with DuckDB 1.5 on TPC-H SF1 (2.16 s against
-  2.05 to 2.19 s) and ahead of DuckDB 1.5 and 2.0's preview on ClickBench (10.47 s against 11.10 and
-  10.89 s).
-- Reading Parquet files on 2 vCPUs, Pondra was the fastest of five at SF10 (38.0 s, against DuckDB's 39.8 s), and
-  level with Polars' streaming engine at SF1. Polars' streaming engine took 3.18 s to Pondra's 3.19 s.
-  Daft took 6.11 s.
+- It is ahead where the work is in the expressions (ClickBench's regular expression, q29: 1.56 s
+  against DuckDB 2.0.0's 3.05 s), and on a bucket with nothing cached: TPC-H SF1's 22 queries over
+  Parquet files on R2 take 14.1 s, against DuckDB 2.0.0's 15.4 s (11-02).
 - It also ingests, streams, serves and spreads a query over machines.
 - It speaks their words. `read_parquet`, `delta_scan`, `CREATE MACRO` and `ASOF JOIN` work as in
   DuckDB, and `pondra.frame` uses Polars' method names.

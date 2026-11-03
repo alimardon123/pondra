@@ -26,14 +26,8 @@ import harness
 # message (`match`, a regex). Each hit is counted in the report under its id, never skipped silently, and once an entry
 # is past `expires` the run fails: by then it is fixed and gone from here, or looked at again with a new date.
 KNOWN = [
-    {"id": "zero-times-decimal",
-     "match": r"simplify_expressions.*CASE expression 'then' values had multiple data types: Decimal128",
-     "evidence": "DataFusion 55's simplifier turns `a * 0` into the zero as written, with the zero's DECIMAL type and not the "
-                 "product's: `0.00 * COALESCE(0.5, 1.0)` is Decimal128(2, 2), where DuckDB has DECIMAL(5,3), and the same "
-                 "0. A CASE or COALESCE whose other branch has the product's type is then refused: "
-                 "COALESCE(((-0.5 * 0.5) - (NULL * 3.75)), ((3.75 - 3.75) * COALESCE(0.5, -1.25))) (seed 3434, round 34). "
-                 "To fix upstream, or in a rule of ours ahead of the simplifier.",
-     "expires": "2026-12-01"},
+    # {"id": "...", "match": r"a regex on Pondra's refusal", "evidence": "what it is, and the query", "expires": "YYYY-MM-DD"}
+    # (none now: `zero-times-decimal`, DataFusion's `x * 0` of a DECIMAL, is optimize.rs's DecimalIdentities)
 ]
 
 TYPES = {"i": "INT", "b": "BIGINT", "d": "DECIMAL(10,2)", "f": "DOUBLE", "s": "VARCHAR", "t": "BOOLEAN", "dt": "DATE"}

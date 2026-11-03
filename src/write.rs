@@ -1957,14 +1957,14 @@ const STAGE_BYTES: usize = 48 << 20;
 /// How many times a staged file is sent while its node answers that it is busy (`served::busy`), a second apart.
 const STAGE_TRIES: usize = 5;
 
-/// The INSERT a joined page stages (`run_listed`): a plain INSERT whose query isn't VALUES (the node's log takes those), with the
-/// columns it names (none: the table's first ones, as many as the query's width).
 /// Whether `sql` is an INSERT a joined page stages (`stage_insert`): one predicate for the page's routing (`page::own_insert`) and
 /// `run_listed`. An upsert (ON CONFLICT, OR IGNORE, OR REPLACE) parses to a MERGE, which is never staged: the node runs it.
 pub fn stages(sql: &str) -> bool {
     parse(sql).as_ref().is_some_and(|s| staging(s).is_some())
 }
 
+/// The INSERT a joined page stages (`run_listed`): a plain INSERT whose query isn't VALUES (the node's log takes those), with the
+/// columns it names (none: the table's first ones, as many as the query's width).
 fn staging(stmt: &Stmt) -> Option<(&str, &[String], &str)> {
     match stmt {
         Stmt::Insert(t, q) if crate::rules::rows::plain_values(q).is_none() => Some((t.as_str(), &[] as &[String], q.as_str())),
@@ -1988,30 +1988,42 @@ fn stage_job(job: &str) -> String {
 /// node's. A refusal keeps its SQLSTATE: the node's own for the rows, and 28000 or 42501 for the sign-in and the staged files.
 async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], query: &str, job: &str, files: bool) -> Result<Value> {
     let lake = &app.lake;
-    let slug = crate::dial::page_slug().context("a joined page stages its rows under its user's folder, and its node gave it none")?;
+    let slug = crate::dial::page_slug().ok_or_else(|| crate::codes::coded("42501", "a joined page stages its rows under its user's folder, and its node gave it none"))?;
     let stage = stage_job(job);
     let ctx = session(lake, query, "").await?;
     let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
-    in_order(&ctx);
-    let df = crate::engine::sql(&ctx, &crate::sys::planned(query)?).await?;
-    let width = df.schema().fields().len();
-    let live: Vec<String> = lake.table_meta(table).await?.sql_order(); // (SQL's order: a query's columns fill them first to last)
-    let names: Vec<String> = match names.is_empty() {
-        true if width > live.len() => return Err(crate::codes::coded("42601", format!("INSERT has more expressions than target columns ({width} given, {table} has {})", live.len()))),
-        true => live[..width].to_vec(),
-        false if names.len() > width => return Err(crate::codes::coded("42601", "INSERT has more target columns than expressions")),
-        false if names.len() < width => return Err(crate::codes::coded("42601", "INSERT has more expressions than target columns")),
-        false => names.to_vec(),
-    };
-    let fields: Vec<datafusion::arrow::datatypes::Field> = df.schema().fields().iter().enumerate().map(|(i, f)| datafusion::arrow::datatypes::Field::new(format!("c{i}"), f.data_type().clone(), true)).collect();
-    let schema: SchemaRef = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
+    let order = crate::rules::rows::row_columns(lake.table_meta(table).await?.sql_order(), names);
     let dir = format!("stage/{slug}/{stage}/");
     let next = std::sync::atomic::AtomicU64::new(0);
-    let partitions = df.execute_stream_partitioned().await?;
-    futures::future::try_join_all(partitions.into_iter().map(|rows| stage_stream(lake, &dir, schema.clone(), rows, &next))).await?;
-    if next.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-        stage_put(lake, &dir, crate::tier::writer(schema.clone(), &[])?, &next).await?; // (no rows: one file of none, so the node answers it as any INSERT of none)
-    }
+    // (out of memory, once more frugally, as a node's INSERT … SELECT runs (`write_files`); but only while nothing is staged: a
+    // staged file holds some of the first try's rows, and is never overwritten)
+    let names = crate::query::frugally(&ctx, |ctx| {
+        let (order, dir, next) = (&order, &dir, &next);
+        async move {
+            if next.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                return Err(crate::codes::coded("53200", "out of memory: this INSERT's query outgrew the page's memory after it had staged some of its rows, so it isn't run again, and nothing was written (memory_max_gb)"));
+            }
+            in_order(&ctx);
+            let df = crate::engine::sql(&ctx, &crate::sys::planned(query)?).await?;
+            let width = df.schema().fields().len();
+            // (the columns its rows fill, as `whole_rows_of` works them out: the node reads the staged files by these names, so a
+            // width that differs is refused here, in the words a node's own INSERT says it with)
+            let names: Vec<String> = if names.is_empty() { crate::rules::fit::implicit(order, Some(width)).to_vec() } else { names.to_vec() };
+            if names.len() != width {
+                return Err(crate::rules::rows::width_refused(table, names.len(), width));
+            }
+            let fields: Vec<datafusion::arrow::datatypes::Field> = df.schema().fields().iter().enumerate().map(|(i, f)| datafusion::arrow::datatypes::Field::new(format!("c{i}"), f.data_type().clone(), true)).collect();
+            let schema: SchemaRef = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
+            let partitions = df.execute_stream_partitioned().await?;
+            futures::future::try_join_all(partitions.into_iter().map(|rows| stage_stream(lake, dir, schema.clone(), rows, next))).await?;
+            if next.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                // (no rows: one file of none, so the node answers it as any INSERT of none)
+                let stored = crate::answer::storable(&RecordBatch::new_empty(schema))?.schema();
+                stage_put(lake, dir, crate::tier::writer(stored, &[])?, next).await?;
+            }
+            Ok(names)
+        }
+    }).await?;
     let files = next.load(std::sync::atomic::Ordering::Relaxed); // (the node takes the INSERT only when it finds exactly these)
     let call = crate::dial::Call::json(format!("/insert/{}?job={stage}&staged=1", percent_encoding::utf8_percent_encode(table, percent_encoding::NON_ALPHANUMERIC)), &j!({"columns": names, "files": files}))?;
     let reply = crate::dial::call(&app.members.leader().addr, call).await?;
@@ -2036,9 +2048,10 @@ async fn stage_stream(lake: &Lake, dir: &str, schema: SchemaRef, mut rows: dataf
         if batch.num_rows() == 0 {
             continue;
         }
-        let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?;
+        // (as Parquet holds it: an INTERVAL as its text, which the node's INSERT casts back exactly, as a tier file's is)
+        let batch = crate::answer::storable(&RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?)?;
         if open.is_none() {
-            open = Some(crate::tier::writer(schema.clone(), &[])?); // (the properties `write_files`' files have: no system columns, no statistics kept)
+            open = Some(crate::tier::writer(batch.schema(), &[])?); // (the properties `write_files`' files have: no system columns, no statistics kept)
         }
         let w = open.as_mut().expect("a file is open");
         w.write(&batch)?;
@@ -2064,7 +2077,9 @@ async fn stage_put(lake: &Lake, dir: &str, mut w: datafusion::parquet::arrow::ar
     if n >= STAGED_FILES_MOST {
         return Err(crate::codes::coded("54000", "a staged INSERT takes a million files at most")); // (Postgres's program limit exceeded)
     }
-    ensure!(bytes.len() <= 64 << 20, "a staged file is past 64 MB: the INSERT's rows come in smaller files");
+    if bytes.len() > 64 << 20 {
+        return Err(crate::codes::coded("54000", "a staged file is past 64 MB: the INSERT's rows come in smaller files")); // (program_limit_exceeded)
+    }
     let (at, bytes) = (object_store::path::Path::from(format!("{dir}{n}.parquet")), Bytes::from(bytes));
     let create = || object_store::PutOptions { mode: object_store::PutMode::Create, ..Default::default() };
     for _ in 1..STAGE_TRIES {

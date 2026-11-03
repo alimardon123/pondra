@@ -9,7 +9,12 @@
 //!
 //! Each spill file is a list of extents of the one file: a writer buffers up to `BUFFER` and writes it at the tail, or in a
 //! freed extent of its size or more (first fit); a reader reads the extents in order, `READ` at a time. A dropped spill file
-//! gives its extents back, and when none is left the file is emptied. The file's size is capped (`State::cap`).
+//! gives its extents back, and when none is left the file is emptied. The file's size is capped (`State::cap`), and the cap is
+//! worked out again at most once a second while the file is written (`refresh`), so two tabs that spill share what is free
+//! rather than each holding half of it as it was when they opened (11-02 audit L7).
+//!
+//! Every page's open sweeps the folder, a page with no spill file too (`start`): a crashed Worker's file goes at the next
+//! page's open, in a Worker or not.
 
 use crate::js;
 use crate::opfs;
@@ -39,6 +44,8 @@ const BUFFER: usize = 1 << 20;
 /// What a read takes at a time: DataFusion's own read size (a larger one would be charged whole to the merge's memory for
 /// every small batch sliced from it).
 const READ: usize = 128 << 10;
+/// How often, at most, the cap is worked out again while the file is written (`refresh`), in ms.
+const REFRESH_MS: f64 = 1000.0;
 
 /// Bytes written to spill files, ever (`spilledBytes`).
 static SPILLED: AtomicU64 = AtomicU64::new(0);
@@ -68,6 +75,8 @@ struct State {
     folder: Option<Handle>, // the folder it is in, and `name` its name there, for its removal at the end
     name: String,
     cap: u64,          // the most the file may hold: its tail never grows past it
+    fixed: bool,       // the cap is `PONDRA_SPILL_GB`'s, never worked out again
+    refreshed: f64,    // when the cap was last worked out (`Date.now()`); infinite while a refresh is under way
     tail: u64,         // the file's end: a write that takes no freed extent goes there
     free: Vec<Extent>, // extents no spill file holds, sorted by `at`, none touching another
     files: HashMap<u64, Vec<Extent>>, // each spill file alive, with its extents in the order it reads them
@@ -90,14 +99,15 @@ impl OpfsSpills {
     async fn open() -> Result<OpfsSpills, String> {
         let global = JsValue::from(js_sys::global());
         let storage = js::get(&js::get(&global, "navigator")?, "storage")?;
-        let cap = cap_of(&storage).await?;
+        let (cap, fixed) = cap_of(&storage).await?;
         let root = js::awaited(&storage, "getDirectory", &[]).await.map_err(js::js_words)?;
         let folder = js::awaited(&root, "getDirectoryHandle", &[FOLDER.into(), opfs::create_option(true)?]).await.map_err(js::js_words)?;
         let name = uuid(&global)?;
         let file = js::awaited(&folder, "getFileHandle", &[name.as_str().into(), opfs::create_option(true)?]).await.map_err(js::js_words)?;
         let handle = js::awaited(&file, "createSyncAccessHandle", &[]).await.map_err(js::js_words)?;
         sweep(&folder, &name).await;
-        let state = State { handle: Some(Handle(handle)), folder: Some(Handle(folder)), name, cap, tail: 0, free: vec![], files: HashMap::new(), next: 0 };
+        let refreshed = js_sys::Date::now();
+        let state = State { handle: Some(Handle(handle)), folder: Some(Handle(folder)), name, cap, fixed, refreshed, tail: 0, free: vec![], files: HashMap::new(), next: 0 };
         let shared = Arc::new(Mutex::new(state));
         *OPEN.lock().unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&shared);
         Ok(OpfsSpills { shared })
@@ -185,8 +195,15 @@ impl Writer {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        lock(&self.shared).place(self.id, &self.buffer)?;
+        let due = {
+            let mut state = lock(&self.shared);
+            state.place(self.id, &self.buffer)?;
+            state.due()
+        };
         self.buffer.clear();
+        if due {
+            spawn_local(refresh(Arc::downgrade(&self.shared)));
+        }
         Ok(())
     }
 }
@@ -252,6 +269,16 @@ impl Stream for Reader {
 }
 
 impl State {
+    /// Whether the cap is due to be worked out again (`refresh`): not a fixed one, and not within `REFRESH_MS` of the last time or
+    /// while a refresh is under way. A due one is marked under way.
+    fn due(&mut self) -> bool {
+        if self.fixed || js_sys::Date::now() - self.refreshed < REFRESH_MS {
+            return false;
+        }
+        self.refreshed = f64::INFINITY;
+        true
+    }
+
     /// Writes `bytes` as one extent of spill file `id`: at the first freed extent of its size or more, else at the tail, which
     /// must stay within the cap. The state changes only once the write has been made, so a refused one leaves it as it was.
     fn place(&mut self, id: u64, bytes: &[u8]) -> io::Result<()> {
@@ -342,16 +369,38 @@ fn closed() -> io::Error {
     io::Error::other("this page's spill file is closed")
 }
 
-/// The most the file may hold: `PONDRA_SPILL_GB` when it is given (read as the core reads it), else half of what the origin has
-/// free (`navigator.storage.estimate()`'s quota less its usage), so a kept page's own files keep the other half.
-async fn cap_of(storage: &JsValue) -> Result<u64, String> {
+/// The most the file may hold, and whether that is fixed: `PONDRA_SPILL_GB` when it is given (read as the core reads it), else
+/// half of what the origin has free, so a kept page's own files keep the other half (`refresh` works it out again).
+async fn cap_of(storage: &JsValue) -> Result<(u64, bool), String> {
     if let Some(gb) = pondra::env::parse::<f64>("PONDRA_SPILL_GB").filter(|gb| *gb >= 0.0) {
-        return Ok((gb * crate::GIB) as u64);
+        return Ok(((gb * crate::GIB) as u64, true));
     }
+    Ok((free_of(storage).await? / 2, false))
+}
+
+/// What the origin has free: `navigator.storage.estimate()`'s quota less its usage, which counts this page's spill file too.
+async fn free_of(storage: &JsValue) -> Result<u64, String> {
     let estimate = js::awaited(storage, "estimate", &[]).await.map_err(js::js_words)?;
     let quota = js::get(&estimate, "quota")?.as_f64().ok_or("the browser gives the site no storage quota")?;
     let usage = js::get(&estimate, "usage")?.as_f64().unwrap_or(0.0);
-    Ok(((quota - usage).max(0.0) / 2.0) as u64)
+    Ok((quota - usage).max(0.0) as u64)
+}
+
+/// The cap worked out again as the file grows (`Writer::out`, at most once a second): what the file holds now, and half of what
+/// the origin has free now, so a tab that spills later, or a kept page's next write, still finds room. A cap that falls below the
+/// file's tail only stops it growing. An estimate that fails keeps the cap as it was.
+async fn refresh(shared: Weak<Mutex<State>>) {
+    let global = JsValue::from(js_sys::global());
+    let free = match js::get(&global, "navigator").and_then(|navigator| js::get(&navigator, "storage")) {
+        Ok(storage) => free_of(&storage).await,
+        Err(e) => Err(e),
+    };
+    let Some(shared) = shared.upgrade() else { return }; // (the file has ended)
+    let mut state = lock(&shared);
+    state.refreshed = js_sys::Date::now();
+    if let Ok(free) = free {
+        state.cap = state.tail + free / 2;
+    }
 }
 
 /// A new name for the file: `crypto.randomUUID()`.
@@ -369,6 +418,21 @@ async fn sweep(folder: &JsValue, keep: &str) {
         if file && name != keep {
             let _ = js::awaited(folder, "removeEntry", &[name.as_str().into()]).await;
         }
+    }
+}
+
+/// The folder swept by a page that keeps no spill file (`start`): every file goes but one a live Worker holds. (A Worker's page
+/// that is between making its file and opening its handle loses it here, and runs with no spill file, as on the main thread.)
+async fn sweep_left() {
+    let folder = async {
+        let global = JsValue::from(js_sys::global());
+        let storage = js::get(&js::get(&global, "navigator")?, "storage")?;
+        let root = js::awaited(&storage, "getDirectory", &[]).await.map_err(js::js_words)?;
+        // (no folder: no page spilled here, and none is made)
+        js::awaited(&root, "getDirectoryHandle", &[FOLDER.into(), opfs::create_option(false)?]).await.map_err(js::js_words)
+    };
+    if let Ok(folder) = folder.await {
+        sweep(&folder, "").await;
     }
 }
 
@@ -392,6 +456,9 @@ pub(crate) struct Spills {
 /// thread.
 pub(crate) fn start() -> Option<Spills> {
     if !available() || pondra::env::parse::<f64>("PONDRA_SPILL_GB") == Some(0.0) {
+        if opfs::available() {
+            spawn_local(sweep_left()); // (no file of its own, but what a crashed Worker's page left still goes)
+        }
         return None;
     }
     let ended = Rc::new(Cell::new(false));
