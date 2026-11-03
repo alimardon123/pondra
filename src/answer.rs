@@ -220,11 +220,49 @@ fn joined(mut out: Vec<u8>, more: Vec<u8>) -> Vec<u8> {
 }
 
 /// A piece's rows as newline-delimited JSON (`render`'s own writer, one line a row).
-fn lines(b: &RecordBatch) -> anyhow::Result<Vec<u8>> {
-    let mut w = arrow_json::LineDelimitedWriter::new(Vec::new());
-    w.write_batches(&[b])?;
+fn lines(b: &RecordBatch) -> anyhow::Result<Vec<u8>> { json_lines([b]) }
+
+// ---------------------------------------------------------------- rows as JSON
+//
+// The one place rows become JSON, for every door and every answer that carries rows inside it: Arrow's writer, so a
+// value is written the same way wherever it goes (a NULL left out of its row's object). `json` is an array of row
+// objects (`[]` for none), `json_lines` one object a line (NDJSON), `json_each` each row's object on its own, and
+// `json_values` the first rows as values, for an answer that holds them inside JSON of its own.
+
+/// Rows as a JSON array of objects.
+pub fn json<'a>(batches: impl IntoIterator<Item = &'a RecordBatch>) -> Result<Vec<u8>> {
+    let mut w = arrow_json::ArrayWriter::new(Vec::new());
+    for b in batches {
+        w.write(b)?;
+    }
     w.finish()?;
     Ok(w.into_inner())
+}
+
+/// Rows as newline-delimited JSON, one object a line.
+pub fn json_lines<'a>(batches: impl IntoIterator<Item = &'a RecordBatch>) -> Result<Vec<u8>> {
+    let mut w = arrow_json::LineDelimitedWriter::new(Vec::new());
+    for b in batches {
+        w.write(b)?;
+    }
+    w.finish()?;
+    Ok(w.into_inner())
+}
+
+/// Each row's JSON object on its own, in order.
+pub fn json_each(b: &RecordBatch) -> Result<Vec<Vec<u8>>> {
+    Ok(json_lines([b])?.split(|&c| c == b'\n').take(b.num_rows()).map(<[u8]>::to_vec).collect())
+}
+
+/// The first `n` rows as JSON values (only those rows are written).
+pub fn json_values(batches: &[RecordBatch], n: usize) -> Result<Vec<Value>> {
+    let mut left = n;
+    let first: Vec<RecordBatch> = batches.iter().map_while(|b| (left > 0).then(|| {
+        let take = left.min(b.num_rows());
+        left -= take;
+        b.slice(0, take)
+    })).collect();
+    Ok(serde_json::from_slice(&json(&first)?)?)
 }
 
 /// What keeps an answer's rows for its later pages and says the id they are kept under (`pages::keep` on a node; a
@@ -253,12 +291,7 @@ pub fn render(batches: &[RecordBatch], format: Option<&str>, keep: Keep) -> anyh
             }
             w.into_inner()
         }
-        Some("ndjson") => {
-            let mut w = arrow_json::LineDelimitedWriter::new(Vec::new());
-            w.write_batches(&batches.iter().collect::<Vec<_>>())?;
-            w.finish()?;
-            w.into_inner()
-        }
+        Some("ndjson") => json_lines(batches)?,
         Some("parquet") => {
             let batches = batches.iter().map(storable).collect::<anyhow::Result<Vec<_>>>()?; // (intervals as text)
             let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
@@ -269,12 +302,7 @@ pub fn render(batches: &[RecordBatch], format: Option<&str>, keep: Keep) -> anyh
             w.into_inner()?
         }
         Some("xlsx") => crate::xlsx::workbook(batches)?,
-        _ => {
-            let mut w = arrow_json::ArrayWriter::new(Vec::new());
-            w.write_batches(&batches.iter().collect::<Vec<_>>())?;
-            w.finish()?;
-            w.into_inner()
-        }
+        _ => json(batches)?,
     }))
 }
 
@@ -289,20 +317,19 @@ pub const MOST: usize = 100_000;
 /// downloaded, are read from there (`page`), not run again.
 pub fn typed(batches: &[RecordBatch], shown: usize, keep: Keep) -> anyhow::Result<Vec<u8>> {
     let columns: Vec<Value> = batches.first().map(|b| b.schema().fields().iter().map(|f| j!({"name": f.name(), "type": type_name(f.data_type())})).collect()).unwrap_or_default();
-    let mut w = arrow_json::ArrayWriter::new(Vec::new());
     let mut left = shown;
+    let mut written = vec![];
     for b in batches.iter().filter(|b| b.num_rows() > 0) {
         let b = b.slice(0, left.min(b.num_rows()));
         left -= b.num_rows();
         let exact: Vec<datafusion::arrow::array::ArrayRef> = b.columns().iter().map(exact).collect::<Result<_, _>>()?;
         let numbered: Vec<_> = b.schema().fields().iter().zip(&exact).enumerate().map(|(i, (f, c))| f.as_ref().clone().with_name(i.to_string()).with_data_type(c.data_type().clone())).collect(); // (unique keys)
-        w.write(&RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(numbered)), exact)?)?;
+        written.push(RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(numbered)), exact)?);
         if left == 0 {
             break;
         }
     }
-    w.finish()?;
-    let objects: Vec<serde_json::Map<String, Value>> = serde_json::from_slice(&w.into_inner()).unwrap_or_default();
+    let objects: Vec<serde_json::Map<String, Value>> = serde_json::from_slice(&json(&written)?).unwrap_or_default();
     let rows: Vec<Value> = objects.into_iter().map(|mut o| Value::Array((0..columns.len()).map(|i| o.remove(&i.to_string()).unwrap_or(Value::Null)).collect())).collect();
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     let pages = keep(batches);

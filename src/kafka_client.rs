@@ -669,12 +669,7 @@ pub async fn copy_to(lake: &crate::store::Lake, df: datafusion::prelude::DataFra
                 let text = text.as_string::<i32>();
                 (0..b.num_rows()).map(|i| (!text.is_null(i)).then(|| text.value(i).as_bytes().to_vec())).collect()
             }
-            _ => {
-                let mut w = datafusion::arrow::json::LineDelimitedWriter::new(vec![]);
-                w.write(&b)?;
-                w.finish()?;
-                w.into_inner().split(|c| *c == b'\n').filter(|l| !l.is_empty()).map(|l| Some(l.to_vec())).collect()
-            }
+            _ => crate::answer::json_each(&b)?.into_iter().map(Some).collect(),
         };
         let keys: Vec<Option<Vec<u8>>> = match key_at {
             Some(k) => {
