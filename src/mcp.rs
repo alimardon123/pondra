@@ -145,13 +145,13 @@ fn tools() -> Value {
     ])
 }
 
-/// A tool's answer as its result, or the JSON-RPC error for a tool the server doesn't have
+/// A tool's answer (its JSON, as text) as its result, or the JSON-RPC error for a tool the server doesn't have
 /// (-32602, Invalid params, with its SQLSTATE 42883 in `data`). A tool that fails is a result with
 /// `isError`, its message carrying the SQLSTATE: the agent sees it and can act on it.
 async fn call(app: &App, role: Role, params: &Value) -> Result<Value, Value> {
     let arg = |k: &str| params["arguments"][k].as_str().unwrap_or_default();
     let out = match params["name"].as_str().unwrap_or_default() {
-        "list_tables" => list(app).await,
+        "list_tables" => list(app).await.map(|v| v.to_string()),
         "query" => query(app, role, arg("sql")).await,
         "write" => write(app, role, arg("sql"), params["arguments"]["job"].as_str()).await,
         "changes" => changes(app, arg("table"), params["arguments"]["after"].as_u64()).await,
@@ -171,7 +171,7 @@ async fn call(app: &App, role: Role, params: &Value) -> Result<Value, Value> {
         }
     };
     let (text, error) = match out {
-        Ok(v) => (v.to_string(), false),
+        Ok(text) => (text, false),
         Err(e) => {
             // (a tool error, which the agent sees and can act on: Postgres's code and the words every door gives, a
             // routine's code cut for a user who may not see it)
@@ -258,7 +258,7 @@ async fn list(app: &App) -> Result<Value> {
 /// A query's rows as JSON. Never a write (the write tool's, and BEGIN, COMMIT and ROLLBACK too). Run as every door runs a
 /// statement (`statement::run`): in a session it reads the transaction's snapshot and its own writes, and `$name`s are
 /// the session's variables; several statements run as a script.
-async fn query(app: &App, role: Role, sql: &str) -> Result<Value> {
+async fn query(app: &App, role: Role, sql: &str) -> Result<String> {
     if crate::statement::is_write(sql) {
         return Err(crate::codes::coded("25006", "this changes data or a transaction: use the write tool")); // (a read-only tool: Postgres's read_only_sql_transaction)
     }
@@ -266,7 +266,8 @@ async fn query(app: &App, role: Role, sql: &str) -> Result<Value> {
     let how = crate::statement::How { job: None, spread: None, after: None, stale: None };
     let who = crate::routines::Who { role, files: false, depth: 0 };
     match crate::statement::run(app, req, how, who, &McpWire).await? {
-        crate::statement::Answer::Own(v) | crate::statement::Answer::Done(v) => Ok(v),
+        crate::statement::Answer::Own(text) => Ok(text),
+        crate::statement::Answer::Done(v) => Ok(v.to_string()),
         crate::statement::Answer::Rows(batches) => rows_json(&batches),
         _ => anyhow::bail!("an answer no tool asks for"), // (MCP keeps no answer and streams none)
     }
@@ -276,17 +277,39 @@ async fn query(app: &App, role: Role, sql: &str) -> Result<Value> {
 struct McpWire;
 
 impl crate::statement::Wire for McpWire {
-    type Own = Value;
+    type Own = String;
     fn kept_as(&self) -> Option<std::borrow::Cow<'_, str>> { None }
-    fn encode(&self, rows: Vec<RecordBatch>) -> Result<(Option<Bytes>, Value)> { Ok((None, rows_json(&rows)?)) }
+    fn encode(&self, rows: Vec<RecordBatch>) -> Result<(Option<Bytes>, String)> { Ok((None, rows_json(&rows)?)) }
 }
 
 /// A query's answer as a tool's JSON: its first rows, and the total.
-fn rows_json(batches: &[RecordBatch]) -> Result<Value> { Ok(json!({"rows": rows(batches)?, "total_rows": total(batches)})) }
+fn rows_json(batches: &[RecordBatch]) -> Result<String> { Rows { total_rows: Some(total(batches)), ..Rows::of(batches, ROWS)? }.text() }
+
+/// A tool's answer that carries rows: the rows as every door writes them (`answer::json_first`, put in as written:
+/// parsed back, a DECIMAL would keep only what a double holds), and what goes with them.
+#[derive(serde::Serialize)]
+struct Rows {
+    rows: Box<serde_json::value::RawValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notices: Vec<String>,
+}
+
+impl Rows {
+    /// The first `n` rows, and nothing with them yet.
+    fn of(batches: &[RecordBatch], n: usize) -> Result<Rows> {
+        Ok(Rows { rows: crate::answer::json_first(batches, n)?, total_rows: None, position: None, notices: vec![] })
+    }
+
+    fn text(&self) -> Result<String> { Ok(serde_json::to_string(self)?) }
+}
 
 /// The write tool's SQL, run as POST /sql runs it (`run`): one statement or several, a
 /// transaction's BEGIN … COMMIT in its session, and `job`, so a retry is applied once.
-async fn write(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<Value> {
+async fn write(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<String> {
     let (out, heard) = crate::routines::with_notices(run(app, role, sql, job.map(String::from))).await;
     answer(out, heard)
 }
@@ -315,30 +338,31 @@ async fn run(app: &App, role: Role, sql: &str, job: Option<String>) -> Result<cr
 }
 
 /// A procedure's answer, as a tool's: its rows or outcome, and what it printed (`notices`).
-async fn called(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<Value> {
+async fn called(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<String> {
     let who = crate::routines::Who { role, files: false, depth: 0 };
     let (out, heard) = crate::routines::with_notices(crate::routines::one(app, sql, who, job.map(String::from))).await;
     answer(out, heard)
 }
 
 /// A statement's answer as a tool's: its rows or outcome, and what it printed (`notices`).
-fn answer(out: Result<crate::routines::Outcome>, heard: Vec<String>) -> Result<Value> {
-    let mut v = match out {
-        Ok(crate::routines::Outcome::Rows(batches)) => json!({"rows": rows(&batches)?}),
-        Ok(crate::routines::Outcome::Done(v)) => v,
-        Err(e) if !heard.is_empty() => return Err(e.context(format!("it printed:\n{}", heard.join("\n")))),
-        Err(e) => return Err(e),
-    };
-    if !heard.is_empty() {
-        v["notices"] = json!(heard);
+fn answer(out: Result<crate::routines::Outcome>, heard: Vec<String>) -> Result<String> {
+    match out {
+        Ok(crate::routines::Outcome::Rows(batches)) => Rows { notices: heard, ..Rows::of(&batches, ROWS)? }.text(),
+        Ok(crate::routines::Outcome::Done(mut v)) => {
+            if !heard.is_empty() {
+                v["notices"] = json!(heard);
+            }
+            Ok(v.to_string())
+        }
+        Err(e) if !heard.is_empty() => Err(e.context(format!("it printed:\n{}", heard.join("\n")))),
+        Err(e) => Err(e),
     }
-    Ok(v)
 }
 
 fn total(batches: &[RecordBatch]) -> usize { batches.iter().map(RecordBatch::num_rows).sum() }
 
 /// Rows committed after `after`, in steps of doubling size until about `ROWS` are in hand.
-async fn changes(app: &App, table: &str, after: Option<u64>) -> Result<Value> {
+async fn changes(app: &App, table: &str, after: Option<u64>) -> Result<String> {
     let found = lakes(app).into_iter().rev().find_map(|(p, l)| Some((table.strip_prefix(p.as_str())?.to_string(), p, l)));
     let (name, prefix, lake) = found.ok_or_else(|| crate::codes::coded("42P01", format!("no table {table}")))?;
     crate::auth::check_all(table)?; // (a user's: every column of the rows, as `/watch` and Kafka need, before anything is read)
@@ -355,11 +379,5 @@ async fn changes(app: &App, table: &str, after: Option<u64>) -> Result<Value> {
         got.extend(crate::change::feed(&lake, &name, at, Some(upto)).await?);
         (at, step) = (upto, step * 2);
     }
-    Ok(json!({"rows": all_rows(&got)?, "position": at})) // (all of them: `position` is past every one)
+    Rows { position: Some(at), ..Rows::of(&got, usize::MAX)? }.text() // (all of them: `position` is past every one)
 }
-
-/// Every row as a JSON object.
-fn all_rows(batches: &[RecordBatch]) -> Result<Value> { Ok(Value::Array(crate::answer::json_values(batches, usize::MAX)?)) }
-
-/// The first `ROWS` rows as JSON objects.
-fn rows(batches: &[RecordBatch]) -> Result<Value> { Ok(Value::Array(crate::answer::json_values(batches, ROWS)?)) }

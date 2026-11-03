@@ -2639,6 +2639,12 @@ def clients():
         and tool("r-tok", "query", sql="SELECT count(*) AS n FROM docs")["rows"] == [{"n": 3}] and tool("r-tok", "write", sql="DELETE FROM docs") is None \
         and wrote == {"rows": 1} and tool("w-tok", "write", sql="INSERT INTO docs VALUES (4, 'trucks', [0.0, 0.1, 0.9])", job="mcp-1") == {"duplicate": True} \
         and len(feed["rows"]) == 5 and any(r.get("_deleted") for r in feed["rows"]) and feed["position"] > 0
+    # MCP's rows are put in its answer as written, so a value reads as HTTP sends it (parsed back, a DECIMAL kept only a double's digits)
+    exact = "SELECT CAST('99999999999999.9999' AS DECIMAL(18,4)) AS d, CAST('0.10' AS DECIMAL(5,2)) AS small, 9007199254740993 AS big"
+    as_mcp = mcp("r-tok", "tools/call", {"name": "query", "arguments": {"sql": exact}})["content"][0]["text"]
+    as_http = urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/sql", data=exact.encode(), headers={"authorization": "Bearer r-tok"})).read().decode()
+    checks["MCP's rows read as HTTP's, byte for byte: a DECIMAL's every digit (99999999999999.9999, 0.10), not a double's"] = \
+        as_mcp == '{"rows":' + as_http + ',"total_rows":1}' and '"d":99999999999999.9999' in as_mcp and '"small":0.10' in as_mcp
     # Raw MCP calls, with the status and headers: (status, headers, the JSON answer or its text)
     def mcp_raw(token, method, params=None, sid=None, verb="POST", port=None):
         headers = {"content-type": "application/json", "authorization": f"Bearer {token}"}
