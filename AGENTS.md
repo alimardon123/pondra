@@ -3133,6 +3133,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    read the table before a move reads it by name since (`ddl::keep_readers`). `cargo test --lib
    friendly::tests::a_call_written`; `harness.py friendly`, `movereaders`
 
+475. **An attached lake's table is read as it was as its plain reads read it** (`past::table`). `b.t AT (…)` and
+   `b.s.t AT (…)` resolve as `FROM b.t` does (`ddl::resolve`): that lake's entry, at its newest commit, behind its own
+   sign-in (`users::across`), and a limited user reads it by the grants that name it (`query::across`, never `guarded`,
+   whose grant on this whole lake would cover it). AT's value is read in the querying lake's words. A plain view AT is
+   refused by name (0A000), not "no table" (11-03 audit L7). `harness.py schemas`
+
 ```bash
 cargo build --release
 cargo test --release --lib [filter]     # unit tests (the tests are the library's; --bin pondra runs none)

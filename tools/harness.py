@@ -4132,10 +4132,18 @@ def schemas():
     # a change to an attached lake's table says which lake and where it runs (ADR-024)
     q("CREATE VIEW from_first AS FROM warehouse.stock")
     from_first = [q("FROM warehouse.stock ORDER BY id"), q("SELECT count(*) AS n FROM (FROM warehouse.stock)", 1), q("FROM from_first ORDER BY id", 2)]
+    before_change = q("SELECT max(_version) AS v FROM warehouse.stock")[0]["v"]
     change = q("UPDATE warehouse.stock SET qty = qty + 1 WHERE id = 1", 2)  # (from a follower: that lake's leader carries it out, ADR-028)
     checks["FROM t is SELECT * FROM t (alone, a subquery, a view's); UPDATE on an attached lake, from any node, is its leader's"] = \
         from_first[0] == [{"id": 1, "qty": 100}, {"id": 2, "qty": 200}, {"id": 3, "qty": 300}] and from_first[1] == [{"n": 3}] and from_first[2] == from_first[0] \
         and change.get("updated") == 1 and until(lambda: sql(A.port + 6, "SELECT qty FROM stock WHERE id = 1"), [{"qty": 101}], 15) == [{"qty": 101}]
+    # an attached lake's table read as it was (11-03 audit L7: "no table warehouse.stock"), by either name; a view AT is
+    # refused by name (0A000), not "no table"
+    pasts = [until(lambda i=i, s=s: _try(lambda: q(f"SELECT qty FROM {s} AT (VERSION => {before_change}) WHERE id = 1", i)), [{"qty": 100}], 15)
+             for i, s in ((0, "warehouse.stock"), (2, "warehouse.public.stock"))]
+    view_at = err("SELECT * FROM from_first AT (VERSION => 1)")
+    checks["an attached lake's table AT (VERSION => n), as lake.t and lake.schema.t, on any node; a view AT is refused by name"] = \
+        pasts == [[{"qty": 100}]] * 2 and "from_first is a view" in (view_at or "")
     q("DROP VIEW from_first")
     q("DETACH warehouse")
     gone = [until(lambda i=i: reach(i), False, 15) for i in range(3)]
