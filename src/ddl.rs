@@ -1806,7 +1806,7 @@ async fn reorder_materialized(lake: &Lake, name: &str, mut v: crate::views::View
     let now = view_outputs(lake, &written).await.map_err(|e| crate::rules::alter::cant_move(name, column, &format!("moved, its query doesn't plan ({e:#})"), MATERIALIZED))?;
     let want: Vec<_> = order.iter().map(|&i| was[i].clone()).collect();
     ensure!(now == want, crate::rules::alter::cant_move(name, column, "moved, its query plans to other columns", MATERIALIZED));
-    let partial = crate::answer::schema(&m.logical().columns)?; // (a finished view's partial rows)
+    let partial = crate::answer::schema(&m.logical_columns())?; // (a finished view's partial rows)
     match m.finish.as_mut() {
         Some(f) => {
             // (its answers come from its finishing SELECT over the partial rows: moved, and proved over none)

@@ -783,8 +783,7 @@ async fn keyed(lake: &Lake, name: &str, meta: &TableMeta, c: &mut Commit) -> Res
     use datafusion::arrow::array::{new_null_array, ArrayRef, BooleanArray};
     use datafusion::prelude::ident;
     anyhow::ensure!(meta.order.is_none() && meta.merge.is_empty(), "{name} combines each key's rows (order_by, or a view's GROUP BY): other engines' changes to it go through Pondra's SQL");
-    let logical = meta.logical();
-    let schema = crate::answer::schema(&logical.columns)?;
+    let schema = crate::answer::schema(&meta.logical_columns())?;
     let names: Vec<&str> = meta.key.iter().map(|k| meta.name_of(k)).collect();
     let list = meta.column_list();
     let ids: std::collections::BTreeSet<i64> = meta.key.iter().filter_map(|k| list.of_stored(k)).map(|c| c.id as i64).collect();
@@ -1001,13 +1000,13 @@ async fn done(lake: &Lake, job: &str) -> Result<bool> { Ok(lake.cat.get::<u64>(&
 /// The writer's files as a table `__incoming` of the table's columns (by name), and the query
 /// that reads them in the table's order.
 async fn incoming(lake: &Lake, meta: &TableMeta, files: &[DataFile]) -> Result<(datafusion::prelude::SessionContext, String)> {
-    let meta = meta.logical();
-    let schema = crate::answer::schema(&meta.columns)?;
+    let logical = meta.logical_columns();
+    let schema = crate::answer::schema(&logical)?;
     let ctx = lake.session();
     let urls: Vec<String> = files.iter().map(|f| lake.full(&f.path)).collect();
     let df = ctx.read_parquet(urls, datafusion::prelude::ParquetReadOptions::default().schema(&schema)).await?;
     ctx.register_table("__incoming", df.into_view())?;
-    let columns: Vec<String> = meta.columns.iter().map(|(c, _)| format!("\"{}\"", c.replace('"', "\"\""))).collect();
+    let columns: Vec<String> = logical.iter().map(|(c, _)| format!("\"{}\"", c.replace('"', "\"\""))).collect();
     Ok((ctx, format!("SELECT {} FROM __incoming", columns.join(", "))))
 }
 

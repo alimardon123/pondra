@@ -167,8 +167,7 @@ pub async fn of_table(lake: &Lake, name: &str) -> (BTreeMap<String, Enum>, BTree
     let Ok((None, local)) = crate::ddl::resolve(lake, name).await else { return Default::default() };
     match lake.cat.get::<TableMeta>(&table_key(&local)).await {
         Ok(Some(m)) => {
-            let l = m.logical();
-            (l.enums, l.sql_types)
+            (m.in_sql(&m.enums), m.in_sql(&m.sql_types))
         }
         _ => Default::default(),
     }

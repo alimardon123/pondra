@@ -1022,7 +1022,7 @@ async fn read(app: &App, table: &str, meta: &TableMeta, offset: u64, visible: u6
             }
             let rows = concat_batches(&s, &rows)?;
             if rows.num_rows() > 0 {
-                out.extend(encode_batch(crate::log::ord(n, start) as i64, seg.ts_ms as i64, &records(&meta.logical(), &meta.to_logical(&rows)?)?)); // (SQL's names: ADR-022)
+                out.extend(encode_batch(crate::log::ord(n, start) as i64, seg.ts_ms as i64, &records(meta, &meta.to_logical(&rows)?)?)); // (SQL's names: ADR-022)
             }
             if partial {
                 break 'fetch; // (never past rows not sent: a consumer goes on from the last it got)
@@ -1033,15 +1033,16 @@ async fn read(app: &App, table: &str, meta: &TableMeta, offset: u64, visible: u6
     Ok(out)
 }
 
-/// Rows as (key, value): the value a JSON row (null for a delete), the key the key columns.
+/// Rows (under SQL's names) as (key, value): the value a JSON row of the table's columns in SQL's order, as `SELECT *`
+/// lists them (null for a delete), the key the key columns. `meta` is the entry as stored: no copy of it per segment.
 fn records(meta: &TableMeta, rows: &RecordBatch) -> Result<Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>> {
     let lines = crate::answer::json_each;
     let pick = |cols: &[&str]| -> Result<RecordBatch> { Ok(rows.project(&cols.iter().map(|c| rows.schema().index_of(c)).collect::<Result<Vec<_>, _>>()?)?) };
-    let shown: Vec<&str> = meta.columns.iter().map(|(c, _)| c.as_str()).filter(|c| *c != "_deleted").collect();
-    let values = lines(&pick(&shown)?)?;
+    let shown = meta.sql_names(); // (SQL's order, as `SELECT *` lists them)
+    let values = lines(&pick(&shown.iter().map(String::as_str).collect::<Vec<_>>())?)?;
     let keys = match meta.key.is_empty() {
         true => vec![None; rows.num_rows()],
-        false => lines(&pick(&meta.key.iter().map(String::as_str).collect::<Vec<_>>())?)?.into_iter().map(Some).collect(),
+        false => lines(&pick(&meta.sql_key().iter().map(String::as_str).collect::<Vec<_>>())?)?.into_iter().map(Some).collect(),
     };
     let deleted = rows.column_by_name("_deleted").map(|c| c.as_boolean().clone()).unwrap_or_else(|| BooleanArray::from(vec![false; rows.num_rows()]));
     Ok(keys.into_iter().zip(values).enumerate().map(|(i, (k, v))| (k, (!deleted.value(i) || deleted.is_null(i)).then_some(v))).collect())
@@ -1528,6 +1529,31 @@ async fn offset_fetch(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A record's value lists a table's columns in SQL's order, under SQL's names, as `SELECT *` does: a renamed key
+    /// column named as SQL names it, a dropped column and the delete markers left out, a moved column where it was put.
+    #[test]
+    fn a_records_value_is_the_row_in_sqls_order() -> Result<()> {
+        use datafusion::arrow::array::Int64Array;
+        let cols = |n: &[&str]| n.iter().map(|c| (c.to_string(), if *c == "_deleted" { "Boolean" } else { "Int64" }.to_string())).collect::<Vec<_>>();
+        let meta = TableMeta {
+            columns: cols(&["k", "a", "b", "gone", "_deleted"]),
+            key: vec!["k".into()],
+            names: [("k".to_string(), "id".to_string())].into(),
+            dropped: vec!["gone".into()],
+            shown: vec!["b".into(), "k".into(), "a".into()],
+            ..Default::default()
+        };
+        let rows = meta.to_logical(&RecordBatch::try_new(
+            schema(&cols(&["k", "a", "b", "gone", "_deleted"]))?,
+            vec![Arc::new(Int64Array::from(vec![1])), Arc::new(Int64Array::from(vec![2])), Arc::new(Int64Array::from(vec![3])), Arc::new(Int64Array::from(vec![4])), Arc::new(BooleanArray::from(vec![false]))],
+        )?)?;
+        let got = records(&meta, &rows)?;
+        let (key, value) = &got[0];
+        assert_eq!(String::from_utf8(value.clone().expect("a live row"))?, r#"{"b":3,"id":1,"a":2}"#);
+        assert_eq!(String::from_utf8(key.clone().expect("a keyed table's"))?, r#"{"id":1}"#);
+        Ok(())
+    }
 
     #[test]
     fn a_batch_decompresses_within_bounds() {
