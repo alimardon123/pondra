@@ -24,6 +24,7 @@ pub mod in_task;
 #[cfg(feature = "lake")] pub mod page; // (a page is a member on the core's lake, one per module)
 pub mod request_body;
 pub mod text;
+pub mod registry;
 // The one walk of the SQL tree (every module's walks go through it: `walk.rs`).
 mod walk;
 // The statements 1.1 brings, refused by name in every form (`page.rs` and the node read the same list).
@@ -236,3 +237,13 @@ mod rules;
 #[cfg(feature = "lake")] mod keep_load;
 #[cfg(feature = "lake")] mod write_outside;
 #[cfg(feature = "lake")] mod workspace;
+
+/// The extensions this build has, in the order the registry adds them (`registry::get`): the host decides, so the
+/// floors below never name one.
+pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
+    static BUILT_IN: &[&dyn registry::Extension] = &[
+        #[cfg(feature = "lake")]
+        &objects::CATALOG,
+    ];
+    BUILT_IN
+}

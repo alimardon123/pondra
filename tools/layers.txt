@@ -10,6 +10,7 @@ codes base
 env base
 metrics base
 parsed base
+registry base
 text base
 walk base
 

@@ -103,7 +103,7 @@ struct Attach {
     kind: Option<String>,
 }
 
-/// What an apply makes: an object of the registry's (`objects::KINDS`: its word and its order), or what
+/// What an apply makes: an object of the registry's (`objects::all_kinds`: its word and its order), or what
 /// pondra.toml and GRANTs say, which aren't objects.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Kind {
@@ -257,7 +257,7 @@ pub(crate) fn project(ask: &Ask) -> Result<Project> {
 fn first_line(sql: &str) -> String { sql.trim().lines().next().unwrap_or_default().chars().take(80).collect() }
 
 /// The kinds a project declares, as the registry lists them (those it doesn't refuse).
-fn declarable() -> String { crate::objects::KINDS.iter().filter(|k| k.project.is_none()).map(|k| k.name).collect::<Vec<_>>().join(", ") }
+fn declarable() -> String { crate::objects::all_kinds().filter(|k| k.project.is_none()).map(|k| k.name).collect::<Vec<_>>().join(", ") }
 
 /// What a statement in `objects/` makes, and its name inside the database. None: nothing (a
 /// comment alone).
