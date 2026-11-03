@@ -399,7 +399,7 @@ fn knocked(client: Option<Option<std::net::IpAddr>>, now_ms: u64) -> (Option<boo
 }
 
 /// A statement a joined page ran, as its node writes it (`page_records::record`, under the sign-in's name, as the door
-/// `page`): its line when its class is written, and always when refused.
+/// `page-reported`): its line when its class is written, and always when refused.
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the node's half: `server::records`)
 pub(crate) fn page_statement(app: &App, class: &'static str, sql: &str, outcome: &'static str, message: Option<String>, ms: i64) {
     if kept(classes(), class, outcome) {

@@ -176,6 +176,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("error parsing timestamp from") => "22007", // invalid_datetime_format (to_date, to_timestamp and their other names: text their format doesn't read)
         _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") || has("invalid input value for enum") => "22P02", // invalid_text_representation
         _ if has("can't reach the bucket") || has("catching up with its leader") => "57P03",   // cannot_connect_now (a leader cut off, a node just started: ask another node)
+        _ if has("a blob: url is read only by the tab that made it") => "58P01",               // undefined_file (a tab's file revoked, or another tab's: `web/`'s words, before "read only" could match)
         _ if has("error sending request") => "58030",                                           // io_error (the bucket or another node didn't answer: try again)
         _ if has("deadlock detected") => "40P01",                                               // deadlock_detected (`locks.rs`)
         _ if has("lock timeout") || has("could not obtain lock") => "55P03",                    // lock_not_available (a lock wait, or NOWAIT)
@@ -289,6 +290,7 @@ mod tests {
         assert_eq!(of("t is a table"), "42809");
         assert_ne!(of("no topic t on this Pondra node: a topic is a table (CREATE TABLE t …)"), "42809"); // (said of a topic, not a name)
         assert_eq!(of("error sending request for url (http://10.0.0.2:8080/cluster/commit)"), "58030");
+        assert_eq!(of("the tab's file at blob:http://localhost/0b4d can't be read: a blob: URL is read only by the tab that made it, until it is revoked"), "58P01");
         assert_eq!(of("cannot insert a non-DEFAULT value into column \"id\" of t: it is an identity column defined as GENERATED ALWAYS"), "428C9");
         assert_eq!(of("nextval: reached maximum value of sequence \"s\" (3)"), "2200H");
         assert_eq!(of("currval of sequence \"s\" is not yet defined in this session"), "55000");
