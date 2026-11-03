@@ -399,11 +399,13 @@ pub async fn create_log(lake: &Lake) -> Result<serde_json::Value> {
     match lake.cat.get::<TableMeta>(&table_key(TABLE)).await? {
         None => {
             let days: u64 = crate::env::or("PONDRA_HISTORY_DAYS", 7);
-            let meta = TableMeta { columns: columns(), ttl: Some(("at".into(), days * 86400)), tiered: lake.visible(), ..Default::default() };
+            let mut meta = TableMeta::with_columns(columns());
+            (meta.ttl, meta.tiered) = (Some(("at".into(), days * 86400)), lake.visible());
             lake.cat.commit(vec![(table_key(TABLE), json(&meta))], &[]).await?;
         }
-        Some(mut meta) if meta.columns.len() < columns().len() && columns().starts_with(&meta.columns) => {
-            meta.columns = columns();
+        Some(mut meta) if meta.columns().len() < columns().len() && columns().starts_with(&meta.columns()) => {
+            let more = columns()[meta.columns().len()..].to_vec();
+            meta.append_columns(more);
             lake.cat.commit(vec![(table_key(TABLE), json(&meta))], &[]).await?;
         }
         Some(_) => {}
@@ -563,7 +565,7 @@ pub fn writer<L: Send + Sync + 'static>(app: &App, table: &'static str, make: cr
             for attempt in 0.. {
                 let append = async {
                     let rows = batch(&app, &lines)?;
-                    if !made && app.lake.cat.get::<TableMeta>(&table_key(table)).await?.is_none_or(|m| m.columns.len() < rows.num_columns()) {
+                    if !made && app.lake.cat.get::<TableMeta>(&table_key(table)).await?.is_none_or(|m| m.columns().len() < rows.num_columns()) {
                         crate::write::on_node_as(&app, crate::write::Stmt::Ddl(vec![make.clone()]), None, false).await?; // (made, or given the columns this build adds)
                     }
                     made = true;

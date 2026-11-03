@@ -297,7 +297,7 @@ pub async fn seal(lake: &Lake, table: &str, meta: &mut TableMeta) -> Result<bool
     if !meta.key.is_empty() || meta.files.len() <= INLINE {
         return Ok(false);
     }
-    let (dir, schema) = (format!("data/{}/_manifests", meta.folder(table)), crate::answer::schema(&crate::sys::with_sys(meta).columns)?);
+    let (dir, schema) = (format!("data/{}/_manifests", meta.folder(table)), crate::answer::schema(&crate::sys::with_sys(meta).columns())?);
     meta.files.sort_by_key(|f| f.ord);
     let mut sealing: Vec<DataFile> = meta.files.drain(..meta.files.len() - SEAL).collect();
     sealing.sort_by(|a, b| (&a.part, a.ord).cmp(&(&b.part, b.ord))); // (a manifest covers few partitions)

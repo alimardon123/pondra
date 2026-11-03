@@ -123,7 +123,7 @@ pub struct Parts {
 }
 
 pub async fn publishable(lake: &Lake, meta: &TableMeta) -> Result<Option<Parts>> {
-    let deletes = meta.columns.iter().any(|(c, _)| c == "_deleted");
+    let deletes = meta.columns().iter().any(|(c, _)| c == "_deleted");
     Ok(match meta.key.is_empty() {
         true => Some(Parts { manifests: crate::manifest::list(lake, meta).await?, inline: meta.files.clone() }),
         // (every generation, its older versions and markers positions: `tier::shadow`)
@@ -577,13 +577,7 @@ mod tests {
     /// SQL's order; a dropped column leaves the schema.
     #[test]
     fn a_mapped_fields_id_is_its_columns_id() {
-        let meta = TableMeta {
-            columns: vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into()), ("c".into(), "Int64".into()), ("d".into(), "Utf8".into())],
-            names: [("b".to_string(), "bee".to_string())].into(),
-            dropped: vec!["c".into()],
-            shown: vec!["d".into()],
-            ..Default::default()
-        };
+        let meta = TableMeta::made(crate::store::Made { columns: vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into()), ("c".into(), "Int64".into()), ("d".into(), "Utf8".into())], names: [("b".to_string(), "bee".to_string())].into(), dropped: vec!["c".into()], shown: vec!["d".into()], ..Default::default() });
         let s: Value = serde_json::from_str(&table_schema(&meta, true).unwrap()).unwrap();
         let got: Vec<(u64, &str, &str)> = s["fields"].as_array().unwrap().iter().map(|f| (f["metadata"][MAPPING_ID].as_u64().unwrap(), f["name"].as_str().unwrap(), f["metadata"]["delta.columnMapping.physicalName"].as_str().unwrap())).collect();
         assert_eq!(got, [(4, "d", "d"), (1, "a", "a"), (2, "bee", "b")]);

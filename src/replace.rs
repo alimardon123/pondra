@@ -126,7 +126,7 @@ pub(crate) async fn replace(lake: &Lake, name: &str, staged: &str) -> Result<Val
     let (at, now) = (lake.visible(), crate::log::now_ms());
     let kept = old.as_ref().is_some_and(|m| keeps(name, m, false));
     let (mut puts, shares) = match &old {
-        Some(m) => set_aside(lake, name, &TableMeta { publish: vec![], ..m.clone() }, kept).await?,
+        Some(m) => set_aside(lake, name, &{ let mut entry = m.clone(); entry.publish = vec![]; entry }, kept).await?,
         None => (vec![], vec![]),
     };
     let stamp = |m: &mut TableMeta| {

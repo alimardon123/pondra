@@ -570,7 +570,7 @@ async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::p
         let share = Some(totals(&base));
         let purges = if p.purged > 0 { vec![(p.purged, 0)] } else { vec![] };
         // (a range's column is a stored name, as the files and the slice's scan know it: `ranges::named`)
-        let meta = Arc::new(TableMeta { files: p.files.clone(), tiered: after, purges, ..(*base).clone() });
+        let meta = Arc::new({ let mut entry = (*base).clone(); entry.files = p.files.clone(); entry.tiered = after; entry.purges = purges; entry });
         let pruned = Pruned { lake: lake.arc(), name: p.table.clone(), meta: meta.clone(), facts, manifests: Some(p.manifests.clone()), upto: Some(upto), at: Some(s.upto), share, range: p.range.clone(), own: Default::default() };
         let table = crate::query::named(&ctx, Arc::new(pruned), &meta, deleted)?;
         ctx.deregister_table(table_ref(&p.table))?;

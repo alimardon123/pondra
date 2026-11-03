@@ -544,7 +544,7 @@ pub async fn resolve(lake: &crate::store::Lake, url: &str) -> Result<crate::stor
             files.push(f);
         }
     }
-    Ok(crate::store::TableMeta { columns: columns(), files, ..Default::default() })
+    Ok({ let mut entry = crate::store::TableMeta::with_columns(columns()); entry.files = files; entry })
 }
 
 /// The records of these partitions' ranges, read as the query asks for them (a LIMIT stops

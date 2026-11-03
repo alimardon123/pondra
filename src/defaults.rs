@@ -87,13 +87,13 @@ pub async fn alter(lake: &Lake, table: &str, column: &str, change: Change) -> Re
     let key = crate::store::table_key(table);
     let mut m: TableMeta = lake.cat.get(&key).await?.with_context(|| format!("no table {table}"))?;
     let stored = m.stored(column).map(str::to_string).with_context(|| format!("column \"{column}\" of relation \"{table}\" does not exist"))?;
-    ensure!(!m.identity.contains_key(&stored), "{column} is an identity column: its values come from its sequence, not a DEFAULT or NULL");
+    ensure!(!m.identity().contains_key(&stored), "{column} is an identity column: its values come from its sequence, not a DEFAULT or NULL");
     match change {
         Change::Default(None) => {
             m.set_default(&stored, None); // (none there is no error)
         }
         Change::Default(Some(expr)) => {
-            let sql_type = m.columns.iter().find(|(c, _)| *c == stored).map(|(_, t)| t.clone()).unwrap_or_default();
+            let sql_type = m.columns().iter().find(|(c, _)| *c == stored).map(|(_, t)| t.clone()).unwrap_or_default();
             validate(column, &sql_type, &expr).await?;
             crate::seq::named_exist(lake, &expr).await?; // (DEFAULT nextval('s'): s is there)
             m.set_default(&stored, Some(expr));

@@ -997,7 +997,7 @@ fn fetch_error(ver: i16, e: &anyhow::Error) -> Vec<u8> {
 async fn read(app: &App, table: &str, meta: &TableMeta, offset: u64, visible: u64, limit: usize) -> Result<Vec<u8>> {
     // (from a few segments back: a big one's rows run on past its number, `log::span`)
     let (mut out, mut at) = (vec![], (offset >> crate::log::ORD_BITS).saturating_sub(64));
-    let s = schema(&meta.columns)?;
+    let s = schema(&meta.columns())?;
     'fetch: while out.is_empty() && at <= visible {
         let upto = visible.min(at + 4095); // (segments without this table are skipped, 4,096 at a time)
         for (key, seg) in app.lake.cat.segments(&seg_key(at), &seg_key(upto + 1)).await? {
@@ -1541,14 +1541,7 @@ mod tests {
     fn a_records_value_is_the_row_in_sqls_order() -> Result<()> {
         use datafusion::arrow::array::Int64Array;
         let cols = |n: &[&str]| n.iter().map(|c| (c.to_string(), if *c == "_deleted" { "Boolean" } else { "Int64" }.to_string())).collect::<Vec<_>>();
-        let meta = TableMeta {
-            columns: cols(&["k", "a", "b", "gone", "_deleted"]),
-            key: vec!["k".into()],
-            names: [("k".to_string(), "id".to_string())].into(),
-            dropped: vec!["gone".into()],
-            shown: vec!["b".into(), "k".into(), "a".into()],
-            ..Default::default()
-        };
+        let meta = { let mut entry = TableMeta::made(crate::store::Made { columns: cols(&["k", "a", "b", "gone", "_deleted"]), names: [("k".to_string(), "id".to_string())].into(), dropped: vec!["gone".into()], shown: vec!["b".into(), "k".into(), "a".into()], ..Default::default() }); entry.key = vec!["k".into()]; entry };
         let rows = meta.to_logical(&RecordBatch::try_new(
             schema(&cols(&["k", "a", "b", "gone", "_deleted"]))?,
             vec![Arc::new(Int64Array::from(vec![1])), Arc::new(Int64Array::from(vec![2])), Arc::new(Int64Array::from(vec![3])), Arc::new(Int64Array::from(vec![4])), Arc::new(BooleanArray::from(vec![false]))],

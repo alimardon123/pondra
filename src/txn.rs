@@ -1877,7 +1877,7 @@ enum Current {
 /// The schema of a row as `current` reads it: the table's columns (SQL's names), then `_row_id`, `_created_at` and `_version`.
 fn row_schema(meta: &TableMeta) -> Result<datafusion::arrow::datatypes::SchemaRef> {
     use datafusion::arrow::datatypes::{Field, TimeUnit};
-    let mut fields: Vec<Arc<Field>> = crate::answer::schema(&meta.columns)?.fields().to_vec();
+    let mut fields: Vec<Arc<Field>> = crate::answer::schema(&meta.columns())?.fields().to_vec();
     fields.push(Arc::new(Field::new(crate::text::ROW_ID, DataType::Int64, true)));
     fields.push(Arc::new(Field::new(crate::text::CREATED, DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true)));
     fields.push(Arc::new(Field::new(crate::text::VERSION, DataType::Int64, true)));
@@ -1929,7 +1929,7 @@ pub async fn point_change(lake: &Lake, name: &str, stored: &TableMeta, snapshot:
 fn point_key(name: &str, stored: &TableMeta, set_to: &[(String, String)], cond: &str) -> Option<Vec<String>> {
     // (`point_table` takes no renamed or dropped column: `stored` is as SQL sees it, `logical()`)
     if !point_table(name, stored)
-        || set_to.iter().any(|(c, _)| stored.key.contains(c) || c == "_deleted" || crate::text::NAMES.contains(&c.as_str()) || !stored.columns.iter().any(|(n, _)| n == c))
+        || set_to.iter().any(|(c, _)| stored.key.contains(c) || c == "_deleted" || crate::text::NAMES.contains(&c.as_str()) || !stored.columns().iter().any(|(n, _)| n == c))
     {
         return None;
     }
@@ -1943,7 +1943,7 @@ fn key_text(meta: &TableMeta, key: &[String]) -> Result<Vec<String>> {
         .iter()
         .zip(key)
         .map(|(c, v)| {
-            let (_, ty) = meta.columns.iter().find(|(n, _)| n == c).with_context(|| format!("no key column {c}"))?;
+            let (_, ty) = meta.columns().iter().find(|(n, _)| n == c).with_context(|| format!("no key column {c}"))?;
             let typed = datafusion::arrow::compute::cast(&datafusion::arrow::array::StringArray::from(vec![v.as_str()]), &crate::answer::dtype(ty)?)?;
             let text = datafusion::arrow::compute::cast(&typed, &DataType::Utf8)?;
             Ok(text.as_string::<i32>().value(0).to_string())

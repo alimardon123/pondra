@@ -113,7 +113,7 @@ struct Table {
 }
 
 /// A temporary table's rows' schema: its columns, then its system columns.
-fn schema_of(meta: &TableMeta) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::answer::schema(&[meta.columns.clone(), crate::sys::columns()].concat()) }
+fn schema_of(meta: &TableMeta) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::answer::schema(&[meta.columns().to_vec(), crate::sys::columns()].concat()) }
 
 impl Table {
     fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { schema_of(&self.meta) }
@@ -301,7 +301,7 @@ pub fn own(stmt: &Stmt) -> bool {
 /// The columns of the current session's temporary table `name`, with the SQL type each holds as text, if there is one
 /// (a node's `Host::relation`, in host.rs, reads them before a lake table of the name: a temporary table shadows it).
 pub fn columns_of(name: &str) -> Option<Vec<(String, Option<String>)>> {
-    peek(&current()?, |x| x.tables.get(name).map(|t| t.meta.columns.iter().map(|(c, _)| (c.clone(), t.meta.sql_types.get(c).cloned())).collect()))
+    peek(&current()?, |x| x.tables.get(name).map(|t| t.meta.columns().iter().map(|(c, _)| (c.clone(), t.meta.sql_types().get(c).cloned())).collect()))
 }
 
 /// The session's temporary tables `text` names, as tables of `ctx` (over the lake's of the same
@@ -313,7 +313,7 @@ pub fn register(ctx: &SessionContext, text: &str) -> Result<()> {
     let Some(x) = all.get_mut(&s) else { return Ok(()) };
     x.used = Some(Instant::now());
     for (name, t) in x.tables.iter().filter(|(n, _)| mentions(text, n)) {
-        let keep: Vec<usize> = (0..t.meta.columns.len() + if sys { crate::text::NAMES.len() } else { 0 }).collect();
+        let keep: Vec<usize> = (0..t.meta.columns().len() + if sys { crate::text::NAMES.len() } else { 0 }).collect();
         let rows = t.rows.iter().map(|b| b.project(&keep)).collect::<Result<Vec<_>, _>>()?;
         ctx.deregister_table(name.as_str())?;
         ctx.register_table(name.as_str(), Arc::new(MemTable::try_new(Arc::new(t.schema()?.project(&keep)?), vec![rows])?))?;
@@ -455,7 +455,7 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
         return Err(crate::codes::coded("0A000", format!("{name}: a temporary table's DEFAULT nextval(…) isn't taken yet")));
     }
     crate::defaults::definition(&columns, &defaults, &checks).await.map_err(crate::write::definition)?; // (checked as CREATE TABLE checks them: 42P16 when wrong)
-    let meta = TableMeta { columns, key, sql_types, not_null, defaults, checks, ids: true, ..Default::default() };
+    let meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, not_null, defaults, ..Default::default() }); entry.key = key; entry.checks = checks; entry.ids = true; entry };
     let rules = Arc::new(meta.to_rules()?);
     with(s, true, |x| Ok(x.tables.insert(name.clone(), Table { meta, rules, rows: vec![], next: 1, version: 0 })))?;
     let rows = match &c.query {
@@ -470,7 +470,7 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
     let (meta, rules) = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| (t.meta.clone(), t.rules.clone())).with_context(|| format!("no temporary table {name}"))?;
     let query = match names {
         Some(n) => {
-            let all = crate::rules::rows::row_columns(meta.columns.iter().map(|(c, _)| c.clone()), n);
+            let all = crate::rules::rows::row_columns(meta.columns().iter().map(|(c, _)| c.clone()), n);
             let names = if n.is_empty() { crate::write::implicit(&all, crate::rules::rows::rows_width(query)) } else { n }; // (no names: `VALUES (1, DEFAULT)`, the columns its rows give)
             crate::rules::rows::rows_for(name, &all, names, query, &|c: &str| crate::rules::rows::default_sql(&meta, c))? // (a column left out takes its DEFAULT)
         }
@@ -542,7 +542,7 @@ fn changed(meta: &TableMeta, rules: &Arc<crate::rules::Table>, name: &str, old: 
         let keep = datafusion::arrow::array::BooleanArray::from(ids.iter().map(|id| Some(!id.is_some_and(|i| gone.contains(&i)))).collect::<Vec<_>>());
         rows.push(datafusion::arrow::compute::filter_record_batch(b, &keep)?);
     }
-    let (schema, n) = (schema_of(meta)?, meta.columns.len());
+    let (schema, n) = (schema_of(meta)?, meta.columns().len());
     for s in new.iter().filter(|s| s.rows().num_rows() > 0) {
         // (shaped for the table as it is: `shape` checked them. Rows shaped for a definition it no longer has, made again
         // meanwhile, are checked again, as the log checks them: R9)
@@ -567,7 +567,7 @@ fn changed(meta: &TableMeta, rules: &Arc<crate::rules::Table>, name: &str, old: 
         let columns = columns.iter().zip(schema.fields()).map(|(c, f)| datafusion::arrow::compute::cast(c, f.data_type())).collect::<Result<_, _>>()?; // (as the table's types)
         rows.push(RecordBatch::try_new(schema.clone(), columns)?);
     }
-    check_key(name, &meta.columns, &meta.key, &rows)?;
+    check_key(name, &meta.columns(), &meta.key, &rows)?;
     Ok((rows, next))
 }
 
@@ -633,12 +633,7 @@ mod tests {
     fn a_temporary_table_keeps_its_types_for_its_writes_and_its_shape() {
         // (the session's state is set directly: `with` starts the reaper, which needs a runtime a plain test doesn't have)
         let s = "unit-temp-types";
-        let meta = TableMeta {
-            columns: vec![("u".into(), "Utf8".into()), ("v".into(), "Utf8".into()), ("n".into(), "Int64".into())],
-            sql_types: std::collections::BTreeMap::from([("u".to_string(), "uuid".to_string()), ("v".to_string(), "varchar(3)".to_string())]),
-            ids: true,
-            ..Default::default()
-        };
+        let meta = { let mut entry = TableMeta::made(crate::store::Made { columns: vec![("u".into(), "Utf8".into()), ("v".into(), "Utf8".into()), ("n".into(), "Int64".into())], sql_types: std::collections::BTreeMap::from([("u".to_string(), "uuid".to_string()), ("v".to_string(), "varchar(3)".to_string())]), ..Default::default() }); entry.ids = true; entry };
         let table = Table { rules: Arc::new(meta.to_rules().unwrap()), meta, rows: vec![], next: 1, version: 0 };
         SESSIONS.lock().unwrap().entry(s.to_string()).or_default().tables.insert("tt".to_string(), table);
         SESSION.sync_scope(Some(s.to_string()), || {
@@ -671,13 +666,7 @@ mod tests {
     async fn a_temporary_table_refuses_what_its_not_null_and_checks_refuse() {
         // (its writes are shaped as a lake table's are: `rules::shape` checks each batch before `apply` puts it in place)
         let s = "unit-temp-checks";
-        let meta = TableMeta {
-            columns: vec![("a".into(), "Int32".into()), ("c".into(), "Int32".into())],
-            not_null: vec!["a".into()],
-            checks: vec![("tt_c_check".into(), "c > 0".into())],
-            ids: true,
-            ..Default::default()
-        };
+        let meta = { let mut entry = TableMeta::made(crate::store::Made { columns: vec![("a".into(), "Int32".into()), ("c".into(), "Int32".into())], not_null: vec!["a".into()], ..Default::default() }); entry.checks = vec![("tt_c_check".into(), "c > 0".into())]; entry.ids = true; entry };
         let rules = Arc::new(meta.to_rules().unwrap());
         SESSIONS.lock().unwrap().entry(s.to_string()).or_default().tables.insert("tt".to_string(), Table { rules: rules.clone(), meta, rows: vec![], next: 1, version: 0 });
         let null_a = crate::rules::shape(&rules, "tt", crate::rules::Rows::Whole(ac_batch(vec![None], vec![1])), crate::rules::How::Change, &Checks).await.err().expect("a NULL in NOT NULL");
@@ -695,13 +684,7 @@ mod tests {
     async fn rows_shaped_for_another_definition_are_checked_again() {
         // (rows shaped for a definition the table no longer has are checked again, as the log checks its rows: R9)
         let s = "unit-temp-redefined";
-        let meta = TableMeta {
-            columns: vec![("a".into(), "Int32".into()), ("c".into(), "Int32".into())],
-            not_null: vec!["a".into()],
-            checks: vec![("tt_c_check".into(), "c > 0".into())],
-            ids: true,
-            ..Default::default()
-        };
+        let meta = { let mut entry = TableMeta::made(crate::store::Made { columns: vec![("a".into(), "Int32".into()), ("c".into(), "Int32".into())], not_null: vec!["a".into()], ..Default::default() }); entry.checks = vec![("tt_c_check".into(), "c > 0".into())]; entry.ids = true; entry };
         let mut loose = meta.clone();
         loose.checks.clear();
         let shaped = crate::rules::shape(&Arc::new(loose.to_rules().unwrap()), "tt", crate::rules::Rows::Whole(ac_batch(vec![Some(1)], vec![-5])), crate::rules::How::Change, &Checks).await.unwrap();
