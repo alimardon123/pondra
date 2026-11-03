@@ -75,7 +75,9 @@ impl Disk {
     }
 
     fn index_put(&self, key: String, len: u64) {
-        let mut ix = self.index.lock().unwrap(); // (files leave under the lock: a put of the same key waits for it)
+        // What leaves is deleted: the least recently used past the tier's size, or this file itself when it alone is past
+        // it (the rest of the tier stays). Under the lock, so a put of the same key waits for the delete.
+        let mut ix = self.index.lock().unwrap();
         for (old, _) in ix.put(key, len, usize::try_from(len).unwrap_or(usize::MAX)) {
             std::fs::remove_file(self.dir.join(old)).ok();
         }

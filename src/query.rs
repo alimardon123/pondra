@@ -221,7 +221,9 @@ fn keep(c: &mut Tails, table: &str, t: Arc<Tail>) {
     }
     let mut forms = c.pop(table).unwrap_or_default();
     forms.retain(|o| o.of.1 != t.of.1 && o.of.0 >= t.of.0); // (its form's tail it replaces; another form's at an older mark)
-    forms.push(t);
+    if t.bytes <= c.most() {
+        forms.push(t); // (one past the whole bound is not kept, and pushes nothing out: the tails it replaces go, the rest stay)
+    }
     let mut bytes = forms.iter().map(|o| o.bytes).sum::<usize>();
     if bytes > c.most() {
         // (the table alone past the bound: every other table goes, and its newest tail alone stays)
@@ -229,7 +231,9 @@ fn keep(c: &mut Tails, table: &str, t: Arc<Tail>) {
         forms.drain(..forms.len() - 1);
         bytes = forms[0].bytes;
     }
-    let _ = c.put(table.to_string(), forms, bytes);
+    if !forms.is_empty() {
+        let _ = c.put(table.to_string(), forms, bytes);
+    }
 }
 
 /// Tables' tails as queries read them (`Lake::tails`): by table, one a form, each table charged its forms' bytes.
@@ -1827,6 +1831,22 @@ mod tests {
         assert_eq!(found(&c, "t", "a").map(|t| t.through), Some(12), "a longer tail at the same mark replaces it");
         assert_eq!(c.bytes(), 150);
         assert_eq!(kept(&c), 1);
+    }
+
+    #[test]
+    fn a_tail_past_the_whole_budget_is_not_kept_and_pushes_no_other_tail_out() {
+        let mut c = cache();
+        keep(&mut c, "u", tail("a", 1, 1, 10));
+        keep(&mut c, "t", tail("a", 5, 9, 20));
+        keep(&mut c, "t", tail("b", 5, 9, 30));
+        keep(&mut c, "t", tail("a", 5, 12, TAILS + 1)); // (it replaces t's a, and alone is past the budget)
+        assert!(found(&c, "u", "a").is_some(), "another table's tail stays");
+        assert!(found(&c, "t", "b").is_some(), "the table's other form stays");
+        assert!(found(&c, "t", "a").is_none(), "neither the tail past the budget nor the one it replaced is kept");
+        assert_eq!(c.bytes(), 40);
+        assert_eq!(c.bytes(), kept_bytes(&c));
+        keep(&mut c, "v", tail("a", 1, 1, TAILS + 1)); // (a table with nothing kept keeps nothing)
+        assert!(!c.contains("v") && c.bytes() == 40);
     }
 
     #[test]
