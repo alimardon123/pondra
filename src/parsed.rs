@@ -16,7 +16,8 @@ pub(crate) const LONGEST: usize = 64 << 10;
 
 type Parsed = Arc<Result<Vec<Statement>, ParserError>>;
 
-// (the last texts and what they parsed to: a per-node static, so a node's stop lets them go)
+// (the last texts and what they parsed to: a per-node static, so a node's stop lets them go. An interim, as `text::TOKENS`
+// is: step 8's statement context carries the parse instead)
 crate::per_node!(static LAST: Mutex<VecDeque<(String, Parsed)>> = Mutex::new(VecDeque::new()));
 
 /// `sql` parsed as `Parser::parse_sql(&GenericDialect {}, sql)` parses it, the same statements or the same error.
