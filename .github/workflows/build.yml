@@ -372,6 +372,9 @@ jobs:
             cargo build --profile dist --target ${{ matrix.target }} --workspace
           fi
       - run: python tools/smoke.py "$BIN" # (on this OS: the shell, SQL, and memory read without /proc)
+      - name: The program within its size budget # (tools/size_check.py: its bytes as shipped and its download, against tools/size-budget.txt; a change that needs more raises the budget there, saying why)
+        if: matrix.platform == 'linux-x64' && needs.plan.outputs.profile == 'dist'
+        run: python tools/size_check.py --bin "$BIN" --platform linux-x64
       - name: A node in this process, from Python and JavaScript # (tools/inprocess_check.py: connect() with nothing on disk, 50 opens and closes, a fork, the library's ABI)
         if: matrix.platform == 'linux-x64'
         run: python tools/inprocess_check.py --bin "$BIN" --lib "$(dirname "$BIN")/libpondra_lib.so"
