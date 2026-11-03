@@ -7,18 +7,19 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::format::{ExplainFormat, MetricCategory, MetricType};
 use datafusion::common::instant::Instant;
-use datafusion::common::{internal_err, Result};
+use datafusion::common::{internal_err, DFSchema, Result};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult};
+use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::sort_properties::{ExprProperties, SortProperties};
-use datafusion::logical_expr::{ColumnarValue, Documentation, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
+use datafusion::logical_expr::{ColumnarValue, Documentation, Expr, ExprSchemable, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
 use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::sql::sqlparser::ast::BinaryOperator;
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +58,7 @@ pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     let mut state = state.with_analyzer_rules(crate::optimize::analyzer_rules()).with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
     state.expr_planners().get_or_insert_with(Vec::new).insert(0, substrings()); // (SUBSTRING of bytes too)
     state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::intervals::planner()); // (n * INTERVAL '37 seconds')
+    state.expr_planners().get_or_insert_with(Vec::new).insert(0, Arc::new(NullConcat)); // (NULL || NULL)
     let mut ctx = SessionContext::new_with_state(state.build());
     // format_string, pmod, parse_url, …
     spark(&ctx); // (first: Spark's set is worked out against DataFusion's names alone)
@@ -212,6 +214,22 @@ fn union_text(u: &UnionArray) -> datafusion::arrow::error::Result<StringArray> {
         out.push(Some(format.value(at).to_string()));
     }
     Ok(StringArray::from(out))
+}
+
+/// `NULL || NULL`, both sides of no type (a NULL, a CASE of NULLs): NULL text, as Postgres reads `unknown || unknown`,
+/// where DataFusion found no string type for the two and refused the query. DuckDB answers NULL too. A NULL beside text or
+/// a list keeps the planning it has.
+#[derive(Debug)]
+struct NullConcat;
+
+impl ExprPlanner for NullConcat {
+    fn plan_binary_op(&self, mut e: RawBinaryExpr, schema: &DFSchema) -> Result<PlannerResult<RawBinaryExpr>> {
+        let null = |x: &Expr| x.get_type(schema).is_ok_and(|t| t == DataType::Null);
+        if matches!(e.op, BinaryOperator::StringConcat) && null(&e.left) && null(&e.right) {
+            e.left = datafusion::logical_expr::cast(e.left, DataType::Utf8);
+        }
+        Ok(PlannerResult::Original(e))
+    }
 }
 
 /// `substr` and `SUBSTRING(… FROM … FOR …)`, and `POSITION(… IN …)`, for bytes and text: planned here, ahead of
@@ -461,6 +479,12 @@ mod tests {
             ("SELECT avg(x) FROM (VALUES (CAST(1 AS DECIMAL(10,2))), (2), (2)) t(x)", "1.666667"),
             ("SELECT '{\"a\": 7}' ->> 'a'", "7"),
             ("SELECT encode(substring(X'0102030405' FROM 2 FOR 2), 'hex')", "0203"),
+            ("SELECT arrow_typeof(NULL || NULL)", "Utf8"), // (text, as Postgres reads `unknown || unknown`: DataFusion refused it)
+            ("SELECT (CASE WHEN true THEN NULL ELSE NULL END || NULL) IS NULL", "true"),
+            ("SELECT upper(NULL || NULL) IS NULL", "true"),
+            ("SELECT coalesce(NULL || NULL, 'a')", "a"),
+            ("SELECT count(*) FROM (VALUES (1)) t(x) WHERE (NULL || NULL) IS NULL", "1"),
+            ("SELECT 'a' || NULL IS NULL", "true"),
         ];
         for (sql, want) in cases {
             let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();

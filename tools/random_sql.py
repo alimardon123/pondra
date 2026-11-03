@@ -6,20 +6,35 @@ agree; and each query split by a random condition `p` into `WHERE p`, `WHERE NOT
 
   random_sql.py [--queries 100000] [--secs 600] [--seed 1] [--nodes 3] [--out logs/round31/random.json]
 
-Exits 1 on a wrong answer (DuckDB's, the three nodes' or the partitions' differ) or a node that stopped,
-and 0 otherwise: a query only Pondra refuses is listed (`kind: refused`), for the list of what it doesn't
-take yet, but doesn't fail the run. The nightly job (fuzz.yml) runs it with seed = the date.
+Exits 1 on a wrong answer (DuckDB's, the three nodes' or the partitions' differ), a node that stopped, or a
+known difference (`KNOWN`) past its date, and 0 otherwise: a query only Pondra refuses is listed (`kind:
+refused`), for that list or a fix, but doesn't fail the run; a refusal an entry of `KNOWN` matches is
+counted under the entry's id instead. The nightly job (fuzz.yml) runs it with seed = the date.
 
 The tables are made afresh each `--every` queries (a few hundred rows of integers, decimals,
 doubles, text, booleans and dates, NULLs and repeats among them). The queries keep to SQL both
 engines mean the same by: no integer division or modulo, explicit NULLS FIRST/LAST, no functions
 whose names or edges differ. A disagreement is kept with its query and both answers.
 """
-import argparse, datetime, decimal, io, json, os, random, sys, time
+import argparse, datetime, decimal, io, json, os, random, re, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import harness
+
+# Known differences from DuckDB (the pgx review's B3): a query Pondra refuses where DuckDB answers, matched by Pondra's
+# message (`match`, a regex). Each hit is counted in the report under its id, never skipped silently, and once an entry
+# is past `expires` the run fails: by then it is fixed and gone from here, or looked at again with a new date.
+KNOWN = [
+    {"id": "zero-times-decimal",
+     "match": r"simplify_expressions.*CASE expression 'then' values had multiple data types: Decimal128",
+     "evidence": "DataFusion 55's simplifier turns `a * 0` into the zero as written, with the zero's DECIMAL type and not the "
+                 "product's: `0.00 * COALESCE(0.5, 1.0)` is Decimal128(2, 2), where DuckDB has DECIMAL(5,3), and the same "
+                 "0. A CASE or COALESCE whose other branch has the product's type is then refused: "
+                 "COALESCE(((-0.5 * 0.5) - (NULL * 3.75)), ((3.75 - 3.75) * COALESCE(0.5, -1.25))) (seed 3434, round 34). "
+                 "To fix upstream, or in a rule of ours ahead of the simplifier.",
+     "expires": "2026-12-01"},
+]
 
 TYPES = {"i": "INT", "b": "BIGINT", "d": "DECIMAL(10,2)", "f": "DOUBLE", "s": "VARCHAR", "t": "BOOLEAN", "dt": "DATE"}
 WORDS = ["a", "b", "ab", "ba", "", "abc", "Z", "zz"]
@@ -135,6 +150,12 @@ def main():
     g = Gen(rnd)
     harness.A = argparse.Namespace(s3=False, keep=False, port=A.port)
     stats = {"queries": 0, "agree": 0, "both_refused": 0, "pondra_refused": 0, "duckdb_refused": 0, "partitions_checked": 0, "spread_checked": 0}
+    for k in KNOWN:  # (each entry whole: an id, a matcher that compiles, its evidence, a real date)
+        assert {"id", "match", "evidence", "expires"} <= k.keys() and k["evidence"], k
+        re.compile(k["match"]), datetime.date.fromisoformat(k["expires"])
+    known = {k["id"]: 0 for k in KNOWN}
+    def known_as(e):  # (the entry a refusal is, if it is a known one)
+        return next((k["id"] for k in KNOWN if re.search(k["match"], str(e))), None)
     found, t0 = [], time.time()
     over = lambda: stats["queries"] >= A.queries or (A.secs and time.time() - t0 >= A.secs)
     while not over():
@@ -172,7 +193,10 @@ def main():
                     key = "both_refused" if isinstance(mine, Exception) and isinstance(theirs, Exception) else "pondra_refused" if isinstance(mine, Exception) else "duckdb_refused"
                     stats[key] += 1
                     if key == "pondra_refused":
-                        found.append({"kind": "refused", "oracle": "duckdb", "sql": sql, "pondra": str(mine)[:300]})
+                        if (k := known_as(mine)) is not None:
+                            known[k] += 1
+                        else:
+                            found.append({"kind": "refused", "oracle": "duckdb", "sql": sql, "pondra": str(mine)[:300]})
                     continue
                 if bag(mine) != bag(theirs):
                     found.append({"kind": "wrong", "tables": made, "oracle": "duckdb", "sql": sql, "pondra": str(bag(mine)[:5])[:400], "duckdb": str(bag(theirs)[:5])[:400]})
@@ -197,6 +221,9 @@ def main():
                         parts = [pondra(A.port, head + where + glue + c) for c in (f"({p})", f"(NOT ({p}))", f"(({p}) IS NULL)")]
                     except Exception as e:  # (a part refused that the whole query took is a finding too)
                         stopped = not all(n.alive() for n in nodes)
+                        if not stopped and (k := known_as(e)) is not None:
+                            known[k] += 1
+                            continue
                         found.append({"kind": "stopped" if stopped else "refused", "tables": made if stopped else None, "oracle": "partitions", "sql": head + where + glue + f"({p})", "pondra": str(e)[:300]})
                         if stopped:
                             break
@@ -208,16 +235,17 @@ def main():
             [n.kill() for n in nodes]
             harness.clean_up()
         print(f"{stats['queries']} queries, {len(found)} found, {round(time.time() - t0)} s", flush=True)
+    expired = [k["id"] for k in KNOWN if datetime.date.fromisoformat(k["expires"]) < datetime.date.today()]
     bad = [f for f in found if f["kind"] != "refused"]  # (wrong answers and stops first: they're what fails the run)
     found = bad + [f for f in found if f["kind"] == "refused"]
     out = {**stats, "seed": A.seed, "nodes": A.nodes, "secs": round(time.time() - t0), "wrong": sum(f["kind"] == "wrong" for f in found),
-           "stopped": sum(f["kind"] == "stopped" for f in found), "found": found[:200]}
+           "stopped": sum(f["kind"] == "stopped" for f in found), "known": known, "expired": expired, "found": found[:200]}
     print(json.dumps({k: v for k, v in out.items() if k != "found"}))
     for f in found[:20]:
         print(json.dumps({k: v for k, v in f.items() if k != "tables"})[:600])  # (the tables are in --out)
     if A.out:
         json.dump(out, open(A.out, "w"), indent=1)
-    sys.exit(1 if bad else 0)
+    sys.exit(1 if bad or expired else 0)  # (a known difference past its date fails too: fixed and gone from KNOWN, or a new date)
 
 
 if __name__ == "__main__":
