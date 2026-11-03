@@ -1,13 +1,15 @@
 ---
 title: Write an extension
-description: Write SQL functions and table functions in Rust, build them once to a WebAssembly file, and install it in any Pondra 1.x.
+description: Write SQL functions and table functions in Rust, build them once to a WebAssembly file, and install it with one statement.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
 An **extension** adds functions to SQL that you write in Rust. You build it once to a `.wasm` file, and
-an admin installs it with one statement. After that every node and every session has its functions,
-and every later Pondra 1.x loads the same file. It needs no rebuild of Pondra or of the extension.
+an admin installs it with one statement. After that every node and every session has its functions.
+From 1.0, every later 1.x loads the same file, with no rebuild of Pondra or of the extension. Before
+1.0 a release may change what an extension is built against, and its notes say so
+([What stays stable](/pondra/reference/stability/)).
 
 ```sql norun
 INSTALL hello FROM 's3://my-bucket/hello-0.1.wasm';
@@ -125,10 +127,10 @@ A call writes at most 100 log lines. Every function of an extension that reads t
 volatile, whatever it says, so a query spread over several nodes never mixes their times into one
 answer.
 
-Each capability carries its own version (`pondra:log/log@1.0.0`, `pondra:clock/clock@1.0.0`). Later
-releases add new capabilities beside these and never take one away, so a file built today keeps
-loading. A file built for a later Pondra that needs a capability this one lacks is refused at
-`INSTALL`, naming it: `hello (hello-0.2.wasm) needs pondra:http/http@1.0.0, which this Pondra
+Each capability carries its own version (`pondra:log/log@1.0.0`, `pondra:clock/clock@1.0.0`). From 1.0,
+later releases add new capabilities beside these and never take one away, so a file built for 1.0 keeps
+loading; before 1.0 a release may change one, and its notes say so. A file built for a later Pondra
+that needs a capability this one lacks is refused at `INSTALL`, naming it: `hello (hello-0.2.wasm) needs pondra:http/http@1.0.0, which this Pondra
 doesn't offer …`.
 
 ## Limits
