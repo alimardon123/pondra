@@ -280,6 +280,14 @@ impl TableMeta {
         }
     }
 
+    /// `logical()`, borrowed when it is the entry itself (no column renamed or dropped): no copy of its files.
+    pub fn logical_ref(&self) -> std::borrow::Cow<'_, TableMeta> {
+        match self.mapped() {
+            true => std::borrow::Cow::Owned(self.logical()),
+            false => std::borrow::Cow::Borrowed(self),
+        }
+    }
+
     /// SQL's columns, as `logical()` has them, without copying the rest of the entry (its files).
     pub fn logical_columns(&self) -> Vec<(String, String)> {
         if !self.mapped() {

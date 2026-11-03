@@ -1136,7 +1136,7 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
 /// stay `VALUES`, so they still go through the log.
 pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str) -> Result<String> {
     let (other, name) = crate::ddl::resolve(lake, table).await?;
-    let meta: TableMeta = other.as_deref().unwrap_or(lake).cat.get(&table_key(&name)).await?.with_context(|| format!("no table {table}"))?;
+    let meta = other.as_deref().unwrap_or(lake).cat.meta(&table_key(&name)).await?.with_context(|| format!("no table {table}"))?; // (as parsed: `Catalog::parsed`)
     whole_rows_of(lake, table, &meta, names, query).await
 }
 
