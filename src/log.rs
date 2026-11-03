@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 /// acks up to 1 MB rides inside: an object write first would cost the latency they save.
 fn inline_bytes() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| crate::env::or::<usize>("PONDRA_INLINE_KB", if crate::env::or::<usize>("PONDRA_REPLICAS", 1) > 1 { 1024 } else { 64 }) << 10)
+    *N.get_or_init(|| crate::env::value::<usize>("PONDRA_INLINE_KB") << 10)
 }
 const FLUSHES_IN_FLIGHT: usize = 4; // per node: object-store latency overlaps instead of adding up
 const COMMITS_IN_FLIGHT: usize = 4; // leader: catalog writes not yet committed

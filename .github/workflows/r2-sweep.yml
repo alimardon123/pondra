@@ -1,0 +1,58 @@
+name: r2-sweep
+
+# What the R2 bucket (the cluster bench's secrets, R2_*) holds, by lake, in the job's summary, and
+# what test runs left in it deleted (tools/clean_bucket.py). Every workflow on R2 deletes its lake
+# when it ends, but a run stopped half way leaves it: a soak day cancelled between legs, a bench
+# whose runner went away, a job past its time. A lake named as the runs name theirs (test-…,
+# soak-…, bench-<run>, and limits/, cost/, cold/, resilience/, roundN/) that nothing has written for
+# two days goes, with uploads left unfinished in it; bench-results/, bench-bin/ and anything named
+# otherwise are only listed.
+#
+# R2's free tier is 10 GB stored, a million writes and lists (class A) and ten million reads
+# (class B) a month. Writes are what cost: a soak day on R2 makes about 7 a second (10-31: 600,000
+# in the day), limits-r2's check and cost about 20,000 a run (so they run on Sundays). Storage
+# rarely does: a soak day's lake ends at 0.16 GB, and every run deletes its own.
+#
+# Mondays, once when this file or the tool changes on main, and by hand (`dry`: list only).
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  push:
+    branches: [main]
+    paths: [.github/workflows/r2-sweep.yml, tools/clean_bucket.py]
+  workflow_dispatch:
+    inputs:
+      dry:
+        description: "Only list what would be deleted"
+        type: boolean
+        default: false
+
+concurrency:
+  group: r2-sweep
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      AWS_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required # (R2 and newer boto3)
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      BUCKET: ${{ secrets.R2_BUCKET }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: pip install -q boto3
+      - name: The bucket's lakes, and what test runs left deleted (two days idle)
+        env:
+          DRY: ${{ inputs.dry && '--dry-run' || '' }}
+        run: python tools/clean_bucket.py --bucket "$BUCKET" --newest 0 --older 48 --tests-only --report "$GITHUB_STEP_SUMMARY" $DRY

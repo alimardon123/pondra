@@ -139,8 +139,8 @@ jobs:
       - name: TPC-H data
         run: |
           chmod +x pondra
-          pip install tpchgen-cli
-          tpchgen-cli -s ${{ needs.plan.outputs.sf }} --format=parquet --output-dir tpch
+          pip install tpchgen-cli==3.0.0 # (pinned: 3.0 took --format away, and every night from 10-19 failed here)
+          tpchgen-cli parquet -s ${{ needs.plan.outputs.sf }} --output-dir tpch
       - name: Wait for the nodes, run the benchmark
         run: |
           prefix="s3://$BUCKET/bench-results/${{ github.run_id }}"

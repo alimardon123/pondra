@@ -389,9 +389,9 @@ def _public(path, classes):
 
 
 def _settings():
-    """src/env.rs's table, the one list of every PONDRA_* name a node reads: {name: who}."""
-    text = open(os.path.join(ROOT, "src", "env.rs"), encoding="utf-8").read()
-    return dict(re.findall(r'\("(PONDRA_[A-Z0-9_]+)",\s*(\w+)\)', text))
+    """src/settings.rs's table, the one list of every PONDRA_* name a node reads: {name: who}."""
+    text = open(os.path.join(ROOT, "src", "settings.rs"), encoding="utf-8").read()
+    return {n: w.capitalize() for w, n in re.findall(r'\b(node|command|starter|test)\("(PONDRA_[A-Z0-9_]+)"', text)}
 
 
 def _variables():

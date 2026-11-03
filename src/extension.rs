@@ -3,7 +3,7 @@
 //! runs unchanged: the statement is answered with a notice saying nothing had to be done. Any other name is refused by name,
 //! never answered as if it were done (principle 10). An installed extension's record is kept at `xt/<name>` and its bytes at
 //! `ext/<name>/<version>/<sha256>.wasm`; E1 keeps the file and never runs it (its functions come in E2). The node's doors answer
-//! the words through `settings.rs`, before anything expands the statement. `INSTALL … FROM` and `UNINSTALL` are writes
+//! the words through `set.rs`, before anything expands the statement. `INSTALL … FROM` and `UNINSTALL` are writes
 //! (`write.rs`): the node that got the statement reads the file, and the leader keeps the record, so every node sees it. A host
 //! that only runs SQL through the front (`pondra sql`) asks `row` instead, and answers one row naming what happened.
 
@@ -226,7 +226,7 @@ fn answer(ask: &Ask, installed: bool) -> Result<Said> {
     Err(coded("0A000", format!("{name} isn't built into Pondra: install a Pondra extension from its file, INSTALL {name} FROM 'path or URL' (ADR-075); the DuckDB extensions built in are {}", built.join(", "))))
 }
 
-/// Is `sql` a statement the node answers from the words (and its lake's records, for a LOAD)? `settings.rs` routes these to
+/// Is `sql` a statement the node answers from the words (and its lake's records, for a LOAD)? `set.rs` routes these to
 /// `statement`; the writes (`write`) and every other statement go on as they did.
 pub fn is(sql: &str) -> bool { read_sql(sql).is_some_and(|ask| !writes(&ask)) }
 
@@ -279,7 +279,7 @@ pub async fn fetch(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl) -
         return Err(coded("0A000", format!("{name}: extensions in the page come after 1.0 (X3 in the plan)")));
     }
     unsigned_allowed(&name)?;
-    let max = crate::env::or("PONDRA_EXTENSION_FILE_MB", 64u64) * (1 << 20);
+    let max = crate::env::value::<u64>("PONDRA_EXTENSION_FILE_MB") * (1 << 20);
     let bytes = bytes_of(lake, &from, max).await?;
     let record = keep(lake, &name, &from, version, bytes).await?;
     let install = Ddl::InstallExtension { name, record };

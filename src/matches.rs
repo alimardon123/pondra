@@ -285,11 +285,11 @@ const STEPS_FOR: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// About the most new rows one run reads (`PONDRA_MATCH_RUN_ROWS`, 1,000,000): past it, the run decides up to an
 /// earlier time and the next one goes on from there, so a catch-up's memory stays bounded at any backlog.
-fn most_rows() -> u64 { crate::env::or("PONDRA_MATCH_RUN_ROWS", 1_000_000u64).max(1) }
+fn most_rows() -> u64 { crate::env::value::<u64>("PONDRA_MATCH_RUN_ROWS").max(1) }
 
 /// The most rows one key's open search may hold (`PONDRA_MATCH_HELD_ROWS`, 1,000,000): a search that is never decided
 /// (no WITHIN, and a row that can always go on) would hold every row of its key and fill the leader's memory.
-fn most_held() -> u64 { crate::env::or("PONDRA_MATCH_HELD_ROWS", 1_000_000u64).max(1) }
+fn most_held() -> u64 { crate::env::value::<u64>("PONDRA_MATCH_HELD_ROWS").max(1) }
 
 /// One run of a matches view (leader only, `views::emit_all`): steps of about `most_rows()` new rows each, back to back
 /// for `STEPS_FOR` while a step has more to do.

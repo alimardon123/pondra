@@ -17,12 +17,16 @@ name: limits-r2
 # and DuckDB 2.0 over httpfs on the same files from a fresh connection. `cold_s` is each query's first
 # run, `total_s` its best of three. Its lakes and files go under cold/ and are deleted the same way.
 #
-# Nightly on main, and by hand. The bucket and its keys are the cluster bench's secrets (R2_*). The
-# lakes go under limits/ in the bucket and are deleted after every run, whatever happened (R2's free
-# tier is 10 GB).
+# The cold reads nightly on main (the scorecard's cold-read row); the limits and the steady stream's
+# cost on Sundays, since they make about 20,000 of the bucket's writes a run (11-01: 8,509 PUTs and
+# 6,803 batch deletes in the check alone) and R2's free tier is a million writes a month; all three
+# by hand. The bucket and its keys are the cluster bench's secrets (R2_*). The lakes go under
+# limits/ in the bucket and are deleted after every run, whatever happened (R2's free tier is
+# 10 GB; r2-sweep.yml deletes what a run stopped half way left).
 on:
   schedule:
-    - cron: "47 3 * * *"
+    - cron: "47 3 * * 0" # (Sundays: all three)
+    - cron: "47 3 * * 1-6" # (the other nights: the cold reads alone)
   workflow_dispatch:
 
 concurrency:
@@ -50,6 +54,7 @@ env:
 jobs:
   check:
     name: the bucket's limits on R2
+    if: github.event.schedule != '47 3 * * 1-6'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -92,7 +97,7 @@ jobs:
   cost:
     name: what a steady 30 MiB/s costs the bucket on R2
     needs: check # (after the limits: they share the bucket)
-    if: always()
+    if: always() && github.event.schedule != '47 3 * * 1-6'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
@@ -131,7 +136,7 @@ jobs:
 
   cold:
     name: TPC-H's reads from R2, cold and warm, beside DuckDB
-    needs: cost # (after the others: they share the bucket)
+    needs: cost # (after the others: they share the bucket; alone on a weekday night)
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 60

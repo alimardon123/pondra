@@ -547,7 +547,7 @@ impl Page {
     async fn node_part(&self, sql: &str, headers: &[(String, String)], format: Option<&str>) -> anyhow::Result<Routed> {
         let Some(paged) = self.member.get() else { return Ok(Routed::Lake) };
         let joined = self.joined.is_some();
-        if !joined && (crate::text::control(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some()) {
+        if !joined && (crate::text::control(sql).is_some() || crate::set::is(sql) || crate::vars::change(sql).is_some()) {
             return Ok(Routed::Lake);
         }
         let token = request_header(headers, "authorization").and_then(|v| v.strip_prefix("Bearer "));
@@ -1059,7 +1059,7 @@ async fn part_of(lake: &crate::store::Lake, sql: &str, format_query: String) -> 
 /// The node's part of a statement a joined page runs (`node_part`, in the request's session), each statement as the node runs it.
 /// A transaction is refused by name: the page holds none of the node's. A setting or a variable is the lake's, and so is a
 /// statement that is the session's own (its temporary tables, views and secrets). An `EXECUTE` runs its prepared text with the
-/// arguments bound, as the lake binds them (`settings::statement`, which for an EXECUTE only reads the text and runs nothing), and
+/// arguments bound, as the lake binds them (`set::statement`, which for an EXECUTE only reads the text and runs nothing), and
 /// is routed by that text. An INSERT the page may write itself is `Own` (`own_insert`, when `superuser`: the join is a superuser's). Any
 /// other write goes whole to the node, with no page tables: a statement that calls `nextval` is one too, since a page can't reach the
 /// leader that numbers it. Any other statement is `part_of`'s, so a name the page lacks (an attached lake's table, which it never
@@ -1073,13 +1073,13 @@ async fn joined_part(lake: &crate::store::Lake, sql: &str, format_query: String,
         return Err(crate::codes::coded("0A000", format!("{word}: {JOINED_TRANSACTION}")));
     }
     let word = crate::text::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default();
-    let text = if crate::settings::is(sql) {
+    let text = if crate::set::is(sql) {
         if !(word.eq_ignore_ascii_case("EXECUTE") || word.eq_ignore_ascii_case("EXEC")) {
             return Ok(Routed::Lake); // (a setting, a PREPARE or a DEALLOCATE: the lake's)
         }
-        match crate::settings::statement(lake, sql).await? {
-            crate::settings::Done::Run(run) => run,
-            crate::settings::Done::Said(_) => return Ok(Routed::Lake),
+        match crate::set::statement(lake, sql).await? {
+            crate::set::Done::Run(run) => run,
+            crate::set::Done::Said(_) => return Ok(Routed::Lake),
         }
     } else if crate::vars::change(sql).is_some() {
         return Ok(Routed::Lake); // (a variable's: the lake's)
@@ -1335,7 +1335,7 @@ fn stream_of(schema: &SchemaRef, batches: &[RecordBatch]) -> anyhow::Result<Vec<
 
 /// The bytes of a page's tables a query sends its node, within `PONDRA_WEB_SEND_MB` (`sending`), both paths' limit.
 fn sending(bytes: usize) -> anyhow::Result<()> {
-    within(bytes, crate::env::or("PONDRA_WEB_SEND_MB", 64))
+    within(bytes, crate::env::value("PONDRA_WEB_SEND_MB"))
 }
 
 /// The bytes of a page's tables a query sends its node, within `limit_mb` MiB (`PONDRA_WEB_SEND_MB`). The rows go in one
@@ -1467,8 +1467,8 @@ mod tests {
         assert_eq!(crate::codes::of(&refused), "0A000");
         // a prepared statement runs as its text, with its arguments bound: a write goes to the node, a read of the lake stays
         crate::statement::scoped(Some(SESSION.to_string()), None, async {
-            crate::settings::statement(lake, "PREPARE p AS INSERT INTO k VALUES ($1)").await.expect("the statement is prepared");
-            crate::settings::statement(lake, "PREPARE q AS SELECT a FROM t").await.expect("the read is prepared");
+            crate::set::statement(lake, "PREPARE p AS INSERT INTO k VALUES ($1)").await.expect("the statement is prepared");
+            crate::set::statement(lake, "PREPARE q AS SELECT a FROM t").await.expect("the read is prepared");
         })
         .await;
         let got = crate::statement::scoped(Some(SESSION.to_string()), None, Box::pin(joined_part(lake, "EXECUTE p(5)", String::new(), true))).await.expect("EXECUTE p");

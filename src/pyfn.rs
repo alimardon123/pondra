@@ -318,7 +318,7 @@ impl Kept {
 
 crate::per_node!(static ANSWERS: Mutex<Answers> = Mutex::new(Answers { kept: crate::ledger::ByteLru::new(answers_bytes()) }); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).kept.clear());
 
-fn answers_bytes() -> usize { crate::env::or("PONDRA_FUNCTION_CACHE_MB", 256usize) << 20 }
+fn answers_bytes() -> usize { crate::env::value::<usize>("PONDRA_FUNCTION_CACHE_MB") << 20 }
 
 impl Answers {
     fn get(&mut self, key: &[u8]) -> Option<&Kept> {

@@ -37,13 +37,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Tables smaller than this aren't worth spreading (`PONDRA_SPREAD_MB`, 256).
-fn spread_bytes() -> u64 { mb("PONDRA_SPREAD_MB", 256) }
+fn spread_bytes() -> u64 { mb("PONDRA_SPREAD_MB") }
 
 /// In a shuffle, tables smaller than this are read whole by every node, so joins broadcast them
 /// (`PONDRA_BROADCAST_MB`, 64; 0 slices every table).
-fn broadcast_bytes() -> u64 { mb("PONDRA_BROADCAST_MB", 64) }
+fn broadcast_bytes() -> u64 { mb("PONDRA_BROADCAST_MB") }
 
-fn mb(var: &str, default: u64) -> u64 { crate::env::or(var, default) << 20 }
+fn mb(var: &str) -> u64 { crate::env::value::<u64>(var) << 20 }
 
 /// One table's share on one node: manifests and files, and maybe the log tail (after..=upto).
 #[derive(Serialize, Deserialize, Clone, Default)]
