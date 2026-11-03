@@ -596,7 +596,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Ok(None) => {}
         Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
     }
-    let name = |s: &str| s.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
+    let name = crate::text::object_of;
     // `ALTER VIEW v RENAME TO w` (dbt's): the parser takes only ALTER VIEW … AS (`rules::alter::view_rename`).
     if let Some((from, to)) = (head == "alter").then(|| crate::rules::alter::view_rename(first_word(sql))).flatten() {
         return Some(Stmt::Ddl(vec![Ddl::RenameTable { name: name(&from), to: name(&to) }]));
@@ -789,11 +789,8 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::DropDefault }] => alter(&a, c, Change::Default(None)),
             [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetNotNull }] => alter(&a, c, Change::NotNull(true)),
             [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::DropNotNull }] => alter(&a, c, Change::NotNull(false)),
-            [ast::AlterTableOperation::RenameTable { table_name }] => {
-                let to = table_name.to_string();
-                let to = to.trim_start_matches("TO ").trim_start_matches("AS ");
-                let to = to.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
-                Stmt::Ddl(vec![Ddl::RenameTable { name: object(&a.name), to }])
+            [ast::AlterTableOperation::RenameTable { table_name: ast::RenameTableNameKind::As(to) | ast::RenameTableNameKind::To(to) }] => {
+                Stmt::Ddl(vec![Ddl::RenameTable { name: object(&a.name), to: object(to) }])
             }
             [ast::AlterTableOperation::SwapWith { table_name }] => Stmt::Ddl(vec![Ddl::Swap { name: object(&a.name), with: object(table_name) }]),
             // Snowflake's and Databricks' `ALTER TABLE t CLUSTER BY (a, b)`: `SET (cluster_by = 'a, b')`.

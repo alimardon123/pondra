@@ -144,7 +144,7 @@ pub fn external(c: &datafusion::sql::parser::CreateExternalTable) -> Result<crat
     ensure!(!(c.or_replace && c.if_not_exists), "CREATE OR REPLACE EXTERNAL TABLE … IF NOT EXISTS: one or the other");
     let urls = c.locations.iter().map(|l| located(l)).collect::<Result<Vec<_>>>()?;
     ensure!(!urls.is_empty(), "CREATE EXTERNAL TABLE {name}: where are its files? (LOCATION '…')");
-    let parts: Vec<String> = c.table_partition_cols.iter().map(|p| p.trim_matches('"').to_string()).collect();
+    let parts: Vec<String> = c.table_partition_cols.iter().map(|p| crate::text::object_of(p)).collect();
     let own = |col: &&datafusion::sql::sqlparser::ast::ColumnDef| !parts.contains(&crate::text::ident(&col.name));
     let typed = |cols: Vec<&datafusion::sql::sqlparser::ast::ColumnDef>| cols.iter().map(|col| format!("{}: {}", text(&crate::text::ident(&col.name)), text(&crate::write::sql_type(&col.data_type)))).collect::<Vec<_>>().join(", ");
     let (in_files, keys): (Vec<_>, Vec<_>) = c.columns.iter().partition(own);

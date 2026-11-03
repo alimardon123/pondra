@@ -1047,12 +1047,21 @@ fn json_udf(name: &'static str, body: impl Fn(&[ArrayRef], usize) -> datafusion:
     crate::pg_functions::marked(name, signature, |_| DataType::Utf8, Some("json"), body)
 }
 
+/// A relation's name as `regclass` reads it from text: its schema, if it says one, and its name, each part as SQL reads it
+/// (`'Orders'` is orders, `'"Orders"'` is Orders: `text::parts`). None: three parts or more, as no relation here is named.
+fn schema_and_name(text: &str) -> Option<(Option<String>, String)> {
+    match crate::text::parts(text).as_slice() {
+        [name] => Some((None, name.clone())),
+        [schema, name] => Some((Some(schema.clone()), name.clone())),
+        _ => None,
+    }
+}
+
 /// The sequence a table's identity column counts by, named as Postgres names it (`schema.name`);
 /// None for a column that has none, or a name that isn't a table.
 fn serial_sequence(l: &Lakes, table: &str, column: &str) -> Option<String> {
-    let table = table.trim_matches('"');
-    let (schema, name) = table.rsplit_once('.').map_or((None, table), |(s, t)| (Some(s.trim_matches('"')), t.trim_matches('"')));
-    let rel = l.rels.iter().find(|r| r.kind != 'v' && r.name == name && schema.is_none_or(|s| s == r.schema))?;
+    let (schema, name) = schema_and_name(table)?;
+    let rel = l.rels.iter().find(|r| r.kind != 'v' && r.name == name && schema.as_ref().is_none_or(|s| *s == r.schema))?;
     let id = rel.identity.get(column)?;
     let seq = l.sequences.iter().find(|q| q.lake_name == id.sequence)?;
     Some(format!("{}.{}", seq.schema, seq.name))
@@ -1175,9 +1184,8 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
         .chain(CATALOG.iter().map(|(n, o)| (*o, "pg_catalog".to_string(), n.to_string()))).collect());
     let sizes: Arc<BTreeMap<u32, u64>> = Arc::new(l.rels.iter().map(|r| (r.oid, r.bytes)).collect());
     let by_name = move |rels: &[(u32, String, String)], name: &str| -> Option<u32> {
-        let name = name.trim_matches('"');
-        let (schema, table) = name.rsplit_once('.').map_or((None, name), |(s, t)| (Some(s.trim_matches('"')), t.trim_matches('"')));
-        rels.iter().find(|(_, s, n)| n == table && schema.is_none_or(|x| x == s)).map(|(o, ..)| *o)
+        let (schema, table) = schema_and_name(name)?;
+        rels.iter().find(|(_, s, n)| *n == table && schema.as_ref().is_none_or(|x| x == s)).map(|(o, ..)| *o)
     };
     for (name, strict) in [("pondra_regclass", true), ("to_regclass", false)] {
         let rels = rels.clone();

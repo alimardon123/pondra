@@ -67,7 +67,7 @@ impl World {
 /// entry means this lake's public.
 pub fn parse(here: &str, text: &str) -> Path {
     static ENTRY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?:"[^"]*"|[^,"])+"#).expect("a regex"));
-    let mut entries: Vec<(String, String)> = ENTRY.find_iter(text).filter_map(|e| match name_parts(e.as_str()).as_slice() {
+    let mut entries: Vec<(String, String)> = ENTRY.find_iter(text).filter_map(|e| match crate::text::parts(e.as_str()).as_slice() {
         [s] if s.as_str() != "$user" => Some((here.to_string(), s.clone())),
         [d, s] => Some((d.clone(), s.clone())),
         _ => None,
@@ -111,8 +111,8 @@ pub async fn use_of(lake: &Lake, sql: &str) -> Result<String> {
     }
     let m = USE.captures(sql).ok_or_else(|| crate::codes::coded("42601", "USE takes a database, a schema or database.schema (USE crm; USE DATABASE dev)"))?;
     let kw = m.get(1).map(|k| k.as_str().to_lowercase());
-    let first = name_parts(&m[2]).into_iter().next().unwrap_or_default();
-    let second = m.get(3).map(|s| name_parts(s.as_str()).into_iter().next().unwrap_or_default());
+    let first = crate::text::parts(&m[2]).into_iter().next().unwrap_or_default();
+    let second = m.get(3).map(|s| crate::text::parts(s.as_str()).into_iter().next().unwrap_or_default());
     let here = lake_name(lake);
     let now = current(lake).unwrap_or_else(|| Path::plain(&here));
     let entry = match (kw.as_deref(), second) {
@@ -298,16 +298,6 @@ async fn stored_current(lake: &Lake, sql: &str) -> Result<bool> {
     }
 }
 
-/// A name's parts as SQL means them: a quoted part as it is written, an unquoted one in lower case
-/// (`"My.s".t` has two parts).
-fn name_parts(name: &str) -> Vec<String> {
-    static PART: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""[^"]*"|[^."\s]+"#).expect("a regex"));
-    PART.find_iter(name).map(|m| match m.as_str().strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
-        Some(quoted) => quoted.to_string(),
-        None => m.as_str().to_lowercase(),
-    }).collect()
-}
-
 /// A name in SQL: its part as it is when it is a plain lower-case word, quoted otherwise.
 fn plain(p: &str) -> bool { !p.is_empty() && p.chars().enumerate().all(|(i, c)| c == '_' || c.is_ascii_lowercase() || (i > 0 && c.is_ascii_digit())) }
 
@@ -437,7 +427,7 @@ async fn head(lake: &Lake, path: &Path, sql: &str, heads: &[Head]) -> Result<Opt
     for (re, fam, creating) in heads {
         let Some(m) = re.captures(sql) else { continue };
         let g = m.get(1).context("a name after the statement's head")?;
-        let parts = name_parts(g.as_str());
+        let parts = crate::text::parts(g.as_str());
         if matches!(parts.as_slice(), [v] if matches!(v.as_str(), "select" | "from" | "with")) {
             return Ok(Some(sql.to_string())); // (SUMMARIZE SELECT …: a query, not a name)
         }

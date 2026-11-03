@@ -243,10 +243,7 @@ fn makes_role(kind: &str, name: &str, role: &str) -> bool {
 /// The roles a project's grant names: the text after its last TO (`TO analyst, "Ann"`), as SQL names them.
 fn grantees(grant: &str) -> Vec<String> {
     let Some(at) = grant.to_ascii_uppercase().rfind(" TO ") else { return vec![] };
-    grant[at + 4..].split(',').map(|r| {
-        let r = r.trim();
-        if r.starts_with('"') { r.trim_matches('"').to_string() } else { r.to_lowercase() }
-    }).collect()
+    grant[at + 4..].split(',').map(|r| crate::text::object_of(r.trim())).collect()
 }
 
 /// The refusal for a change to what `owned` names (its key and its project), in database `db`.

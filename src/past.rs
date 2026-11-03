@@ -156,7 +156,7 @@ pub async fn restore(lake: &Lake, sql: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     let Some(c) = crate::past_names::RESTORE.captures(sql) else { return Ok(None) };
-    let name = c[1].split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
+    let name = crate::text::object_of(&c[1]);
     let t = crate::ddl::local(lake, &name).ok_or_else(|| anyhow!("RESTORE {name}: a table of this lake (run it on a node of {name}'s)"))?;
     let meta: TableMeta = lake.cat.get(&table_key(&t)).await?.ok_or_else(|| anyhow!("no table {name}"))?;
     let cols: Vec<String> = meta.live().map(|(_, n, _)| format!("\"{}\"", n.replace('"', "\"\""))).collect();

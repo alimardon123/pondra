@@ -140,7 +140,7 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
     if stmt.to_string() != format!("SELECT {items} FROM {name} WHERE {filter}") {
         return Ok(None);
     }
-    let table = name.to_string().trim_matches('"').to_string();
+    let table = crate::text::object(name);
     let Some(meta) = lake.cat.meta(&table_key(&table)).await? else { return Ok(None) };
     if !pointable(&meta) {
         return Ok(None);
