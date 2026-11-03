@@ -405,11 +405,13 @@ jobs:
       # The pip and npm packages and the installers' archive, installed and tried as on a user's
       # machine: packaging that breaks on an OS (npm is npm.cmd on Windows) shows on a push.
       - run: python tools/package.py --bin "$BIN" --platform ${{ matrix.platform }} --npm-main --out dist && bash tools/try_packages.sh ${{ matrix.platform }}
-      - name: The Linux wheel on glibc 2.17 (CentOS 7) and on Ubuntu 22.04
+      - name: The Linux wheel on glibc 2.17 (CentOS 7) under Python 3.9 and 3.11, and on Ubuntu 22.04
         if: matrix.platform == 'linux-x64' && needs.plan.outputs.profile == 'dist'
+        # (3.9: the oldest Python python/pyproject.toml's requires-python claims, so the claim is tried, not assumed.
+        # Each Python goes first on PATH, so the node's `--python auto` finds the one the wheel went into.)
         run: |
           docker run --rm -v "$PWD":/w -w /w quay.io/pypa/manylinux2014_x86_64 bash -c \
-            "/opt/python/cp311-cp311/bin/python -m pip install -q --only-binary=:all: dist/*.whl 'pyarrow<19' && /opt/python/cp311-cp311/bin/python tools/package_check.py"
+            "set -e; for py in cp39-cp39 cp311-cp311; do export PATH=/opt/python/\$py/bin:\$PATH; python -m pip install -q --only-binary=:all: dist/*.whl 'pyarrow<19'; python tools/package_check.py; done"
           docker run --rm -v "$PWD":/w -w /w ubuntu:22.04 bash -c \
             "apt-get update -qq && apt-get install -y -qq python3-pip > /dev/null && pip install -q dist/*.whl pyarrow && python3 tools/package_check.py"
       - name: The release's npm publish, tried (--dry-run, with the npm the release uses)
