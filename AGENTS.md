@@ -3101,6 +3101,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    is Utf8View, so `'b'` is) or a folded expression (`('ab' = 'b') > t`). `ValuesRight`, just before the pushdown,
    writes each filter's `value op column` as `column op' value`. `cargo test --lib optimize::tests::a_value_written_first`
 
+455. **A DECIMAL `x * 0` is the zero of the product's type, and `x % 1` is its fraction** (`optimize::DecimalIdentities`).
+   DataFusion's simplifier, for an `x` that can't be NULL, made `x * 0` the zero as written, of the zero's type (a CASE or
+   COALESCE around it was refused, its branches' types apart: `random_sql.py`'s `zero-times-decimal`), and `x % 1` zero,
+   though `3.50 % 1` is 0.50. `DecimalIdentities`, just before the simplifier, writes the first as the product's zero and
+   the second as `x % -1`, the same remainder, which DataFusion leaves; the zero or one is any constant that folds to one.
+   `cargo test --lib optimize::tests::a_decimal_times_zero`
+
 ```bash
 cargo build --release
 cargo test --release --lib [filter]     # unit tests (the tests are the library's; --bin pondra runs none)
