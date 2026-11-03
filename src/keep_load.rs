@@ -148,7 +148,7 @@ async fn copy_one(target: &Lake, folder: &str, schema: Arc<Schema>, job: Job, sy
     let Job { store, location, md, cut } = job;
     // (its piece and the file kept of it, reserved while they are held, so the pool counts them as it admits other work:
     // 11-03 audit M11)
-    let mut held = MemoryConsumer::new("a Parquet load's copy").register(&target.rt.memory_pool);
+    let held = MemoryConsumer::new("a Parquet load's copy").register(&target.rt.memory_pool);
     held.grow(2 * (cut.bytes.end - cut.bytes.start) as usize);
     let piece = store.get_range(&location, cut.bytes.clone()).await?;
     let (bytes, file) = tier::blocking(move || {
