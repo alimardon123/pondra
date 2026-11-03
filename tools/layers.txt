@@ -9,6 +9,7 @@ answer base
 codes base
 column base
 env base
+memo base
 metrics base
 parsed base
 text base

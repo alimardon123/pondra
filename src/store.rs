@@ -192,29 +192,12 @@ pub struct TableMeta {
     pub shares: Vec<String>,
     /// The rules made from this parse, once (`rules`): never in the catalog, and a clone starts without them.
     #[serde(skip)]
-    pub rules: RulesMemo,
+    pub rules: crate::memo::Memo<crate::rules::Table>,
     /// Its column list (`cols`), made once for an entry read from the catalog: a clone's is empty, as `rules`' is.
     #[serde(skip)]
-    pub column_memo: ColumnMemo,
+    pub column_memo: crate::memo::Memo<crate::column::Columns>,
 }
 
-/// The rules made from one parse of a table's entry (`TableMeta::rules`), kept once. A clone gets an empty one:
-/// it may be changed, so it makes its own.
-#[derive(Default)]
-pub struct RulesMemo(std::sync::OnceLock<Arc<crate::rules::Table>>);
-
-impl Clone for RulesMemo {
-    fn clone(&self) -> Self { RulesMemo::default() }
-}
-
-/// The column list made from one parse of a table's entry (`TableMeta::cols`), kept once. A clone gets an empty one, as
-/// `RulesMemo`'s does.
-#[derive(Default)]
-pub struct ColumnMemo(std::sync::OnceLock<Arc<crate::column::Columns>>);
-
-impl Clone for ColumnMemo {
-    fn clone(&self) -> Self { ColumnMemo::default() }
-}
 
 impl TableMeta {
     /// The changes whose old rows are out of the table's files: reads skip their `{t}$deleted` rows.
@@ -237,15 +220,16 @@ impl TableMeta {
     }
 
     /// Its columns as one list (`column.rs`): each with its id, SQL's name and its stored one, in SQL's order (as
-    /// `in_order`), the dropped ones last and marked. Made from the entry's fields each time it is asked: `cols` keeps it
-    /// once for an entry read from the catalog.
+    /// `in_order`), the dropped ones marked. Made from the entry's fields each time it is asked: `cols` keeps it once for
+    /// an entry read from the catalog. Of the entry as stored only: `logical()`'s copy has left out the dropped columns
+    /// and taken SQL's names, so its places are no longer ids.
     pub fn column_list(&self) -> crate::column::Columns {
         crate::column::Columns::new(&self.columns, |c| self.name_of(c), |c| self.is_dropped(c), &self.shown)
     }
 
     /// `column_list`, made once for this version of the entry (it can't change under an `Arc`: a change is made on a
     /// clone, whose memo is empty).
-    pub fn cols(self: &Arc<Self>) -> Arc<crate::column::Columns> { self.column_memo.0.get_or_init(|| Arc::new(self.column_list())).clone() }
+    pub fn cols(self: &Arc<Self>) -> Arc<crate::column::Columns> { self.column_memo.get_or_init(|| self.column_list()) }
 
     /// Was the column stored as `stored` dropped?
     pub fn is_dropped(&self, stored: &str) -> bool { self.dropped.iter().any(|d| d == stored) }
@@ -368,11 +352,7 @@ impl TableMeta {
     /// The rules of this entry, made once per parse and kept beside it: `Catalog::parsed` hands out one `Arc` per
     /// entry's bytes, so a write takes them with no lookup. An owned or changed entry calls `to_rules` instead.
     pub fn rules(self: &Arc<Self>) -> Result<Arc<crate::rules::Table>> {
-        if let Some(t) = self.rules.0.get() {
-            return Ok(t.clone());
-        }
-        let t = Arc::new(self.to_rules()?);
-        Ok(self.rules.0.get_or_init(|| t).clone())
+        self.rules.get_or_try_init(|| self.to_rules())
     }
 
     /// The table as its readers see it, to describe it (listings, `pg_catalog`, MCP): `logical`, its columns in SQL's order
@@ -3797,7 +3777,7 @@ mod tests {
         let b = Arc::new((*a).clone());
         assert!(!Arc::ptr_eq(&b.rules()?, &x), "a new parse makes its own");
         let c = (*a).clone();
-        assert!(c.rules.0.get().is_none(), "a clone's memo is empty");
+        assert!(c.rules.get().is_none(), "a clone's memo is empty");
         let made = Arc::new(c).rules()?;
         assert_eq!(*made, *x, "and the clone's rules are the same");
         Ok(())
@@ -3846,12 +3826,12 @@ mod tests {
                 assert_eq!((c.name.as_str(), c.dropped), (m.name_of(&c.stored), m.dropped.contains(&c.stored)));
             }
             assert_eq!(list.all().len(), n, "every column, the dropped too");
-            assert!(list.stored_order().windows(2).all(|w| w[0].id < w[1].id));
+            assert!(list.stored_order().collect::<Vec<_>>().windows(2).all(|w| w[0].id < w[1].id));
         }
         let a = Arc::new(TableMeta { columns: vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into())], shown: vec!["b".into()], ..Default::default() });
         assert!(Arc::ptr_eq(&a.cols(), &a.cols()), "made once per parse");
         assert_eq!(*a.cols(), a.column_list());
-        assert!((*a).clone().column_memo.0.get().is_none(), "a clone's memo is empty");
+        assert!((*a).clone().column_memo.get().is_none(), "a clone's memo is empty");
     }
 
     /// `past_ttl` keeps out what `ttl_sql` does: a timestamp older than the TTL's seconds, a NULL, a row without the column.
