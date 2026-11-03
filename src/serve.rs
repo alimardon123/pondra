@@ -163,7 +163,7 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
 /// A table a key lookup answers without SQL: keyed, with no merge, no renamed or moved columns, no event-time order and no
 /// TTL (SQL answers those).
 fn pointable(meta: &TableMeta) -> bool {
-    !meta.key.is_empty() && meta.merge.is_empty() && !meta.mapped() && meta.shown.is_empty() && meta.order.is_none() && meta.ttl.is_none()
+    !meta.key.is_empty() && meta.merge.is_empty() && !meta.mapped() && !meta.moved() && meta.order.is_none() && meta.ttl.is_none()
 }
 
 /// The key `filter` names: `<key> = <value> [AND …]`, each of `meta`'s key columns once and no other column. Its values in

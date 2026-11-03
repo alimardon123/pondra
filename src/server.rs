@@ -907,7 +907,7 @@ async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> R
     let query = crate::routines::expand(&app.lake, &query).await?;
     // (a table that moved a column: the query's columns fill SQL's first ones, as an INSERT's do: `write::in_sql_order`)
     let query = match app.lake.table_meta_if(name).await? {
-        Some(m) if !m.shown.is_empty() => crate::write::whole_rows_of(&app.lake, name, &m, &crate::write::filled(&app.lake, &m, name, &query).await?, &query).await?,
+        Some(m) if m.moved() => crate::write::whole_rows_of(&app.lake, name, &m, &crate::write::filled(&app.lake, &m, name, &query).await?, &query).await?,
         _ => query,
     };
     let ctx = session(&app.lake, &query, "").await?;
@@ -1089,7 +1089,7 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
     let meta = lake.table_meta(&name).await?;
     ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
     // (SQL's order, for a table that moved a column: as `SELECT *` lists them)
-    let in_order = |b: RecordBatch| -> anyhow::Result<RecordBatch> { if meta.shown.is_empty() { Ok(b) } else { Ok(crate::answer::batch_reordered(&b, &meta.sql_order())?) } };
+    let in_order = |b: RecordBatch| meta.in_sql_order(&b);
     if meta.merge.is_empty() && meta.ttl.is_none() && meta.order.is_none() {
         let shown = crate::answer::schema(&meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect::<Vec<_>>())?; // (as `SELECT *` shows it)
         let row = crate::serve::lookup(lake, &name, &meta, &key).await?.map(|r| crate::query::conform(&r, &shown)).transpose()?; // (by name: a row from before an ADD COLUMN lacks it)
@@ -1289,9 +1289,8 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
 /// A table's rows (`tail`'s, the change feed's) with its columns in SQL's order (`TableMeta::sql_order`), the system
 /// columns where they are; as they are for a table that never moved a column.
 async fn sql_ordered(lake: &crate::store::Lake, table: &str, batches: Vec<RecordBatch>) -> anyhow::Result<Vec<RecordBatch>> {
-    let Some(meta) = lake.table_meta_if(table).await?.filter(|m| !m.shown.is_empty()) else { return Ok(batches) };
-    let order = meta.sql_order();
-    Ok(batches.iter().map(|b| crate::answer::batch_reordered(b, &order)).collect::<Result<_, _>>()?)
+    let Some(meta) = lake.table_meta_if(table).await?.filter(|m| m.moved()) else { return Ok(batches) };
+    batches.iter().map(|b| meta.in_sql_order(b)).collect()
 }
 
 fn ndjson(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {
