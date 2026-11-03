@@ -24,7 +24,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'Pondra',
-      description: 'A streamhouse in one binary: SQL, Python and streaming over a lake on your disk or in a bucket.',
+      description: 'A Streamhouse in one binary: SQL, Python and streaming over a lake on your disk or in a bucket.',
       logo: { light: './src/assets/brand/mark-light.svg', dark: './src/assets/brand/mark-dark.svg', alt: 'Pondra' },
       favicon: '/favicon.svg',
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/alimardon123/pondra' }],

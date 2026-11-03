@@ -1,4 +1,4 @@
-# Pondra: a streamhouse in one binary
+# Pondra: a Streamhouse in one binary
 
 **Documentation: [alimardon123.github.io/pondra](https://alimardon123.github.io/pondra/)** — how to
 install it, load and query data, stream, run a cluster, and every statement, function, flag and

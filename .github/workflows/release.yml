@@ -43,7 +43,7 @@ jobs:
         run: |
           # (this repository's runs only: a fork's run of this commit never supplies what ships)
           run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?head_sha=$GITHUB_SHA&per_page=10" --jq "[.workflow_runs[] | select(.head_repository.full_name == \"$GITHUB_REPOSITORY\")][0].id // empty")
-          [ -n "$run" ] || { echo "::error::no build run for $GITHUB_SHA: push it to main first (or start the build workflow on this tag)"; exit 1; }
+          [ -n "$run" ] || { echo "::error::no build run for $GITHUB_SHA: push it to main or its release branch first (or start the build workflow on this tag)"; exit 1; }
           gh run watch "$run" --interval 30 > /dev/null || true
           ended=$(gh run view "$run" --json conclusion --jq .conclusion)
           # (main builds only its newest commit: a run dropped for a newer push built nothing, and the

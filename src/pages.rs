@@ -7,21 +7,20 @@
 //! then runs the query again for that page.
 //! Only whoever asked for an answer reads its pages: the id is a key to nothing else (S31), and
 //! another's request for it answers 410 as if it were gone.
+use crate::ledger::ByteLru;
 use datafusion::arrow::record_batch::RecordBatch;
-use std::collections::VecDeque;
 use std::sync::Mutex;
 use datafusion::common::instant::Instant;
 use std::time::Duration;
 
 struct Kept {
-    id: String,
     holder: String, // (who asked: `auth::holder`)
     batches: Vec<RecordBatch>,
-    bytes: usize,
     used: Instant,
 }
 
-crate::per_node!(static KEPT: Mutex<VecDeque<Kept>> = Default::default());
+// (by id, each charged its rows' memory)
+crate::per_node!(static KEPT: Mutex<ByteLru<String, Kept>> = Mutex::new(ByteLru::new(budget())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
 const IDLE: Duration = Duration::from_secs(20 * 60);
 
 fn budget() -> usize { crate::env::or::<usize>("PONDRA_PAGES_MB", 256) << 20 }
@@ -35,13 +34,10 @@ pub fn keep(batches: &[RecordBatch]) -> Option<String> {
     let id = uuid::Uuid::new_v4().simple().to_string(); // (random: an id is known only to whoever was sent the answer)
     let holder = crate::auth::holder();
     let mut kept = KEPT.lock().unwrap();
-    kept.retain(|k| k.used.elapsed() < IDLE);
-    let mut total: usize = kept.iter().map(|k| k.bytes).sum();
-    while total + bytes > budget {
-        let Some(k) = kept.pop_front() else { break };
-        total -= k.bytes;
-    }
-    kept.push_back(Kept { id: id.clone(), holder, batches: batches.to_vec(), bytes, used: Instant::now() });
+    let mut left = kept.retain(|_, k| k.used.elapsed() < IDLE);
+    left.extend(kept.set_most(budget));
+    left.extend(kept.put(id.clone(), Kept { holder, batches: batches.to_vec(), used: Instant::now() }, bytes));
+    drop(kept); // (what left is let go of outside the lock)
     Some(id)
 }
 
@@ -50,8 +46,10 @@ pub fn keep(batches: &[RecordBatch]) -> Option<String> {
 pub fn page(id: &str, from: usize, n: usize) -> Option<Vec<RecordBatch>> {
     let who = crate::auth::holder();
     let mut kept = KEPT.lock().unwrap();
-    let i = kept.iter().position(|k| k.id == id && k.holder == who && k.used.elapsed() < IDLE)?;
-    let mut k = kept.remove(i)?;
+    if !kept.peek(id).is_some_and(|k| k.holder == who && k.used.elapsed() < IDLE) {
+        return None; // (another's answer is left as it is: as if gone)
+    }
+    let k = kept.get_mut(id)?;
     k.used = Instant::now();
     let (mut skip, mut left) = (from, n);
     let mut out: Vec<RecordBatch> = k.batches.first().map(|b| b.slice(0, 0)).into_iter().collect(); // (the columns, even past the end)
@@ -67,7 +65,6 @@ pub fn page(id: &str, from: usize, n: usize) -> Option<Vec<RecordBatch>> {
         out.push(b.slice(skip, take));
         (skip, left) = (0, left - take);
     }
-    kept.push_back(k);
     Some(out)
 }
 

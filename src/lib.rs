@@ -11,6 +11,8 @@ extern crate pondra_tokio_web as tokio;
 // rewrites that need no lake.
 pub mod finish;
 pub mod env;
+// The one place a feature says what it adds (designs/redesign/redesign.md §6): `built_in` below lists the build's extensions.
+pub mod registry;
 pub mod reset;
 pub mod fsum;
 pub mod avg;
@@ -24,6 +26,9 @@ pub mod in_task;
 #[cfg(feature = "lake")] pub mod page; // (a page is a member on the core's lake, one per module)
 pub mod request_body;
 pub mod text;
+// The memory ledger: the one byte-bounded cache every bounded cache of the node uses (`ByteLru`).
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its caches are the lake's)
+mod ledger;
 // A table's columns as one list, each with its id (the redesign's step 1b).
 pub mod column;
 // A value made once beside what it is made from (a table entry's rules and column list).
@@ -58,7 +63,7 @@ mod lateral;
 mod lateral_join;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod measures;
-// Postgres's JSON and text functions: every session has them (`engine::session`), a page's too.
+// Postgres's JSON and text functions: every session has them (the `postgres` extension: `pg_functions::POSTGRES`), a page's too.
 #[cfg_attr(not(feature = "lake"), allow(dead_code))]
 mod pg_formats;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))]
@@ -240,3 +245,21 @@ mod rules;
 #[cfg(feature = "lake")] mod keep_load;
 #[cfg(feature = "lake")] mod write_outside;
 #[cfg(feature = "lake")] mod workspace;
+
+/// The extensions this build has, in the order the registry adds them (`registry::get`): the host decides, so the
+/// floors below never name one. A session gets their function sets in this order, each seeing the ones before it, and
+/// where two name one function the later one's stays: Spark's first, so Pondra's own and Postgres's stay where Spark
+/// has the name too; MATCH_RECOGNIZE's after the ones its DEFINEs may call.
+pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
+    static BUILT_IN: &[&dyn registry::Extension] = &[
+        #[cfg(feature = "lake")]
+        &objects::CATALOG,
+        &sparksql::SPARK,
+        &engine::ENGINE,
+        &pg_functions::POSTGRES,
+        &matcher::MATCH_RECOGNIZE,
+        #[cfg(feature = "lake")]
+        &ai::AI,
+    ];
+    BUILT_IN
+}

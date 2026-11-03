@@ -11,11 +11,11 @@ use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
 /// The session CHECKs, DEFAULTs and expectations are planned in: every function a query's session has but the lake's
-/// (`store::functions`, Postgres's JSON operators among them), so a condition that works in a query works here, and one
+/// (`engine::session`, Postgres's JSON operators among them), so a condition that works in a query works here, and one
 /// that doesn't is refused at CREATE, as Postgres refuses it. Built once: `rules::fit::evaluate` and `rules::fit::breaking`
 /// run it as it is; `values` and `validate` take a copy (`copy`), so what they register is theirs alone.
 static BASE: std::sync::LazyLock<SessionContext> =
-    std::sync::LazyLock::new(|| crate::store::functions(datafusion::prelude::SessionConfig::new(), std::sync::Arc::new(Default::default())));
+    std::sync::LazyLock::new(|| crate::engine::session(datafusion::prelude::SessionConfig::new(), std::sync::Arc::new(Default::default())));
 
 /// The session a node plans a CHECK in (`BASE`), for the write rules' callers (`rules::checked`).
 pub fn base() -> &'static SessionContext { &BASE }

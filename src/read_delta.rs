@@ -294,14 +294,8 @@ async fn checkpoint(reach: &impl Reach, root: &str, files: &[String]) -> Result<
 
 /// Parquet files of actions (checkpoints, sidecars) as JSON actions, as a commit holds them.
 async fn parquet_actions(reach: &impl Reach, urls: Vec<String>) -> Result<Vec<Value>> {
-    use datafusion::arrow::json as arrow_json;
     let batches = reach.session().read_parquet(urls, Default::default()).await?.collect().await?;
-    let mut w = arrow_json::LineDelimitedWriter::new(vec![]);
-    for b in &batches {
-        w.write(b)?;
-    }
-    w.finish()?;
-    lines(&w.into_inner())
+    crate::answer::json_values(&batches, usize::MAX)
 }
 
 fn lines(body: &[u8]) -> Result<Vec<Value>> {

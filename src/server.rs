@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use datafusion::arrow::ipc::reader::StreamReader;
-use datafusion::arrow::{compute::concat_batches, json as arrow_json, record_batch::RecordBatch};
+use datafusion::arrow::{compute::concat_batches, record_batch::RecordBatch};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json as j, Value};
@@ -1094,11 +1094,7 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
         let shown = crate::answer::schema(&meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect::<Vec<_>>())?; // (as `SELECT *` shows it)
         let row = crate::serve::lookup(lake, &name, &meta, &key).await?.map(|r| crate::query::conform(&r, &shown)).transpose()?; // (by name: a row from before an ADD COLUMN lacks it)
         let row = row.map(|r| meta.to_logical(&r).and_then(in_order)).transpose()?;
-        let mut w = arrow_json::ArrayWriter::new(Vec::new());
-        w.write_batches(&row.iter().collect::<Vec<_>>())?;
-        w.finish()?;
-        let body = if row.is_none() { b"[]".to_vec() } else { w.into_inner() };
-        return Ok(([("content-type", "application/json")], body).into_response());
+        return Ok(([("content-type", "application/json")], crate::answer::json(&row)?).into_response());
     }
     let mut where_ = vec![];
     for (col, val) in meta.key.iter().zip(key.split(',')) {
@@ -1120,10 +1116,7 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
     };
     let shown = |b: &RecordBatch| b.project(&(0..b.num_columns()).filter(|&i| b.schema().field(i).name() != "_deleted").collect::<Vec<_>>());
     let batches = ctx.sql(&sql).await?.collect().await?.iter().map(|b| meta.to_logical(&shown(b)?).and_then(in_order)).collect::<anyhow::Result<Vec<_>>>()?;
-    let mut w = arrow_json::ArrayWriter::new(Vec::new());
-    w.write_batches(&batches.iter().collect::<Vec<_>>())?;
-    w.finish()?;
-    Ok(([("content-type", "application/json")], w.into_inner()).into_response())
+    Ok(([("content-type", "application/json")], crate::answer::json(&batches)?).into_response())
 }
 
 /// `POST /sql`: statements (SQL, or JSON with `$name` parameters, or that and tables of the
@@ -1293,12 +1286,7 @@ async fn sql_ordered(lake: &crate::store::Lake, table: &str, batches: Vec<Record
     batches.iter().map(|b| meta.in_sql_order(b)).collect()
 }
 
-fn ndjson(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {
-    let mut w = arrow_json::LineDelimitedWriter::new(Vec::new());
-    w.write_batches(&batches.iter().collect::<Vec<_>>())?;
-    w.finish()?;
-    Ok(w.into_inner())
-}
+fn ndjson(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> { crate::answer::json_lines(batches) }
 
 async fn tier_now(State(app): State<App>) -> Result<Json<Value>, E> {
     Ok(Json(j!({"rows_tiered": app.tier_all(0).await?})))

@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, bail, ensure, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
-use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, keywords::{Keyword, RESERVED_FOR_TABLE_ALIAS}, tokenizer::{Location, Token, Tokenizer}};
+use datafusion::sql::sqlparser::{ast, keywords::{Keyword, RESERVED_FOR_TABLE_ALIAS}, tokenizer::Token};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
@@ -32,13 +32,8 @@ pub fn syntax(sql: &str) -> Cow<'_, str> {
     if !AT.is_match(sql) {
         return Cow::Borrowed(sql);
     }
-    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize_with_location() else { return Cow::Borrowed(sql) };
-    let lines: Vec<usize> = std::iter::once(0).chain(sql.match_indices('\n').map(|(i, _)| i + 1)).collect();
-    let byte = |l: &Location| -> usize {
-        let start = lines.get((l.line.max(1) - 1) as usize).copied().unwrap_or(sql.len());
-        sql[start..].char_indices().nth((l.column.max(1) - 1) as usize).map_or(sql.len(), |(i, _)| start + i)
-    };
-    let solid: Vec<&datafusion::sql::sqlparser::tokenizer::TokenWithSpan> = tokens.iter().filter(|t| !matches!(t.token, Token::Whitespace(_))).collect();
+    let Some(tokens) = crate::text::tokens(sql) else { return Cow::Borrowed(sql) };
+    let solid = tokens.solid();
     let word = |k: usize| match solid.get(k).map(|t| &t.token) {
         Some(Token::Word(w)) => Some(w),
         _ => None,
@@ -65,9 +60,9 @@ pub fn syntax(sql: &str) -> Cow<'_, str> {
             };
             depth == 0
         }) else { break };
-        let (start, end) = (byte(&solid[first].span.start), byte(&solid[close].span.end));
-        let name = &sql[start..byte(&solid[i - 1].span.end)];
-        let expr = &sql[byte(&solid[i + 3].span.end)..byte(&solid[close].span.start)];
+        let (start, end) = (solid[first].start, solid[close].end);
+        let name = &sql[start..solid[i - 1].end];
+        let expr = &sql[solid[i + 3].end..solid[close].start];
         let aliased = word(close + 1).is_some_and(|w| w.keyword == Keyword::AS || w.quote_style.is_some() || !RESERVED_FOR_TABLE_ALIAS.contains(&w.keyword));
         out.push_str(&sql[copied..start]);
         out.push_str(&format!("pondra_at({name}, {} => {expr})", format!("{when:?}").to_lowercase()));
@@ -91,13 +86,8 @@ fn as_of(sql: &str) -> Cow<'_, str> {
     if !AS_OF.is_match(sql) {
         return Cow::Borrowed(sql);
     }
-    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize_with_location() else { return Cow::Borrowed(sql) };
-    let lines: Vec<usize> = std::iter::once(0).chain(sql.match_indices('\n').map(|(i, _)| i + 1)).collect();
-    let byte = |l: &Location| -> usize {
-        let start = lines.get((l.line.max(1) - 1) as usize).copied().unwrap_or(sql.len());
-        sql[start..].char_indices().nth((l.column.max(1) - 1) as usize).map_or(sql.len(), |(i, _)| start + i)
-    };
-    let solid: Vec<_> = tokens.iter().filter(|t| !matches!(t.token, Token::Whitespace(_))).collect();
+    let Some(tokens) = crate::text::tokens(sql) else { return Cow::Borrowed(sql) };
+    let solid = tokens.solid();
     let is = |k: usize, kw: Keyword| matches!(solid.get(k).map(|t| &t.token), Some(Token::Word(w)) if w.quote_style.is_none() && w.keyword == kw);
     let named = |k: usize| matches!(solid.get(k).map(|t| &t.token), Some(Token::Word(_)));
     let (mut out, mut copied, mut next) = (String::new(), 0, 1);
@@ -140,8 +130,8 @@ fn as_of(sql: &str) -> Cow<'_, str> {
             }
             _ => continue,
         };
-        let (start, stop) = (byte(&solid[i].span.start), byte(&solid[end].span.end));
-        let expr = &sql[byte(&solid[at].span.start)..stop];
+        let (start, stop) = (solid[i].start, solid[end].end);
+        let expr = &sql[solid[at].start..stop];
         out.push_str(&sql[copied..start]);
         out.push_str(&format!("AT ({when} => {expr})"));
         (copied, next) = (stop, end + 1);

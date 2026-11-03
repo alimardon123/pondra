@@ -461,7 +461,10 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
                 .filter(|(k, _)| inside(k, 2)).map(|(k, _)| k[2..].to_string()).collect();
             let routines: Vec<String> = lake.cat.scan::<Value>("r/", "r0").await?.into_iter().filter(|(k, _)| inside(k, 2)).map(|(k, _)| k[2..].to_string()).collect();
             let tables: Vec<String> = lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(k, _)| inside(k, 2) && !crate::sys::hidden(k)).map(|(k, _)| k[2..].to_string()).collect();
-            ensure!(cascade || (views.is_empty() && tables.is_empty() && routines.is_empty()), "schema {name} isn't empty ({}): drop them first, or DROP SCHEMA {name} CASCADE", [&views[..], &tables[..], &routines[..]].concat().join(", "));
+            if !cascade && !(views.is_empty() && tables.is_empty() && routines.is_empty()) {
+                // (dependent_objects_still_exist, as Postgres answers it: Iceberg REST's NamespaceNotEmptyException reads the code)
+                return Err(crate::codes::coded("2BP01", format!("schema {name} isn't empty ({}): drop them first, or DROP SCHEMA {name} CASCADE", [&views[..], &tables[..], &routines[..]].concat().join(", "))));
+            }
             for r in &routines {
                 crate::routines::drop(lake, r, true).await?;
             }

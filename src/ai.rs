@@ -30,6 +30,18 @@ crate::per_node!(pub static CALLS: AtomicU64 = AtomicU64::new(0)); // requests t
 crate::per_node!(pub static FAILED: AtomicU64 = AtomicU64::new(0)); // …that failed for good (their rows are null)…
 crate::per_node!(pub static RETRIED: AtomicU64 = AtomicU64::new(0)); // …and that were tried again
 
+/// The AI functions in every session, as the `ai` extension's function set.
+pub static AI: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "ai",
+    requires: &[],
+    register: |r| {
+        r.section_mut::<crate::engine::Functions>().add("ai", |ctx| {
+            register(&ctx);
+            ctx
+        })
+    },
+};
+
 pub fn register(ctx: &SessionContext) {
     for embed in [false, true] {
         let f = Ai { embed, signature: Signature::one_of(vec![TypeSignature::String(1), TypeSignature::String(2)], Volatility::Volatile) };
