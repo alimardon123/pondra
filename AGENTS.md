@@ -120,7 +120,7 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
           counts in the query memory: invariant 414); keys_below.rs (a join's keys cut the rows an aggregate under it
           groups: invariant 437); or_ranges.rs (an OR of ranges of one column that meet as one
-          range: invariant 438); zeros_in.rs (a float IN list's zero answers as `=` does: invariant NNN); round 35 served.rs (a lake's store over HTTP:
+          range: invariant 438); zeros_in.rs (a float IN list's zero answers as `=` does: invariant 448); round 35 served.rs (a lake's store over HTTP:
           pondra://host:port, ADR-072 §8, invariant 299); replace.rs (CREATE OR REPLACE TABLE: a staged table filled, then put
           in the old one's place in one commit: invariant 425); round 36 statement.rs (one statement's
           path behind every door: a door reads its wire into a request and writes the answer back in
@@ -3083,7 +3083,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    only those plans change, and the answers are the same (`logs/round36/or-ranges-2026-11-02.txt`).
    `cargo test --lib or_ranges::`
 
-NNN. **A float IN list answers as its `=`s do: -0.0 is IN a list holding 0.0** (`zeros_in.rs`). DataFusion's comparisons
+448. **A float IN list answers as its `=`s do: -0.0 is IN a list holding 0.0** (`zeros_in.rs`). DataFusion's comparisons
    make the two zeros one, but the set an IN list of floats is checked against compares bits, so `-(c0 + c1) IN (2.0,
    0.0)` kept no row where the sum was 0.0 (`random_sql.py --seed 20261102`, the nightly; Postgres and DuckDB keep
    them), nor did `a = 0.0 OR a = 2.0`, which the simplifier makes an IN list. `ZerosIn`, after the simplifier, takes
