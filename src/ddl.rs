@@ -933,7 +933,7 @@ pub async fn settle(lake: &Lake, d: &Ddl) -> Result<()> {
                 Change::Default(d) => m.stored(column).is_none_or(|s| m.defaults.get(s) == d.as_ref()),
                 Change::NotNull(on) => m.stored(column).is_none_or(|s| m.not_null.iter().any(|c| c == s) == *on),
                 Change::Place(p) => {
-                    let order: Vec<String> = m.sql_order().into_iter().filter(|c| c != "_deleted").collect();
+                    let order: Vec<String> = m.sql_names();
                     m.stored(column).is_none() || p.put(&order, column).is_ok_and(|o| o == order) // (put again, nothing moves)
                 }
             };
@@ -1606,18 +1606,17 @@ async fn place_column(lake: &Lake, name: &str, mut m: TableMeta, column: &str, p
     if let Place::After(b) = place {
         ensure!(b == column || (m.stored(b).is_some() && b != "_deleted"), crate::rules::alter::no_column(name, b));
     }
-    let order: Vec<String> = m.sql_order().into_iter().filter(|c| c != "_deleted").collect(); // (SQL's names, SQL's order)
+    let order: Vec<String> = m.sql_names(); // (SQL's names, SQL's order)
     let new = place.put(&order, column).map_err(|e| crate::codes::coded("42P10", e))?; // (Postgres's invalid column reference)
     if new == order {
         return Ok(j!({"table": name, "unchanged": true}));
     }
-    let star = |m: &TableMeta| -> Vec<(String, String)> { m.sql_columns().into_iter().filter(|(c, _)| !m.marker(c)).collect() }; // (what `SELECT *` lists)
-    let was = star(&m);
+    let was = m.star(); // (what `SELECT *` lists)
     let stored: Vec<String> = new.iter().map(|c| m.stored(c).expect("a live column").to_string()).collect();
     let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| s != "_deleted").collect();
     m.shown = if stored == as_stored { vec![] } else { stored }; // (back as stored: nothing to keep)
     // (what reads it by position keeps reading it as it did, in the same commit: `keep_readers`)
-    let (mut puts, readers) = keep_readers(lake, name, column, was, star(&m)).await?;
+    let (mut puts, readers) = keep_readers(lake, name, column, was, m.star()).await?;
     puts.push((table_key(name), json(&m)));
     lake.cat.commit(puts, &[]).await?;
     published_after_move(lake, &m, &readers).await?;
@@ -1981,7 +1980,7 @@ pub(crate) async fn keep_readers(lake: &Lake, name: &str, column: &str, was: Vec
                     // (its columns in the order its query now gives: by their stored names, the rest after, as `reorder_materialized`)
                     let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| !m.marker(s)).collect();
                     m.shown = if as_stored.starts_with(&then) { vec![] } else { then };
-                    let now: Vec<(String, String)> = m.sql_columns().into_iter().filter(|(c, _)| !m.marker(c)).collect();
+                    let now = m.star();
                     over.push((r.clone(), now));
                     queue.push((r.clone(), has));
                     format!("{who} lists its columns in the new order, its rows kept")
@@ -1997,7 +1996,7 @@ pub(crate) async fn keep_readers(lake: &Lake, name: &str, column: &str, was: Vec
             // (a column it hasn't, new in what its `*` reads: SHOW CREATE leaves it out by name, so that it makes this view)
             let extra: Vec<String> = gives.iter().flatten().filter(|c| !names.contains(c)).cloned().collect();
             if !extra.is_empty() {
-                let own: Vec<String> = m.sql_columns().into_iter().map(|(c, _)| c).filter(|c| !m.marker(c)).collect();
+                let own: Vec<String> = m.star().into_iter().map(|(c, _)| c).collect();
                 if let Some(w) = crate::rules::alter::excluding(v.query(), &extra) {
                     if outputs_over(lake, &w, &over).await.ok().as_ref() == Some(&own) {
                         what.push_str(&format!("; SHOW CREATE gives its `*` with EXCLUDE ({})", extra.join(", ")));

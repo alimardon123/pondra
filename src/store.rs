@@ -214,8 +214,10 @@ impl TableMeta {
     pub fn mapped(&self) -> bool { !self.names.is_empty() || !self.dropped.is_empty() }
 
     /// This entry's live columns (under the names it keeps them by: stored, or SQL's in `logical()`'s) in SQL's order
-    /// (`shown`, then the others as stored). Without `shown`, `columns` as they are, dropped ones out.
-    pub fn in_order(&self) -> Vec<&(String, String)> {
+    /// (`shown`, then the others as stored). Without `shown`, `columns` as they are, dropped ones out. Kept to this file:
+    /// a reader takes the order from `sql_order`, `sql_columns`, `star`, `sql_names` or the list (`cols`), never works it
+    /// out (redesign 1b).
+    fn in_order(&self) -> Vec<&(String, String)> {
         crate::column::sql_places(&self.columns, |c| self.is_dropped(c), &self.shown).into_iter().map(|i| &self.columns[i]).collect()
     }
 
@@ -256,6 +258,14 @@ impl TableMeta {
 
     /// SQL's columns (`logical_columns`) in SQL's order (`in_order`): what `SELECT *` and RETURNING * answer.
     pub fn sql_columns(&self) -> Vec<(String, String)> { self.in_order().into_iter().map(|(c, t)| (self.name_of(c).to_string(), t.clone())).collect() }
+
+    /// What `SELECT *` lists: `sql_columns` without a keyed table's delete markers (`marker`). What SHOW CREATE writes and
+    /// what a view's `*` reads (`ddl::keep_readers`).
+    pub fn star(&self) -> Vec<(String, String)> { self.sql_columns().into_iter().filter(|(c, _)| !self.marker(c)).collect() }
+
+    /// `sql_order` without `_deleted` (a keyed table's or not): what an INSERT without a column list fills, first to last
+    /// (`write::implicit`), and what `ALTER COLUMN … FIRST | AFTER` places a column among.
+    pub fn sql_names(&self) -> Vec<String> { self.sql_order().into_iter().filter(|c| c != "_deleted").collect() }
 
     /// A stored column's name in SQL.
     pub fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.names.get(stored).map_or(stored, String::as_str) }
@@ -3801,7 +3811,8 @@ mod tests {
 
     /// The one column list (redesign step 1b) agrees with the order the entry's own fields gave before it, for any mix
     /// of renames, drops and moves: SQL's order, ids as stored places + 1, a renamed column's stored name kept, and
-    /// dropped columns marked, last. `cols()` makes it once per parse, and a clone's memo is empty.
+    /// dropped columns marked, last. `star` and `sql_names` are the list's, a keyed table's markers out, and the same of
+    /// `logical()`'s copy. `cols()` makes it once per parse, and a clone's memo is empty.
     #[test]
     fn the_column_list_is_the_entrys_columns_in_sqls_order() {
         // (the order as `in_order` made it before the list: `shown`'s columns, then the rest as stored, the dropped out)
@@ -3827,6 +3838,15 @@ mod tests {
                     _ => {}
                 }
             }
+            // (delete markers: a keyed table's, or a column of that name in a table without a key)
+            let keyed = next(3) == 0;
+            if keyed || next(4) == 0 {
+                m.columns.push(("_deleted".into(), "Boolean".into()));
+            }
+            if keyed {
+                m.key = vec!["c0".into()];
+            }
+            let n = m.columns.len();
             // (`shown`: some of the columns, each once, in any order, dropped ones among them)
             let mut shown: Vec<String> = (0..n).filter(|_| next(2) == 0).map(|i| format!("c{i}")).collect();
             for i in (1..shown.len()).rev() {
@@ -3839,6 +3859,11 @@ mod tests {
             assert_eq!(m.sql_order(), sql);
             let stored: Vec<String> = list.stored_order().map(|c| c.name.clone()).collect();
             assert_eq!(m.moved(), sql != stored, "moved: SQL's order isn't the stored one");
+            let star: Vec<(String, String)> = list.sql().filter(|c| !m.marker(&c.stored)).map(|c| (c.name.clone(), c.dtype.clone())).collect();
+            assert_eq!(m.star(), star, "what `SELECT *` lists");
+            assert_eq!(m.sql_names(), sql.iter().filter(|c| *c != "_deleted").cloned().collect::<Vec<_>>());
+            let l = m.logical();
+            assert_eq!((l.star(), l.sql_names(), l.sql_order()), (m.star(), m.sql_names(), m.sql_order()), "the same of the logical copy");
             for c in list.all() {
                 assert_eq!(m.columns[c.id as usize - 1].0, c.stored, "an id is a stored place + 1");
                 assert_eq!((c.name.as_str(), c.dropped), (m.name_of(&c.stored), m.dropped.contains(&c.stored)));
