@@ -342,3 +342,26 @@ SELECT k, n, v FROM pn ORDER BY k
 1 4 a
 2 14 c
 5 1 p
+
+# A DO UPDATE's new version meets the CHECKs once the key's row is read: the SET's value is refused, though the proposed
+# row passes. A jsonb value is held in its one form whether the row is inserted (the proposed row's) or set (the SET's).
+statement error 23514
+INSERT INTO pu VALUES (1, 'ok', 1) ON CONFLICT (k) DO UPDATE SET v = 'bad'
+
+statement ok
+CREATE TABLE pj (k INT PRIMARY KEY, j JSONB CHECK (j IS NOT NULL))
+
+statement count 1
+INSERT INTO pj VALUES (1, '{"b":1,"a":2}') ON CONFLICT (k) DO UPDATE SET j = excluded.j
+
+statement count 1
+INSERT INTO pj VALUES (2, '{"z":0}') ON CONFLICT (k) DO NOTHING
+
+statement count 1
+INSERT INTO pj VALUES (1, '{"y":0}') ON CONFLICT (k) DO UPDATE SET j = '{"d":1,"c":2}'
+
+query IT
+SELECT k, j::text FROM pj ORDER BY k
+----
+1 {"c": 2, "d": 1}
+2 {"z": 0}

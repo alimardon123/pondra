@@ -888,11 +888,13 @@ async fn point(l: &Locks<'_>, key: &[String], set_to: &[(String, String)], snaps
 /// the same way: NOT NULL and CHECK fail it on a hit too, as Postgres checks them first. The row it inserts is that proposed
 /// row as `current` reads a row (`inserted_row`), worked out once as well. Then, each pass, the key's row as of the read
 /// point, under the key's lock: a DO NOTHING keeps it, a DO UPDATE changes it by its SET (`upsert_row`), and a key no row
-/// holds takes the inserted row. None: SQL works the upsert out (`change`'s planned MERGE).
-async fn upsert_point(l: &Locks<'_>, stored: &Arc<TableMeta>, m: &crate::change::Merge, p: &crate::change::PointUpsert, snapshot: u64) -> Result<Option<Changed>> {
+/// holds takes the inserted row. Its new rows come back shaped, each once: the inserted row by `proposed_rows`, and a DO
+/// UPDATE's new version by `shape_new` once the passes are done (its CHECKs meet the row read under the lock, as Postgres's
+/// do). None: SQL works the upsert out (`change`'s planned MERGE).
+async fn upsert_point(l: &Locks<'_>, stored: &Arc<TableMeta>, rules: &Arc<crate::rules::Table>, m: &crate::change::Merge, p: &crate::change::PointUpsert, snapshot: u64) -> Result<Option<Changed>> {
     let (lake, name, meta) = (&l.app.lake, l.name, l.meta);
     let Some(query) = m.upsert_query() else { return Ok(None) };
-    let proposed = crate::change::proposed_rows(lake, name, stored, &stored.rules()?, &p.given, query, snapshot).await?;
+    let proposed = crate::change::proposed_rows(lake, name, stored, rules, &p.given, query, snapshot).await?;
     let inserted = inserted_row(meta, &proposed)?;
     let Ok(mut keys) = keys_of(&proposed, &meta.key) else { return Ok(None) };
     let Some(key) = keys.pop() else { return Ok(None) };
@@ -903,11 +905,16 @@ async fn upsert_point(l: &Locks<'_>, stored: &Arc<TableMeta>, m: &crate::change:
         Ok((found, keys))
     })
     .await?;
-    Ok(done.map(|(old, new)| (old, new, at, keys)))
+    let Some((old, mut new)) = done else { return Ok(None) };
+    if !old.is_empty() {
+        shape_new(l, rules, &mut new).await?; // (a held row's new version, by the SET: a row no one holds takes `inserted`, shaped)
+    }
+    Ok(Some((old, new, at, keys)))
 }
 
 /// One pass of `upsert_point` as of commit `at`, under the key's lock: `(old, new)` as `change_one` gives them, with a key no
-/// row holds inserting `inserted`. `proposed` is what SET's `excluded` names. None: SQL works the SET out (`change_one`).
+/// row holds inserting `inserted` (and no old row). `proposed` is what SET's `excluded` names. None: SQL works the SET out
+/// (`change_one`).
 async fn upsert_row(l: &Locks<'_>, key: &[String], proposed: &RecordBatch, inserted: &RecordBatch, at: u64, alias: &str, p: &crate::change::PointUpsert) -> Result<Option<(Vec<RecordBatch>, Vec<RecordBatch>)>> {
     let (lake, name, meta) = (&l.app.lake, l.name, l.meta);
     let Some(set) = &p.update else {
@@ -935,27 +942,36 @@ fn inserted_row(meta: &TableMeta, proposed: &RecordBatch) -> Result<RecordBatch>
 /// serving path's point read when the statement is an UPDATE of one key (`point`), else by planning (`changing`). The new
 /// versions meet the table's NOT NULL and DEFAULT (invariant 130).
 async fn change(l: &Locks<'_>, stored: &Arc<TableMeta>, stmt: &Stmt, snapshot: u64) -> Result<Changed> {
+    let rules = stored.rules()?;
+    if let Stmt::Merge(m) = stmt {
+        if let Some(p) = m.point_upsert(l.name, stored) {
+            if let Some(c) = upsert_point(l, stored, &rules, m, &p, snapshot).await? {
+                return Ok(c); // (its new rows come shaped: `upsert_point`)
+            }
+        }
+    }
     let hit = match stmt {
         Stmt::Update(_, set, Some(cond)) => match point_key(&l.app.lake, l.name, stored, set, cond).await? {
             Some(key) => point(l, &key, set, snapshot).await?,
             None => None,
         },
-        Stmt::Merge(m) => match m.point_upsert(l.name, stored) {
-            Some(p) => upsert_point(l, stored, m, &p, snapshot).await?,
-            None => None,
-        },
         _ => None,
     };
-    let rules = stored.rules()?;
     let mut changed = match hit {
         Some(c) => c,
         None => changing(l, &rules, stmt, snapshot).await?,
     };
-    let host = crate::defaults::Node(&l.app.lake);
-    for b in changed.1.iter_mut().filter(|b| b.num_rows() > 0) {
-        *b = crate::rules::shape(&rules, l.name, crate::rules::Rows::Whole(b.clone()), crate::rules::How::Change, &host).await?.into_rows(); // (every batch of the new rows: as the table holds them)
-    }
+    shape_new(l, &rules, &mut changed.1).await?; // (every batch of the new rows: as the table holds them)
     Ok(changed)
+}
+
+/// A change's new rows as the table holds them: each batch with rows through `rules::shape` (`Change`), once.
+async fn shape_new(l: &Locks<'_>, rules: &Arc<crate::rules::Table>, new: &mut [RecordBatch]) -> Result<()> {
+    let host = crate::defaults::Node(&l.app.lake);
+    for b in new.iter_mut().filter(|b| b.num_rows() > 0) {
+        *b = crate::rules::shape(rules, l.name, crate::rules::Rows::Whole(b.clone()), crate::rules::How::Change, &host).await?.into_rows();
+    }
+    Ok(())
 }
 
 /// The answer of a write: the rows it replaced and added, as SQL's counts say them.
