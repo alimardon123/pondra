@@ -94,10 +94,13 @@ impl Merge {
 /// a SET of the source's column, a source named as the target, Oracle's `… WHERE` after an action.
 pub fn merge_refused(m: &ast::Merge) -> Option<String> {
     let ast::TableFactor::Table { name, alias, .. } = &m.table else { return None };
-    let target = alias.as_ref().map(|a| a.name.value.to_lowercase()).unwrap_or_else(|| name.0.last().map(|p| p.to_string().to_lowercase()).unwrap_or_default());
+    // (a name's part as SQL means it, `text::ident`; a table by its alias, else its name's last part)
+    let part = |p: &ast::ObjectNamePart| p.as_ident().map(crate::text::ident).unwrap_or_else(|| p.to_string());
+    let called = |name: &ast::ObjectName, alias: &Option<ast::TableAlias>| alias.as_ref().map(|a| crate::text::ident(&a.name)).unwrap_or_else(|| name.0.last().map(part).unwrap_or_default());
+    let target = called(name, alias);
     let source = match &m.source {
-        ast::TableFactor::Table { name, alias, .. } => Some(alias.as_ref().map(|a| a.name.value.to_lowercase()).unwrap_or_else(|| name.0.last().map(|p| p.to_string().to_lowercase()).unwrap_or_default())),
-        ast::TableFactor::Derived { alias: Some(a), .. } => Some(a.name.value.to_lowercase()),
+        ast::TableFactor::Table { name, alias, .. } => Some(called(name, alias)),
+        ast::TableFactor::Derived { alias: Some(a), .. } => Some(crate::text::ident(&a.name)),
         _ => None,
     };
     if m.clauses.is_empty() {
@@ -115,7 +118,7 @@ pub fn merge_refused(m: &ast::Merge) -> Option<String> {
                 }
                 let set: Vec<(Option<String>, String)> = u.assignments.iter().filter_map(|a| match &a.target {
                     ast::AssignmentTarget::ColumnName(n) => {
-                        let parts: Vec<String> = n.0.iter().map(|p| p.to_string().trim_matches('"').to_lowercase()).collect();
+                        let parts: Vec<String> = n.0.iter().map(part).collect();
                         Some((parts.len().checked_sub(2).map(|i| parts[i].clone()), parts.last()?.clone()))
                     }
                     _ => None,
@@ -131,7 +134,7 @@ pub fn merge_refused(m: &ast::Merge) -> Option<String> {
                 if i.insert_predicate.is_some() {
                     return Some("MERGE … INSERT … WHERE: put the condition in the clause, WHEN NOT MATCHED AND … THEN INSERT …".into());
                 }
-                if let Some(c) = twice(i.columns.iter().map(|n| n.to_string().trim_matches('"').to_lowercase()).collect()) {
+                if let Some(c) = twice(i.columns.iter().map(crate::text::object).collect()) {
                     return Some(format!("MERGE … INSERT ({c}, …, {c}): each column once"));
                 }
             }
