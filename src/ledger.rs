@@ -1,11 +1,17 @@
 //! The memory ledger (designs/redesign/redesign.md §3, step 1e): what this process holds in memory, kept in one place.
 //!
-//! Its first piece is `ByteLru`, the one cache bounded by bytes. Each of the node's caches of that shape (a map, a running
-//! byte total, and a loop that drops the least recently used past a bound) was written by hand about ten times, each with
-//! its own total to get right; they all use this one now, so a bound is set, read and later reclaimed in one way.
+//! - `ByteLru`, the one cache bounded by bytes. Each of the node's caches of that shape (a map, a running byte total, and a
+//!   loop that drops the least recently used past a bound) was written by hand about ten times, each with its own total to
+//!   get right; they all use this one now, so a bound is set, read and later reclaimed in one way.
+//! - `Ledger`, the one line for query memory, and `LakePool`, a lake's share of it as DataFusion's `MemoryPool`.
 
+use datafusion::common::human_readable_size;
+use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation};
 use std::borrow::Borrow;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// A map that keeps its most recently used entries within a byte bound, and within a count bound when one is set. Each
 /// entry is charged the bytes its `put` says, fixed for as long as it is kept, so the total never drifts from what the
@@ -143,6 +149,141 @@ impl<K: Hash + Eq, V> std::fmt::Debug for ByteLru<K, V> {
     }
 }
 
+// ---------------------------------------------------------------- the line
+
+/// The node's one line for query memory, which every lake it opens shares. Each lake's queries run on a `LakePool`: DataFusion's
+/// `FairSpillPool` over the lake's share of the line, which is the whole line while one lake runs queries and half of it
+/// while two do. So a node with one lake runs as it did, and several lakes in one process (attached and memory databases,
+/// `pondra.connect` twice) no longer each take a whole line of their own, beside the hot columns and the caches.
+///
+/// As within one `FairSpillPool`, a share is held to at the next grow. When a second lake starts, the first lake's
+/// spilling operators are refused their next grow past its new share and spill, and the second lake's are not refused
+/// for what the first still holds until then. Memory that can't be spilled (a hash join's build side) is held to the
+/// lake's share at each grow, so a lake can't take the other's either. The totals are atomic: a lake's grow locks only
+/// that lake's own counts, as it did on a pool of its own.
+#[derive(Debug)]
+pub struct Ledger {
+    line: usize,
+    reserved: AtomicUsize, // every lake's reservations together
+    busy: AtomicUsize,     // lakes with a memory consumer registered now
+}
+
+impl Ledger {
+    pub fn new(line: usize) -> Arc<Ledger> { Arc::new(Ledger { line, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0) }) }
+
+    /// A new lake's pool on this line.
+    pub fn pool(self: &Arc<Self>) -> Arc<LakePool> { Arc::new(LakePool { ledger: self.clone(), part: Default::default() }) }
+
+    pub fn line(&self) -> usize { self.line }
+
+    /// What every lake's queries hold now.
+    pub fn reserved(&self) -> usize { self.reserved.load(Relaxed) }
+
+    /// A lake's share now: the line over the lakes running queries, at least one.
+    pub fn share(&self) -> usize { self.line / self.busy.load(Relaxed).max(1) }
+}
+
+/// One lake's pool of query memory: `FairSpillPool`'s rules over the lake's share of its ledger's line (`Ledger`).
+#[derive(Debug)]
+pub struct LakePool {
+    ledger: Arc<Ledger>,
+    part: Mutex<Part>,
+}
+
+/// A lake's consumers and what they hold.
+#[derive(Debug, Default)]
+struct Part {
+    consumers: usize,
+    spillers: usize,
+    spillable: usize,
+    unspillable: usize,
+}
+
+impl LakePool {
+    pub fn ledger(&self) -> &Arc<Ledger> { &self.ledger }
+
+    fn part(&self) -> std::sync::MutexGuard<'_, Part> { self.part.lock().unwrap_or_else(PoisonError::into_inner) }
+}
+
+impl Part {
+    fn of(&mut self, r: &MemoryReservation) -> &mut usize {
+        match r.consumer().can_spill() {
+            true => &mut self.spillable,
+            false => &mut self.unspillable,
+        }
+    }
+}
+
+impl std::fmt::Display for LakePool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ledger(share: {} of {})", human_readable_size(self.ledger.share()), human_readable_size(self.ledger.line))
+    }
+}
+
+impl MemoryPool for LakePool {
+    fn name(&self) -> &str { "ledger" }
+
+    fn register(&self, c: &MemoryConsumer) {
+        let mut p = self.part();
+        if p.consumers == 0 {
+            self.ledger.busy.fetch_add(1, Relaxed);
+        }
+        p.consumers += 1;
+        p.spillers += usize::from(c.can_spill());
+    }
+
+    fn unregister(&self, c: &MemoryConsumer) {
+        let mut p = self.part();
+        p.consumers = p.consumers.saturating_sub(1);
+        p.spillers = p.spillers.saturating_sub(usize::from(c.can_spill()));
+        if p.consumers == 0 {
+            self.ledger.busy.fetch_sub(1, Relaxed);
+        }
+    }
+
+    fn grow(&self, r: &MemoryReservation, additional: usize) {
+        *self.part().of(r) += additional;
+        self.ledger.reserved.fetch_add(additional, Relaxed);
+    }
+
+    fn shrink(&self, r: &MemoryReservation, shrink: usize) {
+        let mut p = self.part();
+        let held = p.of(r);
+        *held = held.saturating_sub(shrink);
+        self.ledger.reserved.fetch_sub(shrink, Relaxed);
+    }
+
+    fn try_grow(&self, r: &MemoryReservation, additional: usize) -> Result<()> {
+        let mut p = self.part();
+        let share = self.ledger.share();
+        let available = match r.consumer().can_spill() {
+            // (no spiller past its part of what the lake's unspillable memory leaves of its share)
+            true => share.saturating_sub(p.unspillable).checked_div(p.spillers).unwrap_or(share).saturating_sub(r.size()),
+            false => share.saturating_sub(p.unspillable + p.spillable),
+        };
+        if additional > available {
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total memory pool: {self}",
+                human_readable_size(additional),
+                r.consumer().name(),
+                human_readable_size(r.size()),
+                human_readable_size(available),
+            )));
+        }
+        *p.of(r) += additional;
+        self.ledger.reserved.fetch_add(additional, Relaxed);
+        Ok(())
+    }
+
+    /// What this lake's queries hold (`Ledger::reserved` is every lake's).
+    fn reserved(&self) -> usize {
+        let p = self.part();
+        p.spillable + p.unspillable
+    }
+
+    fn memory_limit(&self) -> MemoryLimit { MemoryLimit::Finite(self.ledger.share()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +372,67 @@ mod tests {
         assert_eq!(c.get("a"), Some(&1));
         assert_eq!((c.peek("a"), c.contains("a")), (Some(&1), true));
         assert_eq!(c.pop("a"), Some(1));
+    }
+
+    fn limit(pool: &LakePool) -> Option<usize> {
+        match pool.memory_limit() {
+            MemoryLimit::Finite(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    fn consumer(pool: &Arc<LakePool>, name: &str, spills: bool) -> MemoryReservation {
+        let pool: Arc<dyn MemoryPool> = pool.clone();
+        MemoryConsumer::new(name).with_can_spill(spills).register(&pool)
+    }
+
+    #[test]
+    fn one_lake_has_the_whole_line_as_on_a_pool_of_its_own() {
+        let ledger = Ledger::new(100);
+        let a = ledger.pool();
+        let (s1, s2) = (consumer(&a, "s1", true), consumer(&a, "s2", true));
+        assert!(s1.try_grow(50).is_ok() && s2.try_grow(50).is_ok(), "two spillers, half the line each");
+        assert!(s1.try_grow(1).is_err(), "no spiller past its half");
+        let held = consumer(&a, "held", false);
+        assert!(held.try_grow(1).is_err(), "nothing that can't spill past the line");
+        s2.shrink(30);
+        assert!(held.try_grow(30).is_ok() && held.try_grow(1).is_err());
+        assert_eq!((a.reserved(), ledger.reserved(), limit(&a)), (100, 100, Some(100)));
+        drop((s1, s2, held));
+        assert_eq!((a.reserved(), ledger.reserved(), ledger.busy.load(Relaxed)), (0, 0, 0), "all given back");
+    }
+
+    #[test]
+    fn two_lakes_in_one_process_each_keep_their_share() {
+        let ledger = Ledger::new(100);
+        let (a, b) = (ledger.pool(), ledger.pool());
+        let spillers: Vec<_> = (0..4).map(|i| consumer(&a, &format!("a{i}"), true)).collect();
+        for s in &spillers {
+            s.try_grow(25).expect("alone, a lake has the whole line: a quarter for each of its four spillers");
+        }
+        assert_eq!(ledger.reserved(), 100);
+        // B starts while A holds the whole line: its spiller gets half the line now, not what A leaves.
+        let b1 = consumer(&b, "b1", true);
+        assert_eq!(limit(&b), Some(50));
+        b1.try_grow(50).expect("B's share, though A still holds the line");
+        assert!(b1.try_grow(1).is_err(), "and no more");
+        // A's spillers are held to A's half at their next grow, and spill.
+        assert!(spillers[0].try_grow(1).is_err(), "a spiller of A past its part of A's half");
+        for s in &spillers {
+            s.shrink(25 - 12); // (what each spilled)
+        }
+        assert!(spillers[0].try_grow(1).is_err() && spillers[0].try_grow(0).is_ok());
+        // Memory that can't be spilled is held to each lake's share too.
+        let (a_held, b_held) = (consumer(&a, "a held", false), consumer(&b, "b held", false));
+        assert!(a_held.try_grow(3).is_err(), "A's 48 and 3 more pass A's half");
+        assert!(a_held.try_grow(2).is_ok());
+        assert!(b_held.try_grow(1).is_err(), "B's spiller holds B's half");
+        b1.shrink(20);
+        assert!(b_held.try_grow(20).is_ok());
+        assert_eq!((a.reserved(), b.reserved(), ledger.reserved()), (50, 50, 100));
+        // When B is done, A has the whole line again.
+        drop((b1, b_held));
+        assert_eq!((ledger.busy.load(Relaxed), limit(&a)), (1, Some(100)));
+        assert!(a_held.try_grow(50).is_ok());
     }
 }

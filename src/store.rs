@@ -958,6 +958,24 @@ pub fn memory_limit() -> usize {
     crate::env::query_memory(|| ram().map_or(4 << 30, |r| r / 3))
 }
 
+crate::per_node!(
+    /// The node's line for query memory (`ledger::Ledger`), by its size: every lake the node opens shares it. (By size, so
+    /// a lake opened after the setting changed, or a test's with memory of its own, gets a line of its own.)
+    static LEDGERS: Mutex<HashMap<usize, Weak<crate::ledger::Ledger>>> = Default::default());
+
+/// A new lake's pool for its queries: its share of the node's line (`memory_limit`), which every lake of the node shares.
+fn lake_pool() -> Arc<crate::ledger::LakePool> {
+    let line = memory_limit();
+    let mut lines = LEDGERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    lines.retain(|_, l| l.strong_count() > 0);
+    let ledger = lines.get(&line).and_then(Weak::upgrade).unwrap_or_else(|| {
+        let made = crate::ledger::Ledger::new(line);
+        lines.insert(line, Arc::downgrade(&made));
+        made
+    });
+    ledger.pool()
+}
+
 /// A page's lake holds what the page's own pool does (`env::page_query_memory`, of its device's line): its memory is its
 /// line, not a machine's (`ram` is None there, and 4 GiB is past a 32-bit `usize`).
 #[cfg(target_arch = "wasm32")]
@@ -1443,7 +1461,7 @@ impl Lake {
         let (url, store, bucket) = open_store(url)?;
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
         let local = bucket.is_none() || memory;
-        let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(memory_limit()));
+        let pool = lake_pool();
         // (spills go to `spill_disk`; no listing kept past its statement: DataFusion's own cache of
         // them would hide a file added to a folder outside the lake, ADR-026)
         // (Parquet footers and files' statistics kept by caches of our own, so `cached_bytes` can say
@@ -1767,8 +1785,13 @@ impl Lake {
         ctx
     }
 
-    /// Query memory in use, and the limit.
-    pub fn memory(&self) -> (usize, usize) { (self.rt.memory_pool.reserved(), memory_limit()) }
+    /// Query memory in use on the node's line, every lake's together, and the line (`ledger::Ledger`).
+    pub fn memory(&self) -> (usize, usize) {
+        match self.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>() {
+            Some(pool) => (pool.ledger().reserved(), pool.ledger().line()),
+            None => (self.rt.memory_pool.reserved(), memory_limit()),
+        }
+    }
 
     /// What each of the node's bounded caches holds now, in bytes (`/metrics`' `cache_bytes`): what
     /// fills up to its limit is not memory the node is losing (`tools/soak.py`).
@@ -3496,6 +3519,30 @@ mod tests {
         assert_eq!(cat.recent_inline(&data_key(163)).as_deref(), Some(&b"other"[..]));
         cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Two lakes a node opens share its one line for query memory (`ledger::Ledger`): each lake's pool is its share of
+    /// it, and each lake's `memory` reads the line and what every lake holds on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_lakes_of_a_node_share_its_one_line_for_queries() -> Result<()> {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        let dirs = [0, 1].map(|_| std::env::temp_dir().join(format!("pondra-ledger-{}", uuid::Uuid::new_v4())));
+        let a = Lake::open(dirs[0].to_str().unwrap(), true, false).await?;
+        let b = Lake::open(dirs[1].to_str().unwrap(), true, false).await?;
+        let ledger = |l: &Lake| l.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
+        assert!(Arc::ptr_eq(&ledger(&a), &ledger(&b)), "one line for both");
+        let held = MemoryConsumer::new("a test's").register(&a.rt.memory_pool);
+        held.try_grow(1 << 20)?;
+        // (other tests' lakes may hold some of the same line meanwhile: what a holds is the least it reads)
+        assert_eq!(b.memory().1, memory_limit());
+        assert!(b.memory().0 >= 1 << 20, "a's reservation counts on the line b reads");
+        assert_eq!(b.rt.memory_pool.reserved(), 0, "and not in b's own pool");
+        drop(held);
+        for (lake, dir) in [a, b].into_iter().zip(&dirs) {
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(dir);
+        }
         Ok(())
     }
 
