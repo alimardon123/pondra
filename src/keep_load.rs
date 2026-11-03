@@ -265,14 +265,15 @@ impl Claims {
                     }
                     _ => vec![Claim { end: group.end, lo: None, hi: None, nulls: None }],
                 };
-                // (a page's bounds within its row group's: what holds of its rows then holds of the row group's)
+                // (each page's rows held to the tighter of its bounds and its row group's: what holds of them holds of both)
+                let start = fine.len().saturating_sub(1);
                 for mut page in pages {
-                    page.lo = within(f.name(), page.lo, &group.lo, Less)?;
-                    page.hi = within(f.name(), page.hi, &group.hi, Greater)?;
+                    page.lo = tighter(f.name(), page.lo, &group.lo, Greater)?;
+                    page.hi = tighter(f.name(), page.hi, &group.hi, Less)?;
                     fine.push(page);
                 }
                 // (pages in order, the last ending where its row group does)
-                ensure!(fine.last().is_some_and(|p| p.end == group.end) && fine.windows(2).all(|w| w[0].end <= w[1].end), "{}: its page index doesn't follow its row groups", f.name());
+                ensure!(fine.last().is_some_and(|p| p.end == group.end) && fine[start..].windows(2).all(|w| w[0].end <= w[1].end), "{}: its page index doesn't follow its row groups", f.name());
             }
             let says = |c: &Claim| c.lo.is_some() || c.hi.is_some() || c.nulls.is_some();
             if groups.iter().chain(&fine).any(says) {
@@ -293,9 +294,12 @@ impl Claims {
         Ok(())
     }
 
-    /// Every claim was of rows the file holds.
-    fn done(&self) -> Result<()> {
-        for runs in &self.columns {
+    /// Every claim was of rows the file holds (pages and row groups of no rows at its end too).
+    fn done(&mut self) -> Result<()> {
+        for runs in &mut self.columns {
+            while runs.fine.get(runs.at.0).is_some_and(|p| p.end == self.row) {
+                runs.close()?;
+            }
             ensure!(runs.at == (runs.fine.len(), runs.groups.len()), "{}: its footer claims rows past its {} rows", runs.name, self.row);
         }
         Ok(())
@@ -317,30 +321,39 @@ impl Runs {
             self.nulls.0 += column.slice(off, take).null_count() as u64;
             off += take;
             if row + off as u64 == page.end {
-                let (end, claimed) = (page.end, page.nulls);
-                held(&self.name, claimed, self.nulls.0)?;
-                self.nulls = (0, self.nulls.1 + self.nulls.0);
-                self.at.0 += 1;
-                if let Some(group) = self.groups.get(self.at.1).filter(|g| g.end == end) {
-                    held(&self.name, group.nulls, self.nulls.1)?;
-                    self.nulls.1 = 0;
-                    self.at.1 += 1;
-                }
+                self.close()?;
             }
         }
         ensure!(off == len, "{}: the file holds rows past what its footer claims", self.name);
         Ok(())
     }
+
+    /// The page under way ends: its NULLs held to its claim, and those of each row group it ends (one of no rows too).
+    fn close(&mut self) -> Result<()> {
+        let page = &self.fine[self.at.0];
+        let end = page.end;
+        held(&self.name, page.nulls, self.nulls.0)?;
+        self.nulls = (0, self.nulls.1 + self.nulls.0);
+        self.at.0 += 1;
+        while let Some(group) = self.groups.get(self.at.1).filter(|g| g.end == end) {
+            held(&self.name, group.nulls, self.nulls.1)?;
+            self.nulls.1 = 0;
+            self.at.1 += 1;
+        }
+        Ok(())
+    }
 }
 
-/// A page's bound `page` (its least value, `way` Less, or its greatest), held within its row group's `group`: either one
-/// where the other says none.
-fn within(name: &str, page: Option<ScalarValue>, group: &Option<ScalarValue>, way: std::cmp::Ordering) -> Result<Option<ScalarValue>> {
+/// The tighter of a page's bound and its row group's: of two least values the greater (`way` Greater), of two greatest
+/// the lesser (Less); either one where the other says none. Rows held to it are held to both. An honest page's bound can
+/// be the looser: parquet-mr (Spark) cuts a page index's strings to 64 bytes and keeps its row groups' whole.
+fn tighter(name: &str, page: Option<ScalarValue>, group: &Option<ScalarValue>, way: std::cmp::Ordering) -> Result<Option<ScalarValue>> {
     Ok(match (page, group) {
-        (Some(p), Some(g)) => {
-            ensure!(g.partial_cmp(&p).is_some_and(|o| o == way || o.is_eq()), "{name}: its page index says {p}, past its footer's {g}");
-            Some(p)
-        }
+        (Some(p), Some(g)) => match p.partial_cmp(g) {
+            Some(o) if o == way => Some(p),
+            Some(_) => Some(g.clone()),
+            None => anyhow::bail!("{name}: its page index's {p} and its footer's {g} don't compare"),
+        },
         (page, group) => page.or_else(|| group.clone()),
     })
 }
@@ -612,6 +625,26 @@ mod tests {
         let mut c = Claims::new(&md, &schema).unwrap();
         c.add(&of(&schema, honest(1999))).unwrap();
         assert!(c.done().is_err());
+    }
+
+    /// Of a page's bound and its row group's the tighter is held (a page's string cut short is looser than its row
+    /// group's whole one), and pages and row groups of no rows at a file's end are its rows' too.
+    #[test]
+    fn a_page_is_held_to_the_tighter_bound_and_empty_runs_end_a_file() {
+        use std::cmp::Ordering::{Greater, Less};
+        let t = |v: &str| Some(ScalarValue::Utf8(Some(v.into())));
+        assert_eq!(tighter("s", t("ab"), &t("abc"), Greater).unwrap(), t("abc"), "a least value cut short");
+        assert_eq!(tighter("s", t("abd"), &t("abc"), Greater).unwrap(), t("abd"));
+        assert_eq!(tighter("s", t("abd"), &t("abc~"), Less).unwrap(), t("abc~"), "a greatest value cut short and raised");
+        assert_eq!(tighter("s", None, &t("abc"), Less).unwrap(), t("abc"));
+        assert_eq!(tighter("s", t("x"), &None, Less).unwrap(), t("x"));
+        assert!(tighter("s", t("x"), &Some(ScalarValue::Int64(Some(1))), Less).is_err());
+        let claim = |end: u64, nulls: Option<u64>| Claim { end, lo: None, hi: None, nulls };
+        let runs = Runs { name: "i".into(), index: 0, floating: false, fine: vec![claim(5, Some(1)), claim(5, Some(0))], groups: vec![claim(5, Some(1)), claim(5, Some(0))], at: (0, 0), nulls: (0, 0) };
+        let mut c = Claims { columns: vec![runs], row: 0 };
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, true)]));
+        c.add(&RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(3), Some(4), Some(5)])) as ArrayRef]).unwrap()).unwrap();
+        c.done().unwrap();
     }
 
     /// A bound holds of strings by their bytes (a value sharing a bound's first eight bytes is compared whole, a zero
