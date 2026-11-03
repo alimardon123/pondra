@@ -48,6 +48,29 @@ pub struct Note {
     queries: u32, // (planned: a statement that ran more than one query, a script's or a procedure's, sums their costs)
     cost: (Option<i64>, Option<i64>), // (cpu_ms and bytes_read: `cost`, over the statement's queries)
     peak_memory: Option<i64>,
+    wrote: Option<Wrote>, // (its door's parse of the statement, when the door noted one: `parsed`)
+}
+
+/// What a write wrote, as `touched` keeps it: the table an INSERT, UPDATE, DELETE, MERGE or CREATE TABLE … AS writes
+/// (as the statement names it), and whether that table is only written (`pure`: an INSERT's or a CREATE's), so not
+/// counted among what it read.
+#[derive(Clone, Default)]
+struct Wrote {
+    table: Option<String>,
+    pure: bool,
+}
+
+impl Wrote {
+    fn of(stmt: Option<&crate::write::Stmt>) -> Wrote {
+        use crate::write::Stmt;
+        let table = match stmt {
+            Some(s @ (Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Create(_) | Stmt::Define(..) | Stmt::Update(..)
+                | Stmt::Delete(..) | Stmt::Merge(_))) => Some(s.table()),
+            _ => None,
+        };
+        let pure = matches!(stmt, Some(Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Create(_) | Stmt::Define(..))); // (its target isn't read)
+        Wrote { table, pure }
+    }
 }
 
 /// A part of a statement's work: what it was, on which node, from when and for how long (ms).
@@ -80,6 +103,10 @@ pub fn rows(n: u64) { with(|_, note| note.rows = Some(n)); }
 
 /// It ran across `n` nodes.
 pub fn spread(n: usize) { with(|_, note| note.nodes = Some(n as u64)); }
+
+/// The statement its door parsed from the statement's own text (`write::parse`, the Postgres door's `run`): the history
+/// writer takes the table it wrote from here, and doesn't parse the text again (`touched`).
+pub fn parsed(stmt: &crate::write::Stmt) { with(|_, note| note.wrote = Some(Wrote::of(Some(stmt)))); }
 
 /// A part of its work on `node`, which began at `began`, has ended.
 pub fn span(what: impl Into<String>, node: &str, began: Instant) {
@@ -432,13 +459,13 @@ fn touched(app: &App, lines: &[Line]) -> [ArrayRef; 2] {
     let (mut reads, mut writes) = (ListBuilder::new(StringBuilder::new()), ListBuilder::new(StringBuilder::new()));
     let local = |n: &String| crate::ddl::local(&app.lake, n).unwrap_or_else(|| n.clone());
     for l in lines {
-        use crate::write::Stmt;
-        let stmt = matches!(l.class, "write" | "ddl").then(|| crate::write::parse(&l.sql)).flatten();
-        let target = match &stmt {
-            Some(s @ (Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Create(_) | Stmt::Define(..) | Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_))) => Some(local(&s.table())),
-            _ => None,
+        let w = if matches!(l.class, "write" | "ddl") {
+            l.note.wrote.clone().unwrap_or_else(|| Wrote::of(crate::write::parse(&l.sql).as_ref())) // (the door's parse, else this one)
+        } else {
+            Wrote::default()
         };
-        let pure = matches!(stmt, Some(Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Create(_) | Stmt::Define(..))); // (its target isn't read)
+        let target = w.table.as_ref().map(local);
+        let pure = w.pure;
         match relations(&l.sql) {
             Some(names) => {
                 names.iter().map(local).filter(|n| !(pure && Some(n) == target.as_ref())).for_each(|n| reads.values().append_value(n));
