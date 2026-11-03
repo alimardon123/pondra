@@ -190,7 +190,7 @@ pub(crate) fn apart(lake: &Lake, to: &str) -> Result<()> {
 /// `BACKUP DATABASE [name] TO 'url'`: the database pinned (by its leader: this one, or an attached
 /// database's), the run asked of the backup's leader, the pin let go.
 async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Option<&str>, to: &str, retention_days: Option<u64>) -> Result<Value> {
-    let source = match database.map(|n| n.trim_matches('"').to_lowercase()) {
+    let source = match database.map(crate::text::database) {
         None => lake.arc(),
         Some(n) if n == crate::ddl::lake_name(lake) => lake.arc(),
         Some(n) => {

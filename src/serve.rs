@@ -4,6 +4,7 @@
 //! decoded once and then kept in memory. A lookup costs a scan of one cached row group — tens of
 //! microseconds — instead of planning and running a query.
 use crate::store::*;
+use crate::ledger::Charged;
 use anyhow::{Context, Result};
 use datafusion::arrow::array::{make_comparator, Array, BooleanArray, RecordBatch};
 use datafusion::arrow::compute::kernels::cmp::{eq, lt_eq};
@@ -27,11 +28,15 @@ pub struct Groups {
     footers: Mutex<HashMap<String, ArrowReaderMetadata>>,
 }
 
+/// The row groups held for lookups (at most `max` bytes), the least recently used given back first.
+impl Charged for Groups {
+    fn held(&self) -> usize { self.rows.held() }
+
+    fn give_back(&self, bytes: usize) -> usize { self.rows.give_back(bytes) }
+}
+
 impl Groups {
     pub fn new(max: usize) -> Self { Groups { rows: Mutex::new(crate::ledger::ByteLru::new(max)), footers: Default::default() } }
-
-    /// The bytes of row groups held for lookups now (at most `max`).
-    pub fn held(&self) -> usize { self.rows.lock().unwrap().bytes() }
 }
 
 /// The newest row of `key` (comma-separated values, in key order) in upsert table `meta`, if it
@@ -140,7 +145,7 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
     if stmt.to_string() != format!("SELECT {items} FROM {name} WHERE {filter}") {
         return Ok(None);
     }
-    let table = name.to_string().trim_matches('"').to_string();
+    let table = crate::text::object(name);
     let Some(meta) = lake.cat.meta(&table_key(&table)).await? else { return Ok(None) };
     if !pointable(&meta) {
         return Ok(None);

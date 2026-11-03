@@ -1091,11 +1091,11 @@ pub struct Lake {
     pub hwm: watch::Sender<u64>, // the last committed segment this node knows of
     pub backlog: std::sync::atomic::AtomicU64, // leader: rows in the log not yet tiered (all tables)
     pub rt: Arc<RuntimeEnv>,         // shared by all queries: object store registry + Parquet metadata cache
-    tail: Mutex<Tail>, // decoded log rows
-    pub tails: Mutex<crate::query::Tails>, // tables' tails as queries read them (`query::Tail`): by table, one a form (`of.1`)
+    tail: Arc<Mutex<Tail>>, // decoded log rows
+    pub tails: Arc<Mutex<crate::query::Tails>>, // tables' tails as queries read them (`query::Tail`): by table, one a form (`of.1`)
     kept: (Arc<Footers>, Arc<FileStatistics>), // DataFusion's caches of Parquet footers and of files' statistics (`rt`'s)
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
-    pub groups: crate::serve::Groups,          // decoded row groups for key lookups
+    pub groups: Arc<crate::serve::Groups>,     // decoded row groups for key lookups
     pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
     cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
@@ -1127,6 +1127,11 @@ crate::per_node!(
     /// The node's line for query memory (`ledger::Ledger`), by its size: every lake the node opens shares it. (By size, so
     /// a lake opened after the setting changed, or a test's with memory of its own, gets a line of its own.)
     static LEDGERS: Mutex<HashMap<usize, Weak<crate::ledger::Ledger>>> = Default::default());
+
+/// The node's lines now (`LEDGERS`): the memory watch takes memory back from the caches charged to them (`oom.rs`).
+pub(crate) fn ledgers() -> Vec<Arc<crate::ledger::Ledger>> {
+    LEDGERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().filter_map(Weak::upgrade).collect()
+}
 
 /// A new lake's pool for its queries: its share of the node's line (`memory_limit`), which every lake of the node shares.
 fn lake_pool() -> Arc<crate::ledger::LakePool> {
@@ -1245,6 +1250,11 @@ pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
 struct Tail {
     rows: std::collections::HashMap<String, BTreeMap<u64, Rows>>,
     bytes: usize,
+}
+
+/// The log's decoded rows, which the log's readers need until their segments are tiered: kept, and counted.
+impl crate::ledger::Charged for Mutex<Tail> {
+    fn held(&self) -> usize { self.lock().unwrap_or_else(std::sync::PoisonError::into_inner).bytes }
 }
 
 impl Tail {
@@ -1627,6 +1637,7 @@ impl Lake {
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
         let local = bucket.is_none() || memory;
         let pool = lake_pool();
+        let ledger = pool.ledger().clone();
         // (spills go to `spill_disk`; no listing kept past its statement: DataFusion's own cache of
         // them would hide a file added to a folder outside the lake, ADR-026)
         // (Parquet footers and files' statistics kept by caches of our own, so `cached_bytes` can say
@@ -1680,8 +1691,12 @@ impl Lake {
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new(crate::query::tails()), kept, disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
-        crate::oom::gives_back(&lake.hot); // (the decoded columns give memory back when the node needs it: the one watch takes them, `oom.rs`)
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
+        for (name, cache) in lake.caches() {
+            ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
+        }
+        ledger.charge("facts", Arc::downgrade(&crate::query::facts_kept())); // (the node's, charged once whatever lakes it opens)
+        crate::oom::wake();
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
             crate::panics::spawn(Lake::commits(Arc::downgrade(&lake), writes)); // (weak: a lake opened in a process goes when its last handle does)
@@ -1952,24 +1967,39 @@ impl Lake {
 
     /// Query memory in use on the node's line, every lake's together, and the line (`ledger::Ledger`).
     pub fn memory(&self) -> (usize, usize) {
-        match self.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>() {
-            Some(pool) => (pool.ledger().reserved(), pool.ledger().line()),
+        match self.ledger() {
+            Some(ledger) => (ledger.reserved(), ledger.line()),
             None => (self.rt.memory_pool.reserved(), memory_limit()),
         }
     }
 
-    /// What each of the node's bounded caches holds now, in bytes (`/metrics`' `cache_bytes`): what
-    /// fills up to its limit is not memory the node is losing (`tools/soak.py`).
-    pub fn cached_bytes(&self) -> [(&'static str, usize); 7] {
-        [
-            ("ranges", self.cached.as_ref().map_or(0, |c| c.held())),
-            ("log", self.tail.lock().unwrap().bytes),
-            ("tails", self.tails.lock().unwrap().bytes()),
-            ("lookups", self.groups.held()),
-            ("catalog_blocks", self.cat.cached()),
-            ("footers", self.kept.0.memory_used()),
-            ("statistics", self.kept.1.memory_used()),
-        ]
+    /// The node's line this lake's queries and caches are on (`lake_pool`).
+    pub fn ledger(&self) -> Option<&Arc<crate::ledger::Ledger>> {
+        Some(self.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>()?.ledger())
+    }
+
+    /// This lake's caches, each by the name `/metrics` gives it, in the order they give memory back when the node needs it
+    /// (`ledger::Charged`; each is charged to the lake's line as it opens). The hot columns go first, decoded again from
+    /// the files when they are read; then the row groups for lookups and the tables' tails, read again from the files and
+    /// the log; then the bucket's byte ranges, fetched again. The log's decoded rows, the catalog's blocks and DataFusion's
+    /// footers and statistics keep what they hold by rules of their own, and say what that is.
+    pub fn caches(&self) -> Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> {
+        let mut caches: Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> = vec![("hot", self.hot.clone()), ("lookups", self.groups.clone()), ("tails", self.tails.clone())];
+        if let Some(ranges) = &self.cached {
+            caches.push(("ranges", ranges.clone())); // (a lake on a bucket: a local or in-memory one reads its store directly)
+        }
+        caches.extend([("log", self.tail.clone() as _), ("catalog_blocks", self.cat.blocks()), ("footers", self.kept.0.clone() as _), ("statistics", self.kept.1.clone() as _)]);
+        caches
+    }
+
+    /// What each of the node's caches on this lake's line holds now, by name, in bytes (`/metrics`' `cache_bytes`; the hot
+    /// columns are its `hot_bytes`): what fills up to its limit is not memory the node is losing (`tools/soak.py`). A cache
+    /// charged to the line (`ledger::Ledger::charge`) is one of them.
+    pub fn cached_bytes(&self) -> Vec<(&'static str, usize)> {
+        match self.ledger() {
+            Some(ledger) => ledger.held_by_name().into_iter().filter(|(name, _)| *name != "hot").collect(),
+            None => self.caches().into_iter().filter(|(name, _)| *name != "hot").map(|(name, cache)| (name, cache.held())).collect(), // (a pool not the ledger's: none here)
+        }
     }
 
     /// This lake as an `Arc` (for query plans that outlive the call that made them).
@@ -2564,6 +2594,15 @@ pub fn serving() { SERVING.send_replace(true); }
 type Footers = datafusion::execution::cache::default_cache::DefaultCache<object_store_df::path::Path, datafusion::execution::cache::cache_manager::CachedFileMetadataEntry>;
 type FileStatistics = datafusion::execution::cache::default_cache::DefaultCache<datafusion::execution::cache::TableScopedPath, datafusion::execution::cache::cache_manager::CachedFileMetadata>;
 
+/// DataFusion's caches keep what they hold at their own limits, and are counted.
+impl crate::ledger::Charged for Footers {
+    fn held(&self) -> usize { self.memory_used() }
+}
+
+impl crate::ledger::Charged for FileStatistics {
+    fn held(&self) -> usize { self.memory_used() }
+}
+
 /// A catalog let go stops what its store runs for it: a reader's polling, a writer's flushing and its
 /// upkeep. SlateDB's tasks outlive its handles, so a lake opened for a moment (a branch's base, a
 /// lake detached, a node stopped in a host's process) went on reading its manifest four times a
@@ -2643,7 +2682,8 @@ impl Catalog {
     }
 
     /// What the catalog's block caches hold, in bytes.
-    pub fn cached(&self) -> usize { self.kv.cached() }
+    /// Its store's block caches (`/metrics`' `catalog_blocks`), which keep what they hold at their own limits.
+    pub fn blocks(&self) -> Arc<dyn crate::ledger::Charged> { self.kv.clone() }
 
     /// The recent frames plus a receiver for every frame from now on: the leader's own stream, or a follower's, which
     /// holds the leader's frames as it relayed them (`relay`). Either serves `GET /cluster/log` the same way.
@@ -3711,6 +3751,31 @@ mod tests {
         Ok(())
     }
 
+    /// A lake's caches are charged to its line as it opens, so the node's memory watch takes memory back from them all:
+    /// here the tables' tails, after the hot columns and the lookups' row groups, which hold nothing yet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lakes_caches_are_charged_to_its_line_and_give_memory_back() -> Result<()> {
+        use crate::ledger::Charged;
+        let dir = std::env::temp_dir().join(format!("pondra-charged-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let ledger = lake.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
+        let names: Vec<&str> = lake.caches().iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["hot", "lookups", "tails", "log", "catalog_blocks", "footers", "statistics"], "a local lake has no cache of a bucket's ranges");
+        let _ = lake.tails.lock().unwrap().put("t".into(), vec![], 4096);
+        // (other tests' lakes may be charged to the same line meanwhile: what this lake holds is the least it reads)
+        assert!(ledger.held() >= 4096, "the line counts the tails");
+        // (taken back from this lake's caches alone, in the line's order: from the whole line, other tests' would go too)
+        let freed = crate::ledger::take_back(lake.caches().iter().map(|(_, c)| &**c), 4096);
+        assert!(freed >= 4096 && lake.tails.held() == 0, "the tails give their memory back");
+        assert!(!lake.cached_bytes().iter().any(|(name, _)| *name == "hot"), "the hot columns are `hot_bytes`");
+        // (`/metrics` reads the line's list by name: the node's planning facts are on it beside the lake's caches)
+        let metrics: Vec<&str> = lake.cached_bytes().iter().map(|(name, _)| *name).collect();
+        assert!(["lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "facts"].iter().all(|n| metrics.contains(n)), "{metrics:?}");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// A lake a process opens to write (a backup taken in it: `backup::take_here`) is let go with its
     /// last handle: the loops `Lake::open` starts hold it weakly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3758,7 +3823,9 @@ mod tests {
             async fn close(&self) -> Result<(), kv::Error> {
                 Ok(())
             }
-            fn cached(&self) -> usize {
+        }
+        impl crate::ledger::Charged for Given {
+            fn held(&self) -> usize {
                 0
             }
         }

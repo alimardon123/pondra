@@ -665,10 +665,17 @@ impl FactsMemo {
     }
 }
 
-crate::per_node!(static FACTS: std::sync::Mutex<FactsMemo> = std::sync::Mutex::new(FactsMemo::default()); clear = |m| *m.lock().unwrap_or_else(|e| e.into_inner()) = FactsMemo::default());
+crate::per_node!(static FACTS: Arc<std::sync::Mutex<FactsMemo>> = Default::default(); clear = |m| *m.lock().unwrap_or_else(|e| e.into_inner()) = FactsMemo::default());
 
-/// The manifests' bytes the planning facts kept now (`cache_bytes{cache="facts"}`).
-pub fn facts_held() -> usize { FACTS.lock().unwrap_or_else(|e| e.into_inner()).by_key.bytes() }
+/// The planning facts, as the node's line counts them (`cache_bytes{cache="facts"}`): the least recently planned versions
+/// give their manifests back first.
+pub fn facts_kept() -> Arc<dyn crate::ledger::Charged> { FACTS.clone() }
+
+impl crate::ledger::Charged for std::sync::Mutex<FactsMemo> {
+    fn held(&self) -> usize { self.lock().unwrap_or_else(|e| e.into_inner()).by_key.bytes() }
+
+    fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(self, |m| &mut m.by_key, bytes) }
+}
 
 /// An append table version's `Facts` as its queries plan it, kept per version of its entry (`FactsMemo`): a table that has
 /// not changed is planned from the same facts by every query.
