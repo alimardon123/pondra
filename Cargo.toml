@@ -2,7 +2,7 @@
 name = "pondra"
 version = "0.34.0"
 edition = "2021"
-description = "Pondra: a streamhouse in one binary"
+description = "Pondra: a Streamhouse in one binary"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alimardon123/pondra"
 publish = false # (not on crates.io yet: pip and npm carry the binary)

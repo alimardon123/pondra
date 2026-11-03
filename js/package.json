@@ -1,7 +1,7 @@
 {
   "name": "pondra",
   "version": "0.34.0",
-  "description": "Pondra, a streamhouse in one binary: the binary for your platform, and a JavaScript client (SQL, exactly-once appends, change feeds)",
+  "description": "Pondra, a Streamhouse in one binary: the binary for your platform, and a JavaScript client (SQL, exactly-once appends, change feeds)",
   "type": "module",
   "main": "index.js",
   "bin": { "pondra": "bin/pondra.js" },

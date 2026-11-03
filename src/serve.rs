@@ -21,18 +21,17 @@ use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// Decoded row groups (least recently used out past `max` bytes) and Parquet footers, per node.
+/// Decoded row groups (least recently used out past `new`'s bytes) and Parquet footers, per node.
 pub struct Groups {
-    rows: Mutex<(lru::LruCache<(String, usize), (RecordBatch, bool)>, usize)>, // (rows, sorted by key)
+    rows: Mutex<crate::ledger::ByteLru<(String, usize), (RecordBatch, bool)>>, // (rows, sorted by key), each charged its rows' memory
     footers: Mutex<HashMap<String, ArrowReaderMetadata>>,
-    max: usize,
 }
 
 impl Groups {
-    pub fn new(max: usize) -> Self { Groups { rows: Mutex::new((lru::LruCache::unbounded(), 0)), footers: Default::default(), max } }
+    pub fn new(max: usize) -> Self { Groups { rows: Mutex::new(crate::ledger::ByteLru::new(max)), footers: Default::default() } }
 
     /// The bytes of row groups held for lookups now (at most `max`).
-    pub fn held(&self) -> usize { self.rows.lock().unwrap().1 }
+    pub fn held(&self) -> usize { self.rows.lock().unwrap().bytes() }
 }
 
 /// The newest row of `key` (comma-separated values, in key order) in upsert table `meta`, if it
@@ -163,7 +162,7 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
 /// A table a key lookup answers without SQL: keyed, with no merge, no renamed or moved columns, no event-time order and no
 /// TTL (SQL answers those).
 fn pointable(meta: &TableMeta) -> bool {
-    !meta.key.is_empty() && meta.merge.is_empty() && !meta.mapped() && meta.shown.is_empty() && meta.order.is_none() && meta.ttl.is_none()
+    !meta.key.is_empty() && meta.merge.is_empty() && !meta.mapped() && !meta.moved() && meta.order.is_none() && meta.ttl.is_none()
 }
 
 /// The key `filter` names: `<key> = <value> [AND …]`, each of `meta`'s key columns once and no other column. Its values in
@@ -227,13 +226,7 @@ pub fn key_where(meta: &TableMeta, cond: &str) -> Option<Vec<String>> {
 pub async fn point_sql(lake: &Lake, sql: &str) -> Result<Option<Vec<u8>>> {
     let Some(p) = point(lake, sql).await? else { return Ok(None) };
     let Some(row) = p.rows(lake).await? else { return Ok(None) };
-    if row.num_rows() == 0 {
-        return Ok(Some(b"[]".to_vec()));
-    }
-    let mut w = datafusion::arrow::json::ArrayWriter::new(Vec::new());
-    w.write_batches(&[&row])?;
-    w.finish()?;
-    Ok(Some(w.into_inner()))
+    Ok(Some(crate::answer::json([&row])?))
 }
 
 /// The log tail's rows of one table by the hash of their key, each hash to its newest row
@@ -440,7 +433,7 @@ async fn footer(lake: &Lake, f: &DataFile) -> Result<ArrowReaderMetadata> {
 /// and whether it is sorted by column `key` (files are written sorted by key; older ones may not be).
 async fn row_group(lake: &Lake, f: &DataFile, footer: &ArrowReaderMetadata, g: usize, key: &str) -> Result<(RecordBatch, bool)> {
     let id = (f.path.clone(), g);
-    if let Some(b) = lake.groups.rows.lock().unwrap().0.get(&id) {
+    if let Some(b) = lake.groups.rows.lock().unwrap().get(&id) {
         return Ok(b.clone());
     }
     let rows = footer.metadata().row_group(g).num_rows() as usize;
@@ -450,15 +443,9 @@ async fn row_group(lake: &Lake, f: &DataFile, footer: &ArrowReaderMetadata, g: u
     let col = batch.column_by_name(key).context("key column missing")?;
     let n = col.len();
     let sorted = n < 2 || lt_eq(&col.slice(0, n - 1), &col.slice(1, n - 1))?.true_count() == n - 1;
-    let mut c = lake.groups.rows.lock().unwrap();
-    c.1 += batch.get_array_memory_size();
-    if let Some((old, _)) = c.0.put(id, (batch.clone(), sorted)) {
-        c.1 -= old.get_array_memory_size();
-    }
-    while c.1 > lake.groups.max {
-        let Some((_, (old, _))) = c.0.pop_lru() else { break };
-        c.1 -= old.get_array_memory_size();
-    }
+    let bytes = batch.get_array_memory_size();
+    let left = lake.groups.rows.lock().unwrap().put(id, (batch.clone(), sorted), bytes);
+    drop(left); // (let go of outside the lock)
     Ok((batch, sorted))
 }
 

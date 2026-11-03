@@ -3159,6 +3159,7 @@ python3 tools/harness.py sso_pg         # psql 18's sign-in through a provider (
 python3 tools/harness.py keycloak       # single sign-on against a real Keycloak (PONDRA_KEYCLOAK): tokens at every door, realm roles, the console's flow, pondra login, psql 18
 python3 tools/node_check.py             # a node stopped once it serves, or while it starts, gives its term back: the next leads at once
 python3 tools/per_node_check.py         # every static per_node! or said to outlive a node; no task Node::stop can't end; settings only through env.rs
+python3 tools/size_check.py --bin <pondra> --platform linux-x64   # the shipped program within its budget (tools/size-budget.txt): its bytes and its gzip download; more raises the budget there, saying why
 cargo test --release --test node_twice  # two lakes in one process, one after the other: nothing of the first in the second
 cargo test --release --test node_library       # a node in process: restarts in place, a vital loop's panic answered as 57P03, opened again
 python3 tools/inprocess_check.py --lib <pondra_lib> --bin <pondra> [--bench]   # pondra.open() in Python and open() in Node and Bun: every way in, 50 opens, a fork, a process gone without close; --bench: open, idle memory, 10 M rows into pandas against local() and DuckDB
@@ -3885,16 +3886,31 @@ feature freeze (the owner called it on 11-03), the from-scratch review, then a r
 under the soak. Edit only your lane's files (the project's `designs/one-month-to-1-0.md` lists
 them and each lane's numbers).
 
-**Under the freeze** (the owner, 11-03 10:25 UTC, until 0.80.0 ships on 11-11), only these merge:
+**Two branches until 0.80.0** (the owner: the freeze 11-03 10:25 UTC, "release branch, redesign on
+main" 12:06). `release/0.80`, cut at main 20c2732, is the release: rc.1 on 11-06 and 0.80.0 on 11-11
+are bumped and tagged there, and a tag names a `release/0.80` commit. Only these merge into it:
 - a fix for a wrong answer, lost or exposed data, or a crash or hang;
 - an rc.1 blocker: a gate, the soak or the upgrade check failing, or the release itself (the
   version, the release notes, the installers, the upgrade guide).
 
-Nothing else merges, however small: no feature, speed work, refactor or new spelling. Keep work in
-flight as a patch under the project's `<lane>-wip/` folder, with a line on where it stands. A fix's
-PR says which of the two kinds it is, and it still proves that no other answer changes and no
-query is slower. The from-scratch redesign (`designs/one-state-every-format.md`) is planned beside
-the freeze; its code lands after 0.80.0.
+Nothing else merges there, however small: no feature, speed work, refactor or new spelling. A fix's
+pull request targets `release/0.80`, says which of the two kinds it is, and still proves that no
+other answer changes and no query is slower. Its lane then ports it to main in its own pull
+request, if the code it fixes is still there.
+
+Main takes the redesign, one step at a time in the order of the project's
+`designs/redesign/redesign.md` (v2.1, §12); the project's `redesign-wip/lane-map.md` says which lane
+takes which step or part. Each step passes its own gate before the next starts, and main stays
+releasable after each. Work parked at the freeze (patches under the project's
+`<lane>-wip/`) is redone on the redesigned layout, never landed as it is.
+
+**A new SQL feature joins the random queries and gets a deep-nesting test before it merges into
+main** (the owner, 11-03). Its pull request names both:
+- **The fuzz:** `tools/random_sql.py` makes it among its other forms, so the nightly run checks it
+  inside big queries from then on. A feature DuckDB has is matched against DuckDB. One it lacks
+  (`json()`, `files()`, a macro, an AI, http or media function) must answer as it does on its own.
+- **The test:** the feature deep inside a query, answering as it does alone: under many CTE layers,
+  in subqueries, on either side of joins, and as the source of COPY and MERGE.
 
 ## Conventions
 

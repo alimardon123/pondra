@@ -14,8 +14,7 @@
 //! - Snowflake's `CREATE STREAM … ON TABLE` and `FLATTEN(INPUT => …)`;
 //! - DuckDB's and SQLite's `PRAGMA …`, CockroachDB's `UPSERT INTO`, and Postgres's `CREATE EXTENSION` (Pondra's
 //!   INSTALL and LOAD).
-use datafusion::sql::sqlparser::dialect::GenericDialect;
-use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
+use datafusion::sql::sqlparser::tokenizer::Token;
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -48,8 +47,7 @@ fn refusal(sql: &str) -> Option<String> {
     if !LOOK.is_match(sql) {
         return None;
     }
-    let tokens = Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?;
-    let tokens: Vec<Token> = tokens.into_iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
+    let tokens = crate::text::tokens(sql)?.solid_tokens();
     tokens.split(|t| *t == Token::SemiColon).find_map(statement)
 }
 

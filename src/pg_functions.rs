@@ -107,6 +107,22 @@ pub(crate) fn int_arg(a: &ArrayRef) -> datafusion::error::Result<Vec<Option<i64>
 
 pub(crate) fn texts_out(v: impl IntoIterator<Item = Option<String>>) -> ArrayRef { Arc::new(StringArray::from_iter(v)) }
 
+/// Postgres's functions in every session, a page's too, as the `postgres` extension's function set: its JSON (operators
+/// planned ahead of the others, `pg_json::planned`), what its clients send (`format()`, `array_upper()`,
+/// `to_char(ts, 'YYYY-MM')`, below) and its casts' functions (`gen_random_uuid()`, `uuidv7()`, `pg_typeof(x)`).
+pub static POSTGRES: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "postgres",
+    requires: &["engine"],
+    register: |r| {
+        r.section_mut::<crate::engine::Functions>().add("postgres", |ctx| {
+            let ctx = crate::pg_json::planned(ctx);
+            register(&ctx);
+            crate::pg_casts::register(&ctx);
+            ctx
+        })
+    },
+};
+
 pub fn register(ctx: &SessionContext) {
     for name in ["generate_series", "range"] {
         if let Ok(f) = ctx.table_function(name) {

@@ -85,10 +85,9 @@ async fn shown_as_stored(lake: &Lake, name: &str, m: &TableMeta, sql: &[String],
     (sorted.0.sort(), sorted.1.sort());
     ensure!(sorted.0 == sorted.1, "{name}'s columns in SQL's order name each of its columns once: {}", sql.join(", "));
     let shown = if stored == as_stored { vec![] } else { stored };
-    let star = |m: &TableMeta| -> Vec<(String, String)> { m.sql_columns().into_iter().filter(|(c, _)| !m.marker(c)).collect() }; // (what `SELECT *` lists)
-    let was: Vec<(String, String)> = star(m).into_iter().filter(|(c, _)| !added.contains(c)).collect();
+    let was: Vec<(String, String)> = m.star().into_iter().filter(|(c, _)| !added.contains(c)).collect();
     let then = TableMeta { shown: shown.clone(), ..m.clone() };
-    let now = star(&then);
+    let now = then.star();
     if now == was {
         return Ok((shown, vec![], vec![])); // (nothing moved, nothing added)
     }
@@ -254,7 +253,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             let added: Vec<String> = columns[old.min(new)..].iter().map(|(c, _)| c.clone()).collect();
             if shown.is_some() || !added.is_empty() {
                 // (ADD COLUMN, at the end or `… AFTER b | FIRST`: what reads it by position keeps reading it as it did, in the same commit)
-                let sql = shown.clone().unwrap_or_else(|| m.sql_order().into_iter().filter(|c| c != "_deleted").collect());
+                let sql = shown.clone().unwrap_or_else(|| m.sql_names());
                 let (shown, puts, readers) = shown_as_stored(lake, name, &m, &sql, &added).await?;
                 (m.shown, kept) = (shown, (puts, readers));
             }
@@ -1059,7 +1058,7 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
                 if let crate::ddl::Place::After(b) = place {
                     ensure!(m.columns.iter().any(|(c, _)| c == b) && b != "_deleted", crate::rules::alter::no_column(&table, b));
                 }
-                let order: Vec<String> = m.in_order().into_iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect();
+                let order: Vec<String> = m.sql_names();
                 spec["shown"] = j!(place.put(&order, column).map_err(|e| crate::codes::coded("42P10", e))?);
             }
             let ctx = SessionContext::new_with_config(crate::optimize::config(datafusion::prelude::SessionConfig::new())); // (TIMESTAMPTZ in UTC)
@@ -1170,7 +1169,7 @@ pub(crate) async fn in_sql_order(lake: &Lake, stmt: Stmt) -> Result<Stmt> {
     let Stmt::Insert(t, q) = &stmt else { return Ok(stmt) };
     let Ok((other, name)) = crate::ddl::resolve(lake, t).await else { return Ok(stmt) }; // (refused by name further on)
     let Some(meta) = other.as_deref().unwrap_or(lake).cat.meta(&table_key(&name)).await? else { return Ok(stmt) };
-    if meta.shown.is_empty() {
+    if !meta.moved() {
         return Ok(stmt);
     }
     let names = filled(lake, &meta, t, q).await?;
@@ -1897,7 +1896,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         _ => {}
     }
     let stored = lake.cat.meta(&table_key(&table)).await?; // (a plain INSERT's routing reads it as stored)
-    let meta = stored.as_ref().map(|m| m.logical()); // (rows under SQL's names: the log keeps them stored, `log::pack`)
+    let meta = stored.as_ref().map(|m| m.logical_ref()); // (rows under SQL's names: the log keeps them stored, `log::pack`)
     // A keyed table's UPDATE or DELETE outside a transaction is a transaction of its own (ADR-067 §7): it locks the keys
     // it changes, so a change worked out from a snapshot can't overwrite a commit that landed meanwhile. Its producer is
     // the job, so a retry of it is a duplicate. A MERGE gets here only when `changes` took it as a one-row upsert of one
@@ -2506,7 +2505,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
         return Ok(Some(Request::Change(sql, job.into(), sent)));
     }
     let stored = target.cat.meta(&table_key(table)).await?; // (as parsed once a version: `rules` is the memo)
-    let meta = stored.as_ref().map(|m| m.logical());
+    let meta = stored.as_ref().map(|m| m.logical_ref());
     let log = meta.as_ref().is_some_and(|m| through_log(m, stmt));
     match (meta, stmt) {
         (Some(m), _) if log => {

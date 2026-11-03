@@ -193,7 +193,7 @@ jobs:
           if [ "$FULL" = true ] && [ "$release" = false ]; then echo "macOS Intel is built on a version commit (the one a release tags) or a run started by hand." >> "$GITHUB_STEP_SUMMARY"; fi
           code=false; unit=false; harness=false; docs=false; site=false; deploy=false; full=false
           if has "$bin|$pkg|$self"; then code=true; fi
-          if has "$bin|^tests/|^tools/per_node_check\.py\$|$self"; then unit=true; fi
+          if has "$bin|^tests/|^tools/per_node_check\.py\$|^tools/layers(\.py|\.txt|-baseline\.txt)\$|$self"; then unit=true; fi
           # (a check, or what one starts: tools/bench/, tools/cloud/, tools/soak.py and tools/train*.py are the benches', the
           # soak's and the merge train's own: train.yml tests the train's)
           if [ "$code" = true ] || [ "$files" = ALL ] || grep -qE '^tools/[^/]+$' <<< "$(grep -vxE 'tools/(soak|train|train_test)\.py' <<< "$files")"; then harness=true; fi
@@ -380,6 +380,9 @@ jobs:
             cargo build --profile dist --target ${{ matrix.target }} --workspace
           fi
       - run: python tools/smoke.py "$BIN" # (on this OS: the shell, SQL, and memory read without /proc)
+      - name: The program within its size budget # (tools/size_check.py: its bytes as shipped and its download, against tools/size-budget.txt; a change that needs more raises the budget there, saying why)
+        if: matrix.platform == 'linux-x64' && needs.plan.outputs.profile == 'dist'
+        run: python tools/size_check.py --bin "$BIN" --platform linux-x64
       - name: A node in this process, from Python and JavaScript # (tools/inprocess_check.py: connect() with nothing on disk, 50 opens and closes, a fork, the library's ABI)
         if: matrix.platform == 'linux-x64'
         run: python tools/inprocess_check.py --bin "$BIN" --lib "$(dirname "$BIN")/libpondra_lib.so"
@@ -496,6 +499,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ needs.plan.outputs.event != 'pull_request' }} # (main's caches only, as the build's)
       - run: python3 tools/per_node_check.py # (a node leaves nothing of itself in its process: the source alone, ADR-061)
+      - run: python3 tools/layers.py --baseline # (no new use across the redesign's floors: tools/layers.txt; designs/redesign/redesign.md §1)
       # Two lakes one after the other in one process, and the library's four checks.
       - run: cargo test --release --test node_twice --test node_library
       # (on main, the workspace too: the cache this job saves is the one a pull request's linux-x64

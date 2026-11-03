@@ -437,11 +437,12 @@ impl Auth {
         }
         let need = if matches!(stmt, Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::CopyTo(..)) { Role::Admin } else { Role::Write };
         if role < need && !(need == Role::Write && limited().is_some()) { // (a user's writes: its grants, below)
-            bail!("this {} may not {}", if limited().is_some() { "user" } else { "token" }, match stmt {
+            let what = match stmt {
                 Stmt::CopyTo(..) => "write files outside the lake",
                 _ if need == Role::Admin => "change the lake's tables, views, schemas, routines or users (an admin token, or a superuser, does)",
                 _ => "write",
-            });
+            };
+            return Err(crate::codes::coded("42501", format!("this {} may not {what}", if limited().is_some() { "user" } else { "token" }))); // (insufficient_privilege, by code: no door reads the words)
         }
         let (t, privileges) = needs(stmt);
         ensure!(!crate::sys::hidden(&t), "{t} is written by Pondra alone"); // (the lake's records, a table's old versions: superusers too)

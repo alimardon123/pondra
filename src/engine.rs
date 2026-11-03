@@ -2,9 +2,8 @@
 //! functions that need no lake (Spark's, JSON's, `sum` over DOUBLE, …). A node adds its own (`Lake::made`); a page
 //! uses it as it is, so both plan a query alike (designs/l2-b4-front-and-web.md).
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, StringArray, StringBuilder, UnionArray};
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::config::ConfigOptions;
 use datafusion::common::format::{ExplainFormat, MetricCategory, MetricType};
 use datafusion::common::instant::Instant;
 use datafusion::common::{internal_err, DFSchema, Result};
@@ -12,9 +11,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
-use datafusion::logical_expr::sort_properties::{ExprProperties, SortProperties};
-use datafusion::logical_expr::{ColumnarValue, Documentation, Expr, ExprSchemable, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
+use datafusion::logical_expr::{ColumnarValue, Expr, ExprSchemable, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
 use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::ExecutionPlan;
@@ -50,8 +47,9 @@ pub fn with_files(ctx: SessionContext) -> SessionContext {
     ctx
 }
 
-/// The session every query starts from: DataFusion's, with Pondra's rules and planners, and the functions
-/// that need no lake. `Lake::made` adds the node's own.
+/// The session every query starts from: DataFusion's, with Pondra's rules and planners, and every function set in the
+/// registry (`Functions`): the engine's own, Spark's, Postgres's, MATCH_RECOGNIZE's, the AI functions. A node's
+/// statements add the lake's own (`Lake::made`, `query::session_at`).
 pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     let config = crate::optimize::config(config.with_information_schema(true));
     let state = SessionStateBuilder::new().with_config(config).with_runtime_env(rt).with_default_features();
@@ -60,8 +58,49 @@ pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::intervals::planner()); // (n * INTERVAL '37 seconds')
     state.expr_planners().get_or_insert_with(Vec::new).insert(0, Arc::new(NullConcat)); // (NULL || NULL)
     let mut ctx = SessionContext::new_with_state(state.build());
-    // format_string, pmod, parse_url, …
-    spark(&ctx); // (first: Spark's set is worked out against DataFusion's names alone)
+    for set in &crate::registry::get().section::<Functions>().0 {
+        ctx = (set.add)(ctx);
+    }
+    ctx
+}
+
+/// The registry's functions section (designs/redesign/redesign.md §6): the sets of functions every session has, each
+/// added by the extension that owns it, in the order the build lists them (`crate::built_in`). Each set is added to the
+/// session the sets before it made, so it sees their functions, and where two name one function the later one's stays.
+#[derive(Default)]
+pub struct Functions(Vec<FunctionSet>);
+
+/// One extension's functions: `add` registers them with a session, or builds the session again with them (Postgres's
+/// JSON puts its operators' planner ahead of the others).
+pub struct FunctionSet {
+    pub name: &'static str,
+    pub add: fn(SessionContext) -> SessionContext,
+}
+
+impl crate::registry::Section for Functions {
+    const NAME: &'static str = "functions";
+}
+
+impl Functions {
+    pub fn add(&mut self, name: &'static str, add: fn(SessionContext) -> SessionContext) {
+        assert!(self.0.iter().all(|s| s.name != name), "two function sets are named {name}");
+        self.0.push(FunctionSet { name, add });
+    }
+
+    /// The sets' names, in the order a session gets them.
+    pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.0.iter().map(|s| s.name)
+    }
+}
+
+/// The engine's own functions, as an extension.
+pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "engine",
+    requires: &[],
+    register: |r| r.section_mut::<Functions>().add("engine", own),
+};
+
+fn own(mut ctx: SessionContext) -> SessionContext {
     datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
     ctx.register_udf(JSON_TEXT.as_ref().clone()); // pondra_json_text(x): a union (json_get's answer) as its text
     crate::asof::register(&ctx); // (ASOF JOIN's marker)
@@ -74,99 +113,9 @@ pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     // `pg_bytea` gives Postgres's bytea functions, `byte_length` among them (DataFusion's other byte functions, sha256
     // and md5, take BINARY as they are); substr is below.
     ctx.register_udf(substr().as_ref().clone());
-    let ctx = crate::pg_json::planned(ctx); // (Postgres's JSON: its operators ahead of the planners above, its functions)
-    crate::pg_functions::register(&ctx); // format(), array_upper(), to_char(ts, 'YYYY-MM'): what Postgres's clients send
-    crate::pg_casts::register(&ctx); // gen_random_uuid(), uuidv7(), pondra_uuid(x), pg_typeof(x): the casts' functions, every session's
-    crate::matcher::register(&ctx); // pondra_match(…) OVER (…): MATCH_RECOGNIZE's matcher
+    #[cfg(feature = "lake")]
+    crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
     ctx
-}
-
-/// Spark's functions whose names DataFusion doesn't have (`format_string`, `pmod`, `parse_url`,
-/// `sha2`, `collect_list`, …: PySpark's vocabulary in SQL). Where both have a name, DataFusion's
-/// stays, so no answer changes, and Spark's is there under a name of its own (`spark_floor`):
-/// `spark_sql('…')` calls it where Spark SQL names `floor` (`sparksql.rs`).
-fn spark(ctx: &SessionContext) {
-    let more = SPARK.get_or_init(|| spark_of(ctx));
-    more.scalar.iter().chain(&more.shared).for_each(|f| { ctx.register_udf(f.clone()); });
-    more.aggregate.iter().for_each(|f| { ctx.register_udaf(f.clone()); });
-}
-
-pub struct Spark {
-    scalar: Vec<datafusion::logical_expr::ScalarUDF>,
-    aggregate: Vec<datafusion::logical_expr::AggregateUDF>,
-    shared: Vec<datafusion::logical_expr::ScalarUDF>, // (Spark's of the names both have, renamed)
-    pub names: std::collections::HashMap<String, String>, // a name both have (or its alias) → Spark's here
-}
-
-static SPARK: std::sync::OnceLock<Spark> = std::sync::OnceLock::new();
-
-/// Spark's functions as every session has them (worked out once, against the first session's
-/// names: DataFusion's own, nothing else yet).
-pub fn spark_functions() -> &'static Spark {
-    SPARK.get_or_init(|| spark_of(&SessionContext::new()))
-}
-
-fn spark_of(ctx: &SessionContext) -> Spark {
-    use datafusion::execution::FunctionRegistry;
-    let new = |name: &str, aliases: &[String]| std::iter::once(name).chain(aliases.iter().map(String::as_str)).all(|n| ctx.udf(n).is_err() && ctx.udaf(n).is_err() && ctx.udwf(n).is_err());
-    let (scalar, shared): (Vec<_>, Vec<_>) = datafusion_spark::all_default_scalar_functions().into_iter().partition(|f| new(f.name(), f.aliases()));
-    let aggregate = datafusion_spark::all_default_aggregate_functions().into_iter().filter(|f| new(f.name(), f.aliases()));
-    let names = shared.iter().flat_map(|f| std::iter::once(f.name().to_string()).chain(f.aliases().iter().cloned()).map(|n| (n, format!("spark_{}", f.name())))).collect();
-    Spark {
-        scalar: scalar.iter().map(|f| f.as_ref().clone()).collect(),
-        aggregate: aggregate.map(|f| f.as_ref().clone()).collect(),
-        shared: shared.iter().map(renamed).collect(),
-        names,
-    }
-}
-
-/// Spark's version of a function DataFusion has too, under a name of its own (`spark_floor`):
-/// everything as Spark's, but the name.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct Renamed {
-    name: String,
-    inner: Arc<ScalarUDF>,
-}
-
-fn renamed(f: &Arc<ScalarUDF>) -> ScalarUDF {
-    ScalarUDF::new_from_impl(Renamed { name: format!("spark_{}", f.name()), inner: f.clone() })
-}
-
-impl ScalarUDFImpl for Renamed {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn signature(&self) -> &Signature {
-        self.inner.signature()
-    }
-    fn return_type(&self, types: &[DataType]) -> datafusion::common::Result<DataType> {
-        self.inner.return_type(types)
-    }
-    fn return_field_from_args(&self, args: ReturnFieldArgs) -> datafusion::common::Result<FieldRef> {
-        self.inner.return_field_from_args(args)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::common::Result<ColumnarValue> {
-        self.inner.invoke_with_args(args)
-    }
-    fn coerce_types(&self, types: &[DataType]) -> datafusion::common::Result<Vec<DataType>> {
-        self.inner.coerce_types(types)
-    }
-    fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> datafusion::common::Result<ExprSimplifyResult> {
-        self.inner.simplify(args, info)
-    }
-    fn short_circuits(&self) -> bool {
-        self.inner.short_circuits()
-    }
-    fn output_ordering(&self, inputs: &[ExprProperties]) -> datafusion::common::Result<SortProperties> {
-        self.inner.output_ordering(inputs)
-    }
-    fn with_updated_config(&self, config: &ConfigOptions) -> Option<ScalarUDF> {
-        let f = Arc::new(self.inner.inner().with_updated_config(config)?);
-        Some(ScalarUDF::new_from_impl(Renamed { name: self.name.clone(), inner: f }))
-    }
-    fn documentation(&self) -> Option<&Documentation> {
-        self.inner.documentation()
-    }
 }
 
 /// `pondra_json_text(x)`: a union (what `json_get` answers: a number, a string, a list…) as the text
@@ -468,6 +417,20 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::util::display::array_value_to_string;
+
+    /// Every session gets the build's function sets, in the order `crate::built_in` lists their extensions, and has
+    /// each set's functions (one of each, by a name only it registers).
+    #[test]
+    fn a_session_has_every_function_set_in_order() {
+        let sets: Vec<_> = crate::registry::get().section::<Functions>().names().collect();
+        assert_eq!(sets, ["spark", "engine", "postgres", "match_recognize", "ai"]);
+        let ctx = session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        use datafusion::execution::FunctionRegistry;
+        for f in ["pmod", "pondra_json_text", "quote_ident", "gen_random_uuid", "ai_embed"] {
+            assert!(ctx.udf(f).is_ok(), "{f}");
+        }
+        assert!(ctx.udwf("pondra_match").is_ok());
+    }
 
     /// A session answers as a node's does: one value per query, from the functions the session has.
     #[tokio::test]

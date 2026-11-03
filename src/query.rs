@@ -192,7 +192,7 @@ async fn tail_rows(lake: &Lake, table: &str, after: u64, upto: Option<u64>, keye
         return Ok(vec![]); // (a slice of a spread query that reads no log)
     }
     let of = (after, format!("{keyed} {sys} {:?}", s.fields()));
-    let kept = lake.tails.lock().unwrap().0.get(table).and_then(|forms| forms.iter().find(|t| t.of == of).cloned());
+    let kept = lake.tails.lock().unwrap().get(table).and_then(|forms| forms.iter().find(|t| t.of == of).cloned());
     if let (Some(t), Some(u)) = (&kept, upto) {
         if u <= t.through {
             return Ok(t.upto(u));
@@ -215,29 +215,32 @@ async fn tail_rows(lake: &Lake, table: &str, after: u64, upto: Option<u64>, keye
 /// form it reads. A kept tail drops the other forms' tails of the table at an older mark, and
 /// past `TAILS` the least recently used tables' go, then the table's other forms. The cache is by
 /// table, so a keep looks at its table's few forms, under the lock, not at every table's twice.
-fn keep(c: &mut (lru::LruCache<String, Vec<Arc<Tail>>>, usize), table: &str, t: Arc<Tail>) {
-    let forms = c.0.get_or_insert_mut_ref(table, Vec::new);
-    if forms.iter().any(|o| o.of.0 > t.of.0 || (o.of == t.of && t.through <= o.through)) {
+fn keep(c: &mut Tails, table: &str, t: Arc<Tail>) {
+    if c.get(table).is_some_and(|forms| forms.iter().any(|o| o.of.0 > t.of.0 || (o.of == t.of && t.through <= o.through))) {
         return;
     }
-    let mut freed = 0;
-    forms.retain(|o| {
-        let gone = o.of.1 == t.of.1 || o.of.0 < t.of.0; // (its form's tail it replaces; another form's at an older mark)
-        freed += if gone { o.bytes } else { 0 };
-        !gone
-    });
-    c.1 = c.1 + t.bytes - freed;
-    forms.push(t);
-    while c.1 > TAILS && c.0.len() > 1 {
-        let Some((_, old)) = c.0.pop_lru() else { break };
-        c.1 -= old.iter().map(|o| o.bytes).sum::<usize>();
+    let mut forms = c.pop(table).unwrap_or_default();
+    forms.retain(|o| o.of.1 != t.of.1 && o.of.0 >= t.of.0); // (its form's tail it replaces; another form's at an older mark)
+    if t.bytes <= c.most() {
+        forms.push(t); // (one past the whole bound is not kept, and pushes nothing out: the tails it replaces go, the rest stay)
     }
-    if c.1 > TAILS {
-        // (the one table left: its newest tail alone)
-        let forms = c.0.peek_mut(table).expect("kept");
-        c.1 -= forms.drain(..forms.len() - 1).map(|o| o.bytes).sum::<usize>();
+    let mut bytes = forms.iter().map(|o| o.bytes).sum::<usize>();
+    if bytes > c.most() {
+        // (the table alone past the bound: every other table goes, and its newest tail alone stays)
+        c.clear();
+        forms.drain(..forms.len() - 1);
+        bytes = forms[0].bytes;
+    }
+    if !forms.is_empty() {
+        let _ = c.put(table.to_string(), forms, bytes);
     }
 }
+
+/// Tables' tails as queries read them (`Lake::tails`): by table, one a form, each table charged its forms' bytes.
+pub type Tails = crate::ledger::ByteLru<String, Vec<Arc<Tail>>>;
+
+/// An empty `Tails`, holding at most `TAILS`.
+pub fn tails() -> Tails { Tails::new(TAILS) }
 
 /// All rows of a table (files ∪ tail up to `upto`); upsert tables carry `_ord` (0 for files).
 pub async fn raw(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<DataFrame> {
@@ -445,13 +448,13 @@ pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &Tabl
     let hide = !deleted && !meta.key.is_empty() && meta.columns.iter().any(|(c, _)| c == "_deleted");
     // (a view that finishes its answers reads under its query's names already: `finish.rs`, and a
     // view's table is never renamed or dropped a column of)
-    if (!meta.mapped() && !hide && meta.shown.is_empty()) || meta.finish.is_some() {
+    if (!meta.mapped() && !hide && !meta.moved()) || meta.finish.is_some() {
         return Ok(Arc::new(Table(provider)));
     }
     let df = ctx.read_table(provider)?;
     let shown = |c: &str| !meta.dropped.iter().any(|d| d == c) && !(hide && c == "_deleted");
     let df = crate::answer::renamed(df, |c| meta.name_of(c).to_string(), shown)?;
-    let df = if meta.shown.is_empty() { df } else { crate::answer::reordered(df, &meta.sql_order())? }; // (a column moved: SQL's order)
+    let df = if meta.moved() { crate::answer::reordered(df, &meta.sql_order())? } else { df }; // (a column moved: SQL's order)
     Ok(Arc::new(Table(df.into_view())))
 }
 
@@ -623,19 +626,17 @@ pub struct Facts {
 /// whose entry is gone leave, and the least recently used go until the new one fits, and a version bigger than the
 /// whole budget is not kept. Each tiering round makes a new version, and a dead one's manifests must not wait for 256 newer.
 struct FactsMemo {
-    by_key: lru::LruCache<(usize, bool), Kept>, // (unbounded: `put` keeps it to `FACTS_ENTRIES` and `FACTS_BYTES`)
-    bytes: usize,                               // the manifests' bytes of every entry in `by_key`
+    by_key: crate::ledger::ByteLru<(usize, bool), Kept>, // (each charged its manifests' bytes: `facts_bytes`)
 }
 
 impl Default for FactsMemo {
-    fn default() -> Self { FactsMemo { by_key: lru::LruCache::unbounded(), bytes: 0 } }
+    fn default() -> Self { FactsMemo { by_key: crate::ledger::ByteLru::new(FACTS_BYTES).with_count(FACTS_ENTRIES) } }
 }
 
-/// One version's entry in `FactsMemo`: its `Weak`, its facts, and what they count for.
+/// One version's entry in `FactsMemo`: its `Weak` and its facts.
 struct Kept {
     held: std::sync::Weak<TableMeta>,
     facts: Arc<Facts>,
-    bytes: usize,
 }
 
 /// Versions kept at once, and the manifests' bytes they may hold together, per node (`cache_bytes{cache="facts"}`).
@@ -655,36 +656,19 @@ impl FactsMemo {
         same.then(|| kept.facts.clone())
     }
 
+    /// Keeps a version's facts in place of its older ones (a version bigger than the whole budget is planned without the
+    /// memo: `ByteLru::put` keeps none past its bound).
     fn put(&mut self, meta: &Arc<TableMeta>, sys: bool, facts: &Arc<Facts>) {
-        let key = (Arc::as_ptr(meta) as usize, sys);
-        let gone: Vec<(usize, bool)> = self.by_key.iter().filter(|(_, k)| k.held.strong_count() == 0).map(|(k, _)| *k).collect();
-        for k in gone {
-            self.remove(&k);
-        }
-        self.remove(&key); // (the version's own older facts: replaced)
-        let bytes = facts_bytes(facts);
-        if bytes > FACTS_BYTES {
-            return; // (a version bigger than the whole budget is planned without the memo)
-        }
-        while self.by_key.len() >= FACTS_ENTRIES || self.bytes + bytes > FACTS_BYTES {
-            let Some((_, old)) = self.by_key.pop_lru() else { break };
-            self.bytes -= old.bytes;
-        }
-        self.by_key.put(key, Kept { held: Arc::downgrade(meta), facts: facts.clone(), bytes });
-        self.bytes += bytes;
-    }
-
-    fn remove(&mut self, key: &(usize, bool)) {
-        if let Some(old) = self.by_key.pop(key) {
-            self.bytes -= old.bytes;
-        }
+        let _ = self.by_key.retain(|_, k| k.held.strong_count() > 0);
+        let kept = Kept { held: Arc::downgrade(meta), facts: facts.clone() };
+        let _ = self.by_key.put((Arc::as_ptr(meta) as usize, sys), kept, facts_bytes(facts));
     }
 }
 
 crate::per_node!(static FACTS: std::sync::Mutex<FactsMemo> = std::sync::Mutex::new(FactsMemo::default()); clear = |m| *m.lock().unwrap_or_else(|e| e.into_inner()) = FactsMemo::default());
 
 /// The manifests' bytes the planning facts kept now (`cache_bytes{cache="facts"}`).
-pub fn facts_held() -> usize { FACTS.lock().unwrap_or_else(|e| e.into_inner()).bytes }
+pub fn facts_held() -> usize { FACTS.lock().unwrap_or_else(|e| e.into_inner()).by_key.bytes() }
 
 /// An append table version's `Facts` as its queries plan it, kept per version of its entry (`FactsMemo`): a table that has
 /// not changed is planned from the same facts by every query.
@@ -1340,7 +1324,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             let view = table_view(lake, &ctx, name, &meta, touched || named_sys, upto).await?;
             let mut t = named(&ctx, view, &meta, names_deleted(&text))?;
             if touched {
-                t = crate::txn::overlaid(&ctx, name, &meta.logical().key, t, crate::sys::mentioned(&text))?;
+                t = crate::txn::overlaid(&ctx, name, &meta.sql_key(), t, crate::sys::mentioned(&text))?;
             }
             if let Some(h) = &meta.history {
                 t = crate::views::history_view(&ctx, t, h, crate::sys::mentioned(&text)).await?; // (each version's __start_at and __end_at, as it is read)
@@ -1650,7 +1634,7 @@ pub fn first_table(sql: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exhausted, frugally, keep, retrying, Facts, FactsMemo, Tail, TAILS};
+    use super::{exhausted, frugally, keep, retrying, tails, Facts, FactsMemo, Tail, Tails, TAILS};
     use crate::store::TableMeta;
     use datafusion::common::DataFusionError;
     use datafusion::prelude::SessionContext;
@@ -1733,19 +1717,19 @@ mod tests {
         memo.put(&one, false, &half);
         assert!(memo.get(&one, false).is_some(), "a version that fits is kept");
         memo.put(&two, false, &three_quarters);
-        assert!(memo.bytes <= FACTS_BYTES, "two big versions don't both fit");
+        assert!(memo.by_key.bytes() <= FACTS_BYTES, "two big versions don't both fit");
         assert!(memo.get(&one, false).is_none(), "the older one made room");
         assert!(memo.get(&two, false).is_some(), "the newer one is kept");
         memo.put(&big, false, &past_the_budget);
         assert!(memo.get(&big, false).is_none(), "past the whole budget: not kept");
         assert!(memo.get(&two, false).is_some(), "and it evicts nothing");
-        assert!(memo.bytes <= FACTS_BYTES);
+        assert!(memo.by_key.bytes() <= FACTS_BYTES);
         let metas: Vec<Arc<TableMeta>> = (0..FACTS_ENTRIES + 44).map(|_| Arc::new(TableMeta::default())).collect();
         for m in &metas {
             memo.put(m, false, &sized(vec![]));
         }
         assert_eq!(memo.by_key.len(), FACTS_ENTRIES, "the count bound holds");
-        assert_eq!(memo.bytes, 0, "and empty manifests count for nothing");
+        assert_eq!(memo.by_key.bytes(), 0, "and empty manifests count for nothing");
     }
 
     #[test]
@@ -1785,17 +1769,17 @@ mod tests {
         Arc::new(Tail { of: (of, form.to_string()), through, rows: vec![], ends: vec![], bytes })
     }
 
-    type Cache = (lru::LruCache<String, Vec<Arc<Tail>>>, usize);
+    type Cache = Tails;
 
-    fn cache() -> Cache { (lru::LruCache::unbounded(), 0) }
+    fn cache() -> Cache { tails() }
 
     /// The tail kept for `table`'s `form`.
-    fn found<'a>(c: &'a Cache, table: &str, form: &str) -> Option<&'a Arc<Tail>> { c.0.peek(table)?.iter().find(|t| t.of.1 == form) }
+    fn found<'a>(c: &'a Cache, table: &str, form: &str) -> Option<&'a Arc<Tail>> { c.peek(table)?.iter().find(|t| t.of.1 == form) }
 
     /// How many tails are kept, over every table and form.
-    fn kept(c: &Cache) -> usize { c.0.iter().map(|(_, forms)| forms.len()).sum() }
+    fn kept(c: &Cache) -> usize { c.iter().map(|(_, forms)| forms.len()).sum() }
 
-    fn kept_bytes(c: &Cache) -> usize { c.0.iter().flat_map(|(_, forms)| forms).map(|t| t.bytes).sum() }
+    fn kept_bytes(c: &Cache) -> usize { c.iter().flat_map(|(_, forms)| forms).map(|t| t.bytes).sum() }
 
     #[test]
     fn two_forms_of_one_table_at_one_mark_are_both_kept() {
@@ -1805,8 +1789,8 @@ mod tests {
         assert_eq!(kept(&c), 2, "one tail per form");
         assert_eq!(found(&c, "t", "keyed sys").map(|t| t.bytes), Some(100), "found by its form");
         assert_eq!(found(&c, "t", "keyed").map(|t| t.bytes), Some(40), "found by its form");
-        assert_eq!(c.1, 140);
-        assert_eq!(c.1, kept_bytes(&c));
+        assert_eq!(c.bytes(), 140);
+        assert_eq!(c.bytes(), kept_bytes(&c));
     }
 
     #[test]
@@ -1819,8 +1803,8 @@ mod tests {
         assert!(found(&c, "t", "b").is_none(), "b at mark 5 is older than a's new mark 6");
         assert!(found(&c, "u", "b").is_some(), "another table keeps its tail");
         assert_eq!(kept(&c), 2);
-        assert_eq!(c.1, 38, "the total is the kept entries' bytes");
-        assert_eq!(c.1, kept_bytes(&c));
+        assert_eq!(c.bytes(), 38, "the total is the kept entries' bytes");
+        assert_eq!(c.bytes(), kept_bytes(&c));
     }
 
     #[test]
@@ -1830,8 +1814,8 @@ mod tests {
         keep(&mut c, "t", tail("b", 5, 9, 40));
         assert!(found(&c, "t", "b").is_none(), "b at mark 5 is older than the table's mark 6");
         assert_eq!(kept(&c), 1);
-        assert_eq!(c.1, 100, "the total is a's bytes");
-        assert_eq!(c.1, kept_bytes(&c));
+        assert_eq!(c.bytes(), 100, "the total is a's bytes");
+        assert_eq!(c.bytes(), kept_bytes(&c));
     }
 
     #[test]
@@ -1842,11 +1826,27 @@ mod tests {
         keep(&mut c, "t", tail("a", 5, 8, 60)); // the same mark, fewer segments
         let a = found(&c, "t", "a").expect("kept");
         assert_eq!((a.of.0, a.through, a.bytes), (5, 9, 100), "the newer entry stays");
-        assert_eq!(c.1, 100);
+        assert_eq!(c.bytes(), 100);
         keep(&mut c, "t", tail("a", 5, 12, 150)); // the same mark, more segments
         assert_eq!(found(&c, "t", "a").map(|t| t.through), Some(12), "a longer tail at the same mark replaces it");
-        assert_eq!(c.1, 150);
+        assert_eq!(c.bytes(), 150);
         assert_eq!(kept(&c), 1);
+    }
+
+    #[test]
+    fn a_tail_past_the_whole_budget_is_not_kept_and_pushes_no_other_tail_out() {
+        let mut c = cache();
+        keep(&mut c, "u", tail("a", 1, 1, 10));
+        keep(&mut c, "t", tail("a", 5, 9, 20));
+        keep(&mut c, "t", tail("b", 5, 9, 30));
+        keep(&mut c, "t", tail("a", 5, 12, TAILS + 1)); // (it replaces t's a, and alone is past the budget)
+        assert!(found(&c, "u", "a").is_some(), "another table's tail stays");
+        assert!(found(&c, "t", "b").is_some(), "the table's other form stays");
+        assert!(found(&c, "t", "a").is_none(), "neither the tail past the budget nor the one it replaced is kept");
+        assert_eq!(c.bytes(), 40);
+        assert_eq!(c.bytes(), kept_bytes(&c));
+        keep(&mut c, "v", tail("a", 1, 1, TAILS + 1)); // (a table with nothing kept keeps nothing)
+        assert!(!c.contains("v") && c.bytes() == 40);
     }
 
     #[test]
@@ -1859,8 +1859,8 @@ mod tests {
         assert_eq!(kept(&c), 2, "t's two forms fit");
         keep(&mut c, "t", tail("c", 5, 9, TAILS / 2)); // (over with one table left: its newest tail alone)
         assert!(found(&c, "t", "c").is_some() && kept(&c) == 1);
-        assert_eq!(c.1, TAILS / 2);
-        assert_eq!(c.1, kept_bytes(&c));
+        assert_eq!(c.bytes(), TAILS / 2);
+        assert_eq!(c.bytes(), kept_bytes(&c));
     }
 
     #[test]

@@ -102,9 +102,9 @@ async fn target_rows(lake: &Lake, task: &Task, rows: &RecordBatch) -> Result<Rec
         return crate::rules::fit::conform(&batch, &schema(&meta.logical_columns())?);
     }
     let batch = crate::query::cast_as(rows, &schema(&meta.sql_columns())?)?;
-    match meta.shown.is_empty() {
-        true => Ok(batch),
-        false => crate::rules::fit::conform(&batch, &schema(&meta.logical_columns())?), // (by name)
+    match meta.moved() {
+        false => Ok(batch),
+        true => crate::rules::fit::conform(&batch, &schema(&meta.logical_columns())?), // (by name)
     }
 }
 

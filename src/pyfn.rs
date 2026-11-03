@@ -299,8 +299,7 @@ impl TableProvider for Called {
 /// lifetime, within `PONDRA_FUNCTION_CACHE_MB` (256), least recently used out first. Only calls
 /// that succeeded are kept. The caller isn't in the key: a function sees only its arguments.
 struct Answers {
-    kept: lru::LruCache<Vec<u8>, (datafusion::common::instant::Instant, Kept)>,
-    bytes: usize,
+    kept: crate::ledger::ByteLru<Vec<u8>, (datafusion::common::instant::Instant, Kept)>, // (each charged its key and its answer)
 }
 
 enum Kept {
@@ -317,13 +316,14 @@ impl Kept {
     }
 }
 
-crate::per_node!(static ANSWERS: Mutex<Answers> = Mutex::new(Answers { kept: lru::LruCache::unbounded(), bytes: 0 }); clear = |m| { let mut a = m.lock().unwrap_or_else(|e| e.into_inner()); a.kept.clear(); a.bytes = 0; });
+crate::per_node!(static ANSWERS: Mutex<Answers> = Mutex::new(Answers { kept: crate::ledger::ByteLru::new(answers_bytes()) }); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).kept.clear());
+
+fn answers_bytes() -> usize { crate::env::or("PONDRA_FUNCTION_CACHE_MB", 256usize) << 20 }
 
 impl Answers {
     fn get(&mut self, key: &[u8]) -> Option<&Kept> {
         if self.kept.peek(key).is_some_and(|(until, _)| *until <= datafusion::common::instant::Instant::now()) {
-            let (_, (_, old)) = self.kept.pop_entry(key).expect("there");
-            self.bytes -= old.size() + key.len();
+            self.kept.pop(key);
             return None;
         }
         self.kept.get(key).map(|(_, k)| k)
@@ -344,15 +344,8 @@ impl Answers {
     }
 
     fn keep(&mut self, key: Vec<u8>, answer: Kept, secs: u64) {
-        static BUDGET: LazyLock<usize> = LazyLock::new(|| crate::env::or("PONDRA_FUNCTION_CACHE_MB", 256usize) << 20);
-        self.bytes += answer.size() + key.len();
-        if let Some((k, (_, old))) = self.kept.push(key, (datafusion::common::instant::Instant::now() + std::time::Duration::from_secs(secs), answer)) {
-            self.bytes -= old.size() + k.len(); // (the key's answer before)
-        }
-        while self.bytes > *BUDGET {
-            let Some((k, (_, old))) = self.kept.pop_lru() else { break };
-            self.bytes -= old.size() + k.len();
-        }
+        let bytes = answer.size() + key.len();
+        let _ = self.kept.put(key, (datafusion::common::instant::Instant::now() + std::time::Duration::from_secs(secs), answer), bytes);
     }
 }
 

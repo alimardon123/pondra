@@ -461,7 +461,10 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
                 .filter(|(k, _)| inside(k, 2)).map(|(k, _)| k[2..].to_string()).collect();
             let routines: Vec<String> = lake.cat.scan::<Value>("r/", "r0").await?.into_iter().filter(|(k, _)| inside(k, 2)).map(|(k, _)| k[2..].to_string()).collect();
             let tables: Vec<String> = lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(k, _)| inside(k, 2) && !crate::sys::hidden(k)).map(|(k, _)| k[2..].to_string()).collect();
-            ensure!(cascade || (views.is_empty() && tables.is_empty() && routines.is_empty()), "schema {name} isn't empty ({}): drop them first, or DROP SCHEMA {name} CASCADE", [&views[..], &tables[..], &routines[..]].concat().join(", "));
+            if !cascade && !(views.is_empty() && tables.is_empty() && routines.is_empty()) {
+                // (dependent_objects_still_exist, as Postgres answers it: Iceberg REST's NamespaceNotEmptyException reads the code)
+                return Err(crate::codes::coded("2BP01", format!("schema {name} isn't empty ({}): drop them first, or DROP SCHEMA {name} CASCADE", [&views[..], &tables[..], &routines[..]].concat().join(", "))));
+            }
             for r in &routines {
                 crate::routines::drop(lake, r, true).await?;
             }
@@ -933,7 +936,7 @@ pub async fn settle(lake: &Lake, d: &Ddl) -> Result<()> {
                 Change::Default(d) => m.stored(column).is_none_or(|s| m.defaults.get(s) == d.as_ref()),
                 Change::NotNull(on) => m.stored(column).is_none_or(|s| m.not_null.iter().any(|c| c == s) == *on),
                 Change::Place(p) => {
-                    let order: Vec<String> = m.sql_order().into_iter().filter(|c| c != "_deleted").collect();
+                    let order: Vec<String> = m.sql_names();
                     m.stored(column).is_none() || p.put(&order, column).is_ok_and(|o| o == order) // (put again, nothing moves)
                 }
             };
@@ -1606,18 +1609,17 @@ async fn place_column(lake: &Lake, name: &str, mut m: TableMeta, column: &str, p
     if let Place::After(b) = place {
         ensure!(b == column || (m.stored(b).is_some() && b != "_deleted"), crate::rules::alter::no_column(name, b));
     }
-    let order: Vec<String> = m.sql_order().into_iter().filter(|c| c != "_deleted").collect(); // (SQL's names, SQL's order)
+    let order: Vec<String> = m.sql_names(); // (SQL's names, SQL's order)
     let new = place.put(&order, column).map_err(|e| crate::codes::coded("42P10", e))?; // (Postgres's invalid column reference)
     if new == order {
         return Ok(j!({"table": name, "unchanged": true}));
     }
-    let star = |m: &TableMeta| -> Vec<(String, String)> { m.sql_columns().into_iter().filter(|(c, _)| !m.marker(c)).collect() }; // (what `SELECT *` lists)
-    let was = star(&m);
+    let was = m.star(); // (what `SELECT *` lists)
     let stored: Vec<String> = new.iter().map(|c| m.stored(c).expect("a live column").to_string()).collect();
     let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| s != "_deleted").collect();
     m.shown = if stored == as_stored { vec![] } else { stored }; // (back as stored: nothing to keep)
     // (what reads it by position keeps reading it as it did, in the same commit: `keep_readers`)
-    let (mut puts, readers) = keep_readers(lake, name, column, was, star(&m)).await?;
+    let (mut puts, readers) = keep_readers(lake, name, column, was, m.star()).await?;
     puts.push((table_key(name), json(&m)));
     lake.cat.commit(puts, &[]).await?;
     published_after_move(lake, &m, &readers).await?;
@@ -1804,7 +1806,7 @@ async fn reorder_materialized(lake: &Lake, name: &str, mut v: crate::views::View
     let now = view_outputs(lake, &written).await.map_err(|e| crate::rules::alter::cant_move(name, column, &format!("moved, its query doesn't plan ({e:#})"), MATERIALIZED))?;
     let want: Vec<_> = order.iter().map(|&i| was[i].clone()).collect();
     ensure!(now == want, crate::rules::alter::cant_move(name, column, "moved, its query plans to other columns", MATERIALIZED));
-    let partial = crate::answer::schema(&m.logical().columns)?; // (a finished view's partial rows)
+    let partial = crate::answer::schema(&m.logical_columns())?; // (a finished view's partial rows)
     match m.finish.as_mut() {
         Some(f) => {
             // (its answers come from its finishing SELECT over the partial rows: moved, and proved over none)
@@ -1981,7 +1983,7 @@ pub(crate) async fn keep_readers(lake: &Lake, name: &str, column: &str, was: Vec
                     // (its columns in the order its query now gives: by their stored names, the rest after, as `reorder_materialized`)
                     let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| !m.marker(s)).collect();
                     m.shown = if as_stored.starts_with(&then) { vec![] } else { then };
-                    let now: Vec<(String, String)> = m.sql_columns().into_iter().filter(|(c, _)| !m.marker(c)).collect();
+                    let now = m.star();
                     over.push((r.clone(), now));
                     queue.push((r.clone(), has));
                     format!("{who} lists its columns in the new order, its rows kept")
@@ -1997,7 +1999,7 @@ pub(crate) async fn keep_readers(lake: &Lake, name: &str, column: &str, was: Vec
             // (a column it hasn't, new in what its `*` reads: SHOW CREATE leaves it out by name, so that it makes this view)
             let extra: Vec<String> = gives.iter().flatten().filter(|c| !names.contains(c)).cloned().collect();
             if !extra.is_empty() {
-                let own: Vec<String> = m.sql_columns().into_iter().map(|(c, _)| c).filter(|c| !m.marker(c)).collect();
+                let own: Vec<String> = m.star().into_iter().map(|(c, _)| c).collect();
                 if let Some(w) = crate::rules::alter::excluding(v.query(), &extra) {
                     if outputs_over(lake, &w, &over).await.ok().as_ref() == Some(&own) {
                         what.push_str(&format!("; SHOW CREATE gives its `*` with EXCLUDE ({})", extra.join(", ")));

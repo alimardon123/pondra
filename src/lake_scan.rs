@@ -43,13 +43,14 @@ async fn adopted_in(lake: &crate::store::Lake, ctx: &datafusion::prelude::Sessio
     let url = url_of(&lake.full(&first.path))?;
     let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
     let (mut ids, mut mapping) = (std::collections::BTreeMap::new(), std::collections::HashMap::new());
-    let own = meta.columns.iter().enumerate().filter(|(_, (c, _))| !crate::text::NAMES.contains(&c.as_str()));
-    for (i, (c, _)) in own.clone() {
-        ids.insert(c.clone(), i as i64 + 1); // (`iceberg::fields`)
-        mapping.insert(c.clone(), i as i64 + 1); // (Pondra's own files carry the stored name…)
+    let list = meta.column_list();
+    let own = list.all().iter().filter(|c| !crate::text::NAMES.contains(&c.stored.as_str()));
+    for c in own.clone() {
+        ids.insert(c.stored.clone(), c.id as i64); // (`iceberg::fields`)
+        mapping.insert(c.stored.clone(), c.id as i64); // (Pondra's own files carry the stored name…)
     }
-    for (i, (c, _)) in own {
-        mapping.insert(meta.name_of(c).to_string(), i as i64 + 1); // (…others' the name SQL knows, which wins)
+    for c in own {
+        mapping.insert(c.name.clone(), c.id as i64); // (…others' the name SQL knows, which wins)
     }
     let file_schema = Arc::new(Schema::new(schema.fields().iter().filter(|f| ids.contains_key(f.name())).cloned().collect::<Vec<_>>())); // (the ids go to `ById`)
     let time = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));

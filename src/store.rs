@@ -192,17 +192,12 @@ pub struct TableMeta {
     pub shares: Vec<String>,
     /// The rules made from this parse, once (`rules`): never in the catalog, and a clone starts without them.
     #[serde(skip)]
-    pub rules: RulesMemo,
+    pub rules: crate::memo::Memo<crate::rules::Table>,
+    /// Its column list (`cols`), made once for an entry read from the catalog: a clone's is empty, as `rules`' is.
+    #[serde(skip)]
+    pub column_memo: crate::memo::Memo<crate::column::Columns>,
 }
 
-/// The rules made from one parse of a table's entry (`TableMeta::rules`), kept once. A clone gets an empty one:
-/// it may be changed, so it makes its own.
-#[derive(Default)]
-pub struct RulesMemo(std::sync::OnceLock<Arc<crate::rules::Table>>);
-
-impl Clone for RulesMemo {
-    fn clone(&self) -> Self { RulesMemo::default() }
-}
 
 impl TableMeta {
     /// The changes whose old rows are out of the table's files: reads skip their `{t}$deleted` rows.
@@ -219,12 +214,43 @@ impl TableMeta {
     pub fn mapped(&self) -> bool { !self.names.is_empty() || !self.dropped.is_empty() }
 
     /// This entry's live columns (under the names it keeps them by: stored, or SQL's in `logical()`'s) in SQL's order
-    /// (`shown`, then the others as stored). Without `shown`, `columns` as they are, dropped ones out.
-    pub fn in_order(&self) -> Vec<&(String, String)> {
-        let first = self.shown.iter().filter_map(|s| self.columns.iter().find(|(c, _)| c == s));
-        let rest = self.columns.iter().filter(|(c, _)| !self.shown.contains(c));
-        first.chain(rest).filter(|(c, _)| !self.dropped.contains(c)).collect()
+    /// (`shown`, then the others as stored). Without `shown`, `columns` as they are, dropped ones out. Kept to this file:
+    /// a reader takes the order from `sql_order`, `sql_columns`, `star`, `sql_names` or the list (`cols`), never works it
+    /// out (redesign 1b).
+    fn in_order(&self) -> Vec<&(String, String)> {
+        crate::column::sql_places(&self.columns, |c| self.is_dropped(c), &self.shown).into_iter().map(|i| &self.columns[i]).collect()
     }
+
+    /// Its columns as one list (`column.rs`): each with its id, SQL's name and its stored one, in SQL's order (as
+    /// `in_order`), the dropped ones marked. Made from the entry's fields each time it is asked: `cols` keeps it once for
+    /// an entry read from the catalog. Of the entry as stored only: `logical()`'s copy has left out the dropped columns
+    /// and taken SQL's names, so its places are no longer ids.
+    pub fn column_list(&self) -> crate::column::Columns {
+        crate::column::Columns::new(&self.columns, |c| self.name_of(c), |c| self.is_dropped(c), &self.shown)
+    }
+
+    /// `column_list`, made once for this version of the entry (it can't change under an `Arc`: a change is made on a
+    /// clone, whose memo is empty).
+    pub fn cols(self: &Arc<Self>) -> Arc<crate::column::Columns> { self.column_memo.get_or_init(|| self.column_list()) }
+
+    /// Was a column moved, so SQL's order isn't the stored one (`ALTER COLUMN … FIRST` or `AFTER`, `ADD COLUMN … FIRST`)?
+    /// The one test of it: a reader reorders, or a write fills SQL's order, only then (`in_sql_order`).
+    pub fn moved(&self) -> bool {
+        !self.shown.is_empty() && crate::column::sql_places(&self.columns, |c| self.is_dropped(c), &self.shown).windows(2).any(|w| w[0] > w[1])
+    }
+
+    /// Rows under SQL's names (`to_logical`'s, a log tail's, the change feed's) with the table's columns in SQL's order,
+    /// any other columns (the rows' system columns) where they are: the one reorder the doors use. As they are when no
+    /// column was moved.
+    pub fn in_sql_order(&self, b: &RecordBatch) -> Result<RecordBatch> {
+        match self.moved() {
+            true => Ok(crate::answer::batch_reordered(b, &self.sql_order())?),
+            false => Ok(b.clone()),
+        }
+    }
+
+    /// Was the column stored as `stored` dropped?
+    pub fn is_dropped(&self, stored: &str) -> bool { self.dropped.iter().any(|d| d == stored) }
 
     /// The live columns' SQL names in SQL's order (`_deleted` among them, if the table has it): what `SELECT *` lists, and
     /// what an INSERT without a column list fills, first to last (`write::implicit`).
@@ -232,6 +258,14 @@ impl TableMeta {
 
     /// SQL's columns (`logical_columns`) in SQL's order (`in_order`): what `SELECT *` and RETURNING * answer.
     pub fn sql_columns(&self) -> Vec<(String, String)> { self.in_order().into_iter().map(|(c, t)| (self.name_of(c).to_string(), t.clone())).collect() }
+
+    /// What `SELECT *` lists: `sql_columns` without a keyed table's delete markers (`marker`). What SHOW CREATE writes and
+    /// what a view's `*` reads (`ddl::keep_readers`).
+    pub fn star(&self) -> Vec<(String, String)> { self.sql_columns().into_iter().filter(|(c, _)| !self.marker(c)).collect() }
+
+    /// `sql_order` without `_deleted` (a keyed table's or not): what an INSERT without a column list fills, first to last
+    /// (`write::implicit`), and what `ALTER COLUMN … FIRST | AFTER` places a column among.
+    pub fn sql_names(&self) -> Vec<String> { self.sql_order().into_iter().filter(|c| c != "_deleted").collect() }
 
     /// A stored column's name in SQL.
     pub fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.names.get(stored).map_or(stored, String::as_str) }
@@ -255,18 +289,14 @@ impl TableMeta {
             return self.clone();
         }
         let n = |c: &String| self.name_of(c).to_string();
-        let partition = self.partition.as_ref().map(|p| match p.split_once('(') {
-            Some((f, c)) => format!("{f}({})", self.name_of(c.trim_end_matches(')'))),
-            None => self.name_of(p).to_string(),
-        });
         TableMeta {
-            columns: self.live().map(|(_, n, t)| (n.to_string(), t.to_string())).collect(),
-            key: self.key.iter().map(n).collect(),
+            columns: self.logical_columns(),
+            key: self.sql_key(),
             merge: self.merge.iter().map(|(c, f)| (n(c), f.clone())).collect(),
             cluster: self.cluster.iter().map(n).collect(),
             ttl: self.ttl.as_ref().map(|(c, s)| (n(c), *s)),
             order: self.order.as_ref().map(n),
-            partition,
+            partition: self.sql_partition(),
             not_null: self.in_sql_list(&self.not_null),
             defaults: self.in_sql(&self.defaults),
             identity: self.in_sql(&self.identity),
@@ -288,6 +318,17 @@ impl TableMeta {
         }
     }
 
+    /// The key under SQL's names, as `logical()` has it, without copying the entry.
+    pub fn sql_key(&self) -> Vec<String> { self.key.iter().map(|c| self.name_of(c).to_string()).collect() }
+
+    /// `partition_by` under SQL's names (`day(ts)`, or a column), as `logical()` has it, without copying the entry.
+    pub fn sql_partition(&self) -> Option<String> {
+        self.partition.as_ref().map(|p| match p.split_once('(') {
+            Some((f, c)) => format!("{f}({})", self.name_of(c.trim_end_matches(')'))),
+            None => self.name_of(p).to_string(),
+        })
+    }
+
     /// SQL's columns, as `logical()` has them, without copying the rest of the entry (its files).
     pub fn logical_columns(&self) -> Vec<(String, String)> {
         if !self.mapped() {
@@ -298,7 +339,7 @@ impl TableMeta {
 
     /// A per-column map, keyed by stored name, under the names SQL knows the columns by: the entries of dropped columns
     /// left out. `logical()` and `to_rules()` both map their fields through this, so a rename or a drop is mapped here.
-    fn in_sql<V: Clone>(&self, m: &BTreeMap<String, V>) -> BTreeMap<String, V> {
+    pub fn in_sql<V: Clone>(&self, m: &BTreeMap<String, V>) -> BTreeMap<String, V> {
         m.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, v)| (self.name_of(c).to_string(), v.clone())).collect()
     }
 
@@ -344,11 +385,7 @@ impl TableMeta {
     /// The rules of this entry, made once per parse and kept beside it: `Catalog::parsed` hands out one `Arc` per
     /// entry's bytes, so a write takes them with no lookup. An owned or changed entry calls `to_rules` instead.
     pub fn rules(self: &Arc<Self>) -> Result<Arc<crate::rules::Table>> {
-        if let Some(t) = self.rules.0.get() {
-            return Ok(t.clone());
-        }
-        let t = Arc::new(self.to_rules()?);
-        Ok(self.rules.0.get_or_init(|| t).clone())
+        self.rules.get_or_try_init(|| self.to_rules())
     }
 
     /// The table as its readers see it, to describe it (listings, `pg_catalog`, MCP): `logical`, its columns in SQL's order
@@ -897,7 +934,7 @@ pub struct Lake {
     pub backlog: std::sync::atomic::AtomicU64, // leader: rows in the log not yet tiered (all tables)
     pub rt: Arc<RuntimeEnv>,         // shared by all queries: object store registry + Parquet metadata cache
     tail: Mutex<Tail>, // decoded log rows
-    pub tails: Mutex<(lru::LruCache<String, Vec<Arc<crate::query::Tail>>>, usize)>, // tables' tails as queries read them (`query::Tail`): by table, one a form (`of.1`); total bytes
+    pub tails: Mutex<crate::query::Tails>, // tables' tails as queries read them (`query::Tail`): by table, one a form (`of.1`)
     kept: (Arc<Footers>, Arc<FileStatistics>), // DataFusion's caches of Parquet footers and of files' statistics (`rt`'s)
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
     pub groups: crate::serve::Groups,          // decoded row groups for key lookups
@@ -926,6 +963,24 @@ impl std::fmt::Debug for Lake {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn memory_limit() -> usize {
     crate::env::query_memory(|| ram().map_or(4 << 30, |r| r / 3))
+}
+
+crate::per_node!(
+    /// The node's line for query memory (`ledger::Ledger`), by its size: every lake the node opens shares it. (By size, so
+    /// a lake opened after the setting changed, or a test's with memory of its own, gets a line of its own.)
+    static LEDGERS: Mutex<HashMap<usize, Weak<crate::ledger::Ledger>>> = Default::default());
+
+/// A new lake's pool for its queries: its share of the node's line (`memory_limit`), which every lake of the node shares.
+fn lake_pool() -> Arc<crate::ledger::LakePool> {
+    let line = memory_limit();
+    let mut lines = LEDGERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    lines.retain(|_, l| l.strong_count() > 0);
+    let ledger = lines.get(&line).and_then(Weak::upgrade).unwrap_or_else(|| {
+        let made = crate::ledger::Ledger::new(line);
+        lines.insert(line, Arc::downgrade(&made));
+        made
+    });
+    ledger.pool()
 }
 
 /// A page's lake holds what the page's own pool does (`env::page_query_memory`, of its device's line): its memory is its
@@ -1374,17 +1429,6 @@ impl ObjectStore for ReadOnly {
     async fn copy_opts(&self, _: &Path, to: &Path, _: object_store::CopyOptions) -> object_store::Result<()> { Err(refused(&self.1, &to.to_string())) }
 }
 
-/// A session with every function a query's session has but what needs a lake: the engine's (`engine::session`, with
-/// Postgres's JSON operators and functions), and the node's own. A node's sessions start from it (`Lake::made`), and so do
-/// the expressions a table keeps (`defaults.rs`: CHECK, DEFAULT and expectations), so a condition planned in a query plans
-/// there too.
-pub(crate) fn functions(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
-    let ctx = crate::engine::session(config, rt);
-    crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
-    crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
-    ctx
-}
-
 /// How often a reader polls the bucket for newer manifests and WAL: a node's, and the CLI's.
 pub const READER_POLL: Duration = Duration::from_millis(250);
 
@@ -1424,7 +1468,7 @@ impl Lake {
         let (url, store, bucket) = open_store(url)?;
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
         let local = bucket.is_none() || memory;
-        let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(memory_limit()));
+        let pool = lake_pool();
         // (spills go to `spill_disk`; no listing kept past its statement: DataFusion's own cache of
         // them would hide a file added to a folder outside the lake, ADR-026)
         // (Parquet footers and files' statistics kept by caches of our own, so `cached_bytes` can say
@@ -1478,7 +1522,7 @@ impl Lake {
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new((lru::LruCache::unbounded(), 0)), kept, disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new(crate::query::tails()), kept, disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
         crate::oom::gives_back(&lake.hot); // (the decoded columns give memory back when the node needs it: the one watch takes them, `oom.rs`)
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
@@ -1736,20 +1780,25 @@ impl Lake {
         ctx
     }
 
-    /// A session made from nothing, with everything every query's session has: the engine's (`engine::session`) and
-    /// the node's own functions. On a page every plan it makes runs its partitions in the page's task, as the page's own
+    /// A session made from nothing, with everything every query's session has: every function set in the registry
+    /// (`engine::session`). On a page every plan it makes runs its partitions in the page's task, as the page's own
     /// session's do (`in_task::planned`): a page has no runtime to start a partition's task on, and a plan of one
     /// partition still merges more than one below it. Plans made by hand from it (`fresh.rs`) are planned by it too.
     fn made(&self, partitions: usize) -> SessionContext {
         let config = SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::text::PUBLIC);
-        let ctx = functions(config, self.rt.clone());
+        let ctx = crate::engine::session(config, self.rt.clone());
         #[cfg(target_arch = "wasm32")]
         let ctx = crate::in_task::planned(ctx);
         ctx
     }
 
-    /// Query memory in use, and the limit.
-    pub fn memory(&self) -> (usize, usize) { (self.rt.memory_pool.reserved(), memory_limit()) }
+    /// Query memory in use on the node's line, every lake's together, and the line (`ledger::Ledger`).
+    pub fn memory(&self) -> (usize, usize) {
+        match self.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>() {
+            Some(pool) => (pool.ledger().reserved(), pool.ledger().line()),
+            None => (self.rt.memory_pool.reserved(), memory_limit()),
+        }
+    }
 
     /// What each of the node's bounded caches holds now, in bytes (`/metrics`' `cache_bytes`): what
     /// fills up to its limit is not memory the node is losing (`tools/soak.py`).
@@ -1757,7 +1806,7 @@ impl Lake {
         [
             ("ranges", self.cached.as_ref().map_or(0, |c| c.held())),
             ("log", self.tail.lock().unwrap().bytes),
-            ("tails", self.tails.lock().unwrap().1),
+            ("tails", self.tails.lock().unwrap().bytes()),
             ("lookups", self.groups.held()),
             ("catalog_blocks", self.cat.cached()),
             ("footers", self.kept.0.memory_used()),
@@ -2004,11 +2053,8 @@ impl Lake {
 /// and their parsed form's (`charge`): an entry of 128 files' statistics is large, and every query fills the
 /// cache, so the least recently used go first.
 struct Parsed<T> {
-    by_key: lru::LruCache<String, (Bytes, Arc<T>)>, // (unbounded: `put` trims it)
-    bytes: usize,                                   // what the entries are charged (`charge`)
-    count: usize,                                   // the most entries kept
-    most: usize,                                    // the most bytes charged
-    charge: fn(usize) -> usize,                     // an entry's bytes, raw and parsed, by its raw length
+    by_key: crate::ledger::ByteLru<String, (Bytes, Arc<T>)>, // (at most `count` entries and `most` bytes charged)
+    charge: fn(usize) -> usize,                              // an entry's bytes, raw and parsed, by its raw length
 }
 
 const PARSED_COUNT: usize = 256;
@@ -2027,7 +2073,7 @@ fn segment_charge(raw: usize) -> usize { 640 + 4 * raw }
 
 impl<T> Parsed<T> {
     fn new(count: usize, most: usize, charge: fn(usize) -> usize) -> Self {
-        Parsed { by_key: lru::LruCache::unbounded(), bytes: 0, count, most, charge }
+        Parsed { by_key: crate::ledger::ByteLru::new(most).with_count(count), charge }
     }
 
     /// The entry parsed from these bytes, if it was parsed from bytes that are these.
@@ -2038,18 +2084,7 @@ impl<T> Parsed<T> {
 
     /// Keeps `m`, parsed from `raw`, unless it alone is charged more than the byte bound.
     fn put(&mut self, key: &str, raw: &Bytes, m: &Arc<T>) {
-        if let Some((old, _)) = self.by_key.pop(key) {
-            self.bytes -= (self.charge)(old.len());
-        }
-        if (self.charge)(raw.len()) > self.most {
-            return;
-        }
-        self.by_key.put(key.to_string(), (raw.clone(), m.clone()));
-        self.bytes += (self.charge)(raw.len());
-        while self.by_key.len() > self.count || self.bytes > self.most {
-            let Some((_, (old, _))) = self.by_key.pop_lru() else { break };
-            self.bytes -= (self.charge)(old.len());
-        }
+        let _ = self.by_key.put(key.to_string(), (raw.clone(), m.clone()), (self.charge)(raw.len()));
     }
 }
 
@@ -3409,11 +3444,11 @@ mod tests {
             cat.parsed(&format!("t/big{n}"), &big(n)?)?;
         }
         let kept = |cat: &Catalog, key: &str| cat.metas.lock().unwrap().by_key.contains(key);
-        assert!(cat.metas.lock().unwrap().bytes <= PARSED_BYTES, "the raw bytes kept are within the bound");
+        assert!(cat.metas.lock().unwrap().by_key.bytes() <= PARSED_BYTES, "the raw bytes kept are within the bound");
         assert!(kept(&cat, "t/big39") && !kept(&cat, "t/big0"), "the least recently used went first");
-        let before = cat.metas.lock().unwrap().bytes;
+        let before = cat.metas.lock().unwrap().by_key.bytes();
         cat.parsed("t/huge", &Bytes::from(serde_json::to_vec(&TableMeta { folder: Some("h".repeat(PARSED_BYTES + 1)), ..Default::default() })?))?;
-        assert!(!kept(&cat, "t/huge") && cat.metas.lock().unwrap().bytes == before, "an entry over the bound is not kept");
+        assert!(!kept(&cat, "t/huge") && cat.metas.lock().unwrap().by_key.bytes() == before, "an entry over the bound is not kept");
         for n in 0..300 {
             cat.parsed(&format!("t/small{n}"), &entry(&n.to_string())?)?;
         }
@@ -3454,8 +3489,8 @@ mod tests {
         assert!(cat.segments_of([(seg_key(7), Bytes::from_static(b"not a segment"))].into_iter().collect()).is_err(), "bytes that aren't a segment are an error");
         {
             let held = cat.segs.lock().unwrap();
-            assert_eq!(held.bytes, held.by_key.iter().map(|(_, (raw, _))| segment_charge(raw.len())).sum::<usize>(), "each entry charged raw and parsed");
-            assert!(held.by_key.len() <= SEGMENTS_COUNT && held.bytes <= SEGMENTS_BYTES, "the bounds hold");
+            assert_eq!(held.by_key.bytes(), held.by_key.iter().map(|(_, (raw, _))| segment_charge(raw.len())).sum::<usize>(), "each entry charged raw and parsed");
+            assert!(held.by_key.len() <= SEGMENTS_COUNT && held.by_key.bytes() <= SEGMENTS_BYTES, "the bounds hold");
         }
         // A sweep of more entries than the cache keeps parses the ones it hasn't without keeping them: the tail's stay.
         let sweep: BTreeMap<String, Bytes> = (1..=SEGMENTS_COUNT as u64 + 1).map(|n| Ok((seg_key(n), seg(n, 2)?))).collect::<Result<_>>()?;
@@ -3491,6 +3526,30 @@ mod tests {
         assert_eq!(cat.recent_inline(&data_key(163)).as_deref(), Some(&b"other"[..]));
         cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Two lakes a node opens share its one line for query memory (`ledger::Ledger`): each lake's pool is its share of
+    /// it, and each lake's `memory` reads the line and what every lake holds on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_lakes_of_a_node_share_its_one_line_for_queries() -> Result<()> {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        let dirs = [0, 1].map(|_| std::env::temp_dir().join(format!("pondra-ledger-{}", uuid::Uuid::new_v4())));
+        let a = Lake::open(dirs[0].to_str().unwrap(), true, false).await?;
+        let b = Lake::open(dirs[1].to_str().unwrap(), true, false).await?;
+        let ledger = |l: &Lake| l.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
+        assert!(Arc::ptr_eq(&ledger(&a), &ledger(&b)), "one line for both");
+        let held = MemoryConsumer::new("a test's").register(&a.rt.memory_pool);
+        held.try_grow(1 << 20)?;
+        // (other tests' lakes may hold some of the same line meanwhile: what a holds is the least it reads)
+        assert_eq!(b.memory().1, memory_limit());
+        assert!(b.memory().0 >= 1 << 20, "a's reservation counts on the line b reads");
+        assert_eq!(b.rt.memory_pool.reserved(), 0, "and not in b's own pool");
+        drop(held);
+        for (lake, dir) in [a, b].into_iter().zip(&dirs) {
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(dir);
+        }
         Ok(())
     }
 
@@ -3773,10 +3832,84 @@ mod tests {
         let b = Arc::new((*a).clone());
         assert!(!Arc::ptr_eq(&b.rules()?, &x), "a new parse makes its own");
         let c = (*a).clone();
-        assert!(c.rules.0.get().is_none(), "a clone's memo is empty");
+        assert!(c.rules.get().is_none(), "a clone's memo is empty");
         let made = Arc::new(c).rules()?;
         assert_eq!(*made, *x, "and the clone's rules are the same");
         Ok(())
+    }
+
+    /// The one column list (redesign step 1b) agrees with the order the entry's own fields gave before it, for any mix
+    /// of renames, drops and moves: SQL's order, ids as stored places + 1, a renamed column's stored name kept, and
+    /// dropped columns marked, last. `star` and `sql_names` are the list's, a keyed table's markers out, and the same of
+    /// `logical()`'s copy; `sql_key`, `sql_partition` and `logical_columns` are its fields. `cols()` makes it once per parse, and a clone's memo is empty.
+    #[test]
+    fn the_column_list_is_the_entrys_columns_in_sqls_order() {
+        // (the order as `in_order` made it before the list: `shown`'s columns, then the rest as stored, the dropped out)
+        fn was(m: &TableMeta) -> Vec<String> {
+            let first = m.shown.iter().filter_map(|s| m.columns.iter().find(|(c, _)| c == s));
+            let rest = m.columns.iter().filter(|(c, _)| !m.shown.contains(c));
+            first.chain(rest).filter(|(c, _)| !m.dropped.contains(c)).map(|(c, _)| m.name_of(c).to_string()).collect()
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for _ in 0..2000 {
+            let n = 1 + next(8) as usize;
+            let mut m = TableMeta { columns: (0..n).map(|i| (format!("c{i}"), if i % 2 == 0 { "Int64" } else { "Utf8" }.to_string())).collect(), ..Default::default() };
+            for i in 0..n {
+                match next(6) {
+                    0 => m.dropped.push(format!("c{i}")),
+                    1 => _ = m.names.insert(format!("c{i}"), format!("r{i}")),
+                    _ => {}
+                }
+            }
+            // (delete markers: a keyed table's, or a column of that name in a table without a key)
+            let keyed = next(3) == 0;
+            if keyed || next(4) == 0 {
+                m.columns.push(("_deleted".into(), "Boolean".into()));
+            }
+            if keyed {
+                m.key = vec!["c0".into()];
+            }
+            m.partition = match next(3) {
+                0 => Some(format!("day(c{})", next(n as u64))),
+                1 => Some(format!("c{}", next(n as u64))),
+                _ => None,
+            };
+            let n = m.columns.len();
+            // (`shown`: some of the columns, each once, in any order, dropped ones among them)
+            let mut shown: Vec<String> = (0..n).filter(|_| next(2) == 0).map(|i| format!("c{i}")).collect();
+            for i in (1..shown.len()).rev() {
+                shown.swap(i, next(i as u64 + 1) as usize);
+            }
+            m.shown = shown;
+            let list = m.column_list();
+            let sql: Vec<String> = list.sql().map(|c| c.name.clone()).collect();
+            assert_eq!(sql, was(&m), "{:?} {:?} {:?}", m.shown, m.dropped, m.names);
+            assert_eq!(m.sql_order(), sql);
+            let stored: Vec<String> = list.stored_order().map(|c| c.name.clone()).collect();
+            assert_eq!(m.moved(), sql != stored, "moved: SQL's order isn't the stored one");
+            let star: Vec<(String, String)> = list.sql().filter(|c| !m.marker(&c.stored)).map(|c| (c.name.clone(), c.dtype.clone())).collect();
+            assert_eq!(m.star(), star, "what `SELECT *` lists");
+            assert_eq!(m.sql_names(), sql.iter().filter(|c| *c != "_deleted").cloned().collect::<Vec<_>>());
+            let l = m.logical();
+            assert_eq!((l.star(), l.sql_names(), l.sql_order()), (m.star(), m.sql_names(), m.sql_order()), "the same of the logical copy");
+            assert_eq!((m.sql_key(), m.sql_partition(), m.logical_columns()), (l.key.clone(), l.partition.clone(), l.columns.clone()), "a field without the copy");
+            for c in list.all() {
+                assert_eq!(m.columns[c.id as usize - 1].0, c.stored, "an id is a stored place + 1");
+                assert_eq!((c.name.as_str(), c.dropped), (m.name_of(&c.stored), m.dropped.contains(&c.stored)));
+            }
+            assert_eq!(list.all().len(), n, "every column, the dropped too");
+            assert!(list.stored_order().collect::<Vec<_>>().windows(2).all(|w| w[0].id < w[1].id));
+        }
+        let a = Arc::new(TableMeta { columns: vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into())], shown: vec!["b".into()], ..Default::default() });
+        assert!(Arc::ptr_eq(&a.cols(), &a.cols()), "made once per parse");
+        assert_eq!(*a.cols(), a.column_list());
+        assert!((*a).clone().column_memo.get().is_none(), "a clone's memo is empty");
     }
 
     /// `past_ttl` keeps out what `ttl_sql` does: a timestamp older than the TTL's seconds, a NULL, a row without the column.

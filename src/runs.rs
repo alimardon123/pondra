@@ -143,9 +143,7 @@ fn args_text(args: &RecordBatch) -> String {
     if args.num_columns() == 0 {
         return "{}".into();
     }
-    let mut w = datafusion::arrow::json::ArrayWriter::new(Vec::new());
-    let text = w.write_batches(&[args]).and_then(|_| w.finish()).ok().map(|_| String::from_utf8_lossy(&w.into_inner()).to_string());
-    text.map(|t| t.trim_start_matches('[').trim_end_matches(']').to_string()).unwrap_or_default()
+    crate::answer::json_each(args).map(|rows| String::from_utf8_lossy(&rows.join(&b',')).into_owned()).unwrap_or_default()
 }
 
 type Sent = (Line, Option<tokio::sync::oneshot::Sender<()>>);
