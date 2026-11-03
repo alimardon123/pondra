@@ -92,6 +92,7 @@ jobs:
       site: ${{ steps.plan.outputs.site }}
       web: ${{ steps.plan.outputs.web }}
       forms: ${{ steps.plan.outputs.forms }}
+      dbt: ${{ steps.plan.outputs.dbt }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -210,6 +211,8 @@ jobs:
           # module is built for it too, beside linux-x64's build)
           forms=false
           if has "$bin|$pkg|^web/|^tests/forms/|^docs/forms\.json\$|^tools/(forms_check\.py|page_serve\.mjs|slt_check\.py|harness\.py)\$|$self"; then forms=true; web=true; fi
+          dbt=false # (dbt's adapter suite on the dbt adapter, python/dbt-pondra: whenever the program or the adapter changes)
+          if has "$bin|^python/dbt-pondra/|$self"; then dbt=true; fi
           if [ "$FULL" = true ] && has '^(deploy/|install\.(sh|ps1)$|src/service\.rs$|tools/(image|deploy_check|distribute|sign|package)\.py$|tools/ci_(artifact|build)\.sh$|\.github/workflows/(deploy|deploy-check|build)\.yml$)'; then deploy=true; fi
           if [ "$FULL" = true ] && { [ "$code" = true ] || [ "$deploy" = true ]; }; then full=true; fi
           upgrade=false; resilience=false; sharing=false; sso=false
@@ -223,12 +226,12 @@ jobs:
             if has '^(src/(sso|sso_flow|users|auth|pg|flight|kafka|tls|server|dbserver|project)\.rs$|src/console/(core|settings|sso)\.js$|python/pondra/client\.py$|js/index\.js$|tools/fake_idp\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sso|build)\.yml$)'; then sso=true; fi
           fi
           binary=false
-          if [ "$event" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ] || [ "$forms" = true ]; then binary=true; fi
+          if [ "$event" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ] || [ "$forms" = true ] || [ "$dbt" = true ]; then binary=true; fi
           suite=$(jq -nc --argjson h "$harness" --argjson d "$docs" '{include: ((if $h then [range(1; 6) | {part: "harness, \(.) of 5", shard: "\(.)/5"}] else [] end) + (if $d then [{part: "frames, console, docs, failover"}] else [] end))}')
-          printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\nweb=%s\nforms=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
-            "$binary" "$unit" "$docs" "$suite" "$site" "$web" "$forms" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
+          printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\nweb=%s\nforms=%s\ndbt=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
+            "$binary" "$unit" "$docs" "$suite" "$site" "$web" "$forms" "$dbt" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
           runs=
-          for k in binary full unit harness docs site web forms upgrade resilience sharing sso deploy; do
+          for k in binary full unit harness docs site web forms dbt upgrade resilience sharing sso deploy; do
             if [ "${!k}" = true ]; then runs="$runs $k"; fi
           done
           echo "Runs:${runs:- nothing (no check reads what this changes)}$([ "$files" != ALL ] || echo ' (everything: started by hand, or no passed run of main found)')." >> "$GITHUB_STEP_SUMMARY"
@@ -611,6 +614,30 @@ jobs:
           path: forms.json
           if-no-files-found: ignore
 
+  # The dbt adapter (python/dbt-pondra) under dbt's own adapter suite, on Python 3.10, the oldest its pyproject.toml
+  # claims, against linux-x64's binary: the claim tried, not assumed (about two minutes).
+  dbt:
+    needs: [plan, linux]
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.plan.outputs.dbt == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.plan.outputs.packages }}-linux-x64
+          path: dist
+      - name: linux-x64's binary
+        run: mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
+      - run: pip install ./python/dbt-pondra dbt-tests-adapter pytest && pip list | grep -i '^dbt'
+      - name: dbt's adapter suite on a node
+        env:
+          PONDRA_BIN: ${{ github.workspace }}/bin/pondra
+        run: cd python/dbt-pondra && python -m pytest -q tests
+
   # The tests of what the build made, each a workflow of its own (which also runs by hand), called
   # once linux-x64's build is done (deploy's once every platform's is). A test that waited for the
   # packages inside its own job held a runner all that time, and enough of them held every runner
@@ -655,7 +682,7 @@ jobs:
   # its lane looks, so a platform that only main builds (the pull request merged on Linux alone) is
   # fixed at once, by whoever merged it. Also in the run's summary, and as an error.
   red:
-    needs: [plan, site, web, forms, linux, build, unit, host, suite, resilience, upgrade, sharing, sso, deploy]
+    needs: [plan, site, web, forms, dbt, linux, build, unit, host, suite, resilience, upgrade, sharing, sso, deploy]
     if: ${{ always() && needs.plan.outputs.event == 'push' && contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-24.04
     permissions:
