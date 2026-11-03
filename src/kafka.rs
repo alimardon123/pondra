@@ -672,7 +672,14 @@ fn wrapped(v: &serde_json::Map<String, Value>) -> bool {
 /// A record as the JSON row to write, None to skip it. Debezium's `after` is the new row, a
 /// delete marks `before` deleted; a null value (a tombstone) deletes the key from a keyed table.
 fn row(t: &crate::rules::Table, key: Option<&[u8]>, value: Option<&[u8]>) -> Result<Option<Value>> {
-    let unwrap = |mut v: Value| if v.as_object().is_some_and(wrapped) { v["payload"].take() } else { v };
+    let unwrap = |mut v: Value| -> Result<Value> {
+        if !v.as_object().is_some_and(wrapped) {
+            return Ok(v);
+        }
+        let mut payload = v["payload"].take();
+        typed(&v["schema"], &mut payload, &t.schema)?;
+        Ok(payload)
+    };
     let deleted = |mut v: Value| {
         if let Some(o) = v.as_object_mut() {
             o.insert("_deleted".into(), true.into());
@@ -682,7 +689,7 @@ fn row(t: &crate::rules::Table, key: Option<&[u8]>, value: Option<&[u8]>) -> Res
     let mut v = unwrap(match value.filter(|v| !v.is_empty()) {
         Some(v) => serde_json::from_slice(v)?,
         None => Value::Null,
-    });
+    })?;
     let keyed = !t.key.is_empty() && t.column("_deleted").is_some();
     if let Some(op) = v.get("op").and_then(Value::as_str).map(String::from).filter(|_| v.get("after").is_some() || v.get("before").is_some()) {
         v = match op.as_str() {
@@ -703,12 +710,101 @@ fn row(t: &crate::rules::Table, key: Option<&[u8]>, value: Option<&[u8]>) -> Res
         return Ok(Some(v));
     }
     let Some(key) = key.filter(|_| keyed) else { return Ok(None) }; // (nothing to delete)
-    let k = unwrap(serde_json::from_slice(key).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(key).into())));
+    let k = unwrap(serde_json::from_slice(key).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(key).into())))?;
     Ok(Some(deleted(match k {
         Value::Object(_) => k,
         k if t.key.len() == 1 => Value::Object([(t.key[0].clone(), k)].into_iter().collect()),
         _ => bail!("a tombstone's key must name every key column"),
     })))
+}
+
+/// Kafka Connect's JSON carries its schema beside the row, and the schema names how a value is written
+/// when JSON has no type for it. Debezium's defaults use these: a NUMERIC is `Decimal` (the unscaled
+/// number's bytes in base64, its scale beside it), a `TIMESTAMP(3)` or `TIME(3)` is milliseconds, a `TIME`
+/// microseconds, a BYTEA base64. Each such value becomes what the column takes: a decimal's digits, a
+/// time in the column's own unit, a binary in hex (as the JSON reader reads it). The rest is kept as sent
+/// (a `ZonedTimestamp` is already text, a `Date` days). The rows are the struct's own fields, or, in
+/// Debezium's envelope, `before`'s and `after`'s.
+fn typed(schema: &Value, v: &mut Value, target: &Schema) -> Result<()> {
+    let (Some(fields), Some(row)) = (schema.get("fields").and_then(Value::as_array), v.as_object_mut()) else { return Ok(()) };
+    for f in fields {
+        let Some(name) = f.get("field").and_then(Value::as_str) else { continue };
+        let Some(x) = row.get_mut(name).filter(|x| !x.is_null()) else { continue };
+        let logical = f.get("name").and_then(Value::as_str).unwrap_or_default();
+        if f.get("type").and_then(Value::as_str) == Some("struct") && logical != "io.debezium.data.VariableScaleDecimal" {
+            if matches!(name, "before" | "after") {
+                typed(f, x, target)?;
+            }
+            continue;
+        }
+        if let Ok(c) = target.field_with_name(name) {
+            *x = connect_value(f, logical, x, c.data_type()).map_err(|e| anyhow!("column {name}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// One value as its column takes it, by Kafka Connect's logical type (see `typed`).
+fn connect_value(f: &Value, logical: &str, x: &Value, ty: &DataType) -> Result<Value> {
+    let int = || x.as_i64().ok_or_else(|| anyhow!("a {logical} is a whole number, not {x}"));
+    let nanos = match logical {
+        "org.apache.kafka.connect.data.Decimal" => {
+            let scale = f["parameters"]["scale"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow!("a Decimal names its scale"))?;
+            return Ok(Value::String(decimal(x, scale)?));
+        }
+        "io.debezium.data.VariableScaleDecimal" => {
+            let scale = x["scale"].as_i64().ok_or_else(|| anyhow!("a VariableScaleDecimal names its scale"))?;
+            return Ok(Value::String(decimal(&x["value"], scale)?));
+        }
+        "io.debezium.time.Timestamp" | "org.apache.kafka.connect.data.Timestamp" | "io.debezium.time.Time" | "org.apache.kafka.connect.data.Time" => int()? as i128 * 1_000_000,
+        "io.debezium.time.MicroTimestamp" | "io.debezium.time.MicroTime" => int()? as i128 * 1_000,
+        "io.debezium.time.NanoTimestamp" | "io.debezium.time.NanoTime" => int()? as i128,
+        "io.debezium.time.Date" | "org.apache.kafka.connect.data.Date" => int()? as i128 * 86_400_000_000_000,
+        "" if f.get("type").and_then(Value::as_str) == Some("bytes") && matches!(ty, DataType::Binary | DataType::LargeBinary | DataType::BinaryView | DataType::FixedSizeBinary(_)) => {
+            return Ok(Value::String(bytes_of(x)?.iter().map(|b| format!("{b:02x}")).collect()));
+        }
+        _ => return Ok(x.clone()),
+    };
+    use datafusion::arrow::datatypes::TimeUnit;
+    let per = |u: &TimeUnit| match u {
+        TimeUnit::Second => 1_000_000_000,
+        TimeUnit::Millisecond => 1_000_000,
+        TimeUnit::Microsecond => 1_000,
+        TimeUnit::Nanosecond => 1,
+    };
+    let n = match ty {
+        DataType::Timestamp(u, _) | DataType::Time32(u) | DataType::Time64(u) | DataType::Duration(u) => nanos.div_euclid(per(u)),
+        DataType::Date32 => nanos.div_euclid(86_400_000_000_000),
+        DataType::Date64 => nanos.div_euclid(1_000_000),
+        _ => return Ok(x.clone()), // (a time into a column that isn't one: as sent)
+    };
+    Ok(Value::from(i64::try_from(n).map_err(|_| anyhow!("{x} is out of range"))?))
+}
+
+/// Kafka Connect's bytes: base64 text.
+fn bytes_of(x: &Value) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let s = x.as_str().ok_or_else(|| anyhow!("bytes are base64 text, not {x}"))?;
+    base64::engine::general_purpose::STANDARD.decode(s).map_err(|e| anyhow!("{s:?} isn't base64: {e}"))
+}
+
+/// Kafka Connect's Decimal: the unscaled number, big-endian two's complement, then its scale.
+fn decimal(x: &Value, scale: i64) -> Result<String> {
+    let b = bytes_of(x)?;
+    ensure!(!b.is_empty() && b.len() <= 16, "a decimal of {} bytes is past 38 digits", b.len());
+    let mut wide = [if b[0] & 0x80 != 0 { 0xff } else { 0 }; 16];
+    wide[16 - b.len()..].copy_from_slice(&b);
+    let n = i128::from_be_bytes(wide);
+    let digits = n.unsigned_abs().to_string();
+    let sign = if n < 0 { "-" } else { "" };
+    Ok(match usize::try_from(scale) {
+        Ok(0) => format!("{sign}{digits}"),
+        Ok(s) => {
+            let d = format!("{digits:0>width$}", width = s + 1);
+            format!("{sign}{}.{}", &d[..d.len() - s], &d[d.len() - s..])
+        }
+        Err(_) => format!("{sign}{digits}{}", "0".repeat(scale.unsigned_abs() as usize)), // (a negative scale: tens)
+    })
 }
 
 // ---------------------------------------------------------------- consuming
@@ -1457,5 +1553,60 @@ mod tests {
             assert!(decompress(codec, &data, 1 << 20).is_err(), "codec {codec} refused past its bound");
             assert_eq!(decompress(codec, &data, 4 << 20).unwrap(), zeros, "codec {codec} within it");
         }
+    }
+
+    #[test]
+    fn debeziums_own_encodings_become_what_the_column_takes() {
+        use datafusion::arrow::datatypes::{Field, TimeUnit};
+        // (as Debezium 2.7 sends a Postgres row with its defaults: NUMERIC(10,2) as Decimal, NUMERIC as
+        // VariableScaleDecimal, TIMESTAMP(3) and TIME(3) in milliseconds, TIME and TIMESTAMP in microseconds, BYTEA base64)
+        let target = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("balance", DataType::Decimal128(10, 2), true),
+            Field::new("num", DataType::Decimal128(20, 4), true),
+            Field::new("ts3", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("seen", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("t", DataType::Time64(TimeUnit::Nanosecond), true),
+            Field::new("t3", DataType::Time64(TimeUnit::Nanosecond), true),
+            Field::new("born", DataType::Date32, true),
+            Field::new("b", DataType::Binary, true),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let row_schema = serde_json::json!({"type": "struct", "fields": [
+            {"type": "int64", "field": "id"},
+            {"type": "bytes", "name": "org.apache.kafka.connect.data.Decimal", "parameters": {"scale": "2", "connect.decimal.precision": "10"}, "field": "balance"},
+            {"type": "struct", "name": "io.debezium.data.VariableScaleDecimal", "fields": [{"type": "int32", "field": "scale"}, {"type": "bytes", "field": "value"}], "field": "num"},
+            {"type": "int64", "name": "io.debezium.time.Timestamp", "field": "ts3"},
+            {"type": "int64", "name": "io.debezium.time.MicroTimestamp", "field": "seen"},
+            {"type": "int64", "name": "io.debezium.time.MicroTime", "field": "t"},
+            {"type": "int32", "name": "io.debezium.time.Time", "field": "t3"},
+            {"type": "int32", "name": "io.debezium.time.Date", "field": "born"},
+            {"type": "bytes", "field": "b"},
+            {"type": "string", "field": "name"}]});
+        let row = serde_json::json!({"id": 1, "balance": "BBo=", "num": {"scale": 4, "value": "EtaH"}, "ts3": 1788256800123i64, "seen": 1788256800123456i64,
+            "t": 45296789012i64, "t3": 45296789, "born": 7306, "b": "AP8Q", "name": "BBo="});
+        let mut event = serde_json::json!({"before": null, "after": row, "op": "c"});
+        let mut before = row_schema.clone();
+        before["field"] = "before".into();
+        let mut after = row_schema.clone();
+        after["field"] = "after".into();
+        let envelope = serde_json::json!({"type": "struct", "fields": [before, after, {"type": "string", "field": "op"}]});
+        typed(&envelope, &mut event, &target).unwrap();
+        assert_eq!(event["after"], serde_json::json!({"id": 1, "balance": "10.50", "num": "123.4567", "ts3": 1788256800123000i64, "seen": 1788256800123456i64,
+            "t": 45296789012000i64, "t3": 45296789000000i64, "born": 7306, "b": "00ff10", "name": "BBo="}));
+        // A negative decimal (two's complement), one of more bytes than it needs, a zero, a negative scale.
+        assert_eq!(decimal(&"/rs=".into(), 2).unwrap(), "-3.25");
+        assert_eq!(decimal(&"//8=".into(), 2).unwrap(), "-0.01");
+        assert_eq!(decimal(&"AAAAAQ==".into(), 0).unwrap(), "1");
+        assert_eq!(decimal(&"AA==".into(), 3).unwrap(), "0.000");
+        assert_eq!(decimal(&"Bw==".into(), -2).unwrap(), "700");
+        assert!(decimal(&"not base64!".into(), 2).is_err());
+        // A row without the envelope (Debezium's ExtractNewRecordState), and a time into a column that isn't one.
+        let mut flat = serde_json::json!({"id": 2, "ts3": 0, "name": 5});
+        typed(&row_schema, &mut flat, &target).unwrap();
+        assert_eq!(flat, serde_json::json!({"id": 2, "ts3": 0, "name": 5}));
+        let mut odd = serde_json::json!({"name": 1000});
+        typed(&serde_json::json!({"fields": [{"type": "int64", "name": "io.debezium.time.Timestamp", "field": "name"}]}), &mut odd, &target).unwrap();
+        assert_eq!(odd, serde_json::json!({"name": 1000}));
     }
 }

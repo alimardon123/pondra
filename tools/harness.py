@@ -2834,6 +2834,24 @@ def kafka():
     p.produce("rounds", value=json.dumps({"v": 2.5}))
     assert p.flush(30) == 0
     checks["a JSON value's 2.5 into an INT column is 3, as SQL writes it"] = sql_("SELECT v FROM rounds") == [{"v": 3}]
+    # Debezium's own encodings, as 2.7 sends a Postgres row with its defaults (Kafka Connect's schema beside it):
+    # NUMERIC(10,2) as Decimal bytes, NUMERIC as VariableScaleDecimal, TIMESTAMP(3) and TIME(3) in ms, TIME in µs,
+    # BYTEA in base64. Before, the decimal was refused and the times landed in 1970 and near midnight.
+    sql_("CREATE TABLE kinds (id BIGINT PRIMARY KEY, balance DECIMAL(10,2), num DECIMAL(20,4), ts3 TIMESTAMP, t TIME, t3 TIME, b BYTEA)")
+    field = lambda name, ty, logical=None, **kw: {"type": ty, "field": name, "optional": True, **({"name": logical} if logical else {}), **kw}
+    fields = [field("id", "int64"), field("balance", "bytes", "org.apache.kafka.connect.data.Decimal", parameters={"scale": "2"}),
+              field("num", "struct", "io.debezium.data.VariableScaleDecimal", fields=[field("scale", "int32"), field("value", "bytes")]),
+              field("ts3", "int64", "io.debezium.time.Timestamp"), field("t", "int64", "io.debezium.time.MicroTime"),
+              field("t3", "int32", "io.debezium.time.Time"), field("b", "bytes")]
+    envelope = {"type": "struct", "name": "pg.public.kinds.Envelope", "fields": [{"type": "struct", "field": "before", "optional": True, "fields": fields},
+                                                                                {"type": "struct", "field": "after", "optional": True, "fields": fields}, field("op", "string")]}
+    after = {"id": 1, "balance": "/rs=", "num": {"scale": 4, "value": "EtaH"}, "ts3": 1788256800123, "t": 45296789012, "t3": 45296789, "b": "AP8Q"}
+    p.produce("kinds", key=json.dumps({"schema": {"type": "struct", "fields": [field("id", "int64")]}, "payload": {"id": 1}}),
+              value=json.dumps({"schema": envelope, "payload": {"before": None, "after": after, "op": "r"}}))
+    assert p.flush(30) == 0
+    checks["Debezium's own encodings: a Decimal's bytes, ms and µs times, BYTEA's base64, as the source has them"] = \
+        sql_("SELECT id, balance::VARCHAR AS balance, num::VARCHAR AS num, ts3::VARCHAR AS ts3, t::VARCHAR AS t, t3::VARCHAR AS t3, encode(b, 'hex') AS b FROM kinds") == \
+        [{"id": 1, "balance": "-3.25", "num": "123.4567", "ts3": "2026-09-01T10:00:00.123", "t": "12:34:56.789012", "t3": "12:34:56.789", "b": "00ff10"}]
     # consumers: kafka-python and librdkafka read the log back from the beginning
     tp = kp.TopicPartition("users", 0)
     c = kp.KafkaConsumer(bootstrap_servers=f"127.0.0.1:{kport}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN",
