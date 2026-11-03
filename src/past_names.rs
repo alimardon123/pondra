@@ -166,7 +166,7 @@ pub fn table_factor(lake: &str, t: &mut ast::TableFactor) -> Result<bool> {
         Some(ast::Expr::CompoundIdentifier(parts)) => parts.iter().map(crate::text::ident).collect::<Vec<_>>().join("."),
         _ => bail!("{shape}: after a table's name"),
     };
-    let table = crate::text::local_in(lake, &table).ok_or_else(|| anyhow!("{table} AT (…): only this lake's tables are read as they were (ask a node of that lake)"))?;
+    let table = crate::text::local_in(lake, &table).unwrap_or(table); // (an attached lake's `l.s.t`: as that lake has it, `past::table`)
     ensure!(a.given.len() == 1 && a.named.len() == 1 && ["version", "timestamp", "offset"].contains(&a.named[0].0.as_str()), "{shape}");
     let (at, expr) = (a.named[0].0.clone(), a.named[0].1.to_string());
     let spec = B64.encode(serde_json::to_vec(&Spec { table, at, expr })?);

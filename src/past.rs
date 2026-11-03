@@ -8,7 +8,7 @@
 //! takes it), then a table of its own, `"at:<base64url JSON>"` (`past_names::table_factor`), which every
 //! session reading it registers (`table`), as files anywhere are (`ext.rs`).
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use crate::past_names::Spec;
 use crate::store::{table_key, Lake, TableMeta};
 use anyhow::Context;
@@ -30,16 +30,34 @@ enum At {
 /// versions of rows changed since that were there at `n` (`{t}$deleted`: `_old_version <= n <
 /// _version`). As of a time, the rows made by then, and, of a row changed since, the version its
 /// first change after then replaced, if the row was made by then.
-pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u64>, sys: bool) -> Result<(String, Arc<dyn TableProvider>)> {
+/// `attached`: the table is an attached lake's (`b.t AT (…)`, read as `SELECT … FROM b.t` reads it: that lake's sign-in and
+/// newest commit, and only the grants that name it).
+pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u64>, sys: bool) -> Result<(String, Arc<dyn TableProvider>, bool)> {
     use crate::text::{CREATED, ROW_ID, UPDATED, VERSION};
     let spec = Spec::of(name)?;
     let t = &spec.table;
-    let meta = lake.cat.meta(&table_key(t)).await?.ok_or_else(|| anyhow!("no table {t}"))?;
+    let (other, local) = crate::ddl::resolve(lake, t).await?;
+    let attached = other.is_some();
+    let upto = match &other {
+        Some(o) => {
+            crate::users::across(o, t.split('.').next().unwrap_or_default()).await?; // (a lake that signs in on its own: refused, as its plain reads are)
+            o.cat.settle().await?;
+            Some(o.visible())
+        }
+        None => upto,
+    };
+    let (home, lake) = (lake, other.as_deref().unwrap_or(lake)); // (`home`: where the query was written, whose words AT's value is in)
+    let Some(meta) = lake.cat.meta(&table_key(&local)).await? else {
+        if lake.cat.get_raw(&crate::ddl::query_key(&local)).await?.is_some() {
+            return Err(crate::codes::coded("0A000", format!("{t} AT (…): {t} is a view, and only a table is read as it was: write the view's query with each of its tables AT (…)")));
+        }
+        bail!("no table {t}");
+    };
     if !meta.key.is_empty() {
         return Err(crate::codes::coded("0A000", format!("{t} AT (…): a keyed table keeps only each key's newest version, so only append tables are read as they were")));
     }
     ensure!(meta.history.is_none(), "{t} AT (…): a history view keeps every version already (__start_at, __end_at)");
-    let at = when(lake, &spec).await?;
+    let at = when(home, &spec).await?;
     if let Some((v, ms)) = kept_since(&meta) {
         let refused = match at {
             At::Version(n) => n < v as i64,
@@ -61,13 +79,13 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
     let user: Vec<Expr> = meta.columns.iter().map(|(c, _)| ident(c)).collect();
     let shown = |more: Vec<Expr>| user.iter().cloned().chain(more).collect::<Vec<_>>();
     let system = || if sys { [ROW_ID, VERSION, CREATED, UPDATED].map(col).to_vec() } else { vec![] };
-    let rows = ctx.read_table(crate::query::table_view(lake, ctx, t, &meta, true, upto).await?)?;
+    let rows = ctx.read_table(crate::query::table_view(lake, ctx, &local, &meta, true, upto).await?)?;
     let made = match at {
         At::Version(n) => col(VERSION).lt_eq(lit(n)),
         At::Time(us) => col(UPDATED).lt_eq(ts(us)),
     };
     let mut out = rows.filter(made)?.select(shown(system()))?;
-    let deleted = crate::sys::deleted(t);
+    let deleted = crate::sys::deleted(&local);
     let dmeta = match meta.changed {
         true => lake.cat.meta(&table_key(&deleted)).await?,
         false => None,
@@ -94,7 +112,7 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
         };
         out = out.union(old)?;
     }
-    Ok((t.clone(), crate::query::named(ctx, out.into_view(), &meta, false)?))
+    Ok((t.clone(), crate::query::named(ctx, out.into_view(), &meta, false)?, attached))
 }
 
 /// The version (and time, in ms) before which `meta`'s past is no longer whole: a purge has let
