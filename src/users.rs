@@ -1024,7 +1024,19 @@ pub async fn signed_for(lake: &Lake, purpose: &str, payload: &str, sig: &str) ->
 fn labelled(purpose: &str, data: &[u8]) -> Vec<u8> { [purpose.as_bytes(), b"\n", data].concat() }
 
 /// A session for `user`: `ps_<payload>.<signature>`, checked by any node with the lake's key.
-pub async fn session(lake: &Lake, user: &str) -> Result<(String, u64)> { signed_session(lake, j!({"u": user})).await }
+pub async fn session(lake: &Lake, user: &str) -> Result<(String, u64)> {
+    let me = lake.cat.get::<User>(&user_key(user)).await?.ok_or_else(|| anyhow::anyhow!("no user {user}"))?;
+    signed_session(lake, j!({"u": user, "k": password_mark(lake, user, &me).await?})).await
+}
+
+/// What a user's session holds of the user it was made for: their password's verifier and when they were made, signed
+/// with the lake's key for this purpose alone (so it tells its holder nothing of the password). A new password, or the
+/// user dropped and made again, changes it, and every session made before ends at once, as a Postgres connection does
+/// (`pg::signed_again`): a session taken from a user outlived their changing the password by up to its 12 hours.
+async fn password_mark(lake: &Lake, user: &str, me: &User) -> Result<String> {
+    let stored = me.verifier.as_ref().map_or("", |v| v.stored_key.as_str());
+    sign_for(lake, "session-password", format!("{user}\0{}\0{stored}", me.created_ms).as_bytes()).await
+}
 
 /// A session an identity provider's sign-in made (ADR-074 §5): it names the provider and the roles its token
 /// claimed, so it signs no one in once the provider is dropped, and a user it vouches for with no user here
@@ -1055,7 +1067,14 @@ async fn session_principal(lake: &Lake, token: &str) -> Option<Principal> {
     if until <= crate::log::now_ms() {
         return None;
     }
-    let Some(name) = v["p"].as_str() else { return principal(lake, user).await.ok() };
+    let Some(name) = v["p"].as_str() else {
+        // (a session from before marks were kept has none, and signs no one in: its user signs in again, once)
+        let me = lake.cat.get::<User>(&user_key(user)).await.ok()??;
+        if !me.login || v["k"].as_str()? != password_mark(lake, user, &me).await.ok()? {
+            return None;
+        }
+        return principal(lake, user).await.ok();
+    };
     let all = crate::sso::all(lake).await.ok()?;
     let (_, p) = all.iter().find(|(n, _)| n == name)?;
     let roles = v["r"].as_array().map(|r| r.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
