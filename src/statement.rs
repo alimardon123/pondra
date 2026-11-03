@@ -179,8 +179,7 @@ pub struct SqlParams {
 /// library's host's key: the node's `Auth::owned_by`)? Then its SQL may read files on this machine, as
 /// `pondra sql` may (invariant 21: nobody else's).
 pub(crate) fn owner(auth: &crate::auth::Auth, headers: &http::HeaderMap) -> bool {
-    let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    crate::auth::lent(token).is_some_and(|l| l.1) // (a Python procedure the owner called)
+    crate::auth::lent(crate::auth::Credential::of_headers(headers).token()).is_some_and(|l| l.1) // (a Python procedure the owner called)
         || headers.get("x-pondra-owner").and_then(|h| h.to_str().ok()).is_some_and(|h| auth.is_owner(h))
 }
 
@@ -264,8 +263,7 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, headers: http:
         Some("postgres") => true,
         Some(other) => return Said { reply: Err(crate::codes::coded("22023", format!("catalog={other}: the catalog a request may ask for is postgres (Postgres's, as the Postgres port answers it)"))), heard: vec![], session: None },
     };
-    let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    let vars = crate::auth::lent_vars(token); // (Python code a run lent a connection to: the run's variables)
+    let vars = crate::auth::lent_vars(crate::auth::Credential::of_headers(&headers).token()); // (Python code a run lent a connection to: the run's variables)
     let (hand, mut handed) = tokio::sync::oneshot::channel(); // (the door's end of an answer in pieces: `query::Pieces`)
     let statement = crate::query::PIECES.scope(crate::query::Pieces::new(hand), sql_as(app, p, role, headers, body));
     // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
@@ -297,7 +295,7 @@ async fn sql_as(app: App, p: SqlParams, role: crate::auth::Role, headers: http::
     let kind = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
     let req = crate::routines::Request::read(kind, &body)?;
     // (a Python procedure's own calls, through the token lent to it; anyone else's is a first call)
-    let lent = crate::auth::lent(headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "))).is_some();
+    let lent = crate::auth::lent(crate::auth::Credential::of_headers(&headers).token()).is_some();
     let depth = headers.get("x-pondra-depth").filter(|_| lent).and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0);
     let who = Who { role, files: owner(&app.auth, &headers), depth };
     let how = How { job: p.job.as_deref(), spread: p.spread.as_deref(), after: p.after, stale: p.stale_ms.map(Duration::from_millis) };

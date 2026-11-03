@@ -53,8 +53,7 @@ pub fn of(headers: &http::HeaderMap) -> anyhow::Result<Option<String>> {
         None => None,
         Some(v) => Some(name(v)?),
     };
-    let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    Ok(crate::auth::lent_session(token).or(named.map(|n| id(&n)))) // (a procedure's own client names one: its caller's wins)
+    Ok(crate::auth::lent_session(crate::auth::Credential::of_headers(headers).token()).or(named.map(|n| id(&n)))) // (a procedure's own client names one: its caller's wins)
 }
 
 /// A session name `x-pondra-session` carries (see `of`): the name, or the reason it is refused (22023).

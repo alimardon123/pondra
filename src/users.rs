@@ -1404,15 +1404,17 @@ pub async fn any(lake: &Lake) -> bool {
     yes
 }
 
-/// Who an HTTP request's `Authorization` is: a token's role, a user's token or session, or a user's
-/// name and password (Basic). None: nobody (refused where a sign-in is needed).
-pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) -> Option<Principal> { who_at(lake, auth, header, false).await }
+/// Whom a credential signs in (`auth::Credential`, read alike at every door): a token's role, a user's token or session,
+/// or a user's name and password. None: nobody (refused where a sign-in is needed).
+pub async fn who(lake: &Lake, auth: &crate::auth::Auth, credential: &crate::auth::Credential) -> Option<Principal> { who_at(lake, auth, credential, false).await }
 
 /// `who`, for a request from this machine or with the nodes' authority's certificate (`vouched`) or from anyone
 /// else: the nodes' key counts as `nodes_key` says.
-pub async fn who_at(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>, vouched: bool) -> Option<Principal> {
-    let header = header?;
-    if let Some(token) = header.strip_prefix("Bearer ") {
+pub async fn who_at(lake: &Lake, auth: &crate::auth::Auth, credential: &crate::auth::Credential, vouched: bool) -> Option<Principal> {
+    if let crate::auth::Credential::Password { user, password } = credential {
+        return sign_in(lake, auth, user, password).await;
+    }
+    if let Some(token) = credential.token() {
         if let Some(p) = auth.lent_principal(token) {
             return Some(p);
         }
@@ -1432,9 +1434,7 @@ pub async fn who_at(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>,
         }
         return principal(lake, &token_user(lake, token).await?).await.ok();
     }
-    let basic = String::from_utf8(B64.decode(header.strip_prefix("Basic ")?).ok()?).ok()?;
-    let (user, password) = basic.split_once(':')?;
-    sign_in(lake, auth, user, password).await
+    None
 }
 
 /// Does the lake's key for its nodes (`pn_`) sign a request in? Only without an admin token (the nodes call each

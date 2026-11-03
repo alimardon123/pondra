@@ -71,8 +71,12 @@ impl FromRequestParts<App> for Caller {
     type Rejection = Response;
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Response> {
         let from = parts.extensions.get::<axum::extract::ConnectInfo<crate::tls::Peer>>().map(|c| c.0.addr);
-        let token = parts.headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).map(str::trim);
-        let found = match token {
+        let credential = crate::auth::Credential::of_headers(&parts.headers); // (read alike at every door: `auth::Credential`)
+        if let Some(why) = credential.malformed() {
+            crate::audit::refused(app, "", "sharing", from, &format!("{} {}", parts.method, parts.uri.path()), &why).await;
+            return Err(Fail(StatusCode::UNAUTHORIZED, "UNAUTHENTICATED", why).into_response());
+        }
+        let found = match credential.token() {
             Some(t) => crate::shares::recipient_of(&app.lake, t).await.map_err(|e| internal(e).into_response())?,
             None => None,
         };

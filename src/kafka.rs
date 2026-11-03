@@ -186,7 +186,7 @@ async fn again(app: &App, said: &Said) -> crate::auth::Principal {
     let now = match said {
         Said::Open => app.open().await.then(|| crate::auth::Principal::of(Role::Admin)),
         Said::Plain(user, password) => crate::users::sign_in(&app.lake, &app.auth, user, password).await,
-        Said::Bearer(token) => crate::users::who(&app.lake, &app.auth, Some(&format!("Bearer {token}"))).await,
+        Said::Bearer(token) => crate::users::who(&app.lake, &app.auth, &crate::auth::Credential::Token(token.clone())).await,
     };
     now.unwrap_or_else(|| crate::auth::Principal::of(Role::None))
 }
@@ -341,24 +341,29 @@ fn sasl_handshake(r: &mut Rd) -> Result<Vec<u8>> {
 /// past ten failures a minute for a user from one address, that pair is refused (`auth::guessing`).
 async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &mut Option<Said>, peer: &crate::tls::Peer, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     let auth = r.nbytes()?.unwrap_or_default();
-    let parts: Vec<&[u8]> = auth.split(|&b| b == 0).collect();
-    let (mut user, password) = match parts[..] {
-        [_, user, password] => (String::from_utf8_lossy(user).to_string(), String::from_utf8_lossy(password).to_string()),
+    // (read alike at every door: `auth::Credential`. OAUTHBEARER's token, else PLAIN's name and password)
+    let credential = match crate::sso::bearer(&auth) {
+        Some(token) => crate::auth::Credential::Token(token),
+        None => crate::auth::Credential::of_sasl_plain(&auth),
+    };
+    let (mut user, password) = match &credential {
+        crate::auth::Credential::Password { user, password } => (user.clone(), password.clone()),
         _ => (String::new(), String::new()),
     };
     let ip = Some(peer.addr.ip());
-    let token = crate::sso::bearer(&auth); // (OAUTHBEARER's; None: PLAIN's)
-    let refused = if app.open().await {
+    let refused = if let Some(why) = credential.malformed() {
+        Some(why) // (never taken for no sign-in, an open node's included)
+    } else if app.open().await {
         *who = crate::auth::Principal::of(Role::Admin).at("kafka", who.from);
         *said = Some(Said::Open);
         None
-    } else if let Some(token) = &token {
+    } else if let Some(token) = credential.token() {
         // (a bearer token, as HTTP takes one: an identity provider's, or Pondra's own; never a guess)
-        match crate::users::who(&app.lake, &app.auth, Some(&format!("Bearer {token}"))).await {
+        match crate::users::who(&app.lake, &app.auth, &credential).await {
             Some(p) => {
                 user = p.name.clone();
                 *who = p.at("kafka", who.from);
-                *said = Some(Said::Bearer(token.clone()));
+                *said = Some(Said::Bearer(token.to_string()));
                 None
             }
             None => Some(crate::sso::why(&app.lake, token).await.unwrap_or_else(|| "wrong token".to_string())),

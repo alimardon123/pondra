@@ -304,8 +304,7 @@ fn error(status: StatusCode, e: anyhow::Error) -> Response { crate::server::erro
 
 /// The token a request carries, and its role on this server.
 fn role(s: &Server, req: &axum::http::HeaderMap) -> Role {
-    let token = req.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    s.auth.role(token)
+    s.auth.role(crate::auth::Credential::of_headers(req).token())
 }
 
 async fn list(State(s): State<Shared>, req: Request) -> Response {
@@ -390,7 +389,11 @@ async fn plain(State(s): State<Shared>, axum::extract::ConnectInfo(peer): axum::
         return (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response();
     }
     // (a password from another machine crosses only TLS, as a node's own door says: its node sees this machine)
-    let basic = req.headers().get("authorization").and_then(|h| h.to_str().ok()).is_some_and(|h| h.starts_with("Basic "));
+    let credential = crate::auth::Credential::of_headers(req.headers()); // (read alike at every door: `auth::Credential`)
+    if let Some(why) = credential.malformed() {
+        return (StatusCode::UNAUTHORIZED, why).into_response();
+    }
+    let basic = matches!(credential, crate::auth::Credential::Password { .. });
     if (basic || req.uri().path().ends_with("/login")) && !peer.may_send_password() {
         return (StatusCode::FORBIDDEN, crate::tls::PASSWORD_PLAIN).into_response();
     }

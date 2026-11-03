@@ -550,7 +550,8 @@ impl Page {
         if !joined && (crate::text::control(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some()) {
             return Ok(Routed::Lake);
         }
-        let token = request_header(headers, "authorization").and_then(|v| v.strip_prefix("Bearer "));
+        let credential = crate::auth::Credential::of_header(request_header(headers, "authorization")); // (`auth::Credential`)
+        let token = credential.token();
         let session = crate::temp::of(&header_map(headers))?;
         let format_query = format.map(|f| format!("format={f}")).unwrap_or_default();
         let lent = crate::auth::lent_vars(token);

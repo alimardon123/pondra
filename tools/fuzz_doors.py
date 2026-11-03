@@ -153,6 +153,12 @@ PATHS = ["/sql", "/sql?format=arrow", "/sql?format=typed&rows=5", "/sql?format=c
          "/sql/pages/x?page=2", "/metrics", "/live", "/secrets/x", "/workspace/run"]
 
 
+# Authorization values (`auth::Credential`): broken Bearer and Basic, odd schemes and cases, long, and not text.
+AUTH = ["Basic !!!", "Basic " + "QUFB" * 100, "Bearer pn_" + "A" * 50, "Bearer ps_x.y", "Bearer ", "Bearer", "Digest x", "bearer pb_x",
+        "BASIC YWRtaW4", "Basic YWRtaW4=", "Basic Og==", "Basic " + "A" * 5000, "Bearer " + "x" * 20000, "Basic\tYTpi", " Basic YTpi ",
+        "Bearer \u00e9\u00e9", "Basic \u00ff\u00fe", "Bearer pt_" + "\u2603" * 10, "Negotiate YIIB", "Basic YTpi YTpi"]
+
+
 def http_one(door):
     method = R.choice(["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
     path = R.choice(PATHS)
@@ -168,7 +174,7 @@ def http_one(door):
     if R.random() < 0.3:
         headers["Content-Type"] = R.choice(["application/json", "text/plain", "application/vnd.apache.arrow.stream", "multipart/form-data; boundary=x", "\x00"])
     if R.random() < 0.3:
-        headers["Authorization"] = R.choice(["Basic !!!", "Basic " + "QUFB" * 100, "Bearer pn_" + "A" * 50, "Bearer ps_x.y", "Bearer ", "Digest x"])
+        headers["Authorization"] = R.choice(AUTH)
     if R.random() < 0.1:
         headers["Content-Length"] = R.choice(["-1", "99999999999999", "abc", str(len(body) + 1000)])
     if R.random() < 0.1:
@@ -347,10 +353,13 @@ def h2_frame(kind, flags, stream, payload):
 
 
 def grpc_headers(path):
-    # HPACK, literal without indexing, new names (simple and valid).
+    # HPACK, literal without indexing, new names (simple and valid); some with an authorization (`AUTH`, short enough
+    # for a one-byte length).
     def lit(n, v):
         return b"\x00" + bytes([len(n)]) + n + bytes([len(v)]) + v
-    return lit(b":method", b"POST") + lit(b":scheme", b"http") + lit(b":path", path) + lit(b":authority", b"x") + lit(b"content-type", b"application/grpc") + lit(b"te", b"trailers")
+    auth = [a.encode("latin-1", "replace") for a in AUTH if len(a.encode("latin-1", "replace")) < 127]
+    signed = lit(b"authorization", R.choice(auth)) if R.random() < 0.4 else b""
+    return lit(b":method", b"POST") + lit(b":scheme", b"http") + lit(b":path", path) + lit(b":authority", b"x") + lit(b"content-type", b"application/grpc") + lit(b"te", b"trailers") + signed
 
 
 def flight_one(door):

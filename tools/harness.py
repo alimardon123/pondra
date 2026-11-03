@@ -10743,6 +10743,7 @@ def users():
     boss = basic("boss", "boss-password-1")
     # Open, until a user who signs in exists; then nothing without a sign-in (no token is set)
     opened = as_(A.port, None, "SELECT 1 AS x")
+    unreadable_open = as_(A.port, "Basic !!!", "SELECT 1 AS x")  # (before: taken for no sign-in, an open node's admin)
     for q in ["CREATE SCHEMA sales", "CREATE TABLE sales.orders (id BIGINT, item VARCHAR, amount DOUBLE, card VARCHAR)", "INSERT INTO sales.orders VALUES (1, 'tea', 2.5, '4111'), (2, 'cake', 4.0, '5500')",
               "CREATE TABLE hr (id BIGINT, salary DOUBLE)", "INSERT INTO hr VALUES (1, 100.0)", "CREATE TABLE notes (id BIGINT, text VARCHAR)", "INSERT INTO notes VALUES (1, 'hello')",
               "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:
@@ -10922,6 +10923,23 @@ def users():
             return f"ERROR {e}"
     flight_said = [bearer[1].decode().startswith("Bearer ps_"), fsql("SELECT item FROM sales.orders ORDER BY id"), fsql("SELECT card FROM sales.orders")]
     checks["Flight: a handshake with a user's name and password gives a session; held to the grants"] = flight_said[0] and flight_said[1] == [{"item": "tea"}, {"item": "cake"}] and "permission denied" in flight_said[2]
+    # A credential that can't be read (`auth::Credential`): refused by name, the same words at HTTP, MCP and Flight, and
+    # at an open node too, never taken for no sign-in
+    def flight_unreadable(header):
+        try:
+            c = fl.FlightClient(f"grpc://127.0.0.1:{A.port + 30}")
+            c.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": "SELECT 1 AS x"})), fl.FlightCallOptions(headers=[(b"authorization", header)]))
+            return "answered"
+        except Exception as e:
+            return f"ERROR {e}"
+    no_colon = "Basic " + base64.b64encode(b"ann").decode()
+    unreadable = [as_(A.port, h, "SELECT 1 AS x") for h in ("Basic !!!", "Bearer", no_colon)] + \
+        [as_(A.port, "Basic !!!", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), path="/mcp")] + \
+        [flight_unreadable(h) for h in (b"Basic !!!", b"Bearer", no_colon.encode())]
+    shown_info["unreadable"] = [str(r)[:160] for r in [unreadable_open] + unreadable]
+    checks["a credential that can't be read is refused by name at HTTP, MCP and Flight, at an open node too"] = \
+        all("the Authorization header can't be read" in str(r) for r in [unreadable_open] + unreadable) \
+        and all(str(r).startswith("ERROR 401") for r in [unreadable_open] + unreadable[:4])
     # MCP: a listing shows what a user may read; changes (a stream of rows, every column, as /watch's) is refused without them
     def tool_result(name, args):
         out = as_(A.port, ann, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}), path="/mcp")
