@@ -3127,9 +3127,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    answer `Option` (each refusal took a backtrace under `RUST_BACKTRACE`). `cargo test --lib parsed::`
 
 470. **Another database's call written as Pondra's keeps its place inside an operator** (`friendly::expression`,
-   `expander::grouped`). A call written as an expression (SAFE_DIVIDE as `CAST(a AS DOUBLE) / nullif(b, 0)`, DATEADD as
-   `(d) + n * INTERVAL '1 day'`, TIMESTAMP_TRUNC(ts, WEEK)) is put in parentheses where it isn't one term: sqlparser
-   writes an operator back as `left op right`, so `8 / SAFE_DIVIDE(a, b)` was `8 / a / b` (11-03 audit H4). A
+   `expander::grouped`). A call written as an expression (DATEADD as `(d) + n * INTERVAL '1 day'`,
+   TIMESTAMP_TRUNC(ts, WEEK)) is put in parentheses where it isn't one term: sqlparser
+   writes an operator back as `left op right`, so `8 / SAFE_DIVIDE(a, b)` was `8 / a / b` (11-03 audit H4).
+   SAFE_DIVIDE is a function of its own since (`dialect_fns::register`), typed by its arguments: two integers give a
+   DOUBLE, a NUMERIC stays a NUMERIC (L8: text made it a DOUBLE; `cargo test --lib dialect_fns::`). A
    streaming task's or a materialized view's run reads its source in SQL's column order (`query::over`), as its query
    was planned at create: a task made after `ALTER COLUMN b FIRST` wrote each value into the other column (H5); what
    read the table before a move reads it by name since (`ddl::keep_readers`). `cargo test --lib

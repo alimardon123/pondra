@@ -25263,6 +25263,9 @@ def friendly():
         "BigQuery's COUNTIF and SAFE_DIVIDE (NULL by zero)": (
             "SELECT k, COUNTIF(x > 100) AS c, SAFE_DIVIDE(sum(x), sum(k)) AS r FROM t GROUP BY k",
             "SELECT k, count(*) FILTER (WHERE x > 100) AS c, CASE WHEN sum(k) = 0 THEN NULL ELSE sum(x) / sum(k) END AS r FROM t GROUP BY k"),
+        "BigQuery's SAFE_DIVIDE of a NUMERIC is a NUMERIC, as `/` gives, and of integers a DOUBLE (11-03 audit L8: a NUMERIC went through DOUBLE)": (
+            "SELECT d, SAFE_DIVIDE(d, 4) AS r, SAFE_DIVIDE(d, d - d) AS z, arrow_typeof(SAFE_DIVIDE(d, 4)) LIKE 'Decimal128(%' AS numeric, arrow_typeof(SAFE_DIVIDE(2, 4)) AS whole FROM big",
+            "SELECT d, d / 4 AS r, NULL AS z, true AS numeric, 'Float64' AS whole FROM big"),
         "BigQuery's DATE(ts), DATE(y, m, d), DATE_TRUNC(d, MONTH), TIMESTAMP_TRUNC, TIMESTAMP_DIFF (whole parts, either way), FORMAT_DATE, PARSE_DATE, UNIX_SECONDS, TIMESTAMP_SECONDS": (
             "SELECT id, DATE(ts) AS a, DATE(2026, 3, k + 1) AS b, DATE_TRUNC(d, MONTH) AS c, TIMESTAMP_TRUNC(ts, HOUR) AS h, TIMESTAMP_DIFF(ts, TIMESTAMP '2026-01-01 00:00:00', HOUR) AS dh, "
             "TIMESTAMP_DIFF(TIMESTAMP '2026-01-01 00:10:30', ts, MINUTE) AS dm, FORMAT_DATE('%Y/%m', d) AS f, PARSE_DATE('%Y%m%d', '20260301') AS p, UNIX_SECONDS(ts) AS u, "

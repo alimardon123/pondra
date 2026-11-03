@@ -36,7 +36,7 @@ pub fn wanted(sql: &str) -> bool {
     // (the last alternatives: BigQuery's `SAFE.f(`, and Snowflake's `payload:page` (a colon after a word or a closing
     // bracket, then a letter, `_`, a quote or `[`: not `x::INT`, nor `a = :p`, a parameter))
     static WORDS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|get_json_object|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|lateral|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd|group_concat|array_agg|iff|iif|zeroifnull|decode|array_construct|array_size|object_construct|isnull|charindex|convert|try_convert|getdate|sysdatetime|eomonth|datepart|curdate|unix_timestamp|unix_seconds|timestamp_seconds|str_to_date|date_format|timestampdiff|countif|safe_divide|date|date_trunc|timestamp_trunc|datetime_trunc|timestamp_diff|datetime_diff|format_date|format_timestamp|format_datetime|parse_date|parse_timestamp|parse_datetime|transform|format)\s*\(|\bselect\s+(?:all\s+|distinct\s+)?top\b|\b(?:int64|float64|number|byteint)\b|\bwithin\s+group\b|\)\s*\.\s*[a-z_]|\bsafe\s*\.\s*\w+\s*\(|(?:[\w)\]"])\s*:(?:[A-Za-z_"\[])"#).expect("a regex")
+        Regex::new(r#"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|get_json_object|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|lateral|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd|group_concat|array_agg|iff|iif|zeroifnull|decode|array_construct|array_size|object_construct|isnull|charindex|convert|try_convert|getdate|sysdatetime|eomonth|datepart|curdate|unix_timestamp|unix_seconds|timestamp_seconds|str_to_date|date_format|timestampdiff|countif|date|date_trunc|timestamp_trunc|datetime_trunc|timestamp_diff|datetime_diff|format_date|format_timestamp|format_datetime|parse_date|parse_timestamp|parse_datetime|transform|format)\s*\(|\bselect\s+(?:all\s+|distinct\s+)?top\b|\b(?:int64|float64|number|byteint)\b|\bwithin\s+group\b|\)\s*\.\s*[a-z_]|\bsafe\s*\.\s*\w+\s*\(|(?:[\w)\]"])\s*:(?:[A-Za-z_"\[])"#).expect("a regex")
     });
     // (a type DuckDB names otherwise, or one Pondra refuses by name: `DUCKDB_TYPES`, `OTHER_TYPES`, and the ones sqlparser
     // reads as its own; only where a type stands, after AS or `::`, before a literal's text, or in a CREATE, ALTER or
@@ -2219,11 +2219,10 @@ mod tests {
             });
             e.to_string()
         };
-        assert_eq!(all("SAFE_DIVIDE(10, 100) / SAFE_DIVIDE(5, 100)"), "(CAST(10 AS DOUBLE) / nullif(100, 0)) / (CAST(5 AS DOUBLE) / nullif(100, 0))");
         assert_eq!(all("x - DATEADD(day, 1, d)"), "x - ((d) + CAST(1 AS BIGINT) * INTERVAL '1 day')");
         assert_eq!(all("ts - TIMESTAMP_TRUNC(ts, WEEK)"), "ts - (date_trunc('day', ts) - CAST(date_part('dow', ts) AS BIGINT) * INTERVAL '1 day')");
-        assert_eq!(all("1 + SAFE_DIVIDE(a, b)"), "1 + (CAST(a AS DOUBLE) / nullif(b, 0))");
-        // (a call that stays a call, or a cast, needs none)
+        // (a call that stays a call, or a cast, needs none; SAFE_DIVIDE is a function of its own since the 11-03 audit's L8)
+        assert_eq!(all("8 / SAFE_DIVIDE(a, b)"), "8 / SAFE_DIVIDE(a, b)");
         assert_eq!(all("2 * ZEROIFNULL(n)"), "2 * coalesce(n, 0)");
         assert_eq!(all("1 + DATE(ts)"), "1 + CAST(ts AS DATE)");
     }
