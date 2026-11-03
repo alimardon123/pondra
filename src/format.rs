@@ -33,7 +33,7 @@ use std::time::Duration;
 pub const FORMAT: u32 = 6;
 
 /// The format whose tables keep their columns as one list (`store::Stored`). A lake moves to it by itself: its leader raises
-/// it once every node knows it (`raise`), and a form that leads its lake alone as it opens (`alone`). The commit sets the
+/// it once every node knows it (`raise`), and a form that leads a lake in memory or a folder alone as it opens (`alone`). The commit sets the
 /// format alone: each table's entry becomes its list at its next write (`Catalog::write`), and an entry still in format
 /// 5's shape reads as it always did, as every format-5 lake's do.
 pub const LISTS: u32 = 6;
@@ -221,15 +221,20 @@ pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>) {
 /// this build has read it (the mark alone, `BASE`, for a test posing as a build from before them).
 fn first() -> u32 { if known() >= LISTS { LISTS } else { BASE } }
 
-/// A form that leads its lake alone, with no leader's loop (`pondra sql`, a program's node, in a folder or in memory): the
-/// lake moves to this build's tables' column lists (`LISTS`) as it opens, in one small commit. Nobody else leads it, so
-/// it has no node to wait for; a node of a release before that starts on the lake later is refused by name (`check`).
+/// A form that leads its lake alone, with no leader's loop (`pondra sql`, a program's node): a lake in memory or in a
+/// local folder moves to this build's tables' column lists (`LISTS`) as it opens, in one small commit. A lake in a bucket
+/// doesn't: a cluster's followers may be serving it, which this form can't hear (a leader gap), and a node of a release
+/// before would stop. A bucket's lake moves on only by its server's leader, which knows its followers' releases
+/// (`raise`); until then its entries keep format 5's shape, which every reader reads.
 pub async fn alone(lake: &Lake) -> Result<()> {
-    if known() >= LISTS {
+    if known() >= LISTS && kept_here(&lake.url) {
         set(lake, LISTS).await?;
     }
     Ok(())
 }
+
+/// Is the lake at `url` in this process's memory or a local folder (no bucket's `scheme://`)?
+fn kept_here(url: &str) -> bool { crate::memory::in_memory(url) || !url.contains("://") }
 
 /// A node that isn't the leader: stop if the lake moves past what this build knows. (It can't,
 /// unless this node was cut off while the others agreed, `raise`, or it started on such a lake
@@ -251,6 +256,13 @@ pub fn watch(lake: Arc<Lake>) {
 mod tests {
     use super::*;
     use crate::store::{json, table_key, TableMeta};
+
+    /// A form alone raises a lake in memory or a folder, never one in a bucket (`alone`).
+    #[test]
+    fn a_form_alone_raises_only_a_lake_kept_here() {
+        assert!(kept_here("/home/me/lake") && kept_here("memory://7") && kept_here("C:\\lakes\\one"));
+        assert!(!kept_here("s3://bucket/lake") && !kept_here("gs://b/l") && !kept_here("az://c/l") && !kept_here("abfss://c@a.dfs.core.windows.net/l"));
+    }
 
     /// Format 6 is one small commit: a format-5 lake's entries stay in their shape and answer as before, and each becomes
     /// its list at its next write (`Catalog::write`), as does an entry made in format 5's shape after it.

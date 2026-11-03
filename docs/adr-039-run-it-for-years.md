@@ -138,9 +138,11 @@ stop, and a 24-hour soak (C4). Where things stood:
 - **The lake's format moves only to what every live node knows** (`format::raise`: followers'
   heartbeats and the commit streams' `x-pondra-format`, after two leases), and a change an
   older release would read wrongly is written only at its format. `upgrade_check.py format`
-  ("…no further") fails if the leader raises past a follower. A form that leads its lake alone
-  (`pondra sql`, a program's node) hears no follower, so it moves the lake to this build's format
-  as it opens (`format::alone`); a node of an older release started on it then is refused by name.
+  ("…no further") fails if the leader raises past a follower. A form that leads a lake alone
+  (`pondra sql`, a program's node) hears no follower: it moves a lake in memory or a local folder
+  to this build's format as it opens (`format::alone`), and never a lake in a bucket, whose
+  cluster's followers it can't hear in a leader gap. A bucket's lake moves on only by its server's
+  leader. `upgrade_check.py guests` ("…and never a lake in a bucket", with `--s3`).
 - **Every release's lake since 0.22 opens in this build and answers as it did**
   (`upgrade_check.py lakes`, `upgrade.yml` on every pull request).
 - **A node told to stop drains** (`drain.rs`): not ready, new requests turned away to be

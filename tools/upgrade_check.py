@@ -19,7 +19,11 @@
       lake is on s3://$PONDRA_BUCKET (AWS_* point at R2, MinIO or tools/sim_r2.py), where a
       follower's flush is always in flight.
 
-  upgrade_check.py lakes,format (any of lakes, format, drain, rolling, comma-separated; all of them by default)
+  upgrade_check.py guests [--s3]
+      `pondra sql` writing alone moves a lake in a folder to this build's format as it opens; with --s3, it never moves a
+      lake in a bucket, whose cluster's followers it can't hear.
+
+  upgrade_check.py lakes,format (any of lakes, format, drain, rolling, guests, comma-separated; all of them by default)
 
 Prints the checks as JSON and exits 1 if one fails (a failing release's lakes and node logs are
 kept in --work). Needs the Python packages in tools/requirements.txt for other engines' reads
@@ -712,6 +716,43 @@ def format_check(new_bin, work, port, old=None):
     return checks, info
 
 
+def guests_check(new_bin, work, port):
+    """`pondra sql` writing on a lake no node serves, which it leads alone (ADR-039): a lake in a local folder moves to this
+    build's column lists (format 6) as it opens, and a lake in a bucket never does (with --s3): a cluster's followers may be
+    serving it in a leader gap, which `pondra sql` can't hear. A bucket's lake moves on only by its server's leader. Each
+    lake is made at format 5 (a build posing as one before the column lists); a node of format 5 then opens it again, or
+    is refused it by name."""
+    checks, info = {}, {}
+    five = {"PONDRA_TEST_FORMAT": "5", "PONDRA_SECRET_KEY": ""}
+    fmt = lambda n: n.get("/stats", timeout=5)["format"]
+    lakes = {"folder": os.path.join(work, "guests-lake")}
+    if A.s3:
+        lakes["bucket"] = f"s3://{os.environ['PONDRA_BUCKET']}/guests-{os.getpid()}-{int(time.time())}"
+    for where, lake in lakes.items():
+        n = Node(new_bin, lake, port, work, env=five, token=False).start()
+        n.q("CREATE TABLE t (x INT NOT NULL, y VARCHAR DEFAULT 'a')")
+        n.q("INSERT INTO t (x) VALUES (1)")
+        made = fmt(n)
+        n.stop()
+        cli(new_bin, lake, "INSERT INTO t (x) VALUES (2)")
+        o = Node(new_bin, lake, port, work, env=five, token=False)
+        try:  # (a node of format 5: it serves a lake still at 5, and refuses one at 6 by name)
+            o.start()
+            got = {"format": fmt(o), "rows": o.q("SELECT x, y FROM t ORDER BY x")}
+        except Failed:
+            got = {"refused": o.said()[-300:]}
+        o.stop("kill")
+        info[where] = {"made at": made, "then": got}
+        if where == "folder":
+            checks["pondra sql writing alone moves a lake in a folder to its tables' column lists (format 6) as it opens: a node of format 5 is then refused it by name"] = \
+                made < LISTS and "format 6" in got.get("refused", "") and "run Pondra" in got.get("refused", "")
+        else:
+            checks["…and never a lake in a bucket, whose cluster's followers it can't hear: it stays at format 5, and a node of format 5 still serves it"] = \
+                made < LISTS and got.get("format") == made and got.get("rows") == [{"x": 1, "y": "a"}, {"x": 2, "y": "a"}]
+            gone(lake)
+    return checks, info
+
+
 # ---------------------------------------------------------------- stopping
 
 class Load:
@@ -1280,7 +1321,7 @@ def run(name, results, f, *args):
 def main():
     global A
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("what", nargs="?", default="all", help="any of lakes, format, drain, rolling (comma-separated), or all")
+    ap.add_argument("what", nargs="?", default="all", help="any of lakes, format, drain, rolling, guests (comma-separated), or all")
     ap.add_argument("--new", default=os.path.join(HERE, "..", "target", "release", "pondra"), help="this build's binary")
     ap.add_argument("--from", dest="first", default="0.22.0", help="the oldest release whose lake must open")
     ap.add_argument("--only", default="", help="these releases only (comma-separated); `rolling` upgrades the newest of them")
@@ -1288,10 +1329,10 @@ def main():
     ap.add_argument("--work", default="", help="where lakes and logs go (default: a new temporary folder, removed if every check passes)")
     ap.add_argument("--port", type=int, default=9720)
     ap.add_argument("--verbose", action="store_true", help="what each check measured, passed or not")
-    ap.add_argument("--s3", action="store_true", help="`drain`'s cluster on s3://$PONDRA_BUCKET (AWS_* point at R2, MinIO or tools/sim_r2.py)")
+    ap.add_argument("--s3", action="store_true", help="`drain`'s cluster, and `guests`' second lake, on s3://$PONDRA_BUCKET (AWS_* point at R2, MinIO or tools/sim_r2.py)")
     A = ap.parse_args()
-    parts = {"lakes", "format", "drain", "rolling"} if A.what == "all" else set(A.what.split(","))
-    if unknown := parts - {"lakes", "format", "drain", "rolling"}:
+    parts = {"lakes", "format", "drain", "rolling", "guests"} if A.what == "all" else set(A.what.split(","))
+    if unknown := parts - {"lakes", "format", "drain", "rolling", "guests"}:
         ap.error(f"no such check: {', '.join(sorted(unknown))}")
     new_bin = os.path.abspath(A.new)
     work = A.work or tempfile.mkdtemp(prefix="pondra-upgrade-")
@@ -1308,6 +1349,8 @@ def main():
         ok &= run("format", out, format_check, new_bin, work, A.port, (found[-1][0], binary(*found[-1], A.cache)) if found else None)
     if "drain" in parts:
         ok &= run("drain", out, drain_check, new_bin, work, A.port)
+    if "guests" in parts:
+        ok &= run("guests", out, guests_check, new_bin, work, A.port)
     if "rolling" in parts:
         v, url = found[-1]
         out["rolling"] = {}
