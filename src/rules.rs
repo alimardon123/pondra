@@ -279,7 +279,7 @@ tokio::task_local! {
 /// a CHECK whose answer can change (one calling `now()`) isn't asked again with the commit's time, as Postgres asks a CHECK
 /// only when a row is written. (`CHECK (until > now())` and `INSERT … now() + '2 s'`, committed 3 s later, was refused.) The
 /// others are asked again, as before: their answer is the same.
-pub async fn committing<F: Future>(f: F) -> F::Output { WRITTEN.scope((), f).await }
+pub fn committing<F: Future>(f: F) -> impl Future<Output = F::Output> { WRITTEN.scope((), f) } // (not an `async fn`: its future would hold `f` twice)
 
 /// Are the rows being checked ones a transaction's statements shaped (`committing`)?
 fn written() -> bool { WRITTEN.try_with(|_| ()).is_ok() }
