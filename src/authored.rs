@@ -16,7 +16,7 @@ use datafusion::sql::sqlparser::{
     dialect::GenericDialect,
     keywords::Keyword,
     parser::Parser,
-    tokenizer::{Location, Span, Token, Tokenizer, Whitespace},
+    tokenizer::{Span, Token, Whitespace},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -68,29 +68,10 @@ pub fn candidate(name: &str, materialized: bool, query: &str) -> Option<String> 
     }
 }
 
-/// `sql`'s tokens with where each starts and ends (bytes), whitespace and comments among them.
+/// `sql`'s tokens with where each starts and ends (bytes), whitespace and comments among them (`text::tokens`, copied).
 fn located(sql: &str) -> Option<Vec<(Token, usize, usize)>> {
-    let spans = Tokenizer::new(&GenericDialect {}, sql).tokenize_with_location().ok()?;
-    let at = Offsets::of(sql);
-    Some(spans.into_iter().map(|t| (t.token, at.byte(&t.span.start), at.byte(&t.span.end))).collect())
-}
-
-/// A text's lines, to turn the parser's (line, column) into bytes.
-struct Offsets<'a> {
-    sql: &'a str,
-    lines: Vec<usize>,
-}
-
-impl<'a> Offsets<'a> {
-    fn of(sql: &'a str) -> Self { Offsets { sql, lines: std::iter::once(0).chain(sql.match_indices('\n').map(|(i, _)| i + 1)).collect() } }
-    fn byte(&self, l: &Location) -> usize {
-        let start = self.lines.get(l.line.saturating_sub(1) as usize).copied().unwrap_or(self.sql.len());
-        self.sql[start..].char_indices().nth(l.column.saturating_sub(1) as usize).map_or(self.sql.len(), |(i, _)| start + i)
-    }
-    /// A span as bytes, None when the parser gave the node none.
-    fn range(&self, s: Span) -> Option<(usize, usize)> {
-        (s != Span::empty() && s.start.line > 0).then(|| (self.byte(&s.start), self.byte(&s.end))).filter(|(a, b)| a < b)
-    }
+    let t = crate::text::tokens(sql)?;
+    Some((0..t.toks.len()).map(|i| (t.toks[i].clone(), t.start[i], t.end[i])).collect())
 }
 
 fn trivia(t: &Token) -> bool { matches!(t, Token::Whitespace(_)) }
@@ -221,7 +202,7 @@ pub async fn proved(lake: &crate::store::Lake, text: &str, query: &str, material
 pub fn moved(text: &str, order: &[usize]) -> Option<String> {
     let q = Parser::new(&GenericDialect {}).try_with_sql(text).and_then(|mut p| p.parse_query()).ok()?;
     let toks = located(text)?;
-    let mut m = Mover { at: Offsets::of(text), toks, order, edits: vec![] };
+    let mut m = Mover { at: crate::text::Offsets::of(text), toks, order, edits: vec![] };
     m.query(&q)?;
     let mut edits = m.edits;
     edits.sort_by_key(|e| e.0);
@@ -236,7 +217,7 @@ pub fn moved(text: &str, order: &[usize]) -> Option<String> {
 }
 
 struct Mover<'a> {
-    at: Offsets<'a>,
+    at: crate::text::Offsets<'a>,
     toks: Vec<(Token, usize, usize)>,
     order: &'a [usize],
     edits: Vec<(usize, usize, String)>,

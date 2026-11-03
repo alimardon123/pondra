@@ -191,22 +191,16 @@ impl PruningStatistics for View<'_> {
 
 crate::per_node!(
     /// Decompressed metadata objects, newest used kept, up to 256 MB (they never change).
-    static CACHE: Mutex<(lru::LruCache<String, Arc<Vec<u8>>>, usize)> = Mutex::new((lru::LruCache::unbounded(), 0)); clear = |m| { let mut c = m.lock().unwrap_or_else(|e| e.into_inner()); c.0.clear(); c.1 = 0; });
+    static CACHE: Mutex<crate::ledger::ByteLru<String, Arc<Vec<u8>>>> = Mutex::new(crate::ledger::ByteLru::new(CACHE_BYTES)); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
 const CACHE_BYTES: usize = 256 << 20;
 
 async fn object(lake: &Lake, path: &str) -> Result<Arc<Vec<u8>>> {
-    if let Some(b) = CACHE.lock().unwrap().0.get(path) {
+    if let Some(b) = CACHE.lock().unwrap().get(path) {
         return Ok(b.clone());
     }
     let b = Arc::new(zstd::decode_all(&lake.object(path).await?[..])?);
-    let mut c = CACHE.lock().unwrap();
-    if c.0.put(path.to_string(), b.clone()).is_none() {
-        c.1 += b.len();
-    }
-    while c.1 > CACHE_BYTES {
-        let Some((_, old)) = c.0.pop_lru() else { break };
-        c.1 -= old.len();
-    }
+    let left = CACHE.lock().unwrap().put(path.to_string(), b.clone(), b.len());
+    drop(left); // (let go of outside the lock)
     Ok(b)
 }
 

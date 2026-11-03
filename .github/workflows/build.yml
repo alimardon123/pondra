@@ -21,11 +21,15 @@ name: build
 # Two pull requests' runs go at once (the account's runners are shared with the owner's other work,
 # 2026-10-16): a third waits, holding no runner, until ci-slots.yml starts it. Each run runs only
 # what its change touches (`plan`), and main builds only its newest commit (`concurrency`).
+# A release branch (`release/0.80`: cut from main for a release, its fixes and candidates land there while the redesign
+# goes on on main; the owner, 2026-11-03) builds as main does, each on its own: its pushes every platform, its pull
+# requests' `ci` and `full-ci` as main's. The train lands on main alone, so a release branch's pull request merges by
+# hand once its run is green, and its tags (release.yml) take that branch's packages.
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "release/**"]
     types: [opened, synchronize, reopened, labeled] # (labeled: `ci` or `full-ci` added)
   workflow_dispatch:
     inputs:
@@ -43,7 +47,7 @@ on:
 # commit (train.yml): a car stacked on the train runs beside the train's own run, and tools/train.py stops
 # the runs of a train it cuts again. The run a landed train starts on main is main's.
 concurrency:
-  group: build-${{ github.event.pull_request.number || ((github.event_name == 'push' || inputs.mode == 'main') && 'main') || (github.ref == 'refs/heads/train' && format('train-{0}', github.sha)) || github.run_id }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
+  group: build-${{ github.event.pull_request.number || ((github.event_name == 'push' || inputs.mode == 'main') && github.ref_name) || (github.ref == 'refs/heads/train' && format('train-{0}', github.sha)) || github.run_id }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/train' }}
 
 # The token each job gets reads the code, and no more (11-02 audit L5): a job that needs more says so (`plan`, `red`).
@@ -88,6 +92,7 @@ jobs:
       site: ${{ steps.plan.outputs.site }}
       web: ${{ steps.plan.outputs.web }}
       forms: ${{ steps.plan.outputs.forms }}
+      dbt: ${{ steps.plan.outputs.dbt }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -136,7 +141,8 @@ jobs:
             base=$(git log -1 --format=%B | sed -n 's/^Train-Base: //p')
             if [ -n "$base" ] && git fetch -q --depth 1 origin "$base"; then files=$(git diff --name-only "$base" HEAD); else files=ALL; fi
           elif [ "$event" = push ]; then
-            base=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?branch=main&status=success&per_page=10" --jq '[.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")][0].head_sha // empty') || base=
+            # (main's, or a release branch's own: each builds on its own)
+            base=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?branch=${GITHUB_REF_NAME//\//%2F}&status=success&per_page=10" --jq '[.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")][0].head_sha // empty') || base=
             if [ "$base" = "$GITHUB_SHA" ]; then base=$(git rev-parse HEAD^1); fi # (a passed run started again)
             if [ -n "$base" ] && git fetch -q --depth 1 origin "$base"; then files=$(git diff --name-only "$base" HEAD); else files=ALL; fi
           else
@@ -205,6 +211,8 @@ jobs:
           # module is built for it too, beside linux-x64's build)
           forms=false
           if has "$bin|$pkg|^web/|^tests/forms/|^docs/forms\.json\$|^tools/(forms_check\.py|page_serve\.mjs|slt_check\.py|harness\.py)\$|$self"; then forms=true; web=true; fi
+          dbt=false # (dbt's adapter suite on the dbt adapter, python/dbt-pondra: whenever the program or the adapter changes)
+          if has "$bin|^python/dbt-pondra/|$self"; then dbt=true; fi
           if [ "$FULL" = true ] && has '^(deploy/|install\.(sh|ps1)$|src/service\.rs$|tools/(image|deploy_check|distribute|sign|package)\.py$|tools/ci_(artifact|build)\.sh$|\.github/workflows/(deploy|deploy-check|build)\.yml$)'; then deploy=true; fi
           if [ "$FULL" = true ] && { [ "$code" = true ] || [ "$deploy" = true ]; }; then full=true; fi
           upgrade=false; resilience=false; sharing=false; sso=false
@@ -218,12 +226,12 @@ jobs:
             if has '^(src/(sso|sso_flow|users|auth|pg|flight|kafka|tls|server|dbserver|project)\.rs$|src/console/(core|settings|sso)\.js$|python/pondra/client\.py$|js/index\.js$|tools/fake_idp\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sso|build)\.yml$)'; then sso=true; fi
           fi
           binary=false
-          if [ "$event" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ] || [ "$forms" = true ]; then binary=true; fi
+          if [ "$event" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ] || [ "$forms" = true ] || [ "$dbt" = true ]; then binary=true; fi
           suite=$(jq -nc --argjson h "$harness" --argjson d "$docs" '{include: ((if $h then [range(1; 6) | {part: "harness, \(.) of 5", shard: "\(.)/5"}] else [] end) + (if $d then [{part: "frames, console, docs, failover"}] else [] end))}')
-          printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\nweb=%s\nforms=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
-            "$binary" "$unit" "$docs" "$suite" "$site" "$web" "$forms" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
+          printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\nweb=%s\nforms=%s\ndbt=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
+            "$binary" "$unit" "$docs" "$suite" "$site" "$web" "$forms" "$dbt" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
           runs=
-          for k in binary full unit harness docs site web forms upgrade resilience sharing sso deploy; do
+          for k in binary full unit harness docs site web forms dbt upgrade resilience sharing sso deploy; do
             if [ "${!k}" = true ]; then runs="$runs $k"; fi
           done
           echo "Runs:${runs:- nothing (no check reads what this changes)}$([ "$files" != ALL ] || echo ' (everything: started by hand, or no passed run of main found)')." >> "$GITHUB_STEP_SUMMARY"
@@ -372,6 +380,9 @@ jobs:
             cargo build --profile dist --target ${{ matrix.target }} --workspace
           fi
       - run: python tools/smoke.py "$BIN" # (on this OS: the shell, SQL, and memory read without /proc)
+      - name: The program within its size budget # (tools/size_check.py: its bytes as shipped and its download, against tools/size-budget.txt; a change that needs more raises the budget there, saying why)
+        if: matrix.platform == 'linux-x64' && needs.plan.outputs.profile == 'dist'
+        run: python tools/size_check.py --bin "$BIN" --platform linux-x64
       - name: A node in this process, from Python and JavaScript # (tools/inprocess_check.py: connect() with nothing on disk, 50 opens and closes, a fork, the library's ABI)
         if: matrix.platform == 'linux-x64'
         run: python tools/inprocess_check.py --bin "$BIN" --lib "$(dirname "$BIN")/libpondra_lib.so"
@@ -383,28 +394,30 @@ jobs:
         run: python tools/startup_order.py check --bin "$BIN" --lib "$(dirname "$BIN")/libpondra_lib.so" --most-mb 31
       # Signed before it is packaged, so every package holds the signed binary: with the certificates' secrets
       # (ADR-041 §8), a step that says so and does nothing until they are set (signed binaries come after 1.0)
-      # (only a run of main's own code gets them, a push's or one started by hand on main: a pull request's run, the train's,
+      # (only a run of main's or a release branch's own code gets them, a push's or one started by hand there: a pull request's run, the train's,
       # or one started by hand on another branch never does, as its tools/sign.py is that branch's (11-02 audit L5); signing in
       # a job of its own is after 1.0)
       - name: Signed (macOS, Windows), when the certificates are set
         if: startsWith(matrix.platform, 'macos') || startsWith(matrix.platform, 'windows')
         env:
-          APPLE_CERTIFICATE: ${{ github.ref == 'refs/heads/main' && secrets.APPLE_CERTIFICATE || '' }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ github.ref == 'refs/heads/main' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
-          APPLE_API_KEY: ${{ github.ref == 'refs/heads/main' && secrets.APPLE_API_KEY || '' }}
-          APPLE_API_KEY_ID: ${{ github.ref == 'refs/heads/main' && secrets.APPLE_API_KEY_ID || '' }}
-          APPLE_API_ISSUER: ${{ github.ref == 'refs/heads/main' && secrets.APPLE_API_ISSUER || '' }}
-          WINDOWS_CERTIFICATE: ${{ github.ref == 'refs/heads/main' && secrets.WINDOWS_CERTIFICATE || '' }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ github.ref == 'refs/heads/main' && secrets.WINDOWS_CERTIFICATE_PASSWORD || '' }}
+          APPLE_CERTIFICATE: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_API_KEY: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.APPLE_API_KEY || '' }}
+          APPLE_API_KEY_ID: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.APPLE_API_KEY_ID || '' }}
+          APPLE_API_ISSUER: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.APPLE_API_ISSUER || '' }}
+          WINDOWS_CERTIFICATE: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.WINDOWS_CERTIFICATE || '' }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.WINDOWS_CERTIFICATE_PASSWORD || '' }}
         run: python tools/sign.py "$BIN"
       # The pip and npm packages and the installers' archive, installed and tried as on a user's
       # machine: packaging that breaks on an OS (npm is npm.cmd on Windows) shows on a push.
       - run: python tools/package.py --bin "$BIN" --platform ${{ matrix.platform }} --npm-main --out dist && bash tools/try_packages.sh ${{ matrix.platform }}
-      - name: The Linux wheel on glibc 2.17 (CentOS 7) and on Ubuntu 22.04
+      - name: The Linux wheel on glibc 2.17 (CentOS 7) under Python 3.9 and 3.11, and on Ubuntu 22.04
         if: matrix.platform == 'linux-x64' && needs.plan.outputs.profile == 'dist'
+        # (3.9: the oldest Python python/pyproject.toml's requires-python claims, so the claim is tried, not assumed.
+        # Each Python goes first on PATH, so the node's `--python auto` finds the one the wheel went into.)
         run: |
           docker run --rm -v "$PWD":/w -w /w quay.io/pypa/manylinux2014_x86_64 bash -c \
-            "/opt/python/cp311-cp311/bin/python -m pip install -q --only-binary=:all: dist/*.whl 'pyarrow<19' && /opt/python/cp311-cp311/bin/python tools/package_check.py"
+            "set -e; for py in cp39-cp39 cp311-cp311; do export PATH=/opt/python/\$py/bin:\$PATH; python -m pip install -q --only-binary=:all: dist/*.whl 'pyarrow<19'; python tools/package_check.py; done"
           docker run --rm -v "$PWD":/w -w /w ubuntu:22.04 bash -c \
             "apt-get update -qq && apt-get install -y -qq python3-pip > /dev/null && pip install -q dist/*.whl pyarrow && python3 tools/package_check.py"
       - name: The release's npm publish, tried (--dry-run, with the npm the release uses)
@@ -605,6 +618,30 @@ jobs:
           path: forms.json
           if-no-files-found: ignore
 
+  # The dbt adapter (python/dbt-pondra) under dbt's own adapter suite, on Python 3.10, the oldest its pyproject.toml
+  # claims, against linux-x64's binary: the claim tried, not assumed (about two minutes).
+  dbt:
+    needs: [plan, linux]
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.plan.outputs.dbt == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.plan.outputs.packages }}-linux-x64
+          path: dist
+      - name: linux-x64's binary
+        run: mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
+      - run: pip install ./python/dbt-pondra dbt-tests-adapter pytest && pip list | grep -i '^dbt'
+      - name: dbt's adapter suite on a node
+        env:
+          PONDRA_BIN: ${{ github.workspace }}/bin/pondra
+        run: cd python/dbt-pondra && python -m pytest -q tests
+
   # The tests of what the build made, each a workflow of its own (which also runs by hand), called
   # once linux-x64's build is done (deploy's once every platform's is). A test that waited for the
   # packages inside its own job held a runner all that time, and enough of them held every runner
@@ -649,7 +686,7 @@ jobs:
   # its lane looks, so a platform that only main builds (the pull request merged on Linux alone) is
   # fixed at once, by whoever merged it. Also in the run's summary, and as an error.
   red:
-    needs: [plan, site, web, forms, linux, build, unit, host, suite, resilience, upgrade, sharing, sso, deploy]
+    needs: [plan, site, web, forms, dbt, linux, build, unit, host, suite, resilience, upgrade, sharing, sso, deploy]
     if: ${{ always() && needs.plan.outputs.event == 'push' && contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-24.04
     permissions:
@@ -665,11 +702,11 @@ jobs:
           failed=$(gh api "repos/$r/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" --jq '.jobs[] | select(.conclusion == "failure") | "- [\(.name)](\(.html_url))"')
           # (main runs only its newest commit, so a run may hold several merges: those since the
           # last run that ran, each said on its pull request once)
-          prev=$(gh api "repos/$r/actions/workflows/build.yml/runs?branch=main&per_page=30" --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and (.event == \"push\" or .event == \"workflow_dispatch\") and .conclusion != \"cancelled\" and .conclusion != \"skipped\")][0].head_sha // empty" || true)
+          prev=$(gh api "repos/$r/actions/workflows/build.yml/runs?branch=${GITHUB_REF_NAME//\//%2F}&per_page=30" --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and (.event == \"push\" or .event == \"workflow_dispatch\") and .conclusion != \"cancelled\" and .conclusion != \"skipped\")][0].head_sha // empty" || true)
           shas=$([ -n "$prev" ] && gh api "repos/$r/compare/$prev...$GITHUB_SHA" --jq '.commits[].sha' || echo "$GITHUB_SHA")
           prs=$(for s in $shas; do gh api "repos/$r/commits/$s/pulls" --jq '.[0].number // empty' || true; done | sort -un)
           held=$([ "$(wc -w <<< "$prs")" -lt 2 ] || printf ' This run holds the merges of%s (main builds only its newest commit): the one that broke it fixes it.' "$(printf ' #%s' $prs)")
-          body=$(printf "Main's build of %s failed:\n\n%s\n\nThe lane that merged it fixes this next, before other work: a pull request merges on Linux's CI alone, and main builds the other platforms.%s\n" "${GITHUB_SHA:0:7}" "$failed" "$held")
+          body=$(printf "The build of %s on %s failed:\n\n%s\n\nThe lane that merged it fixes this next, before other work: a pull request merges on Linux's CI alone, and %s builds the other platforms.%s\n" "${GITHUB_SHA:0:7}" "$GITHUB_REF_NAME" "$failed" "$GITHUB_REF_NAME" "$held")
           echo "$body" >> "$GITHUB_STEP_SUMMARY"
           for p in $prs; do gh api "repos/$r/issues/$p/comments" -f body="$body" > /dev/null && echo "Said on #$p."; done
-          echo "::error title=main is red::$(tr '\n' ' ' <<< "$failed")"
+          echo "::error title=$GITHUB_REF_NAME is red::$(tr '\n' ' ' <<< "$failed")"

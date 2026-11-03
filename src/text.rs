@@ -1,6 +1,9 @@
 //! SQL as text: names as SQL resolves them, a table's name inside the lake, a statement written back.
 use anyhow::{bail, ensure, Result};
 use datafusion::sql::sqlparser::ast::{self, Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, Statement, Value};
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::keywords::Keyword;
+use datafusion::sql::sqlparser::tokenizer::{Location, Span, Token, Tokenizer};
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
@@ -375,9 +378,121 @@ impl<F: FnMut(&mut SelectItem)> ast::VisitorMut for Items<F> {
     }
 }
 
+/// A text's tokens as sqlparser's generic dialect reads them, whitespace and comments among them, each with the bytes it
+/// covers (`start[i]..end[i]`, one after the other, so a text edited between tokens keeps the rest as written). What the
+/// front's passes and every other look at a statement's words read (`tokens`), so none tokenizes on its own.
+pub(crate) struct Tokens {
+    pub(crate) toks: Vec<Token>,
+    pub(crate) start: Vec<usize>,
+    pub(crate) end: Vec<usize>,
+}
+
+/// A token that is neither whitespace nor a comment, with its bytes (`Tokens::solid`).
+#[derive(Clone, Copy)]
+pub(crate) struct Solid<'a> {
+    pub(crate) token: &'a Token,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+impl Tokens {
+    /// The tokens that are neither whitespace nor a comment, in order: a word's neighbours are the next ones.
+    pub(crate) fn solid(&self) -> Vec<Solid<'_>> {
+        (0..self.toks.len()).filter(|&i| !matches!(self.toks[i], Token::Whitespace(_))).map(|i| Solid { token: &self.toks[i], start: self.start[i], end: self.end[i] }).collect()
+    }
+
+    /// The tokens `solid` gives, without their places.
+    pub(crate) fn solid_refs(&self) -> Vec<&Token> { self.toks.iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect() }
+
+    /// The tokens `solid` gives, copied, for a look that keeps them.
+    pub(crate) fn solid_tokens(&self) -> Vec<Token> { self.toks.iter().filter(|t| !matches!(t, Token::Whitespace(_))).cloned().collect() }
+
+    /// The next token after `i` that is neither whitespace nor a comment (or the count of them all).
+    pub(crate) fn next(&self, i: usize) -> usize { (i + 1..self.toks.len()).find(|&j| !matches!(self.toks[j], Token::Whitespace(_))).unwrap_or(self.toks.len()) }
+
+    /// Is token `i` the unquoted keyword `k`.
+    pub(crate) fn word(&self, i: usize, k: Keyword) -> bool { matches!(self.toks.get(i), Some(Token::Word(w)) if w.keyword == k && w.quote_style.is_none()) }
+}
+
+// (the last texts' tokens: kept as the parses are, `parsed::kept`; a per-node static, so a node's stop lets them go. An
+// interim: the redesign's step 8 has the statement's own context carry its parse and tokens through the pipeline's phases,
+// and this static and `parsed::LAST` go then, so step 2's sweep of node statics leaves them to it)
+crate::per_node!(static TOKENS: std::sync::Mutex<std::collections::VecDeque<(String, Option<std::sync::Arc<Tokens>>)>> = std::sync::Mutex::new(std::collections::VecDeque::new()));
+
+/// `sql`'s tokens (None: the tokenizer refuses it, an unclosed string), tokenized once while it is among the last few
+/// texts asked for: the front's passes over one statement, and the looks after them, share them.
+pub(crate) fn tokens(sql: &str) -> Option<std::sync::Arc<Tokens>> {
+    if sql.len() > crate::parsed::LONGEST {
+        return tokenized(sql).map(std::sync::Arc::new); // (a bulk INSERT's rows: tokenized each time, as they are parsed)
+    }
+    crate::parsed::kept(&TOKENS, sql, |sql| tokenized(sql).map(std::sync::Arc::new))
+}
+
+fn tokenized(sql: &str) -> Option<Tokens> {
+    let spans = Tokenizer::new(&GenericDialect {}, sql).tokenize_with_location().ok()?;
+    let at = Offsets::of(sql);
+    let mut t = Tokens { toks: Vec::with_capacity(spans.len()), start: Vec::with_capacity(spans.len()), end: Vec::with_capacity(spans.len()) };
+    for s in spans {
+        t.start.push(at.byte(&s.span.start));
+        t.end.push(at.byte(&s.span.end)); // (a span's end is just past its token)
+        t.toks.push(s.token);
+    }
+    Some(t)
+}
+
+/// Bytes for the places sqlparser gives tokens and nodes: lines from 1, columns from 1 counted in characters.
+pub(crate) struct Offsets<'a> {
+    pub(crate) sql: &'a str,
+    lines: Vec<usize>,
+    ascii: bool, // (a column is then a byte: no line is walked for it)
+}
+
+impl<'a> Offsets<'a> {
+    pub(crate) fn of(sql: &'a str) -> Self { Offsets { sql, lines: std::iter::once(0).chain(sql.match_indices('\n').map(|(i, _)| i + 1)).collect(), ascii: sql.is_ascii() } }
+
+    /// The byte at `l`: the text's end for a place just past its last character.
+    pub(crate) fn byte(&self, l: &Location) -> usize {
+        let start = self.lines.get(l.line.saturating_sub(1) as usize).copied().unwrap_or(self.sql.len());
+        let column = l.column.saturating_sub(1) as usize;
+        match self.ascii {
+            true => (start + column).min(self.sql.len()),
+            false => self.sql[start..].char_indices().nth(column).map_or(self.sql.len(), |(i, _)| start + i),
+        }
+    }
+
+    /// A node's span as bytes, None when the parser gave it none.
+    pub(crate) fn range(&self, s: Span) -> Option<(usize, usize)> {
+        (s != Span::empty() && s.start.line > 0).then(|| (self.byte(&s.start), self.byte(&s.end))).filter(|(a, b)| a < b)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_texts_tokens_cover_it_one_after_the_other_as_the_tokenizer_reads_them() {
+        let texts = ["SELECT a, b FROM t WHERE c = 'x' -- a comment\n  AND d > 1", "SELECT 'é',\n\t\"Ünïcode\" /* ü\nö */ FROM t;  ", "x", "", "SELECT $1, e'\\n' || 'a''b'"];
+        for sql in texts {
+            let t = tokens(sql).expect("tokenized");
+            let want = Tokenizer::new(&GenericDialect {}, sql).tokenize().expect("tokenized");
+            assert_eq!(t.toks, want, "{sql}");
+            assert_eq!(t.start.first().copied().unwrap_or(0), 0, "{sql}");
+            for i in 0..t.toks.len() {
+                let next = t.start.get(i + 1).copied().unwrap_or(sql.len());
+                assert_eq!(t.end[i], next, "{sql}: token {i} ({:?}) ends where the next starts", t.toks[i]);
+                if let Token::Word(w) = &t.toks[i] {
+                    assert!(sql[t.start[i]..t.end[i]].contains(w.value.as_str()), "{sql}: {:?} at {}..{}", w, t.start[i], t.end[i]);
+                }
+            }
+            assert!(std::sync::Arc::ptr_eq(&t, &tokens(sql).expect("kept")), "{sql}: asked again, the same tokens");
+        }
+        assert!(tokens("SELECT 'unclosed").is_none());
+        let solid: Vec<String> = tokens("SELECT /* c */ a ,b").expect("tokenized").solid().iter().map(|s| s.token.to_string()).collect();
+        assert_eq!(solid, ["SELECT", "a", ",", "b"]);
+        let long = format!("SELECT '{}'", "x".repeat(crate::parsed::LONGEST));
+        assert_eq!(tokens(&long).expect("tokenized").toks.len(), 3, "a text past LONGEST is tokenized, not kept");
+    }
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 
     /// `sql` as one statement, read by the generic dialect (the SQL these tests use is plain).

@@ -404,7 +404,7 @@ from third-party summit recaps; check them before relying on them.
   Fluss.
 - **SQL and types:** VARIANT (2.1), process table functions, `FROM_CHANGELOG` / `TO_CHANGELOG`
   (2.3). Pondra has `VARIANT` as JSON text with `json_get` and `->>`.
-- **The threat:** Flink plus Fluss is becoming a streamhouse stack of two mature projects —
+- **The threat:** Flink plus Fluss is becoming a Streamhouse stack of two mature projects —
   log, keyed tables, lake and low-state joins. Pondra's answer is to be that stack in one
   binary: faster to adopt and cheaper to run.
 

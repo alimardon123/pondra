@@ -242,12 +242,11 @@ fn plan_id(plan: &Arc<dyn ExecutionPlan>) -> String {
 /// words before hashing with its strings kept as written (a string can name a relation: `FROM 'a.parquet'` reads that
 /// file) and each number `?` (a number names none): statements of one shape differ only in their numbers.
 fn prints(sql: &str) -> Option<(String, String)> {
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
-    let tokens = Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?;
+    use datafusion::sql::sqlparser::tokenizer::Token;
+    let tokens = crate::text::tokens(sql)?;
     let (mut words, mut shape): (Vec<String>, Vec<String>) = (vec![], vec![]);
-    for t in tokens {
-        let (word, written) = match &t {
-            Token::Whitespace(_) => continue,
+    for t in tokens.solid_refs() {
+        let (word, written) = match t {
             Token::Number(..) => ("?".to_string(), None),
             Token::SingleQuotedString(_) | Token::NationalStringLiteral(_) | Token::EscapedStringLiteral(_) | Token::HexStringLiteral(_) | Token::DollarQuotedString(_) | Token::SingleQuotedByteStringLiteral(_) | Token::DoubleQuotedByteStringLiteral(_) => ("?".to_string(), Some(t.to_string())),
             Token::Word(w) if w.quote_style.is_none() => (w.value.to_lowercase(), None),
