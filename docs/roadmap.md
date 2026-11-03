@@ -124,9 +124,12 @@ Depth by evidence, then the platform on top, each a part behind a small surface 
   - Key-range views place their slots by load: each slot's owner is picked by its measured rows a second, moves are
     delayed and capped a minute, and a node that is leaving hands its slots away before it stops.
 - **F, commits on a local folder** (`reviews/writes-vs-postgres-2026-11-02.md`; the flush of each write, added 10-31,
-  stays): the folder's log appended to one file it keeps open and flushed once a commit (`fdatasync`), as Postgres's
-  WAL is, instead of a new file a commit (three changes to the folder and two flushes each); buckets keep one object a
-  flush. Then group commit: a transaction's COMMIT, and an autocommitted UPDATE or DELETE, checks and queues its flush
+  stays): the folder's log appended to one file it keeps open and preallocated, flushed once a commit (`fdatasync`), as
+  Postgres's WAL is, instead of a new file a commit (three changes to the folder and two flushes each); buckets keep one
+  object a flush. The new file is also why a write slows as the lake grows: on disk a one-row write goes from about 3 ms
+  to 4-5 ms over 16 K rows, because creating the file waits on the file system's journal behind the node's own
+  background flushes (compaction, manifests, tiering, history), which an open file never does
+  (`reviews/pgbench-statements-2026-11-03.md`, L3 11-03). Then group commit: a transaction's COMMIT, and an autocommitted UPDATE or DELETE, checks and queues its flush
   under the lake's lock and waits for it outside, so commits of different rows share one flush, as plain INSERTs share
   one in the sequencer already. A check reads only what is visible, so it also checks the commits still in flight: their
   keys, and their tables' UNIQUE values (ADR-057). pgbench at scale 1 gains nothing from it (every transaction updates
