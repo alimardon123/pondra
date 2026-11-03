@@ -10853,6 +10853,21 @@ def users():
         tok["token"].startswith("pt_") and by_token == [{"salary": 100.0}] and expired.startswith("ERROR 401") and by_session == [{"item": "tea"}] \
         and tampered.startswith("ERROR 401") and ended.startswith("ERROR 401") and dropped_token.startswith("ERROR 401") \
         and "pt_" not in json.dumps(as_(A.port, boss, "SELECT * FROM pondra.users"))
+    # A session ends when its user's password changes, on every node, or when the user is dropped and made again, as a
+    # Postgres connection does (before, it signed in for its 12 hours whatever the password became)
+    as_(A.port, boss, "CREATE USER dee PASSWORD 'dee-password-1'")
+    dee = lambda pw: "Bearer " + as_(A.port, None, json.dumps({"user": "dee", "password": pw}), path="/login")["token"]
+    first = dee("dee-password-1")
+    kept = until(lambda: as_(A.port + 1, first, "SELECT 1 AS x"), [{"x": 1}], 10)
+    as_(A.port, boss, "ALTER USER dee PASSWORD 'dee-password-2'")
+    time.sleep(1.5)  # (a follower's users as of a second ago)
+    second = dee("dee-password-2")
+    after_change = [as_(port, first, "SELECT 1 AS x") for port in (A.port, A.port + 1)] + [as_(A.port + 1, second, "SELECT 1 AS x")]
+    as_(A.port, boss, "DROP USER dee")
+    as_(A.port, boss, "CREATE USER dee PASSWORD 'dee-password-2'")
+    remade = as_(A.port, second, "SELECT 1 AS x")
+    checks["a session ends when its user's password changes, on every node, or when the user is dropped and made again"] = \
+        kept == [{"x": 1}] and all(str(r).startswith("ERROR 401") for r in after_change[:2]) and after_change[2] == [{"x": 1}] and str(remade).startswith("ERROR 401")
     # Postgres: SCRAM-SHA-256 (the verifier only), a token-only user's token as its password
     pg = lambda u, p, q: psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user={u} password={p} dbname=lake", connect_timeout=10).execute(q).fetchall()
     tok2 = as_(A.port, boss, "CREATE TOKEN pg FOR USER svc")["token"]
