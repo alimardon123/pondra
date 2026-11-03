@@ -64,7 +64,7 @@ pub fn door(meta: &TableMeta, table: &str) -> Result<()> {
 /// this table (`How::Insert`), so no two of them give one key, and that test isn't made again.
 pub async fn check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&RecordBatch>, new: Option<&RecordBatch>, plain: bool, shaped: bool) -> Result<()> {
     let Some(new) = new.filter(|n| n.num_rows() > 0) else { return Ok(()) };
-    let named = meta.logical();
+    let named = meta.logical_ref();
     if plain && key_checked(meta) {
         key_check(lake, table, meta, old, new, shaped).await?;
     }

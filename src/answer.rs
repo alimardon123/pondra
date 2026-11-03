@@ -14,22 +14,56 @@ use datafusion::prelude::{ident, DataFrame};
 use serde_json::{json as j, Value};
 use std::sync::Arc;
 
-pub fn content_type(format: Option<&str>) -> &'static str {
-    match format {
-        Some("table") => "text/plain",
-        Some("arrow") => "application/vnd.apache.arrow.stream",
-        Some("csv") => "text/csv; charset=utf-8",
-        Some("tsv") => "text/tab-separated-values; charset=utf-8",
-        Some("ndjson") => "application/x-ndjson",
-        Some("parquet") => "application/vnd.apache.parquet",
-        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        _ => "application/json",
-    }
+// ---------------------------------------------------------------- the formats
+//
+// Each format an answer is sent in is one entry: its name (`?format=`), its content type, how a piece of it is written
+// when it is sent in pieces, and how the whole answer is written. A door asks `format` for the entry by name; the
+// registry (redesign step 1f) takes the list over, so an extension adds a format by adding an entry.
+
+/// One answer format.
+pub struct Format {
+    /// What `?format=` names it.
+    pub name: &'static str,
+    pub content_type: &'static str,
+    /// How a piece of it is written (`Encoding`); none for a format rendered whole: a text table, a typed answer, a
+    /// Parquet or an Excel file is one thing to its reader.
+    shape: Option<Shape>,
+    /// The whole answer's bytes, from its parts.
+    whole: Encode,
 }
 
-/// The formats an answer can be sent in pieces of (the others are rendered whole: a table, a typed
-/// answer, a Parquet or an Excel file is one thing to the reader).
-pub fn streams(format: Option<&str>) -> bool { !matches!(format, Some("table" | "typed" | "parquet" | "xlsx")) }
+/// An answer's bytes from its parts: its schema, its rows and its status. These are the parts of step 8's answer
+/// stream, so the stream takes the entries as they are.
+type Encode = fn(&SchemaRef, &[RecordBatch], &Status) -> Result<Vec<u8>>;
+
+/// What an answer says besides its rows. Step 8's stream adds what a statement that isn't a query says (the rows it
+/// changed, its notices, its tag); today it says where a typed answer's rows are kept for its later pages.
+pub struct Status {
+    pub keep: Keep,
+}
+
+/// The formats, JSON first: an answer is JSON when no format is named, or one this build doesn't have.
+const FORMATS: &[Format] = &[
+    Format { name: "json", content_type: "application/json", shape: Some(Shape::Json), whole: |_, b, _| json(b) },
+    Format { name: "table", content_type: "text/plain", shape: None, whole: |_, b, _| Ok(pretty_format_batches(b)?.to_string().into_bytes()) },
+    Format { name: "typed", content_type: "application/json", shape: None, whole: |_, b, status| typed(b, SHOWN, status.keep) },
+    Format { name: "arrow", content_type: "application/vnd.apache.arrow.stream", shape: Some(Shape::Arrow), whole: |_, b, _| arrow_stream(b) },
+    Format { name: "csv", content_type: "text/csv; charset=utf-8", shape: Some(Shape::Csv(b',')), whole: |_, b, _| csv(b, b',') },
+    Format { name: "tsv", content_type: "text/tab-separated-values; charset=utf-8", shape: Some(Shape::Csv(b'\t')), whole: |_, b, _| csv(b, b'\t') },
+    Format { name: "ndjson", content_type: "application/x-ndjson", shape: Some(Shape::Lines), whole: |_, b, _| json_lines(b) },
+    Format { name: "parquet", content_type: "application/vnd.apache.parquet", shape: None, whole: |_, b, _| parquet(b) },
+    Format { name: "xlsx", content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", shape: None, whole: |_, b, _| crate::xlsx::workbook(b) },
+];
+
+/// The format `name`s (`?format=`): its entry, JSON's when none is named or this build has none of that name.
+pub fn format(name: Option<&str>) -> &'static Format {
+    name.and_then(|n| FORMATS.iter().find(|f| f.name == n)).unwrap_or(&FORMATS[0])
+}
+
+pub fn content_type(format: Option<&str>) -> &'static str { self::format(format).content_type }
+
+/// The formats an answer can be sent in pieces of (the others are rendered whole).
+pub fn streams(format: Option<&str>) -> bool { self::format(format).shape.is_some() }
 
 /// About how much Arrow a door sends at a time: at SF1, lineitem over HTTP comes in 0.98 s in pieces of 4 MB that take
 /// the batches a plan has ready together (`pieces`), against 1.22 s in pieces of 4 MB alone and 1.94 s in pieces of 1 MB.
@@ -105,13 +139,7 @@ enum Shape {
 
 impl Encoding {
     pub fn new(format: Option<&str>) -> Self {
-        let shape = match format {
-            Some("csv") => Shape::Csv(b','),
-            Some("tsv") => Shape::Csv(b'\t'),
-            Some("ndjson") => Shape::Lines,
-            Some("arrow") => Shape::Arrow,
-            _ => Shape::Json, // (as `render`: any other format is JSON)
-        };
+        let shape = self::format(format).shape.unwrap_or(Shape::Json); // (a format rendered whole goes in pieces as JSON)
         Encoding { shape, begun: false, rows: 0, arrow: None }
     }
 
@@ -272,38 +300,38 @@ pub type Keep = fn(&[RecordBatch]) -> Option<String>;
 /// Rows as `?format=` asks: JSON, a text table, or Arrow IPC (straight into pandas, Polars and
 /// DuckDB, no JSON parsing); or a file of them to download: CSV, TSV, NDJSON, Parquet, Excel.
 pub fn render(batches: &[RecordBatch], format: Option<&str>, keep: Keep) -> anyhow::Result<bytes::Bytes> {
-    Ok(bytes::Bytes::from(match format {
-        Some("table") => pretty_format_batches(batches)?.to_string().into_bytes(),
-        Some("typed") => typed(batches, SHOWN, keep)?,
-        Some("arrow") => {
-            // (the pieces a door sends an answer in, one after another: the same bytes as they make)
-            let mut enc = Encoding::new(Some("arrow"));
-            let mut out = vec![];
-            for piece in pieces(batches.iter().map(|b| enc.lean(b.clone()))) {
-                out = joined(out, enc.step(Some(&piece))?);
-            }
-            joined(out, enc.step(None)?)
-        }
-        Some(f @ ("csv" | "tsv")) => {
-            let mut w = datafusion::arrow::csv::WriterBuilder::new().with_header(true).with_delimiter(if f == "tsv" { b'\t' } else { b',' }).build(Vec::new());
-            for b in batches {
-                w.write(b)?;
-            }
-            w.into_inner()
-        }
-        Some("ndjson") => json_lines(batches)?,
-        Some("parquet") => {
-            let batches = batches.iter().map(storable).collect::<anyhow::Result<Vec<_>>>()?; // (intervals as text)
-            let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
-            let mut w = datafusion::parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, None)?;
-            for b in &batches {
-                w.write(b)?;
-            }
-            w.into_inner()?
-        }
-        Some("xlsx") => crate::xlsx::workbook(batches)?,
-        _ => json(batches)?,
-    }))
+    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
+    Ok(bytes::Bytes::from((self::format(format).whole)(&schema, batches, &Status { keep })?))
+}
+
+/// An Arrow stream: the pieces a door sends an answer in, one after another (the same bytes as they make).
+fn arrow_stream(batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    let mut enc = Encoding::new(Some("arrow"));
+    let mut out = vec![];
+    for piece in pieces(batches.iter().map(|b| enc.lean(b.clone()))) {
+        out = joined(out, enc.step(Some(&piece))?);
+    }
+    Ok(joined(out, enc.step(None)?))
+}
+
+/// CSV (or TSV, by its delimiter), with a header.
+fn csv(batches: &[RecordBatch], delimiter: u8) -> Result<Vec<u8>> {
+    let mut w = datafusion::arrow::csv::WriterBuilder::new().with_header(true).with_delimiter(delimiter).build(Vec::new());
+    for b in batches {
+        w.write(b)?;
+    }
+    Ok(w.into_inner())
+}
+
+/// A Parquet file of the rows (intervals as text: `storable`).
+fn parquet(batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    let batches = batches.iter().map(storable).collect::<Result<Vec<_>>>()?;
+    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
+    let mut w = datafusion::parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, None)?;
+    for b in &batches {
+        w.write(b)?;
+    }
+    Ok(w.into_inner()?)
 }
 
 /// The rows of an answer the console is sent at once, a page, unless it asks for another number
@@ -573,9 +601,26 @@ mod tests {
     }
 
     #[test]
+    fn each_format_is_one_entry_and_json_is_the_default() {
+        let names: Vec<&str> = FORMATS.iter().map(|f| f.name).collect();
+        assert!(names.iter().enumerate().all(|(i, n)| !names[..i].contains(n)), "a name twice: {names:?}");
+        assert_eq!(format(None).name, "json");
+        assert_eq!(format(Some("nope")).name, "json", "a format this build doesn't have is JSON, as before");
+        let streamed: Vec<&str> = FORMATS.iter().filter(|f| f.shape.is_some()).map(|f| f.name).collect();
+        assert_eq!(streamed, ["json", "arrow", "csv", "tsv", "ndjson"]);
+        assert_eq!(content_type(Some("typed")), "application/json");
+        assert_eq!(content_type(Some("csv")), "text/csv; charset=utf-8");
+        // (every format writes an answer with no rows, and one with rows)
+        for f in FORMATS {
+            render(&[], Some(f.name), |_| None).unwrap_or_else(|e| panic!("{}: no rows: {e}", f.name));
+            assert!(!render(&[sample(3)], Some(f.name), |_| None).unwrap().is_empty(), "{}", f.name);
+        }
+    }
+
+    #[test]
     fn pieces_are_the_whole() {
         let batch = sample(400_000);
-        for f in [None, Some("csv"), Some("tsv"), Some("ndjson"), Some("arrow")] {
+        for f in FORMATS.iter().filter(|f| f.shape.is_some()).map(|f| Some(f.name)).chain([None]) {
             // (cut as a door cuts them: the batch as its format sends it, in `pieces`)
             let parts = pieces([Encoding::new(f).lean(batch.clone())]);
             assert!(parts.len() > 1, "{f:?}: a piece is about PIECE of Arrow: {} pieces", parts.len());

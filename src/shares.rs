@@ -419,8 +419,8 @@ fn partitions_of(table: &str, meta: &TableMeta, asked: Vec<(String, String)>) ->
     if asked.is_empty() {
         return Ok(vec![]);
     }
-    let l = meta.logical();
-    let spec = l.partition.as_deref().with_context(|| format!("{table} has no partition_by: share it whole, or a materialized view of the rows"))?;
+    let partition = meta.sql_partition();
+    let spec = partition.as_deref().with_context(|| format!("{table} has no partition_by: share it whole, or a materialized view of the rows"))?;
     ensure!(!spec.contains('('), "{table} is partitioned by {spec}: a share takes partitions of a table partitioned by a column; a materialized view takes any rows");
     ensure!(meta.key.is_empty(), "{table} is keyed, and its rows move between partitions: share it whole, or a materialized view of the rows");
     asked.into_iter().map(|(c, v)| { ensure!(c == spec, "{table} is partitioned by {spec}, not {c}"); Ok(v) }).collect()

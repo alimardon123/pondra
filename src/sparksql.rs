@@ -27,7 +27,7 @@ pub fn inline(sql: &str) -> Result<String> {
     if !mentions(sql) {
         return Ok(sql.to_string());
     }
-    let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Ok(sql.to_string()) }; // (its own error later, as written)
+    let Ok(mut stmts) = crate::parsed::generic(sql) else { return Ok(sql.to_string()) }; // (its own error later, as written)
     let mut found = Found(false);
     if let ControlFlow::Break(e) = crate::walk::visit_mut(&mut stmts, &mut found) {
         return Err(e);

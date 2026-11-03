@@ -1,7 +1,10 @@
 name: fuzz
 
 # Each night, about 15 minutes of input nobody wrote (the PGX review's B2, 11-02: "a mechanism nobody runs is not
-# coverage"). Two checks on main's Linux build, both seeded with the date, so a night's run is repeated by its seed:
+# coverage"). Two checks on the Linux build of what ships next, both seeded with the date, so a night's run is repeated
+# by its seed (the head of `REF`: the release branch while a release is being made, as 0.80.0 is until 11-11 on
+# release/0.80, cut 11-03 while the redesign goes on on main; main again once it is out; a run started by hand tries
+# the branch it was started on):
 # - tools/random_sql.py, for 9 minutes: random queries over random tables, each answered by one node, by three
 #   (every tenth), by DuckDB 2.0 on the same rows, and split three ways by a random condition (SQLancer's oracles);
 # - tools/fuzz_doors.py, 24 s a door (2 minutes): malformed input at HTTP, SQL, Postgres, Kafka and Flight.
@@ -24,33 +27,42 @@ concurrency:
 
 env:
   GH_TOKEN: ${{ github.token }}
-  SHA: ${{ github.sha }}
+  REF: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || 'release/0.80' }}
 
 jobs:
   fuzz:
     name: random SQL and malformed input
     runs-on: ubuntu-24.04
-    timeout-minutes: 40 # (the build's packages are waited for: up to WAIT_MINUTES when main's own run is still going)
+    timeout-minutes: 45 # (the head's packages are waited for, up to 20 minutes, while its own build is still going)
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.REF }}
+          fetch-depth: 5 # (the head's build may have been stopped by a newer push: then an older commit's)
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: DuckDB and pyarrow (tools/requirements.txt's versions)
         run: pip install -q $(grep -E '^(duckdb|pyarrow)==' tools/requirements.txt | sed 's/ *#.*//')
-      - name: Main's Linux binary (the build workflow's)
-        env:
-          WAIT_MINUTES: "20"
+      - name: Its Linux binary (the build workflow's, for the branch's head or the newest commit that has one)
+        id: bin
         run: |
-          bash tools/ci_artifact.sh linux-x64 "$SHA"
-          mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
           echo "SEED=$(date -u +%Y%m%d)" >> "$GITHUB_ENV"
+          # (a branch builds only its newest commit: a run still going when a newer push came was stopped, and 11-03's
+          # first night waited 17 minutes for main's head and found nothing. The head is waited for, 20 minutes; the
+          # commits before it have built or never will, so each is asked once)
+          wait=20
+          for sha in $(git log -5 --format=%H); do
+            if WAIT_MINUTES=$wait bash tools/ci_artifact.sh linux-x64 "$sha"; then echo "$REF at $sha" && break; fi
+            wait=1
+          done
+          mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
       - name: Random queries against DuckDB, three nodes and partitions (9 minutes, seed = the date)
         env:
           PONDRA_BIN: ${{ github.workspace }}/bin/pondra
         run: python3 tools/random_sql.py --secs 540 --queries 100000000 --seed "$SEED" --out random.json
       - name: Malformed input at every door (24 s a door, seed = the date)
-        if: success() || failure() # (whatever the queries found)
+        if: (success() || failure()) && steps.bin.outcome == 'success' # (whatever the queries found)
         run: |
           mkdir -p "$RUNNER_TEMP/fuzz"
           set -o pipefail

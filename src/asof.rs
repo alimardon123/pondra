@@ -49,7 +49,7 @@ pub fn as_of(sql: &str) -> anyhow::Result<Cow<'_, str>> {
     if !sql.to_ascii_lowercase().contains("asof") {
         return Ok(Cow::Borrowed(sql));
     }
-    let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Ok(Cow::Borrowed(sql)) };
+    let Ok(mut stmts) = crate::parsed::generic(sql) else { return Ok(Cow::Borrowed(sql)) };
     fn name(t: &TableFactor) -> Option<String> {
         match t {
             TableFactor::Table { alias: Some(a), .. } | TableFactor::Derived { alias: Some(a), .. } => Some(a.name.value.to_lowercase()),

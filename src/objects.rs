@@ -737,7 +737,7 @@ async fn share_sql(lake: &Lake, name: &str, s: &crate::shares::Share) -> Result<
     for t in &s.tables {
         let mut add = format!("ALTER SHARE {} ADD TABLE {}", ident(name), name_sql(&t.table));
         if !t.partitions.is_empty() {
-            let column = lake.cat.meta(&table_key(&t.table)).await?.and_then(|m| m.logical().partition).unwrap_or_default();
+            let column = lake.cat.meta(&table_key(&t.table)).await?.and_then(|m| m.sql_partition()).unwrap_or_default();
             add += &format!(" PARTITION {}", t.partitions.iter().map(|v| format!("({} = {})", ident(&column), literal(v))).collect::<Vec<_>>().join(", "));
         }
         if (t.schema.as_str(), t.name.as_str()) != split(&t.table) {

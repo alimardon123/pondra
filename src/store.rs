@@ -289,18 +289,14 @@ impl TableMeta {
             return self.clone();
         }
         let n = |c: &String| self.name_of(c).to_string();
-        let partition = self.partition.as_ref().map(|p| match p.split_once('(') {
-            Some((f, c)) => format!("{f}({})", self.name_of(c.trim_end_matches(')'))),
-            None => self.name_of(p).to_string(),
-        });
         TableMeta {
-            columns: self.live().map(|(_, n, t)| (n.to_string(), t.to_string())).collect(),
-            key: self.key.iter().map(n).collect(),
+            columns: self.logical_columns(),
+            key: self.sql_key(),
             merge: self.merge.iter().map(|(c, f)| (n(c), f.clone())).collect(),
             cluster: self.cluster.iter().map(n).collect(),
             ttl: self.ttl.as_ref().map(|(c, s)| (n(c), *s)),
             order: self.order.as_ref().map(n),
-            partition,
+            partition: self.sql_partition(),
             not_null: self.in_sql_list(&self.not_null),
             defaults: self.in_sql(&self.defaults),
             identity: self.in_sql(&self.identity),
@@ -322,6 +318,17 @@ impl TableMeta {
         }
     }
 
+    /// The key under SQL's names, as `logical()` has it, without copying the entry.
+    pub fn sql_key(&self) -> Vec<String> { self.key.iter().map(|c| self.name_of(c).to_string()).collect() }
+
+    /// `partition_by` under SQL's names (`day(ts)`, or a column), as `logical()` has it, without copying the entry.
+    pub fn sql_partition(&self) -> Option<String> {
+        self.partition.as_ref().map(|p| match p.split_once('(') {
+            Some((f, c)) => format!("{f}({})", self.name_of(c.trim_end_matches(')'))),
+            None => self.name_of(p).to_string(),
+        })
+    }
+
     /// SQL's columns, as `logical()` has them, without copying the rest of the entry (its files).
     pub fn logical_columns(&self) -> Vec<(String, String)> {
         if !self.mapped() {
@@ -332,7 +339,7 @@ impl TableMeta {
 
     /// A per-column map, keyed by stored name, under the names SQL knows the columns by: the entries of dropped columns
     /// left out. `logical()` and `to_rules()` both map their fields through this, so a rename or a drop is mapped here.
-    fn in_sql<V: Clone>(&self, m: &BTreeMap<String, V>) -> BTreeMap<String, V> {
+    pub fn in_sql<V: Clone>(&self, m: &BTreeMap<String, V>) -> BTreeMap<String, V> {
         m.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, v)| (self.name_of(c).to_string(), v.clone())).collect()
     }
 
@@ -958,6 +965,24 @@ pub fn memory_limit() -> usize {
     crate::env::query_memory(|| ram().map_or(4 << 30, |r| r / 3))
 }
 
+crate::per_node!(
+    /// The node's line for query memory (`ledger::Ledger`), by its size: every lake the node opens shares it. (By size, so
+    /// a lake opened after the setting changed, or a test's with memory of its own, gets a line of its own.)
+    static LEDGERS: Mutex<HashMap<usize, Weak<crate::ledger::Ledger>>> = Default::default());
+
+/// A new lake's pool for its queries: its share of the node's line (`memory_limit`), which every lake of the node shares.
+fn lake_pool() -> Arc<crate::ledger::LakePool> {
+    let line = memory_limit();
+    let mut lines = LEDGERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    lines.retain(|_, l| l.strong_count() > 0);
+    let ledger = lines.get(&line).and_then(Weak::upgrade).unwrap_or_else(|| {
+        let made = crate::ledger::Ledger::new(line);
+        lines.insert(line, Arc::downgrade(&made));
+        made
+    });
+    ledger.pool()
+}
+
 /// A page's lake holds what the page's own pool does (`env::page_query_memory`, of its device's line): its memory is its
 /// line, not a machine's (`ram` is None there, and 4 GiB is past a 32-bit `usize`).
 #[cfg(target_arch = "wasm32")]
@@ -1443,7 +1468,7 @@ impl Lake {
         let (url, store, bucket) = open_store(url)?;
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
         let local = bucket.is_none() || memory;
-        let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(memory_limit()));
+        let pool = lake_pool();
         // (spills go to `spill_disk`; no listing kept past its statement: DataFusion's own cache of
         // them would hide a file added to a folder outside the lake, ADR-026)
         // (Parquet footers and files' statistics kept by caches of our own, so `cached_bytes` can say
@@ -1767,8 +1792,13 @@ impl Lake {
         ctx
     }
 
-    /// Query memory in use, and the limit.
-    pub fn memory(&self) -> (usize, usize) { (self.rt.memory_pool.reserved(), memory_limit()) }
+    /// Query memory in use on the node's line, every lake's together, and the line (`ledger::Ledger`).
+    pub fn memory(&self) -> (usize, usize) {
+        match self.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>() {
+            Some(pool) => (pool.ledger().reserved(), pool.ledger().line()),
+            None => (self.rt.memory_pool.reserved(), memory_limit()),
+        }
+    }
 
     /// What each of the node's bounded caches holds now, in bytes (`/metrics`' `cache_bytes`): what
     /// fills up to its limit is not memory the node is losing (`tools/soak.py`).
@@ -3499,6 +3529,30 @@ mod tests {
         Ok(())
     }
 
+    /// Two lakes a node opens share its one line for query memory (`ledger::Ledger`): each lake's pool is its share of
+    /// it, and each lake's `memory` reads the line and what every lake holds on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_lakes_of_a_node_share_its_one_line_for_queries() -> Result<()> {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        let dirs = [0, 1].map(|_| std::env::temp_dir().join(format!("pondra-ledger-{}", uuid::Uuid::new_v4())));
+        let a = Lake::open(dirs[0].to_str().unwrap(), true, false).await?;
+        let b = Lake::open(dirs[1].to_str().unwrap(), true, false).await?;
+        let ledger = |l: &Lake| l.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
+        assert!(Arc::ptr_eq(&ledger(&a), &ledger(&b)), "one line for both");
+        let held = MemoryConsumer::new("a test's").register(&a.rt.memory_pool);
+        held.try_grow(1 << 20)?;
+        // (other tests' lakes may hold some of the same line meanwhile: what a holds is the least it reads)
+        assert_eq!(b.memory().1, memory_limit());
+        assert!(b.memory().0 >= 1 << 20, "a's reservation counts on the line b reads");
+        assert_eq!(b.rt.memory_pool.reserved(), 0, "and not in b's own pool");
+        drop(held);
+        for (lake, dir) in [a, b].into_iter().zip(&dirs) {
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        Ok(())
+    }
+
     /// A lake a process opens to write (a backup taken in it: `backup::take_here`) is let go with its
     /// last handle: the loops `Lake::open` starts hold it weakly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3787,7 +3841,7 @@ mod tests {
     /// The one column list (redesign step 1b) agrees with the order the entry's own fields gave before it, for any mix
     /// of renames, drops and moves: SQL's order, ids as stored places + 1, a renamed column's stored name kept, and
     /// dropped columns marked, last. `star` and `sql_names` are the list's, a keyed table's markers out, and the same of
-    /// `logical()`'s copy. `cols()` makes it once per parse, and a clone's memo is empty.
+    /// `logical()`'s copy; `sql_key`, `sql_partition` and `logical_columns` are its fields. `cols()` makes it once per parse, and a clone's memo is empty.
     #[test]
     fn the_column_list_is_the_entrys_columns_in_sqls_order() {
         // (the order as `in_order` made it before the list: `shown`'s columns, then the rest as stored, the dropped out)
@@ -3821,6 +3875,11 @@ mod tests {
             if keyed {
                 m.key = vec!["c0".into()];
             }
+            m.partition = match next(3) {
+                0 => Some(format!("day(c{})", next(n as u64))),
+                1 => Some(format!("c{}", next(n as u64))),
+                _ => None,
+            };
             let n = m.columns.len();
             // (`shown`: some of the columns, each once, in any order, dropped ones among them)
             let mut shown: Vec<String> = (0..n).filter(|_| next(2) == 0).map(|i| format!("c{i}")).collect();
@@ -3839,6 +3898,7 @@ mod tests {
             assert_eq!(m.sql_names(), sql.iter().filter(|c| *c != "_deleted").cloned().collect::<Vec<_>>());
             let l = m.logical();
             assert_eq!((l.star(), l.sql_names(), l.sql_order()), (m.star(), m.sql_names(), m.sql_order()), "the same of the logical copy");
+            assert_eq!((m.sql_key(), m.sql_partition(), m.logical_columns()), (l.key.clone(), l.partition.clone(), l.columns.clone()), "a field without the copy");
             for c in list.all() {
                 assert_eq!(m.columns[c.id as usize - 1].0, c.stored, "an id is a stored place + 1");
                 assert_eq!((c.name.as_str(), c.dropped), (m.name_of(&c.stored), m.dropped.contains(&c.stored)));

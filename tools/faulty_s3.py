@@ -197,7 +197,7 @@ class Faulty:
             u = urllib.parse.urlsplit(h.path)
             with self.lock:
                 self.log.append({"t0": h.started, "t1": time.time(), "method": h.command, "path": u.path,
-                                 "query": u.query, "status": h.answered, "bytes": h.sent})
+                                 "query": u.query, "range": h.headers.get("Range"), "status": h.answered, "bytes": h.sent})
 
     def close(self):
         self.server.shutdown()
