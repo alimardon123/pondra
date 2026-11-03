@@ -6,7 +6,8 @@ once the fault is gone (how long it took is in `info`).
 
 - **storage**: three nodes on a bucket, each through its own `faulty_s3.py`: requests answered
   500 and 503, PUTs applied and their replies lost, requests slowed and held, the bucket down for
-  longer than a leader's lease.
+  longer than a leader's lease. Before the faults, a glob of files outside the lake spread over the
+  nodes: each reads only its share of the files, and the answer is one node's.
 - **cutoff**: the leader alone cut off from the bucket while the others reach it: another leads.
 - **catalog**: the leader's catalog compactor answered one 409 by the bucket, as R2 answered it
   on 10-25 (the compactor stopped for good, the leader went on, and its catalog went 26 minutes
@@ -307,11 +308,61 @@ class Bucketed:
             harness.LAKES.remove(self.lake)  # (moto's bucket was in its memory: gone with it)
 
 
+def spread_outside(c):
+    """Parquet files outside the lake, read through a secret that lends each node its own
+    credentials (so each node reads through its own proxy), and asked with ?spread=1: the files are
+    dealt out, each node reads the data of its share alone, and the answer is one node's. A read
+    that starts in a file's first half is its data; the footer is read from its last 512 KiB."""
+    import io, uuid, pyarrow as pa, pyarrow.parquet as pq
+    s3, bkt, prefix = harness.S3[0], os.environ["PONDRA_BUCKET"], f"outside-{uuid.uuid4().hex[:8]}"
+    rng, sizes, want = random.Random(7), {}, {"n": 0, "s": 0}
+    try:
+        for i in range(6):  # (twice as many files as nodes, each 4 MB: well past a footer's read)
+            v = [rng.randrange(10**12) for _ in range(500_000)]
+            buf = io.BytesIO()
+            pq.write_table(pa.table({"v": pa.array(v, pa.int64())}), buf, compression="none", use_dictionary=False)
+            sizes[f"{prefix}/part-{i}.parquet"] = len(buf.getvalue())
+            s3.put_object(Bucket=bkt, Key=f"{prefix}/part-{i}.parquet", Body=buf.getvalue())
+            want = {"n": want["n"] + len(v), "s": want["s"] + sum(v)}
+        url, at = f"s3://{bkt}/{prefix}", c.nodes[0]
+        call(at.port, "POST", "/sql", f"CREATE SECRET outside (TYPE s3, PROVIDER credential_chain, SCOPE '{url}')".encode())
+        sql = f"SELECT count(*) AS n, sum(v) AS s FROM read_parquet('{url}/*.parquet')".encode()
+        until(lambda: len((stats(at) or {}).get("nodes", ())) == 3, 30)
+        before = harness.metrics_of(at.port)["pondra_spread_queries_total"]
+        for p in c.proxies:
+            p.log, p.record = [], True
+        try:
+            spread = call(at.port, "POST", "/sql?spread=1", sql, timeout=120)
+        finally:
+            for p in c.proxies:
+                p.record = False
+        spreads = harness.metrics_of(at.port)["pondra_spread_queries_total"] - before
+        one = call(at.port, "POST", "/sql?spread=0", sql, timeout=120)
+
+        def data(p):  # (the files this node read the data of)
+            got = set()
+            for r in p.log:
+                key = next((k for k in sizes if r["path"].endswith("/" + k)), None)
+                start = (r.get("range") or "bytes=0-").removeprefix("bytes=").split("-")[0]
+                if key and r["method"] == "GET" and r["status"] in (200, 206) and start != "" and int(start) < sizes[key] // 2:
+                    got.add(key)
+            return got
+        reads = [data(p) for p in c.proxies]
+        info["outside glob: files each node read the data of"] = shares = [sorted(k.rsplit("/", 1)[1] for k in r) for r in reads]
+        check("an outside glob spread over three nodes (?spread=1) == one node's answer == pyarrow's", spread == one == [want] and spreads == 1, (spread, one, want, spreads))
+        check("…each node read the data of its own share of the files alone: every file by one node, every node some",
+              all(reads) and sum(map(len, reads)) == len(sizes) and set().union(*reads) == set(sizes), shares)
+    finally:
+        for k in sizes:
+            s3.delete_object(Bucket=bkt, Key=k)
+
+
 def storage(a):
     """Every node's bucket failing alike: errors, lost replies, slowness, then gone for longer than
-    a leader's lease."""
+    a leader's lease; and, before the faults, an outside glob spread over the nodes (`spread_outside`)."""
     c = Bucketed(a)
     try:
+        spread_outside(c)
         s, load = a.secs, c.load
         time.sleep(s / 2)
         info["acks a second, no faults"] = round(load.since(time.time() - s / 2) / (s / 2))

@@ -123,13 +123,13 @@ fn condition_of(text: &str) -> Option<ast::Expr> {
 /// columns come in the table's order? Read by its tokens, so any of Pondra's statements is read, and a `*` that multiplies
 /// or counts (`count(*)`) is not one. A table's column moved (`ALTER COLUMN c AFTER b`) would move such a query's columns.
 pub fn by_position(sql: &str) -> bool {
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
-    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else { return true }; // (unread: taken as one)
-    let tokens: Vec<Token> = tokens.into_iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
-    let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Word(x)) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w));
-    (0..tokens.len()).any(|i| match &tokens[i] {
+    use datafusion::sql::sqlparser::tokenizer::Token;
+    let Some(tokens) = crate::text::tokens(sql) else { return true }; // (unread: taken as one)
+    let tokens = tokens.solid_refs();
+    let word = |t: Option<&&Token>, w: &str| matches!(t, Some(Token::Word(x)) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w));
+    (0..tokens.len()).any(|i| match tokens[i] {
         Token::Mul => i == 0 || matches!(tokens[i - 1], Token::Comma | Token::Period) || ["SELECT", "DISTINCT", "ALL"].iter().any(|w| word(tokens.get(i - 1), w)),
-        Token::Word(_) => word(tokens.get(i), "COLUMNS") && tokens.get(i + 1) == Some(&Token::LParen),
+        Token::Word(_) => word(tokens.get(i), "COLUMNS") && tokens.get(i + 1) == Some(&&Token::LParen),
         _ => false,
     })
 }

@@ -135,7 +135,8 @@ PROCESS = {
     "extension.rs:TURNS": "the extension calls running in this process, against one a core: the cores are the machine's, so every node in a process shares one count (each call gives its turn back as it ends)",
     "wasm.rs:ENGINE": "Wasmtime's engine, the process's compiler: compiled code is shared by every node in a process, and holds no node's state",
     "store.rs:DISK": "the window sorts' spill disk (`window_sorts`, invariant 423), made once from settings read once (PONDRA_SPILL_FAN_IN, --memory-gb, PONDRA_CORES, PONDRA_SPILL_GB): the disk is the machine's, as SPILLERS says",
-    "engine.rs:SPARK": "Spark's functions, made against a session with nothing of a lake",
+    "functions.rs:FUNCTIONS": "Spark's functions, made against a session with nothing of a lake",
+    "registry.rs:REGISTRY": "the build's extensions, registered once from `crate::built_in` and never changed after: the same for every node, and no section holds a node's state",
     "temp.rs:CHANGES": "a counter live queries wait on: it only grows, so a waiter never misses a change",
     "tier.rs:SLOTS": SETTING + " (tiering's slots, sized by --memory-gb)",
     "tls.rs:KEY": SETTING + " (PONDRA_CLIENT_KEY, which the lakes server gives each database's node)",
@@ -151,7 +152,8 @@ PLAIN = {"std", "sync", "collections", "time", "path", "num", "borrow", "regex",
          "LazyLock", "Option", "Vec", "Box", "Arc", "HashMap", "HashSet", "BTreeMap", "BTreeSet", "String",
          "str", "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
          "i128", "isize", "f32", "f64", "Duration", "PathBuf", "Path", "Regex", "Value", "Bytes", "Cow",
-         "NonZeroUsize", "static"}
+         "NonZeroUsize", "static",
+         "crate", "registry", "BuiltIn"}  # (a built-in extension's `registry::BuiltIn`: its names and a function, nothing to change)
 # Where a `"PONDRA_…"` name isn't a setting anything reads, by file, with the reason.
 NOT_READ = {
     "ci.rs": "GitHub secrets' names, which `pondra ci init` sets for a repository's workflows",
