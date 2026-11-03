@@ -126,7 +126,7 @@ pub struct Session {
     views: HashMap<String, String>,
     routines: HashMap<String, crate::expander::Routine>, // CREATE TEMP MACRO | FUNCTION: SQL's, expanded where called (`routines` below)
     secrets: std::collections::BTreeMap<String, crate::ext::Secret>, // (CREATE TEMPORARY SECRET: in memory only)
-    pub settings: std::collections::BTreeMap<String, String>,       // SET name = value (`settings.rs`)
+    pub settings: std::collections::BTreeMap<String, String>,       // SET name = value (`set.rs`)
     pub prepared: HashMap<String, String>,                          // PREPARE name AS …: its text
     pub variables: std::collections::BTreeMap<String, crate::vars::Var>, // DECLARE $name …, $name = … (`vars.rs`)
     pub currval: HashMap<String, i64>,                              // each sequence's last value its nextval gave (`seq.rs`)
@@ -168,7 +168,7 @@ pub fn peek<T>(session: &str, f: impl FnOnce(&Session) -> Option<T>) -> Option<T
 
 /// How long a session may sit unused (`PONDRA_SESSION_IDLE_SECS`, 3600).
 fn idle() -> Duration {
-    Duration::from_secs(crate::env::or("PONDRA_SESSION_IDLE_SECS", 3600))
+    Duration::from_secs(crate::env::value("PONDRA_SESSION_IDLE_SECS"))
 }
 
 /// Sessions idle for `PONDRA_SESSION_IDLE_SECS` end, as `end` ends them (a transaction rolled back,
@@ -506,7 +506,7 @@ async fn change(app: &App, s: &str, name: &str, stmt: &Stmt) -> Result<Value> {
 /// checked outside the sessions' lock, so a big change never stalls another session; they are put in
 /// place only if the table is still as it was read, else made again from what it is now.
 fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<crate::rules::Shaped>) -> Result<()> {
-    static BUDGET: LazyLock<usize> = LazyLock::new(|| crate::env::or("PONDRA_TEMP_MB", 1024usize) << 20);
+    static BUDGET: LazyLock<usize> = LazyLock::new(|| crate::env::value::<usize>("PONDRA_TEMP_MB") << 20);
     loop {
         let (meta, rules, old, next, version) = with(s, false, |x| {
             let t = x.tables.get(name).with_context(|| format!("no temporary table {name}"))?;

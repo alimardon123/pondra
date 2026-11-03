@@ -1,181 +1,24 @@
-//! Every setting a node reads, through one function from one table (ADR-061 §8). A setting is what
+//! Every setting a node reads, through one function from one table (ADR-061 §8; the table is `settings.rs`). A setting is what
 //! the process was given (`open`'s options, the command line's flags), else its environment, and an
 //! empty value is no value. Nothing here sets the environment: in a library the host runs threads of
 //! its own (Jupyter, any Python), and `set_var` beside them is a data race. The browser has no
 //! environment and reads the same table. `tools/per_node_check.py` fails a `PONDRA_*` name read
-//! anywhere else, and a name read that isn't here.
+//! anywhere else, and a name read that isn't in the table.
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// Who a name is for, which says where it may come from.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Who {
-    /// A node's setting: an option of `open`, a flag of the command line, or the environment.
-    Node,
-    /// The command line's own (`pondra sql`, the project commands): the environment only.
-    Command,
-    /// Set by the program that starts a node (the shell, `connect()`, a folder of lakes, a service
-    /// manager): the environment only.
-    Starter,
-    /// A test's hook into the node: the environment only, and left out of the docs.
-    Test,
-}
-
+pub use crate::settings::Who;
 use Who::*;
-
-/// Every `PONDRA_*` name a node or the command line reads, and who it is for.
-pub const NAMES: &[(&str, Who)] = &[
-    ("PONDRA_ADMIN_TOKEN", Node),
-    ("PONDRA_ADMIN_TOKEN_PREVIOUS", Node),
-    ("PONDRA_AI_CALLS", Node),
-    ("PONDRA_AI_KEY", Node),
-    ("PONDRA_AI_MODEL", Node),
-    ("PONDRA_AI_TIMEOUT_SECS", Node),
-    ("PONDRA_AI_URL", Node),
-    ("PONDRA_ALLOW_UNSIGNED_EXTENSIONS", Node),
-    ("PONDRA_AUDIT", Node),
-    ("PONDRA_AUDIT_DAYS", Node),
-    ("PONDRA_BLOCKING_THREADS", Node),
-    ("PONDRA_BROADCAST_MB", Node),
-    ("PONDRA_BUCKET_REQUESTS", Node),
-    ("PONDRA_CACHE_DIR", Node),
-    ("PONDRA_CACHE_GB", Node),
-    ("PONDRA_CACHE_MB", Node),
-    ("PONDRA_CHANGELOG_SECS", Node),
-    ("PONDRA_CODEC", Node),
-    ("PONDRA_CONFIG_DIR", Node),
-    ("PONDRA_CONSOLE_DIR", Node),
-    ("PONDRA_CONSOLE_EXTENSIONS", Node),
-    ("PONDRA_CORES", Node),
-    ("PONDRA_CURSORS_MB", Node),
-    ("PONDRA_DATABASE_IDLE_SECS", Node),
-    ("PONDRA_IDLE_EXIT_SECS", Node),
-    ("PONDRA_DEBUG_FAIL_STEP", Node),
-    ("PONDRA_DEBUG_FAIL_STEP_AFTER", Node),
-    ("PONDRA_DEBUG_JOIN_ORDER", Node),
-    ("PONDRA_DEBUG_OPEN_TWICE", Node),
-    ("PONDRA_DEBUG_PG", Node),
-    ("PONDRA_DEBUG_SPREAD", Node),
-    ("PONDRA_DRAIN_GRACE_SECS", Node),
-    ("PONDRA_DRAIN_SECS", Node),
-    ("PONDRA_EMBED_MODEL", Node),
-    ("PONDRA_EXTENSION_FILE_MB", Node),
-    ("PONDRA_EXTENSION_MB", Node),
-    ("PONDRA_EXTENSION_SECS", Node),
-    ("PONDRA_FILES_CACHE_MB", Node),
-    ("PONDRA_FILE_VERSIONS", Node),
-    ("PONDRA_FILE_VERSIONS_DAYS", Node),
-    ("PONDRA_FSYNC", Node),
-    ("PONDRA_FUNCTION_CACHE_MB", Node),
-    ("PONDRA_GC_SECS", Node),
-    ("PONDRA_HISTORY", Node),
-    ("PONDRA_HISTORY_DAYS", Node),
-    ("PONDRA_HISTORY_RATE", Node),
-    ("PONDRA_HOT_GB", Node),
-    ("PONDRA_INLINE_KB", Node),
-    ("PONDRA_JOIN_ORDER", Node),
-    ("PONDRA_KEEP_AT_ONCE", Test),
-    ("PONDRA_KEEP_PARQUET", Test),
-    ("PONDRA_KMS_COMMAND", Node),
-    ("PONDRA_LATE_ROWS", Test),
-    ("PONDRA_LAUNCHER", Node),
-    ("PONDRA_LEARN", Node),
-    ("PONDRA_LEARN_MS", Node),
-    ("PONDRA_LINK", Node),
-    ("PONDRA_LOAD_RETENTION_SECS", Node),
-    ("PONDRA_LOCK_LEASE_SECS", Node),
-    ("PONDRA_MATCH_HELD_ROWS", Node),
-    ("PONDRA_MATCH_RUN_ROWS", Node),
-    ("PONDRA_MEMORY_GB", Node),
-    ("PONDRA_MEMORY_LAKE_GB", Node),
-    ("PONDRA_MEMORY_MAX_GB", Node),
-    ("PONDRA_PAGES_MB", Node),
-    ("PONDRA_PIN_LEASE_SECS", Node),
-    ("PONDRA_PIN_RENEW_SECS", Node),
-    ("PONDRA_PROCEDURES", Node),
-    ("PONDRA_PUBLISH", Node),
-    ("PONDRA_PURGE_ROWS", Node),
-    ("PONDRA_PYTHON", Node),
-    ("PONDRA_PYTHON_PROBE_SECS", Node),
-    ("PONDRA_QUERIES", Node),
-    ("PONDRA_QUEUE_SECS", Node),
-    ("PONDRA_READ_TOKEN", Node),
-    ("PONDRA_REPLICAS", Node),
-    ("PONDRA_RUNS_DAYS", Node),
-    ("PONDRA_SECRET_KEY", Node),
-    ("PONDRA_SECRET_KEY_PREVIOUS", Node),
-    ("PONDRA_SERVE_STORE", Node),
-    ("PONDRA_SESSION_HOURS", Node),
-    ("PONDRA_SESSION_IDLE_SECS", Node),
-    ("PONDRA_SHARED_KEY_FILE", Node),
-    ("PONDRA_SHARE_FILES_PER_MINUTE", Node),
-    ("PONDRA_SHARE_URL_SECS", Node),
-    ("PONDRA_SHARING_URL", Node),
-    ("PONDRA_SKEW_MB", Node),
-    ("PONDRA_SLOW_MS", Node),
-    ("PONDRA_SPILL_DIR", Node),
-    ("PONDRA_SPILL_FAN_IN", Node),
-    ("PONDRA_SPILL_GB", Node),
-    ("PONDRA_SPILL_MB", Node),
-    ("PONDRA_SPREAD_MB", Node),
-    ("PONDRA_SQL_OPTIONS", Node),
-    ("PONDRA_STAGED_SECS", Node),
-    ("PONDRA_STATEMENT_TIMEOUT", Node),
-    ("PONDRA_STREAM_MB", Node),
-    ("PONDRA_TEMP_MB", Node),
-    ("PONDRA_TLS", Node),
-    ("PONDRA_TLS_CA", Node),
-    ("PONDRA_TLS_CERT", Node),
-    ("PONDRA_TLS_KEY", Node),
-    ("PONDRA_TRACE_COMMIT", Node),
-    ("PONDRA_TRACE_PG", Node),
-    ("PONDRA_TRACE_QUERY", Node),
-    ("PONDRA_TRACE_RERUN", Node),
-    ("PONDRA_TRACE_START", Node),
-    ("PONDRA_TRUSTED_PROXIES", Node),
-    ("PONDRA_TXN_IDLE_SECS", Node),
-    ("PONDRA_USER_QUERIES", Node),
-    ("PONDRA_USER_TIMEOUT", Node),
-    ("PONDRA_VIEW_RUNS", Node),
-    ("PONDRA_VIEW_RUN_SECS", Node),
-    ("PONDRA_WEB_ORIGINS", Node),
-    ("PONDRA_WEB_SEND_MB", Node),
-    ("PONDRA_WORKER_IDLE_SECS", Node),
-    ("PONDRA_WORKER_MB", Node),
-    ("PONDRA_WORKER_START_SECS", Node),
-    ("PONDRA_WRITE_TOKEN", Node),
-    ("PONDRA_BROWSER", Command),
-    ("PONDRA_ENV", Command),
-    ("PONDRA_HOME", Command),
-    ("PONDRA_JOB", Command),
-    ("PONDRA_PASSWORD", Command),
-    ("PONDRA_TOKEN", Command),
-    ("PONDRA_TRIES", Command),
-    ("PONDRA_CLIENT_KEY", Starter),
-    ("PONDRA_NODE_KEY", Starter),
-    ("PONDRA_OWNER_KEY", Starter),
-    ("PONDRA_REACH", Starter),
-    ("PONDRA_SERVER_URL", Starter),
-    ("PONDRA_SUPERVISED", Starter),
-    ("PONDRA_CRASH", Test),
-    ("PONDRA_DROP_BEATS", Test),
-    ("PONDRA_NO_DIRECT", Test),
-    ("PONDRA_TEST_AUTOCOMMIT_PAUSE_MS", Test),
-    ("PONDRA_TEST_FILL_PAUSE_MS", Test),
-    ("PONDRA_TEST_FORMAT", Test),
-    ("PONDRA_TEST_NO_GATE", Test),
-    ("PONDRA_TEST_PANICS", Test),
-];
 
 /// What the process was given, by its full names, fixed by the first `give`.
 static GIVEN: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 
 /// Who a full name is for, or None for a name nothing reads.
 pub fn who(name: &str) -> Option<Who> {
-    NAMES.iter().find(|(n, _)| *n == name).map(|(_, w)| *w)
+    crate::settings::find(name).map(|s| s.who)
 }
 
 /// Gives the process its settings: `open`'s options, or the command line's flags. The first call
@@ -207,7 +50,7 @@ pub fn give<K: AsRef<str>, V: Into<String>>(options: impl IntoIterator<Item = (K
 /// A setting, or None: what the process was given (empty there is None too, the environment unread),
 /// else the environment.
 pub fn get(name: &str) -> Option<String> {
-    debug_assert!(who(name).is_some(), "{name} isn't in env::NAMES");
+    debug_assert!(who(name).is_some(), "{name} isn't in settings.rs");
     match GIVEN.get().and_then(|g| g.get(name)) {
         Some(v) => Some(v.clone()),
         None => std::env::var(name).ok(),
@@ -217,7 +60,7 @@ pub fn get(name: &str) -> Option<String> {
 
 /// A setting that may be a path in the environment's own encoding (a folder, a list of files).
 pub fn os(name: &str) -> Option<OsString> {
-    debug_assert!(who(name).is_some(), "{name} isn't in env::NAMES");
+    debug_assert!(who(name).is_some(), "{name} isn't in settings.rs");
     match GIVEN.get().and_then(|g| g.get(name)) {
         Some(v) => Some(OsString::from(v)),
         None => std::env::var_os(name),
@@ -240,7 +83,28 @@ pub fn cores() -> usize {
     std::thread::available_parallelism().map_or(2, |n| n.get())
 }
 
-/// A setting read as a `T`, else `default`.
+/// A setting read as a `T`, else its default in the table (`settings.rs`): one that isn't set, or doesn't read as a `T`.
+pub fn value<T: FromStr>(name: &str) -> T {
+    parse(name).unwrap_or_else(|| default_as(name))
+}
+
+/// A setting's default in the table, read as a `T`.
+fn default_as<T: FromStr>(name: &str) -> T {
+    default(name).trim().parse().unwrap_or_else(|_| panic!("{name}'s default doesn't read as its kind"))
+}
+
+/// A setting as it was given, else its default in the table.
+pub fn text(name: &str) -> String {
+    get(name).unwrap_or_else(|| default(name))
+}
+
+/// A setting's default in the table.
+fn default(name: &str) -> String {
+    crate::settings::find(name).and_then(|s| s.default()).unwrap_or_else(|| panic!("{name} has no default in settings.rs"))
+}
+
+/// A setting read as a `T`, else `default`: for a default only its reader can work out (from what is above this, as the
+/// format a lake is written in), which the table doesn't hold.
 pub fn or<T: FromStr>(name: &str, default: T) -> T {
     parse(name).unwrap_or(default)
 }
@@ -303,10 +167,10 @@ pub fn device_line() -> Option<usize> {
     Some(DEVICE_LINE.load(std::sync::atomic::Ordering::Relaxed)).filter(|&line| line > 0)
 }
 
-/// A setting in seconds (fractions too), else `default`: one that is negative or not a number is the
+/// A setting in seconds (fractions too), else its default in the table: one that is negative or not a number is the
 /// default too.
-pub fn secs(name: &str, default: f64) -> Duration {
-    parse::<f64>(name).and_then(|s| Duration::try_from_secs_f64(s).ok()).unwrap_or_else(|| Duration::from_secs_f64(default))
+pub fn secs(name: &str) -> Duration {
+    parse::<f64>(name).and_then(|s| Duration::try_from_secs_f64(s).ok()).unwrap_or_else(|| Duration::from_secs_f64(default_as(name)))
 }
 
 /// A switch: on for `1`, `true`, `on` or `yes`.
@@ -340,7 +204,7 @@ fn full(key: &str) -> String {
 fn nearest(key: &str) -> Option<String> {
     let name = full(key);
     let short = &name["PONDRA_".len()..];
-    let (far, best) = NAMES.iter().filter(|(_, w)| *w == Node).map(|(n, _)| (distance(short, &n["PONDRA_".len()..]), *n)).min()?;
+    let (far, best) = crate::settings::ALL.iter().filter(|s| s.who == Node).map(|s| (distance(short, &s.var["PONDRA_".len()..]), s.var)).min()?;
     (far <= (short.len() / 3).max(1)).then(|| match key.trim().to_ascii_uppercase().starts_with("PONDRA_") {
         true => best.to_string(),
         false => best["PONDRA_".len()..].to_ascii_lowercase(),
@@ -408,20 +272,18 @@ mod tests {
     #[test]
     fn values() {
         std::env::set_var("PONDRA_DRAIN_GRACE_SECS", "-1");
-        assert_eq!(secs("PONDRA_DRAIN_GRACE_SECS", 2.5), Duration::from_millis(2500), "a negative time is the default");
+        assert_eq!(secs("PONDRA_DRAIN_GRACE_SECS"), Duration::ZERO, "a negative time is the default");
         std::env::set_var("PONDRA_DRAIN_GRACE_SECS", " 0.25 ");
-        assert_eq!(secs("PONDRA_DRAIN_GRACE_SECS", 2.5), Duration::from_millis(250));
+        assert_eq!(secs("PONDRA_DRAIN_GRACE_SECS"), Duration::from_millis(250));
+        std::env::set_var("PONDRA_TEMP_MB", "lots");
+        assert_eq!(value::<u64>("PONDRA_STREAM_MB") + value::<u64>("PONDRA_TEMP_MB"), 8 + 1024, "unset, or not a number: the table's");
+        std::env::set_var("PONDRA_AI_MODEL", " m ");
+        assert_eq!((text("PONDRA_AI_MODEL"), text("PONDRA_EMBED_MODEL")), (" m ".to_string(), "nomic-embed-text".to_string()), "as given");
         std::env::set_var("PONDRA_LEARN", "On");
         assert!(flag("PONDRA_LEARN"));
         std::env::set_var("PONDRA_LEARN", "off");
         assert!(!flag("PONDRA_LEARN") && is_set("PONDRA_LEARN"));
         std::env::set_var("PONDRA_DEBUG_PG", "");
         assert!(!is_set("PONDRA_DEBUG_PG"), "empty is unset");
-    }
-
-    #[test]
-    fn names_once() {
-        let mut seen = std::collections::HashSet::new();
-        assert!(NAMES.iter().all(|(n, _)| n.starts_with("PONDRA_") && seen.insert(*n)), "each name once");
     }
 }

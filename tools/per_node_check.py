@@ -25,7 +25,7 @@ there, so those modules read the time through DataFusion's `Instant` (std's own 
 `log::now_us` or `now_ms`, and a std clock in one fails (CLOCKS below names a file that may, and why).
 
 And every setting goes through `env.rs` (ADR-061 §8): a `PONDRA_*` name read with `std::env`
-anywhere else fails (by its text, or a constant that names it), so does a `"PONDRA_…"` name its NAMES table doesn't list, and a name the table
+anywhere else fails (by its text, or a constant that names it), so does a `"PONDRA_…"` name the table (`settings.rs`) doesn't list, and a name the table
 lists that nothing reads (env.rs's own rules, the memory line's, read outside the table).
 
 And every walk of the SQL tree goes through `crate::walk` (`src/walk.rs`): sqlparser's `Visit` and `VisitMut` are
@@ -292,9 +292,9 @@ def leaks():
 
 
 def settings():
-    """Settings read past `env.rs`, names it doesn't list, and names it lists that nothing reads."""
-    table = open(os.path.join(SRC, "env.rs"), encoding="utf-8").read()
-    table = table[table.index("pub const NAMES"):]
+    """Settings read past `env.rs`, names the table (`settings.rs`) doesn't list, and names it lists that nothing reads."""
+    table = open(os.path.join(SRC, "settings.rs"), encoding="utf-8").read()
+    table = table[table.index("pub const ALL"):]
     table = table[:table.index("];")]  # (the table alone: its tests name settings that aren't)
     names, read, bad = set(re.findall(r'\(\s*"(PONDRA_[A-Z0-9_]+)"\s*,', table)), set(), []
     sources = {}
@@ -305,22 +305,23 @@ def settings():
     named = {c: v for text in sources.values() for c, v in CONST.findall(text)}  # (constants that are a setting's name)
     for base, _, files in os.walk(SRC):
         for f in sorted(files):
-            if not f.endswith(".rs") or f == "env.rs":
+            if not f.endswith(".rs") or (base == SRC and f in ("env.rs", "settings.rs")):
                 continue
             path = os.path.join(base, f)
             rel = os.path.relpath(path, SRC).replace(os.sep, "/")
             for n, line in enumerate(sources[path].split("\n"), 1):
                 code = line.split("//", 1)[0]
                 if READ.search(code) or any(c in named for c in READ_BY.findall(code)):
-                    bad.append(f"src/{rel}:{n}: a setting read past env.rs: read it with crate::env::get (or os, parse, or, secs, flag, is_set)")
+                    bad.append(f"src/{rel}:{n}: a setting read past env.rs: read it with crate::env::value (or text, get, os, parse, secs, flag, is_set)")
                 for name in NAME.findall(line):
                     read.add(name)
                     if name not in names and f not in NOT_READ:
-                        bad.append(f"src/{rel}:{n}: {name} isn't in env.rs's NAMES: add it there with who it is for (or the file to NOT_READ in tools/per_node_check.py with why)")
-    own = sources[os.path.join(SRC, "env.rs")]  # (a rule env.rs keeps itself, the same in every form, reads its setting too)
-    start = own.index("pub const NAMES")
-    read |= set(NAME.findall(own[:start] + own[own.index("];", start):]))
-    return bad + [f"src/env.rs: NAMES lists {name}, which nothing reads: take it out" for name in sorted(names - read)]
+                        bad.append(f"src/{rel}:{n}: {name} isn't in settings.rs's table: add it there with who it is for and its kind (or the file to NOT_READ in tools/per_node_check.py with why)")
+    # (a rule env.rs keeps itself, the same in every form, reads its setting too, as does a default the table works out)
+    own = sources[os.path.join(SRC, "settings.rs")]
+    start = own.index("pub const ALL")
+    read |= set(NAME.findall(sources[os.path.join(SRC, "env.rs")] + own[:start] + own[own.index("];", start):]))
+    return bad + [f"src/settings.rs: the table lists {name}, which nothing reads: take it out" for name in sorted(names - read)]
 
 
 def clocks():

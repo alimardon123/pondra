@@ -1374,7 +1374,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and parameter types from it too; in a transaction `txn::point_read`; a one-key UPDATE of a keyed
    table is `txn::point_change`, in a transaction or not.
 188. **A session's settings are checked as they are set, and travel with its queries only**
-   (`settings.rs`, round 31): `SET datafusion.*` is validated against DataFusion's options and
+   (`set.rs`, round 31): `SET datafusion.*` is validated against DataFusion's options and
    applied in `query::session_at` (and `write::declared`); a session that has any runs its queries
    on its own node and never from `Results`. Postgres's undotted names are kept for `SHOW`;
    `datafusion.runtime.*` is refused. A script sent without a session gets one of its own

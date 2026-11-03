@@ -1,370 +1,316 @@
-//! A session's settings and prepared statements (round 31): `SET name = value`, `SET TIME ZONE`,
-//! `RESET name | ALL`, `PREPARE name AS …`, `EXECUTE name(…)` and `DEALLOCATE name | ALL`, as in
-//! Postgres. A session is a Postgres connection, or a client's `x-pondra-session` (`temp.rs`).
+//! Every setting, one entry each (redesign §3, step 1c): its name, what kind of value it takes, what it is when unset,
+//! where it holds (a node, a session, a lake) and when it may change. `env.rs` reads a node's through this table, and
+//! `tools/per_node_check.py` fails a `PONDRA_*` name read that isn't here. The table is base: it names nothing above it, so
+//! the registry's settings section takes it over as it is, each owner then registering its own.
 //!
-//! - A `datafusion.*` name is one of DataFusion's options (`datafusion.execution.time_zone`,
-//!   `datafusion.execution.batch_size`, …), checked as it is set. The session's queries use it,
-//!   so they run on its node and aren't answered from the result cache. `datafusion.runtime.*` is
-//!   the node's (its memory), not a session's.
-//! - A name without a dot is Postgres's (`extra_float_digits`, `search_path`, `application_name`,
-//!   …): kept and shown by `SHOW`, whatever it is, as clients set many on connect. `TIME ZONE` and
-//!   `timezone` are DataFusion's `datafusion.execution.time_zone`.
-//! - A prepared statement is kept as its text. `EXECUTE` puts its arguments where `$1`, `$2`, …
-//!   were (cast to the types `PREPARE` gave) and runs it as if it were sent: a query or a write.
-use crate::store::Lake;
-use anyhow::{bail, ensure, Context, Result};
-use datafusion::logical_expr::{LogicalPlan, SetVariable, Statement as Plan};
-use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast::{self, Expr, Reset, Set, Statement, Value, VisitorMut};
-use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
-use std::ops::ControlFlow;
+//! A default is here only where its readers take it from here (`env::value`, `env::secs`, `env::text`): a reader that does
+//! more with an unset value (a 0 that means the default, a value only it can work out) keeps its own until it moves here.
 
-pub const NO_SESSION: &str = "a setting or a prepared statement is a session's: a Postgres connection's, the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>, 8 to 128 letters, digits, - or _), or a script's (send it with the statements that use it)";
-
-/// Is this one of the statements kept here? (`USE`, too: the session's search path, `path.rs`.)
-pub fn is(sql: &str) -> bool {
-    let word = crate::text::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_uppercase();
-    (matches!(word.as_str(), "SET" | "RESET" | "PREPARE" | "EXECUTE" | "EXEC" | "DEALLOCATE" | "ANALYZE" | "ANALYSE" | "REFRESH" | "USE")
-        && crate::runs::execute_of(sql).is_none()) // (EXECUTE TASK: the leader's)
-        || crate::extension::is(sql) // (DuckDB's INSTALL, FORCE INSTALL and LOAD, and Pondra's: `extension.rs`)
+/// Who a name is for, which says where it may come from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Who {
+    /// A node's setting: an option of `open`, a flag of the command line, or the environment.
+    Node,
+    /// The command line's own (`pondra sql`, the project commands): the environment only.
+    Command,
+    /// Set by the program that starts a node (the shell, `connect()`, a folder of lakes, a service
+    /// manager): the environment only.
+    Starter,
+    /// A test's hook into the node: the environment only, and left out of the docs.
+    Test,
 }
 
-/// What Postgres's tools send that has nothing to do here (dbt and BI tools send both): `ANALYZE
-/// [t]`, since statistics are kept with every write, and `REFRESH MATERIALIZED VIEW v`, since a
-/// view is current as rows arrive. Refused for a name that isn't one.
-async fn current(lake: &Lake, sql: &str) -> Result<Option<Done>> {
-    let name = {
-        let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql)?;
-        let word = |p: &mut Parser, w: &str| crate::routines::word(p, w);
-        if word(&mut p, "analyze") || word(&mut p, "analyse") {
-            return Ok(Some(Done::Said("ANALYZE")));
-        }
-        if !word(&mut p, "refresh") {
-            return Ok(None);
-        }
-        ensure!(word(&mut p, "materialized") && word(&mut p, "view"), "REFRESH MATERIALIZED VIEW name");
-        let _ = word(&mut p, "concurrently");
-        crate::text::object(&p.parse_object_name(false)?)
-    };
-    let (other, local) = crate::ddl::resolve(lake, &name).await?;
-    let l = other.as_deref().unwrap_or(lake);
-    let (schema, view) = crate::text::split(&local);
-    let here = crate::ddl::lake_name(l);
-    let found = crate::ddl::listed(l).await?.into_iter().any(|t| t.lake == here && t.schema == schema && t.name == view && t.kind == "materialized view");
-    ensure!(found, "REFRESH MATERIALIZED VIEW {name}: there is no materialized view of that name");
-    Ok(Some(Done::Said("REFRESH MATERIALIZED VIEW")))
+/// What a value is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    /// On when set to anything (the debug switches, the trace switches, a test's hooks).
+    Switch,
+    /// On for `1`, `true`, `on` or `yes` (`env::flag`).
+    Bool,
+    Int,
+    Float,
+    /// Seconds (fractions too), and the others: the unit is the name's ending.
+    Secs,
+    Ms,
+    Hours,
+    Days,
+    Kb,
+    Mb,
+    Gb,
+    Text,
+    /// Several, separated by commas.
+    List,
+    Path,
+    /// Several paths, separated as the system separates them (`:`, `;` on Windows).
+    Paths,
+    Url,
+    /// A token, a password or a key: never shown.
+    Secret,
 }
 
-/// What a statement kept here comes to.
-pub enum Done {
-    Said(&'static str), // (its command tag)
-    Run(String),        // an `EXECUTE`: this statement, run as if sent
+/// Where a value holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    /// The process's: what it was given, else its environment.
+    Node,
+    /// A session's: `SET`.
+    Session,
+    /// The lake's, kept in its catalog so every member agrees.
+    Lake,
 }
 
-/// Carry out a `SET`, `RESET`, `PREPARE`, `EXECUTE` or `DEALLOCATE` for the current session.
-pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
-    if let Some(said) = crate::extension::statement(lake, sql).await {
-        let said = said?; // (DuckDB's INSTALL and LOAD: no session needed; the notice goes to the client as the others do)
-        crate::routines::heard(&said.notice);
-        return Ok(Done::Said(said.tag));
-    }
-    if let Some(done) = current(lake, sql).await? {
-        return Ok(done);
-    }
-    let session = crate::temp::current();
-    let session = || session.clone().context(NO_SESSION);
-    // `USE` and `SET SCHEMA` set the session's search path (`path.rs`). sqlparser reads neither, so
-    // they are taken here. The session is looked for first: a USE with none says so, by name.
-    if crate::path::is_use(sql) {
-        let session = session()?;
-        set(&session, "search_path", crate::path::use_of(lake, sql).await?)?;
-        return Ok(Done::Said("USE"));
-    }
-    if let Some(schema) = crate::path::set_schema(sql) {
-        set(&session()?, "search_path", schema)?;
-        return Ok(Done::Said("SET"));
-    }
-    let mut parsed = Parser::parse_sql(&GenericDialect {}, sql)?;
-    ensure!(parsed.len() == 1, "one statement at a time");
-    Ok(match parsed.remove(0) {
-        Statement::Set(Set::SingleAssignment { variable, values, .. }) => {
-            let value = values.iter().map(text).collect::<Result<Vec<_>>>()?.join(", ");
-            set(&session()?, &variable.to_string(), value)?;
-            Done::Said("SET")
-        }
-        Statement::Set(Set::SetTimeZone { value, .. }) => {
-            set(&session()?, "timezone", text(&value)?)?;
-            Done::Said("SET")
-        }
-        Statement::Set(Set::MultipleAssignments { assignments }) => {
-            let session = session()?;
-            for a in assignments {
-                set(&session, &a.name.to_string(), text(&a.value)?)?;
-            }
-            Done::Said("SET")
-        }
-        // What other statements called SET ask for is done as asked, or refused by name: a SET
-        // answered and not done would be a quiet lie (principle 10).
-        Statement::Set(Set::SetTransaction { modes, snapshot, session: for_session }) => {
-            // SET TRANSACTION (the open transaction) and SET SESSION CHARACTERISTICS (the session's levels):
-            // ADR-067 §1. An imported snapshot isn't built, so it is refused by name.
-            if snapshot.is_some() {
-                return Err(crate::codes::coded("0A000", "SET TRANSACTION SNAPSHOT isn't built here"));
-            }
-            if let Some(w) = crate::txn::modes(&modes, for_session)? {
-                crate::routines::heard(&format!("WARNING: {w}"));
-            }
-            Done::Said("SET")
-        }
-        Statement::Set(Set::SetRole { role_name: None, .. }) => Done::Said("SET"), // (SET ROLE NONE: the sign-in's own rights, which a session always has)
-        Statement::Set(Set::SetRole { role_name: Some(role), .. }) => {
-            return Err(crate::codes::coded("0A000", format!("SET ROLE {role}: a session has its sign-in's rights, and no other: sign in as a user who has them, or GRANT {role} TO the user you sign in as")))
-        }
-        Statement::Set(Set::SetSessionAuthorization(_)) => {
-            return Err(crate::codes::coded("0A000", "SET SESSION AUTHORIZATION: a session is its sign-in's: sign in as that user (with its token or password)"))
-        }
-        Statement::Set(Set::SetNames { charset_name, .. }) => {
-            set(&session()?, "client_encoding", charset_name.value)?; // (Postgres's SET NAMES is client_encoding)
-            Done::Said("SET")
-        }
-        Statement::Set(Set::SetNamesDefault {}) => Done::Said("SET"),
-        Statement::Set(Set::ParenthesizedAssignments { variables, values }) => {
-            let each = variables.iter().zip(values).map(|(n, v)| format!("${n} = {v}")).collect::<Vec<_>>().join("; ");
-            let first = variables.first().map(|n| format!("${n}")).unwrap_or_default();
-            return Err(crate::codes::coded("0A000", format!("SET (…) = (…) is Snowflake's for variables: here each is set on its own, {each} (or DECLARE {first} INT = …), and {first} reads it")));
-        }
-        Statement::Set(other) => return Err(crate::codes::coded("0A000", format!("{other}: not a setting here (SET name = value, or SHOW name)"))),
-        Statement::Reset(r) => {
-            let name = match r.reset {
-                Reset::ALL => None,
-                Reset::ConfigurationParameter(n) => Some(name(&n.to_string())),
-            };
-            if let Some(n) = name.as_deref().filter(|n| n.starts_with("datafusion.") && !n.starts_with("datafusion.runtime.")) {
-                datafusion::config::ConfigField::reset(&mut datafusion::config::ConfigOptions::new(), n)?; // (a name DataFusion has)
-            }
-            crate::temp::with(&session()?, false, |s| Ok(match &name {
-                Some(n) => drop(s.settings.remove(n)),
-                None => s.settings.clear(),
-            }))?;
-            Done::Said("RESET")
-        }
-        Statement::Prepare { name, statement, .. } => {
-            let name = name.value.to_lowercase();
-            if !matches!(*statement, Statement::Insert(_) | Statement::Update(..) | Statement::Delete(_) | Statement::Merge(..)) {
-                let ctx = crate::query::session(lake, &statement.to_string(), "").await?;
-                ctx.execute_logical_plan(ctx.state().create_logical_plan(sql).await?).await?; // (its parameters and their types agree; its tables are there)
-            }
-            crate::temp::with(&session()?, false, |s| Ok(s.prepared.insert(name, sql.to_string())))?;
-            Done::Said("PREPARE")
-        }
-        Statement::Execute { name: Some(name), parameters, .. } if !name.to_string().starts_with('\'') => {
-            let name = name.to_string().to_lowercase();
-            let kept = crate::temp::with(&session()?, false, |s| Ok(s.prepared.get(&name).cloned()))?;
-            let kept = kept.ok_or_else(|| crate::codes::coded("26000", format!("Prepared statement '{name}' does not exist")))?;
-            let Some(Statement::Prepare { data_types, statement, .. }) = Parser::parse_sql(&GenericDialect {}, &kept)?.pop() else { bail!("{name}: not a prepared statement (PREPARE {name} AS … makes one)") };
-            let mut statement = *statement;
-            let mut args = Arguments { values: parameters, types: data_types, wrong: None };
-            let _ = crate::walk::visit_mut(&mut statement, &mut args);
-            if let Some(e) = args.wrong {
-                bail!(e);
-            }
-            Done::Run(statement.to_string())
-        }
-        Statement::Execute { .. } => bail!("EXECUTE statement requires a name (EXECUTE name, or EXECUTE name(1, 'a') with its values)"),
-        Statement::Deallocate { name, .. } => {
-            let name = name.value.to_lowercase();
-            crate::temp::with(&session()?, false, |s| match name.as_str() {
-                "all" => Ok(s.prepared.clear()),
-                _ => s.prepared.remove(&name).map(drop).ok_or_else(|| crate::codes::coded("26000", format!("Prepared statement '{name}' does not exist"))),
-            })?;
-            Done::Said("DEALLOCATE")
-        }
-        _ => bail!("not a setting or a prepared statement (SET name = value or SHOW name for a setting, PREPARE name AS … for a statement)"),
-    })
+/// When a value may change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Change {
+    /// Fixed by the process's first open (`env::give`). Every node setting, until a node's state is off the statics
+    /// (redesign step 2).
+    Start,
+    /// By an admin while it runs.
+    Admin,
+    /// By the session itself.
+    Own,
 }
 
-/// A setting's name as kept: lower case, Postgres's `timezone` as DataFusion's.
-fn name(n: &str) -> String {
-    match n.to_lowercase().as_str() {
-        "timezone" | "time.zone" | "time zone" => "datafusion.execution.time_zone".into(),
-        "threads" | "worker_threads" => "datafusion.execution.target_partitions".into(), // (DuckDB's: how many parts a query runs in at once)
-        n => n.into(),
+/// What a setting is when it isn't set.
+#[derive(Clone, Copy, Debug)]
+pub enum Unset {
+    /// Nothing here: unset, or its readers' own default.
+    No,
+    /// This value.
+    Is(&'static str),
+    /// One worked out when read (from the cores, or another setting).
+    Of(fn() -> String),
+}
+
+/// One setting.
+#[derive(Clone, Copy, Debug)]
+pub struct Setting {
+    /// Its name in the environment: `PONDRA_MEMORY_GB`, which is `memory_gb` as an option of `open` and `--memory-gb` as a
+    /// flag.
+    pub var: &'static str,
+    pub who: Who,
+    pub kind: Kind,
+    pub unset: Unset,
+    pub scope: Scope,
+    pub change: Change,
+}
+
+impl Setting {
+    /// Its short name: `memory_gb`.
+    pub fn name(&self) -> String {
+        self.var["PONDRA_".len()..].to_ascii_lowercase()
+    }
+
+    /// What it is when unset, as text, or None.
+    pub fn default(&self) -> Option<String> {
+        match self.unset {
+            Unset::No => None,
+            Unset::Is(v) => Some(v.to_string()),
+            Unset::Of(f) => Some(f()),
+        }
     }
 }
 
-/// A value as `SET` takes it: a string's text, a number, a word.
-fn text(e: &Expr) -> Result<String> {
-    Ok(match e {
-        Expr::Value(v) => match &v.value {
-            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s.clone(),
-            Value::Number(n, _) => n.to_string(),
-            Value::Boolean(b) => b.to_string(),
-            v => bail!("SET takes a string, a number or a word, not {v}"),
-        },
-        Expr::Identifier(i) => i.value.clone(),
-        Expr::CompoundIdentifier(parts) => parts.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("."), // (SET search_path TO dev.sales)
-        Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } => format!("-{}", text(expr)?),
-        Expr::UnaryOp { op: ast::UnaryOperator::Plus, expr } => format!("+{}", text(expr)?),
-        e => bail!("SET takes a string, a number or a word, not {e}"),
-    })
+const fn of(var: &'static str, who: Who, kind: Kind, unset: Unset) -> Setting {
+    Setting { var, who, kind, unset, scope: Scope::Node, change: Change::Start }
 }
+const fn node(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Node, kind, unset) }
+const fn command(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Command, kind, unset) }
+const fn starter(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Starter, kind, unset) }
+const fn test(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Test, kind, unset) }
 
-/// Postgres's settings that ask for something done one way here: the values that say what is done
-/// are kept (and `DEFAULT`), any other refused by name, with its SQLSTATE.
-const ONE_WAY: &[(&str, &[&str], &str, &str)] = &[
-    ("client_encoding", &["utf8", "utf-8", "unicode", "utf8mb4", "utf8mb3"], "22023", "text is UTF-8 here: SET client_encoding = 'UTF8'"),
-    ("standard_conforming_strings", &["on", "true", "1"], "22023", "a backslash in '…' is itself here, as Postgres has it by default; E'a\\nb' writes an escape"),
-    ("autocommit", &["on", "true", "1"], "22023", "each statement commits on its own here: BEGIN … COMMIT makes several one"),
-    ("transaction_isolation", &["read committed", "read uncommitted", "repeatable read"], "0A000", SERIALIZABLE),
-    ("default_transaction_isolation", &["read committed", "read uncommitted", "repeatable read"], "0A000", SERIALIZABLE),
+// The defaults worked out when read.
+fn blocking_threads() -> String { // (tokio's own on Windows, where a child's pipes are read on blocking threads: `panics::runtime`)
+    if cfg!(windows) { 512 } else { 16.max(4 * crate::env::cores()) }.to_string()
+}
+fn cores() -> String { crate::env::cores().to_string() }
+fn inline_kb() -> String { // (a megabyte where commits are replicated: the followers' copies, `log.rs`)
+    if crate::env::value::<usize>("PONDRA_REPLICAS") > 1 { "1024" } else { "64" }.to_string()
+}
+fn procedures() -> String { (4 * crate::env::cores()).to_string() } // (`python.rs`)
+fn queries() -> String { (4 * crate::env::cores()).max(16).to_string() } // (`app.rs`)
+fn view_runs() -> String { (crate::env::cores() / 2).max(2).to_string() } // (`views.rs`)
+
+use Kind::*;
+use Unset::{Is, No, Of};
+
+/// Every setting.
+pub const ALL: &[Setting] = &[
+    node("PONDRA_ADMIN_TOKEN", Secret, No),
+    node("PONDRA_ADMIN_TOKEN_PREVIOUS", Secret, No),
+    node("PONDRA_AI_CALLS", Int, No),
+    node("PONDRA_AI_KEY", Secret, No),
+    node("PONDRA_AI_MODEL", Text, Is("llama3.2")),
+    node("PONDRA_AI_TIMEOUT_SECS", Secs, Is("300")),
+    node("PONDRA_AI_URL", Url, Is("http://127.0.0.1:11434/v1")),
+    node("PONDRA_ALLOW_UNSIGNED_EXTENSIONS", Bool, No),
+    node("PONDRA_AUDIT", List, Is("role,ddl,function")),
+    node("PONDRA_AUDIT_DAYS", Days, Is("90")),
+    node("PONDRA_BLOCKING_THREADS", Int, Of(blocking_threads)),
+    node("PONDRA_BROADCAST_MB", Mb, Is("64")),
+    node("PONDRA_BUCKET_REQUESTS", Int, Is("256")),
+    node("PONDRA_CACHE_DIR", Path, No),
+    node("PONDRA_CACHE_GB", Gb, No),
+    node("PONDRA_CACHE_MB", Mb, Is("1024")),
+    node("PONDRA_CHANGELOG_SECS", Secs, Is("0")),
+    node("PONDRA_CODEC", Text, No),
+    node("PONDRA_CONFIG_DIR", Path, No),
+    node("PONDRA_CONSOLE_DIR", Path, No),
+    node("PONDRA_CONSOLE_EXTENSIONS", Paths, No),
+    node("PONDRA_CORES", Int, Of(cores)),
+    node("PONDRA_CURSORS_MB", Mb, No),
+    node("PONDRA_DATABASE_IDLE_SECS", Secs, Is("600")),
+    node("PONDRA_IDLE_EXIT_SECS", Secs, Is("0")),
+    node("PONDRA_DEBUG_FAIL_STEP", Switch, No),
+    node("PONDRA_DEBUG_FAIL_STEP_AFTER", Switch, No),
+    node("PONDRA_DEBUG_JOIN_ORDER", Switch, No),
+    node("PONDRA_DEBUG_OPEN_TWICE", Switch, No),
+    node("PONDRA_DEBUG_PG", Switch, No),
+    node("PONDRA_DEBUG_SPREAD", Switch, No),
+    node("PONDRA_DRAIN_GRACE_SECS", Secs, Is("0")),
+    node("PONDRA_DRAIN_SECS", Secs, Is("30")),
+    node("PONDRA_EMBED_MODEL", Text, Is("nomic-embed-text")),
+    node("PONDRA_EXTENSION_FILE_MB", Mb, Is("64")),
+    node("PONDRA_EXTENSION_MB", Mb, Is("256")),
+    node("PONDRA_EXTENSION_SECS", Secs, Is("30")),
+    node("PONDRA_FILES_CACHE_MB", Mb, Is("512")),
+    node("PONDRA_FILE_VERSIONS", Int, Is("50")),
+    node("PONDRA_FILE_VERSIONS_DAYS", Days, Is("90")),
+    node("PONDRA_FSYNC", Bool, No),
+    node("PONDRA_FUNCTION_CACHE_MB", Mb, Is("256")),
+    node("PONDRA_GC_SECS", Secs, No),
+    node("PONDRA_HISTORY", Text, No),
+    node("PONDRA_HISTORY_DAYS", Days, Is("7")),
+    node("PONDRA_HISTORY_RATE", Int, Is("500")),
+    node("PONDRA_HOT_GB", Gb, No),
+    node("PONDRA_INLINE_KB", Kb, Of(inline_kb)),
+    node("PONDRA_JOIN_ORDER", Int, Is("2")),
+    test("PONDRA_KEEP_AT_ONCE", Int, No),
+    test("PONDRA_KEEP_PARQUET", Text, No),
+    node("PONDRA_KMS_COMMAND", Text, No),
+    test("PONDRA_LATE_ROWS", Text, No),
+    node("PONDRA_LAUNCHER", Path, No),
+    node("PONDRA_LEARN", Bool, No),
+    node("PONDRA_LEARN_MS", Ms, Is("100")),
+    node("PONDRA_LINK", List, No),
+    node("PONDRA_LOAD_RETENTION_SECS", Secs, No),
+    node("PONDRA_LOCK_LEASE_SECS", Secs, Is("60")),
+    node("PONDRA_MATCH_HELD_ROWS", Int, Is("1000000")),
+    node("PONDRA_MATCH_RUN_ROWS", Int, Is("1000000")),
+    node("PONDRA_MEMORY_GB", Gb, No),
+    node("PONDRA_MEMORY_LAKE_GB", Gb, No),
+    node("PONDRA_MEMORY_MAX_GB", Gb, No),
+    node("PONDRA_PAGES_MB", Mb, Is("256")),
+    node("PONDRA_PIN_LEASE_SECS", Secs, Is("1209600")),
+    node("PONDRA_PIN_RENEW_SECS", Secs, Is("3600")),
+    node("PONDRA_PROCEDURES", Int, Of(procedures)),
+    node("PONDRA_PUBLISH", List, No),
+    node("PONDRA_PURGE_ROWS", Int, Is("100000")),
+    node("PONDRA_PYTHON", Path, No),
+    node("PONDRA_PYTHON_PROBE_SECS", Secs, Is("15")),
+    node("PONDRA_QUERIES", Int, Of(queries)),
+    node("PONDRA_QUEUE_SECS", Secs, Is("60")),
+    node("PONDRA_READ_TOKEN", Secret, No),
+    node("PONDRA_REPLICAS", Int, Is("1")),
+    node("PONDRA_RUNS_DAYS", Days, Is("30")),
+    node("PONDRA_SECRET_KEY", Secret, No),
+    node("PONDRA_SECRET_KEY_PREVIOUS", Secret, No),
+    node("PONDRA_SERVE_STORE", Bool, No),
+    node("PONDRA_SESSION_HOURS", Hours, No),
+    node("PONDRA_SESSION_IDLE_SECS", Secs, Is("3600")),
+    node("PONDRA_SHARED_KEY_FILE", Path, No),
+    node("PONDRA_SHARE_FILES_PER_MINUTE", Int, Is("10000")),
+    node("PONDRA_SHARE_URL_SECS", Secs, Is("900")),
+    node("PONDRA_SHARING_URL", Url, No),
+    node("PONDRA_SKEW_MB", Mb, Is("64")),
+    node("PONDRA_SLOW_MS", Ms, Is("1000")),
+    node("PONDRA_SPILL_DIR", Path, No),
+    node("PONDRA_SPILL_FAN_IN", Int, No),
+    node("PONDRA_SPILL_GB", Gb, No),
+    node("PONDRA_SPILL_MB", Mb, Is("64")),
+    node("PONDRA_SPREAD_MB", Mb, Is("256")),
+    node("PONDRA_SQL_OPTIONS", List, No),
+    node("PONDRA_STAGED_SECS", Secs, Is("86400")),
+    node("PONDRA_STATEMENT_TIMEOUT", Text, No),
+    node("PONDRA_STREAM_MB", Mb, Is("8")),
+    node("PONDRA_TEMP_MB", Mb, Is("1024")),
+    node("PONDRA_TLS", Text, No),
+    node("PONDRA_TLS_CA", Path, No),
+    node("PONDRA_TLS_CERT", Path, No),
+    node("PONDRA_TLS_KEY", Path, No),
+    node("PONDRA_TRACE_COMMIT", Switch, No),
+    node("PONDRA_TRACE_PG", Switch, No),
+    node("PONDRA_TRACE_QUERY", Switch, No),
+    node("PONDRA_TRACE_RERUN", Switch, No),
+    node("PONDRA_TRACE_START", Switch, No),
+    node("PONDRA_TRUSTED_PROXIES", List, No),
+    node("PONDRA_TXN_IDLE_SECS", Secs, Is("600")),
+    node("PONDRA_USER_QUERIES", Int, No),
+    node("PONDRA_USER_TIMEOUT", Secs, No),
+    node("PONDRA_VIEW_RUNS", Int, Of(view_runs)),
+    node("PONDRA_VIEW_RUN_SECS", Secs, Is("3600")),
+    node("PONDRA_WEB_ORIGINS", List, No),
+    node("PONDRA_WEB_SEND_MB", Mb, Is("64")),
+    node("PONDRA_WORKER_IDLE_SECS", Secs, Is("60")),
+    node("PONDRA_WORKER_MB", Mb, Is("2048")),
+    node("PONDRA_WORKER_START_SECS", Secs, Is("60")),
+    node("PONDRA_WRITE_TOKEN", Secret, No),
+    command("PONDRA_BROWSER", Text, No),
+    command("PONDRA_ENV", Text, No),
+    command("PONDRA_HOME", Path, No),
+    command("PONDRA_JOB", Text, No),
+    command("PONDRA_PASSWORD", Secret, No),
+    command("PONDRA_TOKEN", Secret, No),
+    command("PONDRA_TRIES", Int, Is("0")),
+    starter("PONDRA_CLIENT_KEY", Secret, No),
+    starter("PONDRA_NODE_KEY", Secret, No),
+    starter("PONDRA_OWNER_KEY", Secret, No),
+    starter("PONDRA_REACH", Secret, No),
+    starter("PONDRA_SERVER_URL", Url, No),
+    starter("PONDRA_SUPERVISED", Switch, No),
+    test("PONDRA_CRASH", Text, No),
+    test("PONDRA_DROP_BEATS", Path, No),
+    test("PONDRA_NO_DIRECT", Switch, No),
+    test("PONDRA_TEST_AUTOCOMMIT_PAUSE_MS", Ms, No),
+    test("PONDRA_TEST_FILL_PAUSE_MS", Ms, No),
+    test("PONDRA_TEST_FORMAT", Int, No),
+    test("PONDRA_TEST_NO_GATE", Switch, No),
+    test("PONDRA_TEST_PANICS", Bool, No),
 ];
 
-/// Other engines' settings for what is the node's here, with the way to set it.
-const THE_NODES: &[(&str, &str)] = &[
-    ("memory_limit", "start the node with --memory-gb (PONDRA_MEMORY_GB)"),
-    ("max_memory", "start the node with --memory-gb (PONDRA_MEMORY_GB)"),
-    ("temp_directory", "spill files go to the system's temporary folder (TMPDIR)"),
-];
-
-pub use crate::rules::txn::SERIALIZABLE; // (one definition: rules::txn)
-
-/// Is this value of a setting one `ONE_WAY` refuses? (Its SQLSTATE and why.) `DateStyle` takes any
-/// order of days and months, but only ISO's output.
-fn one_way(n: &str, value: &str) -> Option<(&'static str, String)> {
-    let v = value.trim().to_lowercase();
-    if v == "default" {
-        return None;
-    }
-    if n == "datestyle" {
-        let other = v.split(|c: char| c == ',' || c.is_whitespace()).find(|w| matches!(*w, "postgres" | "sql" | "german"))?;
-        return Some(("22023", format!("DateStyle {other}: dates are shown as ISO 8601 here (2026-10-11): SET DateStyle = 'ISO'")));
-    }
-    let (_, kept, code, why) = ONE_WAY.iter().find(|(name, ..)| *name == n)?;
-    (!kept.contains(&v.as_str())).then(|| (*code, format!("{n} = '{value}': {why}")))
+/// Every setting: the table, until the registry's settings section takes it over.
+pub fn all() -> &'static [Setting] {
+    ALL
 }
 
-fn set(session: &str, variable: &str, value: String) -> Result<()> {
-    let n = name(variable);
-    if let Some(v) = n.strip_prefix('@') {
-        return Err(crate::codes::coded("0A000", crate::dialect_stmts::user_variable(v)));
+/// The setting of a name in the environment (`PONDRA_MEMORY_GB`), or None for one nothing reads.
+pub fn find(var: &str) -> Option<&'static Setting> {
+    ALL.iter().find(|s| s.var == var)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_once() {
+        let mut seen = std::collections::HashSet::new();
+        assert!(ALL.iter().all(|s| s.var.starts_with("PONDRA_") && seen.insert(s.var)), "each name once");
     }
-    if let Some((code, why)) = one_way(&n, &value) {
-        return Err(crate::codes::coded(code, why));
-    }
-    if let Some((_, how)) = THE_NODES.iter().find(|(name, _)| *name == n) {
-        return Err(crate::codes::coded("55P02", format!("{n} is the node's, not a session's: {how}"))); // (cant_change_runtime_param)
-    }
-    if n.starts_with("datafusion.runtime.") {
-        return Err(crate::codes::coded("55P02", format!("{n} is the node's, not a session's: start the node with --memory-gb (PONDRA_MEMORY_GB) for its queries' memory; spill files go to the system's temporary folder (TMPDIR)")));
-    }
-    if n.contains('.') {
-        // (a name DataFusion has is datafusion.…: any other dotted name is no setting of Pondra's, refused as Postgres refuses
-        // one it doesn't have; a Spark one says where its settings are)
-        if !n.starts_with("datafusion.") {
-            let spark = match n.starts_with("spark.") {
-                true => ": Spark's settings aren't Pondra's (SHOW ALL lists Pondra's)",
-                false => "",
+
+    /// A default reads as its kind, so `env::value` never meets one it can't.
+    #[test]
+    fn defaults_read() {
+        for s in ALL {
+            let Some(v) = s.default() else { continue };
+            let ok = match s.kind {
+                Int => v.parse::<u64>().is_ok(),
+                Float | Secs | Ms | Hours | Days | Kb | Mb | Gb => v.parse::<f64>().is_ok_and(|n| n >= 0.0),
+                Switch | Bool | Secret | Path | Paths => false, // (unset is off, or none)
+                Text | List | Url => !v.is_empty(),
             };
-            return Err(crate::codes::coded("42704", format!("unrecognized configuration parameter \"{n}\"{spark}")));
+            assert!(ok, "{}'s default {v:?} isn't a {:?}", s.var, s.kind);
+            assert_eq!((s.scope, s.change), (Scope::Node, Change::Start), "{}: every node setting is fixed at its start, until step 2", s.var);
         }
-        datafusion::config::ConfigOptions::new().set(&n, &value)?; // (a value DataFusion takes for a name it has)
-    }
-    crate::temp::with(session, false, |s| Ok(s.settings.insert(n, value)))?;
-    Ok(())
-}
-
-/// Does the current session have settings of DataFusion's? (Its queries then run on its node,
-/// planned with them, and aren't answered from what another query found.)
-pub fn any() -> bool {
-    crate::temp::current().is_some_and(|s| crate::temp::with(&s, false, |s| Ok(s.settings.keys().any(|k| k.starts_with("datafusion.")))).unwrap_or(false))
-}
-
-/// A query's session with the current session's settings of DataFusion's. In Spark's dialect
-/// (`datafusion.sql_parser.dialect = 'spark'` or `'databricks'`), Spark's functions over
-/// DataFusion's of the same names too (`floor` of a DOUBLE is a BIGINT, `substring` counts from
-/// the end, …), and Spark's `EXTRACT` and `SUBSTRING`.
-pub async fn apply(ctx: SessionContext) -> Result<SessionContext> {
-    let kept = crate::temp::current().map(|s| crate::temp::with(&s, false, |s| Ok(s.settings.iter().filter(|(k, _)| k.starts_with("datafusion.")).map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>())));
-    for (variable, value) in kept.transpose()?.unwrap_or_default() {
-        ctx.execute_logical_plan(LogicalPlan::Statement(Plan::SetVariable(SetVariable { variable, value }))).await?; // (as DataFusion sets one: functions that read it told)
-    }
-    use datafusion::common::config::Dialect;
-    if !matches!(ctx.state().config().options().sql_parser.dialect, Dialect::Spark | Dialect::Databricks) {
-        return Ok(ctx);
-    }
-    // DataFusion's of a name Spark has go, aliases and all: a session rebuilt later (files read by
-    // URL, a query's copy) registers what is left in no set order, and must find Spark's alone. One
-    // whose alias is Spark's name goes too (`array_has`, also `array_contains`): kept, it answered
-    // for Spark's `array_contains` in some sessions and not others.
-    let (scalar, aggregate) = (datafusion_spark::all_default_scalar_functions(), datafusion_spark::all_default_aggregate_functions());
-    let names: std::collections::HashSet<String> = scalar.iter().map(|f| (f.name(), f.aliases())).chain(aggregate.iter().map(|f| (f.name(), f.aliases())))
-        .flat_map(|(n, a)| std::iter::once(n.to_string()).chain(a.iter().cloned())).collect();
-    let mut spark = datafusion::execution::SessionStateBuilder::new_from_existing(ctx.state());
-    spark.expr_planners().get_or_insert_with(Vec::new).insert(0, std::sync::Arc::new(datafusion_spark::planner::SparkFunctionPlanner));
-    let fns = spark.scalar_functions().get_or_insert_with(Vec::new);
-    fns.retain(|f| !names.contains(f.name()) && !f.aliases().iter().any(|a| names.contains(a)));
-    fns.extend(scalar);
-    let fns = spark.aggregate_functions().get_or_insert_with(Vec::new);
-    fns.retain(|f| !names.contains(f.name()) && !f.aliases().iter().any(|a| names.contains(a)));
-    fns.extend(aggregate);
-    Ok(SessionContext::new_with_state(spark.build()))
-}
-
-/// The SQL dialect the session set (or the node: `PONDRA_SQL_OPTIONS`), for a statement the
-/// generic parser doesn't take (DuckDB's `STRUCT(a INT)`, …).
-pub fn dialect() -> Option<Box<dyn datafusion::sql::sqlparser::dialect::Dialect>> {
-    const KEY: &str = "datafusion.sql_parser.dialect";
-    let session = crate::temp::current().and_then(|s| crate::temp::with(&s, false, |s| Ok(s.settings.get(KEY).cloned())).ok().flatten());
-    let node = || crate::env::get("PONDRA_SQL_OPTIONS")?.split(',').find_map(|kv| Some(kv.trim().split_once('=').filter(|(k, _)| *k == KEY)?.1.to_string()));
-    datafusion::sql::sqlparser::dialect::dialect_from_str(session.or_else(node)?)
-}
-
-/// `SHOW name` of a Postgres setting the session keeps: one row, its column named as the setting,
-/// as Postgres answers it (`search_path` is `public` until set). DataFusion's own (`datafusion.*`,
-/// `TIME ZONE`) and a name never set are left to DataFusion's `SHOW`.
-pub fn show(sql: &str) -> Option<String> {
-    if crate::text::head(sql) != "show" {
-        return None;
-    }
-    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^\s*show\s+([a-z_][a-z0-9_]*)\s*;?\s*$").expect("a regex"));
-    let n = SHOW.captures(sql)?[1].to_lowercase();
-    if name(&n).contains('.') {
-        return None;
-    }
-    let v = shown(&n).or_else(|| (n == "search_path").then(|| "public".to_string()))?;
-    Some(format!("SELECT '{}' AS {n}", v.replace('\'', "''")))
-}
-
-/// A Postgres setting the current session set (`SHOW name`).
-pub fn shown(n: &str) -> Option<String> {
-    let s = crate::temp::current()?;
-    crate::temp::peek(&s, |x| x.settings.get(&name(n)).cloned()) // (a peek: reading a setting makes no session)
-}
-
-/// `EXECUTE`'s arguments put where `$1`, `$2`, … are.
-struct Arguments {
-    values: Vec<Expr>,
-    types: Vec<ast::DataType>,
-    wrong: Option<String>,
-}
-
-impl VisitorMut for Arguments {
-    type Break = ();
-    fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
-        let Expr::Value(v) = e else { return ControlFlow::Continue(()) };
-        let Value::Placeholder(p) = &v.value else { return ControlFlow::Continue(()) };
-        let Some(i) = p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()).filter(|i| *i >= 1) else {
-            self.wrong = Some(format!("Unknown placeholder: {p} (the placeholders are $1, $2, … in order)"));
-            return ControlFlow::Break(());
-        };
-        let Some(value) = self.values.get(i - 1).cloned() else {
-            self.wrong = Some(format!("No value found for placeholder with name {p} (EXECUTE name(1, 'a') gives one value per placeholder, in order)"));
-            return ControlFlow::Break(());
-        };
-        *e = match self.types.get(i - 1) {
-            Some(t) => Expr::Cast { kind: ast::CastKind::Cast, expr: Box::new(value), data_type: t.clone(), array: false, format: None },
-            None => Expr::Nested(Box::new(value)),
-        };
-        ControlFlow::Continue(())
     }
 }
