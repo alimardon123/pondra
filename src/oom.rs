@@ -271,7 +271,7 @@ pub fn start() {
             // the timer ends: 2 s while the cache holds columns (Flight, Kafka and tiering grow the node outside
             // `work`, and the cache is what can answer them), else 30 s.
             match line {
-                Some(line) if crate::panics::running() => tokio::time::sleep(every(felt, if felt < trim { trim } else { line }, settling)).await,
+                Some(line) if crate::panics::running() => tokio::time::sleep(every(felt, trim, line, settling)).await,
                 _ => {
                     let timer = if givers().iter().any(|h| h.usage().0 > 0) { Duration::from_secs(2) } else { Duration::from_secs(30) };
                     IDLE.store(true, Relaxed);
@@ -283,16 +283,23 @@ pub fn start() {
     });
 }
 
-/// When to look again: before memory growing at [`RATE`] could pass the next mark from where it is now, the trim
-/// line while under it (the cache must go before the line comes), else the line. (Looking every second while under
+/// When to look again: before memory growing at [`RATE`] could pass the line from where it is now, and while under the
+/// trim line before it could pass that too (the cache must go before the line comes), though no sooner than half the
+/// time to the line: a full cache holds the node just under its trim line (`Hot::room_for`), and looks every 5 ms there
+/// read `/proc` and take the requests' lock 200 times a second (11-03 audit L12). (Looking every second while under
 /// half the line, a query that grew from there in that second passed a 1 GB line by 0.75 GB before the watch saw it.)
 /// No sooner than 5 ms: near the line a GROUP BY's `array_agg` grows the node 1-6 GB/s, and at 20 ms at least the watch
 /// stopped one up to 17 MB past a 1 GB line (its peak 1,031-1,041 MB, harness `hot`), at 5 ms 3 MB (1,029-1,033 MB:
 /// `logs/round36/memory-line-check.json`). While a stop it made settles (`settling`), 20 ms: the stop's memory is going,
 /// and each look then hands freed pages back (`purge`).
-fn every(resident: usize, mark: usize, settling: bool) -> Duration {
+fn every(resident: usize, trim: usize, line: usize, settling: bool) -> Duration {
     let soonest = Duration::from_millis(if settling { 20 } else { 5 });
-    Duration::from_secs_f64(mark.saturating_sub(resident) as f64 / RATE).clamp(soonest, Duration::from_secs(1))
+    let until = |mark: usize| mark.saturating_sub(resident) as f64 / RATE;
+    let secs = match resident < trim {
+        true => until(line).min(until(trim).max(until(line) / 2.0)),
+        false => until(line),
+    };
+    Duration::from_secs_f64(secs).clamp(soonest, Duration::from_secs(1))
 }
 
 /// Is a request to be stopped now: over the line, and no stop still holding.
@@ -553,12 +560,18 @@ mod tests {
 
     #[test]
     fn the_watch_looks_sooner_the_nearer_the_line() {
-        assert_eq!(every(0, 64 << 30, false), Duration::from_secs(1), "far below a big line: a look a second");
-        assert_eq!(every(LINE - (1 << 20), LINE, false), Duration::from_millis(5), "near it: every 5 ms");
-        assert_eq!(every(2 * LINE, LINE, false), Duration::from_millis(5), "past it too");
-        assert_eq!(every(2 * LINE, LINE, true), Duration::from_millis(20), "past it, a stop settling: every 20 ms");
-        let half = every(LINE / 2, LINE, false);
-        assert!(half > Duration::from_millis(50) && half < Duration::from_millis(70), "half a 1 GB line: before 8 GB/s could pass it ({half:?})");
+        let trim = of_line(LINE);
+        assert_eq!(every(0, of_line(64 << 30), 64 << 30, false), Duration::from_secs(1), "far below a big line: a look a second");
+        assert_eq!(every(LINE - (1 << 20), trim, LINE, false), Duration::from_millis(5), "near it: every 5 ms");
+        assert_eq!(every(2 * LINE, trim, LINE, false), Duration::from_millis(5), "past it too");
+        assert_eq!(every(2 * LINE, trim, LINE, true), Duration::from_millis(20), "past it, a stop settling: every 20 ms");
+        let half = every(LINE / 2, trim, LINE, false);
+        assert!(half > Duration::from_millis(20) && half < Duration::from_millis(35), "half a 1 GB line: before 8 GB/s could pass its trim line ({half:?})");
+        // Just under the trim line, where a full cache holds the node: half the time to the line, not 5 ms (11-03 audit L12).
+        let parked = every(trim - (1 << 20), trim, LINE, false);
+        let to_line = (LINE - trim + (1 << 20)) as f64 / RATE;
+        assert!(parked >= Duration::from_secs_f64(to_line / 2.0 - 1e-6) && parked < Duration::from_secs_f64(to_line), "{parked:?}");
+        assert!(parked > Duration::from_millis(15), "a 1 GB line's trim line is 300 MB under it: ~18 ms ({parked:?})");
     }
 
     #[test]

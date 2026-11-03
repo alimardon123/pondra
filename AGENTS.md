@@ -2843,7 +2843,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 417. **A node stops the query that grew it past its memory line, not the node** (`oom.rs`, `panics::work`): some
    operators grow without asking the query memory pool (`array_agg`, `median`, `string_agg` over huge groups), so the
    pool can't refuse them and the OS killed the node. A watch reads the process's resident memory (again before 8 GB/s
-   of growth could pass the line: every 5 ms near it, 20 ms while a stop settles, every second at most) and past `PONDRA_MEMORY_MAX_GB` (85% of the
+   of growth could pass the line, and under the trim line before it could pass that but no sooner than half the time to
+   the line: every 5 ms near the line, 20 ms while a stop settles, every second at most) and past `PONDRA_MEMORY_MAX_GB` (85% of the
    machine's or container's memory; 0 is off, and a host's process has none) stops the client query (`/sql`, `/mcp`,
    pages, every Postgres statement) that grew it. Of those that have run 200 ms and started a tenth of the line lower,
    that is the one whose polls allocated the most, less what they freed, if that is a tenth of the line or more; else
