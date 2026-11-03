@@ -483,6 +483,7 @@ impl Backend {
             return Ok(Response::Query(answer));
         }
         if let Some(stmt) = crate::write::parse(&sql) {
+            crate::history::parsed(&stmt); // (the history writer takes its table from here: `history::touched`)
             self.app.auth.allows(role, &stmt).map_err(user_error)?;
             let tag = command_tag(&sql, &stmt);
             let v = crate::write::on_node(&self.app, stmt, None).await.map_err(user_error)?;
