@@ -897,7 +897,7 @@ pub struct Lake {
     pub backlog: std::sync::atomic::AtomicU64, // leader: rows in the log not yet tiered (all tables)
     pub rt: Arc<RuntimeEnv>,         // shared by all queries: object store registry + Parquet metadata cache
     tail: Mutex<Tail>, // decoded log rows
-    pub tails: Mutex<(lru::LruCache<String, Vec<Arc<crate::query::Tail>>>, usize)>, // tables' tails as queries read them (`query::Tail`): by table, one a form (`of.1`); total bytes
+    pub tails: Mutex<crate::query::Tails>, // tables' tails as queries read them (`query::Tail`): by table, one a form (`of.1`)
     kept: (Arc<Footers>, Arc<FileStatistics>), // DataFusion's caches of Parquet footers and of files' statistics (`rt`'s)
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
     pub groups: crate::serve::Groups,          // decoded row groups for key lookups
@@ -1478,7 +1478,7 @@ impl Lake {
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new((lru::LruCache::unbounded(), 0)), kept, disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new(crate::query::tails()), kept, disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
         crate::oom::gives_back(&lake.hot); // (the decoded columns give memory back when the node needs it: the one watch takes them, `oom.rs`)
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
@@ -1757,7 +1757,7 @@ impl Lake {
         [
             ("ranges", self.cached.as_ref().map_or(0, |c| c.held())),
             ("log", self.tail.lock().unwrap().bytes),
-            ("tails", self.tails.lock().unwrap().1),
+            ("tails", self.tails.lock().unwrap().bytes()),
             ("lookups", self.groups.held()),
             ("catalog_blocks", self.cat.cached()),
             ("footers", self.kept.0.memory_used()),
@@ -2004,11 +2004,8 @@ impl Lake {
 /// and their parsed form's (`charge`): an entry of 128 files' statistics is large, and every query fills the
 /// cache, so the least recently used go first.
 struct Parsed<T> {
-    by_key: lru::LruCache<String, (Bytes, Arc<T>)>, // (unbounded: `put` trims it)
-    bytes: usize,                                   // what the entries are charged (`charge`)
-    count: usize,                                   // the most entries kept
-    most: usize,                                    // the most bytes charged
-    charge: fn(usize) -> usize,                     // an entry's bytes, raw and parsed, by its raw length
+    by_key: crate::ledger::ByteLru<String, (Bytes, Arc<T>)>, // (at most `count` entries and `most` bytes charged)
+    charge: fn(usize) -> usize,                              // an entry's bytes, raw and parsed, by its raw length
 }
 
 const PARSED_COUNT: usize = 256;
@@ -2027,7 +2024,7 @@ fn segment_charge(raw: usize) -> usize { 640 + 4 * raw }
 
 impl<T> Parsed<T> {
     fn new(count: usize, most: usize, charge: fn(usize) -> usize) -> Self {
-        Parsed { by_key: lru::LruCache::unbounded(), bytes: 0, count, most, charge }
+        Parsed { by_key: crate::ledger::ByteLru::new(most).with_count(count), charge }
     }
 
     /// The entry parsed from these bytes, if it was parsed from bytes that are these.
@@ -2038,18 +2035,7 @@ impl<T> Parsed<T> {
 
     /// Keeps `m`, parsed from `raw`, unless it alone is charged more than the byte bound.
     fn put(&mut self, key: &str, raw: &Bytes, m: &Arc<T>) {
-        if let Some((old, _)) = self.by_key.pop(key) {
-            self.bytes -= (self.charge)(old.len());
-        }
-        if (self.charge)(raw.len()) > self.most {
-            return;
-        }
-        self.by_key.put(key.to_string(), (raw.clone(), m.clone()));
-        self.bytes += (self.charge)(raw.len());
-        while self.by_key.len() > self.count || self.bytes > self.most {
-            let Some((_, (old, _))) = self.by_key.pop_lru() else { break };
-            self.bytes -= (self.charge)(old.len());
-        }
+        let _ = self.by_key.put(key.to_string(), (raw.clone(), m.clone()), (self.charge)(raw.len()));
     }
 }
 
@@ -3409,11 +3395,11 @@ mod tests {
             cat.parsed(&format!("t/big{n}"), &big(n)?)?;
         }
         let kept = |cat: &Catalog, key: &str| cat.metas.lock().unwrap().by_key.contains(key);
-        assert!(cat.metas.lock().unwrap().bytes <= PARSED_BYTES, "the raw bytes kept are within the bound");
+        assert!(cat.metas.lock().unwrap().by_key.bytes() <= PARSED_BYTES, "the raw bytes kept are within the bound");
         assert!(kept(&cat, "t/big39") && !kept(&cat, "t/big0"), "the least recently used went first");
-        let before = cat.metas.lock().unwrap().bytes;
+        let before = cat.metas.lock().unwrap().by_key.bytes();
         cat.parsed("t/huge", &Bytes::from(serde_json::to_vec(&TableMeta { folder: Some("h".repeat(PARSED_BYTES + 1)), ..Default::default() })?))?;
-        assert!(!kept(&cat, "t/huge") && cat.metas.lock().unwrap().bytes == before, "an entry over the bound is not kept");
+        assert!(!kept(&cat, "t/huge") && cat.metas.lock().unwrap().by_key.bytes() == before, "an entry over the bound is not kept");
         for n in 0..300 {
             cat.parsed(&format!("t/small{n}"), &entry(&n.to_string())?)?;
         }
@@ -3454,8 +3440,8 @@ mod tests {
         assert!(cat.segments_of([(seg_key(7), Bytes::from_static(b"not a segment"))].into_iter().collect()).is_err(), "bytes that aren't a segment are an error");
         {
             let held = cat.segs.lock().unwrap();
-            assert_eq!(held.bytes, held.by_key.iter().map(|(_, (raw, _))| segment_charge(raw.len())).sum::<usize>(), "each entry charged raw and parsed");
-            assert!(held.by_key.len() <= SEGMENTS_COUNT && held.bytes <= SEGMENTS_BYTES, "the bounds hold");
+            assert_eq!(held.by_key.bytes(), held.by_key.iter().map(|(_, (raw, _))| segment_charge(raw.len())).sum::<usize>(), "each entry charged raw and parsed");
+            assert!(held.by_key.len() <= SEGMENTS_COUNT && held.by_key.bytes() <= SEGMENTS_BYTES, "the bounds hold");
         }
         // A sweep of more entries than the cache keeps parses the ones it hasn't without keeping them: the tail's stay.
         let sweep: BTreeMap<String, Bytes> = (1..=SEGMENTS_COUNT as u64 + 1).map(|n| Ok((seg_key(n), seg(n, 2)?))).collect::<Result<_>>()?;

@@ -24,6 +24,9 @@ pub mod in_task;
 #[cfg(feature = "lake")] pub mod page; // (a page is a member on the core's lake, one per module)
 pub mod request_body;
 pub mod text;
+// The memory ledger: the one byte-bounded cache every bounded cache of the node uses (`ByteLru`).
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its caches are the lake's)
+mod ledger;
 // The one walk of the SQL tree (every module's walks go through it: `walk.rs`).
 mod walk;
 // The statements 1.1 brings, refused by name in every form (`page.rs` and the node read the same list).
