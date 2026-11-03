@@ -841,7 +841,7 @@ async fn look(lake: &Lake) -> Result<()> {
     if now <= from {
         return Ok(());
     }
-    let segments = lake.cat.scan::<Segment>(&seg_key(from + 1), &seg_key(now + 1)).await?;
+    let segments = lake.cat.segments(&seg_key(from + 1), &seg_key(now + 1)).await?;
     let mut seen = CHANGED.lock().unwrap();
     let (upto, at) = seen.get_mut(&lake.url).context("let go meanwhile")?;
     for (key, s) in segments {
@@ -882,7 +882,7 @@ pub fn follows(v: &View) -> Vec<String> {
 
 /// Did commits (after, upto] change any of `tables`?
 async fn moved_since(lake: &Lake, after: u64, upto: u64, tables: &[String]) -> Result<bool> {
-    Ok(lake.cat.scan::<Segment>(&seg_key(after + 1), &seg_key(upto + 1)).await?.iter().any(|(_, s)| tables.iter().any(|t| moved(s, t))))
+    Ok(lake.cat.segments(&seg_key(after + 1), &seg_key(upto + 1)).await?.iter().any(|(_, s)| tables.iter().any(|t| moved(s, t))))
 }
 
 /// One run: the groups commits (done, now] touched (or every row, run whole), worked out again as

@@ -3109,10 +3109,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the second as `x % -1`, the same remainder, which DataFusion leaves; the zero or one is any constant that folds to one.
    `cargo test --lib optimize::tests::a_decimal_times_zero`
 
-460. **A log segment's entry is parsed once a version** (`Catalog::segments`): the tier loop (`tier::backlog` every
-   second, `tier_table`) and a table's log tail at each query (`query::tail_segments`) read every untiered segment;
-   they go through `cat.segments`, not `cat.scan::<Segment>`. The same LRU as invariant 429 (`Parsed`), by key, a hit
-   only for the bytes it was parsed from (65,536 segments, 16 MB of raw bytes). `cargo test --lib store::tests::a_segment`
+460. **A log segment's entry is parsed once a version** (`Catalog::segments`): every reader of the log's segments goes
+   through `cat.segments`, never `cat.scan::<Segment>`: the tier loop, a table's log tail at each query, key lookups
+   (`Lake::segments_after`), Kafka fetches, the change feed, live queries, reruns, tasks and expiry. One cache: the
+   same LRU as invariant 429 (`Parsed`), by key, a hit only for the bytes it was parsed from, bounded at 65,536
+   segments and 64 MB charged raw and parsed (`segment_charge`); a pass over more entries than it keeps doesn't
+   push the tail's out. A search for where the log starts reads keys only. `cargo test --lib store::tests::a_segment`
 
 462. **A statement's text is parsed once for the front's looks** (`parsed::generic`): `write::parse` (what kind of
    statement it is), `front::expand` (what to expand) and `expander::named_apart` (its answer's names) each read the text

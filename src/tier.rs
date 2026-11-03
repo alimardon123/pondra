@@ -729,7 +729,7 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     for (key, task) in lake.cat.scan::<crate::tasks::Task>("k/", "k0").await? {
         for producer in crate::tasks::producers(&key[2..], &task) {
             let done = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
-            let unread = lake.cat.scan::<Segment>(&seg_key(done + 1), &seg_key(floor + 1)).await?.iter().any(|(_, s)| s.rows_of(&task.source) > 0);
+            let unread = lake.cat.segments(&seg_key(done + 1), &seg_key(floor + 1)).await?.iter().any(|(_, s)| s.rows_of(&task.source) > 0);
             if done < floor && unread {
                 floor = done; // the task still has to read these (tasks skip runs with nothing new)
             }
@@ -740,7 +740,7 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     for (key, v) in lake.cat.scan::<crate::views::View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.rerun.is_some()) {
         let done = lake.cat.get(&producer_key(&crate::rerun::producer(&key[2..]))).await?.unwrap_or(0);
         let follows = crate::rerun::follows(&v);
-        if done < floor && lake.cat.scan::<Segment>(&seg_key(done + 1), &seg_key(floor + 1)).await?.iter().any(|(_, s)| follows.iter().any(|t| crate::rerun::moved(s, t))) {
+        if done < floor && lake.cat.segments(&seg_key(done + 1), &seg_key(floor + 1)).await?.iter().any(|(_, s)| follows.iter().any(|t| crate::rerun::moved(s, t))) {
             floor = done;
         }
     }
@@ -758,13 +758,13 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     // (`--changelog-secs`: the log is also a change feed, kept that long for `/watch?after=` replays.)
     let changelog = crate::env::or::<u64>("PONDRA_CHANGELOG_SECS", 0) * 1000;
     let log_cutoff = cutoff.min(crate::log::now_ms().saturating_sub(changelog));
-    let (segs, kept): (Vec<(String, Segment)>, Vec<(String, Segment)>) = lake.cat.scan::<Segment>(&seg_key(1), &seg_key(floor + 1)).await?
+    let (segs, kept): (Vec<(String, std::sync::Arc<Segment>)>, Vec<(String, std::sync::Arc<Segment>)>) = lake.cat.segments(&seg_key(1), &seg_key(floor + 1)).await?
         .into_iter().partition(|(_, s)| s.ts_ms < log_cutoff);
     // A replaced file stays while a segment kept from before its replacement may name it: a file
     // commit's files are read from them by the log's readers (a task behind, `/watch?after=`).
     let next = match kept.first() {
         Some((_, s)) => Some(s.ts_ms),
-        None => lake.cat.scan::<Segment>(&seg_key(floor + 1), &seg_key(floor + 1001)).await?.first().map(|(_, s)| s.ts_ms),
+        None => lake.cat.segments(&seg_key(floor + 1), &seg_key(floor + 1001)).await?.first().map(|(_, s)| s.ts_ms),
     };
     // Files live when a branch was made stay while its pin does (ADR-047).
     crate::branch::lapse(lake).await?; // (pins on lease not renewed: before the files they kept are counted)
@@ -889,7 +889,7 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
         let named = |f: &DataFile| std::iter::once(f.path.clone()).chain(f.delete_files().cloned()).collect::<Vec<_>>();
         let used = match (part.as_str(), folders.get(&part)) {
             ("log", _) => {
-                let segments = lake.cat.scan::<Segment>("s/", "s0").await?;
+                let segments = lake.cat.segments("s/", "s0").await?;
                 let mut used = Seen::of(segments.len());
                 segments.iter().for_each(|(_, s)| used.add(&key(&s.path)));
                 used
