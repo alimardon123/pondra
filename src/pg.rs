@@ -363,6 +363,26 @@ impl Backend {
         let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: its value; `$1` is the protocol's)
         let bound = self.placed(bound.into_owned()).await?; // (the session's search path: full names, ahead of the key lookup)
         let sql: &str = &bound;
+        // (dbt's leading comment is no part of the statement; nothing below changes one of these, so it is answered first:
+        // no key lookup, macros or dialect for a BEGIN or COMMIT)
+        let statement = crate::text::first_word(sql.trim().trim_end_matches(';'));
+        if let Some(word) = crate::text::control(statement) {
+            if debug() {
+                eprintln!("pg {user}: {statement}");
+            }
+            // BEGIN, COMMIT, ROLLBACK: this connection's transaction (ADR-036 §5)
+            let answer = crate::txn::command(&self.app, word, statement).await;
+            crate::cursors::sweep(); // (a COMMIT or ROLLBACK ends the cursors without HOLD: their answers go now, refused or not)
+            let (tag, warning) = answer.map_err(user_error)?;
+            warning.iter().for_each(|w| crate::routines::heard(&format!("WARNING: {w}")));
+            // (the client sees each one in ReadyForQuery's status: a savepoint leaves the transaction open, ROLLBACK TO
+            // reopens it after a failure, and only BEGIN and COMMIT or ROLLBACK start and end it)
+            return Ok(match word {
+                "BEGIN" | "ROLLBACK TO" => Response::TransactionStart(Tag::new(tag)),
+                "SAVEPOINT" | "RELEASE" => Response::Execution(Tag::new(tag)),
+                _ => Response::TransactionEnd(Tag::new(tag)),
+            });
+        }
         let reader = crate::auth::current().is_some_and(|p| p.role >= crate::auth::Role::Read);
         if reader && crate::txn::open() && crate::txn::gate(&self.app.lake, sql).is_ok() {
             if let Some((b, p)) = crate::txn::point_read(&self.app.lake, sql).await.map_err(user_error)? {
@@ -386,23 +406,8 @@ impl Backend {
         }
         let sql = crate::routines::expand(&self.app.lake, sql).await.map_err(user_error)?; // (macros: ADR-023)
         let sql = crate::sys::planned(&pg_dialect(&self.app.lake, &sql, user)).map_err(user_error)?.into_owned();
-        if crate::env::is_set("PONDRA_DEBUG_PG") {
+        if debug() {
             eprintln!("pg {user}: {sql}");
-        }
-        let statement = crate::text::first_word(&sql); // (dbt's leading comment is no part of the statement)
-        if let Some(word) = crate::text::control(statement) {
-            // BEGIN, COMMIT, ROLLBACK: this connection's transaction (ADR-036 §5)
-            let answer = crate::txn::command(&self.app, word, statement).await;
-            crate::cursors::sweep(); // (a COMMIT or ROLLBACK ends the cursors without HOLD: their answers go now, refused or not)
-            let (tag, warning) = answer.map_err(user_error)?;
-            warning.iter().for_each(|w| crate::routines::heard(&format!("WARNING: {w}")));
-            // (the client sees each one in ReadyForQuery's status: a savepoint leaves the transaction open, ROLLBACK TO
-            // reopens it after a failure, and only BEGIN and COMMIT or ROLLBACK start and end it)
-            return Ok(match word {
-                "BEGIN" | "ROLLBACK TO" => Response::TransactionStart(Tag::new(tag)),
-                "SAVEPOINT" | "RELEASE" => Response::Execution(Tag::new(tag)),
-                _ => Response::TransactionEnd(Tag::new(tag)),
-            });
         }
         let _busy = crate::txn::next(&self.app, &sql).await.map_err(user_error)?; // (a failed transaction takes nothing but its end; READ COMMITTED reads the newest commit; the guard keeps the transaction busy while this runs)
         if let Some(b) = crate::txn::locked_read(&self.app, &sql).await.map_err(user_error)? {
@@ -1890,6 +1895,12 @@ where
 /// A result's columns as Postgres describes them: each one's type, in the format the client asked for.
 fn described(schema: &Schema, format: &Format) -> Vec<FieldInfo> {
     schema.fields().iter().enumerate().map(|(i, f)| FieldInfo::new(crate::pg_names::shown(f).to_string(), None, None, field_type(f, format.format_for(i)).0, format.format_for(i))).collect()
+}
+
+/// `PONDRA_DEBUG_PG=1`: each statement as it runs, on stderr. Read once, as `trace`.
+fn debug() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env::is_set("PONDRA_DEBUG_PG"));
+    *ON
 }
 
 /// `PONDRA_TRACE_PG=1`: where a Postgres statement's time goes, on stderr.
