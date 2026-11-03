@@ -487,6 +487,11 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         _ => None,
     };
     let head = head(sql);
+    // A query is a write only as `SELECT … INTO t` (below): one statement that can't say INTO is none, unparsed (a SELECT
+    // goes past here on every door).
+    if head == "select" && !sql.trim_end().trim_end_matches(';').contains(';') && !crate::text::contains_ci(sql, "into") {
+        return None;
+    }
     if let Some(s) = crate::extension::write(sql) {
         return Some(s); // (INSTALL name FROM a file or URL, and UNINSTALL: `extension.rs`)
     }
@@ -2705,6 +2710,16 @@ async fn led(dir: &str, term: u64, req: &mut Option<Request>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_query_is_a_write_only_as_select_into() {
+        assert!(parse("SELECT 1").is_none(), "a query: no write, unparsed");
+        assert!(parse("select a, b from t where k = 1;").is_none());
+        assert!(parse("SELECT a INTO t2 FROM t").is_some(), "SELECT … INTO makes a table");
+        assert!(parse("select * into temp t2 from t").is_some());
+        assert!(matches!(parse("SELECT 1; DELETE FROM t"), Some(Stmt::Delete(..))), "several statements are read as before: the last");
+        assert!(parse("SELECT 'into' AS w").is_none(), "INTO in a string: read, and no write");
+    }
     use datafusion::arrow::array::Float64Array;
     use datafusion::arrow::datatypes::{Field, Schema};
 
