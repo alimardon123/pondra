@@ -124,7 +124,8 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           pondra://host:port, ADR-072 §8, invariant 299); replace.rs (CREATE OR REPLACE TABLE: a staged table filled, then put
           in the old one's place in one commit: invariant 425); round 36 statement.rs (one statement's
           path behind every door: a door reads its wire into a request and writes the answer back in
-          its own encoding, designs/statement-run.md)
+          its own encoding, designs/statement-run.md); parsed.rs (one parse of a statement's text for the front's
+          looks: invariant 462)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -3112,6 +3113,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    second, `tier_table`) and a table's log tail at each query (`query::tail_segments`) read every untiered segment;
    they go through `cat.segments`, not `cat.scan::<Segment>`. The same LRU as invariant 429 (`Parsed`), by key, a hit
    only for the bytes it was parsed from (65,536 segments, 16 MB of raw bytes). `cargo test --lib store::tests::a_segment`
+
+462. **A statement's text is parsed once for the front's looks** (`parsed::generic`): `write::parse` (what kind of
+   statement it is), `front::expand` (what to expand) and `expander::named_apart` (its answer's names) each read the text
+   as sqlparser's generic dialect does; they share one parse. The last 4 texts of up to 64 KB are kept with what they
+   parsed to (a longer one, a bulk INSERT's rows, is parsed each time), and each look takes its own copy to change. A
+   look at a statement's strings makes no error to drop: `pg_casts::uuid_spelled` and `pg_json_make::jsonb_text_if`
+   answer `Option` (each refusal took a backtrace under `RUST_BACKTRACE`). `cargo test --lib parsed::`
 
 ```bash
 cargo build --release
