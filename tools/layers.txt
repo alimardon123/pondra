@@ -14,6 +14,7 @@ memo base
 metrics base
 parsed base
 registry base
+settings base
 text base
 walk base
 
@@ -132,7 +133,7 @@ runs engine
 script engine
 seq engine
 serve engine
-settings engine
+set engine
 skew engine
 spill engine
 spmd engine

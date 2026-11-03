@@ -13,6 +13,7 @@ pub mod finish;
 pub mod env;
 // The one place a feature says what it adds (designs/redesign/redesign.md §6): `built_in` below lists the build's extensions.
 pub mod registry;
+pub mod settings;
 pub mod reset;
 pub mod fsum;
 pub mod avg;
@@ -162,7 +163,7 @@ mod rules;
 #[cfg(feature = "lake")] mod locks;
 #[cfg(feature = "lake")] mod serve;
 #[cfg(feature = "doors")] mod served;
-#[cfg(feature = "lake")] mod settings;
+#[cfg(feature = "lake")] mod set;
 #[cfg(feature = "lake")] mod shares;
 #[cfg(feature = "doors")] mod sharing;
 #[cfg(feature = "lake")] mod sharing_client;

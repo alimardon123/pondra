@@ -125,9 +125,8 @@ struct Turns {
 }
 
 static TURNS: std::sync::LazyLock<Turns> = std::sync::LazyLock::new(|| {
-    let cores = crate::env::cores();
-    let most = crate::env::or::<usize>("PONDRA_QUERIES", (4 * cores).max(16)).max(1);
-    let wait = crate::env::or::<f64>("PONDRA_QUEUE_SECS", 60.0);
+    let most = crate::env::value::<usize>("PONDRA_QUERIES").max(1);
+    let wait = crate::env::value::<f64>("PONDRA_QUEUE_SECS");
     Turns { turns: tokio::sync::Semaphore::new(most), most, wait: Duration::from_secs_f64(wait.max(0.0)) }
 });
 
@@ -184,7 +183,7 @@ impl App {
     /// the session's own: the other nodes read it with no session, as its reader's path says. And
     /// so do a session's queries while it holds temporary secrets, which only this node has.
     pub async fn here_only(&self, query: &str) -> bool {
-        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::called(query).is_some() || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || crate::auth::limited().is_some()
+        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::called(query).is_some() || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::set::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || crate::auth::limited().is_some()
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await)
     }
 
@@ -513,7 +512,7 @@ impl App {
         };
         let volatile = crate::auth::limited().is_some() || asks(query) || crate::pg_catalog::asked(query) // (Postgres's catalog: another answer to the same text)
             || crate::temp::mentioned(query) || crate::temp::called(query).is_some() // (the session's temporary tables change without a commit, and its functions are its own)
-            || crate::settings::any() // (and its settings may change the answer)
+            || crate::set::any() // (and its settings may change the answer)
             || crate::routines::with_views(&self.lake, query).await.map_or(true, |t| t.len() > query.len() && asks(&t)) // (and so may a view it reads: `now()`, files)
             || crate::routines::volatile(&self.lake, query).await // (a Python function may answer differently each time)
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await); // (a view's current_schema() is its reader's: not one answer for every session)

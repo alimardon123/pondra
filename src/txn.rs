@@ -18,7 +18,7 @@
 //! statements are refused (25P03) until a transaction word ends it.
 use crate::store::*;
 use crate::locks::{lock_wait, passes, Hold, Locks, Place, LOCK_MAX};
-use crate::settings::SERIALIZABLE;
+use crate::set::SERIALIZABLE;
 use crate::write::Stmt;
 pub use crate::rules::txn::Level;
 use crate::rules::txn::{aborted, begin_modes, plan, read_only, savepoint_name, write_word};
@@ -457,7 +457,7 @@ fn mark_of(t: &mut Txn, name: &str) -> Result<usize> {
 
 /// How long a transaction may sit idle before the idle timeout ends it (`PONDRA_TXN_IDLE_SECS`, 600).
 fn idle_limit() -> Duration {
-    Duration::from_secs(crate::env::or("PONDRA_TXN_IDLE_SECS", 600))
+    Duration::from_secs(crate::env::value("PONDRA_TXN_IDLE_SECS"))
 }
 
 /// The error for a session whose transaction the idle timeout ended (25P03): its writes were dropped, so its statements
@@ -562,7 +562,7 @@ fn on_off(b: bool) -> &'static str {
 
 /// The session's default isolation level (`default_transaction_isolation`; READ COMMITTED, as Postgres).
 fn default_level() -> Result<Level> {
-    let v = crate::settings::shown("default_transaction_isolation").unwrap_or_default().to_lowercase();
+    let v = crate::set::shown("default_transaction_isolation").unwrap_or_default().to_lowercase();
     match v.as_str() {
         "repeatable read" | "repeatable_read" => Ok(Level::Repeatable),
         "serializable" => Err(crate::codes::coded("0A000", SERIALIZABLE)),
@@ -572,7 +572,7 @@ fn default_level() -> Result<Level> {
 
 /// The session's default access mode (`default_transaction_read_only`).
 fn default_read_only() -> bool {
-    crate::settings::shown("default_transaction_read_only").is_some_and(|v| matches!(v.to_lowercase().as_str(), "on" | "true" | "1"))
+    crate::set::shown("default_transaction_read_only").is_some_and(|v| matches!(v.to_lowercase().as_str(), "on" | "true" | "1"))
 }
 
 // ---------------------------------------------------------------- every statement's gate
@@ -2114,7 +2114,7 @@ mod tests {
     fn begin_takes_its_modes_and_refuses_what_is_not_built() {
         assert_eq!(crate::text::control("BEGIN ISOLATION LEVEL REPEATABLE READ"), Some("BEGIN"));
         assert_eq!(crate::text::control("START TRANSACTION READ ONLY"), Some("BEGIN"));
-        assert_eq!(crate::text::control("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"), None, "SET TRANSACTION is settings.rs's");
+        assert_eq!(crate::text::control("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"), None, "SET TRANSACTION is set.rs's");
         let modes = begin_modes("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").expect("parses");
         assert_eq!(plan(&modes).expect("plans"), (Some(Level::Repeatable), Some(true)));
         assert_eq!(plan(&begin_modes("BEGIN").expect("parses")).expect("plans"), (None, None));

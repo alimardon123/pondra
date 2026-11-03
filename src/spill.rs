@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 /// Rows held in memory before they go to disk (`PONDRA_SPILL_MB`, 64 by default).
 fn piece() -> usize {
-    crate::env::or::<usize>("PONDRA_SPILL_MB", 64) << 20
+    crate::env::value::<usize>("PONDRA_SPILL_MB") << 20
 }
 
 /// Where a node keeps what it spills: `shuffle` in the process's own spill folder (`store::spill_folder`: this

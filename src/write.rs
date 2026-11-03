@@ -696,7 +696,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Ok(sql) => sql,
         Err(e) => return Some(Stmt::of_error(&e, format!("{e:#}"))),
     };
-    let parsed = crate::parsed::generic(sql).or_else(|e| crate::settings::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (parsed once for the front's looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
+    let parsed = crate::parsed::generic(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (parsed once for the front's looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
     let parsed = match parsed {
         Ok(mut s) => s.pop()?,
         Err(_) => return None,
@@ -918,7 +918,7 @@ async fn declared_of(columns: &[ast::ColumnDef]) -> Result<Vec<datafusion::arrow
 /// dialect, so DuckDB's `STRUCT(a INT)` reads here as it does in a query.
 pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::FieldRef>> {
     let ctx = SessionContext::new_with_config(crate::optimize::config(datafusion::prelude::SessionConfig::new())); // (TIMESTAMPTZ in UTC)
-    let ctx = crate::settings::apply(ctx).await?; // (the session's dialect: DuckDB's STRUCT(a INT), …)
+    let ctx = crate::set::apply(ctx).await?; // (the session's dialect: DuckDB's STRUCT(a INT), …)
     crate::ext_names::declared(ctx, cols).await
 }
 
@@ -2661,7 +2661,7 @@ pub(crate) fn fenced(e: &anyhow::Error) -> bool {
 
 /// How many times this command has already started over (it runs itself again, keeping its job).
 pub(crate) fn tries() -> u32 {
-    crate::env::or("PONDRA_TRIES", 0)
+    crate::env::value("PONDRA_TRIES")
 }
 
 /// This `pondra sql`'s job, the same for every statement it records: a run started over takes the

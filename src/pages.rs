@@ -23,7 +23,7 @@ struct Kept {
 crate::per_node!(static KEPT: Mutex<ByteLru<String, Kept>> = Mutex::new(ByteLru::new(budget())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
 const IDLE: Duration = Duration::from_secs(20 * 60);
 
-fn budget() -> usize { crate::env::or::<usize>("PONDRA_PAGES_MB", 256) << 20 }
+fn budget() -> usize { crate::env::value::<usize>("PONDRA_PAGES_MB") << 20 }
 
 /// Keep an answer: its id, or none when it alone is bigger than the budget.
 pub fn keep(batches: &[RecordBatch]) -> Option<String> {

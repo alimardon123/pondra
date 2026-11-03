@@ -234,7 +234,7 @@ server -> sso
 server -> sso_flow
 server -> tls
 server -> udf
-settings -> extension
+set -> extension
 shares -> crypto
 shares -> delta
 sharing -> byte_range

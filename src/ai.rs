@@ -193,12 +193,12 @@ fn turns() -> &'static tokio::sync::Semaphore {
 /// A 429, a 5xx or a request that never reached it is tried again, after what `Retry-After` says or
 /// half a second doubling each time; anything else (a 400: the model's name, say) fails at once.
 async fn call(embed: bool, inputs: &[&str], model: &str) -> anyhow::Result<Vec<Value>> {
-    let url = crate::env::get("PONDRA_AI_URL").unwrap_or_else(|| "http://127.0.0.1:11434/v1".into());
+    let url = crate::env::text("PONDRA_AI_URL");
     let (path, body) = match embed {
         true => ("embeddings", json!({"model": model, "input": inputs})),
         false => ("chat/completions", json!({"model": model, "messages": [{"role": "user", "content": inputs[0]}]})),
     };
-    let secs = crate::env::or("PONDRA_AI_TIMEOUT_SECS", 300);
+    let secs = crate::env::value("PONDRA_AI_TIMEOUT_SECS");
     let mut wait = Duration::from_millis(500);
     for tries in 1.. {
         let req = crate::ext::bare().post(format!("{}/{path}", url.trim_end_matches('/'))).json(&body); // (not the nodes' client: its token is theirs alone)
@@ -242,8 +242,8 @@ async fn call(embed: bool, inputs: &[&str], model: &str) -> anyhow::Result<Vec<V
 
 fn default_model(embed: bool) -> String {
     match embed {
-        true => crate::env::get("PONDRA_EMBED_MODEL").unwrap_or_else(|| "nomic-embed-text".into()),
-        false => crate::env::get("PONDRA_AI_MODEL").unwrap_or_else(|| "llama3.2".into()),
+        true => crate::env::text("PONDRA_EMBED_MODEL"),
+        false => crate::env::text("PONDRA_AI_MODEL"),
     }
 }
 

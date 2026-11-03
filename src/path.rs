@@ -81,7 +81,7 @@ pub fn parse(here: &str, text: &str) -> Path {
 /// The path the current session set, if it set one other than this lake's public (else None).
 pub fn current(lake: &Lake) -> Option<Path> {
     let here = lake_name(lake);
-    let path = parse(&here, &crate::settings::shown("search_path")?);
+    let path = parse(&here, &crate::set::shown("search_path")?);
     (path != Path::plain(&here)).then_some(path)
 }
 
@@ -94,7 +94,7 @@ pub fn schemas_here(lake: &Lake) -> Vec<String> {
     }
 }
 
-/// Is `sql` a `USE`? The session's to set (`settings.rs` checks for one first).
+/// Is `sql` a `USE`? The session's to set (`set.rs` checks for one first).
 pub fn is_use(sql: &str) -> bool {
     static USE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^use\s").expect("a regex"));
     USE.is_match(crate::text::first_word(sql))
@@ -160,7 +160,7 @@ pub fn set_schema(sql: &str) -> Option<String> {
 pub async fn door(lake: &Lake, sql: &str, skip: &HashSet<String>) -> Result<String> {
     let sql = &crate::pg_json::text(sql); // (`doc ->> 'a' = 'x'`, `doc ? 'a'`: Postgres's JSON operators grouped and read as Postgres does)
     if crate::temp::current().is_none() && (is_use(sql) || set_schema(sql).is_some()) {
-        return Err(coded("0A000", crate::settings::NO_SESSION)); // (Flight SQL and MCP hold no session: refused by name, at once)
+        return Err(coded("0A000", crate::set::NO_SESSION)); // (Flight SQL and MCP hold no session: refused by name, at once)
     }
     let path = match current(lake) {
         Some(p) => p,
@@ -1057,10 +1057,10 @@ mod tests {
 
     #[test]
     fn shows_the_path() {
-        assert_eq!(crate::settings::show("show search_path;").as_deref(), Some("SELECT 'public' AS search_path")); // (no session here: public)
-        assert_eq!(crate::settings::show("SHOW datafusion.execution.batch_size"), None);
-        assert_eq!(crate::settings::show("SHOW TIMEZONE"), None);
-        assert_eq!(crate::settings::show("SHOW TABLES"), None);
+        assert_eq!(crate::set::show("show search_path;").as_deref(), Some("SELECT 'public' AS search_path")); // (no session here: public)
+        assert_eq!(crate::set::show("SHOW datafusion.execution.batch_size"), None);
+        assert_eq!(crate::set::show("SHOW TIMEZONE"), None);
+        assert_eq!(crate::set::show("SHOW TABLES"), None);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! changes either. Every `$day` after
 //! that is its value, bound as a parameter is, never pasted in as text. DuckDB's `SET VARIABLE day
 //! = …`, `RESET VARIABLE day` and `getvariable('day')` are other names for the same; `SET` alone
-//! stays the settings' (`settings.rs`), and the `$` keeps `DECLARE` apart from Postgres's cursors.
+//! stays the settings' (`set.rs`), and the `$` keeps `DECLARE` apart from Postgres's cursors.
 //!
 //! - **Where they live.** A variable is its session's (a Postgres connection, a client's
 //!   `x-pondra-session`, a console tab, a script sent in one go: `temp.rs`). A procedure and a file

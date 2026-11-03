@@ -1285,7 +1285,7 @@ fn pg_duration(v: &str) -> Option<std::time::Duration> {
 pub fn quota() -> Quota {
     let p = crate::auth::current();
     // (a session that set `statement_timeout` keeps its own, 0 included; one that set none gets the node's default)
-    let session = match crate::settings::shown("statement_timeout") {
+    let session = match crate::set::shown("statement_timeout") {
         Some(v) => pg_duration(&v),
         None => crate::env::get("PONDRA_STATEMENT_TIMEOUT").and_then(|v| pg_duration(&v)),
     };

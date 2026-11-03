@@ -68,7 +68,7 @@ fn tsql_tran(words: &[String]) -> bool {
 }
 
 /// `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, and the savepoint words: which, if `sql` is one.
-/// (`SET TRANSACTION` is `settings.rs`'s.)
+/// (`SET TRANSACTION` is `set.rs`'s.)
 pub fn control(sql: &str) -> Option<&'static str> {
     // (past leading comments: dbt sends `/* {"app": "dbt"} */ commit;`)
     let words = first_words(sql, 3);
