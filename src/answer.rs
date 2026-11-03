@@ -282,15 +282,24 @@ pub fn json_each(b: &RecordBatch) -> Result<Vec<Vec<u8>>> {
     Ok(json_lines([b])?.split(|&c| c == b'\n').take(b.num_rows()).map(<[u8]>::to_vec).collect())
 }
 
-/// The first `n` rows as JSON values (only those rows are written).
-pub fn json_values(batches: &[RecordBatch], n: usize) -> Result<Vec<Value>> {
+/// The first `n` rows as JSON values (only those rows are written). Parsed back, a number keeps what a double holds:
+/// an answer that carries rows to a reader takes `json_first`'s text instead.
+pub fn json_values(batches: &[RecordBatch], n: usize) -> Result<Vec<Value>> { Ok(serde_json::from_slice(&json(&first(batches, n))?)?) }
+
+/// The first `n` rows as a JSON array, as written: for an answer that holds them inside JSON of its own, put in as they
+/// are (`serde_json::value::RawValue`), so a value reads as every door writes it (a DECIMAL's every digit).
+pub fn json_first(batches: &[RecordBatch], n: usize) -> Result<Box<serde_json::value::RawValue>> {
+    Ok(serde_json::value::RawValue::from_string(String::from_utf8(json(&first(batches, n))?)?)?)
+}
+
+/// The batches' first `n` rows.
+fn first(batches: &[RecordBatch], n: usize) -> Vec<RecordBatch> {
     let mut left = n;
-    let first: Vec<RecordBatch> = batches.iter().map_while(|b| (left > 0).then(|| {
+    batches.iter().map_while(|b| (left > 0).then(|| {
         let take = left.min(b.num_rows());
         left -= take;
         b.slice(0, take)
-    })).collect();
-    Ok(serde_json::from_slice(&json(&first)?)?)
+    })).collect()
 }
 
 /// What keeps an answer's rows for its later pages and says the id they are kept under (`pages::keep` on a node; a
