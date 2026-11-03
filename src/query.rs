@@ -71,7 +71,7 @@ pub async fn tail_of(lake: &Lake, table: &str, after: u64, upto: Option<u64>, or
 async fn tail_segments(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: bool, sys: bool, filed: bool) -> Result<(Vec<(u64, Vec<RecordBatch>)>, u64)> {
     let end = upto.map_or("s0".to_string(), |u| seg_key(u + 1)); // "s0" sorts right after every "s/…"
     let (mut segs, mut seen) = (vec![], after);
-    for (key, seg) in lake.cat.scan::<Segment>(&seg_key(after + 1), &end).await? {
+    for (key, seg) in lake.cat.segments(&seg_key(after + 1), &end).await? {
         let n = key[2..].parse::<u64>()?;
         seen = seen.max(n);
         if seg.parts.contains_key(table) || (filed && seg.files.contains_key(table)) {

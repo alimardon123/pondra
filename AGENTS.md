@@ -3108,6 +3108,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the second as `x % -1`, the same remainder, which DataFusion leaves; the zero or one is any constant that folds to one.
    `cargo test --lib optimize::tests::a_decimal_times_zero`
 
+460. **A log segment's entry is parsed once a version** (`Catalog::segments`): the tier loop (`tier::backlog` every
+   second, `tier_table`) and a table's log tail at each query (`query::tail_segments`) read every untiered segment;
+   they go through `cat.segments`, not `cat.scan::<Segment>`. The same LRU as invariant 429 (`Parsed`), by key, a hit
+   only for the bytes it was parsed from (65,536 segments, 16 MB of raw bytes). `cargo test --lib store::tests::a_segment`
+
 ```bash
 cargo build --release
 cargo test --release --lib [filter]     # unit tests (the tests are the library's; --bin pondra runs none)

@@ -25,9 +25,9 @@ use std::collections::BTreeMap;
 pub async fn backlog(lake: &Lake, after: u64, upto: Option<u64>) -> Result<BTreeMap<String, u64>> {
     let mut rows = BTreeMap::new();
     let end = upto.map_or("s0".to_string(), |u| seg_key(u + 1));
-    for (_, seg) in lake.cat.scan::<Segment>(&seg_key(after + 1), &end).await? {
-        for (table, parts) in seg.parts {
-            *rows.entry(table).or_default() += parts.iter().map(|p| p.2).sum::<u64>();
+    for (_, seg) in lake.cat.segments(&seg_key(after + 1), &end).await? {
+        for (table, parts) in &seg.parts {
+            *rows.entry(table.clone()).or_default() += parts.iter().map(|p| p.2).sum::<u64>();
         }
     }
     Ok(rows)
@@ -52,7 +52,7 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
         return Ok((0, true));
     }
     let (mut segs, mut n) = (vec![], 0); // (segment, this table's rows in it), up to MAX_ROWS
-    for (key, seg) in lake.cat.scan::<Segment>(&seg_key(meta.tiered + 1), &seg_key(hwm + 1)).await? {
+    for (key, seg) in lake.cat.segments(&seg_key(meta.tiered + 1), &seg_key(hwm + 1)).await? {
         let rows = seg.parts.get(table).map_or(0, |p| p.iter().map(|p| p.2).sum());
         segs.push((key[2..].parse::<u64>()?, rows));
         n += rows;
