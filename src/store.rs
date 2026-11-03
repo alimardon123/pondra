@@ -192,17 +192,12 @@ pub struct TableMeta {
     pub shares: Vec<String>,
     /// The rules made from this parse, once (`rules`): never in the catalog, and a clone starts without them.
     #[serde(skip)]
-    pub rules: RulesMemo,
+    pub rules: crate::memo::Memo<crate::rules::Table>,
+    /// Its column list (`cols`), made once for an entry read from the catalog: a clone's is empty, as `rules`' is.
+    #[serde(skip)]
+    pub column_memo: crate::memo::Memo<crate::column::Columns>,
 }
 
-/// The rules made from one parse of a table's entry (`TableMeta::rules`), kept once. A clone gets an empty one:
-/// it may be changed, so it makes its own.
-#[derive(Default)]
-pub struct RulesMemo(std::sync::OnceLock<Arc<crate::rules::Table>>);
-
-impl Clone for RulesMemo {
-    fn clone(&self) -> Self { RulesMemo::default() }
-}
 
 impl TableMeta {
     /// The changes whose old rows are out of the table's files: reads skip their `{t}$deleted` rows.
@@ -221,10 +216,39 @@ impl TableMeta {
     /// This entry's live columns (under the names it keeps them by: stored, or SQL's in `logical()`'s) in SQL's order
     /// (`shown`, then the others as stored). Without `shown`, `columns` as they are, dropped ones out.
     pub fn in_order(&self) -> Vec<&(String, String)> {
-        let first = self.shown.iter().filter_map(|s| self.columns.iter().find(|(c, _)| c == s));
-        let rest = self.columns.iter().filter(|(c, _)| !self.shown.contains(c));
-        first.chain(rest).filter(|(c, _)| !self.dropped.contains(c)).collect()
+        crate::column::sql_places(&self.columns, |c| self.is_dropped(c), &self.shown).into_iter().map(|i| &self.columns[i]).collect()
     }
+
+    /// Its columns as one list (`column.rs`): each with its id, SQL's name and its stored one, in SQL's order (as
+    /// `in_order`), the dropped ones marked. Made from the entry's fields each time it is asked: `cols` keeps it once for
+    /// an entry read from the catalog. Of the entry as stored only: `logical()`'s copy has left out the dropped columns
+    /// and taken SQL's names, so its places are no longer ids.
+    pub fn column_list(&self) -> crate::column::Columns {
+        crate::column::Columns::new(&self.columns, |c| self.name_of(c), |c| self.is_dropped(c), &self.shown)
+    }
+
+    /// `column_list`, made once for this version of the entry (it can't change under an `Arc`: a change is made on a
+    /// clone, whose memo is empty).
+    pub fn cols(self: &Arc<Self>) -> Arc<crate::column::Columns> { self.column_memo.get_or_init(|| self.column_list()) }
+
+    /// Was a column moved, so SQL's order isn't the stored one (`ALTER COLUMN … FIRST` or `AFTER`, `ADD COLUMN … FIRST`)?
+    /// The one test of it: a reader reorders, or a write fills SQL's order, only then (`in_sql_order`).
+    pub fn moved(&self) -> bool {
+        !self.shown.is_empty() && crate::column::sql_places(&self.columns, |c| self.is_dropped(c), &self.shown).windows(2).any(|w| w[0] > w[1])
+    }
+
+    /// Rows under SQL's names (`to_logical`'s, a log tail's, the change feed's) with the table's columns in SQL's order,
+    /// any other columns (the rows' system columns) where they are: the one reorder the doors use. As they are when no
+    /// column was moved.
+    pub fn in_sql_order(&self, b: &RecordBatch) -> Result<RecordBatch> {
+        match self.moved() {
+            true => Ok(crate::answer::batch_reordered(b, &self.sql_order())?),
+            false => Ok(b.clone()),
+        }
+    }
+
+    /// Was the column stored as `stored` dropped?
+    pub fn is_dropped(&self, stored: &str) -> bool { self.dropped.iter().any(|d| d == stored) }
 
     /// The live columns' SQL names in SQL's order (`_deleted` among them, if the table has it): what `SELECT *` lists, and
     /// what an INSERT without a column list fills, first to last (`write::implicit`).
@@ -344,11 +368,7 @@ impl TableMeta {
     /// The rules of this entry, made once per parse and kept beside it: `Catalog::parsed` hands out one `Arc` per
     /// entry's bytes, so a write takes them with no lookup. An owned or changed entry calls `to_rules` instead.
     pub fn rules(self: &Arc<Self>) -> Result<Arc<crate::rules::Table>> {
-        if let Some(t) = self.rules.0.get() {
-            return Ok(t.clone());
-        }
-        let t = Arc::new(self.to_rules()?);
-        Ok(self.rules.0.get_or_init(|| t).clone())
+        self.rules.get_or_try_init(|| self.to_rules())
     }
 
     /// The table as its readers see it, to describe it (listings, `pg_catalog`, MCP): `logical`, its columns in SQL's order
@@ -3806,10 +3826,63 @@ mod tests {
         let b = Arc::new((*a).clone());
         assert!(!Arc::ptr_eq(&b.rules()?, &x), "a new parse makes its own");
         let c = (*a).clone();
-        assert!(c.rules.0.get().is_none(), "a clone's memo is empty");
+        assert!(c.rules.get().is_none(), "a clone's memo is empty");
         let made = Arc::new(c).rules()?;
         assert_eq!(*made, *x, "and the clone's rules are the same");
         Ok(())
+    }
+
+    /// The one column list (redesign step 1b) agrees with the order the entry's own fields gave before it, for any mix
+    /// of renames, drops and moves: SQL's order, ids as stored places + 1, a renamed column's stored name kept, and
+    /// dropped columns marked, last. `cols()` makes it once per parse, and a clone's memo is empty.
+    #[test]
+    fn the_column_list_is_the_entrys_columns_in_sqls_order() {
+        // (the order as `in_order` made it before the list: `shown`'s columns, then the rest as stored, the dropped out)
+        fn was(m: &TableMeta) -> Vec<String> {
+            let first = m.shown.iter().filter_map(|s| m.columns.iter().find(|(c, _)| c == s));
+            let rest = m.columns.iter().filter(|(c, _)| !m.shown.contains(c));
+            first.chain(rest).filter(|(c, _)| !m.dropped.contains(c)).map(|(c, _)| m.name_of(c).to_string()).collect()
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for _ in 0..2000 {
+            let n = 1 + next(8) as usize;
+            let mut m = TableMeta { columns: (0..n).map(|i| (format!("c{i}"), if i % 2 == 0 { "Int64" } else { "Utf8" }.to_string())).collect(), ..Default::default() };
+            for i in 0..n {
+                match next(6) {
+                    0 => m.dropped.push(format!("c{i}")),
+                    1 => _ = m.names.insert(format!("c{i}"), format!("r{i}")),
+                    _ => {}
+                }
+            }
+            // (`shown`: some of the columns, each once, in any order, dropped ones among them)
+            let mut shown: Vec<String> = (0..n).filter(|_| next(2) == 0).map(|i| format!("c{i}")).collect();
+            for i in (1..shown.len()).rev() {
+                shown.swap(i, next(i as u64 + 1) as usize);
+            }
+            m.shown = shown;
+            let list = m.column_list();
+            let sql: Vec<String> = list.sql().map(|c| c.name.clone()).collect();
+            assert_eq!(sql, was(&m), "{:?} {:?} {:?}", m.shown, m.dropped, m.names);
+            assert_eq!(m.sql_order(), sql);
+            let stored: Vec<String> = list.stored_order().map(|c| c.name.clone()).collect();
+            assert_eq!(m.moved(), sql != stored, "moved: SQL's order isn't the stored one");
+            for c in list.all() {
+                assert_eq!(m.columns[c.id as usize - 1].0, c.stored, "an id is a stored place + 1");
+                assert_eq!((c.name.as_str(), c.dropped), (m.name_of(&c.stored), m.dropped.contains(&c.stored)));
+            }
+            assert_eq!(list.all().len(), n, "every column, the dropped too");
+            assert!(list.stored_order().collect::<Vec<_>>().windows(2).all(|w| w[0].id < w[1].id));
+        }
+        let a = Arc::new(TableMeta { columns: vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into())], shown: vec!["b".into()], ..Default::default() });
+        assert!(Arc::ptr_eq(&a.cols(), &a.cols()), "made once per parse");
+        assert_eq!(*a.cols(), a.column_list());
+        assert!((*a).clone().column_memo.get().is_none(), "a clone's memo is empty");
     }
 
     /// `past_ttl` keeps out what `ttl_sql` does: a timestamp older than the TTL's seconds, a NULL, a row without the column.

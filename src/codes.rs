@@ -223,31 +223,131 @@ pub fn named(name: &str) -> Option<&'static str> {
     NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, c)| *c)
 }
 
-/// The HTTP status nearest a SQLSTATE (ADR-036 §4). A client's own mistake — bad SQL, a value that
-/// breaks a constraint, a name that isn't there — is a 4xx, so a proxy, a monitor or a tool reads it
-/// as the user's error, not a server fault; a transient condition (catching up, a timeout, the
-/// bucket not answering) is 503, to try again; only a real fault (XX, 58, an unknown code) is 500.
-/// The body still carries the message and `x-pondra-sqlstate` the exact code, for a client that
-/// wants more than the class.
+/// What kind of error a SQLSTATE is, for a door whose protocol has no SQLSTATE: each code's kind is said once, in
+/// `KINDS`, and each door maps a kind to its protocol once (HTTP's status here, gRPC's code in `flight`, Iceberg REST's
+/// exception in `iceberg_rest`). The exact code still rides along wherever the protocol has room for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// The request is wrong: syntax, a value, a name used wrongly, a procedure's RAISE, a Python routine's own error.
+    Invalid,
+    /// A row breaks a constraint, or the transaction isn't in a state to do it.
+    Refused,
+    /// Sign in, or sign in again.
+    SignIn,
+    /// Not allowed.
+    Denied,
+    /// No such table, column, function, type, schema, database, cursor or prepared statement.
+    Missing,
+    /// It is there already: a table, a column, a key.
+    Exists,
+    /// Try again: a serialization failure, a deadlock.
+    Retry,
+    /// Not now: a wrong state, a lock not available, something still depends on it.
+    State,
+    /// Past a limit on what can be sent.
+    TooBig,
+    /// Too many of a user's queries at once (a quota).
+    Busy,
+    /// Out of memory or disk.
+    Exhausted,
+    /// The statement ran past its time, or was cancelled.
+    Timeout,
+    /// Try again soon: catching up, cut off, stopping, the bucket or another node silent.
+    Unavailable,
+    /// Not supported.
+    Unsupported,
+    /// A real fault.
+    Internal,
+}
+
+/// Each code's kind: exact codes first, then a class (the first two characters); a code in neither is `Internal`.
+const KINDS: &[(&str, Kind)] = &[
+    ("28", Kind::SignIn),
+    ("42501", Kind::Denied),
+    ("42P01", Kind::Missing),
+    ("42703", Kind::Missing),
+    ("42883", Kind::Missing),
+    ("42704", Kind::Missing),
+    ("3F000", Kind::Missing),
+    ("3D000", Kind::Missing),
+    ("34000", Kind::Missing), // invalid_cursor_name: no such cursor
+    ("26000", Kind::Missing), // invalid_sql_statement_name: no such prepared statement
+    ("42P07", Kind::Exists),
+    ("42701", Kind::Exists),
+    ("23505", Kind::Exists),
+    ("53300", Kind::Busy),
+    ("0A000", Kind::Unsupported),
+    ("54000", Kind::TooBig), // program_limit_exceeded (a page's rows past PONDRA_WEB_SEND_MB: too big to send)
+    ("57014", Kind::Timeout),
+    ("58030", Kind::Unavailable), // io_error: the bucket or another node didn't answer
+    ("40", Kind::Retry),
+    ("55", Kind::State),
+    ("2B", Kind::State),
+    ("53", Kind::Exhausted),
+    ("08", Kind::Unavailable),
+    ("57", Kind::Unavailable),
+    ("21", Kind::Invalid),
+    ("22", Kind::Invalid),
+    ("23", Kind::Refused),
+    ("25", Kind::Refused),
+    ("3B", Kind::Invalid), // a savepoint that isn't there
+    ("42", Kind::Invalid),
+    ("P0", Kind::Invalid),
+    ("38", Kind::Invalid),
+];
+
+/// A SQLSTATE's kind (`KINDS`).
+pub fn kind(code: &str) -> Kind {
+    let exact = KINDS.iter().find(|(c, _)| *c == code);
+    let class = || KINDS.iter().find(|(c, _)| c.len() == 2 && code.starts_with(c));
+    exact.or_else(class).map_or(Kind::Internal, |(_, k)| *k)
+}
+
+/// The HTTP status of a SQLSTATE (ADR-036 §4), by its kind. A client's own mistake — bad SQL, a value that breaks a
+/// constraint, a name that isn't there — is a 4xx, so a proxy, a monitor or a tool reads it as the user's error, not a
+/// server fault; a transient condition (catching up, a timeout, the bucket not answering) is 503, to try again; only a
+/// real fault (XX, 58, an unknown code) is 500. The body still carries the message and `x-pondra-sqlstate` the exact
+/// code, for a client that wants more than the class.
 pub fn http(code: &str) -> u16 {
-    match code {
-        "28P01" | "28000" => 401,                                         // invalid_authorization: sign in
-        "42501" => 403,                                                   // insufficient_privilege
-        "42P01" | "42703" | "42883" | "42704" | "3F000" | "3D000" => 404, // undefined table / column / function / type / schema / database
-        "42P07" | "42701" | "23505" => 409,                               // already exists (a table, a column), duplicate key
-        "53300" => 429,                                                   // too many of a user's queries at once (a quota)
-        "0A000" => 501,                                                   // feature_not_supported
-        "54000" => 413,                                                   // program_limit_exceeded (a page's rows past PONDRA_WEB_SEND_MB: too big to send)
-        "57014" | "57P03" | "58030" | "53200" => 503,                     // timeout, catching up / cut off, bucket or node silent, out of memory: try again
-        c if c.starts_with("40") || c.starts_with("55") || c.starts_with("2B") => 409, // serialize / deadlock, wrong state, still depended on
-        c if c.starts_with("08") || c.starts_with("53") || c.starts_with("57") => 503, // connection, resources, operator intervention
-        c if c.starts_with("21") || c.starts_with("22") || c.starts_with("23") || c.starts_with("25") || c.starts_with("42") || c.starts_with("P0") || c.starts_with("38") => 400, // a bad request (cardinality, data, constraint, transaction state, syntax, a procedure's RAISE, a Python routine's own error)
-        _ => 500,                                                         // XX, 58, unknown: a real fault
+    match kind(code) {
+        Kind::Invalid | Kind::Refused => 400,
+        Kind::SignIn => 401,
+        Kind::Denied => 403,
+        Kind::Missing => 404,
+        Kind::Exists | Kind::Retry | Kind::State => 409,
+        Kind::TooBig => 413,
+        Kind::Busy => 429,
+        Kind::Unsupported => 501,
+        Kind::Exhausted | Kind::Timeout | Kind::Unavailable => 503,
+        Kind::Internal => 500,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn each_code_has_one_kind_and_each_door_reads_the_kind() {
+        use super::{http, kind, Kind::*};
+        // (every code Pondra sends, 11-03; the HTTP statuses are the ones before kinds, except a missing cursor, prepared
+        // statement or savepoint, which were 500, a fault, and are now the user's 404 and 400)
+        let cases = [
+            ("08001", Unavailable, 503), ("08P01", Unavailable, 503), ("0A000", Unsupported, 501), ("20000", Internal, 500),
+            ("21000", Invalid, 400), ("22003", Invalid, 400), ("22P02", Invalid, 400), ("2202E", Invalid, 400),
+            ("23502", Refused, 400), ("23514", Refused, 400), ("23505", Exists, 409), ("25006", Refused, 400), ("25P02", Refused, 400),
+            ("26000", Missing, 404), ("28000", SignIn, 401), ("28P01", SignIn, 401), ("2BP01", State, 409), ("34000", Missing, 404),
+            ("38000", Invalid, 400), ("3B001", Invalid, 400), ("3D000", Missing, 404), ("3F000", Missing, 404),
+            ("40001", Retry, 409), ("40P01", Retry, 409), ("42501", Denied, 403), ("42601", Invalid, 400), ("42701", Exists, 409),
+            ("42703", Missing, 404), ("42704", Missing, 404), ("42723", Invalid, 400), ("42883", Missing, 404), ("42P01", Missing, 404),
+            ("42P07", Exists, 409), ("53000", Exhausted, 503), ("53100", Exhausted, 503), ("53200", Exhausted, 503), ("53300", Busy, 429),
+            ("54000", TooBig, 413), ("54001", Internal, 500), ("55000", State, 409), ("55P03", State, 409), ("57014", Timeout, 503),
+            ("57P01", Unavailable, 503), ("57P03", Unavailable, 503), ("58000", Internal, 500), ("58030", Unavailable, 503),
+            ("58P01", Internal, 500), ("P0001", Invalid, 400), ("XX000", Internal, 500), ("XX001", Internal, 500), ("ZZ999", Internal, 500),
+        ];
+        for (code, k, status) in cases {
+            assert_eq!((kind(code), http(code)), (k, status), "{code}");
+        }
+    }
+
     #[test]
     fn received_from_another_node() {
         assert_eq!([super::received("42P16"), super::received("42P16"), super::received("XX000"), super::received("4"), super::received("42p16")], [Some("42P16"), Some("42P16"), None, None, None]);

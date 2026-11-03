@@ -41,9 +41,10 @@ async fn footer(lake: &Lake, ctx: &datafusion::prelude::SessionContext, table: &
     ensure!(rows == f.rows, "{}: its manifest says {} rows, the file holds {rows}", f.path, f.rows);
     let schema = datafusion::parquet::arrow::parquet_to_arrow_schema(md.file_metadata().schema_descr(), md.file_metadata().key_value_metadata())?;
     let (mut stats, mut nulls) = (crate::manifest::Stats::new(), vec![]);
-    for (i, (stored, t)) in meta.columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c)) {
-        let (name, want) = (meta.name_of(stored), crate::answer::dtype(t)?);
-        let Some(field) = in_file(&schema, i as i64 + 1, name) else {
+    let list = meta.column_list();
+    for col in list.stored_order() {
+        let (stored, name, want) = (&col.stored, col.name.as_str(), crate::answer::dtype(&col.dtype)?);
+        let Some(field) = in_file(&schema, col.id as i64, name) else {
             ensure!(!meta.not_null.contains(stored), "{}: it has no column {name}, which is NOT NULL in {table}", f.path);
             nulls.push(stored.clone());
             continue;
@@ -76,9 +77,10 @@ async fn footer(lake: &Lake, ctx: &datafusion::prelude::SessionContext, table: &
 async fn partition(md: &datafusion::parquet::file::metadata::ParquetMetaData, schema: &Schema, meta: &TableMeta, spec: &str, path: &str, rows: u64) -> Result<String> {
     use datafusion::parquet::arrow::arrow_reader::statistics::StatisticsConverter;
     let col = spec.split_once('(').map_or(spec, |(_, c)| c.trim_end_matches(')')).trim();
-    let i = meta.columns.iter().position(|(c, _)| c == col).context("the partition's column")?;
-    let (name, t) = (meta.name_of(col), crate::answer::dtype(&meta.columns[i].1)?);
-    let field = in_file(schema, i as i64 + 1, name).with_context(|| format!("{path}: it has no column {name}, which {spec} partitions by"))?;
+    let list = meta.column_list();
+    let column = list.of_stored(col).context("the partition's column")?;
+    let (name, t) = (column.name.as_str(), crate::answer::dtype(&column.dtype)?);
+    let field = in_file(schema, column.id as i64, name).with_context(|| format!("{path}: it has no column {name}, which {spec} partitions by"))?;
     let c = StatisticsConverter::try_new(field.name(), schema, md.file_metadata().schema_descr())?;
     let nulls: u64 = c.row_group_null_counts(md.row_groups().iter())?.iter().flatten().sum();
     if nulls == rows {

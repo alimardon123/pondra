@@ -7,8 +7,10 @@
 # base: the shared words
 answer base
 codes base
+column base
 env base
 ledger base
+memo base
 metrics base
 parsed base
 text base
