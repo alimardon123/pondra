@@ -178,8 +178,10 @@ impl Kv for Remote {
     async fn close(&self) -> Result<(), Error> {
         Ok(())
     }
+}
 
-    fn cached(&self) -> usize {
+impl crate::ledger::Charged for Remote {
+    fn held(&self) -> usize {
         0
     }
 }
@@ -298,6 +300,6 @@ mod tests {
         assert!(!kv.is_writer());
         let e = kv.write(&[], &[]).await.err().expect("a refused write");
         assert!(e.to_string().contains("/sql"));
-        assert_eq!(kv.cached(), 0);
+        assert_eq!(crate::ledger::Charged::held(&kv), 0);
     }
 }
