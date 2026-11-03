@@ -55,7 +55,7 @@ mod lateral;
 mod lateral_join;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod measures;
-// Postgres's JSON and text functions: every session has them (`engine::session`), a page's too.
+// Postgres's JSON and text functions: every session has them (the `postgres` extension: `pg_functions::POSTGRES`), a page's too.
 #[cfg_attr(not(feature = "lake"), allow(dead_code))]
 mod pg_formats;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))]
@@ -239,11 +239,19 @@ mod rules;
 #[cfg(feature = "lake")] mod workspace;
 
 /// The extensions this build has, in the order the registry adds them (`registry::get`): the host decides, so the
-/// floors below never name one.
+/// floors below never name one. A session gets their function sets in this order, each seeing the ones before it, and
+/// where two name one function the later one's stays: Spark's first, so Pondra's own and Postgres's stay where Spark
+/// has the name too; MATCH_RECOGNIZE's after the ones its DEFINEs may call.
 pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
     static BUILT_IN: &[&dyn registry::Extension] = &[
         #[cfg(feature = "lake")]
         &objects::CATALOG,
+        &sparksql::SPARK,
+        &engine::ENGINE,
+        &pg_functions::POSTGRES,
+        &matcher::MATCH_RECOGNIZE,
+        #[cfg(feature = "lake")]
+        &ai::AI,
     ];
     BUILT_IN
 }

@@ -27,6 +27,26 @@ pub trait Extension: Sync {
     fn register(&self, r: &mut Registry);
 }
 
+/// An extension compiled into the binary: its name, what it builds on, and what it adds. Each built-in one is a
+/// `static` of this beside the code it adds (`objects::CATALOG`, `engine::ENGINE`, …).
+pub struct BuiltIn {
+    pub name: &'static str,
+    pub requires: &'static [&'static str],
+    pub register: fn(&mut Registry),
+}
+
+impl Extension for BuiltIn {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn requires(&self) -> &'static [&'static str] {
+        self.requires
+    }
+    fn register(&self, r: &mut Registry) {
+        (self.register)(r)
+    }
+}
+
 /// Every section, by its type, and the extensions that filled them.
 #[derive(Default)]
 pub struct Registry {

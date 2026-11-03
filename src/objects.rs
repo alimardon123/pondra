@@ -154,17 +154,16 @@ impl Kinds {
 }
 
 /// The extension that adds the core's kinds.
-pub struct Catalog;
-pub static CATALOG: Catalog = Catalog;
-impl crate::registry::Extension for Catalog {
-    fn name(&self) -> &'static str { "catalog" }
-    fn register(&self, r: &mut crate::registry::Registry) {
+pub static CATALOG: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "catalog",
+    requires: &[],
+    register: |r| {
         let kinds = r.section_mut::<Kinds>();
         for k in CORE_KINDS {
             kinds.add(k);
         }
-    }
-}
+    },
+};
 
 /// Every kind of object this build knows, in the order they were added.
 pub fn all_kinds() -> impl Iterator<Item = &'static Kind> + Clone {
