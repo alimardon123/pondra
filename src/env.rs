@@ -268,7 +268,16 @@ fn line_of(set: Option<usize>, own: Option<usize>) -> Option<usize> {
 /// not the decoding and the batches in flight around them, so the share leaves the rest of the line for those. Past it a
 /// node's pool spills to disk; a page's, with no disk, refuses the query.
 pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
-    gib("PONDRA_MEMORY_GB").unwrap_or_else(own)
+    memory_whole().unwrap_or_else(own)
+}
+
+/// The whole line for the queries and the caches together, when `PONDRA_MEMORY_GB` sets it (`ledger::Ledger`): the queries
+/// hold no line of their own then, and a grow past it takes cache bytes back before it spills, as DuckDB's `memory_limit`
+/// holds its buffers and its operators to one number. A cache given a budget of its own (`PONDRA_HOT_GB`, `PONDRA_CACHE_MB`)
+/// keeps it beside the line (`ledger::Charged::inside`). Unset, the whole line is the memory watch's trim line, and the queries
+/// keep their own share inside it (`store::whole_line`).
+pub fn memory_whole() -> Option<usize> {
+    gib("PONDRA_MEMORY_GB")
 }
 
 /// What a refusal tells a user to raise for a query's memory: a page's query pool (`memory_gb`), else a node's (`--memory-gb`).

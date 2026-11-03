@@ -61,6 +61,7 @@ const NEED: usize = 1 << 16;
 
 pub struct Hot {
     max: usize,
+    own: bool,    // its budget is the user's (`PONDRA_HOT_GB`): kept beside the whole line (`ledger::Charged::inside`)
     memory: bool, // a lake held in memory (`memory://`): see the module's doc
     state: Mutex<State>,
     slot: tokio::sync::Semaphore, // one file at a time: loading competes with queries for CPU
@@ -119,6 +120,8 @@ impl crate::ledger::Charged for Hot {
     fn held(&self) -> usize { self.usage().0 }
 
     fn give_back(&self, bytes: usize) -> usize { self.trim(bytes) }
+
+    fn inside(&self) -> bool { !self.own }
 }
 
 impl Hot {
@@ -132,7 +135,7 @@ impl Hot {
             (None, true) => crate::store::memory_limit(),
             (None, false) => crate::store::memory_limit() / 4,
         });
-        Hot { max, memory, state: Default::default(), slot: tokio::sync::Semaphore::new(1) }
+        Hot { max, own: gb.is_some(), memory, state: Default::default(), slot: tokio::sync::Semaphore::new(1) }
     }
 
     pub fn on(&self) -> bool { self.max > 0 }
@@ -144,12 +147,18 @@ impl Hot {
     }
 
     /// Drop the least recently read columns until `bytes` are freed, and say how many were (the one
-    /// watch, `oom::start`, asks for it when the node's memory passes its trim line).
+    /// watch, `oom::start`, asks for it when the node's memory passes its trim line, and a query's grow
+    /// past the whole line, `ledger::Ledger`).
     pub(crate) fn trim(&self, bytes: usize) -> usize {
-        let mut s = self.state.lock().unwrap();
+        // (never waiting on a reader: a scan holding the lock gives back nothing now, and the columns go once it's let go)
+        let mut s = match self.state.try_lock() {
+            Ok(s) => s,
+            Err(std::sync::TryLockError::WouldBlock) => return 0,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        };
         let mut oldest: Vec<(Instant, (String, String))> = s.cols.iter().map(|(k, c)| (c.read, k.clone())).collect();
         oldest.sort();
-        let mut freed = 0;
+        let (mut freed, mut gone) = (0, vec![]);
         for (_, k) in oldest {
             if freed >= bytes {
                 break;
@@ -159,8 +168,11 @@ impl Hot {
                 if !s.cols.keys().any(|(file, _)| *file == k.0) {
                     s.rows.remove(&k.0);
                 }
+                gone.push(c);
             }
         }
+        drop(s);
+        drop(gone); // (the columns' memory is let go of after the lock)
         freed
     }
 
@@ -269,6 +281,9 @@ impl Hot {
     /// than loading what the watch would trim and decoding it again. Its budget is beside the query memory where
     /// the watch runs, which gives the columns back before it stops a query; where none runs (`pondra sql`, a
     /// page), nothing would give them back, so they take only what queries don't reserve, as they did everywhere.
+    /// Within the whole line too, where the queries and the caches fit together (`ledger::Ledger`, all of
+    /// `PONDRA_MEMORY_GB` when it is set): no more than what the queries' reservations and the other caches leave,
+    /// unless `PONDRA_HOT_GB` gives the columns a budget of their own.
     /// Called outside the state's lock (it takes the lock itself).
     pub fn room_for(&self, lake: &Lake) -> usize {
         let room = match crate::oom::watching() {
@@ -278,8 +293,14 @@ impl Hot {
                 self.max.min(limit.saturating_sub(reserved))
             }
         };
+        let held = self.usage().0;
+        let room = match lake.ledger() {
+            // (what the caches held at the watch's last look counts these columns too)
+            Some(l) if !self.own => room.min(l.whole().saturating_sub(l.reserved().saturating_add(l.cached().saturating_sub(held)))),
+            _ => room,
+        };
         match crate::oom::trim_line() {
-            Some(trim) => room.min(self.usage().0 + trim.saturating_sub(crate::store::resident().unwrap_or(0))),
+            Some(trim) => room.min(held + trim.saturating_sub(crate::store::resident().unwrap_or(0))),
             None => room,
         }
     }
@@ -1184,7 +1205,7 @@ mod tests {
     /// (11-03 audit M3: in a lake on disk such entries stayed for the node's life), with or without its deleted rows.
     #[test]
     fn a_replaced_file_that_didnt_fit_is_let_go_of() {
-        let hot = Hot { max: 1 << 30, memory: false, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
+        let hot = Hot { max: 1 << 30, own: false, memory: false, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
         let noted = ["data/t/a.parquet", "data/t/a.parquet#2", "data/t/b.parquet"];
         hot.state.lock().unwrap().need.extend(noted.map(|k| (k.to_string(), 150)));
         hot.forget(&[("data/t/a.parquet".to_string(), 1)]);
@@ -1197,7 +1218,7 @@ mod tests {
 
     #[test]
     fn put_holds_a_file_in_the_readers_batches() {
-        let hot = Hot { max: 1 << 30, memory: false, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
+        let hot = Hot { max: 1 << 30, own: false, memory: false, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
         // Three writes of different sizes: the file is still read in batches of 8,192 rows.
         let pieces = [(0i64, 5_000i64), (5_000, 20_000), (25_000, 3)];
         let ints: Vec<ArrayRef> = pieces.iter().map(|&(from, n)| Arc::new(Int64Array::from_iter_values(from..from + n)) as ArrayRef).collect();
