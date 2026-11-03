@@ -132,9 +132,8 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("hot_limit_bytes", "gauge", "the most the hot columns may hold (PONDRA_HOT_GB)", &one(hot_max as f64));
     metric("hot_loading_files", "gauge", "files whose columns are being decoded into memory, or wait to be", &one(loading as f64));
     metric("hot_batches_skipped_total", "counter", "batches of hot columns scans skipped by their ranges", &one(crate::hot::SKIPPED.load(Relaxed) as f64));
-    let mut caches: Vec<(String, f64)> = app.lake.cached_bytes().iter().map(|(c, b)| (format!("{{cache=\"{c}\"}}"), *b as f64)).collect();
-    caches.push(("{cache=\"answers\"}".into(), app.results.held() as f64));
-    caches.push(("{cache=\"facts\"}".into(), crate::query::facts_held() as f64));
+    // (one line a cache the node's line counts, by its name: `Ledger::charge`)
+    let caches: Vec<(String, f64)> = app.lake.cached_bytes().iter().map(|(c, b)| (format!("{{cache=\"{c}\"}}"), *b as f64)).collect();
     metric("cache_bytes", "gauge", "what each bounded cache holds now: objects' byte ranges, decoded log rows, tables' tails, row groups for lookups, the catalog's blocks, Parquet footers, files' statistics, remembered answers, planning facts' manifest lists", &caches);
     metric("resident_bytes", "gauge", "resident memory of the process", &one(crate::store::resident().unwrap_or(0) as f64));
     let held: Vec<(String, f64)> = allocator().into_iter().map(|(k, b)| (format!("{{kind=\"{k}\"}}"), b as f64)).collect();

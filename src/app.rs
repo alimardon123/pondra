@@ -83,9 +83,14 @@ impl Results {
         let left = self.0.lock().unwrap().put(key, Cached { version, at: datafusion::common::instant::Instant::now(), body, refreshing: None }, bytes);
         drop(left); // (let go of outside the lock)
     }
+}
 
-    /// The bytes of answers remembered now.
-    pub fn held(&self) -> usize { self.0.lock().unwrap().bytes() }
+/// The remembered answers, as the node's line counts them (`cache_bytes{cache="answers"}`): the least recently asked give
+/// their memory back first.
+impl crate::ledger::Charged for Results {
+    fn held(&self) -> usize { crate::ledger::Charged::held(&self.0) }
+
+    fn give_back(&self, bytes: usize) -> usize { crate::ledger::Charged::give_back(&self.0, bytes) }
 }
 
 impl App {

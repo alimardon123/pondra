@@ -114,6 +114,13 @@ impl Held {
     }
 }
 
+/// The decoded columns give memory back first when the node needs it (`Lake::caches`): a column is decoded again when it is read.
+impl crate::ledger::Charged for Hot {
+    fn held(&self) -> usize { self.usage().0 }
+
+    fn give_back(&self, bytes: usize) -> usize { self.trim(bytes) }
+}
+
 impl Hot {
     /// The cache of a lake: `memory` for a lake held in memory. Its budget is half of the machine's memory, beside the
     /// query memory rather than out of it, as an in-memory engine holds its tables (`room_for`); see the module's doc.
