@@ -3467,6 +3467,7 @@ impl Catalog {
             return Err(crate::backup::refused(None)); // (whatever door a write came through: ADR-070)
         }
         let t0 = Instant::now();
+        let puts = listed(self, puts).await?;
         let mut puts: Vec<(String, Bytes)> = puts.into_iter().map(|(k, v)| (k, v.into())).collect();
         let mut id = self.order.lock().await;
         let t1 = commit_stage("order", t0);
@@ -3484,6 +3485,24 @@ impl Catalog {
     }
 }
 
+
+/// A table's entry in format 5's shape (made just now, or read before the lake was raised) is written as its list once the
+/// lake is format 6 (`format::LISTS`): the one place an entry's shape is chosen (redesign 1b, piece 6b). Format 5's
+/// entries begin with their `columns` (`TableMeta`'s first field), so a commit of lists alone looks no further.
+async fn listed(cat: &Catalog, mut puts: Vec<(String, Vec<u8>)>) -> Result<Vec<(String, Vec<u8>)>> {
+    let old = |k: &str, v: &[u8]| k.starts_with("t/") && v.starts_with(br#"{"columns":"#);
+    if !puts.iter().any(|(k, v)| old(k, v)) || crate::format::of(cat).await?.format < crate::format::LISTS {
+        return Ok(puts);
+    }
+    for (k, v) in puts.iter_mut() {
+        if old(k, v) {
+            if let Ok(t) = serde_json::from_slice::<TableMeta>(v) {
+                *v = json(&t.shaped(true));
+            }
+        }
+    }
+    Ok(puts)
+}
 
 /// `PONDRA_TRACE_COMMIT=1`: where a leader's commits spend their time. Each stage is the time since the one before it
 /// (`since`); once a minute one line on stderr gives each stage's p50 and p95 over that minute, and how late a 10 ms

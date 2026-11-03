@@ -11128,7 +11128,8 @@ def _lake_keys():
                 except OSError:
                     pass
         return False
-    # A lake made with a master key every node shares: its keys sealed from the first write (format 3)
+    # A lake made with a master key every node shares: its keys sealed from the first write (format 3, or 6 once its
+    # leader has raised it to its tables' column lists, `format::LISTS`)
     k1 = {"PONDRA_SECRET_KEY": "keys-master-1"}
     lake = new_lake()
     a = Node(lake, A.port, env=k1).start()
@@ -11138,7 +11139,7 @@ def _lake_keys():
     z = z_of(lake, k1)
     info["made sealed"] = {"keys": kept, "format": stats(A.port).get("format"), "z/": z[:300]}
     checks["a lake made with a master key every node shares has its own keys sealed from its first write (format 3): nothing of them in the clear in its files"] = \
-        kept == "sealed" and stats(A.port).get("format") == 3 and '"sealed"' in z and "pn_" not in z and not in_files(lake)
+        kept == "sealed" and stats(A.port).get("format") >= 3 and '"sealed"' in z and "pn_" not in z and not in_files(lake)
     # A follower with the same key opens them and writes through the leader; another key can't open them
     b = Node(lake, A.port + 1, env=k1).start()
     unsigned = as_(A.port + 1, None, "SELECT count(*) AS n FROM t")  # (its mirror may be seeded before the user was flushed: never open for that)
@@ -11221,7 +11222,7 @@ def _lake_keys():
                             "a branch's key from before: pinned, renews, lets go": [str(pinned)[:160], str(old_renews)[:160], str(old_lets_go)[:300]],
                             "a branch's key given after: new, lets go": [new_branch_key != old_branch_key, str(new_lets_go)[:160]]}
     checks["a lake whose keys are in the clear (no shared master key: its files show them) has them sealed when its leader starts with one, made new: the old nodes' key and a session from before, readable from the bucket, sign in no more, and a new sign-in does"] = \
-        clear == "clear" and seen is True and isinstance(before, int) and before < 3 and kept == "sealed" and after == 3 and '"sealed"' in z_of(lake2, k1) \
+        clear == "clear" and seen is True and isinstance(before, int) and kept == "sealed" and after >= 3 and '"sealed"' in z_of(lake2, k1) \
         and str(still).startswith("ERROR 401") and again == [{"n": 1}] and old_signed == [{"n": 1}] and str(old_after).startswith("ERROR 401")
     checks["a branch's key given while the keys were in the clear (anyone who copied them could make it) renews its pin after sealing (and gets no new key for it) and never lets it go; the key given after does (11-01 audit L12)"] = \
         old_branch_key.startswith("pb_") and isinstance(old_renews, dict) and old_renews.get("pinned") == elsewhere and "key" not in old_renews \
@@ -11326,7 +11327,7 @@ def sealed():
     fmt = stats(A.port, t1).get("format")
     info["sealed from the first write"] = {"keys": kept, "format": fmt, "carol": carol}
     checks["with only an admin token, a new lake's own keys are sealed from its first write: nothing of them in the clear in its files"] = \
-        kept == "sealed" and fmt == 3 and not in_files(lake)
+        kept == "sealed" and fmt >= 3 and not in_files(lake)
     # 2. A secret made on one node is used on another with only the admin token, each with its own machine key
     n2 = node(lake, A.port + 1, token=T1, home=own_home()); nodes.append(n2)
     ask(A.port, t1, f"CREATE SECRET rates (TYPE http, BEARER_TOKEN 'tok-123456', SCOPE '{url}')")
