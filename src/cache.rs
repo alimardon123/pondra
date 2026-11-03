@@ -18,6 +18,7 @@ use object_store_df::{
     CopyOptions, Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
 };
+use crate::ledger::ByteLru;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -28,7 +29,7 @@ use std::sync::{Arc, Mutex};
 pub struct Disk {
     pub dir: PathBuf,
     pub max: u64,
-    index: Mutex<(lru::LruCache<String, u64>, u64)>, // lake path -> bytes; total
+    index: Mutex<ByteLru<String, u64>>,              // lake path -> bytes
     store: Arc<dyn object_store::ObjectStore>,       // the lake (for background fetches)
     busy: Mutex<HashSet<String>>,                     // fetches in flight
     slots: Arc<tokio::sync::Semaphore>,
@@ -51,7 +52,7 @@ impl Disk {
             }
         }
         found.sort(); // oldest first, so they are evicted first
-        let index = Mutex::new((lru::LruCache::unbounded(), 0));
+        let index = Mutex::new(ByteLru::new(usize::try_from(max).unwrap_or(usize::MAX)));
         let disk = Disk { dir, max, index, store, busy: Default::default(), slots: Arc::new(tokio::sync::Semaphore::new(4)) };
         found.into_iter().for_each(|(_, key, len)| disk.index_put(key, len));
         Ok(Arc::new(disk))
@@ -59,7 +60,7 @@ impl Disk {
 
     /// Where `key` is on disk, and its size — if it's here.
     pub fn get(&self, key: &str) -> Option<(PathBuf, u64)> {
-        let len = *self.index.lock().unwrap().0.get(key)?;
+        let len = *self.index.lock().unwrap().get(key)?;
         Some((self.dir.join(key), len))
     }
 
@@ -74,14 +75,10 @@ impl Disk {
     }
 
     fn index_put(&self, key: String, len: u64) {
+        // What leaves is deleted: the least recently used past the tier's size, or this file itself when it alone is past
+        // it (the rest of the tier stays). Under the lock, so a put of the same key waits for the delete.
         let mut ix = self.index.lock().unwrap();
-        ix.1 += len;
-        if let Some(old) = ix.0.put(key, len) {
-            ix.1 -= old;
-        }
-        while ix.1 > self.max {
-            let Some((old, len)) = ix.0.pop_lru() else { break };
-            ix.1 -= len;
+        for (old, _) in ix.put(key, len, usize::try_from(len).unwrap_or(usize::MAX)) {
             std::fs::remove_file(self.dir.join(old)).ok();
         }
     }
@@ -125,35 +122,29 @@ type Entry = (Bytes, ObjectMeta, Range<u64>);
 /// statement lists again, and a file changed since is a new key.
 struct Outside {
     seen: lru::LruCache<String, (String, Option<String>)>, // store|location -> (version, e-tag)
-    ranges: lru::LruCache<String, Entry>,                    // store|location|version|range -> bytes
-    bytes: usize,
+    ranges: ByteLru<String, Entry>,                          // store|location|version|range -> bytes
 }
 
 static OUTSIDE: std::sync::LazyLock<Mutex<Outside>> = std::sync::LazyLock::new(|| {
     let seen = lru::LruCache::new(std::num::NonZeroUsize::new(100_000).expect("nonzero"));
-    Mutex::new(Outside { seen, ranges: lru::LruCache::unbounded(), bytes: 0 })
+    Mutex::new(Outside { seen, ranges: ByteLru::new(files_cache_bytes()) })
 });
 
 fn files_cache_bytes() -> usize { crate::env::or("PONDRA_FILES_CACHE_MB", 512usize) << 20 }
 
 /// Keeps a range (or a block) of a file outside the lakes, the least recently used going past `files_cache_bytes`.
 fn keep_outside(key: String, entry: Entry) {
+    let bytes = entry.0.len();
     let mut o = OUTSIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    o.bytes += entry.0.len();
-    if let Some((old, ..)) = o.ranges.put(key, entry) {
-        o.bytes -= old.len();
-    }
-    while o.bytes > files_cache_bytes() {
-        let Some((_, (old, ..))) = o.ranges.pop_lru() else { break };
-        o.bytes -= old.len();
-    }
+    let mut left = o.ranges.set_most(files_cache_bytes());
+    left.extend(o.ranges.put(key, entry, bytes));
+    drop(o); // (what left is let go of outside the lock)
 }
 
 #[derive(Debug)]
 pub struct CachedStore {
     inner: Arc<dyn object_store::ObjectStore>,
-    cache: Mutex<(lru::LruCache<String, Entry>, usize)>, // entries, total bytes
-    max_bytes: usize,
+    cache: Mutex<ByteLru<String, Entry>>, // objects' ranges, at most `max_bytes` of them
     disk: Option<(Arc<Disk>, String)>, // the SSD tier, and the lake's prefix in the bucket
     lakes: std::sync::RwLock<Vec<String>>, // the prefix of each lake read through it (`a/b/`, or `` at the bucket's root)
     id: String, // (this store, in the keys of `OUTSIDE`)
@@ -176,18 +167,18 @@ impl std::fmt::Debug for Disk {
 impl CachedStore {
     pub fn new(inner: Arc<dyn object_store::ObjectStore>, max_bytes: usize, disk: Option<(Arc<Disk>, String)>, prefix: &str) -> Self {
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let this = Self { inner, cache: Mutex::new((lru::LruCache::unbounded(), 0)), max_bytes, disk, lakes: Default::default(), id, blocks: Arc::new(tokio::sync::Semaphore::new(BLOCKS_A_STORE)) };
+        let this = Self { inner, cache: Mutex::new(ByteLru::new(max_bytes)), disk, lakes: Default::default(), id, blocks: Arc::new(tokio::sync::Semaphore::new(BLOCKS_A_STORE)) };
         this.add_lake(prefix);
         this
     }
 
     /// A store of files outside any lake (a bucket `CREATE SECRET` covers, a web server).
     pub fn files(inner: Arc<dyn object_store::ObjectStore>) -> Self {
-        Self { inner, cache: Mutex::new((lru::LruCache::unbounded(), 0)), max_bytes: 0, disk: None, lakes: Default::default(), id: uuid::Uuid::new_v4().simple().to_string(), blocks: Arc::new(tokio::sync::Semaphore::new(BLOCKS_A_STORE)) }
+        Self { inner, cache: Mutex::new(ByteLru::new(0)), disk: None, lakes: Default::default(), id: uuid::Uuid::new_v4().simple().to_string(), blocks: Arc::new(tokio::sync::Semaphore::new(BLOCKS_A_STORE)) }
     }
 
     /// The bytes of objects' ranges held in memory now (at most `max_bytes`).
-    pub fn held(&self) -> usize { self.cache.lock().unwrap().1 }
+    pub fn held(&self) -> usize { self.cache.lock().unwrap().bytes() }
 
     fn saw(&self, m: &ObjectMeta) { saw(&self.id, &self.lakes.read().unwrap(), m) }
 
@@ -341,15 +332,9 @@ impl CachedStore {
     }
 
     fn keep(&self, key: String, entry: Entry) {
-        let mut c = self.cache.lock().unwrap();
-        c.1 += entry.0.len();
-        if let Some((old, ..)) = c.0.put(key, entry) {
-            c.1 -= old.len();
-        }
-        while c.1 > self.max_bytes {
-            let Some((_, (old, ..))) = c.0.pop_lru() else { break };
-            c.1 -= old.len();
-        }
+        let bytes = entry.0.len();
+        let left = self.cache.lock().unwrap().put(key, entry, bytes);
+        drop(left); // (let go of outside the lock)
     }
 
     async fn fetch(&self, location: &Path, range: Option<GetRange>, head: bool) -> Result<Entry> {
@@ -414,7 +399,7 @@ impl ObjectStore for CachedStore {
             return crate::bridge::Bridge(self.inner.clone()).get_opts(location, options).await; // (the lake's other objects: its own client's)
         }
         let key = format!("{location}|{:?}|{}", options.range, options.head);
-        let hit = self.cache.lock().unwrap().0.get(&key).cloned();
+        let hit = self.cache.lock().unwrap().get(&key).cloned();
         let hit = match hit {
             Some(entry) => Some(entry),
             None => self.on_disk(location, &options).await,

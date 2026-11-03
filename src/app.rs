@@ -31,7 +31,7 @@ pub struct App {
 /// the next commit, however many ask. With `?stale_ms=N` a caller accepts one up to N ms old
 /// instead — for dashboards over tables that change every few milliseconds — and while one
 /// request recomputes an expired result, the others keep getting the previous one.
-pub struct Results(std::sync::Mutex<(lru::LruCache<String, Cached>, usize)>, std::sync::Mutex<HashMap<String, Arc<Flight>>>);
+pub struct Results(std::sync::Mutex<crate::ledger::ByteLru<String, Cached>>, std::sync::Mutex<HashMap<String, Arc<Flight>>>);
 
 /// Arrivals so far, and (under the lock: one computation at a time) the arrivals the last
 /// computation covers, with its result.
@@ -45,7 +45,7 @@ struct Cached {
 }
 
 impl Default for Results {
-    fn default() -> Self { Results(std::sync::Mutex::new((lru::LruCache::unbounded(), 0)), Default::default()) }
+    fn default() -> Self { Results(std::sync::Mutex::new(crate::ledger::ByteLru::new(Self::MAX)), Default::default()) }
 }
 
 impl Results {
@@ -63,7 +63,7 @@ impl Results {
 
     fn get(&self, key: &str, version: u64, stale: Option<Duration>) -> Option<bytes::Bytes> {
         let mut c = self.0.lock().unwrap();
-        let e = c.0.get_mut(key)?;
+        let e = c.get_mut(key)?;
         let fresh_enough = stale.is_some_and(|s| e.at.elapsed() <= s);
         let someone_refreshing = stale.is_some() && e.refreshing.is_some_and(|t| t.elapsed() < Duration::from_secs(10));
         if e.version == version || fresh_enough || someone_refreshing {
@@ -79,19 +79,13 @@ impl Results {
         if body.len() > Self::BIGGEST {
             return;
         }
-        let mut c = self.0.lock().unwrap();
-        c.1 += body.len();
-        if let Some(old) = c.0.put(key, Cached { version, at: datafusion::common::instant::Instant::now(), body, refreshing: None }) {
-            c.1 -= old.body.len();
-        }
-        while c.1 > Self::MAX {
-            let Some((_, old)) = c.0.pop_lru() else { break };
-            c.1 -= old.body.len();
-        }
+        let bytes = body.len();
+        let left = self.0.lock().unwrap().put(key, Cached { version, at: datafusion::common::instant::Instant::now(), body, refreshing: None }, bytes);
+        drop(left); // (let go of outside the lock)
     }
 
     /// The bytes of answers remembered now.
-    pub fn held(&self) -> usize { self.0.lock().unwrap().1 }
+    pub fn held(&self) -> usize { self.0.lock().unwrap().bytes() }
 }
 
 impl App {
