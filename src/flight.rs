@@ -103,20 +103,22 @@ impl tower::Service<http::Request<tonic::body::Body>> for Gate {
 
 const SIGN_IN: &str = "sign in: a token, or a user's name and password (handshake)";
 
-/// The gRPC status nearest a SQLSTATE (Flight SQL's errors).
+/// The gRPC status of a SQLSTATE (Flight SQL's errors), by its kind (`codes::kind`).
 fn grpc(code: &str) -> tonic::Code {
-    match code {
-        "40001" => tonic::Code::Aborted,
-        "42501" => tonic::Code::PermissionDenied,
-        "28P01" | "28000" => tonic::Code::Unauthenticated,
-        "42P01" | "42703" | "42883" | "3F000" | "34000" => tonic::Code::NotFound,
-        "42P07" | "23505" => tonic::Code::AlreadyExists,
-        "57014" => tonic::Code::DeadlineExceeded,
-        "53100" | "53200" | "53300" => tonic::Code::ResourceExhausted,
-        "0A000" => tonic::Code::Unimplemented,
-        "23514" | "23502" | "25006" | "25P01" | "25P02" | "25P03" => tonic::Code::FailedPrecondition, // (a transaction that isn't open, failed, or idle-ended)
-        c if c.starts_with("42") || c.starts_with("22") || c.starts_with("21") => tonic::Code::InvalidArgument,
-        _ => tonic::Code::Internal,
+    use crate::codes::Kind;
+    match crate::codes::kind(code) {
+        Kind::Invalid => tonic::Code::InvalidArgument,
+        Kind::Refused | Kind::State => tonic::Code::FailedPrecondition, // (a constraint, a transaction that isn't open, failed or idle-ended, a lock)
+        Kind::SignIn => tonic::Code::Unauthenticated,
+        Kind::Denied => tonic::Code::PermissionDenied,
+        Kind::Missing => tonic::Code::NotFound,
+        Kind::Exists => tonic::Code::AlreadyExists,
+        Kind::Retry => tonic::Code::Aborted,
+        Kind::TooBig | Kind::Busy | Kind::Exhausted => tonic::Code::ResourceExhausted,
+        Kind::Timeout => tonic::Code::DeadlineExceeded,
+        Kind::Unavailable => tonic::Code::Unavailable,
+        Kind::Unsupported => tonic::Code::Unimplemented,
+        Kind::Internal => tonic::Code::Internal,
     }
 }
 
@@ -133,6 +135,7 @@ fn sqlstate(code: tonic::Code) -> &'static str {
         tonic::Code::Unimplemented => "0A000",
         tonic::Code::FailedPrecondition => "55000",
         tonic::Code::InvalidArgument => "22023",
+        tonic::Code::Unavailable => "57P03",
         _ => "XX000",
     }
 }
