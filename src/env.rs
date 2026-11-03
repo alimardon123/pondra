@@ -204,7 +204,7 @@ fn full(key: &str) -> String {
 fn nearest(key: &str) -> Option<String> {
     let name = full(key);
     let short = &name["PONDRA_".len()..];
-    let (far, best) = crate::settings::ALL.iter().filter(|s| s.who == Node).map(|s| (distance(short, &s.var["PONDRA_".len()..]), s.var)).min()?;
+    let (far, best) = crate::settings::all().iter().filter(|s| s.who == Node).map(|s| (distance(short, &s.var["PONDRA_".len()..]), s.var)).min()?;
     (far <= (short.len() / 3).max(1)).then(|| match key.trim().to_ascii_uppercase().starts_with("PONDRA_") {
         true => best.to_string(),
         false => best["PONDRA_".len()..].to_ascii_lowercase(),

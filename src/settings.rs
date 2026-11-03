@@ -1,7 +1,8 @@
 //! Every setting, one entry each (redesign §3, step 1c): its name, what kind of value it takes, what it is when unset,
 //! where it holds (a node, a session, a lake) and when it may change. `env.rs` reads a node's through this table, and
-//! `tools/per_node_check.py` fails a `PONDRA_*` name read that isn't here. The table is base: it names nothing above it, so
-//! the registry's settings section takes it over as it is, each owner then registering its own.
+//! `tools/per_node_check.py` fails a `PONDRA_*` name read that isn't in a table. The tables are the registry's settings section
+//! (`Settings`): the node's own are `CORE` below, added by the `settings` extension, and an extension adds its own beside its
+//! code (`ai::SETTINGS`), so a build lists only the settings of what it has.
 //!
 //! A default is here only where its readers take it from here (`env::value`, `env::secs`, `env::text`): a reader that does
 //! more with an unset value (a 0 that means the default, a value only it can work out) keeps its own until it moves here.
@@ -111,13 +112,13 @@ impl Setting {
     }
 }
 
-const fn of(var: &'static str, who: Who, kind: Kind, unset: Unset) -> Setting {
+pub const fn of(var: &'static str, who: Who, kind: Kind, unset: Unset) -> Setting {
     Setting { var, who, kind, unset, scope: Scope::Node, change: Change::Start }
 }
-const fn node(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Node, kind, unset) }
-const fn command(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Command, kind, unset) }
-const fn starter(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Starter, kind, unset) }
-const fn test(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Test, kind, unset) }
+pub const fn node(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Node, kind, unset) }
+pub const fn command(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Command, kind, unset) }
+pub const fn starter(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Starter, kind, unset) }
+pub const fn test(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Test, kind, unset) }
 
 // The defaults worked out when read.
 fn blocking_threads() -> String { // (tokio's own on Windows, where a child's pipes are read on blocking threads: `panics::runtime`)
@@ -134,15 +135,10 @@ fn view_runs() -> String { (crate::env::cores() / 2).max(2).to_string() } // (`v
 use Kind::*;
 use Unset::{Is, No, Of};
 
-/// Every setting.
-pub const ALL: &[Setting] = &[
+/// The node's own settings, which the `settings` extension adds (an extension's own are beside its code).
+pub const CORE: &[Setting] = &[
     node("PONDRA_ADMIN_TOKEN", Secret, No),
     node("PONDRA_ADMIN_TOKEN_PREVIOUS", Secret, No),
-    node("PONDRA_AI_CALLS", Int, No),
-    node("PONDRA_AI_KEY", Secret, No),
-    node("PONDRA_AI_MODEL", Text, Is("llama3.2")),
-    node("PONDRA_AI_TIMEOUT_SECS", Secs, Is("300")),
-    node("PONDRA_AI_URL", Url, Is("http://127.0.0.1:11434/v1")),
     node("PONDRA_ALLOW_UNSIGNED_EXTENSIONS", Bool, No),
     node("PONDRA_AUDIT", List, Is("role,ddl,function")),
     node("PONDRA_AUDIT_DAYS", Days, Is("90")),
@@ -169,7 +165,6 @@ pub const ALL: &[Setting] = &[
     node("PONDRA_DEBUG_SPREAD", Switch, No),
     node("PONDRA_DRAIN_GRACE_SECS", Secs, Is("0")),
     node("PONDRA_DRAIN_SECS", Secs, Is("30")),
-    node("PONDRA_EMBED_MODEL", Text, Is("nomic-embed-text")),
     node("PONDRA_EXTENSION_FILE_MB", Mb, Is("64")),
     node("PONDRA_EXTENSION_MB", Mb, Is("256")),
     node("PONDRA_EXTENSION_SECS", Secs, Is("30")),
@@ -278,14 +273,43 @@ pub const ALL: &[Setting] = &[
     test("PONDRA_TEST_PANICS", Bool, No),
 ];
 
-/// Every setting: the table, until the registry's settings section takes it over.
-pub fn all() -> &'static [Setting] {
-    ALL
+/// The registry's settings section: every setting this build's extensions add, each name once.
+#[derive(Default)]
+pub struct Settings {
+    all: Vec<Setting>,
+    by_var: std::collections::HashMap<&'static str, usize>,
 }
 
-/// The setting of a name in the environment (`PONDRA_MEMORY_GB`), or None for one nothing reads.
+impl crate::registry::Section for Settings {
+    const NAME: &'static str = "settings";
+}
+
+impl Settings {
+    /// An extension's settings; a name another already added is refused when the registry is built.
+    pub fn add(&mut self, settings: &[Setting]) {
+        for s in settings {
+            assert!(self.by_var.insert(s.var, self.all.len()).is_none(), "two settings are named {}", s.var);
+            self.all.push(*s);
+        }
+    }
+}
+
+/// The node's own settings, as an extension: first in `crate::built_in`, so every other extension's come after.
+pub static SETTINGS: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "settings",
+    requires: &[],
+    register: |r| r.section_mut::<Settings>().add(CORE),
+};
+
+/// Every setting of this build, in the order its extensions added them.
+pub fn all() -> &'static [Setting] {
+    &crate::registry::get().section::<Settings>().all
+}
+
+/// The setting of a name in the environment (`PONDRA_MEMORY_GB`), or None for one nothing in this build reads.
 pub fn find(var: &str) -> Option<&'static Setting> {
-    ALL.iter().find(|s| s.var == var)
+    let s = crate::registry::get().section::<Settings>();
+    s.by_var.get(var).map(|&i| &s.all[i])
 }
 
 #[cfg(test)]
@@ -295,13 +319,29 @@ mod tests {
     #[test]
     fn each_once() {
         let mut seen = std::collections::HashSet::new();
-        assert!(ALL.iter().all(|s| s.var.starts_with("PONDRA_") && seen.insert(s.var)), "each name once");
+        assert!(all().iter().all(|s| s.var.starts_with("PONDRA_") && seen.insert(s.var)), "each name once");
+    }
+
+    /// The section holds the node's own settings first, then each extension's, and finds every one by its name.
+    #[test]
+    fn a_builds_settings_are_its_extensions() {
+        assert_eq!(all()[..CORE.len()].iter().map(|s| s.var).collect::<Vec<_>>(), CORE.iter().map(|s| s.var).collect::<Vec<_>>());
+        assert!(all().iter().all(|s| find(s.var).is_some_and(|f| f.var == s.var)));
+        assert!(find("PONDRA_NOTHING_AT_ALL").is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "two settings are named PONDRA_MEMORY_GB")]
+    fn a_name_is_one_settings() {
+        let mut s = Settings::default();
+        s.add(CORE);
+        s.add(&[node("PONDRA_MEMORY_GB", Gb, No)]);
     }
 
     /// A default reads as its kind, so `env::value` never meets one it can't.
     #[test]
     fn defaults_read() {
-        for s in ALL {
+        for s in all() {
             let Some(v) = s.default() else { continue };
             let ok = match s.kind {
                 Int => v.parse::<u64>().is_ok(),

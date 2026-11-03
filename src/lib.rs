@@ -248,11 +248,13 @@ mod rules;
 #[cfg(feature = "lake")] mod workspace;
 
 /// The extensions this build has, in the order the registry adds them (`registry::get`): the host decides, so the
-/// floors below never name one. A session gets their function sets in this order, each seeing the ones before it, and
+/// floors below never name one. The node's own settings come first, so an extension's may build on them. A session gets
+/// their function sets in this order, each seeing the ones before it, and
 /// where two name one function the later one's stays: Spark's first, so Pondra's own and Postgres's stay where Spark
 /// has the name too; MATCH_RECOGNIZE's after the ones its DEFINEs may call.
 pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
     static BUILT_IN: &[&dyn registry::Extension] = &[
+        &settings::SETTINGS,
         #[cfg(feature = "lake")]
         &objects::CATALOG,
         &sparksql::SPARK,
