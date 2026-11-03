@@ -1170,7 +1170,7 @@ pub(crate) async fn in_sql_order(lake: &Lake, stmt: Stmt) -> Result<Stmt> {
     let Stmt::Insert(t, q) = &stmt else { return Ok(stmt) };
     let Ok((other, name)) = crate::ddl::resolve(lake, t).await else { return Ok(stmt) }; // (refused by name further on)
     let Some(meta) = other.as_deref().unwrap_or(lake).cat.meta(&table_key(&name)).await? else { return Ok(stmt) };
-    if meta.shown.is_empty() {
+    if !meta.moved() {
         return Ok(stmt);
     }
     let names = filled(lake, &meta, t, q).await?;

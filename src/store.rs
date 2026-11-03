@@ -231,6 +231,22 @@ impl TableMeta {
     /// clone, whose memo is empty).
     pub fn cols(self: &Arc<Self>) -> Arc<crate::column::Columns> { self.column_memo.get_or_init(|| self.column_list()) }
 
+    /// Was a column moved, so SQL's order isn't the stored one (`ALTER COLUMN … FIRST` or `AFTER`, `ADD COLUMN … FIRST`)?
+    /// The one test of it: a reader reorders, or a write fills SQL's order, only then (`in_sql_order`).
+    pub fn moved(&self) -> bool {
+        !self.shown.is_empty() && crate::column::sql_places(&self.columns, |c| self.is_dropped(c), &self.shown).windows(2).any(|w| w[0] > w[1])
+    }
+
+    /// Rows under SQL's names (`to_logical`'s, a log tail's, the change feed's) with the table's columns in SQL's order,
+    /// any other columns (the rows' system columns) where they are: the one reorder the doors use. As they are when no
+    /// column was moved.
+    pub fn in_sql_order(&self, b: &RecordBatch) -> Result<RecordBatch> {
+        match self.moved() {
+            true => Ok(crate::answer::batch_reordered(b, &self.sql_order())?),
+            false => Ok(b.clone()),
+        }
+    }
+
     /// Was the column stored as `stored` dropped?
     pub fn is_dropped(&self, stored: &str) -> bool { self.dropped.iter().any(|d| d == stored) }
 
@@ -3821,6 +3837,8 @@ mod tests {
             let sql: Vec<String> = list.sql().map(|c| c.name.clone()).collect();
             assert_eq!(sql, was(&m), "{:?} {:?} {:?}", m.shown, m.dropped, m.names);
             assert_eq!(m.sql_order(), sql);
+            let stored: Vec<String> = list.stored_order().map(|c| c.name.clone()).collect();
+            assert_eq!(m.moved(), sql != stored, "moved: SQL's order isn't the stored one");
             for c in list.all() {
                 assert_eq!(m.columns[c.id as usize - 1].0, c.stored, "an id is a stored place + 1");
                 assert_eq!((c.name.as_str(), c.dropped), (m.name_of(&c.stored), m.dropped.contains(&c.stored)));
