@@ -665,11 +665,11 @@ async fn records(State(app): State<App>, headers: axum::http::HeaderMap, Json(ba
     StatusCode::OK.into_response()
 }
 
-/// Resolves once the caller of an answer that goes on (the commit stream, `/watch`, a live query) may no longer have it: its
+/// Resolves once the caller of an answer that goes on (the commit stream, `/watch`, a live query, Flight's follow stream) may no longer have it: its
 /// sign-in revoked, expired, or changed so that `still` refuses it (a grant taken back, a superuser no more); a caller that
 /// came in with nothing signed, at an open node, once the node is open no more. Checked every 5 s, as `guard` checks a
 /// request (a password is hashed at most once a minute: `users::password_ok` remembers it against its verifier), so such an
-/// answer ends within that (11-01 audit H4 for the commit stream; 11-02 H3 for the rest). A node, a token and the program
+/// answer ends within that (11-01 audit H4 for the commit stream; 11-02 H3 for the rest; 11-03 H1 for Flight). A node, a token and the program
 /// that started this node never end.
 pub(crate) async fn until_revoked(app: App, operator: bool, header: Option<String>, still: impl Fn(&crate::auth::Principal) -> bool + Send) {
     if operator {
