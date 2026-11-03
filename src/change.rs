@@ -527,7 +527,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
         crate::write::identity(lake, &stmt).await?;
     }
     let stored = lake.cat.meta(&table_key(&table)).await?.with_context(|| format!("no table {table}"))?; // (as parsed once a version: `rules` is the memo)
-    let meta = stored.logical(); // (the change's SQL names columns as SQL knows them: ADR-022)
+    let meta = stored.logical_ref(); // (the change's SQL names columns as SQL knows them: ADR-022)
     let view = lake.cat.get::<crate::views::View>(&crate::views::view_key(&table)).await?;
     ensure!(view.is_none(), "{table} is a view's: change the table it follows");
     if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", format!("{table} is a merge table: its rows add up as they're read, so UPDATE and DELETE aren't taken; insert rows that add up to the change"))); }

@@ -365,9 +365,9 @@ impl Backend {
         let sql: &str = &bound;
         let reader = crate::auth::current().is_some_and(|p| p.role >= crate::auth::Role::Read);
         if reader && crate::txn::open() && crate::txn::gate(&self.app.lake, sql).is_ok() {
-            if let Some(b) = crate::txn::point_read(&self.app.lake, sql).await.map_err(user_error)? {
+            if let Some((b, p)) = crate::txn::point_read(&self.app.lake, sql).await.map_err(user_error)? {
                 let schema = b.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
-                let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, sql).await);
+                let schema = crate::pg_types::typed(&schema, &p.types().into()); // (its columns' types, as outside a transaction: no second parse)
                 return Ok(Response::Query(rows(&schema, b, format)?)); // (in a transaction: its own version, or its snapshot's)
             }
         }

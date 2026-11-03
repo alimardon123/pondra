@@ -951,7 +951,7 @@ async fn change(l: &Locks<'_>, stored: &Arc<TableMeta>, stmt: &Stmt, snapshot: u
         }
     }
     let hit = match stmt {
-        Stmt::Update(_, set, Some(cond)) => match point_key(&l.app.lake, l.name, stored, set, cond).await? {
+        Stmt::Update(_, set, Some(cond)) => match point_key(l.name, stored, set, cond) {
             Some(key) => point(l, &key, set, snapshot).await?,
             None => None,
         },
@@ -1039,7 +1039,7 @@ pub async fn statement(app: &crate::app::App, stmt: &Stmt, files: bool) -> Resul
     let (other, name) = crate::ddl::resolve(lake, &table).await?;
     ensure!(other.is_none(), "{table} is an attached lake's: a transaction writes this lake's tables");
     let stored = stored_table(lake, &name).await?;
-    let meta = stored.logical();
+    let meta = stored.logical_ref();
     refuse_change(lake, &name, &meta, stmt).await?;
     // (an enforced UNIQUE takes no row locks: its COMMIT's check refuses a row changed since it was read. A MERGE and an
     // INSERT … ON CONFLICT lock their rows as an UPDATE does: a counter's upsert waits for the one holding it, as Postgres's does)
@@ -1092,7 +1092,7 @@ async fn autocommit_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &st
     let lake = &app.lake;
     let name = stmt.table();
     let stored = stored_table(lake, &name).await?;
-    let meta = stored.logical();
+    let meta = stored.logical_ref();
     // (a one-row upsert of one key is checked as an INSERT's job is, and as `change::run` checks a MERGE: its view refused by
     // that name, and what follows the table asked once its rows are known, `change::run`'s order)
     let upsert = matches!(stmt, Stmt::Merge(_));
@@ -1159,7 +1159,7 @@ async fn insert_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &str, t
     }
     let name = stmt.table();
     let stored = stored_table(lake, &name).await?;
-    let meta = stored.logical();
+    let meta = stored.logical_ref();
     let sql = crate::write::rows_sql(&meta, stmt)?;
     let files = crate::change::FILES.try_with(|f| *f).unwrap_or(false);
     let l = Locks { app, name: &name, meta: &meta, owner: owner.to_string(), txn: false, locking: true, committed: true, wait: lock_wait(), taken };
@@ -1444,7 +1444,7 @@ async fn lock_select(app: &crate::app::App, (level, ro, snapshot): (Level, bool,
     let Some(stored) = lake.cat.get::<TableMeta>(&table_key(&name)).await? else {
         return Err(crate::codes::coded("0A000", format!("{name} isn't a table: FOR UPDATE locks a table's rows")));
     };
-    let meta = stored.logical();
+    let meta = stored.logical_ref();
     if !meta.merge.is_empty() {
         return Err(crate::codes::coded("0A000", format!("{name} is a merge table: its rows add up as they're read, so there is no row to lock")));
     }
@@ -1738,7 +1738,7 @@ async fn write_changes(lake: &Lake, seq: &crate::log::Sequencer, c: Commit) -> R
             None => (unipc(new)?, unipc(old)?),
         };
         let stored = lake.cat.meta(&table_key(name)).await?.with_context(|| format!("no table {name} (dropped while the transaction ran)"))?;
-        let meta = stored.logical();
+        let meta = stored.logical_ref();
         let append = meta.key.is_empty();
         if old.iter().any(|b| b.num_rows() > 0) {
             crate::views::can_follow(lake, name, append).await?;
@@ -1917,22 +1917,21 @@ pub(crate) fn point_table(name: &str, stored: &TableMeta) -> bool {
 /// new versions, as `change::rows_of` gives them. In a transaction (`snapshot`) the row is its own version or the snapshot's;
 /// one changed since refuses it at once (40001: its COMMIT would be). None: not such an UPDATE (SQL works it out).
 pub async fn point_change(lake: &Lake, name: &str, stored: &TableMeta, snapshot: Option<u64>, set_to: &[(String, String)], cond: &str) -> Result<Option<(Vec<RecordBatch>, Vec<RecordBatch>)>> {
-    let Some(key) = point_key(lake, name, stored, set_to, cond).await? else { return Ok(None) };
-    change_one(lake, name, &stored.logical(), &key, snapshot, set_to, None).await
+    let Some(key) = point_key(name, stored, set_to, cond) else { return Ok(None) };
+    change_one(lake, name, stored, &key, snapshot, set_to, None).await // (`stored` as SQL sees it: `point_table` takes no renamed column)
 }
 
 /// The key an UPDATE's `WHERE` names (`<key> = <value> [AND …]`) on a keyed table, as text (`key_text`). None: the UPDATE isn't
 /// one key's, sets a key or a column SQL must work out, or names a key the text can't say (a JSON key: the general path).
-async fn point_key(lake: &Lake, name: &str, stored: &TableMeta, set_to: &[(String, String)], cond: &str) -> Result<Option<Vec<String>>> {
-    let meta = stored.logical();
+/// The WHERE alone is parsed (`serve::key_where`): the statement around it was, once.
+fn point_key(name: &str, stored: &TableMeta, set_to: &[(String, String)], cond: &str) -> Option<Vec<String>> {
+    // (`point_table` takes no renamed or dropped column: `stored` is as SQL sees it, `logical()`)
     if !point_table(name, stored)
-        || set_to.iter().any(|(c, _)| meta.key.contains(c) || c == "_deleted" || crate::text::NAMES.contains(&c.as_str()) || !meta.columns.iter().any(|(n, _)| n == c))
+        || set_to.iter().any(|(c, _)| stored.key.contains(c) || c == "_deleted" || crate::text::NAMES.contains(&c.as_str()) || !stored.columns.iter().any(|(n, _)| n == c))
     {
-        return Ok(None);
+        return None;
     }
-    let Some(p) = crate::serve::point(lake, &format!("SELECT * FROM \"{name}\" WHERE {cond}")).await? else { return Ok(None) };
-    let Some(key) = p.key.iter().cloned().collect::<Option<Vec<String>>>() else { return Ok(None) };
-    Ok(key_text(&meta, &key).ok())
+    key_text(stored, &crate::serve::key_where(stored, cond)?).ok()
 }
 
 /// A key's values named as the locks and the commit's check name them: each value cast to its column's type, then to text
@@ -1993,8 +1992,9 @@ fn joined(alias: &str, row: &RecordBatch, proposed: &RecordBatch) -> Result<(Rec
 }
 
 /// In a transaction, a key lookup (`serve::Point`) answered from the transaction's own version of the row or the snapshot's,
-/// without planning. None: not one, or the row changed since the snapshot (SQL reads it as of then).
-pub async fn point_read(lake: &Lake, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
+/// without planning, with the lookup (its columns' types: the Postgres port's answer, as outside a transaction). None: not
+/// one, or the row changed since the snapshot (SQL reads it as of then).
+pub async fn point_read(lake: &Lake, sql: &str) -> Result<Option<(Vec<RecordBatch>, Arc<crate::serve::Point>)>> {
     let Some(snapshot) = snapshot() else { return Ok(None) };
     // (a locking read takes its locks first, and is planned over the rows it locked: `lock_reads`)
     if crate::auth::limited().is_some() || crate::temp::mentioned(sql) || LOCKING.is_match(sql) {
@@ -2004,11 +2004,12 @@ pub async fn point_read(lake: &Lake, sql: &str) -> Result<Option<Vec<RecordBatch
     let Some(key) = p.key.iter().cloned().collect::<Option<Vec<String>>>() else { return Ok(None) };
     let Ok(key) = key_text(&p.meta, &key) else { return Ok(None) }; // (a key the text can't say: SQL answers it)
     let schema = p.schema()?;
-    Ok(match current(lake, &p.table, &p.meta, &key, Some(snapshot)).await? {
-        Current::Row(r) => Some(vec![crate::query::conform(&r, &schema)?]),
-        Current::Gone => Some(vec![RecordBatch::new_empty(schema)]),
-        Current::Changed => None,
-    })
+    let rows = match current(lake, &p.table, &p.meta, &key, Some(snapshot)).await? {
+        Current::Row(r) => vec![crate::query::conform(&r, &schema)?],
+        Current::Gone => vec![RecordBatch::new_empty(schema)],
+        Current::Changed => return Ok(None),
+    };
+    Ok(Some((rows, p)))
 }
 
 #[cfg(test)]

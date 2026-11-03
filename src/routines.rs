@@ -912,7 +912,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
         app.auth.allows(who.role, &stmt)?;
         return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files).await?));
     }
-    if let Some(rows) = Box::pin(crate::txn::point_read(&app.lake, sql)).await? {
+    if let Some((rows, _)) = Box::pin(crate::txn::point_read(&app.lake, sql)).await? {
         return Ok(Outcome::Rows(rows)); // (a key lookup in a transaction: no planning)
     }
     Ok(Outcome::Rows(match who.files {

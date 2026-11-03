@@ -240,7 +240,7 @@ const FIRST: &str = "pondra.first_row_id";
 /// they had ids (a column of them took a third off ingest: ZSTD). Carried ids, an UPDATE's, stay a
 /// column. Reading the log puts the column back (`expand`).
 pub fn compact(b: &RecordBatch) -> Result<RecordBatch> {
-    let Some(i) = b.schema().index_of(ROW_ID).ok() else { return Ok(b.clone()) };
+    let Some((i, _)) = b.schema().column_with_name(ROW_ID) else { return Ok(b.clone()) };
     let ids = b.column(i).as_primitive_opt::<Int64Type>().filter(|c| c.null_count() == 0 && !c.is_empty());
     let Some(ids) = ids.filter(|c| c.values().windows(2).all(|w| w[1] == w[0] + 1)) else { return Ok(b.clone()) };
     let first = ids.value(0);
@@ -305,9 +305,9 @@ pub fn at_commit(b: &RecordBatch, seg: u64, ms: u64) -> Result<RecordBatch> {
 fn set(b: &RecordBatch, name: &str, values: ArrayRef) -> Result<RecordBatch> {
     let (mut fields, mut cols): (Vec<_>, Vec<_>) = (b.schema().fields().to_vec(), b.columns().to_vec());
     let field = Arc::new(Field::new(name, values.data_type().clone(), true));
-    match b.schema().index_of(name) {
-        Ok(i) => (fields[i], cols[i]) = (field, values),
-        Err(_) => {
+    match b.schema().column_with_name(name) { // (not `index_of`, whose miss formats an error to throw away)
+        Some((i, _)) => (fields[i], cols[i]) = (field, values),
+        None => {
             fields.push(field);
             cols.push(values);
         }

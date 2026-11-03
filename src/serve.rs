@@ -141,6 +141,35 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
     if stmt.to_string() != format!("SELECT {items} FROM {name} WHERE {filter}") {
         return Ok(None);
     }
+    let table = name.to_string().trim_matches('"').to_string();
+    let Some(meta) = lake.cat.meta(&table_key(&table)).await? else { return Ok(None) };
+    if !pointable(&meta) {
+        return Ok(None);
+    }
+    let Some((key, params)) = key_of(&meta, filter) else { return Ok(None) };
+    let names: Vec<String> = match s.projection.as_slice() {
+        [SelectItem::Wildcard(_)] => meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect(), // (as `SELECT *` shows it)
+        items => items.iter().map(|i| match i {
+            SelectItem::UnnamedExpr(Expr::Identifier(c)) if meta.columns.iter().any(|(n, _)| *n == c.value) => Some(c.value.clone()),
+            _ => None,
+        }).collect::<Option<_>>().unwrap_or_default(),
+    };
+    if names.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Point { table, meta, names, key, params }))
+}
+
+/// A table a key lookup answers without SQL: keyed, with no merge, no renamed or moved columns, no event-time order and no
+/// TTL (SQL answers those).
+fn pointable(meta: &TableMeta) -> bool {
+    !meta.key.is_empty() && meta.merge.is_empty() && !meta.mapped() && meta.shown.is_empty() && meta.order.is_none() && meta.ttl.is_none()
+}
+
+/// The key `filter` names: `<key> = <value> [AND …]`, each of `meta`'s key columns once and no other column. Its values in
+/// key order (None: a parameter, whose number the map gives). None: any other condition.
+fn key_of(meta: &TableMeta, filter: &datafusion::sql::sqlparser::ast::Expr) -> Option<(Vec<Option<String>>, HashMap<String, usize>)> {
+    use datafusion::sql::sqlparser::ast::{BinaryOperator, Expr, Value};
     let (mut eqs, mut params) = (vec![], HashMap::new());
     let mut stack = vec![filter];
     while let Some(e) = stack.pop() {
@@ -152,38 +181,41 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
                         params.insert(c.value.clone(), p.trim_start_matches('$').parse::<usize>().unwrap_or(0));
                         eqs.push((c.value.clone(), None));
                     }
-                    Value::Null => return Ok(None),
+                    Value::Null => return None,
                     // (a string's value, as written: `'O''Brien'` is `O'Brien`, not the text it was typed as)
                     Value::SingleQuotedString(s) => eqs.push((c.value.clone(), Some(s.clone()))),
                     v => eqs.push((c.value.clone(), Some(v.to_string().trim_matches('\'').to_string()))),
                 },
-                _ => return Ok(None),
+                _ => return None,
             },
-            _ => return Ok(None),
+            _ => return None,
         }
     }
-    let table = name.to_string().trim_matches('"').to_string();
-    let Some(meta) = lake.cat.meta(&table_key(&table)).await? else { return Ok(None) };
     let mut cols: Vec<&String> = eqs.iter().map(|(c, _)| c).collect();
     cols.sort();
     let mut key: Vec<&String> = meta.key.iter().collect();
     key.sort();
-    if meta.key.is_empty() || !meta.merge.is_empty() || cols != key || meta.mapped() || !meta.shown.is_empty() || meta.order.is_some() || meta.ttl.is_some() { // (renamed or moved columns, event-time order, a TTL: SQL answers it)
-        return Ok(None);
-    }
-    let names: Vec<String> = match s.projection.as_slice() {
-        [SelectItem::Wildcard(_)] => meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect(), // (as `SELECT *` shows it)
-        items => items.iter().map(|i| match i {
-            SelectItem::UnnamedExpr(Expr::Identifier(c)) if meta.columns.iter().any(|(n, _)| *n == c.value) => Some(c.value.clone()),
-            _ => None,
-        }).collect::<Option<_>>().unwrap_or_default(),
-    };
-    if names.is_empty() {
-        return Ok(None);
+    if cols != key {
+        return None;
     }
     // (a uuid key written another way Postgres takes, `'A0EE…'`, is looked up as the column holds it)
     let key = meta.key.iter().map(|k| eqs.iter().find(|(c, _)| c == k).and_then(|(_, v)| v.clone()).map(|v| if meta.uuid(k) { crate::pg_casts::uuid_spelled(&v).unwrap_or(v) } else { v })).collect();
-    Ok(Some(Point { table, meta, names, key, params }))
+    Some((key, params))
+}
+
+/// The key a write's `WHERE` names on `meta`'s table, as a key lookup's (`point`) would: from the condition alone, with no
+/// statement around it to parse (an UPDATE's, `txn::point_key`). None: not one key's, or a parameter in it.
+pub fn key_where(meta: &TableMeta, cond: &str) -> Option<Vec<String>> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser, tokenizer::Token};
+    if !pointable(meta) {
+        return None;
+    }
+    let mut p = Parser::new(&GenericDialect {}).try_with_sql(cond).ok()?;
+    let filter = p.parse_expr().ok()?;
+    if p.peek_token().token != Token::EOF {
+        return None;
+    }
+    key_of(meta, &filter)?.0.into_iter().collect()
 }
 
 /// A SQL point query answered like `/lookup` (`Point`): its rows as JSON, or `None` for any other
@@ -442,5 +474,31 @@ impl AsyncFileReader for Reader {
     fn get_metadata<'a>(&'a mut self, _: Option<&'a ArrowReaderOptions>) -> BoxFuture<'a, datafusion::parquet::errors::Result<Arc<ParquetMetaData>>> {
         let size = self.2;
         async move { Ok(Arc::new(ParquetMetaDataReader::new().load_and_finish(self, size).await?)) }.boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_writes_where_names_its_key_as_a_lookup_does() {
+        let meta = TableMeta {
+            columns: vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into()), ("v".into(), "Int64".into()), ("u".into(), "Utf8".into())],
+            key: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        let key = |cond: &str| key_where(&meta, cond);
+        let k = |a: &str, b: &str| Some(vec![a.to_string(), b.to_string()]);
+        assert_eq!(key("a = 1 AND b = 'x'"), k("1", "x"));
+        assert_eq!(key("b = 'O''Brien' AND a = 2"), k("2", "O'Brien"), "in key order, a string as its value");
+        assert_eq!(key("(a = 1) AND b = 'x'"), None, "the shapes a lookup takes, no others");
+        for other in ["a = 1", "a = 1 AND b = 'x' AND v = 3", "a = 1 AND a = 2", "a = 1 OR b = 'x'", "a > 1 AND b = 'x'", "a = NULL AND b = 'x'", "a = $1 AND b = 'x'", "a = 1 AND b = 'x' x", "a = -1 AND b = 'x'", ""] {
+            assert_eq!(key(other), None, "{other}");
+        }
+        let uuid = TableMeta { columns: vec![("u".into(), "Utf8".into())], key: vec!["u".into()], sql_types: [("u".to_string(), "uuid".to_string())].into(), ..Default::default() };
+        assert_eq!(key_where(&uuid, "u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'"), Some(vec!["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11".to_string()]), "a uuid as the column holds it");
+        let ttl = TableMeta { ttl: Some(("v".into(), 60)), ..meta.clone() };
+        assert_eq!(key_where(&ttl, "a = 1 AND b = 'x'"), None, "a TTL's table: SQL answers it");
     }
 }
