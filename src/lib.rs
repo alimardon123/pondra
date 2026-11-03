@@ -24,6 +24,8 @@ pub mod in_task;
 #[cfg(feature = "lake")] pub mod page; // (a page is a member on the core's lake, one per module)
 pub mod request_body;
 pub mod text;
+// A table's columns as one list, each with its id (the redesign's step 1b).
+pub mod column;
 // The one walk of the SQL tree (every module's walks go through it: `walk.rs`).
 mod walk;
 // The statements 1.1 brings, refused by name in every form (`page.rs` and the node read the same list).
