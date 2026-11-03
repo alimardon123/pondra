@@ -18,6 +18,9 @@
 //! `CASE x WHEN a THEN r …` becomes `CASE WHEN x = a THEN r …`, what SQL defines it as, and NULLIF(x, y) becomes
 //! `CASE WHEN x = y THEN NULL ELSE x END`: each `=` is DataFusion's, which makes the zeros one, and a value given back
 //! keeps its sign. A volatile operand is left as it is, for the same reason.
+//!
+//! A MATCH_RECOGNIZE DEFINE that reads the match (FIRST, LAST, an aggregate) is an expression no plan holds, planned by
+//! `matcher::glue_expr` without the optimizer's rules: it takes the same rewrite there (`alone`).
 
 use datafusion::common::{DFSchema, Result, ScalarValue};
 use datafusion::common::tree_node::Transformed;
@@ -41,6 +44,17 @@ impl OptimizerRule for ZerosIn {
     fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
         crate::optimize::rewrite_typed(plan, looks, split)
     }
+}
+
+/// `e` as `ZerosIn` writes it, its columns' types those of `schema`: for an expression no plan holds, a MATCH_RECOGNIZE
+/// DEFINE that reads the match (`matcher::glue_expr`, 11-03 audit M1), after the simplifier as in a plan.
+pub(crate) fn alone(e: Expr, schema: &DFSchema) -> Result<Expr> {
+    use datafusion::common::tree_node::TreeNode;
+    Ok(e.transform_up(|e| Ok(match split(&e, schema) {
+        Some(new) => Transformed::yes(new),
+        None => Transformed::no(e),
+    }))?
+    .data)
 }
 
 /// A float literal 0.0 or -0.0 (the list's values have the list's type once types are coerced).

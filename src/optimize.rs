@@ -944,7 +944,8 @@ fn decimal_identity(e: &Expr, schema: &DFSchema) -> Option<Expr> {
 /// each filter, just before DataFusion's filter pushdown. Its merging of one column's comparisons (`simplify_predicates`)
 /// read the operator as if the column came first: `s = 'b' AND 'b' = s` was FALSE (two equalities that differ), and of
 /// `s <= 'b' AND 'b' > s` it kept `s <= 'b'` (the two bounds tie, and only `<` written column first won the tie), so 'b'
-/// was in. Found by `tools/random_sql.py` (11-03). The same comparison either way round, so no answer changes.
+/// was in. Found by `tools/random_sql.py` (11-03). A join's ON too (11-03 audit H6). The same comparison either way round,
+/// so no answer changes.
 #[derive(Debug)]
 struct ValuesRight;
 
@@ -958,20 +959,35 @@ impl OptimizerRule for ValuesRight {
     }
 
     fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
-        let LogicalPlan::Filter(mut f) = plan else { return Ok(Transformed::no(plan)) };
-        let swapped = std::mem::replace(&mut f.predicate, Expr::Literal(ScalarValue::Null, None)).transform_up(|e| match e {
-            Expr::BinaryExpr(b) if matches!(*b.left, Expr::Literal(..)) && matches!(*b.right, Expr::Column(_)) => {
-                match b.op.swap().filter(|op| matches!(op, Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq)) {
-                    Some(op) => Ok(Transformed::yes(Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(b.right, op, b.left)))),
-                    None => Ok(Transformed::no(Expr::BinaryExpr(b))),
-                }
+        match plan {
+            LogicalPlan::Filter(mut f) => {
+                let t = values_right(std::mem::replace(&mut f.predicate, Expr::Literal(ScalarValue::Null, None)))?;
+                f.predicate = t.data;
+                Ok(Transformed::new_transformed(LogicalPlan::Filter(f), t.transformed))
             }
-            e => Ok(Transformed::no(e)),
-        })?;
-        let changed = swapped.transformed;
-        f.predicate = swapped.data;
-        Ok(if changed { Transformed::yes(LogicalPlan::Filter(f)) } else { Transformed::no(LogicalPlan::Filter(f)) })
+            // (a join's ON: the pushdown moves its one-sided comparisons into a filter on that side and merges them there,
+            // in the same pass)
+            LogicalPlan::Join(mut j) if j.filter.is_some() => {
+                let t = values_right(j.filter.take().expect("a filter"))?;
+                j.filter = Some(t.data);
+                Ok(Transformed::new_transformed(LogicalPlan::Join(j), t.transformed))
+            }
+            plan => Ok(Transformed::no(plan)),
+        }
     }
+}
+
+/// `e` with each `value op column` in it written `column op' value`.
+fn values_right(e: Expr) -> Result<Transformed<Expr>> {
+    e.transform_up(|e| match e {
+        Expr::BinaryExpr(b) if matches!(*b.left, Expr::Literal(..)) && matches!(*b.right, Expr::Column(_)) => {
+            match b.op.swap().filter(|op| matches!(op, Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq)) {
+                Some(op) => Ok(Transformed::yes(Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(b.right, op, b.left)))),
+                None => Ok(Transformed::no(Expr::BinaryExpr(b))),
+            }
+        }
+        e => Ok(Transformed::no(e)),
+    })
 }
 
 /// `x IN (a, b)` whose list isn't all values (`c1`, `CASE WHEN c1 < 0 THEN … END`, `NULL`, `NULL +
@@ -2819,8 +2835,9 @@ mod tests {
         assert_eq!(answer(&ctx, "SELECT d * 0.0 AS z FROM v").await.0, ["z: Decimal128(12, 3)"]);
     }
 
-    /// A comparison written value first is merged with the column's others as the same comparison (`ValuesRight`): without
-    /// the rule, DataFusion's filter pushdown made `s = 'b' AND 'b' = s` FALSE and let 'b' into `s <= 'b' AND 'b' > s`. (The
+    /// A comparison written value first is merged with the column's others as the same comparison (`ValuesRight`), in a
+    /// WHERE and a join's ON: without the rule, DataFusion's filter pushdown made `s = 'b' AND 'b' = s` FALSE and let 'b'
+    /// into `s <= 'b' AND 'b' > s`. (The
     /// simplifier writes `'b' = s` column first itself where the value is a literal as written; a lake's text is a
     /// Utf8View, so 'b' is a cast until it is folded, and stays first.)
     #[tokio::test]
@@ -2845,6 +2862,12 @@ mod tests {
             ("t >= true AND true = t", "2"),
         ] {
             assert_eq!(first(&ctx, &count(w)).await, want, "{w}");
+        }
+        // (a join's ON too: the pushdown moves a LEFT JOIN's comparisons of its right side into a filter there, 11-03 audit H6)
+        let joined = |on: &str| format!("SELECT count(b.s) FROM v AS a LEFT JOIN v AS b ON a.s = b.s AND {on}");
+        assert_eq!(first(&plain, &joined("b.s = 'b' AND 'b' = b.s")).await, "0", "DataFusion's answer, without the rule");
+        for (on, want) in [("b.s = 'b' AND 'b' = b.s", "4"), ("b.s <= 'b' AND 'b' > b.s", "1"), ("'b' > b.s AND b.s <= 'b'", "1")] {
+            assert_eq!(first(&ctx, &joined(on)).await, want, "{on}");
         }
     }
 

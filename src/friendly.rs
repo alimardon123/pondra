@@ -16,6 +16,7 @@
 //! What needs the data (a PIVOT's values, a FROM's columns) is asked with a query of its own, as
 //! the caller, before the tree is rewritten: a first pass collects the questions, a second takes
 //! the answers in the same order (`Asks`).
+use crate::expander::grouped; // (a call written as an expression: in parentheses inside an operator)
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::sql::sqlparser::ast::*;
 use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::{Token, Tokenizer}};
@@ -1464,15 +1465,15 @@ fn expression(e: &mut Expr) -> Result<()> {
         return like_escape(pattern, escape_char);
     }
     if let Some(text) = typed_literal(e)? {
-        *e = expr(&text)?; // (a literal in Postgres's spelling, as the expression DataFusion reads)
+        *e = grouped(expr(&text)?); // (a literal in Postgres's spelling, as the expression DataFusion reads)
         return Ok(());
     }
     if let Some(text) = row_in(e)? {
-        *e = expr(&text)?;
+        *e = grouped(expr(&text)?);
         return Ok(());
     }
     if let Some(text) = json_arrow(e)? {
-        *e = expr(&text)?;
+        *e = grouped(expr(&text)?);
         return Ok(());
     }
     match e {
@@ -1517,7 +1518,7 @@ fn expression(e: &mut Expr) -> Result<()> {
             within_group(f)?;
             group_concat(f);
             if let Some(text) = array_agg_limit(f) {
-                *e = expr(&text)?;
+                *e = grouped(expr(&text)?);
                 return Ok(());
             }
             let n = function_name(f);
@@ -1531,7 +1532,7 @@ fn expression(e: &mut Expr) -> Result<()> {
             };
             if plain {
                 if let Some(text) = crate::dialect_fns::call(&n, &a)? {
-                    *e = expr(&text)?;
+                    *e = grouped(expr(&text)?);
                     return Ok(());
                 }
             }
@@ -1543,13 +1544,13 @@ fn expression(e: &mut Expr) -> Result<()> {
                         Some(w) => format!("({w}) AND ({by}) IS NOT NULL"),
                         None => format!("({by}) IS NOT NULL"),
                     };
-                    *e = expr(&format!("first_value({x} ORDER BY {by} {} NULLS LAST) FILTER (WHERE {only})", if desc { "DESC" } else { "ASC" }))?;
+                    *e = grouped(expr(&format!("first_value({x} ORDER BY {by} {} NULLS LAST) FILTER (WHERE {only})", if desc { "DESC" } else { "ASC" }))?);
                 }
                 ("string_split" | "str_split" | "split", 2) => f.name = ObjectName::from(vec![Ident::new("string_to_array")]),
                 // (DuckDB's dates and patterns, and the part-first DATEDIFF and DATEADD of Snowflake and SQL Server: `dates`)
                 ("strftime" | "strptime" | "epoch" | "regexp_extract" | "date_diff" | "datediff" | "dateadd" | "date_add" | "date_sub" | "timestampadd" | "timeadd", _) => {
                     if let Some(text) = dates(&n, &a)? {
-                        *e = expr(&text)?;
+                        *e = grouped(expr(&text)?);
                     }
                 }
                 ("list", 1) => f.name = ObjectName::from(vec![Ident::new("array_agg")]), // (DuckDB's name for it)
@@ -1561,10 +1562,10 @@ fn expression(e: &mut Expr) -> Result<()> {
                     let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(path), .. }) = a[1] else { bail!("{n}(json, path): the path is a literal, such as '$.a.b'; json_get(json, key, …) takes expressions") };
                     let keys = json_path(path)?.join(", ");
                     let call = if n == "json_extract" { "json_get_json" } else { "json_as_text" };
-                    *e = expr(&match keys.is_empty() {
+                    *e = grouped(expr(&match keys.is_empty() {
                         true => a[0].to_string(),
                         false => format!("{call}({}, {keys})", a[0]),
-                    })?;
+                    })?);
                 }
                 // (Postgres's bytea-only functions read a string literal as their first argument as a bytea, of any
                 // arity: `sha256('\x01')` hashes the byte 0x01, and `encode('\x01', 'hex')` is `01`, as Postgres does;
@@ -2216,6 +2217,27 @@ mod tests {
     }
 
     #[test]
+    fn a_call_written_as_an_expression_keeps_its_place_inside_an_operator() {
+        // (11-03 audit H4: `SAFE_DIVIDE(10, 100) / SAFE_DIVIDE(5, 100)` was written `CAST(10 AS DOUBLE) / nullif(100, 0) /
+        // CAST(5 AS DOUBLE) / nullif(100, 0)`, 0.0002, and `x - DATEADD(day, 1, d)` subtracted d and added the day)
+        let all = |sql: &str| {
+            let mut e = expr(sql).unwrap();
+            let _ = crate::walk::visit_expressions_mut(&mut e, |x| match expression(x) {
+                Ok(()) => ControlFlow::Continue(()),
+                Err(e) => ControlFlow::Break(e),
+            });
+            e.to_string()
+        };
+        assert_eq!(all("SAFE_DIVIDE(10, 100) / SAFE_DIVIDE(5, 100)"), "(CAST(10 AS DOUBLE) / nullif(100, 0)) / (CAST(5 AS DOUBLE) / nullif(100, 0))");
+        assert_eq!(all("x - DATEADD(day, 1, d)"), "x - ((d) + CAST(1 AS BIGINT) * INTERVAL '1 day')");
+        assert_eq!(all("ts - TIMESTAMP_TRUNC(ts, WEEK)"), "ts - (date_trunc('day', ts) - CAST(date_part('dow', ts) AS BIGINT) * INTERVAL '1 day')");
+        assert_eq!(all("1 + SAFE_DIVIDE(a, b)"), "1 + (CAST(a AS DOUBLE) / nullif(b, 0))");
+        // (a call that stays a call, or a cast, needs none)
+        assert_eq!(all("2 * ZEROIFNULL(n)"), "2 * coalesce(n, 0)");
+        assert_eq!(all("1 + DATE(ts)"), "1 + CAST(ts AS DATE)");
+    }
+
+    #[test]
     fn top_is_a_name_unless_it_is_sql_servers_top() {
         // (a LATERAL named top is an alias: quoted, so it parses; SELECT TOP n, TOP (n) and TOP … PERCENT are left as they are)
         let lateral = "SELECT c.name, top.amount FROM customers c LEFT JOIN LATERAL (SELECT o.amount FROM orders o WHERE o.customer_id = c.id ORDER BY o.amount DESC LIMIT 1) top ON true";
@@ -2243,9 +2265,9 @@ mod tests {
         assert!(call("date_diff('week', a, b)").unwrap().starts_with("CAST(trunc(round((date_part('epoch', date_trunc('day', b))"));
         assert_eq!(call("date_diff('day', a, b)").unwrap(), "CAST(round((date_part('epoch', date_trunc('day', b)) - date_part('epoch', date_trunc('day', a))) / 86400) AS BIGINT)");
         assert_eq!(call("DATEDIFF(month, a, b)").unwrap(), "CAST((date_part('year', b) * 12 + date_part('month', b)) - (date_part('year', a) * 12 + date_part('month', a)) AS BIGINT)");
-        assert_eq!(call("DATEADD(week, 2, ts)").unwrap(), "(ts) + CAST(2 AS BIGINT) * 7 * INTERVAL '1 day'");
-        assert_eq!(call("date_add(d, INTERVAL 7 DAY)").unwrap(), "(d) + INTERVAL 7 DAY");
-        assert_eq!(call("date_sub(d, INTERVAL '1 month')").unwrap(), "(d) - INTERVAL '1 month'");
+        assert_eq!(call("DATEADD(week, 2, ts)").unwrap(), "((ts) + CAST(2 AS BIGINT) * 7 * INTERVAL '1 day')");
+        assert_eq!(call("date_add(d, INTERVAL 7 DAY)").unwrap(), "((d) + INTERVAL 7 DAY)");
+        assert_eq!(call("date_sub(d, INTERVAL '1 month')").unwrap(), "((d) - INTERVAL '1 month')");
         // (Spark's own: its days as an INT, once; a column holding the part is left as written)
         assert_eq!(call("date_add(d, 7)").unwrap(), "date_add(d, CAST(7 AS INT))");
         assert_eq!(call("date_add(d, CAST(7 AS INT))").unwrap(), "date_add(d, CAST(7 AS INT))");

@@ -761,7 +761,7 @@ fn cast(e: Expr, t: &str) -> Result<Expr> {
 /// `e` in parentheses where an operator around it could take part of it (`x + x` into `x * 2`),
 /// and as it is otherwise: functions calling functions add their levels to every parser's limit
 /// (DataFusion's is 50).
-fn grouped(e: Expr) -> Expr {
+pub(crate) fn grouped(e: Expr) -> Expr {
     match e {
         Expr::Cast { kind: ast::CastKind::Cast | ast::CastKind::TryCast | ast::CastKind::SafeCast, .. }
         | Expr::Nested(_)

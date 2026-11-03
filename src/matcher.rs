@@ -1601,6 +1601,7 @@ fn glue_expr(base: &SessionState, text: &str, frame: &DFSchema) -> Result<Arc<dy
     // The optimizer rewrites COALESCE and its kin to CASE before a plan runs; a glue has no plan, so it is simplified here.
     let info = SimplifyContext::builder().with_schema(Arc::new(frame.clone())).build();
     let expr = ExprSimplifier::new(info).simplify(expr)?;
+    let expr = crate::zeros_in::alone(expr, frame)?; // (a float IN list's zero, a CASE's and NULLIF's, as the row path's ZerosIn)
     // An async function (a Python or external one, file_read) runs only as a plan step of its own, which a glue hasn't.
     let mut called = None;
     expr.apply(|e| {
@@ -2682,6 +2683,22 @@ mod tests {
         )
         .await?;
         assert_eq!(rows, ["1|a", "2|d", "3|b"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_define_that_reads_the_match_takes_the_zeros_as_one() -> Result<()> {
+        // (11-03 audit M1: such a DEFINE is planned without the optimizer's rules, so `ZerosIn` never ran on it: a -0.0 was
+        // not IN (0.0, 2.0), CASE … WHEN 0.0 missed it, and NULLIF(-0.0, 0) wasn't NULL)
+        let q = |define: &str| {
+            format!(
+                "WITH t(day, x) AS (VALUES (1, CAST('-0.0' AS DOUBLE)), (2, CAST(1 AS DOUBLE)), (3, CAST(1 AS DOUBLE))) SELECT day, sym FROM t \
+                 MATCH_RECOGNIZE (ORDER BY day MEASURES CLASSIFIER() AS sym ALL ROWS PER MATCH PATTERN (a b) DEFINE b AS {define}) ORDER BY day"
+            )
+        };
+        for define in ["LAST(a.x) IN (0.0, 2.0)", "CASE LAST(a.x) WHEN 0.0 THEN true ELSE false END", "NULLIF(FIRST(a.x), 0) IS NULL", "LAST(a.x) NOT IN (0.0, 2.0) IS FALSE"] {
+            assert_eq!(rows_of(&q(define)).await?, ["1|a", "2|b"], "{define}");
+        }
         Ok(())
     }
 

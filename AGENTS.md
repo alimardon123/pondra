@@ -3100,7 +3100,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `s = 'b' AND 'b' = s` was FALSE, and `s <= 'b' AND 'b' > s` kept `s <= 'b'`, letting 'b' in (`random_sql.py --seed
    20261102`). Its simplifier swaps a literal as written itself, but not one that is a cast until folded (a lake's text
    is Utf8View, so `'b'` is) or a folded expression (`('ab' = 'b') > t`). `ValuesRight`, just before the pushdown,
-   writes each filter's `value op column` as `column op' value`. `cargo test --lib optimize::tests::a_value_written_first`
+   writes each filter's `value op column` as `column op' value`, and each join's ON (a LEFT JOIN's comparisons of its right
+   side are moved into a filter there and merged in the same pass: 11-03 audit H6). `cargo test --lib optimize::tests::a_value_written_first`
 
 459. **A DECIMAL `x * 0` is the zero of the product's type, and `x % 1` is its fraction** (`optimize::DecimalIdentities`).
    DataFusion's simplifier, for an `x` that can't be NULL, made `x * 0` the zero as written, of the zero's type (a CASE or
@@ -3120,6 +3121,15 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    parsed to (a longer one, a bulk INSERT's rows, is parsed each time), and each look takes its own copy to change. A
    look at a statement's strings makes no error to drop: `pg_casts::uuid_spelled` and `pg_json_make::jsonb_text_if`
    answer `Option` (each refusal took a backtrace under `RUST_BACKTRACE`). `cargo test --lib parsed::`
+
+470. **Another database's call written as Pondra's keeps its place inside an operator** (`friendly::expression`,
+   `expander::grouped`). A call written as an expression (SAFE_DIVIDE as `CAST(a AS DOUBLE) / nullif(b, 0)`, DATEADD as
+   `(d) + n * INTERVAL '1 day'`, TIMESTAMP_TRUNC(ts, WEEK)) is put in parentheses where it isn't one term: sqlparser
+   writes an operator back as `left op right`, so `8 / SAFE_DIVIDE(a, b)` was `8 / a / b` (11-03 audit H4). A
+   streaming task's or a materialized view's run reads its source in SQL's column order (`query::over`), as its query
+   was planned at create: a task made after `ALTER COLUMN b FIRST` wrote each value into the other column (H5); what
+   read the table before a move reads it by name since (`ddl::keep_readers`). `cargo test --lib
+   friendly::tests::a_call_written`; `harness.py friendly`, `movereaders`
 
 ```bash
 cargo build --release
