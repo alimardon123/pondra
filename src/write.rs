@@ -79,14 +79,15 @@ enum TableSpec {
 /// adds, wherever they go: a task's `*` would give one more column than its target has) (`ddl::keep_readers`): the
 /// catalog's writes for that, for the same commit, and what each reader does now.
 async fn shown_as_stored(lake: &Lake, name: &str, m: &TableMeta, sql: &[String], added: &[String]) -> Result<(Vec<String>, Vec<(String, Vec<u8>)>, Vec<String>)> {
-    let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| s != "_deleted").collect();
+    let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| s != "_deleted").collect(); // (to check `sql` names each once)
     let stored = sql.iter().map(|c| m.stored(c).map(str::to_string).ok_or_else(|| anyhow::anyhow!(crate::rules::alter::no_column(name, c)))).collect::<Result<Vec<_>>>()?;
     let mut sorted = (stored.clone(), as_stored.clone());
     (sorted.0.sort(), sorted.1.sort());
     ensure!(sorted.0 == sorted.1, "{name}'s columns in SQL's order name each of its columns once: {}", sql.join(", "));
-    let shown = if stored == as_stored { vec![] } else { stored };
+    let mut then = m.clone();
+    then.set_order(stored);
+    let shown = then.shown.clone();
     let was: Vec<(String, String)> = m.star().into_iter().filter(|(c, _)| !added.contains(c)).collect();
-    let then = TableMeta { shown: shown.clone(), ..m.clone() };
     let now = then.star();
     if now == was {
         return Ok((shown, vec![], vec![])); // (nothing moved, nothing added)
@@ -227,25 +228,13 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 // A new column is stored under its name, or, if an older column (renamed or
                 // dropped) is stored under that, `name~2`, `name~3`…: files are never rewritten.
                 for (c, t) in &columns[old..] {
-                    let taken = |s: &str| m.columns.iter().any(|(n, _)| n == s);
-                    let s = (1..).map(|i| if i == 1 { c.clone() } else { format!("{c}~{i}") }).find(|s| !taken(s)).expect("a free name");
-                    if s != *c {
-                        m.names.insert(s.clone(), c.clone());
-                    }
-                    if let Some(e) = enums.get(c) {
-                        m.enums.insert(s.clone(), e.clone()); // (ALTER TABLE … ADD COLUMN c mood)
-                    }
-                    if let Some(t) = sql_types.get(c) {
-                        m.sql_types.insert(s.clone(), t.clone()); // (ALTER TABLE … ADD COLUMN c UUID)
-                    }
-                    m.columns.push((s, t.clone()));
+                    m.add_column(c, t, sql_types.get(c).cloned(), enums.get(c).cloned());
                 }
                 if m.changed {
                     // (its replaced rows' table takes the column too, before its `_old_version`)
                     let del = crate::sys::deleted(name);
                     if let Some(mut d) = lake.cat.get::<TableMeta>(&table_key(&del)).await? {
-                        d.columns = m.columns.iter().cloned().chain([("_old_version".to_string(), "Int64".to_string())]).collect();
-                        d.names = m.names.clone();
+                        d.follow_columns(&m);
                         lake.cat.commit(vec![(table_key(&del), json(&d))], &[]).await?;
                     }
                 }
@@ -255,7 +244,8 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 // (ADD COLUMN, at the end or `… AFTER b | FIRST`: what reads it by position keeps reading it as it did, in the same commit)
                 let sql = shown.clone().unwrap_or_else(|| m.sql_names());
                 let (shown, puts, readers) = shown_as_stored(lake, name, &m, &sql, &added).await?;
-                (m.shown, kept) = (shown, (puts, readers));
+                m.set_order(shown);
+                kept = (puts, readers);
             }
             let stored = |c: &String| m.stored(c).unwrap_or(c).to_string();
             let cluster = cluster.map(|c| c.iter().map(stored).collect());
