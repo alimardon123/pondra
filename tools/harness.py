@@ -2404,6 +2404,15 @@ def serverless_idle(port):
     held = ended(node, 6) is None
     c.close()
     checks["e a watch keeps it up while it streams; its client gone, it ends"] = first == 200 and held and ended(node, 30) == 0
+    # g. a joined page's follow of the commit stream is a use while it streams, though the nodes' own follows aren't (a page says
+    # no format, as the nodes' own client does); its tab gone, the node ends (11-03 audit M7)
+    node = idle()
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    c.request("GET", "/cluster/log")
+    first = c.getresponse().status
+    held = ended(node, 6) is None
+    c.close()
+    checks["g a joined page's follow of the commit stream keeps it up; its tab gone, it ends"] = first == 200 and held and ended(node, 30) == 0
     # f. a folder of lakes refuses it: each database's node already stops once idle (PONDRA_DATABASE_IDLE_SECS)
     folder = tempfile.mkdtemp(prefix="pondra-lakes-")
     subprocess.run([BIN, "sql", "--dir", os.path.join(folder, "one"), "CREATE TABLE x (a INT)"], capture_output=True, timeout=120)
@@ -12401,6 +12410,23 @@ def served():
     checks["a database in a bucket attaches no node's lake or folder (ATTACH, the owner's, a raw Attach with the admin token): refused saying --attach; nothing dials the node named; a bucket's lake attaches (11-02 M4)"] = \
         all(str(r).startswith("ERROR") and "--attach" in str(r) for r in refused_m4) and heard == [] \
         and not str(m4["owner: a bucket's lake"]).startswith("ERROR") and "other" in str(m4["attached"]) and "far" not in str(m4["attached"])
+    # 11-03 L4: a catalog in a bucket that names a folder all the same (written by a release before M4, or by whoever may write
+    # the bucket: here a folder's lake that attached a folder, copied into the bucket) is refused at once to whoever names it,
+    # saying why, not after 5 s a name as "no lake"
+    far_dir, home_dir = mk(), mk()
+    subprocess.run([BIN, "sql", "--dir", far_dir, "CREATE TABLE z (a INT)"], capture_output=True, timeout=120)
+    subprocess.run([BIN, "sql", "--dir", home_dir, f"ATTACH '{far_dir}' AS far"], capture_output=True, timeout=120)
+    for d, _, fs in os.walk(home_dir):
+        for f in fs:
+            s3.upload_file(os.path.join(d, f), "m4lakes", "copied/" + os.path.relpath(os.path.join(d, f), home_dir))
+    l4 = {}
+    for q in ("INSERT INTO far.z VALUES (1)", "INSERT INTO far.public.z VALUES (1)"):
+        t = time.monotonic()
+        p = subprocess.run([BIN, "sql", "--dir", "s3://m4lakes/copied", q], capture_output=True, text=True, timeout=120, env={**os.environ, **benv})
+        l4[q] = {"s": round(time.monotonic() - t, 1), "said": (p.stdout + p.stderr).strip().splitlines()[-1:]}
+    info["L4"] = l4
+    checks["a statement naming a lake the bucket's catalog attaches but no node opens is refused at once, saying --attach (11-03 L4)"] = \
+        all(v["s"] < 5 and "--attach" in str(v["said"]) for v in l4.values())
     for n in (A_node, B_node, C_node, M, E, D, X, BK):
         n.kill()
     ok = all(checks.values())

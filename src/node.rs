@@ -343,7 +343,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
 pub fn keep(app: &crate::app::App, s: &Start) {
     let lives = !is_guest();
     let leader = app.seq.is_some();
-    crate::idle::serving(&app.lake, leader); // (what `--idle-exit` waits for: `idle.rs`)
+    crate::idle::serving(&app.lake, leader, app.replica.as_ref()); // (what `--idle-exit` waits for: `idle.rs`)
     let reader = s.reader || app.members.reader();
     let lake = app.lake.clone();
     if leader && lives {
