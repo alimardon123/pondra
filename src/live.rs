@@ -7,7 +7,7 @@
 //! several on one connection, each line naming its query's `id` (a page's: a browser opens six
 //! connections to a host at most, and live answers each holding one left nothing for the rest).
 use crate::app::App;
-use crate::store::{seg_key, Segment, TableMeta};
+use crate::store::{seg_key, TableMeta};
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
@@ -194,7 +194,7 @@ async fn print(w: &mut Watch) -> anyhow::Result<u64> {
     }
     let mut touched = false;
     if now > w.seen {
-        for (_, seg) in lake.cat.scan::<Segment>(&seg_key(w.seen + 1), &seg_key(now + 1)).await? {
+        for (_, seg) in lake.cat.segments(&seg_key(w.seen + 1), &seg_key(now + 1)).await? {
             touched |= w.tables.iter().any(|t| seg.parts.contains_key(t) || seg.parts.contains_key(&crate::sys::deleted(t)));
         }
     }

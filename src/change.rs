@@ -1010,7 +1010,7 @@ pub async fn feed(lake: &Lake, table: &str, after: u64, upto: Option<u64>) -> Re
 pub async fn taken_out(lake: &Lake, table: &str, after: u64, upto: Option<u64>) -> Result<Vec<RecordBatch>> {
     let end = upto.map_or("s0".to_string(), |u| seg_key(u + 1));
     let mut out = vec![];
-    for (key, seg) in lake.cat.scan::<Segment>(&seg_key(after + 1), &end).await? {
+    for (key, seg) in lake.cat.segments(&seg_key(after + 1), &end).await? {
         if seg.files.get(table).is_some_and(|f| !f.removed.is_empty() || !f.deleted.is_empty()) {
             let n: u64 = key[2..].parse()?;
             let mut rows = lake.filed_rows(&seg, table, true, 0, u64::MAX).await?;
