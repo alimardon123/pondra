@@ -361,7 +361,7 @@ fn java_field(c: char, n: usize) -> Result<&'static str> {
 /// stays a NUMERIC (11-03 audit L8: it went through DOUBLE). The same cast, zero check and division in every plan
 /// and every expression planned alone (a CHECK, a DEFAULT).
 pub fn register(ctx: &datafusion::prelude::SessionContext) {
-    ctx.register_udf(divide::SAFE_DIVIDE.clone());
+    ctx.register_udf(divide::safe_divide());
 }
 
 mod divide {
@@ -372,9 +372,8 @@ mod divide {
     use datafusion::logical_expr::type_coercion::binary::BinaryTypeCoercer;
     use datafusion::logical_expr::{ColumnarValue, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
     use datafusion::physical_expr_common::datum::{apply, apply_cmp};
-    use std::sync::LazyLock;
 
-    pub(super) static SAFE_DIVIDE: LazyLock<ScalarUDF> = LazyLock::new(|| ScalarUDF::new_from_impl(SafeDivide(Signature::any(2, Volatility::Immutable))));
+    pub(super) fn safe_divide() -> ScalarUDF { ScalarUDF::new_from_impl(SafeDivide(Signature::any(2, Volatility::Immutable))) }
 
     #[derive(Debug, PartialEq, Eq, Hash)]
     struct SafeDivide(Signature);
