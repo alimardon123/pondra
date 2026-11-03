@@ -330,7 +330,7 @@ impl Merge {
         }
         let given: Vec<String> = match u.columns.is_empty() {
             true => {
-                let columns: Vec<String> = stored.sql_order().into_iter().filter(|c| c != "_deleted").collect(); // (SQL's order)
+                let columns: Vec<String> = stored.sql_names(); // (SQL's order)
                 crate::write::implicit(&columns, Some(width)).to_vec()
             }
             false => u.columns.clone(),
@@ -420,7 +420,7 @@ impl Upsert {
     fn given(&self, meta: &TableMeta, target: &str) -> Result<Vec<String>> {
         let width = crate::rules::rows::rows_width(&self.query);
         let given: Vec<String> = match self.columns.is_empty() {
-            true => crate::write::implicit(&meta.sql_order().into_iter().filter(|c| c != "_deleted").collect::<Vec<_>>(), width).to_vec(), // (SQL's order)
+            true => crate::write::implicit(&meta.sql_names(), width).to_vec(), // (SQL's order)
             false => self.columns.clone(),
         };
         if let Some(w) = width.filter(|&w| w != given.len()) {
@@ -742,7 +742,7 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
                 (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a).await?,
                 (Action::Insert(columns, values), _) => {
                     // (no list: the table's first columns, as many as the values, as an INSERT's: `write::implicit`)
-                    let given = if columns.is_empty() { crate::write::implicit(&meta.sql_order().into_iter().filter(|c| c != "_deleted").collect::<Vec<_>>(), Some(values.len())).to_vec() } else { columns.clone() }; // (SQL's order)
+                    let given = if columns.is_empty() { crate::write::implicit(&meta.sql_names(), Some(values.len())).to_vec() } else { columns.clone() }; // (SQL's order)
                     if given.len() != values.len() {
                         let what = if values.len() > given.len() { "INSERT has more expressions than target columns" } else { "INSERT has more target columns than expressions" };
                         return Err(crate::codes::coded("42601", format!("{what} (MERGE: INSERT gives {} values for {} columns)", values.len(), given.len())));

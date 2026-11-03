@@ -558,9 +558,11 @@ pub(crate) fn sql_type(t: &str) -> String {
     crate::answer::dtype(t).map_or_else(|_| t.to_string(), |d| of(&d))
 }
 
-/// `CREATE TABLE`, its layout as clauses (`layout.rs`): what makes the table again, without rows.
+/// `CREATE TABLE`, its layout as clauses (`layout.rs`): what makes the table again, without rows. Under SQL's names, for
+/// an entry as stored too (`ddl::alike` compares two).
 pub(crate) fn table_sql(name: &str, m: &TableMeta) -> String {
-    let mut parts: Vec<String> = m.in_order().into_iter().filter(|(c, _)| !m.marker(c)).map(|(c, t)| { // (SQL's order; a keyed table's `_deleted` is its own)
+    let m = &*m.logical_ref();
+    let mut parts: Vec<String> = m.star().iter().map(|(c, t)| { // (SQL's order; a keyed table's `_deleted` is its own)
         let merge = m.merge.get(c).map(|f| format!(" MERGE {f}")).unwrap_or_default();
         let null = if m.not_null.contains(c) && !m.key.contains(c) && !m.identity.contains_key(c) { " NOT NULL" } else { "" };
         let default = match m.identity.get(c) {
@@ -963,7 +965,7 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
     let strings = |v: &Value| -> Vec<String> { serde_json::from_value(v.clone()).unwrap_or_default() };
     // (a keyed table's `_deleted` is its own, wherever it is: never in a definition)
     let columns: Vec<(String, String)> = pairs(&s["columns"]).into_iter().filter(|(c, _)| !old.marker(c)).collect();
-    let was: Vec<&(String, String)> = old.in_order().into_iter().filter(|(c, _)| !old.marker(c)).collect(); // (SQL's order, as SHOW CREATE gives it)
+    let was = old.star(); // (SQL's order, as SHOW CREATE gives it)
     // What can't be brought along: a column taken away, moved or renamed; another key or merge.
     for (i, (c, _)) in was.iter().enumerate() {
         match columns.iter().position(|(n, _)| n == c) {
