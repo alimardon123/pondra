@@ -4873,7 +4873,7 @@ def _flight_memory_stop(fport, aggregate, stopped, settle):
     except Exception as e:  # (pyarrow raises the gRPC status as its own error: the text carries the status and the message)
         text = str(e)
     stopped_here = bool(re.search(r"resource[ _]exhausted", text, re.I)) and "out of memory" in text
-    counted = (stopped() or 0) == before + 1
+    counted = until(lambda: stopped() or 0, before + 1, 5) == before + 1  # (the counter can lag the error by a moment: waited for, not raced)
     settle()
     try:  # (a refusal fails the check, it doesn't end the run: as `rows_of` does over HTTP)
         after = client.do_get(fl.Ticket(json.dumps({"sql": "SELECT 1 AS one"}))).read_all().to_pylist()
