@@ -9936,6 +9936,31 @@ def colorder():
         except Exception as e:
             theirs[name] = f"error: {str(e)[:160]}"
     checks["Delta and Iceberg readers list a, e, c, d, b, f, with the same row"] = all(v == [["a", "e", "c", "d", "b", "f"], [19, 50, 39, 49, 29, 59]] for v in theirs.values())
+    # A move while an INSERT without a column list is written on another node: the leader refuses the rows put by the old
+    # order (40001, so it is run again, by the new one) and never takes them (11-03 audit M9: a node that hadn't seen the
+    # move filled the old order). The INSERT counts a few hundred million numbers first, so the move lands while it runs.
+    slow = "(SELECT least(count(*), 0) AS z FROM generate_series(1, 400000000) g(v) WHERE v % 7 = 3)"
+    raced = {}
+    for kind, ins in (("select", f"INSERT INTO race_{{}} SELECT 1 + z, 2 FROM {slow} s"), ("values", f"INSERT INTO race_{{}} VALUES (1, (SELECT 2 + z FROM {slow} s))")):
+        table = f"race_{kind}"
+        q(f"CREATE TABLE {table} (a BIGINT, b BIGINT)")
+        until(lambda: names(table, A.port + 1), ["a", "b"], 10)
+        outcome = {}
+        def insert():
+            status, head, text = reply(A.port + 1, "POST", "/sql", ins.format(kind).encode())
+            outcome.update(status=status, state=head.get("x-pondra-sqlstate"), text=text if isinstance(text, str) else text.decode(), done=time.time())
+        writer = threading.Thread(target=insert)
+        writer.start()
+        time.sleep(0.3)
+        q(f"ALTER TABLE {table} ALTER COLUMN b FIRST")
+        moved_at = time.time()
+        writer.join()
+        rows_then = q(f"SELECT a, b FROM {table}")
+        again = sql(A.port + 1, ins.format(kind))
+        raced[kind] = {"insert": {k: outcome[k] for k in ("status", "state")}, "after_move_s": round(outcome["done"] - moved_at, 2), "rows_then": rows_then,
+                       "again": again, "rows": until(lambda: q(f"SELECT a, b FROM {table}"), [{"a": 2, "b": 1}], 10)}
+        checks[f"a move while a {kind} INSERT without a column list runs on another node: refused 40001, nothing written, then by the new order"] = \
+            outcome["done"] > moved_at and outcome["status"] != 200 and outcome["state"] == "40001" and rows_then == [] and raced[kind]["rows"] == [{"a": 2, "b": 1}]
     # After a restart, as it was
     before = gotk()
     for node in nodes:
@@ -9945,7 +9970,7 @@ def colorder():
     for node in nodes:
         node.kill()
     ok = all(checks.values())
-    print(json.dumps({"colorder": checks, "refused": refused, "outside_readers": theirs, "rows": len(before), "ok": ok}, indent=1, default=str))
+    print(json.dumps({"colorder": checks, "refused": refused, "outside_readers": theirs, "raced": raced, "rows": len(before), "ok": ok}, indent=1, default=str))
     if not ok:
         sys.exit(1)
     return f"column order: {len(checks)} checks pass (every positional write and read, a keyed table, two nodes, Delta and Iceberg, a restart)"
@@ -10922,6 +10947,20 @@ def users():
             return f"ERROR {e}"
     flight_said = [bearer[1].decode().startswith("Bearer ps_"), fsql("SELECT item FROM sales.orders ORDER BY id"), fsql("SELECT card FROM sales.orders")]
     checks["Flight: a handshake with a user's name and password gives a session; held to the grants"] = flight_said[0] and flight_said[1] == [{"item": "tea"}, {"item": "cake"}] and "permission denied" in flight_said[2]
+    # …and a user's token gives the token itself, checked at every call, so once dropped it signs nothing in (11-06 audit H2)
+    tok3 = as_(A.port, boss, "CREATE TOKEN fl FOR USER svc")["token"]
+    shaken = client.authenticate_basic_token("svc", tok3)
+    def tsql(q, h=fl.FlightCallOptions(headers=[shaken])):
+        try:
+            info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": q})), h)
+            return client.do_get(info.endpoints[0].ticket, h).read_all().to_pylist()
+        except Exception as e:
+            return f"ERROR {e}"
+    token_said = [shaken[1].decode() == "Bearer " + tok3, tsql("SELECT salary FROM hr")]
+    as_(A.port, boss, "DROP TOKEN fl FOR svc")
+    token_said.append(tsql("SELECT salary FROM hr"))
+    shown_info["flight token"] = token_said
+    checks["Flight: a handshake with a user's token hands back that token, so a dropped one signs nothing in"] = token_said[:2] == [True, [{"salary": 100.0}]] and str(token_said[2]).startswith("ERROR")
     # MCP: a listing shows what a user may read; changes (a stream of rows, every column, as /watch's) is refused without them
     def tool_result(name, args):
         out = as_(A.port, ann, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}), path="/mcp")
