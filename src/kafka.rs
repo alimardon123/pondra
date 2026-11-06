@@ -556,7 +556,12 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
 /// is applied once), so only a record that can't succeed is given up on.
 fn failed(e: &anyhow::Error) -> Outcome {
     use crate::codes::Kind::*;
-    let code = crate::codes::of(e);
+    // (a code read from an error's words is trusted only when the error isn't the machine's or the bucket's: the OS's
+    // "Read-only file system" or "Permission denied" would read as 25006 or 42501, and a write may pass once the disk or
+    // the bucket is back, so it is retried, 11-06 audit L5)
+    let coded = e.chain().any(|c| c.is::<crate::codes::Coded>() || c.is::<crate::codes::Violation>());
+    let machine = !coded && e.chain().any(|c| c.is::<std::io::Error>() || c.is::<object_store::Error>());
+    let code = if machine { "58030" } else { crate::codes::of(e) }; // (io_error: Unavailable)
     let error = match crate::codes::kind(code) {
         Missing if matches!(code, "42P01" | "3F000" | "3D000") => UNKNOWN_TOPIC,
         Invalid | Refused | Exists | Missing | Unsupported => INVALID_RECORD,
@@ -1575,6 +1580,14 @@ mod tests {
             assert_eq!((code, got, offset), (code, want, -1));
             assert!(said.unwrap().contains("why"), "{code}");
         }
+        // (the OS's or the bucket's error is retried, whatever its words would read as; a coded one keeps its code, 11-06 audit L5)
+        let os = |kind, words: &str| anyhow::Error::from(std::io::Error::new(kind, words.to_string())).context("writing the log");
+        assert_eq!(failed(&os(std::io::ErrorKind::ReadOnlyFilesystem, "Read-only file system (os error 30)")).0, REQUEST_TIMED_OUT);
+        assert_eq!(failed(&os(std::io::ErrorKind::PermissionDenied, "Permission denied (os error 13)")).0, REQUEST_TIMED_OUT);
+        let bucket = anyhow::Error::from(object_store::Error::NotFound { path: "t/1".into(), source: "gone".into() });
+        assert_eq!(failed(&bucket).0, REQUEST_TIMED_OUT);
+        assert_eq!(failed(&anyhow::anyhow!("permission denied for table t")).0, TOPIC_AUTHORIZATION_FAILED);
+        assert_eq!(failed(&crate::codes::coded("25006", "a backup database is read only")).0, INVALID_RECORD);
     }
 
     #[test]
