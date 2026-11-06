@@ -28,12 +28,20 @@ use std::time::Duration;
 /// from before can't read: it took the lake for one nobody signs in to.
 /// 5: an identity provider (`sso::Provider`, ADR-074), which a node from before ignores: it takes the
 /// provider's tokens for nobody's and, with no other user, the lake for one nobody signs in to.
-pub const FORMAT: u32 = 5;
+/// 6: a table's columns kept as one list, each column with its facts (`store::Stored`, redesign 1b,
+/// piece 6b), which a node from before can't read (`LISTS`).
+pub const FORMAT: u32 = 6;
+
+/// The format whose tables keep their columns as one list (`store::Stored`). A lake moves to it by itself: its leader raises
+/// it once every node knows it (`raise`), and a form that leads a lake in memory or a folder alone as it opens (`alone`). The commit sets the
+/// format alone: each table's entry becomes its list at its next write (`Catalog::write`), and an entry still in format
+/// 5's shape reads as it always did, as every format-5 lake's do.
+pub const LISTS: u32 = 6;
 
 /// The format every lake gets without asking: the mark itself (`raise`).
 const BASE: u32 = 1;
 
-/// `FORMAT`, unless a test says otherwise (`PONDRA_TEST_FORMAT`: a build of a later format). The
+/// `FORMAT`, unless a test says otherwise (`PONDRA_TEST_FORMAT`: a build of a later or an earlier format). The
 /// process's, not a node's: the build is the process's, and a test pretends to be another build.
 pub fn known() -> u32 {
     static KNOWN: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| crate::env::or("PONDRA_TEST_FORMAT", FORMAT));
@@ -178,7 +186,7 @@ pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>) {
         let mut marked = false;
         if MADE.load(Relaxed) {
             READY.store(known() + 2, Relaxed);
-            marked = set(&lake, BASE).await.map_err(|e| eprintln!("the lake's format: {e:#}")).is_ok();
+            marked = set(&lake, first()).await.map_err(|e| eprintln!("the lake's format: {e:#}")).is_ok();
         } else {
             READY.store(1, Relaxed); // (looking: `require` waits for it)
         }
@@ -195,6 +203,11 @@ pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>) {
                 };
                 marked = done.map_err(|e| eprintln!("the lake's format: {e:#}")).is_ok();
             }
+            if ready >= LISTS {
+                if let Err(e) = set(&lake, LISTS).await {
+                    eprintln!("the tables' column lists (format {LISTS}): {e:#}");
+                }
+            }
             if known() > FORMAT {
                 // (a build posing as a later one, `PONDRA_TEST_FORMAT`: it writes what needs it)
                 let _ = require(&lake, known(), "this test build").await;
@@ -203,6 +216,25 @@ pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>) {
         }
     });
 }
+
+/// The format a lake this build makes starts at: its tables' column lists (`LISTS`) at once, since no release older than
+/// this build has read it (the mark alone, `BASE`, for a test posing as a build from before them).
+fn first() -> u32 { if known() >= LISTS { LISTS } else { BASE } }
+
+/// A form that leads its lake alone, with no leader's loop (`pondra sql`, a program's node): a lake in memory or in a
+/// local folder moves to this build's tables' column lists (`LISTS`) as it opens, in one small commit. A lake in a bucket
+/// doesn't: a cluster's followers may be serving it, which this form can't hear (a leader gap), and a node of a release
+/// before would stop. A bucket's lake moves on only by its server's leader, which knows its followers' releases
+/// (`raise`); until then its entries keep format 5's shape, which every reader reads.
+pub async fn alone(lake: &Lake) -> Result<()> {
+    if known() >= LISTS && kept_here(&lake.url) {
+        set(lake, LISTS).await?;
+    }
+    Ok(())
+}
+
+/// Is the lake at `url` in this process's memory or a local folder (no bucket's `scheme://`)?
+fn kept_here(url: &str) -> bool { matches!(crate::store::place(url), Ok(crate::store::Place::Memory | crate::store::Place::Folder)) }
 
 /// A node that isn't the leader: stop if the lake moves past what this build knows. (It can't,
 /// unless this node was cut off while the others agreed, `raise`, or it started on such a lake
@@ -218,4 +250,57 @@ pub fn watch(lake: Arc<Lake>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{json, table_key, TableMeta};
+
+    /// A form alone raises a lake in memory or a folder, never one in a bucket (`alone`).
+    #[test]
+    fn a_form_alone_raises_only_a_lake_kept_here() {
+        assert!(kept_here("/home/me/lake") && kept_here("memory://7") && kept_here("C:\\lakes\\one"));
+        assert!(!kept_here("s3://bucket/lake") && !kept_here("gs://b/l") && !kept_here("az://c/l") && !kept_here("abfss://c@a.dfs.core.windows.net/l"));
+    }
+
+    /// Format 6 is one small commit: a format-5 lake's entries stay in their shape and answer as before, and each becomes
+    /// its list at its next write (`Catalog::write`), as does an entry made in format 5's shape after it.
+    #[tokio::test]
+    async fn format_6_turns_each_entry_into_its_list_at_its_next_write() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-lists-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().expect("a path"), true, false).await?;
+        lake.cat.commit(vec![(KEY.into(), serde_json::to_vec(&Stamp { format: 5, by: "0.80.0".into() })?)], &[]).await?;
+        let entry = |i: usize| {
+            let mut t = TableMeta::with_columns((0..8).map(|c| (format!("c{c}"), if c % 2 == 0 { "Int64" } else { "Utf8" }.to_string())).collect());
+            t.rename_column("c1", "renamed");
+            t.drop_column("c2");
+            t.set_not_null("c0", true);
+            t.set_default("c3", Some(format!("'{i}'")));
+            t.set_order(vec!["c7".into()]);
+            t
+        };
+        lake.cat.commit((0..300).map(|i| (table_key(&format!("t{i}")), json(&entry(i)))).collect(), &[]).await?;
+        let shapes = |raw: &std::collections::BTreeMap<String, bytes::Bytes>| raw.values().filter(|v| v.starts_with(br#"{"list":"#)).count();
+        let at5 = lake.cat.scan_raw("t/", "t0").await?;
+        assert!(at5.len() == 300 && at5.values().all(|v| v.starts_with(br#"{"columns":"#)), "below format 6, each as 0.80 wrote it");
+        set(&lake, LISTS).await?;
+        assert_eq!(of(&lake.cat).await?.format, LISTS);
+        let raised = lake.cat.scan_raw("t/", "t0").await?;
+        assert_eq!(shapes(&raised), 0, "the raise sets the format alone");
+        let again = |k: &str| -> Result<TableMeta> { Ok(serde_json::from_slice(&raised[k])?) };
+        let mut t7 = again(&table_key("t7"))?;
+        t7.set_not_null("c4", true); // (a write of an entry read in format 5's shape, after the raise)
+        lake.cat.commit(vec![(table_key("t7"), json(&t7)), (table_key("made"), json(&entry(0)))], &[]).await?;
+        let after = lake.cat.scan_raw("t/", "t0").await?;
+        assert_eq!(shapes(&after), 2, "the entry written, and the one made: each its list");
+        assert!(after[&table_key("t7")].starts_with(br#"{"list":"#) && after[&table_key("made")].starts_with(br#"{"list":"#));
+        for (k, v) in &after {
+            let (t, was): (TableMeta, TableMeta) = (serde_json::from_slice(v)?, if k == &table_key("t7") { t7.clone() } else { entry(k[3..].parse().unwrap_or(0)) });
+            assert_eq!((t.sql_columns(), t.column_list(), json(&t.logical().shaped(true))), (was.sql_columns(), was.column_list(), json(&was.logical().shaped(true))), "{k}: as before");
+        }
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 }
