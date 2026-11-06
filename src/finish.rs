@@ -181,7 +181,8 @@ impl Split {
                         true => format!("pondra_avg_of({s}, {n})"),
                         false => format!("CAST({s} AS DOUBLE) / NULLIF({n}, 0)"),
                     };
-                    *x = expr(&average).expect("an average");
+                    // (in parentheses: `avg(a) / avg(b)` divides by the whole second average, 11-06 audit H3)
+                    *x = crate::expander::grouped(expr(&average).expect("an average"));
                 }
             }
             ControlFlow::<()>::Continue(())
@@ -435,6 +436,24 @@ mod tests {
         let (partial, finish) = split_of("SELECT t.k, avg(x) AS a, round(sum(x) / count(*), 2) AS r FROM t GROUP BY t.k HAVING count(*) > 1 ORDER BY a DESC LIMIT 3", &["k", "a", "r"]).unwrap();
         assert_eq!(partial, "SELECT t.k AS \"k\", sum(x) AS \"__sum_1\", count(x) AS \"__count_2\", count(*) AS \"__count\" FROM t GROUP BY 1");
         assert_eq!(finish, "SELECT \"k\" AS \"k\", pondra_avg_of(\"__sum_1\", \"__count_2\") AS \"a\", round(\"__sum_1\" / \"__count\", 2) AS \"r\" FROM __partial WHERE \"__count\" > 1 ORDER BY a DESC LIMIT 3");
+    }
+
+    #[tokio::test]
+    async fn an_average_inside_an_operator_is_one_value() {
+        // (11-06 audit H3: over (a, b) = (4, 2) and (9, 6), avg(a) / avg(b) is 6.5 / 4, where the bare
+        // `CAST(s AS DOUBLE) / NULLIF(n, 0)` made it 13 / 2 / 8 / 2; `100 / avg(b)` 25, and `avg(a)::int` 6)
+        let aggregates: HashSet<String> = ["count", "sum", "avg"].map(String::from).into();
+        let names: Vec<String> = ["k", "r", "h", "i"].map(String::from).into();
+        let s = split("SELECT k, avg(a) / avg(b) AS r, 100 / avg(b) AS h, avg(a)::int + 1 AS i FROM t GROUP BY k", &names, &aggregates).unwrap().unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE t AS SELECT * FROM (VALUES (1, 4, 2), (1, 9, 6)) AS v(k, a, b)").await.unwrap().collect().await.unwrap();
+        ctx.register_table(PARTIAL, ctx.sql(&s.partial).await.unwrap().into_view()).unwrap();
+        let finish = s.finish(|_| false, &[]);
+        let q = format!("SELECT CAST(r AS DOUBLE) AS r, CAST(h AS DOUBLE) AS h, CAST(i AS DOUBLE) AS i FROM ({finish}) AS f");
+        let b = &ctx.sql(&q).await.unwrap().collect().await.unwrap()[0];
+        use datafusion::arrow::array::AsArray;
+        let got: Vec<f64> = (0..3).map(|c| b.column(c).as_primitive::<datafusion::arrow::datatypes::Float64Type>().value(0)).collect();
+        assert_eq!(got, [1.625, 25.0, 7.0], "{finish}");
     }
 
     #[test]
