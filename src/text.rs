@@ -15,11 +15,21 @@ pub fn object(n: &ast::ObjectName) -> String {
 }
 
 /// A name as SQL resolves it (`S` is `s`, `"S"` is `S`), as `nextval('…')`, `ALTER` and `DROP TYPE` give it.
-pub fn object_of(name: &str) -> String {
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
-    let parsed = Parser::new(&GenericDialect {}).try_with_sql(name).and_then(|mut p| p.parse_object_name(false));
-    parsed.map(|n| object(&n)).unwrap_or_else(|_| name.to_lowercase())
+pub fn object_of(name: &str) -> String { parts(name).join(".") }
+
+/// A name's parts as SQL reads them, written as text: a quoted part as written (`"My.s"` is one part, `"a""b"` is `a"b`),
+/// an unquoted one in lower case, split at dots and spaces. The one splitter of a name in text. (An unquoted part is
+/// anything but those: `my-db`, as Pondra's names after a statement's head take it, `path::NAME`.)
+pub(crate) fn parts(name: &str) -> Vec<String> {
+    static PART: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#""(?:[^"]|"")*"|[^."\s]+"#).expect("a regex"));
+    PART.find_iter(name).map(|m| match m.as_str().strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
+        Some(quoted) => quoted.replace("\"\"", "\""),
+        None => m.as_str().to_lowercase(),
+    }).collect()
 }
+
+/// A database's name as written (`"Dev"`, `dev`): a database is named in lower case, quoted or not.
+pub(crate) fn database(name: &str) -> String { name.trim_matches('"').to_lowercase() }
 
 /// One part of a name: as written if quoted, else in lower case.
 pub fn ident(i: &ast::Ident) -> String { if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() } }
@@ -68,7 +78,7 @@ fn tsql_tran(words: &[String]) -> bool {
 }
 
 /// `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, and the savepoint words: which, if `sql` is one.
-/// (`SET TRANSACTION` is `settings.rs`'s.)
+/// (`SET TRANSACTION` is `set.rs`'s.)
 pub fn control(sql: &str) -> Option<&'static str> {
     // (past leading comments: dbt sends `/* {"app": "dbt"} */ commit;`)
     let words = first_words(sql, 3);
@@ -469,6 +479,26 @@ impl<'a> Offsets<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_in_text_splits_as_sql_reads_it() {
+        let cases: [(&str, &[&str]); 9] = [
+            ("orders", &["orders"]),
+            ("Sales.Orders", &["sales", "orders"]),
+            ("\"Sales\".\"Orders\"", &["Sales", "Orders"]),
+            ("\"My.s\".t", &["My.s", "t"]),
+            ("\"a\"\"b\"", &["a\"b"]),
+            (" lake.public.T ", &["lake", "public", "t"]),
+            ("my-db.Sales", &["my-db", "sales"]),
+            ("\"$user\"", &["$user"]),
+            ("", &[]),
+        ];
+        for (name, want) in cases {
+            assert_eq!(parts(name), want, "{name}");
+        }
+        assert_eq!(object_of("\"S\".Seq"), "S.seq");
+        assert_eq!(database("\"Dev\""), "dev");
+    }
 
     #[test]
     fn a_texts_tokens_cover_it_one_after_the_other_as_the_tokenizer_reads_them() {

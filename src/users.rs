@@ -387,7 +387,7 @@ fn grant(w: &mut Words, grant: bool) -> Result<Change> {
     } else if w.is("secret") {
         On::Secret(w.name()?)
     } else if w.is("database") {
-        database = Some(w.name()?.trim_matches('"').to_lowercase()); // (checked to be this one where it runs: `apply`)
+        database = Some(crate::text::database(&w.name()?)); // (checked to be this one where it runs: `apply`)
         On::Lake
     } else if w.is("all") {
         w.expect("tables")?;
@@ -1304,7 +1304,7 @@ fn pg_duration(v: &str) -> Option<std::time::Duration> {
 pub fn quota() -> Quota {
     let p = crate::auth::current();
     // (a session that set `statement_timeout` keeps its own, 0 included; one that set none gets the node's default)
-    let session = match crate::settings::shown("statement_timeout") {
+    let session = match crate::set::shown("statement_timeout") {
         Some(v) => pg_duration(&v),
         None => crate::env::get("PONDRA_STATEMENT_TIMEOUT").and_then(|v| pg_duration(&v)),
     };

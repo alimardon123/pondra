@@ -204,7 +204,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     let inline_changed = st.inline.is_none() != parts.inline.is_empty() || st.inlined != inlined || st.deleted != deleted;
     let layout = Layout::of(meta);
     let shape = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(),
-        json!([fields, layout.spec(), layout.sort, layout.keys, meta.columns.iter().map(|(c, _)| meta.name_of(c)).collect::<Vec<_>>(), meta.properties]).to_string()); // (a rename, say)
+        json!([fields, layout.spec(), layout.sort, layout.keys, meta.columns().iter().map(|(c, _)| meta.name_of(c)).collect::<Vec<_>>(), meta.properties]).to_string()); // (a rename, say)
     if st.version > 0 && fresh.is_empty() && went.is_empty() && !inline_changed && named.is_none() && st.shape == shape && !moved {
         return Ok(None);
     }
@@ -450,7 +450,7 @@ fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Va
 
 /// A new table's first metadata, with no snapshot (`COPY … TO … (FORMAT iceberg)`: ADR-028).
 pub fn empty(location: &str, columns: &[(String, String)], now: u64) -> Option<Value> {
-    let fields = fields(&TableMeta { columns: columns.to_vec(), ..Default::default() })?;
+    let fields = fields(&TableMeta::with_columns(columns.to_vec()))?;
     Some(json!({
         "format-version": 2, "table-uuid": uuid::Uuid::new_v4().to_string(), "location": location,
         "last-sequence-number": 0, "last-updated-ms": now, "last-column-id": 2 * columns.len(),
@@ -463,7 +463,7 @@ pub fn empty(location: &str, columns: &[(String, String)], now: u64) -> Option<V
 
 /// Does Iceberg have a type for a column of type `t`?
 pub fn carries(t: &str) -> bool {
-    fields(&TableMeta { columns: vec![("x".into(), t.into())], ..Default::default() }).is_some()
+    fields(&TableMeta::with_columns(vec![("x".into(), t.into())])).is_some()
 }
 
 /// The table's columns as Iceberg fields, if every type has an equivalent: optional but a key's, each
@@ -790,12 +790,12 @@ async fn keyed(lake: &Lake, name: &str, meta: &TableMeta, c: &mut Commit) -> Res
     let ctx = lake.session();
     let mut gone = vec![]; // (the keys it deletes, under their SQL names)
     for (f, by) in &c.equality {
-        let named = |by: &[i64]| by.iter().map(|i| usize::try_from(i - 1).ok().and_then(|i| meta.columns.get(i)).map_or_else(|| format!("field {i}"), |(c, _)| meta.name_of(c).to_string())).collect::<Vec<_>>().join(", ");
+        let named = |by: &[i64]| by.iter().map(|i| usize::try_from(i - 1).ok().and_then(|i| meta.columns().get(i)).map_or_else(|| format!("field {i}"), |(c, _)| meta.name_of(c).to_string())).collect::<Vec<_>>().join(", ");
         anyhow::ensure!(by.iter().copied().collect::<std::collections::BTreeSet<_>>() == ids, "{}: an equality delete by {}; {name} takes equality deletes by its key ({}) only", f.path, named(by), names.join(", "));
         let df = ctx.read_parquet(lake.full(&f.path), Default::default()).await?;
         gone.extend(df.select(names.iter().map(|n| ident(*n)).collect::<Vec<_>>())?.collect().await?);
     }
-    let stored = crate::answer::schema(&meta.columns.iter().filter(|(c, _)| meta.key.contains(c)).cloned().collect::<Vec<_>>())?;
+    let stored = crate::answer::schema(&meta.columns().iter().filter(|(c, _)| meta.key.contains(c)).cloned().collect::<Vec<_>>())?;
     let file = |p: &str| meta.files.iter().find(|f| f.path == p).cloned().with_context(|| format!("{CONFLICT}: {p} is no longer {name}'s"));
     for (p, d, _) in &c.deleted {
         for b in crate::adopt::rows_deleted(lake, meta, &file(p)?, std::slice::from_ref(d), &stored).await? {
@@ -1119,13 +1119,7 @@ mod tests {
 
     /// A table renamed one column of, dropped another and moved a third: its stored places + 1 (`Column.id`).
     fn moved() -> TableMeta {
-        TableMeta {
-            columns: vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into()), ("c".into(), "Int64".into()), ("d".into(), "Utf8".into())],
-            names: [("b".to_string(), "bee".to_string())].into(),
-            dropped: vec!["c".into()],
-            shown: vec!["d".into()],
-            ..Default::default()
-        }
+        TableMeta::made(crate::store::Made { columns: vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into()), ("c".into(), "Int64".into()), ("d".into(), "Utf8".into())], names: [("b".to_string(), "bee".to_string())].into(), dropped: vec!["c".into()], shown: vec!["d".into()], ..Default::default() })
     }
 
     /// A field's id is its column's (`Column.id`) whatever its name or its place in SQL's order, the fields listed in
@@ -1135,7 +1129,7 @@ mod tests {
         let f = fields(&moved()).unwrap();
         let got: Vec<(u64, &str)> = f.iter().map(|f| (f["id"].as_u64().unwrap(), f["name"].as_str().unwrap())).collect();
         assert_eq!(got, [(4, "d"), (1, "a"), (2, "bee")]);
-        let layout = Layout::of(&TableMeta { partition: Some("b".into()), ..moved() });
+        let layout = Layout::of(&{ let mut entry = moved(); entry.partition = Some("b".into()); entry });
         assert_eq!((layout.spec()[0]["source-id"].as_u64(), layout.name.as_str()), (Some(2), "bee"));
     }
 }

@@ -37,13 +37,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Tables smaller than this aren't worth spreading (`PONDRA_SPREAD_MB`, 256).
-fn spread_bytes() -> u64 { mb("PONDRA_SPREAD_MB", 256) }
+fn spread_bytes() -> u64 { mb("PONDRA_SPREAD_MB") }
 
 /// In a shuffle, tables smaller than this are read whole by every node, so joins broadcast them
 /// (`PONDRA_BROADCAST_MB`, 64; 0 slices every table).
-fn broadcast_bytes() -> u64 { mb("PONDRA_BROADCAST_MB", 64) }
+fn broadcast_bytes() -> u64 { mb("PONDRA_BROADCAST_MB") }
 
-fn mb(var: &str, default: u64) -> u64 { crate::env::or(var, default) << 20 }
+fn mb(var: &str) -> u64 { crate::env::value::<u64>(var) << 20 }
 
 /// One table's share on one node: manifests and files, and maybe the log tail (after..=upto).
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -570,7 +570,7 @@ async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::p
         let share = Some(totals(&base));
         let purges = if p.purged > 0 { vec![(p.purged, 0)] } else { vec![] };
         // (a range's column is a stored name, as the files and the slice's scan know it: `ranges::named`)
-        let meta = Arc::new(TableMeta { files: p.files.clone(), tiered: after, purges, ..(*base).clone() });
+        let meta = Arc::new({ let mut entry = (*base).clone(); entry.files = p.files.clone(); entry.tiered = after; entry.purges = purges; entry });
         let pruned = Pruned { lake: lake.arc(), name: p.table.clone(), meta: meta.clone(), facts, manifests: Some(p.manifests.clone()), upto: Some(upto), at: Some(s.upto), share, range: p.range.clone(), own: Default::default() };
         let table = crate::query::named(&ctx, Arc::new(pruned), &meta, deleted)?;
         ctx.deregister_table(table_ref(&p.table))?;

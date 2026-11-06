@@ -85,7 +85,7 @@ struct Server {
 
 type Shared = Arc<Server>;
 
-fn idle() -> Duration { Duration::from_secs(crate::env::or("PONDRA_DATABASE_IDLE_SECS", 600)) }
+fn idle() -> Duration { Duration::from_secs(crate::env::value("PONDRA_DATABASE_IDLE_SECS")) }
 
 /// Does `path` hold lakes rather than be one (`pondra serve data`: each a database)? Not when it
 /// holds one itself, or is new or empty (it becomes a lake).

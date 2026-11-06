@@ -1374,7 +1374,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and parameter types from it too; in a transaction `txn::point_read`; a one-key UPDATE of a keyed
    table is `txn::point_change`, in a transaction or not.
 188. **A session's settings are checked as they are set, and travel with its queries only**
-   (`settings.rs`, round 31): `SET datafusion.*` is validated against DataFusion's options and
+   (`set.rs`, round 31): `SET datafusion.*` is validated against DataFusion's options and
    applied in `query::session_at` (and `write::declared`); a session that has any runs its queries
    on its own node and never from `Results`. Postgres's undotted names are kept for `SHOW`;
    `datafusion.runtime.*` is refused. A script sent without a session gets one of its own
@@ -3127,9 +3127,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    answer `Option` (each refusal took a backtrace under `RUST_BACKTRACE`). `cargo test --lib parsed::`
 
 470. **Another database's call written as Pondra's keeps its place inside an operator** (`friendly::expression`,
-   `expander::grouped`). A call written as an expression (SAFE_DIVIDE as `CAST(a AS DOUBLE) / nullif(b, 0)`, DATEADD as
-   `(d) + n * INTERVAL '1 day'`, TIMESTAMP_TRUNC(ts, WEEK)) is put in parentheses where it isn't one term: sqlparser
-   writes an operator back as `left op right`, so `8 / SAFE_DIVIDE(a, b)` was `8 / a / b` (11-03 audit H4). A
+   `expander::grouped`). A call written as an expression (DATEADD as `(d) + n * INTERVAL '1 day'`,
+   TIMESTAMP_TRUNC(ts, WEEK)) is put in parentheses where it isn't one term: sqlparser
+   writes an operator back as `left op right`, so `8 / SAFE_DIVIDE(a, b)` was `8 / a / b` (11-03 audit H4).
+   SAFE_DIVIDE is a function of its own since (`dialect_fns::register`), typed by its arguments: two integers give a
+   DOUBLE, a NUMERIC stays a NUMERIC (L8: text made it a DOUBLE; `cargo test --lib dialect_fns::`). A
    streaming task's or a materialized view's run reads its source in SQL's column order (`query::over`), as its query
    was planned at create: a task made after `ALTER COLUMN b FIRST` wrote each value into the other column (H5); what
    read the table before a move reads it by name since (`ddl::keep_readers`). `cargo test --lib

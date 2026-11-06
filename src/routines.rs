@@ -541,7 +541,7 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
     if let Some(first) = missing.first() {
         let n = first.trim_start_matches('$');
         let literal = |v: String| if v.parse::<f64>().is_ok() { v } else { format!("'{}'", v.replace('\'', "''")) };
-        let setting = crate::settings::shown(n).map(|v| format!("; SET {n} = … made a setting, not a variable: ${n} = {} makes one", literal(v))).unwrap_or_default();
+        let setting = crate::set::shown(n).map(|v| format!("; SET {n} = … made a setting, not a variable: ${n} = {} makes one", literal(v))).unwrap_or_default();
         return Err(crate::codes::coded("42P02", format!("no value for {} (give it one, or declare it: DECLARE {first} = …{setting})", missing.join(", ")))); // (undefined_parameter)
     }
     Ok(text(&stmts))
@@ -637,7 +637,7 @@ pub(crate) fn show(sql: &str) -> Option<String> {
     if !matches!(crate::text::head(sql).as_str(), "show" | "describe" | "desc") {
         return None;
     }
-    if let Some(q) = crate::settings::show(sql) {
+    if let Some(q) = crate::set::show(sql) {
         return Some(q); // (`SHOW search_path`, `SHOW application_name`: the session's)
     }
     static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks|materialized\s+views|views|schemas|databases|secrets|extensions|users|roles|grants)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
@@ -892,11 +892,11 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
     if let Some((name, args)) = crate::runs::execute_of(sql) {
         return Box::pin(crate::runs::execute(app, name, args, who)).await; // (EXECUTE TASK: a tick now, ADR-045)
     }
-    if crate::settings::is(sql) {
+    if crate::set::is(sql) {
         // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: the session's (round 31)
-        return match Box::pin(crate::settings::statement(&app.lake, sql)).await? {
-            crate::settings::Done::Said(tag) => Ok(Outcome::Done(j!({"command": tag}))),
-            crate::settings::Done::Run(sql) => Box::pin(one_of(app, &sql, who, job)).await,
+        return match Box::pin(crate::set::statement(&app.lake, sql)).await? {
+            crate::set::Done::Said(tag) => Ok(Outcome::Done(j!({"command": tag}))),
+            crate::set::Done::Run(sql) => Box::pin(one_of(app, &sql, who, job)).await,
         };
     }
     if let Some(steps) = Box::pin(steps(app, sql, who)).await? {

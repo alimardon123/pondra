@@ -14,7 +14,7 @@ pub fn is_word(text: &str) -> bool { text.trim().eq_ignore_ascii_case("default")
 /// the table's types after).
 #[cfg(feature = "lake")]
 pub(crate) fn default_sql(meta: &TableMeta, column: &str) -> Option<String> {
-    Some(format!("({})", meta.defaults.get(meta.stored(column)?)?))
+    Some(format!("({})", meta.defaults().get(meta.stored(column)?)?))
 }
 
 /// The SQL for a value written for `column`: the word DEFAULT is the column's default (NULL with none), as Postgres
@@ -211,7 +211,7 @@ mod tests {
     #[cfg(feature = "lake")]
     fn the_word_default_is_the_column_default() {
         // (one test of the word: a SET, a VALUES item, an upsert and a MERGE all take it from `value`)
-        let meta = TableMeta { columns: vec![("n".into(), "Int32".into()), ("t".into(), "Utf8".into())], defaults: [("n".to_string(), "3".to_string())].into(), ..Default::default() };
+        let meta = TableMeta::made(crate::store::Made { columns: vec![("n".into(), "Int32".into()), ("t".into(), "Utf8".into())], defaults: [("n".to_string(), "3".to_string())].into(), ..Default::default() });
         for w in ["DEFAULT", "default", " DEFAULT "] {
             assert!(is_word(w), "{w}");
             assert_eq!(value(&meta, "n", w), "(3)", "{w}");

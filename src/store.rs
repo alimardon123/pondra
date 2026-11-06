@@ -54,10 +54,25 @@ impl std::fmt::Display for Changed {
 }
 impl std::error::Error for Changed {}
 
+/// A table's columns as it is made (`TableMeta::made`): the entry keeps them as its own, so a writer outside store.rs
+/// hands them over here, or edits them through the column edits (`TableMeta::add_column` and the rest). By stored name.
+#[derive(Default)]
+pub struct Made {
+    pub columns: Vec<(String, String)>,
+    pub names: BTreeMap<String, String>,
+    pub dropped: Vec<String>,
+    pub shown: Vec<String>,
+    pub not_null: Vec<String>,
+    pub defaults: BTreeMap<String, String>,
+    pub identity: BTreeMap<String, crate::seq::Identity>,
+    pub enums: BTreeMap<String, crate::types::Enum>,
+    pub sql_types: BTreeMap<String, String>,
+}
+
 /// A table: columns, the Parquet files already tiered, and the last log segment they cover.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct TableMeta {
-    pub columns: Vec<(String, String)>, // (name, Arrow type such as "Int64" or "Utf8")
+    columns: Vec<(String, String)>, // (name, Arrow type such as "Int64" or "Utf8")
     #[serde(default)]
     pub key: Vec<String>, // primary key: non-empty = upsert table (latest row per key wins)
     #[serde(default)]
@@ -108,16 +123,16 @@ pub struct TableMeta {
     /// Columns renamed since they were first written: the name in the files and the log (what
     /// `columns` says) -> the name SQL knows it by. Files are never rewritten for a rename.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub names: BTreeMap<String, String>,
+    names: BTreeMap<String, String>,
     /// Columns dropped (their stored names): older files still hold them; nothing reads them again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dropped: Vec<String>,
+    dropped: Vec<String>,
     /// The order SQL lists the columns in, by stored name (`ALTER COLUMN c AFTER b`, `ADD COLUMN … FIRST`); the columns
     /// it leaves out follow in their stored order, so a column added later comes last. Empty: as stored. Storage keeps
     /// `columns`' order (a file's field ids are places in it), and so does everything under SQL: this is SQL's order only,
     /// for `SELECT *`, an INSERT without a column list, `SHOW CREATE` and the catalogs (`in_order`, `sql_order`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub shown: Vec<String>,
+    shown: Vec<String>,
     /// Where its files, manifests and Delta and Iceberg copies are: `data/{folder}/`. None: its
     /// name, as for every table before round 26; a renamed table keeps the folder it had
     /// (`ALTER TABLE … RENAME TO`, ADR-030).
@@ -126,11 +141,11 @@ pub struct TableMeta {
     /// Columns a write must give a value (`NOT NULL`; a key's columns are too, for tables made
     /// from round 26 on), by stored name (`defaults.rs`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub not_null: Vec<String>,
+    not_null: Vec<String>,
     /// A column's value when a write leaves it out (`DEFAULT expr`): stored name -> the SQL
     /// expression, worked out for each row as it is written (`defaults.rs`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub defaults: BTreeMap<String, String>,
+    defaults: BTreeMap<String, String>,
     /// `CHECK` constraints (ADR-036 §3): (name, condition over the columns by their SQL names),
     /// which every row written must not make false (`defaults.rs`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -138,7 +153,7 @@ pub struct TableMeta {
     /// Identity columns (by stored name): each numbered by a sequence it owns, which its default
     /// calls (`seq.rs`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub identity: BTreeMap<String, crate::seq::Identity>,
+    identity: BTreeMap<String, crate::seq::Identity>,
     /// UNIQUE, and PRIMARY KEY and FOREIGN KEY said NOT ENFORCED, by stored column names
     /// (`constraints.rs`, ADR-057): an enforced UNIQUE has every write checked on the leader.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -146,11 +161,11 @@ pub struct TableMeta {
     /// Enum columns, by stored name: their labels, and the type they are of (`types.rs`). Every
     /// door refuses a value its column's labels don't list.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub enums: BTreeMap<String, crate::types::Enum>,
+    enums: BTreeMap<String, crate::types::Enum>,
     /// Columns that hold text but are of another SQL type, by stored name: "uuid", "json", "jsonb", "varchar(n)"
     /// (`types.rs`). Every door refuses a value that isn't one of the type's, written its one way.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub sql_types: BTreeMap<String, String>,
+    sql_types: BTreeMap<String, String>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ext: Option<crate::ext_names::Spec>,
@@ -206,6 +221,51 @@ impl TableMeta {
     /// Is this column an upsert table's delete markers (`_deleted`)? Others never see it: published,
     /// its rows are positions (`tier::shadow`), and Iceberg keeps the name for its own.
     pub fn marker(&self, column: &str) -> bool { column == "_deleted" && !self.key.is_empty() }
+
+    // The column fields are this file's own (redesign 1b, piece 6b): a reader outside it reads them through these, and
+    // a writer through the column edits below (`add_column` and the rest), so the entry can keep them in either shape.
+
+    /// Every column the entry keeps, dropped ones too, as (stored name, Arrow type text), in stored order: a file's
+    /// schema. SQL's view of them is `sql_columns`, `star` or the list (`cols`).
+    pub fn columns(&self) -> &[(String, String)] { &self.columns }
+    /// The stored columns, taken out of an entry made for the purpose (`described`, `with_sys`).
+    pub fn into_columns(self) -> Vec<(String, String)> { self.columns }
+
+    /// Renamed columns: stored name to SQL's (`name_of` for one).
+    pub fn names(&self) -> &BTreeMap<String, String> { &self.names }
+
+    /// Dropped columns, by stored name (`is_dropped` for one).
+    pub fn dropped(&self) -> &[String] { &self.dropped }
+
+    /// SQL's order of the live columns by stored name when it isn't the stored one (`set_order`), else empty: what
+    /// `moved`, `sql_order` and the list read.
+    pub fn shown(&self) -> &[String] { &self.shown }
+
+    /// The NOT NULL columns, by stored name.
+    pub fn not_null(&self) -> &[String] { &self.not_null }
+
+    /// Each column's DEFAULT, by stored name.
+    pub fn defaults(&self) -> &BTreeMap<String, String> { &self.defaults }
+
+    /// The identity columns, by stored name.
+    pub fn identity(&self) -> &BTreeMap<String, crate::seq::Identity> { &self.identity }
+
+    /// The enum columns, by stored name.
+    pub fn enums(&self) -> &BTreeMap<String, crate::types::Enum> { &self.enums }
+
+    /// The types text columns are held as (uuid, JSON, a length: `types.rs`), by stored name.
+    pub fn sql_types(&self) -> &BTreeMap<String, String> { &self.sql_types }
+
+    /// An entry with these columns (stored name, Arrow type text) in stored order and nothing else: a table being made,
+    /// or a test's. The rest is set on it as on any entry (its fields, and the column edits).
+    pub fn with_columns(columns: Vec<(String, String)>) -> TableMeta { TableMeta { columns, ..Default::default() } }
+
+    /// An entry with these columns and their facts, and nothing else: a table being made (`Made`'s fields, by stored
+    /// name). The rest is set on it as on any entry.
+    pub fn made(c: Made) -> TableMeta {
+        let Made { columns, names, dropped, shown, not_null, defaults, identity, enums, sql_types } = c;
+        TableMeta { columns, names, dropped, shown, not_null, defaults, identity, enums, sql_types, ..Default::default() }
+    }
 
     /// Is this column (by the names its entry uses) a uuid, held as text (`types.rs`)?
     pub fn uuid(&self, column: &str) -> bool { self.sql_types.get(column).is_some_and(|t| t == "uuid") }
@@ -346,6 +406,104 @@ impl TableMeta {
     /// A per-column list, by stored name, under SQL's names: the dropped columns left out (`in_sql` for a list).
     fn in_sql_list(&self, l: &[String]) -> Vec<String> {
         l.iter().filter(|c| !self.dropped.contains(c)).map(|c| self.name_of(c).to_string()).collect()
+    }
+
+    // The edits to a table's columns: the one way DDL changes them (redesign 1b, piece 6a). Each names a column by its
+    // stored name and keeps the entry's fields as they always were, so the record doesn't change. Format 6 (piece 6b)
+    // makes the list the record behind these same edits.
+
+    /// ADD COLUMN `name`: stored under its name, or `name~2`, `name~3`… when an older column (renamed or dropped) is
+    /// stored under that, since files are never rewritten. Last in stored order, and in SQL's unless `set_order` puts it
+    /// elsewhere. Returns its stored name.
+    pub fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<crate::types::Enum>) -> String {
+        let taken = |s: &str| self.columns.iter().any(|(n, _)| n == s);
+        let stored = (1..).map(|i| if i == 1 { name.to_string() } else { format!("{name}~{i}") }).find(|s| !taken(s)).expect("a free name");
+        if stored != name {
+            self.names.insert(stored.clone(), name.to_string());
+        }
+        if let Some(e) = labels {
+            self.enums.insert(stored.clone(), e); // (ALTER TABLE … ADD COLUMN c mood)
+        }
+        if let Some(t) = held {
+            self.sql_types.insert(stored.clone(), t); // (ALTER TABLE … ADD COLUMN c UUID)
+        }
+        self.columns.push((stored.clone(), dtype.to_string()));
+        stored
+    }
+
+    /// RENAME COLUMN: the column stored as `stored` is `to` in SQL from now on (its files keep the stored name).
+    pub fn rename_column(&mut self, stored: &str, to: &str) {
+        match to == stored {
+            true => self.names.remove(stored),
+            false => self.names.insert(stored.to_string(), to.to_string()),
+        };
+    }
+
+    /// DROP COLUMN: marked dropped, kept in the list (older files still hold it). The table facts that name it (its
+    /// clustering, merge, constraints, checks) are the caller's.
+    pub fn drop_column(&mut self, stored: &str) {
+        self.names.remove(stored);
+        self.dropped.push(stored.to_string());
+    }
+
+    /// ALTER COLUMN … TYPE that widens it: its Arrow type from now on.
+    pub fn retype_column(&mut self, stored: &str, dtype: String) {
+        if let Some(c) = self.columns.iter_mut().find(|(c, _)| c == stored) {
+            c.1 = dtype;
+        }
+    }
+
+    /// The type a text column is held as (a uuid, JSON, a length: `types.rs`), or none: as text, its enum gone too.
+    pub fn hold_column(&mut self, stored: &str, held: Option<String>) {
+        match held {
+            Some(t) => _ = self.sql_types.insert(stored.to_string(), t),
+            None => {
+                self.sql_types.remove(stored);
+                self.enums.remove(stored);
+            }
+        }
+    }
+
+    /// SQL's order of the live columns, by stored name: kept only when it isn't the stored order (or its start), so a
+    /// table whose columns are back in stored order keeps nothing and pays nothing (`moved`).
+    pub fn set_order(&mut self, stored: Vec<String>) {
+        let as_stored: Vec<&str> = self.live().map(|(s, _, _)| s).filter(|s| *s != "_deleted").collect();
+        self.shown = match as_stored.starts_with(&stored.iter().map(String::as_str).collect::<Vec<_>>()) {
+            true => vec![],
+            false => stored,
+        };
+    }
+
+    /// SET or DROP DEFAULT.
+    pub fn set_default(&mut self, stored: &str, expr: Option<String>) {
+        match expr {
+            Some(e) => _ = self.defaults.insert(stored.to_string(), e),
+            None => _ = self.defaults.remove(stored),
+        }
+    }
+
+    /// SET or DROP NOT NULL.
+    pub fn set_not_null(&mut self, stored: &str, not_null: bool) {
+        self.not_null.retain(|c| c != stored);
+        if not_null {
+            self.not_null.push(stored.to_string());
+        }
+    }
+
+    /// An enum type changed (ALTER TYPE … ADD VALUE or RENAME, `types.rs`): every column of this table of that type
+    /// takes it, in the same commit.
+    pub fn edit_enums(&mut self, of: &str, mut f: impl FnMut(&mut crate::types::Enum)) {
+        self.enums.values_mut().filter(|e| e.of.as_deref() == Some(of)).for_each(&mut f);
+    }
+
+    /// Columns kept as they are named (a system table's, `sys::with_sys`'s system columns), after the others: no
+    /// renamed or dropped column is stored under these names.
+    pub fn append_columns(&mut self, more: impl IntoIterator<Item = (String, String)>) { self.columns.extend(more); }
+
+    /// The table of `of`'s replaced rows (`sys::deleted`) takes its columns: the same list, `_old_version` after it.
+    pub fn follow_columns(&mut self, of: &TableMeta) {
+        self.columns = of.columns.iter().cloned().chain([("_old_version".to_string(), "Int64".to_string())]).collect();
+        (self.names, self.dropped) = (of.names.clone(), of.dropped.clone());
     }
 
     /// The table a write's rules see (`rules::Table`), made from the rule fields alone: never `files` or the
@@ -603,7 +761,7 @@ const RECENT_BYTES: usize = 64 << 20; // …within this much memory (past it, a 
 // follower reads from its own view until it has caught up, instead of the leader buffering more)
 
 /// Query read cache in memory, MB (env PONDRA_CACHE_MB, default 1024).
-fn cache_mb() -> usize { crate::env::or("PONDRA_CACHE_MB", 1024) }
+fn cache_mb() -> usize { crate::env::value("PONDRA_CACHE_MB") }
 
 /// The folder the node's SSD tiers and replica logs go under: `PONDRA_CACHE_DIR` when set (the operator's own
 /// choice), else `pondra-cache-{uid}` in the temp dir, made 0700 and used only while it is this user's alone
@@ -933,11 +1091,11 @@ pub struct Lake {
     pub hwm: watch::Sender<u64>, // the last committed segment this node knows of
     pub backlog: std::sync::atomic::AtomicU64, // leader: rows in the log not yet tiered (all tables)
     pub rt: Arc<RuntimeEnv>,         // shared by all queries: object store registry + Parquet metadata cache
-    tail: Mutex<Tail>, // decoded log rows
-    pub tails: Mutex<crate::query::Tails>, // tables' tails as queries read them (`query::Tail`): by table, one a form (`of.1`)
+    tail: Arc<Mutex<Tail>>, // decoded log rows
+    pub tails: Arc<Mutex<crate::query::Tails>>, // tables' tails as queries read them (`query::Tail`): by table, one a form (`of.1`)
     kept: (Arc<Footers>, Arc<FileStatistics>), // DataFusion's caches of Parquet footers and of files' statistics (`rt`'s)
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
-    pub groups: crate::serve::Groups,          // decoded row groups for key lookups
+    pub groups: Arc<crate::serve::Groups>,     // decoded row groups for key lookups
     pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
     cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
@@ -969,6 +1127,11 @@ crate::per_node!(
     /// The node's line for query memory (`ledger::Ledger`), by its size: every lake the node opens shares it. (By size, so
     /// a lake opened after the setting changed, or a test's with memory of its own, gets a line of its own.)
     static LEDGERS: Mutex<HashMap<usize, Weak<crate::ledger::Ledger>>> = Default::default());
+
+/// The node's lines now (`LEDGERS`): the memory watch takes memory back from the caches charged to them (`oom.rs`).
+pub(crate) fn ledgers() -> Vec<Arc<crate::ledger::Ledger>> {
+    LEDGERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().filter_map(Weak::upgrade).collect()
+}
 
 /// A new lake's pool for its queries: its share of the node's line (`memory_limit`), which every lake of the node shares.
 fn lake_pool() -> Arc<crate::ledger::LakePool> {
@@ -1087,6 +1250,11 @@ pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
 struct Tail {
     rows: std::collections::HashMap<String, BTreeMap<u64, Rows>>,
     bytes: usize,
+}
+
+/// The log's decoded rows, which the log's readers need until their segments are tiered: kept, and counted.
+impl crate::ledger::Charged for Mutex<Tail> {
+    fn held(&self) -> usize { self.lock().unwrap_or_else(std::sync::PoisonError::into_inner).bytes }
 }
 
 impl Tail {
@@ -1469,6 +1637,7 @@ impl Lake {
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
         let local = bucket.is_none() || memory;
         let pool = lake_pool();
+        let ledger = pool.ledger().clone();
         // (spills go to `spill_disk`; no listing kept past its statement: DataFusion's own cache of
         // them would hide a file added to a folder outside the lake, ADR-026)
         // (Parquet footers and files' statistics kept by caches of our own, so `cached_bytes` can say
@@ -1522,8 +1691,12 @@ impl Lake {
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new(crate::query::tails()), kept, disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
-        crate::oom::gives_back(&lake.hot); // (the decoded columns give memory back when the node needs it: the one watch takes them, `oom.rs`)
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
+        for (name, cache) in lake.caches() {
+            ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
+        }
+        ledger.charge("facts", Arc::downgrade(&crate::query::facts_kept())); // (the node's, charged once whatever lakes it opens)
+        crate::oom::wake();
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
             crate::panics::spawn(Lake::commits(Arc::downgrade(&lake), writes)); // (weak: a lake opened in a process goes when its last handle does)
@@ -1794,24 +1967,39 @@ impl Lake {
 
     /// Query memory in use on the node's line, every lake's together, and the line (`ledger::Ledger`).
     pub fn memory(&self) -> (usize, usize) {
-        match self.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>() {
-            Some(pool) => (pool.ledger().reserved(), pool.ledger().line()),
+        match self.ledger() {
+            Some(ledger) => (ledger.reserved(), ledger.line()),
             None => (self.rt.memory_pool.reserved(), memory_limit()),
         }
     }
 
-    /// What each of the node's bounded caches holds now, in bytes (`/metrics`' `cache_bytes`): what
-    /// fills up to its limit is not memory the node is losing (`tools/soak.py`).
-    pub fn cached_bytes(&self) -> [(&'static str, usize); 7] {
-        [
-            ("ranges", self.cached.as_ref().map_or(0, |c| c.held())),
-            ("log", self.tail.lock().unwrap().bytes),
-            ("tails", self.tails.lock().unwrap().bytes()),
-            ("lookups", self.groups.held()),
-            ("catalog_blocks", self.cat.cached()),
-            ("footers", self.kept.0.memory_used()),
-            ("statistics", self.kept.1.memory_used()),
-        ]
+    /// The node's line this lake's queries and caches are on (`lake_pool`).
+    pub fn ledger(&self) -> Option<&Arc<crate::ledger::Ledger>> {
+        Some(self.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>()?.ledger())
+    }
+
+    /// This lake's caches, each by the name `/metrics` gives it, in the order they give memory back when the node needs it
+    /// (`ledger::Charged`; each is charged to the lake's line as it opens). The hot columns go first, decoded again from
+    /// the files when they are read; then the row groups for lookups and the tables' tails, read again from the files and
+    /// the log; then the bucket's byte ranges, fetched again. The log's decoded rows, the catalog's blocks and DataFusion's
+    /// footers and statistics keep what they hold by rules of their own, and say what that is.
+    pub fn caches(&self) -> Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> {
+        let mut caches: Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> = vec![("hot", self.hot.clone()), ("lookups", self.groups.clone()), ("tails", self.tails.clone())];
+        if let Some(ranges) = &self.cached {
+            caches.push(("ranges", ranges.clone())); // (a lake on a bucket: a local or in-memory one reads its store directly)
+        }
+        caches.extend([("log", self.tail.clone() as _), ("catalog_blocks", self.cat.blocks()), ("footers", self.kept.0.clone() as _), ("statistics", self.kept.1.clone() as _)]);
+        caches
+    }
+
+    /// What each of the node's caches on this lake's line holds now, by name, in bytes (`/metrics`' `cache_bytes`; the hot
+    /// columns are its `hot_bytes`): what fills up to its limit is not memory the node is losing (`tools/soak.py`). A cache
+    /// charged to the line (`ledger::Ledger::charge`) is one of them.
+    pub fn cached_bytes(&self) -> Vec<(&'static str, usize)> {
+        match self.ledger() {
+            Some(ledger) => ledger.held_by_name().into_iter().filter(|(name, _)| *name != "hot").collect(),
+            None => self.caches().into_iter().filter(|(name, _)| *name != "hot").map(|(name, cache)| (name, cache.held())).collect(), // (a pool not the ledger's: none here)
+        }
     }
 
     /// This lake as an `Arc` (for query plans that outlive the call that made them).
@@ -2406,6 +2594,15 @@ pub fn serving() { SERVING.send_replace(true); }
 type Footers = datafusion::execution::cache::default_cache::DefaultCache<object_store_df::path::Path, datafusion::execution::cache::cache_manager::CachedFileMetadataEntry>;
 type FileStatistics = datafusion::execution::cache::default_cache::DefaultCache<datafusion::execution::cache::TableScopedPath, datafusion::execution::cache::cache_manager::CachedFileMetadata>;
 
+/// DataFusion's caches keep what they hold at their own limits, and are counted.
+impl crate::ledger::Charged for Footers {
+    fn held(&self) -> usize { self.memory_used() }
+}
+
+impl crate::ledger::Charged for FileStatistics {
+    fn held(&self) -> usize { self.memory_used() }
+}
+
 /// A catalog let go stops what its store runs for it: a reader's polling, a writer's flushing and its
 /// upkeep. SlateDB's tasks outlive its handles, so a lake opened for a moment (a branch's base, a
 /// lake detached, a node stopped in a host's process) went on reading its manifest four times a
@@ -2427,7 +2624,7 @@ impl Catalog {
     /// opening began, for `PONDRA_TRACE_START`.
     async fn writer(kv: Arc<dyn Kv>, since: Instant) -> Result<Self> {
         let mut cat = Self::new(kv);
-        cat.replicas = crate::env::or("PONDRA_REPLICAS", 1);
+        cat.replicas = crate::env::value("PONDRA_REPLICAS");
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
         let c = cat.get::<u64>("c").await?.unwrap_or(0);
         *cat.order.get_mut() = c + 1;
@@ -2485,7 +2682,8 @@ impl Catalog {
     }
 
     /// What the catalog's block caches hold, in bytes.
-    pub fn cached(&self) -> usize { self.kv.cached() }
+    /// Its store's block caches (`/metrics`' `catalog_blocks`), which keep what they hold at their own limits.
+    pub fn blocks(&self) -> Arc<dyn crate::ledger::Charged> { self.kv.clone() }
 
     /// The recent frames plus a receiver for every frame from now on: the leader's own stream, or a follower's, which
     /// holds the leader's frames as it relayed them (`relay`). Either serves `GET /cluster/log` the same way.
@@ -3553,6 +3751,31 @@ mod tests {
         Ok(())
     }
 
+    /// A lake's caches are charged to its line as it opens, so the node's memory watch takes memory back from them all:
+    /// here the tables' tails, after the hot columns and the lookups' row groups, which hold nothing yet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lakes_caches_are_charged_to_its_line_and_give_memory_back() -> Result<()> {
+        use crate::ledger::Charged;
+        let dir = std::env::temp_dir().join(format!("pondra-charged-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let ledger = lake.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
+        let names: Vec<&str> = lake.caches().iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["hot", "lookups", "tails", "log", "catalog_blocks", "footers", "statistics"], "a local lake has no cache of a bucket's ranges");
+        let _ = lake.tails.lock().unwrap().put("t".into(), vec![], 4096);
+        // (other tests' lakes may be charged to the same line meanwhile: what this lake holds is the least it reads)
+        assert!(ledger.held() >= 4096, "the line counts the tails");
+        // (taken back from this lake's caches alone, in the line's order: from the whole line, other tests' would go too)
+        let freed = crate::ledger::take_back(lake.caches().iter().map(|(_, c)| &**c), 4096);
+        assert!(freed >= 4096 && lake.tails.held() == 0, "the tails give their memory back");
+        assert!(!lake.cached_bytes().iter().any(|(name, _)| *name == "hot"), "the hot columns are `hot_bytes`");
+        // (`/metrics` reads the line's list by name: the node's planning facts are on it beside the lake's caches)
+        let metrics: Vec<&str> = lake.cached_bytes().iter().map(|(name, _)| *name).collect();
+        assert!(["lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "facts"].iter().all(|n| metrics.contains(n)), "{metrics:?}");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// A lake a process opens to write (a backup taken in it: `backup::take_here`) is let go with its
     /// last handle: the loops `Lake::open` starts hold it weakly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3600,7 +3823,9 @@ mod tests {
             async fn close(&self) -> Result<(), kv::Error> {
                 Ok(())
             }
-            fn cached(&self) -> usize {
+        }
+        impl crate::ledger::Charged for Given {
+            fn held(&self) -> usize {
                 0
             }
         }
@@ -3910,6 +4135,172 @@ mod tests {
         assert!(Arc::ptr_eq(&a.cols(), &a.cols()), "made once per parse");
         assert_eq!(*a.cols(), a.column_list());
         assert!((*a).clone().column_memo.get().is_none(), "a clone's memo is empty");
+    }
+
+    /// What decoding an entry and making its column list cost (redesign 1b, piece 6b's before and after): a wide table
+    /// (500 columns, renames, drops, a move, per-column facts and 200 files) and 2,000 small random ones. A measure, not a
+    /// check: `cargo test --release --lib entry_parse_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn entry_parse_time() {
+        let wide = {
+            let mut m = TableMeta { columns: (0..500).map(|i| (format!("column_{i}"), if i % 3 == 0 { "Int64" } else { "Utf8" }.to_string())).collect(), ..Default::default() };
+            for i in (0..500).step_by(10) {
+                m.names.insert(format!("column_{i}"), format!("renamed_{i}"));
+            }
+            m.dropped = (5..500).step_by(25).map(|i| format!("column_{i}")).collect();
+            m.shown = ["column_499", "column_1", "column_2"].map(String::from).to_vec();
+            m.not_null = (0..100).map(|i| format!("column_{i}")).collect();
+            m.defaults = (100..150).map(|i| (format!("column_{i}"), "'x'".to_string())).collect();
+            m.sql_types = (200..230).map(|i| (format!("column_{i}"), "uuid".to_string())).collect();
+            m.key = vec!["column_0".into()];
+            m.files = (0..200).map(|i| crate::data_file::DataFile { path: format!("data/t/{i:08}.parquet"), rows: 1000, bytes: 1 << 20, ..Default::default() }).collect();
+            json(&m)
+        };
+        let small: Vec<Vec<u8>> = (0..2000u64)
+            .map(|i| {
+                let n = 1 + (i % 8) as usize;
+                let mut m = TableMeta { columns: (0..n).map(|c| (format!("c{c}"), "Int64".to_string())).collect(), ..Default::default() };
+                if i % 3 == 0 {
+                    m.names.insert("c0".into(), "r0".into());
+                }
+                if i % 5 == 0 && n > 1 {
+                    m.dropped.push(format!("c{}", n - 1));
+                }
+                json(&m)
+            })
+            .collect();
+        let time = |what: &str, raws: &[&[u8]], rounds: u32| {
+            let t = std::time::Instant::now();
+            for _ in 0..rounds {
+                for r in raws {
+                    let m: TableMeta = serde_json::from_slice(r).unwrap();
+                    std::hint::black_box(m.column_list().len());
+                }
+            }
+            let each = t.elapsed().as_nanos() as f64 / (rounds as f64 * raws.len() as f64);
+            println!("{what}: {:.1} µs an entry, decoded and listed ({} bytes)", each / 1000.0, raws.iter().map(|r| r.len()).sum::<usize>() / raws.len());
+        };
+        time("wide (500 columns, 200 files)", &[&wide], 2000);
+        time("small (2,000 random)", &small.iter().map(Vec::as_slice).collect::<Vec<_>>(), 20);
+    }
+
+    /// The column edits (piece 6a) leave the entry as the field edits they replace did, over random sequences of ADD,
+    /// RENAME, DROP, a type, a held type, a default, NOT NULL and a move: the same record, byte for byte.
+    #[test]
+    fn the_column_edits_leave_the_entry_as_the_field_edits_did() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n.max(1)
+        };
+        for _ in 0..500 {
+            let (mut a, mut b) = (TableMeta::default(), TableMeta::default());
+            for _ in 0..12 {
+                let live: Vec<String> = a.live().map(|(s, _, _)| s.to_string()).collect();
+                let pick = |i: u64| live.get(i as usize).cloned();
+                match next(8) {
+                    0 => {
+                        // (ADD COLUMN: as write.rs did it)
+                        let name = format!("c{}", next(4));
+                        if a.live().any(|(_, n, _)| n == name) {
+                            continue;
+                        }
+                        let held = (next(3) == 0).then(|| "uuid".to_string());
+                        a.add_column(&name, "Utf8", held.clone(), None);
+                        let taken = |s: &str| b.columns.iter().any(|(n, _)| n == s);
+                        let s = (1..).map(|i| if i == 1 { name.clone() } else { format!("{name}~{i}") }).find(|s| !taken(s)).unwrap();
+                        if s != name {
+                            b.names.insert(s.clone(), name.clone());
+                        }
+                        if let Some(t) = held {
+                            b.sql_types.insert(s.clone(), t);
+                        }
+                        b.columns.push((s, "Utf8".into()));
+                    }
+                    1 => {
+                        let (Some(s), to) = (pick(next(live.len() as u64)), format!("r{}", next(4))) else { continue };
+                        if a.live().any(|(_, n, _)| n == to) {
+                            continue;
+                        }
+                        a.rename_column(&s, &to);
+                        match to == s {
+                            true => b.names.remove(&s),
+                            false => b.names.insert(s.clone(), to),
+                        };
+                    }
+                    2 => {
+                        let Some(s) = pick(next(live.len() as u64)).filter(|_| live.len() > 1) else { continue };
+                        a.drop_column(&s);
+                        b.names.remove(&s);
+                        b.dropped.push(s);
+                    }
+                    3 => {
+                        let Some(s) = pick(next(live.len() as u64)) else { continue };
+                        a.retype_column(&s, "LargeUtf8".into());
+                        let at = b.columns.iter().position(|(c, _)| *c == s).unwrap();
+                        b.columns[at].1 = "LargeUtf8".into();
+                    }
+                    4 => {
+                        let Some(s) = pick(next(live.len() as u64)) else { continue };
+                        match next(2) {
+                            0 => {
+                                a.hold_column(&s, Some("varchar(9)".into()));
+                                b.sql_types.insert(s, "varchar(9)".into());
+                            }
+                            _ => {
+                                a.hold_column(&s, None);
+                                b.sql_types.remove(&s);
+                                b.enums.remove(&s);
+                            }
+                        }
+                    }
+                    5 => {
+                        let Some(s) = pick(next(live.len() as u64)) else { continue };
+                        match next(2) {
+                            0 => {
+                                a.set_default(&s, Some("'x'".into()));
+                                b.defaults.insert(s, "'x'".into());
+                            }
+                            _ => {
+                                a.set_default(&s, None);
+                                b.defaults.remove(&s);
+                            }
+                        }
+                    }
+                    6 => {
+                        // (SET NOT NULL only on a column that isn't: defaults.rs refuses the rest by the rows it finds)
+                        let Some(s) = pick(next(live.len() as u64)) else { continue };
+                        match b.not_null.contains(&s) {
+                            false => {
+                                a.set_not_null(&s, true);
+                                b.not_null.push(s);
+                            }
+                            true => {
+                                a.set_not_null(&s, false);
+                                b.not_null.retain(|c| *c != s);
+                            }
+                        }
+                    }
+                    _ => {
+                        // (a move: every live column in a random order, as ddl.rs's `place_column` gives it)
+                        let mut order = live.clone();
+                        for i in (1..order.len()).rev() {
+                            order.swap(i, next(i as u64 + 1) as usize);
+                        }
+                        a.set_order(order.clone());
+                        b.shown = if order == live { vec![] } else { order };
+                    }
+                }
+                assert_eq!(json(&a), json(&b), "{:?}", a.columns);
+            }
+            let mut d = TableMeta::default();
+            d.follow_columns(&a);
+            assert_eq!(d.columns.last().map(|(c, _)| c.as_str()), Some("_old_version"));
+            assert_eq!((d.names.clone(), d.dropped.clone(), d.columns.len()), (a.names.clone(), a.dropped.clone(), a.columns.len() + 1));
+        }
     }
 
     /// `past_ttl` keeps out what `ttl_sql` does: a timestamp older than the TTL's seconds, a NULL, a row without the column.

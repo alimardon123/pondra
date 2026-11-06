@@ -141,7 +141,7 @@ async fn relation(lake: &Lake, name: &str) -> Option<Relation<Lake>> {
         if m.finish.is_some() {
             // (a view that finishes its answers shows the columns it answers, SQL's names as `SELECT *` shows them, not its partial ones)
             let l = m.described();
-            return Some(Relation::Columns(l.columns.iter().filter(|(c, _)| !l.marker(c)).map(|(c, _)| (c.clone(), l.sql_types.get(c).and_then(|t| Ty::of(t)))).collect()));
+            return Some(Relation::Columns(l.columns().iter().filter(|(c, _)| !l.marker(c)).map(|(c, _)| (c.clone(), l.sql_types().get(c).and_then(|t| Ty::of(t)))).collect()));
         }
         return Some(Relation::Columns(typed_columns(&m)));
     }
@@ -152,5 +152,5 @@ async fn relation(lake: &Lake, name: &str) -> Option<Relation<Lake>> {
 /// A table's columns as SQL sees them, in order, without an upsert table's delete markers, each with the type the port names it
 /// by: from its column list (`sql_types` is keyed by the stored name).
 fn typed_columns(m: &Arc<TableMeta>) -> Vec<(String, Option<Ty>)> {
-    m.cols().sql().filter(|c| !m.marker(&c.stored)).map(|c| (c.name.clone(), m.sql_types.get(&c.stored).and_then(|t| Ty::of(t)))).collect()
+    m.cols().sql().filter(|c| !m.marker(&c.stored)).map(|c| (c.name.clone(), m.sql_types().get(&c.stored).and_then(|t| Ty::of(t)))).collect()
 }

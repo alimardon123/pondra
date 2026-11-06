@@ -55,7 +55,7 @@ async fn attempt(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str,
     let Some(stamp) = stamp else { return Ok(Err("no commit number reserved: the rows take a lineage".into())) };
     // The table: this statement's own, with nothing in it, and nothing a file as it is can't keep.
     let Some(meta) = stored else { return Ok(Err("no table".into())) };
-    let plain = meta.made_by.as_deref() == Some(job) && meta.files.is_empty() && meta.sealed.is_none() && fits_as_written(meta) && meta.partition.is_none() && meta.cluster.is_empty() && meta.constraints.is_empty() && meta.identity.is_empty();
+    let plain = meta.made_by.as_deref() == Some(job) && meta.files.is_empty() && meta.sealed.is_none() && fits_as_written(meta) && meta.partition.is_none() && meta.cluster.is_empty() && meta.constraints.is_empty() && meta.identity().is_empty();
     if !plain || meta.rules()?.ruled() {
         return Ok(Err("the table isn't this statement's, or has a partition, a key, a rule or identity".into()));
     }
@@ -78,7 +78,7 @@ async fn attempt(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str,
     // Every file planned from its footer before any is copied, in cuts (a kept file each) of a share of the whole, so the
     // copies keep every core busy: a load of one 230 MB file in two cuts used two cores. A share is at most `FILE_BYTES`
     // and at least `SHARE_FLOOR`; a file whose row groups don't fit a share's file is cut at `FILE_BYTES`.
-    let schema = answer::schema(&meta.columns)?;
+    let schema = answer::schema(&meta.columns())?;
     let at_once = copies(target);
     let total: u64 = listed.files.iter().map(|f| f.bytes).sum();
     let share = usize::try_from(total / at_once as u64).unwrap_or(usize::MAX).clamp(SHARE_FLOOR, tier::FILE_BYTES);

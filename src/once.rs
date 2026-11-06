@@ -228,7 +228,7 @@ fn grows(e: &ast::Expr) -> Grows {
 /// with, and the expression over that column alone (written `"ts"`).
 fn window(s: &ast::Select, src: &TableMeta) -> Result<(String, String, String)> {
     let ast::GroupByExpr::Expressions(by, _) = &s.group_by else { bail!("EMIT FINAL: GROUP BY a time bucket") };
-    let timestamp = |c: &str| src.columns.iter().any(|(n, t)| n == c && (t.starts_with("Timestamp") || t.starts_with("Date")));
+    let timestamp = |c: &str| src.columns().iter().any(|(n, t)| n == c && (t.starts_with("Timestamp") || t.starts_with("Date")));
     // (each GROUP BY item as the SELECT names it: an alias, a position, or the same expression)
     let projected: Vec<(Option<String>, ast::Expr)> = s.projection.iter().filter_map(|p| match p {
         ast::SelectItem::ExprWithAlias { expr, alias } => Some((Some(name(alias)), expr.clone())),
@@ -280,7 +280,7 @@ async fn planned(lake: &Lake, source: &str, o: &Once) -> Result<Planned> {
         return Ok(p.clone());
     }
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(source)).await?.with_context(|| format!("no table {source}"))?.logical();
-    let t = crate::answer::schema(&src.columns)?.field_with_name(&o.time)?.data_type().clone();
+    let t = crate::answer::schema(&src.columns())?.field_with_name(&o.time)?.data_type().clone();
     let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(&o.time, t, true)]));
     let df = datafusion::common::DFSchema::try_from(schema.as_ref().clone())?;
     let ctx = crate::query::session(lake, "", "").await?;
@@ -425,7 +425,7 @@ mod tests {
     use super::*;
 
     fn bucket(sql: &str) -> Result<(String, String, String)> {
-        let src = TableMeta { columns: vec![("ts".into(), "Timestamp(Microsecond, None)".into()), ("user".into(), "Utf8".into()), ("n".into(), "Int64".into())], ..Default::default() };
+        let src = TableMeta::with_columns(vec![("ts".into(), "Timestamp(Microsecond, None)".into()), ("user".into(), "Utf8".into()), ("n".into(), "Int64".into())]);
         window(&select(sql)?.0, &src)
     }
 

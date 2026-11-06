@@ -389,9 +389,17 @@ def _public(path, classes):
 
 
 def _settings():
-    """src/env.rs's table, the one list of every PONDRA_* name a node reads: {name: who}."""
-    text = open(os.path.join(ROOT, "src", "env.rs"), encoding="utf-8").read()
-    return dict(re.findall(r'\("(PONDRA_[A-Z0-9_]+)",\s*(\w+)\)', text))
+    """The settings tables (src/settings.rs's CORE, an extension's SETTINGS beside its code), together every PONDRA_* name a
+    node reads: {name: who}."""
+    out = {}
+    for base, _, files in os.walk(os.path.join(ROOT, "src")):
+        for f in files:
+            if f.endswith(".rs"):
+                text = open(os.path.join(base, f), encoding="utf-8").read()
+                for m in re.finditer(r"\bconst\s+[A-Z_]+\s*:\s*&\[(?:crate::settings::)?Setting\]\s*=[^;]*?&\[", text):
+                    table = text[m.end():text.index("];", m.end())]
+                    out |= {n: w.capitalize() for w, n in re.findall(r'\b(node|command|starter|test)\("(PONDRA_[A-Z0-9_]+)"', table)}
+    return out
 
 
 def _variables():

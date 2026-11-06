@@ -76,7 +76,7 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
         ensure!(!before, "{t} AT (…): {t} was made at version {v} ({made}); it has no past before that");
     }
     let ts = |us: i64| lit(ScalarValue::TimestampMicrosecond(Some(us), Some("UTC".into())));
-    let user: Vec<Expr> = meta.columns.iter().map(|(c, _)| ident(c)).collect();
+    let user: Vec<Expr> = meta.columns().iter().map(|(c, _)| ident(c)).collect();
     let shown = |more: Vec<Expr>| user.iter().cloned().chain(more).collect::<Vec<_>>();
     let system = || if sys { [ROW_ID, VERSION, CREATED, UPDATED].map(col).to_vec() } else { vec![] };
     let rows = ctx.read_table(crate::query::table_view(lake, ctx, &local, &meta, true, upto).await?)?;
@@ -156,7 +156,7 @@ pub async fn restore(lake: &Lake, sql: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     let Some(c) = crate::past_names::RESTORE.captures(sql) else { return Ok(None) };
-    let name = c[1].split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
+    let name = crate::text::object_of(&c[1]);
     let t = crate::ddl::local(lake, &name).ok_or_else(|| anyhow!("RESTORE {name}: a table of this lake (run it on a node of {name}'s)"))?;
     let meta: TableMeta = lake.cat.get(&table_key(&t)).await?.ok_or_else(|| anyhow!("no table {name}"))?;
     let cols: Vec<String> = meta.live().map(|(_, n, _)| format!("\"{}\"", n.replace('"', "\"\""))).collect();

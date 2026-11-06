@@ -304,7 +304,7 @@ pub fn cloning(d: &Ddl) -> Result<()> {
 
 /// The lake a clone is of (this one, or one attached here), and its own bases.
 async fn base(lake: &Lake, from: &str) -> Result<(String, Bases)> {
-    let from = from.trim_matches('"').to_lowercase();
+    let from = crate::text::database(from);
     if from == crate::ddl::lake_name(lake) {
         return Ok((lake.url.clone(), lake.cat.get(BASES).await?.unwrap_or_default()));
     }
@@ -422,7 +422,7 @@ pub async fn keyed(lake: &Lake, d: &Ddl, key: &str) -> Result<()> {
 /// to runs it as the node. A branch's own REFRESH goes by its key (`keyed`).
 pub async fn may(lake: &Lake, d: &Ddl) -> Result<()> {
     let name = match d {
-        Ddl::CreateDatabase { clone: Some(of), .. } => of.from.trim_matches('"').to_lowercase(),
+        Ddl::CreateDatabase { clone: Some(of), .. } => crate::text::database(&of.from),
         Ddl::Refresh { database: Some(db), .. } => db.clone(),
         _ => return Ok(()),
     };
@@ -477,7 +477,7 @@ async fn user_door(lake: &Lake, d: &mut Ddl, a: &crate::users::Access) -> Result
 /// schema, or those granted, and only those it names); on a database attached here, by its own grant.
 /// Prod still decides what the attachment's token may pin (`pin`), so `may` isn't asked there.
 fn clone_as(lake: &Lake, of: &mut CloneOf, a: &crate::users::Access) -> Result<()> {
-    let from = of.from.trim_matches('"').to_lowercase();
+    let from = crate::text::database(&of.from);
     let here = crate::ddl::lake_name(lake);
     let me = crate::auth::current().map(|p| p.name).unwrap_or_default();
     if from != here {
@@ -548,10 +548,10 @@ pub async fn sweep(lake: &Lake) -> Result<()> {
 }
 
 /// How long a base keeps a pin on lease that isn't renewed (`PONDRA_PIN_LEASE_SECS`, 14 days).
-fn lease_ms() -> u64 { crate::env::or::<u64>("PONDRA_PIN_LEASE_SECS", 14 * 86_400) * 1000 }
+fn lease_ms() -> u64 { crate::env::value::<u64>("PONDRA_PIN_LEASE_SECS") * 1000 }
 
 /// How often a branch renews its pins on lease (`PONDRA_PIN_RENEW_SECS`, an hour).
-pub fn renew_every() -> std::time::Duration { std::time::Duration::from_secs(crate::env::or::<u64>("PONDRA_PIN_RENEW_SECS", 3600)) }
+pub fn renew_every() -> std::time::Duration { std::time::Duration::from_secs(crate::env::value::<u64>("PONDRA_PIN_RENEW_SECS")) }
 
 /// A base's leader, each retention round: a pin on lease that wasn't renewed within
 /// `PONDRA_PIN_LEASE_SECS` goes. Its branch is on another server, which this lake can't look at

@@ -39,8 +39,9 @@ pub(crate) async fn reader(store: crate::store::Store, _: bool, _: Option<std::p
 }
 
 /// The catalog's ordered key-value store: SlateDB on a node (`kv::slate`), a page's log in the lake's store (`kv::page`).
+/// What its block caches hold is what it says it holds (`ledger::Charged`: `/metrics`' `catalog_blocks`).
 #[async_trait::async_trait]
-pub(crate) trait Kv: Send + Sync {
+pub(crate) trait Kv: crate::ledger::Charged {
     /// A key's value. `remote`: only what the bucket holds (a writer's memtable left out, as `DurabilityLevel::Remote`).
     async fn get(&self, key: &str, remote: bool) -> Result<Option<Bytes>, Error>;
     /// The keys in `range`, in order, with their values; `remote` as for `get`.
@@ -60,8 +61,6 @@ pub(crate) trait Kv: Send + Sync {
     /// Its garbage collector once, now: old WAL, manifests and compacted files that no reader needs.
     async fn collect(&self) {}
     async fn close(&self) -> Result<(), Error>;
-    /// The bytes its block caches hold (`/metrics`).
-    fn cached(&self) -> usize;
 }
 
 /// One batch's handle: `durable` resolves once the batch is in the bucket.

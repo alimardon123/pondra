@@ -991,8 +991,8 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<St
     let merge: BTreeMap<String, String> = serde_json::from_value(opts["merge"].clone()).unwrap_or_default();
     ensure!(merge == m.merge, "its merge functions can't change in place");
     let not_null: Vec<String> = list(&opts["not_null"]).into_iter().chain(key.iter().cloned()).collect();
-    let mut nn_have: Vec<&String> = m.not_null.iter().collect();
-    let mut nn_want: Vec<&String> = m.columns.iter().map(|(c, _)| c).filter(|c| not_null.contains(c)).collect();
+    let mut nn_have: Vec<&String> = m.not_null().iter().collect();
+    let mut nn_want: Vec<&String> = m.columns().iter().map(|(c, _)| c).filter(|c| not_null.contains(c)).collect();
     nn_have.sort();
     nn_want.sort();
     nn_want.dedup();
@@ -1001,7 +1001,7 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<St
     let checks: Vec<(String, String)> = serde_json::from_value(opts["checks"].clone()).unwrap_or_default();
     ensure!(checks == m.checks, "its CHECKs differ: a migration's (a new table, the rows moved)");
     let defaults: BTreeMap<String, String> = serde_json::from_value(opts["defaults"].clone()).unwrap_or_default();
-    ensure!(defaults.iter().filter(|(c, _)| !added.contains(c)).all(|(c, v)| m.defaults.get(c) == Some(v)) && m.defaults.keys().all(|c| defaults.contains_key(c)), "its DEFAULTs differ: a migration's");
+    ensure!(defaults.iter().filter(|(c, _)| !added.contains(c)).all(|(c, v)| m.defaults().get(c) == Some(v)) && m.defaults().keys().all(|c| defaults.contains_key(c)), "its DEFAULTs differ: a migration's");
     let mut set = vec![];
     let publish = opts.get("publish").filter(|v| !v.is_null()).map(list).unwrap_or_else(crate::store::default_publish);
     if publish != m.publish {

@@ -40,7 +40,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, topic: &str, options: &s
     let schema = crate::answer::schema(&crate::kafka_client::columns())?;
     let (ctx, plan) = over(lake, &feed, datafusion::arrow::record_batch::RecordBatch::new_empty(schema)).await?;
     let columns: Vec<(String, String)> = crate::query::run_schema(&ctx, plan.logical_plan())?.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect(); // (the types as the query runs)
-    let meta = TableMeta { columns, publish: crate::store::default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
+    let meta = { let mut entry = TableMeta::with_columns(columns); entry.publish = crate::store::default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (feed_key(name), json(&feed))], &[]).await
 }
 
@@ -155,7 +155,7 @@ async fn shard(app: App, view: String, p: i32) -> Result<()> {
         // (the batches the query gives have the types it runs with, as the table's columns do)
         let out_schema = Arc::new(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow().clone());
         let rows = datafusion::arrow::compute::concat_batches(&out_schema, &df.collect().await?)?;
-        let target = crate::answer::schema(&lake.cat.get::<TableMeta>(&table_key(&view)).await?.context("the view's table is gone")?.columns)?;
+        let target = crate::answer::schema(&lake.cat.get::<TableMeta>(&table_key(&view)).await?.context("the view's table is gone")?.columns())?;
         let rows = crate::query::cast_as(&rows, &target)?;
         let src = crate::log::Src { producer: producer.clone(), seq: next as u64, prev: Some(done) }; // (the rows and the offset, if the offset is still `done`)
         let ack = app.log()?.append(view.clone(), src, rows).await?;

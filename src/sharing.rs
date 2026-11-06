@@ -360,7 +360,7 @@ async fn partitions(app: &App, t: &Shared) -> anyhow::Result<HashMap<String, Str
 /// node: their reads are GETs on the lake's bucket that no node's request budget sees (principle 7).
 fn quota(who: &str, n: usize) -> Result<(), Fail> {
     crate::per_node!(static USED: Mutex<Option<HashMap<String, (u64, usize)>>> = Mutex::new(None));
-    let most: usize = crate::env::or("PONDRA_SHARE_FILES_PER_MINUTE", 10_000);
+    let most: usize = crate::env::value("PONDRA_SHARE_FILES_PER_MINUTE");
     let minute = crate::log::now_ms() / 60_000;
     let mut used = USED.lock().unwrap();
     let e = used.get_or_insert_default().entry(who.to_string()).or_insert((minute, 0));

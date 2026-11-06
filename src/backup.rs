@@ -190,7 +190,7 @@ pub(crate) fn apart(lake: &Lake, to: &str) -> Result<()> {
 /// `BACKUP DATABASE [name] TO 'url'`: the database pinned (by its leader: this one, or an attached
 /// database's), the run asked of the backup's leader, the pin let go.
 async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Option<&str>, to: &str, retention_days: Option<u64>) -> Result<Value> {
-    let source = match database.map(|n| n.trim_matches('"').to_lowercase()) {
+    let source = match database.map(crate::text::database) {
         None => lake.arc(),
         Some(n) if n == crate::ddl::lake_name(lake) => lake.arc(),
         Some(n) => {
@@ -667,7 +667,7 @@ async fn table_placed(source: &Lake, name: &str, mut meta: TableMeta, target: &S
         // (manifests that name a base's paths: sealed again here, naming the backup's)
         Some(s) if based(&s.list) || list.iter().any(|m| based(&m.path)) || sealed.iter().any(|f| based(&f.path) || f.delete_files().any(|p| based(p))) => {
             sealed.iter_mut().for_each(placed_file);
-            let schema = crate::answer::schema(&crate::sys::with_sys(&meta).columns)?;
+            let schema = crate::answer::schema(&crate::sys::with_sys(&meta).columns())?;
             meta.sealed = Some(crate::manifest::sealed_into(target, &format!("data/{}/_manifests", meta.folder(name)), &sealed, &schema, written).await?);
         }
         Some(s) => {

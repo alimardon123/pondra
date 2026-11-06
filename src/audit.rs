@@ -48,8 +48,8 @@ fn columns() -> Vec<(String, String)> {
 /// Leader: the table, made the first time a node has a line for it (`Ddl::AuditLog`).
 pub async fn create_log(lake: &Lake) -> Result<serde_json::Value> {
     if lake.cat.get::<TableMeta>(&table_key(TABLE)).await?.is_none() {
-        let days: u64 = crate::env::or("PONDRA_AUDIT_DAYS", 90);
-        let meta = TableMeta { columns: columns(), ttl: Some(("at".into(), days * 86400)), tiered: lake.visible(), ..Default::default() };
+        let days: u64 = crate::env::value("PONDRA_AUDIT_DAYS");
+        let meta = { let mut entry = TableMeta::with_columns(columns()); entry.ttl = Some(("at".into(), days * 86400)); entry.tiered = lake.visible(); entry };
         lake.cat.commit(vec![(table_key(TABLE), json(&meta))], &[]).await?;
     }
     Ok(serde_json::json!({"table": "pondra.audit"}))
@@ -59,7 +59,7 @@ pub async fn create_log(lake: &Lake) -> Result<serde_json::Value> {
 fn classes() -> &'static [String] {
     static C: OnceLock<Vec<String>> = OnceLock::new();
     C.get_or_init(|| {
-        let v = crate::env::get("PONDRA_AUDIT").unwrap_or_else(|| "role,ddl,function".into()).to_lowercase();
+        let v = crate::env::text("PONDRA_AUDIT").to_lowercase();
         v.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()
     })
 }

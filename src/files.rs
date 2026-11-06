@@ -347,7 +347,7 @@ pub async fn version(lake: &Lake, path: &str, id: &str) -> anyhow::Result<bytes:
 /// `PONDRA_FILE_VERSIONS_DAYS` (the newest is always kept). A notebook's earlier saves stay.
 async fn prune(lake: &Lake, path: &str) -> anyhow::Result<()> {
     use object_store::ObjectStoreExt;
-    let (most, days) = (crate::env::or::<u64>("PONDRA_FILE_VERSIONS", 50).max(1), crate::env::or::<u64>("PONDRA_FILE_VERSIONS_DAYS", 90));
+    let (most, days) = (crate::env::value::<u64>("PONDRA_FILE_VERSIONS").max(1), crate::env::value::<u64>("PONDRA_FILE_VERSIONS_DAYS"));
     let since = crate::log::now_ms().saturating_sub(days * 86_400_000);
     let all = versions(lake, path).await?;
     for (i, v) in all.iter().enumerate().filter(|(_, v)| !v.id.contains('/')) {

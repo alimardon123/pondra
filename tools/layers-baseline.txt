@@ -136,7 +136,6 @@ metrics -> app
 metrics -> budget
 metrics -> hot
 metrics -> jemalloc
-metrics -> query
 metrics -> spill
 metrics -> store
 objects -> auth
@@ -234,7 +233,7 @@ server -> sso
 server -> sso_flow
 server -> tls
 server -> udf
-settings -> extension
+set -> extension
 shares -> crypto
 shares -> delta
 sharing -> byte_range

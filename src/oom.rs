@@ -12,12 +12,13 @@
 //! less (a median from a sort's middle rows, `frugal.rs`); a second stop takes the request. Which request grew it is
 //! read from the allocator (`Meter`): each request is charged what its own polls allocated, less what
 //! they freed, so a long cheap request started early is not stopped for a query that grew the node.
-//! The one watch lets the hot columns (`hot.rs`) go first, under the line (`of_line`), since a column
-//! is decoded again when it is read; it stops a query only past the line itself.
+//! The one watch lets the node's caches go first, under the line (`of_line`), since what a cache held is read
+//! again when it is needed: the caches charged to the node's lines (`ledger::Charged`), each lake's in the order
+//! `Lake::caches` lists them, its hot columns first (`hot.rs`). It stops a query only past the line itself.
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use datafusion::common::instant::Instant;
 use std::time::Duration;
@@ -48,8 +49,6 @@ crate::per_node!(static SEEN: AtomicUsize = AtomicUsize::new(0));
 crate::per_node!(static IDLE: AtomicBool = AtomicBool::new(false));
 // (the watch runs in this process: the hot columns may then sit beside the query memory, `Hot::room_for`)
 crate::per_node!(static WATCHING: AtomicBool = AtomicBool::new(false));
-// (the caches the watch may give memory back from: a lake opened in this node registers its hot columns)
-crate::per_node!(static GIVERS: std::sync::Mutex<Vec<Weak<crate::hot::Hot>>> = Default::default());
 // (a wake-up holding no data: a request started, or the hot columns grew, so the watch looks again now)
 crate::per_node!(static WAKE: tokio::sync::Notify = tokio::sync::Notify::new(); clear = |_| ());
 
@@ -156,32 +155,27 @@ pub fn watching() -> bool {
     WATCHING.load(Relaxed)
 }
 
-/// Lets `hot`'s decoded columns be given back when the node needs memory: the watch (`start`) trims
-/// them past [`trim_line`], before it stops any query. A lake opened outside a node (`pondra sql`,
-/// `pondra catalog`, `pondra backup`) is held to the cache's own budget alone, since no watch runs in
-/// its process.
-pub fn gives_back(hot: &Arc<crate::hot::Hot>) {
-    if hot.on() {
-        GIVERS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(hot));
-        wake();
-    }
-}
-
 /// Wakes the watch, so it looks again now. `notify_one` keeps a wake sent between a look and the wait
 /// after it, so none is lost.
 pub fn wake() {
     WAKE.notify_one()
 }
 
-/// The caches still alive, upgraded for the caller to hold a moment (dead entries are dropped here: a
-/// closed lake's columns go with its last `Arc`, and the caller must not keep one over a wait).
-fn givers() -> Vec<Arc<crate::hot::Hot>> {
-    let mut list = GIVERS.lock().unwrap_or_else(|e| e.into_inner());
-    list.retain(|w| w.strong_count() > 0);
-    list.iter().filter_map(Weak::upgrade).collect()
+/// Takes about `bytes` back from the node's caches (`ledger::Ledger::give_back`), and says how many bytes came back. The
+/// watch gives them back past [`trim_line`], before it stops any query. A lake opened outside a node (`pondra sql`,
+/// `pondra catalog`, `pondra backup`) holds its caches to their own budgets alone, since no watch runs in its process.
+fn give_back(bytes: usize) -> usize {
+    let mut freed = 0;
+    for ledger in crate::store::ledgers() {
+        if freed >= bytes {
+            break;
+        }
+        freed += ledger.give_back(bytes - freed);
+    }
+    freed
 }
 
-/// Starts the watch, when the process can say how much memory it holds and the hot columns can be given
+/// Starts the watch, when the process can say how much memory it holds and the caches can be given
 /// back (`trim_line`). The line is checked only where there is one (a node's own process). It runs on a thread of
 /// its own (`panics::alone`), which a node stopped ends, as its other loops end.
 pub fn start() {
@@ -211,17 +205,8 @@ pub fn start() {
             let now = Instant::now();
             let mut felt = resident;
             if felt > trim {
-                // The cache goes first: a column is decoded again when it is read, a query can't be.
-                let need = felt - trim;
-                let holders = givers();
-                let mut freed = 0;
-                for hot in &holders {
-                    if freed >= need {
-                        break;
-                    }
-                    freed += hot.trim(need - freed);
-                }
-                drop(holders); // (held over a wait, a closed lake's columns would stay in memory)
+                // The caches go first: what they held is read again when it is needed, a query can't be.
+                let freed = give_back(felt - trim);
                 if freed > 0 {
                     // The pages just freed would stay resident for seconds (`purge`), so they are handed back now:
                     // the reading after it is what the process holds, and the watch goes by that alone.
@@ -267,13 +252,13 @@ pub fn start() {
                 settling = winding || last_stop.is_some();
             }
             // The wait: as often as the trim and the stop need while a request runs (a plain sleep, since a wake on every
-            // request would look on every statement); otherwise until a request starts, the cache changes, or
-            // the timer ends: 2 s while the cache holds columns (Flight, Kafka and tiering grow the node outside
-            // `work`, and the cache is what can answer them), else 30 s.
+            // request would look on every statement); otherwise until a request starts, a lake opens, the hot columns
+            // grow, or the timer ends: 2 s while the caches hold anything (Flight, Kafka and tiering grow the node
+            // outside `work`, and the caches are what can answer them), else 30 s.
             match line {
                 Some(line) if crate::panics::running() => tokio::time::sleep(every(felt, trim, line, settling)).await,
                 _ => {
-                    let timer = if givers().iter().any(|h| h.usage().0 > 0) { Duration::from_secs(2) } else { Duration::from_secs(30) };
+                    let timer = if crate::store::ledgers().iter().any(|l| l.held() > 0) { Duration::from_secs(2) } else { Duration::from_secs(30) };
                     IDLE.store(true, Relaxed);
                     let _ = tokio::time::timeout(timer, WAKE.notified()).await;
                     IDLE.store(false, Relaxed);

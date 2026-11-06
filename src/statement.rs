@@ -95,7 +95,7 @@ pub(crate) fn single_statement(sql: &str) -> Option<String> {
 /// CALL, a write, transaction control, a setting or several statements. Such a statement is answered from a read, and a
 /// `pondra sql` process leaves it to a guest that reads (`node::Guest::Reads`).
 pub(crate) fn plain_statement(one: &str) -> bool {
-    !crate::write::checkpoint(one) && !routines::runs_procedure(one) && crate::write::parse(one).is_none() && !routines::several(one) && crate::text::control(one).is_none() && !crate::settings::is(one) && crate::with_writes::of(one).is_none()
+    !crate::write::checkpoint(one) && !routines::runs_procedure(one) && crate::write::parse(one).is_none() && !routines::several(one) && crate::text::control(one).is_none() && !crate::set::is(one) && crate::with_writes::of(one).is_none()
 }
 
 /// A plain query's text as sent, and the statement it runs as (its `$name`s and macros expanded, `vars::bound` and
@@ -112,7 +112,7 @@ pub(crate) async fn plain_of(app: &App, sql: &str) -> Result<Option<(String, Str
 /// Flight ticket) refuses it by name, as Postgres's read-only transaction does. (What it takes is listed, not what it
 /// refuses, so a statement kind added later is refused until it is called a read.)
 pub(crate) fn is_write(sql: &str) -> bool {
-    routines::split(sql).iter().any(|one| !(plain_statement(one) || crate::settings::is(one) || crate::vars::change(one).is_some()))
+    routines::split(sql).iter().any(|one| !(plain_statement(one) || crate::set::is(one) || crate::vars::change(one).is_some()))
 }
 
 /// Step 2's inside, on a statement already expanded (`run` makes it, inside `audit::statement`): the key lookup, the

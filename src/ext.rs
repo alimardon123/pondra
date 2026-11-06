@@ -144,7 +144,7 @@ pub fn external(c: &datafusion::sql::parser::CreateExternalTable) -> Result<crat
     ensure!(!(c.or_replace && c.if_not_exists), "CREATE OR REPLACE EXTERNAL TABLE … IF NOT EXISTS: one or the other");
     let urls = c.locations.iter().map(|l| located(l)).collect::<Result<Vec<_>>>()?;
     ensure!(!urls.is_empty(), "CREATE EXTERNAL TABLE {name}: where are its files? (LOCATION '…')");
-    let parts: Vec<String> = c.table_partition_cols.iter().map(|p| p.trim_matches('"').to_string()).collect();
+    let parts: Vec<String> = c.table_partition_cols.iter().map(|p| crate::text::object_of(p)).collect();
     let own = |col: &&datafusion::sql::sqlparser::ast::ColumnDef| !parts.contains(&crate::text::ident(&col.name));
     let typed = |cols: Vec<&datafusion::sql::sqlparser::ast::ColumnDef>| cols.iter().map(|col| format!("{}: {}", text(&crate::text::ident(&col.name)), text(&crate::write::sql_type(&col.data_type)))).collect::<Vec<_>>().join(", ");
     let (in_files, keys): (Vec<_>, Vec<_>) = c.columns.iter().partition(own);
@@ -457,16 +457,16 @@ async fn retyped_meta(spec: &Spec) -> Result<Option<TableMeta>> {
     if listed.files.is_empty() || listed.files.iter().any(|f| !f.part.is_empty()) {
         return Ok(None);
     }
-    let Ok(schema) = crate::answer::schema(&listed.columns) else { return Ok(None) };
+    let Ok(schema) = crate::answer::schema(&listed.columns()) else { return Ok(None) };
     let schema = crate::ext_names::retyped(&schema, &types)?;
-    Ok(Some(TableMeta { columns: crate::ext_names::named(schema.fields()), files: listed.files, ext: Some(spec.clone()), ..Default::default() }))
+    Ok(Some({ let mut entry = TableMeta::with_columns(crate::ext_names::named(schema.fields())); entry.files = listed.files; entry.ext = Some(spec.clone()); entry }))
 }
 
 /// The files, their schema, and (Parquet) each file's rows and column ranges from its footer.
 async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     match spec.format.as_str() {
-        "kafka" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::kafka_client::resolve(lake, &spec.urls[0]).await? }),
-        "share" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::sharing_client::read(lake, spec).await? }), // (its files' links are the provider's: ADR-046)
+        "kafka" => return Ok({ let mut entry = crate::kafka_client::resolve(lake, &spec.urls[0]).await?; entry.ext = Some(spec.clone()); entry }),
+        "share" => return Ok({ let mut entry = crate::sharing_client::read(lake, spec).await?; entry.ext = Some(spec.clone()); entry }), // (its files' links are the provider's: ADR-046)
         "delta" | "iceberg" => {
             let (mut m, d) = match spec.format.as_str() {
                 "delta" => (table_meta(crate::read_delta::resolve(lake, &crate::ddl::full(&spec.urls[0])?, crate::ext_names::version(spec)?).await?), None), // (a folder named relatively: from where the node runs)
@@ -476,7 +476,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
             if let Some(d) = &d {
                 crate::catalogs::rehome(d, &mut m); // (its files are read through the table's own delegated store)
             }
-            return Ok(TableMeta { ext: Some(spec.clone()), ..m });
+            return Ok({ let mut entry = m; entry.ext = Some(spec.clone()); entry });
         }
         _ => {}
     }
@@ -499,7 +499,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     }
     let undeclared = declared.is_none();
     let (columns, files) = crate::ext_names::files_table(&state, spec, declared, &hive_types, types_of(spec).await?.as_deref(), |u| undeclared.then(|| crate::codes::coded("42P01", format!("no file matches {}", shown(lake, u))))).await?; // (declared: none yet is an empty table)
-    Ok(TableMeta { columns, files, ext: Some(spec.clone()), ..Default::default() })
+    Ok({ let mut entry = TableMeta::with_columns(columns); entry.files = files; entry.ext = Some(spec.clone()); entry })
 }
 
 /// The files a spec's path names, as `resolve` lists them (a glob, or a folder's files of the
@@ -601,7 +601,7 @@ impl crate::reach::Reach for Lake {
 /// A table read from another engine's log, as a node's table (its columns, names and files; the rest is the
 /// catalog's own and empty).
 pub(crate) fn table_meta(found: crate::read_delta::Found) -> TableMeta {
-    TableMeta { columns: found.columns, names: found.names, files: found.files, ..Default::default() }
+    { let mut entry = TableMeta::made(crate::store::Made { columns: found.columns, names: found.names, ..Default::default() }); entry.files = found.files; entry }
 }
 
 /// Whom a store `build` makes is for.
@@ -1909,19 +1909,19 @@ mod tests {
         let mut typed = plain.clone();
         typed.options.insert("types".into(), "\"zip\" VARCHAR".into());
         let file = || DataFile { path: "file:///d/a.csv".into(), bytes: 9, rows: 1, ..Default::default() };
-        let listed = TableMeta { columns: vec![("zip".into(), "Int64".into()), ("n".into(), "Int64".into())], files: vec![file()], ext: Some(plain.clone()), ..Default::default() };
+        let listed = { let mut entry = TableMeta::with_columns(vec![("zip".into(), "Int64".into()), ("n".into(), "Int64".into())]); entry.files = vec![file()]; entry.ext = Some(plain.clone()); entry };
         assert!(retyped_meta(&typed).await.unwrap().is_none(), "not listed: resolve reads it");
         LISTED.scope(Default::default(), async {
             keep(&crate::ext_names::name(&plain), &listed);
             let m = retyped_meta(&typed).await.unwrap().expect("listed");
-            assert_eq!(m.columns, vec![("zip".to_string(), "Utf8".to_string()), ("n".to_string(), "Int64".to_string())]);
+            assert_eq!(m.columns(), vec![("zip".to_string(), "Utf8".to_string()), ("n".to_string(), "Int64".to_string())]);
             assert_eq!(m.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["file:///d/a.csv"]);
             assert_eq!(m.ext.expect("its spec").options["types"], "\"zip\" VARCHAR");
             let mut nope = plain.clone();
             nope.options.insert("types".into(), "\"nope\" VARCHAR".into());
             let err = retyped_meta(&nope).await.err().expect("refused");
             assert!(err.to_string().starts_with("types names nope, which the files don't have"), "{err}");
-            keep(&crate::ext_names::name(&plain), &TableMeta { files: vec![], ..listed.clone() });
+            keep(&crate::ext_names::name(&plain), &{ let mut entry = listed.clone(); entry.files = vec![]; entry });
             assert!(retyped_meta(&typed).await.unwrap().is_none(), "no files: resolve reads it");
         })
         .await;

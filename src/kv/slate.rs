@@ -159,8 +159,10 @@ impl Kv for Writer {
         self.upkeep.stop().await;
         Ok(self.db.close().await?)
     }
+}
 
-    fn cached(&self) -> usize {
+impl crate::ledger::Charged for Writer {
+    fn held(&self) -> usize {
         self.blocks.iter().map(Blocks::weighted_size).sum()
     }
 }
@@ -191,8 +193,10 @@ impl Kv for Reader {
     async fn close(&self) -> Result<(), Error> {
         Ok(self.r.close().await?)
     }
+}
 
-    fn cached(&self) -> usize {
+impl crate::ledger::Charged for Reader {
+    fn held(&self) -> usize {
         self.blocks.iter().map(Blocks::weighted_size).sum()
     }
 }

@@ -2090,7 +2090,7 @@ struct JoinOrder;
 /// default). The estimates are bounds, not counts, so a small difference between two orders is
 /// not a reason to overrule the one the query asked for.
 fn margin() -> u64 {
-    crate::env::or::<u64>("PONDRA_JOIN_ORDER", 2).max(1)
+    crate::env::value::<u64>("PONDRA_JOIN_ORDER").max(1)
 }
 
 impl OptimizerRule for JoinOrder {

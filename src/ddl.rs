@@ -933,8 +933,8 @@ pub async fn settle(lake: &Lake, d: &Ddl) -> Result<()> {
                 Change::Rename(to) => m.stored(to).is_some(),
                 Change::Drop { .. } => m.stored(column).is_none(),
                 Change::Type(_) => true, // (the same names either way)
-                Change::Default(d) => m.stored(column).is_none_or(|s| m.defaults.get(s) == d.as_ref()),
-                Change::NotNull(on) => m.stored(column).is_none_or(|s| m.not_null.iter().any(|c| c == s) == *on),
+                Change::Default(d) => m.stored(column).is_none_or(|s| m.defaults().get(s) == d.as_ref()),
+                Change::NotNull(on) => m.stored(column).is_none_or(|s| m.not_null().iter().any(|c| c == s) == *on),
                 Change::Place(p) => {
                     let order: Vec<String> = m.sql_names();
                     m.stored(column).is_none() || p.put(&order, column).is_ok_and(|o| o == order) // (put again, nothing moves)
@@ -953,7 +953,7 @@ pub async fn settle(lake: &Lake, d: &Ddl) -> Result<()> {
         for _ in 0..200 {
             let order: Vec<String> = match materialized {
                 true => match lake.cat.get::<TableMeta>(&table_key(&name)).await? {
-                    Some(m) => m.described().columns.into_iter().map(|(c, _)| c).filter(|c| !m.marker(c)).collect(),
+                    Some(m) => m.described().into_columns().into_iter().map(|(c, _)| c).filter(|c| !m.marker(c)).collect(),
                     None => break,
                 },
                 false => match lake.cat.get::<StoredView>(&query_key(&name)).await? {
@@ -1359,7 +1359,7 @@ async fn swappable(lake: &Lake, n: &str) -> Result<()> {
 async fn alike(lake: &Lake, a: &str, b: &str) -> Result<()> {
     let ma = lake.cat.get::<TableMeta>(&table_key(a)).await?.ok_or_else(|| anyhow::anyhow!("no table {a}"))?;
     let mb = lake.cat.get::<TableMeta>(&table_key(b)).await?.ok_or_else(|| anyhow::anyhow!("no table {b}"))?;
-    let same = crate::objects::table_sql("t", &ma) == crate::objects::table_sql("t", &mb) && ma.columns == mb.columns && ma.names == mb.names && ma.dropped == mb.dropped;
+    let same = crate::objects::table_sql("t", &ma) == crate::objects::table_sql("t", &mb) && ma.columns() == mb.columns() && ma.names() == mb.names() && ma.dropped() == mb.dropped();
     ensure!(same, "{a} and {b} differ in more than their rows: a swap exchanges two tables alike (CREATE TABLE {b} CLONE {a} makes one)");
     Ok(())
 }
@@ -1513,16 +1513,13 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
         ensure!(matches!(change, Change::Drop { if_exists: true }), crate::rules::alter::no_column(&name, column));
         return Ok(j!({"table": name, "unchanged": true}));
     };
-    let partition = m.partition.as_deref().map(|p| p.split_once('(').map_or(p, |(_, c)| c.trim_end_matches(')')));
+    let partition = m.partition.as_deref().map(|p| p.split_once('(').map_or(p, |(_, c)| c.trim_end_matches(')')).to_string()); // (its own: the edits below take the entry)
     let what = match change {
         Change::Rename(to) => {
             ensure!(!to.is_empty(), "a column needs a name");
             ensure!(!system(&to), "{to} is a system column's name");
             ensure!(m.stored(&to).is_none(), crate::rules::alter::has_column(&name, &to));
-            match to == stored {
-                true => m.names.remove(&stored),
-                false => m.names.insert(stored.clone(), to.clone()),
-            };
+            m.rename_column(&stored, &to);
             for (_, condition) in &mut m.checks {
                 *condition = crate::rules::alter::check_renamed(condition, column, &to); // (its checks are in SQL's names: they follow it)
             }
@@ -1531,7 +1528,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
         Change::Drop { .. } => {
             let role = match () {
                 _ if m.key.contains(&stored) => "key",
-                _ if partition == Some(stored.as_str()) => "partition_by",
+                _ if partition.as_deref() == Some(stored.as_str()) => "partition_by",
                 _ if m.ttl.as_ref().is_some_and(|(c, _)| *c == stored) => "ttl",
                 _ if m.order.as_ref() == Some(&stored) => "order_by",
                 _ => "",
@@ -1540,14 +1537,13 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             ensure!(m.live().count() > 1 + usize::from(m.stored("_deleted").is_some()), crate::rules::alter::last_column(&name, column));
             m.cluster.retain(|c| *c != stored);
             m.merge.remove(&stored);
-            m.names.remove(&stored);
             crate::constraints::without_column(&mut m, &stored); // (its UNIQUE and the facts naming it go with it, as in Postgres)
             m.checks.retain(|(_, condition)| !crate::rules::alter::check_reads(condition, column)); // (and its checks)
-            m.dropped.push(stored.clone());
+            m.drop_column(&stored);
             j!({"dropped": column})
         }
         Change::Type(sql_type) => {
-            let (held, declared) = (m.sql_types.get(&stored).cloned(), crate::types::declared(&sql_type)?);
+            let (held, declared) = (m.sql_types().get(&stored).cloned(), crate::types::declared(&sql_type)?);
             if let Some(t) = declared.as_deref().filter(|t| matches!(*t, "uuid" | "json" | "jsonb")) {
                 if held.as_deref() != Some(t) {
                     return Err(crate::codes::coded("42804", not_held(column, t)));
@@ -1557,8 +1553,8 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             let ctx = datafusion::prelude::SessionContext::new();
             ctx.sql(&format!("CREATE TABLE t (c {sql_type})")).await?;
             let new = crate::answer::stored(ctx.table("t").await?.schema().field(0).data_type());
-            let at = m.columns.iter().position(|(c, _)| *c == stored).expect("a live column");
-            let old = crate::answer::dtype(&m.columns[at].1)?;
+            let at = m.columns().iter().position(|(c, _)| *c == stored).expect("a live column");
+            let old = crate::answer::dtype(&m.columns()[at].1)?;
             if let Some(wanted) = declared.filter(|_| old == new) {
                 // A length on text only grows: the rows there were checked against the one it had.
                 match (held.as_deref().and_then(crate::rules::typed::length), crate::rules::typed::length(&wanted)) {
@@ -1567,20 +1563,19 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
                     (Some(k), _) => return Err(crate::codes::coded("42804", format!("{column} is VARCHAR({k}): its length only grows, since its rows may be {k} characters long (VARCHAR({k}) or more, or TEXT)"))),
                     (None, _) => return Err(crate::codes::coded("42804", format!("{column} can't take a length: a column's length holds only from when it is made, since the rows there were never checked against one (a new {} column can take them: UPDATE … SET new = {column})", wanted.to_uppercase()))),
                 }
-                m.sql_types.insert(stored.clone(), wanted.clone());
+                m.hold_column(&stored, Some(wanted.clone()));
                 j!({"column": column, "type": wanted.to_uppercase()})
             } else {
-                if old == new && (held.is_some() || m.enums.contains_key(&stored)) {
+                if old == new && (held.is_some() || m.enums().contains_key(&stored)) {
                     // (a uuid, a length or an enum is text held a way: as text, every row reads as it did, as Postgres casts them)
-                    m.sql_types.remove(&stored);
-                    m.enums.remove(&stored);
+                    m.hold_column(&stored, None);
                 } else if old == new {
                     return Ok(j!({"table": name, "unchanged": true}));
                 }
                 ensure!(old == new || widens(&old, &new), "{column} is {old}: a column's type can only widen (a smaller integer to a bigger one, FLOAT to DOUBLE, a DECIMAL to more digits), which every file already written still reads as");
-                ensure!(old == new || partition != Some(stored.as_str()), "{column} is {name}'s partition_by column: its type stays");
-                m.columns[at].1 = crate::answer::type_name(&new);
-                j!({"column": column, "type": m.columns[at].1})
+                ensure!(old == new || partition.as_deref() != Some(stored.as_str()), "{column} is {name}'s partition_by column: its type stays");
+                m.retype_column(&stored, crate::answer::type_name(&new));
+                j!({"column": column, "type": m.columns()[at].1})
             }
         }
         Change::Default(_) | Change::NotNull(_) => unreachable!("defaults::alter takes them, above"),
@@ -1590,8 +1585,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
     let del = crate::sys::deleted(&name);
     if let Some(mut d) = lake.cat.get::<TableMeta>(&table_key(&del)).await? {
         // (its replaced rows' table follows: the same columns, before its `_old_version`)
-        d.columns = m.columns.iter().cloned().chain([("_old_version".to_string(), "Int64".to_string())]).collect();
-        (d.names, d.dropped) = (m.names.clone(), m.dropped.clone());
+        d.follow_columns(&m);
         puts.push((table_key(&del), json(&d)));
     }
     lake.cat.commit(puts, &[]).await?;
@@ -1616,8 +1610,7 @@ async fn place_column(lake: &Lake, name: &str, mut m: TableMeta, column: &str, p
     }
     let was = m.star(); // (what `SELECT *` lists)
     let stored: Vec<String> = new.iter().map(|c| m.stored(c).expect("a live column").to_string()).collect();
-    let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| s != "_deleted").collect();
-    m.shown = if stored == as_stored { vec![] } else { stored }; // (back as stored: nothing to keep)
+    m.set_order(stored); // (back as stored: nothing kept)
     // (what reads it by position keeps reading it as it did, in the same commit: `keep_readers`)
     let (mut puts, readers) = keep_readers(lake, name, column, was, m.star()).await?;
     puts.push((table_key(name), json(&m)));
@@ -1787,7 +1780,7 @@ async fn movable(lake: &Lake, name: &str, column: &str) -> Result<(crate::views:
         return Err(crate::rules::alter::cant_move(name, column, why, MATERIALIZED));
     }
     let was = view_outputs(lake, v.query()).await?;
-    let listed: Vec<String> = m.described().columns.into_iter().map(|(c, _)| c).filter(|c| !m.marker(c)).collect();
+    let listed: Vec<String> = m.described().into_columns().into_iter().map(|(c, _)| c).filter(|c| !m.marker(c)).collect();
     ensure!(was.iter().map(|(c, ..)| c).eq(listed.iter()), crate::rules::alter::cant_move(name, column, "its columns aren't its query's as SHOW CREATE gives it", MATERIALIZED));
     Ok((v, m, was))
 }
@@ -1820,12 +1813,11 @@ async fn reorder_materialized(lake: &Lake, name: &str, mut v: crate::views::View
         None => {
             // (its table's columns are its query's, never renamed: SQL's order by their stored names, the rest after)
             let stored: Vec<String> = order.iter().map(|&i| names[i].clone()).collect();
-            let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| !m.marker(s)).collect();
             ensure!(stored.iter().all(|c| m.stored(c) == Some(c.as_str())), crate::rules::alter::cant_move(name, column, "its table's columns aren't its query's", MATERIALIZED));
-            m.shown = if as_stored.starts_with(&stored) { vec![] } else { stored };
+            m.set_order(stored);
         }
     }
-    let star = |m: &TableMeta| -> Vec<(String, String)> { m.described().columns.into_iter().filter(|(c, _)| !m.marker(c)).collect() };
+    let star = |m: &TableMeta| -> Vec<(String, String)> { m.described().into_columns().into_iter().filter(|(c, _)| !m.marker(c)).collect() };
     let (was, now) = (star(&before), star(&m));
     let (mut puts, readers) = keep_readers(lake, name, column, was, now).await?; // (what reads it by position reads it as it did)
     let (query, authored) = (v.query().to_string(), v.authored.take());
@@ -1957,7 +1949,7 @@ pub(crate) async fn keep_readers(lake: &Lake, name: &str, column: &str, was: Vec
                 continue;
             }
             ensure!(v.fill.as_ref().is_none_or(|f| f.upto.is_some()), cant(&who, &x, "it is still taking in the rows its tables had: move it a moment later".into())); // (`views::bound` writes its entry once more)
-            let has: Vec<(String, String)> = m.described().columns.into_iter().filter(|(c, _)| !m.marker(c)).collect();
+            let has: Vec<(String, String)> = m.described().into_columns().into_iter().filter(|(c, _)| !m.marker(c)).collect();
             let names: Vec<String> = has.iter().map(|(c, _)| c.clone()).collect();
             let written = v.written.is_some();
             if let Some(f) = crate::rules::alter::frozen(&v.sql, &is, &listed) {
@@ -1981,8 +1973,7 @@ pub(crate) async fn keep_readers(lake: &Lake, name: &str, column: &str, was: Vec
             let mut what = match then {
                 Some(then) if then != names && sorted.0 == sorted.1 && names.iter().all(|c| m.stored(c) == Some(c.as_str())) => {
                     // (its columns in the order its query now gives: by their stored names, the rest after, as `reorder_materialized`)
-                    let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| !m.marker(s)).collect();
-                    m.shown = if as_stored.starts_with(&then) { vec![] } else { then };
+                    m.set_order(then);
                     let now = m.star();
                     over.push((r.clone(), now));
                     queue.push((r.clone(), has));

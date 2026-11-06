@@ -103,7 +103,7 @@ pub struct Limits {
 }
 
 impl Limits {
-    pub fn now() -> Self { Limits { mb: crate::env::or("PONDRA_EXTENSION_MB", 256usize), secs: crate::env::or("PONDRA_EXTENSION_SECS", 30u64).max(1) } }
+    pub fn now() -> Self { Limits { mb: crate::env::value::<usize>("PONDRA_EXTENSION_MB"), secs: crate::env::value::<u64>("PONDRA_EXTENSION_SECS").max(1) } }
 }
 
 /// What a call's store holds: its memory's limit and whether the call reached it, and for its log lines the extension's name
