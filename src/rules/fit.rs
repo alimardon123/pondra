@@ -287,9 +287,11 @@ mod tests {
         let rows = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, true)])), vec![x]).expect("rows");
         let base = SessionContext::new();
         let broke = |check: &str| breaking(&base, &rows, check).expect("plans").iter().map(|b| b == Some(true)).collect::<Vec<_>>();
-        assert_eq!(broke("x NOT IN (0.0)"), [true, true, false, false, false], "-0.0 is 0.0");
-        assert_eq!(broke("x NOT IN (2.0, -0.0)"), [true, true, true, false, false]);
-        assert_eq!(broke("x IN (2.0, 0.0)"), [false, false, false, true, false]);
+        // (a list of more than 3: the simplifier makes a shorter one ORed `=`s, which never compared bits)
+        assert_eq!(broke("x NOT IN (2.0, 3.0, 4.0, 0.0)"), [true, true, true, false, false], "-0.0 is 0.0");
+        assert_eq!(broke("x NOT IN (2.0, 3.0, 4.0, -0.0)"), [true, true, true, false, false]);
+        assert_eq!(broke("x IN (2.0, 3.0, 4.0, 0.0)"), [false, false, false, true, false]);
+        assert_eq!(broke("x NOT IN (0.0)"), [true, true, false, false, false]);
         let value = |e: &str| evaluate(&base, &rows, e).expect("evaluates").expect("plans");
         assert_eq!(value("x IN (2.0, 0.0)").as_boolean().iter().collect::<Vec<_>>(), [Some(true), Some(true), Some(true), Some(false), None]);
         let case = value("CASE x WHEN 0.0 THEN 1 ELSE 2 END");
