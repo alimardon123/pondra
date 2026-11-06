@@ -2858,6 +2858,22 @@ def kafka():
     checks["Debezium's own encodings: a Decimal's bytes, ms and µs times, BYTEA's base64, as the source has them"] = \
         sql_("SELECT id, balance::VARCHAR AS balance, num::VARCHAR AS num, ts3::VARCHAR AS ts3, t::VARCHAR AS t, t3::VARCHAR AS t3, encode(b, 'hex') AS b FROM kinds") == \
         [{"id": 1, "balance": "-3.25", "num": "123.4567", "ts3": "2026-09-01T10:00:00.123", "t": "12:34:56.789012", "t3": "12:34:56.789", "b": "00ff10"}]
+    # A scale past 76 is refused as INVALID_RECORD, and the node stays up: a scale of -2^40 once asked for a terabyte
+    # of zeros and aborted it (11-06 audit H1). A Decimal sent as a JSON number (JsonConverter's decimal.format=NUMERIC)
+    # loads as sent, as it did before Debezium's encodings were read (11-06 audit M3).
+    decimal_at = lambda scale: field("balance", "bytes", "org.apache.kafka.connect.data.Decimal", parameters={"scale": scale})
+    after_only = lambda fs: {"type": "struct", "fields": [{"type": "struct", "field": "after", "optional": True, "fields": fs}, field("op", "string")]}
+    huge, numeric = [], dict(after, id=3, balance=10.5, num=None)
+    for fs, row in [(fields, dict(after, id=2, num={"scale": -(1 << 40), "value": "Bw=="})),
+                    ([decimal_at("-9000000000") if f["field"] == "balance" else f for f in fields], dict(after, id=2, balance="Bw=="))]:
+        p.produce("kinds", key=json.dumps({"id": 2}), value=json.dumps({"schema": after_only(fs), "payload": {"after": row, "op": "c"}}),
+                  on_delivery=lambda e, m: huge.append(e))
+    p.flush(30)  # (a refused record refuses its batch: the good one goes in a batch of its own)
+    p.produce("kinds", key=json.dumps({"id": 3}), value=json.dumps({"schema": envelope, "payload": {"before": None, "after": numeric, "op": "c"}}))
+    p.flush(30)
+    checks["a decimal's scale past 76 is refused as INVALID_RECORD and the node stays up; a Decimal as a JSON number loads as sent"] = \
+        len(huge) == 2 and all(e is not None and e.code() == ck.KafkaError.INVALID_RECORD for e in huge) and \
+        sql_("SELECT id, balance::VARCHAR AS balance FROM kinds ORDER BY id") == [{"id": 1, "balance": "-3.25"}, {"id": 3, "balance": "10.50"}]
     # consumers: kafka-python and librdkafka read the log back from the beginning
     tp = kp.TopicPartition("users", 0)
     c = kp.KafkaConsumer(bootstrap_servers=f"127.0.0.1:{kport}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN",
