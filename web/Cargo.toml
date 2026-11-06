@@ -1,6 +1,6 @@
 [package]
 name = "pondra-web"
-version = "0.34.0"
+version = "0.80.0-rc.1"
 edition = "2021"
 publish = false
 description = "Pondra in a page: the core's lake in a browser or Node, through wasm-bindgen (designs/l2-b4-web.md)"
