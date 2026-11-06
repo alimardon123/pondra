@@ -1135,6 +1135,10 @@ const RECENT_BYTES: usize = 64 << 20; // …within this much memory (past it, a 
 /// Query read cache in memory, MB (env PONDRA_CACHE_MB, default 1024).
 fn cache_mb() -> usize { crate::env::value("PONDRA_CACHE_MB") }
 
+/// Did the user give the read caches (a bucket's byte ranges, lookups' row groups) a budget of their own, `PONDRA_CACHE_MB`?
+/// Then they keep it beside the whole line for queries and caches (`ledger::Charged::inside`).
+pub(crate) fn own_cache_budget() -> bool { crate::env::get("PONDRA_CACHE_MB").is_some() }
+
 /// The folder the node's SSD tiers and replica logs go under: `PONDRA_CACHE_DIR` when set (the operator's own
 /// choice), else `pondra-cache-{uid}` in the temp dir, made 0700 and used only while it is this user's alone
 /// (`memory::own_dir`: the temp dir is shared, so a folder with a predictable name may be another user's).
@@ -1489,16 +1493,18 @@ impl std::fmt::Debug for Lake {
 /// it, sorts, aggregations and joins spill to temporary files, or the query stops with an error:
 /// a query never takes the node down. (A third, not half: what DataFusion counts here is the big
 /// hash tables and sort buffers, not the Parquet decoding and the batches in flight around them,
-/// so the node's own memory runs ahead of this number. The hot columns come out of it too.)
+/// so the node's own memory runs ahead of this number.) The queries and the caches fit one whole
+/// line together (`whole_line`): `PONDRA_MEMORY_GB` itself when it is set.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn memory_limit() -> usize {
     crate::env::query_memory(|| ram().map_or(4 << 30, |r| r / 3))
 }
 
 crate::per_node!(
-    /// The node's line for query memory (`ledger::Ledger`), by its size: every lake the node opens shares it. (By size, so
-    /// a lake opened after the setting changed, or a test's with memory of its own, gets a line of its own.)
-    static LEDGERS: Mutex<HashMap<usize, Weak<crate::ledger::Ledger>>> = Default::default());
+    /// The node's line for query memory (`ledger::Ledger`), by its queries' line, its whole line and whether that is the
+    /// user's (`PONDRA_MEMORY_GB`): every lake the node opens shares it. (By size, so a lake opened after the setting
+    /// changed, or a test's with memory of its own, gets a line of its own.)
+    static LEDGERS: Mutex<HashMap<(usize, usize, bool), Weak<crate::ledger::Ledger>>> = Default::default());
 
 /// The node's lines now (`LEDGERS`): the memory watch takes memory back from the caches charged to them (`oom.rs`).
 pub(crate) fn ledgers() -> Vec<Arc<crate::ledger::Ledger>> {
@@ -1507,15 +1513,22 @@ pub(crate) fn ledgers() -> Vec<Arc<crate::ledger::Ledger>> {
 
 /// A new lake's pool for its queries: its share of the node's line (`memory_limit`), which every lake of the node shares.
 fn lake_pool() -> Arc<crate::ledger::LakePool> {
-    let line = memory_limit();
+    let key = (memory_limit(), whole_line(), crate::env::memory_whole().is_some());
     let mut lines = LEDGERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     lines.retain(|_, l| l.strong_count() > 0);
-    let ledger = lines.get(&line).and_then(Weak::upgrade).unwrap_or_else(|| {
-        let made = crate::ledger::Ledger::new(line);
-        lines.insert(line, Arc::downgrade(&made));
+    let ledger = lines.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+        let made = crate::ledger::Ledger::new(key.0, key.1, key.2);
+        lines.insert(key, Arc::downgrade(&made));
         made
     });
     ledger.pool()
+}
+
+/// The whole line a node's queries and caches share (`ledger::Ledger`): `PONDRA_MEMORY_GB` when it is set, which is then
+/// the queries' line too, and a spiller it has no room for spills; else the memory watch's trim line (`oom::trim_line`),
+/// past which a grow takes cache bytes back and goes on within its share; none (`usize::MAX`) where neither is known.
+fn whole_line() -> usize {
+    crate::env::memory_whole().or_else(crate::oom::trim_line).unwrap_or(usize::MAX)
 }
 
 /// A page's lake holds what the page's own pool does (`env::page_query_memory`, of its device's line): its memory is its
@@ -4177,7 +4190,10 @@ mod tests {
         // (other tests' lakes may be charged to the same line meanwhile: what this lake holds is the least it reads)
         assert!(ledger.held() >= 4096, "the line counts the tails");
         // (taken back from this lake's caches alone, in the line's order: from the whole line, other tests' would go too)
-        let freed = crate::ledger::take_back(lake.caches().iter().map(|(_, c)| &**c), 4096);
+        let mut freed = 0;
+        for (_, cache) in lake.caches() {
+            freed += if freed < 4096 { cache.give_back(4096 - freed) } else { 0 };
+        }
         assert!(freed >= 4096 && lake.tails.held() == 0, "the tails give their memory back");
         assert!(!lake.cached_bytes().iter().any(|(name, _)| *name == "hot"), "the hot columns are `hot_bytes`");
         // (`/metrics` reads the line's list by name: the node's planning facts are on it beside the lake's caches)
