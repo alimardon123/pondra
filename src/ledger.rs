@@ -12,7 +12,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation};
 use std::borrow::Borrow;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError, TryLockError, Weak};
 
 /// A map that keeps its most recently used entries within a byte bound, and within a count bound when one is set. Each
@@ -254,6 +254,7 @@ pub struct Ledger {
     reserved: AtomicUsize, // every lake's reservations together
     busy: AtomicUsize,     // lakes with a memory consumer registered now
     cached: AtomicUsize,   // what the caches held at the last look (`note`), less what grows took back since
+    dry: AtomicBool,       // a take-back since the last look came back short: grows don't ask the caches again until `note`
     caches: Mutex<Vec<(&'static str, Weak<dyn Charged>)>>, // what the node keeps on this line, by name (`charge`), in the order they give back
 }
 
@@ -261,7 +262,7 @@ impl Ledger {
     /// A ledger whose queries hold `line` at most, inside `whole` with the caches (`line` itself when the setting is the whole
     /// line). A `hard` whole line refuses a spiller's grow the caches don't make room for; a soft one only takes cache bytes back.
     pub fn new(line: usize, whole: usize, hard: bool) -> Arc<Ledger> {
-        Arc::new(Ledger { line, whole, hard, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0), cached: AtomicUsize::new(0), caches: Default::default() })
+        Arc::new(Ledger { line, whole, hard, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0), cached: AtomicUsize::new(0), dry: AtomicBool::new(false), caches: Default::default() })
     }
 
     /// A new lake's pool on this line.
@@ -280,6 +281,7 @@ impl Ledger {
     pub fn note(&self) -> usize {
         let held = self.charged().iter().filter(|(_, c)| c.inside()).map(|(_, c)| c.held()).sum();
         self.cached.store(held, Relaxed);
+        self.dry.store(false, Relaxed);
         held
     }
 
@@ -460,19 +462,29 @@ impl MemoryPool for LakePool {
         }
         let over = self.ledger.over(additional);
         if over > 0 {
-            // (the cache bytes go outside the lake's lock, so its other grows don't wait on them; then its share is read again)
-            drop(p);
-            if self.ledger.make_room(over) < over && self.ledger.hard && r.consumer().can_spill() {
+            // A take-back that came back short (a reader in a cache, or bytes a cache can't give back: a table's tail, the
+            // footers) isn't asked for again until the memory watch's next look, so a query growing near the line doesn't
+            // walk the caches at every grow for bytes that aren't there.
+            let mut short = self.ledger.dry.load(Relaxed);
+            if !short {
+                // (the cache bytes go outside the lake's lock, so its other grows don't wait on them; then its share is read again)
+                drop(p);
+                short = self.ledger.make_room(over) < over;
+                if short {
+                    self.ledger.dry.store(true, Relaxed);
+                }
+                p = self.part();
+                let available = self.available(&p, r);
+                if additional > available {
+                    return Err(self.refused(r, additional, available));
+                }
+            }
+            if short && self.ledger.hard && r.consumer().can_spill() {
                 // On the user's line a spiller spills at once rather than wait on a reader. What can't spill (a hash join's
                 // build side) would fail its query for a reader's moment in a cache, so it is held to its share alone, as
                 // before, with the memory watch behind it, and takes back what the caches give. On the default line every
                 // grow does that: it spills where it did before, and the caches it found free gave their bytes back.
                 return Err(self.refused(r, additional, 0));
-            }
-            p = self.part();
-            let available = self.available(&p, r);
-            if additional > available {
-                return Err(self.refused(r, additional, available));
             }
         }
         *p.of(r) += additional;
@@ -797,7 +809,9 @@ mod tests {
         held.try_grow(30).expect("what can't spill is held to its share alone, not failed for a reader's moment");
         drop(reader);
         let s = grow.join().unwrap();
-        s.try_grow(50).expect("once the reader is done, the same grow takes the cache bytes back");
+        assert!(s.try_grow(50).is_err(), "until the watch looks again, a grow doesn't walk the caches for bytes it was refused");
+        ledger.note();
+        s.try_grow(50).expect("once the reader is done, the grow after the next look takes the cache bytes back");
         assert_eq!((cache.held(), ledger.cached(), ledger.reserved()), (20, 20, 80));
     }
 }
