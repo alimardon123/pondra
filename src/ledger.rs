@@ -479,11 +479,13 @@ impl MemoryPool for LakePool {
                     return Err(self.refused(r, additional, available));
                 }
             }
-            if short && self.ledger.hard && r.consumer().can_spill() {
-                // On the user's line a spiller spills at once rather than wait on a reader. What can't spill (a hash join's
-                // build side) would fail its query for a reader's moment in a cache, so it is held to its share alone, as
-                // before, with the memory watch behind it, and takes back what the caches give. On the default line every
-                // grow does that: it spills where it did before, and the caches it found free gave their bytes back.
+            if short && self.ledger.hard && r.consumer().can_spill() && r.size() > 0 {
+                // On the user's line a spiller spills at once rather than wait on a reader. One that holds nothing yet has
+                // nothing to spill (a sort's first batch would fail its query: "Not enough memory to continue external
+                // sort"), and what can't spill (a hash join's build side) would fail its query for a reader's moment in a
+                // cache, so both are held to their share alone, as before, with the memory watch behind them, and take back
+                // what the caches give. On the default line every grow does that: it spills where it did before, and the
+                // caches it found free gave their bytes back.
                 return Err(self.refused(r, additional, 0));
             }
         }
@@ -756,6 +758,28 @@ mod tests {
         assert!(s.try_grow(1).is_err(), "past the share it spills, as before");
     }
 
+    /// A cache inside the line that gives nothing back (a table's tail, the footers).
+    struct Kept(usize);
+
+    impl Charged for Kept {
+        fn held(&self) -> usize { self.0 }
+    }
+
+    #[test]
+    fn a_spiller_that_holds_nothing_yet_is_never_refused_for_bytes_the_caches_keep() {
+        let ledger = Ledger::new(100, 100, true);
+        let kept: Arc<dyn Charged> = Arc::new(Kept(90));
+        ledger.charge("kept", Arc::downgrade(&kept));
+        ledger.note();
+        let a = ledger.pool();
+        let sort = consumer(&a, "sort", true);
+        sort.try_grow(15).expect("past the line, a sort's first batch has nothing to spill, so it grows within its share");
+        assert!(sort.try_grow(10).is_err(), "holding bytes past the line, it spills them");
+        sort.free();
+        sort.try_grow(20).expect("and grows again from nothing");
+        assert_eq!(ledger.reserved(), 20);
+    }
+
     /// A cache the user gave a budget of its own (`Charged::inside`).
     struct Own(Mutex<ByteLru<usize, ()>>);
 
@@ -797,13 +821,14 @@ mod tests {
             let a = a.clone();
             std::thread::spawn(move || {
                 let s = consumer(&a, "s", true);
+                s.try_grow(10).expect("within the line, beside the caches");
                 let refused = s.try_grow(50).is_err();
                 tx.send(refused).unwrap();
                 s
             })
         };
         let refused = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the grow answered while the reader held the cache");
-        assert!(refused, "nothing came back, so the grow is refused, and the operator spills");
+        assert!(refused, "nothing came back, so the grow is refused, and the operator spills what it holds");
         assert_eq!(reader.bytes(), 80, "and the cache kept what it held");
         let held = consumer(&a, "held", false);
         held.try_grow(30).expect("what can't spill is held to its share alone, not failed for a reader's moment");
@@ -812,6 +837,6 @@ mod tests {
         assert!(s.try_grow(50).is_err(), "until the watch looks again, a grow doesn't walk the caches for bytes it was refused");
         ledger.note();
         s.try_grow(50).expect("once the reader is done, the grow after the next look takes the cache bytes back");
-        assert_eq!((cache.held(), ledger.cached(), ledger.reserved()), (20, 20, 80));
+        assert_eq!((cache.held(), ledger.cached(), ledger.reserved()), (10, 10, 90));
     }
 }
