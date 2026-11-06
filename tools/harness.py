@@ -4545,7 +4545,7 @@ def scale():
     last_ten = sorted(heapq.nlargest(10, ((f"name-{v % 2000000}", v) for v in range(1, 3000001))))
     spilled_ok = sort_rows == [{"r": 3000000}] and group_rows == [{"g": 2000000, "n": 3000000}] and order_rows is not None and [(r["s"], r["id"]) for r in order_rows] == last_ten
     stopped_http = status == 503 and sqlstate == "53200" and "out of memory" in body
-    stopped_count = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    stopped_count = until(lambda: metrics_of(port).get("pondra_queries_stopped_for_memory_total"), 1, 5)  # (the counter can lag the error by a moment: waited for, not raced)
     # A stop holds the watch for ten seconds (`oom.rs`): each later attempt waits that out, so its refusal is the watch's
     # and not the pool's, and the counter says so.
     time.sleep(11)
@@ -4556,7 +4556,7 @@ def scale():
             stopped_pg = None
         except psycopg.Error as e:
             stopped_pg = (e.sqlstate, "nearly out of memory" in str(e))
-    count_pg = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    count_pg = until(lambda: metrics_of(port).get("pondra_queries_stopped_for_memory_total"), 2, 5)  # (the counter can lag the error by a moment: waited for, not raced)
     time.sleep(11)
     settle()
     session = "harness-stopped-txn"
@@ -4567,7 +4567,7 @@ def scale():
     tx_after = answer("SELECT 1 AS one", session)[1]
     tx_commit = answer("COMMIT", session)[2]
     tx_count = rows_of("SELECT count(*) AS n FROM stopped_tx")
-    count_tx = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    count_tx = until(lambda: metrics_of(port).get("pondra_queries_stopped_for_memory_total"), 3, 5)  # (the counter can lag the error by a moment: waited for, not raced)
     memory_line = {"array_agg_http": [status, sqlstate, body[:160]], "array_agg_seconds": round(agg_seconds, 1), "peak_mb": agg_peak >> 20,
                    "settled_after_s": round(agg_settled, 1), "after_stop_seconds": round(after_seconds, 3), "sort_seconds": round(sort_seconds, 1),
                    "group_seconds": round(group_seconds, 1), "order_seconds": round(order_seconds, 1), "stopped_count": stopped_count,
