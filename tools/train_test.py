@@ -107,6 +107,8 @@ class FakeGitHub(GitHub):
         self.writes = []      # (method, path) of every write made through api
         self.refuse_workflows = False   # a move of main whose new commits differ from a parent in a workflow fails
         self.later = 0        # train.yml runs started (a wait's hand-over)
+        self.merges = []      # PRs merged through the API (a release branch's)
+        self.refuse_merge = False   # the merge endpoint answers 405, as for a PR GitHub finds not mergeable
 
     def git(self, *args):
         return sh("git", "--git-dir", self.bare, *args)
@@ -126,7 +128,24 @@ class FakeGitHub(GitHub):
             self.writes.append((method, route))
         base = f"repos/{REPO}"
         if method == "GET" and route == f"{base}/pulls":
-            return [self.pr_json(n) for n in sorted(self.prs) if self.prs[n]["open"]]
+            wanted = re.search(r"[?&]base=([^&]+)", path)
+            return [self.pr_json(n) for n in sorted(self.prs) if self.prs[n]["open"]
+                    and (not wanted or self.prs[n].get("base", "main") == wanted[1])]
+        if (m := re.fullmatch(rf"{base}/branches/(.+)", route)) and method == "GET":
+            return {"commit": {"sha": self.bare_rev(f"refs/heads/{m[1]}")}}
+        if (m := re.fullmatch(rf"{base}/commits/([0-9a-f]+)", route)) and method == "GET":
+            return {"parents": [{"sha": p} for p in self.git("rev-list", "--parents", "-n1", m[1]).split()[1:]]}
+        if (m := re.fullmatch(rf"{base}/issues/(\d+)/comments", route)) and method == "GET":
+            return [{"body": b} for b in self.comments.get(int(m[1]), [])]
+        if (m := re.fullmatch(rf"{base}/pulls/(\d+)/merge", route)) and method == "PUT":
+            n = int(m[1])
+            if self.refuse_merge:
+                raise GitHubError(405, '{"message": "Pull Request is not mergeable"}', "gh: Pull Request is not mergeable (HTTP 405)")
+            expect(body == {"sha": self.bare_rev(f"refs/pull/{n}/head"), "merge_method": "merge"}, f"merge of #{n}: {body}")
+            self.git("update-ref", f"refs/heads/{self.prs[n]['base']}", self.bare_rev(f"refs/pull/{n}/merge"))
+            self.merges.append(n)
+            self.prs[n]["open"] = False
+            return {"merged": True}
         if method == "GET" and route == f"{base}/actions/workflows/build.yml/runs":
             return {"workflow_runs": self.runs}
         if method == "PATCH" and route == f"{base}/git/refs/heads/main":
@@ -156,7 +175,7 @@ class FakeGitHub(GitHub):
 
     def pr_json(self, n):
         pr = self.prs[n]
-        return {"number": n, "title": pr["title"], "draft": pr["draft"],
+        return {"number": n, "title": pr["title"], "draft": pr["draft"], "base": {"ref": pr.get("base", "main")},
                 "labels": [{"name": name} for name in pr["labels"]],
                 "head": {"repo": {"full_name": REPO}, "sha": self.bare_rev(f"refs/pull/{n}/head")}}
 
@@ -237,6 +256,34 @@ class Scenario:
         write_commit(self.work, edits, title)
         git(self.work, "push", "-q", self.bare, f"HEAD:refs/pull/{n}/head")
         self.gh.prs[n] = {"title": title, "draft": draft, "labels": list(labels), "files": list(edits), "open": True}
+
+    def open_release_pr(self, n, title, edits, labels=("train", "ci"), base="release/0.80"):
+        """Opens PR n against a release branch (made from main the first time), as `open_pr` does, and makes its merge
+        onto the branch as it is now, refs/pull/<n>/merge, as GitHub does for its run. Returns the merge's sha."""
+        if self.gh.bare_rev(f"refs/heads/{base}") is None:
+            self.gh.git("update-ref", f"refs/heads/{base}", "refs/heads/main")
+        git(self.work, "fetch", "-q", "origin")
+        git(self.work, "checkout", "-q", "-B", f"pr{n}", f"origin/{base}")
+        write_commit(self.work, edits, title)
+        git(self.work, "push", "-q", self.bare, f"HEAD:refs/pull/{n}/head")
+        self.gh.prs[n] = {"title": title, "draft": False, "labels": list(labels), "files": list(edits), "open": True, "base": base}
+        return self.merge_ref(n)
+
+    def merge_ref(self, n):
+        """PR n's merge onto its branch as it is now (refs/pull/<n>/merge): its sha."""
+        git(self.work, "fetch", "-q", "origin")
+        git(self.work, "checkout", "-q", "-B", f"merge{n}", f"origin/{self.gh.prs[n]['base']}")
+        git(self.work, "fetch", "-q", "origin", f"refs/pull/{n}/head")
+        git(self.work, "merge", "-q", "--no-ff", "--no-edit", "FETCH_HEAD")
+        git(self.work, "push", "-q", "-f", self.bare, f"HEAD:refs/pull/{n}/merge")
+        return self.gh.bare_rev(f"refs/pull/{n}/merge")
+
+    def add_release_run(self, run_id, n, merge, status="completed", conclusion="success"):
+        """PR n's ci run, which tested `merge`: its reusable workflows' ref is the PR's merge, as GitHub lists them."""
+        self.add_run(run_id, self.gh.bare_rev(f"refs/pull/{n}/head"), event="pull_request", branch=f"pr{n}",
+                     status=status, conclusion=conclusion)
+        self.gh.runs[0]["referenced_workflows"] = [{"path": "owner/repo/.github/workflows/upgrade.yml@" + merge, "sha": merge,
+                                                    "ref": f"refs/pull/{n}/merge"}]
 
     def push_main(self, edits, title):
         """A commit straight onto main, as another lane's merge would be."""
@@ -1143,6 +1190,92 @@ def wait_stops(path):
             out = sc.conduct(50)
         expect("waiting: main fails the same way: lint" in out, out)
         expect(pauses == [] and sc.gh.later == 0, f"pauses {pauses}, started {sc.gh.later}")
+
+
+RELEASE = "release/0.80"
+
+
+@case
+def release_lands(path):
+    """A release branch's PR labelled train and ci, green on the branch's head: merged, the branch's run started."""
+    with Scenario(path) as sc:
+        merge = sc.open_release_pr(5, "a fix", {"fix.txt": "fixed\n"})
+        sc.add_release_run(70, 5, merge)
+        out = sc.step()
+        expect(sc.gh.merges == [5] and sc.gh.bare_rev(f"refs/heads/{RELEASE}") == merge, f"merges {sc.gh.merges}")
+        expect(sc.gh.dispatches == [(RELEASE, "main")] and sc.tip() is None, f"dispatches {sc.gh.dispatches}, tip {sc.tip()}")
+        expect(f"landed #5 on {RELEASE} with its run {run_url(70)}" in out and sc.comments(5) == [], out)
+
+
+@case
+def release_beside_main(path):
+    """A release PR lands in the same step that cuts main's train, and main's train never takes it."""
+    with Scenario(path) as sc:
+        merge = sc.open_release_pr(5, "a fix", {"fix.txt": "fixed\n"})
+        sc.add_release_run(70, 5, merge)
+        sc.open_pr(1, "first", {"a.txt": "one\n"})
+        out = sc.step()
+        expect(sc.gh.merges == [5] and sc.train_heads() == [1], f"merges {sc.gh.merges}, train {sc.train_heads()}: {out}")
+        expect("riding" not in sc.labels(5), f"#5: {sc.labels(5)}")
+
+
+@case
+def release_waits(path):
+    """A release PR whose run goes, is red, or was skipped (no ci then): nothing is merged, and nothing said."""
+    with Scenario(path) as sc:
+        merge = sc.open_release_pr(5, "a fix", {"fix.txt": "fixed\n"})
+        for run_id, status, conclusion in [(70, "in_progress", None), (71, "completed", "failure"), (72, "completed", "skipped")]:
+            sc.add_release_run(run_id, 5, merge, status=status, conclusion=conclusion)
+            before = sc.state()
+            sc.step()
+            expect(sc.gh.merges == [] and sc.state() == before, f"after run {run_id}: merges {sc.gh.merges}")
+
+
+@case
+def release_needs_ci(path):
+    """A release PR labelled train alone is told, once, to take ci (the train's own label would start no run)."""
+    with Scenario(path) as sc:
+        sc.open_release_pr(5, "a fix", {"fix.txt": "fixed\n"}, labels=("train",))
+        sc.step()
+        sc.step()
+        expect(len(sc.comments(5)) == 1 and "label it ci as well" in sc.comments(5)[0], f"comments {sc.comments(5)}")
+        expect(sc.gh.merges == [] and sc.labels(5) == ["train"], f"merges {sc.gh.merges}, labels {sc.labels(5)}")
+
+
+@case
+def release_moved(path):
+    """The release branch moved since a PR's green run: it is told once to merge the branch, and lands from the run
+    that tests the branch's new head."""
+    with Scenario(path) as sc:
+        merge = sc.open_release_pr(5, "a fix", {"fix.txt": "fixed\n"})
+        sc.add_release_run(70, 5, merge)
+        sc.open_release_pr(6, "another fix", {"other.txt": "other\n"}, labels=())
+        sc.gh.git("update-ref", f"refs/heads/{RELEASE}", sc.merge_ref(6))   # (merged by hand meanwhile)
+        sc.step()
+        sc.step()
+        expect(sc.gh.merges == [] and len(sc.comments(5)) == 1, f"merges {sc.gh.merges}, comments {sc.comments(5)}")
+        expect(f"{RELEASE} moved since this pull request's green run ({run_url(70)})" in sc.comments(5)[0], sc.comments(5)[0])
+        sc.add_release_run(71, 5, sc.merge_ref(5))
+        sc.step()
+        expect(sc.gh.merges == [5], f"merges {sc.gh.merges}")
+
+
+@case
+def release_workflow_and_refused(path):
+    """A release PR that changes a workflow is told once to merge by hand; one GitHub won't merge is said in the log,
+    and main's train goes on."""
+    with Scenario(path) as sc:
+        merge = sc.open_release_pr(5, "a workflow fix", {".github/workflows/build.yml": "name: build\n"})
+        sc.add_release_run(70, 5, merge)
+        sc.step()
+        sc.step()
+        expect(sc.gh.merges == [] and len(sc.comments(5)) == 1 and "merge it by hand" in sc.comments(5)[0], f"{sc.comments(5)}")
+        merge = sc.open_release_pr(7, "a fix", {"fix.txt": "fixed\n"})
+        sc.add_release_run(71, 7, merge)
+        sc.open_pr(1, "first", {"a.txt": "one\n"})
+        sc.gh.refuse_merge = True
+        out = sc.step()
+        expect(f"#7 didn't land on {RELEASE}" in out and sc.train_heads() == [1], out)
 
 
 def main():
