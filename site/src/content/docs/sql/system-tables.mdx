@@ -1,6 +1,6 @@
 ---
 title: System columns and tables
-description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.objects, pondra.kinds, pondra.parts, pondra.find, pondra.dropped, pondra.flows, pondra.expectations and pondra.settings tables.
+description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.objects, pondra.kinds, pondra.parts, pondra.find, pondra.dropped, pondra.flows, pondra.expectations, pondra.functions and pondra.settings tables.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -412,6 +412,18 @@ SELECT name, follows, kind FROM pondra.flows WHERE name = 'sold_by_item';
 
 ```text
 [{"name":"sold_by_item","follows":"sold","kind":"aggregate"}]
+```
+
+## Functions
+
+`pondra.functions` lists every function a query can call, one row each: `name`, `kind` (`scalar`,
+`aggregate`, `window` or `table`) and `source`, which part of Pondra gives it: `datafusion` for the
+engine's built-in functions, `engine` for Pondra's own, `spark`, `postgres`, `match_recognize` or `ai`.
+Where two parts name one function, the later one's is the function, as `source` says. Your own
+functions are in [`pondra.routines`](#routines-and-tasks).
+
+```sql
+SELECT name, kind FROM pondra.functions WHERE source = 'postgres' ORDER BY name;
 ```
 
 ## Settings
