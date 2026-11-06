@@ -2868,6 +2868,22 @@ def kafka():
     checks["Debezium's own encodings: a Decimal's bytes, ms and µs times, BYTEA's base64, as the source has them"] = \
         sql_("SELECT id, balance::VARCHAR AS balance, num::VARCHAR AS num, ts3::VARCHAR AS ts3, t::VARCHAR AS t, t3::VARCHAR AS t3, encode(b, 'hex') AS b FROM kinds") == \
         [{"id": 1, "balance": "-3.25", "num": "123.4567", "ts3": "2026-09-01T10:00:00.123", "t": "12:34:56.789012", "t3": "12:34:56.789", "b": "00ff10"}]
+    # A scale past 76 is refused as INVALID_RECORD, and the node stays up: a scale of -2^40 once asked for a terabyte
+    # of zeros and aborted it (11-06 audit H1). A Decimal sent as a JSON number (JsonConverter's decimal.format=NUMERIC)
+    # loads as sent, as it did before Debezium's encodings were read (11-06 audit M3).
+    decimal_at = lambda scale: field("balance", "bytes", "org.apache.kafka.connect.data.Decimal", parameters={"scale": scale})
+    after_only = lambda fs: {"type": "struct", "fields": [{"type": "struct", "field": "after", "optional": True, "fields": fs}, field("op", "string")]}
+    huge, numeric = [], dict(after, id=3, balance=10.5, num=None)
+    for fs, row in [(fields, dict(after, id=2, num={"scale": -(1 << 40), "value": "Bw=="})),
+                    ([decimal_at("-9000000000") if f["field"] == "balance" else f for f in fields], dict(after, id=2, balance="Bw=="))]:
+        p.produce("kinds", key=json.dumps({"id": 2}), value=json.dumps({"schema": after_only(fs), "payload": {"after": row, "op": "c"}}),
+                  on_delivery=lambda e, m: huge.append(e))
+    p.flush(30)  # (a refused record refuses its batch: the good one goes in a batch of its own)
+    p.produce("kinds", key=json.dumps({"id": 3}), value=json.dumps({"schema": envelope, "payload": {"before": None, "after": numeric, "op": "c"}}))
+    p.flush(30)
+    checks["a decimal's scale past 76 is refused as INVALID_RECORD and the node stays up; a Decimal as a JSON number loads as sent"] = \
+        len(huge) == 2 and all(e is not None and e.code() == ck.KafkaError.INVALID_RECORD for e in huge) and \
+        sql_("SELECT id, balance::VARCHAR AS balance FROM kinds ORDER BY id") == [{"id": 1, "balance": "-3.25"}, {"id": 3, "balance": "10.50"}]
     # consumers: kafka-python and librdkafka read the log back from the beginning
     tp = kp.TopicPartition("users", 0)
     c = kp.KafkaConsumer(bootstrap_servers=f"127.0.0.1:{kport}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN",
@@ -10769,12 +10785,23 @@ def users():
     # Open, until a user who signs in exists; then nothing without a sign-in (no token is set)
     opened = as_(A.port, None, "SELECT 1 AS x")
     unreadable_open = as_(A.port, "Basic !!!", "SELECT 1 AS x")  # (before: taken for no sign-in, an open node's admin)
+    open_pg = psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=anyone dbname=lake", connect_timeout=10, autocommit=True)  # (made while the lake is open)
+    open_said = [open_pg.execute("SELECT 1 AS x").fetchall()]
     for q in ["CREATE SCHEMA sales", "CREATE TABLE sales.orders (id BIGINT, item VARCHAR, amount DOUBLE, card VARCHAR)", "INSERT INTO sales.orders VALUES (1, 'tea', 2.5, '4111'), (2, 'cake', 4.0, '5500')",
               "CREATE TABLE hr (id BIGINT, salary DOUBLE)", "INSERT INTO hr VALUES (1, 100.0)", "CREATE TABLE notes (id BIGINT, text VARCHAR)", "INSERT INTO notes VALUES (1, 'hello')",
               "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:
         as_(A.port, None, q)
     closed = until(lambda: as_(A.port, None, "SELECT 1 AS x"), "ERROR 401: b\"sign in: a token, or a user's name and password\"", 10)
     checks["open until a user who signs in exists; then nothing without a sign-in (no token set)"] = opened == [{"x": 1}] and closed.startswith("ERROR 401")
+    # …and a Postgres connection made while it was open is ended at its next check (5 s), as a stream is; before, it kept its
+    # superuser rights after the CREATE USER (11-06 audit M2)
+    time.sleep(5.5)
+    try:
+        open_said.append(open_pg.execute("SELECT 1 AS x").fetchall())
+    except Exception as e:
+        open_said.append(f"ERROR {e}")
+    checks["a Postgres connection made while the lake was open is ended once a user who signs in exists"] = open_said[0] == [(1,)] and \
+        "the lake now signs its users in" in str(open_said[1])
     for q in ["CREATE USER ann PASSWORD 'ann-password-1'", "CREATE ROLE analyst", "GRANT SELECT (id, item, amount) ON sales.orders TO analyst", "GRANT analyst TO ann",
               "CREATE USER bob PASSWORD 'bob-password-1'", "GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA sales TO bob", "GRANT SELECT ON notes TO public", "CREATE USER svc"]:
         as_(A.port, boss, q)
@@ -10845,6 +10872,7 @@ def users():
     shown["applier_export"] = as_(A.port, dee, b"", method="GET", path="/export")
     names = sorted(o["name"] for o in shown["objects"]["objects"]) if isinstance(shown["objects"], dict) else shown["objects"]
     shown_info = {k: v for k, v in shown.items() if k != "objects"} | {"objects": names}
+    shown_info["open pg"] = open_said
     checks["a user is shown only the tables it may read (GET /objects) and no routine's code: /routines, information_schema, pg_proc, pondra.objects, SHOW CREATE (S27); an admin all of it"] = \
         names == ["notes", "orders"] and isinstance(shown["routines"], dict) and shown["routines"].get("leak", {}).get("body") == "" \
         and "INSERT INTO sales.refunds" in json.dumps(shown["boss_routines"]) and shown["defined"] == [(None,)] and shown["prosrc"] == [(None,)] \
