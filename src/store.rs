@@ -3793,17 +3793,17 @@ mod tests {
     #[test]
     fn placed_changes_with_the_order_an_insert_fills() {
         // (11-03 audit M9: the leader refuses rows a node put by another order, `log::Ack::moved`)
-        let m = TableMeta { columns: vec![("a".into(), "Int32".into()), ("b".into(), "Int32".into())], ..Default::default() };
+        let m = TableMeta::with_columns(vec![("a".into(), "Int32".into()), ("b".into(), "Int32".into())]);
         let mut moved = m.clone();
         moved.set_order(vec!["b".into(), "a".into()]);
         let mut back = moved.clone();
         back.set_order(vec!["a".into(), "b".into()]);
         let mut renamed = m.clone();
-        renamed.names.insert("a".into(), "x".into());
+        renamed.rename_column("a", "x");
         let mut added = m.clone();
-        added.columns.push(("c".into(), "Int32".into()));
+        added.add_column("c", "Int32", None, None);
         let mut dropped = added.clone();
-        dropped.dropped.push("c".into());
+        dropped.drop_column("c");
         assert_ne!(m.placed(), moved.placed(), "a move");
         assert_eq!(m.placed(), back.placed(), "moved back: the same places");
         assert_eq!(m.placed(), renamed.placed(), "a rename puts nothing elsewhere");
