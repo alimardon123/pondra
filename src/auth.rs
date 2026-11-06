@@ -671,8 +671,8 @@ impl Credential {
     }
 
     /// A request's `Authorization` header (`of_header`); one that isn't text can't be read.
-    pub fn of_headers(headers: &axum::http::HeaderMap) -> Credential {
-        match headers.get(axum::http::header::AUTHORIZATION).map(|v| v.to_str()) {
+    pub fn of_headers(headers: &http::HeaderMap) -> Credential {
+        match headers.get(http::header::AUTHORIZATION).map(|v| v.to_str()) {
             None => Credential::None,
             Some(Ok(v)) => Credential::of_header(Some(v)),
             Some(Err(_)) => Credential::Malformed("an Authorization header that isn't text"),
