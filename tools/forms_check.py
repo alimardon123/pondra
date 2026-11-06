@@ -37,6 +37,7 @@ sys.path.insert(0, HERE)
 import harness, slt_check
 
 FORMS = ("server", "cluster", "inprocess", "memory", "page")
+LISTS = 6  # the lake format a new lake starts at in every form: its tables' column lists (`format::LISTS`)
 SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
 # DataFusion's own words for what it lacks: a refusal in them isn't yet one the form names (ADR-072 §6)
 DATAFUSION = re.compile(r"This feature is not implemented|not supported|Unsupported|SQL error|Schema error|Error during planning|Inconsistent data length|Placeholder")
@@ -208,6 +209,26 @@ def run_file(name, form, path, refusal):
     return passed, 0, failures, None
 
 
+def new_lake_format(name, form):
+    """A new lake starts at format 6 (its tables' column lists) in every form that answers /stats, as a server's does:
+    the failure, or None. (A page answers no /stats; it makes its lake as a node does, `format::raise`.)"""
+    form.open()
+    try:
+        status, _, said = form.request("POST", "/sql", {}, b"CREATE TABLE lists (x INT NOT NULL, y VARCHAR DEFAULT 'a')")
+        if status >= 300:
+            return f"CREATE TABLE: {status} {said[:200]!r}"
+        fmt = None
+        for _ in range(50):  # (a server's leader marks the lake as it starts, beside serving)
+            status, _, said = form.request("GET", "/stats", {}, None)
+            fmt = json.loads(said).get("format") if status < 300 else f"{status} {said[:200]!r}"
+            if fmt == LISTS:
+                return None
+            time.sleep(0.1)
+        return f"a new lake is format {fmt}, not {LISTS} (its tables' column lists)"
+    finally:
+        form.close()
+
+
 def split(table):
     """src/lib.rs's modules built for the server only (its `doors`: a page builds the lake) that forms.json's
     `server_only` doesn't list, and those it lists that aren't."""
@@ -249,6 +270,9 @@ def main():
             counts["unrun"] += unrun
             counts["failed"] += len(failed)
             failures += failed
+        if not isinstance(form, Page):
+            why = new_lake_format(name, form)
+            failures += [{"form": name, "file": "-", "line": 0, "sql": "", "why": why}] if why else []
         if isinstance(form, Page) and form.child:
             form.stop()
         summary[name] = counts
