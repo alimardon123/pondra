@@ -748,6 +748,9 @@ fn typed(schema: &Value, v: &mut Value, target: &Schema) -> Result<()> {
 fn connect_value(f: &Value, logical: &str, x: &Value, ty: &DataType) -> Result<Value> {
     let int = || x.as_i64().ok_or_else(|| anyhow!("a {logical} is a whole number, not {x}"));
     let nanos = match logical {
+        // (JsonConverter's `decimal.format=NUMERIC` sends a Decimal as a JSON number: kept as sent, as before
+        // Debezium's encodings were read. Its BASE64 format, the default, is the only one that sends text.)
+        "org.apache.kafka.connect.data.Decimal" if x.is_number() => return Ok(x.clone()),
         "org.apache.kafka.connect.data.Decimal" => {
             let scale = f["parameters"]["scale"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow!("a Decimal names its scale"))?;
             return Ok(Value::String(decimal(x, scale)?));
@@ -789,7 +792,10 @@ fn bytes_of(x: &Value) -> Result<Vec<u8>> {
 }
 
 /// Kafka Connect's Decimal: the unscaled number, big-endian two's complement, then its scale.
+/// A scale past 76 (a DECIMAL's widest) fits no column, and would ask for that many zeros: it is refused
+/// before anything is written out, so a record can't make the node allocate without bound.
 fn decimal(x: &Value, scale: i64) -> Result<String> {
+    ensure!(scale.unsigned_abs() <= 76, "a decimal's scale of {scale} is past 76, the most any DECIMAL has");
     let b = bytes_of(x)?;
     ensure!(!b.is_empty() && b.len() <= 16, "a decimal of {} bytes is past 38 digits", b.len());
     let mut wide = [if b[0] & 0x80 != 0 { 0xff } else { 0 }; 16];
@@ -1601,6 +1607,21 @@ mod tests {
         assert_eq!(decimal(&"AA==".into(), 3).unwrap(), "0.000");
         assert_eq!(decimal(&"Bw==".into(), -2).unwrap(), "700");
         assert!(decimal(&"not base64!".into(), 2).is_err());
+        // A scale past 76 either way is refused before a digit is written (it asked for a terabyte once).
+        assert_eq!(decimal(&"Bw==".into(), 76).unwrap().len(), 78);
+        assert_eq!(decimal(&"Bw==".into(), -76).unwrap(), format!("7{}", "0".repeat(76)));
+        for scale in [77, -77, -1_099_511_627_776, i64::MIN, i64::MAX] {
+            assert!(decimal(&"Bw==".into(), scale).unwrap_err().to_string().contains("past 76"), "{scale}");
+        }
+        let mut huge = serde_json::json!({"num": {"scale": -1_099_511_627_776i64, "value": "Bw=="}});
+        assert!(typed(&row_schema, &mut huge, &target).is_err());
+        let mut wide = serde_json::json!({"balance": "Bw=="});
+        let decimal_schema = |scale: &str| serde_json::json!({"fields": [{"type": "bytes", "name": "org.apache.kafka.connect.data.Decimal", "parameters": {"scale": scale}, "field": "balance"}]});
+        assert!(typed(&decimal_schema("-9000000000"), &mut wide, &target).is_err());
+        // A Decimal as a JSON number (JsonConverter's `decimal.format=NUMERIC`) is kept as sent.
+        let mut numeric = serde_json::json!({"balance": 10.5, "num": {"scale": 1, "value": "AQ=="}});
+        typed(&row_schema, &mut numeric, &target).unwrap();
+        assert_eq!(numeric, serde_json::json!({"balance": 10.5, "num": "0.1"}));
         // A row without the envelope (Debezium's ExtractNewRecordState), and a time into a column that isn't one.
         let mut flat = serde_json::json!({"id": 2, "ts3": 0, "name": 5});
         typed(&row_schema, &mut flat, &target).unwrap();
