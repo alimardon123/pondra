@@ -16,10 +16,10 @@
 //!
 //! Another database's name for a function Pondra doesn't have is refused by name, with what to write (`OURS`). So is SQL
 //! Server's `FORMAT(value, 'pattern')`, which Postgres's `format` takes the other way round.
-use crate::friendly::{part_word, quote};
+use crate::friendly::{part_word, quote, string_of as string}; // (`string`: a string literal's text)
 use anyhow::Result;
 use std::sync::LazyLock;
-use datafusion::sql::sqlparser::ast::{Expr, Value, ValueWithSpan};
+use datafusion::sql::sqlparser::ast::{Expr, ValueWithSpan};
 
 /// Other databases' functions Pondra doesn't have, as (name, whose, what to write). `call` refuses each by name, and
 /// `friendly::wanted` looks for them, so the list is kept in one place.
@@ -168,13 +168,6 @@ pub fn call(name: &str, a: &[&Expr]) -> Result<Option<String>> {
 
 fn list(a: &[&Expr]) -> String { a.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ") }
 
-/// A string literal's text.
-fn string(e: &Expr) -> Option<&str> {
-    match e {
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Some(s),
-        _ => None,
-    }
-}
 
 /// A bare word's text, in lower case (`weekday`, `MONTH`).
 fn word(e: &Expr) -> Option<String> {
