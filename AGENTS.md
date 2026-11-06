@@ -3885,16 +3885,23 @@ feature freeze (the owner called it on 11-03), the from-scratch review, then a r
 under the soak. Edit only your lane's files (the project's `designs/one-month-to-1-0.md` lists
 them and each lane's numbers).
 
-**Under the freeze** (the owner, 11-03 10:25 UTC, until 0.80.0 ships on 11-11), only these merge:
+**Two branches until 0.80.0** (the owner: the freeze 11-03 10:25 UTC, "release branch, redesign on
+main" 12:06). `release/0.80`, cut at main 20c2732, is the release: rc.1 on 11-06 and 0.80.0 on 11-11
+are bumped and tagged there, and a tag names a `release/0.80` commit. Only these merge into it:
 - a fix for a wrong answer, lost or exposed data, or a crash or hang;
 - an rc.1 blocker: a gate, the soak or the upgrade check failing, or the release itself (the
   version, the release notes, the installers, the upgrade guide).
 
-Nothing else merges, however small: no feature, speed work, refactor or new spelling. Keep work in
-flight as a patch under the project's `<lane>-wip/` folder, with a line on where it stands. A fix's
-PR says which of the two kinds it is, and it still proves that no other answer changes and no
-query is slower. The from-scratch redesign (`designs/one-state-every-format.md`) is planned beside
-the freeze; its code lands after 0.80.0.
+Nothing else merges there, however small: no feature, speed work, refactor or new spelling. A fix's
+pull request targets `release/0.80`, says which of the two kinds it is, and still proves that no
+other answer changes and no query is slower. Its lane then ports it to main in its own pull
+request, if the code it fixes is still there.
+
+Main takes the redesign, one step at a time in the order of the project's
+`designs/redesign/redesign.md` (v2.1, §12); the project's `redesign-wip/lane-map.md` says which lane
+takes which step or part. Each step passes its own gate before the next starts, and main stays
+releasable after each. Work parked at the freeze (patches under the project's
+`<lane>-wip/`) is redone on the redesigned layout, never landed as it is.
 
 ## Conventions
 
