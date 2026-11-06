@@ -234,7 +234,7 @@ pub async fn alone(lake: &Lake) -> Result<()> {
 }
 
 /// Is the lake at `url` in this process's memory or a local folder (no bucket's `scheme://`)?
-fn kept_here(url: &str) -> bool { crate::memory::in_memory(url) || !url.contains("://") }
+fn kept_here(url: &str) -> bool { matches!(crate::store::place(url), Ok(crate::store::Place::Memory | crate::store::Place::Folder)) }
 
 /// A node that isn't the leader: stop if the lake moves past what this build knows. (It can't,
 /// unless this node was cut off while the others agreed, `raise`, or it started on such a lake
