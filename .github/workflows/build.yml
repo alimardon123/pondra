@@ -23,8 +23,9 @@ name: build
 # what its change touches (`plan`), and main builds only its newest commit (`concurrency`).
 # A release branch (`release/0.80`: cut from main for a release, its fixes and candidates land there while the redesign
 # goes on on main; the owner, 2026-11-03) builds as main does, each on its own: its pushes every platform, its pull
-# requests' `ci` and `full-ci` as main's. The train lands on main alone, so a release branch's pull request merges by
-# hand once its run is green, and its tags (release.yml) take that branch's packages.
+# requests' `ci` and `full-ci` as main's. The train cuts trains on main alone: a release branch's pull request labelled
+# `ci` and `train` is merged by the conductor (tools/train.py) once its own run is green on the branch's head, and its
+# tags (release.yml) take that branch's packages.
 on:
   push:
     branches: [main, "release/**"]
