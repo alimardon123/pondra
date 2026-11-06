@@ -221,18 +221,6 @@ pub fn give_back_from<T, K: Hash + Eq, V>(cache: &Mutex<T>, lru: impl Fn(&mut T)
     freed
 }
 
-/// Takes about `bytes` back from `caches`, each in turn, and says how many bytes came back.
-pub fn take_back<'a>(caches: impl IntoIterator<Item = &'a dyn Charged>, bytes: usize) -> usize {
-    let mut freed = 0;
-    for c in caches {
-        if freed >= bytes {
-            break;
-        }
-        freed += c.give_back(bytes - freed);
-    }
-    freed
-}
-
 // ---------------------------------------------------------------- the line
 
 /// The node's one line for query memory, which every lake it opens shares. Each lake's queries run on a `LakePool`: DataFusion's
@@ -242,14 +230,16 @@ pub fn take_back<'a>(caches: impl IntoIterator<Item = &'a dyn Charged>, bytes: u
 ///
 /// The queries and the caches charged to the ledger also fit one whole line together (`whole`): a grow that would pass it
 /// takes cache bytes back first, and spills only if they don't come back. Every cache is inside it, except one the user
-/// gave a budget of its own (`Charged::inside`), which keeps that budget beside it with the memory watch behind it. With `PONDRA_MEMORY_GB` set it is the whole line,
-/// queries and caches together, as DuckDB's `memory_limit` is; unset, the queries keep their own line (a third of the
+/// gave a budget of its own (`Charged::inside`), which keeps that budget beside it with the memory watch behind it. With
+/// `PONDRA_MEMORY_GB` set it is the whole line, queries and caches together, as DuckDB's `memory_limit` is (`hard`): a
+/// spilling operator the caches didn't make room for spills at once. Unset, the queries keep their own line (a third of the
 /// machine's memory, which leaves room for what their reservations don't count, `array_agg` and the like) inside a whole
-/// line at the memory watch's trim line (`oom::trim_line`). So the budgets no longer add up past the machine's memory, and a
-/// query grows into what the caches hold rather than the watch stopping it there. What the caches hold is read at the watch's
-/// looks (`note`) and lowered by what each grow takes back, so a grow reads one number and locks no cache to read it; it
-/// takes bytes back only from a cache it finds free (`Charged::give_back`), and never waits on a reader. A spilling operator
-/// the caches didn't make room for spills at once; memory that can't spill is held to its share alone, as before.
+/// line at the memory watch's trim line (`oom::trim_line`), and a grow past it takes what the caches give back and goes on
+/// within its share, as before: spilling sooner than today would change what a query does by default. So the budgets no
+/// longer add up past the machine's memory, and a query grows into what the caches hold rather than the watch stopping it
+/// there. What the caches hold is read at the watch's looks (`note`) and lowered by what each grow takes back, so a grow
+/// reads one number and locks no cache to read it; it takes bytes back only from a cache it finds free
+/// (`Charged::give_back`), and never waits on a reader. Memory that can't spill is held to its share alone on either line.
 ///
 /// As within one `FairSpillPool`, a share is held to at the next grow. When a second lake starts, the first lake's
 /// spilling operators are refused their next grow past its new share and spill, and the second lake's are not refused
@@ -260,6 +250,7 @@ pub fn take_back<'a>(caches: impl IntoIterator<Item = &'a dyn Charged>, bytes: u
 pub struct Ledger {
     line: usize,           // the queries' line: what their reservations hold together, at most
     whole: usize,          // the whole line: the queries' reservations and the caches together (`usize::MAX`: none known)
+    hard: bool,            // the whole line is the user's (`PONDRA_MEMORY_GB`): a spiller it has no room for spills
     reserved: AtomicUsize, // every lake's reservations together
     busy: AtomicUsize,     // lakes with a memory consumer registered now
     cached: AtomicUsize,   // what the caches held at the last look (`note`), less what grows took back since
@@ -267,9 +258,10 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// A ledger whose queries hold `line` at most, inside `whole` with the caches (`line` itself when the setting is the whole line).
-    pub fn new(line: usize, whole: usize) -> Arc<Ledger> {
-        Arc::new(Ledger { line, whole, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0), cached: AtomicUsize::new(0), caches: Default::default() })
+    /// A ledger whose queries hold `line` at most, inside `whole` with the caches (`line` itself when the setting is the whole
+    /// line). A `hard` whole line refuses a spiller's grow the caches don't make room for; a soft one only takes cache bytes back.
+    pub fn new(line: usize, whole: usize, hard: bool) -> Arc<Ledger> {
+        Arc::new(Ledger { line, whole, hard, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0), cached: AtomicUsize::new(0), caches: Default::default() })
     }
 
     /// A new lake's pool on this line.
@@ -470,10 +462,11 @@ impl MemoryPool for LakePool {
         if over > 0 {
             // (the cache bytes go outside the lake's lock, so its other grows don't wait on them; then its share is read again)
             drop(p);
-            if self.ledger.make_room(over) < over && r.consumer().can_spill() {
-                // A spiller spills at once rather than wait on a reader. What can't spill (a hash join's build side) would
-                // fail its query for a reader's moment in a cache, so it is held to its share alone, as before, with the
-                // memory watch behind it, and takes back what the caches give.
+            if self.ledger.make_room(over) < over && self.ledger.hard && r.consumer().can_spill() {
+                // On the user's line a spiller spills at once rather than wait on a reader. What can't spill (a hash join's
+                // build side) would fail its query for a reader's moment in a cache, so it is held to its share alone, as
+                // before, with the memory watch behind it, and takes back what the caches give. On the default line every
+                // grow does that: it spills where it did before, and the caches it found free gave their bytes back.
                 return Err(self.refused(r, additional, 0));
             }
             p = self.part();
@@ -600,7 +593,7 @@ mod tests {
 
     #[test]
     fn one_lake_has_the_whole_line_as_on_a_pool_of_its_own() {
-        let ledger = Ledger::new(100, usize::MAX);
+        let ledger = Ledger::new(100, usize::MAX, false);
         let a = ledger.pool();
         let (s1, s2) = (consumer(&a, "s1", true), consumer(&a, "s2", true));
         assert!(s1.try_grow(50).is_ok() && s2.try_grow(50).is_ok(), "two spillers, half the line each");
@@ -616,7 +609,7 @@ mod tests {
 
     #[test]
     fn two_lakes_in_one_process_each_keep_their_share() {
-        let ledger = Ledger::new(100, usize::MAX);
+        let ledger = Ledger::new(100, usize::MAX, false);
         let (a, b) = (ledger.pool(), ledger.pool());
         let spillers: Vec<_> = (0..4).map(|i| consumer(&a, &format!("a{i}"), true)).collect();
         for s in &spillers {
@@ -667,7 +660,7 @@ mod tests {
 
     #[test]
     fn a_line_takes_memory_back_from_its_caches_in_turn_and_forgets_the_dropped_ones() {
-        let ledger = Ledger::new(1000, usize::MAX);
+        let ledger = Ledger::new(1000, usize::MAX, false);
         let cache = |bytes: &[usize]| {
             let c = Arc::new(Mutex::new(ByteLru::new(1000)));
             for (i, &b) in bytes.iter().enumerate() {
@@ -707,7 +700,7 @@ mod tests {
     #[test]
     fn a_grow_past_the_whole_line_takes_cache_bytes_back_rather_than_spill() {
         // Queries and caches inside one line of 100: the caches hold 80, which a grow sees from the last look alone.
-        let ledger = Ledger::new(100, 100);
+        let ledger = Ledger::new(100, 100, true);
         let cache = charged_cache(&ledger, 8, 10);
         assert_eq!((ledger.note(), ledger.cached()), (80, 80));
         let a = ledger.pool();
@@ -726,12 +719,29 @@ mod tests {
         assert!(s.try_grow(1).is_err(), "the line is full");
         drop((s, held));
         // With no whole line (a machine whose memory isn't read), the caches stay beside the queries, as before.
-        let beside = Ledger::new(100, usize::MAX);
+        let beside = Ledger::new(100, usize::MAX, false);
         let kept = charged_cache(&beside, 8, 10);
         beside.note();
         let q = consumer(&beside.pool(), "q", true);
         assert!(q.try_grow(100).is_ok() && q.try_grow(1).is_err());
         assert_eq!(kept.held(), 80);
+    }
+
+    #[test]
+    fn on_the_default_line_a_grow_takes_what_the_caches_give_back_and_spills_only_where_it_did_before() {
+        // The whole line is the memory watch's trim line (`PONDRA_MEMORY_GB` unset): the queries keep their share.
+        let ledger = Ledger::new(100, 120, false);
+        let cache = charged_cache(&ledger, 8, 10);
+        ledger.note();
+        let a = ledger.pool();
+        let s = consumer(&a, "s", true);
+        s.try_grow(60).expect("past the whole line, the caches give back 20");
+        assert_eq!((cache.held(), ledger.cached()), (60, 60));
+        let reader = cache.lock().unwrap();
+        s.try_grow(40).expect("a reader holds the cache: the grow goes on within its share and never waits");
+        assert_eq!(reader.bytes(), 60);
+        drop(reader);
+        assert!(s.try_grow(1).is_err(), "past the share it spills, as before");
     }
 
     /// A cache the user gave a budget of its own (`Charged::inside`).
@@ -747,7 +757,7 @@ mod tests {
 
     #[test]
     fn a_cache_with_a_budget_of_its_own_keeps_it_beside_the_line_and_only_the_watch_takes_it_back() {
-        let ledger = Ledger::new(100, 100);
+        let ledger = Ledger::new(100, 100, true);
         let own = Arc::new(Own(Mutex::new(ByteLru::new(usize::MAX))));
         for i in 0..8 {
             let _ = own.0.lock().unwrap().put(i, (), 10);
@@ -765,7 +775,7 @@ mod tests {
 
     #[test]
     fn a_grow_that_finds_every_cache_held_by_a_reader_spills_at_once_and_never_waits() {
-        let ledger = Ledger::new(100, 100);
+        let ledger = Ledger::new(100, 100, true);
         let cache = charged_cache(&ledger, 8, 10);
         ledger.note();
         let a = ledger.pool();
