@@ -1395,11 +1395,11 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         }
         ctx.register_catalog(ns, catalog);
     }
-    if crate::runs::mentioned(&text) && default.schema("pondra").is_none() {
-        // (`pondra.runs`, `pondra.routines`, `pondra.tasks`; a lake's own schema called pondra is one made before 0.80, which wins as it did: 0.80 refuses a new one, 42939)
+    if (crate::runs::mentioned(&text) || !crate::lists::mentioned(&text).is_empty()) && default.schema("pondra").is_none() {
+        // (`pondra.runs`, `pondra.routines`, `pondra.tasks`, the lists; a lake's own schema called pondra is one made before 0.80, which wins as it did: 0.80 refuses a new one, 42939)
         use datafusion::catalog::SchemaProvider;
         let system = Arc::new(MemorySchemaProvider::new());
-        for (name, table) in crate::runs::tables(lake).await?.into_iter().chain(crate::users::tables(lake).await?).chain(crate::objects::tables(lake, &text).await?).chain(crate::copy::tables(lake, &text).await?) {
+        for (name, table) in crate::runs::tables(lake).await?.into_iter().chain(crate::users::tables(lake).await?).chain(crate::objects::tables(lake, &text).await?).chain(crate::copy::tables(lake, &text).await?).chain(crate::lists::tables(&text)?) {
             system.register_table(name.into(), table)?;
         }
         let runs = match lake.cat.meta(&crate::store::table_key(crate::runs::TABLE)).await? {

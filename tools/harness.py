@@ -21440,6 +21440,11 @@ def registry():
         and all(k["inside"] and set(k["inside"]) <= object_names for k in kinds if k["is"] == "part") \
         and all(k["lists"] for k in kinds if k["is"] == "pattern") \
         and {k["kind"] for k in kinds if k["is"] == "object" and k["on_clone"] == "leave"} == {"secret", "share", "recipient"}
+    settings = {r["variable"]: r for r in q("SELECT * FROM pondra.settings")}
+    info["settings"] = len(settings)
+    checks["pondra.settings lists the node's settings and an extension's, a test's hooks left out"] = \
+        settings.get("PONDRA_MEMORY_GB", {}).get("type") == "gb" and settings.get("PONDRA_AI_MODEL", {}).get("default_value") == "llama3.2" \
+        and settings["PONDRA_AI_KEY"]["type"] == "secret" and not any(v.startswith("PONDRA_TEST_") for v in settings)
     missing = [http(s)[0] for s in ("SHOW CREATE TABLE nothing_here", "COMMENT ON TABLE nothing_here IS 'x'", "COMMENT ON COLUMN events.nothing IS 'x'", "COMMENT ON COLUMN eu_orders.region IS 'x'")]
     quiet = q("COMMENT IF EXISTS ON TABLE nothing_here IS 'x'")
     checks["what isn't there: refused by name (4xx), or nothing with IF EXISTS"] = all(400 <= s < 500 for s in missing) and quiet.get("exists") is False

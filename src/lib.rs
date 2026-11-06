@@ -14,6 +14,8 @@ pub mod env;
 // The one place a feature says what it adds (designs/redesign/redesign.md §6): `built_in` below lists the build's extensions.
 pub mod registry;
 pub mod settings;
+// A section read as a table: every `pondra.*` list the registry gives (`pondra.settings`, `pondra.kinds`, …).
+pub mod lists;
 pub mod reset;
 pub mod fsum;
 pub mod avg;
