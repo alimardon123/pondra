@@ -19,7 +19,11 @@
       lake is on s3://$PONDRA_BUCKET (AWS_* point at R2, MinIO or tools/sim_r2.py), where a
       follower's flush is always in flight.
 
-  upgrade_check.py lakes,format (any of lakes, format, drain, rolling, comma-separated; all of them by default)
+  upgrade_check.py guests [--s3]
+      `pondra sql` writing alone moves a lake in a folder to this build's format as it opens; with --s3, it never moves a
+      lake in a bucket, whose cluster's followers it can't hear.
+
+  upgrade_check.py lakes,format (any of lakes, format, drain, rolling, guests, comma-separated; all of them by default)
 
 Prints the checks as JSON and exits 1 if one fails (a failing release's lakes and node logs are
 kept in --work). Needs the Python packages in tools/requirements.txt for other engines' reads
@@ -622,38 +626,43 @@ def until(what, secs, step=0.5):
 
 # ---------------------------------------------------------------- the lake's format
 
+LISTS = 6  # this build's format: every table's columns kept as one list (`format::LISTS`): a new lake starts there, an older one moves there by itself
+
+
 def format_check(new_bin, work, port, old=None):
-    """The lake's format (ADR-039), this build posing as a later one for a node (PONDRA_TEST_FORMAT=6:
-    this build's format, 5, plus one); and the writes that need formats 2 to 5 (ADR-055, ADR-058, ADR-074)
-    against `old`, the release before (version, binary)."""
+    """The lake's format (ADR-039), this build posing as a later one for a node (PONDRA_TEST_FORMAT=7:
+    this build's format, 6, plus one); and the writes that need formats 2 to 5 (ADR-055, ADR-058, ADR-074)
+    against `old`, the release before (version, binary), this build posing as one that knows only format 5
+    (so the lake doesn't move on to its column lists by itself)."""
     checks, info = {}, {}
     unsealed = {"PONDRA_SECRET_KEY": ""}  # (no shared master key: the lake's keys stay in the clear, so the format moves only for what this check asks)
-    lake, later = os.path.join(work, "format-lake"), {"PONDRA_TEST_FORMAT": "6", **unsealed}
+    lake, later = os.path.join(work, "format-lake"), {"PONDRA_TEST_FORMAT": str(LISTS + 1), **unsealed}
     fmt = lambda n: n.get("/stats", timeout=5)["format"]
     first = Node(new_bin, lake, port, work, env=unsealed, token=False).start()  # makes the lake
-    checks["a lake this build makes has the mark (format 1) from the start, and moves past it only for what needs it"] = until(lambda: fmt(first) == 1, 3, step=0.1)
+    checks["a lake this build makes starts at its tables' column lists (format 6)"] = until(lambda: fmt(first) == LISTS, 3, step=0.1)
     first.q("CREATE TABLE t (x INT)")
     first.q("INSERT INTO t VALUES (1), (2)")
     first.stop()
-    a = Node(new_bin, lake, port, work, env=later, token=False).start()  # leads, and knows format 6
-    b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False).start()  # follows, and knows format 5
+    a = Node(new_bin, lake, port, work, env=later, token=False).start()  # leads, and knows format 7
+    b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False).start()  # follows, and knows format 6
     time.sleep(22)  # (the leader's first two looks: it must not go past what the follower knows)
     info["with a node of each"] = {"leader's": fmt(a), "follower's": fmt(b), "releases": a.get("/stats")["releases"]}
-    checks["a lake moves on only to the newest format every node knows"] = fmt(a) == 1 and fmt(b) == 1
+    checks["a lake moves on only to the newest format every node knows"] = fmt(a) == LISTS and fmt(b) == LISTS
+    checks["…and reads as it did"] = a.q("SELECT count(*) AS n FROM t") == [{"n": 2}] and b.q("SELECT count(*) AS n FROM t") == [{"n": 2}]
     b.stop()
-    checks["…and on again once the node that didn't know the next one has gone"] = until(lambda: fmt(a) == 6, 40)
-    refused = lambda x, n=6: x.p.poll() not in (None, 0) and f"format {n}" in x.said() and "run Pondra" in x.said()
+    checks["…and on again once the node that didn't know the next one has gone"] = until(lambda: fmt(a) == LISTS + 1, 40)
+    refused = lambda x, n=LISTS + 1: x.p.poll() not in (None, 0) and f"format {n}" in x.said() and "run Pondra" in x.said()
     b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False)
     try:  # a node that doesn't know the lake's format: at once, or as soon as its view holds the format
         b.start()
         b.p.wait(20)
     except (Failed, subprocess.TimeoutExpired):
         pass
-    info["a follower that knows format 5 said"] = b.said()[-300:]
+    info["a follower that knows format 6 said"] = b.said()[-300:]
     checks["a node that doesn't know the lake's format refuses it, saying which release it needs"] = refused(b)
     b.stop("kill")
     code, said = cli(new_bin, lake, "SELECT count(*) AS n FROM t", ok=False)
-    checks["…and so does pondra sql"] = code != 0 and "format 6" in said
+    checks["…and so does pondra sql"] = code != 0 and f"format {LISTS + 1}" in said
     a.stop()
     t0 = time.time()
     b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False)
@@ -664,21 +673,21 @@ def format_check(new_bin, work, port, old=None):
     b.stop("kill")
     t1 = time.time()
     a = Node(new_bin, lake, port, work, env=later, token=False).start()
-    info["seconds"] = {"a node of format 5 refused to lead it": round(t1 - t0, 1), "then one of format 6 led it": round(time.time() - t1, 1)}
+    info["seconds"] = {"a node of format 6 refused to lead it": round(t1 - t0, 1), "then one of format 7 led it": round(time.time() - t1, 1)}
     checks["…without holding on to the leader's term: the next node leads at once"] = refused(b) and time.time() - t1 < 10
     checks["the lake reads as it did"] = a.q("SELECT count(*) AS n FROM t") == [{"n": 2}]
     a.stop()
     if old:  # format 2's first need, a view that works its answers out as it is read (ADR-055); format 3's, the lake's own keys sealed; 4's, a grant on another database (ADR-058); 5's, an identity provider (ADR-074)
         v, old_bin = old
-        lake = os.path.join(work, "format-views-lake")
-        n = Node(new_bin, lake, port, work, env=unsealed, token=False).start()
+        lake, five = os.path.join(work, "format-views-lake"), {"PONDRA_TEST_FORMAT": "5"}  # (posing as a build of format 5: no column lists by themselves)
+        n = Node(new_bin, lake, port, work, env={**unsealed, **five}, token=False).start()
         n.q("CREATE TABLE s (k VARCHAR, x DOUBLE)")
         n.q("CREATE MATERIALIZED VIEW totals AS SELECT k, sum(x) AS t FROM s GROUP BY k")
         plain = fmt(n)
         n.q("CREATE MATERIALIZED VIEW means AS SELECT k, avg(x) AS m FROM s GROUP BY k")
         means = fmt(n)
         n.stop()
-        n = Node(new_bin, lake, port, work).start()  # (now with a master key every node shares: its leader seals the lake's own keys)
+        n = Node(new_bin, lake, port, work, env=five).start()  # (now with a master key every node shares: its leader seals the lake's own keys)
         sealed = until(lambda: fmt(n) == 3 and n.get("/stats", timeout=5)["keys"] == "sealed", 40)
         keys = fmt(n)
         n.q(f"ATTACH '{os.path.join(work, 'format-other-lake')}' AS other")
@@ -704,6 +713,43 @@ def format_check(new_bin, work, port, old=None):
             plain == 1 and means == 2 and bool(sealed) and keys == 3 and info["formats"]["a grant on another database"] == 4
             and info["formats"]["an identity provider"] == 5 and refused(o, 5))
         o.stop("kill")
+    return checks, info
+
+
+def guests_check(new_bin, work, port):
+    """`pondra sql` writing on a lake no node serves, which it leads alone (ADR-039): a lake in a local folder moves to this
+    build's column lists (format 6) as it opens, and a lake in a bucket never does (with --s3): a cluster's followers may be
+    serving it in a leader gap, which `pondra sql` can't hear. A bucket's lake moves on only by its server's leader. Each
+    lake is made at format 5 (a build posing as one before the column lists); a node of format 5 then opens it again, or
+    is refused it by name."""
+    checks, info = {}, {}
+    five = {"PONDRA_TEST_FORMAT": "5", "PONDRA_SECRET_KEY": ""}
+    fmt = lambda n: n.get("/stats", timeout=5)["format"]
+    lakes = {"folder": os.path.join(work, "guests-lake")}
+    if A.s3:
+        lakes["bucket"] = f"s3://{os.environ['PONDRA_BUCKET']}/guests-{os.getpid()}-{int(time.time())}"
+    for where, lake in lakes.items():
+        n = Node(new_bin, lake, port, work, env=five, token=False).start()
+        n.q("CREATE TABLE t (x INT NOT NULL, y VARCHAR DEFAULT 'a')")
+        n.q("INSERT INTO t (x) VALUES (1)")
+        made = fmt(n)
+        n.stop()
+        cli(new_bin, lake, "INSERT INTO t (x) VALUES (2)")
+        o = Node(new_bin, lake, port, work, env=five, token=False)
+        try:  # (a node of format 5: it serves a lake still at 5, and refuses one at 6 by name)
+            o.start()
+            got = {"format": fmt(o), "rows": o.q("SELECT x, y FROM t ORDER BY x")}
+        except Failed:
+            got = {"refused": o.said()[-300:]}
+        o.stop("kill")
+        info[where] = {"made at": made, "then": got}
+        if where == "folder":
+            checks["pondra sql writing alone moves a lake in a folder to its tables' column lists (format 6) as it opens: a node of format 5 is then refused it by name"] = \
+                made < LISTS and "format 6" in got.get("refused", "") and "run Pondra" in got.get("refused", "")
+        else:
+            checks["…and never a lake in a bucket, whose cluster's followers it can't hear: it stays at format 5, and a node of format 5 still serves it"] = \
+                made < LISTS and got.get("format") == made and got.get("rows") == [{"x": 1, "y": "a"}, {"x": 2, "y": "a"}]
+            gone(lake)
     return checks, info
 
 
@@ -1217,8 +1263,16 @@ def rolling_check(old_v, old_bin, new_bin, work, port, leader_first=False):
         until(lambda: y.plain("GET", "/ready")[0] == 200, 30)
         live.append(y)
         time.sleep(2)
+        if k == 1:  # (a table made, and a column of it renamed, while nodes of the release before still run: below format 6, they read it)
+            y.q("CREATE TABLE mid (a INT, b VARCHAR)")
+            y.q("INSERT INTO mid VALUES (1, 'x')")
+            y.q("ALTER TABLE mid RENAME COLUMN b TO c")
+            olds = [z for z in live if z.bin == old_bin]
+            info["a table made with a node of each: format, then"] = y.get("/stats", timeout=5)["format"]
+            checks[f"a table this build made (a column renamed) while Pondra {old_v} still runs: that release's nodes read it"] = all(
+                until(lambda: z.q("SELECT a, c FROM mid") == [{"a": 1, "c": "x"}], 20) for z in olds) and y.get("/stats", timeout=5)["format"] < LISTS
         steps[f"{was} {x.port} on the new binary"] = {"longest wait for an ack, s": load.longest(t0 - 0.5), "seconds": round(time.time() - t0, 1)}
-    raised = until(lambda: all(y.get("/stats", timeout=5)["format"] >= 1 for y in live), 60)
+    raised = until(lambda: all(y.get("/stats", timeout=5)["format"] == LISTS for y in live), 60)
     # The next upgrade, from this build: each node drained and its leader stepping down.
     since = time.time()
     for x in sorted(list(live), key=lambda x: role(x) == "leader"):
@@ -1240,7 +1294,8 @@ def rolling_check(old_v, old_bin, new_bin, work, port, leader_first=False):
     checks["every acknowledged batch once, no torn read, through every step"] = not result["lost or twice"] and not result["torn reads"]
     checks["every node answers the same: rows, a keyed table, a view"] = same("SELECT count(*) AS n FROM ev2") and same("SELECT * FROM kv2 ORDER BY k") and same("SELECT * FROM per_producer ORDER BY producer")
     checks["the view equals its rows"] = live[0].q("SELECT * FROM per_producer ORDER BY producer") == live[0].q("SELECT producer, count(*) AS n, max(seq) AS mx FROM ev2 GROUP BY producer ORDER BY producer")
-    checks["the lake moves to this build's format once every node runs it"] = bool(raised)
+    checks["the lake moves to this build's format (6: its tables' column lists) once every node runs it, under load"] = bool(raised)
+    checks["…and the table made before it answers as it did"] = same("SELECT * FROM mid") and live[0].q("SELECT a, c FROM mid") == [{"a": 1, "c": "x"}]
     checks["the leader hears every node say its release (none from before formats)"] = len(info["releases"]) == 3 and "older" not in info["releases"].values()
     checks["restarted a node at a time from this build, no batch waits more than 2 s (drained, the leader stepping down)"] = restarted < 2
     [y.stop() for y in live]
@@ -1266,7 +1321,7 @@ def run(name, results, f, *args):
 def main():
     global A
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("what", nargs="?", default="all", help="any of lakes, format, drain, rolling (comma-separated), or all")
+    ap.add_argument("what", nargs="?", default="all", help="any of lakes, format, drain, rolling, guests (comma-separated), or all")
     ap.add_argument("--new", default=os.path.join(HERE, "..", "target", "release", "pondra"), help="this build's binary")
     ap.add_argument("--from", dest="first", default="0.22.0", help="the oldest release whose lake must open")
     ap.add_argument("--only", default="", help="these releases only (comma-separated); `rolling` upgrades the newest of them")
@@ -1274,10 +1329,10 @@ def main():
     ap.add_argument("--work", default="", help="where lakes and logs go (default: a new temporary folder, removed if every check passes)")
     ap.add_argument("--port", type=int, default=9720)
     ap.add_argument("--verbose", action="store_true", help="what each check measured, passed or not")
-    ap.add_argument("--s3", action="store_true", help="`drain`'s cluster on s3://$PONDRA_BUCKET (AWS_* point at R2, MinIO or tools/sim_r2.py)")
+    ap.add_argument("--s3", action="store_true", help="`drain`'s cluster, and `guests`' second lake, on s3://$PONDRA_BUCKET (AWS_* point at R2, MinIO or tools/sim_r2.py)")
     A = ap.parse_args()
-    parts = {"lakes", "format", "drain", "rolling"} if A.what == "all" else set(A.what.split(","))
-    if unknown := parts - {"lakes", "format", "drain", "rolling"}:
+    parts = {"lakes", "format", "drain", "rolling", "guests"} if A.what == "all" else set(A.what.split(","))
+    if unknown := parts - {"lakes", "format", "drain", "rolling", "guests"}:
         ap.error(f"no such check: {', '.join(sorted(unknown))}")
     new_bin = os.path.abspath(A.new)
     work = A.work or tempfile.mkdtemp(prefix="pondra-upgrade-")
@@ -1294,6 +1349,8 @@ def main():
         ok &= run("format", out, format_check, new_bin, work, A.port, (found[-1][0], binary(*found[-1], A.cache)) if found else None)
     if "drain" in parts:
         ok &= run("drain", out, drain_check, new_bin, work, A.port)
+    if "guests" in parts:
+        ok &= run("guests", out, guests_check, new_bin, work, A.port)
     if "rolling" in parts:
         v, url = found[-1]
         out["rolling"] = {}

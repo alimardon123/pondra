@@ -27,6 +27,8 @@ impl<T> Memo<T> {
         Ok(self.0.get_or_init(|| v).clone())
     }
 
+    /// The value, made by `make` the first time, borrowed from the memo.
+    pub fn get_ref(&self, make: impl FnOnce() -> T) -> &T { self.0.get_or_init(|| Arc::new(make())) }
     /// The value, if it was made.
     pub fn get(&self) -> Option<&Arc<T>> { self.0.get() }
 }

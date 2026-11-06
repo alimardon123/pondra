@@ -565,7 +565,8 @@ crate::per_node!(static GUESSED: Guesses = Guesses::default(); clear = |g| {
 });
 
 /// Seconds to wait before this address may try this user name again, when it has had ten failures in
-/// the last minute (None: it may try). A door that can't tell the address counts under 0.0.0.0.
+/// the last minute (None: it may try). A door that can't tell the address counts under 0.0.0.0. Each node
+/// counts its own, so a cluster of N nodes allows N times the guesses until 1.1 (redesign step 11's shared state).
 pub fn guessing(addr: Option<std::net::IpAddr>, user: &str) -> Option<u64> { GUESSED.guessing_at(addr, user, datafusion::common::instant::Instant::now()) }
 
 /// A failed sign-in of this address and user name, now.
@@ -618,11 +619,154 @@ impl Guesses {
     }
 }
 
+/// A credential as a client sent it, read alike at every door (redesign step 7, piece 1): an `Authorization` header (HTTP,
+/// MCP, Iceberg REST, Delta Sharing, Flight), Kafka's SASL PLAIN, Postgres's password message. It decides no rights: a
+/// door asks `users` and `Auth` whom it signs in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Credential {
+    /// A bearer token: a node's token, a user's (`pt_`), a session (`ps_`), a provider's JWT, a key, a lent token.
+    Token(String),
+    /// A name and a password (which may itself be a token, under any name).
+    Password { user: String, password: String },
+    /// A Bearer or Basic header that can't be read, and why: refused at every door with `Credential::MALFORMED`, never
+    /// taken for no credential.
+    Malformed(&'static str),
+    /// None sent, or a scheme Pondra doesn't read.
+    None,
+}
+
+impl Credential {
+    /// What every door answers a credential it can't read, before why.
+    pub const MALFORMED: &'static str = "the credential can't be read";
+
+    /// An `Authorization` header's value: `Bearer <token>` or `Basic <base64 of name:password>`. The scheme in any case
+    /// (RFC 9110 §11.1), the spaces around its value taken off, Basic's base64 with its padding or without (as ADBC
+    /// sends it), the name ended at the first `:`.
+    pub fn of_header(value: Option<&str>) -> Credential {
+        let Some((scheme, rest)) = value.map(str::trim).and_then(|v| v.split_once(' ')) else {
+            return match value.map(str::trim) {
+                Some(v) if v.eq_ignore_ascii_case("bearer") => Credential::Malformed("a Bearer header with no token"),
+                Some(v) if v.eq_ignore_ascii_case("basic") => Credential::Malformed("a Basic header with no name and password"),
+                _ => Credential::None,
+            };
+        };
+        let rest = rest.trim();
+        if scheme.eq_ignore_ascii_case("bearer") {
+            return match rest {
+                "" => Credential::Malformed("a Bearer header with no token"),
+                t => Credential::Token(t.to_string()),
+            };
+        }
+        if !scheme.eq_ignore_ascii_case("basic") {
+            return Credential::None;
+        }
+        use base64::Engine;
+        let lenient = base64::engine::GeneralPurpose::new(&base64::alphabet::STANDARD, base64::engine::GeneralPurposeConfig::new().with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent));
+        let Ok(bytes) = lenient.decode(rest) else { return Credential::Malformed("a Basic header's value isn't base64") };
+        let Ok(text) = String::from_utf8(bytes) else { return Credential::Malformed("a Basic header's name and password aren't UTF-8") };
+        match text.split_once(':') {
+            Some((user, password)) => Credential::Password { user: user.to_string(), password: password.to_string() },
+            None => Credential::Malformed("a Basic header with no ':' between the name and the password"),
+        }
+    }
+
+    /// A request's `Authorization` header (`of_header`); one that isn't text can't be read.
+    pub fn of_headers(headers: &axum::http::HeaderMap) -> Credential {
+        match headers.get(axum::http::header::AUTHORIZATION).map(|v| v.to_str()) {
+            None => Credential::None,
+            Some(Ok(v)) => Credential::of_header(Some(v)),
+            Some(Err(_)) => Credential::Malformed("an Authorization header that isn't text"),
+        }
+    }
+
+    /// Kafka's SASL PLAIN message (RFC 4616): `authzid NUL name NUL password`.
+    pub fn of_sasl_plain(message: &[u8]) -> Credential {
+        let parts: Vec<&[u8]> = message.split(|b| *b == 0).collect();
+        let [_, user, password] = parts[..] else { return Credential::Malformed("a SASL PLAIN message that isn't authzid, name and password") };
+        match (std::str::from_utf8(user), std::str::from_utf8(password)) {
+            (Ok(user), Ok(password)) => Credential::Password { user: user.to_string(), password: password.to_string() },
+            _ => Credential::Malformed("a SASL PLAIN name and password that aren't UTF-8"),
+        }
+    }
+
+    /// The token, if it is one.
+    pub fn token(&self) -> Option<&str> {
+        match self {
+            Credential::Token(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// The name a password came with (who tried, for the audit and the guess count).
+    pub fn user(&self) -> Option<&str> {
+        match self {
+            Credential::Password { user, .. } => Some(user),
+            _ => None,
+        }
+    }
+
+    /// The secret itself: a token, or a password (which may be a token).
+    pub fn secret(&self) -> Option<&str> {
+        match self {
+            Credential::Token(t) => Some(t),
+            Credential::Password { password, .. } => Some(password),
+            _ => None,
+        }
+    }
+
+    /// What a door answers it when it can't be read (`MALFORMED`, and why).
+    pub fn malformed(&self) -> Option<String> {
+        match self {
+            Credential::Malformed(why) => Some(format!("{}: {why}", Credential::MALFORMED)),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_credential_is_read_alike_at_every_door() {
+        use Credential::*;
+        let pw = |u: &str, p: &str| Password { user: u.into(), password: p.into() };
+        let b64 = |s: &str| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(s)
+        };
+        let cases: Vec<(String, Credential)> = vec![
+            ("Bearer pt_abc".into(), Token("pt_abc".into())),
+            ("bearer pt_abc".into(), Token("pt_abc".into())), // (the scheme in any case)
+            ("BEARER   pt_abc  ".into(), Token("pt_abc".into())),
+            (format!("Basic {}", b64("ann:secret")), pw("ann", "secret")),
+            (format!("basic {}", b64("ann:secret").trim_end_matches('=')), pw("ann", "secret")), // (no padding: ADBC)
+            (format!("Basic {}", b64("ann:a:b")), pw("ann", "a:b")), // (the name ends at the first ':')
+            (format!("Basic {}", b64(":tok")), pw("", "tok")),
+            ("Bearer".into(), Malformed("a Bearer header with no token")),
+            ("Bearer   ".into(), Malformed("a Bearer header with no token")),
+            ("Basic".into(), Malformed("a Basic header with no name and password")),
+            ("Basic %%%".into(), Malformed("a Basic header's value isn't base64")),
+            (format!("Basic {}", b64("ann")), Malformed("a Basic header with no ':' between the name and the password")),
+            ("Digest x=1".into(), None),
+            ("Token abc".into(), None),
+            ("".into(), None),
+        ];
+        for (header, want) in cases {
+            assert_eq!(Credential::of_header(Some(&header)), want, "{header:?}");
+        }
+        assert_eq!(Credential::of_header(Option::None), None);
+        // (one name and password, as each door's wire carries it, is one credential)
+        let http = Credential::of_header(Some(&format!("Basic {}", b64("ann:pässword")))); // (HTTP and Flight Basic)
+        let kafka = Credential::of_sasl_plain(b"\0ann\0p\xc3\xa4ssword");
+        let pg = pw("ann", "pässword"); // (Postgres's password message is the password; the name is the startup's)
+        assert_eq!((&http, &kafka), (&pg, &pg));
+        assert_eq!(Credential::of_sasl_plain(b"ann\0secret"), Malformed("a SASL PLAIN message that isn't authzid, name and password"));
+        assert_eq!(Credential::of_sasl_plain(b"\0ann\0\xff"), Malformed("a SASL PLAIN name and password that aren't UTF-8"));
+        assert_eq!(Malformed("x").malformed().as_deref(), Some("the credential can't be read: x"));
+    }
 
     fn ip(last: u8) -> Option<IpAddr> { Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))) }
 

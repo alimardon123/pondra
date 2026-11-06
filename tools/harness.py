@@ -10759,6 +10759,7 @@ def users():
     boss = basic("boss", "boss-password-1")
     # Open, until a user who signs in exists; then nothing without a sign-in (no token is set)
     opened = as_(A.port, None, "SELECT 1 AS x")
+    unreadable_open = as_(A.port, "Basic !!!", "SELECT 1 AS x")  # (before: taken for no sign-in, an open node's admin)
     open_pg = psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=anyone dbname=lake", connect_timeout=10, autocommit=True)  # (made while the lake is open)
     open_said = [open_pg.execute("SELECT 1 AS x").fetchall()]
     for q in ["CREATE SCHEMA sales", "CREATE TABLE sales.orders (id BIGINT, item VARCHAR, amount DOUBLE, card VARCHAR)", "INSERT INTO sales.orders VALUES (1, 'tea', 2.5, '4111'), (2, 'cake', 4.0, '5500')",
@@ -10950,6 +10951,37 @@ def users():
             return f"ERROR {e}"
     flight_said = [bearer[1].decode().startswith("Bearer ps_"), fsql("SELECT item FROM sales.orders ORDER BY id"), fsql("SELECT card FROM sales.orders")]
     checks["Flight: a handshake with a user's name and password gives a session; held to the grants"] = flight_said[0] and flight_said[1] == [{"item": "tea"}, {"item": "cake"}] and "permission denied" in flight_said[2]
+    # …and a user's token gives the token itself, checked at every call, so once dropped it signs nothing in (11-06 audit H2)
+    tok3 = as_(A.port, boss, "CREATE TOKEN fl FOR USER svc")["token"]
+    shaken = client.authenticate_basic_token("svc", tok3)
+    def tsql(q, h=fl.FlightCallOptions(headers=[shaken])):
+        try:
+            info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": q})), h)
+            return client.do_get(info.endpoints[0].ticket, h).read_all().to_pylist()
+        except Exception as e:
+            return f"ERROR {e}"
+    token_said = [shaken[1].decode() == "Bearer " + tok3, tsql("SELECT salary FROM hr")]
+    as_(A.port, boss, "DROP TOKEN fl FOR svc")
+    token_said.append(tsql("SELECT salary FROM hr"))
+    shown_info["flight token"] = token_said
+    checks["Flight: a handshake with a user's token hands back that token, so a dropped one signs nothing in"] = token_said[:2] == [True, [{"salary": 100.0}]] and str(token_said[2]).startswith("ERROR")
+    # A credential that can't be read (`auth::Credential`): refused by name, the same words at HTTP, MCP and Flight, and
+    # at an open node too, never taken for no sign-in
+    def flight_unreadable(header):
+        try:
+            c = fl.FlightClient(f"grpc://127.0.0.1:{A.port + 30}")
+            c.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": "SELECT 1 AS x"})), fl.FlightCallOptions(headers=[(b"authorization", header)]))
+            return "answered"
+        except Exception as e:
+            return f"ERROR {e}"
+    no_colon = "Basic " + base64.b64encode(b"ann").decode()
+    unreadable = [as_(A.port, h, "SELECT 1 AS x") for h in ("Basic !!!", "Bearer", no_colon)] + \
+        [as_(A.port, "Basic !!!", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), path="/mcp")] + \
+        [flight_unreadable(h) for h in (b"Basic !!!", b"Bearer", no_colon.encode())]
+    shown_info["unreadable"] = [str(r)[:160] for r in [unreadable_open] + unreadable]
+    checks["a credential that can't be read is refused by name at HTTP, MCP and Flight, at an open node too"] = \
+        all("the credential can't be read" in str(r) for r in [unreadable_open] + unreadable) \
+        and all(str(r).startswith("ERROR 401") for r in [unreadable_open] + unreadable[:4])
     # MCP: a listing shows what a user may read; changes (a stream of rows, every column, as /watch's) is refused without them
     def tool_result(name, args):
         out = as_(A.port, ann, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}), path="/mcp")
@@ -11187,7 +11219,8 @@ def _lake_keys():
                 except OSError:
                     pass
         return False
-    # A lake made with a master key every node shares: its keys sealed from the first write (format 3)
+    # A lake made with a master key every node shares: its keys sealed from the first write (format 3, or 6 once its
+    # leader has raised it to its tables' column lists, `format::LISTS`)
     k1 = {"PONDRA_SECRET_KEY": "keys-master-1"}
     lake = new_lake()
     a = Node(lake, A.port, env=k1).start()
@@ -11197,7 +11230,7 @@ def _lake_keys():
     z = z_of(lake, k1)
     info["made sealed"] = {"keys": kept, "format": stats(A.port).get("format"), "z/": z[:300]}
     checks["a lake made with a master key every node shares has its own keys sealed from its first write (format 3): nothing of them in the clear in its files"] = \
-        kept == "sealed" and stats(A.port).get("format") == 3 and '"sealed"' in z and "pn_" not in z and not in_files(lake)
+        kept == "sealed" and stats(A.port).get("format") >= 3 and '"sealed"' in z and "pn_" not in z and not in_files(lake)
     # A follower with the same key opens them and writes through the leader; another key can't open them
     b = Node(lake, A.port + 1, env=k1).start()
     unsigned = as_(A.port + 1, None, "SELECT count(*) AS n FROM t")  # (its mirror may be seeded before the user was flushed: never open for that)
@@ -11280,7 +11313,7 @@ def _lake_keys():
                             "a branch's key from before: pinned, renews, lets go": [str(pinned)[:160], str(old_renews)[:160], str(old_lets_go)[:300]],
                             "a branch's key given after: new, lets go": [new_branch_key != old_branch_key, str(new_lets_go)[:160]]}
     checks["a lake whose keys are in the clear (no shared master key: its files show them) has them sealed when its leader starts with one, made new: the old nodes' key and a session from before, readable from the bucket, sign in no more, and a new sign-in does"] = \
-        clear == "clear" and seen is True and isinstance(before, int) and before < 3 and kept == "sealed" and after == 3 and '"sealed"' in z_of(lake2, k1) \
+        clear == "clear" and seen is True and isinstance(before, int) and kept == "sealed" and after >= 3 and '"sealed"' in z_of(lake2, k1) \
         and str(still).startswith("ERROR 401") and again == [{"n": 1}] and old_signed == [{"n": 1}] and str(old_after).startswith("ERROR 401")
     checks["a branch's key given while the keys were in the clear (anyone who copied them could make it) renews its pin after sealing (and gets no new key for it) and never lets it go; the key given after does (11-01 audit L12)"] = \
         old_branch_key.startswith("pb_") and isinstance(old_renews, dict) and old_renews.get("pinned") == elsewhere and "key" not in old_renews \
@@ -11389,7 +11422,7 @@ def sealed():
     fmt = stats(A.port, t1).get("format")
     info["sealed from the first write"] = {"keys": kept, "format": fmt, "carol": carol}
     checks["with only an admin token, a new lake's own keys are sealed from its first write: nothing of them in the clear in its files"] = \
-        kept == "sealed" and fmt == 3 and not in_files(lake)
+        kept == "sealed" and fmt >= 3 and not in_files(lake)
     # 2. A secret made on one node is used on another with only the admin token, each with its own machine key
     n2 = node(lake, A.port + 1, token=T1, home=own_home()); nodes.append(n2)
     ask(A.port, t1, f"CREATE SECRET rates (TYPE http, BEARER_TOKEN 'tok-123456', SCOPE '{url}')")
