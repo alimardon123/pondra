@@ -3143,6 +3143,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    whose grant on this whole lake would cover it). AT's value is read in the querying lake's words. A plain view AT is
    refused by name (0A000), not "no table" (11-03 audit L7). `harness.py schemas`
 
+476. **An INSERT without a column list takes the order it was placed by to the leader** (`log::placed_for`). Each node fills
+   such an INSERT by its own catalog (`write::in_sql_order`), which follows the leader's a moment late, so a node that hadn't
+   seen `ALTER COLUMN b FIRST` yet filled the old order. Its rows (`log::Part::placed`) and files (`write::Files`) carry
+   `TableMeta::placed` (the stored columns in SQL's order: a move, an added or a dropped column changes it, a rename doesn't),
+   and the leader refuses them with 40001 when the table's is another (`Ack::moved`, `write::record`): run again, by the new
+   order. A page's staged INSERT sends its own (`server::insert_staged`). Named columns carry none (11-03 audit M9).
+   `cargo test --lib store::tests::placed`; `harness.py colorder`
+
 ```bash
 cargo build --release
 cargo test --release --lib [filter]     # unit tests (the tests are the library's; --bin pondra runs none)

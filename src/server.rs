@@ -926,7 +926,7 @@ async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> R
 /// file lost on the way (or swept: `tier::collect_orphans`) is a refusal, never a quiet loss of its rows.
 async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<Json<Value>, E> {
     #[derive(Deserialize)]
-    struct Staged { columns: Vec<String>, files: u64 }
+    struct Staged { columns: Vec<String>, files: u64, #[serde(default)] placed: Option<u64> }
     ensure!(!app.members.reader(), "read-only node");
     let who = crate::auth::current().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None));
     let Some(slug) = crate::auth::slug(&who) else { return Err(crate::codes::coded("42501", "a staged INSERT is a user's: its sign-in has no name to stage under").into()) };
@@ -934,7 +934,7 @@ async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<J
         return Err(crate::codes::coded("22023", "a staged INSERT's job is letters, digits and hyphens, 64 at most").into()); // (invalid_parameter_value)
     }
     crate::auth::check_rows(name)?; // (its INSERT grant, as SQL's)
-    let Staged { columns, files } = serde_json::from_str(body)?;
+    let Staged { columns, files, placed } = serde_json::from_str(body)?;
     if files > crate::write::STAGED_FILES_MOST {
         return Err(crate::codes::coded("54000", format!("a staged INSERT takes {} files at most, and this one says {files}", crate::write::STAGED_FILES_MOST)).into());
     }
@@ -952,7 +952,12 @@ async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<J
     let url = format!("{}/stage/{slug}/{job}/*.parquet", app.lake.url.trim_end_matches('/')).replace('\'', "''");
     let stmt = crate::write::Stmt::InsertInto(name.to_string(), columns, format!("SELECT {} FROM '{url}'", picks.join(", ")));
     app.auth.allows(who.role, &stmt)?;
-    let out = crate::write::on_node_as(app, stmt, Some(format!("staged:{slug}:{job}")), true).await;
+    // (the page's INSERT without a column list: the order it put the values by, which the leader checks, `log::placed_for`)
+    let placed = match (placed, crate::ddl::resolve(&app.lake, name).await) {
+        (Some(p), Ok((None, table))) => Some((table, p)),
+        _ => None,
+    };
+    let out = crate::log::placed_as(placed, crate::write::on_node_as(app, stmt, Some(format!("staged:{slug}:{job}")), true)).await;
     unstage.now().await; // (before the answer, so a resend of the same job stages afresh)
     Ok(Json(out?))
 }

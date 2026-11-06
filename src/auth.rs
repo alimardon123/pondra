@@ -633,7 +633,7 @@ mod tests {
         use crate::log::{Flush, Part};
         let flush = |path: &str, table: Option<&str>| Flush {
             path: path.into(),
-            parts: table.map(|t| Part { table: t.into(), off: 0, len: 0, rows: 0, src: None }).into_iter().collect(),
+            parts: table.map(|t| Part { table: t.into(), off: 0, len: 0, rows: 0, src: None, placed: None }).into_iter().collect(),
             ..Default::default()
         };
         let mine = ["data/orders/a.parquet".to_string()];
