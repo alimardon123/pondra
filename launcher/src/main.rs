@@ -49,11 +49,26 @@ fn library_name() -> &'static str {
     }
 }
 
+/// Cargo's version as a wheel names it (PEP 440, as `tools/package.py`'s `python_version`): a release candidate
+/// 0.80.0-rc.1 is 0.80.0rc1, -alpha.N aN and -beta.N bN; anything else as it is.
+fn python_version(version: &str) -> String {
+    let Some((base, pre)) = version.split_once('-') else { return version.to_string() };
+    for (word, short) in [("alpha", "a"), ("beta", "b"), ("rc", "rc"), ("a", "a"), ("b", "b")] {
+        if let Some(n) = pre.strip_prefix(word).map(|n| n.strip_prefix('.').unwrap_or(n)) {
+            if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
+                return format!("{base}{short}{n}");
+            }
+        }
+    }
+    version.to_string()
+}
+
 /// Every place the library is looked for, in order, whether or not it is there: beside the program, then
 /// the site-packages folders a scripts folder can belong to. A site folder counts only with its own
-/// `pondra-<version>.dist-info`, so two Pythons in one prefix never mix versions.
+/// `pondra-<version>.dist-info` (the version as the wheel names it), so two Pythons in one prefix never mix versions.
 fn places(exe_dir: &Path, version: &str) -> Vec<PathBuf> {
     let name = library_name();
+    let version = python_version(version);
     let mut places = vec![exe_dir.join(name)];
     // `parent`, not `..`: a path with `..` in it isn't normalised, and the folders are named the same
     // way on every platform.
@@ -259,6 +274,20 @@ mod tests {
         tree.dir("prefix/lib/python3.12/site-packages/pondra-0.33.0.dist-info");
         let library = tree.file(&in_wheel("prefix/lib/python3.12/site-packages"));
         assert_eq!(candidates(&bin, V, None), vec![library]);
+    }
+
+    #[test]
+    fn finds_a_release_candidates_wheel_by_its_python_name() {
+        // (pip names a candidate's dist-info as PEP 440 writes its version: 0.80.0rc1, not Cargo's 0.80.0-rc.1)
+        let tree = Tree::new("candidate");
+        let bin = tree.dir("venv/bin");
+        tree.dir("venv/lib/python3.12/site-packages/pondra-0.80.0rc1.dist-info");
+        let library = tree.file(&in_wheel("venv/lib/python3.12/site-packages"));
+        assert_eq!(candidates(&bin, "0.80.0-rc.1", None), vec![library]);
+        assert_eq!(
+            ["0.80.0", "0.80.0-rc.1", "1.0.0-alpha.2", "1.0.0-beta.3", "1.0.0-rc2", "1.0.0-dev"].map(python_version),
+            ["0.80.0", "0.80.0rc1", "1.0.0a2", "1.0.0b3", "1.0.0rc2", "1.0.0-dev"]
+        );
     }
 
     #[test]
