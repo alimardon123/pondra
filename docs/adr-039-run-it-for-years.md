@@ -143,6 +143,13 @@ stop, and a 24-hour soak (C4). Where things stood:
   to this build's format as it opens (`format::alone`), and never a lake in a bucket, whose
   cluster's followers it can't hear in a leader gap. A bucket's lake moves on only by its server's
   leader. `upgrade_check.py guests` ("…and never a lake in a bucket", with `--s3`).
+- **Below a format, nothing an older node reads is in the newer shape.** A table's entry is written
+  in the shape it was read in, and a new one in the older shape, until its lake is format 6
+  (`store::Record`; `Catalog::write` gives each `t/` entry its lake's shape as it commits). That
+  covers what a 0.80 node reads beyond the entries: a dropped table's record (`dt/`) and what one
+  node hands another (a tier job, a filing, a query's tables). `upgrade_check.py rolling`. This is
+  the rule for upgrades from 0.80, not the end state: the release that no longer upgrades a lake
+  from 0.80 writes every entry as its list and drops format 5's encoder.
 - **Every release's lake since 0.22 opens in this build and answers as it did**
   (`upgrade_check.py lakes`, `upgrade.yml` on every pull request).
 - **A node told to stop drains** (`drain.rs`): not ready, new requests turned away to be
