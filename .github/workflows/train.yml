@@ -10,7 +10,9 @@ name: train
 # half tested alone, so one pull request can't hold the others for long. A pull request labelled in the first five
 # minutes of a train's run joins it (the train is cut again); one labelled later rides a car stacked on the train, its
 # merges on the train's tip with a run of their own, and lands right after it. A pull request whose workflows aren't
-# main's can't ride (the workflow's token may not push a workflow): it takes `ci` as before.
+# main's can't ride (the workflow's token may not push a workflow): it takes `ci` as before. A release branch's pull
+# request (release/0.80) labelled `train` rides no train: labelled `ci` too, it is merged once its own run is green on
+# the branch's head, and the branch's run is started then.
 #
 # A run steps on a `train` label, at the end of every build run, every 15 minutes, and by hand. The train's own build
 # run ends without starting one (GitHub starts no workflow_run for a run the workflow's token began) and the schedule
