@@ -285,6 +285,10 @@ impl Node {
         let replica = if !lives || reader || crate::memory::in_memory(&dir) { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr)?)?) }; // (a lake in memory has no followers to hold changes for; a guest is on no network)
         let app = node::start_app(lake.clone(), cluster.clone(), replica.clone(), &start).await?;
         tr("the app");
+        if leader && !lives {
+            // (a guest that leads its lake runs no leader's loop to raise it, `format::raise`: it moves on as it opens)
+            crate::format::alone(&lake).await.unwrap_or_else(|e| eprintln!("the lake's format: {e:#}"));
+        }
         // A door whose port is taken stops the start, as HTTP's does: beside a Postgres on 5432, psql would
         // otherwise talk to that one. (Each door binds again a moment later; handing it this listener is cleaner.)
         for (flag, door) in [("pg", &pg), ("kafka", &kafka), ("flight", &flight)] {

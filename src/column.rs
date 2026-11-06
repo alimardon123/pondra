@@ -43,6 +43,8 @@ impl Columns {
         Columns { by_id, sql }
     }
 
+    /// The list as it is kept (`store::Stored`): every column by id, and SQL's order as places in it (`places`).
+    pub fn from_parts(by_id: Vec<Column>, sql: Vec<usize>) -> Columns { Columns { by_id, sql } }
     /// The live columns in SQL's order.
     pub fn sql(&self) -> impl Iterator<Item = &Column> { self.sql.iter().map(|i| &self.by_id[*i]) }
 
@@ -73,16 +75,23 @@ impl Columns {
 /// comes last. A name in `first` that isn't a live column, or is there twice, is passed over. The one place this order is
 /// worked out: `Columns::new` and the entry's own `in_order` both take it from here.
 pub fn sql_places(stored: &[(String, String)], dropped: impl Fn(&str) -> bool, first: &[String]) -> Vec<usize> {
-    let mut taken: Vec<bool> = stored.iter().map(|(c, _)| dropped(c)).collect();
-    let mut places = Vec::with_capacity(stored.len());
-    for s in first {
-        if let Some(i) = stored.iter().position(|(c, _)| c == s).filter(|i| !taken[*i]) {
+    let first: Vec<usize> = first.iter().filter_map(|s| stored.iter().position(|(c, _)| c == s)).collect();
+    places(stored.len(), |i| dropped(&stored[i].0), &first)
+}
+
+/// `sql_places` from places: of `n` columns in stored order, those at `first` (live, once each) come first in that order,
+/// then the other live ones as stored. A list that keeps SQL's order by ids (`store::Stored`) takes its order from here.
+pub fn places(n: usize, dropped: impl Fn(usize) -> bool, first: &[usize]) -> Vec<usize> {
+    let mut taken: Vec<bool> = (0..n).map(&dropped).collect();
+    let mut out = Vec::with_capacity(n);
+    for &i in first {
+        if i < n && !taken[i] {
             taken[i] = true;
-            places.push(i);
+            out.push(i);
         }
     }
-    places.extend((0..stored.len()).filter(|i| !taken[*i]));
-    places
+    out.extend((0..n).filter(|i| !taken[*i]));
+    out
 }
 
 #[cfg(test)]

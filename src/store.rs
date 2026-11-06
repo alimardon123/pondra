@@ -54,9 +54,13 @@ impl std::fmt::Display for Changed {
 }
 impl std::error::Error for Changed {}
 
-/// A table's columns as it is made (`TableMeta::made`): the entry keeps them as its own, so a writer outside store.rs
-/// hands them over here, or edits them through the column edits (`TableMeta::add_column` and the rest). By stored name.
-#[derive(Default)]
+/// A table's column fields by stored name: what a writer outside store.rs hands over to make an entry (`TableMeta::made`),
+/// what an entry below lake format 6 stores, and what the column edits work on (`TableMeta::edit`).
+///
+/// INTERIM (redesign 1b, piece 6b-2): an entry is in one of two shapes, these fields or the list (`Stored`), and an edit
+/// of a list-shaped entry goes through these and back. Piece 6b-3 makes the list the only shape in memory, these fields
+/// only the encoding a format-5 lake is written in, and the edits work on the list itself.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Made {
     pub columns: Vec<(String, String)>,
     pub names: BTreeMap<String, String>,
@@ -69,10 +73,335 @@ pub struct Made {
     pub sql_types: BTreeMap<String, String>,
 }
 
+impl Made {
+    fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.names.get(stored).map_or(stored, String::as_str) }
+
+    fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<crate::types::Enum>) -> String {
+        let taken = |s: &str| self.columns.iter().any(|(n, _)| n == s);
+        let stored = (1..).map(|i| if i == 1 { name.to_string() } else { format!("{name}~{i}") }).find(|s| !taken(s)).expect("a free name");
+        if stored != name {
+            self.names.insert(stored.clone(), name.to_string());
+        }
+        if let Some(e) = labels {
+            self.enums.insert(stored.clone(), e); // (ALTER TABLE … ADD COLUMN c mood)
+        }
+        if let Some(t) = held {
+            self.sql_types.insert(stored.clone(), t); // (ALTER TABLE … ADD COLUMN c UUID)
+        }
+        self.columns.push((stored.clone(), dtype.to_string()));
+        stored
+    }
+
+    fn rename_column(&mut self, stored: &str, to: &str) {
+        match to == stored {
+            true => self.names.remove(stored),
+            false => self.names.insert(stored.to_string(), to.to_string()),
+        };
+    }
+
+    fn drop_column(&mut self, stored: &str) {
+        self.names.remove(stored);
+        self.dropped.push(stored.to_string());
+    }
+
+    fn retype_column(&mut self, stored: &str, dtype: String) {
+        if let Some(c) = self.columns.iter_mut().find(|(c, _)| c == stored) {
+            c.1 = dtype;
+        }
+    }
+
+    fn hold_column(&mut self, stored: &str, held: Option<String>) {
+        match held {
+            Some(t) => _ = self.sql_types.insert(stored.to_string(), t),
+            None => {
+                self.sql_types.remove(stored);
+                self.enums.remove(stored);
+            }
+        }
+    }
+
+    fn set_order(&mut self, stored: Vec<String>) {
+        let as_stored: Vec<&str> = self.columns.iter().map(|(s, _)| s.as_str()).filter(|s| !self.dropped.iter().any(|d| d == s) && *s != "_deleted").collect();
+        self.shown = match as_stored.starts_with(&stored.iter().map(String::as_str).collect::<Vec<_>>()) {
+            true => vec![],
+            false => stored,
+        };
+    }
+
+    fn set_default(&mut self, stored: &str, expr: Option<String>) {
+        match expr {
+            Some(e) => _ = self.defaults.insert(stored.to_string(), e),
+            None => _ = self.defaults.remove(stored),
+        }
+    }
+
+    fn set_not_null(&mut self, stored: &str, not_null: bool) {
+        self.not_null.retain(|c| c != stored);
+        if not_null {
+            self.not_null.push(stored.to_string());
+        }
+    }
+}
+
+/// One column of a table as its entry stores it from lake format 6 (redesign 1b, piece 6b): its id (its Parquet field id,
+/// its stored place + 1) and every fact about it, where before format 6 each fact was a map of its own by stored name.
+/// Written as `[name, type]`, then `"not null"` and `"dropped"` when they hold, then an object of the facts that aren't
+/// at their default (`Facts`), so the list is no bigger than format 5's fields (`entry_size`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Col {
+    pub id: u32,
+    /// The name SQL knows it by.
+    pub name: String,
+    /// The name its files and the log hold it under, when it was renamed (otherwise `name`).
+    pub stored: Option<String>,
+    /// Its Arrow type, as text.
+    pub dtype: String,
+    pub dropped: bool,
+    pub not_null: bool,
+    /// `DEFAULT expr`, the SQL expression.
+    pub default: Option<String>,
+    pub identity: Option<crate::seq::Identity>,
+    /// The type a text column is held as (uuid, json, varchar(n): `types.rs`).
+    pub held: Option<String>,
+    /// An enum column's labels and type.
+    pub labels: Option<crate::types::Enum>,
+}
+
+/// A table's columns as its entry stores them from lake format 6: every column, dropped ones too, in field-id order, and
+/// SQL's order of them by id when it isn't the stored one (before format 6, `shown`). Written as `[columns]`, or
+/// `[columns, order]` when a column was moved; a column's id only where it isn't its place + 1.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Stored {
+    pub columns: Vec<Col>,
+    pub order: Vec<u32>,
+}
+
+const NOT_NULL: &str = "not null";
+const DROPPED: &str = "dropped";
+
+/// A column's facts past its name, type and flags, as its entry writes them: each left out at its default (the id too,
+/// where it is the column's place + 1). (A missing one reads as None: no `default`, which would ask `Default` of each.)
+#[derive(Serialize, Deserialize)]
+struct Facts<S, I, E> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stored: Option<S>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default: Option<S>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<I>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    held: Option<S>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<E>,
+}
+
+/// A column at its place in the list, for writing: its id is written only when it isn't `place`.
+struct At<'a>(&'a Col, u32);
+
+impl Serialize for At<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let (c, place) = (self.0, self.1);
+        let facts = Facts { id: (c.id != place).then_some(c.id), stored: c.stored.as_ref(), default: c.default.as_ref(), identity: c.identity.as_ref(), held: c.held.as_ref(), labels: c.labels.as_ref() };
+        let any = facts.id.is_some() || c.stored.is_some() || c.default.is_some() || c.identity.is_some() || c.held.is_some() || c.labels.is_some();
+        let mut seq = s.serialize_seq(Some(2 + c.not_null as usize + c.dropped as usize + any as usize))?;
+        seq.serialize_element(&c.name)?;
+        seq.serialize_element(&c.dtype)?;
+        if c.not_null {
+            seq.serialize_element(NOT_NULL)?;
+        }
+        if c.dropped {
+            seq.serialize_element(DROPPED)?;
+        }
+        if any {
+            seq.serialize_element(&facts)?;
+        }
+        seq.end()
+    }
+}
+
+impl Serialize for Stored {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        struct Cols<'a>(&'a [Col]);
+        impl Serialize for Cols<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> { s.collect_seq(self.0.iter().zip(1..).map(|(c, place)| At(c, place))) }
+        }
+        let mut seq = s.serialize_seq(Some(1 + !self.order.is_empty() as usize))?;
+        seq.serialize_element(&Cols(&self.columns))?;
+        if !self.order.is_empty() {
+            seq.serialize_element(&self.order)?;
+        }
+        seq.end()
+    }
+}
+
+/// What follows a column's name and type: a flag, or its facts.
+enum Rest {
+    NotNull,
+    Dropped,
+    Facts(Facts<String, crate::seq::Identity, crate::types::Enum>),
+}
+
+impl<'de> Deserialize<'de> for Rest {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Rest, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Rest;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "\"{NOT_NULL}\", \"{DROPPED}\" or a column's facts") }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Rest, E> {
+                match v {
+                    NOT_NULL => Ok(Rest::NotNull),
+                    DROPPED => Ok(Rest::Dropped),
+                    _ => Err(E::unknown_variant(v, &[NOT_NULL, DROPPED])),
+                }
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, m: M) -> std::result::Result<Rest, M::Error> { Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(m)).map(Rest::Facts) }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl<'de> Deserialize<'de> for Col {
+    /// A column as `At` writes it, its id 0 when the list gives it none (`Stored` gives it its place's).
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Col, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Col;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("a column: [name, type, flags…, facts]") }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Col, A::Error> {
+                use serde::de::Error;
+                let name = seq.next_element::<String>()?.ok_or_else(|| A::Error::invalid_length(0, &self))?;
+                let dtype = seq.next_element::<String>()?.ok_or_else(|| A::Error::invalid_length(1, &self))?;
+                let mut c = Col { name, dtype, ..Default::default() };
+                while let Some(r) = seq.next_element::<Rest>()? {
+                    match r {
+                        Rest::NotNull => c.not_null = true,
+                        Rest::Dropped => c.dropped = true,
+                        Rest::Facts(f) => {
+                            c.id = f.id.unwrap_or_default();
+                            (c.stored, c.default, c.identity, c.held, c.labels) = (f.stored, f.default, f.identity, f.held, f.labels);
+                        }
+                    }
+                }
+                Ok(c)
+            }
+        }
+        d.deserialize_seq(V)
+    }
+}
+
+impl<'de> Deserialize<'de> for Stored {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Stored, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Stored;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("a table's columns: [columns] or [columns, order]") }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Stored, A::Error> {
+                let mut columns: Vec<Col> = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let order = seq.next_element()?.unwrap_or_default();
+                for (c, place) in columns.iter_mut().zip(1..) {
+                    if c.id == 0 {
+                        c.id = place;
+                    }
+                }
+                Ok(Stored { columns, order })
+            }
+        }
+        d.deserialize_seq(V)
+    }
+}
+
+impl Stored {
+    /// The list from the fields by stored name. Facts for a name no column has are passed over, as every reader did.
+    pub fn of(m: &Made) -> Stored {
+        let columns = m
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, (s, t))| Col {
+                id: i as u32 + 1,
+                name: m.name_of(s).to_string(),
+                stored: m.names.contains_key(s).then(|| s.clone()),
+                dtype: t.clone(),
+                dropped: m.dropped.contains(s),
+                not_null: m.not_null.contains(s),
+                default: m.defaults.get(s).cloned(),
+                identity: m.identity.get(s).cloned(),
+                held: m.sql_types.get(s).cloned(),
+                labels: m.enums.get(s).cloned(),
+            })
+            .collect();
+        let order = m.shown.iter().filter_map(|s| m.columns.iter().position(|(c, _)| c == s)).map(|i| i as u32 + 1).collect();
+        Stored { columns, order }
+    }
+
+    /// The fields by stored name from the list: `of`'s inverse (the dropped and NOT NULL columns in id order).
+    pub fn fields(&self) -> Made {
+        let mut m = Made { columns: Vec::with_capacity(self.columns.len()), ..Default::default() };
+        for c in &self.columns {
+            let s = c.stored.as_ref().unwrap_or(&c.name);
+            m.columns.push((s.clone(), c.dtype.clone()));
+            if c.stored.is_some() {
+                m.names.insert(s.clone(), c.name.clone());
+            }
+            if c.dropped {
+                m.dropped.push(s.clone());
+            }
+            if c.not_null {
+                m.not_null.push(s.clone());
+            }
+            if let Some(d) = &c.default {
+                m.defaults.insert(s.clone(), d.clone());
+            }
+            if let Some(i) = &c.identity {
+                m.identity.insert(s.clone(), i.clone());
+            }
+            if let Some(t) = &c.held {
+                m.sql_types.insert(s.clone(), t.clone());
+            }
+            if let Some(e) = &c.labels {
+                m.enums.insert(s.clone(), e.clone());
+            }
+        }
+        m.shown = self.order.iter().filter_map(|id| self.columns.get((*id as usize).checked_sub(1)?)).map(|c| c.stored.as_ref().unwrap_or(&c.name).clone()).collect();
+        m
+    }
+
+    /// The list for readers (`column.rs`): each column by id, SQL's order as places.
+    fn column_list(&self) -> crate::column::Columns {
+        let by_id = self.columns.iter().map(|c| crate::column::Column { id: c.id, name: c.name.clone(), stored: c.stored.as_ref().unwrap_or(&c.name).clone(), dtype: c.dtype.clone(), dropped: c.dropped }).collect();
+        let first: Vec<usize> = self.order.iter().filter_map(|id| (*id as usize).checked_sub(1)).collect();
+        let sql = crate::column::places(self.columns.len(), |i| self.columns[i].dropped, &first);
+        crate::column::Columns::from_parts(by_id, sql)
+    }
+}
+
+/// An entry's `columns` below format 6: always written, even with no columns (a 0.80 node needs the field), and absent
+/// from a format-6 entry, which keeps its list (`Stored`) instead. A new entry starts with none.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(transparent)]
+struct OldColumns(Option<Vec<(String, String)>>);
+impl Default for OldColumns {
+    fn default() -> Self { OldColumns(Some(vec![])) }
+}
+impl OldColumns {
+    fn absent() -> Self { OldColumns(None) }
+    fn is_absent(&self) -> bool { self.0.is_none() }
+}
+
 /// A table: columns, the Parquet files already tiered, and the last log segment they cover.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct TableMeta {
-    columns: Vec<(String, String)>, // (name, Arrow type such as "Int64" or "Utf8")
+    /// Below format 6, the columns (stored name, Arrow type such as "Int64" or "Utf8") and the eight fields of facts by
+    /// stored name below; from format 6, `list` instead (`Stored`). One or the other: read through the accessors
+    /// (`columns()` and the rest), changed through the column edits (`edit`).
+    #[serde(rename = "columns", default = "OldColumns::absent", skip_serializing_if = "OldColumns::is_absent")]
+    o_columns: OldColumns,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    list: Option<Stored>,
     #[serde(default)]
     pub key: Vec<String>, // primary key: non-empty = upsert table (latest row per key wins)
     #[serde(default)]
@@ -122,17 +451,17 @@ pub struct TableMeta {
     pub purges: Vec<(u64, u64)>, // changed tables: (commit, when): the old rows of every change up to it are out of the files (`tier::purge`)
     /// Columns renamed since they were first written: the name in the files and the log (what
     /// `columns` says) -> the name SQL knows it by. Files are never rewritten for a rename.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    names: BTreeMap<String, String>,
+    #[serde(rename = "names", default, skip_serializing_if = "BTreeMap::is_empty")]
+    o_names: BTreeMap<String, String>,
     /// Columns dropped (their stored names): older files still hold them; nothing reads them again.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    dropped: Vec<String>,
+    #[serde(rename = "dropped", default, skip_serializing_if = "Vec::is_empty")]
+    o_dropped: Vec<String>,
     /// The order SQL lists the columns in, by stored name (`ALTER COLUMN c AFTER b`, `ADD COLUMN … FIRST`); the columns
     /// it leaves out follow in their stored order, so a column added later comes last. Empty: as stored. Storage keeps
     /// `columns`' order (a file's field ids are places in it), and so does everything under SQL: this is SQL's order only,
     /// for `SELECT *`, an INSERT without a column list, `SHOW CREATE` and the catalogs (`in_order`, `sql_order`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    shown: Vec<String>,
+    #[serde(rename = "shown", default, skip_serializing_if = "Vec::is_empty")]
+    o_shown: Vec<String>,
     /// Where its files, manifests and Delta and Iceberg copies are: `data/{folder}/`. None: its
     /// name, as for every table before round 26; a renamed table keeps the folder it had
     /// (`ALTER TABLE … RENAME TO`, ADR-030).
@@ -140,32 +469,32 @@ pub struct TableMeta {
     pub folder: Option<String>,
     /// Columns a write must give a value (`NOT NULL`; a key's columns are too, for tables made
     /// from round 26 on), by stored name (`defaults.rs`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    not_null: Vec<String>,
+    #[serde(rename = "not_null", default, skip_serializing_if = "Vec::is_empty")]
+    o_not_null: Vec<String>,
     /// A column's value when a write leaves it out (`DEFAULT expr`): stored name -> the SQL
     /// expression, worked out for each row as it is written (`defaults.rs`).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    defaults: BTreeMap<String, String>,
+    #[serde(rename = "defaults", default, skip_serializing_if = "BTreeMap::is_empty")]
+    o_defaults: BTreeMap<String, String>,
     /// `CHECK` constraints (ADR-036 §3): (name, condition over the columns by their SQL names),
     /// which every row written must not make false (`defaults.rs`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<(String, String)>,
     /// Identity columns (by stored name): each numbered by a sequence it owns, which its default
     /// calls (`seq.rs`).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    identity: BTreeMap<String, crate::seq::Identity>,
+    #[serde(rename = "identity", default, skip_serializing_if = "BTreeMap::is_empty")]
+    o_identity: BTreeMap<String, crate::seq::Identity>,
     /// UNIQUE, and PRIMARY KEY and FOREIGN KEY said NOT ENFORCED, by stored column names
     /// (`constraints.rs`, ADR-057): an enforced UNIQUE has every write checked on the leader.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraints: Vec<crate::constraints::Constraint>,
     /// Enum columns, by stored name: their labels, and the type they are of (`types.rs`). Every
     /// door refuses a value its column's labels don't list.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    enums: BTreeMap<String, crate::types::Enum>,
+    #[serde(rename = "enums", default, skip_serializing_if = "BTreeMap::is_empty")]
+    o_enums: BTreeMap<String, crate::types::Enum>,
     /// Columns that hold text but are of another SQL type, by stored name: "uuid", "json", "jsonb", "varchar(n)"
     /// (`types.rs`). Every door refuses a value that isn't one of the type's, written its one way.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    sql_types: BTreeMap<String, String>,
+    #[serde(rename = "sql_types", default, skip_serializing_if = "BTreeMap::is_empty")]
+    o_sql_types: BTreeMap<String, String>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ext: Option<crate::ext_names::Spec>,
@@ -211,6 +540,9 @@ pub struct TableMeta {
     /// Its column list (`cols`), made once for an entry read from the catalog: a clone's is empty, as `rules`' is.
     #[serde(skip)]
     pub column_memo: crate::memo::Memo<crate::column::Columns>,
+    /// A list-shaped entry's fields by stored name, made once for the accessors (INTERIM: 6b-3 makes the list the only shape).
+    #[serde(skip)]
+    old_memo: crate::memo::Memo<Made>,
 }
 
 
@@ -227,58 +559,129 @@ impl TableMeta {
 
     /// Every column the entry keeps, dropped ones too, as (stored name, Arrow type text), in stored order: a file's
     /// schema. SQL's view of them is `sql_columns`, `star` or the list (`cols`).
-    pub fn columns(&self) -> &[(String, String)] { &self.columns }
+    pub fn columns(&self) -> &[(String, String)] { self.o_columns.0.as_deref().map_or_else(|| self.old().columns.as_slice(), |c| c) }
     /// The stored columns, taken out of an entry made for the purpose (`described`, `with_sys`).
-    pub fn into_columns(self) -> Vec<(String, String)> { self.columns }
+    pub fn into_columns(mut self) -> Vec<(String, String)> { self.take_fields().columns }
 
     /// Renamed columns: stored name to SQL's (`name_of` for one).
-    pub fn names(&self) -> &BTreeMap<String, String> { &self.names }
+    pub fn names(&self) -> &BTreeMap<String, String> { if self.list.is_some() { &self.old().names } else { &self.o_names } }
 
     /// Dropped columns, by stored name (`is_dropped` for one).
-    pub fn dropped(&self) -> &[String] { &self.dropped }
+    pub fn dropped(&self) -> &[String] { if self.list.is_some() { &self.old().dropped } else { &self.o_dropped } }
 
     /// SQL's order of the live columns by stored name when it isn't the stored one (`set_order`), else empty: what
     /// `moved`, `sql_order` and the list read.
-    pub fn shown(&self) -> &[String] { &self.shown }
+    pub fn shown(&self) -> &[String] { if self.list.is_some() { &self.old().shown } else { &self.o_shown } }
 
     /// The NOT NULL columns, by stored name.
-    pub fn not_null(&self) -> &[String] { &self.not_null }
+    pub fn not_null(&self) -> &[String] { if self.list.is_some() { &self.old().not_null } else { &self.o_not_null } }
 
     /// Each column's DEFAULT, by stored name.
-    pub fn defaults(&self) -> &BTreeMap<String, String> { &self.defaults }
+    pub fn defaults(&self) -> &BTreeMap<String, String> { if self.list.is_some() { &self.old().defaults } else { &self.o_defaults } }
 
     /// The identity columns, by stored name.
-    pub fn identity(&self) -> &BTreeMap<String, crate::seq::Identity> { &self.identity }
+    pub fn identity(&self) -> &BTreeMap<String, crate::seq::Identity> { if self.list.is_some() { &self.old().identity } else { &self.o_identity } }
 
     /// The enum columns, by stored name.
-    pub fn enums(&self) -> &BTreeMap<String, crate::types::Enum> { &self.enums }
+    pub fn enums(&self) -> &BTreeMap<String, crate::types::Enum> { if self.list.is_some() { &self.old().enums } else { &self.o_enums } }
 
     /// The types text columns are held as (uuid, JSON, a length: `types.rs`), by stored name.
-    pub fn sql_types(&self) -> &BTreeMap<String, String> { &self.sql_types }
+    pub fn sql_types(&self) -> &BTreeMap<String, String> { if self.list.is_some() { &self.old().sql_types } else { &self.o_sql_types } }
+
+    /// A list-shaped entry's fields by stored name, made once (INTERIM, 6b-2: 6b-3 has readers read the list).
+    fn old(&self) -> &Made { self.old_memo.get_ref(|| self.list.as_ref().map(Stored::fields).unwrap_or_default()) }
+
+    /// Is the entry in format 6's shape: its columns kept as one list (`Stored`)?
+    pub fn listed(&self) -> bool { self.list.is_some() }
+
+    /// The entry in format 6's shape (the format-6 commit, and each entry written to a format-6 lake), or format 5's.
+    /// Nothing it answers changes: the same columns and facts, kept the other way.
+    pub fn shaped(mut self, listed: bool) -> TableMeta {
+        if listed != self.list.is_some() {
+            let f = self.take_fields();
+            self.put_fields(f, listed);
+        }
+        self
+    }
+
+    /// The column fields, taken out of the entry (either shape).
+    fn take_fields(&mut self) -> Made {
+        if let Some(l) = self.list.take() {
+            self.old_memo = Default::default();
+            return l.fields();
+        }
+        use std::mem::take;
+        Made {
+            columns: self.o_columns.0.take().unwrap_or_default(),
+            names: take(&mut self.o_names),
+            dropped: take(&mut self.o_dropped),
+            shown: take(&mut self.o_shown),
+            not_null: take(&mut self.o_not_null),
+            defaults: take(&mut self.o_defaults),
+            identity: take(&mut self.o_identity),
+            enums: take(&mut self.o_enums),
+            sql_types: take(&mut self.o_sql_types),
+        }
+    }
+
+    /// The column fields put back, in the shape asked for.
+    fn put_fields(&mut self, f: Made, listed: bool) {
+        match listed {
+            true => {
+                (self.list, self.o_columns) = (Some(Stored::of(&f)), OldColumns::absent());
+                (self.o_names, self.o_dropped, self.o_shown, self.o_not_null) = Default::default();
+                (self.o_defaults, self.o_identity, self.o_enums, self.o_sql_types) = Default::default();
+            }
+            false => {
+                self.list = None;
+                let Made { columns, names, dropped, shown, not_null, defaults, identity, enums, sql_types } = f;
+                self.o_columns = OldColumns(Some(columns));
+                (self.o_names, self.o_dropped, self.o_shown, self.o_not_null) = (names, dropped, shown, not_null);
+                (self.o_defaults, self.o_identity, self.o_enums, self.o_sql_types) = (defaults, identity, enums, sql_types);
+            }
+        }
+        (self.old_memo, self.column_memo, self.rules) = Default::default();
+    }
+
+    /// The stored columns to change by hand: a test's field edits, to hold the column edits to (format 5's shape).
+    #[cfg(test)]
+    fn cols_mut(&mut self) -> &mut Vec<(String, String)> { self.o_columns.0.get_or_insert_with(Vec::new) }
+
+    /// One change to the column fields, the entry kept in its shape. INTERIM (6b-2): a list-shaped entry is changed
+    /// through its fields by stored name and made a list again; 6b-3 edits the list itself.
+    fn edit<R>(&mut self, f: impl FnOnce(&mut Made) -> R) -> R {
+        let listed = self.list.is_some();
+        let mut fields = self.take_fields();
+        let r = f(&mut fields);
+        self.put_fields(fields, listed);
+        r
+    }
 
     /// An entry with these columns (stored name, Arrow type text) in stored order and nothing else: a table being made,
-    /// or a test's. The rest is set on it as on any entry (its fields, and the column edits).
-    pub fn with_columns(columns: Vec<(String, String)>) -> TableMeta { TableMeta { columns, ..Default::default() } }
+    /// or a test's. The rest is set on it as on any entry (its fields, and the column edits). In format 5's shape: a
+    /// format-6 lake's commit gives it the list (`shaped`).
+    pub fn with_columns(columns: Vec<(String, String)>) -> TableMeta { TableMeta { o_columns: OldColumns(Some(columns)), ..Default::default() } }
 
     /// An entry with these columns and their facts, and nothing else: a table being made (`Made`'s fields, by stored
     /// name). The rest is set on it as on any entry.
     pub fn made(c: Made) -> TableMeta {
-        let Made { columns, names, dropped, shown, not_null, defaults, identity, enums, sql_types } = c;
-        TableMeta { columns, names, dropped, shown, not_null, defaults, identity, enums, sql_types, ..Default::default() }
+        let mut t = TableMeta::default();
+        t.put_fields(c, false);
+        t
     }
 
     /// Is this column (by the names its entry uses) a uuid, held as text (`types.rs`)?
-    pub fn uuid(&self, column: &str) -> bool { self.sql_types.get(column).is_some_and(|t| t == "uuid") }
+    pub fn uuid(&self, column: &str) -> bool { self.sql_types().get(column).is_some_and(|t| t == "uuid") }
 
     /// Has any column been renamed or dropped (ADR-022)? If not, SQL sees `columns` as stored.
-    pub fn mapped(&self) -> bool { !self.names.is_empty() || !self.dropped.is_empty() }
+    pub fn mapped(&self) -> bool { !self.names().is_empty() || !self.dropped().is_empty() }
 
     /// This entry's live columns (under the names it keeps them by: stored, or SQL's in `logical()`'s) in SQL's order
     /// (`shown`, then the others as stored). Without `shown`, `columns` as they are, dropped ones out. Kept to this file:
     /// a reader takes the order from `sql_order`, `sql_columns`, `star`, `sql_names` or the list (`cols`), never works it
     /// out (redesign 1b).
     fn in_order(&self) -> Vec<&(String, String)> {
-        crate::column::sql_places(&self.columns, |c| self.is_dropped(c), &self.shown).into_iter().map(|i| &self.columns[i]).collect()
+        crate::column::sql_places(&self.columns(), |c| self.is_dropped(c), &self.shown()).into_iter().map(|i| &self.columns()[i]).collect()
     }
 
     /// Its columns as one list (`column.rs`): each with its id, SQL's name and its stored one, in SQL's order (as
@@ -286,7 +689,10 @@ impl TableMeta {
     /// an entry read from the catalog. Of the entry as stored only: `logical()`'s copy has left out the dropped columns
     /// and taken SQL's names, so its places are no longer ids.
     pub fn column_list(&self) -> crate::column::Columns {
-        crate::column::Columns::new(&self.columns, |c| self.name_of(c), |c| self.is_dropped(c), &self.shown)
+        match &self.list {
+            Some(l) => l.column_list(),
+            None => crate::column::Columns::new(self.columns(), |c| self.name_of(c), |c| self.is_dropped(c), self.shown()),
+        }
     }
 
     /// `column_list`, made once for this version of the entry (it can't change under an `Arc`: a change is made on a
@@ -296,7 +702,7 @@ impl TableMeta {
     /// Was a column moved, so SQL's order isn't the stored one (`ALTER COLUMN … FIRST` or `AFTER`, `ADD COLUMN … FIRST`)?
     /// The one test of it: a reader reorders, or a write fills SQL's order, only then (`in_sql_order`).
     pub fn moved(&self) -> bool {
-        !self.shown.is_empty() && crate::column::sql_places(&self.columns, |c| self.is_dropped(c), &self.shown).windows(2).any(|w| w[0] > w[1])
+        !self.shown().is_empty() && crate::column::sql_places(&self.columns(), |c| self.is_dropped(c), &self.shown()).windows(2).any(|w| w[0] > w[1])
     }
 
     /// Rows under SQL's names (`to_logical`'s, a log tail's, the change feed's) with the table's columns in SQL's order,
@@ -310,7 +716,7 @@ impl TableMeta {
     }
 
     /// Was the column stored as `stored` dropped?
-    pub fn is_dropped(&self, stored: &str) -> bool { self.dropped.iter().any(|d| d == stored) }
+    pub fn is_dropped(&self, stored: &str) -> bool { self.dropped().iter().any(|d| d == stored) }
 
     /// The live columns' SQL names in SQL's order (`_deleted` among them, if the table has it): what `SELECT *` lists, and
     /// what an INSERT without a column list fills, first to last (`write::implicit`).
@@ -328,14 +734,14 @@ impl TableMeta {
     pub fn sql_names(&self) -> Vec<String> { self.sql_order().into_iter().filter(|c| c != "_deleted").collect() }
 
     /// A stored column's name in SQL.
-    pub fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.names.get(stored).map_or(stored, String::as_str) }
+    pub fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.names().get(stored).map_or(stored, String::as_str) }
 
     /// The folder under `data/` its files are in (`name`'s, unless it was renamed).
     pub fn folder<'a>(&'a self, name: &'a str) -> &'a str { self.folder.as_deref().unwrap_or(name) }
 
     /// The columns SQL sees, as (stored name, name in SQL, type): all but the dropped.
     pub fn live(&self) -> impl Iterator<Item = (&str, &str, &str)> {
-        self.columns.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, t)| (c.as_str(), self.name_of(c), t.as_str()))
+        self.columns().iter().filter(|(c, _)| !self.dropped().contains(c)).map(|(c, t)| (c.as_str(), self.name_of(c), t.as_str()))
     }
 
     /// The column SQL calls `name`: its stored name.
@@ -349,25 +755,23 @@ impl TableMeta {
             return self.clone();
         }
         let n = |c: &String| self.name_of(c).to_string();
-        TableMeta {
+        let fields = Made {
             columns: self.logical_columns(),
-            key: self.sql_key(),
-            merge: self.merge.iter().map(|(c, f)| (n(c), f.clone())).collect(),
-            cluster: self.cluster.iter().map(n).collect(),
-            ttl: self.ttl.as_ref().map(|(c, s)| (n(c), *s)),
-            order: self.order.as_ref().map(n),
-            partition: self.sql_partition(),
-            not_null: self.in_sql_list(&self.not_null),
-            defaults: self.in_sql(&self.defaults),
-            identity: self.in_sql(&self.identity),
-            constraints: self.constraints.iter().map(|c| c.named(&n)).collect(),
-            enums: self.in_sql(&self.enums),
-            sql_types: self.in_sql(&self.sql_types),
+            not_null: self.in_sql_list(self.not_null()),
+            defaults: self.in_sql(self.defaults()),
+            identity: self.in_sql(self.identity()),
+            enums: self.in_sql(self.enums()),
+            sql_types: self.in_sql(self.sql_types()),
             names: BTreeMap::new(),
             dropped: vec![],
-            shown: self.in_sql_list(&self.shown),
-            ..self.clone()
-        }
+            shown: self.in_sql_list(self.shown()),
+        };
+        let mut t = self.clone();
+        (t.key, t.merge, t.cluster) = (self.sql_key(), self.merge.iter().map(|(c, f)| (n(c), f.clone())).collect(), self.cluster.iter().map(n).collect());
+        (t.ttl, t.order, t.partition) = (self.ttl.as_ref().map(|(c, s)| (n(c), *s)), self.order.as_ref().map(n), self.sql_partition());
+        t.constraints = self.constraints.iter().map(|c| c.named(&n)).collect();
+        t.put_fields(fields, false); // (SQL's names, the dropped columns gone: its places are no longer ids, so never a list)
+        t
     }
 
     /// `logical()`, borrowed when it is the entry itself (no column renamed or dropped): no copy of its files.
@@ -392,7 +796,7 @@ impl TableMeta {
     /// SQL's columns, as `logical()` has them, without copying the rest of the entry (its files).
     pub fn logical_columns(&self) -> Vec<(String, String)> {
         if !self.mapped() {
-            return self.columns.clone();
+            return self.columns().to_vec();
         }
         self.live().map(|(_, n, t)| (n.to_string(), t.to_string())).collect()
     }
@@ -400,12 +804,12 @@ impl TableMeta {
     /// A per-column map, keyed by stored name, under the names SQL knows the columns by: the entries of dropped columns
     /// left out. `logical()` and `to_rules()` both map their fields through this, so a rename or a drop is mapped here.
     pub fn in_sql<V: Clone>(&self, m: &BTreeMap<String, V>) -> BTreeMap<String, V> {
-        m.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, v)| (self.name_of(c).to_string(), v.clone())).collect()
+        m.iter().filter(|(c, _)| !self.dropped().contains(c)).map(|(c, v)| (self.name_of(c).to_string(), v.clone())).collect()
     }
 
     /// A per-column list, by stored name, under SQL's names: the dropped columns left out (`in_sql` for a list).
     fn in_sql_list(&self, l: &[String]) -> Vec<String> {
-        l.iter().filter(|c| !self.dropped.contains(c)).map(|c| self.name_of(c).to_string()).collect()
+        l.iter().filter(|c| !self.dropped().contains(c)).map(|c| self.name_of(c).to_string()).collect()
     }
 
     // The edits to a table's columns: the one way DDL changes them (redesign 1b, piece 6a). Each names a column by its
@@ -415,95 +819,46 @@ impl TableMeta {
     /// ADD COLUMN `name`: stored under its name, or `name~2`, `name~3`… when an older column (renamed or dropped) is
     /// stored under that, since files are never rewritten. Last in stored order, and in SQL's unless `set_order` puts it
     /// elsewhere. Returns its stored name.
-    pub fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<crate::types::Enum>) -> String {
-        let taken = |s: &str| self.columns.iter().any(|(n, _)| n == s);
-        let stored = (1..).map(|i| if i == 1 { name.to_string() } else { format!("{name}~{i}") }).find(|s| !taken(s)).expect("a free name");
-        if stored != name {
-            self.names.insert(stored.clone(), name.to_string());
-        }
-        if let Some(e) = labels {
-            self.enums.insert(stored.clone(), e); // (ALTER TABLE … ADD COLUMN c mood)
-        }
-        if let Some(t) = held {
-            self.sql_types.insert(stored.clone(), t); // (ALTER TABLE … ADD COLUMN c UUID)
-        }
-        self.columns.push((stored.clone(), dtype.to_string()));
-        stored
-    }
+    pub fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<crate::types::Enum>) -> String { self.edit(|f| f.add_column(name, dtype, held, labels)) }
 
     /// RENAME COLUMN: the column stored as `stored` is `to` in SQL from now on (its files keep the stored name).
-    pub fn rename_column(&mut self, stored: &str, to: &str) {
-        match to == stored {
-            true => self.names.remove(stored),
-            false => self.names.insert(stored.to_string(), to.to_string()),
-        };
-    }
+    pub fn rename_column(&mut self, stored: &str, to: &str) { self.edit(|f| f.rename_column(stored, to)) }
 
     /// DROP COLUMN: marked dropped, kept in the list (older files still hold it). The table facts that name it (its
     /// clustering, merge, constraints, checks) are the caller's.
-    pub fn drop_column(&mut self, stored: &str) {
-        self.names.remove(stored);
-        self.dropped.push(stored.to_string());
-    }
+    pub fn drop_column(&mut self, stored: &str) { self.edit(|f| f.drop_column(stored)) }
 
     /// ALTER COLUMN … TYPE that widens it: its Arrow type from now on.
-    pub fn retype_column(&mut self, stored: &str, dtype: String) {
-        if let Some(c) = self.columns.iter_mut().find(|(c, _)| c == stored) {
-            c.1 = dtype;
-        }
-    }
+    pub fn retype_column(&mut self, stored: &str, dtype: String) { self.edit(|f| f.retype_column(stored, dtype)) }
 
     /// The type a text column is held as (a uuid, JSON, a length: `types.rs`), or none: as text, its enum gone too.
-    pub fn hold_column(&mut self, stored: &str, held: Option<String>) {
-        match held {
-            Some(t) => _ = self.sql_types.insert(stored.to_string(), t),
-            None => {
-                self.sql_types.remove(stored);
-                self.enums.remove(stored);
-            }
-        }
-    }
+    pub fn hold_column(&mut self, stored: &str, held: Option<String>) { self.edit(|f| f.hold_column(stored, held)) }
 
     /// SQL's order of the live columns, by stored name: kept only when it isn't the stored order (or its start), so a
     /// table whose columns are back in stored order keeps nothing and pays nothing (`moved`).
-    pub fn set_order(&mut self, stored: Vec<String>) {
-        let as_stored: Vec<&str> = self.live().map(|(s, _, _)| s).filter(|s| *s != "_deleted").collect();
-        self.shown = match as_stored.starts_with(&stored.iter().map(String::as_str).collect::<Vec<_>>()) {
-            true => vec![],
-            false => stored,
-        };
-    }
+    pub fn set_order(&mut self, stored: Vec<String>) { self.edit(|f| f.set_order(stored)) }
 
     /// SET or DROP DEFAULT.
-    pub fn set_default(&mut self, stored: &str, expr: Option<String>) {
-        match expr {
-            Some(e) => _ = self.defaults.insert(stored.to_string(), e),
-            None => _ = self.defaults.remove(stored),
-        }
-    }
+    pub fn set_default(&mut self, stored: &str, expr: Option<String>) { self.edit(|f| f.set_default(stored, expr)) }
 
     /// SET or DROP NOT NULL.
-    pub fn set_not_null(&mut self, stored: &str, not_null: bool) {
-        self.not_null.retain(|c| c != stored);
-        if not_null {
-            self.not_null.push(stored.to_string());
-        }
-    }
+    pub fn set_not_null(&mut self, stored: &str, not_null: bool) { self.edit(|f| f.set_not_null(stored, not_null)) }
 
     /// An enum type changed (ALTER TYPE … ADD VALUE or RENAME, `types.rs`): every column of this table of that type
     /// takes it, in the same commit.
-    pub fn edit_enums(&mut self, of: &str, mut f: impl FnMut(&mut crate::types::Enum)) {
-        self.enums.values_mut().filter(|e| e.of.as_deref() == Some(of)).for_each(&mut f);
+    pub fn edit_enums(&mut self, of: &str, mut g: impl FnMut(&mut crate::types::Enum)) {
+        self.edit(|f| f.enums.values_mut().filter(|e| e.of.as_deref() == Some(of)).for_each(&mut g))
     }
 
     /// Columns kept as they are named (a system table's, `sys::with_sys`'s system columns), after the others: no
     /// renamed or dropped column is stored under these names.
-    pub fn append_columns(&mut self, more: impl IntoIterator<Item = (String, String)>) { self.columns.extend(more); }
+    pub fn append_columns(&mut self, more: impl IntoIterator<Item = (String, String)>) { self.edit(|f| f.columns.extend(more)) }
 
     /// The table of `of`'s replaced rows (`sys::deleted`) takes its columns: the same list, `_old_version` after it.
     pub fn follow_columns(&mut self, of: &TableMeta) {
-        self.columns = of.columns.iter().cloned().chain([("_old_version".to_string(), "Int64".to_string())]).collect();
-        (self.names, self.dropped) = (of.names.clone(), of.dropped.clone());
+        let columns = of.columns().iter().cloned().chain([("_old_version".to_string(), "Int64".to_string())]).collect();
+        let (names, dropped) = (of.names().clone(), of.dropped().to_vec());
+        self.edit(|f| (f.columns, f.names, f.dropped) = (columns, names, dropped))
     }
 
     /// The table a write's rules see (`rules::Table`), made from the rule fields alone: never `files` or the
@@ -515,11 +870,11 @@ impl TableMeta {
             .map(|(stored, name, _)| crate::rules::Column {
                 name: name.to_string(),
                 stored: stored.to_string(),
-                not_null: self.not_null.iter().any(|c| c == stored),
-                default: self.defaults.get(stored).cloned(),
-                always: self.identity.get(stored).is_some_and(|i| i.always),
-                held: self.sql_types.get(stored).cloned(),
-                labels: self.enums.get(stored).map(|e| (e.of.clone(), e.labels.clone())),
+                not_null: self.not_null().iter().any(|c| c == stored),
+                default: self.defaults().get(stored).cloned(),
+                always: self.identity().get(stored).is_some_and(|i| i.always),
+                held: self.sql_types().get(stored).cloned(),
+                labels: self.enums().get(stored).map(|e| (e.of.clone(), e.labels.clone())),
             })
             .collect();
         Ok(crate::rules::Table {
@@ -551,9 +906,18 @@ impl TableMeta {
     /// Only to describe: its `columns` aren't the stored order once a column moved.
     pub fn described(&self) -> TableMeta {
         match &self.finish {
-            Some(f) => TableMeta { columns: f.columns.clone(), merge: BTreeMap::new(), ..self.logical() },
-            None if self.shown.is_empty() => self.logical(),
-            None => TableMeta { columns: self.sql_columns(), shown: vec![], ..self.logical() },
+            Some(f) => {
+                let mut t = self.logical();
+                t.edit(|m| m.columns = f.columns.clone());
+                t.merge = BTreeMap::new();
+                t
+            }
+            None if self.shown().is_empty() => self.logical(),
+            None => {
+                let (mut t, columns) = (self.logical(), self.sql_columns());
+                t.edit(|m| (m.columns, m.shown) = (columns, vec![]));
+                t
+            }
         }
     }
 
@@ -569,7 +933,7 @@ impl TableMeta {
         for (f, c) in b.schema().fields().iter().zip(b.columns()) {
             let name = match self.stored(f.name()) {
                 Some(s) => s,
-                None if self.columns.iter().any(|(n, _)| n == f.name()) => continue, // (an old name)
+                None if self.columns().iter().any(|(n, _)| n == f.name()) => continue, // (an old name)
                 None => f.name(), // (not the table's: reads leave it out)
             };
             fields.push(Arc::new(f.as_ref().clone().with_name(name)));
@@ -584,7 +948,7 @@ impl TableMeta {
         if !self.mapped() {
             return Ok(b.clone());
         }
-        let keep: Vec<usize> = (0..b.num_columns()).filter(|&i| !self.dropped.contains(b.schema().field(i).name())).collect();
+        let keep: Vec<usize> = (0..b.num_columns()).filter(|&i| !self.dropped().contains(b.schema().field(i).name())).collect();
         let b = b.project(&keep)?;
         let fields: Vec<_> = b.schema().fields().iter().map(|f| Arc::new(f.as_ref().clone().with_name(self.name_of(f.name())))).collect();
         Ok(RecordBatch::try_new(Arc::new(Schema::new_with_metadata(fields, b.schema().metadata().clone())), b.columns().to_vec())?)
@@ -2200,7 +2564,7 @@ impl Lake {
     pub async fn filed_rows(&self, seg: &Segment, table: &str, removed: bool, from: u64, rows: u64) -> Result<Vec<RecordBatch>> {
         let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
         let meta = crate::sys::with_sys(&meta);
-        let schema = crate::answer::schema(&meta.columns)?;
+        let schema = crate::answer::schema(&meta.columns())?;
         let (ctx, end, mut at, mut out) = (self.session(), from.saturating_add(rows), 0u64, vec![]);
         for f in if removed { &filed.removed } else { &filed.added } {
             let (lo, hi) = (at.max(from), (at + f.rows).min(end));
@@ -2220,7 +2584,7 @@ impl Lake {
     pub async fn deleted_rows(&self, seg: &Segment, table: &str) -> Result<Vec<RecordBatch>> {
         let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
         let meta = crate::sys::with_sys(&meta);
-        let schema = crate::answer::schema(&meta.columns)?;
+        let schema = crate::answer::schema(&meta.columns())?;
         let mut out = vec![];
         for (f, deletes) in &filed.deleted {
             out.extend(crate::adopt::rows_deleted(self, &meta, f, deletes, &schema).await?);
@@ -3273,6 +3637,7 @@ impl Catalog {
             return Err(crate::backup::refused(None)); // (whatever door a write came through: ADR-070)
         }
         let t0 = Instant::now();
+        let puts = listed(self, puts).await?;
         let mut puts: Vec<(String, Bytes)> = puts.into_iter().map(|(k, v)| (k, v.into())).collect();
         let mut id = self.order.lock().await;
         let t1 = commit_stage("order", t0);
@@ -3290,6 +3655,24 @@ impl Catalog {
     }
 }
 
+
+/// A table's entry in format 5's shape (made just now, or read before the lake was raised) is written as its list once the
+/// lake is format 6 (`format::LISTS`): the one place an entry's shape is chosen (redesign 1b, piece 6b). Format 5's
+/// entries begin with their `columns` (`TableMeta`'s first field), so a commit of lists alone looks no further.
+async fn listed(cat: &Catalog, mut puts: Vec<(String, Vec<u8>)>) -> Result<Vec<(String, Vec<u8>)>> {
+    let old = |k: &str, v: &[u8]| k.starts_with("t/") && v.starts_with(br#"{"columns":"#);
+    if !puts.iter().any(|(k, v)| old(k, v)) || crate::format::of(cat).await?.format < crate::format::LISTS {
+        return Ok(puts);
+    }
+    for (k, v) in puts.iter_mut() {
+        if old(k, v) {
+            if let Ok(t) = serde_json::from_slice::<TableMeta>(v) {
+                *v = json(&t.shaped(true));
+            }
+        }
+    }
+    Ok(puts)
+}
 
 /// `PONDRA_TRACE_COMMIT=1`: where a leader's commits spend their time. Each stage is the time since the one before it
 /// (`since`); once a minute one line on stderr gives each stage's p50 and p95 over that minute, and how late a 10 ms
@@ -3974,20 +4357,21 @@ mod tests {
         let set = |v: &[(&str, &str)]| v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<String, String>>();
         let id = |always: bool, seq: &str| crate::seq::Identity { always, declared: vec![], sequence: seq.into() };
         let unique = |name: &str, c: &str, enforced: bool| crate::constraints::Constraint { name: name.into(), kind: crate::constraints::Kind::Unique, columns: vec![c.into()], references: None, enforced };
-        TableMeta {
+        let mut t = TableMeta::made(Made {
             columns: vec![col("id", "Int64"), col("seq_no", "Int64"), col("c_code", "Utf8"), col("c_status", "Utf8"), col("owner", "Utf8"), col("total", "Int64"), col("doc", "Utf8"), col("gone", "Utf8"), col("_deleted", "Boolean")],
-            key: vec!["id".into()],
             names: set(&[("c_code", "code"), ("c_status", "status")]),
             dropped: vec!["gone".into()],
             not_null: vec!["id".into(), "c_code".into(), "gone".into()],
             defaults: set(&[("id", "nextval('orders_id_seq')"), ("seq_no", "nextval('orders_seq_no_seq')"), ("total", "0"), ("gone", "'x'")]),
-            checks: vec![("orders_total_check".into(), "total >= 0".into())],
             identity: [("id".to_string(), id(false, "orders_id_seq")), ("seq_no".to_string(), id(true, "orders_seq_no_seq"))].into(),
-            constraints: vec![unique("orders_code_key", "c_code", true), unique("orders_owner_key", "owner", false)],
             enums: [("c_status".to_string(), crate::types::Enum { of: Some("order_status".into()), labels: vec!["open".into(), "shipped".into()] })].into(),
             sql_types: set(&[("owner", "uuid"), ("c_code", "varchar(3)"), ("doc", "json"), ("gone", "json")]),
             ..Default::default()
-        }
+        });
+        t.key = vec!["id".into()];
+        t.checks = vec![("orders_total_check".into(), "total >= 0".into())];
+        t.constraints = vec![unique("orders_code_key", "c_code", true), unique("orders_owner_key", "owner", false)];
+        t
     }
 
     /// `logical()` of `with_rules`, as JSON: the golden is the unchanged code's.
@@ -4023,22 +4407,23 @@ mod tests {
         assert_eq!(t.checks, [("orders_total_check".to_string(), "total >= 0".to_string())]);
         assert!(t.column("gone").is_none() && t.marker("_deleted") && !t.marker("total"));
         for c in &t.columns {
-            assert_eq!(l.not_null.contains(&c.name), c.not_null, "{}", c.name);
-            assert_eq!(l.defaults.get(&c.name).cloned(), c.default, "{}", c.name);
-            assert_eq!(l.identity.get(&c.name).is_some_and(|i| i.always), c.always, "{}", c.name);
-            assert_eq!(l.sql_types.get(&c.name).cloned(), c.held, "{}", c.name);
-            assert_eq!(l.enums.get(&c.name).map(|e| (e.of.clone(), e.labels.clone())), c.labels, "{}", c.name);
+            assert_eq!(l.not_null().contains(&c.name), c.not_null, "{}", c.name);
+            assert_eq!(l.defaults().get(&c.name).cloned(), c.default, "{}", c.name);
+            assert_eq!(l.identity().get(&c.name).is_some_and(|i| i.always), c.always, "{}", c.name);
+            assert_eq!(l.sql_types().get(&c.name).cloned(), c.held, "{}", c.name);
+            assert_eq!(l.enums().get(&c.name).map(|e| (e.of.clone(), e.labels.clone())), c.labels, "{}", c.name);
         }
         assert_eq!(l.key, t.key);
-        assert_eq!(l.columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), names);
-        assert!(!l.defaults.contains_key("gone") && !l.sql_types.contains_key("gone") && !l.not_null.iter().any(|c| c == "gone"));
+        assert_eq!(l.columns().iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), names);
+        assert!(!l.defaults().contains_key("gone") && !l.sql_types().contains_key("gone") && !l.not_null().iter().any(|c| c == "gone"));
         Ok(())
     }
 
     /// A merge table (a GROUP BY view's) has a key, but its plain INSERTs' keys are not checked.
     #[test]
     fn a_merge_table_is_not_key_checked() -> Result<()> {
-        let m = TableMeta { columns: vec![("day".into(), "Int64".into()), ("n".into(), "Int64".into())], key: vec!["day".into()], merge: [("n".to_string(), "sum".to_string())].into(), ..Default::default() };
+        let mut m = TableMeta::with_columns(vec![("day".into(), "Int64".into()), ("n".into(), "Int64".into())]);
+        (m.key, m.merge) = (vec!["day".into()], [("n".to_string(), "sum".to_string())].into());
         let t = m.to_rules()?;
         assert!(!t.key_checked && !t.checked() && !t.mapped);
         assert_eq!(t.key, ["day"]);
@@ -4071,9 +4456,9 @@ mod tests {
     fn the_column_list_is_the_entrys_columns_in_sqls_order() {
         // (the order as `in_order` made it before the list: `shown`'s columns, then the rest as stored, the dropped out)
         fn was(m: &TableMeta) -> Vec<String> {
-            let first = m.shown.iter().filter_map(|s| m.columns.iter().find(|(c, _)| c == s));
-            let rest = m.columns.iter().filter(|(c, _)| !m.shown.contains(c));
-            first.chain(rest).filter(|(c, _)| !m.dropped.contains(c)).map(|(c, _)| m.name_of(c).to_string()).collect()
+            let first = m.shown().iter().filter_map(|s| m.columns().iter().find(|(c, _)| c == s));
+            let rest = m.columns().iter().filter(|(c, _)| !m.shown().contains(c));
+            first.chain(rest).filter(|(c, _)| !m.dropped().contains(c)).map(|(c, _)| m.name_of(c).to_string()).collect()
         }
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = |n: u64| {
@@ -4084,18 +4469,18 @@ mod tests {
         };
         for _ in 0..2000 {
             let n = 1 + next(8) as usize;
-            let mut m = TableMeta { columns: (0..n).map(|i| (format!("c{i}"), if i % 2 == 0 { "Int64" } else { "Utf8" }.to_string())).collect(), ..Default::default() };
+            let mut m = TableMeta::with_columns((0..n).map(|i| (format!("c{i}"), if i % 2 == 0 { "Int64" } else { "Utf8" }.to_string())).collect());
             for i in 0..n {
                 match next(6) {
-                    0 => m.dropped.push(format!("c{i}")),
-                    1 => _ = m.names.insert(format!("c{i}"), format!("r{i}")),
+                    0 => m.o_dropped.push(format!("c{i}")),
+                    1 => _ = m.o_names.insert(format!("c{i}"), format!("r{i}")),
                     _ => {}
                 }
             }
             // (delete markers: a keyed table's, or a column of that name in a table without a key)
             let keyed = next(3) == 0;
             if keyed || next(4) == 0 {
-                m.columns.push(("_deleted".into(), "Boolean".into()));
+                m.cols_mut().push(("_deleted".into(), "Boolean".into()));
             }
             if keyed {
                 m.key = vec!["c0".into()];
@@ -4105,16 +4490,16 @@ mod tests {
                 1 => Some(format!("c{}", next(n as u64))),
                 _ => None,
             };
-            let n = m.columns.len();
+            let n = m.columns().len();
             // (`shown`: some of the columns, each once, in any order, dropped ones among them)
             let mut shown: Vec<String> = (0..n).filter(|_| next(2) == 0).map(|i| format!("c{i}")).collect();
             for i in (1..shown.len()).rev() {
                 shown.swap(i, next(i as u64 + 1) as usize);
             }
-            m.shown = shown;
+            m.o_shown = shown;
             let list = m.column_list();
             let sql: Vec<String> = list.sql().map(|c| c.name.clone()).collect();
-            assert_eq!(sql, was(&m), "{:?} {:?} {:?}", m.shown, m.dropped, m.names);
+            assert_eq!(sql, was(&m), "{:?} {:?} {:?}", m.shown(), m.dropped(), m.names());
             assert_eq!(m.sql_order(), sql);
             let stored: Vec<String> = list.stored_order().map(|c| c.name.clone()).collect();
             assert_eq!(m.moved(), sql != stored, "moved: SQL's order isn't the stored one");
@@ -4123,18 +4508,65 @@ mod tests {
             assert_eq!(m.sql_names(), sql.iter().filter(|c| *c != "_deleted").cloned().collect::<Vec<_>>());
             let l = m.logical();
             assert_eq!((l.star(), l.sql_names(), l.sql_order()), (m.star(), m.sql_names(), m.sql_order()), "the same of the logical copy");
-            assert_eq!((m.sql_key(), m.sql_partition(), m.logical_columns()), (l.key.clone(), l.partition.clone(), l.columns.clone()), "a field without the copy");
+            assert_eq!((m.sql_key(), m.sql_partition(), m.logical_columns()), (l.key.clone(), l.partition.clone(), l.columns().to_vec()), "a field without the copy");
             for c in list.all() {
-                assert_eq!(m.columns[c.id as usize - 1].0, c.stored, "an id is a stored place + 1");
-                assert_eq!((c.name.as_str(), c.dropped), (m.name_of(&c.stored), m.dropped.contains(&c.stored)));
+                assert_eq!(m.columns()[c.id as usize - 1].0, c.stored, "an id is a stored place + 1");
+                assert_eq!((c.name.as_str(), c.dropped), (m.name_of(&c.stored), m.dropped().contains(&c.stored)));
             }
             assert_eq!(list.all().len(), n, "every column, the dropped too");
             assert!(list.stored_order().collect::<Vec<_>>().windows(2).all(|w| w[0].id < w[1].id));
         }
-        let a = Arc::new(TableMeta { columns: vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into())], shown: vec!["b".into()], ..Default::default() });
+        let a = Arc::new(TableMeta::made(Made { columns: vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into())], shown: vec!["b".into()], ..Default::default() }));
         assert!(Arc::ptr_eq(&a.cols(), &a.cols()), "made once per parse");
         assert_eq!(*a.cols(), a.column_list());
         assert!((*a).clone().column_memo.get().is_none(), "a clone's memo is empty");
+    }
+
+    /// The parse and size measures' wide entry: 500 columns, renames, drops, a moved order, NOT NULLs, defaults, held
+    /// types and 200 files.
+    fn wide_entry() -> TableMeta {
+        let mut m = TableMeta::with_columns((0..500).map(|i| (format!("column_{i}"), if i % 3 == 0 { "Int64" } else { "Utf8" }.to_string())).collect());
+        for i in (0..500).step_by(10) {
+            m.o_names.insert(format!("column_{i}"), format!("renamed_{i}"));
+        }
+        m.o_dropped = (5..500).step_by(25).map(|i| format!("column_{i}")).collect();
+        m.o_shown = ["column_499", "column_1", "column_2"].map(String::from).to_vec();
+        m.o_not_null = (0..100).map(|i| format!("column_{i}")).collect();
+        m.o_defaults = (100..150).map(|i| (format!("column_{i}"), "'x'".to_string())).collect();
+        m.o_sql_types = (200..230).map(|i| (format!("column_{i}"), "uuid".to_string())).collect();
+        m.key = vec!["column_0".into()];
+        m.files = (0..200).map(|i| crate::data_file::DataFile { path: format!("data/t/{i:08}.parquet"), rows: 1000, bytes: 1 << 20, ..Default::default() }).collect();
+        m
+    }
+
+    /// Their 2,000 small entries: 1 to 8 columns, some renamed, some with a column dropped.
+    fn small_entries() -> Vec<TableMeta> {
+        (0..2000u64)
+            .map(|i| {
+                let n = 1 + (i % 8) as usize;
+                let mut m = TableMeta::with_columns((0..n).map(|c| (format!("c{c}"), "Int64".to_string())).collect());
+                if i % 3 == 0 {
+                    m.o_names.insert("c0".into(), "r0".into());
+                }
+                if i % 5 == 0 && n > 1 {
+                    m.o_dropped.push(format!("c{}", n - 1));
+                }
+                m
+            })
+            .collect()
+    }
+
+    /// Format 6's list is no bigger than format 5's fields: the wide entry at or under its 35,088 bytes, and the small
+    /// ones at or under their 269 bytes on average (the redesign thread's gate for 6b).
+    #[test]
+    fn entry_size() {
+        let (wide, small) = (wide_entry(), small_entries());
+        let avg = |ts: &[TableMeta], listed: bool| ts.iter().map(|t| json(&t.clone().shaped(listed)).len()).sum::<usize>() / ts.len();
+        let (w5, w6) = (json(&wide).len(), json(&wide.clone().shaped(true)).len());
+        let (s5, s6) = (avg(&small, false), avg(&small, true));
+        println!("wide: {w5} bytes in format 5's fields, {w6} as format 6's list; small: {s5} and {s6} on average");
+        assert!(w5 == 35_088 && s5 == 269, "the measures' entries changed: wide {w5}, small {s5}");
+        assert!(w6 <= w5 && s6 <= s5, "format 6's list is bigger: wide {w6}, small {s6}");
     }
 
     /// What decoding an entry and making its column list cost (redesign 1b, piece 6b's before and after): a wide table
@@ -4143,46 +4575,44 @@ mod tests {
     #[test]
     #[ignore]
     fn entry_parse_time() {
-        let wide = {
-            let mut m = TableMeta { columns: (0..500).map(|i| (format!("column_{i}"), if i % 3 == 0 { "Int64" } else { "Utf8" }.to_string())).collect(), ..Default::default() };
-            for i in (0..500).step_by(10) {
-                m.names.insert(format!("column_{i}"), format!("renamed_{i}"));
-            }
-            m.dropped = (5..500).step_by(25).map(|i| format!("column_{i}")).collect();
-            m.shown = ["column_499", "column_1", "column_2"].map(String::from).to_vec();
-            m.not_null = (0..100).map(|i| format!("column_{i}")).collect();
-            m.defaults = (100..150).map(|i| (format!("column_{i}"), "'x'".to_string())).collect();
-            m.sql_types = (200..230).map(|i| (format!("column_{i}"), "uuid".to_string())).collect();
-            m.key = vec!["column_0".into()];
-            m.files = (0..200).map(|i| crate::data_file::DataFile { path: format!("data/t/{i:08}.parquet"), rows: 1000, bytes: 1 << 20, ..Default::default() }).collect();
-            json(&m)
-        };
-        let small: Vec<Vec<u8>> = (0..2000u64)
-            .map(|i| {
-                let n = 1 + (i % 8) as usize;
-                let mut m = TableMeta { columns: (0..n).map(|c| (format!("c{c}"), "Int64".to_string())).collect(), ..Default::default() };
-                if i % 3 == 0 {
-                    m.names.insert("c0".into(), "r0".into());
-                }
-                if i % 5 == 0 && n > 1 {
-                    m.dropped.push(format!("c{}", n - 1));
-                }
-                json(&m)
-            })
-            .collect();
+        let (wide, small) = (json(&wide_entry()), small_entries().iter().map(json).collect::<Vec<_>>());
         let time = |what: &str, raws: &[&[u8]], rounds: u32| {
-            let t = std::time::Instant::now();
-            for _ in 0..rounds {
-                for r in raws {
-                    let m: TableMeta = serde_json::from_slice(r).unwrap();
-                    std::hint::black_box(m.column_list().len());
-                }
-            }
-            let each = t.elapsed().as_nanos() as f64 / (rounds as f64 * raws.len() as f64);
-            println!("{what}: {:.1} µs an entry, decoded and listed ({} bytes)", each / 1000.0, raws.iter().map(|r| r.len()).sum::<usize>() / raws.len());
+            let best = (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    for _ in 0..rounds {
+                        for r in raws {
+                            let m: TableMeta = serde_json::from_slice(r).unwrap();
+                            std::hint::black_box(m.column_list().len());
+                        }
+                    }
+                    t.elapsed().as_nanos() as f64 / (rounds as f64 * raws.len() as f64)
+                })
+                .fold(f64::MAX, f64::min);
+            println!("{what}: {:.1} µs an entry, decoded and listed, best of 5 ({} bytes)", best / 1000.0, raws.iter().map(|r| r.len()).sum::<usize>() / raws.len());
         };
+        // (format 6's shape: the same entries kept as the list)
+        let listed = |r: &[u8]| json(&serde_json::from_slice::<TableMeta>(r).unwrap().shaped(true));
+        let (wide6, small6): (Vec<u8>, Vec<Vec<u8>>) = (listed(&wide), small.iter().map(|r| listed(r)).collect());
         time("wide (500 columns, 200 files)", &[&wide], 2000);
         time("small (2,000 random)", &small.iter().map(Vec::as_slice).collect::<Vec<_>>(), 20);
+        time("wide, format 6's list", &[&wide6], 2000);
+        time("small, format 6's list", &small6.iter().map(Vec::as_slice).collect::<Vec<_>>(), 20);
+    }
+
+    /// Format 6's shape is written as the list alone and read back as it was; format 5's always writes `columns`, even
+    /// with none (a 0.80 node needs the field); either gives the other back.
+    #[test]
+    fn an_entry_is_written_in_its_own_shape() {
+        let t = with_rules();
+        let (old, new) = (serde_json::to_value(&t).unwrap(), serde_json::to_value(t.clone().shaped(true)).unwrap());
+        assert!(old.get("columns").is_some() && old.get("names").is_some() && old.get("list").is_none(), "{old}");
+        assert!(["columns", "names", "dropped", "not_null", "defaults", "identity", "enums", "sql_types"].iter().all(|k| new.get(k).is_none()), "{new}");
+        let back: TableMeta = serde_json::from_value(new.clone()).unwrap();
+        assert!(back.listed() && serde_json::to_value(&back).unwrap() == new);
+        assert_eq!((back.columns(), back.names(), back.not_null(), back.identity()), (t.columns(), t.names(), t.not_null(), t.identity()));
+        assert_eq!(serde_json::to_value(back.shaped(false)).unwrap(), old, "and back, field for field");
+        assert!(serde_json::to_string(&TableMeta::default()).unwrap().starts_with(r#"{"columns":[]"#), "no columns: still written");
     }
 
     /// The column edits (piece 6a) leave the entry as the field edits they replace did, over random sequences of ADD,
@@ -4197,7 +4627,7 @@ mod tests {
             seed % n.max(1)
         };
         for _ in 0..500 {
-            let (mut a, mut b) = (TableMeta::default(), TableMeta::default());
+            let (mut a, mut b, mut c) = (TableMeta::default(), TableMeta::default(), TableMeta::default().shaped(true));
             for _ in 0..12 {
                 let live: Vec<String> = a.live().map(|(s, _, _)| s.to_string()).collect();
                 let pick = |i: u64| live.get(i as usize).cloned();
@@ -4210,15 +4640,16 @@ mod tests {
                         }
                         let held = (next(3) == 0).then(|| "uuid".to_string());
                         a.add_column(&name, "Utf8", held.clone(), None);
-                        let taken = |s: &str| b.columns.iter().any(|(n, _)| n == s);
+                        c.add_column(&name, "Utf8", held.clone(), None);
+                        let taken = |s: &str| b.columns().iter().any(|(n, _)| n == s);
                         let s = (1..).map(|i| if i == 1 { name.clone() } else { format!("{name}~{i}") }).find(|s| !taken(s)).unwrap();
                         if s != name {
-                            b.names.insert(s.clone(), name.clone());
+                            b.o_names.insert(s.clone(), name.clone());
                         }
                         if let Some(t) = held {
-                            b.sql_types.insert(s.clone(), t);
+                            b.o_sql_types.insert(s.clone(), t);
                         }
-                        b.columns.push((s, "Utf8".into()));
+                        b.cols_mut().push((s, "Utf8".into()));
                     }
                     1 => {
                         let (Some(s), to) = (pick(next(live.len() as u64)), format!("r{}", next(4))) else { continue };
@@ -4226,34 +4657,39 @@ mod tests {
                             continue;
                         }
                         a.rename_column(&s, &to);
+                        c.rename_column(&s, &to);
                         match to == s {
-                            true => b.names.remove(&s),
-                            false => b.names.insert(s.clone(), to),
+                            true => b.o_names.remove(&s),
+                            false => b.o_names.insert(s.clone(), to),
                         };
                     }
                     2 => {
                         let Some(s) = pick(next(live.len() as u64)).filter(|_| live.len() > 1) else { continue };
                         a.drop_column(&s);
-                        b.names.remove(&s);
-                        b.dropped.push(s);
+                        c.drop_column(&s);
+                        b.o_names.remove(&s);
+                        b.o_dropped.push(s);
                     }
                     3 => {
                         let Some(s) = pick(next(live.len() as u64)) else { continue };
                         a.retype_column(&s, "LargeUtf8".into());
-                        let at = b.columns.iter().position(|(c, _)| *c == s).unwrap();
-                        b.columns[at].1 = "LargeUtf8".into();
+                        c.retype_column(&s, "LargeUtf8".into());
+                        let at = b.columns().iter().position(|(c, _)| *c == s).unwrap();
+                        b.cols_mut()[at].1 = "LargeUtf8".into();
                     }
                     4 => {
                         let Some(s) = pick(next(live.len() as u64)) else { continue };
                         match next(2) {
                             0 => {
                                 a.hold_column(&s, Some("varchar(9)".into()));
-                                b.sql_types.insert(s, "varchar(9)".into());
+                                c.hold_column(&s, Some("varchar(9)".into()));
+                                b.o_sql_types.insert(s, "varchar(9)".into());
                             }
                             _ => {
                                 a.hold_column(&s, None);
-                                b.sql_types.remove(&s);
-                                b.enums.remove(&s);
+                                c.hold_column(&s, None);
+                                b.o_sql_types.remove(&s);
+                                b.o_enums.remove(&s);
                             }
                         }
                     }
@@ -4262,25 +4698,29 @@ mod tests {
                         match next(2) {
                             0 => {
                                 a.set_default(&s, Some("'x'".into()));
-                                b.defaults.insert(s, "'x'".into());
+                                c.set_default(&s, Some("'x'".into()));
+                                b.o_defaults.insert(s, "'x'".into());
                             }
                             _ => {
                                 a.set_default(&s, None);
-                                b.defaults.remove(&s);
+                                c.set_default(&s, None);
+                                b.o_defaults.remove(&s);
                             }
                         }
                     }
                     6 => {
                         // (SET NOT NULL only on a column that isn't: defaults.rs refuses the rest by the rows it finds)
                         let Some(s) = pick(next(live.len() as u64)) else { continue };
-                        match b.not_null.contains(&s) {
+                        match b.not_null().contains(&s) {
                             false => {
                                 a.set_not_null(&s, true);
-                                b.not_null.push(s);
+                                c.set_not_null(&s, true);
+                                b.o_not_null.push(s);
                             }
                             true => {
                                 a.set_not_null(&s, false);
-                                b.not_null.retain(|c| *c != s);
+                                c.set_not_null(&s, false);
+                                b.o_not_null.retain(|c| *c != s);
                             }
                         }
                     }
@@ -4291,15 +4731,24 @@ mod tests {
                             order.swap(i, next(i as u64 + 1) as usize);
                         }
                         a.set_order(order.clone());
-                        b.shown = if order == live { vec![] } else { order };
+                        c.set_order(order.clone());
+                        b.o_shown = if order == live { vec![] } else { order };
                     }
                 }
-                assert_eq!(json(&a), json(&b), "{:?}", a.columns);
+                assert_eq!(json(&a), json(&b), "{:?}", a.columns());
+                // (the same edits on a list-shaped entry (format 6's) leave it as the list of the fields' entry, and
+                // answer the same: INTERIM until 6b-3, where the list is the only shape)
+                assert!(c.listed() && !a.listed());
+                assert_eq!(json(&c), json(&a.clone().shaped(true)), "{:?}", a.columns());
+                assert_eq!((c.sql_columns(), c.star(), c.sql_names(), c.column_list()), (a.sql_columns(), a.star(), a.sql_names(), a.column_list()));
+                assert_eq!(json(&c.logical().shaped(true)), json(&a.logical().shaped(true)), "the logical copy");
+                let list = c.list.clone().unwrap();
+                assert_eq!(Stored::of(&list.fields()), list, "list -> fields -> list is the identity");
             }
             let mut d = TableMeta::default();
             d.follow_columns(&a);
-            assert_eq!(d.columns.last().map(|(c, _)| c.as_str()), Some("_old_version"));
-            assert_eq!((d.names.clone(), d.dropped.clone(), d.columns.len()), (a.names.clone(), a.dropped.clone(), a.columns.len() + 1));
+            assert_eq!(d.columns().last().map(|(c, _)| c.as_str()), Some("_old_version"));
+            assert_eq!((d.names().clone(), d.dropped().to_vec(), d.columns().len()), (a.names().clone(), a.dropped().to_vec(), a.columns().len() + 1));
         }
     }
 
