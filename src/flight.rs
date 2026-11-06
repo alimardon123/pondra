@@ -197,17 +197,22 @@ fn allowed<T>(_: &App, _: &Request<T>, need: Role) -> Result<Role, Status> {
 /// nothing that needs a sign-in, anyone is an admin. A wrong password is an error, said at once.
 async fn sign_in(app: &App, header: Option<&str>, peer: Option<crate::tls::Peer>) -> Result<crate::auth::Principal, Status> {
     let from = peer.map(|p| p.addr);
-    let who = match header.and_then(basic) {
-        Some((user, password)) => password_sign_in(app, &user, &password, peer).await?,
-        None => crate::users::who(&app.lake, &app.auth, header).await,
+    let credential = crate::auth::Credential::of_header(header); // (read alike at every door: `auth::Credential`)
+    if let Some(why) = credential.malformed() {
+        crate::audit::refused(app, "", "flight", from, "sign in", &why).await;
+        return Err(refused("28000", why));
+    }
+    let who = match &credential {
+        crate::auth::Credential::Password { user, password } => password_sign_in(app, user, password, peer).await?,
+        c => crate::users::who(&app.lake, &app.auth, c).await,
     };
     let who = match who {
         Some(p) => p,
         None if app.open().await => crate::auth::Principal::of(Role::Admin),
         None => {
             // (an identity provider's token says why it was refused, as HTTP's 401 does)
-            let why = match header.and_then(|h| h.strip_prefix("Bearer ")) {
-                Some(t) => crate::sso::why(&app.lake, t.trim()).await,
+            let why = match credential.token() {
+                Some(t) => crate::sso::why(&app.lake, t).await,
                 None => None,
             };
             if header.is_some() {
@@ -220,14 +225,6 @@ async fn sign_in(app: &App, header: Option<&str>, peer: Option<crate::tls::Peer>
         }
     };
     Ok(who.at("flight", from))
-}
-
-/// A `Basic` header's name and password (padding optional: ADBC's driver sends none).
-fn basic(header: &str) -> Option<(String, String)> {
-    use base64::Engine;
-    let lenient = base64::engine::GeneralPurpose::new(&base64::alphabet::STANDARD, base64::engine::GeneralPurposeConfig::new().with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent));
-    let up = String::from_utf8(lenient.decode(header.strip_prefix("Basic ")?).ok()?).ok()?;
-    up.split_once(':').map(|(u, p)| (u.to_string(), p.to_string()))
 }
 
 /// A name and password: a token as the password whatever the name, else a user's password (or
@@ -853,8 +850,8 @@ impl FlightSqlService for Sql {
     async fn do_handshake(&self, req: Request<Streaming<HandshakeRequest>>) -> Result<Response<Out<HandshakeResponse>>, Status> {
         // (signed in by `Gate` already; here a token is handed back: the password when it is one, a user's
         // `pt_` token included, or anything on a node nothing locks; a session when a user signed in)
-        let password = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).and_then(basic).map(|(_, p)| p);
-        let Some(password) = password else { return Err(refused("28P01", "wrong user name or password")) };
+        let credential = crate::auth::Credential::of_header(req.metadata().get("authorization").and_then(|v| v.to_str().ok()));
+        let crate::auth::Credential::Password { password, .. } = credential else { return Err(refused("28P01", "wrong user name or password")) };
         let open = self.0.open().await;
         let token = match self.0.auth.token_role(&password) {
             // (a user's token is handed back as itself, which every call checks again: a session made from it

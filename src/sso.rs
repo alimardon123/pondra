@@ -299,8 +299,7 @@ pub fn bearer(message: &[u8]) -> Option<String> {
     }
     let text = std::str::from_utf8(message).ok()?;
     let value = text.split('\x01').find_map(|kv| kv.strip_prefix("auth="))?;
-    let (scheme, token) = value.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim().to_string())
+    crate::auth::Credential::of_header(Some(value)).token().map(String::from) // (as an Authorization header is read)
 }
 
 // ---------------------------------------------------------------- a token checked

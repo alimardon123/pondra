@@ -268,23 +268,25 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")], crate::members::CUT_OFF_SAYS).into_response();
     }
     let header = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
+    let credential = crate::auth::Credential::of_headers(req.headers()); // (read alike at every door: `auth::Credential`)
+    let pn = credential.token().is_some_and(|t| t.starts_with("pn_"));
     let from = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().map(|c| c.0.addr);
     let vouched = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().is_some_and(|c| c.0.signed || c.0.own(req.headers())); // (`users::nodes_key`)
     if let Some(axum::extract::ConnectInfo(peer)) = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>() {
         if !peer.allowed() {
             return (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response(); // (`tls.rs`)
         }
-        if header.as_deref().is_some_and(|h| h.starts_with("Basic ")) && !peer.may_send_password() {
+        if matches!(credential, crate::auth::Credential::Password { .. }) && !peer.may_send_password() {
             return (StatusCode::FORBIDDEN, crate::tls::PASSWORD_PLAIN).into_response(); // (under PONDRA_TLS=optional: a token may cross, a password never)
         }
-        if header.as_deref().is_some_and(|h| h.starts_with("Bearer pn_")) && !peer.may_be_node() {
+        if pn && !peer.may_be_node() {
             return (StatusCode::UNAUTHORIZED, "the nodes' key is taken only with a certificate the nodes' authority signed (PONDRA_TLS_CA)").into_response();
         }
-        if header.as_deref().is_some_and(|h| h.starts_with("Bearer pn_")) && !app.auth.admin_set() && !crate::users::nodes_key(false, crate::ext::shared_master(), vouched) {
+        if pn && !app.auth.admin_set() && !crate::users::nodes_key(false, crate::ext::shared_master(), vouched) {
             return (StatusCode::UNAUTHORIZED, "the lake's keys are in the clear in its bucket, so the nodes' key is taken only from this machine, not through a proxy, or with a certificate the nodes' authority signed (PONDRA_TLS_CA): to run nodes on other machines, give every node --admin-token (or PONDRA_SECRET_KEY)").into_response();
         }
     }
-    if header.as_deref().is_some_and(|h| h.starts_with("Bearer pb_")) {
+    if credential.token().is_some_and(|t| t.starts_with("pb_")) {
         // (a branch's key: it renews or lets go of its own pin, which `ddl` checks, and opens nothing else: ADR-058)
         if req.uri().path() != "/cluster/ddl" {
             return (StatusCode::UNAUTHORIZED, "a branch's key renews its pin, and opens nothing else").into_response();
@@ -302,17 +304,22 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             Err(m) => E(anyhow::anyhow!(m)).into_response(),
         };
     }
+    let client = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().map(|c| c.0.client(req.headers()));
+    if let Some(why) = credential.malformed() {
+        // (a header that can't be read is told so, at every door alike, never taken for no sign-in: an open node's)
+        crate::audit::refused_by(&app, "", "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why).await;
+        return challenge(&app, req.uri().path(), req.headers(), (StatusCode::UNAUTHORIZED, why).into_response()).await;
+    }
     let needed = crate::auth::Auth::needed(req.uri().path(), req.method().as_str());
     let starting = !*app.lake.caught.borrow();
-    let token = header.as_deref().and_then(|h| h.strip_prefix("Bearer "));
+    let token = credential.token();
     let node = token.is_some_and(|t| t.starts_with("pn_") || app.auth.token_role(t) > crate::auth::Role::None); // (the cluster's own calls: never held)
     if starting && needed > crate::auth::Role::None && !node {
         let _ = app.lake.caught_up().await; // (a node that just started signs users in from what its leader had: `open`)
     }
     // (a sign-in with a user's name and password is counted per address and name: past ten failures a minute
     // that pair is refused at once, the right password too; a bearer token isn't counted: `auth::guessing`)
-    let client = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().map(|c| c.0.client(req.headers()));
-    let basic_by = header.as_deref().filter(|h| h.starts_with("Basic ")).map(|h| (basic_user(Some(h)), client));
+    let basic_by = credential.user().map(|name| (name.to_string(), client));
     if let Some((name, ip)) = &basic_by {
         if let Some(wait) = crate::auth::guessing(*ip, name) {
             let why = crate::auth::guessing_says(name, wait);
@@ -321,10 +328,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
         }
     }
-    let signed = match &header {
-        Some(h) => crate::users::who_at(&app.lake, &app.auth, Some(h), vouched).await,
-        None => None,
-    };
+    let signed = crate::users::who_at(&app.lake, &app.auth, &credential, vouched).await;
     let mut open = false; // (a node with no tokens and no users: anyone who reaches it is its admin and one of its nodes)
     let who = match signed {
         Some(p) => p,
@@ -345,12 +349,12 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
                 crate::auth::guessed(*ip, name);
             }
             // (an identity provider's token says why it was refused: expired, another audience, no such user here)
-            let why = match token.map(str::to_string).or_else(|| basic_password(header.as_deref())) {
-                Some(t) => crate::sso::why(&app.lake, &t).await,
+            let why = match credential.secret() {
+                Some(t) => crate::sso::why(&app.lake, t).await,
                 None => None,
             };
             let why = why.unwrap_or_else(|| "wrong token, or user name and password".into());
-            crate::audit::refused_by(&app, &basic_user(header.as_deref()), "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why).await;
+            crate::audit::refused_by(&app, credential.user().unwrap_or_default(), "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why).await;
             tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
             return challenge(&app, req.uri().path(), req.headers(), (StatusCode::UNAUTHORIZED, why).into_response()).await;
         }
@@ -434,20 +438,6 @@ fn stoppable(path: &str, query: Option<&str>) -> bool {
 /// so appends, commits, heartbeats and the commit stream keep theirs.
 fn queries(path: &str) -> bool {
     matches!(path, "/sql" | "/mcp" | "/live" | "/tier" | "/cluster/stage" | "/cluster/copy" | "/cluster/insert" | "/cluster/job") || path.starts_with("/sql/pages/") || path.starts_with("/insert/")
-}
-
-/// The user name in a Basic header (for the audit log: who tried).
-fn basic_user(header: Option<&str>) -> String {
-    use base64::Engine;
-    let b = header.and_then(|h| h.strip_prefix("Basic ")).and_then(|b| base64::engine::general_purpose::STANDARD.decode(b.trim()).ok());
-    b.and_then(|b| String::from_utf8(b).ok()).and_then(|up| up.split_once(':').map(|(u, _)| u.to_string())).unwrap_or_default()
-}
-
-/// The password in a Basic header (an identity provider's token sent as one says why it was refused).
-fn basic_password(header: Option<&str>) -> Option<String> {
-    use base64::Engine;
-    let b = header.and_then(|h| h.strip_prefix("Basic ")).and_then(|b| base64::engine::general_purpose::STANDARD.decode(b.trim()).ok())?;
-    String::from_utf8(b).ok()?.split_once(':').map(|(_, p)| p.to_string())
 }
 
 /// A 401 for MCP says where its identity providers are (RFC 9728, as MCP's clients look for them):
@@ -656,7 +646,8 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
 /// sign-in's name, as the door `page-reported` (`page_records::REPORTED`). Only a superuser's own sign-in sends them (`page_records::refusal`: never the nodes' key, a
 /// user with grants, or a procedure's lent token); a batch past `BATCH_LINES` lines is 413.
 async fn records(State(app): State<App>, headers: axum::http::HeaderMap, Json(batch): Json<crate::page_records::Batch>) -> Response {
-    let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer "));
+    let credential = crate::auth::Credential::of_headers(&headers);
+    let token = credential.token();
     let Some(who) = crate::auth::current() else { return (StatusCode::FORBIDDEN, "a joined page's lines need a sign-in").into_response() };
     if let Some(why) = crate::page_records::refusal(&who, token) {
         return (StatusCode::FORBIDDEN, why).into_response();
@@ -681,7 +672,7 @@ pub(crate) async fn until_revoked(app: App, operator: bool, header: Option<Strin
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let signed = match &header {
-            Some(h) => crate::users::who_at(&app.lake, &app.auth, Some(h), false).await.is_some_and(|p| still(&p)),
+            Some(h) => crate::users::who(&app.lake, &app.auth, &crate::auth::Credential::of_header(Some(h))).await.is_some_and(|p| still(&p)),
             None => false,
         };
         if !signed && !app.open().await {
@@ -1044,10 +1035,10 @@ async fn change(State(app): State<App>, Json((sql, job, sent)): Json<(String, St
 /// lake), which the door it first came in by checked. A user's sign-in, Basic included, is not, so
 /// the routes the cluster forwards to check a protected database's objects for it (`protect.rs`).
 fn cluster_call(app: &App, headers: &HeaderMap) -> bool {
-    match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        None => true,
+    match crate::auth::Credential::of_headers(headers) {
+        crate::auth::Credential::None => !headers.contains_key("authorization"),
         // (a `pn_` key counts only without an admin token, as in `users::who`)
-        Some(h) => h.strip_prefix("Bearer ").is_some_and(|b| (b.starts_with("pn_") && !app.auth.admin_set()) || app.auth.token_role(b) > crate::auth::Role::None),
+        c => c.token().is_some_and(|b| (b.starts_with("pn_") && !app.auth.admin_set()) || app.auth.token_role(b) > crate::auth::Role::None),
     }
 }
 
@@ -1055,8 +1046,8 @@ fn cluster_call(app: &App, headers: &HeaderMap) -> bool {
 /// branch's pin (ADR-058). A follower sends it to the leader, asked with the caller's own token.
 async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Extension<crate::auth::Role>>, Json(mut d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
     crate::backup::sent(&d)?;
-    let bearer = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).map(String::from);
-    let key = bearer.as_deref().filter(|k| k.starts_with("pb_"));
+    let credential = crate::auth::Credential::of_headers(&headers);
+    let key = credential.token().filter(|k| k.starts_with("pb_"));
     if let Some(key) = key {
         crate::branch::keyed(&app.lake, &d, key).await?; // (a branch's key: its own pin, nothing else)
     } else if role.is_none_or(|r| r.0 < crate::auth::Role::Admin) || !cluster_call(&app, &headers) {
@@ -1068,7 +1059,7 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
     crate::protect::stamp(&mut d); // (who lifts a protection, when the statement doesn't say)
     let out = match &app.seq {
         Some(seq) => crate::write::ddl_here(&app.lake, seq, &app.lock, d.clone()).await?,
-        None if !app.members.is_leader() => Box::pin(crate::write::send_as(&app.lake.url, crate::write::Request::Ddl(d.clone()), bearer.as_deref())).await?, // (the leader makes it)
+        None if !app.members.is_leader() => Box::pin(crate::write::send_as(&app.lake.url, crate::write::Request::Ddl(d.clone()), credential.token())).await?, // (the leader makes it)
         None => {
             let _guard = app.lock.lock().await;
             crate::ddl::apply(&app.lake, d.clone()).await?
@@ -1155,7 +1146,8 @@ fn held_session(mut r: Response, session: Option<&str>) -> Response {
 /// (`pondra.secret`) and nothing else: the token must be one lent to a procedure while it runs.
 /// The values are kept out of what that procedure says (its notices, its error, the run log).
 async fn secret(State(app): State<App>, Path(name): Path<String>, headers: axum::http::HeaderMap) -> Result<Json<Value>, E> {
-    let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+    let credential = crate::auth::Credential::of_headers(&headers);
+    let token = credential.token();
     if crate::auth::lent(token).is_none() {
         return Err(E(crate::codes::coded("42501", "only a procedure's code reads a secret: pondra.secret(name), in a Python procedure")));
     }
