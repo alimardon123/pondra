@@ -3634,7 +3634,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "pondra"
-version = "0.34.0"
+version = "0.80.0-rc.1"
 dependencies = [
  "anyhow",
  "arrow-flight",
@@ -3701,7 +3701,7 @@ dependencies = [
 
 [[package]]
 name = "pondra-capi"
-version = "0.34.0"
+version = "0.80.0-rc.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3716,14 +3716,14 @@ dependencies = [
 
 [[package]]
 name = "pondra-launcher"
-version = "0.34.0"
+version = "0.80.0-rc.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "pondra-tokio-web"
-version = "0.34.0"
+version = "0.80.0-rc.1"
 dependencies = [
  "futures",
  "js-sys",
