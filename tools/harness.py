@@ -25462,6 +25462,24 @@ def friendly():
     checks["the Postgres port refuses SQL Server's SET NOCOUNT ON by name too, 0A000"] = port_refusal is not None and port_refusal[0] == "0A000" and "SET NOCOUNT is SQL Server's" in port_refusal[1]
     if not checks[list(checks)[-1]]:
         failed["port refusal"] = port_refusal
+    # (11-02 audit M14: another database's statement anywhere in a script refuses the whole script before any of it runs,
+    # at every door that runs one. POST /sql did; MCP's write tool, a task's and a file's ran the CREATE first.)
+    whole = {}
+    for door in ("http", "mcp"):
+        text = f"CREATE TABLE m14_{door} (a INT); REPLACE INTO m14_{door} VALUES (1)"
+        if door == "http":
+            c.request("POST", "/sql", text.encode())
+            r = c.getresponse()
+            whole[door] = (r.getheader("x-pondra-sqlstate"), r.read().decode()[:200])
+        else:
+            call_ = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "write", "arguments": {"sql": text}}}).encode()
+            res = json.loads(urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/mcp", data=call_, headers={"content-type": "application/json"})).read())["result"]
+            whole[door] = (res.get("isError"), res["content"][0]["text"][:200])
+    whole["made"] = [r["table_name"] for r in sql(A.port, "SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'm14%'")]
+    checks["a script with another database's statement is refused whole before any of it runs, over HTTP and MCP's write tool alike (0A000, nothing made)"] = \
+        whole["http"][0] == "0A000" and "REPLACE INTO is MySQL's" in whole["http"][1] and whole["mcp"][0] is True and "REPLACE INTO is MySQL's" in whole["mcp"][1] and whole["made"] == []
+    if not checks[list(checks)[-1]]:
+        failed["script refused whole"] = whole
     # (11-02 audit M13: a UBIGINT went out as INT8, and 2^63 and above as NULL)
     try:
         with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pc:

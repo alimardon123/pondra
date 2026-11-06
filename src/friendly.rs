@@ -1287,7 +1287,7 @@ fn array_agg_limit(f: &mut Function) -> Option<String> {
 }
 
 /// A string literal's text.
-fn string_of(e: &Expr) -> Option<&str> {
+pub(crate) fn string_of(e: &Expr) -> Option<&str> {
     match e {
         Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Some(s),
         _ => None,

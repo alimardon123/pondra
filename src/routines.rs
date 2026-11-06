@@ -1042,6 +1042,7 @@ async fn run_steps(app: &App, steps: Vec<(String, Option<String>)>, who: Who, jo
 /// `params` are the values it was given (`vars.rs`): `$name` is one until something sets it, and a
 /// `DECLARE` takes one in place of its default.
 pub async fn script(app: &App, sql: &str, params: &HashMap<String, Value>, views: &HashMap<String, String>, who: Who, job: Option<String>) -> Result<Outcome> {
+    crate::dialect_stmts::refused(sql)?; // (another database's statement anywhere in it: refused by name before any of it runs, at every door that runs a script, `dialect_stmts.rs`)
     let go = script_of(app, sql, views, who, job);
     match crate::vars::in_run() && params.is_empty() {
         true => go.await, // (a file run's cell, a lent connection's request: the run's values)
