@@ -1,0 +1,35 @@
+Pondra: a streamhouse in one binary. With no command, a SQL shell on a lake
+
+Usage: pondra [LAKE]
+       pondra <COMMAND>
+
+Commands:
+  serve      Serve a lake, or a folder of lakes as databases: `pondra serve lake`, `pondra serve data`
+  service    Keep a node running on this machine: started at boot and again if it stops (systemd, launchd or Windows's service manager). `pondra service install --lake s3://bucket/lake`
+  workspace  The lake's files kept in a folder of your own, for git and your editor: `pondra workspace pull ./ws` writes them there, `pondra workspace push ./ws` sends back what changed. A file changed on both sides is listed and left as it is
+  init       Start a project in DIR (default: this folder): pondra.toml, objects/, migrations/, seeds/ and tests/. `pondra export` writes one from a database instead (pondra init shop)
+  login      Keep a token for each server, for every command after. With no URL: the servers pondra.toml names (pondra login https://pondra.acme.com)
+  branch     Start a branch: a Git branch and a database of the same name, prod's data with no file copied (pondra branch add-discounts). With no name, the branches; -d NAME drops one
+  switch     Go to a branch that exists, as `git switch` does, and make its database if it isn't there (pondra switch add-discounts)
+  plan       What an apply would change in an environment, and why anything is refused (pondra plan test)
+  status     What differs between the project's files and an environment, as `git status` does: what an apply would change, what was changed in the database outside an apply, and what no project declares (pondra status)
+  capture    Write what was changed in the database outside an apply into the project's files: each object's statement, a migration for a renamed table or column (pondra capture sales.memos)
+  apply      Make the project true in an environment: its plan, each step, then its tests (pondra apply test)
+  test       Run the project's tests (tests/*.sql: any row back is a failure) in an environment (pondra test test)
+  export     An environment's objects as a project's files, in DIR (default: this folder) (pondra export copy --env prod)
+  diff       What an environment changes against another: the objects, and the rows of each table both have (`pondra.diff`). Written as Markdown, for a pull request's summary (pondra diff pr-12)
+  ci         Continuous integration: `pondra ci init` writes a GitHub Actions workflow for the project (pondra ci init)
+  catalog    Print catalog entries whose keys start with `prefix` (t/ tables, s/ segments, p/ producers…)
+  sql        Run SQL straight against the lake, no server needed. Queries read the bucket (and local files: `SELECT * FROM 'x.parquet'`). Writes (CREATE TABLE, INSERT, UPDATE, DELETE) run here too; the leader records them — over HTTP, or through the bucket if this machine can't reach it — or this process does if nobody leads
+  backup     Back a lake up into a lake of its own: `pondra backup s3://b/prod s3://b/backups/prod`. Run again, it copies only what changed since, and keeps what earlier runs need for `--retention-days` (7 by default), so a restore can go back that far. The backup is read like any lake, and written only by its next run. Works with no node running
+  restore    Make a lake again from its backup, in a new place: `pondra restore s3://b/backups/prod s3://b/prod2 [--at '2026-10-12 03:00:00']` (its newest run at or before that time, in UTC). Its tasks come back suspended (ALTER TASK name RESUME)
+  token      Make a token for a user of a lake, and print it (once: the lake keeps only its hash). Through the bucket, so no token is needed: whoever can write the lake's folder owns it. The lake's first user is `pondra` (made by a node on the network with no token, which prints its token too). `T=$(pondra token --dir lake)`
+  run        Run a SQL file — its statements in order, `$name` taking the value of `--name` — on a node of the lake started for it (`pondra run load.sql lake --day 2026-09-27`), or on a node already running (`--url http://host:8080`). `pondra run load.sql --help` lists its parameters
+  help       Print this message or the help of the given subcommand(s)
+
+Arguments:
+  [LAKE]  With no command: the lake the SQL shell opens (a folder, s3://bucket/prefix, or :memory: for one held in memory until the shell ends; default ./lake)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version

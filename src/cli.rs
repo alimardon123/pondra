@@ -1,11 +1,10 @@
 //! The `pondra` command: its subcommands and options, and what each one starts.
 use crate::*;
-use clap::Parser;
 use std::io::Write;
 use std::sync::Arc;
 
 /// Pondra: a streamhouse in one binary. With no command, a SQL shell on a lake.
-#[derive(Parser)]
+#[derive(clap::Parser)]
 #[command(version, args_conflicts_with_subcommands = true)]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -33,6 +32,7 @@ pub(crate) enum Cmd {
         /// a lake held in this node's memory, gone when it stops. `pondra://host:port`: a lake whose
         /// store another node serves (`--serve-store`), which leads it.
         path: Option<String>,
+        // (the flags that are node settings, `--memory-gb` and the others, are their entries' in `settings.rs`: `command`)
         /// For scripts and services, nothing guessed: exactly this lake (made if it isn't there).
         #[arg(long = "lake", alias = "dir", value_name = "LAKE", conflicts_with_all = ["path", "databases"])]
         dir: Option<String>,
@@ -53,10 +53,6 @@ pub(crate) enum Cmd {
         /// Read-only node: any number can run next to the single writer.
         #[arg(long)]
         reader: bool,
-        /// Serve this lake's store to nodes on other machines, which open it as pondra://host:port. Needs an
-        /// admin token, the same on every node; this node leads the lake. A folder or :memory: only.
-        #[arg(long)]
-        serve_store: bool,
         /// Minimum milliseconds between a node's flushes. 0: flush as soon as the previous flush
         /// is committed (what queued up meanwhile goes together), for the lowest latency.
         #[arg(long, default_value_t = node::Start::default().flush_ms)]
@@ -71,29 +67,13 @@ pub(crate) enum Cmd {
         /// Streaming tasks run as soon as new rows commit, and at least this often (milliseconds).
         #[arg(long, default_value_t = node::Start::default().task_ms)]
         task_ms: u64,
-        /// Memory for queries, in GB (also PONDRA_MEMORY_GB; default: a third of the machine's).
-        /// Sorts, joins and aggregations that need more spill to the temp dir.
-        #[arg(long)]
-        memory_gb: Option<f64>,
         /// Seconds to keep consumed log segments and replaced files before deleting them.
         #[arg(long, default_value_t = node::Start::default().retain_secs)]
         retain_secs: u64,
-        /// Keep the log this many seconds as a change feed: `/watch/{t}?after=N` replays every
-        /// change since N (upserts and deletes of keyed tables included). 0: only `--retain-secs`.
-        #[arg(long, default_value_t = 0)]
-        changelog_secs: u64,
         /// Rows allowed to wait in the log for tiering before commits pause (backpressure).
         /// Lower it for less memory, raise it to absorb longer bursts.
         #[arg(long, default_value_t = node::Start::default().backlog)]
         backlog: u64,
-        /// Lakes on object storage: where this node keeps its local SSD copy of recent objects
-        /// (default: <temp dir>/pondra-cache-<uid>, the user's own).
-        #[arg(long)]
-        cache_dir: Option<String>,
-        /// Size of that SSD tier in GB (0 turns it off; default: 20, or a quarter of the free
-        /// disk if that is less).
-        #[arg(long)]
-        cache_gb: Option<u64>,
         /// When a write is acknowledged. `durable`: once it is in the bucket (one object-store
         /// write: a millisecond on local disk, 100s of ms on S3 or R2). `replicated`: once
         /// `--replicas` nodes hold it — the leader in memory, followers on local disk — which
@@ -105,15 +85,6 @@ pub(crate) enum Cmd {
         /// leader is one). Until enough followers are up, writes are acknowledged once durable.
         #[arg(long, default_value_t = 2)]
         replicas: usize,
-        /// With `--ack replicated`: followers flush each copy to disk before acknowledging it, so
-        /// an acked write survives a power loss of the follower too (costs a disk flush per change).
-        #[arg(long)]
-        fsync: bool,
-        /// Open formats new tables are also published in, for engines that don't know Pondra:
-        /// `delta`, `iceberg` or `delta,iceberg` (default: none; Pondra and `pondra sql` read the
-        /// lake natively, fresher). Per table: `"publish"` when creating it.
-        #[arg(long, default_value = "")]
-        publish: String,
         /// Also speak the Postgres wire protocol here (e.g. 0.0.0.0:5432): psql, drivers, BI tools.
         #[arg(long)]
         pg: Option<String>,
@@ -129,26 +100,6 @@ pub(crate) enum Cmd {
         /// pyarrow clients, Arrow in and out; a table's log as a columnar stream.
         #[arg(long)]
         flight: Option<String>,
-        /// Access tokens (also PONDRA_READ_TOKEN, PONDRA_WRITE_TOKEN, PONDRA_ADMIN_TOKEN): reading
-        /// needs any, writing rows write or admin, tables/views/tasks admin. Give every node the
-        /// same ones; none set = no checks.
-        #[arg(long)]
-        read_token: Option<String>,
-        #[arg(long)]
-        write_token: Option<String>,
-        #[arg(long)]
-        admin_token: Option<String>,
-        /// TLS on every door (also PONDRA_TLS_CERT, PONDRA_TLS_KEY): a PEM certificate and its key.
-        /// Plain connections are then taken only from this machine (PONDRA_TLS=optional: from
-        /// anywhere), and nodes call each other over HTTPS.
-        #[arg(long)]
-        tls_cert: Option<String>,
-        #[arg(long)]
-        tls_key: Option<String>,
-        /// The authority that signs the nodes' certificates (also PONDRA_TLS_CA): nodes show theirs
-        /// to each other (mutual TLS), and the nodes' key is taken only with one.
-        #[arg(long)]
-        tls_ca: Option<String>,
         /// Another lake to read as `name.table`, and write to through its own leader (repeatable):
         /// `--attach sales=s3://bucket/sales`. Several clusters, each leading its own lake, share
         /// one bucket this way.
@@ -280,10 +231,67 @@ pub(crate) enum Cmd {
     },
 }
 
+/// The `pondra` command and its subcommands, as `run` parses them. `serve` also takes the node settings whose entries give
+/// them a flag (`settings.rs`), each shown after the flag its entry names.
+pub(crate) fn command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command().mut_subcommand("serve", |mut serve| {
+        let flags: Vec<(&settings::Setting, settings::Flag)> = settings::all().iter().filter_map(|s| Some((s, s.flag?))).collect();
+        for &(s, f) in &flags {
+            // (its help as a doc comment's is: clap ends one without a period)
+            let help = if f.help.ends_with('.') && !f.help.ends_with("..") { &f.help[..f.help.len() - 1] } else { f.help };
+            let arg = clap::Arg::new(s.var).long(long(s)).help(Some(help).filter(|h| !h.is_empty()));
+            serve = serve.arg(match s.kind {
+                settings::Kind::Bool | settings::Kind::Switch => arg.action(clap::ArgAction::SetTrue),
+                _ => arg.action(clap::ArgAction::Set).value_name(&s.var["PONDRA_".len()..]).default_value(f.shows).value_parser(move |v: &str| match s.reads(v) {
+                    true => Ok(v.to_string()),
+                    false => Err(if s.kind == settings::Kind::Int { "not a whole number of 0 or more" } else { "not a number of 0 or more" }),
+                }),
+            });
+        }
+        let mut order = Vec::new();
+        for (id, at) in serve.get_arguments().filter(|a| !a.is_positional() && flags.iter().all(|(s, _)| a.get_id() != s.var)).map(|a| (a.get_id().to_string(), a.get_long().unwrap_or_default().to_string())).collect::<Vec<_>>() {
+            order.push(id);
+            after(&at, &flags, &mut order);
+        }
+        order.extend(flags.iter().map(|(s, _)| s.var.to_string()).filter(|v| !order.contains(v)).collect::<Vec<_>>()); // (after a flag there isn't: last)
+        for (i, id) in order.into_iter().enumerate() {
+            serve = serve.mut_arg(id, |a| a.display_order(i));
+        }
+        serve
+    })
+}
+
+/// `args` parsed as `run` parses its command line (`pondra service install` checks a service's options with it).
+pub(crate) fn parse_from(args: impl IntoIterator<Item = String>) -> Result<Cli, clap::Error> {
+    let m = command().try_get_matches_from(args)?;
+    <Cli as clap::FromArgMatches>::from_arg_matches(&m).map_err(|e| e.format(&mut command()))
+}
+
+/// A setting's flag: `--memory-gb` for `PONDRA_MEMORY_GB`.
+fn long(s: &settings::Setting) -> String {
+    s.name().replace('_', "-")
+}
+
+/// Puts in `order` the setting flags shown after the flag `at`, each followed by the ones after it.
+fn after(at: &str, flags: &[(&settings::Setting, settings::Flag)], order: &mut Vec<String>) {
+    for (s, _) in flags.iter().filter(|(_, f)| f.after == at) {
+        order.push(s.var.to_string());
+        after(&long(s), flags, order);
+    }
+}
+
+/// The settings `pondra serve` was given as flags on its command line (`command`), by their names in the environment.
+fn flags(serve: &clap::ArgMatches) -> Vec<(&'static str, String)> {
+    let on = |s: &&settings::Setting| s.flag.is_some() && serve.value_source(s.var) == Some(clap::parser::ValueSource::CommandLine);
+    settings::all().iter().filter(on).map(|s| (s.var, match s.kind {
+        settings::Kind::Bool | settings::Kind::Switch => "true".to_string(),
+        _ => serve.get_one::<String>(s.var).cloned().unwrap_or_default(),
+    })).collect()
+}
+
 /// `pondra run --help`, and with a file its parameters, as `--name` options (ADR-037).
 fn run_help(file: Option<&str>) -> anyhow::Result<()> {
-    use clap::CommandFactory;
-    let mut cmd = Cli::command();
+    let mut cmd = command();
     let run = cmd.find_subcommand_mut("run").expect("the run command");
     let Some(file) = file else { return Ok(run.print_help()?) };
     let text = std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("{file}: {e}"))?;
@@ -383,7 +391,7 @@ async fn opened(lake: &str, given: bool) -> anyhow::Result<()> {
     }
     anyhow::ensure!(!path.is_file(), "{lake} is a file, and pondra opens a lake (a folder): run pondra, then read it with FROM '{lake}'");
     if !path.exists() {
-        let commands = <Cli as clap::CommandFactory>::command();
+        let commands = command();
         if let Some(c) = commands.get_subcommands().filter(|c| !c.is_hide_set()).map(|c| c.get_name()).find(|c| mistyped(lake, c)) {
             anyhow::bail!("no command {lake}: did you mean `pondra {c}`? (a new lake named {lake}: pondra ./{lake})");
         }
@@ -414,7 +422,8 @@ fn mistyped(word: &str, c: &str) -> bool {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let matches = command().get_matches();
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.format(&mut command()).exit());
     store::inherit(); // (a lake led for a moment, reached as the process that asked reaches it)
     let Some(cmd) = cli.cmd else {
         let given = cli.lake.is_some();
@@ -423,23 +432,22 @@ async fn run() -> anyhow::Result<()> {
         return shell::run(&lake).await;
     };
     match cmd {
-        Cmd::Serve { path, dir, databases, default, addr, advertise, reader, serve_store, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, tls_cert, tls_key, tls_ca, attach: attached, attach_found, stop_with_stdin, idle_exit, python } => {
-            // The flags that are settings (`env.rs`) are given to the process at once, before anything
-            // reads them; its children get them too (a folder of lakes' databases, `pondra lead`).
-            let mut given: Vec<(&str, String)> = [("PONDRA_TLS_CERT", tls_cert), ("PONDRA_TLS_KEY", tls_key), ("PONDRA_TLS_CA", tls_ca)]
-                .into_iter().filter_map(|(var, flag)| Some((var, flag?))).collect();
-            let token = |flag: Option<String>, var: &str| flag.or_else(|| env::get(var)).filter(|t| !t.is_empty());
+        Cmd::Serve { path, dir, databases, default, addr, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, ack, replicas, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, stop_with_stdin, idle_exit, python } => {
+            // The flags that are settings (`settings.rs`) are given to the process at once, before anything reads them, and
+            // its children get them too (a folder of lakes' databases, `pondra lead`). A setting not on the command line is
+            // the environment's, else its default, as anywhere.
+            let mut given = flags(matches.subcommand_matches("serve").expect("serve's own"));
+            given.push(("PONDRA_REPLICAS", if ack == "replicated" { replicas.max(1) } else { 1 }.to_string()));
+            given.extend(idle_exit.map(|s| ("PONDRA_IDLE_EXIT_SECS", s.to_string())));
+            env::give(given)?;
             // A lake, or a folder of lakes (each a database: `dbserver.rs`), by what the path holds.
             let (path, dir) = (path.map(|p| crate::memory::place(&p)), dir.map(|d| crate::memory::place(&d))); // (`:memory:`: in this process's memory)
             // (a node that serves its lake's store: checked before anything is opened; a folder of lakes is never
             // served that way, and `--lakes` names none: `served.rs`)
-            let serving = serve_store || env::flag("PONDRA_SERVE_STORE");
+            let serving = env::flag("PONDRA_SERVE_STORE");
             if databases.is_none() {
                 let lake = dir.clone().or_else(|| path.clone()).unwrap_or_else(|| ".".into());
-                served::checked(&lake, reader, token(admin_token.clone(), "PONDRA_ADMIN_TOKEN").is_some(), serving)?;
-            }
-            if serving {
-                given.push(("PONDRA_SERVE_STORE", "1".to_string())); // (a node's setting, as `--serve-store` is: nodes restarted by it keep it)
+                served::checked(&lake, reader, env::get("PONDRA_ADMIN_TOKEN").is_some(), serving)?;
             }
             let (dir, many) = match (dir, databases) {
                 // (a lake another node serves: its place is its URL, and nothing here is made or counted as a folder)
@@ -475,26 +483,15 @@ async fn run() -> anyhow::Result<()> {
                 if let Some((_, flag)) = one.iter().find(|(given, _)| *given) {
                     anyhow::bail!("{dir} holds several lakes, served as databases; {flag} is one lake's (serve that lake: pondra serve {dir}/<name> {flag} …)");
                 }
-                let (r, w, a) = (token(read_token, "PONDRA_READ_TOKEN"), token(write_token, "PONDRA_WRITE_TOKEN"), token(admin_token, "PONDRA_ADMIN_TOKEN"));
-                // (each database's node takes the tokens from here)
-                given.extend([("PONDRA_READ_TOKEN", &r), ("PONDRA_WRITE_TOKEN", &w), ("PONDRA_ADMIN_TOKEN", &a)].into_iter().filter_map(|(var, t)| Some((var, t.clone()?))));
-                env::give(given)?;
                 tls::init()?; // (a certificate that can't be read: said now)
-                let auth = Arc::new(auth::Auth::new(r, w, a));
+                let auth = Arc::new(auth::Auth::new(env::get("PONDRA_READ_TOKEN"), env::get("PONDRA_WRITE_TOKEN"), env::get("PONDRA_ADMIN_TOKEN")));
                 let on_network = on_network(&addr, [&pg, &kafka, &flight]);
                 anyhow::ensure!(auth.on() || !on_network, "a folder of lakes served on {addr} answers anyone there: set --admin-token (each database's node takes it), or listen on 127.0.0.1");
                 anyhow::ensure!(python.is_none() || auth.on() || !on_network, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
-                // Each database's node gets the rest, as `pondra serve <lake>` would take them.
-                let mut node: Vec<String> = ["--flush-ms", &flush_ms.to_string(), "--task-ms", &task_ms.to_string(), "--retain-secs", &retain_secs.to_string(),
-                    "--changelog-secs", &changelog_secs.to_string(), "--backlog", &backlog.to_string(), "--ack", &ack, "--replicas", &replicas.to_string()].map(String::from).to_vec();
-                for (flag, v) in [("--memory-gb", memory_gb.map(|m| m.to_string())), ("--cache-dir", cache_dir), ("--cache-gb", cache_gb.map(|g| g.to_string())), ("--publish", Some(publish).filter(|p| !p.is_empty()))] {
-                    if let Some(v) = v {
-                        node.extend([flag.to_string(), v]);
-                    }
-                }
-                if fsync {
-                    node.push("--fsync".into());
-                }
+                // Each database's node gets the rest, as `pondra serve <lake>` would take them (and the settings given here, the
+                // tokens too, as its environment: `dbserver.rs`).
+                let node: Vec<String> = ["--flush-ms", &flush_ms.to_string(), "--task-ms", &task_ms.to_string(), "--retain-secs", &retain_secs.to_string(),
+                    "--backlog", &backlog.to_string(), "--ack", &ack, "--replicas", &replicas.to_string()].map(String::from).to_vec();
                 let options = dbserver::Options { python, tier_secs: Some(tier_secs), reader, node };
                 return dbserver::serve(dir, addr, pg, default, options, auth).await;
             }
@@ -509,21 +506,8 @@ async fn run() -> anyhow::Result<()> {
             }
             // (on the network a node is never open: with no token, its leader makes the lake's first user before it serves, `node.rs`)
             let on_network = on_network(&addr, [&pg, &kafka, &flight]);
-            let auth = auth::Auth::new(token(read_token, "PONDRA_READ_TOKEN"), token(write_token, "PONDRA_WRITE_TOKEN"), token(admin_token.clone(), "PONDRA_ADMIN_TOKEN"));
-            let auth = Arc::new(auth.on_network(on_network).owned_by(owner));
-            if let Some(t) = token(admin_token, "PONDRA_ADMIN_TOKEN") {
-                given.push(("PONDRA_ADMIN_TOKEN", t)); // (nodes call each other with it: cluster::http)
-            }
-            given.extend(cache_gb.map(|gb| ("PONDRA_CACHE_GB", gb.to_string())).into_iter().chain(memory_gb.map(|gb| ("PONDRA_MEMORY_GB", gb.to_string())))); // (read by Lake::open)
-            given.extend([
-                ("PONDRA_PUBLISH", publish), // read by POST /tables
-                ("PONDRA_CHANGELOG_SECS", changelog_secs.to_string()), // read by tier::expire
-                ("PONDRA_FSYNC", fsync.to_string()), // read by replica::ReplicaLog::hold
-                ("PONDRA_REPLICAS", if ack == "replicated" { replicas.max(1) } else { 1 }.to_string()),
-            ]);
-            given.extend(cache_dir.map(|d| ("PONDRA_CACHE_DIR", d)));
-            given.extend(idle_exit.map(|s| ("PONDRA_IDLE_EXIT_SECS", s.to_string())));
-            env::give(given)?;
+            let auth = auth::Auth::new(env::get("PONDRA_READ_TOKEN"), env::get("PONDRA_WRITE_TOKEN"), env::get("PONDRA_ADMIN_TOKEN"));
+            let auth = Arc::new(auth.on_network(on_network).owned_by(owner)); // (nodes call each other with the admin one: cluster::http)
             tls::init()?; // (a certificate that can't be read: said now)
             anyhow::ensure!(python.is_none() || auth.on() || !on_network, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
             // Stopped (Ctrl-C, SIGTERM from a scheduler scaling down, or the program that started
@@ -727,6 +711,53 @@ mod tests {
         assert_eq!(sql, "BACKUP DATABASE TO 'it''s/here' WITH (retention_days = 3)");
         let Some(crate::write::Stmt::Ddl(ds)) = crate::write::parse(&sql) else { panic!("a backup statement: {sql}") };
         assert!(matches!(&ds[..], [crate::ddl::Ddl::BackupDatabase { database: None, to, retention_days: Some(3) }] if to == "it's/here"), "{sql}");
+    }
+
+    /// `pondra --help`, `pondra serve --help` and their `-h`, as `tests/fixtures/help/` holds them: a change to them is
+    /// meant (copy the one it writes under target/help/ there), never a side effect of where a flag is defined.
+    #[test]
+    fn the_help_is_as_it_was() {
+        let at = |p: &str| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(p);
+        let mut changed = Vec::new();
+        for (file, args) in [("pondra.txt", &["pondra", "--help"][..]), ("pondra-h.txt", &["pondra", "-h"]), ("serve.txt", &["pondra", "serve", "--help"]), ("serve-h.txt", &["pondra", "serve", "-h"])] {
+            let Err(e) = super::command().try_get_matches_from(args) else { panic!("{args:?} shows help") };
+            assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp, "{args:?}");
+            let shown = e.render().to_string();
+            if std::fs::read_to_string(at(&format!("tests/fixtures/help/{file}"))).ok().as_ref() != Some(&shown) {
+                let _ = std::fs::create_dir_all(at("target/help"));
+                std::fs::write(at(&format!("target/help/{file}")), &shown).unwrap();
+                changed.push(format!("`{}` (target/help/{file})", args.join(" ")));
+            }
+        }
+        assert!(changed.is_empty(), "{} changed: diff each with tests/fixtures/help/, and copy it there if that is meant", changed.join(", "));
+    }
+
+    /// A setting's flag is given only when it is on the command line, as it was written there; else the environment holds.
+    #[test]
+    fn serve_gives_the_settings_on_its_command_line() {
+        let given = |args: &[&str]| {
+            let m = super::command().try_get_matches_from([&["pondra", "serve"][..], args].concat()).unwrap();
+            super::flags(m.subcommand_matches("serve").unwrap())
+        };
+        assert_eq!(given(&[]), vec![]);
+        assert!(super::parse_from(["pondra", "serve", "--memory-gb", "4", "--tls-cert", "c.pem"].map(String::from)).is_ok(), "as a service's options are checked");
+        assert_eq!(given(&["--publish", "delta", "--fsync", "--memory-gb", "1.5", "--admin-token", ""]),
+            [("PONDRA_ADMIN_TOKEN", ""), ("PONDRA_FSYNC", "true"), ("PONDRA_MEMORY_GB", "1.5"), ("PONDRA_PUBLISH", "delta")].map(|(v, x)| (v, x.to_string())).to_vec());
+        for wrong in [&["--memory-gb", "-1"][..], &["--cache-gb", "lots"], &["--changelog-secs", "inf"]] {
+            assert!(super::command().try_get_matches_from([&["pondra", "serve"][..], wrong].concat()).is_err(), "{wrong:?}");
+        }
+    }
+
+    /// Each setting's flag comes after a flag `serve` has, and is a node's.
+    #[test]
+    fn each_setting_flag_has_its_place() {
+        let mut cmd = super::command();
+        let serve = cmd.find_subcommand_mut("serve").unwrap();
+        let longs: Vec<String> = serve.get_arguments().filter_map(|a| a.get_long()).map(String::from).collect();
+        for s in crate::settings::all().iter().filter(|s| s.flag.is_some()) {
+            assert!(longs.contains(&s.flag.unwrap().after.to_string()), "{} comes after --{}, which serve hasn't", s.var, s.flag.unwrap().after);
+            assert_eq!(s.who, crate::settings::Who::Node, "{}", s.var);
+        }
     }
 
     #[test]

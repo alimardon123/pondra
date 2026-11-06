@@ -94,6 +94,21 @@ pub struct Setting {
     pub unset: Unset,
     pub scope: Scope,
     pub change: Change,
+    /// `pondra serve` takes it as a flag too (`--memory-gb`).
+    pub flag: Option<Flag>,
+}
+
+/// A node setting's flag of `pondra serve`, named as the setting is (`--memory-gb` for `memory_gb`). One given on the command line
+/// is given to the node (`env::give`) and wins; else the environment holds, else the default, as for any setting.
+#[derive(Clone, Copy, Debug)]
+pub struct Flag {
+    /// What it does, one paragraph (`pondra serve --help`, and the reference page), or empty for one that the flag before it
+    /// says (`--write-token` after `--read-token`).
+    pub help: &'static str,
+    /// The flag it comes after in `pondra serve --help`, by its long name.
+    pub after: &'static str,
+    /// The default the help shows, where it shows one.
+    pub shows: Option<&'static str>,
 }
 
 impl Setting {
@@ -110,10 +125,32 @@ impl Setting {
             Unset::Of(f) => Some(f()),
         }
     }
+
+    /// Does `v` read as a value of its kind: a number for a number, 0 or more (a time and a size take fractions)?
+    pub fn reads(&self, v: &str) -> bool {
+        match self.kind {
+            Kind::Int => v.trim().parse::<u64>().is_ok(),
+            Kind::Float | Kind::Secs | Kind::Ms | Kind::Hours | Kind::Days | Kind::Kb | Kind::Mb | Kind::Gb => v.trim().parse::<f64>().is_ok_and(|n| n >= 0.0 && n.is_finite()),
+            _ => true,
+        }
+    }
+
+    /// The same setting, which `pondra serve` also takes as a flag, shown after the flag `after`.
+    pub const fn flag(self, after: &'static str, help: &'static str) -> Setting {
+        Setting { flag: Some(Flag { help, after, shows: None }), ..self }
+    }
+
+    /// Its flag's help shows this default.
+    pub const fn shows(self, default: &'static str) -> Setting {
+        match self.flag {
+            Some(f) => Setting { flag: Some(Flag { shows: Some(default), ..f }), ..self },
+            None => panic!("only a flag shows a default"),
+        }
+    }
 }
 
 pub const fn of(var: &'static str, who: Who, kind: Kind, unset: Unset) -> Setting {
-    Setting { var, who, kind, unset, scope: Scope::Node, change: Change::Start }
+    Setting { var, who, kind, unset, scope: Scope::Node, change: Change::Start, flag: None }
 }
 pub const fn node(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Node, kind, unset) }
 pub const fn command(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Command, kind, unset) }
@@ -137,7 +174,7 @@ use Unset::{Is, No, Of};
 
 /// The node's own settings, which the `settings` extension adds (an extension's own are beside its code).
 pub const CORE: &[Setting] = &[
-    node("PONDRA_ADMIN_TOKEN", Secret, No),
+    node("PONDRA_ADMIN_TOKEN", Secret, No).flag("write-token", ""),
     node("PONDRA_ADMIN_TOKEN_PREVIOUS", Secret, No),
     node("PONDRA_ALLOW_UNSIGNED_EXTENSIONS", Bool, No),
     node("PONDRA_AUDIT", List, Is("role,ddl,function")),
@@ -145,10 +182,13 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_BLOCKING_THREADS", Int, Of(blocking_threads)),
     node("PONDRA_BROADCAST_MB", Mb, Is("64")),
     node("PONDRA_BUCKET_REQUESTS", Int, Is("256")),
-    node("PONDRA_CACHE_DIR", Path, No),
-    node("PONDRA_CACHE_GB", Gb, No),
+    node("PONDRA_CACHE_DIR", Path, No).flag("backlog", "Lakes on object storage: where this node keeps its local SSD copy of recent \
+        objects (default: <temp dir>/pondra-cache-<uid>, the user's own)."),
+    node("PONDRA_CACHE_GB", Gb, No).flag("cache-dir", "Size of that SSD tier in GB (0 turns it off; default: 20, or a quarter of \
+        the free disk if that is less)."),
     node("PONDRA_CACHE_MB", Mb, Is("1024")),
-    node("PONDRA_CHANGELOG_SECS", Secs, Is("0")),
+    node("PONDRA_CHANGELOG_SECS", Secs, Is("0")).flag("retain-secs", "Keep the log this many seconds as a change feed: \
+        `/watch/{t}?after=N` replays every change since N (upserts and deletes of keyed tables included). 0: only `--retain-secs`.").shows("0"),
     node("PONDRA_CODEC", Text, No),
     node("PONDRA_CONFIG_DIR", Path, No),
     node("PONDRA_CONSOLE_DIR", Path, No),
@@ -171,7 +211,8 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_FILES_CACHE_MB", Mb, Is("512")),
     node("PONDRA_FILE_VERSIONS", Int, Is("50")),
     node("PONDRA_FILE_VERSIONS_DAYS", Days, Is("90")),
-    node("PONDRA_FSYNC", Bool, No),
+    node("PONDRA_FSYNC", Bool, No).flag("replicas", "With `--ack replicated`: followers flush each copy to disk before acknowledging \
+        it, so an acked write survives a power loss of the follower too (costs a disk flush per change)."),
     node("PONDRA_FUNCTION_CACHE_MB", Mb, Is("256")),
     node("PONDRA_GC_SECS", Secs, No),
     node("PONDRA_HISTORY", Text, No),
@@ -192,25 +233,31 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_LOCK_LEASE_SECS", Secs, Is("60")),
     node("PONDRA_MATCH_HELD_ROWS", Int, Is("1000000")),
     node("PONDRA_MATCH_RUN_ROWS", Int, Is("1000000")),
-    node("PONDRA_MEMORY_GB", Gb, No),
+    node("PONDRA_MEMORY_GB", Gb, No).flag("task-ms", "Memory for queries, in GB (also PONDRA_MEMORY_GB; default: a third of the \
+        machine's). Sorts, joins and aggregations that need more spill to the temp dir."),
     node("PONDRA_MEMORY_LAKE_GB", Gb, No),
     node("PONDRA_MEMORY_MAX_GB", Gb, No),
     node("PONDRA_PAGES_MB", Mb, Is("256")),
     node("PONDRA_PIN_LEASE_SECS", Secs, Is("1209600")),
     node("PONDRA_PIN_RENEW_SECS", Secs, Is("3600")),
     node("PONDRA_PROCEDURES", Int, Of(procedures)),
-    node("PONDRA_PUBLISH", List, No),
+    node("PONDRA_PUBLISH", List, No).flag("fsync", "Open formats new tables are also published in, for engines that don't know Pondra: \
+        `delta`, `iceberg` or `delta,iceberg` (default: none; Pondra and `pondra sql` read the lake natively, fresher). Per table: \
+        `\"publish\"` when creating it.").shows(""),
     node("PONDRA_PURGE_ROWS", Int, Is("100000")),
     node("PONDRA_PYTHON", Path, No),
     node("PONDRA_PYTHON_PROBE_SECS", Secs, Is("15")),
     node("PONDRA_QUERIES", Int, Of(queries)),
     node("PONDRA_QUEUE_SECS", Secs, Is("60")),
-    node("PONDRA_READ_TOKEN", Secret, No),
+    node("PONDRA_READ_TOKEN", Secret, No).flag("flight", "Access tokens (also PONDRA_READ_TOKEN, PONDRA_WRITE_TOKEN, \
+        PONDRA_ADMIN_TOKEN): reading needs any, writing rows write or admin, tables/views/tasks admin. Give every node the same \
+        ones; none set = no checks."),
     node("PONDRA_REPLICAS", Int, Is("1")),
     node("PONDRA_RUNS_DAYS", Days, Is("30")),
     node("PONDRA_SECRET_KEY", Secret, No),
     node("PONDRA_SECRET_KEY_PREVIOUS", Secret, No),
-    node("PONDRA_SERVE_STORE", Bool, No),
+    node("PONDRA_SERVE_STORE", Bool, No).flag("reader", "Serve this lake's store to nodes on other machines, which open it as \
+        pondra://host:port. Needs an admin token, the same on every node; this node leads the lake. A folder or :memory: only."),
     node("PONDRA_SESSION_HOURS", Hours, No),
     node("PONDRA_SESSION_IDLE_SECS", Secs, Is("3600")),
     node("PONDRA_SHARED_KEY_FILE", Path, No),
@@ -230,9 +277,12 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_STREAM_MB", Mb, Is("8")),
     node("PONDRA_TEMP_MB", Mb, Is("1024")),
     node("PONDRA_TLS", Text, No),
-    node("PONDRA_TLS_CA", Path, No),
-    node("PONDRA_TLS_CERT", Path, No),
-    node("PONDRA_TLS_KEY", Path, No),
+    node("PONDRA_TLS_CA", Path, No).flag("tls-key", "The authority that signs the nodes' certificates (also PONDRA_TLS_CA): nodes \
+        show theirs to each other (mutual TLS), and the nodes' key is taken only with one."),
+    node("PONDRA_TLS_CERT", Path, No).flag("admin-token", "TLS on every door (also PONDRA_TLS_CERT, PONDRA_TLS_KEY): a PEM certificate \
+        and its key. Plain connections are then taken only from this machine (PONDRA_TLS=optional: from anywhere), and nodes call \
+        each other over HTTPS."),
+    node("PONDRA_TLS_KEY", Path, No).flag("tls-cert", ""),
     node("PONDRA_TRACE_COMMIT", Switch, No),
     node("PONDRA_TRACE_PG", Switch, No),
     node("PONDRA_TRACE_QUERY", Switch, No),
@@ -249,7 +299,7 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_WORKER_IDLE_SECS", Secs, Is("60")),
     node("PONDRA_WORKER_MB", Mb, Is("2048")),
     node("PONDRA_WORKER_START_SECS", Secs, Is("60")),
-    node("PONDRA_WRITE_TOKEN", Secret, No),
+    node("PONDRA_WRITE_TOKEN", Secret, No).flag("read-token", ""),
     command("PONDRA_BROWSER", Text, No),
     command("PONDRA_ENV", Text, No),
     command("PONDRA_HOME", Path, No),
@@ -336,6 +386,14 @@ mod tests {
         let mut s = Settings::default();
         s.add(CORE);
         s.add(&[node("PONDRA_MEMORY_GB", Gb, No)]);
+    }
+
+    #[test]
+    fn a_value_reads_as_its_kind() {
+        let (gb, n, path) = (find("PONDRA_MEMORY_GB").unwrap(), find("PONDRA_REPLICAS").unwrap(), find("PONDRA_CACHE_DIR").unwrap());
+        assert!(gb.reads("1.5") && gb.reads(" 0 ") && !gb.reads("-1") && !gb.reads("inf") && !gb.reads("NaN") && !gb.reads("lots"));
+        assert!(n.reads("3") && !n.reads("1.5") && !n.reads("-1"));
+        assert!(path.reads("-1") && path.reads(""));
     }
 
     /// A default reads as its kind, so `env::value` never meets one it can't.

@@ -1,0 +1,80 @@
+Serve a lake, or a folder of lakes as databases: `pondra serve lake`, `pondra serve data`
+
+Usage: pondra serve [OPTIONS] [PATH]
+
+Arguments:
+  [PATH]  The lake (a folder, or s3://bucket/prefix, its credentials from the AWS_* variables), or a folder of lakes. Default: this folder. A new or empty one becomes a lake. `:memory:`: a lake held in this node's memory, gone when it stops. `pondra://host:port`: a lake whose store another node serves (`--serve-store`), which leads it
+
+Options:
+      --lake <LAKE>
+          For scripts and services, nothing guessed: exactly this lake (made if it isn't there)
+      --lakes <FOLDER>
+          For scripts and services, nothing guessed: exactly this folder of lakes, each a database
+      --default <DEFAULT>
+          Serving a folder of lakes: the database a client that names none gets (default: `lake`, else the only one)
+      --addr <ADDR>
+          Address other nodes reach this one at (also the listen address) [default: 127.0.0.1:8080]
+      --advertise <ADVERTISE>
+          Address other nodes reach this one at, if not `--addr`: a database's node, behind the process serving its folder, `host:port/db/name` (it passes it through)
+      --reader
+          Read-only node: any number can run next to the single writer
+      --serve-store
+          Serve this lake's store to nodes on other machines, which open it as pondra://host:port. Needs an admin token, the same on every node; this node leads the lake. A folder or :memory: only
+      --flush-ms <FLUSH_MS>
+          Minimum milliseconds between a node's flushes. 0: flush as soon as the previous flush is committed (what queued up meanwhile goes together), for the lowest latency [default: 0]
+      --tier-secs <TIER_SECS>
+          Tiering starts as soon as rows commit, at most once per this many seconds (fractions allowed): how soon new rows are Parquet, and a Delta or Iceberg version other engines can read (Pondra's own reads see every commit at once). Each run costs a few object-store writes per busy table, so not more often than that by default; a table with a million rows waiting is tiered within a second anyway (0 = only via POST /tier) [default: 10]
+      --task-ms <TASK_MS>
+          Streaming tasks run as soon as new rows commit, and at least this often (milliseconds) [default: 1000]
+      --memory-gb <MEMORY_GB>
+          Memory for queries, in GB (also PONDRA_MEMORY_GB; default: a third of the machine's). Sorts, joins and aggregations that need more spill to the temp dir
+      --retain-secs <RETAIN_SECS>
+          Seconds to keep consumed log segments and replaced files before deleting them [default: 60]
+      --changelog-secs <CHANGELOG_SECS>
+          Keep the log this many seconds as a change feed: `/watch/{t}?after=N` replays every change since N (upserts and deletes of keyed tables included). 0: only `--retain-secs` [default: 0]
+      --backlog <BACKLOG>
+          Rows allowed to wait in the log for tiering before commits pause (backpressure). Lower it for less memory, raise it to absorb longer bursts [default: 10000000]
+      --cache-dir <CACHE_DIR>
+          Lakes on object storage: where this node keeps its local SSD copy of recent objects (default: <temp dir>/pondra-cache-<uid>, the user's own)
+      --cache-gb <CACHE_GB>
+          Size of that SSD tier in GB (0 turns it off; default: 20, or a quarter of the free disk if that is less)
+      --ack <ACK>
+          When a write is acknowledged. `durable`: once it is in the bucket (one object-store write: a millisecond on local disk, 100s of ms on S3 or R2). `replicated`: once `--replicas` nodes hold it — the leader in memory, followers on local disk — which takes milliseconds on any storage; it reaches the bucket a moment later. Give every node the same setting (any of them may lead) [default: durable] [possible values: durable, replicated]
+      --replicas <REPLICAS>
+          With `--ack replicated`: how many nodes hold a write before it's acknowledged (the leader is one). Until enough followers are up, writes are acknowledged once durable [default: 2]
+      --fsync
+          With `--ack replicated`: followers flush each copy to disk before acknowledging it, so an acked write survives a power loss of the follower too (costs a disk flush per change)
+      --publish <PUBLISH>
+          Open formats new tables are also published in, for engines that don't know Pondra: `delta`, `iceberg` or `delta,iceberg` (default: none; Pondra and `pondra sql` read the lake natively, fresher). Per table: `"publish"` when creating it [default: ""]
+      --pg <PG>
+          Also speak the Postgres wire protocol here (e.g. 0.0.0.0:5432): psql, drivers, BI tools
+      --kafka <KAFKA>
+          Also speak the Kafka protocol here (e.g. 0.0.0.0:9092): Kafka producers write to tables (a topic is a table), consumers read their log
+      --kafka-advertise <KAFKA_ADVERTISE>
+          Where Kafka clients are told to connect to this node (default: the host of `--addr`, the port of `--kafka`)
+      --flight <FLIGHT>
+          Also speak Arrow Flight and Flight SQL here (e.g. 0.0.0.0:8815): ADBC, JDBC and pyarrow clients, Arrow in and out; a table's log as a columnar stream
+      --read-token <READ_TOKEN>
+          Access tokens (also PONDRA_READ_TOKEN, PONDRA_WRITE_TOKEN, PONDRA_ADMIN_TOKEN): reading needs any, writing rows write or admin, tables/views/tasks admin. Give every node the same ones; none set = no checks
+      --write-token <WRITE_TOKEN>
+          
+      --admin-token <ADMIN_TOKEN>
+          
+      --tls-cert <TLS_CERT>
+          TLS on every door (also PONDRA_TLS_CERT, PONDRA_TLS_KEY): a PEM certificate and its key. Plain connections are then taken only from this machine (PONDRA_TLS=optional: from anywhere), and nodes call each other over HTTPS
+      --tls-key <TLS_KEY>
+          
+      --tls-ca <TLS_CA>
+          The authority that signs the nodes' certificates (also PONDRA_TLS_CA): nodes show theirs to each other (mutual TLS), and the nodes' key is taken only with one
+      --attach <ATTACH>
+          Another lake to read as `name.table`, and write to through its own leader (repeatable): `--attach sales=s3://bucket/sales`. Several clusters, each leading its own lake, share one bucket this way
+      --attach-found <ATTACH_FOUND>
+          Attach, for as long as this node runs, the lakes in this folder (its subfolders that hold one) under their folder names: the shell passes its own folder, so the lakes side by side are its databases. Nothing is saved in the catalog
+      --stop-with-stdin
+          Stop, as on Ctrl-C, when standard input closes: when the program that started this node ends, however it ends (a node `connect()` starts beside a Python or JavaScript program, the shell)
+      --idle-exit <SECS>
+          End, as on SIGTERM, once nobody has used this node for this many seconds and it has nothing left to tier (also PONDRA_IDLE_EXIT_SECS): no HTTP or Flight request on its way, no Postgres or Kafka connection open, no run. A platform that starts it again on the next request (Cloud Run, Fly, Knative, a systemd socket) then bills only while there is work. A lake with tasks on a schedule keeps its leader up: they run only while a node does
+      --python <PYTHON>
+          Run Python functions and procedures (`LANGUAGE python`) with this Python, which has the `pondra` package and pyarrow (`auto`: the first found), on warm workers beside the node, gone after a minute idle. A routine runs any code on this machine, so only an admin token makes one, and a node without tokens takes this only when it listens on 127.0.0.1
+  -h, --help
+          Print help (see more with '--help')

@@ -57,7 +57,7 @@ log = { version = "0.4", optional = true } # (SlateDB's error records, which the
 toml = { version = "0.8", default-features = false, features = ["parse"], optional = true } # pondra.toml (already built for slatedb's figment)
 bytes = "1"
 uuid = { version = "1", features = ["v4", "v7"] } # (every form: the casts' functions, `pg_casts.rs`, make and check uuids on a page too)
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive", "string"], optional = true } # (`string`: flags named at run time, from the settings table)
 futures = "0.3"
 async-trait = "0.1"
 lru = "0.18"
