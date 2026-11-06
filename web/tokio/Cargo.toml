@@ -1,6 +1,6 @@
 [package]
 name = "pondra-tokio-web"
-version = "0.34.0"
+version = "0.80.0-rc.1"
 edition = "2021"
 publish = false
 description = "tokio's time and task calls over a browser's clock and event loop: the page's stand-in for tokio (designs/page-same-core.md section 2)"

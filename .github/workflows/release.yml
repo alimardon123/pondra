@@ -76,12 +76,14 @@ jobs:
         run: |
           v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           [ "$GITHUB_REF_TYPE" != tag ] || [ "$GITHUB_REF_NAME" = "v$v" ] || { echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml says $v"; exit 1; }
+          # (a wheel names the version as Python writes it: 0.80.0-rc.1's is 0.80.0rc1, tools/package.py)
+          w=$(python3 -c 'import sys; sys.path.insert(0, "tools"); import package; print(package.python_version(sys.argv[1]))' "$v")
           ls -l dist
           for p in linux-x64 linux-arm64 macos-x64 macos-arm64 windows-x64; do
             a=dist/pondra-$p.tar.gz; [ $p != windows-x64 ] || a=dist/pondra-$p.zip
-            ls dist/pondra-$v-*.whl dist/pondra-$p-$v.tgz "$a" > /dev/null || exit 1
+            ls dist/pondra-$w-*.whl dist/pondra-$p-$v.tgz "$a" > /dev/null || exit 1
           done
-          [ "$(ls dist/pondra-$v-*.whl | wc -l)" = 5 ] && ls dist/pondra-$v.tgz
+          [ "$(ls dist/pondra-$w-*.whl | wc -l)" = 5 ] && ls dist/pondra-$v.tgz
       - uses: actions/download-artifact@v7 # (the page's module, which build.yml's `web` job built and checked)
         continue-on-error: true # (a run that didn't build it still publishes, below, without the page)
         with:
