@@ -21440,6 +21440,9 @@ def registry():
         and all(k["inside"] and set(k["inside"]) <= object_names for k in kinds if k["is"] == "part") \
         and all(k["lists"] for k in kinds if k["is"] == "pattern") \
         and {k["kind"] for k in kinds if k["is"] == "object" and k["on_clone"] == "leave"} == {"secret", "share", "recipient"}
+    checks["pondra.functions lists each function under the set that gives it"] = \
+        q("SELECT source FROM pondra.functions WHERE name = 'quote_ident' AND kind = 'scalar'") == [{"source": "postgres"}] \
+        and q("SELECT count(*) AS n FROM pondra.functions WHERE source = 'datafusion'")[0]["n"] > 100
     settings = {r["variable"]: r for r in q("SELECT * FROM pondra.settings")}
     info["settings"] = len(settings)
     checks["pondra.settings lists the node's settings and an extension's, a test's hooks left out"] = \

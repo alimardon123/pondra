@@ -93,12 +93,53 @@ impl Functions {
     }
 }
 
-/// The engine's own functions, as an extension.
+/// The engine's own functions, as an extension. It lists every set's as `pondra.functions`.
 pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "engine",
     requires: &[],
-    register: |r| r.section_mut::<Functions>().add("engine", own),
+    register: |r| {
+        r.section_mut::<Functions>().add("engine", own);
+        r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "functions", columns: FUNCTION_COLUMNS, rows: functions });
+    },
 };
+
+/// `pondra.functions`' columns: a function's name, whether it is a `scalar`, `aggregate`, `window` or `table` function,
+/// and the set that gives it, its `source` (`datafusion` for DataFusion's own, else its extension's: `engine`, `spark`, `postgres`…).
+const FUNCTION_COLUMNS: &[(&str, crate::lists::Cell)] = {
+    use crate::lists::Cell::Text;
+    &[("name", Text), ("kind", Text), ("source", Text)]
+};
+
+/// One row per function a session has, made as `session` makes one: DataFusion's, then each set in turn, a name the
+/// set added or took over being its. A lake's own routines are `pondra.routines`'.
+fn functions(r: &crate::registry::Registry) -> Vec<serde_json::Value> {
+    use std::collections::BTreeMap;
+    fn names<T>(m: &std::collections::HashMap<String, Arc<T>>) -> impl Iterator<Item = (&String, usize)> {
+        m.iter().map(|(n, f)| (n, Arc::as_ptr(f) as *const () as usize))
+    }
+    let now = |ctx: &SessionContext| {
+        let s = ctx.state();
+        let mut all: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
+        for (kind, them) in [("scalar", names(s.scalar_functions()).collect::<Vec<_>>()), ("aggregate", names(s.aggregate_functions()).collect()), ("window", names(s.window_functions()).collect())] {
+            all.extend(them.into_iter().map(|(n, p)| ((n.clone(), kind), p)));
+        }
+        all.extend(names(s.table_functions()).map(|(n, p)| ((n.clone(), "table"), p)));
+        all
+    };
+    let mut ctx = SessionContext::new();
+    let mut set: BTreeMap<(String, &'static str), (&'static str, usize)> = now(&ctx).into_iter().map(|(k, p)| (k, ("datafusion", p))).collect();
+    for s in &r.section::<Functions>().0 {
+        ctx = (s.add)(ctx);
+        let has = now(&ctx);
+        set.retain(|k, _| has.contains_key(k)); // (a set may take a name away)
+        for (k, p) in has {
+            if set.get(&k).is_none_or(|&(_, was)| was != p) {
+                set.insert(k, (s.name, p));
+            }
+        }
+    }
+    set.into_iter().map(|((name, kind), (set, _))| serde_json::json!({"name": name, "kind": kind, "source": set})).collect()
+}
 
 fn own(mut ctx: SessionContext) -> SessionContext {
     datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
@@ -431,6 +472,21 @@ mod tests {
             assert!(ctx.udf(f).is_ok(), "{f}");
         }
         assert!(ctx.udwf("pondra_match").is_ok());
+    }
+
+    /// `pondra.functions` lists what a session has, each function under the set that gave it.
+    #[test]
+    fn pondra_functions_lists_each_function_by_its_set() {
+        let list = crate::lists::all().iter().find(|l| l.name == "functions").expect("the engine lists its functions");
+        let rows = crate::lists::rows(list);
+        let set = |name: &str, kind: &str| rows.iter().find(|r| r["name"] == name && r["kind"] == kind).map(|r| r["source"].as_str().unwrap_or_default().to_string());
+        assert_eq!(
+            [set("abs", "scalar"), set("pmod", "scalar"), set("pondra_json_text", "scalar"), set("quote_ident", "scalar"), set("ai_embed", "scalar"), set("pondra_match", "window"), set("sum", "aggregate"), set("generate_series", "table")],
+            [Some("datafusion"), Some("spark"), Some("engine"), Some("postgres"), Some("ai"), Some("match_recognize"), Some("engine"), Some("postgres")].map(|s| s.map(String::from))
+        );
+        let ctx = session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        let state = ctx.state();
+        assert_eq!(rows.iter().filter(|r| r["kind"] == "scalar").count(), state.scalar_functions().len(), "every scalar function a session has, once");
     }
 
     /// A session answers as a node's does: one value per query, from the functions the session has.
