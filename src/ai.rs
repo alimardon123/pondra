@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{atomic::{AtomicU64, Ordering::Relaxed}, Arc, OnceLock};
 use std::time::Duration;
+use crate::settings::{node, Kind, Setting, Settings, Unset};
 
 const EMBEDS: usize = 64; // texts in one embeddings request
 const TRIES: u32 = 5; // a call, and four more after a 429, a 5xx or a lost connection
@@ -30,17 +31,28 @@ crate::per_node!(pub static CALLS: AtomicU64 = AtomicU64::new(0)); // requests t
 crate::per_node!(pub static FAILED: AtomicU64 = AtomicU64::new(0)); // …that failed for good (their rows are null)…
 crate::per_node!(pub static RETRIED: AtomicU64 = AtomicU64::new(0)); // …and that were tried again
 
-/// The AI functions in every session, as the `ai` extension's function set.
+/// The `ai` extension: its functions in every session, and its settings.
 pub static AI: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "ai",
-    requires: &[],
+    requires: &["settings"],
     register: |r| {
         r.section_mut::<crate::engine::Functions>().add("ai", |ctx| {
             register(&ctx);
             ctx
-        })
+        });
+        r.section_mut::<Settings>().add(SETTINGS);
     },
 };
+
+/// The endpoint the AI functions call, and how (the registry's settings section, `settings.rs`).
+pub const SETTINGS: &[Setting] = &[
+    node("PONDRA_AI_CALLS", Kind::Int, Unset::No),
+    node("PONDRA_AI_KEY", Kind::Secret, Unset::No),
+    node("PONDRA_AI_MODEL", Kind::Text, Unset::Is("llama3.2")),
+    node("PONDRA_AI_TIMEOUT_SECS", Kind::Secs, Unset::Is("300")),
+    node("PONDRA_AI_URL", Kind::Url, Unset::Is("http://127.0.0.1:11434/v1")),
+    node("PONDRA_EMBED_MODEL", Kind::Text, Unset::Is("nomic-embed-text")),
+];
 
 pub fn register(ctx: &SessionContext) {
     for embed in [false, true] {
@@ -193,12 +205,12 @@ fn turns() -> &'static tokio::sync::Semaphore {
 /// A 429, a 5xx or a request that never reached it is tried again, after what `Retry-After` says or
 /// half a second doubling each time; anything else (a 400: the model's name, say) fails at once.
 async fn call(embed: bool, inputs: &[&str], model: &str) -> anyhow::Result<Vec<Value>> {
-    let url = crate::env::get("PONDRA_AI_URL").unwrap_or_else(|| "http://127.0.0.1:11434/v1".into());
+    let url = crate::env::text("PONDRA_AI_URL");
     let (path, body) = match embed {
         true => ("embeddings", json!({"model": model, "input": inputs})),
         false => ("chat/completions", json!({"model": model, "messages": [{"role": "user", "content": inputs[0]}]})),
     };
-    let secs = crate::env::or("PONDRA_AI_TIMEOUT_SECS", 300);
+    let secs = crate::env::value("PONDRA_AI_TIMEOUT_SECS");
     let mut wait = Duration::from_millis(500);
     for tries in 1.. {
         let req = crate::ext::bare().post(format!("{}/{path}", url.trim_end_matches('/'))).json(&body); // (not the nodes' client: its token is theirs alone)
@@ -242,8 +254,8 @@ async fn call(embed: bool, inputs: &[&str], model: &str) -> anyhow::Result<Vec<V
 
 fn default_model(embed: bool) -> String {
     match embed {
-        true => crate::env::get("PONDRA_EMBED_MODEL").unwrap_or_else(|| "nomic-embed-text".into()),
-        false => crate::env::get("PONDRA_AI_MODEL").unwrap_or_else(|| "llama3.2".into()),
+        true => crate::env::text("PONDRA_EMBED_MODEL"),
+        false => crate::env::text("PONDRA_AI_MODEL"),
     }
 }
 
@@ -380,4 +392,16 @@ fn sum<N: Copy + Into<f64>>(x: &[N], y: &[N], f: impl Fn(f64, f64) -> f64) -> f6
         }
     }
     lanes.iter().sum::<f64>() + xr.iter().zip(yr).map(|(a, b)| f((*a).into(), (*b).into())).sum::<f64>()
+}
+
+#[cfg(test)]
+mod tests {
+    /// The extension's settings are the build's, each found by its name and read with its default.
+    #[test]
+    fn its_settings_are_the_builds() {
+        for s in super::SETTINGS {
+            assert!(crate::settings::find(s.var).is_some_and(|f| f.var == s.var), "{} is in the build's settings", s.var);
+        }
+        assert_eq!(crate::env::text("PONDRA_AI_URL"), "http://127.0.0.1:11434/v1");
+    }
 }

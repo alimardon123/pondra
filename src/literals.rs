@@ -37,7 +37,7 @@ use std::sync::Arc;
 pub fn literal_rows(sql: &str, target: &Schema) -> Option<RecordBatch> {
     let rows = value_rows(sql)?;
     // (a session's own DataFusion settings may read the literals differently: it plans them)
-    if crate::settings::any() {
+    if crate::set::any() {
         return None;
     }
     let config = crate::optimize::config(SessionConfig::new());

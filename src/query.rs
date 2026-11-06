@@ -983,7 +983,7 @@ pub async fn when_handed() {
 /// The size from which a query's answer goes to its door in pieces (`PONDRA_STREAM_MB`, 8 MB of Arrow), read
 /// once. 0 sends every answer in pieces (the tests compare the two ways).
 pub fn stream_bytes() -> usize {
-    static MB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| crate::env::or("PONDRA_STREAM_MB", 8));
+    static MB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| crate::env::value("PONDRA_STREAM_MB"));
     *MB << 20
 }
 
@@ -1294,7 +1294,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     lake.caught_up().await?; // (a node that just started: not from an older catalog than its leader's)
     let upto = upto.or_else(crate::txn::snapshot); // (in a transaction: as of its snapshot, its writes over it)
     use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
-    let ctx = crate::settings::apply(lake.session()).await?; // (the session's `SET datafusion.…`)
+    let ctx = crate::set::apply(lake.session()).await?; // (the session's `SET datafusion.…`)
     crate::udf::register(lake, &ctx).await?; // the lake's own functions (`POST /functions/…`)
     crate::pyfn::register(lake, &ctx).await?; // …and its Python functions (`CREATE FUNCTION … LANGUAGE python`)
     let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)

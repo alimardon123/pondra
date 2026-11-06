@@ -25,7 +25,7 @@ there, so those modules read the time through DataFusion's `Instant` (std's own 
 `log::now_us` or `now_ms`, and a std clock in one fails (CLOCKS below names a file that may, and why).
 
 And every setting goes through `env.rs` (ADR-061 §8): a `PONDRA_*` name read with `std::env`
-anywhere else fails (by its text, or a constant that names it), so does a `"PONDRA_…"` name its NAMES table doesn't list, and a name the table
+anywhere else fails (by its text, or a constant that names it), so does a `"PONDRA_…"` name the table (`settings.rs`) doesn't list, and a name the table
 lists that nothing reads (env.rs's own rules, the memory line's, read outside the table).
 
 And every walk of the SQL tree goes through `crate::walk` (`src/walk.rs`): sqlparser's `Visit` and `VisitMut` are
@@ -164,6 +164,7 @@ CONST = re.compile(r'\bconst\s+([A-Z_][A-Z0-9_]*)\s*:\s*&(?:\'static\s+)?str\s*=
 NAME = re.compile(r'"(PONDRA_[A-Z0-9_]+)"')
 SPAWN = re.compile(r"\btokio::(?:task::)?spawn\(|Handle::(?:current|try_current)\(\)[^;]*?\.spawn\(")
 REGEX = re.compile(r"^(?:std::sync::)?LazyLock<(?:regex::)?Regex>$")
+TABLE = re.compile(r"\bconst\s+[A-Z_]+\s*:\s*&\[(?:crate::settings::)?Setting\]\s*=[^;]*?&\[")
 STATIC = re.compile(r"\bstatic\s+(?:mut\s+)?([A-Z_][A-Z0-9_]*)\s*:")
 
 
@@ -291,36 +292,51 @@ def leaks():
     return bad
 
 
+def tables(text):
+    """A file's settings tables (`settings::CORE`, an extension's `SETTINGS`): the spans of `&[Setting] = … &[ … ];`."""
+    out = []
+    for m in TABLE.finditer(text):
+        start = text.index("&[", m.end() - 2)
+        out.append((m.start(), text.index("];", start) + 2))
+    return out
+
+
+def untabled(text):
+    """The text with its settings tables blanked (lines kept): what is left reads settings, or names them."""
+    for a, b in reversed(tables(text)):
+        text = text[:a] + re.sub(r"[^\n]", " ", text[a:b]) + text[b:]
+    return text
+
+
 def settings():
-    """Settings read past `env.rs`, names it doesn't list, and names it lists that nothing reads."""
-    table = open(os.path.join(SRC, "env.rs"), encoding="utf-8").read()
-    table = table[table.index("pub const NAMES"):]
-    table = table[:table.index("];")]  # (the table alone: its tests name settings that aren't)
-    names, read, bad = set(re.findall(r'\(\s*"(PONDRA_[A-Z0-9_]+)"\s*,', table)), set(), []
-    sources = {}
+    """Settings read past `env.rs`, names no settings table lists, and names a table lists that nothing reads."""
+    sources, names, read, bad = {}, {}, set(), []
     for base, _, files in os.walk(SRC):
         for f in sorted(files):
             if f.endswith(".rs"):
-                sources[os.path.join(base, f)] = tests_cut(open(os.path.join(base, f), encoding="utf-8").read())
+                path = os.path.join(base, f)
+                sources[path] = tests_cut(open(path, encoding="utf-8").read())
+                for a, b in tables(sources[path]):
+                    for name in re.findall(r'\(\s*"(PONDRA_[A-Z0-9_]+)"\s*,', sources[path][a:b]):
+                        names[name] = os.path.relpath(path, SRC).replace(os.sep, "/")
     named = {c: v for text in sources.values() for c, v in CONST.findall(text)}  # (constants that are a setting's name)
     for base, _, files in os.walk(SRC):
         for f in sorted(files):
-            if not f.endswith(".rs") or f == "env.rs":
+            if not f.endswith(".rs") or (base == SRC and f in ("env.rs", "settings.rs")):
                 continue
             path = os.path.join(base, f)
             rel = os.path.relpath(path, SRC).replace(os.sep, "/")
-            for n, line in enumerate(sources[path].split("\n"), 1):
+            for n, line in enumerate(untabled(sources[path]).split("\n"), 1):
                 code = line.split("//", 1)[0]
                 if READ.search(code) or any(c in named for c in READ_BY.findall(code)):
-                    bad.append(f"src/{rel}:{n}: a setting read past env.rs: read it with crate::env::get (or os, parse, or, secs, flag, is_set)")
+                    bad.append(f"src/{rel}:{n}: a setting read past env.rs: read it with crate::env::value (or text, get, os, parse, secs, flag, is_set)")
                 for name in NAME.findall(line):
                     read.add(name)
                     if name not in names and f not in NOT_READ:
-                        bad.append(f"src/{rel}:{n}: {name} isn't in env.rs's NAMES: add it there with who it is for (or the file to NOT_READ in tools/per_node_check.py with why)")
-    own = sources[os.path.join(SRC, "env.rs")]  # (a rule env.rs keeps itself, the same in every form, reads its setting too)
-    start = own.index("pub const NAMES")
-    read |= set(NAME.findall(own[:start] + own[own.index("];", start):]))
-    return bad + [f"src/env.rs: NAMES lists {name}, which nothing reads: take it out" for name in sorted(names - read)]
+                        bad.append(f"src/{rel}:{n}: {name} isn't in a settings table: add it to settings.rs's CORE, or its extension's SETTINGS, with who it is for and its kind (or the file to NOT_READ in tools/per_node_check.py with why)")
+    # (a rule env.rs keeps itself, the same in every form, reads its setting too, as does a default the table works out)
+    read |= set(NAME.findall(untabled(sources[os.path.join(SRC, "env.rs")] + sources[os.path.join(SRC, "settings.rs")])))
+    return bad + [f"src/{names[name]}: its settings table lists {name}, which nothing reads: take it out" for name in sorted(set(names) - read)]
 
 
 def clocks():

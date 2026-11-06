@@ -1162,14 +1162,14 @@ crate::per_node!(
 
 /// A slot for one background view run: waits until one is free.
 pub(crate) async fn slot() -> tokio::sync::OwnedSemaphorePermit {
-    let slots = SLOTS.get_or(|| std::sync::Arc::new(tokio::sync::Semaphore::new(crate::env::or("PONDRA_VIEW_RUNS", (crate::env::cores() / 2).max(2)).max(1))));
+    let slots = SLOTS.get_or(|| std::sync::Arc::new(tokio::sync::Semaphore::new(crate::env::value::<usize>("PONDRA_VIEW_RUNS").max(1))));
     slots.acquire_owned().await.expect("never closed")
 }
 
 /// A background view run, stopped as a statement is once it has run `PONDRA_VIEW_RUN_SECS` (3600; 0: none): its future
 /// dropped, its stop flag set (`audit::stoppable`), so a MATCH_RECOGNIZE search still running ends too; 57014.
 pub(crate) async fn bounded(f: impl std::future::Future<Output = Result<()>>) -> Result<()> {
-    bounded_by(crate::env::or("PONDRA_VIEW_RUN_SECS", 3600u64), f).await
+    bounded_by(crate::env::value::<u64>("PONDRA_VIEW_RUN_SECS"), f).await
 }
 
 async fn bounded_by(secs: u64, f: impl std::future::Future<Output = Result<()>>) -> Result<()> {

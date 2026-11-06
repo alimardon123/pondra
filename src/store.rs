@@ -1125,7 +1125,7 @@ const RECENT_BYTES: usize = 64 << 20; // …within this much memory (past it, a 
 // follower reads from its own view until it has caught up, instead of the leader buffering more)
 
 /// Query read cache in memory, MB (env PONDRA_CACHE_MB, default 1024).
-fn cache_mb() -> usize { crate::env::or("PONDRA_CACHE_MB", 1024) }
+fn cache_mb() -> usize { crate::env::value("PONDRA_CACHE_MB") }
 
 /// The folder the node's SSD tiers and replica logs go under: `PONDRA_CACHE_DIR` when set (the operator's own
 /// choice), else `pondra-cache-{uid}` in the temp dir, made 0700 and used only while it is this user's alone
@@ -2988,7 +2988,7 @@ impl Catalog {
     /// opening began, for `PONDRA_TRACE_START`.
     async fn writer(kv: Arc<dyn Kv>, since: Instant) -> Result<Self> {
         let mut cat = Self::new(kv);
-        cat.replicas = crate::env::or("PONDRA_REPLICAS", 1);
+        cat.replicas = crate::env::value("PONDRA_REPLICAS");
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
         let c = cat.get::<u64>("c").await?.unwrap_or(0);
         *cat.order.get_mut() = c + 1;
