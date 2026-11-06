@@ -81,10 +81,13 @@ struct Backend {
 
 /// How a connection's sign-in is checked again (`Backend::signed`). Postgres checks a role's privileges at every statement, so
 /// a REVOKE, a DROP USER, NOLOGIN, a new password, or a revoked or expired token reaches a connection already open, as it
-/// reaches HTTP's next request and a stream's next check (`server::until_revoked`). None: the nodes' own tokens and an open
-/// lake's anyone, which `until_revoked` never ends either.
+/// reaches HTTP's next request and a stream's next check (`server::until_revoked`). None: the nodes' own tokens, which
+/// `until_revoked` never ends either.
 #[derive(Clone)]
 enum Again {
+    /// Anyone, at a lake nothing locked (no tokens, no users): ended once the lake is locked (a `CREATE USER`), as
+    /// `until_revoked` ends a stream; before, the connection kept its superuser rights (11-06 audit M2).
+    Open,
     /// A user signed in by its password: its role and grants read again; ended once it no longer signs in or its password is
     /// another.
     User { user: String, verifier: Option<crate::users::Verifier> },
@@ -231,7 +234,7 @@ impl StartupHandler for Startup {
                 pgwire::api::auth::protocol_negotiation(client, startup).await?;
                 pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
                 if app.open().await {
-                    self.backend.signed_in(crate::auth::Principal::of(crate::auth::Role::Admin).at("postgres", Some(client.socket_addr())), None);
+                    self.backend.signed_in(crate::auth::Principal::of(crate::auth::Role::Admin).at("postgres", Some(client.socket_addr())), Some(Again::Open));
                     return finish(client, &self.cancels).await;
                 }
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
@@ -604,6 +607,10 @@ impl Backend {
     async fn signed_again(&self, again: Again) -> PgWireResult<crate::auth::Principal> {
         let (lake, auth, was) = (&self.app.lake, &self.app.auth, self.who());
         let now = match &again {
+            Again::Open => match self.app.open().await {
+                true => Ok(was.clone()),
+                false => Err("the lake now signs its users in (CREATE USER, or a token): connect again and sign in".into()),
+            },
             Again::Token { user, token } => match crate::users::sign_in(lake, auth, user, token).await {
                 Some(p) => Ok(p),
                 None => Err(crate::sso::why(lake, token).await.unwrap_or_else(|| "its token was revoked or has expired".into())),

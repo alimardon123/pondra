@@ -10749,12 +10749,23 @@ def users():
     boss = basic("boss", "boss-password-1")
     # Open, until a user who signs in exists; then nothing without a sign-in (no token is set)
     opened = as_(A.port, None, "SELECT 1 AS x")
+    open_pg = psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=anyone dbname=lake", connect_timeout=10, autocommit=True)  # (made while the lake is open)
+    open_said = [open_pg.execute("SELECT 1 AS x").fetchall()]
     for q in ["CREATE SCHEMA sales", "CREATE TABLE sales.orders (id BIGINT, item VARCHAR, amount DOUBLE, card VARCHAR)", "INSERT INTO sales.orders VALUES (1, 'tea', 2.5, '4111'), (2, 'cake', 4.0, '5500')",
               "CREATE TABLE hr (id BIGINT, salary DOUBLE)", "INSERT INTO hr VALUES (1, 100.0)", "CREATE TABLE notes (id BIGINT, text VARCHAR)", "INSERT INTO notes VALUES (1, 'hello')",
               "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:
         as_(A.port, None, q)
     closed = until(lambda: as_(A.port, None, "SELECT 1 AS x"), "ERROR 401: b\"sign in: a token, or a user's name and password\"", 10)
     checks["open until a user who signs in exists; then nothing without a sign-in (no token set)"] = opened == [{"x": 1}] and closed.startswith("ERROR 401")
+    # …and a Postgres connection made while it was open is ended at its next check (5 s), as a stream is; before, it kept its
+    # superuser rights after the CREATE USER (11-06 audit M2)
+    time.sleep(5.5)
+    try:
+        open_said.append(open_pg.execute("SELECT 1 AS x").fetchall())
+    except Exception as e:
+        open_said.append(f"ERROR {e}")
+    checks["a Postgres connection made while the lake was open is ended once a user who signs in exists"] = open_said[0] == [(1,)] and \
+        "the lake now signs its users in" in str(open_said[1])
     for q in ["CREATE USER ann PASSWORD 'ann-password-1'", "CREATE ROLE analyst", "GRANT SELECT (id, item, amount) ON sales.orders TO analyst", "GRANT analyst TO ann",
               "CREATE USER bob PASSWORD 'bob-password-1'", "GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA sales TO bob", "GRANT SELECT ON notes TO public", "CREATE USER svc"]:
         as_(A.port, boss, q)
@@ -10825,6 +10836,7 @@ def users():
     shown["applier_export"] = as_(A.port, dee, b"", method="GET", path="/export")
     names = sorted(o["name"] for o in shown["objects"]["objects"]) if isinstance(shown["objects"], dict) else shown["objects"]
     shown_info = {k: v for k, v in shown.items() if k != "objects"} | {"objects": names}
+    shown_info["open pg"] = open_said
     checks["a user is shown only the tables it may read (GET /objects) and no routine's code: /routines, information_schema, pg_proc, pondra.objects, SHOW CREATE (S27); an admin all of it"] = \
         names == ["notes", "orders"] and isinstance(shown["routines"], dict) and shown["routines"].get("leak", {}).get("body") == "" \
         and "INSERT INTO sales.refunds" in json.dumps(shown["boss_routines"]) and shown["defined"] == [(None,)] and shown["prosrc"] == [(None,)] \
