@@ -476,7 +476,7 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
             0 => RecordBatch::new_empty(crate::answer::schema(&crate::views::expected_table(lake).columns())?),
             n => crate::once::late_batch(view, &m.id, n)?,
         };
-        pending.push(Append { table: EXPECTED.into(), src: Src { producer: late_producer, seq: at, prev: Some(at0) }, batch, ack: tokio::sync::oneshot::channel().0 });
+        pending.push(Append { table: EXPECTED.into(), src: Src { producer: late_producer, seq: at, prev: Some(at0) }, batch, ack: tokio::sync::oneshot::channel().0, placed: None });
     }
 
     // The commit, under the lake's lock: this view still the one this run is for.
@@ -697,7 +697,7 @@ fn nonempty(b: RecordBatch) -> Vec<RecordBatch> {
 /// part (its producer's seq must move with the flush, as `rerun` sends them).
 fn flush_parts(parts: Vec<Append>, table: &str, meta: &TableMeta, producer: &str, seq: u64, prev: u64) -> Result<Vec<Append>> {
     let mut parts = match parts.is_empty() {
-        true => vec![Append { table: table.to_string(), src: Src { producer: String::new(), seq: 0, prev: None }, batch: RecordBatch::new_empty(crate::answer::schema(&meta.columns())?), ack: tokio::sync::oneshot::channel().0 }],
+        true => vec![Append { table: table.to_string(), src: Src { producer: String::new(), seq: 0, prev: None }, batch: RecordBatch::new_empty(crate::answer::schema(&meta.columns())?), ack: tokio::sync::oneshot::channel().0, placed: None }],
         false => parts,
     };
     for a in &mut parts {

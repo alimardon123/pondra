@@ -984,7 +984,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
         let (mut pending, _) = crate::change::appends(lake, seq, view, &meta, vec![old], vec![new], &producer, false, false).await?; // (a view's rows: upserts)
         if pending.is_empty() {
             // (nothing came out different: only its progress moves, both parts' together)
-            let empty = |table: String, s: SchemaRef| crate::log::Append { table, src: crate::log::Src { producer: String::new(), seq: 0, prev: None }, batch: RecordBatch::new_empty(s), ack: tokio::sync::oneshot::channel().0 };
+            let empty = |table: String, s: SchemaRef| crate::log::Append { table, src: crate::log::Src { producer: String::new(), seq: 0, prev: None }, batch: RecordBatch::new_empty(s), ack: tokio::sync::oneshot::channel().0, placed: None };
             let s = crate::answer::schema(&meta.columns())?;
             pending = vec![empty(view.to_string(), s.clone()), empty(crate::sys::deleted(view), s)];
         }
