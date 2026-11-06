@@ -45,7 +45,7 @@ async fn footer(lake: &Lake, ctx: &datafusion::prelude::SessionContext, table: &
     for col in list.stored_order() {
         let (stored, name, want) = (&col.stored, col.name.as_str(), crate::answer::dtype(&col.dtype)?);
         let Some(field) = in_file(&schema, col.id as i64, name) else {
-            ensure!(!meta.not_null.contains(stored), "{}: it has no column {name}, which is NOT NULL in {table}", f.path);
+            ensure!(!meta.not_null().contains(stored), "{}: it has no column {name}, which is NOT NULL in {table}", f.path);
             nulls.push(stored.clone());
             continue;
         };
@@ -53,7 +53,7 @@ async fn footer(lake: &Lake, ctx: &datafusion::prelude::SessionContext, table: &
         let c = StatisticsConverter::try_new(field.name(), &schema, md.file_metadata().schema_descr())?;
         let counts = c.row_group_null_counts(md.row_groups().iter())?;
         let (known, held) = (counts.null_count() == 0, counts.iter().flatten().sum::<u64>());
-        ensure!(!meta.not_null.contains(stored) || (known && held == 0), "{}: {name} is NOT NULL in {table}, and the file {}", f.path, if known { "holds a NULL there" } else { "doesn't say it holds none" });
+        ensure!(!meta.not_null().contains(stored) || (known && held == 0), "{}: {name} is NOT NULL in {table}, and the file {}", f.path, if known { "holds a NULL there" } else { "doesn't say it holds none" });
         if !known || held > 0 {
             nulls.push(stored.clone());
         }
@@ -234,7 +234,7 @@ pub async fn upserts(lake: &Lake, seq: &crate::log::Sequencer, table: &str, rows
 /// `_row_id` (the new rows'); and, for the old rows it takes out, `_created_at` and `_version` too.
 fn sys_schema(meta: &TableMeta, old: bool) -> Result<datafusion::arrow::datatypes::SchemaRef> {
     let sys = crate::sys::columns();
-    let mut columns = meta.columns.clone();
+    let mut columns = meta.columns().to_vec();
     columns.extend(sys.iter().filter(|(c, _)| c == crate::text::ROW_ID || (old && (c == crate::text::CREATED || c == crate::text::VERSION))).cloned());
     crate::answer::schema(&columns)
 }

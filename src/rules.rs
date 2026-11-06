@@ -149,7 +149,7 @@ pub enum LeftOut {
 /// JSON lines: for each default's column, the rows whose object hasn't the key.
 #[cfg(feature = "lake")]
 pub fn absent_keys(meta: &TableMeta, lines: &[u8]) -> Result<std::collections::HashMap<String, BooleanArray>> {
-    let names: Vec<String> = meta.defaults.keys().map(|s| meta.name_of(s).to_string()).collect();
+    let names: Vec<String> = meta.defaults().keys().map(|s| meta.name_of(s).to_string()).collect();
     let mut out: std::collections::HashMap<String, Vec<bool>> = names.iter().map(|n| (n.clone(), vec![])).collect();
     for v in serde_json::Deserializer::from_slice(lines).into_iter::<serde_json::Value>() {
         let v = v?;

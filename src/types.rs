@@ -89,7 +89,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             // (every table using it takes the label in the same commit: a write checks its own copy)
             let mut puts = vec![(key(&name), json(&t))];
             for (k, mut m) in users(lake, &name).await? {
-                m.enums.values_mut().filter(|e| e.of.as_deref() == Some(name.as_str())).for_each(|e| e.labels = t.labels.clone());
+                m.edit_enums(&name, |e| e.labels = t.labels.clone());
                 puts.push((k, json(&m)));
             }
             lake.cat.commit(puts, &[]).await?;
@@ -101,7 +101,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             ensure!(lake.cat.get::<Type>(&key(&to)).await?.is_none(), exists(&to));
             let mut puts = vec![(key(&to), json(&t))];
             for (k, mut m) in users(lake, &name).await? {
-                m.enums.values_mut().filter(|e| e.of.as_deref() == Some(name.as_str())).for_each(|e| e.of = Some(to.clone()));
+                m.edit_enums(&name, |e| e.of = Some(to.clone()));
                 puts.push((k, json(&m)));
             }
             lake.cat.commit(puts, &[key(&name)]).await?;
@@ -118,8 +118,8 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
                 // whichever way the drop was written.
                 let mut using = vec![];
                 for (k, m) in users(lake, &n).await? {
-                    for (c, e) in &m.enums {
-                        if e.of.as_deref() == Some(n.as_str()) && !m.dropped.contains(c) {
+                    for (c, e) in m.enums() {
+                        if e.of.as_deref() == Some(n.as_str()) && !m.dropped().contains(c) {
                             using.push(format!("{}.{}", &k[2..], m.name_of(c)));
                         }
                     }
@@ -146,7 +146,7 @@ pub(crate) async fn labels(lake: &Lake, name: &str) -> Option<Vec<String>> { fin
 /// The tables (their catalog keys and entries) with a column of this type, dropped columns aside.
 async fn users(lake: &Lake, name: &str) -> Result<Vec<(String, TableMeta)>> {
     let all = lake.cat.scan::<TableMeta>("t/", "t0").await?;
-    Ok(all.into_iter().filter(|(_, m)| m.enums.iter().any(|(c, e)| e.of.as_deref() == Some(name) && !m.dropped.contains(c))).collect())
+    Ok(all.into_iter().filter(|(_, m)| m.enums().iter().any(|(c, e)| e.of.as_deref() == Some(name) && !m.dropped().contains(c))).collect())
 }
 
 /// A column's declared type, if it is an enum: `ENUM('a', 'b')`, or a type of this lake's.
@@ -167,7 +167,7 @@ pub async fn of_table(lake: &Lake, name: &str) -> (BTreeMap<String, Enum>, BTree
     let Ok((None, local)) = crate::ddl::resolve(lake, name).await else { return Default::default() };
     match lake.cat.get::<TableMeta>(&table_key(&local)).await {
         Ok(Some(m)) => {
-            (m.in_sql(&m.enums), m.in_sql(&m.sql_types))
+            (m.in_sql(&m.enums()), m.in_sql(&m.sql_types()))
         }
         _ => Default::default(),
     }
@@ -192,7 +192,7 @@ pub async fn columns(lake: &Lake, cols: &[ast::ColumnDef]) -> Result<(Vec<ast::C
 /// A column's type as SQL writes it (`SHOW CREATE`, `pondra.parts`): an enum's, `UUID`, or what its
 /// Arrow type is (`objects::sql_type`). `m` and `column` alike by stored or alike by SQL's names.
 pub fn shown(m: &TableMeta, column: &str, arrow: &str) -> String {
-    match (m.enums.get(column), m.sql_types.get(column)) {
+    match (m.enums().get(column), m.sql_types().get(column)) {
         (Some(e), _) => e.sql(),
         (None, Some(t)) => t.to_uppercase(),
         (None, None) => crate::objects::sql_type(arrow),

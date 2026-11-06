@@ -35,10 +35,10 @@ pub fn columns() -> Vec<(String, String)> {
 /// key: its first row and first commit, its last commit.
 pub fn with_sys(meta: &TableMeta) -> TableMeta {
     let mut m = meta.clone();
-    if m.columns.iter().any(|(c, _)| c == ROW_ID) {
+    if m.columns().iter().any(|(c, _)| c == ROW_ID) {
         return m;
     }
-    m.columns.extend(columns());
+    m.append_columns(columns());
     if !m.merge.is_empty() {
         for (c, f) in [(ROW_ID, "min"), (CREATED, "min"), (VERSION, "max"), (UPDATED, "max")] {
             m.merge.insert(c.into(), f.into());

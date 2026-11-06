@@ -197,8 +197,8 @@ async fn shadow(lake: &Lake, table: &str, meta: &mut TableMeta, new: &[String], 
     if !meta.shadows || new.is_empty() {
         return Ok(());
     }
-    let (ctx, marked) = (lake.session(), meta.columns.iter().any(|(c, _)| c == "_deleted"));
-    let cols: Vec<(String, String)> = meta.columns.iter().filter(|(c, _)| meta.key.contains(c) || c == "_deleted").cloned().collect();
+    let (ctx, marked) = (lake.session(), meta.columns().iter().any(|(c, _)| c == "_deleted"));
+    let cols: Vec<(String, String)> = meta.columns().iter().filter(|(c, _)| meta.key.contains(c) || c == "_deleted").cloned().collect();
     let schema = schema(&cols)?;
     let places = |b: Vec<RecordBatch>| b.iter().flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().iter().map(|p| *p as u64).collect::<Vec<_>>()).collect::<Vec<u64>>();
     let mut hit: Vec<(String, Vec<u64>)> = vec![];
@@ -251,12 +251,12 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
     let (after, upto, now) = (meta.purged(), meta.tiered.min(dmeta.tiered), crate::log::now_ms());
     let within = datafusion::prelude::col(VERSION).between(datafusion::prelude::lit(after as i64 + 1), datafusion::prelude::lit(upto as i64));
     let gone = match upto > after {
-        true => crate::manifest::pruned(lake, &dmeta, None, &[within], &schema(&with_sys(&dmeta).columns)?).await?,
+        true => crate::manifest::pruned(lake, &dmeta, None, &[within], &schema(&with_sys(&dmeta).columns())?).await?,
         false => vec![],
     };
     let waiting: u64 = gone.iter().map(|f| f.rows).sum();
     let rows = meta.files.iter().map(|f| f.rows).sum::<u64>() + meta.sealed.as_ref().map_or(0, |s| s.rows);
-    let at_least = crate::env::or("PONDRA_PURGE_ROWS", 100_000);
+    let at_least = crate::env::value("PONDRA_PURGE_ROWS");
     if upto <= after || (!now_anyway && meta.publish.is_empty() && waiting < at_least && waiting * 10 < rows) {
         // (nothing to purge yet; the old rows past the table's retention may still go)
         if settle(&mut meta, &mut dmeta, now, retain_ms) {
@@ -541,7 +541,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
         // still have to shadow what older files hold for that key).
         Kind::Fold { after, upto, rows } => {
             caught_up(lake, &table, after, upto, rows).await?;
-            let part = TableMeta { files: vec![], tiered: after, ..meta.clone() };
+            let part = { let mut entry = meta.clone(); entry.files = vec![]; entry.tiered = after; entry };
             (latest(lake, &table, &part, upto, !first).await?, upto)
         }
         Kind::Compact { upto, rows } => {
@@ -553,7 +553,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
         // (they still shadow the older files left out), as new as the newest of them.
         Kind::Squash { files } => {
             let ord = files.iter().map(|f| f.ord).max().unwrap_or(0);
-            let part = TableMeta { files, ..meta.clone() };
+            let part = { let mut entry = meta.clone(); entry.files = files; entry };
             (latest(lake, &table, &part, meta.tiered, true).await?, ord)
         }
         // The places of the old versions these files hold, in one delete file.
@@ -577,7 +577,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
             }).collect());
         }
         Kind::Merge { files } => {
-            let schema = schema(&meta.columns)?;
+            let schema = schema(&meta.columns())?;
             let session = lake.session();
             let read = || async { crate::query::files_once(lake, &session, &files.iter().collect::<Vec<_>>(), &meta, &schema).await };
             let rows = match meta.cluster.is_empty() {
@@ -633,7 +633,7 @@ pub async fn fold_into(from: &Lake, to: &Lake, table: &str, meta: &TableMeta, af
     let meta = crate::sys::with_sys(meta);
     let (keys, batches) = match meta.key.is_empty() {
         true => (meta.cluster.clone(), crate::query::tail_of(from, table, after, Some(upto), false, true, false).await?),
-        false => (meta.key.clone(), latest(from, table, &TableMeta { files: vec![], tiered: after, ..meta.clone() }, upto, true).await?),
+        false => (meta.key.clone(), latest(from, table, &{ let mut entry = meta.clone(); entry.files = vec![]; entry.tiered = after; entry }, upto, true).await?),
     };
     write_parts(to, table, &meta, batches, &keys, upto, false).await
 }
@@ -756,7 +756,7 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
         if floors[0].0 <= cutoff { floors[0].1 } else { 0 }
     };
     // (`--changelog-secs`: the log is also a change feed, kept that long for `/watch?after=` replays.)
-    let changelog = crate::env::or::<u64>("PONDRA_CHANGELOG_SECS", 0) * 1000;
+    let changelog = crate::env::value::<u64>("PONDRA_CHANGELOG_SECS") * 1000;
     let log_cutoff = cutoff.min(crate::log::now_ms().saturating_sub(changelog));
     let (segs, kept): (Vec<(String, std::sync::Arc<Segment>)>, Vec<(String, std::sync::Arc<Segment>)>) = lake.cat.segments(&seg_key(1), &seg_key(floor + 1)).await?
         .into_iter().partition(|(_, s)| s.ts_ms < log_cutoff);

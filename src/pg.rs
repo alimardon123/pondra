@@ -452,11 +452,11 @@ impl Backend {
                 crate::cursors::Answer::Tag(tag) => Response::Execution(Tag::new(&tag)),
             });
         }
-        if crate::settings::is(&sql) {
+        if crate::set::is(&sql) {
             // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: this connection's (round 31)
-            return match crate::settings::statement(&self.app.lake, &sql).await {
-                Ok(crate::settings::Done::Said(tag)) => Ok(Response::Execution(Tag::new(tag))),
-                Ok(crate::settings::Done::Run(sql)) => Box::pin(self.run(user, &sql, format)).await,
+            return match crate::set::statement(&self.app.lake, &sql).await {
+                Ok(crate::set::Done::Said(tag)) => Ok(Response::Execution(Tag::new(tag))),
+                Ok(crate::set::Done::Run(sql)) => Box::pin(self.run(user, &sql, format)).await,
                 Err(_) if crate::text::first_word(&sql).to_uppercase().starts_with("DEALLOCATE") => Ok(Response::Execution(Tag::new("DEALLOCATE"))), // (a statement the protocol prepared: pgwire's)
                 Err(e) => Err(user_error(e)),
             };
@@ -856,7 +856,7 @@ fn command_tag(sql: &str, stmt: &crate::write::Stmt) -> String {
 }
 
 /// Postgres's session commands: `SHOW` of a Postgres setting (what the session set, or what
-/// clients expect), and `DISCARD` and `CLOSE` accepted. (`SET` and the rest: `settings.rs`.)
+/// clients expect), and `DISCARD` and `CLOSE` accepted. (`SET` and the rest: `set.rs`.)
 fn session_command(sql: &str) -> Option<Response> {
     if crate::script::is(sql) {
         return None; // (`BEGIN … END` that opens a block is a script's)
@@ -878,7 +878,7 @@ fn session_command(sql: &str) -> Option<Response> {
         }
         "SHOW" if show_column(sql).is_some() => {
             let (name, column) = show_column(sql)?;
-            setting(&column, &crate::txn::shown(&name).or_else(|| crate::settings::shown(&name)).unwrap_or_else(|| match name.as_str() {
+            setting(&column, &crate::txn::shown(&name).or_else(|| crate::set::shown(&name)).unwrap_or_else(|| match name.as_str() {
                 "search_path" => "public".into(), // (no session path: this lake's public, as Postgres's `"$user", public` in its usual setup)
                 s if s.contains("standard_conforming_strings") => "on".into(),
                 s if s.contains("transaction") => "read committed".into(),
@@ -1728,7 +1728,7 @@ impl Backend {
         if n > 0 {
             arithmetic_types(sql, &mut types); // (an operand of + - * / %: the other operand's type, as Postgres gives it; the plan below still wins)
         }
-        if n > 0 && session_command(sql).is_none() && !crate::settings::is(sql) && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() && !crate::script::is(sql) {
+        if n > 0 && session_command(sql).is_none() && !crate::set::is(sql) && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() && !crate::script::is(sql) {
             let plan = async {
                 let sql = crate::routines::expand(&self.app.lake, sql).await.ok()?;
                 crate::engine::sql(&self.session(&sql, "").await.ok()?, &crate::sys::planned(&sql).ok()?).await.ok()
@@ -1803,7 +1803,7 @@ impl Backend {
             None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.types().into()))), // (a key lookup's columns, unplanned, first)
             Some(_) => None,
         };
-        if point.is_none() && (session_command(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some() || crate::script::is(sql)) {
+        if point.is_none() && (session_command(sql).is_some() || crate::set::is(sql) || crate::vars::change(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some() || crate::script::is(sql)) {
             return Ok((vec![], Columns::None)); // (a COPY's columns come with its data)
         }
         let marks = match point {

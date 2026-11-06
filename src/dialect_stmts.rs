@@ -21,7 +21,7 @@ use std::sync::LazyLock;
 /// SQL Server's `SET name ON|OFF` options, which nothing here reads.
 const SQL_SERVER_SETS: &[&str] = &["NOCOUNT", "ANSI_NULLS", "QUOTED_IDENTIFIER", "XACT_ABORT", "ANSI_PADDING", "ANSI_WARNINGS", "ARITHABORT", "CONCAT_NULL_YIELDS_NULL", "NUMERIC_ROUNDABORT", "IDENTITY_INSERT", "STATISTICS", "SHOWPLAN_ALL", "SHOWPLAN_XML", "IMPLICIT_TRANSACTIONS", "FMTONLY"];
 
-/// The words for MySQL's `SET @v = …` (`settings.rs` says them too, for a SET it reads).
+/// The words for MySQL's `SET @v = …` (`set.rs` says them too, for a SET it reads).
 pub(crate) fn user_variable(v: &str) -> String { format!("SET @{v} is MySQL's for a variable: here a variable is ${v} = …, and ${v} reads it") }
 
 /// Refused (0A000) with what to write, when a statement of `sql` is one of these.

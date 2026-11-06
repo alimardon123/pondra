@@ -100,8 +100,8 @@ pub fn still_taken(path: &str) -> bool { path.starts_with("/cluster/") || matche
 /// Drain: stop being ready, wait out the grace, then for the requests in flight (bounded).
 pub async fn drain() {
     DRAINING.store(true, SeqCst);
-    tokio::time::sleep(crate::env::secs("PONDRA_DRAIN_GRACE_SECS", 0.0)).await;
-    let (start, most, count) = (tokio::time::Instant::now(), crate::env::secs("PONDRA_DRAIN_SECS", 30.0), in_flight());
+    tokio::time::sleep(crate::env::secs("PONDRA_DRAIN_GRACE_SECS")).await;
+    let (start, most, count) = (tokio::time::Instant::now(), crate::env::secs("PONDRA_DRAIN_SECS"), in_flight());
     *DRAIN_START.lock().unwrap_or_else(|e| e.into_inner()) = Some(start); // (the door's wait is what is left of `most`: `door_bound`)
     while count.load(SeqCst) > 0 && start.elapsed() < most {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -159,7 +159,7 @@ fn door_bound() -> Duration {
         return Duration::ZERO;
     }
     match *DRAIN_START.lock().unwrap_or_else(|e| e.into_inner()) {
-        Some(start) => crate::env::secs("PONDRA_DRAIN_SECS", 30.0).saturating_sub(start.elapsed()),
+        Some(start) => crate::env::secs("PONDRA_DRAIN_SECS").saturating_sub(start.elapsed()),
         None => Duration::from_secs(1),
     }
 }

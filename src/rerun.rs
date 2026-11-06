@@ -629,7 +629,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &Tabl
     crate::format::require(lake, 2, "a materialized view that runs its query again (median, count(DISTINCT …), ORDER BY … LIMIT, …)").await?;
     let ctx = crate::query::session(lake, sql, "").await?; // (the table's columns are the types the query runs with)
     let (columns, sql_types) = table_columns(lake, sql, &ctx, plan).await?;
-    let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), sql_types, ..Default::default() };
+    let meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry };
     let r = Rerun { id: uuid::Uuid::new_v4().to_string(), keys, full, reason, asked, lag_secs, joins };
     let view = View { source: source.into(), sql: sql.into(), emit: None, sessions: None, ids: false, join: None, fill: None, expect: vec![], once: None, written, rerun: Some(r), matches: None, from, authored: None };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (crate::views::view_key(name), json(&view))], &[]).await
@@ -966,7 +966,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
         crate::change::companion(lake, view, &meta).await?; // (its `$deleted`, which every run names)
         let meta = lake.cat.meta(&table_key(view)).await?.context("view without table")?;
         let at = lake.visible();
-        let stands = none || meta.columns == before.columns && !moved_since(lake, seen, at, &[view.to_string()]).await?;
+        let stands = none || meta.columns() == before.columns() && !moved_since(lake, seen, at, &[view.to_string()]).await?;
         let (old, new) = match stands {
             true => changed,
             false => diff(&meta, &r.keys, &old_rows(lake, view, &r.keys, scanned.as_ref(), at).await?, &new)?,
@@ -985,7 +985,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
         if pending.is_empty() {
             // (nothing came out different: only its progress moves, both parts' together)
             let empty = |table: String, s: SchemaRef| crate::log::Append { table, src: crate::log::Src { producer: String::new(), seq: 0, prev: None }, batch: RecordBatch::new_empty(s), ack: tokio::sync::oneshot::channel().0 };
-            let s = crate::answer::schema(&meta.columns)?;
+            let s = crate::answer::schema(&meta.columns())?;
             pending = vec![empty(view.to_string(), s.clone()), empty(crate::sys::deleted(view), s)];
         }
         // Both parts under the same seq and `prev`: they always move together, so a run that lost
@@ -1075,7 +1075,7 @@ async fn changed(lake: &Lake, source: &str, after: u64, upto: u64) -> Result<Dat
     }
     let out = crate::change::taken_out(lake, source, after, Some(upto)).await?;
     if out.iter().any(|b| b.num_rows() > 0) {
-        let stored = crate::answer::schema(&crate::sys::with_sys(&meta).columns)?;
+        let stored = crate::answer::schema(&crate::sys::with_sys(&meta).columns())?;
         let out = out.iter().map(|b| meta.to_logical(&crate::query::conform(b, &stored)?)).collect::<Result<Vec<_>>>()?;
         all = all.union(pick(ctx.read_batches(out)?)?)?;
     }
@@ -1206,7 +1206,7 @@ async fn old_rows(lake: &Lake, view: &str, keys: &[String], touched: Option<&Tou
 fn diff(meta: &TableMeta, keys: &[String], old: &[RecordBatch], new: &[RecordBatch]) -> Result<(RecordBatch, RecordBatch)> {
     use datafusion::arrow::compute::{concat_batches, filter_record_batch, take, take_record_batch};
     use datafusion::arrow::row::{RowConverter, SortField};
-    let s = crate::answer::schema(&meta.columns)?;
+    let s = crate::answer::schema(&meta.columns())?;
     let mut fields = s.fields().to_vec();
     let ts = crate::sys::time();
     fields.extend([Field::new(ROW_ID, DataType::Int64, true), Field::new(CREATED, ts, true), Field::new(VERSION, DataType::Int64, true)].map(Arc::new));
@@ -1334,7 +1334,7 @@ mod tests {
 
     #[test]
     fn diff_compares_whole_rows_only_for_old_keys() {
-        let meta = TableMeta { columns: vec![("k".into(), "Int64".into()), ("v".into(), "Utf8".into())], ..Default::default() };
+        let meta = TableMeta::with_columns(vec![("k".into(), "Int64".into()), ("v".into(), "Utf8".into())]);
         let (old, new) = (vec![old_batch()], vec![new_batch()]);
 
         let (gone, put) = diff(&meta, &["k".to_string()], &old, &new).unwrap();

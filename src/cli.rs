@@ -471,7 +471,7 @@ async fn run() -> anyhow::Result<()> {
             };
             if many {
                 anyhow::ensure!(!serving, "--serve-store serves one lake's store: serve a lake (--lake), not a folder of them");
-                anyhow::ensure!(idle_exit.is_none() && env::secs("PONDRA_IDLE_EXIT_SECS", 0.0).is_zero(), "{dir} holds several lakes, served as databases, and each database's node already stops once idle (PONDRA_DATABASE_IDLE_SECS): --idle-exit is for one lake's node");
+                anyhow::ensure!(idle_exit.is_none() && env::secs("PONDRA_IDLE_EXIT_SECS").is_zero(), "{dir} holds several lakes, served as databases, and each database's node already stops once idle (PONDRA_DATABASE_IDLE_SECS): --idle-exit is for one lake's node");
                 let one = [(flight.is_some(), "--flight"), (kafka.is_some(), "--kafka"), (kafka_advertise.is_some(), "--kafka-advertise"), (!attached.is_empty(), "--attach"), (advertise.is_some(), "--advertise"), (attach_found.is_some(), "--attach-found")];
                 if let Some((_, flag)) = one.iter().find(|(given, _)| *given) {
                     anyhow::bail!("{dir} holds several lakes, served as databases; {flag} is one lake's (serve that lake: pondra serve {dir}/<name> {flag} …)");
@@ -536,7 +536,7 @@ async fn run() -> anyhow::Result<()> {
             let mut stop = Box::pin(stopped(stop_with_stdin));
             // (`--idle-exit`: once nobody has used the node for that long and it has nothing left to do, it stops as on
             // SIGTERM: `idle.rs`)
-            let quiet = env::secs("PONDRA_IDLE_EXIT_SECS", 0.0);
+            let quiet = env::secs("PONDRA_IDLE_EXIT_SECS");
             let mut idle = Box::pin(crate::idle::ended(quiet.as_secs_f64()));
             let mut moves = node::mover(); // (a lake moving to another place: `memory::set_location`)
             let mut options = node::Options { dir, listen: addr, advertise, start: node::Start { reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, python, auth }, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest: None };
@@ -669,7 +669,7 @@ async fn run() -> anyhow::Result<()> {
 /// notices its procedures printed, then the answer.
 async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Result<()> {
     // `USE` sets a session's path, and this command has no session (`path.rs`).
-    anyhow::ensure!(!path::is_use(query) && path::set_schema(query).is_none(), "{}", settings::NO_SESSION);
+    anyhow::ensure!(!path::is_use(query) && path::set_schema(query).is_none(), "{}", set::NO_SESSION);
     // DuckDB's INSTALL and LOAD answer a row naming what happened, as a page answers them (`extension.rs`).
     let query = match extension::row(query) { Some(row) => row?, None => query.to_string() };
     let reads = statement::single_statement(&query).is_some_and(|one| statement::plain_statement(&one)) || matches!(write::parse(&query), Some(write::Stmt::CopyTo(..)));

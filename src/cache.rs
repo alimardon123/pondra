@@ -130,7 +130,7 @@ static OUTSIDE: std::sync::LazyLock<Mutex<Outside>> = std::sync::LazyLock::new(|
     Mutex::new(Outside { seen, ranges: ByteLru::new(files_cache_bytes()) })
 });
 
-fn files_cache_bytes() -> usize { crate::env::or("PONDRA_FILES_CACHE_MB", 512usize) << 20 }
+fn files_cache_bytes() -> usize { crate::env::value::<usize>("PONDRA_FILES_CACHE_MB") << 20 }
 
 /// Keeps a range (or a block) of a file outside the lakes, the least recently used going past `files_cache_bytes`.
 fn keep_outside(key: String, entry: Entry) {
