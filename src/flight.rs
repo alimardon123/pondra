@@ -848,12 +848,18 @@ impl FlightSqlService for Sql {
     type FlightService = Sql;
 
     async fn do_handshake(&self, req: Request<Streaming<HandshakeRequest>>) -> Result<Response<Out<HandshakeResponse>>, Status> {
-        // (signed in by `Gate` already; here a token is handed back: the password when it is one, or
-        // anything on a node nothing locks; a session when a user signed in)
+        // (signed in by `Gate` already; here a token is handed back: the password when it is one, a user's
+        // `pt_` token included, or anything on a node nothing locks; a session when a user signed in)
         let credential = crate::auth::Credential::of_header(req.metadata().get("authorization").and_then(|v| v.to_str().ok()));
         let crate::auth::Credential::Password { password, .. } = credential else { return Err(refused("28P01", "wrong user name or password")) };
         let open = self.0.open().await;
         let token = match self.0.auth.token_role(&password) {
+            // (a user's token is handed back as itself, which every call checks again: a session made from it
+            // would outlive a DROP TOKEN and the token's own end by the session's hours, 11-06 audit H2)
+            Role::None if !open && password.starts_with("pt_") => match caller(&req) {
+                who if who.role > Role::None => password,
+                _ => return Err(refused("28P01", "wrong user name or password")),
+            },
             Role::None if !open => match caller(&req) {
                 who if who.role > Role::None => match crate::sso::check(&self.0.lake, &password).await {
                     Some(Ok(c)) => crate::users::session_of(&self.0.lake, &c).await, // (a provider's: its session names it, ADR-074 §5)
