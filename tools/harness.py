@@ -10938,7 +10938,7 @@ def users():
         [flight_unreadable(h) for h in (b"Basic !!!", b"Bearer", no_colon.encode())]
     shown_info["unreadable"] = [str(r)[:160] for r in [unreadable_open] + unreadable]
     checks["a credential that can't be read is refused by name at HTTP, MCP and Flight, at an open node too"] = \
-        all("the Authorization header can't be read" in str(r) for r in [unreadable_open] + unreadable) \
+        all("the credential can't be read" in str(r) for r in [unreadable_open] + unreadable) \
         and all(str(r).startswith("ERROR 401") for r in [unreadable_open] + unreadable[:4])
     # MCP: a listing shows what a user may read; changes (a stream of rows, every column, as /watch's) is refused without them
     def tool_result(name, args):

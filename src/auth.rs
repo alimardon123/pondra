@@ -637,7 +637,7 @@ pub enum Credential {
 
 impl Credential {
     /// What every door answers a credential it can't read, before why.
-    pub const MALFORMED: &'static str = "the Authorization header can't be read";
+    pub const MALFORMED: &'static str = "the credential can't be read";
 
     /// An `Authorization` header's value: `Bearer <token>` or `Basic <base64 of name:password>`. The scheme in any case
     /// (RFC 9110 §11.1), the spaces around its value taken off, Basic's base64 with its padding or without (as ADBC
@@ -765,7 +765,7 @@ mod tests {
         assert_eq!((&http, &kafka), (&pg, &pg));
         assert_eq!(Credential::of_sasl_plain(b"ann\0secret"), Malformed("a SASL PLAIN message that isn't authzid, name and password"));
         assert_eq!(Credential::of_sasl_plain(b"\0ann\0\xff"), Malformed("a SASL PLAIN name and password that aren't UTF-8"));
-        assert_eq!(Malformed("x").malformed().as_deref(), Some("the Authorization header can't be read: x"));
+        assert_eq!(Malformed("x").malformed().as_deref(), Some("the credential can't be read: x"));
     }
 
     fn ip(last: u8) -> Option<IpAddr> { Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))) }
