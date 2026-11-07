@@ -82,9 +82,10 @@ impl tower::Service<http::Request<tonic::body::Body>> for Gate {
     fn call(&mut self, mut req: http::Request<tonic::body::Body>) -> Self::Future {
         let (app, mut inner, used) = (self.app.clone(), self.inner.clone(), crate::idle::Use::new()); // (a call is a use of the node until its answer is sent: `idle.rs`)
         Box::pin(async move {
-            let header = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
+            // (a header that isn't text can't be read, and is refused as HTTP refuses it: not taken for no credential)
+            let (credential, sent) = (crate::auth::Credential::of_headers(req.headers()), req.headers().contains_key("authorization"));
             let peer = req.extensions().get::<crate::tls::Peer>().copied();
-            let who = match sign_in(&app, header.as_deref(), peer).await {
+            let who = match sign_in(&app, credential, sent, peer).await {
                 Ok(who) => who,
                 Err(refused) => return Ok(refused.into_http()),
             };
@@ -195,9 +196,8 @@ fn allowed<T>(_: &App, _: &Request<T>, need: Role) -> Result<Role, Status> {
 /// Who a call is, from its `authorization`: a token, or a user's token or session (`Bearer`:
 /// `users::who`); or a name and password (`Basic`: what ADBC's and pyarrow's handshakes send). With
 /// nothing that needs a sign-in, anyone is an admin. A wrong password is an error, said at once.
-async fn sign_in(app: &App, header: Option<&str>, peer: Option<crate::tls::Peer>) -> Result<crate::auth::Principal, Status> {
+async fn sign_in(app: &App, credential: crate::auth::Credential, sent: bool, peer: Option<crate::tls::Peer>) -> Result<crate::auth::Principal, Status> {
     let from = peer.map(|p| p.addr);
-    let credential = crate::auth::Credential::of_header(header); // (read alike at every door: `auth::Credential`)
     if let Some(why) = credential.malformed() {
         crate::audit::refused(app, "", "flight", from, "sign in", &why).await;
         return Err(refused("28000", why));
@@ -215,7 +215,7 @@ async fn sign_in(app: &App, header: Option<&str>, peer: Option<crate::tls::Peer>
                 Some(t) => crate::sso::why(&app.lake, t).await,
                 None => None,
             };
-            if header.is_some() {
+            if sent {
                 crate::audit::refused(app, "", "flight", from, "sign in", why.as_deref().unwrap_or("wrong token")).await;
             }
             if let Some(why) = why {

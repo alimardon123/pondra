@@ -34,7 +34,10 @@ use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::future::BoxFuture;
 use futures::FutureExt;
+use serde_json::value::RawValue;
 use serde_json::Value;
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -579,9 +582,10 @@ fn failed(e: &anyhow::Error) -> Outcome {
     use crate::codes::Kind::*;
     // (a code read from an error's words is trusted only when the error isn't the machine's or the bucket's: the OS's
     // "Read-only file system" or "Permission denied" would read as 25006 or 42501, and a write may pass once the disk or
-    // the bucket is back, so it is retried, 11-06 audit L5)
+    // the bucket is back, so it is retried, 11-06 audit L5; the bucket as DataFusion reads it, a UNIQUE check on the
+    // leader, is object_store 0.13's, 11-07 audit L7)
     let coded = e.chain().any(|c| c.is::<crate::codes::Coded>() || c.is::<crate::codes::Violation>());
-    let machine = !coded && e.chain().any(|c| c.is::<std::io::Error>() || c.is::<object_store::Error>());
+    let machine = !coded && e.chain().any(|c| c.is::<std::io::Error>() || c.is::<object_store::Error>() || c.is::<object_store_df::Error>());
     let code = if machine { "58030" } else { crate::codes::of(e) }; // (io_error: Unavailable)
     let error = match crate::codes::kind(code) {
         Missing if matches!(code, "42P01" | "3F000" | "3D000") => UNKNOWN_TOPIC,
@@ -660,7 +664,7 @@ fn to_rows(t: &crate::rules::Table, recs: &[Rec]) -> Result<(RecordBatch, Vec<u8
             (true, _) => {}
             (false, false) => lines.extend_from_slice(r.value.as_deref().unwrap_or_default()),
             (false, true) => match row(t, r.key.as_deref(), r.value.as_deref())? {
-                Some(v) => serde_json::to_writer(&mut lines, &v)?,
+                Some((v, sent)) => write_row(&mut lines, &v, sent.as_deref())?,
                 None => continue,
             },
         }
@@ -701,15 +705,18 @@ fn wrapped(v: &serde_json::Map<String, Value>) -> bool {
     v.contains_key("payload") && v.keys().all(|k| k == "payload" || k == "schema")
 }
 
-/// A record as the JSON row to write, None to skip it. Debezium's `after` is the new row, a
-/// delete marks `before` deleted; a null value (a tombstone) deletes the key from a keyed table.
-fn row(t: &crate::rules::Table, key: Option<&[u8]>, value: Option<&[u8]>) -> Result<Option<Value>> {
-    let unwrap = |mut v: Value| -> Result<Value> {
+/// A record as the JSON row to write, None to skip it, with the JSON text the row was sent as (when it holds a
+/// number: see `write_row`). Debezium's `after` is the new row, a delete marks `before` deleted; a null value (a
+/// tombstone) deletes the key from a keyed table.
+fn row<'a>(t: &crate::rules::Table, key: Option<&'a [u8]>, value: Option<&'a [u8]>) -> Result<Option<(Value, Option<Cow<'a, str>>)>> {
+    // (the row's place in the record, a key at each step: `payload`, then `after` or `before`)
+    let unwrap = |mut v: Value, path: &mut Vec<&'static str>| -> Result<Value> {
         if !v.as_object().is_some_and(wrapped) {
             return Ok(v);
         }
         let mut payload = v["payload"].take();
         typed(&v["schema"], &mut payload, &t.schema)?;
+        path.push("payload");
         Ok(payload)
     };
     let deleted = |mut v: Value| {
@@ -718,17 +725,25 @@ fn row(t: &crate::rules::Table, key: Option<&[u8]>, value: Option<&[u8]>) -> Res
         }
         v
     };
+    let numbers = |v: &Value| v.as_object().is_some_and(|o| o.values().any(Value::is_number));
+    let mut path = vec![];
     let mut v = unwrap(match value.filter(|v| !v.is_empty()) {
         Some(v) => serde_json::from_slice(v)?,
         None => Value::Null,
-    })?;
+    }, &mut path)?;
     let keyed = !t.key.is_empty() && t.column("_deleted").is_some();
     if let Some(op) = v.get("op").and_then(Value::as_str).map(String::from).filter(|_| v.get("after").is_some() || v.get("before").is_some()) {
         v = match op.as_str() {
-            "c" | "u" | "r" => v["after"].take(),
+            "c" | "u" | "r" => {
+                path.push("after");
+                v["after"].take()
+            }
             // (a table without a key can't tell which row went: appending `before` would bring it back)
             "d" if !keyed => bail!("a change event deletes a row, and only a table with a key knows which: create this table with a PRIMARY KEY (the source's)"),
-            "d" => deleted(v["before"].take()),
+            "d" => {
+                path.push("before");
+                deleted(v["before"].take())
+            }
             // (a truncate: not applied yet, and said, so a table that kept its rows isn't a surprise; Debezium sends one
             // only with `skipped.operations=none`)
             "t" => {
@@ -739,15 +754,57 @@ fn row(t: &crate::rules::Table, key: Option<&[u8]>, value: Option<&[u8]>) -> Res
         };
     }
     if !v.is_null() {
-        return Ok(Some(v));
+        let sent = value.filter(|_| numbers(&v)).and_then(|b| sent_at(b, &path)).map(Cow::Borrowed);
+        return Ok(Some((v, sent)));
     }
     let Some(key) = key.filter(|_| keyed) else { return Ok(None) }; // (nothing to delete)
-    let k = unwrap(serde_json::from_slice(key).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(key).into())))?;
-    Ok(Some(deleted(match k {
-        Value::Object(_) => k,
-        k if t.key.len() == 1 => Value::Object([(t.key[0].clone(), k)].into_iter().collect()),
+    let mut path = vec![];
+    let k = unwrap(serde_json::from_slice(key).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(key).into())), &mut path)?;
+    let sent = sent_at(key, &path);
+    Ok(Some(match k {
+        Value::Object(_) => {
+            let sent = sent.filter(|_| numbers(&k)).map(Cow::Borrowed);
+            (deleted(k), sent)
+        }
+        k if t.key.len() == 1 => {
+            let sent = sent.filter(|_| k.is_number()).map(|s| Cow::Owned(format!("{{{}:{s}}}", Value::from(t.key[0].as_str()))));
+            (deleted(Value::Object([(t.key[0].clone(), k)].into_iter().collect())), sent)
+        }
         _ => bail!("a tombstone's key must name every key column"),
-    })))
+    }))
+}
+
+/// The JSON text at `path` in a record's JSON, each step a key of an object.
+fn sent_at<'a>(json: &'a [u8], path: &[&str]) -> Option<&'a str> {
+    let mut at: &'a RawValue = serde_json::from_slice(json).ok()?;
+    for k in path {
+        at = serde_json::from_str::<HashMap<String, &'a RawValue>>(at.get()).ok()?.get(*k).copied()?;
+    }
+    Some(at.get())
+}
+
+/// A row as a line of JSON for `from_json`, each number in it as the record sent it (`sent`: the row's own text).
+/// A `Value` holds a number as an f64, sure of only 15 significant digits, and a DECIMAL(38, 18) takes 38: so
+/// 0.123456789012345678 is written as it came, not as 0.12345678901234568, as a record of plain rows is read.
+/// A number changed on the way (a time in another unit) is written as it is now.
+fn write_row(out: &mut Vec<u8>, v: &Value, sent: Option<&str>) -> Result<()> {
+    let (Value::Object(o), Some(sent)) = (v, sent.and_then(|s| serde_json::from_str::<HashMap<String, &RawValue>>(s).ok())) else {
+        return Ok(serde_json::to_writer(out, v)?);
+    };
+    out.push(b'{');
+    for (i, (k, x)) in o.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        serde_json::to_writer(&mut *out, k)?;
+        out.push(b':');
+        match sent.get(k).map(|r| r.get()) {
+            Some(r) if x.is_number() && serde_json::from_str::<Value>(r).is_ok_and(|y| y == *x) => out.extend_from_slice(r.as_bytes()),
+            _ => serde_json::to_writer(&mut *out, x)?,
+        }
+    }
+    out.push(b'}');
+    Ok(())
 }
 
 /// Kafka Connect's JSON carries its schema beside the row, and the schema names how a value is written
@@ -1607,6 +1664,10 @@ mod tests {
         assert_eq!(failed(&os(std::io::ErrorKind::PermissionDenied, "Permission denied (os error 13)")).0, REQUEST_TIMED_OUT);
         let bucket = anyhow::Error::from(object_store::Error::NotFound { path: "t/1".into(), source: "gone".into() });
         assert_eq!(failed(&bucket).0, REQUEST_TIMED_OUT);
+        // (and the bucket as DataFusion reads it, through object_store 0.13 and DataFusion's own error, 11-07 audit L7)
+        let denied = || object_store_df::Error::PermissionDenied { path: "t/1".into(), source: "Permission denied".into() };
+        assert_eq!(failed(&anyhow::Error::from(denied())).0, REQUEST_TIMED_OUT);
+        assert_eq!(failed(&anyhow::Error::from(datafusion::error::DataFusionError::ObjectStore(Box::new(denied()))).context("a UNIQUE check")).0, REQUEST_TIMED_OUT);
         assert_eq!(failed(&anyhow::anyhow!("permission denied for table t")).0, TOPIC_AUTHORIZATION_FAILED);
         assert_eq!(failed(&crate::codes::coded("25006", "a backup database is read only")).0, INVALID_RECORD);
     }
@@ -1630,6 +1691,47 @@ mod tests {
             assert!(decompress(codec, &data, 1 << 20).is_err(), "codec {codec} refused past its bound");
             assert_eq!(decompress(codec, &data, 4 << 20).unwrap(), zeros, "codec {codec} within it");
         }
+    }
+
+    /// Every number a record sent reaches the table as it was sent, on the path that reads a record one by one too
+    /// (an envelope, a tombstone in the batch): not through an f64, which keeps 15 significant digits for sure.
+    #[test]
+    fn numbers_keep_every_digit_they_were_sent_with() {
+        use datafusion::arrow::array::Decimal128Array;
+        use datafusion::arrow::datatypes::Field;
+        let column = |name: &str| crate::rules::Column { name: name.into(), stored: name.into(), not_null: false, default: None, always: false, held: None, labels: None };
+        let fields = vec![Field::new("id", DataType::Int64, true), Field::new("amount", DataType::Decimal128(38, 18), true), Field::new("big", DataType::Decimal128(38, 2), true),
+                          Field::new("ms", DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None), true), Field::new("_deleted", DataType::Boolean, true)];
+        let t = crate::rules::Table {
+            schema: Arc::new(Schema::new(fields)), columns: ["id", "amount", "big", "ms", "_deleted"].map(column).to_vec(), key: vec!["id".into()], key_checked: true,
+            unique: vec![], checks: vec![], mapped: false, order: ["id", "amount", "big", "ms", "_deleted"].map(String::from).to_vec(), planned: Default::default(),
+        };
+        let rec = |key: Option<&str>, value: Option<&str>| Rec { key: key.map(|k| Bytes::from(k.to_string())), value: value.map(|v| Bytes::from(v.to_string())), ts: 0 };
+        let decimal = r#"{"type": "bytes", "name": "org.apache.kafka.connect.data.Decimal", "parameters": {"scale": "18"}, "field": "amount"}"#;
+        let ms = r#"{"type": "int64", "name": "io.debezium.time.Timestamp", "field": "ms"}"#;
+        let recs = [
+            // Kafka Connect's JSON, `decimal.format=NUMERIC`: the Decimal as a JSON number, beside a time in milliseconds.
+            rec(None, Some(&format!(r#"{{"schema": {{"type": "struct", "fields": [{decimal}, {ms}]}}, "payload": {{"id": 1, "amount": 0.123456789012345678, "big": 12345678901234567.89, "ms": 1000}}}}"#))),
+            // Debezium's envelope without its schema, and a plain row in the same batch.
+            rec(None, Some(r#"{"before": null, "after": {"id": 2, "amount": 1.000000000000000001, "big": 99999999999999999999.99}, "op": "c"}"#)),
+            rec(None, Some(r#"{"id": 3, "amount": 0.333333333333333333}"#)),
+            // A tombstone: the key's number as sent too.
+            rec(Some("12345678901234567"), None),
+        ];
+        let (batch, _) = to_rows(&t, &recs).unwrap();
+        let text = |c: &str| { let a = batch.column_by_name(c).unwrap().as_any().downcast_ref::<Decimal128Array>().unwrap().clone(); (0..a.len()).map(|i| a.is_valid(i).then(|| a.value_as_string(i))).collect::<Vec<_>>() };
+        assert_eq!(text("amount"), [Some("0.123456789012345678".into()), Some("1.000000000000000001".into()), Some("0.333333333333333333".into()), None]);
+        assert_eq!(text("big"), [Some("12345678901234567.89".into()), Some("99999999999999999999.99".into()), None, None]);
+        assert_eq!(batch.column_by_name("id").unwrap().as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().unwrap().values().to_vec(), [1, 2, 3, 12345678901234567]);
+        // (a number changed on the way is written as it is now: milliseconds as the column's microseconds)
+        assert_eq!(batch.column_by_name("ms").unwrap().as_any().downcast_ref::<datafusion::arrow::array::TimestampMicrosecondArray>().unwrap().value(0), 1_000_000);
+        // A row's text is found by its place in the record, and a number in a pretty-printed record keeps its digits.
+        let pretty = b"{\n  \"payload\": {\n    \"after\": {\"x\": 1.5e3}\n  }\n}";
+        assert_eq!(sent_at(pretty, &["payload", "after"]), Some(r#"{"x": 1.5e3}"#));
+        assert_eq!(sent_at(pretty, &["payload", "before"]), None);
+        let mut line = vec![];
+        write_row(&mut line, &serde_json::json!({"x": 1500.0, "y": "a"}), Some(r#"{"x": 1.5e3}"#)).unwrap();
+        assert_eq!(String::from_utf8(line).unwrap(), r#"{"x":1.5e3,"y":"a"}"#);
     }
 
     #[test]
