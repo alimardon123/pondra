@@ -1032,7 +1032,7 @@ async fn fetch(app: &App, ver: i16, req: FetchReq, who: &crate::auth::Principal)
                 // earliest offset it had cached from before those segments expired, in a loop.)
                 let (offset, end) = (offset.max(crate::log::ord(first, 0)), crate::log::ord(visible + 1, 0));
                 let (error, records) = match &meta {
-                    Some(_) if !who.may_read_all(name) => (TOPIC_AUTHORIZATION_FAILED, vec![]),
+                    Some(_) if crate::rights::may(who, crate::rights::Action::SelectAll, crate::rights::Object::Table(name)).is_err() => (TOPIC_AUTHORIZATION_FAILED, vec![]),
                     Some(meta) if index == 0 && offset <= end => (0, read(app, name, meta, offset, visible, limit.min(budget)).await?),
                     Some(_) if index == 0 => (OFFSET_OUT_OF_RANGE, vec![]),
                     _ => (UNKNOWN_TOPIC, vec![]),
