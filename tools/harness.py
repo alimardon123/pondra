@@ -5844,6 +5844,65 @@ def copies():
         r_ = hc.getresponse()
         b_ = r_.read().decode()
         off_port[q_] = r_.status != 200 and r_.getheader("x-pondra-sqlstate") == "0A000" and words in b_
+    # A COPY given up leaves nothing on the node. 12 COPYs are given up, four each way: a client that goes away mid-COPY
+    # (24 MB sent, under the 32 MB chunk, so none is loaded), a CopyFail after 24 MB, and a chunk refused partway (33 MB
+    # with a bad value at 24 MB: 22P02, nothing of it written, and the 20 MB the client sends after are not read). Their
+    # answers are as before: CopyFail is XX000 in pgwire's words. Ten seconds on (jemalloc gives back what has been free
+    # that long), the node holds about what it held before them, and the next COPY on the same connection loads. Before,
+    # each one's bytes stayed for good.
+    rss = lambda: int(next(l for l in open(f"/proc/{node.p.pid}/status") if l.startswith("VmRSS")).split()[1]) >> 10
+    mb = b"".join(b"%d\tname\t0.5\n" % i for i in range(80_000))[: 1 << 20]
+    mb = mb[: mb.rindex(b"\n") + 1]
+    away = ("import os, sys, time, psycopg\n"
+            "c = psycopg.connect(sys.argv[1], autocommit=True)\n"
+            "with c.cursor() as cur, cur.copy('COPY gaveup FROM STDIN') as cp:\n"
+            "    for _ in range(24): cp.write(open(sys.argv[2], 'rb').read())\n"
+            "    while c.pgconn.flush() != 0: time.sleep(0.01)\n"
+            "    time.sleep(0.5); os._exit(7)\n")
+    fd, rows_file = tempfile.mkstemp(suffix=".tsv")
+    os.write(fd, mb)
+    os.close(fd)
+    gave_up = {"away": [], "failed": [], "refused": []}
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("CREATE TABLE gaveup (id BIGINT, name VARCHAR, amount DOUBLE)")
+        time.sleep(11)
+        gave_up["before_mb"] = rss()
+        conn = c.pgconn
+        def given_up(frames):
+            """A COPY sent at the protocol, frame by frame, then ended by CopyFail: its answer's SQLSTATE and words."""
+            conn.send_query(b"COPY gaveup FROM STDIN")
+            conn.get_result()
+            try:
+                for f in frames:
+                    conn.put_copy_data(f)
+                while conn.flush() != 0:
+                    time.sleep(0.01)
+                time.sleep(0.5)
+                conn.put_copy_end(b"given up")
+            except psycopg.OperationalError:
+                pass  # (libpq read the refusal of a chunk as it sent: the COPY is over)
+            r_ = conn.get_result()
+            said_ = (r_.error_field(psycopg.pq.DiagnosticField.SQLSTATE).decode(), r_.error_field(psycopg.pq.DiagnosticField.MESSAGE_PRIMARY).decode())
+            while conn.get_result() is not None:
+                pass
+            return said_
+        for i in range(12):
+            if i % 3 == 0:
+                gave_up["away"].append(subprocess.run([sys.executable, "-c", away, dsn, rows_file], timeout=60).returncode)
+            elif i % 3 == 1:
+                gave_up["failed"].append(given_up([mb] * 24))
+            else:
+                gave_up["refused"].append(given_up([mb] * 24 + [b"1\tbad\tnot a number\n"] + [mb] * 29)[0])
+        time.sleep(11)
+        gave_up["after_mb"] = rss()
+        gave_up["rows"] = c.execute("SELECT count(*) FROM gaveup").fetchone()[0]
+        with c.cursor() as cur, cur.copy("COPY gaveup FROM STDIN") as cp:
+            cp.write(b"1\tlast\t0.5\n")
+        gave_up["then"] = list(c.execute("SELECT count(*), max(name) FROM gaveup").fetchone())
+    os.remove(rows_file)
+    gave_up_ok = (gave_up["after_mb"] - gave_up["before_mb"] < 100 and gave_up["rows"] == 0 and gave_up["then"] == [1, "last"]
+                  and gave_up["away"] == [7] * 4 and gave_up["refused"] == ["22P02"] * 4
+                  and gave_up["failed"] == [("XX000", "COPY IN mode terminated by the user: given up")] * 4)
     node.kill()
     checks = {"COPY FROM STDIN, text and CSV": (text_in, csv_in) == (1000, 1000),
               "COPY FROM's end marker, blank lines and out-of-range values as Postgres 16 answers them (rows, or the SQLSTATE with nothing written)": edge_ok,
@@ -5859,11 +5918,14 @@ def copies():
               "COPY FROM a row past 64 MB, CSV (a quote open over 70 MB of lines) in 64 KB frames: refused with 54000, and the connection runs SELECT 1 after":
                   longs["csv"] == "54000" and longs["csv_then_select_1"] == 1 and longs["csv_secs"] <= 10,
               "COPY FROM 40 MB of rows in 64 KB frames: every row loads (count, sum and max of id)": bulk_ok,
+              "12 COPYs given up (a client gone mid-COPY, a CopyFail, a chunk refused with 22P02), each answered as before: none "
+              "loads, the node keeps none of their bytes (RSS within 100 MB of before), and the connection's next COPY loads": gave_up_ok,
               "over HTTP, COPY … TO STDOUT, FROM STDIN and FROM a server's file: refused by name with what to write there, 0A000": all(off_port.values())}
     out = {"passed": all(checks.values()), "checks": checks,
            "info": {"compared": f"{len(cases)} COPY FROM cases (text, CSV, CSV HEADER; one or two columns; int, smallint, bigint, numeric(3,1)) "
                                 "with Postgres 16's rows or SQLSTATE, and 10 rows, a marker, then 34 MB after a 32 MB chunk, against the rows loaded",
-                    "loaded_in_big_copy": len(big_rows), "mismatched": mismatched, "past_64_mb": longs, "bulk_40_mb": bulk, "off_port": off_port}}
+                    "loaded_in_big_copy": len(big_rows), "mismatched": mismatched, "past_64_mb": longs, "bulk_40_mb": bulk, "off_port": off_port,
+                    "given_up": gave_up}}
     print(json.dumps({"copies": out}))
     if not out["passed"]:
         sys.exit(1)
