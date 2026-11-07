@@ -766,77 +766,28 @@ pub fn statements(text: &str) -> (Vec<String>, String) {
     }
 }
 
-/// `statements`, each `;` a statement's end (a block's statements apart): each `;` the tokenizer reads as one
-/// (`text::tokens`), so a `;` in a string, a quoted name or a comment ends nothing, as every look after this reads it
-/// (11-06 audit M7: `SELECT E'it\'s; ok'` was cut at its `;`). The text is scanned first, which finds the same `;`s at a
-/// tenth of the cost (a bulk INSERT is split a few times a request, and tokenizing 6 MB of one takes a fifth of a
-/// second), and is left to the tokenizer where the scan meets what the two would read apart (`scanned`). A text the
-/// tokenizer refuses (a string never closed) is scanned whole, for the parser to say what is wrong with it.
+/// `statements`, each `;` a statement's end (a block's statements apart): each `;` of code as the tokenizer reads it
+/// (`text::stretches`), so one in a string, a quoted name or a comment ends nothing, as every look after this reads it
+/// (11-06 audit M7: `SELECT E'it\'s; ok'` was cut at its `;`). A piece of only whitespace and comments is none.
 fn pieces(text: &str) -> (Vec<String>, String) {
-    scanned(text, true).or_else(|| crate::text::tokens(text).map(|t| by_tokens(text, &t))).unwrap_or_else(|| scanned(text, false).expect("a scan that defers nothing"))
-}
-
-/// `pieces` from the text's tokens: each `;` token ends a statement that holds more than whitespace and comments.
-fn by_tokens(text: &str, t: &crate::text::Tokens) -> (Vec<String>, String) {
+    use crate::text::Stretch;
     let (mut out, mut start, mut code) = (vec![], 0, false);
-    for (i, tok) in t.toks.iter().enumerate() {
-        match tok {
-            Token::SemiColon => {
-                if code {
-                    out.push(text[start..t.start[i]].to_string());
+    crate::text::stretches(text, |s, r| match s {
+        Stretch::Comment => {}
+        Stretch::Quoted => code = true,
+        Stretch::Code => {
+            let mut from = r.start; // (since the last `;`)
+            for (j, _) in text[r.clone()].match_indices(';') {
+                let at = r.start + j;
+                if code || !text[from..at].trim_start().is_empty() {
+                    out.push(text[start..at].to_string());
                 }
-                (start, code) = (t.end[i], false);
+                (start, from, code) = (at + 1, at + 1, false);
             }
-            Token::Whitespace(_) => {}
-            _ => code = true,
+            code = code || !text[from..r.end].trim_start().is_empty();
         }
-    }
+    });
     (out, if code { text[start..].to_string() } else { String::new() })
-}
-
-/// `pieces` by a scan of the bytes: a string, a quoted name, a comment or a dollar-quoted string skipped whole. With
-/// `defer`, None where the scan and the tokenizer could read the text apart: a string after `E` (a backslash escapes
-/// its quote), `q` (`q'[…]'` may hold a quote) or `U&`; a backtick (a quoted name); a dollar (a dollar-quoted string,
-/// or part of a name: `v$session`); a comment in a comment (they nest).
-fn scanned(text: &str, defer: bool) -> Option<(Vec<String>, String)> {
-    let (mut out, mut start, mut i, mut code) = (vec![], 0, 0, false);
-    let bytes = text.as_bytes();
-    while i < text.len() {
-        let rest = &text[i..];
-        let quoted = |end: &str, from: usize| rest[from..].find(end).map_or(rest.len(), |e| from + e + end.len());
-        let (skip, is_code) = match bytes[i] {
-            b'-' if rest.starts_with("--") => (quoted("\n", 2), false),
-            b'/' if rest.starts_with("/*") => {
-                let end = quoted("*/", 2);
-                if defer && rest[2..end].contains("/*") {
-                    return None;
-                }
-                (end, false)
-            }
-            b'\'' if defer && i > 0 && matches!(bytes[i - 1], b'e' | b'E' | b'q' | b'Q' | b'&') => return None,
-            b'\'' => (quoted("'", 1), true),
-            b'"' => (quoted("\"", 1), true),
-            b'`' | b'$' if defer => return None,
-            b'$' => match dollar_tag(rest) {
-                Some(tag) => (quoted(tag, tag.len()), true),
-                None => (1, true),
-            },
-            b';' => {
-                if code {
-                    out.push(text[start..i].to_string());
-                }
-                (start, code) = (i + 1, false);
-                (1, false)
-            }
-            _ => {
-                let c = rest.chars().next().expect("not empty");
-                (c.len_utf8(), !c.is_whitespace())
-            }
-        };
-        code |= is_code;
-        i += skip.min(rest.len());
-    }
-    Some((out, if code { text[start..].to_string() } else { String::new() }))
 }
 
 /// A script's statements, the last one's `;` optional.
@@ -846,13 +797,6 @@ pub fn split(text: &str) -> Vec<String> {
         out.push(rest);
     }
     out
-}
-
-/// `$$` or `$tag$` where a dollar-quoted string starts (not `$1` or `$name`: parameters).
-pub(crate) fn dollar_tag(s: &str) -> Option<&str> {
-    let end = s[1..].find('$')? + 2;
-    let inner = &s[1..end - 1];
-    (inner.chars().all(|c| c.is_alphanumeric() || c == '_') && !inner.starts_with(|c: char| c.is_ascii_digit())).then(|| &s[..end])
 }
 
 /// Run one statement here as the caller could have sent it (the audit log told: `audit.rs`).
@@ -1395,8 +1339,20 @@ mod tests {
     /// comments (None: the tokenizer refuses the text).
     fn by_the_tokenizer(text: &str) -> Option<Vec<String>> {
         let t = crate::text::tokens(text)?;
-        let (mut out, rest) = by_tokens(text, &t);
-        out.extend((!rest.is_empty()).then_some(rest));
+        let (mut out, mut start, mut code) = (vec![], 0, false);
+        for (i, tok) in t.toks.iter().enumerate() {
+            match tok {
+                Token::SemiColon => {
+                    if code {
+                        out.push(text[start..t.start[i]].to_string());
+                    }
+                    (start, code) = (t.end[i], false);
+                }
+                Token::Whitespace(_) => {}
+                _ => code = true,
+            }
+        }
+        out.extend(code.then(|| text[start..].to_string()));
         Some(out)
     }
 
@@ -1412,15 +1368,20 @@ mod tests {
             ("SELECT $$a; b$$ AS s; SELECT 2", 2),
             ("SELECT 'it''s; ok' AS s; -- a; b\n SELECT \"x;y\" FROM t;", 2),
             ("-- only a comment;\n", 0),
+            ("SELECT X'\\'; SELECT 2'; SELECT 3", 2),
+            ("SELECT r'''a;'b''' AS s; SELECT 2", 2),
+            ("SELECT 4 //* ; */ 2", 2),
+            ("SELECT 4 |/* ; */ 2", 2),
+            ("SELECT #'a; b' AS c'", 2),
         ] {
             let got = split(text);
             assert_eq!(got.len(), n, "{text}: {got:?}");
             assert_eq!(Some(got), by_the_tokenizer(text), "{text}");
         }
         assert_eq!(split("SELECT 'never closed; SELECT 2"), ["SELECT 'never closed; SELECT 2"], "the tokenizer refuses it: scanned, for the parser to say why");
-        // Texts made of the pieces either way could read apart, each split as the tokenizer splits it: where the scan
-        // doesn't leave a text to the tokenizer, it finds the same `;`s.
-        let parts = ["SELECT 1", ";", " ", "'a;b'", "'it''s'", "E'x\\';'", "\"c;d\"", "`e;f`", "-- g;\n", "/* h; */", "/* i /* j */ ; */", "$$k;l$$", "$t$m;n$t$", "v$x", "q'[o;p]'", "'faq'", "U&'d\\0061;'", "DATE'2026'", "\n", "x", "(", ")", "$1"];
+        // Texts made of the pieces hand and tokenizer could read apart (`text::differs`), each split as the tokenizer
+        // splits it.
+        let parts = ["SELECT 1", ";", " ", "'a;b'", "'it''s'", "E'x\\';'", "\"c;d\"", "`e;f`", "-- g;\n", "/* h; */", "/* i /* j */ ; */", "$$k;l$$", "$t$m;n$t$", "v$x", "q'[o;p]'", "'faq'", "U&'d\\0061;'", "DATE'2026'", "\n", "x", "(", ")", "$1", "X'\\';'", "r'''g;'h'''", "R\"\"\"i;\"j\"\"\"", "#'k;'", "//* l; */", "|/* m; */", "#-- n;\n", "@/* o; */", "$1$p;$1$", "a$q$;$q$"];
         let mut seed = 20261107u64;
         let mut next = || {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -1430,7 +1391,7 @@ mod tests {
         for _ in 0..20000 {
             let text: String = (0..1 + next() % 12).map(|_| parts[next() % parts.len()]).collect();
             if let Some(want) = by_the_tokenizer(&text) {
-                assert_eq!(split(&text), want, "{text:?} (scanned: {})", scanned(&text, true).is_some());
+                assert_eq!(split(&text), want, "{text:?}");
                 compared += 1;
             }
         }

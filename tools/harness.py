@@ -25579,6 +25579,17 @@ def friendly():
         e_said["http"][0] == 200 and json.loads(e_said["http"][1]) == [{"s": "it's; ok"}] and e_said["port"] == "it's; ok"
     if not checks[list(checks)[-1]]:
         failed["E-string split"] = e_said
+    # (11-06 audit M7, piece 3: a block's words and the $names it uses are read past strings as the tokenizer reads
+    # them; the block reader ended E'…' at its escaped quote, so the END after it closed the IF, and $m was a variable)
+    p_said = []
+    for body in ["CREATE OR REPLACE PROCEDURE m7_block() AS BEGIN IF 1 = 1 THEN SELECT E'it\\'s the end, $m' AS s; END IF; END", "CALL m7_block()"]:
+        c.request("POST", "/sql", body.encode())
+        r = c.getresponse()
+        p_said.append((r.status, r.read().decode()[:300]))
+    checks["a block's END and a $name inside E'…' after an escaped quote are the string's: the procedure is made and runs"] = \
+        all(s == 200 for s, _ in p_said) and "it's the end, $m" in p_said[1][1]
+    if not checks[list(checks)[-1]]:
+        failed["E-string block"] = p_said
     # (11-02 audit M13: a UBIGINT went out as INT8, and 2^63 and above as NULL)
     try:
         with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pc:
