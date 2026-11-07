@@ -111,6 +111,7 @@ locks engine
 median engine
 multiply engine
 once engine
+one_row engine
 oom engine
 optimize engine
 or_ranges engine
