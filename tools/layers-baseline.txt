@@ -81,12 +81,11 @@ flight -> server  1
 flight -> sso  3
 flight -> tls  6
 format -> panics  2
-friendly -> pg_bytea  6
+friendly -> pg_bytea  5
 front -> measures  5
-front -> pattern  5
+front -> pattern  2
 front -> pg_casts  1
 front -> pg_trace  1
-front -> sparksql  1
 git -> crypto  1
 git -> fetch  1
 guard -> dial  2

@@ -16,7 +16,10 @@ use std::sync::Arc;
 pub static SPARK: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "spark",
     requires: &[],
-    register: |r| r.section_mut::<crate::engine::Functions>().add("spark", add),
+    register: |r| {
+        r.section_mut::<crate::engine::Functions>().add("spark", add);
+        r.section_mut::<crate::passes::Passes>().add(crate::sparksql::pass());
+    },
 };
 
 fn add(ctx: SessionContext) -> SessionContext {
