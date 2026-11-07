@@ -8,6 +8,10 @@ extension uses no other extension's modules. Uses that break a rule are listed. 
 an edge not in tools/layers-baseline.txt fails, and so does one with more uses than the baseline counts, so main can't
 add one while the old ones go. Comments and the insides of string literals are not code (`strip_comments`).
 
+The page's target is counted the same way: each module's lines that name `target_arch = "wasm32"` are an edge
+`module -> wasm32` with that many uses. The page's platform lives in web/, so the core names its target nowhere once
+step 2 and the later steps have moved each line (§9): a module that starts naming it fails, as does one naming it more.
+
   python3 tools/layers.py                  # report: counts by rule, every edge
   python3 tools/layers.py --baseline       # CI: fail on an edge the baseline doesn't have, or more uses along one
   python3 tools/layers.py --write-baseline # after a step removes edges, record what is left
@@ -46,6 +50,14 @@ def modules():
             for dirpath, _, names in os.walk(path):
                 out.setdefault(entry, []).extend(os.path.join(dirpath, n) for n in names if n.endswith(".rs"))
     return out
+
+
+WASM32 = re.compile(r'target_arch\s*=\s*"wasm32"')
+
+
+def wasm32_lines(files):
+    """How many lines of these files name the page's target, in code (a `//` comment's mention doesn't count)."""
+    return sum(1 for f in files for line in open(f, encoding="utf-8") if WASM32.search(line.split("//", 1)[0]))
 
 
 def braces(text, start):
@@ -180,6 +192,9 @@ def main():
                 why = broken(name, dst, floors)
                 if why:
                     edges[f"{name} -> {dst}"] = (why, n)
+        n = wasm32_lines(files)
+        if n:
+            edges[f"{name} -> wasm32"] = ("names the page's target (its platform is web/'s: §9)", n)
     if "--write-baseline" in sys.argv:
         with open(BASELINE, "w") as out:
             out.write("# Uses that break the floors, as main has them (tools/layers.py --write-baseline): each edge and how many\n")
