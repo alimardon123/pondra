@@ -232,7 +232,7 @@ fn may_see(prefix: &str, name: &str) -> bool {
 fn sql_type(m: &TableMeta, column: &str, t: &str) -> String { m.col(column).map_or_else(|| crate::objects::sql_type(t), crate::types::shown) }
 
 async fn list(app: &App) -> Result<Value> {
-    let mut tables = vec![];
+    let (mut tables, scope) = (vec![], crate::rights::scope());
     for (prefix, lake) in lakes(app) {
         if !prefix.is_empty() && crate::users::across(&lake, prefix.trim_end_matches('.')).await.is_err() {
             continue; // (another database that signs in on its own: not even its names, as `pondra.tables`)
@@ -245,9 +245,18 @@ async fn list(app: &App) -> Result<Value> {
             }
             let kind = if !m.merge.is_empty() { "merge" } else if !m.key.is_empty() { "upsert" } else { "append" };
             let m = m.described(); // (SQL's names: ADR-022; a finished view's answers)
-            let columns: Vec<Value> = m.columns().filter(|(c, _)| *c != "_deleted").map(|(c, t)| json!({"name": c, "type": sql_type(&m, c, t)})).collect();
+            // (a table granted in part: the columns granted, as every listing shows them: `rights::Scope::columns`)
+            let shown = match prefix.is_empty() {
+                true => scope.columns(name),
+                false => scope.named("select", &format!("{prefix}{name}")),
+            }
+            .flatten();
+            let reads = |c: &str| shown.as_ref().is_none_or(|s| s.contains(c));
+            let columns: Vec<Value> = m.columns().filter(|(c, _)| *c != "_deleted" && reads(c)).map(|(c, t)| json!({"name": c, "type": sql_type(&m, c, t)})).collect();
+            let key: Vec<&String> = m.key.iter().filter(|c| reads(c)).collect();
+            let merge: std::collections::BTreeMap<&String, &String> = m.merge.iter().filter(|(c, _)| reads(c)).collect();
             let view = crate::views::code_for_caller(|| views.iter().find(|(k, _)| &k[2..] == name).map(|(_, v)| v.sql.clone())).flatten();
-            tables.push(json!({"table": format!("{prefix}{name}"), "kind": kind, "key": m.key, "merge": m.merge, "columns": columns, "view": view}));
+            tables.push(json!({"table": format!("{prefix}{name}"), "kind": kind, "key": key, "merge": merge, "columns": columns, "view": view}));
         }
         for (key, v) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await? {
             if !may_see(&prefix, &key[2..]) {
