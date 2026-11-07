@@ -801,6 +801,9 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
 
 fn attached_key(n: &str) -> String { format!("o/{n}") }
 
+/// Other engines' catalogs in this one (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "o/", owner: "ext", holds: "a database attached from another engine's catalog (attached_key)" }];
+
 pub async fn attached(lake: &Lake) -> Result<Vec<(String, Attached)>> {
     let mut all: Vec<(String, Attached)> = lake.cat.scan::<Attached>("o/", "o0").await?.into_iter().map(|(k, a)| (k[2..].to_string(), a)).collect();
     for (_, a) in all.iter_mut().filter(|(_, a)| a.connection.is_some()) {
@@ -1358,8 +1361,16 @@ fn copy_into_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Op
             Err(e) => return invalid(e.to_string()),
         }
     } else {
+        let quoted = matches!(p.peek_token().token, Token::SingleQuotedString(_));
         match p.parse_literal_string() {
-            Ok(path) => Source::Path(crate::connections::place(&path).unwrap_or(path)), // ('@drop/in/*.csv': a connection's files, Snowflake's stage)
+            Ok(stage) if !quoted && stage.starts_with('@') => {
+                // (Snowflake's stage, unquoted: here a connection's files are named in a string)
+                let name = stage.trim_start_matches('@');
+                return Some(crate::write::Stmt::Invalid(format!(
+                    "COPY INTO {table} FROM {stage}: an unquoted stage isn't supported. A connection's files are named in a string, '{stage}/…' (CREATE CONNECTION {name} TYPE s3 WITH (url = 's3://bucket/folder')), or name the files where they are: COPY INTO {table} FROM 's3://bucket/folder/*.csv' (FORMAT csv, HEADER true)"
+                )));
+            }
+            Ok(path) => Source::Path(crate::connections::place(&path).unwrap_or(path)), // ('@drop/in/*.csv': a connection's files)
             Err(_) => return invalid("the path is a string".into()),
         }
     };

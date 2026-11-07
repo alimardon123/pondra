@@ -4,7 +4,6 @@
 //! notebook (its `parameters` cell's values replaced), as its caller, from every door: SQL over HTTP and Postgres, the clients' `run`, MCP, a task's
 //! schedule, `pondra.start('run', …)`. A file may run another. Each run is a row of the run log
 //! (`pondra.runs`), named `files/<path>@<version>`: the file and the version that ran.
-use crate::auth::Role;
 use crate::routines::{Outcome, Who};
 use crate::app::App;
 use anyhow::{bail, ensure, Context, Result};
@@ -56,7 +55,9 @@ pub async fn run(app: &App, args: &[FunctionArg], who: Who, job: Option<String>,
         }
     }
     let runs_python = kind == "py" || kind == "ipynb" && notebook(&text)?.iter().any(|c| c.python);
-    ensure!(!runs_python || who.role >= Role::Admin, "run: {path} runs Python on the node: it needs an admin token, as DO does");
+    if runs_python {
+        crate::rights::may_as(who.role, crate::rights::Action::RunCode, crate::rights::Object::Lake)?; // (as DO is)
+    }
     let log = crate::runs::Run::start(app, &format!("{path}@{version}"), who.role, job.as_deref(), &row, id);
     let inner = Who { depth: who.depth + 1, ..who };
     let mut heard = vec![];

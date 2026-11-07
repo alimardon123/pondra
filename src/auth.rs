@@ -8,8 +8,7 @@
 //! network, as before).
 //!
 //! Every door (HTTP, Postgres, Kafka, Flight) works out a `Principal` and runs the request inside
-//! `WHO.scope(…)`, so one check (`check`, `allows`, the query's tables in `query.rs`) sees it.
-use crate::write::Stmt;
+//! `WHO.scope(…)`, so one check (`rights::may`, the query's tables in `query.rs`) sees it.
 use anyhow::{bail, ensure, Result};
 use std::sync::Arc;
 
@@ -50,15 +49,6 @@ impl Principal {
     /// May it use `privilege` on `table` (as SQL names it)? (Its role decides what kind of thing.)
     pub fn may(&self, privilege: &str, table: &str) -> bool { self.access.as_ref().is_none_or(|a| a.may(privilege, &catalog_name(table))) }
 
-    /// May it read every column of `table`? (What a stream of its rows needs: Kafka, Flight, lookups.) A
-    /// hidden table (the lake's records, a table's old versions) only a superuser streams: SQL reads the
-    /// records through `pondra.audit` and `pondra.history`, which show a user its own statements only.
-    pub fn may_read_all(&self, table: &str) -> bool {
-        if crate::sys::hidden(table) {
-            return self.role == Role::Admin && self.access.is_none();
-        }
-        self.access.as_ref().is_none_or(|a| a.columns("select", &catalog_name(table)) == Some(None))
-    }
 }
 
 tokio::task_local! {
@@ -88,15 +78,6 @@ pub fn carried<F: std::future::Future>(f: F) -> impl std::future::Future<Output 
             Some(p) => WHO.scope(p, f).await,
             None => f.await,
         }
-    }
-}
-
-/// May the request being served read every column of `table`? Refused with why, if not.
-pub fn check_all(table: &str) -> Result<()> {
-    match current() {
-        Some(p) if !p.may_read_all(table) && crate::sys::hidden(table) => bail!("permission denied: {table} is Pondra's own, and its rows stream to a superuser only"),
-        Some(p) if !p.may_read_all(table) => bail!("permission denied: SELECT on every column of {table}, which a stream of its rows needs (GRANT SELECT ON {table} TO {})", p.name),
-        _ => Ok(()),
     }
 }
 
@@ -181,36 +162,6 @@ static MACHINE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(s
 #[cfg(target_arch = "wasm32")]
 static MACHINE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| None);
 
-/// May the request being served add rows to `table` (as the catalog names it) through a door that
-/// takes rows, not SQL (`/append`, `/insert`, Flight's DoPut and ingest, Kafka's produce)? Its INSERT
-/// grant, as SQL's `INSERT` asks; and never a system table (`$` in its name: `pondra$audit`,
-/// `t$deleted`), which only Pondra writes.
-pub fn check_rows(table: &str) -> Result<()> {
-    ensure!(!table.contains('$'), "{table} is written by Pondra alone");
-    check("insert", table)
-}
-
-/// What a write that changes rows already there asks of a user's grants beyond INSERT, as SQL's own
-/// do (S11): rows that replace their key's (`replaces`: ON CONFLICT DO UPDATE asks UPDATE) and rows
-/// taken out (`deletes`: DELETE). A door that takes rows or another engine's commits asks it once it
-/// knows, so a user granted INSERT alone neither overwrites nor deletes through a back door.
-pub fn check_changes(table: &str, replaces: bool, deletes: bool) -> Result<()> {
-    if replaces {
-        check("update", table)?;
-    }
-    if deletes {
-        check("delete", table)?;
-    }
-    Ok(())
-}
-
-/// Is the request being served at least `role`'s? (Making a table through `/insert`: an admin's, as
-/// `CREATE TABLE` is.)
-pub fn at_least(role: Role, what: &str) -> Result<()> {
-    ensure!(current().is_none_or(|p| p.role >= role), "{what} needs an admin");
-    Ok(())
-}
-
 /// The lake's own records: what was done and by whom, which no writer but the nodes may add to.
 const RECORDS: [&str; 3] = ["pondra$audit", "pondra$history", "pondra$runs"];
 
@@ -271,23 +222,6 @@ fn writer() -> Result<bool> {
     let Some(p) = current().filter(|p| p.role < Role::Admin) else { return Ok(false) };
     ensure!(p.access.is_none(), "a user's rows go in through SQL (POST /sql, the Postgres port), where its grants are checked: this route is the nodes' own");
     Ok(true)
-}
-
-/// May the request being served use `privilege` on `table` (as the catalog names it)?
-pub fn check(privilege: &str, table: &str) -> Result<()> {
-    match limited() {
-        Some(a) if !a.may(privilege, table) => bail!("permission denied: {} on {table} (GRANT {} ON {table} TO {})", privilege.to_uppercase(), privilege.to_uppercase(), current().map(|p| p.name).unwrap_or_default()),
-        _ => Ok(()),
-    }
-}
-
-/// A locking read (`SELECT … FOR UPDATE`) takes the rows as an UPDATE would, so it needs what an UPDATE needs: a write
-/// token, or a user granted UPDATE on the table (Postgres asks the UPDATE privilege of FOR UPDATE, 42501 without it).
-pub fn may_lock(table: &str) -> Result<()> {
-    match current() {
-        Some(p) if p.access.is_none() && p.role < Role::Write => bail!("permission denied: FOR UPDATE on {table} needs UPDATE, and this token may only read"),
-        _ => check("update", &catalog_name(table)),
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
@@ -388,7 +322,7 @@ impl Auth {
     /// The role of a Postgres user who got past the password check.
     pub fn role_of_user(&self, user: &str) -> Role { self.role(self.token_for(user).as_deref()) }
 
-    /// What an HTTP route needs (writes in `POST /sql` are checked by `allows`).
+    /// What an HTTP route needs (writes in `POST /sql` are checked by `rights::may_run`).
     pub fn needed(path: &str, method: &str) -> Role {
         let first = path.trim_start_matches('/').split('/').next().unwrap_or_default();
         match first {
@@ -414,33 +348,6 @@ impl Auth {
     /// the keys `objects::readable` allows (`server::feed`, `server::kv`), and where a superuser's joined page sends its own
     /// statements' lines (`server::records`, `page_records`). The others carry the lake's keys or write what only the nodes write.
     pub fn users_reach(path: &str) -> bool { matches!(path, "/cluster/ddl" | "/cluster/leader" | "/cluster/kafka" | "/cluster/log" | "/cluster/kv" | "/cluster/records") }
-
-    /// May this role run this write? (And, for a user's request, is it granted: `check`.)
-    pub fn allows(&self, role: Role, stmt: &Stmt) -> Result<()> {
-        if crate::temp::own(stmt) {
-            return Ok(()); // (the session's own tables and views: any role may keep them)
-        }
-        // (CLONE is enough to make a branch, and its owner drops it: `branch::door` checks)
-        if limited().is_some() && matches!(stmt, Stmt::Ddl(ds) if ds.len() == 1 && matches!(ds[0], crate::ddl::Ddl::CreateDatabase { clone: Some(_), .. } | crate::ddl::Ddl::DropDatabase { .. })) {
-            return Ok(());
-        }
-        let need = match stmt {
-            Stmt::Ddl(ds) if ds.iter().any(|d| matches!(d, crate::ddl::Ddl::Entry { .. })) => crate::statements::role(ds), // (an extension's: its entry's right)
-            Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::CopyTo(..) => Role::Admin,
-            _ => Role::Write,
-        };
-        if role < need && !(need == Role::Write && limited().is_some()) { // (a user's writes: its grants, below)
-            let what = match stmt {
-                Stmt::CopyTo(..) => "write files outside the lake",
-                _ if need == Role::Admin => "change the lake's tables, views, schemas, routines or users (an admin token, or a superuser, does)",
-                _ => "write",
-            };
-            return Err(crate::codes::coded("42501", format!("this {} may not {what}", if limited().is_some() { "user" } else { "token" }))); // (insufficient_privilege, by code: no door reads the words)
-        }
-        let (t, privileges) = needs(stmt);
-        ensure!(!crate::sys::hidden(&t), "{t} is written by Pondra alone"); // (the lake's records, a table's old versions: superusers too)
-        privileges.iter().try_for_each(|p| check(p, &t))
-    }
 }
 
 /// Does a request's path name code a node runs? Decided on the name the door stores it under, so the path is
@@ -450,22 +357,6 @@ fn runs_as_code(path: &str) -> bool { py_name(&percent_encoding::percent_decode_
 /// The `.py` test on a name (`files::put` asks it of the name the store keeps): any case, and no trailing `/`, dot or
 /// space, which the store drops and Windows drops.
 pub(crate) fn py_name(name: &str) -> bool { name.trim_end_matches(['/', '.', ' ']).to_ascii_lowercase().ends_with(".py") }
-
-/// The table a write changes (as the catalog names it) and the privileges it needs on it: none for
-/// anything else.
-pub fn needs(stmt: &Stmt) -> (String, Vec<&'static str>) {
-    match stmt {
-        Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::CopyInto(t, ..) => (catalog_name(t), vec!["insert"]), // (COPY INTO's rows are an INSERT's)
-        Stmt::Update(t, ..) => (catalog_name(t), vec!["update"]),
-        Stmt::Delete(t, _) => (catalog_name(t), vec!["delete"]),
-        Stmt::Merge(m) => (catalog_name(&m.target), m.privileges()),
-        // (a `$` table is Pondra's: a user's CREATE or definition of one is refused as a row write to it is. A replace's staged
-        // table is defined by the leader's own steps, which no door checks: `write::create_as`)
-        Stmt::Create(c) => (catalog_name(&crate::text::object(&c.name)), vec![]),
-        Stmt::Define(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => (catalog_name(t), vec![]),
-        _ => (String::new(), vec![]),
-    }
-}
 
 /// A token lent to a Python procedure for its calls back to the node (`routines::python`): the
 /// rights of whoever called it (and whether it may read files on this machine), until it ends;

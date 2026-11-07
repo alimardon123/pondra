@@ -199,6 +199,9 @@ impl std::fmt::Display for Unreached {
 
 impl std::error::Error for Unreached {}
 
+/// The replicas' record in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "m", owner: "replica", holds: "the followers whose copies count towards a commit" }];
+
 /// Leader, replicated mode: keep the list of followers whose copies count ("m") in step with
 /// the live ones. A follower is listed — in the bucket — before its acks count, and stops counting
 /// (with everything it helped commit in the bucket) before it leaves the list, so a new leader

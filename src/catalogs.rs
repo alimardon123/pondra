@@ -22,7 +22,10 @@ use std::sync::{Arc, Mutex};
 pub static ICEBERG: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "iceberg",
     requires: &[],
-    register: |r| r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES),
+    register: |r| {
+        r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES);
+        r.section_mut::<crate::records::Prefixes>().add(crate::iceberg::PREFIXES);
+    },
 };
 
 const TABLES: crate::connections::ConnectionType = {

@@ -78,15 +78,9 @@ fn bucket(url: &str, secret: Option<&BTreeMap<String, String>>) -> Result<std::s
     })
 }
 
-/// A folder's files, on this machine (a page has none).
-#[cfg(not(target_arch = "wasm32"))]
-const FOLDER: Option<crate::connections::Opener> = Some(|url, _| {
-    let dir = url.strip_prefix("file://").unwrap_or(url);
-    std::fs::create_dir_all(dir)?; // (COPY … TO '@drop/out/' writes into it)
-    Ok(std::sync::Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir)?))
-});
-#[cfg(target_arch = "wasm32")]
-const FOLDER: Option<crate::connections::Opener> = None;
+/// A folder's files, on this machine: opened as a lake's folder is (`store::open_store`: made if it isn't there, for
+/// COPY … TO '@drop/out/'), which a page refuses by name, having no folders.
+const FOLDER: Option<crate::connections::Opener> = Some(|url, _| Ok(crate::store::open_store(url.strip_prefix("file://").unwrap_or(url))?.1));
 
 /// SHOW CREATE CONNECTION's statement: its options as they were given, the secret by its name.
 fn shown(name: &str, def: &Value) -> String {

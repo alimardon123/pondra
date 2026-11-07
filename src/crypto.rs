@@ -248,7 +248,7 @@ pub use native::*;
 #[cfg(target_arch = "wasm32")]
 pub use page::*;
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 mod tests {
     use super::{native, page};
     use std::num::NonZeroU32;

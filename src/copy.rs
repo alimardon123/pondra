@@ -37,7 +37,7 @@ impl Target {
 /// `COPY … TO` a file or folder outside the lake: Parquet, CSV or JSON lines, by `FORMAT` or the
 /// name's extension. A name ending in `/` is a folder of files; otherwise one file, replaced if it
 /// is there. A folder that holds files already takes `OVERWRITE` (replace them) or `APPEND`
-/// (DuckDB's). With the secret covering it (an admin's statement anyway: `auth::allows`), or, on
+/// (DuckDB's). With the secret covering it (an admin's statement anyway: `rights::may_run`), or, on
 /// the node's machine, from its owner. `nodes`: the cluster's live members, `me` among them.
 pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<String, String>, nodes: &[String], me: &str) -> Result<serde_json::Value> {
     if let Some(k) = options.iter().find(|(k, v)| !KNOWN.contains(&k.as_str()) && writer(k, v).is_none()) {
@@ -840,6 +840,9 @@ async fn columns_of(lake: &Lake, query: &str, positional: bool, cols: &[String],
     let names: Vec<String> = given.iter().map(|(c, _)| c.clone()).collect();
     Ok((given, names))
 }
+
+/// COPY's records in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "ld/", owner: "copy", holds: "each file a COPY INTO loaded, by its folder, so it loads once (ld_key)" }];
 
 fn ld_key(folder: &str, file: &str) -> String {
     let hash = crate::crypto::sha256(file.as_bytes());

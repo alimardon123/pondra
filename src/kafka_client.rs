@@ -16,7 +16,10 @@ use tokio::sync::Mutex;
 pub static KAFKA: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "kafka",
     requires: &[],
-    register: |r| r.section_mut::<crate::connections::ConnectionTypes>().add(&TOPICS),
+    register: |r| {
+        r.section_mut::<crate::connections::ConnectionTypes>().add(&TOPICS);
+        r.section_mut::<crate::records::Prefixes>().add(crate::feeds::PREFIXES);
+    },
 };
 
 const TOPICS: crate::connections::ConnectionType = {

@@ -1463,7 +1463,7 @@ async fn lock_select(app: &crate::app::App, (level, ro, snapshot): (Level, bool,
         return Err(crate::codes::coded("0A000", format!("{name} is a merge table: its rows add up as they're read, so there is no row to lock")));
     }
     ensure!(meta.ids, "{name} holds rows from before row ids (made before Pondra 0.19): copy it once and change the copy");
-    crate::auth::may_lock(&name)?; // (the right to UPDATE it: Postgres asks that of FOR UPDATE)
+    crate::rights::may_here(crate::rights::Action::Lock, crate::rights::Object::Table(&name))?; // (the right to UPDATE it: Postgres asks that of FOR UPDATE)
     let append = meta.key.is_empty();
     let cols = if append { vec![crate::text::ROW_ID.to_string()] } else { meta.key.clone() };
     let (n, table_name) = (cols.len(), name.as_str());

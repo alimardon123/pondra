@@ -1155,6 +1155,9 @@ pub(crate) async fn no_followers(lake: &Lake, name: &str, why: &str) -> Result<(
 /// Is a dropped table kept to be undropped (ADR-043)? Not with PURGE, not a hidden table, and not with a retention of 0.
 pub(crate) fn keeps(name: &str, meta: &TableMeta, purge: bool) -> bool { meta.retention_secs.map_or(KEEP_MS, |s| s * 1000) > 0 && !purge && !crate::sys::hidden(name) }
 
+/// DDL's own records beside the kinds' (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "dt/", owner: "ddl", holds: "a dropped table, kept while it can be undropped (dt/name/at)" }];
+
 /// A table's entries set aside as a drop sets them (leader, under the lock): kept to be undropped when `kept`, as `dt/` with
 /// its changed rows' old versions; taken out of every share (`shares::tables_moved`). The caller's commit deletes the table's own
 /// entries and its published states (`delta::Copies`), and deletes their objects after it: until then other engines still

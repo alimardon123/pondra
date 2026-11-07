@@ -438,10 +438,7 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
         let meta = app.lake.cat.meta(&table_key(&name)).await?; // (the stored entry: its JSON fields are SQL's names too, ADR-022)
         let rules = meta.as_ref().map(|m| m.rules());
         let not_yours = format!("this {} may not write {name}", if who.access.is_some() { "user" } else { "token" });
-        let may = match who.role >= Role::Write {
-            true => crate::writer::may(Some(who), &crate::auth::catalog_name(&name), None, false).map_err(|e| e.to_string()), // (the row doors' one check)
-            false => Err(not_yours.clone()),
-        };
+        let may = crate::writer::may(Some(who), &crate::auth::catalog_name(&name), None, false).map_err(|e| e.to_string()); // (the row doors' one check)
         let mut parts = vec![];
         for _ in 0..r.len()? {
             let (index, records) = (r.i32()?, r.nbytes()?.unwrap_or_default());
@@ -1032,7 +1029,7 @@ async fn fetch(app: &App, ver: i16, req: FetchReq, who: &crate::auth::Principal)
                 // earliest offset it had cached from before those segments expired, in a loop.)
                 let (offset, end) = (offset.max(crate::log::ord(first, 0)), crate::log::ord(visible + 1, 0));
                 let (error, records) = match &meta {
-                    Some(_) if !who.may_read_all(name) => (TOPIC_AUTHORIZATION_FAILED, vec![]),
+                    Some(_) if crate::rights::may(who, crate::rights::Action::SelectAll, crate::rights::Object::Table(name)).is_err() => (TOPIC_AUTHORIZATION_FAILED, vec![]),
                     Some(meta) if index == 0 && offset <= end => (0, read(app, name, meta, offset, visible, limit.min(budget)).await?),
                     Some(_) if index == 0 => (OFFSET_OUT_OF_RANGE, vec![]),
                     _ => (UNKNOWN_TOPIC, vec![]),

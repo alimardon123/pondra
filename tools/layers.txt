@@ -50,6 +50,7 @@ log catalog
 manifest catalog
 members catalog
 objects catalog
+records catalog
 replica catalog
 scan catalog
 sketch catalog
@@ -63,6 +64,7 @@ app engine
 asof engine
 audit engine
 auth engine
+rights engine
 authored engine
 avg engine
 branch engine
