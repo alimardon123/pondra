@@ -19,6 +19,7 @@
 //!   a second or two (`listen`), and one that doesn't answer in `HEARD` is gone (`deaf`); but not a
 //!   replicating leader, whose followers hold acknowledged changes: its mark alone decides. A leader
 //!   killed and started again takes the next term: only its own restart takes its term back.
+use crate::log::{now_ms, untaken_flush};
 use crate::members::{self, Members};
 use crate::node::Guest;
 use crate::replica::ReplicaLog;
@@ -203,7 +204,7 @@ impl Cluster {
     /// turns requests away (`cut_off`: `server::guard`, `audit::statement`): it can't commit, and
     /// what it reads may be stale.
     pub fn keep_alive(self: Arc<Self>, store: Store, lake: &str) {
-        let marked = Arc::new(std::sync::atomic::AtomicU64::new(crate::log::now_ms()));
+        let marked = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
         let (me, m) = (self.clone(), marked.clone());
         crate::panics::spawn(async move {
             // (the claim marked it a moment ago: C5, a key at most once a second. A term taken back after a
@@ -222,7 +223,7 @@ impl Cluster {
                 }
                 let ok = mark_alive(&store, me.leader.n).await.is_ok();
                 if ok {
-                    m.store(crate::log::now_ms(), std::sync::atomic::Ordering::Relaxed);
+                    m.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
                     // (a newer term claimed meanwhile: cut off a moment ago, or paused for longer
                     // than a lease. SlateDB's fencing stops our commits; this stops our reads too.)
                     if superseded(&store, me.leader.n).await {
@@ -238,7 +239,7 @@ impl Cluster {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let heard = marked.load(std::sync::atomic::Ordering::Relaxed).max(bucket.as_deref().map_or(0, crate::budget::answered));
-                if cut != (crate::log::now_ms().saturating_sub(heard) > CUT_OFF.as_millis() as u64) {
+                if cut != (now_ms().saturating_sub(heard) > CUT_OFF.as_millis() as u64) {
                     cut = !cut;
                     self.cut_off.store(cut, std::sync::atomic::Ordering::Relaxed);
                     self.others.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -255,10 +256,21 @@ impl Cluster {
     pub fn follow(self: Arc<Self>, store: Store) {
         crate::panics::spawn(async move {
             let mut reached: Option<Instant> = None; // (since when we reach the bucket the leader says it can't)
+            let mut missed = false; // (the last beat went unanswered)
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                // A drained leader closes its door, then steps down (`node::run::Held::stop`): its followers take over
+                // then, not at their next beat up to a second on (invariant 210). So a beat unanswered is asked again
+                // every tenth of a second while the leader's lease lasts, and a flush the leader didn't take
+                // (`log::untaken_flush`) asks at once. Each look asks the bucket one HEAD (`stepped_down`). Past the lease,
+                // once a second again: a takeover's own questions (a peer, the bucket's newest term) are never asked faster.
+                let pause = if missed && self.leader_ok() { Duration::from_millis(100) } else { Duration::from_secs(1) };
+                tokio::select! {
+                    _ = tokio::time::sleep(pause) => {}
+                    _ = untaken_flush(), if self.leader_ok() => {}
+                }
                 let url = crate::tls::url(&format!("{}/cluster/beat?from={}", self.leader.addr, self.addr));
                 let answer = http().post(url).timeout(Duration::from_secs(2)).send().await;
+                missed = !answer.as_ref().is_ok_and(|r| r.status().is_success() || r.headers().contains_key(CUT_OFF_HEADER)); // (a leader cut off answers: its branch below keeps its pace)
                 if self.may_lead && answer.as_ref().is_ok_and(|r| r.headers().contains_key(CUT_OFF_HEADER)) {
                     // The leader says it can't reach the bucket: no lease to wait out, no peer to
                     // ask. Take the next term once this node has reached the bucket for a few
@@ -460,7 +472,8 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
                 Err(_) => {}
             }
             if since.elapsed() < Duration::from_secs(30) {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                // (a leader that just took over answers a moment after this node started: every 50 ms for a second, then 200)
+                tokio::time::sleep(Duration::from_millis(if since.elapsed() < Duration::from_secs(1) { 50 } else { 200 })).await;
                 continue;
             }
             if !alive(&store, &leader).await {

@@ -23,7 +23,7 @@ catalogs -> fetch  1
 cluster -> app  1
 cluster -> auth  1
 cluster -> format  2
-cluster -> log  3
+cluster -> log  1
 cluster -> members  1
 cluster -> node  11
 cluster -> panics  7
@@ -128,7 +128,7 @@ log -> backup  4
 log -> constraints  3
 log -> copy  2
 log -> defaults  1
-log -> dial  4
+log -> dial  1
 log -> locks  1
 log -> node  1
 log -> panics  4

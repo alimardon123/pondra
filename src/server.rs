@@ -569,12 +569,21 @@ async fn beat(State(app): State<App>, Query(p): Query<BeatParams>, headers: axum
     node.beat(p.from, crate::format::said(&headers)).map(Json).ok_or_else(cut_off)
 }
 
-/// A follower's flush, to be sequenced (leader only).
-async fn commit(State(app): State<App>, body: Bytes) -> Result<Json<crate::log::Outcome>, E> {
-    let seq = app.seq.as_ref().ok_or_else(|| anyhow::anyhow!("not the leader"))?;
-    let flush = decode_flush(body)?;
-    crate::auth::flush_from_writer(&flush)?; // (a write token's: rows, and no more)
-    Ok(Json(seq.submit(flush).await?))
+/// A follower's flush, to be sequenced (leader only). A node that doesn't lead refuses it as misdirected (421) before any
+/// sequencer sees it, so its follower knows it was never taken and asks again once it follows the leader there is
+/// (`log::led`): a leader killed and started again may come back a follower of the term another took, while followers of
+/// its old term still send it their flushes until their next beat.
+async fn commit(State(app): State<App>, body: Bytes) -> Result<Json<crate::log::Outcome>, Response> {
+    let Some(seq) = app.seq.as_ref() else {
+        return Err(error_response(Some(StatusCode::MISDIRECTED_REQUEST), &anyhow::anyhow!("not the leader")));
+    };
+    async {
+        let flush = decode_flush(body)?;
+        crate::auth::flush_from_writer(&flush)?; // (a write token's: rows, and no more)
+        anyhow::Ok(Json(seq.submit(flush).await?))
+    }
+    .await
+    .map_err(|e| E(e).into_response())
 }
 
 /// This node's share of a distributed query, sent a piece at a time (a big share is on disk).
