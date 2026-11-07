@@ -4,7 +4,8 @@
 20,000 tables, each made by CREATE TABLE … AS SELECT: one file each) and at each step measures:
 
 - what one commit reads and writes: `pondra_catalog_records_total` around one INSERT into one table and one
-  CREATE TABLE, the least of five tries (a node's own rounds read records too, and are shown as the idle rate);
+  CREATE TABLE, the least of five tries, less what reading /metrics reads itself (its per-table rows read every
+  table's record: shown as `metrics_scrape_reads`); a node's own rounds read records too, shown as the idle rate;
 - the leader's resident memory;
 - a follower's start (to its first answer), its resident memory once settled, and its first query's latency;
 - the point lookup's p50 and p99 (GET /lookup on a keyed table of 100,000 rows), on the leader and the follower.
@@ -12,9 +13,9 @@
 The write-set rule (§4) says a commit's records may not grow with the tables it doesn't touch: the commit rows
 should read the same at every step. It changes nothing; it is the measure the other pieces are held to.
 
-Today each commit reads every table's record (an INSERT about N, a CREATE TABLE about 2N), so making N tables
-takes time in N squared: the default steps stop at 20,000 (about twenty minutes). Step 100,000 (about nine hours
-today) is run once piece 10 holds commits to their write set.
+Today a CREATE TABLE reads every table's record, so making N tables takes time in N squared: the default steps
+stop at 20,000 (about twenty minutes). Step 100,000 (about nine hours today) is run once piece 10 holds commits
+to their write set.
 
   catalog_scale.py [--bin target/release/pondra] [--lake DIR | s3://bucket/prefix] [--steps 1000,5000,10000,20000]
                    [--workers 8] [--out results.json]
@@ -104,8 +105,20 @@ def records(port):
     return float(got.get("read", 0)), float(got.get("write", 0))
 
 
-def per_commit(port, statement):
-    """The records one commit reads and writes: the least of five, with what the node read idle subtracted."""
+def scrape(port):
+    """What one read of /metrics reads itself (its per-table rows scan every table's record), with what the node
+    read idle meanwhile: the least of five back-to-back reads. The rows below subtract it."""
+    tries = []
+    for _ in range(5):
+        r0, w0 = records(port)
+        r1, w1 = records(port)
+        tries.append((r1 - r0, w1 - w0))
+        time.sleep(0.2)
+    return min(tries)
+
+
+def per_commit(port, statement, base):
+    """The records one commit reads and writes: the least of five, less what reading /metrics read (`scrape`)."""
     tries = []
     for i in range(5):
         r0, w0 = records(port)
@@ -113,17 +126,17 @@ def per_commit(port, statement):
         sql(port, statement(i))
         took = time.perf_counter() - t0
         r1, w1 = records(port)
-        tries.append((r1 - r0, w1 - w0, took))
+        tries.append((r1 - r0 - base[0], w1 - w0 - base[1], took))
         time.sleep(0.2)
     best = min(tries)
-    return {"reads": int(best[0]), "writes": int(best[1]), "p50_ms": round(statistics.median(t[2] for t in tries) * 1000, 2)}
+    return {"reads": max(0, int(best[0])), "writes": max(0, int(best[1])), "p50_ms": round(statistics.median(t[2] for t in tries) * 1000, 2)}
 
 
-def idle_rate(port, secs=5):
+def idle_rate(port, base, secs=5):
     r0, _ = records(port)
     time.sleep(secs)
     r1, _ = records(port)
-    return round((r1 - r0) / secs, 1)
+    return round(max(0.0, r1 - r0 - base[0]) / secs, 1)
 
 
 def lookups(port):
@@ -172,9 +185,11 @@ try:
         have = n
         sql(A.port, "CHECKPOINT")
         row = {"tables": n, "tables_made_per_s": rate}
-        row["leader_idle_reads_per_s"] = idle_rate(A.port)
-        row["commit_insert"] = per_commit(A.port, lambda i: f"INSERT INTO t{(i * 7919) % n:06d} VALUES (-1)")
-        row["commit_create"] = per_commit(A.port, lambda i: f"CREATE TABLE probe_{n}_{i} (x BIGINT)")
+        base = scrape(A.port)
+        row["metrics_scrape_reads"] = int(base[0])
+        row["leader_idle_reads_per_s"] = idle_rate(A.port, base)
+        row["commit_insert"] = per_commit(A.port, lambda i: f"INSERT INTO t{(i * 7919) % n:06d} VALUES (-1)", base)
+        row["commit_create"] = per_commit(A.port, lambda i: f"CREATE TABLE probe_{n}_{i} (x BIGINT)", base)
         row["leader_rss_mb"] = rss_settled(leader.pid)
         row["leader_lookup"] = lookups(A.port)
         follower, row["follower_start_s"] = start(A.port + 1, reader=True)
