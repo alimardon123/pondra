@@ -492,6 +492,9 @@ def external():
     checks["the owner's answers are remembered, but not one that reads a file here: it is read again, changed"] = first == again == [{"s": 3}] and after_lake > before \
         and read1 == [{"s": 1}] and read2 == [{"s": 3}] and after_file == after_lake and q("SELECT sum(a) AS s FROM owned") == [{"s": 6}]
     q("DROP TABLE owned")
+    names = set(re.findall(rb'pondra_cache_bytes\{cache="(\w+)"\}', call(A.port, "GET", "/metrics", headers=hdr)))
+    checks["/metrics counts every cache on the node's line, the node's own with the lake's (tables' manifests, kept pages, Delta logs and Iceberg manifests)"] = \
+        {b"answers", b"facts", b"manifests", b"pages", b"delta_logs", b"iceberg_manifests", b"tails", b"lookups"} <= names
     q("CREATE EXTERNAL TABLE ev (id INT, name VARCHAR) STORED AS CSV LOCATION 'ev/' OPTIONS ('format.has_header' 'false')")
     empty = q("SELECT count(*) AS n FROM ev")
     q("INSERT INTO ev VALUES (1, 'one'), (2, 'two')")

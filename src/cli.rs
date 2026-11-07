@@ -72,7 +72,7 @@ pub(crate) enum Cmd {
         #[arg(long, default_value_t = node::Start::default().task_ms)]
         task_ms: u64,
         /// Memory for queries and every cache together, in GB (also PONDRA_MEMORY_GB; default: queries
-        /// a third of the machine's), except a cache given its own budget (PONDRA_HOT_GB, PONDRA_CACHE_MB).
+        /// a third of the machine's), except a cache given its own budget (PONDRA_HOT_GB, PONDRA_CACHE_MB, PONDRA_PAGES_MB).
         /// A query that needs more takes it from the caches, then sorts, joins and aggregations spill.
         #[arg(long)]
         memory_gb: Option<f64>,
