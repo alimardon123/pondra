@@ -903,7 +903,7 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
 async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> Result<Json<Value>, E> {
     ensure!(!app.members.reader(), "read-only node");
     if app.lake.table_meta_if(name).await?.is_none() {
-        crate::auth::at_least(crate::auth::Role::Admin, "making a table")?; // (as CREATE TABLE is)
+        crate::rights::may_here(crate::rights::Action::Define, crate::rights::Object::Table(name))?; // (making a table, as CREATE TABLE does)
     }
     crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name))?; // (its INSERT grant, as SQL's)
     let query = crate::routines::expand(&app.lake, &query).await?;

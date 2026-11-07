@@ -162,13 +162,6 @@ static MACHINE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(s
 #[cfg(target_arch = "wasm32")]
 static MACHINE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| None);
 
-/// Is the request being served at least `role`'s? (Making a table through `/insert`: an admin's, as
-/// `CREATE TABLE` is.)
-pub fn at_least(role: Role, what: &str) -> Result<()> {
-    ensure!(current().is_none_or(|p| p.role >= role), "{what} needs an admin");
-    Ok(())
-}
-
 /// The lake's own records: what was done and by whom, which no writer but the nodes may add to.
 const RECORDS: [&str; 3] = ["pondra$audit", "pondra$history", "pondra$runs"];
 
