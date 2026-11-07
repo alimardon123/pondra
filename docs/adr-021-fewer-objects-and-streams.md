@@ -75,6 +75,12 @@ or more `cluster_by` columns, rows are ordered along a Hilbert curve through the
 holds a narrow part of every column. Like liquid clustering it is incremental (each file as it is
 written or merged) and the columns can change (`ALTER TABLE … SET (cluster_by = …)`).
 
+The curve orders rows; it is never a filter. The planner never rewrites a filter into ranges of the curve's key, and
+the key is never stored: the columns' own min/max statistics already skip the row groups those ranges would, and in
+DuckDB's Lindel tests a join on the key's ranges was never faster, and up to 7.7x slower
+(https://query.farm/blog/lindel-duckdb-2-curve-keys/, 2026-11-06). So step 8's planner and `CLUSTER BY AUTO` add no
+such rewrite.
+
 ### 5. COPY over the Postgres protocol
 
 The Postgres protocol sends rows, not columns, and every client expects it that way: Arrow can't
