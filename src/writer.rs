@@ -69,14 +69,14 @@ pub struct Load {
     who: Option<Principal>,
     door: &'static str,
     table: String,
-    start: std::time::Instant,
+    start: datafusion::common::instant::Instant,
     end: Option<Option<String>>,
 }
 
 impl Load {
     /// A load into `table` through `door`, by `who` (None: the caller in scope).
     pub fn new(app: &App, who: Option<Principal>, door: &'static str, table: &str) -> Load {
-        Load { app: app.clone(), who: who.or_else(crate::auth::current), door, table: table.to_string(), start: std::time::Instant::now(), end: None }
+        Load { app: app.clone(), who: who.or_else(crate::auth::current), door, table: table.to_string(), start: datafusion::common::instant::Instant::now(), end: None }
     }
 
     /// It ended: well, or with `error`. The first end counts.
