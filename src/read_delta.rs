@@ -87,8 +87,12 @@ fn seen(root: &str, log: &Arc<Log>) {
 /// A table as its log says it at a version: its columns (name and type), the names of its renamed columns, and its
 /// files. A node makes its own table from it (`ext::table_meta`).
 pub struct Found {
+    /// (physical name, the files' type), as `TableMeta::made` takes them.
     pub columns: Vec<(String, String)>,
     pub names: BTreeMap<String, String>,
+    /// A column's type as SQL reads it, where its files hold another: a mapped table's struct, its fields under their
+    /// physical names in the files (`Col::sql_type`).
+    pub logical_types: BTreeMap<String, String>,
     pub files: Vec<DataFile>,
 }
 
@@ -106,9 +110,12 @@ pub fn table<'a>(root: &str, protocol: &Value, metadata: &Value, adds: impl Iter
     let types: HashMap<&str, DataType> = columns.iter().map(|(p, _, t)| (p.as_str(), t.clone())).collect();
     let mut files: Vec<DataFile> = adds.map(|add| file(root, add, &partitions, &types)).collect::<Result<_>>()?;
     files.sort_by(|a, b| a.path.cmp(&b.path)); // (every node lists them in one order)
+    let physical = if mapped { physical_types(metadata)? } else { HashMap::new() }; // (a struct's fields as its files name them)
+    let files_type = |p: &String, t: &DataType| crate::answer::type_name(physical.get(p).unwrap_or(t));
     Ok(Found {
-        columns: columns.iter().map(|(p, _, t)| (p.clone(), crate::answer::type_name(t))).collect(),
+        columns: columns.iter().map(|(p, _, t)| (p.clone(), files_type(p, t))).collect(),
         names: columns.iter().filter(|(p, l, _)| mapped && p != l).map(|(p, l, _)| (p.clone(), l.clone())).collect(),
+        logical_types: columns.iter().filter(|(p, _, t)| physical.contains_key(p) && files_type(p, t) != crate::answer::type_name(t)).map(|(p, _, t)| (p.clone(), crate::answer::type_name(t))).collect(),
         files,
     })
 }
@@ -358,14 +365,36 @@ pub fn schema(root: &str, metadata: &Value) -> Result<(Vec<(String, String, Data
     Ok((columns, partitions, mode != "none"))
 }
 
+/// A mapped table's columns whose type names a struct's fields: each one's type as its files hold it, every struct field
+/// (at any depth, in an array too) under its physical name, by the column's physical name.
+fn physical_types(metadata: &Value) -> Result<HashMap<String, DataType>> {
+    let s: Value = serde_json::from_str(metadata["schemaString"].as_str().context("no schema in the log")?)?;
+    let physical = |f: &Value| f["metadata"]["delta.columnMapping.physicalName"].as_str().or_else(|| f["name"].as_str()).unwrap_or_default().to_string();
+    let mut out = HashMap::new();
+    for f in s["fields"].as_array().into_iter().flatten() {
+        if f["type"].is_object() {
+            out.insert(physical(f), type_as(&f["type"], true)?);
+        }
+    }
+    Ok(out)
+}
+
 /// A Delta type Pondra doesn't read, and those it does.
 fn unread(t: &str) -> String {
     format!("a Delta {t}, which Pondra doesn't read: it reads Delta's numbers, strings, binary, booleans, dates, timestamps, decimals, arrays and structs")
 }
 
 /// A Delta type as Arrow's.
-fn arrow_type(t: &Value) -> Result<DataType> {
-    let item = |v: &Value, n: &str, nullable: bool| -> Result<Arc<Field>> { Ok(Arc::new(Field::new(n, arrow_type(v)?, nullable))) };
+fn arrow_type(t: &Value) -> Result<DataType> { type_as(t, false) }
+
+/// A Delta type as Arrow's, a struct's fields under their physical names (`physical`, a mapped table's files) or their
+/// names.
+fn type_as(t: &Value, physical: bool) -> Result<DataType> {
+    let item = |v: &Value, n: &str, nullable: bool| -> Result<Arc<Field>> { Ok(Arc::new(Field::new(n, type_as(v, physical)?, nullable))) };
+    fn named(f: &Value, physical: bool) -> &str {
+        let name = f["name"].as_str().unwrap_or_default();
+        if physical { f["metadata"]["delta.columnMapping.physicalName"].as_str().unwrap_or(name) } else { name }
+    }
     Ok(match t {
         Value::String(s) => match s.as_str() {
             "string" => DataType::Utf8,
@@ -388,7 +417,7 @@ fn arrow_type(t: &Value) -> Result<DataType> {
         },
         Value::Object(o) => match o.get("type").and_then(Value::as_str) {
             Some("array") => DataType::List(item(&o["elementType"], "element", o["containsNull"].as_bool().unwrap_or(true))?),
-            Some("struct") => DataType::Struct(o["fields"].as_array().into_iter().flatten().map(|f| item(&f["type"], f["name"].as_str().unwrap_or_default(), true)).collect::<Result<Vec<_>>>()?.into()),
+            Some("struct") => DataType::Struct(o["fields"].as_array().into_iter().flatten().map(|f| item(&f["type"], named(f, physical), true)).collect::<Result<Vec<_>>>()?.into()),
             Some(other) => bail!("{}", unread(other)),
             None => bail!("a type without a name"),
         },

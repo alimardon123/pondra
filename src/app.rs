@@ -91,6 +91,8 @@ impl crate::ledger::Charged for Results {
     fn held(&self) -> usize { crate::ledger::Charged::held(&self.0) }
 
     fn give_back(&self, bytes: usize) -> usize { crate::ledger::Charged::give_back(&self.0, bytes) }
+
+    fn gives_back(&self) -> bool { true }
 }
 
 impl App {

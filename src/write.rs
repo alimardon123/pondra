@@ -1027,9 +1027,10 @@ fn placed(sql: &str) -> Option<Stmt> {
 
 /// `ALTER TABLE t ADD COLUMN c TYPE`: the table's definition with the new column at the end, sent
 /// like a CREATE TABLE (the leader adds it; old rows read it as null). None: IF NOT EXISTS, and it does.
-async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
+/// `table` is the statement's table as `lake` names it (an attached lake's table by its name there, not `l.s.t`).
+async fn alter_spec(lake: &Lake, table: &str, stmt: &Stmt) -> Result<Option<String>> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
-    let table = stmt.table();
+    let table = table.to_string();
     let m: TableMeta = (*lake.table_meta(&table).await?).clone().logical(); // (as SQL names it)
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
     let mut spec = j!({"columns": m.to_columns(), "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": crate::objects::not_null_columns(&m), "defaults": crate::objects::column_defaults(&m), "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds"))});
@@ -1152,12 +1153,19 @@ pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, na
 /// fills the columns as stored (`rows_sql`, `write_rows`), so this is the one place SQL's order is put in. Every other
 /// statement, and every INSERT into a table that never moved a column, as it is. With it, for a plain INSERT into this
 /// lake's table: the table and the order its values go by (`TableMeta::placed`), which the leader checks
-/// (`log::placed_for`).
+/// (`log::placed_for`). A MERGE that puts values by position (`Merge::by_position`: an `INSERT … ON CONFLICT` or `INSERT OR …`
+/// without a column list) puts SQL's order in itself, and is checked the same way: its node may not have seen a move either
+/// (11-07 audit M1).
 pub(crate) async fn in_sql_order(lake: &Lake, stmt: Stmt) -> Result<(Stmt, Option<(String, u64)>)> {
-    let Stmt::Insert(t, q) = &stmt else { return Ok((stmt, None)) };
-    let Ok((other, name)) = crate::ddl::resolve(lake, t).await else { return Ok((stmt, None)) }; // (refused by name further on)
+    let t = match &stmt {
+        Stmt::Insert(t, _) => t.clone(),
+        Stmt::Merge(m) if m.by_position() => m.target.clone(),
+        _ => return Ok((stmt, None)),
+    };
+    let Ok((other, name)) = crate::ddl::resolve(lake, &t).await else { return Ok((stmt, None)) }; // (refused by name further on)
     let Some(meta) = other.as_deref().unwrap_or(lake).cat.meta(&table_key(&name)).await? else { return Ok((stmt, None)) };
     let placed = other.is_none().then(|| (name, meta.placed())); // (another lake's leader records its own: not checked)
+    let Stmt::Insert(t, q) = &stmt else { return Ok((stmt, placed)) };
     if !meta.moved() {
         return Ok((stmt, placed));
     }
@@ -1470,8 +1478,12 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
     ensure!(!f.files.iter().any(|d| d.sys) || !follows(lake, &f.table).await?, "{AGAIN}: a materialized view or task of {} was made as it was written", f.table);
     let live: Vec<(String, String)> = meta.live().map(|(s, _, t)| (s.to_string(), t.to_string())).collect(); // (dropped columns aren't written)
     let listed = |c: &[(String, String)]| c.iter().map(|(n, t)| format!("{} {}", meta.name_of(n), crate::objects::sql_type(t))).collect::<Vec<_>>().join(", ");
-    ensure!(types(&live) == types(&f.columns), "the rows' columns ({}) aren't {}'s ({}), in order and type; if the table changed while they were written, write them again", listed(&f.columns), f.table, listed(&live));
-    ensure!(f.placed.is_none_or(|placed| placed == meta.placed()), crate::log::moved(&f.table)); // (a move the node hadn't seen: `log::placed_for`)
+    if types(&live) != types(&f.columns) {
+        // (40001, as a move's: a column added, dropped or retyped while they were written, so they are written again. The
+        // words say so too, since a node that sent them reads the code from them)
+        return Err(crate::codes::coded("40001", format!("could not serialize the INSERT into {}: its rows' columns ({}) aren't the table's ({}), in order and type, since it changed while they were written. Run it again", f.table, listed(&f.columns), listed(&live))));
+    }
+    ensure!(f.placed.is_none_or(|placed| meta.places(placed)), crate::log::moved(&f.table)); // (a move the node hadn't seen: `log::placed_for`)
     let rows: u64 = f.files.iter().map(|f| f.rows).sum();
     let commit = crate::adopt::FileCommit { table: f.table.clone(), job: f.job.clone(), added: f.files, new: Some(new), ..Default::default() };
     Ok(match crate::adopt::file(lake, seq, &[commit]).await? {
@@ -1798,9 +1810,10 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     }
     let stmt = match stmt {
         Stmt::InsertInto(t, names, query) => match crate::ext::outside_target(&app.lake, &t).await? {
-            // (another engine's table: the columns the list leaves out are NULL, as its format keeps no DEFAULT; a NOT NULL one
-            // is refused by its writer, `write_outside::Fit`)
-            Some(target) => Stmt::Insert(t.clone(), crate::rules::rows::rows_for(&t, &crate::write_outside::columns(&app.lake, &target).await?, &names, &query, &|_| None)?),
+            // (another engine's table: its writer places the list in the schema it writes by, `write_outside::Rows`; a guest's,
+            // sent through the inbox, is placed here: the columns the list leaves out are NULL, as its format keeps no DEFAULT)
+            Some(target) if inbox => Stmt::Insert(t.clone(), crate::rules::rows::rows_for(&t, &crate::write_outside::columns(&app.lake, &target).await?, &names, &query, &|_| None)?),
+            Some(_) => Stmt::InsertInto(t, names, query),
             None => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
         },
         Stmt::Insert(t, query) => {
@@ -1836,10 +1849,12 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     // Another engine's table, attached (`ATTACH … (TYPE delta | iceberg)`): its next version,
     // written from here.
     if let Some(target) = crate::ext::outside_target(lake, &stmt.table()).await? {
-        return match &stmt {
-            Stmt::Insert(_, query) => crate::write_outside::insert(lake, &target, query, &job).await,
+        let (names, query) = match &stmt {
+            Stmt::Insert(_, query) => (None, query),
+            Stmt::InsertInto(_, names, query) => (Some(names.clone()), query),
             _ => bail!("{}: another engine's table takes INSERTs from Pondra (UPDATE, DELETE and MERGE: not yet)", stmt.table()),
         };
+        return crate::write_outside::insert(lake, &target, &stmt.table(), names, query, &job).await;
     }
     // (an UPDATE's, DELETE's or MERGE's target reaches here named as its files already: it read
     // "no table" with a quoted path)
@@ -1890,7 +1905,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         }
         Stmt::Define(_, spec) => return define(app, &table, spec).await,
         Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => {
-            return match alter_spec(lake, &stmt).await? {
+            return match alter_spec(lake, &table, &stmt).await? {
                 Some(spec) => define(app, t, &spec).await,
                 None => Ok(j!({"table": t, "unchanged": true})),
             };
@@ -2031,7 +2046,13 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
         }
     }).await?;
     let files = next.load(std::sync::atomic::Ordering::Relaxed); // (the node takes the INSERT only when it finds exactly these)
-    let call = crate::dial::Call::json(format!("/insert/{}?job={stage}&staged=1", percent_encoding::utf8_percent_encode(table, percent_encoding::NON_ALPHANUMERIC)), &j!({"columns": names, "files": files, "placed": crate::log::placed_for(table)}))?;
+    // (the order an INSERT without a column list put its values by, kept under the table's name as its lake has it, which
+    // may not be the name as written: `public.t`, 11-07 audit L3)
+    let placed = match crate::ddl::resolve(lake, table).await {
+        Ok((None, name)) => crate::log::placed_for(&name),
+        _ => None,
+    };
+    let call = crate::dial::Call::json(format!("/insert/{}?job={stage}&staged=1", percent_encoding::utf8_percent_encode(table, percent_encoding::NON_ALPHANUMERIC)), &j!({"columns": names, "files": files, "placed": placed}))?;
     let reply = crate::dial::call(&app.members.leader().addr, call).await?;
     if reply.ok() {
         return reply.json().await;
@@ -2179,10 +2200,16 @@ pub(crate) async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> 
         Err(_) if matches!(stmt, Stmt::Insert(..)) => return Ok(None), // (an INSERT's own path names what it can't find, or finds an attached lake's)
         r => r?,
     };
-    let lake = other.as_deref().unwrap_or(lake);
-    let meta = lake.cat.meta(&table_key(&table)).await?;
-    if let (Stmt::Merge(m), None, Some(stored)) = (stmt, &other, &meta) {
-        if m.point_upsert(&table, stored).is_some() {
+    changes_in(other.as_deref().unwrap_or(lake), other.is_none(), &table, stmt).await
+}
+
+/// `changes`, of `table` as `lake` names it (`here`: this database's, not an attached one's). The statement keeps the
+/// name its own session gave it, which `lake` may not know: `dev.public.t`, after `USE dev`, is `public.t` to dev.
+async fn changes_in(lake: &Lake, here: bool, table: &str, stmt: &Stmt) -> Result<Option<String>> {
+    let (Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_) | Stmt::Insert(..)) = stmt else { return Ok(None) };
+    let meta = lake.cat.meta(&table_key(table)).await?;
+    if let (Stmt::Merge(m), true, Some(stored)) = (stmt, here, &meta) {
+        if m.point_upsert(table, stored).is_some() {
             return Ok(None);
         }
     }
@@ -2499,11 +2526,10 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
         _ => {}
     }
     if let Stmt::AddColumn(..) | Stmt::SetOptions(..) = stmt {
-        return Ok(alter_spec(target, stmt).await?.map(|spec| Request::Table(table.into(), spec)));
+        return Ok(alter_spec(target, table, stmt).await?.map(|spec| Request::Table(table.into(), spec))); // (by its name there: ADD COLUMN under USE of a branch found no table)
     }
-    if let Some(sql) = changes(target, stmt).await? {
-        let t = stmt.table();
-        let (sql, sent) = crate::change::for_leader(query, target, &t, &t, &sql, files).await?; // (files here: this machine's)
+    if let Some(sql) = changes_in(target, true, table, stmt).await? {
+        let (sql, sent) = crate::change::for_leader(query, target, &stmt.table(), table, &sql, files).await?; // (files here: this machine's)
         return Ok(Some(Request::Change(sql, job.into(), sent)));
     }
     let stored = target.cat.meta(&table_key(table)).await?; // (as parsed once a version: `rules` is the memo)

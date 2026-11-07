@@ -317,8 +317,9 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     if let Some(ledger) = lake.ledger() {
         ledger.charge("answers", Arc::downgrade(&app.results) as std::sync::Weak<dyn crate::ledger::Charged>); // (the remembered answers: `/metrics`' `cache_bytes`)
         // (the node's caches of what the lake's own floor doesn't reach, charged once whatever lakes it opens: the answers
-        // kept for their pages, and the logs and manifests of Delta and Iceberg tables read)
-        for (name, cache) in [("pages", crate::pages::kept()), ("delta_logs", crate::read_delta::logs()), ("iceberg_manifests", crate::read_iceberg::manifests())] {
+        // kept for their pages, the logs and manifests of Delta and Iceberg tables read, what lookups keep (the
+        // statements worked out as point queries and the log tails' keys), and the functions' answers)
+        for (name, cache) in [("pages", crate::pages::kept()), ("delta_logs", crate::read_delta::logs()), ("iceberg_manifests", crate::read_iceberg::manifests()), ("point_plans", crate::serve::points()), ("tail_keys", crate::serve::tail_keys()), ("function_answers", crate::pyfn::kept())] {
             ledger.charge(name, Arc::downgrade(&cache));
         }
     }

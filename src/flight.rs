@@ -82,9 +82,10 @@ impl tower::Service<http::Request<tonic::body::Body>> for Gate {
     fn call(&mut self, mut req: http::Request<tonic::body::Body>) -> Self::Future {
         let (app, mut inner, used) = (self.app.clone(), self.inner.clone(), crate::idle::Use::new()); // (a call is a use of the node until its answer is sent: `idle.rs`)
         Box::pin(async move {
-            let header = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
+            // (a header that isn't text can't be read, and is refused as HTTP refuses it: not taken for no credential)
+            let (credential, sent) = (crate::auth::Credential::of_headers(req.headers()), req.headers().contains_key("authorization"));
             let peer = req.extensions().get::<crate::tls::Peer>().copied();
-            let who = match sign_in(&app, header.as_deref(), peer).await {
+            let who = match sign_in(&app, credential, sent, peer).await {
                 Ok(who) => who,
                 Err(refused) => return Ok(refused.into_http()),
             };
@@ -195,9 +196,8 @@ fn allowed<T>(_: &App, _: &Request<T>, need: Role) -> Result<Role, Status> {
 /// Who a call is, from its `authorization`: a token, or a user's token or session (`Bearer`:
 /// `users::who`); or a name and password (`Basic`: what ADBC's and pyarrow's handshakes send). With
 /// nothing that needs a sign-in, anyone is an admin. A wrong password is an error, said at once.
-async fn sign_in(app: &App, header: Option<&str>, peer: Option<crate::tls::Peer>) -> Result<crate::auth::Principal, Status> {
+async fn sign_in(app: &App, credential: crate::auth::Credential, sent: bool, peer: Option<crate::tls::Peer>) -> Result<crate::auth::Principal, Status> {
     let from = peer.map(|p| p.addr);
-    let credential = crate::auth::Credential::of_header(header); // (read alike at every door: `auth::Credential`)
     if let Some(why) = credential.malformed() {
         crate::audit::refused(app, "", "flight", from, "sign in", &why).await;
         return Err(refused("28000", why));
@@ -215,7 +215,7 @@ async fn sign_in(app: &App, header: Option<&str>, peer: Option<crate::tls::Peer>
                 Some(t) => crate::sso::why(&app.lake, t).await,
                 None => None,
             };
-            if header.is_some() {
+            if sent {
                 crate::audit::refused(app, "", "flight", from, "sign in", why.as_deref().unwrap_or("wrong token")).await;
             }
             if let Some(why) = why {
@@ -403,7 +403,7 @@ async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<&[u8]
     .await?;
     let schema = first_announced(&batches);
     // (a read token's script could keep answers that no ticket reads: counted here, they are bounded by the query memory)
-    let reserved = crate::query::kept_memory(&pool, &batches).ok_or_else(|| status(crate::query::too_big()))?;
+    let reserved = crate::query::kept_memory(&pool, &batches).ok_or_else(|| status(crate::query::too_big(crate::query::room_of(&pool))))?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     KEPT.lock().unwrap().insert(id.clone(), (batches, std::time::Instant::now(), reserved));
     let ticket = TicketStatementQuery { statement_handle: format!("kept:{id}").into_bytes().into() };
@@ -674,6 +674,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
     }
     let (app, again, table2) = (app.clone(), log.clone(), table.clone());
     let who = crate::auth::current(); // (the caller, for its grants in the task below: a task keeps no task-local)
+    let mut load = crate::writer::Load::new(&app, who.clone(), "Flight DoPut", &table); // (its line in the audit log, as its acks end)
     let (acks_tx, mut acks_rx) = tokio::sync::mpsc::channel::<Result<crate::writer::Queued, Status>>(256);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel(); // (acks are small; a client may read them only at the end)
     crate::panics::task(async move {
@@ -734,10 +735,16 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
                 }
                 Err(e) => Err(e),
             };
+            if let Err(e) = &acked {
+                load.end(Some(e.message().to_string()));
+            }
             let stop = acked.is_err();
             if tx.send(acked).is_err() || stop {
                 break;
             }
+        }
+        if acks_rx.is_closed() && acks_rx.is_empty() {
+            load.end(None); // (every batch taken; a client gone before the last ack leaves the load unended: failed)
         }
     });
     Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|r| (r, rx)) })))
@@ -956,7 +963,10 @@ impl FlightSqlService for Sql {
         };
         let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(stream_status).peekable();
         let mut exists = self.0.lake.cat.meta(&table_key(&table)).await.map_err(status)?.is_some();
-        crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(denied)?; // (the row doors' one check)
+        crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(|e| {
+            crate::writer::Load::refused(&self.0, None, "Flight DoPut", &table, &e); // (in the audit log, as every refusal at a door is)
+            denied(e)
+        })?; // (the row doors' one check)
         // ADBC's modes: create (fail if there), append (fail if not), replace, create_append.
         use arrow_flight::sql::{TableExistsOption as IfThere, TableNotExistOption as IfNot};
         let options = cmd.table_definition_options.unwrap_or_default();
@@ -1005,7 +1015,10 @@ impl FlightSqlService for Sql {
             [t, p, s] => (t.clone(), p.clone(), s.parse().map_err(|_| refused("22023", "the first seq is a number"))?),
             _ => return Err(refused("22023", "DoPut to a path: [table] or [table, producer, first seq]")),
         };
-        crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(denied)?; // (the row doors' one check, before a batch is read)
+        crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(|e| {
+            crate::writer::Load::refused(&self.0, None, "Flight DoPut", &table, &e); // (in the audit log, as every refusal at a door is)
+            denied(e)
+        })?; // (the row doors' one check, before a batch is read)
         let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(input.map_err(Into::into)).map_err(stream_status);
         Ok(Response::new(append(&self.0, table, producer, seq, batches)?))
     }

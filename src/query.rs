@@ -19,9 +19,8 @@ use datafusion::physical_plan::ExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 
-/// A table's columns as queries read them: strings as views (Utf8View), so scans don't copy them
-/// and string filters and joins take their fast paths (TPC-H runs about 8% faster). Tables store
-/// plain Utf8 (see `schema`). A table's own: `TableMeta::read_schema`.
+/// A table's columns as queries read them: `answer::read_schema_of` (strings as views, and why), of
+/// owned pairs. A table's own: `TableMeta::read_schema`.
 pub fn read_schema(columns: &[(String, String)]) -> Result<SchemaRef> { crate::answer::read_schema_of(columns.iter().map(|(n, t)| (n.as_str(), t.as_str()))) }
 
 pub use crate::rules::fit::{conform, strict};
@@ -441,12 +440,14 @@ pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &Tabl
     let hide = !deleted && !meta.key.is_empty() && meta.columns().any(|(c, _)| c == "_deleted");
     // (a view that finishes its answers reads under its query's names already: `finish.rs`, and a
     // view's table is never renamed or dropped a column of)
-    if (!meta.mapped() && !hide && !meta.moved()) || meta.finish.is_some() {
+    let relabeled = meta.relabeled(); // (a column SQL reads as another type than its files hold: `Col::sql_type`)
+    if (!meta.mapped() && !hide && !meta.moved() && !relabeled) || meta.finish.is_some() {
         return Ok(Arc::new(Table(provider)));
     }
     let df = ctx.read_table(provider)?;
     let shown = |c: &str| !meta.is_dropped(c) && !(hide && c == "_deleted");
-    let df = crate::answer::renamed(df, |c| meta.name_of(c).to_string(), shown)?;
+    let sql_type = |c: &str| relabeled.then(|| meta.col(c)?.sql_type.as_deref()).flatten().and_then(|t| crate::answer::dtype(t).ok());
+    let df = crate::answer::renamed(df, |c| meta.name_of(c).to_string(), shown, sql_type)?;
     let df = if meta.moved() { crate::answer::reordered(df, &meta.sql_order())? } else { df }; // (a column moved: SQL's order)
     Ok(Arc::new(Table(df.into_view())))
 }
@@ -668,6 +669,8 @@ impl crate::ledger::Charged for std::sync::Mutex<FactsMemo> {
     fn held(&self) -> usize { self.lock().unwrap_or_else(|e| e.into_inner()).by_key.bytes() }
 
     fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(self, |m| &mut m.by_key, bytes) }
+
+    fn gives_back(&self) -> bool { true }
 }
 
 /// An append table version's `Facts` as its queries plan it, kept per version of its entry (`FactsMemo`): a table that has
@@ -996,7 +999,8 @@ pub async fn collect_or_send(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext
 
 /// `collect`'s loop. `send`: the answer may go to its door in pieces of this format (`collect_or_send`).
 async fn gather(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>, send: Option<Option<String>>) -> Result<Vec<RecordBatch>> {
-    let held = MemoryConsumer::new("an answer").register(task.memory_pool());
+    let pool = task.memory_pool().clone();
+    let held = MemoryConsumer::new("an answer").register(&pool);
     let mut counted = RecordBatchMemoryCounter::new(); // (each buffer once: batches cut from one batch or page share theirs)
     let mut stream = datafusion::physical_plan::execute_stream(plan, task)?;
     let mut out = vec![];
@@ -1005,12 +1009,12 @@ async fn gather(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>, send: Opti
         // what `big` measures, so a small answer whose strings were other rows' is not sent in pieces, nor left out of `Results`)
         let batch = match &send { Some(format) => crate::answer::as_sent(batch, format.as_deref()), None => batch };
         if held.try_grow(counted.count_batch(&batch)).is_err() {
-            return Err(too_big());
+            return Err(too_big(room_of(&pool)));
         }
         out.push(batch);
         if let Some(format) = &send {
             if held.size() >= stream_bytes() && may_hand() {
-                return send_rest(out, stream, held, format.as_deref()).await;
+                return send_rest(out, stream, held, &pool, format.as_deref()).await;
             }
         }
     }
@@ -1027,9 +1031,24 @@ pub fn kept_memory(pool: &Arc<dyn MemoryPool>, batches: &[RecordBatch]) -> Optio
     Some(held)
 }
 
-/// The refusal of an answer bigger than the query memory (53200), with the way out.
-pub(crate) fn too_big() -> anyhow::Error {
-    crate::codes::coded("53200", format!("the answer is bigger than this node's memory for queries ({} MB): ask for fewer rows (a LIMIT or a filter), or write them out with COPY (…) TO a file or folder", memory_limit() >> 20))
+/// The memory a statement's answer may take at most now: its database's room in the node's line (`ledger::LakePool`), at
+/// most the node's memory for queries.
+pub(crate) fn room_of(pool: &Arc<dyn MemoryPool>) -> usize {
+    match pool.memory_limit() {
+        datafusion::execution::memory_pool::MemoryLimit::Finite(n) => n.min(memory_limit()),
+        _ => memory_limit(),
+    }
+}
+
+/// The refusal of an answer bigger than the query memory (53200), with the way out. `room`: what the statement's database
+/// has of it now (`room_of`), less than the node's while the node's other databases' queries hold some (11-06 audit M10).
+pub(crate) fn too_big(room: usize) -> anyhow::Error {
+    let line = memory_limit();
+    let what = match room < line {
+        true => format!("the memory this database has for queries now ({} MB of the node's {} MB: its other databases' queries hold the rest)", room >> 20, line >> 20),
+        false => format!("this node's memory for queries ({} MB)", line >> 20),
+    };
+    crate::codes::coded("53200", format!("the answer is bigger than {what}: ask for fewer rows (a LIMIT or a filter), or write them out with COPY (…) TO a file or folder"))
 }
 
 /// The refusal of a client that went before the answer's end (57014).
@@ -1050,7 +1069,7 @@ fn set_sent(rows: Option<u64>) {
 /// writes it (`answer::Encoding`). The first piece is written before the door is handed anything, so a format that
 /// can't write these columns is refused as `render` refuses it. Then the door's body takes each piece as its client
 /// reads it (two at a time), and each batch is counted only while it is written.
-async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan::SendableRecordBatchStream, mut held: MemoryReservation, format: Option<&str>) -> Result<Vec<RecordBatch>> {
+async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan::SendableRecordBatchStream, mut held: MemoryReservation, pool: &Arc<dyn MemoryPool>, format: Option<&str>) -> Result<Vec<RecordBatch>> {
     let mut enc = crate::answer::Encoding::new(format);
     let mut prefix: std::collections::VecDeque<RecordBatch> = crate::answer::pieces(out.into_iter().map(|b| enc.lean(b))).into();
     let (mut rows, mut first) = (0u64, vec![]);
@@ -1066,7 +1085,7 @@ async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan:
         return Err(gone());
     }
     set_sent(Some(0));
-    match pour(&mut enc, &tx, prefix, &mut stream, &mut held).await {
+    match pour(&mut enc, &tx, prefix, &mut stream, &mut held, pool).await {
         Ok(more) => {
             ended.store(true, std::sync::atomic::Ordering::Release); // (set before the channel closes: the body ends whole only then)
             drop(tx);
@@ -1124,7 +1143,7 @@ async fn write_all(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Se
 
 /// The pieces after the first: the prefix's, then each batch of the stream's, counted while it is written; then the
 /// end. Returns the rows written.
-async fn pour(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>, prefix: std::collections::VecDeque<RecordBatch>, stream: &mut datafusion::physical_plan::SendableRecordBatchStream, held: &mut MemoryReservation) -> Result<u64> {
+async fn pour(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>, prefix: std::collections::VecDeque<RecordBatch>, stream: &mut datafusion::physical_plan::SendableRecordBatchStream, held: &mut MemoryReservation, pool: &Arc<dyn MemoryPool>) -> Result<u64> {
     let mut rows = write_all(enc, tx, prefix).await?;
     held.free(); // (the prefix's batches are written: their memory goes)
     loop {
@@ -1151,7 +1170,7 @@ async fn pour(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<
                 None => break, // (none is ready: what is goes now)
             }
         }
-        held.try_grow(size).map_err(|_| too_big())?;
+        held.try_grow(size).map_err(|_| too_big(room_of(pool)))?;
         for piece in crate::answer::pieces(ready) {
             rows += piece.num_rows() as u64;
             step_to(enc, tx, Some(&piece)).await?;
@@ -1634,9 +1653,11 @@ pub fn first_table(sql: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exhausted, frugally, keep, retrying, tails, Facts, FactsMemo, Tail, Tails, TAILS};
+    use super::{exhausted, frugally, keep, peak_pool, retrying, tails, task_with_peak, Facts, FactsMemo, Tail, Tails, TAILS};
     use crate::store::TableMeta;
     use datafusion::common::DataFusionError;
+    use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion::prelude::SessionContext;
     use std::sync::Arc;
 
@@ -1730,6 +1751,24 @@ mod tests {
         }
         assert_eq!(memo.by_key.len(), FACTS_ENTRIES, "the count bound holds");
         assert_eq!(memo.by_key.bytes(), 0, "and empty manifests count for nothing");
+    }
+
+    /// A statement's memory goes through `task_with_peak`'s pool, and its lake is busy on the line while it runs (11-06
+    /// audit L9): with A's statement holding 80 of 100, B's spiller has B's half of the line, not the 20 A leaves; were A
+    /// not marked busy, B's share would be the whole line.
+    #[test]
+    fn a_statement_through_its_peak_pool_marks_its_lake_busy() {
+        let ledger = crate::ledger::Ledger::new(100, usize::MAX, false);
+        let (a, b): (Arc<dyn MemoryPool>, Arc<dyn MemoryPool>) = (ledger.pool(), ledger.pool());
+        let ctx = SessionContext::new_with_config_rt(datafusion::prelude::SessionConfig::new(), RuntimeEnvBuilder::new().with_memory_pool(a).build_arc().unwrap());
+        let peak = peak_pool(&ctx);
+        let task = task_with_peak(&ctx.state(), &peak).unwrap();
+        let sort = MemoryConsumer::new("a's sort").with_can_spill(true).register(task.memory_pool());
+        sort.try_grow(80).unwrap();
+        let b_sort = MemoryConsumer::new("b's sort").with_can_spill(true).register(&b);
+        assert!(b_sort.try_grow(50).is_ok() && b_sort.try_grow(1).is_err(), "B's half");
+        drop(sort);
+        assert!(b_sort.try_grow(50).is_ok(), "A's statement over: B has the line");
     }
 
     #[test]

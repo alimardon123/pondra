@@ -609,9 +609,10 @@ impl Guesses {
 }
 
 /// A credential as a client sent it, read alike at every door (redesign step 7, piece 1): an `Authorization` header (HTTP,
-/// MCP, Iceberg REST, Delta Sharing, Flight), Kafka's SASL PLAIN, Postgres's password message. It decides no rights: a
-/// door asks `users` and `Auth` whom it signs in.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// MCP, Iceberg REST, Delta Sharing, Flight) and Kafka's SASL PLAIN. It decides no rights: a door asks `users` and `Auth`
+/// whom it signs in. (Postgres's password message and SCRAM's are read by pgwire and `pg.rs` still: step 10.) Its `Debug`
+/// shows no secret.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Credential {
     /// A bearer token: a node's token, a user's (`pt_`), a session (`ps_`), a provider's JWT, a key, a lent token.
     Token(String),
@@ -622,6 +623,17 @@ pub enum Credential {
     Malformed(&'static str),
     /// None sent, or a scheme Pondra doesn't read.
     None,
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credential::Token(_) => f.write_str("Token(…)"),
+            Credential::Password { user, .. } => f.debug_struct("Password").field("user", user).finish_non_exhaustive(),
+            Credential::Malformed(why) => f.debug_tuple("Malformed").field(why).finish(),
+            Credential::None => f.write_str("None"),
+        }
+    }
 }
 
 impl Credential {
@@ -755,6 +767,13 @@ mod tests {
         assert_eq!(Credential::of_sasl_plain(b"ann\0secret"), Malformed("a SASL PLAIN message that isn't authzid, name and password"));
         assert_eq!(Credential::of_sasl_plain(b"\0ann\0\xff"), Malformed("a SASL PLAIN name and password that aren't UTF-8"));
         assert_eq!(Malformed("x").malformed().as_deref(), Some("the credential can't be read: x"));
+        // (a header that isn't text, as Flight's gRPC metadata can carry it too, is refused, not taken for none)
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, http::HeaderValue::from_bytes(b"Bearer \xff").unwrap());
+        assert_eq!(Credential::of_headers(&headers), Malformed("an Authorization header that isn't text"));
+        // (its Debug, in a log or a panic, shows no secret, 11-07 audit L5)
+        let shown = format!("{:?} {:?}", pw("ann", "s3cret"), Credential::Token("pt_s3cret".into()));
+        assert!(!shown.contains("s3cret") && shown.contains("ann"), "{shown}");
     }
 
     fn ip(last: u8) -> Option<IpAddr> { Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))) }

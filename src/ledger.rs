@@ -12,7 +12,8 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation};
 use std::borrow::Borrow;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use datafusion::common::instant::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError, TryLockError, Weak};
 
 /// A map that keeps its most recently used entries within a byte bound, and within a count bound when one is set. Each
@@ -179,6 +180,10 @@ pub trait Charged: Send + Sync {
         0
     }
 
+    /// Does it give memory back (`give_back`)? A cache that keeps what it holds, `give_back`'s default, says no: an idle
+    /// node's watch looks every 2 s only while a cache holds what it could give back (`oom.rs`).
+    fn gives_back(&self) -> bool { false }
+
     /// Does it hold its bytes inside the whole line, with the queries (`Ledger`)? Yes, unless the user gave it a budget of
     /// its own (`PONDRA_HOT_GB`, `PONDRA_CACHE_MB`): then it keeps that budget beside the line, and only the node's memory
     /// watch takes memory back from it.
@@ -189,6 +194,8 @@ impl<K: Hash + Eq + Send, V: Send> Charged for Mutex<ByteLru<K, V>> {
     fn held(&self) -> usize { self.lock().unwrap_or_else(PoisonError::into_inner).bytes() }
 
     fn give_back(&self, bytes: usize) -> usize { give_back_from(self, |c| c, bytes) }
+
+    fn gives_back(&self) -> bool { true }
 }
 
 /// About the memory a parsed JSON value holds, to charge a cache of them (`ByteLru::put`): each value's own 32 bytes, a
@@ -232,6 +239,21 @@ pub fn give_back_from<T, K: Hash + Eq, V>(cache: &Mutex<T>, lru: impl Fn(&mut T)
     freed
 }
 
+/// How old the caches' count may be at a query's grow, in ms (`Ledger::fresh`).
+const STALE_MS: u64 = 1000;
+const NEVER: u64 = u64::MAX;
+
+/// Each name once, in the order first given.
+fn kinds_of(names: impl Iterator<Item = &'static str>) -> Vec<&'static str> {
+    let mut kinds = vec![];
+    for name in names {
+        if !kinds.contains(&name) {
+            kinds.push(name);
+        }
+    }
+    kinds
+}
+
 // ---------------------------------------------------------------- the line
 
 /// The node's one line for query memory, which every lake it opens shares. Each lake's queries run on a `LakePool`: DataFusion's
@@ -266,6 +288,8 @@ pub struct Ledger {
     busy: AtomicUsize,     // lakes with a memory consumer registered now
     cached: AtomicUsize,   // what the caches held at the last look (`note`), less what grows took back since
     dry: AtomicBool,       // a take-back since the last look came back short: grows don't ask the caches again until `note`
+    born: Instant,         // (what `noted` counts from)
+    noted: AtomicU64,      // the last look (`note`), in ms since `born`: `NEVER` before the first
     caches: Mutex<Vec<(&'static str, Weak<dyn Charged>)>>, // what the node keeps on this line, by name (`charge`), in the order they give back
 }
 
@@ -273,7 +297,7 @@ impl Ledger {
     /// A ledger whose queries hold `line` at most, inside `whole` with the caches (`line` itself when the setting is the whole
     /// line). A `hard` whole line refuses a spiller's grow the caches don't make room for; a soft one only takes cache bytes back.
     pub fn new(line: usize, whole: usize, hard: bool) -> Arc<Ledger> {
-        Arc::new(Ledger { line, whole, hard, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0), cached: AtomicUsize::new(0), dry: AtomicBool::new(false), caches: Default::default() })
+        Arc::new(Ledger { line, whole, hard, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0), cached: AtomicUsize::new(0), dry: AtomicBool::new(false), born: Instant::now(), noted: AtomicU64::new(NEVER), caches: Default::default() })
     }
 
     /// A new lake's pool on this line.
@@ -287,14 +311,33 @@ impl Ledger {
     /// What the caches held at the last look, less what grows took back since: what a grow goes by.
     pub fn cached(&self) -> usize { self.cached.load(Relaxed) }
 
+    /// A cache inside the whole line holds `bytes` more since the last look (`note`): a hot load's decode, while it runs.
+    pub fn cache_grew(&self, bytes: usize) { self.cached.fetch_add(bytes, Relaxed); }
+
+    /// A cache inside the whole line holds `bytes` less since the last look, of what it said it grew (`cache_grew`).
+    pub fn cache_shrank(&self, bytes: usize) { let _ = self.cached.fetch_update(Relaxed, Relaxed, |held| Some(held.saturating_sub(bytes))); }
+
     /// Reads what the caches inside the whole line hold now (`Charged::inside`), for the grows to go by until the next look,
     /// and says it. The node's memory watch reads it at each of its looks (`oom.rs`), so a grow never locks a cache to read it.
     pub fn note(&self) -> usize {
+        self.noted.store(self.now(), Relaxed);
         let held = self.charged().iter().filter(|(_, c)| c.inside()).map(|(_, c)| c.held()).sum();
         self.cached.store(held, Relaxed);
         self.dry.store(false, Relaxed);
         held
     }
+
+    /// Notes the caches (`note`) when nothing has for [`STALE_MS`]: where no memory watch runs (`pondra sql`, a page), a
+    /// query's grow is what notes them, so the whole line holds the caches there too (11-07 audit M4). Where the watch runs it
+    /// looks at each request's start, and on a node's line at least every second while one runs, so there this seldom notes.
+    fn fresh(&self) {
+        let (now, noted) = (self.now(), self.noted.load(Relaxed));
+        if (noted == NEVER || now.saturating_sub(noted) >= STALE_MS) && self.noted.compare_exchange(noted, now, Relaxed, Relaxed).is_ok() {
+            self.note(); // (one grow notes: the others go by the last look meanwhile)
+        }
+    }
+
+    fn now(&self) -> u64 { self.born.elapsed().as_millis() as u64 }
 
     /// What every lake's queries hold now.
     pub fn reserved(&self) -> usize { self.reserved.load(Relaxed) }
@@ -303,8 +346,8 @@ impl Ledger {
     pub fn share(&self) -> usize { self.line / self.busy.load(Relaxed).max(1) }
 
     /// Counts `cache` on this line, under `name`, for as long as it lives: `/metrics`' `cache_bytes` reads it by that name,
-    /// and the node's memory watch takes memory back from it before it stops a query (`oom.rs`). Caches give back in the
-    /// order they were charged, so a lake's go in the order it lists them. A cache is charged once, though several lakes
+    /// and the node's memory watch takes memory back from it before it stops a query (`oom.rs`). Caches give back by kind,
+    /// in the order the names were first charged, so a lake's kinds go in the order it lists them. A cache is charged once, though several lakes
     /// keep it (the ranges of a bucket two lakes are in, the node's planning facts).
     pub fn charge(&self, name: &'static str, cache: Weak<dyn Charged>) {
         let mut caches = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
@@ -314,12 +357,27 @@ impl Ledger {
         }
     }
 
-    /// The caches still alive, for the caller to hold a moment (a closed lake's go here).
+    /// The caches still alive, for the caller to hold a moment (a closed lake's go here), by kind: each name's together, in
+    /// the order the names were first charged, so every lake's hot columns come before any lake's ranges (11-06 audit L7).
+    /// The order they give memory back in.
     fn charged(&self) -> Vec<(&'static str, Arc<dyn Charged>)> {
         let mut caches = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
         caches.retain(|(_, c)| c.strong_count() > 0);
-        caches.iter().filter_map(|(name, c)| Some((*name, c.upgrade()?))).collect()
+        let kinds = kinds_of(caches.iter().map(|(name, _)| *name));
+        let mut alive: Vec<_> = caches.iter().filter_map(|(name, c)| Some((*name, c.upgrade()?))).collect();
+        alive.sort_by_key(|(name, _)| kinds.iter().position(|kind| kind == name)); // (stable: a name's in the order charged)
+        alive
     }
+
+    /// The names of the caches on this line, each once, in the order they were first charged: the order kinds give memory
+    /// back in, on this line and across the node's lines (`oom.rs`).
+    pub fn kinds(&self) -> Vec<&'static str> {
+        let caches = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
+        kinds_of(caches.iter().filter(|(_, c)| c.strong_count() > 0).map(|(name, _)| *name))
+    }
+
+    /// Do the caches on this line hold anything they could give back (`Charged::gives_back`)?
+    pub fn givable(&self) -> bool { self.charged().iter().any(|(_, c)| c.gives_back() && c.held() > 0) }
 
     /// What the caches on this line hold now.
     pub fn held(&self) -> usize { self.charged().iter().map(|(_, c)| c.held()).sum() }
@@ -337,21 +395,25 @@ impl Ledger {
         by_name
     }
 
-    /// Takes about `bytes` back from the caches on this line, in the order they were charged, and says how many came back:
+    /// Takes about `bytes` back from the caches on this line, a kind at a time (`charged`), and says how many came back:
     /// the node's memory watch, from every cache.
-    pub fn give_back(&self, bytes: usize) -> usize { self.take(bytes, false) }
+    pub fn give_back(&self, bytes: usize) -> usize { self.take(bytes, false, None) }
+
+    /// Takes about `bytes` back from this line's caches named `kind` alone: the node's memory watch, a kind at a time
+    /// across the node's lines (`oom.rs`).
+    pub fn give_back_kind(&self, kind: &str, bytes: usize) -> usize { self.take(bytes, false, Some(kind)) }
 
     /// Takes about `bytes` back from the caches inside the whole line alone: a query's grow past it.
-    fn make_room(&self, bytes: usize) -> usize { self.take(bytes, true) }
+    fn make_room(&self, bytes: usize) -> usize { self.take(bytes, true, None) }
 
-    fn take(&self, bytes: usize, inside_only: bool) -> usize {
+    fn take(&self, bytes: usize, inside_only: bool, kind: Option<&str>) -> usize {
         let (mut freed, mut inside) = (0, 0);
-        for (_, c) in self.charged() {
+        for (name, c) in self.charged() {
             if freed >= bytes {
                 break;
             }
             let counted = c.inside();
-            if inside_only && !counted {
+            if (inside_only && !counted) || kind.is_some_and(|kind| kind != name) {
                 continue;
             }
             let got = c.give_back(bytes - freed);
@@ -390,25 +452,48 @@ impl LakePool {
 
     fn part(&self) -> std::sync::MutexGuard<'_, Part> { self.part.lock().unwrap_or_else(PoisonError::into_inner) }
 
-    /// What `r` may grow by within the lake's share, by `FairSpillPool`'s rules.
-    fn available(&self, p: &Part, r: &MemoryReservation) -> usize {
-        let share = self.ledger.share();
-        match r.consumer().can_spill() {
-            // (no spiller past its part of what the lake's unspillable memory leaves of its share)
-            true => share.saturating_sub(p.unspillable).checked_div(p.spillers).unwrap_or(share).saturating_sub(r.size()),
-            false => share.saturating_sub(p.unspillable + p.spillable),
-        }
+    /// What `r` may grow by within the lake's room (`room`), by `FairSpillPool`'s rules, and the room.
+    fn available(&self, p: &Part, r: &MemoryReservation) -> (usize, usize) {
+        let spills = r.consumer().can_spill();
+        let room = self.room(p, spills);
+        let available = match spills {
+            // (no spiller past its part of what the lake's unspillable memory leaves of its room)
+            true => room.saturating_sub(p.unspillable).checked_div(p.spillers).unwrap_or(room).saturating_sub(r.size()),
+            false => room.saturating_sub(p.unspillable + p.spillable),
+        };
+        (available, room)
+    }
+
+    /// What the lake's queries may hold now: the line less what the other lakes' queries hold, so a lake running one small
+    /// SELECT beside it doesn't halve its room (11-06 audit M10). A spiller has at least the lake's even share of the line
+    /// (`Ledger::share`) while others hold the rest, as between pools of their own: the other lakes' spillers are held to
+    /// theirs at their next grow, and spill.
+    fn room(&self, p: &Part, spills: bool) -> usize {
+        let l = &self.ledger;
+        let free = l.line.saturating_sub(l.reserved().saturating_sub(p.spillable + p.unspillable));
+        if spills { free.max(l.share()) } else { free }
     }
 
     /// The refusal of a grow, which a spilling operator answers by spilling and any other query by stopping.
-    fn refused(&self, r: &MemoryReservation, additional: usize, available: usize) -> DataFusionError {
+    /// (`room`: the lake's, which the error names, `LakePool::line`)
+    fn refused(&self, r: &MemoryReservation, additional: usize, available: usize, room: usize) -> DataFusionError {
         DataFusionError::ResourcesExhausted(format!(
-            "Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total memory pool: {self}",
+            "Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total memory pool: {}",
             human_readable_size(additional),
             r.consumer().name(),
             human_readable_size(r.size()),
             human_readable_size(available),
+            self.line(room),
         ))
+    }
+
+    /// The line as an error says it: the lake's room in it, and the caches beside the queries.
+    fn line(&self, room: usize) -> String {
+        let l = &self.ledger;
+        match l.whole {
+            usize::MAX => format!("ledger(this database's room: {} of {})", human_readable_size(room), human_readable_size(l.line)),
+            whole => format!("ledger(this database's room: {} of {}, caches {} of {} with queries)", human_readable_size(room), human_readable_size(l.line), human_readable_size(l.cached()), human_readable_size(whole)),
+        }
     }
 }
 
@@ -466,10 +551,11 @@ impl MemoryPool for LakePool {
     }
 
     fn try_grow(&self, r: &MemoryReservation, additional: usize) -> Result<()> {
+        self.ledger.fresh(); // (before the lake's lock: a note locks each cache a moment)
         let mut p = self.part();
-        let available = self.available(&p, r);
+        let (available, room) = self.available(&p, r);
         if additional > available {
-            return Err(self.refused(r, additional, available));
+            return Err(self.refused(r, additional, available, room));
         }
         let over = self.ledger.over(additional);
         if over > 0 {
@@ -485,9 +571,9 @@ impl MemoryPool for LakePool {
                     self.ledger.dry.store(true, Relaxed);
                 }
                 p = self.part();
-                let available = self.available(&p, r);
+                let (available, room) = self.available(&p, r);
                 if additional > available {
-                    return Err(self.refused(r, additional, available));
+                    return Err(self.refused(r, additional, available, room));
                 }
             }
             if short && self.ledger.hard && r.consumer().can_spill() && r.size() > 0 {
@@ -497,7 +583,7 @@ impl MemoryPool for LakePool {
                 // cache, so both are held to their share alone, as before, with the memory watch behind them, and take back
                 // what the caches give. On the default line every grow does that: it spills where it did before, and the
                 // caches it found free gave their bytes back.
-                return Err(self.refused(r, additional, 0));
+                return Err(self.refused(r, additional, 0, self.room(&p, true)));
             }
         }
         *p.of(r) += additional;
@@ -511,7 +597,7 @@ impl MemoryPool for LakePool {
         p.spillable + p.unspillable
     }
 
-    fn memory_limit(&self) -> MemoryLimit { MemoryLimit::Finite(self.ledger.share()) }
+    fn memory_limit(&self) -> MemoryLimit { MemoryLimit::Finite(self.room(&self.part(), true)) }
 }
 
 #[cfg(test)]
@@ -666,6 +752,27 @@ mod tests {
         assert!(a_held.try_grow(50).is_ok());
     }
 
+    /// A lake's room is the line less what the other lakes' queries hold (11-06 audit M10): B's one small statement doesn't
+    /// halve A's, so A's hash join that needs 60% of the line fits, and its refusal names A's room. A spiller still has its
+    /// lake's even share while the other lake holds the rest.
+    #[test]
+    fn a_lakes_room_is_the_line_less_what_the_others_hold() {
+        let ledger = Ledger::new(100, usize::MAX, false);
+        let (a, b) = (ledger.pool(), ledger.pool());
+        let small = consumer(&b, "b's small SELECT", false);
+        small.try_grow(1).unwrap();
+        let join = consumer(&a, "a's hash join", false);
+        assert!(join.try_grow(60).is_ok(), "60 of the 99 B leaves, not of half the line");
+        assert!(join.try_grow(39).is_ok());
+        let e = join.try_grow(1).unwrap_err().to_string();
+        assert!(e.contains("0.0 B remain available for the total memory pool: ledger(this database's room: 99.0 B of 100.0 B)"), "{e}");
+        let sorter = consumer(&b, "b's sort", true);
+        assert_eq!(limit(&b), Some(50));
+        assert!(sorter.try_grow(49).is_ok() && sorter.try_grow(1).is_err(), "B's half, less its small SELECT's 1");
+        drop(join);
+        assert!(sorter.try_grow(50).is_ok(), "A done: the line less B's own");
+    }
+
     #[test]
     fn shed_lets_the_least_recently_used_go_until_enough_has_and_keeps_the_bound() {
         let mut c = ByteLru::new(100);
@@ -684,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn a_line_takes_memory_back_from_its_caches_in_turn_and_forgets_the_dropped_ones() {
+    fn a_line_takes_memory_back_from_its_caches_by_kind_and_forgets_the_dropped_ones() {
         let ledger = Ledger::new(1000, usize::MAX, false);
         let cache = |bytes: &[usize]| {
             let c = Arc::new(Mutex::new(ByteLru::new(1000)));
@@ -693,22 +800,27 @@ mod tests {
             }
             c
         };
-        let (first, second, third) = (cache(&[100, 100]), cache(&[50, 50]), cache(&[70]));
+        let (first, second, third) = (cache(&[100, 100]), cache(&[50, 50]), cache(&[50, 20]));
         for (name, c) in [("first", &first), ("second", &second), ("first", &third)] {
             let c: Arc<dyn Charged> = c.clone();
             ledger.charge(name, Arc::downgrade(&c));
             ledger.charge(name, Arc::downgrade(&c)); // (charged once, however many lakes keep it)
         }
-        assert_eq!((ledger.held(), ledger.held_by_name()), (370, vec![("first", 270), ("second", 100)]));
-        assert_eq!(ledger.give_back(250), 250, "the first cache's entries, the least recently used first, then the second's");
-        assert_eq!((first.held(), second.held(), third.held()), (0, 50, 70));
+        assert_eq!((ledger.held(), ledger.held_by_name(), ledger.kinds()), (370, vec![("first", 270), ("second", 100)], vec!["first", "second"]));
+        // (as two lakes' hot columns and one's ranges: the second lake's hot columns go before the first's ranges, 11-06 audit L7)
+        assert_eq!(ledger.give_back(250), 250, "the first kind's caches, each in the order charged and its least recently used first");
+        assert_eq!((first.held(), second.held(), third.held()), (0, 100, 20));
+        assert_eq!(ledger.give_back_kind("second", 50), 50, "a kind alone");
+        assert_eq!((first.held(), second.held(), third.held()), (0, 50, 20));
         let held = third.lock().unwrap();
         assert_eq!(ledger.give_back(1000), 50, "a cache a reader holds now is skipped, and asked again at the next look");
         drop(held);
         drop(second);
-        assert_eq!(ledger.held(), 70, "a dropped cache is let go of");
-        assert_eq!(ledger.give_back(1000), 70);
+        assert_eq!((ledger.held(), ledger.kinds()), (20, vec!["first"]), "a dropped cache is let go of");
+        assert!(ledger.givable());
+        assert_eq!(ledger.give_back(1000), 20);
         assert_eq!((ledger.held(), ledger.caches.lock().unwrap().len()), (0, 2));
+        assert!(!ledger.givable(), "nothing left to give back");
     }
 
     /// A cache of `entries` entries of `each` bytes, charged to `ledger` (the caller keeps it alive).
@@ -781,6 +893,7 @@ mod tests {
         let ledger = Ledger::new(100, 100, true);
         let kept: Arc<dyn Charged> = Arc::new(Kept(90));
         ledger.charge("kept", Arc::downgrade(&kept));
+        assert!(!ledger.givable(), "what a cache keeps isn't what it could give back (11-06 audit L8)");
         ledger.note();
         let a = ledger.pool();
         let sort = consumer(&a, "sort", true);
@@ -791,6 +904,37 @@ mod tests {
         assert_eq!(ledger.reserved(), 20);
     }
 
+    /// A hot load's decode holds its estimate on the line while it runs (`Hot::load`, 11-07 audit L6): a grow meanwhile
+    /// has only what it leaves.
+    #[test]
+    fn a_decode_running_holds_its_estimate_on_the_line() {
+        let ledger = Ledger::new(100, 100, true);
+        let a = ledger.pool();
+        let sort = consumer(&a, "sort", true);
+        ledger.note(); // (the watch's look: the grows go by it, and the decode's estimate on it, for a second)
+        ledger.cache_grew(60);
+        sort.try_grow(40).expect("beside the decode's 60");
+        assert!(sort.try_grow(1).is_err(), "nothing past it");
+        ledger.cache_shrank(60);
+        sort.try_grow(60).expect("the decode is over");
+        assert_eq!(ledger.cached(), 0);
+    }
+
+    /// Where no memory watch looks (`pondra sql`, a page), a query's grow notes the caches itself (11-07 audit M4): the whole
+    /// line holds them there too.
+    #[test]
+    fn where_no_watch_looks_a_grow_notes_the_caches() {
+        let ledger = Ledger::new(100, 100, true);
+        let kept: Arc<dyn Charged> = Arc::new(Kept(70));
+        ledger.charge("kept", Arc::downgrade(&kept));
+        assert_eq!(ledger.cached(), 0, "no look yet");
+        let a = ledger.pool();
+        let sort = consumer(&a, "sort", true);
+        sort.try_grow(30).expect("beside the 70 the cache holds");
+        assert_eq!(ledger.cached(), 70, "the grow looked");
+        assert!(sort.try_grow(1).is_err(), "and nothing past them");
+    }
+
     /// A cache the user gave a budget of its own (`Charged::inside`).
     struct Own(Mutex<ByteLru<usize, ()>>);
 
@@ -798,6 +942,8 @@ mod tests {
         fn held(&self) -> usize { self.0.held() }
 
         fn give_back(&self, bytes: usize) -> usize { self.0.give_back(bytes) }
+
+        fn gives_back(&self) -> bool { true }
 
         fn inside(&self) -> bool { false }
     }

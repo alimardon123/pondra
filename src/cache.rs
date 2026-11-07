@@ -125,10 +125,24 @@ struct Outside {
     ranges: ByteLru<String, Entry>,                          // store|location|version|range -> bytes
 }
 
-static OUTSIDE: std::sync::LazyLock<Mutex<Outside>> = std::sync::LazyLock::new(|| {
+static OUTSIDE: std::sync::LazyLock<Arc<Mutex<Outside>>> = std::sync::LazyLock::new(|| {
     let seen = lru::LruCache::new(std::num::NonZeroUsize::new(100_000).expect("nonzero"));
-    Mutex::new(Outside { seen, ranges: ByteLru::new(files_cache_bytes()) })
+    Arc::new(Mutex::new(Outside { seen, ranges: ByteLru::new(files_cache_bytes()) }))
 });
+
+/// The ranges of files outside the lakes, as the node's line counts them (`cache_bytes{cache="files"}`, 11-07 audit M4).
+pub fn outside() -> Arc<dyn Charged> { OUTSIDE.clone() }
+
+impl Charged for Mutex<Outside> {
+    fn held(&self) -> usize { self.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ranges.bytes() }
+
+    fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(self, |o| &mut o.ranges, bytes) }
+
+    fn gives_back(&self) -> bool { true }
+
+    /// Inside the whole line, unless `PONDRA_FILES_CACHE_MB` gives them a budget of their own.
+    fn inside(&self) -> bool { crate::env::get("PONDRA_FILES_CACHE_MB").is_none() }
+}
 
 fn files_cache_bytes() -> usize { crate::env::value::<usize>("PONDRA_FILES_CACHE_MB") << 20 }
 
@@ -169,6 +183,8 @@ impl Charged for CachedStore {
     fn held(&self) -> usize { self.cache.held() }
 
     fn give_back(&self, bytes: usize) -> usize { self.cache.give_back(bytes) }
+
+    fn gives_back(&self) -> bool { true }
 
     fn inside(&self) -> bool { !crate::store::own_cache_budget() }
 }

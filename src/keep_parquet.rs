@@ -202,7 +202,15 @@ pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes
     }
     let to = crate::tier::codec();
     let mut props = WriterProperties::builder().set_compression(to);
-    if md.offset_index().is_none() {
+    // A source's offset index says where each page starts, in bytes and in rows, and a reader skipping pages goes by it:
+    // a page said to start 20 rows early is read 20 rows off its neighbours (11-06 audit M1). A chunk's pages written
+    // again (`squeeze`) get an index of their own, each at the offset it's written at and starting at the rows the pages
+    // before it hold; a chunk copied as it is keeps the source's only once each page is where it says (`as_indexed`).
+    // Rows are counted as levels, which a leaf with repetition doesn't have a row each of: a file with one keeps no
+    // page index, as a file written without one does.
+    let flat = (0..descr.num_columns()).all(|i| descr.column(i).max_rep_level() == 0);
+    let indexed = md.offset_index().is_some() && flat;
+    if !indexed {
         // (a file's chunks all have an offset index or none do: a source with none, the system columns with none, and
         // ranges per chunk, not per page, which would ask for one)
         props = props.set_offset_index_disabled(true).set_statistics_enabled(EnabledStatistics::Chunk);
@@ -236,11 +244,15 @@ pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes
         let mut out = w.next_row_group()?;
         for (i, chunk) in rg.columns().iter().enumerate() {
             if in_codec(chunk, to) {
-                SerializedPageReader::new(reader.clone(), chunk, rg.num_rows() as usize, None)?.peek_next_page()?;
-                out.append_column(reader.as_ref(), column_close(md, g, i, chunk, our_descr.column(i), None)?)?;
+                if indexed {
+                    as_indexed(md, g, i, chunk, reader.clone())?;
+                } else {
+                    SerializedPageReader::new(reader.clone(), chunk, rg.num_rows() as usize, None)?.peek_next_page()?;
+                }
+                out.append_column(reader.as_ref(), column_close(md, g, i, chunk, our_descr.column(i), None, indexed)?)?;
             } else {
-                let (bytes, moved) = squeeze(md, g, i, chunk, reader.clone(), to)?;
-                out.append_column(&bytes, column_close(md, g, i, chunk, our_descr.column(i), Some(moved))?)?;
+                let (bytes, moved) = squeeze(md, g, i, chunk, reader.clone(), to, indexed)?;
+                out.append_column(&bytes, column_close(md, g, i, chunk, our_descr.column(i), Some(moved), indexed)?)?;
             }
         }
         if let Some(s) = sys {
@@ -309,8 +321,10 @@ struct Moved {
 
 /// One chunk's pages, decompressed and compressed again in `to` (LZ4_RAW or none), each written as it was otherwise:
 /// its values, levels, encoding, NULL and row counts and statistics as the source has them. The chunk's bytes from
-/// offset 0, and where its pages are in them; the offset index the source's, at the new offsets.
-fn squeeze(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaData, reader: Arc<Piece>, to: Compression) -> Result<(Bytes, Moved)> {
+/// offset 0, and where its pages are in them; with `indexed`, an offset index of its pages at the new offsets, each
+/// starting at the rows the pages before it hold (its leaf has no repetition: a level a row), not where the source's
+/// says.
+fn squeeze(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaData, reader: Arc<Piece>, to: Compression, indexed: bool) -> Result<(Bytes, Moved)> {
     let pack = |raw: &[u8]| -> Result<Bytes> {
         Ok(match to {
             Compression::UNCOMPRESSED => Bytes::copy_from_slice(raw),
@@ -324,11 +338,14 @@ fn squeeze(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaData, 
     };
     let mut pages = SerializedPageReader::new(reader, src, md.row_group(g).num_rows() as usize, None)?;
     let mut sink = TrackedWrite::new(Vec::with_capacity(kept_size(src, to) as usize + (64 << 10)));
-    let mut specs = Vec::new();
+    let (mut specs, mut levels) = (Vec::new(), Vec::new());
     {
         let mut w = SerializedPageWriter::new(&mut sink);
         while let Some(page) = pages.get_next_page()? {
             let whole = page.buffer().len();
+            if !matches!(page, Page::DictionaryPage { .. }) {
+                levels.push(page.num_values() as i64);
+            }
             let page = match page {
                 Page::DictionaryPage { buf, num_values, encoding, is_sorted } => Page::DictionaryPage { buf: pack(&buf)?, num_values, encoding, is_sorted },
                 Page::DataPage { buf, num_values, encoding, def_level_encoding, rep_level_encoding, statistics } => {
@@ -351,10 +368,18 @@ fn squeeze(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaData, 
     let bytes = Bytes::from(sink.into_inner()?);
     let data: Vec<_> = specs.iter().filter(|(d, _)| !d).map(|(_, s)| s).collect();
     let first = data.first().context("a chunk with no data page")?;
-    let offset_index = match md.offset_index().and_then(|oi| oi.get(g)).and_then(|row| row.get(i)) {
+    let offset_index = match md.offset_index().and_then(|oi| oi.get(g)).and_then(|row| row.get(i)).filter(|_| indexed) {
         Some(was) => {
             ensure!(was.page_locations.len() == data.len(), "the offset index has {} pages, the chunk {}", was.page_locations.len(), data.len());
-            let page_locations = was.page_locations.iter().zip(&data).map(|(p, s)| PageLocation { offset: s.offset as i64, compressed_page_size: s.bytes_written as i32, first_row_index: p.first_row_index }).collect();
+            let mut first = 0i64;
+            let page_locations = data.iter().zip(&levels).map(|(s, n)| {
+                let p = PageLocation { offset: s.offset as i64, compressed_page_size: s.bytes_written as i32, first_row_index: first };
+                first += n;
+                p
+            });
+            let page_locations = page_locations.collect();
+            let rows = md.row_group(g).num_rows();
+            ensure!(first == rows, "the pages of column {i} in row group {g} hold {first} rows, the row group {rows}");
             Some(OffsetIndexMetaData { page_locations, unencoded_byte_array_data_bytes: was.unencoded_byte_array_data_bytes.clone() })
         }
         None => None,
@@ -370,12 +395,70 @@ fn squeeze(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaData, 
     Ok((bytes, moved))
 }
 
+/// Whether a chunk copied as it is has its pages where the source's offset index says: each page at the byte and of the
+/// size it says, and starting at the rows the pages before it hold (a leaf with no repetition has a row a level). Err
+/// when one isn't, and the load is written as today (`keep_load`). Only the pages' headers are read: a reader going
+/// through a chunk in order starts a read at each page's header (`Noted`), and skips its values.
+fn as_indexed(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaData, reader: Arc<Piece>) -> Result<()> {
+    let rows = md.row_group(g).num_rows();
+    let says = &md.offset_index().and_then(|oi| oi.get(g)).and_then(|row| row.get(i)).context("no offset index")?.page_locations;
+    let noted = Arc::new(Noted { piece: reader, starts: Default::default() });
+    let mut pages = SerializedPageReader::new(noted.clone(), src, rows as usize, None)?;
+    let mut found = vec![]; // (each page's first byte, and its rows: None for a dictionary page)
+    while let Some(page) = pages.peek_next_page()? {
+        let at = noted.starts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last().copied().context("a page read from nowhere")?;
+        found.push((at, if page.is_dict { None } else { Some(page.num_rows.or(page.num_levels).context("a data page with no count")?) }));
+        pages.skip_next_page()?;
+    }
+    let (start, len) = src.byte_range();
+    let ends = found.iter().skip(1).map(|p| p.0).chain([start + len]);
+    let (mut k, mut first) = (0, 0i64);
+    for (&(at, n), end) in found.iter().zip(ends) {
+        let Some(n) = n else { continue };
+        let p = says.get(k).with_context(|| format!("column {i} in row group {g} has more pages than its offset index says ({})", says.len()))?;
+        let size = end.saturating_sub(at) as i64;
+        ensure!(
+            (p.offset, p.compressed_page_size as i64, p.first_row_index) == (at as i64, size, first),
+            "column {i} in row group {g}: its page {k} isn't where its offset index says: byte {at}, {size} bytes, from row {first}; it says byte {}, {} bytes, from row {}",
+            p.offset,
+            p.compressed_page_size,
+            p.first_row_index
+        );
+        (first, k) = (first + n as i64, k + 1);
+    }
+    ensure!(k == says.len(), "column {i} in row group {g} has {k} pages, its offset index {}", says.len());
+    ensure!(first == rows, "the pages of column {i} in row group {g} hold {first} rows, the row group {rows}");
+    Ok(())
+}
+
+/// A piece that notes where each read of it starts: `as_indexed`'s reader starts one at each page's header.
+struct Noted {
+    piece: Arc<Piece>,
+    starts: std::sync::Mutex<Vec<u64>>,
+}
+
+impl Length for Noted {
+    fn len(&self) -> u64 { self.piece.len() }
+}
+
+impl ChunkReader for Noted {
+    type T = <Piece as ChunkReader>::T;
+
+    fn get_read(&self, start: u64) -> datafusion::parquet::errors::Result<Self::T> {
+        self.starts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(start);
+        self.piece.get_read(start)
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> datafusion::parquet::errors::Result<Bytes> { self.piece.get_bytes(start, length) }
+}
+
 /// The close result of a source chunk: its metadata under our descriptor, its statistics only where they are trusted
-/// (`trusted`), else their NULL count alone; its column index only with trusted statistics; its offset index always.
-/// `moved`: its pages as `squeeze` wrote them, else where the source has them.
-fn column_close(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaData, ours: ColumnDescPtr, moved: Option<Moved>) -> Result<ColumnCloseResult> {
+/// (`trusted`), else their NULL count alone; with `indexed`, its offset index (`squeeze`'s, else the source's, which
+/// `as_indexed` checked) and its column index where its statistics are trusted. `moved`: its pages as `squeeze` wrote
+/// them, else where the source has them.
+fn column_close(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaData, ours: ColumnDescPtr, moved: Option<Moved>, indexed: bool) -> Result<ColumnCloseResult> {
     let (stats, column_index) = match src.statistics() {
-        Some(s) if trusted(md, i, s) => (Some(s.clone()), md.column_index().and_then(|ci| ci.get(g)).and_then(|row| row.get(i)).cloned()),
+        Some(s) if trusted(md, i, s) => (Some(s.clone()), md.column_index().and_then(|ci| ci.get(g)).and_then(|row| row.get(i)).filter(|_| indexed).cloned()),
         Some(s) => (nulls_only(s), None),
         None => (None, None),
     };
@@ -387,7 +470,7 @@ fn column_close(md: &ParquetMetaData, g: usize, i: usize, src: &ColumnChunkMetaD
         }
         None => {
             b = b.set_compression_codec(src.compression_codec()).set_total_compressed_size(src.compressed_size()).set_total_uncompressed_size(src.uncompressed_size()).set_data_page_offset(src.data_page_offset()).set_dictionary_page_offset(src.dictionary_page_offset());
-            (md.offset_index().and_then(|oi| oi.get(g)).and_then(|row| row.get(i)).cloned(), src.compressed_size() as u64)
+            (md.offset_index().and_then(|oi| oi.get(g)).and_then(|row| row.get(i)).filter(|_| indexed).cloned(), src.compressed_size() as u64)
         }
     };
     b = b
@@ -761,6 +844,74 @@ mod tests {
                 }
             }
             assert_eq!(some(&kept[0].bytes), some(&file), "{name}: rows read by the offset index");
+        }
+    }
+
+    /// A file whose offset index says a page starts 20 rows early, or is where another page is (11-06 audit M1): a reader
+    /// skipping pages by it reads the column off its neighbours. Its pages written again (Snappy, `squeeze`): kept, with
+    /// an offset index of where they are and the rows they hold, which a read that skips pages goes by. Copied as they
+    /// are (LZ4_RAW): not kept, since `as_indexed` finds the page isn't where it says. Told the truth, both are kept with
+    /// the source's starts, and read the same by skipping pages.
+    #[test]
+    fn a_lying_offset_index_isnt_kept() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false), Field::new("s", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int64Array::from_iter_values(0..3000)) as ArrayRef,
+            Arc::new(StringArray::from_iter((0..3000).map(|v| (v % 7 != 0).then(|| format!("s{}", v % 50))))),
+        ]).unwrap();
+        let starts = |md: &ParquetMetaData, c: usize| md.offset_index().unwrap()[0][c].page_locations.iter().map(|p| p.first_row_index).collect::<Vec<_>>();
+        let lie = |md: &ParquetMetaData, how: fn(&mut Vec<PageLocation>)| {
+            let mut b = md.clone().into_builder();
+            let mut oi = b.take_offset_index().unwrap();
+            how(&mut oi[0][0].page_locations);
+            b.set_offset_index(Some(oi)).build()
+        };
+        // (rows 1010 to 1029 of column i, read by skipping pages)
+        let skipping = |file: &Bytes| -> Vec<i64> {
+            let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
+            let selection = RowSelection::from(vec![RowSelector::skip(1010), RowSelector::select(20)]);
+            let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file.clone(), options).unwrap().with_row_selection(selection).build().unwrap();
+            reader.flat_map(|b| b.unwrap().column(0).as_primitive::<Int64Type>().values().to_vec()).collect()
+        };
+        for codec in [Compression::SNAPPY, Compression::LZ4_RAW] {
+            let props = WriterProperties::builder().set_compression(codec).set_data_page_row_count_limit(1000).set_write_batch_size(1000).build();
+            let mut w = ArrowWriter::try_new(Vec::new(), schema.clone(), Some(props)).unwrap();
+            w.write(&batch).unwrap();
+            let file = Bytes::from(w.into_inner().unwrap());
+            let md = footer_of(&file);
+            assert_eq!(starts(&md, 0), [0, 1000, 2000], "{codec:?}: three pages");
+            assert!(md.row_group(0).column(0).dictionary_page_offset().is_some(), "{codec:?}: a dictionary page");
+            let cuts = plan(&md, &schema, &limits()).unwrap();
+            let piece = file.slice(cuts[0].bytes.start as usize..cuts[0].bytes.end as usize);
+
+            let k = copy(&md, &schema, &cuts[0], piece.clone(), None).unwrap();
+            assert_eq!(starts(&footer_of(&k.bytes), 0), [0, 1000, 2000], "{codec:?}");
+            assert_eq!(skipping(&k.bytes), (1010..1030).collect::<Vec<_>>(), "{codec:?}");
+
+            let early = lie(&md, |p| p[1].first_row_index -= 20);
+            let moved = lie(&md, |p| (p[1].offset, p[1].compressed_page_size) = (p[2].offset, p[2].compressed_page_size));
+            let outside = lie(&md, |p| p[0].offset = 0);
+            for (how, md) in [("early", &early), ("moved", &moved), ("outside", &outside)] {
+                let got = copy(md, &schema, &cuts[0], piece.clone(), None);
+                if codec == Compression::SNAPPY {
+                    let k = got.unwrap();
+                    let footer = footer_of(&k.bytes);
+                    assert_eq!((starts(&footer, 0), starts(&footer, 1)), (vec![0, 1000, 2000], starts(&md, 1)), "{how}");
+                    assert_same_rows(&k.bytes, &file);
+                    assert_eq!(skipping(&k.bytes), (1010..1030).collect::<Vec<_>>(), "{how}");
+                } else {
+                    let why = format!("{:#}", got.unwrap_err());
+                    let want = match how {
+                        "early" => "its page 1 isn't where its offset index says: byte",
+                        "moved" => "its page 1 isn't where its offset index says: byte",
+                        _ => "its page 0 isn't where its offset index says: byte",
+                    };
+                    assert!(why.contains(want), "{how}: {why}");
+                    assert!(how != "early" || why.ends_with("from row 980"), "{why}");
+                }
+            }
         }
     }
 

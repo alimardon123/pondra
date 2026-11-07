@@ -5,6 +5,7 @@
 //! moment it is durable, and they lay those changes over their own (slightly behind) view of the
 //! catalog: every node sees a commit within milliseconds, while the bucket stays the source of truth.
 use anyhow::{bail, Context, Result};
+use crate::{finish::Finish, seq::Identity, types::Enum}; // (catalog uses engine: counted once each, tools/layers.py)
 use bytes::Bytes;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -65,9 +66,12 @@ pub struct Made {
     pub shown: Vec<String>,
     pub not_null: Vec<String>,
     pub defaults: BTreeMap<String, String>,
-    pub identity: BTreeMap<String, crate::seq::Identity>,
-    pub enums: BTreeMap<String, crate::types::Enum>,
+    pub identity: BTreeMap<String, Identity>,
+    pub enums: BTreeMap<String, Enum>,
     pub sql_types: BTreeMap<String, String>,
+    /// Each column's Arrow type as SQL reads it, by stored name, where its files hold another (`Col::sql_type`): filled
+    /// only for another engine's table (`ext::table_meta`).
+    pub logical_types: BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -79,7 +83,7 @@ impl Made {
 /// to, over random sequences of them (`the_list_edits_leave_the_entry_as_the_field_edits_did`).
 #[cfg(test)]
 impl Made {
-    fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<crate::types::Enum>) -> String {
+    fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<Enum>) -> String {
         let taken = |s: &str| self.columns.iter().any(|(n, _)| n == s);
         let stored = (1..).map(|i| if i == 1 { name.to_string() } else { format!("{name}~{i}") }).find(|s| !taken(s)).expect("a free name");
         if stored != name {
@@ -157,17 +161,20 @@ pub struct Col {
     pub name: String,
     /// The name its files and the log hold it under, when it was renamed (otherwise `name`).
     pub stored: Option<String>,
-    /// Its Arrow type, as text.
+    /// Its Arrow type, as text: its files' (`sql_type` says SQL's, when SQL reads another).
     pub dtype: String,
+    /// Its Arrow type as SQL reads it, when its files hold another: a mapped Delta table's struct, whose fields its files
+    /// keep under their physical names (`ext::table_meta`), read under SQL's (`query::named`). Read through `sql_type()`.
+    pub sql_type: Option<String>,
     pub dropped: bool,
     pub not_null: bool,
     /// `DEFAULT expr`, the SQL expression.
     pub default: Option<String>,
-    pub identity: Option<crate::seq::Identity>,
+    pub identity: Option<Identity>,
     /// The type a text column is held as (uuid, json, varchar(n): `types.rs`).
     pub held: Option<String>,
     /// An enum column's labels and type.
-    pub labels: Option<crate::types::Enum>,
+    pub labels: Option<Enum>,
     /// What it means, beside what it is (`About`).
     pub about: Option<Box<About>>,
 }
@@ -191,6 +198,8 @@ pub struct Stored {
 
 const NOT_NULL: &str = "not null";
 const DROPPED: &str = "dropped";
+/// `TableMeta::placed` of no columns: FNV-1a's offset basis.
+const PLACED_NONE: u64 = 0xcbf29ce484222325;
 
 /// A column's facts past its name, type and flags, as its entry writes them: each left out at its default (the id too,
 /// where it is the column's place + 1). (A missing one reads as None: no `default`, which would ask `Default` of each.)
@@ -209,6 +218,8 @@ struct Facts<S, I, E, A> {
     #[serde(skip_serializing_if = "Option::is_none")]
     labels: Option<E>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    sql_type: Option<S>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     about: Option<A>,
 }
 
@@ -219,8 +230,8 @@ impl Serialize for At<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let (c, place) = (self.0, self.1);
-        let facts = Facts { id: (c.id != place).then_some(c.id), stored: c.stored.as_ref(), default: c.default.as_ref(), identity: c.identity.as_ref(), held: c.held.as_ref(), labels: c.labels.as_ref(), about: c.about.as_deref() };
-        let any = facts.id.is_some() || c.stored.is_some() || c.default.is_some() || c.identity.is_some() || c.held.is_some() || c.labels.is_some() || c.about.is_some();
+        let facts = Facts { id: (c.id != place).then_some(c.id), stored: c.stored.as_ref(), default: c.default.as_ref(), identity: c.identity.as_ref(), held: c.held.as_ref(), labels: c.labels.as_ref(), sql_type: c.sql_type.as_ref(), about: c.about.as_deref() };
+        let any = facts.id.is_some() || c.stored.is_some() || c.default.is_some() || c.identity.is_some() || c.held.is_some() || c.labels.is_some() || c.sql_type.is_some() || c.about.is_some();
         let mut seq = s.serialize_seq(Some(2 + c.not_null as usize + c.dropped as usize + any as usize))?;
         seq.serialize_element(&c.name)?;
         seq.serialize_element(&c.dtype)?;
@@ -257,7 +268,7 @@ impl Serialize for Stored {
 enum Rest {
     NotNull,
     Dropped,
-    Facts(Facts<String, crate::seq::Identity, crate::types::Enum, About>),
+    Facts(Facts<String, Identity, Enum, About>),
 }
 
 impl<'de> Deserialize<'de> for Rest {
@@ -297,7 +308,7 @@ impl<'de> Deserialize<'de> for Col {
                         Rest::Dropped => c.dropped = true,
                         Rest::Facts(f) => {
                             c.id = f.id.unwrap_or_default();
-                            (c.stored, c.default, c.identity, c.held, c.labels, c.about) = (f.stored, f.default, f.identity, f.held, f.labels, f.about.map(Box::new));
+                            (c.stored, c.default, c.identity, c.held, c.labels, c.sql_type, c.about) = (f.stored, f.default, f.identity, f.held, f.labels, f.sql_type, f.about.map(Box::new));
                         }
                     }
                 }
@@ -352,6 +363,7 @@ impl Stored {
                 identity: m.identity.get(s).cloned(),
                 held: m.sql_types.get(s).cloned(),
                 labels: m.enums.get(s).cloned(),
+                sql_type: m.logical_types.get(s).cloned(),
                 about: None,
             })
             .collect();
@@ -386,12 +398,12 @@ impl Stored {
             .enumerate()
             .map(|(i, (s, dtype))| {
                 let (is_dropped, is_not_null) = (dropped.contains(s.as_str()), not_null.contains(s.as_str()));
-                let (default, identity, held, labels) = (m.defaults.remove(&s), m.identity.remove(&s), m.sql_types.remove(&s), m.enums.remove(&s));
+                let (default, identity, held, labels, sql_type) = (m.defaults.remove(&s), m.identity.remove(&s), m.sql_types.remove(&s), m.enums.remove(&s), m.logical_types.remove(&s));
                 let (name, stored) = match m.names.remove(&s) {
                     Some(n) => (n, Some(s)),
                     None => (s, None),
                 };
-                Col { id: i as u32 + 1, name, stored, dtype, dropped: is_dropped, not_null: is_not_null, default, identity, held, labels, about: None }
+                Col { id: i as u32 + 1, name, stored, dtype, sql_type, dropped: is_dropped, not_null: is_not_null, default, identity, held, labels, about: None }
             })
             .collect();
         Stored { columns, order }
@@ -425,6 +437,9 @@ impl Stored {
             }
             if let Some(e) = &c.labels {
                 m.enums.insert(s.clone(), e.clone());
+            }
+            if let Some(t) = &c.sql_type {
+                m.logical_types.insert(s.clone(), t.clone());
             }
         }
         m.shown = self.order.iter().filter_map(|id| self.columns.get(self.place(*id)?)).map(|c| c.stored_name().to_string()).collect();
@@ -497,7 +512,7 @@ impl Stored {
     /// The column stored as `stored`.
     fn at(&mut self, stored: &str) -> Option<&mut Col> { self.columns.iter_mut().find(|c| c.stored_name() == stored) }
 
-    fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<crate::types::Enum>) -> String {
+    fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<Enum>) -> String {
         let taken = |s: &str| self.columns.iter().any(|c| c.stored_name() == s);
         let stored = (1..).map(|i| if i == 1 { name.to_string() } else { format!("{name}~{i}") }).find(|s| !taken(s)).expect("a free name");
         let id = self.next_id();
@@ -583,6 +598,9 @@ impl<'a> Lookup<'a> {
 impl Col {
     /// The name its files and the log hold it under.
     pub fn stored_name(&self) -> &str { self.stored.as_deref().unwrap_or(&self.name) }
+
+    /// Its Arrow type as SQL reads it: `sql_type`, else its files' (`dtype`).
+    pub fn sql_type(&self) -> &str { self.sql_type.as_deref().unwrap_or(&self.dtype) }
 }
 
 /// A table's columns as its entry keeps them in memory (redesign 1b, piece 6b): the list (`Stored`), the one shape the
@@ -684,7 +702,7 @@ impl Serialize for Record {
         macro_rules! unless_empty {
             ($($field:ident),*) => { $(if !f.$field.is_empty() { m.serialize_entry(stringify!($field), &f.$field)?; })* };
         }
-        unless_empty!(names, dropped, shown, not_null, defaults, identity, enums, sql_types);
+        unless_empty!(names, dropped, shown, not_null, defaults, identity, enums, sql_types, logical_types);
         m.end()
     }
 }
@@ -698,9 +716,10 @@ struct Fields<'a> {
     shown: Vec<&'a str>,
     not_null: Vec<&'a str>,
     defaults: BTreeMap<&'a str, &'a str>,
-    identity: BTreeMap<&'a str, &'a crate::seq::Identity>,
-    enums: BTreeMap<&'a str, &'a crate::types::Enum>,
+    identity: BTreeMap<&'a str, &'a Identity>,
+    enums: BTreeMap<&'a str, &'a Enum>,
     sql_types: BTreeMap<&'a str, &'a str>,
+    logical_types: BTreeMap<&'a str, &'a str>,
 }
 
 impl<'a> Fields<'a> {
@@ -728,6 +747,9 @@ impl<'a> Fields<'a> {
             }
             if let Some(e) = &c.labels {
                 f.enums.insert(s, e);
+            }
+            if let Some(t) = &c.sql_type {
+                f.logical_types.insert(s, t);
             }
         }
         f.shown = l.order.iter().filter_map(|id| l.columns.get(l.place(*id)?)).map(Col::stored_name).collect();
@@ -773,18 +795,20 @@ macro_rules! entry {
             #[serde(default)]
             defaults: BTreeMap<String, String>,
             #[serde(default)]
-            identity: BTreeMap<String, crate::seq::Identity>,
+            identity: BTreeMap<String, Identity>,
             #[serde(default)]
-            enums: BTreeMap<String, crate::types::Enum>,
+            enums: BTreeMap<String, Enum>,
             #[serde(default)]
             sql_types: BTreeMap<String, String>,
+            #[serde(default)]
+            logical_types: BTreeMap<String, String>,
             $($(#[$fm])* $field: $ty,)*
         }
 
         impl From<Wire> for $name {
             fn from(w: Wire) -> $name {
                 let (columns, names, dropped, shown, not_null) = (w.columns, w.names, w.dropped, w.shown, w.not_null);
-                let made = Made { columns, names, dropped, shown, not_null, defaults: w.defaults, identity: w.identity, enums: w.enums, sql_types: w.sql_types };
+                let made = Made { columns, names, dropped, shown, not_null, defaults: w.defaults, identity: w.identity, enums: w.enums, sql_types: w.sql_types, logical_types: w.logical_types };
                 $name { record: Record::read(w.list, made), $($field: w.$field,)* }
             }
         }
@@ -882,7 +906,7 @@ pub struct TableMeta {
     /// A GROUP BY view's table whose answers need a last step (avg, stddev, HAVING, …: ADR-055):
     /// its columns are what adds up, and reads give the view's columns from them (`finish.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub finish: Option<crate::finish::Finish>,
+    pub finish: Option<Finish>,
     /// `retention = '7 days'` (ADR-043): how long the table's past is kept (`ddl::KEEP_MS` when not
     /// set): read `AT (…)` (`past.rs`), and undropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -984,6 +1008,9 @@ impl TableMeta {
     /// Is this column (by the names its entry uses) a uuid, held as text (`types.rs`)?
     pub fn uuid(&self, column: &str) -> bool { self.col(column).is_some_and(|c| c.held.as_deref() == Some("uuid")) }
 
+    /// Does SQL read any column as another type than its files hold (`Col::sql_type`)? Then `query::named` reads it so.
+    pub fn relabeled(&self) -> bool { self.list().columns.iter().any(|c| c.sql_type.is_some()) }
+
     /// Has any column been renamed or dropped (ADR-022)? If not, SQL sees `columns` as stored.
     pub fn mapped(&self) -> bool {
         let m = self.record.marked();
@@ -1034,18 +1061,31 @@ impl TableMeta {
 
     /// Where an INSERT without a column list puts each value, as one number: the stored columns in SQL's order (`in_order`).
     /// A move, an added or a dropped column changes it, a rename doesn't. Of the entry as stored. The leader refuses rows a
-    /// node placed by another one (`log::Ack::moved`, `write::record`): one that hadn't seen a move yet filled the old order
-    /// (11-03 audit M9).
-    pub fn placed(&self) -> u64 {
-        self.in_order().flat_map(|c| c.stored_name().bytes().chain([0])).fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+    /// node placed by an order this entry doesn't place them by (`places`; `log::Ack::moved`, `write::record`): one that
+    /// hadn't seen a move yet filled the old order (11-03 audit M9).
+    pub fn placed(&self) -> u64 { self.placings().last().unwrap_or(PLACED_NONE) }
+
+    /// Are values put by the order `placed` (`placed`, of the entry a node had) where this entry puts them? They are when it
+    /// is this entry's order, or its first columns': a node that hadn't seen an ADD COLUMN at the end yet filled the columns
+    /// it knew, and the new one takes its DEFAULT, as here. A move, a dropped column or one added before the others changes
+    /// the first columns, so they aren't (11-07 audit L3).
+    pub fn places(&self, placed: u64) -> bool { self.placings().any(|p| p == placed) }
+
+    /// `placed` of the order's first column, of its first two, and on to all of them (FNV-1a over the stored names, each
+    /// ended by a 0).
+    fn placings(&self) -> impl Iterator<Item = u64> + '_ {
+        self.in_order().scan(PLACED_NONE, |h, c| {
+            *h = c.stored_name().bytes().chain([0]).fold(*h, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+            Some(*h)
+        })
     }
 
     /// SQL's columns (`logical_columns`) in SQL's order (`in_order`): what `SELECT *` and RETURNING * answer.
-    pub fn sql_columns(&self) -> Vec<(String, String)> { self.in_order().map(|c| (c.name.clone(), c.dtype.clone())).collect() }
+    pub fn sql_columns(&self) -> Vec<(String, String)> { self.in_order().map(|c| (c.name.clone(), c.sql_type().to_string())).collect() }
 
     /// What `SELECT *` lists: `sql_columns` without a keyed table's delete markers (`marker`). What SHOW CREATE writes and
     /// what a view's `*` reads (`ddl::keep_readers`).
-    pub fn star(&self) -> Vec<(String, String)> { self.star_cols().map(|c| (c.name.clone(), c.dtype.clone())).collect() }
+    pub fn star(&self) -> Vec<(String, String)> { self.star_cols().map(|c| (c.name.clone(), c.sql_type().to_string())).collect() }
 
     /// `star`'s columns as the list has them, each with its facts (`objects::table_sql`).
     pub fn star_cols(&self) -> impl Iterator<Item = &Col> { self.in_order().filter(|c| !self.marker(&c.name)) }
@@ -1117,7 +1157,7 @@ impl TableMeta {
     /// ADD COLUMN `name`: stored under its name, or `name~2`, `name~3`… when an older column (renamed or dropped) is
     /// stored under that, since files are never rewritten. Last in stored order, and in SQL's unless `set_order` puts it
     /// elsewhere. Returns its stored name.
-    pub fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<crate::types::Enum>) -> String { self.edit(|f| f.add_column(name, dtype, held, labels)) }
+    pub fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<Enum>) -> String { self.edit(|f| f.add_column(name, dtype, held, labels)) }
 
     /// RENAME COLUMN: the column stored as `stored` is `to` in SQL from now on (its files keep the stored name).
     pub fn rename_column(&mut self, stored: &str, to: &str) { self.edit(|f| f.rename_column(stored, to)) }
@@ -1144,7 +1184,7 @@ impl TableMeta {
 
     /// An enum type changed (ALTER TYPE … ADD VALUE or RENAME, `types.rs`): every column of this table of that type
     /// takes it, in the same commit.
-    pub fn edit_enums(&mut self, of: &str, mut g: impl FnMut(&mut crate::types::Enum)) {
+    pub fn edit_enums(&mut self, of: &str, mut g: impl FnMut(&mut Enum)) {
         self.edit(|l| l.columns.iter_mut().filter_map(|c| c.labels.as_mut()).filter(|e| e.of.as_deref() == Some(of)).for_each(&mut g))
     }
 
@@ -1210,7 +1250,7 @@ impl TableMeta {
                 t.merge = BTreeMap::new();
                 t
             }
-            None if self.list().order.is_empty() => self.logical(),
+            None if self.list().order.is_empty() && !self.relabeled() => self.logical(),
             None => {
                 let mut t = self.logical();
                 let list = Stored { order: vec![], ..t.described_as(&self.sql_columns()) };
@@ -1241,6 +1281,7 @@ impl TableMeta {
                     name: name.clone(),
                     stored: None,
                     dtype: dtype.clone(),
+                    sql_type: None, // (`dtype` is SQL's already: `sql_columns`)
                     dropped: of.is_some_and(|c| c.dropped),
                     not_null: of.is_some_and(|c| c.not_null),
                     default: facts.and_then(|c| c.default.clone()),
@@ -1493,8 +1534,8 @@ fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
             return None;
         }
     };
-    let bytes = match crate::env::parse::<u64>("PONDRA_CACHE_GB") {
-        Some(gb) => gb << 30,
+    let bytes = match crate::env::gib("PONDRA_CACHE_GB") {
+        Some(bytes) => bytes as u64,
         None => space(&dir).map_or(20 << 30, |(free, _)| (free / 4).min(20 << 30)),
     };
     let dir = dir.join(url.trim_start_matches("s3://").replace(['/', ':', '\\'], "_")); // one folder per lake
@@ -2414,6 +2455,7 @@ impl Lake {
         }
         ledger.charge("facts", Arc::downgrade(&crate::query::facts_kept())); // (the node's, charged once whatever lakes it opens)
         ledger.charge("manifests", Arc::downgrade(&crate::manifest::kept())); // (the node's too: see `node::start_app` for the rest)
+        ledger.charge("files", Arc::downgrade(&crate::cache::outside())); // (the process's, of files outside the lakes)
         crate::oom::wake();
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
@@ -2707,6 +2749,7 @@ impl Lake {
             caches.push(("ranges", ranges.clone())); // (a lake on a bucket: a local or in-memory one reads its store directly)
         }
         caches.extend([("log", self.tail.clone() as _), ("catalog_blocks", self.cat.blocks()), ("footers", self.kept.0.clone() as _), ("statistics", self.kept.1.clone() as _)]);
+        caches.extend(self.cat.kept_parsed());
         caches
     }
 
@@ -2994,6 +3037,15 @@ impl<T> Parsed<T> {
     }
 }
 
+/// The entries kept parsed give memory back when the node needs it, the least recently used first: each is parsed again.
+impl<T: Send + Sync> crate::ledger::Charged for Mutex<Parsed<T>> {
+    fn held(&self) -> usize { self.lock().unwrap_or_else(std::sync::PoisonError::into_inner).by_key.bytes() }
+
+    fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(self, |p| &mut p.by_key, bytes) }
+
+    fn gives_back(&self) -> bool { true }
+}
+
 /// Whether two buffers hold the same bytes. A buffer held by `Parsed` is never freed, and `Bytes` never
 /// change, so the same start and length is the same content; any other pair is compared, which is cheap
 /// next to a parse.
@@ -3121,8 +3173,8 @@ pub struct Catalog {
     follows: bool,                // follower / read-only node that gets the commit stream
     mirror: AtomicBool,           // the overlay holds the whole catalog (but inline data): read only it
     loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
-    metas: Mutex<Parsed<TableMeta>>, // tables' entries as parsed (`parsed`)
-    segs: Mutex<Parsed<Segment>>,    // log segments' entries as parsed (`segments`)
+    metas: Arc<Mutex<Parsed<TableMeta>>>, // tables' entries as parsed (`parsed`)
+    segs: Arc<Mutex<Parsed<Segment>>>,    // log segments' entries as parsed (`segments`)
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
     closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
 }
@@ -3396,12 +3448,16 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw)), segs: Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge)), frozen: Default::default(), closing: Default::default() }
+        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default() }
     }
 
     /// What the catalog's block caches hold, in bytes.
     /// Its store's block caches (`/metrics`' `catalog_blocks`), which keep what they hold at their own limits.
     pub fn blocks(&self) -> Arc<dyn crate::ledger::Charged> { self.kv.clone() }
+
+    /// The entries kept parsed, tables' and log segments', as the node's line counts them (`cache_bytes{cache=
+    /// "catalog_entries"}`, `"catalog_segments"`; 11-07 audit M4).
+    pub fn kept_parsed(&self) -> [(&'static str, Arc<dyn crate::ledger::Charged>); 2] { [("catalog_entries", self.metas.clone() as _), ("catalog_segments", self.segs.clone() as _)] }
 
     /// The recent frames plus a receiver for every frame from now on: the leader's own stream, or a follower's, which
     /// holds the leader's frames as it relayed them (`relay`). Either serves `GET /cluster/log` the same way.
@@ -4162,6 +4218,18 @@ mod tests {
         assert_eq!(m.placed(), renamed.placed(), "a rename puts nothing elsewhere");
         assert_ne!(m.placed(), added.placed(), "a column more");
         assert_eq!(m.placed(), dropped.placed(), "a dropped column isn't filled");
+        // (11-07 audit L3: values a node put by an order that is the first columns of the table's are where they go)
+        assert!(m.places(m.placed()) && moved.places(moved.placed()), "its own order");
+        assert!(added.places(m.placed()), "the order before a column was added at the end: its first columns");
+        assert!(!m.places(added.placed()), "an order with a column more");
+        assert!(!moved.places(m.placed()) && !m.places(moved.placed()), "a move");
+        let mut first = m.clone();
+        let c = first.add_column("c", "Int32", None, None);
+        first.set_order(vec![c, "a".into(), "b".into()]);
+        assert!(!first.places(m.placed()), "a column added before the others");
+        let mut gone = added.clone();
+        gone.drop_column("b");
+        assert!(!gone.places(m.placed()) && !gone.places(added.placed()), "a column dropped from among them");
     }
 
     #[test]
@@ -4525,7 +4593,7 @@ mod tests {
         let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
         let ledger = lake.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
         let names: Vec<&str> = lake.caches().iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, ["hot", "lookups", "tails", "log", "catalog_blocks", "footers", "statistics"], "a local lake has no cache of a bucket's ranges");
+        assert_eq!(names, ["hot", "lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments"], "a local lake has no cache of a bucket's ranges");
         let _ = lake.tails.lock().unwrap().put("t".into(), vec![], 4096);
         // (other tests' lakes may be charged to the same line meanwhile: what this lake holds is the least it reads)
         assert!(ledger.held() >= 4096, "the line counts the tails");
@@ -4539,7 +4607,7 @@ mod tests {
         // (`/metrics` reads the line's list by name: the node's planning facts and manifests are on it beside the lake's caches;
         // a node's start charges its kept pages and outside tables' logs and manifests, `node::start_app`)
         let metrics: Vec<&str> = lake.cached_bytes().iter().map(|(name, _)| *name).collect();
-        assert!(["lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "facts", "manifests"].iter().all(|n| metrics.contains(n)), "{metrics:?}");
+        assert!(["lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments", "facts", "manifests", "files"].iter().all(|n| metrics.contains(n)), "{metrics:?}");
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
@@ -4741,7 +4809,7 @@ mod tests {
     fn with_rules() -> TableMeta {
         let col = |c: &str, t: &str| (c.to_string(), t.to_string());
         let set = |v: &[(&str, &str)]| v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<String, String>>();
-        let id = |always: bool, seq: &str| crate::seq::Identity { always, declared: vec![], sequence: seq.into() };
+        let id = |always: bool, seq: &str| Identity { always, declared: vec![], sequence: seq.into() };
         let unique = |name: &str, c: &str, enforced: bool| crate::constraints::Constraint { name: name.into(), kind: crate::constraints::Kind::Unique, columns: vec![c.into()], references: None, enforced };
         let mut t = TableMeta::made(Made {
             columns: vec![col("id", "Int64"), col("seq_no", "Int64"), col("c_code", "Utf8"), col("c_status", "Utf8"), col("owner", "Utf8"), col("total", "Int64"), col("doc", "Utf8"), col("gone", "Utf8"), col("_deleted", "Boolean")],
@@ -4750,7 +4818,7 @@ mod tests {
             not_null: vec!["id".into(), "c_code".into(), "gone".into()],
             defaults: set(&[("id", "nextval('orders_id_seq')"), ("seq_no", "nextval('orders_seq_no_seq')"), ("total", "0"), ("gone", "'x'")]),
             identity: [("id".to_string(), id(false, "orders_id_seq")), ("seq_no".to_string(), id(true, "orders_seq_no_seq"))].into(),
-            enums: [("c_status".to_string(), crate::types::Enum { of: Some("order_status".into()), labels: vec!["open".into(), "shipped".into()] })].into(),
+            enums: [("c_status".to_string(), Enum { of: Some("order_status".into()), labels: vec!["open".into(), "shipped".into()] })].into(),
             sql_types: set(&[("owner", "uuid"), ("c_code", "varchar(3)"), ("doc", "json"), ("gone", "json")]),
             ..Default::default()
         });
@@ -4975,7 +5043,7 @@ mod tests {
         macro_rules! unless_empty {
             ($($field:ident),*) => { $(if !f.$field.is_empty() { parts.push(format!("\"{}\":{}", stringify!($field), serde_json::to_string(&f.$field).unwrap())); })* };
         }
-        unless_empty!(names, dropped, shown, not_null, defaults, identity, enums, sql_types);
+        unless_empty!(names, dropped, shown, not_null, defaults, identity, enums, sql_types, logical_types);
         format!("{{{}}}", parts.join(","))
     }
 
@@ -4998,7 +5066,7 @@ mod tests {
             }
             let mut v = t.clone();
             let answers: Vec<(String, String)> = t.sql_columns().into_iter().rev().chain([("x".into(), "Utf8".into())]).collect();
-            v.finish = Some(crate::finish::Finish { sql: String::new(), columns: answers.clone() });
+            v.finish = Some(Finish { sql: String::new(), columns: answers.clone() });
             let d = v.described();
             assert_eq!(d.list(), &was(&v, answers, true), "{:?}", t.list());
             assert!(d.merge.is_empty());
@@ -5180,6 +5248,37 @@ mod tests {
         assert_eq!((m.col("e").map(|c| c.id), m.list().order.clone(), m.sql_order()), (Some(5), vec![5, 3], vec!["e".to_string(), "a".into(), "b".into(), "c".into()]));
     }
 
+    /// A column SQL reads as another type than its files hold (a mapped Delta table's struct: `Col::sql_type`) keeps it in
+    /// either shape, written only where it has one; SQL's columns and the description give SQL's type, the files' stays.
+    #[test]
+    fn a_columns_sql_type_is_kept_in_either_shape() {
+        let (files, sql) = (r#"Struct("col-9": Utf8)"#, r#"Struct("city": Utf8)"#);
+        let made = Made {
+            columns: vec![("col-1".into(), "Int64".into()), ("col-2".into(), files.into())],
+            names: [("col-1", "id"), ("col-2", "addr")].iter().map(|(s, n)| (s.to_string(), n.to_string())).collect(),
+            logical_types: [("col-2".to_string(), sql.to_string())].into(),
+            ..Default::default()
+        };
+        let t = TableMeta::made(made.clone());
+        assert_eq!((t.col("col-2").map(|c| (c.dtype.as_str(), c.sql_type())), t.relabeled()), (Some((files, sql)), true));
+        let (five, six) = (serde_json::to_value(&t).unwrap(), serde_json::to_value(t.clone().as_list()).unwrap());
+        assert_eq!(five["logical_types"], serde_json::json!({"col-2": sql}), "{five}");
+        assert_eq!(six["list"][0][1][2]["sql_type"], serde_json::json!(sql), "{six}");
+        for raw in [five, six] {
+            let back: TableMeta = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(back.list(), t.list(), "{raw}");
+        }
+        assert_eq!(t.fields(), made, "the fields by stored name again");
+        let want = vec![("id".to_string(), "Int64".to_string()), ("addr".into(), sql.into())];
+        assert_eq!((t.sql_columns(), t.star()), (want.clone(), want.clone()));
+        let described: Vec<(String, String)> = t.described().columns().map(|(c, ty)| (c.to_string(), ty.to_string())).collect();
+        assert_eq!((described, t.described().relabeled()), (want, false));
+        assert_eq!(t.columns().map(|(_, ty)| ty).collect::<Vec<_>>(), ["Int64", files], "the files' types, as a scan reads them");
+        let plain = TableMeta::made(Made { columns: vec![("a".into(), "Int64".into())], ..Default::default() });
+        let (five, six) = (serde_json::to_string(&plain).unwrap(), serde_json::to_string(&plain.clone().as_list()).unwrap());
+        assert!(!five.contains("logical_types") && !six.contains("sql_type") && !plain.relabeled(), "{five} {six}");
+    }
+
     /// A table's replaced rows (`sys::deleted`) take its columns as stored, ids, names and drop marks kept, and none of
     /// its facts or its order: no write is checked there, and nothing reads it by SQL's order.
     #[test]
@@ -5229,7 +5328,7 @@ mod tests {
             seed ^= seed << 17;
             seed % n.max(1)
         };
-        let mood = || crate::types::Enum { of: Some("mood".into()), labels: vec!["sad".into(), "ok".into()] };
+        let mood = || Enum { of: Some("mood".into()), labels: vec!["sad".into(), "ok".into()] };
         for round in 0..500 {
             // (`a` edits its list; `r` is the reference, the fields edited as 6a did; `c` is an entry read as its list)
             let (mut a, mut r, mut c) = (TableMeta::default(), Made::default(), TableMeta::default().as_list());
@@ -5423,6 +5522,7 @@ mod tests {
             identity: field(raw, "identity"),
             enums: field(raw, "enums"),
             sql_types: field(raw, "sql_types"),
+            logical_types: field(raw, "logical_types"),
         };
         assert_eq!(t.list(), &Stored::of(&f), "{at}: the list its fields make");
         let empty = |v: Option<&serde_json::Value>| v.is_none_or(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty) || v.as_object().is_some_and(|o| o.is_empty()));

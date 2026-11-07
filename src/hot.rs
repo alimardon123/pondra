@@ -72,6 +72,7 @@ struct State {
     cols: HashMap<(String, String), Col>, // (file, column) -> its arrays, a batch each
     rows: BTreeMap<String, Arc<Vec<usize>>>, // file -> rows per batch (the same for all its columns)
     used: usize,
+    loading: usize,                  // what the decode running now holds, about: its footer's estimate (`load`)
     busy: HashSet<String>,           // files being loaded
     once: std::collections::VecDeque<String>, // files a scan read once (the next read loads them)
     need: HashMap<String, usize>,    // files that didn't fit: the bytes they decode to, so no read decodes them again until that much is free
@@ -121,6 +122,8 @@ impl crate::ledger::Charged for Hot {
 
     fn give_back(&self, bytes: usize) -> usize { self.trim(bytes) }
 
+    fn gives_back(&self) -> bool { true }
+
     fn inside(&self) -> bool { !self.own }
 }
 
@@ -140,15 +143,15 @@ impl Hot {
 
     pub fn on(&self) -> bool { self.max > 0 }
 
-    /// Bytes held, the most it may hold, and files being loaded (or waiting to be).
+    /// Bytes held (with the estimate of a decode running now), the most it may hold, and files being loaded (or waiting to be).
     pub fn usage(&self) -> (usize, usize, usize) {
         let s = self.state.lock().unwrap();
-        (s.used, self.max, s.busy.len())
+        (s.used + s.loading, self.max, s.busy.len())
     }
 
     /// Drop the least recently read columns until `bytes` are freed, and say how many were (the one
     /// watch, `oom::start`, asks for it when the node's memory passes its trim line, and a query's grow
-    /// past the whole line, `ledger::Ledger`).
+    /// past the whole line, `ledger::Ledger`). A column a query holds stays (`held_elsewhere`).
     pub(crate) fn trim(&self, bytes: usize) -> usize {
         // (never waiting on a reader: a scan holding the lock gives back nothing now, and the columns go once it's let go)
         let mut s = match self.state.try_lock() {
@@ -162,6 +165,11 @@ impl Hot {
         for (_, k) in oldest {
             if freed >= bytes {
                 break;
+            }
+            // (letting go of a column a running scan holds frees nothing, and a grow admitted on its bytes passed the line
+            // while the next read decoded it again: it stays, and isn't counted; 11-07 audit M3)
+            if s.cols.get(&k).is_some_and(|c| held_elsewhere(&c.arrays)) {
+                continue;
             }
             if let Some(c) = s.cols.remove(&k) {
                 (freed, s.used) = (freed + c.bytes, s.used.saturating_sub(c.bytes));
@@ -253,11 +261,31 @@ impl Hot {
             let _slot = hot.slot.acquire().await;
             // (the room now, not when the scan asked: its query is over, and the next may hold what it left)
             let room = hot.room_for(&lake);
+            // The decode holds its estimate on the line while it runs (11-07 audit L6): what it reads and keeps is in no
+            // cache yet, and a query's grow meanwhile goes by what the caches hold (`ledger::Ledger::cached`).
+            let line = lake.ledger().filter(|_| !hot.own).cloned();
+            let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let fits = {
-                let hot = hot.clone();
-                move |estimate: usize| hot.state.lock().unwrap().room(estimate, room)
+                let (hot, line, held) = (hot.clone(), line.clone(), held.clone());
+                move |estimate: usize| {
+                    let mut s = hot.state.lock().unwrap();
+                    let fits = s.room(estimate, room);
+                    if fits {
+                        s.loading += estimate;
+                        held.store(estimate, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(line) = &line {
+                            line.cache_grew(estimate);
+                        }
+                    }
+                    fits
+                }
             };
             let decoded = decode(&lake, &file, &fields, deletes, fits).await;
+            let estimate = held.load(std::sync::atomic::Ordering::Relaxed);
+            hot.state.lock().unwrap().loading -= estimate; // (let go of before the room is read, as `room_for` reads it)
+            if let Some(line) = &line {
+                line.cache_shrank(estimate);
+            }
             let room = hot.room_for(&lake);
             let mut s = hot.state.lock().unwrap();
             s.busy.remove(&key);
@@ -282,6 +310,9 @@ impl Hot {
                 s.cols.insert((key.clone(), f.name().clone()), Col { arrays: Arc::new(arrays), ranges, bytes, read: Instant::now() });
             }
             drop(s);
+            if let Some(line) = &line {
+                line.cache_grew(bytes); // (the columns are the cache's now, until the watch's next look counts them)
+            }
             crate::oom::wake(); // (the columns are in: the watch may need to give some back)
         });
         true
@@ -420,6 +451,7 @@ impl State {
 
     /// Is there room for `bytes` more, after dropping columns unread for a minute (oldest first)?
     fn room(&mut self, bytes: usize, max: usize) -> bool {
+        let max = max.saturating_sub(self.loading); // (a decode running holds its estimate: `load`)
         if self.used + bytes <= max {
             return true;
         }
@@ -438,6 +470,10 @@ impl State {
         self.used + bytes <= max
     }
 }
+
+/// Whether a column's arrays are held outside the cache too: by a scan's `Held`, or a batch of them by a query. The
+/// cache letting go of them frees nothing then.
+fn held_elsewhere(arrays: &Arc<Vec<ArrayRef>>) -> bool { Arc::strong_count(arrays) > 1 || arrays.iter().any(|a| Arc::strong_count(a) > 1) }
 
 /// Memory held by a column's arrays: each buffer once (string views of one page share its buffer).
 fn size(arrays: &[ArrayRef]) -> usize {
@@ -1292,6 +1328,15 @@ mod tests {
         }
     }
 
+    /// A decode running holds its estimate (11-07 audit L6): another file's load has only the room left beside it.
+    #[test]
+    fn a_running_decode_holds_its_estimate() {
+        let mut s = State { loading: 60, ..Default::default() };
+        assert!(!s.room(50, 100) && s.room(40, 100));
+        s.loading = 0;
+        assert!(s.room(100, 100), "once it's over, the room is the cache's again");
+    }
+
     /// A file that didn't fit was never held, so a commit that replaced it lets go of what was noted for it all the same
     /// (11-03 audit M3: in a lake on disk such entries stayed for the node's life), with or without its deleted rows.
     #[test]
@@ -1332,6 +1377,31 @@ mod tests {
         let held_fields = hot.columns("t", &schema);
         assert_eq!(names_and_types(held_fields), vec![("i".to_string(), DataType::Int64), ("s".to_string(), DataType::Utf8View)]);
         assert!(hot.columns("t2", &schema).is_empty());
+    }
+
+    /// A column a running scan holds isn't freed by the cache letting go of it, so a take-back leaves it and doesn't count
+    /// it (11-07 audit M3: a query's grow was admitted on the bytes of its own table's columns). The other file's column
+    /// goes; a batch of the held one that a query still has holds it too; then it goes.
+    #[test]
+    fn a_take_back_leaves_the_columns_a_query_holds() {
+        let hot = Hot { max: 1 << 30, own: false, memory: false, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
+        let fields: Vec<FieldRef> = vec![Arc::new(Field::new("i", DataType::Int64, true))];
+        for (file, from) in [("data/t/a.parquet", 0i64), ("data/t/b.parquet", 10_000)] {
+            hot.put(file, &fields, vec![vec![Arc::new(Int64Array::from_iter_values(from..from + 10_000)) as ArrayRef]], 1 << 30);
+        }
+        let schema = Arc::new(Schema::new(vec![fields[0].as_ref().clone()]));
+        let each = hot.usage().0 / 2;
+        assert!(each > 0);
+        let held = hot.get("data/t/a.parquet", &schema).expect("held"); // (a scan of a, running)
+        assert_eq!(hot.trim(usize::MAX), each, "b's column alone");
+        assert_eq!(hot.usage().0, each);
+        assert!(hot.get("data/t/a.parquet", &schema).is_some(), "a's stays");
+        let batch = held.batch(&schema, &[0], 1).unwrap();
+        drop(held);
+        assert_eq!(hot.trim(usize::MAX), 0, "a batch of it a query still has");
+        drop(batch);
+        assert_eq!(hot.trim(usize::MAX), each, "then a's goes too");
+        assert_eq!(hot.usage().0, 0);
     }
 
     /// A file's footer tells about what its columns decode to before any page is: no less than they hold once decoded,

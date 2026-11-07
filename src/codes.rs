@@ -31,12 +31,36 @@ pub fn words(e: &anyhow::Error) -> String {
         {
             c = inner.to_string();
         }
+        let c = parser_said(&c).unwrap_or(c);
         if !out.contains(c.trim()) {
             out += if out.is_empty() { "" } else { ": " };
             out += &c;
         }
     }
     crate::ext_names::readable(&SPILL_SAYS.iter().fold(out, |out, (from, to)| out.replace(from, to))) // (DataFusion's words for spilling, in the setting Pondra asks for; files as SQL named them)
+}
+
+/// The SQL parser's error, which DataFusion says twice (`SQL error: ParserError("…")`, then its source's `sql parser
+/// error: …`), said once in Postgres's words: `syntax error: …` (42601, a tokenizer's error too). None: not the parser's.
+fn parser_said(c: &str) -> Option<String> {
+    if let Some(rest) = c.strip_prefix("sql parser error: ") {
+        return Some(format!("syntax error: {rest}"));
+    }
+    let quoted = ["SQL error: ParserError(\"", "SQL error: TokenizerError(\""].iter().find_map(|p| c.strip_prefix(p))?.strip_suffix("\")")?;
+    // (its words as Rust's Debug quotes them: `\"`, `\\`, `\n` and the like back to what they stand for)
+    let (mut said, mut chars) = (String::new(), quoted.chars());
+    while let Some(ch) = chars.next() {
+        said.push(match (ch, ch == '\\') {
+            (_, true) => match chars.next()? {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                other => other,
+            },
+            (ch, false) => ch,
+        });
+    }
+    Some(format!("syntax error: {said}"))
 }
 
 /// An error in words for whoever sent the statement (`words`), a Python routine's quoted lines cut when the caller
@@ -175,7 +199,7 @@ fn by_words(text: &str) -> &'static str {
         _ if nan_into_decimal(&t) => "0A000", // feature_not_supported (NaN into a decimal: the planner's own cast, as `casts::into` refuses it)
         _ if has("error parsing timestamp from") => "22007", // invalid_datetime_format (to_date, to_timestamp and their other names: text their format doesn't read)
         _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") || has("invalid input value for enum") => "22P02", // invalid_text_representation
-        _ if has("can't reach the bucket") || has("catching up with its leader") => "57P03",   // cannot_connect_now (a leader cut off, a node just started: ask another node)
+        _ if has("can't reach the bucket") || has("catching up with its leader") || has("no longer leads") => "57P03", // cannot_connect_now (a leader cut off, a node just started, a follower's leader gone: ask again)
         _ if has("a blob: url is read only by the tab that made it") => "58P01",               // undefined_file (a tab's file revoked, or another tab's: `web/`'s words, before "read only" could match)
         _ if has("error sending request") => "58030",                                           // io_error (the bucket or another node didn't answer: try again)
         _ if has("deadlock detected") => "40P01",                                               // deadlock_detected (`locks.rs`)
@@ -354,11 +378,24 @@ mod tests {
     }
 
     #[test]
+    fn a_parse_error_is_said_once() {
+        use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+        let parsed = Parser::parse_sql(&GenericDialect {}, "SELEC 1").unwrap_err();
+        let e = anyhow::Error::from(datafusion::error::DataFusionError::SQL(Box::new(parsed), None));
+        assert_eq!(super::words(&e), "syntax error: Expected: an SQL statement, found: SELEC at Line: 1, Column: 1");
+        assert_eq!(super::of(&e), "42601");
+        let quoted = Parser::parse_sql(&GenericDialect {}, "SELECT \"a\" FROM").unwrap_err();
+        let e = anyhow::Error::from(datafusion::error::DataFusionError::SQL(Box::new(quoted), None));
+        assert!(!super::words(&e).contains("\\") && super::words(&e).matches("syntax error").count() == 1, "{}", super::words(&e));
+    }
+
+    #[test]
     fn known_by_words() {
         let of = |s: &str| super::of(&anyhow::anyhow!("{s}"));
         assert_eq!(of("Error during planning: table 'datafusion.public.nope' not found"), "42P01");
         assert_eq!(of("Schema error: No field named nope. Valid fields are t.a."), "42703");
         assert_eq!(of("SQL error: ParserError(\"Expected: an SQL statement, found: SELEC at Line: 1, Column: 1\")"), "42601");
+        assert_eq!(of("SQL error: TokenizerError(\"Unterminated string literal at Line: 1, Column: 8\")"), "42601");
         assert_eq!(of("Inconsistent data length across values list: got 1 values in row 2 but expected 2"), "42601");
         assert_eq!(of("Arrow error: Divide by zero error"), "22012");
         assert_eq!(of("Execution error: Error parsing timestamp from 'not a date' using format '%Y-%m-%d': input contains invalid characters"), "22007"); // (to_date, PARSE_DATE, STR_TO_DATE)
