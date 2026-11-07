@@ -1798,9 +1798,10 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     }
     let stmt = match stmt {
         Stmt::InsertInto(t, names, query) => match crate::ext::outside_target(&app.lake, &t).await? {
-            // (another engine's table: the columns the list leaves out are NULL, as its format keeps no DEFAULT; a NOT NULL one
-            // is refused by its writer, `write_outside::Fit`)
-            Some(target) => Stmt::Insert(t.clone(), crate::rules::rows::rows_for(&t, &crate::write_outside::columns(&app.lake, &target).await?, &names, &query, &|_| None)?),
+            // (another engine's table: its writer places the list in the schema it writes by, `write_outside::Rows`; a guest's,
+            // sent through the inbox, is placed here: the columns the list leaves out are NULL, as its format keeps no DEFAULT)
+            Some(target) if inbox => Stmt::Insert(t.clone(), crate::rules::rows::rows_for(&t, &crate::write_outside::columns(&app.lake, &target).await?, &names, &query, &|_| None)?),
+            Some(_) => Stmt::InsertInto(t, names, query),
             None => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
         },
         Stmt::Insert(t, query) => {
@@ -1836,10 +1837,12 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     // Another engine's table, attached (`ATTACH … (TYPE delta | iceberg)`): its next version,
     // written from here.
     if let Some(target) = crate::ext::outside_target(lake, &stmt.table()).await? {
-        return match &stmt {
-            Stmt::Insert(_, query) => crate::write_outside::insert(lake, &target, query, &job).await,
+        let (names, query) = match &stmt {
+            Stmt::Insert(_, query) => (None, query),
+            Stmt::InsertInto(_, names, query) => (Some(names.clone()), query),
             _ => bail!("{}: another engine's table takes INSERTs from Pondra (UPDATE, DELETE and MERGE: not yet)", stmt.table()),
         };
+        return crate::write_outside::insert(lake, &target, &stmt.table(), names, query, &job).await;
     }
     // (an UPDATE's, DELETE's or MERGE's target reaches here named as its files already: it read
     // "no table" with a quoted path)

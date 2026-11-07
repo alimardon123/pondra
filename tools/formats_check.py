@@ -524,6 +524,17 @@ def inserts(con, root, expected, spark, port):
         ok = got("SELECT * FROM rest_w.db.sales") == theirs and len(theirs) == n + 20
         out["insert:rest"] = ok
         print(json.dumps({"table": "INSERT into a REST catalog's table, committed by the catalog, read back by PyIceberg", "equal": ok, **({} if ok else {"n": n, "theirs": len(theirs)})}), flush=True)
+        # An INSERT that names its columns reads the table once: its values are placed by the schema its rows are written by.
+        import urllib.request
+        loads = lambda: json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/_stats").read())["loads"]
+        before = loads()
+        con.sql("INSERT INTO rest_w.db.sales (region, id) VALUES ('named', 20001)")
+        once = loads() - before
+        table = SqlCatalog("local", uri=f"sqlite:///{root}/pyiceberg/catalog.db", warehouse=f"file://{root}/pyiceberg").load_table("db.sales")
+        row = [r for r in table.scan().to_arrow().to_pylist() if r["id"] == 20001]
+        ok = once == 1 and len(row) == 1 and row[0]["region"] == "named" and row[0]["total"] is None and row[0]["day"] is None
+        out["insert:rest_named"] = ok
+        print(json.dumps({"table": "INSERT INTO a REST catalog's table (region, id): its table loaded once, each value in the column it names", "equal": ok, **({} if ok else {"loads": once, "row": [{k: plain(v) for k, v in r.items()} for r in row]})}), flush=True)
     finally:
         server.kill()
     return out
