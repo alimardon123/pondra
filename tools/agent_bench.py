@@ -5,8 +5,8 @@
   agent_bench.py run    [--set a|b] [--bin PATH | --port N] [--model M] [--effort E] [--runs 3] [--jobs 6] [--out DIR]
   agent_bench.py replay FILE [--bin PATH | --port N]
   agent_bench.py serve  [--set a|b] [--bin PATH] [--model M] [--engines ...] [--out DIR]   # helper agents, no API key
-  agent_bench.py begin  --at PORT LANE TASK [RUN]  |  tool --at PORT TRY TOOL [VALUE]  |  finish --at PORT TRY [--tokens N
-                        --tool-uses N --seconds S]  |  stop --at PORT
+  agent_bench.py --at PORT begin LANE TASK [RUN]  |  --at PORT tool TRY TOOL [VALUE]  |  --at PORT finish TRY [--tokens N
+                        --tool-uses N --seconds S]  |  --at PORT stop      # (options first: Python 3.11's argparse)
 
 An agent is given a question in plain words and a few tools, and its answer is the rows of the query it gives. The same
 tasks, data, model and tools run on Pondra, DuckDB and Postgres, so the numbers say what Pondra adds.
@@ -654,7 +654,7 @@ class Door:
                                                          **({"id": 1} if not method.startswith("notifications/") else {})}).encode()
         req = urllib.request.Request(self.url, body, {"content-type": "application/json", "accept": "application/json, text/event-stream",
                                                       **({"mcp-session-id": self.sid} if self.sid else {})}, method=verb)
-        with urllib.request.urlopen(req, timeout=QUERY_S * 2) as r:
+        with LOOPBACK.open(req, timeout=QUERY_S * 2) as r:
             self.sid = r.headers.get("mcp-session-id") or self.sid
             raw = r.read()
         if not raw:
@@ -1146,14 +1146,25 @@ def answering(h, out, done):
     return http.server.ThreadingHTTPServer(("127.0.0.1", 0), Door)
 
 
+LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # (127.0.0.1 never goes through a proxy)
+
+
+def helper_cmd(at):
+    """A helper's one command: this Python and this file, the door's port, then `tool`. Options go before the mode,
+    since Python 3.11's argparse refuses positionals given after an option once `args` has matched."""
+    return f"{sys.executable} {os.path.abspath(__file__)} --at {at} tool"
+
+
 def asked(at, path, body):
     """One call to a serving run's helpers' door."""
     req = urllib.request.Request(f"http://127.0.0.1:{at}{path}", json.dumps(body).encode(), {"content-type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=QUERY_S * 3) as r:
+        with LOOPBACK.open(req, timeout=QUERY_S * 3) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as err:
         return json.loads(err.read() or b"{}") or {"error": str(err)}
+    except (urllib.error.URLError, OSError) as err:
+        return {"error": f"the helpers' door at {at}: {getattr(err, 'reason', err)}"}
 
 
 def serve(a):
@@ -1170,7 +1181,7 @@ def serve(a):
         h = Helpers(a.set, a.model, engines, [n for n in names if n.split("+")[0] in by], a.out, None)
         server = answering(h, out, done)
         at = server.server_address[1]
-        h.cmd = f"python3 {os.path.abspath(__file__)} tool --at {at}"
+        h.cmd = helper_cmd(at)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         print(json.dumps({"at": at, "lanes": h.lanes, "tasks": list(h.todo)}), flush=True)
         done.wait()
@@ -1353,7 +1364,7 @@ def helper_checks(engines):
     done, out = threading.Event(), {"set": "a", "engines": {}, "helpers": True}
     server = answering(h, out, done)
     at = server.server_address[1]
-    h.cmd = f"python3 {os.path.abspath(__file__)} tool --at {at}"
+    h.cmd = helper_cmd(at)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         t = tasks("a")[0]
@@ -1361,7 +1372,8 @@ def helper_checks(engines):
             door = lane.endswith("+mcp")
             b = asked(at, "/begin", {"lane": lane, "task": t["id"]})
             name = b["try"]
-            cli = subprocess.run(h.cmd.split() + [name, "list_tables"], capture_output=True, text=True, timeout=60).stdout
+            ran = subprocess.run(h.cmd.split() + [name, "list_tables"], capture_output=True, text=True, timeout=60)
+            cli = ran.stdout
             bare = asked(at, "/tool", {"try": name, "tool": "query" if door else "describe"})
             bad = asked(at, "/tool", {"try": name, "tool": "query" if door else "sql", "value": "SELEC 1"})
             ans = asked(at, "/tool", {"try": name, "tool": "answer", "value": gold_sql(t, lane.split("+")[0])})
@@ -1380,7 +1392,8 @@ def helper_checks(engines):
                 "counts": rec["tokens"] == {"total": 1234} and rec["outside"] == 0 and rec["turns"] is None,
                 "outside its tools": rec2.get("passed") is False and rec2["end"] == "no answer; 2 calls outside its tools",
             }
-            wrong += [f"helpers {lane}: {k}" for k, v in checks.items() if not v]
+            wrong += [f"helpers {lane}: {k}" + (f" ({ran.returncode}: {(ran.stderr or cli).strip()[-300:]})" if k == "the command" else "")
+                      for k, v in checks.items() if not v]
         j = next(x for x in tasks("b") if x["id"] == "b06")
         name = jobs.begin("duckdb", "b06")["try"]
         said = [jobs.call(name, "sql", st) for st in gold_sql(j, "duckdb")] + [jobs.call(name, "done", "fixed")]
