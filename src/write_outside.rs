@@ -276,24 +276,6 @@ fn mapped_type(t: &Value, logical: &DataType) -> DataType {
     }
 }
 
-/// `a` with its type's names as `to` says them: the same values, its structs' fields (at any depth) renamed (`mapped_type`).
-fn renamed(a: &ArrayRef, to: &DataType) -> Result<ArrayRef> {
-    use datafusion::arrow::array::{ListArray, StructArray};
-    Ok(match (a.data_type(), to) {
-        (from, to) if from == to => a.clone(),
-        (DataType::Struct(_), DataType::Struct(fields)) => {
-            let s = a.as_struct();
-            let columns = s.columns().iter().zip(fields.iter()).map(|(c, f)| renamed(c, f.data_type())).collect::<Result<Vec<_>>>()?;
-            Arc::new(StructArray::try_new(fields.clone(), columns, s.nulls().cloned())?)
-        }
-        (DataType::List(_), DataType::List(item)) => {
-            let l = a.as_list::<i32>();
-            Arc::new(ListArray::try_new(item.clone(), l.offsets().clone(), renamed(l.values(), item.data_type())?, l.nulls().cloned())?)
-        }
-        _ => a.clone(),
-    })
-}
-
 /// Does a Delta type say NOT NULL of something inside it: a struct's field, an array's elements, a map's values?
 fn not_null_inside(t: &Value) -> bool {
     let no = |k: &str| t[k].as_bool() == Some(false);
@@ -488,7 +470,7 @@ impl Fit {
     }
 
     fn fit(&self, b: RecordBatch) -> Result<RecordBatch> {
-        let cols = b.columns().iter().zip(&self.cast).zip(self.target.fields()).map(|((c, t), f)| renamed(&crate::rules::fit::strict(c, t)?, f.data_type())).collect::<Result<Vec<_>>>()?;
+        let cols = b.columns().iter().zip(&self.cast).zip(self.target.fields()).map(|((c, t), f)| Ok(crate::answer::relabeled(&crate::rules::fit::strict(c, t)?, f.data_type())?)).collect::<Result<Vec<_>>>()?;
         if let Some(name) = cols.iter().zip(&self.not_null).find_map(|(c, n)| n.as_ref().filter(|_| c.null_count() > 0)) {
             return Err(crate::codes::coded("23502", format!("{}: column {name} is NOT NULL, and a row gives it no value", self.table)));
         }

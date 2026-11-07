@@ -69,6 +69,9 @@ pub struct Made {
     pub identity: BTreeMap<String, Identity>,
     pub enums: BTreeMap<String, Enum>,
     pub sql_types: BTreeMap<String, String>,
+    /// Each column's Arrow type as SQL reads it, by stored name, where its files hold another (`Col::sql_type`): filled
+    /// only for another engine's table (`ext::table_meta`).
+    pub logical_types: BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -158,8 +161,11 @@ pub struct Col {
     pub name: String,
     /// The name its files and the log hold it under, when it was renamed (otherwise `name`).
     pub stored: Option<String>,
-    /// Its Arrow type, as text.
+    /// Its Arrow type, as text: its files' (`sql_type` says SQL's, when SQL reads another).
     pub dtype: String,
+    /// Its Arrow type as SQL reads it, when its files hold another: a mapped Delta table's struct, whose fields its files
+    /// keep under their physical names (`ext::table_meta`), read under SQL's (`query::named`). Read through `sql_type()`.
+    pub sql_type: Option<String>,
     pub dropped: bool,
     pub not_null: bool,
     /// `DEFAULT expr`, the SQL expression.
@@ -201,6 +207,8 @@ struct Facts<S, I, E> {
     held: Option<S>,
     #[serde(skip_serializing_if = "Option::is_none")]
     labels: Option<E>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sql_type: Option<S>,
 }
 
 /// A column at its place in the list, for writing: its id is written only when it isn't `place`.
@@ -210,8 +218,8 @@ impl Serialize for At<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let (c, place) = (self.0, self.1);
-        let facts = Facts { id: (c.id != place).then_some(c.id), stored: c.stored.as_ref(), default: c.default.as_ref(), identity: c.identity.as_ref(), held: c.held.as_ref(), labels: c.labels.as_ref() };
-        let any = facts.id.is_some() || c.stored.is_some() || c.default.is_some() || c.identity.is_some() || c.held.is_some() || c.labels.is_some();
+        let facts = Facts { id: (c.id != place).then_some(c.id), stored: c.stored.as_ref(), default: c.default.as_ref(), identity: c.identity.as_ref(), held: c.held.as_ref(), labels: c.labels.as_ref(), sql_type: c.sql_type.as_ref() };
+        let any = facts.id.is_some() || c.stored.is_some() || c.default.is_some() || c.identity.is_some() || c.held.is_some() || c.labels.is_some() || c.sql_type.is_some();
         let mut seq = s.serialize_seq(Some(2 + c.not_null as usize + c.dropped as usize + any as usize))?;
         seq.serialize_element(&c.name)?;
         seq.serialize_element(&c.dtype)?;
@@ -288,7 +296,7 @@ impl<'de> Deserialize<'de> for Col {
                         Rest::Dropped => c.dropped = true,
                         Rest::Facts(f) => {
                             c.id = f.id.unwrap_or_default();
-                            (c.stored, c.default, c.identity, c.held, c.labels) = (f.stored, f.default, f.identity, f.held, f.labels);
+                            (c.stored, c.default, c.identity, c.held, c.labels, c.sql_type) = (f.stored, f.default, f.identity, f.held, f.labels, f.sql_type);
                         }
                     }
                 }
@@ -343,6 +351,7 @@ impl Stored {
                 identity: m.identity.get(s).cloned(),
                 held: m.sql_types.get(s).cloned(),
                 labels: m.enums.get(s).cloned(),
+                sql_type: m.logical_types.get(s).cloned(),
             })
             .collect();
         let mut place = std::collections::HashMap::with_capacity(if m.shown.is_empty() { 0 } else { m.columns.len() });
@@ -376,12 +385,12 @@ impl Stored {
             .enumerate()
             .map(|(i, (s, dtype))| {
                 let (is_dropped, is_not_null) = (dropped.contains(s.as_str()), not_null.contains(s.as_str()));
-                let (default, identity, held, labels) = (m.defaults.remove(&s), m.identity.remove(&s), m.sql_types.remove(&s), m.enums.remove(&s));
+                let (default, identity, held, labels, sql_type) = (m.defaults.remove(&s), m.identity.remove(&s), m.sql_types.remove(&s), m.enums.remove(&s), m.logical_types.remove(&s));
                 let (name, stored) = match m.names.remove(&s) {
                     Some(n) => (n, Some(s)),
                     None => (s, None),
                 };
-                Col { id: i as u32 + 1, name, stored, dtype, dropped: is_dropped, not_null: is_not_null, default, identity, held, labels }
+                Col { id: i as u32 + 1, name, stored, dtype, sql_type, dropped: is_dropped, not_null: is_not_null, default, identity, held, labels }
             })
             .collect();
         Stored { columns, order }
@@ -415,6 +424,9 @@ impl Stored {
             }
             if let Some(e) = &c.labels {
                 m.enums.insert(s.clone(), e.clone());
+            }
+            if let Some(t) = &c.sql_type {
+                m.logical_types.insert(s.clone(), t.clone());
             }
         }
         m.shown = self.order.iter().filter_map(|id| self.columns.get(self.place(*id)?)).map(|c| c.stored_name().to_string()).collect();
@@ -573,6 +585,9 @@ impl<'a> Lookup<'a> {
 impl Col {
     /// The name its files and the log hold it under.
     pub fn stored_name(&self) -> &str { self.stored.as_deref().unwrap_or(&self.name) }
+
+    /// Its Arrow type as SQL reads it: `sql_type`, else its files' (`dtype`).
+    pub fn sql_type(&self) -> &str { self.sql_type.as_deref().unwrap_or(&self.dtype) }
 }
 
 /// A table's columns as its entry keeps them in memory (redesign 1b, piece 6b): the list (`Stored`), the one shape the
@@ -674,7 +689,7 @@ impl Serialize for Record {
         macro_rules! unless_empty {
             ($($field:ident),*) => { $(if !f.$field.is_empty() { m.serialize_entry(stringify!($field), &f.$field)?; })* };
         }
-        unless_empty!(names, dropped, shown, not_null, defaults, identity, enums, sql_types);
+        unless_empty!(names, dropped, shown, not_null, defaults, identity, enums, sql_types, logical_types);
         m.end()
     }
 }
@@ -691,6 +706,7 @@ struct Fields<'a> {
     identity: BTreeMap<&'a str, &'a Identity>,
     enums: BTreeMap<&'a str, &'a Enum>,
     sql_types: BTreeMap<&'a str, &'a str>,
+    logical_types: BTreeMap<&'a str, &'a str>,
 }
 
 impl<'a> Fields<'a> {
@@ -718,6 +734,9 @@ impl<'a> Fields<'a> {
             }
             if let Some(e) = &c.labels {
                 f.enums.insert(s, e);
+            }
+            if let Some(t) = &c.sql_type {
+                f.logical_types.insert(s, t);
             }
         }
         f.shown = l.order.iter().filter_map(|id| l.columns.get(l.place(*id)?)).map(Col::stored_name).collect();
@@ -768,13 +787,15 @@ macro_rules! entry {
             enums: BTreeMap<String, Enum>,
             #[serde(default)]
             sql_types: BTreeMap<String, String>,
+            #[serde(default)]
+            logical_types: BTreeMap<String, String>,
             $($(#[$fm])* $field: $ty,)*
         }
 
         impl From<Wire> for $name {
             fn from(w: Wire) -> $name {
                 let (columns, names, dropped, shown, not_null) = (w.columns, w.names, w.dropped, w.shown, w.not_null);
-                let made = Made { columns, names, dropped, shown, not_null, defaults: w.defaults, identity: w.identity, enums: w.enums, sql_types: w.sql_types };
+                let made = Made { columns, names, dropped, shown, not_null, defaults: w.defaults, identity: w.identity, enums: w.enums, sql_types: w.sql_types, logical_types: w.logical_types };
                 $name { record: Record::read(w.list, made), $($field: w.$field,)* }
             }
         }
@@ -974,6 +995,9 @@ impl TableMeta {
     /// Is this column (by the names its entry uses) a uuid, held as text (`types.rs`)?
     pub fn uuid(&self, column: &str) -> bool { self.col(column).is_some_and(|c| c.held.as_deref() == Some("uuid")) }
 
+    /// Does SQL read any column as another type than its files hold (`Col::sql_type`)? Then `query::named` reads it so.
+    pub fn relabeled(&self) -> bool { self.list().columns.iter().any(|c| c.sql_type.is_some()) }
+
     /// Has any column been renamed or dropped (ADR-022)? If not, SQL sees `columns` as stored.
     pub fn mapped(&self) -> bool {
         let m = self.record.marked();
@@ -1044,11 +1068,11 @@ impl TableMeta {
     }
 
     /// SQL's columns (`logical_columns`) in SQL's order (`in_order`): what `SELECT *` and RETURNING * answer.
-    pub fn sql_columns(&self) -> Vec<(String, String)> { self.in_order().map(|c| (c.name.clone(), c.dtype.clone())).collect() }
+    pub fn sql_columns(&self) -> Vec<(String, String)> { self.in_order().map(|c| (c.name.clone(), c.sql_type().to_string())).collect() }
 
     /// What `SELECT *` lists: `sql_columns` without a keyed table's delete markers (`marker`). What SHOW CREATE writes and
     /// what a view's `*` reads (`ddl::keep_readers`).
-    pub fn star(&self) -> Vec<(String, String)> { self.star_cols().map(|c| (c.name.clone(), c.dtype.clone())).collect() }
+    pub fn star(&self) -> Vec<(String, String)> { self.star_cols().map(|c| (c.name.clone(), c.sql_type().to_string())).collect() }
 
     /// `star`'s columns as the list has them, each with its facts (`objects::table_sql`).
     pub fn star_cols(&self) -> impl Iterator<Item = &Col> { self.in_order().filter(|c| !self.marker(&c.name)) }
@@ -1213,7 +1237,7 @@ impl TableMeta {
                 t.merge = BTreeMap::new();
                 t
             }
-            None if self.list().order.is_empty() => self.logical(),
+            None if self.list().order.is_empty() && !self.relabeled() => self.logical(),
             None => {
                 let mut t = self.logical();
                 let list = Stored { order: vec![], ..t.described_as(&self.sql_columns()) };
@@ -1244,6 +1268,7 @@ impl TableMeta {
                     name: name.clone(),
                     stored: None,
                     dtype: dtype.clone(),
+                    sql_type: None, // (`dtype` is SQL's already: `sql_columns`)
                     dropped: of.is_some_and(|c| c.dropped),
                     not_null: of.is_some_and(|c| c.not_null),
                     default: facts.and_then(|c| c.default.clone()),
@@ -5004,7 +5029,7 @@ mod tests {
         macro_rules! unless_empty {
             ($($field:ident),*) => { $(if !f.$field.is_empty() { parts.push(format!("\"{}\":{}", stringify!($field), serde_json::to_string(&f.$field).unwrap())); })* };
         }
-        unless_empty!(names, dropped, shown, not_null, defaults, identity, enums, sql_types);
+        unless_empty!(names, dropped, shown, not_null, defaults, identity, enums, sql_types, logical_types);
         format!("{{{}}}", parts.join(","))
     }
 
@@ -5182,6 +5207,37 @@ mod tests {
         m.add_column("e", "Utf8", None, None);
         m.set_order(vec!["e".into(), "a".into()]);
         assert_eq!((m.col("e").map(|c| c.id), m.list().order.clone(), m.sql_order()), (Some(5), vec![5, 3], vec!["e".to_string(), "a".into(), "b".into(), "c".into()]));
+    }
+
+    /// A column SQL reads as another type than its files hold (a mapped Delta table's struct: `Col::sql_type`) keeps it in
+    /// either shape, written only where it has one; SQL's columns and the description give SQL's type, the files' stays.
+    #[test]
+    fn a_columns_sql_type_is_kept_in_either_shape() {
+        let (files, sql) = (r#"Struct("col-9": Utf8)"#, r#"Struct("city": Utf8)"#);
+        let made = Made {
+            columns: vec![("col-1".into(), "Int64".into()), ("col-2".into(), files.into())],
+            names: [("col-1", "id"), ("col-2", "addr")].iter().map(|(s, n)| (s.to_string(), n.to_string())).collect(),
+            logical_types: [("col-2".to_string(), sql.to_string())].into(),
+            ..Default::default()
+        };
+        let t = TableMeta::made(made.clone());
+        assert_eq!((t.col("col-2").map(|c| (c.dtype.as_str(), c.sql_type())), t.relabeled()), (Some((files, sql)), true));
+        let (five, six) = (serde_json::to_value(&t).unwrap(), serde_json::to_value(t.clone().as_list()).unwrap());
+        assert_eq!(five["logical_types"], serde_json::json!({"col-2": sql}), "{five}");
+        assert_eq!(six["list"][0][1][2]["sql_type"], serde_json::json!(sql), "{six}");
+        for raw in [five, six] {
+            let back: TableMeta = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(back.list(), t.list(), "{raw}");
+        }
+        assert_eq!(t.fields(), made, "the fields by stored name again");
+        let want = vec![("id".to_string(), "Int64".to_string()), ("addr".into(), sql.into())];
+        assert_eq!((t.sql_columns(), t.star()), (want.clone(), want.clone()));
+        let described: Vec<(String, String)> = t.described().columns().map(|(c, ty)| (c.to_string(), ty.to_string())).collect();
+        assert_eq!((described, t.described().relabeled()), (want, false));
+        assert_eq!(t.columns().map(|(_, ty)| ty).collect::<Vec<_>>(), ["Int64", files], "the files' types, as a scan reads them");
+        let plain = TableMeta::made(Made { columns: vec![("a".into(), "Int64".into())], ..Default::default() });
+        let (five, six) = (serde_json::to_string(&plain).unwrap(), serde_json::to_string(&plain.clone().as_list()).unwrap());
+        assert!(!five.contains("logical_types") && !six.contains("sql_type") && !plain.relabeled(), "{five} {six}");
     }
 
     /// A table's replaced rows (`sys::deleted`) take its columns as stored, ids, names and drop marks kept, and none of
@@ -5427,6 +5483,7 @@ mod tests {
             identity: field(raw, "identity"),
             enums: field(raw, "enums"),
             sql_types: field(raw, "sql_types"),
+            logical_types: field(raw, "logical_types"),
         };
         assert_eq!(t.list(), &Stored::of(&f), "{at}: the list its fields make");
         let empty = |v: Option<&serde_json::Value>| v.is_none_or(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty) || v.as_object().is_some_and(|o| o.is_empty()));
