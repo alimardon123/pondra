@@ -756,7 +756,7 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
         if floors[0].0 <= cutoff { floors[0].1 } else { 0 }
     };
     // (`--changelog-secs`: the log is also a change feed, kept that long for `/watch?after=` replays.)
-    let changelog = crate::env::value::<u64>("PONDRA_CHANGELOG_SECS") * 1000;
+    let changelog = crate::env::secs("PONDRA_CHANGELOG_SECS").as_millis() as u64;
     let log_cutoff = cutoff.min(crate::log::now_ms().saturating_sub(changelog));
     let (segs, kept): (Vec<(String, std::sync::Arc<Segment>)>, Vec<(String, std::sync::Arc<Segment>)>) = lake.cat.segments(&seg_key(1), &seg_key(floor + 1)).await?
         .into_iter().partition(|(_, s)| s.ts_ms < log_cutoff);

@@ -446,8 +446,10 @@ def inserts(con, root, expected, spark, port):
     """INSERT into other engines' tables, attached: Delta (deletion vectors on, columns mapped by
     name, partitions with odd values and NULL) and Iceberg (plain, and partitioned by day, bucket,
     identity and truncate), then read back by the engine that made them (Spark) == Pondra's read,
-    every row there once; a retried INSERT (same job) applied once; a PyIceberg table in a REST
-    catalog, committed through the catalog, read back by PyIceberg."""
+    every row there once; a retried INSERT (same job) applied once; delta-rs's tables with names
+    mapped (one of plain columns written and read back by delta-rs, one with a struct refused) and
+    one with a NOT NULL field in a struct (refused); a PyIceberg table in a REST catalog, committed
+    through the catalog, read back by PyIceberg."""
     import uuid
     out = {}
     got = lambda q: sorted([[plain(v) for v in r.values()] for r in con.sql(q).collect().to_pylist()], key=json.dumps)
@@ -483,6 +485,31 @@ def inserts(con, root, expected, spark, port):
         print(json.dumps({"table": "INSERT into an Iceberg table by day, bucket and truncate: PyIceberg prunes by the values Pondra wrote", "equal": found}), flush=True)
         out["insert:retried"] = again.get("duplicate") is True
         print(json.dumps({"table": "INSERT retried with its job: applied once", "equal": out["insert:retried"]}), flush=True)
+    # delta-rs's tables with names mapped: one of plain columns takes the rows, and delta-rs reads them back; one with a
+    # struct is refused by name, as is one with a NOT NULL field in a struct (Pondra writes neither inside a struct yet).
+    import pyarrow as pa, deltalake
+    shutil.rmtree(f"{root}/deltars_w", ignore_errors=True)
+    mapped = {"delta.columnMapping.mode": "name"}
+    city = pa.struct([pa.field("city", pa.string())])
+    deltalake.write_deltalake(f"{root}/deltars_w/flat", pa.table({"id": pa.array([1, 2], pa.int64()), "name": ["a", "b"]}), configuration=mapped)
+    deltalake.write_deltalake(f"{root}/deltars_w/nested", pa.table({"id": pa.array([1], pa.int64()), "addr": pa.array([{"city": "Oslo"}], city)}), configuration=mapped)
+    strict = pa.schema([pa.field("id", pa.int64()), pa.field("addr", pa.struct([pa.field("city", pa.string(), nullable=False)]))])
+    deltalake.write_deltalake(f"{root}/deltars_w/strict", pa.table({"id": [1], "addr": [{"city": "Oslo"}]}, schema=strict))
+    con.sql(f"ATTACH '{root}/deltars_w' AS drw (TYPE delta)")
+    con.sql("INSERT INTO drw.flat VALUES (3, 'c')")
+    # (read through delta-rs's DataFusion: its pyarrow dataset reads a mapped table's columns as NULL, its own files too)
+    theirs = pa.table(deltalake.QueryBuilder().register("t", deltalake.DeltaTable(f"{root}/deltars_w/flat")).execute("SELECT id, name FROM t ORDER BY id").read_all()).to_pylist()
+    out["insert:deltars_mapped"] = ok = theirs == [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}, {"id": 3, "name": "c"}]
+    print(json.dumps({"table": "INSERT into delta-rs's table with names mapped, read back by delta-rs", "equal": ok, **({} if ok else {"theirs": theirs})}, default=str), flush=True)
+    for t, words, row in (("nested", "holds a struct", "(2, {'city': 'Rome'})"), ("strict", "NOT NULL value inside", "(2, {'city': 'Rome'})")):
+        try:
+            con.sql(f"INSERT INTO drw.{t} VALUES {row}")
+            why = "written"
+        except Exception as e:  # noqa: BLE001 (reported)
+            why = str(e)
+        ok = words in why and deltalake.DeltaTable(f"{root}/deltars_w/{t}").version() == 0
+        out[f"insert:deltars_{t}"] = ok
+        print(json.dumps({"table": f"INSERT into delta-rs's table {t} refused by name, nothing written", "equal": ok, **({} if ok else {"why": why[:300]})}), flush=True)
     # Through an Iceberg REST catalog: the catalog commits it.
     from pyiceberg.catalog.sql import SqlCatalog
     server = subprocess.Popen([sys.executable, os.path.join(HERE, "sim_iceberg_rest.py"), "--port", str(port), "--warehouse", f"{root}/pyiceberg"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -528,13 +555,16 @@ def rules(con, root):
     con.sql("INSERT INTO rules_d.nn VALUES (3, '\\x00ff', 3)")
     con.sql("INSERT INTO rules_d.nn (n, id) VALUES (4, 4)")  # (piece 4b: a column list; b, left out, is NULL)
     t = deltalake.DeltaTable(path)
+    import pyarrow.parquet as pq
+    required = [not pq.read_schema(u.removeprefix("file://")).field("id").nullable for u in t.file_uris()]  # (piece 4c: a NOT NULL column as Parquet's required, as delta-rs writes it)
     rows = sorted(t.to_pyarrow_table().to_pylist(), key=lambda r: (r["id"] is None, r["id"] or 0))  # (a NULL id, where it got in, last)
     ok = refused["null"].startswith("23502") and "column id is NOT NULL" in refused["null"] and refused["text"].startswith("22P02") \
         and 'invalid input syntax for type integer: "12x"' in refused["text"] and refused["left out"].startswith("23502") and "column id is NOT NULL" in refused["left out"] \
-        and refused["no such"].startswith("42703") and t.version() == 2 and rows == [{"id": 1, "b": b"x", "n": 1}, {"id": 3, "b": b"\x00\xff", "n": 3}, {"id": 4, "b": None, "n": 4}]
+        and refused["no such"].startswith("42703") and t.version() == 2 and len(required) == 3 and all(required) \
+        and con.sql("SELECT id, n FROM rules_d.nn ORDER BY id").rows() == [{"id": r["id"], "n": r["n"]} for r in rows] and rows == [{"id": 1, "b": b"x", "n": 1}, {"id": 3, "b": b"\x00\xff", "n": 3}, {"id": 4, "b": None, "n": 4}]
     out["rules:delta"] = ok
-    print(json.dumps({"table": "INSERT into a Delta table with a NOT NULL column (delta-rs): a NULL refused 23502, nothing committed, and so is a column list that leaves it out; '12x' into an int refused 22P02 in Postgres's words; '\\x00ff' into a binary column is the two bytes 00 ff; a column list fills the rest with NULL, and one naming no column is 42703", "equal": ok,
-                      **({} if ok else {"refused": refused, "version": t.version(), "rows": [{**r, "b": r["b"].hex() if r["b"] else None} for r in rows]})}), flush=True)
+    print(json.dumps({"table": "INSERT into a Delta table with a NOT NULL column (delta-rs): a NULL refused 23502, nothing committed, and so is a column list that leaves it out; '12x' into an int refused 22P02 in Postgres's words; '\\x00ff' into a binary column is the two bytes 00 ff; a column list fills the rest with NULL, and one naming no column is 42703; every file has the NOT NULL column as Parquet's required, and Pondra reads them all", "equal": ok,
+                      **({} if ok else {"refused": refused, "version": t.version(), "required": required, "rows": [{**r, "b": r["b"].hex() if r["b"] else None} for r in rows]})}), flush=True)
     cat = SqlCatalog("rules", uri=f"sqlite:///{root}/rules/catalog.db", warehouse=f"file://{root}/rules/iceberg")
     cat.create_namespace("db")
     made = cat.create_table("db.req", schema=Schema(NestedField(1, "id", LongType(), required=True), NestedField(2, "v", StringType(), required=False)), location=f"file://{root}/rules/iceberg/db/req")
@@ -547,9 +577,12 @@ def rules(con, root):
     from pyiceberg.table import StaticTable
     newest = sorted(glob.glob(os.path.join(os.path.dirname(meta), "*.metadata.json")))[-1]  # (Pondra's commit, the file after PyIceberg's)
     theirs = sorted(StaticTable.from_metadata(newest).scan().to_arrow().to_pylist(), key=lambda r: (r["id"] is None, r["id"] or 0))  # (a NULL id, where it got in, last)
-    ok = refused.startswith("23502") and "column id is NOT NULL" in refused and theirs == [{"id": 1, "v": "a"}, {"id": 2, "v": None}, {"id": 3, "v": None}]
+    files = glob.glob(f"{root}/rules/iceberg/db/req/data/**/*.parquet", recursive=True)
+    required = [not pq.read_schema(f).field("id").nullable for f in files]
+    ok = refused.startswith("23502") and "column id is NOT NULL" in refused and theirs == [{"id": 1, "v": "a"}, {"id": 2, "v": None}, {"id": 3, "v": None}] and len(required) == 3 and all(required) \
+        and con.sql("SELECT id FROM rules_i.db.req ORDER BY id").rows() == [{"id": 1}, {"id": 2}, {"id": 3}]
     out["rules:iceberg"] = ok
-    print(json.dumps({"table": "INSERT into an Iceberg table with a required column (PyIceberg): a NULL refused 23502, a row with it given goes in, and a column list fills the rest with NULL, read back by PyIceberg", "equal": ok, **({} if ok else {"refused": refused, "rows": theirs})}), flush=True)
+    print(json.dumps({"table": "INSERT into an Iceberg table with a required column (PyIceberg): a NULL refused 23502, a row with it given goes in, and a column list fills the rest with NULL, read back by PyIceberg; every file has the column as Parquet's required, and Pondra reads them all", "equal": ok, **({} if ok else {"refused": refused, "rows": theirs, "required": required})}), flush=True)
     return out
 
 

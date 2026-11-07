@@ -106,14 +106,15 @@ async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job:
     delta_writable(root, &log)?;
     let (columns, partitions, mapped) = read_delta::schema(root, &log.metadata)?;
     let fields = read_delta_fields(&log.metadata)?;
+    let not_null = delta_not_null(&log.metadata)?;
+    // (a NOT NULL column is written as Parquet's required, as the table's own writers write it: `Fit` has refused any NULL in it)
     let target: Vec<Field> = columns.iter().map(|(p, l, t)| {
-        let f = Field::new(p, t.clone(), true);
+        let f = Field::new(p, t.clone(), !not_null.contains(l));
         match fields.get(l).and_then(|m| m["delta.columnMapping.id"].as_i64()).filter(|_| mapped) {
             Some(id) => f.with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into()),
             None => f,
         }
     }).collect();
-    let not_null = delta_not_null(&log.metadata)?;
     let fit = Fit::new(&df, &target, columns.iter().map(|(_, l, _)| not_null.contains(l).then(|| l.clone())).collect(), root)?; // (said by its logical name)
     let partition_at: Vec<usize> = partitions.iter().map(|p| target.iter().position(|f| f.name() == p).expect("a partition column")).collect();
     let file_fields: Vec<Field> = target.iter().enumerate().filter(|(i, _)| !partition_at.contains(i)).map(|(_, f)| f.clone()).collect();
@@ -213,12 +214,41 @@ fn delta_writable(root: &str, log: &read_delta::Log) -> Result<()> {
             ensure!(meta.get(k).is_none(), "{root}: column {name} has {what}, which Pondra doesn't compute or check yet: INSERT with Spark or delta-rs");
         }
     }
+    // (Pondra names and numbers a mapped table's top-level columns only, and checks no NOT NULL inside a column: a
+    // struct's fields written under their own names are NULL to Spark, and the table no longer reads in delta-rs)
+    let mapped = log.metadata["configuration"]["delta.columnMapping.mode"].as_str().is_some_and(|m| m != "none");
+    let schema: Value = serde_json::from_str(log.metadata["schemaString"].as_str().context("no schema")?)?;
+    for f in schema["fields"].as_array().into_iter().flatten() {
+        let name = f["name"].as_str().unwrap_or_default();
+        ensure!(!(mapped && holds_struct(&f["type"])), "{root}: column {name} holds a struct, and the table maps its columns' names (delta.columnMapping.mode), which Pondra doesn't do inside a struct yet: INSERT with Spark or delta-rs");
+        ensure!(!not_null_inside(&f["type"]), "{root}: column {name} has a NOT NULL value inside it, which Pondra doesn't check yet: INSERT with Spark or delta-rs");
+    }
     let config = log.metadata["configuration"].as_object().cloned().unwrap_or_default();
     if let Some(k) = config.keys().find(|k| k.starts_with("delta.constraints.")) {
         bail!("{root}: the table has a CHECK constraint ({}), which Pondra doesn't check yet", &k["delta.constraints.".len()..]);
     }
     ensure!(config.get("delta.appendOnly").is_none_or(|v| v == "true" || v == "false"), "{root}: delta.appendOnly");
     Ok(())
+}
+
+/// Does a Delta type hold a struct (a map's entries are one), at any depth?
+fn holds_struct(t: &Value) -> bool {
+    match t["type"].as_str() {
+        Some("struct" | "map") => true,
+        Some("array") => holds_struct(&t["elementType"]),
+        _ => false,
+    }
+}
+
+/// Does a Delta type say NOT NULL of something inside it: a struct's field, an array's elements, a map's values?
+fn not_null_inside(t: &Value) -> bool {
+    let no = |k: &str| t[k].as_bool() == Some(false);
+    match t["type"].as_str() {
+        Some("struct") => t["fields"].as_array().into_iter().flatten().any(|f| f["nullable"].as_bool() == Some(false) || not_null_inside(&f["type"])),
+        Some("array") => no("containsNull") || not_null_inside(&t["elementType"]),
+        Some("map") => no("valueContainsNull") || not_null_inside(&t["keyType"]) || not_null_inside(&t["valueType"]),
+        _ => false,
+    }
 }
 
 /// A Delta schema's top-level fields' metadata, by logical name.
@@ -455,8 +485,9 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
     // (named by the table's metadata, wherever it likes: written only where the caller may write, as its files are read)
     crate::ext::check_urls(lake, &[format!("{location}/data/").as_str(), format!("{location}/metadata/").as_str()]).await?;
     let (schema_json, columns) = crate::read_iceberg::schema_of(&meta)?;
-    let target: Vec<Field> = columns.iter().map(|(n, id, t)| Field::new(n, t.clone(), true).with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into())).collect();
-    let required = columns.iter().map(|(n, ..)| schema_json["fields"].as_array().into_iter().flatten().any(|f| f["name"] == n.as_str() && f["required"] == true).then(|| n.clone())).collect();
+    let required: Vec<Option<String>> = columns.iter().map(|(n, ..)| schema_json["fields"].as_array().into_iter().flatten().any(|f| f["name"] == n.as_str() && f["required"] == true).then(|| n.clone())).collect();
+    // (a required column is written as Parquet's required, as Iceberg's writers write it: `Fit` has refused any NULL in it)
+    let target: Vec<Field> = columns.iter().zip(&required).map(|((n, id, t), r)| Field::new(n, t.clone(), r.is_none()).with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into())).collect();
     let fit = Fit::new(&df, &target, required, url)?;
     let spec_id = meta["default-spec-id"].as_i64().unwrap_or(0);
     let pspec = meta["partition-specs"].as_array().into_iter().flatten().find(|s| s["spec-id"].as_i64() == Some(spec_id)).cloned().unwrap_or(json!({"fields": []}));

@@ -148,7 +148,7 @@ impl Hot {
 
     /// Drop the least recently read columns until `bytes` are freed, and say how many were (the one
     /// watch, `oom::start`, asks for it when the node's memory passes its trim line, and a query's grow
-    /// past the whole line, `ledger::Ledger`).
+    /// past the whole line, `ledger::Ledger`). A column a query holds stays (`held_elsewhere`).
     pub(crate) fn trim(&self, bytes: usize) -> usize {
         // (never waiting on a reader: a scan holding the lock gives back nothing now, and the columns go once it's let go)
         let mut s = match self.state.try_lock() {
@@ -162,6 +162,11 @@ impl Hot {
         for (_, k) in oldest {
             if freed >= bytes {
                 break;
+            }
+            // (letting go of a column a running scan holds frees nothing, and a grow admitted on its bytes passed the line
+            // while the next read decoded it again: it stays, and isn't counted; 11-07 audit M3)
+            if s.cols.get(&k).is_some_and(|c| held_elsewhere(&c.arrays)) {
+                continue;
             }
             if let Some(c) = s.cols.remove(&k) {
                 (freed, s.used) = (freed + c.bytes, s.used.saturating_sub(c.bytes));
@@ -438,6 +443,10 @@ impl State {
         self.used + bytes <= max
     }
 }
+
+/// Whether a column's arrays are held outside the cache too: by a scan's `Held`, or a batch of them by a query. The
+/// cache letting go of them frees nothing then.
+fn held_elsewhere(arrays: &Arc<Vec<ArrayRef>>) -> bool { Arc::strong_count(arrays) > 1 || arrays.iter().any(|a| Arc::strong_count(a) > 1) }
 
 /// Memory held by a column's arrays: each buffer once (string views of one page share its buffer).
 fn size(arrays: &[ArrayRef]) -> usize {
@@ -1332,6 +1341,31 @@ mod tests {
         let held_fields = hot.columns("t", &schema);
         assert_eq!(names_and_types(held_fields), vec![("i".to_string(), DataType::Int64), ("s".to_string(), DataType::Utf8View)]);
         assert!(hot.columns("t2", &schema).is_empty());
+    }
+
+    /// A column a running scan holds isn't freed by the cache letting go of it, so a take-back leaves it and doesn't count
+    /// it (11-07 audit M3: a query's grow was admitted on the bytes of its own table's columns). The other file's column
+    /// goes; a batch of the held one that a query still has holds it too; then it goes.
+    #[test]
+    fn a_take_back_leaves_the_columns_a_query_holds() {
+        let hot = Hot { max: 1 << 30, own: false, memory: false, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
+        let fields: Vec<FieldRef> = vec![Arc::new(Field::new("i", DataType::Int64, true))];
+        for (file, from) in [("data/t/a.parquet", 0i64), ("data/t/b.parquet", 10_000)] {
+            hot.put(file, &fields, vec![vec![Arc::new(Int64Array::from_iter_values(from..from + 10_000)) as ArrayRef]], 1 << 30);
+        }
+        let schema = Arc::new(Schema::new(vec![fields[0].as_ref().clone()]));
+        let each = hot.usage().0 / 2;
+        assert!(each > 0);
+        let held = hot.get("data/t/a.parquet", &schema).expect("held"); // (a scan of a, running)
+        assert_eq!(hot.trim(usize::MAX), each, "b's column alone");
+        assert_eq!(hot.usage().0, each);
+        assert!(hot.get("data/t/a.parquet", &schema).is_some(), "a's stays");
+        let batch = held.batch(&schema, &[0], 1).unwrap();
+        drop(held);
+        assert_eq!(hot.trim(usize::MAX), 0, "a batch of it a query still has");
+        drop(batch);
+        assert_eq!(hot.trim(usize::MAX), each, "then a's goes too");
+        assert_eq!(hot.usage().0, 0);
     }
 
     /// A file's footer tells about what its columns decode to before any page is: no less than they hold once decoded,

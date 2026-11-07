@@ -1479,8 +1479,8 @@ fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
             return None;
         }
     };
-    let bytes = match crate::env::parse::<u64>("PONDRA_CACHE_GB") {
-        Some(gb) => gb << 30,
+    let bytes = match crate::env::gib("PONDRA_CACHE_GB") {
+        Some(bytes) => bytes as u64,
         None => space(&dir).map_or(20 << 30, |(free, _)| (free / 4).min(20 << 30)),
     };
     let dir = dir.join(url.trim_start_matches("s3://").replace(['/', ':', '\\'], "_")); // one folder per lake

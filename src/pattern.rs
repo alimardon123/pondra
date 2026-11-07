@@ -401,25 +401,11 @@ fn pattern_text(p: &MatchRecognizePattern) -> (String, Option<String>) {
 /// so a word there is not read. A text the tokenizer refuses holds no code: nothing in it is rewritten or refused here,
 /// and the parser says what is wrong with it.
 fn code_mask(sql: &str) -> Vec<bool> {
-    use datafusion::sql::sqlparser::tokenizer::{Token, Whitespace};
     let Some(t) = crate::text::tokens(sql) else { return vec![false; sql.len()] };
     let mut mask = vec![true; sql.len()];
-    for (i, tok) in t.toks.iter().enumerate() {
-        let quoted = match tok {
-            Token::Whitespace(w) => !matches!(w, Whitespace::Space | Whitespace::Newline | Whitespace::Tab),
-            Token::Word(w) => w.quote_style.is_some(),
-            t => matches!(
-                t,
-                Token::SingleQuotedString(_) | Token::DoubleQuotedString(_) | Token::TripleSingleQuotedString(_) | Token::TripleDoubleQuotedString(_) | Token::DollarQuotedString(_)
-                    | Token::SingleQuotedByteStringLiteral(_) | Token::DoubleQuotedByteStringLiteral(_) | Token::TripleSingleQuotedByteStringLiteral(_)
-                    | Token::TripleDoubleQuotedByteStringLiteral(_) | Token::SingleQuotedRawStringLiteral(_) | Token::DoubleQuotedRawStringLiteral(_)
-                    | Token::TripleSingleQuotedRawStringLiteral(_) | Token::TripleDoubleQuotedRawStringLiteral(_) | Token::NationalStringLiteral(_)
-                    | Token::QuoteDelimitedStringLiteral(_) | Token::NationalQuoteDelimitedStringLiteral(_) | Token::EscapedStringLiteral(_)
-                    | Token::UnicodeStringLiteral(_) | Token::HexStringLiteral(_)
-            ),
-        };
-        if quoted {
-            mask[t.start[i]..t.end[i]].fill(false);
+    for j in 0..t.toks.len() {
+        if let Some((_, r)) = crate::text::quiet_token(sql, &t, j) {
+            mask[r].fill(false);
         }
     }
     mask

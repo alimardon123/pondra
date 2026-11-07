@@ -29,7 +29,7 @@ use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use pgwire::api::store::{Entry, PortalStore};
 use pgwire::api::{ClientInfo, ClientPortalStore, ConnectionManager, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use pgwire::messages::copy::{CopyData, CopyDone};
+use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::extendedquery::{Bind, BindComplete, Describe, Execute, Parse, ParseComplete, TARGET_TYPE_BYTE_PORTAL};
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
@@ -53,7 +53,7 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
         let tls = tls.clone();
         // A connection is a session: its temporary tables end with it (`temp.rs`).
         let session = format!("pg-{}", uuid::Uuid::new_v4().simple());
-        let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), again: Default::default(), me: me.clone() });
+        let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), again: Default::default(), copy: Default::default(), me: me.clone() });
         let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: cancels.clone() };
         let pg = Arc::new(Pg(backend, Arc::new(startup), cancel.clone()));
         let used = crate::idle::Use::new(); // (an open connection is a use of the node: `idle.rs`)
@@ -76,6 +76,7 @@ struct Backend {
     session: String,
     who: std::sync::Mutex<Option<crate::auth::Principal>>, // (whoever signed in)
     again: std::sync::Mutex<Option<(Again, std::time::Instant)>>, // (how that sign-in is checked again, and when it last was: `signed`)
+    copy: std::sync::Mutex<Option<Pending>>,               // (its COPY FROM STDIN under way: the connection's own, so its bytes end with it)
     me: std::sync::Weak<Backend>,                          // (a statement runs on the queries' runtime: `told`)
 }
 
@@ -368,6 +369,14 @@ fn copy_refused(given: &[String], e: datafusion::arrow::error::ArrowError) -> an
     match FIELDS.captures(&said).and_then(|c| c[2].parse::<usize>().ok()) {
         Some(got) => crate::codes::coded("22P04", format!("{} ({said})", crate::pg_copy::width(given, got))),
         None => e.into(),
+    }
+}
+
+/// An error's words as the client reads them, for the audit log.
+fn said(e: &PgWireError) -> String {
+    match e {
+        PgWireError::UserError(info) => info.message.clone(),
+        e => e.to_string(),
     }
 }
 
@@ -689,8 +698,17 @@ impl Backend {
         Ok(Response::CopyOut(CopyResponse::new(if c.format == "binary" { 1 } else { 0 }, schema.fields().len(), data)))
     }
 
-    /// `COPY t FROM STDIN`: what is to come, noted on the connection (`on_copy_data` gathers it).
+    /// `COPY t FROM STDIN`: what is to come, noted on the connection (`on_copy_data` gathers it). Its line in the audit log
+    /// is written when it ends, or now if it is refused (`writer::Load`).
     async fn copy_in<C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send>(&self, client: &mut C, _user: &str, c: Copy) -> PgWireResult<Response> {
+        let mut load = crate::writer::Load::new(&self.app, None, "COPY FROM STDIN", &c.table);
+        let (copy, n) = self.copy_begun(client, c).await.inspect_err(|e| load.end(Some(said(e))))?;
+        *self.copy.lock().unwrap() = Some(Pending { copy, data: vec![], ends: Default::default(), rows: 0, seq: 0, job: uuid::Uuid::new_v4().to_string(), ended: false, load });
+        Ok(Response::CopyIn(CopyResponse::new(0, n, stream::empty())))
+    }
+
+    /// `copy_in`'s checks: the COPY with its table resolved, and how many columns it sends.
+    async fn copy_begun<C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send>(&self, client: &mut C, c: Copy) -> PgWireResult<(Copy, usize)> {
         let refuse = |why: &str| Err(user_error(anyhow::anyhow!("{why}")));
         if c.query.is_some() || c.format == "binary" {
             return refuse("COPY FROM STDIN takes a table, in text or CSV");
@@ -712,8 +730,7 @@ impl Backend {
         // keyed table's rows replace their keys', UPDATE too; a `_deleted` column named may delete them: S11)
         let writer = crate::writer::Writer::open(&self.app, None, &table, crate::rules::How::Load, deletes(&c)).await.map_err(|r| user_error(r.into()))?;
         let n = if c.columns.is_empty() { writer.rules().width() } else { c.columns.len() };
-        COPIES.lock().unwrap().insert(client.socket_addr(), Pending { copy: Copy { table, ..c }, data: vec![], ends: Default::default(), rows: 0, seq: 0, job: uuid::Uuid::new_v4().to_string(), ended: false });
-        Ok(Response::CopyIn(CopyResponse::new(0, n, stream::empty())))
+        Ok((Copy { table, ..c }, n))
     }
 
     /// Rows a COPY FROM sent, up to the last whole line (`all`: everything), into the table's log. Nothing is read
@@ -1306,6 +1323,7 @@ struct Pending {
     seq: u64,
     job: String,
     ended: bool,
+    load: crate::writer::Load, // (its line in the audit log, written as it ends: when it is dropped, with the connection too)
 }
 
 /// The longest row a COPY FROM may send. The bytes after a COPY's last whole row that pass this are refused (54000) as
@@ -1313,36 +1331,40 @@ struct Pending {
 /// this and one frame.
 const LONGEST_ROW: usize = 64 << 20;
 
-crate::per_node!(static COPIES: std::sync::Mutex<std::collections::HashMap<std::net::SocketAddr, Pending>> = Default::default());
-
 #[async_trait]
 impl CopyHandler for Backend {
     /// Gathered, and loaded 32 MB at a time.
-    async fn on_copy_data<C>(&self, client: &mut C, data: CopyData) -> PgWireResult<()>
+    async fn on_copy_data<C>(&self, _: &mut C, data: CopyData) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let mut p = {
-            let mut copies = COPIES.lock().unwrap();
-            let Some(p) = copies.get_mut(&client.socket_addr()) else { return Err(user_error(anyhow::anyhow!("COPY data without a COPY"))) };
+            let mut copy = self.copy.lock().unwrap();
+            let Some(p) = copy.as_mut() else { return Err(user_error(anyhow::anyhow!("COPY data without a COPY"))) };
             if !p.ended {
                 p.data.extend_from_slice(&data.data); // (what follows the end marker is not gathered)
                 let end = p.ends.end(&p.data, p.copy.format == "csv"); // (each byte is looked at once, as it comes)
                 if p.data.len() - end > LONGEST_ROW {
-                    copies.remove(&client.socket_addr()); // (dropped: nothing more is gathered, and the connection goes on)
-                    return Err(user_error(crate::codes::coded("54000", "a row of COPY data is longer than 64 MB")));
+                    let e = user_error(crate::codes::coded("54000", "a row of COPY data is longer than 64 MB"));
+                    p.load.end(Some(said(&e)));
+                    *copy = None; // (dropped: nothing more is gathered, and the connection goes on)
+                    return Err(e);
                 }
             }
             if p.data.len() < 32 << 20 {
                 return Ok(());
             }
-            copies.remove(&client.socket_addr()).expect("there")
+            copy.take().expect("there")
         };
-        let r = self.load(&mut p, false).await;
-        COPIES.lock().unwrap().insert(client.socket_addr(), p);
-        r
+        // (a chunk refused ends the COPY: pgwire answers it, and drops what the client still sends, so its bytes go too)
+        if let Err(e) = self.load(&mut p, false).await {
+            p.load.end(Some(said(&e)));
+            return Err(e);
+        }
+        *self.copy.lock().unwrap() = Some(p);
+        Ok(())
     }
 
     async fn on_copy_done<C>(&self, client: &mut C, _: CopyDone) -> PgWireResult<()>
@@ -1351,11 +1373,28 @@ impl CopyHandler for Backend {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let Some(mut p) = COPIES.lock().unwrap().remove(&client.socket_addr()) else { return Err(user_error(anyhow::anyhow!("COPY done without a COPY"))) };
-        self.load(&mut p, true).await?;
+        let Some(mut p) = self.copy.lock().unwrap().take() else { return Err(user_error(anyhow::anyhow!("COPY done without a COPY"))) };
+        let loaded = self.load(&mut p, true).await;
+        p.load.end(loaded.as_ref().err().map(said));
+        loaded?;
         // (written with the ReadyForQuery that follows: pgwire's, or the Sync's in the extended protocol)
         client.feed(PgWireBackendMessage::CommandComplete(Tag::new("COPY").with_rows(p.rows as usize).into())).await?;
         Ok(())
+    }
+
+    /// The client gave the COPY up: what it sent since the last chunk is dropped, as Postgres drops it, with its words
+    /// and code (query_canceled). The chunks before it stay written (`load`).
+    async fn on_copy_fail<C>(&self, _: &mut C, fail: CopyFail) -> PgWireError
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let e = PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), "57014".into(), format!("COPY from stdin failed: {}", fail.message))));
+        if let Some(mut p) = self.copy.lock().unwrap().take() {
+            p.load.end(Some(said(&e)));
+        }
+        e
     }
 }
 
