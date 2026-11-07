@@ -12,7 +12,7 @@
 //! node as one line a minute (`audit::page_note`), at the first batch that comes after the minute has ended.
 #![cfg_attr(not(feature = "doors"), allow(dead_code))] // (the node's half is the doors' route, `server::records`: a page's build has none of it)
 use crate::app::App;
-use crate::auth::{Principal, Role};
+use crate::auth::Principal;
 use crate::dial::Dial;
 use crate::{audit, history};
 use serde::{Deserialize, Serialize};
@@ -205,7 +205,7 @@ pub fn refusal(who: &Principal, token: Option<&str>) -> Option<&'static str> {
     if who.operator {
         return Some("the nodes' own key and their tokens send no page's lines: a joined page sends its own sign-in's");
     }
-    if who.role < Role::Admin || who.access.is_some() {
+    if !who.superuser() {
         return Some("a joined page's lines are sent by a superuser's sign-in only");
     }
     if crate::auth::lent(token).is_some() {
@@ -331,6 +331,7 @@ pub async fn record(app: &App, who: &Principal, batch: Batch) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Role;
     use std::net::SocketAddr;
 
     fn text(n: usize) -> String {
@@ -407,7 +408,7 @@ mod tests {
         assert_eq!(refusal(&boss, None), None);
         assert!(refusal(&Principal::token(Role::Admin), None).is_some(), "the nodes' key or a token of the nodes'");
         assert!(refusal(&Principal { name: "rd".into(), ..Principal::of(Role::Read) }, None).is_some(), "a reader");
-        let granted = Principal { name: "bob".into(), access: Some(Default::default()), ..Principal::of(Role::Admin) };
+        let granted = Principal { name: "bob".into(), scope: crate::rights::Scope::granted(Default::default()), ..Principal::of(Role::Admin) };
         assert!(refusal(&granted, None).is_some(), "a sign-in with grants is not a superuser's");
     }
 

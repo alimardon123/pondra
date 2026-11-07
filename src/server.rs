@@ -366,7 +366,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let who = who.at("http", from);
     // (a branch's pin: a user granted CLONE may ask for it, and `ddl` lets nothing else of theirs through: ADR-058)
     let pin = req.uri().path() == "/cluster/ddl";
-    let cloning = pin && crate::rights::Scope::of(&who).clones().is_some();
+    let cloning = pin && who.scope.clones().is_some();
     if who.role < needed && !cloning {
         return match who.role {
             crate::auth::Role::None if header.is_none() && app.auth.owned() => (StatusCode::UNAUTHORIZED, "this node answers only the program that started it (the shell, connect()): open the console from the link it printed, or start the node with --admin-token to connect other tools").into_response(),
@@ -501,7 +501,7 @@ async fn whoami(State(app): State<App>) -> Json<Value> {
         crate::auth::Role::Read => "read",
         crate::auth::Role::None => "none",
     };
-    Json(j!({"user": p.name, "role": role, "superuser": p.role == crate::auth::Role::Admin && p.access.is_none(), "slug": crate::auth::slug(&p), "open": app.open().await}))
+    Json(j!({"user": p.name, "role": role, "superuser": p.superuser(), "slug": crate::auth::slug(&p), "open": app.open().await}))
 }
 
 /// Followers forward metadata writes to the leader, unchanged. The leader checks the caller's own sign-in (security pass 3,
@@ -638,7 +638,7 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
     let operator = nodes_own(&app).await; // (read now: the stream is polled after this request's scope has ended)
     let header = headers.get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
     let need = crate::auth::Auth::needed("/cluster/log", "GET"); // (a superuser's own sign-in, as `guard` lets it follow the stream)
-    let revoked = until_revoked(app.clone(), operator, header, move |p| p.role >= need && p.access.is_none());
+    let revoked = until_revoked(app.clone(), operator, header, move |p| p.role >= need && p.scope.whole());
     let cat = &app.lake.cat;
     let streamed = operator.then(|| crate::format::Streamed::to(crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
     // (a joined page's tab, which says no format as the nodes' own client does (`cluster::http`), is a use of the node while it

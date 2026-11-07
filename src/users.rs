@@ -1304,7 +1304,7 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
         }
     };
     let role = if superuser { Role::Admin } else if access.writes() { Role::Write } else { Role::Read };
-    Ok(Principal { name: user.to_string(), role, access: (!superuser).then_some(access), door: "node", from: None, operator: false, epoch, until: None })
+    Ok(Principal { name: user.to_string(), role, scope: if superuser { Default::default() } else { crate::rights::Scope::granted(access) }, door: "node", from: None, operator: false, epoch, until: None })
 }
 
 /// Seconds as said: `90 seconds`, `5 minutes`, `1 hour`.
@@ -1353,9 +1353,9 @@ pub fn quota() -> Quota {
         Some(v) => pg_duration(&v),
         None => crate::env::get("PONDRA_STATEMENT_TIMEOUT").and_then(|v| pg_duration(&v)),
     };
-    let Some((user, a)) = p.and_then(|p| Some((p.name, p.access?))) else { return Quota { turns: None, timeout: session, user: String::new(), by_session: session.is_some() } };
-    let most = a.limits.max_queries.map(u64::from).or_else(|| crate::env::parse::<u64>("PONDRA_USER_QUERIES")).filter(|n| *n > 0).map(|n| n.min(10_000) as u32);
-    let timeout = a.limits.timeout_secs.map(std::time::Duration::from_secs).or_else(|| crate::env::secs_given("PONDRA_USER_TIMEOUT")).filter(|t| !t.is_zero());
+    let Some((user, limits)) = p.and_then(|p| Some((p.name, p.scope.limits()?))) else { return Quota { turns: None, timeout: session, user: String::new(), by_session: session.is_some() } };
+    let most = limits.max_queries.map(u64::from).or_else(|| crate::env::parse::<u64>("PONDRA_USER_QUERIES")).filter(|n| *n > 0).map(|n| n.min(10_000) as u32);
+    let timeout = limits.timeout_secs.map(std::time::Duration::from_secs).or_else(|| crate::env::secs_given("PONDRA_USER_TIMEOUT")).filter(|t| !t.is_zero());
     // (the shorter of the session's and the user's is in force)
     let (timeout, by_session) = match (session, timeout) {
         (Some(s), Some(t)) if s >= t => (Some(t), false),

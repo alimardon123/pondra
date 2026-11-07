@@ -10,15 +10,14 @@
 //! Every door (HTTP, Postgres, Kafka, Flight) works out a `Principal` and runs the request inside
 //! `WHO.scope(…)`, so one check (`rights::may`, the query's tables in `query.rs`) sees it.
 use anyhow::{bail, ensure, Result};
-use std::sync::Arc;
 
-/// Who a request is: a name, the most it may do (`role`), and, for a user who isn't a superuser,
-/// what it is granted (`access`; None: everything its role allows).
+/// Who a request is: a name, the most it may do (`role`), and what it may see (`scope`: for a user who isn't a
+/// superuser, what it is granted; whole: everything its role allows).
 #[derive(Clone)]
 pub struct Principal {
     pub name: String,
     pub role: Role,
-    pub access: Option<Arc<crate::users::Access>>,
+    pub scope: crate::rights::Scope,
     pub door: &'static str,                  // (which door it came in by, and from where: the audit log's)
     pub from: Option<std::net::SocketAddr>,
     pub operator: bool, // (whoever runs the nodes: one of their tokens, their key, the program that started this one; `users::across`)
@@ -38,8 +37,11 @@ impl Principal {
             Role::Read => "reader",
             Role::None => "",
         };
-        Principal { name: name.into(), role, access: None, door: "node", from: None, operator: false, epoch: 0, until: None }
+        Principal { name: name.into(), role, scope: Default::default(), door: "node", from: None, operator: false, epoch: 0, until: None }
     }
+
+    /// An admin token's rights, or a superuser's: an admin whose scope is whole.
+    pub fn superuser(&self) -> bool { self.role == Role::Admin && self.scope.whole() }
 
     /// Must a session that holds it make it again before its next statement? Who may do what changed since it was made
     /// (a REVOKE, a DROP USER, a new password, a token revoked: `Catalog::rights_version`), or its credential ended.
@@ -113,7 +115,7 @@ crate::per_node!(static TOKENS: std::sync::atomic::AtomicBool = std::sync::atomi
 pub const AS_USER: &str = "x-pondra-as";
 
 /// The user the request being served is for, when its work goes on elsewhere (None: not a user's).
-pub fn as_user() -> Option<String> { current().filter(|p| p.access.is_some()).map(|p| p.name) }
+pub fn as_user() -> Option<String> { current().filter(|p| !p.scope.whole()).map(|p| p.name) }
 
 /// Whether a request a node with no sign-in would answer as anyone may be answered. Programs send no
 /// `Origin` or `Sec-Fetch-Site`, and the node's own console sends its own origin; a browser sends
@@ -229,7 +231,7 @@ pub fn staged_job(job: &str) -> bool { !job.is_empty() && job.len() <= 64 && job
 /// Is the request being served a writer's that isn't an admin (refused if it is a user's)?
 fn writer() -> Result<bool> {
     let Some(p) = current().filter(|p| p.role < Role::Admin) else { return Ok(false) };
-    ensure!(p.access.is_none(), "a user's rows go in through SQL (POST /sql, the Postgres port), where its grants are checked: this route is the nodes' own");
+    ensure!(p.scope.whole(), "a user's rows go in through SQL (POST /sql, the Postgres port), where its grants are checked: this route is the nodes' own");
     Ok(true)
 }
 
@@ -714,7 +716,7 @@ mod tests {
     /// other key, a token's and a caller with no name are all refused.
     #[test]
     fn a_page_stages_only_its_own_files() {
-        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, access: None, door: "http", from: None, operator: false, epoch: 0, until: None };
+        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, scope: Default::default(), door: "http", from: None, operator: false, epoch: 0, until: None };
         assert_eq!(slug(&user("ali")).as_deref(), Some("616c69"), "a user's slug is its name in hex");
         assert!(slug(&Principal::token(Role::Admin)).is_none(), "a token has no slug");
         let long = format!("stage/616c69/{}/0.parquet", "j".repeat(65));

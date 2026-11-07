@@ -1059,7 +1059,7 @@ pub async fn ask(app: &App, verb: Verb, ask: Ask, who: Who) -> Result<Value> {
     apply(app, &p, &plan, &ask, who, applier).await
 }
 
-/// Whether the caller holds APPLY on this database (a user granted it: `users::Access`).
+/// Whether the caller holds APPLY on this database (a user granted it: `rights::Scope::applies`).
 pub(crate) fn applier() -> bool { crate::rights::scope().applies() }
 
 /// Who may apply. On a database that isn't protected: an admin, or an APPLY holder. On a protected one
@@ -1109,7 +1109,7 @@ async fn making(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, applie
 /// The admin an APPLY holder below admin acts as for an apply's statements, and for the migrations `capture`
 /// records as run: making the project true takes an admin's statements, and the record keeps who asked.
 pub(crate) fn admin_for(who: Who, applier: bool) -> Option<crate::auth::Principal> {
-    crate::auth::current().filter(|_| applier && who.role < crate::auth::Role::Admin).map(|me| crate::auth::Principal { role: crate::auth::Role::Admin, access: None, operator: false, ..me })
+    crate::auth::current().filter(|_| applier && who.role < crate::auth::Role::Admin).map(|me| crate::auth::Principal { role: crate::auth::Role::Admin, scope: Default::default(), operator: false, ..me })
 }
 
 /// The claim, the apply's statements (`statements`), and its record's end (`making`'s span).

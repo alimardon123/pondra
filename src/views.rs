@@ -2125,7 +2125,7 @@ mod tests {
     #[tokio::test]
     async fn a_view_query_is_shown_to_a_caller_who_may_see_code_only() {
         // a user granted tables (no APPLY, no CLONE) is shown no view's query; an admin is shown it
-        let reader = Principal { access: Some(std::sync::Arc::new(crate::users::Access::default())), ..Principal::of(Role::Read) };
+        let reader = Principal { scope: crate::rights::Scope::granted(Default::default()), ..Principal::of(Role::Read) };
         let query = |who: Principal| WHO.scope(who, async { code_for_caller(|| "SELECT id FROM t WHERE region = 'EU'".to_string()) });
         assert_eq!(query(reader).await, None);
         assert_eq!(query(Principal::of(Role::Admin)).await.as_deref(), Some("SELECT id FROM t WHERE region = 'EU'"));

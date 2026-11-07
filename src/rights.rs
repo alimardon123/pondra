@@ -125,16 +125,16 @@ impl From<Refusal> for anyhow::Error {
 
 /// May `who` do `action` to `object`?
 pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusal> {
-    let superuser = who.role == Role::Admin && who.access.is_none();
+    let superuser = who.superuser();
     // (a role first: a token's, and a user's for what no grant names)
     let need = action.role();
-    if (who.access.is_none() || action.privilege().is_none()) && who.role < need {
+    if (who.scope.whole() || action.privilege().is_none()) && who.role < need {
         let needs = match need {
             Role::Admin => "an admin token, or a superuser",
             Role::Write => "a write token, or a user granted a write",
             _ => "a token, or a user's sign-in",
         };
-        return Err(Refusal::new(format!("this {} may not {}: it needs {needs}", if who.access.is_some() { "user" } else { "token" }, action.words())));
+        return Err(Refusal::new(format!("this {} may not {}: it needs {needs}", if who.scope.whole() { "token" } else { "user" }, action.words())));
     }
     let Object::Table(name) = object else { return Ok(()) };
     let table = catalog_name(name);
@@ -146,7 +146,7 @@ pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusa
     if crate::sys::hidden(&table) && action == Action::SelectAll && !superuser {
         return Err(Refusal::new(format!("permission denied: {table} is Pondra's own, and its rows stream to a superuser only")));
     }
-    let (Some(a), Some(privilege)) = (&who.access, action.privilege()) else { return Ok(()) };
+    let (Some(a), Some(privilege)) = (&who.scope.0, action.privilege()) else { return Ok(()) };
     let granted = match action {
         Action::SelectAll => a.columns(privilege, &table) == Some(None),
         _ => a.may(privilege, &table),
@@ -201,7 +201,7 @@ pub fn may_run(role: Role, stmt: &Stmt) -> anyhow::Result<()> {
     let Some(&first) = actions.first() else { return Ok(()) };
     let who = as_role(role, first)?;
     // (CLONE is enough to make a branch, and its owner drops it: `branch::door` checks)
-    if who.access.is_some() && matches!(stmt, Stmt::Ddl(ds) if ds.len() == 1 && matches!(ds[0], crate::ddl::Ddl::CreateDatabase { clone: Some(_), .. } | crate::ddl::Ddl::DropDatabase { .. })) {
+    if !who.scope.whole() && matches!(stmt, Stmt::Ddl(ds) if ds.len() == 1 && matches!(ds[0], crate::ddl::Ddl::CreateDatabase { clone: Some(_), .. } | crate::ddl::Ddl::DropDatabase { .. })) {
         return Ok(());
     }
     let object = if table.is_empty() { Object::Lake } else { Object::Table(&table) };
@@ -217,12 +217,16 @@ pub fn may_run(role: Role, stmt: &Stmt) -> anyhow::Result<()> {
 #[derive(Clone, Default)]
 pub struct Scope(Option<std::sync::Arc<crate::users::Access>>);
 
-/// The scope of the request being served.
-pub fn scope() -> Scope { crate::auth::current().map_or_else(Scope::default, |p| Scope::of(&p)) }
+/// The scope of the request being served: its principal's (`Principal::scope`).
+pub fn scope() -> Scope { crate::auth::current().map(|p| p.scope).unwrap_or_default() }
 
 impl Scope {
-    /// What `who` may see.
-    pub fn of(who: &Principal) -> Scope { Scope(who.access.clone()) }
+    /// What a user who isn't a superuser may see: what `access` grants it (`users::principal_with` makes it once, as the
+    /// principal is made).
+    pub fn granted(access: std::sync::Arc<crate::users::Access>) -> Scope { Scope(Some(access)) }
+
+    /// A user's own quota (`users::quota`); None: whole, which has none.
+    pub fn limits(&self) -> Option<crate::users::Limits> { self.0.as_ref().map(|a| a.limits) }
 
     /// Everything: no grants narrow it. A remembered answer, the key lookup and the results cache serve only a whole
     /// scope (a user's grants may change, and its plan reads what they name).
@@ -303,7 +307,7 @@ mod tests {
 
     fn user(grants: &[(&str, On, &[&str])]) -> Principal {
         let grants = grants.iter().map(|(p, on, cols)| Grant { privilege: p.to_string(), on: on.clone(), columns: cols.iter().map(|c| c.to_string()).collect() }).collect();
-        Principal { name: "ann".into(), access: Some(Arc::new(Access::granted(grants))), ..Principal::of(Role::Read) }
+        Principal { name: "ann".into(), scope: Scope::granted(Arc::new(Access::granted(grants))), ..Principal::of(Role::Read) }
     }
 
     fn said(r: Result<(), Refusal>) -> String { r.err().map(|r| r.text).unwrap_or_else(|| "ok".into()) }
