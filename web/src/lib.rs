@@ -19,13 +19,6 @@ mod spill;
 extern "C" {
     #[wasm_bindgen(js_namespace = console)]
     fn error(text: &str);
-    #[wasm_bindgen(js_namespace = console, js_name = log)]
-    fn console_log(text: &str);
-}
-
-/// Where a page's member says its lines (a lake's format moved on, why its lake stopped): the console.
-fn said(line: &str) {
-    console_log(line)
 }
 
 /// A page: tables given to it, SQL read as a node reads it, answers in a node's bytes. It is the module's one page
@@ -292,7 +285,7 @@ fn give(settings: Vec<(String, String)>) -> Result<(), JsValue> {
 /// `node` (`node.rs`) answers the tables the page doesn't have, and the bytes its allocator holds (`heap::live`) are
 /// watched against the line its device has (`device_line`).
 fn options(store: Option<Arc<dyn object_store::ObjectStore>>, node: Option<Node>) -> pondra::page::Options {
-    pondra::page::Options { store, node, memory: Some(Arc::new(heap::live)), line: device_line(), say: Some(said), ..Default::default() }
+    pondra::page::Options { store, node, memory: Some(Arc::new(heap::live)), line: device_line(), ..Default::default() }
 }
 
 /// Refuses `node` and `token` in a join's options by name: a join's node is its `url`, and its sign-in its `session`.

@@ -95,8 +95,9 @@ pub struct Options {
     /// `node`. A joined page has no `store`. A body that isn't plain text is not routed, so its write fails 25006 on the page.
     /// None: a page of its own.
     pub joined: Option<Join>,
-    /// Where the page's member says its lines (a lake's format moved on, why it stopped): the page's console (`web/`). None
-    /// says them nowhere.
+    /// Where the page's member says its lines (a lake's format moved on, why it stopped), as a node writes them to its log.
+    /// None says them nowhere. `web/` gives none: under Node a page's console is the program's stdout, which a caller reads
+    /// as its own (`web_check.mjs`'s children answer in JSON there). Why a page stopped is in its answers.
     pub say: Option<fn(&str)>,
 }
 
@@ -470,6 +471,13 @@ impl Page {
             crate::node::unclaim_page();
         }
         self.member.take().map(|paged| paged.close())
+    }
+
+    /// The lifecycle of the page's member, once it has opened: what stops its lake (a joined page's lake moved past this
+    /// build: `format::watch`) or starts it again. tests/page_lake.rs stops a page's lake with it.
+    #[doc(hidden)]
+    pub fn lifecycle(&self) -> Option<crate::lifecycle::Life> {
+        self.member.get().map(|m| m.life.clone() as crate::lifecycle::Life)
     }
 
     /// `close`, for a build with no core's lake: nothing was opened, so nothing ends.
@@ -1490,42 +1498,5 @@ mod tests {
         assert!(shown.contains("(5)") && !shown.contains('$'), "EXECUTE p into a keyed table is the node's write, bound: it routed {shown}");
         assert_eq!(kind(&routed("EXECUTE q", true).await), "lake", "EXECUTE q reads the lake's own table");
         Ok(())
-    }
-
-    /// A page whose lake stops (its lifecycle's stop: a joined page's lake moved past this build, `format::watch`) answers every
-    /// request with why and 57P01, and its worker lives on; a restart answers 57P03 (redesign step 2, the page's `Lifecycle`).
-    /// Closed, the module's page is claimed again, and the new one answers.
-    #[cfg(feature = "lake")]
-    #[test]
-    fn a_page_whose_lake_stopped_answers_by_name_and_opens_again() {
-        // (a page's planning needs more than a test thread's 2 MB, as tests/page_lake.rs's does: invariant 195)
-        std::thread::Builder::new().stack_size(32 << 20).spawn(|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread().thread_stack_size(32 << 20).enable_all().build().unwrap();
-            runtime.block_on(async {
-                async fn sql(page: &Page, text: &'static str) -> (u16, Option<String>, String) {
-                    let a = page.request("POST", "/sql?format=csv", &[], bytes::Bytes::from_static(text.as_bytes())).await;
-                    (a.status, a.header("x-pondra-sqlstate").map(str::to_string), String::from_utf8_lossy(&a.body).into_owned())
-                }
-                let life = |page: &Page| -> crate::lifecycle::Life { page.member.get().expect("opened").life.clone() };
-                let mut page = Page::open_lake(&Options::default()).await.expect("a page opens");
-                assert_eq!(sql(&page, "SELECT 1").await.0, 200, "it answers");
-                life(&page).stop("a test's stop".into());
-                for _ in 0..2 {
-                    let (status, code, words) = sql(&page, "SELECT 1").await;
-                    assert_eq!((status, code.as_deref()), (503, Some("57P01")), "every request after the stop: {words}");
-                    assert!(words.contains("a test's stop") && words.contains("open it again"), "{words}");
-                }
-                page.close().await;
-                let mut page = Page::open_lake(&Options::default()).await.expect("the module's page is claimed again");
-                assert_eq!(sql(&page, "SELECT 1").await.0, 200, "the new page answers");
-                let life = life(&page);
-                let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| life.restart("a test's restart", &[]))).expect_err("a restart doesn't return");
-                assert!(unwound.downcast_ref::<crate::lifecycle::Restarting>().is_some(), "it unwinds with Restarting");
-                let (status, code, words) = sql(&page, "SELECT 1").await;
-                assert_eq!((status, code.as_deref()), (503, Some("57P03")), "a restart: {words}");
-                assert!(words.contains("a test's restart"), "{words}");
-                page.close().await;
-            });
-        }).unwrap().join().unwrap();
     }
 }

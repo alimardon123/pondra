@@ -176,7 +176,7 @@ pub struct PageLife {
 }
 
 impl PageLife {
-    /// A page's lifecycle, saying its lines with `say` (the page's console: `web/`), or nowhere.
+    /// A page's lifecycle, saying its lines with `say` (`page::Options::say`), or nowhere.
     pub fn new(say: Option<fn(&str)>) -> Arc<PageLife> { Arc::new(PageLife { stopped: Mutex::new(None), say }) }
 
     /// The SQLSTATE and the words of how the member ended (`stop`, `restart`), or None while it lives.
@@ -853,5 +853,34 @@ mod tests {
         super::unclaim_page();
         super::claim_page().expect("the page is claimable again once it is given back");
         super::unclaim_page();
+    }
+
+    /// A page's lifecycle keeps how its member ended: a stop's 57P01 with why and the way out, said to the page's console;
+    /// a restart's 57P03, after which the task that asked unwinds with `Restarting`. The first end is the one kept. It has no
+    /// program and leads no other lake. (No page is claimed or opened here: `page::tests` says why. tests/page_lake.rs step 11
+    /// runs a page through it.)
+    #[test]
+    fn a_page_life_keeps_its_first_end_and_unwinds_on_a_restart() {
+        use crate::lifecycle::Lifecycle;
+        static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        fn said(line: &str) { SAID.lock().unwrap().push(line.to_string()) }
+        let stopped = super::PageLife::new(Some(said));
+        assert!(stopped.stopped().is_none(), "a member that lives has not ended");
+        stopped.stop("a test's stop".into());
+        let (code, words) = stopped.stopped().expect("a stop is kept");
+        assert_eq!(code, "57P01");
+        assert!(words.contains("a test's stop") && words.contains("open it again"), "{words}");
+        assert_eq!(SAID.lock().unwrap().as_slice(), [words.clone()], "the stop is said to the page's console");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stopped.restart("a later restart", &[]))).expect_err("a restart doesn't return");
+        assert!(unwound.downcast_ref::<super::Restarting>().is_some(), "it unwinds with Restarting");
+        assert_eq!(stopped.stopped().map(|(c, _)| c), Some("57P01"), "the first end is the one kept");
+        let restarted = super::PageLife::new(None);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| restarted.restart("a test's restart", &[])));
+        let (code, words) = restarted.stopped().expect("a restart is kept");
+        assert_eq!(code, "57P03");
+        assert!(words.contains("a test's restart"), "{words}");
+        assert!(restarted.program().is_err() && !restarted.one_off() && restarted.owns_process());
+        let elsewhere = futures::executor::block_on(restarted.lead_elsewhere("s3://b/l")).expect_err("a page leads its own lake only");
+        assert!(elsewhere.to_string().contains("s3://b/l"), "{elsewhere}");
     }
 }
