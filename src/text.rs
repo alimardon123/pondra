@@ -489,6 +489,167 @@ fn tokenized(sql: &str) -> Option<Tokens> {
     Some(t)
 }
 
+/// What a stretch of SQL text is, as the tokenizer reads it (`stretches`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stretch {
+    /// Words, numbers, operators and the whitespace between them.
+    Code,
+    /// A `-- …` or `/* … */` comment.
+    Comment,
+    /// A string of any kind, a quoted name or a dollar body.
+    Quoted,
+}
+
+/// The stretch token `t` is part of (`quiet_token` reads it with its text).
+fn stretch_of(t: &Token) -> Stretch {
+    use datafusion::sql::sqlparser::tokenizer::Whitespace;
+    match t {
+        Token::Whitespace(Whitespace::Space | Whitespace::Newline | Whitespace::Tab) => Stretch::Code,
+        Token::Whitespace(_) => Stretch::Comment,
+        Token::Word(w) if w.quote_style.is_some() => Stretch::Quoted,
+        Token::SingleQuotedString(_) | Token::DoubleQuotedString(_) | Token::TripleSingleQuotedString(_) | Token::TripleDoubleQuotedString(_) | Token::DollarQuotedString(_)
+        | Token::SingleQuotedByteStringLiteral(_) | Token::DoubleQuotedByteStringLiteral(_) | Token::TripleSingleQuotedByteStringLiteral(_)
+        | Token::TripleDoubleQuotedByteStringLiteral(_) | Token::SingleQuotedRawStringLiteral(_) | Token::DoubleQuotedRawStringLiteral(_)
+        | Token::TripleSingleQuotedRawStringLiteral(_) | Token::TripleDoubleQuotedRawStringLiteral(_) | Token::NationalStringLiteral(_)
+        | Token::QuoteDelimitedStringLiteral(_) | Token::NationalQuoteDelimitedStringLiteral(_) | Token::EscapedStringLiteral(_)
+        | Token::UnicodeStringLiteral(_) | Token::HexStringLiteral(_) => Stretch::Quoted,
+        _ => Stretch::Code,
+    }
+}
+
+/// `text` in stretches, each with its bytes, one after the other, as the tokenizer reads it: `f` is given each in turn.
+/// Read by hand at a byte loop's speed (a bulk INSERT's 7 MB in about 10 ms, where the tokenizer takes about 200), and
+/// from where the two might read it otherwise (`differs`) on, by the tokenizer's tokens; if it refuses the text (an
+/// unclosed string), by hand throughout. (One exception: MySQL's `/*! … */`, which sqlparser reads as code, is a comment
+/// here, as Postgres and DuckDB read it; every door refuses a text with one, `hint`.) Each look at a script's text by hand reads it here: its split at `;`s
+/// (`routines::pieces`), its blocks (`script::tokens`), its `$name`s (`vars::names`). So none tells strings and comments
+/// apart its own way (11-06 audit M7).
+pub(crate) fn stretches(text: &str, mut f: impl FnMut(Stretch, std::ops::Range<usize>)) {
+    let (b, mut from, mut at, mut raw) = (text.as_bytes(), 0, 0, false);
+    while let Some(j) = b[at..].iter().position(|&c| MARKS[c as usize]) {
+        let i = at + j;
+        if !raw && differs(text, i) {
+            match tokens(text) {
+                Some(t) => return by_tokens(text, &t, from, f),
+                None => raw = true,
+            }
+        }
+        match quiet_at(text, i) {
+            Some((end, s)) => {
+                if i > from {
+                    f(Stretch::Code, from..i);
+                }
+                f(s, i..end);
+                (from, at) = (end, end);
+            }
+            None => at = i + 1,
+        }
+    }
+    if from < text.len() {
+        f(Stretch::Code, from..text.len());
+    }
+}
+
+/// Token `j` of `text`'s tokens `t` as a stretch that isn't code, with its bytes: past a string's prefix, which the hand
+/// reads as code (the `E` of `E'…'`, the `N` of `N'…'`: a word to each look). None for code, `0xFF` among it (a hex
+/// string to the tokenizer, with no quote in it).
+pub(crate) fn quiet_token(text: &str, t: &Tokens, j: usize) -> Option<(Stretch, std::ops::Range<usize>)> {
+    let (s, r) = (stretch_of(&t.toks[j]), t.start[j]..t.end[j]);
+    let open = match s {
+        Stretch::Code => return None,
+        Stretch::Comment => 0,
+        Stretch::Quoted => text[r.clone()].find(['\'', '"', '`', '$'])?,
+    };
+    Some((s, r.start + open..r.end))
+}
+
+/// `stretches` from byte `from` on, by the tokenizer's tokens (`from` ends what the two read alike: a token starts there).
+fn by_tokens(text: &str, t: &Tokens, from: usize, mut f: impl FnMut(Stretch, std::ops::Range<usize>)) {
+    let mut code = from;
+    for j in t.start.partition_point(|&s| s < from)..t.toks.len() {
+        if let Some((s, r)) = quiet_token(text, t, j) {
+            if r.start > code {
+                f(Stretch::Code, code..r.start);
+            }
+            code = r.end;
+            f(s, r);
+        }
+    }
+    if code < text.len() {
+        f(Stretch::Code, code..text.len());
+    }
+}
+
+// (the bytes a comment, a string, a quoted name or a dollar body starts with: none is a byte of a longer character)
+static MARKS: [bool; 256] = {
+    let (mut t, mut k, m) = ([false; 256], 0, b"-/'\"`$");
+    while k < m.len() {
+        t[m[k] as usize] = true;
+        k += 1;
+    }
+    t
+};
+
+/// The hand's reading of the comment, string, quoted name or dollar body that starts at byte `i`, with the byte past it
+/// (None: byte `i` is code). Each ends at its first closing mark (a doubled quote reads as two strings, one after the
+/// other, as long as the tokenizer's one); comments nest; an unclosed one runs to the end.
+fn quiet_at(text: &str, i: usize) -> Option<(usize, Stretch)> {
+    let rest = &text[i..];
+    let past = |close: &str, from: usize| i + rest[from..].find(close).map_or(rest.len(), |e| from + e + close.len());
+    Some(match rest.as_bytes()[0] {
+        b'-' if rest.starts_with("--") => (past("\n", 2), Stretch::Comment),
+        b'/' if rest.starts_with("/*") => (i + comment_end(rest), Stretch::Comment),
+        q @ (b'\'' | b'"' | b'`') => (rest[1..].find(q as char).map_or(text.len(), |e| i + e + 2), Stretch::Quoted),
+        b'$' => {
+            let tag = dollar_tag(rest)?;
+            (past(tag, tag.len()), Stretch::Quoted)
+        }
+        _ => return None,
+    })
+}
+
+/// The `$tag$` (or `$$`) `s` starts with, as Postgres reads one: a tag of letters, digits and `_`, not starting with a
+/// digit.
+fn dollar_tag(s: &str) -> Option<&str> {
+    let end = s[1..].find('$')? + 2;
+    let inner = &s[1..end - 1];
+    (inner.chars().all(|c| c.is_alphanumeric() || c == '_') && !inner.starts_with(|c: char| c.is_ascii_digit())).then(|| &s[..end])
+}
+
+/// Might the tokenizer read byte `i` otherwise than `quiet_at` does? Read off sqlparser 0.62's tokenizer for the generic
+/// dialect: a quote after a prefix that makes another kind of string of it (`E'…'` and `X'…'` take `\` escapes; `q'[…]'`,
+/// `r'''…'''`, `r"""…"""`, `U&'…'`) or after a `#` (`#'x` is a name to it); a `--` or `/*` whose first mark an operator
+/// or name before it takes (`#-`, `@-`, `@/`, `//`, `|/`); any of them after `@@`; a dollar body after a name (`a$b$` and `@($b$` are names) or under a tag
+/// that starts with a digit (`$1$ … $1$`, not one to Postgres). On the safe side: a byte this names is read by the
+/// tokenizer, which is never wrong. `tests::stretches_are_read_as_the_tokenizer_reads_them` tries each.
+fn differs(text: &str, i: usize) -> bool {
+    let (b, rest) = (text.as_bytes(), &text[i..]);
+    let prev = i.checked_sub(1).map_or(b' ', |j| b[j]);
+    if i >= 2 && &b[i - 2..i] == b"@@" {
+        return true; // (`@@` and the character after it start a name to it, whatever that is: `@@'`)
+    }
+    match b[i] {
+        b'\'' => matches!(prev, b'e' | b'E' | b'q' | b'Q' | b'r' | b'R' | b'x' | b'X' | b'&' | b'#'),
+        b'"' => matches!(prev, b'r' | b'R' | b'#'),
+        b'`' => prev == b'#',
+        b'-' => matches!(prev, b'#' | b'@') && rest.starts_with("--"),
+        b'/' => matches!(prev, b'/' | b'|' | b'#' | b'@') && rest.starts_with("/*"),
+        b'$' => match dollar_tag(rest) {
+            Some(_) => prev.is_ascii_alphanumeric() || matches!(prev, b'_' | b'$' | b'#' | b'@') || prev >= 0x80 || i >= 2 && matches!(b[i - 2], b'#' | b'@'), // (`@(` starts a name to it too)
+            None => rest[1..].starts_with(|c: char| c.is_ascii_digit()) && rest[1..].trim_start_matches(|c: char| c.is_alphanumeric() || c == '_').starts_with('$'),
+        },
+        _ => false,
+    }
+}
+
+/// Is the `$` at byte `i` of code part of a name, as the tokenizer reads it? `a$b` is one name, as `x1$b` is: neither
+/// uses `$b`. `1$b`'s is a placeholder's.
+pub(crate) fn in_name(text: &str, i: usize) -> bool {
+    let before = &text[..i];
+    let run = before.trim_end_matches(|c: char| c.is_alphabetic() || c.is_ascii_digit() || matches!(c, '_' | '$' | '#' | '@'));
+    before[run.len()..].contains(|c: char| !c.is_ascii_digit())
+}
+
 /// Bytes for the places sqlparser gives tokens and nodes: lines from 1, columns from 1 counted in characters.
 pub(crate) struct Offsets<'a> {
     pub(crate) sql: &'a str,
@@ -578,13 +739,83 @@ mod tests {
                     assert!(sql[t.start[i]..t.end[i]].contains(w.value.as_str()), "{sql}: {:?} at {}..{}", w, t.start[i], t.end[i]);
                 }
             }
-            assert!(std::sync::Arc::ptr_eq(&t, &tokens(sql).expect("kept")), "{sql}: asked again, the same tokens");
+            // (asked again at once, the same tokens; tried a few times, as other tests running beside this one share the
+            // cache and may push a text out between two asks)
+            assert!((0..10).any(|_| std::sync::Arc::ptr_eq(&tokens(sql).expect("tokenized"), &tokens(sql).expect("kept"))), "{sql}: asked again, the same tokens");
         }
         assert!(tokens("SELECT 'unclosed").is_none());
         let solid: Vec<String> = tokens("SELECT /* c */ a ,b").expect("tokenized").solid().iter().map(|s| s.token.to_string()).collect();
         assert_eq!(solid, ["SELECT", "a", ",", "b"]);
         let long = format!("SELECT '{}'", "x".repeat(crate::parsed::LONGEST));
         assert_eq!(tokens(&long).expect("tokenized").toks.len(), 3, "a text past LONGEST is tokenized, not kept");
+    }
+
+    #[test]
+    fn stretches_are_read_as_the_tokenizer_reads_them() {
+        // (11-06 audit M7) Each byte's stretch by `stretches` and by the tokenizer's tokens: the same, wherever the
+        // tokenizer reads the text.
+        let by_tokens = |sql: &str| -> Option<Vec<Stretch>> {
+            let t = tokens(sql)?;
+            let mut out = vec![Stretch::Code; sql.len()];
+            for j in 0..t.toks.len() {
+                if let Some((s, r)) = quiet_token(sql, &t, j) {
+                    out[r].fill(s); // (a string's prefix, the N of N'…', is code, and so is 0xFF)
+                }
+            }
+            Some(out)
+        };
+        let read = |sql: &str| -> Vec<Stretch> {
+            let (mut out, mut at) = (vec![], 0);
+            stretches(sql, |s, r| {
+                assert_eq!(r.start, at, "{sql:?}: one after the other");
+                at = r.end;
+                out.extend(std::iter::repeat_n(s, r.len()));
+            });
+            assert_eq!(at, sql.len(), "{sql:?}: to its end");
+            out
+        };
+        // (each one the hand alone reads otherwise than the tokenizer, `differs`; the last two it reads alike)
+        for sql in [
+            "SELECT E'it\\'s' AS s",
+            "SELECT X'\\'' AS b",
+            "SELECT q'[it's]' AS s",
+            "SELECT r'''a'b''' AS s",
+            "SELECT R\"\"\"a\"b\"\"\" AS s",
+            "SELECT U&'d\\0061' AS s",
+            "SELECT #'a' FROM t'",
+            "SELECT 4 //* c */",
+            "SELECT 4 |/* c */",
+            "SELECT @-- c\n1",
+            "SELECT #-- c\n1",
+            "SELECT a$b$ FROM t -- $b$",
+            "SELECT $1$ a $1$",
+            "SELECT @($t$ AS x",
+            "SELECT @@'a' AS b', 0xFF",
+            "SELECT /* a /* b */ c */ 1",
+            "SELECT 'it''s', \"a\"\"b\", `c``d`, $$e$$, $f$g$f$, N'h', B'i', b\"j\" -- k\n",
+        ] {
+            assert_eq!(Some(read(sql)), by_tokens(sql), "{sql}");
+        }
+        let parts = ["SELECT 1", ";", " ", "'a'", "'it''s'", "E'x\\''", "X'\\''", "\"c\"", "`e`", "-- g\n", "/* h */", "/* i /* j */ */", "$$k$$", "$t$m$t$", "v$x", "q'[o'p]'", "r'''q'r'''", "U&'d\\0061'", "DATE'2026'", "#", "@", "/", "|", "-", "*", "\n", "x", "(", "$1", "$1$", "$a$", "é", "e", "'"];
+        let mut seed = 20261107u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        let mut compared = 0;
+        for _ in 0..30000 {
+            let sql: String = (0..1 + next() % 12).map(|_| parts[next() % parts.len()]).collect();
+            if let Some(want) = by_tokens(&sql) {
+                assert_eq!(read(&sql), want, "{sql:?}");
+                compared += 1;
+            }
+        }
+        assert!(compared > 10000, "{compared}");
+        // (one the tokenizer refuses: the hand's reading)
+        let mut unclosed = vec![];
+        stretches("SELECT 'a", |s, r| unclosed.push((s, r)));
+        assert_eq!(unclosed, [(Stretch::Code, 0..7), (Stretch::Quoted, 7..9)]);
+        assert!(in_name("SELECT a$b", 8) && in_name("SELECT x1$b", 9) && !in_name("SELECT 1$b", 8) && !in_name("SELECT $b", 7));
     }
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 

@@ -212,32 +212,23 @@ pub fn bound(sql: &str) -> Result<std::borrow::Cow<'_, str>> {
     })
 }
 
-/// The `$name`s `sql` uses, outside strings, quoted names, comments and `$tag$` bodies, in order,
-/// each once.
+/// The `$name`s `sql` uses, outside strings, quoted names, comments and `$tag$` bodies as the tokenizer reads them
+/// (`text::stretches`), in order, each once; not one inside a name (`a$b`), as the tokenizer reads none there either.
 pub fn names(sql: &str) -> Vec<String> {
-    let (mut out, mut i, b) = (Vec::<String>::new(), 0, sql.as_bytes());
-    while i < b.len() {
-        let rest = &sql[i..];
-        let past = |end: &str, from: usize| rest[from..].find(end).map_or(rest.len(), |e| from + e + end.len());
-        i += match b[i] {
-            b'-' if rest.starts_with("--") => past("\n", 2),
-            b'/' if rest.starts_with("/*") => past("*/", 2),
-            b'\'' => past("'", 1),
-            b'"' => past("\"", 1),
-            b'$' => match crate::routines::dollar_tag(rest) {
-                Some(tag) => past(tag, tag.len()),
-                None => {
-                    let n = rest[1..].find(|c: char| !(c.is_alphanumeric() || c == '_')).map_or(rest.len() - 1, |e| e);
-                    let name = &rest[1..1 + n];
-                    if name.starts_with(|c: char| c.is_alphabetic() || c == '_') && !out.iter().any(|o| o == name) {
-                        out.push(name.to_string());
-                    }
-                    1 + n
-                }
-            },
-            _ => rest.chars().next().map_or(1, char::len_utf8),
-        };
-    }
+    let mut out = Vec::<String>::new();
+    crate::text::stretches(sql, |s, r| {
+        if s != crate::text::Stretch::Code {
+            return;
+        }
+        for (j, _) in sql[r.clone()].match_indices('$') {
+            let at = r.start + j;
+            let rest = &sql[at + 1..r.end];
+            let name = &rest[..rest.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(rest.len())];
+            if name.starts_with(|c: char| c.is_alphabetic() || c == '_') && !crate::text::in_name(sql, at) && !out.iter().any(|o| o == name) {
+                out.push(name.to_string());
+            }
+        }
+    });
     out
 }
 
@@ -560,6 +551,8 @@ mod tests {
             assert_eq!(set(s), Some(("x".into(), "2".into())), "{s}");
         }
         assert!(change("SET x = 2").is_none()); // (a session setting)
+        // (11-06 audit M7) the `$name`s used, past strings and comments as the tokenizer reads them; none in a name
+        assert_eq!(super::names("SELECT E'it\\'s $a', $b, /* /* $c */ $d */ $e, a$f, 1+$g, X'\\'$h'"), ["b", "e", "g"]);
         assert!(matches!(change("RESET $x"), Some(Change::Reset(n)) if n == "x"));
         assert!(matches!(change("DECLARE $x INT := 1"), Some(Change::Declare { ty: Some(t), default: Some(d), .. }) if t == "INT" && d == "1"));
     }
