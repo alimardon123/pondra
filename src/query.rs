@@ -440,12 +440,14 @@ pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &Tabl
     let hide = !deleted && !meta.key.is_empty() && meta.columns().any(|(c, _)| c == "_deleted");
     // (a view that finishes its answers reads under its query's names already: `finish.rs`, and a
     // view's table is never renamed or dropped a column of)
-    if (!meta.mapped() && !hide && !meta.moved()) || meta.finish.is_some() {
+    let relabeled = meta.relabeled(); // (a column SQL reads as another type than its files hold: `Col::sql_type`)
+    if (!meta.mapped() && !hide && !meta.moved() && !relabeled) || meta.finish.is_some() {
         return Ok(Arc::new(Table(provider)));
     }
     let df = ctx.read_table(provider)?;
     let shown = |c: &str| !meta.is_dropped(c) && !(hide && c == "_deleted");
-    let df = crate::answer::renamed(df, |c| meta.name_of(c).to_string(), shown)?;
+    let sql_type = |c: &str| relabeled.then(|| meta.col(c)?.sql_type.as_deref()).flatten().and_then(|t| crate::answer::dtype(t).ok());
+    let df = crate::answer::renamed(df, |c| meta.name_of(c).to_string(), shown, sql_type)?;
     let df = if meta.moved() { crate::answer::reordered(df, &meta.sql_order())? } else { df }; // (a column moved: SQL's order)
     Ok(Arc::new(Table(df.into_view())))
 }

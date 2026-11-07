@@ -601,7 +601,7 @@ impl crate::reach::Reach for Lake {
 /// A table read from another engine's log, as a node's table (its columns, names and files; the rest is the
 /// catalog's own and empty).
 pub(crate) fn table_meta(found: crate::read_delta::Found) -> TableMeta {
-    { let mut entry = TableMeta::made(crate::store::Made { columns: found.columns, names: found.names, ..Default::default() }); entry.files = found.files; entry }
+    { let mut entry = TableMeta::made(crate::store::Made { columns: found.columns, names: found.names, logical_types: found.logical_types, ..Default::default() }); entry.files = found.files; entry }
 }
 
 /// Whom a store `build` makes is for.

@@ -508,6 +508,14 @@ def inserts(con, root, expected, spark, port):
     ok = theirs == [{"id": 1, "addr": {"city": "Oslo"}, "stops": [{"city": "Bergen"}]}, {"id": 2, "addr": {"city": "Rome"}, "stops": [{"city": "Bari"}, {"city": "Pisa"}]}]
     out["insert:deltars_nested"] = ok
     print(json.dumps({"table": "INSERT into delta-rs's table with names mapped and structs (one in a list), read back by delta-rs", "equal": ok, **({} if ok else {"theirs": theirs})}, default=str), flush=True)
+    # Pondra reads that table as delta-rs does (H2's read side): a struct's fields, in its files under their physical names,
+    # under SQL's, whole, by field and in a list, and its type as SQL's names say it (none of the files')
+    ours = [{k: plain(v) for k, v in r.items()} for r in con.sql("SELECT id, addr, stops FROM drw.nested ORDER BY id").collect().to_pylist()]
+    picked = con.sql("SELECT addr['city'] AS city, stops[1]['city'] AS first FROM drw.nested WHERE addr['city'] = 'Rome'").collect().to_pylist()
+    typed = con.sql("SELECT arrow_typeof(addr) AS a, arrow_typeof(stops) AS s FROM drw.nested LIMIT 1").collect().to_pylist()
+    ok = ours == theirs and picked == [{"city": "Rome", "first": "Bari"}] and all("city" in t and "col-" not in t for t in typed[0].values())
+    out["read:deltars_nested"] = ok
+    print(json.dumps({"table": "delta-rs's table with names mapped and structs (one in a list), read by Pondra as delta-rs reads it", "equal": ok, **({} if ok else {"ours": ours, "picked": picked, "typed": typed})}, default=str), flush=True)
     for t, words, row in (("strict", "NOT NULL value inside", "(2, {'city': 'Rome'})"),):
         try:
             con.sql(f"INSERT INTO drw.{t} VALUES {row}")

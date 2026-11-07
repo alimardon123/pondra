@@ -516,13 +516,84 @@ pub fn read_schema_of<'a>(columns: impl IntoIterator<Item = (&'a str, &'a str)>)
 /// DataFusion 55's push_down_leaf_projections, which takes a JSON or struct field down to the scan, adds `?table?.id`
 /// beside such an alias's `id`, and refused the plan as ambiguous (`doc->'a'` on every keyed table, and on any table with
 /// a renamed column). Used by a node's tables (`query::named`).
-pub fn renamed(df: DataFrame, name_of: impl Fn(&str) -> String, shown: impl Fn(&str) -> bool) -> datafusion::error::Result<DataFrame> {
+/// A column `sql_type` gives a type is read as that type (`relabel`): a mapped Delta table's struct, its fields' physical
+/// names as SQL's.
+pub fn renamed(df: DataFrame, name_of: impl Fn(&str) -> String, shown: impl Fn(&str) -> bool, sql_type: impl Fn(&str) -> Option<DataType>) -> datafusion::error::Result<DataFrame> {
     let keep: Vec<Expr> = df.schema().fields().iter().filter(|f| shown(f.name())).map(|f| {
         let name = name_of(f.name());
         let column = ident(f.name());
-        if name == *f.name() { column } else { column.alias(name) }
+        match sql_type(f.name()) {
+            Some(t) => relabel(column, t).alias(name),
+            None if name == *f.name() => column,
+            None => column.alias(name),
+        }
     }).collect();
     df.select(keep)
+}
+
+/// `a` with its type's names as `to` says them: the same values, its structs' fields (at any depth, a list's items' too)
+/// under `to`'s names, with `to`'s nullability and metadata (a field's Parquet id), no value copied; each leaf keeps its
+/// own type. A mapped Delta table's struct is read so, its files' physical names as SQL's (`relabel`), and written so
+/// the other way (`write_outside`).
+pub fn relabeled(a: &ArrayRef, to: &DataType) -> datafusion::error::Result<ArrayRef> {
+    use datafusion::arrow::array::{Array, AsArray, ListArray, StructArray};
+    let named = |want: &Field, c: &ArrayRef| Arc::new(Field::new(want.name(), c.data_type().clone(), want.is_nullable()).with_metadata(want.metadata().clone()));
+    Ok(match (a.data_type(), to) {
+        (from, to) if from == to => a.clone(),
+        (DataType::Struct(have), DataType::Struct(want)) if have.len() == want.len() => {
+            let s = a.as_struct();
+            let columns = s.columns().iter().zip(want.iter()).map(|(c, f)| relabeled(c, f.data_type())).collect::<datafusion::error::Result<Vec<_>>>()?;
+            let fields: Vec<_> = want.iter().zip(&columns).map(|(f, c)| named(f, c)).collect();
+            Arc::new(StructArray::try_new(fields.into(), columns, s.nulls().cloned())?)
+        }
+        (DataType::List(_), DataType::List(item)) => {
+            let l = a.as_list::<i32>();
+            let values = relabeled(l.values(), item.data_type())?;
+            Arc::new(ListArray::try_new(named(item, &values), l.offsets().clone(), values, l.nulls().cloned())?)
+        }
+        _ => a.clone(),
+    })
+}
+
+/// The type `relabeled` makes of a `from` array.
+fn relabeled_type(from: &DataType, to: &DataType) -> DataType {
+    let named = |want: &Field, t: DataType| Arc::new(Field::new(want.name(), t, want.is_nullable()).with_metadata(want.metadata().clone()));
+    match (from, to) {
+        (DataType::Struct(have), DataType::Struct(want)) if have.len() == want.len() => {
+            DataType::Struct(have.iter().zip(want.iter()).map(|(h, w)| named(w, relabeled_type(h.data_type(), w.data_type()))).collect())
+        }
+        (DataType::List(have), DataType::List(item)) => DataType::List(named(item, relabeled_type(have.data_type(), item.data_type()))),
+        _ => from.clone(),
+    }
+}
+
+/// `e` read as `to` (`relabeled`): a function made for that one type, in a plan built here (`renamed`), never named in SQL.
+pub fn relabel(e: Expr, to: DataType) -> Expr {
+    use datafusion::logical_expr::{expr::ScalarFunction, ScalarUDF, Signature, Volatility};
+    let f = ScalarUDF::new_from_impl(Relabel { to, signature: Signature::any(1, Volatility::Immutable) });
+    Expr::ScalarFunction(ScalarFunction::new_udf(Arc::new(f), vec![e]))
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Relabel {
+    to: DataType,
+    signature: datafusion::logical_expr::Signature,
+}
+
+impl datafusion::logical_expr::ScalarUDFImpl for Relabel {
+    fn name(&self) -> &str { "pondra_relabel" }
+
+    fn signature(&self) -> &datafusion::logical_expr::Signature { &self.signature }
+
+    fn return_type(&self, args: &[DataType]) -> datafusion::error::Result<DataType> { Ok(relabeled_type(&args[0], &self.to)) }
+
+    fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> datafusion::error::Result<datafusion::logical_expr::ColumnarValue> {
+        use datafusion::logical_expr::ColumnarValue;
+        Ok(match &args.args[0] {
+            ColumnarValue::Array(a) => ColumnarValue::Array(relabeled(a, &self.to)?),
+            ColumnarValue::Scalar(v) => ColumnarValue::Scalar(datafusion::common::ScalarValue::try_from_array(&relabeled(&v.to_array()?, &self.to)?, 0)?),
+        })
+    }
 }
 
 /// `df` with the columns `order` names in that order, in the places they hold among its columns (a table's columns in SQL's
