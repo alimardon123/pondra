@@ -267,6 +267,14 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &objects::CATALOG,
         #[cfg(feature = "lake")]
         &connect::CONNECTIONS,
+        #[cfg(feature = "lake")]
+        &read_delta::DELTA,
+        #[cfg(feature = "lake")]
+        &catalogs::ICEBERG,
+        #[cfg(feature = "lake")]
+        &kafka_client::KAFKA,
+        #[cfg(feature = "lake")]
+        &sharing_client::SHARING,
         &sparksql::SPARK,
         &engine::ENGINE,
         &pg_functions::POSTGRES,

@@ -17,6 +17,33 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
+/// The `iceberg` extension's type of connection: an Iceberg catalog (REST, Glue, S3 Tables) or a folder of Iceberg
+/// tables, attached as a database (`ATTACH … (TYPE iceberg)`).
+pub static ICEBERG: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "iceberg",
+    requires: &[],
+    register: |r| r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES),
+};
+
+static TABLES: crate::connections::ConnectionType = {
+    use crate::connections::{ConnectionType, Holds, Opt, READ_ONLY, SECRET, URL};
+    ConnectionType {
+        name: "iceberg",
+        holds: Holds::Tables,
+        options: &[
+            URL,
+            Opt { name: "endpoint", required: false, about: "the catalog's REST address, when url is its warehouse" },
+            SECRET,
+            READ_ONLY,
+            Opt { name: "endpoint_type", required: false, about: "glue or s3_tables: an AWS catalog, signed with a TYPE s3 secret" },
+            Opt { name: "access_delegation_mode", required: false, about: "vended_credentials or none: whether the catalog hands out its tables' credentials" },
+        ],
+        schemes: &[], // (a REST catalog's https://, a folder or a bucket, or an AWS account or ARN)
+        secret_types: &["iceberg", "s3", "r2", "gcs", "azure"],
+        about: "an Iceberg catalog (REST, Glue, S3 Tables) or a folder of Iceberg tables: url = 'https://catalog/warehouse'",
+    }
+};
+
 /// A REST catalog as one statement reaches it.
 pub struct Rest {
     base: String, // `{endpoint}/v1/{prefix}`

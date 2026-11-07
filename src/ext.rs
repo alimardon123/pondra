@@ -769,26 +769,31 @@ pub async fn outside_target(lake: &Lake, name: &str) -> Result<Option<String>> {
 /// Leader: keep an attachment of another engine's tables.
 pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>) -> Result<serde_json::Value> {
     crate::ddl::check(name)?;
-    if matches!(kind, "postgres" | "mysql" | "sqlserver") {
-        return Err(crate::codes::coded("0A000", format!("ATTACH … (TYPE {kind}): another database is attached in 1.1 (TYPE postgres, mysql or sqlserver); today TYPE is delta, iceberg, kafka or share")));
-    }
-    ensure!(["delta", "iceberg", "kafka", "share"].contains(&kind), "ATTACH … (TYPE {kind}): delta, iceberg, kafka or share (or a Pondra lake, with no TYPE)");
-    ensure!((kind == "kafka") == url.starts_with("kafka://"), "ATTACH … (TYPE kafka) takes a kafka://brokers URL, and only it does");
+    // (its TYPE and its options are a connection type's, from the registry: ATTACH and CREATE CONNECTION list the same ones)
+    use crate::connections::attached as attachable;
+    let types = crate::connections::named(attachable);
+    let Some(t) = crate::connections::find(kind).filter(|t| attachable(t)) else {
+        if matches!(kind, "postgres" | "mysql" | "sqlserver") {
+            return Err(crate::codes::coded("0A000", format!("ATTACH … (TYPE {kind}): another database is attached in 1.1 (TYPE postgres, mysql or sqlserver); today TYPE is {types}")));
+        }
+        return Err(crate::codes::coded("22023", format!("ATTACH … (TYPE {kind}): {types} (or a Pondra lake, with no TYPE)")));
+    };
+    let at = scheme(url).unwrap_or_default();
+    let others = crate::connections::named(|o| attachable(o) && o.schemes.contains(&at));
+    ensure!(t.reaches(url) && (others.is_empty() || !t.schemes.is_empty()), crate::codes::coded("22023", match t.schemes.is_empty() {
+        true => format!("ATTACH '{url}' … (TYPE {kind}): a {at}:// URL is TYPE {others}'s"),
+        false => format!("ATTACH … (TYPE {kind}) takes a {}:// URL: {}", t.schemes.join(":// or "), t.about),
+    }));
     let mut options = options;
     if kind == "share" {
         options = crate::sharing_client::accept(lake, name, url, options).await?; // (its token kept as a secret)
     }
-    let iceberg_only = ["endpoint_type", "access_delegation_mode"];
-    ensure!(kind == "iceberg" || !options.keys().any(|k| iceberg_only.contains(&k.as_str())), "ENDPOINT_TYPE and ACCESS_DELEGATION_MODE are an Iceberg REST catalog's");
-    let known: &[&str] = match kind {
-        "share" => &["share"],
-        "iceberg" => &["endpoint", "secret", "read_only", "endpoint_type", "access_delegation_mode"],
-        _ => &["endpoint", "secret", "read_only"],
-    };
-    if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
-        bail!("ATTACH … (TYPE {kind}) has no option {k}: {}", known.join(", "));
+    if let Some(k) = options.keys().find(|k| !t.options.iter().any(|o| o.name != "url" && o.name == k.as_str())) {
+        let known: Vec<&str> = t.option_names().into_iter().filter(|o| *o != "url").collect();
+        let theirs = crate::connections::named(|o| attachable(o) && o.options.iter().any(|x| x.name != "url" && x.name == k.as_str()));
+        let theirs = if theirs.is_empty() { String::new() } else { format!(" ({k} is TYPE {theirs}'s)") };
+        return Err(crate::codes::coded("22023", format!("ATTACH … (TYPE {kind}) has no option {k}: {}{theirs}", known.join(", "))));
     }
-    ensure!(kind == "iceberg" || !options.contains_key("endpoint"), "ENDPOINT is an Iceberg REST catalog's");
     if let Some(m) = options.get("access_delegation_mode") {
         ensure!(m == "vended_credentials" || m == "none", "ACCESS_DELEGATION_MODE is vended_credentials or none, not {m}");
     }

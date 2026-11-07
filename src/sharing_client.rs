@@ -6,6 +6,26 @@ use crate::reset::Once;
 use serde_json::{json as j, Value};
 use std::sync::Arc;
 
+/// The `sharing` extension's type of connection: a Delta Sharing server's share, attached as a database
+/// (`ATTACH … (TYPE share)`). Its token is the TYPE share secret whose scope covers the server.
+pub static SHARING: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "sharing",
+    requires: &[],
+    register: |r| r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES),
+};
+
+static TABLES: crate::connections::ConnectionType = {
+    use crate::connections::{ConnectionType, Holds, Opt, URL};
+    ConnectionType {
+        name: "share",
+        holds: Holds::Tables,
+        options: &[URL, Opt { name: "share", required: false, about: "which of the server's shares, when it has more than one for the token" }],
+        schemes: &[], // (https://, checked when it is attached, which also reads a provider's profile)
+        secret_types: &[],
+        about: "a share on a Delta Sharing server, its token in the TYPE share secret covering it: url = 'https://host/delta-sharing'",
+    }
+};
+
 crate::per_node!(pub(crate) static ENDPOINT: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None));
 
 /// Where recipients reach the door (a profile's `endpoint`): `PONDRA_SHARING_URL` (a cluster's
