@@ -316,6 +316,11 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone() };
     if let Some(ledger) = lake.ledger() {
         ledger.charge("answers", Arc::downgrade(&app.results) as std::sync::Weak<dyn crate::ledger::Charged>); // (the remembered answers: `/metrics`' `cache_bytes`)
+        // (the node's caches of what the lake's own floor doesn't reach, charged once whatever lakes it opens: the answers
+        // kept for their pages, and the logs and manifests of Delta and Iceberg tables read)
+        for (name, cache) in [("pages", crate::pages::kept()), ("delta_logs", crate::read_delta::logs()), ("iceberg_manifests", crate::read_iceberg::manifests())] {
+            ledger.charge(name, Arc::downgrade(&cache));
+        }
     }
     crate::constraints::share_lock(&app.lake, app.lock.clone()); // a checked append of this lake takes this lock (`constraints::leader`); the Log is reachable only through the App
     learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)

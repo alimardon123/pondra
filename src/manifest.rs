@@ -190,8 +190,12 @@ impl PruningStatistics for View<'_> {
 // ---------------------------------------------------------------- reading
 
 crate::per_node!(
-    /// Decompressed metadata objects, newest used kept, up to 256 MB (they never change).
-    static CACHE: Mutex<crate::ledger::ByteLru<String, Arc<Vec<u8>>>> = Mutex::new(crate::ledger::ByteLru::new(CACHE_BYTES)); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+    /// Decompressed metadata objects, newest used kept, up to 256 MB (they never change), charged to the node's line,
+    /// which takes them back when it needs the memory (`kept`).
+    static CACHE: Arc<Mutex<crate::ledger::ByteLru<String, Arc<Vec<u8>>>>> = Arc::new(Mutex::new(crate::ledger::ByteLru::new(CACHE_BYTES))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+
+/// The tables' manifests and lists kept, as the node's line counts them (`cache_bytes{cache="manifests"}`).
+pub fn kept() -> Arc<dyn crate::ledger::Charged> { CACHE.clone() }
 const CACHE_BYTES: usize = 256 << 20;
 
 async fn object(lake: &Lake, path: &str) -> Result<Arc<Vec<u8>>> {
