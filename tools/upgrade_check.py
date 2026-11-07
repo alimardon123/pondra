@@ -1233,10 +1233,20 @@ def gone(lake):
 
 # ---------------------------------------------------------------- a rolling upgrade
 
+def tried(f, *args):
+    """`f(*args)`, or False when the node refused it (a check that a node answers at all)."""
+    try:
+        return f(*args)
+    except Failed:
+        return False
+
+
 def rolling_check(old_v, old_bin, new_bin, work, port, leader_first=False):
     """A cluster of release `old_v` upgraded to this build a node at a time, under load: the
     followers first (or the leader first), each stopped and started again on the new binary; then
-    restarted a node at a time again, as the next upgrade from this build will be."""
+    restarted a node at a time again, as the next upgrade from this build will be. With a node of
+    each release, what one writes or hands the other is read: a table's entry, a dropped table's
+    record, a tier job."""
     checks, info = {}, {}
     lake = os.path.join(work, f"rolling-{old_v}-{'leader' if leader_first else 'followers'}-first")
     nodes = [Node(old_bin, lake, port + i, work).start() for i in range(3)]
@@ -1248,7 +1258,7 @@ def rolling_check(old_v, old_bin, new_bin, work, port, leader_first=False):
     load = Load(live, "ev2").start()
     role = lambda x: x.get("/stats", timeout=5)["role"]
     order = sorted(nodes, key=lambda x: (role(x) == "leader") != leader_first)  # (followers first, or the leader)
-    steps, k = {}, 0
+    steps, k, rounds = {}, 0, []
     for x in order:
         time.sleep(4)
         was = role(x)
@@ -1271,10 +1281,23 @@ def rolling_check(old_v, old_bin, new_bin, work, port, leader_first=False):
             info["a table made with a node of each: format, then"] = y.get("/stats", timeout=5)["format"]
             checks[f"a table this build made (a column renamed) while Pondra {old_v} still runs: that release's nodes read it"] = all(
                 until(lambda: z.q("SELECT a, c FROM mid") == [{"a": 1, "c": "x"}], 20) for z in olds) and y.get("/stats", timeout=5)["format"] < LISTS
+            if since(old_v, "0.30.0"):  # (a dropped table's record, `dt/`, holds its entry: `pondra.dropped` reads it)
+                y.q("CREATE TABLE gone (a INT, b VARCHAR)")
+                y.q("ALTER TABLE gone RENAME COLUMN b TO c")
+                y.q("DROP TABLE gone")
+                listed = lambda z: any(r.get("name") == "gone" for r in z.q("SELECT name FROM pondra.dropped"))
+                checks[f"…and one it dropped: Pondra {old_v}'s nodes list it among the dropped tables"] = all(until(lambda: tried(listed, z), 20) for z in olds)
+        if any(z.bin == old_bin for z in live):
+            # (a tier round deals its jobs to every node in turn, each job holding its table's entry: ev2, kv2, mid and
+            # the view's table have rows in the log, more tables than nodes, so one release's entries reach the other's)
+            boss = until(lambda: next((z for z in live if role(z) == "leader"), None), 30)
+            rounds.append({"leader": "this build" if boss.bin == new_bin else old_v, "every job done": tried(lambda z: z.post("/tier") is not None, boss)})
         steps[f"{was} {x.port} on the new binary"] = {"longest wait for an ack, s": load.longest(t0 - 0.5), "seconds": round(time.time() - t0, 1)}
+    info["tier rounds with nodes of both releases"] = rounds
+    checks[f"a tier round with nodes of both releases: every job done, Pondra {old_v}'s and this build's entries each read by the other"] = bool(rounds) and all(r["every job done"] for r in rounds)
     raised = until(lambda: all(y.get("/stats", timeout=5)["format"] == LISTS for y in live), 60)
     # The next upgrade, from this build: each node drained and its leader stepping down.
-    since = time.time()
+    restarting = time.time()
     for x in sorted(list(live), key=lambda x: role(x) == "leader"):
         time.sleep(3)
         live.remove(x)
@@ -1286,7 +1309,7 @@ def rolling_check(old_v, old_bin, new_bin, work, port, leader_first=False):
         until(lambda: y.plain("GET", "/ready")[0] == 200, 30)
         live.append(y)
     time.sleep(2)
-    restarted = load.longest(since)
+    restarted = load.longest(restarting)
     result = load.finish(live[0])
     leader = next(y for y in live if role(y) == "leader")
     info.update({"steps": steps, "then restarted from this build, longest wait for an ack, s": restarted, "releases": leader.get("/stats")["releases"], **result})

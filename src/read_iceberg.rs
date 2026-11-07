@@ -15,8 +15,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 crate::per_node!(
-    /// Manifests already read, by path: a manifest, once written, never changes.
-    static MANIFESTS: Mutex<lru::LruCache<String, Arc<Vec<Value>>>> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+    /// Manifests already read, by path: a manifest, once written, never changes. The newest 256, each charged its parsed
+    /// entries to the node's line, which takes them back when it needs the memory (`manifests`).
+    static MANIFESTS: Arc<Mutex<crate::ledger::ByteLru<String, Arc<Vec<Value>>>>> = Arc::new(Mutex::new(crate::ledger::ByteLru::new(usize::MAX).with_count(256))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+
+/// The Iceberg manifests read, as the node's line counts them (`cache_bytes{cache="iceberg_manifests"}`).
+pub fn manifests() -> Arc<dyn crate::ledger::Charged> { MANIFESTS.clone() }
 
 /// The table at `url` (a table's folder or a metadata file), at its current snapshot or the one
 /// asked for: `version` (of its metadata), `snapshot_from_id`, `snapshot_from_timestamp`.
@@ -203,7 +207,9 @@ async fn manifest(lake: &Lake, path: String) -> Result<Arc<Vec<Value>>> {
         return Ok(e);
     }
     let e = Arc::new(crate::avro::records(&crate::reach::get(lake, &path).await?)?);
-    MANIFESTS.lock().unwrap().put(path, e.clone());
+    let bytes = e.iter().map(crate::ledger::json_bytes).sum();
+    let left = MANIFESTS.lock().unwrap().put(path, e.clone(), bytes);
+    drop(left); // (let go of outside the lock)
     Ok(e)
 }
 

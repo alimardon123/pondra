@@ -280,10 +280,17 @@ mod tests {
             t.set_order(vec!["c7".into()]);
             t
         };
-        lake.cat.commit((0..300).map(|i| (table_key(&format!("t{i}")), json(&entry(i)))).collect(), &[]).await?;
+        // (one entry read as its list, from another lake: below format 6 it is written as format 5's fields too)
+        let mut puts: Vec<_> = (0..300).map(|i| (table_key(&format!("t{i}")), json(&entry(i)))).collect();
+        puts[299].1 = json(&entry(299).as_list());
+        lake.cat.commit(puts, &[]).await?;
         let shapes = |raw: &std::collections::BTreeMap<String, bytes::Bytes>| raw.values().filter(|v| v.starts_with(br#"{"list":"#)).count();
         let at5 = lake.cat.scan_raw("t/", "t0").await?;
         assert!(at5.len() == 300 && at5.values().all(|v| v.starts_with(br#"{"columns":"#)), "below format 6, each as 0.80 wrote it");
+        let mut t3: TableMeta = serde_json::from_slice(&at5[&table_key("t3")])?;
+        t3.set_default("c5", Some("'y'".into())); // (a write of an entry read in format 5's shape, below format 6)
+        lake.cat.commit(vec![(table_key("t3"), json(&t3))], &[]).await?;
+        assert!(lake.cat.get_raw(&table_key("t3")).await?.is_some_and(|v| v.starts_with(br#"{"columns":"#)), "and written in it again");
         set(&lake, LISTS).await?;
         assert_eq!(of(&lake.cat).await?.format, LISTS);
         let raised = lake.cat.scan_raw("t/", "t0").await?;
@@ -296,8 +303,12 @@ mod tests {
         assert_eq!(shapes(&after), 2, "the entry written, and the one made: each its list");
         assert!(after[&table_key("t7")].starts_with(br#"{"list":"#) && after[&table_key("made")].starts_with(br#"{"list":"#));
         for (k, v) in &after {
-            let (t, was): (TableMeta, TableMeta) = (serde_json::from_slice(v)?, if k == &table_key("t7") { t7.clone() } else { entry(k[3..].parse().unwrap_or(0)) });
-            assert_eq!((t.sql_columns(), t.column_list(), json(&t.logical().shaped(true))), (was.sql_columns(), was.column_list(), json(&was.logical().shaped(true))), "{k}: as before");
+            let (t, was): (TableMeta, TableMeta) = match k.as_str() {
+                "t/t7" => (serde_json::from_slice(v)?, t7.clone()),
+                "t/t3" => (serde_json::from_slice(v)?, t3.clone()),
+                _ => (serde_json::from_slice(v)?, entry(k[3..].parse().unwrap_or(0))),
+            };
+            assert_eq!((t.sql_columns(), t.column_list(), t.logical().list()), (was.sql_columns(), was.column_list(), was.logical().list()), "{k}: as before");
         }
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);

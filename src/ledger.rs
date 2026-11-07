@@ -191,6 +191,17 @@ impl<K: Hash + Eq + Send, V: Send> Charged for Mutex<ByteLru<K, V>> {
     fn give_back(&self, bytes: usize) -> usize { give_back_from(self, |c| c, bytes) }
 }
 
+/// About the memory a parsed JSON value holds, to charge a cache of them (`ByteLru::put`): each value's own 32 bytes, a
+/// string's text, and each field's name with a map's overhead for it. Neither exact nor costly: a walk over what was parsed.
+pub fn json_bytes(v: &serde_json::Value) -> usize {
+    32 + match v {
+        serde_json::Value::String(s) => s.len(),
+        serde_json::Value::Array(a) => a.iter().map(json_bytes).sum(),
+        serde_json::Value::Object(o) => o.iter().map(|(k, v)| 48 + k.len() + json_bytes(v)).sum(),
+        _ => 0,
+    }
+}
+
 /// The entries `give_back_from` takes at once: a reader that comes meanwhile waits for this many at most.
 const AT_ONCE: usize = 64;
 

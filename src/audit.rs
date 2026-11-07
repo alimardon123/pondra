@@ -68,22 +68,10 @@ fn on() -> bool { !classes().iter().any(|c| c == "off") }
 
 fn written(class: &str) -> bool { on() && classes().iter().any(|c| c == class || c == "all") }
 
-/// A statement without the comments and spaces before its first word (a comment first must not
-/// make a `GRANT` a read).
-fn lead(mut sql: &str) -> &str {
-    loop {
-        sql = sql.trim_start();
-        sql = match () {
-            _ if sql.starts_with("--") => sql.find('\n').map_or("", |i| &sql[i..]),
-            _ if sql.starts_with("/*") => sql.find("*/").map_or("", |i| &sql[i + 2..]),
-            _ => return sql,
-        };
-    }
-}
 
 /// A statement's class, by its first words.
 pub fn class(sql: &str) -> &'static str {
-    let sql = lead(sql);
+    let sql = crate::text::first_word(sql); // (past the comments and spaces before its first word: a comment first must not make a `GRANT` a read)
     let words: Vec<String> = sql.split(|c: char| c.is_whitespace() || c == '(' || c == ';').filter(|w| !w.is_empty()).take(6).map(|w| w.to_uppercase()).collect();
     let first = words.first().map_or("", |w| w.as_str());
     let about = |o: &[&str]| words.iter().skip(1).take(4).any(|w| o.contains(&w.as_str()));
@@ -107,7 +95,7 @@ pub fn class(sql: &str) -> &'static str {
 /// secret's; at most 4 KB.
 pub fn redacted(sql: &str, class: &str) -> String {
     let mut out = String::with_capacity(sql.len().min(4096));
-    let words: Vec<String> = lead(sql).split(|c: char| c.is_whitespace() || c == '(').filter(|w| !w.is_empty()).take(5).map(|w| w.to_uppercase()).collect();
+    let words: Vec<String> = crate::text::first_word(sql).split(|c: char| c.is_whitespace() || c == '(').filter(|w| !w.is_empty()).take(5).map(|w| w.to_uppercase()).collect();
     let secret = matches!(words.first().map(String::as_str), Some("CREATE" | "ALTER")) && words.iter().any(|w| w == "SECRET");
     match (class == "role", sql.find('(')) {
         // (a secret's options may be quoted either way, or not at all: every value but its TYPE is
@@ -489,6 +477,7 @@ mod tests {
         assert_eq!(class("WITH d AS (SELECT 1) SELECT * FROM d"), "read");
         assert_eq!(class("create or replace secret s (type s3, secret 'y')"), "role");
         assert_eq!(class("GRANT SELECT ON t TO ana"), "role");
+        assert_eq!(class("/* a /* b */ GRANT */ SELECT 1"), "read"); // (a comment in a comment: its words are no statement's, 11-06 audit M7)
         assert_eq!(class("ALTER DATABASE prod SET (protected = false)"), "role");
         assert_eq!(class("ALTER DATABASE dev REFRESH t"), "ddl");
         assert_eq!(class("CREATE TABLE t (a INT)"), "ddl");
