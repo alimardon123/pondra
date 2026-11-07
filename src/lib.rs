@@ -121,6 +121,7 @@ mod rules;
 #[cfg(feature = "lake")] mod rerun;
 #[cfg(feature = "lake")] mod replica;
 #[cfg(feature = "lake")] mod auth;
+#[cfg(feature = "lake")] mod rights; // (what a principal may do, decided in one place: step 6)
 #[cfg(feature = "lake")] mod budget;
 #[cfg(feature = "lake")] mod byte_range;
 #[cfg(feature = "lake")] mod cache;

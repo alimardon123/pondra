@@ -41,8 +41,7 @@ pub enum Run {
     Leader(for<'a> fn(&'a Lake, Value) -> BoxFuture<'a, Result<Value>>),
 }
 
-/// The right a statement needs, read where every statement's is (`auth::Auth::allows`). Checked through today's
-/// grants until step 6's `may` takes it over.
+/// The right a statement needs, read where every statement's is (`rights::asks`, which `rights::may` decides).
 pub enum Right {
     /// An admin's: a superuser, or an admin token.
     Admin,

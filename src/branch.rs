@@ -459,7 +459,7 @@ fn places(d: &Ddl) -> Result<()> {
     Ok(())
 }
 
-/// A user who isn't a superuser: its grants decide a branch or a drop (`Auth::allows` lets nothing
+/// A user who isn't a superuser: its grants decide a branch or a drop (`rights::may_run` lets nothing
 /// else of its through).
 async fn user_door(lake: &Lake, d: &mut Ddl, a: &crate::users::Access) -> Result<()> {
     if let Ddl::CreateDatabase { clone: Some(of), dir, .. } = d {

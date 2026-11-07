@@ -635,7 +635,7 @@ async fn values(app: &App, task: &Task, given: HashMap<String, serde_json::Value
 /// claims a tick for it now (`Ddl::ExecuteTask`).
 pub async fn execute(app: &App, name: String, args: Vec<(String, String)>, who: Who) -> Result<Outcome> {
     let asked = |params: HashMap<String, serde_json::Value>| crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::ExecuteTask { name: name.clone(), params }]);
-    app.auth.allows(who.role, &asked(HashMap::new()))?; // (before its values: a caller who may not run it runs none of their queries)
+    crate::rights::may_run(who.role, &asked(HashMap::new()))?; // (before its values: a caller who may not run it runs none of their queries)
     let mut params = HashMap::new();
     if !args.is_empty() {
         let select = args.iter().map(|(k, v)| format!("({v}) AS \"{k}\"")).collect::<Vec<_>>().join(", ");

@@ -369,7 +369,7 @@ fn total(batches: &[RecordBatch]) -> usize { batches.iter().map(RecordBatch::num
 async fn changes(app: &App, table: &str, after: Option<u64>) -> Result<String> {
     let found = lakes(app).into_iter().rev().find_map(|(p, l)| Some((table.strip_prefix(p.as_str())?.to_string(), p, l)));
     let (name, prefix, lake) = found.ok_or_else(|| crate::codes::coded("42P01", format!("no table {table}")))?;
-    crate::auth::check_all(table)?; // (a user's: every column of the rows, as `/watch` and Kafka need, before anything is read)
+    crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(table))?; // (a user's: every column of the rows, as `/watch` and Kafka need, before anything is read)
     if !prefix.is_empty() {
         crate::users::across(&lake, prefix.trim_end_matches('.')).await?; // (an attached lake that signs in on its own: its own sign-in, as queries use)
     }
