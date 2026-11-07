@@ -34,6 +34,16 @@ pub struct Udf {
 
 pub fn key(name: &str) -> String { format!("f/{name}") }
 
+/// The `udf` extension (functions served over Flight), as the registry knows it: its catalog records.
+pub static UDF: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "udf",
+    requires: &[],
+    register: |r| r.section_mut::<crate::records::Prefixes>().add(PREFIXES),
+};
+
+/// The functions' records in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "f/", owner: "udf", holds: "a Flight function's address, by its name (key)" }];
+
 /// Register the lake's functions in a session (they are in the catalog, so on every node).
 /// The list is re-read at most once a second: a query must not pay a catalog scan for it.
 pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {

@@ -479,6 +479,52 @@ def final_failure_mid_run(path):
 
 
 @case
+def a_halved_train_takes_no_joiner(path):
+    """A red front car is halved while a car stacked on it goes: both runs stop, and the stacked car's run, stopped
+    with nothing failed, is newer than the red one. The PRs halved away still don't join the halved train: they ride
+    a car stacked on it (11-07: they joined at once, the train failed as the whole had, and was halved again)."""
+    with Scenario(path) as sc:
+        for n in (1, 2, 3):
+            sc.open_pr(n, f"pr {n}", {f"f{n}.txt": f"{n}\n"})
+        sc.step()
+        sc.add_run(9, sc.tip(), status="in_progress", conclusion=None)
+        sc.open_pr(4, "pr 4", {"f4.txt": "4\n"})
+        with old_train():
+            out = sc.step()
+        expect("stacked #4 on the train's run" in out, out)
+        sc.add_run(10, sc.tip(), status="in_progress", conclusion=None)
+        sc.gh.jobs[9] = [{"id": 900, "name": "unit tests", "conclusion": "failure", "steps": [{"name": "a", "conclusion": "failure"}]}]
+        time.sleep(1.1)
+        out = sc.step()
+        expect(sorted(sc.gh.cancels) == [9, 10] and "halved the train: 3 to 2" in out and sc.train_heads() == [1, 2], out)
+        for r in sc.gh.runs:   # (as GitHub ends the runs the step stopped)
+            if r["id"] in (9, 10):
+                r.update(status="completed", conclusion="cancelled")
+        sc.add_run(11, sc.tip(), status="in_progress", conclusion=None)
+        out = sc.step()
+        expect("joined the train" not in out and "stacked #3 #4 on the train's run" in out, out)
+        expect(sc.train_heads() == [1, 2, 3, 4] and sc.gh.cancels == [9, 10], f"{sc.train_heads()} {sc.gh.cancels}")
+
+
+@case
+def a_log_with_colors_is_read(path):
+    """gh refuses to print a log's terminal colors unless told it may: the log is asked for again with the flag."""
+    asked = []
+
+    def fake(args, data=None):
+        asked.append(args)
+        if train.ESCAPES not in args:
+            raise train.GitHubError(None, "", "the response contains terminal escape sequences; pass "
+                                              "--allow-escape-sequences to output it anyway")
+        return "\x1b[1m\x1b[91merror[E0061]\x1b[0m: this function takes 4 arguments\n --> src/connect.rs:462:20\n"
+    gh = GitHub(REPO)
+    gh._gh = fake
+    log = gh.log(7)
+    expect(len(asked) == 2 and asked[1][-1] == train.ESCAPES, f"{asked}")
+    expect(train.pointed(log) == {"src/connect.rs"}, f"{train.pointed(log)}")
+
+
+@case
 def final_failure_mid_run_as_main(path):
     """A check that can't flake fails while the run goes, and main's latest run failed it too: nothing is stopped."""
     with Scenario(path) as sc:

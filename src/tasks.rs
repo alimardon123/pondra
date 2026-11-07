@@ -43,6 +43,9 @@ fn one() -> u32 { 1 }
 
 pub fn task_key(name: &str) -> String { format!("k/{name}") }
 
+/// The streaming tasks' records in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "k/", owner: "tasks", holds: "a streaming task: its query and where it has read to (task_key)" }];
+
 /// The producer names that carry a task's progress, one per shard.
 pub fn producers(name: &str, task: &Task) -> Vec<String> {
     match task.shards {

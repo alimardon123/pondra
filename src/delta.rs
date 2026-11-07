@@ -162,6 +162,9 @@ pub fn left_out(name: &str, meta: &TableMeta) -> Option<String> {
     (!formats.is_empty()).then(|| format!("{name} isn't published as {}, though --publish asks for it: {}", formats.join(" or "), whys.join("; ")))
 }
 
+/// The Delta log's records in the catalog (`records`); Iceberg's `i/` is iceberg's.
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "x/", owner: "delta", holds: "a table's published Delta log: its version and files (state_key)" }];
+
 /// The catalog key of a table's published state in `format`: the Delta log's (`x/`) or the Iceberg metadata's (`i/`).
 pub fn state_key(table: &str, format: &str) -> String {
     match format {

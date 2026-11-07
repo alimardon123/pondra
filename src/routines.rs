@@ -855,7 +855,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
         return Box::pin(crate::vars::apply(app, c)).await; // (DECLARE $day …, $day = …: the scope's variable)
     }
     if crate::write::checkpoint(sql) {
-        ensure!(who.role >= Role::Write, "CHECKPOINT needs a write token");
+        crate::rights::may_as(who.role, crate::rights::Action::Write, crate::rights::Object::Lake)?;
         return Ok(Outcome::Done(app.checkpoint().await?));
     }
     if let Some((name, args)) = call_of(sql) {
@@ -876,7 +876,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
     }
     if let Some((language, body)) = do_of(sql) {
         // A procedure made, called once and forgotten, as its caller: an admin's, as making one is.
-        ensure!(who.role >= Role::Admin, "DO runs code on the node: it needs an admin token, as making a procedure does");
+        crate::rights::may_as(who.role, crate::rights::Action::RunCode, crate::rights::Object::Lake)?; // (as making a procedure is)
         let r = match language.as_str() {
             "python" => Routine { kind: Kind::Procedure, params: vec![], language, body, returns: None, with: Options::default() },
             "sql" => Routine { kind: Kind::Procedure, params: vec![], language, body, returns: None, with: Options::default() },
@@ -905,7 +905,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
         return Ok(Outcome::Rows(vec![Box::pin(crate::returning::run(app, &r, who.role, who.files, job)).await?])); // (INSERT … RETURNING: the rows it wrote)
     }
     if let Some(stmt) = crate::write::parse(sql) {
-        app.auth.allows(who.role, &stmt)?;
+        crate::rights::may_run(who.role, &stmt)?;
         return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files).await?));
     }
     if let Some((rows, _)) = Box::pin(crate::txn::point_read(&app.lake, sql)).await? {
@@ -933,7 +933,7 @@ async fn steps(app: &App, sql: &str, who: Who) -> Result<Option<Vec<(String, Opt
             Some(Stmt::Invalid(why)) => bail!("{why}"),
             Some(Stmt::Refused(code, why)) => return Err(crate::codes::coded(code, why)),
             Some(stmt) => {
-                app.auth.allows(who.role, &stmt)?;
+                crate::rights::may_run(who.role, &stmt)?;
                 if let Stmt::Ddl(ds) = &stmt {
                     for d in ds {
                         crate::protect::check_ddl(&app.lake, d).await?;

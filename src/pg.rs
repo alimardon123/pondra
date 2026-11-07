@@ -545,7 +545,7 @@ impl Backend {
         }
         if let Some(stmt) = crate::write::parse(&sql) {
             crate::history::parsed(&stmt); // (the history writer takes its table from here: `history::touched`)
-            self.app.auth.allows(role, &stmt).map_err(user_error)?;
+            crate::rights::may_run(role, &stmt).map_err(user_error)?;
             let kind = stmt.kind(&sql);
             let v = crate::write::on_node(&self.app, stmt, None).await.map_err(user_error)?;
             return Ok(Response::Execution(tag(&kind, Some(v["rows"].as_u64().unwrap_or(0)))));

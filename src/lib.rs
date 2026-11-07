@@ -54,6 +54,7 @@ pub mod sketch;
 mod asof;
 mod explain;
 mod multiply;
+mod divide;
 mod sparksql;
 mod parsed;
 mod past_names;
@@ -126,7 +127,9 @@ mod rules;
 #[cfg(feature = "lake")] mod bridge;
 #[cfg(feature = "lake")] mod rerun;
 #[cfg(feature = "lake")] mod replica;
+#[cfg(feature = "lake")] mod records; // (the catalog's record scheme: every prefix, and whose it is)
 #[cfg(feature = "lake")] mod auth;
+#[cfg(feature = "lake")] mod rights; // (what a principal may do, decided in one place: step 6)
 #[cfg(feature = "lake")] mod budget;
 #[cfg(feature = "lake")] mod byte_range;
 #[cfg(feature = "lake")] mod cache;
@@ -276,12 +279,24 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &objects::CATALOG,
         #[cfg(feature = "lake")]
         &connect::CONNECTIONS,
+        #[cfg(feature = "lake")]
+        &read_delta::DELTA,
+        #[cfg(feature = "lake")]
+        &catalogs::ICEBERG,
+        #[cfg(feature = "lake")]
+        &kafka_client::KAFKA,
+        #[cfg(feature = "lake")]
+        &sharing_client::SHARING,
         &sparksql::SPARK,
         &engine::ENGINE,
         &pg_functions::POSTGRES,
         &matcher::MATCH_RECOGNIZE,
         #[cfg(feature = "lake")]
         &ai::AI,
+        #[cfg(feature = "lake")]
+        &apply::PROJECT,
+        #[cfg(feature = "lake")]
+        &udf::UDF,
     ];
     BUILT_IN
 }

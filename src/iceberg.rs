@@ -21,6 +21,9 @@ use std::collections::BTreeMap;
 
 const HISTORY: usize = 100; // snapshots (and metadata files) kept
 
+/// The Iceberg metadata's records in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "i/", owner: "iceberg", holds: "a table's published Iceberg metadata (delta::state_key)" }];
+
 /// What the Iceberg metadata says right now (kept in the catalog under `i/{table}`).
 ///
 /// One Iceberg manifest per Pondra manifest: ours are immutable, so a sealed manifest's files are
@@ -740,7 +743,7 @@ pub(crate) async fn prepare(lake: &Lake, name: &str, current: &Value, asked: &Va
     let mut c = parse(lake, name, &current["metadata"], asked).await?;
     // (a user's: taking rows out asks DELETE, and a keyed table's rows replace their keys', UPDATE: S11)
     let (replaces, deletes) = (!meta.key.is_empty() && !c.incoming.is_empty(), !c.removed.is_empty() || !c.deletes.is_empty() || !c.equality.is_empty());
-    crate::auth::check_changes(name, replaces, deletes).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
+    crate::rights::changing(replaces, deletes).try_for_each(|action| crate::rights::may_here(action, crate::rights::Object::Table(name))).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
     if done(lake, &c.job()).await.map_err(|e| bad(crate::ext::said(&e)))? {
         return Ok(None);
     }
