@@ -1,0 +1,96 @@
+name: agent-bench
+
+# The agent benchmark with a model (tools/agent_bench.py run; the 1.0 scorecard's agent row): the same shop questions,
+# model, prompt and plain tools on Pondra, DuckDB and Postgres, each task tried `runs` times. What it proves and how it
+# scores: redesign-wip/agent-benchmark-plan.md. CI runs the rest of it with no model on every pull request
+# (harness.py agents).
+#
+# By hand only (Actions → agent-bench → Run workflow): it spends API dollars at list prices, which the report gives, so
+# a schedule waits for the first run's bill. It needs the repository secret ANTHROPIC_API_KEY. What is kept: the
+# report in the job's summary, and the artifact agent-bench (runs.jsonl, every try's transcript, report.md and
+# replay.jsonl, the passed answers that tools/agent_bench/replay_a.jsonl takes so CI replays them).
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model (claude-opus-5-5 is the default; claude-haiku-5-5 is the small one)"
+        default: claude-opus-5-5
+      effort:
+        description: "Effort"
+        type: choice
+        options: [low, medium, high, xhigh, max]
+        default: medium
+      runs:
+        description: "Tries at each task on each engine"
+        default: "3"
+      only:
+        description: "Task ids, comma-separated (empty: all of set A)"
+        default: ""
+
+concurrency:
+  group: agent-bench-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read # (the build run's package, tools/ci_build.sh)
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04 # (its PostgreSQL 16 is the Postgres the agent works on: /usr/lib/postgresql/16/bin)
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - name: The key, before anything is built
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::The repository secret ANTHROPIC_API_KEY is not set (Settings → Secrets and variables → Actions)."
+            exit 1
+          fi
+      - name: The build workflow's package for this commit (nothing, if no build run passed)
+        id: ci
+        run: echo "run=$(bash tools/ci_build.sh "$GITHUB_SHA" pondra-linux-x64)" >> "$GITHUB_OUTPUT"
+      - name: Its linux-x64 binary
+        if: steps.ci.outputs.run != ''
+        run: gh run download "${{ steps.ci.outputs.run }}" --name pondra-linux-x64 --dir dl && tar -xzf dl/pondra-linux-x64.tar.gz pondra
+      - name: Rust, when no build run passed
+        if: steps.ci.outputs.run == ''
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - if: steps.ci.outputs.run == ''
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: build # (main's build cache: the dependencies)
+          save-if: false
+      - name: The build from this commit, when no build run passed
+        if: steps.ci.outputs.run == ''
+        run: cargo build --profile dist && cp target/dist/pondra pondra
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: The packages it uses (tools/requirements.txt's versions)
+        run: pip install duckdb==2.0.0 'psycopg[binary]==3.3.6' anthropic==2.6.0
+      - name: The benchmark
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MODEL: ${{ inputs.model }}
+          EFFORT: ${{ inputs.effort }}
+          RUNS: ${{ inputs.runs }}
+          ONLY: ${{ inputs.only }}
+        run: |
+          chmod +x pondra && ./pondra --version
+          python3 tools/agent_bench.py run --bin ./pondra --model "$MODEL" --effort "$EFFORT" --runs "$RUNS" \
+            ${ONLY:+--only "$ONLY"} --out agent-bench
+      - name: The report, in the job's summary
+        if: always()
+        run: if [ -f agent-bench/report.md ]; then cat agent-bench/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with: { name: agent-bench, path: agent-bench, retention-days: 30, if-no-files-found: ignore }

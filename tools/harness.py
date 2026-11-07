@@ -297,17 +297,18 @@ def crash():
 
 
 def agents():
-    """The agent benchmark's tasks without a model (tools/agent_bench.py gold; the 1.0 scorecard's agent row): each
-    task's gold SQL on Pondra, DuckDB and, where its binaries are, Postgres, scored as an agent's answer will be. It
-    proves the tasks and the scorer before any model runs on them, and checks Pondra's answers to a shop's questions
-    against two other engines'."""
-    r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_bench.py"), "gold", "--bin", BIN],
+    """The agent benchmark with no model (tools/agent_bench.py check; the 1.0 scorecard's agent row): each task's gold
+    SQL on Pondra, DuckDB and, where its binaries are, Postgres, scored as an agent's answer is; the agent's loop with a
+    scripted model on each engine; and the answers agents once gave that passed (tools/agent_bench/replay_*.jsonl), run
+    again on this commit."""
+    r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_bench.py"), "check", "--bin", BIN],
                        capture_output=True, text=True, timeout=900)
     out = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {"ok": False, "error": r.stderr[-1500:]}
     print(json.dumps({"agents": out}, indent=1, default=str))
     if not out.get("ok"):
         sys.exit(1)
-    return {e: v if isinstance(v, str) else f"{v['passed']} of {out['tasks']}" for e, v in out["engines"].items()}
+    return {**{e: v if isinstance(v, str) else f"{v['passed']} of {out['tasks']}" for e, v in out["engines"].items()},
+            "replayed": f"{out['replay']['passed']} of {out['replay']['answers']}"}
 
 
 def synced():
