@@ -3713,6 +3713,7 @@ impl Catalog {
         self.streamed.fetch_max(c, Relaxed);
         self.loud.fetch_max(c, Relaxed);
         self.rights.fetch_max(c, Relaxed); // (a whole snapshot: what changed in it isn't told apart)
+        self.written.lock().unwrap().clear(); // (…nor which tables: each round's next look reads every table)
         self.last_n.fetch_max(n, Relaxed);
         self.mirror.store(true, Relaxed);
         Ok(())
