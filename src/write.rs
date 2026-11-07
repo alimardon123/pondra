@@ -1152,12 +1152,19 @@ pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, na
 /// fills the columns as stored (`rows_sql`, `write_rows`), so this is the one place SQL's order is put in. Every other
 /// statement, and every INSERT into a table that never moved a column, as it is. With it, for a plain INSERT into this
 /// lake's table: the table and the order its values go by (`TableMeta::placed`), which the leader checks
-/// (`log::placed_for`).
+/// (`log::placed_for`). A MERGE that puts values by position (`Merge::by_position`: an `INSERT … ON CONFLICT` or `INSERT OR …`
+/// without a column list) puts SQL's order in itself, and is checked the same way: its node may not have seen a move either
+/// (11-07 audit M1).
 pub(crate) async fn in_sql_order(lake: &Lake, stmt: Stmt) -> Result<(Stmt, Option<(String, u64)>)> {
-    let Stmt::Insert(t, q) = &stmt else { return Ok((stmt, None)) };
-    let Ok((other, name)) = crate::ddl::resolve(lake, t).await else { return Ok((stmt, None)) }; // (refused by name further on)
+    let t = match &stmt {
+        Stmt::Insert(t, _) => t.clone(),
+        Stmt::Merge(m) if m.by_position() => m.target.clone(),
+        _ => return Ok((stmt, None)),
+    };
+    let Ok((other, name)) = crate::ddl::resolve(lake, &t).await else { return Ok((stmt, None)) }; // (refused by name further on)
     let Some(meta) = other.as_deref().unwrap_or(lake).cat.meta(&table_key(&name)).await? else { return Ok((stmt, None)) };
     let placed = other.is_none().then(|| (name, meta.placed())); // (another lake's leader records its own: not checked)
+    let Stmt::Insert(t, q) = &stmt else { return Ok((stmt, placed)) };
     if !meta.moved() {
         return Ok((stmt, placed));
     }
@@ -1470,8 +1477,12 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
     ensure!(!f.files.iter().any(|d| d.sys) || !follows(lake, &f.table).await?, "{AGAIN}: a materialized view or task of {} was made as it was written", f.table);
     let live: Vec<(String, String)> = meta.live().map(|(s, _, t)| (s.to_string(), t.to_string())).collect(); // (dropped columns aren't written)
     let listed = |c: &[(String, String)]| c.iter().map(|(n, t)| format!("{} {}", meta.name_of(n), crate::objects::sql_type(t))).collect::<Vec<_>>().join(", ");
-    ensure!(types(&live) == types(&f.columns), "the rows' columns ({}) aren't {}'s ({}), in order and type; if the table changed while they were written, write them again", listed(&f.columns), f.table, listed(&live));
-    ensure!(f.placed.is_none_or(|placed| placed == meta.placed()), crate::log::moved(&f.table)); // (a move the node hadn't seen: `log::placed_for`)
+    if types(&live) != types(&f.columns) {
+        // (40001, as a move's: a column added, dropped or retyped while they were written, so they are written again. The
+        // words say so too, since a node that sent them reads the code from them)
+        return Err(crate::codes::coded("40001", format!("could not serialize the INSERT into {}: its rows' columns ({}) aren't the table's ({}), in order and type, since it changed while they were written. Run it again", f.table, listed(&f.columns), listed(&live))));
+    }
+    ensure!(f.placed.is_none_or(|placed| meta.places(placed)), crate::log::moved(&f.table)); // (a move the node hadn't seen: `log::placed_for`)
     let rows: u64 = f.files.iter().map(|f| f.rows).sum();
     let commit = crate::adopt::FileCommit { table: f.table.clone(), job: f.job.clone(), added: f.files, new: Some(new), ..Default::default() };
     Ok(match crate::adopt::file(lake, seq, &[commit]).await? {
@@ -2034,7 +2045,13 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
         }
     }).await?;
     let files = next.load(std::sync::atomic::Ordering::Relaxed); // (the node takes the INSERT only when it finds exactly these)
-    let call = crate::dial::Call::json(format!("/insert/{}?job={stage}&staged=1", percent_encoding::utf8_percent_encode(table, percent_encoding::NON_ALPHANUMERIC)), &j!({"columns": names, "files": files, "placed": crate::log::placed_for(table)}))?;
+    // (the order an INSERT without a column list put its values by, kept under the table's name as its lake has it, which
+    // may not be the name as written: `public.t`, 11-07 audit L3)
+    let placed = match crate::ddl::resolve(lake, table).await {
+        Ok((None, name)) => crate::log::placed_for(&name),
+        _ => None,
+    };
+    let call = crate::dial::Call::json(format!("/insert/{}?job={stage}&staged=1", percent_encoding::utf8_percent_encode(table, percent_encoding::NON_ALPHANUMERIC)), &j!({"columns": names, "files": files, "placed": placed}))?;
     let reply = crate::dial::call(&app.members.leader().addr, call).await?;
     if reply.ok() {
         return reply.json().await;

@@ -786,8 +786,10 @@ impl Backend {
             let b = crate::rules::typed::spelled(&rules, b, true).map_err(err)?; // (`'A0EE…'` in a uuid column as Postgres reads it)
             let left_out = rules.left_out(&given); // (the columns not given take their DEFAULT, or are null)
             let src = crate::log::Src { producer: format!("copy:{}", p.job), seq: p.seq + 1, prev: None };
-            // (each set is committed as it comes, as before: a set refused leaves the ones before it written)
-            let queued = writer.put(crate::rules::Rows::Named(b, left_out), src).await.map_err(|r| err(r.into()))?;
+            // (each set is committed as it comes, as before: a set refused leaves the ones before it written. Without a column
+            // list, its fields fill the columns by this node's order, which the leader checks: `log::placed_for`, 11-07 audit M1)
+            let placed = p.copy.columns.is_empty().then(|| (p.copy.table.clone(), writer.meta().placed()));
+            let queued = crate::log::placed_as(placed, writer.put(crate::rules::Rows::Named(b, left_out), src)).await.map_err(|r| err(r.into()))?;
             let rows = queued.rows.rows().num_rows() as u64;
             queued.ack.await.map_err(err)?;
             p.rows += rows;

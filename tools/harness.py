@@ -9885,7 +9885,9 @@ def colorder():
     the old order shows as wrong values: INSERT VALUES (whole and short rows), INSERT SELECT (of a known width and of a
     `*`), the bulk door, COPY INTO a headerless CSV, the Postgres port's COPY FROM STDIN, RETURNING *, a keyed table's
     INSERT, ON CONFLICT, INSERT OR REPLACE, MERGE … INSERT VALUES, UPDATE, DELETE and a transaction, a write through a
-    second node. Reads list the new order: SELECT *, DESCRIBE, information_schema, pg_attribute, a Postgres row's
+    second node. A move while a positional write runs on another node (an INSERT, a transaction's INSERT before its COMMIT,
+    a headerless COPY, a one-key upsert) refuses it 40001, nothing written; an ADD COLUMN at the end doesn't. Reads list
+    the new order: SELECT *, DESCRIBE, information_schema, pg_attribute, a Postgres row's
     description, a point lookup, a past read, /watch, SHOW CREATE (which makes the same table again, and CREATE OR ALTER
     leaves as it is), Delta and Iceberg readers; all as it was after a restart. A view with a `*` lists the new order. Refused
     by name: a column after itself or after one the table lacks, a system column. A materialized view that reads the table
@@ -10047,6 +10049,90 @@ def colorder():
                        "again": again, "rows": until(lambda: q(f"SELECT a, b FROM {table}"), [{"a": 2, "b": 1}], 10)}
         checks[f"a move while a {kind} INSERT without a column list runs on another node: refused 40001, nothing written, then by the new order"] = \
             outcome["done"] > moved_at and outcome["status"] != 200 and outcome["state"] == "40001" and rows_then == [] and raced[kind]["rows"] == [{"a": 2, "b": 1}]
+    # The other doors that fill by position (11-07 audit M1): a transaction's INSERT on another node, a headerless CSV's COPY
+    # and a one-key upsert. Each puts its values by the order its node had, and the leader refuses them (40001) when the
+    # table's order is another by the time they come: a node that hadn't seen a move filled the old one.
+    def told(port, stmt, session=None, headers=None):
+        status, head, text = reply(port, "POST", "/sql", stmt.encode(), headers={**({"x-pondra-session": session} if session else {}), **(headers or {})})
+        return {"status": status, "state": head.get("x-pondra-sqlstate"), "text": (text if isinstance(text, str) else text.decode())[:300]}
+    q("CREATE TABLE race_txn (a BIGINT, b BIGINT)")
+    until(lambda: names("race_txn", A.port + 1), ["a", "b"], 10)
+    session = "colorder-txn-" + uuid.uuid4().hex[:8]
+    began = [told(A.port + 1, "BEGIN", session), told(A.port + 1, "INSERT INTO race_txn VALUES (1, 2)", session)]
+    q("ALTER TABLE race_txn ALTER COLUMN b FIRST")
+    committed = told(A.port + 1, "COMMIT", session)
+    txn_then = q("SELECT a, b FROM race_txn")
+    until(lambda: names("race_txn", A.port + 1), ["b", "a"], 10)
+    again = [told(A.port + 1, s, session) for s in ("BEGIN", "INSERT INTO race_txn VALUES (1, 2)", "COMMIT")]
+    raced["txn"] = {"began": began, "commit": committed, "rows_then": txn_then, "again": again}
+    checks["a move between a transaction's INSERT without a column list on another node and its COMMIT: refused 40001, nothing written, then by the new order"] = \
+        all(r["status"] == 200 for r in began) and committed["state"] == "40001" and txn_then == [] \
+        and all(r["status"] == 200 for r in again) and until(lambda: q("SELECT a, b FROM race_txn"), [{"a": 2, "b": 1}], 10) == [{"a": 2, "b": 1}]
+    # (11-07 audit L3: an ADD COLUMN at the end between them moves nothing: the INSERT's values are where they go, so it commits)
+    q("CREATE TABLE race_add (a BIGINT, b BIGINT)")
+    until(lambda: names("race_add", A.port + 1), ["a", "b"], 10)
+    session = "colorder-add-" + uuid.uuid4().hex[:8]
+    began = [told(A.port + 1, "BEGIN", session), told(A.port + 1, "INSERT INTO race_add VALUES (1, 2)", session)]
+    q("ALTER TABLE race_add ADD COLUMN c BIGINT")
+    committed = told(A.port + 1, "COMMIT", session)
+    raced["txn_add"] = {"began": began, "commit": committed}
+    checks["an ADD COLUMN at the end between a transaction's INSERT without a column list on another node and its COMMIT: committed where it was put"] = \
+        all(r["status"] == 200 for r in began) and committed["status"] == 200 and until(lambda: q("SELECT a, b, c FROM race_add"), [{"a": 1, "b": 2}], 10) == [{"a": 1, "b": 2}]
+    # (the same while an autocommitted one runs: its rows are where they go, so they are taken. An INSERT … SELECT's files
+    # lack the new column, so the leader has them written again: 40001, as for a move, not an internal error)
+    for kind, ins in (("values", f"INSERT INTO race_add_{{}} VALUES (1, (SELECT 2 + z FROM {slow} s))"), ("select", f"INSERT INTO race_add_{{}} SELECT 1 + z, 2 FROM {slow} s")):
+        table = f"race_add_{kind}"
+        q(f"CREATE TABLE {table} (a BIGINT, b BIGINT)")
+        until(lambda: names(table, A.port + 1), ["a", "b"], 10)
+        outcome = {}
+        def insert_added():
+            outcome.update(told(A.port + 1, ins.format(kind)), done=time.time())
+        writer = threading.Thread(target=insert_added)
+        writer.start()
+        time.sleep(0.3)
+        q(f"ALTER TABLE {table} ADD COLUMN c BIGINT")
+        moved_at = time.time()
+        writer.join()
+        raced[f"add_{kind}"] = {**outcome, "after_move_s": round(outcome["done"] - moved_at, 2), "rows": q(f"SELECT a, b, c FROM {table}")}
+    checks["an ADD COLUMN at the end while an INSERT … VALUES without a column list runs on another node: written where it was put"] = \
+        raced["add_values"]["after_move_s"] > 0 and raced["add_values"]["status"] == 200 and until(lambda: q("SELECT a, b, c FROM race_add_values"), [{"a": 1, "b": 2}], 10) == [{"a": 1, "b": 2}]
+    checks["…an INSERT … SELECT's files: refused 40001 (written again), nothing written"] = \
+        raced["add_select"]["after_move_s"] > 0 and raced["add_select"]["state"] == "40001" and raced["add_select"]["rows"] == []
+    q("CREATE TABLE race_copy (a BIGINT, b BIGINT)")
+    until(lambda: names("race_copy", A.port + 1), ["a", "b"], 10)
+    with open(os.path.join(d, "many.csv"), "w") as f:  # (enough lines that the move lands while it is read)
+        f.write("1,2\n" * 16_000_000)
+    outcome = {}
+    def load():
+        outcome.update(told(A.port + 2, f"COPY INTO race_copy FROM '{d}/many.csv' (FORMAT csv, HEADER false)", headers={"x-pondra-owner": owner_key}), done=time.time())
+    loader = threading.Thread(target=load)
+    loader.start()
+    time.sleep(0.2)
+    q("ALTER TABLE race_copy ALTER COLUMN b FIRST")
+    moved_at = time.time()
+    loader.join()
+    copied = q("SELECT count(*) AS n FROM race_copy")
+    raced["copy"] = {**outcome, "after_move_s": round(outcome["done"] - moved_at, 2), "rows_then": copied}
+    checks["a move while a headerless CSV's COPY runs on another node: refused 40001, nothing written"] = \
+        outcome["done"] > moved_at and outcome["state"] == "40001" and copied == [{"n": 0}]
+    # (a node whose autocommitted writes wait 1.5 s once their rows are worked out, before their append: the move lands then)
+    paused = Node(lake, A.port + 3, tier_secs=0.3, env={"PONDRA_TEST_AUTOCOMMIT_PAUSE_MS": "1500"}).start()
+    nodes.append(paused)
+    q("CREATE TABLE race_up (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)")
+    until(lambda: names("race_up", A.port + 3), ["id", "a", "b"], 10)
+    outcome = {}
+    def upsert():
+        outcome.update(told(A.port + 3, "INSERT INTO race_up VALUES (1, 10, 20) ON CONFLICT (id) DO UPDATE SET a = excluded.a, b = excluded.b"), done=time.time())
+    writer = threading.Thread(target=upsert)
+    writer.start()
+    time.sleep(0.5)
+    q("ALTER TABLE race_up ALTER COLUMN b AFTER id")
+    moved_at = time.time()
+    writer.join()
+    upserted = q("SELECT a, b FROM race_up")
+    raced["upsert"] = {**outcome, "after_move_s": round(outcome["done"] - moved_at, 2), "rows_then": upserted}
+    checks["a move while a one-key upsert without a column list waits to append on another node: refused 40001, nothing written"] = \
+        outcome["done"] > moved_at and outcome["state"] == "40001" and upserted == []
     # After a restart, as it was
     before = gotk()
     for node in nodes:

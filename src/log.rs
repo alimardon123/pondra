@@ -870,7 +870,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
             match lake.cat.meta(&table_key(&p.table)).await? {
                 None => acks[i].gone = true,
                 Some(m) if !f.checked && crate::constraints::checked(&m) => acks[i].refused = true,
-                Some(m) if p.placed.is_some_and(|placed| placed != m.placed()) => acks[i].moved = true,
+                Some(m) if p.placed.is_some_and(|placed| !m.places(placed)) => acks[i].moved = true,
                 Some(_) => continue,
             }
             bad.push(i);

@@ -377,7 +377,11 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
             _ => p.query,
         };
         let load = Load { folder: folder.clone(), file: p.url.clone(), version: p.version.clone(), run: run.clone() };
-        let out = match crate::write::on_node_as(app, Stmt::InsertInto(table.to_string(), names, query.clone()), Some(job_of(&load)), owner()).await {
+        // (a headerless CSV's columns fill the table's by this node's order, which the leader checks: a node that hadn't seen a
+        // move yet would fill the old one, as an INSERT without a column list would, `log::placed_for`: 11-07 audit M1)
+        let placed = positional.then(|| (name.clone(), meta.placed()));
+        let insert = crate::write::on_node_as(app, Stmt::InsertInto(table.to_string(), names, query.clone()), Some(job_of(&load)), owner());
+        let out = match crate::log::placed_as(placed, insert).await {
             Ok(out) => out,
             Err(e) => return Err(refused_at(lake, &query, &p.url, p.dialect, e).await),
         };
