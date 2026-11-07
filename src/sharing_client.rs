@@ -23,6 +23,7 @@ static TABLES: crate::connections::ConnectionType = {
         schemes: &[], // (https://, checked when it is attached, which also reads a provider's profile)
         secret_types: &[],
         about: "a share on a Delta Sharing server, its token in the TYPE share secret covering it: url = 'https://host/delta-sharing'",
+        open: None,
     }
 };
 

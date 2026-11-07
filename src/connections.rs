@@ -4,6 +4,11 @@
 //! connection's definition; ATTACH and the paths that name a connection read it too (l1-wip/step4-plan.md, pieces 3
 //! and 4), so a new type is one entry and no other edit.
 use crate::registry::Section;
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// What a connection of a type holds, and so how it is used (§3.7's rows).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,6 +48,10 @@ pub const SECRET: Opt = Opt { name: "secret", required: false, about: "the secre
 /// Read only: nothing is written through it.
 pub const READ_ONLY: Opt = Opt { name: "read_only", required: false, about: "nothing is written through it" };
 
+/// A Files type's store for a connection's `url`, signed with its secret's settings (None: it names none). Its paths are the
+/// connection's own: `'@drop/incoming/a.csv'` is `incoming/a.csv` in it.
+pub type Opener = fn(url: &str, secret: Option<&BTreeMap<String, String>>) -> Result<Arc<dyn object_store::ObjectStore>>;
+
 /// A type of connection.
 pub struct ConnectionType {
     pub name: &'static str,
@@ -55,6 +64,8 @@ pub struct ConnectionType {
     /// The types of secret its `secret` may name (`CREATE SECRET … (TYPE s3, …)`); empty: it takes none.
     pub secret_types: &'static [&'static str],
     pub about: &'static str,
+    /// Its files' store, for a type that holds files and is read through a path (`'@name/…'`); None: not yet, or not files.
+    pub open: Option<Opener>,
 }
 
 impl ConnectionType {
@@ -68,6 +79,40 @@ impl ConnectionType {
         let scheme = url.split_once("://").map_or(String::new(), |(s, _)| s.to_lowercase());
         self.schemes.is_empty() || self.schemes.contains(&scheme.as_str()) || (scheme == "file" && self.schemes.contains(&""))
     }
+}
+
+/// A connection as the catalog keeps it (`cn/<name>`): its type and its options, the secret's name among them.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct Definition {
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub options: BTreeMap<String, Value>,
+}
+
+/// Where the catalog keeps the connection `name`.
+pub const PREFIX: &str = "cn/";
+
+pub fn key(name: &str) -> String {
+    format!("{PREFIX}{name}")
+}
+
+/// The scheme a connection's files are read at: `cn://drop/incoming/a.csv` is `'@drop/incoming/a.csv'`. Its URL never
+/// enters the statement, its plan or what it says: the store `cn://drop` is made from the connection (`ext::register`).
+pub const SCHEME: &str = "cn";
+
+/// A path that starts with a connection's name, `'@drop/incoming/*.csv'` (or `'@drop'`, its files), as the URL it is read
+/// at; None: not such a path.
+pub fn place(path: &str) -> Option<String> {
+    let rest = path.strip_prefix('@')?;
+    let (name, after) = rest.split_once('/').unwrap_or((rest, ""));
+    let named = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    named.then(|| format!("{SCHEME}://{}/{after}", name.to_ascii_lowercase()))
+}
+
+/// The connection a URL is read through (`cn://drop/…`), by name.
+pub fn named_in(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix(SCHEME)?.strip_prefix("://")?;
+    Some(rest.split_once('/').map_or(rest, |(n, _)| n))
 }
 
 /// The registry's connection types: each one's name once.

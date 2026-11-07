@@ -41,6 +41,7 @@ static TABLES: crate::connections::ConnectionType = {
         schemes: &[], // (a REST catalog's https://, a folder or a bucket, or an AWS account or ARN)
         secret_types: &["iceberg", "s3", "r2", "gcs", "azure"],
         about: "an Iceberg catalog (REST, Glue, S3 Tables) or a folder of Iceberg tables: url = 'https://catalog/warehouse'",
+        open: None,
     }
 };
 
