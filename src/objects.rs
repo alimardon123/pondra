@@ -593,18 +593,26 @@ pub(crate) fn sql_type(t: &str) -> String {
     crate::answer::dtype(t).map_or_else(|_| t.to_string(), |d| of(&d))
 }
 
+/// The NOT NULL columns, by the names the entry keeps them under, in field-id order: as a table's spec and its listing
+/// write them.
+pub(crate) fn not_null_columns(m: &TableMeta) -> Vec<&str> { m.list().columns.iter().filter(|c| c.not_null).map(|c| c.stored_name()).collect() }
+
+/// Each column's DEFAULT, by the name the entry keeps it under: as a table's spec and its listing write them.
+pub(crate) fn column_defaults(m: &TableMeta) -> BTreeMap<&str, &str> { m.list().columns.iter().filter_map(|c| Some((c.stored_name(), c.default.as_deref()?))).collect() }
+
 /// `CREATE TABLE`, its layout as clauses (`layout.rs`): what makes the table again, without rows. Under SQL's names, for
 /// an entry as stored too (`ddl::alike` compares two).
 pub(crate) fn table_sql(name: &str, m: &TableMeta) -> String {
     let m = &*m.logical_ref();
-    let mut parts: Vec<String> = m.star().iter().map(|(c, t)| { // (SQL's order; a keyed table's `_deleted` is its own)
+    let mut parts: Vec<String> = m.star_cols().map(|col| { // (SQL's order; a keyed table's `_deleted` is its own)
+        let c = &col.name;
         let merge = m.merge.get(c).map(|f| format!(" MERGE {f}")).unwrap_or_default();
-        let null = if m.not_null().contains(c) && !m.key.contains(c) && !m.identity().contains_key(c) { " NOT NULL" } else { "" };
-        let default = match m.identity().get(c) {
+        let null = if col.not_null && !m.key.contains(c) && col.identity.is_none() { " NOT NULL" } else { "" };
+        let default = match &col.identity {
             Some(i) => format!(" {}", i.sql()), // (its sequence is the table's: made with it)
-            None => m.defaults().get(c).map(|d| format!(" DEFAULT {d}")).unwrap_or_default(),
+            None => col.default.as_ref().map(|d| format!(" DEFAULT {d}")).unwrap_or_default(),
         };
-        let ty = crate::types::shown(m, c, t); // (an enum or a uuid column: its type, not the text it holds)
+        let ty = crate::types::shown_col(col); // (an enum or a uuid column: its type, not the text it holds)
         format!("{} {ty}{merge}{null}{default}", ident(c))
     }).collect();
     if !m.key.is_empty() {
@@ -1017,19 +1025,20 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
     let not_null: Vec<String> = strings(&s["not_null"]).into_iter().chain(key.iter().cloned()).collect();
     let defaults: BTreeMap<String, String> = serde_json::from_value(s["defaults"].clone()).unwrap_or_default();
     for (c, _) in &was {
-        ensure!(not_null.contains(c) == old.not_null().contains(c) && defaults.get(c) == old.defaults().get(c), "{table}.{c}: NOT NULL and DEFAULT of a column there can't change yet");
+        let had = old.col(c);
+        ensure!(not_null.contains(c) == had.is_some_and(|h| h.not_null) && defaults.get(c) == had.and_then(|h| h.default.as_ref()), "{table}.{c}: NOT NULL and DEFAULT of a column there can't change yet");
     }
     let checks: Vec<(String, String)> = serde_json::from_value(s["checks"].clone()).unwrap_or_default();
     ensure!(checks == old.checks, "{table}'s CHECK constraints can't change yet");
     let constraints: Vec<crate::constraints::Constraint> = serde_json::from_value(s["constraints"].clone()).unwrap_or_default();
     ensure!(constraints == old.constraints, "{table}'s UNIQUE, PRIMARY KEY and FOREIGN KEY constraints change with ALTER TABLE {table} ADD | DROP CONSTRAINT");
     let enums: BTreeMap<String, crate::types::Enum> = serde_json::from_value(s["enums"].clone()).unwrap_or_default();
-    if let Some((c, _)) = was.iter().find(|(c, _)| enums.get(c) != old.enums().get(c)) {
+    if let Some((c, _)) = was.iter().find(|(c, _)| enums.get(c) != old.col(c).and_then(|h| h.labels.as_ref())) {
         bail!("{table}.{c}: a column's enum can't change here (a type takes a new label with ALTER TYPE … ADD VALUE)");
     }
     let sql_types: BTreeMap<String, String> = serde_json::from_value(s["sql_types"].clone()).unwrap_or_default();
     // (refused before anything changes: a uuid or a length the rows there were never checked against)
-    if let Some((c, t)) = was.iter().find_map(|(c, _)| sql_types.get(c).filter(|t| !crate::types::grows(old.sql_types().get(c).map(String::as_str), t)).map(|t| (c, t))) {
+    if let Some((c, t)) = was.iter().find_map(|(c, _)| sql_types.get(c).filter(|t| !crate::types::grows(old.col(c).and_then(|h| h.held.as_deref()), t)).map(|t| (c, t))) {
         let why = match t.as_str() {
             "uuid" => "a uuid: a column is a uuid only from when it is made, since the rows there were never checked as uuids".to_string(),
             "json" | "jsonb" => format!("{0}: a column is {0} only from when it is made, since the rows there were never checked as {0}", t.to_uppercase()),
@@ -1041,7 +1050,7 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
     // check rows that were never checked (a uuid, a length); a uuid made text, a length grown.
     let mut changed = vec![];
     for ((c, t), (_, new)) in was.iter().zip(&columns) {
-        if crate::answer::dtype(t).ok() != crate::answer::dtype(new).ok() || sql_types.get(c) != old.sql_types().get(c) {
+        if crate::answer::dtype(t).ok() != crate::answer::dtype(new).ok() || sql_types.get(c) != old.col(c).and_then(|h| h.held.as_ref()) {
             let written = create.columns.iter().find(|d| d.name.value == *c || d.name.value.to_lowercase() == *c).map_or_else(|| sql_type(new), |d| d.data_type.to_string());
             Box::pin(crate::ddl::apply(lake, Ddl::AlterColumn { table: table.clone(), column: c.clone(), change: crate::ddl::Change::Type(written) })).await?;
             changed.push(format!("{c} {}", sql_type(new)));
@@ -1226,7 +1235,7 @@ pub async fn listed(lake: &crate::store::Lake) -> anyhow::Result<serde_json::Val
         let (rows, bytes) = m.files.iter().fold((sealed.rows, sealed.bytes), |(r, b), f| (r + f.rows, b + f.bytes));
         all.push(serde_json::json!({"catalog": catalog, "schema": schema, "name": name, "kind": o.kind, "rows": rows, "bytes": bytes,
             "files": m.files.len() as u64 + sealed.files, "key": m.key, "partition": m.partition, "cluster": m.cluster, "publish": m.publish,
-            "not_null": m.not_null(), "defaults": m.defaults(), "ttl": m.ttl.as_ref().map(|(c, s)| format!("{c}: {s} s")), "ttl_secs": m.ttl,
+            "not_null": not_null_columns(&m), "defaults": column_defaults(&m), "ttl": m.ttl.as_ref().map(|(c, s)| format!("{c}: {s} s")), "ttl_secs": m.ttl,
             "merge": m.merge, "order_by": m.order, "sql": o.sql})); // (a materialized view's SQL: what the console scripts it as)
     }
     Ok(serde_json::json!({"objects": all, "files": format!("{}/files/", lake.url.trim_end_matches('/'))}))

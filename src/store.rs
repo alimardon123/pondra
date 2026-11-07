@@ -70,6 +70,7 @@ pub struct Made {
     pub sql_types: BTreeMap<String, String>,
 }
 
+#[cfg(test)]
 impl Made {
     fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.names.get(stored).map_or(stored, String::as_str) }
 }
@@ -318,6 +319,8 @@ impl<'de> Deserialize<'de> for Stored {
 
 impl Stored {
     /// The list from the fields by stored name. Facts for a name no column has are passed over, as every reader did.
+    /// The tests' check of `from_fields`, which moves the fields in rather than copying them.
+    #[cfg(test)]
     pub fn of(m: &Made) -> Stored {
         // (sets and places, not scans: a wide table's 500 columns against its drops and order were 0.1 ms an entry)
         fn set(v: &[String]) -> std::collections::HashSet<&str> { v.iter().map(String::as_str).collect() }
@@ -409,7 +412,7 @@ impl Stored {
                 m.enums.insert(s.clone(), e.clone());
             }
         }
-        m.shown = self.order.iter().filter_map(|id| self.columns.get((*id as usize).checked_sub(1)?)).map(|c| c.stored.as_ref().unwrap_or(&c.name).clone()).collect();
+        m.shown = self.order.iter().filter_map(|id| self.columns.get(self.place(*id)?)).map(|c| c.stored_name().to_string()).collect();
         m
     }
 
@@ -419,9 +422,23 @@ impl Stored {
         crate::column::Columns::from_parts(by_id, self.sql_places())
     }
 
+    /// The place of the column whose id is `id`: `id - 1` in every list written so far, else found by its id. The format
+    /// writes an id only where it isn't the column's place + 1, so nothing takes one for the other: the one reading of an
+    /// id (`order`'s, `column::Columns::by_id`'s).
+    fn place(&self, id: u32) -> Option<usize> {
+        let at = (id as usize).checked_sub(1)?;
+        match self.columns.get(at) {
+            Some(c) if c.id == id => Some(at),
+            _ => self.columns.iter().position(|c| c.id == id),
+        }
+    }
+
+    /// The id a new column takes: one past the highest (its place + 1, while every id is).
+    fn next_id(&self) -> u32 { self.columns.iter().map(|c| c.id).max().unwrap_or(0) + 1 }
+
     /// The live columns' places in SQL's order: those `order` names first, then the others as stored.
     fn sql_places(&self) -> Vec<usize> {
-        let first: Vec<usize> = self.order.iter().filter_map(|id| (*id as usize).checked_sub(1)).collect();
+        let first: Vec<usize> = self.order.iter().filter_map(|id| self.place(*id)).collect();
         crate::column::places(self.columns.len(), |i| self.columns[i].dropped, &first)
     }
 
@@ -446,7 +463,7 @@ impl Stored {
                 Col { id: place, stored: None, ..c.clone() }
             })
             .collect();
-        let order = self.order.iter().filter_map(|id| ids.get((*id as usize).checked_sub(1)?).copied().filter(|&p| p > 0)).collect();
+        let order = self.order.iter().filter_map(|id| ids.get(self.place(*id)?).copied().filter(|&p| p > 0)).collect();
         Stored { columns, order }
     }
 
@@ -460,7 +477,7 @@ impl Stored {
     fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<crate::types::Enum>) -> String {
         let taken = |s: &str| self.columns.iter().any(|c| c.stored_name() == s);
         let stored = (1..).map(|i| if i == 1 { name.to_string() } else { format!("{name}~{i}") }).find(|s| !taken(s)).expect("a free name");
-        let id = self.columns.len() as u32 + 1;
+        let id = self.next_id();
         self.columns.push(Col { id, name: name.to_string(), stored: (stored != name).then(|| stored.clone()), dtype: dtype.to_string(), held, labels, ..Default::default() });
         stored
     }
@@ -499,7 +516,7 @@ impl Stored {
         let as_stored: Vec<&str> = self.columns.iter().filter(|c| !c.dropped && c.stored_name() != "_deleted").map(Col::stored_name).collect();
         self.order = match as_stored.starts_with(&stored.iter().map(String::as_str).collect::<Vec<_>>()) {
             true => vec![],
-            false => stored.iter().filter_map(|s| self.columns.iter().position(|c| c.stored_name() == s)).map(|i| i as u32 + 1).collect(),
+            false => stored.iter().filter_map(|s| self.columns.iter().find(|c| c.stored_name() == s)).map(|c| c.id).collect(),
         };
     }
 
@@ -517,7 +534,7 @@ impl Stored {
 
     fn append(&mut self, more: impl IntoIterator<Item = (String, String)>) {
         for (name, dtype) in more {
-            let id = self.columns.len() as u32 + 1;
+            let id = self.next_id();
             self.columns.push(Col { id, name, dtype, ..Default::default() });
         }
     }
@@ -564,9 +581,9 @@ struct Record {
     /// The fields by stored name, for the readers that ask for them (`columns()` and the rest): made from the list once,
     /// kept by a clone, emptied by an edit.
     fields: crate::memo::Shared<Made>,
-    /// The columns' places in order of their stored names, for `col` on a wide table: made once, kept by a clone, emptied
-    /// by an edit.
-    by_stored: crate::memo::Shared<Vec<u32>>,
+    /// The columns' places by their stored names, for `col` on a wide table: made once, kept by a clone, emptied by an
+    /// edit.
+    by_stored: crate::memo::Shared<datafusion::common::HashMap<Box<str>, u32>>,
     /// The renamed and the dropped columns, made once from the list: few, or none, on most tables.
     marked: crate::memo::Shared<Marked>,
 }
@@ -600,19 +617,14 @@ impl Record {
 
     fn fields(&self) -> &Made { self.fields.get_ref(|| self.list.fields()) }
 
-    /// The column stored as `stored`: looked through, or found by its index on a wide table (as the fields' maps found it).
+    /// The column stored as `stored`: looked through, or found by its index on a wide table.
     fn col(&self, stored: &str) -> Option<&Col> {
         let c = &self.list.columns;
         if c.len() <= SCANNED {
             return self.list.col(stored);
         }
-        let by = self.by_stored.get_ref(|| {
-            let mut by: Vec<u32> = (0..c.len() as u32).collect();
-            by.sort_unstable_by(|a, b| c[*a as usize].stored_name().cmp(c[*b as usize].stored_name()));
-            by
-        });
-        let i = by.binary_search_by(|i| c[*i as usize].stored_name().cmp(stored)).ok()?;
-        Some(&c[by[i] as usize])
+        let by = self.by_stored.get_ref(|| c.iter().zip(0..).map(|(c, i)| (c.stored_name().into(), i)).collect());
+        Some(&c[*by.get(stored)? as usize])
     }
 
     fn marked(&self) -> &Marked {
@@ -980,7 +992,10 @@ impl TableMeta {
 
     /// What `SELECT *` lists: `sql_columns` without a keyed table's delete markers (`marker`). What SHOW CREATE writes and
     /// what a view's `*` reads (`ddl::keep_readers`).
-    pub fn star(&self) -> Vec<(String, String)> { self.sql_columns().into_iter().filter(|(c, _)| !self.marker(c)).collect() }
+    pub fn star(&self) -> Vec<(String, String)> { self.star_cols().map(|c| (c.name.clone(), c.dtype.clone())).collect() }
+
+    /// `star`'s columns as the list has them, each with its facts (`objects::table_sql`).
+    pub fn star_cols(&self) -> impl Iterator<Item = &Col> { self.in_order().filter(|c| !self.marker(&c.name)) }
 
     /// `sql_order` without `_deleted` (a keyed table's or not): what an INSERT without a column list fills, first to last
     /// (`write::implicit`), and what `ALTER COLUMN … FIRST | AFTER` places a column among.
@@ -1041,17 +1056,6 @@ impl TableMeta {
             return self.columns().to_vec();
         }
         self.live().map(|(_, n, t)| (n.to_string(), t.to_string())).collect()
-    }
-
-    /// A per-column map, keyed by stored name, under the names SQL knows the columns by: the entries of dropped columns
-    /// left out, as `logical()` and `to_rules()` take each column's facts.
-    pub fn in_sql<V: Clone>(&self, m: &BTreeMap<String, V>) -> BTreeMap<String, V> {
-        let named = |c: &'_ String| match self.col(c) {
-            Some(c) if c.dropped => None,
-            Some(c) => Some(c.name.clone()),
-            None => Some(c.clone()),
-        };
-        m.iter().filter_map(|(c, v)| Some((named(c)?, v.clone()))).collect()
     }
 
     // The edits to a table's columns: the one way DDL changes them (redesign 1b, piece 6a). Each names a column by its
@@ -4959,7 +4963,10 @@ mod tests {
                 })
                 .fold(f64::MAX, f64::min)
         };
-        let helpers: [(&str, fn(&TableMeta) -> usize); 6] = [
+        let helpers: [(&str, fn(&TableMeta) -> usize); 9] = [
+            ("table_sql()", |m| crate::objects::table_sql("t", m).len()),
+            ("types::shown(), each column", |m| m.list().columns.iter().map(|c| crate::types::shown(m, c.stored_name(), &c.dtype).len()).sum()),
+            ("default_sql(), each column", |m| m.live().filter_map(|(_, n, _)| crate::rules::rows::default_sql(m, n)).count()),
             ("logical()", |m| m.logical().columns().len()),
             ("to_rules()", |m| m.to_rules().unwrap().columns.len()),
             ("sql_columns()", |m| m.sql_columns().len()),
@@ -4984,6 +4991,27 @@ mod tests {
             let warm = best(rounds, &mut || { std::hint::black_box(m.to_logical(&b).unwrap().num_columns()); });
             println!("{what}, to_logical() of a batch of every stored column: {warm:.2} µs warm, the first entry");
         }
+    }
+
+    /// A list's `order` names columns by id, and an id is its place + 1 only as lists are written so far (the format writes
+    /// one where it isn't): SQL's order, `logical()`, the fields' view, the column list and a new column's id all take an
+    /// id as an id (`Stored::place`).
+    #[test]
+    fn an_id_that_isnt_a_place_is_read_as_an_id() {
+        let col = |id: u32, name: &str| Col { id, name: name.into(), dtype: "Int64".into(), ..Default::default() };
+        let list = Stored { columns: vec![col(3, "a"), col(1, "b"), col(2, "c"), Col { dropped: true, ..col(4, "d") }], order: vec![2, 3] };
+        let m = TableMeta { record: Record::new(list, true), ..Default::default() };
+        assert_eq!(m.sql_order(), ["c", "a", "b"]);
+        assert!(m.moved());
+        assert_eq!(m.logical().sql_order(), ["c", "a", "b"]);
+        assert_eq!(m.list().fields().shown, ["c", "a"]);
+        let cols = m.column_list();
+        assert_eq!(cols.sql().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["c", "a", "b"]);
+        assert_eq!([3, 1, 4].map(|id| cols.by_id(id).map(|c| c.name.as_str())), [Some("a"), Some("b"), Some("d")]);
+        let mut m = m;
+        m.add_column("e", "Utf8", None, None);
+        m.set_order(vec!["e".into(), "a".into()]);
+        assert_eq!((m.col("e").map(|c| c.id), m.list().order.clone(), m.sql_order()), (Some(5), vec![5, 3], vec!["e".to_string(), "a".into(), "b".into(), "c".into()]));
     }
 
     /// An entry is written in the shape it was read in (`Record`): format 6's as the list alone, format 5's as its fields,

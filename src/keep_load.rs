@@ -55,7 +55,7 @@ async fn attempt(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str,
     let Some(stamp) = stamp else { return Ok(Err("no commit number reserved: the rows take a lineage".into())) };
     // The table: this statement's own, with nothing in it, and nothing a file as it is can't keep.
     let Some(meta) = stored else { return Ok(Err("no table".into())) };
-    let plain = meta.made_by.as_deref() == Some(job) && meta.files.is_empty() && meta.sealed.is_none() && fits_as_written(meta) && meta.partition.is_none() && meta.cluster.is_empty() && meta.constraints.is_empty() && meta.identity().is_empty();
+    let plain = meta.made_by.as_deref() == Some(job) && meta.files.is_empty() && meta.sealed.is_none() && fits_as_written(meta) && meta.partition.is_none() && meta.cluster.is_empty() && meta.constraints.is_empty() && !meta.list().columns.iter().any(|c| c.identity.is_some());
     if !plain || meta.rules()?.ruled() {
         return Ok(Err("the table isn't this statement's, or has a partition, a key, a rule or identity".into()));
     }

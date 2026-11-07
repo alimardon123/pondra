@@ -118,10 +118,8 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
                 // whichever way the drop was written.
                 let mut using = vec![];
                 for (k, m) in users(lake, &n).await? {
-                    for (c, e) in m.enums() {
-                        if e.of.as_deref() == Some(n.as_str()) && !m.dropped().contains(c) {
-                            using.push(format!("{}.{}", &k[2..], m.name_of(c)));
-                        }
+                    for c in m.list().columns.iter().filter(|c| uses(c, &n)) {
+                        using.push(format!("{}.{}", &k[2..], c.name));
                     }
                 }
                 in_use(&n, &using)?;
@@ -146,8 +144,11 @@ pub(crate) async fn labels(lake: &Lake, name: &str) -> Option<Vec<String>> { fin
 /// The tables (their catalog keys and entries) with a column of this type, dropped columns aside.
 async fn users(lake: &Lake, name: &str) -> Result<Vec<(String, TableMeta)>> {
     let all = lake.cat.scan::<TableMeta>("t/", "t0").await?;
-    Ok(all.into_iter().filter(|(_, m)| m.enums().iter().any(|(c, e)| e.of.as_deref() == Some(name) && !m.dropped().contains(c))).collect())
+    Ok(all.into_iter().filter(|(_, m)| m.list().columns.iter().any(|c| uses(c, name))).collect())
 }
+
+/// Is this a live column of the enum type `name`?
+fn uses(c: &crate::store::Col, name: &str) -> bool { !c.dropped && c.labels.as_ref().is_some_and(|e| e.of.as_deref() == Some(name)) }
 
 /// A column's declared type, if it is an enum: `ENUM('a', 'b')`, or a type of this lake's.
 pub async fn of(lake: &Lake, t: &ast::DataType) -> Result<Option<Enum>> {
@@ -167,7 +168,8 @@ pub async fn of_table(lake: &Lake, name: &str) -> (BTreeMap<String, Enum>, BTree
     let Ok((None, local)) = crate::ddl::resolve(lake, name).await else { return Default::default() };
     match lake.cat.get::<TableMeta>(&table_key(&local)).await {
         Ok(Some(m)) => {
-            (m.in_sql(&m.enums()), m.in_sql(&m.sql_types()))
+            let live = || m.list().columns.iter().filter(|c| !c.dropped);
+            (live().filter_map(|c| Some((c.name.clone(), c.labels.clone()?))).collect(), live().filter_map(|c| Some((c.name.clone(), c.held.clone()?))).collect())
         }
         _ => Default::default(),
     }
@@ -192,10 +194,18 @@ pub async fn columns(lake: &Lake, cols: &[ast::ColumnDef]) -> Result<(Vec<ast::C
 /// A column's type as SQL writes it (`SHOW CREATE`, `pondra.parts`): an enum's, `UUID`, or what its
 /// Arrow type is (`objects::sql_type`). `m` and `column` alike by stored or alike by SQL's names.
 pub fn shown(m: &TableMeta, column: &str, arrow: &str) -> String {
-    match (m.enums().get(column), m.sql_types().get(column)) {
+    match m.col(column) {
+        Some(c) => shown_col(c),
+        None => crate::objects::sql_type(arrow),
+    }
+}
+
+/// `shown`, of a column of the list.
+pub fn shown_col(c: &crate::store::Col) -> String {
+    match (&c.labels, &c.held) {
         (Some(e), _) => e.sql(),
         (None, Some(t)) => t.to_uppercase(),
-        (None, None) => crate::objects::sql_type(arrow),
+        (None, None) => crate::objects::sql_type(&c.dtype),
     }
 }
 

@@ -14,7 +14,7 @@ pub fn is_word(text: &str) -> bool { text.trim().eq_ignore_ascii_case("default")
 /// the table's types after).
 #[cfg(feature = "lake")]
 pub(crate) fn default_sql(meta: &TableMeta, column: &str) -> Option<String> {
-    Some(format!("({})", meta.defaults().get(meta.stored(column)?)?))
+    Some(format!("({})", meta.col(meta.stored(column)?)?.default.as_ref()?))
 }
 
 /// The SQL for a value written for `column`: the word DEFAULT is the column's default (NULL with none), as Postgres
