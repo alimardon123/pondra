@@ -453,14 +453,19 @@ pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &Tabl
 }
 
 /// `name` as the request being served may read it: as it is for a token or a superuser; for a user
-/// granted some tables, `Guarded` (and left out of a listing if it may read none of it).
+/// granted some tables, `Guarded`. None, as if it weren't there, when it may read none of it and is listing, or doesn't
+/// know it is there (`Scope::knows`): a statement naming it is told no such table (42P01), not refused, nor told its
+/// columns. The views over it are still planned against it (`unlisted`, `register_views`).
 fn guarded(name: &str, t: Arc<dyn TableProvider>, listing: bool) -> Option<Arc<dyn TableProvider>> {
     let scope = crate::rights::scope();
     if scope.whole() {
         return Some(t);
     }
     let columns = scope.columns(name);
-    if listing && columns.is_none() {
+    if columns.is_none() && (listing || !scope.knows(name)) {
+        if !listing {
+            crate::rights::told_unseen(); // (for the audit log: a refusal, `rights::noting`)
+        }
         return None;
     }
     Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: None }))
@@ -475,8 +480,11 @@ fn across(name: &str, t: Arc<dyn TableProvider>, listing: bool, locked: &Option<
         None if scope.whole() => return Some(t),
         None => scope.named("select", name),
     };
-    if listing && columns.is_none() {
-        return None;
+    if columns.is_none() && (listing || locked.is_none() && !scope.knows_named(name)) {
+        if !listing {
+            crate::rights::told_unseen();
+        }
+        return None; // (as `guarded`: a table it doesn't know is there isn't, for it)
     }
     Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: locked.clone() }))
 }
@@ -1586,9 +1594,10 @@ pub async fn stored_views(lake: &Lake, sql: &str, listing: bool) -> Result<Vec<(
 
 /// Stored views over the tables `ctx` has now — again, if they are there already: a node's shares
 /// of its tables replace them (`spmd.rs`), and the views must read those. One view may use
-/// another: until none is left.
+/// another: until none is left. A view its user may not see (`guarded`) is there for the views over it to be planned
+/// against, and taken out after, as a table is (`session`'s `unlisted`).
 pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String)>, strict: bool, listing: bool) -> Result<()> {
-    let mut failed = None;
+    let (mut failed, mut planned_only) = (None, vec![]);
     while !views.is_empty() {
         let before = views.len();
         let mut left = vec![];
@@ -1597,9 +1606,13 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
                 Ok(df) => {
                     ctx.deregister_table(table_ref(&name))?;
                     let view = Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext_names::readable(&sql)))); // (its files as SQL named them)
-                    if let Some(v) = guarded(&name, view, listing) {
-                        ctx.register_table(table_ref(&name), v)?;
-                    }
+                    match guarded(&name, view.clone(), listing) {
+                        Some(v) => ctx.register_table(table_ref(&name), v)?,
+                        None => {
+                            planned_only.push(table_ref(&name));
+                            ctx.register_table(table_ref(&name), Arc::new(Guarded { inner: view, name: name.clone(), columns: None, why: None }))?
+                        }
+                    };
                 }
                 Err(e) => {
                     failed = Some(anyhow::anyhow!("view {name}: {e}"));
@@ -1614,6 +1627,9 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
             }
         }
         views = left;
+    }
+    for name in planned_only {
+        ctx.deregister_table(name)?;
     }
     Ok(())
 }

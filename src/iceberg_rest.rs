@@ -374,7 +374,7 @@ async fn load(axum::extract::State(app): axum::extract::State<crate::app::App>, 
     // metadata table `files` of `t`, as Spark does)
     let no_table = || missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException");
     let (_, lake, schema) = space(&app, &ns).await.map_err(|_| no_table())?;
-    crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&crate::text::join(&schema, &table))).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?; // (a user's: an engine reads the whole files)
+    crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&crate::text::join(&schema, &table))).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), false))?; // (a user's: an engine reads the whole files; one it doesn't know of is no such table, `Scope::knows`)
     Ok(axum::Json(loaded(&lake, &crate::text::join(&schema, &table)).await.map_err(|_| no_table())?))
 }
 
@@ -391,7 +391,7 @@ async fn load(axum::extract::State(app): axum::extract::State<crate::app::App>, 
 async fn update(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>, body: bytes::Bytes) -> Reply {
     let (parts, lake, schema) = space(&app, &ns).await?;
     let name = crate::text::join(&schema, &table);
-    crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name)).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
+    crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name)).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), false))?;
     let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException"))?;
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the commit: {e}")))?;
     let updates = asked["updates"].as_array().cloned().unwrap_or_default();
@@ -437,7 +437,7 @@ async fn transaction(axum::extract::State(app): axum::extract::State<crate::app:
         }
         let table = id["name"].as_str().unwrap_or_default();
         let name = crate::text::join(&schema, table);
-        crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name)).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
+        crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name)).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), false))?;
         let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.join(".")), "NoSuchTableException"))?;
         if let Some(c) = prepare(&lake, &name, &current, change).await.map_err(door)? {
             commits.push(c);

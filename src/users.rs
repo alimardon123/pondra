@@ -1163,6 +1163,9 @@ async fn token_principal(lake: &Lake, user: &str, until: Option<u64>) -> Option<
 
 // ---------------------------------------------------------------- who is asking, and what they may do
 
+/// The privileges a grant gives on a table (or view): holding any of them, a user knows the table is there.
+const TABLE_PRIVILEGES: [&str; 4] = ["select", "insert", "update", "delete"];
+
 /// What a user may do: every grant of its own, its roles' (and theirs') and public's.
 #[derive(Default, Debug)]
 pub struct Access {
@@ -1193,6 +1196,10 @@ impl Access {
         some.map(Some)
     }
     pub fn may(&self, privilege: &str, table: &str) -> bool { self.columns(privilege, table).is_some() }
+    /// Whether it holds any privilege on `table`: SELECT, INSERT, UPDATE or DELETE, on it, its schema or the lake.
+    pub fn knows(&self, table: &str) -> bool { TABLE_PRIVILEGES.iter().any(|p| self.columns(p, table).is_some()) }
+    /// The same, for a table of another lake attached here (`named`).
+    pub fn knows_named(&self, table: &str) -> bool { TABLE_PRIVILEGES.iter().any(|p| self.named(p, table).is_some()) }
     /// What it holds, as one name (`rights::Scope::key`): its grants and its names, each in any order, hashed. Not its
     /// limits, which change no answer.
     pub fn key(&self) -> &str {

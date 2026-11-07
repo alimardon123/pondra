@@ -210,12 +210,12 @@ async fn request(app: &App, me: &Broker, who: &mut crate::auth::Principal, said:
     let done = |body: Vec<u8>| -> Reply { async move { Some(frame(corr, body)) }.boxed() };
     Ok(match key {
         API_VERSIONS => done(api_versions(if supported { ver } else { 0 }, supported)),
-        METADATA => done(metadata(app, me, ver, &mut r).await?),
+        METADATA => done(metadata(app, me, ver, &mut r, who).await?),
         SASL_HANDSHAKE => done(sasl_handshake(&mut r)?),
         SASL_AUTHENTICATE => done(sasl_authenticate(app, who, said, peer, ver, &mut r).await?),
         INIT_PRODUCER_ID => done(init_producer_id(&mut r)?),
         PRODUCE => produce(app, who, ver, &mut r).await?.map(move |body| body.map(|b| frame(corr, b))).boxed(),
-        LIST_OFFSETS => done(list_offsets(app, ver, &mut r).await?),
+        LIST_OFFSETS => done(list_offsets(app, ver, &mut r, who).await?),
         FIND_COORDINATOR => done(find_coordinator(app, me, ver, &mut r).await?),
         JOIN_GROUP => join_group(app, ver, &mut r).await?.map(move |b| Some(frame(corr, b))).boxed(),
         SYNC_GROUP => sync_group(app, ver, &mut r).await?.map(move |b| Some(frame(corr, b))).boxed(),
@@ -269,7 +269,8 @@ fn api_versions(ver: i16, supported: bool) -> Vec<u8> {
 /// signed-in request of 126 MB made a node of 3.7 GB, and each name was looked for through every table: security pass 2.)
 const ASKED: i32 = 10_000;
 
-async fn metadata(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
+/// The topics `who` knows of are the tables it holds a privilege on (`rights::Scope::knows`): another is no topic, for it.
+async fn metadata(app: &App, me: &Broker, ver: i16, r: &mut Rd, who: &crate::auth::Principal) -> Result<Vec<u8>> {
     let asked: Option<Vec<String>> = match r.i32()? {
         -1 => None, // all topics
         n => {
@@ -277,7 +278,7 @@ async fn metadata(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Result<Vec<u8
             Some((0..n).map(|_| r.str()).collect::<Result<_>>()?)
         }
     };
-    let tables: std::collections::BTreeSet<String> = app.lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(k, _)| k[2..].to_string()).filter(|t| !crate::sys::hidden(t)).collect();
+    let tables: std::collections::BTreeSet<String> = app.lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(k, _)| k[2..].to_string()).filter(|t| !crate::sys::hidden(t) && who.scope.knows(t)).collect();
     let topics: Vec<(String, bool)> = match asked {
         None => tables.into_iter().map(|t| (t, true)).collect(),
         Some(names) => names.into_iter().map(|n| (n.clone(), tables.contains(&n))).collect(),
@@ -451,7 +452,10 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
             let outcome = match (&meta, &rules, index) {
                 _ if may.is_err() => {
                     load.end(may.clone().err());
-                    ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(not_yours.clone())))
+                    match who.scope.knows(&crate::auth::catalog_name(&name)) {
+                        true => ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(not_yours.clone()))),
+                        false => ready((UNKNOWN_TOPIC, -1, None)), // (one it doesn't know of: as one that isn't there, `metadata`)
+                    }
                 }
                 (Some(meta), Some(Ok(rules)), 0) => queue(app, who, &name, meta, rules, &records).await,
                 (Some(_), Some(Err(e)), 0) => {
@@ -907,7 +911,7 @@ fn decimal(x: &Value, scale: i64) -> Result<String> {
 
 /// Offsets: the earliest one still in the log, the next one to be written (-1), or the first at
 /// or after a time.
-async fn list_offsets(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
+async fn list_offsets(app: &App, ver: i16, r: &mut Rd, who: &crate::auth::Principal) -> Result<Vec<u8>> {
     r.i32()?; // replica
     if ver >= 2 {
         r.i8()?; // isolation level
@@ -920,7 +924,7 @@ async fn list_offsets(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     w.put_i32(n as i32);
     for _ in 0..n {
         let name = r.str()?;
-        let exists = app.lake.cat.meta(&table_key(&name)).await?.is_some();
+        let exists = app.lake.cat.meta(&table_key(&name)).await?.is_some() && who.scope.knows(&crate::auth::catalog_name(&name)); // (one it doesn't know of isn't, for it: `metadata`)
         put_str(&mut w, &name);
         let parts = r.len()?;
         w.put_i32(parts as i32);
@@ -1033,6 +1037,7 @@ async fn fetch(app: &App, ver: i16, req: FetchReq, who: &crate::auth::Principal)
                 // earliest offset it had cached from before those segments expired, in a loop.)
                 let (offset, end) = (offset.max(crate::log::ord(first, 0)), crate::log::ord(visible + 1, 0));
                 let (error, records) = match &meta {
+                    Some(_) if !who.scope.knows(&crate::auth::catalog_name(name)) => (UNKNOWN_TOPIC, vec![]), // (as one that isn't there: `metadata`)
                     Some(_) if crate::rights::may(who, crate::rights::Action::SelectAll, crate::rights::Object::Table(name)).is_err() => (TOPIC_AUTHORIZATION_FAILED, vec![]),
                     Some(meta) if index == 0 && offset <= end => (0, read(app, name, meta, offset, visible, limit.min(budget)).await?),
                     Some(_) if index == 0 => (OFFSET_OUT_OF_RANGE, vec![]),
