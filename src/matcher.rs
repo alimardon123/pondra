@@ -1792,7 +1792,8 @@ pub static MATCH_RECOGNIZE: crate::registry::BuiltIn = crate::registry::BuiltIn 
         r.section_mut::<crate::engine::Functions>().add("match_recognize", |ctx| {
             register(&ctx);
             ctx
-        })
+        });
+        crate::pattern::passes().into_iter().for_each(|p| r.section_mut::<crate::passes::Passes>().add(p));
     },
 };
 

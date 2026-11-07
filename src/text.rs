@@ -291,6 +291,19 @@ pub fn makes_json(sql: &str) -> bool {
     CALL.is_match(sql)
 }
 
+/// The front's pass for `names_a_type` (`passes.rs`): triggered by an array type's `[]`, a set function, a JSON maker, `||`,
+/// a string, `::`, a cast, and the enum functions.
+pub(crate) fn types_pass() -> crate::passes::Pass {
+    let mut words = vec!["generate_series", "range", "unnest", "enum_range", "enum_first", "enum_last", "pg_typeof", "cast", "try_cast", "safe_cast"];
+    for j in ["json", "jsonb"] {
+        for f in ["array_elements", "array_elements_text", "each", "each_text", "object_keys", "to_record", "to_recordset"] {
+            words.push(Box::leak(format!("{j}_{f}").into_boxed_str()));
+        }
+    }
+    words.extend(JSON_MAKERS.iter().copied());
+    crate::passes::Pass { name: "text.names_a_type", order: 80, words, marks: vec![&["[]"], &["||"], &["'"], &["::"]], run: crate::passes::Run::Wants(names_a_type) }
+}
+
 /// Could `sql` name a type of one's own, in a cast or one of the enum functions? (Only then is
 /// it parsed for one: the built-in types' names are left alone.) A cast to uuid, json or jsonb,
 /// an array type, a set function (which may read a column: `lateral::functions`), a JSON maker's
