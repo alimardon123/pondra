@@ -3889,25 +3889,25 @@ Known limits, in the order they matter:
     tables it would have made, Spark's function library, EXPLAIN's text (Pondra plans its own
     way), number literals typed DECIMAL (as Postgres and DuckDB do), strings read as `Utf8View`.
 
-Good next moves: `docs/roadmap.md` (2026-10-11) is one month to the 11-11 release (0.80.0 since the owner's 11-02 call; 1.0 follows the redesign), at the owner's bar
-("high quality, stable, workable, fully featured"): nine lanes side by side, each a thread that owns
-its files (engine and proof; in-process and the browser; the Postgres port; sources and outside
-catalogs; measures, the ontology and AI; SQL; durability and shipping; the console; the docs), a
-feature freeze (the owner called it on 11-03), the from-scratch review, then a release candidate
-under the soak. Edit only your lane's files (the project's `designs/one-month-to-1-0.md` lists
-them and each lane's numbers).
+Good next moves: the redesign on main (below), at the owner's bar ("high quality, stable, workable,
+fully featured"). No release is tagged while it runs (the owner, 11-07), rc.1 and 0.80.0 included:
+first the architecture is made modular, flexible, reusable and easy to extend, swap or remove, and
+proven to work; then L1 recommends the version for him to tag, and new features ship on that base.
+`docs/roadmap.md` keeps the month that led here and the scorecard 1.0 waits on. Each lane is a
+thread that owns its files; edit only your lane's files (the project's `designs/one-month-to-1-0.md`
+lists them and each lane's numbers).
 
-**Two branches until 0.80.0** (the owner: the freeze 11-03 10:25 UTC, "release branch, redesign on
-main" 12:06). `release/0.80`, cut at main 20c2732, is the release: rc.1 on 11-06 and 0.80.0 on 11-11
-are bumped and tagged there, and a tag names a `release/0.80` commit. Only these merge into it:
-- a fix for a wrong answer, lost or exposed data, or a crash or hang;
-- an rc.1 blocker: a gate, the soak or the upgrade check failing, or the release itself (the
-  version, the release notes, the installers, the upgrade guide).
+**Two branches** (the owner: the freeze 11-03 10:25 UTC, "release branch, redesign on main" 12:06;
+no release for now, 11-07). `release/0.80`, cut at main 20c2732, holds 0.80 as it stands. No rc.1 or
+0.80.0 is tagged for now and no new release work is done there; the owner may tag it himself later,
+once the gates run again on its head. A tag names a `release/0.80` commit. Only a fix already under
+way merges into it, if it is cheap, and only of this kind: a fix for a wrong answer, lost or exposed
+data, or a crash or hang.
 
 Nothing else merges there, however small: no feature, speed work, refactor or new spelling. A fix's
-pull request targets `release/0.80`, says which of the two kinds it is, and still proves that no
-other answer changes and no query is slower. Its lane then ports it to main in its own pull
-request, if the code it fixes is still there.
+pull request targets `release/0.80`, says which kind it is, and still proves that no other answer
+changes and no query is slower. Its lane then ports it to main in its own pull request, if the code
+it fixes is still there.
 
 Main takes the redesign, one step at a time in the order of the project's
 `designs/redesign/redesign.md` (v2.1, §12); the project's `redesign-wip/lane-map.md` says which lane
