@@ -3,10 +3,14 @@
 **Date:** 2026-10-11 (one month to 1.0; the 2026-10-03 plan of rounds is in git) · **Status:** the
 month is the owner's (2026-10-11), the lanes my plan for it; the decisions at the end are his.
 
-**0.80, not 1.0, on 11-11** (the owner, 2026-11-02): the release the month was building ships as 0.80.0, its
-candidate on 11-06 as 0.80.0-rc.1, on the same dates, so a clean 1.0 has room to mature. 1.0 follows
-the from-scratch redesign, once every row below is proven; until then no release promises compatibility (the
-stability page's 1.x promises start at 1.0). "After 1.0" below still means after 1.0.
+**No release until the redesign is done** (the owner, 2026-11-07): 0.80.0-rc.1 and 0.80.0 are not
+tagged on 11-06 and 11-11 as planned. The redesign on main comes first, until its architecture is
+modular, flexible, reusable and easy to extend, and proven to work; then L1 recommends the version,
+and new features ship on it. `release/0.80` keeps 0.80 as it stands (its candidate passed every gate
+on 11-07), so the owner may still tag it himself later, once the gates run again on its head. On
+11-02 he had named the month's release 0.80.0, not 1.0, so a clean 1.0 has room to mature. 1.0
+follows the redesign, once every row below is proven; until then no release promises compatibility
+(the stability page's 1.x promises start at 1.0). "After 1.0" below still means after 1.0.
 
 **The bar** (the owner, 2026-10-03): reach 1.0 faster and more productively, with everything before
 it high quality, stable, workable, fully featured and true to the design principles (AGENTS.md).
@@ -69,10 +73,10 @@ is `designs/one-month-to-1-0.md` in the project's files). Rounds 17 to 34 are re
 |---|---|
 | Wednesdays (10-14, 10-21, 10-28) | 0.34.0, 0.35.0, 0.36.0: whatever is green on main |
 | 10-31 to 11-03 | Features kept landing as they fit by rc.1, High fixes first (the owner, 10-31: the freeze waited for his call) |
-| **11-03** | **Feature freeze** (the owner, 11-03 10:25 UTC). `release/0.80` was cut at main 20c2732 (his pick, 12:06). It takes only fixes and rc.1 blockers until 0.80.0, and each fix is ported to main. Main takes the redesign's steps in order (AGENTS.md, "Two branches until 0.80.0") |
+| **11-03** | **Feature freeze** (the owner, 11-03 10:25 UTC). `release/0.80` was cut at main 20c2732 (his pick, 12:06). It took only fixes and rc.1 blockers, and each fix is ported to main. Main takes the redesign's steps in order (AGENTS.md, "Two branches") |
 | 11-03 on | The review, once every feature works (above all one core with its forms and APIs: ADR-072), from scratch (the owner, 10-16): architecture, design, security and the code reviewed again, and simplified so the parts work together: modular, flexible, one reusable part in every place over copies, easy to add, swap or remove for maintainers and customers alike, still one small binary; every door tried as a new user would; the docs finished; the console's last fixes |
-| 11-06 | 0.80.0-rc.1, then the 24-hour soak on R2, the cluster bench, the gates and the upgrade check |
-| **11-11** | **0.80.0** (planned as 1.0.0 until 11-02) |
+| 11-06 | 0.80.0-rc.1 was planned, then the 24-hour soak on R2, the cluster bench, the gates and the upgrade check. Its candidate passed the gates on 11-07 |
+| 11-07 | **No release for now** (the owner, 11-07): rc.1 and 0.80.0 (planned for 11-11, and as 1.0.0 until 11-02) wait. The redesign comes first; a version follows once its architecture is done and proven |
 
 | Lane | Thread | By the freeze |
 |---|---|---|
