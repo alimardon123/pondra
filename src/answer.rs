@@ -253,13 +253,17 @@ fn lines(b: &RecordBatch) -> anyhow::Result<Vec<u8>> { json_lines([b]) }
 // ---------------------------------------------------------------- rows as JSON
 //
 // The one place rows become JSON, for every door and every answer that carries rows inside it: Arrow's writer, so a
-// value is written the same way wherever it goes (a NULL left out of its row's object). `json` is an array of row
-// objects (`[]` for none), `json_lines` one object a line (NDJSON), `json_each` each row's object on its own, and
-// `json_values` the first rows as values, for an answer that holds them inside JSON of its own.
+// value is written the same way wherever it goes (a NULL left out of its row's object, but where an answer asks for it
+// said: `json_first`). `json` is an array of row objects (`[]` for none), `json_lines` one object a line (NDJSON),
+// `json_each` each row's object on its own, and `json_values` the first rows as values, for an answer that holds them
+// inside JSON of its own.
 
 /// Rows as a JSON array of objects.
-pub fn json<'a>(batches: impl IntoIterator<Item = &'a RecordBatch>) -> Result<Vec<u8>> {
-    let mut w = arrow_json::ArrayWriter::new(Vec::new());
+pub fn json<'a>(batches: impl IntoIterator<Item = &'a RecordBatch>) -> Result<Vec<u8>> { json_array(batches, false) }
+
+/// Rows as a JSON array of objects, a NULL as `null` (`nulls`) or left out.
+fn json_array<'a>(batches: impl IntoIterator<Item = &'a RecordBatch>, nulls: bool) -> Result<Vec<u8>> {
+    let mut w = arrow_json::WriterBuilder::new().with_explicit_nulls(nulls).build::<_, arrow_json::writer::JsonArray>(Vec::new());
     for b in batches {
         w.write(b)?;
     }
@@ -287,9 +291,10 @@ pub fn json_each(b: &RecordBatch) -> Result<Vec<Vec<u8>>> {
 pub fn json_values(batches: &[RecordBatch], n: usize) -> Result<Vec<Value>> { Ok(serde_json::from_slice(&json(&first(batches, n))?)?) }
 
 /// The first `n` rows as a JSON array, as written: for an answer that holds them inside JSON of its own, put in as they
-/// are (`serde_json::value::RawValue`), so a value reads as every door writes it (a DECIMAL's every digit).
-pub fn json_first(batches: &[RecordBatch], n: usize) -> Result<Box<serde_json::value::RawValue>> {
-    Ok(serde_json::value::RawValue::from_string(String::from_utf8(json(&first(batches, n))?)?)?)
+/// are (`serde_json::value::RawValue`), so a value reads as every door writes it (a DECIMAL's every digit). With `nulls`,
+/// each row has every column, a NULL as `null`: MCP's, so an agent tells a NULL from a column that isn't there.
+pub fn json_first(batches: &[RecordBatch], n: usize, nulls: bool) -> Result<Box<serde_json::value::RawValue>> {
+    Ok(serde_json::value::RawValue::from_string(String::from_utf8(json_array(&first(batches, n), nulls)?)?)?)
 }
 
 /// The batches' first `n` rows.
