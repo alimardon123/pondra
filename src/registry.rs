@@ -80,6 +80,11 @@ impl Registry {
             .unwrap_or_else(|| panic!("no extension of this build adds to the registry's {} section", S::NAME))
     }
 
+    /// A section, or None when no extension of this build adds to it (a reader that has nothing to do without one).
+    pub fn find<S: Section>(&self) -> Option<&S> {
+        self.sections.get(&TypeId::of::<S>()).and_then(|s| s.downcast_ref())
+    }
+
     /// A section to add to, made empty the first time.
     pub fn section_mut<S: Section>(&mut self) -> &mut S {
         self.sections.entry(TypeId::of::<S>()).or_insert_with(|| Box::new(S::default())).downcast_mut().expect("a section is kept under its own type")
@@ -142,6 +147,12 @@ mod tests {
     #[should_panic(expected = "registry's words section")]
     fn a_missing_section_is_named() {
         Registry::build(&[]).section::<Words>();
+    }
+
+    #[test]
+    fn a_missing_section_is_found_as_none() {
+        assert!(Registry::build(&[]).find::<Words>().is_none());
+        assert_eq!(Registry::build(&[&Adds("a", &[], "one")]).find::<Words>().map(|w| w.0.clone()), Some(vec!["one"]));
     }
 
 }

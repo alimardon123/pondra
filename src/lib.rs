@@ -246,6 +246,8 @@ mod rules;
 #[cfg(feature = "lake")] mod vars;
 #[cfg(feature = "lake")] mod views;
 #[cfg(feature = "lake")] mod write;
+// The registry's statements section: a statement an extension adds, read by `write::parse` at one place.
+#[cfg(feature = "lake")] pub mod statements;
 #[cfg(feature = "lake")] mod writer;
 #[cfg(feature = "lake")] mod keep_load;
 #[cfg(feature = "lake")] mod write_outside;
