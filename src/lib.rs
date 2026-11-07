@@ -85,6 +85,7 @@ mod pg_oids;
 mod pg_casts;
 mod pg_trace;
 pub mod pg_bytea;
+mod one_row;
 mod optimize;
 mod or_ranges;
 mod zeros_in;

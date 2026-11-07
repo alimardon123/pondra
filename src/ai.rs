@@ -46,7 +46,7 @@ pub static AI: crate::registry::BuiltIn = crate::registry::BuiltIn {
 
 /// The endpoint the AI functions call, and how (the registry's settings section, `settings.rs`).
 pub const SETTINGS: &[Setting] = &[
-    node("PONDRA_AI_CALLS", Kind::Int, Unset::No),
+    node("PONDRA_AI_CALLS", Kind::Int, Unset::Is("16")),
     node("PONDRA_AI_KEY", Kind::Secret, Unset::No),
     node("PONDRA_AI_MODEL", Kind::Text, Unset::Is("llama3.2")),
     node("PONDRA_AI_TIMEOUT_SECS", Kind::Secs, Unset::Is("300")),
@@ -198,7 +198,7 @@ fn failed(embed: bool, e: &anyhow::Error) {
 /// many partitions on many nodes never storm a provider.
 fn turns() -> &'static tokio::sync::Semaphore {
     static TURNS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-    TURNS.get_or_init(|| tokio::sync::Semaphore::new(crate::env::parse::<usize>("PONDRA_AI_CALLS").filter(|&n| n > 0).unwrap_or(16)))
+    TURNS.get_or_init(|| tokio::sync::Semaphore::new(crate::env::value::<usize>("PONDRA_AI_CALLS").max(1)))
 }
 
 /// One request to the endpoint: the answers' texts, or the embeddings as JSON arrays, one per input.
