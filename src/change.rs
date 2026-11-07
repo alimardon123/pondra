@@ -833,7 +833,7 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &Arc<Table
     }
     let inserted = new.as_ref().and_then(|n| Some(n.column_by_name(ROW_ID)?.null_count())).unwrap_or(0); // (new rows: no id yet)
     let src = |p: &str| Src { producer: format!("{producer}{p}"), seq: 1, prev: None };
-    let append = |table: &str, batch: RecordBatch, src: Src| Append { table: table.into(), src, batch, ack: tokio::sync::oneshot::channel().0 };
+    let append = |table: &str, batch: RecordBatch, src: Src| Append { table: table.into(), src, batch, ack: tokio::sync::oneshot::channel().0, placed: None };
     let mut pending = vec![];
     if meta.key.is_empty() {
         if old.is_some() {

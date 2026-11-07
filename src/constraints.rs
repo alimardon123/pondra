@@ -412,7 +412,7 @@ async fn append(lake: &Lake, seq: &Sequencer, table: &str, src: Src, batch: Reco
     }
     // (an empty batch still moves its producer's seq: `change::appends` has nothing to append for it)
     let mut pending = match batch.num_rows() {
-        0 => vec![Append { table: table.into(), src: src.clone(), batch: RecordBatch::new_empty(crate::answer::schema(&meta.logical_columns())?), ack: tokio::sync::oneshot::channel().0 }],
+        0 => vec![Append { table: table.into(), src: src.clone(), batch: RecordBatch::new_empty(crate::answer::schema(&meta.logical_columns())?), ack: tokio::sync::oneshot::channel().0, placed: None }],
         _ => crate::change::appends(lake, seq, table, &meta, vec![], vec![batch], "", false, false).await?.0, // (a loader's rows: upserts)
     };
     let table_append = pending.first_mut().ok_or_else(|| anyhow::anyhow!("no rows for {table}"))?;
