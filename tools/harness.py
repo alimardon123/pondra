@@ -10561,6 +10561,11 @@ def server():
         and "hr signs in on its own" in str(seen["open_writes"]) and "403" in seen["open_iceberg"] and "people" not in str(seen["open_lists"])
     checks["a database's superuser reads another only as that one lets anyone: open, yes; signing in on its own, no"] = seen["boss_open"] == [{"text": "hi"}] \
         and "sales signs in on its own" in str(seen["boss_locked"])
+    # (11-06 audit L3: a past read is guarded under the name a plain read is, so a grant naming lake.notes reads it as
+    # lake.public.notes AT (…) too; it was guarded as written, and refused)
+    v_notes = _try(lambda: at("hr", "SELECT max(_version) AS v FROM lake.notes", boss)[0]["v"])
+    seen["ann_past"] = [at("hr", f"SELECT text FROM {n} AT (VERSION => {v_notes})", ann) for n in ("lake.notes", "lake.public.notes")]
+    checks["a grant naming an attached lake's table reads it as it was too, by lake.t and lake.schema.t (AT (VERSION => n))"] = seen["ann_past"] == [[{"text": "hi"}]] * 2
     # Whoever runs the nodes (one of their tokens) still reads across; a user of the node's own lake doesn't.
     mine = new_lake()
     subprocess.run([BIN, "sql", "--dir", mine, "CREATE TABLE t AS SELECT 1 AS id"], check=True, capture_output=True)
