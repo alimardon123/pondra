@@ -11,6 +11,8 @@ extern crate pondra_tokio_web as tokio;
 // rewrites that need no lake.
 pub mod finish;
 pub mod env;
+// What a node's host does when the node must stop or start again, and what the code below it may ask of its form.
+pub mod lifecycle;
 // The one place a feature says what it adds (designs/redesign/redesign.md §6): `built_in` below lists the build's extensions.
 pub mod registry;
 pub mod settings;
@@ -47,6 +49,7 @@ pub mod sketch;
 mod asof;
 mod explain;
 mod multiply;
+mod divide;
 mod sparksql;
 mod parsed;
 mod past_names;
@@ -118,6 +121,7 @@ mod rules;
 #[cfg(feature = "lake")] mod bridge;
 #[cfg(feature = "lake")] mod rerun;
 #[cfg(feature = "lake")] mod replica;
+#[cfg(feature = "lake")] mod records; // (the catalog's record scheme: every prefix, and whose it is)
 #[cfg(feature = "lake")] mod auth;
 #[cfg(feature = "lake")] mod rights; // (what a principal may do, decided in one place: step 6)
 #[cfg(feature = "lake")] mod budget;
@@ -283,6 +287,10 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &matcher::MATCH_RECOGNIZE,
         #[cfg(feature = "lake")]
         &ai::AI,
+        #[cfg(feature = "lake")]
+        &apply::PROJECT,
+        #[cfg(feature = "lake")]
+        &udf::UDF,
     ];
     BUILT_IN
 }

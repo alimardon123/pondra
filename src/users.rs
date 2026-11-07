@@ -22,6 +22,12 @@ pub fn user_key(name: &str) -> String { format!("u/{name}") }
 pub const KEYS: &str = "z/auth"; // (the lake's own keys: sessions' signing key, and the nodes' key; `k/` is streaming tasks')
 /// Set once a lake has been served with tokens (S26, invariant 379): a node started by hand without them is not open.
 const SIGNED: &str = "z/signed";
+
+/// The users' own records beside their kinds' (`records`): the lake's keys.
+pub const PREFIXES: &[crate::records::Prefix] = &[
+    crate::records::Prefix { prefix: KEYS, owner: "users", holds: "the lake's own keys: sessions' signing key, and the nodes' key" },
+    crate::records::Prefix { prefix: SIGNED, owner: "users", holds: "set once the lake has been served with tokens" },
+];
 /// The names the three tokens sign in as over Postgres and Kafka: no user may take them.
 pub const BUILT_IN: [&str; 3] = ["admin", "writer", "reader"];
 

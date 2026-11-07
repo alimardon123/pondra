@@ -41,6 +41,20 @@ const STALE_MS: u64 = 120_000;
 fn record_key(n: u64) -> String { format!("dp/{n:010}") }
 pub(crate) fn migration_key(project: &str, file: &str) -> String { format!("dm/{project}/{file}") }
 
+/// The `project` extension (a project's plans, applies and migrations), as the registry knows it: its catalog records.
+pub static PROJECT: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "project",
+    requires: &[],
+    register: |r| r.section_mut::<crate::records::Prefixes>().add(PREFIXES),
+};
+
+/// A project's records in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[
+    crate::records::Prefix { prefix: "dp/", owner: "apply", holds: "each apply of a project, by number (record_key)" },
+    crate::records::Prefix { prefix: "dm/", owner: "apply", holds: "the migrations a project has run (migration_key)" },
+    crate::records::Prefix { prefix: LOCK, owner: "apply", holds: "the apply under way, and when it last said it was alive" },
+];
+
 /// What is asked of a project: `POST /plan`, `/apply`, `/test`, `/status` and `/capture` (`CALL plan`, `CALL
 /// apply`, `CALL status`; capture writes files, so only the command line and `POST /capture` ask it).
 #[derive(Clone, Copy, PartialEq)]

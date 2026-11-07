@@ -580,7 +580,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
                     }
                     (dir, false)
                 }
-                false => lake_dir(&dir).await?,
+                false => lake_dir(&dir, &*lake.life).await?,
             };
             lake.cat.commit(vec![(attachment_key(&name), json(&Attachment { dir: dir.clone(), read_only, endpoint }))], &[]).await?;
             Ok(match (created, read_only) {
@@ -614,7 +614,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             let (mut bases, mut branches) = (None, vec![]);
             if let Some(t) = &target {
                 // (as the lake is now, not as this node last saw it: a branch made or dropped just now counts)
-                let now = Lake::open(&t.url, false, false).await?;
+                let now = Lake::open(&t.url, false, false, lake.life.clone()).await?;
                 bases = now.cat.get::<crate::branch::Bases>(crate::branch::BASES).await?;
                 branches = now.cat.scan::<crate::branch::Pin>("pn/", "pn0").await?.into_iter().map(|(_, p)| p.lake).collect();
             }
@@ -705,8 +705,8 @@ pub async fn attachable(lake: &Lake, name: &str, fresh: bool) -> Result<()> {
 /// relative one would mean something else on every machine); and whether it was made just now.
 /// Nothing there yet (no catalog): a new, empty lake is made there, as DuckDB's ATTACH makes a
 /// new database file.
-async fn lake_dir(dir: &str) -> Result<(String, bool)> {
-    let dir = &crate::memory::place(dir); // (`:memory:`: a new lake in memory, which only opening makes: `node::lead_once`)
+async fn lake_dir(dir: &str, life: &dyn crate::lifecycle::Lifecycle) -> Result<(String, bool)> {
+    let dir = &crate::memory::place(dir); // (`:memory:`: a new lake in memory, which only opening makes: `Lifecycle::lead_elsewhere`)
     if !dir.contains("://") {
         std::fs::create_dir_all(dir).with_context(|| format!("no folder {dir}"))?;
     }
@@ -714,7 +714,7 @@ async fn lake_dir(dir: &str) -> Result<(String, bool)> {
     if has_catalog(&dir).await? {
         return Ok((dir, false));
     }
-    crate::node::lead_once(&dir).await?; // (whoever leads a lake first makes it)
+    life.lead_elsewhere(&dir).await?; // (whoever leads a lake first makes it)
     ensure!(has_catalog(&dir).await?, "couldn't make a lake at {dir}");
     Ok((dir, true))
 }
@@ -804,7 +804,7 @@ pub fn beside(url: &str, name: &str) -> String {
 /// Attach lake `dir` as `name` here, and return it. A node (`follow`) keeps it fresh from its catalog, until it
 /// is detached; `live` opens it to follow its leader's commit stream too (`--attach`: for good, `node::attach`).
 pub async fn attach(home: &Lake, name: &str, dir: &str, follow: bool, live: bool) -> Result<Arc<Lake>> {
-    let other = Lake::open(dir, false, live).await?;
+    let other = Lake::open(dir, false, live, home.life.clone()).await?;
     if follow {
         let (home, weak) = (Arc::downgrade(&home.arc()), Arc::downgrade(&other));
         crate::panics::spawn(async move {
@@ -1144,6 +1144,9 @@ pub(crate) async fn no_followers(lake: &Lake, name: &str, why: &str) -> Result<(
 
 /// Is a dropped table kept to be undropped (ADR-043)? Not with PURGE, not a hidden table, and not with a retention of 0.
 pub(crate) fn keeps(name: &str, meta: &TableMeta, purge: bool) -> bool { meta.retention_secs.map_or(KEEP_MS, |s| s * 1000) > 0 && !purge && !crate::sys::hidden(name) }
+
+/// DDL's own records beside the kinds' (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "dt/", owner: "ddl", holds: "a dropped table, kept while it can be undropped (dt/name/at)" }];
 
 /// A table's entries set aside as a drop sets them (leader, under the lock): kept to be undropped when `kept`, as `dt/` with
 /// its changed rows' old versions; taken out of every share (`shares::tables_moved`). The caller's commit deletes the table's own
@@ -2216,7 +2219,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_ctas_drops_only_the_table_its_job_made() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-made-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         crate::write::create_table(&lake, "t", r#"{"columns": [["a", "Int64"]], "made_by": "job-a"}"#).await?;
         let drop = |made_by: &str| Ddl::DropTable { name: "t".into(), if_exists: true, purge: true, made_by: Some(made_by.into()) };
         let out = apply(&lake, drop("job-b")).await?;
