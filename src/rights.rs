@@ -159,22 +159,35 @@ pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusa
     Err(Refusal::new(format!("permission denied: {what} {table} (GRANT {p} ON {table} TO {})", who.name)))
 }
 
-/// The same, for the request being served. None set is the node's own work: it may do anything an admin token may, and
-/// a door still writes no row of Pondra's own tables for it.
-pub fn may_here(action: Action, object: Object) -> anyhow::Result<()> { Ok(may(&served(), action, object)?) }
+/// The same, for the request being served. The node's own work (`auth::as_node`) may do anything an admin token may,
+/// and a door still writes no row of Pondra's own tables for it. Work with neither is refused (`nobody`).
+pub fn may_here(action: Action, object: Object) -> anyhow::Result<()> { Ok(may(&served(action)?, action, object)?) }
 
-/// The principal of the request being served (none set: the node's own, an admin token's rights).
-fn served() -> Principal { crate::auth::current().unwrap_or_else(|| Principal::token(Role::Admin)) }
+/// The principal of the request being served: the node's own work's is an admin token.
+fn served(action: Action) -> Result<Principal, Refusal> {
+    match crate::auth::current() {
+        Some(p) => Ok(p),
+        None if crate::auth::node_work() => Ok(Principal::token(Role::Admin)),
+        None => Err(nobody(action)),
+    }
+}
+
+/// Work that no request is served by and that isn't the node's own: work a request started, spawned without its caller
+/// (`auth::carried`). It gets no rights, rather than an admin's.
+fn nobody(action: Action) -> Refusal {
+    Refusal::new(format!("nobody asked for this, so it may not {}: work a request starts runs as its caller (auth::carried)", action.words()))
+}
 
 /// The same, for the request being served with `role`: its door's, a statement's `Who` (step 8's session carries one
 /// principal, and this goes).
-pub fn may_as(role: Role, action: Action, object: Object) -> anyhow::Result<()> { Ok(may(&as_role(role), action, object)?) }
+pub fn may_as(role: Role, action: Action, object: Object) -> anyhow::Result<()> { Ok(may(&as_role(role, action)?, action, object)?) }
 
-/// The principal of the request being served, with `role`.
-fn as_role(role: Role) -> Principal {
+/// The principal of the request being served, with `role` (the node's own work: a token of it). `action` names a refusal.
+fn as_role(role: Role, action: Action) -> Result<Principal, Refusal> {
     match crate::auth::current() {
-        Some(p) => Principal { role, ..p },
-        None => Principal::of(role),
+        Some(p) => Ok(Principal { role, ..p }),
+        None if crate::auth::node_work() => Ok(Principal::of(role)),
+        None => Err(nobody(action)),
     }
 }
 
@@ -184,12 +197,13 @@ pub fn may_run(role: Role, stmt: &Stmt) -> anyhow::Result<()> {
     if crate::temp::own(stmt) {
         return Ok(()); // (the session's own tables and views: any role may keep them)
     }
-    let who = as_role(role);
+    let (table, actions) = asks(stmt);
+    let Some(&first) = actions.first() else { return Ok(()) };
+    let who = as_role(role, first)?;
     // (CLONE is enough to make a branch, and its owner drops it: `branch::door` checks)
     if who.access.is_some() && matches!(stmt, Stmt::Ddl(ds) if ds.len() == 1 && matches!(ds[0], crate::ddl::Ddl::CreateDatabase { clone: Some(_), .. } | crate::ddl::Ddl::DropDatabase { .. })) {
         return Ok(());
     }
-    let (table, actions) = asks(stmt);
     let object = if table.is_empty() { Object::Lake } else { Object::Table(&table) };
     for action in actions {
         may(&who, action, object)?;
@@ -288,6 +302,34 @@ mod tests {
         assert_eq!(said(may(&Principal::token(Role::Admin), Action::SelectAll, audit)), "ok");
         assert_eq!(said(may(&Principal::token(Role::Write), Action::SelectAll, audit)), "permission denied: pondra$audit is Pondra's own, and its rows stream to a superuser only");
         assert_eq!(said(may(&all, Action::SelectAll, audit)), "permission denied: pondra$audit is Pondra's own, and its rows stream to a superuser only");
+    }
+
+    /// Work with no caller is refused, not given an admin's rights: work a request spawns without `auth::carried` loses
+    /// its caller. Only the node's own work (`auth::as_node`) is decided as an admin token's, and what it spawns with
+    /// `carried` stays so.
+    #[tokio::test]
+    async fn work_with_no_caller_is_refused() {
+        use crate::auth::{as_node, carried, WHO};
+        let t = Object::Table("t");
+        let told = |r: anyhow::Result<()>| r.err().map(|e| e.to_string()).unwrap_or_else(|| "ok".into());
+        let nobody = "nobody asked for this, so it may not write: work a request starts runs as its caller (auth::carried)";
+        assert_eq!(told(may_here(Action::Insert, t)), nobody);
+        assert_eq!(told(may_as(Role::Admin, Action::Insert, t)), nobody);
+        assert_eq!(told(may_run(Role::Admin, &Stmt::Delete("t".into(), None))), nobody);
+        assert_eq!(crate::codes::of(&may_here(Action::Insert, t).unwrap_err()), "42501");
+        let (lost, kept) = WHO
+            .scope(Principal::token(Role::Admin), async {
+                let lost = tokio::spawn(async move { told(may_here(Action::Insert, t)) }).await.unwrap();
+                (lost, tokio::spawn(carried(async move { told(may_here(Action::Insert, t)) })).await.unwrap())
+            })
+            .await;
+        assert_eq!((lost.as_str(), kept.as_str()), (nobody, "ok"), "spawned without its caller: refused, not an admin's");
+        let node = as_node(async {
+            let audit = told(may_here(Action::Insert, Object::Table("pondra$audit")));
+            (told(may_here(Action::Insert, t)), audit, tokio::spawn(carried(async move { told(may_as(Role::Write, Action::Insert, t)) })).await.unwrap())
+        })
+        .await;
+        assert_eq!(node, ("ok".to_string(), "pondra$audit is written by Pondra alone".to_string(), "ok".to_string()));
     }
 
     /// A write asks of its table what SQL's own would, and rows written ask UPDATE and DELETE as they need them.
