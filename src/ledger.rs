@@ -390,25 +390,48 @@ impl LakePool {
 
     fn part(&self) -> std::sync::MutexGuard<'_, Part> { self.part.lock().unwrap_or_else(PoisonError::into_inner) }
 
-    /// What `r` may grow by within the lake's share, by `FairSpillPool`'s rules.
-    fn available(&self, p: &Part, r: &MemoryReservation) -> usize {
-        let share = self.ledger.share();
-        match r.consumer().can_spill() {
-            // (no spiller past its part of what the lake's unspillable memory leaves of its share)
-            true => share.saturating_sub(p.unspillable).checked_div(p.spillers).unwrap_or(share).saturating_sub(r.size()),
-            false => share.saturating_sub(p.unspillable + p.spillable),
-        }
+    /// What `r` may grow by within the lake's room (`room`), by `FairSpillPool`'s rules, and the room.
+    fn available(&self, p: &Part, r: &MemoryReservation) -> (usize, usize) {
+        let spills = r.consumer().can_spill();
+        let room = self.room(p, spills);
+        let available = match spills {
+            // (no spiller past its part of what the lake's unspillable memory leaves of its room)
+            true => room.saturating_sub(p.unspillable).checked_div(p.spillers).unwrap_or(room).saturating_sub(r.size()),
+            false => room.saturating_sub(p.unspillable + p.spillable),
+        };
+        (available, room)
+    }
+
+    /// What the lake's queries may hold now: the line less what the other lakes' queries hold, so a lake running one small
+    /// SELECT beside it doesn't halve its room (11-06 audit M10). A spiller has at least the lake's even share of the line
+    /// (`Ledger::share`) while others hold the rest, as between pools of their own: the other lakes' spillers are held to
+    /// theirs at their next grow, and spill.
+    fn room(&self, p: &Part, spills: bool) -> usize {
+        let l = &self.ledger;
+        let free = l.line.saturating_sub(l.reserved().saturating_sub(p.spillable + p.unspillable));
+        if spills { free.max(l.share()) } else { free }
     }
 
     /// The refusal of a grow, which a spilling operator answers by spilling and any other query by stopping.
-    fn refused(&self, r: &MemoryReservation, additional: usize, available: usize) -> DataFusionError {
+    /// (`room`: the lake's, which the error names, `LakePool::line`)
+    fn refused(&self, r: &MemoryReservation, additional: usize, available: usize, room: usize) -> DataFusionError {
         DataFusionError::ResourcesExhausted(format!(
-            "Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total memory pool: {self}",
+            "Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total memory pool: {}",
             human_readable_size(additional),
             r.consumer().name(),
             human_readable_size(r.size()),
             human_readable_size(available),
+            self.line(room),
         ))
+    }
+
+    /// The line as an error says it: the lake's room in it, and the caches beside the queries.
+    fn line(&self, room: usize) -> String {
+        let l = &self.ledger;
+        match l.whole {
+            usize::MAX => format!("ledger(this database's room: {} of {})", human_readable_size(room), human_readable_size(l.line)),
+            whole => format!("ledger(this database's room: {} of {}, caches {} of {} with queries)", human_readable_size(room), human_readable_size(l.line), human_readable_size(l.cached()), human_readable_size(whole)),
+        }
     }
 }
 
@@ -467,9 +490,9 @@ impl MemoryPool for LakePool {
 
     fn try_grow(&self, r: &MemoryReservation, additional: usize) -> Result<()> {
         let mut p = self.part();
-        let available = self.available(&p, r);
+        let (available, room) = self.available(&p, r);
         if additional > available {
-            return Err(self.refused(r, additional, available));
+            return Err(self.refused(r, additional, available, room));
         }
         let over = self.ledger.over(additional);
         if over > 0 {
@@ -485,9 +508,9 @@ impl MemoryPool for LakePool {
                     self.ledger.dry.store(true, Relaxed);
                 }
                 p = self.part();
-                let available = self.available(&p, r);
+                let (available, room) = self.available(&p, r);
                 if additional > available {
-                    return Err(self.refused(r, additional, available));
+                    return Err(self.refused(r, additional, available, room));
                 }
             }
             if short && self.ledger.hard && r.consumer().can_spill() && r.size() > 0 {
@@ -497,7 +520,7 @@ impl MemoryPool for LakePool {
                 // cache, so both are held to their share alone, as before, with the memory watch behind them, and take back
                 // what the caches give. On the default line every grow does that: it spills where it did before, and the
                 // caches it found free gave their bytes back.
-                return Err(self.refused(r, additional, 0));
+                return Err(self.refused(r, additional, 0, self.room(&p, true)));
             }
         }
         *p.of(r) += additional;
@@ -511,7 +534,7 @@ impl MemoryPool for LakePool {
         p.spillable + p.unspillable
     }
 
-    fn memory_limit(&self) -> MemoryLimit { MemoryLimit::Finite(self.ledger.share()) }
+    fn memory_limit(&self) -> MemoryLimit { MemoryLimit::Finite(self.room(&self.part(), true)) }
 }
 
 #[cfg(test)]
@@ -664,6 +687,27 @@ mod tests {
         drop((b1, b_held));
         assert_eq!((ledger.busy.load(Relaxed), limit(&a)), (1, Some(100)));
         assert!(a_held.try_grow(50).is_ok());
+    }
+
+    /// A lake's room is the line less what the other lakes' queries hold (11-06 audit M10): B's one small statement doesn't
+    /// halve A's, so A's hash join that needs 60% of the line fits, and its refusal names A's room. A spiller still has its
+    /// lake's even share while the other lake holds the rest.
+    #[test]
+    fn a_lakes_room_is_the_line_less_what_the_others_hold() {
+        let ledger = Ledger::new(100, usize::MAX, false);
+        let (a, b) = (ledger.pool(), ledger.pool());
+        let small = consumer(&b, "b's small SELECT", false);
+        small.try_grow(1).unwrap();
+        let join = consumer(&a, "a's hash join", false);
+        assert!(join.try_grow(60).is_ok(), "60 of the 99 B leaves, not of half the line");
+        assert!(join.try_grow(39).is_ok());
+        let e = join.try_grow(1).unwrap_err().to_string();
+        assert!(e.contains("0.0 B remain available for the total memory pool: ledger(this database's room: 99.0 B of 100.0 B)"), "{e}");
+        let sorter = consumer(&b, "b's sort", true);
+        assert_eq!(limit(&b), Some(50));
+        assert!(sorter.try_grow(49).is_ok() && sorter.try_grow(1).is_err(), "B's half, less its small SELECT's 1");
+        drop(join);
+        assert!(sorter.try_grow(50).is_ok(), "A done: the line less B's own");
     }
 
     #[test]
