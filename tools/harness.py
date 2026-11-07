@@ -11869,11 +11869,12 @@ def guarded():
     nobody but the nodes adds to the lake's own records; a change a follower forwards runs as its
     user, reads included; a .py file is an admin's; a page of an answer is its asker's; /stats names
     the cluster's nodes only to a signed-in caller; rows through /append and /insert are in the audit log;
-    rows through Flight's DoPut and Kafka's produce are taken as through /append, and a hidden table's rows
+    rows through Flight's DoPut and Kafka's produce are taken as through /append, and each load through them and
+    COPY FROM STDIN is in the audit log too; a hidden table's rows
     stream only to a superuser and are written by no statement; a keyed table's loads ask UPDATE too, rows
     marked deleted and another engine's commit taking rows out ask DELETE (S11); a joined page's own statements are written by its
     node as the sign-in's, from a superuser only (M8)."""
-    import base64
+    import base64, psycopg
     import pyarrow as pa, pyarrow.flight as fl, confluent_kafka as ck
     P = A.port
     lake = new_lake()
@@ -12195,6 +12196,25 @@ def guarded():
     checks["a hidden table's rows (pondra$audit) stream to a superuser only: Flight's DoGet and /watch refuse a user granted every table"] = \
         "is Pondra's own" in said["flight get the audit log, carol"] and said["watch the audit log, carol"].startswith("403") and "is Pondra's own" in said["watch the audit log, carol"]
     checks["…and SQL writes none of them, a superuser's INSERT included"] = "written by Pondra alone" in str(said["SQL insert into the audit log, by a superuser"])
+    # Each load through Flight's DoPut, Kafka's produce and COPY FROM STDIN leaves its line in the audit log while writes
+    # are audited, as /append's does, and a refused one always: in its user's name.
+    def copy_rows(table):
+        try:
+            with psycopg.connect(host="127.0.0.1", port=P + 42, user="bob", password="bob-password-1", dbname="lake", autocommit=True) as con, \
+                    con.cursor() as cur, cur.copy(f"COPY {table} FROM STDIN") as cp:
+                cp.write("11\t1.0\n")
+            return "ok"
+        except Exception as e:
+            return f"ERROR {e}"
+    said["COPY, granted"], said["COPY, not granted"] = copy_rows("orders"), copy_rows("hr")
+    loads = {(f"INSERT INTO {t} (rows through {door})", outcome) for door in ("Flight DoPut", "Kafka produce", "COPY FROM STDIN")
+             for t, outcome in (("orders", "ok"), ("hr", "refused"))}
+    def loads_audited():
+        got = ask(P, "SELECT \"user\", statement, outcome FROM pondra.audit WHERE statement LIKE '%rows through%' ORDER BY at", auth=boss)
+        return {(r["statement"], r["outcome"]) for r in got if r["user"] == "bob"} if isinstance(got, list) else set()
+    checks["a load through Flight's DoPut, Kafka's produce or COPY FROM STDIN is in the audit log as its user's, and a refused one always"] = \
+        until(lambda: loads <= loads_audited(), True, 15) and said["COPY, granted"] == "ok" and "permission denied" in said["COPY, not granted"]
+    info["audit_loads"] = {"lines": sorted(loads_audited()), "copies": [said["COPY, granted"], said["COPY, not granted"]]}
     # S11: a keyed table's loads replace the rows of a key it holds, so every row door asks UPDATE for them too (as
     # Postgres asks it for ON CONFLICT DO UPDATE), and rows marked deleted (`_deleted`, a Kafka tombstone) ask DELETE;
     # another engine's commit that takes rows out asks DELETE. An append table's loads still ask INSERT alone.

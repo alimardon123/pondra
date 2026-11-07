@@ -2,7 +2,8 @@
 //! [`Writer`] on its table and gives it the rows a batch at a time. The steps and their order are kept here, not at the
 //! doors: the caller's rights first, then the columns a batch leaves out, the casts and the checks (`rules::shape`),
 //! then the log. A door reads its own wire (COPY's text, Kafka's records, Flight's and HTTP's batches) and nothing else.
-//! COPY, Kafka, Flight's DoPut and HTTP's `/append` write through it. SQL's writes come with step 8.
+//! COPY, Kafka, Flight's DoPut and HTTP's `/append` write through it, and each load leaves its line in the audit log
+//! ([`Load`]). SQL's writes come with step 8.
 
 use crate::app::App;
 use crate::auth::{Principal, Role};
@@ -57,6 +58,46 @@ pub fn may(who: Option<&Principal>, table: &str, meta: Option<&TableMeta>, delet
     match who {
         Some(w) => crate::auth::WHO.sync_scope(w.clone(), ask),
         None => ask(),
+    }
+}
+
+/// One load at a row door (a COPY FROM STDIN, a DoPut's stream, a produce's partition), as the audit log keeps it: one
+/// line when it ends, the INSERT it stands for (`audit::rows`, as `/append`'s), in its caller's name, with the first
+/// error it met. A load dropped before it ended (its client went away) ends as failed.
+pub struct Load {
+    app: App,
+    who: Option<Principal>,
+    door: &'static str,
+    table: String,
+    start: std::time::Instant,
+    end: Option<Option<String>>,
+}
+
+impl Load {
+    /// A load into `table` through `door`, by `who` (None: the caller in scope).
+    pub fn new(app: &App, who: Option<Principal>, door: &'static str, table: &str) -> Load {
+        Load { app: app.clone(), who: who.or_else(crate::auth::current), door, table: table.to_string(), start: std::time::Instant::now(), end: None }
+    }
+
+    /// It ended: well, or with `error`. The first end counts.
+    pub fn end(&mut self, error: Option<String>) {
+        self.end.get_or_insert(error);
+    }
+
+    /// A load refused before it began: its line now.
+    pub fn refused(app: &App, who: Option<Principal>, door: &'static str, table: &str, error: &anyhow::Error) {
+        Load::new(app, who, door, table).end(Some(error.to_string()));
+    }
+}
+
+impl Drop for Load {
+    fn drop(&mut self) {
+        let error = self.end.take().unwrap_or_else(|| Some("the client went away before the load ended".into()));
+        let line = || crate::audit::rows(&self.app, self.door, &self.table, error, self.start.elapsed());
+        match self.who.clone() {
+            Some(w) => crate::auth::WHO.sync_scope(w, line),
+            None => line(),
+        }
     }
 }
 
