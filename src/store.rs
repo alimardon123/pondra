@@ -415,10 +415,39 @@ impl Stored {
 
     /// The list for readers (`column.rs`): each column by id, SQL's order as places.
     fn column_list(&self) -> crate::column::Columns {
-        let by_id = self.columns.iter().map(|c| crate::column::Column { id: c.id, name: c.name.clone(), stored: c.stored.as_ref().unwrap_or(&c.name).clone(), dtype: c.dtype.clone(), dropped: c.dropped }).collect();
+        let by_id = self.columns.iter().map(|c| crate::column::Column { id: c.id, name: c.name.clone(), stored: c.stored_name().to_string(), dtype: c.dtype.clone(), dropped: c.dropped }).collect();
+        crate::column::Columns::from_parts(by_id, self.sql_places())
+    }
+
+    /// The live columns' places in SQL's order: those `order` names first, then the others as stored.
+    fn sql_places(&self) -> Vec<usize> {
         let first: Vec<usize> = self.order.iter().filter_map(|id| (*id as usize).checked_sub(1)).collect();
-        let sql = crate::column::places(self.columns.len(), |i| self.columns[i].dropped, &first);
-        crate::column::Columns::from_parts(by_id, sql)
+        crate::column::places(self.columns.len(), |i| self.columns[i].dropped, &first)
+    }
+
+    /// The column stored as `stored` (a dropped one too).
+    fn col(&self, stored: &str) -> Option<&Col> { self.columns.iter().find(|c| c.stored_name() == stored) }
+
+    /// `col` for names that come in stored order, as a file's or a batch's fields mostly do: one pass for all of them.
+    fn lookup(&self) -> Lookup<'_> { Lookup { columns: &self.columns, next: 0 } }
+
+    /// SQL's view of the list (`TableMeta::logical`): the live columns alone, under SQL's names, each with its facts, and
+    /// SQL's order of them. Its places are no longer ids, so it is never written as a list.
+    fn logical(&self) -> Stored {
+        let mut ids = vec![0; self.columns.len()];
+        let columns = self
+            .columns
+            .iter()
+            .zip(&mut ids)
+            .filter(|(c, _)| !c.dropped)
+            .zip(1..)
+            .map(|((c, id), place)| {
+                *id = place;
+                Col { id: place, stored: None, ..c.clone() }
+            })
+            .collect();
+        let order = self.order.iter().filter_map(|id| ids.get((*id as usize).checked_sub(1)?).copied().filter(|&p| p > 0)).collect();
+        Stored { columns, order }
     }
 
     // The edits to a table's columns, on the list itself (redesign 1b, piece 6b-3): each names a column by its stored
@@ -494,9 +523,26 @@ impl Stored {
     }
 }
 
+/// Columns found by stored name, each first looked for after the last one found (`Stored::lookup`).
+struct Lookup<'a> {
+    columns: &'a [Col],
+    next: usize,
+}
+
+impl<'a> Lookup<'a> {
+    fn find(&mut self, stored: &str) -> Option<&'a Col> {
+        let i = match self.columns.get(self.next) {
+            Some(c) if c.stored_name() == stored => self.next,
+            _ => self.columns.iter().position(|c| c.stored_name() == stored)?,
+        };
+        self.next = i + 1;
+        Some(&self.columns[i])
+    }
+}
+
 impl Col {
     /// The name its files and the log hold it under.
-    fn stored_name(&self) -> &str { self.stored.as_deref().unwrap_or(&self.name) }
+    pub fn stored_name(&self) -> &str { self.stored.as_deref().unwrap_or(&self.name) }
 }
 
 /// A table's columns as its entry keeps them in memory (redesign 1b, piece 6b): the list (`Stored`), the one shape the
@@ -518,24 +564,76 @@ struct Record {
     /// The fields by stored name, for the readers that ask for them (`columns()` and the rest): made from the list once,
     /// kept by a clone, emptied by an edit.
     fields: crate::memo::Shared<Made>,
+    /// The columns' places in order of their stored names, for `col` on a wide table: made once, kept by a clone, emptied
+    /// by an edit.
+    by_stored: crate::memo::Shared<Vec<u32>>,
+    /// The renamed and the dropped columns, made once from the list: few, or none, on most tables.
+    marked: crate::memo::Shared<Marked>,
 }
+
+/// The renamed and the dropped columns (`Record::marked`), each by stored name and place, in order of stored name: what
+/// `name_of`, `is_dropped` and `mapped` search. (The names kept beside the places: a search reads them without going to
+/// each column, as the fields' maps were read.)
+#[derive(Default)]
+struct Marked {
+    renamed: Vec<(Box<str>, u32)>,
+    dropped: Vec<(Box<str>, u32)>,
+}
+
+/// Up to this many columns, `col` looks through them (quicker than its index, and nothing kept).
+const SCANNED: usize = 16;
 
 impl Record {
     /// The list of these fields, to be written as them: they are its readers' view, as they are.
-    fn of(m: Made) -> Record { Record { list: Stored::from_fields(m), listed: false, fields: Default::default() } }
+    fn of(m: Made) -> Record { Record { list: Stored::from_fields(m), ..Default::default() } }
+
+    /// The list, written as it or not.
+    fn new(list: Stored, listed: bool) -> Record { Record { list, listed, ..Default::default() } }
 
     /// A decoded entry's: the list it was written as, or the list of its format 5's fields.
     fn read(list: Option<Stored>, m: Made) -> Record {
         match list {
-            Some(list) => Record { list, listed: true, fields: Default::default() },
+            Some(list) => Record::new(list, true),
             None => Record::of(m),
         }
     }
 
     fn fields(&self) -> &Made { self.fields.get_ref(|| self.list.fields()) }
 
+    /// The column stored as `stored`: looked through, or found by its index on a wide table (as the fields' maps found it).
+    fn col(&self, stored: &str) -> Option<&Col> {
+        let c = &self.list.columns;
+        if c.len() <= SCANNED {
+            return self.list.col(stored);
+        }
+        let by = self.by_stored.get_ref(|| {
+            let mut by: Vec<u32> = (0..c.len() as u32).collect();
+            by.sort_unstable_by(|a, b| c[*a as usize].stored_name().cmp(c[*b as usize].stored_name()));
+            by
+        });
+        let i = by.binary_search_by(|i| c[*i as usize].stored_name().cmp(stored)).ok()?;
+        Some(&c[by[i] as usize])
+    }
+
+    fn marked(&self) -> &Marked {
+        self.marked.get_ref(|| {
+            let places = |f: fn(&Col) -> bool| {
+                let mut places: Vec<(Box<str>, u32)> = self.list.columns.iter().zip(0..).filter(|(c, _)| f(c)).map(|(c, i)| (c.stored_name().into(), i)).collect();
+                places.sort_unstable();
+                places
+            };
+            Marked { renamed: places(|c| c.stored.is_some()), dropped: places(|c| c.dropped) }
+        })
+    }
+
+    /// Of `marked`'s renamed or dropped columns, the one stored as `stored`.
+    fn among(&self, marked: &[(Box<str>, u32)], stored: &str) -> Option<&Col> {
+        let i = marked.binary_search_by(|(s, _)| s.as_ref().cmp(stored)).ok()?;
+        Some(&self.list.columns[marked[i].1 as usize])
+    }
+
     fn edit<R>(&mut self, f: impl FnOnce(&mut Stored) -> R) -> R {
-        self.fields = Default::default();
+        (self.fields, self.by_stored, self.marked) = Default::default();
         f(&mut self.list)
     }
 }
@@ -791,11 +889,13 @@ impl TableMeta {
         self.record.edit(f)
     }
 
-    /// The columns made again from these fields, the entry written in the shape it was (`logical`, `described`,
-    /// `follow_columns`).
-    fn set_fields(&mut self, m: Made) {
+    /// The columns made again from these fields, the entry written in the shape it was (`described`, `follow_columns`).
+    fn set_fields(&mut self, m: Made) { self.set_list(Stored::from_fields(m), self.record.listed) }
+
+    /// These columns from now on, written as the list or not: what was made from the old ones is made again.
+    fn set_list(&mut self, list: Stored, listed: bool) {
         (self.column_memo, self.rules) = Default::default();
-        self.record = Record { listed: self.record.listed, ..Record::of(m) };
+        self.record = Record::new(list, listed);
     }
 
     /// An entry with these columns (stored name, Arrow type text) in stored order and nothing else: a table being made,
@@ -813,18 +913,25 @@ impl TableMeta {
         self
     }
 
+    /// The column stored as `stored` (or named so in `logical()`'s copy), with its facts: a dropped one too.
+    pub fn col(&self, stored: &str) -> Option<&Col> { self.record.col(stored) }
+
     /// Is this column (by the names its entry uses) a uuid, held as text (`types.rs`)?
-    pub fn uuid(&self, column: &str) -> bool { self.sql_types().get(column).is_some_and(|t| t == "uuid") }
+    pub fn uuid(&self, column: &str) -> bool { self.col(column).is_some_and(|c| c.held.as_deref() == Some("uuid")) }
 
     /// Has any column been renamed or dropped (ADR-022)? If not, SQL sees `columns` as stored.
-    pub fn mapped(&self) -> bool { !self.names().is_empty() || !self.dropped().is_empty() }
+    pub fn mapped(&self) -> bool {
+        let m = self.record.marked();
+        !m.renamed.is_empty() || !m.dropped.is_empty()
+    }
 
     /// This entry's live columns (under the names it keeps them by: stored, or SQL's in `logical()`'s) in SQL's order
     /// (`shown`, then the others as stored). Without `shown`, `columns` as they are, dropped ones out. Kept to this file:
     /// a reader takes the order from `sql_order`, `sql_columns`, `star`, `sql_names` or the list (`cols`), never works it
     /// out (redesign 1b).
-    fn in_order(&self) -> Vec<&(String, String)> {
-        crate::column::sql_places(&self.columns(), |c| self.is_dropped(c), &self.shown()).into_iter().map(|i| &self.columns()[i]).collect()
+    fn in_order(&self) -> impl Iterator<Item = &Col> {
+        let l = self.list();
+        l.sql_places().into_iter().map(|i| &l.columns[i])
     }
 
     /// Its columns as one list (`column.rs`): each with its id, SQL's name and its stored one, in SQL's order (as
@@ -840,7 +947,7 @@ impl TableMeta {
     /// Was a column moved, so SQL's order isn't the stored one (`ALTER COLUMN … FIRST` or `AFTER`, `ADD COLUMN … FIRST`)?
     /// The one test of it: a reader reorders, or a write fills SQL's order, only then (`in_sql_order`).
     pub fn moved(&self) -> bool {
-        !self.shown().is_empty() && crate::column::sql_places(&self.columns(), |c| self.is_dropped(c), &self.shown()).windows(2).any(|w| w[0] > w[1])
+        !self.list().order.is_empty() && self.list().sql_places().windows(2).any(|w| w[0] > w[1])
     }
 
     /// Rows under SQL's names (`to_logical`'s, a log tail's, the change feed's) with the table's columns in SQL's order,
@@ -854,22 +961,22 @@ impl TableMeta {
     }
 
     /// Was the column stored as `stored` dropped?
-    pub fn is_dropped(&self, stored: &str) -> bool { self.dropped().iter().any(|d| d == stored) }
+    pub fn is_dropped(&self, stored: &str) -> bool { self.record.among(&self.record.marked().dropped, stored).is_some() }
 
     /// The live columns' SQL names in SQL's order (`_deleted` among them, if the table has it): what `SELECT *` lists, and
     /// what an INSERT without a column list fills, first to last (`write::implicit`).
-    pub fn sql_order(&self) -> Vec<String> { self.in_order().into_iter().map(|(c, _)| self.name_of(c).to_string()).collect() }
+    pub fn sql_order(&self) -> Vec<String> { self.in_order().map(|c| c.name.clone()).collect() }
 
     /// Where an INSERT without a column list puts each value, as one number: the stored columns in SQL's order (`in_order`).
     /// A move, an added or a dropped column changes it, a rename doesn't. Of the entry as stored. The leader refuses rows a
     /// node placed by another one (`log::Ack::moved`, `write::record`): one that hadn't seen a move yet filled the old order
     /// (11-03 audit M9).
     pub fn placed(&self) -> u64 {
-        self.in_order().into_iter().flat_map(|(c, _)| c.bytes().chain([0])).fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+        self.in_order().flat_map(|c| c.stored_name().bytes().chain([0])).fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
     }
 
     /// SQL's columns (`logical_columns`) in SQL's order (`in_order`): what `SELECT *` and RETURNING * answer.
-    pub fn sql_columns(&self) -> Vec<(String, String)> { self.in_order().into_iter().map(|(c, t)| (self.name_of(c).to_string(), t.clone())).collect() }
+    pub fn sql_columns(&self) -> Vec<(String, String)> { self.in_order().map(|c| (c.name.clone(), c.dtype.clone())).collect() }
 
     /// What `SELECT *` lists: `sql_columns` without a keyed table's delete markers (`marker`). What SHOW CREATE writes and
     /// what a view's `*` reads (`ddl::keep_readers`).
@@ -880,14 +987,14 @@ impl TableMeta {
     pub fn sql_names(&self) -> Vec<String> { self.sql_order().into_iter().filter(|c| c != "_deleted").collect() }
 
     /// A stored column's name in SQL.
-    pub fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.names().get(stored).map_or(stored, String::as_str) }
+    pub fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.record.among(&self.record.marked().renamed, stored).map_or(stored, |c| &c.name) }
 
     /// The folder under `data/` its files are in (`name`'s, unless it was renamed).
     pub fn folder<'a>(&'a self, name: &'a str) -> &'a str { self.folder.as_deref().unwrap_or(name) }
 
     /// The columns SQL sees, as (stored name, name in SQL, type): all but the dropped.
     pub fn live(&self) -> impl Iterator<Item = (&str, &str, &str)> {
-        self.columns().iter().filter(|(c, _)| !self.dropped().contains(c)).map(|(c, t)| (c.as_str(), self.name_of(c), t.as_str()))
+        self.list().columns.iter().filter(|c| !c.dropped).map(|c| (c.stored_name(), c.name.as_str(), c.dtype.as_str()))
     }
 
     /// The column SQL calls `name`: its stored name.
@@ -901,23 +1008,11 @@ impl TableMeta {
             return self.clone();
         }
         let n = |c: &String| self.name_of(c).to_string();
-        let fields = Made {
-            columns: self.logical_columns(),
-            not_null: self.in_sql_list(self.not_null()),
-            defaults: self.in_sql(self.defaults()),
-            identity: self.in_sql(self.identity()),
-            enums: self.in_sql(self.enums()),
-            sql_types: self.in_sql(self.sql_types()),
-            names: BTreeMap::new(),
-            dropped: vec![],
-            shown: self.in_sql_list(self.shown()),
-        };
         let mut t = self.clone();
         (t.key, t.merge, t.cluster) = (self.sql_key(), self.merge.iter().map(|(c, f)| (n(c), f.clone())).collect(), self.cluster.iter().map(n).collect());
         (t.ttl, t.order, t.partition) = (self.ttl.as_ref().map(|(c, s)| (n(c), *s)), self.order.as_ref().map(n), self.sql_partition());
         t.constraints = self.constraints.iter().map(|c| c.named(&n)).collect();
-        t.set_fields(fields);
-        t.record.listed = false; // (SQL's names, the dropped columns gone: its places are no longer ids, so never written as a list)
+        t.set_list(self.list().logical(), false); // (SQL's names, the dropped columns gone: its places are no longer ids, so never written as a list)
         t
     }
 
@@ -949,14 +1044,14 @@ impl TableMeta {
     }
 
     /// A per-column map, keyed by stored name, under the names SQL knows the columns by: the entries of dropped columns
-    /// left out. `logical()` and `to_rules()` both map their fields through this, so a rename or a drop is mapped here.
+    /// left out, as `logical()` and `to_rules()` take each column's facts.
     pub fn in_sql<V: Clone>(&self, m: &BTreeMap<String, V>) -> BTreeMap<String, V> {
-        m.iter().filter(|(c, _)| !self.dropped().contains(c)).map(|(c, v)| (self.name_of(c).to_string(), v.clone())).collect()
-    }
-
-    /// A per-column list, by stored name, under SQL's names: the dropped columns left out (`in_sql` for a list).
-    fn in_sql_list(&self, l: &[String]) -> Vec<String> {
-        l.iter().filter(|c| !self.dropped().contains(c)).map(|c| self.name_of(c).to_string()).collect()
+        let named = |c: &'_ String| match self.col(c) {
+            Some(c) if c.dropped => None,
+            Some(c) => Some(c.name.clone()),
+            None => Some(c.clone()),
+        };
+        m.iter().filter_map(|(c, v)| Some((named(c)?, v.clone()))).collect()
     }
 
     // The edits to a table's columns: the one way DDL changes them (redesign 1b, piece 6a). Each names a column by its
@@ -1013,15 +1108,18 @@ impl TableMeta {
     /// stored name, as the entry keeps them.
     pub fn to_rules(&self) -> Result<crate::rules::Table> {
         let columns = self
-            .live()
-            .map(|(stored, name, _)| crate::rules::Column {
-                name: name.to_string(),
-                stored: stored.to_string(),
-                not_null: self.not_null().iter().any(|c| c == stored),
-                default: self.defaults().get(stored).cloned(),
-                always: self.identity().get(stored).is_some_and(|i| i.always),
-                held: self.sql_types().get(stored).cloned(),
-                labels: self.enums().get(stored).map(|e| (e.of.clone(), e.labels.clone())),
+            .list()
+            .columns
+            .iter()
+            .filter(|c| !c.dropped)
+            .map(|c| crate::rules::Column {
+                name: c.name.clone(),
+                stored: c.stored_name().to_string(),
+                not_null: c.not_null,
+                default: c.default.clone(),
+                always: c.identity.as_ref().is_some_and(|i| i.always),
+                held: c.held.clone(),
+                labels: c.labels.as_ref().map(|e| (e.of.clone(), e.labels.clone())),
             })
             .collect();
         Ok(crate::rules::Table {
@@ -1061,7 +1159,7 @@ impl TableMeta {
                 t.merge = BTreeMap::new();
                 t
             }
-            None if self.shown().is_empty() => self.logical(),
+            None if self.list().order.is_empty() => self.logical(),
             None => {
                 let (mut t, columns) = (self.logical(), self.sql_columns());
                 let mut m = t.fields().clone();
@@ -1084,7 +1182,7 @@ impl TableMeta {
         for (f, c) in b.schema().fields().iter().zip(b.columns()) {
             let name = match self.stored(f.name()) {
                 Some(s) => s,
-                None if self.columns().iter().any(|(n, _)| n == f.name()) => continue, // (an old name)
+                None if self.col(f.name()).is_some() => continue, // (an old name)
                 None => f.name(), // (not the table's: reads leave it out)
             };
             fields.push(Arc::new(f.as_ref().clone().with_name(name)));
@@ -1099,10 +1197,17 @@ impl TableMeta {
         if !self.mapped() {
             return Ok(b.clone());
         }
-        let keep: Vec<usize> = (0..b.num_columns()).filter(|&i| !self.dropped().contains(b.schema().field(i).name())).collect();
-        let b = b.project(&keep)?;
-        let fields: Vec<_> = b.schema().fields().iter().map(|f| Arc::new(f.as_ref().clone().with_name(self.name_of(f.name())))).collect();
-        Ok(RecordBatch::try_new(Arc::new(Schema::new_with_metadata(fields, b.schema().metadata().clone())), b.columns().to_vec())?)
+        let (mut found, mut fields, mut columns) = (self.list().lookup(), vec![], vec![]);
+        for (f, c) in b.schema().fields().iter().zip(b.columns()) {
+            match found.find(f.name()) {
+                Some(col) if col.dropped => continue,
+                Some(col) => fields.push(Arc::new(f.as_ref().clone().with_name(&col.name))),
+                None => fields.push(f.clone()),
+            }
+            columns.push(c.clone());
+        }
+        let options = datafusion::arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(b.num_rows()));
+        Ok(RecordBatch::try_new_with_options(Arc::new(Schema::new_with_metadata(fields, b.schema().metadata().clone())), columns, &options)?)
     }
 
     /// The TTL as a SQL condition that keeps live rows ("" if none).
@@ -4836,6 +4941,49 @@ mod tests {
         time("small (2,000 random)", &small.iter().map(Vec::as_slice).collect::<Vec<_>>(), 20);
         time("wide, format 6's list", &[&wide6], 2000);
         time("small, format 6's list", &small6.iter().map(Vec::as_slice).collect::<Vec<_>>(), 20);
+    }
+
+    /// What the entry's own column helpers cost (redesign 1b, piece 7a's before and after: from the fields by stored name
+    /// to the list): each on an entry read as format 6's list, asked again ("warm") and first after the read ("first",
+    /// the read's own cost taken off). The wide table and the 2,000 small ones of `entry_parse_time`. A measure, not a
+    /// check: `cargo test --release --lib column_helpers_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn column_helpers_time() {
+        let best = |rounds: u32, f: &mut dyn FnMut()| {
+            (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    (0..rounds).for_each(|_| f());
+                    t.elapsed().as_nanos() as f64 / rounds as f64 / 1000.0
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        let helpers: [(&str, fn(&TableMeta) -> usize); 6] = [
+            ("logical()", |m| m.logical().columns().len()),
+            ("to_rules()", |m| m.to_rules().unwrap().columns.len()),
+            ("sql_columns()", |m| m.sql_columns().len()),
+            ("placed()", |m| m.placed() as usize),
+            ("live()", |m| m.live().count()),
+            ("name_of() each column", |m| m.list().columns.iter().map(|c| m.name_of(c.stored_name()).len()).sum()),
+        ];
+        let (wide, small) = (json(&wide_entry().as_list()), small_entries().iter().map(|m| json(&m.clone().as_list())).collect::<Vec<_>>());
+        for (what, raws, rounds) in [("wide", vec![wide], 2000), ("small", small, 20)] {
+            let read = || raws.iter().map(|r| serde_json::from_slice::<TableMeta>(r).unwrap()).collect::<Vec<_>>();
+            let n = raws.len() as f64;
+            let decode = best(rounds, &mut || { std::hint::black_box(read()); }) / n;
+            for (helper, f) in helpers {
+                let first = best(rounds, &mut || { std::hint::black_box(read().iter().map(f).sum::<usize>()); }) / n - decode;
+                let entries = read();
+                entries.iter().for_each(|m| _ = f(m));
+                let warm = best(rounds, &mut || { std::hint::black_box(entries.iter().map(f).sum::<usize>()); }) / n;
+                println!("{what}, {helper}: {warm:.2} µs warm, {first:.2} µs first, an entry, best of 5");
+            }
+            let m = read().remove(0);
+            let b = RecordBatch::new_empty(crate::answer::schema(m.columns()).unwrap());
+            let warm = best(rounds, &mut || { std::hint::black_box(m.to_logical(&b).unwrap().num_columns()); });
+            println!("{what}, to_logical() of a batch of every stored column: {warm:.2} µs warm, the first entry");
+        }
     }
 
     /// An entry is written in the shape it was read in (`Record`): format 6's as the list alone, format 5's as its fields,
