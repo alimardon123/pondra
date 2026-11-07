@@ -165,6 +165,50 @@ impl crate::lifecycle::Lifecycle for Native {
     fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir)) }
 }
 
+/// A page's lifecycle (redesign §8): what ends is the page's member, never its worker. A stop ends the member, which
+/// answers every request with why from then on (`Paged::stopped`, 57P01), until the page closes and the module's page is
+/// claimed again. A restart is a stop said as one (57P03), and then the task that asked unwinds with [`Restarting`]. A page
+/// can't unwind (the page's std is built to abort), so there the module traps, and the program that runs the page opens
+/// it again: a kept page's tables are in its folder, and an in-memory page's are gone.
+pub struct PageLife {
+    stopped: Mutex<Option<(&'static str, String)>>, // (the SQLSTATE and the words every request answers once the member ended)
+    say: Option<fn(&str)>,
+}
+
+impl PageLife {
+    /// A page's lifecycle, saying its lines with `say` (the page's console: `web/`), or nowhere.
+    pub fn new(say: Option<fn(&str)>) -> Arc<PageLife> { Arc::new(PageLife { stopped: Mutex::new(None), say }) }
+
+    /// The SQLSTATE and the words of how the member ended (`stop`, `restart`), or None while it lives.
+    pub fn stopped(&self) -> Option<(&'static str, String)> { self.stopped.lock().unwrap_or_else(PoisonError::into_inner).clone() }
+
+    fn end(&self, code: &'static str, words: String) {
+        if let Some(say) = self.say {
+            say(&words)
+        }
+        self.stopped.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert((code, words)); // (the first end is the one said)
+    }
+}
+
+impl crate::lifecycle::Lifecycle for PageLife {
+    fn stop(&self, why: String) { self.end("57P01", format!("this page's lake stopped ({why}): close the page and open it again")) }
+    fn restart(&self, why: &str, _: &[(&str, String)]) -> ! {
+        self.end("57P03", Restarting(why.to_string()).to_string());
+        std::panic::resume_unwind(Box::new(Restarting(why.to_string())))
+    }
+    fn say(&self, line: &str) {
+        if let Some(say) = self.say {
+            say(line)
+        }
+    }
+    fn one_off(&self) -> bool { false }
+    fn owns_process(&self) -> bool { true } // (the page's worker is its own: no host shares it)
+    fn program(&self) -> anyhow::Result<PathBuf> { anyhow::bail!("a page has no pondra program to start") }
+    fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move { anyhow::bail!("a page leads its own lake only, not {dir}") })
+    }
+}
+
 /// The node starts again to rejoin its cluster (`Lifecycle::restart`), with settings of the command line's own for the
 /// next run (`pondra sql`'s job and its tries: `env.rs`), on top of what this process was given. A guest sent back five times gives up: its statement
 /// fails, saying why. In a library the node is halted and started again in place: the supervisor is told, and the
@@ -572,7 +616,7 @@ pub fn unclaim_page() {
 /// term it leads, 0 for a joined page, which claims none (`open_joined`); `marks` keeps that term alive (a finished task for one).
 /// `ended` is the sign-in a joined page follows its node with has ended (`ended`); an own page's never does. `follow` is the
 /// task that follows a joined page's node's stream (`open_joined`), aborted at the page's end (`end_page`).
-pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, ended: Arc<AtomicBool>, superuser: AtomicBool }
+pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, ended: Arc<AtomicBool>, superuser: AtomicBool, pub(crate) life: Arc<PageLife> }
 
 /// Takes the module's page (`PAGED`) for a page's member, and sets the device line its queries hold (`env::device_line`). A
 /// freed page's member may still be closing in the background, which sets PAGED back when it has ended: then this waits for
@@ -593,7 +637,7 @@ async fn claim_paged(line: Option<usize>) -> anyhow::Result<()> {
 
 /// Opens a page's member (`Paged`), its lake on `store` when one is given (a kept page's folder), else in memory, and its
 /// queries holding the page's share of its device's `line` (`claim_paged`). Set back if the open fails.
-pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) -> anyhow::Result<Paged> {
+pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>, life: Arc<PageLife>) -> anyhow::Result<Paged> {
     claim_paged(line).await?;
     let url = crate::memory::place(":memory:");
     let owned = store.is_some(); // (a given store is a kept page's folder, under its Web Lock: no other writer, so its term is taken at once)
@@ -614,7 +658,7 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open(&url, true, false, native(false)).await?; // (a page's: it lives, as a server's node)
+        let l = crate::store::Lake::open(&url, true, false, life.clone()).await?;
         lake = Some(l.clone());
         start_app(l, alone.clone(), None, &start).await
     }
@@ -622,7 +666,7 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
     match made {
         Ok(app) => {
             keep(&app, &start);
-            Ok(Paged { app, url, term, marks, follow: None, ended: Default::default(), superuser: AtomicBool::new(false) })
+            Ok(Paged { app, url, term, marks, follow: None, ended: Default::default(), superuser: AtomicBool::new(false), life })
         }
         Err(e) => {
             end_page(marks, None, lake, &store, term, &url).await; // (a failed open leaves nothing running)
@@ -657,7 +701,7 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
 /// 3 s (a node's is 250 ms, but each of a page's is a request). It claims no term and writes nothing to the cluster, so closing
 /// it changes nothing there. The sign-in's end stops both loops and sets `ended` (a 401 or 403 from the node, or the refresh's
 /// closed error).
-pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, line: Option<usize>) -> anyhow::Result<Paged> {
+pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, line: Option<usize>, life: Arc<PageLife>) -> anyhow::Result<Paged> {
     claim_paged(line).await?;
     let url = crate::memory::place(":memory:");
     crate::memory::give(&url, store);
@@ -670,7 +714,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open_on(&url, true, kv, native(false)).await?;
+        let l = crate::store::Lake::open_on(&url, true, kv, life.clone()).await?;
         lake = Some(l.clone());
         start_app(l, members, None, &start).await
     }
@@ -713,7 +757,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
                     }
                 }
             });
-            Ok(Paged { app, url, term: 0, marks, follow: Some(follow), ended, superuser: AtomicBool::new(superuser) })
+            Ok(Paged { app, url, term: 0, marks, follow: Some(follow), ended, superuser: AtomicBool::new(superuser), life })
         }
         Err(e) => {
             end_page(marks, None, lake, &store, 0, &url).await; // (a failed open leaves nothing running)
@@ -754,6 +798,12 @@ impl Paged {
     /// Whether the sign-in a joined page follows its node with has ended (`open_joined`): its requests are then refused.
     pub fn ended(&self) -> bool {
         self.ended.load(SeqCst)
+    }
+
+    /// The SQLSTATE and the words of how the member's lake ended (its lifecycle's stop or restart: `PageLife`), or None while
+    /// it lives. Every request is answered with them from then on.
+    pub fn stopped(&self) -> Option<(&'static str, String)> {
+        self.life.stopped()
     }
 
     /// Says the sign-in has ended, as a node refusing it does (`page::Page::ask`): the page answers 28000 from then on.
