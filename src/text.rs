@@ -35,6 +35,31 @@ pub fn first_word(sql: &str) -> &str {
     }
 }
 
+/// Where MySQL's executable comment `/*! … */` starts in `sql`, when the tokenizer reads one. sqlparser reads its words as
+/// code (`supports_multiline_comment_hints`), Postgres and DuckDB as a comment, so a text with one would run otherwise
+/// than it reads: `SELECT /*! 1 + */ 2` would be 3, and `SELECT 1 /*! ; DROP TABLE t */` two statements. None for one in
+/// a string, a quoted name or another comment (a token that starts before it holds it), and when the tokenizer refuses
+/// the text. (Every door refuses a text with one, `dialect_stmts.rs`; the audit log classes it as the parser reads it.)
+pub(crate) fn hint(sql: &str) -> Option<usize> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Location, Tokenizer}};
+    if !sql.contains("/*!") {
+        return None;
+    }
+    let spans = Tokenizer::new(&GenericDialect {}, sql).tokenize_with_location().ok()?;
+    let lines: Vec<usize> = std::iter::once(0).chain(sql.match_indices('\n').map(|(i, _)| i + 1)).collect();
+    let byte = |l: &Location| {
+        let start = lines.get(l.line.saturating_sub(1) as usize).copied().unwrap_or(sql.len());
+        sql[start..].char_indices().nth(l.column.saturating_sub(1) as usize).map_or(sql.len(), |(i, _)| start + i)
+    };
+    let (start, end): (Vec<usize>, Vec<usize>) = spans.iter().map(|s| (byte(&s.span.start), byte(&s.span.end))).unzip();
+    // (a hint's own words are given places from where it starts on, so up to the first hint the tokens are in order)
+    let held = |p: usize| {
+        let j = start.partition_point(|&s| s < p);
+        j > 0 && end[j - 1] > p
+    };
+    sql.match_indices("/*!").map(|(p, _)| p).find(|&p| !held(p))
+}
+
 /// The first `n` words of `sql` past its leading comments, upper-cased, with a `;` at its end taken off: the words
 /// `control` reads, so a word is whole (`merged` is not `MERGE`).
 pub fn first_words(sql: &str, n: usize) -> Vec<String> {
@@ -384,6 +409,20 @@ mod tests {
     fn one(sql: &str) -> Option<Statement> {
         let mut parsed = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
         (parsed.len() == 1).then(|| parsed.pop()).flatten()
+    }
+
+    #[test]
+    fn a_hint_is_found_where_the_tokenizer_reads_one() {
+        // (MySQL's `/*! … */`, which the parser reads as code: 11-07)
+        assert_eq!(hint("SELECT /*! 1 + */ 2"), Some(7));
+        assert_eq!(hint("SELECT 1 AS x /*! ; DROP TABLE t */"), Some(14));
+        assert_eq!(hint("SELECT 1 /*!50110 KEY_BLOCK_SIZE = 1024 */"), Some(9));
+        assert_eq!(hint("/*!\nDROP TABLE t */ SELECT 1"), Some(0));
+        let late = "SELECT '/*!', /* /*! */ */ a, /*! 1 + */ 2";
+        assert_eq!(hint(late), late.rfind("/*!"));
+        for quiet in ["SELECT '/*! 1 + */ 2'", "SELECT \"/*!\" FROM t", "SELECT 1 -- /*! 2\n", "/* a /*! b */ c */ SELECT 1", "SELECT $$/*! 1$$", "SELECT E'\\'/*! 1 */'", "SELECT 1 /* ! */", "SELECT '/*! 1", "SELECT 1"] {
+            assert_eq!(hint(quiet), None, "{quiet}");
+        }
     }
 
     #[test]
