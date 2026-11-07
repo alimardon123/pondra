@@ -70,12 +70,12 @@ enum TableSpec {
         #[serde(default)]
         made_by: Option<String>, // the job of the CREATE TABLE that sends it (`made_by_job`); none: sent again freely
         #[serde(default)]
-        shown: Option<Vec<String>>, // an existing table's columns in SQL's order, SQL's names (`ADD COLUMN … AFTER b`): `TableMeta::shown`
+        shown: Option<Vec<String>>, // an existing table's columns in SQL's order, SQL's names (`ADD COLUMN … AFTER b`): `TableMeta::set_order`
     },
 }
 
-/// Leader: `TableMeta::shown` for SQL's order `sql` (SQL's names, every live column but `_deleted`): empty when that is
-/// the stored order. What reads the table by position keeps reading it as it did, without `added` (the columns this ALTER
+/// Leader: SQL's order `sql` (SQL's names, every live column but `_deleted`) by stored names, for `TableMeta::set_order`
+/// (which keeps nothing when that is the stored order). What reads the table by position keeps reading it as it did, without `added` (the columns this ALTER
 /// adds, wherever they go: a task's `*` would give one more column than its target has) (`ddl::keep_readers`): the
 /// catalog's writes for that, for the same commit, and what each reader does now.
 async fn shown_as_stored(lake: &Lake, name: &str, m: &TableMeta, sql: &[String], added: &[String]) -> Result<(Vec<String>, Vec<(String, Vec<u8>)>, Vec<String>)> {
@@ -85,16 +85,15 @@ async fn shown_as_stored(lake: &Lake, name: &str, m: &TableMeta, sql: &[String],
     (sorted.0.sort(), sorted.1.sort());
     ensure!(sorted.0 == sorted.1, "{name}'s columns in SQL's order name each of its columns once: {}", sql.join(", "));
     let mut then = m.clone();
-    then.set_order(stored);
-    let shown = then.shown().to_vec();
+    then.set_order(stored.clone());
     let was: Vec<(String, String)> = m.star().into_iter().filter(|(c, _)| !added.contains(c)).collect();
     let now = then.star();
     if now == was {
-        return Ok((shown, vec![], vec![])); // (nothing moved, nothing added)
+        return Ok((stored, vec![], vec![])); // (nothing moved, nothing added)
     }
     let moved = sql.iter().zip(&m.sql_order()).find(|(a, b)| a != b).map(|(a, _)| a.as_str()).or(added.first().map(String::as_str)).unwrap_or("a column");
     let (puts, readers) = crate::ddl::keep_readers(lake, name, moved, was, now).await?;
-    Ok((shown, puts, readers))
+    Ok((stored, puts, readers))
 }
 
 /// A CREATE TABLE of a table that's there, refused as Postgres refuses it (42P07).
@@ -1148,7 +1147,7 @@ pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, na
     crate::rules::rows::rows_for(table, &columns, names, query, &default)
 }
 
-/// A plain INSERT (no column list) into a table that moved a column (`TableMeta::shown`), as the INSERT that names the
+/// A plain INSERT (no column list) into a table that moved a column (`TableMeta::set_order`), as the INSERT that names the
 /// columns its rows fill: SQL's first ones, as `SELECT *` lists them. Below the doors, a query without a column list
 /// fills the columns as stored (`rows_sql`, `write_rows`), so this is the one place SQL's order is put in. Every other
 /// statement, and every INSERT into a table that never moved a column, as it is. With it, for a plain INSERT into this
@@ -1798,7 +1797,12 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         }
     }
     let stmt = match stmt {
-        Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
+        Stmt::InsertInto(t, names, query) => match crate::ext::outside_target(&app.lake, &t).await? {
+            // (another engine's table: the columns the list leaves out are NULL, as its format keeps no DEFAULT; a NOT NULL one
+            // is refused by its writer, `write_outside::Fit`)
+            Some(target) => Stmt::Insert(t.clone(), crate::rules::rows::rows_for(&t, &crate::write_outside::columns(&app.lake, &target).await?, &names, &query, &|_| None)?),
+            None => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
+        },
         Stmt::Insert(t, query) => {
             if !is_there(&app.lake, &t).await? {
                 seen_here(app).await; // (a table just made through another node: this one holds it once it holds what its leader had; a reader, and so a guest by the inbox, waits for nothing)

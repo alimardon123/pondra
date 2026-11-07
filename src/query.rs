@@ -346,7 +346,7 @@ async fn read_files(lake: &Lake, ctx: &SessionContext, files: Vec<&DataFile>, me
 }
 
 fn hot_files(lake: &Lake, files: Vec<DataFile>, meta: &TableMeta, schema: &SchemaRef, known: Arc<std::collections::HashMap<String, crate::hot::Known>>) -> crate::hot::HotFiles {
-    let meta = { let mut t = TableMeta::made(crate::store::Made { columns: meta.columns().to_vec(), names: meta.names().clone(), ..Default::default() }); t.key = meta.key.clone(); t }; // (what reading a file takes of its table)
+    let meta = { let mut t = TableMeta::with_list(meta.list().clone()); t.key = meta.key.clone(); t }; // (what reading a file takes of its table)
     crate::hot::HotFiles { lake: lake.arc(), files, schema: schema.clone(), meta, known }
 }
 
@@ -452,7 +452,7 @@ pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &Tabl
         return Ok(Arc::new(Table(provider)));
     }
     let df = ctx.read_table(provider)?;
-    let shown = |c: &str| !meta.dropped().iter().any(|d| d == c) && !(hide && c == "_deleted");
+    let shown = |c: &str| !meta.is_dropped(c) && !(hide && c == "_deleted");
     let df = crate::answer::renamed(df, |c| meta.name_of(c).to_string(), shown)?;
     let df = if meta.moved() { crate::answer::reordered(df, &meta.sql_order())? } else { df }; // (a column moved: SQL's order)
     Ok(Arc::new(Table(df.into_view())))

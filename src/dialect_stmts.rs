@@ -15,7 +15,10 @@
 //! - SQL Server's `OUTPUT inserted.…`, which would otherwise run with the clause left out, and `OPTION (…)`;
 //! - Snowflake's `CREATE STREAM … ON TABLE` and `FLATTEN(INPUT => …)`;
 //! - DuckDB's and SQLite's `PRAGMA …`, CockroachDB's `UPSERT INTO`, and Postgres's `CREATE EXTENSION` (Pondra's
-//!   INSTALL and LOAD).
+//!   INSTALL and LOAD);
+//! - MySQL's executable comment `/*! … */` anywhere outside a string or another comment (`text::hint`): the parser reads
+//!   its words as code and Postgres and DuckDB as a comment, so `SELECT /*! 1 + */ 2` would be 3, and the `DROP` of
+//!   `SELECT 1 /*! ; DROP TABLE t */` a statement of its own.
 use datafusion::sql::sqlparser::tokenizer::Token;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -34,8 +37,14 @@ pub fn refused(sql: &str) -> anyhow::Result<()> {
     }
 }
 
+/// The words for MySQL's `/*! … */` (`text::hint`).
+const HINT: &str = "/*! … */ is MySQL's comment that runs as code: here a comment is only a comment, as Postgres and DuckDB read it, so write its words outside the comment, or /* … */ to keep it one";
+
 /// The words of the refusal, or None. A text with none of these words is not tokenized.
 fn refusal(sql: &str) -> Option<String> {
+    if crate::text::hint(sql).is_some() {
+        return Some(HINT.to_string());
+    }
     static LOOK: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(concat!(
             r"(?is)\b(?:desc|describe)\s+table\b|\bexplain\s+(?:extended|formatted|codegen|cost|using|format\s*=)|\bshow\s+(?:full\s+)?tables\s+(?:like|in|from)\b",
@@ -343,6 +352,19 @@ mod tests {
         assert!(said("SELECT 1; CREATE EXTENSION pgcrypto WITH SCHEMA public").contains("digest(text, 'sha256')"));
         // (a column, a string or a comment called so is no statement)
         for sql in ["SELECT pragma FROM t -- pragma", "SELECT 'PRAGMA x'", "SELECT upsert FROM t", "SELECT 'create extension x'"] {
+            assert_eq!(refusal(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn mysqls_executable_comment_is_refused_where_the_parser_reads_it_as_code() {
+        // (11-07: `SELECT /*! 1 + */ 2` was 3, and the DROP in a `/*! … */` ran as a statement of its own)
+        for sql in ["SELECT /*! 1 + */ 2", "SELECT 1 AS x /*! ; DROP TABLE t */", "/*!40101 SET NAMES utf8 */", "SELECT 1 /*!*/"] {
+            let e = refused(sql).unwrap_err();
+            assert_eq!(crate::codes::of(&e), "0A000", "{sql}");
+            assert_eq!(e.to_string(), HINT, "{sql}");
+        }
+        for sql in ["SELECT '/*! 1 + */' AS s", "SELECT 1 -- /*! 2", "/* a /*! b */ c */ SELECT 1", "SELECT 1 /* ! */", "SELECT \"/*!\" FROM t"] {
             assert_eq!(refusal(sql), None, "{sql}");
         }
     }

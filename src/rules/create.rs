@@ -312,7 +312,7 @@ pub fn in_order(sql: &str) -> Option<String> {
     (out != sql).then(|| out.into_owned())
 }
 
-/// An identity column, as its table keeps it (`TableMeta::identity`, by stored name).
+/// An identity column, as its table keeps it (its column's `identity`, `store::Col`).
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Identity {
     pub always: bool,

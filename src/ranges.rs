@@ -192,7 +192,7 @@ fn overlaps(s: &Span, cuts: &[ScalarValue], i: usize) -> bool {
 fn named(meta: &TableMeta, words: &HashSet<String>) -> Result<Vec<(String, DataType)>> {
     let schema = crate::query::read_schema(&meta.columns())?;
     let key = |t: &DataType| t.is_integer() || matches!(t, DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) | DataType::Decimal128(..) | DataType::Utf8);
-    let live = |c: &String| !meta.dropped().contains(c) && words.contains(&meta.name_of(c).to_lowercase());
+    let live = |c: &String| meta.col(c).is_some_and(|c| !c.dropped && words.contains(&c.name.to_lowercase()));
     Ok(schema.fields().iter().filter(|f| live(f.name()) && key(f.data_type())).map(|f| (f.name().clone(), f.data_type().clone())).collect())
 }
 

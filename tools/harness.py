@@ -493,8 +493,8 @@ def external():
         and read1 == [{"s": 1}] and read2 == [{"s": 3}] and after_file == after_lake and q("SELECT sum(a) AS s FROM owned") == [{"s": 6}]
     q("DROP TABLE owned")
     names = set(re.findall(rb'pondra_cache_bytes\{cache="(\w+)"\}', call(A.port, "GET", "/metrics", headers=hdr)))
-    checks["/metrics counts every cache on the node's line, the node's own with the lake's (tables' manifests, kept pages, Delta logs and Iceberg manifests)"] = \
-        {b"answers", b"facts", b"manifests", b"pages", b"delta_logs", b"iceberg_manifests", b"tails", b"lookups"} <= names
+    checks["/metrics counts every cache on the node's line, the node's own with the lake's (tables' manifests, kept pages, Delta logs and Iceberg manifests, point plans, the log tails' keys)"] = \
+        {b"answers", b"facts", b"manifests", b"pages", b"delta_logs", b"iceberg_manifests", b"point_plans", b"tail_keys", b"tails", b"lookups"} <= names
     q("CREATE EXTERNAL TABLE ev (id INT, name VARCHAR) STORED AS CSV LOCATION 'ev/' OPTIONS ('format.has_header' 'false')")
     empty = q("SELECT count(*) AS n FROM ev")
     q("INSERT INTO ev VALUES (1, 'one'), (2, 'two')")
@@ -3576,7 +3576,8 @@ def bykey_on_three():
         if k == 5:
             nodes[0].kill(); nodes[0].start()  # (the leader, between runs)
     retry("DELETE FROM orders WHERE region = 'north' AND customer = 'c2'", A.port + 2)
-    ok = all(_bykey_same(lambda s: q(s, port), name, query, by) for name, (query, by) in BYKEY_VIEWS.items() for port in (A.port, A.port + 1, A.port + 2))
+    # (read through `retry` too: a follower that finds a new leader restarts to rejoin, and its port is closed meanwhile)
+    ok = all(_bykey_same(lambda s: retry(s, port), name, query, by) for name, (query, by) in BYKEY_VIEWS.items() for port in (A.port, A.port + 1, A.port + 2))
     for n in nodes:
         n.kill()
     return ok
@@ -3622,7 +3623,8 @@ def full_on_three():
         retry(f"UPDATE tiers SET tier = 'gold' WHERE customer = 'c{k % 11}'", port)
         if k == 4:
             nodes[0].kill(); nodes[0].start()  # (the leader, between runs)
-    ok = all(_bykey_same(lambda s: q(s, port), name, query, by, secs=60) for name, (query, by) in FULL_VIEWS.items() for port in (A.port, A.port + 1, A.port + 2))
+    # (read through `retry` too: a follower that finds a new leader restarts to rejoin, and its port is closed meanwhile)
+    ok = all(_bykey_same(lambda s: retry(s, port), name, query, by, secs=60) for name, (query, by) in FULL_VIEWS.items() for port in (A.port, A.port + 1, A.port + 2))
     for n in nodes:
         n.kill()
     return ok
@@ -5857,6 +5859,54 @@ def copies():
         r_ = hc.getresponse()
         b_ = r_.read().decode()
         off_port[q_] = r_.status != 200 and r_.getheader("x-pondra-sqlstate") == "0A000" and words in b_
+    # A COPY given up leaves nothing on the node. 12 COPYs of 24 MB (under the 32 MB chunk, so none is loaded) are given
+    # up: half by a client that goes away mid-COPY, half by CopyFail, which is answered 57014 in Postgres's words (psycopg
+    # takes that answer as Postgres's own and raises its own error, so it is read here at the protocol). Ten seconds on
+    # (jemalloc gives back what has been free that long), the node holds about what it held before them, and the next
+    # COPY on the same connection loads. Before, each one's bytes stayed for good.
+    rss = lambda: int(next(l for l in open(f"/proc/{node.p.pid}/status") if l.startswith("VmRSS")).split()[1]) >> 10
+    mb = b"".join(b"%d\tname\t0.5\n" % i for i in range(80_000))[: 1 << 20]
+    mb = mb[: mb.rindex(b"\n") + 1]
+    away = ("import os, sys, time, psycopg\n"
+            "c = psycopg.connect(sys.argv[1], autocommit=True)\n"
+            "with c.cursor() as cur, cur.copy('COPY gaveup FROM STDIN') as cp:\n"
+            "    for _ in range(24): cp.write(open(sys.argv[2], 'rb').read())\n"
+            "    while c.pgconn.flush() != 0: time.sleep(0.01)\n"
+            "    time.sleep(0.5); os._exit(7)\n")
+    fd, rows_file = tempfile.mkstemp(suffix=".tsv")
+    os.write(fd, mb)
+    os.close(fd)
+    gave_up = {"away": [], "failed": []}
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("CREATE TABLE gaveup (id BIGINT, name VARCHAR, amount DOUBLE)")
+        time.sleep(11)
+        gave_up["before_mb"] = rss()
+        conn = c.pgconn
+        for i in range(12):
+            if i % 2 == 0:
+                gave_up["away"].append(subprocess.run([sys.executable, "-c", away, dsn, rows_file], timeout=60).returncode)
+                continue
+            conn.send_query(b"COPY gaveup FROM STDIN")
+            conn.get_result()
+            for _ in range(24):
+                conn.put_copy_data(mb)
+            while conn.flush() != 0:
+                time.sleep(0.01)
+            time.sleep(0.5)
+            conn.put_copy_end(b"given up")
+            r_ = conn.get_result()
+            gave_up["failed"].append((r_.error_field(psycopg.pq.DiagnosticField.SQLSTATE).decode(), r_.error_field(psycopg.pq.DiagnosticField.MESSAGE_PRIMARY).decode()))
+            while conn.get_result() is not None:
+                pass
+        time.sleep(11)
+        gave_up["after_mb"] = rss()
+        gave_up["rows"] = c.execute("SELECT count(*) FROM gaveup").fetchone()[0]
+        with c.cursor() as cur, cur.copy("COPY gaveup FROM STDIN") as cp:
+            cp.write(b"1\tlast\t0.5\n")
+        gave_up["then"] = list(c.execute("SELECT count(*), max(name) FROM gaveup").fetchone())
+    os.remove(rows_file)
+    gave_up_ok = (gave_up["after_mb"] - gave_up["before_mb"] < 100 and gave_up["rows"] == 0 and gave_up["then"] == [1, "last"]
+                  and gave_up["away"] == [7] * 6 and gave_up["failed"] == [("57014", "COPY from stdin failed: given up")] * 6)
     node.kill()
     checks = {"COPY FROM STDIN, text and CSV": (text_in, csv_in) == (1000, 1000),
               "COPY FROM's end marker, blank lines and out-of-range values as Postgres 16 answers them (rows, or the SQLSTATE with nothing written)": edge_ok,
@@ -5872,11 +5922,14 @@ def copies():
               "COPY FROM a row past 64 MB, CSV (a quote open over 70 MB of lines) in 64 KB frames: refused with 54000, and the connection runs SELECT 1 after":
                   longs["csv"] == "54000" and longs["csv_then_select_1"] == 1 and longs["csv_secs"] <= 10,
               "COPY FROM 40 MB of rows in 64 KB frames: every row loads (count, sum and max of id)": bulk_ok,
+              "12 COPYs of 24 MB given up (a client gone mid-COPY, or CopyFail: 57014 in Postgres's words): none loads, the node "
+              "keeps none of their bytes (RSS within 100 MB of before), and the connection's next COPY loads": gave_up_ok,
               "over HTTP, COPY … TO STDOUT, FROM STDIN and FROM a server's file: refused by name with what to write there, 0A000": all(off_port.values())}
     out = {"passed": all(checks.values()), "checks": checks,
            "info": {"compared": f"{len(cases)} COPY FROM cases (text, CSV, CSV HEADER; one or two columns; int, smallint, bigint, numeric(3,1)) "
                                 "with Postgres 16's rows or SQLSTATE, and 10 rows, a marker, then 34 MB after a 32 MB chunk, against the rows loaded",
-                    "loaded_in_big_copy": len(big_rows), "mismatched": mismatched, "past_64_mb": longs, "bulk_40_mb": bulk, "off_port": off_port}}
+                    "loaded_in_big_copy": len(big_rows), "mismatched": mismatched, "past_64_mb": longs, "bulk_40_mb": bulk, "off_port": off_port,
+                    "given_up": gave_up}}
     print(json.dumps({"copies": out}))
     if not out["passed"]:
         sys.exit(1)
@@ -10499,9 +10552,11 @@ def server():
     checks["the folder's lakes are its databases, none running until used"] = running() == {"crm": False, "lake": False, "sales": False}
     checks["psql and HTTP reach each database by name; no /db/ means the default (lake)"] = pq("sales", "SELECT sum(amount) FROM orders") == [(30.5,)] \
         and call(port, "POST", "/db/crm/sql", b"SELECT name FROM customers ORDER BY id") == [{"name": "ann"}, {"name": "bob"}] and call(port, "POST", "/sql", b"SELECT text FROM notes") == [{"text": "hi"}]
-    nodes_of = lambda: [open(f"/proc/{p}/cmdline").read().split("\0") for p in subprocess.run(["pgrep", "-x", "pondra"], capture_output=True, text=True).stdout.split()
+    nodes_of = lambda: [p for p in subprocess.run(["pgrep", "-x", "pondra"], capture_output=True, text=True).stdout.split()
                         if os.path.exists(f"/proc/{p}/cmdline") and "--attach-found" in open(f"/proc/{p}/cmdline").read() and folder in open(f"/proc/{p}/cmdline").read()]
-    checks["each database's node gets pondra serve's options (--memory-gb 1.5 here)"] = bool(nodes_of()) and all("--memory-gb" in a and a[a.index("--memory-gb") + 1] == "1.5" for a in nodes_of())
+    # (a setting given to serve reaches each database's node as its environment, `env::given`; the other flags on its command line)
+    environ = lambda p: dict(kv.split("=", 1) for kv in open(f"/proc/{p}/environ").read().split("\0") if "=" in kv)
+    checks["each database's node gets pondra serve's options (--memory-gb 1.5 here)"] = bool(nodes_of()) and all(environ(p).get("PONDRA_MEMORY_GB") == "1.5" for p in nodes_of())
     checks["a query joins across databases (name.schema.table)"] = pq("sales", "SELECT c.name, o.amount FROM orders o JOIN crm.customers c ON c.id = o.id ORDER BY o.id") == [("ann", 10.5), ("bob", 20.0)]
     checks["the console is at /"] = b"<html" in call(port, "GET", "/").lower() or b"<!doctype html" in call(port, "GET", "/").lower()
     pq("sales", "CREATE DATABASE hr")
@@ -11826,11 +11881,12 @@ def guarded():
     nobody but the nodes adds to the lake's own records; a change a follower forwards runs as its
     user, reads included; a .py file is an admin's; a page of an answer is its asker's; /stats names
     the cluster's nodes only to a signed-in caller; rows through /append and /insert are in the audit log;
-    rows through Flight's DoPut and Kafka's produce are taken as through /append, and a hidden table's rows
+    rows through Flight's DoPut and Kafka's produce are taken as through /append, and each load through them and
+    COPY FROM STDIN is in the audit log too; a hidden table's rows
     stream only to a superuser and are written by no statement; a keyed table's loads ask UPDATE too, rows
     marked deleted and another engine's commit taking rows out ask DELETE (S11); a joined page's own statements are written by its
     node as the sign-in's, from a superuser only (M8)."""
-    import base64
+    import base64, psycopg
     import pyarrow as pa, pyarrow.flight as fl, confluent_kafka as ck
     P = A.port
     lake = new_lake()
@@ -12152,6 +12208,25 @@ def guarded():
     checks["a hidden table's rows (pondra$audit) stream to a superuser only: Flight's DoGet and /watch refuse a user granted every table"] = \
         "is Pondra's own" in said["flight get the audit log, carol"] and said["watch the audit log, carol"].startswith("403") and "is Pondra's own" in said["watch the audit log, carol"]
     checks["…and SQL writes none of them, a superuser's INSERT included"] = "written by Pondra alone" in str(said["SQL insert into the audit log, by a superuser"])
+    # Each load through Flight's DoPut, Kafka's produce and COPY FROM STDIN leaves its line in the audit log while writes
+    # are audited, as /append's does, and a refused one always: in its user's name.
+    def copy_rows(table):
+        try:
+            with psycopg.connect(host="127.0.0.1", port=P + 42, user="bob", password="bob-password-1", dbname="lake", autocommit=True) as con, \
+                    con.cursor() as cur, cur.copy(f"COPY {table} FROM STDIN") as cp:
+                cp.write("11\t1.0\n")
+            return "ok"
+        except Exception as e:
+            return f"ERROR {e}"
+    said["COPY, granted"], said["COPY, not granted"] = copy_rows("orders"), copy_rows("hr")
+    loads = {(f"INSERT INTO {t} (rows through {door})", outcome) for door in ("Flight DoPut", "Kafka produce", "COPY FROM STDIN")
+             for t, outcome in (("orders", "ok"), ("hr", "refused"))}
+    def loads_audited():
+        got = ask(P, "SELECT \"user\", statement, outcome FROM pondra.audit WHERE statement LIKE '%rows through%' ORDER BY at", auth=boss)
+        return {(r["statement"], r["outcome"]) for r in got if r["user"] == "bob"} if isinstance(got, list) else set()
+    checks["a load through Flight's DoPut, Kafka's produce or COPY FROM STDIN is in the audit log as its user's, and a refused one always"] = \
+        until(lambda: loads <= loads_audited(), True, 15) and said["COPY, granted"] == "ok" and "permission denied" in said["COPY, not granted"]
+    info["audit_loads"] = {"lines": sorted(loads_audited()), "copies": [said["COPY, granted"], said["COPY, not granted"]]}
     # S11: a keyed table's loads replace the rows of a key it holds, so every row door asks UPDATE for them too (as
     # Postgres asks it for ON CONFLICT DO UPDATE), and rows marked deleted (`_deleted`, a Kafka tombstone) ask DELETE;
     # another engine's commit that takes rows out asks DELETE. An append table's loads still ask INSERT alone.
@@ -25579,6 +25654,17 @@ def friendly():
         e_said["http"][0] == 200 and json.loads(e_said["http"][1]) == [{"s": "it's; ok"}] and e_said["port"] == "it's; ok"
     if not checks[list(checks)[-1]]:
         failed["E-string split"] = e_said
+    # (11-06 audit M7, piece 3: a block's words and the $names it uses are read past strings as the tokenizer reads
+    # them; the block reader ended E'…' at its escaped quote, so the END after it closed the IF, and $m was a variable)
+    p_said = []
+    for body in ["CREATE OR REPLACE PROCEDURE m7_block() AS BEGIN IF 1 = 1 THEN SELECT E'it\\'s the end, $m' AS s; END IF; END", "CALL m7_block()"]:
+        c.request("POST", "/sql", body.encode())
+        r = c.getresponse()
+        p_said.append((r.status, r.read().decode()[:300]))
+    checks["a block's END and a $name inside E'…' after an escaped quote are the string's: the procedure is made and runs"] = \
+        all(s == 200 for s, _ in p_said) and "it's the end, $m" in p_said[1][1]
+    if not checks[list(checks)[-1]]:
+        failed["E-string block"] = p_said
     # (11-02 audit M13: a UBIGINT went out as INT8, and 2^63 and above as NULL)
     try:
         with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pc:

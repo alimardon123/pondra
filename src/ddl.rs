@@ -317,7 +317,7 @@ pub enum Change {
     Type(String),
     Default(Option<String>), // SET DEFAULT expr (Some), DROP DEFAULT (None): `defaults::alter`
     NotNull(bool),           // SET NOT NULL (true), DROP NOT NULL (false): `defaults::alter`
-    Place(Place),            // FIRST, AFTER b: where SQL lists it (`TableMeta::shown`)
+    Place(Place),            // FIRST, AFTER b: where SQL lists it (`TableMeta::set_order`)
 }
 
 /// Where a column goes among a table's columns as SQL lists them: `ALTER COLUMN c FIRST | AFTER b`, `ADD COLUMN … FIRST |
@@ -1359,7 +1359,8 @@ async fn swappable(lake: &Lake, n: &str) -> Result<()> {
 async fn alike(lake: &Lake, a: &str, b: &str) -> Result<()> {
     let ma = lake.cat.get::<TableMeta>(&table_key(a)).await?.ok_or_else(|| anyhow::anyhow!("no table {a}"))?;
     let mb = lake.cat.get::<TableMeta>(&table_key(b)).await?.ok_or_else(|| anyhow::anyhow!("no table {b}"))?;
-    let same = crate::objects::table_sql("t", &ma) == crate::objects::table_sql("t", &mb) && ma.columns() == mb.columns() && ma.names() == mb.names() && ma.dropped() == mb.dropped();
+    fn stored(m: &TableMeta) -> Vec<(u32, &str, &str, &str, bool)> { m.list().columns.iter().map(|c| (c.id, c.stored_name(), c.name.as_str(), c.dtype.as_str(), c.dropped)).collect() }
+    let same = crate::objects::table_sql("t", &ma) == crate::objects::table_sql("t", &mb) && stored(&ma) == stored(&mb);
     ensure!(same, "{a} and {b} differ in more than their rows: a swap exchanges two tables alike (CREATE TABLE {b} CLONE {a} makes one)");
     Ok(())
 }
@@ -1595,7 +1596,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
     Ok(j!({"table": name, "altered": what}))
 }
 
-/// `ALTER TABLE t ALTER COLUMN c FIRST | AFTER b`: the order SQL lists the columns in changes (`TableMeta::shown`); the
+/// `ALTER TABLE t ALTER COLUMN c FIRST | AFTER b`: the order SQL lists the columns in changes (`TableMeta::set_order`); the
 /// stored order, which every file's field ids are places in, and the files never do. What reads the table's columns by
 /// position keeps reading them as it did, in the same commit (`keep_readers`): a move is never refused for it.
 async fn place_column(lake: &Lake, name: &str, mut m: TableMeta, column: &str, place: &Place) -> Result<Value> {
