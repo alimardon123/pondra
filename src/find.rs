@@ -107,7 +107,8 @@ async fn stored_parts(l: &Lake, o: &Object, partial: Option<&HashSet<String>>) -
     let d = meta.described();
     let comments = column_comments(l, &local).await?;
     let mut out = vec![];
-    for (name, ty) in d.columns() {
+    for c in &d.list().columns {
+        let name = &c.name;
         if d.marker(name) {
             continue; // (a keyed table's `_deleted` is the table's own, not a column)
         }
@@ -115,7 +116,7 @@ async fn stored_parts(l: &Lake, o: &Object, partial: Option<&HashSet<String>>) -
         if partial.is_some_and(|cols| !cols.contains(name) && !cols.contains(stored)) {
             continue;
         }
-        let ty = crate::types::shown(&d, name, ty);
+        let ty = crate::types::shown(c);
         let comment = comments.get(stored).cloned();
         out.push(part(o, "column", name.clone(), Some(ty), comment, None));
     }
