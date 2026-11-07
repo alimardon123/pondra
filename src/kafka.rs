@@ -434,7 +434,7 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
         let name = r.str()?;
         let meta = app.lake.cat.meta(&table_key(&name)).await?; // (the stored entry: its JSON fields are SQL's names too, ADR-022)
         let rules = meta.as_ref().map(|m| m.rules());
-        let allowed = who.role >= Role::Write && crate::auth::WHO.sync_scope(who.clone(), || crate::auth::check_rows(&crate::auth::catalog_name(&name))).is_ok(); // (the row doors' one check)
+        let allowed = who.role >= Role::Write && crate::writer::may(Some(who), &crate::auth::catalog_name(&name), None, false).is_ok(); // (the row doors' one check)
         let mut parts = vec![];
         for _ in 0..r.len()? {
             let (index, records) = (r.i32()?, r.nbytes()?.unwrap_or_default());
@@ -484,13 +484,20 @@ fn ready(o: Outcome) -> BoxFuture<'static, Outcome> { async move { o }.boxed() }
 /// exactly-once: its (producer id, sequence) become a Pondra producer and seq, and `prev` makes
 /// a batch that overtook its predecessor go again once that one is in (OUT_OF_ORDER_SEQUENCE
 /// only if it never comes).
-async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, records: &[u8]) -> BoxFuture<'static, Outcome> {
+async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Arc<TableMeta>, rules: &Arc<crate::rules::Table>, records: &[u8]) -> BoxFuture<'static, Outcome> {
     let invalid = |e: anyhow::Error| {
         eprintln!("kafka: a record for {table} refused: {e:#}"); // (librdkafka shows only the code; this says why)
         ready((INVALID_RECORD, -1, Some(crate::ext::said(&e))))
     };
     let Some(log) = app.log.clone() else {
         return ready((POLICY_VIOLATION, -1, Some("read-only node".into())));
+    };
+    // (a keyed topic's records replace their keys', a tombstone deletes: S11; asked again for each batch, `Writer::put`)
+    let denied = |e: anyhow::Error| ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(crate::ext::said(&e))));
+    let writer = match crate::writer::Writer::with(app, Some(who.clone()), table, meta.clone(), rules.clone(), crate::rules::How::Load, false) {
+        Ok(w) => w,
+        Err(crate::writer::Refused::Rights(e)) => return denied(e),
+        Err(e) => return invalid(e.into()),
     };
     let batches = match decode_batches(records) {
         Ok(b) => b,
@@ -510,14 +517,6 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
             },
             false => crate::rules::LeftOut::None,
         };
-        // (NOT NULL, a CHECK, a held form: said as a bad record, which a producer doesn't retry; a UNIQUE's duplicate is the leader's to find, and `failed` says it the same way)
-        let rows = match crate::rules::shape(rules, table, crate::rules::Rows::Named(batch, left_out), crate::rules::How::Load, &crate::defaults::Node(&app.lake)).await {
-            Ok(rows) => rows,
-            Err(e) => return invalid(e),
-        };
-        if let Err(e) = crate::auth::WHO.sync_scope(who.clone(), || crate::auth::check_load(meta, &crate::auth::catalog_name(table), rows.rows())) {
-            return ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(crate::ext::said(&e)))); // (a keyed topic's records replace their keys', a tombstone deletes: S11)
-        }
         let src = match b.producer_id >= 0 && b.base_seq >= 0 {
             true => {
                 // A producer that gave up on a batch bumps its epoch and numbers from 0 again
@@ -529,9 +528,12 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
             }
             false => Src { producer: String::new(), seq: 0, prev: None }, // at-least-once, as in Kafka
         };
-        match log.queue_shaped(table.to_string(), src.clone(), rows.clone()).await {
-            Ok(ack) => acks.push((ack, src, rows)),
-            Err(e) => return ready(failed(&e)),
+        // (NOT NULL, a CHECK, a held form: said as a bad record, which a producer doesn't retry; a UNIQUE's duplicate is the leader's to find, and `failed` says it the same way)
+        match writer.put(crate::rules::Rows::Named(batch, left_out), src).await {
+            Ok(q) => acks.push((q.ack, q.src, q.rows)),
+            Err(crate::writer::Refused::Rows(e)) => return invalid(e),
+            Err(crate::writer::Refused::Rights(e)) => return denied(e),
+            Err(e) => return ready(failed(&e.into())),
         }
     }
     let table = table.to_string();

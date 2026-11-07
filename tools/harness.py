@@ -11067,6 +11067,37 @@ def users():
         or {"before": ann_before, "revoked": ann_revoked, "last": ann_last[-3:]}
     checks["revoked (a column, a role) and dropped: at once on the leader and a follower; pondra.grants says what stands"] = revoked == [True, True] and still == [{"id": 1}, {"id": 2}] \
         and no_role is True and gone == [True, True] and {"grantee": "analyst", "privilege": "SELECT", "on_name": "sales.orders", "columns": "id, amount"} in grants
+    # A COPY's rights are asked for each chunk it loads (step 9, `writer::may`): a REVOKE in the middle of a long COPY stops it
+    # at its next chunk, once the connection's sign-in is checked again (every 5 s), 42501. Each chunk is committed as it
+    # comes, as before, so the chunks loaded before the REVOKE stay. (Outside `sales`, whose tables bob is granted all of;
+    # libpq keeps what a full socket didn't take until it is flushed, so each 34 MB is flushed before the next step.)
+    for q in ["CREATE TABLE copied (a VARCHAR)", "GRANT INSERT ON copied TO bob"]:
+        as_(A.port, boss, q)
+    chunk, copy_out = (b"x" * 999 + b"\n") * 34000, {}  # (34 MB: past the 32 MB a COPY gathers before it loads them)
+    def copied_n():
+        r = as_(A.port, boss, "SELECT count(*) AS n FROM copied")
+        return r[0]["n"] if isinstance(r, list) and r else None
+    def sent(pg, cp):
+        for k in range(0, len(chunk), 1 << 20):
+            cp.write(chunk[k:k + (1 << 20)])
+        for _ in range(3000):
+            if pg.pgconn.flush() == 0:
+                break
+            time.sleep(0.01)
+    try:
+        with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=bob password=bob-password-1 dbname=lake", connect_timeout=10, autocommit=True) as bob_pg:
+            with bob_pg.cursor().copy("COPY copied FROM STDIN") as cp:
+                sent(bob_pg, cp)
+                copy_out["first"] = until(lambda: (copied_n() or 0) > 0, True, 30)
+                copy_out["revoked"] = as_(A.port, boss, "REVOKE INSERT ON copied FROM bob")
+                time.sleep(5.5)
+                sent(bob_pg, cp)
+        copy_out["end"] = "accepted"
+    except psycopg.Error as e:
+        copy_out["end"] = f"{e.sqlstate} {e}"
+    copy_out["rows"] = copied_n()
+    checks["a REVOKE in the middle of a long COPY stops it at its next chunk (42501), and the chunks before it stay written"] = \
+        copy_out["first"] is True and copy_out["end"].startswith("42501") and "permission denied" in copy_out["end"] and 0 < (copy_out["rows"] or 0) < 68000 or copy_out
     # W50: a user granted a view (and a materialized view) alone is shown their names, columns and rows, not their queries,
     # the base table's name or the filter; a listing shows the view as a read does; the server's folder is an admin's
     vee_pw = "vee-password-1"
@@ -11136,7 +11167,7 @@ def users():
             "tokens": [by_token, expired, by_session, tampered, ended, dropped_token], "shown": shown_info}
     info["w50"] = w50  # (a view granted alone: what it was shown, for a failing check)
     a.kill(), b.kill()  # (the ports free for the next test of `all`)
-    ok = all(checks.values())
+    ok = all(v is True for v in checks.values())  # (a check that failed says why as a dict, which is truthy)
     print(json.dumps({"users": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:
         sys.exit(1)  # (as the other sections: a false check ends the run with a failing status, and `all` with it)
