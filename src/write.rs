@@ -1033,7 +1033,7 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
     let table = stmt.table();
     let m: TableMeta = (*lake.table_meta(&table).await?).clone().logical(); // (as SQL names it)
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
-    let mut spec = j!({"columns": m.columns(), "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": m.not_null(), "defaults": m.defaults(), "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds"))});
+    let mut spec = j!({"columns": m.columns(), "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": crate::objects::not_null_columns(&m), "defaults": crate::objects::column_defaults(&m), "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds"))});
     match stmt {
         Stmt::AddColumn(_, column, sql_type, if_not_exists, place) => {
             if m.columns().iter().any(|(c, _)| c == column) {
@@ -1138,7 +1138,7 @@ pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, na
     let order = crate::rules::rows::row_columns(meta.sql_order(), names); // (SQL's order: what a row without a column list gives, first to last)
     let names = if names.is_empty() { implicit(&order, crate::rules::rows::rows_width(query)) } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: the columns its rows give)
     let default = |c: &str| crate::rules::rows::default_sql(meta, c);
-    if meta.defaults().values().any(|d| crate::seq::calls(d)) && crate::rules::rows::plain_values(query).is_some() {
+    if meta.list().columns.iter().filter_map(|c| c.default.as_ref()).any(|d| crate::seq::calls(d)) && crate::rules::rows::plain_values(query).is_some() {
         // (`nextval` in rows of VALUES: taken here, in the rows' order: `seq::taken`)
         let used = std::cell::RefCell::new(vec![]);
         crate::rules::rows::rows_for(table, &columns, names, query, &|c| default(c).inspect(|d| used.borrow_mut().push(d.clone())))?;
@@ -1392,7 +1392,7 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
     let null = || datafusion::prelude::lit(datafusion::scalar::ScalarValue::Null);
     // (a column the query leaves out: its DEFAULT, else NULL)
     let default = |stored: &str| -> Result<Expr> {
-        match meta.as_ref().and_then(|m| m.defaults().get(stored)) {
+        match meta.as_ref().and_then(|m| m.col(stored)?.default.as_ref()) {
             Some(e) => Ok(ctx.parse_sql_expr(e, df.schema())?),
             None => Ok(null()),
         }
@@ -2150,7 +2150,7 @@ pub(crate) async fn identity(lake: &Lake, stmt: &Stmt) -> Result<()> {
     // (a name not in a lake here, say an outside catalog's table: its own path takes it)
     let Ok((other, name)) = crate::ddl::resolve(lake, &table).await else { return Ok(()) };
     let Some(meta) = other.as_deref().unwrap_or(lake).cat.meta(&table_key(&name)).await? else { return Ok(()) }; // (as parsed once a version: `rules` is the memo)
-    if !meta.identity().values().any(|i| i.always) {
+    if !meta.list().columns.iter().any(|c| c.identity.as_ref().is_some_and(|i| i.always)) {
         return Ok(());
     }
     let t = meta.rules()?;

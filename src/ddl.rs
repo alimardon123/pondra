@@ -933,8 +933,8 @@ pub async fn settle(lake: &Lake, d: &Ddl) -> Result<()> {
                 Change::Rename(to) => m.stored(to).is_some(),
                 Change::Drop { .. } => m.stored(column).is_none(),
                 Change::Type(_) => true, // (the same names either way)
-                Change::Default(d) => m.stored(column).is_none_or(|s| m.defaults().get(s) == d.as_ref()),
-                Change::NotNull(on) => m.stored(column).is_none_or(|s| m.not_null().iter().any(|c| c == s) == *on),
+                Change::Default(d) => m.stored(column).is_none_or(|s| m.col(s).and_then(|c| c.default.as_ref()) == d.as_ref()),
+                Change::NotNull(on) => m.stored(column).is_none_or(|s| m.col(s).is_some_and(|c| c.not_null) == *on),
                 Change::Place(p) => {
                     let order: Vec<String> = m.sql_names();
                     m.stored(column).is_none() || p.put(&order, column).is_ok_and(|o| o == order) // (put again, nothing moves)
@@ -1543,7 +1543,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             j!({"dropped": column})
         }
         Change::Type(sql_type) => {
-            let (held, declared) = (m.sql_types().get(&stored).cloned(), crate::types::declared(&sql_type)?);
+            let (held, declared) = (m.col(&stored).and_then(|c| c.held.clone()), crate::types::declared(&sql_type)?);
             if let Some(t) = declared.as_deref().filter(|t| matches!(*t, "uuid" | "json" | "jsonb")) {
                 if held.as_deref() != Some(t) {
                     return Err(crate::codes::coded("42804", not_held(column, t)));
@@ -1566,7 +1566,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
                 m.hold_column(&stored, Some(wanted.clone()));
                 j!({"column": column, "type": wanted.to_uppercase()})
             } else {
-                if old == new && (held.is_some() || m.enums().contains_key(&stored)) {
+                if old == new && (held.is_some() || m.col(&stored).is_some_and(|c| c.labels.is_some())) {
                     // (a uuid, a length or an enum is text held a way: as text, every row reads as it did, as Postgres casts them)
                     m.hold_column(&stored, None);
                 } else if old == new {

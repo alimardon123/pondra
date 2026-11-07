@@ -991,17 +991,19 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<St
     let merge: BTreeMap<String, String> = serde_json::from_value(opts["merge"].clone()).unwrap_or_default();
     ensure!(merge == m.merge, "its merge functions can't change in place");
     let not_null: Vec<String> = list(&opts["not_null"]).into_iter().chain(key.iter().cloned()).collect();
-    let mut nn_have: Vec<&String> = m.not_null().iter().collect();
-    let mut nn_want: Vec<&String> = m.columns().iter().map(|(c, _)| c).filter(|c| not_null.contains(c)).collect();
+    let mut nn_have: Vec<&str> = m.list().columns.iter().filter(|c| c.not_null).map(|c| c.stored_name()).collect();
+    let mut nn_want: Vec<&str> = m.columns().iter().map(|(c, _)| c.as_str()).filter(|c| not_null.iter().any(|n| n == c)).collect();
     nn_have.sort();
     nn_want.sort();
     nn_want.dedup();
-    let added: Vec<&String> = declared[have.len()..].iter().map(|(c, ..)| c).collect();
+    let added: Vec<&str> = declared[have.len()..].iter().map(|(c, ..)| c.as_str()).collect();
     ensure!(nn_have == nn_want || nn_want.iter().all(|c| nn_have.contains(c) || added.contains(c)) && nn_have.iter().all(|c| nn_want.contains(c)), "its NOT NULL columns differ: a migration's (a new table, the rows moved)");
     let checks: Vec<(String, String)> = serde_json::from_value(opts["checks"].clone()).unwrap_or_default();
     ensure!(checks == m.checks, "its CHECKs differ: a migration's (a new table, the rows moved)");
     let defaults: BTreeMap<String, String> = serde_json::from_value(opts["defaults"].clone()).unwrap_or_default();
-    ensure!(defaults.iter().filter(|(c, _)| !added.contains(c)).all(|(c, v)| m.defaults().get(c) == Some(v)) && m.defaults().keys().all(|c| defaults.contains_key(c)), "its DEFAULTs differ: a migration's");
+    let had = |c: &str| m.col(c).and_then(|c| c.default.as_ref());
+    let kept = m.list().columns.iter().filter(|c| c.default.is_some()).all(|c| defaults.contains_key(c.stored_name()));
+    ensure!(defaults.iter().filter(|(c, _)| !added.contains(&c.as_str())).all(|(c, v)| had(c.as_str()) == Some(v)) && kept, "its DEFAULTs differ: a migration's");
     let mut set = vec![];
     let publish = opts.get("publish").filter(|v| !v.is_null()).map(list).unwrap_or_else(crate::store::default_publish);
     if publish != m.publish {

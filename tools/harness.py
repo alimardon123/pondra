@@ -11214,9 +11214,17 @@ def users():
         and "permission denied" in str(w50["select"]) and w50["mat_rows"] == [{"item": "cake", "n": 1}, {"item": "tea", "n": 1}]
     checks["W50: over the Postgres port a granted view and materialized view are listed by information_schema.tables, the view's columns read, and its base table not"] = \
         w50["pg_info_tables"] == [("m_orders",), ("v_orders",)] and w50["pg_columns"] == [("id",), ("item",)]
+    # A view replaced keeps its grants: a grant names the view, not its query (CREATE OR REPLACE VIEW, as Databricks keeps them)
+    as_(A.port, boss, "CREATE OR REPLACE VIEW sales.v_orders (PRIMARY KEY (id) NOT ENFORCED) AS SELECT id, item, 1 AS one FROM sales.orders WHERE item = 'tea'")
+    replaced = {"columns": as_(A.port, vee, "SHOW COLUMNS FROM sales.v_orders"),
+                "grants": as_(A.port, boss, "SELECT grantee, privilege, on_name FROM pondra.grants WHERE grantee = 'vee' ORDER BY on_name")}
+    checks["a view replaced (CREATE OR REPLACE VIEW) keeps its grants: the user granted it reads its columns, the new one too, and pondra.grants still lists the grant"] = \
+        [r.get("column_name") for r in rows(replaced["columns"])] == ["id", "item", "one"] \
+        and {"grantee": "vee", "privilege": "SELECT", "on_name": "sales.v_orders"} in rows(replaced["grants"])
     info = {"said": said, "wrote": wrote, "pg": pg_said, "kafka": kafka_said, "flight": flight_said[1:], "grants": grants, "revoked": [revoked, still, no_role, gone],
             "tokens": [by_token, expired, by_session, tampered, ended, dropped_token], "shown": shown_info}
     info["w50"] = w50  # (a view granted alone: what it was shown, for a failing check)
+    info["replaced"] = replaced  # (the view replaced: its columns as the granted user reads them, and the grants)
     a.kill(), b.kill()  # (the ports free for the next test of `all`)
     ok = all(v is True for v in checks.values())  # (a check that failed says why as a dict, which is truthy)
     print(json.dumps({"users": checks, "ok": ok, "info": info}, indent=1, default=str))
