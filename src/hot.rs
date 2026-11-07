@@ -467,56 +467,101 @@ fn base(key: &str) -> &str { key.rsplit_once('#').map_or(key, |(path, _)| path) 
 /// `fields` of `file`, cast to their types (a column the file lacks, added to the table after it
 /// was written, is null): rows per batch, and each field's arrays and their ranges. Its system
 /// columns come from its lineage if it has one; with `deletes`, its deleted rows are left out.
-/// A file's columns `fields`, decoded: each batch's rows, each column's arrays, and their ranges. First its footer says
-/// about what they decode to (`estimate`), and `fits` whether that has room: if not, nothing is decoded, and the
-/// estimate is handed back (a file of a lake in memory was decoded in full and thrown away: at a 0.25 GB
-/// `PONDRA_MEMORY_GB`, a second lineitem file of 248 MB, its decode taking the process from 1.1 to 1.58 GB).
+/// First its footer says about what they decode to (`estimate`), and `fits` whether that has room: if not, nothing is
+/// decoded, and the estimate is handed back (a file of a lake in memory was decoded in full and thrown away: at a
+/// 0.25 GB `PONDRA_MEMORY_GB`, a second lineitem file of 248 MB, its decode taking the process from 1.1 to 1.58 GB).
+/// One column is read at a time and copied into its own allocation (`whole`) before the next is read, so a decode
+/// holds what it has kept and about twice one column, not twice the file's columns (7 of lineitem's decoded at once
+/// took 248 MB to the cache and 519 MB to the process, at a 0.25 GB `PONDRA_MEMORY_GB`).
 async fn decode(lake: &Lake, file: &DataFile, fields: &[FieldRef], deletes: bool, fits: impl FnOnce(usize) -> bool + Send + 'static) -> Result<std::result::Result<Decoded, usize>> {
     let bytes = lake.object(&file.path).await?;
     let gone = if deletes && !file.deletes.is_empty() { crate::lake_scan::deleted_rows(lake, file).await? } else { vec![] };
     let (fields, lineage) = (fields.to_vec(), file.lineage);
-    tokio::task::spawn_blocking(move || {
-        // Strings straight to views (no copy of their bytes), as the table is read (see `read_schema`).
-        let file = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?.schema().clone();
-        let views = file.fields().iter().map(|f| match f.data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 => Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8View)),
-            _ => f.clone(),
-        });
-        let hint = Arc::new(Schema::new_with_metadata(views.collect::<Vec<_>>(), file.metadata().clone()));
-        let b = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, ArrowReaderOptions::new().with_schema(hint))?;
-        let present: Vec<usize> = fields.iter().filter_map(|f| b.schema().index_of(f.name()).ok()).collect();
-        let mask = ProjectionMask::roots(b.parquet_schema(), present);
-        let guess = estimate(b.metadata(), &mask);
-        if !fits(guess) {
-            return Ok(Err(guess));
-        }
-        let (mut rows, mut out, mut at, mut next) = (vec![], vec![vec![]; fields.len()], 0, 0); // (at: the batch's first row's place in the file)
-        for batch in b.with_projection(mask).with_batch_size(BATCH).build()? {
+    tokio::task::spawn_blocking(move || read_columns(bytes, &gone, &fields, lineage, fits)).await?
+}
+
+/// `decode`'s reading, of a file's `bytes` whose rows `gone` are deleted.
+fn read_columns(bytes: bytes::Bytes, gone: &[u64], fields: &[FieldRef], lineage: Option<Lineage>, fits: impl FnOnce(usize) -> bool) -> Result<std::result::Result<Decoded, usize>> {
+    use datafusion::parquet::arrow::arrow_reader::ArrowReaderMetadata;
+    // Strings straight to views (no copy of their bytes), as the table is read (see `read_schema`).
+    let file = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?.schema().clone();
+    let views = file.fields().iter().map(|f| match f.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8View)),
+        _ => f.clone(),
+    });
+    let hint = Arc::new(Schema::new_with_metadata(views.collect::<Vec<_>>(), file.metadata().clone()));
+    let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::new().with_schema(hint))?;
+    // (the file's column each field is read from: none for one its lineage makes or the file lacks)
+    let made = |f: &FieldRef| lineage.is_some() && [crate::text::ROW_ID, crate::text::VERSION, crate::text::CREATED, crate::text::UPDATED].contains(&f.name().as_str());
+    let roots: Vec<Option<usize>> = fields.iter().map(|f| if made(f) { None } else { meta.schema().index_of(f.name()).ok() }).collect();
+    let guess = estimate(meta.metadata(), &ProjectionMask::roots(meta.parquet_schema(), roots.iter().flatten().copied()));
+    if !fits(guess) {
+        return Ok(Err(guess));
+    }
+    let read = |roots: Vec<usize>| {
+        let b = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes.clone(), meta.clone());
+        let mask = ProjectionMask::roots(b.parquet_schema(), roots);
+        b.with_projection(mask).with_batch_size(BATCH).build()
+    };
+    // (which of a batch's rows are kept, the batch's first row being row `at` of the file)
+    let keep = |at: u64, n: usize| {
+        (!gone.is_empty()).then(|| {
+            let mut next = gone.partition_point(|&g| g < at);
+            BooleanArray::from_iter((at..at + n as u64).map(|i| {
+                while next < gone.len() && gone[next] < i {
+                    next += 1;
+                }
+                Some(gone.get(next) != Some(&i))
+            }))
+        })
+    };
+    // A field's arrays, a batch each, from `batches` (each one's rows pushed to `n`).
+    let arrays = |f: &FieldRef, batches: &mut dyn Iterator<Item = Result<RecordBatch>>, n: &mut Vec<usize>| -> Result<Vec<ArrayRef>> {
+        let (mut out, mut at) = (vec![], 0u64);
+        for batch in batches {
             let batch = batch?;
-            let n = batch.num_rows();
-            let keep = (!gone.is_empty()).then(|| {
-                BooleanArray::from_iter((at..at + n as u64).map(|i| {
-                    while next < gone.len() && gone[next] < i {
-                        next += 1;
-                    }
-                    Some(gone.get(next) != Some(&i))
-                }))
+            let c = datafusion::arrow::compute::cast(&column(&batch, f, lineage, at), f.data_type())?;
+            out.push(match keep(at, batch.num_rows()) {
+                Some(k) => datafusion::arrow::compute::filter(&c, &k)?,
+                None => c,
             });
-            for (f, arrays) in fields.iter().zip(&mut out) {
-                let c = datafusion::arrow::compute::cast(&column(&batch, f, lineage, at), f.data_type())?;
-                arrays.push(match &keep {
-                    Some(k) => datafusion::arrow::compute::filter(&c, k)?,
-                    None => c,
-                });
-            }
-            rows.push(keep.as_ref().map_or(n, |k| k.true_count()));
-            at += n as u64;
+            n.push(batch.num_rows());
+            at += batch.num_rows() as u64;
         }
-        let ranges = out.iter().map(|arrays| ranges(arrays)).collect();
-        let out = out.into_iter().map(whole).collect();
-        Ok(Ok((rows, out, ranges)))
-    })
-    .await?
+        Ok(out)
+    };
+    let (mut out, mut ranged, mut rows) = (vec![vec![]; fields.len()], vec![None; fields.len()], None::<Vec<usize>>);
+    for (i, f) in fields.iter().enumerate() {
+        let Some(root) = roots[i] else { continue };
+        let mut n = vec![];
+        let a = arrays(f, &mut read(vec![root])?.map(|b| b.map_err(anyhow::Error::from)), &mut n)?;
+        if rows.get_or_insert_with(|| n.clone()) != &n {
+            anyhow::bail!("{}: its columns read in batches of other sizes", f.name());
+        }
+        ranged[i] = ranges(&a);
+        out[i] = whole(a);
+    }
+    // The batches' rows (a file none of whose fields are read: from a read of no column), and the fields made, not read.
+    let rows = match rows {
+        Some(rows) => rows,
+        None => read(vec![])?.map(|b| Ok(b?.num_rows())).collect::<Result<Vec<_>>>()?,
+    };
+    for (i, f) in fields.iter().enumerate().filter(|(i, _)| roots[*i].is_none()) {
+        let mut batches = rows.iter().map(|&n| Ok(RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &RecordBatchOptions::new().with_row_count(Some(n)))?));
+        let a = arrays(f, &mut batches, &mut vec![])?;
+        ranged[i] = ranges(&a);
+        out[i] = whole(a);
+    }
+    let mut at = 0u64;
+    let rows = rows
+        .iter()
+        .map(|&n| {
+            let kept = keep(at, n).map_or(n, |k| k.true_count());
+            at += n as u64;
+            kept
+        })
+        .collect();
+    Ok(Ok((rows, out, ranged)))
 }
 
 /// What `decode` gives: each batch's rows, each column's arrays (a batch each), and each column's ranges.
@@ -1313,6 +1358,49 @@ mod tests {
         let one = estimate(b.metadata(), &ProjectionMask::roots(b.parquet_schema(), [0]));
         let all = estimate(b.metadata(), &ProjectionMask::roots(b.parquet_schema(), [0, 1, 2]));
         assert!(all > one * 3, "the columns asked for: {one} of {all}");
+    }
+
+    /// A file's columns read one at a time come out as if read together: every column in the same batches, its system
+    /// columns from its lineage, a column it lacks null, its deleted rows left out (at the edges of batches too). One
+    /// that doesn't fit isn't read.
+    #[test]
+    fn a_files_columns_read_one_at_a_time_line_up() {
+        use datafusion::parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+        let n = 20_000i64;
+        let ints: ArrayRef = Arc::new(Int64Array::from_iter_values(0..n));
+        let texts: ArrayRef = Arc::new(StringViewArray::from_iter_values((0..n).map(|v| format!("s{v}"))));
+        let batch = RecordBatch::try_from_iter(vec![("i", ints), ("s", texts)]).unwrap();
+        let mut body = vec![];
+        let small = WriterProperties::builder().set_max_row_group_row_count(Some(7_000)).build(); // (batches across its row groups)
+        let mut w = ArrowWriter::try_new(&mut body, batch.schema(), Some(small)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let body = bytes::Bytes::from(body);
+        let field = |name: &str, t: DataType| Arc::new(Field::new(name, t, true));
+        let fields = [field("i", DataType::Int64), field("s", DataType::Utf8View), field("later", DataType::Int32), field(crate::text::ROW_ID, DataType::Int64), field(crate::text::VERSION, DataType::Int64)];
+        let lineage = Some(Lineage { first: 100, version: 7, ms: 5 });
+        let gone = [0u64, 5, 8_191, 8_192, 19_999];
+
+        let (rows, out, ranges) = read_columns(body.clone(), &gone, &fields, lineage, |_| true).unwrap().unwrap();
+        let kept: Vec<i64> = (0..n).filter(|i| !gone.contains(&(*i as u64))).collect();
+        assert_eq!(rows.iter().sum::<usize>(), kept.len());
+        for (f, arrays) in fields.iter().zip(&out) {
+            assert_eq!(arrays.iter().map(|a| a.len()).collect::<Vec<_>>(), rows, "{}: the same batches", f.name());
+        }
+        let values = |c: usize| -> Vec<i64> { out[c].iter().flat_map(|a| a.as_primitive::<Int64Type>().values().to_vec()).collect() };
+        assert_eq!(values(0), kept);
+        let texts: Vec<String> = out[1].iter().flat_map(|a| a.as_string_view().iter().map(|s| s.unwrap().to_string()).collect::<Vec<_>>()).collect();
+        assert_eq!(texts, kept.iter().map(|v| format!("s{v}")).collect::<Vec<_>>());
+        assert!(out[2].iter().all(|a| a.null_count() == a.len() && a.data_type() == &DataType::Int32), "a column the file lacks is null");
+        assert_eq!(values(3), kept.iter().map(|i| 100 + i).collect::<Vec<_>>(), "row ids from the lineage");
+        assert!(values(4).iter().all(|&v| v == 7));
+        assert!(ranges[0].is_some());
+
+        let guess = estimate(ParquetRecordBatchReaderBuilder::try_new(body.clone()).unwrap().metadata(), &ProjectionMask::all());
+        match read_columns(body, &gone, &fields, lineage, |_| false).unwrap() {
+            Err(estimate) => assert!(estimate > 0 && estimate <= guess, "{estimate} of {guess}"),
+            Ok(_) => panic!("read though it doesn't fit"),
+        }
     }
 
     #[test]
