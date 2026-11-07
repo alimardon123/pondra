@@ -9,7 +9,7 @@
 //! another's request for it answers 410 as if it were gone.
 use crate::ledger::ByteLru;
 use datafusion::arrow::record_batch::RecordBatch;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use datafusion::common::instant::Instant;
 use std::time::Duration;
 
@@ -19,8 +19,23 @@ struct Kept {
     used: Instant,
 }
 
-// (by id, each charged its rows' memory)
-crate::per_node!(static KEPT: Mutex<ByteLru<String, Kept>> = Mutex::new(ByteLru::new(budget())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+// (by id, each charged its rows' memory, to the node's line too: `kept`)
+crate::per_node!(static KEPT: Arc<Pages> = Arc::new(Pages(Mutex::new(ByteLru::new(budget())))); clear = |m| m.0.lock().unwrap_or_else(|e| e.into_inner()).clear());
+
+/// The answers kept for their pages.
+pub struct Pages(Mutex<ByteLru<String, Kept>>);
+
+impl crate::ledger::Charged for Pages {
+    fn held(&self) -> usize { self.0.lock().unwrap_or_else(|e| e.into_inner()).bytes() }
+
+    fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(&self.0, |c| c, bytes) }
+
+    /// Inside the whole line, unless `PONDRA_PAGES_MB` gives them a budget of their own.
+    fn inside(&self) -> bool { crate::env::get("PONDRA_PAGES_MB").is_none() }
+}
+
+/// The answers kept for their pages, as the node's line counts them (`cache_bytes{cache="pages"}`).
+pub fn kept() -> Arc<dyn crate::ledger::Charged> { KEPT.clone() }
 const IDLE: Duration = Duration::from_secs(20 * 60);
 
 fn budget() -> usize { crate::env::value::<usize>("PONDRA_PAGES_MB") << 20 }
@@ -33,7 +48,7 @@ pub fn keep(batches: &[RecordBatch]) -> Option<String> {
     }
     let id = uuid::Uuid::new_v4().simple().to_string(); // (random: an id is known only to whoever was sent the answer)
     let holder = crate::auth::holder();
-    let mut kept = KEPT.lock().unwrap();
+    let mut kept = KEPT.0.lock().unwrap();
     let mut left = kept.retain(|_, k| k.used.elapsed() < IDLE);
     left.extend(kept.set_most(budget));
     left.extend(kept.put(id.clone(), Kept { holder, batches: batches.to_vec(), used: Instant::now() }, bytes));
@@ -45,7 +60,7 @@ pub fn keep(batches: &[RecordBatch]) -> Option<String> {
 /// or was asked for by someone else.
 pub fn page(id: &str, from: usize, n: usize) -> Option<Vec<RecordBatch>> {
     let who = crate::auth::holder();
-    let mut kept = KEPT.lock().unwrap();
+    let mut kept = KEPT.0.lock().unwrap();
     if !kept.peek(id).is_some_and(|k| k.holder == who && k.used.elapsed() < IDLE) {
         return None; // (another's answer is left as it is: as if gone)
     }

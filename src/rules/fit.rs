@@ -137,6 +137,8 @@ pub fn evaluate_in(base: &SessionContext, rows: &RecordBatch, schema: &datafusio
     }) else {
         return Ok(None);
     };
+    // (a float IN list's zero, a CASE's and NULLIF's, as a query's plan has them: `ZerosIn`, 11-06 audit M5)
+    let Ok(e) = crate::zeros_in::alone(e, schema) else { return Ok(None) };
     let Ok(phys) = base.create_physical_expr(e, schema) else { return Ok(None) };
     Ok(Some(phys.evaluate(rows)?.into_array(rows.num_rows())?))
 }
@@ -176,6 +178,8 @@ pub fn plan(base: &SessionContext, schema: &SchemaRef, check: &str) -> Result<(A
     let options = Arc::new(datafusion::config::ConfigOptions::clone(base.state_ref().read().config_options()));
     let now = ExprSimplifier::new(SimplifyContext::builder().with_schema(schema.clone()).with_config_options(options).with_current_time().build());
     let expr = now.simplify(now.coerce(expr, &schema)?)?;
+    // (as a query's WHERE has it after the simplifier: a float IN list's zero is an `=`, which takes -0.0 too, 11-06 audit M5)
+    let expr = crate::zeros_in::alone(expr, &schema)?;
     Ok((base.create_physical_expr(expr, &schema)?, !changing))
 }
 
@@ -272,5 +276,27 @@ mod tests {
         let rows = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)])), vec![n]).expect("rows");
         let broke = breaking(&SessionContext::new(), &rows, "n > 0").expect("plans");
         assert_eq!(broke.iter().collect::<Vec<_>>(), [Some(false), Some(true), Some(false), Some(true)]);
+    }
+
+    /// A float's zero is one value in a CHECK, an expectation, an upsert's condition and a DEFAULT, as in a query's WHERE:
+    /// `CHECK (x NOT IN (0.0))` refuses -0.0, as Postgres does (11-06 audit M5; `zeros_in`).
+    #[test]
+    fn a_float_zero_is_one_value_in_a_check_and_an_expression_alone() {
+        use datafusion::arrow::array::Float64Array;
+        let x: ArrayRef = Arc::new(Float64Array::from(vec![Some(-0.0), Some(0.0), Some(2.0), Some(1.0), None]));
+        let rows = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, true)])), vec![x]).expect("rows");
+        let base = SessionContext::new();
+        let broke = |check: &str| breaking(&base, &rows, check).expect("plans").iter().map(|b| b == Some(true)).collect::<Vec<_>>();
+        // (a list of more than 3: the simplifier makes a shorter one ORed `=`s, which never compared bits)
+        assert_eq!(broke("x NOT IN (2.0, 3.0, 4.0, 0.0)"), [true, true, true, false, false], "-0.0 is 0.0");
+        assert_eq!(broke("x NOT IN (2.0, 3.0, 4.0, -0.0)"), [true, true, true, false, false]);
+        assert_eq!(broke("x IN (2.0, 3.0, 4.0, 0.0)"), [false, false, false, true, false]);
+        assert_eq!(broke("x NOT IN (0.0)"), [true, true, false, false, false]);
+        let value = |e: &str| evaluate(&base, &rows, e).expect("evaluates").expect("plans");
+        assert_eq!(value("x IN (2.0, 0.0)").as_boolean().iter().collect::<Vec<_>>(), [Some(true), Some(true), Some(true), Some(false), None]);
+        let case = value("CASE x WHEN 0.0 THEN 1 ELSE 2 END");
+        let case = datafusion::arrow::compute::cast(&case, &DataType::Int64).expect("a number");
+        assert_eq!(case.as_primitive::<datafusion::arrow::datatypes::Int64Type>().values().to_vec(), [1, 1, 2, 2, 2]);
+        assert_eq!(value("NULLIF(x, 0)").null_count(), 3, "both zeros, and the NULL");
     }
 }

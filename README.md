@@ -150,8 +150,8 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
   must reach this node at another address than `--addr`'s host).
 - `--flight 0.0.0.0:8815`: also speak Arrow Flight and Flight SQL.
 - `--memory-gb 24`: memory for queries and every cache together, as DuckDB's `memory_limit`, except a
-  cache given a budget of its own (`PONDRA_HOT_GB`, `PONDRA_CACHE_MB`); a query that needs more takes
-  it from the caches, then sorts, aggregations and joins spill to the temp
+  cache given a budget of its own (`PONDRA_HOT_GB`, `PONDRA_CACHE_MB`, `PONDRA_PAGES_MB`); a query that
+  needs more takes it from the caches, then sorts, aggregations and joins spill to the temp
   directory. Unset, queries have a third of the machine's memory, and the columns kept decoded in memory
   (`PONDRA_HOT_GB`, half of the machine's memory by default) sit beside it, as an in-memory
   engine's tables do, and give way to queries: past 85% of the memory line (320 MB under a small one, never under 70%)

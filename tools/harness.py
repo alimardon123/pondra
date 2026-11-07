@@ -492,6 +492,9 @@ def external():
     checks["the owner's answers are remembered, but not one that reads a file here: it is read again, changed"] = first == again == [{"s": 3}] and after_lake > before \
         and read1 == [{"s": 1}] and read2 == [{"s": 3}] and after_file == after_lake and q("SELECT sum(a) AS s FROM owned") == [{"s": 6}]
     q("DROP TABLE owned")
+    names = set(re.findall(rb'pondra_cache_bytes\{cache="(\w+)"\}', call(A.port, "GET", "/metrics", headers=hdr)))
+    checks["/metrics counts every cache on the node's line, the node's own with the lake's (tables' manifests, kept pages, Delta logs and Iceberg manifests)"] = \
+        {b"answers", b"facts", b"manifests", b"pages", b"delta_logs", b"iceberg_manifests", b"tails", b"lookups"} <= names
     q("CREATE EXTERNAL TABLE ev (id INT, name VARCHAR) STORED AS CSV LOCATION 'ev/' OPTIONS ('format.has_header' 'false')")
     empty = q("SELECT count(*) AS n FROM ev")
     q("INSERT INTO ev VALUES (1, 'one'), (2, 'two')")
@@ -10561,6 +10564,11 @@ def server():
         and "hr signs in on its own" in str(seen["open_writes"]) and "403" in seen["open_iceberg"] and "people" not in str(seen["open_lists"])
     checks["a database's superuser reads another only as that one lets anyone: open, yes; signing in on its own, no"] = seen["boss_open"] == [{"text": "hi"}] \
         and "sales signs in on its own" in str(seen["boss_locked"])
+    # (11-06 audit L3: a past read is guarded under the name a plain read is, so a grant naming lake.notes reads it as
+    # lake.public.notes AT (…) too; it was guarded as written, and refused)
+    v_notes = _try(lambda: at("hr", "SELECT max(_version) AS v FROM lake.notes", boss)[0]["v"])
+    seen["ann_past"] = [at("hr", f"SELECT text FROM {n} AT (VERSION => {v_notes})", ann) for n in ("lake.notes", "lake.public.notes")]
+    checks["a grant naming an attached lake's table reads it as it was too, by lake.t and lake.schema.t (AT (VERSION => n))"] = seen["ann_past"] == [[{"text": "hi"}]] * 2
     # Whoever runs the nodes (one of their tokens) still reads across; a user of the node's own lake doesn't.
     mine = new_lake()
     subprocess.run([BIN, "sql", "--dir", mine, "CREATE TABLE t AS SELECT 1 AS id"], check=True, capture_output=True)
@@ -25516,6 +25524,22 @@ def friendly():
         whole["http"][0] == "0A000" and "REPLACE INTO is MySQL's" in whole["http"][1] and whole["mcp"][0] is True and "REPLACE INTO is MySQL's" in whole["mcp"][1] and whole["made"] == []
     if not checks[list(checks)[-1]]:
         failed["script refused whole"] = whole
+    # (11-06 audit M7: a text is split where the tokenizer reads a `;`, so one in E'…' after an escaped quote ends nothing,
+    # over HTTP and on the Postgres port's simple query; both cut it there and failed "unterminated string")
+    e_text = "SELECT E'it\\'s; ok' AS s"
+    c.request("POST", "/sql", e_text.encode())
+    r = c.getresponse()
+    e_said = {"http": (r.status, r.read().decode()[:200])}
+    try:
+        with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pc:
+            res = pc.pgconn.exec_(e_text.encode())  # (libpq's simple query: the port splits its text into statements)
+            e_said["port"] = res.get_value(0, 0).decode() if res.ntuples == 1 else (res.error_message or b"").decode(errors="replace")[:200]
+    except psycopg.Error as e:
+        e_said["port"] = str(e)[:200]
+    checks["a ; inside E'…' after an escaped quote ends no statement, over HTTP and on the Postgres port's simple query"] = \
+        e_said["http"][0] == 200 and json.loads(e_said["http"][1]) == [{"s": "it's; ok"}] and e_said["port"] == "it's; ok"
+    if not checks[list(checks)[-1]]:
+        failed["E-string split"] = e_said
     # (11-02 audit M13: a UBIGINT went out as INT8, and 2^63 and above as NULL)
     try:
         with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pc:

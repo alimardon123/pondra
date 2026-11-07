@@ -34,18 +34,39 @@ pub(crate) fn database(name: &str) -> String { name.trim_matches('"').to_lowerca
 /// One part of a name: as written if quoted, else in lower case.
 pub fn ident(i: &ast::Ident) -> String { if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() } }
 
-/// `sql` from its first word on: past leading whitespace and comments (`-- …`, `/* … */`).
+/// `sql` from its first word on: past leading whitespace and comments (`-- …`, `/* … */`, which nest as the tokenizer
+/// reads them: `/* a /* b */ c */` is one). Every look at where a statement's code starts reads it here (`status.rs`,
+/// `audit.rs`; 11-06 audit M7: each skipped comments its own way).
 pub fn first_word(sql: &str) -> &str {
     let mut s = sql.trim_start();
     loop {
         if let Some(rest) = s.strip_prefix("--") {
             s = rest.find('\n').map_or("", |i| &rest[i + 1..]).trim_start();
-        } else if let Some(rest) = s.strip_prefix("/*") {
-            s = rest.find("*/").map_or("", |i| &rest[i + 2..]).trim_start();
+        } else if s.starts_with("/*") {
+            s = s[comment_end(s)..].trim_start();
         } else {
             return s;
         }
     }
+}
+
+/// Where the comment `s` starts with ends: past the `*/` that closes its first `/*`, those between nesting (the text's
+/// end, when none does).
+fn comment_end(s: &str) -> usize {
+    let (b, mut depth, mut i) = (s.as_bytes(), 0, 0);
+    while i + 1 < b.len() {
+        match (b[i], b[i + 1]) {
+            (b'/', b'*') => (depth, i) = (depth + 1, i + 2),
+            (b'*', b'/') => {
+                (depth, i) = (depth - 1, i + 2);
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    s.len()
 }
 
 /// The first `n` words of `sql` past its leading comments, upper-cased, with a `;` at its end taken off: the words
@@ -479,6 +500,16 @@ impl<'a> Offsets<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_word_is_past_comments_as_the_tokenizer_reads_them() {
+        // (11-06 audit M7: a comment in a comment ended at its first `*/`, and `c */` was the statement's first word)
+        assert_eq!(first_word("/* a /* b */ c */ SELECT 1"), "SELECT 1");
+        assert_eq!(first_word("  -- x\n/* y */\n  GRANT SELECT ON t TO ana"), "GRANT SELECT ON t TO ana");
+        assert_eq!(first_word("/**/SELECT 1"), "SELECT 1");
+        assert_eq!(first_word("/* never closed SELECT 1"), "");
+        assert_eq!(first_word("SELECT 1 /* a */"), "SELECT 1 /* a */");
+    }
 
     #[test]
     fn a_name_in_text_splits_as_sql_reads_it() {
