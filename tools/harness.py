@@ -9886,7 +9886,7 @@ def colorder():
     `*`), the bulk door, COPY INTO a headerless CSV, the Postgres port's COPY FROM STDIN, RETURNING *, a keyed table's
     INSERT, ON CONFLICT, INSERT OR REPLACE, MERGE … INSERT VALUES, UPDATE, DELETE and a transaction, a write through a
     second node. A move while a positional write runs on another node (an INSERT, a transaction's INSERT before its COMMIT,
-    a headerless COPY, a one-key upsert) refuses it 40001, nothing written. Reads list
+    a headerless COPY, a one-key upsert) refuses it 40001, nothing written; an ADD COLUMN at the end doesn't. Reads list
     the new order: SELECT *, DESCRIBE, information_schema, pg_attribute, a Postgres row's
     description, a point lookup, a past read, /watch, SHOW CREATE (which makes the same table again, and CREATE OR ALTER
     leaves as it is), Delta and Iceberg readers; all as it was after a restart. A view with a `*` lists the new order. Refused
@@ -10068,6 +10068,36 @@ def colorder():
     checks["a move between a transaction's INSERT without a column list on another node and its COMMIT: refused 40001, nothing written, then by the new order"] = \
         all(r["status"] == 200 for r in began) and committed["state"] == "40001" and txn_then == [] \
         and all(r["status"] == 200 for r in again) and until(lambda: q("SELECT a, b FROM race_txn"), [{"a": 2, "b": 1}], 10) == [{"a": 2, "b": 1}]
+    # (11-07 audit L3: an ADD COLUMN at the end between them moves nothing: the INSERT's values are where they go, so it commits)
+    q("CREATE TABLE race_add (a BIGINT, b BIGINT)")
+    until(lambda: names("race_add", A.port + 1), ["a", "b"], 10)
+    session = "colorder-add-" + uuid.uuid4().hex[:8]
+    began = [told(A.port + 1, "BEGIN", session), told(A.port + 1, "INSERT INTO race_add VALUES (1, 2)", session)]
+    q("ALTER TABLE race_add ADD COLUMN c BIGINT")
+    committed = told(A.port + 1, "COMMIT", session)
+    raced["txn_add"] = {"began": began, "commit": committed}
+    checks["an ADD COLUMN at the end between a transaction's INSERT without a column list on another node and its COMMIT: committed where it was put"] = \
+        all(r["status"] == 200 for r in began) and committed["status"] == 200 and until(lambda: q("SELECT a, b, c FROM race_add"), [{"a": 1, "b": 2}], 10) == [{"a": 1, "b": 2}]
+    # (the same while an autocommitted one runs: its rows are where they go, so they are taken. An INSERT … SELECT's files
+    # lack the new column, so the leader has them written again: 40001, as for a move, not an internal error)
+    for kind, ins in (("values", f"INSERT INTO race_add_{{}} VALUES (1, (SELECT 2 + z FROM {slow} s))"), ("select", f"INSERT INTO race_add_{{}} SELECT 1 + z, 2 FROM {slow} s")):
+        table = f"race_add_{kind}"
+        q(f"CREATE TABLE {table} (a BIGINT, b BIGINT)")
+        until(lambda: names(table, A.port + 1), ["a", "b"], 10)
+        outcome = {}
+        def insert_added():
+            outcome.update(told(A.port + 1, ins.format(kind)), done=time.time())
+        writer = threading.Thread(target=insert_added)
+        writer.start()
+        time.sleep(0.3)
+        q(f"ALTER TABLE {table} ADD COLUMN c BIGINT")
+        moved_at = time.time()
+        writer.join()
+        raced[f"add_{kind}"] = {**outcome, "after_move_s": round(outcome["done"] - moved_at, 2), "rows": q(f"SELECT a, b, c FROM {table}")}
+    checks["an ADD COLUMN at the end while an INSERT … VALUES without a column list runs on another node: written where it was put"] = \
+        raced["add_values"]["after_move_s"] > 0 and raced["add_values"]["status"] == 200 and until(lambda: q("SELECT a, b, c FROM race_add_values"), [{"a": 1, "b": 2}], 10) == [{"a": 1, "b": 2}]
+    checks["…an INSERT … SELECT's files: refused 40001 (written again), nothing written"] = \
+        raced["add_select"]["after_move_s"] > 0 and raced["add_select"]["state"] == "40001" and raced["add_select"]["rows"] == []
     q("CREATE TABLE race_copy (a BIGINT, b BIGINT)")
     until(lambda: names("race_copy", A.port + 1), ["a", "b"], 10)
     with open(os.path.join(d, "many.csv"), "w") as f:  # (enough lines that the move lands while it is read)

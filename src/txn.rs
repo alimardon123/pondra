@@ -1749,7 +1749,7 @@ async fn write_changes(lake: &Lake, seq: &crate::log::Sequencer, c: Commit) -> R
         let stored = lake.cat.meta(&table_key(name)).await?.with_context(|| format!("no table {name} (dropped while the transaction ran)"))?;
         // (an INSERT without a column list whose node put its values by an order of the columns the table no longer has: a
         // follower that hadn't seen a move yet, as `log::placed_for` checks an autocommitted one; under the lock DDL takes too)
-        if c.placed.get(name).is_some_and(|placed| placed.iter().any(|p| *p != stored.placed())) {
+        if c.placed.get(name).is_some_and(|placed| placed.iter().any(|p| !stored.places(*p))) {
             return Err(crate::codes::coded("40001", crate::log::moved(name)));
         }
         let meta = stored.logical_ref();

@@ -181,6 +181,8 @@ pub struct Stored {
 
 const NOT_NULL: &str = "not null";
 const DROPPED: &str = "dropped";
+/// `TableMeta::placed` of no columns: FNV-1a's offset basis.
+const PLACED_NONE: u64 = 0xcbf29ce484222325;
 
 /// A column's facts past its name, type and flags, as its entry writes them: each left out at its default (the id too,
 /// where it is the column's place + 1). (A missing one reads as None: no `default`, which would ask `Default` of each.)
@@ -972,10 +974,23 @@ impl TableMeta {
 
     /// Where an INSERT without a column list puts each value, as one number: the stored columns in SQL's order (`in_order`).
     /// A move, an added or a dropped column changes it, a rename doesn't. Of the entry as stored. The leader refuses rows a
-    /// node placed by another one (`log::Ack::moved`, `write::record`): one that hadn't seen a move yet filled the old order
-    /// (11-03 audit M9).
-    pub fn placed(&self) -> u64 {
-        self.in_order().flat_map(|c| c.stored_name().bytes().chain([0])).fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+    /// node placed by an order this entry doesn't place them by (`places`; `log::Ack::moved`, `write::record`): one that
+    /// hadn't seen a move yet filled the old order (11-03 audit M9).
+    pub fn placed(&self) -> u64 { self.placings().last().unwrap_or(PLACED_NONE) }
+
+    /// Are values put by the order `placed` (`placed`, of the entry a node had) where this entry puts them? They are when it
+    /// is this entry's order, or its first columns': a node that hadn't seen an ADD COLUMN at the end yet filled the columns
+    /// it knew, and the new one takes its DEFAULT, as here. A move, a dropped column or one added before the others changes
+    /// the first columns, so they aren't (11-07 audit L3).
+    pub fn places(&self, placed: u64) -> bool { self.placings().any(|p| p == placed) }
+
+    /// `placed` of the order's first column, of its first two, and on to all of them (FNV-1a over the stored names, each
+    /// ended by a 0).
+    fn placings(&self) -> impl Iterator<Item = u64> + '_ {
+        self.in_order().scan(PLACED_NONE, |h, c| {
+            *h = c.stored_name().bytes().chain([0]).fold(*h, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+            Some(*h)
+        })
     }
 
     /// SQL's columns (`logical_columns`) in SQL's order (`in_order`): what `SELECT *` and RETURNING * answer.
@@ -4068,6 +4083,18 @@ mod tests {
         assert_eq!(m.placed(), renamed.placed(), "a rename puts nothing elsewhere");
         assert_ne!(m.placed(), added.placed(), "a column more");
         assert_eq!(m.placed(), dropped.placed(), "a dropped column isn't filled");
+        // (11-07 audit L3: values a node put by an order that is the first columns of the table's are where they go)
+        assert!(m.places(m.placed()) && moved.places(moved.placed()), "its own order");
+        assert!(added.places(m.placed()), "the order before a column was added at the end: its first columns");
+        assert!(!m.places(added.placed()), "an order with a column more");
+        assert!(!moved.places(m.placed()) && !m.places(moved.placed()), "a move");
+        let mut first = m.clone();
+        let c = first.add_column("c", "Int32", None, None);
+        first.set_order(vec![c, "a".into(), "b".into()]);
+        assert!(!first.places(m.placed()), "a column added before the others");
+        let mut gone = added.clone();
+        gone.drop_column("b");
+        assert!(!gone.places(m.placed()) && !gone.places(added.placed()), "a column dropped from among them");
     }
 
     #[test]
