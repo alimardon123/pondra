@@ -2,9 +2,9 @@ name: fuzz
 
 # Each night, about 15 minutes of input nobody wrote (the PGX review's B2, 11-02: "a mechanism nobody runs is not
 # coverage"). Two checks on the Linux build of what ships next, both seeded with the date, so a night's run is repeated
-# by its seed (the head of `REF`: the release branch while a release is being made, as 0.80.0 is until 11-11 on
-# release/0.80, cut 11-03 while the redesign goes on on main; main again once it is out; a run started by hand tries
-# the branch it was started on):
+# by its seed (the head of `REF`: main, where the redesign goes on; a release branch only while a release is being
+# made, as release/0.80 was from 11-03 until the owner held its tags on 11-07; a run started by hand tries the branch
+# it was started on):
 # - tools/random_sql.py, for 9 minutes: random queries over random tables, each answered by one node, by three
 #   (every tenth), by DuckDB 2.0 on the same rows, and split three ways by a random condition (SQLancer's oracles);
 # - tools/fuzz_doors.py, 24 s a door (2 minutes): malformed input at HTTP, SQL, Postgres, Kafka and Flight.
@@ -27,7 +27,7 @@ concurrency:
 
 env:
   GH_TOKEN: ${{ github.token }}
-  REF: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || 'release/0.80' }}
+  REF: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || 'main' }}
 
 jobs:
   fuzz:

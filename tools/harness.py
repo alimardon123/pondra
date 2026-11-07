@@ -23117,6 +23117,97 @@ class Pg16:
             f.write("\n")
 
 
+def onerow():
+    """A scalar subquery that reads the outer row and isn't aggregated (`one_row.rs`, `OneRow`): `(SELECT c.list_price FROM
+    price_changes c WHERE c.product_id = p.product_id)` in a select list, a WHERE, inside an expression, and as an UPDATE's SET
+    (the form an agent writes for "apply these new prices"); and the same with `ORDER BY … LIMIT 1` (the latest change)
+    and with `LIMIT 1` alone. Each answer equals Postgres 16's (`Pg16`, recorded in tools/pg16/onerow.json) and DuckDB's.
+    A row whose subquery gives more than one row is refused with 21000, as Postgres refuses it, and an UPDATE refused so
+    changes nothing; a product the outer WHERE leaves out may have many changes and raises nothing."""
+    import csv, duckdb
+    setup = ["CREATE TABLE products (product_id BIGINT, list_price BIGINT, cat TEXT)",
+             "INSERT INTO products VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'a'), (4, 40, 'b')",
+             "CREATE TABLE price_changes (product_id BIGINT, list_price BIGINT, day BIGINT)",
+             "INSERT INTO price_changes VALUES (1, 11, 1), (2, 20, 1), (2, 21, 2), (4, 41, 1), (4, 42, 3), (4, 43, 2)"]
+    one = "(SELECT c.list_price FROM price_changes c WHERE c.product_id = p.product_id)"
+    latest = "(SELECT c.list_price FROM price_changes c WHERE c.product_id = p.product_id ORDER BY c.day DESC LIMIT 1)"
+    cases = [  # (name, text, ordered)
+        ("in the select list", f"SELECT p.product_id, {one} AS np FROM products p WHERE p.product_id IN (1, 3) ORDER BY 1", True),
+        ("in a WHERE", f"SELECT p.product_id FROM products p WHERE p.product_id IN (1, 3) AND {one} > 10", False),
+        ("inside an expression", f"SELECT p.product_id, coalesce({one}, p.list_price) + 1 AS np FROM products p WHERE p.cat = 'a' ORDER BY 1", True),
+        ("ORDER BY … LIMIT 1, latest first", f"SELECT p.product_id, {latest} AS v FROM products p ORDER BY 1", True),
+        ("ORDER BY … LIMIT 1 on the value", "SELECT p.product_id, (SELECT c.day FROM price_changes c WHERE c.product_id = p.product_id ORDER BY c.list_price LIMIT 1) AS d FROM products p ORDER BY 1", True),
+        ("LIMIT 1 alone, one row each", "SELECT p.product_id, (SELECT c.list_price FROM price_changes c WHERE c.product_id = p.product_id LIMIT 1) AS v FROM products p WHERE p.product_id IN (1, 3) ORDER BY 1", True),
+    ]
+    refused = [  # (name, text): 21000 on all three
+        ("a product with two changes", f"SELECT p.product_id, {one} AS np FROM products p"),
+        ("in a WHERE, a product with two changes", f"SELECT p.product_id FROM products p WHERE {one} > 0"),
+        ("reading no outer row", "SELECT (SELECT c.list_price FROM price_changes c) AS v"),
+    ]
+    checks, info = {}, {}
+    pg16 = Pg16("onerow", setup)
+    duck = duckdb.connect()
+    for s_ in setup:
+        duck.execute(s_)
+    lake = new_lake()
+    node = Node(lake, A.port).start()
+    for s_ in setup:
+        sql(A.port, s_)
+    def rows_of_pondra(text):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=120)
+        c.request("POST", "/sql?format=csv", text.encode())
+        r = c.getresponse()
+        body = r.read().decode()
+        assert r.status == 200, body[:300]
+        return [tuple(row) for row in list(csv.reader(io.StringIO(body)))[1:]]
+    def rows_of_duck(text):
+        return [tuple("" if v is None else str(v) for v in r) for r in duck.execute(text).fetchall()]
+    key = lambda rows: sorted(rows, key=repr)
+    for name, text, ordered in cases:
+        got = rows_of_pondra(text)
+        info[name] = got
+        checks[f"{name}: == Postgres 16's answer ({len(got)} rows)"] = pg16.same(text, got, ordered)
+        want = rows_of_duck(text)
+        checks[f"{name}: == DuckDB's answer"] = (got == want) if ordered else key(got) == key(want)
+    for name, text in refused:
+        status, state, body = _sqlstate_of(A.port, text)
+        info[f"refused: {name}"] = [status, state, body[:200]]
+        pg_state = pg16.answer(text).get("error", [None])[0]
+        try:
+            duck.execute(text).fetchall()
+            duck_refused = False
+        except duckdb.Error as e:
+            duck_refused = "More than one row returned by a subquery" in str(e)
+        checks[f"refused with 21000 as Postgres 16 refuses it: {name}"] = status >= 400 and state == "21000" == pg_state and "more than one row returned by a subquery" in body.lower()
+        checks[f"refused by DuckDB too: {name}"] = duck_refused
+    # An UPDATE whose SET is such a subquery: the products asked for take their one change; one asking for a product with
+    # two changes is refused, 21000, and changes nothing. The products' rows after each equal Postgres 16's.
+    applied = "UPDATE products SET list_price = (SELECT c.list_price FROM price_changes c WHERE c.product_id = products.product_id) WHERE product_id IN (1, 3)"
+    too_many = "UPDATE products SET list_price = (SELECT c.list_price FROM price_changes c WHERE c.product_id = products.product_id) WHERE product_id IN (1, 2)"
+    latest_set = "UPDATE products SET list_price = (SELECT c.list_price FROM price_changes c WHERE c.product_id = products.product_id ORDER BY c.day DESC LIMIT 1) WHERE product_id = 4"
+    after = "SELECT product_id, list_price FROM products ORDER BY product_id"
+    sql(A.port, applied)
+    pg16.answer(applied)
+    got_applied = rows_of_pondra(after)
+    checks["UPDATE … SET = (subquery of the row): 1 takes 11, 3 none (NULL), as Postgres 16"] = pg16.same(after, got_applied, True) and got_applied == [("1", "11"), ("2", "20"), ("3", ""), ("4", "40")]
+    status, state, body = _sqlstate_of(A.port, too_many)
+    pg_state = pg16.answer(too_many).get("error", [None])[0]
+    got_refused = rows_of_pondra(after)
+    info["update"] = [got_applied, [status, state, body[:200]], got_refused]
+    checks["an UPDATE whose subquery gives a row two rows is refused with 21000, as Postgres 16, and changes nothing"] = status >= 400 and state == "21000" == pg_state and got_refused == got_applied
+    sql(A.port, latest_set)
+    pg16.answer(latest_set)
+    got_latest = rows_of_pondra(after + " ")  # (another text: Postgres's answer after this UPDATE is recorded on its own)
+    checks["UPDATE … SET = (… ORDER BY … LIMIT 1): 4 takes its latest, 42, as Postgres 16"] = pg16.same(after + " ", got_latest, True) and got_latest[3] == ("4", "42")
+    node.kill()
+    pg16.close()
+    ok = all(checks.values())
+    print(json.dumps({"onerow": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} one-row subquery checks"
+
+
 def _sqlstate_of(port, text):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
     c.request("POST", "/sql", text.encode())
@@ -29382,7 +29473,7 @@ SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 175, "scal
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, connections, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns, recursive, extensions, synced, agents)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, connections, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, onerow, jsonfns, recursive, extensions, synced, agents)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -29583,7 +29674,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns", "recursive", "extensions", "synced", "agents"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "onerow", "jsonfns", "recursive", "extensions", "synced", "agents"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -29596,7 +29687,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "onerow": onerow, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

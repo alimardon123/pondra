@@ -20,8 +20,8 @@
       follower's flush is always in flight.
 
   upgrade_check.py guests [--s3]
-      `pondra sql` writing alone moves a lake in a folder to this build's format as it opens; with --s3, it never moves a
-      lake in a bucket, whose cluster's followers it can't hear.
+      `pondra sql` writing alone never moves a lake made before to this build's format, in a folder or (with --s3) in a
+      bucket, so a node of the release before still serves it; a folder lake it makes starts at this build's format.
 
   upgrade_check.py lakes,format (any of lakes, format, drain, rolling, guests, comma-separated; all of them by default)
 
@@ -717,11 +717,12 @@ def format_check(new_bin, work, port, old=None):
 
 
 def guests_check(new_bin, work, port):
-    """`pondra sql` writing on a lake no node serves, which it leads alone (ADR-039): a lake in a local folder moves to this
-    build's column lists (format 6) as it opens, and a lake in a bucket never does (with --s3): a cluster's followers may be
-    serving it in a leader gap, which `pondra sql` can't hear. A bucket's lake moves on only by its server's leader. Each
-    lake is made at format 5 (a build posing as one before the column lists); a node of format 5 then opens it again, or
-    is refused it by name."""
+    """`pondra sql` writing on a lake no node serves, which it leads alone (ADR-039): a lake made before never moves to this
+    build's column lists (format 6) by it, in a local folder or in a bucket (with --s3), since a node of the release before
+    may serve it again (11-07 audit L2: one `pondra sql` raised a folder for good, and a 0.80 server was refused it). Such a
+    lake moves on only by its server's leader. Each lake is made at format 5 (a build posing as one before the column
+    lists); a node of format 5 then serves it again. A folder lake `pondra sql` makes starts at format 6, as a node's does,
+    and a node of format 5 is refused it by name."""
     checks, info = {}, {}
     five = {"PONDRA_TEST_FORMAT": "5", "PONDRA_SECRET_KEY": ""}
     fmt = lambda n: n.get("/stats", timeout=5)["format"]
@@ -743,13 +744,26 @@ def guests_check(new_bin, work, port):
             got = {"refused": o.said()[-300:]}
         o.stop("kill")
         info[where] = {"made at": made, "then": got}
+        kept = made < LISTS and got.get("format") == made and got.get("rows") == [{"x": 1, "y": "a"}, {"x": 2, "y": "a"}]
         if where == "folder":
-            checks["pondra sql writing alone moves a lake in a folder to its tables' column lists (format 6) as it opens: a node of format 5 is then refused it by name"] = \
-                made < LISTS and "format 6" in got.get("refused", "") and "run Pondra" in got.get("refused", "")
+            checks["pondra sql writing alone never moves a folder's lake made before to its tables' column lists (format 6): it stays at format 5, and a node of format 5 still serves it"] = kept
         else:
-            checks["…and never a lake in a bucket, whose cluster's followers it can't hear: it stays at format 5, and a node of format 5 still serves it"] = \
-                made < LISTS and got.get("format") == made and got.get("rows") == [{"x": 1, "y": "a"}, {"x": 2, "y": "a"}]
+            checks["…nor a lake in a bucket, whose cluster's followers it can't hear"] = kept
             gone(lake)
+    # A folder lake `pondra sql` makes: no release before has read it, so it starts at this build's format, as a node's does.
+    fresh = os.path.join(work, "guests-fresh")
+    same_keys = {**os.environ, **{k: v for k, v in five.items() if k != "PONDRA_TEST_FORMAT"}}  # (this build's format, the keys the node below has)
+    made_fresh = subprocess.run([new_bin, "sql", "--dir", fresh, "CREATE TABLE t (x INT)"], capture_output=True, text=True, timeout=300, env=same_keys)
+    o = Node(new_bin, fresh, port, work, env=five, token=False)
+    try:
+        o.start()
+        got = {"format": fmt(o)}
+    except Failed:
+        got = {"refused": o.said()[-300:]}
+    o.stop("kill")
+    info["made by pondra sql"] = {"exit": made_fresh.returncode, **got}
+    checks["…and a folder lake pondra sql makes starts at format 6: a node of format 5 is refused it by name"] = \
+        made_fresh.returncode == 0 and "format 6" in got.get("refused", "") and "run Pondra" in got.get("refused", "")
     # A RESTORE by this build into a new folder, of a backup a node of format 5 took: the new place is led for the moment by
     # `pondra lead`, which doesn't raise it, so its entries are written in format 5's shape under the backup's own mark (below
     # 6), and a node of format 5 serves it with the same rows (going back to 0.80 after a restore by main).

@@ -11,6 +11,7 @@
 //! the provider says `POSTGRES 'oauth'`, through OAUTHBEARER, which psql 18 fetches itself (ADR-074).
 //! Each statement runs as whoever signed in (`auth::WHO`).
 use crate::pg_types::Ty;
+use crate::answer::Kind;
 use crate::app::App;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
@@ -416,9 +417,9 @@ impl Backend {
         crate::dialect_stmts::refused(sql).map_err(user_error)?; // (as every door refuses them: `dialect_stmts.rs`)
         if let Some(c) = crate::vars::change(sql) {
             // DECLARE $day …, $day = …: this connection's variable (`vars.rs`)
-            let tag = c.tag();
+            let kind = c.kind();
             Box::pin(crate::vars::apply(&self.app, c)).await.map_err(user_error)?;
-            return Ok(Response::Execution(Tag::new(tag)));
+            return Ok(Response::Execution(tag(&kind, None)));
         }
         let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: its value; `$1` is the protocol's)
         let bound = self.placed(bound.into_owned()).await?; // (the session's search path: full names, ahead of the key lookup)
@@ -433,14 +434,15 @@ impl Backend {
             // BEGIN, COMMIT, ROLLBACK: this connection's transaction (ADR-036 §5)
             let answer = crate::txn::command(&self.app, word, statement).await;
             crate::cursors::sweep(); // (a COMMIT or ROLLBACK ends the cursors without HOLD: their answers go now, refused or not)
-            let (tag, warning) = answer.map_err(user_error)?;
+            let (words, warning) = answer.map_err(user_error)?;
             warning.iter().for_each(|w| crate::routines::heard(&format!("WARNING: {w}")));
             // (the client sees each one in ReadyForQuery's status: a savepoint leaves the transaction open, ROLLBACK TO
             // reopens it after a failure, and only BEGIN and COMMIT or ROLLBACK start and end it)
-            return Ok(match word {
-                "BEGIN" | "ROLLBACK TO" => Response::TransactionStart(Tag::new(tag)),
-                "SAVEPOINT" | "RELEASE" => Response::Execution(Tag::new(tag)),
-                _ => Response::TransactionEnd(Tag::new(tag)),
+            let kind = Kind::new(words);
+            return Ok(match crate::txn::word_change(word) {
+                Some(crate::answer::Txn::Started) => Response::TransactionStart(tag(&kind, None)),
+                None => Response::Execution(tag(&kind, None)),
+                Some(crate::answer::Txn::Ended) => Response::TransactionEnd(tag(&kind, None)),
             });
         }
         let reader = crate::auth::current().is_some_and(|p| p.role >= crate::auth::Role::Read);
@@ -483,18 +485,18 @@ impl Backend {
                 crate::cursors::Answer::Rows(batches) => {
                     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
                     let mut answer = rows(&schema, batches, format)?;
-                    answer.command_tag = "FETCH".into(); // (its command tag: "FETCH n", the rows counted as they go out)
+                    answer.command_tag = Kind::new("FETCH").prefix(); // (its command tag: "FETCH n", the rows counted as they go out)
                     Response::Query(answer)
                 }
-                crate::cursors::Answer::Tag(tag) => Response::Execution(Tag::new(&tag)),
+                crate::cursors::Answer::Done(kind, rows) => Response::Execution(tag(&kind, rows)),
             });
         }
         if crate::set::is(&sql) {
             // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: this connection's (round 31)
             return match crate::set::statement(&self.app.lake, &sql).await {
-                Ok(crate::set::Done::Said(tag)) => Ok(Response::Execution(Tag::new(tag))),
+                Ok(crate::set::Done::Said(kind)) => Ok(Response::Execution(tag(&kind, None))),
                 Ok(crate::set::Done::Run(sql)) => Box::pin(self.run(user, &sql, format)).await,
-                Err(_) if crate::text::first_word(&sql).to_uppercase().starts_with("DEALLOCATE") => Ok(Response::Execution(Tag::new("DEALLOCATE"))), // (a statement the protocol prepared: pgwire's)
+                Err(_) if crate::text::first_word(&sql).to_uppercase().starts_with("DEALLOCATE") => Ok(Response::Execution(tag(&Kind::new("DEALLOCATE"), None))), // (a statement the protocol prepared: pgwire's)
                 Err(e) => Err(user_error(e)),
             };
         }
@@ -515,7 +517,7 @@ impl Backend {
                     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
                     Ok(Response::Query(rows(&schema, batches, format)?))
                 }
-                crate::routines::Outcome::Done(_) => Ok(Response::Execution(Tag::new(if crate::routines::do_of(&sql).is_some() { "DO" } else { "CALL" }))),
+                crate::routines::Outcome::Done(_) => Ok(Response::Execution(tag(&Kind::new(if crate::routines::do_of(&sql).is_some() { "DO" } else { "CALL" }), None))),
             };
         }
         if let Some(w) = crate::with_writes::of(&sql) {
@@ -527,16 +529,10 @@ impl Backend {
                     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
                     let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, &bound).await);
                     let mut answer = rows(&schema, batches, format)?;
-                    answer.command_tag = w.tag().into();
+                    answer.command_tag = w.kind().prefix();
                     Response::Query(answer)
                 }
-                crate::routines::Outcome::Done(v) => {
-                    let tag = Tag::new(w.tag().split(' ').next().unwrap_or_default()).with_rows(v["rows"].as_u64().unwrap_or(0) as usize);
-                    Response::Execution(match w.tag().starts_with("INSERT") {
-                        true => tag.with_oid(0),
-                        false => tag,
-                    })
-                }
+                crate::routines::Outcome::Done(v) => Response::Execution(tag(&w.kind(), Some(v["rows"].as_u64().unwrap_or(0)))),
             });
         }
         if let Some(r) = crate::returning::of(&sql) {
@@ -544,20 +540,15 @@ impl Backend {
             let b = Box::pin(crate::returning::run(&self.app, &r, role, false, None)).await.map_err(user_error)?;
             let schema = crate::pg_types::typed(&b.schema(), &crate::pg_types::columns(&self.app.lake, &bound).await);
             let mut answer = rows(&schema, vec![b], format)?;
-            answer.command_tag = r.tag().into();
+            answer.command_tag = r.kind().prefix();
             return Ok(Response::Query(answer));
         }
         if let Some(stmt) = crate::write::parse(&sql) {
             crate::history::parsed(&stmt); // (the history writer takes its table from here: `history::touched`)
             self.app.auth.allows(role, &stmt).map_err(user_error)?;
-            let tag = command_tag(&sql, &stmt);
+            let kind = stmt.kind(&sql);
             let v = crate::write::on_node(&self.app, stmt, None).await.map_err(user_error)?;
-            let rows = v["rows"].as_u64().unwrap_or(0) as usize;
-            return Ok(Response::Execution(match tag.as_str() {
-                "INSERT" => Tag::new("INSERT").with_oid(0).with_rows(rows),
-                "SELECT" | "UPDATE" | "DELETE" | "MERGE" | "COPY" => Tag::new(&tag).with_rows(rows),
-                _ => Tag::new(&tag),
-            }));
+            return Ok(Response::Execution(tag(&kind, Some(v["rows"].as_u64().unwrap_or(0)))));
         }
         let catalog = crate::pg_catalog::wanted(&sql);
         let batches = match catalog {
@@ -880,34 +871,15 @@ fn pg_dialect(lake: &crate::store::Lake, sql: &str, user: &str) -> String {
     sql.replace("version()", "'PostgreSQL 16.0 (Pondra on Apache DataFusion)'") // (current_schema() and current_database() are `path::door`'s, at every door)
 }
 
-/// The command tag Postgres answers a write with: `INSERT 0 3`, `UPDATE 2`, `SELECT 5` for a
-/// CREATE TABLE … AS, `CREATE VIEW`, `DROP TABLE`, `ALTER TABLE` (what clients show, and dbt logs).
-fn command_tag(sql: &str, stmt: &crate::write::Stmt) -> String {
-    use crate::write::Stmt;
-    let words: Vec<String> = crate::text::first_word(sql).split_whitespace().take(6).map(|w| w.to_uppercase()).collect();
-    match stmt {
-        Stmt::Insert(..) | Stmt::InsertInto(..) => return "INSERT".into(),
-        Stmt::Update(..) => return "UPDATE".into(),
-        Stmt::Delete(..) if words.first().is_some_and(|w| w == "TRUNCATE") => return "TRUNCATE TABLE".into(),
-        Stmt::Delete(..) => return "DELETE".into(),
-        Stmt::Merge(_) if words.first().is_some_and(|w| w == "MERGE") => return "MERGE".into(),
-        Stmt::Merge(_) if words.first().is_some_and(|w| w == "INSERT") => return "INSERT".into(),
-        Stmt::Merge(_) => return words.first().cloned().unwrap_or_default(),
-        Stmt::Create(c) if c.query.is_some() => return "SELECT".into(),
-        _ => {}
+/// Postgres's command tag for a statement of `kind` that changed or sent `rows` (`INSERT 0 3`, `UPDATE 2`, `CREATE TABLE`).
+fn tag(kind: &Kind, rows: Option<u64>) -> Tag {
+    let mut t = Tag::new(kind.words());
+    if kind.words() == "INSERT" {
+        t = t.with_oid(0);
     }
-    let skip = ["OR", "REPLACE", "TEMP", "TEMPORARY", "UNLOGGED", "GLOBAL", "LOCAL", "IF", "NOT", "EXISTS"];
-    match words.first().map(String::as_str) {
-        Some(verb @ ("CREATE" | "DROP" | "ALTER")) => {
-            let mut rest = words[1..].iter().filter(|w| !skip.contains(&w.as_str()));
-            match rest.next().map(String::as_str) {
-                Some("MATERIALIZED") => format!("{verb} MATERIALIZED VIEW"),
-                Some(obj) => format!("{verb} {obj}"),
-                None => verb.to_string(),
-            }
-        }
-        Some(w) => w.to_string(),
-        None => "OK".into(),
+    match (kind.counts(), rows) {
+        (true, Some(n)) => t.with_rows(n as usize),
+        _ => t,
     }
 }
 
@@ -930,7 +902,7 @@ fn session_command(sql: &str) -> Option<Response> {
     match first.as_str() {
         "START" if crate::routines::start_of(sql).is_some() => None, // (`START CALL p(…)`: a run started)
         "SET" | "RESET" | "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "DISCARD" | "DEALLOCATE" | "CLOSE" if !commented => {
-            Some(Response::Execution(Tag::new(&first)))
+            Some(Response::Execution(tag(&Kind::new(first.clone()), None)))
         }
         "SHOW" if show_column(sql).is_some() => {
             let (name, column) = show_column(sql)?;
@@ -1405,7 +1377,7 @@ impl CopyHandler for Backend {
         p.load.end(loaded.as_ref().err().map(said));
         loaded?;
         // (written with the ReadyForQuery that follows: pgwire's, or the Sync's in the extended protocol)
-        client.feed(PgWireBackendMessage::CommandComplete(Tag::new("COPY").with_rows(p.rows as usize).into())).await?;
+        client.feed(PgWireBackendMessage::CommandComplete(tag(&Kind::new("COPY"), Some(p.rows)).into())).await?;
         Ok(())
     }
 

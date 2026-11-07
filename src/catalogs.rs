@@ -25,7 +25,7 @@ pub static ICEBERG: crate::registry::BuiltIn = crate::registry::BuiltIn {
     register: |r| r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES),
 };
 
-static TABLES: crate::connections::ConnectionType = {
+const TABLES: crate::connections::ConnectionType = {
     use crate::connections::{ConnectionType, Holds, Opt, READ_ONLY, SECRET, URL};
     ConnectionType {
         name: "iceberg",

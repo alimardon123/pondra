@@ -37,7 +37,8 @@ pub fn words(e: &anyhow::Error) -> String {
             out += &c;
         }
     }
-    crate::ext_names::readable(&SPILL_SAYS.iter().fold(out, |out, (from, to)| out.replace(from, to))) // (DataFusion's words for spilling, in the setting Pondra asks for; files as SQL named them)
+    let out = SPILL_SAYS.iter().chain(POSTGRES_SAYS).fold(out, |out, (from, to)| out.replace(from, to));
+    crate::ext_names::readable(&out) // (DataFusion's words for spilling, in the setting Pondra asks for, and in Postgres's words; files as SQL named them)
 }
 
 /// The SQL parser's error, which DataFusion says twice (`SQL error: ParserError("…")`, then its source's `sql parser
@@ -86,6 +87,10 @@ const SPILL_SAYS: &[(&str, &str)] = &[
     ("Please try increasing the config: `datafusion.runtime.max_temp_directory_size`.", "Raise PONDRA_SPILL_GB to let it spill more."),
     ("(DiskManager is disabled)", DISABLED),
 ];
+
+/// DataFusion's words for what Postgres says otherwise, said in Postgres's words: a client (or an agent) that knows them
+/// reads one error at every door. A scalar subquery that gives more than one row is 21000 either way (`by_words`).
+const POSTGRES_SAYS: &[(&str, &str)] = &[("Scalar subquery returned more than one row", "more than one row returned by a subquery used as an expression")];
 
 /// What a spill that is off says, in the setting a user can change: a page's query pool, `memory_gb`, or a node's `PONDRA_SPILL_GB`.
 #[cfg(target_arch = "wasm32")]
@@ -168,6 +173,7 @@ fn by_words(text: &str) -> &'static str {
     match () {
         _ if has("could not serialize") => "40001",                                             // serialization_failure
         _ if has("cannot insert a non-default value") || has("can only be updated to default") => "428C9", // generated_always
+        _ if has("more than one row returned by a subquery") || has("scalar subquery returned more than one row") => "21000", // cardinality_violation (`one_row::MANY`; DataFusion's and spmd's words for one that reads no outer row)
         _ if has("nextval: reached") => "2200H",                                                // sequence_generator_limit_exceeded
         _ if has("is not yet defined in this session") => "55000",                              // object_not_in_prerequisite_state
         _ if has("is not a variable which can be viewed with 'show'") => "42704",                // undefined_object (Postgres: unrecognized configuration parameter)

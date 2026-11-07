@@ -139,10 +139,12 @@ stop, and a 24-hour soak (C4). Where things stood:
   heartbeats and the commit streams' `x-pondra-format`, after two leases), and a change an
   older release would read wrongly is written only at its format. `upgrade_check.py format`
   ("…no further") fails if the leader raises past a follower. A form that leads a lake alone
-  (`pondra sql`, a program's node) hears no follower: it moves a lake in memory or a local folder
-  to this build's format as it opens (`format::alone`), and never a lake in a bucket, whose
-  cluster's followers it can't hear in a leader gap. A bucket's lake moves on only by its server's
-  leader. `upgrade_check.py guests` ("…and never a lake in a bucket", with `--s3`).
+  (`pondra sql`, a program's node) hears no follower: it moves on only a lake no older release has
+  read, one in memory or one it made in a local folder (`format::alone`). A folder's lake made
+  before stays, since a node of the release before may serve it again after a restart (11-07 audit
+  L2), and so does a bucket's, whose cluster's followers it can't hear in a leader gap. Those move
+  on only by their server's leader. `upgrade_check.py guests` ("…never moves a folder's lake made
+  before", "…nor a lake in a bucket" with `--s3`).
 - **Below a format, nothing an older node reads is in the newer shape.** A table's entry is written
   in the shape it was read in, and a new one in the older shape, until its lake is format 6
   (`store::Record`; `Catalog::write` gives each `t/` entry its lake's shape as it commits). That
