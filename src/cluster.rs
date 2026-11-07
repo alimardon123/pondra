@@ -32,12 +32,6 @@ use std::time::{Duration, Instant};
 const STARTUP: Duration = Duration::from_secs(30); // a new leader may need this long to open the catalog
 const CUT_OFF: Duration = Duration::from_secs(15); // a leader that hasn't reached the bucket this long steps aside
 pub const CUT_OFF_HEADER: &str = "x-pondra-cut-off"; // (a heartbeat's answer from a leader cut off)
-// A follower's flush its leader didn't take (`log.rs`): the follow loop asks the leader at once, not at its next beat.
-crate::per_node!(static UNTAKEN: tokio::sync::Notify = tokio::sync::Notify::new(); clear = |_| ());
-
-/// A flush this follower sent its leader went unanswered (the connection refused or closed): a drained leader's door is
-/// closing, and it steps down a moment later. The follow loop asks it again now, then every tenth of a second.
-pub fn flush_untaken() { UNTAKEN.notify_one() }
 
 pub struct Cluster {
     pub addr: String, // a node is known by its address
@@ -266,12 +260,12 @@ impl Cluster {
                 // A drained leader closes its door, then steps down (`node::run::Held::stop`): its followers take over
                 // then, not at their next beat up to a second on (invariant 210). So a beat unanswered is asked again
                 // every tenth of a second while the leader's lease lasts, and a flush the leader didn't take
-                // (`flush_untaken`) asks at once. Each look asks the bucket one HEAD (`stepped_down`). Past the lease,
+                // (`log::untaken_flush`) asks at once. Each look asks the bucket one HEAD (`stepped_down`). Past the lease,
                 // once a second again: a takeover's own questions (a peer, the bucket's newest term) are never asked faster.
                 let pause = if missed && self.leader_ok() { Duration::from_millis(100) } else { Duration::from_secs(1) };
                 tokio::select! {
                     _ = tokio::time::sleep(pause) => {}
-                    _ = UNTAKEN.notified(), if self.leader_ok() => {}
+                    _ = crate::log::untaken_flush(), if self.leader_ok() => {}
                 }
                 let url = crate::tls::url(&format!("{}/cluster/beat?from={}", self.leader.addr, self.addr));
                 let answer = http().post(url).timeout(Duration::from_secs(2)).send().await;

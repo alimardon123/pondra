@@ -224,12 +224,16 @@ impl To {
     }
 }
 
-/// A flush this follower sent its leader went unanswered: its follow loop asks the leader now (`cluster::flush_untaken`).
-/// A page follows no leader over the network.
-fn untaken() {
-    #[cfg(feature = "doors")]
-    crate::cluster::flush_untaken();
-}
+// A follower's flush its leader didn't take: its follow loop (`cluster::Cluster::follow`) asks the leader at once, not at its
+// next beat. (Here, not in `cluster`, which this layer doesn't reach: the follow loop waits on it.)
+crate::per_node!(static UNTAKEN: tokio::sync::Notify = tokio::sync::Notify::new(); clear = |_| ());
+
+/// A flush this follower sent its leader went unanswered (the connection refused or closed): a drained leader's door is
+/// closing, and it steps down a moment later. Its follow loop asks it again now, then every tenth of a second.
+fn untaken() { UNTAKEN.notify_one() }
+
+/// Waits for a flush the leader didn't take (`untaken`), for the follow loop.
+pub async fn untaken_flush() { UNTAKEN.notified().await }
 
 /// The leader's answer to a flush, or the refusal of one that doesn't lead (421, `server::commit`): made before any
 /// sequencer took it, so its writes are refused as never run (57P03), and their clients send them again, to this node once
