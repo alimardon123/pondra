@@ -36,17 +36,38 @@ pub struct Opt {
     pub about: &'static str,
 }
 
+/// Where it is: a Files type's folder, a Tables type's catalog or table folder, brokers…
+pub const URL: Opt = Opt { name: "url", required: true, about: "where it is" };
+/// The secret it signs in with, by its name: its value is the secret's, never the connection's.
+pub const SECRET: Opt = Opt { name: "secret", required: false, about: "the secret it signs in with, by name" };
+/// Read only: nothing is written through it.
+pub const READ_ONLY: Opt = Opt { name: "read_only", required: false, about: "nothing is written through it" };
+
 /// A type of connection.
 pub struct ConnectionType {
     pub name: &'static str,
     pub holds: Holds,
-    /// Its options, beside `secret`, which every type that names `secret_types` takes.
+    /// Every option it takes, `url` and `secret` among them, in the order a refusal lists them.
     pub options: &'static [Opt],
-    /// The schemes its `url` may have (`s3` for `s3://bucket/…`); empty: a folder's path, with no scheme or `file`.
+    /// The schemes its `url` may have (`s3` for `s3://bucket/…`; `""` for a path with no scheme, a folder's); empty:
+    /// any, the type's own reader checks it (a Delta table's folder is in a bucket or on the machine).
     pub schemes: &'static [&'static str],
-    /// The types of secret it may name (`CREATE SECRET … (TYPE s3, …)`); empty: it takes none.
+    /// The types of secret its `secret` may name (`CREATE SECRET … (TYPE s3, …)`); empty: it takes none.
     pub secret_types: &'static [&'static str],
     pub about: &'static str,
+}
+
+impl ConnectionType {
+    /// Its options' names, in their order.
+    pub fn option_names(&self) -> Vec<&'static str> {
+        self.options.iter().map(|o| o.name).collect()
+    }
+
+    /// Is its url's scheme one it takes? (`memory://x`'s is `memory`; a path's is `""`.)
+    pub fn reaches(&self, url: &str) -> bool {
+        let scheme = url.split_once("://").map_or(String::new(), |(s, _)| s.to_lowercase());
+        self.schemes.is_empty() || self.schemes.contains(&scheme.as_str()) || (scheme == "file" && self.schemes.contains(&""))
+    }
 }
 
 /// The registry's connection types: each one's name once.
@@ -75,4 +96,25 @@ impl ConnectionTypes {
 /// This build's connection types.
 pub fn types() -> &'static [&'static ConnectionType] {
     crate::registry::get().find::<ConnectionTypes>().map_or(&[], |t| t.all())
+}
+
+/// This build's type of that name.
+pub fn find(name: &str) -> Option<&'static ConnectionType> {
+    types().iter().find(|t| t.name == name).copied()
+}
+
+/// The names of this build's types that pass `which`, in words and in order: "delta, iceberg, kafka or share".
+pub fn named(which: impl Fn(&ConnectionType) -> bool) -> String {
+    let mut all: Vec<&str> = types().iter().filter(|t| which(t)).map(|t| t.name).collect();
+    all.sort_unstable();
+    match all.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.to_string(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
+/// Does ATTACH attach a type's tables as a database? Those that hold tables or messages (a topic is read as a table).
+pub fn attached(t: &ConnectionType) -> bool {
+    matches!(t.holds, Holds::Tables | Holds::Messages)
 }

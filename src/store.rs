@@ -4395,7 +4395,6 @@ mod tests {
 
     /// A catalog its own node's stop closed answers an error, never a restart (invariant 300):
     /// taken for a fence, the write below would exec this test again.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closed_by_its_own_stop_is_no_fence() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-closed-{}", uuid::Uuid::new_v4()));
@@ -4412,7 +4411,6 @@ mod tests {
 
     /// A catalog closed under its node (a newer leader's fence) restarts that node by the lifecycle its lake was handed, never
     /// the process: of two nodes in one process (step 2's gate), the other is told nothing and goes on writing.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fence_restarts_the_node_its_catalog_was_opened_in_and_no_other() -> Result<()> {
         /// A node's lifecycle that writes down what it was told, and unwinds on a restart as a library's node does.
@@ -4458,7 +4456,6 @@ mod tests {
     /// e-tag a put or a head gave goes through, and the next with the e-tag that one gave too; an old e-tag, a
     /// missing object and two updates racing on one e-tag are refused as S3 refuses them; an update with an
     /// attribute is refused by name and changes nothing; creates and overwrites are as they were.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_folder_takes_conditional_overwrites() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-local-{}", uuid::Uuid::new_v4()));
@@ -4503,7 +4500,6 @@ mod tests {
 
     /// A table entry is parsed once for its bytes: the same bytes (in the same buffer or another) give the
     /// same parse, changed bytes a new one, and what is kept stays under its count and byte bounds.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_table_entry_is_parsed_once_per_version() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-parsed-{}", uuid::Uuid::new_v4()));
@@ -4542,7 +4538,6 @@ mod tests {
     /// entries, in other buffers, gives the same parses; changed bytes a new one; bad bytes an error; each entry
     /// is charged its parsed form too, within the bounds; and a sweep bigger than the cache leaves it as it was.
     /// Prints what a pass over 5,000 entries costs parsed and kept.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_segment_entry_is_parsed_once_per_version() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-segments-{}", uuid::Uuid::new_v4()));
@@ -4588,7 +4583,6 @@ mod tests {
 
     /// `recent_inline` answers a `d/` key that one of the last 64 commits wrote, and no other key: the
     /// frames are sent by hand, as the commit loop would send them, so no commit has to wait for it.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recent_inline_answers_the_last_64_commits() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-recent-{}", uuid::Uuid::new_v4()));

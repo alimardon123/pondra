@@ -3,7 +3,7 @@
 //! the whole extension: its kind, its statements and its types, each an entry in the registry, so the core lists,
 //! shows, describes and grants connections with no edit of its own. Its credentials stay in a secret, which it names;
 //! SHOW CREATE and `pondra.objects` show that name, never a value.
-use crate::connections::{ConnectionType, ConnectionTypes, Holds, Opt};
+use crate::connections::{ConnectionType, ConnectionTypes, Holds, SECRET, URL};
 use crate::objects::{Kind, Kinds, OnClone};
 use crate::registry::BuiltIn;
 use crate::statements::{Parsed, Right, Run, Statement, Statements};
@@ -54,16 +54,15 @@ const CREATE_OR_REPLACE: Statement = Statement { words: &["CREATE", "OR", "REPLA
 const ALTER: Statement = Statement { words: &["ALTER", "CONNECTION"], parse: altered, run: Run::Leader(change), right: Right::Admin, needs: &[], about: "changes a connection: ALTER CONNECTION [IF EXISTS] name SET (option = value, …) | RESET (option, …) | RENAME TO new_name", extension: "connections" };
 const DROP: Statement = Statement { words: &["DROP", "CONNECTION"], parse: dropped, run: Run::Leader(remove), right: Right::Admin, needs: &[], about: "drops a connection: DROP CONNECTION [IF EXISTS] name", extension: "connections" };
 
-const URL: Opt = Opt { name: "url", required: true, about: "where it is" };
-
-/// The types for places Pondra reaches today: buckets, a folder, and another node's served store. Tables, messages and
-/// calls come as their own entries (l1-wip/step4-plan.md, piece 3).
+/// The types for files Pondra reaches today: buckets, a folder, and another node's served store. A type for tables or
+/// messages is its own extension's entry (`delta`, `iceberg`, `kafka`, `share`), so ATTACH and CREATE CONNECTION list the
+/// same types.
 static TYPES: &[&ConnectionType] = &[
-    &ConnectionType { name: "s3", holds: Holds::Files, options: &[URL], schemes: &["s3"], secret_types: &["s3", "r2"], about: "an S3 bucket, or one that speaks S3 (R2, MinIO): url = 's3://bucket/folder'" },
-    &ConnectionType { name: "gcs", holds: Holds::Files, options: &[URL], schemes: &["gs"], secret_types: &["gcs"], about: "a Google Cloud Storage bucket: url = 'gs://bucket/folder'" },
-    &ConnectionType { name: "azure", holds: Holds::Files, options: &[URL], schemes: &["az", "abfs", "abfss"], secret_types: &["azure"], about: "an Azure Blob Storage or Data Lake container: url = 'az://container/folder'" },
-    &ConnectionType { name: "folder", holds: Holds::Files, options: &[URL], schemes: &[], secret_types: &[], about: "a folder on the machine, for a lake in a folder: url = '/data/drop'" },
-    &ConnectionType { name: "pondra", holds: Holds::Files, options: &[URL], schemes: &["pondra"], secret_types: &["pondra"], about: "the store another Pondra node serves: url = 'pondra://host:7070/folder'" },
+    &ConnectionType { name: "s3", holds: Holds::Files, options: &[URL, SECRET], schemes: &["s3"], secret_types: &["s3", "r2"], about: "an S3 bucket, or one that speaks S3 (R2, MinIO): url = 's3://bucket/folder'" },
+    &ConnectionType { name: "gcs", holds: Holds::Files, options: &[URL, SECRET], schemes: &["gs"], secret_types: &["gcs"], about: "a Google Cloud Storage bucket: url = 'gs://bucket/folder'" },
+    &ConnectionType { name: "azure", holds: Holds::Files, options: &[URL, SECRET], schemes: &["az", "abfs", "abfss"], secret_types: &["azure"], about: "an Azure Blob Storage or Data Lake container: url = 'az://container/folder'" },
+    &ConnectionType { name: "folder", holds: Holds::Files, options: &[URL], schemes: &[""], secret_types: &[], about: "a folder on the machine, for a lake in a folder: url = '/data/drop'" },
+    &ConnectionType { name: "pondra", holds: Holds::Files, options: &[URL, SECRET], schemes: &["pondra"], secret_types: &["pondra"], about: "the store another Pondra node serves: url = 'pondra://host:7070/folder'" },
 ];
 
 /// A connection as the catalog keeps it (`cn/<name>`): its type and its options, the secret's name among them.
@@ -238,8 +237,7 @@ fn dropped(sql: &str) -> Result<Parsed> {
 // ---------------------------------------------------------------- the statements, carried out by the leader
 
 fn type_names() -> String {
-    let all: Vec<&str> = crate::connections::types().iter().map(|t| t.name).collect();
-    format!("this build's types are {}", all.join(", "))
+    format!("this build's types are {}", crate::connections::named(|_| true))
 }
 
 /// A definition as it may be kept: its type is one this build has, its options are the type's, and the secret it names is
@@ -247,10 +245,7 @@ fn type_names() -> String {
 async fn checked(lake: &Lake, name: &str, d: &Definition) -> Result<()> {
     let t = crate::connections::types().iter().find(|t| t.name == d.ty).copied();
     let t: &ConnectionType = t.ok_or_else(|| invalid(format!("CREATE CONNECTION {name} TYPE {}: {}", d.ty, type_names())))?;
-    let mut known: Vec<&str> = t.options.iter().map(|o| o.name).collect();
-    if !t.secret_types.is_empty() {
-        known.push("secret");
-    }
+    let known = t.option_names();
     if let Some(k) = d.options.keys().find(|k| !known.contains(&k.as_str())) {
         return Err(invalid(format!("a TYPE {} connection has no option {k}: its options are {}", t.name, known.join(", "))));
     }
@@ -259,25 +254,19 @@ async fn checked(lake: &Lake, name: &str, d: &Definition) -> Result<()> {
     }
     if let Some(url) = d.options.get("url") {
         let url = url.as_str().ok_or_else(|| invalid(format!("url is a string: {}", t.about)))?;
-        let scheme = url.split_once("://").map(|(s, _)| s.to_lowercase());
-        match (&scheme, t.schemes.is_empty()) {
-            (None, true) => {}
-            (Some(s), true) if s == "file" => {}
-            (Some(s), false) if t.schemes.contains(&s.as_str()) => {}
-            _ => return Err(invalid(format!("{url}: {}", t.about))),
+        if !t.reaches(url) {
+            return Err(invalid(format!("{url}: {}", t.about)));
         }
-        if t.schemes.is_empty() {
-            // (every node must reach it: a lake in a bucket is served by nodes on other machines)
-            if !matches!(crate::store::place(&lake.url), Ok(crate::store::Place::Folder)) {
-                return Err(invalid("a TYPE folder connection is for a lake in a folder: this lake's nodes may run on other machines, so name a bucket, or a node's served store (TYPE pondra)".into()));
-            }
+        // (every node must reach a folder: a lake in a bucket is served by nodes on other machines)
+        if t.schemes == [""] && !matches!(crate::store::place(&lake.url), Ok(crate::store::Place::Folder)) {
+            return Err(invalid("a TYPE folder connection is for a lake in a folder: this lake's nodes may run on other machines, so name a bucket, or a node's served store (TYPE pondra)".into()));
         }
     }
     if let Some(s) = d.options.get("secret") {
         let s = s.as_str().ok_or_else(|| invalid("secret names a secret: secret = name".into()))?;
         let kept = lake.cat.get::<Value>(&crate::ext::secret_key(s)).await?;
         // (on a branch, a secret isn't copied: it is made there, as this says)
-        let kept = kept.ok_or_else(|| coded("42704", format!("no secret {s}: make it first (CREATE SECRET {s} (TYPE {}, …))", t.secret_types[0])))?;
+        let kept = kept.ok_or_else(|| coded("42704", format!("no secret {s}: make it first (CREATE SECRET {s} (TYPE {}, …))", t.secret_types.first().copied().unwrap_or("…"))))?;
         let kind = kept["kind"].as_str().unwrap_or_default();
         if !t.secret_types.contains(&kind) {
             return Err(invalid(format!("secret {s} is of TYPE {kind}: a TYPE {} connection takes a secret of TYPE {}", t.name, t.secret_types.join(" or "))));
@@ -443,7 +432,7 @@ mod tests {
         let lake = lake().await?;
         let (c, e) = code(run(&lake, "CREATE CONNECTION shop TYPE postgres WITH (host = 'db')").await);
         assert_eq!(c, "22023");
-        assert!(e.ends_with("TYPE postgres: this build's types are s3, gcs, azure, folder, pondra"), "{e}");
+        assert!(e.ends_with("TYPE postgres: this build's types are azure, delta, folder, gcs, iceberg, kafka, pondra, s3 or share"), "{e}");
         let (c, e) = code(run(&lake, "CREATE CONNECTION b TYPE s3 WITH (url = 's3://b', region = 'eu')").await);
         assert_eq!((c.as_str(), e.as_str()), ("22023", "a TYPE s3 connection has no option region: its options are url, secret"));
         assert!(code(run(&lake, "CREATE CONNECTION b TYPE s3").await).1.starts_with("a TYPE s3 connection needs url (where it is)"));
@@ -456,6 +445,31 @@ mod tests {
         assert_eq!(code(run(&lake, "CREATE CONNECTION b TYPE s3 WITH (url = 's3://b', secret = k)").await).1, "secret k is of TYPE gcs: a TYPE s3 connection takes a secret of TYPE s3 or r2");
         run(&lake, "CREATE CONNECTION b TYPE gcs WITH (url = 'gs://b/in', secret = k)").await.unwrap();
         assert_eq!(shown("b", &lake.cat.get::<Value>(&key("b")).await?.expect("kept")), "CREATE CONNECTION b TYPE gcs WITH (secret = k, url = 'gs://b/in')");
+        Ok(())
+    }
+
+    /// A type for tables is its own extension's entry (`read_delta`, `catalogs`, `kafka_client`, `sharing_client`), and
+    /// ATTACH reads the same entries: its TYPE list and each type's options are CREATE CONNECTION's.
+    #[tokio::test]
+    async fn attach_and_create_connection_read_one_list_of_types() -> Result<()> {
+        let lake = lake().await?;
+        run(&lake, "CREATE CONNECTION tables TYPE delta WITH (url = 's3://bucket/tables', read_only = true)").await.unwrap();
+        assert_eq!(shown("tables", &lake.cat.get::<Value>(&key("tables")).await?.expect("kept")), "CREATE CONNECTION tables TYPE delta WITH (read_only = true, url = 's3://bucket/tables')");
+        assert_eq!(code(run(&lake, "CREATE CONNECTION k TYPE kafka WITH (url = 's3://b')").await).1, "s3://b: a Kafka cluster, its topics read as tables: url = 'kafka://broker:9092'");
+        let said = |sql: &'static str| {
+            let lake = lake.clone();
+            async move { code(run(&lake, sql).await) }
+        };
+        let types = "delta, iceberg, kafka or share (or a Pondra lake, with no TYPE)";
+        assert_eq!(said("ATTACH 's3://b' AS x (TYPE parquet)").await, ("22023".into(), format!("ATTACH … (TYPE parquet): {types}")));
+        assert_eq!(said("ATTACH 's3://b' AS x (TYPE s3)").await.1, format!("ATTACH … (TYPE s3): {types}"), "a type for files isn't attached");
+        assert_eq!(said("ATTACH 'pg://h' AS x (TYPE postgres)").await.0, "0A000");
+        assert_eq!(said("ATTACH 'kafka://b:9092' AS x (TYPE delta)").await.1, "ATTACH 'kafka://b:9092' … (TYPE delta): a kafka:// URL is TYPE kafka's");
+        assert_eq!(said("ATTACH 's3://b' AS x (TYPE kafka)").await.1, "ATTACH … (TYPE kafka) takes a kafka:// URL: a Kafka cluster, its topics read as tables: url = 'kafka://broker:9092'");
+        assert_eq!(said("ATTACH 's3://b' AS x (TYPE delta, ENDPOINT 'https://c')").await, ("22023".into(), "ATTACH … (TYPE delta) has no option endpoint: secret, read_only (endpoint is TYPE iceberg's)".into()));
+        assert_eq!(said("ATTACH 's3://b' AS x (TYPE iceberg, FORMAT x)").await.1, "ATTACH … (TYPE iceberg) has no option format: endpoint, secret, read_only, endpoint_type, access_delegation_mode");
+        assert_eq!(said("ATTACH 's3://b' AS x (TYPE delta, URL 's3://c')").await.1, "ATTACH … (TYPE delta) has no option url: secret, read_only", "its url is ATTACH's own");
+        assert_eq!(run(&lake, "ATTACH 's3://b/t' AS x (TYPE delta, READ_ONLY)").await.unwrap()[0]["type"], "delta");
         Ok(())
     }
 
@@ -475,7 +489,7 @@ mod tests {
         assert_eq!(tree("ALTER CONNECTION d RESET (url, secret)").2["reset"], j!(["url", "secret"]));
         assert_eq!(tree("DROP CONNECTION IF EXISTS d").0, "DROP CONNECTION");
         for (sql, said) in [
-            ("CREATE CONNECTION d", "CREATE CONNECTION d TYPE t: this build's types are s3, gcs, azure, folder, pondra"),
+            ("CREATE CONNECTION d", "CREATE CONNECTION d TYPE t: this build's types are azure, delta, folder, gcs, iceberg, kafka, pondra, s3 or share"),
             ("CREATE CONNECTION d TYPE s3 WITH (url)", "CREATE [OR REPLACE] CONNECTION [IF NOT EXISTS] name TYPE t [WITH (option = value, …)]"),
             ("ALTER CONNECTION d", "ALTER CONNECTION [IF EXISTS] name SET (option = value, …) | RESET (option, …) | RENAME TO new_name"),
             ("DROP CONNECTION d e", "DROP CONNECTION [IF EXISTS] name"),

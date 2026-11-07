@@ -11,6 +11,19 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+/// The `kafka` extension's type of connection: another Kafka cluster, its topics read as tables
+/// (`ATTACH … (TYPE kafka)`).
+pub static KAFKA: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "kafka",
+    requires: &[],
+    register: |r| r.section_mut::<crate::connections::ConnectionTypes>().add(&TOPICS),
+};
+
+const TOPICS: crate::connections::ConnectionType = {
+    use crate::connections::{ConnectionType, Holds, READ_ONLY, SECRET, URL};
+    ConnectionType { name: "kafka", holds: Holds::Messages, options: &[URL, SECRET, READ_ONLY], schemes: &["kafka"], secret_types: &["kafka"], about: "a Kafka cluster, its topics read as tables: url = 'kafka://broker:9092'" }
+};
+
 const PRODUCE: i16 = 0;
 const FETCH: i16 = 1;
 const LIST_OFFSETS: i16 = 2;
