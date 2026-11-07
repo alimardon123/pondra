@@ -1,333 +1,345 @@
-# Uses that break the floors, as main has them (tools/layers.py --write-baseline).
-# Each redesign step removes some; nothing may add one.
-adopt -> iceberg
-ai -> fetch
-answer -> xlsx
-app -> delta
-app -> dial
-app -> iceberg
-app -> node
-app -> pg_catalog
-audit -> reset
-auth -> crypto
-auth -> origins
-backup -> memory
-branch -> crypto
-branch -> extension
-branch -> memory
-budget -> log
-cache -> bridge
-cache -> panics
-catalogs -> crypto
-catalogs -> fetch
-cluster -> app
-cluster -> auth
-cluster -> format
-cluster -> log
-cluster -> members
-cluster -> node
-cluster -> panics
-cluster -> replica
-cluster -> store
-cluster -> terms
-cluster -> write
-codes -> ext_names
-console -> tls
-constraints -> dial
-copy -> crypto
-copy -> kafka_client
-copy -> write_outside
-cursors -> pg_types
-ddl -> apply
-ddl -> delta
-ddl -> dial
-ddl -> extension
-ddl -> feeds
-ddl -> matches
-ddl -> memory
-ddl -> node
-ddl -> shares
-delta -> iceberg
-delta -> write_outside
-dial -> ext
-dial -> store
-dial -> users
-engine -> pattern
-engine -> pg_bytea
-engine -> pg_json_make
-extension -> crypto
-facts -> measures
-files -> auth
-files -> ext
-files -> panics
-find -> measures
-flight -> drain
-flight -> idle
-flight -> server
-flight -> sso
-flight -> tls
-format -> node
-format -> panics
-friendly -> pg_bytea
-front -> measures
-front -> pattern
-front -> pg_casts
-front -> pg_trace
-front -> sparksql
-git -> crypto
-git -> fetch
-guard -> dial
-history -> node
-history -> reset
-host -> git
-host -> measures
-host -> pg_trace
-iceberg -> delta
-iceberg -> write_outside
-inbox -> backup
-inbox -> node
-inbox -> panics
-inbox -> write
-joined -> ext
-joined -> store
-kafka -> dial
-kafka -> drain
-kafka -> idle
-kafka -> reset
-kafka -> sso
-kafka -> tls
-kafka_client -> crypto
-keep_load -> adopt
-keep_load -> expander
-keep_load -> ext
-keep_load -> ext_names
-keep_load -> tier
-keep_load -> write
-keep_parquet -> adopt
-keep_parquet -> sys
-keep_parquet -> tier
-kv -> fetch
-kv -> node
-kv -> panics
-live -> drain
-locks -> dial
-locks -> drain
-log -> adopt
-log -> backup
-log -> constraints
-log -> copy
-log -> defaults
-log -> dial
-log -> locks
-log -> node
-log -> panics
-log -> rules
-log -> seq
-log -> sys
-log -> tier
-log -> views
-manifest -> branch
-manifest -> crypto
-manifest -> sys
-members -> fetch
-members -> memory
-metrics -> ai
-metrics -> app
-metrics -> budget
-metrics -> hot
-metrics -> jemalloc
-metrics -> spill
-metrics -> store
-objects -> auth
-objects -> authored
-objects -> branch
-objects -> constraints
-objects -> ddl
-objects -> engine
-objects -> expander
-objects -> ext
-objects -> extension
-objects -> facts
-objects -> find
-objects -> index
-objects -> once
-objects -> protect
-objects -> query
-objects -> routines
-objects -> runs
-objects -> seq
-objects -> shares
-objects -> sso
-objects -> sys
-objects -> temp
-objects -> types
-objects -> users
-objects -> views
-objects -> write
-once -> matches
-once -> pattern
-oom -> jemalloc
-oom -> node
-page_records -> dial
-panics -> drain
-panics -> node
-path -> pg_json
-path -> sparksql
-pg -> drain
-pg -> idle
-pg -> sso
-pg -> tls
-pg_json_sets -> measures
-protect -> apply
-public -> ext
-python -> memory
-python -> node
-query -> extension
-query -> matcher
-query -> pattern
-query -> pyfn
-query -> udf
-read_iceberg -> write_outside
-replace -> delta
-replace -> iceberg
-replica -> dial
-replica -> panics
-rerun -> matcher
-rerun -> pattern
-returning -> pg_types
-routines -> apply
-routines -> extension
-routines -> git
-routines -> pg_json
-routines -> pyfn
-routines -> python
-routines -> sparksql
-routines -> workspace
-rules -> pg_bytea
-rules -> pg_casts
-rules -> pg_json
-rules -> pg_json_make
-runs -> apply
-runs -> crypto
-runs -> idle
-runs -> reset
-serve -> pg_casts
-serve -> pg_types
-served -> auth
-served -> store
-server -> apply
-server -> cluster
-server -> console
-server -> drain
-server -> iceberg
-server -> iceberg_rest
-server -> idle
-server -> kafka
-server -> mcp
-server -> memory
-server -> origins
-server -> python
-server -> served
-server -> sharing
-server -> sso
-server -> sso_flow
-server -> tls
-server -> udf
-set -> extension
-shares -> crypto
-shares -> delta
-sharing -> byte_range
-sharing -> read_delta
-sharing -> reset
-sharing -> tls
-sharing_client -> byte_range
-sharing_client -> fetch
-sharing_client -> public
-sharing_client -> read_delta
-sharing_client -> reset
-spill -> reset
-spmd -> dial
-sso -> crypto
-sso -> fetch
-sso_flow -> crypto
-sso_flow -> tls
-statement -> pg_catalog
-statement -> python
-store -> adopt
-store -> audit
-store -> auth
-store -> backup
-store -> branch
-store -> bridge
-store -> budget
-store -> constraints
-store -> copy
-store -> ddl
-store -> delta
-store -> engine
-store -> ext
-store -> ext_names
-store -> extension
-store -> finish
-store -> history
-store -> hot
-store -> in_task
-store -> locks
-store -> memory
-store -> node
-store -> oom
-store -> panics
-store -> query
-store -> rules
-store -> seq
-store -> serve
-store -> served
-store -> spill
-store -> sys
-store -> types
-store -> users
-store -> views
-store -> write
-store_wire -> store
-temp -> python
-terms -> memory
-terms -> panics
-text -> pg_json_make
-tier -> delta
-tier -> dial
-tls -> drain
-tls -> panics
-types -> pg_casts
-users -> crypto
-users -> dial
-users -> shares
-users -> sso
-vars -> workspace
-vend -> crypto
-views -> delta
-views -> matches
-views -> measures
-views -> pattern
-views -> pg_json
-views -> reset
-with_writes -> pg_types
-workspace -> python
-write -> crypto
-write -> delta
-write -> dial
-write -> extension
-write -> iceberg
-write -> memory
-write -> node
-write -> pattern
-write -> pg_types
-write -> shares
-write -> sso
-write -> store_wire
-write -> write_outside
-write_outside -> avro
-write_outside -> catalogs
-write_outside -> delta
-write_outside -> iceberg
-write_outside -> read_delta
-write_outside -> read_iceberg
+# Uses that break the floors, as main has them (tools/layers.py --write-baseline): each edge and how many
+# `crate::` uses it has. Each redesign step removes some; nothing may add an edge or a use along one.
+adopt -> iceberg  5
+ai -> fetch  3
+answer -> xlsx  1
+app -> delta  3
+app -> dial  4
+app -> iceberg  2
+app -> node  2
+app -> pg_catalog  3
+audit -> reset  1
+auth -> crypto  2
+auth -> origins  1
+backup -> memory  1
+branch -> crypto  2
+branch -> extension  1
+branch -> memory  1
+budget -> log  2
+cache -> bridge  10
+cache -> panics  1
+catalogs -> crypto  2
+catalogs -> fetch  1
+cluster -> app  1
+cluster -> auth  1
+cluster -> format  2
+cluster -> log  3
+cluster -> members  1
+cluster -> node  11
+cluster -> panics  7
+cluster -> replica  1
+cluster -> store  2
+cluster -> terms  1
+cluster -> write  1
+codes -> ext_names  1
+console -> tls  1
+constraints -> dial  2
+copy -> crypto  1
+copy -> kafka_client  1
+copy -> write_outside  1
+cursors -> pg_types  2
+ddl -> apply  1
+ddl -> delta  7
+ddl -> dial  2
+ddl -> extension  3
+ddl -> feeds  9
+ddl -> matches  2
+ddl -> memory  5
+ddl -> node  1
+ddl -> shares  7
+delta -> iceberg  3
+delta -> write_outside  1
+dial -> ext  1
+dial -> store  1
+dial -> users  1
+engine -> pattern  2
+engine -> pg_bytea  1
+engine -> pg_json_make  1
+ext -> bridge  1
+ext -> budget  3
+ext -> catalogs  9
+ext -> crypto  8
+ext -> fetch  1
+ext -> kafka_client  2
+ext -> public  6
+ext -> read_delta  2
+ext -> read_iceberg  1
+ext -> sharing_client  2
+extension -> crypto  3
+facts -> measures  2
+files -> auth  4
+files -> ext  1
+files -> panics  1
+find -> measures  1
+flight -> drain  15
+flight -> idle  2
+flight -> server  1
+flight -> sso  3
+flight -> tls  6
+format -> node  2
+format -> panics  2
+friendly -> pg_bytea  6
+front -> measures  5
+front -> pattern  5
+front -> pg_casts  1
+front -> pg_trace  1
+front -> sparksql  1
+git -> crypto  1
+git -> fetch  1
+guard -> dial  2
+history -> node  1
+history -> reset  1
+host -> git  1
+host -> measures  1
+host -> pg_trace  1
+iceberg -> delta  9
+iceberg -> write_outside  1
+inbox -> backup  1
+inbox -> node  1
+inbox -> panics  2
+inbox -> write  1
+joined -> ext  1
+joined -> store  1
+kafka -> dial  5
+kafka -> drain  4
+kafka -> idle  1
+kafka -> reset  1
+kafka -> sso  3
+kafka -> tls  5
+kafka_client -> crypto  7
+keep_load -> adopt  1
+keep_load -> expander  1
+keep_load -> ext  1
+keep_load -> ext_names  2
+keep_load -> tier  1
+keep_load -> write  1
+keep_parquet -> adopt  1
+keep_parquet -> sys  1
+keep_parquet -> tier  3
+kv -> fetch  1
+kv -> node  2
+kv -> panics  3
+lake_files -> ext_names  1
+live -> drain  2
+locks -> dial  2
+locks -> drain  3
+log -> adopt  1
+log -> backup  4
+log -> constraints  3
+log -> copy  2
+log -> defaults  1
+log -> dial  4
+log -> locks  1
+log -> node  1
+log -> panics  4
+log -> rules  4
+log -> seq  6
+log -> sys  5
+log -> tier  1
+log -> views  7
+manifest -> branch  4
+manifest -> crypto  1
+manifest -> sys  1
+members -> fetch  1
+members -> memory  2
+metrics -> ai  3
+metrics -> app  1
+metrics -> budget  1
+metrics -> hot  1
+metrics -> jemalloc  1
+metrics -> spill  1
+metrics -> store  4
+objects -> auth  11
+objects -> authored  2
+objects -> branch  2
+objects -> constraints  1
+objects -> ddl  32
+objects -> engine  1
+objects -> expander  3
+objects -> ext  3
+objects -> extension  1
+objects -> facts  1
+objects -> find  2
+objects -> index  3
+objects -> once  2
+objects -> protect  1
+objects -> query  1
+objects -> routines  2
+objects -> runs  3
+objects -> seq  3
+objects -> shares  7
+objects -> sso  2
+objects -> sys  2
+objects -> temp  1
+objects -> types  6
+objects -> users  2
+objects -> views  6
+objects -> write  11
+once -> matches  1
+once -> pattern  1
+oom -> jemalloc  2
+oom -> node  1
+page_records -> dial  4
+panics -> drain  1
+panics -> node  3
+path -> pg_json  1
+path -> sparksql  1
+pg -> drain  5
+pg -> idle  1
+pg -> sso  6
+pg -> tls  6
+pg_json_sets -> measures  1
+protect -> apply  4
+public -> ext  1
+python -> memory  1
+python -> node  1
+query -> extension  1
+query -> matcher  1
+query -> pattern  1
+query -> pyfn  1
+query -> udf  1
+read_iceberg -> write_outside  1
+replace -> delta  7
+replace -> iceberg  1
+replica -> dial  3
+replica -> panics  1
+rerun -> matcher  1
+rerun -> pattern  1
+returning -> pg_types  1
+routines -> apply  3
+routines -> extension  3
+routines -> git  3
+routines -> pg_json  2
+routines -> pyfn  2
+routines -> python  8
+routines -> sparksql  1
+routines -> workspace  6
+rules -> pg_bytea  1
+rules -> pg_casts  1
+rules -> pg_json  1
+rules -> pg_json_make  6
+runs -> apply  1
+runs -> crypto  2
+runs -> idle  2
+runs -> reset  1
+serve -> pg_casts  1
+serve -> pg_types  2
+served -> auth  7
+served -> memory  1
+served -> store  4
+server -> apply  5
+server -> cluster  6
+server -> console  4
+server -> drain  7
+server -> iceberg  1
+server -> iceberg_rest  1
+server -> idle  4
+server -> kafka  1
+server -> mcp  2
+server -> memory  1
+server -> origins  2
+server -> python  10
+server -> served  2
+server -> sharing  1
+server -> sso  4
+server -> sso_flow  3
+server -> tls  12
+server -> udf  6
+set -> extension  2
+shares -> crypto  1
+shares -> delta  2
+sharing -> byte_range  1
+sharing -> read_delta  3
+sharing -> reset  1
+sharing -> tls  2
+sharing_client -> byte_range  1
+sharing_client -> fetch  5
+sharing_client -> public  4
+sharing_client -> read_delta  1
+sharing_client -> reset  1
+spill -> reset  1
+spmd -> dial  9
+sso -> crypto  6
+sso -> fetch  2
+sso_flow -> crypto  2
+sso_flow -> tls  1
+statement -> pg_catalog  1
+statement -> python  1
+store -> adopt  1
+store -> audit  2
+store -> auth  1
+store -> backup  6
+store -> branch  4
+store -> bridge  1
+store -> budget  2
+store -> constraints  5
+store -> copy  1
+store -> ddl  4
+store -> delta  1
+store -> engine  2
+store -> ext  3
+store -> ext_names  1
+store -> extension  1
+store -> finish  1
+store -> history  2
+store -> hot  2
+store -> in_task  1
+store -> locks  1
+store -> memory  11
+store -> node  4
+store -> oom  2
+store -> panics  4
+store -> query  6
+store -> rules  14
+store -> seq  7
+store -> serve  2
+store -> served  1
+store -> spill  2
+store -> sys  3
+store -> types  11
+store -> users  2
+store -> views  1
+store -> write  1
+store_wire -> store  1
+temp -> python  2
+terms -> memory  5
+terms -> panics  1
+text -> pg_json_make  1
+tier -> delta  1
+tier -> dial  2
+tls -> drain  1
+tls -> panics  2
+types -> pg_casts  1
+users -> crypto  17
+users -> dial  1
+users -> shares  1
+users -> sso  12
+vars -> workspace  1
+vend -> crypto  1
+views -> delta  1
+views -> matches  4
+views -> measures  1
+views -> pattern  1
+views -> pg_json  1
+views -> reset  1
+with_writes -> pg_types  2
+workspace -> python  4
+write -> crypto  1
+write -> delta  5
+write -> dial  13
+write -> extension  2
+write -> iceberg  2
+write -> memory  1
+write -> node  1
+write -> pattern  1
+write -> pg_types  1
+write -> shares  1
+write -> sso  1
+write -> store_wire  1
+write -> write_outside  2
+write_outside -> avro  3
+write_outside -> catalogs  1
+write_outside -> delta  3
+write_outside -> iceberg  4
+write_outside -> read_delta  1
+write_outside -> read_iceberg  7

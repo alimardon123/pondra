@@ -5,10 +5,11 @@ Reads every module of src/, finds the modules it uses (`crate::name`, `use crate
 and checks each use against tools/layers.txt: a module may use its own floor and the floors below
 (base < catalog < engine < extensions < hosts); platform modules are reached only from hosts; an
 extension uses no other extension's modules. Uses that break a rule are listed. With --baseline,
-only those not in tools/layers-baseline.txt fail, so main can't add one while the old ones go.
+an edge not in tools/layers-baseline.txt fails, and so does one with more uses than the baseline counts, so main can't
+add one while the old ones go. Comments and the insides of string literals are not code (`strip_comments`).
 
   python3 tools/layers.py                  # report: counts by rule, every edge
-  python3 tools/layers.py --baseline       # CI: fail on an edge the baseline doesn't have
+  python3 tools/layers.py --baseline       # CI: fail on an edge the baseline doesn't have, or more uses along one
   python3 tools/layers.py --write-baseline # after a step removes edges, record what is left
 """
 import os, re, sys
@@ -79,8 +80,52 @@ def top_names(group):
 
 
 def strip_comments(text):
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    return re.sub(r"//[^\n]*", "", text)
+    """The code alone: comments (`//`, and `/* */` nested as Rust nests them) and the insides of string and char literals
+    (`"…"`, `r#"…"#`, `b"…"`, `'x'`) taken out, newlines kept. A `crate::` in a doc line or a message isn't a use, and a
+    `/*` or `//` inside a string doesn't start a comment (`"s3://…"`, `"*/*"`)."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    if text[i] == "\n":
+                        out.append("\n")
+                    i += 1
+        elif c in "rbc" and not (i and (text[i - 1].isalnum() or text[i - 1] == "_")) and (m := re.match(r'(?:br|cr|r)(#*)"', text[i:])):
+            close = '"' + m.group(1)
+            j = text.find(close, i + m.end())
+            j = n if j < 0 else j + len(close)
+            out.append('""' + "\n" * text.count("\n", i, j))
+            i = j
+        elif c == '"' or (c in "bc" and text.startswith('"', i + 1) and not (i and (text[i - 1].isalnum() or text[i - 1] == "_"))):
+            i += 1 if c == '"' else 2
+            start = i
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            out.append('""' + "\n" * text.count("\n", start, i))
+            i += 1
+        elif c == "'":
+            # a char literal ('x', '\'', '\u{1F600}'), or a lifetime or label ('a, 'static), left as it is
+            m = re.match(r"'(?:\\(?:u\{[0-9a-fA-F_]*\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'", text[i:])
+            if m:
+                out.append("' '")
+                i += m.end()
+            else:
+                out.append(c)
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 
 def uses(files, known):
@@ -110,7 +155,19 @@ def broken(src, dst, floors):
     return None
 
 
+# What `strip_comments` must keep and take out, checked on every run so a change to it can't quietly pass a broken floor.
+LEXED = (
+    'let a = "s3://x/*"; crate::one(); /* crate::two /* nested */ crate::three */ crate::four; let b = r#"crate::five "q" "#;\n'
+    "let c = '\"'; let d = '\\''; fn f<'a>(x: &'a str) {} crate::six; // crate::seven\n"
+    'let e = b"crate::eight"; let g = "esc \\" crate::nine"; crate::ten',
+    ["one", "four", "six", "ten"],
+)
+
+
 def main():
+    text, want = LEXED
+    got = [m.group(1) for m in re.finditer(r"crate::(\w+)", strip_comments(text))]
+    assert got == want, f"strip_comments keeps {got}, not {want}"
     floors = load_map()
     mods = modules()
     missing = sorted(set(mods) - set(floors))
@@ -125,22 +182,29 @@ def main():
                     edges[f"{name} -> {dst}"] = (why, n)
     if "--write-baseline" in sys.argv:
         with open(BASELINE, "w") as out:
-            out.write("# Uses that break the floors, as main has them (tools/layers.py --write-baseline).\n")
-            out.write("# Each redesign step removes some; nothing may add one.\n")
+            out.write("# Uses that break the floors, as main has them (tools/layers.py --write-baseline): each edge and how many\n")
+            out.write("# `crate::` uses it has. Each redesign step removes some; nothing may add an edge or a use along one.\n")
             for e in sorted(edges):
-                out.write(e + "\n")
-        print(f"{len(edges)} edges written to tools/layers-baseline.txt")
+                out.write(f"{e}  {edges[e][1]}\n")
+        print(f"{len(edges)} edges ({sum(n for _, n in edges.values())} uses) written to tools/layers-baseline.txt")
         return
     if "--baseline" in sys.argv:
-        known = {l.strip() for l in open(BASELINE) if l.strip() and not l.startswith("#")}
-        new = sorted(set(edges) - known)
-        gone = len(known - set(edges))
+        known = {}
+        for l in open(BASELINE):
+            if l.strip() and not l.startswith("#"):
+                edge, _, count = l.strip().rpartition("  ")
+                known[edge or count] = int(count) if edge else None  # (a line without a count: any number of uses)
+        new = sorted(set(edges) - set(known))
+        more = sorted(e for e in set(edges) & set(known) if known[e] is not None and edges[e][1] > known[e])
+        fewer = sum(1 for e in known if e not in edges or (known[e] is not None and edges[e][1] < known[e]))
         for e in new:
             print(f"new: {e}  ({edges[e][0]})")
-        print(f"{len(edges)} edges break the floors ({len(new)} new, {gone} gone since the baseline)")
-        if gone:
-            print("run tools/layers.py --write-baseline to record the ones gone")
-        sys.exit(1 if new else 0)
+        for e in more:
+            print(f"more: {e}  {known[e]} -> {edges[e][1]} uses ({edges[e][0]})")
+        print(f"{len(edges)} edges break the floors ({len(new)} new, {len(more)} with more uses, {fewer} gone or with fewer since the baseline)")
+        if fewer:
+            print("run tools/layers.py --write-baseline to record the ones gone or fewer")
+        sys.exit(1 if new or more else 0)
     by_rule = Counter(why for why, _ in edges.values())
     lines = defaultdict(int)
     for name, files in mods.items():

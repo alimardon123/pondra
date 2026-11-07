@@ -485,14 +485,15 @@ def inserts(con, root, expected, spark, port):
         print(json.dumps({"table": "INSERT into an Iceberg table by day, bucket and truncate: PyIceberg prunes by the values Pondra wrote", "equal": found}), flush=True)
         out["insert:retried"] = again.get("duplicate") is True
         print(json.dumps({"table": "INSERT retried with its job: applied once", "equal": out["insert:retried"]}), flush=True)
-    # delta-rs's tables with names mapped: one of plain columns takes the rows, and delta-rs reads them back; one with a
-    # struct is refused by name, as is one with a NOT NULL field in a struct (Pondra writes neither inside a struct yet).
+    # delta-rs's tables with names mapped: one of plain columns and one of structs (one in a list too) take the rows, and
+    # delta-rs reads them back, a struct's fields found by their physical names; one with a NOT NULL field in a struct is
+    # refused by name (Pondra checks no NOT NULL inside a column yet).
     import pyarrow as pa, deltalake
     shutil.rmtree(f"{root}/deltars_w", ignore_errors=True)
     mapped = {"delta.columnMapping.mode": "name"}
     city = pa.struct([pa.field("city", pa.string())])
     deltalake.write_deltalake(f"{root}/deltars_w/flat", pa.table({"id": pa.array([1, 2], pa.int64()), "name": ["a", "b"]}), configuration=mapped)
-    deltalake.write_deltalake(f"{root}/deltars_w/nested", pa.table({"id": pa.array([1], pa.int64()), "addr": pa.array([{"city": "Oslo"}], city)}), configuration=mapped)
+    deltalake.write_deltalake(f"{root}/deltars_w/nested", pa.table({"id": pa.array([1], pa.int64()), "addr": pa.array([{"city": "Oslo"}], city), "stops": pa.array([[{"city": "Bergen"}]], pa.list_(city))}), configuration=mapped)
     strict = pa.schema([pa.field("id", pa.int64()), pa.field("addr", pa.struct([pa.field("city", pa.string(), nullable=False)]))])
     deltalake.write_deltalake(f"{root}/deltars_w/strict", pa.table({"id": [1], "addr": [{"city": "Oslo"}]}, schema=strict))
     con.sql(f"ATTACH '{root}/deltars_w' AS drw (TYPE delta)")
@@ -501,7 +502,13 @@ def inserts(con, root, expected, spark, port):
     theirs = pa.table(deltalake.QueryBuilder().register("t", deltalake.DeltaTable(f"{root}/deltars_w/flat")).execute("SELECT id, name FROM t ORDER BY id").read_all()).to_pylist()
     out["insert:deltars_mapped"] = ok = theirs == [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}, {"id": 3, "name": "c"}]
     print(json.dumps({"table": "INSERT into delta-rs's table with names mapped, read back by delta-rs", "equal": ok, **({} if ok else {"theirs": theirs})}, default=str), flush=True)
-    for t, words, row in (("nested", "holds a struct", "(2, {'city': 'Rome'})"), ("strict", "NOT NULL value inside", "(2, {'city': 'Rome'})")):
+    con.sql("INSERT INTO drw.nested VALUES (2, named_struct('city', 'Rome'), make_array(named_struct('city', 'Bari'), named_struct('city', 'Pisa')))")
+    dt = deltalake.DeltaTable(f"{root}/deltars_w/nested")
+    theirs = pa.table(deltalake.QueryBuilder().register("t", dt).execute("SELECT id, addr, stops FROM t ORDER BY id").read_all()).to_pylist()
+    ok = theirs == [{"id": 1, "addr": {"city": "Oslo"}, "stops": [{"city": "Bergen"}]}, {"id": 2, "addr": {"city": "Rome"}, "stops": [{"city": "Bari"}, {"city": "Pisa"}]}]
+    out["insert:deltars_nested"] = ok
+    print(json.dumps({"table": "INSERT into delta-rs's table with names mapped and structs (one in a list), read back by delta-rs", "equal": ok, **({} if ok else {"theirs": theirs})}, default=str), flush=True)
+    for t, words, row in (("strict", "NOT NULL value inside", "(2, {'city': 'Rome'})"),):
         try:
             con.sql(f"INSERT INTO drw.{t} VALUES {row}")
             why = "written"
@@ -524,6 +531,17 @@ def inserts(con, root, expected, spark, port):
         ok = got("SELECT * FROM rest_w.db.sales") == theirs and len(theirs) == n + 20
         out["insert:rest"] = ok
         print(json.dumps({"table": "INSERT into a REST catalog's table, committed by the catalog, read back by PyIceberg", "equal": ok, **({} if ok else {"n": n, "theirs": len(theirs)})}), flush=True)
+        # An INSERT that names its columns reads the table once: its values are placed by the schema its rows are written by.
+        import urllib.request
+        loads = lambda: json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/_stats").read())["loads"]
+        before = loads()
+        con.sql("INSERT INTO rest_w.db.sales (region, id) VALUES ('named', 20001)")
+        once = loads() - before
+        table = SqlCatalog("local", uri=f"sqlite:///{root}/pyiceberg/catalog.db", warehouse=f"file://{root}/pyiceberg").load_table("db.sales")
+        row = [r for r in table.scan().to_arrow().to_pylist() if r["id"] == 20001]
+        ok = once == 1 and len(row) == 1 and row[0]["region"] == "named" and row[0]["total"] is None and row[0]["day"] is None
+        out["insert:rest_named"] = ok
+        print(json.dumps({"table": "INSERT INTO a REST catalog's table (region, id): its table loaded once, each value in the column it names", "equal": ok, **({} if ok else {"loads": once, "row": [{k: plain(v) for k, v in r.items()} for r in row]})}), flush=True)
     finally:
         server.kill()
     return out

@@ -5,3 +5,10 @@
 # 11-03, at 20c2732: the program 156,330,304 bytes, its download 56,123,799 (main's linux-x64 build, run 41626771333).
 # Each budget leaves about 2% for growth before someone has to say why.
 linux-x64 159500000 57300000
+#
+# A pull request's own build is held to linux-x64-release (build.yml), so a pull request that adds bytes fails itself,
+# not main after it. That build is the release profile (no LTO, 16 codegen units, not stripped), about twice the
+# shipped program. A pull request that changes the lock file builds the dist profile and is held to linux-x64; when it
+# raises that line it raises this one too, by about twice the bytes, or the next pull request fails for them.
+# 11-07, at 0fcfb55: the program 318,296,952 bytes, its download 91,923,509 (the train's build, run 42354370150).
+linux-x64-release 324700000 93800000
