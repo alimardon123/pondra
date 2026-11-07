@@ -446,8 +446,9 @@ def inserts(con, root, expected, spark, port):
     identity and truncate), then read back by the engine that made them (Spark) == Pondra's read,
     every row there once; a retried INSERT (same job) applied once; delta-rs's tables with names
     mapped (one of plain columns written and read back by delta-rs, one with a struct refused) and
-    one with a NOT NULL field in a struct (refused); a PyIceberg table in a REST catalog, committed
-    through the catalog, read back by PyIceberg."""
+    one with a NOT NULL field in a struct (refused); a NULL into a NOT NULL column refused, in Delta
+    and in Iceberg; a PyIceberg table in a REST catalog, committed through the catalog, read back by
+    PyIceberg."""
     import uuid
     out = {}
     got = lambda q: sorted([[plain(v) for v in r.values()] for r in con.sql(q).collect().to_pylist()], key=json.dumps)
@@ -493,13 +494,15 @@ def inserts(con, root, expected, spark, port):
     deltalake.write_deltalake(f"{root}/deltars_w/nested", pa.table({"id": pa.array([1], pa.int64()), "addr": pa.array([{"city": "Oslo"}], city)}), configuration=mapped)
     strict = pa.schema([pa.field("id", pa.int64()), pa.field("addr", pa.struct([pa.field("city", pa.string(), nullable=False)]))])
     deltalake.write_deltalake(f"{root}/deltars_w/strict", pa.table({"id": [1], "addr": [{"city": "Oslo"}]}, schema=strict))
+    deltalake.write_deltalake(f"{root}/deltars_w/keyed", pa.table({"id": [1], "name": ["a"]}, schema=pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("name", pa.string())])))
     con.sql(f"ATTACH '{root}/deltars_w' AS drw (TYPE delta)")
     con.sql("INSERT INTO drw.flat VALUES (3, 'c')")
     # (read through delta-rs's DataFusion: its pyarrow dataset reads a mapped table's columns as NULL, its own files too)
     theirs = pa.table(deltalake.QueryBuilder().register("t", deltalake.DeltaTable(f"{root}/deltars_w/flat")).execute("SELECT id, name FROM t ORDER BY id").read_all()).to_pylist()
     out["insert:deltars_mapped"] = ok = theirs == [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}, {"id": 3, "name": "c"}]
     print(json.dumps({"table": "INSERT into delta-rs's table with names mapped, read back by delta-rs", "equal": ok, **({} if ok else {"theirs": theirs})}, default=str), flush=True)
-    for t, words, row in (("nested", "holds a struct", "(2, {'city': 'Rome'})"), ("strict", "NOT NULL value inside", "(2, {'city': 'Rome'})")):
+    for t, words, row in (("nested", "holds a struct", "(2, {'city': 'Rome'})"), ("strict", "NOT NULL value inside", "(2, {'city': 'Rome'})"),
+                          ("keyed", "column id is NOT NULL, and a row gives it no value", "(2, 'b'), (NULL, 'c')")):
         try:
             con.sql(f"INSERT INTO drw.{t} VALUES {row}")
             why = "written"
@@ -522,6 +525,21 @@ def inserts(con, root, expected, spark, port):
         ok = got("SELECT * FROM rest_w.db.sales") == theirs and len(theirs) == n + 20
         out["insert:rest"] = ok
         print(json.dumps({"table": "INSERT into a REST catalog's table, committed by the catalog, read back by PyIceberg", "equal": ok, **({} if ok else {"n": n, "theirs": len(theirs)})}), flush=True)
+        # A NULL into a required column is refused, and nothing is committed; a row with its value goes in.
+        from pyiceberg.schema import Schema
+        from pyiceberg.types import LongType, NestedField, StringType
+        catalog = SqlCatalog("local", uri=f"sqlite:///{root}/pyiceberg/catalog.db", warehouse=f"file://{root}/pyiceberg")
+        catalog.create_table("db.required", schema=Schema(NestedField(1, "id", LongType(), required=True), NestedField(2, "name", StringType())))
+        try:
+            con.sql("INSERT INTO rest_w.db.required VALUES (1, 'a'), (NULL, 'b')")
+            why = "written"
+        except Exception as e:  # noqa: BLE001 (reported)
+            why = str(e)
+        con.sql("INSERT INTO rest_w.db.required VALUES (2, 'b')")
+        theirs = catalog.load_table("db.required").scan().to_arrow().to_pylist()
+        ok = "column id is NOT NULL, and a row gives it no value" in why and theirs == [{"id": 2, "name": "b"}]
+        out["insert:required"] = ok
+        print(json.dumps({"table": "INSERT of a NULL into an Iceberg table's required column refused, nothing committed", "equal": ok, **({} if ok else {"why": why[:300], "theirs": theirs})}), flush=True)
     finally:
         server.kill()
     return out

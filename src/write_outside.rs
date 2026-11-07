@@ -103,7 +103,11 @@ async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job:
     let df = conform(df, &target, root)?;
     let partition_at: Vec<usize> = partitions.iter().map(|p| target.iter().position(|f| f.name() == p).expect("a partition column")).collect();
     let file_fields: Vec<Field> = target.iter().enumerate().filter(|(i, _)| !partition_at.contains(i)).map(|(_, f)| f.clone()).collect();
+    let schema: Value = serde_json::from_str(log.metadata["schemaString"].as_str().context("no schema")?)?;
+    let not_null: Vec<&str> = schema["fields"].as_array().into_iter().flatten().filter(|f| f["nullable"].as_bool() == Some(false)).filter_map(|f| f["name"].as_str()).collect();
+    let required: Vec<(usize, &str)> = columns.iter().enumerate().filter(|(_, (_, l, _))| not_null.contains(&l.as_str())).map(|(i, (_, l, _))| (i, l.as_str())).collect();
     let parts = |b: &RecordBatch| -> Result<Vec<Part>> {
+        refuse_nulls(b, &required, root)?;
         let text: Vec<ArrayRef> = partition_at.iter().map(|&i| partition_text(b.column(i))).collect::<Result<_>>()?;
         let mut groups: BTreeMap<Vec<Option<String>>, Vec<u32>> = BTreeMap::new();
         for r in 0..b.num_rows() {
@@ -406,6 +410,15 @@ fn conform(df: datafusion::prelude::DataFrame, target: &[Field], table: &str) ->
     Ok(df.select(exprs)?)
 }
 
+/// A NULL in a column the table says is NOT NULL (Delta's `nullable: false`, Iceberg's `required`) is refused before a
+/// file is committed: other engines read the table trusting it. `required`: (the column's place in the rows, its name).
+fn refuse_nulls(b: &RecordBatch, required: &[(usize, &str)], table: &str) -> Result<()> {
+    for (i, name) in required {
+        ensure!(b.column(*i).null_count() == 0, "INSERT into {table}: column {name} is NOT NULL, and a row gives it no value");
+    }
+    Ok(())
+}
+
 /// Write an object only if nothing is there: false if something is (another writer won).
 pub async fn put_new(lake: &Lake, url: &str, body: Vec<u8>) -> Result<bool> {
     let (store, path) = crate::ext::store(lake, url).await?;
@@ -446,6 +459,8 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
     let (schema_json, columns) = crate::read_iceberg::schema_of(&meta)?;
     let target: Vec<Field> = columns.iter().map(|(n, id, t)| Field::new(n, t.clone(), true).with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into())).collect();
     let df = conform(df, &target, url)?;
+    let required_ids: Vec<i64> = schema_json["fields"].as_array().into_iter().flatten().filter(|f| f["required"].as_bool() == Some(true)).filter_map(|f| f["id"].as_i64()).collect();
+    let required: Vec<(usize, &str)> = columns.iter().enumerate().filter(|(_, (_, id, _))| required_ids.contains(id)).map(|(i, (n, _, _))| (i, n.as_str())).collect();
     let spec_id = meta["default-spec-id"].as_i64().unwrap_or(0);
     let pspec = meta["partition-specs"].as_array().into_iter().flatten().find(|s| s["spec-id"].as_i64() == Some(spec_id)).cloned().unwrap_or(json!({"fields": []}));
     let fields: Vec<(String, usize, String, DataType)> = pspec["fields"].as_array().into_iter().flatten().map(|f| {
@@ -456,6 +471,7 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
     let partition_avro: Vec<Value> = pspec["fields"].as_array().into_iter().flatten().zip(&fields)
         .map(|(f, (name, _, t, dt))| Ok(crate::iceberg::opt(name, f["field-id"].as_u64().unwrap_or(1000) as u32, avro_type(t, dt)?))).collect::<Result<_>>()?;
     let parts = |b: &RecordBatch| -> Result<Vec<Part>> {
+        refuse_nulls(b, &required, url)?;
         let values: Vec<Vec<Value>> = fields.iter().map(|(_, i, t, _)| transform(b.column(*i), t)).collect::<Result<_>>()?;
         let mut groups: BTreeMap<String, (Vec<u32>, Value)> = BTreeMap::new();
         for r in 0..b.num_rows() {
