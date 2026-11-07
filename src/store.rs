@@ -177,7 +177,17 @@ pub struct Col {
     pub held: Option<String>,
     /// An enum column's labels and type.
     pub labels: Option<Enum>,
+    /// What it means, beside what it is (`About`).
+    pub about: Option<Box<About>>,
 }
+
+/// What a column means, beside what it is, by key: the semantic layer plan's *about* (a label, synonyms, a format, a
+/// unit, instructions, tags; designs/semantic-layer-plan.md §5), each key's value as JSON. It is kept on the column
+/// record, so a rename, a drop, a clone, a `logical()` copy and a description keep it, and no side map by name can lose
+/// it. Nothing sets it yet: its keys come with the plan's phase S1. Format 6's list writes it with the column's facts.
+/// Format 5's fields have no place for it, so a lake below format 6 never holds one (S1 refuses to set it there), and an
+/// entry written in that shape (a new one, a `logical()` copy) leaves it out.
+pub type About = BTreeMap<String, serde_json::Value>;
 
 /// A table's columns as its entry stores them from lake format 6: every column, dropped ones too, in field-id order, and
 /// SQL's order of them by id when it isn't the stored one (before format 6, `shown`). Written as `[columns]`, or
@@ -196,7 +206,7 @@ const PLACED_NONE: u64 = 0xcbf29ce484222325;
 /// A column's facts past its name, type and flags, as its entry writes them: each left out at its default (the id too,
 /// where it is the column's place + 1). (A missing one reads as None: no `default`, which would ask `Default` of each.)
 #[derive(Serialize, Deserialize)]
-struct Facts<S, I, E> {
+struct Facts<S, I, E, A> {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -211,6 +221,8 @@ struct Facts<S, I, E> {
     labels: Option<E>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sql_type: Option<S>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    about: Option<A>,
 }
 
 /// A column at its place in the list, for writing: its id is written only when it isn't `place`.
@@ -220,8 +232,8 @@ impl Serialize for At<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let (c, place) = (self.0, self.1);
-        let facts = Facts { id: (c.id != place).then_some(c.id), stored: c.stored.as_ref(), default: c.default.as_ref(), identity: c.identity.as_ref(), held: c.held.as_ref(), labels: c.labels.as_ref(), sql_type: c.sql_type.as_ref() };
-        let any = facts.id.is_some() || c.stored.is_some() || c.default.is_some() || c.identity.is_some() || c.held.is_some() || c.labels.is_some() || c.sql_type.is_some();
+        let facts = Facts { id: (c.id != place).then_some(c.id), stored: c.stored.as_ref(), default: c.default.as_ref(), identity: c.identity.as_ref(), held: c.held.as_ref(), labels: c.labels.as_ref(), sql_type: c.sql_type.as_ref(), about: c.about.as_deref() };
+        let any = facts.id.is_some() || c.stored.is_some() || c.default.is_some() || c.identity.is_some() || c.held.is_some() || c.labels.is_some() || c.sql_type.is_some() || c.about.is_some();
         let mut seq = s.serialize_seq(Some(2 + c.not_null as usize + c.dropped as usize + any as usize))?;
         seq.serialize_element(&c.name)?;
         seq.serialize_element(&c.dtype)?;
@@ -258,7 +270,7 @@ impl Serialize for Stored {
 enum Rest {
     NotNull,
     Dropped,
-    Facts(Facts<String, Identity, Enum>),
+    Facts(Facts<String, Identity, Enum, About>),
 }
 
 impl<'de> Deserialize<'de> for Rest {
@@ -298,7 +310,7 @@ impl<'de> Deserialize<'de> for Col {
                         Rest::Dropped => c.dropped = true,
                         Rest::Facts(f) => {
                             c.id = f.id.unwrap_or_default();
-                            (c.stored, c.default, c.identity, c.held, c.labels, c.sql_type) = (f.stored, f.default, f.identity, f.held, f.labels, f.sql_type);
+                            (c.stored, c.default, c.identity, c.held, c.labels, c.sql_type, c.about) = (f.stored, f.default, f.identity, f.held, f.labels, f.sql_type, f.about.map(Box::new));
                         }
                     }
                 }
@@ -354,6 +366,7 @@ impl Stored {
                 held: m.sql_types.get(s).cloned(),
                 labels: m.enums.get(s).cloned(),
                 sql_type: m.logical_types.get(s).cloned(),
+                about: None,
             })
             .collect();
         let mut place = std::collections::HashMap::with_capacity(if m.shown.is_empty() { 0 } else { m.columns.len() });
@@ -392,7 +405,7 @@ impl Stored {
                     Some(n) => (n, Some(s)),
                     None => (s, None),
                 };
-                Col { id: i as u32 + 1, name, stored, dtype, sql_type, dropped: is_dropped, not_null: is_not_null, default, identity, held, labels }
+                Col { id: i as u32 + 1, name, stored, dtype, sql_type, dropped: is_dropped, not_null: is_not_null, default, identity, held, labels, about: None }
             })
             .collect();
         Stored { columns, order }
@@ -1277,6 +1290,7 @@ impl TableMeta {
                     identity: facts.and_then(|c| c.identity.clone()),
                     held: facts.and_then(|c| c.held.clone()),
                     labels: facts.and_then(|c| c.labels.clone()),
+                    about: facts.and_then(|c| c.about.clone()),
                 }
             })
             .collect();
@@ -5146,6 +5160,31 @@ mod tests {
             let warm = best(rounds, &mut || { std::hint::black_box(m.to_logical(&b).unwrap().num_columns()); });
             println!("{what}, to_logical() of a batch of every stored column: {warm:.2} µs warm, the first entry");
         }
+    }
+
+    /// A column's *about* (`About`) is kept on its record: written with format 6's facts and read back, through a rename
+    /// and a drop, in a `logical()` copy and in a description. Format 5's fields leave it out: they have no place for it.
+    #[test]
+    fn a_columns_about_is_kept_on_its_record() {
+        let about: About = [("label".to_string(), serde_json::json!("Net revenue")), ("synonyms".to_string(), serde_json::json!(["sales", "turnover"]))].into();
+        let mut t = TableMeta::with_columns(vec![("a".into(), "Int64".into()), ("b".into(), "Float64".into()), ("c".into(), "Utf8".into())]).as_list();
+        t.edit(|l| {
+            for s in ["b", "c"] {
+                l.at(s).unwrap().about = Some(Box::new(about.clone()));
+            }
+        });
+        t.rename_column("b", "revenue");
+        t.drop_column("c");
+        let back: TableMeta = serde_json::from_slice(&json(&t)).unwrap();
+        assert_eq!(back.list(), t.list(), "format 6's list, read back");
+        assert_eq!([("b", true), ("c", true), ("a", false)].map(|(s, has)| back.col(s).unwrap().about.as_deref() == has.then_some(&about)), [true; 3], "through a rename and a drop");
+        assert_eq!(t.logical().col("revenue").and_then(|c| c.about.as_deref()), Some(&about), "SQL's copy");
+        let mut v = t.clone();
+        v.finish = Some(Finish { sql: String::new(), columns: vec![("revenue".into(), "Float64".into())] });
+        assert_eq!(v.described().col("revenue").and_then(|c| c.about.as_deref()), Some(&about), "a description");
+        let mut five = t.clone();
+        five.record.listed = false;
+        assert!(!String::from_utf8(json(&five)).unwrap().contains("synonyms"), "format 5's fields leave it out");
     }
 
     /// A list's `order` names columns by id, and an id is its place + 1 only as lists are written so far (the format writes

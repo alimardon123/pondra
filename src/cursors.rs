@@ -35,10 +35,10 @@ pub enum Cmd {
 }
 
 /// What a cursor statement answers: FETCH's rows (one empty batch when there are none, so the
-/// columns stay), or the command's tag (`DECLARE CURSOR`, `MOVE 5`, `CLOSE CURSOR`).
+/// columns stay), or the command's kind and the rows it moved (`DECLARE CURSOR`, `MOVE 5`, `CLOSE CURSOR`).
 pub enum Answer {
     Rows(Vec<RecordBatch>),
-    Tag(String),
+    Done(crate::answer::Kind, Option<u64>),
 }
 
 struct Cursor {
@@ -183,7 +183,7 @@ async fn declare_as(app: &App, name: &str, hold: bool, query: &str) -> Result<An
         Entry::Occupied(_) => Err(taken(name)),
         Entry::Vacant(v) => {
             v.insert(Cursor { schema, batches, batch: 0, row: 0, txn: in_txn, bytes });
-            Ok(Answer::Tag("DECLARE CURSOR".into()))
+            Ok(Answer::Done(crate::answer::Kind::new("DECLARE CURSOR"), None))
         }
     }
 }
@@ -235,7 +235,7 @@ fn fetch(name: &str, rows: Option<usize>, moving: bool) -> Result<Answer> {
     let c = all.get_mut(&session()).and_then(|cs| cs.get_mut(name)).ok_or_else(|| missing(name))?;
     let batches = c.take(rows);
     if moving {
-        return Ok(Answer::Tag(format!("MOVE {}", batches.iter().map(|b| b.num_rows()).sum::<usize>())));
+        return Ok(Answer::Done(crate::answer::Kind::new("MOVE"), Some(batches.iter().map(|b| b.num_rows() as u64).sum())));
     }
     Ok(Answer::Rows(match batches.is_empty() {
         true => vec![RecordBatch::new_empty(c.schema.clone())],
@@ -271,11 +271,11 @@ fn close_as(name: Option<String>) -> Result<Answer> {
     match name {
         None => {
             all.remove(&session());
-            Ok(Answer::Tag("CLOSE CURSOR ALL".into()))
+            Ok(Answer::Done(crate::answer::Kind::new("CLOSE CURSOR ALL"), None))
         }
         Some(name) => {
             let closed = all.get_mut(&session()).and_then(|cs| cs.remove(&name));
-            closed.map(|_| Answer::Tag("CLOSE CURSOR".into())).ok_or_else(|| missing(&name))
+            closed.map(|_| Answer::Done(crate::answer::Kind::new("CLOSE CURSOR"), None)).ok_or_else(|| missing(&name))
         }
     }
 }

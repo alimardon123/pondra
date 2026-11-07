@@ -336,6 +336,7 @@ def spread_outside(c):
         finally:
             for p in c.proxies:
                 p.record = False
+        settled = all(p.settled() for p in c.proxies)  # (each read the query made is in its proxy's log)
         spreads = harness.metrics_of(at.port)["pondra_spread_queries_total"] - before
         one = call(at.port, "POST", "/sql?spread=0", sql, timeout=120)
 
@@ -351,7 +352,7 @@ def spread_outside(c):
         info["outside glob: files each node read the data of"] = shares = [sorted(k.rsplit("/", 1)[1] for k in r) for r in reads]
         check("an outside glob spread over three nodes (?spread=1) == one node's answer == pyarrow's", spread == one == [want] and spreads == 1, (spread, one, want, spreads))
         check("…each node read the data of its own share of the files alone: every file by one node, every node some",
-              all(reads) and sum(map(len, reads)) == len(sizes) and set().union(*reads) == set(sizes), shares)
+              settled and all(reads) and sum(map(len, reads)) == len(sizes) and set().union(*reads) == set(sizes), shares)
     finally:
         for k in sizes:
             s3.delete_object(Bucket=bkt, Key=k)

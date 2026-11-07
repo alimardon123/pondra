@@ -424,7 +424,11 @@ impl Auth {
         if limited().is_some() && matches!(stmt, Stmt::Ddl(ds) if ds.len() == 1 && matches!(ds[0], crate::ddl::Ddl::CreateDatabase { clone: Some(_), .. } | crate::ddl::Ddl::DropDatabase { .. })) {
             return Ok(());
         }
-        let need = if matches!(stmt, Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::CopyTo(..)) { Role::Admin } else { Role::Write };
+        let need = match stmt {
+            Stmt::Ddl(ds) if ds.iter().any(|d| matches!(d, crate::ddl::Ddl::Entry { .. })) => crate::statements::role(ds), // (an extension's: its entry's right)
+            Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::CopyTo(..) => Role::Admin,
+            _ => Role::Write,
+        };
         if role < need && !(need == Role::Write && limited().is_some()) { // (a user's writes: its grants, below)
             let what = match stmt {
                 Stmt::CopyTo(..) => "write files outside the lake",

@@ -75,6 +75,12 @@ or more `cluster_by` columns, rows are ordered along a Hilbert curve through the
 holds a narrow part of every column. Like liquid clustering it is incremental (each file as it is
 written or merged) and the columns can change (`ALTER TABLE … SET (cluster_by = …)`).
 
+The curve orders rows; it is never a filter. The planner never rewrites a filter into ranges of the curve's key, and
+the key is never stored: the columns' own min/max statistics already skip the row groups those ranges would, and in
+DuckDB's Lindel tests a join on the key's ranges was never faster, and up to 7.7x slower
+(https://query.farm/blog/lindel-duckdb-2-curve-keys/, 2026-11-06). So step 8's planner and `CLUSTER BY AUTO` add no
+such rewrite.
+
 ### 5. COPY over the Postgres protocol
 
 The Postgres protocol sends rows, not columns, and every client expects it that way: Arrow can't
@@ -150,6 +156,25 @@ On one 2-vCPU box (`logs/round20/`):
   or `CHECKPOINT`).
 - **Hilbert order gives each column about half** of what sorting by that column alone gives; a
   table filtered almost always by one column is better clustered by that one.
+
+**Clustering counted in what a query reads** (`tools/bench/clustering_reads.py`, 2026-11-07, one 4-vCPU box, local
+disk, decoded columns kept in memory off). It uses Lindel's setup: random points (x, y), and a box 0.01 on a side. Our
+losing case is x alone, within 0.0001. Each cell gives files read of all, row groups read of all, rows decoded, and
+the median of 20 runs:
+
+| 20 M rows, 5 files | A small box | x alone |
+|---|---|---|
+| No order | 5/5, 20/20, 20 M, 128 ms | 5/5, 20/20, 20 M, 63 ms |
+| `cluster_by = 'x'` | 5/5, 5/80, 287 K, 9.7 ms | 5/5, 5/80, 123 K, 5.9 ms |
+| Hilbert (x, y) | 5/5, 5/80, 300 K, 9.2 ms | 5/5, 20/80, 1.88 M, 15.4 ms |
+| Hilbert with curve keys across files | not built yet (steps 5 and 11) | |
+
+In one file of 4 M rows, the box takes 27 / 5.9 / 5.9 ms and x alone 15 / 4.4 / 6.5 ms (no order / x / Hilbert).
+
+- **No file is skipped, whatever the clustering.** A fold sorts at most 4 M rows (`tier_table`'s `MAX_ROWS`), so
+  every file spans the whole of each clustered column, and the catalog's min/max rules none out. Inside a file, row
+  groups and pages do the work. Curve keys that hold across files (the Lindel review's pick C1) are measured against
+  these rows, and merge only if none gets slower.
 
 ## What is still open
 

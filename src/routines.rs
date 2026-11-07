@@ -628,6 +628,17 @@ async fn read_stored(lake: &Lake, sql: &str) -> Result<String> {
     Ok(crate::path::currents(lake, &crate::front::expand(lake, &crate::path::currents(lake, sql), &HashMap::new()).await?))
 }
 
+/// `SHOW <kind>s [LIKE 'pattern']` for a kind an extension adds (`objects::Kind::shown`: `SHOW CONNECTIONS`): its
+/// objects, from `pondra.objects`, so the extension adds no SHOW of its own.
+fn show_defined(sql: &str) -> Option<String> {
+    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+([a-z][a-z ]*?)s(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
+    let m = SHOW.captures(sql)?;
+    let word = m[1].split_whitespace().map(str::to_lowercase).collect::<Vec<_>>().join(" ");
+    let k = crate::objects::all_kinds().find(|k| k.name == word && k.shown.is_some())?;
+    let like = m.get(2).map(|l| format!(" AND name LIKE {}", l.as_str())).unwrap_or_default();
+    Some(format!("SELECT lake, name, comment FROM pondra.objects WHERE kind = '{}'{like} ORDER BY lake, name", k.name))
+}
+
 /// `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS`, `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS`,
 /// `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW EXTENSIONS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS`
 /// (`[LIKE 'pattern']`; shares and recipients: `show_shares`): this lake's own, from `pondra.routines`, `pondra.tasks`, `pondra.tables`,
@@ -645,7 +656,7 @@ pub(crate) fn show(sql: &str) -> Option<String> {
     if let Some(q) = show_shares(sql) {
         return Some(q);
     }
-    let m = SHOW.captures(sql)?;
+    let Some(m) = SHOW.captures(sql) else { return show_defined(sql) };
     let what = m[1].split_whitespace().map(str::to_lowercase).collect::<Vec<_>>().join(" ");
     let named = match what.as_str() { "schemas" => "schema_name", "databases" => "catalog_name", "grants" => "grantee", _ => "name" };
     let like = m.get(2).map(|l| format!(" AND {named} LIKE {}", l.as_str())).unwrap_or_default();
@@ -834,7 +845,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
         // DECLARE, FETCH, MOVE, CLOSE: the session's cursors (cursors.rs). Before the script's check: DECLARE reads as one.
         return Ok(match crate::cursors::run(app, cmd?, who.role).await? {
             crate::cursors::Answer::Rows(batches) => Outcome::Rows(batches),
-            crate::cursors::Answer::Tag(tag) => Outcome::Done(j!({"command": tag})),
+            crate::cursors::Answer::Done(kind, rows) => Outcome::Done(j!({"command": kind.tag(rows)})),
         });
     }
     if crate::script::is(sql) {
@@ -880,7 +891,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
     if crate::set::is(sql) {
         // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: the session's (round 31)
         return match Box::pin(crate::set::statement(&app.lake, sql)).await? {
-            crate::set::Done::Said(tag) => Ok(Outcome::Done(j!({"command": tag}))),
+            crate::set::Done::Said(kind) => Ok(Outcome::Done(j!({"command": kind.words()}))),
             crate::set::Done::Run(sql) => Box::pin(one_of(app, &sql, who, job)).await,
         };
     }

@@ -259,6 +259,7 @@ pub enum Ddl {
     CreateExternal { name: String, sql: String, replace: bool, if_not_exists: bool }, // DataFusion's CREATE EXTERNAL TABLE: a view of files (`ext::external`)
     CreateMaterialized { name: String, sql: String, options: std::collections::BTreeMap<String, String>, #[serde(default, skip_serializing_if = "Option::is_none")] text: Option<String> }, // (`views::options`; `text`: its query as written, `authored.rs`)
     DropView { name: String, if_exists: bool },
+    Entry { words: String, object: String, tree: Value }, // an extension's statement, by its words (`statements.rs`): `object` is what it changes
     Attach { name: String, dir: String, #[serde(default, skip_serializing_if = "std::ops::Not::not")] read_only: bool, #[serde(default, skip_serializing_if = "Option::is_none")] endpoint: Option<String> }, // (READ_ONLY and ENDPOINT: a lake on another server, ADR-058)
     Detach { name: String, if_exists: bool },
     CreateDatabase { name: String, if_not_exists: bool, dir: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] clone: Option<crate::branch::CloneOf> }, // a new lake (beside this one unless `dir`), attached; a branch of another (ADR-047)
@@ -456,6 +457,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             }
         }
         Ddl::Object(op) => crate::objects::apply(lake, op).await,
+        Ddl::Entry { words, tree, .. } => crate::statements::carry_out(lake, &words, tree).await,
         Ddl::Sequence(c) => crate::seq::apply(lake, c).await,
         Ddl::Index(c) => crate::index::apply(lake, c).await,
         Ddl::Type(c) => crate::types::apply(lake, c).await,

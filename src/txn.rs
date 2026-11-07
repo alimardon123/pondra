@@ -364,6 +364,16 @@ pub async fn command(app: &crate::app::App, word: &str, sql: &str) -> Result<(&'
     word_in(app, &s, word, sql).await
 }
 
+/// How the transaction word `word` (`control`'s) changes its session's transaction: BEGIN and ROLLBACK TO start one, every
+/// other end (COMMIT, ROLLBACK) ends one, and a savepoint word (SAVEPOINT, RELEASE) leaves it as it is.
+pub fn word_change(word: &str) -> Option<crate::answer::Txn> {
+    match word {
+        "BEGIN" | "ROLLBACK TO" => Some(crate::answer::Txn::Started),
+        "SAVEPOINT" | "RELEASE" => None,
+        _ => Some(crate::answer::Txn::Ended),
+    }
+}
+
 /// Flight SQL's own transaction actions (flight.rs): BeginTransaction begins the current session's transaction as the
 /// protocol's, and EndTransaction (`word` COMMIT or ROLLBACK) ends it as `command` would.
 pub async fn protocol(app: &crate::app::App, word: &str) -> Result<(&'static str, Option<String>)> {

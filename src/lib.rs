@@ -90,6 +90,7 @@ mod pg_oids;
 mod pg_casts;
 mod pg_trace;
 pub mod pg_bytea;
+mod one_row;
 mod optimize;
 mod or_ranges;
 mod zeros_in;
@@ -251,6 +252,11 @@ mod rules;
 #[cfg(feature = "lake")] mod vars;
 #[cfg(feature = "lake")] mod views;
 #[cfg(feature = "lake")] mod write;
+// The registry's statements section: a statement an extension adds, read by `write::parse` at one place.
+#[cfg(feature = "lake")] pub mod statements;
+// The registry's connection types section, and the `connections` extension that adds the kind and its statements.
+#[cfg(feature = "lake")] pub mod connections;
+#[cfg(feature = "lake")] mod connect;
 #[cfg(feature = "lake")] mod writer;
 #[cfg(feature = "lake")] mod keep_load;
 #[cfg(feature = "lake")] mod write_outside;
@@ -266,6 +272,8 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &settings::SETTINGS,
         #[cfg(feature = "lake")]
         &objects::CATALOG,
+        #[cfg(feature = "lake")]
+        &connect::CONNECTIONS,
         &sparksql::SPARK,
         &engine::ENGINE,
         &pg_functions::POSTGRES,

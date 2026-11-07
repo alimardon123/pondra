@@ -115,6 +115,7 @@ locks engine
 median engine
 multiply engine
 once engine
+one_row engine
 oom engine
 optimize engine
 or_ranges engine
@@ -143,6 +144,8 @@ skew engine
 spill engine
 spmd engine
 statement engine
+statements engine
+connections catalog
 string_agg engine
 sys engine
 tasks engine
@@ -160,6 +163,7 @@ zeros_in engine
 
 # extensions, built in
 ai extensions:ai
+connect extensions:connections
 apply extensions:project
 git extensions:project
 status extensions:project

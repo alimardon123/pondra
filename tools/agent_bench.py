@@ -4,6 +4,9 @@
   agent_bench.py check  [--bin PATH | --port N] [--pg-bin DIR] [--only a01,a02]    # CI's, with no model (harness.py agents)
   agent_bench.py run    [--set a|b] [--bin PATH | --port N] [--model M] [--effort E] [--runs 3] [--jobs 6] [--out DIR]
   agent_bench.py replay FILE [--bin PATH | --port N]
+  agent_bench.py serve  [--set a|b] [--bin PATH] [--model M] [--engines ...] [--out DIR]   # helper agents, no API key
+  agent_bench.py --at PORT begin LANE TASK [RUN]  |  --at PORT tool TRY TOOL [VALUE]  |  --at PORT finish TRY [--tokens N
+                        --tool-uses N --seconds S]  |  --at PORT stop      # (options first: Python 3.11's argparse)
 
 An agent is given a question in plain words and a few tools, and its answer is the rows of the query it gives. The same
 tasks, data, model and tools run on Pondra, DuckDB and Postgres, so the numbers say what Pondra adds.
@@ -40,7 +43,14 @@ the loop itself with a scripted model; and the answers (a job's: its statements)
 tools/agent_bench/replay_*.jsonl run again, so an engine change that breaks an answer an agent once gave shows. `run`
 spends API dollars (ANTHROPIC_API_KEY; .github/workflows/agent-bench.yml): it writes runs.jsonl, every try's
 transcript, report.md and replay.jsonl (the passed answers, to keep as a replay file) to --out. `replay` runs a saved
-file's answers again. Postgres is a throwaway cluster, started when its binaries are found (--pg-bin, PG_BIN, pg_ctl on
+file's answers again.
+
+`serve` is the same run with no API key, its model a helper agent on a subscription (a Claude Code session's): it keeps
+the engines up and answers on a port of 127.0.0.1. `begin` opens a try and gives the words to brief a helper with (the
+API run's system words, task and tools, as one command's); the helper calls `tool`, each call the API loop's own
+(`step`), until `answer` or `done`; `finish` gives the try what its runner counted (the helper's whole tokens, all its
+tool calls, its seconds), and `stop` writes the run's files and ends it. The API's turns, token meters and dollars
+aren't there, and a try whose helper did anything but call its tools isn't passed. Postgres is a throwaway cluster, started when its binaries are found (--pg-bin, PG_BIN, pg_ctl on
 PATH, or /usr/lib/postgresql/*/bin); Pondra is started from --bin on a fresh lake, or reached on --port's Postgres door.
 Each mode prints one JSON line.
 """
@@ -644,7 +654,7 @@ class Door:
                                                          **({"id": 1} if not method.startswith("notifications/") else {})}).encode()
         req = urllib.request.Request(self.url, body, {"content-type": "application/json", "accept": "application/json, text/event-stream",
                                                       **({"mcp-session-id": self.sid} if self.sid else {})}, method=verb)
-        with urllib.request.urlopen(req, timeout=QUERY_S * 2) as r:
+        with LOOPBACK.open(req, timeout=QUERY_S * 2) as r:
             self.sid = r.headers.get("mcp-session-id") or self.sid
             raw = r.read()
         if not raw:
@@ -674,6 +684,38 @@ def dump(content):
     return [b.model_dump(mode="json", exclude_none=True) if hasattr(b, "model_dump") else b for b in content]
 
 
+def begin(task, engine, kit, model, effort):
+    """A try's start, however its model is reached: the system's words, the task as the user puts it, the tools (the
+    kit's, and `answer` or `done`), and its empty record."""
+    job = "job" in task
+    system = (JOB if job else SYSTEM).format(label=engine.label) + (f"\n\nThe database's own notes for agents: {kit.notes}" if kit.notes else "")
+    prompt = task["job" if job else "question"] + (f"\n\nFacts you may use: {task['evidence']}" if task.get("evidence") else "")
+    rec = {"id": task["id"], "engine": engine.name + kit.suffix, "model": model, "effort": effort, "turns": 0, "steps": 0,
+           "tokens": {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0}, "model_s": 0.0, "engine_s": 0.0,
+           "sql": None, "ran": [], "end": None, "only": bool(task.get("only"))}
+    return system, prompt, kit.tools + [DONE if job else ANSWER], rec
+
+
+def step(rec, kit, job, name, args):
+    """One tool call of a try, however its model is reached: counted as a step; `answer` (a question's) or `done` (a
+    job's) ends the try, and gives None; a statement is kept for a replay; any other call is the kit's, as (text,
+    is_error), its seconds the engine's."""
+    rec["steps"] += 1
+    if name == "answer" and not job:
+        rec["sql"], rec["end"] = args["query"], "answered"
+        return None
+    if name == "done" and job:
+        rec["end"] = "done"
+        return None
+    if name in ("sql", "query", "write"):  # (the plain tool's, or the MCP door's: what a replay runs again)
+        rec["ran"].append(args.get("query") or args.get("sql") or "")
+    t0 = time.perf_counter()
+    try:
+        return kit.use(name, args) if name in {t["name"] for t in kit.tools} else (f"no tool named {name}", True)
+    finally:
+        rec["engine_s"] += time.perf_counter() - t0
+
+
 def attempt(client, model, effort, task, engine, kit=None):
     """One try at a task: the model's loop over a kit of tools (the plain ones, or Pondra's MCP door's) and `answer`,
     and its record (turns, steps, tokens, seconds, the answer's SQL and how it ended), with the whole conversation as
@@ -681,13 +723,8 @@ def attempt(client, model, effort, task, engine, kit=None):
     thinking goes back as it came."""
     job = "job" in task
     kit = kit or Plain(engine, writes=job)
-    tools = kit.tools + [DONE if job else ANSWER]
-    system = (JOB if job else SYSTEM).format(label=engine.label) + (f"\n\nThe database's own notes for agents: {kit.notes}" if kit.notes else "")
-    prompt = task["job" if job else "question"] + (f"\n\nFacts you may use: {task['evidence']}" if task.get("evidence") else "")
+    system, prompt, tools, rec = begin(task, engine, kit, model, effort)
     messages = [{"role": "user", "content": prompt}]
-    rec = {"id": task["id"], "engine": engine.name + kit.suffix, "model": model, "effort": effort, "turns": 0, "steps": 0,
-           "tokens": {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0}, "model_s": 0.0, "engine_s": 0.0,
-           "sql": None, "ran": [], "end": None, "only": bool(task.get("only"))}
     while rec["end"] is None:
         if rec["turns"] == TURNS:
             rec["end"] = "turn cap"
@@ -719,19 +756,10 @@ def attempt(client, model, effort, task, engine, kit=None):
             continue
         results = []
         for b in calls:
-            rec["steps"] += 1
-            if b.name == "answer" and not job:
-                rec["sql"], rec["end"] = b.input["query"], "answered"
+            said = step(rec, kit, job, b.name, b.input)
+            if said is None:
                 break
-            if b.name == "done" and job:
-                rec["end"] = "done"
-                break
-            if b.name in ("sql", "query", "write"):  # (the plain tool's, or the MCP door's: what a replay runs again)
-                rec["ran"].append(b.input.get("query") or b.input.get("sql") or "")
-            t0 = time.perf_counter()
-            text, err = kit.use(b.name, b.input) if b.name in {t["name"] for t in kit.tools} else (f"no tool named {b.name}", True)
-            rec["engine_s"] += time.perf_counter() - t0
-            results.append({"type": "tool_result", "tool_use_id": b.id, "content": text, **({"is_error": True} if err else {})})
+            results.append({"type": "tool_result", "tool_use_id": b.id, "content": said[0], **({"is_error": True} if said[1] else {})})
         if rec["end"] is None:
             messages.append({"role": "user", "content": results})
     rec["transcript"] = {"system": system, "messages": [{"role": m["role"], "content": dump(m["content"])} for m in messages]}
@@ -779,6 +807,11 @@ def median(xs):
     return None if not xs else xs[len(xs) // 2] if len(xs) % 2 else (xs[len(xs) // 2 - 1] + xs[len(xs) // 2]) / 2
 
 
+def tokens_in(t):
+    """The tokens a try read: the API's three input meters, or a helper's whole count (`total`), in and out."""
+    return t["total"] if "total" in t else t["input"] + t["cache_write"] + t["cache_read"]
+
+
 def summary(recs, runs):
     """Each engine's pass rate on the tasks every engine runs (the mean of its runs', and their spread), the medians of
     such a passed task's steps, tokens, seconds and dollars, and how it did on the tasks only it can do."""
@@ -792,11 +825,11 @@ def summary(recs, runs):
         alone = [r for r in every if r["only"]]
         out[name] = {"passed": round(sum(rates) / runs, 4), "spread": [round(min(rates), 4), round(max(rates), 4)],
                      "steps": median([r["steps"] for r in ok]),
-                     "tokens_in": median([r["tokens"]["input"] + r["tokens"]["cache_write"] + r["tokens"]["cache_read"] for r in ok]),
-                     "tokens_out": median([r["tokens"]["output"] for r in ok]),
+                     "tokens_in": median([tokens_in(r["tokens"]) for r in ok]),
+                     "tokens_out": median([r["tokens"].get("output") for r in ok]),
                      "seconds": median([round(r["model_s"] + r["engine_s"], 2) for r in ok]),
                      "dollars": median([r["dollars"] for r in ok]),
-                     "spent": round(sum(r["dollars"] or 0 for r in every), 4)}
+                     "spent": None if all(r["dollars"] is None for r in every) else round(sum(r["dollars"] or 0 for r in every), 4)}
         if alone:
             out[name]["only_it"] = f"{sum(r['passed'] for r in alone)} of {len(alone)}"
     return out
@@ -821,7 +854,10 @@ def report(out, recs, runs):
         lines.append(f"| {name} | {v['passed']:.1%} | {v['spread'][0]:.1%} to {v['spread'][1]:.1%} | "
                      + " | ".join(num(v[k]) for k in ("steps", "tokens_in", "tokens_out", "seconds", "dollars", "spent")) + " |")
     lines += ["", "Passed is over the tasks every engine runs; steps, tokens, seconds and dollars are the medians of such "
-              "a passed task. Dollars are list prices times tokens; Spent is the whole run's.", ""]
+              "a passed task. Dollars are list prices times tokens; Spent is the whole run's."
+              + (" On a subscription, each try's model is a helper agent: Tokens in is its whole count as its runner gave it "
+                 "(in and out, its own prompt and tools included), the same on every engine, and there are no dollars. "
+                 "A try whose helper used anything but its tools isn't passed." if out.get("helpers") else ""), ""]
     alone = [f"{name} passed {v['only_it']} tries" for name, v in out["engines"].items() if isinstance(v, dict) and v.get("only_it")]
     lines += [f"On the tasks only Pondra can do, {', '.join(alone)}."] if alone else []
     lines += [""] if lines[-1] else []
@@ -850,29 +886,49 @@ def version(a):
     return r.stdout.strip() or "pondra"
 
 
+def want_of(t, oracle):
+    """What a try is scored against: a job's wanted end state, or a question's gold rows (DuckDB's)."""
+    return wanted(t, oracle) if "job" in t else oracle.run(gold_sql(t, "duckdb"))[1]
+
+
+def opened(t, e, door, name):
+    """A try's own database and its kit: for a job a copy of the shop with the job's setup done, for a question a
+    session; the plain tools on it, or Pondra's MCP door's (the copy's own node's, for a job)."""
+    s = e.copy(name) if "job" in t else e.session()
+    try:
+        for st in t.get("setup", []):
+            s.run(st)
+        return s, Door((s if "job" in t else e).mcp, writes="job" in t) if door else Plain(s, writes="job" in t)
+    except BaseException:
+        closed(t, e, s, name)
+        raise
+
+
+def closed(t, e, s, name, kit=None):
+    try:
+        if kit:
+            kit.stop()
+    finally:
+        if "job" in t:
+            e.uncopy(s, name)
+        else:
+            s.stop()
+
+
 def run_agents(client, a, oracle, engines, todo, out):
     """Every task on every engine it runs on, `runs` times, `jobs` at a time; the records, each with its transcript
     saved apart. A try at a job gets a copy of the shop of its own, with the job's setup done."""
-    want = {t["id"]: wanted(t, oracle) if "job" in t else oracle.run(gold_sql(t, "duckdb"))[1] for t in todo}
+    want = {t["id"]: want_of(t, oracle) for t in todo}
     count = itertools.count()
 
     def one(job):
         k, t, e, door = job
         name = f"try_{next(count)}"
-        s = e.copy(name) if "job" in t else e.session()
+        s, kit = opened(t, e, door, name)
         try:
-            for st in t.get("setup", []):
-                s.run(st)
-            kit = Door((s if "job" in t else e).mcp, writes="job" in t) if door else Plain(s, writes="job" in t)
-            try:
-                rec = scored(attempt(client, a.model, a.effort, t, s, kit), t, want[t["id"]], s)
-            finally:
-                kit.stop()
+            rec = scored(attempt(client, a.model, a.effort, t, s, kit), t, want[t["id"]], s)
         finally:
-            if "job" in t:
-                e.uncopy(s, name)
-            else:
-                s.stop()
+            closed(t, e, s, name, kit)
         rec["run"], rec["dollars"] = k, dollars(rec, a.per_hour)
         if a.out:
             with open(os.path.join(a.out, "transcripts", f"{rec['engine']}-{t['id']}-{k}.json"), "w") as f:
@@ -910,19 +966,251 @@ def run(a):
     finally:
         down(engines)
     if a.out:
-        with open(os.path.join(a.out, "runs.jsonl"), "w") as f:
-            f.writelines(json.dumps(r, default=str) + "\n" for r in recs)
-        seen = set()
-        with open(os.path.join(a.out, "replay.jsonl"), "w") as f:
-            for r in recs:
-                said = {"sql": r["sql"]} if a.set == "a" else {"ran": r["ran"]}
-                if r["passed"] and (r["id"], r["engine"], json.dumps(said)) not in seen:
-                    seen.add((r["id"], r["engine"], json.dumps(said)))
-                    f.write(json.dumps({"set": a.set, "id": r["id"], "engine": r["engine"], **said}) + "\n")
-        with open(os.path.join(a.out, "report.md"), "w") as f:
-            f.write(report(out, recs, a.runs))
+        written(a.out, out, recs)
     print(json.dumps(out, default=str))
     return 0
+
+
+def written(to, out, recs):
+    """A run's files: a record per try (runs.jsonl), the passed answers to replay (replay.jsonl), and report.md."""
+    with open(os.path.join(to, "runs.jsonl"), "w") as f:
+        f.writelines(json.dumps(r, default=str) + "\n" for r in recs)
+    seen = set()
+    with open(os.path.join(to, "replay.jsonl"), "w") as f:
+        for r in recs:
+            said = {"sql": r["sql"]} if out["set"] == "a" else {"ran": r["ran"]}
+            if r["passed"] and (r["id"], r["engine"], json.dumps(said)) not in seen:
+                seen.add((r["id"], r["engine"], json.dumps(said)))
+                f.write(json.dumps({"set": out["set"], "id": r["id"], "engine": r["engine"], **said}) + "\n")
+    with open(os.path.join(to, "report.md"), "w") as f:
+        f.write(report(out, recs, out["runs"]))
+
+
+# ---------------------------------------------------------------- on a subscription, with helper agents
+
+HELPER = """{system}
+
+{prompt}
+
+Your tools are one command, which you run with Bash: `{cmd} TOOL [VALUE]`. VALUE is the tool's one argument as a single
+quoted shell word, or a JSON object of its arguments when it takes more than one. The tools:
+{tools}
+
+Use that command and nothing else: no other command, file or program, and no web. Call one tool at a time, at most {cap}
+calls before your last one. {last} The command says when the try has ended: stop then, and reply with one line saying
+how it ended."""
+
+
+def brief(cmd, system, prompt, tools, job):
+    """What a helper agent is told: the API run's system words and task, and its tools as one command's."""
+    listed = "\n".join(f"- {t['name']}" + (f" ({', '.join(t['input_schema'].get('required', []))})" if t["input_schema"].get("required") else "")
+                       + f": {t['description']}" for t in tools)
+    last = "End with `done` when the job is done." if job else "End with `answer` and the one SQL query whose rows answer the question."
+    return HELPER.format(system=system, prompt=prompt, cmd=cmd, tools=listed, cap=TURNS, last=last)
+
+
+class Helpers:
+    """Tries whose model is a helper agent on a subscription, with no API key (`serve`). A helper gets the API run's
+    system words, task and tools (`begin`, `brief`) and calls the tools through one command (`tool`), each call the API
+    loop's (`step`), so the tasks, the tools, the scoring and the records are the API run's. What only the API counts
+    (turns, the four token meters, dollars) is left out: a helper's whole token count, its tool calls and its seconds
+    come from whoever ran it (`finish`). A try ends at its answer or done, at TURNS calls before it, or at `finish`; a
+    try whose helper made calls other than its tools' is not passed."""
+
+    def __init__(self, set_, model, engines, lanes, to=None, cmd=None):
+        self.set, self.model, self.to, self.cmd = set_, model, to, cmd
+        self.by, self.lanes, self.oracle = {e.name: e for e in engines}, lanes, engines[0]
+        self.todo = {t["id"]: t for t in tasks(set_)}
+        self.want, self.tries, self.recs, self.lock, self.count = {}, {}, [], threading.Lock(), itertools.count()
+
+    def begin(self, lane, task_id, run=0):
+        if lane not in self.lanes or task_id not in self.todo:
+            raise ValueError(f"no lane {lane} or no task {task_id}")
+        t, e, door = self.todo[task_id], self.by[lane.split("+")[0]], lane.endswith("+mcp")
+        if not runs_on(t, e.name):
+            raise ValueError(f"{task_id} doesn't run on {e.name}")
+        with self.lock:
+            if task_id not in self.want:
+                self.want[task_id] = want_of(t, self.oracle)
+            name = f"try_{next(self.count)}"
+        s, kit = opened(t, e, door, name)
+        system, prompt, tools, rec = begin(t, s, kit, self.model, None)
+        rec.update(run=run, turns=None, tokens={}, calls=[], helper=True, dollars=None)
+        self.tries[name] = {"t": t, "e": e, "s": s, "kit": kit, "rec": rec, "system": system, "prompt": prompt, "tools": tools,
+                            "t0": time.perf_counter(), "lock": threading.Lock(), "asked": 0}
+        return {"try": name, "brief": brief(f"{self.cmd} {name}", system, prompt, tools, "job" in t)}
+
+    def call(self, name, tool, value=None, args=None):
+        tr = self.tries.get(name)
+        if tr is None:
+            return {"text": f"no try named {name}", "error": True, "ended": True}
+        with tr["lock"]:
+            rec, job = tr["rec"], "job" in tr["t"]
+            tr["asked"] += 1  # (every use of the command, even after the end: what its runner's count is checked against)
+            if rec["end"]:
+                return {"text": f"This try has ended ({rec['end']}).", "error": True, "ended": True}
+            if tool != ("done" if job else "answer") and rec["steps"] >= TURNS:
+                rec["end"] = "turn cap"
+                self.close(name)
+                return {"text": f"This try has ended: {TURNS} calls without an answer.", "error": True, "ended": True}
+            spec = next((x for x in tr["tools"] if x["name"] == tool), None)
+            need = (spec or {}).get("input_schema", {}).get("required", [])
+            args = dict(args or {})
+            if value is not None and need and need[0] not in args:
+                args[need[0]] = value
+            missing = [k for k in need if k not in args]
+            if missing:  # (the API's strict tools never send this; a helper's command can, and it costs a call)
+                rec["steps"] += 1
+                said = (f"{tool} needs {', '.join(missing)}", True)
+            else:
+                said = step(rec, tr["kit"], job, tool, args)
+            rec["calls"].append({"tool": tool, "args": args, **({"text": said[0], "error": said[1]} if said else {})})
+            if said is None:
+                self.close(name)
+                return {"text": f"This try has ended ({rec['end']}).", "ended": True}
+            return {"text": said[0], "error": said[1], "ended": False}
+
+    def close(self, name):
+        """The try scored on its own database, which is then closed (its copy, for a job, dropped)."""
+        tr = self.tries[name]
+        try:
+            scored(tr["rec"], tr["t"], self.want[tr["t"]["id"]], tr["s"])
+        finally:
+            closed(tr["t"], tr["e"], tr["s"], name, tr["kit"])
+
+    def finish(self, name, tokens=None, tool_uses=None, seconds=None):
+        """A helper's try done with: closed if it never ended, and given what its runner counted."""
+        tr = self.tries[name]
+        rec = tr["rec"]
+        with tr["lock"]:
+            if rec["end"] is None:
+                rec["end"] = "no done" if "job" in tr["t"] else "no answer"
+                self.close(name)
+            del self.tries[name]
+        rec["tokens"] = {"total": tokens} if tokens is not None else {}
+        rec["model_s"] = round(max((seconds if seconds is not None else time.perf_counter() - tr["t0"]) - rec["engine_s"], 0), 2)
+        rec["outside"] = max(tool_uses - tr["asked"], 0) if tool_uses is not None else None
+        if rec["outside"]:
+            rec["passed"], rec["end"] = False, f"{rec['end']}; {rec['outside']} calls outside its tools"
+        if self.to:
+            with open(os.path.join(self.to, "transcripts", f"{rec['engine']}-{rec['id']}-{rec['run']}.json"), "w") as f:
+                json.dump({**rec, "system": tr["system"], "prompt": tr["prompt"]}, f, indent=1, default=str)
+        out = {k: v for k, v in rec.items() if k != "calls"}
+        with self.lock:
+            self.recs.append(out)
+        return out
+
+    def stop(self, out):
+        """What a run's report holds, from the tries finished so far; the files, when it has a folder."""
+        for name in list(self.tries):
+            self.finish(name)
+        runs = max([r["run"] for r in self.recs] + [0]) + 1
+        out.update(runs=runs, tasks=len({r["id"] for r in self.recs}))
+        for name, v in summary(self.recs, runs).items():
+            out["engines"].setdefault(name, {}).update(v)
+        if self.to:
+            written(self.to, out, self.recs)
+        return out
+
+
+def answering(h, out, done):
+    """The helpers' HTTP door on 127.0.0.1: POST /begin, /tool, /finish and /stop, each a JSON body and answer."""
+    import http.server
+
+    class Door(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)) or b"{}")
+            said, code = {"error": f"no {self.path} here"}, 404
+            try:
+                if self.path == "/begin":
+                    said, code = h.begin(body["lane"], body["task"], int(body.get("run", 0))), 200
+                elif self.path == "/tool":
+                    said, code = h.call(body["try"], body["tool"], body.get("value"), body.get("args")), 200
+                elif self.path == "/finish":
+                    said, code = h.finish(body["try"], body.get("tokens"), body.get("tool_uses"), body.get("seconds")), 200
+                elif self.path == "/stop":
+                    said, code = h.stop(out), 200
+                    done.set()
+            except Exception as err:
+                said, code = {"error": f"{type(err).__name__}: {err}"}, 400
+            raw = json.dumps(said, default=str).encode()
+            self.send_response(code)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *_):
+            pass
+
+    return http.server.ThreadingHTTPServer(("127.0.0.1", 0), Door)
+
+
+LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # (127.0.0.1 never goes through a proxy)
+
+
+def helper_cmd(at):
+    """A helper's one command: this Python and this file, the door's port, then `tool`. Options go before the mode,
+    since Python 3.11's argparse refuses positionals given after an option once `args` has matched."""
+    return f"{sys.executable} {os.path.abspath(__file__)} --at {at} tool"
+
+
+def asked(at, path, body):
+    """One call to a serving run's helpers' door."""
+    req = urllib.request.Request(f"http://127.0.0.1:{at}{path}", json.dumps(body).encode(), {"content-type": "application/json"})
+    try:
+        with LOOPBACK.open(req, timeout=QUERY_S * 3) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as err:
+        return json.loads(err.read() or b"{}") or {"error": str(err)}
+    except (urllib.error.URLError, OSError) as err:
+        return {"error": f"the helpers' door at {at}: {getattr(err, 'reason', err)}"}
+
+
+def serve(a):
+    """The engines up and the helpers' door open until /stop: one JSON line with its port first, the run's after."""
+    scorer_checks()
+    names = a.engines.split(",")
+    os.makedirs(os.path.join(a.out, "transcripts"), exist_ok=True)
+    engines, notes = up(a, {n.split("+")[0] for n in names})
+    out = {"set": a.set, "date": datetime.date.today().isoformat(), "model": f"{a.model} on a subscription", "effort": "its default",
+           "commit": commit(), "pondra": version(a), "engines": notes, "helpers": True}
+    try:
+        by = {e.name for e in engines}
+        done = threading.Event()
+        h = Helpers(a.set, a.model, engines, [n for n in names if n.split("+")[0] in by], a.out, None)
+        server = answering(h, out, done)
+        at = server.server_address[1]
+        h.cmd = helper_cmd(at)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        print(json.dumps({"at": at, "lanes": h.lanes, "tasks": list(h.todo)}), flush=True)
+        done.wait()
+        server.shutdown()
+    finally:
+        down(engines)
+    print(json.dumps(out, default=str))
+    return 0
+
+
+def client(a):
+    """`begin`, `tool`, `finish` and `stop` against a serving run (--at its port)."""
+    if not a.at:
+        raise SystemExit("--at: the serving run's port")
+    x = a.args
+    if a.mode == "begin":
+        said = asked(a.at, "/begin", {"lane": x[0], "task": x[1], "run": int(x[2]) if len(x) > 2 else 0})
+    elif a.mode == "finish":
+        said = asked(a.at, "/finish", {"try": x[0], "tokens": a.tokens, "tool_uses": a.tool_uses, "seconds": a.seconds})
+    elif a.mode == "stop":
+        said = asked(a.at, "/stop", {})
+    else:  # (a helper's: the tool's text, as the API run's tool result says it)
+        value = x[2] if len(x) > 2 else None
+        args = json.loads(value) if value and value.lstrip().startswith("{") else None
+        said = asked(a.at, "/tool", {"try": x[0], "tool": x[1], "value": None if args else value, "args": args})
+        print(("error: " if said.get("error") is True and not said.get("ended") else "") + said.get("text", str(said.get("error"))))
+        return 0
+    print(json.dumps(said, default=str))
+    return 1 if "error" in said else 0
 
 
 # ---------------------------------------------------------------- with no model
@@ -1062,7 +1350,65 @@ def loop_checks(engines, out):
                       "wrote": all("is_error" not in r for r in results), "its words": client.seen[0]["system"].startswith("You do jobs"),
                       "its tools": [x["name"] for x in client.seen[0]["tools"]] == ["list_tables", "describe", "sql", "done"]}
             wrong += [f"{e.name} {t['id']}: {k}" for k, v in checks.items() if not v]
+    wrong += helper_checks(engines)
     out["loop"] = {"ok": not wrong, "wrong": wrong}
+
+
+def helper_checks(engines):
+    """The helpers' door on every lane, as a helper agent would use it, with no model: a try told its task and tools,
+    a tool called through the command itself, an argument left out, an error as text, the answer that ends it and a call
+    after that, its runner's counts; a try with calls outside its tools, not passed; and a job on a copy of its own."""
+    wrong, lanes = [], [e.name for e in engines] + ["pondra+mcp" for e in engines if getattr(e, "mcp", None)]
+    h = Helpers("a", "claude-opus-5-5", engines, lanes)
+    jobs = Helpers("b", "claude-opus-5-5", engines, ["duckdb"])
+    done, out = threading.Event(), {"set": "a", "engines": {}, "helpers": True}
+    server = answering(h, out, done)
+    at = server.server_address[1]
+    h.cmd = helper_cmd(at)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        t = tasks("a")[0]
+        for lane in lanes:
+            door = lane.endswith("+mcp")
+            b = asked(at, "/begin", {"lane": lane, "task": t["id"]})
+            name = b["try"]
+            ran = subprocess.run(h.cmd.split() + [name, "list_tables"], capture_output=True, text=True, timeout=60)
+            cli = ran.stdout
+            bare = asked(at, "/tool", {"try": name, "tool": "query" if door else "describe"})
+            bad = asked(at, "/tool", {"try": name, "tool": "query" if door else "sql", "value": "SELEC 1"})
+            ans = asked(at, "/tool", {"try": name, "tool": "answer", "value": gold_sql(t, lane.split("+")[0])})
+            after = asked(at, "/tool", {"try": name, "tool": "list_tables"})
+            rec = asked(at, "/finish", {"try": name, "tokens": 1234, "tool_uses": 5, "seconds": 9.5})
+            b2 = asked(at, "/begin", {"lane": lane, "task": t["id"], "run": 1})
+            asked(at, "/tool", {"try": b2["try"], "tool": "list_tables"})
+            rec2 = asked(at, "/finish", {"try": b2["try"], "tokens": 50, "tool_uses": 3})
+            checks = {
+                "brief": t["question"] in b["brief"] and f"{h.cmd} {name} TOOL" in b["brief"] and "- answer (query): " in b["brief"],
+                "the command": ("customers" in cli) and not cli.startswith("error"),
+                "a missing argument": bare.get("error") is True and "needs" in bare.get("text", ""),
+                "error as text": bad.get("error") is True and "SELEC" in bad.get("text", ""),
+                "answered": ans.get("ended") is True and after.get("ended") is True,
+                "scored": rec.get("passed") is True and rec["end"] == "answered" and rec["steps"] == 4 and rec["engine"] == lane,
+                "counts": rec["tokens"] == {"total": 1234} and rec["outside"] == 0 and rec["turns"] is None,
+                "outside its tools": rec2.get("passed") is False and rec2["end"] == "no answer; 2 calls outside its tools",
+            }
+            wrong += [f"helpers {lane}: {k}" + (f" ({ran.returncode}: {(ran.stderr or cli).strip()[-300:]})" if k == "the command" else "")
+                      for k, v in checks.items() if not v]
+        j = next(x for x in tasks("b") if x["id"] == "b06")
+        name = jobs.begin("duckdb", "b06")["try"]
+        said = [jobs.call(name, "sql", st) for st in gold_sql(j, "duckdb")] + [jobs.call(name, "done", "fixed")]
+        rec = jobs.finish(name, 10, len(said))
+        if not (rec["passed"] and rec["end"] == "done" and rec["ran"] == gold_sql(j, "duckdb") and said[-1]["ended"]):
+            wrong.append("helpers duckdb b06: a job")
+        summed = asked(at, "/stop", {})
+        if not (done.is_set() and summed["engines"]["duckdb"]["passed"] == 0.5 and summed["engines"]["duckdb"]["tokens_in"] == 1234
+                and summed["engines"]["duckdb"]["spent"] is None):
+            wrong.append(f"helpers: the summary {summed['engines'].get('duckdb')}")
+    except Exception as err:
+        wrong.append(f"helpers: {type(err).__name__}: {err}")
+    finally:
+        server.shutdown()
+    return wrong
 
 
 def check(a):
@@ -1091,8 +1437,8 @@ def check(a):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["gold", "check", "run", "replay"])
-    p.add_argument("file", nargs="?", help="replay: a runs.jsonl or replay.jsonl")
+    p.add_argument("mode", choices=["gold", "check", "run", "replay", "serve", "begin", "tool", "finish", "stop"])
+    p.add_argument("args", nargs="*", help="replay: a runs.jsonl or replay.jsonl; begin: LANE TASK [RUN]; tool: TRY TOOL [VALUE]; finish: TRY")
     p.add_argument("--bin", help="a pondra binary to start on a fresh lake")
     p.add_argument("--port", type=int, help="or a running node's Postgres door")
     p.add_argument("--pg-bin", help="Postgres's initdb and pg_ctl folder")
@@ -1105,12 +1451,20 @@ def main():
     p.add_argument("--engines", default=",".join(ENGINES + ("pondra+mcp",)), help="pondra+mcp: Pondra with its MCP door's tools")
     p.add_argument("--per-hour", type=float, default=0.0, help="the machine's dollars an hour, for the engines' seconds")
     p.add_argument("--out", default="agent-bench-out")
+    p.add_argument("--at", type=int, help="begin, tool, finish, stop: the serving run's port")
+    p.add_argument("--tokens", type=int, help="finish: the helper's whole token count")
+    p.add_argument("--tool-uses", type=int, help="finish: the helper's tool calls, all of them")
+    p.add_argument("--seconds", type=float, help="finish: the helper's seconds")
     a = p.parse_args()
     if a.mode in ("gold", "check"):
         return check(a)
     if a.mode == "run":
         return run(a)
-    with open(a.file) as f:
+    if a.mode == "serve":
+        return serve(a)
+    if a.mode in ("begin", "tool", "finish", "stop"):
+        return client(a)
+    with open(a.args[0]) as f:
         lines = [json.loads(x) for x in f if x.strip()]
     lines = [ln for ln in lines if ln.get("passed", True)]
     engines, notes = up(a, {ln["engine"].split("+")[0] for ln in lines})

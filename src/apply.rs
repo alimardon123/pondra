@@ -531,6 +531,7 @@ async fn grants(lake: &Lake) -> Result<Vec<String>> {
                 On::Lake => "ALL TABLES".into(),
                 On::Secret(s) => format!("SECRET {}", ident(s)),
                 On::Database(d) => format!("DATABASE {}", ident(d)), // (CLONE on a database attached here: the project's attachments are exported too)
+                On::Object { kind, name } => format!("{} {}", kind.to_uppercase(), ident(name)), // (an extension's kind: `GRANT READ ON CONNECTION shop`)
             };
             out.push(format!("GRANT {}{columns} ON {on} TO {}", g.privilege.to_uppercase(), ident(&k[2..])));
         }
