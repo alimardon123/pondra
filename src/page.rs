@@ -803,7 +803,7 @@ impl Page {
         anyhow::ensure!(holds == counted, "{name}: a table of this name is there already, with {holds} rows where its file has {counted}");
         // (a table with no identity was imported without its rules, as `imported_without_rules` leaves one: it has no counter to set)
         let lake = &self.member.get().context("the page's member on the core's lake is not open")?.app.lake;
-        let identity = lake.table_meta_if(name).await?.is_some_and(|m| !m.identity().is_empty());
+        let identity = lake.table_meta_if(name).await?.is_some_and(|m| m.list().columns.iter().any(|c| c.identity.is_some()));
         self.restored(at, name, kept, !identity || kept.metadata().get(CREATE_KEY).is_none()).await?;
         forgotten(store, at).await
     }
@@ -865,7 +865,7 @@ impl Page {
                 }
                 let Some(next) = counted.get(&sequence).and_then(counters::Counter::next) else { continue };
                 let lake = &self.member.get().context("the page's member on the core's lake is not open")?.app.lake;
-                let lake_sequence = lake.table_meta_if(name).await?.and_then(|m| m.identity().get(field.name()).map(|i| i.sequence.clone()));
+                let lake_sequence = lake.table_meta_if(name).await?.and_then(|m| m.col(field.name())?.identity.as_ref().map(|i| i.sequence.clone()));
                 let lake_sequence = lake_sequence.with_context(|| format!("{name}: its column {} is no identity column", field.name()))?;
                 self.imported_said(&format!("ALTER SEQUENCE {} RESTART WITH {next}", crate::ext_names::quoted(&lake_sequence)), None).await.map_err(|answer| answered_words(&answer))?;
             } else if plain {

@@ -79,7 +79,7 @@ impl Point {
     }
 
     /// Which types its columns are (`pg_types`: a uuid, json or jsonb): its table's own, by name.
-    pub fn types(&self) -> Vec<Option<crate::pg_types::Ty>> { self.names.iter().map(|n| self.meta.sql_types().get(n).and_then(|t| crate::pg_types::Ty::of(t))).collect() }
+    pub fn types(&self) -> Vec<Option<crate::pg_types::Ty>> { self.names.iter().map(|n| self.meta.col(n).and_then(|c| c.held.as_deref()).and_then(crate::pg_types::Ty::of)).collect() }
 
     /// Its parameters' types (`$1`…, in order), as the key columns they stand for.
     pub fn parameters(&self, sql: &str) -> Vec<datafusion::arrow::datatypes::DataType> {

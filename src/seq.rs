@@ -203,7 +203,7 @@ async fn gone_with(lake: &Lake, name: &str, s: &Sequence) -> Result<()> {
         return Ok(());
     }
     for (_, m) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
-        if m.identity().values().any(|i| i.sequence == name) {
+        if m.list().columns.iter().filter_map(|c| c.identity.as_ref()).any(|i| i.sequence == name) {
             return Ok(());
         }
     }
@@ -241,17 +241,19 @@ pub async fn owned(lake: &Lake, table: &str, column: &str, declared: Vec<Opt>) -
 /// The sequences a table's identity columns own, dropped with it (leader). A clone shares its
 /// source's sequence, so one a table still numbers by (live, or kept to be undropped) stays.
 pub async fn drop_owned(lake: &Lake, meta: &TableMeta) -> Result<()> {
-    if meta.identity().is_empty() {
+    let owned: Vec<&Identity> = meta.list().columns.iter().filter_map(|c| c.identity.as_ref()).collect();
+    if owned.is_empty() {
         return Ok(());
     }
+    let numbered = |t: &TableMeta| t.list().columns.iter().filter_map(|c| Some(c.identity.as_ref()?.sequence.clone())).collect::<Vec<_>>();
     let mut used: std::collections::HashSet<String> = Default::default();
     for (_, t) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
-        used.extend(t.identity().values().map(|i| i.sequence.clone()));
+        used.extend(numbered(&t));
     }
     for (_, d) in crate::ddl::dropped(lake).await? {
-        used.extend(d.meta.identity().values().map(|i| i.sequence.clone()));
+        used.extend(numbered(&d.meta));
     }
-    for i in meta.identity().values() {
+    for i in owned {
         if !used.contains(&i.sequence) && lake.cat.get::<Sequence>(&key(&i.sequence)).await?.is_some_and(|s| s.owned.is_some()) {
             submit(lake, Op::Drop { name: i.sequence.clone() }).await?;
         }
@@ -309,8 +311,8 @@ pub async fn named_exist(lake: &Lake, expr: &str) -> Result<()> {
 /// A table's column whose default takes values from the sequence (`table.column`), if one does.
 async fn used_by(lake: &Lake, name: &str) -> Result<Option<String>> {
     for (k, m) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
-        if let Some((c, _)) = m.defaults().iter().find(|(c, e)| !m.identity().contains_key(*c) && named(e).iter().any(|n| n == name)) {
-            return Ok(Some(format!("{}.{}", &k[2..], m.name_of(c))));
+        if let Some(c) = m.list().columns.iter().find(|c| c.identity.is_none() && c.default.as_ref().is_some_and(|e| named(e).iter().any(|n| n == name))) {
+            return Ok(Some(format!("{}.{}", &k[2..], c.name)));
         }
     }
     Ok(None)

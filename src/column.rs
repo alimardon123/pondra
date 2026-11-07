@@ -55,7 +55,12 @@ impl Columns {
     pub fn all(&self) -> &[Column] { &self.by_id }
 
     /// The column (live or dropped) whose id is `id`.
-    pub fn by_id(&self, id: u32) -> Option<&Column> { self.by_id.get((id as usize).checked_sub(1)?) }
+    pub fn by_id(&self, id: u32) -> Option<&Column> {
+        match self.by_id.get((id as usize).checked_sub(1)?) {
+            Some(c) if c.id == id => Some(c),
+            _ => self.by_id.iter().find(|c| c.id == id), // (an id that isn't its place + 1: `store::Stored::place`)
+        }
+    }
 
     /// The live column SQL calls `name`.
     pub fn named(&self, name: &str) -> Option<&Column> { self.sql().find(|c| c.name == name) }

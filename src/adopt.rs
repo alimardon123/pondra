@@ -44,8 +44,9 @@ async fn footer(lake: &Lake, ctx: &datafusion::prelude::SessionContext, table: &
     let list = meta.column_list();
     for col in list.stored_order() {
         let (stored, name, want) = (&col.stored, col.name.as_str(), crate::answer::dtype(&col.dtype)?);
+        let not_null = meta.col(stored).is_some_and(|c| c.not_null);
         let Some(field) = in_file(&schema, col.id as i64, name) else {
-            ensure!(!meta.not_null().contains(stored), "{}: it has no column {name}, which is NOT NULL in {table}", f.path);
+            ensure!(!not_null, "{}: it has no column {name}, which is NOT NULL in {table}", f.path);
             nulls.push(stored.clone());
             continue;
         };
@@ -53,7 +54,7 @@ async fn footer(lake: &Lake, ctx: &datafusion::prelude::SessionContext, table: &
         let c = StatisticsConverter::try_new(field.name(), &schema, md.file_metadata().schema_descr())?;
         let counts = c.row_group_null_counts(md.row_groups().iter())?;
         let (known, held) = (counts.null_count() == 0, counts.iter().flatten().sum::<u64>());
-        ensure!(!meta.not_null().contains(stored) || (known && held == 0), "{}: {name} is NOT NULL in {table}, and the file {}", f.path, if known { "holds a NULL there" } else { "doesn't say it holds none" });
+        ensure!(!not_null || (known && held == 0), "{}: {name} is NOT NULL in {table}, and the file {}", f.path, if known { "holds a NULL there" } else { "doesn't say it holds none" });
         if !known || held > 0 {
             nulls.push(stored.clone());
         }
