@@ -21673,6 +21673,25 @@ def registry():
     LAKES.extend([dev_at, slim_at])
     q("CREATE SECRET reg_secret (TYPE http, BEARER_TOKEN 'reg-token-1', SCOPE 'https://reg.example.com/')")  # (a secret the clone must leave)
     q(f"CREATE DATABASE dev LOCATION '{dev_at}' CLONE \"{here}\"")
+    # A Postgres client's startup database (dbname) is its session's when it names one here: `psql -d dev` writes into the
+    # branch, never the lake it was cloned from; any other name is this lake, as before
+    import psycopg
+    pg_dsn = lambda db: f"host=127.0.0.1 port={A.port + 10} user=pondra dbname={db}"
+    by_db = {}
+    with psycopg.connect(pg_dsn("dev"), autocommit=True) as c:
+        by_db["current_database"] = c.execute("SELECT current_database()").fetchone()[0]
+        c.execute("INSERT INTO kv VALUES (9, 'by dbname', 9)")
+        by_db["inserted (branch, base)"] = [q("SELECT count(*) AS n FROM dev.kv WHERE k = 9"), q("SELECT count(*) AS n FROM kv WHERE k = 9")]
+        c.execute("UPDATE kv SET v = 'changed' WHERE k = 9")  # (an UPDATE and a DELETE too: they once looked up `dev.public.kv` inside dev)
+        by_db["updated"] = q("SELECT v FROM dev.kv WHERE k = 9")
+        c.execute("DELETE FROM kv WHERE k = 9")
+        by_db["deleted"] = q("SELECT count(*) AS n FROM dev.kv WHERE k = 9")
+    base_rows = q("SELECT count(*) AS n FROM kv")[0]["n"]
+    with psycopg.connect(pg_dsn("nosuch"), autocommit=True) as c:
+        by_db["nosuch"] = [c.execute("SELECT current_database()").fetchone()[0], c.execute("SELECT count(*) FROM kv").fetchone()[0]]
+    info["dbname"] = by_db
+    checks["a Postgres client's dbname that names a branch is its session's: its INSERT, UPDATE and DELETE land in the branch, not the base; another name is this lake"] = \
+        by_db == {"current_database": "dev", "inserted (branch, base)": [[{"n": 1}], [{"n": 0}]], "updated": [{"v": "changed"}], "deleted": [{"n": 0}], "nosuch": [here, base_rows]}
     # What the clone took, as the registry says (pondra.kinds' on_clone, read here, never written in), against what each lake lists
     on_clone = {r["kind"]: r for r in q("SELECT * FROM pondra.kinds") if r["is"] == "object"}
     cloned_families = ("schema", "relation", "routine", "task", "type", "secret")
