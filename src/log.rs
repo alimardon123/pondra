@@ -50,6 +50,10 @@ pub struct Part {
     pub len: u64,
     pub rows: u64,
     pub src: Option<Src>, // None = derived by a view
+    /// An INSERT without a column list: the table's `TableMeta::placed` its node put the values by, which the leader
+    /// checks (`Ack::moved`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placed: Option<u64>,
 }
 
 /// One node's flush: its parts, whose bytes are at `path` (written by the node) or in `data`. Or,
@@ -114,6 +118,8 @@ pub struct Ack {
     pub refused: bool, // rows for a table with a UNIQUE constraint that the leader's check didn't make
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gone: bool, // rows for a table that isn't there (renamed or dropped as they came)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub moved: bool, // rows put by the table's columns in another order than its own now (a move its node hadn't seen: `Part::placed`)
     #[serde(default)]
     pub row: u64, // where the rows start among the table's rows in `seg` (their `_ord`: `ord(seg, row)`)
     #[serde(default)]
@@ -147,6 +153,7 @@ pub struct Append {
     pub src: Src,
     pub batch: RecordBatch, // may be empty: then only the producer's seq advances
     pub ack: oneshot::Sender<Result<Ack, Refusal>>,
+    pub placed: Option<u64>, // (`Part::placed`: an INSERT without a column list's, `placed_for`)
 }
 
 /// Why an append failed, as its producer hears it. `lost`: the flush went out and no answer came back (the request failed
@@ -331,7 +338,8 @@ impl Log {
         };
         let (ack, rx) = oneshot::channel();
         crate::metrics::add(&crate::metrics::ROWS_IN, batch.num_rows() as u64);
-        self.tx.send(Append { table, src, batch, ack }).await.map_err(|_| anyhow!("log closed"))?;
+        let placed = placed_for(&table);
+        self.tx.send(Append { table, src, batch, ack, placed }).await.map_err(|_| anyhow!("log closed"))?;
         Ok(Either::Left(async move {
             match rx.await {
                 Ok(answer) => Ok(answer?),
@@ -435,11 +443,41 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
 
 /// An append's answer: its ack, or why the sequencer refused it.
 fn answer(a: &Append, ack: Ack) -> Result<Ack, Refusal> {
-    match (ack.refused, ack.gone) {
-        (true, _) => Err(format!("{} has a UNIQUE constraint: it takes rows through SQL's INSERT, UPDATE and MERGE, which check them on the leader", a.table).into()),
-        (_, true) => Err(format!("no table {}", a.table).into()),
+    match (ack.refused, ack.gone, ack.moved) {
+        (true, _, _) => Err(format!("{} has a UNIQUE constraint: it takes rows through SQL's INSERT, UPDATE and MERGE, which check them on the leader", a.table).into()),
+        (_, true, _) => Err(format!("no table {}", a.table).into()),
+        (_, _, true) => Err(moved(&a.table).into()),
         _ => Ok(ack),
     }
+}
+
+tokio::task_local! {
+    /// The statement's INSERT without a column list: its table and the order this node put its values by
+    /// (`write::in_sql_order`).
+    static PLACED: (String, u64);
+}
+
+/// The order the running statement put its values into `table` by, when it is an INSERT without a column list
+/// (`write::in_sql_order`): what its rows (`Part::placed`) and files (`write::Files`) take to the leader, which refuses
+/// them as 40001 when the table's columns moved since (`moved`). A node that hadn't seen a move yet filled the old order
+/// (11-03 audit M9).
+pub(crate) fn placed_for(table: &str) -> Option<u64> {
+    PLACED.try_with(|(t, placed)| (t == table).then_some(*placed)).ok().flatten()
+}
+
+/// `run` with the statement's `placed` (`write::in_sql_order`): an INSERT without a column list, or one a page put by its
+/// own order (`server::insert_staged`), whose order is kept.
+pub(crate) async fn placed_as<T>(placed: Option<(String, u64)>, run: impl std::future::Future<Output = T>) -> T {
+    match placed {
+        Some(p) => PLACED.scope(p, run).await,
+        None => run.await,
+    }
+}
+
+/// What the leader says of an INSERT without a column list whose node put its values by the columns' order before a move
+/// it hadn't seen yet (`Ack::moved`, `write::record`): 40001, so it is run again, where it is placed anew.
+pub fn moved(table: &str) -> String {
+    format!("could not serialize the INSERT into {table}: its columns moved while it was written, so it fills them by an order that is gone. Run it again")
 }
 
 /// Encode the producers' batches and their views' output into one flush.
@@ -449,12 +487,12 @@ pub async fn pack(lake: &Lake, pending: &[Append]) -> Result<Flush> { pack_with(
 /// change's old ones, under `{t}$deleted`), which the flush doesn't carry itself.
 pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<String, Vec<RecordBatch>>) -> Result<Flush> {
     let (mut data, mut parts) = (vec![], vec![]);
-    let mut add = |table: &str, batch: &RecordBatch, src: Option<Src>| -> Result<()> {
+    let mut add = |table: &str, batch: &RecordBatch, src: Option<Src>, placed: Option<u64>| -> Result<()> {
         let off = data.len() as u64;
         if batch.num_rows() > 0 {
             data.extend(encode_ipc(&[crate::sys::compact(batch)?])?);
         }
-        parts.push(Part { table: table.into(), off, len: data.len() as u64 - off, rows: batch.num_rows() as u64, src });
+        parts.push(Part { table: table.into(), off, len: data.len() as u64 - off, rows: batch.num_rows() as u64, src, placed });
         Ok(())
     };
     let mut by_table = followed;
@@ -467,11 +505,11 @@ pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<Strin
             Some(m) => m.to_stored(&a.batch)?,
             None => a.batch.clone(),
         };
-        add(&a.table, &stored, Some(a.src.clone()))?;
+        add(&a.table, &stored, Some(a.src.clone()), a.placed)?;
         by_table.entry(a.table.clone()).or_default().push(a.batch.clone());
     }
     for (table, batch) in crate::views::derive(lake, &by_table).await? {
-        add(&table, &batch, None)?;
+        add(&table, &batch, None, None)?;
     }
     let mut f = Flush { parts, ..Default::default() };
     if data.len() > inline_bytes() {
@@ -825,12 +863,14 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
         }
         // 2. Rows go only into a table that is there (a node may not have seen it renamed or
         // dropped yet), and into one with a UNIQUE constraint only from the leader's check (a node
-        // may not know of an ALTER TABLE … ADD CONSTRAINT a moment ago).
+        // may not know of an ALTER TABLE … ADD CONSTRAINT a moment ago), and an INSERT without a column list's
+        // only by the columns' order the table has (a node may not have seen a move: `Part::placed`).
         let (mut acks, mut bad, mut mine) = (vec![Ack::default(); f.parts.len()], vec![], HashMap::new());
         for (i, p) in f.parts.iter().enumerate().filter(|(_, p)| written(p)) {
             match lake.cat.meta(&table_key(&p.table)).await? {
                 None => acks[i].gone = true,
                 Some(m) if !f.checked && crate::constraints::checked(&m) => acks[i].refused = true,
+                Some(m) if p.placed.is_some_and(|placed| placed != m.placed()) => acks[i].moved = true,
                 Some(_) => continue,
             }
             bad.push(i);
@@ -1312,7 +1352,7 @@ mod tests {
         /// One commit at `now`: each of `marks` is a producer's batch with no rows, at its seq.
         async fn send(&mut self, now: u64, marks: &[(&str, u64)]) -> Outcome {
             at(now);
-            let parts = marks.iter().map(|(p, seq)| Part { table: "t".into(), off: 0, len: 0, rows: 0, src: Some(Src { producer: p.to_string(), seq: *seq, prev: None }) }).collect();
+            let parts = marks.iter().map(|(p, seq)| Part { table: "t".into(), off: 0, len: 0, rows: 0, src: Some(Src { producer: p.to_string(), seq: *seq, prev: None }), placed: None }).collect();
             let (reply, answer) = oneshot::channel();
             let slot = Arc::new(tokio::sync::Semaphore::new(1)).acquire_owned().await.expect("open");
             commit(&self.lake, &mut self.next, &mut self.block, &mut self.producers, &mut self.sequences, &self.held, vec![(Flush { parts, ..Default::default() }, reply)], &self.ms, slot).await.expect("a commit");

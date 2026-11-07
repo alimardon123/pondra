@@ -230,6 +230,14 @@ impl TableMeta {
     /// what an INSERT without a column list fills, first to last (`write::implicit`).
     pub fn sql_order(&self) -> Vec<String> { self.in_order().into_iter().map(|(c, _)| self.name_of(c).to_string()).collect() }
 
+    /// Where an INSERT without a column list puts each value, as one number: the stored columns in SQL's order (`in_order`).
+    /// A move, an added or a dropped column changes it, a rename doesn't. Of the entry as stored. The leader refuses rows a
+    /// node placed by another one (`log::Ack::moved`, `write::record`): one that hadn't seen a move yet filled the old order
+    /// (11-03 audit M9).
+    pub fn placed(&self) -> u64 {
+        self.in_order().into_iter().flat_map(|(c, _)| c.bytes().chain([0])).fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+    }
+
     /// SQL's columns (`logical_columns`) in SQL's order (`in_order`): what `SELECT *` and RETURNING * answer.
     pub fn sql_columns(&self) -> Vec<(String, String)> { self.in_order().into_iter().map(|(c, t)| (self.name_of(c).to_string(), t.clone())).collect() }
 
@@ -3165,6 +3173,24 @@ pub fn partitions() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placed_changes_with_the_order_an_insert_fills() {
+        // (11-03 audit M9: the leader refuses rows a node put by another order, `log::Ack::moved`)
+        // (release/0.80's entry: `shown` for SQL's order, `names` for renames, `dropped` by stored name)
+        let col = |c: &str| (c.to_string(), "Int32".to_string());
+        let m = TableMeta { columns: vec![col("a"), col("b")], ..Default::default() };
+        let moved = TableMeta { shown: vec!["b".into(), "a".into()], ..m.clone() };
+        let back = TableMeta { shown: vec!["a".into(), "b".into()], ..m.clone() };
+        let renamed = TableMeta { names: BTreeMap::from([("a".to_string(), "x".to_string())]), ..m.clone() };
+        let added = TableMeta { columns: vec![col("a"), col("b"), col("c")], ..m.clone() };
+        let dropped = TableMeta { dropped: vec!["c".into()], ..added.clone() };
+        assert_ne!(m.placed(), moved.placed(), "a move");
+        assert_eq!(m.placed(), back.placed(), "moved back: the same places");
+        assert_eq!(m.placed(), renamed.placed(), "a rename puts nothing elsewhere");
+        assert_ne!(m.placed(), added.placed(), "a column more");
+        assert_eq!(m.placed(), dropped.placed(), "a dropped column isn't filled");
+    }
 
     #[test]
     fn a_place_is_a_folder_a_bucket_memory_or_a_node_and_no_other_scheme() {

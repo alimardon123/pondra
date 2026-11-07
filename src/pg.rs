@@ -770,7 +770,10 @@ impl Backend {
             p.rows += shaped.rows().num_rows() as u64;
             p.seq += 1;
             let src = crate::log::Src { producer: format!("copy:{}", p.job), seq: p.seq, prev: None };
-            self.app.log().map_err(err)?.append_shaped(p.copy.table.clone(), src, shaped).await.map_err(err)?;
+            // (without a column list, its fields fill the columns by this node's order, which the leader checks:
+            // `log::placed_for`, 11-07 audit M1)
+            let placed = p.copy.columns.is_empty().then(|| (p.copy.table.clone(), meta.placed()));
+            crate::log::placed_as(placed, self.app.log().map_err(err)?.append_shaped(p.copy.table.clone(), src, shaped)).await.map_err(err)?;
         }
         Ok(())
     }

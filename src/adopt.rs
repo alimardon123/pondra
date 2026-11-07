@@ -176,7 +176,7 @@ pub async fn file(lake: &Lake, seq: &crate::log::Sequencer, commits: &[FileCommi
             }
             let src = Src { producer: format!("job:{}", c.job), seq: 1, prev: None }; // (the job, once)
             let none = RecordBatch::new_empty(crate::answer::schema(&meta.logical_columns())?);
-            marks.push(Append { table: c.table.clone(), src, batch: none, ack: tokio::sync::oneshot::channel().0 });
+            marks.push(Append { table: c.table.clone(), src, batch: none, ack: tokio::sync::oneshot::channel().0, placed: None });
             // (a COPY INTO file's record and the job mark of the version it replaces: in this commit, so the file's rows and its record land together)
             let (record, lost) = match crate::copy::load_of(&c.job) {
                 Some(load) => crate::copy::entries(lake, &load, &c.job, c.added.iter().map(|f| f.rows).sum()).await?,
@@ -216,7 +216,7 @@ pub async fn upserts(lake: &Lake, seq: &crate::log::Sequencer, table: &str, rows
         lake.ids.refill(seq.block().await?);
     };
     let batch = crate::sys::stamp(&rows, first)?;
-    let append = Append { table: table.into(), src: Src { producer: format!("job:{job}"), seq: 1, prev: None }, batch, ack: tokio::sync::oneshot::channel().0 };
+    let append = Append { table: table.into(), src: Src { producer: format!("job:{job}"), seq: 1, prev: None }, batch, ack: tokio::sync::oneshot::channel().0, placed: None };
     loop {
         match seq.submit(crate::log::pack(lake, std::slice::from_ref(&append)).await?).await? {
             Outcome::Retry(r) if r.is_empty() => tokio::time::sleep(std::time::Duration::from_millis(10)).await, // (views changed: derive again)

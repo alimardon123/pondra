@@ -9883,7 +9883,9 @@ def colorder():
     the old order shows as wrong values: INSERT VALUES (whole and short rows), INSERT SELECT (of a known width and of a
     `*`), the bulk door, COPY INTO a headerless CSV, the Postgres port's COPY FROM STDIN, RETURNING *, a keyed table's
     INSERT, ON CONFLICT, INSERT OR REPLACE, MERGE … INSERT VALUES, UPDATE, DELETE and a transaction, a write through a
-    second node. Reads list the new order: SELECT *, DESCRIBE, information_schema, pg_attribute, a Postgres row's
+    second node. A move while a positional write runs on another node (an INSERT, a transaction's INSERT before its COMMIT,
+    a headerless COPY, a one-key upsert) refuses it 40001, nothing written. Reads list
+    the new order: SELECT *, DESCRIBE, information_schema, pg_attribute, a Postgres row's
     description, a point lookup, a past read, /watch, SHOW CREATE (which makes the same table again, and CREATE OR ALTER
     leaves as it is), Delta and Iceberg readers; all as it was after a restart. A view with a `*` lists the new order. Refused
     by name: a column after itself or after one the table lacks, a system column. A materialized view that reads the table
@@ -10020,6 +10022,85 @@ def colorder():
         except Exception as e:
             theirs[name] = f"error: {str(e)[:160]}"
     checks["Delta and Iceberg readers list a, e, c, d, b, f, with the same row"] = all(v == [["a", "e", "c", "d", "b", "f"], [19, 50, 39, 49, 29, 59]] for v in theirs.values())
+    # A move while an INSERT without a column list is written on another node: the leader refuses the rows put by the old
+    # order (40001, so it is run again, by the new one) and never takes them (11-03 audit M9: a node that hadn't seen the
+    # move filled the old order). The INSERT counts a few hundred million numbers first, so the move lands while it runs.
+    slow = "(SELECT least(count(*), 0) AS z FROM generate_series(1, 400000000) g(v) WHERE v % 7 = 3)"
+    raced = {}
+    for kind, ins in (("select", f"INSERT INTO race_{{}} SELECT 1 + z, 2 FROM {slow} s"), ("values", f"INSERT INTO race_{{}} VALUES (1, (SELECT 2 + z FROM {slow} s))")):
+        table = f"race_{kind}"
+        q(f"CREATE TABLE {table} (a BIGINT, b BIGINT)")
+        until(lambda: names(table, A.port + 1), ["a", "b"], 10)
+        outcome = {}
+        def insert():
+            status, head, text = reply(A.port + 1, "POST", "/sql", ins.format(kind).encode())
+            outcome.update(status=status, state=head.get("x-pondra-sqlstate"), text=text if isinstance(text, str) else text.decode(), done=time.time())
+        writer = threading.Thread(target=insert)
+        writer.start()
+        time.sleep(0.3)
+        q(f"ALTER TABLE {table} ALTER COLUMN b FIRST")
+        moved_at = time.time()
+        writer.join()
+        rows_then = q(f"SELECT a, b FROM {table}")
+        again = sql(A.port + 1, ins.format(kind))
+        raced[kind] = {"insert": {k: outcome[k] for k in ("status", "state")}, "after_move_s": round(outcome["done"] - moved_at, 2), "rows_then": rows_then,
+                       "again": again, "rows": until(lambda: q(f"SELECT a, b FROM {table}"), [{"a": 2, "b": 1}], 10)}
+        checks[f"a move while a {kind} INSERT without a column list runs on another node: refused 40001, nothing written, then by the new order"] = \
+            outcome["done"] > moved_at and outcome["status"] != 200 and outcome["state"] == "40001" and rows_then == [] and raced[kind]["rows"] == [{"a": 2, "b": 1}]
+    # The other doors that fill by position (11-07 audit M1): a transaction's INSERT on another node, a headerless CSV's COPY
+    # and a one-key upsert. Each puts its values by the order its node had, and the leader refuses them (40001) when the
+    # table's order is another by the time they come: a node that hadn't seen a move filled the old one.
+    def told(port, stmt, session=None, headers=None):
+        status, head, text = reply(port, "POST", "/sql", stmt.encode(), headers={**({"x-pondra-session": session} if session else {}), **(headers or {})})
+        return {"status": status, "state": head.get("x-pondra-sqlstate"), "text": (text if isinstance(text, str) else text.decode())[:300]}
+    q("CREATE TABLE race_txn (a BIGINT, b BIGINT)")
+    until(lambda: names("race_txn", A.port + 1), ["a", "b"], 10)
+    session = "colorder-txn-" + uuid.uuid4().hex[:8]
+    began = [told(A.port + 1, "BEGIN", session), told(A.port + 1, "INSERT INTO race_txn VALUES (1, 2)", session)]
+    q("ALTER TABLE race_txn ALTER COLUMN b FIRST")
+    committed = told(A.port + 1, "COMMIT", session)
+    txn_then = q("SELECT a, b FROM race_txn")
+    until(lambda: names("race_txn", A.port + 1), ["b", "a"], 10)
+    again = [told(A.port + 1, s, session) for s in ("BEGIN", "INSERT INTO race_txn VALUES (1, 2)", "COMMIT")]
+    raced["txn"] = {"began": began, "commit": committed, "rows_then": txn_then, "again": again}
+    checks["a move between a transaction's INSERT without a column list on another node and its COMMIT: refused 40001, nothing written, then by the new order"] = \
+        all(r["status"] == 200 for r in began) and committed["state"] == "40001" and txn_then == [] \
+        and all(r["status"] == 200 for r in again) and until(lambda: q("SELECT a, b FROM race_txn"), [{"a": 2, "b": 1}], 10) == [{"a": 2, "b": 1}]
+    q("CREATE TABLE race_copy (a BIGINT, b BIGINT)")
+    until(lambda: names("race_copy", A.port + 1), ["a", "b"], 10)
+    with open(os.path.join(d, "many.csv"), "w") as f:  # (enough lines that the move lands while it is read)
+        f.write("1,2\n" * 16_000_000)
+    outcome = {}
+    def load():
+        outcome.update(told(A.port + 2, f"COPY INTO race_copy FROM '{d}/many.csv' (FORMAT csv, HEADER false)", headers={"x-pondra-owner": owner_key}), done=time.time())
+    loader = threading.Thread(target=load)
+    loader.start()
+    time.sleep(0.2)
+    q("ALTER TABLE race_copy ALTER COLUMN b FIRST")
+    moved_at = time.time()
+    loader.join()
+    copied = q("SELECT count(*) AS n FROM race_copy")
+    raced["copy"] = {**outcome, "after_move_s": round(outcome["done"] - moved_at, 2), "rows_then": copied}
+    checks["a move while a headerless CSV's COPY runs on another node: refused 40001, nothing written"] = \
+        outcome["done"] > moved_at and outcome["state"] == "40001" and copied == [{"n": 0}]
+    # (a node whose autocommitted writes wait 1.5 s once their rows are worked out, before their append: the move lands then)
+    paused = Node(lake, A.port + 3, tier_secs=0.3, env={"PONDRA_TEST_AUTOCOMMIT_PAUSE_MS": "1500"}).start()
+    nodes.append(paused)
+    q("CREATE TABLE race_up (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)")
+    until(lambda: names("race_up", A.port + 3), ["id", "a", "b"], 10)
+    outcome = {}
+    def upsert():
+        outcome.update(told(A.port + 3, "INSERT INTO race_up VALUES (1, 10, 20) ON CONFLICT (id) DO UPDATE SET a = excluded.a, b = excluded.b"), done=time.time())
+    writer = threading.Thread(target=upsert)
+    writer.start()
+    time.sleep(0.5)
+    q("ALTER TABLE race_up ALTER COLUMN b AFTER id")
+    moved_at = time.time()
+    writer.join()
+    upserted = q("SELECT a, b FROM race_up")
+    raced["upsert"] = {**outcome, "after_move_s": round(outcome["done"] - moved_at, 2), "rows_then": upserted}
+    checks["a move while a one-key upsert without a column list waits to append on another node: refused 40001, nothing written"] = \
+        outcome["done"] > moved_at and outcome["state"] == "40001" and upserted == []
     # After a restart, as it was
     before = gotk()
     for node in nodes:
@@ -10029,7 +10110,7 @@ def colorder():
     for node in nodes:
         node.kill()
     ok = all(checks.values())
-    print(json.dumps({"colorder": checks, "refused": refused, "outside_readers": theirs, "rows": len(before), "ok": ok}, indent=1, default=str))
+    print(json.dumps({"colorder": checks, "refused": refused, "outside_readers": theirs, "raced": raced, "rows": len(before), "ok": ok}, indent=1, default=str))
     if not ok:
         sys.exit(1)
     return f"column order: {len(checks)} checks pass (every positional write and read, a keyed table, two nodes, Delta and Iceberg, a restart)"
