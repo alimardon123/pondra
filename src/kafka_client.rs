@@ -19,7 +19,7 @@ pub static KAFKA: crate::registry::BuiltIn = crate::registry::BuiltIn {
     register: |r| r.section_mut::<crate::connections::ConnectionTypes>().add(&TOPICS),
 };
 
-static TOPICS: crate::connections::ConnectionType = {
+const TOPICS: crate::connections::ConnectionType = {
     use crate::connections::{ConnectionType, Holds, READ_ONLY, SECRET, URL};
     ConnectionType { name: "kafka", holds: Holds::Messages, options: &[URL, SECRET, READ_ONLY], schemes: &["kafka"], secret_types: &["kafka"], about: "a Kafka cluster, its topics read as tables: url = 'kafka://broker:9092'" }
 };
