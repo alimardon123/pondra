@@ -541,6 +541,7 @@ def files_checks(browser, port, show):
     clean = until(lambda: pg.tab(), ("top.sql", False))
     checks["a SQL file changed shows it (its tab, the Workspace) and Ctrl+S saves it in place"] = dirty == (("top.sql", True), 1) and saved == top + b"\nLIMIT 2" and clean == ("top.sql", False)
     put(port, "scripts/multi.sql", b"CREATE TABLE IF NOT EXISTS fm AS SELECT 1 AS a;\n-- its rows; this ; is a comment's\nSELECT a, 'x;y' AS s FROM fm;\nSELECT nope;\nSELECT 5")
+    p.click("#refresh")  # (a file put from outside is in the tree once it reads the files again; the save's own read, 250 ms after it, may come first)
     pg.workspace("scripts", "multi.sql").click()
     until(lambda: pg.tab()[0], "multi.sql")
     p.click("#runAll")
