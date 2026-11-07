@@ -207,7 +207,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             // Sent again: columns may only grow at the end (ALTER TABLE … ADD COLUMN; a re-sent
             // original definition is fine), and `publish` may change.
             let (old, new) = (l.columns().len(), columns.len());
-            ensure!(columns[..new.min(old)] == l.columns()[..new.min(old)], "{name} exists with other columns (only new ones can be added, at the end)");
+            ensure!(columns[..new.min(old)].iter().map(|(c, t)| (c.as_str(), t.as_str())).eq(l.columns().take(new.min(old))), "{name} exists with other columns (only new ones can be added, at the end)");
             let republish = publish.as_ref().is_some_and(|p| *p != m.publish);
             // (Delta and Iceberg name a table's files under its folder; a clone lists others': ADR-043)
             ensure!(!republish || m.shares.is_empty() || publish.as_ref().is_some_and(|p| p.is_empty()), "{name} is a clone, whose files are partly another table's: it can't be published (CREATE TABLE … AS SELECT * FROM {name} copies it)");
@@ -1032,17 +1032,17 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
     let table = stmt.table();
     let m: TableMeta = (*lake.table_meta(&table).await?).clone().logical(); // (as SQL names it)
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
-    let mut spec = j!({"columns": m.columns(), "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": crate::objects::not_null_columns(&m), "defaults": crate::objects::column_defaults(&m), "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds"))});
+    let mut spec = j!({"columns": m.to_columns(), "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": crate::objects::not_null_columns(&m), "defaults": crate::objects::column_defaults(&m), "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds"))});
     match stmt {
         Stmt::AddColumn(_, column, sql_type, if_not_exists, place) => {
-            if m.columns().iter().any(|(c, _)| c == column) {
+            if m.columns().any(|(c, _)| c == column) {
                 ensure!(*if_not_exists, crate::rules::alter::has_column(&table, column));
                 return Ok(None);
             }
             if let Some(place) = place {
                 // (where SQL lists it, sent with it: one commit, `create_table`'s `shown`)
                 if let crate::ddl::Place::After(b) = place {
-                    ensure!(m.columns().iter().any(|(c, _)| c == b) && b != "_deleted", crate::rules::alter::no_column(&table, b));
+                    ensure!(m.columns().any(|(c, _)| c == b) && b != "_deleted", crate::rules::alter::no_column(&table, b));
                 }
                 let order: Vec<String> = m.sql_names();
                 spec["shown"] = j!(place.put(&order, column).map_err(|e| crate::codes::coded("42P10", e))?);
@@ -1059,7 +1059,7 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
             };
             let sql_type = if enumerated.is_some() || held.is_some() { "VARCHAR" } else { sql_type }; // (an enum, a uuid or a VARCHAR(n) column holds text)
             ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
-            let mut columns = m.columns().to_vec();
+            let mut columns = m.to_columns();
             columns.push((column.to_string(), crate::answer::type_name(ctx.table("t").await?.schema().field(0).data_type())));
             spec["columns"] = j!(columns);
             if let Some(e) = enumerated {
@@ -1096,16 +1096,16 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
     let q = |c: &str| format!("\"{c}\"");
     // (a changed row keeps its `_row_id` and `_created_at`: `sys.rs`)
     let select = |pick: &dyn Fn(&str) -> String, table: &str, cond: &Option<String>| {
-        let cols = meta.columns().iter().map(|(c, _)| format!("{} AS {}", pick(c), q(c))).collect::<Vec<_>>().join(", ");
+        let cols = meta.columns().map(|(c, _)| format!("{} AS {}", pick(c), q(c))).collect::<Vec<_>>().join(", ");
         format!("SELECT {cols}, \"_row_id\", \"_created_at\" FROM {} {}", sql_name(table), cond.as_ref().map(|w| format!("WHERE {w}")).unwrap_or_default())
     };
-    let deletes = meta.columns().iter().any(|(c, _)| c == "_deleted");
+    let deletes = meta.columns().any(|(c, _)| c == "_deleted");
     ensure!(matches!(stmt, Stmt::Insert(..)) || !meta.key.is_empty(), "UPDATE and DELETE need a keyed table (append tables only take INSERTs)");
     match stmt {
         Stmt::Insert(_, query) => Ok(query.clone()),
         Stmt::Update(t, set, cond) => {
             if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", "merge tables combine rows per key: INSERT into them instead of UPDATE")); }
-            ensure!(set.iter().all(|(c, _)| !meta.key.contains(c) && meta.columns().iter().any(|(n, _)| n == c)), "UPDATE sets existing non-key columns");
+            ensure!(set.iter().all(|(c, _)| !meta.key.contains(c) && meta.columns().any(|(n, _)| n == c)), "UPDATE sets existing non-key columns");
             let pick = |c: &str| match set.iter().find(|(s, _)| s == c) {
                 Some((_, e)) => format!("({})", crate::rules::rows::value(meta, c, e)),
                 None => q(c), // (`_deleted` too: an updated row keeps its own, as `change::select_as` does)

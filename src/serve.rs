@@ -44,7 +44,7 @@ impl Groups {
 /// The newest row of `key` (comma-separated values, in key order) in upsert table `meta`, if it
 /// exists, isn't deleted and isn't past the table's TTL. Table metadata first, then the log: one consistent snapshot.
 pub async fn lookup(lake: &Lake, table: &str, meta: &TableMeta, key: &str) -> Result<Option<RecordBatch>> {
-    let types: HashMap<&str, &str> = meta.columns().iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
+    let types: HashMap<&str, &str> = meta.columns().collect();
     let keys: Vec<(&str, ScalarValue)> = meta.key.iter().zip(key.split(',')).map(|(c, v)| {
         Ok((c.as_str(), ScalarValue::try_from_string(v.to_string(), &types[c.as_str()].parse()?)?))
     }).collect::<Result<_>>()?;
@@ -74,7 +74,7 @@ pub struct Point {
 impl Point {
     /// Its answer's columns.
     pub fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> {
-        let types: HashMap<&str, &str> = self.meta.columns().iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
+        let types: HashMap<&str, &str> = self.meta.columns().collect();
         crate::answer::schema(&self.names.iter().map(|n| (n.clone(), types[n.as_str()].to_string())).collect::<Vec<_>>())
     }
 
@@ -84,7 +84,7 @@ impl Point {
     /// Its parameters' types (`$1`…, in order), as the key columns they stand for.
     pub fn parameters(&self, sql: &str) -> Vec<datafusion::arrow::datatypes::DataType> {
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
-        let types: HashMap<&str, &str> = self.meta.columns().iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
+        let types: HashMap<&str, &str> = self.meta.columns().collect();
         let mut out = vec![datafusion::arrow::datatypes::DataType::Utf8; n];
         for (k, v) in self.meta.key.iter().zip(&self.key) {
             if v.is_none() {
@@ -154,9 +154,9 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
     }
     let Some((key, params)) = key_of(&meta, filter) else { return Ok(None) };
     let names: Vec<String> = match s.projection.as_slice() {
-        [SelectItem::Wildcard(_)] => meta.columns().iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect(), // (as `SELECT *` shows it)
+        [SelectItem::Wildcard(_)] => meta.columns().map(|(c, _)| c.to_string()).filter(|c| c != "_deleted").collect(), // (as `SELECT *` shows it)
         items => items.iter().map(|i| match i {
-            SelectItem::UnnamedExpr(Expr::Identifier(c)) if meta.columns().iter().any(|(n, _)| *n == c.value) => Some(c.value.clone()),
+            SelectItem::UnnamedExpr(Expr::Identifier(c)) if meta.columns().any(|(n, _)| *n == c.value) => Some(c.value.clone()),
             _ => None,
         }).collect::<Option<_>>().unwrap_or_default(),
     };
@@ -176,7 +176,7 @@ fn pointable(meta: &TableMeta) -> bool {
 /// key order (None: a parameter, whose number the map gives). None: any other condition.
 fn key_of(meta: &TableMeta, filter: &datafusion::sql::sqlparser::ast::Expr) -> Option<(Vec<Option<String>>, HashMap<String, usize>)> {
     use datafusion::sql::sqlparser::ast::{BinaryOperator, DollarQuotedString, Expr, Value};
-    let text = |c: &str| meta.columns().iter().any(|(n, t)| n == c && t.contains("Utf8"));
+    let text = |c: &str| meta.columns().any(|(n, t)| n == c && t.contains("Utf8"));
     let (mut eqs, mut params) = (vec![], HashMap::new());
     let mut stack = vec![filter];
     while let Some(e) = stack.pop() {
@@ -336,7 +336,7 @@ async fn newest_in_log(lake: &Lake, table: &str, meta: &TableMeta, keys: &[(&str
 pub async fn lookup_versioned(lake: &Lake, table: &str, meta: &TableMeta, key: &[String]) -> Result<Option<(RecordBatch, u64, Option<i64>)>> {
     use datafusion::arrow::array::AsArray;
     use datafusion::arrow::datatypes::{DataType, Int64Type, TimeUnit, TimestampMicrosecondType};
-    let types: HashMap<&str, &str> = meta.columns().iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
+    let types: HashMap<&str, &str> = meta.columns().collect();
     let keys: Vec<(&str, ScalarValue)> = meta.key.iter().zip(key).map(|(c, v)| Ok((c.as_str(), ScalarValue::try_from_string(v.to_string(), &types[c.as_str()].parse()?)?))).collect::<Result<_>>()?;
     anyhow::ensure!(keys.len() == meta.key.len(), "the key of {table} has {} parts", meta.key.len());
     let created = |r: &RecordBatch| -> Result<Option<i64>> {

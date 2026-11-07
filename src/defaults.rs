@@ -93,7 +93,7 @@ pub async fn alter(lake: &Lake, table: &str, column: &str, change: Change) -> Re
             m.set_default(&stored, None); // (none there is no error)
         }
         Change::Default(Some(expr)) => {
-            let sql_type = m.columns().iter().find(|(c, _)| *c == stored).map(|(_, t)| t.clone()).unwrap_or_default();
+            let sql_type = m.col(&stored).map(|c| c.dtype.clone()).unwrap_or_default();
             validate(column, &sql_type, &expr).await?;
             crate::seq::named_exist(lake, &expr).await?; // (DEFAULT nextval('s'): s is there)
             m.set_default(&stored, Some(expr));

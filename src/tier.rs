@@ -197,8 +197,8 @@ async fn shadow(lake: &Lake, table: &str, meta: &mut TableMeta, new: &[String], 
     if !meta.shadows || new.is_empty() {
         return Ok(());
     }
-    let (ctx, marked) = (lake.session(), meta.columns().iter().any(|(c, _)| c == "_deleted"));
-    let cols: Vec<(String, String)> = meta.columns().iter().filter(|(c, _)| meta.key.contains(c) || c == "_deleted").cloned().collect();
+    let (ctx, marked) = (lake.session(), meta.columns().any(|(c, _)| c == "_deleted"));
+    let cols: Vec<(String, String)> = meta.columns().filter(|(c, _)| meta.key.iter().any(|k| k == c) || *c == "_deleted").map(|(c, t)| (c.to_string(), t.to_string())).collect();
     let schema = schema(&cols)?;
     let places = |b: Vec<RecordBatch>| b.iter().flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().iter().map(|p| *p as u64).collect::<Vec<_>>()).collect::<Vec<u64>>();
     let mut hit: Vec<(String, Vec<u64>)> = vec![];
@@ -251,7 +251,7 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
     let (after, upto, now) = (meta.purged(), meta.tiered.min(dmeta.tiered), crate::log::now_ms());
     let within = datafusion::prelude::col(VERSION).between(datafusion::prelude::lit(after as i64 + 1), datafusion::prelude::lit(upto as i64));
     let gone = match upto > after {
-        true => crate::manifest::pruned(lake, &dmeta, None, &[within], &schema(&with_sys(&dmeta).columns())?).await?,
+        true => crate::manifest::pruned(lake, &dmeta, None, &[within], &with_sys(&dmeta).schema()?).await?,
         false => vec![],
     };
     let waiting: u64 = gone.iter().map(|f| f.rows).sum();
@@ -577,7 +577,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
             }).collect());
         }
         Kind::Merge { files } => {
-            let schema = schema(&meta.columns())?;
+            let schema = meta.schema()?;
             let session = lake.session();
             let read = || async { crate::query::files_once(lake, &session, &files.iter().collect::<Vec<_>>(), &meta, &schema).await };
             let rows = match meta.cluster.is_empty() {

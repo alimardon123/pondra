@@ -235,7 +235,7 @@ pub async fn upserts(lake: &Lake, seq: &crate::log::Sequencer, table: &str, rows
 /// `_row_id` (the new rows'); and, for the old rows it takes out, `_created_at` and `_version` too.
 fn sys_schema(meta: &TableMeta, old: bool) -> Result<datafusion::arrow::datatypes::SchemaRef> {
     let sys = crate::sys::columns();
-    let mut columns = meta.columns().to_vec();
+    let mut columns = meta.to_columns();
     columns.extend(sys.iter().filter(|(c, _)| c == crate::text::ROW_ID || (old && (c == crate::text::CREATED || c == crate::text::VERSION))).cloned());
     crate::answer::schema(&columns)
 }

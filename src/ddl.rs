@@ -1554,8 +1554,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             let ctx = datafusion::prelude::SessionContext::new();
             ctx.sql(&format!("CREATE TABLE t (c {sql_type})")).await?;
             let new = crate::answer::stored(ctx.table("t").await?.schema().field(0).data_type());
-            let at = m.columns().iter().position(|(c, _)| *c == stored).expect("a live column");
-            let old = crate::answer::dtype(&m.columns()[at].1)?;
+            let old = crate::answer::dtype(&m.col(&stored).expect("a live column").dtype)?;
             if let Some(wanted) = declared.filter(|_| old == new) {
                 // A length on text only grows: the rows there were checked against the one it had.
                 match (held.as_deref().and_then(crate::rules::typed::length), crate::rules::typed::length(&wanted)) {
@@ -1576,7 +1575,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
                 ensure!(old == new || widens(&old, &new), "{column} is {old}: a column's type can only widen (a smaller integer to a bigger one, FLOAT to DOUBLE, a DECIMAL to more digits), which every file already written still reads as");
                 ensure!(old == new || partition.as_deref() != Some(stored.as_str()), "{column} is {name}'s partition_by column: its type stays");
                 m.retype_column(&stored, crate::answer::type_name(&new));
-                j!({"column": column, "type": m.columns()[at].1})
+                j!({"column": column, "type": m.col(&stored).map(|c| c.dtype.as_str())})
             }
         }
         Change::Default(_) | Change::NotNull(_) => unreachable!("defaults::alter takes them, above"),

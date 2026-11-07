@@ -78,7 +78,7 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
         ensure!(!before, "{t} AT (…): {t} was made at version {v} ({made}); it has no past before that");
     }
     let ts = |us: i64| lit(ScalarValue::TimestampMicrosecond(Some(us), Some("UTC".into())));
-    let user: Vec<Expr> = meta.columns().iter().map(|(c, _)| ident(c)).collect();
+    let user: Vec<Expr> = meta.columns().map(|(c, _)| ident(c)).collect();
     let shown = |more: Vec<Expr>| user.iter().cloned().chain(more).collect::<Vec<_>>();
     let system = || if sys { [ROW_ID, VERSION, CREATED, UPDATED].map(col).to_vec() } else { vec![] };
     let rows = ctx.read_table(crate::query::table_view(lake, ctx, &local, &meta, true, upto).await?)?;

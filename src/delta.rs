@@ -123,7 +123,7 @@ pub struct Parts {
 }
 
 pub async fn publishable(lake: &Lake, meta: &TableMeta) -> Result<Option<Parts>> {
-    let deletes = meta.columns().iter().any(|(c, _)| c == "_deleted");
+    let deletes = meta.columns().any(|(c, _)| c == "_deleted");
     Ok(match meta.key.is_empty() {
         true => Some(Parts { manifests: crate::manifest::list(lake, meta).await?, inline: meta.files.clone() }),
         // (every generation, its older versions and markers positions: `tier::shadow`)

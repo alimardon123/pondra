@@ -868,8 +868,17 @@ impl TableMeta {
     pub(crate) fn list(&self) -> &Stored { &self.record.list }
 
     /// Every column the entry keeps, dropped ones too, as (stored name, Arrow type text), in stored order: a file's
-    /// schema. SQL's view of them is `sql_columns`, `star` or the list (`cols`).
-    pub fn columns(&self) -> &[(String, String)] { &self.fields().columns }
+    /// schema (`schema`, `read_schema`). SQL's view of them is `sql_columns`, `star` or the list (`cols`).
+    pub fn columns(&self) -> impl ExactSizeIterator<Item = (&str, &str)> + Clone + '_ { self.list().columns.iter().map(|c| (c.stored_name(), c.dtype.as_str())) }
+
+    /// `columns`, copied out: for a reader that keeps them or adds to them.
+    pub fn to_columns(&self) -> Vec<(String, String)> { self.columns().map(|(c, t)| (c.to_string(), t.to_string())).collect() }
+
+    /// The stored columns' Arrow schema (`columns`), each nullable: a file's, as the table writes it.
+    pub fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::answer::schema_of(self.columns()) }
+
+    /// `schema` as a scan reads it, text as Utf8View (`query::read_schema`).
+    pub fn read_schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::answer::read_schema_of(self.columns()) }
     /// The stored columns, taken out of an entry made for the purpose (`described`, `with_sys`).
     pub fn into_columns(self) -> Vec<(String, String)> { self.record.list.columns.into_iter().map(|c| (c.stored.unwrap_or(c.name), c.dtype)).collect() }
 
@@ -1035,7 +1044,7 @@ impl TableMeta {
     /// SQL's columns, as `logical()` has them, without copying the rest of the entry (its files).
     pub fn logical_columns(&self) -> Vec<(String, String)> {
         if !self.mapped() {
-            return self.columns().to_vec();
+            return self.to_columns();
         }
         self.live().map(|(_, n, t)| (n.to_string(), t.to_string())).collect()
     }
@@ -2815,7 +2824,7 @@ impl Lake {
     pub async fn filed_rows(&self, seg: &Segment, table: &str, removed: bool, from: u64, rows: u64) -> Result<Vec<RecordBatch>> {
         let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
         let meta = crate::sys::with_sys(&meta);
-        let schema = crate::answer::schema(&meta.columns())?;
+        let schema = meta.schema()?;
         let (ctx, end, mut at, mut out) = (self.session(), from.saturating_add(rows), 0u64, vec![]);
         for f in if removed { &filed.removed } else { &filed.added } {
             let (lo, hi) = (at.max(from), (at + f.rows).min(end));
@@ -2835,7 +2844,7 @@ impl Lake {
     pub async fn deleted_rows(&self, seg: &Segment, table: &str) -> Result<Vec<RecordBatch>> {
         let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
         let meta = crate::sys::with_sys(&meta);
-        let schema = crate::answer::schema(&meta.columns())?;
+        let schema = meta.schema()?;
         let mut out = vec![];
         for (f, deletes) in &filed.deleted {
             out.extend(crate::adopt::rows_deleted(self, &meta, f, deletes, &schema).await?);
@@ -4699,7 +4708,7 @@ mod tests {
             assert_eq!(l.fields().enums.get(&c.name).map(|e| (e.of.clone(), e.labels.clone())), c.labels, "{}", c.name);
         }
         assert_eq!(l.key, t.key);
-        assert_eq!(l.columns().iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), names);
+        assert_eq!(l.columns().map(|(n, _)| n).collect::<Vec<_>>(), names);
         assert!(!l.fields().defaults.contains_key("gone") && !l.fields().sql_types.contains_key("gone") && !l.fields().not_null.iter().any(|c| c == "gone"));
         Ok(())
     }
@@ -4741,9 +4750,10 @@ mod tests {
     fn the_column_list_is_the_entrys_columns_in_sqls_order() {
         // (the order as `in_order` made it before the list: `shown`'s columns, then the rest as stored, the dropped out)
         fn was(m: &TableMeta) -> Vec<String> {
-            let first = m.fields().shown.iter().filter_map(|s| m.columns().iter().find(|(c, _)| c == s));
-            let rest = m.columns().iter().filter(|(c, _)| !m.fields().shown.contains(c));
-            first.chain(rest).filter(|(c, _)| !m.fields().dropped.contains(c)).map(|(c, _)| m.name_of(c).to_string()).collect()
+            let (shown, dropped) = (&m.fields().shown, &m.fields().dropped);
+            let first = shown.iter().filter_map(|s| m.columns().find(|(c, _)| c == s));
+            let rest = m.columns().filter(|(c, _)| !shown.iter().any(|s| s == c));
+            first.chain(rest).filter(|(c, _)| !dropped.iter().any(|d| d == c)).map(|(c, _)| m.name_of(c).to_string()).collect()
         }
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = |n: u64| {
@@ -4798,9 +4808,9 @@ mod tests {
             assert_eq!(m.sql_names(), sql.iter().filter(|c| *c != "_deleted").cloned().collect::<Vec<_>>());
             let l = m.logical();
             assert_eq!((l.star(), l.sql_names(), l.sql_order()), (m.star(), m.sql_names(), m.sql_order()), "the same of the logical copy");
-            assert_eq!((m.sql_key(), m.sql_partition(), m.logical_columns()), (l.key.clone(), l.partition.clone(), l.columns().to_vec()), "a field without the copy");
+            assert_eq!((m.sql_key(), m.sql_partition(), m.logical_columns()), (l.key.clone(), l.partition.clone(), l.to_columns()), "a field without the copy");
             for c in list.all() {
-                assert_eq!(m.columns()[c.id as usize - 1].0, c.stored, "an id is a stored place + 1");
+                assert_eq!(m.columns().nth(c.id as usize - 1).map(|(s, _)| s), Some(c.stored.as_str()), "an id is a stored place + 1");
                 assert_eq!((c.name.as_str(), c.dropped), (m.name_of(&c.stored), m.fields().dropped.contains(&c.stored)));
             }
             assert_eq!(list.all().len(), n, "every column, the dropped too");
@@ -4940,7 +4950,10 @@ mod tests {
                 })
                 .fold(f64::MAX, f64::min)
         };
-        let helpers: [(&str, fn(&TableMeta) -> usize); 9] = [
+        let helpers: [(&str, fn(&TableMeta) -> usize); 12] = [
+            ("columns()", |m| m.columns().map(|(c, t)| c.len() + t.len()).sum()),
+            ("schema()", |m| m.schema().unwrap().fields().len()),
+            ("read_schema()", |m| m.read_schema().unwrap().fields().len()),
             ("table_sql()", |m| crate::objects::table_sql("t", m).len()),
             ("types::shown(), each column", |m| m.list().columns.iter().filter_map(|c| m.col(c.stored_name())).map(|c| crate::types::shown(c).len()).sum()),
             ("default_sql(), each column", |m| m.live().filter_map(|(_, n, _)| crate::rules::rows::default_sql(m, n)).count()),
@@ -4964,7 +4977,7 @@ mod tests {
                 println!("{what}, {helper}: {warm:.2} µs warm, {first:.2} µs first, an entry, best of 5");
             }
             let m = read().remove(0);
-            let b = RecordBatch::new_empty(crate::answer::schema(m.columns()).unwrap());
+            let b = RecordBatch::new_empty(m.schema().unwrap());
             let warm = best(rounds, &mut || { std::hint::black_box(m.to_logical(&b).unwrap().num_columns()); });
             println!("{what}, to_logical() of a batch of every stored column: {warm:.2} µs warm, the first entry");
         }
@@ -5018,7 +5031,7 @@ mod tests {
         assert!(["columns", "names", "dropped", "not_null", "defaults", "identity", "enums", "sql_types"].iter().all(|k| new.get(k).is_none()), "{new}");
         let back: TableMeta = serde_json::from_value(new.clone()).unwrap();
         assert!(back.record.listed && serde_json::to_value(&back).unwrap() == new);
-        assert_eq!((back.columns(), &back.fields().names, &back.fields().not_null, &back.fields().identity), (t.columns(), &t.fields().names, &t.fields().not_null, &t.fields().identity));
+        assert_eq!((back.to_columns(), &back.fields().names, &back.fields().not_null, &back.fields().identity), (t.to_columns(), &t.fields().names, &t.fields().not_null, &t.fields().identity));
         let again: TableMeta = serde_json::from_value(old.clone()).unwrap();
         assert!(!again.record.listed && serde_json::to_value(&again).unwrap() == old, "format 5's, field for field");
         let mut edited = back.clone();
@@ -5143,7 +5156,7 @@ mod tests {
             }
             let mut d = TableMeta::default();
             d.follow_columns(&a);
-            assert_eq!(d.columns().last().map(|(c, _)| c.as_str()), Some("_old_version"));
+            assert_eq!(d.columns().last().map(|(c, _)| c), Some("_old_version"));
             assert_eq!((&d.fields().names, &d.fields().dropped, d.columns().len()), (&a.fields().names, &a.fields().dropped, a.columns().len() + 1));
         }
     }

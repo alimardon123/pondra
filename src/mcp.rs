@@ -241,7 +241,7 @@ async fn list(app: &App) -> Result<Value> {
             }
             let kind = if !m.merge.is_empty() { "merge" } else if !m.key.is_empty() { "upsert" } else { "append" };
             let m = m.described(); // (SQL's names: ADR-022; a finished view's answers)
-            let columns: Vec<Value> = m.columns().iter().filter(|(c, _)| c != "_deleted").map(|(c, t)| json!({"name": c, "type": t})).collect();
+            let columns: Vec<Value> = m.columns().filter(|(c, _)| *c != "_deleted").map(|(c, t)| json!({"name": c, "type": t})).collect();
             let view = crate::views::code_for_caller(|| views.iter().find(|(k, _)| &k[2..] == name).map(|(_, v)| v.sql.clone())).flatten();
             tables.push(json!({"table": format!("{prefix}{name}"), "kind": kind, "key": m.key, "merge": m.merge, "columns": columns, "view": view}));
         }

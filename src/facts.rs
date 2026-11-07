@@ -351,7 +351,7 @@ async fn kept(lake: &Lake, view: &str) -> Result<Kept> {
     let meta: TableMeta = lake.cat.get(&table_key(view)).await?.ok_or_else(|| anyhow!("relation \"{view}\" does not exist"))?;
     let d = meta.described();
     Ok(Kept {
-        columns: d.columns().iter().map(|(n, _)| n.clone()).filter(|n| !d.marker(n)).collect(),
+        columns: d.columns().map(|(n, _)| n.to_string()).filter(|n| !d.marker(n)).collect(),
         key: d.key.clone(),
         facts: d.constraints.clone(),
         meta,

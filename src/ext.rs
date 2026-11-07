@@ -457,7 +457,7 @@ async fn retyped_meta(spec: &Spec) -> Result<Option<TableMeta>> {
     if listed.files.is_empty() || listed.files.iter().any(|f| !f.part.is_empty()) {
         return Ok(None);
     }
-    let Ok(schema) = crate::answer::schema(&listed.columns()) else { return Ok(None) };
+    let Ok(schema) = listed.schema() else { return Ok(None) };
     let schema = crate::ext_names::retyped(&schema, &types)?;
     Ok(Some({ let mut entry = TableMeta::with_columns(crate::ext_names::named(schema.fields())); entry.files = listed.files; entry.ext = Some(spec.clone()); entry }))
 }
@@ -1914,7 +1914,7 @@ mod tests {
         LISTED.scope(Default::default(), async {
             keep(&crate::ext_names::name(&plain), &listed);
             let m = retyped_meta(&typed).await.unwrap().expect("listed");
-            assert_eq!(m.columns(), vec![("zip".to_string(), "Utf8".to_string()), ("n".to_string(), "Int64".to_string())]);
+            assert_eq!(m.to_columns(), vec![("zip".to_string(), "Utf8".to_string()), ("n".to_string(), "Int64".to_string())]);
             assert_eq!(m.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["file:///d/a.csv"]);
             assert_eq!(m.ext.expect("its spec").options["types"], "\"zip\" VARCHAR");
             let mut nope = plain.clone();
