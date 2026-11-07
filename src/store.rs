@@ -23,6 +23,7 @@ use object_store::local::LocalFileSystem;
 use object_store::{path::Path, prefix::PrefixStore, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::kv::{self, Kv, Written};
+use crate::lifecycle::Life;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, Weak};
@@ -1842,6 +1843,9 @@ pub struct Lake {
     bases: std::sync::RwLock<BTreeMap<String, (String, Option<Store>)>>, // a branch's bases (ADR-047): id -> place, and its store once read
     sessions: Mutex<std::collections::HashMap<usize, datafusion::execution::SessionState>>, // (`session_with`'s, made once a partition count)
     me: std::sync::Weak<Lake>,
+    /// The lifecycle of the node it is open in, or of the program or test that opened it: what its catalog's fence and its
+    /// vital loops' failures stop or restart (`lifecycle.rs`).
+    pub life: crate::lifecycle::Life,
 }
 
 impl std::fmt::Debug for Lake {
@@ -2359,24 +2363,24 @@ impl Lake {
     /// What opening a folder with no catalog says (a follower of a leader still making one waits).
     pub const NO_LAKE: &'static str = "holds no lake yet";
 
-    pub async fn open(url: &str, writer: bool, streamed: bool) -> Result<Arc<Lake>> {
-        Self::open_polled(url, writer, streamed, READER_POLL).await
+    pub async fn open(url: &str, writer: bool, streamed: bool, life: Life) -> Result<Arc<Lake>> {
+        Self::open_polled(url, writer, streamed, READER_POLL, life).await
     }
 
     /// `open`, a reader polling the bucket every `poll` (`READER_POLL`, or `READER_ONE_SNAPSHOT` for a guest's one statement).
-    pub async fn open_polled(url: &str, writer: bool, streamed: bool, poll: Duration) -> Result<Arc<Lake>> {
-        Self::open_with(url, writer, streamed, poll, None).await
+    pub async fn open_polled(url: &str, writer: bool, streamed: bool, poll: Duration, life: Life) -> Result<Arc<Lake>> {
+        Self::open_with(url, writer, streamed, poll, None, life).await
     }
 
     /// A reader of the lake at `url` (a memory URL whose store is given: `memory::give`) whose catalog is `kv`, a node's
     /// over `kv::remote` for a joined page (designs/l2-page-joins-cluster.md, J5). Nothing polls `kv`, and the lake's torn
     /// move is not checked here: the node that serves the catalog checks it.
-    pub(crate) async fn open_on(url: &str, streamed: bool, kv: Arc<dyn Kv>) -> Result<Arc<Lake>> {
-        Self::open_with(url, false, streamed, READER_POLL, Some(kv)).await
+    pub(crate) async fn open_on(url: &str, streamed: bool, kv: Arc<dyn Kv>, life: Life) -> Result<Arc<Lake>> {
+        Self::open_with(url, false, streamed, READER_POLL, Some(kv), life).await
     }
 
     /// `open_polled` and `open_on`: a reader's catalog is `given` when one is, else `kv::reader` on the lake's store.
-    async fn open_with(url: &str, writer: bool, streamed: bool, poll: Duration, given: Option<Arc<dyn Kv>>) -> Result<Arc<Lake>> {
+    async fn open_with(url: &str, writer: bool, streamed: bool, poll: Duration, given: Option<Arc<dyn Kv>>, life: Life) -> Result<Arc<Lake>> {
         let (url, store, bucket) = open_store(url)?;
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
         let local = bucket.is_none() || memory;
@@ -2408,15 +2412,15 @@ impl Lake {
             Ok::<_, anyhow::Error>(match writer {
                 true => {
                     let t0 = datafusion::common::instant::Instant::now();
-                    let kv = kv::writer(store.clone(), cache_dir, local).await?;
+                    let kv = kv::writer(store.clone(), cache_dir, local, life.clone()).await?;
                     trace_since("the catalog's writer open", t0);
-                    Catalog::writer(kv, t0).await?
+                    Catalog::writer(kv, t0, life.clone()).await?
                 }
                 // (a given catalog is a node's: no bucket to wait for, and the store a page holds lists nothing under `catalog/`,
                 // so `opened`'s listing after 3 s would fail a slow open)
                 false => match given {
-                    Some(kv) => Catalog::reader(kv, streamed).await?,
-                    None => match Catalog::opened(store.clone(), streamed, kv::reader(store.clone(), streamed, cache_dir, poll)).await {
+                    Some(kv) => Catalog::reader(kv, streamed, life.clone()).await?,
+                    None => match Catalog::opened(store.clone(), streamed, kv::reader(store.clone(), streamed, cache_dir, poll), life.clone()).await {
                         Ok(cat) => cat,
                         // (no catalog at all: say so, rather than the database's own words for it)
                         Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
@@ -2435,7 +2439,7 @@ impl Lake {
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), life });
         for (name, cache) in lake.caches() {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
@@ -2445,7 +2449,7 @@ impl Lake {
         crate::oom::wake();
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
-            crate::panics::spawn(Lake::commits(Arc::downgrade(&lake), writes)); // (weak: a lake opened in a process goes when its last handle does)
+            crate::panics::spawn(Lake::commits(Arc::downgrade(&lake), writes, lake.life.clone())); // (weak: a lake opened in a process goes when its last handle does)
         }
         Ok(lake)
     }
@@ -2457,14 +2461,14 @@ impl Lake {
     /// us out) has an unknown outcome: restart and rejoin; the restart reloads the state.
     /// Both loops hold the lake weakly: the writes' sender is the lake's own (`Catalog::writes`), so
     /// a strong hold would keep a lake opened in a process (a backup taken in it) for ever.
-    async fn commits(me: std::sync::Weak<Self>, mut writes: mpsc::UnboundedReceiver<Write>) {
+    async fn commits(me: std::sync::Weak<Self>, mut writes: mpsc::UnboundedReceiver<Write>, life: Life) {
         let (to_bucket, mut in_bucket) = mpsc::unbounded_channel::<(Arc<dyn Written>, u64)>();
-        let lake = me.clone();
+        let (lake, lives) = (me.clone(), life.clone());
         crate::panics::spawn(async move {
             while let Some((handle, id)) = in_bucket.recv().await {
                 if let Err(e) = handle.durable().await {
                     eprintln!("catalog commit failed: {e}");
-                    crate::node::restart("a catalog commit failed");
+                    lives.restart("a catalog commit failed", &[]);
                 }
                 let Some(lake) = lake.upgrade() else { return };
                 lake.cat.durable.send_replace(id);
@@ -2491,7 +2495,7 @@ impl Lake {
                     r = handle.durable() => {
                         if let Err(e) = r {
                             eprintln!("catalog commit failed: {e}");
-                            crate::node::restart("a catalog commit failed");
+                            life.restart("a catalog commit failed", &[]);
                         }
                         break;
                     }
@@ -3163,6 +3167,7 @@ pub struct Catalog {
     segs: Arc<Mutex<Parsed<Segment>>>,    // log segments' entries as parsed (`segments`)
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
     closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
+    life: Life,                   // what a fence restarts: its lake's (`fatal`)
 }
 
 /// A scan in progress: the streamed changes it may still lay over its (older) view stay.
@@ -3378,8 +3383,8 @@ impl Drop for Catalog {
 impl Catalog {
     /// The catalog as its leader opens it, on `kv` (the leader's store, `kv::writer`). `since`: when its
     /// opening began, for `PONDRA_TRACE_START`.
-    async fn writer(kv: Arc<dyn Kv>, since: Instant) -> Result<Self> {
-        let mut cat = Self::new(kv);
+    async fn writer(kv: Arc<dyn Kv>, since: Instant, life: Life) -> Result<Self> {
+        let mut cat = Self::new(kv, life);
         cat.replicas = crate::env::value("PONDRA_REPLICAS");
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
         let c = cat.get::<u64>("c").await?.unwrap_or(0);
@@ -3391,8 +3396,9 @@ impl Catalog {
         // (what we inherited, replayed from the WAL, reaches every node's view at the first
         // checkpoint: right after the node serves, `main.rs`)
         // The leader too reads the catalog from memory: everything committed, nothing in flight.
-        let mut all = cat.kv.scan(b"".to_vec()..b"d/".to_vec(), false).await.map_err(fatal)?;
-        all.extend(cat.kv.scan(b"d0".to_vec()..vec![0xff], false).await.map_err(fatal)?);
+        let life = cat.life.clone();
+        let mut all = cat.kv.scan(b"".to_vec()..b"d/".to_vec(), false).await.map_err(|e| fatal(e, &*life))?;
+        all.extend(cat.kv.scan(b"d0".to_vec()..vec![0xff], false).await.map_err(|e| fatal(e, &*life))?);
         trace_since("the catalog in memory", since);
         let overlay = cat.overlay.get_mut().unwrap();
         for (k, v) in all {
@@ -3405,8 +3411,8 @@ impl Catalog {
     }
 
     /// The catalog as a follower or a reader opens it, on `kv` (`kv::reader`).
-    async fn reader(kv: Arc<dyn Kv>, streamed: bool) -> Result<Self> {
-        let mut cat = Self::new(kv);
+    async fn reader(kv: Arc<dyn Kv>, streamed: bool, life: Life) -> Result<Self> {
+        let mut cat = Self::new(kv, life);
         cat.follows = streamed;
         cat.refresh().await?; // (one try at the in-memory catalog before serving; later refreshes retry)
         Ok(cat)
@@ -3417,8 +3423,8 @@ impl Catalog {
     /// for ever. When opening takes a while, a listing (after the store's own retries) says
     /// whether there is a catalog to wait for. `reader_open` is the reader's opening: this waits
     /// for it, and for the catalog's first view of the bucket, under the one timeout.
-    async fn opened(store: Store, streamed: bool, reader_open: impl std::future::Future<Output = Result<Arc<dyn Kv>, kv::Error>>) -> Result<Self> {
-        let open = async { Self::reader(reader_open.await?, streamed).await };
+    async fn opened(store: Store, streamed: bool, reader_open: impl std::future::Future<Output = Result<Arc<dyn Kv>, kv::Error>>, life: Life) -> Result<Self> {
+        let open = async { Self::reader(reader_open.await?, streamed, life).await };
         tokio::pin!(open);
         if let Ok(cat) = tokio::time::timeout(Duration::from_secs(3), &mut open).await {
             return cat;
@@ -3430,11 +3436,11 @@ impl Catalog {
         }
     }
 
-    fn new(kv: Arc<dyn Kv>) -> Self {
+    fn new(kv: Arc<dyn Kv>, life: Life) -> Self {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default() }
+        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default(), life }
     }
 
     /// What the catalog's block caches hold, in bytes.
@@ -4127,25 +4133,25 @@ impl Catalog {
         if self.closing.load(Relaxed) {
             return e.into();
         }
-        fatal(e)
+        fatal(e, &*self.life)
     }
 }
 
 /// A writer that was fenced out (a new leader took over) must stop at once: it restarts and
 /// rejoins the cluster as a follower. (The upkeep's failures take this too: `kv::slate`.)
-pub(crate) fn fatal(e: kv::Error) -> anyhow::Error {
+pub(crate) fn fatal(e: kv::Error, life: &dyn crate::lifecycle::Lifecycle) -> anyhow::Error {
     if e.closed() {
         eprintln!("catalog closed: {e}");
-        crate::node::restart("the catalog was closed (fenced by a newer leader)");
+        life.restart("the catalog was closed (fenced by a newer leader)", &[]);
     }
     e.into()
 }
 
 /// Test hook: `PONDRA_CRASH=after_seg_put:0.05,after_parquet_put:0.2` aborts the process at
 /// that point with that probability, to prove crashes never lose or duplicate rows.
-pub fn maybe_crash(point: &str) {
+pub fn maybe_crash(point: &str, life: &dyn crate::lifecycle::Lifecycle) {
     if crash_rolled(point) {
-        if crate::node::hosted() {
+        if !life.owns_process() {
             panic!("PONDRA_CRASH at {point}"); // (a library's node fails, its host stays: a vital loop's panic)
         }
         eprintln!("PONDRA_CRASH: aborting at {point}");
@@ -4318,7 +4324,7 @@ mod tests {
         // (a lake opened to write: its commits are applied by `Lake::open`'s `commits`, which a bare
         // `Catalog::writer` never starts, so its `commit` would wait for ever)
         let dir = std::env::temp_dir().join(format!("pondra-scan-first-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         lake.cat.commit((0..5u8).map(|i| (format!("g/{i}"), vec![i])).chain([("h/x".to_string(), vec![9])]).collect(), &[]).await?;
         let first: Vec<String> = lake.cat.scan_first("g/", "g0", 3).await?.into_iter().map(|(k, _)| k).collect();
         assert_eq!(first, ["g/0", "g/1", "g/2"]);
@@ -4334,7 +4340,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scan_page_pages_a_range_past_the_keys_it_refuses() -> Result<()> {
         let url = format!("memory://scan-page-{}", uuid::Uuid::new_v4().simple());
-        let lake = Lake::open(&url, true, false).await?;
+        let lake = Lake::open(&url, true, false, crate::lifecycle::unhosted()).await?;
         lake.cat.commit((0..12u8).map(|i| (format!("g/{i:02}"), vec![i])).collect(), &[]).await?;
         let may = |k: &str| !matches!(k, "g/03" | "g/04" | "g/05" | "g/10");
         let (mut got, mut from, mut ats) = (Vec::new(), "g/".to_string(), Vec::new());
@@ -4355,7 +4361,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn moved_since_sees_a_commit_in_the_range_and_not_one_outside() -> Result<()> {
         let url = format!("memory://moved-since-{}", uuid::Uuid::new_v4().simple());
-        let lake = Lake::open(&url, true, false).await?;
+        let lake = Lake::open(&url, true, false, crate::lifecycle::unhosted()).await?;
         lake.cat.commit(vec![("g/1".to_string(), vec![1])], &[]).await?;
         let since = lake.cat.committed();
         lake.cat.commit(vec![("h/x".to_string(), vec![2])], &[]).await?;
@@ -4381,12 +4387,56 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-closed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
-        let cat = Catalog::writer(kv::writer(store, None, true).await?, Instant::now()).await?;
+        let cat = Catalog::writer(kv::writer(store, None, true, crate::lifecycle::unhosted()).await?, Instant::now(), crate::lifecycle::unhosted()).await?;
         let _ = cat.write(vec![("t/a".into(), b"1".to_vec())], &[]).await?;
         cat.close().await?;
         assert!(cat.write(vec![("t/b".into(), b"2".to_vec())], &[]).await.is_err());
         assert!(cat.get_raw("d/1").await.is_err());
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A catalog closed under its node (a newer leader's fence) restarts that node by the lifecycle its lake was handed, never
+    /// the process: of two nodes in one process (step 2's gate), the other is told nothing and goes on writing.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fence_restarts_the_node_its_catalog_was_opened_in_and_no_other() -> Result<()> {
+        /// A node's lifecycle that writes down what it was told, and unwinds on a restart as a library's node does.
+        #[derive(Default)]
+        struct Told(Mutex<Vec<String>>);
+        impl crate::lifecycle::Lifecycle for Told {
+            fn stop(&self, why: String) { self.0.lock().unwrap().push(why) }
+            fn restart(&self, why: &str, _: &[(&str, String)]) -> ! {
+                self.0.lock().unwrap().push(why.to_string());
+                std::panic::resume_unwind(Box::new(crate::lifecycle::Restarting(why.to_string())))
+            }
+            fn say(&self, _: &str) {}
+            fn one_off(&self) -> bool { false }
+            fn owns_process(&self) -> bool { false }
+            fn program(&self) -> anyhow::Result<std::path::PathBuf> { anyhow::bail!("a test starts no helpers") }
+            fn lead_elsewhere<'a>(&'a self, _: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+                Box::pin(async { anyhow::bail!("a test leads no other lake") })
+            }
+        }
+        let lives = [Arc::new(Told::default()), Arc::new(Told::default())];
+        let dirs = [0, 1].map(|_| std::env::temp_dir().join(format!("pondra-told-{}", uuid::Uuid::new_v4())));
+        let mut cats = vec![];
+        for (dir, life) in dirs.iter().zip(&lives) {
+            std::fs::create_dir_all(dir)?;
+            let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(dir)?));
+            cats.push(Catalog::writer(kv::writer(store, None, true, life.clone()).await?, Instant::now(), life.clone()).await?);
+        }
+        cats[0].kv.close().await?; // (closed under the catalog, as a fence closes it: not by its own node's stop)
+        let fenced = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(cats[0].write(vec![("t/a".into(), b"1".to_vec())], &[]))).await;
+        let unwound = fenced.err().expect("a fenced catalog's write restarts its node");
+        assert!(unwound.downcast_ref::<crate::lifecycle::Restarting>().is_some(), "it unwinds as a node restarting in place");
+        assert_eq!(*lives[0].0.lock().unwrap(), ["the catalog was closed (fenced by a newer leader)"]);
+        let _ = cats[1].write(vec![("t/a".into(), b"1".to_vec())], &[]).await?;
+        assert!(lives[1].0.lock().unwrap().is_empty(), "the other node is told nothing");
+        cats[1].close().await?;
+        for dir in &dirs {
+            std::fs::remove_dir_all(dir)?;
+        }
         Ok(())
     }
 
@@ -4445,7 +4495,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-parsed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
-        let cat = Catalog::writer(kv::writer(store, None, true).await?, Instant::now()).await?;
+        let cat = Catalog::writer(kv::writer(store, None, true, crate::lifecycle::unhosted()).await?, Instant::now(), crate::lifecycle::unhosted()).await?;
         let entry = |folder: &str| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&TableMeta { folder: Some(folder.to_string()), ..Default::default() })?)) };
         let raw = entry("x")?;
         let first = cat.parsed("t/a", &raw)?;
@@ -4484,7 +4534,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-segments-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
-        let cat = Catalog::writer(kv::writer(store, None, true).await?, Instant::now()).await?;
+        let cat = Catalog::writer(kv::writer(store, None, true, crate::lifecycle::unhosted()).await?, Instant::now(), crate::lifecycle::unhosted()).await?;
         let seg = |n: u64, rows: u64| -> Result<Bytes> {
             let parts = ["pgbench_accounts", "pgbench_tellers", "pgbench_branches", "pgbench_history"].map(|t| (t.to_string(), vec![(n, 300, rows)]));
             Ok(Bytes::from(serde_json::to_vec(&Segment { path: String::new(), parts: parts.into_iter().collect(), ts_ms: n, files: BTreeMap::new() })?))
@@ -4530,7 +4580,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-recent-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir)?);
-        let cat = Catalog::writer(kv::writer(store, None, true).await?, Instant::now()).await?;
+        let cat = Catalog::writer(kv::writer(store, None, true, crate::lifecycle::unhosted()).await?, Instant::now(), crate::lifecycle::unhosted()).await?;
         let change = |id: u64, key: String, bytes: &'static [u8]| Frame::Change(Arc::new(Delta { id, puts: vec![(key, Bytes::from_static(bytes))], deletes: vec![] }));
         cat.send(change(1, data_key(1), b"rows"));
         assert_eq!(cat.recent_inline(&data_key(1)).as_deref(), Some(&b"rows"[..]));
@@ -4552,8 +4602,8 @@ mod tests {
     async fn two_lakes_of_a_node_share_its_one_line_for_queries() -> Result<()> {
         use datafusion::execution::memory_pool::MemoryConsumer;
         let dirs = [0, 1].map(|_| std::env::temp_dir().join(format!("pondra-ledger-{}", uuid::Uuid::new_v4())));
-        let a = Lake::open(dirs[0].to_str().unwrap(), true, false).await?;
-        let b = Lake::open(dirs[1].to_str().unwrap(), true, false).await?;
+        let a = Lake::open(dirs[0].to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let b = Lake::open(dirs[1].to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         let ledger = |l: &Lake| l.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
         assert!(Arc::ptr_eq(&ledger(&a), &ledger(&b)), "one line for both");
         let held = MemoryConsumer::new("a test's").register(&a.rt.memory_pool);
@@ -4576,7 +4626,7 @@ mod tests {
     async fn a_lakes_caches_are_charged_to_its_line_and_give_memory_back() -> Result<()> {
         use crate::ledger::Charged;
         let dir = std::env::temp_dir().join(format!("pondra-charged-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         let ledger = lake.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
         let names: Vec<&str> = lake.caches().iter().map(|(name, _)| *name).collect();
         assert_eq!(names, ["hot", "lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments"], "a local lake has no cache of a bucket's ranges");
@@ -4604,7 +4654,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_lake_opened_to_write_goes_with_its_last_handle() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-dropped-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         lake.cat.commit(vec![("t/a".into(), b"1".to_vec())], &[]).await?;
         lake.cat.close().await?;
         let gone = Arc::downgrade(&lake);
@@ -4655,12 +4705,12 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("pondra-joined-{}", uuid::Uuid::new_v4()));
         let folder = dir.to_str().unwrap().to_string();
-        let writer = Lake::open(&folder, true, false).await?;
+        let writer = Lake::open(&folder, true, false, crate::lifecycle::unhosted()).await?;
         crate::write::create_table(&writer, "t", r#"{"columns": [["a", "Int64"]]}"#).await?;
         let copied = writer.cat.kv.scan(b"".to_vec()..vec![0xff], false).await?;
         assert!(copied.contains_key(&table_key("t")), "the writer's catalog holds its table");
 
-        let reader = Lake::open_on(&folder, false, Arc::new(Given(copied))).await?;
+        let reader = Lake::open_on(&folder, false, Arc::new(Given(copied)), crate::lifecycle::unhosted()).await?;
         let tables = reader.cat.scan::<TableMeta>("t/", "t0").await?;
         assert_eq!(tables.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec![table_key("t").as_str()]);
 
@@ -4677,10 +4727,10 @@ mod tests {
     async fn a_listed_segment_waits_for_its_inline_rows() -> Result<()> {
         use datafusion::arrow::array::{ArrayRef, Int64Array};
         let dir = std::env::temp_dir().join(format!("pondra-inline-{}", uuid::Uuid::new_v4()));
-        let writer = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let writer = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         writer.cat.commit(vec![("t/x".into(), b"1".to_vec())], &[]).await?;
         writer.cat.checkpoint().await?; // (a reader's view sees only what is flushed)
-        let reader = Lake::open(dir.to_str().unwrap(), false, true).await?;
+        let reader = Lake::open(dir.to_str().unwrap(), false, true, crate::lifecycle::unhosted()).await?;
         assert!(reader.cat.mirror.load(Relaxed), "a streamed reader holds the whole catalog once it opens");
 
         // The next commit, streamed to the reader with its segment and inline rows.
@@ -5423,7 +5473,7 @@ mod tests {
             // (a copy: opening a lake may write to it)
             let copy = std::env::temp_dir().join(format!("pondra-old-{v}-{}", uuid::Uuid::new_v4()));
             anyhow::ensure!(std::process::Command::new("cp").arg("-r").arg(&at).arg(&copy).status()?.success(), "copying {at:?}");
-            let lake = Lake::open(copy.to_str().expect("a path"), true, false).await?;
+            let lake = Lake::open(copy.to_str().expect("a path"), true, false, crate::lifecycle::unhosted()).await?;
             for (from, to) in [("t/", "t0"), ("dt/", "dt0")] {
                 for (k, raw) in lake.cat.scan_raw(from, to).await? {
                     out += &format!("{{\"release\":\"{v}\",\"key\":{},\"entry\":{}}}\n", serde_json::to_string(&k)?, std::str::from_utf8(&raw)?);

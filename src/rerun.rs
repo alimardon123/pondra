@@ -1368,7 +1368,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_view_made_again_under_its_name_starts_afresh() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-rerun-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         let made = |id: &str| Rerun { id: id.into(), keys: vec![], full: None, reason: String::new(), asked: false, lag_secs: None, joins: vec![] };
         let (a, b) = (made("a"), made("b"));
         let key = (lake.url.clone(), "v".to_string());

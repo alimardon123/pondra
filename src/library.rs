@@ -4,9 +4,9 @@
 //! supervisor, a thread of its own: a restart halts the node and starts it again in place, and a
 //! failure stops it and says why to every request after, until it is opened again.
 //!
-//! The places that exec, abort or exit ask [`hosted`](crate::node::hosted) first and call
-//! [`restart`](crate::node::restart) or [`failed`](crate::node::failed) instead (`node::restart_with`, `panics::spawn`,
-//! `format::watch`, the catalog's compactor). The node's host state is kept in `node.rs`, beside the rest of the node.
+//! The places that exec, abort or exit ask the node's [`Lifecycle`](crate::lifecycle::Lifecycle) instead, which the
+//! host implements (`node::Native`: here a restart unwinds and a stop fails the node, `panics::spawn`, `format::watch`,
+//! the catalog's compactor). The node's host state is kept in `node.rs`, beside the rest of the node.
 //! Helpers the node starts (`pondra lead`, Python looked for beside it) are the program the packages give
 //! ([`exe`](crate::node::exe)), never the host's own executable.
 //!
