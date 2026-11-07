@@ -377,7 +377,7 @@ mod tests {
     use crate::write::Stmt;
 
     async fn lake() -> Result<std::sync::Arc<Lake>> {
-        Lake::open(&format!("memory://connections-{}", uuid::Uuid::new_v4().simple()), true, false).await
+        Lake::open(&format!("memory://connections-{}", uuid::Uuid::new_v4().simple()), true, false, crate::node_state::NodeState::unhosted()).await
     }
 
     /// One statement through the core's one path: `write::parse`, then the leader's `ddl::apply`. Err: its refusal, with its code.
