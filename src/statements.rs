@@ -186,7 +186,7 @@ mod tests {
         assert!(matched_in(&r, "SELECT 1", every).is_none());
         assert!(matches!(matched_in(&r, "MAKE THING", every), Some(Stmt::Invalid(e)) if e == "MAKE THING name"), "its parser's refusal is the answer");
         let url = format!("memory://statements-{}", uuid::Uuid::new_v4().simple());
-        let lake = Lake::open(&url, true, false).await?;
+        let lake = Lake::open(&url, true, false, crate::lifecycle::unhosted()).await?;
         assert_eq!(carry_out_in(&r, &lake, &words, tree).await?, json!({"made": "box", "big": false}));
         let e = carry_out_in(&r, &lake, "MAKE NOTHING", json!({})).await.unwrap_err();
         assert_eq!(e.to_string(), "MAKE NOTHING: this node's build has no extension that adds it");
