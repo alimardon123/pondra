@@ -4899,7 +4899,19 @@ mod tests {
             ("small, format 6's list", small.iter().map(|m| json(&m.clone().as_list())).collect(), 20),
         ] {
             let (read, both) = (time(&raws, rounds, false), time(&raws, rounds, true));
-            println!("{what}: {both:.1} µs an entry read and written, {read:.1} µs read alone, best of 5");
+            // (and written again: each entry decoded once, then written `rounds` times)
+            let entries: Vec<TableMeta> = raws.iter().map(|r| serde_json::from_slice(r).unwrap()).collect();
+            entries.iter().for_each(|m| _ = serde_json::to_vec(m).unwrap());
+            let again = (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    for _ in 0..rounds {
+                        entries.iter().for_each(|m| _ = std::hint::black_box(serde_json::to_vec(m).unwrap().len()));
+                    }
+                    t.elapsed().as_nanos() as f64 / (rounds as f64 * entries.len() as f64) / 1000.0
+                })
+                .fold(f64::MAX, f64::min);
+            println!("{what}: {both:.1} µs an entry read and written, {read:.1} µs read alone, {again:.1} µs written again, best of 5");
         }
     }
 
@@ -4950,8 +4962,9 @@ mod tests {
                 })
                 .fold(f64::MAX, f64::min)
         };
-        let helpers: [(&str, fn(&TableMeta) -> usize); 12] = [
+        let helpers: [(&str, fn(&TableMeta) -> usize); 13] = [
             ("columns()", |m| m.columns().map(|(c, t)| c.len() + t.len()).sum()),
+            ("described()", |m| m.described().columns().len()),
             ("schema()", |m| m.schema().unwrap().fields().len()),
             ("read_schema()", |m| m.read_schema().unwrap().fields().len()),
             ("table_sql()", |m| crate::objects::table_sql("t", m).len()),
