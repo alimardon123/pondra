@@ -352,6 +352,32 @@ impl Place {
     }
 }
 
+/// What a statement makes, drops or undrops when its name is another lake's (`l.s.t`, as `USE l`
+/// places a name), and that name. It isn't carried to that lake: its name was refused with other
+/// words ("no table l.public.t", a name check), and `DROP … IF EXISTS` did nothing, saying it was
+/// done. Renames, swaps, ALTERs and indexes already refuse such a name, naming the lake.
+fn in_another<'a>(lake: &Lake, d: &'a Ddl) -> Option<(&'static str, &'a str)> {
+    let (what, name) = match d {
+        Ddl::DropTable { name, .. } => ("DROP TABLE", name),
+        Ddl::Undrop { name } => ("UNDROP TABLE", name),
+        Ddl::Clone { name, .. } => ("CREATE TABLE … CLONE", name),
+        Ddl::CreateView { name, .. } => ("CREATE VIEW", name),
+        Ddl::CreateExternal { name, .. } => ("CREATE EXTERNAL TABLE", name),
+        Ddl::CreateMaterialized { name, .. } => ("CREATE MATERIALIZED VIEW", name),
+        Ddl::DropView { name, .. } => ("DROP VIEW", name),
+        Ddl::DetachView { name } => ("ALTER MATERIALIZED VIEW … DETACH", name),
+        Ddl::CreateRoutine { name, routine, .. } => (if routine.kind == crate::expander::Kind::Procedure { "CREATE PROCEDURE" } else { "CREATE FUNCTION" }, name),
+        Ddl::DropRoutine { name, .. } => ("DROP FUNCTION", name), // (or a procedure: the text says which, the name is the same)
+        Ddl::Sequence(crate::seq::Change::Create { name, .. }) => ("CREATE SEQUENCE", name),
+        Ddl::Unless { then, .. } | Ddl::Replacing { then, .. } => return in_another(lake, then),
+        _ => return None,
+    };
+    match name.split('.').collect::<Vec<_>>()[..] {
+        [l, _, _] if l != lake_name(lake) => Some((what, name.as_str())),
+        _ => None,
+    }
+}
+
 /// Leader: carry one out (under the lake's lock). Comments follow what it renames, and go with
 /// what it drops (`objects::follow`).
 pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
@@ -365,6 +391,10 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
 }
 
 async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
+    if let Some((what, name)) = in_another(lake, &d) {
+        let db = name.split('.').next().unwrap_or_default();
+        return Err(crate::codes::coded("0A000", format!("{what} {name}: {db} is an attached lake, whose tables, views and routines are made, dropped and changed from a node of that lake (from here, its rows are written and its tables made with CREATE TABLE)")));
+    }
     // (this lake's own three-part names, as dbt writes them: `"lake"."schema"."t"` is `schema.t`)
     let here = |n: String| match n.split('.').collect::<Vec<_>>()[..] {
         [l, s, t] if l == lake_name(lake) => join(s, t),
