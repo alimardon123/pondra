@@ -10,7 +10,7 @@ The AWS shapes and credential vending are options of their own:
   --prefix catalogs/123456789012 /v1/{prefix}/… (an encoded ARN works too); --warehouse-id names /v1/config's
   --vend K:S:T [--vend-endpoint URL]   loadTable with X-Iceberg-Access-Delegation: vended-credentials
                                        answers credentials for the table's location
-GET /_stats (no sign-in) counts the requests and the vended-credentials asks, so a test can check them.
+GET /_stats (no sign-in) counts the requests, the loadTable calls and the vended-credentials asks, so a test can check them.
 """
 import argparse, hmac, json, os, secrets, sys, threading, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,7 +23,7 @@ from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.table import CommitTableRequest
 
 TOKENS = set()
-STATS = {"requests": 0, "delegation_headers": 0}
+STATS = {"requests": 0, "delegation_headers": 0, "loads": 0}  # (loads: loadTable calls)
 LOCK = threading.Lock()  # (requests are served on a thread each)
 VENDED = "vended-credentials"
 
@@ -188,6 +188,8 @@ def main():
             self.error(404, "no such path")
 
         def load(self, ns, name):
+            with LOCK:
+                STATS["loads"] += 1
             try:
                 t = catalog.load_table((*ns, name))
             except Exception as e:  # noqa: BLE001 (the catalog's own answer)

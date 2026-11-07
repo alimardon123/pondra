@@ -966,7 +966,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
         crate::change::companion(lake, view, &meta).await?; // (its `$deleted`, which every run names)
         let meta = lake.cat.meta(&table_key(view)).await?.context("view without table")?;
         let at = lake.visible();
-        let stands = none || meta.columns() == before.columns() && !moved_since(lake, seen, at, &[view.to_string()]).await?;
+        let stands = none || meta.columns().eq(before.columns()) && !moved_since(lake, seen, at, &[view.to_string()]).await?;
         let (old, new) = match stands {
             true => changed,
             false => diff(&meta, &r.keys, &old_rows(lake, view, &r.keys, scanned.as_ref(), at).await?, &new)?,
@@ -985,7 +985,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
         if pending.is_empty() {
             // (nothing came out different: only its progress moves, both parts' together)
             let empty = |table: String, s: SchemaRef| crate::log::Append { table, src: crate::log::Src { producer: String::new(), seq: 0, prev: None }, batch: RecordBatch::new_empty(s), ack: tokio::sync::oneshot::channel().0, placed: None };
-            let s = crate::answer::schema(&meta.columns())?;
+            let s = meta.schema()?;
             pending = vec![empty(view.to_string(), s.clone()), empty(crate::sys::deleted(view), s)];
         }
         // Both parts under the same seq and `prev`: they always move together, so a run that lost
@@ -1075,7 +1075,7 @@ async fn changed(lake: &Lake, source: &str, after: u64, upto: u64) -> Result<Dat
     }
     let out = crate::change::taken_out(lake, source, after, Some(upto)).await?;
     if out.iter().any(|b| b.num_rows() > 0) {
-        let stored = crate::answer::schema(&crate::sys::with_sys(&meta).columns())?;
+        let stored = crate::sys::with_sys(&meta).schema()?;
         let out = out.iter().map(|b| meta.to_logical(&crate::query::conform(b, &stored)?)).collect::<Result<Vec<_>>>()?;
         all = all.union(pick(ctx.read_batches(out)?)?)?;
     }
@@ -1206,7 +1206,7 @@ async fn old_rows(lake: &Lake, view: &str, keys: &[String], touched: Option<&Tou
 fn diff(meta: &TableMeta, keys: &[String], old: &[RecordBatch], new: &[RecordBatch]) -> Result<(RecordBatch, RecordBatch)> {
     use datafusion::arrow::compute::{concat_batches, filter_record_batch, take, take_record_batch};
     use datafusion::arrow::row::{RowConverter, SortField};
-    let s = crate::answer::schema(&meta.columns())?;
+    let s = meta.schema()?;
     let mut fields = s.fields().to_vec();
     let ts = crate::sys::time();
     fields.extend([Field::new(ROW_ID, DataType::Int64, true), Field::new(CREATED, ts, true), Field::new(VERSION, DataType::Int64, true)].map(Arc::new));

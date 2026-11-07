@@ -112,7 +112,7 @@ struct Table {
 }
 
 /// A temporary table's rows' schema: its columns, then its system columns.
-fn schema_of(meta: &TableMeta) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::answer::schema(&[meta.columns().to_vec(), crate::sys::columns()].concat()) }
+fn schema_of(meta: &TableMeta) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::answer::schema(&[meta.to_columns(), crate::sys::columns()].concat()) }
 
 impl Table {
     fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { schema_of(&self.meta) }
@@ -469,7 +469,7 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
     let (meta, rules) = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| (t.meta.clone(), t.rules.clone())).with_context(|| format!("no temporary table {name}"))?;
     let query = match names {
         Some(n) => {
-            let all = crate::rules::rows::row_columns(meta.columns().iter().map(|(c, _)| c.clone()), n);
+            let all = crate::rules::rows::row_columns(meta.columns().map(|(c, _)| c.to_string()), n);
             let names = if n.is_empty() { crate::write::implicit(&all, crate::rules::rows::rows_width(query)) } else { n }; // (no names: `VALUES (1, DEFAULT)`, the columns its rows give)
             crate::rules::rows::rows_for(name, &all, names, query, &|c: &str| crate::rules::rows::default_sql(&meta, c))? // (a column left out takes its DEFAULT)
         }
@@ -566,18 +566,19 @@ fn changed(meta: &TableMeta, rules: &Arc<crate::rules::Table>, name: &str, old: 
         let columns = columns.iter().zip(schema.fields()).map(|(c, f)| datafusion::arrow::compute::cast(c, f.data_type())).collect::<Result<_, _>>()?; // (as the table's types)
         rows.push(RecordBatch::try_new(schema.clone(), columns)?);
     }
-    check_key(name, &meta.columns(), &meta.key, &rows)?;
+    check_key(name, &meta, &rows)?;
     Ok((rows, next))
 }
 
 /// A temporary table's PRIMARY KEY, checked over every row as a change leaves them: no NULL in a key
 /// column (23502), and no two rows with the same key, within one INSERT too (23505, named `{name}_pkey`
 /// as Postgres names it).
-fn check_key(name: &str, columns: &[(String, String)], key: &[String], rows: &[RecordBatch]) -> Result<()> {
+fn check_key(name: &str, meta: &TableMeta, rows: &[RecordBatch]) -> Result<()> {
+    let key = &meta.key;
     if key.is_empty() {
         return Ok(());
     }
-    let at: Vec<usize> = key.iter().map(|k| columns.iter().position(|(c, _)| c == k).with_context(|| format!("key column {k}"))).collect::<Result<_>>()?;
+    let at: Vec<usize> = key.iter().map(|k| meta.columns().position(|(c, _)| c == k.as_str()).with_context(|| format!("key column {k}"))).collect::<Result<_>>()?;
     let mut seen = HashSet::new();
     for b in rows {
         for r in 0..b.num_rows() {

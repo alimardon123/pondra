@@ -804,11 +804,11 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
         puts.push((table_key(EXPECTED), json(&expected_table(lake))));
     }
     if let Some(e) = &mut emit {
-        let is_time = meta.columns().iter().any(|(c, t)| *c == e.window && t.starts_with("Timestamp"));
+        let is_time = meta.columns().any(|(c, t)| *c == e.window && t.starts_with("Timestamp"));
         ensure!(meta.key.contains(&e.window) && is_time, "emit: the window column must be a GROUP BY timestamp (date_bin(…) AS {})", e.window);
         e.time = event_time(&plan, &e.window).filter(|t| timestamp(&src, t));
         ensure!(e.time.is_some(), "emit: the window must be cut from a timestamp column of {source}: date_bin(INTERVAL '1 minute', ts) AS {}", e.window);
-        let columns = meta.columns().iter().filter(|(c, _)| c != "_deleted").cloned().collect();
+        let columns = meta.columns().filter(|(c, _)| *c != "_deleted").map(|(c, t)| (c.to_string(), t.to_string())).collect();
         puts.push((table_key(&format!("{name}_final")), json(&{ let mut entry = TableMeta::made(crate::store::Made { columns, sql_types: sql_types.clone(), ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry })));
     }
     if let Some(o) = &keep {
@@ -871,7 +871,7 @@ pub(crate) fn expected_table(lake: &Lake) -> TableMeta {
 /// A new view's expectations: each a condition over its columns; and one that fails a write
 /// (`FAIL`) refuses the view if rows already there break it (they would fill it).
 async fn expectations(lake: &Lake, name: &str, source: &str, planned: &str, meta: &TableMeta, expect: &[Expect]) -> Result<()> {
-    let empty = RecordBatch::new_empty(crate::answer::schema(&meta.columns())?);
+    let empty = RecordBatch::new_empty(meta.schema()?);
     let mut names = std::collections::HashSet::new();
     for e in expect {
         ensure!(names.insert(e.name.to_lowercase()), "{name} has two expectations named {}", e.name);
@@ -954,7 +954,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     for g in &agg.group_expr {
         match g {
             Expr::Column(c) if c.name == "session_start" || c.name == "session_end" => {}
-            Expr::Column(c) if src.columns().iter().any(|(n, _)| *n == c.name) => s.keys.push(c.name.clone()),
+            Expr::Column(c) if src.columns().any(|(n, _)| *n == c.name) => s.keys.push(c.name.clone()),
             other => bail!("a session view groups by columns of {source}, not {other}"),
         }
     }
@@ -969,12 +969,12 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
 
-fn timestamp(meta: &TableMeta, column: &str) -> bool { meta.columns().iter().any(|(c, t)| c == column && t.starts_with("Timestamp")) }
+fn timestamp(meta: &TableMeta, column: &str) -> bool { meta.columns().any(|(c, t)| c == column && t.starts_with("Timestamp")) }
 
 /// The source's columns and the two a session view's SQL also sees: `session_start`, `session_end`.
 fn extended(src: &TableMeta, time: &str) -> Result<datafusion::arrow::datatypes::SchemaRef> {
     use datafusion::arrow::datatypes::{Field, Schema};
-    let s = crate::answer::schema(&src.columns())?;
+    let s = src.schema()?;
     let t = s.field_with_name(time)?.data_type().clone();
     let mut fields = s.fields().to_vec();
     fields.extend(["session_start", "session_end"].map(|n| std::sync::Arc::new(Field::new(n, t.clone(), true))));
@@ -1253,7 +1253,7 @@ async fn newest_parts(lake: &Lake, table: &str, time: &str) -> Result<BTreeMap<S
     let part = part_of(None);
     if seen < meta.tiered {
         // (rows went into files since: their ranges say how new they were)
-        let s = crate::answer::schema(&meta.columns())?;
+        let s = meta.schema()?;
         let ranges = crate::manifest::ranges(&crate::manifest::list(lake, &meta).await?, &meta.files, &s);
         if let Some((_, hi)) = ranges.get(&stored) {
             if let ScalarValue::TimestampMicrosecond(Some(v), _) = ScalarValue::try_from_string(hi.clone(), s.field_with_name(&stored)?.data_type())?.cast_to(&us)? {
@@ -1347,7 +1347,7 @@ async fn emit(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, e: &Emit
         Some(slide) => {
             let meta: TableMeta = lake.cat.get(&table_key(view)).await?.with_context(|| format!("no table {view}"))?;
             let offsets = (0..e.size_secs / slide).map(|i| format!("(INTERVAL '{} seconds')", i * slide)).collect::<Vec<_>>().join(", ");
-            let cols = meta.columns().iter().filter(|(c, _)| c != "_deleted").map(|(c, _)| match (c == &e.window, meta.merge.get(c).map(String::as_str)) {
+            let cols = meta.columns().filter(|(c, _)| *c != "_deleted").map(|(c, _)| match (c == e.window, meta.merge.get(c).map(String::as_str)) {
                 (true, _) => format!("{w} - __o AS {w}"),
                 (_, Some("count" | "sum")) => format!("sum({0}) AS {0}", quoted(c)),
                 (_, Some(f)) => format!("{f}({0}) AS {0}", quoted(c)),
@@ -1366,7 +1366,7 @@ async fn emit(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, e: &Emit
 /// conflict: another leader emitted first; the next round catches up.)
 pub(crate) async fn append(lake: &Lake, log: &crate::log::Log, table: &str, src: crate::log::Src, rows: Vec<RecordBatch>) -> Result<()> {
     let meta: TableMeta = lake.cat.get(&table_key(table)).await?.with_context(|| format!("no table {table}"))?;
-    let s = crate::answer::schema(&meta.columns())?;
+    let s = meta.schema()?;
     let rows = datafusion::arrow::compute::concat_batches(&s, &rows.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?;
     log.append(table.to_string(), src, rows).await?;
     Ok(())
@@ -1448,7 +1448,7 @@ pub(crate) async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Res
             _ if !alone(&plan(lake, &v).await?, true) => Some("reads other tables too"),
             _ if meta.merge.values().any(|f| !["sum", "count", crate::finish::MOMENTS].contains(&f.as_str())) => Some("keeps a min or max"),
             _ if !meta.merge.values().any(|f| f == "count") => Some("has no count(*) to drop the groups a change empties: make it again with count(*) among its columns, or WITH (refresh = 'by key')"),
-            _ if meta.columns().iter().any(|(c, t)| meta.merge.contains_key(c) && t.starts_with("UInt")) => Some("adds up an unsigned column (it can't subtract)"),
+            _ if meta.columns().any(|(c, t)| meta.merge.contains_key(c) && t.starts_with("UInt")) => Some("adds up an unsigned column (it can't subtract)"),
             _ => None,
         };
         match why {
@@ -1708,7 +1708,7 @@ async fn fill_one(lake: &Lake, log: &crate::log::Log, name: &str, v: &View, upto
     let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;
     let out = match rows.iter().any(|b| b.num_rows() > 0) {
         true => view_rows(lake, v, &meta, &rows, false).await?,
-        false => RecordBatch::new_empty(crate::answer::schema(&meta.columns())?),
+        false => RecordBatch::new_empty(meta.schema()?),
     };
     let (out, failed) = expected(name, v, out, true)?;
     if let Some(failed) = failed {
@@ -1725,7 +1725,7 @@ async fn view_rows(lake: &Lake, v: &View, meta: &TableMeta, rows: &[RecordBatch]
     use crate::query::cast_as;
     use crate::answer::schema;
     if !v.ids {
-        return cast_as(&over(lake, &v.source, rows.to_vec(), &v.sql).await?, &schema(&meta.columns())?);
+        return cast_as(&over(lake, &v.source, rows.to_vec(), &v.sql).await?, &meta.schema()?);
     }
     let mut ids = vec![(crate::text::ROW_ID.to_string(), "Int64".to_string()), crate::sys::columns()[2].clone()];
     if old {
@@ -1736,8 +1736,8 @@ async fn view_rows(lake: &Lake, v: &View, meta: &TableMeta, rows: &[RecordBatch]
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&v.source)).await?.with_context(|| format!("no table {}", v.source))?.logical();
     let sql = crate::sys::planned(&v.sql)?;
     let names: Vec<&str> = ids.iter().map(|(c, _)| c.as_str()).collect();
-    let (_, batches) = crate::fresh::run(lake, &v.source, schema(&[src.columns().to_vec(), ids.clone()].concat())?, rows, &sql, &names.join(","), |p| carry(p, &names)).await?;
-    let target = schema(&[meta.columns().to_vec(), ids].concat())?;
+    let (_, batches) = crate::fresh::run(lake, &v.source, schema(&[src.to_columns(), ids.clone()].concat())?, rows, &sql, &names.join(","), |p| carry(p, &names)).await?;
+    let target = schema(&[meta.to_columns(), ids].concat())?;
     let Some(first) = batches.first() else { return Ok(RecordBatch::new_empty(target)) };
     let all = datafusion::arrow::compute::concat_batches(&first.schema(), &batches)?;
     let picked = target.fields().iter().map(|f| all.schema().index_of(f.name())).collect::<Result<Vec<_>, _>>()?;
@@ -1978,14 +1978,14 @@ async fn join(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, j: &Join
         for (i, df) in [(fresh, rows.read_batches(fresh_rows.clone())?), (other_i, other.clone())] {
             let t = &j.tables[i];
             let meta: TableMeta = lake.cat.get(&table_key(t)).await?.with_context(|| format!("no table {t}"))?;
-            let df = df.select_columns(&meta.columns().iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>())?;
+            let df = df.select_columns(&meta.columns().map(|(c, _)| c).collect::<Vec<_>>())?;
             ctx.deregister_table(crate::query::table_ref(t))?;
             ctx.register_table(crate::query::table_ref(t), df.into_view())?;
         }
         out.extend(crate::engine::sql(&ctx, &crate::sys::planned(&v.sql)?).await?.collect().await?);
     }
     let meta: TableMeta = lake.cat.get(&table_key(view)).await?.with_context(|| format!("no table {view}"))?;
-    let s = crate::answer::schema(&meta.columns())?;
+    let s = meta.schema()?;
     let out = out.iter().map(|b| crate::query::cast_as(b, &s)).collect::<Result<Vec<_>>>()?;
     append(lake, log, view, crate::log::Src { producer, seq: now, prev: Some(done) }, out).await
 }

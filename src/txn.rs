@@ -32,7 +32,7 @@ use datafusion::sql::sqlparser::ast::{
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,11 +41,14 @@ use datafusion::common::instant::Instant;
 use std::time::Duration;
 
 /// A table's changes in a transaction: rows it adds (new rows, whose `_row_id` is negative until the commit stamps
-/// them, and new versions, which keep theirs), and the snapshot's rows it replaces or deletes. Under SQL's names.
+/// them, and new versions, which keep theirs), and the snapshot's rows it replaces or deletes. Under SQL's names. `placed`:
+/// the orders of the table's columns its INSERTs without a column list put their values by (`log::placed_for`), which the
+/// leader checks at COMMIT (`write_changes`).
 #[derive(Default, Clone)]
 struct Changes {
     new: Vec<RecordBatch>,
     old: Vec<RecordBatch>,
+    placed: BTreeSet<u64>,
 }
 
 /// A keyed table's kept rows by key, as text (`key_texts`): how many of the transaction's own rows hold each key (`live`, over
@@ -1228,6 +1231,7 @@ fn keep(table: &str, key: &[String], old: Vec<RecordBatch>, new: Vec<RecordBatch
         return Err(ended_since());
     }
     let c = t.tables.entry(table.to_string()).or_default();
+    c.placed.extend(crate::log::placed_for(table)); // (an INSERT without a column list: the order this node put its values by)
     let mut by = (!key.is_empty()).then(|| t.by_key.entry(table.to_string()).or_insert_with(|| ByKey { key: key.to_vec(), ..Default::default() }));
     let mut mine = HashSet::new(); // (rows of its own it replaces: no `_version`)
     for b in old.iter().filter(|b| b.num_rows() > 0) {
@@ -1557,6 +1561,10 @@ pub struct Commit {
     #[serde(default)]
     pub reads: BTreeMap<String, Reads>,
     pub tables: Vec<(String, String, String)>,
+    /// Per table, the orders of its columns the transaction's INSERTs without a column list put their values by
+    /// (`Changes::placed`): refused as 40001 at COMMIT when the table's order is another (`write_changes`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub placed: BTreeMap<String, BTreeSet<u64>>,
     /// The rows themselves, table by table as `tables` lists them (new, old), when this node leads: handed over as they
     /// are, with nothing encoded to send or read back (`commit`). Empty when the commit came over HTTP.
     #[serde(skip)]
@@ -1623,7 +1631,8 @@ async fn commit(app: &crate::app::App, s: &str) -> Result<(&'static str, Option<
             tables.push((n.clone(), ipc(&fresh(c.new.clone())?)?, ipc(&c.old)?));
         }
     }
-    let c = Commit { id: t.id.clone(), job: t.job.clone(), reads: t.reads.clone(), tables, rows };
+    let placed = t.tables.iter().filter(|(_, c)| !c.placed.is_empty()).map(|(n, c)| (n.clone(), c.placed.clone())).collect();
+    let c = Commit { id: t.id.clone(), job: t.job.clone(), reads: t.reads.clone(), tables, placed, rows };
     let sent = match &app.seq {
         Some(seq) => commit_here(&app.lake, seq, &app.lock, c).await,
         None => crate::write::post(&app.members.leader().addr, &crate::write::Request::Txn(c)).await,
@@ -1738,6 +1747,11 @@ async fn write_changes(lake: &Lake, seq: &crate::log::Sequencer, c: Commit) -> R
             None => (unipc(new)?, unipc(old)?),
         };
         let stored = lake.cat.meta(&table_key(name)).await?.with_context(|| format!("no table {name} (dropped while the transaction ran)"))?;
+        // (an INSERT without a column list whose node put its values by an order of the columns the table no longer has: a
+        // follower that hadn't seen a move yet, as `log::placed_for` checks an autocommitted one; under the lock DDL takes too)
+        if c.placed.get(name).is_some_and(|placed| placed.iter().any(|p| !stored.places(*p))) {
+            return Err(crate::codes::coded("40001", crate::log::moved(name)));
+        }
         let meta = stored.logical_ref();
         let append = meta.key.is_empty();
         if old.iter().any(|b| b.num_rows() > 0) {
@@ -1877,7 +1891,7 @@ enum Current {
 /// The schema of a row as `current` reads it: the table's columns (SQL's names), then `_row_id`, `_created_at` and `_version`.
 fn row_schema(meta: &TableMeta) -> Result<datafusion::arrow::datatypes::SchemaRef> {
     use datafusion::arrow::datatypes::{Field, TimeUnit};
-    let mut fields: Vec<Arc<Field>> = crate::answer::schema(&meta.columns())?.fields().to_vec();
+    let mut fields: Vec<Arc<Field>> = meta.schema()?.fields().to_vec();
     fields.push(Arc::new(Field::new(crate::text::ROW_ID, DataType::Int64, true)));
     fields.push(Arc::new(Field::new(crate::text::CREATED, DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true)));
     fields.push(Arc::new(Field::new(crate::text::VERSION, DataType::Int64, true)));
@@ -1929,7 +1943,7 @@ pub async fn point_change(lake: &Lake, name: &str, stored: &TableMeta, snapshot:
 fn point_key(name: &str, stored: &TableMeta, set_to: &[(String, String)], cond: &str) -> Option<Vec<String>> {
     // (`point_table` takes no renamed or dropped column: `stored` is as SQL sees it, `logical()`)
     if !point_table(name, stored)
-        || set_to.iter().any(|(c, _)| stored.key.contains(c) || c == "_deleted" || crate::text::NAMES.contains(&c.as_str()) || !stored.columns().iter().any(|(n, _)| n == c))
+        || set_to.iter().any(|(c, _)| stored.key.contains(c) || c == "_deleted" || crate::text::NAMES.contains(&c.as_str()) || !stored.columns().any(|(n, _)| n == c))
     {
         return None;
     }
@@ -1943,7 +1957,7 @@ fn key_text(meta: &TableMeta, key: &[String]) -> Result<Vec<String>> {
         .iter()
         .zip(key)
         .map(|(c, v)| {
-            let (_, ty) = meta.columns().iter().find(|(n, _)| n == c).with_context(|| format!("no key column {c}"))?;
+            let (_, ty) = meta.columns().find(|(n, _)| n == c).with_context(|| format!("no key column {c}"))?;
             let typed = datafusion::arrow::compute::cast(&datafusion::arrow::array::StringArray::from(vec![v.as_str()]), &crate::answer::dtype(ty)?)?;
             let text = datafusion::arrow::compute::cast(&typed, &DataType::Utf8)?;
             Ok(text.as_string::<i32>().value(0).to_string())
@@ -2054,7 +2068,7 @@ mod tests {
         assert!(!by.rows.as_ref().expect("made").contains_key(&text(2, "b")), "a live key whose row is dropped loses its row");
         assert_eq!(v_of(by.own(&text(2, "b"), &kept[1..])), None, "and it is neither kept nor taken");
         // (made again from the rows it keeps, as ROLLBACK TO does: none until asked, then the same keys)
-        let c = Changes { new: vec![rows(&[1], &["a"], &[11])], old: vec![rows(&[3], &["c"], &[30])] };
+        let c = Changes { new: vec![rows(&[1], &["a"], &[11])], old: vec![rows(&[3], &["c"], &[30])], ..Default::default() };
         let mut again = ByKey::of(&key, Some(&c)).expect("made again");
         assert!(again.rows.is_none(), "made again, its rows wait for the next ask");
         assert_eq!(v_of(again.own(&text(1, "a"), &c.new)), Some(Some(11)));

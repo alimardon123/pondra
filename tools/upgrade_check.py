@@ -750,6 +750,27 @@ def guests_check(new_bin, work, port):
             checks["…and never a lake in a bucket, whose cluster's followers it can't hear: it stays at format 5, and a node of format 5 still serves it"] = \
                 made < LISTS and got.get("format") == made and got.get("rows") == [{"x": 1, "y": "a"}, {"x": 2, "y": "a"}]
             gone(lake)
+    # A RESTORE by this build into a new folder, of a backup a node of format 5 took: the new place is led for the moment by
+    # `pondra lead`, which doesn't raise it, so its entries are written in format 5's shape under the backup's own mark (below
+    # 6), and a node of format 5 serves it with the same rows (going back to 0.80 after a restore by main).
+    src, bk, back = (os.path.join(work, f"guests-{w}") for w in ("backed", "backup", "restored"))
+    n = Node(new_bin, src, port, work, env=five, token=False).start()
+    n.q("CREATE TABLE t (x INT NOT NULL, y VARCHAR DEFAULT 'a')")
+    n.q("INSERT INTO t (x) VALUES (1)")
+    n.q(f"BACKUP DATABASE TO '{bk}'")
+    n.stop()
+    env = {**os.environ, **{k: v for k, v in five.items() if k != "PONDRA_TEST_FORMAT"}}  # (this build's format, the same keys)
+    r = subprocess.run([new_bin, "restore", bk, back], capture_output=True, text=True, timeout=300, env=env)
+    o = Node(new_bin, back, port, work, env=five, token=False)
+    try:
+        o.start()
+        got = {"format": fmt(o), "rows": o.q("SELECT x, y FROM t ORDER BY x")}
+    except Failed:
+        got = {"refused": o.said()[-300:]}
+    o.stop("kill")
+    info["restored"] = {"restore": [r.returncode, (r.stdout + r.stderr)[-300:]], "then": got}
+    checks["a RESTORE by this build of a backup at format 5 is written in format 5's shape under the backup's mark: a node of format 5 serves it, the same rows"] = \
+        r.returncode == 0 and got.get("format", LISTS) < LISTS and got.get("rows") == [{"x": 1, "y": "a"}]
     return checks, info
 
 

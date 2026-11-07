@@ -477,8 +477,14 @@ async fn restore_into(lake: &Lake, t: &Take) -> Result<Value> {
     let mut puts = carried(&cat);
     puts.push(("n".into(), json(&run.next)));
     puts.push(("b".into(), json(&run.block)));
+    // (never below the lake's own: a format moves one way, `format::set`. A restore's new place is led by `pondra lead`,
+    // which doesn't raise it, so it is at 0 here and takes the backup's mark. A leader that raised it first, `format::alone`,
+    // would have its entries written as lists, `store::listed`, and a lower mark would then let a node of that format fail
+    // on each table instead of refusing the lake by name)
     if let Some(f) = backup.cat.get::<crate::format::Stamp>("format").await? {
-        puts.push(("format".into(), json(&f)));
+        if f.format > crate::format::of(&lake.cat).await?.format {
+            puts.push(("format".into(), json(&f)));
+        }
     }
     lake.cat.start_after(run.commit).await;
     lake.cat.commit(puts, &[]).await?;
@@ -667,7 +673,7 @@ async fn table_placed(source: &Lake, name: &str, mut meta: TableMeta, target: &S
         // (manifests that name a base's paths: sealed again here, naming the backup's)
         Some(s) if based(&s.list) || list.iter().any(|m| based(&m.path)) || sealed.iter().any(|f| based(&f.path) || f.delete_files().any(|p| based(p))) => {
             sealed.iter_mut().for_each(placed_file);
-            let schema = crate::answer::schema(&crate::sys::with_sys(&meta).columns())?;
+            let schema = crate::sys::with_sys(&meta).schema()?;
             meta.sealed = Some(crate::manifest::sealed_into(target, &format!("data/{}/_manifests", meta.folder(name)), &sealed, &schema, written).await?);
         }
         Some(s) => {

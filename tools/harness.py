@@ -2887,6 +2887,20 @@ def kafka():
     checks["a decimal's scale past 76 is refused as INVALID_RECORD and the node stays up; a Decimal as a JSON number loads as sent"] = \
         len(huge) == 2 and all(e is not None and e.code() == ck.KafkaError.INVALID_RECORD for e in huge) and \
         sql_("SELECT id, balance::VARCHAR AS balance FROM kinds ORDER BY id") == [{"id": 1, "balance": "-3.25"}, {"id": 3, "balance": "10.50"}]
+    # Every number reaches the table with the digits it was sent with, on the path that reads records one by one too: a
+    # Decimal as a JSON number, a change event without its schema, and a plain row batched with a tombstone. They went
+    # through an f64 there, so 0.123456789012345678 was stored as 0.123456789012345680 (11-07 audit H1).
+    sql_("CREATE TABLE digits (id BIGINT PRIMARY KEY, amount DECIMAL(38,18), big DECIMAL(38,2))")
+    digits = {"type": "struct", "fields": [field("id", "int64"), field("amount", "bytes", "org.apache.kafka.connect.data.Decimal", parameters={"scale": "18"})]}
+    p.produce("digits", value=json.dumps({"schema": digits, "payload": {"id": 1, "amount": "AMOUNT", "big": "BIG"}}).replace('"AMOUNT"', "0.123456789012345678").replace('"BIG"', "12345678901234567.89"))
+    p.produce("digits", value='{"before": null, "after": {"id": 2, "amount": 1.000000000000000001, "big": 99999999999999999999.99}, "op": "c"}')
+    p.produce("digits", value='{"id": 3, "amount": 0.333333333333333333}')
+    p.produce("digits", key=json.dumps({"id": 4}), value=None)
+    assert p.flush(30) == 0
+    checks["a number keeps every digit it was sent with: a Decimal as a JSON number, a change event, a row batched with a tombstone"] = \
+        sql_("SELECT id, amount::VARCHAR AS amount, big::VARCHAR AS big FROM digits ORDER BY id") == [
+            {"id": 1, "amount": "0.123456789012345678", "big": "12345678901234567.89"}, {"id": 2, "amount": "1.000000000000000001", "big": "99999999999999999999.99"},
+            {"id": 3, "amount": "0.333333333333333333"}]  # (a NULL is left out of the answer's row)
     # consumers: kafka-python and librdkafka read the log back from the beginning
     tp = kp.TopicPartition("users", 0)
     c = kp.KafkaConsumer(bootstrap_servers=f"127.0.0.1:{kport}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN",
@@ -9871,7 +9885,9 @@ def colorder():
     the old order shows as wrong values: INSERT VALUES (whole and short rows), INSERT SELECT (of a known width and of a
     `*`), the bulk door, COPY INTO a headerless CSV, the Postgres port's COPY FROM STDIN, RETURNING *, a keyed table's
     INSERT, ON CONFLICT, INSERT OR REPLACE, MERGE … INSERT VALUES, UPDATE, DELETE and a transaction, a write through a
-    second node. Reads list the new order: SELECT *, DESCRIBE, information_schema, pg_attribute, a Postgres row's
+    second node. A move while a positional write runs on another node (an INSERT, a transaction's INSERT before its COMMIT,
+    a headerless COPY, a one-key upsert) refuses it 40001, nothing written; an ADD COLUMN at the end doesn't. Reads list
+    the new order: SELECT *, DESCRIBE, information_schema, pg_attribute, a Postgres row's
     description, a point lookup, a past read, /watch, SHOW CREATE (which makes the same table again, and CREATE OR ALTER
     leaves as it is), Delta and Iceberg readers; all as it was after a restart. A view with a `*` lists the new order. Refused
     by name: a column after itself or after one the table lacks, a system column. A materialized view that reads the table
@@ -10033,6 +10049,90 @@ def colorder():
                        "again": again, "rows": until(lambda: q(f"SELECT a, b FROM {table}"), [{"a": 2, "b": 1}], 10)}
         checks[f"a move while a {kind} INSERT without a column list runs on another node: refused 40001, nothing written, then by the new order"] = \
             outcome["done"] > moved_at and outcome["status"] != 200 and outcome["state"] == "40001" and rows_then == [] and raced[kind]["rows"] == [{"a": 2, "b": 1}]
+    # The other doors that fill by position (11-07 audit M1): a transaction's INSERT on another node, a headerless CSV's COPY
+    # and a one-key upsert. Each puts its values by the order its node had, and the leader refuses them (40001) when the
+    # table's order is another by the time they come: a node that hadn't seen a move filled the old one.
+    def told(port, stmt, session=None, headers=None):
+        status, head, text = reply(port, "POST", "/sql", stmt.encode(), headers={**({"x-pondra-session": session} if session else {}), **(headers or {})})
+        return {"status": status, "state": head.get("x-pondra-sqlstate"), "text": (text if isinstance(text, str) else text.decode())[:300]}
+    q("CREATE TABLE race_txn (a BIGINT, b BIGINT)")
+    until(lambda: names("race_txn", A.port + 1), ["a", "b"], 10)
+    session = "colorder-txn-" + uuid.uuid4().hex[:8]
+    began = [told(A.port + 1, "BEGIN", session), told(A.port + 1, "INSERT INTO race_txn VALUES (1, 2)", session)]
+    q("ALTER TABLE race_txn ALTER COLUMN b FIRST")
+    committed = told(A.port + 1, "COMMIT", session)
+    txn_then = q("SELECT a, b FROM race_txn")
+    until(lambda: names("race_txn", A.port + 1), ["b", "a"], 10)
+    again = [told(A.port + 1, s, session) for s in ("BEGIN", "INSERT INTO race_txn VALUES (1, 2)", "COMMIT")]
+    raced["txn"] = {"began": began, "commit": committed, "rows_then": txn_then, "again": again}
+    checks["a move between a transaction's INSERT without a column list on another node and its COMMIT: refused 40001, nothing written, then by the new order"] = \
+        all(r["status"] == 200 for r in began) and committed["state"] == "40001" and txn_then == [] \
+        and all(r["status"] == 200 for r in again) and until(lambda: q("SELECT a, b FROM race_txn"), [{"a": 2, "b": 1}], 10) == [{"a": 2, "b": 1}]
+    # (11-07 audit L3: an ADD COLUMN at the end between them moves nothing: the INSERT's values are where they go, so it commits)
+    q("CREATE TABLE race_add (a BIGINT, b BIGINT)")
+    until(lambda: names("race_add", A.port + 1), ["a", "b"], 10)
+    session = "colorder-add-" + uuid.uuid4().hex[:8]
+    began = [told(A.port + 1, "BEGIN", session), told(A.port + 1, "INSERT INTO race_add VALUES (1, 2)", session)]
+    q("ALTER TABLE race_add ADD COLUMN c BIGINT")
+    committed = told(A.port + 1, "COMMIT", session)
+    raced["txn_add"] = {"began": began, "commit": committed}
+    checks["an ADD COLUMN at the end between a transaction's INSERT without a column list on another node and its COMMIT: committed where it was put"] = \
+        all(r["status"] == 200 for r in began) and committed["status"] == 200 and until(lambda: q("SELECT a, b, c FROM race_add"), [{"a": 1, "b": 2}], 10) == [{"a": 1, "b": 2}]
+    # (the same while an autocommitted one runs: its rows are where they go, so they are taken. An INSERT … SELECT's files
+    # lack the new column, so the leader has them written again: 40001, as for a move, not an internal error)
+    for kind, ins in (("values", f"INSERT INTO race_add_{{}} VALUES (1, (SELECT 2 + z FROM {slow} s))"), ("select", f"INSERT INTO race_add_{{}} SELECT 1 + z, 2 FROM {slow} s")):
+        table = f"race_add_{kind}"
+        q(f"CREATE TABLE {table} (a BIGINT, b BIGINT)")
+        until(lambda: names(table, A.port + 1), ["a", "b"], 10)
+        outcome = {}
+        def insert_added():
+            outcome.update(told(A.port + 1, ins.format(kind)), done=time.time())
+        writer = threading.Thread(target=insert_added)
+        writer.start()
+        time.sleep(0.3)
+        q(f"ALTER TABLE {table} ADD COLUMN c BIGINT")
+        moved_at = time.time()
+        writer.join()
+        raced[f"add_{kind}"] = {**outcome, "after_move_s": round(outcome["done"] - moved_at, 2), "rows": q(f"SELECT a, b, c FROM {table}")}
+    checks["an ADD COLUMN at the end while an INSERT … VALUES without a column list runs on another node: written where it was put"] = \
+        raced["add_values"]["after_move_s"] > 0 and raced["add_values"]["status"] == 200 and until(lambda: q("SELECT a, b, c FROM race_add_values"), [{"a": 1, "b": 2}], 10) == [{"a": 1, "b": 2}]
+    checks["…an INSERT … SELECT's files: refused 40001 (written again), nothing written"] = \
+        raced["add_select"]["after_move_s"] > 0 and raced["add_select"]["state"] == "40001" and raced["add_select"]["rows"] == []
+    q("CREATE TABLE race_copy (a BIGINT, b BIGINT)")
+    until(lambda: names("race_copy", A.port + 1), ["a", "b"], 10)
+    with open(os.path.join(d, "many.csv"), "w") as f:  # (enough lines that the move lands while it is read)
+        f.write("1,2\n" * 16_000_000)
+    outcome = {}
+    def load():
+        outcome.update(told(A.port + 2, f"COPY INTO race_copy FROM '{d}/many.csv' (FORMAT csv, HEADER false)", headers={"x-pondra-owner": owner_key}), done=time.time())
+    loader = threading.Thread(target=load)
+    loader.start()
+    time.sleep(0.2)
+    q("ALTER TABLE race_copy ALTER COLUMN b FIRST")
+    moved_at = time.time()
+    loader.join()
+    copied = q("SELECT count(*) AS n FROM race_copy")
+    raced["copy"] = {**outcome, "after_move_s": round(outcome["done"] - moved_at, 2), "rows_then": copied}
+    checks["a move while a headerless CSV's COPY runs on another node: refused 40001, nothing written"] = \
+        outcome["done"] > moved_at and outcome["state"] == "40001" and copied == [{"n": 0}]
+    # (a node whose autocommitted writes wait 1.5 s once their rows are worked out, before their append: the move lands then)
+    paused = Node(lake, A.port + 3, tier_secs=0.3, env={"PONDRA_TEST_AUTOCOMMIT_PAUSE_MS": "1500"}).start()
+    nodes.append(paused)
+    q("CREATE TABLE race_up (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)")
+    until(lambda: names("race_up", A.port + 3), ["id", "a", "b"], 10)
+    outcome = {}
+    def upsert():
+        outcome.update(told(A.port + 3, "INSERT INTO race_up VALUES (1, 10, 20) ON CONFLICT (id) DO UPDATE SET a = excluded.a, b = excluded.b"), done=time.time())
+    writer = threading.Thread(target=upsert)
+    writer.start()
+    time.sleep(0.5)
+    q("ALTER TABLE race_up ALTER COLUMN b AFTER id")
+    moved_at = time.time()
+    writer.join()
+    upserted = q("SELECT a, b FROM race_up")
+    raced["upsert"] = {**outcome, "after_move_s": round(outcome["done"] - moved_at, 2), "rows_then": upserted}
+    checks["a move while a one-key upsert without a column list waits to append on another node: refused 40001, nothing written"] = \
+        outcome["done"] > moved_at and outcome["state"] == "40001" and upserted == []
     # After a restart, as it was
     before = gotk()
     for node in nodes:
@@ -11221,9 +11321,14 @@ def users():
     # A view replaced keeps its grants: a grant names the view, not its query (CREATE OR REPLACE VIEW, as Databricks keeps them)
     as_(A.port, boss, "CREATE OR REPLACE VIEW sales.v_orders (PRIMARY KEY (id) NOT ENFORCED) AS SELECT id, item, 1 AS one FROM sales.orders WHERE item = 'tea'")
     replaced = {"columns": as_(A.port, vee, "SHOW COLUMNS FROM sales.v_orders"),
+                "select": as_(A.port, vee, "SELECT * FROM sales.v_orders"),
                 "grants": as_(A.port, boss, "SELECT grantee, privilege, on_name FROM pondra.grants WHERE grantee = 'vee' ORDER BY on_name")}
-    checks["a view replaced (CREATE OR REPLACE VIEW) keeps its grants: the user granted it reads its columns, the new one too, and pondra.grants still lists the grant"] = \
+    # (its rows too: a view reads its base table as the user, so vee's SELECT goes past the view, as before the replace,
+    # and is refused at `sales.orders`, which vee isn't granted; a grant lost for rows would refuse it at the view)
+    checks["a view replaced (CREATE OR REPLACE VIEW) keeps its grants: the user granted it reads its columns, the new one too, its SELECT is refused at the base table as before, not at the view, and pondra.grants still lists the grant"] = \
         [r.get("column_name") for r in rows(replaced["columns"])] == ["id", "item", "one"] \
+        and "permission denied" in str(replaced["select"]) and "orders" in str(replaced["select"]) and "v_orders" not in str(replaced["select"]) \
+        and "v_orders" not in str(w50["select"]) \
         and {"grantee": "vee", "privilege": "SELECT", "on_name": "sales.v_orders"} in rows(replaced["grants"])
     info = {"said": said, "wrote": wrote, "pg": pg_said, "kafka": kafka_said, "flight": flight_said[1:], "grants": grants, "revoked": [revoked, still, no_role, gone],
             "tokens": [by_token, expired, by_session, tampered, ended, dropped_token], "shown": shown_info}
@@ -26065,6 +26170,22 @@ def dialects():
     internal = [r["sql"][:80] for r in rows if not r["ok"] and r["sqlstate"] == "XX000"]
     info["refused as XX000 (internal)"] = internal
     checks[f"at most {XX000} refusals are XX000 (an internal error) rather than a code that names what went wrong"] = len(internal) <= XX000
+    # MySQL's `/*! … */` over HTTP after USE and with a `$name`: both print a plain query back before the front reads it, and
+    # the print kept the comment's words as code (11-07 audit M2: `SELECT /*! 1 + */ 2` answered 3)
+    def hinted(s, session):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {"x-pondra-session": session})
+        r = c.getresponse()
+        return r.status, r.getheader("x-pondra-sqlstate"), r.read().decode()[:160]
+    q("CREATE SCHEMA hint_s")
+    q("CREATE TABLE hint_s.t (a INT)")
+    q("INSERT INTO hint_s.t VALUES (1)")
+    hinted("USE hint_s", "dialects-hint-use")
+    hinted("$k = 5", "dialects-hint-var")
+    got = {"as sent": hinted("SELECT /*! 1 + */ 2 AS x FROM hint_s.t", "dialects-hint-none"), "after USE": hinted("SELECT /*! 1 + */ 2 AS x FROM t", "dialects-hint-use"),
+           "with a $name": hinted("SELECT /*! 1 + */ 2 AS x, $k AS k", "dialects-hint-var")}
+    info["a /*! … */ comment"] = got
+    checks["a /*! … */ comment is refused (0A000) over HTTP after USE and with a $name, as it is without (11-07 audit M2)"] = all(st == "0A000" for _, st, _ in got.values())
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"dialects": checks, "ok": ok, "info": info}, indent=1, default=str))

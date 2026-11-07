@@ -7,7 +7,8 @@ Reads the budget for the platform from tools/size-budget.txt, which holds two nu
 program's bytes as it ships (the dist profile, stripped), and the bytes it takes to download (gzip at level 6, as
 the release's .tar.gz is made). Over either one, this fails and names both numbers. A change that needs more raises
 the budget in tools/size-budget.txt in the same pull request, with a line saying why, so every byte added is a choice.
-A platform without a line is reported, not checked. One JSON line goes to stdout, and the numbers to the job's summary.
+A pull request's own build, in the release profile, is checked as `linux-x64-release` (build.yml), so a pull request
+that adds bytes fails itself, not main after it. A platform without a line is reported, not checked. One JSON line goes to stdout, and the numbers to the job's summary.
 """
 import argparse
 import json

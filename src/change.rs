@@ -70,6 +70,13 @@ impl Merge {
         self.upsert.as_ref().map(|u| u.on.as_slice()).filter(|on| !on.is_empty())
     }
 
+    /// Does it put values by the table's columns' order: an `INSERT … ON CONFLICT` (or `INSERT OR …`) without a column list, or
+    /// a `WHEN NOT MATCHED THEN INSERT VALUES` without one? Then the order its node had is checked on the leader, as a plain
+    /// INSERT's is (`write::in_sql_order`).
+    pub fn by_position(&self) -> bool {
+        self.upsert.as_ref().is_some_and(|u| u.columns.is_empty()) || self.clauses.iter().any(|c| matches!(&c.action, Action::Insert(columns, _) if columns.is_empty()))
+    }
+
     /// The privileges on its table it needs: what its clauses do (`auth::allows`).
     pub fn privileges(&self) -> Vec<&'static str> {
         let mut all: Vec<&'static str> = self.clauses.iter().map(|c| match c.action {
@@ -279,7 +286,7 @@ impl Merge {
         }
         let Some(sources) = self.key_sources(meta) else { return false };
         // (an INSERT without a column list fills the table's columns in order, as `merge` reads it)
-        let all: Vec<String> = meta.columns().iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect();
+        let all: Vec<String> = meta.columns().map(|(c, _)| c.to_string()).filter(|c| c != "_deleted").collect();
         self.clauses.iter().filter(|c| c.kind == Kind::NotMatched).all(|c| match &c.action {
             Action::Insert(columns, values) => {
                 let given = if columns.is_empty() { &all } else { columns };
@@ -322,7 +329,7 @@ impl Merge {
         if self.alias().eq_ignore_ascii_case("excluded") {
             return None; // (`txn::joined` names the old row by the alias: a name the proposed row's `excluded` can't share)
         }
-        let plain = |c: &str| c != "_deleted" && !crate::text::NAMES.contains(&c) && stored.columns().iter().any(|(n, _)| n == c);
+        let plain = |c: &str| c != "_deleted" && !crate::text::NAMES.contains(&c) && stored.columns().any(|(n, _)| n == c);
         let distinct = |cs: &[String]| cs.iter().enumerate().all(|(i, c)| !cs[..i].contains(c));
         if !crate::txn::point_table(name, stored) || stored.ttl.is_some() || !stored.ids || crate::constraints::checked(stored) || crate::auth::limited().is_some() {
             return None;
@@ -398,7 +405,7 @@ async fn compared_as_keys(lake: &Lake, meta: &TableMeta, sources: &[(String, (St
     let schema = crate::query::run_schema(&ctx, df.logical_plan())?; // (the types the query gives: a literal's as the analyzer types it)
     let fields = schema.fields();
     Ok(sources.iter().zip(fields.iter()).all(|((k, _), f)| {
-        let key = meta.columns().iter().find(|(c, _)| c == k).map(|(_, t)| crate::answer::dtype(t));
+        let key = meta.columns().find(|(c, _)| c == k).map(|(_, t)| crate::answer::dtype(t));
         matches!(key, Some(Ok(t)) if same_key_type(&t, f.data_type()))
     }))
 }
@@ -441,7 +448,7 @@ impl Upsert {
         let on = self.on_columns(meta, &m.target)?;
         // Every column of the table is in `excluded` and the insert: one the rows leave out holds its default (NULL with none),
         // as the rows were shaped. `_deleted` only when the rows give it.
-        let columns: Vec<String> = meta.columns().iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted" || given.contains(c)).collect();
+        let columns: Vec<String> = meta.columns().map(|(c, _)| c.to_string()).filter(|c| c != "_deleted" || given.contains(c)).collect();
         let (a, x) = (q(&m.alias), "excluded");
         let names: Vec<String> = columns.iter().map(|c| q(c)).collect();
         let source = format!("(SELECT {} FROM {PROPOSED_TABLE}) AS {x}", names.join(", "));
@@ -618,7 +625,7 @@ fn from(table: &str) -> String { format!("{} AS {}", crate::write::sql_name(tabl
 fn filter(cond: &Option<String>) -> String { cond.as_ref().map(|w| format!("WHERE {w}")).unwrap_or_default() }
 
 async fn update(lake: &Lake, table: &str, meta: &TableMeta, set: &[(String, String)], cond: &Option<String>, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
-    ensure!(set.iter().all(|(c, _)| meta.columns().iter().any(|(n, _)| n == c) && c != "_deleted"), "UPDATE sets the table's own columns");
+    ensure!(set.iter().all(|(c, _)| meta.columns().any(|(n, _)| n == c) && c != "_deleted"), "UPDATE sets the table's own columns");
     ensure!(set.iter().all(|(c, _)| !crate::text::NAMES.contains(&c.as_str())), "system columns can't be set");
     select(lake, table, meta, set, &format!("FROM {} {}", from(table), filter(cond)), upto).await
 }
@@ -632,7 +639,7 @@ async fn select(lake: &Lake, table: &str, meta: &TableMeta, set: &[(String, Stri
 /// (`set`) or new rows (`insert`: values for the table's columns).
 #[allow(clippy::too_many_arguments)]
 async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)]>, insert: Option<&[String]>, rest: &str, upto: u64, a: &str) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
-    let cols: Vec<&String> = meta.columns().iter().map(|(c, _)| c).collect();
+    let cols: Vec<&str> = meta.columns().map(|(c, _)| c).collect();
     let mut items = vec![];
     if insert.is_none() {
         items.extend(cols.iter().map(|c| format!("{a}.{} AS {}", q(c), q(&format!("__o_{c}")))));
@@ -663,7 +670,7 @@ async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)
 /// (`query::strict`: a fraction into an integer rounds, a value that won't go is an error), and (`ids`) the rows'
 /// `_row_id`, `_created_at` (and, for old versions, `_version`) after them.
 fn part(all: &RecordBatch, meta: &TableMeta, prefix: &str, ids: bool) -> Result<RecordBatch> {
-    let target = crate::answer::schema(&meta.columns())?;
+    let target = meta.schema()?;
     let get = |name: &str| all.column_by_name(name).cloned().with_context(|| format!("{name}?"));
     let mut fields: Vec<Arc<Field>> = target.fields().to_vec();
     let mut columns = target.fields().iter().map(|f| crate::query::strict(&get(&format!("{prefix}{}", f.name()))?, f.data_type())).collect::<Result<Vec<ArrayRef>>>()?;
@@ -739,7 +746,7 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
                     if let Some((c, _)) = set.iter().find(|(c, _)| meta.key.contains(c)) {
                         return Err(crate::codes::coded("0A000", format!("{what}: UPDATE of {table}'s key column {c} isn't taken here: delete the row, then insert it with its new key")));
                     }
-                    ensure!(set.iter().all(|(c, _)| meta.columns().iter().any(|(n, _)| n == c) && !crate::text::NAMES.contains(&c.as_str())), "{}: UPDATE sets the table's own columns", what);
+                    ensure!(set.iter().all(|(c, _)| meta.columns().any(|(n, _)| n == c) && !crate::text::NAMES.contains(&c.as_str())), "{}: UPDATE sets the table's own columns", what);
                     select_as(lake, meta, Some(set), None, &rest, upto, &a).await?
                 }
                 (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a).await?,
@@ -750,9 +757,9 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
                         let what = if values.len() > given.len() { "INSERT has more expressions than target columns" } else { "INSERT has more target columns than expressions" };
                         return Err(crate::codes::coded("42601", format!("{what} (MERGE: INSERT gives {} values for {} columns)", values.len(), given.len())));
                     }
-                    ensure!(given.iter().all(|c| meta.columns().iter().any(|(n, _)| n == c)), "MERGE: INSERT names the table's own columns");
+                    ensure!(given.iter().all(|c| meta.columns().any(|(n, _)| n == c)), "MERGE: INSERT names the table's own columns");
                     // (a column the clause leaves out takes its default, as `select_as` gives it: NULL with none)
-                    let values: Vec<String> = meta.columns().iter().map(|(c, _)| given.iter().position(|g| g == c).map_or("DEFAULT".into(), |i| values[i].clone())).collect();
+                    let values: Vec<String> = meta.columns().map(|(c, _)| given.iter().position(|g| g == c).map_or("DEFAULT".into(), |i| values[i].clone())).collect();
                     select_as(lake, meta, None, Some(&values), &rest, upto, &a).await?
                 }
             };
@@ -836,7 +843,8 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &Arc<Table
     }
     let inserted = new.as_ref().and_then(|n| Some(n.column_by_name(ROW_ID)?.null_count())).unwrap_or(0); // (new rows: no id yet)
     let src = |p: &str| Src { producer: format!("{producer}{p}"), seq: 1, prev: None };
-    let append = |table: &str, batch: RecordBatch, src: Src| Append { table: table.into(), src, batch, ack: tokio::sync::oneshot::channel().0, placed: None };
+    // (the table's rows a plain INSERT or a by-position MERGE put by its node's order carry it, for the leader: `log::placed_for`)
+    let append = |table: &str, batch: RecordBatch, src: Src| Append { table: table.into(), src, batch, ack: tokio::sync::oneshot::channel().0, placed: crate::log::placed_for(table) };
     let mut pending = vec![];
     if meta.key.is_empty() {
         if old.is_some() {
@@ -978,7 +986,7 @@ pub async fn feed(lake: &Lake, table: &str, after: u64, upto: Option<u64>) -> Re
     };
     let keys = |bs: &[RecordBatch]| bs.iter().flat_map(|b| (0..b.num_rows()).map(move |i| key(b, i))).collect::<HashSet<_>>();
     let (new, old) = (keys(&rows), keys(&gone));
-    let out = crate::answer::schema(&sys::with_sys(&meta).columns())?;
+    let out = sys::with_sys(&meta).schema()?;
     let mut fields = out.fields().to_vec();
     fields.push(Arc::new(Field::new("_change_type", DataType::Utf8, false)));
     let s = Arc::new(Schema::new(fields));

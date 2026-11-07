@@ -190,7 +190,7 @@ fn overlaps(s: &Span, cuts: &[ScalarValue], i: usize) -> bool {
 /// The columns of `meta` a query can be sliced by: named in its text (by SQL's names), with an
 /// order. Their stored names: files' ranges and a slice's scan know them so (ADR-022).
 fn named(meta: &TableMeta, words: &HashSet<String>) -> Result<Vec<(String, DataType)>> {
-    let schema = crate::query::read_schema(&meta.columns())?;
+    let schema = meta.read_schema()?;
     let key = |t: &DataType| t.is_integer() || matches!(t, DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) | DataType::Decimal128(..) | DataType::Utf8);
     let live = |c: &String| meta.col(c).is_some_and(|c| !c.dropped && words.contains(&c.name.to_lowercase()));
     Ok(schema.fields().iter().filter(|f| live(f.name()) && key(f.data_type())).map(|f| (f.name().clone(), f.data_type().clone())).collect())
@@ -238,7 +238,7 @@ pub async fn scheme(lake: &Lake, sql: &str, tables: &[(String, TableMeta)], n: u
 /// which each reads through its range.
 pub async fn parts(lake: &Lake, meta: &TableMeta, table: &str, scheme: &Scheme, n: usize, tail: (u64, u64)) -> Result<Vec<Part>> {
     let column = &scheme.columns[table];
-    let schema = crate::query::read_schema(&meta.columns())?;
+    let schema = meta.read_schema()?;
     let t = schema.field_with_name(column)?.data_type().clone();
     let spans = spans(&pieces(lake, meta, n).await?, column, &t).context("a piece without a range")?;
     let cuts: Vec<String> = scheme.cuts.iter().map(|c| crate::manifest::text(c).context("a cut that can't be written down")).collect::<Result<_>>()?;

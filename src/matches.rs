@@ -98,7 +98,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     let (columns, sql_types) = crate::rerun::table_columns(lake, sql, &pctx, &plan).await?;
 
     // The three tables. `$held` is keyed by its source row's id; `$resume` by the PARTITION BY columns (none: one key).
-    let mut held_cols = src.columns().to_vec();
+    let mut held_cols = src.to_columns();
     held_cols.extend([("__mr_row".to_string(), "Int64".to_string()), ("_deleted".to_string(), "Boolean".to_string())]);
     let mut held_meta = TableMeta::with_columns(held_cols);
     (held_meta.key, held_meta.tiered, held_meta.ids) = (vec!["__mr_row".into()], lake.visible(), true);
@@ -319,7 +319,7 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     let resume_meta: Arc<TableMeta> = Arc::new(table_meta(lake, &resume_name).await?);
     let view_meta = table_meta(lake, view).await?;
     let time_type = dtype(&column_type(&src, &m.time)?)?;
-    let cols: Vec<(String, DataType)> = src.columns().iter().map(|(c, t)| Ok((c.clone(), dtype(t)?))).collect::<Result<_>>()?;
+    let cols: Vec<(String, DataType)> = src.columns().map(|(c, t)| Ok((c.to_string(), dtype(t)?))).collect::<Result<_>>()?;
     let part: Vec<(String, DataType)> = m.part.iter().map(|p| Ok((p.clone(), dtype(&column_type(&src, p)?)?))).collect::<Result<_>>()?;
     let t = ident(m.time.as_str());
 
@@ -331,7 +331,7 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     }
 
     // S: the source's rows in (W0, W], as they are at `at`, with their ids and versions. The run decides up to the cut.
-    let names: Vec<String> = src.columns().iter().map(|(c, _)| c.clone()).collect();
+    let names: Vec<String> = src.columns().map(|(c, _)| c.to_string()).collect();
     let read = format!("SELECT {}, {ROW_ID}, {VERSION} FROM {}", crate::objects::list_sql(&names), crate::write::sql_name(&v.source));
     let sctx = session_at(lake, &read, "", Some(at)).await?;
     let table = sctx.table(table_ref(&v.source)).await?;
@@ -440,7 +440,7 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     // The view's rows: the matches, through the query's own clause when it has one.
     let match_schema: SchemaRef = Arc::new(Schema::new(inner_schema.fields().iter().filter(|f| f.name() != "__mr_resume").map(|f| f.as_ref().clone()).collect::<Vec<_>>()));
     let all_matches = rows_as(&match_schema, &matched)?;
-    let view_schema = crate::answer::schema(&view_meta.columns())?;
+    let view_schema = view_meta.schema()?;
     let view_rows = match &m.outer {
         Some(outer) => {
             let octx = session(lake, outer, "__matches").await?;
@@ -473,7 +473,7 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     pending.extend(flush_parts(resume_parts, &resume_name, &resume_meta, &format!("{producer}$resume"), wv, w0v)?);
     if at > at0 {
         let batch = match late {
-            0 => RecordBatch::new_empty(crate::answer::schema(&crate::views::expected_table(lake).columns())?),
+            0 => RecordBatch::new_empty(crate::views::expected_table(lake).schema()?),
             n => crate::once::late_batch(view, &m.id, n)?,
         };
         pending.push(Append { table: EXPECTED.into(), src: Src { producer: late_producer, seq: at, prev: Some(at0) }, batch, ack: tokio::sync::oneshot::channel().0, placed: None });
@@ -644,7 +644,7 @@ async fn table_meta(lake: &Lake, name: &str) -> Result<TableMeta> {
 
 /// A source column's type, as the table has it.
 fn column_type(src: &TableMeta, column: &str) -> Result<String> {
-    src.columns().iter().find(|(c, _)| c == column).map(|(_, t)| t.clone()).with_context(|| format!("no column {column}"))
+    src.columns().find(|(c, _)| *c == column).map(|(_, t)| t.to_string()).with_context(|| format!("no column {column}"))
 }
 
 fn dtype(t: &str) -> Result<DataType> { crate::answer::dtype(t) }
@@ -697,7 +697,7 @@ fn nonempty(b: RecordBatch) -> Vec<RecordBatch> {
 /// part (its producer's seq must move with the flush, as `rerun` sends them).
 fn flush_parts(parts: Vec<Append>, table: &str, meta: &TableMeta, producer: &str, seq: u64, prev: u64) -> Result<Vec<Append>> {
     let mut parts = match parts.is_empty() {
-        true => vec![Append { table: table.to_string(), src: Src { producer: String::new(), seq: 0, prev: None }, batch: RecordBatch::new_empty(crate::answer::schema(&meta.columns())?), ack: tokio::sync::oneshot::channel().0, placed: None }],
+        true => vec![Append { table: table.to_string(), src: Src { producer: String::new(), seq: 0, prev: None }, batch: RecordBatch::new_empty(meta.schema()?), ack: tokio::sync::oneshot::channel().0, placed: None }],
         false => parts,
     };
     for a in &mut parts {
@@ -849,7 +849,7 @@ fn keys_batch(keys: &[Key], part: &[(String, DataType)]) -> Result<RecordBatch> 
 
 /// `$resume`'s rows for the keys with a marker: the key's columns, `k`, `m` (the marker's `next_m`) and `due`.
 fn resume_batch(markers: &[(Key, Marker)], part: &[(String, DataType)], meta: &TableMeta) -> Result<RecordBatch> {
-    let schema = crate::answer::schema(&meta.columns().iter().filter(|(c, _)| c != "_deleted").cloned().collect::<Vec<_>>())?;
+    let schema = crate::answer::schema_of(meta.columns().filter(|(c, _)| *c != "_deleted"))?;
     if markers.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
     }
@@ -1014,13 +1014,13 @@ mod tests {
         assert!(!view.inline() && view.once.is_none());
         assert!(view.written.as_deref().is_some_and(|w| w.ends_with("EMIT FINAL")), "the statement as written");
         let out: TableMeta = lake.cat.get(&table_key("dips")).await?.context("the view's table")?;
-        assert_eq!(out.columns().iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(), ["symbol", "start_ts"]);
+        assert_eq!(out.columns().map(|(c, _)| c).collect::<Vec<_>>(), ["symbol", "start_ts"]);
         let held: TableMeta = lake.cat.get(&table_key("dips$held")).await?.context("held")?;
         assert_eq!(held.key, ["__mr_row"]);
-        assert_eq!(held.columns().iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(), ["symbol", "ts", "price", "__mr_row", "_deleted"]);
+        assert_eq!(held.columns().map(|(c, _)| c).collect::<Vec<_>>(), ["symbol", "ts", "price", "__mr_row", "_deleted"]);
         let resume: TableMeta = lake.cat.get(&table_key("dips$resume")).await?.context("resume")?;
         assert_eq!(resume.key, ["symbol"]);
-        assert_eq!(resume.columns().iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(), ["symbol", "k", "m", "due", "_deleted"]);
+        assert_eq!(resume.columns().map(|(c, _)| c).collect::<Vec<_>>(), ["symbol", "k", "m", "due", "_deleted"]);
         assert!(lake.cat.get::<TableMeta>(&table_key(EXPECTED)).await?.is_some());
         assert_eq!(producers("dips"), ["match:dips", "match:dips$held", "match:dips$resume", "match:dips$late"].map(String::from));
         assert_eq!(tables("dips"), ["dips$held", "dips$resume"].map(String::from));
@@ -1029,7 +1029,7 @@ mod tests {
         create(&lake, "all", &TICKER.replace("PARTITION BY symbol ", ""), options()).await?;
         let resume: TableMeta = lake.cat.get(&table_key("all$resume")).await?.context("resume")?;
         assert_eq!(resume.key, ["__mr_all"]);
-        assert_eq!(resume.columns().iter().map(|(c, t)| format!("{c}:{t}")).collect::<Vec<_>>(), ["__mr_all:Boolean", "k:Int64", "m:Int64", "due:Int64", "_deleted:Boolean"]);
+        assert_eq!(resume.columns().map(|(c, t)| format!("{c}:{t}")).collect::<Vec<_>>(), ["__mr_all:Boolean", "k:Int64", "m:Int64", "due:Int64", "_deleted:Boolean"]);
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

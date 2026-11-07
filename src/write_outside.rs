@@ -20,21 +20,47 @@ use std::sync::Arc;
 
 const FILE_BYTES: usize = 128 << 20; // (a file this big is closed, and another started)
 
-/// INSERT INTO `table` (a table of files: `ext_names::attached_table`) the rows of `query`.
-pub async fn insert(lake: &Lake, table: &str, query: &str, job: &str) -> Result<Value> {
+/// INSERT INTO `table` (a table of files: `ext_names::attached_table`; SQL names it `name`) the rows of `query`, into the
+/// columns `names` lists (`INSERT INTO t (b, a) …`), or into each column in turn.
+pub async fn insert(lake: &Lake, table: &str, name: &str, names: Option<Vec<String>>, query: &str, job: &str) -> Result<Value> {
     let spec = crate::ext_names::spec(table).context("not another engine's table")?;
     crate::ext::check(lake, &spec).await?; // (written by whoever may read it: a secret covering it, or the node's owner)
-    let query = crate::routines::expand(lake, query).await?;
-    let df = crate::engine::sql(&crate::query::session(lake, &query, "").await?, &query).await?;
+    let rows = Rows::Insert { name: name.to_string(), names, query: query.to_string() };
     match spec.format.as_str() {
-        "delta" => delta(lake, spec.urls[0].trim_end_matches('/'), df, job, false).await,
-        "iceberg" => iceberg(lake, &spec, df, job, false).await,
+        "delta" => delta(lake, spec.urls[0].trim_end_matches('/'), rows, job, false).await,
+        "iceberg" => iceberg(lake, &spec, rows, job, false).await,
         f => bail!("INSERT into {f} files: into a table attached as delta or iceberg"),
     }
 }
 
-/// The columns of another engine's table (`ext_names` spec `target`), as SQL names them, in the table's order: what an INSERT
-/// that names some of them fills the rest of with NULL (`write::run`'s column list), as its format keeps no DEFAULT.
+/// The rows a write here takes: a query planned already (COPY … TO's), or an INSERT's, planned once its writer has read the
+/// table's schema. A column list is placed in that schema (`rows_for`: the columns it leaves out are NULL, as the format
+/// keeps no DEFAULT, and a NOT NULL one is refused by `Fit`), the one the rows are written by: read apart from it, a column
+/// another engine moved or dropped in between would take another's values. A guest's INSERT, through the inbox, is placed
+/// where it is sent (`write::run`, `columns`).
+pub enum Rows {
+    Planned(datafusion::prelude::DataFrame),
+    Insert { name: String, names: Option<Vec<String>>, query: String },
+}
+
+impl Rows {
+    /// The rows, as a query of the table's columns in its order (`columns`, as SQL names them).
+    async fn frame(self, lake: &Lake, columns: &[String]) -> Result<datafusion::prelude::DataFrame> {
+        let (name, names, query) = match self {
+            Rows::Planned(df) => return Ok(df),
+            Rows::Insert { name, names, query } => (name, names, query),
+        };
+        let query = match names {
+            Some(names) => crate::rules::rows::rows_for(&name, columns, &names, &query, &|_| None)?,
+            None => query,
+        };
+        let query = crate::routines::expand(lake, &query).await?;
+        crate::engine::sql(&crate::query::session(lake, &query, "").await?, &query).await
+    }
+}
+
+/// The columns of another engine's table (`ext_names` spec `target`), as SQL names them, in the table's order: what a guest's
+/// INSERT that names some of them fills the rest of with NULL (`write::run`'s column list), as its format keeps no DEFAULT.
 pub async fn columns(lake: &Lake, target: &str) -> Result<Vec<String>> {
     let spec = crate::ext_names::spec(target).context("not another engine's table")?;
     crate::ext::check(lake, &spec).await?; // (its columns are read by whoever may write it, as its rows are: `insert`)
@@ -91,13 +117,13 @@ pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, 
     }
     let replace = table && overwrite;
     match format {
-        "delta" => delta(lake, root, df, job, replace).await,
-        _ => iceberg(lake, &crate::ext_names::Spec { urls: vec![root.to_string()], format: format.into(), options: Default::default() }, df, job, replace).await,
+        "delta" => delta(lake, root, Rows::Planned(df), job, replace).await,
+        _ => iceberg(lake, &crate::ext_names::Spec { urls: vec![root.to_string()], format: format.into(), options: Default::default() }, Rows::Planned(df), job, replace).await,
     }
 }
 
 /// Rows into a Delta table: added, or (`replace`) instead of its rows.
-async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job: &str, replace: bool) -> Result<Value> {
+async fn delta(lake: &Lake, root: &str, rows: Rows, job: &str, replace: bool) -> Result<Value> {
     let app = format!("pondra:{job}");
     let log = read_delta::replay(lake, root, None).await?;
     if let Some(&v) = log.txns.get(&app) {
@@ -105,17 +131,21 @@ async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job:
     }
     delta_writable(root, &log)?;
     let (columns, partitions, mapped) = read_delta::schema(root, &log.metadata)?;
+    let df = rows.frame(lake, &columns.iter().map(|(_, l, _)| l.clone()).collect::<Vec<_>>()).await?; // (by logical name)
     let fields = read_delta_fields(&log.metadata)?;
     let not_null = delta_not_null(&log.metadata)?;
-    // (a NOT NULL column is written as Parquet's required, as the table's own writers write it: `Fit` has refused any NULL in it)
+    let types: HashMap<String, Value> = serde_json::from_str::<Value>(log.metadata["schemaString"].as_str().context("no schema")?)?["fields"].as_array().into_iter().flatten()
+        .filter_map(|f| Some((f["name"].as_str()?.to_string(), f["type"].clone()))).collect();
+    // (a NOT NULL column is written as Parquet's required, as the table's own writers write it: `Fit` has refused any NULL in it;
+    // a mapped table's struct holds its fields by their physical names and ids, as its own writers write them: `mapped_type`)
     let target: Vec<Field> = columns.iter().map(|(p, l, t)| {
-        let f = Field::new(p, t.clone(), !not_null.contains(l));
+        let f = Field::new(p, match types.get(l).filter(|_| mapped) { Some(d) => mapped_type(d, t), None => t.clone() }, !not_null.contains(l));
         match fields.get(l).and_then(|m| m["delta.columnMapping.id"].as_i64()).filter(|_| mapped) {
             Some(id) => f.with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into()),
             None => f,
         }
     }).collect();
-    let fit = Fit::new(&df, &target, columns.iter().map(|(_, l, _)| not_null.contains(l).then(|| l.clone())).collect(), root)?; // (said by its logical name)
+    let fit = Fit::new(&df, &target, columns.iter().map(|(_, _, t)| t.clone()).collect(), columns.iter().map(|(_, l, _)| not_null.contains(l).then(|| l.clone())).collect(), root)?; // (said by its logical name)
     let partition_at: Vec<usize> = partitions.iter().map(|p| target.iter().position(|f| f.name() == p).expect("a partition column")).collect();
     let file_fields: Vec<Field> = target.iter().enumerate().filter(|(i, _)| !partition_at.contains(i)).map(|(_, f)| f.clone()).collect();
     let parts = |b: &RecordBatch| -> Result<Vec<Part>> {
@@ -214,12 +244,65 @@ fn delta_writable(root: &str, log: &read_delta::Log) -> Result<()> {
             ensure!(meta.get(k).is_none(), "{root}: column {name} has {what}, which Pondra doesn't compute or check yet: INSERT with Spark or delta-rs");
         }
     }
+    // (Pondra checks no NOT NULL inside a column: a struct's NOT NULL field, an array's NOT NULL elements)
+    let schema: Value = serde_json::from_str(log.metadata["schemaString"].as_str().context("no schema")?)?;
+    for f in schema["fields"].as_array().into_iter().flatten() {
+        let name = f["name"].as_str().unwrap_or_default();
+        ensure!(!not_null_inside(&f["type"]), "{root}: column {name} has a NOT NULL value inside it, which Pondra doesn't check yet: INSERT with Spark or delta-rs");
+    }
     let config = log.metadata["configuration"].as_object().cloned().unwrap_or_default();
     if let Some(k) = config.keys().find(|k| k.starts_with("delta.constraints.")) {
         bail!("{root}: the table has a CHECK constraint ({}), which Pondra doesn't check yet", &k["delta.constraints.".len()..]);
     }
     ensure!(config.get("delta.appendOnly").is_none_or(|v| v == "true" || v == "false"), "{root}: delta.appendOnly");
     Ok(())
+}
+
+/// A column's type as a table that maps its columns' names (`delta.columnMapping.mode`) holds it in its files: a struct's
+/// fields, at any depth, by their physical names and with their ids (Parquet's field ids), as Spark and delta-rs write and
+/// find them. `t` is the column's Delta type, `logical` its type as SQL reads it (`read_delta::schema`).
+fn mapped_type(t: &Value, logical: &DataType) -> DataType {
+    match (t["type"].as_str(), logical) {
+        (Some("struct"), DataType::Struct(fields)) => DataType::Struct(t["fields"].as_array().into_iter().flatten().zip(fields.iter()).map(|(f, l)| {
+            let meta = &f["metadata"];
+            let field = Field::new(meta["delta.columnMapping.physicalName"].as_str().unwrap_or(l.name()), mapped_type(&f["type"], l.data_type()), l.is_nullable());
+            Arc::new(match meta["delta.columnMapping.id"].as_i64() {
+                Some(id) => field.with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into()),
+                None => field,
+            })
+        }).collect()),
+        (Some("array"), DataType::List(item)) => DataType::List(Arc::new(Field::new(item.name(), mapped_type(&t["elementType"], item.data_type()), item.is_nullable()))),
+        _ => logical.clone(),
+    }
+}
+
+/// `a` with its type's names as `to` says them: the same values, its structs' fields (at any depth) renamed (`mapped_type`).
+fn renamed(a: &ArrayRef, to: &DataType) -> Result<ArrayRef> {
+    use datafusion::arrow::array::{ListArray, StructArray};
+    Ok(match (a.data_type(), to) {
+        (from, to) if from == to => a.clone(),
+        (DataType::Struct(_), DataType::Struct(fields)) => {
+            let s = a.as_struct();
+            let columns = s.columns().iter().zip(fields.iter()).map(|(c, f)| renamed(c, f.data_type())).collect::<Result<Vec<_>>>()?;
+            Arc::new(StructArray::try_new(fields.clone(), columns, s.nulls().cloned())?)
+        }
+        (DataType::List(_), DataType::List(item)) => {
+            let l = a.as_list::<i32>();
+            Arc::new(ListArray::try_new(item.clone(), l.offsets().clone(), renamed(l.values(), item.data_type())?, l.nulls().cloned())?)
+        }
+        _ => a.clone(),
+    })
+}
+
+/// Does a Delta type say NOT NULL of something inside it: a struct's field, an array's elements, a map's values?
+fn not_null_inside(t: &Value) -> bool {
+    let no = |k: &str| t[k].as_bool() == Some(false);
+    match t["type"].as_str() {
+        Some("struct") => t["fields"].as_array().into_iter().flatten().any(|f| f["nullable"].as_bool() == Some(false) || not_null_inside(&f["type"])),
+        Some("array") => no("containsNull") || not_null_inside(&t["elementType"]),
+        Some("map") => no("valueContainsNull") || not_null_inside(&t["keyType"]) || not_null_inside(&t["valueType"]),
+        _ => false,
+    }
 }
 
 /// A Delta schema's top-level fields' metadata, by logical name.
@@ -392,19 +475,20 @@ async fn finish(lake: &Lake, root: &str, folder: &str, w: ArrowWriter<Vec<u8>>, 
 /// with one is refused by name, `delta_writable`).
 pub struct Fit {
     target: SchemaRef,
+    cast: Vec<DataType>, // (each column's type as SQL reads it: the target's, but for a mapped Delta table's struct names)
     not_null: Vec<Option<String>>, // (a NOT NULL column's name, as SQL names it)
     table: String,
 }
 
 impl Fit {
-    fn new(df: &datafusion::prelude::DataFrame, target: &[Field], not_null: Vec<Option<String>>, table: &str) -> Result<Fit> {
+    fn new(df: &datafusion::prelude::DataFrame, target: &[Field], cast: Vec<DataType>, not_null: Vec<Option<String>>, table: &str) -> Result<Fit> {
         let have = df.schema().fields().len();
         ensure!(have == target.len(), "INSERT into {table}: the query gives {have} columns, the table has {} ({})", target.len(), target.iter().map(|f| f.name().as_str()).collect::<Vec<_>>().join(", "));
-        Ok(Fit { target: Arc::new(Schema::new(target.to_vec())), not_null, table: table.to_string() })
+        Ok(Fit { target: Arc::new(Schema::new(target.to_vec())), cast, not_null, table: table.to_string() })
     }
 
     fn fit(&self, b: RecordBatch) -> Result<RecordBatch> {
-        let cols = b.columns().iter().zip(self.target.fields()).map(|(c, f)| crate::rules::fit::strict(c, f.data_type())).collect::<Result<Vec<_>>>()?;
+        let cols = b.columns().iter().zip(&self.cast).zip(self.target.fields()).map(|((c, t), f)| renamed(&crate::rules::fit::strict(c, t)?, f.data_type())).collect::<Result<Vec<_>>>()?;
         if let Some(name) = cols.iter().zip(&self.not_null).find_map(|(c, n)| n.as_ref().filter(|_| c.null_count() > 0)) {
             return Err(crate::codes::coded("23502", format!("{}: column {name} is NOT NULL, and a row gives it no value", self.table)));
         }
@@ -435,16 +519,16 @@ pub async fn put_new(lake: &Lake, url: &str, body: Vec<u8>) -> Result<bool> {
 /// the snapshot's manifests and it, and the next metadata — a new file beside the last (put if
 /// absent), or the REST catalog's commit (the current snapshot asserted).
 /// …`replace`: the snapshot holds only the new files (an overwrite).
-pub async fn iceberg(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::prelude::DataFrame, job: &str, replace: bool) -> Result<Value> {
+pub async fn iceberg(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &str, replace: bool) -> Result<Value> {
     let url = spec.urls[0].trim_end_matches('/');
     let (at, meta, d) = crate::read_iceberg::current(lake, url, &spec.options).await?;
-    crate::catalogs::within(d, written(lake, spec, df, job, replace, at, meta)).await
+    crate::catalogs::within(d, written(lake, spec, rows, job, replace, at, meta)).await
 }
 
 /// Write a table's files and commit their snapshot, on top of its current metadata (`at`, `meta`),
 /// as often as another writer's commit makes it wait. Run where the catalog's credentials for the
 /// table's location are in scope (`iceberg`).
-async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::prelude::DataFrame, job: &str, replace: bool, mut at: String, mut meta: Value) -> Result<Value> {
+async fn written(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &str, replace: bool, mut at: String, mut meta: Value) -> Result<Value> {
     let url = spec.urls[0].trim_end_matches('/');
     let rest = spec.options.contains_key("namespace");
     if let Some(s) = done(&meta, job) {
@@ -456,10 +540,11 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
     // (named by the table's metadata, wherever it likes: written only where the caller may write, as its files are read)
     crate::ext::check_urls(lake, &[format!("{location}/data/").as_str(), format!("{location}/metadata/").as_str()]).await?;
     let (schema_json, columns) = crate::read_iceberg::schema_of(&meta)?;
+    let df = rows.frame(lake, &columns.iter().map(|(n, ..)| n.clone()).collect::<Vec<_>>()).await?;
     let required: Vec<Option<String>> = columns.iter().map(|(n, ..)| schema_json["fields"].as_array().into_iter().flatten().any(|f| f["name"] == n.as_str() && f["required"] == true).then(|| n.clone())).collect();
     // (a required column is written as Parquet's required, as Iceberg's writers write it: `Fit` has refused any NULL in it)
     let target: Vec<Field> = columns.iter().zip(&required).map(|((n, id, t), r)| Field::new(n, t.clone(), r.is_none()).with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into())).collect();
-    let fit = Fit::new(&df, &target, required, url)?;
+    let fit = Fit::new(&df, &target, target.iter().map(|f| f.data_type().clone()).collect(), required, url)?;
     let spec_id = meta["default-spec-id"].as_i64().unwrap_or(0);
     let pspec = meta["partition-specs"].as_array().into_iter().flatten().find(|s| s["spec-id"].as_i64() == Some(spec_id)).cloned().unwrap_or(json!({"fields": []}));
     let fields: Vec<(String, usize, String, DataType)> = pspec["fields"].as_array().into_iter().flatten().map(|f| {
@@ -484,6 +569,7 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
     let written = write_files(lake, &location, "data/", df, &fit, Arc::new(Schema::new(target.clone())), &keep, &parts).await?;
     let rows: u64 = written.iter().map(|w| w.rows).sum();
     let ids: HashMap<&str, i64> = columns.iter().map(|(n, id, _)| (n.as_str(), *id)).collect();
+    let wrote_for = (meta["current-schema-id"].clone(), spec_id); // (the schema and spec the files are written by)
     loop {
         let snapshot_id = (uuid::Uuid::new_v4().as_u64_pair().0 >> 1) as i64;
         let seq = meta["last-sequence-number"].as_i64().unwrap_or(0) + 1;
@@ -548,11 +634,14 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
         if committed {
             return Ok(json!({"rows": rows, "snapshot": snapshot_id}));
         }
-        // Another writer committed first: on top of theirs (our files stay; the lists are new).
+        // Another writer committed first: on top of theirs (our files stay; the lists are new), unless it changed what we
+        // wrote for (the files' columns and partitions are the schema's and spec's we read), as a Delta table's INSERT is.
         (at, meta, _) = crate::read_iceberg::current(lake, url, &spec.options).await?;
         if let Some(s) = done(&meta, job) {
             return Ok(iceberg_duplicate(s));
         }
+        ensure!((meta["current-schema-id"].clone(), meta["default-spec-id"].as_i64().unwrap_or(0)) == wrote_for,
+                "{url}: the table's schema or partitioning changed while this INSERT wrote: run it again");
     }
 }
 

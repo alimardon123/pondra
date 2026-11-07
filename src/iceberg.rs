@@ -204,7 +204,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     let inline_changed = st.inline.is_none() != parts.inline.is_empty() || st.inlined != inlined || st.deleted != deleted;
     let layout = Layout::of(meta);
     let shape = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(),
-        json!([fields, layout.spec(), layout.sort, layout.keys, meta.columns().iter().map(|(c, _)| meta.name_of(c)).collect::<Vec<_>>(), meta.properties]).to_string()); // (a rename, say)
+        json!([fields, layout.spec(), layout.sort, layout.keys, meta.columns().map(|(c, _)| meta.name_of(c)).collect::<Vec<_>>(), meta.properties]).to_string()); // (a rename, say)
     if st.version > 0 && fresh.is_empty() && went.is_empty() && !inline_changed && named.is_none() && st.shape == shape && !moved {
         return Ok(None);
     }
@@ -790,12 +790,12 @@ async fn keyed(lake: &Lake, name: &str, meta: &TableMeta, c: &mut Commit) -> Res
     let ctx = lake.session();
     let mut gone = vec![]; // (the keys it deletes, under their SQL names)
     for (f, by) in &c.equality {
-        let named = |by: &[i64]| by.iter().map(|i| usize::try_from(i - 1).ok().and_then(|i| meta.columns().get(i)).map_or_else(|| format!("field {i}"), |(c, _)| meta.name_of(c).to_string())).collect::<Vec<_>>().join(", ");
+        let named = |by: &[i64]| by.iter().map(|i| usize::try_from(i - 1).ok().and_then(|i| meta.columns().nth(i)).map_or_else(|| format!("field {i}"), |(c, _)| meta.name_of(c).to_string())).collect::<Vec<_>>().join(", ");
         anyhow::ensure!(by.iter().copied().collect::<std::collections::BTreeSet<_>>() == ids, "{}: an equality delete by {}; {name} takes equality deletes by its key ({}) only", f.path, named(by), names.join(", "));
         let df = ctx.read_parquet(lake.full(&f.path), Default::default()).await?;
         gone.extend(df.select(names.iter().map(|n| ident(*n)).collect::<Vec<_>>())?.collect().await?);
     }
-    let stored = crate::answer::schema(&meta.columns().iter().filter(|(c, _)| meta.key.contains(c)).cloned().collect::<Vec<_>>())?;
+    let stored = crate::answer::schema_of(meta.columns().filter(|(c, _)| meta.key.iter().any(|k| k == c)))?;
     let file = |p: &str| meta.files.iter().find(|f| f.path == p).cloned().with_context(|| format!("{CONFLICT}: {p} is no longer {name}'s"));
     for (p, d, _) in &c.deleted {
         for b in crate::adopt::rows_deleted(lake, meta, &file(p)?, std::slice::from_ref(d), &stored).await? {

@@ -19,17 +19,9 @@ use datafusion::physical_plan::ExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 
-/// A table's columns as queries read them: strings as views (Utf8View), so scans don't copy them
-/// and string filters and joins take their fast paths (TPC-H runs about 8% faster). Tables store
-/// plain Utf8 (see `schema`).
-pub fn read_schema(columns: &[(String, String)]) -> Result<SchemaRef> {
-    let stored = schema(columns)?;
-    let fields = stored.fields().iter().map(|f| match f.data_type() {
-        DataType::Utf8 => Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8View)),
-        _ => f.clone(),
-    });
-    Ok(Arc::new(Schema::new(fields.collect::<Vec<_>>())))
-}
+/// A table's columns as queries read them: `answer::read_schema_of` (strings as views, and why), of
+/// owned pairs. A table's own: `TableMeta::read_schema`.
+pub fn read_schema(columns: &[(String, String)]) -> Result<SchemaRef> { crate::answer::read_schema_of(columns.iter().map(|(n, t)| (n.as_str(), t.as_str()))) }
 
 pub use crate::rules::fit::{conform, strict};
 
@@ -89,8 +81,8 @@ async fn tail_segments(lake: &Lake, table: &str, after: u64, upto: Option<u64>, 
     }).collect();
     let fetched: Vec<Vec<(RecordBatch, bool)>> = futures::stream::iter(fetches).buffered(32).try_collect().await?;
     let target = match lake.cat.meta(&table_key(table)).await? {
-        Some(m) if sys => Some(schema(&crate::sys::with_sys(&m).columns())?),
-        Some(m) => Some(schema(&m.columns())?),
+        Some(m) if sys => Some(crate::sys::with_sys(&m).schema()?),
+        Some(m) => Some(m.schema()?),
         None => None,
     };
     let mut out = vec![];
@@ -290,7 +282,7 @@ async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, a
     let Some(dmeta) = lake.cat.meta(&table_key(&deleted)).await? else { return Ok(vec![]) };
     let within = col(VERSION).gt(lit(meta.purged() as i64)).and(col(VERSION).lt_eq(lit(at.unwrap_or(u64::MAX >> 1) as i64)));
     let dmeta = with_sys(&dmeta);
-    let files = crate::manifest::pruned(lake, &dmeta, None, &[within.clone()], &schema(&dmeta.columns())?).await?;
+    let files = crate::manifest::pruned(lake, &dmeta, None, &[within.clone()], &dmeta.schema()?).await?;
     let dmeta = { let mut entry = dmeta; entry.files = files; entry.sealed = None; entry };
     let mut out = vec![];
     for b in raw(lake, ctx, &deleted, &dmeta, at).await?.filter(within)?.select(vec![col(ROW_ID), col("_old_version")])?.collect().await? {
@@ -308,9 +300,9 @@ async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, a
 pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<(Option<DataFrame>, Vec<DataFrame>)> {
     if let Some(spec) = &meta.ext {
         let files = meta.files.iter().collect::<Vec<_>>(); // (files outside the lake: no log, no hot columns)
-        return Ok((None, if files.is_empty() { vec![] } else { vec![crate::ext::read(lake, ctx, &files, &read_schema(&meta.columns())?, spec, meta.outside.as_ref()).await?] }));
+        return Ok((None, if files.is_empty() { vec![] } else { vec![crate::ext::read(lake, ctx, &files, &meta.read_schema()?, spec, meta.outside.as_ref()).await?] }));
     }
-    let (schema, keyed, upsert) = (read_schema(&meta.columns())?, !meta.key.is_empty(), !meta.key.is_empty() && meta.merge.is_empty());
+    let (schema, keyed, upsert) = (meta.read_schema()?, !meta.key.is_empty(), !meta.key.is_empty() && meta.merge.is_empty());
     let mut files = vec![];
     if upsert {
         let mut by_ord: std::collections::BTreeMap<u64, Vec<&DataFile>> = Default::default();
@@ -324,7 +316,7 @@ pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
         let df = read_files(lake, ctx, meta.files.iter().collect(), meta, &schema).await?;
         files.push(if keyed { df.with_column("_ord", lit(0u64))? } else { df });
     }
-    let sys = meta.columns().iter().any(|(c, _)| c == crate::text::ROW_ID); // (`sys::with_sys`)
+    let sys = meta.columns().any(|(c, _)| c == crate::text::ROW_ID); // (`sys::with_sys`)
     let mut fields = schema.fields().to_vec(); // the table's own schema, so every batch agrees
     if keyed {
         fields.push(Arc::new(Field::new("_ord", DataType::UInt64, false)));
@@ -356,8 +348,8 @@ fn hot_files(lake: &Lake, files: Vec<DataFile>, meta: &TableMeta, schema: &Schem
 /// a sixth of a dashboard query's time while rows streamed in.
 async fn plain_scan(lake: &Lake, state: &dyn datafusion::catalog::Session, name: &str, meta: &TableMeta, files: Vec<DataFile>, upto: Option<u64>, projection: Option<&Vec<usize>>, known: Arc<std::collections::HashMap<String, crate::hot::Known>>) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
     use datafusion::datasource::memory::MemorySourceConfig;
-    let schema = read_schema(&meta.columns())?;
-    let sys = meta.columns().iter().any(|(c, _)| c == crate::text::ROW_ID);
+    let schema = meta.read_schema()?;
+    let sys = meta.columns().any(|(c, _)| c == crate::text::ROW_ID);
     let tail = tail_rows(lake, name, meta.tiered, upto, false, sys, &schema).await?;
     let mut parts: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>> = vec![];
     if !tail.is_empty() {
@@ -399,7 +391,7 @@ fn union_all(parts: Vec<DataFrame>) -> Result<DataFrame> {
 }
 
 fn empty(ctx: &SessionContext, meta: &TableMeta) -> Result<DataFrame> {
-    let df = ctx.read_table(Arc::new(MemTable::try_new(read_schema(&meta.columns())?, vec![vec![]])?))?;
+    let df = ctx.read_table(Arc::new(MemTable::try_new(meta.read_schema()?, vec![vec![]])?))?;
     Ok(if meta.key.is_empty() { df } else { df.with_column("_ord", lit(0u64))? })
 }
 
@@ -422,11 +414,11 @@ async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
         names.push(format!("__f{i}"));
     }
     if names.is_empty() {
-        return Ok(Arc::new(MemTable::try_new(read_schema(&meta.columns())?, vec![vec![]])?));
+        return Ok(Arc::new(MemTable::try_new(meta.read_schema()?, vec![vec![]])?));
     }
-    let q = |c: &String| format!("\"{c}\"");
-    let cols = |p: &str| meta.columns().iter().map(|(c, _)| format!("{p}{}", q(c))).collect::<Vec<_>>().join(", ");
-    let keys = meta.key.iter().map(q).collect::<Vec<_>>().join(", ");
+    let q = |c: &str| format!("\"{c}\"");
+    let cols = |p: &str| meta.columns().map(|(c, _)| format!("{p}{}", q(c))).collect::<Vec<_>>().join(", ");
+    let keys = meta.key.iter().map(|k| q(k)).collect::<Vec<_>>().join(", ");
     let on = meta.key.iter().map(|k| format!("s.{} = n.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
     let parts: Vec<String> = names.iter().enumerate().map(|(i, src)| match i {
         0 => format!("SELECT {} FROM \"{src}\"", cols("")),
@@ -445,7 +437,7 @@ async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
 /// is left out too, unless the query names it (`deleted`): reads leave deleted rows out anyway,
 /// so `SELECT *` shows the table's own columns.
 pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &TableMeta, deleted: bool) -> Result<Arc<dyn TableProvider>> {
-    let hide = !deleted && !meta.key.is_empty() && meta.columns().iter().any(|(c, _)| c == "_deleted");
+    let hide = !deleted && !meta.key.is_empty() && meta.columns().any(|(c, _)| c == "_deleted");
     // (a view that finishes its answers reads under its query's names already: `finish.rs`, and a
     // view's table is never renamed or dropped a column of)
     if (!meta.mapped() && !hide && !meta.moved()) || meta.finish.is_some() {
@@ -692,7 +684,7 @@ pub async fn facts(lake: &Lake, meta: &Arc<TableMeta>, sys: bool) -> Result<Arc<
 pub async fn facts_once(lake: &Lake, meta: &TableMeta, sys: bool) -> Result<Facts> {
     let columns = match sys {
         true => crate::sys::with_sys(meta).into_columns(),
-        false => meta.columns().to_vec(),
+        false => meta.to_columns(),
     };
     let schema = read_schema(&columns)?;
     let manifests = crate::manifest::list(lake, meta).await?;
@@ -849,14 +841,14 @@ impl TableProvider for Pruned {
 /// older files hold for that key; a full compaction drops them.
 pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool, keep_deleted: bool) -> String {
     debug_assert!(!meta.key.is_empty(), "latest_sql needs a key: an append table has no versions");
-    let q = |c: &String| format!("\"{c}\"");
-    let key = meta.key.iter().map(q).collect::<Vec<_>>().join(", ");
+    let q = |c: &str| format!("\"{c}\"");
+    let key = meta.key.iter().map(|k| q(k)).collect::<Vec<_>>().join(", ");
     let order = match (sorted, meta.cluster.len()) {
-        (true, 0 | 1) => format!(" ORDER BY {}", meta.cluster.iter().chain(&meta.key).map(q).collect::<Vec<_>>().join(", ")),
+        (true, 0 | 1) => format!(" ORDER BY {}", meta.cluster.iter().chain(&meta.key).map(|k| q(k)).collect::<Vec<_>>().join(", ")),
         _ => String::new(), // (two or more cluster_by columns: a Hilbert curve's order, `tier::latest`)
     };
     if !meta.merge.is_empty() {
-        let cols = meta.columns().iter().map(|(c, _)| match meta.merge.get(c).map(String::as_str) {
+        let cols = meta.columns().map(|(c, _)| match meta.merge.get(c).map(String::as_str) {
             Some("count") => format!("sum({}) AS {}", q(c), q(c)), // (partial counts add up)
             Some(f) => format!("{f}({}) AS {}", q(c), q(c)),
             None => q(c),
@@ -864,21 +856,21 @@ pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool, keep_deleted:
         let live = if keep_deleted { String::new() } else { live(meta) }; // (windows past their TTL drop out; emptied groups too)
         return format!("SELECT * FROM (SELECT {} FROM \"{raw_table}\" GROUP BY {key}){live}{order}", cols.collect::<Vec<_>>().join(", "));
     }
-    let out = meta.columns().iter().map(|(c, _)| q(c)).collect::<Vec<_>>().join(", ");
+    let out = meta.columns().map(|(c, _)| q(c)).collect::<Vec<_>>().join(", ");
     let deleted = if keep_deleted { String::new() } else { live(meta) }; // (a partial merge keeps markers and expired rows)
     if let Some(o) = &meta.order {
         // By event time: each key's greatest `order_by`, then the last to come among rows that tie
         // on it — two hash aggregates and two hash joins (`(key, _ord)` is one row).
         let on = |a: &str, b: &str| meta.key.iter().map(|k| format!("{a}.{} = {b}.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
-        let picked = meta.columns().iter().map(|(c, _)| format!("c.{} AS {}", q(c), q(c))).collect::<Vec<_>>().join(", ");
+        let picked = meta.columns().map(|(c, _)| format!("c.{} AS {}", q(c), q(c))).collect::<Vec<_>>().join(", ");
         return format!("WITH m AS (SELECT {key}, max({o}) AS __m FROM \"{raw_table}\" GROUP BY {key}), \
             c AS (SELECT r.* FROM \"{raw_table}\" r JOIN m ON {} AND r.{o} IS NOT DISTINCT FROM m.__m), \
             l AS (SELECT {key}, max(\"_ord\") AS __o FROM c GROUP BY {key}) \
             SELECT {out} FROM (SELECT {picked} FROM c JOIN l ON {} AND c.\"_ord\" = l.__o){deleted}{order}", on("r", "m"), on("c", "l"), o = q(o));
     }
     // Newest version per key as a grouped aggregate (a hash table), not a window (a sort).
-    let newest = |c: &String| format!("first_value({} ORDER BY \"_ord\" DESC) AS {}", q(c), q(c));
-    let cols = meta.columns().iter().map(|(c, _)| if meta.key.contains(c) { q(c) } else { newest(c) });
+    let newest = |c: &str| format!("first_value({} ORDER BY \"_ord\" DESC) AS {}", q(c), q(c));
+    let cols = meta.columns().map(|(c, _)| if meta.key.iter().any(|k| k == c) { q(c) } else { newest(c) });
     format!("SELECT {out} FROM (SELECT {} FROM \"{raw_table}\" GROUP BY {key}){deleted}{order}",
             cols.collect::<Vec<_>>().join(", "))
 }
@@ -890,13 +882,13 @@ pub fn current_sql(meta: &TableMeta, raw_table: &str, upto: u64) -> String {
     if meta.files.len() > 1 || upto != meta.tiered {
         return latest_sql(meta, raw_table, false, false);
     }
-    let cols = meta.columns().iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+    let cols = meta.columns().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
     format!("SELECT {cols} FROM \"{raw_table}\"{}", live(meta))
 }
 
 /// ` WHERE …` keeping a keyed table's live rows: not deleted, not past their TTL ("" if nothing to drop).
 pub fn live(meta: &TableMeta) -> String {
-    let deleted = meta.columns().iter().any(|(c, _)| c == "_deleted").then(|| "\"_deleted\" IS NOT TRUE".to_string());
+    let deleted = meta.columns().any(|(c, _)| c == "_deleted").then(|| "\"_deleted\" IS NOT TRUE".to_string());
     // A view's group whose rows a change took back (its count added up to 0) is gone.
     let emptied = meta.merge.iter().find(|(_, f)| *f == "count").map(|(c, _)| format!("\"{c}\" <> 0"));
     let conds: Vec<String> = deleted.into_iter().chain(emptied).chain(Some(meta.ttl_sql()).filter(|t| !t.is_empty())).collect();
@@ -1003,7 +995,8 @@ pub async fn collect_or_send(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext
 
 /// `collect`'s loop. `send`: the answer may go to its door in pieces of this format (`collect_or_send`).
 async fn gather(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>, send: Option<Option<String>>) -> Result<Vec<RecordBatch>> {
-    let held = MemoryConsumer::new("an answer").register(task.memory_pool());
+    let pool = task.memory_pool().clone();
+    let held = MemoryConsumer::new("an answer").register(&pool);
     let mut counted = RecordBatchMemoryCounter::new(); // (each buffer once: batches cut from one batch or page share theirs)
     let mut stream = datafusion::physical_plan::execute_stream(plan, task)?;
     let mut out = vec![];
@@ -1012,12 +1005,12 @@ async fn gather(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>, send: Opti
         // what `big` measures, so a small answer whose strings were other rows' is not sent in pieces, nor left out of `Results`)
         let batch = match &send { Some(format) => crate::answer::as_sent(batch, format.as_deref()), None => batch };
         if held.try_grow(counted.count_batch(&batch)).is_err() {
-            return Err(too_big());
+            return Err(too_big(room_of(&pool)));
         }
         out.push(batch);
         if let Some(format) = &send {
             if held.size() >= stream_bytes() && may_hand() {
-                return send_rest(out, stream, held, format.as_deref()).await;
+                return send_rest(out, stream, held, &pool, format.as_deref()).await;
             }
         }
     }
@@ -1034,9 +1027,24 @@ pub fn kept_memory(pool: &Arc<dyn MemoryPool>, batches: &[RecordBatch]) -> Optio
     Some(held)
 }
 
-/// The refusal of an answer bigger than the query memory (53200), with the way out.
-pub(crate) fn too_big() -> anyhow::Error {
-    crate::codes::coded("53200", format!("the answer is bigger than this node's memory for queries ({} MB): ask for fewer rows (a LIMIT or a filter), or write them out with COPY (…) TO a file or folder", memory_limit() >> 20))
+/// The memory a statement's answer may take at most now: its database's room in the node's line (`ledger::LakePool`), at
+/// most the node's memory for queries.
+pub(crate) fn room_of(pool: &Arc<dyn MemoryPool>) -> usize {
+    match pool.memory_limit() {
+        datafusion::execution::memory_pool::MemoryLimit::Finite(n) => n.min(memory_limit()),
+        _ => memory_limit(),
+    }
+}
+
+/// The refusal of an answer bigger than the query memory (53200), with the way out. `room`: what the statement's database
+/// has of it now (`room_of`), less than the node's while the node's other databases' queries hold some (11-06 audit M10).
+pub(crate) fn too_big(room: usize) -> anyhow::Error {
+    let line = memory_limit();
+    let what = match room < line {
+        true => format!("the memory this database has for queries now ({} MB of the node's {} MB: its other databases' queries hold the rest)", room >> 20, line >> 20),
+        false => format!("this node's memory for queries ({} MB)", line >> 20),
+    };
+    crate::codes::coded("53200", format!("the answer is bigger than {what}: ask for fewer rows (a LIMIT or a filter), or write them out with COPY (…) TO a file or folder"))
 }
 
 /// The refusal of a client that went before the answer's end (57014).
@@ -1057,7 +1065,7 @@ fn set_sent(rows: Option<u64>) {
 /// writes it (`answer::Encoding`). The first piece is written before the door is handed anything, so a format that
 /// can't write these columns is refused as `render` refuses it. Then the door's body takes each piece as its client
 /// reads it (two at a time), and each batch is counted only while it is written.
-async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan::SendableRecordBatchStream, mut held: MemoryReservation, format: Option<&str>) -> Result<Vec<RecordBatch>> {
+async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan::SendableRecordBatchStream, mut held: MemoryReservation, pool: &Arc<dyn MemoryPool>, format: Option<&str>) -> Result<Vec<RecordBatch>> {
     let mut enc = crate::answer::Encoding::new(format);
     let mut prefix: std::collections::VecDeque<RecordBatch> = crate::answer::pieces(out.into_iter().map(|b| enc.lean(b))).into();
     let (mut rows, mut first) = (0u64, vec![]);
@@ -1073,7 +1081,7 @@ async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan:
         return Err(gone());
     }
     set_sent(Some(0));
-    match pour(&mut enc, &tx, prefix, &mut stream, &mut held).await {
+    match pour(&mut enc, &tx, prefix, &mut stream, &mut held, pool).await {
         Ok(more) => {
             ended.store(true, std::sync::atomic::Ordering::Release); // (set before the channel closes: the body ends whole only then)
             drop(tx);
@@ -1131,7 +1139,7 @@ async fn write_all(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Se
 
 /// The pieces after the first: the prefix's, then each batch of the stream's, counted while it is written; then the
 /// end. Returns the rows written.
-async fn pour(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>, prefix: std::collections::VecDeque<RecordBatch>, stream: &mut datafusion::physical_plan::SendableRecordBatchStream, held: &mut MemoryReservation) -> Result<u64> {
+async fn pour(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>, prefix: std::collections::VecDeque<RecordBatch>, stream: &mut datafusion::physical_plan::SendableRecordBatchStream, held: &mut MemoryReservation, pool: &Arc<dyn MemoryPool>) -> Result<u64> {
     let mut rows = write_all(enc, tx, prefix).await?;
     held.free(); // (the prefix's batches are written: their memory goes)
     loop {
@@ -1158,7 +1166,7 @@ async fn pour(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<
                 None => break, // (none is ready: what is goes now)
             }
         }
-        held.try_grow(size).map_err(|_| too_big())?;
+        held.try_grow(size).map_err(|_| too_big(room_of(pool)))?;
         for piece in crate::answer::pieces(ready) {
             rows += piece.num_rows() as u64;
             step_to(enc, tx, Some(&piece)).await?;
@@ -1641,9 +1649,11 @@ pub fn first_table(sql: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exhausted, frugally, keep, retrying, tails, Facts, FactsMemo, Tail, Tails, TAILS};
+    use super::{exhausted, frugally, keep, peak_pool, retrying, tails, task_with_peak, Facts, FactsMemo, Tail, Tails, TAILS};
     use crate::store::TableMeta;
     use datafusion::common::DataFusionError;
+    use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion::prelude::SessionContext;
     use std::sync::Arc;
 
@@ -1737,6 +1747,24 @@ mod tests {
         }
         assert_eq!(memo.by_key.len(), FACTS_ENTRIES, "the count bound holds");
         assert_eq!(memo.by_key.bytes(), 0, "and empty manifests count for nothing");
+    }
+
+    /// A statement's memory goes through `task_with_peak`'s pool, and its lake is busy on the line while it runs (11-06
+    /// audit L9): with A's statement holding 80 of 100, B's spiller has B's half of the line, not the 20 A leaves; were A
+    /// not marked busy, B's share would be the whole line.
+    #[test]
+    fn a_statement_through_its_peak_pool_marks_its_lake_busy() {
+        let ledger = crate::ledger::Ledger::new(100, usize::MAX, false);
+        let (a, b): (Arc<dyn MemoryPool>, Arc<dyn MemoryPool>) = (ledger.pool(), ledger.pool());
+        let ctx = SessionContext::new_with_config_rt(datafusion::prelude::SessionConfig::new(), RuntimeEnvBuilder::new().with_memory_pool(a).build_arc().unwrap());
+        let peak = peak_pool(&ctx);
+        let task = task_with_peak(&ctx.state(), &peak).unwrap();
+        let sort = MemoryConsumer::new("a's sort").with_can_spill(true).register(task.memory_pool());
+        sort.try_grow(80).unwrap();
+        let b_sort = MemoryConsumer::new("b's sort").with_can_spill(true).register(&b);
+        assert!(b_sort.try_grow(50).is_ok() && b_sort.try_grow(1).is_err(), "B's half");
+        drop(sort);
+        assert!(b_sort.try_grow(50).is_ok(), "A's statement over: B has the line");
     }
 
     #[test]
