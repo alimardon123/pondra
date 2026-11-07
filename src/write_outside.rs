@@ -33,6 +33,19 @@ pub async fn insert(lake: &Lake, table: &str, query: &str, job: &str) -> Result<
     }
 }
 
+/// The columns of another engine's table (`ext_names` spec `target`), as SQL names them, in the table's order: what an INSERT
+/// that names some of them fills the rest of with NULL (`write::run`'s column list), as its format keeps no DEFAULT.
+pub async fn columns(lake: &Lake, target: &str) -> Result<Vec<String>> {
+    let spec = crate::ext_names::spec(target).context("not another engine's table")?;
+    crate::ext::check(lake, &spec).await?; // (its columns are read by whoever may write it, as its rows are: `insert`)
+    let url = spec.urls[0].trim_end_matches('/');
+    Ok(match spec.format.as_str() {
+        "delta" => read_delta::schema(url, &read_delta::replay(lake, url, None).await?.metadata)?.0.into_iter().map(|(_, logical, _)| logical).collect(),
+        "iceberg" => crate::read_iceberg::schema_of(&crate::read_iceberg::current(lake, url, &spec.options).await?.1)?.1.into_iter().map(|(n, ..)| n).collect(),
+        f => bail!("INSERT into {f} files: into a table attached as delta or iceberg"),
+    })
+}
+
 // ---------------------------------------------------------------- Delta
 
 /// Writer features handled here (Delta's protocol, writer version 7).
@@ -100,7 +113,8 @@ async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job:
             None => f,
         }
     }).collect();
-    let df = conform(df, &target, root)?;
+    let not_null = delta_not_null(&log.metadata)?;
+    let fit = Fit::new(&df, &target, columns.iter().map(|(_, l, _)| not_null.contains(l).then(|| l.clone())).collect(), root)?; // (said by its logical name)
     let partition_at: Vec<usize> = partitions.iter().map(|p| target.iter().position(|f| f.name() == p).expect("a partition column")).collect();
     let file_fields: Vec<Field> = target.iter().enumerate().filter(|(i, _)| !partition_at.contains(i)).map(|(_, f)| f.clone()).collect();
     let parts = |b: &RecordBatch| -> Result<Vec<Part>> {
@@ -116,7 +130,7 @@ async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job:
         }).collect())
     };
     let keep: Vec<usize> = (0..target.len()).filter(|i| !partition_at.contains(i)).collect();
-    let written = write_files(lake, root, "", df, Arc::new(Schema::new(file_fields)), &keep, &parts).await?;
+    let written = write_files(lake, root, "", df, &fit, Arc::new(Schema::new(file_fields)), &keep, &parts).await?;
     let rows: u64 = written.iter().map(|w| w.rows).sum();
     let bytes: u64 = written.iter().map(|w| w.bytes).sum();
     let now = crate::log::now_ms();
@@ -315,7 +329,7 @@ pub struct Written {
 
 /// The rows as Parquet files under `root` (in `dir`, then each partition's folder): the columns
 /// `keep` of each batch, as `schema`; files closed at `FILE_BYTES`.
-pub async fn write_files(lake: &Lake, root: &str, dir: &str, df: datafusion::prelude::DataFrame, schema: SchemaRef, keep: &[usize], parts: &(dyn Fn(&RecordBatch) -> Result<Vec<Part>> + Send + Sync)) -> Result<Vec<Written>> {
+pub async fn write_files(lake: &Lake, root: &str, dir: &str, df: datafusion::prelude::DataFrame, fit: &Fit, schema: SchemaRef, keep: &[usize], parts: &(dyn Fn(&RecordBatch) -> Result<Vec<Part>> + Send + Sync)) -> Result<Vec<Written>> {
     use datafusion::parquet::basic::Compression;
     use datafusion::parquet::file::properties::WriterProperties;
     let props = || WriterProperties::builder().set_compression(Compression::SNAPPY).build(); // (read by every engine)
@@ -323,6 +337,7 @@ pub async fn write_files(lake: &Lake, root: &str, dir: &str, df: datafusion::pre
     let mut out = vec![];
     let mut stream = df.execute_stream().await?;
     while let Some(b) = stream.next().await.transpose()? {
+        let b = fit.fit(b)?; // (cast and checked before any of it is written)
         for p in parts(&b)? {
             let cols = keep.iter().map(|&i| Ok(datafusion::arrow::compute::take(b.column(i), &p.rows, None)?)).collect::<Result<Vec<_>>>()?;
             let piece = RecordBatch::try_new(schema.clone(), cols)?;
@@ -368,13 +383,38 @@ async fn finish(lake: &Lake, root: &str, folder: &str, w: ArrowWriter<Vec<u8>>, 
     Ok(Written { path, bytes, rows, values, ranges, nulls })
 }
 
-/// The query's rows as the table's columns (by position, cast to its types, under its names).
-fn conform(df: datafusion::prelude::DataFrame, target: &[Field], table: &str) -> Result<datafusion::prelude::DataFrame> {
-    use datafusion::prelude::{cast, col};
-    let have = df.schema().fields().len();
-    ensure!(have == target.len(), "INSERT into {table}: the query gives {have} columns, the table has {} ({})", target.len(), target.iter().map(|f| f.name().as_str()).collect::<Vec<_>>().join(", "));
-    let exprs = df.schema().columns().into_iter().zip(target).map(|(c, f)| cast(col(c), f.data_type().clone()).alias(f.name())).collect::<Vec<_>>();
-    Ok(df.select(exprs)?)
+/// The table's columns, as a query's rows go into them by position. Each value is cast as a value written into a lake
+/// table is (`fit::strict`, the one rule: Postgres's rounding and words, a bytea's text as Postgres reads it), and a NULL
+/// in a column the table's format says is NOT NULL (Delta's `nullable: false`, Iceberg's `required`) is refused with 23502,
+/// as a lake table refuses it. These are `rules::shape`'s steps for a table whose rules are its format's: it has no DEFAULT
+/// (Delta's column defaults are a writer feature not written here, and Iceberg v2 has none) and no CHECK (a Delta table
+/// with one is refused by name, `delta_writable`).
+pub struct Fit {
+    target: SchemaRef,
+    not_null: Vec<Option<String>>, // (a NOT NULL column's name, as SQL names it)
+    table: String,
+}
+
+impl Fit {
+    fn new(df: &datafusion::prelude::DataFrame, target: &[Field], not_null: Vec<Option<String>>, table: &str) -> Result<Fit> {
+        let have = df.schema().fields().len();
+        ensure!(have == target.len(), "INSERT into {table}: the query gives {have} columns, the table has {} ({})", target.len(), target.iter().map(|f| f.name().as_str()).collect::<Vec<_>>().join(", "));
+        Ok(Fit { target: Arc::new(Schema::new(target.to_vec())), not_null, table: table.to_string() })
+    }
+
+    fn fit(&self, b: RecordBatch) -> Result<RecordBatch> {
+        let cols = b.columns().iter().zip(self.target.fields()).map(|(c, f)| crate::rules::fit::strict(c, f.data_type())).collect::<Result<Vec<_>>>()?;
+        if let Some(name) = cols.iter().zip(&self.not_null).find_map(|(c, n)| n.as_ref().filter(|_| c.null_count() > 0)) {
+            return Err(crate::codes::coded("23502", format!("{}: column {name} is NOT NULL, and a row gives it no value", self.table)));
+        }
+        Ok(RecordBatch::try_new(self.target.clone(), cols)?)
+    }
+}
+
+/// A Delta schema's top-level columns that are NOT NULL (`"nullable": false`), by logical name.
+fn delta_not_null(metadata: &Value) -> Result<std::collections::HashSet<String>> {
+    let s: Value = serde_json::from_str(metadata["schemaString"].as_str().context("no schema")?)?;
+    Ok(s["fields"].as_array().into_iter().flatten().filter(|f| f["nullable"] == false).filter_map(|f| Some(f["name"].as_str()?.to_string())).collect())
 }
 
 /// Write an object only if nothing is there: false if something is (another writer won).
@@ -416,7 +456,8 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
     crate::ext::check_urls(lake, &[format!("{location}/data/").as_str(), format!("{location}/metadata/").as_str()]).await?;
     let (schema_json, columns) = crate::read_iceberg::schema_of(&meta)?;
     let target: Vec<Field> = columns.iter().map(|(n, id, t)| Field::new(n, t.clone(), true).with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into())).collect();
-    let df = conform(df, &target, url)?;
+    let required = columns.iter().map(|(n, ..)| schema_json["fields"].as_array().into_iter().flatten().any(|f| f["name"] == n.as_str() && f["required"] == true).then(|| n.clone())).collect();
+    let fit = Fit::new(&df, &target, required, url)?;
     let spec_id = meta["default-spec-id"].as_i64().unwrap_or(0);
     let pspec = meta["partition-specs"].as_array().into_iter().flatten().find(|s| s["spec-id"].as_i64() == Some(spec_id)).cloned().unwrap_or(json!({"fields": []}));
     let fields: Vec<(String, usize, String, DataType)> = pspec["fields"].as_array().into_iter().flatten().map(|f| {
@@ -438,7 +479,7 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
         Ok(groups.into_iter().map(|(folder, (rows, values))| Part { folder, rows: UInt32Array::from(rows), values }).collect())
     };
     let keep: Vec<usize> = (0..target.len()).collect();
-    let written = write_files(lake, &location, "data/", df, Arc::new(Schema::new(target.clone())), &keep, &parts).await?;
+    let written = write_files(lake, &location, "data/", df, &fit, Arc::new(Schema::new(target.clone())), &keep, &parts).await?;
     let rows: u64 = written.iter().map(|w| w.rows).sum();
     let ids: HashMap<&str, i64> = columns.iter().map(|(n, id, _)| (n.as_str(), *id)).collect();
     loop {
