@@ -175,7 +175,7 @@ fn by_words(text: &str) -> &'static str {
         _ if nan_into_decimal(&t) => "0A000", // feature_not_supported (NaN into a decimal: the planner's own cast, as `casts::into` refuses it)
         _ if has("error parsing timestamp from") => "22007", // invalid_datetime_format (to_date, to_timestamp and their other names: text their format doesn't read)
         _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") || has("invalid input value for enum") => "22P02", // invalid_text_representation
-        _ if has("can't reach the bucket") || has("catching up with its leader") => "57P03",   // cannot_connect_now (a leader cut off, a node just started: ask another node)
+        _ if has("can't reach the bucket") || has("catching up with its leader") || has("no longer leads") => "57P03", // cannot_connect_now (a leader cut off, a node just started, a follower's leader gone: ask again)
         _ if has("a blob: url is read only by the tab that made it") => "58P01",               // undefined_file (a tab's file revoked, or another tab's: `web/`'s words, before "read only" could match)
         _ if has("error sending request") => "58030",                                           // io_error (the bucket or another node didn't answer: try again)
         _ if has("deadlock detected") => "40P01",                                               // deadlock_detected (`locks.rs`)

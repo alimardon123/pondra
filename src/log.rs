@@ -219,9 +219,24 @@ impl To {
     async fn outcome(&self, f: Flush) -> Result<Outcome> {
         Ok(match self {
             To::Local(seq) => seq.submit(f).await?,
-            To::Leader(addr) => crate::dial::call(addr, crate::dial::Call::post("/cluster/commit", encode_flush(&f)?)).await?.checked()?.json().await?,
+            To::Leader(addr) => led(addr, crate::dial::call(addr, crate::dial::Call::post("/cluster/commit", encode_flush(&f)?)).await.inspect_err(|_| untaken())?)?.checked()?.json().await?,
         })
     }
+}
+
+/// A flush this follower sent its leader went unanswered: its follow loop asks the leader now (`cluster::flush_untaken`).
+/// A page follows no leader over the network.
+fn untaken() {
+    #[cfg(feature = "doors")]
+    crate::cluster::flush_untaken();
+}
+
+/// The leader's answer to a flush, or the refusal of one that doesn't lead (421, `server::commit`): made before any
+/// sequencer took it, so its writes are refused as never run (57P03), and their clients send them again, to this node once
+/// it follows the leader there is, or to another.
+fn led(addr: &str, r: crate::dial::Reply) -> Result<crate::dial::Reply> {
+    anyhow::ensure!(r.status != 421, "{addr} no longer leads: this node follows the next leader in a moment, ask again");
+    Ok(r)
 }
 
 /// A reservation's answer.
@@ -378,11 +393,11 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                     let request = crate::dial::call(addr, crate::dial::Call::post("/cluster/commit", encode_flush(&f)?));
                     drop(done.take()); // (sent in order; over HTTP they may still arrive out of order, rarely)
                     unanswered = true;
-                    let response = request.await?;
+                    let response = request.await.inspect_err(|_| untaken())?; // (its follow loop looks now: `cluster.rs`)
                     // (a 4xx is the leader's refusal, made before its sequencer took the flush; a 5xx, or a body lost on the
                     // way, may come after it did, so the rows may still commit: lost, as a dropped reply is here)
                     unanswered = !(400..500).contains(&response.status);
-                    let outcome = response.checked()?.json().await?;
+                    let outcome = led(addr, response)?.checked()?.json().await?;
                     unanswered = false;
                     Ok(outcome)
                 }
@@ -1163,6 +1178,18 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, DictionaryArray, Int64Array, StringArray};
     use datafusion::arrow::datatypes::Int32Type;
     use datafusion::arrow::ipc::writer::StreamWriter;
+
+    /// A flush a node that doesn't lead refused (421: a leader killed and started again, back as a follower of the term
+    /// another took) is refused to its writers as never run, which a client sends again (57P03), not as an answer lost.
+    #[test]
+    fn a_flush_refused_by_a_node_that_doesnt_lead_is_asked_again() {
+        use futures::StreamExt;
+        let reply = |status| crate::dial::Reply::new(status, None, None, futures::stream::empty().boxed());
+        let e = led("127.0.0.1:8712", reply(421)).err().expect("refused");
+        let refused = anyhow::Error::new(Refusal { why: format!("{e:#}"), lost: false }); // (as `send` gives it to each writer)
+        assert_eq!((crate::codes::of(&e), crate::codes::of(&refused), unanswered(&refused)), ("57P03", "57P03", false), "{e:#}");
+        assert!(led("127.0.0.1:8712", reply(200)).is_ok());
+    }
 
     #[test]
     fn a_row_or_two_is_written_plain_and_more_compressed() {
