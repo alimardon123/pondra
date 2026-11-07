@@ -167,6 +167,11 @@ pub async fn door(lake: &Lake, sql: &str, skip: &HashSet<String>) -> Result<Stri
         None if !mentions_current(sql) => return Ok(sql.to_string()),
         None => Path::plain(&lake_name(lake)),
     };
+    if path.database() != path.here {
+        if let Some(what) = schema_change(sql) {
+            return Err(coded("0A000", in_other(what, path.database())));
+        }
+    }
     let inlined = crate::sparksql::inline(sql)?; // (`spark_sql('…')` first: its text is placed like any SQL's)
     let sql = inlined.as_str();
     if let Some(out) = head(lake, &path, sql, &HEADS).await? {
@@ -313,6 +318,25 @@ fn part(p: &str) -> ObjectNamePart {
 /// The `search_path` text of entries: this lake's schemas bare, another database's as `db.schema`.
 fn text_of(here: &str, entries: &[(String, String)]) -> String {
     entries.iter().map(|(d, s)| if d.as_str() == here { quoted(s) } else { format!("{}.{}", quoted(d), quoted(s)) }).collect::<Vec<_>>().join(", ")
+}
+
+/// A statement in `sql` that makes, changes, drops, describes or grants on a schema, by its head. A schema's name is
+/// never placed by the path (it isn't a table's), so under `USE` of another database such a statement would name this
+/// lake's schema: `DROP SCHEMA s CASCADE` dropped this lake's `s` and its tables. It is refused there (`in_other`).
+fn schema_change(sql: &str) -> Option<&'static str> {
+    const START: &str = r"(?:^|;)(?:\s|--[^\n]*(?:\n|$)|/\*.*?\*/)*";
+    static HEADS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+        [(r"create\s+schema\b", "CREATE SCHEMA"), (r"drop\s+schema\b", "DROP SCHEMA"), (r"alter\s+schema\b", "ALTER SCHEMA"), (r"comment\s+on\s+schema\b", "COMMENT ON SCHEMA"), (r"(?:grant|revoke)\b[^;]*\b(?:on|in)\s+schema\b", "a grant on a schema")]
+            .into_iter()
+            .map(|(h, what)| (Regex::new(&format!("(?is){START}{h}")).expect("a regex"), what))
+            .collect()
+    });
+    HEADS.iter().find(|(re, _)| re.is_match(sql)).map(|(_, what)| *what)
+}
+
+/// The refusal of `schema_change`'s statement under `USE` of the attached lake `db`, as its other changes are refused.
+fn in_other(what: &str, db: &str) -> String {
+    format!("{what} under USE of {db}: {db} is an attached lake, whose schemas are changed from a node of that lake (this one's are changed with no USE of another database)")
 }
 
 fn mentions_current(sql: &str) -> bool {
@@ -917,6 +941,29 @@ mod tests {
         let mut stmts = parse_text(sql).expect("the statement parses");
         apply(path, &HashSet::new(), w, &mut stmts);
         stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n")
+    }
+
+    /// Under `USE` of another database, a statement on a schema would name this lake's (its name isn't placed): it is
+    /// found by its head wherever it is in the text, and nothing else is.
+    #[test]
+    fn a_schema_change_is_found_by_its_head() {
+        for (sql, what) in [
+            ("DROP SCHEMA s CASCADE", "DROP SCHEMA"),
+            ("drop  schema if exists s", "DROP SCHEMA"),
+            ("CREATE SCHEMA s", "CREATE SCHEMA"),
+            ("ALTER SCHEMA s RENAME TO t", "ALTER SCHEMA"),
+            ("COMMENT ON SCHEMA s IS 'x'", "COMMENT ON SCHEMA"),
+            ("GRANT USAGE ON SCHEMA s TO r", "a grant on a schema"),
+            ("REVOKE SELECT ON ALL TABLES IN SCHEMA s FROM r", "a grant on a schema"),
+            ("SELECT 1; DROP SCHEMA s CASCADE", "DROP SCHEMA"),
+            ("-- a note\n/* and more */ DROP SCHEMA s", "DROP SCHEMA"),
+        ] {
+            assert_eq!(schema_change(sql), Some(what), "{sql}");
+        }
+        for sql in ["SELECT * FROM t", "DROP TABLE s.t", "CREATE TABLE schema_x (a INT)", "SELECT 'drop schema' AS a", "GRANT SELECT ON t TO r", "CREATE VIEW v AS SELECT schema_name FROM information_schema.schemata"] {
+            assert_eq!(schema_change(sql), None, "{sql}");
+        }
+        assert!(in_other("DROP SCHEMA", "br").starts_with("DROP SCHEMA under USE of br: br is an attached lake"));
     }
 
     #[test]
