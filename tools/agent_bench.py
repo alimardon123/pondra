@@ -23,6 +23,8 @@ tasks, data, model and tools run on Pondra, DuckDB and Postgres, so the numbers 
   prompt is the same for every engine but its name; 15 turns at most. A try's record holds its turns, its steps (tool
   calls), its tokens as the API counted them, its seconds, its dollars at list prices, how it ended, and the whole
   conversation. A refusal ends the try as not passed: no fallback model answers in its place.
+- **pondra+mcp** is Pondra a second time, with its own MCP door's tools in place of the plain ones (the read-only
+  ones it lists, called through POST /mcp, its notes for agents added to the prompt), to show what the door adds.
 
 `check` is what CI runs, with no key: every task's gold SQL on each engine, scored against DuckDB's rows (the tasks, the
 scorer, and Pondra against two other engines); the loop itself with a scripted model; and the answers saved in
@@ -51,6 +53,7 @@ import tempfile
 import threading
 import time
 import types
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TASKS = os.path.join(HERE, "agent_bench")
@@ -303,12 +306,13 @@ class Pondra(Over):
     name, label = "pondra", "Pondra"
 
     def __init__(self, bin_path=None, port=None):
-        self.proc, self.work = None, None
+        self.proc, self.work, self.mcp = None, None, None
         if port is None:
             self.work, port, http = tempfile.mkdtemp(prefix="agent-bench-lake-"), free_port(), free_port()
             self.log = open(os.path.join(self.work, "stderr"), "wb")
             self.proc = subprocess.Popen([bin_path, "serve", "--dir", os.path.join(self.work, "lake"), "--addr", f"127.0.0.1:{http}", f"--pg=127.0.0.1:{port}"],
                                          stdout=subprocess.DEVNULL, stderr=self.log)
+            self.mcp = f"http://127.0.0.1:{http}/mcp"
         self.connect(port=port, user="pondra", dbname="pondra")
 
     def stop(self):
@@ -418,8 +422,8 @@ PLAIN = [
     tool("describe", "A table's columns and their types.", table="the table's name"),
     tool("sql", f"Run one read-only SQL query (SELECT, WITH, VALUES, TABLE, EXPLAIN, SHOW or DESCRIBE) and see its column "
                 f"names and its first {SHOWN} rows. An error comes back as its message.", query="the query"),
-    tool("answer", "Give the final answer: the one SQL query whose rows answer the question. This ends the task.", query="the query"),
 ]
+ANSWER = tool("answer", "Give the final answer: the one SQL query whose rows answer the question. This ends the task.", query="the query")
 
 
 def first_word(sql):
@@ -467,20 +471,79 @@ def use(engine, name, args):
     return shown(cols, rows), False
 
 
+class Plain:
+    """The plain tools, the same on every engine."""
+    suffix, tools, notes = "", PLAIN, ""
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def use(self, name, args):
+        return use(self.engine, name, args)
+
+    def stop(self):
+        pass
+
+
+class Door:
+    """Pondra's own MCP door (POST /mcp), as an MCP client sees it: a session, the door's notes for the model, and the
+    tools it lists as read-only, each called through it. Its write tool is left out, as the plain sql is read-only."""
+    suffix = "+mcp"
+
+    def __init__(self, url):
+        self.url, self.sid = url, None
+        self.notes = self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                             "clientInfo": {"name": "agent-bench", "version": "1"}}).get("instructions", "")
+        self.rpc("notifications/initialized", None)
+        self.tools = [{"name": t["name"], "description": t.get("description", ""), "input_schema": t["inputSchema"]}
+                      for t in self.rpc("tools/list", {})["tools"] if (t.get("annotations") or {}).get("readOnlyHint")]
+
+    def rpc(self, method, params, verb="POST"):
+        body = None if verb == "DELETE" else json.dumps({"jsonrpc": "2.0", "method": method, **({"params": params} if params is not None else {}),
+                                                         **({"id": 1} if not method.startswith("notifications/") else {})}).encode()
+        req = urllib.request.Request(self.url, body, {"content-type": "application/json", "accept": "application/json, text/event-stream",
+                                                      **({"mcp-session-id": self.sid} if self.sid else {})}, method=verb)
+        with urllib.request.urlopen(req, timeout=QUERY_S * 2) as r:
+            self.sid = r.headers.get("mcp-session-id") or self.sid
+            raw = r.read()
+        if not raw:
+            return {}
+        out = json.loads(raw)
+        if "error" in out:
+            raise RuntimeError(out["error"].get("message", str(out["error"])))
+        return out["result"]
+
+    def use(self, name, args):
+        try:
+            r = self.rpc("tools/call", {"name": name, "arguments": args})
+        except Exception as err:
+            return str(err)[:2000], True
+        return "\n".join(c.get("text", "") for c in r.get("content", [])), bool(r.get("isError"))
+
+    def stop(self):
+        try:
+            self.rpc(None, None, "DELETE")
+        except Exception:
+            pass
+
+
 def dump(content):
     if isinstance(content, str):
         return content
     return [b.model_dump(mode="json", exclude_none=True) if hasattr(b, "model_dump") else b for b in content]
 
 
-def attempt(client, model, effort, task, engine):
-    """One try at a task: the model's loop over the plain tools, and its record (turns, steps, tokens, seconds, the
-    answer's SQL and how it ended), with the whole conversation as its transcript. It never edits what was said: each
-    turn only appends, so the prompt cache holds and the model's thinking goes back as it came."""
-    system = SYSTEM.format(label=engine.label)
+def attempt(client, model, effort, task, engine, kit=None):
+    """One try at a task: the model's loop over a kit of tools (the plain ones, or Pondra's MCP door's) and `answer`,
+    and its record (turns, steps, tokens, seconds, the answer's SQL and how it ended), with the whole conversation as
+    its transcript. It never edits what was said: each turn only appends, so the prompt cache holds and the model's
+    thinking goes back as it came."""
+    kit = kit or Plain(engine)
+    tools = kit.tools + [ANSWER]
+    system = SYSTEM.format(label=engine.label) + (f"\n\nThe database's own notes for agents: {kit.notes}" if kit.notes else "")
     prompt = task["question"] + (f"\n\nFacts you may use: {task['evidence']}" if task.get("evidence") else "")
     messages = [{"role": "user", "content": prompt}]
-    rec = {"id": task["id"], "engine": engine.name, "model": model, "effort": effort, "turns": 0, "steps": 0,
+    rec = {"id": task["id"], "engine": engine.name + kit.suffix, "model": model, "effort": effort, "turns": 0, "steps": 0,
            "tokens": {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0}, "model_s": 0.0, "engine_s": 0.0,
            "sql": None, "end": None}
     while rec["end"] is None:
@@ -489,7 +552,7 @@ def attempt(client, model, effort, task, engine):
             break
         t0 = time.perf_counter()
         try:
-            r = client.messages.create(model=model, max_tokens=16000, system=system, tools=PLAIN, messages=messages,
+            r = client.messages.create(model=model, max_tokens=16000, system=system, tools=tools, messages=messages,
                                        cache_control={"type": "ephemeral"}, output_config={"effort": effort})
         except Exception as err:  # (one that outlasted the SDK's retries ends this try, and what it spent stays counted)
             if getattr(err, "status_code", None) in (401, 403):
@@ -519,7 +582,7 @@ def attempt(client, model, effort, task, engine):
                 rec["sql"], rec["end"] = b.input["query"], "answered"
                 break
             t0 = time.perf_counter()
-            text, err = use(engine, b.name, b.input)
+            text, err = kit.use(b.name, b.input) if b.name in {t["name"] for t in kit.tools} else (f"no tool named {b.name}", True)
             rec["engine_s"] += time.perf_counter() - t0
             results.append({"type": "tool_result", "tool_use_id": b.id, "content": text, **({"is_error": True} if err else {})})
         if rec["end"] is None:
@@ -582,7 +645,8 @@ def num(x):
 
 def report(out, recs, runs):
     lines = [f"# Agent benchmark, set {out['set'].upper()}: {out['date']}", "",
-             f"Model `{out['model']}` at effort {out['effort']}, plain tools; {out['tasks']} tasks, {runs} run{'' if runs == 1 else 's'} of each. "
+             f"Model `{out['model']}` at effort {out['effort']}; each engine with the plain tools"
+             + (", and pondra+mcp with Pondra's MCP door's" if "pondra+mcp" in out["engines"] else "") + f". {out['tasks']} tasks, {runs} run{'' if runs == 1 else 's'} of each. "
              f"Commit `{out['commit']}`, {out['pondra']}. Every number is from this run.", "",
              "| Engine | Passed | Spread of runs | Steps | Tokens in | Tokens out | Seconds | Dollars | Spent |",
              "|---|---|---|---|---|---|---|---|---|"]
@@ -625,24 +689,26 @@ def run_agents(client, a, oracle, engines, todo, out):
     want = {t["id"]: oracle.run(gold_sql(t, "duckdb"))[1] for t in todo}
 
     def one(job):
-        k, t, e = job
+        k, t, e, door = job
         s = e.session()
+        kit = Door(e.mcp) if door else Plain(s)
         try:
-            rec = scored(attempt(client, a.model, a.effort, t, s), t, want[t["id"]], s)
+            rec = scored(attempt(client, a.model, a.effort, t, s, kit), t, want[t["id"]], s)
         finally:
+            kit.stop()
             s.stop()
         rec["run"], rec["dollars"] = k, dollars(rec, a.per_hour)
         if a.out:
-            with open(os.path.join(a.out, "transcripts", f"{e.name}-{t['id']}-{k}.json"), "w") as f:
+            with open(os.path.join(a.out, "transcripts", f"{rec['engine']}-{t['id']}-{k}.json"), "w") as f:
                 json.dump(rec, f, indent=1, default=str)
         rec.pop("transcript", None)
         return rec
 
-    jobs = [(k, t, e) for k in range(a.runs) for t in todo for e in engines]
+    jobs = [(k, t, e, door) for k in range(a.runs) for t in todo for e, door in engines]
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
         recs = list(pool.map(one, jobs))
     for name, v in summary(recs, a.runs).items():
-        out["engines"][name].update(v)
+        out["engines"].setdefault(name, {}).update(v)
     return recs
 
 
@@ -656,11 +722,15 @@ def run(a):
     names = a.engines.split(",")
     if a.out:
         os.makedirs(os.path.join(a.out, "transcripts"), exist_ok=True)
-    engines, notes = up(a, names)
+    engines, notes = up(a, {n.split("+")[0] for n in names})
     out = {"set": a.set, "date": datetime.date.today().isoformat(), "model": a.model, "effort": a.effort, "tasks": len(todo),
            "runs": a.runs, "commit": commit(), "pondra": version(a), "engines": notes}
     try:  # (DuckDB is always started: its rows are the gold, whether or not an agent runs on it)
-        recs = run_agents(client, a, engines[0], [e for e in engines if e.name in names], todo, out)
+        by = {e.name: e for e in engines}
+        lanes = [(by[n.split("+")[0]], n.endswith("+mcp")) for n in names if n.split("+")[0] in by]
+        if any(door and not e.mcp for e, door in lanes):
+            raise SystemExit("pondra+mcp needs --bin: the door's address is the node's it starts")
+        recs = run_agents(client, a, engines[0], lanes, todo, out)
     finally:
         down(engines)
     if a.out:
@@ -687,7 +757,7 @@ def replay(engines, lines, out):
     gold_of = {}
     out["replay"] = {"answers": len(lines), "passed": 0, "skipped": 0, "broke": {}}
     for ln in lines:
-        e = by.get(ln["engine"])
+        e = by.get(ln["engine"].split("+")[0])  # (an answer given through Pondra's MCP door is run on Pondra)
         if e is None:
             out["replay"]["skipped"] += 1
             continue
@@ -730,8 +800,8 @@ class Scripted:
 
 def loop_checks(engines, out):
     """The loop on every engine with a scripted model: two tools in one turn, a failing query whose error goes back as
-    text, a turn with no call (asked once more), then the gold SQL as the answer; and a model that never answers,
-    which stops at the turn cap."""
+    text, a turn with no call (asked once more), then the gold SQL as the answer; a model that never answers, which
+    stops at the turn cap; and on Pondra, the same through its MCP door's tools."""
     wrong = []
     for e in engines:
         for t in tasks("a")[:2]:
@@ -749,7 +819,7 @@ def loop_checks(engines, out):
                 "describe": results["t1_1"]["content"].split("\n")[0].startswith("order_id "),
                 "error as text": results["t2_0"].get("is_error") is True and len(results["t2_0"]["content"]) > 0,
                 "asked again": msgs[6]["content"].startswith("Give your answer"),
-                "one prompt": all(kw["system"] == client.seen[0]["system"] and kw["tools"] is PLAIN for kw in client.seen),
+                "one prompt": all(kw["system"] == client.seen[0]["system"] and kw["tools"] == PLAIN + [ANSWER] for kw in client.seen),
                 "dollars": dollars(rec, 0) == round((400 * 4 + 40 * 20 + 80 * 5 + 1200 * 0.2) / 1e6, 6),
             }
             wrong += [f"{e.name} {t['id']}: {k}" for k, v in checks.items() if not v]
@@ -759,6 +829,25 @@ def loop_checks(engines, out):
         write = use(e, "sql", {"query": "/* x */ DROP TABLE orders"})
         if write[1] is not True:
             wrong.append(f"{e.name}: a write went through the read-only tool")
+        if getattr(e, "mcp", None):
+            t, door = tasks("a")[0], Door(e.mcp)
+            client = Scripted([[("tool_use", "list_tables", {}), ("tool_use", "query", {"sql": "SELEC 1"})],
+                               [("tool_use", "write", {"sql": "DROP TABLE orders"})], [("tool_use", "answer", {"query": gold_sql(t, "pondra")})]])
+            try:
+                rec = scored(attempt(client, "claude-opus-5-5", "medium", t, e, door), t, engines[0].run(gold_sql(t, "duckdb"))[1], e)
+            finally:
+                door.stop()
+            results = {r["tool_use_id"]: r for m in rec["transcript"]["messages"] if isinstance(m["content"], list) for r in m["content"] if r.get("type") == "tool_result"}
+            names = [x["name"] for x in client.seen[0]["tools"]]
+            checks = {
+                "passed": rec["passed"], "named": rec["engine"] == "pondra+mcp", "steps": rec["steps"] == 4,
+                "its tools": {"list_tables", "query", "find"} <= set(names) and names[-1] == "answer" and "write" not in names,
+                "its notes": "own notes for agents: " in client.seen[0]["system"],
+                "tables": '"customers"' in results["t1_0"]["content"] and "is_error" not in results["t1_0"],
+                "error as text": results["t1_1"].get("is_error") is True and "SELEC" in results["t1_1"]["content"],
+                "no write": results["t2_0"].get("is_error") is True,
+            }
+            wrong += [f"{e.name}+mcp: {k}" for k, v in checks.items() if not v]
     out["loop"] = {"ok": not wrong, "wrong": wrong}
 
 
@@ -797,7 +886,7 @@ def main():
     p.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"])
     p.add_argument("--runs", type=int, default=3)
     p.add_argument("--jobs", type=int, default=6, help="tries at once")
-    p.add_argument("--engines", default=",".join(ENGINES))
+    p.add_argument("--engines", default=",".join(ENGINES + ("pondra+mcp",)), help="pondra+mcp: Pondra with its MCP door's tools")
     p.add_argument("--per-hour", type=float, default=0.0, help="the machine's dollars an hour, for the engines' seconds")
     p.add_argument("--out", default="agent-bench-out")
     a = p.parse_args()
@@ -808,7 +897,7 @@ def main():
     with open(a.file) as f:
         lines = [json.loads(x) for x in f if x.strip()]
     lines = [ln for ln in lines if ln.get("passed", True)]
-    engines, notes = up(a, {ln["engine"] for ln in lines})
+    engines, notes = up(a, {ln["engine"].split("+")[0] for ln in lines})
     out = {"engines": notes}
     try:
         replay(engines, lines, out)

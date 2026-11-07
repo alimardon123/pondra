@@ -1,7 +1,8 @@
 name: agent-bench
 
 # The agent benchmark with a model (tools/agent_bench.py run; the 1.0 scorecard's agent row): the same shop questions,
-# model, prompt and plain tools on Pondra, DuckDB and Postgres, each task tried `runs` times. What it proves and how it
+# model, prompt and plain tools on Pondra, DuckDB and Postgres, and Pondra again with its MCP door's tools, each task
+# tried `runs` times. What it proves and how it
 # scores: redesign-wip/agent-benchmark-plan.md. CI runs the rest of it with no model on every pull request
 # (harness.py agents).
 #
@@ -24,6 +25,9 @@ on:
       runs:
         description: "Tries at each task on each engine"
         default: "3"
+      engines:
+        description: "Engines (pondra+mcp: Pondra with its MCP door's tools)"
+        default: duckdb,postgres,pondra,pondra+mcp
       only:
         description: "Task ids, comma-separated (empty: all of set A)"
         default: ""
@@ -83,11 +87,12 @@ jobs:
           MODEL: ${{ inputs.model }}
           EFFORT: ${{ inputs.effort }}
           RUNS: ${{ inputs.runs }}
+          ENGINES: ${{ inputs.engines }}
           ONLY: ${{ inputs.only }}
         run: |
           chmod +x pondra && ./pondra --version
           python3 tools/agent_bench.py run --bin ./pondra --model "$MODEL" --effort "$EFFORT" --runs "$RUNS" \
-            ${ONLY:+--only "$ONLY"} --out agent-bench
+            --engines "$ENGINES" ${ONLY:+--only "$ONLY"} --out agent-bench
       - name: The report, in the job's summary
         if: always()
         run: if [ -f agent-bench/report.md ]; then cat agent-bench/report.md >> "$GITHUB_STEP_SUMMARY"; fi
