@@ -157,6 +157,9 @@ impl Kinds {
     }
 }
 
+/// The objects' own records beside their kinds' (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "cm/", owner: "objects", holds: "comments: on an object (cm/kind/name) or a column (cm/column/table/column)" }];
+
 /// The extension that adds the core's kinds.
 pub static CATALOG: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "catalog",
@@ -166,7 +169,12 @@ pub static CATALOG: crate::registry::BuiltIn = crate::registry::BuiltIn {
         for k in CORE_KINDS {
             kinds.add(k);
         }
+        let prefixes = r.section_mut::<crate::records::Prefixes>(); // (the catalog floor's; each floor's extension adds its own)
+        for p in [crate::records::PREFIXES, crate::store::PREFIXES, crate::log::PREFIXES, crate::format::PREFIXES, crate::replica::PREFIXES, PREFIXES] {
+            prefixes.add(p);
+        }
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "kinds", columns: COLUMNS, rows });
+        r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "prefixes", columns: crate::records::COLUMNS, rows: crate::records::rows });
     },
 };
 

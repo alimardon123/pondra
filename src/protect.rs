@@ -16,6 +16,9 @@ use std::sync::Arc;
 /// Where the protection is kept: under `z/`, which a branch never copies.
 pub const KEY: &str = "z/protect";
 
+/// The protection's record in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: KEY, owner: "protect", holds: "what the lake is protected against, and until when" }];
+
 /// A database's protection, and its last change: when, and by whom.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Protection {

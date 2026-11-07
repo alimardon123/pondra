@@ -973,9 +973,7 @@ impl FlightSqlService for Sql {
         match (exists, IfThere::try_from(options.if_exists), IfNot::try_from(options.if_not_exist)) {
             (true, Ok(IfThere::Fail), _) => return Err(refused("42P07", format!("{table} exists (mode create): append to it, or replace it"))),
             (true, Ok(IfThere::Replace), _) => {
-                if role < Role::Admin {
-                    return Err(refused("42501", "replacing a table needs the admin token"));
-                }
+                crate::rights::may_as(role, crate::rights::Action::Define, crate::rights::Object::Table(&table)).map_err(denied)?; // (replacing it)
                 let drop = crate::write::parse(&format!("DROP TABLE {}", crate::write::sql_name(&table))).ok_or_else(|| refused("XX000", "DROP TABLE"))?;
                 crate::write::on_node(&self.0, drop, None).await.map_err(status)?;
                 exists = false;
@@ -985,9 +983,7 @@ impl FlightSqlService for Sql {
         }
         if !exists {
             // ADBC's create modes: a table from the stream's schema (strings as Utf8, times in µs).
-            if role < Role::Admin {
-                return Err(refused("42501", "creating a table needs the admin token"));
-            }
+            crate::rights::may_as(role, crate::rights::Action::Define, crate::rights::Object::Table(&table)).map_err(denied)?; // (creating it)
             let schema = match std::pin::Pin::new(&mut batches).peek().await {
                 Some(Ok(b)) => b.schema(),
                 _ => return Err(refused("22023", "no rows to take the table's columns from")),

@@ -24,13 +24,16 @@ use std::sync::{Arc, Mutex};
 pub static DELTA: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "delta",
     requires: &[],
-    register: |r| r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES),
+    register: |r| {
+        r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES);
+        r.section_mut::<crate::records::Prefixes>().add(crate::delta::PREFIXES);
+    },
 };
 
 #[cfg(feature = "lake")]
 const TABLES: crate::connections::ConnectionType = {
     use crate::connections::{ConnectionType, Holds, READ_ONLY, SECRET, URL};
-    ConnectionType { name: "delta", holds: Holds::Tables, options: &[URL, SECRET, READ_ONLY], schemes: &[], secret_types: &["s3", "r2", "gcs", "azure"], about: "a folder of Delta tables, on the machine or in a bucket: url = 's3://bucket/tables'" }
+    ConnectionType { name: "delta", holds: Holds::Tables, options: &[URL, SECRET, READ_ONLY], schemes: &[], secret_types: &["s3", "r2", "gcs", "azure"], about: "a folder of Delta tables, on the machine or in a bucket: url = 's3://bucket/tables'", open: None }
 };
 
 /// The reader features read here (Delta's protocol, reader version 3).

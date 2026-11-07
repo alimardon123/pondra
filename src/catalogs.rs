@@ -22,7 +22,10 @@ use std::sync::{Arc, Mutex};
 pub static ICEBERG: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "iceberg",
     requires: &[],
-    register: |r| r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES),
+    register: |r| {
+        r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES);
+        r.section_mut::<crate::records::Prefixes>().add(crate::iceberg::PREFIXES);
+    },
 };
 
 const TABLES: crate::connections::ConnectionType = {
@@ -41,6 +44,7 @@ const TABLES: crate::connections::ConnectionType = {
         schemes: &[], // (a REST catalog's https://, a folder or a bucket, or an AWS account or ARN)
         secret_types: &["iceberg", "s3", "r2", "gcs", "azure"],
         about: "an Iceberg catalog (REST, Glue, S3 Tables) or a folder of Iceberg tables: url = 'https://catalog/warehouse'",
+        open: None,
     }
 };
 

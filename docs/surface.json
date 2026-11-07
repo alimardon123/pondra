@@ -1434,6 +1434,11 @@
    "comment Utf8",
    "definition Utf8"
   ],
+  "pondra.prefixes": [
+   "prefix Utf8",
+   "owner Utf8",
+   "holds Utf8"
+  ],
   "pondra.recipients": [
    "name Utf8",
    "comment Utf8",
