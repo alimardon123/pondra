@@ -106,14 +106,15 @@ async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job:
     delta_writable(root, &log)?;
     let (columns, partitions, mapped) = read_delta::schema(root, &log.metadata)?;
     let fields = read_delta_fields(&log.metadata)?;
+    let not_null = delta_not_null(&log.metadata)?;
+    // (a NOT NULL column is written as Parquet's required, as the table's own writers write it: `Fit` has refused any NULL in it)
     let target: Vec<Field> = columns.iter().map(|(p, l, t)| {
-        let f = Field::new(p, t.clone(), true);
+        let f = Field::new(p, t.clone(), !not_null.contains(l));
         match fields.get(l).and_then(|m| m["delta.columnMapping.id"].as_i64()).filter(|_| mapped) {
             Some(id) => f.with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into()),
             None => f,
         }
     }).collect();
-    let not_null = delta_not_null(&log.metadata)?;
     let fit = Fit::new(&df, &target, columns.iter().map(|(_, l, _)| not_null.contains(l).then(|| l.clone())).collect(), root)?; // (said by its logical name)
     let partition_at: Vec<usize> = partitions.iter().map(|p| target.iter().position(|f| f.name() == p).expect("a partition column")).collect();
     let file_fields: Vec<Field> = target.iter().enumerate().filter(|(i, _)| !partition_at.contains(i)).map(|(_, f)| f.clone()).collect();
@@ -484,8 +485,9 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
     // (named by the table's metadata, wherever it likes: written only where the caller may write, as its files are read)
     crate::ext::check_urls(lake, &[format!("{location}/data/").as_str(), format!("{location}/metadata/").as_str()]).await?;
     let (schema_json, columns) = crate::read_iceberg::schema_of(&meta)?;
-    let target: Vec<Field> = columns.iter().map(|(n, id, t)| Field::new(n, t.clone(), true).with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into())).collect();
-    let required = columns.iter().map(|(n, ..)| schema_json["fields"].as_array().into_iter().flatten().any(|f| f["name"] == n.as_str() && f["required"] == true).then(|| n.clone())).collect();
+    let required: Vec<Option<String>> = columns.iter().map(|(n, ..)| schema_json["fields"].as_array().into_iter().flatten().any(|f| f["name"] == n.as_str() && f["required"] == true).then(|| n.clone())).collect();
+    // (a required column is written as Parquet's required, as Iceberg's writers write it: `Fit` has refused any NULL in it)
+    let target: Vec<Field> = columns.iter().zip(&required).map(|((n, id, t), r)| Field::new(n, t.clone(), r.is_none()).with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into())).collect();
     let fit = Fit::new(&df, &target, required, url)?;
     let spec_id = meta["default-spec-id"].as_i64().unwrap_or(0);
     let pspec = meta["partition-specs"].as_array().into_iter().flatten().find(|s| s["spec-id"].as_i64() == Some(spec_id)).cloned().unwrap_or(json!({"fields": []}));

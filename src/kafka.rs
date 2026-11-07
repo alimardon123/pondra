@@ -437,12 +437,21 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
         let name = r.str()?;
         let meta = app.lake.cat.meta(&table_key(&name)).await?; // (the stored entry: its JSON fields are SQL's names too, ADR-022)
         let rules = meta.as_ref().map(|m| m.rules());
-        let allowed = who.role >= Role::Write && crate::writer::may(Some(who), &crate::auth::catalog_name(&name), None, false).is_ok(); // (the row doors' one check)
+        let not_yours = format!("this {} may not write {name}", if who.access.is_some() { "user" } else { "token" });
+        let may = match who.role >= Role::Write {
+            true => crate::writer::may(Some(who), &crate::auth::catalog_name(&name), None, false).map_err(|e| e.to_string()), // (the row doors' one check)
+            false => Err(not_yours.clone()),
+        };
         let mut parts = vec![];
         for _ in 0..r.len()? {
             let (index, records) = (r.i32()?, r.nbytes()?.unwrap_or_default());
+            // (each partition's records are a load, with its line in the audit log as its outcome comes: `writer::Load`)
+            let mut load = crate::writer::Load::new(app, Some(who.clone()), "Kafka produce", &name);
             let outcome = match (&meta, &rules, index) {
-                _ if !allowed => ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(format!("this {} may not write {name}", if who.access.is_some() { "user" } else { "token" })))),
+                _ if may.is_err() => {
+                    load.end(may.clone().err());
+                    ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(not_yours.clone())))
+                }
                 (Some(meta), Some(Ok(rules)), 0) => queue(app, who, &name, meta, rules, &records).await,
                 (Some(_), Some(Err(e)), 0) => {
                     eprintln!("kafka: a record for {name} refused: {e:#}"); // (the table's rules don't make: its records are refused)
@@ -450,7 +459,12 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
                 }
                 _ => ready((UNKNOWN_TOPIC, -1, None)),
             };
-            parts.push((index, outcome));
+            let outcome = async move {
+                let o = outcome.await;
+                load.end((o.0 != 0).then(|| o.2.clone().unwrap_or_else(|| format!("Kafka's error {}", o.0))));
+                o
+            };
+            parts.push((index, outcome.boxed()));
         }
         topics.push((name, parts));
     }
