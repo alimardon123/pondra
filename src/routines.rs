@@ -1159,7 +1159,7 @@ async fn run(app: &App, name: String, r: Routine, row: RecordBatch, who: Who, jo
             }
             let (given, views) = (HashMap::new(), HashMap::new());
             let go = crate::vars::own(values, script(app, &r.body, &given, &views, inner, job)); // (a procedure's variables are its own)
-            match name == "do" || crate::auth::shows_code() {
+            match name == "do" || crate::rights::scope().shows_code() {
                 true => Box::pin(go).await,
                 false => Box::pin(crate::script::unshown(go)).await, // (its errors don't quote its code to this caller: S27)
             }

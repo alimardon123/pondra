@@ -455,8 +455,11 @@ pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &Tabl
 /// `name` as the request being served may read it: as it is for a token or a superuser; for a user
 /// granted some tables, `Guarded` (and left out of a listing if it may read none of it).
 fn guarded(name: &str, t: Arc<dyn TableProvider>, listing: bool) -> Option<Arc<dyn TableProvider>> {
-    let Some(access) = crate::auth::limited() else { return Some(t) };
-    let columns = access.columns("select", name);
+    let scope = crate::rights::scope();
+    if scope.whole() {
+        return Some(t);
+    }
+    let columns = scope.columns(name);
     if listing && columns.is_none() {
         return None;
     }
@@ -466,10 +469,11 @@ fn guarded(name: &str, t: Arc<dyn TableProvider>, listing: bool) -> Option<Arc<d
 /// An attached lake's table `name` as the request being served may read it: not at all when that
 /// lake signs in on its own (`locked`, why); for a user granted some tables, by grants naming it.
 fn across(name: &str, t: Arc<dyn TableProvider>, listing: bool, locked: &Option<String>) -> Option<Arc<dyn TableProvider>> {
-    let columns = match (locked, crate::auth::limited()) {
-        (Some(_), _) => None,
-        (None, None) => return Some(t),
-        (None, Some(access)) => access.named("select", name),
+    let scope = crate::rights::scope();
+    let columns = match locked {
+        Some(_) => None,
+        None if scope.whole() => return Some(t),
+        None => scope.named("select", name),
     };
     if listing && columns.is_none() {
         return None;

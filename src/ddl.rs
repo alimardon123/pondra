@@ -152,9 +152,10 @@ pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> {
             all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: crate::views::code_for_caller(|| crate::views::shown(&v.sql)) });
         }
     }
-    if let Some(a) = crate::auth::limited() {
+    let scope = crate::rights::scope();
+    if !scope.whole() {
         let here = lake_name(lake);
-        all.retain(|o| a.may("select", &if o.lake == here { join(&o.schema, &o.name) } else { format!("{}.{}", o.lake, join(&o.schema, &o.name)) })); // (a user's: what it may read, at every listing: S27)
+        all.retain(|o| scope.sees(crate::rights::Object::Table(&if o.lake == here { join(&o.schema, &o.name) } else { format!("{}.{}", o.lake, join(&o.schema, &o.name)) }))); // (a user's: what it may read, at every listing: S27)
     }
     Ok(all)
 }

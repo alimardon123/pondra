@@ -353,10 +353,11 @@ pub async fn pin(lake: &Lake, branch: &str, ms: Option<u64>, lease: bool) -> Res
     let (key, now) = (pin_key(branch), crate::log::now_ms());
     let mut ms = ms.unwrap_or(now.saturating_sub(MARGIN_MS));
     // (a user who may only clone is a server elsewhere's: its pin is a lease, and once one, always)
-    let mut lease = lease || crate::auth::limited().and_then(|a| a.clones()).is_some();
+    let scope = crate::rights::scope();
+    let mut lease = lease || scope.clones().is_some();
     // (a user who may only clone makes the pins it makes its own: it renews those alone, so it is never given
     // another branch's key, nor makes another's pin a lease)
-    let limited = crate::auth::limited().is_some();
+    let limited = !scope.whole();
     let me = match limited {
         true => crate::auth::current().map(|p| p.name),
         false => None,
@@ -373,7 +374,7 @@ pub async fn pin(lake: &Lake, branch: &str, ms: Option<u64>, lease: bool) -> Res
     lake.cat.commit(vec![(key, json(&Pin { lake: branch.into(), ms, at_ms: now, lease, by }))], &[]).await?;
     let mut out = j!({"pinned": branch, "ms": ms, "at_ms": now, "key": key_for(lake, branch).await?});
     // (a user granted CLONE on some schemas only: the branch takes only those, and says so here)
-    if let Some(s) = crate::auth::limited().and_then(|a| a.clones()).filter(|s| !s.is_empty()) {
+    if let Some(s) = scope.clones().filter(|s| !s.is_empty()) {
         out["schemas"] = j!(s);
     }
     Ok(out)
@@ -439,9 +440,10 @@ pub async fn may(lake: &Lake, d: &Ddl) -> Result<()> {
 /// before (`may`).
 pub async fn door(lake: &Lake, d: &mut Ddl) -> Result<()> {
     places(d)?;
-    match crate::auth::limited() {
-        Some(a) => user_door(lake, d, &a).await?,
-        None => may(lake, d).await?,
+    let scope = crate::rights::scope();
+    match scope.whole() {
+        true => may(lake, d).await?,
+        false => user_door(lake, d, &scope).await?,
     }
     stamp(lake, d).await
 }
@@ -461,7 +463,7 @@ fn places(d: &Ddl) -> Result<()> {
 
 /// A user who isn't a superuser: its grants decide a branch or a drop (`rights::may_run` lets nothing
 /// else of its through).
-async fn user_door(lake: &Lake, d: &mut Ddl, a: &crate::users::Access) -> Result<()> {
+async fn user_door(lake: &Lake, d: &mut Ddl, a: &crate::rights::Scope) -> Result<()> {
     if let Ddl::CreateDatabase { clone: Some(of), dir, .. } = d {
         // (a branch's files go beside its base's, on its base's server: a folder or a URL named here would be opened with this node's own credentials)
         ensure!(dir.is_none(), crate::codes::coded("42501", "permission denied: a branch made with CLONE lives beside the database it is made on; LOCATION is a superuser's choice"));
@@ -476,7 +478,7 @@ async fn user_door(lake: &Lake, d: &mut Ddl, a: &crate::users::Access) -> Result
 /// A branch of a database, made by a user with CLONE: on this database, as its grants let it (every
 /// schema, or those granted, and only those it names); on a database attached here, by its own grant.
 /// Prod still decides what the attachment's token may pin (`pin`), so `may` isn't asked there.
-fn clone_as(lake: &Lake, of: &mut CloneOf, a: &crate::users::Access) -> Result<()> {
+fn clone_as(lake: &Lake, of: &mut CloneOf, a: &crate::rights::Scope) -> Result<()> {
     let from = crate::text::database(&of.from);
     let here = crate::ddl::lake_name(lake);
     let me = crate::auth::current().map(|p| p.name).unwrap_or_default();
@@ -808,7 +810,7 @@ pub async fn databases(lake: &Lake) -> Result<datafusion::arrow::record_batch::R
     let s = |f: &dyn Fn(&(String, String, Option<String>, Option<i64>, i64, Option<String>)) -> Option<String>| Arc::new(rows.iter().map(f).collect::<StringArray>()) as ArrayRef;
     Ok(datafusion::arrow::record_batch::RecordBatch::try_from_iter(vec![
         ("name", s(&|r| Some(r.0.clone()))),
-        ("location", s(&|r| crate::auth::shows_code().then(|| r.1.clone()))), // (the server's folder is the operator's: a caller who may see code only)
+        ("location", s(&|r| crate::rights::scope().shows_code().then(|| r.1.clone()))), // (the server's folder is the operator's: a caller who may see code only)
         ("base", s(&|r| r.2.clone())),
         ("owner", s(&|r| r.5.clone())), // (the user who made a branch; none for an admin's branch and for a database that isn't one)
         ("branched_at", Arc::new(rows.iter().map(|r| r.3).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef),

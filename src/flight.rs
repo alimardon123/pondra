@@ -145,7 +145,7 @@ fn sqlstate(code: tonic::Code) -> &'static str {
 /// every door tells them (`codes::answer`).
 fn status(e: impl Into<anyhow::Error>) -> Status {
     let e = e.into();
-    let (_, code, words) = crate::codes::answer(&e, crate::auth::shows_code()); // (the code and words every door gives)
+    let (_, code, words) = crate::codes::answer(&e, crate::rights::scope().shows_code()); // (the code and words every door gives)
     let mut s = Status::new(grpc(code), words);
     s.metadata_mut().insert("x-pondra-sqlstate", tonic::metadata::MetadataValue::from_static(code));
     s

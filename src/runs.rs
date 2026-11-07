@@ -1147,7 +1147,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("returns", r(&|_, r| r.returns.clone())),
         ("volatility", r(&|_, r| (r.kind != Kind::Procedure).then(|| r.with.volatility.clone().unwrap_or_else(|| if r.python() { "volatile" } else { "as its body" }.into())))),
         ("options", r(&|_, r| Some(serde_json::to_string(&r.with).unwrap_or_default()).filter(|o| o != "{}"))),
-        ("body", r(&|_, r| crate::auth::shows_code().then(|| r.body.clone()))), // (a routine's code: S27)
+        ("body", r(&|_, r| crate::rights::scope().shows_code().then(|| r.body.clone()))), // (a routine's code: S27)
     ])?;
     let all = tasks(lake).await?;
     let mut ticks = vec![];
@@ -1162,7 +1162,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("schedule", t(&|_, (_, x)| Some(x.schedule.clone()).filter(|s| !s.is_empty()))),
         ("after", t(&|_, (_, x)| Some(x.after.join(", ")).filter(|s| !s.is_empty()))),
         ("when", t(&|_, (_, x)| x.when.clone())),
-        ("statement", t(&|_, (_, x)| crate::auth::shows_code().then(|| x.sql.clone()))), // (a task's statement: S27)
+        ("statement", t(&|_, (_, x)| crate::rights::scope().shows_code().then(|| x.sql.clone()))), // (a task's statement: S27)
         ("options", t(&|_, (_, x)| (!x.with.plain()).then(|| serde_json::to_string(&x.with).unwrap_or_default()))),
         ("state", t(&|_, (_, x)| Some(if x.suspended { "suspended" } else { "started" }.into()))),
         ("last_tick", at(&|i, _| ticks[i].as_ref().map(|t| t.at))),
@@ -1189,9 +1189,8 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
     ])?;
     // (dropped tables that UNDROP TABLE can still bring back: ADR-043)
     let mut gone = crate::ddl::dropped(lake).await?;
-    if let Some(a) = crate::auth::limited() {
-        gone.retain(|(n, _)| a.may("select", n));
-    }
+    let scope = crate::rights::scope();
+    gone.retain(|(n, _)| scope.sees(crate::rights::Object::Table(n)));
     let g = |f: &dyn Fn(&crate::ddl::Dropped) -> u64| Arc::new(gone.iter().map(|(_, d)| Some(f(d) as i64)).collect::<Int64Array>()) as ArrayRef;
     let when = |f: &dyn Fn(&crate::ddl::Dropped) -> u64| Arc::new(gone.iter().map(|(_, d)| Some(f(d) as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef;
     let dropped = RecordBatch::try_from_iter(vec![

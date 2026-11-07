@@ -175,7 +175,7 @@ async fn call(app: &App, role: Role, params: &Value) -> Result<Value, Value> {
         Err(e) => {
             // (a tool error, which the agent sees and can act on: Postgres's code and the words every door gives, a
             // routine's code cut for a user who may not see it)
-            let (_, code, words) = crate::codes::answer(&e, crate::auth::shows_code());
+            let (_, code, words) = crate::codes::answer(&e, crate::rights::scope().shows_code());
             (format!("SQLSTATE {code}: {words}"), true)
         }
     };
@@ -224,7 +224,7 @@ fn lakes(app: &App) -> Vec<(String, Arc<Lake>)> {
 /// May the request being served read `name`, a table or view of the lake `prefix` names? A user
 /// with grants sees only what it may SELECT, as `pondra.tables` lists it.
 fn may_see(prefix: &str, name: &str) -> bool {
-    crate::auth::limited().is_none_or(|a| a.may("select", &format!("{prefix}{name}")))
+    crate::rights::scope().sees(crate::rights::Object::Table(&format!("{prefix}{name}")))
 }
 
 /// A column's type as SQL names it, for an agent that writes SQL: as `SHOW CREATE` writes it (`types::shown`), so it

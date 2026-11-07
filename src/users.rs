@@ -1167,7 +1167,7 @@ async fn token_principal(lake: &Lake, user: &str, until: Option<u64>) -> Option<
 #[derive(Default, Debug)]
 pub struct Access {
     grants: Vec<Grant>,
-    names: HashSet<String>, // (itself, its roles, public: whose grants they are)
+    pub(crate) names: HashSet<String>, // (itself, its roles, public: whose grants they are; `rights::Scope::names`)
     pub limits: Limits,     // (its own)
 }
 
@@ -1412,9 +1412,12 @@ pub async fn across(other: &Lake, ns: &str) -> Result<()> {
 /// key reads all of it whoever asks, so here it is read by whoever may use that key's secret (a
 /// user granted USAGE on it), and by tokens, as files under a secret's scope are.
 fn read_only(r: &crate::store::Reach, ns: &str) -> Result<()> {
-    let Some(a) = crate::auth::limited() else { return Ok(()) };
+    let scope = crate::rights::scope();
+    if scope.whole() {
+        return Ok(());
+    }
     match &r.secret {
-        Some(s) if a.secret(s) => Ok(()),
+        Some(s) if scope.secret(s) => Ok(()),
         Some(s) => bail!("permission denied: {ns} is read with the secret {s}: GRANT USAGE ON SECRET {s} TO …"),
         None => bail!("permission denied: {ns} is read with this server's own key: a token's, or an admin's"),
     }
@@ -1424,9 +1427,9 @@ fn read_only(r: &crate::store::Reach, ns: &str) -> Result<()> {
 /// tables, a grant naming it for each privilege the write needs.
 pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::write::Stmt) -> Result<()> {
     across(other, ns).await?;
-    let Some(a) = crate::auth::limited() else { return Ok(()) };
+    let scope = crate::rights::scope();
     let (table, privileges) = (format!("{ns}.{table}"), crate::rights::asks(stmt).1.into_iter().filter_map(crate::rights::Action::privilege).collect::<Vec<_>>());
-    match privileges.iter().find(|p| a.named(p, &table).is_none()) {
+    match privileges.iter().find(|p| scope.named(p, &table).is_none()) {
         Some(p) => bail!("permission denied: {} on {table}, another database's table: GRANT {} ON {table} TO … (ON ALL TABLES and ON SCHEMA are this database's)", p.to_uppercase(), p.to_uppercase()),
         None => Ok(()),
     }
@@ -1524,8 +1527,8 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
     use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray, TimestampMicrosecondArray};
     use datafusion::datasource::MemTable;
     let mut all = lake.cat.scan::<User>("u/", "u0").await?;
-    if let Some(a) = crate::auth::limited() {
-        all.retain(|(k, _)| a.names.contains(&k[2..])); // (a user's: itself and its roles)
+    if let Some(names) = crate::rights::scope().names() {
+        all.retain(|(k, _)| names.contains(&k[2..])); // (a user's: itself and its roles)
     }
     let s = |f: &dyn Fn(&String, &User) -> Option<String>| Arc::new(all.iter().map(|(k, u)| f(&k[2..].to_string(), u)).collect::<StringArray>()) as ArrayRef;
     let users = RecordBatch::try_from_iter(vec![

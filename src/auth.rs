@@ -56,10 +56,6 @@ impl Principal {
         (self.door, self.from) = (door, from);
         self
     }
-
-    /// May it use `privilege` on `table` (as SQL names it)? (Its role decides what kind of thing.)
-    pub fn may(&self, privilege: &str, table: &str) -> bool { self.access.as_ref().is_none_or(|a| a.may(privilege, &catalog_name(table))) }
-
 }
 
 tokio::task_local! {
@@ -101,14 +97,6 @@ pub fn carried<F: std::future::Future>(f: F) -> impl std::future::Future<Output 
         }
     }
 }
-
-/// A user's grants, if the request being served is a user's who isn't a superuser.
-pub fn limited() -> Option<Arc<crate::users::Access>> { current().and_then(|p| p.access) }
-
-/// Whether the request being served is shown routines' code, tasks' statements and views' queries (S27): a token, a
-/// superuser, an open node, and a user who could hold them anyway (APPLY deploys them, CLONE ON DATABASE copies them
-/// into a branch it owns). A user granted some tables is shown their names and parameters only.
-pub fn shows_code() -> bool { limited().is_none_or(|a| a.applies() || a.clones().is_some_and(|s| s.is_empty())) }
 
 /// Is the request being served from whoever runs the nodes (`Principal::token`)? (None: work no
 /// door started, a task's included, is not: whoever made the task may be anyone.)

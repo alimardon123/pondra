@@ -223,9 +223,9 @@ impl View {
 pub fn shown(sql: &str) -> String { crate::pattern::shown(&crate::measures::written(sql)).into_owned() }
 
 /// What a caller may see of a view's query, or of a name or expression taken from it: `text`, for a caller who may see
-/// code (`auth::shows_code`), and nothing for any other user. A view's query names the tables under it and the filters
+/// code (`rights::Scope::shows_code`), and nothing for any other user. A view's query names the tables under it and the filters
 /// that keep rows out, so a user granted only the view is not shown them, as a routine's code is not (S27).
-pub fn code_for_caller<T>(text: impl FnOnce() -> T) -> Option<T> { crate::auth::shows_code().then(text) }
+pub fn code_for_caller<T>(text: impl FnOnce() -> T) -> Option<T> { crate::rights::scope().shows_code().then(text) }
 
 /// The producers a view's rows are written under (what goes when it is dropped or detached).
 pub fn producers(name: &str) -> Vec<String> {
@@ -2023,9 +2023,8 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
     use datafusion::arrow::array::{Array, AsArray, Int64Array, StringArray};
     use datafusion::datasource::MemTable;
     let mut views = in_order(lake.cat.scan::<View>("v/", "v0").await?);
-    if let Some(a) = crate::auth::limited() {
-        views.retain(|(name, v)| a.may("select", v.shown(name)));
-    }
+    let scope = crate::rights::scope();
+    views.retain(|(name, v)| scope.sees(crate::rights::Object::Table(v.shown(name))));
     let (mut kinds, mut histories) = (vec![], std::collections::HashSet::new());
     for (name, v) in &views {
         let meta = lake.cat.meta(&table_key(name)).await?;

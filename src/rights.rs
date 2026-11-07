@@ -211,6 +211,62 @@ pub fn may_run(role: Role, stmt: &Stmt) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What the request being served may see and read (design v2.1 §5, step 6 piece 2): everything (`whole`: a token, a
+/// superuser, an open node, the node's own work), or what a user's grants name. Listings ask `sees`, planning asks
+/// `columns`, the caches and the key lookup serve only a whole one, and nothing outside this module reads a user's grants.
+#[derive(Clone, Default)]
+pub struct Scope(Option<std::sync::Arc<crate::users::Access>>);
+
+/// The scope of the request being served.
+pub fn scope() -> Scope { crate::auth::current().map_or_else(Scope::default, |p| Scope::of(&p)) }
+
+impl Scope {
+    /// What `who` may see.
+    pub fn of(who: &Principal) -> Scope { Scope(who.access.clone()) }
+
+    /// Everything: no grants narrow it. A remembered answer, the key lookup and the results cache serve only a whole
+    /// scope (a user's grants may change, and its plan reads what they name).
+    pub fn whole(&self) -> bool { self.0.is_none() }
+
+    /// Does it see `object`? A table or view (as the catalog names it, `l.t` for another lake's) when it may read any of
+    /// its columns (SELECT, S27); the lake's own records (its users, identity providers, shares) when it is whole.
+    pub fn sees(&self, object: Object) -> bool {
+        match (&self.0, object) {
+            (None, _) => true,
+            (Some(a), Object::Table(t)) => a.may("select", t),
+            (Some(_), Object::Lake) => false,
+        }
+    }
+
+    /// The columns of `table` (as the catalog names it) it reads: None, none; Some(None), every column; Some(these).
+    pub fn columns(&self, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.0.as_ref().map_or(Some(None), |a| a.columns("select", table)) }
+
+    /// The same, for a table of another lake attached here (`l.t`, `l.s.t`): only grants naming it count; ON ALL TABLES
+    /// and ON SCHEMA are this lake's. `privilege` as `Action::privilege` names it.
+    pub fn named(&self, privilege: &str, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.0.as_ref().map_or(Some(None), |a| a.named(privilege, table)) }
+
+    /// May it use the secret `name` (GRANT USAGE ON SECRET)?
+    pub fn secret(&self, name: &str) -> bool { self.0.as_ref().is_none_or(|a| a.secret(name)) }
+
+    /// The schemas a user granted CLONE may branch (ADR-058): None, no CLONE grant (and a whole scope, which needs none);
+    /// Some(none), every schema (CLONE ON DATABASE); Some(these), CLONE ON SCHEMA.
+    pub fn clones(&self) -> Option<Vec<String>> { self.0.as_ref().and_then(|a| a.clones()) }
+
+    /// May it branch `db`, a database attached here, through its attachment (GRANT CLONE ON DATABASE db)?
+    pub fn clones_of(&self, db: &str) -> bool { self.0.as_ref().is_none_or(|a| a.clones_of(db)) }
+
+    /// Is it a user granted APPLY on this database (`apply::applier`)? A whole scope applies by its role instead: false.
+    pub fn applies(&self) -> bool { self.0.as_ref().is_some_and(|a| a.applies()) }
+
+    /// Is it shown routines' code, tasks' statements and views' queries (S27): a token, a superuser, an open node,
+    /// and a user who could hold them anyway (APPLY deploys them, CLONE ON DATABASE copies them into a branch it
+    /// owns)? A user granted some tables is shown their names and parameters only.
+    pub fn shows_code(&self) -> bool { self.0.as_ref().is_none_or(|a| a.applies() || a.clones().is_some_and(|s| s.is_empty())) }
+
+    /// The names whose grants it has: a user's own, its roles' and public's. None: whole.
+    pub fn names(&self) -> Option<&std::collections::HashSet<String>> { self.0.as_ref().map(|a| &a.names) }
+}
+
 /// The table a write changes (as the catalog names it; empty: the lake's) and what it asks to do to it.
 pub fn asks(stmt: &Stmt) -> (String, Vec<Action>) {
     match stmt {

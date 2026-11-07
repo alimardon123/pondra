@@ -236,7 +236,7 @@ async fn list_functions(State(app): State<App>) -> Result<Json<Value>, E> {
 /// (a user granted some tables needs the first three to call one, never the body: S27).
 async fn routines_shown(State(app): State<App>) -> Result<Json<Value>, E> {
     let all = crate::routines::listed(&app.lake).await?;
-    if crate::auth::shows_code() {
+    if crate::rights::scope().shows_code() {
         return Ok(Json(j!(*all)));
     }
     let mut hidden = (*all).clone();
@@ -366,7 +366,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let who = who.at("http", from);
     // (a branch's pin: a user granted CLONE may ask for it, and `ddl` lets nothing else of theirs through: ADR-058)
     let pin = req.uri().path() == "/cluster/ddl";
-    let cloning = pin && who.access.as_ref().is_some_and(|a| a.clones().is_some());
+    let cloning = pin && crate::rights::Scope::of(&who).clones().is_some();
     if who.role < needed && !cloning {
         return match who.role {
             crate::auth::Role::None if header.is_none() && app.auth.owned() => (StatusCode::UNAUTHORIZED, "this node answers only the program that started it (the shell, connect()): open the console from the link it printed, or start the node with --admin-token to connect other tools").into_response(),
@@ -1380,7 +1380,7 @@ impl IntoResponse for E {
 /// An error as a response: its words are the body, its SQLSTATE the `x-pondra-sqlstate` header, and its status the one
 /// its code stands for, unless the caller gives its own (a database server answers its own errors this way too).
 pub fn error_response(status: Option<StatusCode>, e: &anyhow::Error) -> Response {
-    let (mapped, code, told) = crate::codes::answer(e, crate::auth::shows_code()); // (Postgres's SQLSTATE, for any client: ADR-036 §4; the words its caller may see)
+    let (mapped, code, told) = crate::codes::answer(e, crate::rights::scope().shows_code()); // (Postgres's SQLSTATE, for any client: ADR-036 §4; the words its caller may see)
     let status = status.unwrap_or_else(|| StatusCode::from_u16(mapped).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
     (status, [("x-pondra-sqlstate", code)], told).into_response()
 }

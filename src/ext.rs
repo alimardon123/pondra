@@ -260,7 +260,7 @@ fn located(l: &str) -> Result<String> {
 // ---------------------------------------------------------------- the table they make
 
 /// An error in words for whoever sent the statement, as this caller may see it (`codes::told`).
-pub fn said(e: &anyhow::Error) -> String { crate::codes::told(e, crate::auth::shows_code()) }
+pub fn said(e: &anyhow::Error) -> String { crate::codes::told(e, crate::rights::scope().shows_code()) }
 
 /// Does this table read files on the node's machine? (Such a query stays on it.)
 pub fn local(table: &str) -> bool { spec(table).is_some_and(|s| s.format == "share" || s.urls.iter().any(|u| scheme(u).is_none_or(|s| s == "file"))) } // (a share's links: as its node got them)
@@ -1389,7 +1389,7 @@ pub async fn list(lake: &Lake) -> Result<Vec<(String, Secret)>> {
 
 /// May the request being served use this secret? Its own temporary one, or one a user is granted
 /// USAGE on (`GRANT USAGE ON SECRET`); a token's or a superuser's, any but a key lent to read a base.
-pub(crate) fn usable(name: &str, s: &Secret) -> bool { !s.lent && (s.temporary || crate::auth::limited().is_none_or(|a| a.secret(name))) }
+pub(crate) fn usable(name: &str, s: &Secret) -> bool { !s.lent && (s.temporary || crate::rights::scope().secret(name)) }
 
 /// The secret for a URL: the longest scope that is a prefix of it (no scope: every URL of its
 /// type's schemes).

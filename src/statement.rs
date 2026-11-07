@@ -117,7 +117,7 @@ pub(crate) fn is_write(sql: &str) -> bool {
 /// Step 2's inside, on a statement already expanded (`run` makes it, inside `audit::statement`): the key lookup, the
 /// remembered answer or the run. Postgres's door enters here too, with its own text and its own audit.
 pub(crate) async fn query<W: Wire>(app: &App, one: &str, how: &How<'_>, files: bool, wire: &W) -> Result<Answer<W::Own>> {
-    let limited = crate::auth::limited().is_some(); // (a user granted some tables: planned as it may read them, never answered from what another read, nor kept: its grants may change)
+    let limited = !crate::rights::scope().whole(); // (a user granted some tables: planned as it may read them, never answered from what another read, nor kept: its grants may change)
     if wire.takes_point_json() && !crate::temp::mentioned(one) && !limited {
         if let Some(body) = crate::serve::point_sql(&app.lake, one).await? {
             return Ok(Answer::Kept(body.into())); // a key lookup: no planning

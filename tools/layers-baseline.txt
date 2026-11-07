@@ -163,7 +163,6 @@ metrics -> jemalloc  1
 metrics -> spill  1
 metrics -> store  4
 node -> wasm32  1
-objects -> auth  11
 objects -> authored  2
 objects -> branch  2
 objects -> constraints  1
@@ -178,6 +177,7 @@ objects -> index  3
 objects -> once  2
 objects -> protect  1
 objects -> query  1
+objects -> rights  16
 objects -> routines  2
 objects -> runs  3
 objects -> seq  3

@@ -588,7 +588,7 @@ pub async fn export(lake: &Lake) -> Result<BTreeMap<String, String>> {
 /// so only whoever is shown code gets it (S27: `pondra diff` and `pondra export` as an admin, APPLY or CLONE ON
 /// DATABASE); an attached database is `export_attached`'s.
 pub async fn export_here(lake: &Lake) -> Result<BTreeMap<String, String>> {
-    ensure!(crate::auth::shows_code(), "permission denied: this database's export (its routines' code, tasks and grants) is an admin's, or needs APPLY or CLONE on it");
+    ensure!(crate::rights::scope().shows_code(), "permission denied: this database's export (its routines' code, tasks and grants) is an admin's, or needs APPLY or CLONE on it");
     export(lake).await
 }
 
@@ -596,9 +596,7 @@ pub async fn export_here(lake: &Lake) -> Result<BTreeMap<String, String>> {
 /// with its base this way when the base is on another server (ADR-058). Its objects are what a clone of it holds,
 /// so CLONE on it is enough.
 pub async fn export_attached(lake: &Lake, name: &str) -> Result<BTreeMap<String, String>> {
-    if let Some(a) = crate::auth::limited() {
-        ensure!(a.clones_of(name), "permission denied: {name}'s objects are read here with CLONE on it (GRANT CLONE ON DATABASE {name} TO …)");
-    }
+    ensure!(crate::rights::scope().clones_of(name), "permission denied: {name}'s objects are read here with CLONE on it (GRANT CLONE ON DATABASE {name} TO …)");
     let other = lake.attached.read().unwrap().iter().find(|(n, _)| n == name).map(|(_, l)| l.clone());
     let other = other.ok_or_else(|| crate::codes::coded("3D000", format!("database \"{name}\" isn't attached here")))?;
     export(&other).await
@@ -1062,7 +1060,7 @@ pub async fn ask(app: &App, verb: Verb, ask: Ask, who: Who) -> Result<Value> {
 }
 
 /// Whether the caller holds APPLY on this database (a user granted it: `users::Access`).
-pub(crate) fn applier() -> bool { crate::auth::limited().is_some_and(|a| a.applies()) }
+pub(crate) fn applier() -> bool { crate::rights::scope().applies() }
 
 /// Who may apply. On a database that isn't protected: an admin, or an APPLY holder. On a protected one
 /// (`protect.rs`): an APPLY holder, whoever runs the nodes (their tokens, their key, the program that

@@ -906,10 +906,11 @@ pub async fn tables(lake: &Lake, text: &str) -> Result<Vec<(&'static str, Arc<dy
         by_folder.entry(folder).or_default().push((schema.to_string(), table.to_string()));
     }
     let (mut schema, mut table, mut file, mut version, mut rows, mut at) = (vec![], vec![], vec![], vec![], vec![], vec![]);
+    let scope = crate::rights::scope();
     for (key, e) in lake.cat.scan::<Entry>("ld/", "ld0").await? {
         let folder = key[3..].rsplit_once('/').map_or("", |(f, _)| f);
         for (s, t) in by_folder.get(folder).into_iter().flatten() {
-            if !crate::auth::current().is_none_or(|p| p.may("select", &crate::text::join(s, t))) {
+            if !scope.sees(crate::rights::Object::Table(&crate::text::join(s, t))) {
                 continue;
             }
             schema.push(s.clone());

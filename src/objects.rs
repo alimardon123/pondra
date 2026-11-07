@@ -245,7 +245,7 @@ pub async fn list(lake: &Lake) -> Result<Vec<Object>> {
         all.extend(lister(lake).await?);
     }
     // (a user limited by grants sees no secret, and none of an extension's objects until step 6's `may` says which)
-    if crate::auth::limited().is_none() {
+    if crate::rights::scope().whole() {
         all.extend(defined(lake).await?);
     } else {
         all.retain(|o| o.kind != "secret");
@@ -304,14 +304,14 @@ fn relations(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
         }
         let here = crate::ddl::lake_name(lake);
         let all = crate::ddl::listed(lake).await?;
-        let limit = crate::auth::limited(); // (`listed` keeps a user's rows to what it may read)
+        let scope = crate::rights::scope(); // (`listed` keeps a user's rows to what it may read)
         Ok(all.into_iter().map(|o| {
             let local = join(&o.schema, &o.name);
             let named = if o.lake == here { name_sql(&local) } else { format!("{}.{}.{}", ident(&o.lake), ident(&o.schema), ident(&o.name)) };
             // (a column a user may not read is not shown by name either: a definition names every column, so a
             // user granted only some of them gets none)
             let catalog = if o.lake == here { local.clone() } else { format!("{}.{local}", o.lake) };
-            let partial = limit.as_ref().is_some_and(|a| a.columns("select", &catalog) != Some(None));
+            let partial = scope.columns(&catalog) != Some(None);
             let def = match o.kind {
                 "table" => o.meta.as_ref().map(|m| table_sql(&named, m)),
                 "view" => o.sql.as_ref().map(|s| {
@@ -350,7 +350,7 @@ fn indexes(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
         let mut all = vec![];
         for (name, l) in lakes(lake).await {
             for (k, i) in l.cat.scan::<crate::index::Index>("ix/", "ix0").await? {
-                if crate::auth::limited().is_some_and(|a| !a.may("select", &if name == here { i.table.clone() } else { format!("{name}.{}", i.table) })) {
+                if !crate::rights::scope().sees(crate::rights::Object::Table(&if name == here { i.table.clone() } else { format!("{name}.{}", i.table) })) {
                     continue;
                 }
                 let meta = l.cat.meta(&table_key(&i.table)).await?;
@@ -395,7 +395,7 @@ fn routines(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
                     (R::Table, _) => "table function",
                     _ => "function",
                 };
-                Object::new(kind, &name, n, (name == here && crate::auth::shows_code()).then(|| routine_sql(&name_sql(n), r)))
+                Object::new(kind, &name, n, (name == here && crate::rights::scope().shows_code()).then(|| routine_sql(&name_sql(n), r)))
             }));
         }
         Ok(out)
@@ -408,7 +408,7 @@ fn tasks(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
         let mut out = vec![];
         for (name, l) in lakes(lake).await {
             for (k, t) in l.cat.scan::<crate::runs::Task>("j/", "j0").await? {
-                out.push(Object::new("task", &name, &k[2..], (name == here && crate::auth::shows_code()).then(|| task_sql(&name_sql(&k[2..]), &t))));
+                out.push(Object::new("task", &name, &k[2..], (name == here && crate::rights::scope().shows_code()).then(|| task_sql(&name_sql(&k[2..]), &t))));
             }
         }
         Ok(out)
@@ -457,7 +457,7 @@ fn extensions(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
 
 fn providers(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
     Box::pin(async move {
-        if crate::auth::limited().is_some() {
+        if !crate::rights::scope().sees(crate::rights::Object::Lake) {
             return Ok(vec![]); // (an admin's to list, as users are)
         }
         let here = crate::ddl::lake_name(lake);
@@ -468,7 +468,7 @@ fn providers(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
 fn users(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
     Box::pin(async move {
         let here = crate::ddl::lake_name(lake);
-        if crate::auth::limited().is_some() {
+        if !crate::rights::scope().sees(crate::rights::Object::Lake) {
             return Ok(vec![]); // (an admin's to list: a user sees itself in pondra.users)
         }
         let all = lake.cat.scan::<crate::users::User>("u/", "u0").await?;
@@ -529,7 +529,7 @@ async fn branched(lake: &Lake, name: &str, dir: &str) -> Option<String> {
 
 fn shares(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
     Box::pin(async move {
-        if crate::auth::limited().is_some() {
+        if !crate::rights::scope().sees(crate::rights::Object::Lake) {
             return Ok(vec![]); // (an admin's, as pondra.shares is)
         }
         let here = crate::ddl::lake_name(lake);
@@ -543,7 +543,7 @@ fn shares(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
 
 fn recipients(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
     Box::pin(async move {
-        if crate::auth::limited().is_some() {
+        if !crate::rights::scope().sees(crate::rights::Object::Lake) {
             return Ok(vec![]);
         }
         let here = crate::ddl::lake_name(lake);
@@ -1161,8 +1161,8 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
         "user" => "a user's password and tokens are never shown (CREATE USER … PASSWORD '…')",
         "recipient" => "a recipient's token is shown once, when it is made (ALTER RECIPIENT … ROTATE TOKEN gives it another)",
         "external table" => "its statement isn't kept as written yet (its query is in pondra.tables)",
-        _ if !crate::auth::shows_code() && (matches!(o.family(), "routine" | "task") || matches!(o.kind, "view" | "materialized view")) => "its code is shown to an admin, a token, a superuser, or a user with APPLY or CLONE on this database",
-        _ if crate::auth::limited().is_some() => "its statement names every column, and you may read only some of them",
+        _ if !crate::rights::scope().shows_code() && (matches!(o.family(), "routine" | "task") || matches!(o.kind, "view" | "materialized view")) => "its code is shown to an admin, a token, a superuser, or a user with APPLY or CLONE on this database",
+        _ if !crate::rights::scope().whole() => "its statement names every column, and you may read only some of them",
         _ => "made with its materialized view",
     }))?;
     let mut script = vec![def.clone()];
