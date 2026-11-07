@@ -1169,15 +1169,16 @@ pub(crate) async fn slot() -> tokio::sync::OwnedSemaphorePermit {
 /// A background view run, stopped as a statement is once it has run `PONDRA_VIEW_RUN_SECS` (3600; 0: none): its future
 /// dropped, its stop flag set (`audit::stoppable`), so a MATCH_RECOGNIZE search still running ends too; 57014.
 pub(crate) async fn bounded(f: impl std::future::Future<Output = Result<()>>) -> Result<()> {
-    bounded_by(crate::env::value::<u64>("PONDRA_VIEW_RUN_SECS"), f).await
+    bounded_by(crate::env::secs("PONDRA_VIEW_RUN_SECS"), f).await
 }
 
-async fn bounded_by(secs: u64, f: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+async fn bounded_by(most: std::time::Duration, f: impl std::future::Future<Output = Result<()>>) -> Result<()> {
     let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if secs == 0 {
+    if most.is_zero() {
         return crate::audit::stoppable(flag, f).await;
     }
-    tokio::time::timeout(std::time::Duration::from_secs(secs), crate::audit::stoppable(flag, f))
+    let secs = most.as_secs_f64();
+    tokio::time::timeout(most, crate::audit::stoppable(flag, f))
         .await
         .unwrap_or_else(|_| Err(coded("57014", format!("a run went past {secs} s (PONDRA_VIEW_RUN_SECS) and was stopped; it is tried again later, and stopped again if it takes as long: a view whose whole run takes longer needs PONDRA_VIEW_RUN_SECS raised (0: no limit)"))))
 }
@@ -2159,7 +2160,7 @@ mod tests {
         let flag = std::sync::Arc::new(std::sync::Mutex::new(None));
         let seen = flag.clone();
         let started = std::time::Instant::now();
-        let err = bounded_by(1, async move {
+        let err = bounded_by(std::time::Duration::from_secs(1), async move {
             *seen.lock().unwrap() = crate::audit::stop();
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             Ok(())
@@ -2170,7 +2171,7 @@ mod tests {
         assert!(err.to_string().contains("needs PONDRA_VIEW_RUN_SECS raised (0: no limit)"), "{err:#}"); // (11-01 audit L10: says what to do)
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "stopped at its deadline, not when it would end");
         assert!(flag.lock().unwrap().as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst)));
-        assert!(bounded_by(0, async { Ok(()) }).await.is_ok(), "0: no limit");
+        assert!(bounded_by(std::time::Duration::ZERO, async { Ok(()) }).await.is_ok(), "0: no limit");
     }
 
     #[tokio::test]

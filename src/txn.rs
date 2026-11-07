@@ -460,7 +460,7 @@ fn mark_of(t: &mut Txn, name: &str) -> Result<usize> {
 
 /// How long a transaction may sit idle before the idle timeout ends it (`PONDRA_TXN_IDLE_SECS`, 600).
 fn idle_limit() -> Duration {
-    Duration::from_secs(crate::env::value("PONDRA_TXN_IDLE_SECS"))
+    crate::env::secs("PONDRA_TXN_IDLE_SECS")
 }
 
 /// The error for a session whose transaction the idle timeout ended (25P03): its writes were dropped, so its statements

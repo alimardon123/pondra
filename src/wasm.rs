@@ -99,11 +99,14 @@ fn engine() -> &'static Engine {
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub mb: usize,
-    pub secs: u64,
+    pub secs: f64, // (fractions too: `PONDRA_EXTENSION_SECS`)
 }
 
+/// A batch's time as the engine's epoch deadline: in ticks, at least one.
+fn ticks(secs: f64) -> u64 { ((secs * 1000.0 / TICK.as_millis() as f64).ceil() as u64).max(1) }
+
 impl Limits {
-    pub fn now() -> Self { Limits { mb: crate::env::value::<usize>("PONDRA_EXTENSION_MB"), secs: crate::env::value::<u64>("PONDRA_EXTENSION_SECS").max(1) } }
+    pub fn now() -> Self { Limits { mb: crate::env::value::<usize>("PONDRA_EXTENSION_MB"), secs: crate::env::secs("PONDRA_EXTENSION_SECS").as_secs_f64() } }
 }
 
 /// What a call's store holds: its memory's limit and whether the call reached it, and for its log lines the extension's name
@@ -195,7 +198,7 @@ impl wasmtime::ResourceLimiter for Held {
 fn store(limits: Limits, who: &str) -> Store<Held> {
     let mut store = Store::new(engine(), Held { max_bytes: limits.mb << 20, memory: 0, full: false, who: who.to_string(), lines: 0 });
     store.limiter(|held| held);
-    store.set_epoch_deadline(limits.secs * 1000 / TICK.as_millis() as u64);
+    store.set_epoch_deadline(ticks(limits.secs));
     store
 }
 
@@ -375,7 +378,7 @@ impl Rows {
         if !self.open {
             return Ok(None);
         }
-        self.store.set_epoch_deadline(self.limits.secs * 1000 / TICK.as_millis() as u64); // (its time is each batch's)
+        self.store.set_epoch_deadline(ticks(self.limits.secs)); // (its time is each batch's)
         let out = match self.instance.call_next(&mut self.store, self.handle) {
             Ok(out) => out,
             Err(e) => {
@@ -468,11 +471,11 @@ mod tests {
         let w = words();
         let n: ArrayRef = Arc::new(Int64Array::from(vec![1]));
         let started = std::time::Instant::now();
-        let e = w.call_with("spin", &[n.clone()], 1, Limits { mb: 256, secs: 1 }).unwrap_err();
+        let e = w.call_with("spin", &[n.clone()], 1, Limits { mb: 256, secs: 1.0 }).unwrap_err();
         assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("57014", "words's spin ran past 1 s, its time for one batch (PONDRA_EXTENSION_SECS)".to_string()));
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "stopped at its time: {:?}", started.elapsed());
         let big: ArrayRef = Arc::new(Int64Array::from(vec![64]));
-        let e = w.call_with("hog", &[big.clone()], 1, Limits { mb: 32, secs: 30 }).unwrap_err();
+        let e = w.call_with("hog", &[big.clone()], 1, Limits { mb: 32, secs: 30.0 }).unwrap_err();
         assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("53200", "words's hog passed 32 MB, an extension's memory (PONDRA_EXTENSION_MB)".to_string()));
         assert_eq!(w.call("hog", &[big], 1).unwrap().as_any().downcast_ref::<Int64Array>().unwrap().value(0), 64 << 20, "under the default 256 MB it answers");
         let text: ArrayRef = Arc::new(StringArray::from(vec!["still here"]));

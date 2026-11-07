@@ -129,8 +129,8 @@ pub fn staged_for(name: &str) -> Option<&str> {
 /// Is a staged table left behind (a node died between its define and its replace) and old enough to
 /// let go? `made_ms` is when it was made; a replace takes seconds, so `secs` (PONDRA_STAGED_SECS) is
 /// far past any statement still running.
-pub fn stale_staged(name: &str, made_ms: u64, now_ms: u64, secs: u64) -> bool {
-    staged_for(name).is_some() && now_ms.saturating_sub(made_ms) >= secs.saturating_mul(1000)
+pub fn stale_staged(name: &str, made_ms: u64, now_ms: u64, ms: u64) -> bool {
+    staged_for(name).is_some() && now_ms.saturating_sub(made_ms) >= ms
 }
 
 #[cfg(test)]
@@ -151,9 +151,9 @@ mod tests {
     #[test]
     fn a_staged_table_is_stale_only_past_its_time() {
         let name = staged("t", "job-1");
-        assert!(!stale_staged(&name, 1_000, 1_000 + 86_399_999, 86_400));
-        assert!(stale_staged(&name, 1_000, 1_000 + 86_400_000, 86_400));
-        assert!(!stale_staged("t", 0, u64::MAX, 86_400), "a table that isn't staged is never stale");
+        assert!(!stale_staged(&name, 1_000, 1_000 + 86_399_999, 86_400_000));
+        assert!(stale_staged(&name, 1_000, 1_000 + 86_400_000, 86_400_000));
+        assert!(!stale_staged("t", 0, u64::MAX, 86_400_000), "a table that isn't staged is never stale");
     }
 }
 

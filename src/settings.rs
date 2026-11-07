@@ -30,7 +30,8 @@ pub enum Kind {
     Bool,
     Int,
     Float,
-    /// Seconds (fractions too), and the others: the unit is the name's ending.
+    /// Seconds, read through `env::secs`, and the others: the unit is the name's ending. Seconds, hours and GB take
+    /// fractions; milliseconds, days, KB and MB are whole, as their readers read them (`Setting::reads`).
     Secs,
     Ms,
     Hours,
@@ -126,11 +127,12 @@ impl Setting {
         }
     }
 
-    /// Does `v` read as a value of its kind: a number for a number, 0 or more (a time and a size take fractions)?
+    /// Does `v` read as a value of its kind, as its readers read it: a number for a number, 0 or more (seconds, hours and GB
+    /// take fractions, the other units are whole)?
     pub fn reads(&self, v: &str) -> bool {
         match self.kind {
-            Kind::Int => v.trim().parse::<u64>().is_ok(),
-            Kind::Float | Kind::Secs | Kind::Ms | Kind::Hours | Kind::Days | Kind::Kb | Kind::Mb | Kind::Gb => v.trim().parse::<f64>().is_ok_and(|n| n >= 0.0 && n.is_finite()),
+            Kind::Int | Kind::Ms | Kind::Days | Kind::Kb | Kind::Mb => v.trim().parse::<u64>().is_ok(),
+            Kind::Float | Kind::Secs | Kind::Hours | Kind::Gb => v.trim().parse::<f64>().is_ok_and(|n| n >= 0.0 && n.is_finite()),
             _ => true,
         }
     }
@@ -229,7 +231,7 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_LEARN", Bool, No),
     node("PONDRA_LEARN_MS", Ms, Is("100")),
     node("PONDRA_LINK", List, No),
-    node("PONDRA_LOAD_RETENTION_SECS", Secs, No),
+    node("PONDRA_LOAD_RETENTION_SECS", Secs, Is("5529600")), // (64 days, as Snowflake keeps its load metadata)
     node("PONDRA_LOCK_LEASE_SECS", Secs, Is("60")),
     node("PONDRA_MATCH_HELD_ROWS", Int, Is("1000000")),
     node("PONDRA_MATCH_RUN_ROWS", Int, Is("1000000")),
@@ -259,7 +261,7 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_SECRET_KEY_PREVIOUS", Secret, No),
     node("PONDRA_SERVE_STORE", Bool, No).flag("reader", "Serve this lake's store to nodes on other machines, which open it as \
         pondra://host:port. Needs an admin token, the same on every node; this node leads the lake. A folder or :memory: only."),
-    node("PONDRA_SESSION_HOURS", Hours, No),
+    node("PONDRA_SESSION_HOURS", Hours, Is("12")),
     node("PONDRA_SESSION_IDLE_SECS", Secs, Is("3600")),
     node("PONDRA_SHARED_KEY_FILE", Path, No),
     node("PONDRA_SHARE_FILES_PER_MINUTE", Int, Is("10000")),
@@ -414,16 +416,18 @@ mod tests {
         assert!(gb.reads("1.5") && gb.reads(" 0 ") && !gb.reads("-1") && !gb.reads("inf") && !gb.reads("NaN") && !gb.reads("lots"));
         assert!(n.reads("3") && !n.reads("1.5") && !n.reads("-1"));
         assert!(path.reads("-1") && path.reads(""));
+        let (secs, mb) = (find("PONDRA_TXN_IDLE_SECS").unwrap(), find("PONDRA_CACHE_MB").unwrap());
+        assert!(secs.reads("0.5") && mb.reads("512") && !mb.reads("0.5"), "seconds take fractions, MB are whole, as their readers read them");
     }
 
-    /// A default reads as its kind, so `env::value` never meets one it can't.
+    /// A default reads as its kind, as its readers read it (`reads`), so `env::value` and `env::secs` never meet one they
+    /// can't (11-06 audit L10: a fraction for a whole kind).
     #[test]
     fn defaults_read() {
         for s in all() {
             let Some(v) = s.default() else { continue };
             let ok = match s.kind {
-                Int => v.parse::<u64>().is_ok(),
-                Float | Secs | Ms | Hours | Days | Kb | Mb | Gb => v.parse::<f64>().is_ok_and(|n| n >= 0.0),
+                Int | Float | Secs | Ms | Hours | Days | Kb | Mb | Gb => s.reads(&v) && v == v.trim(),
                 Switch | Bool | Secret | Path | Paths => false, // (unset is off, or none)
                 Text | List | Url => !v.is_empty(),
             };

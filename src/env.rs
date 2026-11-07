@@ -177,9 +177,15 @@ pub fn device_line() -> Option<usize> {
 }
 
 /// A setting in seconds (fractions too), else its default in the table: one that is negative or not a number is the
-/// default too.
+/// default too. Every `Secs` setting is read through this, or `secs_given` (`settings::Kind::Secs`).
 pub fn secs(name: &str) -> Duration {
-    parse::<f64>(name).and_then(|s| Duration::try_from_secs_f64(s).ok()).unwrap_or_else(|| Duration::from_secs_f64(default_as(name)))
+    secs_given(name).unwrap_or_else(|| Duration::from_secs_f64(default_as(name)))
+}
+
+/// A setting in seconds (fractions too), or None when it isn't set or isn't a time: for one with no default in the table,
+/// whose reader says what unset is.
+pub fn secs_given(name: &str) -> Option<Duration> {
+    parse::<f64>(name).and_then(|s| Duration::try_from_secs_f64(s).ok())
 }
 
 /// A switch: on for `1`, `true`, `on` or `yes`.

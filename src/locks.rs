@@ -318,7 +318,7 @@ crate::per_node!(static TABLES: Mutex<HashMap<String, Arc<Mutex<Table>>>> = Defa
 /// How long a holder's lock lasts without a request from it (`PONDRA_LOCK_LEASE_SECS`, 60). A transaction
 /// renews its locks every third of it (`txn::upkeep`), so an idle session keeps them while it lives.
 pub fn lease() -> Duration {
-    Duration::from_secs(crate::env::value("PONDRA_LOCK_LEASE_SECS"))
+    crate::env::secs("PONDRA_LOCK_LEASE_SECS")
 }
 
 fn table(lake: &str) -> Arc<Mutex<Table>> {

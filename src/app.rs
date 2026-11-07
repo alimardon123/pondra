@@ -131,8 +131,7 @@ struct Turns {
 
 static TURNS: std::sync::LazyLock<Turns> = std::sync::LazyLock::new(|| {
     let most = crate::env::value::<usize>("PONDRA_QUERIES").max(1);
-    let wait = crate::env::value::<f64>("PONDRA_QUEUE_SECS");
-    Turns { turns: tokio::sync::Semaphore::new(most), most, wait: Duration::from_secs_f64(wait.max(0.0)) }
+    Turns { turns: tokio::sync::Semaphore::new(most), most, wait: crate::env::secs("PONDRA_QUEUE_SECS") }
 });
 
 /// A turn for one query, once it is its turn (in line, counted as waiting), or 53300.
