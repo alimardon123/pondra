@@ -347,8 +347,8 @@ fn record(app: &App, class: &'static str, sql: &str, outcome: &'static str, erro
     let (user, door, from) = who.map_or((String::new(), "node", None), |p| (p.name, p.door, p.from.map(|a| a.to_string())));
     let statement = crate::audit::redacted(sql, class);
     if slow && !page {
-        // (a library's host or a `pondra sql` guest doesn't print it: `node::say`. It is in pondra.history)
-        crate::node::say(format!("slow statement: {} ms, {user} by {door}{}: {}", took.as_millis(), note.nodes.map(|n| format!(" on {n} nodes")).unwrap_or_default(), cut(statement.replace('\n', " "), 300)));
+        // (a library's host or a `pondra sql` guest doesn't print it: `Lifecycle::say`. It is in pondra.history)
+        app.lake.life.say(&format!("slow statement: {} ms, {user} by {door}{}: {}", took.as_millis(), note.nodes.map(|n| format!(" on {n} nodes")).unwrap_or_default(), cut(statement.replace('\n', " "), 300)));
     }
     let line = Line { at: crate::log::now_ms(), id: crate::runs::new_id(), user, door, from, session: crate::temp::current(), class, statement, sql: sql.to_string(), outcome, error, ms: took.as_millis() as i64, note };
     let tx = WRITER.get_or(|| writer(app, TABLE, crate::ddl::Ddl::HistoryLog, Duration::from_secs(1), batch));

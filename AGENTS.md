@@ -669,7 +669,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `query::register_views` again). A `ViewTable` keeps the table it was planned over; planned
    over whole tables, a spread query over a view counted every row once per node
    (`harness.py schemas`: "queries over views spread" fails without it).
-52. **A follower that finds no catalog starts over** (`cli.rs`: `node::restart`). A new lake's
+52. **A follower that finds no catalog starts over** (`node/run.rs`: `Lifecycle::restart`). A new lake's
    leader may not have made it yet, or may have died first; the restart waits for the one or
    takes over from the other when its mark is stale. Exiting instead lost a node of the R2
    cluster bench (`cluster.py race`: "a leader that never made the catalog").
@@ -1528,7 +1528,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 206. **A service's node stops the way a node stops** (`service.rs`): systemd and launchd send
    SIGTERM; on Windows the supervisor closes the child's standard input (invariant 46), and a
    node that must restart to rejoin exits 75 for the supervisor to start it again
-   (`node::restart` under `PONDRA_SUPERVISED`), never a process the service manager doesn't
+   (`Lifecycle::restart` under `PONDRA_SUPERVISED`), never a process the service manager doesn't
    know. `deploy_check.py service` on all three (deploy.yml): "killed, its manager starts it again,
    with its rows", "installed again with other options: stopped, started on its new port, with its
    rows".
@@ -2314,20 +2314,28 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `tests/node_twice.rs`: lake B after lake A in one process has none of A's users, tables, history,
    counters, format or hot columns, and three more opens leave no threads, files or tasks behind
    (the runtime's alive tasks: with the compactor and collector left running, 13 then 19).
+   Redesign step 2 moves this state off statics onto values the code already holds, so two nodes
+   can run in one process at once: a node's on its `Node`, a lake's on its `Lake`, and what the host
+   does when a node must stop or start again on the `Lifecycle` every lake and member is handed
+   (`lifecycle.rs`; code below the hosts asks it for facts, never which form it runs in). A new
+   piece of node or lake state goes there, never in a new static: a DataFusion task (a UDF, a table
+   provider) reaches its node and lake through its session's config (`SessionConfig::with_extension`,
+   read from its `TaskContext`), and a task a library spawns for us (SlateDB, hyper) gets a clone of
+   what it needs when it is spawned.
 
 302. **Every setting is read through `env.rs`, from one table of names** (ADR-061 §8): what the
    process was given (`open`'s options, the command line's flags: `env::give`), else the
    environment, and an empty value is no value. Nothing sets the environment (`set_var`): beside a
    library's host it is a data race, so a Pondra process it starts gets what it was given as its
    environment (`env::given()`), and `pondra sql`'s job and tries go to its next run through
-   `node::restart_with`. The first `give` fixes the settings; a later one may repeat a setting,
+   `Lifecycle::restart`'s `carried`. The first `give` fixes the settings; a later one may repeat a setting,
    never change one, and each it would change is named, as is a name that isn't a setting (with the
    nearest one). `tools/per_node_check.py` fails a `PONDRA_*` name read past `env.rs` (by its text,
    or through a constant that names it), a name its `NAMES` doesn't list, a listed name nothing
    reads, and any `set_var`. `cargo test --lib env::`.
 303. **A node in a library never takes its host's process down** (`library.rs`, ADR-061 §5): what the
-   program does by exec, abort or exit, a library does to the node alone. `node::restart_with`
-   halts the node and starts it again in place (`node::restart`: its lock file says
+   program does by exec, abort or exit, a library does to the node alone. Its `Lifecycle::restart`
+   (`node::Native`) halts the node and starts it again in place (its lock file says
    `restarting`, then a `Restarting` unwind that `panics::spawn` lets go and a door answers as 57P03);
    a vital loop's panic, the catalog's compactor failing and a lake newer than the build stop the
    node with the reason (`node::failed`), and every request is then 57P03 with it until it is

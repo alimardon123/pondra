@@ -1841,7 +1841,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn own_file_takes_no_escaped_dot_dot() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-own-file-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         let files = format!("{}/files", lake.url.trim_end_matches('/'));
         assert!(own_file(&lake, &format!("{files}/orders.csv")));
         assert!(!own_file(&lake, &format!("{files}/%2E%2E/catalog")), "an escaped .. reaches past files/");
@@ -1853,7 +1853,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn own_stage_takes_only_the_callers_slug_and_no_escaped_dot_dot() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-own-stage-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         let stage = format!("{}/stage", lake.url.trim_end_matches('/'));
         let ali = crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Write, access: None, door: "http", from: None, operator: false };
         assert!(!own_stage(&lake, &format!("{stage}/616c69/j1/*.parquet")), "with no sign-in, none");
@@ -1908,7 +1908,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_relative_name_is_the_lakes_file_for_a_client_and_the_owners_folder_for_its_program() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-relative-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         lake.put("files/orders.csv", b"id,qty\n1,2\n2,5\n".to_vec()).await?;
         for sql in ["SELECT sum(qty) AS q FROM 'orders.csv'", "SELECT sum(qty) AS q FROM './orders.csv'"] {
             assert_eq!(one_int(&run(&lake, false, sql).await?), 7, "{sql}");
@@ -1941,7 +1941,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_blob_url_is_refused_by_name_off_the_page() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-blob-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         for owner in [true, false] {
             for sql in ["SELECT * FROM read_csv('blob:https://o/6f1c')", "SELECT * FROM read_csv('blob:nodedata:6f1c')", "SELECT * FROM read_csv('BLOB:https://o/6f1c')"] {
                 let err = run(&lake, owner, sql).await.unwrap_err();

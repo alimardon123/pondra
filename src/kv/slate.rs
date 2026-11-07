@@ -36,14 +36,14 @@ impl Writer {
     /// The catalog as its leader opens it: the bucket's `catalog` database for writing, with its block caches and its
     /// compactor and garbage collector, started once the node serves. `local`: a folder, where each write's WAL is
     /// flushed at once.
-    pub(crate) async fn open(store: Store, cache_dir: Option<PathBuf>, local: bool) -> Result<Writer, Error> {
+    pub(crate) async fn open(store: Store, cache_dir: Option<PathBuf>, local: bool, life: crate::lifecycle::Life) -> Result<Writer, Error> {
         // Poll object storage rarely when idle (that's an idle writer's request bill), but often
         // enough that compaction keeps up with the checkpoints. A one-off writer (a guest that leads) lives for
         // its statement, and runs the compactor only when it tidies (`App::tidy_one_off`, a CHECKPOINT), and waits
         // for it: there each of a compaction's steps (scheduled, picked up by the worker, committed) is looked for
         // every 100 ms, not every 5 s, 5 s and 1 s, so a tidy takes about a second, not 20 (a few dozen more
         // requests, once in 32 writes).
-        let compactor_options = Some(match crate::node::is_guest() {
+        let compactor_options = Some(match life.one_off() {
             true => {
                 let soon = Duration::from_millis(100);
                 let worker = CompactionWorkerOptions { compactions_poll_interval: soon, heartbeat_interval: Duration::from_secs(1), ..Default::default() };
@@ -71,7 +71,7 @@ impl Writer {
         let flushed = slatedb::BlockCachePolicy::default().with_flush_targets(&[slatedb::CacheTarget::Index, slatedb::CacheTarget::Filters]);
         let (cache, blocks) = caches();
         let db = Db::builder("catalog", store.clone()).with_settings(settings).with_db_cache(cache).with_block_cache_policy(flushed).build().await?;
-        let upkeep = upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local);
+        let upkeep = upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local, life);
         Ok(Writer { db, upkeep, blocks, flush_now: local })
     }
 }
@@ -265,7 +265,7 @@ impl slatedb::db_cache::DbCache for Blocks {
 /// The catalog's compactor and garbage collector, as SlateDB runs them beside a writer, started
 /// once the node serves (or after 10 s: a `pondra sql` writer never does), so a cold start waits
 /// for neither (C5). A failure in either stops the node, as one in the writer would.
-fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions, local: bool) -> Upkeep {
+fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions, local: bool, life: crate::lifecycle::Life) -> Upkeep {
     let compactor = slatedb::CompactorBuilder::new("catalog", store.clone()).with_options(compactor).build();
     let gc = slatedb::GarbageCollectorBuilder::new("catalog", store.clone()).with_options(gc).build();
     let (c, g, once) = (compactor.clone(), gc.clone(), gc.clone());
@@ -283,8 +283,8 @@ fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions
         if let Err(e) = tokio::try_join!(c.run(), g.run()) {
             // (a compactor fenced by a newer leader's is this node's step down, not a failure: it restarts and rejoins
             // as a follower, as a fenced write does. Stopping there left a stale leader that woke gone: harness `fence`)
-            let e = crate::store::fatal(e.into());
-            crate::node::stop(format!("the catalog's compactor or garbage collector failed: {e}"));
+            let e = crate::store::fatal(e.into(), &*life);
+            life.stop(format!("the catalog's compactor or garbage collector failed: {e}"));
         }
     });
     // (SlateDB doesn't export the collector's type, so how the two stop is kept as a future to run)

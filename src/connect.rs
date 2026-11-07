@@ -371,7 +371,7 @@ mod tests {
     use crate::write::Stmt;
 
     async fn lake() -> Result<std::sync::Arc<Lake>> {
-        Lake::open(&format!("memory://connections-{}", uuid::Uuid::new_v4().simple()), true, false).await
+        Lake::open(&format!("memory://connections-{}", uuid::Uuid::new_v4().simple()), true, false, crate::lifecycle::unhosted()).await
     }
 
     /// One statement through the core's one path: `write::parse`, then the leader's `ddl::apply`. Err: its refusal, with its code.
@@ -459,7 +459,7 @@ mod tests {
     async fn a_connections_files_are_reached_by_its_name() -> Result<()> {
         use object_store_df::ObjectStoreExt as _;
         let dir = std::env::temp_dir().join(format!("pondra-cn-{}", uuid::Uuid::new_v4().simple()));
-        let lake = Lake::open(dir.join("lake").to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.join("lake").to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         let (drop, later) = (dir.join("drop"), dir.join("later"));
         run(&lake, &format!("CREATE CONNECTION drop_zone TYPE folder WITH (url = '{}')", drop.display())).await.unwrap();
         // (the paths that take one: a file reference, a reader's list, COPY's source and target, a LOCATION)
