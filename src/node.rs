@@ -43,11 +43,13 @@ impl Default for Start {
 }
 
 /// The node stops, for good, with this reason, when its own work can't go on (a vital loop's panic, the catalog's
-/// compactor, a lake a newer Pondra wrote). In a library the node stops and the host's process stays: `failed`
-/// says why, and this returns. In the program the process ends with status 1, as a supervisor expects of a stop and
-/// with no core: what it made goes first (an exit runs no destructor).
+/// compactor, a lake a newer Pondra wrote). Where a host supervises the node, it is told (`failed`) and this returns:
+/// it stops the node as it stops it on a close, so a leader makes what it committed durable, checkpoints its catalog
+/// and gives up its term, and the next node leads at once (invariant 210). A library's host then stays; `pondra serve`
+/// then ends with status 1 (`cli.rs`). Elsewhere (a guest, a command of the command line's) the process ends here with
+/// status 1, as a supervisor expects of a stop and with no core: what it made goes first (an exit runs no destructor).
 pub(crate) fn stop(why: String) {
-    if hosted() {
+    if hosted() || supervised() {
         return failed(why);
     }
     eprintln!("stopping: {why}");
@@ -84,8 +86,8 @@ pub fn move_lake(m: Move) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Where a node's restarts and failures are sent: the supervisor of the node open now, if any. One node is open at a
-/// time in a process.
+/// Where a node's restarts and failures are sent: the supervisor of the node open now, if any (a library's, `host`, or
+/// `pondra serve`'s, `supervise`). One node is open at a time in a process.
 static SUPERVISOR: Mutex<Option<mpsc::UnboundedSender<Event>>> = Mutex::new(None);
 
 /// Is this process a library's (`host`), not the program's?
@@ -109,8 +111,8 @@ pub(crate) fn send(e: Event) {
     }
 }
 
-/// In a library, the node stops with this reason (a vital loop's panic, the compactor, a lake that moved past this
-/// build), and every request is answered with it until the node is opened again.
+/// The node's supervisor is told it stops with this reason (a vital loop's panic, the compactor, a lake that moved past
+/// this build). A library's then answers every request with it until the node is opened again; `pondra serve`'s ends.
 pub fn failed(why: String) {
     eprintln!("stopping: {why}");
     send(Event::Failed(why));
@@ -128,6 +130,18 @@ pub(crate) fn host(tx: mpsc::UnboundedSender<Event>) -> anyhow::Result<()> {
     crate::machine::set_hosted(); // (what the process is, from its first library's open: it outlives each node)
     Ok(())
 }
+
+/// `pondra serve`'s end of its nodes' failures (`stop`), taken once, before it starts its first node. Not `host`: the
+/// process is still the program's (`hosted` stays false), so a restart still runs the program again.
+#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the command line's serve takes it)
+pub(crate) fn supervise() -> mpsc::UnboundedReceiver<Event> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    *SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx);
+    rx
+}
+
+/// Is a supervisor told of this process's node's failures (`host`, `supervise`)?
+fn supervised() -> bool { SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|s| !s.is_closed()) }
 
 /// Takes the supervisor back: the library's node is closed, or its open failed.
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's close calls it)

@@ -76,7 +76,7 @@ struct Backend {
     parser: Arc<Parser>,
     session: String,
     who: std::sync::Mutex<Option<crate::auth::Principal>>, // (whoever signed in)
-    again: std::sync::Mutex<Option<(Again, std::time::Instant)>>, // (how that sign-in is checked again, and when it last was: `signed`)
+    again: std::sync::Mutex<Option<Again>>,                // (how that sign-in is checked again: `signed`)
     copy: std::sync::Mutex<Option<Pending>>,               // (its COPY FROM STDIN under way: the connection's own, so its bytes end with it)
     me: std::sync::Weak<Backend>,                          // (a statement runs on the queries' runtime: `told`)
 }
@@ -97,8 +97,6 @@ enum Again {
     Token { user: String, token: String },
 }
 
-/// How often a connection's sign-in is checked again: as `server::until_revoked` checks a stream's.
-const AGAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl PgWireServerHandlers for Pg {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> { self.0.clone() }
@@ -260,8 +258,10 @@ impl StartupHandler for Startup {
                 }
                 pgwire::api::auth::protocol_negotiation(client, startup).await?;
                 pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
+                let epoch = app.lake.cat.rights_version(); // (before it is asked: a user made after it moves the version past it)
                 if app.open().await {
-                    self.backend.signed_in(crate::auth::Principal::of(crate::auth::Role::Admin).at("postgres", Some(client.socket_addr())), Some(Again::Open));
+                    let who = crate::auth::Principal { epoch, ..crate::auth::Principal::of(crate::auth::Role::Admin) };
+                    self.backend.signed_in(who.at("postgres", Some(client.socket_addr())), Some(Again::Open));
                     return self.ready(client).await;
                 }
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
@@ -610,27 +610,25 @@ impl Backend {
     fn signed_in(&self, who: crate::auth::Principal, again: Option<Again>) {
         let again = again.filter(|_| !who.operator);
         *self.who.lock().unwrap() = Some(who);
-        *self.again.lock().unwrap() = again.map(|a| (a, std::time::Instant::now()));
+        *self.again.lock().unwrap() = again;
     }
 
-    /// Whoever signed in, as a statement runs: `who`, its sign-in checked again at most every `AGAIN`, with its role and grants
-    /// as they are now. One that no longer signs in ends the connection (FATAL 28000), as Postgres ends a session whose role
-    /// can't go on.
+    /// Whoever signed in, as a statement runs: `who`, its sign-in checked again once who may do what changed since it was
+    /// made, or its credential ended (`Principal::stale`: one load and a compare), with its role and grants as they are now.
+    /// One that no longer signs in ends the connection (FATAL 28000), as Postgres ends a session whose role can't go on.
     async fn signed(&self) -> PgWireResult<crate::auth::Principal> {
-        let due = match self.again.lock().unwrap().as_mut() {
-            Some((again, at)) if at.elapsed() >= AGAIN => {
-                *at = std::time::Instant::now();
-                Some(again.clone())
-            }
-            _ => None,
-        };
-        let Some(again) = due else { return Ok(self.who()) };
+        let who = self.who();
+        if !who.stale(&self.app.lake) {
+            return Ok(who);
+        }
+        let Some(again) = self.again.lock().unwrap().clone() else { return Ok(who) };
         Box::pin(self.signed_again(again)).await // (boxed: a statement's future doesn't carry a sign-in's)
     }
 
     /// `signed`'s check, due: whoever `again` signs in now, kept as who this connection is.
     async fn signed_again(&self, again: Again) -> PgWireResult<crate::auth::Principal> {
         let (lake, auth, was) = (&self.app.lake, &self.app.auth, self.who());
+        let epoch = lake.cat.rights_version(); // (before it is asked again, as at sign-in)
         let now = match &again {
             Again::Open => match self.app.open().await {
                 true => Ok(was.clone()),
@@ -648,7 +646,7 @@ impl Backend {
         };
         match now {
             Ok(p) => {
-                let p = p.at(was.door, was.from);
+                let p = crate::auth::Principal { epoch: p.epoch.max(epoch), ..p.at(was.door, was.from) }; // (an open lake's anyone: as it was)
                 *self.who.lock().unwrap() = Some(p.clone());
                 Ok(p)
             }
@@ -771,8 +769,8 @@ impl Backend {
         let header = p.copy.header && p.seq == 0;
         // (both formats read Postgres's UTF-8 only: a chunk that isn't is refused before any line is read)
         let text = crate::pg_bytea::checked_utf8(&chunk).map_err(|b| err(crate::codes::coded(b.code, b.message)))?;
-        // Each chunk is written by the caller as it is now: signed in again when its 5 s are up (`signed`: one signed
-        // out ends here), its rights asked again (`writer::may`), and the table's entry as it is now.
+        // Each chunk is written by the caller as it is now: signed in again once who may do what changed (`signed`: one
+        // signed out ends here), its rights asked again (`writer::may`), and the table's entry as it is now.
         let who = self.signed().await?;
         let writer = crate::writer::Writer::open(&self.app, Some(who), &p.copy.table, crate::rules::How::Load, deletes(&p.copy)).await.map_err(|r| err(r.into()))?;
         let rules = writer.rules().clone();

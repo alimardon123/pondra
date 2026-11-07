@@ -1549,8 +1549,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `PONDRA_DRAIN_SECS` (a leader's followers keep sending it flushes, and on a bucket one is always
    in flight: waiting for none held a leader the whole 30 s); a leader then waits for durability,
    checkpoints and steps down (`cluster/left/{n}`), and a follower whose leader stopped answering
-   and stepped down claims the next term without the lease. `upgrade_check.py drain` ("…sooner than
-   when it is killed"; with `--s3`, "…exits within 10 s, though its followers keep sending").
+   and stepped down claims the next term without the lease. A node whose own work fails (`node::stop`:
+   a vital loop's panic, the catalog's compactor, a lake newer than the build) is stopped the same
+   way without the drain, within 30 s, before `pondra serve` ends with 1 (a library's host stops it so
+   too). `upgrade_check.py drain` ("…sooner than when it is killed"; with `--s3`, "…exits within
+   10 s, though its followers keep sending"); `resilience_check.py catalog` ("…the stopped leader
+   gave up its term").
 211. **A key lookup reads `_deleted` only where it is valid** (`serve::lookup`): a NULL's value bit
    means nothing. `upgrade_check.py`'s "a key looked up (GET /lookup, a point query) as SQL reads it".
 212. **A hot column's batches share one allocation per file column, and a buffer several batches
