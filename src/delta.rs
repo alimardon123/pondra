@@ -66,8 +66,35 @@ pub async fn publish_named(lake: &Lake, named: &[crate::iceberg::Named<'_>]) -> 
     // A table whose metadata is as last published is skipped without loading its manifests.
     crate::per_node!(static SEEN: std::sync::Mutex<std::collections::HashMap<String, u64>> = Default::default());
     let print = |meta: &TableMeta| std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), json(meta));
+    // Only tables committed since the last call can have changed (`Catalog::written`), and a table that failed to publish
+    // is put back for the next: every table is read at the first call and once a sweep (`tier::SWEEP`). A reader reads
+    // them all: it commits nothing, so it keeps no list.
+    let written = match lake.cat.is_writer() {
+        true => lake.cat.written("publish", crate::tier::SWEEP),
+        false => None,
+    };
+    let tables: Vec<(String, TableMeta)> = match &written {
+        None => lake.cat.scan::<TableMeta>("t/", "t0").await?,
+        Some(names) => {
+            let mut names: Vec<String> = names.iter().cloned().chain(named.iter().map(|n| n.table.to_string())).collect();
+            (names.sort(), names.dedup());
+            let mut tables = vec![];
+            for name in names {
+                let key = table_key(&name);
+                match lake.cat.get::<TableMeta>(&key).await {
+                    Ok(Some(meta)) => tables.push((key, meta)),
+                    Ok(None) => {} // (dropped since)
+                    Err(e) => {
+                        lake.cat.missed("publish"); // (the next call reads every table)
+                        return Err(e);
+                    }
+                }
+            }
+            tables
+        }
+    };
     // (a staged table of a CREATE OR REPLACE TABLE is published once it has taken the old table's place: `replace::replace`)
-    let tables: Vec<_> = lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(key, _)| crate::sys::staged_for(&key[2..]).is_none()).collect();
+    let tables: Vec<_> = tables.into_iter().filter(|(key, _)| crate::sys::staged_for(&key[2..]).is_none()).collect();
     let changed: Vec<_> = tables.iter().filter(|(key, meta)| named.iter().any(|n| key[2..] == *n.table) || SEEN.lock().unwrap().get(key) != Some(&print(meta))).collect();
     // Each table's formats publish at once (Delta's PUTs must not add to Iceberg's freshness every
     // round: `freshness.py --s3`), and the table's puts extend together only if all its formats
@@ -94,17 +121,23 @@ pub async fn publish_named(lake: &Lake, named: &[crate::iceberg::Named<'_>]) -> 
         ((*key).clone(), meta, Ok(puts))
     }))
     .await;
-    let (mut puts, mut failed, mut seen): (Vec<(String, Vec<u8>)>, Vec<String>, Vec<(String, u64)>) = (vec![], vec![], vec![]);
+    let (mut puts, mut failed, mut seen, mut again): (Vec<(String, Vec<u8>)>, Vec<String>, Vec<(String, u64)>, Vec<String>) = (vec![], vec![], vec![], vec![]);
     for (key, meta, r) in done {
         match r {
             Ok(p) => { puts.extend(p); seen.push((key, print(meta))); }
-            Err(e) => failed.push(e),
+            Err(e) => { failed.push(e); again.push(key[2..].to_string()); }
         }
     }
     if !puts.is_empty() {
-        lake.cat.commit(puts, &[]).await?; // (committed before the next round reads it)
+        if let Err(e) = lake.cat.commit(puts, &[]).await { // (committed before the next round reads it)
+            lake.cat.missed("publish"); // (none of them is seen: the next call reads every table)
+            return Err(e);
+        }
     }
     SEEN.lock().unwrap().extend(seen); // (only the tables that published: a failed one retries next round)
+    if written.is_some() {
+        lake.cat.again("publish", again);
+    }
     anyhow::ensure!(failed.is_empty(), "{}", failed.join("; "));
     Ok(())
 }
