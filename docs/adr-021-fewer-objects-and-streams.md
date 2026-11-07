@@ -157,6 +157,25 @@ On one 2-vCPU box (`logs/round20/`):
 - **Hilbert order gives each column about half** of what sorting by that column alone gives; a
   table filtered almost always by one column is better clustered by that one.
 
+**Clustering counted in what a query reads** (`tools/bench/clustering_reads.py`, 2026-11-07, one 4-vCPU box, local
+disk, decoded columns kept in memory off). It uses Lindel's setup: random points (x, y), and a box 0.01 on a side. Our
+losing case is x alone, within 0.0001. Each cell gives files read of all, row groups read of all, rows decoded, and
+the median of 20 runs:
+
+| 20 M rows, 5 files | A small box | x alone |
+|---|---|---|
+| No order | 5/5, 20/20, 20 M, 128 ms | 5/5, 20/20, 20 M, 63 ms |
+| `cluster_by = 'x'` | 5/5, 5/80, 287 K, 9.7 ms | 5/5, 5/80, 123 K, 5.9 ms |
+| Hilbert (x, y) | 5/5, 5/80, 300 K, 9.2 ms | 5/5, 20/80, 1.88 M, 15.4 ms |
+| Hilbert with curve keys across files | not built yet (steps 5 and 11) | |
+
+In one file of 4 M rows, the box takes 27 / 5.9 / 5.9 ms and x alone 15 / 4.4 / 6.5 ms (no order / x / Hilbert).
+
+- **No file is skipped, whatever the clustering.** A fold sorts at most 4 M rows (`tier_table`'s `MAX_ROWS`), so
+  every file spans the whole of each clustered column, and the catalog's min/max rules none out. Inside a file, row
+  groups and pages do the work. Curve keys that hold across files (the Lindel review's pick C1) are measured against
+  these rows, and merge only if none gets slower.
+
 ## What is still open
 
 - **More of Flink:** deduplication and Top-N per key by event time, timers, pattern matching

@@ -172,6 +172,8 @@ pub fn asks(stmt: &Stmt) -> (String, Vec<Action>) {
         // staged table is defined by the leader's own steps, which no door checks: `write::create_as`)
         Stmt::Create(c) => (catalog_name(&crate::text::object(&c.name)), vec![Action::Define]),
         Stmt::Define(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => (catalog_name(t), vec![Action::Define]),
+        // (an extension's statement: the right its entry names, `statements::role`, an admin's for each today)
+        Stmt::Ddl(ds) if ds.iter().any(|d| matches!(d, crate::ddl::Ddl::Entry { .. })) && crate::statements::role(ds) == Role::Admin => (String::new(), vec![Action::Define]),
         Stmt::Ddl(_) => (String::new(), vec![Action::Define]),
         Stmt::CopyTo(..) => (String::new(), vec![Action::Export]),
         // (a statement written wrong, or a temporary object of another session's: its own answer says why)
