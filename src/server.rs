@@ -123,6 +123,9 @@ pub fn router(app: App) -> Router {
 /// (see `udf.rs`): `{"flight": "http://host:port", "args": ["Binary"], "returns": "Utf8"}`.
 /// `DELETE /functions/<name>` takes it away; `GET /functions` lists them.
 async fn create_function(State(app): State<App>, Path(name): Path<String>, body: Bytes) -> Result<Json<Value>, E> {
+    if let Some(says) = crate::kept::function_named(&name) {
+        return Err(E(crate::codes::coded("0A000", says))); // (a name kept free for 1.1, as SQL refuses it: `kept.rs`)
+    }
     let udf: crate::udf::Udf = serde_json::from_slice(&body).map_err(|e| E(anyhow::anyhow!("{e}: {{\"flight\": \"http://host:port\", \"args\": [\"Binary\"], \"returns\": \"Utf8\"}}")))?;
     for t in udf.args.iter().chain([&udf.returns]) {
         crate::answer::dtype(t)?;

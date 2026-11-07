@@ -1380,6 +1380,11 @@ mod tests {
             assert_eq!(Some(got), by_the_tokenizer(text), "{text}");
         }
         assert_eq!(split("SELECT 'never closed; SELECT 2"), ["SELECT 'never closed; SELECT 2"], "the tokenizer refuses it: scanned, for the parser to say why");
+        // (11-07 audit L8: a `;` in MySQL's `/*! … */` ends nothing, whether or not a mark before it hands the text to the
+        // tokenizer, which reads the comment's words as code; a text with one is refused anyway, `text::hint`)
+        for (text, n) in [("SELECT 1 /*! ; SELECT 2 */", 1), ("SELECT E'x' /*! ; SELECT 2 */", 1), ("SELECT E'x' /*! 'a;b' */ ; SELECT 3 /*!*/", 2), ("SELECT `a` /*!50110 ; */ ; SELECT ';/*!'", 2)] {
+            assert_eq!(split(text).len(), n, "{text}: {:?}", split(text));
+        }
         // Texts made of the pieces hand and tokenizer could read apart (`text::differs`), each split as the tokenizer
         // splits it.
         let parts = ["SELECT 1", ";", " ", "'a;b'", "'it''s'", "E'x\\';'", "\"c;d\"", "`e;f`", "-- g;\n", "/* h; */", "/* i /* j */ ; */", "$$k;l$$", "$t$m;n$t$", "v$x", "q'[o;p]'", "'faq'", "U&'d\\0061;'", "DATE'2026'", "\n", "x", "(", ")", "$1", "X'\\';'", "r'''g;'h'''", "R\"\"\"i;\"j\"\"\"", "#'k;'", "//* l; */", "|/* m; */", "#-- n;\n", "@/* o; */", "$1$p;$1$", "a$q$;$q$"];

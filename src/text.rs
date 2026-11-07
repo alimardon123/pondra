@@ -521,7 +521,7 @@ fn stretch_of(t: &Token) -> Stretch {
 /// Read by hand at a byte loop's speed (a bulk INSERT's 7 MB in about 10 ms, where the tokenizer takes about 200), and
 /// from where the two might read it otherwise (`differs`) on, by the tokenizer's tokens; if it refuses the text (an
 /// unclosed string), by hand throughout. (One exception: MySQL's `/*! … */`, which sqlparser reads as code, is a comment
-/// here, as Postgres and DuckDB read it; every door refuses a text with one, `hint`.) Each look at a script's text by hand reads it here: its split at `;`s
+/// here both ways, as Postgres and DuckDB read it; every door refuses a text with one, `hint`.) Each look at a script's text by hand reads it here: its split at `;`s
 /// (`routines::pieces`), its blocks (`script::tokens`), its `$name`s (`vars::names`). So none tells strings and comments
 /// apart its own way (11-06 audit M7).
 pub(crate) fn stretches(text: &str, mut f: impl FnMut(Stretch, std::ops::Range<usize>)) {
@@ -564,20 +564,53 @@ pub(crate) fn quiet_token(text: &str, t: &Tokens, j: usize) -> Option<(Stretch, 
 }
 
 /// `stretches` from byte `from` on, by the tokenizer's tokens (`from` ends what the two read alike: a token starts there).
+/// MySQL's `/*! … */` is a comment here too, as the hand reads it (`hints`): the tokenizer reads its words as code, so
+/// without this a text was split at a `;` in one only when a mark before it had handed the text to the tokenizer
+/// (`SELECT E'x' /*! ; SELECT 2 */` two pieces, `SELECT 1 /*! ; SELECT 2 */` one: 11-07 audit L8).
 fn by_tokens(text: &str, t: &Tokens, from: usize, mut f: impl FnMut(Stretch, std::ops::Range<usize>)) {
-    let mut code = from;
-    for j in t.start.partition_point(|&s| s < from)..t.toks.len() {
-        if let Some((s, r)) = quiet_token(text, t, j) {
-            if r.start > code {
-                f(Stretch::Code, code..r.start);
-            }
-            code = r.end;
-            f(s, r);
+    let (hints, mut h, mut code) = (hints(text, t, from), 0, from);
+    let mut quiet = |s: Stretch, r: std::ops::Range<usize>, code: &mut usize| {
+        if r.start > *code {
+            f(Stretch::Code, *code..r.start);
         }
+        *code = r.end;
+        f(s, r);
+    };
+    for j in t.start.partition_point(|&s| s < from)..t.toks.len() {
+        while h < hints.len() && hints[h].end <= t.start[j] {
+            quiet(Stretch::Comment, hints[h].clone(), &mut code);
+            h += 1;
+        }
+        if h < hints.len() && t.start[j] >= hints[h].start {
+            continue; // (a hint's own words: the tokenizer places them from where it starts on)
+        }
+        if let Some((s, r)) = quiet_token(text, t, j) {
+            quiet(s, r, &mut code);
+        }
+    }
+    for r in &hints[h..] {
+        quiet(Stretch::Comment, r.clone(), &mut code);
     }
     if code < text.len() {
         f(Stretch::Code, code..text.len());
     }
+}
+
+/// The bytes of each MySQL `/*! … */` in `text` from byte `from` on, as the tokenizer reads one (`hint`: not in a token
+/// that starts before it), each to its comment's end.
+fn hints(text: &str, t: &Tokens, from: usize) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = vec![];
+    if !text[from..].contains("/*!") {
+        return out;
+    }
+    for (p, _) in text[from..].match_indices("/*!").map(|(p, m)| (from + p, m)) {
+        let j = t.start.partition_point(|&s| s < p);
+        if out.last().is_some_and(|r| p < r.end) || j > 0 && t.end[j - 1] > p {
+            continue; // (inside a hint, or inside a string, a quoted name or another comment)
+        }
+        out.push(p..p + comment_end(&text[p..]));
+    }
+    out
 }
 
 // (the bytes a comment, a string, a quoted name or a dollar body starts with: none is a byte of a longer character)
@@ -795,6 +828,28 @@ mod tests {
             "SELECT 'it''s', \"a\"\"b\", `c``d`, $$e$$, $f$g$f$, N'h', B'i', b\"j\" -- k\n",
         ] {
             assert_eq!(Some(read(sql)), by_tokens(sql), "{sql}");
+        }
+        // (11-07 audit L8: MySQL's `/*! … */` is a comment both ways, where the hand reads it and after a mark that hands
+        // the text to the tokenizer, which reads its words as code)
+        for sql in ["SELECT 1 /*! ; SELECT 2 */ x", "SELECT E'x' /*! ; SELECT 2 */ x", "SELECT E'x' /*! 'a;b' */ ; 3 /*!*/", "SELECT E'x', '/*!' /* /*! */ */ /*!50110 a */"] {
+            let got = read(sql);
+            let hand: Vec<Stretch> = {
+                let (mut out, mut at) = (vec![Stretch::Code; sql.len()], 0);
+                while let Some(j) = sql[at..].find(|c: char| c.is_ascii() && MARKS[c as usize]) {
+                    match quiet_at(sql, at + j) {
+                        Some((end, st)) => {
+                            out[at + j..end].fill(st);
+                            at = end;
+                        }
+                        None => at += j + 1,
+                    }
+                }
+                out
+            };
+            assert_eq!(got, hand, "{sql}: as the hand reads it");
+            for (p, _) in sql.match_indices("/*!").filter(|(p, _)| !sql[..*p].ends_with("'") && !sql[..*p].ends_with("/* ")) {
+                assert_eq!(got[p], Stretch::Comment, "{sql}: the `/*!` at {p} is a comment");
+            }
         }
         let parts = ["SELECT 1", ";", " ", "'a'", "'it''s'", "E'x\\''", "X'\\''", "\"c\"", "`e`", "-- g\n", "/* h */", "/* i /* j */ */", "$$k$$", "$t$m$t$", "v$x", "q'[o'p]'", "r'''q'r'''", "U&'d\\0061'", "DATE'2026'", "#", "@", "/", "|", "-", "*", "\n", "x", "(", "$1", "$1$", "$a$", "é", "e", "'"];
         let mut seed = 20261107u64;
