@@ -13,7 +13,8 @@ name: r2-sweep
 # in the day), limits-r2's check and cost about 20,000 a run (so they run on Sundays). Storage
 # rarely does: a soak day's lake ends at 0.16 GB, and every run deletes its own.
 #
-# Mondays, once when this file or the tool changes on main, and by hand (`dry`: list only).
+# Mondays, once when this file or the tool changes on main, and by hand (`dry`: list only), on main
+# alone: a run started on another branch would run that branch's clean_bucket.py with the R2 keys (11-06 audit L6).
 on:
   schedule:
     - cron: "41 4 * * 1"
@@ -36,6 +37,7 @@ permissions:
 
 jobs:
   sweep:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
