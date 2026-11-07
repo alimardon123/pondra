@@ -31,7 +31,7 @@ pub async fn accept(lake: &crate::store::Lake, name: &str, url: &str, mut option
         crate::ext::create(lake, &format!("share_{name}"), params, true, false).await?;
     }
     let token = crate::ext::share_token(lake, endpoint).await?.with_context(|| format!("no token for {endpoint}: ATTACH '<the share's profile>' AS {name} (TYPE share), or add TOKEN '…'"))?;
-    let r = crate::fetch::send(crate::fetch::timeout(own_web().get(format!("{endpoint}/shares")).bearer_auth(&token), std::time::Duration::from_secs(15))).await.with_context(|| format!("reaching {endpoint}"))?;
+    let r = crate::fetch::send(crate::net::timeout(lake.node.net.client(OWN).get(format!("{endpoint}/shares")).bearer_auth(&token), std::time::Duration::from_secs(15))).await.with_context(|| format!("reaching {endpoint}"))?;
     ensure!(!r.status().is_redirection(), "{endpoint} sent its shares' list off its own address: a provider's own calls stay on it");
     let (status, body) = (r.status(), r.json::<Value>().await.unwrap_or_default());
     ensure!(status.is_success(), "{endpoint} says {status}: {}", body["message"].as_str().unwrap_or_default());
@@ -59,7 +59,8 @@ pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> a
         ask["version"] = j!(v.parse::<i64>().with_context(|| format!("version is a number, not {v}"))?);
     }
     let at = format!("{endpoint}/shares/{}/schemas/{}/tables/{}/query", o("share"), o("schema"), o("table"));
-    let r = crate::fetch::send(own_web().post(&at).bearer_auth(&token).header("delta-sharing-capabilities", "responseformat=delta,parquet;readerfeatures=deletionvectors,columnmapping,timestampntz").json(&ask)).await.with_context(|| format!("reaching {endpoint}"))?;
+    let ask = lake.node.net.client(OWN).post(&at).bearer_auth(&token).header("delta-sharing-capabilities", "responseformat=delta,parquet;readerfeatures=deletionvectors,columnmapping,timestampntz").json(&ask);
+    let r = crate::fetch::send(crate::net::timeout(ask, LIMIT)).await.with_context(|| format!("reaching {endpoint}"))?;
     let status = r.status();
     ensure!(!status.is_redirection(), "{at}: sent off the provider's own address: a provider's own calls stay on it");
     let delta = r.headers().get("delta-sharing-capabilities").and_then(|v| v.to_str().ok()).is_some_and(|c| c.contains("responseformat=delta"));
@@ -71,7 +72,7 @@ pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> a
     // (a link on the provider's own origin, its scheme, host and port, is reached as the provider is, its admin having
     // named it, and so is one that a secret an admin made covers by its SCOPE (a provider's files in a bucket of a
     // network both reach); any other only on the public internet, every address and redirect checked as it is reached:
-    // `public::web`)
+    // the `Public` policy)
     let origin = url::Url::parse(endpoint).ok().map(|u| u.origin());
     let secrets = crate::ext::list(lake).await?;
     let named = |u: &str| crate::ext::covering(&secrets, u).is_some_and(|(_, s)| s.scope.is_some() && (!s.temporary || s.trusted));
@@ -79,7 +80,7 @@ pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> a
         let at = url::Url::parse(u).with_context(|| format!("{endpoint}: a link that isn't a URL"))?;
         let own = origin.as_ref().is_some_and(|o| o.is_tuple() && *o == at.origin()) || named(u);
         if !own {
-            crate::public::check(&at).with_context(|| format!("{endpoint} links to {}", at.host_str().unwrap_or_default()))?;
+            crate::net::check(&at).with_context(|| format!("{endpoint} links to {}", at.host_str().unwrap_or_default()))?;
         }
         Ok(format!("share://{}/{}", if own { "files" } else { "public" }, base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, u)))
     };
@@ -99,37 +100,28 @@ pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> a
         }
         Ok(add)
     }).collect::<anyhow::Result<_>>()?;
-    lake.rt.register_object_store(&url::Url::parse("share://files")?, Arc::new(Links { public: false }));
-    lake.rt.register_object_store(&url::Url::parse("share://public")?, Arc::new(Links { public: true }));
+    let (own, outside) = (lake.node.net.client(OWN), lake.node.net.client(crate::net::Policy::Public));
+    lake.rt.register_object_store(&url::Url::parse("share://files")?, Arc::new(Links { public: false, own: own.clone(), outside: outside.clone() }));
+    lake.rt.register_object_store(&url::Url::parse("share://public")?, Arc::new(Links { public: true, own, outside }));
     crate::read_delta::table(endpoint, &protocol, &metadata, adds.iter()).map(crate::ext::table_meta)
 }
 
-/// The client for a provider's own calls (its `/shares`, its tables' `/query` and links on its own origin): a redirect
-/// is followed on that origin (scheme, host and port) alone, and one elsewhere is handed back unfollowed, refused or
-/// reached as the public internet is (`public::web`): a provider can't send this node to an address of its network
-/// (audit 10-30 M8). On a page it is the web client, as `public::web` is.
-fn own_web() -> &'static reqwest::Client {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-        CLIENT.get_or_init(|| {
-            let same = reqwest::redirect::Policy::custom(|to| match to.previous().len() >= 10 {
-                true => to.error("more than 10 redirects"),
-                false if to.previous().first().is_some_and(|first| first.origin() == to.url().origin()) => to.follow(),
-                false => to.stop(),
-            });
-            reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).redirect(same).build().expect("an HTTP client")
-        })
-    }
-    #[cfg(target_arch = "wasm32")]
-    crate::ext::web()
-}
+/// The policy of a provider's own calls (its `/shares`, its tables' `/query` and links on its own origin): a redirect is
+/// followed on that origin (scheme, host and port) alone, and one elsewhere is handed back unfollowed, refused or reached
+/// as the public internet is (the `Public` policy): a provider can't send this node to an address of its network (audit
+/// 10-30 M8).
+const OWN: crate::net::Policy = crate::net::Policy::Endpoint { origin_only: true };
+
+/// A provider's call's time limit, and a link's read's.
+const LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The files a provider links to (`share://files/<link, base64url>`, or `share://public/…` for a link off its own host):
 /// read with a GET of the link and the range asked, as a bucket would answer it. Links end, so nothing of them is kept.
 #[derive(Debug)]
 struct Links {
-    public: bool, // (reached only on the public internet: `public::web`)
+    public: bool, // (reached only on the public internet: `outside`)
+    own: reqwest::Client,
+    outside: reqwest::Client,
 }
 
 impl std::fmt::Display for Links {
@@ -171,14 +163,14 @@ impl object_store_df::ObjectStore for Links {
             (None, _) => object_store::GetRange::Offset(0),
         };
         let range = byte_range::header(&want);
-        let web = if self.public { crate::public::web() } else { own_web() };
-        let mut r = crate::fetch::send(web.get(&url).header("range", &range)).await.map_err(links_error)?;
+        let web = if self.public { &self.outside } else { &self.own };
+        let mut r = crate::fetch::send(crate::net::timeout(web.get(&url).header("range", &range), LIMIT)).await.map_err(links_error)?;
         if !self.public && r.status().is_redirection() {
             // (a link on the provider's own origin sent elsewhere, to a bucket's signed link say: reached as the public
             // internet is, its address and every redirect checked)
             let to = r.headers().get("location").and_then(|v| v.to_str().ok()).and_then(|l| url::Url::parse(&url).ok()?.join(l).ok()).ok_or_else(|| links_error("the provider's link redirected without a Location"))?;
-            crate::public::check(&to).map_err(|e| links_error(format!("the provider's link redirected to {}: {e}", to.host_str().unwrap_or_default())))?;
-            r = crate::fetch::send(crate::public::web().get(to.as_str()).header("range", &range)).await.map_err(links_error)?;
+            crate::net::check(&to).map_err(|e| links_error(format!("the provider's link redirected to {}: {e}", to.host_str().unwrap_or_default())))?;
+            r = crate::fetch::send(crate::net::timeout(self.outside.get(to.as_str()).header("range", &range), LIMIT)).await.map_err(links_error)?;
         }
         match r.status().as_u16() {
             200 | 206 => {}

@@ -185,7 +185,7 @@ async fn finish(app: &App, flow: &Value, q: &HashMap<String, String>) -> Result<
     let p = &provider.1;
     let form = [("grant_type", "authorization_code"), ("code", code), ("redirect_uri", flow["r"].as_str().unwrap_or_default()), ("client_id", &p.client_id), ("code_verifier", flow["v"].as_str().unwrap_or_default())];
     let form = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(form).finish();
-    let mut ask = crate::ext::web().post(flow["t"].as_str().unwrap_or_default()).timeout(Duration::from_secs(10)).header("content-type", "application/x-www-form-urlencoded").body(form);
+    let mut ask = app.lake.node.net.client(crate::net::Policy::ENDPOINT).post(flow["t"].as_str().unwrap_or_default()).timeout(Duration::from_secs(10)).header("content-type", "application/x-www-form-urlencoded").body(form);
     if let Some(s) = &p.secret {
         ask = ask.basic_auth(&p.client_id, Some(client_secret(app, s).await?)); // (client_secret_basic: OpenID Connect's default)
     }

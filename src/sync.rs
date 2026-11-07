@@ -48,7 +48,7 @@ pub async fn command(cmd: Command) -> Result<()> {
     let token = crate::project::token(at.token.clone(), at.url.as_deref()); // (`pondra login`'s too, for a node at --url)
     let push = matches!(cmd, Command::Push { .. });
     let said = match &at.url {
-        Some(url) => Node { http: reqwest::Client::new(), base: url.trim_end_matches('/').into(), token, owner: None }.sync(Path::new(dir), push).await,
+        Some(url) => Node { http: crate::net::process().client(crate::net::Policy::ENDPOINT), base: url.trim_end_matches('/').into(), token, owner: None }.sync(Path::new(dir), push).await,
         None => {
             let (mut child, base, key, log) = crate::shell::start(at.lake.as_deref().unwrap_or("lake"))?;
             let r = match crate::shell::up(&base, &mut child, &log).await {

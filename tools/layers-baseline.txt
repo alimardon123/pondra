@@ -1,7 +1,7 @@
 # Uses that break the floors, as main has them (tools/layers.py --write-baseline): each edge and how many
 # `crate::` uses it has. Each redesign step removes some; nothing may add an edge or a use along one.
 adopt -> iceberg  5
-ai -> fetch  3
+ai -> fetch  2
 answer -> xlsx  1
 app -> delta  3
 app -> dial  4
@@ -46,7 +46,6 @@ ddl -> memory  5
 ddl -> shares  7
 delta -> iceberg  3
 delta -> write_outside  1
-dial -> ext  1
 dial -> store  1
 dial -> users  1
 engine -> pattern  2
@@ -58,7 +57,7 @@ ext -> catalogs  9
 ext -> crypto  8
 ext -> fetch  1
 ext -> kafka_client  2
-ext -> public  6
+ext -> public  4
 ext -> read_delta  2
 ext -> read_iceberg  1
 ext -> sharing_client  2
@@ -90,7 +89,6 @@ iceberg -> write_outside  1
 inbox -> backup  1
 inbox -> panics  2
 inbox -> write  1
-joined -> ext  1
 joined -> store  1
 kafka -> dial  5
 kafka -> reset  1
@@ -172,7 +170,6 @@ pg -> sso  6
 pg -> tls  6
 pg_json_sets -> measures  1
 protect -> apply  4
-public -> ext  1
 python -> memory  1
 python -> node  1
 query -> extension  1
@@ -209,7 +206,7 @@ served -> auth  7
 served -> memory  1
 served -> store  4
 server -> apply  5
-server -> cluster  6
+server -> cluster  5
 server -> console  4
 server -> iceberg  1
 server -> iceberg_rest  1
@@ -232,14 +229,13 @@ sharing -> read_delta  3
 sharing -> reset  1
 sharing -> tls  2
 sharing_client -> byte_range  1
-sharing_client -> fetch  5
-sharing_client -> public  4
+sharing_client -> fetch  4
 sharing_client -> read_delta  1
 sharing_client -> reset  1
 spill -> reset  1
 spmd -> dial  9
 sso -> crypto  6
-sso -> fetch  2
+sso -> fetch  1
 sso_flow -> crypto  2
 sso_flow -> tls  1
 statement -> pg_catalog  1

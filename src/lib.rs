@@ -14,6 +14,8 @@ pub mod env;
 // What a node's host does when the node must stop or start again, and what the code below it may ask of its form.
 pub mod lifecycle;
 pub mod machine;
+// How a node's calls out reach the network: one client factory, with the policy named by whom a call goes to.
+#[cfg(feature = "lake")] pub mod net;
 // The node as the code below the hosts sees it: its lifecycle, and what its stop waits for and refuses.
 pub mod node_state;
 // The one place a feature says what it adds (designs/redesign/redesign.md §6): `built_in` below lists the build's extensions.

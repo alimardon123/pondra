@@ -352,7 +352,8 @@ impl ::log::Log for ErrorLines {
 static ERROR_LINES: ErrorLines = ErrorLines;
 
 pub fn main() {
-    crate::machine::install(std::sync::Arc::new(crate::os::Os::default())); // (the program's machine, before anything reads it)
+    crate::machine::install(std::sync::Arc::new(crate::os::Os::default())); // (the program's machine and network, before anything reads them)
+    crate::net::install(std::sync::Arc::new(crate::os::Net::default()));
     if ::log::set_logger(&ERROR_LINES).is_ok() {
         ::log::set_max_level(::log::LevelFilter::Error);
     }
@@ -620,7 +621,7 @@ async fn run() -> anyhow::Result<()> {
             let store = store::open_store(&dir)?.1;
             match terms::latest(&store).await? {
                 Some(t) if !t.addr.is_empty() && terms::alive(&store, &t).await => {
-                    println!("{}", cluster::http().post(crate::tls::url(&format!("{}/sql", t.addr))).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)
+                    println!("{}", crate::net::process().client(crate::net::Policy::Cluster).post(crate::tls::url(&format!("{}/sql", t.addr))).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)
                 }
                 _ => sql_on_guest(&dir, &query, &attached).await?,
             }

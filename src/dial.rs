@@ -200,7 +200,7 @@ async fn page_call(node: &str, auth: &str, to: &str, c: Call) -> Result<Reply> {
         Verb::Delete => reqwest::Method::DELETE,
     };
     let url = format!("{node}{}", c.path);
-    let mut req = crate::ext::bare().request(verb, url.as_str()).header(reqwest::header::AUTHORIZATION, auth);
+    let mut req = crate::net::process().client(crate::net::Policy::ENDPOINT).request(verb, url.as_str()).header(reqwest::header::AUTHORIZATION, auth);
     if c.json {
         req = req.header(reqwest::header::CONTENT_TYPE, "application/json");
     }

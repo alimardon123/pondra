@@ -55,10 +55,10 @@ pub trait Host: Send + Sync {
     async fn pull_request(&self, title: &str, head: &str, base: &str, body: &str) -> Result<(u64, String)>;
 }
 
-/// The host a provider's repositories are reached through: one arm per provider.
-pub fn host(provider: &str, repository: &str, token: &str) -> Result<Box<dyn Host>> {
+/// The host a provider's repositories are reached through: one arm per provider. `http`: the client it is reached with.
+pub fn host(provider: &str, repository: &str, token: &str, http: reqwest::Client) -> Result<Box<dyn Host>> {
     match provider {
-        "github" => Ok(Box::new(GitHub::new(repository, token)?)),
+        "github" => Ok(Box::new(GitHub::new(repository, token, http)?)),
         "gitlab" => bail!("GitLab isn't spoken to yet: PROVIDER 'github'"),
         other => bail!("{other} isn't spoken to yet: PROVIDER 'github'"),
     }
@@ -69,18 +69,19 @@ pub struct GitHub {
     api: String,
     repo: String,
     token: String,
+    http: reqwest::Client,
 }
 
 impl GitHub {
-    fn new(repository: &str, token: &str) -> Result<Self> {
+    fn new(repository: &str, token: &str, http: reqwest::Client) -> Result<Self> {
         let (api, repo) = api_of(repository)?;
-        Ok(Self { api, repo, token: token.to_string() })
+        Ok(Self { api, repo, token: token.to_string(), http })
     }
 
     /// One request under the repository's path: GitHub's status and its JSON answer.
     async fn send(&self, method: Method, path: &str, body: Option<Value>) -> Result<(StatusCode, Value)> {
         let url = format!("{}/repos/{}{path}", self.api, self.repo);
-        let mut req = ext::web().request(method, url.as_str()).bearer_auth(&self.token).header("accept", "application/vnd.github+json").header("user-agent", "pondra").header("x-github-api-version", "2022-11-28");
+        let mut req = crate::net::timeout(self.http.request(method, url.as_str()), std::time::Duration::from_secs(60)).bearer_auth(&self.token).header("accept", "application/vnd.github+json").header("user-agent", "pondra").header("x-github-api-version", "2022-11-28");
         if let Some(b) = body {
             req = req.json(&b);
         }
@@ -250,7 +251,8 @@ fn within(scope: &str, url: &str) -> bool {
 
 async fn host_for(lake: &Lake, repository: &str, secret: Option<&str>) -> Result<Box<dyn Host>> {
     let (_, token, provider) = git_token(lake, repository, secret).await?;
-    host(&provider, repository, &token)
+    // (a service the admin named: a git secret's token goes only where its SCOPE, an admin's, says)
+    host(&provider, repository, &token, lake.node.net.client(crate::net::Policy::ENDPOINT))
 }
 
 // ---------------------------------------------------------------- the folder

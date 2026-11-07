@@ -176,9 +176,10 @@ impl Node {
         // (a guest answers one program's statements and ends: none of the loops and doors a node that lives keeps, so
         // every `lives` below keeps them for a node that lives only)
         let lives = guest.is_none();
-        // (the machine, installed by the program's start; a library's process or a test's installs it here, its first node's
-        // start, as the host it is)
+        // (the machine and the network, installed by the program's start; a library's process or a test's installs them here,
+        // its first node's start, as the host it is)
         crate::machine::install(Arc::new(crate::os::Os::default()));
+        crate::net::install(Arc::new(crate::os::Net::default()));
         // (what this node does when it must stop or start again, and what its stop waits for: its lakes and its member hold it)
         let here = crate::node::native(!lives);
         let _ = held.node.set(here.clone()); // (a stop drains and closes this node's door: `Held::stop`)

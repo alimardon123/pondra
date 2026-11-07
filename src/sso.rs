@@ -573,7 +573,7 @@ async fn fetch(issuer: &str) -> Result<(Value, Vec<Jwk>)> {
 
 pub(crate) async fn get_json(url: &str) -> Result<Value> {
     ensure!(reachable(url), "{url}: a provider is asked over https (http only on this machine)");
-    let r = crate::fetch::send(crate::fetch::timeout(crate::ext::web().get(url), Duration::from_secs(10))).await.with_context(|| url.to_string())?;
+    let r = crate::fetch::send(crate::net::timeout(crate::net::process().client(crate::net::Policy::ENDPOINT).get(url), Duration::from_secs(10))).await.with_context(|| url.to_string())?;
     ensure!(r.status().is_success(), "{url} answered {}", r.status());
     let body = r.body_within(1 << 20).await.with_context(|| url.to_string())?.with_context(|| format!("{url} answered more than 1 MB"))?;
     serde_json::from_slice(&body).with_context(|| format!("{url} didn't answer JSON"))

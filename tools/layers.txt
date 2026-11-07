@@ -11,6 +11,7 @@ column base
 env base
 lifecycle base
 machine base
+net base
 node_state base
 ledger base
 memo base
