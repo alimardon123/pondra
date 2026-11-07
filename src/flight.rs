@@ -197,17 +197,22 @@ fn allowed<T>(_: &App, _: &Request<T>, need: Role) -> Result<Role, Status> {
 /// nothing that needs a sign-in, anyone is an admin. A wrong password is an error, said at once.
 async fn sign_in(app: &App, header: Option<&str>, peer: Option<crate::tls::Peer>) -> Result<crate::auth::Principal, Status> {
     let from = peer.map(|p| p.addr);
-    let who = match header.and_then(basic) {
-        Some((user, password)) => password_sign_in(app, &user, &password, peer).await?,
-        None => crate::users::who(&app.lake, &app.auth, header).await,
+    let credential = crate::auth::Credential::of_header(header); // (read alike at every door: `auth::Credential`)
+    if let Some(why) = credential.malformed() {
+        crate::audit::refused(app, "", "flight", from, "sign in", &why).await;
+        return Err(refused("28000", why));
+    }
+    let who = match &credential {
+        crate::auth::Credential::Password { user, password } => password_sign_in(app, user, password, peer).await?,
+        c => crate::users::who(&app.lake, &app.auth, c).await,
     };
     let who = match who {
         Some(p) => p,
         None if app.open().await => crate::auth::Principal::of(Role::Admin),
         None => {
             // (an identity provider's token says why it was refused, as HTTP's 401 does)
-            let why = match header.and_then(|h| h.strip_prefix("Bearer ")) {
-                Some(t) => crate::sso::why(&app.lake, t.trim()).await,
+            let why = match credential.token() {
+                Some(t) => crate::sso::why(&app.lake, t).await,
                 None => None,
             };
             if header.is_some() {
@@ -220,14 +225,6 @@ async fn sign_in(app: &App, header: Option<&str>, peer: Option<crate::tls::Peer>
         }
     };
     Ok(who.at("flight", from))
-}
-
-/// A `Basic` header's name and password (padding optional: ADBC's driver sends none).
-fn basic(header: &str) -> Option<(String, String)> {
-    use base64::Engine;
-    let lenient = base64::engine::GeneralPurpose::new(&base64::alphabet::STANDARD, base64::engine::GeneralPurposeConfig::new().with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent));
-    let up = String::from_utf8(lenient.decode(header.strip_prefix("Basic ")?).ok()?).ok()?;
-    up.split_once(':').map(|(u, p)| (u.to_string(), p.to_string()))
 }
 
 /// A name and password: a token as the password whatever the name, else a user's password (or
@@ -675,46 +672,43 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
     if !producer.is_empty() && first == 0 {
         return Err(refused("22023", crate::log::SEQ_FROM_1)); // (0 is "nothing yet": its batch would be taken for a retry)
     }
-    let (lake, again, table2) = (app.lake.clone(), log.clone(), table.clone());
+    let (app, again, table2) = (app.clone(), log.clone(), table.clone());
     let who = crate::auth::current(); // (the caller, for its grants in the task below: a task keeps no task-local)
-    type Queued = Pin<Box<dyn std::future::Future<Output = anyhow::Result<crate::log::Ack>> + Send>>;
-    let (acks_tx, mut acks_rx) = tokio::sync::mpsc::channel::<Result<(Queued, crate::rules::Shaped, crate::log::Src), Status>>(256);
+    let (acks_tx, mut acks_rx) = tokio::sync::mpsc::channel::<Result<crate::writer::Queued, Status>>(256);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel(); // (acks are small; a client may read them only at the end)
     crate::panics::task(async move {
         let mut batches = std::pin::pin!(batches);
-        let meta = lake.cat.meta(&table_key(&table)).await.ok().flatten();
-        let Some((meta, rules)) = meta.and_then(|m| {
-            let rules = m.rules().ok()?;
-            Some((m, rules))
-        }) else {
-            // (SQL's names: ADR-022)
-            let _ = acks_tx.send(Err(refused("42P01", format!("no table {table}")))).await;
-            return;
-        };
-        // (the batch's rows, shaped for the table: a column it leaves out takes its DEFAULT)
-        let (m, r, lk, name) = (&meta, &rules, &lake, table.as_str());
-        let shaped = |b: RecordBatch| async move {
-            let given: Vec<String> = b.schema().fields().iter().map(|f| f.name().clone()).collect();
-            let left_out = r.left_out(&given);
-            crate::rules::shape(r, name, crate::rules::Rows::Named(b, left_out), crate::rules::How::Load, &crate::defaults::Node(lk)).await
+        // (a rights refusal is said as the writer's scope says it: `shows_code`)
+        let denied_as = |e: anyhow::Error| match &who {
+            Some(w) => crate::auth::WHO.sync_scope(w.clone(), || denied(e)),
+            None => denied(e),
         };
         // (a keyed table's rows replace their keys', and rows marked _deleted delete them: S11)
-        let named = crate::auth::catalog_name(&table);
-        let load = |b: &RecordBatch| match &who {
-            Some(w) => crate::auth::WHO.sync_scope(w.clone(), || crate::auth::check_load(m, &named, b).map_err(denied)), // (said as the writer's scope says it: `shows_code`)
-            None => Ok(()),
+        let writer = match crate::writer::Writer::open(&app, who.clone(), &table, crate::rules::How::Load, false).await {
+            Ok(w) => w,
+            Err(crate::writer::Refused::Rights(e)) => {
+                let _ = acks_tx.send(Err(denied_as(e))).await;
+                return;
+            }
+            Err(_) => {
+                // (SQL's names: ADR-022)
+                let _ = acks_tx.send(Err(refused("42P01", format!("no table {table}")))).await;
+                return;
+            }
         };
         let mut i = 0;
         while let Some(b) = batches.next().await {
-            let b = match b {
-                Ok(b) => shaped(b).await.map_err(status).and_then(|s| load(s.rows()).map(|_| s)),
-                Err(e) => Err(e),
-            };
             let queued = match b {
-                Ok(s) => {
+                Ok(b) => {
+                    // (the batch's rows, shaped for the table: a column it leaves out takes its DEFAULT)
+                    let given: Vec<String> = b.schema().fields().iter().map(|f| f.name().clone()).collect();
+                    let left_out = writer.rules().left_out(&given);
                     let (seq, prev) = if producer.is_empty() { (0, None) } else { (first + i, (i > 0).then(|| first + i - 1)) };
                     let src = crate::log::Src { producer: producer.clone(), seq, prev };
-                    log.queue_shaped(table.clone(), src.clone(), s.clone()).await.map(|f| (Box::pin(f) as Queued, s, src)).map_err(status)
+                    writer.put(crate::rules::Rows::Named(b, left_out), src).await.map_err(|r| match r {
+                        crate::writer::Refused::Rights(e) => denied_as(e),
+                        r => status(anyhow::Error::from(r)),
+                    })
                 }
                 Err(e) => Err(e),
             };
@@ -729,7 +723,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
     crate::panics::task(async move {
         while let Some(queued) = acks_rx.recv().await {
             let acked = match queued {
-                Ok((ack, batch, src)) => {
+                Ok(crate::writer::Queued { ack, src, rows: batch }) => {
                     // (overtaken by the batch after it on the way to the leader, it goes again: `Log::sent_again`)
                     let ack = log.sent_again(ack.await, &table, &src, &batch).await.map_err(status);
                     ack.map(|a| {
@@ -853,8 +847,8 @@ impl FlightSqlService for Sql {
     async fn do_handshake(&self, req: Request<Streaming<HandshakeRequest>>) -> Result<Response<Out<HandshakeResponse>>, Status> {
         // (signed in by `Gate` already; here a token is handed back: the password when it is one, a user's
         // `pt_` token included, or anything on a node nothing locks; a session when a user signed in)
-        let password = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).and_then(basic).map(|(_, p)| p);
-        let Some(password) = password else { return Err(refused("28P01", "wrong user name or password")) };
+        let credential = crate::auth::Credential::of_header(req.metadata().get("authorization").and_then(|v| v.to_str().ok()));
+        let crate::auth::Credential::Password { password, .. } = credential else { return Err(refused("28P01", "wrong user name or password")) };
         let open = self.0.open().await;
         let token = match self.0.auth.token_role(&password) {
             // (a user's token is handed back as itself, which every call checks again: a session made from it
@@ -962,7 +956,7 @@ impl FlightSqlService for Sql {
         };
         let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(stream_status).peekable();
         let mut exists = self.0.lake.cat.meta(&table_key(&table)).await.map_err(status)?.is_some();
-        crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(denied)?; // (the row doors' one check)
+        crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(denied)?; // (the row doors' one check)
         // ADBC's modes: create (fail if there), append (fail if not), replace, create_append.
         use arrow_flight::sql::{TableExistsOption as IfThere, TableNotExistOption as IfNot};
         let options = cmd.table_definition_options.unwrap_or_default();
@@ -1011,7 +1005,7 @@ impl FlightSqlService for Sql {
             [t, p, s] => (t.clone(), p.clone(), s.parse().map_err(|_| refused("22023", "the first seq is a number"))?),
             _ => return Err(refused("22023", "DoPut to a path: [table] or [table, producer, first seq]")),
         };
-        crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(denied)?; // (the row doors' one check)
+        crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(denied)?; // (the row doors' one check, before a batch is read)
         let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(input.map_err(Into::into)).map_err(stream_status);
         Ok(Response::new(append(&self.0, table, producer, seq, batches)?))
     }

@@ -13,6 +13,7 @@ ledger base
 memo base
 metrics base
 parsed base
+lists base
 registry base
 settings base
 text base
@@ -150,6 +151,7 @@ vars engine
 views engine
 with_writes engine
 write engine
+writer engine
 zeros_in engine
 
 # extensions, built in

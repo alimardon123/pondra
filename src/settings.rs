@@ -233,8 +233,9 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_LOCK_LEASE_SECS", Secs, Is("60")),
     node("PONDRA_MATCH_HELD_ROWS", Int, Is("1000000")),
     node("PONDRA_MATCH_RUN_ROWS", Int, Is("1000000")),
-    node("PONDRA_MEMORY_GB", Gb, No).flag("task-ms", "Memory for queries, in GB (also PONDRA_MEMORY_GB; default: a third of the \
-        machine's). Sorts, joins and aggregations that need more spill to the temp dir."),
+    node("PONDRA_MEMORY_GB", Gb, No).flag("task-ms", "Memory for queries and every cache together, in GB (also \
+        PONDRA_MEMORY_GB; default: queries a third of the machine's), except a cache given its own budget (PONDRA_HOT_GB, \
+        PONDRA_CACHE_MB, PONDRA_PAGES_MB). A query that needs more takes it from the caches, then sorts, joins and aggregations spill."),
     node("PONDRA_MEMORY_LAKE_GB", Gb, No),
     node("PONDRA_MEMORY_MAX_GB", Gb, No),
     node("PONDRA_PAGES_MB", Mb, Is("256")),
@@ -344,12 +345,31 @@ impl Settings {
     }
 }
 
-/// The node's own settings, as an extension: first in `crate::built_in`, so every other extension's come after.
+/// The node's own settings, as an extension: first in `crate::built_in`, so every other extension's come after. It lists
+/// them all as `pondra.settings`.
 pub static SETTINGS: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "settings",
     requires: &[],
-    register: |r| r.section_mut::<Settings>().add(CORE),
+    register: |r| {
+        r.section_mut::<Settings>().add(CORE);
+        r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "settings", columns: COLUMNS, rows });
+    },
 };
+
+/// `pondra.settings`' columns: each name in the environment and as an option, what it takes, what it is when unset here
+/// (worked out on this machine, where it is), where it holds, when it may change and who it is for.
+const COLUMNS: &[(&str, crate::lists::Cell)] = {
+    use crate::lists::Cell::Text;
+    &[("name", Text), ("variable", Text), ("type", Text), ("default_value", Text), ("scope", Text), ("change", Text), ("who", Text)]
+};
+
+/// One row per setting, a test's hooks left out as the docs leave them out. Each word is its variant's name in lower case.
+fn rows(r: &crate::registry::Registry) -> Vec<serde_json::Value> {
+    let word = |d: &dyn std::fmt::Debug| format!("{d:?}").to_lowercase();
+    r.section::<Settings>().all.iter().filter(|s| s.who != Who::Test).map(|s| serde_json::json!({
+        "name": s.name(), "variable": s.var, "type": word(&s.kind), "default_value": s.default(), "scope": word(&s.scope), "change": word(&s.change), "who": word(&s.who),
+    })).collect()
+}
 
 /// Every setting of this build, in the order its extensions added them.
 pub fn all() -> &'static [Setting] {

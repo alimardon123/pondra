@@ -766,17 +766,57 @@ pub fn statements(text: &str) -> (Vec<String>, String) {
     }
 }
 
-/// `statements`, each `;` a statement's end (a block's statements apart).
+/// `statements`, each `;` a statement's end (a block's statements apart): each `;` the tokenizer reads as one
+/// (`text::tokens`), so a `;` in a string, a quoted name or a comment ends nothing, as every look after this reads it
+/// (11-06 audit M7: `SELECT E'it\'s; ok'` was cut at its `;`). The text is scanned first, which finds the same `;`s at a
+/// tenth of the cost (a bulk INSERT is split a few times a request, and tokenizing 6 MB of one takes a fifth of a
+/// second), and is left to the tokenizer where the scan meets what the two would read apart (`scanned`). A text the
+/// tokenizer refuses (a string never closed) is scanned whole, for the parser to say what is wrong with it.
 fn pieces(text: &str) -> (Vec<String>, String) {
+    scanned(text, true).or_else(|| crate::text::tokens(text).map(|t| by_tokens(text, &t))).unwrap_or_else(|| scanned(text, false).expect("a scan that defers nothing"))
+}
+
+/// `pieces` from the text's tokens: each `;` token ends a statement that holds more than whitespace and comments.
+fn by_tokens(text: &str, t: &crate::text::Tokens) -> (Vec<String>, String) {
+    let (mut out, mut start, mut code) = (vec![], 0, false);
+    for (i, tok) in t.toks.iter().enumerate() {
+        match tok {
+            Token::SemiColon => {
+                if code {
+                    out.push(text[start..t.start[i]].to_string());
+                }
+                (start, code) = (t.end[i], false);
+            }
+            Token::Whitespace(_) => {}
+            _ => code = true,
+        }
+    }
+    (out, if code { text[start..].to_string() } else { String::new() })
+}
+
+/// `pieces` by a scan of the bytes: a string, a quoted name, a comment or a dollar-quoted string skipped whole. With
+/// `defer`, None where the scan and the tokenizer could read the text apart: a string after `E` (a backslash escapes
+/// its quote), `q` (`q'[…]'` may hold a quote) or `U&`; a backtick (a quoted name); a dollar (a dollar-quoted string,
+/// or part of a name: `v$session`); a comment in a comment (they nest).
+fn scanned(text: &str, defer: bool) -> Option<(Vec<String>, String)> {
     let (mut out, mut start, mut i, mut code) = (vec![], 0, 0, false);
+    let bytes = text.as_bytes();
     while i < text.len() {
         let rest = &text[i..];
         let quoted = |end: &str, from: usize| rest[from..].find(end).map_or(rest.len(), |e| from + e + end.len());
-        let (skip, is_code) = match rest.as_bytes()[0] {
+        let (skip, is_code) = match bytes[i] {
             b'-' if rest.starts_with("--") => (quoted("\n", 2), false),
-            b'/' if rest.starts_with("/*") => (quoted("*/", 2), false),
+            b'/' if rest.starts_with("/*") => {
+                let end = quoted("*/", 2);
+                if defer && rest[2..end].contains("/*") {
+                    return None;
+                }
+                (end, false)
+            }
+            b'\'' if defer && i > 0 && matches!(bytes[i - 1], b'e' | b'E' | b'q' | b'Q' | b'&') => return None,
             b'\'' => (quoted("'", 1), true),
             b'"' => (quoted("\"", 1), true),
+            b'`' | b'$' if defer => return None,
             b'$' => match dollar_tag(rest) {
                 Some(tag) => (quoted(tag, tag.len()), true),
                 None => (1, true),
@@ -796,7 +836,7 @@ fn pieces(text: &str) -> (Vec<String>, String) {
         code |= is_code;
         i += skip.min(rest.len());
     }
-    (out, if code { text[start..].to_string() } else { String::new() })
+    Some((out, if code { text[start..].to_string() } else { String::new() }))
 }
 
 /// A script's statements, the last one's `;` optional.
@@ -1042,6 +1082,7 @@ async fn run_steps(app: &App, steps: Vec<(String, Option<String>)>, who: Who, jo
 /// `params` are the values it was given (`vars.rs`): `$name` is one until something sets it, and a
 /// `DECLARE` takes one in place of its default.
 pub async fn script(app: &App, sql: &str, params: &HashMap<String, Value>, views: &HashMap<String, String>, who: Who, job: Option<String>) -> Result<Outcome> {
+    crate::dialect_stmts::refused(sql)?; // (another database's statement anywhere in it: refused by name before any of it runs, at every door that runs a script, `dialect_stmts.rs`)
     let go = script_of(app, sql, views, who, job);
     match crate::vars::in_run() && params.is_empty() {
         true => go.await, // (a file run's cell, a lent connection's request: the run's values)
@@ -1349,6 +1390,52 @@ mod tests {
     use super::*;
     use crate::expander::named_apart;
     use crate::text::args;
+
+    /// The statements the tokenizer reads in `text`: each `;` token's text before it, when more than whitespace and
+    /// comments (None: the tokenizer refuses the text).
+    fn by_the_tokenizer(text: &str) -> Option<Vec<String>> {
+        let t = crate::text::tokens(text)?;
+        let (mut out, rest) = by_tokens(text, &t);
+        out.extend((!rest.is_empty()).then_some(rest));
+        Some(out)
+    }
+
+    #[test]
+    fn a_script_is_split_where_the_tokenizer_reads_a_semicolon() {
+        // (11-06 audit M7: the scan ended a string at the next quote, so `E'it\'s; ok'` was cut at its `;`)
+        for (text, n) in [
+            ("SELECT E'it\\'s; ok' AS s; SELECT 2", 2),
+            ("SELECT `a;b` FROM t; SELECT 1", 2),
+            ("SELECT 1 /* a /* b */ ; */ ; SELECT 2", 2),
+            ("SELECT q'[it's; ok]' AS s; SELECT 2", 2),
+            ("SELECT v$a$b FROM t; SELECT ';$a$'", 2),
+            ("SELECT $$a; b$$ AS s; SELECT 2", 2),
+            ("SELECT 'it''s; ok' AS s; -- a; b\n SELECT \"x;y\" FROM t;", 2),
+            ("-- only a comment;\n", 0),
+        ] {
+            let got = split(text);
+            assert_eq!(got.len(), n, "{text}: {got:?}");
+            assert_eq!(Some(got), by_the_tokenizer(text), "{text}");
+        }
+        assert_eq!(split("SELECT 'never closed; SELECT 2"), ["SELECT 'never closed; SELECT 2"], "the tokenizer refuses it: scanned, for the parser to say why");
+        // Texts made of the pieces either way could read apart, each split as the tokenizer splits it: where the scan
+        // doesn't leave a text to the tokenizer, it finds the same `;`s.
+        let parts = ["SELECT 1", ";", " ", "'a;b'", "'it''s'", "E'x\\';'", "\"c;d\"", "`e;f`", "-- g;\n", "/* h; */", "/* i /* j */ ; */", "$$k;l$$", "$t$m;n$t$", "v$x", "q'[o;p]'", "'faq'", "U&'d\\0061;'", "DATE'2026'", "\n", "x", "(", ")", "$1"];
+        let mut seed = 20261107u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        let mut compared = 0;
+        for _ in 0..20000 {
+            let text: String = (0..1 + next() % 12).map(|_| parts[next() % parts.len()]).collect();
+            if let Some(want) = by_the_tokenizer(&text) {
+                assert_eq!(split(&text), want, "{text:?} (scanned: {})", scanned(&text, true).is_some());
+                compared += 1;
+            }
+        }
+        assert!(compared > 10000, "{compared}");
+    }
 
     fn call(sql: &str) -> Vec<FunctionArg> {
         let Expr::Function(f) = parse_expr(sql).unwrap() else { panic!("{sql}: not a call") };

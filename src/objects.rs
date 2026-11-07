@@ -162,6 +162,7 @@ pub static CATALOG: crate::registry::BuiltIn = crate::registry::BuiltIn {
         for k in CORE_KINDS {
             kinds.add(k);
         }
+        r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "kinds", columns: COLUMNS, rows });
     },
 };
 
@@ -1155,16 +1156,16 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
     Ok(Some(format!("SELECT {} AS definition", literal(&format!("{};", script.join(";\n"))))))
 }
 
-/// Does `sql` read `pondra.objects`, `pondra.kinds` or `pondra.parts`?
+/// Does `sql` read `pondra.objects` or `pondra.parts`?
 pub fn mentioned(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    s.contains("pondra.objects") || s.contains("pondra.kinds") || s.contains("pondra.parts")
+    s.contains("pondra.objects") || s.contains("pondra.parts")
 }
 
-/// `pondra.objects` and `pondra.kinds`, as they are now (when `text` reads them). `pondra.parts` is
-/// listed only when a query names it: its views are planned to find their columns.
+/// `pondra.objects`, as it is now (when `text` reads it). `pondra.parts` is listed only when a query names it: its views
+/// are planned to find their columns. (`pondra.kinds` is a list: `crate::lists`.)
 pub async fn tables(lake: &Lake, text: &str) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
-    use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray};
+    use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray};
     use datafusion::datasource::MemTable;
     if !mentioned(text) {
         return Ok(vec![]);
@@ -1180,25 +1181,24 @@ pub async fn tables(lake: &Lake, text: &str) -> Result<Vec<(&'static str, Arc<dy
         ("comment", o(&|o| o.comment.clone())),
         ("definition", o(&|o| o.definition.clone())),
     ])?;
-    let registry = rows();
-    let cell = |c: &str| Arc::new(registry.iter().map(|r| words(&r[c])).collect::<StringArray>()) as ArrayRef;
-    let flag = |c: &str| Arc::new(registry.iter().map(|r| r[c].as_bool()).collect::<BooleanArray>()) as ArrayRef;
-    let kinds = RecordBatch::try_from_iter(vec![
-        ("kind", cell("kind")), ("is", cell("is")), ("family", cell("family")), ("inside", cell("inside")), ("statements", cell("statements")),
-        ("privileges", cell("privileges")), ("on_clone", cell("on_clone")), ("in_project", flag("in_project")), ("undrop", flag("undrop")), ("secret", flag("secret")),
-        ("lists", cell("lists")), ("about", cell("about")), ("also", cell("also")),
-    ])?;
-    let mut out = vec![("objects", mem(objects)?), ("kinds", mem(kinds)?)];
+    let mut out = vec![("objects", mem(objects)?)];
     if text.to_lowercase().contains("pondra.parts") {
         out.push(("parts", mem(crate::find::parts_batch(&crate::find::parts(lake, &all).await?)?)?));
     }
     Ok(out)
 }
 
+/// `pondra.kinds`' columns: a list's cell is its words joined with ", ".
+const COLUMNS: &[(&str, crate::lists::Cell)] = {
+    use crate::lists::Cell::{Flag, Text};
+    &[("kind", Text), ("is", Text), ("family", Text), ("inside", Text), ("statements", Text), ("privileges", Text), ("on_clone", Text),
+      ("in_project", Flag), ("undrop", Flag), ("secret", Flag), ("lists", Text), ("about", Text), ("also", Text)]
+};
+
 /// One row per kind, then per part, then per pattern: what `pondra.kinds` and `GET /kinds` list. A
 /// column that doesn't apply to a row is null (a part has no statements; a pattern no family).
-fn rows() -> Vec<Value> {
-    let objects = all_kinds().map(|k| j!({"kind": k.name, "is": "object", "family": k.family, "inside": null, "statements": k.verbs, "privileges": k.privileges,
+fn rows(r: &crate::registry::Registry) -> Vec<Value> {
+    let objects = r.section::<Kinds>().0.iter().map(|k| j!({"kind": k.name, "is": "object", "family": k.family, "inside": null, "statements": k.verbs, "privileges": k.privileges,
         "on_clone": k.on_clone.word(), "in_project": k.project.is_none(), "undrop": k.verbs.contains(&"UNDROP"), "secret": k.secret, "lists": null, "about": k.about, "also": k.also}));
     let parts = PARTS.iter().map(|p| j!({"kind": p.name, "is": "part", "family": null, "inside": p.inside, "statements": null, "privileges": null, "on_clone": null,
         "in_project": null, "undrop": null, "secret": null, "lists": null, "about": p.about, "also": p.also}));
@@ -1207,17 +1207,8 @@ fn rows() -> Vec<Value> {
     objects.chain(parts).chain(patterns).collect()
 }
 
-/// A row's cell as text: a list joined with ", " (an empty list is ""), a string as it is, null as NULL.
-fn words(v: &Value) -> Option<String> {
-    match v {
-        Value::Array(a) => Some(a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
-        Value::String(s) => Some(s.clone()),
-        _ => None,
-    }
-}
-
 /// `GET /kinds`: every kind, part and pattern, as `pondra.kinds` lists them.
-pub fn kinds() -> Value { Value::Array(rows()) }
+pub fn kinds() -> Value { Value::Array(rows(crate::registry::get())) }
 
 /// `GET /objects`'s answer, at every door (the HTTP door, a page): what the console's catalog and its details panel show of
 /// each table and view of this lake and the lakes attached to it — its kind, key, layout, formats and size, and a view's

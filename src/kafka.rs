@@ -186,7 +186,7 @@ async fn again(app: &App, said: &Said) -> crate::auth::Principal {
     let now = match said {
         Said::Open => app.open().await.then(|| crate::auth::Principal::of(Role::Admin)),
         Said::Plain(user, password) => crate::users::sign_in(&app.lake, &app.auth, user, password).await,
-        Said::Bearer(token) => crate::users::who(&app.lake, &app.auth, Some(&format!("Bearer {token}"))).await,
+        Said::Bearer(token) => crate::users::who(&app.lake, &app.auth, &crate::auth::Credential::Token(token.clone())).await,
     };
     now.unwrap_or_else(|| crate::auth::Principal::of(Role::None))
 }
@@ -341,24 +341,29 @@ fn sasl_handshake(r: &mut Rd) -> Result<Vec<u8>> {
 /// past ten failures a minute for a user from one address, that pair is refused (`auth::guessing`).
 async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &mut Option<Said>, peer: &crate::tls::Peer, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     let auth = r.nbytes()?.unwrap_or_default();
-    let parts: Vec<&[u8]> = auth.split(|&b| b == 0).collect();
-    let (mut user, password) = match parts[..] {
-        [_, user, password] => (String::from_utf8_lossy(user).to_string(), String::from_utf8_lossy(password).to_string()),
+    // (read alike at every door: `auth::Credential`. OAUTHBEARER's token, else PLAIN's name and password)
+    let credential = match crate::sso::bearer(&auth) {
+        Some(token) => crate::auth::Credential::Token(token),
+        None => crate::auth::Credential::of_sasl_plain(&auth),
+    };
+    let (mut user, password) = match &credential {
+        crate::auth::Credential::Password { user, password } => (user.clone(), password.clone()),
         _ => (String::new(), String::new()),
     };
     let ip = Some(peer.addr.ip());
-    let token = crate::sso::bearer(&auth); // (OAUTHBEARER's; None: PLAIN's)
-    let refused = if app.open().await {
+    let refused = if let Some(why) = credential.malformed() {
+        Some(why) // (never taken for no sign-in, an open node's included)
+    } else if app.open().await {
         *who = crate::auth::Principal::of(Role::Admin).at("kafka", who.from);
         *said = Some(Said::Open);
         None
-    } else if let Some(token) = &token {
+    } else if let Some(token) = credential.token() {
         // (a bearer token, as HTTP takes one: an identity provider's, or Pondra's own; never a guess)
-        match crate::users::who(&app.lake, &app.auth, Some(&format!("Bearer {token}"))).await {
+        match crate::users::who(&app.lake, &app.auth, &credential).await {
             Some(p) => {
                 user = p.name.clone();
                 *who = p.at("kafka", who.from);
-                *said = Some(Said::Bearer(token.clone()));
+                *said = Some(Said::Bearer(token.to_string()));
                 None
             }
             None => Some(crate::sso::why(&app.lake, token).await.unwrap_or_else(|| "wrong token".to_string())),
@@ -429,7 +434,7 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
         let name = r.str()?;
         let meta = app.lake.cat.meta(&table_key(&name)).await?; // (the stored entry: its JSON fields are SQL's names too, ADR-022)
         let rules = meta.as_ref().map(|m| m.rules());
-        let allowed = who.role >= Role::Write && crate::auth::WHO.sync_scope(who.clone(), || crate::auth::check_rows(&crate::auth::catalog_name(&name))).is_ok(); // (the row doors' one check)
+        let allowed = who.role >= Role::Write && crate::writer::may(Some(who), &crate::auth::catalog_name(&name), None, false).is_ok(); // (the row doors' one check)
         let mut parts = vec![];
         for _ in 0..r.len()? {
             let (index, records) = (r.i32()?, r.nbytes()?.unwrap_or_default());
@@ -479,13 +484,20 @@ fn ready(o: Outcome) -> BoxFuture<'static, Outcome> { async move { o }.boxed() }
 /// exactly-once: its (producer id, sequence) become a Pondra producer and seq, and `prev` makes
 /// a batch that overtook its predecessor go again once that one is in (OUT_OF_ORDER_SEQUENCE
 /// only if it never comes).
-async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, records: &[u8]) -> BoxFuture<'static, Outcome> {
+async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Arc<TableMeta>, rules: &Arc<crate::rules::Table>, records: &[u8]) -> BoxFuture<'static, Outcome> {
     let invalid = |e: anyhow::Error| {
         eprintln!("kafka: a record for {table} refused: {e:#}"); // (librdkafka shows only the code; this says why)
         ready((INVALID_RECORD, -1, Some(crate::ext::said(&e))))
     };
     let Some(log) = app.log.clone() else {
         return ready((POLICY_VIOLATION, -1, Some("read-only node".into())));
+    };
+    // (a keyed topic's records replace their keys', a tombstone deletes: S11; asked again for each batch, `Writer::put`)
+    let denied = |e: anyhow::Error| ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(crate::ext::said(&e))));
+    let writer = match crate::writer::Writer::with(app, Some(who.clone()), table, meta.clone(), rules.clone(), crate::rules::How::Load, false) {
+        Ok(w) => w,
+        Err(crate::writer::Refused::Rights(e)) => return denied(e),
+        Err(e) => return invalid(e.into()),
     };
     let batches = match decode_batches(records) {
         Ok(b) => b,
@@ -505,14 +517,6 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
             },
             false => crate::rules::LeftOut::None,
         };
-        // (NOT NULL, a CHECK, a held form: said as a bad record, which a producer doesn't retry; a UNIQUE's duplicate is the leader's to find, and `failed` says it the same way)
-        let rows = match crate::rules::shape(rules, table, crate::rules::Rows::Named(batch, left_out), crate::rules::How::Load, &crate::defaults::Node(&app.lake)).await {
-            Ok(rows) => rows,
-            Err(e) => return invalid(e),
-        };
-        if let Err(e) = crate::auth::WHO.sync_scope(who.clone(), || crate::auth::check_load(meta, &crate::auth::catalog_name(table), rows.rows())) {
-            return ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(crate::ext::said(&e)))); // (a keyed topic's records replace their keys', a tombstone deletes: S11)
-        }
         let src = match b.producer_id >= 0 && b.base_seq >= 0 {
             true => {
                 // A producer that gave up on a batch bumps its epoch and numbers from 0 again
@@ -524,9 +528,12 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
             }
             false => Src { producer: String::new(), seq: 0, prev: None }, // at-least-once, as in Kafka
         };
-        match log.queue_shaped(table.to_string(), src.clone(), rows.clone()).await {
-            Ok(ack) => acks.push((ack, src, rows)),
-            Err(e) => return ready(failed(&e)),
+        // (NOT NULL, a CHECK, a held form: said as a bad record, which a producer doesn't retry; a UNIQUE's duplicate is the leader's to find, and `failed` says it the same way)
+        match writer.put(crate::rules::Rows::Named(batch, left_out), src).await {
+            Ok(q) => acks.push((q.ack, q.src, q.rows)),
+            Err(crate::writer::Refused::Rows(e)) => return invalid(e),
+            Err(crate::writer::Refused::Rights(e)) => return denied(e),
+            Err(e) => return ready(failed(&e.into())),
         }
     }
     let table = table.to_string();
@@ -556,7 +563,12 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
 /// is applied once), so only a record that can't succeed is given up on.
 fn failed(e: &anyhow::Error) -> Outcome {
     use crate::codes::Kind::*;
-    let code = crate::codes::of(e);
+    // (a code read from an error's words is trusted only when the error isn't the machine's or the bucket's: the OS's
+    // "Read-only file system" or "Permission denied" would read as 25006 or 42501, and a write may pass once the disk or
+    // the bucket is back, so it is retried, 11-06 audit L5)
+    let coded = e.chain().any(|c| c.is::<crate::codes::Coded>() || c.is::<crate::codes::Violation>());
+    let machine = !coded && e.chain().any(|c| c.is::<std::io::Error>() || c.is::<object_store::Error>());
+    let code = if machine { "58030" } else { crate::codes::of(e) }; // (io_error: Unavailable)
     let error = match crate::codes::kind(code) {
         Missing if matches!(code, "42P01" | "3F000" | "3D000") => UNKNOWN_TOPIC,
         Invalid | Refused | Exists | Missing | Unsupported => INVALID_RECORD,
@@ -754,6 +766,9 @@ fn typed(schema: &Value, v: &mut Value, target: &Schema) -> Result<()> {
 fn connect_value(f: &Value, logical: &str, x: &Value, ty: &DataType) -> Result<Value> {
     let int = || x.as_i64().ok_or_else(|| anyhow!("a {logical} is a whole number, not {x}"));
     let nanos = match logical {
+        // (JsonConverter's `decimal.format=NUMERIC` sends a Decimal as a JSON number: kept as sent, as before
+        // Debezium's encodings were read. Its BASE64 format, the default, is the only one that sends text.)
+        "org.apache.kafka.connect.data.Decimal" if x.is_number() => return Ok(x.clone()),
         "org.apache.kafka.connect.data.Decimal" => {
             let scale = f["parameters"]["scale"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow!("a Decimal names its scale"))?;
             return Ok(Value::String(decimal(x, scale)?));
@@ -795,7 +810,10 @@ fn bytes_of(x: &Value) -> Result<Vec<u8>> {
 }
 
 /// Kafka Connect's Decimal: the unscaled number, big-endian two's complement, then its scale.
+/// A scale past 76 (a DECIMAL's widest) fits no column, and would ask for that many zeros: it is refused
+/// before anything is written out, so a record can't make the node allocate without bound.
 fn decimal(x: &Value, scale: i64) -> Result<String> {
+    ensure!(scale.unsigned_abs() <= 76, "a decimal's scale of {scale} is past 76, the most any DECIMAL has");
     let b = bytes_of(x)?;
     ensure!(!b.is_empty() && b.len() <= 16, "a decimal of {} bytes is past 38 digits", b.len());
     let mut wide = [if b[0] & 0x80 != 0 { 0xff } else { 0 }; 16];
@@ -1569,6 +1587,14 @@ mod tests {
             assert_eq!((code, got, offset), (code, want, -1));
             assert!(said.unwrap().contains("why"), "{code}");
         }
+        // (the OS's or the bucket's error is retried, whatever its words would read as; a coded one keeps its code, 11-06 audit L5)
+        let os = |kind, words: &str| anyhow::Error::from(std::io::Error::new(kind, words.to_string())).context("writing the log");
+        assert_eq!(failed(&os(std::io::ErrorKind::ReadOnlyFilesystem, "Read-only file system (os error 30)")).0, REQUEST_TIMED_OUT);
+        assert_eq!(failed(&os(std::io::ErrorKind::PermissionDenied, "Permission denied (os error 13)")).0, REQUEST_TIMED_OUT);
+        let bucket = anyhow::Error::from(object_store::Error::NotFound { path: "t/1".into(), source: "gone".into() });
+        assert_eq!(failed(&bucket).0, REQUEST_TIMED_OUT);
+        assert_eq!(failed(&anyhow::anyhow!("permission denied for table t")).0, TOPIC_AUTHORIZATION_FAILED);
+        assert_eq!(failed(&crate::codes::coded("25006", "a backup database is read only")).0, INVALID_RECORD);
     }
 
     #[test]
@@ -1638,6 +1664,21 @@ mod tests {
         assert_eq!(decimal(&"AA==".into(), 3).unwrap(), "0.000");
         assert_eq!(decimal(&"Bw==".into(), -2).unwrap(), "700");
         assert!(decimal(&"not base64!".into(), 2).is_err());
+        // A scale past 76 either way is refused before a digit is written (it asked for a terabyte once).
+        assert_eq!(decimal(&"Bw==".into(), 76).unwrap().len(), 78);
+        assert_eq!(decimal(&"Bw==".into(), -76).unwrap(), format!("7{}", "0".repeat(76)));
+        for scale in [77, -77, -1_099_511_627_776, i64::MIN, i64::MAX] {
+            assert!(decimal(&"Bw==".into(), scale).unwrap_err().to_string().contains("past 76"), "{scale}");
+        }
+        let mut huge = serde_json::json!({"num": {"scale": -1_099_511_627_776i64, "value": "Bw=="}});
+        assert!(typed(&row_schema, &mut huge, &target).is_err());
+        let mut wide = serde_json::json!({"balance": "Bw=="});
+        let decimal_schema = |scale: &str| serde_json::json!({"fields": [{"type": "bytes", "name": "org.apache.kafka.connect.data.Decimal", "parameters": {"scale": scale}, "field": "balance"}]});
+        assert!(typed(&decimal_schema("-9000000000"), &mut wide, &target).is_err());
+        // A Decimal as a JSON number (JsonConverter's `decimal.format=NUMERIC`) is kept as sent.
+        let mut numeric = serde_json::json!({"balance": 10.5, "num": {"scale": 1, "value": "AQ=="}});
+        typed(&row_schema, &mut numeric, &target).unwrap();
+        assert_eq!(numeric, serde_json::json!({"balance": 10.5, "num": "0.1"}));
         // A row without the envelope (Debezium's ExtractNewRecordState), and a time into a column that isn't one.
         let mut flat = serde_json::json!({"id": 2, "ts3": 0, "name": 5});
         typed(&row_schema, &mut flat, &target).unwrap();

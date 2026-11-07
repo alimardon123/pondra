@@ -81,10 +81,13 @@ struct Backend {
 
 /// How a connection's sign-in is checked again (`Backend::signed`). Postgres checks a role's privileges at every statement, so
 /// a REVOKE, a DROP USER, NOLOGIN, a new password, or a revoked or expired token reaches a connection already open, as it
-/// reaches HTTP's next request and a stream's next check (`server::until_revoked`). None: the nodes' own tokens and an open
-/// lake's anyone, which `until_revoked` never ends either.
+/// reaches HTTP's next request and a stream's next check (`server::until_revoked`). None: the nodes' own tokens, which
+/// `until_revoked` never ends either.
 #[derive(Clone)]
 enum Again {
+    /// Anyone, at a lake nothing locked (no tokens, no users): ended once the lake is locked (a `CREATE USER`), as
+    /// `until_revoked` ends a stream; before, the connection kept its superuser rights (11-06 audit M2).
+    Open,
     /// A user signed in by its password: its role and grants read again; ended once it no longer signs in or its password is
     /// another.
     User { user: String, verifier: Option<crate::users::Verifier> },
@@ -231,7 +234,7 @@ impl StartupHandler for Startup {
                 pgwire::api::auth::protocol_negotiation(client, startup).await?;
                 pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
                 if app.open().await {
-                    self.backend.signed_in(crate::auth::Principal::of(crate::auth::Role::Admin).at("postgres", Some(client.socket_addr())), None);
+                    self.backend.signed_in(crate::auth::Principal::of(crate::auth::Role::Admin).at("postgres", Some(client.socket_addr())), Some(Again::Open));
                     return finish(client, &self.cancels).await;
                 }
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
@@ -376,7 +379,7 @@ fn user_error(e: anyhow::Error) -> PgWireError {
 impl Backend {
     /// Run one statement the way `POST /sql` does, for a client whose role comes from its user name.
     async fn run(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
-        crate::dialect_stmts::refused(sql).map_err(user_error)?; // (as `statement::run` refuses them: `dialect_stmts.rs`)
+        crate::dialect_stmts::refused(sql).map_err(user_error)?; // (as every door refuses them: `dialect_stmts.rs`)
         if let Some(c) = crate::vars::change(sql) {
             // DECLARE $day …, $day = …: this connection's variable (`vars.rs`)
             let tag = c.tag();
@@ -604,6 +607,10 @@ impl Backend {
     async fn signed_again(&self, again: Again) -> PgWireResult<crate::auth::Principal> {
         let (lake, auth, was) = (&self.app.lake, &self.app.auth, self.who());
         let now = match &again {
+            Again::Open => match self.app.open().await {
+                true => Ok(was.clone()),
+                false => Err("the lake now signs its users in (CREATE USER, or a token): connect again and sign in".into()),
+            },
             Again::Token { user, token } => match crate::users::sign_in(lake, auth, user, token).await {
                 Some(p) => Ok(p),
                 None => Err(crate::sso::why(lake, token).await.unwrap_or_else(|| "its token was revoked or has expired".into())),
@@ -688,8 +695,8 @@ impl Backend {
         if c.query.is_some() || c.format == "binary" {
             return refuse("COPY FROM STDIN takes a table, in text or CSV");
         }
-        let stmt = crate::write::parse(&format!("INSERT INTO {} SELECT 1", c.table)).ok_or_else(|| user_error(anyhow::anyhow!("COPY: no table {}", c.table)))?;
-        self.app.auth.allows(crate::auth::current().map_or(crate::auth::Role::None, |p| p.role), &stmt).map_err(user_error)?;
+        crate::write::parse(&format!("INSERT INTO {} SELECT 1", c.table)).ok_or_else(|| user_error(anyhow::anyhow!("COPY: no table {}", c.table)))?; // (a name SQL takes)
+        crate::writer::may(None, &crate::auth::catalog_name(&c.table), None, deletes(&c)).map_err(user_error)?; // (the caller's rights before anything else: the row doors' one check)
         // In a transaction the rows go to the log as they come, not into the transaction's kept writes (as DDL does,
         // ADR-067 §7): READ ONLY and a failed transaction refuse the COPY (25006, 25P02), and a notice says it ran at once.
         crate::txn::gate(&self.app.lake, &format!("COPY {} FROM STDIN", c.table)).map_err(user_error)?;
@@ -701,10 +708,10 @@ impl Backend {
         if other.is_some() {
             return refuse("COPY into an attached lake: INSERT INTO it instead");
         }
-        let rules = self.app.lake.cat.meta(&crate::store::table_key(&table)).await.map_err(user_error)?.ok_or_else(|| user_error(anyhow::anyhow!("no table {table}")))?.rules().map_err(user_error)?;
-        // (a keyed table's rows replace their keys': UPDATE too; a `_deleted` column named may delete them: S11)
-        crate::auth::check_changes(&table, !rules.key.is_empty(), c.columns.iter().any(|c| c == "_deleted")).map_err(user_error)?;
-        let n = if c.columns.is_empty() { rules.width() } else { c.columns.len() };
+        // (the caller's rights first, as every row door asks them (`writer::may`), and again for each chunk (`load`): a
+        // keyed table's rows replace their keys', UPDATE too; a `_deleted` column named may delete them: S11)
+        let writer = crate::writer::Writer::open(&self.app, None, &table, crate::rules::How::Load, deletes(&c)).await.map_err(|r| user_error(r.into()))?;
+        let n = if c.columns.is_empty() { writer.rules().width() } else { c.columns.len() };
         COPIES.lock().unwrap().insert(client.socket_addr(), Pending { copy: Copy { table, ..c }, data: vec![], ends: Default::default(), rows: 0, seq: 0, job: uuid::Uuid::new_v4().to_string(), ended: false });
         Ok(Response::CopyIn(CopyResponse::new(0, n, stream::empty())))
     }
@@ -731,8 +738,11 @@ impl Backend {
         let header = p.copy.header && p.seq == 0;
         // (both formats read Postgres's UTF-8 only: a chunk that isn't is refused before any line is read)
         let text = crate::pg_bytea::checked_utf8(&chunk).map_err(|b| err(crate::codes::coded(b.code, b.message)))?;
-        let meta = self.app.lake.cat.meta(&crate::store::table_key(&p.copy.table)).await.map_err(err)?.ok_or_else(|| err(anyhow::anyhow!("no table {}", p.copy.table)))?;
-        let rules = meta.rules().map_err(err)?;
+        // Each chunk is written by the caller as it is now: signed in again when its 5 s are up (`signed`: one signed
+        // out ends here), its rights asked again (`writer::may`), and the table's entry as it is now.
+        let who = self.signed().await?;
+        let writer = crate::writer::Writer::open(&self.app, Some(who), &p.copy.table, crate::rules::How::Load, deletes(&p.copy)).await.map_err(|r| err(r.into()))?;
+        let rules = writer.rules().clone();
         let table = rules.schema.clone(); // (SQL's names: ADR-022)
         let given: Vec<String> = if p.copy.columns.is_empty() { rules.order.iter().filter(|c| *c != "_deleted").cloned().collect() } else { p.copy.columns.clone() }; // (as `SELECT *` shows it)
         let schema = Arc::new(Schema::new(given.iter().map(|c| table.field_with_name(c).cloned()).collect::<Result<Vec<_>, _>>().map_err(|e| err(e.into()))?));
@@ -758,11 +768,13 @@ impl Backend {
             let b = crate::pg_copy::typed(cols, &schema).map_err(err)?;
             let b = crate::rules::typed::spelled(&rules, b, true).map_err(err)?; // (`'A0EE…'` in a uuid column as Postgres reads it)
             let left_out = rules.left_out(&given); // (the columns not given take their DEFAULT, or are null)
-            let shaped = crate::rules::shape(&rules, &p.copy.table, crate::rules::Rows::Named(b, left_out), crate::rules::How::Load, &crate::defaults::Node(&self.app.lake)).await.map_err(err)?;
-            p.rows += shaped.rows().num_rows() as u64;
+            let src = crate::log::Src { producer: format!("copy:{}", p.job), seq: p.seq + 1, prev: None };
+            // (each set is committed as it comes, as before: a set refused leaves the ones before it written)
+            let queued = writer.put(crate::rules::Rows::Named(b, left_out), src).await.map_err(|r| err(r.into()))?;
+            let rows = queued.rows.rows().num_rows() as u64;
+            queued.ack.await.map_err(err)?;
+            p.rows += rows;
             p.seq += 1;
-            let src = crate::log::Src { producer: format!("copy:{}", p.job), seq: p.seq, prev: None };
-            self.app.log().map_err(err)?.append_shaped(p.copy.table.clone(), src, shaped).await.map_err(err)?;
         }
         Ok(())
     }
@@ -1280,6 +1292,9 @@ impl Copy {
         Some(Ok(c))
     }
 }
+
+/// Does a COPY name `_deleted`, so its rows may delete (S11)? Then it asks DELETE before its first row.
+fn deletes(c: &Copy) -> bool { c.columns.iter().any(|c| c == "_deleted") }
 
 /// A COPY FROM STDIN under way, per connection: what it loads, and what came that isn't loaded yet. `ended`: its
 /// data's end marker has come, so what follows it is not read. `ends`: where the whole rows of `data` end, as it grows.

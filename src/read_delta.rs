@@ -7,6 +7,7 @@
 //! In the core over `reach::Reach`, so a page reads a lake's published Delta tables too; a node's `TableMeta` is made
 //! from what it finds (`ext::table_meta`).
 use crate::data_file::DataFile;
+use crate::ledger::ByteLru;
 use crate::reach::Reach;
 use crate::scan::{Delete, Outside};
 use anyhow::{bail, ensure, Context, Result};
@@ -32,6 +33,12 @@ pub struct Log {
 }
 
 impl Log {
+    /// About the memory it holds: its actions as parsed, and each writer's transaction.
+    fn bytes(&self) -> usize {
+        let json = crate::ledger::json_bytes;
+        json(&self.protocol) + json(&self.metadata) + self.files.iter().map(|(k, v)| 64 + k.len() + json(v)).sum::<usize>() + self.txns.keys().map(|k| 64 + k.len()).sum::<usize>()
+    }
+
     /// The table's files, as their add actions.
     pub fn live(&self) -> impl Iterator<Item = &Value> { self.files.values() }
 
@@ -63,8 +70,19 @@ fn logical(a: &Value) -> String {
 
 crate::per_node!(
     /// Logs already replayed, by table and version: a commit, once written, never changes, so the
-    /// next statement reads only the commits after the newest it knows.
-    static SEEN: Mutex<lru::LruCache<String, Arc<Log>>> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(16).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+    /// next statement reads only the commits after the newest it knows. The newest 16 tables', each charged its parsed
+    /// actions (`Log::bytes`) to the node's line, which takes them back when it needs the memory (`logs`).
+    static SEEN: Arc<Mutex<ByteLru<String, Arc<Log>>>> = Arc::new(Mutex::new(ByteLru::new(usize::MAX).with_count(16))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+
+/// The replayed Delta logs, as the node's line counts them (`cache_bytes{cache="delta_logs"}`).
+pub fn logs() -> Arc<dyn crate::ledger::Charged> { SEEN.clone() }
+
+/// Keeps a replayed log as the newest `root` knows, charged what it holds; what leaves goes after the lock.
+fn seen(root: &str, log: &Arc<Log>) {
+    let bytes = log.bytes();
+    let left = SEEN.lock().unwrap().put(root.to_string(), log.clone(), bytes);
+    drop(left);
+}
 
 /// A table as its log says it at a version: its columns (name and type), the names of its renamed columns, and its
 /// files. A node makes its own table from it (`ext::table_meta`).
@@ -157,7 +175,7 @@ pub async fn replay(reach: &impl Reach, root: &str, version: Option<i64>) -> Res
     }
     let log = Arc::new(log);
     if version.is_none() {
-        SEEN.lock().unwrap().put(root.to_string(), log.clone());
+        seen(root, &log);
     }
     Ok(log)
 }
@@ -193,7 +211,7 @@ async fn replay_unlisted(reach: &impl Reach, root: &str, version: Option<i64>) -
     apply_commits(reach, root, &mut log, version, newest).await?;
     let log = Arc::new(log);
     if version.is_none() {
-        SEEN.lock().unwrap().put(root.to_string(), log.clone());
+        seen(root, &log);
     }
     Ok(log)
 }
@@ -577,6 +595,24 @@ mod tests {
         put_commits(&web, &root, &[]).await;
         assert_eq!(replay(&web, &root, None).await.unwrap().version, 2);
         assert_eq!(paths(&resolve(&web, &root, None).await.unwrap()), vec![format!("{root}/b.parquet"), format!("{root}/c.parquet")]);
+    }
+
+    /// A replayed log is charged what it parsed to the node's line, which can take it back: the next statement replays it
+    /// again, from its commits (11-07: the logs, kept by count alone, were outside `PONDRA_MEMORY_GB`).
+    #[tokio::test]
+    async fn a_replayed_log_is_charged_to_the_line_and_given_back_when_asked() {
+        let web = web();
+        let root = format!("{ROOT}/charged");
+        put_commits(&web, &root, &[]).await;
+        let log = replay(&web, &root, None).await.unwrap();
+        let bytes = SEEN.lock().unwrap().iter().find(|(k, _)| **k == root).map(|(_, l)| l.bytes()).expect("kept");
+        assert!(bytes > PROTOCOL.len() + METADATA.len(), "its actions as parsed: {bytes}");
+        assert_eq!(bytes, log.bytes());
+        assert!(logs().held() >= bytes);
+        assert!(logs().inside());
+        logs().give_back(usize::MAX);
+        assert!(!SEEN.lock().unwrap().contains(&root), "given back");
+        assert_eq!(replay(&web, &root, None).await.unwrap().version, 2, "replayed again");
     }
 
     #[tokio::test]

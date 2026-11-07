@@ -1,5 +1,7 @@
 //! Other databases' statements for what Pondra writes another way, refused by name (0A000) with what to write, at
-//! every door in the same words (`statement::run`, and the Postgres port's `pg.rs`), before anything else reads them.
+//! every door in the same words, before anything else reads them: a statement at the front (`front::expand`), a script
+//! whole before any of it runs (`routines::script`, so a write tool's script, a task's or a file's is refused as
+//! POST /sql refuses it), and the Postgres port's text before its variables (`pg.rs`).
 //! Each would otherwise fail with the parser's words, or, for MySQL's `UPDATE … JOIN … SET`, with a column it can't see.
 //!
 //! A statement is matched by its words as tokens, so a string or a comment holding them is not:

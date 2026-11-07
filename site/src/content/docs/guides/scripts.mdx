@@ -109,7 +109,9 @@ total
 
 `EXECUTE IMMEDIATE` runs a statement that is made as text, from variables. Its `USING` values are
 bound as `$1`, `$2`, … and never pasted into the text. `INTO` puts the first row's values into
-variables. `IDENTIFIER(value)` turns a value into a table or column name, where a name goes.
+variables. `IDENTIFIER(value)` turns a value into a table or column name, where a name goes. For a
+statement whose text doesn't change, run many times, `PREPARE` names it once and `EXECUTE` runs it
+with its values ([Settings and prepared statements](/pondra/sql/statements/#settings-and-prepared-statements)).
 
 ```sql
 CREATE TABLE amounts (id BIGINT, amount DOUBLE);

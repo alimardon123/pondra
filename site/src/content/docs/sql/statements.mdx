@@ -595,6 +595,10 @@ one script's (statements sent together over HTTP).
   and `'duckdb'` takes DuckDB's `STRUCT(a INT)` in `CREATE TABLE`.
 - A prepared statement can be a query or a write. `EXECUTE` puts its values where `$1`, `$2`, …
   were, each cast to the type `PREPARE` gave, and runs it as if it were sent.
+- `PREPARE` and [`EXECUTE IMMEDIATE`](#scripts) both bind values as `$1`, `$2`, …, never pasted into
+  the text. `PREPARE` is for a statement whose text is fixed: it is named, kept by the session and run
+  many times with `EXECUTE p (values)`. `EXECUTE IMMEDIATE` is for text made as it runs, from
+  variables, and runs it once; a table's or column's name goes in with `IDENTIFIER(value)`.
 - `USE crm` makes `crm`, a schema of this lake, the session's schema. `USE dev` makes an attached
   lake `dev` the database (its `public` schema), and `USE dev.sales` names both. When a name is both
   a database and a schema, say which: `USE DATABASE dev` or `USE SCHEMA dev`. Without a session,

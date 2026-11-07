@@ -33,6 +33,8 @@ impl Charged for Groups {
     fn held(&self) -> usize { self.rows.held() }
 
     fn give_back(&self, bytes: usize) -> usize { self.rows.give_back(bytes) }
+
+    fn inside(&self) -> bool { !crate::store::own_cache_budget() }
 }
 
 impl Groups {
@@ -130,12 +132,12 @@ pub async fn point(lake: &Lake, sql: &str) -> Result<Option<Arc<Point>>> {
 }
 
 async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
-    use datafusion::sql::sqlparser::{ast::*, dialect::GenericDialect, parser::Parser};
+    use datafusion::sql::sqlparser::ast::*;
     let head = sql.trim_start();
     if !head.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("select")) || !sql.to_lowercase().contains(" where ") {
         return Ok(None); // (most statements: no parse)
     }
-    let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Ok(None) };
+    let Ok(mut stmts) = crate::parsed::generic(sql) else { return Ok(None) }; // (the statement's looks parsed it already: `parsed.rs`)
     let (Some(stmt), true) = (stmts.pop(), stmts.is_empty()) else { return Ok(None) };
     let Statement::Query(q) = &stmt else { return Ok(None) };
     let SetExpr::Select(s) = q.body.as_ref() else { return Ok(None) };

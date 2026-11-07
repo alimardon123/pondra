@@ -492,6 +492,9 @@ def external():
     checks["the owner's answers are remembered, but not one that reads a file here: it is read again, changed"] = first == again == [{"s": 3}] and after_lake > before \
         and read1 == [{"s": 1}] and read2 == [{"s": 3}] and after_file == after_lake and q("SELECT sum(a) AS s FROM owned") == [{"s": 6}]
     q("DROP TABLE owned")
+    names = set(re.findall(rb'pondra_cache_bytes\{cache="(\w+)"\}', call(A.port, "GET", "/metrics", headers=hdr)))
+    checks["/metrics counts every cache on the node's line, the node's own with the lake's (tables' manifests, kept pages, Delta logs and Iceberg manifests)"] = \
+        {b"answers", b"facts", b"manifests", b"pages", b"delta_logs", b"iceberg_manifests", b"tails", b"lookups"} <= names
     q("CREATE EXTERNAL TABLE ev (id INT, name VARCHAR) STORED AS CSV LOCATION 'ev/' OPTIONS ('format.has_header' 'false')")
     empty = q("SELECT count(*) AS n FROM ev")
     q("INSERT INTO ev VALUES (1, 'one'), (2, 'two')")
@@ -2868,6 +2871,22 @@ def kafka():
     checks["Debezium's own encodings: a Decimal's bytes, ms and µs times, BYTEA's base64, as the source has them"] = \
         sql_("SELECT id, balance::VARCHAR AS balance, num::VARCHAR AS num, ts3::VARCHAR AS ts3, t::VARCHAR AS t, t3::VARCHAR AS t3, encode(b, 'hex') AS b FROM kinds") == \
         [{"id": 1, "balance": "-3.25", "num": "123.4567", "ts3": "2026-09-01T10:00:00.123", "t": "12:34:56.789012", "t3": "12:34:56.789", "b": "00ff10"}]
+    # A scale past 76 is refused as INVALID_RECORD, and the node stays up: a scale of -2^40 once asked for a terabyte
+    # of zeros and aborted it (11-06 audit H1). A Decimal sent as a JSON number (JsonConverter's decimal.format=NUMERIC)
+    # loads as sent, as it did before Debezium's encodings were read (11-06 audit M3).
+    decimal_at = lambda scale: field("balance", "bytes", "org.apache.kafka.connect.data.Decimal", parameters={"scale": scale})
+    after_only = lambda fs: {"type": "struct", "fields": [{"type": "struct", "field": "after", "optional": True, "fields": fs}, field("op", "string")]}
+    huge, numeric = [], dict(after, id=3, balance=10.5, num=None)
+    for fs, row in [(fields, dict(after, id=2, num={"scale": -(1 << 40), "value": "Bw=="})),
+                    ([decimal_at("-9000000000") if f["field"] == "balance" else f for f in fields], dict(after, id=2, balance="Bw=="))]:
+        p.produce("kinds", key=json.dumps({"id": 2}), value=json.dumps({"schema": after_only(fs), "payload": {"after": row, "op": "c"}}),
+                  on_delivery=lambda e, m: huge.append(e))
+    p.flush(30)  # (a refused record refuses its batch: the good one goes in a batch of its own)
+    p.produce("kinds", key=json.dumps({"id": 3}), value=json.dumps({"schema": envelope, "payload": {"before": None, "after": numeric, "op": "c"}}))
+    p.flush(30)
+    checks["a decimal's scale past 76 is refused as INVALID_RECORD and the node stays up; a Decimal as a JSON number loads as sent"] = \
+        len(huge) == 2 and all(e is not None and e.code() == ck.KafkaError.INVALID_RECORD for e in huge) and \
+        sql_("SELECT id, balance::VARCHAR AS balance FROM kinds ORDER BY id") == [{"id": 1, "balance": "-3.25"}, {"id": 3, "balance": "10.50"}]
     # consumers: kafka-python and librdkafka read the log back from the beginning
     tp = kp.TopicPartition("users", 0)
     c = kp.KafkaConsumer(bootstrap_servers=f"127.0.0.1:{kport}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN",
@@ -4545,7 +4564,7 @@ def scale():
     last_ten = sorted(heapq.nlargest(10, ((f"name-{v % 2000000}", v) for v in range(1, 3000001))))
     spilled_ok = sort_rows == [{"r": 3000000}] and group_rows == [{"g": 2000000, "n": 3000000}] and order_rows is not None and [(r["s"], r["id"]) for r in order_rows] == last_ten
     stopped_http = status == 503 and sqlstate == "53200" and "out of memory" in body
-    stopped_count = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    stopped_count = until(lambda: metrics_of(port).get("pondra_queries_stopped_for_memory_total"), 1, 5)  # (the counter can lag the error by a moment: waited for, not raced)
     # A stop holds the watch for ten seconds (`oom.rs`): each later attempt waits that out, so its refusal is the watch's
     # and not the pool's, and the counter says so.
     time.sleep(11)
@@ -4556,7 +4575,7 @@ def scale():
             stopped_pg = None
         except psycopg.Error as e:
             stopped_pg = (e.sqlstate, "nearly out of memory" in str(e))
-    count_pg = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    count_pg = until(lambda: metrics_of(port).get("pondra_queries_stopped_for_memory_total"), 2, 5)  # (the counter can lag the error by a moment: waited for, not raced)
     time.sleep(11)
     settle()
     session = "harness-stopped-txn"
@@ -4567,7 +4586,7 @@ def scale():
     tx_after = answer("SELECT 1 AS one", session)[1]
     tx_commit = answer("COMMIT", session)[2]
     tx_count = rows_of("SELECT count(*) AS n FROM stopped_tx")
-    count_tx = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    count_tx = until(lambda: metrics_of(port).get("pondra_queries_stopped_for_memory_total"), 3, 5)  # (the counter can lag the error by a moment: waited for, not raced)
     memory_line = {"array_agg_http": [status, sqlstate, body[:160]], "array_agg_seconds": round(agg_seconds, 1), "peak_mb": agg_peak >> 20,
                    "settled_after_s": round(agg_settled, 1), "after_stop_seconds": round(after_seconds, 3), "sort_seconds": round(sort_seconds, 1),
                    "group_seconds": round(group_seconds, 1), "order_seconds": round(order_seconds, 1), "stopped_count": stopped_count,
@@ -4873,7 +4892,7 @@ def _flight_memory_stop(fport, aggregate, stopped, settle):
     except Exception as e:  # (pyarrow raises the gRPC status as its own error: the text carries the status and the message)
         text = str(e)
     stopped_here = bool(re.search(r"resource[ _]exhausted", text, re.I)) and "out of memory" in text
-    counted = (stopped() or 0) == before + 1
+    counted = until(lambda: stopped() or 0, before + 1, 5) == before + 1  # (the counter can lag the error by a moment: waited for, not raced)
     settle()
     try:  # (a refusal fails the check, it doesn't end the run: as `rows_of` does over HTTP)
         after = client.do_get(fl.Ticket(json.dumps({"sql": "SELECT 1 AS one"}))).read_all().to_pylist()
@@ -10545,6 +10564,11 @@ def server():
         and "hr signs in on its own" in str(seen["open_writes"]) and "403" in seen["open_iceberg"] and "people" not in str(seen["open_lists"])
     checks["a database's superuser reads another only as that one lets anyone: open, yes; signing in on its own, no"] = seen["boss_open"] == [{"text": "hi"}] \
         and "sales signs in on its own" in str(seen["boss_locked"])
+    # (11-06 audit L3: a past read is guarded under the name a plain read is, so a grant naming lake.notes reads it as
+    # lake.public.notes AT (…) too; it was guarded as written, and refused)
+    v_notes = _try(lambda: at("hr", "SELECT max(_version) AS v FROM lake.notes", boss)[0]["v"])
+    seen["ann_past"] = [at("hr", f"SELECT text FROM {n} AT (VERSION => {v_notes})", ann) for n in ("lake.notes", "lake.public.notes")]
+    checks["a grant naming an attached lake's table reads it as it was too, by lake.t and lake.schema.t (AT (VERSION => n))"] = seen["ann_past"] == [[{"text": "hi"}]] * 2
     # Whoever runs the nodes (one of their tokens) still reads across; a user of the node's own lake doesn't.
     mine = new_lake()
     subprocess.run([BIN, "sql", "--dir", mine, "CREATE TABLE t AS SELECT 1 AS id"], check=True, capture_output=True)
@@ -10768,12 +10792,24 @@ def users():
     boss = basic("boss", "boss-password-1")
     # Open, until a user who signs in exists; then nothing without a sign-in (no token is set)
     opened = as_(A.port, None, "SELECT 1 AS x")
+    unreadable_open = as_(A.port, "Basic !!!", "SELECT 1 AS x")  # (before: taken for no sign-in, an open node's admin)
+    open_pg = psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=anyone dbname=lake", connect_timeout=10, autocommit=True)  # (made while the lake is open)
+    open_said = [open_pg.execute("SELECT 1 AS x").fetchall()]
     for q in ["CREATE SCHEMA sales", "CREATE TABLE sales.orders (id BIGINT, item VARCHAR, amount DOUBLE, card VARCHAR)", "INSERT INTO sales.orders VALUES (1, 'tea', 2.5, '4111'), (2, 'cake', 4.0, '5500')",
               "CREATE TABLE hr (id BIGINT, salary DOUBLE)", "INSERT INTO hr VALUES (1, 100.0)", "CREATE TABLE notes (id BIGINT, text VARCHAR)", "INSERT INTO notes VALUES (1, 'hello')",
               "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:
         as_(A.port, None, q)
     closed = until(lambda: as_(A.port, None, "SELECT 1 AS x"), "ERROR 401: b\"sign in: a token, or a user's name and password\"", 10)
     checks["open until a user who signs in exists; then nothing without a sign-in (no token set)"] = opened == [{"x": 1}] and closed.startswith("ERROR 401")
+    # …and a Postgres connection made while it was open is ended at its next check (5 s), as a stream is; before, it kept its
+    # superuser rights after the CREATE USER (11-06 audit M2)
+    time.sleep(5.5)
+    try:
+        open_said.append(open_pg.execute("SELECT 1 AS x").fetchall())
+    except Exception as e:
+        open_said.append(f"ERROR {e}")
+    checks["a Postgres connection made while the lake was open is ended once a user who signs in exists"] = open_said[0] == [(1,)] and \
+        "the lake now signs its users in" in str(open_said[1])
     for q in ["CREATE USER ann PASSWORD 'ann-password-1'", "CREATE ROLE analyst", "GRANT SELECT (id, item, amount) ON sales.orders TO analyst", "GRANT analyst TO ann",
               "CREATE USER bob PASSWORD 'bob-password-1'", "GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA sales TO bob", "GRANT SELECT ON notes TO public", "CREATE USER svc"]:
         as_(A.port, boss, q)
@@ -10844,6 +10880,7 @@ def users():
     shown["applier_export"] = as_(A.port, dee, b"", method="GET", path="/export")
     names = sorted(o["name"] for o in shown["objects"]["objects"]) if isinstance(shown["objects"], dict) else shown["objects"]
     shown_info = {k: v for k, v in shown.items() if k != "objects"} | {"objects": names}
+    shown_info["open pg"] = open_said
     checks["a user is shown only the tables it may read (GET /objects) and no routine's code: /routines, information_schema, pg_proc, pondra.objects, SHOW CREATE (S27); an admin all of it"] = \
         names == ["notes", "orders"] and isinstance(shown["routines"], dict) and shown["routines"].get("leak", {}).get("body") == "" \
         and "INSERT INTO sales.refunds" in json.dumps(shown["boss_routines"]) and shown["defined"] == [(None,)] and shown["prosrc"] == [(None,)] \
@@ -10961,6 +10998,23 @@ def users():
     token_said.append(tsql("SELECT salary FROM hr"))
     shown_info["flight token"] = token_said
     checks["Flight: a handshake with a user's token hands back that token, so a dropped one signs nothing in"] = token_said[:2] == [True, [{"salary": 100.0}]] and str(token_said[2]).startswith("ERROR")
+    # A credential that can't be read (`auth::Credential`): refused by name, the same words at HTTP, MCP and Flight, and
+    # at an open node too, never taken for no sign-in
+    def flight_unreadable(header):
+        try:
+            c = fl.FlightClient(f"grpc://127.0.0.1:{A.port + 30}")
+            c.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": "SELECT 1 AS x"})), fl.FlightCallOptions(headers=[(b"authorization", header)]))
+            return "answered"
+        except Exception as e:
+            return f"ERROR {e}"
+    no_colon = "Basic " + base64.b64encode(b"ann").decode()
+    unreadable = [as_(A.port, h, "SELECT 1 AS x") for h in ("Basic !!!", "Bearer", no_colon)] + \
+        [as_(A.port, "Basic !!!", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), path="/mcp")] + \
+        [flight_unreadable(h) for h in (b"Basic !!!", b"Bearer", no_colon.encode())]
+    shown_info["unreadable"] = [str(r)[:160] for r in [unreadable_open] + unreadable]
+    checks["a credential that can't be read is refused by name at HTTP, MCP and Flight, at an open node too"] = \
+        all("the credential can't be read" in str(r) for r in [unreadable_open] + unreadable) \
+        and all(str(r).startswith("ERROR 401") for r in [unreadable_open] + unreadable[:4])
     # MCP: a listing shows what a user may read; changes (a stream of rows, every column, as /watch's) is refused without them
     def tool_result(name, args):
         out = as_(A.port, ann, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}), path="/mcp")
@@ -11013,6 +11067,37 @@ def users():
         or {"before": ann_before, "revoked": ann_revoked, "last": ann_last[-3:]}
     checks["revoked (a column, a role) and dropped: at once on the leader and a follower; pondra.grants says what stands"] = revoked == [True, True] and still == [{"id": 1}, {"id": 2}] \
         and no_role is True and gone == [True, True] and {"grantee": "analyst", "privilege": "SELECT", "on_name": "sales.orders", "columns": "id, amount"} in grants
+    # A COPY's rights are asked for each chunk it loads (step 9, `writer::may`): a REVOKE in the middle of a long COPY stops it
+    # at its next chunk, once the connection's sign-in is checked again (every 5 s), 42501. Each chunk is committed as it
+    # comes, as before, so the chunks loaded before the REVOKE stay. (Outside `sales`, whose tables bob is granted all of;
+    # libpq keeps what a full socket didn't take until it is flushed, so each 34 MB is flushed before the next step.)
+    for q in ["CREATE TABLE copied (a VARCHAR)", "GRANT INSERT ON copied TO bob"]:
+        as_(A.port, boss, q)
+    chunk, copy_out = (b"x" * 999 + b"\n") * 34000, {}  # (34 MB: past the 32 MB a COPY gathers before it loads them)
+    def copied_n():
+        r = as_(A.port, boss, "SELECT count(*) AS n FROM copied")
+        return r[0]["n"] if isinstance(r, list) and r else None
+    def sent(pg, cp):
+        for k in range(0, len(chunk), 1 << 20):
+            cp.write(chunk[k:k + (1 << 20)])
+        for _ in range(3000):
+            if pg.pgconn.flush() == 0:
+                break
+            time.sleep(0.01)
+    try:
+        with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=bob password=bob-password-1 dbname=lake", connect_timeout=10, autocommit=True) as bob_pg:
+            with bob_pg.cursor().copy("COPY copied FROM STDIN") as cp:
+                sent(bob_pg, cp)
+                copy_out["first"] = until(lambda: (copied_n() or 0) > 0, True, 30)
+                copy_out["revoked"] = as_(A.port, boss, "REVOKE INSERT ON copied FROM bob")
+                time.sleep(5.5)
+                sent(bob_pg, cp)
+        copy_out["end"] = "accepted"
+    except psycopg.Error as e:
+        copy_out["end"] = f"{e.sqlstate} {e}"
+    copy_out["rows"] = copied_n()
+    checks["a REVOKE in the middle of a long COPY stops it at its next chunk (42501), and the chunks before it stay written"] = \
+        copy_out["first"] is True and copy_out["end"].startswith("42501") and "permission denied" in copy_out["end"] and 0 < (copy_out["rows"] or 0) < 68000 or copy_out
     # W50: a user granted a view (and a materialized view) alone is shown their names, columns and rows, not their queries,
     # the base table's name or the filter; a listing shows the view as a read does; the server's folder is an admin's
     vee_pw = "vee-password-1"
@@ -11082,7 +11167,7 @@ def users():
             "tokens": [by_token, expired, by_session, tampered, ended, dropped_token], "shown": shown_info}
     info["w50"] = w50  # (a view granted alone: what it was shown, for a failing check)
     a.kill(), b.kill()  # (the ports free for the next test of `all`)
-    ok = all(checks.values())
+    ok = all(v is True for v in checks.values())  # (a check that failed says why as a dict, which is truthy)
     print(json.dumps({"users": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:
         sys.exit(1)  # (as the other sections: a false check ends the run with a failing status, and `all` with it)
@@ -21422,6 +21507,14 @@ def registry():
         and all(k["inside"] and set(k["inside"]) <= object_names for k in kinds if k["is"] == "part") \
         and all(k["lists"] for k in kinds if k["is"] == "pattern") \
         and {k["kind"] for k in kinds if k["is"] == "object" and k["on_clone"] == "leave"} == {"secret", "share", "recipient"}
+    checks["pondra.functions lists each function under the set that gives it"] = \
+        q("SELECT source FROM pondra.functions WHERE name = 'quote_ident' AND kind = 'scalar'") == [{"source": "postgres"}] \
+        and q("SELECT count(*) AS n FROM pondra.functions WHERE source = 'datafusion'")[0]["n"] > 100
+    settings = {r["variable"]: r for r in q("SELECT * FROM pondra.settings")}
+    info["settings"] = len(settings)
+    checks["pondra.settings lists the node's settings and an extension's, a test's hooks left out"] = \
+        settings.get("PONDRA_MEMORY_GB", {}).get("type") == "gb" and settings.get("PONDRA_AI_MODEL", {}).get("default_value") == "llama3.2" \
+        and settings["PONDRA_AI_KEY"]["type"] == "secret" and not any(v.startswith("PONDRA_TEST_") for v in settings)
     missing = [http(s)[0] for s in ("SHOW CREATE TABLE nothing_here", "COMMENT ON TABLE nothing_here IS 'x'", "COMMENT ON COLUMN events.nothing IS 'x'", "COMMENT ON COLUMN eu_orders.region IS 'x'")]
     quiet = q("COMMENT IF EXISTS ON TABLE nothing_here IS 'x'")
     checks["what isn't there: refused by name (4xx), or nothing with IF EXISTS"] = all(400 <= s < 500 for s in missing) and quiet.get("exists") is False
@@ -25444,6 +25537,40 @@ def friendly():
     checks["the Postgres port refuses SQL Server's SET NOCOUNT ON by name too, 0A000"] = port_refusal is not None and port_refusal[0] == "0A000" and "SET NOCOUNT is SQL Server's" in port_refusal[1]
     if not checks[list(checks)[-1]]:
         failed["port refusal"] = port_refusal
+    # (11-02 audit M14: another database's statement anywhere in a script refuses the whole script before any of it runs,
+    # at every door that runs one. POST /sql did; MCP's write tool, a task's and a file's ran the CREATE first.)
+    whole = {}
+    for door in ("http", "mcp"):
+        text = f"CREATE TABLE m14_{door} (a INT); REPLACE INTO m14_{door} VALUES (1)"
+        if door == "http":
+            c.request("POST", "/sql", text.encode())
+            r = c.getresponse()
+            whole[door] = (r.getheader("x-pondra-sqlstate"), r.read().decode()[:200])
+        else:
+            call_ = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "write", "arguments": {"sql": text}}}).encode()
+            res = json.loads(urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/mcp", data=call_, headers={"content-type": "application/json"})).read())["result"]
+            whole[door] = (res.get("isError"), res["content"][0]["text"][:200])
+    whole["made"] = [r["table_name"] for r in sql(A.port, "SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'm14%'")]
+    checks["a script with another database's statement is refused whole before any of it runs, over HTTP and MCP's write tool alike (0A000, nothing made)"] = \
+        whole["http"][0] == "0A000" and "REPLACE INTO is MySQL's" in whole["http"][1] and whole["mcp"][0] is True and "REPLACE INTO is MySQL's" in whole["mcp"][1] and whole["made"] == []
+    if not checks[list(checks)[-1]]:
+        failed["script refused whole"] = whole
+    # (11-06 audit M7: a text is split where the tokenizer reads a `;`, so one in E'…' after an escaped quote ends nothing,
+    # over HTTP and on the Postgres port's simple query; both cut it there and failed "unterminated string")
+    e_text = "SELECT E'it\\'s; ok' AS s"
+    c.request("POST", "/sql", e_text.encode())
+    r = c.getresponse()
+    e_said = {"http": (r.status, r.read().decode()[:200])}
+    try:
+        with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pc:
+            res = pc.pgconn.exec_(e_text.encode())  # (libpq's simple query: the port splits its text into statements)
+            e_said["port"] = res.get_value(0, 0).decode() if res.ntuples == 1 else (res.error_message or b"").decode(errors="replace")[:200]
+    except psycopg.Error as e:
+        e_said["port"] = str(e)[:200]
+    checks["a ; inside E'…' after an escaped quote ends no statement, over HTTP and on the Postgres port's simple query"] = \
+        e_said["http"][0] == 200 and json.loads(e_said["http"][1]) == [{"s": "it's; ok"}] and e_said["port"] == "it's; ok"
+    if not checks[list(checks)[-1]]:
+        failed["E-string split"] = e_said
     # (11-02 audit M13: a UBIGINT went out as INT8, and 2^63 and above as NULL)
     try:
         with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pc:

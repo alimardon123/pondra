@@ -61,6 +61,7 @@ const NEED: usize = 1 << 16;
 
 pub struct Hot {
     max: usize,
+    own: bool,    // its budget is the user's (`PONDRA_HOT_GB`): kept beside the whole line (`ledger::Charged::inside`)
     memory: bool, // a lake held in memory (`memory://`): see the module's doc
     state: Mutex<State>,
     slot: tokio::sync::Semaphore, // one file at a time: loading competes with queries for CPU
@@ -119,6 +120,8 @@ impl crate::ledger::Charged for Hot {
     fn held(&self) -> usize { self.usage().0 }
 
     fn give_back(&self, bytes: usize) -> usize { self.trim(bytes) }
+
+    fn inside(&self) -> bool { !self.own }
 }
 
 impl Hot {
@@ -132,7 +135,7 @@ impl Hot {
             (None, true) => crate::store::memory_limit(),
             (None, false) => crate::store::memory_limit() / 4,
         });
-        Hot { max, memory, state: Default::default(), slot: tokio::sync::Semaphore::new(1) }
+        Hot { max, own: gb.is_some(), memory, state: Default::default(), slot: tokio::sync::Semaphore::new(1) }
     }
 
     pub fn on(&self) -> bool { self.max > 0 }
@@ -144,12 +147,18 @@ impl Hot {
     }
 
     /// Drop the least recently read columns until `bytes` are freed, and say how many were (the one
-    /// watch, `oom::start`, asks for it when the node's memory passes its trim line).
+    /// watch, `oom::start`, asks for it when the node's memory passes its trim line, and a query's grow
+    /// past the whole line, `ledger::Ledger`).
     pub(crate) fn trim(&self, bytes: usize) -> usize {
-        let mut s = self.state.lock().unwrap();
+        // (never waiting on a reader: a scan holding the lock gives back nothing now, and the columns go once it's let go)
+        let mut s = match self.state.try_lock() {
+            Ok(s) => s,
+            Err(std::sync::TryLockError::WouldBlock) => return 0,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        };
         let mut oldest: Vec<(Instant, (String, String))> = s.cols.iter().map(|(k, c)| (c.read, k.clone())).collect();
         oldest.sort();
-        let mut freed = 0;
+        let (mut freed, mut gone) = (0, vec![]);
         for (_, k) in oldest {
             if freed >= bytes {
                 break;
@@ -159,8 +168,11 @@ impl Hot {
                 if !s.cols.keys().any(|(file, _)| *file == k.0) {
                     s.rows.remove(&k.0);
                 }
+                gone.push(c);
             }
         }
+        drop(s);
+        drop(gone); // (the columns' memory is let go of after the lock)
         freed
     }
 
@@ -239,10 +251,21 @@ impl Hot {
         crate::panics::spawn(async move {
             let _ = gate.await; // (the scan's query is over: its plan was dropped)
             let _slot = hot.slot.acquire().await;
-            let decoded = decode(&lake, &file, &fields, deletes).await;
+            // (the room now, not when the scan asked: its query is over, and the next may hold what it left)
+            let room = hot.room_for(&lake);
+            let fits = {
+                let hot = hot.clone();
+                move |estimate: usize| hot.state.lock().unwrap().room(estimate, room)
+            };
+            let decoded = decode(&lake, &file, &fields, deletes, fits).await;
+            let room = hot.room_for(&lake);
             let mut s = hot.state.lock().unwrap();
             s.busy.remove(&key);
-            let Ok((rows, arrays, ranges)) = decoded else { return };
+            let (rows, arrays, ranges) = match decoded {
+                Ok(Ok(decoded)) => decoded,
+                Ok(Err(estimate)) => return s.needs(key.clone(), estimate), // (its footer says it can't fit: not decoded)
+                Err(_) => return,
+            };
             if s.rows.get(&key).is_some_and(|r| **r != rows) {
                 return; // (batches cut differently: can't be combined)
             }
@@ -269,6 +292,9 @@ impl Hot {
     /// than loading what the watch would trim and decoding it again. Its budget is beside the query memory where
     /// the watch runs, which gives the columns back before it stops a query; where none runs (`pondra sql`, a
     /// page), nothing would give them back, so they take only what queries don't reserve, as they did everywhere.
+    /// Within the whole line too, where the queries and the caches fit together (`ledger::Ledger`, all of
+    /// `PONDRA_MEMORY_GB` when it is set): no more than what the queries' reservations and the other caches leave,
+    /// unless `PONDRA_HOT_GB` gives the columns a budget of their own.
     /// Called outside the state's lock (it takes the lock itself).
     pub fn room_for(&self, lake: &Lake) -> usize {
         let room = match crate::oom::watching() {
@@ -278,8 +304,14 @@ impl Hot {
                 self.max.min(limit.saturating_sub(reserved))
             }
         };
+        let held = self.usage().0;
+        let room = match lake.ledger() {
+            // (what the caches held at the watch's last look counts these columns too)
+            Some(l) if !self.own => room.min(l.whole().saturating_sub(l.reserved().saturating_add(l.cached().saturating_sub(held)))),
+            _ => room,
+        };
         match crate::oom::trim_line() {
-            Some(trim) => room.min(self.usage().0 + trim.saturating_sub(crate::store::resident().unwrap_or(0))),
+            Some(trim) => room.min(held + trim.saturating_sub(crate::store::resident().unwrap_or(0))),
             None => room,
         }
     }
@@ -356,14 +388,14 @@ impl State {
     /// Should a scan of this file decode it into the cache? Not on a lake's first read of it (a lake in memory: its first
     /// too), and only when there is room for it: for a file that didn't fit before, the room its decoded size took, not a
     /// guess of it (`need`), so a cache with no room for it doesn't decode it on every read and throw it away (a lake in
-    /// memory guesses nothing: its file is decoded and fits or not).
+    /// memory guesses nothing here: its load reads the file's footer and decodes it only if that fits).
     fn tries(&mut self, key: &str, guess: usize, memory: bool, room: usize) -> bool {
         let need = self.need.get(key).copied().unwrap_or(if memory { 0 } else { guess });
         (memory || self.twice(key)) && self.room(need, room)
     }
 
-    /// Notes that `key` decodes to `bytes`, which didn't fit (`need`). Bounded as `once` is: past [`NEED`] files one noted
-    /// before is let go of, and is decoded again if it is read.
+    /// Notes that `key` decodes to `bytes` (or its footer says it would), which didn't fit (`need`). Bounded as `once` is:
+    /// past [`NEED`] files one noted before is let go of, and is decoded again if it is read.
     fn needs(&mut self, key: String, bytes: usize) {
         if self.need.len() >= NEED && !self.need.contains_key(&key) {
             if let Some(any) = self.need.keys().next().cloned() {
@@ -435,7 +467,11 @@ fn base(key: &str) -> &str { key.rsplit_once('#').map_or(key, |(path, _)| path) 
 /// `fields` of `file`, cast to their types (a column the file lacks, added to the table after it
 /// was written, is null): rows per batch, and each field's arrays and their ranges. Its system
 /// columns come from its lineage if it has one; with `deletes`, its deleted rows are left out.
-async fn decode(lake: &Lake, file: &DataFile, fields: &[FieldRef], deletes: bool) -> Result<(Vec<usize>, Vec<Vec<ArrayRef>>, Vec<Option<Ranges>>)> {
+/// A file's columns `fields`, decoded: each batch's rows, each column's arrays, and their ranges. First its footer says
+/// about what they decode to (`estimate`), and `fits` whether that has room: if not, nothing is decoded, and the
+/// estimate is handed back (a file of a lake in memory was decoded in full and thrown away: at a 0.25 GB
+/// `PONDRA_MEMORY_GB`, a second lineitem file of 248 MB, its decode taking the process from 1.1 to 1.58 GB).
+async fn decode(lake: &Lake, file: &DataFile, fields: &[FieldRef], deletes: bool, fits: impl FnOnce(usize) -> bool + Send + 'static) -> Result<std::result::Result<Decoded, usize>> {
     let bytes = lake.object(&file.path).await?;
     let gone = if deletes && !file.deletes.is_empty() { crate::lake_scan::deleted_rows(lake, file).await? } else { vec![] };
     let (fields, lineage) = (fields.to_vec(), file.lineage);
@@ -450,6 +486,10 @@ async fn decode(lake: &Lake, file: &DataFile, fields: &[FieldRef], deletes: bool
         let b = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, ArrowReaderOptions::new().with_schema(hint))?;
         let present: Vec<usize> = fields.iter().filter_map(|f| b.schema().index_of(f.name()).ok()).collect();
         let mask = ProjectionMask::roots(b.parquet_schema(), present);
+        let guess = estimate(b.metadata(), &mask);
+        if !fits(guess) {
+            return Ok(Err(guess));
+        }
         let (mut rows, mut out, mut at, mut next) = (vec![], vec![vec![]; fields.len()], 0, 0); // (at: the batch's first row's place in the file)
         for batch in b.with_projection(mask).with_batch_size(BATCH).build()? {
             let batch = batch?;
@@ -474,9 +514,36 @@ async fn decode(lake: &Lake, file: &DataFile, fields: &[FieldRef], deletes: bool
         }
         let ranges = out.iter().map(|arrays| ranges(arrays)).collect();
         let out = out.into_iter().map(whole).collect();
-        Ok((rows, out, ranges))
+        Ok(Ok((rows, out, ranges)))
     })
     .await?
+}
+
+/// What `decode` gives: each batch's rows, each column's arrays (a batch each), and each column's ranges.
+type Decoded = (Vec<usize>, Vec<Vec<ArrayRef>>, Vec<Option<Ranges>>);
+
+/// About the bytes the columns `mask` takes decode to, from the file's footer: each column chunk's uncompressed bytes,
+/// and at least its rows times what a value takes once decoded (a dictionary's indices decode to whole values; a string
+/// to a 16-byte view beside its bytes).
+fn estimate(meta: &datafusion::parquet::file::metadata::ParquetMetaData, mask: &ProjectionMask) -> usize {
+    use datafusion::parquet::basic::Type;
+    let columns = meta.file_metadata().schema_descr().columns();
+    let mut bytes = 0usize;
+    for g in meta.row_groups() {
+        let rows = g.num_rows().max(0) as usize;
+        for (i, c) in columns.iter().enumerate().filter(|(i, _)| mask.leaf_included(*i)) {
+            let raw = g.column(i).uncompressed_size().max(0) as usize;
+            bytes += match c.physical_type() {
+                Type::BYTE_ARRAY => raw + rows * 16,
+                Type::BOOLEAN => raw.max(rows / 8),
+                Type::INT32 | Type::FLOAT => raw.max(rows * 4),
+                Type::INT64 | Type::DOUBLE => raw.max(rows * 8),
+                Type::INT96 => raw.max(rows * 16), // (read as a timestamp of 8 bytes, or 12 kept: the larger)
+                Type::FIXED_LEN_BYTE_ARRAY => raw.max(rows * c.type_length().max(1) as usize),
+            };
+        }
+    }
+    bytes
 }
 
 /// A file's batches of one column copied into one allocation of their own (invariant 212), each buffer a piece of
@@ -1184,7 +1251,7 @@ mod tests {
     /// (11-03 audit M3: in a lake on disk such entries stayed for the node's life), with or without its deleted rows.
     #[test]
     fn a_replaced_file_that_didnt_fit_is_let_go_of() {
-        let hot = Hot { max: 1 << 30, memory: false, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
+        let hot = Hot { max: 1 << 30, own: false, memory: false, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
         let noted = ["data/t/a.parquet", "data/t/a.parquet#2", "data/t/b.parquet"];
         hot.state.lock().unwrap().need.extend(noted.map(|k| (k.to_string(), 150)));
         hot.forget(&[("data/t/a.parquet".to_string(), 1)]);
@@ -1197,7 +1264,7 @@ mod tests {
 
     #[test]
     fn put_holds_a_file_in_the_readers_batches() {
-        let hot = Hot { max: 1 << 30, memory: false, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
+        let hot = Hot { max: 1 << 30, own: false, memory: false, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
         // Three writes of different sizes: the file is still read in batches of 8,192 rows.
         let pieces = [(0i64, 5_000i64), (5_000, 20_000), (25_000, 3)];
         let ints: Vec<ArrayRef> = pieces.iter().map(|&(from, n)| Arc::new(Int64Array::from_iter_values(from..from + n)) as ArrayRef).collect();
@@ -1220,6 +1287,32 @@ mod tests {
         let held_fields = hot.columns("t", &schema);
         assert_eq!(names_and_types(held_fields), vec![("i".to_string(), DataType::Int64), ("s".to_string(), DataType::Utf8View)]);
         assert!(hot.columns("t2", &schema).is_empty());
+    }
+
+    /// A file's footer tells about what its columns decode to before any page is: no less than they hold once decoded,
+    /// and not wildly more, for numbers, distinct strings and a string of three values (whose dictionary's indices
+    /// decode to a 16-byte view each). Only the columns asked for count.
+    #[test]
+    fn a_footer_tells_about_what_a_files_columns_decode_to() {
+        use datafusion::parquet::arrow::ArrowWriter;
+        let n = 100_000i64;
+        let ints: ArrayRef = Arc::new(Int64Array::from_iter_values(0..n));
+        let names: ArrayRef = Arc::new(StringViewArray::from_iter_values((0..n).map(|v| format!("name number {v}"))));
+        let flags: ArrayRef = Arc::new(StringViewArray::from_iter_values((0..n).map(|v| ["A", "N", "R"][v as usize % 3])));
+        let batch = RecordBatch::try_from_iter(vec![("i", ints), ("name", names), ("flag", flags)]).unwrap();
+        let mut body = vec![];
+        let mut w = ArrowWriter::try_new(&mut body, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let b = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(body)).unwrap();
+        for (c, name) in [(0usize, "i"), (1, "name"), (2, "flag")] {
+            let decoded = size(&whole(vec![batch.column(c).clone()]));
+            let guess = estimate(b.metadata(), &ProjectionMask::roots(b.parquet_schema(), [c]));
+            assert!(guess >= decoded && guess <= decoded * 3, "{name}: guessed {guess} for {decoded}");
+        }
+        let one = estimate(b.metadata(), &ProjectionMask::roots(b.parquet_schema(), [0]));
+        let all = estimate(b.metadata(), &ProjectionMask::roots(b.parquet_schema(), [0, 1, 2]));
+        assert!(all > one * 3, "the columns asked for: {one} of {all}");
     }
 
     #[test]

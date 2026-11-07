@@ -14,7 +14,9 @@
 //! they freed, so a long cheap request started early is not stopped for a query that grew the node.
 //! The one watch lets the node's caches go first, under the line (`of_line`), since what a cache held is read
 //! again when it is needed: the caches charged to the node's lines (`ledger::Charged`), each lake's in the order
-//! `Lake::caches` lists them, its hot columns first (`hot.rs`). It stops a query only past the line itself.
+//! `Lake::caches` lists them, its hot columns first (`hot.rs`). It stops a query only past the line itself. At each
+//! look it notes what the caches hold, which a query's grow past the whole line goes by to take cache bytes back
+//! before it spills (`ledger::Ledger`): the trim line is that whole line, unless `PONDRA_MEMORY_GB` sets it.
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
@@ -201,6 +203,9 @@ pub fn start() {
             let mut settling = false; // (a stop this watch made still holds, or its request is still ending)
             let resident = crate::store::resident().unwrap_or(0);
             SEEN.store(resident, Relaxed); // (what the OS says: `noted` and `pick` compare it)
+            for ledger in crate::store::ledgers() {
+                ledger.note(); // (what the caches hold, which a query's grow goes by until the next look: `ledger::Ledger`)
+            }
             crate::panics::note(resident); // (a request that started unread takes this look's reading, before any stop)
             let now = Instant::now();
             let mut felt = resident;
@@ -258,7 +263,7 @@ pub fn start() {
             match line {
                 Some(line) if crate::panics::running() => tokio::time::sleep(every(felt, trim, line, settling)).await,
                 _ => {
-                    let timer = if crate::store::ledgers().iter().any(|l| l.held() > 0) { Duration::from_secs(2) } else { Duration::from_secs(30) };
+                    let timer = if crate::store::ledgers().iter().any(|l| l.cached() > 0) { Duration::from_secs(2) } else { Duration::from_secs(30) };
                     IDLE.store(true, Relaxed);
                     let _ = tokio::time::timeout(timer, WAKE.notified()).await;
                     IDLE.store(false, Relaxed);
