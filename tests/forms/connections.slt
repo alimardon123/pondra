@@ -12,7 +12,7 @@ CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://bucket/incoming');
 statement error 42710 already exists
 CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://other')
 
-statement error 22023 this build's types are s3, gcs, azure, folder, pondra
+statement error 22023 this build's types are azure, delta, folder, gcs, iceberg, .*s3 or share
 CREATE CONNECTION shop TYPE postgres WITH (host = 'db')
 
 statement error 22023 has no option region: its options are url, secret
@@ -68,3 +68,22 @@ DROP CONNECTION landing
 
 statement ok
 DROP CONNECTION IF EXISTS landing
+
+# A type for tables is its own extension's entry (piece 3: read_delta, catalogs, kafka_client, sharing_client), and
+# ATTACH reads the same entries: its TYPE list and each type's options are CREATE CONNECTION's.
+statement ok
+CREATE CONNECTION tables TYPE delta WITH (url = 's3://bucket/tables', read_only = true)
+
+query T
+SHOW CREATE CONNECTION tables
+----
+CREATE CONNECTION tables TYPE delta WITH (read_only = true, url = 's3://bucket/tables');
+
+statement error 22023 has no option endpoint: secret, read_only \(endpoint is TYPE iceberg's\)
+ATTACH 's3://bucket/tables' AS t (TYPE delta, ENDPOINT 'https://catalog')
+
+statement error 22023 ATTACH … \(TYPE s3\): delta, iceberg, kafka or share
+ATTACH 's3://bucket/tables' AS t (TYPE s3)
+
+statement ok
+DROP CONNECTION tables
