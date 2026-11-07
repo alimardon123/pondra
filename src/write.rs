@@ -1027,9 +1027,10 @@ fn placed(sql: &str) -> Option<Stmt> {
 
 /// `ALTER TABLE t ADD COLUMN c TYPE`: the table's definition with the new column at the end, sent
 /// like a CREATE TABLE (the leader adds it; old rows read it as null). None: IF NOT EXISTS, and it does.
-async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
+/// `table` is the statement's table as `lake` names it (an attached lake's table by its name there, not `l.s.t`).
+async fn alter_spec(lake: &Lake, table: &str, stmt: &Stmt) -> Result<Option<String>> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
-    let table = stmt.table();
+    let table = table.to_string();
     let m: TableMeta = (*lake.table_meta(&table).await?).clone().logical(); // (as SQL names it)
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
     let mut spec = j!({"columns": m.to_columns(), "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": crate::objects::not_null_columns(&m), "defaults": crate::objects::column_defaults(&m), "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds"))});
@@ -1904,7 +1905,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         }
         Stmt::Define(_, spec) => return define(app, &table, spec).await,
         Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => {
-            return match alter_spec(lake, &stmt).await? {
+            return match alter_spec(lake, &table, &stmt).await? {
                 Some(spec) => define(app, t, &spec).await,
                 None => Ok(j!({"table": t, "unchanged": true})),
             };
@@ -2525,7 +2526,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
         _ => {}
     }
     if let Stmt::AddColumn(..) | Stmt::SetOptions(..) = stmt {
-        return Ok(alter_spec(target, stmt).await?.map(|spec| Request::Table(table.into(), spec)));
+        return Ok(alter_spec(target, table, stmt).await?.map(|spec| Request::Table(table.into(), spec))); // (by its name there: ADD COLUMN under USE of a branch found no table)
     }
     if let Some(sql) = changes_in(target, true, table, stmt).await? {
         let (sql, sent) = crate::change::for_leader(query, target, &stmt.table(), table, &sql, files).await?; // (files here: this machine's)

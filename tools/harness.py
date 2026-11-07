@@ -23856,6 +23856,17 @@ def use_path():
         all(st != 200 and code == "0A000" and "under USE of other: other is an attached lake" in str(body) for st, code, body in info["schema under USE other"]) \
         and q("SELECT count(*) AS n FROM crm.t") == crm_before and crm_before[0]["n"] > 0 \
         and q("SELECT count(*) AS n FROM information_schema.schemata WHERE schema_name IN ('crm', 'crm2', 'made_in_other')") == [{"n": 1}]
+    # A routine's or a type's name is placed only when the path has it: under USE other, DROP MACRO here_m dropped this
+    # lake's here_m, as other has none (and so for a function and a type). It is refused by name, 0A000.
+    q("CREATE MACRO here_m(a) AS a + 1")
+    q("CREATE FUNCTION here_f(a INT) RETURNS INT AS 'SELECT a + 2'")
+    q("CREATE TYPE here_ty AS ENUM ('a', 'b')")
+    info["routine under USE other"] = [http(s, "use-db-one") for s in (
+        "DROP MACRO here_m", "DROP FUNCTION IF EXISTS here_f", "DROP TYPE here_ty", "ALTER TYPE here_ty ADD VALUE 'c'", "COMMENT ON MACRO here_m IS 'x'")]
+    info["routines here after"] = q("SELECT here_m(1) AS m, here_f(1) AS f, CAST('b' AS here_ty) AS t")
+    checks["under USE other, DROP of a macro, function or type only this lake has, and ALTER and COMMENT ON one, are refused by name (0A000); this lake's stay"] = \
+        all(st != 200 and code == "0A000" and "under USE of other: other is an attached lake" in str(body) for st, code, body in info["routine under USE other"]) \
+        and info["routines here after"] == [{"m": 2, "f": 3, "t": "b"}]
     # Postgres's catalog under USE other is other's, as Postgres's is the connection's database's: it listed this lake's.
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as c:
         c.execute("USE other")
@@ -23865,6 +23876,20 @@ def use_path():
         info["catalog after"] = c.execute("SELECT DISTINCT table_catalog FROM information_schema.tables WHERE table_schema = 'public'").fetchall()
     checks["over Postgres under USE other, information_schema.tables and pg_class are other's (ot, its catalog other), not this lake's; with the path reset, this lake's again"] = \
         info["catalog under USE other"] == [("other", "ot")] and info["pg_class under USE other"] == [("ot",)] and info["catalog after"] == [(db_name,)]
+    # What makes, drops or undrops a table, view, routine or sequence isn't carried to an attached lake: under USE other each
+    # was refused with other words ("no table other.public.ot", a name check), and DROP TABLE IF EXISTS ot did nothing,
+    # saying it was done. Each is refused naming the lake (0A000). ADD COLUMN, a table's own change, found no table: it is
+    # made in other's ot.
+    info["DDL under USE other"] = [http(s, "use-db-one") for s in (
+        "DROP TABLE ot", "DROP TABLE IF EXISTS ot", "UNDROP TABLE ot", "CREATE VIEW ov AS SELECT 1 AS x", "CREATE OR REPLACE VIEW ov AS SELECT 1 AS x",
+        "CREATE MATERIALIZED VIEW om AS SELECT count(*) AS n FROM ot", "CREATE TABLE oc CLONE ot", "DROP VIEW IF EXISTS ov",
+        "CREATE MACRO om2(a) AS a + 1", "DROP MACRO IF EXISTS om2", "CREATE SEQUENCE os")]
+    info["ADD COLUMN under USE other"] = http("ALTER TABLE ot ADD COLUMN y INT", "use-db-one")
+    info["ot after"] = q("SELECT count(*) AS n, count(y) AS y FROM other.public.ot")
+    info["none made"] = [_raises(lambda n=n: q(f"SELECT * FROM other.public.{n}")) for n in ("ov", "om", "oc")]
+    checks["under USE other, what makes or drops a table, view, routine or sequence is refused naming other (0A000); ADD COLUMN adds other's column"] = \
+        all(st != 200 and code == "0A000" and "other is an attached lake" in str(body) for st, code, body in info["DDL under USE other"]) \
+        and info["ADD COLUMN under USE other"][0] == 200 and info["ot after"] == [{"n": 5, "y": 0}] and all(info["none made"])
     # Refused by name: a name that is both, unknown ones, no session, pondra sql.
     q("CREATE SCHEMA other")  # (now `other` is a database and a schema of this lake: USE other must say which)
     info["both"] = http("USE other", "use-both-1")
