@@ -1516,7 +1516,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    too). Unless every bound fills at once (one aggregate; several of one column, or of columns never
    NULL, and none with a FILTER), the aggregate keeps a filter of its own and the scans keep theirs,
    which never moves from `true`. `harness.py minmax`: three of its seven checks fail without it.
-205. **A node's memory is its container's** (`store::ram`): the smaller of the machine's and its
+205. **A node's memory is its container's** (`os::Os`, the native `Machine::ram`): the smaller of the machine's and its
    cgroup's limit (v2 `memory.max`, v1 `memory.limit_in_bytes`, the smallest over its ancestors).
    With the machine's, a node in a 1 GB container planned a third of the host's memory for
    queries, more than the container may use. `deploy_check.py image`: "its queries are sized by
@@ -2318,7 +2318,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    piece of node or lake state goes there, never in a new static: a DataFusion task (a UDF, a table
    provider) reaches its node and lake through its session's config (`SessionConfig::with_extension`,
    read from its `TaskContext`), and a task a library spawns for us (SlateDB, hyper) gets a clone of
-   what it needs when it is spawned.
+   what it needs when it is spawned. The machine (its memory with a container's limit, its cores,
+   the process's resident memory, a disk's free room) is read through `machine::Machine`, never
+   `/proc` or the OS below the hosts: the host installs it once (`machine::install`; natively
+   `os::Os`, on a page its device's) and a node's state holds it (`NodeState::machine`), so the
+   sim can give each member a machine of its own.
 
 302. **Every setting is read through `env.rs`, from one table of names** (ADR-061 §8): what the
    process was given (`open`'s options, the command line's flags: `env::give`), else the

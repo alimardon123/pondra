@@ -115,7 +115,7 @@ pub fn give(url: &str, given: Store) { MEMORY.lock().unwrap_or_else(PoisonError:
 fn budget() -> u64 {
     match crate::env::parse::<f64>("PONDRA_MEMORY_LAKE_GB") {
         Some(gb) => (gb * (1u64 << 30) as f64) as u64,
-        None => crate::store::ram().map_or(4 << 30, |r| (r / 4) as u64),
+        None => crate::machine::process().ram().map_or(4 << 30, |r| (r / 4) as u64),
     }
 }
 
@@ -324,7 +324,7 @@ impl Inner {
         let gb = self.setting();
         let others = gb.map_or(0, |_| crate::store::others_held()); // (the queries' and the shuffles' spills count under the setting only)
         let fits = |reserved: u64| {
-            let room = crate::store::space(&disk.folder.path).map(|(free, total)| (free.saturating_sub(reserved), total));
+            let room = crate::machine::process().space(&disk.folder.path).map(|(free, total)| (free.saturating_sub(reserved), total));
             crate::store::piece_fits(gb, others + self.spilled.on_disk.load(SeqCst) + reserved, bytes, room)
         };
         self.spilled

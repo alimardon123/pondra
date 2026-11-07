@@ -134,7 +134,7 @@ metrics -> budget  1
 metrics -> hot  1
 metrics -> jemalloc  1
 metrics -> spill  1
-metrics -> store  4
+metrics -> store  3
 objects -> auth  11
 objects -> authored  2
 objects -> branch  2
@@ -164,7 +164,6 @@ objects -> write  11
 once -> matches  1
 once -> pattern  1
 oom -> jemalloc  2
-oom -> node  1
 page_records -> dial  4
 panics -> node  1
 path -> pg_json  1

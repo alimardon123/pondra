@@ -84,16 +84,12 @@ pub fn move_lake(m: Move) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether this process runs its node as a library: set by the first library's open (`host`), never by
-/// the program. What the process is, so it outlives each node.
-static HOSTED: AtomicBool = AtomicBool::new(false);
-
 /// Where a node's restarts and failures are sent: the supervisor of the node open now, if any. One node is open at a
 /// time in a process.
 static SUPERVISOR: Mutex<Option<mpsc::UnboundedSender<Event>>> = Mutex::new(None);
 
 /// Is this process a library's (`host`), not the program's?
-pub fn hosted() -> bool { HOSTED.load(SeqCst) }
+pub fn hosted() -> bool { crate::machine::hosted() }
 
 /// What a node's supervisor is told: a restart or a failure from the node's own work, or the close of the node
 /// (a library's `Opened`).
@@ -129,7 +125,7 @@ pub(crate) fn host(tx: mpsc::UnboundedSender<Event>) -> anyhow::Result<()> {
         anyhow::ensure!(s.is_none(), "a node is open in this process already: close it first (one at a time)");
         *s = Some(tx);
     }
-    HOSTED.store(true, SeqCst);
+    crate::machine::set_hosted(); // (what the process is, from its first library's open: it outlives each node)
     Ok(())
 }
 

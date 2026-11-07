@@ -134,8 +134,22 @@ impl std::fmt::Debug for Join {
     }
 }
 
-/// The page's live heap bytes, as the program that runs the page reads them (`Options::memory`, `store::Memory`).
-pub use crate::store::Memory;
+/// The page's live heap bytes, as the program that runs the page reads them (`Options::memory`).
+pub type Memory = Arc<dyn Fn() -> usize + Send + Sync>;
+
+/// A page's machine (`machine::Machine`), installed by its first claim when its program reads its live bytes: its memory
+/// is its device's line, not a machine's (`ram` is None, and 4 GiB is past a 32-bit `usize`), its resident memory the
+/// bytes its program reads, its cores one. (The web platform's, which moves beside the page's other platform parts.)
+#[cfg(target_arch = "wasm32")]
+struct Device(Memory);
+
+#[cfg(target_arch = "wasm32")]
+impl crate::machine::Machine for Device {
+    fn ram(&self) -> Option<usize> { None }
+    fn resident(&self) -> Option<usize> { Some((self.0)()) }
+    fn cores(&self) -> usize { 1 }
+    fn space(&self, _: &std::path::Path) -> Option<(u64, u64)> { None }
+}
 
 /// A page's memory watch: what it reads its live bytes with, and the line past which the query that grew them is stopped
 /// (`oom::polled`). A page's line is set by `PONDRA_MEMORY_MAX_GB`, else by its device (`oom::line_on`).
@@ -398,7 +412,7 @@ impl Page {
         crate::node::claim_page()?;
         #[cfg(target_arch = "wasm32")]
         if let Some(live) = &options.memory {
-            crate::store::read_resident_with(live.clone()); // (the core's watch reads the page's memory as this page's program does)
+            crate::machine::install(Arc::new(Device(live.clone()))); // (the core's watch reads the page's memory as this page's program does: once a process, as its allocator is)
         }
         let watch = options.memory.as_ref().zip(crate::oom::line_on(options.line)).map(|(live, line)| Watch { live: live.clone(), line });
         Ok(Page { holds_claim: true, member: Default::default(), store: options.store.clone(), line: options.line, node: options.node.clone(), watch, unread: vec![], joined: options.joined.clone() })

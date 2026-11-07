@@ -57,14 +57,14 @@ crate::per_node!(static WAKE: tokio::sync::Notify = tokio::sync::Notify::new(); 
 /// The node's memory line in bytes: `PONDRA_MEMORY_MAX_GB`, else 85% of the machine's or container's
 /// memory. None when it is 0 (off), or in a host's process, where the memory is the host's.
 pub fn line() -> Option<usize> {
-    // (a page's line is its device's, and it has one only where its memory is read: `store::resident`)
+    // (a page's line is its device's, and it has one only where its memory is read: `Machine::resident`, a page's `Device`)
     if cfg!(target_arch = "wasm32") {
-        return crate::store::resident().and_then(|_| line_on(crate::env::device_line()));
+        return crate::machine::process().resident().and_then(|_| line_on(crate::env::device_line()));
     }
-    if crate::node::hosted() {
+    if crate::machine::hosted() {
         return None;
     }
-    crate::env::memory_line(crate::store::ram().map(|ram| (ram as f64 * 0.85) as usize))
+    crate::env::memory_line(crate::machine::process().ram().map(|ram| (ram as f64 * 0.85) as usize))
 }
 
 /// The memory line on a page's device, which has `device` bytes (`Options::line`, or the one its member was opened with): the
@@ -137,7 +137,7 @@ pub(crate) async fn come_back(_: usize) -> bool {
 /// line the machine would have (85% of its memory): the host's memory isn't ours to stop queries for,
 /// but our own cache is ours to drop.
 pub fn trim_line() -> Option<usize> {
-    line().or_else(|| Some(crate::store::ram()? / 20 * 17)).map(of_line)
+    line().or_else(|| Some(crate::machine::process().ram()? / 20 * 17)).map(of_line)
 }
 
 /// 85% of a line, or 320 MB under it where that is lower, and never under 70% of it. With the default line
@@ -196,7 +196,7 @@ pub fn start() {
         return;
     }
     let Some(trim) = trim_line() else { return };
-    if crate::store::resident().is_none() {
+    if crate::machine::process().resident().is_none() {
         return;
     }
     let line = line(); // (None in a host's process: there the watch only gives the cache back)
@@ -211,7 +211,7 @@ pub fn start() {
         let mut said = false; // the line for this stretch over the line, said once
         loop {
             let mut settling = false; // (a stop this watch made still holds, or its request is still ending)
-            let resident = crate::store::resident().unwrap_or(0);
+            let resident = crate::machine::process().resident().unwrap_or(0);
             SEEN.store(resident, Relaxed); // (what the OS says: `noted` and `pick` compare it)
             for ledger in crate::store::ledgers() {
                 ledger.note(); // (what the caches hold, which a query's grow goes by until the next look: `ledger::Ledger`)
@@ -226,7 +226,7 @@ pub fn start() {
                     // The pages just freed would stay resident for seconds (`purge`), so they are handed back now:
                     // the reading after it is what the process holds, and the watch goes by that alone.
                     purge();
-                    felt = crate::store::resident().unwrap_or(felt);
+                    felt = crate::machine::process().resident().unwrap_or(felt);
                     SEEN.store(felt, Relaxed);
                     crate::panics::note(felt);
                 }
@@ -239,7 +239,7 @@ pub fn start() {
                     // over ten seconds: handed back now, the node is under its line again before the next query comes
                     // (stopped median, then string_agg at once: killed with the stop's memory still resident, B50 10-31).
                     purge();
-                    felt = crate::store::resident().unwrap_or(felt);
+                    felt = crate::machine::process().resident().unwrap_or(felt);
                     SEEN.store(felt, Relaxed);
                     crate::panics::note(felt);
                 }

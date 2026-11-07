@@ -130,10 +130,11 @@ impl crate::ledger::Charged for Hot {
 impl Hot {
     /// The cache of a lake: `memory` for a lake held in memory. Its budget is half of the machine's memory, beside the
     /// query memory rather than out of it, as an in-memory engine holds its tables (`room_for`); see the module's doc.
-    /// (A page, whose machine's memory isn't read, keeps its query memory's: all of it for a lake held in memory.)
-    pub fn new(memory: bool) -> Hot {
+    /// (A page, whose machine's memory isn't read, keeps its query memory's: all of it for a lake held in memory.) `ram`
+    /// is the memory of its node's machine (`Machine::ram`).
+    pub fn new(memory: bool, ram: Option<usize>) -> Hot {
         let gb = crate::env::parse::<f64>("PONDRA_HOT_GB");
-        let max = gb.map(|g| (g * (1u64 << 30) as f64) as usize).unwrap_or_else(|| match (crate::store::ram(), memory) {
+        let max = gb.map(|g| (g * (1u64 << 30) as f64) as usize).unwrap_or_else(|| match (ram, memory) {
             (Some(ram), _) => ram / 2,
             (None, true) => crate::store::memory_limit(),
             (None, false) => crate::store::memory_limit() / 4,
@@ -342,7 +343,7 @@ impl Hot {
             _ => room,
         };
         match crate::oom::trim_line() {
-            Some(trim) => room.min(held + trim.saturating_sub(crate::store::resident().unwrap_or(0))),
+            Some(trim) => room.min(held + trim.saturating_sub(lake.node.machine.resident().unwrap_or(0))),
             None => room,
         }
     }
