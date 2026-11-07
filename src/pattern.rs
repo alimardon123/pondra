@@ -396,23 +396,31 @@ fn pattern_text(p: &MatchRecognizePattern) -> (String, Option<String>) {
     (p.to_string(), None)
 }
 
-/// Which bytes of `sql` are code: not inside a string, a quoted name or a comment (so a word there is not read).
+/// Which bytes of `sql` are code: not inside a string, a quoted name or a comment, as the tokenizer reads them
+/// (`text::tokens`: an `E'…'` string with an escaped quote, a `$$` body and a comment in a comment too; 11-06 audit M7),
+/// so a word there is not read. A text the tokenizer refuses holds no code: nothing in it is rewritten or refused here,
+/// and the parser says what is wrong with it.
 fn code_mask(sql: &str) -> Vec<bool> {
-    let b = sql.as_bytes();
-    let mut mask = vec![true; b.len()];
-    let mut i = 0;
-    while i < b.len() {
-        let end = match (b[i], b.get(i + 1)) {
-            (q @ (b'\'' | b'"'), _) => (i + 1..b.len()).find(|&j| b[j] == q).map_or(b.len(), |j| j + 1),
-            (b'-', Some(b'-')) => (i..b.len()).find(|&j| b[j] == b'\n').unwrap_or(b.len()),
-            (b'/', Some(b'*')) => sql[i + 2..].find("*/").map_or(b.len(), |j| i + 2 + j + 2),
-            _ => {
-                i += 1;
-                continue;
-            }
+    use datafusion::sql::sqlparser::tokenizer::{Token, Whitespace};
+    let Some(t) = crate::text::tokens(sql) else { return vec![false; sql.len()] };
+    let mut mask = vec![true; sql.len()];
+    for (i, tok) in t.toks.iter().enumerate() {
+        let quoted = match tok {
+            Token::Whitespace(w) => !matches!(w, Whitespace::Space | Whitespace::Newline | Whitespace::Tab),
+            Token::Word(w) => w.quote_style.is_some(),
+            t => matches!(
+                t,
+                Token::SingleQuotedString(_) | Token::DoubleQuotedString(_) | Token::TripleSingleQuotedString(_) | Token::TripleDoubleQuotedString(_) | Token::DollarQuotedString(_)
+                    | Token::SingleQuotedByteStringLiteral(_) | Token::DoubleQuotedByteStringLiteral(_) | Token::TripleSingleQuotedByteStringLiteral(_)
+                    | Token::TripleDoubleQuotedByteStringLiteral(_) | Token::SingleQuotedRawStringLiteral(_) | Token::DoubleQuotedRawStringLiteral(_)
+                    | Token::TripleSingleQuotedRawStringLiteral(_) | Token::TripleDoubleQuotedRawStringLiteral(_) | Token::NationalStringLiteral(_)
+                    | Token::QuoteDelimitedStringLiteral(_) | Token::NationalQuoteDelimitedStringLiteral(_) | Token::EscapedStringLiteral(_)
+                    | Token::UnicodeStringLiteral(_) | Token::HexStringLiteral(_)
+            ),
         };
-        mask[i..end].fill(false);
-        i = end;
+        if quoted {
+            mask[t.start[i]..t.end[i]].fill(false);
+        }
     }
     mask
 }
@@ -1948,6 +1956,16 @@ pub(crate) fn rewritten(sql: &str) -> anyhow::Result<String> {
 mod tests {
     use super::*;
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+
+    #[test]
+    fn a_word_is_code_where_the_tokenizer_reads_code() {
+        // (11-06 audit M7: the mask ended a string at the next quote, so a word after `\'` in an E'…' string was code)
+        let sql = "SELECT E'it\\'s subset' AS s, $$ subset $$ AS d /* a /* b */ subset */ FROM subset";
+        let code = code_mask(sql);
+        let at: Vec<bool> = sql.match_indices("subset").map(|(i, _)| code[i]).collect();
+        assert_eq!(at, [false, false, false, true], "{sql}");
+        assert!(code_mask("SELECT 'never closed subset").iter().all(|c| !c), "a text the tokenizer refuses holds no code");
+    }
 
     /// The engine's own functions, as a session has them (open mode asks them what a later run answers differently).
     fn engine_functions() -> datafusion::prelude::SessionContext {

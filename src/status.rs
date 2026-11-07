@@ -375,22 +375,8 @@ fn replaced(sql: &str, key: &str, text: Option<&str>) -> String {
     sql.to_string()
 }
 
-/// Where a statement's code begins: past its whitespace and the comments in front of it (`--` lines, `/* */`).
-fn code_start(piece: &str) -> usize {
-    let mut i = 0;
-    loop {
-        let rest = &piece[i..];
-        i += rest.len() - rest.trim_start().len();
-        let rest = &piece[i..];
-        if rest.starts_with("--") {
-            i += rest.find('\n').map_or(rest.len(), |n| n + 1);
-        } else if rest.starts_with("/*") {
-            i += rest.find("*/").map_or(rest.len(), |n| n + 2);
-        } else {
-            return i;
-        }
-    }
-}
+/// Where a statement's code begins: past its whitespace and the comments in front of it (`text::first_word`).
+fn code_start(piece: &str) -> usize { piece.len() - crate::text::first_word(piece).len() }
 
 /// The migration a renamed table, or columns renamed or dropped, need for the databases that still have the old
 /// names: the views and tasks that read the table are dropped first (the apply makes them again after the
