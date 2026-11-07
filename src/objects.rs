@@ -612,7 +612,7 @@ pub(crate) fn table_sql(name: &str, m: &TableMeta) -> String {
             Some(i) => format!(" {}", i.sql()), // (its sequence is the table's: made with it)
             None => col.default.as_ref().map(|d| format!(" DEFAULT {d}")).unwrap_or_default(),
         };
-        let ty = crate::types::shown_col(col); // (an enum or a uuid column: its type, not the text it holds)
+        let ty = crate::types::shown(col); // (an enum or a uuid column: its type, not the text it holds)
         format!("{} {ty}{merge}{null}{default}", ident(c))
     }).collect();
     if !m.key.is_empty() {

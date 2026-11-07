@@ -3,7 +3,7 @@
 //! text in its files, so Delta and Iceberg readers and every client read it as a string, and every
 //! door that writes rows refuses a value its labels don't list (`check`, from `rules::checks`:
 //! Postgres's 22P02, the writer's alone). Each table keeps the labels of its enum columns
-//! (`TableMeta::enums`), so a write's check reads nothing else; `ALTER TYPE … ADD VALUE` adds the
+//! (its column's `labels`, `store::Col`), so a write's check reads nothing else; `ALTER TYPE … ADD VALUE` adds the
 //! label to every table using the type, in the type's own commit. A label is never renamed or
 //! taken out: rows keep the text they were written with, and files are never rewritten. Values
 //! compare and sort as text, not in their labels' order (`array_position(enum_range(NULL::mood),
@@ -192,16 +192,8 @@ pub async fn columns(lake: &Lake, cols: &[ast::ColumnDef]) -> Result<(Vec<ast::C
 }
 
 /// A column's type as SQL writes it (`SHOW CREATE`, `pondra.parts`): an enum's, `UUID`, or what its
-/// Arrow type is (`objects::sql_type`). `m` and `column` alike by stored or alike by SQL's names.
-pub fn shown(m: &TableMeta, column: &str, arrow: &str) -> String {
-    match m.col(column) {
-        Some(c) => shown_col(c),
-        None => crate::objects::sql_type(arrow),
-    }
-}
-
-/// `shown`, of a column of the list.
-pub fn shown_col(c: &crate::store::Col) -> String {
+/// Arrow type is (`objects::sql_type`).
+pub fn shown(c: &crate::store::Col) -> String {
     match (&c.labels, &c.held) {
         (Some(e), _) => e.sql(),
         (None, Some(t)) => t.to_uppercase(),
