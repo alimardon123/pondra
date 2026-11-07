@@ -44,22 +44,28 @@ struct Tok {
     end: usize,
 }
 
-/// The words of `text` outside comments; a string, a quoted name or a `$tag$` body is one token.
+/// The words of `text` outside comments; a string, a quoted name or a `$tag$` body is one token. Strings and comments
+/// as the tokenizer reads them (`text::stretches`), and a name runs on through `$`, `#` and `@` as its names do (`a$b`
+/// uses no `$b`).
 fn tokens(text: &str) -> Vec<Tok> {
-    let (mut out, b, mut i) = (vec![], text.as_bytes(), 0);
+    let mut out = vec![];
+    crate::text::stretches(text, |s, r| match s {
+        crate::text::Stretch::Comment => {}
+        crate::text::Stretch::Quoted => out.push(Tok { k: K::Other, at: r.start, end: r.end }),
+        crate::text::Stretch::Code => code(text, r, &mut out),
+    });
+    out
+}
+
+/// `tokens` of a stretch of code.
+fn code(text: &str, r: std::ops::Range<usize>, out: &mut Vec<Tok>) {
+    let (b, mut i) = (text.as_bytes(), r.start);
     let word = |s: &str| s.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(s.len());
-    while i < b.len() {
-        let rest = &text[i..];
-        let past = |end: &str, from: usize| rest[from..].find(end).map_or(rest.len(), |e| from + e + end.len());
+    let name = |s: &str| s.find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '$' | '#' | '@'))).unwrap_or(s.len());
+    while i < r.end {
+        let rest = &text[i..r.end];
         let (n, k) = match b[i] {
-            b'-' if rest.starts_with("--") => (past("\n", 2), None),
-            b'/' if rest.starts_with("/*") => (past("*/", 2), None),
-            b'\'' => (past("'", 1), Some(K::Other)),
-            b'"' => (past("\"", 1), Some(K::Other)),
-            b'$' => match crate::routines::dollar_tag(rest) {
-                Some(tag) => (past(tag, tag.len()), Some(K::Other)),
-                None => (1 + word(&rest[1..]), Some(K::Var)),
-            },
+            b'$' => (1 + word(&rest[1..]), Some(K::Var)),
             b';' => (1, Some(K::Semi)),
             b'(' => (1, Some(K::Open)),
             b')' => (1, Some(K::Close)),
@@ -67,9 +73,9 @@ fn tokens(text: &str) -> Vec<Tok> {
             b',' => (1, Some(K::Comma)),
             c if c.is_ascii_whitespace() => (1, None),
             c if c.is_ascii_digit() => (word(rest).max(1), Some(K::Other)),
-            _ => match word(rest) {
-                0 => (rest.chars().next().map_or(1, char::len_utf8), Some(K::Other)),
-                n => (n, Some(K::Word)),
+            _ => match rest.chars().next() {
+                Some(c) if c.is_alphanumeric() || c == '_' => (name(rest), Some(K::Word)),
+                c => (c.map_or(1, char::len_utf8), Some(K::Other)),
             },
         };
         if let Some(k) = k {
@@ -77,7 +83,6 @@ fn tokens(text: &str) -> Vec<Tok> {
         }
         i += n.max(1);
     }
-    out
 }
 
 /// What a piece of a script (the text between two `;`s) does to how deep in blocks it is: one more
@@ -1502,6 +1507,18 @@ END;
         assert_eq!(inside("BEGIN IF a THEN SELECT 1; END IF"), None);
         let (done, rest) = crate::routines::statements("IF a THEN SELECT 1;");
         assert!(done.is_empty() && rest.contains("IF a")); // (the shell waits for END IF)
+    }
+
+    #[test]
+    fn a_blocks_words_are_read_past_strings_and_comments_as_the_tokenizer_reads_them() {
+        // (11-06 audit M7: the block reader ended a string at its next quote and a comment at its first `*/`)
+        assert_eq!(split("IF a THEN SELECT E'it\\'s end'; END IF; SELECT 2").len(), 2);
+        assert_eq!(split("IF a THEN SELECT 1 /* a /* b */ END IF */; END IF; SELECT 2").len(), 2);
+        assert_eq!(split("IF a THEN SELECT `end` FROM t; END IF; SELECT 2").len(), 2);
+        assert_eq!(split("IF a THEN SELECT X'\\' END IF' AS b; END IF; SELECT 2").len(), 2);
+        assert_eq!(depth("SELECT x#end FROM t"), 0); // (`x#end` is one name)
+        let vars: Vec<_> = tokens("SELECT a$b, $c FROM t").iter().filter(|t| t.k == K::Var).map(|t| t.at).collect();
+        assert_eq!(vars, [12], "a$b is a name, not a's $b");
     }
 
     #[test]
