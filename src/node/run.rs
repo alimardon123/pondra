@@ -1,7 +1,7 @@
 //! The doors half of a node (`node.rs` is the lake half): the options a node is started with, its start and its stop,
 //! and the requests its router answers. Declared by `node.rs` under feature `doors`, as the doors' own code is.
 use crate::*;
-use super::{say, set_guest, Guest, Start};
+use super::{Guest, Start};
 use crate::members::Members;
 use std::{sync::{Arc, OnceLock}, time::Duration};
 
@@ -132,10 +132,10 @@ fn close_after(open: tokio::task::JoinHandle<anyhow::Result<Arc<store::Lake>>>) 
 }
 
 impl Beside {
-    fn start(dir: &str, guest: Option<Guest>) -> Beside {
+    fn start(dir: &str, guest: Option<Guest>, life: &crate::lifecycle::Life) -> Beside {
         Beside(matches!(guest, Some(Guest::Reads)).then(|| {
-            let dir = dir.to_string();
-            panics::untracked(async move { store::Lake::open_polled(&dir, false, false, store::READER_ONE_SNAPSHOT).await })
+            let (dir, life) = (dir.to_string(), life.clone());
+            panics::untracked(async move { store::Lake::open_polled(&dir, false, false, store::READER_ONE_SNAPSHOT, life).await })
         }))
     }
 
@@ -170,7 +170,7 @@ impl Node {
         // (a guest answers one program's statements and ends: none of the loops and doors a node that lives keeps, so
         // every `lives` below keeps them for a node that lives only)
         let lives = guest.is_none();
-        set_guest(!lives);
+        let life = crate::node::native(!lives); // (what this node does when it must stop or start again: its lakes and its member hold it)
         if lives {
             // (the spill folders of processes that ended, swept beside the start and not on it: a crashed one's may be
             // gigabytes, and a cold start waits for nothing but what serving needs, invariant 182)
@@ -201,10 +201,10 @@ impl Node {
         }
         // (a guest that reads begins its lake's open here, beside the term look: the look and the open are each requests to
         // the bucket, and the start waits for the later of them, not for both in turn)
-        let mut beside = Beside::start(&dir, guest);
+        let mut beside = Beside::start(&dir, guest, &life);
         let cluster = match guest {
-            None => cluster::Cluster::join(&store, &addr, start.reader, !store::served(&dir), serve_store).await?,
-            Some(g) => cluster::Cluster::guest(&store, g, !store::served(&dir)).await.map_err(|e| e.context(dir.clone()))?,
+            None => cluster::Cluster::join(&store, &addr, start.reader, !store::served(&dir), serve_store, life.clone()).await?,
+            Some(g) => cluster::Cluster::guest(&store, g, !store::served(&dir), life.clone()).await.map_err(|e| e.context(dir.clone()))?,
         };
         // (a guest that reads is a reader from here on: no log, whose history and audit lines would go to a leader it doesn't have)
         let reader = start.reader || cluster.reader;
@@ -239,7 +239,7 @@ impl Node {
         };
         let opened = match beside.keep(streamed).await {
             Some(lake) => lake,
-            None => store::Lake::open_polled(&dir, leader, streamed, poll).await,
+            None => store::Lake::open_polled(&dir, leader, streamed, poll, life.clone()).await,
         };
         let lake = match opened {
             // (a lake a newer Pondra wrote, or a place a move didn't finish: this binary must not lead or serve it,
@@ -255,14 +255,14 @@ impl Node {
             Err(e) if leader => {
                 eprintln!("opening the lake as leader failed: {e:#}"); // e.g. a newer leader fenced us
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                crate::node::restart("opening the lake as leader failed")
+                life.restart("opening the lake as leader failed", &[])
             }
             // A new lake whose first leader hasn't made the catalog yet (nodes started
             // together), or never will (it died first): look again, until it has or its
             // mark goes stale and this node takes over.
             Err(e) if ["failed to find latest transactional object", store::Lake::NO_LAKE].iter().any(|m| format!("{e:#}").contains(m)) => {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                crate::node::restart("the lake has no catalog yet: its leader is still making it")
+                life.restart("the lake has no catalog yet: its leader is still making it", &[])
             }
             lake => lake?,
         };
@@ -339,7 +339,7 @@ impl Node {
         }
         if lives {
             let role = if reader { "reader" } else if leader { "leader" } else { "follower" };
-            say(format!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n));
+            life.say(&format!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n));
         }
         // No Nagle: a small answer goes out at once, not after the client's delayed ACK (the
         // Postgres, Kafka and Flight ports do the same).
@@ -471,8 +471,7 @@ pub(crate) async fn attach(home: &store::Lake, spec: &str, me: &str, follow: boo
 
 /// The program's restart: the same binary runs again with the same arguments, in place (exec) on unix; elsewhere a
 /// new process starts and this one leaves. `carried` goes to the new process on top of what this one was given.
-pub(crate) fn exec_again(carried: &[(&str, String)]) -> ! {
-    let guest = crate::node::is_guest();
+pub(crate) fn exec_again(guest: bool, carried: &[(&str, String)]) -> ! {
     crate::memory::leave(); // (what this process made goes first: exec and `process::exit` run no destructor)
     let mut args = std::env::args_os();
     let mut cmd = std::process::Command::new(args.next().expect("argv[0]"));

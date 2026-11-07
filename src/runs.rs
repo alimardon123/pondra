@@ -803,7 +803,9 @@ pub fn schedule(app: App) {
                 let (app, name, task) = (app.clone(), name.clone(), task.clone());
                 let ran = Ran(running.clone(), name.clone()); // (let go even if the tick panics: else it never ran again here)
                 crate::panics::task(async move {
-                    crate::ext::scope(as_owner, run_tick(&app, &name, &task, tick)).await; // (as the task's owner, an asked run only when the owner asked: `Tick::as_owner`)
+                    // (as the task's owner, an asked run only when the owner asked: `Tick::as_owner`; the node's own work, which
+                    // no request asked for: `auth::as_node`)
+                    crate::auth::as_node(crate::ext::scope(as_owner, run_tick(&app, &name, &task, tick))).await;
                     drop(ran);
                 });
             }
@@ -1290,7 +1292,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_task_remembers_whether_its_owner_made_it() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-task-owner-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         // (what the wire says is no say: `owner` is signed where CREATE TASK runs, by its owner's program)
         let sent = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), owner: Some("theirs".into()), ..Default::default() };
         create_task(&lake, "theirs", sent, false).await?;
@@ -1310,10 +1312,10 @@ mod tests {
         assert!(!owners(&lake, Some(mark.as_str()), &stored.what("theirs")), "the mark is of its own name");
         assert!(holds(Task { suspended: true, ..stored.clone() }), "a suspended task is still the owner's");
         // (a reader of the same lake with another program's key, or with none, verifies no mark of this one)
-        let other = Lake::open(dir.to_str().unwrap(), false, false).await?;
+        let other = Lake::open(dir.to_str().unwrap(), false, false, crate::lifecycle::unhosted()).await?;
         let _ = other.owner_key.set("k2".into());
         assert!(!owners(&other, Some(mark.as_str()), &stored.what("mine")), "another program's key signs no mark of this owner's");
-        let none = Lake::open(dir.to_str().unwrap(), false, false).await?;
+        let none = Lake::open(dir.to_str().unwrap(), false, false, crate::lifecycle::unhosted()).await?;
         assert!(!owners(&none, Some(mark.as_str()), &stored.what("mine")), "a lake with no owner's key verifies no mark");
         Ok(())
     }
@@ -1321,7 +1323,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_asked_run_is_the_owners_only_when_the_owner_asked() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-tick-owner-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         let _ = lake.owner_key.set("k1".into());
         let mut owned = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), ..Default::default() };
         owned.owner = signed(&lake, &owned.what("owned"));
@@ -1348,7 +1350,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_owners_run_reads_only_the_owners_results() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-result-owner-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         let _ = lake.owner_key.set("k1".into());
         let up = |owner: Option<String>| Tick { at: 7, done: true, status: Some("ok".into()), result: Some("42".into()), owner, ..Default::default() };
         let sql = "SELECT pondra.result('up')";

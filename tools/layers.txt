@@ -9,6 +9,7 @@ answer base
 codes base
 column base
 env base
+lifecycle base
 ledger base
 memo base
 metrics base
@@ -79,6 +80,7 @@ defaults engine
 dialect_fns engine
 dialect_stmts engine
 diff engine
+divide engine
 engine engine
 expander engine
 explain engine

@@ -26,17 +26,17 @@ pub async fn ring(store: &Store, id: &str) -> bool { store.put(&Path::from(BELL)
 /// Writer: leave a request and wait for the answer. None if no leader is alive any more (the
 /// caller then leads itself; the request is withdrawn, and a retry of it would be a duplicate).
 /// `wake`: nobody leads the lake at that place, so once the request is in, a process of its own
-/// leads it for a moment and answers it (`node::lead_once`). `holder`: the term whose leader is to answer,
+/// leads it for a moment and answers it (`Lifecycle::lead_elsewhere`, of the node that asks). `holder`: the term whose leader is to answer,
 /// which is gone if it doesn't mark itself when the bell rings (`terms::Ear`).
-pub async fn send(store: &Store, r: &Request, wake: Option<&str>, holder: Option<&crate::terms::Term>) -> Result<Option<Value>> {
+pub async fn send(store: &Store, r: &Request, wake: Option<(&str, &crate::lifecycle::Life)>, holder: Option<&crate::terms::Term>) -> Result<Option<Value>> {
     let (kind, body) = r.inbox()?;
     let id = uuid::Uuid::new_v4();
     let (req, out) = (Path::from(format!("inbox/{id}.{kind}")), Path::from(format!("inbox/{id}.out")));
     store.put(&req, body.into()).await?;
     let mut ear = crate::terms::Ear::ring(store, holder, &id.to_string()).await;
-    let woke = wake.map(|dir| {
-        let dir = dir.to_string();
-        crate::panics::spawn(async move { crate::node::lead_once(&dir).await })
+    let woke = wake.map(|(dir, life)| {
+        let (dir, life) = (dir.to_string(), life.clone());
+        crate::panics::spawn(async move { life.lead_elsewhere(&dir).await })
     });
     for tick in 1.. {
         tokio::time::sleep(Duration::from_millis(500)).await;

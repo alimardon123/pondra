@@ -11,6 +11,8 @@ extern crate pondra_tokio_web as tokio;
 // rewrites that need no lake.
 pub mod finish;
 pub mod env;
+// What a node's host does when the node must stop or start again, and what the code below it may ask of its form.
+pub mod lifecycle;
 // The one place a feature says what it adds (designs/redesign/redesign.md §6): `built_in` below lists the build's extensions.
 pub mod registry;
 pub mod settings;
@@ -47,6 +49,7 @@ pub mod sketch;
 mod asof;
 mod explain;
 mod multiply;
+mod divide;
 mod sparksql;
 mod parsed;
 mod past_names;

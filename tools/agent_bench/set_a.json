@@ -87,7 +87,7 @@
   {"id": "a38", "question": "What is the most revenue a single order line ever earned, and which product was it?", "places": 2,
    "evidence": "A line's revenue is its quantity times its unit price times (1 - its discount).",
    "sql": "SELECT p.name, i.quantity * i.unit_price * (1 - i.discount) AS revenue FROM order_items i JOIN products p ON p.product_id = i.product_id ORDER BY revenue DESC LIMIT 1"},
-  {"id": "a39", "question": "For each month of 2025, how many customers placed their first ever order in it? Give the month's number and the count, in month order.", "ordered": true,
+  {"id": "a39", "question": "In which months of 2025 did customers place their first ever order, and how many in each? Give the month's number and the count, in month order.", "ordered": true,
    "sql": "SELECT extract(month FROM first) AS month, count(*) FROM (SELECT customer_id, min(ordered_at) AS first FROM orders GROUP BY customer_id) f GROUP BY 1 ORDER BY 1"},
   {"id": "a40", "question": "Which customers from Uzbekistan have no email address on file? Give their names in name order.", "ordered": true,
    "evidence": "Countries are stored as two-letter codes (Uzbekistan is UZ).",
