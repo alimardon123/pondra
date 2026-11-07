@@ -37,6 +37,7 @@ reruns) and makes none, and steps once. tools/train_test.py runs these rules aga
 """
 import argparse
 import datetime
+import itertools
 import json
 import math
 import os
@@ -58,6 +59,7 @@ CHANGES_WORKFLOW_NOTE = ("This pull request changes a workflow, which the workfl
 WORKFLOW_NOTE = ("This pull request's workflows aren't main's (main changed one since it branched), and GitHub "
                  "refused the train's push of its merge: merge main into it and label it train again.")
 REFUSED = "refusing to allow"   # (GitHub's words when a push or a ref's move would change a workflow)
+ESCAPES = "--allow-escape-sequences"   # (the flag gh asks for before it prints a log's terminal colors)
 RED = ("failure", "timed_out", "startup_failure")  # job conclusions that count against the train
 POLL = 60  # seconds between the steps of a wait
 # The jobs whose failure can be a flake, so a red one is run again once before anyone is blamed: the suites that run
@@ -100,8 +102,15 @@ class GitHub:
         return json.loads(out) if out.strip() else {}
 
     def log(self, job_id):
-        """A job's log, as text."""
-        return self._gh(["api", f"repos/{self.repo}/actions/jobs/{job_id}/logs"])
+        """A job's log, as text. (A log holds terminal colors, which gh prints only when told it may: on 11-07 a newer
+        gh refused, so no failure was blamed on the PR whose file it named.)"""
+        args = ["api", f"repos/{self.repo}/actions/jobs/{job_id}/logs"]
+        try:
+            return self._gh(args)
+        except GitHubError as e:
+            if ESCAPES not in f"{e.stdout} {e.stderr}":
+                raise
+            return self._gh([*args, ESCAPES])
 
     def dispatch(self, ref, mode):
         self._gh(["workflow", "run", "build.yml", "--repo", self.repo, "--ref", ref, "-f", f"mode={mode}"])
@@ -253,12 +262,18 @@ class Train:
 
     def bisecting(self, tip):
         """Whether the train's run before this one failed: then this train was cut from a red one (halved, or cut
-        again on a moved main) to test its riders alone, and nobody joins it."""
-        prev = next((r for r in self.runs() if self.ours(r) and r["event"] == "workflow_dispatch" and r["head_branch"] == "train"
-                     and r["head_sha"] != tip), None)
-        if prev is None or prev["conclusion"] == "success":
-            return False
-        return prev["conclusion"] in ("failure", "timed_out") or any(self.failed_jobs(prev["id"]).values())
+        again on a moved main) to test its riders alone, and nobody joins it. A run a cut stopped with nothing final
+        failed (a car stacked on the red one, a train cut again for a joiner) says nothing: the run before it does.
+        (On 11-07 a halved train took the stacked car's stopped run for the one before it: the PRs halved away joined
+        it at once, it failed as the whole had, was halved again, and nothing landed for two hours.)"""
+        before = (r for r in self.runs() if self.ours(r) and r["event"] == "workflow_dispatch" and r["head_branch"] == "train"
+                  and r["head_sha"] != tip)
+        for prev in itertools.islice(before, 6):   # (each a request for its jobs: the latest few say it)
+            if prev["conclusion"] == "success":
+                return False
+            if prev["conclusion"] in ("failure", "timed_out") or any(self.failed_jobs(prev["id"]).values()):
+                return True
+        return False
 
     def as_main(self, failed, tip):
         """Whether main's latest run that ran failed every one of these jobs too: then they aren't the train's, and it

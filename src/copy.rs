@@ -56,7 +56,10 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     match remote {
         false => ensure!(owner(), crate::codes::coded("42501", format!("COPY … TO {to}: a path on the server's own disk, which a client writes only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): write it there, or to a bucket (s3://, gs://, az://)"))),
         true => {
-            ensure!(owner() || covering(&list(lake).await?, to).is_some(), crate::codes::coded("42501", uncovered(to)));
+            match crate::connections::named_in(to) {
+                Some(_) => crate::ext::through(to, "WRITE")?, // ('@drop/out/': the connection's, which lends its secret)
+                None => ensure!(owner() || covering(&list(lake).await?, to).is_some(), crate::codes::coded("42501", uncovered(to))),
+            }
             register(lake, to).await?;
         }
     }
@@ -837,6 +840,9 @@ async fn columns_of(lake: &Lake, query: &str, positional: bool, cols: &[String],
     let names: Vec<String> = given.iter().map(|(c, _)| c.clone()).collect();
     Ok((given, names))
 }
+
+/// COPY's records in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "ld/", owner: "copy", holds: "each file a COPY INTO loaded, by its folder, so it loads once (ld_key)" }];
 
 fn ld_key(folder: &str, file: &str) -> String {
     let hash = crate::crypto::sha256(file.as_bytes());

@@ -456,7 +456,7 @@ async fn commit(app: &crate::app::App, lake: &std::sync::Arc<Lake>, commits: Vec
     let files: Vec<String> = commits.iter().flat_map(|c| c.written.iter().flat_map(|f| f.paths())).collect();
     let out = match std::sync::Arc::ptr_eq(lake, &app.lake) {
         true => app.record_iceberg(commits).await,
-        false => crate::write::send(&lake.url, crate::write::Request::Iceberg(commits)).await,
+        false => crate::write::send(&lake.url, crate::write::Request::Iceberg(commits), &lake.life).await,
     };
     out.map_err(|e| {
         let (raw, e) = (format!("{e:#}"), crate::ext::said(&e)); // (the words are matched raw, sent as said)

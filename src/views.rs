@@ -435,6 +435,9 @@ pub fn constraints(sql: &str) -> Result<Option<(String, Vec<Expect>)>> {
 /// A session view's bound: no session still open starts before this (µs).
 fn open_key(name: &str) -> String { format!("w/{name}") }
 
+/// The views' own records beside their kind's `v/` (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "w/", owner: "views", holds: "a session view's bound: no open session starts before it (open_key)" }];
+
 /// The refusal of a view that takes each row once (`what`: sessions, stream joins, pattern views with EMIT FINAL)
 /// over `source`, whose rows are replaced: `kept`, a view kept by key, or a view that follows one row by row
 /// (`replaced`). Its rows are replaced as their groups are worked out again (0A000).
@@ -2096,7 +2099,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_views_ctes_and_plain_views_are_written_in() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-written-in-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         let view = |sql: &str| json(&crate::ddl::StoredView { sql: sql.into(), external: false, facts: vec![], authored: None });
         lake.cat.commit(vec![(crate::ddl::query_key("vx"), view("SELECT x FROM a WHERE x > 1")), (crate::ddl::query_key("vy"), view("SELECT x FROM vx"))], &[]).await?;
         let w = |sql: &'static str| written_in(&lake, sql);
