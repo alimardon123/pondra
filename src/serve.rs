@@ -34,6 +34,8 @@ impl Charged for Groups {
 
     fn give_back(&self, bytes: usize) -> usize { self.rows.give_back(bytes) }
 
+    fn gives_back(&self) -> bool { true }
+
     fn inside(&self) -> bool { !crate::store::own_cache_budget() }
 }
 

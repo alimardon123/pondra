@@ -121,6 +121,8 @@ impl crate::ledger::Charged for Hot {
 
     fn give_back(&self, bytes: usize) -> usize { self.trim(bytes) }
 
+    fn gives_back(&self) -> bool { true }
+
     fn inside(&self) -> bool { !self.own }
 }
 

@@ -179,6 +179,10 @@ pub trait Charged: Send + Sync {
         0
     }
 
+    /// Does it give memory back (`give_back`)? A cache that keeps what it holds, `give_back`'s default, says no: an idle
+    /// node's watch looks every 2 s only while a cache holds what it could give back (`oom.rs`).
+    fn gives_back(&self) -> bool { false }
+
     /// Does it hold its bytes inside the whole line, with the queries (`Ledger`)? Yes, unless the user gave it a budget of
     /// its own (`PONDRA_HOT_GB`, `PONDRA_CACHE_MB`): then it keeps that budget beside the line, and only the node's memory
     /// watch takes memory back from it.
@@ -189,6 +193,8 @@ impl<K: Hash + Eq + Send, V: Send> Charged for Mutex<ByteLru<K, V>> {
     fn held(&self) -> usize { self.lock().unwrap_or_else(PoisonError::into_inner).bytes() }
 
     fn give_back(&self, bytes: usize) -> usize { give_back_from(self, |c| c, bytes) }
+
+    fn gives_back(&self) -> bool { true }
 }
 
 /// About the memory a parsed JSON value holds, to charge a cache of them (`ByteLru::put`): each value's own 32 bytes, a
@@ -230,6 +236,17 @@ pub fn give_back_from<T, K: Hash + Eq, V>(cache: &Mutex<T>, lru: impl Fn(&mut T)
         drop(gone); // (big values are let go of after the lock is)
     }
     freed
+}
+
+/// Each name once, in the order first given.
+fn kinds_of(names: impl Iterator<Item = &'static str>) -> Vec<&'static str> {
+    let mut kinds = vec![];
+    for name in names {
+        if !kinds.contains(&name) {
+            kinds.push(name);
+        }
+    }
+    kinds
 }
 
 // ---------------------------------------------------------------- the line
@@ -303,8 +320,8 @@ impl Ledger {
     pub fn share(&self) -> usize { self.line / self.busy.load(Relaxed).max(1) }
 
     /// Counts `cache` on this line, under `name`, for as long as it lives: `/metrics`' `cache_bytes` reads it by that name,
-    /// and the node's memory watch takes memory back from it before it stops a query (`oom.rs`). Caches give back in the
-    /// order they were charged, so a lake's go in the order it lists them. A cache is charged once, though several lakes
+    /// and the node's memory watch takes memory back from it before it stops a query (`oom.rs`). Caches give back by kind,
+    /// in the order the names were first charged, so a lake's kinds go in the order it lists them. A cache is charged once, though several lakes
     /// keep it (the ranges of a bucket two lakes are in, the node's planning facts).
     pub fn charge(&self, name: &'static str, cache: Weak<dyn Charged>) {
         let mut caches = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
@@ -314,12 +331,27 @@ impl Ledger {
         }
     }
 
-    /// The caches still alive, for the caller to hold a moment (a closed lake's go here).
+    /// The caches still alive, for the caller to hold a moment (a closed lake's go here), by kind: each name's together, in
+    /// the order the names were first charged, so every lake's hot columns come before any lake's ranges (11-06 audit L7).
+    /// The order they give memory back in.
     fn charged(&self) -> Vec<(&'static str, Arc<dyn Charged>)> {
         let mut caches = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
         caches.retain(|(_, c)| c.strong_count() > 0);
-        caches.iter().filter_map(|(name, c)| Some((*name, c.upgrade()?))).collect()
+        let kinds = kinds_of(caches.iter().map(|(name, _)| *name));
+        let mut alive: Vec<_> = caches.iter().filter_map(|(name, c)| Some((*name, c.upgrade()?))).collect();
+        alive.sort_by_key(|(name, _)| kinds.iter().position(|kind| kind == name)); // (stable: a name's in the order charged)
+        alive
     }
+
+    /// The names of the caches on this line, each once, in the order they were first charged: the order kinds give memory
+    /// back in, on this line and across the node's lines (`oom.rs`).
+    pub fn kinds(&self) -> Vec<&'static str> {
+        let caches = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
+        kinds_of(caches.iter().filter(|(_, c)| c.strong_count() > 0).map(|(name, _)| *name))
+    }
+
+    /// Do the caches on this line hold anything they could give back (`Charged::gives_back`)?
+    pub fn givable(&self) -> bool { self.charged().iter().any(|(_, c)| c.gives_back() && c.held() > 0) }
 
     /// What the caches on this line hold now.
     pub fn held(&self) -> usize { self.charged().iter().map(|(_, c)| c.held()).sum() }
@@ -337,21 +369,25 @@ impl Ledger {
         by_name
     }
 
-    /// Takes about `bytes` back from the caches on this line, in the order they were charged, and says how many came back:
+    /// Takes about `bytes` back from the caches on this line, a kind at a time (`charged`), and says how many came back:
     /// the node's memory watch, from every cache.
-    pub fn give_back(&self, bytes: usize) -> usize { self.take(bytes, false) }
+    pub fn give_back(&self, bytes: usize) -> usize { self.take(bytes, false, None) }
+
+    /// Takes about `bytes` back from this line's caches named `kind` alone: the node's memory watch, a kind at a time
+    /// across the node's lines (`oom.rs`).
+    pub fn give_back_kind(&self, kind: &str, bytes: usize) -> usize { self.take(bytes, false, Some(kind)) }
 
     /// Takes about `bytes` back from the caches inside the whole line alone: a query's grow past it.
-    fn make_room(&self, bytes: usize) -> usize { self.take(bytes, true) }
+    fn make_room(&self, bytes: usize) -> usize { self.take(bytes, true, None) }
 
-    fn take(&self, bytes: usize, inside_only: bool) -> usize {
+    fn take(&self, bytes: usize, inside_only: bool, kind: Option<&str>) -> usize {
         let (mut freed, mut inside) = (0, 0);
-        for (_, c) in self.charged() {
+        for (name, c) in self.charged() {
             if freed >= bytes {
                 break;
             }
             let counted = c.inside();
-            if inside_only && !counted {
+            if (inside_only && !counted) || kind.is_some_and(|kind| kind != name) {
                 continue;
             }
             let got = c.give_back(bytes - freed);
@@ -728,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn a_line_takes_memory_back_from_its_caches_in_turn_and_forgets_the_dropped_ones() {
+    fn a_line_takes_memory_back_from_its_caches_by_kind_and_forgets_the_dropped_ones() {
         let ledger = Ledger::new(1000, usize::MAX, false);
         let cache = |bytes: &[usize]| {
             let c = Arc::new(Mutex::new(ByteLru::new(1000)));
@@ -737,22 +773,27 @@ mod tests {
             }
             c
         };
-        let (first, second, third) = (cache(&[100, 100]), cache(&[50, 50]), cache(&[70]));
+        let (first, second, third) = (cache(&[100, 100]), cache(&[50, 50]), cache(&[50, 20]));
         for (name, c) in [("first", &first), ("second", &second), ("first", &third)] {
             let c: Arc<dyn Charged> = c.clone();
             ledger.charge(name, Arc::downgrade(&c));
             ledger.charge(name, Arc::downgrade(&c)); // (charged once, however many lakes keep it)
         }
-        assert_eq!((ledger.held(), ledger.held_by_name()), (370, vec![("first", 270), ("second", 100)]));
-        assert_eq!(ledger.give_back(250), 250, "the first cache's entries, the least recently used first, then the second's");
-        assert_eq!((first.held(), second.held(), third.held()), (0, 50, 70));
+        assert_eq!((ledger.held(), ledger.held_by_name(), ledger.kinds()), (370, vec![("first", 270), ("second", 100)], vec!["first", "second"]));
+        // (as two lakes' hot columns and one's ranges: the second lake's hot columns go before the first's ranges, 11-06 audit L7)
+        assert_eq!(ledger.give_back(250), 250, "the first kind's caches, each in the order charged and its least recently used first");
+        assert_eq!((first.held(), second.held(), third.held()), (0, 100, 20));
+        assert_eq!(ledger.give_back_kind("second", 50), 50, "a kind alone");
+        assert_eq!((first.held(), second.held(), third.held()), (0, 50, 20));
         let held = third.lock().unwrap();
         assert_eq!(ledger.give_back(1000), 50, "a cache a reader holds now is skipped, and asked again at the next look");
         drop(held);
         drop(second);
-        assert_eq!(ledger.held(), 70, "a dropped cache is let go of");
-        assert_eq!(ledger.give_back(1000), 70);
+        assert_eq!((ledger.held(), ledger.kinds()), (20, vec!["first"]), "a dropped cache is let go of");
+        assert!(ledger.givable());
+        assert_eq!(ledger.give_back(1000), 20);
         assert_eq!((ledger.held(), ledger.caches.lock().unwrap().len()), (0, 2));
+        assert!(!ledger.givable(), "nothing left to give back");
     }
 
     /// A cache of `entries` entries of `each` bytes, charged to `ledger` (the caller keeps it alive).
@@ -825,6 +866,7 @@ mod tests {
         let ledger = Ledger::new(100, 100, true);
         let kept: Arc<dyn Charged> = Arc::new(Kept(90));
         ledger.charge("kept", Arc::downgrade(&kept));
+        assert!(!ledger.givable(), "what a cache keeps isn't what it could give back (11-06 audit L8)");
         ledger.note();
         let a = ledger.pool();
         let sort = consumer(&a, "sort", true);
@@ -842,6 +884,8 @@ mod tests {
         fn held(&self) -> usize { self.0.held() }
 
         fn give_back(&self, bytes: usize) -> usize { self.0.give_back(bytes) }
+
+        fn gives_back(&self) -> bool { true }
 
         fn inside(&self) -> bool { false }
     }
