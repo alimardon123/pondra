@@ -9,11 +9,16 @@ name: agent-bench
 # By hand only (Actions → agent-bench → Run workflow): it spends API dollars at list prices, which the report gives, so
 # a schedule waits for the first run's bill. It needs the repository secret ANTHROPIC_API_KEY. What is kept: the
 # report in the job's summary, and the artifact agent-bench (runs.jsonl, every try's transcript, report.md and
-# replay.jsonl, the passed answers that tools/agent_bench/replay_a.jsonl takes so CI replays them).
+# replay.jsonl, the passed answers that tools/agent_bench/replay_<set>.jsonl takes so CI replays them).
 
 on:
   workflow_dispatch:
     inputs:
+      set:
+        description: "Set: a (questions) or b (jobs that write)"
+        type: choice
+        options: [a, b]
+        default: a
       model:
         description: "Model (claude-opus-5-5 is the default; claude-haiku-5-5 is the small one)"
         default: claude-opus-5-5
@@ -29,7 +34,7 @@ on:
         description: "Engines (pondra+mcp: Pondra with its MCP door's tools)"
         default: duckdb,postgres,pondra,pondra+mcp
       only:
-        description: "Task ids, comma-separated (empty: all of set A)"
+        description: "Task ids, comma-separated (empty: all of the set)"
         default: ""
 
 concurrency:
@@ -84,6 +89,7 @@ jobs:
       - name: The benchmark
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SET: ${{ inputs.set }}
           MODEL: ${{ inputs.model }}
           EFFORT: ${{ inputs.effort }}
           RUNS: ${{ inputs.runs }}
@@ -91,7 +97,7 @@ jobs:
           ONLY: ${{ inputs.only }}
         run: |
           chmod +x pondra && ./pondra --version
-          python3 tools/agent_bench.py run --bin ./pondra --model "$MODEL" --effort "$EFFORT" --runs "$RUNS" \
+          python3 tools/agent_bench.py run --set "$SET" --bin ./pondra --model "$MODEL" --effort "$EFFORT" --runs "$RUNS" \
             --engines "$ENGINES" ${ONLY:+--only "$ONLY"} --out agent-bench
       - name: The report, in the job's summary
         if: always()
