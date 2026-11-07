@@ -1152,12 +1152,19 @@ pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, na
 /// fills the columns as stored (`rows_sql`, `write_rows`), so this is the one place SQL's order is put in. Every other
 /// statement, and every INSERT into a table that never moved a column, as it is. With it, for a plain INSERT into this
 /// lake's table: the table and the order its values go by (`TableMeta::placed`), which the leader checks
-/// (`log::placed_for`).
+/// (`log::placed_for`). A MERGE that puts values by position (`Merge::by_position`: an `INSERT … ON CONFLICT` or `INSERT OR …`
+/// without a column list) puts SQL's order in itself, and is checked the same way: its node may not have seen a move either
+/// (11-07 audit M1).
 pub(crate) async fn in_sql_order(lake: &Lake, stmt: Stmt) -> Result<(Stmt, Option<(String, u64)>)> {
-    let Stmt::Insert(t, q) = &stmt else { return Ok((stmt, None)) };
-    let Ok((other, name)) = crate::ddl::resolve(lake, t).await else { return Ok((stmt, None)) }; // (refused by name further on)
+    let t = match &stmt {
+        Stmt::Insert(t, _) => t.clone(),
+        Stmt::Merge(m) if m.by_position() => m.target.clone(),
+        _ => return Ok((stmt, None)),
+    };
+    let Ok((other, name)) = crate::ddl::resolve(lake, &t).await else { return Ok((stmt, None)) }; // (refused by name further on)
     let Some(meta) = other.as_deref().unwrap_or(lake).cat.meta(&table_key(&name)).await? else { return Ok((stmt, None)) };
     let placed = other.is_none().then(|| (name, meta.placed())); // (another lake's leader records its own: not checked)
+    let Stmt::Insert(t, q) = &stmt else { return Ok((stmt, placed)) };
     if !meta.moved() {
         return Ok((stmt, placed));
     }
