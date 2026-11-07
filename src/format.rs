@@ -221,20 +221,29 @@ pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>) {
 /// this build has read it (the mark alone, `BASE`, for a test posing as a build from before them).
 fn first() -> u32 { if known() >= LISTS { LISTS } else { BASE } }
 
-/// A form that leads its lake alone, with no leader's loop (`pondra sql`, a program's node): a lake in memory or in a
-/// local folder moves to this build's tables' column lists (`LISTS`) as it opens, in one small commit. A lake in a bucket
-/// doesn't: a cluster's followers may be serving it, which this form can't hear (a leader gap), and a node of a release
-/// before would stop. A bucket's lake moves on only by its server's leader, which knows its followers' releases
-/// (`raise`); until then its entries keep format 5's shape, which every reader reads.
+/// A form that leads its lake alone, with no leader's loop (`pondra sql`, a program's node): a lake in memory, or one this
+/// process made in a local folder, moves to this build's tables' column lists (`LISTS`) as it opens, in one small commit.
+/// No release before this build has read either. A folder's lake made before doesn't, nor a bucket's: a node of a release
+/// before may serve it again (a folder's after a restart, a bucket's cluster at once: its followers, which this form can't
+/// hear in a leader gap), and it would stop (11-07 audit L2: one `pondra sql` raised a folder for good, so a 0.80 server
+/// was refused it). Such a lake moves on only by its server's leader, which knows its nodes' releases (`raise`), or by
+/// `require`, for what needs the lists; until then its entries keep format 5's shape, which every reader reads.
 pub async fn alone(lake: &Lake) -> Result<()> {
-    if known() >= LISTS && kept_here(&lake.url) {
+    if known() >= LISTS && moves_alone(&lake.url, made()) {
         set(lake, LISTS).await?;
     }
     Ok(())
 }
 
-/// Is the lake at `url` in this process's memory or a local folder (no bucket's `scheme://`)?
-fn kept_here(url: &str) -> bool { matches!(crate::store::place(url), Ok(crate::store::Place::Memory | crate::store::Place::Folder)) }
+/// Does a form alone move the lake at `url` on (`alone`): one in this process's memory, or in a local folder when this
+/// process made it (`made`), never one in a bucket?
+fn moves_alone(url: &str, made: bool) -> bool {
+    match crate::store::place(url) {
+        Ok(crate::store::Place::Memory) => true,
+        Ok(crate::store::Place::Folder) => made,
+        _ => false,
+    }
+}
 
 /// A node that isn't the leader: stop if the lake moves past what this build knows. (It can't,
 /// unless this node was cut off while the others agreed, `raise`, or it started on such a lake
@@ -257,11 +266,15 @@ mod tests {
     use super::*;
     use crate::store::{json, table_key, TableMeta};
 
-    /// A form alone raises a lake in memory or a folder, never one in a bucket (`alone`).
+    /// A form alone raises a lake in memory, and one it made in a folder; never a folder's made before, nor a bucket's
+    /// (`alone`).
     #[test]
-    fn a_form_alone_raises_only_a_lake_kept_here() {
-        assert!(kept_here("/home/me/lake") && kept_here("memory://7") && kept_here("C:\\lakes\\one"));
-        assert!(!kept_here("s3://bucket/lake") && !kept_here("gs://b/l") && !kept_here("az://c/l") && !kept_here("abfss://c@a.dfs.core.windows.net/l"));
+    fn a_form_alone_raises_only_a_lake_no_release_before_has_read() {
+        assert!(moves_alone("memory://7", false) && moves_alone("/home/me/lake", true) && moves_alone("C:\\lakes\\one", true));
+        assert!(!moves_alone("/home/me/lake", false) && !moves_alone("C:\\lakes\\one", false));
+        for bucket in ["s3://bucket/lake", "gs://b/l", "az://c/l", "abfss://c@a.dfs.core.windows.net/l"] {
+            assert!(!moves_alone(bucket, true) && !moves_alone(bucket, false), "{bucket}");
+        }
     }
 
     /// Format 6 is one small commit: a format-5 lake's entries stay in their shape and answer as before, and each becomes
