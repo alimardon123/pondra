@@ -40,7 +40,10 @@ fn public_v6(ip: Ipv6Addr) -> bool {
     match s {
         [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] => inside(hi, lo), // (NAT64: the IPv4 address it reaches)
         [0x2002, hi, lo, ..] => inside(hi, lo),               // (6to4)
+        [0, 0, 0, 0, 0xffff, 0, hi, lo] => inside(hi, lo),    // (IPv4-translated, RFC 2765: `to_ipv4_mapped` doesn't take it)
         [0, 0, 0, 0, 0, 0, ..] => false,                      // (unspecified, loopback, IPv4-compatible)
+        [0x64, 0xff9b, 1, ..] => false,                       // (local-use NAT64, RFC 8215: a network's own way to its IPv4 ones)
+        [0x2001, 0, ..] => false,                             // (Teredo: an IPv4 address inside, through a relay)
         _ => !(ip.is_multicast()
             || s[0] & 0xfe00 == 0xfc00 // (unique local: AWS's metadata address fd00:ec2::254 among them)
             || s[0] & 0xffc0 == 0xfe80 // (link-local)
@@ -77,18 +80,7 @@ impl HttpConnector for Connector {
     #[cfg(not(target_arch = "wasm32"))]
     fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
         let http = options.get_config_value(&ClientConfigKey::AllowHttp).as_deref() == Some("true");
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("pondra/", env!("CARGO_PKG_VERSION")))
-            .default_headers(self.headers.clone())
-            .connect_timeout(std::time::Duration::from_secs(5)) // (object_store's own defaults)
-            .timeout(std::time::Duration::from_secs(30))
-            .http1_only()
-            .no_gzip().no_brotli().no_zstd().no_deflate() // (sizes are read from Content-Length)
-            .https_only(!http)
-            .dns_resolver(Names)
-            .redirect(redirects())
-            .build()
-            .map_err(|e| object_store::Error::Generic { store: "outside", source: Box::new(e) })?;
+        let client = self.client(http).map_err(|e| object_store::Error::Generic { store: "outside", source: Box::new(e) })?;
         Ok(HttpClient::new(client))
     }
 
@@ -102,6 +94,30 @@ impl HttpConnector for Connector {
             .map_err(|e| object_store::Error::Generic { store: "outside", source: Box::new(e) })?;
         Ok(HttpClient::new(client))
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Connector {
+    /// The store's client (`connect`), plain HTTP too when `http`.
+    fn client(&self, http: bool) -> reqwest::Result<reqwest::Client> {
+        guarded(reqwest::Client::builder())
+            .user_agent(concat!("pondra/", env!("CARGO_PKG_VERSION")))
+            .default_headers(self.headers.clone())
+            .connect_timeout(std::time::Duration::from_secs(5)) // (object_store's own defaults)
+            .timeout(std::time::Duration::from_secs(30))
+            .http1_only()
+            .no_gzip().no_brotli().no_zstd().no_deflate() // (sizes are read from Content-Length)
+            .https_only(!http)
+            .build()
+    }
+}
+
+/// What makes a client reach only the public internet: names checked as they resolve (`Names`), each redirect checked
+/// (`redirects`), and never a proxy, which would resolve the names itself, past `Names`' check (audit 10-30 M8). Both of
+/// this module's clients are made with it.
+#[cfg(not(target_arch = "wasm32"))]
+fn guarded(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    b.dns_resolver(Names).redirect(redirects()).no_proxy()
 }
 
 /// Each redirect checked as the first request was (`check`; a name is checked as it resolves), ten at most.
@@ -129,8 +145,7 @@ pub fn web() -> &'static reqwest::Client {
     {
         static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
         CLIENT.get_or_init(|| {
-            // (never through a proxy: a proxy resolves the names itself, past `Names`' check: audit 10-30 M8)
-            reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).dns_resolver(Names).redirect(redirects()).no_proxy().build().expect("an HTTP client")
+            guarded(reqwest::Client::builder()).timeout(std::time::Duration::from_secs(60)).build().expect("an HTTP client")
         })
     }
     #[cfg(target_arch = "wasm32")]
@@ -162,12 +177,13 @@ mod tests {
 
     #[test]
     fn only_the_public_internet() {
-        for a in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "64:ff9b::808:808", "2002:808:808::1", "::ffff:8.8.8.8"] {
+        for a in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "64:ff9b::808:808", "2002:808:808::1", "::ffff:8.8.8.8", "::ffff:0:808:808", "2001:4860:4860::8888"] {
             assert!(public(a.parse().unwrap()), "{a} is public");
         }
         for a in ["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "255.255.255.255", "224.0.0.1",
                   "192.0.0.10", "198.18.0.1", "::1", "::", "fd00:ec2::254", "fe80::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254", "64:ff9b::a9fe:a9fe",
-                  "2002:a9fe:a9fe::1", "2001:db8::1", "ff02::1", "::127.0.0.1"] {
+                  "2002:a9fe:a9fe::1", "2001:db8::1", "ff02::1", "::127.0.0.1", "::ffff:0:a9fe:a9fe", "::ffff:0:7f00:1", "64:ff9b:1::a00:1",
+                  "2001:0:4136:e378:8000:63bf:3fff:fdd2"] {
             assert!(!public(a.parse().unwrap()), "{a} isn't public");
         }
     }
@@ -178,5 +194,47 @@ mod tests {
         assert!(ok("https://example.com/x.csv") && ok("s3://bucket/x") && ok("https://8.8.8.8/x"));
         assert!(!ok("http://169.254.169.254/latest/meta-data/") && !ok("http://[::1]:8080/") && !ok("http://localhost:9000/b") && !ok("http://a.localhost./x"));
         assert!(!ok("http://[::ffff:a9fe:a9fe]/") && !ok("http://2130706433/"), "an address however it is written");
+    }
+
+    /// A temporary secret's store never goes through a proxy the environment names, which would resolve the names itself,
+    /// past `Names` (audit 10-30 M8 closed it for `web()`; this is the store's client). The check runs in a child of this
+    /// test binary, since the proxy is named in the environment, which the other tests here share.
+    #[test]
+    fn a_temporary_secrets_store_goes_through_no_proxy() {
+        const CHILD: &str = "PONDRA_TEST_PROXY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let ask = |client: reqwest::Client| async move { client.get("http://nothing.invalid/x.csv").send().await };
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let (store, web) = runtime.block_on(async { (ask(Connector::default().client(true).unwrap()).await, ask(web().clone()).await) });
+            assert!(store.is_err() && web.is_err(), "nothing.invalid doesn't resolve");
+            return;
+        }
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = format!("http://{}", proxy.local_addr().unwrap());
+        proxy.set_nonblocking(true).unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watch = {
+            let done = done.clone();
+            // (a request that reaches the proxy is noted and its connection closed at once, so the child's request fails then)
+            std::thread::spawn(move || {
+                let mut reached = false;
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    match proxy.accept() {
+                        Ok(_) => reached = true,
+                        Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    }
+                }
+                reached
+            })
+        };
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "public::tests::a_temporary_secrets_store_goes_through_no_proxy", "--test-threads=1"]).env(CHILD, "1");
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+            child.env(name, &at);
+        }
+        let status = child.env_remove("NO_PROXY").env_remove("no_proxy").status().unwrap();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!watch.join().unwrap(), "a request went to the proxy");
+        assert!(status.success(), "the child's own check");
     }
 }

@@ -95,13 +95,13 @@ pub fn of(sql: &str) -> Option<Returning> {
 }
 
 impl Returning {
-    /// Postgres's command tag, which the row count follows (`INSERT 0 3`, `UPDATE 2`).
-    pub fn tag(&self) -> &'static str {
-        match self.kind {
-            Kind::Insert => "INSERT 0",
+    /// The command's words, which Postgres's command tag starts with (`INSERT 0 3` is `prefix` of INSERT, then the count).
+    pub fn kind(&self) -> crate::answer::Kind {
+        crate::answer::Kind::new(match self.kind {
+            Kind::Insert => "INSERT",
             Kind::Update => "UPDATE",
             Kind::Delete => "DELETE",
-        }
+        })
     }
 
     fn word(&self) -> &'static str {
