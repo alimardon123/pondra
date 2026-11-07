@@ -25,6 +25,9 @@ pub struct Feed {
 
 pub fn feed_key(view: &str) -> String { format!("fd/{view}") } // (`f/` is the functions')
 
+/// The feeds' records in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "fd/", owner: "feeds", holds: "a view's feed: where its consumers read from (feed_key)" }];
+
 /// Leader: make the view's table and its feed (`CREATE MATERIALIZED VIEW` over a topic).
 pub async fn create(lake: &Lake, name: &str, sql: &str, topic: &str, options: &std::collections::BTreeMap<String, String>) -> Result<()> {
     ensure!(lake.cat.get::<TableMeta>(&table_key(name)).await?.is_none(), "table {name} already exists");

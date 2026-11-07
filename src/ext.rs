@@ -244,6 +244,9 @@ const PARQUET_TUNING: [&str; 8] = ["pushdown_filters", "reorder_filters", "enabl
 /// lake's files (`for_caller`), as a view over `'x.csv'` is; one that leaves them is refused here.
 fn located(l: &str) -> Result<String> {
     off_page(l)?;
+    if let Some(through) = crate::connections::place(l) {
+        return Ok(through); // (a connection's files: '@drop/sales/')
+    }
     if scheme(l).is_some() {
         return Ok(l.to_string());
     }
@@ -381,6 +384,9 @@ pub async fn check_urls(lake: &Lake, urls: &[&str]) -> Result<()> {
 
 fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
     off_page(u)?;
+    if crate::connections::named_in(u).is_some() {
+        return through(u, "READ");
+    }
     match scheme(u).filter(|s| *s != "file") {
         None => return Err(crate::codes::coded("42501", format!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): read it there, or from a bucket (s3://, gs://, az://, https://)"))),
         Some(_) => match covering(secrets, u) {
@@ -389,6 +395,16 @@ fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
             Some(_) => {}
         },
     }
+    Ok(())
+}
+
+/// May the caller use the connection `u` is read or written through (`cn://drop/…`, `'@drop/…'`) for `privilege`, READ or
+/// WRITE? Granted to it, a role of its or public; a token's and a superuser's, always. Its secret is the connection's to
+/// lend: the caller needs no USAGE on it.
+pub(crate) fn through(u: &str, privilege: &str) -> Result<()> {
+    let name = crate::connections::named_in(u).unwrap_or_default();
+    ensure!(owner() || crate::auth::limited().is_none_or(|a| a.may_use("connection", name, privilege)),
+        crate::codes::coded("42501", format!("'@{name}/…': {privilege} on connection {name} isn't granted to this user (an admin grants it: GRANT {privilege} ON CONNECTION {name} TO …)")));
     Ok(())
 }
 
@@ -543,6 +559,9 @@ pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
     if is_blob(url) {
         return register_blob(lake, url).await; // (before any secret is listed or covers it)
     }
+    if crate::connections::named_in(url).is_some() {
+        return connected(lake, url).await;
+    }
     let Some(root) = root(url).filter(|_| scheme(url).is_some_and(|s| s != "file" && s != "kafka")) else { return Ok(()) }; // (this machine's: DataFusion's own; a topic: a Kafka client's)
     let lake_root = self::root(&lake.url);
     let attached: Vec<Option<String>> = lake.attached.read().unwrap().iter().map(|(_, o)| self::root(&o.url)).collect();
@@ -552,7 +571,6 @@ pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
     let secrets = list(lake).await?;
     let secret = covering(&secrets, url);
     let made_with = secret.as_ref().map_or("the node's own".to_string(), |(n, s)| format!("{n}:{}", s.sealed));
-    crate::per_node!(static MADE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None));
     if MADE.lock().unwrap().get_or_insert_default().get(&root) == Some(&made_with) {
         return Ok(());
     }
@@ -560,6 +578,39 @@ pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
     let to = if secret.as_ref().is_some_and(|(_, s)| s.temporary && !s.trusted) { For::Public } else { For::Files };
     let store = build(&url::Url::parse(&root)?, params.as_ref(), to)?;
     lake.rt.register_object_store(&url::Url::parse(&root)?, Arc::new(crate::cache::CachedStore::files(store))); // (a file's ranges kept by its version)
+    MADE.lock().unwrap().get_or_insert_default().insert(root, made_with);
+    Ok(())
+}
+
+// (each root's store, and what it was made with: made again when that changes)
+crate::per_node!(static MADE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None));
+
+/// The store a connection's files are read and written through, `cn://drop`, made from its definition: its type's store for
+/// its url, signed with the secret it names, whose settings never leave the node (the caller needs no USAGE on it: the
+/// connection lends it, after READ or WRITE, `through`). Made again when the definition or the secret changes.
+async fn connected(lake: &Lake, url: &str) -> Result<()> {
+    use crate::connections::{find, key, Definition};
+    let name = crate::connections::named_in(url).unwrap_or_default();
+    let made = || format!("CREATE CONNECTION {name} TYPE s3 WITH (url = 's3://bucket/folder')");
+    let d: Definition = lake.cat.get(&key(name)).await?.ok_or_else(|| crate::codes::coded("42704", format!("no connection {name}: '@{name}/…' reads a connection's files ({})", made())))?;
+    let t = find(&d.ty).ok_or_else(|| crate::codes::coded("0A000", format!("connection {name} is of TYPE {}, which this node's build doesn't have", d.ty)))?;
+    let opener = t.open.ok_or_else(|| crate::codes::coded("0A000", match t.holds {
+        crate::connections::Holds::Files => format!("'@{name}/…': files are read through a TYPE {} connection in a later step", t.name),
+        holds => format!("connection {name} holds {}, not files: '@{name}/…' reads files", holds.word()),
+    }))?;
+    let secret = match d.options.get("secret").and_then(|s| s.as_str()) {
+        Some(s) => Some(list(lake).await?.into_iter().find(|(n, _)| n == s).ok_or_else(|| crate::codes::coded("42704", format!("connection {name} signs in with secret {s}, which isn't there (CREATE SECRET {s} (…))")))?),
+        None => None,
+    };
+    let made_with = format!("{}:{}", serde_json::to_string(&d)?, secret.as_ref().map_or("", |(_, s)| s.sealed.as_str()));
+    let root = format!("{}://{name}", crate::connections::SCHEME);
+    if MADE.lock().unwrap().get_or_insert_default().get(&root) == Some(&made_with) {
+        return Ok(());
+    }
+    let params = secret.as_ref().map(|(n, s)| open(n, s)).transpose()?;
+    let at = d.options.get("url").and_then(|u| u.as_str()).with_context(|| format!("connection {name} has no url ({})", made()))?;
+    let store = opener(at, params.as_ref())?;
+    lake.rt.register_object_store(&url::Url::parse(&root)?, Arc::new(crate::cache::CachedStore::files(store)));
     MADE.lock().unwrap().get_or_insert_default().insert(root, made_with);
     Ok(())
 }
@@ -749,6 +800,9 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
 // ---------------------------------------------------------------- other engines' catalogs
 
 fn attached_key(n: &str) -> String { format!("o/{n}") }
+
+/// Other engines' catalogs in this one (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "o/", owner: "ext", holds: "a database attached from another engine's catalog (attached_key)" }];
 
 pub async fn attached(lake: &Lake) -> Result<Vec<(String, Attached)>> {
     Ok(lake.cat.scan::<Attached>("o/", "o0").await?.into_iter().map(|(k, a)| (k[2..].to_string(), a)).collect())
@@ -1164,6 +1218,7 @@ fn copy_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Option<
         return refused("COPY … TO STDOUT is the Postgres port's (psql, a driver's copy): elsewhere, run the query as CSV (POST /sql?format=csv), or COPY it TO 's3://…' (FORMAT csv)".into());
     }
     let Ok(to) = p.parse_literal_string() else { return None };
+    let to = crate::connections::place(&to).unwrap_or(to); // ('@drop/out/': a connection's files)
     let mut options = BTreeMap::new();
     // DataFusion's words for the same: STORED AS csv, PARTITIONED BY (…), OPTIONS ('format.has_header' 'false', …).
     loop {
@@ -1255,15 +1310,16 @@ fn copy_into_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Op
             Err(e) => return invalid(e.to_string()),
         }
     } else {
+        let quoted = matches!(p.peek_token().token, Token::SingleQuotedString(_));
         match p.parse_literal_string() {
-            Ok(path) if path.starts_with('@') => {
-                // (Snowflake's stage: Pondra has none, it reads the files where they are; a connection's '@name/path' is 1.1's)
-                let stage = path.split('/').next().unwrap_or(&path);
+            Ok(stage) if !quoted && stage.starts_with('@') => {
+                // (Snowflake's stage, unquoted: here a connection's files are named in a string)
+                let name = stage.trim_start_matches('@');
                 return Some(crate::write::Stmt::Invalid(format!(
-                    "COPY INTO {table} FROM {stage}: a stage isn't supported (a connection's '@name/path' comes in 1.1); name the files where they are: COPY INTO {table} FROM 's3://bucket/folder/*.csv' (FORMAT csv, HEADER true)"
+                    "COPY INTO {table} FROM {stage}: an unquoted stage isn't supported. A connection's files are named in a string, '{stage}/…' (CREATE CONNECTION {name} TYPE s3 WITH (url = 's3://bucket/folder')), or name the files where they are: COPY INTO {table} FROM 's3://bucket/folder/*.csv' (FORMAT csv, HEADER true)"
                 )));
             }
-            Ok(path) => Source::Path(path),
+            Ok(path) => Source::Path(crate::connections::place(&path).unwrap_or(path)), // ('@drop/in/*.csv': a connection's files)
             Err(_) => return invalid("the path is a string".into()),
         }
     };

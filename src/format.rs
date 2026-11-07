@@ -51,6 +51,9 @@ pub fn known() -> u32 {
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The catalog key that holds it.
 const KEY: &str = "format";
+
+/// The format's record in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: KEY, owner: "format", holds: "the lake's format: what a node must read to open it" }];
 /// What a node says of itself on every call to another: its release, and the newest format it knows.
 pub fn headers() -> [(&'static str, String); 2] { [("x-pondra-version", VERSION.into()), ("x-pondra-format", known().to_string())] }
 

@@ -51,6 +51,7 @@ log catalog
 manifest catalog
 members catalog
 objects catalog
+records catalog
 replica catalog
 scan catalog
 sketch catalog

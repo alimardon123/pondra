@@ -52,7 +52,7 @@ delta -> write_outside  1
 dial -> ext  1
 dial -> store  1
 dial -> users  1
-engine -> pattern  2
+engine -> pattern  1
 engine -> pg_bytea  1
 engine -> pg_json_make  1
 env -> wasm32  3

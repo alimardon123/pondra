@@ -710,6 +710,12 @@ pub fn forget_producers(names: impl IntoIterator<Item = String>) { FORGOTTEN.loc
 /// one (`Producers::settle`).
 pub const EXPIRY: &str = "g/";
 
+/// The log's own records in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[
+    crate::records::Prefix { prefix: EXPIRY, owner: "log", holds: "when each producer's mark expires (expiry_key)" },
+    crate::records::Prefix { prefix: "b", owner: "log", holds: "the next block of row ids the log hands out" },
+];
+
 /// The old marks' pass (`Producers::settle`): its state, one key.
 const OLD_MARKS: &str = "g/~old";
 

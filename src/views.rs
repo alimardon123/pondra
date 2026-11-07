@@ -435,6 +435,9 @@ pub fn constraints(sql: &str) -> Result<Option<(String, Vec<Expect>)>> {
 /// A session view's bound: no session still open starts before this (µs).
 fn open_key(name: &str) -> String { format!("w/{name}") }
 
+/// The views' own records beside their kind's `v/` (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "w/", owner: "views", holds: "a session view's bound: no open session starts before it (open_key)" }];
+
 /// The refusal of a view that takes each row once (`what`: sessions, stream joins, pattern views with EMIT FINAL)
 /// over `source`, whose rows are replaced: `kept`, a view kept by key, or a view that follows one row by row
 /// (`replaced`). Its rows are replaced as their groups are worked out again (0A000).
