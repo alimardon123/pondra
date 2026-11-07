@@ -388,14 +388,14 @@ impl State {
     /// Should a scan of this file decode it into the cache? Not on a lake's first read of it (a lake in memory: its first
     /// too), and only when there is room for it: for a file that didn't fit before, the room its decoded size took, not a
     /// guess of it (`need`), so a cache with no room for it doesn't decode it on every read and throw it away (a lake in
-    /// memory guesses nothing: its file is decoded and fits or not).
+    /// memory guesses nothing here: its load reads the file's footer and decodes it only if that fits).
     fn tries(&mut self, key: &str, guess: usize, memory: bool, room: usize) -> bool {
         let need = self.need.get(key).copied().unwrap_or(if memory { 0 } else { guess });
         (memory || self.twice(key)) && self.room(need, room)
     }
 
-    /// Notes that `key` decodes to `bytes`, which didn't fit (`need`). Bounded as `once` is: past [`NEED`] files one noted
-    /// before is let go of, and is decoded again if it is read.
+    /// Notes that `key` decodes to `bytes` (or its footer says it would), which didn't fit (`need`). Bounded as `once` is:
+    /// past [`NEED`] files one noted before is let go of, and is decoded again if it is read.
     fn needs(&mut self, key: String, bytes: usize) {
         if self.need.len() >= NEED && !self.need.contains_key(&key) {
             if let Some(any) = self.need.keys().next().cloned() {
