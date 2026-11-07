@@ -339,35 +339,58 @@ pub fn names_a_type(sql: &str) -> bool {
         "float8", "real", "double", "decimal", "numeric", "dec", "text", "varchar", "char", "character", "string", "bpchar", "bool", "boolean", "date", "time", "timestamp", "timestamptz",
         "datetime", "interval", "json", "jsonb", "uuid", "bytea", "blob", "binary", "varbinary", "bytes", "regclass", "regtype", "regproc", "regnamespace", "oid", "name", "variant", "bit"];
     // (a name after AS is a type only in a cast's parentheses: `SELECT x AS mood` names a column, `CAST(x AS mood)` a type)
-    // (and only a text with a cast's call is tokenized to tell: most have none)
+    // (and only a text with a cast's call is tokenized to tell, once for all its AS: most have none)
     static CAST_CALL: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:try_|safe_)?cast\s*\(").expect("a regex"));
     let calls = std::cell::OnceCell::new();
-    let a_type = |c: &regex::Captures| c.get(0).is_some_and(|m| m.as_str().starts_with("::") || (*calls.get_or_init(|| CAST_CALL.is_match(sql)) && casts_as(sql, m.start())));
+    let mut casts: Option<Casts> = None;
+    let mut a_type = |c: &regex::Captures| c.get(0).is_some_and(|m| m.as_str().starts_with("::") || (*calls.get_or_init(|| CAST_CALL.is_match(sql)) && casts.get_or_insert_with(|| Casts::of(sql)).as_at(m.start())));
     NAMED.captures_iter(sql).any(|c| match (c.get(1), c.get(2)) {
         _ if c.get(3).is_some() => c.get(3).is_some_and(|s| !is_uuid(s.as_str())), // (`'A0EE…'`: read as a uuid where one is compared with it or written into one)
         (None, _) => true, // (enum_range(…), pg_typeof(…))
         (Some(_), Some(_)) => a_type(&c),
-        (Some(n), None) => a_type(&c) && (["uuid", "json", "jsonb"].iter().any(|t| n.as_str().eq_ignore_ascii_case(t)) || !BUILT_IN.contains(&n.as_str().to_lowercase().as_str())), // (a cast to uuid, json or jsonb: written as text)
+        // (a built-in type's name is looked at first: `CAST(x AS VARCHAR)` asks nothing more; uuid, json and jsonb are written as text)
+        (Some(n), None) => (["uuid", "json", "jsonb"].iter().any(|t| n.as_str().eq_ignore_ascii_case(t)) || !BUILT_IN.contains(&n.as_str().to_lowercase().as_str())) && a_type(&c),
     })
 }
 
-/// Whether the `AS` at byte `at` of `sql` is a cast's (`CAST(x AS t)`, `TRY_CAST`, `SAFE_CAST`): the innermost parenthesis
-/// open there follows one of those words. Not an alias's, a CREATE's or a WITH query's. When the tokenizer refuses the text,
-/// yes, so the parser is the one to say.
-fn casts_as(sql: &str, at: usize) -> bool {
-    let Some(t) = tokens(sql) else { return true };
-    let mut open: Vec<bool> = vec![]; // (each open parenthesis: a cast's?)
-    let mut before: Option<&Token> = None;
-    for (token, _) in t.toks.iter().zip(&t.start).take_while(|(_, &start)| start < at) {
-        match token {
-            Token::Whitespace(_) => continue,
-            Token::LParen => open.push(matches!(before, Some(Token::Word(w)) if w.quote_style.is_none() && ["cast", "try_cast", "safe_cast"].iter().any(|k| w.value.eq_ignore_ascii_case(k)))),
-            Token::RParen => _ = open.pop(),
-            _ => {}
-        }
-        before = Some(token);
+/// Whether each `AS` of a text, asked in the order they come, is a cast's (`CAST(x AS t)`, `TRY_CAST`, `SAFE_CAST`): the
+/// innermost parenthesis open there follows one of those words. Not an alias's, a CREATE's or a WITH query's. The tokens are
+/// walked once for all of them: walked from the start for each, a `pondra.find` over 1,000 tables (a VALUES of nine casts a
+/// row, past `parsed::LONGEST` so tokenized for each too) took minutes. When the tokenizer refuses the text, yes, so the
+/// parser is the one to say.
+struct Casts {
+    tokens: Option<std::sync::Arc<Tokens>>,
+    next: usize,     // (the first token not walked yet)
+    open: Vec<bool>, // (each open parenthesis: a cast's?)
+    after_cast: bool, // (the last token walked, whitespace aside, is the word cast, try_cast or safe_cast)
+}
+
+impl Casts {
+    fn of(sql: &str) -> Casts {
+        Casts { tokens: tokens(sql), next: 0, open: vec![], after_cast: false }
     }
-    open.last().copied().unwrap_or(false)
+
+    /// Whether the `AS` at byte `at` is a cast's: `at` comes after every place asked before.
+    fn as_at(&mut self, at: usize) -> bool {
+        let Some(t) = &self.tokens else { return true };
+        while self.next < t.toks.len() && t.start[self.next] < at {
+            match &t.toks[self.next] {
+                Token::Whitespace(_) => {}
+                Token::LParen => {
+                    self.open.push(self.after_cast);
+                    self.after_cast = false;
+                }
+                Token::RParen => {
+                    self.open.pop();
+                    self.after_cast = false;
+                }
+                Token::Word(w) => self.after_cast = w.quote_style.is_none() && ["cast", "try_cast", "safe_cast"].iter().any(|k| w.value.eq_ignore_ascii_case(k)),
+                _ => self.after_cast = false,
+            }
+            self.next += 1;
+        }
+        self.open.last().copied().unwrap_or(false)
+    }
 }
 
 /// An expression's place in its statement, which tells it from another of the same text.
@@ -934,6 +957,16 @@ mod tests {
             assert!(names_a_type(sql), "{sql}");
         }
         assert!(names_a_type("SELECT CAST(x AS mood), 'open"), "the tokenizer refuses an unclosed string: the parser is the one to say");
+        assert!(names_a_type("SELECT CAST(a AS INT) AS m1, f(CAST(b AS s.mood)) AS m2"), "the second cast, after an alias");
+        assert!(!names_a_type("SELECT CAST(CAST(a AS INT) AS TEXT) AS mood, (b) AS m, CAST((c) AS VARCHAR) AS t"));
+        // (a long text with an AS in each of thousands of items, as `pondra.find`'s rows are: its tokens walked once, not once an AS)
+        let items: Vec<String> = (0..6000).map(|i| format!("CAST(f(a, '{i}') AS VARCHAR) AS c{i}")).collect();
+        let long = format!("SELECT {} FROM t", items.join(", "));
+        assert!(long.len() > crate::parsed::LONGEST);
+        let started = std::time::Instant::now();
+        assert!(!names_a_type(&long), "built-in types and aliases only");
+        assert!(names_a_type(&format!("{long} WHERE CAST(x AS mood) = 'happy'")), "and a type of one's own at its end");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     #[test]
