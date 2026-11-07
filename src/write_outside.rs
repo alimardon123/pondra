@@ -103,7 +103,11 @@ async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job:
     let df = conform(df, &target, root)?;
     let partition_at: Vec<usize> = partitions.iter().map(|p| target.iter().position(|f| f.name() == p).expect("a partition column")).collect();
     let file_fields: Vec<Field> = target.iter().enumerate().filter(|(i, _)| !partition_at.contains(i)).map(|(_, f)| f.clone()).collect();
+    let schema: Value = serde_json::from_str(log.metadata["schemaString"].as_str().context("no schema")?)?;
+    let not_null: Vec<&str> = schema["fields"].as_array().into_iter().flatten().filter(|f| f["nullable"].as_bool() == Some(false)).filter_map(|f| f["name"].as_str()).collect();
+    let required: Vec<(usize, &str)> = columns.iter().enumerate().filter(|(_, (_, l, _))| not_null.contains(&l.as_str())).map(|(i, (_, l, _))| (i, l.as_str())).collect();
     let parts = |b: &RecordBatch| -> Result<Vec<Part>> {
+        refuse_nulls(b, &required, root)?;
         let text: Vec<ArrayRef> = partition_at.iter().map(|&i| partition_text(b.column(i))).collect::<Result<_>>()?;
         let mut groups: BTreeMap<Vec<Option<String>>, Vec<u32>> = BTreeMap::new();
         for r in 0..b.num_rows() {
@@ -199,12 +203,41 @@ fn delta_writable(root: &str, log: &read_delta::Log) -> Result<()> {
             ensure!(meta.get(k).is_none(), "{root}: column {name} has {what}, which Pondra doesn't compute or check yet: INSERT with Spark or delta-rs");
         }
     }
+    // (Pondra names and numbers a mapped table's top-level columns only, and checks no NOT NULL inside a column: a
+    // struct's fields written under their own names are NULL to Spark, and the table no longer reads in delta-rs)
+    let mapped = log.metadata["configuration"]["delta.columnMapping.mode"].as_str().is_some_and(|m| m != "none");
+    let schema: Value = serde_json::from_str(log.metadata["schemaString"].as_str().context("no schema")?)?;
+    for f in schema["fields"].as_array().into_iter().flatten() {
+        let name = f["name"].as_str().unwrap_or_default();
+        ensure!(!(mapped && holds_struct(&f["type"])), "{root}: column {name} holds a struct, and the table maps its columns' names (delta.columnMapping.mode), which Pondra doesn't do inside a struct yet: INSERT with Spark or delta-rs");
+        ensure!(!not_null_inside(&f["type"]), "{root}: column {name} has a NOT NULL value inside it, which Pondra doesn't check yet: INSERT with Spark or delta-rs");
+    }
     let config = log.metadata["configuration"].as_object().cloned().unwrap_or_default();
     if let Some(k) = config.keys().find(|k| k.starts_with("delta.constraints.")) {
         bail!("{root}: the table has a CHECK constraint ({}), which Pondra doesn't check yet", &k["delta.constraints.".len()..]);
     }
     ensure!(config.get("delta.appendOnly").is_none_or(|v| v == "true" || v == "false"), "{root}: delta.appendOnly");
     Ok(())
+}
+
+/// Does a Delta type hold a struct (a map's entries are one), at any depth?
+fn holds_struct(t: &Value) -> bool {
+    match t["type"].as_str() {
+        Some("struct" | "map") => true,
+        Some("array") => holds_struct(&t["elementType"]),
+        _ => false,
+    }
+}
+
+/// Does a Delta type say NOT NULL of something inside it: a struct's field, an array's elements, a map's values?
+fn not_null_inside(t: &Value) -> bool {
+    let no = |k: &str| t[k].as_bool() == Some(false);
+    match t["type"].as_str() {
+        Some("struct") => t["fields"].as_array().into_iter().flatten().any(|f| f["nullable"].as_bool() == Some(false) || not_null_inside(&f["type"])),
+        Some("array") => no("containsNull") || not_null_inside(&t["elementType"]),
+        Some("map") => no("valueContainsNull") || not_null_inside(&t["keyType"]) || not_null_inside(&t["valueType"]),
+        _ => false,
+    }
 }
 
 /// A Delta schema's top-level fields' metadata, by logical name.
@@ -377,6 +410,15 @@ fn conform(df: datafusion::prelude::DataFrame, target: &[Field], table: &str) ->
     Ok(df.select(exprs)?)
 }
 
+/// A NULL in a column the table says is NOT NULL (Delta's `nullable: false`, Iceberg's `required`) is refused before a
+/// file is committed: other engines read the table trusting it. `required`: (the column's place in the rows, its name).
+fn refuse_nulls(b: &RecordBatch, required: &[(usize, &str)], table: &str) -> Result<()> {
+    for (i, name) in required {
+        ensure!(b.column(*i).null_count() == 0, "INSERT into {table}: column {name} is NOT NULL, and a row gives it no value");
+    }
+    Ok(())
+}
+
 /// Write an object only if nothing is there: false if something is (another writer won).
 pub async fn put_new(lake: &Lake, url: &str, body: Vec<u8>) -> Result<bool> {
     let (store, path) = crate::ext::store(lake, url).await?;
@@ -417,6 +459,8 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
     let (schema_json, columns) = crate::read_iceberg::schema_of(&meta)?;
     let target: Vec<Field> = columns.iter().map(|(n, id, t)| Field::new(n, t.clone(), true).with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into())).collect();
     let df = conform(df, &target, url)?;
+    let required_ids: Vec<i64> = schema_json["fields"].as_array().into_iter().flatten().filter(|f| f["required"].as_bool() == Some(true)).filter_map(|f| f["id"].as_i64()).collect();
+    let required: Vec<(usize, &str)> = columns.iter().enumerate().filter(|(_, (_, id, _))| required_ids.contains(id)).map(|(i, (n, _, _))| (i, n.as_str())).collect();
     let spec_id = meta["default-spec-id"].as_i64().unwrap_or(0);
     let pspec = meta["partition-specs"].as_array().into_iter().flatten().find(|s| s["spec-id"].as_i64() == Some(spec_id)).cloned().unwrap_or(json!({"fields": []}));
     let fields: Vec<(String, usize, String, DataType)> = pspec["fields"].as_array().into_iter().flatten().map(|f| {
@@ -427,6 +471,7 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
     let partition_avro: Vec<Value> = pspec["fields"].as_array().into_iter().flatten().zip(&fields)
         .map(|(f, (name, _, t, dt))| Ok(crate::iceberg::opt(name, f["field-id"].as_u64().unwrap_or(1000) as u32, avro_type(t, dt)?))).collect::<Result<_>>()?;
     let parts = |b: &RecordBatch| -> Result<Vec<Part>> {
+        refuse_nulls(b, &required, url)?;
         let values: Vec<Vec<Value>> = fields.iter().map(|(_, i, t, _)| transform(b.column(*i), t)).collect::<Result<_>>()?;
         let mut groups: BTreeMap<String, (Vec<u32>, Value)> = BTreeMap::new();
         for r in 0..b.num_rows() {

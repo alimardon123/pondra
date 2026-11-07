@@ -2874,6 +2874,20 @@ def kafka():
     checks["a decimal's scale past 76 is refused as INVALID_RECORD and the node stays up; a Decimal as a JSON number loads as sent"] = \
         len(huge) == 2 and all(e is not None and e.code() == ck.KafkaError.INVALID_RECORD for e in huge) and \
         sql_("SELECT id, balance::VARCHAR AS balance FROM kinds ORDER BY id") == [{"id": 1, "balance": "-3.25"}, {"id": 3, "balance": "10.50"}]
+    # Every number reaches the table with the digits it was sent with, on the path that reads records one by one too: a
+    # Decimal as a JSON number, a change event without its schema, and a plain row batched with a tombstone. They went
+    # through an f64 there, so 0.123456789012345678 was stored as 0.123456789012345680 (11-07 audit H1).
+    sql_("CREATE TABLE digits (id BIGINT PRIMARY KEY, amount DECIMAL(38,18), big DECIMAL(38,2))")
+    digits = {"type": "struct", "fields": [field("id", "int64"), field("amount", "bytes", "org.apache.kafka.connect.data.Decimal", parameters={"scale": "18"})]}
+    p.produce("digits", value=json.dumps({"schema": digits, "payload": {"id": 1, "amount": "AMOUNT", "big": "BIG"}}).replace('"AMOUNT"', "0.123456789012345678").replace('"BIG"', "12345678901234567.89"))
+    p.produce("digits", value='{"before": null, "after": {"id": 2, "amount": 1.000000000000000001, "big": 99999999999999999999.99}, "op": "c"}')
+    p.produce("digits", value='{"id": 3, "amount": 0.333333333333333333}')
+    p.produce("digits", key=json.dumps({"id": 4}), value=None)
+    assert p.flush(30) == 0
+    checks["a number keeps every digit it was sent with: a Decimal as a JSON number, a change event, a row batched with a tombstone"] = \
+        sql_("SELECT id, amount::VARCHAR AS amount, big::VARCHAR AS big FROM digits ORDER BY id") == [
+            {"id": 1, "amount": "0.123456789012345678", "big": "12345678901234567.89"}, {"id": 2, "amount": "1.000000000000000001", "big": "99999999999999999999.99"},
+            {"id": 3, "amount": "0.333333333333333333"}]  # (a NULL is left out of the answer's row)
     # consumers: kafka-python and librdkafka read the log back from the beginning
     tp = kp.TopicPartition("users", 0)
     c = kp.KafkaConsumer(bootstrap_servers=f"127.0.0.1:{kport}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN",
