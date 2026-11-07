@@ -29,6 +29,10 @@ pub enum Action {
     Define,
     /// Write files outside the lake: `COPY (…) TO 'url'`.
     Export,
+    /// Write the lake where no table is named: CHECKPOINT, the workspace's files (`pondra.git_*`).
+    Write,
+    /// Run code on the node: DO, a Python file or notebook (`pondra.run`).
+    RunCode,
 }
 
 impl Action {
@@ -50,16 +54,39 @@ impl Action {
             Action::Insert => Some("insert"),
             Action::Update | Action::Lock => Some("update"),
             Action::Delete => Some("delete"),
-            Action::Define | Action::Export => None,
+            Action::Define | Action::Export | Action::Write | Action::RunCode => None,
         }
     }
 
-    /// The role a principal with no grants (a token, a superuser, an open node) needs for it.
+    /// What a statement that needs `role` asks of the lake: an extension's, by its entry (`statements::role`).
+    fn of_role(role: Role) -> Option<Action> {
+        match role {
+            Role::Admin => Some(Action::Define),
+            Role::Write => Some(Action::Write),
+            Role::Read => Some(Action::Select),
+            Role::None => None,
+        }
+    }
+
+    /// The role it needs: of a principal with no grants (a token, a superuser, an open node), and of a user for what no
+    /// grant names (a user's role is a writer's when it is granted a write, and never an admin's).
     fn role(self) -> Role {
         match self {
             Action::Select | Action::SelectAll => Role::Read,
-            Action::Insert | Action::Update | Action::Delete | Action::Lock => Role::Write,
-            Action::Define | Action::Export => Role::Admin,
+            Action::Insert | Action::Update | Action::Delete | Action::Lock | Action::Write => Role::Write,
+            Action::Define | Action::Export | Action::RunCode => Role::Admin,
+        }
+    }
+
+    /// What it is, in a refusal's words ("this token may not …").
+    fn words(self) -> &'static str {
+        match self {
+            Action::Select | Action::SelectAll => "read",
+            Action::Insert | Action::Update | Action::Delete | Action::Write => "write",
+            Action::Lock => "take rows FOR UPDATE, as an UPDATE does",
+            Action::Define => "change the lake's tables, views, schemas, routines or users",
+            Action::Export => "write files outside the lake",
+            Action::RunCode => "run code on the node",
         }
     }
 
@@ -99,15 +126,15 @@ impl From<Refusal> for anyhow::Error {
 /// May `who` do `action` to `object`?
 pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusal> {
     let superuser = who.role == Role::Admin && who.access.is_none();
-    // (a role first: a token's, and a user, who never defines the lake or writes outside it)
-    if who.access.as_ref().map_or(who.role < action.role(), |_| action.privilege().is_none()) {
-        return Err(Refusal::new(format!("this {} may not {}", if who.access.is_some() { "user" } else { "token" }, match action {
-            Action::Select | Action::SelectAll => "read",
-            Action::Insert | Action::Update | Action::Delete => "write",
-            Action::Lock => "write: FOR UPDATE takes rows as an UPDATE does",
-            Action::Define => "change the lake's tables, views, schemas, routines or users (an admin token, or a superuser, does)",
-            Action::Export => "write files outside the lake",
-        })));
+    // (a role first: a token's, and a user's for what no grant names)
+    let need = action.role();
+    if (who.access.is_none() || action.privilege().is_none()) && who.role < need {
+        let needs = match need {
+            Role::Admin => "an admin token, or a superuser",
+            Role::Write => "a write token, or a user granted a write",
+            _ => "a token, or a user's sign-in",
+        };
+        return Err(Refusal::new(format!("this {} may not {}: it needs {needs}", if who.access.is_some() { "user" } else { "token" }, action.words())));
     }
     let Object::Table(name) = object else { return Ok(()) };
     let table = catalog_name(name);
@@ -139,16 +166,25 @@ pub fn may_here(action: Action, object: Object) -> anyhow::Result<()> { Ok(may(&
 /// The principal of the request being served (none set: the node's own, an admin token's rights).
 fn served() -> Principal { crate::auth::current().unwrap_or_else(|| Principal::token(Role::Admin)) }
 
-/// May the request being served, with `role` (its door's: its principal's), run this write? Every action the write asks
-/// of its table, as `asks` lists them.
+/// The same, for the request being served with `role`: its door's, a statement's `Who` (step 8's session carries one
+/// principal, and this goes).
+pub fn may_as(role: Role, action: Action, object: Object) -> anyhow::Result<()> { Ok(may(&as_role(role), action, object)?) }
+
+/// The principal of the request being served, with `role`.
+fn as_role(role: Role) -> Principal {
+    match crate::auth::current() {
+        Some(p) => Principal { role, ..p },
+        None => Principal::of(role),
+    }
+}
+
+/// May the request being served, with `role` (`may_as`), run this write? Every action the write asks of its table, as
+/// `asks` lists them.
 pub fn may_run(role: Role, stmt: &Stmt) -> anyhow::Result<()> {
     if crate::temp::own(stmt) {
         return Ok(()); // (the session's own tables and views: any role may keep them)
     }
-    let who = match crate::auth::current() {
-        Some(p) => Principal { role, ..p },
-        None => Principal::of(role),
-    };
+    let who = as_role(role);
     // (CLONE is enough to make a branch, and its owner drops it: `branch::door` checks)
     if who.access.is_some() && matches!(stmt, Stmt::Ddl(ds) if ds.len() == 1 && matches!(ds[0], crate::ddl::Ddl::CreateDatabase { clone: Some(_), .. } | crate::ddl::Ddl::DropDatabase { .. })) {
         return Ok(());
@@ -173,7 +209,7 @@ pub fn asks(stmt: &Stmt) -> (String, Vec<Action>) {
         Stmt::Create(c) => (catalog_name(&crate::text::object(&c.name)), vec![Action::Define]),
         Stmt::Define(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => (catalog_name(t), vec![Action::Define]),
         // (an extension's statement: the right its entry names, `statements::role`, an admin's for each today)
-        Stmt::Ddl(ds) if ds.iter().any(|d| matches!(d, crate::ddl::Ddl::Entry { .. })) && crate::statements::role(ds) == Role::Admin => (String::new(), vec![Action::Define]),
+        Stmt::Ddl(ds) if ds.iter().any(|d| matches!(d, crate::ddl::Ddl::Entry { .. })) => (String::new(), Action::of_role(crate::statements::role(ds)).into_iter().collect()),
         Stmt::Ddl(_) => (String::new(), vec![Action::Define]),
         Stmt::CopyTo(..) => (String::new(), vec![Action::Export]),
         // (a statement written wrong, or a temporary object of another session's: its own answer says why)
@@ -211,14 +247,18 @@ mod tests {
         let admin = Principal::token(Role::Admin);
         assert_eq!(said(may(&reader, Action::Select, t)), "ok");
         assert_eq!(said(may(&reader, Action::SelectAll, t)), "ok");
-        assert_eq!(said(may(&reader, Action::Insert, t)), "this token may not write");
-        assert_eq!(said(may(&reader, Action::Lock, t)), "this token may not write: FOR UPDATE takes rows as an UPDATE does");
-        assert_eq!(said(may(&Principal::token(Role::None), Action::Select, t)), "this token may not read");
+        assert_eq!(said(may(&reader, Action::Insert, t)), "this token may not write: it needs a write token, or a user granted a write");
+        assert_eq!(said(may(&reader, Action::Write, Object::Lake)), "this token may not write: it needs a write token, or a user granted a write");
+        assert_eq!(said(may(&reader, Action::Lock, t)), "this token may not take rows FOR UPDATE, as an UPDATE does: it needs a write token, or a user granted a write");
+        assert_eq!(said(may(&Principal::token(Role::None), Action::Select, t)), "this token may not read: it needs a token, or a user's sign-in");
         assert_eq!(said(may(&writer, Action::Delete, t)), "ok");
-        assert!(said(may(&writer, Action::Define, Object::Lake)).starts_with("this token may not change the lake's tables"));
-        assert_eq!(said(may(&writer, Action::Export, Object::Lake)), "this token may not write files outside the lake");
+        assert_eq!(said(may(&writer, Action::Write, Object::Lake)), "ok");
+        assert_eq!(said(may(&writer, Action::Define, Object::Lake)), "this token may not change the lake's tables, views, schemas, routines or users: it needs an admin token, or a superuser");
+        assert_eq!(said(may(&writer, Action::Export, Object::Lake)), "this token may not write files outside the lake: it needs an admin token, or a superuser");
+        assert_eq!(said(may(&writer, Action::RunCode, Object::Lake)), "this token may not run code on the node: it needs an admin token, or a superuser");
         assert_eq!(said(may(&admin, Action::Define, t)), "ok");
         assert_eq!(said(may(&admin, Action::Export, Object::Lake)), "ok");
+        assert_eq!(said(may(&admin, Action::RunCode, Object::Lake)), "ok");
 
         let ann = user(&[("select", On::Table("t".into()), &["a"]), ("insert", On::Table("t".into()), &[]), ("select", On::Schema("s".into()), &[])]);
         assert_eq!(said(may(&ann, Action::Select, t)), "ok"); // (some columns: planning picks them)
@@ -229,7 +269,11 @@ mod tests {
         assert_eq!(said(may(&ann, Action::Lock, t)), "permission denied: UPDATE on t (GRANT UPDATE ON t TO ann)");
         assert_eq!(said(may(&ann, Action::Delete, Object::Table("u"))), "permission denied: DELETE on u (GRANT DELETE ON u TO ann)");
         assert!(said(may(&ann, Action::Define, t)).starts_with("this user may not change the lake's tables"));
-        assert_eq!(said(may(&ann, Action::Export, Object::Lake)), "this user may not write files outside the lake");
+        assert_eq!(said(may(&ann, Action::Export, Object::Lake)), "this user may not write files outside the lake: it needs an admin token, or a superuser");
+        assert_eq!(said(may(&ann, Action::Write, Object::Lake)), "this user may not write: it needs a write token, or a user granted a write"); // (a reader's role)
+        let bob = Principal { role: Role::Write, ..ann.clone() };
+        assert_eq!(said(may(&bob, Action::Write, Object::Lake)), "ok"); // (a user granted a write: CHECKPOINT, the workspace's files)
+        assert_eq!(said(may(&bob, Action::RunCode, Object::Lake)), "this user may not run code on the node: it needs an admin token, or a superuser");
         assert_eq!(may(&ann, Action::Update, t).unwrap_err().code, "42501");
     }
 

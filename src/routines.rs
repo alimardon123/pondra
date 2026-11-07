@@ -855,7 +855,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
         return Box::pin(crate::vars::apply(app, c)).await; // (DECLARE $day …, $day = …: the scope's variable)
     }
     if crate::write::checkpoint(sql) {
-        ensure!(who.role >= Role::Write, "CHECKPOINT needs a write token");
+        crate::rights::may_as(who.role, crate::rights::Action::Write, crate::rights::Object::Lake)?;
         return Ok(Outcome::Done(app.checkpoint().await?));
     }
     if let Some((name, args)) = call_of(sql) {
@@ -876,7 +876,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
     }
     if let Some((language, body)) = do_of(sql) {
         // A procedure made, called once and forgotten, as its caller: an admin's, as making one is.
-        ensure!(who.role >= Role::Admin, "DO runs code on the node: it needs an admin token, as making a procedure does");
+        crate::rights::may_as(who.role, crate::rights::Action::RunCode, crate::rights::Object::Lake)?; // (as making a procedure is)
         let r = match language.as_str() {
             "python" => Routine { kind: Kind::Procedure, params: vec![], language, body, returns: None, with: Options::default() },
             "sql" => Routine { kind: Kind::Procedure, params: vec![], language, body, returns: None, with: Options::default() },
