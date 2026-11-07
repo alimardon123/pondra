@@ -49,6 +49,7 @@ pub struct Drain {
     // (each request holds its own node's count: one that outlives its node's stop counts down that node's)
     in_flight: Arc<AtomicUsize>,
     pub(crate) door: tokio::sync::watch::Sender<Door>,
+    #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the doors' drain and idle exit read it: a page has neither)
     pub(crate) started: Mutex<Option<tokio::time::Instant>>,
     // (whether the HTTP door took a connection: only then may a client still be reading an answer's last bytes)
     pub(crate) took: AtomicBool,
@@ -68,9 +69,11 @@ impl Drain {
     pub fn draining(&self) -> bool { self.draining.load(SeqCst) }
 
     /// The drain begins (`drain::drain`): no request counted from here on.
+    #[cfg_attr(not(feature = "doors"), allow(dead_code))]
     pub(crate) fn begin(&self) { self.draining.store(true, SeqCst) }
 
     /// The requests in flight now that came before the drain.
+    #[cfg_attr(not(feature = "doors"), allow(dead_code))]
     pub(crate) fn in_flight(&self) -> usize { self.in_flight.load(SeqCst) }
 
     /// Held by a request's work while it runs (`panics::door`): counted if it came before the drain.
@@ -158,6 +161,7 @@ pub struct Idle {
     // (each use holds its own node's count, as `Busy` does)
     uses: Arc<Uses>,
     /// Whether the wait for scheduled tasks was said (once a node).
+    #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the doors' drain and idle exit read it: a page has neither)
     pub(crate) said: AtomicBool,
 }
 
@@ -187,12 +191,15 @@ impl Idle {
     }
 
     /// The uses open now.
+    #[cfg_attr(not(feature = "doors"), allow(dead_code))]
     pub(crate) fn using(&self) -> usize { self.uses.open.load(SeqCst) }
 
     /// Milliseconds since the node's state was made, counted from 1: what [`Idle::last`] counts in.
+    #[cfg_attr(not(feature = "doors"), allow(dead_code))]
     pub(crate) fn now(&self) -> u64 { self.uses.now() }
 
     /// When the last use began or ended ([`Idle::now`]'s count); 0 until the first.
+    #[cfg_attr(not(feature = "doors"), allow(dead_code))]
     pub(crate) fn last(&self) -> u64 { self.uses.last.load(SeqCst) }
 }
 
