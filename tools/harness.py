@@ -23699,6 +23699,17 @@ def use_path():
         all(st != 200 and code == "0A000" and "under USE of other: other is an attached lake" in str(body) for st, code, body in info["schema under USE other"]) \
         and q("SELECT count(*) AS n FROM crm.t") == crm_before and crm_before[0]["n"] > 0 \
         and q("SELECT count(*) AS n FROM information_schema.schemata WHERE schema_name IN ('crm', 'crm2', 'made_in_other')") == [{"n": 1}]
+    # A routine's or a type's name is placed only when the path has it: under USE other, DROP MACRO here_m dropped this
+    # lake's here_m, as other has none (and so for a function and a type). It is refused by name, 0A000.
+    q("CREATE MACRO here_m(a) AS a + 1")
+    q("CREATE FUNCTION here_f(a INT) RETURNS INT AS 'SELECT a + 2'")
+    q("CREATE TYPE here_ty AS ENUM ('a', 'b')")
+    info["routine under USE other"] = [http(s, "use-db-one") for s in (
+        "DROP MACRO here_m", "DROP FUNCTION IF EXISTS here_f", "DROP TYPE here_ty", "ALTER TYPE here_ty ADD VALUE 'c'", "COMMENT ON MACRO here_m IS 'x'")]
+    info["routines here after"] = q("SELECT here_m(1) AS m, here_f(1) AS f, CAST('b' AS here_ty) AS t")
+    checks["under USE other, DROP of a macro, function or type only this lake has, and ALTER and COMMENT ON one, are refused by name (0A000); this lake's stay"] = \
+        all(st != 200 and code == "0A000" and "under USE of other: other is an attached lake" in str(body) for st, code, body in info["routine under USE other"]) \
+        and info["routines here after"] == [{"m": 2, "f": 3, "t": "b"}]
     # Postgres's catalog under USE other is other's, as Postgres's is the connection's database's: it listed this lake's.
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as c:
         c.execute("USE other")
