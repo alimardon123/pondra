@@ -491,8 +491,18 @@ pub fn type_name(t: &DataType) -> String {
     }
 }
 
-pub fn schema(columns: &[(String, String)]) -> Result<SchemaRef> {
-    let fields = columns.iter().map(|(n, t)| Ok(Field::new(n, dtype(t)?, true)));
+pub fn schema(columns: &[(String, String)]) -> Result<SchemaRef> { schema_of(columns.iter().map(|(n, t)| (n.as_str(), t.as_str()))) }
+
+/// `schema`, of (name, Arrow type text) pairs however they are held (`TableMeta::columns`, of its list).
+pub fn schema_of<'a>(columns: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<SchemaRef> {
+    let fields = columns.into_iter().map(|(n, t)| Ok(Field::new(n, dtype(t)?, true)));
+    Ok(Arc::new(Schema::new(fields.collect::<Result<Vec<_>>>()?)))
+}
+
+/// `schema_of` as queries read it: strings as views (Utf8View), so scans don't copy them and string filters and joins
+/// take their fast paths (TPC-H runs about 8% faster). Tables store plain Utf8 (`query::read_schema`).
+pub fn read_schema_of<'a>(columns: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<SchemaRef> {
+    let fields = columns.into_iter().map(|(n, t)| Ok(Field::new(n, match dtype(t)? { DataType::Utf8 => DataType::Utf8View, d => d }, true)));
     Ok(Arc::new(Schema::new(fields.collect::<Result<Vec<_>>>()?)))
 }
 

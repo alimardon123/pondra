@@ -992,7 +992,7 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<St
     ensure!(merge == m.merge, "its merge functions can't change in place");
     let not_null: Vec<String> = list(&opts["not_null"]).into_iter().chain(key.iter().cloned()).collect();
     let mut nn_have: Vec<&str> = m.list().columns.iter().filter(|c| c.not_null).map(|c| c.stored_name()).collect();
-    let mut nn_want: Vec<&str> = m.columns().iter().map(|(c, _)| c.as_str()).filter(|c| not_null.iter().any(|n| n == c)).collect();
+    let mut nn_want: Vec<&str> = m.columns().map(|(c, _)| c).filter(|c| not_null.iter().any(|n| n == c)).collect();
     nn_have.sort();
     nn_want.sort();
     nn_want.dedup();

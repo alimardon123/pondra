@@ -155,7 +155,7 @@ async fn shard(app: App, view: String, p: i32) -> Result<()> {
         // (the batches the query gives have the types it runs with, as the table's columns do)
         let out_schema = Arc::new(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow().clone());
         let rows = datafusion::arrow::compute::concat_batches(&out_schema, &df.collect().await?)?;
-        let target = crate::answer::schema(&lake.cat.get::<TableMeta>(&table_key(&view)).await?.context("the view's table is gone")?.columns())?;
+        let target = lake.cat.get::<TableMeta>(&table_key(&view)).await?.context("the view's table is gone")?.schema()?;
         let rows = crate::query::cast_as(&rows, &target)?;
         let src = crate::log::Src { producer: producer.clone(), seq: next as u64, prev: Some(done) }; // (the rows and the offset, if the offset is still `done`)
         let ack = app.log()?.append(view.clone(), src, rows).await?;

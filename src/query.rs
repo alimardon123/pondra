@@ -21,15 +21,8 @@ use std::sync::Arc;
 
 /// A table's columns as queries read them: strings as views (Utf8View), so scans don't copy them
 /// and string filters and joins take their fast paths (TPC-H runs about 8% faster). Tables store
-/// plain Utf8 (see `schema`).
-pub fn read_schema(columns: &[(String, String)]) -> Result<SchemaRef> {
-    let stored = schema(columns)?;
-    let fields = stored.fields().iter().map(|f| match f.data_type() {
-        DataType::Utf8 => Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8View)),
-        _ => f.clone(),
-    });
-    Ok(Arc::new(Schema::new(fields.collect::<Vec<_>>())))
-}
+/// plain Utf8 (see `schema`). A table's own: `TableMeta::read_schema`.
+pub fn read_schema(columns: &[(String, String)]) -> Result<SchemaRef> { crate::answer::read_schema_of(columns.iter().map(|(n, t)| (n.as_str(), t.as_str()))) }
 
 pub use crate::rules::fit::{conform, strict};
 
@@ -89,8 +82,8 @@ async fn tail_segments(lake: &Lake, table: &str, after: u64, upto: Option<u64>, 
     }).collect();
     let fetched: Vec<Vec<(RecordBatch, bool)>> = futures::stream::iter(fetches).buffered(32).try_collect().await?;
     let target = match lake.cat.meta(&table_key(table)).await? {
-        Some(m) if sys => Some(schema(&crate::sys::with_sys(&m).columns())?),
-        Some(m) => Some(schema(&m.columns())?),
+        Some(m) if sys => Some(crate::sys::with_sys(&m).schema()?),
+        Some(m) => Some(m.schema()?),
         None => None,
     };
     let mut out = vec![];
@@ -290,7 +283,7 @@ async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, a
     let Some(dmeta) = lake.cat.meta(&table_key(&deleted)).await? else { return Ok(vec![]) };
     let within = col(VERSION).gt(lit(meta.purged() as i64)).and(col(VERSION).lt_eq(lit(at.unwrap_or(u64::MAX >> 1) as i64)));
     let dmeta = with_sys(&dmeta);
-    let files = crate::manifest::pruned(lake, &dmeta, None, &[within.clone()], &schema(&dmeta.columns())?).await?;
+    let files = crate::manifest::pruned(lake, &dmeta, None, &[within.clone()], &dmeta.schema()?).await?;
     let dmeta = { let mut entry = dmeta; entry.files = files; entry.sealed = None; entry };
     let mut out = vec![];
     for b in raw(lake, ctx, &deleted, &dmeta, at).await?.filter(within)?.select(vec![col(ROW_ID), col("_old_version")])?.collect().await? {
@@ -308,9 +301,9 @@ async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, a
 pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<(Option<DataFrame>, Vec<DataFrame>)> {
     if let Some(spec) = &meta.ext {
         let files = meta.files.iter().collect::<Vec<_>>(); // (files outside the lake: no log, no hot columns)
-        return Ok((None, if files.is_empty() { vec![] } else { vec![crate::ext::read(lake, ctx, &files, &read_schema(&meta.columns())?, spec, meta.outside.as_ref()).await?] }));
+        return Ok((None, if files.is_empty() { vec![] } else { vec![crate::ext::read(lake, ctx, &files, &meta.read_schema()?, spec, meta.outside.as_ref()).await?] }));
     }
-    let (schema, keyed, upsert) = (read_schema(&meta.columns())?, !meta.key.is_empty(), !meta.key.is_empty() && meta.merge.is_empty());
+    let (schema, keyed, upsert) = (meta.read_schema()?, !meta.key.is_empty(), !meta.key.is_empty() && meta.merge.is_empty());
     let mut files = vec![];
     if upsert {
         let mut by_ord: std::collections::BTreeMap<u64, Vec<&DataFile>> = Default::default();
@@ -324,7 +317,7 @@ pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
         let df = read_files(lake, ctx, meta.files.iter().collect(), meta, &schema).await?;
         files.push(if keyed { df.with_column("_ord", lit(0u64))? } else { df });
     }
-    let sys = meta.columns().iter().any(|(c, _)| c == crate::text::ROW_ID); // (`sys::with_sys`)
+    let sys = meta.columns().any(|(c, _)| c == crate::text::ROW_ID); // (`sys::with_sys`)
     let mut fields = schema.fields().to_vec(); // the table's own schema, so every batch agrees
     if keyed {
         fields.push(Arc::new(Field::new("_ord", DataType::UInt64, false)));
@@ -356,8 +349,8 @@ fn hot_files(lake: &Lake, files: Vec<DataFile>, meta: &TableMeta, schema: &Schem
 /// a sixth of a dashboard query's time while rows streamed in.
 async fn plain_scan(lake: &Lake, state: &dyn datafusion::catalog::Session, name: &str, meta: &TableMeta, files: Vec<DataFile>, upto: Option<u64>, projection: Option<&Vec<usize>>, known: Arc<std::collections::HashMap<String, crate::hot::Known>>) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
     use datafusion::datasource::memory::MemorySourceConfig;
-    let schema = read_schema(&meta.columns())?;
-    let sys = meta.columns().iter().any(|(c, _)| c == crate::text::ROW_ID);
+    let schema = meta.read_schema()?;
+    let sys = meta.columns().any(|(c, _)| c == crate::text::ROW_ID);
     let tail = tail_rows(lake, name, meta.tiered, upto, false, sys, &schema).await?;
     let mut parts: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>> = vec![];
     if !tail.is_empty() {
@@ -399,7 +392,7 @@ fn union_all(parts: Vec<DataFrame>) -> Result<DataFrame> {
 }
 
 fn empty(ctx: &SessionContext, meta: &TableMeta) -> Result<DataFrame> {
-    let df = ctx.read_table(Arc::new(MemTable::try_new(read_schema(&meta.columns())?, vec![vec![]])?))?;
+    let df = ctx.read_table(Arc::new(MemTable::try_new(meta.read_schema()?, vec![vec![]])?))?;
     Ok(if meta.key.is_empty() { df } else { df.with_column("_ord", lit(0u64))? })
 }
 
@@ -422,11 +415,11 @@ async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
         names.push(format!("__f{i}"));
     }
     if names.is_empty() {
-        return Ok(Arc::new(MemTable::try_new(read_schema(&meta.columns())?, vec![vec![]])?));
+        return Ok(Arc::new(MemTable::try_new(meta.read_schema()?, vec![vec![]])?));
     }
-    let q = |c: &String| format!("\"{c}\"");
-    let cols = |p: &str| meta.columns().iter().map(|(c, _)| format!("{p}{}", q(c))).collect::<Vec<_>>().join(", ");
-    let keys = meta.key.iter().map(q).collect::<Vec<_>>().join(", ");
+    let q = |c: &str| format!("\"{c}\"");
+    let cols = |p: &str| meta.columns().map(|(c, _)| format!("{p}{}", q(c))).collect::<Vec<_>>().join(", ");
+    let keys = meta.key.iter().map(|k| q(k)).collect::<Vec<_>>().join(", ");
     let on = meta.key.iter().map(|k| format!("s.{} = n.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
     let parts: Vec<String> = names.iter().enumerate().map(|(i, src)| match i {
         0 => format!("SELECT {} FROM \"{src}\"", cols("")),
@@ -445,7 +438,7 @@ async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
 /// is left out too, unless the query names it (`deleted`): reads leave deleted rows out anyway,
 /// so `SELECT *` shows the table's own columns.
 pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &TableMeta, deleted: bool) -> Result<Arc<dyn TableProvider>> {
-    let hide = !deleted && !meta.key.is_empty() && meta.columns().iter().any(|(c, _)| c == "_deleted");
+    let hide = !deleted && !meta.key.is_empty() && meta.columns().any(|(c, _)| c == "_deleted");
     // (a view that finishes its answers reads under its query's names already: `finish.rs`, and a
     // view's table is never renamed or dropped a column of)
     if (!meta.mapped() && !hide && !meta.moved()) || meta.finish.is_some() {
@@ -692,7 +685,7 @@ pub async fn facts(lake: &Lake, meta: &Arc<TableMeta>, sys: bool) -> Result<Arc<
 pub async fn facts_once(lake: &Lake, meta: &TableMeta, sys: bool) -> Result<Facts> {
     let columns = match sys {
         true => crate::sys::with_sys(meta).into_columns(),
-        false => meta.columns().to_vec(),
+        false => meta.to_columns(),
     };
     let schema = read_schema(&columns)?;
     let manifests = crate::manifest::list(lake, meta).await?;
@@ -849,14 +842,14 @@ impl TableProvider for Pruned {
 /// older files hold for that key; a full compaction drops them.
 pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool, keep_deleted: bool) -> String {
     debug_assert!(!meta.key.is_empty(), "latest_sql needs a key: an append table has no versions");
-    let q = |c: &String| format!("\"{c}\"");
-    let key = meta.key.iter().map(q).collect::<Vec<_>>().join(", ");
+    let q = |c: &str| format!("\"{c}\"");
+    let key = meta.key.iter().map(|k| q(k)).collect::<Vec<_>>().join(", ");
     let order = match (sorted, meta.cluster.len()) {
-        (true, 0 | 1) => format!(" ORDER BY {}", meta.cluster.iter().chain(&meta.key).map(q).collect::<Vec<_>>().join(", ")),
+        (true, 0 | 1) => format!(" ORDER BY {}", meta.cluster.iter().chain(&meta.key).map(|k| q(k)).collect::<Vec<_>>().join(", ")),
         _ => String::new(), // (two or more cluster_by columns: a Hilbert curve's order, `tier::latest`)
     };
     if !meta.merge.is_empty() {
-        let cols = meta.columns().iter().map(|(c, _)| match meta.merge.get(c).map(String::as_str) {
+        let cols = meta.columns().map(|(c, _)| match meta.merge.get(c).map(String::as_str) {
             Some("count") => format!("sum({}) AS {}", q(c), q(c)), // (partial counts add up)
             Some(f) => format!("{f}({}) AS {}", q(c), q(c)),
             None => q(c),
@@ -864,21 +857,21 @@ pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool, keep_deleted:
         let live = if keep_deleted { String::new() } else { live(meta) }; // (windows past their TTL drop out; emptied groups too)
         return format!("SELECT * FROM (SELECT {} FROM \"{raw_table}\" GROUP BY {key}){live}{order}", cols.collect::<Vec<_>>().join(", "));
     }
-    let out = meta.columns().iter().map(|(c, _)| q(c)).collect::<Vec<_>>().join(", ");
+    let out = meta.columns().map(|(c, _)| q(c)).collect::<Vec<_>>().join(", ");
     let deleted = if keep_deleted { String::new() } else { live(meta) }; // (a partial merge keeps markers and expired rows)
     if let Some(o) = &meta.order {
         // By event time: each key's greatest `order_by`, then the last to come among rows that tie
         // on it — two hash aggregates and two hash joins (`(key, _ord)` is one row).
         let on = |a: &str, b: &str| meta.key.iter().map(|k| format!("{a}.{} = {b}.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
-        let picked = meta.columns().iter().map(|(c, _)| format!("c.{} AS {}", q(c), q(c))).collect::<Vec<_>>().join(", ");
+        let picked = meta.columns().map(|(c, _)| format!("c.{} AS {}", q(c), q(c))).collect::<Vec<_>>().join(", ");
         return format!("WITH m AS (SELECT {key}, max({o}) AS __m FROM \"{raw_table}\" GROUP BY {key}), \
             c AS (SELECT r.* FROM \"{raw_table}\" r JOIN m ON {} AND r.{o} IS NOT DISTINCT FROM m.__m), \
             l AS (SELECT {key}, max(\"_ord\") AS __o FROM c GROUP BY {key}) \
             SELECT {out} FROM (SELECT {picked} FROM c JOIN l ON {} AND c.\"_ord\" = l.__o){deleted}{order}", on("r", "m"), on("c", "l"), o = q(o));
     }
     // Newest version per key as a grouped aggregate (a hash table), not a window (a sort).
-    let newest = |c: &String| format!("first_value({} ORDER BY \"_ord\" DESC) AS {}", q(c), q(c));
-    let cols = meta.columns().iter().map(|(c, _)| if meta.key.contains(c) { q(c) } else { newest(c) });
+    let newest = |c: &str| format!("first_value({} ORDER BY \"_ord\" DESC) AS {}", q(c), q(c));
+    let cols = meta.columns().map(|(c, _)| if meta.key.iter().any(|k| k == c) { q(c) } else { newest(c) });
     format!("SELECT {out} FROM (SELECT {} FROM \"{raw_table}\" GROUP BY {key}){deleted}{order}",
             cols.collect::<Vec<_>>().join(", "))
 }
@@ -890,13 +883,13 @@ pub fn current_sql(meta: &TableMeta, raw_table: &str, upto: u64) -> String {
     if meta.files.len() > 1 || upto != meta.tiered {
         return latest_sql(meta, raw_table, false, false);
     }
-    let cols = meta.columns().iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+    let cols = meta.columns().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
     format!("SELECT {cols} FROM \"{raw_table}\"{}", live(meta))
 }
 
 /// ` WHERE …` keeping a keyed table's live rows: not deleted, not past their TTL ("" if nothing to drop).
 pub fn live(meta: &TableMeta) -> String {
-    let deleted = meta.columns().iter().any(|(c, _)| c == "_deleted").then(|| "\"_deleted\" IS NOT TRUE".to_string());
+    let deleted = meta.columns().any(|(c, _)| c == "_deleted").then(|| "\"_deleted\" IS NOT TRUE".to_string());
     // A view's group whose rows a change took back (its count added up to 0) is gone.
     let emptied = meta.merge.iter().find(|(_, f)| *f == "count").map(|(c, _)| format!("\"{c}\" <> 0"));
     let conds: Vec<String> = deleted.into_iter().chain(emptied).chain(Some(meta.ttl_sql()).filter(|t| !t.is_empty())).collect();

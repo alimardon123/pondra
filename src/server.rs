@@ -1086,14 +1086,14 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
     // (SQL's order, for a table that moved a column: as `SELECT *` lists them)
     let in_order = |b: RecordBatch| meta.in_sql_order(&b);
     if meta.merge.is_empty() && meta.ttl.is_none() && meta.order.is_none() {
-        let shown = crate::answer::schema(&meta.columns().iter().filter(|(c, _)| c != "_deleted").cloned().collect::<Vec<_>>())?; // (as `SELECT *` shows it)
+        let shown = crate::answer::schema_of(meta.columns().filter(|(c, _)| *c != "_deleted"))?; // (as `SELECT *` shows it)
         let row = crate::serve::lookup(lake, &name, &meta, &key).await?.map(|r| crate::query::conform(&r, &shown)).transpose()?; // (by name: a row from before an ADD COLUMN lacks it)
         let row = row.map(|r| meta.to_logical(&r).and_then(in_order)).transpose()?;
         return Ok(([("content-type", "application/json")], crate::answer::json(&row)?).into_response());
     }
     let mut where_ = vec![];
     for (col, val) in meta.key.iter().zip(key.split(',')) {
-        let text = meta.columns().iter().any(|(c, t)| c == col && (t == "Utf8" || t == "LargeUtf8"));
+        let text = meta.columns().any(|(c, t)| c == col && (t == "Utf8" || t == "LargeUtf8"));
         ensure!(!val.contains('\''), "quote in key");
         where_.push(match text {
             true => format!("\"{col}\" = '{val}'"),
@@ -1102,7 +1102,7 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
     }
     let (ctx, where_) = (lake.session_with(1), where_.join(" AND "));
     ctx.register_table("__raw", raw(lake, &ctx, &name, &meta, None).await?.into_view())?;
-    let cols = meta.columns().iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+    let cols = meta.columns().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
     let sql = match meta.merge.is_empty() {
         // Upsert table: the newest version of the key wins (no window over the whole table).
         true => format!("SELECT * FROM (SELECT {cols} FROM __raw WHERE {where_} ORDER BY {}\"_ord\" DESC LIMIT 1){}", meta.order.as_ref().map(|o| format!("\"{o}\" DESC NULLS LAST, ")).unwrap_or_default(), crate::query::live(&meta)),

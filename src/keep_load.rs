@@ -78,7 +78,7 @@ async fn attempt(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str,
     // Every file planned from its footer before any is copied, in cuts (a kept file each) of a share of the whole, so the
     // copies keep every core busy: a load of one 230 MB file in two cuts used two cores. A share is at most `FILE_BYTES`
     // and at least `SHARE_FLOOR`; a file whose row groups don't fit a share's file is cut at `FILE_BYTES`.
-    let schema = answer::schema(&meta.columns())?;
+    let schema = meta.schema()?;
     let at_once = copies(target);
     let total: u64 = listed.files.iter().map(|f| f.bytes).sum();
     let share = usize::try_from(total / at_once as u64).unwrap_or(usize::MAX).clamp(SHARE_FLOOR, tier::FILE_BYTES);

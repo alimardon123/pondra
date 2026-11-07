@@ -35,7 +35,7 @@ pub fn columns() -> Vec<(String, String)> {
 /// key: its first row and first commit, its last commit.
 pub fn with_sys(meta: &TableMeta) -> TableMeta {
     let mut m = meta.clone();
-    if m.columns().iter().any(|(c, _)| c == ROW_ID) {
+    if m.columns().any(|(c, _)| c == ROW_ID) {
         return m;
     }
     m.append_columns(columns());

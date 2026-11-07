@@ -1058,7 +1058,7 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
     }
     // The table's columns as they are now, then the new ones (as `ALTER TABLE … ADD COLUMN` adds them).
     let now = lake.cat.get::<TableMeta>(&table_key(&table)).await?.context("the table")?.logical();
-    s["columns"] = j!(now.columns().iter().cloned().chain(columns[was.len()..].iter().cloned()).collect::<Vec<_>>());
+    s["columns"] = j!(now.to_columns().into_iter().chain(columns[was.len()..].iter().cloned()).collect::<Vec<_>>());
     // Layout and options as written: one left out is taken away.
     s["cluster_by"] = s["cluster_by"].take().as_array().map_or(j!([]), |a| j!(a));
     s["publish"] = if s["publish"].is_null() { j!(crate::store::default_publish()) } else { s["publish"].take() };
@@ -1071,7 +1071,7 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
         lake.cat.commit(vec![(table_key(&table), json(&meta))], &[]).await?;
     }
     let new = meta.logical();
-    changed.extend(new.columns()[old.columns().len()..].iter().map(|(c, _)| format!("+ {c}")));
+    changed.extend(new.columns().skip(old.columns().len()).map(|(c, _)| format!("+ {c}")));
     for (what, was, now) in [
         ("CLUSTER BY", old.cluster.join(", "), new.cluster.join(", ")),
         ("SEQUENCE BY", old.order.clone().unwrap_or_default(), new.order.clone().unwrap_or_default()),

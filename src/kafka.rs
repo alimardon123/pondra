@@ -1035,7 +1035,7 @@ fn fetch_error(ver: i16, e: &anyhow::Error) -> Vec<u8> {
 async fn read(app: &App, table: &str, meta: &TableMeta, offset: u64, visible: u64, limit: usize) -> Result<Vec<u8>> {
     // (from a few segments back: a big one's rows run on past its number, `log::span`)
     let (mut out, mut at) = (vec![], (offset >> crate::log::ORD_BITS).saturating_sub(64));
-    let s = schema(&meta.columns())?;
+    let s = meta.schema()?;
     'fetch: while out.is_empty() && at <= visible {
         let upto = visible.min(at + 4095); // (segments without this table are skipped, 4,096 at a time)
         for (key, seg) in app.lake.cat.segments(&seg_key(at), &seg_key(upto + 1)).await? {

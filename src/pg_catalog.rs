@@ -372,7 +372,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         });
         let typed = enums.chain(held_types(&l)).collect();
         let comment = notes.get(&format!("relation/{name}")).cloned();
-        let comments = l.columns().iter().filter_map(|(c, _)| Some((c.clone(), notes.get(&format!("column/{name}/{}", m.stored(c)?))?.clone()))).collect();
+        let comments = l.columns().filter_map(|(c, _)| Some((c.to_string(), notes.get(&format!("column/{name}/{}", m.stored(c)?))?.clone()))).collect();
         rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: crate::views::code_for_caller(|| mvs.get(name).cloned()).flatten(), identity: l.list().columns.iter().filter_map(|c| Some((c.name.clone(), c.identity.clone()?))).collect(), constraints: if kind == 'm' { crate::views::code_for_caller(|| l.constraints.clone()).unwrap_or_default() } else { l.constraints.clone() }, checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
     }
     let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;

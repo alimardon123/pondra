@@ -402,7 +402,7 @@ pub async fn create_log(lake: &Lake) -> Result<serde_json::Value> {
             (meta.ttl, meta.tiered) = (Some(("at".into(), days * 86400)), lake.visible());
             lake.cat.commit(vec![(table_key(TABLE), json(&meta))], &[]).await?;
         }
-        Some(mut meta) if meta.columns().len() < columns().len() && columns().starts_with(&meta.columns()) => {
+        Some(mut meta) if meta.columns().len() < columns().len() && columns().starts_with(&meta.to_columns()) => {
             let more = columns()[meta.columns().len()..].to_vec();
             meta.append_columns(more);
             lake.cat.commit(vec![(table_key(TABLE), json(&meta))], &[]).await?;
