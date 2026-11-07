@@ -10,7 +10,6 @@ app -> pg_catalog  3
 audit -> reset  1
 auth -> crypto  2
 auth -> origins  1
-backup -> memory  1
 branch -> crypto  2
 branch -> extension  1
 branch -> memory  1
@@ -42,7 +41,6 @@ ddl -> dial  2
 ddl -> extension  3
 ddl -> feeds  9
 ddl -> matches  2
-ddl -> memory  5
 ddl -> shares  7
 delta -> iceberg  3
 delta -> write_outside  1
@@ -125,7 +123,6 @@ manifest -> branch  4
 manifest -> crypto  1
 manifest -> sys  1
 members -> fetch  1
-members -> memory  2
 metrics -> ai  3
 metrics -> app  1
 metrics -> budget  1
@@ -170,7 +167,6 @@ pg -> sso  6
 pg -> tls  6
 pg_json_sets -> measures  1
 protect -> apply  4
-python -> memory  1
 python -> node  1
 query -> extension  1
 query -> matcher  1
@@ -203,7 +199,7 @@ runs -> reset  1
 serve -> pg_casts  1
 serve -> pg_types  2
 served -> auth  7
-served -> memory  1
+served -> memory_lake  1
 served -> store  4
 server -> apply  5
 server -> cluster  5
@@ -260,7 +256,6 @@ store -> history  2
 store -> hot  2
 store -> in_task  1
 store -> locks  1
-store -> memory  11
 store -> oom  2
 store -> panics  4
 store -> query  6
@@ -276,7 +271,6 @@ store -> views  1
 store -> write  1
 store_wire -> store  1
 temp -> python  2
-terms -> memory  5
 terms -> panics  1
 text -> pg_json_make  1
 tier -> delta  1

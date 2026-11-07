@@ -4694,7 +4694,7 @@ def scale():
     spill_top = tempfile.mkdtemp(prefix="pondra-spill-")
     spill_dir = os.path.join(spill_top, "not", "made", "yet")  # (a folder the node has to make, parents and all)
     spill_env = {"PONDRA_CORES": "4", "PONDRA_SPILL_DIR": spill_dir}
-    spill_root = os.path.join(spill_dir, f"pondra-spill-{os.getuid()}")  # the user's folder a node makes there (memory::spill_base)
+    spill_root = os.path.join(spill_dir, f"pondra-spill-{os.getuid()}")  # the user's folder a node makes there (scratch::spill_base)
     def reply(s, timeout=600):  # (status, SQLSTATE, body) as the node sends it, a refusal included
         c = http_client.HTTPConnection("127.0.0.1", port, timeout=timeout)
         c.request("POST", "/sql", s.encode(), {})

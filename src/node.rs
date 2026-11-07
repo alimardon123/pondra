@@ -218,7 +218,7 @@ pub fn exe() -> anyhow::Result<PathBuf> {
 #[cfg(feature = "doors")]
 pub async fn lead_once(dir: &str) -> anyhow::Result<()> {
     // (another process would lead a lake of its own memory, gone when it ends)
-    anyhow::ensure!(!crate::memory::in_memory(dir), "{dir} is in a process's memory, where a lake is made by opening it (pondra.open(), pondra :memory:) and led by that process alone: attach or make a database in a folder or a bucket");
+    anyhow::ensure!(!crate::memory_lake::in_memory(dir), "{dir} is in a process's memory, where a lake is made by opening it (pondra.open(), pondra :memory:) and led by that process alone: attach or make a database in a folder or a bucket");
     run::lead_once(dir).await
 }
 
@@ -590,17 +590,17 @@ async fn claim_paged(line: Option<usize>) -> anyhow::Result<()> {
 /// queries holding the page's share of its device's `line` (`claim_paged`). Set back if the open fails.
 pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) -> anyhow::Result<Paged> {
     claim_paged(line).await?;
-    let url = crate::memory::place(":memory:");
+    let url = crate::memory_lake::place(":memory:");
     let owned = store.is_some(); // (a given store is a kept page's folder, under its Web Lock: no other writer, so its term is taken at once)
     if let Some(given) = store {
-        crate::memory::give(&url, given); // (a kept page's objects stay in its folder when the page closes: `end_page` forgets the URL only)
+        crate::memory_lake::give(&url, given); // (a kept page's objects stay in its folder when the page closes: `end_page` forgets the URL only)
     }
-    let store = crate::memory::store(&url);
+    let store = crate::memory_lake::store(&url);
     let lead = if owned { crate::members::Alone::lead_owned(&store).await } else { crate::members::Alone::lead(&store).await };
     let (alone, marks) = match lead {
         Ok(led) => led,
         Err(e) => {
-            crate::memory::forget_memory(&url);
+            crate::memory_lake::forget_memory(&url);
             PAGED.store(false, SeqCst);
             return Err(e);
         }
@@ -641,7 +641,7 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
     if term > 0 {
         crate::terms::release(store, term).await; // (a joined page claimed no term: `open_joined`'s is 0, and its store takes no write)
     }
-    crate::memory::forget_memory(url);
+    crate::memory_lake::forget_memory(url);
     crate::reset::reset();
     PAGED.store(false, SeqCst); // (last: the next `open_page` starts once the statics are set back)
 }
@@ -654,9 +654,9 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
 /// closed error).
 pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, line: Option<usize>) -> anyhow::Result<Paged> {
     claim_paged(line).await?;
-    let url = crate::memory::place(":memory:");
-    crate::memory::give(&url, store);
-    let store = crate::memory::store(&url);
+    let url = crate::memory_lake::place(":memory:");
+    crate::memory_lake::give(&url, store);
+    let store = crate::memory_lake::store(&url);
     let node = node.trim_end_matches('/').to_string();
     crate::dial::set_page(node.clone(), auth.to_string()); // (the page's calls go to this node, with this sign-in: `dial::Paged`)
     let members: Arc<dyn Members> = Arc::new(crate::members::Joined::new(&node));

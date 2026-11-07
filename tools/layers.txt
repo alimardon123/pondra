@@ -12,6 +12,7 @@ env base
 lifecycle base
 machine base
 net base
+scratch base
 node_state base
 ledger base
 memo base
@@ -231,6 +232,7 @@ lib hosts
 library hosts
 main hosts
 memory hosts
+memory_lake catalog
 node hosts
 page hosts
 project hosts

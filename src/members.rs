@@ -294,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn one_alone_leads_a_lake_until_it_lets_go() {
         let url = format!("memory://members-{}", uuid::Uuid::new_v4().simple());
-        let store = crate::memory::store(&url);
+        let store = crate::memory_lake::store(&url);
         let (first, marks) = Alone::lead(&store).await.unwrap();
         assert_eq!(first.leader().n, 1);
         let asked = Instant::now();
@@ -305,6 +305,6 @@ mod tests {
         let (second, marks) = Alone::lead(&store).await.unwrap();
         assert_eq!(second.leader().n, 2, "let go, the next claim is the next term");
         marks.abort();
-        crate::memory::forget_memory(&url);
+        crate::memory_lake::forget_memory(&url);
     }
 }

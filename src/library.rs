@@ -114,8 +114,8 @@ impl Opened {
     /// Opens a node in this process, once it serves (or has failed to, saying why). One at a time: a
     /// second open while one is open is refused by name.
     pub fn open(mut options: Options) -> anyhow::Result<Opened> {
-        options.dir = crate::memory::place(&options.dir); // (`:memory:`: a new lake in this process's memory)
-        let memory = crate::memory::in_memory(&options.dir).then(|| options.dir.clone());
+        options.dir = crate::memory_lake::place(&options.dir); // (`:memory:`: a new lake in this process's memory)
+        let memory = crate::memory_lake::in_memory(&options.dir).then(|| options.dir.clone());
         let (events, rx) = mpsc::unbounded_channel();
         crate::node::host(events.clone())?;
         let state = Arc::new(Mutex::new(State::Starting));
@@ -151,7 +151,7 @@ impl Opened {
             crate::node::unhost();
         }
         if let Some(lake) = &self.memory {
-            crate::memory::forget_memory(lake);
+            crate::memory_lake::forget_memory(lake);
         }
     }
 
@@ -356,7 +356,7 @@ async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<M
                         }
                     }
                 }
-                Ok(Err(e)) if e.downcast_ref::<crate::format::Newer>().is_some() || crate::memory::torn(&e) => {
+                Ok(Err(e)) if e.downcast_ref::<crate::format::Newer>().is_some() || crate::memory_lake::torn(&e) => {
                     return failed_until_closed(&set, format!("{e:#}"), &mut events, first.take()).await; // (no try will open it: nor a place a move didn't finish)
                 }
                 Ok(Err(e)) => format!("{e:#}"), // (`Node::open` gave back what it took)
