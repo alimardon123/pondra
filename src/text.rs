@@ -338,12 +338,36 @@ pub fn names_a_type(sql: &str) -> bool {
     const BUILT_IN: &[&str] = &["int", "integer", "bigint", "smallint", "tinyint", "int2", "int4", "int8", "hugeint", "ubigint", "uinteger", "usmallint", "utinyint", "float", "float4",
         "float8", "real", "double", "decimal", "numeric", "dec", "text", "varchar", "char", "character", "string", "bpchar", "bool", "boolean", "date", "time", "timestamp", "timestamptz",
         "datetime", "interval", "json", "jsonb", "uuid", "bytea", "blob", "binary", "varbinary", "bytes", "regclass", "regtype", "regproc", "regnamespace", "oid", "name", "variant", "bit"];
+    // (a name after AS is a type only in a cast's parentheses: `SELECT x AS mood` names a column, `CAST(x AS mood)` a type)
+    // (and only a text with a cast's call is tokenized to tell: most have none)
+    static CAST_CALL: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:try_|safe_)?cast\s*\(").expect("a regex"));
+    let calls = std::cell::OnceCell::new();
+    let a_type = |c: &regex::Captures| c.get(0).is_some_and(|m| m.as_str().starts_with("::") || (*calls.get_or_init(|| CAST_CALL.is_match(sql)) && casts_as(sql, m.start())));
     NAMED.captures_iter(sql).any(|c| match (c.get(1), c.get(2)) {
         _ if c.get(3).is_some() => c.get(3).is_some_and(|s| !is_uuid(s.as_str())), // (`'A0EE…'`: read as a uuid where one is compared with it or written into one)
         (None, _) => true, // (enum_range(…), pg_typeof(…))
-        (Some(_), Some(_)) => true,
-        (Some(n), None) => ["uuid", "json", "jsonb"].iter().any(|t| n.as_str().eq_ignore_ascii_case(t)) || !BUILT_IN.contains(&n.as_str().to_lowercase().as_str()), // (a cast to uuid, json or jsonb: written as text)
+        (Some(_), Some(_)) => a_type(&c),
+        (Some(n), None) => a_type(&c) && (["uuid", "json", "jsonb"].iter().any(|t| n.as_str().eq_ignore_ascii_case(t)) || !BUILT_IN.contains(&n.as_str().to_lowercase().as_str())), // (a cast to uuid, json or jsonb: written as text)
     })
+}
+
+/// Whether the `AS` at byte `at` of `sql` is a cast's (`CAST(x AS t)`, `TRY_CAST`, `SAFE_CAST`): the innermost parenthesis
+/// open there follows one of those words. Not an alias's, a CREATE's or a WITH query's. When the tokenizer refuses the text,
+/// yes, so the parser is the one to say.
+fn casts_as(sql: &str, at: usize) -> bool {
+    let Some(t) = tokens(sql) else { return true };
+    let mut open: Vec<bool> = vec![]; // (each open parenthesis: a cast's?)
+    let mut before: Option<&Token> = None;
+    for (token, _) in t.toks.iter().zip(&t.start).take_while(|(_, &start)| start < at) {
+        match token {
+            Token::Whitespace(_) => continue,
+            Token::LParen => open.push(matches!(before, Some(Token::Word(w)) if w.quote_style.is_none() && ["cast", "try_cast", "safe_cast"].iter().any(|k| w.value.eq_ignore_ascii_case(k)))),
+            Token::RParen => _ = open.pop(),
+            _ => {}
+        }
+        before = Some(token);
+    }
+    open.last().copied().unwrap_or(false)
 }
 
 /// An expression's place in its statement, which tells it from another of the same text.
@@ -896,6 +920,20 @@ mod tests {
             assert!(names_a_type(sql), "{sql}");
         }
         assert!(names_a_type("SELECT json_agg(x) FROM t") && names_a_type("SELECT * FROM generate_series(1, t.n)") && names_a_type("SELECT * FROM jsonb_each(t.doc)") && names_a_type("SELECT '{a}'::text[]"));
+    }
+
+    #[test]
+    fn a_name_after_as_is_a_type_only_in_a_cast() {
+        // (a column's or a table's alias, a CREATE's AS and a WITH query's name send no statement through the parser)
+        for sql in ["SELECT 77 AS k", "SELECT g AS mood, count(*) AS n FROM t AS a GROUP BY g", "SELECT x AS uuid FROM t", "CREATE TABLE c AS SELECT 1",
+            "WITH q AS MATERIALIZED (SELECT 1) SELECT * FROM q", "SELECT CAST(x AS INT) AS mood FROM t", "SELECT f(x) AS mood FROM t", "SELECT 'cast(x as mood)' AS a"] {
+            assert!(!names_a_type(sql), "{sql}");
+        }
+        for sql in ["SELECT CAST(x AS mood) FROM t", "SELECT try_cast(x AS mood)", "SELECT SAFE_CAST(x AS s.mood)", "SELECT CAST((x) AS mood)", "SELECT CAST(f(x, y) AS mood) AS m",
+            "SELECT upper(CAST(CAST(x AS mood) AS TEXT))", "SELECT x::mood AS m", "SELECT CAST(x AS uuid) AS id", "SELECT CAST(x AS jsonb)"] {
+            assert!(names_a_type(sql), "{sql}");
+        }
+        assert!(names_a_type("SELECT CAST(x AS mood), 'open"), "the tokenizer refuses an unclosed string: the parser is the one to say");
     }
 
     #[test]
