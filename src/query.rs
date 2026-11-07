@@ -19,9 +19,8 @@ use datafusion::physical_plan::ExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 
-/// A table's columns as queries read them: strings as views (Utf8View), so scans don't copy them
-/// and string filters and joins take their fast paths (TPC-H runs about 8% faster). Tables store
-/// plain Utf8 (see `schema`). A table's own: `TableMeta::read_schema`.
+/// A table's columns as queries read them: `answer::read_schema_of` (strings as views, and why), of
+/// owned pairs. A table's own: `TableMeta::read_schema`.
 pub fn read_schema(columns: &[(String, String)]) -> Result<SchemaRef> { crate::answer::read_schema_of(columns.iter().map(|(n, t)| (n.as_str(), t.as_str()))) }
 
 pub use crate::rules::fit::{conform, strict};
