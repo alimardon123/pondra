@@ -10979,9 +10979,8 @@ def users():
         as_(A.port, None, q)
     closed = until(lambda: as_(A.port, None, "SELECT 1 AS x"), "ERROR 401: b\"sign in: a token, or a user's name and password\"", 10)
     checks["open until a user who signs in exists; then nothing without a sign-in (no token set)"] = opened == [{"x": 1}] and closed.startswith("ERROR 401")
-    # …and a Postgres connection made while it was open is ended at its next check (5 s), as a stream is; before, it kept its
-    # superuser rights after the CREATE USER (11-06 audit M2)
-    time.sleep(5.5)
+    # …and a Postgres connection made while it was open is ended at its next statement (the CREATE USER moved the lake's rights
+    # version: `Principal::stale`), as a stream is; before, it kept its superuser rights after the CREATE USER (11-06 audit M2)
     try:
         open_said.append(open_pg.execute("SELECT 1 AS x").fetchall())
     except Exception as e:
@@ -11235,18 +11234,18 @@ def users():
     as_(A.port, boss, "REVOKE analyst FROM ann")
     no_role = until(lambda: "permission denied" in str(as_(A.port + 1, ann, "SELECT id FROM sales.orders")), True, 10)
     grants = as_(A.port, boss, "SELECT grantee, privilege, on_name, columns FROM pondra.grants ORDER BY grantee, privilege, on_name")
-    ann_revoked = until(lambda: "permission denied" in str(ann_said("SELECT item FROM sales.orders ORDER BY id")), True, 15)
+    ann_revoked = "permission denied" in str(ann_said("SELECT item FROM sales.orders ORDER BY id"))  # (its very next statement: no wait)
     as_(A.port, boss, "DROP USER ann")
     gone = [until(lambda: str(as_(port, ann, "SELECT 1 AS x")).startswith("ERROR 401"), True, 10) for port in (A.port, A.port + 1)]
-    ann_last = []  # (what its open connection is told, up to the first error: FATAL, then closed)
-    until(lambda: ann_last.append(str(ann_said("SELECT 1 AS x"))) or ann_last[-1].startswith("ERROR"), True, 15)
-    checks["a Postgres connection open across them: a REVOKE reaches its next statement, a DROP USER ends it (FATAL, its sign-in checked again every 5 s)"] = \
-        isinstance(ann_before, list) and ("tea",) in ann_before and ann_revoked is True and "signed out" in ann_last[-1] and ann_pg.closed \
+    ann_last = [str(ann_said("SELECT 1 AS x"))]  # (what its open connection is told at its next statement: FATAL, then closed)
+    ann_last.append(str(ann_said("SELECT 1 AS x")))  # (the server closed it: the client finds out at its next use, and is closed)
+    checks["a Postgres connection open across them: a REVOKE reaches its next statement, a DROP USER ends it at its next (FATAL), with no wait"] = \
+        isinstance(ann_before, list) and ("tea",) in ann_before and ann_revoked is True and "signed out" in ann_last[0] and ann_pg.closed \
         or {"before": ann_before, "revoked": ann_revoked, "last": ann_last[-3:]}
     checks["revoked (a column, a role) and dropped: at once on the leader and a follower; pondra.grants says what stands"] = revoked == [True, True] and still == [{"id": 1}, {"id": 2}] \
         and no_role is True and gone == [True, True] and {"grantee": "analyst", "privilege": "SELECT", "on_name": "sales.orders", "columns": "id, amount"} in grants
     # A COPY's rights are asked for each chunk it loads (step 9, `writer::may`): a REVOKE in the middle of a long COPY stops it
-    # at its next chunk, once the connection's sign-in is checked again (every 5 s), 42501. Each chunk is committed as it
+    # at its next chunk, whose sign-in is checked again since the REVOKE moved the lake's rights, 42501. Each chunk is committed as it
     # comes, as before, so the chunks loaded before the REVOKE stay. (Outside `sales`, whose tables bob is granted all of;
     # libpq keeps what a full socket didn't take until it is flushed, so each 34 MB is flushed before the next step.)
     for q in ["CREATE TABLE copied (a VARCHAR)", "GRANT INSERT ON copied TO bob"]:
@@ -11268,7 +11267,6 @@ def users():
                 sent(bob_pg, cp)
                 copy_out["first"] = until(lambda: (copied_n() or 0) > 0, True, 30)
                 copy_out["revoked"] = as_(A.port, boss, "REVOKE INSERT ON copied FROM bob")
-                time.sleep(5.5)
                 sent(bob_pg, cp)
         copy_out["end"] = "accepted"
     except psycopg.Error as e:
@@ -12524,6 +12522,7 @@ def guarded():
     h3_flowing = until(lambda: all(s.get("status") == 200 and s.get("bytes", 0) > 0 for s in h3.values()), True, 20)
     t0 = time.monotonic()
     h3_said = [ask(P, q, auth=boss) for q in ("REVOKE SELECT ON stock FROM hana", "DROP USER ivo", "ALTER USER jon NOSUPERUSER")]
+    kafka_at_once = fetched()  # (the consumer's very next fetch: its connection's sign-in is read again once the REVOKE moved the lake's rights)
     time.sleep(6)
     ask(P, "INSERT INTO stock VALUES (12, 1.0)", auth=boss)  # (the no-longer-superuser's next answer is refused; the consumer's next fetch)
     until(lambda: all("ended" in s for s in h3.values()), True, 20)
@@ -12531,10 +12530,10 @@ def guarded():
     kafka_after = fetched()
     kc.close()
     info["H3"] = {"streams": {k: {x: str(y)[:200] for x, y in s.items()} for k, s in h3.items()}, "said": [str(x)[:200] for x in h3_said],
-                  "ended after s": h3_ended, "kafka fetched": [kafka_before, kafka_after]}
-    checks["/watch, a live query and a Kafka consumer end when their sign-in may no longer have them: REVOKE, DROP USER and NOSUPERUSER end each within 12 s, and the consumer's next fetch is refused (11-02 H3)"] = \
+                  "ended after s": h3_ended, "kafka fetched": [kafka_before, kafka_at_once, kafka_after]}
+    checks["/watch, a live query and a Kafka consumer end when their sign-in may no longer have them: REVOKE, DROP USER and NOSUPERUSER end each within 12 s, and the consumer's very next fetch is refused (11-02 H3)"] = \
         h3_flowing is True and not any(str(x).startswith("ERROR") for x in h3_said) and set(h3_ended) == set(h3) \
-        and all(v <= 12 for v in h3_ended.values()) and isinstance(kafka_before, int) and kafka_before >= 1 and kafka_after == "refused"
+        and all(v <= 12 for v in h3_ended.values()) and isinstance(kafka_before, int) and kafka_before >= 1 and kafka_at_once == kafka_after == "refused"
     checks["Flight's follow stream ends when its sign-in may no longer read the table: REVOKE ends it within 12 s, telling the client to sign in again (11-03 H1)"] = \
         h3_flowing is True and h3_ended.get("flight follow", 99) <= 12 and "sign in again" in h3["flight follow"].get("error", "")
     # M8: a joined page's own statements are written by its node, as the sign-in's (`POST /cluster/records`, page_records.rs): a
@@ -14220,6 +14219,18 @@ def sso_pg():
         # 1. By default (POSTGRES 'password'), as part 1 left it: ana, with no password, is asked for one, and her token is it.
         checks["by default, a user with no password is asked for a password, and her provider's token signs her in"] = \
             setup == [200] * len(setup) and by_hand(ana, None) == {"asked": "password"} and pg_as(ana, ana_t) == [(7,)]
+        # 1b. A token's own end (its exp, and the clocks' 60 s leeway) ends a connection it signed in, at the first statement
+        # after it (`Principal::until`: a connection's one timer). Before, the sign-in was checked again every 5 s instead.
+        ending = psycopg.connect(f"host=127.0.0.1 port={PG} user={ana} password={token_for(ana, ttl=-57)} dbname=lake connect_timeout=10", autocommit=True)
+        ending_said = [ending.execute("SELECT x FROM t").fetchall()]
+        time.sleep(4.5)
+        try:
+            ending_said.append(ending.execute("SELECT x FROM t").fetchall())
+        except psycopg.Error as e:
+            ending_said.append(str(e).strip())
+        info["a token's end"] = [str(x)[:200] for x in ending_said]
+        checks["a connection her token signed in is ended at its first statement after the token ends (its exp and the clocks' leeway)"] = \
+            ending_said[0] == [(7,)] and "signed out" in str(ending_said[1])
 
         # 2. With POSTGRES 'oauth': OAUTHBEARER first, told where the provider is, then refused; a token signs straight in.
         info["oauth"] = sql(f"CREATE OR REPLACE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), POSTGRES 'oauth')")

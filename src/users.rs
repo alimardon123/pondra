@@ -1111,7 +1111,7 @@ async fn session_principal(lake: &Lake, token: &str) -> Option<Principal> {
         if !me.login || v["k"].as_str()? != password_mark(lake, user, &me).await.ok()? {
             return None;
         }
-        return principal(lake, user).await.ok();
+        return principal(lake, user).await.ok().map(|p| Principal { until: Some(until), ..p });
     };
     let all = crate::sso::all(lake).await.ok()?;
     let (_, p) = all.iter().find(|(n, _)| n == name)?;
@@ -1155,13 +1155,17 @@ pub async fn has_tokens(lake: &Lake, user: &str) -> bool {
 }
 
 /// A user's token (`pt_…`): whose, if it is theirs and hasn't expired.
-async fn token_user(lake: &Lake, token: &str) -> Option<String> {
+async fn token_user(lake: &Lake, token: &str) -> Option<(String, Option<u64>)> {
     let user = String::from_utf8(B64U.decode(token.strip_prefix("pt_")?.split_once('_')?.0).ok()?).ok()?;
     let u = lake.cat.get::<User>(&user_key(&user)).await.ok()??;
     let hash = sha256(token);
     let now = crate::log::now_ms();
-    (u.login && u.tokens.iter().any(|t| crate::crypto::same(t.hash.as_bytes(), hash.as_bytes()) && t.expires_ms.is_none_or(|x| x > now))).then_some(user)
+    let t = u.tokens.iter().find(|t| crate::crypto::same(t.hash.as_bytes(), hash.as_bytes()) && t.expires_ms.is_none_or(|x| x > now))?;
+    u.login.then_some((user, t.expires_ms))
 }
+
+/// `user`'s principal, signed in by its token `pt_…` (`token_user`): until the token expires.
+async fn token_principal(lake: &Lake, user: &str, until: Option<u64>) -> Option<Principal> { principal(lake, user).await.ok().map(|p| Principal { until, ..p }) }
 
 // ---------------------------------------------------------------- who is asking, and what they may do
 
@@ -1257,12 +1261,13 @@ pub async fn claimed(lake: &Lake, c: &crate::sso::Claimed) -> Result<Principal> 
         Some(u) => ensure!(u.login, "{} is a role, and no one signs in as a role", c.user),
         None => ensure!(c.any, "no user {} here: CREATE USER \"{}\" (identity provider {} signs in only the users made here, unless it is made with USERS 'any')", c.user, c.user, c.provider),
     }
-    principal_with(lake, &c.user, &c.roles, c.any).await
+    Ok(Principal { until: (c.expires_ms > 0).then_some(c.expires_ms), ..principal_with(lake, &c.user, &c.roles, c.any).await? })
 }
 
 /// `user`'s principal, with `claimed` roles besides its own (those of them that are roles here); `unmade`:
 /// a user not made here may be (it has public's grants and those roles').
 async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: bool) -> Result<Principal> {
+    let epoch = lake.cat.rights_version(); // (before its records are read: a change after it moves the version past it)
     let version = lake.cat.version();
     let id = std::iter::once(user).chain(claimed.iter().map(String::as_str)).collect::<Vec<_>>().join("\0"); // (cached by the roles claimed too)
     let cached = ACCESS.lock().unwrap().get(&id).filter(|c| fresh(lake, version, c.0, c.1)).map(|c| (c.2.clone(), c.3));
@@ -1305,7 +1310,7 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
         }
     };
     let role = if superuser { Role::Admin } else if access.writes() { Role::Write } else { Role::Read };
-    Ok(Principal { name: user.to_string(), role, access: (!superuser).then_some(access), door: "node", from: None, operator: false })
+    Ok(Principal { name: user.to_string(), role, access: (!superuser).then_some(access), door: "node", from: None, operator: false, epoch, until: None })
 }
 
 /// Seconds as said: `90 seconds`, `5 minutes`, `1 hour`.
@@ -1478,7 +1483,8 @@ pub async fn who_at(lake: &Lake, auth: &crate::auth::Auth, credential: &crate::a
         if token.starts_with("ps_") {
             return session_principal(lake, token).await;
         }
-        return principal(lake, &token_user(lake, token).await?).await.ok();
+        let (user, until) = token_user(lake, token).await?;
+        return token_principal(lake, &user, until).await;
     }
     None
 }
@@ -1506,11 +1512,14 @@ pub async fn sign_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password
         let c = c.ok().filter(|c| c.user == user.to_lowercase())?;
         return claimed(lake, &c).await.ok();
     }
-    let ok = match password.starts_with("pt_") {
-        true => token_user(lake, password).await.as_deref() == Some(user),
-        false => password_ok(lake, user, password).await,
-    };
-    match ok {
+    if password.starts_with("pt_") {
+        let (named, until) = token_user(lake, password).await?;
+        return match named == user {
+            true => token_principal(lake, user, until).await,
+            false => None,
+        };
+    }
+    match password_ok(lake, user, password).await {
         true => principal(lake, user).await.ok(),
         false => None,
     }

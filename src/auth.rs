@@ -22,6 +22,11 @@ pub struct Principal {
     pub door: &'static str,                  // (which door it came in by, and from where: the audit log's)
     pub from: Option<std::net::SocketAddr>,
     pub operator: bool, // (whoever runs the nodes: one of their tokens, their key, the program that started this one; `users::across`)
+    /// The lake's rights version it was made at (`Catalog::rights_version`; 0: not made from the lake's records, as a
+    /// token's). A session makes it again once the version moved (`stale`).
+    pub epoch: u64,
+    /// When its credential ends (ms since the epoch): a user's token's expiry, a session's, an identity provider's token's.
+    pub until: Option<u64>,
 }
 
 impl Principal {
@@ -33,7 +38,13 @@ impl Principal {
             Role::Read => "reader",
             Role::None => "",
         };
-        Principal { name: name.into(), role, access: None, door: "node", from: None, operator: false }
+        Principal { name: name.into(), role, access: None, door: "node", from: None, operator: false, epoch: 0, until: None }
+    }
+
+    /// Must a session that holds it make it again before its next statement? Who may do what changed since it was made
+    /// (a REVOKE, a DROP USER, a new password, a token revoked: `Catalog::rights_version`), or its credential ended.
+    pub fn stale(&self, lake: &crate::store::Lake) -> bool {
+        self.epoch != lake.cat.rights_version() || self.until.is_some_and(|u| u <= crate::log::now_ms())
     }
 
     /// A token's (one of the nodes', or their key), or the program's that started the node: its
@@ -715,7 +726,7 @@ mod tests {
     /// other key, a token's and a caller with no name are all refused.
     #[test]
     fn a_page_stages_only_its_own_files() {
-        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, access: None, door: "http", from: None, operator: false };
+        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, access: None, door: "http", from: None, operator: false, epoch: 0, until: None };
         assert_eq!(slug(&user("ali")).as_deref(), Some("616c69"), "a user's slug is its name in hex");
         assert!(slug(&Principal::token(Role::Admin)).is_none(), "a token has no slug");
         let long = format!("stage/616c69/{}/0.parquet", "j".repeat(65));

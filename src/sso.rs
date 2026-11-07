@@ -325,7 +325,7 @@ pub struct Claimed {
     pub roles: Vec<String>, // (its roles claim's values)
     pub provider: String,
     pub any: bool, // (its provider signs in anyone, not only users made here)
-    pub expires_ms: u64,
+    pub expires_ms: u64, // (when it stops signing in: its `exp` and the clocks' leeway; 0: never asked)
 }
 
 /// None: not a token for the providers (not shaped like one, or the lake has none). Some(Err): one
@@ -425,7 +425,7 @@ fn claimed(name: &str, p: &Provider, c: &Value, exp: f64) -> Result<Claimed> {
         Some(Value::String(s)) => s.split_whitespace().map(String::from).collect(),
         _ => vec![],
     };
-    Ok(Claimed { user: user.to_lowercase(), roles: roles.into_iter().take(64).collect(), provider: name.into(), any: p.any, expires_ms: (exp * 1000.0) as u64 })
+    Ok(Claimed { user: user.to_lowercase(), roles: roles.into_iter().take(64).collect(), provider: name.into(), any: p.any, expires_ms: ((exp + LEEWAY) * 1000.0) as u64 })
 }
 
 /// A claim by its name or, when no claim has that name, by a path of names: Keycloak's realm roles are
