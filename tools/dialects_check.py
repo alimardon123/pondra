@@ -256,6 +256,8 @@ CASES = [
     ("mysql", "CREATE PROCEDURE mark_paid(IN oid INT) UPDATE orders SET status = 'paid' WHERE id = oid", ("42601", "CREATE PROCEDURE: unexpected UPDATE")),
     ("mysql", "CALL mark_paid(2)", ("42883", "procedure mark_paid does not exist")),
     ("mysql", "SELECT VERSION(), DATABASE(), CURRENT_USER()", ("0A000", "DATABASE() is MySQL's: write current_database()")),
+    ("mysql", "/*!40101 SET NAMES utf8mb4 */", ("0A000", "MySQL's comment that runs as code")),
+    ("mysql", "SELECT 1 AS x /*! ; DROP TABLE t_case_402 */", ("0A000", "MySQL's comment that runs as code")),
     # bigquery: queries
     ("bigquery", "SELECT o.id, c.name, o.amount FROM `orders` AS o JOIN `customers` AS c ON c.id = o.customer_id ORDER BY o.id"),
     ("bigquery", "SELECT status, COUNT(*) AS n, SUM(amount) AS total FROM orders GROUP BY ALL"),

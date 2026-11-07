@@ -81,8 +81,36 @@ fn lead(mut sql: &str) -> &str {
     }
 }
 
-/// A statement's class, by its first words.
+/// A statement's class, by its first words. A text with MySQL's `/*! … */` in it (`text::hint`) has the most telling class
+/// of the statements the parser reads in it, the comment's words among them, so a `DROP` hidden in one is never a read
+/// (every door refuses such a text, `dialect_stmts.rs`, but a log that keeps it by its class must not take it for one).
 pub fn class(sql: &str) -> &'static str {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::Tokenizer};
+    match crate::text::hint(sql).and_then(|_| Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()) {
+        Some(t) => as_parsed(&t),
+        None => by_words(sql),
+    }
+}
+
+/// The most telling class of the statements in `t`, each read by its words as the parser reads them (`class`).
+fn as_parsed(t: &[datafusion::sql::sqlparser::tokenizer::Token]) -> &'static str {
+    use datafusion::sql::sqlparser::tokenizer::Token;
+    const TELLING: [&str; 6] = ["read", "misc", "function", "write", "ddl", "role"];
+    let solid: Vec<&Token> = t.iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
+    let text = |s: &[&Token]| {
+        let mut out = String::new();
+        for (i, t) in s.iter().enumerate() {
+            if i > 0 && !matches!(t, Token::Period | Token::LParen) && *s[i - 1] != Token::Period {
+                out.push(' ');
+            }
+            out.push_str(&t.to_string());
+        }
+        out
+    };
+    solid.split(|t| **t == Token::SemiColon).map(|s| by_words(&text(s))).max_by_key(|c| TELLING.iter().position(|t| t == c)).unwrap_or("read")
+}
+
+fn by_words(sql: &str) -> &'static str {
     let sql = lead(sql);
     let words: Vec<String> = sql.split(|c: char| c.is_whitespace() || c == '(' || c == ';').filter(|w| !w.is_empty()).take(6).map(|w| w.to_uppercase()).collect();
     let first = words.first().map_or("", |w| w.as_str());
@@ -504,6 +532,15 @@ mod tests {
         assert_eq!(class("-- note\nCREATE USER ana PASSWORD 'x'"), "role");
         assert_eq!(redacted("CREATE SECRET s (TYPE s3, KEY_ID \"k\", SECRET xyz)", "role"), "CREATE SECRET s (TYPE s3, KEY_ID '***', SECRET '***')");
         assert_eq!(redacted("/* a */ create temporary secret t (type http, bearer_token 'a,b''c')", "role"), "/* a */ create temporary secret t (type http, bearer_token '***')");
+        // (MySQL's `/*! … */`: its words are classed as the parser reads them, code, so a statement hidden in one is never a read, 11-07)
+        assert_eq!(class("SELECT 1 AS x /*! ; DROP TABLE t */"), "ddl");
+        assert_eq!(class("/*! GRANT ALL ON t TO ana */ SELECT 1"), "role");
+        assert_eq!(class("SELECT 1; /*! DELETE FROM t */"), "write");
+        assert_eq!(class("SELECT 1 /*! ; SELECT pondra.start('j') */"), "function");
+        let hidden = "SELECT 1 /*! ; CREATE USER ana PASSWORD 'x' */";
+        assert_eq!((class(hidden), redacted(hidden, class(hidden)).as_str()), ("role", "SELECT 1 /*! ; CREATE USER ana PASSWORD '***' */"));
+        assert_eq!(class("SELECT /*! 1 + */ 2"), "read");
+        assert_eq!((class("SELECT '/*! ; DROP TABLE t */'"), class("/* /*! DROP TABLE t */ */ SELECT 1")), ("read", "read"));
     }
 
     /// A joined page's line is written by its node by the node's own classes (`page_statement`): with the read class off, an ok
