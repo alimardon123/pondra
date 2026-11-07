@@ -92,10 +92,10 @@ pub async fn live(State(app): State<App>, Query(p): Query<Params>, headers: axum
                 Err(e) => futures::stream::once(async move { Ok(error(e, &tag)) }).boxed(),
             });
         }
-        return ([("content-type", "application/x-ndjson")], Body::from_stream(crate::drain::endless(futures::stream::select_all(all).take_until(revoked)))).into_response();
+        return ([("content-type", "application/x-ndjson")], Body::from_stream(app.lake.node.drain.endless(futures::stream::select_all(all).take_until(revoked)))).into_response();
     }
     match watch(&app, &headers, p.sql.as_deref(), &kind, &body, every, String::new()).await {
-        Ok(w) => ([("content-type", "application/x-ndjson")], Body::from_stream(crate::drain::endless(lines(w).take_until(revoked)))).into_response(),
+        Ok(w) => ([("content-type", "application/x-ndjson")], Body::from_stream(app.lake.node.drain.endless(lines(w).take_until(revoked)))).into_response(),
         Err(e) => (axum::http::StatusCode::BAD_REQUEST, crate::ext::said(&e)).into_response(),
     }
 }

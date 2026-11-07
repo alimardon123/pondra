@@ -107,7 +107,7 @@ async fn set(lake: &Lake, to: u32) -> Result<()> {
     }
     let stamp = Stamp { format: to, by: VERSION.into() };
     lake.cat.commit(vec![(KEY.into(), serde_json::to_vec(&stamp).expect("json"))], &[]).await?;
-    lake.life.say(&format!("the lake is format {to} now (Pondra {VERSION})"));
+    lake.node.life.say(&format!("the lake is format {to} now (Pondra {VERSION})"));
     Ok(())
 }
 
@@ -254,7 +254,7 @@ pub fn watch(lake: Arc<Lake>) {
             tokio::time::sleep(Duration::from_secs(1)).await;
             if let Err(e) = check(&lake.cat, &lake.url, false).await {
                 if e.downcast_ref::<Newer>().is_some() {
-                    return lake.life.stop(format!("{e}"));
+                    return lake.node.life.stop(format!("{e}"));
                 }
             }
         }
@@ -282,7 +282,7 @@ mod tests {
     #[tokio::test]
     async fn format_6_turns_each_entry_into_its_list_at_its_next_write() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-lists-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().expect("a path"), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().expect("a path"), true, false, crate::node_state::NodeState::unhosted()).await?;
         lake.cat.commit(vec![(KEY.into(), serde_json::to_vec(&Stamp { format: 5, by: "0.80.0".into() })?)], &[]).await?;
         let entry = |i: usize| {
             let mut t = TableMeta::with_columns((0..8).map(|c| (format!("c{c}"), if c % 2 == 0 { "Int64" } else { "Utf8" }.to_string())).collect());

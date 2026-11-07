@@ -1105,7 +1105,7 @@ impl Encoding {
         let (buf, file) = blocking(move || self.finish()).await?;
         let path = format!("data/{}/{}.parquet", meta.map_or(table, |m| m.folder(table)), uuid::Uuid::new_v4());
         lake.put(&path, buf).await?;
-        maybe_crash("after_parquet_put", &*lake.life);
+        maybe_crash("after_parquet_put", &*lake.node.life);
         if !hot.is_empty() {
             let (cache, room, held) = (lake.hot.clone(), lake.hot.room_for(lake), path.clone());
             blocking(move || Ok(cache.put(&held, &hot, kept, room))).await?;
@@ -1287,7 +1287,7 @@ mod tests {
             Box::pin(RecordBatchStreamAdapter::new(schema.clone(), futures::stream::iter(items)))
         };
         let dir = std::env::temp_dir().join(format!("pondra-streamed-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let files = write_stream(&lake, "t", stream(false), 2500, &[], true, None).await?;
         assert_eq!(files.iter().map(|f| f.rows).collect::<Vec<_>>(), [3000, 3000, 3000, 1000]);
         for (k, f) in files.iter().enumerate() {

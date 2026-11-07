@@ -114,7 +114,7 @@ pub fn router(app: App) -> Router {
         .merge(crate::sharing::routes()) // (recipients sign in there with their own tokens: `sharing.rs`)
         .layer(axum::extract::DefaultBodyLimit::max(1 << 30)) // batches up to 1 GiB
         .layer(middleware::from_fn_with_state(app.clone(), guard))
-        .layer(middleware::from_fn(used))
+        .layer(middleware::from_fn_with_state(app.clone(), used))
         .layer(middleware::from_fn_with_state(Arc::new(crate::origins::ORIGINS.clone()), crate::origins::door)) // (outermost: a preflight is answered before guard, and guard's refusals carry the headers)
         .with_state(app)
 }
@@ -248,12 +248,12 @@ async fn routines_shown(State(app): State<App>) -> Result<Json<Value>, E> {
 
 /// A request is a use of the node until its answer has been sent (`idle.rs`: `--idle-exit`), but for the ones a cluster
 /// sends all the time and the health checks.
-async fn used(req: Request, next: Next) -> Response {
-    if crate::idle::background(req.uri().path()) {
+async fn used(State(app): State<App>, req: Request, next: Next) -> Response {
+    if crate::node_state::background(req.uri().path()) {
         return next.run(req).await;
     }
-    let used = crate::idle::Use::new();
-    next.run(req).await.map(|body| axum::body::Body::new(crate::idle::kept(body, used)))
+    let used = app.lake.node.idle.begin();
+    next.run(req).await.map(|body| axum::body::Body::new(crate::node_state::kept(body, used)))
 }
 
 /// Who asks (see `auth.rs`, `users.rs`): a token, a user's token, session or password; the
@@ -262,10 +262,10 @@ async fn used(req: Request, next: Next) -> Response {
 /// role too.
 async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path();
-    if crate::drain::draining() && !crate::drain::still_taken(path) {
+    if app.lake.node.drain.draining() && !crate::node_state::still_taken(path) {
         return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")], "this node is stopping: ask another").into_response(); // (`drain.rs`)
     }
-    if app.members.cut_off() && !crate::drain::still_taken(path) {
+    if app.members.cut_off() && !crate::node_state::still_taken(path) {
         // (a leader that can't reach the bucket can't commit, and its reads may already be stale:
         // another node leads soon. The cluster's own calls and the health checks still go through.)
         return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")], crate::members::CUT_OFF_SAYS).into_response();
@@ -295,14 +295,14 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             return (StatusCode::UNAUTHORIZED, "a branch's key renews its pin, and opens nothing else").into_response();
         }
         let who = crate::auth::Principal::of(crate::auth::Role::None).at("http", from);
-        return match crate::panics::door(crate::auth::WHO.scope(who, next.run(req))).await {
+        return match crate::panics::door(&app.lake.node, crate::auth::WHO.scope(who, next.run(req))).await {
             Ok(r) => r,
             Err(m) => E(anyhow::anyhow!(m)).into_response(),
         };
     }
     if req.uri().path().starts_with("/delta-sharing/") {
         // (a recipient's token or a file's signed link, which the door checks: never a user's sign-in)
-        return match crate::panics::door(next.run(req)).await {
+        return match crate::panics::door(&app.lake.node, next.run(req)).await {
             Ok(r) => r,
             Err(m) => E(anyhow::anyhow!(m)).into_response(),
         };
@@ -418,7 +418,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             false => run.await,
         }
     };
-    match if heavy { crate::panics::work(stoppable, run).await } else { crate::panics::door(run).await } {
+    match if heavy { crate::panics::work(&app.lake.node, stoppable, run).await } else { crate::panics::door(&app.lake.node, run).await } {
         Ok(r) => r,
         Err(m) => {
             if let (true, Some((who, headers))) = (m == crate::oom::OOM, asked) {
@@ -643,7 +643,7 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
     let streamed = operator.then(|| crate::format::Streamed::to(crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
     // (a joined page's tab, which says no format as the nodes' own client does (`cluster::http`), is a use of the node while it
     // follows, as its other requests are; the nodes' streams never end while a cluster runs, so they aren't: `idle.rs`, 11-03 audit M7)
-    let page = (!headers.contains_key("x-pondra-format")).then(crate::idle::Use::new);
+    let page = (!headers.contains_key("x-pondra-format")).then(|| app.lake.node.idle.begin());
     let start = Frame::Start { term: app.members.leader().n, replicated: cat.replicas > 1 };
     let (recent, rx) = cat.subscribe();
     let live = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.ok().map(|f| (f, rx)) }); // a lagging follower reconnects
@@ -651,7 +651,7 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
         let _ = (&streamed, &page);
         Ok::<_, std::io::Error>(for_caller(f, operator).encode())
     });
-    Body::from_stream(crate::drain::endless(frames.take_until(revoked))).into_response() // (the node's door closing ends it too: `drain::endless`)
+    Body::from_stream(app.lake.node.drain.endless(frames.take_until(revoked))).into_response() // (the node's door closing ends it too: `Drain::endless`)
 }
 
 /// `POST /cluster/records`: a joined page's own statements, which this node writes as its own (`page_records::record`), under the
@@ -1070,7 +1070,7 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
     crate::protect::stamp(&mut d); // (who lifts a protection, when the statement doesn't say)
     let out = match &app.seq {
         Some(seq) => crate::write::ddl_here(&app.lake, seq, &app.lock, d.clone()).await?,
-        None if !app.members.is_leader() => Box::pin(crate::write::send_as(&app.lake.url, crate::write::Request::Ddl(d.clone()), credential.token(), &app.lake.life)).await?, // (the leader makes it)
+        None if !app.members.is_leader() => Box::pin(crate::write::send_as(&app.lake.url, crate::write::Request::Ddl(d.clone()), credential.token(), &app.lake.node)).await?, // (the leader makes it)
         None => {
             let _guard = app.lock.lock().await;
             crate::ddl::apply(&app.lake, d.clone()).await?
@@ -1131,9 +1131,10 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
 /// was sent may be answered from `Results`.
 async fn sql(State(app): State<App>, Query(p): Query<crate::statement::SqlParams>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let format = p.format.clone(); // (an answer handed to the door in pieces is sent in this format)
+    let node = app.lake.node.clone(); // (an answer in pieces is in flight until its last piece is read: `pieces`)
     let said = crate::statement::sql(app, p, role.0, headers, body).await;
     let mut r = match said.reply {
-        Ok(crate::statement::Reply::Rendered(r)) => respond(r, format.as_deref()),
+        Ok(crate::statement::Reply::Rendered(r)) => respond(r, format.as_deref(), &node),
         Ok(crate::statement::Reply::Done(v)) => Json(v).into_response(),
         Err(e) => E::from(e).into_response(),
     };
@@ -1185,10 +1186,10 @@ async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extensi
 
 /// An answer as the HTTP door sends it, in `format`'s content type: its bytes, or its pieces (`pieces`), or no body for
 /// `Sent` (its answer went to the door in pieces as its plan made them, `query::collect_or_send`, and the door has it).
-fn respond(r: Rendered, format: Option<&str>) -> Response {
+fn respond(r: Rendered, format: Option<&str>, node: &crate::node_state::NodeState) -> Response {
     let body = match r {
         Rendered::Whole(bytes) => Body::from(bytes),
-        Rendered::Pieces(h) => pieces(h),
+        Rendered::Pieces(h) => pieces(h, node),
         Rendered::Sent => return StatusCode::NO_CONTENT.into_response(),
     };
     ([("content-type", crate::answer::content_type(format))], body).into_response()
@@ -1196,11 +1197,11 @@ fn respond(r: Rendered, format: Option<&str>) -> Response {
 
 /// The body of an answer in pieces (`query::Handed`): its first piece, then the rest as they are written. A channel
 /// that closes before the last piece was written fails the body, so a client never takes a cut answer for a whole one.
-fn pieces(h: crate::query::Handed) -> Body {
+fn pieces(h: crate::query::Handed, node: &crate::node_state::NodeState) -> Body {
     let crate::query::Handed { first, rest, ended, stop } = h;
     // (counted until the body's last piece is read, not until its writer ends: the pieces still in the channel are what
-    // a node stopping after the writer would cut short, so a node told to stop waits for them: `drain::Busy::carried`)
-    let busy = crate::drain::Busy::carried();
+    // a node stopping after the writer would cut short, so a node told to stop waits for them: `Drain::carried`)
+    let busy = node.drain.carried();
     let head = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(first)) });
     let rest = futures::stream::unfold(Some((rest, ended, busy)), |state| async move {
         let (mut rest, ended, busy) = state?;
@@ -1259,6 +1260,7 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
     let hwm = app.lake.hwm.subscribe();
     let after = p.after.unwrap_or_else(|| app.lake.visible());
     let (marks, changes) = (p.marks, p.changes);
+    let node = app.lake.node.clone(); // (its door closing ends the watch: `Drain::endless`)
     let rows = futures::stream::unfold((app, hwm, after, name), move |(app, mut hwm, after, name)| async move {
         loop {
             hwm.borrow_and_update();
@@ -1284,7 +1286,7 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
             hwm.changed().await.ok()?;
         }
     });
-    Body::from_stream(crate::drain::endless(rows.filter(|c| std::future::ready(!matches!(c, Ok(b) if b.is_empty()))).take_until(revoked))).into_response() // (never ends by itself: `drain::endless`)
+    Body::from_stream(node.drain.endless(rows.filter(|c| std::future::ready(!matches!(c, Ok(b) if b.is_empty()))).take_until(revoked))).into_response() // (never ends by itself: `Drain::endless`)
 }
 
 /// A table's rows (`tail`'s, the change feed's) with its columns in SQL's order (`TableMeta::sql_order`), the system
@@ -1303,7 +1305,7 @@ async fn tier_now(State(app): State<App>) -> Result<Json<Value>, E> {
 /// `GET /ready`: 200 once this node answers as it should (it holds what its leader had: invariant
 /// 197), 503 while it catches up or drains (`drain.rs`): a load balancer's readiness probe.
 async fn ready(State(app): State<App>) -> Response {
-    match (crate::drain::draining(), *app.lake.caught.borrow()) {
+    match (app.lake.node.drain.draining(), *app.lake.caught.borrow()) {
         (true, _) => (StatusCode::SERVICE_UNAVAILABLE, "stopping").into_response(),
         (_, false) => (StatusCode::SERVICE_UNAVAILABLE, "catching up with the leader").into_response(),
         _ if app.members.cut_off() => (StatusCode::SERVICE_UNAVAILABLE, "can't reach the bucket: another node leads").into_response(),

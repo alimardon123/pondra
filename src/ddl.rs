@@ -578,7 +578,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
                     }
                     (dir, false)
                 }
-                false => lake_dir(&dir, &*lake.life).await?,
+                false => lake_dir(&dir, &*lake.node.life).await?,
             };
             lake.cat.commit(vec![(attachment_key(&name), json(&Attachment { dir: dir.clone(), read_only, endpoint }))], &[]).await?;
             Ok(match (created, read_only) {
@@ -612,7 +612,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             let (mut bases, mut branches) = (None, vec![]);
             if let Some(t) = &target {
                 // (as the lake is now, not as this node last saw it: a branch made or dropped just now counts)
-                let now = Lake::open(&t.url, false, false, lake.life.clone()).await?;
+                let now = Lake::open(&t.url, false, false, lake.node.clone()).await?;
                 bases = now.cat.get::<crate::branch::Bases>(crate::branch::BASES).await?;
                 branches = now.cat.scan::<crate::branch::Pin>("pn/", "pn0").await?.into_iter().map(|(_, p)| p.lake).collect();
             }
@@ -802,7 +802,7 @@ pub fn beside(url: &str, name: &str) -> String {
 /// Attach lake `dir` as `name` here, and return it. A node (`follow`) keeps it fresh from its catalog, until it
 /// is detached; `live` opens it to follow its leader's commit stream too (`--attach`: for good, `node::attach`).
 pub async fn attach(home: &Lake, name: &str, dir: &str, follow: bool, live: bool) -> Result<Arc<Lake>> {
-    let other = Lake::open(dir, false, live, home.life.clone()).await?;
+    let other = Lake::open(dir, false, live, home.node.clone()).await?;
     if follow {
         let (home, weak) = (Arc::downgrade(&home.arc()), Arc::downgrade(&other));
         crate::panics::spawn(async move {
@@ -2214,7 +2214,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_ctas_drops_only_the_table_its_job_made() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-made-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         crate::write::create_table(&lake, "t", r#"{"columns": [["a", "Int64"]], "made_by": "job-a"}"#).await?;
         let drop = |made_by: &str| Ddl::DropTable { name: "t".into(), if_exists: true, purge: true, made_by: Some(made_by.into()) };
         let out = apply(&lake, drop("job-b")).await?;

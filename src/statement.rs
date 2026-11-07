@@ -253,6 +253,7 @@ pub(crate) async fn scoped<F: std::future::Future>(session: Option<String>, vars
 /// `statement::run` (the session, the owner's files, …): server.rs's `sql`, moved.
 pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, headers: http::HeaderMap, body: Bytes) -> Said {
     let files = owner(&app.auth, &headers); // (the program that started this node: its files, and URLs no secret covers)
+    let node = app.lake.node.clone(); // (its rest, run on after the answer is handed over, is still in flight: `panics::work`)
     let session = match crate::temp::of(&headers) { // (its temporary tables: `temp.rs`)
         Ok(session) => session,
         Err(e) => return Said { reply: Err(e), heard: vec![], session: None }, // (a session name that isn't one: refused, saying what one is)
@@ -279,7 +280,7 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, headers: http:
             // Its answer goes in pieces as its plan makes them (`query::send_rest`): the rest of the request, the
             // pieces and the statement's end, is polled on the queries' runtime while its client reads; the plan's
             // partition tasks stay where the prefix spawned them. The node may still stop it for memory (`oom.rs`).
-            crate::panics::aside(crate::panics::work(true, go));
+            crate::panics::aside(crate::panics::work(&node, true, go));
             return Said { reply: Ok(Reply::Rendered(Rendered::Pieces(h))), heard: vec![], session };
         }
     };

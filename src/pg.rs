@@ -47,7 +47,7 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     let cancel = Arc::new(DefaultCancelHandler::new(cancels.clone()));
     loop {
         let (socket, _) = listener.accept().await?;
-        if crate::drain::draining() {
+        if app.lake.node.drain.draining() {
             continue; // (stopping: a new connection goes to another node, `drain.rs`)
         }
         let tls = tls.clone();
@@ -56,7 +56,7 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
         let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), again: Default::default(), copy: Default::default(), me: me.clone() });
         let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: cancels.clone() };
         let pg = Arc::new(Pg(backend, Arc::new(startup), cancel.clone()));
-        let used = crate::idle::Use::new(); // (an open connection is a use of the node: `idle.rs`)
+        let used = app.lake.node.idle.begin(); // (an open connection is a use of the node: `idle.rs`)
         crate::panics::task(async move {
             let _used = used;
             let _ = socket.set_nodelay(true);
@@ -586,7 +586,7 @@ impl Backend {
             let session = Some(me.session.clone());
             crate::routines::with_notices(crate::temp::SESSION.scope(session, crate::auth::WHO.scope(who, me.caught(&u, &q, &f)))).await
         };
-        let (out, heard) = crate::panics::work(true, Box::pin(run)).await.unwrap_or_else(|m| (Err(user_error(anyhow::anyhow!(m))), vec![])); // (stoppable for memory: `oom.rs`)
+        let (out, heard) = crate::panics::work(&self.app.lake.node, true, Box::pin(run)).await.unwrap_or_else(|m| (Err(user_error(anyhow::anyhow!(m))), vec![])); // (stoppable for memory: `oom.rs`)
         for n in heard {
             let _ = client.feed(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
         }
@@ -598,11 +598,11 @@ impl Backend {
 
     /// `run`, a panic in it answered as an error (`panics.rs`); in a transaction, an error fails it.
     async fn caught(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
-        if crate::drain::draining() {
+        if self.app.lake.node.drain.draining() {
             // (stopping: the statement goes to another node, as a new connection does; `drain.rs`)
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), "57P01".into(), "this node is stopping: connect to another node".into()))));
         }
-        let run = async { crate::panics::door(Box::pin(self.run(user, sql, format))).await.unwrap_or_else(|m| Err(user_error(anyhow::anyhow!(m)))) };
+        let run = async { crate::panics::door(&self.app.lake.node, Box::pin(self.run(user, sql, format))).await.unwrap_or_else(|m| Err(user_error(anyhow::anyhow!(m)))) };
         let out = crate::audit::statement(&self.app, sql, run).await;
         if let Err(e) = &out {
             if crate::text::control(sql).is_none() {
@@ -1618,7 +1618,7 @@ impl SimpleQueryHandler for Backend {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         // (pgwire writes the answer's rows inside this call, so the drain counts the call until they are written)
-        let _busy = crate::drain::Busy::new();
+        let _busy = self.app.lake.node.drain.busy();
         let out = self._on_query(client, query).await;
         self.cancelled(&out);
         out
@@ -1656,9 +1656,9 @@ impl ExtendedQueryHandler for Backend {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         // (pgwire writes the rows this Execute sends inside this call, so the drain counts the call until they are written)
-        let _busy = crate::drain::Busy::new();
+        let _busy = self.app.lake.node.drain.busy();
         let out = self._on_execute(&mut Corked::new(client), message).await;
-        if crate::drain::draining() {
+        if self.app.lake.node.drain.draining() {
             client.flush().await?; // (a node stopping writes the rows now, while the drain still counts this call)
         }
         self.cancelled(&out);

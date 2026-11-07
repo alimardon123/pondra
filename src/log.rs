@@ -536,7 +536,7 @@ pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<Strin
     if data.len() > inline_bytes() {
         f.path = format!("log/{}-{:015}.seg", uuid::Uuid::new_v4().simple(), now_ms()); // (a random first part: every node's flushes spread over the key range, C5; the catalog holds each path)
         lake.put(&f.path, data).await?;
-        maybe_crash("after_seg_put", &*lake.life);
+        maybe_crash("after_seg_put", &*lake.node.life);
     } else {
         f.data = data.into();
     }
@@ -653,7 +653,7 @@ impl Sequencer {
                 if let Err(e) = commit(&lake, &mut next, &mut block, &mut producers, &mut sequences, &holds, batch, &ms, slot).await {
                     // Committed or not, we can't tell: restart and reload the state from the catalog.
                     eprintln!("sequencer failed: {e:#}");
-                    lake.life.restart("the sequencer failed", &[]);
+                    lake.node.life.restart("the sequencer failed", &[]);
                 }
             }
         });
@@ -1006,7 +1006,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
             ms.push(t0.elapsed().as_secs_f64() * 1e3);
             drop(ms);
             crate::store::commit_stage("commit", t0); // (from `order` to here: the commit /stats times)
-            maybe_crash("after_commit", &*lake.life);
+            maybe_crash("after_commit", &*lake.node.life);
             lake.advance(hwm);
             for (reply, outcome) in replies {
                 let _ = reply.send(outcome);
@@ -1350,7 +1350,7 @@ mod tests {
 
     async fn fresh() -> Result<(std::path::PathBuf, Arc<Lake>)> {
         let dir = std::env::temp_dir().join(format!("pondra-marks-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         Ok((dir, lake))
     }
 
@@ -1584,7 +1584,7 @@ mod tests {
         assert_eq!(lake.cat.tallies(), scanned(&lake).await?);
         drop(s);
         lake.cat.close().await?;
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?; // (a restart as the leader counts what the catalog holds)
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?; // (a restart as the leader counts what the catalog holds)
         assert_eq!(lake.cat.tallies(), scanned(&lake).await?, "after a restart");
         done(lake, dir).await
     }

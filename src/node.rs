@@ -147,8 +147,8 @@ pub struct Native {
     guest: bool,
 }
 
-/// A node's lifecycle, a guest's when `guest`.
-pub fn native(guest: bool) -> crate::lifecycle::Life { Arc::new(Native { guest }) }
+/// A node's state as the code below the hosts sees it, with this host's lifecycle: a guest's when `guest`.
+pub fn native(guest: bool) -> Arc<crate::node_state::NodeState> { crate::node_state::NodeState::new(Arc::new(Native { guest })) }
 
 impl crate::lifecycle::Lifecycle for Native {
     fn stop(&self, why: String) { stop(why) }
@@ -239,7 +239,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     if let Some(key) = s.auth.owner_key() {
         let _ = lake.owner_key.set(key.to_string()); // (whose tasks this process runs with its owner's files: `runs::signed`)
     }
-    let lives = !lake.life.one_off();
+    let lives = !lake.node.life.one_off();
     let leader = members.is_leader();
     let term = members.leader().n;
     let reader = s.reader || members.reader();
@@ -276,7 +276,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
         Some(Err(e)) if e.downcast_ref::<replica::Unreached>().is_some() => {
             eprintln!("{e:#}");
             crate::terms::newer_claimed(&lake.store, term).await;
-            lake.life.restart("not leading past members this node can't reach", &[])
+            lake.node.life.restart("not leading past members this node can't reach", &[])
         }
         Some(r) => {
             r?;
@@ -332,9 +332,8 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
 /// The member's own loops over its App, each as a node that lives keeps it (none for a guest): the leader's keys,
 /// tasks, tiering, checkpoints and emission, a follower's catalog refresh, streaming tasks, the store's upkeep.
 pub fn keep(app: &crate::app::App, s: &Start) {
-    let lives = !app.lake.life.one_off();
+    let lives = !app.lake.node.life.one_off();
     let leader = app.seq.is_some();
-    crate::idle::serving(&app.lake, leader, app.replica.as_ref()); // (what `--idle-exit` waits for: `idle.rs`)
     let reader = s.reader || app.members.reader();
     let lake = app.lake.clone();
     if leader && lives {
@@ -385,7 +384,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     }
     if lives {
         let l = app.lake.clone();
-        let closing = crate::drain::closing();
+        let closing = app.lake.node.drain.closing();
         panics::spawn(async move {
             // (a follower's catalog shows the leader's keys once the leader has flushed them)
             let mut said = false;

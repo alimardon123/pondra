@@ -156,7 +156,7 @@ pub async fn statement(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Dd
             for place in [&crate::ddl::full(&from)?, &to] {
                 crate::ext::reach_place(lake, place).await?; // (a backup in another bucket: the secret that reaches it)
             }
-            let mut out = restore(&from, &to, at, &lake.life).await?;
+            let mut out = restore(&from, &to, at, &lake.node).await?;
             let attach = Ddl::Attach { name: name.clone(), dir: to, read_only: false, endpoint: None };
             match lock {
                 Some(lock) => {
@@ -164,7 +164,7 @@ pub async fn statement(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Dd
                     crate::ddl::apply(lake, attach).await?;
                 }
                 None => {
-                    Box::pin(crate::write::send(&lake.url, Request::Ddl(attach), &lake.life)).await?; // (the leader attaches it, under its lock; boxed: `send` leads back here)
+                    Box::pin(crate::write::send(&lake.url, Request::Ddl(attach), &lake.node)).await?; // (the leader attaches it, under its lock; boxed: `send` leads back here)
                 }
             }
             out["attached"] = name.into();
@@ -219,7 +219,7 @@ async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Op
                 let _guard = lock.lock().await;
                 crate::ddl::apply(lake, d).await
             }
-            None => Box::pin(crate::write::send(&source.url, Request::Ddl(d), &lake.life)).await,
+            None => Box::pin(crate::write::send(&source.url, Request::Ddl(d), &lake.node)).await,
         }
     };
     let first = ask(Ddl::Pin { lake: pin.clone(), ms: None, lease: false }).await.with_context(|| format!("pinning {}", source.url))?;
@@ -235,7 +235,7 @@ async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Op
     };
     let out = tokio::select! {
         // (a lake held in this process's memory is taken here: no `pondra lead` of its own can reach it)
-        out = async { if crate::memory::in_memory(&source.url) { take_here(&to, take, &lake.life).await } else { Box::pin(crate::write::send(&to, Request::Ddl(Ddl::Backup(take)), &lake.life)).await } } => out, // (boxed: `send` leads back here through `deliver`)
+        out = async { if crate::memory::in_memory(&source.url) { take_here(&to, take, &lake.node).await } else { Box::pin(crate::write::send(&to, Request::Ddl(Ddl::Backup(take)), &lake.node)).await } } => out, // (boxed: `send` leads back here through `deliver`)
         _ = renew => unreachable!(),
     };
     if let Err(e) = ask(Ddl::Unpin { lake: pin.clone() }).await {
@@ -249,7 +249,7 @@ async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Op
 /// (`write::deliver`): a term claimed with no address, its mark kept fresh, let go at the end. Its catalog's
 /// writer is closed on every path, a panic's too, so no writer of another lake stays in this node for that
 /// lake's next leader to fence.
-async fn take_here(to: &str, t: Take, life: &crate::lifecycle::Life) -> Result<Value> {
+async fn take_here(to: &str, t: Take, node: &std::sync::Arc<crate::node_state::NodeState>) -> Result<Value> {
     let store = crate::store::open_store(to)?.1;
     // (a term none holds, or that another one-off writer holds: waited for; a node serving the backup refuses)
     let term = crate::terms::claim_one_off(&store, |t| {
@@ -258,7 +258,7 @@ async fn take_here(to: &str, t: Take, life: &crate::lifecycle::Life) -> Result<V
     })
     .await?;
     let marks = Marks(crate::terms::mark_every(store.clone(), term.n)); // (it answers the bell, as its term says: `terms::deaf`)
-    let out = match Lake::open(to, true, false, life.clone()).await {
+    let out = match Lake::open(to, true, false, node.clone()).await {
         Ok(lake) => {
             let run = AssertUnwindSafe(take_led(&lake, t, term.n)).catch_unwind().await;
             if let Err(e) = lake.cat.close().await {
@@ -296,13 +296,13 @@ async fn take_led(lake: &Lake, t: Take, term: u64) -> Result<Value> {
 /// `RESTORE DATABASE name FROM 'url' [AT (TIMESTAMP => …)]` and `pondra restore`: a new lake at
 /// `to`, made by its own leader from the backup's run. Only read from the backup: a backup on
 /// storage that this machine may only read can be restored.
-pub async fn restore(from: &str, to: &str, at: Option<u64>, life: &crate::lifecycle::Life) -> Result<Value> {
+pub async fn restore(from: &str, to: &str, at: Option<u64>, node: &std::sync::Arc<crate::node_state::NodeState>) -> Result<Value> {
     let (from, to) = (crate::ddl::full(from)?, crate::ddl::full(to)?);
     ensure!(crate::ddl::has_catalog(&from).await?, "{from} holds no lake");
     ensure!(!crate::ddl::has_catalog(&to).await?, "a lake is at {to} already: restore into a new place");
     ensure!(empty(&to).await?, "{to} holds other things: restore into a new place (or an empty folder)");
     let take = Take { source: from, pin: String::new(), retention_days: None, restore: true, at, fresh: true }; // (checked empty above)
-    let out = Box::pin(crate::write::send(&to, Request::Ddl(Ddl::Backup(take)), life)).await;
+    let out = Box::pin(crate::write::send(&to, Request::Ddl(Ddl::Backup(take)), node)).await;
     if out.is_err() {
         let _ = crate::ddl::delete_lake(&to).await; // (nothing half made stays)
     }
@@ -384,7 +384,7 @@ pub async fn take(lake: &Lake, t: Take) -> Result<Value> {
             lake.url
         ),
     }
-    let source = Lake::open(&t.source, false, false, lake.life.clone()).await.with_context(|| format!("opening {}", t.source))?;
+    let source = Lake::open(&t.source, false, false, lake.node.clone()).await.with_context(|| format!("opening {}", t.source))?;
     let snap = crate::branch::snapshot(&source, &crate::branch::pin_key(&t.pin), 0).await?;
     let number = |k: &str| snap.get(k).and_then(|v| serde_json::from_slice::<u64>(v).ok()).unwrap_or(0);
     let (commit, next, block) = (number("c"), number("n").max(1), number("b"));
@@ -451,7 +451,7 @@ pub async fn take(lake: &Lake, t: Take) -> Result<Value> {
 /// in. Its tasks are suspended (nothing a copy runs reaches the outside on its own: ALTER TASK …
 /// RESUME), and it publishes to Delta and Iceberg anew.
 async fn restore_into(lake: &Lake, t: &Take) -> Result<Value> {
-    let backup = Lake::open(&t.source, false, false, lake.life.clone()).await.with_context(|| format!("opening {}", t.source))?;
+    let backup = Lake::open(&t.source, false, false, lake.node.clone()).await.with_context(|| format!("opening {}", t.source))?;
     let b: Backup = backup.cat.get(KEY).await?.with_context(|| format!("{} is not a backup (BACKUP DATABASE … TO makes one)", t.source))?;
     let run = b.runs.iter().rev().find(|r| t.at.is_none_or(|at| r.ms <= at)).with_context(|| {
         format!("{} has no run then: its first kept is {}", t.source, b.runs.first().map(|r| when(r.ms)).unwrap_or_default())

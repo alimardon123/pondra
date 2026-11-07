@@ -2097,7 +2097,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_views_ctes_and_plain_views_are_written_in() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-written-in-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let view = |sql: &str| json(&crate::ddl::StoredView { sql: sql.into(), external: false, facts: vec![], authored: None });
         lake.cat.commit(vec![(crate::ddl::query_key("vx"), view("SELECT x FROM a WHERE x > 1")), (crate::ddl::query_key("vy"), view("SELECT x FROM vx"))], &[]).await?;
         let w = |sql: &'static str| written_in(&lake, sql);
