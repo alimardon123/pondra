@@ -79,8 +79,9 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
     let Some(args) = args else {
         let [part] = &n.0[..] else { return Ok(None) };
         let Some(id) = part.as_ident().filter(|i| i.quote_style == Some('\'')) else { return Ok(None) }; // (a name in single quotes: files, as DuckDB reads it)
-        let (format, options) = format_of(&id.value)?;
-        return Ok(Some(name(&Spec { urls: vec![id.value.clone()], format, options })));
+        let url = through(&id.value);
+        let (format, options) = format_of(&url)?;
+        return Ok(Some(name(&Spec { urls: vec![url], format, options })));
     };
     let f = n.to_string().to_lowercase();
     let format = match f.as_str() {
@@ -95,7 +96,7 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
     let (mut urls, mut options) = (vec![], BTreeMap::new());
     let a = crate::text::args(&f, &args.args)?;
     for e in a.given {
-        urls.extend(strings(e).with_context(|| format!("{f}: files are a string or a list of them"))?);
+        urls.extend(strings(e).with_context(|| format!("{f}: files are a string or a list of them"))?.iter().map(|u| through(u)));
     }
     for (name, e) in a.named {
         let value = match (name.to_lowercase().as_str(), e) {
@@ -240,6 +241,16 @@ fn decoded_here(variant: CompressionTypeVariant, decoders: bool, urls: &[String]
     }
 }
 
+/// A path as it is read: one that starts with a connection's name (`'@drop/sales/*.csv'`) at its files' URL, any other as
+/// written.
+fn through(path: &str) -> String {
+    #[cfg(feature = "lake")]
+    if let Some(url) = crate::connections::place(path) {
+        return url;
+    }
+    path.to_string()
+}
+
 /// A URL's scheme, if it names one Pondra reads (not a path on this machine).
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the node's readers call it; a page's build doesn't yet)
 pub(crate) fn scheme(url: &str) -> Option<&str> {
@@ -247,7 +258,7 @@ pub(crate) fn scheme(url: &str) -> Option<&str> {
         return Some("blob");
     }
     let s = url.split_once("://")?.0;
-    ["s3", "r2", "gs", "gcs", "az", "azure", "abfs", "abfss", "http", "https", "kafka", "file"].contains(&s).then_some(s)
+    ["s3", "r2", "gs", "gcs", "az", "azure", "abfs", "abfss", "http", "https", "kafka", "file", "cn"].contains(&s).then_some(s) // (cn: a connection's files, `connections::SCHEME`)
 }
 
 /// A `blob:` URL: a browser tab's own file (`blob:https://o/uuid` in Chromium, `blob:nodedata:uuid` in Node). Only the

@@ -177,7 +177,17 @@ pub struct Col {
     pub held: Option<String>,
     /// An enum column's labels and type.
     pub labels: Option<Enum>,
+    /// What it means, beside what it is (`About`).
+    pub about: Option<Box<About>>,
 }
+
+/// What a column means, beside what it is, by key: the semantic layer plan's *about* (a label, synonyms, a format, a
+/// unit, instructions, tags; designs/semantic-layer-plan.md §5), each key's value as JSON. It is kept on the column
+/// record, so a rename, a drop, a clone, a `logical()` copy and a description keep it, and no side map by name can lose
+/// it. Nothing sets it yet: its keys come with the plan's phase S1. Format 6's list writes it with the column's facts.
+/// Format 5's fields have no place for it, so a lake below format 6 never holds one (S1 refuses to set it there), and an
+/// entry written in that shape (a new one, a `logical()` copy) leaves it out.
+pub type About = BTreeMap<String, serde_json::Value>;
 
 /// A table's columns as its entry stores them from lake format 6: every column, dropped ones too, in field-id order, and
 /// SQL's order of them by id when it isn't the stored one (before format 6, `shown`). Written as `[columns]`, or
@@ -196,7 +206,7 @@ const PLACED_NONE: u64 = 0xcbf29ce484222325;
 /// A column's facts past its name, type and flags, as its entry writes them: each left out at its default (the id too,
 /// where it is the column's place + 1). (A missing one reads as None: no `default`, which would ask `Default` of each.)
 #[derive(Serialize, Deserialize)]
-struct Facts<S, I, E> {
+struct Facts<S, I, E, A> {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -211,6 +221,8 @@ struct Facts<S, I, E> {
     labels: Option<E>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sql_type: Option<S>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    about: Option<A>,
 }
 
 /// A column at its place in the list, for writing: its id is written only when it isn't `place`.
@@ -220,8 +232,8 @@ impl Serialize for At<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let (c, place) = (self.0, self.1);
-        let facts = Facts { id: (c.id != place).then_some(c.id), stored: c.stored.as_ref(), default: c.default.as_ref(), identity: c.identity.as_ref(), held: c.held.as_ref(), labels: c.labels.as_ref(), sql_type: c.sql_type.as_ref() };
-        let any = facts.id.is_some() || c.stored.is_some() || c.default.is_some() || c.identity.is_some() || c.held.is_some() || c.labels.is_some() || c.sql_type.is_some();
+        let facts = Facts { id: (c.id != place).then_some(c.id), stored: c.stored.as_ref(), default: c.default.as_ref(), identity: c.identity.as_ref(), held: c.held.as_ref(), labels: c.labels.as_ref(), sql_type: c.sql_type.as_ref(), about: c.about.as_deref() };
+        let any = facts.id.is_some() || c.stored.is_some() || c.default.is_some() || c.identity.is_some() || c.held.is_some() || c.labels.is_some() || c.sql_type.is_some() || c.about.is_some();
         let mut seq = s.serialize_seq(Some(2 + c.not_null as usize + c.dropped as usize + any as usize))?;
         seq.serialize_element(&c.name)?;
         seq.serialize_element(&c.dtype)?;
@@ -258,7 +270,7 @@ impl Serialize for Stored {
 enum Rest {
     NotNull,
     Dropped,
-    Facts(Facts<String, Identity, Enum>),
+    Facts(Facts<String, Identity, Enum, About>),
 }
 
 impl<'de> Deserialize<'de> for Rest {
@@ -298,7 +310,7 @@ impl<'de> Deserialize<'de> for Col {
                         Rest::Dropped => c.dropped = true,
                         Rest::Facts(f) => {
                             c.id = f.id.unwrap_or_default();
-                            (c.stored, c.default, c.identity, c.held, c.labels, c.sql_type) = (f.stored, f.default, f.identity, f.held, f.labels, f.sql_type);
+                            (c.stored, c.default, c.identity, c.held, c.labels, c.sql_type, c.about) = (f.stored, f.default, f.identity, f.held, f.labels, f.sql_type, f.about.map(Box::new));
                         }
                     }
                 }
@@ -354,6 +366,7 @@ impl Stored {
                 held: m.sql_types.get(s).cloned(),
                 labels: m.enums.get(s).cloned(),
                 sql_type: m.logical_types.get(s).cloned(),
+                about: None,
             })
             .collect();
         let mut place = std::collections::HashMap::with_capacity(if m.shown.is_empty() { 0 } else { m.columns.len() });
@@ -392,7 +405,7 @@ impl Stored {
                     Some(n) => (n, Some(s)),
                     None => (s, None),
                 };
-                Col { id: i as u32 + 1, name, stored, dtype, sql_type, dropped: is_dropped, not_null: is_not_null, default, identity, held, labels }
+                Col { id: i as u32 + 1, name, stored, dtype, sql_type, dropped: is_dropped, not_null: is_not_null, default, identity, held, labels, about: None }
             })
             .collect();
         Stored { columns, order }
@@ -1277,6 +1290,7 @@ impl TableMeta {
                     identity: facts.and_then(|c| c.identity.clone()),
                     held: facts.and_then(|c| c.held.clone()),
                     labels: facts.and_then(|c| c.labels.clone()),
+                    about: facts.and_then(|c| c.about.clone()),
                 }
             })
             .collect();
@@ -1401,6 +1415,17 @@ pub async fn folder_of(lake: &Lake, t: &str) -> Result<String> {
 }
 pub fn seg_key(n: u64) -> String { format!("s/{n:020}") }
 pub fn producer_key(p: &str) -> String { format!("p/{p}") }
+
+/// The store's own records in the catalog (`records`): the log's segments and their inline data, each producer's mark,
+/// and the commit's numbers.
+pub const PREFIXES: &[crate::records::Prefix] = &[
+    crate::records::Prefix { prefix: "s/", owner: "store", holds: "the log's segments: each commit's rows and files, by number (seg_key)" },
+    crate::records::Prefix { prefix: "d/", owner: "store", holds: "a small segment's data, inside the catalog (data_key)" },
+    crate::records::Prefix { prefix: "p/", owner: "store", holds: "each producer's last sequence, for exactly-once (a job's, a feed's, a Kafka group's offsets)" },
+    crate::records::Prefix { prefix: "c", owner: "store", holds: "the last commit's number" },
+    crate::records::Prefix { prefix: "n", owner: "store", holds: "the next segment's number" },
+    crate::records::Prefix { prefix: QUIET, owner: "store", holds: "a commit's mark that a read sees nothing changed (retention's)" },
+];
 
 /// How long a producer's mark is kept after its last commit, from its name and the time `now` (ms; 0: kept for
 /// good, as every mark was before expiries). Three windows:
@@ -3719,6 +3744,7 @@ impl Catalog {
     /// A table's entry (`t/…`) as parsed, for a read that runs per query or request: see `parsed`.
     pub async fn meta(&self, key: &str) -> Result<Option<Arc<TableMeta>>> {
         let raw = if self.mirror.load(Relaxed) {
+            crate::metrics::add(&crate::metrics::CATALOG_READS, 1);
             self.overlay.lock().unwrap().get(key).and_then(|(_, v)| v.clone()) // (the overlay holds the whole catalog)
         } else {
             self.get_raw(key).await?
@@ -3749,6 +3775,11 @@ impl Catalog {
     }
 
     pub async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
+        crate::metrics::add(&crate::metrics::CATALOG_READS, 1); // (a record looked up, there or not: the write-set rule counts it)
+        self.get_raw_uncounted(key).await
+    }
+
+    async fn get_raw_uncounted(&self, key: &str) -> Result<Option<Bytes>> {
         if self.kv.is_writer() {
             return Ok(match key.starts_with("d/") {
                 // The leader answers from its in-memory catalog: committed writes only, never ones
@@ -3846,6 +3877,12 @@ impl Catalog {
     /// `scan_raw`, and the commit the entries are read as of (`at`): the lake as of commit `at`, which a page of a range
     /// is checked against (`kv`, `Remote::scan`). A mirror answers as of its last streamed commit; a view alone as of its own.
     pub async fn scan_raw_at(&self, from: &str, to: &str) -> Result<(BTreeMap<String, Bytes>, u64)> {
+        let got = self.scan_raw_at_uncounted(from, to).await?;
+        crate::metrics::add(&crate::metrics::CATALOG_READS, got.0.len() as u64); // (each record a scan read)
+        Ok(got)
+    }
+
+    async fn scan_raw_at_uncounted(&self, from: &str, to: &str) -> Result<(BTreeMap<String, Bytes>, u64)> {
         if from >= to {
             return Ok((BTreeMap::new(), self.at_now().await?));
         }
@@ -3906,6 +3943,12 @@ impl Catalog {
     /// (`scan_raw_at`'s `at`): one page of a range (`kv`). In memory it takes only those `n` (the overlay's range, filtered
     /// and `take`n), so keys `keep` refuses don't cost a page; without the whole catalog here, it reads all of the range.
     pub async fn scan_page(&self, from: &str, to: &str, n: usize, keep: impl Fn(&str) -> bool) -> Result<(Vec<(String, Bytes)>, u64)> {
+        let got = self.scan_page_uncounted(from, to, n, keep).await?;
+        crate::metrics::add(&crate::metrics::CATALOG_READS, got.0.len() as u64);
+        Ok(got)
+    }
+
+    async fn scan_page_uncounted(&self, from: &str, to: &str, n: usize, keep: impl Fn(&str) -> bool) -> Result<(Vec<(String, Bytes)>, u64)> {
         if from >= to {
             return Ok((Vec::new(), self.at_now().await?));
         }
@@ -4037,6 +4080,7 @@ impl Catalog {
     /// waiting (pipelined commits: one round trip no longer blocks the next).
     pub async fn write(&self, puts: Vec<(String, Vec<u8>)>, deletes: &[String]) -> Result<oneshot::Receiver<()>> {
         let (true, Some(writes)) = (self.kv.is_writer(), &self.writes) else { bail!("read-only node") };
+        crate::metrics::add(&crate::metrics::CATALOG_WRITES, (puts.len() + deletes.len()) as u64); // (records put or deleted)
         if self.frozen.load(Relaxed) && !crate::backup::may_write(puts.iter().map(|(k, _)| k).chain(deletes)) {
             return Err(crate::backup::refused(None)); // (whatever door a write came through: ADR-070)
         }
@@ -4383,7 +4427,6 @@ mod tests {
 
     /// A catalog its own node's stop closed answers an error, never a restart (invariant 300):
     /// taken for a fence, the write below would exec this test again.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closed_by_its_own_stop_is_no_fence() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-closed-{}", uuid::Uuid::new_v4()));
@@ -4400,7 +4443,6 @@ mod tests {
 
     /// A catalog closed under its node (a newer leader's fence) restarts that node by the lifecycle its lake was handed, never
     /// the process: of two nodes in one process (step 2's gate), the other is told nothing and goes on writing.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fence_restarts_the_node_its_catalog_was_opened_in_and_no_other() -> Result<()> {
         /// A node's lifecycle that writes down what it was told, and unwinds on a restart as a library's node does.
@@ -4446,7 +4488,6 @@ mod tests {
     /// e-tag a put or a head gave goes through, and the next with the e-tag that one gave too; an old e-tag, a
     /// missing object and two updates racing on one e-tag are refused as S3 refuses them; an update with an
     /// attribute is refused by name and changes nothing; creates and overwrites are as they were.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_folder_takes_conditional_overwrites() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-local-{}", uuid::Uuid::new_v4()));
@@ -4491,7 +4532,6 @@ mod tests {
 
     /// A table entry is parsed once for its bytes: the same bytes (in the same buffer or another) give the
     /// same parse, changed bytes a new one, and what is kept stays under its count and byte bounds.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_table_entry_is_parsed_once_per_version() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-parsed-{}", uuid::Uuid::new_v4()));
@@ -4530,7 +4570,6 @@ mod tests {
     /// entries, in other buffers, gives the same parses; changed bytes a new one; bad bytes an error; each entry
     /// is charged its parsed form too, within the bounds; and a sweep bigger than the cache leaves it as it was.
     /// Prints what a pass over 5,000 entries costs parsed and kept.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_segment_entry_is_parsed_once_per_version() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-segments-{}", uuid::Uuid::new_v4()));
@@ -4576,7 +4615,6 @@ mod tests {
 
     /// `recent_inline` answers a `d/` key that one of the last 64 commits wrote, and no other key: the
     /// frames are sent by hand, as the commit loop would send them, so no commit has to wait for it.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recent_inline_answers_the_last_64_commits() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-recent-{}", uuid::Uuid::new_v4()));
@@ -5235,6 +5273,31 @@ mod tests {
             let warm = best(rounds, &mut || { std::hint::black_box(m.to_logical(&b).unwrap().num_columns()); });
             println!("{what}, to_logical() of a batch of every stored column: {warm:.2} µs warm, the first entry");
         }
+    }
+
+    /// A column's *about* (`About`) is kept on its record: written with format 6's facts and read back, through a rename
+    /// and a drop, in a `logical()` copy and in a description. Format 5's fields leave it out: they have no place for it.
+    #[test]
+    fn a_columns_about_is_kept_on_its_record() {
+        let about: About = [("label".to_string(), serde_json::json!("Net revenue")), ("synonyms".to_string(), serde_json::json!(["sales", "turnover"]))].into();
+        let mut t = TableMeta::with_columns(vec![("a".into(), "Int64".into()), ("b".into(), "Float64".into()), ("c".into(), "Utf8".into())]).as_list();
+        t.edit(|l| {
+            for s in ["b", "c"] {
+                l.at(s).unwrap().about = Some(Box::new(about.clone()));
+            }
+        });
+        t.rename_column("b", "revenue");
+        t.drop_column("c");
+        let back: TableMeta = serde_json::from_slice(&json(&t)).unwrap();
+        assert_eq!(back.list(), t.list(), "format 6's list, read back");
+        assert_eq!([("b", true), ("c", true), ("a", false)].map(|(s, has)| back.col(s).unwrap().about.as_deref() == has.then_some(&about)), [true; 3], "through a rename and a drop");
+        assert_eq!(t.logical().col("revenue").and_then(|c| c.about.as_deref()), Some(&about), "SQL's copy");
+        let mut v = t.clone();
+        v.finish = Some(Finish { sql: String::new(), columns: vec![("revenue".into(), "Float64".into())] });
+        assert_eq!(v.described().col("revenue").and_then(|c| c.about.as_deref()), Some(&about), "a description");
+        let mut five = t.clone();
+        five.record.listed = false;
+        assert!(!String::from_utf8(json(&five)).unwrap().contains("synonyms"), "format 5's fields leave it out");
     }
 
     /// A list's `order` names columns by id, and an id is its place + 1 only as lists are written so far (the format writes

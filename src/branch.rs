@@ -18,6 +18,12 @@ use std::collections::BTreeMap;
 
 /// The catalog key of a branch's bases (`Bases`).
 pub const BASES: &str = "bs";
+
+/// A branch's records in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[
+    crate::records::Prefix { prefix: "pn/", owner: "branch", holds: "a branch's pin: the base's files it still reads (pin_key)" },
+    crate::records::Prefix { prefix: BASES, owner: "branch", holds: "the lakes a branch is made from" },
+];
 /// A pin is taken this long before its base's leader commits it: garbage is stamped by whichever
 /// leader made it, and a leader since may run a little behind on its clock.
 const MARGIN_MS: u64 = 60_000;
@@ -459,7 +465,7 @@ fn places(d: &Ddl) -> Result<()> {
     Ok(())
 }
 
-/// A user who isn't a superuser: its grants decide a branch or a drop (`Auth::allows` lets nothing
+/// A user who isn't a superuser: its grants decide a branch or a drop (`rights::may_run` lets nothing
 /// else of its through).
 async fn user_door(lake: &Lake, d: &mut Ddl, a: &crate::users::Access) -> Result<()> {
     if let Ddl::CreateDatabase { clone: Some(of), dir, .. } = d {

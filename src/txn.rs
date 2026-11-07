@@ -364,6 +364,16 @@ pub async fn command(app: &crate::app::App, word: &str, sql: &str) -> Result<(&'
     word_in(app, &s, word, sql).await
 }
 
+/// How the transaction word `word` (`control`'s) changes its session's transaction: BEGIN and ROLLBACK TO start one, every
+/// other end (COMMIT, ROLLBACK) ends one, and a savepoint word (SAVEPOINT, RELEASE) leaves it as it is.
+pub fn word_change(word: &str) -> Option<crate::answer::Txn> {
+    match word {
+        "BEGIN" | "ROLLBACK TO" => Some(crate::answer::Txn::Started),
+        "SAVEPOINT" | "RELEASE" => None,
+        _ => Some(crate::answer::Txn::Ended),
+    }
+}
+
 /// Flight SQL's own transaction actions (flight.rs): BeginTransaction begins the current session's transaction as the
 /// protocol's, and EndTransaction (`word` COMMIT or ROLLBACK) ends it as `command` would.
 pub async fn protocol(app: &crate::app::App, word: &str) -> Result<(&'static str, Option<String>)> {
@@ -1453,7 +1463,7 @@ async fn lock_select(app: &crate::app::App, (level, ro, snapshot): (Level, bool,
         return Err(crate::codes::coded("0A000", format!("{name} is a merge table: its rows add up as they're read, so there is no row to lock")));
     }
     ensure!(meta.ids, "{name} holds rows from before row ids (made before Pondra 0.19): copy it once and change the copy");
-    crate::auth::may_lock(&name)?; // (the right to UPDATE it: Postgres asks that of FOR UPDATE)
+    crate::rights::may_here(crate::rights::Action::Lock, crate::rights::Object::Table(&name))?; // (the right to UPDATE it: Postgres asks that of FOR UPDATE)
     let append = meta.key.is_empty();
     let cols = if append { vec![crate::text::ROW_ID.to_string()] } else { meta.key.clone() };
     let (n, table_name) = (cols.len(), name.as_str());

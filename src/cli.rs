@@ -599,8 +599,11 @@ async fn run() -> anyhow::Result<()> {
                     None => println!("{prefix}: not in the catalog"),
                 },
                 false => {
-                    for (k, v) in lake.cat.scan::<serde_json::Value>(&prefix, &format!("{prefix}\u{10ffff}")).await? {
-                        println!("{k} {v}");
+                    for (k, v) in lake.cat.scan_raw(&prefix, &format!("{prefix}\u{10ffff}")).await? {
+                        match serde_json::from_slice::<serde_json::Value>(&v) {
+                            Ok(v) => println!("{k} {v}"),
+                            Err(_) => println!("{k} ({} bytes)", v.len()), // (inline data, under every prefix's scan: binary)
+                        }
                     }
                 }
             }

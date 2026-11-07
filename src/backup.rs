@@ -22,6 +22,9 @@ use std::panic::AssertUnwindSafe;
 
 /// The catalog entry that makes a lake a backup.
 pub const KEY: &str = "bk";
+
+/// A backup's record in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: KEY, owner: "backup", holds: "the mark that makes a lake a backup" }];
 /// Where each run's catalog is kept (a restore of an earlier run reads it), and the mark of a run
 /// under way.
 const RUNS: &str = "_backups";

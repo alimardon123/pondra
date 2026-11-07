@@ -351,7 +351,7 @@ fn java_field(c: char, n: usize) -> Result<&'static str> {
 /// BigQuery's `SAFE_DIVIDE(a, b)`, a function in every session: `a / b`, NULL where `b` is 0 (either zero). It answers
 /// in the type BigQuery does, so it is typed by its arguments, which text alone doesn't know: two integers divide into a
 /// DOUBLE (BigQuery's FLOAT64, where Postgres's `/` keeps whole numbers), and anything else as `/` does, so a NUMERIC
-/// stays a NUMERIC (11-03 audit L8: it went through DOUBLE). The same cast, zero check and division in every plan
+/// stays a NUMERIC (11-03 audit L8: it went through DOUBLE), with `/`'s places (`divide.rs`). The same cast, zero check and division in every plan
 /// and every expression planned alone (a CHECK, a DEFAULT).
 pub fn register(ctx: &datafusion::prelude::SessionContext) {
     ctx.register_udf(divide::safe_divide());
@@ -385,12 +385,19 @@ mod divide {
         fn return_type(&self, args: &[DataType]) -> Result<DataType> {
             let [a, b] = args else { return exec_err!("safe_divide takes two values") };
             let (a, b) = halves(a, b)?;
-            BinaryTypeCoercer::new(&a, &Operator::Divide, &b).get_result_type()
+            match crate::divide::quotient_type(&a, &b, false) {
+                Some(t) => Ok(t), // (two DECIMALs: `/`'s places, `divide.rs`)
+                None => BinaryTypeCoercer::new(&a, &Operator::Divide, &b).get_result_type(),
+            }
         }
         fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
             let [a, b] = &args.args[..] else { return exec_err!("safe_divide takes two values") };
             let (to_a, to_b) = halves(&a.data_type(), &b.data_type())?;
             let (a, b) = (a.cast_to(&to_a, None)?, b.cast_to(&to_b, None)?);
+            let to = args.return_field.data_type();
+            if crate::divide::quotient_type(&to_a, &to_b, false).is_some() {
+                return crate::divide::divided(&a, &b, args.number_rows, to, true); // (NULL for a zero divisor and for an overflow, row by row)
+            }
             // (`=`'s comparison, which takes -0.0 as 0 too, where arrow's kernels compare bits)
             let zero = apply_cmp(Operator::Eq, &b, &ColumnarValue::Scalar(ScalarValue::new_zero(&to_b)?))?;
             let b = match (b, zero) {
@@ -398,7 +405,6 @@ mod divide {
                 (ColumnarValue::Scalar(_), ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)))) => ColumnarValue::Scalar(ScalarValue::try_from(&to_b)?),
                 (b, _) => b,
             };
-            let to = args.return_field.data_type();
             match apply(&a, &b, div) {
                 Ok(q) => q.cast_to(to, None), // (the type `/` gives: no change)
                 Err(DataFusionError::ArrowError(e, _)) if matches!(*e, ArrowError::ArithmeticOverflow(_)) => by_row(&a, &b, args.number_rows, to),
@@ -523,8 +529,10 @@ mod tests {
     async fn safe_divide_answers_in_the_type_its_arguments_say() {
         // (11-03 audit L8: a NUMERIC went through DOUBLE. Each row: what is divided, the type its answer must be, and
         // whether two integers' DOUBLE is meant; the answer's type and text are `/`'s, NULL where `b` is either zero;
-        // once over literals, folded, and once over a table's columns)
-        let ctx = datafusion::prelude::SessionContext::new();
+        // once over literals, folded, and once over a table's columns; `/` with Pondra's analyzer, so a DECIMAL quotient
+        // has `divide.rs`'s places)
+        let state = datafusion::execution::SessionStateBuilder::new().with_default_features().with_analyzer_rules(crate::optimize::analyzer_rules()).build();
+        let ctx = datafusion::prelude::SessionContext::new_with_state(state);
         register(&ctx);
         let rows = [
             ("7, 2", "Float64", true),

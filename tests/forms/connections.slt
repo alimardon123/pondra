@@ -1,0 +1,103 @@
+# Connections on every form (redesign step 4, piece 2): the `connections` extension's kind and statements (src/connect.rs),
+# listed, shown, described, granted and dropped by the core's own pondra.objects, SHOW CREATE, COMMENT ON and GRANT,
+# with no edit of their own. A definition is checked against its type; its secret is shown by name, never by value.
+statement ok
+CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://bucket/incoming')
+
+query T
+SHOW CREATE CONNECTION drop_zone
+----
+CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://bucket/incoming');
+
+statement error 42710 already exists
+CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://other')
+
+statement error 22023 this build's types are azure, delta, folder, gcs, iceberg, .*s3 or share
+CREATE CONNECTION shop TYPE postgres WITH (host = 'db')
+
+statement error 22023 has no option region: its options are url, secret
+CREATE CONNECTION b TYPE s3 WITH (url = 's3://b', region = 'eu')
+
+statement error 22023 needs url
+CREATE CONNECTION b TYPE s3
+
+statement error 42704 no secret k: make it first
+CREATE CONNECTION b TYPE s3 WITH (url = 's3://b', secret = k)
+
+statement error 42601 RENAME TO new_name
+ALTER CONNECTION drop_zone
+
+statement ok
+ALTER CONNECTION drop_zone SET (url = 's3://bucket/later')
+
+statement ok
+COMMENT ON CONNECTION drop_zone IS 'incoming'
+
+statement ok
+ALTER CONNECTION drop_zone RENAME TO landing
+
+query TTT
+SELECT name, comment, definition FROM pondra.objects WHERE kind = 'connection'
+----
+landing incoming CREATE CONNECTION landing TYPE s3 WITH (url = 's3://bucket/later')
+
+statement ok
+CREATE ROLE analyst
+
+statement ok
+GRANT READ ON CONNECTION landing TO analyst
+
+query TTT
+SELECT privilege, on_kind, on_name FROM pondra.grants WHERE grantee = 'analyst'
+----
+READ connection landing
+
+statement error 0LP01 USAGE: a connection's privileges are READ and WRITE
+GRANT USAGE ON CONNECTION landing TO analyst
+
+statement ok
+DROP CONNECTION landing
+
+query I
+SELECT count(*) FROM pondra.objects WHERE kind = 'connection'
+----
+0
+
+statement error 42704 no connection landing
+DROP CONNECTION landing
+
+statement ok
+DROP CONNECTION IF EXISTS landing
+
+# A type for tables is its own extension's entry (piece 3: read_delta, catalogs, kafka_client, sharing_client), and
+# ATTACH reads the same entries: its TYPE list and each type's options are CREATE CONNECTION's.
+statement ok
+CREATE CONNECTION tables TYPE delta WITH (url = 's3://bucket/tables', read_only = true)
+
+query T
+SHOW CREATE CONNECTION tables
+----
+CREATE CONNECTION tables TYPE delta WITH (read_only = true, url = 's3://bucket/tables');
+
+statement error 22023 has no option endpoint: secret, read_only \(endpoint is TYPE iceberg's\)
+ATTACH 's3://bucket/tables' AS t (TYPE delta, ENDPOINT 'https://catalog')
+
+statement error 22023 ATTACH … \(TYPE s3\): delta, iceberg, kafka or share
+ATTACH 's3://bucket/tables' AS t (TYPE s3)
+
+statement ok
+DROP CONNECTION tables
+
+# A connection's files are reached by its name, '@name/…' (piece 4): a name that isn't a connection, or one that holds
+# tables, is refused by name, on every form.
+statement ok
+CREATE CONNECTION shop TYPE delta WITH (url = 's3://bucket/tables')
+
+statement error no connection nope: '@nope/…' reads a connection's files
+SELECT * FROM '@nope/x.csv'
+
+statement error connection shop holds tables, not files
+SELECT * FROM '@shop/x.parquet'
+
+statement ok
+DROP CONNECTION shop
