@@ -326,6 +326,16 @@ pub(crate) async fn stopped(stdin: bool) {
     tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = closed => {} }
 }
 
+/// `pondra serve`'s node failed (`node::stop`, which said why): it is stopped, `stop` (a leader's term given back, so
+/// the next node leads at once, invariant 210), within 30 s as a library's host bounds it, and the process ends with 1.
+async fn failed_stop(stop: impl std::future::Future<Output = ()>) -> ! {
+    if tokio::time::timeout(std::time::Duration::from_secs(30), stop).await.is_err() {
+        eprintln!("the node's stop took over 30 s: it ends now");
+    }
+    crate::memory::leave(); // (what this process made goes first: `process::exit` runs no destructor)
+    std::process::exit(1)
+}
+
 /// Does a node listen beyond this machine: `--addr`, or `--pg`, `--kafka` or `--flight` when given, on
 /// anything but 127.0.0.1, localhost or [::1]?
 fn on_network(addr: &str, others: [&Option<String>; 3]) -> bool {
@@ -521,6 +531,9 @@ async fn run() -> anyhow::Result<()> {
             // SIGTERM: `idle.rs`)
             let quiet = env::secs("PONDRA_IDLE_EXIT_SECS");
             let mut moves = node::mover(); // (a lake moving to another place: `memory::set_location`)
+            // (the node's own work failing, `node::stop`: the node is stopped as on SIGTERM but with no drain, as a library's
+            // host stops it, so a leader gives up its term and the next node leads at once; then the process ends with 1)
+            let mut failures = node::supervise();
             let mut options = node::Options { dir, listen: addr, advertise, start: node::Start { reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, python, auth }, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest: None };
             loop {
                 let held = Arc::new(node::Held::default()); // (what the start takes, given back by a stop: `node.rs`)
@@ -539,6 +552,9 @@ async fn run() -> anyhow::Result<()> {
                         crate::memory::leave();
                         std::process::exit(0);
                     }
+                    Some(node::Event::Failed(_)) = failures.recv() => {
+                        failed_stop(held.stop()).await;
+                    }
                 };
                 let mut idle = Box::pin(node.idle(quiet.as_secs_f64())); // (this node's uses, counted from its start)
                 tokio::select! {
@@ -555,9 +571,13 @@ async fn run() -> anyhow::Result<()> {
                     // The lake moves: its requests answered and the node stopped, its objects settled on the
                     // target, and the node started again there, on the same port. A move that fails leaves
                     // the lake in memory: the node starts again on it, on the same port, and says why.
+                    Some(node::Event::Failed(_)) = failures.recv() => {
+                        failed_stop(node.stop()).await;
+                    }
                     Some(m) = moves.recv() => {
                         node.drain().await;
                         node.stop().await;
+                        while failures.try_recv().is_ok() {} // (what the stopped node's work said is no failure of the next one's)
                         if let Err(e) = crate::memory::settle(&m).await {
                             crate::memory::move_failed(&m.to, &e);
                             continue;
