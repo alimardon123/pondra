@@ -1414,6 +1414,17 @@ pub async fn folder_of(lake: &Lake, t: &str) -> Result<String> {
 pub fn seg_key(n: u64) -> String { format!("s/{n:020}") }
 pub fn producer_key(p: &str) -> String { format!("p/{p}") }
 
+/// The store's own records in the catalog (`records`): the log's segments and their inline data, each producer's mark,
+/// and the commit's numbers.
+pub const PREFIXES: &[crate::records::Prefix] = &[
+    crate::records::Prefix { prefix: "s/", owner: "store", holds: "the log's segments: each commit's rows and files, by number (seg_key)" },
+    crate::records::Prefix { prefix: "d/", owner: "store", holds: "a small segment's data, inside the catalog (data_key)" },
+    crate::records::Prefix { prefix: "p/", owner: "store", holds: "each producer's last sequence, for exactly-once (a job's, a feed's, a Kafka group's offsets)" },
+    crate::records::Prefix { prefix: "c", owner: "store", holds: "the last commit's number" },
+    crate::records::Prefix { prefix: "n", owner: "store", holds: "the next segment's number" },
+    crate::records::Prefix { prefix: QUIET, owner: "store", holds: "a commit's mark that a read sees nothing changed (retention's)" },
+];
+
 /// How long a producer's mark is kept after its last commit, from its name and the time `now` (ms; 0: kept for
 /// good, as every mark was before expiries). Three windows:
 /// - the named window, `copy::retention_ms` (64 days): a job a client named (`POST /sql?job=`,

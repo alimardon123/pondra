@@ -838,6 +838,9 @@ async fn columns_of(lake: &Lake, query: &str, positional: bool, cols: &[String],
     Ok((given, names))
 }
 
+/// COPY's records in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "ld/", owner: "copy", holds: "each file a COPY INTO loaded, by its folder, so it loads once (ld_key)" }];
+
 fn ld_key(folder: &str, file: &str) -> String {
     let hash = crate::crypto::sha256(file.as_bytes());
     format!("ld/{folder}/{}", crate::text::hex(&hash))

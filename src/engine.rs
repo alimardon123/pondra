@@ -100,6 +100,11 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
     register: |r| {
         r.section_mut::<Functions>().add("engine", own);
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "functions", columns: FUNCTION_COLUMNS, rows: functions });
+        #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)
+        for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,
+                  crate::runs::PREFIXES, crate::tasks::PREFIXES, crate::users::PREFIXES, crate::views::PREFIXES] {
+            r.section_mut::<crate::records::Prefixes>().add(p);
+        }
     },
 };
 

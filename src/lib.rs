@@ -118,6 +118,7 @@ mod rules;
 #[cfg(feature = "lake")] mod bridge;
 #[cfg(feature = "lake")] mod rerun;
 #[cfg(feature = "lake")] mod replica;
+#[cfg(feature = "lake")] mod records; // (the catalog's record scheme: every prefix, and whose it is)
 #[cfg(feature = "lake")] mod auth;
 #[cfg(feature = "lake")] mod rights; // (what a principal may do, decided in one place: step 6)
 #[cfg(feature = "lake")] mod budget;
@@ -283,6 +284,10 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &matcher::MATCH_RECOGNIZE,
         #[cfg(feature = "lake")]
         &ai::AI,
+        #[cfg(feature = "lake")]
+        &apply::PROJECT,
+        #[cfg(feature = "lake")]
+        &udf::UDF,
     ];
     BUILT_IN
 }
