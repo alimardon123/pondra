@@ -379,7 +379,7 @@ pub async fn planned(ctx: &SessionContext, sql: &str) -> anyhow::Result<LogicalP
             None => (None, false),
         },
     };
-    if let (Some(stmt), true) = (&stmt, kept && one_parse_checked()) {
+    if let (Some(stmt), true) = (&stmt, kept && crate::parsed::checked()) {
         datafusions_parse(&state, sql, stmt)?;
     }
     match stmt {
@@ -387,14 +387,6 @@ pub async fn planned(ctx: &SessionContext, sql: &str) -> anyhow::Result<LogicalP
         None => state.create_logical_plan(sql).await,
     }
     .map_err(|e| crate::pattern::reworded(e, sql))
-}
-
-/// Whether the front's parse is checked against DataFusion's own (`datafusions_parse`) where it is planned from: in a
-/// debug build, and in a node started with `PONDRA_TEST_ONE_PARSE` (the gates' runs: DataFusion's SQL tests, TPC-H,
-/// TPC-DS, the random queries, the harness).
-fn one_parse_checked() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| cfg!(debug_assertions) || crate::env::is_set("PONDRA_TEST_ONE_PARSE"));
-    *ON
 }
 
 /// `kept`, the front's parse of `sql`, is the statement DataFusion parses `sql` to with the session's settings: an error
@@ -692,6 +684,46 @@ mod tests {
         assert!(crate::parsed::generic(&sql).is_ok());
         let plan = planned(&generic, &sql).await.unwrap();
         assert_eq!(plan, generic.state().create_logical_plan(&sql).await.unwrap());
+    }
+
+    /// A tree the front rewrote is kept as the parse of the text it prints to (`text::text_kept`), so the engine plans it
+    /// rather than parse that text: the same statements DataFusion's parse of the text gives (the one-parse check), and
+    /// the same plan. A tree printed with a fix for the reader (a doubled minus) parses back to another tree: not kept.
+    #[tokio::test]
+    async fn a_tree_the_front_rewrote_is_planned_from_itself() {
+        use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, parser::Parser};
+        let ctx = session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        let batch = RecordBatch::try_from_iter(vec![("x", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef)]).unwrap();
+        ctx.register_batch("t", batch).unwrap();
+        let state = ctx.state();
+        // (a rewrite as the front makes one: a FROM-first query given its `SELECT *`, a projection aliased)
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, "FROM t WHERE x > 1 -- kept").unwrap_or_else(|_| Parser::parse_sql(&GenericDialect {}, "SELECT * FROM t WHERE x > 1 -- kept").unwrap());
+        let ast::Statement::Query(q) = &mut stmts[0] else { panic!("a query") };
+        let ast::SetExpr::Select(s) = q.body.as_mut() else { panic!("a select") };
+        s.projection = vec![ast::SelectItem::ExprWithAlias { expr: ast::Expr::Nested(Box::new(ast::Expr::BinaryOp { left: Box::new(ast::Expr::Identifier("x".into())), op: ast::BinaryOperator::Plus, right: Box::new(ast::Expr::Value(ast::Value::Number("1".into(), false).into())) })), alias: ast::Ident::with_quote('"', "x + 1") }];
+        // (the kept texts are the last few of the process's looks, which other tests run beside this one: kept again until
+        // it is the tree that is found)
+        let (text, kept) = (0..20)
+            .find_map(|_| {
+                let text = crate::text::text_kept(stmts.clone());
+                parsed_query(&text).map(|kept| (text, kept))
+            })
+            .expect("kept as its text's parse");
+        assert_eq!(text, r#"SELECT (x + 1) AS "x + 1" FROM t WHERE x > 1"#);
+        assert_eq!(kept, datafusion::sql::parser::Statement::Statement(Box::new(stmts[0].clone())));
+        assert_eq!(Parser::parse_sql(&GenericDialect {}, &text).unwrap(), stmts, "it parses back to itself");
+        datafusions_parse(&state, &text, &kept).unwrap();
+        assert_eq!(planned(&ctx, &text).await.unwrap(), state.create_logical_plan(&text).await.unwrap());
+        // (`- -3` is written `-(-3)`, which parses to another tree: the text is parsed again)
+        let minus = ast::Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr: Box::new(ast::Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr: Box::new(ast::Expr::Value(ast::Value::Number("3".into(), false).into())) }) };
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, "SELECT 0 AS v FROM t -- minus").unwrap();
+        let ast::Statement::Query(q) = &mut stmts[0] else { panic!("a query") };
+        let ast::SetExpr::Select(s) = q.body.as_mut() else { panic!("a select") };
+        s.projection = vec![ast::SelectItem::ExprWithAlias { expr: minus, alias: "v".into() }];
+        let text = crate::text::text_kept(stmts);
+        assert_eq!(text, "SELECT -(-3) AS v FROM t");
+        assert!(crate::parsed::already(&text).is_none(), "not kept: {text}");
+        assert_eq!(planned(&ctx, &text).await.unwrap(), state.create_logical_plan(&text).await.unwrap());
     }
 
     /// `EXPLAIN ANALYZE` is answered by `collect` (`analyzed`, this file's copy of DataFusion's `create_output_batch`) and
