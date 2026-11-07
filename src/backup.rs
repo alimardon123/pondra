@@ -477,8 +477,14 @@ async fn restore_into(lake: &Lake, t: &Take) -> Result<Value> {
     let mut puts = carried(&cat);
     puts.push(("n".into(), json(&run.next)));
     puts.push(("b".into(), json(&run.block)));
+    // (never below the lake's own: a format moves one way, `format::set`. A restore's new place is led by `pondra lead`,
+    // which doesn't raise it, so it is at 0 here and takes the backup's mark. A leader that raised it first, `format::alone`,
+    // would have its entries written as lists, `store::listed`, and a lower mark would then let a node of that format fail
+    // on each table instead of refusing the lake by name)
     if let Some(f) = backup.cat.get::<crate::format::Stamp>("format").await? {
-        puts.push(("format".into(), json(&f)));
+        if f.format > crate::format::of(&lake.cat).await?.format {
+            puts.push(("format".into(), json(&f)));
+        }
     }
     lake.cat.start_after(run.commit).await;
     lake.cat.commit(puts, &[]).await?;
