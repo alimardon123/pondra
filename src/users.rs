@@ -22,6 +22,12 @@ pub fn user_key(name: &str) -> String { format!("u/{name}") }
 pub const KEYS: &str = "z/auth"; // (the lake's own keys: sessions' signing key, and the nodes' key; `k/` is streaming tasks')
 /// Set once a lake has been served with tokens (S26, invariant 379): a node started by hand without them is not open.
 const SIGNED: &str = "z/signed";
+
+/// The users' own records beside their kinds' (`records`): the lake's keys.
+pub const PREFIXES: &[crate::records::Prefix] = &[
+    crate::records::Prefix { prefix: KEYS, owner: "users", holds: "the lake's own keys: sessions' signing key, and the nodes' key" },
+    crate::records::Prefix { prefix: SIGNED, owner: "users", holds: "set once the lake has been served with tokens" },
+];
 /// The names the three tokens sign in as over Postgres and Kafka: no user may take them.
 pub const BUILT_IN: [&str; 3] = ["admin", "writer", "reader"];
 
@@ -96,6 +102,13 @@ pub enum On {
     Lake,           // every table of the lake
     Secret(String),
     Database(String), // another database attached here: CLONE through its attachment (ADR-058)
+    Object { kind: String, name: String }, // an object of a kind an extension adds (`objects::Kind::shown`): its own privileges
+}
+
+/// The kind an extension adds that `word` names, when its objects take grants (`GRANT READ ON CONNECTION shop`): the core's
+/// kinds have their own arms above.
+fn granted_kind(word: &str) -> Option<&'static crate::objects::Kind> {
+    crate::objects::all_kinds().find(|k| k.shown.is_some() && !k.privileges.is_empty() && k.name == word)
 }
 
 /// What a statement about users changes: the leader carries it out (`ddl::Ddl::Users`). A password
@@ -142,7 +155,7 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     }
     Some(match parse(words) {
         Ok(change) => Stmt::Ddl(vec![crate::ddl::Ddl::Users(change)]),
-        Err(e) => Stmt::Invalid(e.to_string()),
+        Err(e) => Stmt::of_error(&e, e.to_string()), // (a coded refusal keeps its code: `0LP01` for a privilege its kind lacks)
     })
 }
 
@@ -375,14 +388,32 @@ fn grant(w: &mut Words, grant: bool) -> Result<Change> {
         let roles = list.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
         return Ok(if grant { Change::GrantRole { roles, to: users } } else { Change::RevokeRole { roles, from: users } });
     }
+    let kind = w.peek_word().and_then(|k| granted_kind(&k)); // (`ON CONNECTION shop`: its kind's privileges, below)
     for p in list {
         match p.as_str() {
+            "all" if kind.is_some() => privileges.extend(kind.iter().flat_map(|k| k.privileges.iter().map(|p| p.to_lowercase()))),
+            p if kind.is_some() => privileges.push(p.to_string()),
             "all" => privileges.extend(["select", "insert", "update", "delete"].map(String::from)),
             p if PRIVILEGES.contains(&p) => privileges.push(p.to_string()),
             p => bail!("{p}: the privileges are SELECT, INSERT, UPDATE, DELETE, ALL (on tables), USAGE (on secrets), CLONE (on a database or a schema) and APPLY (on a database)"),
         }
     }
-    let on = if w.is("schema") {
+    let on = if let Some(k) = kind {
+        w.next(); // (its kind's word)
+        let name = w.name()?;
+        let given: Vec<String> = k.privileges.iter().map(|p| p.to_lowercase()).collect();
+        if let Some(p) = privileges.iter().find(|p| !given.contains(p)) {
+            return Err(crate::codes::coded("0LP01", format!("{}: a {}'s privileges are {}", p.to_uppercase(), k.name, k.privileges.join(" and "))));
+        }
+        ensure!(columns.is_empty(), "columns are named for SELECT on a table: GRANT SELECT (a, b) ON t TO r");
+        let to = if grant { "to" } else { "from" };
+        w.expect(to)?;
+        role_word(w);
+        let who = w.names()?.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
+        w.done()?;
+        let on = On::Object { kind: k.name.to_string(), name };
+        return Ok(if grant { Change::Grant { privileges, on, columns, to: who, database } } else { Change::Revoke { privileges, on, columns, from: who, database } });
+    } else if w.is("schema") {
         On::Schema(w.name()?)
     } else if w.is("secret") {
         On::Secret(w.name()?)
@@ -694,6 +725,13 @@ async fn resolved(lake: &Lake, on: On) -> Result<On> {
         }
         On::Lake => On::Lake,
         On::Database(d) => On::Database(d), // (checked by `on_database`, where the grant comes in)
+        On::Object { kind, name } => {
+            let k = granted_kind(&kind).with_context(|| format!("{kind}: this node's build has no extension that adds it"))?;
+            if lake.cat.get::<Value>(&format!("{}{name}", k.prefix)).await?.is_none() {
+                return Err(crate::codes::coded("42704", format!("no {kind} {name}")));
+            }
+            On::Object { kind, name }
+        }
     })
 }
 
@@ -1136,6 +1174,9 @@ pub struct Access {
 }
 
 impl Access {
+    /// One with these grants and no roles (the rights tests').
+    #[cfg(test)]
+    pub fn granted(grants: Vec<Grant>) -> Access { Access { grants, ..Default::default() } }
     /// The columns of `table` (as the catalog names it) it may use for `privilege`: None, none;
     /// Some(None), every column; Some(Some(these)).
     pub fn columns(&self, privilege: &str, table: &str) -> Option<Option<HashSet<String>>> {
@@ -1166,6 +1207,11 @@ impl Access {
         some.map(Some)
     }
     pub fn secret(&self, name: &str) -> bool { self.grants.iter().any(|g| g.privilege == "usage" && g.on == On::Secret(name.to_string())) }
+    /// Whether it may use the object `name` of an extension's `kind` for `privilege` (`READ` on a connection), granted to it,
+    /// a role of its or public.
+    pub fn may_use(&self, kind: &str, name: &str, privilege: &str) -> bool {
+        self.grants.iter().any(|g| g.privilege.eq_ignore_ascii_case(privilege) && matches!(&g.on, On::Object { kind: k, name: n } if k == kind && n == name))
+    }
     /// The schemas this user may clone a branch of, or pin one for (ADR-058): None, no CLONE grant;
     /// Some(none), every schema (CLONE ON DATABASE); Some(these), CLONE ON SCHEMA.
     pub fn clones(&self) -> Option<Vec<String>> {
@@ -1380,7 +1426,7 @@ fn read_only(r: &crate::store::Reach, ns: &str) -> Result<()> {
 pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::write::Stmt) -> Result<()> {
     across(other, ns).await?;
     let Some(a) = crate::auth::limited() else { return Ok(()) };
-    let (table, privileges) = (format!("{ns}.{table}"), crate::auth::needs(stmt).1);
+    let (table, privileges) = (format!("{ns}.{table}"), crate::rights::asks(stmt).1.into_iter().filter_map(crate::rights::Action::privilege).collect::<Vec<_>>());
     match privileges.iter().find(|p| a.named(p, &table).is_none()) {
         Some(p) => bail!("permission denied: {} on {table}, another database's table: GRANT {} ON {table} TO … (ON ALL TABLES and ON SCHEMA are this database's)", p.to_uppercase(), p.to_uppercase()),
         None => Ok(()),
@@ -1496,8 +1542,8 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
     let grants = RecordBatch::try_from_iter(vec![
         ("grantee", g(&|n, _| Some(n.clone()))),
         ("privilege", g(&|_, g| Some(g.privilege.to_uppercase()))),
-        ("on_kind", g(&|_, g| Some(match &g.on { On::Table(_) => "table", On::Schema(_) => "schema", On::Lake if g.of_database() => "database", On::Lake => "lake", On::Secret(_) => "secret", On::Database(_) => "database" }.into()))),
-        ("on_name", g(&|_, g| match &g.on { On::Table(n) | On::Schema(n) | On::Secret(n) | On::Database(n) => Some(n.clone()), On::Lake if g.of_database() => Some(here.clone()), On::Lake => None })),
+        ("on_kind", g(&|_, g| Some(match &g.on { On::Table(_) => "table", On::Schema(_) => "schema", On::Lake if g.of_database() => "database", On::Lake => "lake", On::Secret(_) => "secret", On::Database(_) => "database", On::Object { kind, .. } => kind }.into()))),
+        ("on_name", g(&|_, g| match &g.on { On::Table(n) | On::Schema(n) | On::Secret(n) | On::Database(n) | On::Object { name: n, .. } => Some(n.clone()), On::Lake if g.of_database() => Some(here.clone()), On::Lake => None })),
         ("columns", g(&|_, g| Some(g.columns.join(", ")).filter(|c| !c.is_empty()))),
     ])?;
     let mem = |b: RecordBatch| -> Result<Arc<dyn datafusion::catalog::TableProvider>> { Ok(Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };

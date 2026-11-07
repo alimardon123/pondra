@@ -6,7 +6,7 @@
 //! ([`Load`]). SQL's writes come with step 8.
 
 use crate::app::App;
-use crate::auth::{Principal, Role};
+use crate::auth::Principal;
 use crate::log::{Ack, Src};
 use crate::rules::{How, Rows, Shaped};
 use crate::store::TableMeta;
@@ -36,29 +36,21 @@ impl From<Refused> for anyhow::Error {
     }
 }
 
-/// May `who` write rows into `table` (as the catalog names it)? The one place a row door asks: before it reads a row
-/// against the table's columns, and again for each batch, so a grant taken back stops a load at its next batch (step
-/// 6's `may` takes this place). A token that writes, or a user with the table's INSERT grant, and never a system table
-/// (`auth::check_rows`); with the table's entry, UPDATE too for a keyed table (its rows replace their keys'), and
-/// DELETE when `deletes` (rows marked `_deleted`, or a COPY that names that column): S11. `who` None is the node's
-/// own work, or a door that is in the caller's scope already.
+/// May `who` write rows into `table` (as the catalog names it)? What a row door asks: before it reads a row against the
+/// table's columns, and again for each batch, so a grant taken back stops a load at its next batch. INSERT
+/// (`rights::may`: a token that writes, or a user with the grant, and never a system table) and, with the table's
+/// entry, what its rows change (`rights::changing`): UPDATE for a keyed table (its rows replace their keys'), and
+/// DELETE when `deletes` (rows marked `_deleted`, or a COPY that names that column). `who` None is the request being
+/// served's (`rights::may_here`).
 pub fn may(who: Option<&Principal>, table: &str, meta: Option<&TableMeta>, deletes: bool) -> Result<()> {
-    let ask = || -> Result<()> {
-        if let Some(p) = crate::auth::current() {
-            if p.access.is_none() && p.role < Role::Write {
-                return Err(crate::codes::coded("42501", "this token may not write")); // (as `Auth::allows` says it)
-            }
-        }
-        crate::auth::check_rows(table)?;
-        match meta {
-            Some(meta) => crate::auth::check_changes(table, !meta.key.is_empty(), deletes),
-            None => Ok(()),
-        }
+    use crate::rights::{Action, Object};
+    let ask = |action| match who {
+        Some(who) => Ok(crate::rights::may(who, action, Object::Table(table))?),
+        None => crate::rights::may_here(action, Object::Table(table)),
     };
-    match who {
-        Some(w) => crate::auth::WHO.sync_scope(w.clone(), ask),
-        None => ask(),
-    }
+    ask(Action::Insert)?;
+    let Some(meta) = meta else { return Ok(()) };
+    crate::rights::changing(!meta.key.is_empty(), deletes).try_for_each(ask)
 }
 
 /// One load at a row door (a COPY FROM STDIN, a DoPut's stream, a produce's partition), as the audit log keeps it: one

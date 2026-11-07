@@ -323,6 +323,37 @@ impl Stmt {
         }
     }
 
+    /// The kind an answer to this write says it was: Postgres's command tag words for it (`INSERT 0 3`, `UPDATE 2`,
+    /// `SELECT 5` for a CREATE TABLE … AS, `CREATE VIEW`, `DROP TABLE`, `ALTER TABLE`: what clients show, and dbt logs).
+    pub fn kind(&self, sql: &str) -> crate::answer::Kind {
+        use crate::answer::Kind;
+        let words: Vec<String> = first_word(sql).split_whitespace().take(6).map(|w| w.to_uppercase()).collect();
+        match self {
+            Stmt::Insert(..) | Stmt::InsertInto(..) => return Kind::new("INSERT"),
+            Stmt::Update(..) => return Kind::new("UPDATE"),
+            Stmt::Delete(..) if words.first().is_some_and(|w| w == "TRUNCATE") => return Kind::new("TRUNCATE TABLE"),
+            Stmt::Delete(..) => return Kind::new("DELETE"),
+            Stmt::Merge(_) if words.first().is_some_and(|w| w == "MERGE") => return Kind::new("MERGE"),
+            Stmt::Merge(_) if words.first().is_some_and(|w| w == "INSERT") => return Kind::new("INSERT"),
+            Stmt::Merge(_) => return Kind::new(words.first().cloned().unwrap_or_default()),
+            Stmt::Create(c) if c.query.is_some() => return Kind::new("SELECT"),
+            _ => {}
+        }
+        let skip = ["OR", "REPLACE", "TEMP", "TEMPORARY", "UNLOGGED", "GLOBAL", "LOCAL", "IF", "NOT", "EXISTS"];
+        match words.first().map(String::as_str) {
+            Some(verb @ ("CREATE" | "DROP" | "ALTER")) => {
+                let mut rest = words[1..].iter().filter(|w| !skip.contains(&w.as_str()));
+                match rest.next().map(String::as_str) {
+                    Some("MATERIALIZED") => Kind::new(format!("{verb} MATERIALIZED VIEW")),
+                    Some(obj) => Kind::new(format!("{verb} {obj}")),
+                    None => Kind::new(verb.to_string()),
+                }
+            }
+            Some(w) => Kind::new(w.to_string()),
+            None => Kind::new("OK"),
+        }
+    }
+
     /// The table it writes.
     pub fn table(&self) -> String {
         match self {
@@ -484,6 +515,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     }
     if let Some(s) = crate::extension::write(sql) {
         return Some(s); // (INSTALL name FROM a file or URL, and UNINSTALL: `extension.rs`)
+    }
+    if let Some(s) = crate::statements::matched(sql) {
+        return Some(s); // (an extension's statement, by its words: the registry's statements section, read here alone)
     }
     // OR REPLACE where replacing one would lose what it holds: refused, saying why.
     static NO_REPLACE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*CREATE\s+OR\s+REPLACE\s+(SCHEMA|DATABASE|USER|ROLE|SHARE|RECIPIENT)\b").expect("a regex"));

@@ -21,6 +21,8 @@ crate::per_node!(pub static OBJECT_WRITES: AtomicU64 = AtomicU64::new(0)); // ob
 crate::per_node!(pub static OBJECT_LISTS: AtomicU64 = AtomicU64::new(0)); // …lists…
 crate::per_node!(pub static OBJECT_DELETES: AtomicU64 = AtomicU64::new(0)); // …deletes…
 crate::per_node!(pub static OBJECT_READS: AtomicU64 = AtomicU64::new(0)); // …and reads (GET and HEAD)
+crate::per_node!(pub static CATALOG_READS: AtomicU64 = AtomicU64::new(0)); // catalog records this node read (a lookup, there or not, or each a scan gave)…
+crate::per_node!(pub static CATALOG_WRITES: AtomicU64 = AtomicU64::new(0)); // …and put or deleted (the write-set rule: designs/redesign/redesign.md §4)
 crate::per_node!(pub static SPILLED: AtomicU64 = AtomicU64::new(0)); // shuffle bytes written to this node's disk
 crate::per_node!(pub static SKEW: AtomicU64 = AtomicU64::new(0)); // the worst bucket/average seen in a shuffle, x100
 crate::per_node!(pub static SKEW_SPLITS: AtomicU64 = AtomicU64::new(0)); // hot partitions of shuffled joins shared out
@@ -106,6 +108,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("shuffled_queries_total", "counter", "…of them with a shuffle", &one(get(&SHUFFLED)));
     metric("ranged_queries_total", "counter", "…of them with their tables sliced by a key's ranges", &one(get(&RANGED)));
     metric("files_scanned_total", "counter", "Parquet files queries read", &one(get(&FILES_SCANNED)));
+    metric("catalog_records_total", "counter", "catalog records this node read and wrote", &[("{op=\"read\"}".to_string(), get(&CATALOG_READS)), ("{op=\"write\"}".to_string(), get(&CATALOG_WRITES))]);
     metric("files_skipped_total", "counter", "Parquet files queries skipped by min/max, unopened", &one(get(&FILES_SKIPPED)));
     let requests = [("write", &OBJECT_WRITES), ("list", &OBJECT_LISTS), ("delete", &OBJECT_DELETES), ("read", &OBJECT_READS)].map(|(op, c)| (format!("{{op=\"{op}\"}}"), get(c)));
     metric("object_requests_total", "counter", "requests this process made of its bucket, past the SSD tier: writes (a multipart upload's start, parts and end each one), lists, deletes and reads, as a bucket bills and rate-limits them", &requests);

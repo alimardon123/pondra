@@ -54,6 +54,7 @@ log catalog
 manifest catalog
 members catalog
 objects catalog
+records catalog
 replica catalog
 scan catalog
 sketch catalog
@@ -67,6 +68,7 @@ app engine
 asof engine
 audit engine
 auth engine
+rights engine
 authored engine
 avg engine
 branch engine
@@ -81,6 +83,7 @@ defaults engine
 dialect_fns engine
 dialect_stmts engine
 diff engine
+divide engine
 engine engine
 expander engine
 explain engine
@@ -115,6 +118,7 @@ locks engine
 median engine
 multiply engine
 once engine
+one_row engine
 oom engine
 optimize engine
 or_ranges engine
@@ -143,6 +147,8 @@ skew engine
 spill engine
 spmd engine
 statement engine
+statements engine
+connections catalog
 string_agg engine
 sys engine
 tasks engine
@@ -160,6 +166,7 @@ zeros_in engine
 
 # extensions, built in
 ai extensions:ai
+connect extensions:connections
 apply extensions:project
 git extensions:project
 status extensions:project

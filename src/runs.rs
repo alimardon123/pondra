@@ -453,6 +453,9 @@ impl Tick {
 pub fn task_key(name: &str) -> String { format!("j/{name}") }
 fn tick_key(name: &str) -> String { format!("jt/{name}") }
 
+/// The tasks' runs in the catalog (`records`), beside the task kind's `j/`.
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "jt/", owner: "runs", holds: "a task's last tick: when it last ran (tick_key)" }];
+
 /// `what`, signed with the key of the program that started this process's node on `lake` (`Lake::owner_key`), as hex;
 /// None when no program did. The lake's URL is signed too, so a mark copied into a restored or branched lake holds there
 /// for no one. A task's owner and a tick's are kept so (invariant 260).
@@ -635,7 +638,7 @@ async fn values(app: &App, task: &Task, given: HashMap<String, serde_json::Value
 /// claims a tick for it now (`Ddl::ExecuteTask`).
 pub async fn execute(app: &App, name: String, args: Vec<(String, String)>, who: Who) -> Result<Outcome> {
     let asked = |params: HashMap<String, serde_json::Value>| crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::ExecuteTask { name: name.clone(), params }]);
-    app.auth.allows(who.role, &asked(HashMap::new()))?; // (before its values: a caller who may not run it runs none of their queries)
+    crate::rights::may_run(who.role, &asked(HashMap::new()))?; // (before its values: a caller who may not run it runs none of their queries)
     let mut params = HashMap::new();
     if !args.is_empty() {
         let select = args.iter().map(|(k, v)| format!("({v}) AS \"{k}\"")).collect::<Vec<_>>().join(", ");
@@ -800,7 +803,9 @@ pub fn schedule(app: App) {
                 let (app, name, task) = (app.clone(), name.clone(), task.clone());
                 let ran = Ran(running.clone(), name.clone()); // (let go even if the tick panics: else it never ran again here)
                 crate::panics::task(async move {
-                    crate::ext::scope(as_owner, run_tick(&app, &name, &task, tick)).await; // (as the task's owner, an asked run only when the owner asked: `Tick::as_owner`)
+                    // (as the task's owner, an asked run only when the owner asked: `Tick::as_owner`; the node's own work, which
+                    // no request asked for: `auth::as_node`)
+                    crate::auth::as_node(crate::ext::scope(as_owner, run_tick(&app, &name, &task, tick))).await;
                     drop(ran);
                 });
             }

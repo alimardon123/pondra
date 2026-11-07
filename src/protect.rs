@@ -16,6 +16,9 @@ use std::sync::Arc;
 /// Where the protection is kept: under `z/`, which a branch never copies.
 pub const KEY: &str = "z/protect";
 
+/// The protection's record in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: KEY, owner: "protect", holds: "what the lake is protected against, and until when" }];
+
 /// A database's protection, and its last change: when, and by whom.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Protection {
@@ -121,7 +124,7 @@ fn ddl_touches(d: &Ddl) -> Vec<Touch> {
         | Ddl::CreateMaterialized { name, .. } | Ddl::DropView { name, .. } | Ddl::Attach { name, .. } | Ddl::Detach { name, .. } | Ddl::CreateRoutine { name, .. }
         | Ddl::DropRoutine { name, .. } | Ddl::CreateSecret { name, .. } | Ddl::AttachOutside { name, .. } | Ddl::DropSecret { name, .. } | Ddl::CreateTask { name, .. }
         | Ddl::DropTask { name, .. } | Ddl::AlterTask { name, .. } | Ddl::DetachView { name } | Ddl::ViewFacts { view: name, .. } | Ddl::PlaceViewColumn { view: name, .. }
-        | Ddl::FetchExtension { name, .. } | Ddl::InstallExtension { name, .. } | Ddl::UninstallExtension { name, .. } => object(name),
+        | Ddl::FetchExtension { name, .. } | Ddl::InstallExtension { name, .. } | Ddl::UninstallExtension { name, .. } | Ddl::Entry { object: name, .. } => object(name),
         Ddl::AlterColumn { table, .. } | Ddl::Constraint { table, .. } => object(table),
         Ddl::RenameTable { name, to } => vec![Touch::Object(name.clone()), Touch::Object(to.clone())],
         Ddl::Swap { .. } => vec![], // (a swap changes what two tables hold, as writes do: a protected database allows it, and no definition changes)

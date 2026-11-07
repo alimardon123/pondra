@@ -119,6 +119,8 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
 pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     let mut rules = Analyzer::new().rules;
     let at = rules.iter().position(|r| r.name() == "type_coercion").unwrap_or(0);
+    rules.insert(at, Arc::new(crate::divide::Quotients)); // (just before: what reads a quotient is typed from its type)
+    rules.insert(at, Arc::new(crate::one_row::OneRow)); // (a scalar subquery that reads the outer row and isn't aggregated, or ends in LIMIT 1: one DataFusion runs)
     rules.insert(at, Arc::new(FloatsWin));
     rules.insert(at, Arc::new(crate::lateral::Lateral)); // (before type coercion, as the analyzer's own: a function's rows of a column, one pass)
     rules.insert(at, Arc::new(WholeLiterals)); // (first: FloatsWin and type coercion see whole decimals)
@@ -129,7 +131,7 @@ pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
 
 /// Whether the analyzer's rules may answer `e`, an expression over `schema`, otherwise than planning it alone does
 /// (`create_physical_expr`, which coerces types as the analyzer's type coercion does): a cast (`casts::Rounds` rounds one to
-/// an integer), a float or a decimal among its columns and literals (`FloatsWin`, `WholeLiterals`), or anything whose type
+/// an integer), a float or a decimal among its columns and literals (`FloatsWin`, `WholeLiterals`, `divide::Quotients`), or anything whose type
 /// comes from elsewhere (a function, a parameter, a subquery). An expression of none of these, `n + 1` over an integer or
 /// `excluded.v` over text, skips the analyzer (`rules::fit::evaluate_in`). A rule that rewrites anything else says so here.
 pub fn analyzed_alone(e: &Expr, schema: &DFSchema) -> bool {
@@ -225,7 +227,7 @@ impl AnalyzerRule for WholeLiterals {
 /// A plan node once its expressions changed, with the schema they now give. DataFusion keeps a VALUES node's schema as
 /// it was (`recompute_schema` says it isn't clear why), so a VALUES is typed again as DataFusion types one
 /// (`LogicalPlanBuilder::values`: the widest type of each column, the rows cast to it), under the names it had.
-fn settled(plan: LogicalPlan) -> Result<LogicalPlan> {
+pub(crate) fn settled(plan: LogicalPlan) -> Result<LogicalPlan> {
     match plan {
         LogicalPlan::Values(old) => {
             let typed = match LogicalPlanBuilder::values(old.values)?.build()? {
@@ -1193,6 +1195,7 @@ fn cost(e: &Expr, schema: &DFSchema) -> usize {
             Expr::Literal(..) | Expr::Alias(_) => 0,
             Expr::InList(l) => l.list.len(),
             Expr::ScalarFunction(f) if f.func.name() == crate::multiply::NAME => 1, // (a product, as the `*` it replaces)
+            Expr::ScalarFunction(f) if f.func.name() == crate::divide::NAME => 1, // (a quotient, as the `/` it replaces)
             Expr::Like(_) | Expr::SimilarTo(_) | Expr::ScalarFunction(_) => 20,
             Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_) => 1000,
             _ => 1,
@@ -3006,6 +3009,65 @@ mod tests {
         let without = plain.sql(overflow).await.unwrap().collect().await.unwrap_err().to_string();
         assert_eq!(with, without, "{overflow}");
         assert!(with.contains("Overflow happened on"), "{with}");
+    }
+
+    /// A DECIMAL quotient keeps 16 places, rounded, as Postgres's (`divide::Quotients`): `71 / 3.0` was 23.6666, cut, as a
+    /// DECIMAL(25, 4), and TPC-DS q83's shares, three divisions deep, were wrong from their ninth digit. Names, NULLs, a
+    /// zero divisor, GROUP BY, UNION, a recursive CTE, SAFE_DIVIDE and Spark's dialect, and an integer's `/` left as it was.
+    #[tokio::test]
+    async fn a_decimal_quotient_keeps_16_places_rounded() {
+        use datafusion::arrow::array::{Int64Array, RecordBatch};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let ctx = session();
+        crate::dialect_fns::register(&ctx);
+        let one = |sql: &'static str, ty: &'static str, value: &'static str| (sql, ty, value);
+        for (sql, ty, value) in [
+            one("SELECT 71 / 3.0 AS q", "q: Decimal128(37, 16)", "23.6666666666666667"),
+            one("SELECT -71 / 3.0 AS q", "q: Decimal128(37, 16)", "-23.6666666666666667"),
+            one("SELECT 1.0 / 3 AS q", "q: Decimal128(17, 16)", "0.3333333333333333"),
+            one("SELECT 2.00 / 3.00 AS q", "q: Decimal128(19, 16)", "0.6666666666666667"),
+            one("SELECT 1.5 / 1 AS q", "q: Decimal128(17, 16)", "1.5000000000000000"),
+            one("SELECT 1.000000000000000000 / 3 AS q", "q: Decimal128(19, 18)", "0.333333333333333333"),
+            one("SELECT 71 / 3 AS q", "q: Int64", "23"),
+            one("SELECT 71 / 3.0::double AS q", "q: Float64", "23.666666666666668"),
+            one("SELECT safe_divide(71, 3.0) AS q", "q: Decimal128(37, 16)", "23.6666666666666667"),
+        ] {
+            let (types, rows) = answer(&ctx, sql).await;
+            assert_eq!((types[0].as_str(), rows[0][0].as_deref()), (ty, Some(value)), "{sql}");
+        }
+        assert_eq!(answer(&ctx, "SELECT safe_divide(1.0, 0) AS q").await.1, vec![vec![None]], "SAFE_DIVIDE's zero divisor: NULL");
+        assert_eq!(answer(&ctx, "SELECT NULL / 3.0 AS q, 3.0 / NULL AS r").await.1, vec![vec![None, None]]);
+        let zero = ctx.sql("SELECT 1.0 / 0").await.unwrap().collect().await.unwrap_err().to_string();
+        assert!(zero.contains("Divide by zero error"), "{zero}");
+        // (q83's shares and average, on its first item's quantities)
+        let t = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false), Field::new("sr", DataType::Int64, true), Field::new("cr", DataType::Int64, false), Field::new("wr", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(Int64Array::from(vec![Some(27), None])), Arc::new(Int64Array::from(vec![37, 1])), Arc::new(Int64Array::from(vec![7, 2]))],
+        )
+        .unwrap();
+        ctx.register_batch("q", t).unwrap();
+        let (types, rows) = answer(&ctx, "SELECT (sr * 1.0000) / (sr + cr + wr) / 3.0000 * 100 AS sr_dev, (sr + cr + wr) / 3.0 AS average, cr / 3.0 FROM q ORDER BY k").await;
+        assert_eq!(types[..2], ["sr_dev: Decimal128(38, 16)", "average: Decimal128(37, 16)"]);
+        assert!(types[2].starts_with("q.cr / ") && types[2].ends_with(": Decimal128(37, 16)"), "a column keeps `/`'s name: {}", types[2]);
+        let some = |v: &[&str]| v.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect::<Vec<_>>();
+        assert_eq!(rows, vec![some(&["12.6760563380281700", "23.6666666666666667", "12.3333333333333333"]), some(&["", "", "0.3333333333333333"])]);
+        let plan = plan_of(&ctx, "SELECT cr / 3.0 FROM q").await;
+        assert!(plan.contains(crate::divide::NAME), "{plan}");
+        for sql in [
+            "SELECT k, sum(cr / 3.0) AS s FROM q GROUP BY k ORDER BY k",
+            "SELECT cr / 3.0 AS g, count(*) AS n FROM q GROUP BY cr / 3.0 ORDER BY g",
+            "SELECT k FROM q WHERE cr / 3.0 > 1 ORDER BY k",
+            "SELECT cr / 3.0 AS v FROM q UNION ALL SELECT 2.5 ORDER BY v",
+            "WITH RECURSIVE r(n, x) AS (SELECT 1, 1.0 UNION ALL SELECT n + 1, x / 3 FROM r WHERE n < 3) SELECT n, x FROM r ORDER BY n",
+        ] {
+            let (types, rows) = answer(&ctx, sql).await;
+            assert!(!rows.is_empty(), "{sql}: {types:?}");
+        }
+        assert_eq!(answer(&ctx, "SELECT k, sum(cr / 3.0) AS s FROM q GROUP BY k ORDER BY k").await.1[0][1].as_deref(), Some("12.3333333333333333"));
+        let spark = session();
+        spark.sql("SET datafusion.sql_parser.dialect = 'Spark'").await.unwrap();
+        let (types, rows) = answer(&spark, "SELECT 71 / 3.0 AS q").await;
+        assert_eq!((types[0].as_str(), rows[0][0].as_deref()), ("q: Decimal128(27, 6)", Some("23.666667")), "Spark's type, rounded");
     }
 
     /// A number with an exponent is a whole decimal (`WholeLiterals`): a cast of `1e15` to a float is

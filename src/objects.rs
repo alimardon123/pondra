@@ -46,6 +46,10 @@ pub struct Kind {
     pub about: &'static str,
     /// Other products' names for it.
     pub also: &'static [&'static str],
+    /// How an extension's kind is shown: the statement that makes one again, from its name and the definition the
+    /// catalog keeps for it as JSON under its prefix. Such a kind is listed, shown, described and granted with no edit
+    /// outside its extension (redesign.md §6). None: one of the core's, listed by its family's lister in `FAMILIES`.
+    pub shown: Option<fn(&str, &Value) -> String>,
 }
 
 /// What CREATE DATABASE … CLONE does with an object: its entries are copied; its files are pinned
@@ -95,27 +99,27 @@ const ROWS: &[&str] = &["SELECT", "INSERT", "UPDATE", "DELETE"];
 const SHARES_PROJECT: &str = "shares and recipients are each environment's: prod's never reach its branches, so a partner's token never reaches dev; make and grant them in the database (CREATE SHARE …)";
 /// The kinds of the core, which the `catalog` extension adds to the registry (`CATALOG`).
 static CORE_KINDS: &[Kind] = &[
-    Kind { name: "schema", family: "schema", verbs: &["CREATE", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "ns/", privileges: &["SELECT", "INSERT", "UPDATE", "DELETE", "CLONE"], on_clone: OnClone::Copy, project: None, order: 1, secret: false, about: "a namespace for a database's objects, named `schema.name`", also: &["namespace", "dataset"] },
-    Kind { name: "table", family: "relation", verbs: &["CREATE", "CREATE OR ALTER", "CREATE OR REPLACE", "ALTER", "DROP", "UNDROP", "CLONE", "COMMENT ON", "SHOW CREATE"], prefix: "t/", privileges: ROWS, on_clone: OnClone::Pin, project: None, order: 5, secret: false, about: "rows in the lake's files and log, queried and changed with SQL", also: &["relation"] },
-    Kind { name: "view", family: "relation", verbs: RELATION, prefix: "q/", privileges: READ, on_clone: OnClone::Copy, project: None, order: 7, secret: false, about: "a stored query with a name, run where it is used", also: &["virtual table"] },
-    Kind { name: "materialized view", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "v/", privileges: READ, on_clone: OnClone::Copy, project: None, order: 7, secret: false, about: "a query's result kept current as its tables change, read like a table", also: &["dynamic table", "live table", "continuous query"] },
-    Kind { name: "external table", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON"], prefix: "q/", privileges: READ, on_clone: OnClone::Copy, project: None, order: 7, secret: false, about: "a view of files outside the lake, read in place where they are", also: &["foreign table"] },
-    Kind { name: "sequence", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "sq/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 4, secret: false, about: "numbers handed out one at a time, never twice (`nextval`)", also: &["serial", "auto increment"] },
-    Kind { name: "index", family: "relation", verbs: &["CREATE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "ix/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 6, secret: false, about: "a named set of a table's columns, kept as a definition: nothing is built", also: &[] },
-    Kind { name: "type", family: "type", verbs: &["CREATE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "ty/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 4, secret: false, about: "a named set of labels a column may hold", also: &["enum"] },
-    Kind { name: "function", family: "routine", verbs: ROUTINE, prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 6, secret: false, about: "a named computation, in SQL or Python, run per row, per batch or in a query", also: &["UDF", "user-defined function"] },
-    Kind { name: "macro", family: "routine", verbs: ROUTINE, prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 6, secret: false, about: "a named SQL expression or query, expanded where it is written", also: &["SQL macro"] },
-    Kind { name: "table function", family: "routine", verbs: ROUTINE, prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 6, secret: false, about: "a function that returns the rows of a table, used where a table is named", also: &["UDTF"] },
-    Kind { name: "procedure", family: "routine", verbs: &["CREATE", "CREATE OR REPLACE", "CALL", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 8, secret: false, about: "a named piece of work, run with CALL as its caller", also: &["stored procedure"] },
-    Kind { name: "task", family: "task", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "EXECUTE", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "j/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 9, secret: false, about: "a statement run on a schedule, or after other tasks (AFTER)", also: &["job", "schedule", "cron"] },
-    Kind { name: "secret", family: "secret", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON"], prefix: "e/", privileges: &["USAGE"], on_clone: OnClone::Leave, project: None, order: 3, secret: true, about: "credentials sealed in the lake, handed to a procedure and never shown", also: &["credential"] }, // ("connection" is 1.1's own kind: kept.rs)
-    Kind { name: "user", family: "user", verbs: &["CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "COMMENT ON"], prefix: "u/", privileges: &[], on_clone: OnClone::Copy, project: Some("users are each environment's: a project makes roles (CREATE ROLE analyst), and an environment's admin grants them (GRANT analyst TO ann)"), order: 0, secret: true, about: "a person who signs in, with a password or token, and grants", also: &["login"] },
-    Kind { name: "role", family: "user", verbs: &["CREATE", "DROP", "GRANT", "REVOKE", "COMMENT ON", "SHOW CREATE"], prefix: "u/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 2, secret: false, about: "a group of grants, given to users", also: &["group"] },
-    Kind { name: "database", family: "database", verbs: &["CREATE", "CLONE", "ATTACH", "DETACH", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "a/", privileges: &["CLONE"], on_clone: OnClone::Copy, project: Some("a database is each environment's: an attached lake or catalog goes in pondra.toml ([env.prod] attach.events = { type = \"kafka\", url = \"…\" })"), order: 0, secret: false, about: "another lake this one reads, attached by name, or a branch cloned from one", also: &["catalog", "lake", "workspace"] },
-    Kind { name: "share", family: "share", verbs: &["CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "COMMENT ON", "SHOW CREATE"], prefix: "sh/", privileges: READ, on_clone: OnClone::Leave, project: Some(SHARES_PROJECT), order: 0, secret: false, about: "tables handed to other companies at published versions, through links that end", also: &["Delta Share", "data share"] },
-    Kind { name: "recipient", family: "recipient", verbs: &["CREATE", "ALTER", "DROP", "COMMENT ON"], prefix: "sr/", privileges: &[], on_clone: OnClone::Leave, project: Some(SHARES_PROJECT), order: 0, secret: false, about: "a company that a share is granted to, with the token it reads with", also: &["data consumer"] },
-    Kind { name: "identity provider", family: "identity provider", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "ip/", privileges: &[], on_clone: OnClone::Copy, project: Some("an identity provider is each environment's, as its users are: CREATE IDENTITY PROVIDER in each database"), order: 0, secret: false, about: "the company's sign-in (Okta, Entra ID, Google, Keycloak), whose tokens sign people in at every door", also: &["single sign-on", "SSO", "OpenID Connect", "OIDC", "security integration"] },
-    Kind { name: "extension", family: "extension", verbs: &["INSTALL", "UNINSTALL", "LOAD"], prefix: "xt/", privileges: &[], on_clone: OnClone::Copy, project: Some("an extension is an admin's: INSTALL name FROM 'file or URL'; a project pins them after 1.0"), order: 0, secret: false, about: "functions in a WebAssembly file, installed once and kept in the lake", also: &["plugin"] },
+    Kind { name: "schema", family: "schema", verbs: &["CREATE", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "ns/", privileges: &["SELECT", "INSERT", "UPDATE", "DELETE", "CLONE"], on_clone: OnClone::Copy, project: None, order: 1, secret: false, about: "a namespace for a database's objects, named `schema.name`", also: &["namespace", "dataset"], shown: None },
+    Kind { name: "table", family: "relation", verbs: &["CREATE", "CREATE OR ALTER", "CREATE OR REPLACE", "ALTER", "DROP", "UNDROP", "CLONE", "COMMENT ON", "SHOW CREATE"], prefix: "t/", privileges: ROWS, on_clone: OnClone::Pin, project: None, order: 5, secret: false, about: "rows in the lake's files and log, queried and changed with SQL", also: &["relation"], shown: None },
+    Kind { name: "view", family: "relation", verbs: RELATION, prefix: "q/", privileges: READ, on_clone: OnClone::Copy, project: None, order: 7, secret: false, about: "a stored query with a name, run where it is used", also: &["virtual table"], shown: None },
+    Kind { name: "materialized view", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "v/", privileges: READ, on_clone: OnClone::Copy, project: None, order: 7, secret: false, about: "a query's result kept current as its tables change, read like a table", also: &["dynamic table", "live table", "continuous query"], shown: None },
+    Kind { name: "external table", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON"], prefix: "q/", privileges: READ, on_clone: OnClone::Copy, project: None, order: 7, secret: false, about: "a view of files outside the lake, read in place where they are", also: &["foreign table"], shown: None },
+    Kind { name: "sequence", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "sq/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 4, secret: false, about: "numbers handed out one at a time, never twice (`nextval`)", also: &["serial", "auto increment"], shown: None },
+    Kind { name: "index", family: "relation", verbs: &["CREATE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "ix/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 6, secret: false, about: "a named set of a table's columns, kept as a definition: nothing is built", also: &[], shown: None },
+    Kind { name: "type", family: "type", verbs: &["CREATE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "ty/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 4, secret: false, about: "a named set of labels a column may hold", also: &["enum"], shown: None },
+    Kind { name: "function", family: "routine", verbs: ROUTINE, prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 6, secret: false, about: "a named computation, in SQL or Python, run per row, per batch or in a query", also: &["UDF", "user-defined function"], shown: None },
+    Kind { name: "macro", family: "routine", verbs: ROUTINE, prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 6, secret: false, about: "a named SQL expression or query, expanded where it is written", also: &["SQL macro"], shown: None },
+    Kind { name: "table function", family: "routine", verbs: ROUTINE, prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 6, secret: false, about: "a function that returns the rows of a table, used where a table is named", also: &["UDTF"], shown: None },
+    Kind { name: "procedure", family: "routine", verbs: &["CREATE", "CREATE OR REPLACE", "CALL", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 8, secret: false, about: "a named piece of work, run with CALL as its caller", also: &["stored procedure"], shown: None },
+    Kind { name: "task", family: "task", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "EXECUTE", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "j/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 9, secret: false, about: "a statement run on a schedule, or after other tasks (AFTER)", also: &["job", "schedule", "cron"], shown: None },
+    Kind { name: "secret", family: "secret", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON"], prefix: "e/", privileges: &["USAGE"], on_clone: OnClone::Leave, project: None, order: 3, secret: true, about: "credentials sealed in the lake, handed to a procedure and never shown", also: &["credential"], shown: None },
+    Kind { name: "user", family: "user", verbs: &["CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "COMMENT ON"], prefix: "u/", privileges: &[], on_clone: OnClone::Copy, project: Some("users are each environment's: a project makes roles (CREATE ROLE analyst), and an environment's admin grants them (GRANT analyst TO ann)"), order: 0, secret: true, about: "a person who signs in, with a password or token, and grants", also: &["login"], shown: None },
+    Kind { name: "role", family: "user", verbs: &["CREATE", "DROP", "GRANT", "REVOKE", "COMMENT ON", "SHOW CREATE"], prefix: "u/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 2, secret: false, about: "a group of grants, given to users", also: &["group"], shown: None },
+    Kind { name: "database", family: "database", verbs: &["CREATE", "CLONE", "ATTACH", "DETACH", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "a/", privileges: &["CLONE"], on_clone: OnClone::Copy, project: Some("a database is each environment's: an attached lake or catalog goes in pondra.toml ([env.prod] attach.events = { type = \"kafka\", url = \"…\" })"), order: 0, secret: false, about: "another lake this one reads, attached by name, or a branch cloned from one", also: &["catalog", "lake", "workspace"], shown: None },
+    Kind { name: "share", family: "share", verbs: &["CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "COMMENT ON", "SHOW CREATE"], prefix: "sh/", privileges: READ, on_clone: OnClone::Leave, project: Some(SHARES_PROJECT), order: 0, secret: false, about: "tables handed to other companies at published versions, through links that end", also: &["Delta Share", "data share"], shown: None },
+    Kind { name: "recipient", family: "recipient", verbs: &["CREATE", "ALTER", "DROP", "COMMENT ON"], prefix: "sr/", privileges: &[], on_clone: OnClone::Leave, project: Some(SHARES_PROJECT), order: 0, secret: false, about: "a company that a share is granted to, with the token it reads with", also: &["data consumer"], shown: None },
+    Kind { name: "identity provider", family: "identity provider", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "ip/", privileges: &[], on_clone: OnClone::Copy, project: Some("an identity provider is each environment's, as its users are: CREATE IDENTITY PROVIDER in each database"), order: 0, secret: false, about: "the company's sign-in (Okta, Entra ID, Google, Keycloak), whose tokens sign people in at every door", also: &["single sign-on", "SSO", "OpenID Connect", "OIDC", "security integration"], shown: None },
+    Kind { name: "extension", family: "extension", verbs: &["INSTALL", "UNINSTALL", "LOAD"], prefix: "xt/", privileges: &[], on_clone: OnClone::Copy, project: Some("an extension is an admin's: INSTALL name FROM 'file or URL'; a project pins them after 1.0"), order: 0, secret: false, about: "functions in a WebAssembly file, installed once and kept in the lake", also: &["plugin"], shown: None },
 ];
 
 /// The parts: stored inside one object, and listed beside the kinds.
@@ -153,6 +157,9 @@ impl Kinds {
     }
 }
 
+/// The objects' own records beside their kinds' (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "cm/", owner: "objects", holds: "comments: on an object (cm/kind/name) or a column (cm/column/table/column)" }];
+
 /// The extension that adds the core's kinds.
 pub static CATALOG: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "catalog",
@@ -162,7 +169,12 @@ pub static CATALOG: crate::registry::BuiltIn = crate::registry::BuiltIn {
         for k in CORE_KINDS {
             kinds.add(k);
         }
+        let prefixes = r.section_mut::<crate::records::Prefixes>(); // (the catalog floor's; each floor's extension adds its own)
+        for p in [crate::records::PREFIXES, crate::store::PREFIXES, crate::log::PREFIXES, crate::format::PREFIXES, crate::replica::PREFIXES, PREFIXES] {
+            prefixes.add(p);
+        }
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "kinds", columns: COLUMNS, rows });
+        r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "prefixes", columns: crate::records::COLUMNS, rows: crate::records::rows });
     },
 };
 
@@ -239,6 +251,12 @@ pub async fn list(lake: &Lake) -> Result<Vec<Object>> {
     let mut all = vec![];
     for (_, lister) in FAMILIES {
         all.extend(lister(lake).await?);
+    }
+    // (a user limited by grants sees no secret, and none of an extension's objects until step 6's `may` says which)
+    if crate::auth::limited().is_none() {
+        all.extend(defined(lake).await?);
+    } else {
+        all.retain(|o| o.kind != "secret");
     }
     let mut notes = HashMap::new();
     for (name, l) in lakes(lake).await {
@@ -407,15 +425,31 @@ fn tasks(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
 
 fn secrets(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
     Box::pin(async move {
-        if crate::auth::limited().is_some() {
-            return Ok(vec![]); // (their names and scopes are an admin's to see)
-        }
-        let mut out = vec![];
+        let mut out = vec![]; // (their names and scopes are an admin's to see: `list` keeps them from a limited user)
         for (name, l) in lakes(lake).await {
             out.extend(crate::ext::list(&l).await?.into_iter().map(|(n, _)| Object::new("secret", &name, &n, None))); // (values are never shown)
         }
         Ok(out)
     })
+}
+
+/// The objects of every kind an extension adds (`Kind::shown`), from the definitions kept under its prefix: this lake's
+/// with the statement that makes each again, an attached lake's by name (a node of that lake shows its statements).
+async fn defined(lake: &Lake) -> Result<Vec<Object>> {
+    let all = lakes(lake).await; // (this lake first)
+    let mut out = vec![];
+    for k in all_kinds().filter(|k| k.shown.is_some()) {
+        let end = format!("{}0", k.prefix.trim_end_matches('/')); // (`cn/` to `cn0`: every key under the prefix)
+        for (i, (name, l)) in all.iter().enumerate() {
+            let here = i == 0;
+            for (key, def) in l.cat.scan::<Value>(k.prefix, &end).await? {
+                let n = &key[k.prefix.len()..];
+                let shown = k.shown.filter(|_| here).map(|show| show(n, &def));
+                out.push(Object::new(k.name, name, n, shown));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Installed extensions of this lake and those attached (`extension.rs`): by name, their records are read with `SHOW EXTENSIONS`.
@@ -894,7 +928,10 @@ async fn there(lake: &Lake, key: &str) -> Result<bool> {
         "share" => has(crate::shares::share_key(name)).await?,
         "recipient" => has(crate::shares::recipient_key(name)).await?,
         "identity provider" => has(crate::sso::key(name)).await?,
-        _ => false,
+        family => match all_kinds().find(|k| k.family == family && k.shown.is_some()) {
+            Some(k) => has(format!("{}{name}", k.prefix)).await?, // (an extension's kind: its definitions under its prefix)
+            None => false,
+        },
     })
 }
 
@@ -948,7 +985,7 @@ fn view_columns<'a>(lake: &'a Lake, view: &'a str) -> BoxFuture<'a, Result<Optio
 pub fn moves(d: &Ddl) -> bool {
     matches!(d, Ddl::Sequence(_) | Ddl::Index(_) | Ddl::Type(_) | Ddl::DropTable { .. } | Ddl::ReplaceTable { .. } | Ddl::DropView { .. } | Ddl::DropSchema { .. } | Ddl::DropRoutine { .. } | Ddl::DropTask { .. } | Ddl::DropSecret { .. }
         | Ddl::Detach { .. } | Ddl::DropDatabase { .. } | Ddl::RenameTable { .. } | Ddl::AlterColumn { .. } | Ddl::Users(_)
-        | Ddl::Shares(crate::shares::Change::DropShare { .. } | crate::shares::Change::DropRecipient { .. }))
+        | Ddl::Shares(crate::shares::Change::DropShare { .. } | crate::shares::Change::DropRecipient { .. }) | Ddl::Entry { .. })
 }
 
 /// After a drop or a rename (`out`: what it answered): comments follow a renamed table or view, and
@@ -961,7 +998,8 @@ pub async fn follow(lake: &Lake, out: &Value) -> Result<()> {
     }
     let (mut put, mut gone) = (vec![], vec![]);
     let relation = out["table"].as_str().or(out["view"].as_str()).or(out["sequence"].as_str()).or(out["index"].as_str()).map(|n| ("relation", n));
-    let renamed = match (relation.or(out["type"].as_str().map(|n| ("type", n))), out["renamed"].as_str()) {
+    let added = all_kinds().filter(|k| k.shown.is_some()).find_map(|k| out[k.name].as_str().map(|n| (k.family, n))); // (an extension's kind answers by its name)
+    let renamed = match (relation.or(out["type"].as_str().map(|n| ("type", n))).or(added), out["renamed"].as_str()) {
         (Some((family, from)), Some(to)) => Some((family, from.to_string(), to.to_string())),
         _ => None,
     };

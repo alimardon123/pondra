@@ -628,6 +628,17 @@ async fn read_stored(lake: &Lake, sql: &str) -> Result<String> {
     Ok(crate::path::currents(lake, &crate::front::expand(lake, &crate::path::currents(lake, sql), &HashMap::new()).await?))
 }
 
+/// `SHOW <kind>s [LIKE 'pattern']` for a kind an extension adds (`objects::Kind::shown`: `SHOW CONNECTIONS`): its
+/// objects, from `pondra.objects`, so the extension adds no SHOW of its own.
+fn show_defined(sql: &str) -> Option<String> {
+    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+([a-z][a-z ]*?)s(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
+    let m = SHOW.captures(sql)?;
+    let word = m[1].split_whitespace().map(str::to_lowercase).collect::<Vec<_>>().join(" ");
+    let k = crate::objects::all_kinds().find(|k| k.name == word && k.shown.is_some())?;
+    let like = m.get(2).map(|l| format!(" AND name LIKE {}", l.as_str())).unwrap_or_default();
+    Some(format!("SELECT lake, name, comment FROM pondra.objects WHERE kind = '{}'{like} ORDER BY lake, name", k.name))
+}
+
 /// `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS`, `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS`,
 /// `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW EXTENSIONS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS`
 /// (`[LIKE 'pattern']`; shares and recipients: `show_shares`): this lake's own, from `pondra.routines`, `pondra.tasks`, `pondra.tables`,
@@ -645,7 +656,7 @@ pub(crate) fn show(sql: &str) -> Option<String> {
     if let Some(q) = show_shares(sql) {
         return Some(q);
     }
-    let m = SHOW.captures(sql)?;
+    let Some(m) = SHOW.captures(sql) else { return show_defined(sql) };
     let what = m[1].split_whitespace().map(str::to_lowercase).collect::<Vec<_>>().join(" ");
     let named = match what.as_str() { "schemas" => "schema_name", "databases" => "catalog_name", "grants" => "grantee", _ => "name" };
     let like = m.get(2).map(|l| format!(" AND {named} LIKE {}", l.as_str())).unwrap_or_default();
@@ -834,7 +845,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
         // DECLARE, FETCH, MOVE, CLOSE: the session's cursors (cursors.rs). Before the script's check: DECLARE reads as one.
         return Ok(match crate::cursors::run(app, cmd?, who.role).await? {
             crate::cursors::Answer::Rows(batches) => Outcome::Rows(batches),
-            crate::cursors::Answer::Tag(tag) => Outcome::Done(j!({"command": tag})),
+            crate::cursors::Answer::Done(kind, rows) => Outcome::Done(j!({"command": kind.tag(rows)})),
         });
     }
     if crate::script::is(sql) {
@@ -844,7 +855,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
         return Box::pin(crate::vars::apply(app, c)).await; // (DECLARE $day …, $day = …: the scope's variable)
     }
     if crate::write::checkpoint(sql) {
-        ensure!(who.role >= Role::Write, "CHECKPOINT needs a write token");
+        crate::rights::may_as(who.role, crate::rights::Action::Write, crate::rights::Object::Lake)?;
         return Ok(Outcome::Done(app.checkpoint().await?));
     }
     if let Some((name, args)) = call_of(sql) {
@@ -865,7 +876,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
     }
     if let Some((language, body)) = do_of(sql) {
         // A procedure made, called once and forgotten, as its caller: an admin's, as making one is.
-        ensure!(who.role >= Role::Admin, "DO runs code on the node: it needs an admin token, as making a procedure does");
+        crate::rights::may_as(who.role, crate::rights::Action::RunCode, crate::rights::Object::Lake)?; // (as making a procedure is)
         let r = match language.as_str() {
             "python" => Routine { kind: Kind::Procedure, params: vec![], language, body, returns: None, with: Options::default() },
             "sql" => Routine { kind: Kind::Procedure, params: vec![], language, body, returns: None, with: Options::default() },
@@ -880,7 +891,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
     if crate::set::is(sql) {
         // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: the session's (round 31)
         return match Box::pin(crate::set::statement(&app.lake, sql)).await? {
-            crate::set::Done::Said(tag) => Ok(Outcome::Done(j!({"command": tag}))),
+            crate::set::Done::Said(kind) => Ok(Outcome::Done(j!({"command": kind.words()}))),
             crate::set::Done::Run(sql) => Box::pin(one_of(app, &sql, who, job)).await,
         };
     }
@@ -894,7 +905,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
         return Ok(Outcome::Rows(vec![Box::pin(crate::returning::run(app, &r, who.role, who.files, job)).await?])); // (INSERT … RETURNING: the rows it wrote)
     }
     if let Some(stmt) = crate::write::parse(sql) {
-        app.auth.allows(who.role, &stmt)?;
+        crate::rights::may_run(who.role, &stmt)?;
         return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files).await?));
     }
     if let Some((rows, _)) = Box::pin(crate::txn::point_read(&app.lake, sql)).await? {
@@ -922,7 +933,7 @@ async fn steps(app: &App, sql: &str, who: Who) -> Result<Option<Vec<(String, Opt
             Some(Stmt::Invalid(why)) => bail!("{why}"),
             Some(Stmt::Refused(code, why)) => return Err(crate::codes::coded(code, why)),
             Some(stmt) => {
-                app.auth.allows(who.role, &stmt)?;
+                crate::rights::may_run(who.role, &stmt)?;
                 if let Stmt::Ddl(ds) = &stmt {
                     for d in ds {
                         crate::protect::check_ddl(&app.lake, d).await?;

@@ -52,6 +52,7 @@ pub mod sketch;
 mod asof;
 mod explain;
 mod multiply;
+mod divide;
 mod sparksql;
 mod parsed;
 mod past_names;
@@ -90,6 +91,7 @@ mod pg_oids;
 mod pg_casts;
 mod pg_trace;
 pub mod pg_bytea;
+mod one_row;
 mod optimize;
 mod or_ranges;
 mod zeros_in;
@@ -123,7 +125,9 @@ mod rules;
 #[cfg(feature = "lake")] mod bridge;
 #[cfg(feature = "lake")] mod rerun;
 #[cfg(feature = "lake")] mod replica;
+#[cfg(feature = "lake")] mod records; // (the catalog's record scheme: every prefix, and whose it is)
 #[cfg(feature = "lake")] mod auth;
+#[cfg(feature = "lake")] mod rights; // (what a principal may do, decided in one place: step 6)
 #[cfg(feature = "lake")] mod budget;
 #[cfg(feature = "lake")] mod byte_range;
 #[cfg(feature = "lake")] mod cache;
@@ -251,6 +255,11 @@ mod rules;
 #[cfg(feature = "lake")] mod vars;
 #[cfg(feature = "lake")] mod views;
 #[cfg(feature = "lake")] mod write;
+// The registry's statements section: a statement an extension adds, read by `write::parse` at one place.
+#[cfg(feature = "lake")] pub mod statements;
+// The registry's connection types section, and the `connections` extension that adds the kind and its statements.
+#[cfg(feature = "lake")] pub mod connections;
+#[cfg(feature = "lake")] mod connect;
 #[cfg(feature = "lake")] mod writer;
 #[cfg(feature = "lake")] mod keep_load;
 #[cfg(feature = "lake")] mod write_outside;
@@ -266,12 +275,26 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &settings::SETTINGS,
         #[cfg(feature = "lake")]
         &objects::CATALOG,
+        #[cfg(feature = "lake")]
+        &connect::CONNECTIONS,
+        #[cfg(feature = "lake")]
+        &read_delta::DELTA,
+        #[cfg(feature = "lake")]
+        &catalogs::ICEBERG,
+        #[cfg(feature = "lake")]
+        &kafka_client::KAFKA,
+        #[cfg(feature = "lake")]
+        &sharing_client::SHARING,
         &sparksql::SPARK,
         &engine::ENGINE,
         &pg_functions::POSTGRES,
         &matcher::MATCH_RECOGNIZE,
         #[cfg(feature = "lake")]
         &ai::AI,
+        #[cfg(feature = "lake")]
+        &apply::PROJECT,
+        #[cfg(feature = "lake")]
+        &udf::UDF,
     ];
     BUILT_IN
 }

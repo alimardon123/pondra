@@ -11,6 +11,7 @@
 //!   `timezone` are DataFusion's `datafusion.execution.time_zone`.
 //! - A prepared statement is kept as its text. `EXECUTE` puts its arguments where `$1`, `$2`, …
 //!   were (cast to the types `PREPARE` gave) and runs it as if it were sent: a query or a write.
+use crate::answer::Kind;
 use crate::store::Lake;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::logical_expr::{LogicalPlan, SetVariable, Statement as Plan};
@@ -37,7 +38,7 @@ async fn current(lake: &Lake, sql: &str) -> Result<Option<Done>> {
         let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql)?;
         let word = |p: &mut Parser, w: &str| crate::routines::word(p, w);
         if word(&mut p, "analyze") || word(&mut p, "analyse") {
-            return Ok(Some(Done::Said("ANALYZE")));
+            return Ok(Some(Done::Said(Kind::new("ANALYZE"))));
         }
         if !word(&mut p, "refresh") {
             return Ok(None);
@@ -52,12 +53,12 @@ async fn current(lake: &Lake, sql: &str) -> Result<Option<Done>> {
     let here = crate::ddl::lake_name(l);
     let found = crate::ddl::listed(l).await?.into_iter().any(|t| t.lake == here && t.schema == schema && t.name == view && t.kind == "materialized view");
     ensure!(found, "REFRESH MATERIALIZED VIEW {name}: there is no materialized view of that name");
-    Ok(Some(Done::Said("REFRESH MATERIALIZED VIEW")))
+    Ok(Some(Done::Said(Kind::new("REFRESH MATERIALIZED VIEW"))))
 }
 
 /// What a statement kept here comes to.
 pub enum Done {
-    Said(&'static str), // (its command tag)
+    Said(Kind), // (its command tag)
     Run(String),        // an `EXECUTE`: this statement, run as if sent
 }
 
@@ -66,7 +67,7 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
     if let Some(said) = crate::extension::statement(lake, sql).await {
         let said = said?; // (DuckDB's INSTALL and LOAD: no session needed; the notice goes to the client as the others do)
         crate::routines::heard(&said.notice);
-        return Ok(Done::Said(said.tag));
+        return Ok(Done::Said(Kind::new(said.tag)));
     }
     if let Some(done) = current(lake, sql).await? {
         return Ok(done);
@@ -78,11 +79,11 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
     if crate::path::is_use(sql) {
         let session = session()?;
         set(&session, "search_path", crate::path::use_of(lake, sql).await?)?;
-        return Ok(Done::Said("USE"));
+        return Ok(Done::Said(Kind::new("USE")));
     }
     if let Some(schema) = crate::path::set_schema(sql) {
         set(&session()?, "search_path", schema)?;
-        return Ok(Done::Said("SET"));
+        return Ok(Done::Said(Kind::new("SET")));
     }
     let mut parsed = Parser::parse_sql(&GenericDialect {}, sql)?;
     ensure!(parsed.len() == 1, "one statement at a time");
@@ -90,18 +91,18 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
         Statement::Set(Set::SingleAssignment { variable, values, .. }) => {
             let value = values.iter().map(text).collect::<Result<Vec<_>>>()?.join(", ");
             set(&session()?, &variable.to_string(), value)?;
-            Done::Said("SET")
+            Done::Said(Kind::new("SET"))
         }
         Statement::Set(Set::SetTimeZone { value, .. }) => {
             set(&session()?, "timezone", text(&value)?)?;
-            Done::Said("SET")
+            Done::Said(Kind::new("SET"))
         }
         Statement::Set(Set::MultipleAssignments { assignments }) => {
             let session = session()?;
             for a in assignments {
                 set(&session, &a.name.to_string(), text(&a.value)?)?;
             }
-            Done::Said("SET")
+            Done::Said(Kind::new("SET"))
         }
         // What other statements called SET ask for is done as asked, or refused by name: a SET
         // answered and not done would be a quiet lie (principle 10).
@@ -114,9 +115,9 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
             if let Some(w) = crate::txn::modes(&modes, for_session)? {
                 crate::routines::heard(&format!("WARNING: {w}"));
             }
-            Done::Said("SET")
+            Done::Said(Kind::new("SET"))
         }
-        Statement::Set(Set::SetRole { role_name: None, .. }) => Done::Said("SET"), // (SET ROLE NONE: the sign-in's own rights, which a session always has)
+        Statement::Set(Set::SetRole { role_name: None, .. }) => Done::Said(Kind::new("SET")), // (SET ROLE NONE: the sign-in's own rights, which a session always has)
         Statement::Set(Set::SetRole { role_name: Some(role), .. }) => {
             return Err(crate::codes::coded("0A000", format!("SET ROLE {role}: a session has its sign-in's rights, and no other: sign in as a user who has them, or GRANT {role} TO the user you sign in as")))
         }
@@ -125,9 +126,9 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
         }
         Statement::Set(Set::SetNames { charset_name, .. }) => {
             set(&session()?, "client_encoding", charset_name.value)?; // (Postgres's SET NAMES is client_encoding)
-            Done::Said("SET")
+            Done::Said(Kind::new("SET"))
         }
-        Statement::Set(Set::SetNamesDefault {}) => Done::Said("SET"),
+        Statement::Set(Set::SetNamesDefault {}) => Done::Said(Kind::new("SET")),
         Statement::Set(Set::ParenthesizedAssignments { variables, values }) => {
             let each = variables.iter().zip(values).map(|(n, v)| format!("${n} = {v}")).collect::<Vec<_>>().join("; ");
             let first = variables.first().map(|n| format!("${n}")).unwrap_or_default();
@@ -146,7 +147,7 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
                 Some(n) => drop(s.settings.remove(n)),
                 None => s.settings.clear(),
             }))?;
-            Done::Said("RESET")
+            Done::Said(Kind::new("RESET"))
         }
         Statement::Prepare { name, statement, .. } => {
             let name = name.value.to_lowercase();
@@ -155,7 +156,7 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
                 ctx.execute_logical_plan(ctx.state().create_logical_plan(sql).await?).await?; // (its parameters and their types agree; its tables are there)
             }
             crate::temp::with(&session()?, false, |s| Ok(s.prepared.insert(name, sql.to_string())))?;
-            Done::Said("PREPARE")
+            Done::Said(Kind::new("PREPARE"))
         }
         Statement::Execute { name: Some(name), parameters, .. } if !name.to_string().starts_with('\'') => {
             let name = name.to_string().to_lowercase();
@@ -177,7 +178,7 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
                 "all" => Ok(s.prepared.clear()),
                 _ => s.prepared.remove(&name).map(drop).ok_or_else(|| crate::codes::coded("26000", format!("Prepared statement '{name}' does not exist"))),
             })?;
-            Done::Said("DEALLOCATE")
+            Done::Said(Kind::new("DEALLOCATE"))
         }
         _ => bail!("not a setting or a prepared statement (SET name = value or SHOW name for a setting, PREPARE name AS … for a statement)"),
     })

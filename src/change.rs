@@ -77,7 +77,7 @@ impl Merge {
         self.upsert.as_ref().is_some_and(|u| u.columns.is_empty()) || self.clauses.iter().any(|c| matches!(&c.action, Action::Insert(columns, _) if columns.is_empty()))
     }
 
-    /// The privileges on its table it needs: what its clauses do (`auth::allows`).
+    /// The privileges on its table it needs: what its clauses do (`rights::asks`).
     pub fn privileges(&self) -> Vec<&'static str> {
         let mut all: Vec<&'static str> = self.clauses.iter().map(|c| match c.action {
             Action::Update(_) => "update",

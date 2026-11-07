@@ -362,6 +362,7 @@
   "branch",
   "check",
   "column",
+  "connection",
   "database",
   "expectation",
   "external table",
@@ -395,6 +396,7 @@
   "pondra_bucket_turns",
   "pondra_bucket_turns_most",
   "pondra_cache_bytes",
+  "pondra_catalog_records_total",
   "pondra_catalog_unflushed_seconds",
   "pondra_commit_ms",
   "pondra_files_scanned_total",
@@ -1267,6 +1269,7 @@
  ],
  "sqlstates": [
   "0A000",
+  "0LP01",
   "22003",
   "2200H",
   "22012",
@@ -1285,6 +1288,7 @@
   "42601",
   "42703",
   "42704",
+  "42710",
   "42883",
   "428C9",
   "42P01",
@@ -1429,6 +1433,11 @@
    "name Utf8",
    "comment Utf8",
    "definition Utf8"
+  ],
+  "pondra.prefixes": [
+   "prefix Utf8",
+   "owner Utf8",
+   "holds Utf8"
   ],
   "pondra.recipients": [
    "name Utf8",

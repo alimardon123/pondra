@@ -29,6 +29,12 @@ pub(crate) fn generic(sql: &str) -> Result<Vec<Statement>, ParserError> {
     (*parsed).clone() // (copied outside the lock: another statement's look waits for no copy)
 }
 
+/// `sql`'s parse when one of the last few looks made it (`generic`), and None when none did: nothing is parsed here. The
+/// engine plans a query from it rather than parse the text again (`engine::planned`).
+pub(crate) fn already(sql: &str) -> Option<Parsed> {
+    LAST.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(text, _)| text == sql).map(|(_, parsed)| parsed.clone())
+}
+
 /// What `make` makes of `sql`, kept with it among the last `KEPT` texts of `last` (the caller leaves out a text past
 /// `LONGEST`): made once while the text is among them. The lock is held for the look and the keeping, never for `make`.
 pub(crate) fn kept<T: Clone>(last: &Mutex<VecDeque<(String, T)>>, sql: &str, make: impl FnOnce(&str) -> T) -> T {
