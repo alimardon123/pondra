@@ -904,9 +904,9 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
 async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> Result<Json<Value>, E> {
     ensure!(!app.members.reader(), "read-only node");
     if app.lake.table_meta_if(name).await?.is_none() {
-        crate::auth::at_least(crate::auth::Role::Admin, "making a table")?; // (as CREATE TABLE is)
+        crate::rights::may_here(crate::rights::Action::Define, crate::rights::Object::Table(name))?; // (making a table, as CREATE TABLE does)
     }
-    crate::auth::check_rows(&name)?; // (its INSERT grant, as SQL's)
+    crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name))?; // (its INSERT grant, as SQL's)
     let query = crate::routines::expand(&app.lake, &query).await?;
     // (a table that moved a column: the query's columns fill SQL's first ones, as an INSERT's do: `write::in_sql_order`)
     let query = match app.lake.table_meta_if(name).await? {
@@ -936,7 +936,7 @@ async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<J
     if !crate::auth::staged_job(job) {
         return Err(crate::codes::coded("22023", "a staged INSERT's job is letters, digits and hyphens, 64 at most").into()); // (invalid_parameter_value)
     }
-    crate::auth::check_rows(name)?; // (its INSERT grant, as SQL's)
+    crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(name))?; // (its INSERT grant, as SQL's)
     let Staged { columns, files, placed } = serde_json::from_str(body)?;
     if files > crate::write::STAGED_FILES_MOST {
         return Err(crate::codes::coded("54000", format!("a staged INSERT takes {} files at most, and this one says {files}", crate::write::STAGED_FILES_MOST)).into());
@@ -954,7 +954,7 @@ async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<J
     let picks: Vec<String> = columns.iter().enumerate().map(|(i, c)| format!("c{i} AS \"{}\"", c.replace('"', "\"\""))).collect();
     let url = format!("{}/stage/{slug}/{job}/*.parquet", app.lake.url.trim_end_matches('/')).replace('\'', "''");
     let stmt = crate::write::Stmt::InsertInto(name.to_string(), columns, format!("SELECT {} FROM '{url}'", picks.join(", ")));
-    app.auth.allows(who.role, &stmt)?;
+    crate::rights::may_run(who.role, &stmt)?;
     // (the page's INSERT without a column list: the order it put the values by, which the leader checks, `log::placed_for`)
     let placed = match (placed, crate::ddl::resolve(&app.lake, name).await) {
         (Some(p), Ok((None, table))) => Some((table, p)),
@@ -1092,7 +1092,7 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
 /// the key's partial rows with a filter + GROUP BY on one thread. Composite keys are
 /// comma-separated, in the key's column order.
 async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)>) -> Result<Response, E> {
-    crate::auth::check_all(&name)?; // (a user's: the whole row)
+    crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&name))?; // (a user's: the whole row)
     let lake = &app.lake;
     let meta = lake.table_meta(&name).await?;
     ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
@@ -1248,7 +1248,7 @@ struct WatchParams {
 /// New rows of a table as NDJSON, pushed the moment they commit (a view's rows included); with
 /// `?changes=true`, its changes: UPDATE's and DELETE's too, with the rows' system columns.
 async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query<WatchParams>, headers: HeaderMap) -> Response {
-    if let Err(e) = crate::auth::check_all(&name) {
+    if let Err(e) = crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&name)) {
         return (StatusCode::FORBIDDEN, crate::ext::said(&e)).into_response(); // (a user's: the whole rows)
     }
     // (the rows come after this request's scope has ended: its sign-in is checked again, and the table's whole rows with it, so
@@ -1256,7 +1256,7 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
     let (operator, header) = caller(&headers);
     let table = name.clone();
     let revoked = until_revoked(app.clone(), operator, header, move |p| {
-        p.role >= crate::auth::Role::Read && crate::auth::WHO.sync_scope(p.clone(), || crate::auth::check_all(&table)).is_ok()
+        crate::rights::may(p, crate::rights::Action::SelectAll, crate::rights::Object::Table(&table)).is_ok()
     });
     let hwm = app.lake.hwm.subscribe();
     let after = p.after.unwrap_or_else(|| app.lake.visible());

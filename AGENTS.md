@@ -916,7 +916,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 104. **Each kind of catalog entry has a prefix of its own** (round 23: `o/` catalogs attached from
    outside, `fd/` feeds, `e/` secrets; `f/` is the functions'). A scan of one prefix must never see
    another kind: feeds under `f/` broke `/functions` ("missing field flight"). `harness.py kafkas`:
-   "…its feed kept apart from the lake's functions".
+   "…its feed kept apart from the lake's functions". A prefix that isn't a kind's is registered by the module
+   that owns it (`records::Prefixes`, beside its key functions), and the registry refuses one that starts
+   another when it is built (`records`' tests); an installed extension's records go under
+   `ex/<extension>/` (`records::of_extension`). `pondra.prefixes` lists them all. `harness.py registry`:
+   "every key of a lake that made every kind is under a registered prefix".
 105. **A query that reads files on the node's machine runs there alone** (`spmd::sliced`:
    `ext::local`): other machines don't have them. One machine can't show it (every node there
    has the files), so no test fails without it; `outside` checks such a query's answer.

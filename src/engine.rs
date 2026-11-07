@@ -100,6 +100,11 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
     register: |r| {
         r.section_mut::<Functions>().add("engine", own);
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "functions", columns: FUNCTION_COLUMNS, rows: functions });
+        #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)
+        for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,
+                  crate::runs::PREFIXES, crate::tasks::PREFIXES, crate::users::PREFIXES, crate::views::PREFIXES] {
+            r.section_mut::<crate::records::Prefixes>().add(p);
+        }
     },
 };
 
@@ -361,10 +366,61 @@ pub async fn planned(ctx: &SessionContext, sql: &str) -> anyhow::Result<LogicalP
     let state = ctx.state(); // (one copy of the session's state: each is a clone of all of it, ~80K instructions a query)
     let generic = matches!(state.config().options().sql_parser.dialect, Dialect::Generic);
     // (a MATCH_RECOGNIZE's measure named like an input's column: DataFusion's duplicate field, said as the refusal: `pattern::reworded`)
-    Ok(match crate::friendly::lambdas(sql).filter(|_| generic) {
-        Some(stmt) => state.statement_to_plan(stmt).await.map_err(|e| crate::pattern::reworded(e, sql))?,
-        None => state.create_logical_plan(sql).await.map_err(|e| crate::pattern::reworded(e, sql))?,
-    })
+    // (and a query the front's looks parsed, planned from that parse, when the session parses as they did: `parsed_query`)
+    let as_looks = generic && state.config().options().sql_parser.recursion_limit.get() == LOOKS_DEPTH;
+    let (stmt, kept) = match crate::friendly::lambdas(sql).filter(|_| generic) {
+        Some(stmt) => (Some(stmt), false),
+        None => match as_looks.then(|| parsed_query(sql)).flatten() {
+            Some(stmt) => (Some(stmt), true),
+            None => (None, false),
+        },
+    };
+    if let (Some(stmt), true) = (&stmt, kept && one_parse_checked()) {
+        datafusions_parse(&state, sql, stmt)?;
+    }
+    match stmt {
+        Some(stmt) => state.statement_to_plan(stmt).await,
+        None => state.create_logical_plan(sql).await,
+    }
+    .map_err(|e| crate::pattern::reworded(e, sql))
+}
+
+/// Whether the front's parse is checked against DataFusion's own (`datafusions_parse`) where it is planned from: in a
+/// debug build, and in a node started with `PONDRA_TEST_ONE_PARSE` (the gates' runs: DataFusion's SQL tests, TPC-H,
+/// TPC-DS, the random queries, the harness).
+fn one_parse_checked() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| cfg!(debug_assertions) || crate::env::is_set("PONDRA_TEST_ONE_PARSE"));
+    *ON
+}
+
+/// `kept`, the front's parse of `sql`, is the statement DataFusion parses `sql` to with the session's settings: an error
+/// that names the text and both statements when it isn't (`parsed_query` would then be taking a text it must not). The
+/// statements are compared, not their plans: DataFusion's planner gives one statement plans that differ run to run where
+/// no answer does (the columns an ORDER BY adds below its projection come out of a hash set, in either order).
+fn datafusions_parse(state: &datafusion::execution::SessionState, sql: &str, kept: &datafusion::sql::parser::Statement) -> anyhow::Result<()> {
+    let theirs = state.sql_to_statement(sql, &state.config().options().sql_parser.dialect);
+    anyhow::ensure!(theirs.as_ref().is_ok_and(|t| t == kept), "one parse: the front's parse of the text is not DataFusion's, for {sql}\nthe front's: {kept}\nDataFusion's: {theirs:?}");
+    Ok(())
+}
+
+/// The depth the front's looks parse to: sqlparser's own limit, which is also DataFusion's default
+/// (`sql_parser.recursion_limit`). A session set to another depth parses each text itself.
+const LOOKS_DEPTH: usize = 50;
+
+/// A query the front's looks parsed already (`parsed::already`), to plan from that parse rather than parse the text a
+/// second time (step 8's one parse, while the front still hands on text). In the generic dialect at the same depth limit
+/// DataFusion parses a query as this parse did: sqlparser's tokenizer and parser, for any statement but its own CREATE,
+/// COPY, EXPLAIN and RESET. So only one statement that is a query is taken, and a text that didn't parse is parsed by
+/// DataFusion, for its own words.
+fn parsed_query(sql: &str) -> Option<datafusion::sql::parser::Statement> {
+    use datafusion::sql::sqlparser::ast::Statement;
+    match crate::parsed::already(sql)?.as_ref() {
+        Ok(stmts) => match stmts.as_slice() {
+            [q @ Statement::Query(_)] => Some(datafusion::sql::parser::Statement::Statement(Box::new(q.clone()))),
+            _ => None,
+        },
+        Err(_) => None,
+    }
 }
 
 /// A planned statement run, as `sql_checked` runs it: the frame of its rows. A DDL statement takes effect here.
@@ -534,6 +590,104 @@ mod tests {
         let batches = rows_of(&ctx, &sql).await.unwrap();
         assert_eq!(array_value_to_string(batches[0].column(0), 0).unwrap(), "2");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A query planned from the front's parse (`parsed_query`) is the plan DataFusion makes of its text: the same tree, the
+    /// same names and types, and the same refusal. If DataFusion's parser drifts from sqlparser's (its options: unescaping,
+    /// the dialect's trailing commas; its depth; a statement it parses itself), this fails, and `parsed_query` takes fewer
+    /// texts. The parse is kept under the very text it was made of, so it is planned only for that text (`parsed::already`).
+    #[tokio::test]
+    async fn a_query_planned_from_the_fronts_parse_is_datafusions_plan() {
+        use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+        let ctx = session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        let batch = RecordBatch::try_from_iter(vec![("x", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef)]).unwrap();
+        ctx.register_batch("t", batch).unwrap();
+        let state = ctx.state();
+        assert_eq!(state.config().options().sql_parser.recursion_limit.get(), LOOKS_DEPTH, "DataFusion's default depth");
+        let deep = |n: usize| format!("SELECT {}1{}", "(".repeat(n), ")".repeat(n));
+        let texts = [
+            "SELECT x, count(*) AS n FROM t WHERE x > 1 GROUP BY x ORDER BY x DESC NULLS FIRST LIMIT 2 OFFSET 0".to_string(),
+            "SELECT 'it''s', 'a\\nb', E'a\\nb', U&'\\0041', X'0102', 1e3, 0.1, -7, 2::bigint, CAST(x AS DOUBLE) FROM t".to_string(),
+            r#"SELECT "x" AS "Mixed Case", "x" AS "a""b", t.x AS ünï FROM t AS t"#.to_string(),
+            "SELECT E'\\n', E'it\\'s', 'a\nb', 'x''y''' FROM t".to_string(), // (escapes as the tokenizer unescapes them; a newline kept)
+            "SELECT x, sum(x), FROM t GROUP BY x".to_string(), // (a trailing comma, as the dialect's own setting reads it)
+            "SELECT x FROM t WHERE x IN (1, 2,)".to_string(),
+            "WITH a AS (SELECT x FROM t), b AS (SELECT x FROM a) SELECT * FROM b UNION ALL SELECT 1".to_string(),
+            "SELECT x, sum(x) OVER (PARTITION BY x % 2 ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t".to_string(),
+            "SELECT [1, 2], {'a': 1}, INTERVAL '1 day', x IN (1, 2), x BETWEEN 1 AND 2, x IS DISTINCT FROM 1 FROM t -- a comment".to_string(),
+            "/* a comment */ VALUES (1, 'a'), (2, 'b')".to_string(),
+            "SELECT * FROM t WHERE x = $1".to_string(),
+            "SELECT x FROM nope".to_string(),
+            "SELECT nope FROM t".to_string(),
+            deep(LOOKS_DEPTH / 2),
+        ];
+        let mut refused = vec![]; // (the texts neither parse takes)
+        for sql in &texts {
+            let theirs = state.create_logical_plan(sql).await.map(|p| p.display_indent_schema().to_string()).map_err(|e| e.to_string());
+            let Ok(parsed) = Parser::parse_sql(&GenericDialect {}, sql) else {
+                assert!(theirs.is_err(), "{sql}: DataFusion parsed a text sqlparser refused");
+                refused.push(sql.as_str());
+                continue;
+            };
+            assert!(matches!(parsed.as_slice(), [datafusion::sql::sqlparser::ast::Statement::Query(_)]), "{sql}: one query");
+            let stmt = datafusion::sql::parser::Statement::Statement(Box::new(parsed[0].clone()));
+            datafusions_parse(&state, sql, &stmt).unwrap_or_else(|e| panic!("{e}"));
+            let ours = state.statement_to_plan(stmt).await.map(|p| p.display_indent_schema().to_string()).map_err(|e| e.to_string());
+            assert_eq!(ours, theirs, "{sql}");
+        }
+        assert_eq!(refused, ["SELECT x FROM t WHERE x IN (1, 2,)"], "the texts neither parse takes");
+        // (the check itself: a statement unlike DataFusion's parse of the text is refused, naming the text; its own passes)
+        let sql = "SELECT x FROM t WHERE x > 1";
+        let of = |sql: &str| datafusion::sql::parser::Statement::Statement(Box::new(Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0)));
+        let err = datafusions_parse(&state, sql, &of("SELECT x FROM t WHERE x > 2")).expect_err("another statement").to_string();
+        assert!(err.starts_with("one parse:") && err.contains(sql), "{err}");
+        datafusions_parse(&state, sql, &of(sql)).unwrap();
+        // (too deep for either parse: DataFusion parses it, for its own words)
+        let sql = deep(LOOKS_DEPTH + 5);
+        assert!(Parser::parse_sql(&GenericDialect {}, &sql).is_err() && state.create_logical_plan(&sql).await.is_err());
+        // (the kept parse is the text's parse, or none: never another text's)
+        assert!(crate::parsed::already("SELECT 'never parsed by a look'").is_none());
+        let sql = "SELECT x + 1 AS y FROM t";
+        let _ = crate::parsed::generic(sql);
+        if let Some(kept) = crate::parsed::already(sql) {
+            assert_eq!(*kept, Parser::parse_sql(&GenericDialect {}, sql));
+        }
+        assert_eq!(
+            planned(&ctx, sql).await.unwrap().display_indent_schema().to_string(),
+            state.create_logical_plan(sql).await.unwrap().display_indent_schema().to_string()
+        );
+    }
+
+    /// A session that parses otherwise than the front's looks (another dialect, another depth) plans each text from its
+    /// own parse, even with the front's parse of that text at hand: `planned` takes the kept parse only as the looks parse.
+    #[tokio::test]
+    async fn a_session_that_parses_otherwise_plans_from_the_text() {
+        use datafusion::config::Dialect;
+        let with = |set: &dyn Fn(&mut SessionConfig)| {
+            let mut config = SessionConfig::new();
+            set(&mut config);
+            let ctx = session(config, Arc::new(RuntimeEnv::default()));
+            let batch = RecordBatch::try_from_iter(vec![("x", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef)]).unwrap();
+            ctx.register_batch("t", batch).unwrap();
+            ctx
+        };
+        // (MySQL reads "x" as a string, the generic dialect as a column)
+        let mysql = with(&|c| c.options_mut().sql_parser.dialect = Dialect::MySQL);
+        let sql = r#"SELECT "x" AS v FROM t WHERE 'mysql' = 'mysql'"#;
+        assert!(crate::parsed::generic(sql).is_ok());
+        let plan = planned(&mysql, sql).await.unwrap().display_indent().to_string();
+        assert!(plan.contains(r#"Utf8("x")"#), "{plan}");
+        // (a depth the looks take but a session set shallower refuses)
+        let shallow = with(&|c| c.options_mut().sql_parser.recursion_limit = datafusion::config::ConfigNonZeroUsize::try_new(10).unwrap());
+        let sql = format!("SELECT {}x{} FROM t WHERE 'shallow' = 'shallow'", "(".repeat(20), ")".repeat(20));
+        assert!(crate::parsed::generic(&sql).is_ok());
+        let err = planned(&shallow, &sql).await.expect_err("too deep for the session's parser").to_string();
+        assert!(err.to_lowercase().contains("recursion"), "{err}");
+        // (and a session that parses as the looks do plans the same text from their parse, to the same plan)
+        let generic = with(&|_| {});
+        assert!(crate::parsed::generic(&sql).is_ok());
+        let plan = planned(&generic, &sql).await.unwrap();
+        assert_eq!(plan, generic.state().create_logical_plan(&sql).await.unwrap());
     }
 
     /// `EXPLAIN ANALYZE` is answered by `collect` (`analyzed`, this file's copy of DataFusion's `create_output_batch`) and

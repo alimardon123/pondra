@@ -6,7 +6,6 @@
 //! (SHA-1 of `blob <size>\0` and the bytes), so local changes come from the folder's files and the
 //! record alone, with no network.
 
-use crate::auth::Role;
 use crate::ext;
 use crate::files::{APPLIES, VERSIONS};
 use crate::lake_files::under_files;
@@ -487,7 +486,7 @@ pub async fn call(app: &App, name: &str, args: &[FunctionArg], who: Who) -> Resu
     let v = crate::apply::rows_json(&rows, 1)?.into_iter().next().unwrap_or_default();
     let folder = folder_of(v["folder"].as_str().unwrap_or_default())?;
     if verb != "git_status" {
-        ensure!(who.role >= Role::Write, "{name} writes the workspace's files: it needs a write token");
+        crate::rights::may_as(who.role, crate::rights::Action::Write, crate::rights::Object::Lake)?; // (the workspace's files)
     }
     let (lake, secret) = (&app.lake, text(&v, "secret"));
     Ok(match verb {

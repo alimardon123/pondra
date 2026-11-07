@@ -1416,6 +1416,17 @@ pub async fn folder_of(lake: &Lake, t: &str) -> Result<String> {
 pub fn seg_key(n: u64) -> String { format!("s/{n:020}") }
 pub fn producer_key(p: &str) -> String { format!("p/{p}") }
 
+/// The store's own records in the catalog (`records`): the log's segments and their inline data, each producer's mark,
+/// and the commit's numbers.
+pub const PREFIXES: &[crate::records::Prefix] = &[
+    crate::records::Prefix { prefix: "s/", owner: "store", holds: "the log's segments: each commit's rows and files, by number (seg_key)" },
+    crate::records::Prefix { prefix: "d/", owner: "store", holds: "a small segment's data, inside the catalog (data_key)" },
+    crate::records::Prefix { prefix: "p/", owner: "store", holds: "each producer's last sequence, for exactly-once (a job's, a feed's, a Kafka group's offsets)" },
+    crate::records::Prefix { prefix: "c", owner: "store", holds: "the last commit's number" },
+    crate::records::Prefix { prefix: "n", owner: "store", holds: "the next segment's number" },
+    crate::records::Prefix { prefix: QUIET, owner: "store", holds: "a commit's mark that a read sees nothing changed (retention's)" },
+];
+
 /// How long a producer's mark is kept after its last commit, from its name and the time `now` (ms; 0: kept for
 /// good, as every mark was before expiries). Three windows:
 /// - the named window, `copy::retention_ms` (64 days): a job a client named (`POST /sql?job=`,
@@ -3630,6 +3641,7 @@ impl Catalog {
     /// A table's entry (`t/…`) as parsed, for a read that runs per query or request: see `parsed`.
     pub async fn meta(&self, key: &str) -> Result<Option<Arc<TableMeta>>> {
         let raw = if self.mirror.load(Relaxed) {
+            crate::metrics::add(&crate::metrics::CATALOG_READS, 1);
             self.overlay.lock().unwrap().get(key).and_then(|(_, v)| v.clone()) // (the overlay holds the whole catalog)
         } else {
             self.get_raw(key).await?
@@ -3660,6 +3672,11 @@ impl Catalog {
     }
 
     pub async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
+        crate::metrics::add(&crate::metrics::CATALOG_READS, 1); // (a record looked up, there or not: the write-set rule counts it)
+        self.get_raw_uncounted(key).await
+    }
+
+    async fn get_raw_uncounted(&self, key: &str) -> Result<Option<Bytes>> {
         if self.kv.is_writer() {
             return Ok(match key.starts_with("d/") {
                 // The leader answers from its in-memory catalog: committed writes only, never ones
@@ -3757,6 +3774,12 @@ impl Catalog {
     /// `scan_raw`, and the commit the entries are read as of (`at`): the lake as of commit `at`, which a page of a range
     /// is checked against (`kv`, `Remote::scan`). A mirror answers as of its last streamed commit; a view alone as of its own.
     pub async fn scan_raw_at(&self, from: &str, to: &str) -> Result<(BTreeMap<String, Bytes>, u64)> {
+        let got = self.scan_raw_at_uncounted(from, to).await?;
+        crate::metrics::add(&crate::metrics::CATALOG_READS, got.0.len() as u64); // (each record a scan read)
+        Ok(got)
+    }
+
+    async fn scan_raw_at_uncounted(&self, from: &str, to: &str) -> Result<(BTreeMap<String, Bytes>, u64)> {
         if from >= to {
             return Ok((BTreeMap::new(), self.at_now().await?));
         }
@@ -3817,6 +3840,12 @@ impl Catalog {
     /// (`scan_raw_at`'s `at`): one page of a range (`kv`). In memory it takes only those `n` (the overlay's range, filtered
     /// and `take`n), so keys `keep` refuses don't cost a page; without the whole catalog here, it reads all of the range.
     pub async fn scan_page(&self, from: &str, to: &str, n: usize, keep: impl Fn(&str) -> bool) -> Result<(Vec<(String, Bytes)>, u64)> {
+        let got = self.scan_page_uncounted(from, to, n, keep).await?;
+        crate::metrics::add(&crate::metrics::CATALOG_READS, got.0.len() as u64);
+        Ok(got)
+    }
+
+    async fn scan_page_uncounted(&self, from: &str, to: &str, n: usize, keep: impl Fn(&str) -> bool) -> Result<(Vec<(String, Bytes)>, u64)> {
         if from >= to {
             return Ok((Vec::new(), self.at_now().await?));
         }
@@ -3948,6 +3977,7 @@ impl Catalog {
     /// waiting (pipelined commits: one round trip no longer blocks the next).
     pub async fn write(&self, puts: Vec<(String, Vec<u8>)>, deletes: &[String]) -> Result<oneshot::Receiver<()>> {
         let (true, Some(writes)) = (self.kv.is_writer(), &self.writes) else { bail!("read-only node") };
+        crate::metrics::add(&crate::metrics::CATALOG_WRITES, (puts.len() + deletes.len()) as u64); // (records put or deleted)
         if self.frozen.load(Relaxed) && !crate::backup::may_write(puts.iter().map(|(k, _)| k).chain(deletes)) {
             return Err(crate::backup::refused(None)); // (whatever door a write came through: ADR-070)
         }
@@ -4279,7 +4309,6 @@ mod tests {
 
     /// A catalog its own node's stop closed answers an error, never a restart (invariant 300):
     /// taken for a fence, the write below would exec this test again.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closed_by_its_own_stop_is_no_fence() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-closed-{}", uuid::Uuid::new_v4()));
@@ -4296,7 +4325,6 @@ mod tests {
 
     /// A catalog closed under its node (a newer leader's fence) restarts that node by the lifecycle its lake was handed, never
     /// the process: of two nodes in one process (step 2's gate), the other is told nothing and goes on writing.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fence_restarts_the_node_its_catalog_was_opened_in_and_no_other() -> Result<()> {
         /// A node's lifecycle that writes down what it was told, and unwinds on a restart as a library's node does.
@@ -4371,7 +4399,6 @@ mod tests {
     /// e-tag a put or a head gave goes through, and the next with the e-tag that one gave too; an old e-tag, a
     /// missing object and two updates racing on one e-tag are refused as S3 refuses them; an update with an
     /// attribute is refused by name and changes nothing; creates and overwrites are as they were.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_folder_takes_conditional_overwrites() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-local-{}", uuid::Uuid::new_v4()));
@@ -4416,7 +4443,6 @@ mod tests {
 
     /// A table entry is parsed once for its bytes: the same bytes (in the same buffer or another) give the
     /// same parse, changed bytes a new one, and what is kept stays under its count and byte bounds.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_table_entry_is_parsed_once_per_version() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-parsed-{}", uuid::Uuid::new_v4()));
@@ -4455,7 +4481,6 @@ mod tests {
     /// entries, in other buffers, gives the same parses; changed bytes a new one; bad bytes an error; each entry
     /// is charged its parsed form too, within the bounds; and a sweep bigger than the cache leaves it as it was.
     /// Prints what a pass over 5,000 entries costs parsed and kept.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_segment_entry_is_parsed_once_per_version() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-segments-{}", uuid::Uuid::new_v4()));
@@ -4501,7 +4526,6 @@ mod tests {
 
     /// `recent_inline` answers a `d/` key that one of the last 64 commits wrote, and no other key: the
     /// frames are sent by hand, as the commit loop would send them, so no commit has to wait for it.
-    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recent_inline_answers_the_last_64_commits() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-recent-{}", uuid::Uuid::new_v4()));

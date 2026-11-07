@@ -19,6 +19,23 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
+/// The `delta` extension's type of connection: a folder of Delta tables, attached as a database (`ATTACH … (TYPE delta)`).
+#[cfg(feature = "lake")]
+pub static DELTA: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "delta",
+    requires: &[],
+    register: |r| {
+        r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES);
+        r.section_mut::<crate::records::Prefixes>().add(crate::delta::PREFIXES);
+    },
+};
+
+#[cfg(feature = "lake")]
+const TABLES: crate::connections::ConnectionType = {
+    use crate::connections::{ConnectionType, Holds, READ_ONLY, SECRET, URL};
+    ConnectionType { name: "delta", holds: Holds::Tables, options: &[URL, SECRET, READ_ONLY], schemes: &[], secret_types: &["s3", "r2", "gcs", "azure"], about: "a folder of Delta tables, on the machine or in a bucket: url = 's3://bucket/tables'", open: None }
+};
+
 /// The reader features read here (Delta's protocol, reader version 3).
 const FEATURES: &[&str] = &["columnMapping", "deletionVectors", "timestampNtz", "typeWidening", "typeWidening-preview", "v2Checkpoint", "vacuumProtocolCheck"];
 
