@@ -2416,6 +2416,7 @@ impl Lake {
         }
         ledger.charge("facts", Arc::downgrade(&crate::query::facts_kept())); // (the node's, charged once whatever lakes it opens)
         ledger.charge("manifests", Arc::downgrade(&crate::manifest::kept())); // (the node's too: see `node::start_app` for the rest)
+        ledger.charge("files", Arc::downgrade(&crate::cache::outside())); // (the process's, of files outside the lakes)
         crate::oom::wake();
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
@@ -2709,6 +2710,7 @@ impl Lake {
             caches.push(("ranges", ranges.clone())); // (a lake on a bucket: a local or in-memory one reads its store directly)
         }
         caches.extend([("log", self.tail.clone() as _), ("catalog_blocks", self.cat.blocks()), ("footers", self.kept.0.clone() as _), ("statistics", self.kept.1.clone() as _)]);
+        caches.extend(self.cat.kept_parsed());
         caches
     }
 
@@ -2996,6 +2998,15 @@ impl<T> Parsed<T> {
     }
 }
 
+/// The entries kept parsed give memory back when the node needs it, the least recently used first: each is parsed again.
+impl<T: Send + Sync> crate::ledger::Charged for Mutex<Parsed<T>> {
+    fn held(&self) -> usize { self.lock().unwrap_or_else(std::sync::PoisonError::into_inner).by_key.bytes() }
+
+    fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(self, |p| &mut p.by_key, bytes) }
+
+    fn gives_back(&self) -> bool { true }
+}
+
 /// Whether two buffers hold the same bytes. A buffer held by `Parsed` is never freed, and `Bytes` never
 /// change, so the same start and length is the same content; any other pair is compared, which is cheap
 /// next to a parse.
@@ -3123,8 +3134,8 @@ pub struct Catalog {
     follows: bool,                // follower / read-only node that gets the commit stream
     mirror: AtomicBool,           // the overlay holds the whole catalog (but inline data): read only it
     loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
-    metas: Mutex<Parsed<TableMeta>>, // tables' entries as parsed (`parsed`)
-    segs: Mutex<Parsed<Segment>>,    // log segments' entries as parsed (`segments`)
+    metas: Arc<Mutex<Parsed<TableMeta>>>, // tables' entries as parsed (`parsed`)
+    segs: Arc<Mutex<Parsed<Segment>>>,    // log segments' entries as parsed (`segments`)
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
     closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
 }
@@ -3398,12 +3409,16 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw)), segs: Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge)), frozen: Default::default(), closing: Default::default() }
+        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default() }
     }
 
     /// What the catalog's block caches hold, in bytes.
     /// Its store's block caches (`/metrics`' `catalog_blocks`), which keep what they hold at their own limits.
     pub fn blocks(&self) -> Arc<dyn crate::ledger::Charged> { self.kv.clone() }
+
+    /// The entries kept parsed, tables' and log segments', as the node's line counts them (`cache_bytes{cache=
+    /// "catalog_entries"}`, `"catalog_segments"`; 11-07 audit M4).
+    pub fn kept_parsed(&self) -> [(&'static str, Arc<dyn crate::ledger::Charged>); 2] { [("catalog_entries", self.metas.clone() as _), ("catalog_segments", self.segs.clone() as _)] }
 
     /// The recent frames plus a receiver for every frame from now on: the leader's own stream, or a follower's, which
     /// holds the leader's frames as it relayed them (`relay`). Either serves `GET /cluster/log` the same way.
@@ -4539,7 +4554,7 @@ mod tests {
         let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
         let ledger = lake.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
         let names: Vec<&str> = lake.caches().iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, ["hot", "lookups", "tails", "log", "catalog_blocks", "footers", "statistics"], "a local lake has no cache of a bucket's ranges");
+        assert_eq!(names, ["hot", "lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments"], "a local lake has no cache of a bucket's ranges");
         let _ = lake.tails.lock().unwrap().put("t".into(), vec![], 4096);
         // (other tests' lakes may be charged to the same line meanwhile: what this lake holds is the least it reads)
         assert!(ledger.held() >= 4096, "the line counts the tails");
@@ -4553,7 +4568,7 @@ mod tests {
         // (`/metrics` reads the line's list by name: the node's planning facts and manifests are on it beside the lake's caches;
         // a node's start charges its kept pages and outside tables' logs and manifests, `node::start_app`)
         let metrics: Vec<&str> = lake.cached_bytes().iter().map(|(name, _)| *name).collect();
-        assert!(["lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "facts", "manifests"].iter().all(|n| metrics.contains(n)), "{metrics:?}");
+        assert!(["lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments", "facts", "manifests", "files"].iter().all(|n| metrics.contains(n)), "{metrics:?}");
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

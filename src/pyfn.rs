@@ -316,9 +316,23 @@ impl Kept {
     }
 }
 
-crate::per_node!(static ANSWERS: Mutex<Answers> = Mutex::new(Answers { kept: crate::ledger::ByteLru::new(answers_bytes()) }); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).kept.clear());
+crate::per_node!(static ANSWERS: Arc<Mutex<Answers>> = Arc::new(Mutex::new(Answers { kept: crate::ledger::ByteLru::new(answers_bytes()) })); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).kept.clear());
 
 fn answers_bytes() -> usize { crate::env::value::<usize>("PONDRA_FUNCTION_CACHE_MB") << 20 }
+
+/// The functions' answers kept, as the node's line counts them (`cache_bytes{cache="function_answers"}`, 11-07 audit M4).
+pub fn kept() -> Arc<dyn crate::ledger::Charged> { ANSWERS.clone() }
+
+impl crate::ledger::Charged for Mutex<Answers> {
+    fn held(&self) -> usize { self.lock().unwrap_or_else(|e| e.into_inner()).kept.bytes() }
+
+    fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(self, |a| &mut a.kept, bytes) }
+
+    fn gives_back(&self) -> bool { true }
+
+    /// Inside the whole line, unless `PONDRA_FUNCTION_CACHE_MB` gives them a budget of their own.
+    fn inside(&self) -> bool { crate::env::get("PONDRA_FUNCTION_CACHE_MB").is_none() }
+}
 
 impl Answers {
     fn get(&mut self, key: &[u8]) -> Option<&Kept> {
