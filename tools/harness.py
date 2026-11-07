@@ -508,8 +508,8 @@ def external():
         and read1 == [{"s": 1}] and read2 == [{"s": 3}] and after_file == after_lake and q("SELECT sum(a) AS s FROM owned") == [{"s": 6}]
     q("DROP TABLE owned")
     names = set(re.findall(rb'pondra_cache_bytes\{cache="(\w+)"\}', call(A.port, "GET", "/metrics", headers=hdr)))
-    checks["/metrics counts every cache on the node's line, the node's own with the lake's (tables' manifests, kept pages, Delta logs and Iceberg manifests, point plans, the log tails' keys)"] = \
-        {b"answers", b"facts", b"manifests", b"pages", b"delta_logs", b"iceberg_manifests", b"point_plans", b"tail_keys", b"tails", b"lookups"} <= names
+    checks["/metrics counts every cache on the node's line, the node's own with the lake's (tables' manifests, kept pages, Delta logs and Iceberg manifests, point plans, the log tails' keys, outside files, functions' answers, the catalog's parsed entries)"] = \
+        {b"answers", b"facts", b"manifests", b"pages", b"delta_logs", b"iceberg_manifests", b"point_plans", b"tail_keys", b"tails", b"lookups", b"files", b"function_answers", b"catalog_entries", b"catalog_segments"} <= names
     q("CREATE EXTERNAL TABLE ev (id INT, name VARCHAR) STORED AS CSV LOCATION 'ev/' OPTIONS ('format.has_header' 'false')")
     empty = q("SELECT count(*) AS n FROM ev")
     q("INSERT INTO ev VALUES (1, 'one'), (2, 'two')")

@@ -72,6 +72,7 @@ struct State {
     cols: HashMap<(String, String), Col>, // (file, column) -> its arrays, a batch each
     rows: BTreeMap<String, Arc<Vec<usize>>>, // file -> rows per batch (the same for all its columns)
     used: usize,
+    loading: usize,                  // what the decode running now holds, about: its footer's estimate (`load`)
     busy: HashSet<String>,           // files being loaded
     once: std::collections::VecDeque<String>, // files a scan read once (the next read loads them)
     need: HashMap<String, usize>,    // files that didn't fit: the bytes they decode to, so no read decodes them again until that much is free
@@ -142,10 +143,10 @@ impl Hot {
 
     pub fn on(&self) -> bool { self.max > 0 }
 
-    /// Bytes held, the most it may hold, and files being loaded (or waiting to be).
+    /// Bytes held (with the estimate of a decode running now), the most it may hold, and files being loaded (or waiting to be).
     pub fn usage(&self) -> (usize, usize, usize) {
         let s = self.state.lock().unwrap();
-        (s.used, self.max, s.busy.len())
+        (s.used + s.loading, self.max, s.busy.len())
     }
 
     /// Drop the least recently read columns until `bytes` are freed, and say how many were (the one
@@ -260,11 +261,31 @@ impl Hot {
             let _slot = hot.slot.acquire().await;
             // (the room now, not when the scan asked: its query is over, and the next may hold what it left)
             let room = hot.room_for(&lake);
+            // The decode holds its estimate on the line while it runs (11-07 audit L6): what it reads and keeps is in no
+            // cache yet, and a query's grow meanwhile goes by what the caches hold (`ledger::Ledger::cached`).
+            let line = lake.ledger().filter(|_| !hot.own).cloned();
+            let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let fits = {
-                let hot = hot.clone();
-                move |estimate: usize| hot.state.lock().unwrap().room(estimate, room)
+                let (hot, line, held) = (hot.clone(), line.clone(), held.clone());
+                move |estimate: usize| {
+                    let mut s = hot.state.lock().unwrap();
+                    let fits = s.room(estimate, room);
+                    if fits {
+                        s.loading += estimate;
+                        held.store(estimate, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(line) = &line {
+                            line.cache_grew(estimate);
+                        }
+                    }
+                    fits
+                }
             };
             let decoded = decode(&lake, &file, &fields, deletes, fits).await;
+            let estimate = held.load(std::sync::atomic::Ordering::Relaxed);
+            hot.state.lock().unwrap().loading -= estimate; // (let go of before the room is read, as `room_for` reads it)
+            if let Some(line) = &line {
+                line.cache_shrank(estimate);
+            }
             let room = hot.room_for(&lake);
             let mut s = hot.state.lock().unwrap();
             s.busy.remove(&key);
@@ -289,6 +310,9 @@ impl Hot {
                 s.cols.insert((key.clone(), f.name().clone()), Col { arrays: Arc::new(arrays), ranges, bytes, read: Instant::now() });
             }
             drop(s);
+            if let Some(line) = &line {
+                line.cache_grew(bytes); // (the columns are the cache's now, until the watch's next look counts them)
+            }
             crate::oom::wake(); // (the columns are in: the watch may need to give some back)
         });
         true
@@ -427,6 +451,7 @@ impl State {
 
     /// Is there room for `bytes` more, after dropping columns unread for a minute (oldest first)?
     fn room(&mut self, bytes: usize, max: usize) -> bool {
+        let max = max.saturating_sub(self.loading); // (a decode running holds its estimate: `load`)
         if self.used + bytes <= max {
             return true;
         }
@@ -1301,6 +1326,15 @@ mod tests {
             assert!(!s.tries("f", 10, memory, 100), "memory {memory}: no room for 150, so no decode");
             assert!(s.tries("f", 10, memory, 200), "memory {memory}: room for it now");
         }
+    }
+
+    /// A decode running holds its estimate (11-07 audit L6): another file's load has only the room left beside it.
+    #[test]
+    fn a_running_decode_holds_its_estimate() {
+        let mut s = State { loading: 60, ..Default::default() };
+        assert!(!s.room(50, 100) && s.room(40, 100));
+        s.loading = 0;
+        assert!(s.room(100, 100), "once it's over, the room is the cache's again");
     }
 
     /// A file that didn't fit was never held, so a commit that replaced it lets go of what was noted for it all the same

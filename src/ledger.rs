@@ -12,7 +12,8 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation};
 use std::borrow::Borrow;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use datafusion::common::instant::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError, TryLockError, Weak};
 
 /// A map that keeps its most recently used entries within a byte bound, and within a count bound when one is set. Each
@@ -238,6 +239,10 @@ pub fn give_back_from<T, K: Hash + Eq, V>(cache: &Mutex<T>, lru: impl Fn(&mut T)
     freed
 }
 
+/// How old the caches' count may be at a query's grow, in ms (`Ledger::fresh`).
+const STALE_MS: u64 = 1000;
+const NEVER: u64 = u64::MAX;
+
 /// Each name once, in the order first given.
 fn kinds_of(names: impl Iterator<Item = &'static str>) -> Vec<&'static str> {
     let mut kinds = vec![];
@@ -283,6 +288,8 @@ pub struct Ledger {
     busy: AtomicUsize,     // lakes with a memory consumer registered now
     cached: AtomicUsize,   // what the caches held at the last look (`note`), less what grows took back since
     dry: AtomicBool,       // a take-back since the last look came back short: grows don't ask the caches again until `note`
+    born: Instant,         // (what `noted` counts from)
+    noted: AtomicU64,      // the last look (`note`), in ms since `born`: `NEVER` before the first
     caches: Mutex<Vec<(&'static str, Weak<dyn Charged>)>>, // what the node keeps on this line, by name (`charge`), in the order they give back
 }
 
@@ -290,7 +297,7 @@ impl Ledger {
     /// A ledger whose queries hold `line` at most, inside `whole` with the caches (`line` itself when the setting is the whole
     /// line). A `hard` whole line refuses a spiller's grow the caches don't make room for; a soft one only takes cache bytes back.
     pub fn new(line: usize, whole: usize, hard: bool) -> Arc<Ledger> {
-        Arc::new(Ledger { line, whole, hard, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0), cached: AtomicUsize::new(0), dry: AtomicBool::new(false), caches: Default::default() })
+        Arc::new(Ledger { line, whole, hard, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0), cached: AtomicUsize::new(0), dry: AtomicBool::new(false), born: Instant::now(), noted: AtomicU64::new(NEVER), caches: Default::default() })
     }
 
     /// A new lake's pool on this line.
@@ -304,14 +311,33 @@ impl Ledger {
     /// What the caches held at the last look, less what grows took back since: what a grow goes by.
     pub fn cached(&self) -> usize { self.cached.load(Relaxed) }
 
+    /// A cache inside the whole line holds `bytes` more since the last look (`note`): a hot load's decode, while it runs.
+    pub fn cache_grew(&self, bytes: usize) { self.cached.fetch_add(bytes, Relaxed); }
+
+    /// A cache inside the whole line holds `bytes` less since the last look, of what it said it grew (`cache_grew`).
+    pub fn cache_shrank(&self, bytes: usize) { let _ = self.cached.fetch_update(Relaxed, Relaxed, |held| Some(held.saturating_sub(bytes))); }
+
     /// Reads what the caches inside the whole line hold now (`Charged::inside`), for the grows to go by until the next look,
     /// and says it. The node's memory watch reads it at each of its looks (`oom.rs`), so a grow never locks a cache to read it.
     pub fn note(&self) -> usize {
+        self.noted.store(self.now(), Relaxed);
         let held = self.charged().iter().filter(|(_, c)| c.inside()).map(|(_, c)| c.held()).sum();
         self.cached.store(held, Relaxed);
         self.dry.store(false, Relaxed);
         held
     }
+
+    /// Notes the caches (`note`) when nothing has for [`STALE_MS`]: where no memory watch runs (`pondra sql`, a page), a
+    /// query's grow is what notes them, so the whole line holds the caches there too (11-07 audit M4). Where the watch runs it
+    /// looks at each request's start, and on a node's line at least every second while one runs, so there this seldom notes.
+    fn fresh(&self) {
+        let (now, noted) = (self.now(), self.noted.load(Relaxed));
+        if (noted == NEVER || now.saturating_sub(noted) >= STALE_MS) && self.noted.compare_exchange(noted, now, Relaxed, Relaxed).is_ok() {
+            self.note(); // (one grow notes: the others go by the last look meanwhile)
+        }
+    }
+
+    fn now(&self) -> u64 { self.born.elapsed().as_millis() as u64 }
 
     /// What every lake's queries hold now.
     pub fn reserved(&self) -> usize { self.reserved.load(Relaxed) }
@@ -525,6 +551,7 @@ impl MemoryPool for LakePool {
     }
 
     fn try_grow(&self, r: &MemoryReservation, additional: usize) -> Result<()> {
+        self.ledger.fresh(); // (before the lake's lock: a note locks each cache a moment)
         let mut p = self.part();
         let (available, room) = self.available(&p, r);
         if additional > available {
@@ -875,6 +902,37 @@ mod tests {
         sort.free();
         sort.try_grow(20).expect("and grows again from nothing");
         assert_eq!(ledger.reserved(), 20);
+    }
+
+    /// A hot load's decode holds its estimate on the line while it runs (`Hot::load`, 11-07 audit L6): a grow meanwhile
+    /// has only what it leaves.
+    #[test]
+    fn a_decode_running_holds_its_estimate_on_the_line() {
+        let ledger = Ledger::new(100, 100, true);
+        let a = ledger.pool();
+        let sort = consumer(&a, "sort", true);
+        ledger.note(); // (the watch's look: the grows go by it, and the decode's estimate on it, for a second)
+        ledger.cache_grew(60);
+        sort.try_grow(40).expect("beside the decode's 60");
+        assert!(sort.try_grow(1).is_err(), "nothing past it");
+        ledger.cache_shrank(60);
+        sort.try_grow(60).expect("the decode is over");
+        assert_eq!(ledger.cached(), 0);
+    }
+
+    /// Where no memory watch looks (`pondra sql`, a page), a query's grow notes the caches itself (11-07 audit M4): the whole
+    /// line holds them there too.
+    #[test]
+    fn where_no_watch_looks_a_grow_notes_the_caches() {
+        let ledger = Ledger::new(100, 100, true);
+        let kept: Arc<dyn Charged> = Arc::new(Kept(70));
+        ledger.charge("kept", Arc::downgrade(&kept));
+        assert_eq!(ledger.cached(), 0, "no look yet");
+        let a = ledger.pool();
+        let sort = consumer(&a, "sort", true);
+        sort.try_grow(30).expect("beside the 70 the cache holds");
+        assert_eq!(ledger.cached(), 70, "the grow looked");
+        assert!(sort.try_grow(1).is_err(), "and nothing past them");
     }
 
     /// A cache the user gave a budget of its own (`Charged::inside`).
