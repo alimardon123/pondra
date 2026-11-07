@@ -40,7 +40,7 @@ FORMS = ("server", "cluster", "inprocess", "memory", "page")
 LISTS = 6  # the lake format a new lake starts at in every form: its tables' column lists (`format::LISTS`)
 SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
 # DataFusion's own words for what it lacks: a refusal in them isn't yet one the form names (ADR-072 §6)
-DATAFUSION = re.compile(r"This feature is not implemented|not supported|Unsupported|SQL error|Schema error|Error during planning|Inconsistent data length|Placeholder")
+DATAFUSION = re.compile(r"This feature is not implemented|not supported|Unsupported|SQL error|syntax error: |Schema error|Error during planning|Inconsistent data length|Placeholder")  # (`syntax error: …`: the parser's own words, `codes::parser_said`)
 TIMEOUT = 120
 
 

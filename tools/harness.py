@@ -2663,6 +2663,14 @@ def clients():
     as_http = urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/sql", data=exact.encode(), headers={"authorization": "Bearer r-tok"})).read().decode()
     checks["MCP's rows read as HTTP's, byte for byte: a DECIMAL's every digit (99999999999999.9999, 0.10), not a double's"] = \
         as_mcp == '{"rows":' + as_http + ',"total_rows":1}' and '"d":99999999999999.9999' in as_mcp and '"small":0.10' in as_mcp
+    # What an agent writes its next SQL from (the agent benchmark's findings): a NULL said as null (not left out), columns
+    # typed as SHOW CREATE types them (not Arrow's Int64, Utf8), the dialect named as Pondra's, a parse error said once
+    with_null = tool("r-tok", "query", sql="SELECT 1 AS a, CAST(NULL AS INT) AS b")["rows"]
+    docs_types = [c["type"] for t in tool("r-tok", "list_tables")["tables"] if t["table"] == "docs" for c in t["columns"]]
+    unparsed = mcp("r-tok", "tools/call", {"name": "query", "arguments": {"sql": "SELEC 1"}})["content"][0]["text"]
+    checks["MCP for agents: a NULL said as null; list_tables types as SHOW CREATE does; Postgres's dialect named; a parse error said once, 42601"] = \
+        with_null == [{"a": 1, "b": None}] and docs_types == ["BIGINT", "VARCHAR", "REAL[]"] and "PostgreSQL's" in init["instructions"] \
+        and "DataFusion" not in init["instructions"] and unparsed.startswith("SQLSTATE 42601: syntax error: Expected: ") and unparsed.count("Expected") == 1
     # Raw MCP calls, with the status and headers: (status, headers, the JSON answer or its text)
     def mcp_raw(token, method, params=None, sid=None, verb="POST", port=None):
         headers = {"content-type": "application/json", "authorization": f"Bearer {token}"}
@@ -21665,6 +21673,25 @@ def registry():
     LAKES.extend([dev_at, slim_at])
     q("CREATE SECRET reg_secret (TYPE http, BEARER_TOKEN 'reg-token-1', SCOPE 'https://reg.example.com/')")  # (a secret the clone must leave)
     q(f"CREATE DATABASE dev LOCATION '{dev_at}' CLONE \"{here}\"")
+    # A Postgres client's startup database (dbname) is its session's when it names one here: `psql -d dev` writes into the
+    # branch, never the lake it was cloned from; any other name is this lake, as before
+    import psycopg
+    pg_dsn = lambda db: f"host=127.0.0.1 port={A.port + 10} user=pondra dbname={db}"
+    by_db = {}
+    with psycopg.connect(pg_dsn("dev"), autocommit=True) as c:
+        by_db["current_database"] = c.execute("SELECT current_database()").fetchone()[0]
+        c.execute("INSERT INTO kv VALUES (9, 'by dbname', 9)")
+        by_db["inserted (branch, base)"] = [q("SELECT count(*) AS n FROM dev.kv WHERE k = 9"), q("SELECT count(*) AS n FROM kv WHERE k = 9")]
+        c.execute("UPDATE kv SET v = 'changed' WHERE k = 9")  # (an UPDATE and a DELETE too: they once looked up `dev.public.kv` inside dev)
+        by_db["updated"] = q("SELECT v FROM dev.kv WHERE k = 9")
+        c.execute("DELETE FROM kv WHERE k = 9")
+        by_db["deleted"] = q("SELECT count(*) AS n FROM dev.kv WHERE k = 9")
+    base_rows = q("SELECT count(*) AS n FROM kv")[0]["n"]
+    with psycopg.connect(pg_dsn("nosuch"), autocommit=True) as c:
+        by_db["nosuch"] = [c.execute("SELECT current_database()").fetchone()[0], c.execute("SELECT count(*) FROM kv").fetchone()[0]]
+    info["dbname"] = by_db
+    checks["a Postgres client's dbname that names a branch is its session's: its INSERT, UPDATE and DELETE land in the branch, not the base; another name is this lake"] = \
+        by_db == {"current_database": "dev", "inserted (branch, base)": [[{"n": 1}], [{"n": 0}]], "updated": [{"v": "changed"}], "deleted": [{"n": 0}], "nosuch": [here, base_rows]}
     # What the clone took, as the registry says (pondra.kinds' on_clone, read here, never written in), against what each lake lists
     on_clone = {r["kind"]: r for r in q("SELECT * FROM pondra.kinds") if r["is"] == "object"}
     cloned_families = ("schema", "relation", "routine", "task", "type", "secret")

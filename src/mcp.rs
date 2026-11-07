@@ -53,7 +53,7 @@ pub async fn handle(State(app): State<App>, Extension(role): Extension<Role>, he
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "pondra", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": "Pondra is a streaming lakehouse: tables that take appends, upserts and deletes and \
-                    are queryable within milliseconds, in SQL (Apache DataFusion's dialect, close to PostgreSQL). \
+                    are queryable within milliseconds, in SQL: PostgreSQL's, with DuckDB's forms and Pondra's own. \
                     Start with list_tables."})
         }
         "ping" => json!({}),
@@ -227,6 +227,10 @@ fn may_see(prefix: &str, name: &str) -> bool {
     crate::auth::limited().is_none_or(|a| a.may("select", &format!("{prefix}{name}")))
 }
 
+/// A column's type as SQL names it, for an agent that writes SQL: as `SHOW CREATE` writes it (`types::shown`), so it
+/// reads back in a `CREATE TABLE` or a `CAST`: `BIGINT`, `VARCHAR(3)`, `DECIMAL(10, 2)`, `UUID`, an enum's type.
+fn sql_type(m: &TableMeta, column: &str, t: &str) -> String { m.col(column).map_or_else(|| crate::objects::sql_type(t), crate::types::shown) }
+
 async fn list(app: &App) -> Result<Value> {
     let mut tables = vec![];
     for (prefix, lake) in lakes(app) {
@@ -241,7 +245,7 @@ async fn list(app: &App) -> Result<Value> {
             }
             let kind = if !m.merge.is_empty() { "merge" } else if !m.key.is_empty() { "upsert" } else { "append" };
             let m = m.described(); // (SQL's names: ADR-022; a finished view's answers)
-            let columns: Vec<Value> = m.columns().filter(|(c, _)| *c != "_deleted").map(|(c, t)| json!({"name": c, "type": t})).collect();
+            let columns: Vec<Value> = m.columns().filter(|(c, _)| *c != "_deleted").map(|(c, t)| json!({"name": c, "type": sql_type(&m, c, t)})).collect();
             let view = crate::views::code_for_caller(|| views.iter().find(|(k, _)| &k[2..] == name).map(|(_, v)| v.sql.clone())).flatten();
             tables.push(json!({"table": format!("{prefix}{name}"), "kind": kind, "key": m.key, "merge": m.merge, "columns": columns, "view": view}));
         }
@@ -301,7 +305,7 @@ struct Rows {
 impl Rows {
     /// The first `n` rows, and nothing with them yet.
     fn of(batches: &[RecordBatch], n: usize) -> Result<Rows> {
-        Ok(Rows { rows: crate::answer::json_first(batches, n)?, total_rows: None, position: None, notices: vec![] })
+        Ok(Rows { rows: crate::answer::json_first(batches, n, true)?, total_rows: None, position: None, notices: vec![] })
     }
 
     fn text(&self) -> Result<String> { Ok(serde_json::to_string(self)?) }
