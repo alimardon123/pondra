@@ -32,7 +32,7 @@ pub struct WithWrites {
     steps: Vec<Step>,
     /// The main statement as the steps leave it: a query, or a write (`INSERT`, `UPDATE`, `DELETE` or `MERGE`).
     rest: String,
-    /// Postgres's command tag for the answer: the main statement's, or `SELECT` for a query.
+    /// The command's words for the answer: the main statement's, or `SELECT` for a query (`kind`).
     tag: &'static str,
     /// What each part reads and writes, the steps' in order and the rest's last, as `clash` checks them.
     parts: Vec<Part>,
@@ -185,7 +185,7 @@ fn build(sql: &str) -> Result<Option<WithWrites>> {
     let reads: Vec<Vec<String>> = parts.iter().map(|p| p.reads.clone()).collect();
     clash(&parts, &reads)?;
     let tag = match &rest_stmt {
-        Statement::Insert(_) => "INSERT 0",
+        Statement::Insert(_) => "INSERT",
         Statement::Update(_) => "UPDATE",
         Statement::Delete(_) => "DELETE",
         Statement::Merge(_) => "MERGE",
@@ -210,8 +210,8 @@ fn clash(parts: &[Part], reads: &[Vec<String>]) -> Result<()> {
 }
 
 impl WithWrites {
-    /// Postgres's command tag for the answer (`INSERT 0 3`, `UPDATE 2`, `SELECT 5`): the main statement's.
-    pub fn tag(&self) -> &'static str { self.tag }
+    /// The kind of the answer (`INSERT`, `UPDATE`, `SELECT`): the main statement's.
+    pub fn kind(&self) -> crate::answer::Kind { crate::answer::Kind::new(self.tag) }
 
     /// Does the main statement write, so that its answer is a write's? (Its part names a table.)
     fn rest_writes(&self) -> bool { self.parts.last().is_some_and(|p| p.write.is_some()) }
@@ -509,17 +509,17 @@ mod tests {
         assert_eq!(step_names(&moved), vec!["moved"]);
         assert!(matches!(&moved.steps[0], Step::Write { sql, returns: true, columns, .. } if sql.starts_with("DELETE FROM orders") && columns.is_empty()));
         assert!(moved.rest.starts_with("INSERT INTO archive") && moved.rest.contains("FROM moved"));
-        assert_eq!(moved.tag(), "INSERT 0");
+        assert_eq!(moved.kind().prefix(), "INSERT 0");
         // (2) two write CTEs, the second reading the first's rows, and a query over the second's
         let chained = of("WITH ins AS (INSERT INTO parent (name) VALUES ('a') RETURNING id), kid AS (INSERT INTO child SELECT id, 'x' FROM ins RETURNING *) SELECT count(*) AS n FROM kid").unwrap().unwrap();
         assert_eq!(step_names(&chained), vec!["ins", "kid"]);
         assert!(chained.rest.starts_with("SELECT") && chained.rest.contains("FROM kid"));
-        assert_eq!(chained.tag(), "SELECT");
+        assert_eq!(chained.kind().prefix(), "SELECT");
         // (3) a plain CTE with no write CTE: it moves into the INSERT's source, and no step runs first
         let src = of("WITH src AS (SELECT 20 AS id, 'new' AS status, 1 AS amount) INSERT INTO orders SELECT * FROM src").unwrap().unwrap();
         assert!(step_names(&src).is_empty());
         assert!(src.rest.starts_with("INSERT INTO orders") && src.rest.contains("WITH src AS") && src.rest.contains("SELECT * FROM src"));
-        assert_eq!(src.tag(), "INSERT 0");
+        assert_eq!(src.kind().prefix(), "INSERT 0");
         // (4) a plain CTE before an UPDATE is a step, as a plain CTE before a write is
         let update = of("WITH c AS (SELECT 1 AS id) UPDATE orders SET status = 'seen' FROM c WHERE orders.id = c.id").unwrap().unwrap();
         assert_eq!(step_names(&update), vec!["c"]);

@@ -250,6 +250,50 @@ fn joined(mut out: Vec<u8>, more: Vec<u8>) -> Vec<u8> {
 /// A piece's rows as newline-delimited JSON (`render`'s own writer, one line a row).
 fn lines(b: &RecordBatch) -> anyhow::Result<Vec<u8>> { json_lines([b]) }
 
+// ---------------------------------------------------------------- the kinds
+//
+// What a statement was, as its answer says it: a door makes Postgres's command tag from it, and a client sees that tag.
+
+/// What a statement was, as its answer says: its command's words as Postgres's command tag names them ("SELECT",
+/// "INSERT", "CREATE TABLE", "BEGIN", "DECLARE CURSOR"). A door makes its tag from it (`tag`). Rows, for the kinds that
+/// count them (`counts`): rows changed for INSERT, UPDATE, DELETE and MERGE; rows sent for SELECT and FETCH (a CREATE
+/// TABLE … AS is SELECT, its rows written); rows moved for MOVE; rows copied for COPY.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Kind(std::borrow::Cow<'static, str>);
+
+impl Kind {
+    pub fn new(words: impl Into<std::borrow::Cow<'static, str>>) -> Kind { Kind(words.into()) }
+
+    /// The command's words, as the tag starts with them.
+    pub fn words(&self) -> &str { &self.0 }
+
+    /// Whether the tag ends with a row count.
+    pub fn counts(&self) -> bool { matches!(self.words(), "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "COPY" | "FETCH" | "MOVE") }
+
+    /// The tag before its count: `INSERT 0` (Postgres's oid comes before the count), else the words.
+    pub fn prefix(&self) -> String {
+        match self.words() {
+            "INSERT" => "INSERT 0".into(),
+            words => words.into(),
+        }
+    }
+
+    /// The whole tag: the prefix and the count, for a kind that counts and `rows` it; else the words.
+    pub fn tag(&self, rows: Option<u64>) -> String {
+        match (self.counts(), rows) {
+            (true, Some(n)) => format!("{} {n}", self.prefix()),
+            _ => self.words().into(),
+        }
+    }
+}
+
+/// How a statement changed its session's transaction, which Postgres's status byte shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Txn {
+    Started,
+    Ended,
+}
+
 // ---------------------------------------------------------------- rows as JSON
 //
 // The one place rows become JSON, for every door and every answer that carries rows inside it: Arrow's writer, so a
@@ -693,6 +737,18 @@ mod tests {
         let mut out: Vec<u8> = parts.iter().flat_map(|p| enc.step(Some(p)).unwrap()).collect();
         out.extend(enc.step(None).unwrap());
         out
+    }
+
+    #[test]
+    fn kind_tags_are_postgres_command_tags() {
+        assert_eq!(Kind::new("INSERT").tag(Some(3)), "INSERT 0 3");
+        assert_eq!(Kind::new("UPDATE").tag(Some(2)), "UPDATE 2");
+        assert_eq!(Kind::new("SELECT").tag(Some(5)), "SELECT 5");
+        assert_eq!(Kind::new("MOVE").tag(Some(4)), "MOVE 4");
+        assert_eq!(Kind::new("CREATE TABLE").tag(Some(1)), "CREATE TABLE");
+        assert_eq!(Kind::new("BEGIN").tag(None), "BEGIN");
+        assert_eq!(Kind::new(String::from("INSERT")).prefix(), "INSERT 0");
+        assert_eq!(Kind::new("FETCH").prefix(), "FETCH");
     }
 
     #[test]
