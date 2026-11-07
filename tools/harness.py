@@ -11166,9 +11166,14 @@ def users():
     # A view replaced keeps its grants: a grant names the view, not its query (CREATE OR REPLACE VIEW, as Databricks keeps them)
     as_(A.port, boss, "CREATE OR REPLACE VIEW sales.v_orders (PRIMARY KEY (id) NOT ENFORCED) AS SELECT id, item, 1 AS one FROM sales.orders WHERE item = 'tea'")
     replaced = {"columns": as_(A.port, vee, "SHOW COLUMNS FROM sales.v_orders"),
+                "select": as_(A.port, vee, "SELECT * FROM sales.v_orders"),
                 "grants": as_(A.port, boss, "SELECT grantee, privilege, on_name FROM pondra.grants WHERE grantee = 'vee' ORDER BY on_name")}
-    checks["a view replaced (CREATE OR REPLACE VIEW) keeps its grants: the user granted it reads its columns, the new one too, and pondra.grants still lists the grant"] = \
+    # (its rows too: a view reads its base table as the user, so vee's SELECT goes past the view, as before the replace,
+    # and is refused at `sales.orders`, which vee isn't granted; a grant lost for rows would refuse it at the view)
+    checks["a view replaced (CREATE OR REPLACE VIEW) keeps its grants: the user granted it reads its columns, the new one too, its SELECT is refused at the base table as before, not at the view, and pondra.grants still lists the grant"] = \
         [r.get("column_name") for r in rows(replaced["columns"])] == ["id", "item", "one"] \
+        and "permission denied" in str(replaced["select"]) and "orders" in str(replaced["select"]) and "v_orders" not in str(replaced["select"]) \
+        and "v_orders" not in str(w50["select"]) \
         and {"grantee": "vee", "privilege": "SELECT", "on_name": "sales.v_orders"} in rows(replaced["grants"])
     info = {"said": said, "wrote": wrote, "pg": pg_said, "kafka": kafka_said, "flight": flight_said[1:], "grants": grants, "revoked": [revoked, still, no_role, gone],
             "tokens": [by_token, expired, by_session, tampered, ended, dropped_token], "shown": shown_info}
