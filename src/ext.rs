@@ -801,6 +801,9 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
 
 fn attached_key(n: &str) -> String { format!("o/{n}") }
 
+/// Other engines' catalogs in this one (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "o/", owner: "ext", holds: "a database attached from another engine's catalog (attached_key)" }];
+
 pub async fn attached(lake: &Lake) -> Result<Vec<(String, Attached)>> {
     Ok(lake.cat.scan::<Attached>("o/", "o0").await?.into_iter().map(|(k, a)| (k[2..].to_string(), a)).collect())
 }

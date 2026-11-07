@@ -21748,7 +21748,16 @@ def registry():
     missing = [http(s)[0] for s in ("SHOW CREATE TABLE nothing_here", "COMMENT ON TABLE nothing_here IS 'x'", "COMMENT ON COLUMN events.nothing IS 'x'", "COMMENT ON COLUMN eu_orders.region IS 'x'")]
     quiet = q("COMMENT IF EXISTS ON TABLE nothing_here IS 'x'")
     checks["what isn't there: refused by name (4xx), or nothing with IF EXISTS"] = all(400 <= s < 500 for s in missing) and quiet.get("exists") is False
+    prefixes = q("SELECT prefix, owner FROM pondra.prefixes")
     node.kill()
+    # Every key this lake holds, having made every kind, is under a prefix its owner registered (`records::Prefixes`): a
+    # key nobody registered is a prefix the registry's overlap check never saw.
+    listed = subprocess.run([BIN, "catalog", "--dir", lake, ""], capture_output=True, text=True, timeout=120)
+    keys = [line.split(" ", 1)[0] for line in listed.stdout.splitlines() if line]
+    under = lambda k: any(k.startswith(p["prefix"]) if p["prefix"].endswith("/") else k == p["prefix"] for p in prefixes)
+    info["keys"], info["unregistered_keys"] = len(keys), [k for k in keys if not under(k)][:20] or listed.stderr[-300:]
+    checks["every key of a lake that made every kind is under a registered prefix (pondra.prefixes), ex/ kept for installed extensions"] = \
+        len(keys) > 50 and all(under(k) for k in keys) and any(p["prefix"] == "ex/" and p["owner"] == "records" for p in prefixes)
     ok = all(checks.values())
     print(json.dumps({"registry": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:

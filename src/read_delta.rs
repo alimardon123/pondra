@@ -24,7 +24,10 @@ use std::sync::{Arc, Mutex};
 pub static DELTA: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "delta",
     requires: &[],
-    register: |r| r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES),
+    register: |r| {
+        r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES);
+        r.section_mut::<crate::records::Prefixes>().add(crate::delta::PREFIXES);
+    },
 };
 
 #[cfg(feature = "lake")]
