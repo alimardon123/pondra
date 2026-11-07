@@ -63,6 +63,7 @@ app engine
 asof engine
 audit engine
 auth engine
+rights engine
 authored engine
 avg engine
 branch engine

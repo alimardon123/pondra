@@ -1119,7 +1119,7 @@ impl FlightService for Door {
             let app = &self.0 .0;
             allowed(app, &req, Role::Read)?;
             let mut infos = vec![];
-            for (key, _) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k) && crate::auth::check("select", &k[2..]).is_ok()) {
+            for (key, _) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k) && crate::rights::may_here(crate::rights::Action::Select, crate::rights::Object::Table(&k[2..])).is_ok()) {
                 let table = &key[2..];
                 // (the schema its ticket streams, planned as DoGet runs it: a table's strings are Utf8View, not the table's Utf8)
                 let sql = format!("SELECT * FROM {}", crate::write::sql_name(table));
@@ -1141,7 +1141,7 @@ impl FlightService for Door {
                 (Some(sql), _) => plan_schema(app, sql).await.map_err(status)?,
                 (None, Some(table)) => {
                     // Its schema names every column: a user needs SELECT on all of them, as its log stream does (checked before the table is looked up, so an unreadable one isn't told apart).
-                    crate::auth::check_all(&crate::auth::catalog_name(table)).map_err(denied)?;
+                    crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(table)).map_err(denied)?;
                     let meta = app.lake.cat.meta(&table_key(table)).await.map_err(status)?.ok_or_else(|| refused("42P01", format!("no table {table}")))?;
                     let full = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
                     let order = meta.sql_order(); // (no columns asked: SQL's order, as the log stream sends them)
@@ -1178,12 +1178,12 @@ impl FlightService for Door {
                 }
                 (None, Some(table)) => {
                     let name = crate::auth::catalog_name(&table);
-                    crate::auth::check_all(&name).map_err(denied)?; // (a stream of rows: every column, as `/watch` needs)
+                    crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&name)).map_err(denied)?; // (a stream of rows: every column, as `/watch` needs)
                     // (the rows come after this call's scope has ended: its sign-in is checked again, and the table's whole rows
                     // with it, so a REVOKE, a DROP USER or a session's end stops them within 5 s, as at `/watch`: 11-03 audit H1)
                     let header = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
                     let revoked = crate::server::until_revoked(app.clone(), crate::auth::operator(), header, move |p| {
-                        p.role >= Role::Read && crate::auth::WHO.sync_scope(p.clone(), || crate::auth::check_all(&name)).is_ok()
+                        crate::rights::may(p, crate::rights::Action::SelectAll, crate::rights::Object::Table(&name)).is_ok()
                     });
                     Ok(Response::new(log_stream(app.clone(), table, json.after, json.columns, json.follow, revoked).await?))
                 }

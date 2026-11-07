@@ -145,11 +145,11 @@ impl Returning {
 /// written: the write itself, the table, the items, and that the caller may read the table's rows.
 pub async fn run(app: &App, r: &Returning, role: Role, files: bool, job: Option<String>) -> Result<RecordBatch> {
     let stmt = parsed(r)?;
-    app.auth.allows(role, &stmt)?;
+    crate::rights::may_run(role, &stmt)?;
     let (table, shown) = target(app, r, &stmt).await?;
     let items = r.items();
     answer(app, &items, RecordBatch::new_empty(shown.clone())).await?; // (a wrong item refuses the write, as Postgres refuses it)
-    may_read(&table)?;
+    crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&table))?; // (RETURNING reads the rows it wrote: SELECT on every column, as Postgres asks)
     let kept = Arc::new(Mutex::new(None));
     let out = KEPT.scope(kept.clone(), write(app, r, &table, stmt, job.clone(), files)).await?;
     if out["duplicate"] == true {
@@ -220,13 +220,6 @@ async fn target(app: &App, r: &Returning, stmt: &Stmt) -> Result<(String, Schema
     Ok((name, crate::answer::schema(&columns)?))
 }
 
-/// RETURNING reads the rows it wrote, so a user granted some tables needs SELECT on this one, as Postgres asks.
-fn may_read(table: &str) -> Result<()> {
-    match crate::auth::current() {
-        Some(p) if !p.may_read_all(table) => Err(crate::codes::coded("42501", format!("permission denied: RETURNING reads the rows written to {table}, which needs SELECT on it (GRANT SELECT ON {table} TO {})", p.name))),
-        _ => Ok(()),
-    }
-}
 
 /// `rows` as the items ask. Columns and `*` are picked from them; anything else is a query over them, run here and never
 /// remembered (`query::SENT`, beside the tables the request sent).

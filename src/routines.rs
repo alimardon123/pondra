@@ -905,7 +905,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
         return Ok(Outcome::Rows(vec![Box::pin(crate::returning::run(app, &r, who.role, who.files, job)).await?])); // (INSERT … RETURNING: the rows it wrote)
     }
     if let Some(stmt) = crate::write::parse(sql) {
-        app.auth.allows(who.role, &stmt)?;
+        crate::rights::may_run(who.role, &stmt)?;
         return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files).await?));
     }
     if let Some((rows, _)) = Box::pin(crate::txn::point_read(&app.lake, sql)).await? {
@@ -933,7 +933,7 @@ async fn steps(app: &App, sql: &str, who: Who) -> Result<Option<Vec<(String, Opt
             Some(Stmt::Invalid(why)) => bail!("{why}"),
             Some(Stmt::Refused(code, why)) => return Err(crate::codes::coded(code, why)),
             Some(stmt) => {
-                app.auth.allows(who.role, &stmt)?;
+                crate::rights::may_run(who.role, &stmt)?;
                 if let Stmt::Ddl(ds) = &stmt {
                     for d in ds {
                         crate::protect::check_ddl(&app.lake, d).await?;
