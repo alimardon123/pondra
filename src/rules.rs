@@ -164,6 +164,7 @@ pub fn absent_keys(meta: &TableMeta, lines: &[u8]) -> Result<std::collections::H
 /// it looks, when the table's key is checked); rows whose writer looks for that itself, later (`Load`: a loading door's, an
 /// INSERT whose key check comes after its row locks, R8, or after it asks whether its job is in, and a temporary table's INSERT,
 /// whose key is checked over all its rows, R6); or an UPDATE's or MERGE's new versions (`Change`).
+#[derive(Clone, Copy)]
 pub enum How {
     Insert,
     Load,

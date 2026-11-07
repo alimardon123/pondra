@@ -150,6 +150,7 @@ vars engine
 views engine
 with_writes engine
 write engine
+writer engine
 zeros_in engine
 
 # extensions, built in

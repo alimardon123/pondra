@@ -204,17 +204,6 @@ pub fn check_changes(table: &str, replaces: bool, deletes: bool) -> Result<()> {
     Ok(())
 }
 
-/// A row door's rows into a table (`/append`, Flight, Kafka, Postgres's COPY): a keyed table's
-/// replace the rows of their keys, and its rows marked `_deleted` (a tombstone, Debezium's delete)
-/// delete them.
-pub fn check_load(meta: &crate::store::TableMeta, table: &str, rows: &datafusion::arrow::array::RecordBatch) -> Result<()> {
-    if limited().is_none() {
-        return Ok(()); // (a token's role, or the node's own work: no grants to ask)
-    }
-    let marked = rows.column_by_name("_deleted").and_then(|c| c.as_any().downcast_ref::<datafusion::arrow::array::BooleanArray>()).is_some_and(|d| d.true_count() > 0);
-    check_changes(table, !meta.key.is_empty(), marked)
-}
-
 /// Is the request being served at least `role`'s? (Making a table through `/insert`: an admin's, as
 /// `CREATE TABLE` is.)
 pub fn at_least(role: Role, what: &str) -> Result<()> {
