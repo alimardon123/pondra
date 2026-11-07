@@ -436,6 +436,14 @@ impl Stored {
     /// The id a new column takes: one past the highest (its place + 1, while every id is).
     fn next_id(&self) -> u32 { self.columns.iter().map(|c| c.id).max().unwrap_or(0) + 1 }
 
+    /// The list of a table's replaced rows (`sys::deleted`): `of`'s columns as stored, each with its id, names, type and
+    /// drop mark but none of its facts (no write is checked there), in stored order, then `_old_version`.
+    pub(crate) fn replaced(of: &Stored) -> Stored {
+        let mut columns: Vec<Col> = of.columns.iter().map(|c| Col { id: c.id, name: c.name.clone(), stored: c.stored.clone(), dtype: c.dtype.clone(), dropped: c.dropped, ..Default::default() }).collect();
+        columns.push(Col { id: of.next_id(), name: "_old_version".into(), dtype: "Int64".into(), ..Default::default() });
+        Stored { columns, order: vec![] }
+    }
+
     /// The live columns' places in SQL's order: those `order` names first, then the others as stored.
     fn sql_places(&self) -> Vec<usize> {
         let first: Vec<usize> = self.order.iter().filter_map(|id| self.place(*id)).collect();
@@ -865,36 +873,6 @@ impl TableMeta {
     /// The stored columns, taken out of an entry made for the purpose (`described`, `with_sys`).
     pub fn into_columns(self) -> Vec<(String, String)> { self.record.list.columns.into_iter().map(|c| (c.stored.unwrap_or(c.name), c.dtype)).collect() }
 
-    /// Renamed columns: stored name to SQL's (`name_of` for one). Files are never rewritten for a rename.
-    pub fn names(&self) -> &BTreeMap<String, String> { &self.fields().names }
-
-    /// Dropped columns, by stored name (`is_dropped` for one): older files still hold them; nothing reads them again.
-    pub fn dropped(&self) -> &[String] { &self.fields().dropped }
-
-    /// SQL's order of the live columns by stored name when it isn't the stored one (`set_order`), else empty: what
-    /// `moved`, `sql_order` and the list read. The columns it leaves out follow in their stored order, so a column added
-    /// later comes last. Storage keeps the stored order (a file's field ids are places in it), and so does everything
-    /// under SQL: this is SQL's order only, for `SELECT *`, an INSERT without a column list, `SHOW CREATE` and the catalogs.
-    pub fn shown(&self) -> &[String] { &self.fields().shown }
-
-    /// The columns a write must give a value (`NOT NULL`; a key's columns are too, for tables made from round 26 on), by
-    /// stored name (`defaults.rs`).
-    pub fn not_null(&self) -> &[String] { &self.fields().not_null }
-
-    /// Each column's DEFAULT, by stored name: the SQL expression, worked out for each row as it is written (`defaults.rs`).
-    pub fn defaults(&self) -> &BTreeMap<String, String> { &self.fields().defaults }
-
-    /// The identity columns, by stored name: each numbered by a sequence it owns, which its default calls (`seq.rs`).
-    pub fn identity(&self) -> &BTreeMap<String, crate::seq::Identity> { &self.fields().identity }
-
-    /// The enum columns, by stored name: their labels, and the type they are of (`types.rs`). Every door refuses a value
-    /// its column's labels don't list.
-    pub fn enums(&self) -> &BTreeMap<String, crate::types::Enum> { &self.fields().enums }
-
-    /// The columns that hold text but are of another SQL type, by stored name: "uuid", "json", "jsonb", "varchar(n)"
-    /// (`types.rs`). Every door refuses a value that isn't one of the type's, written its one way.
-    pub fn sql_types(&self) -> &BTreeMap<String, String> { &self.fields().sql_types }
-
     /// One edit of the list: what was made from it (its fields' view, its column list, its rules) is made again.
     fn edit<R>(&mut self, f: impl FnOnce(&mut Stored) -> R) -> R {
         (self.column_memo, self.rules) = Default::default();
@@ -917,6 +895,10 @@ impl TableMeta {
     /// An entry with these columns and their facts, and nothing else: a table being made (`Made`'s fields, by stored
     /// name). The rest is set on it as on any entry.
     pub fn made(c: Made) -> TableMeta { TableMeta { record: Record::of(c), ..Default::default() } }
+
+    /// An entry with this list of columns and nothing else: a table made from another's columns (`Stored::replaced`), or
+    /// a reader's copy. The rest is set on it as on any entry.
+    pub(crate) fn with_list(list: Stored) -> TableMeta { TableMeta { record: Record::new(list, false), ..Default::default() } }
 
     /// The entry written as its list (format 6's shape), as an entry read as one is: a test's.
     #[cfg(test)]
@@ -1100,12 +1082,7 @@ impl TableMeta {
     pub fn append_columns(&mut self, more: impl IntoIterator<Item = (String, String)>) { self.edit(|l| l.append(more)) }
 
     /// The table of `of`'s replaced rows (`sys::deleted`) takes its columns: the same list, `_old_version` after it.
-    pub fn follow_columns(&mut self, of: &TableMeta) {
-        let mut m = self.fields().clone();
-        m.columns = of.columns().iter().cloned().chain([("_old_version".to_string(), "Int64".to_string())]).collect();
-        (m.names, m.dropped) = (of.names().clone(), of.dropped().to_vec());
-        self.set_fields(m)
-    }
+    pub fn follow_columns(&mut self, of: &TableMeta) { self.set_list(Stored::replaced(of.list()), self.record.listed) }
 
     /// The table a write's rules see (`rules::Table`), made from the rule fields alone: never `files` or the
     /// statistics. Each column SQL sees (`live`, the one mapping of stored names to SQL's) takes its rules by its
@@ -4715,15 +4692,15 @@ mod tests {
         assert_eq!(t.checks, [("orders_total_check".to_string(), "total >= 0".to_string())]);
         assert!(t.column("gone").is_none() && t.marker("_deleted") && !t.marker("total"));
         for c in &t.columns {
-            assert_eq!(l.not_null().contains(&c.name), c.not_null, "{}", c.name);
-            assert_eq!(l.defaults().get(&c.name).cloned(), c.default, "{}", c.name);
-            assert_eq!(l.identity().get(&c.name).is_some_and(|i| i.always), c.always, "{}", c.name);
-            assert_eq!(l.sql_types().get(&c.name).cloned(), c.held, "{}", c.name);
-            assert_eq!(l.enums().get(&c.name).map(|e| (e.of.clone(), e.labels.clone())), c.labels, "{}", c.name);
+            assert_eq!(l.fields().not_null.contains(&c.name), c.not_null, "{}", c.name);
+            assert_eq!(l.fields().defaults.get(&c.name).cloned(), c.default, "{}", c.name);
+            assert_eq!(l.fields().identity.get(&c.name).is_some_and(|i| i.always), c.always, "{}", c.name);
+            assert_eq!(l.fields().sql_types.get(&c.name).cloned(), c.held, "{}", c.name);
+            assert_eq!(l.fields().enums.get(&c.name).map(|e| (e.of.clone(), e.labels.clone())), c.labels, "{}", c.name);
         }
         assert_eq!(l.key, t.key);
         assert_eq!(l.columns().iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), names);
-        assert!(!l.defaults().contains_key("gone") && !l.sql_types().contains_key("gone") && !l.not_null().iter().any(|c| c == "gone"));
+        assert!(!l.fields().defaults.contains_key("gone") && !l.fields().sql_types.contains_key("gone") && !l.fields().not_null.iter().any(|c| c == "gone"));
         Ok(())
     }
 
@@ -4764,9 +4741,9 @@ mod tests {
     fn the_column_list_is_the_entrys_columns_in_sqls_order() {
         // (the order as `in_order` made it before the list: `shown`'s columns, then the rest as stored, the dropped out)
         fn was(m: &TableMeta) -> Vec<String> {
-            let first = m.shown().iter().filter_map(|s| m.columns().iter().find(|(c, _)| c == s));
-            let rest = m.columns().iter().filter(|(c, _)| !m.shown().contains(c));
-            first.chain(rest).filter(|(c, _)| !m.dropped().contains(c)).map(|(c, _)| m.name_of(c).to_string()).collect()
+            let first = m.fields().shown.iter().filter_map(|s| m.columns().iter().find(|(c, _)| c == s));
+            let rest = m.columns().iter().filter(|(c, _)| !m.fields().shown.contains(c));
+            first.chain(rest).filter(|(c, _)| !m.fields().dropped.contains(c)).map(|(c, _)| m.name_of(c).to_string()).collect()
         }
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = |n: u64| {
@@ -4812,7 +4789,7 @@ mod tests {
             let back: TableMeta = serde_json::from_slice(&json(&m.clone().as_list())).unwrap();
             assert_eq!((back.column_list(), back.sql_order(), back.star(), back.logical().list()), (list.clone(), m.sql_order(), m.star(), m.logical().list()));
             let sql: Vec<String> = list.sql().map(|c| c.name.clone()).collect();
-            assert_eq!(sql, was(&m), "{:?} {:?} {:?}", m.shown(), m.dropped(), m.names());
+            assert_eq!(sql, was(&m), "{:?} {:?} {:?}", m.fields().shown, m.fields().dropped, m.fields().names);
             assert_eq!(m.sql_order(), sql);
             let stored: Vec<String> = list.stored_order().map(|c| c.name.clone()).collect();
             assert_eq!(m.moved(), sql != stored, "moved: SQL's order isn't the stored one");
@@ -4824,7 +4801,7 @@ mod tests {
             assert_eq!((m.sql_key(), m.sql_partition(), m.logical_columns()), (l.key.clone(), l.partition.clone(), l.columns().to_vec()), "a field without the copy");
             for c in list.all() {
                 assert_eq!(m.columns()[c.id as usize - 1].0, c.stored, "an id is a stored place + 1");
-                assert_eq!((c.name.as_str(), c.dropped), (m.name_of(&c.stored), m.dropped().contains(&c.stored)));
+                assert_eq!((c.name.as_str(), c.dropped), (m.name_of(&c.stored), m.fields().dropped.contains(&c.stored)));
             }
             assert_eq!(list.all().len(), n, "every column, the dropped too");
             assert!(list.stored_order().collect::<Vec<_>>().windows(2).all(|w| w[0].id < w[1].id));
@@ -4965,7 +4942,7 @@ mod tests {
         };
         let helpers: [(&str, fn(&TableMeta) -> usize); 9] = [
             ("table_sql()", |m| crate::objects::table_sql("t", m).len()),
-            ("types::shown(), each column", |m| m.list().columns.iter().map(|c| crate::types::shown(m, c.stored_name(), &c.dtype).len()).sum()),
+            ("types::shown(), each column", |m| m.list().columns.iter().filter_map(|c| m.col(c.stored_name())).map(|c| crate::types::shown(c).len()).sum()),
             ("default_sql(), each column", |m| m.live().filter_map(|(_, n, _)| crate::rules::rows::default_sql(m, n)).count()),
             ("logical()", |m| m.logical().columns().len()),
             ("to_rules()", |m| m.to_rules().unwrap().columns.len()),
@@ -5014,6 +4991,22 @@ mod tests {
         assert_eq!((m.col("e").map(|c| c.id), m.list().order.clone(), m.sql_order()), (Some(5), vec![5, 3], vec!["e".to_string(), "a".into(), "b".into(), "c".into()]));
     }
 
+    /// A table's replaced rows (`sys::deleted`) take its columns as stored, ids, names and drop marks kept, and none of
+    /// its facts or its order: no write is checked there, and nothing reads it by SQL's order.
+    #[test]
+    fn the_replaced_rows_take_the_columns_and_nothing_else() {
+        let col = |id: u32, name: &str| Col { id, name: name.into(), dtype: "Int64".into(), ..Default::default() };
+        let facts = Col { not_null: true, default: Some("1".into()), held: Some("uuid".into()), stored: Some("b0".into()), ..col(1, "b") };
+        let of = Stored { columns: vec![col(3, "a"), facts, Col { dropped: true, ..col(2, "c") }], order: vec![1, 3] };
+        let r = Stored::replaced(&of);
+        let want = [(3, "a", "a", false), (1, "b", "b0", false), (2, "c", "c", true), (4, "_old_version", "_old_version", false)];
+        assert_eq!(r.columns.iter().map(|c| (c.id, c.name.as_str(), c.stored_name(), c.dropped)).collect::<Vec<_>>(), want);
+        assert!(r.order.is_empty() && r.columns.iter().all(|c| !c.not_null && c.default.is_none() && c.held.is_none()));
+        let mut d = TableMeta::default();
+        d.follow_columns(&TableMeta::with_list(of));
+        assert_eq!(d.list(), &r);
+    }
+
     /// An entry is written in the shape it was read in (`Record`): format 6's as the list alone, format 5's as its fields,
     /// `columns` always (a 0.80 node needs the field), each read back as it was; an edit keeps the shape, and a new entry
     /// and a `logical()` copy are written as format 5's fields.
@@ -5025,7 +5018,7 @@ mod tests {
         assert!(["columns", "names", "dropped", "not_null", "defaults", "identity", "enums", "sql_types"].iter().all(|k| new.get(k).is_none()), "{new}");
         let back: TableMeta = serde_json::from_value(new.clone()).unwrap();
         assert!(back.record.listed && serde_json::to_value(&back).unwrap() == new);
-        assert_eq!((back.columns(), back.names(), back.not_null(), back.identity()), (t.columns(), t.names(), t.not_null(), t.identity()));
+        assert_eq!((back.columns(), &back.fields().names, &back.fields().not_null, &back.fields().identity), (t.columns(), &t.fields().names, &t.fields().not_null, &t.fields().identity));
         let again: TableMeta = serde_json::from_value(old.clone()).unwrap();
         assert!(!again.record.listed && serde_json::to_value(&again).unwrap() == old, "format 5's, field for field");
         let mut edited = back.clone();
@@ -5151,7 +5144,7 @@ mod tests {
             let mut d = TableMeta::default();
             d.follow_columns(&a);
             assert_eq!(d.columns().last().map(|(c, _)| c.as_str()), Some("_old_version"));
-            assert_eq!((d.names().clone(), d.dropped().to_vec(), d.columns().len()), (a.names().clone(), a.dropped().to_vec(), a.columns().len() + 1));
+            assert_eq!((&d.fields().names, &d.fields().dropped, d.columns().len()), (&a.fields().names, &a.fields().dropped, a.columns().len() + 1));
         }
     }
 

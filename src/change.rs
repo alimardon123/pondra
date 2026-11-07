@@ -942,9 +942,7 @@ pub async fn companion(lake: &Lake, table: &str, meta: &TableMeta) -> Result<()>
     if meta.changed {
         return Ok(());
     }
-    let mut columns = meta.columns().to_vec();
-    columns.push(("_old_version".into(), "Int64".into()));
-    let mut deleted = TableMeta::made(crate::store::Made { columns, names: meta.names().clone(), dropped: meta.dropped().to_vec(), ..Default::default() });
+    let mut deleted = TableMeta::with_list(crate::store::Stored::replaced(meta.list()));
     (deleted.tiered, deleted.ids) = (lake.visible(), true);
     let changed = { let mut entry = meta.clone(); entry.changed = true; entry.past_from = meta.past_from.or(Some((0, 0))); entry }; // (its past kept whole from here: `past.rs`)
     lake.cat.commit(vec![(table_key(&sys::deleted(table)), json(&deleted)), (table_key(table), json(&changed))], &[]).await

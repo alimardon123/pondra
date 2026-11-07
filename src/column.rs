@@ -3,8 +3,8 @@
 //! carries (`tier::field_ids`), never reused, so no file moves for a rename, a drop or a move. Its SQL order (what
 //! `SELECT *` lists and an INSERT without a column list fills) is worked out once, here, dropped columns kept and marked, so
 //! every reader takes the order from here and none works it out again (the 11-03 audit's H5, M8 to M10 and L6 came from
-//! readers that did). A table's entry still keeps the order in `names`, `dropped` and `shown` until the one-time upgrade
-//! stores the list (step 1b's piece 6); until then `TableMeta::column_list` makes it from them.
+//! readers that did). A table's entry keeps its columns as a list (`store::Stored`, step 1b's piece 6), and
+//! `TableMeta::column_list` makes this from it.
 
 /// One column of a table.
 #[derive(Clone, Debug, PartialEq, Eq)]
