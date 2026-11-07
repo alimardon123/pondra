@@ -219,9 +219,16 @@ impl To {
     async fn outcome(&self, f: Flush) -> Result<Outcome> {
         Ok(match self {
             To::Local(seq) => seq.submit(f).await?,
-            To::Leader(addr) => crate::dial::call(addr, crate::dial::Call::post("/cluster/commit", encode_flush(&f)?)).await?.checked()?.json().await?,
+            To::Leader(addr) => crate::dial::call(addr, crate::dial::Call::post("/cluster/commit", encode_flush(&f)?)).await.inspect_err(|_| untaken())?.checked()?.json().await?,
         })
     }
+}
+
+/// A flush this follower sent its leader went unanswered: its follow loop asks the leader now (`cluster::flush_untaken`).
+/// A page follows no leader over the network.
+fn untaken() {
+    #[cfg(feature = "doors")]
+    crate::cluster::flush_untaken();
 }
 
 /// A reservation's answer.
@@ -378,7 +385,7 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                     let request = crate::dial::call(addr, crate::dial::Call::post("/cluster/commit", encode_flush(&f)?));
                     drop(done.take()); // (sent in order; over HTTP they may still arrive out of order, rarely)
                     unanswered = true;
-                    let response = request.await?;
+                    let response = request.await.inspect_err(|_| untaken())?; // (its follow loop looks now: `cluster.rs`)
                     // (a 4xx is the leader's refusal, made before its sequencer took the flush; a 5xx, or a body lost on the
                     // way, may come after it did, so the rows may still commit: lost, as a dropped reply is here)
                     unanswered = !(400..500).contains(&response.status);
