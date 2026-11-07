@@ -674,6 +674,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
     }
     let (app, again, table2) = (app.clone(), log.clone(), table.clone());
     let who = crate::auth::current(); // (the caller, for its grants in the task below: a task keeps no task-local)
+    let mut load = crate::writer::Load::new(&app, who.clone(), "Flight DoPut", &table); // (its line in the audit log, as its acks end)
     let (acks_tx, mut acks_rx) = tokio::sync::mpsc::channel::<Result<crate::writer::Queued, Status>>(256);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel(); // (acks are small; a client may read them only at the end)
     crate::panics::task(async move {
@@ -734,10 +735,16 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
                 }
                 Err(e) => Err(e),
             };
+            if let Err(e) = &acked {
+                load.end(Some(e.message().to_string()));
+            }
             let stop = acked.is_err();
             if tx.send(acked).is_err() || stop {
                 break;
             }
+        }
+        if acks_rx.is_closed() && acks_rx.is_empty() {
+            load.end(None); // (every batch taken; a client gone before the last ack leaves the load unended: failed)
         }
     });
     Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|r| (r, rx)) })))
@@ -956,7 +963,10 @@ impl FlightSqlService for Sql {
         };
         let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(stream_status).peekable();
         let mut exists = self.0.lake.cat.meta(&table_key(&table)).await.map_err(status)?.is_some();
-        crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(denied)?; // (the row doors' one check)
+        crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(|e| {
+            crate::writer::Load::refused(&self.0, None, "Flight DoPut", &table, &e); // (in the audit log, as every refusal at a door is)
+            denied(e)
+        })?; // (the row doors' one check)
         // ADBC's modes: create (fail if there), append (fail if not), replace, create_append.
         use arrow_flight::sql::{TableExistsOption as IfThere, TableNotExistOption as IfNot};
         let options = cmd.table_definition_options.unwrap_or_default();
@@ -1005,7 +1015,10 @@ impl FlightSqlService for Sql {
             [t, p, s] => (t.clone(), p.clone(), s.parse().map_err(|_| refused("22023", "the first seq is a number"))?),
             _ => return Err(refused("22023", "DoPut to a path: [table] or [table, producer, first seq]")),
         };
-        crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(denied)?; // (the row doors' one check, before a batch is read)
+        crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(|e| {
+            crate::writer::Load::refused(&self.0, None, "Flight DoPut", &table, &e); // (in the audit log, as every refusal at a door is)
+            denied(e)
+        })?; // (the row doors' one check, before a batch is read)
         let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(input.map_err(Into::into)).map_err(stream_status);
         Ok(Response::new(append(&self.0, table, producer, seq, batches)?))
     }
