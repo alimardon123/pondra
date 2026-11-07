@@ -23846,6 +23846,25 @@ def use_path():
     checks["USE other, USE other.public, USE DATABASE other: ot is other's (3, then 4 and 5 once written); this lake has no ot"] = \
         info["other first"] == [{"n": 3}] and info["other after"] == [{"n": 4}] and info["not here"] and info["other.public"] == [{"n": 4}] \
         and info["DATABASE other"] == [{"n": 5}] and q("SELECT count(*) AS n FROM other.public.ot") == [{"n": 5}]
+    # A statement on a schema under USE other: a schema's name isn't placed by the path, so it named this lake's
+    # (DROP SCHEMA crm CASCADE dropped this lake's crm and its tables). It is refused by name, 0A000.
+    crm_before = q("SELECT count(*) AS n FROM crm.t")
+    info["schema under USE other"] = [http(s, "use-db-one") for s in (
+        "DROP SCHEMA crm CASCADE", "SELECT 1; DROP SCHEMA IF EXISTS crm CASCADE", "ALTER SCHEMA crm RENAME TO crm2",
+        "COMMENT ON SCHEMA crm IS 'x'", "CREATE SCHEMA made_in_other")]
+    checks["under USE other, DROP, ALTER, COMMENT ON and CREATE SCHEMA are refused by name (0A000), and this lake's crm keeps its table and rows"] = \
+        all(st != 200 and code == "0A000" and "under USE of other: other is an attached lake" in str(body) for st, code, body in info["schema under USE other"]) \
+        and q("SELECT count(*) AS n FROM crm.t") == crm_before and crm_before[0]["n"] > 0 \
+        and q("SELECT count(*) AS n FROM information_schema.schemata WHERE schema_name IN ('crm', 'crm2', 'made_in_other')") == [{"n": 1}]
+    # Postgres's catalog under USE other is other's, as Postgres's is the connection's database's: it listed this lake's.
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as c:
+        c.execute("USE other")
+        info["catalog under USE other"] = c.execute("SELECT table_catalog, table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 2").fetchall()
+        info["pg_class under USE other"] = c.execute("SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY 1").fetchall()
+        c.execute("RESET search_path")
+        info["catalog after"] = c.execute("SELECT DISTINCT table_catalog FROM information_schema.tables WHERE table_schema = 'public'").fetchall()
+    checks["over Postgres under USE other, information_schema.tables and pg_class are other's (ot, its catalog other), not this lake's; with the path reset, this lake's again"] = \
+        info["catalog under USE other"] == [("other", "ot")] and info["pg_class under USE other"] == [("ot",)] and info["catalog after"] == [(db_name,)]
     # Refused by name: a name that is both, unknown ones, no session, pondra sql.
     q("CREATE SCHEMA other")  # (now `other` is a database and a schema of this lake: USE other must say which)
     info["both"] = http("USE other", "use-both-1")

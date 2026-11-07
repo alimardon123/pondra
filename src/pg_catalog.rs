@@ -1349,7 +1349,20 @@ pub async fn register(ctx: &SessionContext, lake: &Lake, user: &str, sql: &str) 
     let columns = ["pg_attribute", "pg_constraint", "information_schema", "columns"].iter().any(|w| lower.contains(w));
     // (and the log's rows only for SQL that sizes tables: they cost a read of the log tail's entries)
     let counts = ["n_live_tup", "reltuples", "pg_stat"].iter().any(|w| lower.contains(w));
-    let l = Arc::new(lakes(lake, user, columns, counts).await?);
+    // (under `USE` of an attached lake, its catalog is shown, as Postgres shows the connection's database's: its tables,
+    // and its name as `table_catalog` and `current_database`'s row; the list of databases stays this node's)
+    let l = match crate::path::current(lake) {
+        Some(p) if p.database() != p.here => {
+            let db = p.database();
+            let shown = crate::ddl::database(lake, db).await?.ok_or_else(|| anyhow::anyhow!("no database {db}"))?;
+            let mut l = lakes(&shown, user, columns, counts).await?;
+            l.database = db.to_string(); // (the name it is attached by here, not its own lake's folder's)
+            l.databases = std::iter::once(crate::ddl::lake_name(lake)).chain(lake.attached.read().unwrap().iter().map(|(n, _)| n.clone())).collect();
+            l
+        }
+        _ => lakes(lake, user, columns, counts).await?,
+    };
+    let l = Arc::new(l);
     let catalog = ctx.catalog(&crate::ddl::lake_name(lake)).expect("the lake's catalog");
     let pg = Arc::new(MemorySchemaProvider::new());
     let want = |t: &str| lower.contains(t); // (a table's name, as the rewritten statement has it)
