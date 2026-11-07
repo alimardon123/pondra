@@ -492,6 +492,11 @@ fn databases(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
             all.push(Object::new("database", &here, &k[2..], Some(made)));
         }
         for (n, a) in crate::ext::attached(lake).await? {
+            if let Some(c) = &a.connection {
+                // (over a connection: by its name, as it was attached; its url and options are the connection's)
+                all.push(Object::new("database", &here, &n, Some(format!("ATTACH {} AS {}", ident(c), ident(&n)))));
+                continue;
+            }
             let options: String = a.options.iter().map(|(k, v)| format!(", {} {}", k.to_uppercase(), literal(v))).collect();
             all.push(Object::new("database", &here, &n, Some(format!("ATTACH {} AS {} (TYPE {}{options})", literal(&a.url), ident(&n), a.kind))));
         }

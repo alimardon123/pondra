@@ -802,7 +802,38 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
 fn attached_key(n: &str) -> String { format!("o/{n}") }
 
 pub async fn attached(lake: &Lake) -> Result<Vec<(String, Attached)>> {
-    Ok(lake.cat.scan::<Attached>("o/", "o0").await?.into_iter().map(|(k, a)| (k[2..].to_string(), a)).collect())
+    let mut all: Vec<(String, Attached)> = lake.cat.scan::<Attached>("o/", "o0").await?.into_iter().map(|(k, a)| (k[2..].to_string(), a)).collect();
+    for (_, a) in all.iter_mut().filter(|(_, a)| a.connection.is_some()) {
+        // (attached over a connection: its url and options as the connection has them now, ALTER CONNECTION's too)
+        let Some(d) = lake.cat.get::<crate::connections::Definition>(&crate::connections::key(a.connection.as_deref().unwrap_or_default())).await? else { continue };
+        let (url, options) = of_connection(&d);
+        let declared = crate::connections::find(&d.ty).map(|t| t.option_names()).unwrap_or_default();
+        a.url = url.trim_end_matches('/').to_string();
+        a.options.retain(|k, _| !declared.contains(&k.as_str())); // (what ATTACH added, a share's token, stays)
+        a.options.extend(options);
+    }
+    Ok(all)
+}
+
+/// A connection's url and its other options, as ATTACH takes them (text).
+fn of_connection(d: &crate::connections::Definition) -> (String, BTreeMap<String, String>) {
+    let text = |v: &serde_json::Value| v.as_str().map_or_else(|| v.to_string(), str::to_string);
+    let url = d.options.get("url").map(text).unwrap_or_default();
+    (url, d.options.iter().filter(|(k, _)| *k != "url").map(|(k, v)| (k.clone(), text(v))).collect())
+}
+
+/// The databases attached over the connection `name` (`ATTACH name`), by their names here.
+pub async fn attached_over(lake: &Lake, name: &str) -> Result<Vec<String>> {
+    Ok(lake.cat.scan::<Attached>("o/", "o0").await?.into_iter().filter(|(_, a)| a.connection.as_deref() == Some(name)).map(|(k, _)| k[2..].to_string()).collect())
+}
+
+/// Leader: `ATTACH shop [AS name]`, a connection's tables as a database: checked as ATTACH 'url' … (TYPE t, …) is, with the
+/// connection's type, url and options, and read through the connection from then on (`attached`).
+pub async fn attach_connection(lake: &Lake, name: &str, connection: &str) -> Result<serde_json::Value> {
+    let d: crate::connections::Definition = lake.cat.get(&crate::connections::key(connection)).await?
+        .ok_or_else(|| crate::codes::coded("42704", format!("no connection {connection}: ATTACH {connection} attaches a connection's tables (CREATE CONNECTION {connection} TYPE delta WITH (url = '…'))")))?;
+    let (url, options) = of_connection(&d);
+    attach_as(lake, name, &url, &d.ty, options, Some(connection)).await
 }
 
 /// Is this attached as another engine's tables?
@@ -819,6 +850,10 @@ pub async fn outside_target(lake: &Lake, name: &str) -> Result<Option<String>> {
 
 /// Leader: keep an attachment of another engine's tables.
 pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>) -> Result<serde_json::Value> {
+    attach_as(lake, name, url, kind, options, None).await
+}
+
+async fn attach_as(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>, connection: Option<&str>) -> Result<serde_json::Value> {
     crate::ddl::check(name)?;
     // (its TYPE and its options are a connection type's, from the registry: ATTACH and CREATE CONNECTION list the same ones)
     use crate::connections::attached as attachable;
@@ -865,7 +900,7 @@ pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTr
         let found = list(lake).await?.into_iter().find(|(n, _)| n == secret).with_context(|| format!("no secret {secret}"))?;
         ensure!(covering(&[found.clone()], &at).is_some(), "secret {secret}'s SCOPE doesn't cover {at} (CREATE OR REPLACE SECRET {secret} (…, SCOPE '{at}'))");
     }
-    let a = Attached { kind: kind.into(), url: url.trim_end_matches('/').into(), options };
+    let a = Attached { kind: kind.into(), url: url.trim_end_matches('/').into(), options, connection: connection.map(str::to_string) };
     if let Some(had) = lake.cat.get::<Attached>(&attached_key(name)).await? {
         ensure!(had.url == a.url && had.kind == a.kind, "{name} is attached already, to {}", had.url);
         return Ok(serde_json::json!({"attached": name, "unchanged": true}));
@@ -1126,6 +1161,22 @@ fn attach_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Optio
     let usage = "ATTACH 's3://bucket/tables' AS name (TYPE delta), or ATTACH 'https://catalog' AS name (TYPE iceberg)";
     let _ = p.parse_keyword(Keyword::DATABASE);
     let _ = p.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+    if matches!(p.peek_token().token, Token::Word(_)) {
+        // (`ATTACH shop [AS name]`: a connection's tables, by its name)
+        let connection = crate::text::ident(&p.parse_identifier().ok()?);
+        let name = match p.parse_keyword(Keyword::AS) {
+            true => match p.parse_identifier() {
+                Ok(n) => crate::text::ident(&n),
+                Err(_) => return Some(crate::write::Stmt::Invalid(format!("ATTACH {connection} AS name"))),
+            },
+            false => connection.clone(),
+        };
+        while p.consume_token(&Token::SemiColon) {}
+        if p.peek_token().token != Token::EOF {
+            return Some(crate::write::Stmt::Invalid(format!("ATTACH {connection} [AS name]: a connection's options are its own (ALTER CONNECTION {connection} SET (…))")));
+        }
+        return Some(crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::AttachOutside { name, url: String::new(), kind: String::new(), options: BTreeMap::new(), connection: Some(connection) }]));
+    }
     let url = p.parse_literal_string().ok()?;
     let _ = p.parse_keyword(Keyword::AS);
     let name = p.parse_identifier().ok()?.value.to_lowercase();
@@ -1173,7 +1224,7 @@ fn attach_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Optio
         options.insert("token".into(), token.to_string());
         url = endpoint.to_string();
     }
-    Some(crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::AttachOutside { name, url, kind, options }]))
+    Some(crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::AttachOutside { name, url, kind, options, connection: None }]))
 }
 
 /// `COPY (query) TO 'url' (FORMAT parquet, PARTITION_BY (a, b), HEADER true, DELIMITER ';')` or
