@@ -12,6 +12,7 @@ boto3
 moto[server]==5.2.3  # (the server: tools/sim_r2.py, harness.py outside; it needs Flask)
 azure-storage-blob==12.30.3  # (Azurite's containers, harness.py clouds; Azurite itself: npm install -g azurite)
 psycopg[binary]==3.3.6
+anthropic==2.6.0  # (tools/agent_bench.py run: the agent benchmark's model runs, agent-bench.yml)
 psycopg2-binary==2.9.13
 asyncpg==0.31.0
 SQLAlchemy==2.0.54

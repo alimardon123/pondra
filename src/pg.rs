@@ -145,6 +145,31 @@ async fn guessing_refused(app: &App, user: &str, from: Option<std::net::SocketAd
 }
 
 impl Startup {
+    /// Signed in: in the database the client named at startup (`dbname`), then ready for queries. A name that is a
+    /// database here (`ddl::database`: an attached lake, a clone among them) starts the session in it, as `USE DATABASE`
+    /// does, with the signed-in user's rights: `psql -d br` reads and writes `br`, never the lake it was cloned from.
+    /// Any other name is this lake, as before (a node that serves one lake takes any name: `postgres`, the user's own).
+    async fn ready<C>(&self, client: &mut C) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let lake = &self.backend.app.lake;
+        if let Some(db) = client.metadata().get("database").cloned().filter(|d| !d.is_empty() && *d != crate::ddl::lake_name(lake)) {
+            let said = |e: anyhow::Error| {
+                let (_, code, words) = crate::codes::answer(&e, false);
+                PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), code.into(), words)))
+            };
+            if crate::ddl::database(lake, &db).await.map_err(said)?.is_some() {
+                let sql = format!("USE DATABASE {}", crate::objects::ident(&db));
+                let into = crate::set::statement(lake, &sql);
+                crate::temp::SESSION.scope(Some(self.backend.session.clone()), crate::auth::WHO.scope(self.backend.who(), into)).await.map_err(said)?;
+            }
+        }
+        finish(client, &self.cancels).await
+    }
+
     /// OAUTHBEARER asked for (true), when a provider that says `POSTGRES 'oauth'` would sign this user in: one
     /// way a connection, as pg_hba has it, since libpq 18 takes the first mechanism it knows and never falls
     /// back to a password (ADR-074 §4a). SCRAM-SHA-256 is offered after it only so that a client before libpq
@@ -192,7 +217,7 @@ impl Startup {
                 Some(who) => {
                     let again = Again::Token { user: user.clone(), token: token.to_string() };
                     self.backend.signed_in(who.at("postgres", from), Some(again));
-                    return finish(client, &self.cancels).await;
+                    return self.ready(client).await;
                 }
                 None => {
                     let why = crate::sso::why(&app.lake, &token).await.unwrap_or_else(|| format!("the token doesn't sign in {user}"));
@@ -236,7 +261,7 @@ impl StartupHandler for Startup {
                 pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
                 if app.open().await {
                     self.backend.signed_in(crate::auth::Principal::of(crate::auth::Role::Admin).at("postgres", Some(client.socket_addr())), Some(Again::Open));
-                    return finish(client, &self.cancels).await;
+                    return self.ready(client).await;
                 }
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
                 // (a user with only tokens, a service's, or one an identity provider signs in: its token
@@ -285,7 +310,7 @@ impl StartupHandler for Startup {
                     false => Again::User { verifier: crate::users::verifier(&app.lake, &user).await, user: user.clone() },
                 };
                 self.backend.signed_in(who.at("postgres", Some(client.socket_addr())), Some(again));
-                return finish(client, &self.cancels).await;
+                return self.ready(client).await;
             }
             PgWireFrontendMessage::PasswordMessageFamily(m) => {
                 let user = client.metadata().get("user").cloned().unwrap_or_default();
@@ -328,7 +353,7 @@ impl StartupHandler for Startup {
                         let again = Again::User { verifier: crate::users::verifier(&app.lake, &user).await, user: user.clone() };
                         self.backend.signed_in(who.at("postgres", Some(client.socket_addr())), Some(again));
                         client.send(PgWireBackendMessage::Authentication(Authentication::SASLFinal(reply.into_bytes().into()))).await?;
-                        return finish(client, &self.cancels).await;
+                        return self.ready(client).await;
                     }
                 }
             }

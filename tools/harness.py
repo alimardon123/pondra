@@ -296,6 +296,21 @@ def crash():
     return f"{A.runs}/{A.runs} runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {totals}"
 
 
+def agents():
+    """The agent benchmark with no model (tools/agent_bench.py check; the 1.0 scorecard's agent row): each question's
+    gold SQL on Pondra, DuckDB and, where its binaries are, Postgres, scored as an agent's answer is; each job's gold on
+    a copy of the shop on each engine, its end state checked; the agent's loop with a scripted model on each engine;
+    and the answers agents once gave that passed (tools/agent_bench/replay_*.jsonl), run again on this commit."""
+    r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_bench.py"), "check", "--bin", BIN],
+                       capture_output=True, text=True, timeout=900)
+    out = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {"ok": False, "error": r.stderr[-1500:]}
+    print(json.dumps({"agents": out}, indent=1, default=str))
+    if not out.get("ok"):
+        sys.exit(1)
+    return {**{e: v if isinstance(v, str) else f"{v['passed']} of {out['tasks']['a']} questions, {v['jobs']} jobs" for e, v in out["engines"].items()},
+            "replayed": f"{out['replay']['passed']} of {out['replay']['answers']}"}
+
+
 def synced():
     """A folder lake's write is on the disk when it answers, through a power loss too (`store.rs`, `with_fsync`; 11-01
     audit L15): each file it writes is synced before it is moved into place, and the folder after, so the move lasts
@@ -493,8 +508,8 @@ def external():
         and read1 == [{"s": 1}] and read2 == [{"s": 3}] and after_file == after_lake and q("SELECT sum(a) AS s FROM owned") == [{"s": 6}]
     q("DROP TABLE owned")
     names = set(re.findall(rb'pondra_cache_bytes\{cache="(\w+)"\}', call(A.port, "GET", "/metrics", headers=hdr)))
-    checks["/metrics counts every cache on the node's line, the node's own with the lake's (tables' manifests, kept pages, Delta logs and Iceberg manifests, point plans, the log tails' keys)"] = \
-        {b"answers", b"facts", b"manifests", b"pages", b"delta_logs", b"iceberg_manifests", b"point_plans", b"tail_keys", b"tails", b"lookups"} <= names
+    checks["/metrics counts every cache on the node's line, the node's own with the lake's (tables' manifests, kept pages, Delta logs and Iceberg manifests, point plans, the log tails' keys, outside files, functions' answers, the catalog's parsed entries)"] = \
+        {b"answers", b"facts", b"manifests", b"pages", b"delta_logs", b"iceberg_manifests", b"point_plans", b"tail_keys", b"tails", b"lookups", b"files", b"function_answers", b"catalog_entries", b"catalog_segments"} <= names
     q("CREATE EXTERNAL TABLE ev (id INT, name VARCHAR) STORED AS CSV LOCATION 'ev/' OPTIONS ('format.has_header' 'false')")
     empty = q("SELECT count(*) AS n FROM ev")
     q("INSERT INTO ev VALUES (1, 'one'), (2, 'two')")
@@ -2648,6 +2663,14 @@ def clients():
     as_http = urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/sql", data=exact.encode(), headers={"authorization": "Bearer r-tok"})).read().decode()
     checks["MCP's rows read as HTTP's, byte for byte: a DECIMAL's every digit (99999999999999.9999, 0.10), not a double's"] = \
         as_mcp == '{"rows":' + as_http + ',"total_rows":1}' and '"d":99999999999999.9999' in as_mcp and '"small":0.10' in as_mcp
+    # What an agent writes its next SQL from (the agent benchmark's findings): a NULL said as null (not left out), columns
+    # typed as SHOW CREATE types them (not Arrow's Int64, Utf8), the dialect named as Pondra's, a parse error said once
+    with_null = tool("r-tok", "query", sql="SELECT 1 AS a, CAST(NULL AS INT) AS b")["rows"]
+    docs_types = [c["type"] for t in tool("r-tok", "list_tables")["tables"] if t["table"] == "docs" for c in t["columns"]]
+    unparsed = mcp("r-tok", "tools/call", {"name": "query", "arguments": {"sql": "SELEC 1"}})["content"][0]["text"]
+    checks["MCP for agents: a NULL said as null; list_tables types as SHOW CREATE does; Postgres's dialect named; a parse error said once, 42601"] = \
+        with_null == [{"a": 1, "b": None}] and docs_types == ["BIGINT", "VARCHAR", "REAL[]"] and "PostgreSQL's" in init["instructions"] \
+        and "DataFusion" not in init["instructions"] and unparsed.startswith("SQLSTATE 42601: syntax error: Expected: ") and unparsed.count("Expected") == 1
     # Raw MCP calls, with the status and headers: (status, headers, the JSON answer or its text)
     def mcp_raw(token, method, params=None, sid=None, verb="POST", port=None):
         headers = {"content-type": "application/json", "authorization": f"Bearer {token}"}
@@ -21650,6 +21673,25 @@ def registry():
     LAKES.extend([dev_at, slim_at])
     q("CREATE SECRET reg_secret (TYPE http, BEARER_TOKEN 'reg-token-1', SCOPE 'https://reg.example.com/')")  # (a secret the clone must leave)
     q(f"CREATE DATABASE dev LOCATION '{dev_at}' CLONE \"{here}\"")
+    # A Postgres client's startup database (dbname) is its session's when it names one here: `psql -d dev` writes into the
+    # branch, never the lake it was cloned from; any other name is this lake, as before
+    import psycopg
+    pg_dsn = lambda db: f"host=127.0.0.1 port={A.port + 10} user=pondra dbname={db}"
+    by_db = {}
+    with psycopg.connect(pg_dsn("dev"), autocommit=True) as c:
+        by_db["current_database"] = c.execute("SELECT current_database()").fetchone()[0]
+        c.execute("INSERT INTO kv VALUES (9, 'by dbname', 9)")
+        by_db["inserted (branch, base)"] = [q("SELECT count(*) AS n FROM dev.kv WHERE k = 9"), q("SELECT count(*) AS n FROM kv WHERE k = 9")]
+        c.execute("UPDATE kv SET v = 'changed' WHERE k = 9")  # (an UPDATE and a DELETE too: they once looked up `dev.public.kv` inside dev)
+        by_db["updated"] = q("SELECT v FROM dev.kv WHERE k = 9")
+        c.execute("DELETE FROM kv WHERE k = 9")
+        by_db["deleted"] = q("SELECT count(*) AS n FROM dev.kv WHERE k = 9")
+    base_rows = q("SELECT count(*) AS n FROM kv")[0]["n"]
+    with psycopg.connect(pg_dsn("nosuch"), autocommit=True) as c:
+        by_db["nosuch"] = [c.execute("SELECT current_database()").fetchone()[0], c.execute("SELECT count(*) FROM kv").fetchone()[0]]
+    info["dbname"] = by_db
+    checks["a Postgres client's dbname that names a branch is its session's: its INSERT, UPDATE and DELETE land in the branch, not the base; another name is this lake"] = \
+        by_db == {"current_database": "dev", "inserted (branch, base)": [[{"n": 1}], [{"n": 0}]], "updated": [{"v": "changed"}], "deleted": [{"n": 0}], "nosuch": [here, base_rows]}
     # What the clone took, as the registry says (pondra.kinds' on_clone, read here, never written in), against what each lake lists
     on_clone = {r["kind"]: r for r in q("SELECT * FROM pondra.kinds") if r["is"] == "object"}
     cloned_families = ("schema", "relation", "routine", "task", "type", "secret")
@@ -23804,6 +23846,25 @@ def use_path():
     checks["USE other, USE other.public, USE DATABASE other: ot is other's (3, then 4 and 5 once written); this lake has no ot"] = \
         info["other first"] == [{"n": 3}] and info["other after"] == [{"n": 4}] and info["not here"] and info["other.public"] == [{"n": 4}] \
         and info["DATABASE other"] == [{"n": 5}] and q("SELECT count(*) AS n FROM other.public.ot") == [{"n": 5}]
+    # A statement on a schema under USE other: a schema's name isn't placed by the path, so it named this lake's
+    # (DROP SCHEMA crm CASCADE dropped this lake's crm and its tables). It is refused by name, 0A000.
+    crm_before = q("SELECT count(*) AS n FROM crm.t")
+    info["schema under USE other"] = [http(s, "use-db-one") for s in (
+        "DROP SCHEMA crm CASCADE", "SELECT 1; DROP SCHEMA IF EXISTS crm CASCADE", "ALTER SCHEMA crm RENAME TO crm2",
+        "COMMENT ON SCHEMA crm IS 'x'", "CREATE SCHEMA made_in_other")]
+    checks["under USE other, DROP, ALTER, COMMENT ON and CREATE SCHEMA are refused by name (0A000), and this lake's crm keeps its table and rows"] = \
+        all(st != 200 and code == "0A000" and "under USE of other: other is an attached lake" in str(body) for st, code, body in info["schema under USE other"]) \
+        and q("SELECT count(*) AS n FROM crm.t") == crm_before and crm_before[0]["n"] > 0 \
+        and q("SELECT count(*) AS n FROM information_schema.schemata WHERE schema_name IN ('crm', 'crm2', 'made_in_other')") == [{"n": 1}]
+    # Postgres's catalog under USE other is other's, as Postgres's is the connection's database's: it listed this lake's.
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as c:
+        c.execute("USE other")
+        info["catalog under USE other"] = c.execute("SELECT table_catalog, table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 2").fetchall()
+        info["pg_class under USE other"] = c.execute("SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY 1").fetchall()
+        c.execute("RESET search_path")
+        info["catalog after"] = c.execute("SELECT DISTINCT table_catalog FROM information_schema.tables WHERE table_schema = 'public'").fetchall()
+    checks["over Postgres under USE other, information_schema.tables and pg_class are other's (ot, its catalog other), not this lake's; with the path reset, this lake's again"] = \
+        info["catalog under USE other"] == [("other", "ot")] and info["pg_class under USE other"] == [("ot",)] and info["catalog after"] == [(db_name,)]
     # Refused by name: a name that is both, unknown ones, no session, pondra sql.
     q("CREATE SCHEMA other")  # (now `other` is a database and a schema of this lake: USE other must say which)
     info["both"] = http("USE other", "use-both-1")
@@ -29244,7 +29305,7 @@ SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 175, "scal
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns, recursive, extensions, synced)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns, recursive, extensions, synced, agents)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -29445,7 +29506,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns", "recursive", "extensions", "synced"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns", "recursive", "extensions", "synced", "agents"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -29458,7 +29519,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

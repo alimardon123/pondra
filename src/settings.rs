@@ -237,7 +237,7 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_MATCH_RUN_ROWS", Int, Is("1000000")),
     node("PONDRA_MEMORY_GB", Gb, No).flag("task-ms", "Memory for queries and every cache together, in GB (also \
         PONDRA_MEMORY_GB; default: queries a third of the machine's), except a cache given its own budget (PONDRA_HOT_GB, \
-        PONDRA_CACHE_MB, PONDRA_PAGES_MB). A query that needs more takes it from the caches, then sorts, joins and aggregations spill."),
+        PONDRA_CACHE_MB, PONDRA_PAGES_MB, PONDRA_FILES_CACHE_MB, PONDRA_FUNCTION_CACHE_MB). A query that needs more takes it from the caches, then sorts, joins and aggregations spill."),
     node("PONDRA_MEMORY_LAKE_GB", Gb, No),
     node("PONDRA_MEMORY_MAX_GB", Gb, No),
     node("PONDRA_PAGES_MB", Mb, Is("256")),
