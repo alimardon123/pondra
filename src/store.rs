@@ -5217,7 +5217,7 @@ mod tests {
         assert_eq!([("b", true), ("c", true), ("a", false)].map(|(s, has)| back.col(s).unwrap().about.as_deref() == has.then_some(&about)), [true; 3], "through a rename and a drop");
         assert_eq!(t.logical().col("revenue").and_then(|c| c.about.as_deref()), Some(&about), "SQL's copy");
         let mut v = t.clone();
-        v.finish = Some(crate::finish::Finish { sql: String::new(), columns: vec![("revenue".into(), "Float64".into())] });
+        v.finish = Some(Finish { sql: String::new(), columns: vec![("revenue".into(), "Float64".into())] });
         assert_eq!(v.described().col("revenue").and_then(|c| c.about.as_deref()), Some(&about), "a description");
         let mut five = t.clone();
         five.record.listed = false;
