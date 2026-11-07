@@ -5,6 +5,7 @@
 //! moment it is durable, and they lay those changes over their own (slightly behind) view of the
 //! catalog: every node sees a commit within milliseconds, while the bucket stays the source of truth.
 use anyhow::{bail, Context, Result};
+use crate::{finish::Finish, seq::Identity, types::Enum}; // (catalog uses engine: counted once each, tools/layers.py)
 use bytes::Bytes;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -65,8 +66,8 @@ pub struct Made {
     pub shown: Vec<String>,
     pub not_null: Vec<String>,
     pub defaults: BTreeMap<String, String>,
-    pub identity: BTreeMap<String, crate::seq::Identity>,
-    pub enums: BTreeMap<String, crate::types::Enum>,
+    pub identity: BTreeMap<String, Identity>,
+    pub enums: BTreeMap<String, Enum>,
     pub sql_types: BTreeMap<String, String>,
 }
 
@@ -79,7 +80,7 @@ impl Made {
 /// to, over random sequences of them (`the_list_edits_leave_the_entry_as_the_field_edits_did`).
 #[cfg(test)]
 impl Made {
-    fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<crate::types::Enum>) -> String {
+    fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<Enum>) -> String {
         let taken = |s: &str| self.columns.iter().any(|(n, _)| n == s);
         let stored = (1..).map(|i| if i == 1 { name.to_string() } else { format!("{name}~{i}") }).find(|s| !taken(s)).expect("a free name");
         if stored != name {
@@ -163,11 +164,11 @@ pub struct Col {
     pub not_null: bool,
     /// `DEFAULT expr`, the SQL expression.
     pub default: Option<String>,
-    pub identity: Option<crate::seq::Identity>,
+    pub identity: Option<Identity>,
     /// The type a text column is held as (uuid, json, varchar(n): `types.rs`).
     pub held: Option<String>,
     /// An enum column's labels and type.
-    pub labels: Option<crate::types::Enum>,
+    pub labels: Option<Enum>,
 }
 
 /// A table's columns as its entry stores them from lake format 6: every column, dropped ones too, in field-id order, and
@@ -245,7 +246,7 @@ impl Serialize for Stored {
 enum Rest {
     NotNull,
     Dropped,
-    Facts(Facts<String, crate::seq::Identity, crate::types::Enum>),
+    Facts(Facts<String, Identity, Enum>),
 }
 
 impl<'de> Deserialize<'de> for Rest {
@@ -484,7 +485,7 @@ impl Stored {
     /// The column stored as `stored`.
     fn at(&mut self, stored: &str) -> Option<&mut Col> { self.columns.iter_mut().find(|c| c.stored_name() == stored) }
 
-    fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<crate::types::Enum>) -> String {
+    fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<Enum>) -> String {
         let taken = |s: &str| self.columns.iter().any(|c| c.stored_name() == s);
         let stored = (1..).map(|i| if i == 1 { name.to_string() } else { format!("{name}~{i}") }).find(|s| !taken(s)).expect("a free name");
         let id = self.next_id();
@@ -685,8 +686,8 @@ struct Fields<'a> {
     shown: Vec<&'a str>,
     not_null: Vec<&'a str>,
     defaults: BTreeMap<&'a str, &'a str>,
-    identity: BTreeMap<&'a str, &'a crate::seq::Identity>,
-    enums: BTreeMap<&'a str, &'a crate::types::Enum>,
+    identity: BTreeMap<&'a str, &'a Identity>,
+    enums: BTreeMap<&'a str, &'a Enum>,
     sql_types: BTreeMap<&'a str, &'a str>,
 }
 
@@ -760,9 +761,9 @@ macro_rules! entry {
             #[serde(default)]
             defaults: BTreeMap<String, String>,
             #[serde(default)]
-            identity: BTreeMap<String, crate::seq::Identity>,
+            identity: BTreeMap<String, Identity>,
             #[serde(default)]
-            enums: BTreeMap<String, crate::types::Enum>,
+            enums: BTreeMap<String, Enum>,
             #[serde(default)]
             sql_types: BTreeMap<String, String>,
             $($(#[$fm])* $field: $ty,)*
@@ -869,7 +870,7 @@ pub struct TableMeta {
     /// A GROUP BY view's table whose answers need a last step (avg, stddev, HAVING, …: ADR-055):
     /// its columns are what adds up, and reads give the view's columns from them (`finish.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub finish: Option<crate::finish::Finish>,
+    pub finish: Option<Finish>,
     /// `retention = '7 days'` (ADR-043): how long the table's past is kept (`ddl::KEEP_MS` when not
     /// set): read `AT (…)` (`past.rs`), and undropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1104,7 +1105,7 @@ impl TableMeta {
     /// ADD COLUMN `name`: stored under its name, or `name~2`, `name~3`… when an older column (renamed or dropped) is
     /// stored under that, since files are never rewritten. Last in stored order, and in SQL's unless `set_order` puts it
     /// elsewhere. Returns its stored name.
-    pub fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<crate::types::Enum>) -> String { self.edit(|f| f.add_column(name, dtype, held, labels)) }
+    pub fn add_column(&mut self, name: &str, dtype: &str, held: Option<String>, labels: Option<Enum>) -> String { self.edit(|f| f.add_column(name, dtype, held, labels)) }
 
     /// RENAME COLUMN: the column stored as `stored` is `to` in SQL from now on (its files keep the stored name).
     pub fn rename_column(&mut self, stored: &str, to: &str) { self.edit(|f| f.rename_column(stored, to)) }
@@ -1131,7 +1132,7 @@ impl TableMeta {
 
     /// An enum type changed (ALTER TYPE … ADD VALUE or RENAME, `types.rs`): every column of this table of that type
     /// takes it, in the same commit.
-    pub fn edit_enums(&mut self, of: &str, mut g: impl FnMut(&mut crate::types::Enum)) {
+    pub fn edit_enums(&mut self, of: &str, mut g: impl FnMut(&mut Enum)) {
         self.edit(|l| l.columns.iter_mut().filter_map(|c| c.labels.as_mut()).filter(|e| e.of.as_deref() == Some(of)).for_each(&mut g))
     }
 
@@ -4727,7 +4728,7 @@ mod tests {
     fn with_rules() -> TableMeta {
         let col = |c: &str, t: &str| (c.to_string(), t.to_string());
         let set = |v: &[(&str, &str)]| v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<String, String>>();
-        let id = |always: bool, seq: &str| crate::seq::Identity { always, declared: vec![], sequence: seq.into() };
+        let id = |always: bool, seq: &str| Identity { always, declared: vec![], sequence: seq.into() };
         let unique = |name: &str, c: &str, enforced: bool| crate::constraints::Constraint { name: name.into(), kind: crate::constraints::Kind::Unique, columns: vec![c.into()], references: None, enforced };
         let mut t = TableMeta::made(Made {
             columns: vec![col("id", "Int64"), col("seq_no", "Int64"), col("c_code", "Utf8"), col("c_status", "Utf8"), col("owner", "Utf8"), col("total", "Int64"), col("doc", "Utf8"), col("gone", "Utf8"), col("_deleted", "Boolean")],
@@ -4736,7 +4737,7 @@ mod tests {
             not_null: vec!["id".into(), "c_code".into(), "gone".into()],
             defaults: set(&[("id", "nextval('orders_id_seq')"), ("seq_no", "nextval('orders_seq_no_seq')"), ("total", "0"), ("gone", "'x'")]),
             identity: [("id".to_string(), id(false, "orders_id_seq")), ("seq_no".to_string(), id(true, "orders_seq_no_seq"))].into(),
-            enums: [("c_status".to_string(), crate::types::Enum { of: Some("order_status".into()), labels: vec!["open".into(), "shipped".into()] })].into(),
+            enums: [("c_status".to_string(), Enum { of: Some("order_status".into()), labels: vec!["open".into(), "shipped".into()] })].into(),
             sql_types: set(&[("owner", "uuid"), ("c_code", "varchar(3)"), ("doc", "json"), ("gone", "json")]),
             ..Default::default()
         });
@@ -4984,7 +4985,7 @@ mod tests {
             }
             let mut v = t.clone();
             let answers: Vec<(String, String)> = t.sql_columns().into_iter().rev().chain([("x".into(), "Utf8".into())]).collect();
-            v.finish = Some(crate::finish::Finish { sql: String::new(), columns: answers.clone() });
+            v.finish = Some(Finish { sql: String::new(), columns: answers.clone() });
             let d = v.described();
             assert_eq!(d.list(), &was(&v, answers, true), "{:?}", t.list());
             assert!(d.merge.is_empty());
@@ -5190,7 +5191,7 @@ mod tests {
             seed ^= seed << 17;
             seed % n.max(1)
         };
-        let mood = || crate::types::Enum { of: Some("mood".into()), labels: vec!["sad".into(), "ok".into()] };
+        let mood = || Enum { of: Some("mood".into()), labels: vec!["sad".into(), "ok".into()] };
         for round in 0..500 {
             // (`a` edits its list; `r` is the reference, the fields edited as 6a did; `c` is an entry read as its list)
             let (mut a, mut r, mut c) = (TableMeta::default(), Made::default(), TableMeta::default().as_list());

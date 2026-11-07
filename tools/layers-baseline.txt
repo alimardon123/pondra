@@ -291,12 +291,12 @@ store -> oom  2
 store -> panics  4
 store -> query  6
 store -> rules  14
-store -> seq  7
+store -> seq  3
 store -> serve  2
 store -> served  1
 store -> spill  2
 store -> sys  3
-store -> types  11
+store -> types  2
 store -> users  2
 store -> views  1
 store -> write  1
