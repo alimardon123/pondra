@@ -481,7 +481,7 @@ mod tests {
 
     async fn fresh() -> Result<(std::path::PathBuf, Arc<Lake>)> {
         let dir = std::env::temp_dir().join(format!("pondra-shaped-key-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         Ok((dir, lake))
     }
 

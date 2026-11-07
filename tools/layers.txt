@@ -9,6 +9,7 @@ answer base
 codes base
 column base
 env base
+lifecycle base
 ledger base
 memo base
 metrics base

@@ -6,7 +6,6 @@ answer -> xlsx  1
 app -> delta  3
 app -> dial  4
 app -> iceberg  2
-app -> node  2
 app -> pg_catalog  3
 audit -> reset  1
 auth -> crypto  2
@@ -25,7 +24,6 @@ cluster -> auth  1
 cluster -> format  2
 cluster -> log  1
 cluster -> members  1
-cluster -> node  11
 cluster -> panics  7
 cluster -> replica  1
 cluster -> store  2
@@ -45,7 +43,6 @@ ddl -> extension  3
 ddl -> feeds  9
 ddl -> matches  2
 ddl -> memory  5
-ddl -> node  1
 ddl -> shares  7
 delta -> iceberg  3
 delta -> write_outside  1
@@ -76,7 +73,6 @@ flight -> idle  2
 flight -> server  1
 flight -> sso  3
 flight -> tls  6
-format -> node  2
 format -> panics  2
 friendly -> pg_bytea  6
 front -> measures  5
@@ -87,7 +83,6 @@ front -> sparksql  1
 git -> crypto  1
 git -> fetch  1
 guard -> dial  2
-history -> node  1
 history -> reset  1
 host -> git  1
 host -> measures  1
@@ -95,7 +90,6 @@ host -> pg_trace  1
 iceberg -> delta  9
 iceberg -> write_outside  1
 inbox -> backup  1
-inbox -> node  1
 inbox -> panics  2
 inbox -> write  1
 joined -> ext  1
@@ -117,7 +111,6 @@ keep_parquet -> adopt  1
 keep_parquet -> sys  1
 keep_parquet -> tier  3
 kv -> fetch  1
-kv -> node  2
 kv -> panics  3
 lake_files -> ext_names  1
 live -> drain  2
@@ -130,7 +123,6 @@ log -> copy  2
 log -> defaults  1
 log -> dial  1
 log -> locks  1
-log -> node  1
 log -> panics  4
 log -> rules  4
 log -> seq  6
@@ -181,7 +173,7 @@ oom -> jemalloc  2
 oom -> node  1
 page_records -> dial  4
 panics -> drain  1
-panics -> node  3
+panics -> node  1
 path -> pg_json  1
 path -> sparksql  1
 pg -> drain  5
@@ -286,7 +278,6 @@ store -> hot  2
 store -> in_task  1
 store -> locks  1
 store -> memory  11
-store -> node  4
 store -> oom  2
 store -> panics  4
 store -> query  6
@@ -330,7 +321,6 @@ write -> dial  13
 write -> extension  2
 write -> iceberg  2
 write -> memory  1
-write -> node  1
 write -> pattern  1
 write -> pg_types  1
 write -> shares  1

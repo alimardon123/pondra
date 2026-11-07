@@ -21,7 +21,7 @@
 //!   killed and started again takes the next term: only its own restart takes its term back.
 use crate::log::{now_ms, untaken_flush};
 use crate::members::{self, Members};
-use crate::node::Guest;
+use crate::lifecycle::{Guest, Life};
 use crate::replica::ReplicaLog;
 use crate::store::{Frame, Lake, Store};
 use crate::terms::{alive, claim, deaf, gone_here, holder, latest, listen, lock_dir, lock_path, mark_alive, open_lock, say, stepped_down, superseded, wait_for, Holder, Term, HELD, LEASE};
@@ -55,6 +55,8 @@ pub struct Cluster {
     /// A guest that writes through the bucket's inbox (`inboxed`): it reads as a reader does, and its writes go to the
     /// leader through the inbox, since the leader doesn't answer from here (`write::by_inbox`).
     by_inbox: bool,
+    /// What a move to another term restarts: the node's (`lifecycle.rs`).
+    life: Life,
 }
 
 impl Cluster {
@@ -62,7 +64,7 @@ impl Cluster {
     /// from our own restart: `coming_back`). `may_lead` false: our store is another node's (`pondra://`),
     /// which leads its lake; we follow it, and wait for it, and never claim a term (invariant 299). `serves_store`
     /// is the node's own `--serve-store` (`served.rs`), kept for `cut_off`.
-    pub async fn join(store: &Store, addr: &str, reader: bool, may_lead: bool, serves_store: bool) -> Result<Arc<Cluster>> {
+    pub async fn join(store: &Store, addr: &str, reader: bool, may_lead: bool, serves_store: bool, life: Life) -> Result<Arc<Cluster>> {
         let (mut said, mut taken_back) = (false, false);
         let leader = loop {
             let now = match holder(store).await {
@@ -113,7 +115,7 @@ impl Cluster {
                 }
             }
         };
-        Ok(made(addr, leader, reader, may_lead, serves_store, taken_back))
+        Ok(made(addr, leader, reader, may_lead, serves_store, taken_back, life.clone()))
     }
 
     /// A guest's cluster (`node.rs`: a program's node for its own statements, which ends after them). Not `join`:
@@ -126,39 +128,39 @@ impl Cluster {
     /// reads, and a write claims the next term with no address and leads it (invariant 17). `may_lead` false is a store
     /// another node serves (`pondra://`): it is never led, so a write whose holder doesn't answer is an error, not a wait.
     /// A lake on a read-only reach (`write::across`) is refused by `Node::start` before this runs.
-    pub async fn guest(store: &Store, guest: Guest, may_lead: bool) -> Result<Arc<Cluster>> {
+    pub async fn guest(store: &Store, guest: Guest, may_lead: bool, life: Life) -> Result<Arc<Cluster>> {
         let writes = guest == Guest::Writes;
         let not_led = || anyhow::anyhow!("the node that serves this store doesn't lead it or answer from here, and a write can't go another way: start it, or read");
         loop {
             match holder(store).await? {
                 Holder::Led(t) => {
-                    let follower = made("", t.clone(), false, false, false, false);
+                    let follower = made("", t.clone(), false, false, false, false, life.clone());
                     if (!writes || !crate::env::is_set("PONDRA_NO_DIRECT")) && follower.leader_alive().await {
                         return Ok(follower);
                     }
                     return match (writes, may_lead) {
-                        (false, _) => Ok(made("", t, true, may_lead, false, false)),
+                        (false, _) => Ok(made("", t, true, may_lead, false, false, life.clone())),
                         (true, false) => Err(not_led()),
-                        (true, true) => Ok(inboxed(t, may_lead)),
+                        (true, true) => Ok(inboxed(t, may_lead, life.clone())),
                     };
                 }
                 // (another one-off writer is recording: a read reads beside it, a write waits for it to finish)
                 Holder::Recording(t) => {
                     if !writes {
-                        return Ok(made("", t, true, may_lead, false, false));
+                        return Ok(made("", t, true, may_lead, false, false, life.clone()));
                     }
                     wait_for(store, &t).await;
                 }
                 // (nobody alive: a read reads what is there, and a write claims the next term and leads it)
                 Holder::Free(t) => {
                     if !writes {
-                        return Ok(made("", t.unwrap_or(Term { n: 0, addr: String::new(), lock: String::new(), bell: false }), true, may_lead, false, false));
+                        return Ok(made("", t.unwrap_or(Term { n: 0, addr: String::new(), lock: String::new(), bell: false }), true, may_lead, false, false, life.clone()));
                     }
                     if !may_lead {
                         return Err(not_led());
                     }
                     if let Some(term) = claim(store, t.map_or(1, |t| t.n + 1), "").await? {
-                        return Ok(made("", term, false, true, false, false));
+                        return Ok(made("", term, false, true, false, false, life.clone()));
                     }
                     // (someone else claimed it just now: look again)
                 }
@@ -227,7 +229,7 @@ impl Cluster {
                     // (a newer term claimed meanwhile: cut off a moment ago, or paused for longer
                     // than a lease. SlateDB's fencing stops our commits; this stops our reads too.)
                     if superseded(&store, me.leader.n).await {
-                        crate::node::restart("a newer term has a leader");
+                        me.life.restart("a newer term has a leader", &[]);
                     }
                 }
                 due = Instant::now() + Duration::from_secs(if ok { 10 } else { 0 }); // (C5: a key at most once a second, each look)
@@ -277,10 +279,10 @@ impl Cluster {
                     // seconds (claiming needs it): if the bucket was down for everyone, the leader
                     // reaches it again in those seconds, and keeps leading.
                     match latest(&store).await {
-                        Ok(Some(t)) if t.n > self.leader.n => crate::node::restart(&format!("term {} has a newer leader", t.n)),
+                        Ok(Some(t)) if t.n > self.leader.n => self.life.restart(&format!("term {} has a newer leader", t.n), &[]),
                         Ok(_) if reached.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(3) => {
                             if claim(&store, self.leader.n + 1, &self.addr).await.is_ok() {
-                                crate::node::restart("the leader can't reach the bucket: the next term was claimed");
+                                self.life.restart("the leader can't reach the bucket: the next term was claimed", &[]);
                             }
                         }
                         Ok(_) => {}
@@ -293,12 +295,12 @@ impl Cluster {
                     Ok(r) => {
                         let (term, nodes): (u64, Vec<String>) = r.json().await.unwrap_or_default();
                         if term != self.leader.n {
-                            crate::node::restart("a new leader answers at the leader's address");
+                            self.life.restart("a new leader answers at the leader's address", &[]);
                         }
                         // (a holder away past the lease may hold another lake now: a lake in memory started
                         // again claims the same first term, so the term alone doesn't tell them apart)
                         if !self.may_lead && !self.leader_ok() {
-                            crate::node::restart("its holder answers again after the lease: it may hold another lake now (a lake in memory started again)");
+                            self.life.restart("its holder answers again after the lease: it may hold another lake now (a lake in memory started again)", &[]);
                         }
                         *self.view.lock().unwrap() = nodes;
                         *self.last_ok.lock().unwrap() = Instant::now();
@@ -309,17 +311,17 @@ impl Cluster {
                         if !matches!(latest(&store).await, Ok(Some(t)) if t.n > self.leader.n) {
                             claim(&store, self.leader.n + 1, &self.addr).await.ok();
                         }
-                        crate::node::restart("the leader stepped down");
+                        self.life.restart("the leader stepped down", &[]);
                     }
                     // A member that lost the leader takes over after the lease (if no peer still
                     // hears it). One that never reached it — say, outside the cluster's network —
                     // only once the leader is gone (`alive`): it never deposes a live one.
                     Err(_) if self.may_lead && if self.heard.load(std::sync::atomic::Ordering::Relaxed) { !self.leader_ok() } else { !alive(&store, &self.leader).await || deaf(&store, &self.leader).await } => match latest(&store).await {
-                        Ok(Some(t)) if t.n > self.leader.n => crate::node::restart(&format!("term {} has a newer leader", t.n)), // follow it
+                        Ok(Some(t)) if t.n > self.leader.n => self.life.restart(&format!("term {} has a newer leader", t.n), &[]), // follow it
                         Ok(_) if self.peer_sees_leader().await => {}     // only our link to the leader is down
                         Ok(_) => {
                             claim(&store, self.leader.n + 1, &self.addr).await.ok(); // we win the term, or someone else does
-                            crate::node::restart("the leader stopped answering (and no peer hears it): the next term was claimed");
+                            self.life.restart("the leader stopped answering (and no peer hears it): the next term was claimed", &[]);
                         }
                         Err(_) => {} // can't reach the bucket either: wait
                     },
@@ -341,7 +343,7 @@ impl Cluster {
                 for _ in 0..15 {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     if STREAM_DOWN.load(std::sync::atomic::Ordering::Relaxed) && matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
-                        crate::node::restart("another leads");
+                        self.life.restart("another leads", &[]);
                     }
                 }
                 // Following a leader that has been gone for two checks: reopen reading the
@@ -349,7 +351,7 @@ impl Cluster {
                 // files our view reads) would stay invisible until a new leader appears.
                 gone = if streamed && !self.leader_alive().await { gone + 1 } else { 0 };
                 if gone >= 2 || matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
-                    crate::node::restart("the leader is gone or another leads");
+                    self.life.restart("the leader is gone or another leads", &[]);
                 }
             }
         });
@@ -422,18 +424,18 @@ async fn answers(t: &Term) -> bool {
 }
 
 /// A cluster as a node's start decided it (`Cluster::join`, `Cluster::guest`): the term it follows or leads, and what it is.
-fn made(addr: &str, leader: Term, reader: bool, may_lead: bool, serves_store: bool, taken_back: bool) -> Arc<Cluster> {
+fn made(addr: &str, leader: Term, reader: bool, may_lead: bool, serves_store: bool, taken_back: bool, life: Life) -> Arc<Cluster> {
     let view = Mutex::new(vec![]); // a follower runs no shards until the leader lists it
     // (a node that never leads gets no startup grace: a holder that changed under its name shows at
     // its first answer, not 30 s later, so the restart check in `follow` can fire)
     let last_ok = Mutex::new(if may_lead { Instant::now() + STARTUP } else { Instant::now() }); // until we first hear from the leader
     let (beats, heard) = (Default::default(), Default::default());
-    Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, cut_off: Default::default(), others: Default::default(), may_lead, serves_store, taken_back, rang: tokio::sync::watch::Sender::new(0), by_inbox: false })
+    Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, cut_off: Default::default(), others: Default::default(), may_lead, serves_store, taken_back, rang: tokio::sync::watch::Sender::new(0), by_inbox: false, life })
 }
 
 /// A guest that writes through the bucket's inbox (`Cluster::guest`): it reads the lake as a `Reads` guest does, and says so.
-fn inboxed(t: Term, may_lead: bool) -> Arc<Cluster> {
-    let mut guest = made("", t, true, may_lead, false, false);
+fn inboxed(t: Term, may_lead: bool, life: Life) -> Arc<Cluster> {
+    let mut guest = made("", t, true, may_lead, false, false, life);
     Arc::get_mut(&mut guest).expect("made just now: no other handle").by_inbox = true;
     guest
 }

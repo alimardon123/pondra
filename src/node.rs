@@ -2,9 +2,10 @@
 //! with its signals and standard input around it; a library will start and stop one in its own process.
 //! A guest (`Options::guest`) is a node a program starts for its own statements: it answers them and ends.
 //!
-//! This file is the lake half: what a node is made of that a page has too (`stop`, `say`, the guest's and the moves'
-//! state), a host's state (`hosted`, `host`, the supervisor's events), and what a node does to start again
-//! (`restart`, `restart_with`), the program's own path (`exe`) and the lead of a lake nobody leads (`lead_once`).
+//! This file is the lake half: what a node is made of that a page has too (`stop`, the moves' state), a host's state
+//! (`hosted`, `host`, the supervisor's events), and what a node does when it must stop or start again (`Native`, the
+//! `Lifecycle` every lake it opens is handed), the program's own path (`exe`) and the lead of a lake nobody leads
+//! (`lead_once`).
 //! The doors half is `node/run.rs`.
 use crate::{app, backup, branch, ddl, ext, feeds, format, learned, log, panics, python, replica, runs, spmd, store, terms, users, views};
 use std::future::Future;
@@ -18,26 +19,7 @@ use crate::members::Members;
 #[cfg(feature = "doors")] pub use run::{Node, Options};
 #[cfg(feature = "doors")] pub(crate) use run::{request, Held};
 
-/// What a guest is for. A guest that reads claims nothing; one that writes may record, so it leads a lake nobody leads.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Guest {
-    /// It only reads: it follows a leader that answers, or reads beside one that doesn't, or nobody's, and claims nothing.
-    Reads,
-    /// It may record writes, so it leads a lake nobody leads (`Cluster::guest`).
-    Writes,
-}
-
-crate::per_node!(
-    /// Is the node open in this process a guest? Set at its start, set back when it stops: `restart_with`
-    /// keeps a guest's job, and a guest's lock file counts as gone at once.
-    static GUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
-
-/// Is the node open in this process a guest (`Options::guest`)?
-pub(crate) fn is_guest() -> bool { GUEST.load(std::sync::atomic::Ordering::SeqCst) }
-
-/// Marks the node being started a guest or not (`Node::start`).
-#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (only the doors half starts a node)
-pub(crate) fn set_guest(on: bool) { GUEST.store(on, std::sync::atomic::Ordering::SeqCst) }
+pub use crate::lifecycle::{Guest, Restarting};
 
 /// What a member's start takes besides its lake: `pondra serve`'s flags for the lake (the node's `Options` holds one),
 /// a library's, a guest's.
@@ -71,14 +53,6 @@ pub(crate) fn stop(why: String) {
     eprintln!("stopping: {why}");
     crate::memory::leave();
     std::process::exit(1)
-}
-
-/// A line the node says on stderr when all goes well (a node is up, a lake's format moved on). A library's host and a
-/// `pondra sql` guest's shell show only trouble, so there it is not said.
-pub(crate) fn say(line: impl std::fmt::Display) {
-    if !hosted() && !is_guest() {
-        eprintln!("{line}");
-    }
 }
 
 /// A lake moving to another place (`memory::set_location`): the host stops the node, settles the lake's
@@ -125,7 +99,7 @@ pub fn hosted() -> bool { HOSTED.load(SeqCst) }
 /// (a library's `Opened`).
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's supervisor is the doors half's)
 pub(crate) enum Event {
-    /// Halt the node and start it again (`restart_with`).
+    /// Halt the node and start it again (`Lifecycle::restart`).
     Restart(String),
     /// Stop the node and say why until it is opened again.
     Failed(String),
@@ -167,30 +141,37 @@ pub(crate) fn unhost() { SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inne
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's open of a lake from JSON asks it first)
 pub(crate) fn hosting() -> bool { SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).is_some() }
 
-/// What a node restarting in place unwinds with ([`restart_with`]): `panics::spawn` lets it go, and
-/// `panics::door` answers the request 57P03, as a node catching up does.
-#[derive(Debug)]
-pub struct Restarting(pub String);
+/// The lifecycle of a node in this process (`lifecycle::Lifecycle`): the program's, a library's (`hosted`) or a page's.
+/// A guest's (`Options::guest`) ends with its statement. Every lake the node opens, and its member, is handed it.
+pub struct Native {
+    guest: bool,
+}
 
-impl std::fmt::Display for Restarting {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the node is restarting to rejoin the cluster ({}), catching up with its leader: try again, or ask another node", self.0)
+/// A node's lifecycle, a guest's when `guest`.
+pub fn native(guest: bool) -> crate::lifecycle::Life { Arc::new(Native { guest }) }
+
+impl crate::lifecycle::Lifecycle for Native {
+    fn stop(&self, why: String) { stop(why) }
+    fn restart(&self, why: &str, carried: &[(&str, String)]) -> ! { restart_with(self.guest, why, carried) }
+    /// (a library's host and a `pondra sql` guest's shell show only trouble, so there it is not said)
+    fn say(&self, line: &str) {
+        if !hosted() && !self.guest {
+            eprintln!("{line}");
+        }
     }
+    fn one_off(&self) -> bool { self.guest }
+    fn owns_process(&self) -> bool { !hosted() }
+    fn program(&self) -> anyhow::Result<PathBuf> { exe() }
+    fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir)) }
 }
 
-/// The node must start again, to rejoin its cluster: `restart_with`, with nothing carried.
-pub fn restart(why: &str) -> ! {
-    restart_with(why, &[])
-}
-
-/// `restart`, with settings of the command line's own for the next run (`pondra sql`'s job and its
-/// tries: `env.rs`), on top of what this process was given. A guest sent back five times gives up: its statement
+/// The node starts again to rejoin its cluster (`Lifecycle::restart`), with settings of the command line's own for the
+/// next run (`pondra sql`'s job and its tries: `env.rs`), on top of what this process was given. A guest sent back five times gives up: its statement
 /// fails, saying why. In a library the node is halted and started again in place: the supervisor is told, and the
 /// task that asked unwinds, past the panic hook (a host's error reporting sees no panic for a takeover). In the
 /// program the same binary runs again (`run::exec_again`). On a page there is no program to run again, so a restart
 /// is a stop until the page decides otherwise (L2's answer in the design).
-pub fn restart_with(why: &str, carried: &[(&str, String)]) -> ! {
-    let guest = is_guest();
+fn restart_with(guest: bool, why: &str, carried: &[(&str, String)]) -> ! {
     if guest && crate::write::tries() >= 5 {
         eprintln!("gave up after 5 restarts: {why}"); // (a guest that is sent back five times is a statement that fails: it says why)
         crate::memory::leave();
@@ -210,9 +191,10 @@ pub fn restart_with(why: &str, carried: &[(&str, String)]) -> ! {
         std::panic::resume_unwind(Box::new(Restarting(why.to_string())))
     }
     #[cfg(feature = "doors")]
-    run::exec_again(carried);
+    run::exec_again(guest, carried);
     #[cfg(not(feature = "doors"))]
     {
+        let _ = carried; // (a page carries nothing: nothing runs again)
         stop(format!("{why}")); // (a page: a restart is a stop, until the page decides otherwise)
         unreachable!("stop ends an unhosted process")
     }
@@ -257,7 +239,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     if let Some(key) = s.auth.owner_key() {
         let _ = lake.owner_key.set(key.to_string()); // (whose tasks this process runs with its owner's files: `runs::signed`)
     }
-    let lives = !is_guest();
+    let lives = !lake.life.one_off();
     let leader = members.is_leader();
     let term = members.leader().n;
     let reader = s.reader || members.reader();
@@ -294,7 +276,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
         Some(Err(e)) if e.downcast_ref::<replica::Unreached>().is_some() => {
             eprintln!("{e:#}");
             crate::terms::newer_claimed(&lake.store, term).await;
-            restart("not leading past members this node can't reach")
+            lake.life.restart("not leading past members this node can't reach", &[])
         }
         Some(r) => {
             r?;
@@ -350,7 +332,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
 /// The member's own loops over its App, each as a node that lives keeps it (none for a guest): the leader's keys,
 /// tasks, tiering, checkpoints and emission, a follower's catalog refresh, streaming tasks, the store's upkeep.
 pub fn keep(app: &crate::app::App, s: &Start) {
-    let lives = !is_guest();
+    let lives = !app.lake.life.one_off();
     let leader = app.seq.is_some();
     crate::idle::serving(&app.lake, leader, app.replica.as_ref()); // (what `--idle-exit` waits for: `idle.rs`)
     let reader = s.reader || app.members.reader();
@@ -632,7 +614,7 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open(&url, true, false).await?;
+        let l = crate::store::Lake::open(&url, true, false, native(false)).await?; // (a page's: it lives, as a server's node)
         lake = Some(l.clone());
         start_app(l, alone.clone(), None, &start).await
     }
@@ -688,7 +670,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open_on(&url, true, kv).await?;
+        let l = crate::store::Lake::open_on(&url, true, kv, native(false)).await?;
         lake = Some(l.clone());
         start_app(l, members, None, &start).await
     }

@@ -900,7 +900,7 @@ mod tests {
     const TICKER: &str = "SELECT * FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES strt.ts AS start_ts ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) AS m";
 
     async fn lake_with_ticks(dir: &std::path::Path) -> Result<Arc<Lake>> {
-        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         crate::write::create_table(&lake, "ticks", r#"{"columns": [["symbol", "Utf8"], ["ts", "Timestamp(Microsecond, None)"], ["price", "Float64"]]}"#).await?;
         Ok(lake)
     }

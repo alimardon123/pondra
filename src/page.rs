@@ -1402,7 +1402,7 @@ mod tests {
         assert!(format!("{e:#}").contains("sends its writes to its node"), "{e:#}");
         // (both are refused before the module's page is claimed, so this test never takes it: `node.rs`'s claim test does)
         let dir = std::env::temp_dir().join(format!("pondra-joined-{}", uuid::Uuid::new_v4()));
-        let made = crate::store::Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let made = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         let _sequencer = crate::log::Sequencer::start(made.clone(), None).await?;
         let lake = &made;
         // a table with no key, one with a PRIMARY KEY, and one with a UNIQUE: a superuser's query INSERT into any of them is the page's to
