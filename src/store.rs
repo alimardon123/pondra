@@ -70,6 +70,7 @@ pub struct Made {
     pub sql_types: BTreeMap<String, String>,
 }
 
+#[cfg(test)]
 impl Made {
     fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.names.get(stored).map_or(stored, String::as_str) }
 }
@@ -318,6 +319,8 @@ impl<'de> Deserialize<'de> for Stored {
 
 impl Stored {
     /// The list from the fields by stored name. Facts for a name no column has are passed over, as every reader did.
+    /// The tests' check of `from_fields`, which moves the fields in rather than copying them.
+    #[cfg(test)]
     pub fn of(m: &Made) -> Stored {
         // (sets and places, not scans: a wide table's 500 columns against its drops and order were 0.1 ms an entry)
         fn set(v: &[String]) -> std::collections::HashSet<&str> { v.iter().map(String::as_str).collect() }
