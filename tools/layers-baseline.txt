@@ -291,12 +291,12 @@ store -> oom  2
 store -> panics  4
 store -> query  6
 store -> rules  14
-store -> seq  8
+store -> seq  7
 store -> serve  2
 store -> served  1
 store -> spill  2
 store -> sys  3
-store -> types  12
+store -> types  11
 store -> users  2
 store -> views  1
 store -> write  1
@@ -336,10 +336,10 @@ write -> pg_types  1
 write -> shares  1
 write -> sso  1
 write -> store_wire  1
-write -> write_outside  1
+write -> write_outside  2
 write_outside -> avro  3
 write_outside -> catalogs  1
 write_outside -> delta  3
 write_outside -> iceberg  4
 write_outside -> read_delta  1
-write_outside -> read_iceberg  5
+write_outside -> read_iceberg  7
