@@ -204,10 +204,14 @@ pub fn uses(sql: &str) -> bool { sql.contains('$') && !names(sql).is_empty() || 
 pub fn calls_getvariable(sql: &str) -> bool { sql.as_bytes().windows(11).any(|w| w.eq_ignore_ascii_case(b"getvariable")) }
 
 /// `$name` and `getvariable('name')` in `sql` → their values; Postgres's `$1`, `$2` left for
-/// whoever binds them (`pg.rs`). Text that uses no variable is left as it is.
+/// whoever binds them (`pg.rs`). Text that uses no variable is left as it is. A text with MySQL's `/*! … */` is refused
+/// before it is bound, since binding prints it back without the comment (`dialect_stmts::hint_refused`).
 pub fn bound(sql: &str) -> Result<std::borrow::Cow<'_, str>> {
     Ok(match uses(sql) {
-        true => crate::routines::bind_named(sql, &values(&HashMap::new()))?.into(),
+        true => {
+            crate::dialect_stmts::hint_refused(sql)?;
+            crate::routines::bind_named(sql, &values(&HashMap::new()))?.into()
+        }
         false => sql.into(),
     })
 }
