@@ -145,15 +145,12 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
         }
         anyhow::Ok(())
     });
-    let mut who = crate::auth::Principal::of(if app.open().await { Role::Admin } else { Role::None }).at("kafka", from);
+    let epoch = app.lake.cat.rights_version(); // (before it is asked: a user made after it moves the version past it)
+    let mut who = crate::auth::Principal { epoch, ..crate::auth::Principal::of(if app.open().await { Role::Admin } else { Role::None }) }.at("kafka", from);
     let mut said = (who.role > Role::None).then_some(Said::Open); // (how it signed in, to check again: `again`)
-    let mut checked = std::time::Instant::now();
     while let Ok(size) = rd.read_i32().await {
-        if checked.elapsed() >= Duration::from_secs(5) {
-            checked = std::time::Instant::now();
-            if let Some(s) = &said {
-                who = again(&app, s).await.at("kafka", from);
-            }
+        if let Some(s) = said.as_ref().filter(|_| who.stale(&app.lake)) {
+            who = again(&app, s).await.at("kafka", from);
         }
         let most = if who.role == Role::None { 1 << 20 } else { 128 << 20 }; // (before signing in: ApiVersions, SASL and Metadata, all small)
         ensure!((0..=most).contains(&size), "request of {size} bytes");
@@ -181,17 +178,22 @@ enum Said {
     Bearer(String),
 }
 
-/// Who a connection that signed in is now, checked again every 5 s, as `server::until_revoked` checks an HTTP stream's
-/// caller (11-02 audit H3): its user dropped, made no superuser or its grants taken back, its password changed, its token
-/// or session expired, and it is nobody, so its next fetch or produce ends the connection; signed in at an open node, once
-/// the node is open no more. (A password is hashed at most once a minute: `users::password_ok` remembers it.)
+/// Who a connection that signed in (`was`) is now, checked again at its next request once who may do what changed or its
+/// credential ended (`Principal::stale`; 11-02 audit H3): its user dropped, made no superuser or its grants taken back,
+/// its password changed, its token or session expired, and it is nobody, so its next fetch or produce ends the
+/// connection; signed in at an open node, once the node is open no more. (A password is hashed at most once a minute:
+/// `users::password_ok` remembers it.)
 async fn again(app: &App, said: &Said) -> crate::auth::Principal {
+    let epoch = app.lake.cat.rights_version(); // (before it is asked again, as at sign-in)
     let now = match said {
         Said::Open => app.open().await.then(|| crate::auth::Principal::of(Role::Admin)),
         Said::Plain(user, password) => crate::users::sign_in(&app.lake, &app.auth, user, password).await,
         Said::Bearer(token) => crate::users::who(&app.lake, &app.auth, &crate::auth::Credential::Token(token.clone())).await,
     };
-    now.unwrap_or_else(|| crate::auth::Principal::of(Role::None))
+    match now {
+        Some(p) => crate::auth::Principal { epoch: p.epoch.max(epoch), ..p },
+        None => crate::auth::Principal::of(Role::None),
+    }
 }
 
 async fn request(app: &App, me: &Broker, who: &mut crate::auth::Principal, said: &mut Option<Said>, peer: &crate::tls::Peer, buf: Bytes) -> Result<Reply> {
@@ -344,6 +346,8 @@ fn sasl_handshake(r: &mut Rd) -> Result<Vec<u8>> {
 /// past ten failures a minute for a user from one address, that pair is refused (`auth::guessing`).
 async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &mut Option<Said>, peer: &crate::tls::Peer, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     let auth = r.nbytes()?.unwrap_or_default();
+    let epoch = app.lake.cat.rights_version(); // (before it is asked: a change after it moves the version past it)
+    let made = |p: crate::auth::Principal| crate::auth::Principal { epoch: p.epoch.max(epoch), ..p };
     // (read alike at every door: `auth::Credential`. OAUTHBEARER's token, else PLAIN's name and password)
     let credential = match crate::sso::bearer(&auth) {
         Some(token) => crate::auth::Credential::Token(token),
@@ -357,7 +361,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &m
     let refused = if let Some(why) = credential.malformed() {
         Some(why) // (never taken for no sign-in, an open node's included)
     } else if app.open().await {
-        *who = crate::auth::Principal::of(Role::Admin).at("kafka", who.from);
+        *who = made(crate::auth::Principal::of(Role::Admin)).at("kafka", who.from);
         *said = Some(Said::Open);
         None
     } else if let Some(token) = credential.token() {
@@ -365,7 +369,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &m
         match crate::users::who(&app.lake, &app.auth, &credential).await {
             Some(p) => {
                 user = p.name.clone();
-                *who = p.at("kafka", who.from);
+                *who = made(p).at("kafka", who.from);
                 *said = Some(Said::Bearer(token.to_string()));
                 None
             }
@@ -378,7 +382,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &m
     } else {
         match crate::users::sign_in(&app.lake, &app.auth, &user, &password).await {
             Some(p) => {
-                *who = p.at("kafka", who.from);
+                *who = made(p).at("kafka", who.from);
                 *said = Some(Said::Plain(user.clone(), password.clone()));
                 None
             }
