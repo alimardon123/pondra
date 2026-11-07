@@ -70,6 +70,13 @@ impl Merge {
         self.upsert.as_ref().map(|u| u.on.as_slice()).filter(|on| !on.is_empty())
     }
 
+    /// Does it put values by the table's columns' order: an `INSERT … ON CONFLICT` (or `INSERT OR …`) without a column list, or
+    /// a `WHEN NOT MATCHED THEN INSERT VALUES` without one? Then the order its node had is checked on the leader, as a plain
+    /// INSERT's is (`write::in_sql_order`).
+    pub fn by_position(&self) -> bool {
+        self.upsert.as_ref().is_some_and(|u| u.columns.is_empty()) || self.clauses.iter().any(|c| matches!(&c.action, Action::Insert(columns, _) if columns.is_empty()))
+    }
+
     /// The privileges on its table it needs: what its clauses do (`auth::allows`).
     pub fn privileges(&self) -> Vec<&'static str> {
         let mut all: Vec<&'static str> = self.clauses.iter().map(|c| match c.action {
@@ -833,7 +840,8 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &Arc<Table
     }
     let inserted = new.as_ref().and_then(|n| Some(n.column_by_name(ROW_ID)?.null_count())).unwrap_or(0); // (new rows: no id yet)
     let src = |p: &str| Src { producer: format!("{producer}{p}"), seq: 1, prev: None };
-    let append = |table: &str, batch: RecordBatch, src: Src| Append { table: table.into(), src, batch, ack: tokio::sync::oneshot::channel().0, placed: None };
+    // (the table's rows a plain INSERT or a by-position MERGE put by its node's order carry it, for the leader: `log::placed_for`)
+    let append = |table: &str, batch: RecordBatch, src: Src| Append { table: table.into(), src, batch, ack: tokio::sync::oneshot::channel().0, placed: crate::log::placed_for(table) };
     let mut pending = vec![];
     if meta.key.is_empty() {
         if old.is_some() {
