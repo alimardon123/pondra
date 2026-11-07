@@ -3576,7 +3576,8 @@ def bykey_on_three():
         if k == 5:
             nodes[0].kill(); nodes[0].start()  # (the leader, between runs)
     retry("DELETE FROM orders WHERE region = 'north' AND customer = 'c2'", A.port + 2)
-    ok = all(_bykey_same(lambda s: q(s, port), name, query, by) for name, (query, by) in BYKEY_VIEWS.items() for port in (A.port, A.port + 1, A.port + 2))
+    # (read through `retry` too: a follower that finds a new leader restarts to rejoin, and its port is closed meanwhile)
+    ok = all(_bykey_same(lambda s: retry(s, port), name, query, by) for name, (query, by) in BYKEY_VIEWS.items() for port in (A.port, A.port + 1, A.port + 2))
     for n in nodes:
         n.kill()
     return ok
@@ -3622,7 +3623,8 @@ def full_on_three():
         retry(f"UPDATE tiers SET tier = 'gold' WHERE customer = 'c{k % 11}'", port)
         if k == 4:
             nodes[0].kill(); nodes[0].start()  # (the leader, between runs)
-    ok = all(_bykey_same(lambda s: q(s, port), name, query, by, secs=60) for name, (query, by) in FULL_VIEWS.items() for port in (A.port, A.port + 1, A.port + 2))
+    # (read through `retry` too: a follower that finds a new leader restarts to rejoin, and its port is closed meanwhile)
+    ok = all(_bykey_same(lambda s: retry(s, port), name, query, by, secs=60) for name, (query, by) in FULL_VIEWS.items() for port in (A.port, A.port + 1, A.port + 2))
     for n in nodes:
         n.kill()
     return ok
