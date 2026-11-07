@@ -59,10 +59,10 @@ impl Writer {
         // replaced files a minute on, not five: a minute of WAL is a file per commit (100 MB at 400
         // commits a second), and a disk they filled had no room to flush the catalog, so nothing
         // could ever clear it. (A follower reads the files of a manifest it polled a second ago at most: `store::FOLLOWER_POLL`.)
-        let every = |interval: u64, min_age: u64| Some(GarbageCollectorDirectoryOptions { interval: Some(Duration::from_secs(interval)), min_age: Duration::from_secs(min_age), dry_run: false });
-        let gc = crate::env::parse("PONDRA_GC_SECS");
-        let (wal, secs) = (gc.unwrap_or(if local { 5 } else { 60 }), gc.unwrap_or(60));
-        let compacted = if local { every(10, 60) } else { GarbageCollectorOptions::default().compacted_options };
+        let every = |interval: Duration, min_age: Duration| Some(GarbageCollectorDirectoryOptions { interval: Some(interval), min_age, dry_run: false });
+        let (gc, s) = (crate::env::secs_given("PONDRA_GC_SECS"), Duration::from_secs);
+        let (wal, secs) = (gc.unwrap_or(s(if local { 5 } else { 60 })), gc.unwrap_or(s(60)));
+        let compacted = if local { every(s(10), s(60)) } else { GarbageCollectorOptions::default().compacted_options };
         let garbage_collector_options = Some(GarbageCollectorOptions { wal_options: every(wal, wal), manifest_options: every(secs, secs), compactions_options: every(secs, secs), compacted_options: compacted, ..Default::default() });
         // (the compactor and the garbage collector start once the node serves: their first reads
         // were most of a cold start's, C5; `upkeep`)

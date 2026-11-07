@@ -191,10 +191,10 @@ async fn state_bytes(lake: &Lake, table: &str, format: &str) -> Option<Vec<u8>> 
 /// `PONDRA_STAGED_SECS` (`sys::stale_staged`), purged as a failed replace's are. `tables` is the table entries the caller
 /// has just read (`tier::expire`'s scan, so no second one); the tables let go are taken out of it.
 pub async fn drop_stale_staged(lake: &Lake, tables: &mut Vec<(String, TableMeta)>) -> Result<()> {
-    let (now, secs) = (crate::log::now_ms(), crate::env::value::<u64>("PONDRA_STAGED_SECS"));
+    let (now, ms) = (crate::log::now_ms(), crate::env::secs("PONDRA_STAGED_SECS").as_millis() as u64);
     let stale: Vec<String> = tables
         .iter()
-        .filter(|(key, m)| m.made.is_some_and(|(_, made_ms)| crate::sys::stale_staged(&key[2..], made_ms, now, secs)))
+        .filter(|(key, m)| m.made.is_some_and(|(_, made_ms)| crate::sys::stale_staged(&key[2..], made_ms, now, ms)))
         .map(|(key, _)| key[2..].to_string())
         .collect();
     for name in &stale {

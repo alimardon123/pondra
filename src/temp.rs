@@ -167,7 +167,7 @@ pub fn peek<T>(session: &str, f: impl FnOnce(&Session) -> Option<T>) -> Option<T
 
 /// How long a session may sit unused (`PONDRA_SESSION_IDLE_SECS`, 3600).
 fn idle() -> Duration {
-    Duration::from_secs(crate::env::value("PONDRA_SESSION_IDLE_SECS"))
+    crate::env::secs("PONDRA_SESSION_IDLE_SECS")
 }
 
 /// Sessions idle for `PONDRA_SESSION_IDLE_SECS` end, as `end` ends them (a transaction rolled back,
