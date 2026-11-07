@@ -18271,9 +18271,11 @@ def remembered():
     """The Postgres port answers a repeated query as HTTP does (`App::remembers`): the same text at the same
     catalog version, from any connection, runs once (`pondra_queries_total`), and a commit makes the next one
     run again with the new rows. Never what may answer otherwise: a transaction's reads (its own writes), now(),
-    random(), a temporary table, a session with a DataFusion setting; nor for a user granted some tables, who
-    is refused a table another user's remembered answer read. Each connection sends the answer in its own
-    formats (text, binary) and parameters are part of the text a prepared statement runs."""
+    random(), a temporary table, a session with a DataFusion setting. A user granted some tables has its answers
+    remembered under what it may read: it is refused a table another user's remembered answer read, as is a user
+    granted fewer columns, or one a REVOKE took the table from; and its key lookups are answered of the columns it may
+    read. Each connection sends the answer in its own formats (text, binary) and parameters are part of the text a
+    prepared statement runs."""
     import psycopg
     lake = new_lake()
     pg = A.port + 10
@@ -18363,6 +18365,57 @@ def remembered():
     ann_n = ann.execute("SELECT count(*) FROM r_t").fetchall()[0][0]
     info["a user granted r_t, asking what a superuser's answer read"] = refused
     checks["a user granted some tables is refused a table another user's remembered answer read (42501), and reads its own"] = boss_n == [2, 2] and refused == "42501" and ann_n == 1001
+
+    # 8. A user granted some tables has its own answers remembered, under what it may read (`rights::Scope::key`): asked
+    # again, run once. Another user granted fewer columns is refused the same text, as it would be; a REVOKE is another key,
+    # so the user revoked is refused too, never given what it was answered before. A key lookup answers a user what it
+    # may read, unplanned; a column it may not read is refused, with SELECT * too, over HTTP and the port.
+    import base64
+    hdr = lambda u, pw: {"Authorization": "Basic " + base64.b64encode(f"{u}:{pw}".encode()).decode()}
+    boss_h = hdr("r_boss", "boss-password-1")
+    ran = lambda: metrics_of(A.port, headers=boss_h).get("pondra_queries_total", 0)
+    for s in ["CREATE USER r_cat PASSWORD 'cat-password-1'", "GRANT SELECT (id) ON r_t TO r_cat", "CREATE TABLE r_kv (k BIGINT PRIMARY KEY, v VARCHAR, hidden VARCHAR)",
+              "INSERT INTO r_kv VALUES (1, 'one', 'h1'), (2, 'two', 'h2')", "GRANT SELECT (k, v) ON r_kv TO r_cat"]:
+        boss.execute(s)
+    cat = psycopg.connect(f"host=127.0.0.1 port={pg} user=r_cat password=cat-password-1 dbname=lake", autocommit=True)
+    def sqlstate(conn, s):
+        try:
+            conn.execute(s).fetchall()
+            return None
+        except psycopg.Error as e:
+            return e.sqlstate
+    def http(who, s):
+        try:
+            return call(A.port, "POST", "/sql", s.encode(), headers=who)
+        except Exception as e:
+            return f"ERROR {e}"
+    K = f"SELECT sum(amount) AS s FROM r_t WHERE id % 5 = 0 -- {uuid.uuid4()}"
+    before = ran()
+    kept = [ann.execute(K).fetchall() for _ in range(3)] + [http(hdr("r_ann", "ann-password-1"), K) for _ in range(2)]
+    runs = ran() - before
+    info["a user with grants, asking one query five times over the port and HTTP: runs"] = runs
+    checks["a user granted some tables asks one query again, over the port and HTTP: run once per door, the same answer"] = runs == 2 and kept[0] == kept[1] == kept[2] \
+        and kept[0][0][0] == 150752.0 and kept[3] == kept[4] == [{"s": 150752.0}]
+    fewer = (sqlstate(cat, K), http(hdr("r_cat", "cat-password-1"), K))
+    info["a user granted only r_t's id, asking the text another user's answer is kept for"] = fewer
+    checks["a user granted fewer columns is refused the text another user's answer is kept for (42501), over the port and HTTP"] = fewer[0] == "42501" and "permission denied" in str(fewer[1])
+    boss.execute("REVOKE SELECT ON r_t FROM r_ann")
+    revoked = (sqlstate(ann, K), http(hdr("r_ann", "ann-password-1"), K))
+    info["the user revoked, asking the text its own answer is kept for"] = revoked
+    checks["after a REVOKE the user is refused the text its own answer was kept for (42501), over the port and HTTP"] = revoked[0] == "42501" and "permission denied" in str(revoked[1])
+    boss.execute("GRANT SELECT ON r_t TO r_ann")
+    cat_h = hdr("r_cat", "cat-password-1")
+    before = ran()
+    looked = [cat.execute("SELECT k, v FROM r_kv WHERE k = 2").fetchall(), http(cat_h, "SELECT k, v FROM r_kv WHERE k = 1"), http(cat_h, "SELECT v FROM r_kv WHERE k = 2")]
+    planned = ran() - before
+    info["a key lookup by a user granted r_kv's k and v: planned"] = planned
+    checks["a key lookup by a user granted its columns is answered unplanned, over the port and HTTP"] = planned == 0 and looked == [[(2, "two")], [{"k": 1, "v": "one"}], [{"v": "two"}]]
+    hidden = [sqlstate(cat, "SELECT k, hidden FROM r_kv WHERE k = 2"), sqlstate(cat, "SELECT * FROM r_kv WHERE k = 2"),
+              http(cat_h, "SELECT k, hidden FROM r_kv WHERE k = 1"), http(cat_h, "SELECT * FROM r_kv WHERE k = 1"), http(cat_h, "SELECT v FROM r_kv WHERE k = 1 AND hidden = 'h1'")]
+    info["a key lookup of a column not granted"] = hidden
+    checks["a key lookup of a column it may not read is refused (42501), SELECT * too, over the port and HTTP"] = hidden[:2] == ["42501", "42501"] \
+        and all("permission denied" in str(h) and "hidden" in str(h) for h in hidden[2:])
+    cat.close(); ann.close(); boss.close()
 
     node.kill()
     ok = all(checks.values())

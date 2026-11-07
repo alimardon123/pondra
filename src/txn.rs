@@ -2023,7 +2023,7 @@ fn joined(alias: &str, row: &RecordBatch, proposed: &RecordBatch) -> Result<(Rec
 pub async fn point_read(lake: &Lake, sql: &str) -> Result<Option<(Vec<RecordBatch>, Arc<crate::serve::Point>)>> {
     let Some(snapshot) = snapshot() else { return Ok(None) };
     // (a locking read takes its locks first, and is planned over the rows it locked: `lock_reads`)
-    if !crate::rights::scope().whole() || crate::temp::mentioned(sql) || LOCKING.is_match(sql) {
+    if crate::temp::mentioned(sql) || LOCKING.is_match(sql) {
         return Ok(None);
     }
     let Some(p) = crate::serve::point(lake, sql.trim().trim_end_matches(';')).await? else { return Ok(None) };

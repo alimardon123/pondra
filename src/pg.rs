@@ -453,8 +453,8 @@ impl Backend {
                 return Ok(Response::Query(rows(&schema, b, format)?)); // (in a transaction: its own version, or its snapshot's)
             }
         }
-        if reader && crate::rights::scope().whole() && !crate::txn::open() && !crate::temp::mentioned(sql) {
-            // A key lookup: the serving path, before anything else (ADR-036 §6), as `/lookup` answers it.
+        if reader && !crate::txn::open() && !crate::temp::mentioned(sql) {
+            // A key lookup: the serving path, before anything else (ADR-036 §6), as `/lookup` answers it (of what its caller may read).
             let t0 = std::time::Instant::now();
             if let Some(p) = crate::serve::point(&self.app.lake, sql.trim().trim_end_matches(';')).await.map_err(user_error)? {
                 let t1 = t0.elapsed();
@@ -830,7 +830,7 @@ impl Backend {
             };
             Ok((keep, batches)) // (its own caller takes the batches as they are: never decoded again)
         };
-        match self.app.remembered(format!("pg|{sql}"), sql, version, None, run).await? {
+        match self.app.remembered(format!("pg|{}|{sql}", crate::rights::scope().key()), sql, version, None, run).await? {
             Kept::Bytes(b) => crate::query::read_ipc(&b),
             Kept::Own(batches) => Ok(batches),
         }
@@ -1771,7 +1771,7 @@ impl Backend {
 
     /// `param_types`, but for uuids (`pg_types`), which are text to the planner.
     async fn inferred(&self, sql: &str) -> Vec<Type> {
-        if let (true, Ok(Some(p))) = (crate::rights::scope().whole(), crate::serve::point(&self.app.lake, sql).await) {
+        if let Ok(Some(p)) = crate::serve::point(&self.app.lake, sql).await {
             return p.parameters(sql).iter().map(|t| pg_type(t, FieldFormat::Text).0).collect(); // (a key lookup's: its key's types, unplanned)
         }
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
@@ -1850,10 +1850,7 @@ impl Backend {
                 });
             }
         }
-        let point = match crate::rights::scope().whole() {
-            true => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.types().into()))), // (a key lookup's columns, unplanned, first)
-            false => None,
-        };
+        let point = crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.types().into()))); // (a key lookup's columns, unplanned, first)
         if point.is_none() && (session_command(sql).is_some() || crate::set::is(sql) || crate::vars::change(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some() || crate::script::is(sql)) {
             return Ok((vec![], Columns::None)); // (a COPY's columns come with its data)
         }

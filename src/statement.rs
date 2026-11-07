@@ -117,10 +117,9 @@ pub(crate) fn is_write(sql: &str) -> bool {
 /// Step 2's inside, on a statement already expanded (`run` makes it, inside `audit::statement`): the key lookup, the
 /// remembered answer or the run. Postgres's door enters here too, with its own text and its own audit.
 pub(crate) async fn query<W: Wire>(app: &App, one: &str, how: &How<'_>, files: bool, wire: &W) -> Result<Answer<W::Own>> {
-    let limited = !crate::rights::scope().whole(); // (a user granted some tables: planned as it may read them, never answered from what another read, nor kept: its grants may change)
-    if wire.takes_point_json() && !crate::temp::mentioned(one) && !limited {
+    if wire.takes_point_json() && !crate::temp::mentioned(one) {
         if let Some(body) = crate::serve::point_sql(&app.lake, one).await? {
-            return Ok(Answer::Kept(body.into())); // a key lookup: no planning
+            return Ok(Answer::Kept(body.into())); // a key lookup: no planning (of the columns its caller may read: `serve::point`)
         }
     }
     // The program that started the node (`files`) has its answers remembered apart, run with its
@@ -134,7 +133,8 @@ pub(crate) async fn query<W: Wire>(app: &App, one: &str, how: &How<'_>, files: b
         crate::query::mark("answer kept?");
         return Ok(run_once(app, how, one, files, wire).await?.1);
     };
-    let key = format!("{kept}|{}|{}|{one}", how.spread.unwrap_or(""), if files { "owner" } else { "" });
+    // (a user granted some tables: kept under what it may read, `Scope::key`, so an answer made under other grants is never its)
+    let key = format!("{kept}|{}|{}|{}|{one}", how.spread.unwrap_or(""), if files { "owner" } else { "" }, crate::rights::scope().key());
     let stale = how.stale.filter(|_| how.after.is_none()); // (read-your-writes wins)
     Ok(match app.remembered(key, one, version, stale, || run_once(app, how, one, files, wire)).await? {
         Kept::Bytes(body) => Answer::Kept(body),

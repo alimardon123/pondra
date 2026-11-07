@@ -1169,6 +1169,7 @@ pub struct Access {
     grants: Vec<Grant>,
     pub(crate) names: HashSet<String>, // (itself, its roles, public: whose grants they are; `rights::Scope::names`)
     pub limits: Limits,     // (its own)
+    key: std::sync::OnceLock<String>, // (`key`: worked out once, at the first remembered answer)
 }
 
 impl Access {
@@ -1192,6 +1193,18 @@ impl Access {
         some.map(Some)
     }
     pub fn may(&self, privilege: &str, table: &str) -> bool { self.columns(privilege, table).is_some() }
+    /// What it holds, as one name (`rights::Scope::key`): its grants and its names, each in any order, hashed. Not its
+    /// limits, which change no answer.
+    pub fn key(&self) -> &str {
+        self.key.get_or_init(|| {
+            let mut grants: Vec<String> = self.grants.iter().map(|g| serde_json::to_string(g).unwrap_or_default()).collect();
+            grants.sort();
+            grants.dedup();
+            let mut names: Vec<&str> = self.names.iter().map(String::as_str).collect();
+            names.sort();
+            sha256(&serde_json::to_string(&(grants, names)).unwrap_or_default())[..32].to_string() // (JSON: no two contents spell alike)
+        })
+    }
     /// The same, for a table of another lake attached here (`l.t`, `l.s.t`): only grants naming
     /// it count; ON ALL TABLES and ON SCHEMA are this lake's.
     pub fn named(&self, privilege: &str, table: &str) -> Option<Option<HashSet<String>>> {
@@ -1298,7 +1311,7 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
                 grants.extend(u.grants.iter().cloned());
                 todo.extend(u.roles.iter().map(|r| (r.clone(), None, false)));
             }
-            let access = Arc::new(Access { grants, names: seen, limits: me.limits });
+            let access = Arc::new(Access { grants, names: seen, limits: me.limits, ..Default::default() });
             ACCESS.lock().unwrap().insert(id, (version, datafusion::common::instant::Instant::now(), access.clone(), superuser));
             (access, superuser)
         }

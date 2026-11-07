@@ -125,11 +125,17 @@ impl Point {
     }
 }
 
-/// `sql` as a point query, if it is one (`Point`): worked out once per catalog version. Not per
-/// `visible()`, which only the log's segments move: an `ALTER TABLE` or a tiering round left a kept
-/// `Point` with the table's old columns and files. A node whose catalog has no version (a follower
-/// between seeds) works it out each time.
+/// `sql` as a point query, if it is one (`Point`) the request being served may read (`rights::Scope::reads`: a user
+/// granted some tables, every column it returns and its key's; SQL refuses the rest, naming the column). Worked out once
+/// per catalog version, for everyone. Not per `visible()`, which only the log's segments move: an `ALTER TABLE` or a
+/// tiering round left a kept `Point` with the table's old columns and files. A node whose catalog has no version (a
+/// follower between seeds) works it out each time.
 pub async fn point(lake: &Lake, sql: &str) -> Result<Option<Arc<Point>>> {
+    let scope = crate::rights::scope();
+    Ok(worked_out(lake, sql).await?.filter(|p| scope.reads(&p.table, p.names.iter().chain(&p.meta.key).map(String::as_str))))
+}
+
+async fn worked_out(lake: &Lake, sql: &str) -> Result<Option<Arc<Point>>> {
     let head = sql.trim_start();
     if !head.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("select")) {
         return Ok(None); // (most statements: no parse)
