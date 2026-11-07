@@ -140,6 +140,7 @@ spill engine
 spmd engine
 statement engine
 statements engine
+connections catalog
 string_agg engine
 sys engine
 tasks engine
@@ -157,6 +158,7 @@ zeros_in engine
 
 # extensions, built in
 ai extensions:ai
+connect extensions:connections
 apply extensions:project
 git extensions:project
 status extensions:project
