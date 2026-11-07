@@ -609,6 +609,7 @@ fn quote(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
 /// The current session's search path is written in first (`path.rs`), so every door, a task's body
 /// and a spread query see full names. Stored SQL is read with `expand_stored` instead.
 pub async fn expand(lake: &Lake, sql: &str) -> Result<String> {
+    crate::dialect_stmts::hint_refused(sql)?; // (MySQL's `/*! … */`, before the path prints the text back without it: 11-07 audit M2)
     let sql = crate::path::door(lake, sql, &std::collections::HashSet::new()).await?;
     Ok(crate::path::currents(lake, &crate::front::expand(lake, &sql, &HashMap::new()).await?)) // (a macro's `current_*`: its caller's, as `prepare`)
 }

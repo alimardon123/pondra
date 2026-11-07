@@ -39,6 +39,17 @@ pub fn refused(sql: &str) -> anyhow::Result<()> {
 /// The words for MySQL's `/*! … */` (`text::hint`).
 const HINT: &str = "/*! … */ is MySQL's comment that runs as code: here a comment is only a comment, as Postgres and DuckDB read it, so write its words outside the comment, or /* … */ to keep it one";
 
+/// Refused (0A000) with `refused`'s words when `sql` holds MySQL's `/*! … */` (`text::hint`), for a look that parses a
+/// text and prints it back before the front refuses it: `vars::bound` binding a `$name`, `routines::expand` writing in the
+/// session's path after `USE`. The print keeps the comment's words as code and drops the comment, so the front would never
+/// see it (11-07 audit M2: after `USE crm`, `SELECT /*! 1 + */ 2 AS x FROM t` answered 3 over HTTP).
+pub fn hint_refused(sql: &str) -> anyhow::Result<()> {
+    match crate::text::hint(sql) {
+        Some(_) => Err(crate::codes::coded("0A000", HINT)),
+        None => Ok(()),
+    }
+}
+
 /// The words of the refusal, or None. A text with none of these words is not tokenized.
 fn refusal(sql: &str) -> Option<String> {
     if crate::text::hint(sql).is_some() {
@@ -366,7 +377,13 @@ mod tests {
         }
         for sql in ["SELECT '/*! 1 + */' AS s", "SELECT 1 -- /*! 2", "/* a /*! b */ c */ SELECT 1", "SELECT 1 /* ! */", "SELECT \"/*!\" FROM t"] {
             assert_eq!(refusal(sql), None, "{sql}");
+            assert!(hint_refused(sql).is_ok(), "{sql}");
         }
+        // (the looks that print a text back refuse it first, in the same words: 11-07 audit M2)
+        let e = hint_refused("SELECT /*! 1 + */ 2 AS x FROM t").unwrap_err();
+        assert_eq!((crate::codes::of(&e), e.to_string().as_str()), ("0A000", HINT));
+        let e = crate::vars::bound("SELECT /*! 1 + */ 2 AS x, $k AS k").unwrap_err();
+        assert_eq!((crate::codes::of(&e), e.to_string().as_str()), ("0A000", HINT));
     }
 
     #[test]
