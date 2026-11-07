@@ -41,36 +41,53 @@ pub enum Run {
     Leader(for<'a> fn(&'a Lake, Value) -> BoxFuture<'a, Result<Value>>),
 }
 
-/// The right a statement needs. Checked through today's grants until step 6's `may` takes it over.
+/// The right a statement needs, read where every statement's is (`auth::Auth::allows`). Checked through today's
+/// grants until step 6's `may` takes it over.
 pub enum Right {
     /// An admin's: a superuser, or an admin token.
     Admin,
 }
 
-/// Something a form offers or lacks (docs/forms.json's forms): a page in a browser has no disk of its own, no Python and
-/// nothing it listens on.
+/// The role the extensions' statements in `ds` need (an admin's for one this build has no extension for: the leader
+/// refuses it by name).
+pub(crate) fn role(ds: &[crate::ddl::Ddl]) -> crate::auth::Role {
+    let statements = crate::registry::get().find::<Statements>();
+    let right = |words: &str| statements.and_then(|s| s.named(words)).map(|s| &s.right);
+    let of = |d: &crate::ddl::Ddl| match d {
+        crate::ddl::Ddl::Entry { words, .. } => match right(words) {
+            Some(Right::Admin) | None => crate::auth::Role::Admin,
+        },
+        _ => crate::auth::Role::Admin,
+    };
+    ds.iter().map(of).fold(crate::auth::Role::None, |most, r| if r > most { r } else { most })
+}
+
+/// Something a form offers or lacks (docs/forms.json's forms), from the facts a node has today; step 2's lifecycle facts
+/// take this over.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Need {
-    Disk,
-    Python,
+    /// A port it listens on: a node that serves (`pondra serve`), not one in a program's process or a page.
     Listening,
+    /// The network: every form reaches it.
     Network,
 }
 
 impl Need {
+    /// What it is, and which node has it.
     fn word(self) -> &'static str {
         match self {
-            Need::Disk => "a disk",
-            Need::Python => "Python",
-            Need::Listening => "a port to listen on",
-            Need::Network => "the network",
+            Need::Listening => "a port to listen on, which this node doesn't have: a node started with pondra serve has one",
+            Need::Network => "the network, which this node can't reach",
         }
     }
 }
 
-/// Whether this build's form offers `need`: a page (WebAssembly) reaches the network and nothing else of these.
+/// Whether this node offers `need`.
 fn offered(need: Need) -> bool {
-    !cfg!(target_arch = "wasm32") || need == Need::Network
+    match need {
+        Need::Listening => *crate::store::SERVING.borrow(),
+        Need::Network => true,
+    }
 }
 
 /// The registry's statements section: every statement an extension adds, each one's words once.
@@ -112,7 +129,7 @@ fn matched_in(r: &Registry, sql: &str, offered: fn(Need) -> bool) -> Option<crat
     let s = r.find::<Statements>()?.of(sql)?;
     let words = s.words.join(" ");
     if let Some(need) = s.needs.iter().find(|n| !offered(**n)) {
-        return Some(Stmt::Refused("0A000", format!("{words} needs {}, which this form doesn't have: run it on a node (pondra serve, or connect(path) in a program)", need.word())));
+        return Some(Stmt::Refused("0A000", format!("{words} needs {}", need.word())));
     }
     Some(match (s.parse)(sql) {
         Ok(Parsed { object, tree }) => match s.run {
@@ -198,7 +215,7 @@ mod tests {
         let r = Registry::build(&[&THINGS]);
         let page = |n: Need| n == Need::Network;
         match matched_in(&r, "SERVE THING x", page) {
-            Some(Stmt::Refused("0A000", e)) => assert!(e.starts_with("SERVE THING needs a port to listen on, which this form doesn't have"), "{e}"),
+            Some(Stmt::Refused("0A000", e)) => assert!(e.starts_with("SERVE THING needs a port to listen on, which this node doesn't have"), "{e}"),
             _ => panic!("refused"),
         }
         assert!(entry(matched_in(&r, "MAKE THING x", page)).is_some(), "a statement that needs nothing runs on every form");

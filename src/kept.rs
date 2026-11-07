@@ -1,5 +1,5 @@
 //! The statements 1.1 brings, refused by name in 0.80 at every door and form (ADR-072): pipelines, dashboards, the grants on
-//! them, and `GRANT EXECUTE`; and connections (1.1, one object for every outside place), shown the `ATTACH` and the secret 1.0 writes. One list, read at the front (`front::expand`, which every node door and the
+//! them, and `GRANT EXECUTE` (connections are the `connections` extension's now: `connect.rs`). One list, read at the front (`front::expand`, which every node door and the
 //! page pass through), so a word added here is refused at every door in the same words. A pipeline's STEP, PARALLEL and
 //! WAIT FOR are refused where a statement starts: here, and in a script before any of it runs (`script.rs`, with its
 //! line). A statement that starts with none of the heads below is not read further, and a query pays nothing.
@@ -42,12 +42,6 @@ const PARALLEL: &str = "PARALLEL … END PARALLEL is a pipeline's, coming in 1.1
 /// A pipeline's WAIT FOR, where a script's statement starts.
 const WAIT_FOR: &str = "WAIT FOR is a pipeline's, coming in 1.1";
 const GRANT_EXECUTE: &str = "GRANT EXECUTE comes in 1.1, with pipelines";
-/// What a connection's statements say; `{}` is the statement's words. A connection, one object for every outside place (a
-/// database, a bucket, SFTP, HTTP), comes in 1.1 with `ATTACH` as its one-line form for tables (Alimardon, 10-31 15:28;
-/// `designs/etl-and-bi-tools.md` §3.7), so the words show what 1.0 writes instead.
-const CONNECTION: &str = "{} comes in 1.1. Today a lake or catalog is attached: ATTACH 'url' AS name (TYPE delta, iceberg, kafka or share; a Pondra lake takes none); a bucket's or an API's credentials are a SECRET with a SCOPE: CREATE SECRET … SCOPE 's3://bucket'";
-/// `SHOW CONNECTIONS`: what `ATTACH` makes is listed as a database.
-const SHOW_CONNECTIONS: &str = "SHOW CONNECTIONS: connections come in 1.1; SHOW DATABASES lists what ATTACH makes";
 /// What a Postgres advisory-lock function says; `{}` is its name. Migration tools take one first (Rails, Prisma Migrate,
 /// Flyway, golang-migrate), so the answer says what locks a row instead.
 const ADVISORY: &str = "{}: advisory locks aren't built yet (planned for 1.1); until then, a transaction locks a row: SELECT … FROM a lock table WHERE … FOR UPDATE, held until its COMMIT";
@@ -80,13 +74,6 @@ const REFUSED: &[(&[&str], &str)] = &[
     (&["SHOW", "CREATE", "DASHBOARD"], DASHBOARD),
     (&["SHOW", "DASHBOARDS"], DASHBOARD),
     (&["COMMENT", "ON", "DASHBOARD"], DASHBOARD),
-    (&["CREATE", "CONNECTION"], CONNECTION),
-    (&["CREATE", "OR", "REPLACE", "CONNECTION"], CONNECTION),
-    (&["ALTER", "CONNECTION"], CONNECTION),
-    (&["DROP", "CONNECTION"], CONNECTION),
-    (&["SHOW", "CREATE", "CONNECTION"], CONNECTION),
-    (&["SHOW", "CONNECTIONS"], SHOW_CONNECTIONS),
-    (&["COMMENT", "ON", "CONNECTION"], CONNECTION),
     (&["GRANT", "EXECUTE", "ON"], GRANT_EXECUTE), // (a bare `GRANT execute TO u` grants a role, as it did)
     (&["REVOKE", "EXECUTE", "ON"], GRANT_EXECUTE),
     (&["LISTEN"], LISTEN),
@@ -231,7 +218,7 @@ fn is_name(word: &str) -> bool {
     !matches!(word, "TO" | "FROM") && word.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == '"')
 }
 
-/// `GRANT` or `REVOKE` … ON PIPELINE name, … ON DASHBOARD name or … ON CONNECTION name, where the name follows the first
+/// `GRANT` or `REVOKE` … ON PIPELINE name or … ON DASHBOARD name, where the name follows the first
 /// ON. `GRANT SELECT ON pipeline TO r` is a table's grant, as it was.
 fn grant_on(words: &[String]) -> Option<String> {
     let verb = words.first()?;
@@ -243,7 +230,6 @@ fn grant_on(words: &[String]) -> Option<String> {
     match words.get(at + 1)?.as_str() {
         "PIPELINE" if named => Some(PIPELINE.replace("{}", &format!("{verb} ON PIPELINE"))),
         "DASHBOARD" if named => Some(DASHBOARD.replace("{}", &format!("{verb} ON DASHBOARD"))),
-        "CONNECTION" if named => Some(CONNECTION.replace("{}", &format!("{verb} ON CONNECTION"))),
         _ => None,
     }
 }
@@ -297,11 +283,8 @@ mod tests {
         assert!(refusal("REVOKE EXECUTE ON FUNCTION f FROM r").unwrap().starts_with("GRANT EXECUTE comes in 1.1"));
         assert!(refusal("EXECUTE PIPELINE sales.orders (day => 1)").unwrap().starts_with("EXECUTE PIPELINE: pipelines come in 1.1"));
         assert!(refusal("EXECUTE PIPELINE nightly").unwrap().starts_with("EXECUTE PIPELINE: pipelines come in 1.1"));
-        assert!(refusal("CREATE CONNECTION crm (TYPE postgres, HOST $host)").unwrap().starts_with("CREATE CONNECTION comes in 1.1. Today a lake or catalog is attached: ATTACH"));
-        assert!(refusal("ALTER CONNECTION crm SET (db => 'eu')").unwrap().contains("CREATE SECRET … SCOPE 's3://bucket'"));
-        assert_eq!(refusal("show connections").as_deref(), Some(SHOW_CONNECTIONS));
-        assert!(refusal("GRANT USAGE ON CONNECTION crm TO r").unwrap().starts_with("GRANT ON CONNECTION comes in 1.1"));
-        assert_eq!(refusal("GRANT SELECT ON connection TO r"), None); // (a table called connection)
+        assert_eq!(refusal("CREATE CONNECTION crm TYPE s3"), None); // (the `connections` extension's: `connect.rs`)
+        assert_eq!(refusal("GRANT READ ON CONNECTION crm TO r"), None);
         assert_eq!(refusal("STEP a AS SELECT 1").as_deref(), Some(STEP));
         assert_eq!(refusal("parallel SELECT 1").as_deref(), Some(PARALLEL));
         assert_eq!(refusal("WAIT FOR p").as_deref(), Some(WAIT_FOR));
