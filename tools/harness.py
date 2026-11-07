@@ -4319,7 +4319,7 @@ def scale():
     iso = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     lake = new_lake()
     port = A.port
-    node = Node(lake, port, tier_secs=0.5).start()
+    node = Node(lake, port, tier_secs=0.5, env={"PONDRA_METRICS_TABLES": "on"}).start()  # (`ev`'s files below: a line for each table)
     q = lambda s, p=port: sql(p, s)
     refused = [_raises(lambda s=s: q(s)) for s in (
         "CREATE TABLE bad1 (id BIGINT, ts TIMESTAMP) WITH (partition_by = 'week(ts)')",
@@ -8520,7 +8520,7 @@ def hot():
     settle, with a query memory too small for a quarter of it to hold the table (`hot::Hot::new`)."""
     import re
     lake = new_lake()
-    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1"}).start()
+    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1", "PONDRA_METRICS_TABLES": "on"}).start()  # (`m`'s files below)
     q = lambda s: sql(A.port, s)
     skipped = lambda: float(g.group(1)) if (g := re.search(rb"\npondra_hot_batches_skipped_total (\S+)", call(A.port, "GET", "/metrics"))) else 0.0
     t0, n = 1767225600, 200000
