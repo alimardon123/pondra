@@ -3221,6 +3221,7 @@ python3 tools/serve_bench.py --tpch ~/tpch/sf1 [--cache] [--door pg] [--writes] 
 python3 tools/harness.py registry       # pondra.objects, SHOW CREATE of every kind run again after a drop, COMMENT ON through renames, CREATE OR ALTER TABLE, GET /kinds
 python3 tools/harness.py find           # pondra.parts and pondra.find at every door (HTTP, Postgres, MCP, Python, JavaScript), as each user may see them; 1,000 tables and 200 views
 python3 tools/harness.py measures       # measures in views: the query's own grain, BI's sum(m), three nodes, Postgres, frames, refusals, cost against the hand-written GROUP BY
+python3 tools/harness.py agents         # the agent benchmark's shop questions without a model: each one's gold SQL on Pondra == DuckDB == Postgres, as the scorer reads answers (tools/agent_bench.py)
 python3 tools/harness.py facts          # a view's PRIMARY KEY, UNIQUE and FOREIGN KEY NOT ENFORCED: parts, ALTER VIEW, SHOW CREATE again, OR REPLACE, Postgres's catalog, refusals
 python3 tools/random_sql.py --queries 100000 # random queries: one node == DuckDB, every tenth == three nodes, each split three ways by a condition (TLP)
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover
