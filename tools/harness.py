@@ -26070,6 +26070,22 @@ def dialects():
     internal = [r["sql"][:80] for r in rows if not r["ok"] and r["sqlstate"] == "XX000"]
     info["refused as XX000 (internal)"] = internal
     checks[f"at most {XX000} refusals are XX000 (an internal error) rather than a code that names what went wrong"] = len(internal) <= XX000
+    # MySQL's `/*! … */` over HTTP after USE and with a `$name`: both print a plain query back before the front reads it, and
+    # the print kept the comment's words as code (11-07 audit M2: `SELECT /*! 1 + */ 2` answered 3)
+    def hinted(s, session):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {"x-pondra-session": session})
+        r = c.getresponse()
+        return r.status, r.getheader("x-pondra-sqlstate"), r.read().decode()[:160]
+    q("CREATE SCHEMA hint_s")
+    q("CREATE TABLE hint_s.t (a INT)")
+    q("INSERT INTO hint_s.t VALUES (1)")
+    hinted("USE hint_s", "dialects-hint-use")
+    hinted("$k = 5", "dialects-hint-var")
+    got = {"as sent": hinted("SELECT /*! 1 + */ 2 AS x FROM hint_s.t", "dialects-hint-none"), "after USE": hinted("SELECT /*! 1 + */ 2 AS x FROM t", "dialects-hint-use"),
+           "with a $name": hinted("SELECT /*! 1 + */ 2 AS x, $k AS k", "dialects-hint-var")}
+    info["a /*! … */ comment"] = got
+    checks["a /*! … */ comment is refused (0A000) over HTTP after USE and with a $name, as it is without (11-07 audit M2)"] = all(st == "0A000" for _, st, _ in got.values())
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"dialects": checks, "ok": ok, "info": info}, indent=1, default=str))
