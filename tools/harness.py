@@ -24114,6 +24114,9 @@ def use_path():
     sql(A.port, "INSERT INTO crm.w VALUES (1, 'x'), (2, 'x')")
     sql(A.port, "CREATE VIEW crm.here AS SELECT current_schema() AS s")
     on_follower = lambda body: call(A.port + 1, "POST", "/sql", body, headers=f)
+    # (once the follower has the view: until then it can't tell the view says current_schema(), and the leader reads it
+    # as public's, `path::session_view`)
+    until(lambda: _try(lambda: on_follower(b"SELECT s FROM here")), [{"s": "crm"}], 15)
     on_follower(b"UPDATE w SET s = (SELECT s FROM here) WHERE id = 1")
     on_follower(b"MERGE INTO w USING (SELECT 2 AS id, s FROM here) AS src ON w.id = src.id WHEN MATCHED THEN UPDATE SET s = src.s || '-m'")
     info["follower's change through a view"] = sql(A.port, "SELECT id, s FROM crm.w ORDER BY id")
