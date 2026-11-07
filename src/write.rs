@@ -2196,10 +2196,16 @@ pub(crate) async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> 
         Err(_) if matches!(stmt, Stmt::Insert(..)) => return Ok(None), // (an INSERT's own path names what it can't find, or finds an attached lake's)
         r => r?,
     };
-    let lake = other.as_deref().unwrap_or(lake);
-    let meta = lake.cat.meta(&table_key(&table)).await?;
-    if let (Stmt::Merge(m), None, Some(stored)) = (stmt, &other, &meta) {
-        if m.point_upsert(&table, stored).is_some() {
+    changes_in(other.as_deref().unwrap_or(lake), other.is_none(), &table, stmt).await
+}
+
+/// `changes`, of `table` as `lake` names it (`here`: this database's, not an attached one's). The statement keeps the
+/// name its own session gave it, which `lake` may not know: `dev.public.t`, after `USE dev`, is `public.t` to dev.
+async fn changes_in(lake: &Lake, here: bool, table: &str, stmt: &Stmt) -> Result<Option<String>> {
+    let (Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_) | Stmt::Insert(..)) = stmt else { return Ok(None) };
+    let meta = lake.cat.meta(&table_key(table)).await?;
+    if let (Stmt::Merge(m), true, Some(stored)) = (stmt, here, &meta) {
+        if m.point_upsert(table, stored).is_some() {
             return Ok(None);
         }
     }
@@ -2518,9 +2524,8 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
     if let Stmt::AddColumn(..) | Stmt::SetOptions(..) = stmt {
         return Ok(alter_spec(target, stmt).await?.map(|spec| Request::Table(table.into(), spec)));
     }
-    if let Some(sql) = changes(target, stmt).await? {
-        let t = stmt.table();
-        let (sql, sent) = crate::change::for_leader(query, target, &t, &t, &sql, files).await?; // (files here: this machine's)
+    if let Some(sql) = changes_in(target, true, table, stmt).await? {
+        let (sql, sent) = crate::change::for_leader(query, target, &stmt.table(), table, &sql, files).await?; // (files here: this machine's)
         return Ok(Some(Request::Change(sql, job.into(), sent)));
     }
     let stored = target.cat.meta(&table_key(table)).await?; // (as parsed once a version: `rules` is the memo)
