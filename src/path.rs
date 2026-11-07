@@ -168,8 +168,8 @@ pub async fn door(lake: &Lake, sql: &str, skip: &HashSet<String>) -> Result<Stri
         None => Path::plain(&lake_name(lake)),
     };
     if path.database() != path.here {
-        if let Some(what) = schema_change(sql) {
-            return Err(coded("0A000", in_other(what, path.database())));
+        if let Some((what, kind)) = unplaced_change(sql) {
+            return Err(coded("0A000", in_other(what, kind, path.database())));
         }
     }
     let inlined = crate::sparksql::inline(sql)?; // (`spark_sql('…')` first: its text is placed like any SQL's)
@@ -320,23 +320,38 @@ fn text_of(here: &str, entries: &[(String, String)]) -> String {
     entries.iter().map(|(d, s)| if d.as_str() == here { quoted(s) } else { format!("{}.{}", quoted(d), quoted(s)) }).collect::<Vec<_>>().join(", ")
 }
 
-/// A statement in `sql` that makes, changes, drops, describes or grants on a schema, by its head. A schema's name is
-/// never placed by the path (it isn't a table's), so under `USE` of another database such a statement would name this
-/// lake's schema: `DROP SCHEMA s CASCADE` dropped this lake's `s` and its tables. It is refused there (`in_other`).
-fn schema_change(sql: &str) -> Option<&'static str> {
+/// A statement in `sql` that changes something whose name the path doesn't place, by its head, and what that is. A
+/// schema's name is never placed (it isn't a table's), and a routine's or a type's is only when the path has it, so under
+/// `USE` of another database such a statement named this lake's: `DROP SCHEMA s CASCADE` dropped this lake's `s` and its
+/// tables, and `DROP MACRO m` this lake's `m` when that database had none. It is refused there (`in_other`).
+fn unplaced_change(sql: &str) -> Option<(&'static str, &'static str)> {
     const START: &str = r"(?:^|;)(?:\s|--[^\n]*(?:\n|$)|/\*.*?\*/)*";
-    static HEADS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
-        [(r"create\s+schema\b", "CREATE SCHEMA"), (r"drop\s+schema\b", "DROP SCHEMA"), (r"alter\s+schema\b", "ALTER SCHEMA"), (r"comment\s+on\s+schema\b", "COMMENT ON SCHEMA"), (r"(?:grant|revoke)\b[^;]*\b(?:on|in)\s+schema\b", "a grant on a schema")]
-            .into_iter()
-            .map(|(h, what)| (Regex::new(&format!("(?is){START}{h}")).expect("a regex"), what))
-            .collect()
+    static HEADS: LazyLock<Vec<(Regex, &'static str, &'static str)>> = LazyLock::new(|| {
+        [
+            (r"create\s+schema\b", "CREATE SCHEMA", "schemas"),
+            (r"drop\s+schema\b", "DROP SCHEMA", "schemas"),
+            (r"alter\s+schema\b", "ALTER SCHEMA", "schemas"),
+            (r"comment\s+on\s+schema\b", "COMMENT ON SCHEMA", "schemas"),
+            (r"(?:grant|revoke)\b[^;]*\b(?:on|in)\s+schema\b", "a grant on a schema", "schemas"),
+            (r"drop\s+function\b", "DROP FUNCTION", "functions"),
+            (r"drop\s+macro\b", "DROP MACRO", "functions"),
+            (r"drop\s+procedure\b", "DROP PROCEDURE", "functions"),
+            (r"alter\s+(?:function|procedure)\b", "ALTER FUNCTION", "functions"),
+            (r"comment\s+on\s+(?:function|procedure|macro)\b", "COMMENT ON FUNCTION", "functions"),
+            (r"drop\s+type\b", "DROP TYPE", "types"),
+            (r"alter\s+type\b", "ALTER TYPE", "types"),
+            (r"comment\s+on\s+type\b", "COMMENT ON TYPE", "types"),
+        ]
+        .into_iter()
+        .map(|(h, what, kind)| (Regex::new(&format!("(?is){START}{h}")).expect("a regex"), what, kind))
+        .collect()
     });
-    HEADS.iter().find(|(re, _)| re.is_match(sql)).map(|(_, what)| *what)
+    HEADS.iter().find(|(re, ..)| re.is_match(sql)).map(|(_, what, kind)| (*what, *kind))
 }
 
-/// The refusal of `schema_change`'s statement under `USE` of the attached lake `db`, as its other changes are refused.
-fn in_other(what: &str, db: &str) -> String {
-    format!("{what} under USE of {db}: {db} is an attached lake, whose schemas are changed from a node of that lake (this one's are changed with no USE of another database)")
+/// The refusal of `unplaced_change`'s statement under `USE` of the attached lake `db`, as its other changes are refused.
+fn in_other(what: &str, kind: &str, db: &str) -> String {
+    format!("{what} under USE of {db}: {db} is an attached lake, whose {kind} are changed from a node of that lake (this one's are changed with no USE of another database)")
 }
 
 fn mentions_current(sql: &str) -> bool {
@@ -943,27 +958,43 @@ mod tests {
         stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n")
     }
 
-    /// Under `USE` of another database, a statement on a schema would name this lake's (its name isn't placed): it is
-    /// found by its head wherever it is in the text, and nothing else is.
+    /// Under `USE` of another database, a statement on a schema, or one that drops or changes a routine or a type that
+    /// database hasn't, would name this lake's (its name isn't placed): it is found by its head wherever it is in the
+    /// text, and nothing else is.
     #[test]
-    fn a_schema_change_is_found_by_its_head() {
-        for (sql, what) in [
-            ("DROP SCHEMA s CASCADE", "DROP SCHEMA"),
-            ("drop  schema if exists s", "DROP SCHEMA"),
-            ("CREATE SCHEMA s", "CREATE SCHEMA"),
-            ("ALTER SCHEMA s RENAME TO t", "ALTER SCHEMA"),
-            ("COMMENT ON SCHEMA s IS 'x'", "COMMENT ON SCHEMA"),
-            ("GRANT USAGE ON SCHEMA s TO r", "a grant on a schema"),
-            ("REVOKE SELECT ON ALL TABLES IN SCHEMA s FROM r", "a grant on a schema"),
-            ("SELECT 1; DROP SCHEMA s CASCADE", "DROP SCHEMA"),
-            ("-- a note\n/* and more */ DROP SCHEMA s", "DROP SCHEMA"),
+    fn an_unplaced_change_is_found_by_its_head() {
+        for (sql, what, kind) in [
+            ("DROP SCHEMA s CASCADE", "DROP SCHEMA", "schemas"),
+            ("drop  schema if exists s", "DROP SCHEMA", "schemas"),
+            ("CREATE SCHEMA s", "CREATE SCHEMA", "schemas"),
+            ("ALTER SCHEMA s RENAME TO t", "ALTER SCHEMA", "schemas"),
+            ("COMMENT ON SCHEMA s IS 'x'", "COMMENT ON SCHEMA", "schemas"),
+            ("GRANT USAGE ON SCHEMA s TO r", "a grant on a schema", "schemas"),
+            ("REVOKE SELECT ON ALL TABLES IN SCHEMA s FROM r", "a grant on a schema", "schemas"),
+            ("SELECT 1; DROP SCHEMA s CASCADE", "DROP SCHEMA", "schemas"),
+            ("-- a note\n/* and more */ DROP SCHEMA s", "DROP SCHEMA", "schemas"),
+            ("DROP FUNCTION f", "DROP FUNCTION", "functions"),
+            ("drop function if exists f(int)", "DROP FUNCTION", "functions"),
+            ("DROP MACRO m", "DROP MACRO", "functions"),
+            ("DROP MACRO TABLE m", "DROP MACRO", "functions"),
+            ("DROP PROCEDURE p", "DROP PROCEDURE", "functions"),
+            ("ALTER FUNCTION f RENAME TO g", "ALTER FUNCTION", "functions"),
+            ("COMMENT ON MACRO m IS 'x'", "COMMENT ON FUNCTION", "functions"),
+            ("DROP TYPE ty", "DROP TYPE", "types"),
+            ("ALTER TYPE ty ADD VALUE 'c'", "ALTER TYPE", "types"),
+            ("COMMENT ON TYPE ty IS 'x'", "COMMENT ON TYPE", "types"),
+            ("SELECT 1; drop type ty", "DROP TYPE", "types"),
         ] {
-            assert_eq!(schema_change(sql), Some(what), "{sql}");
+            assert_eq!(unplaced_change(sql), Some((what, kind)), "{sql}");
         }
-        for sql in ["SELECT * FROM t", "DROP TABLE s.t", "CREATE TABLE schema_x (a INT)", "SELECT 'drop schema' AS a", "GRANT SELECT ON t TO r", "CREATE VIEW v AS SELECT schema_name FROM information_schema.schemata"] {
-            assert_eq!(schema_change(sql), None, "{sql}");
+        for sql in [
+            "SELECT * FROM t", "DROP TABLE s.t", "CREATE TABLE schema_x (a INT)", "SELECT 'drop schema' AS a", "GRANT SELECT ON t TO r",
+            "CREATE VIEW v AS SELECT schema_name FROM information_schema.schemata", "ALTER TABLE t ALTER COLUMN a TYPE BIGINT", "SELECT m(1) AS drop_macro",
+            "CREATE MACRO m(a) AS a + 1", "CREATE TYPE ty AS ENUM ('a')", "DROP TABLE type_x", "SELECT 'drop function f'",
+        ] {
+            assert_eq!(unplaced_change(sql), None, "{sql}");
         }
-        assert!(in_other("DROP SCHEMA", "br").starts_with("DROP SCHEMA under USE of br: br is an attached lake"));
+        assert!(in_other("DROP SCHEMA", "schemas", "br").starts_with("DROP SCHEMA under USE of br: br is an attached lake, whose schemas are changed"));
     }
 
     #[test]
