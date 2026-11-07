@@ -271,7 +271,7 @@ impl Cluster {
                 let pause = if missed && self.leader_ok() { Duration::from_millis(100) } else { Duration::from_secs(1) };
                 tokio::select! {
                     _ = tokio::time::sleep(pause) => {}
-                    _ = UNTAKEN.notified() => {}
+                    _ = UNTAKEN.notified(), if self.leader_ok() => {}
                 }
                 let url = crate::tls::url(&format!("{}/cluster/beat?from={}", self.leader.addr, self.addr));
                 let answer = http().post(url).timeout(Duration::from_secs(2)).send().await;
