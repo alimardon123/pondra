@@ -403,7 +403,7 @@ async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<&[u8]
     .await?;
     let schema = first_announced(&batches);
     // (a read token's script could keep answers that no ticket reads: counted here, they are bounded by the query memory)
-    let reserved = crate::query::kept_memory(&pool, &batches).ok_or_else(|| status(crate::query::too_big()))?;
+    let reserved = crate::query::kept_memory(&pool, &batches).ok_or_else(|| status(crate::query::too_big(crate::query::room_of(&pool))))?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     KEPT.lock().unwrap().insert(id.clone(), (batches, std::time::Instant::now(), reserved));
     let ticket = TicketStatementQuery { statement_handle: format!("kept:{id}").into_bytes().into() };
