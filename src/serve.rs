@@ -69,21 +69,25 @@ pub struct Point {
     pub table: String,
     pub meta: Arc<TableMeta>,
     pub names: Vec<String>,      // the columns it returns
+    pub shown: Vec<String>,      // what its answer calls them (`SELECT name AS n`: n)
     pub key: Vec<Option<String>>, // each key column's value, in key order (None: a parameter)
     params: HashMap<String, usize>, // a key column a parameter stands for -> its number ($n)
 }
 
 impl Point {
     /// Its answer's columns.
-    pub fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> {
+    pub fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { self.typed(&self.shown) }
+
+    /// The columns it reads, by their table's names, as the answer's types.
+    fn typed(&self, names: &[String]) -> Result<datafusion::arrow::datatypes::SchemaRef> {
         let types: HashMap<&str, &str> = self.meta.columns().collect();
-        crate::answer::schema(&self.names.iter().map(|n| (n.clone(), types[n.as_str()].to_string())).collect::<Vec<_>>())
+        crate::answer::schema(&self.names.iter().zip(names).map(|(c, n)| (n.clone(), types[c.as_str()].to_string())).collect::<Vec<_>>())
     }
 
     /// What it holds of its own, as the node's line counts it (its table's meta is the catalog's, shared).
     fn bytes(&self) -> usize {
         let text = |s: &String| 24 + s.len();
-        std::mem::size_of::<Point>() + self.table.len() + self.names.iter().map(text).sum::<usize>()
+        std::mem::size_of::<Point>() + self.table.len() + self.names.iter().chain(&self.shown).map(text).sum::<usize>()
             + self.key.iter().map(|k| 24 + k.as_ref().map_or(0, |k| k.len())).sum::<usize>()
             + self.params.keys().map(|k| text(k) + 8).sum::<usize>()
     }
@@ -112,7 +116,10 @@ impl Point {
         let schema = self.schema()?;
         let row = lookup(lake, &self.table, &self.meta, &key.join(",")).await?;
         Ok(Some(match row {
-            Some(r) => crate::query::conform(&r, &schema)?, // (by name: a row from before an ADD COLUMN lacks it)
+            Some(r) => {
+                let read = crate::query::conform(&r, &self.typed(&self.names)?)?; // (by name: a row from before an ADD COLUMN lacks it)
+                RecordBatch::try_new(schema, read.columns().to_vec())?
+            }
             None => RecordBatch::new_empty(schema),
         }))
     }
@@ -182,17 +189,47 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
         return Ok(None);
     }
     let Some((key, params)) = key_of(&meta, filter) else { return Ok(None) };
-    let names: Vec<String> = match s.projection.as_slice() {
-        [SelectItem::Wildcard(_)] => meta.columns().map(|(c, _)| c.to_string()).filter(|c| c != "_deleted").collect(), // (as `SELECT *` shows it)
-        items => items.iter().map(|i| match i {
-            SelectItem::UnnamedExpr(Expr::Identifier(c)) if meta.columns().any(|(n, _)| *n == c.value) => Some(c.value.clone()),
-            _ => None,
-        }).collect::<Option<_>>().unwrap_or_default(),
-    };
-    if names.is_empty() {
-        return Ok(None);
+    let Some((names, shown)) = answered(&meta, name, &s.projection) else { return Ok(None) };
+    Ok(Some(Point { table, meta, names, shown, key, params }))
+}
+
+/// The columns a lookup's `SELECT` list reads, and what its answer calls each: `*`, or columns of `from` by name, bare
+/// or qualified by the table (`kv.name`), each with an alias or none (`name AS n`), as SQL would answer them. None for
+/// anything else, or two answer columns with one name: SQL answers those.
+fn answered(meta: &TableMeta, from: &datafusion::sql::sqlparser::ast::ObjectName, items: &[datafusion::sql::sqlparser::ast::SelectItem]) -> Option<(Vec<String>, Vec<String>)> {
+    use datafusion::sql::sqlparser::ast::*;
+    if let [SelectItem::Wildcard(_)] = items {
+        let all: Vec<String> = meta.columns().map(|(c, _)| c.to_string()).filter(|c| c != "_deleted").collect(); // (as `SELECT *` shows it)
+        return Some((all.clone(), all));
     }
-    Ok(Some(Point { table, meta, names, key, params }))
+    let table: Vec<String> = from.0.iter().filter_map(|p| p.as_ident()).map(crate::text::ident).collect();
+    let column = |e: &Expr| -> Option<String> {
+        let c = match e {
+            Expr::Identifier(c) => crate::text::ident(c),
+            Expr::CompoundIdentifier(parts) => {
+                let (c, by) = parts.split_last()?;
+                let by: Vec<String> = by.iter().map(crate::text::ident).collect();
+                if by.is_empty() || !table.ends_with(&by) {
+                    return None;
+                }
+                crate::text::ident(c)
+            }
+            _ => return None,
+        };
+        (c != "_deleted" && meta.columns().any(|(n, _)| n == c)).then_some(c)
+    };
+    let (mut names, mut shown) = (vec![], vec![]);
+    for i in items {
+        let (c, n) = match i {
+            SelectItem::UnnamedExpr(e) => (column(e)?, None),
+            SelectItem::ExprWithAlias { expr, alias } => (column(expr)?, Some(crate::text::ident(alias))),
+            _ => return None,
+        };
+        shown.push(n.unwrap_or_else(|| c.clone()));
+        names.push(c);
+    }
+    let unique = shown.iter().collect::<std::collections::HashSet<_>>().len() == shown.len();
+    (!names.is_empty() && unique).then_some((names, shown))
 }
 
 /// A table a key lookup answers without SQL: keyed, with no merge, no renamed or moved columns, no event-time order and no
@@ -549,9 +586,32 @@ mod tests {
         assert!(full - empty <= 100_000 * 24 * 3, "not wildly more: {full}");
 
         let meta = Arc::new(TableMeta::with_columns(vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into())]));
-        let p = |b: &str| Point { table: "t".into(), meta: meta.clone(), names: vec!["a".into(), "b".into()], key: vec![Some(b.into())], params: HashMap::new() };
+        let p = |b: &str| Point { table: "t".into(), meta: meta.clone(), names: vec!["a".into(), "b".into()], shown: vec!["a".into(), "b".into()], key: vec![Some(b.into())], params: HashMap::new() };
         assert_eq!(p(&"x".repeat(1000)).bytes() - p("").bytes(), 1000, "its key's text");
         assert!(p("").bytes() < 1024, "its table's columns aren't its own");
+    }
+
+    /// A lookup's columns may be named as ORMs write them: with an alias, or by the table (`kv.name`). What SQL would answer
+    /// differently is SQL's (L6's step 8 numbers, 11-07: `SELECT name AS n FROM kv WHERE id = k` took 3.4 ms, not 0.17).
+    #[test]
+    fn a_lookups_columns_are_read_bare_qualified_or_renamed() {
+        use datafusion::sql::sqlparser::ast::{SetExpr, Statement};
+        let meta = TableMeta::with_columns(vec![("id".into(), "Int64".into()), ("name".into(), "Utf8".into()), ("_deleted".into(), "Boolean".into())]);
+        let read = |sql: &str| {
+            let Statement::Query(q) = crate::parsed::generic(sql).unwrap().pop().unwrap() else { panic!("a query") };
+            let SetExpr::Select(s) = *q.body else { panic!("a select") };
+            let datafusion::sql::sqlparser::ast::TableFactor::Table { name, .. } = &s.from[0].relation else { panic!("a table") };
+            answered(&meta, name, &s.projection)
+        };
+        let both = |n: &[&str], s: &[&str]| Some((n.iter().map(|x| x.to_string()).collect(), s.iter().map(|x| x.to_string()).collect()));
+        assert_eq!(read("SELECT * FROM kv WHERE id = 1"), both(&["id", "name"], &["id", "name"]));
+        assert_eq!(read("SELECT name, id FROM kv WHERE id = 1"), both(&["name", "id"], &["name", "id"]));
+        assert_eq!(read("SELECT name AS n, kv.id FROM kv WHERE id = 1"), both(&["name", "id"], &["n", "id"]));
+        assert_eq!(read("SELECT public.kv.name AS \"N\", Name FROM public.kv WHERE id = 1"), both(&["name", "name"], &["N", "name"]));
+        for other in ["SELECT other.name FROM kv WHERE id = 1", "SELECT name AS n, id AS n FROM kv WHERE id = 1", "SELECT name, name FROM kv WHERE id = 1",
+                      "SELECT \"Name\" FROM kv WHERE id = 1", "SELECT _deleted FROM kv WHERE id = 1", "SELECT name || 'x' AS n FROM kv WHERE id = 1", "SELECT kv.* FROM kv WHERE id = 1"] {
+            assert_eq!(read(other), None, "{other}");
+        }
     }
 
     #[test]

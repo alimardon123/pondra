@@ -845,7 +845,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
         // DECLARE, FETCH, MOVE, CLOSE: the session's cursors (cursors.rs). Before the script's check: DECLARE reads as one.
         return Ok(match crate::cursors::run(app, cmd?, who.role).await? {
             crate::cursors::Answer::Rows(batches) => Outcome::Rows(batches),
-            crate::cursors::Answer::Tag(tag) => Outcome::Done(j!({"command": tag})),
+            crate::cursors::Answer::Done(kind, rows) => Outcome::Done(j!({"command": kind.tag(rows)})),
         });
     }
     if crate::script::is(sql) {
@@ -891,7 +891,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
     if crate::set::is(sql) {
         // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: the session's (round 31)
         return match Box::pin(crate::set::statement(&app.lake, sql)).await? {
-            crate::set::Done::Said(tag) => Ok(Outcome::Done(j!({"command": tag}))),
+            crate::set::Done::Said(kind) => Ok(Outcome::Done(j!({"command": kind.words()}))),
             crate::set::Done::Run(sql) => Box::pin(one_of(app, &sql, who, job)).await,
         };
     }

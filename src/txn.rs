@@ -364,6 +364,16 @@ pub async fn command(app: &crate::app::App, word: &str, sql: &str) -> Result<(&'
     word_in(app, &s, word, sql).await
 }
 
+/// How the transaction word `word` (`control`'s) changes its session's transaction: BEGIN and ROLLBACK TO start one, every
+/// other end (COMMIT, ROLLBACK) ends one, and a savepoint word (SAVEPOINT, RELEASE) leaves it as it is.
+pub fn word_change(word: &str) -> Option<crate::answer::Txn> {
+    match word {
+        "BEGIN" | "ROLLBACK TO" => Some(crate::answer::Txn::Started),
+        "SAVEPOINT" | "RELEASE" => None,
+        _ => Some(crate::answer::Txn::Ended),
+    }
+}
+
 /// Flight SQL's own transaction actions (flight.rs): BeginTransaction begins the current session's transaction as the
 /// protocol's, and EndTransaction (`word` COMMIT or ROLLBACK) ends it as `command` would.
 pub async fn protocol(app: &crate::app::App, word: &str) -> Result<(&'static str, Option<String>)> {
@@ -460,7 +470,7 @@ fn mark_of(t: &mut Txn, name: &str) -> Result<usize> {
 
 /// How long a transaction may sit idle before the idle timeout ends it (`PONDRA_TXN_IDLE_SECS`, 600).
 fn idle_limit() -> Duration {
-    Duration::from_secs(crate::env::value("PONDRA_TXN_IDLE_SECS"))
+    crate::env::secs("PONDRA_TXN_IDLE_SECS")
 }
 
 /// The error for a session whose transaction the idle timeout ended (25P03): its writes were dropped, so its statements

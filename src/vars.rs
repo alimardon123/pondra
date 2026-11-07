@@ -61,13 +61,13 @@ pub enum Change {
 }
 
 impl Change {
-    /// Its command tag (Postgres's port).
-    pub fn tag(&self) -> &'static str {
-        match self {
+    /// Its kind: the command's words (Postgres's port).
+    pub fn kind(&self) -> crate::answer::Kind {
+        crate::answer::Kind::new(match self {
             Change::Declare { .. } => "DECLARE",
             Change::Set { .. } => "SET",
             Change::Reset(_) => "RESET",
-        }
+        })
     }
 }
 

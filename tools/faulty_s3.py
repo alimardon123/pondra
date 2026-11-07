@@ -44,6 +44,7 @@ class Faulty:
         self.host = u.hostname if u.port in (None, 443, 80) else f"{u.hostname}:{u.port}"
         self.faults, self.counts, self.lock = dict(OFF), {}, threading.Lock()
         self.record, self.log = record, []  # (record: every forwarded request is logged, see `note`)
+        self.pending = 0  # (requests started while recording and not yet logged: `settled`)
         proxy = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -62,6 +63,9 @@ class Faulty:
                 if self.path.startswith("/__faults"):
                     return proxy.control(self)
                 self.started, self.sent, self.answered = time.time(), 0, 0
+                with proxy.lock:  # (a request is logged if recording was on when it started, however late it ends)
+                    self.recorded = proxy.record
+                    proxy.pending += self.recorded
                 try:
                     return self.forward()
                 finally:
@@ -193,11 +197,20 @@ class Faulty:
     def note(self, h):
         """Logs one request the proxy forwarded (`record`): when it started and ended, what it was,
         and how it was answered (0 where the proxy dropped it: `down`, `hang`, `lost`)."""
-        if self.record:
+        if h.recorded:
             u = urllib.parse.urlsplit(h.path)
             with self.lock:
                 self.log.append({"t0": h.started, "t1": time.time(), "method": h.command, "path": u.path,
                                  "query": u.query, "range": h.headers.get("Range"), "status": h.answered, "bytes": h.sent})
+                self.pending -= 1
+
+    def settled(self, secs=30):
+        """Waits until every request started while recording is logged: a request is noted after its answer is sent, so
+        the node may have used the bytes, and its caller been answered, before the proxy's thread gets to log it."""
+        deadline = time.time() + secs
+        while self.pending and time.time() < deadline:
+            time.sleep(0.01)
+        return not self.pending
 
     def close(self):
         self.server.shutdown()

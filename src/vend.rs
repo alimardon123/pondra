@@ -16,7 +16,7 @@ use std::time::Duration;
 const LINK: &str = "share-link";
 
 /// How long a link lasts: `PONDRA_SHARE_URL_SECS` (900, at most a week: S3's limit).
-pub fn secs() -> u64 { crate::env::value::<u64>("PONDRA_SHARE_URL_SECS").clamp(1, 7 * 86400) }
+pub fn secs() -> u64 { crate::env::secs("PONDRA_SHARE_URL_SECS").as_secs().clamp(1, 7 * 86400) } // (a link's time is whole seconds)
 
 /// Links to these objects of the lake (`data/…`, as the lake names them) for `who`, and when they
 /// end (ms). `base` is where a node's links point (a lake on a disk): the sharing door's address.

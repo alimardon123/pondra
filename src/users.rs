@@ -1031,7 +1031,7 @@ pub async fn node_key_made(lake: &Lake) -> Option<String> {
 }
 
 /// How long a signed-in session lasts: `PONDRA_SESSION_HOURS` (12).
-fn session_ms() -> u64 { crate::env::parse::<f64>("PONDRA_SESSION_HOURS").map_or(12 * 3_600_000, |h| (h * 3_600_000.0) as u64) }
+fn session_ms() -> u64 { (crate::env::value::<f64>("PONDRA_SESSION_HOURS").max(0.0) * 3_600_000.0) as u64 }
 
 /// `data` signed with the lake's key (base64url).
 async fn sign(lake: &Lake, data: &[u8]) -> Result<String> { Ok(B64U.encode(hmac256(&B64.decode(keys(lake).await?.session)?, data))) }
@@ -1347,7 +1347,7 @@ pub fn quota() -> Quota {
     };
     let Some((user, a)) = p.and_then(|p| Some((p.name, p.access?))) else { return Quota { turns: None, timeout: session, user: String::new(), by_session: session.is_some() } };
     let most = a.limits.max_queries.map(u64::from).or_else(|| crate::env::parse::<u64>("PONDRA_USER_QUERIES")).filter(|n| *n > 0).map(|n| n.min(10_000) as u32);
-    let timeout = a.limits.timeout_secs.or_else(|| crate::env::parse::<u64>("PONDRA_USER_TIMEOUT")).filter(|s| *s > 0).map(std::time::Duration::from_secs);
+    let timeout = a.limits.timeout_secs.map(std::time::Duration::from_secs).or_else(|| crate::env::secs_given("PONDRA_USER_TIMEOUT")).filter(|t| !t.is_zero());
     // (the shorter of the session's and the user's is in force)
     let (timeout, by_session) = match (session, timeout) {
         (Some(s), Some(t)) if s >= t => (Some(t), false),
