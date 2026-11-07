@@ -23,8 +23,10 @@ enum At {
     Time(i64), // microseconds since 1970, UTC
 }
 
-/// The table `name` (`at:…`) stands for, read as of `upto` as any is: (the table's name, its rows
-/// as they were). `sys`: with the system columns, which the query names.
+/// The table `name` (`at:…`) stands for, read as of `upto` as any is: (the table's name as a grant names it, its rows
+/// as they were). `sys`: with the system columns, which the query names. The name is the one a plain read is guarded
+/// under (`t` for `public.t`, `b.t` for `b.public.t`), so a grant reads the same for both (11-06 audit L3: `b.public.t
+/// AT (…)` was guarded as written, and a user granted `SELECT ON b.t` was refused).
 ///
 /// As of commit `n`, an append table is its rows made by `n` (`_version <= n`), and the old
 /// versions of rows changed since that were there at `n` (`{t}$deleted`: `_old_version <= n <
@@ -112,7 +114,11 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
         };
         out = out.union(old)?;
     }
-    Ok((t.clone(), crate::query::named(ctx, out.into_view(), &meta, false)?, attached))
+    let named = match attached {
+        true => format!("{}.{local}", t.split('.').next().unwrap_or_default()), // (the attached lake's name, then its table's as it keeps it)
+        false => local,
+    };
+    Ok((named, crate::query::named(ctx, out.into_view(), &meta, false)?, attached))
 }
 
 /// The version (and time, in ms) before which `meta`'s past is no longer whole: a purge has let

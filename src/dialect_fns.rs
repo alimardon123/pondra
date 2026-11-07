@@ -358,10 +358,11 @@ pub fn register(ctx: &datafusion::prelude::SessionContext) {
 }
 
 mod divide {
-    use datafusion::arrow::array::AsArray;
-    use datafusion::arrow::compute::{kernels::numeric::div, nullif};
+    use datafusion::arrow::array::{new_null_array, AsArray};
+    use datafusion::arrow::compute::{cast_with_options, concat, kernels::numeric::div, nullif, CastOptions};
     use datafusion::arrow::datatypes::DataType;
-    use datafusion::common::{exec_err, Result, ScalarValue};
+    use datafusion::arrow::error::ArrowError;
+    use datafusion::common::{exec_err, DataFusionError, Result, ScalarValue};
     use datafusion::logical_expr::type_coercion::binary::BinaryTypeCoercer;
     use datafusion::logical_expr::{ColumnarValue, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
     use datafusion::physical_expr_common::datum::{apply, apply_cmp};
@@ -397,8 +398,34 @@ mod divide {
                 (ColumnarValue::Scalar(_), ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)))) => ColumnarValue::Scalar(ScalarValue::try_from(&to_b)?),
                 (b, _) => b,
             };
-            apply(&a, &b, div)?.cast_to(args.return_field.data_type(), None) // (the type `/` gives: no change)
+            let to = args.return_field.data_type();
+            match apply(&a, &b, div) {
+                Ok(q) => q.cast_to(to, None), // (the type `/` gives: no change)
+                Err(DataFusionError::ArrowError(e, _)) if matches!(*e, ArrowError::ArithmeticOverflow(_)) => by_row(&a, &b, args.number_rows, to),
+                Err(e) => Err(e),
+            }
         }
+    }
+
+    /// Each row's quotient on its own, NULL where it overflows: BigQuery's SAFE_ answers NULL for a row's error, where
+    /// `/` fails the statement (11-06 audit L2: a NUMERIC whose quotient is past its precision failed every row).
+    /// Taken only once the whole division has overflowed.
+    fn by_row(a: &ColumnarValue, b: &ColumnarValue, rows: usize, to: &DataType) -> Result<ColumnarValue> {
+        let one_row = matches!((a, b), (ColumnarValue::Scalar(_), ColumnarValue::Scalar(_)));
+        let (a, b) = (a.to_array(rows)?, b.to_array(rows)?);
+        let safe = CastOptions { safe: true, ..Default::default() };
+        let parts = (0..a.len())
+            .map(|i| match div(&a.slice(i, 1), &b.slice(i, 1)) {
+                Ok(q) => Ok(cast_with_options(&q, to, &safe)?),
+                Err(ArrowError::ArithmeticOverflow(_)) => Ok(new_null_array(to, 1)),
+                Err(e) => Err(e.into()),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let all = concat(&parts.iter().map(|p| p.as_ref()).collect::<Vec<_>>())?;
+        Ok(match one_row {
+            true => ColumnarValue::Scalar(ScalarValue::try_from_array(&all, 0)?),
+            false => ColumnarValue::Array(all),
+        })
     }
 }
 
@@ -527,5 +554,16 @@ mod tests {
                 assert!(ours.0.starts_with(typed), "{args}: {}", ours.0);
             }
         }
+        // (11-06 audit L2: a NUMERIC quotient past its precision is NULL for its row, as BigQuery's SAFE_ answers an
+        // error, and the other rows keep theirs; `/` fails, and so did this, for every row)
+        let big = "(VALUES (CAST(1e27 AS DECIMAL(38, 10)), CAST(0.001 AS DECIMAL(38, 10))), (CAST(5 AS DECIMAL(38, 10)), CAST(2 AS DECIMAL(38, 10))), (CAST(5 AS DECIMAL(38, 10)), CAST(0 AS DECIMAL(38, 10)))) AS t(a, b)";
+        assert!(ctx.sql(&format!("SELECT a / b AS r FROM {big}")).await.unwrap().collect().await.is_err(), "`/` overflows");
+        let batches = ctx.sql(&format!("SELECT safe_divide(a, b) AS r FROM {big}")).await.unwrap().collect().await.unwrap();
+        let rows = datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap().to_string();
+        let r = batches[0].column(0);
+        assert!(r.data_type().to_string().starts_with("Decimal128("), "{rows}");
+        assert!(r.is_null(0) && !r.is_null(1) && r.is_null(2) && rows.contains("2.5"), "{rows}");
+        let one = ctx.sql("SELECT safe_divide(CAST(1e27 AS DECIMAL(38, 10)), CAST(0.001 AS DECIMAL(38, 10))) AS r").await.unwrap().collect().await.unwrap();
+        assert!(one[0].column(0).is_null(0), "a folded overflow is NULL too");
     }
 }
