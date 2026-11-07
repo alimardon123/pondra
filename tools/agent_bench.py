@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """The agent benchmark: can an agent rely on Pondra? (redesign-wip/agent-benchmark-plan.md; the 1.0 scorecard's agent row)
 
-  agent_bench.py gold [--bin PATH] [--port N] [--pg-bin DIR] [--only a01,a02]
+  agent_bench.py check  [--bin PATH | --port N] [--pg-bin DIR] [--only a01,a02]    # CI's, with no model (harness.py agents)
+  agent_bench.py run    [--bin PATH | --port N] [--model M] [--effort E] [--runs 3] [--jobs 6] [--out DIR]
+  agent_bench.py replay FILE [--bin PATH | --port N]
 
-An agent is given a question in plain words and a few tools, and its answer is the rows of the last query it names. The
-same tasks, data, model and tools run on Pondra, DuckDB and Postgres, so the numbers say what Pondra adds.
-
-This piece has no model in it. `gold` loads the same data into each engine and runs every task's gold SQL there: each
-engine's rows must be DuckDB's, as the scorer reads them. That proves the tasks and the scorer, and doubles as a check
-that Pondra answers like the other two. The agent loop, its costs and the replays come in the next pieces.
+An agent is given a question in plain words and a few tools, and its answer is the rows of the query it gives. The same
+tasks, data, model and tools run on Pondra, DuckDB and Postgres, so the numbers say what Pondra adds.
 
 - **The data** (`shop`) is made here from a seed: a shop's customers, products, stores, orders, order lines and returns,
   with NULLs, web orders without a store, customers who never ordered and products never sold. It is loaded with plain
@@ -20,12 +18,25 @@ that Pondra answers like the other two. The agent loop, its costs and the replay
   An answer may hold more columns than the gold one, so long as the gold's columns are among them. Numbers compare as
   numbers at the task's decimals (6 significant digits if it gives none), and a timestamp at midnight compares as its
   date.
+- **The agent** (`attempt`) is the Messages API's tool loop with four plain tools on every engine: `list_tables`,
+  `describe`, `sql` (read-only, its first 50 rows, an error as its message, 30 s a query) and `answer`. The system
+  prompt is the same for every engine but its name; 15 turns at most. A try's record holds its turns, its steps (tool
+  calls), its tokens as the API counted them, its seconds, its dollars at list prices, how it ended, and the whole
+  conversation. A refusal ends the try as not passed: no fallback model answers in its place.
+- **pondra+mcp** is Pondra a second time, with its own MCP door's tools in place of the plain ones (the read-only
+  ones it lists, called through POST /mcp, its notes for agents added to the prompt), to show what the door adds.
 
-Postgres is started here as a throwaway cluster when its binaries are found (--pg-bin, PG_BIN, pg_ctl on PATH, or
-/usr/lib/postgresql/*/bin); without them it is reported, not checked. Pondra is started from --bin on a fresh lake, or
-reached on --port's Postgres door. One JSON line goes to stdout.
+`check` is what CI runs, with no key: every task's gold SQL on each engine, scored against DuckDB's rows (the tasks, the
+scorer, and Pondra against two other engines); the loop itself with a scripted model; and the answers saved in
+tools/agent_bench/replay_*.jsonl run again, so an engine change that breaks an answer an agent once gave shows. `run`
+spends API dollars (ANTHROPIC_API_KEY; .github/workflows/agent-bench.yml): it writes runs.jsonl, every try's
+transcript, report.md and replay.jsonl (the passed answers, to keep as a replay file) to --out. `replay` runs a saved
+file's answers again. Postgres is a throwaway cluster, started when its binaries are found (--pg-bin, PG_BIN, pg_ctl on
+PATH, or /usr/lib/postgresql/*/bin); Pondra is started from --bin on a fresh lake, or reached on --port's Postgres door.
+Each mode prints one JSON line.
 """
 import argparse
+import concurrent.futures
 import datetime
 import decimal
 import glob
@@ -33,12 +44,16 @@ import itertools
 import json
 import os
 import random
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import types
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TASKS = os.path.join(HERE, "agent_bench")
@@ -193,15 +208,26 @@ def free_port():
 
 
 class DuckDB:
-    name = "duckdb"
+    name, label = "duckdb", "DuckDB"
 
-    def __init__(self):
-        import duckdb
-        self.con = duckdb.connect()
+    def __init__(self, con=None):
+        if con is None:
+            import duckdb
+            con = duckdb.connect()
+        self.con = con
 
-    def run(self, sql):
+    def run(self, sql, limit=None):
         cur = self.con.execute(sql)
-        return [d[0] for d in cur.description] if cur.description else [], cur.fetchall() if cur.description else []
+        if not cur.description:
+            return [], []
+        return [d[0] for d in cur.description], cur.fetchall() if limit is None else cur.fetchmany(limit)
+
+    def session(self):
+        """A connection of its own to the same database, for one worker."""
+        return DuckDB(self.con.cursor())
+
+    def cancel(self):
+        self.con.interrupt()
 
     def stop(self):
         self.con.close()
@@ -212,6 +238,7 @@ class Over:
 
     def connect(self, **kw):
         import psycopg
+        self.kw = kw
         deadline = time.time() + 60
         while True:
             try:
@@ -222,9 +249,24 @@ class Over:
                     raise
                 time.sleep(0.2)
 
-    def run(self, sql):
+    def run(self, sql, limit=None):
         cur = self.con.execute(sql)
-        return ([d.name for d in cur.description], cur.fetchall()) if cur.description else ([], [])
+        if not cur.description:
+            return [], []
+        return [d.name for d in cur.description], cur.fetchall() if limit is None else cur.fetchmany(limit)
+
+    def session(self):
+        """A connection of its own to the same door, for one worker."""
+        s = Over()
+        s.name, s.label = self.name, self.label
+        s.connect(**self.kw)
+        return s
+
+    def cancel(self):
+        self.con.cancel_safe()
+
+    def stop(self):
+        self.con.close()
 
 
 def pg_bin(given):
@@ -234,7 +276,7 @@ def pg_bin(given):
 
 class Postgres(Over):
     """A throwaway cluster: trust on 127.0.0.1, as the `postgres` user when this runs as root (Postgres refuses root)."""
-    name = "postgres"
+    name, label = "postgres", "PostgreSQL"
 
     def __init__(self, bin_dir):
         self.bin, self.work, self.port = bin_dir, tempfile.mkdtemp(prefix="agent-bench-pg-"), free_port()
@@ -261,15 +303,16 @@ class Postgres(Over):
 
 class Pondra(Over):
     """A node on a fresh lake from --bin, or a running one's Postgres door (--port)."""
-    name = "pondra"
+    name, label = "pondra", "Pondra"
 
     def __init__(self, bin_path=None, port=None):
-        self.proc, self.work = None, None
+        self.proc, self.work, self.mcp = None, None, None
         if port is None:
             self.work, port, http = tempfile.mkdtemp(prefix="agent-bench-lake-"), free_port(), free_port()
             self.log = open(os.path.join(self.work, "stderr"), "wb")
             self.proc = subprocess.Popen([bin_path, "serve", "--dir", os.path.join(self.work, "lake"), "--addr", f"127.0.0.1:{http}", f"--pg=127.0.0.1:{port}"],
                                          stdout=subprocess.DEVNULL, stderr=self.log)
+            self.mcp = f"http://127.0.0.1:{http}/mcp"
         self.connect(port=port, user="pondra", dbname="pondra")
 
     def stop(self):
@@ -283,72 +326,585 @@ class Pondra(Over):
 
 # ---------------------------------------------------------------- the tasks
 
-def tasks(name="a"):
+def tasks(name="a", only=None):
     with open(os.path.join(TASKS, f"set_{name}.json")) as f:
-        return json.load(f)
+        return [t for t in json.load(f) if not only or t["id"] in only.split(",")]
 
 
 def gold_sql(task, engine):
     return task.get(engine) or task["sql"]
 
 
-def gold(a):
-    """Every task's gold SQL on each engine, scored against DuckDB's rows: the tasks and the scorer proved, and Pondra
-    checked against two others on a shop's questions."""
-    scorer_checks()
-    todo = [t for t in tasks() if not a.only or t["id"] in a.only.split(",")]
-    engines, out = [DuckDB()], {"set": "a", "tasks": len(todo), "engines": {}, "failed": {}, "ok": True}
-    pg = pg_bin(a.pg_bin)
-    if pg:
-        engines.append(Postgres(pg))
-    else:
-        out["engines"]["postgres"] = "not here (no initdb and pg_ctl found)"
-    if a.bin or a.port:
-        engines.append(Pondra(a.bin, a.port))
-    else:
-        out["engines"]["pondra"] = "not here (give --bin or --port)"
+def up(a, names=ENGINES):
+    """DuckDB, and those of `names` that are here, each loaded with the shop; and a note for each one that isn't."""
+    engines, notes = [DuckDB()], {}
     try:
+        if "postgres" in names:
+            pg = pg_bin(a.pg_bin)
+            if pg:
+                engines.append(Postgres(pg))
+            else:
+                notes["postgres"] = "not here (no initdb and pg_ctl found)"
+        if "pondra" in names:
+            if a.bin or a.port:
+                engines.append(Pondra(a.bin, a.port))
+            else:
+                notes["pondra"] = "not here (give --bin or --port)"
         data = shop()
         for e in engines:
             t0 = time.perf_counter()
             for s in statements(data):
                 e.run(s)
-            out["engines"][e.name] = {"loaded_s": round(time.perf_counter() - t0, 2), "passed": 0}
-        for t in todo:
-            answers = {}
-            for e in engines:
-                try:
-                    answers[e.name] = e.run(gold_sql(t, e.name))
-                except Exception as err:
-                    answers[e.name] = err
-            want = answers["duckdb"]
-            if isinstance(want, Exception):
-                out["failed"].setdefault(t["id"], {})["duckdb"] = str(want)[:300]
-                continue
-            out["engines"]["duckdb"]["passed"] += 1
-            for e in engines[1:]:
-                got = answers[e.name]
-                if not isinstance(got, Exception) and same(want[1], got[1], t.get("ordered", False), t.get("places"), extra=False):
-                    out["engines"][e.name]["passed"] += 1
-                else:
-                    out["failed"].setdefault(t["id"], {})[e.name] = str(got)[:300] if isinstance(got, Exception) else {"want": [list(map(str, r)) for r in want[1][:3]], "got": [list(map(str, r)) for r in got[1][:3]], "rows": [len(want[1]), len(got[1])]}
-    finally:
+            notes[e.name] = {"loaded_s": round(time.perf_counter() - t0, 2)}
+    except BaseException:
+        down(engines)
+        raise
+    return engines, notes
+
+
+def down(engines):
+    for e in engines:
+        e.stop()
+
+
+def gold(engines, todo, out):
+    """Every task's gold SQL on each engine, scored against DuckDB's rows: the tasks and the scorer proved, and Pondra
+    checked against two others on a shop's questions."""
+    for e in engines:
+        out["engines"][e.name]["passed"] = 0
+    for t in todo:
+        answers = {}
         for e in engines:
-            e.stop()
-    out["ok"] = not out["failed"]
+            try:
+                answers[e.name] = e.run(gold_sql(t, e.name))
+            except Exception as err:
+                answers[e.name] = err
+        want = answers["duckdb"]
+        if isinstance(want, Exception):
+            out["failed"].setdefault(t["id"], {})["duckdb"] = str(want)[:300]
+            continue
+        out["engines"]["duckdb"]["passed"] += 1
+        for e in engines[1:]:
+            got = answers[e.name]
+            if not isinstance(got, Exception) and same(want[1], got[1], t.get("ordered", False), t.get("places"), extra=False):
+                out["engines"][e.name]["passed"] += 1
+            else:
+                out["failed"].setdefault(t["id"], {})[e.name] = str(got)[:300] if isinstance(got, Exception) else {"want": [list(map(str, r)) for r in want[1][:3]], "got": [list(map(str, r)) for r in got[1][:3]], "rows": [len(want[1]), len(got[1])]}
+
+
+# ---------------------------------------------------------------- the agent
+
+# Dollars per million tokens: input, output, a 5-minute cache write, a cache read (list prices, 11-07). A model not
+# here is run, and its dollars are left out.
+PRICES = {
+    "claude-opus-5-5": (4.0, 20.0, 5.0, 0.20),
+    "claude-sonnet-5-5": (2.0, 10.0, 2.50, 0.20),
+    "claude-haiku-5-5": (0.10, 0.50, 0.125, 0.01),
+}
+TURNS, SHOWN, QUERY_S = 15, 50, 30  # the turn cap, the rows a query shows the agent, and each query's seconds
+READS = {"select", "with", "values", "table", "explain", "show", "describe", "from"}
+
+# The same words for every engine, which they only name: what differs between runs is the engine.
+SYSTEM = ("You answer questions about a shop's data, which is in a {label} database. Use the tools to look at the "
+          "tables and to run SQL. When you know the answer, call `answer` with the one SQL query whose result answers the "
+          "question. Its rows are what is checked, so it returns the rows the question asks for, with the values it asks "
+          "for among its columns. Give the answer as that query, never as text.")
+
+
+def tool(name, description, **args):
+    return {"name": name, "description": description, "strict": True,
+            "input_schema": {"type": "object", "properties": {k: {"type": "string", "description": v} for k, v in args.items()},
+                             "required": list(args), "additionalProperties": False}}
+
+
+PLAIN = [
+    tool("list_tables", "The tables in the database."),
+    tool("describe", "A table's columns and their types.", table="the table's name"),
+    tool("sql", f"Run one read-only SQL query (SELECT, WITH, VALUES, TABLE, EXPLAIN, SHOW or DESCRIBE) and see its column "
+                f"names and its first {SHOWN} rows. An error comes back as its message.", query="the query"),
+]
+ANSWER = tool("answer", "Give the final answer: the one SQL query whose rows answer the question. This ends the task.", query="the query")
+
+
+def first_word(sql):
+    rest = re.sub(r"^(\s+|--[^\n]*(\n|$)|/\*.*?\*/|\()*", "", sql, flags=re.S)
+    return (re.match(r"\w+", rest) or [""])[0].lower()
+
+
+def capped(engine, sql, limit=None):
+    """A query under the time cap (QUERY_S): the engine is asked to cancel it when the cap passes."""
+    timer = threading.Timer(QUERY_S, engine.cancel)
+    timer.start()
+    try:
+        return engine.run(sql, limit)
+    finally:
+        timer.cancel()
+
+
+def shown(cols, rows):
+    more = len(rows) > SHOWN
+    lines = [" | ".join(cols)] + [" | ".join("NULL" if v is None else str(v) for v in r) for r in rows[:SHOWN]]
+    return "\n".join(lines + [f"(the first {SHOWN} rows; there are more)" if more else f"({len(rows)} row{'' if len(rows) == 1 else 's'})"])
+
+
+def use(engine, name, args):
+    """One plain tool call, as (text, is_error). Each engine's catalog is read with the same information_schema query."""
+    if name == "list_tables":
+        sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() ORDER BY 1"
+    elif name == "describe":
+        sql = ("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = current_schema() "
+               f"AND table_name = '{args['table'].replace(chr(39), chr(39) * 2)}' ORDER BY ordinal_position")
+    elif name == "sql" and first_word(args["query"]) in READS:
+        sql = args["query"]
+    elif name == "sql":
+        return "only a read-only query here: SELECT, WITH, VALUES, TABLE, EXPLAIN, SHOW or DESCRIBE", True
+    else:
+        return f"no tool named {name}", True
+    try:
+        cols, rows = capped(engine, sql, SHOWN + 1 if name == "sql" else None)
+    except Exception as err:
+        return str(err).strip()[:2000] or type(err).__name__, True
+    if name == "list_tables":
+        return "\n".join(r[0] for r in rows), False
+    if name == "describe":
+        return ("\n".join(f"{c} {t}" for c, t in rows), False) if rows else (f"no table named {args['table']}", True)
+    return shown(cols, rows), False
+
+
+class Plain:
+    """The plain tools, the same on every engine."""
+    suffix, tools, notes = "", PLAIN, ""
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def use(self, name, args):
+        return use(self.engine, name, args)
+
+    def stop(self):
+        pass
+
+
+class Door:
+    """Pondra's own MCP door (POST /mcp), as an MCP client sees it: a session, the door's notes for the model, and the
+    tools it lists as read-only, each called through it. Its write tool is left out, as the plain sql is read-only."""
+    suffix = "+mcp"
+
+    def __init__(self, url):
+        self.url, self.sid = url, None
+        self.notes = self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                             "clientInfo": {"name": "agent-bench", "version": "1"}}).get("instructions", "")
+        self.rpc("notifications/initialized", None)
+        self.tools = [{"name": t["name"], "description": t.get("description", ""), "input_schema": t["inputSchema"]}
+                      for t in self.rpc("tools/list", {})["tools"] if (t.get("annotations") or {}).get("readOnlyHint")]
+
+    def rpc(self, method, params, verb="POST"):
+        body = None if verb == "DELETE" else json.dumps({"jsonrpc": "2.0", "method": method, **({"params": params} if params is not None else {}),
+                                                         **({"id": 1} if not method.startswith("notifications/") else {})}).encode()
+        req = urllib.request.Request(self.url, body, {"content-type": "application/json", "accept": "application/json, text/event-stream",
+                                                      **({"mcp-session-id": self.sid} if self.sid else {})}, method=verb)
+        with urllib.request.urlopen(req, timeout=QUERY_S * 2) as r:
+            self.sid = r.headers.get("mcp-session-id") or self.sid
+            raw = r.read()
+        if not raw:
+            return {}
+        out = json.loads(raw)
+        if "error" in out:
+            raise RuntimeError(out["error"].get("message", str(out["error"])))
+        return out["result"]
+
+    def use(self, name, args):
+        try:
+            r = self.rpc("tools/call", {"name": name, "arguments": args})
+        except Exception as err:
+            return str(err)[:2000], True
+        return "\n".join(c.get("text", "") for c in r.get("content", [])), bool(r.get("isError"))
+
+    def stop(self):
+        try:
+            self.rpc(None, None, "DELETE")
+        except Exception:
+            pass
+
+
+def dump(content):
+    if isinstance(content, str):
+        return content
+    return [b.model_dump(mode="json", exclude_none=True) if hasattr(b, "model_dump") else b for b in content]
+
+
+def attempt(client, model, effort, task, engine, kit=None):
+    """One try at a task: the model's loop over a kit of tools (the plain ones, or Pondra's MCP door's) and `answer`,
+    and its record (turns, steps, tokens, seconds, the answer's SQL and how it ended), with the whole conversation as
+    its transcript. It never edits what was said: each turn only appends, so the prompt cache holds and the model's
+    thinking goes back as it came."""
+    kit = kit or Plain(engine)
+    tools = kit.tools + [ANSWER]
+    system = SYSTEM.format(label=engine.label) + (f"\n\nThe database's own notes for agents: {kit.notes}" if kit.notes else "")
+    prompt = task["question"] + (f"\n\nFacts you may use: {task['evidence']}" if task.get("evidence") else "")
+    messages = [{"role": "user", "content": prompt}]
+    rec = {"id": task["id"], "engine": engine.name + kit.suffix, "model": model, "effort": effort, "turns": 0, "steps": 0,
+           "tokens": {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0}, "model_s": 0.0, "engine_s": 0.0,
+           "sql": None, "end": None}
+    while rec["end"] is None:
+        if rec["turns"] == TURNS:
+            rec["end"] = "turn cap"
+            break
+        t0 = time.perf_counter()
+        try:
+            r = client.messages.create(model=model, max_tokens=16000, system=system, tools=tools, messages=messages,
+                                       cache_control={"type": "ephemeral"}, output_config={"effort": effort})
+        except Exception as err:  # (one that outlasted the SDK's retries ends this try, and what it spent stays counted)
+            if getattr(err, "status_code", None) in (401, 403):
+                raise  # (a key that doesn't work stops the whole run)
+            rec["end"] = f"error: {type(err).__name__}: {str(err)[:300]}"
+            break
+        finally:
+            rec["model_s"] += time.perf_counter() - t0
+        rec["turns"] += 1
+        for k, f in (("input", "input_tokens"), ("cache_write", "cache_creation_input_tokens"), ("cache_read", "cache_read_input_tokens"), ("output", "output_tokens")):
+            rec["tokens"][k] += getattr(r.usage, f, 0) or 0
+        messages.append({"role": "assistant", "content": r.content})
+        if r.stop_reason == "refusal":  # (no fallback model: that would change who answered)
+            rec["end"] = f"refused: {getattr(getattr(r, 'stop_details', None), 'category', None)}"
+            break
+        if r.stop_reason == "max_tokens":
+            rec["end"] = "max_tokens"
+            break
+        calls = [b for b in r.content if b.type == "tool_use"]
+        if not calls:  # (a tool call is never forced: the model is asked once more, which costs it a turn)
+            messages.append({"role": "user", "content": "Give your answer by calling `answer` with its SQL query."})
+            continue
+        results = []
+        for b in calls:
+            rec["steps"] += 1
+            if b.name == "answer":
+                rec["sql"], rec["end"] = b.input["query"], "answered"
+                break
+            t0 = time.perf_counter()
+            text, err = kit.use(b.name, b.input) if b.name in {t["name"] for t in kit.tools} else (f"no tool named {b.name}", True)
+            rec["engine_s"] += time.perf_counter() - t0
+            results.append({"type": "tool_result", "tool_use_id": b.id, "content": text, **({"is_error": True} if err else {})})
+        if rec["end"] is None:
+            messages.append({"role": "user", "content": results})
+    rec["transcript"] = {"system": system, "messages": [{"role": m["role"], "content": dump(m["content"])} for m in messages]}
+    return rec
+
+
+def scored(rec, task, want, engine):
+    """The answer's rows against the gold ones, as an agent's answer is scored: extra columns allowed."""
+    rec["passed"] = False
+    if rec["sql"] is None:
+        return rec
+    t0 = time.perf_counter()
+    try:
+        cols, rows = capped(engine, rec["sql"])
+        rec["passed"] = same(want, rows, task.get("ordered", False), task.get("places"))
+        rec["rows"] = len(rows)
+    except Exception as err:
+        rec["end"] = f"its answer failed: {str(err).strip()[:300]}"
+    rec["engine_s"] += time.perf_counter() - t0
+    return rec
+
+
+def dollars(rec, per_hour):
+    p = PRICES.get(rec["model"])
+    if p is None:
+        return None
+    t = rec["tokens"]
+    return round((t["input"] * p[0] + t["output"] * p[1] + t["cache_write"] * p[2] + t["cache_read"] * p[3]) / 1e6 + rec["engine_s"] * per_hour / 3600, 6)
+
+
+def median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    return None if not xs else xs[len(xs) // 2] if len(xs) % 2 else (xs[len(xs) // 2 - 1] + xs[len(xs) // 2]) / 2
+
+
+def summary(recs, runs):
+    """Each engine's pass rate (the mean of its runs', and their spread) and the medians of a passed task's steps,
+    tokens, seconds and dollars."""
+    out = {}
+    for name in dict.fromkeys(r["engine"] for r in recs):
+        mine = [r for r in recs if r["engine"] == name]
+        n = len(mine) // runs
+        rates = [sum(r["passed"] for r in mine if r["run"] == k) / n for k in range(runs)]
+        ok = [r for r in mine if r["passed"]]
+        out[name] = {"passed": round(sum(rates) / runs, 4), "spread": [round(min(rates), 4), round(max(rates), 4)],
+                     "steps": median([r["steps"] for r in ok]),
+                     "tokens_in": median([r["tokens"]["input"] + r["tokens"]["cache_write"] + r["tokens"]["cache_read"] for r in ok]),
+                     "tokens_out": median([r["tokens"]["output"] for r in ok]),
+                     "seconds": median([round(r["model_s"] + r["engine_s"], 2) for r in ok]),
+                     "dollars": median([r["dollars"] for r in ok]),
+                     "spent": round(sum(r["dollars"] or 0 for r in mine), 4)}
+    return out
+
+
+def num(x):
+    return "" if x is None else str(int(x)) if float(x).is_integer() else f"{x:.4g}"
+
+
+def report(out, recs, runs):
+    lines = [f"# Agent benchmark, set {out['set'].upper()}: {out['date']}", "",
+             f"Model `{out['model']}` at effort {out['effort']}; each engine with the plain tools"
+             + (", and pondra+mcp with Pondra's MCP door's" if "pondra+mcp" in out["engines"] else "") + f". {out['tasks']} tasks, {runs} run{'' if runs == 1 else 's'} of each. "
+             f"Commit `{out['commit']}`, {out['pondra']}. Every number is from this run.", "",
+             "| Engine | Passed | Spread of runs | Steps | Tokens in | Tokens out | Seconds | Dollars | Spent |",
+             "|---|---|---|---|---|---|---|---|---|"]
+    for name, v in out["engines"].items():
+        if isinstance(v, str):
+            lines.append(f"| {name} | {v} | | | | | | | |")
+        if not isinstance(v, dict) or "passed" not in v:
+            continue
+        lines.append(f"| {name} | {v['passed']:.1%} | {v['spread'][0]:.1%} to {v['spread'][1]:.1%} | "
+                     + " | ".join(num(v[k]) for k in ("steps", "tokens_in", "tokens_out", "seconds", "dollars", "spent")) + " |")
+    lines += ["", "Steps, tokens, seconds and dollars are the medians of a passed task. Dollars are list prices times "
+              "tokens; Spent is the whole run's.", ""]
+    missed = {}
+    for r in recs:
+        if not r["passed"]:
+            missed.setdefault(r["id"], {}).setdefault(r["engine"], []).append(r["end"] if r["end"] != "answered" else "wrong rows")
+    if missed:
+        lines += ["| Task | Missed |", "|---|---|"]
+        for tid in sorted(missed):
+            lines.append(f"| {tid} | " + "; ".join(f"{e}: {len(v)} of {runs} ({', '.join(sorted(set(v)))})" for e, v in missed[tid].items()) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def commit():
+    if os.environ.get("GITHUB_SHA"):
+        return os.environ["GITHUB_SHA"][:12]
+    r = subprocess.run(["git", "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True, cwd=HERE)
+    return r.stdout.strip() or "unknown"
+
+
+def version(a):
+    if not a.bin:
+        return "Pondra on --port" if a.port else "no Pondra"
+    r = subprocess.run([a.bin, "--version"], capture_output=True, text=True)
+    return r.stdout.strip() or "pondra"
+
+
+def run_agents(client, a, oracle, engines, todo, out):
+    """Every task on every engine, `runs` times, `jobs` at a time; the records, each with its transcript saved apart."""
+    want = {t["id"]: oracle.run(gold_sql(t, "duckdb"))[1] for t in todo}
+
+    def one(job):
+        k, t, e, door = job
+        s = e.session()
+        kit = Door(e.mcp) if door else Plain(s)
+        try:
+            rec = scored(attempt(client, a.model, a.effort, t, s, kit), t, want[t["id"]], s)
+        finally:
+            kit.stop()
+            s.stop()
+        rec["run"], rec["dollars"] = k, dollars(rec, a.per_hour)
+        if a.out:
+            with open(os.path.join(a.out, "transcripts", f"{rec['engine']}-{t['id']}-{k}.json"), "w") as f:
+                json.dump(rec, f, indent=1, default=str)
+        rec.pop("transcript", None)
+        return rec
+
+    jobs = [(k, t, e, door) for k in range(a.runs) for t in todo for e, door in engines]
+    with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
+        recs = list(pool.map(one, jobs))
+    for name, v in summary(recs, a.runs).items():
+        out["engines"].setdefault(name, {}).update(v)
+    return recs
+
+
+def run(a):
+    """The model's runs: a record per try (runs.jsonl), each try's transcript, the passed answers to replay
+    (replay.jsonl), a report (report.md), and one JSON line to stdout."""
+    import anthropic
+    scorer_checks()
+    client = anthropic.Anthropic(max_retries=8)
+    todo = tasks(a.set, a.only)
+    names = a.engines.split(",")
+    if a.out:
+        os.makedirs(os.path.join(a.out, "transcripts"), exist_ok=True)
+    engines, notes = up(a, {n.split("+")[0] for n in names})
+    out = {"set": a.set, "date": datetime.date.today().isoformat(), "model": a.model, "effort": a.effort, "tasks": len(todo),
+           "runs": a.runs, "commit": commit(), "pondra": version(a), "engines": notes}
+    try:  # (DuckDB is always started: its rows are the gold, whether or not an agent runs on it)
+        by = {e.name: e for e in engines}
+        lanes = [(by[n.split("+")[0]], n.endswith("+mcp")) for n in names if n.split("+")[0] in by]
+        if any(door and not e.mcp for e, door in lanes):
+            raise SystemExit("pondra+mcp needs --bin: the door's address is the node's it starts")
+        recs = run_agents(client, a, engines[0], lanes, todo, out)
+    finally:
+        down(engines)
+    if a.out:
+        with open(os.path.join(a.out, "runs.jsonl"), "w") as f:
+            f.writelines(json.dumps(r, default=str) + "\n" for r in recs)
+        seen = set()
+        with open(os.path.join(a.out, "replay.jsonl"), "w") as f:
+            for r in recs:
+                if r["passed"] and (r["id"], r["engine"], r["sql"]) not in seen:
+                    seen.add((r["id"], r["engine"], r["sql"]))
+                    f.write(json.dumps({"set": a.set, "id": r["id"], "engine": r["engine"], "sql": r["sql"]}) + "\n")
+        with open(os.path.join(a.out, "report.md"), "w") as f:
+            f.write(report(out, recs, a.runs))
+    print(json.dumps(out, default=str))
+    return 0
+
+
+# ---------------------------------------------------------------- with no model
+
+def replay(engines, lines, out):
+    """Saved answers that once passed, run again on this commit with no model call: an engine change that breaks an
+    answer an agent once gave shows here."""
+    by = {e.name: e for e in engines}
+    gold_of = {}
+    out["replay"] = {"answers": len(lines), "passed": 0, "skipped": 0, "broke": {}}
+    for ln in lines:
+        e = by.get(ln["engine"].split("+")[0])  # (an answer given through Pondra's MCP door is run on Pondra)
+        if e is None:
+            out["replay"]["skipped"] += 1
+            continue
+        key = (ln.get("set", "a"), ln["id"])
+        if key not in gold_of:
+            t = next(t for t in tasks(key[0]) if t["id"] == ln["id"])
+            gold_of[key] = (t, engines[0].run(gold_sql(t, "duckdb"))[1])
+        t, want = gold_of[key]
+        try:
+            ok = same(want, capped(e, ln["sql"])[1], t.get("ordered", False), t.get("places"))
+            why = "wrong rows"
+        except Exception as err:
+            ok, why = False, str(err).strip()[:300]
+        if ok:
+            out["replay"]["passed"] += 1
+        else:
+            out["replay"]["broke"].setdefault(ln["id"], {})[e.name] = why
+
+
+class Scripted:
+    """A stand-in for the API client that plays a fixed script, shaped like the SDK's answers: the loop's own test,
+    with no key and no model."""
+
+    class Thing(types.SimpleNamespace):
+        def model_dump(self, **_):
+            return {k: v.model_dump() if hasattr(v, "model_dump") else v for k, v in vars(self).items()}
+
+    def __init__(self, script):
+        self.script, self.messages, self.seen = list(script), self, []
+
+    def create(self, **kw):
+        self.seen.append(kw)
+        blocks = self.script.pop(0) if self.script else [("tool_use", "list_tables", {})]
+        T = Scripted.Thing
+        content = [T(type="text", text=b[1]) if b[0] == "text" else T(type="tool_use", id=f"t{len(self.seen)}_{i}", name=b[1], input=b[2])
+                   for i, b in enumerate(blocks)]
+        return T(content=content, stop_reason="tool_use" if any(b[0] == "tool_use" for b in blocks) else "end_turn",
+                 usage=T(input_tokens=100, output_tokens=10, cache_creation_input_tokens=20, cache_read_input_tokens=300))
+
+
+def loop_checks(engines, out):
+    """The loop on every engine with a scripted model: two tools in one turn, a failing query whose error goes back as
+    text, a turn with no call (asked once more), then the gold SQL as the answer; a model that never answers, which
+    stops at the turn cap; and on Pondra, the same through its MCP door's tools."""
+    wrong = []
+    for e in engines:
+        for t in tasks("a")[:2]:
+            want = engines[0].run(gold_sql(t, "duckdb"))[1]
+            client = Scripted([[("tool_use", "list_tables", {}), ("tool_use", "describe", {"table": "orders"})],
+                               [("tool_use", "sql", {"query": "SELEC 1"})], [("text", "I think it is 42.")],
+                               [("tool_use", "answer", {"query": gold_sql(t, e.name)})]])
+            rec = scored(attempt(client, "claude-opus-5-5", "medium", t, e), t, want, e)
+            msgs = rec["transcript"]["messages"]
+            results = {r["tool_use_id"]: r for m in msgs if isinstance(m["content"], list) for r in m["content"] if r.get("type") == "tool_result"}
+            checks = {
+                "passed": rec["passed"], "ended": rec["end"] == "answered", "turns": rec["turns"] == 4, "steps": rec["steps"] == 4,
+                "tokens": rec["tokens"] == {"input": 400, "cache_write": 80, "cache_read": 1200, "output": 40},
+                "tables": results["t1_0"]["content"].split("\n") == sorted(COLUMNS) and "is_error" not in results["t1_0"],
+                "describe": results["t1_1"]["content"].split("\n")[0].startswith("order_id "),
+                "error as text": results["t2_0"].get("is_error") is True and len(results["t2_0"]["content"]) > 0,
+                "asked again": msgs[6]["content"].startswith("Give your answer"),
+                "one prompt": all(kw["system"] == client.seen[0]["system"] and kw["tools"] == PLAIN + [ANSWER] for kw in client.seen),
+                "dollars": dollars(rec, 0) == round((400 * 4 + 40 * 20 + 80 * 5 + 1200 * 0.2) / 1e6, 6),
+            }
+            wrong += [f"{e.name} {t['id']}: {k}" for k, v in checks.items() if not v]
+        rec = attempt(Scripted([]), "claude-opus-5-5", "medium", tasks("a")[0], e)
+        if (rec["end"], rec["turns"], rec["steps"], rec["sql"]) != ("turn cap", TURNS, TURNS, None):
+            wrong.append(f"{e.name}: the turn cap")
+        write = use(e, "sql", {"query": "/* x */ DROP TABLE orders"})
+        if write[1] is not True:
+            wrong.append(f"{e.name}: a write went through the read-only tool")
+        if getattr(e, "mcp", None):
+            t, door = tasks("a")[0], Door(e.mcp)
+            client = Scripted([[("tool_use", "list_tables", {}), ("tool_use", "query", {"sql": "SELEC 1"})],
+                               [("tool_use", "write", {"sql": "DROP TABLE orders"})], [("tool_use", "answer", {"query": gold_sql(t, "pondra")})]])
+            try:
+                rec = scored(attempt(client, "claude-opus-5-5", "medium", t, e, door), t, engines[0].run(gold_sql(t, "duckdb"))[1], e)
+            finally:
+                door.stop()
+            results = {r["tool_use_id"]: r for m in rec["transcript"]["messages"] if isinstance(m["content"], list) for r in m["content"] if r.get("type") == "tool_result"}
+            names = [x["name"] for x in client.seen[0]["tools"]]
+            checks = {
+                "passed": rec["passed"], "named": rec["engine"] == "pondra+mcp", "steps": rec["steps"] == 4,
+                "its tools": {"list_tables", "query", "find"} <= set(names) and names[-1] == "answer" and "write" not in names,
+                "its notes": "own notes for agents: " in client.seen[0]["system"],
+                "tables": '"customers"' in results["t1_0"]["content"] and "is_error" not in results["t1_0"],
+                "error as text": results["t1_1"].get("is_error") is True and "SELEC" in results["t1_1"]["content"],
+                "no write": results["t2_0"].get("is_error") is True,
+            }
+            wrong += [f"{e.name}+mcp: {k}" for k, v in checks.items() if not v]
+    out["loop"] = {"ok": not wrong, "wrong": wrong}
+
+
+def check(a):
+    """What CI runs (harness.py agents): the gold, the loop with a scripted model, and the saved answers replayed."""
+    scorer_checks()
+    todo = tasks("a", a.only)
+    engines, notes = up(a)
+    out = {"set": "a", "tasks": len(todo), "engines": notes, "failed": {}}
+    try:
+        gold(engines, todo, out)
+        if a.mode == "check":
+            loop_checks(engines, out)
+            lines = []
+            for f in sorted(glob.glob(os.path.join(TASKS, "replay_*.jsonl"))):
+                with open(f) as fh:
+                    lines += [json.loads(x) for x in fh if x.strip()]
+            replay(engines, lines, out)
+    finally:
+        down(engines)
+    out["ok"] = not out["failed"] and out.get("loop", {}).get("ok", True) and not out.get("replay", {}).get("broke")
     print(json.dumps(out, default=str))
     return 0 if out["ok"] else 1
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["gold"])
+    p.add_argument("mode", choices=["gold", "check", "run", "replay"])
+    p.add_argument("file", nargs="?", help="replay: a runs.jsonl or replay.jsonl")
     p.add_argument("--bin", help="a pondra binary to start on a fresh lake")
     p.add_argument("--port", type=int, help="or a running node's Postgres door")
     p.add_argument("--pg-bin", help="Postgres's initdb and pg_ctl folder")
     p.add_argument("--only", help="task ids, comma-separated")
+    p.add_argument("--set", default="a")
+    p.add_argument("--model", default="claude-opus-5-5")
+    p.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"])
+    p.add_argument("--runs", type=int, default=3)
+    p.add_argument("--jobs", type=int, default=6, help="tries at once")
+    p.add_argument("--engines", default=",".join(ENGINES + ("pondra+mcp",)), help="pondra+mcp: Pondra with its MCP door's tools")
+    p.add_argument("--per-hour", type=float, default=0.0, help="the machine's dollars an hour, for the engines' seconds")
+    p.add_argument("--out", default="agent-bench-out")
     a = p.parse_args()
-    return gold(a)
+    if a.mode in ("gold", "check"):
+        return check(a)
+    if a.mode == "run":
+        return run(a)
+    with open(a.file) as f:
+        lines = [json.loads(x) for x in f if x.strip()]
+    lines = [ln for ln in lines if ln.get("passed", True)]
+    engines, notes = up(a, {ln["engine"].split("+")[0] for ln in lines})
+    out = {"engines": notes}
+    try:
+        replay(engines, lines, out)
+    finally:
+        down(engines)
+    print(json.dumps(out, default=str))
+    return 0 if not out["replay"]["broke"] else 1
 
 
 if __name__ == "__main__":
