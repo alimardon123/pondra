@@ -4,7 +4,7 @@
 //! decoded once and then kept in memory. A lookup costs a scan of one cached row group — tens of
 //! microseconds — instead of planning and running a query.
 use crate::store::*;
-use crate::ledger::Charged;
+use crate::ledger::{ByteLru, Charged};
 use anyhow::{Context, Result};
 use datafusion::arrow::array::{make_comparator, Array, BooleanArray, RecordBatch};
 use datafusion::arrow::compute::kernels::cmp::{eq, lt_eq};
@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 /// Decoded row groups (least recently used out past `new`'s bytes) and Parquet footers, per node.
 pub struct Groups {
-    rows: Mutex<crate::ledger::ByteLru<(String, usize), (RecordBatch, bool)>>, // (rows, sorted by key), each charged its rows' memory
+    rows: Mutex<ByteLru<(String, usize), (RecordBatch, bool)>>, // (rows, sorted by key), each charged its rows' memory
     footers: Mutex<HashMap<String, ArrowReaderMetadata>>,
 }
 
@@ -38,7 +38,7 @@ impl Charged for Groups {
 }
 
 impl Groups {
-    pub fn new(max: usize) -> Self { Groups { rows: Mutex::new(crate::ledger::ByteLru::new(max)), footers: Default::default() } }
+    pub fn new(max: usize) -> Self { Groups { rows: Mutex::new(ByteLru::new(max)), footers: Default::default() } }
 }
 
 /// The newest row of `key` (comma-separated values, in key order) in upsert table `meta`, if it
@@ -78,6 +78,14 @@ impl Point {
         crate::answer::schema(&self.names.iter().map(|n| (n.clone(), types[n.as_str()].to_string())).collect::<Vec<_>>())
     }
 
+    /// What it holds of its own, as the node's line counts it (its table's meta is the catalog's, shared).
+    fn bytes(&self) -> usize {
+        let text = |s: &String| 24 + s.len();
+        std::mem::size_of::<Point>() + self.table.len() + self.names.iter().map(text).sum::<usize>()
+            + self.key.iter().map(|k| 24 + k.as_ref().map_or(0, |k| k.len())).sum::<usize>()
+            + self.params.keys().map(|k| text(k) + 8).sum::<usize>()
+    }
+
     /// Which types its columns are (`pg_types`: a uuid, json or jsonb): its table's own, by name.
     pub fn types(&self) -> Vec<Option<crate::pg_types::Ty>> { self.names.iter().map(|n| self.meta.sql_types().get(n).and_then(|t| crate::pg_types::Ty::of(t))).collect() }
 
@@ -113,23 +121,42 @@ impl Point {
 /// `Point` with the table's old columns and files. A node whose catalog has no version (a follower
 /// between seeds) works it out each time.
 pub async fn point(lake: &Lake, sql: &str) -> Result<Option<Arc<Point>>> {
-    type Seen = lru::LruCache<(String, String), (u64, Option<Arc<Point>>)>;
-    crate::per_node!(static SEEN: Mutex<Seen> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).expect("non-zero"))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
     let head = sql.trim_start();
     if !head.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("select")) {
         return Ok(None); // (most statements: no parse)
     }
     let Some(now) = lake.cat.version() else { return Ok(point_of(lake, sql).await?.map(Arc::new)) };
     let key = (lake.url.clone(), sql.to_string());
-    if let Some((v, p)) = SEEN.lock().unwrap().get(&key) {
+    if let Some((v, p)) = POINTS.lock().unwrap().get(&key) {
         if *v == now {
             return Ok(p.clone());
         }
     }
     let p = point_of(lake, sql).await?.map(Arc::new);
-    SEEN.lock().unwrap().put(key, (now, p.clone()));
+    let bytes = 64 + key.0.len() + key.1.len() + p.as_ref().map_or(0, |p| p.bytes());
+    let left = POINTS.lock().unwrap().put(key, (now, p.clone()), bytes);
+    drop(left); // (after the lock)
     Ok(p)
 }
+
+type Points = ByteLru<(String, String), (u64, Option<Arc<Point>>)>;
+crate::per_node!(
+    /// The statements `point` worked out, by lake and statement, with the catalog version each was worked out at: the
+    /// newest 4096, each charged its statement and plan to the node's line, which takes them back when it needs the
+    /// memory (`points`).
+    static POINTS: Arc<Mutex<Points>> = Arc::new(Mutex::new(ByteLru::new(usize::MAX).with_count(4096))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+
+/// The statements worked out as point queries, as the node's line counts them (`cache_bytes{cache="point_plans"}`).
+pub fn points() -> Arc<dyn Charged> { POINTS.clone() }
+
+type Tails = ByteLru<(String, String), Arc<Mutex<Tail>>>;
+crate::per_node!(
+    /// Each table's `Tail`, by lake and table: the newest 16 tables', each charged its index to the node's line, which
+    /// takes them back when it needs the memory (`tail_keys`).
+    static TAILS: Arc<Mutex<Tails>> = Arc::new(Mutex::new(ByteLru::new(usize::MAX).with_count(16))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+
+/// The log tails' keys `newest_in_log` indexes, as the node's line counts them (`cache_bytes{cache="tail_keys"}`).
+pub fn tail_keys() -> Arc<dyn Charged> { TAILS.clone() }
 
 async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
     use datafusion::sql::sqlparser::ast::*;
@@ -250,6 +277,15 @@ struct Tail {
     segs: HashMap<u64, Arc<Segment>>,
 }
 
+impl Tail {
+    /// What its index holds, as the node's line counts it: each slot of its maps (an entry and its control byte, at a
+    /// table of 8 slots for each 7 entries) and the key's types; the segments are the log's, shared.
+    fn bytes(&self) -> usize {
+        fn slots<K, V>(m: &HashMap<K, V>) -> usize { m.capacity() * (std::mem::size_of::<(K, V)>() + 1) * 8 / 7 }
+        std::mem::size_of::<Tail>() + self.types.len() * std::mem::size_of::<datafusion::arrow::datatypes::DataType>() + slots(&self.rows) + slots(&self.segs)
+    }
+}
+
 const KEYS: datafusion::common::hash_utils::RandomState = datafusion::common::hash_utils::RandomState::with_seed(0);
 
 /// Each row's hash of its key columns, as the key's types.
@@ -265,16 +301,19 @@ fn hashes(batch: &RecordBatch, keys: &[(&str, ScalarValue)]) -> Result<Vec<u64>>
 
 /// The log tail's newest row of the key, with the commit that wrote it and when (`Tail`).
 async fn newest_in_log(lake: &Lake, table: &str, meta: &TableMeta, keys: &[(&str, ScalarValue)]) -> Result<Option<(RecordBatch, u64, u64)>> {
-    crate::per_node!(static TAILS: Mutex<lru::LruCache<(String, String), Arc<Mutex<Tail>>>> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(16).expect("non-zero"))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
     let types: Vec<_> = keys.iter().map(|(_, v)| v.data_type()).collect();
+    let id = (lake.url.clone(), table.to_string());
     let tail = {
         let mut all = TAILS.lock().unwrap();
-        let id = (lake.url.clone(), table.to_string());
         match all.get(&id).filter(|t| matches!(&*t.lock().unwrap(), t if t.tiered == meta.tiered && t.types == types)) {
             Some(t) => t.clone(),
             None => {
-                let t = Arc::new(Mutex::new(Tail { tiered: meta.tiered, types, upto: meta.tiered, rows: HashMap::new(), segs: HashMap::new() }));
-                all.put(id, t.clone());
+                let made = Tail { tiered: meta.tiered, types, upto: meta.tiered, rows: HashMap::new(), segs: HashMap::new() };
+                let bytes = made.bytes();
+                let t = Arc::new(Mutex::new(made));
+                let left = all.put(id.clone(), t.clone(), bytes);
+                drop(all);
+                drop(left); // (after the lock)
                 t
             }
         }
@@ -289,8 +328,9 @@ async fn newest_in_log(lake: &Lake, table: &str, meta: &TableMeta, keys: &[(&str
         };
         fresh.push((n, seg, hashed));
     }
-    let hit = {
+    let (hit, grown) = {
         let mut t = tail.lock().unwrap();
+        let before = t.bytes();
         for (n, seg, hashed) in fresh {
             if n <= t.upto {
                 continue; // (another lookup brought it this far)
@@ -305,13 +345,28 @@ async fn newest_in_log(lake: &Lake, table: &str, meta: &TableMeta, keys: &[(&str
                 t.segs.insert(n, seg);
             }
         }
-        if t.rows.is_empty() {
-            return Ok(None); // (no rows of the table since its files)
-        }
-        let mut want = [0];
-        datafusion::common::hash_utils::create_hashes(&keys.iter().map(|(_, v)| v.to_array()).collect::<Result<Vec<_>, _>>()?, &KEYS, &mut want)?;
-        t.rows.get(&want[0]).map(|&(n, b, i)| (n, t.segs[&n].clone(), b as usize, i as usize))
+        let grown = Some(t.bytes()).filter(|b| *b != before);
+        let hit = match t.rows.is_empty() {
+            true => None, // (no rows of the table since its files)
+            false => {
+                let mut want = [0];
+                datafusion::common::hash_utils::create_hashes(&keys.iter().map(|(_, v)| v.to_array()).collect::<Result<Vec<_>, _>>()?, &KEYS, &mut want)?;
+                t.rows.get(&want[0]).map(|&(n, b, i)| (n, t.segs[&n].clone(), b as usize, i as usize))
+            }
+        };
+        (hit, grown)
     };
+    // (its new size charged, after its own lock: the cache's is taken before a tail's. Unless the line took it back
+    // meanwhile, or another lookup put a newer one: then it isn't kept)
+    if let Some(bytes) = grown {
+        let mut all = TAILS.lock().unwrap();
+        let left = match all.peek(&id).is_some_and(|t| Arc::ptr_eq(t, &tail)) {
+            true => all.put(id, tail.clone(), bytes),
+            false => vec![],
+        };
+        drop(all);
+        drop(left);
+    }
     let Some((n, seg, b, i)) = hit else { return Ok(None) };
     let row = lake.segment_rows(n, &seg, table).await?[b].slice(i, 1);
     if last_match(&row, keys, false)?.is_some() {
@@ -478,6 +533,24 @@ impl AsyncFileReader for Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tail's index is charged what its maps hold, which grows as lookups bring it up to date; a point plan what its
+    /// own parts hold, not its table's meta, which the catalog keeps.
+    #[test]
+    fn a_tails_index_and_a_point_plan_say_what_they_hold() {
+        let mut t = Tail { tiered: 0, types: vec![datafusion::arrow::datatypes::DataType::Int64], upto: 0, rows: HashMap::new(), segs: HashMap::new() };
+        let empty = t.bytes();
+        assert!(empty >= std::mem::size_of::<Tail>());
+        t.rows.extend((0..100_000u64).map(|h| (h, (1, 0, h as u32))));
+        let full = t.bytes();
+        assert!(full - empty >= 100_000 * 24, "its keys' slots: {full}");
+        assert!(full - empty <= 100_000 * 24 * 3, "not wildly more: {full}");
+
+        let meta = Arc::new(TableMeta::with_columns(vec![("a".into(), "Int64".into()), ("b".into(), "Utf8".into())]));
+        let p = |b: &str| Point { table: "t".into(), meta: meta.clone(), names: vec!["a".into(), "b".into()], key: vec![Some(b.into())], params: HashMap::new() };
+        assert_eq!(p(&"x".repeat(1000)).bytes() - p("").bytes(), 1000, "its key's text");
+        assert!(p("").bytes() < 1024, "its table's columns aren't its own");
+    }
 
     #[test]
     fn a_writes_where_names_its_key_as_a_lookup_does() {
