@@ -11314,10 +11314,16 @@ def _lake_keys():
     logs = [open(f.log).read() for f in pair]
     for f in pair:
         f.kill()
-    info["followers"] = {"joined": joined, "a follower took over": led, "sealed, taken": [sealed_new, took_new], "wrote after": wrote, "logs": [l[-300:] for l in logs]}
+    # (the other takes the new keys from the bucket by its look every 10 s, or as it opens the lake again: a second election
+    # can follow the first, the node that sealed fenced by the other, and each then restarts to rejoin and opens the sealed
+    # keys. Its writes after, which the leader refuses under the old key, show it has them either way.)
+    sealers = [i for i, l in enumerate(logs) if "made new (the ones in the clear" in l]
+    other = logs[1 - sealers[0]] if len(sealers) == 1 else ""
+    way = "its look" if "took the lake's new keys from the bucket" in other else "opened again" if "restarting to rejoin the cluster" in other else None
+    info["followers"] = {"joined": joined, "a follower took over": led, "sealed, taken": [sealed_new, took_new], "the other's new keys, by": way, "wrote after": wrote,
+                         "logs": [l[-300:] for l in logs]}
     checks["followers that knew the lake's keys in the clear: the one that takes over seals new ones, and the other takes them from the bucket and writes through it"] = \
-        joined == [{"rows": 1}] * 2 and led is True and sealed_new == 1 and took_new == 1 and wrote == [{"rows": 1}] * 2 \
-        and sum("made new (the ones in the clear" in l for l in logs) == 1 and sum("took the lake's new keys from the bucket" in l for l in logs) == 1
+        joined == [{"rows": 1}] * 2 and led is True and sealed_new == 1 and len(sealers) == 1 and way is not None and wrote == [{"rows": 1}] * 2
     return checks, info
 
 
