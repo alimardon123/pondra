@@ -1136,6 +1136,9 @@ pub struct Access {
 }
 
 impl Access {
+    /// One with these grants and no roles (the rights tests').
+    #[cfg(test)]
+    pub fn granted(grants: Vec<Grant>) -> Access { Access { grants, ..Default::default() } }
     /// The columns of `table` (as the catalog names it) it may use for `privilege`: None, none;
     /// Some(None), every column; Some(Some(these)).
     pub fn columns(&self, privilege: &str, table: &str) -> Option<Option<HashSet<String>>> {
@@ -1380,7 +1383,7 @@ fn read_only(r: &crate::store::Reach, ns: &str) -> Result<()> {
 pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::write::Stmt) -> Result<()> {
     across(other, ns).await?;
     let Some(a) = crate::auth::limited() else { return Ok(()) };
-    let (table, privileges) = (format!("{ns}.{table}"), crate::auth::needs(stmt).1);
+    let (table, privileges) = (format!("{ns}.{table}"), crate::rights::asks(stmt).1.into_iter().filter_map(crate::rights::Action::privilege).collect::<Vec<_>>());
     match privileges.iter().find(|p| a.named(p, &table).is_none()) {
         Some(p) => bail!("permission denied: {} on {table}, another database's table: GRANT {} ON {table} TO … (ON ALL TABLES and ON SCHEMA are this database's)", p.to_uppercase(), p.to_uppercase()),
         None => Ok(()),
