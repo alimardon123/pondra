@@ -3190,6 +3190,7 @@ pub struct Catalog {
     follows: bool,                // follower / read-only node that gets the commit stream
     mirror: AtomicBool,           // the overlay holds the whole catalog (but inline data): read only it
     loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
+    rights: AtomicU64,            // the last commit that changed who may do what (`RIGHTS`, `rights_version`)
     metas: Arc<Mutex<Parsed<TableMeta>>>, // tables' entries as parsed (`parsed`)
     segs: Arc<Mutex<Parsed<Segment>>>,    // log segments' entries as parsed (`segments`)
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
@@ -3234,6 +3235,14 @@ impl Delta {
 
 /// A commit's key that says nothing a read sees changed (retention's marks: `tier::expire`).
 pub const QUIET: &str = "quiet";
+
+/// The keys a principal is made from: users, roles, their grants, passwords and tokens (`users::user_key`), identity
+/// providers (`sso::key`), the lake's own signing keys (`users::KEYS`) and its mark of being served with tokens
+/// (`users::SIGNED`). A commit that puts or deletes one moves the rights version (`Catalog::rights_version`).
+const RIGHTS: [&str; 4] = ["u/", "ip/", "z/auth", "z/signed"];
+
+/// Does a commit change who may do what (`RIGHTS`)?
+fn moves_rights(d: &Delta) -> bool { d.puts.iter().map(|(k, _)| k).chain(&d.deletes).any(|k| RIGHTS.iter().any(|r| k.starts_with(r))) }
 
 /// The node's own records, which its writer appends (`history::writer`) and no remembered answer
 /// reads (`App::remembers`): the statements' history and the audit log.
@@ -3433,6 +3442,7 @@ impl Catalog {
         }
         cat.streamed.store(c, Relaxed);
         cat.loud.store(c, Relaxed);
+        cat.rights.store(c, Relaxed);
         cat.mirror.store(true, Relaxed);
         Ok(cat)
     }
@@ -3465,9 +3475,9 @@ impl Catalog {
 
     fn new(kv: Arc<dyn Kv>, life: Life) -> Self {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
-        let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
+        let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud, rights) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default(), life }
+        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, rights, metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default(), life }
     }
 
     /// What the catalog's block caches hold, in bytes.
@@ -3573,6 +3583,7 @@ impl Catalog {
             o.clear();
             self.mirror.store(false, Relaxed);
             self.hold.fetch_max(d.id - 1, Relaxed);
+            self.rights.fetch_max(d.id, Relaxed); // (any of them may have changed who may do what)
         }
         if let Some((_, v)) = d.puts.iter().find(|(k, _)| k == "n") {
             self.last_n.fetch_max(serde_json::from_slice(v).unwrap_or(1), Relaxed);
@@ -3590,6 +3601,9 @@ impl Catalog {
         self.streamed.fetch_max(d.id, Relaxed);
         if !quiet(d) {
             self.loud.fetch_max(d.id, Relaxed);
+        }
+        if moves_rights(d) {
+            self.rights.fetch_max(d.id, Relaxed);
         }
     }
 
@@ -3692,6 +3706,7 @@ impl Catalog {
         self.pruned.fetch_max(c, Relaxed); // older streamed commits are in the snapshot
         self.streamed.fetch_max(c, Relaxed);
         self.loud.fetch_max(c, Relaxed);
+        self.rights.fetch_max(c, Relaxed); // (a whole snapshot: what changed in it isn't told apart)
         self.last_n.fetch_max(n, Relaxed);
         self.mirror.store(true, Relaxed);
         Ok(())
@@ -3736,6 +3751,11 @@ impl Catalog {
             false => self.mirror.load(Relaxed).then(|| self.loud.load(Relaxed)),
         }
     }
+
+    /// The rights version: the last commit that changed who may do what (`RIGHTS`), or that may have (commits that never
+    /// arrived, a snapshot read whole). A session makes its principal again when this moved since the principal was made
+    /// (`auth::Principal::epoch`): one load at each statement, and no timer.
+    pub fn rights_version(&self) -> u64 { self.rights.load(Relaxed) }
 
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         self.get_raw(key).await?.map(|v| serde_json::from_slice(&v).context(key.to_string())).transpose()
@@ -4311,6 +4331,25 @@ mod tests {
         let kb: usize = status.lines().find_map(|l| l.strip_prefix("VmRSS:")?.trim().strip_suffix("kB")?.trim().parse().ok()).expect("VmRSS");
         let theirs = kb << 10;
         assert!(ours.abs_diff(theirs) * 4 <= theirs, "resident {ours} bytes, VmRSS {theirs} bytes");
+    }
+
+    /// A commit that changes who may do what moves the rights version (`moves_rights`): users, roles, grants and tokens,
+    /// identity providers, the lake's keys and its signed mark, put or deleted. A table's rows or entry don't.
+    #[test]
+    fn rights_move_with_users_providers_and_keys() {
+        let d = |puts: &[&str], deletes: &[&str]| Delta { id: 9, puts: puts.iter().map(|k| (k.to_string(), Bytes::new())).collect(), deletes: deletes.iter().map(|k| k.to_string()).collect() };
+        for (puts, deletes, moves) in [
+            (&["u/ann", "c"][..], &[][..], true),
+            (&["c"], &["u/ann"], true),
+            (&["ip/acme", "c"], &[], true),
+            (&["z/auth"], &[], true),
+            (&["z/signed"], &[], true),
+            (&["t/orders", "d/3", "s/3", "c", "n"], &[], false),
+            (&["c"], &["p/sql:1"], false),
+            (&["e/stripe", "v/u_view"], &[], false),
+        ] {
+            assert_eq!(moves_rights(&d(puts, deletes)), moves, "{puts:?} {deletes:?}");
+        }
     }
 
     #[test]
