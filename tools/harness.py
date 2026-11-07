@@ -10552,9 +10552,11 @@ def server():
     checks["the folder's lakes are its databases, none running until used"] = running() == {"crm": False, "lake": False, "sales": False}
     checks["psql and HTTP reach each database by name; no /db/ means the default (lake)"] = pq("sales", "SELECT sum(amount) FROM orders") == [(30.5,)] \
         and call(port, "POST", "/db/crm/sql", b"SELECT name FROM customers ORDER BY id") == [{"name": "ann"}, {"name": "bob"}] and call(port, "POST", "/sql", b"SELECT text FROM notes") == [{"text": "hi"}]
-    nodes_of = lambda: [open(f"/proc/{p}/cmdline").read().split("\0") for p in subprocess.run(["pgrep", "-x", "pondra"], capture_output=True, text=True).stdout.split()
+    nodes_of = lambda: [p for p in subprocess.run(["pgrep", "-x", "pondra"], capture_output=True, text=True).stdout.split()
                         if os.path.exists(f"/proc/{p}/cmdline") and "--attach-found" in open(f"/proc/{p}/cmdline").read() and folder in open(f"/proc/{p}/cmdline").read()]
-    checks["each database's node gets pondra serve's options (--memory-gb 1.5 here)"] = bool(nodes_of()) and all("--memory-gb" in a and a[a.index("--memory-gb") + 1] == "1.5" for a in nodes_of())
+    # (a setting given to serve reaches each database's node as its environment, `env::given`; the other flags on its command line)
+    environ = lambda p: dict(kv.split("=", 1) for kv in open(f"/proc/{p}/environ").read().split("\0") if "=" in kv)
+    checks["each database's node gets pondra serve's options (--memory-gb 1.5 here)"] = bool(nodes_of()) and all(environ(p).get("PONDRA_MEMORY_GB") == "1.5" for p in nodes_of())
     checks["a query joins across databases (name.schema.table)"] = pq("sales", "SELECT c.name, o.amount FROM orders o JOIN crm.customers c ON c.id = o.id ORDER BY o.id") == [("ann", 10.5), ("bob", 20.0)]
     checks["the console is at /"] = b"<html" in call(port, "GET", "/").lower() or b"<!doctype html" in call(port, "GET", "/").lower()
     pq("sales", "CREATE DATABASE hr")
