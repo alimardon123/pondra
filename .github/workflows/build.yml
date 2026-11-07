@@ -397,19 +397,21 @@ jobs:
         run: python tools/startup_order.py check --bin "$BIN" --lib "$(dirname "$BIN")/libpondra_lib.so" --most-mb 31
       # Signed before it is packaged, so every package holds the signed binary: with the certificates' secrets
       # (ADR-041 §8), a step that says so and does nothing until they are set (signed binaries come after 1.0)
-      # (only a run of main's or a release branch's own code gets them, a push's or one started by hand there: a pull request's run, the train's,
-      # or one started by hand on another branch never does, as its tools/sign.py is that branch's (11-02 audit L5); signing in
-      # a job of its own is after 1.0)
+      # (only a run of main's or release/0.80's own code gets them, a push's or one started by hand there: a pull request's run, the train's,
+      # or one started by hand on another branch never does, as its tools/sign.py is that branch's (11-02 audit L5). The release
+      # branch is named exactly, not release/*, so a branch pushed with that name gets no certificates (11-06 audit M4): the next
+      # release branch's cut names itself here. Signing in a job of its own, behind an environment that admits only protected
+      # branches, is after 1.0)
       - name: Signed (macOS, Windows), when the certificates are set
         if: startsWith(matrix.platform, 'macos') || startsWith(matrix.platform, 'windows')
         env:
-          APPLE_CERTIFICATE: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.APPLE_CERTIFICATE || '' }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
-          APPLE_API_KEY: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.APPLE_API_KEY || '' }}
-          APPLE_API_KEY_ID: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.APPLE_API_KEY_ID || '' }}
-          APPLE_API_ISSUER: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.APPLE_API_ISSUER || '' }}
-          WINDOWS_CERTIFICATE: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.WINDOWS_CERTIFICATE || '' }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && secrets.WINDOWS_CERTIFICATE_PASSWORD || '' }}
+          APPLE_CERTIFICATE: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/0.80') && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/0.80') && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_API_KEY: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/0.80') && secrets.APPLE_API_KEY || '' }}
+          APPLE_API_KEY_ID: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/0.80') && secrets.APPLE_API_KEY_ID || '' }}
+          APPLE_API_ISSUER: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/0.80') && secrets.APPLE_API_ISSUER || '' }}
+          WINDOWS_CERTIFICATE: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/0.80') && secrets.WINDOWS_CERTIFICATE || '' }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/0.80') && secrets.WINDOWS_CERTIFICATE_PASSWORD || '' }}
         run: python tools/sign.py "$BIN"
       # The pip and npm packages and the installers' archive, installed and tried as on a user's
       # machine: packaging that breaks on an OS (npm is npm.cmd on Windows) shows on a push.
