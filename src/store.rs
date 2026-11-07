@@ -3742,6 +3742,7 @@ impl Catalog {
     /// A table's entry (`t/…`) as parsed, for a read that runs per query or request: see `parsed`.
     pub async fn meta(&self, key: &str) -> Result<Option<Arc<TableMeta>>> {
         let raw = if self.mirror.load(Relaxed) {
+            crate::metrics::add(&crate::metrics::CATALOG_READS, 1);
             self.overlay.lock().unwrap().get(key).and_then(|(_, v)| v.clone()) // (the overlay holds the whole catalog)
         } else {
             self.get_raw(key).await?
@@ -3772,6 +3773,11 @@ impl Catalog {
     }
 
     pub async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
+        crate::metrics::add(&crate::metrics::CATALOG_READS, 1); // (a record looked up, there or not: the write-set rule counts it)
+        self.get_raw_uncounted(key).await
+    }
+
+    async fn get_raw_uncounted(&self, key: &str) -> Result<Option<Bytes>> {
         if self.kv.is_writer() {
             return Ok(match key.starts_with("d/") {
                 // The leader answers from its in-memory catalog: committed writes only, never ones
@@ -3869,6 +3875,12 @@ impl Catalog {
     /// `scan_raw`, and the commit the entries are read as of (`at`): the lake as of commit `at`, which a page of a range
     /// is checked against (`kv`, `Remote::scan`). A mirror answers as of its last streamed commit; a view alone as of its own.
     pub async fn scan_raw_at(&self, from: &str, to: &str) -> Result<(BTreeMap<String, Bytes>, u64)> {
+        let got = self.scan_raw_at_uncounted(from, to).await?;
+        crate::metrics::add(&crate::metrics::CATALOG_READS, got.0.len() as u64); // (each record a scan read)
+        Ok(got)
+    }
+
+    async fn scan_raw_at_uncounted(&self, from: &str, to: &str) -> Result<(BTreeMap<String, Bytes>, u64)> {
         if from >= to {
             return Ok((BTreeMap::new(), self.at_now().await?));
         }
@@ -3929,6 +3941,12 @@ impl Catalog {
     /// (`scan_raw_at`'s `at`): one page of a range (`kv`). In memory it takes only those `n` (the overlay's range, filtered
     /// and `take`n), so keys `keep` refuses don't cost a page; without the whole catalog here, it reads all of the range.
     pub async fn scan_page(&self, from: &str, to: &str, n: usize, keep: impl Fn(&str) -> bool) -> Result<(Vec<(String, Bytes)>, u64)> {
+        let got = self.scan_page_uncounted(from, to, n, keep).await?;
+        crate::metrics::add(&crate::metrics::CATALOG_READS, got.0.len() as u64);
+        Ok(got)
+    }
+
+    async fn scan_page_uncounted(&self, from: &str, to: &str, n: usize, keep: impl Fn(&str) -> bool) -> Result<(Vec<(String, Bytes)>, u64)> {
         if from >= to {
             return Ok((Vec::new(), self.at_now().await?));
         }
@@ -4060,6 +4078,7 @@ impl Catalog {
     /// waiting (pipelined commits: one round trip no longer blocks the next).
     pub async fn write(&self, puts: Vec<(String, Vec<u8>)>, deletes: &[String]) -> Result<oneshot::Receiver<()>> {
         let (true, Some(writes)) = (self.kv.is_writer(), &self.writes) else { bail!("read-only node") };
+        crate::metrics::add(&crate::metrics::CATALOG_WRITES, (puts.len() + deletes.len()) as u64); // (records put or deleted)
         if self.frozen.load(Relaxed) && !crate::backup::may_write(puts.iter().map(|(k, _)| k).chain(deletes)) {
             return Err(crate::backup::refused(None)); // (whatever door a write came through: ADR-070)
         }

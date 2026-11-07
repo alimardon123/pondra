@@ -49,6 +49,7 @@ pub mod sketch;
 mod asof;
 mod explain;
 mod multiply;
+mod divide;
 mod sparksql;
 mod parsed;
 mod past_names;

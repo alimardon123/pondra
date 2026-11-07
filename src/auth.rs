@@ -54,7 +54,16 @@ impl Principal {
 tokio::task_local! {
     /// The principal of the request being served.
     pub static WHO: Principal;
+    /// Set around the node's own work, which no request asked for (`as_node`: a task's tick).
+    static NODE: ();
 }
+
+/// `f` as the node's own work: with no principal set, `rights::may` decides what it asks as an admin token's. Work with
+/// neither is refused, so work a request starts and loses its caller (spawned without `carried`) gets no rights.
+pub async fn as_node<F: std::future::Future>(f: F) -> F::Output { NODE.scope((), f).await }
+
+/// Is this the node's own work (`as_node`)?
+pub fn node_work() -> bool { NODE.try_with(|_| ()).is_ok() }
 
 /// The principal of the request being served (None: no door set one: this process's own work).
 pub fn current() -> Option<Principal> { WHO.try_with(|p| p.clone()).ok() }
@@ -71,11 +80,12 @@ pub fn holder() -> String { current().map_or_else(|| "node".to_string(), |p| for
 /// same user (its grants) and session. A spawned task keeps no task-local, and with no principal a
 /// started procedure ran with its role's every right, past the user's grants.
 pub fn carried<F: std::future::Future>(f: F) -> impl std::future::Future<Output = F::Output> {
-    let (who, session) = (current(), crate::temp::current());
+    let (who, node, session) = (current(), node_work(), crate::temp::current());
     async move {
         let f = crate::temp::SESSION.scope(session, f);
         match who {
             Some(p) => WHO.scope(p, f).await,
+            None if node => as_node(f).await,
             None => f.await,
         }
     }
