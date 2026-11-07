@@ -19,6 +19,7 @@
 //!   a second or two (`listen`), and one that doesn't answer in `HEARD` is gone (`deaf`); but not a
 //!   replicating leader, whose followers hold acknowledged changes: its mark alone decides. A leader
 //!   killed and started again takes the next term: only its own restart takes its term back.
+use crate::log::{now_ms, untaken_flush};
 use crate::members::{self, Members};
 use crate::node::Guest;
 use crate::replica::ReplicaLog;
@@ -203,7 +204,7 @@ impl Cluster {
     /// turns requests away (`cut_off`: `server::guard`, `audit::statement`): it can't commit, and
     /// what it reads may be stale.
     pub fn keep_alive(self: Arc<Self>, store: Store, lake: &str) {
-        let marked = Arc::new(std::sync::atomic::AtomicU64::new(crate::log::now_ms()));
+        let marked = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
         let (me, m) = (self.clone(), marked.clone());
         crate::panics::spawn(async move {
             // (the claim marked it a moment ago: C5, a key at most once a second. A term taken back after a
@@ -222,7 +223,7 @@ impl Cluster {
                 }
                 let ok = mark_alive(&store, me.leader.n).await.is_ok();
                 if ok {
-                    m.store(crate::log::now_ms(), std::sync::atomic::Ordering::Relaxed);
+                    m.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
                     // (a newer term claimed meanwhile: cut off a moment ago, or paused for longer
                     // than a lease. SlateDB's fencing stops our commits; this stops our reads too.)
                     if superseded(&store, me.leader.n).await {
@@ -238,7 +239,7 @@ impl Cluster {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let heard = marked.load(std::sync::atomic::Ordering::Relaxed).max(bucket.as_deref().map_or(0, crate::budget::answered));
-                if cut != (crate::log::now_ms().saturating_sub(heard) > CUT_OFF.as_millis() as u64) {
+                if cut != (now_ms().saturating_sub(heard) > CUT_OFF.as_millis() as u64) {
                     cut = !cut;
                     self.cut_off.store(cut, std::sync::atomic::Ordering::Relaxed);
                     self.others.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -265,7 +266,7 @@ impl Cluster {
                 let pause = if missed && self.leader_ok() { Duration::from_millis(100) } else { Duration::from_secs(1) };
                 tokio::select! {
                     _ = tokio::time::sleep(pause) => {}
-                    _ = crate::log::untaken_flush(), if self.leader_ok() => {}
+                    _ = untaken_flush(), if self.leader_ok() => {}
                 }
                 let url = crate::tls::url(&format!("{}/cluster/beat?from={}", self.leader.addr, self.addr));
                 let answer = http().post(url).timeout(Duration::from_secs(2)).send().await;

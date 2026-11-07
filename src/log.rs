@@ -7,6 +7,7 @@
 //! * The sequencer (the leader): skips retried batches (each producer's last seq: exactly-once),
 //!   numbers every flush as a log segment and commits them all, with the producers' seqs, in ONE
 //!   catalog write. Producers are acked only after that.
+use crate::dial;
 use crate::rules::Shaped;
 use crate::store::*;
 use anyhow::{anyhow, Result};
@@ -219,7 +220,7 @@ impl To {
     async fn outcome(&self, f: Flush) -> Result<Outcome> {
         Ok(match self {
             To::Local(seq) => seq.submit(f).await?,
-            To::Leader(addr) => led(addr, crate::dial::call(addr, crate::dial::Call::post("/cluster/commit", encode_flush(&f)?)).await.inspect_err(|_| untaken())?)?.checked()?.json().await?,
+            To::Leader(addr) => led(addr, dial::call(addr, dial::Call::post("/cluster/commit", encode_flush(&f)?)).await.inspect_err(|_| untaken())?)?.checked()?.json().await?,
         })
     }
 }
@@ -233,12 +234,13 @@ crate::per_node!(static UNTAKEN: tokio::sync::Notify = tokio::sync::Notify::new(
 fn untaken() { UNTAKEN.notify_one() }
 
 /// Waits for a flush the leader didn't take (`untaken`), for the follow loop.
+#[cfg(feature = "doors")]
 pub async fn untaken_flush() { UNTAKEN.notified().await }
 
 /// The leader's answer to a flush, or the refusal of one that doesn't lead (421, `server::commit`): made before any
 /// sequencer took it, so its writes are refused as never run (57P03), and their clients send them again, to this node once
 /// it follows the leader there is, or to another.
-fn led(addr: &str, r: crate::dial::Reply) -> Result<crate::dial::Reply> {
+fn led(addr: &str, r: dial::Reply) -> Result<dial::Reply> {
     anyhow::ensure!(r.status != 421, "{addr} no longer leads: this node follows the next leader in a moment, ask again");
     Ok(r)
 }
@@ -394,7 +396,7 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                     anyhow::Ok(outcome)
                 }
                 To::Leader(addr) => {
-                    let request = crate::dial::call(addr, crate::dial::Call::post("/cluster/commit", encode_flush(&f)?));
+                    let request = dial::call(addr, dial::Call::post("/cluster/commit", encode_flush(&f)?));
                     drop(done.take()); // (sent in order; over HTTP they may still arrive out of order, rarely)
                     unanswered = true;
                     let response = request.await.inspect_err(|_| untaken())?; // (its follow loop looks now: `cluster.rs`)
@@ -1188,7 +1190,7 @@ mod tests {
     #[test]
     fn a_flush_refused_by_a_node_that_doesnt_lead_is_asked_again() {
         use futures::StreamExt;
-        let reply = |status| crate::dial::Reply::new(status, None, None, futures::stream::empty().boxed());
+        let reply = |status| dial::Reply::new(status, None, None, futures::stream::empty().boxed());
         let e = led("127.0.0.1:8712", reply(421)).err().expect("refused");
         let refused = anyhow::Error::new(Refusal { why: format!("{e:#}"), lost: false }); // (as `send` gives it to each writer)
         assert_eq!((crate::codes::of(&e), crate::codes::of(&refused), unanswered(&refused)), ("57P03", "57P03", false), "{e:#}");
