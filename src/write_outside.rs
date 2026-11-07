@@ -33,6 +33,19 @@ pub async fn insert(lake: &Lake, table: &str, query: &str, job: &str) -> Result<
     }
 }
 
+/// The columns of another engine's table (`ext_names` spec `target`), as SQL names them, in the table's order: what an INSERT
+/// that names some of them fills the rest of with NULL (`write::run`'s column list), as its format keeps no DEFAULT.
+pub async fn columns(lake: &Lake, target: &str) -> Result<Vec<String>> {
+    let spec = crate::ext_names::spec(target).context("not another engine's table")?;
+    crate::ext::check(lake, &spec).await?; // (its columns are read by whoever may write it, as its rows are: `insert`)
+    let url = spec.urls[0].trim_end_matches('/');
+    Ok(match spec.format.as_str() {
+        "delta" => read_delta::schema(url, &read_delta::replay(lake, url, None).await?.metadata)?.0.into_iter().map(|(_, logical, _)| logical).collect(),
+        "iceberg" => crate::read_iceberg::schema_of(&crate::read_iceberg::current(lake, url, &spec.options).await?.1)?.1.into_iter().map(|(n, ..)| n).collect(),
+        f => bail!("INSERT into {f} files: into a table attached as delta or iceberg"),
+    })
+}
+
 // ---------------------------------------------------------------- Delta
 
 /// Writer features handled here (Delta's protocol, writer version 7).
