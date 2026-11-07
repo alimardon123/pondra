@@ -166,13 +166,23 @@ pub fn wake() {
 /// Takes about `bytes` back from the node's caches (`ledger::Ledger::give_back`), and says how many bytes came back. The
 /// watch gives them back past [`trim_line`], before it stops any query. A lake opened outside a node (`pondra sql`,
 /// `pondra catalog`, `pondra backup`) holds its caches to their own budgets alone, since no watch runs in its process.
+/// A kind at a time across the node's lines, so a line's ranges never go before another's hot columns (11-06 audit L7).
 fn give_back(bytes: usize) -> usize {
-    let mut freed = 0;
-    for ledger in crate::store::ledgers() {
-        if freed >= bytes {
-            break;
+    let ledgers = crate::store::ledgers();
+    let mut kinds: Vec<&'static str> = vec![];
+    for kind in ledgers.iter().flat_map(|ledger| ledger.kinds()) {
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
         }
-        freed += ledger.give_back(bytes - freed);
+    }
+    let mut freed = 0;
+    for kind in kinds {
+        for ledger in &ledgers {
+            if freed >= bytes {
+                return freed;
+            }
+            freed += ledger.give_back_kind(kind, bytes - freed);
+        }
     }
     freed
 }
@@ -258,12 +268,13 @@ pub fn start() {
             }
             // The wait: as often as the trim and the stop need while a request runs (a plain sleep, since a wake on every
             // request would look on every statement); otherwise until a request starts, a lake opens, the hot columns
-            // grow, or the timer ends: 2 s while the caches hold anything (Flight, Kafka and tiering grow the node
-            // outside `work`, and the caches are what can answer them), else 30 s.
+            // grow, or the timer ends: 2 s while the caches hold what they could give back (Flight, Kafka and tiering grow
+            // the node outside `work`, and the caches are what can answer them), else 30 s. (The log's rows and the
+            // catalog's blocks are never empty, and keep what they hold: counted, an idle node looked every 2 s.)
             match line {
                 Some(line) if crate::panics::running() => tokio::time::sleep(every(felt, trim, line, settling)).await,
                 _ => {
-                    let timer = if crate::store::ledgers().iter().any(|l| l.cached() > 0) { Duration::from_secs(2) } else { Duration::from_secs(30) };
+                    let timer = if crate::store::ledgers().iter().any(|l| l.givable()) { Duration::from_secs(2) } else { Duration::from_secs(30) };
                     IDLE.store(true, Relaxed);
                     let _ = tokio::time::timeout(timer, WAKE.notified()).await;
                     IDLE.store(false, Relaxed);

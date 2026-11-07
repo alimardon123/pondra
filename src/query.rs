@@ -667,6 +667,8 @@ impl crate::ledger::Charged for std::sync::Mutex<FactsMemo> {
     fn held(&self) -> usize { self.lock().unwrap_or_else(|e| e.into_inner()).by_key.bytes() }
 
     fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(self, |m| &mut m.by_key, bytes) }
+
+    fn gives_back(&self) -> bool { true }
 }
 
 /// An append table version's `Facts` as its queries plan it, kept per version of its entry (`FactsMemo`): a table that has

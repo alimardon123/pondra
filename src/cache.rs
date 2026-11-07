@@ -170,6 +170,8 @@ impl Charged for CachedStore {
 
     fn give_back(&self, bytes: usize) -> usize { self.cache.give_back(bytes) }
 
+    fn gives_back(&self) -> bool { true }
+
     fn inside(&self) -> bool { !crate::store::own_cache_budget() }
 }
 

@@ -30,6 +30,8 @@ impl crate::ledger::Charged for Pages {
 
     fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(&self.0, |c| c, bytes) }
 
+    fn gives_back(&self) -> bool { true }
+
     /// Inside the whole line, unless `PONDRA_PAGES_MB` gives them a budget of their own.
     fn inside(&self) -> bool { crate::env::get("PONDRA_PAGES_MB").is_none() }
 }
