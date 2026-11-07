@@ -109,12 +109,15 @@ pub async fn follow(
     let mut last = 0; // the last change we got (a reconnect replays some we have)
     let mut term = None; // the leader's term, as its `Start` says
     let mut relayed = Relayed::default(); // what was relayed (`relays`)
+    let mut refused = 0; // (opens in a row refused, or that gave no frame)
     while lake.strong_count() > 0 {
         match open().await {
             Ok(r) => {
+                refused += 1;
                 let mut frames = Box::pin(frames(r.bytes_stream()));
                 let mut first = true; // (this connection's first frame: its node's own `Start`)
                 while let Some(Ok(f)) = frames.next().await {
+                    refused = 0;
                     let Some(live) = lake.upgrade() else { return };
                     if let Frame::Start { term: t, .. } = &f {
                         let new = term.replace(*t) != Some(*t);
@@ -142,10 +145,12 @@ pub async fn follow(
                 }
             }
             Err(Open::Stop) => return,
-            Err(Open::Retry) => {}
+            Err(Open::Retry) => refused += 1,
         }
         down();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // (a leader that just took over serves a moment after its followers restart, and a follower's writes wait until its
+        // stream has caught it up (`cluster::catch_up`): asked again every 50 ms for a second, then every half second)
+        tokio::time::sleep(Duration::from_millis(if refused <= 20 { 50 } else { 500 })).await;
     }
 }
 

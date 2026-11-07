@@ -32,6 +32,12 @@ use std::time::{Duration, Instant};
 const STARTUP: Duration = Duration::from_secs(30); // a new leader may need this long to open the catalog
 const CUT_OFF: Duration = Duration::from_secs(15); // a leader that hasn't reached the bucket this long steps aside
 pub const CUT_OFF_HEADER: &str = "x-pondra-cut-off"; // (a heartbeat's answer from a leader cut off)
+// A follower's flush its leader didn't take (`log.rs`): the follow loop asks the leader at once, not at its next beat.
+crate::per_node!(static UNTAKEN: tokio::sync::Notify = tokio::sync::Notify::new(); clear = |_| ());
+
+/// A flush this follower sent its leader went unanswered (the connection refused or closed): a drained leader's door is
+/// closing, and it steps down a moment later. The follow loop asks it again now, then every tenth of a second.
+pub fn flush_untaken() { UNTAKEN.notify_one() }
 
 pub struct Cluster {
     pub addr: String, // a node is known by its address
@@ -255,10 +261,21 @@ impl Cluster {
     pub fn follow(self: Arc<Self>, store: Store) {
         crate::panics::spawn(async move {
             let mut reached: Option<Instant> = None; // (since when we reach the bucket the leader says it can't)
+            let mut missed = false; // (the last beat went unanswered)
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                // A drained leader closes its door, then steps down (`node::run::Held::stop`): its followers take over
+                // then, not at their next beat up to a second on (invariant 210). So a beat unanswered is asked again
+                // every tenth of a second while the leader's lease lasts, and a flush the leader didn't take
+                // (`flush_untaken`) asks at once. Each look asks the bucket one HEAD (`stepped_down`). Past the lease,
+                // once a second again: a takeover's own questions (a peer, the bucket's newest term) are never asked faster.
+                let pause = if missed && self.leader_ok() { Duration::from_millis(100) } else { Duration::from_secs(1) };
+                tokio::select! {
+                    _ = tokio::time::sleep(pause) => {}
+                    _ = UNTAKEN.notified() => {}
+                }
                 let url = crate::tls::url(&format!("{}/cluster/beat?from={}", self.leader.addr, self.addr));
                 let answer = http().post(url).timeout(Duration::from_secs(2)).send().await;
+                missed = !answer.as_ref().is_ok_and(|r| r.status().is_success() || r.headers().contains_key(CUT_OFF_HEADER)); // (a leader cut off answers: its branch below keeps its pace)
                 if self.may_lead && answer.as_ref().is_ok_and(|r| r.headers().contains_key(CUT_OFF_HEADER)) {
                     // The leader says it can't reach the bucket: no lease to wait out, no peer to
                     // ask. Take the next term once this node has reached the bucket for a few
@@ -460,7 +477,8 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
                 Err(_) => {}
             }
             if since.elapsed() < Duration::from_secs(30) {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                // (a leader that just took over answers a moment after this node started: every 50 ms for a second, then 200)
+                tokio::time::sleep(Duration::from_millis(if since.elapsed() < Duration::from_secs(1) { 50 } else { 200 })).await;
                 continue;
             }
             if !alive(&store, &leader).await {
