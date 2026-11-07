@@ -835,13 +835,12 @@ async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
 }
 
 async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
-    let log = app.log()?;
+    app.log()?; // (a read-only node refuses before anything is read)
     if !p.producer.is_empty() && p.seq == 0 {
         return Err(E(anyhow::anyhow!(crate::log::SEQ_FROM_1))); // (0 is "nothing yet": its batch would be taken for a retry)
     }
-    crate::auth::check_rows(&name)?; // (its INSERT grant, as SQL's)
-    let meta = app.lake.table_meta(name).await?;
-    let rules = meta.rules()?;
+    let writer = crate::writer::Writer::open(app, None, name, crate::rules::How::Load, false).await?; // (the caller's rights first: `writer::may`)
+    let (meta, rules) = (writer.meta(), writer.rules());
     let schema = rules.schema.clone(); // (rows come under SQL's names; the log keeps stored ones: ADR-022)
     let arrow = headers.get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"application/vnd.apache.arrow"));
     let read = || -> anyhow::Result<_> {
@@ -862,12 +861,12 @@ async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap,
     let batch = concat_batches(&schema, &batches)?;
     let left_out = match given {
         Some(given) => rules.left_out(&given),
-        None if rules.fills() => crate::rules::LeftOut::PerRow(crate::rules::absent_keys(&meta, &body)?), // (a JSON row without the key)
+        None if rules.fills() => crate::rules::LeftOut::PerRow(crate::rules::absent_keys(meta, &body)?), // (a JSON row without the key)
         None => crate::rules::LeftOut::None,
     };
-    let rows = crate::rules::shape(&rules, name, crate::rules::Rows::Named(batch, left_out), crate::rules::How::Load, &crate::defaults::Node(&app.lake)).await?;
-    crate::auth::check_load(&meta, name, rows.rows())?; // (a keyed table's rows replace their keys': UPDATE too; marked _deleted, DELETE: S11)
-    Ok(Json(log.append_shaped(name.to_string(), Src { producer: p.producer, seq: p.seq, prev: p.prev }, rows).await?))
+    // (shaped, then the rights its rows ask: a keyed table's replace their keys', UPDATE too; marked _deleted, DELETE: S11)
+    let queued = writer.put(crate::rules::Rows::Named(batch, left_out), Src { producer: p.producer, seq: p.seq, prev: p.prev }).await?;
+    Ok(Json(queued.ack.await?))
 }
 
 #[derive(Deserialize)]

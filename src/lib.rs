@@ -245,6 +245,7 @@ mod rules;
 #[cfg(feature = "lake")] mod vars;
 #[cfg(feature = "lake")] mod views;
 #[cfg(feature = "lake")] mod write;
+#[cfg(feature = "lake")] mod writer;
 #[cfg(feature = "lake")] mod keep_load;
 #[cfg(feature = "lake")] mod write_outside;
 #[cfg(feature = "lake")] mod workspace;

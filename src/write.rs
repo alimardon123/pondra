@@ -1797,7 +1797,12 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         }
     }
     let stmt = match stmt {
-        Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
+        Stmt::InsertInto(t, names, query) => match crate::ext::outside_target(&app.lake, &t).await? {
+            // (another engine's table: the columns the list leaves out are NULL, as its format keeps no DEFAULT; a NOT NULL one
+            // is refused by its writer, `write_outside::Fit`)
+            Some(target) => Stmt::Insert(t.clone(), crate::rules::rows::rows_for(&t, &crate::write_outside::columns(&app.lake, &target).await?, &names, &query, &|_| None)?),
+            None => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
+        },
         Stmt::Insert(t, query) => {
             if !is_there(&app.lake, &t).await? {
                 seen_here(app).await; // (a table just made through another node: this one holds it once it holds what its leader had; a reader, and so a guest by the inbox, waits for nothing)
