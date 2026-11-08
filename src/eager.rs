@@ -227,22 +227,30 @@ fn eager(a: &Aggregate) -> Result<Option<LogicalPlan>> {
     Ok(Some(LogicalPlan::Projection(Projection::try_new_with_schema(out, Arc::new(second), a.schema.clone())?)))
 }
 
-/// `inputs` joined left-deep, each by the keys that connect it to what is built (the first input it can join next),
-/// and a key left over (two inputs already joined) as a condition; None when an input connects to none.
+/// `inputs` joined left-deep, each by the keys that connect it to what is built (the first input it can join next:
+/// `optimize::connect`, as the join order takes them), and a key left over (two inputs already joined) as a condition;
+/// None when an input connects to none.
 fn joined(mut inputs: Vec<LogicalPlan>, keys: &[(Expr, Expr)], equality: NullEquality) -> Result<Option<LogicalPlan>> {
     let mut used = vec![false; keys.len()];
     let mut left = inputs.remove(0);
     while !inputs.is_empty() {
-        let next = inputs.iter().position(|r| keys.iter().zip(&used).any(|(k, u)| !u && connects(k, left.schema(), r.schema()).is_some()));
-        let Some(next) = next else { return Ok(None) };
-        let right = inputs.remove(next);
-        let mut on = vec![];
-        for (k, u) in keys.iter().zip(used.iter_mut()) {
-            if let Some(pair) = connects(k, left.schema(), right.schema()).filter(|_| !*u) {
-                on.push(pair);
-                *u = true;
+        let mut next = None;
+        for (i, right) in inputs.iter().enumerate() {
+            let on: Vec<_> = crate::optimize::connect(keys, left.schema(), right.schema())?.into_iter().filter(|(k, _)| !used[*k]).collect();
+            if !on.is_empty() {
+                next = Some((i, on));
+                break;
             }
         }
+        let Some((i, on)) = next else { return Ok(None) };
+        let right = inputs.remove(i);
+        let on = on
+            .into_iter()
+            .map(|(k, pair)| {
+                used[k] = true;
+                pair
+            })
+            .collect();
         left = LogicalPlan::Join(Join::try_new(Arc::new(left), Arc::new(right), on, None, JoinType::Inner, JoinConstraint::On, equality, false)?);
     }
     let rest = keys.iter().zip(&used).filter(|(_, u)| !**u).map(|((l, r), _)| l.clone().eq(r.clone()));
@@ -250,18 +258,6 @@ fn joined(mut inputs: Vec<LogicalPlan>, keys: &[(Expr, Expr)], equality: NullEqu
         left = LogicalPlan::Filter(Filter::try_new(rest, Arc::new(left))?);
     }
     Ok(Some(left))
-}
-
-/// `key` ordered as (a column of `left`, one of `right`), when it joins them.
-fn connects((l, r): &(Expr, Expr), left: &DFSchema, right: &DFSchema) -> Option<(Expr, Expr)> {
-    let all = |e: &Expr, s: &DFSchema| e.column_refs().iter().all(|c| s.has_column(c));
-    if all(l, left) && all(r, right) {
-        Some((l.clone(), r.clone()))
-    } else if all(r, left) && all(l, right) {
-        Some((r.clone(), l.clone()))
-    } else {
-        None
-    }
 }
 
 /// Is `p` a whole table: a scan with no filter and no limit?

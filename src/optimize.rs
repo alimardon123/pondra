@@ -2478,7 +2478,7 @@ fn rows_moved(sizes: &[Size], keys: &[(Expr, Expr)], sides: &[Option<(u64, u64)>
 
 /// The keys that join `right` to what is built, each written (built side, right side) and with
 /// its place in `keys`, so the caller can take each one exactly once.
-fn connect(keys: &[(Expr, Expr)], left: &DFSchema, right: &DFSchema) -> Result<Vec<(usize, (Expr, Expr))>> {
+pub(crate) fn connect(keys: &[(Expr, Expr)], left: &DFSchema, right: &DFSchema) -> Result<Vec<(usize, (Expr, Expr))>> {
     use datafusion::logical_expr::ExprSchemable;
     let mut on: Vec<(usize, (Expr, Expr))> = vec![];
     for (k, (l, r)) in keys.iter().enumerate() {
