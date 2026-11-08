@@ -13,20 +13,14 @@ use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, WriteMultipart};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path as FsPath;
-use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-crate::per_node!(
-    /// Why the last move of this node's lake failed (`move_failed`): the host starts the node again on the lake
-    /// in memory after it, so the flag belongs to the node that starts next, and goes when that node stops.
-    pub static MOVE_FAILED: Mutex<Option<String>> = Default::default());
-
-/// A move that failed (`settle`): said on stderr, and kept for the node that starts again on the lake in memory,
-/// which says so in `/stats`. The host calls it after the node stopped (`Node::stop` sets its statics back).
-pub fn move_failed(to: &str, e: &anyhow::Error) {
+/// A move that failed (`settle`), said on stderr: why, for the host to start the node again on the lake in memory
+/// with (`node::Options::move_failed`), which says so in `/stats` and `pondra.databases` until a move lands.
+pub fn move_failed(to: &str, e: &anyhow::Error) -> String {
     let why = format!("moving the lake to {to} failed: {e:#}");
     eprintln!("{why}; it stays in memory");
-    *MOVE_FAILED.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
+    why
 }
 
 /// The program's end, for the ends that run no destructor (`process::exit`, and `main` returning past its

@@ -95,6 +95,8 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     if ordered {
         rules.insert(at, Arc::new(OuterLast)); // (the inner joins it gathers are the order's to choose)
     }
+    let grouped = rules.iter().position(|r| r.name() == "group_only_joined").map_or(rules.len(), |i| i + 1);
+    rules.insert(grouped, Arc::new(crate::eager::Eager)); // (after the join order: it groups the big table first)
     let marked = rules.iter().position(|r| r.name() == "decorrelate_predicate_subquery").map_or(0, |i| i + 1);
     rules.insert(marked, Arc::new(SubqueriesMarked)); // (before DataFusion's scalar subqueries become joins: it makes one)
     rules.insert(0, Arc::new(InListOfRows)); // (before DataFusion's simplifier meets two lists of one column)
@@ -2191,12 +2193,12 @@ impl OptimizerRule for JoinOrder {
 
 /// A join tree this rule may take apart: inner joins on equalities, nothing null-aware, all
 /// treating nulls alike.
-fn flat(j: &Join, equality: NullEquality) -> bool {
+pub(crate) fn flat(j: &Join, equality: NullEquality) -> bool {
     j.join_type == JoinType::Inner && j.join_constraint == JoinConstraint::On && !j.null_aware && j.null_equality == equality
 }
 
 /// The tree's inputs, in the order it joins them, with every equi-key and condition it holds.
-fn flatten(plan: &LogicalPlan, equality: NullEquality, leaves: &mut Vec<LogicalPlan>, keys: &mut Vec<(Expr, Expr)>, filters: &mut Vec<Expr>) {
+pub(crate) fn flatten(plan: &LogicalPlan, equality: NullEquality, leaves: &mut Vec<LogicalPlan>, keys: &mut Vec<(Expr, Expr)>, filters: &mut Vec<Expr>) {
     match plan {
         LogicalPlan::Join(j) if flat(j, equality) => {
             let (on, rest) = equalities(j);
@@ -2511,7 +2513,7 @@ fn rows_moved(sizes: &[Size], keys: &[(Expr, Expr)], sides: &[Option<(u64, u64)>
 
 /// The keys that join `right` to what is built, each written (built side, right side) and with
 /// its place in `keys`, so the caller can take each one exactly once.
-fn connect(keys: &[(Expr, Expr)], left: &DFSchema, right: &DFSchema) -> Result<Vec<(usize, (Expr, Expr))>> {
+pub(crate) fn connect(keys: &[(Expr, Expr)], left: &DFSchema, right: &DFSchema) -> Result<Vec<(usize, (Expr, Expr))>> {
     use datafusion::logical_expr::ExprSchemable;
     let mut on: Vec<(usize, (Expr, Expr))> = vec![];
     for (k, (l, r)) in keys.iter().enumerate() {
