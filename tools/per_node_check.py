@@ -84,6 +84,8 @@ PROCESS = {
     "machine.rs:INSTALLED": "the process's machine, installed once by its host as its allocator is chosen once; a node holds it (`NodeState::machine`)",
     "net.rs:INSTALLED": "the process's clients by policy, installed once by its host as its machine is; a node holds them (`NodeState::net`)",
     "net.rs:UNINSTALLED": "the clients of a process whose host installed none (`net::process`): only their keep-alive sockets",
+    "scratch.rs:INSTALLED": "the process's spill space, installed once by its host as its machine is; a node holds it (`NodeState::scratch`)",
+    "scratch.rs:UNINSTALLED": "this machine's folders, for a process whose host installed no space (`scratch::process`): no state of its own",
     "node.rs:MOVER": "the host's end of a lake's moves (`node::mover`): taken by each host before its node starts, so it outlives the node it starts; a stopped host's receiver closes it",
     "node.rs:PAGED": "a page's member is open in this process (`node::open_page`): plain, not per_node!, since reset() would set it back before the other statics, and a page opened in that gap would have them cleared under it; end_page sets it back last",
     "node.rs:SUPERVISOR": "the supervisor of the node open now, which outlives each start of that node (a restart in place)",
