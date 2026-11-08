@@ -23,6 +23,8 @@ pub struct NodeState {
     pub scratch: std::sync::Arc<dyn crate::scratch::Scratch>,
     /// Its settings, read once as it started (`settings::Values`).
     pub settings: crate::settings::Values,
+    /// Its counters, which `/metrics` and `/stats` say (`metrics::Metrics`).
+    pub metrics: Arc<crate::metrics::Metrics>,
     /// What its drain refuses and waits for (`drain.rs`).
     pub drain: Drain,
     /// What counts as a use of it, for `--idle-exit` (`idle.rs`).
@@ -46,7 +48,7 @@ impl NodeState {
     pub fn on(life: Life, machine: crate::machine::Mach) -> Arc<NodeState> { NodeState::make(life, machine, crate::settings::Values::now()) }
 
     fn make(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values) -> Arc<NodeState> {
-        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, drain: Drain::default(), idle: Idle::default(), line: Default::default(), began: datafusion::common::instant::Instant::now() })
+        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).
