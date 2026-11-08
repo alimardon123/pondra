@@ -1347,6 +1347,22 @@ mod tests {
     use crate::expander::named_apart;
     use crate::text::args;
 
+    /// A statement only the fallback dialect reads (a list comprehension) comes out of the front as its tree's text, which
+    /// GenericDialect reads, even when nothing else of the front had work in it: nothing after the front reads the fallback's
+    /// forms (`front::expand`).
+    #[tokio::test]
+    async fn a_statement_only_the_fallback_reads_comes_out_as_generic_reads_it() {
+        let lake = Lake::open(&format!("memory://fallback-{}", uuid::Uuid::new_v4().simple()), true, false, crate::node_state::NodeState::unhosted()).await.unwrap();
+        for (sql, want) in [
+            ("SELECT id, [y * 2 FOR y IN l IF y > 0] AS d FROM t", "SELECT id, array_transform(array_filter(l, y -> (y > 0)), y -> (y * 2)) AS d FROM t"),
+            ("SELECT [x FOR x IN [1, 2]] AS v", "SELECT array_transform((make_array(1, 2)), x -> (x)) AS v"), // (an array literal as make_array: `pg_casts`)
+        ] {
+            let got = expand(&lake, sql).await.unwrap();
+            assert_eq!(got, want, "{sql}");
+            assert!(crate::parsed::generic(&got).is_ok(), "{got}");
+        }
+    }
+
     /// The statements the tokenizer reads in `text`: each `;` token's text before it, when more than whitespace and
     /// comments (None: the tokenizer refuses the text).
     fn by_the_tokenizer(text: &str) -> Option<Vec<String>> {

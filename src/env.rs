@@ -73,15 +73,10 @@ pub fn parse<T: FromStr>(name: &str) -> Option<T> {
     get(name)?.trim().parse().ok()
 }
 
-/// The cores this process has: the machine's (its cgroup's, as the standard library reads them), else 2; 1 on a page, which
-/// has one thread. Every count of threads, turns or partitions starts from it (`PONDRA_CORES` is the query planner's own,
-/// `store::partitions`).
-pub fn cores() -> usize {
-    #[cfg(target_arch = "wasm32")]
-    return 1;
-    #[cfg(not(target_arch = "wasm32"))]
-    std::thread::available_parallelism().map_or(2, |n| n.get())
-}
+/// The cores this process has, as its machine says (`Machine::cores`: its cgroup's, as the standard library reads them,
+/// else 2; 1 on a page, which has one thread). Every count of threads, turns or partitions starts from it (`PONDRA_CORES`
+/// is the query planner's own, `store::partitions`).
+pub fn cores() -> usize { crate::machine::process().cores() }
 
 /// A setting read as a `T`, else its default in the table (`settings.rs`): one that isn't set, or doesn't read as a `T`.
 pub fn value<T: FromStr>(name: &str) -> T {
@@ -127,9 +122,10 @@ fn line_of(set: Option<usize>, own: Option<usize>) -> Option<usize> {
     set.or(own).filter(|&bytes| bytes > 0)
 }
 
-/// How much memory queries may hold in DataFusion's pool: `PONDRA_MEMORY_GB`, else the form's share (`own`: a third of the
-/// machine's memory on a node, two thirds of its line on a page). What the pool counts is the big hash tables and sort buffers,
-/// not the decoding and the batches in flight around them, so the share leaves the rest of the line for those. Past it a
+/// How much memory queries may hold in DataFusion's pool: `PONDRA_MEMORY_GB`, else the form's share (`own`: the memory
+/// watch's trim line on a node, `store::memory_limit`, two thirds of its line on a page). What the pool counts is the big
+/// hash tables and sort buffers, not the decoding and the batches in flight around them, so the share leaves the rest of
+/// the line for those. Past it a
 /// node's pool spills to disk; a page's, with no disk, refuses the query.
 pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
     memory_whole().unwrap_or_else(own)
@@ -139,7 +135,8 @@ pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
 /// hold no line of their own then, and a grow past it takes cache bytes back before it spills, as DuckDB's `memory_limit`
 /// holds its buffers and its operators to one number. A cache given a budget of its own (`PONDRA_HOT_GB`, `PONDRA_CACHE_MB`)
 /// keeps it beside the line (`ledger::Charged::inside`). Unset, the whole line is the memory watch's trim line, and the queries
-/// keep their own share inside it (`store::whole_line`).
+/// may hold all of it too, the caches giving way (`store::whole_line`), but a spiller isn't refused for a reader's moment in
+/// a cache.
 pub fn memory_whole() -> Option<usize> {
     gib("PONDRA_MEMORY_GB")
 }

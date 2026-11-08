@@ -91,6 +91,7 @@ pub fn router(app: App) -> Router {
         }))
         .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::objects::listed(&app.lake).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
+        .route("/metrics/tables", get(|State(app): State<App>| async move { crate::metrics::tables(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
         .route("/cluster/log", get(feed))
         .route("/cluster/kv", get(kv))
@@ -841,8 +842,8 @@ struct AppendParams {
 /// Body: NDJSON rows, or an Arrow IPC stream (content-type application/vnd.apache.arrow.stream).
 async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
     let start = std::time::Instant::now();
-    let out = append_rows(&app, &name, p, headers, body).await;
-    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
+    let (out, unseen) = crate::rights::noting(append_rows(&app, &name, p, headers, body)).await;
+    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.to_string()), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -892,11 +893,14 @@ struct InsertParams {
 /// the table if missing. With `staged=1` the body is the columns of a joined page's staged rows (`insert_staged`).
 async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, body: String) -> Result<Json<Value>, E> {
     let start = std::time::Instant::now();
-    let out = match p.staged {
-        Some(1) => insert_staged(&app, &name, &p.job, &body).await,
-        _ => insert_rows(&app, &name, p, body).await,
-    };
-    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
+    let (out, unseen) = crate::rights::noting(async {
+        match p.staged {
+            Some(1) => insert_staged(&app, &name, &p.job, &body).await,
+            _ => insert_rows(&app, &name, p, body).await,
+        }
+    })
+    .await;
+    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 

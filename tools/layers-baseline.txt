@@ -55,7 +55,7 @@ dial -> users  1
 engine -> pattern  1
 engine -> pg_bytea  1
 engine -> pg_json_make  1
-env -> wasm32  3
+env -> wasm32  1
 ext -> bridge  1
 ext -> budget  3
 ext -> catalogs  9
@@ -134,6 +134,7 @@ log -> sys  5
 log -> tier  1
 log -> views  7
 log -> wasm32  4
+machine -> wasm32  2
 manifest -> branch  4
 manifest -> crypto  1
 manifest -> sys  1
@@ -146,7 +147,7 @@ metrics -> budget  1
 metrics -> hot  1
 metrics -> jemalloc  1
 metrics -> spill  1
-metrics -> store  2
+metrics -> store  1
 node -> wasm32  1
 objects -> authored  2
 objects -> branch  2
@@ -177,10 +178,9 @@ objects -> write  11
 once -> matches  1
 once -> pattern  1
 oom -> jemalloc  2
-oom -> node  1
 oom -> wasm32  5
 optimize -> wasm32  1
-page -> wasm32  5
+page -> wasm32  7
 page_records -> dial  4
 panics -> node  1
 panics -> wasm32  11
@@ -300,7 +300,7 @@ store -> sys  3
 store -> types  2
 store -> users  2
 store -> views  1
-store -> wasm32  24
+store -> wasm32  17
 store -> write  1
 store_wire -> store  1
 temp -> python  2

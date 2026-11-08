@@ -2,8 +2,8 @@
 //! from here when all it needs are here, and skips reading and decoding the Parquet file (TPC-H
 //! runs about 1.5x faster hot). Files never change, so nothing here goes stale.
 //!
-//! Filled in the background, one file at a time, within `PONDRA_HOT_GB` (default: half of RAM, beside the
-//! query memory's third, as an in-memory engine holds its tables; 0 turns it off). The node's memory watch gives
+//! Filled in the background, one file at a time, within `PONDRA_HOT_GB` (default: half of RAM, inside the
+//! line it shares with the queries, which take its bytes back as they grow; 0 turns it off). The node's memory watch gives
 //! the columns back past its trim line, before it stops any query (`oom.rs`). Only for a file a second scan came back to:
 //! data read once — a backfill, a consumer reading the log through, a one-off report — passes through
 //! without costing the CPU that decoding it would. A table whose columns are held keeps each file it
@@ -128,12 +128,13 @@ impl crate::ledger::Charged for Hot {
 }
 
 impl Hot {
-    /// The cache of a lake: `memory` for a lake held in memory. Its budget is half of the machine's memory, beside the
-    /// query memory rather than out of it, as an in-memory engine holds its tables (`room_for`); see the module's doc.
-    /// (A page, whose machine's memory isn't read, keeps its query memory's: all of it for a lake held in memory.)
-    pub fn new(memory: bool) -> Hot {
+    /// The cache of a lake: `memory` for a lake held in memory. Its budget is half of the machine's memory, inside the line
+    /// it shares with the queries, which take its bytes back as they grow (`room_for`, `ledger::Ledger`); see the module's doc.
+    /// (A page, whose machine's memory isn't read, keeps its query memory's: all of it for a lake held in memory.) `ram`
+    /// is the memory of its node's machine (`Machine::ram`).
+    pub fn new(memory: bool, ram: Option<usize>) -> Hot {
         let gb = crate::env::parse::<f64>("PONDRA_HOT_GB");
-        let max = gb.map(|g| (g * (1u64 << 30) as f64) as usize).unwrap_or_else(|| match (crate::store::ram(), memory) {
+        let max = gb.map(|g| (g * (1u64 << 30) as f64) as usize).unwrap_or_else(|| match (ram, memory) {
             (Some(ram), _) => ram / 2,
             (None, true) => crate::store::memory_limit(),
             (None, false) => crate::store::memory_limit() / 4,
@@ -342,7 +343,7 @@ impl Hot {
             _ => room,
         };
         match crate::oom::trim_line() {
-            Some(trim) => room.min(held + trim.saturating_sub(crate::store::resident().unwrap_or(0))),
+            Some(trim) => room.min(held + trim.saturating_sub(lake.node.machine.resident().unwrap_or(0))),
             None => room,
         }
     }

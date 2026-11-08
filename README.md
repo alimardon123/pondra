@@ -152,10 +152,10 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
 - `--memory-gb 24`: memory for queries and every cache together, as DuckDB's `memory_limit`, except a
   cache given a budget of its own (`PONDRA_HOT_GB`, `PONDRA_CACHE_MB`, `PONDRA_PAGES_MB`); a query that
   needs more takes it from the caches, then sorts, aggregations and joins spill to the temp
-  directory. Unset, queries have a third of the machine's memory, and the columns kept decoded in memory
-  (`PONDRA_HOT_GB`, half of the machine's memory by default) sit beside it, as an in-memory
-  engine's tables do, and give way to queries: past 85% of the memory line (320 MB under a small one, never under 70%)
-  they are let go before any query is stopped, and a query's grow past it takes them back before it spills.
+  directory. Unset, queries and the caches share 85% of the memory line (320 MB under a small one, never
+  under 70%: 72% of the machine's memory), as DuckDB's queries have 80% of it, and the caches give way: the
+  columns kept decoded in memory (`PONDRA_HOT_GB`, half of the machine's memory by default) are let go
+  before any query is stopped, and a query's grow takes them back before it spills.
   `PONDRA_HOT_GB=0` turns them off.
 - `PONDRA_CODEC=lz4|zstd|snappy|none`: how Parquet files are compressed. LZ4 by default — it
   decodes fastest, so scans are CPU-cheap; `zstd` where storage or bandwidth costs more than CPU.

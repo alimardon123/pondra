@@ -283,7 +283,7 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
     }
     let (class, start, quota) = (class(sql), Instant::now(), crate::users::quota());
     let mut stopped = Stopped(Some((app, class, sql, start)));
-    let (out, note) = crate::history::noted(crate::ext::rooted(&app.lake.url, INSIDE.scope((), crate::authored::door(sql, async {
+    let ((out, note), unseen) = crate::rights::noting(crate::history::noted(crate::ext::rooted(&app.lake.url, INSIDE.scope((), crate::authored::door(sql, async {
         let _turn = quota.turn().await.map_err(|m| E::refusal("53000", m))?; // (insufficient_resources)
         let flag = Arc::new(AtomicBool::new(false)); // (set if the work is dropped first: a timeout drops it, inside the timeout)
         match quota.timeout {
@@ -293,7 +293,7 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
             }))),
             None => stoppable(flag, f).await,
         }
-    }))))
+    })))))
     .await;
     stopped.0 = None;
     let took = start.elapsed();
@@ -304,8 +304,11 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
         (_, Some(_)) => "refused",
         _ => "failed",
     };
-    if on() && (written(class) || refused.is_some()) {
-        log(app, class, redacted(sql, class), outcome, message.clone(), Some(took.as_millis() as i64));
+    // (told that a table it holds no privilege on isn't there: refused in the audit log, which a superuser reads, and
+    // failed in its own history, as for a table that isn't: `rights::noting`)
+    let logged = if out.is_err() && unseen { "refused" } else { outcome };
+    if on() && (written(class) || logged == "refused") {
+        log(app, class, redacted(sql, class), logged, message.clone(), Some(took.as_millis() as i64));
     }
     crate::history::ended(app, class, sql, outcome, message, took, note); // (`pondra.history`)
     out
@@ -314,8 +317,10 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
 /// Rows a door took that takes rows, not SQL (`/append`, `/insert`): a line of the audit log as the
 /// INSERT it stands for, when writes are written (`PONDRA_AUDIT=…,write`), and always when refused.
 /// Not a statement, so not in `pondra.history` (an append can come thousands of times a second).
-pub fn rows(app: &App, door: &str, table: &str, error: Option<String>, took: std::time::Duration) {
-    let refused = error.as_deref().is_some_and(refusal);
+/// Rows for a table its sender holds no privilege on, or reading one (`unseen`: `rights::noting`), told it isn't there,
+/// are refused too.
+pub fn rows(app: &App, door: &str, table: &str, error: Option<String>, unseen: bool, took: std::time::Duration) {
+    let refused = error.as_deref().is_some_and(|m| refusal(m) || unseen || !crate::rights::scope().knows(&crate::auth::catalog_name(table)));
     let outcome = match (&error, refused) {
         (None, _) => "ok",
         (_, true) => "refused",

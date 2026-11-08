@@ -176,6 +176,9 @@ impl Node {
         // (a guest answers one program's statements and ends: none of the loops and doors a node that lives keeps, so
         // every `lives` below keeps them for a node that lives only)
         let lives = guest.is_none();
+        // (the machine, installed by the program's start; a library's process or a test's installs it here, its first node's
+        // start, as the host it is)
+        crate::machine::install(Arc::new(crate::os::Os::default()));
         // (what this node does when it must stop or start again, and what its stop waits for: its lakes and its member hold it)
         let here = crate::node::native(!lives);
         let _ = held.node.set(here.clone()); // (a stop drains and closes this node's door: `Held::stop`)
@@ -189,8 +192,7 @@ impl Node {
         crate::origins::check()?; // (a page's origins that aren't origins stop the node here, before it joins or serves: `origins.rs`)
         let owner = start.auth.owner_key().map(str::to_string); // (what `ask` signs with)
         let (_, store, _) = store::open_store(&dir)?;
-        store::trace_from_now();
-        let tr = store::trace;
+        let tr = |what: &str| here.trace(what); // (timed from this start: `NodeState::trace`)
         let addr = advertise.unwrap_or_else(|| listen.clone()); // (how others reach it: its cluster name)
         if lives {
             sharing::set_endpoint(&addr); // (where a recipient's profile points: `sharing.rs`)

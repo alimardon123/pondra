@@ -92,6 +92,8 @@ def history_check(bin, work, port):
     purged = refused("UNDROP TABLE p")
     q("CREATE TABLE z (a BIGINT) WITH (retention = '0 seconds')")
     q("DROP TABLE z")
+    q("CREATE TABLE d (a BIGINT)")
+    q("DROP TABLE d")
     q("CREATE TABLE r (a BIGINT) WITH (retention = '7 days')")
     q("ALTER TABLE r SET (retention = '2 seconds')")
     q("INSERT INTO r VALUES (1)")
@@ -101,8 +103,8 @@ def history_check(bin, work, port):
     tier()
     let_go = refused("UNDROP TABLE r")
     bad = refused("CREATE TABLE b (a BIGINT) WITH (retention = 'soon')")
-    checks["DROP … PURGE and retention = '0 seconds' keep nothing; a table's retention is how long it's kept (ALTER TABLE … SET too), then it goes; a bad one refused"] = \
-        "no dropped table p" in purged and kept == [("r", 2.0)] and "no dropped table r" in let_go and "retention" in bad
+    checks["DROP … PURGE and retention = '0 seconds' keep nothing; a table's retention is how long it's kept (7 days unless set; ALTER TABLE … SET too), then it goes; a bad one refused"] = \
+        "no dropped table p" in purged and kept == [("d", 7 * 86400.0), ("r", 2.0)] and "no dropped table r" in let_go and "retention" in bad
 
     # A keyed table, and one published for other engines.
     q("CREATE TABLE k (id BIGINT PRIMARY KEY, v VARCHAR) WITH (publish = 'delta')")

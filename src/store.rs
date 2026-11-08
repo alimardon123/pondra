@@ -1549,26 +1549,10 @@ fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
     };
     let bytes = match crate::env::gib("PONDRA_CACHE_GB") {
         Some(bytes) => bytes as u64,
-        None => space(&dir).map_or(20 << 30, |(free, _)| (free / 4).min(20 << 30)),
+        None => crate::machine::process().space(&dir).map_or(20 << 30, |(free, _)| (free / 4).min(20 << 30)),
     };
     let dir = dir.join(url.trim_start_matches("s3://").replace(['/', ':', '\\'], "_")); // one folder per lake
     (bytes > 0).then(|| crate::cache::Disk::open(dir, bytes, store.clone()).ok()).flatten()
-}
-
-/// Free and total bytes of the disk that holds `dir` (or its nearest existing parent), where the
-/// platform says.
-pub(crate) fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
-    #[cfg(unix)]
-    {
-        let at = std::ffi::CString::new(dir.ancestors().find(|a| a.exists())?.as_os_str().as_encoded_bytes()).ok()?;
-        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-        (unsafe { libc::statvfs(at.as_ptr(), &mut s) } == 0).then(|| (s.f_bavail as u64 * s.f_frsize as u64, s.f_blocks as u64 * s.f_frsize as u64))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        None
-    }
 }
 
 /// Room a lake on local disk keeps for its own upkeep: a quarter of the disk, 256 MB at most (of
@@ -1578,7 +1562,7 @@ pub(crate) fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
 fn lake_keeps(total: u64) -> u64 { (total / 4).min(256 << 20) }
 
 pub fn short_of_room(dir: &std::path::Path) -> Option<(u64, u64)> {
-    space(dir).map(|(free, total)| (free, lake_keeps(total))).filter(|(free, keep)| free < keep)
+    crate::machine::process().space(dir).map(|(free, total)| (free, lake_keeps(total))).filter(|(free, keep)| free < keep)
 }
 
 /// The folder of this process's spills, DataFusion's and a shuffle's (`spill::dir`): a `memory::Folder` of
@@ -1611,7 +1595,7 @@ pub(crate) fn spill_gb() -> Option<f64> { crate::env::parse::<f64>("PONDRA_SPILL
 pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
     match spill_gb() {
         Some(gb) => Some(gb_bytes(gb)),
-        None => dir.and_then(space).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
+        None => dir.and_then(|d| crate::machine::process().space(d)).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
     }
 }
 
@@ -1778,7 +1762,7 @@ fn room_cap(gb: Option<f64>, used: u64, shuffled: u64, disk: Option<(u64, u64)>)
 /// and a GROUP BY spilling beside them could take twice it: audit 11-01 M13.)
 fn set_room(gb: Option<f64>) {
     let shuffled = gb.map_or(0, |_| crate::spill::held() + crate::memory::spilled());
-    let disk = space(&crate::memory::spill_base()); // (the disk the folder is, or would be on: not made here, the first spill makes it)
+    let disk = crate::machine::process().space(&crate::memory::spill_base()); // (the disk the folder is, or would be on: not made here, the first spill makes it)
     let managers = live_spillers();
     let all: u64 = managers.iter().map(|m| m.used_disk_space()).sum();
     for manager in managers {
@@ -1829,7 +1813,7 @@ pub(crate) fn spill_fits(bytes: u64) -> Result<()> {
     let Ok(folder) = spill_folder() else { return Ok(()) };
     let gb = spill_gb();
     let held = gb.map_or(0, |_| others_held() + crate::memory::spilled());
-    match piece_fits(gb, held, bytes, space(folder)) {
+    match piece_fits(gb, held, bytes, crate::machine::process().space(folder)) {
         true => Ok(()),
         false => Err(no_room(bytes, gb)),
     }
@@ -1881,15 +1865,17 @@ impl std::fmt::Debug for Lake {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "Lake({})", self.url) }
 }
 
-/// How much memory queries may use on this node (`PONDRA_MEMORY_GB`, else a third of RAM). Past
-/// it, sorts, aggregations and joins spill to temporary files, or the query stops with an error:
-/// a query never takes the node down. (A third, not half: what DataFusion counts here is the big
-/// hash tables and sort buffers, not the Parquet decoding and the batches in flight around them,
-/// so the node's own memory runs ahead of this number.) The queries and the caches fit one whole
-/// line together (`whole_line`): `PONDRA_MEMORY_GB` itself when it is set.
+/// How much memory queries may use on this node: `PONDRA_MEMORY_GB`, else the whole line they share with the caches
+/// (`whole_line`: the memory watch's trim line, 72% of RAM on a machine of 3 GB or more), as DuckDB's `memory_limit` is 80%
+/// of RAM by default. Past it, sorts, aggregations and joins spill to temporary files, or the query stops with an error: a
+/// query never takes the node down. A grow past what the caches leave takes their bytes back first: the caches give way
+/// to the queries. What the reservations don't count (the Parquet decoding and the batches in flight around the big hash
+/// tables and sort buffers, `array_agg`) runs in the room between the trim line and the stop line, with the watch and its
+/// once-more-holding-less retry behind it. (A third of RAM, before, left room the caches took anyway, and spilled TPC-DS
+/// q67's last aggregation 8 times at SF10 on 15 GB: 12.6 s, against 5.7 s at 10 GB and DataFusion's 6.3 s.)
 #[cfg(not(target_arch = "wasm32"))]
 pub fn memory_limit() -> usize {
-    crate::env::query_memory(|| ram().map_or(4 << 30, |r| r / 3))
+    crate::env::query_memory(|| Some(whole_line()).filter(|&w| w < usize::MAX).unwrap_or(4 << 30))
 }
 
 crate::per_node!(
@@ -1916,9 +1902,10 @@ fn lake_pool() -> Arc<crate::ledger::LakePool> {
     ledger.pool()
 }
 
-/// The whole line a node's queries and caches share (`ledger::Ledger`): `PONDRA_MEMORY_GB` when it is set, which is then
-/// the queries' line too, and a spiller it has no room for spills; else the memory watch's trim line (`oom::trim_line`),
-/// past which a grow takes cache bytes back and goes on within its share; none (`usize::MAX`) where neither is known.
+/// The whole line a node's queries and caches share (`ledger::Ledger`), which is the queries' line too (`memory_limit`):
+/// `PONDRA_MEMORY_GB` when it is set, and a spiller it has no room for spills; else the memory watch's trim line
+/// (`oom::trim_line`), past which a grow takes cache bytes back and goes on within its share; none (`usize::MAX`) where
+/// neither is known.
 fn whole_line() -> usize {
     crate::env::memory_whole().or_else(crate::oom::trim_line).unwrap_or(usize::MAX)
 }
@@ -1927,93 +1914,6 @@ fn whole_line() -> usize {
 /// line, not a machine's (`ram` is None there, and 4 GiB is past a 32-bit `usize`).
 #[cfg(target_arch = "wasm32")]
 pub fn memory_limit() -> usize { crate::env::page_query_memory(crate::env::device_line()) }
-
-/// The machine's memory, if it says: `/proc` on Linux, the OS's own call elsewhere. Less when a
-/// cgroup limits this process (a container, a service with `MemoryMax`): `/proc/meminfo` is the
-/// host's, and a node in a 4 GB container on a 64 GB host sized its queries for 64 and was killed.
-pub fn ram() -> Option<usize> {
-    static RAM: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *RAM.get_or_init(read_ram)
-}
-
-// (a page's memory is its line, which `page.rs` takes from its device: none is the machine's)
-#[cfg(target_arch = "wasm32")]
-fn read_ram() -> Option<usize> {
-    None
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn read_ram() -> Option<usize> {
-    let proc = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| m.lines().find_map(|l| l.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?.trim().parse::<usize>().ok()));
-    proc.map(|kb| (kb << 10).min(cgroup_memory().unwrap_or(usize::MAX))).or_else(|| {
-        let s = sysinfo::System::new_with_specifics(sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()));
-        Some(s.total_memory() as usize).filter(|&b| b > 0)
-    })
-}
-
-/// The least memory limit of this process's cgroups and their parents (v2 `memory.max`, v1
-/// `memory.limit_in_bytes`; "max" or none: no limit). In a container the cgroup is its root.
-#[cfg(not(target_arch = "wasm32"))]
-fn cgroup_memory() -> Option<usize> {
-    let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let limits = groups.lines().filter_map(|line| {
-        let (controllers, path) = line.split_once(':')?.1.split_once(':')?; // "0::/path" (v2), "4:memory:/path" (v1)
-        let (base, file) = match controllers {
-            "" => ("/sys/fs/cgroup", "memory.max"),
-            c if c.split(',').any(|c| c == "memory") => ("/sys/fs/cgroup/memory", "memory.limit_in_bytes"),
-            _ => return None,
-        };
-        let read = |dir: &std::path::Path| std::fs::read_to_string(format!("{base}{}/{file}", dir.display())).ok()?.trim().parse::<usize>().ok();
-        std::path::Path::new(path).ancestors().filter_map(read).min()
-    });
-    limits.min()
-}
-
-/// This process's resident memory, if the OS says.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn resident() -> Option<usize> {
-    let proc = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok());
-    proc.map(|pages| pages * page_size()).or_else(|| {
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
-        let (pid, mut s) = (sysinfo::get_current_pid().ok()?, System::new());
-        s.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), false, ProcessRefreshKind::nothing().with_memory());
-        Some(s.process(pid)?.memory() as usize).filter(|&b| b > 0)
-    })
-}
-
-/// The page's live heap bytes, as the program that runs the page reads them (`page::Options::memory`, which re-exports this).
-pub type Memory = Arc<dyn Fn() -> usize + Send + Sync>;
-
-// A page's live bytes, as the program that runs the page reads them (`page::Options::memory`): process-wide, as the page's allocator is.
-#[cfg(target_arch = "wasm32")]
-static READER: std::sync::OnceLock<Memory> = std::sync::OnceLock::new();
-
-/// Gives the page's live bytes to the core's watch (`oom`): set once, and a second call keeps the first.
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn read_resident_with(reading: Memory) {
-    let _ = READER.set(reading);
-}
-
-/// A page's resident memory is the bytes its program reads (`read_resident_with`), and none until one is given.
-#[cfg(target_arch = "wasm32")]
-pub fn resident() -> Option<usize> {
-    READER.get().map(|reading| reading())
-}
-
-/// The size of a page in bytes, which `/proc/self/statm` counts in: 4 KB, or 64 KB on some arm64 builds
-/// (where a count of pages read as 4 KB pages was 16 times too little). Asked each time: glibc answers
-/// from memory, and a static would be a node's state for nothing.
-#[cfg(not(target_arch = "wasm32"))]
-fn page_size() -> usize {
-    #[cfg(unix)]
-    {
-        let bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if bytes > 0 {
-            return bytes as usize;
-        }
-    }
-    4096
-}
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
 
@@ -2469,7 +2369,7 @@ impl Lake {
         let format = crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory)), manifests: crate::manifest::kept(), format, states: Default::default(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), node });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory, node.machine.ram())), manifests: crate::manifest::kept(), format, states: Default::default(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), node });
         for (name, cache) in lake.caches() {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
@@ -2505,9 +2405,9 @@ impl Lake {
             }
         });
         while let Some((handle, d, done, sent)) = writes.recv().await {
-            let t = commit_stage("queued", sent);
             let Some(lake) = me.upgrade() else { return };
             let cat = &lake.cat;
+            let t = cat.stage("queued", sent);
             let need = cat.replicas.saturating_sub(1);
             if need > 0 {
                 cat.send(Frame::Change(d.clone())); // followers keep it and say so
@@ -2531,7 +2431,7 @@ impl Lake {
                     _ = acked.changed() => {}
                 }
             }
-            let t = commit_stage("durable", t);
+            let t = cat.stage("durable", t);
             if need == 0 {
                 cat.send(Frame::Change(d.clone()));
             }
@@ -2540,7 +2440,7 @@ impl Lake {
             cat.send(Frame::Committed(d.id));
             let _ = to_bucket.send((handle, d.id));
             let _ = done.send(());
-            commit_stage("applied", t);
+            cat.stage("applied", t);
         }
     }
 
@@ -3205,6 +3105,7 @@ pub struct Catalog {
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
     closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
     life: Life,                   // what a fence restarts: its lake's (`fatal`)
+    stages: Arc<Stages>,          // where its commits spend their time, with `PONDRA_TRACE_COMMIT` (`stage`)
     written: Mutex<Vec<(&'static str, Instant, std::collections::HashSet<String>)>>, // each round that follows the tables committed (`written`): its last read of them all, and the ones since
 }
 
@@ -3224,7 +3125,7 @@ impl Drop for Pin<'_> {
 }
 
 type Recent = Arc<Mutex<(VecDeque<(Instant, Frame)>, usize)>>;
-type Write = (Arc<dyn Written>, Arc<Delta>, oneshot::Sender<()>, Instant); // (when it was handed to `commits`: `commit_stage`)
+type Write = (Arc<dyn Written>, Arc<Delta>, oneshot::Sender<()>, Instant); // (when it was handed to `commits`: `Catalog::stage`)
 
 /// One committed catalog write.
 pub struct Delta {
@@ -3367,23 +3268,7 @@ fn field(f: &mut Bytes) -> Result<Bytes> {
     next(f, n)
 }
 
-crate::per_node!(
-    /// When the node open now began its start (`trace_from_now`): what `trace`'s times count from.
-    static TRACED_FROM: std::sync::Mutex<Option<datafusion::common::instant::Instant>> = std::sync::Mutex::new(None));
-
-/// The node's start begins now, for `trace` (`Node::start`).
-pub fn trace_from_now() { *TRACED_FROM.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(datafusion::common::instant::Instant::now()); }
-
-/// A cold start's steps and their times, with `PONDRA_TRACE_START` (`tools/cold_trace.sh`, C5): since the node's start
-/// began (`trace_from_now`), nothing before it.
-pub fn trace(what: &str) {
-    let from = *TRACED_FROM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let (Some(since), true) = (from, crate::env::is_set("PONDRA_TRACE_START")) {
-        eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
-    }
-}
-
-/// `trace`'s line, timed from `since`: the catalog's open times its own steps.
+/// A start's line (`NodeState::trace`), timed from `since`: the catalog's open times its own steps.
 pub fn trace_since(what: &str, since: datafusion::common::instant::Instant) {
     if crate::env::is_set("PONDRA_TRACE_START") {
         eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
@@ -3431,6 +3316,9 @@ impl Catalog {
     /// opening began, for `PONDRA_TRACE_START`.
     async fn writer(kv: Arc<dyn Kv>, since: Instant, life: Life) -> Result<Self> {
         let mut cat = Self::new(kv, life);
+        if traced_commits() {
+            Stages::sample_lag(Arc::downgrade(&cat.stages)); // (a leader's commits are what it times)
+        }
         cat.replicas = crate::env::value("PONDRA_REPLICAS");
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
         let c = cat.get::<u64>("c").await?.unwrap_or(0);
@@ -3487,7 +3375,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud, rights) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, rights, marks: crate::registry::get().find::<crate::records::Rights>(), metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default(), life, written: Default::default() }
+        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, rights, marks: crate::registry::get().find::<crate::records::Rights>(), metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default(), life, stages: Arc::new(Stages::new()), written: Default::default() }
     }
 
     /// What the catalog's block caches hold, in bytes.
@@ -4192,11 +4080,11 @@ impl Catalog {
         let puts = listed(self, puts).await?;
         let mut puts: Vec<(String, Bytes)> = puts.into_iter().map(|(k, v)| (k, v.into())).collect();
         let mut id = self.order.lock().await;
-        let t1 = commit_stage("order", t0);
+        let t1 = self.stage("order", t0);
         // The commit number is the last put: the store takes the puts as they are, and the `Delta` keeps the same list.
         puts.push(("c".to_string(), Bytes::from(json(&*id))));
         let handle = self.kv.write(&puts, deletes).await.map_err(|e| self.fenced(e))?;
-        let t2 = commit_stage("kv write", t1);
+        let t2 = self.stage("kv write", t1);
         if let Some((_, v)) = puts.iter().find(|(k, _)| k == "n") {
             self.last_n.store(serde_json::from_slice(v)?, Relaxed);
         }
@@ -4233,49 +4121,62 @@ async fn listed(cat: &Catalog, mut puts: Vec<(String, Vec<u8>)>) -> Result<Vec<(
     Ok(puts)
 }
 
-/// `PONDRA_TRACE_COMMIT=1`: where a leader's commits spend their time. Each stage is the time since the one before it
-/// (`since`); once a minute one line on stderr gives each stage's p50 and p95 over that minute, and how late a 10 ms
-/// sleep woke (`lag`: the runtime's own wait, which every stage pays when the node's cores are busy). Returns now, the
-/// next stage's start.
-pub fn commit_stage(stage: &'static str, since: Instant) -> Instant {
-    type Stages = Mutex<(Instant, Vec<(&'static str, Vec<f64>)>)>;
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = crate::env::is_set("PONDRA_TRACE_COMMIT");
-        if on {
-            crate::panics::spawn(async {
-                loop {
-                    let t = Instant::now();
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    commit_stage("lag", t + Duration::from_millis(10));
-                }
-            });
+/// `PONDRA_TRACE_COMMIT=1`: where a leader's commits spend their time, its catalog's own (`Catalog::stage`). Each stage
+/// is the time since the one before it; once a minute one line on stderr gives each stage's p50 and p95 over that minute,
+/// and how late a 10 ms sleep woke (`lag`: the runtime's own wait, which every stage pays when the node's cores are busy).
+struct Stages(Mutex<(Instant, Vec<(&'static str, Vec<f64>)>)>);
+
+/// Is `PONDRA_TRACE_COMMIT` set? (Read once: a setting.)
+fn traced_commits() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env::is_set("PONDRA_TRACE_COMMIT"));
+    *ON
+}
+
+impl Stages {
+    fn new() -> Stages { Stages(Mutex::new((Instant::now(), vec![]))) }
+
+    /// A stage took from `since` to now; returns now, the next stage's start.
+    fn stage(&self, stage: &'static str, since: Instant) -> Instant {
+        let now = Instant::now();
+        if !traced_commits() {
+            return now;
         }
-        on
-    });
-    crate::per_node!(static STAGES: Stages = Mutex::new((Instant::now(), vec![])); clear = |s| *s.lock().unwrap_or_else(|e| e.into_inner()) = (Instant::now(), vec![]));
-    let now = Instant::now();
-    if !*ON {
-        return now;
+        let mut s = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ms = now.saturating_duration_since(since).as_secs_f64() * 1e3;
+        match s.1.iter_mut().find(|(n, _)| *n == stage) {
+            Some((_, v)) => v.push(ms),
+            None => s.1.push((stage, vec![ms])),
+        }
+        if now - s.0 >= Duration::from_secs(60) {
+            let line: Vec<String> = s.1.iter_mut().map(|(n, v)| {
+                v.sort_by(f64::total_cmp);
+                let q = |p: f64| v[((v.len() - 1) as f64 * p) as usize];
+                format!("{n} {:.3}/{:.3} ({})", q(0.5), q(0.95), v.len())
+            }).collect();
+            eprintln!("commit stages p50/p95 ms (count): {}", line.join(", "));
+            *s = (now, vec![]);
+        }
+        now
     }
-    let mut s = STAGES.lock().unwrap();
-    let ms = now.saturating_duration_since(since).as_secs_f64() * 1e3;
-    match s.1.iter_mut().find(|(n, _)| *n == stage) {
-        Some((_, v)) => v.push(ms),
-        None => s.1.push((stage, vec![ms])),
+
+    /// How late a 10 ms sleep wakes, as the `lag` stage, while the catalog is (weak: it ends with it).
+    fn sample_lag(stages: Weak<Stages>) {
+        crate::panics::spawn(async move {
+            loop {
+                let t = Instant::now();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let Some(s) = stages.upgrade() else { return };
+                s.stage("lag", t + Duration::from_millis(10));
+            }
+        });
     }
-    if now - s.0 >= Duration::from_secs(60) {
-        let line: Vec<String> = s.1.iter_mut().map(|(n, v)| {
-            v.sort_by(f64::total_cmp);
-            let q = |p: f64| v[((v.len() - 1) as f64 * p) as usize];
-            format!("{n} {:.3}/{:.3} ({})", q(0.5), q(0.95), v.len())
-        }).collect();
-        eprintln!("commit stages p50/p95 ms (count): {}", line.join(", "));
-        *s = (now, vec![]);
-    }
-    now
 }
 
 impl Catalog {
+    /// A commit's stage took from `since` to now, with `PONDRA_TRACE_COMMIT` (`Stages`); returns now, the next stage's
+    /// start.
+    pub(crate) fn stage(&self, stage: &'static str, since: Instant) -> Instant { self.stages.stage(stage, since) }
+
     /// `fatal`, unless this node's own stop closed the catalog: then the write or read in flight
     /// fails and the stop goes on to give up the term. Restarting there led the term again, and its
     /// followers waited out the lease (`upgrade_check.py rolling`: a batch waited 5.8 s).
@@ -4417,21 +4318,6 @@ mod tests {
         assert_eq!(merge_fan_in(256 << 20, 4), 8);
         assert_eq!(merge_fan_in(64 << 20, 4), 4, "4 at least");
         assert_eq!(merge_fan_in(5 << 30, 4), 64, "64 at most");
-    }
-
-    /// `resident` counts bytes: `/proc/self/statm` counts pages, and the page size is the OS's (64 KB on
-    /// some arm64 builds), so it agrees with `VmRSS` in kilobytes. (On 4 KB pages the old constant passed
-    /// too; it is the arm64 case this guards.)
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn resident_is_in_bytes_as_the_page_size_says() {
-        let block = vec![1u8; 100 << 20]; // (written, so resident)
-        std::hint::black_box(&block);
-        let ours = resident().expect("resident memory");
-        let status = std::fs::read_to_string("/proc/self/status").expect("the process's status");
-        let kb: usize = status.lines().find_map(|l| l.strip_prefix("VmRSS:")?.trim().strip_suffix("kB")?.trim().parse().ok()).expect("VmRSS");
-        let theirs = kb << 10;
-        assert!(ours.abs_diff(theirs) * 4 <= theirs, "resident {ours} bytes, VmRSS {theirs} bytes");
     }
 
     /// A commit that changes who may do what moves the rights version (`moves_rights`): users, roles, grants and tokens,
@@ -4621,6 +4507,35 @@ mod tests {
         for dir in &dirs {
             std::fs::remove_dir_all(dir)?;
         }
+        Ok(())
+    }
+
+    /// A lake reads the machine of the node that opened it, not the process's (step 2's gate, and the sim's members):
+    /// of two nodes in one process on machines of 2 and 8 GB, each lake's hot columns may take half its own machine's.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lake_is_sized_by_its_own_nodes_machine() -> Result<()> {
+        struct Sized(usize);
+        impl crate::machine::Machine for Sized {
+            fn ram(&self) -> Option<usize> { Some(self.0) }
+            fn resident(&self) -> Option<usize> { None }
+            fn cores(&self) -> usize { 2 }
+            fn space(&self, _: &std::path::Path) -> Option<(u64, u64)> { None }
+        }
+        if crate::env::parse::<f64>("PONDRA_HOT_GB").is_some() {
+            return Ok(()); // (a budget the user gave is the hot columns' whatever the machine)
+        }
+        let mut sized = vec![];
+        for ram in [2usize << 30, 8 << 30] {
+            let dir = std::env::temp_dir().join(format!("pondra-machine-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir)?;
+            let node = crate::node_state::NodeState::on(crate::lifecycle::unhosted(), Arc::new(Sized(ram)));
+            let lake = Lake::open(dir.to_str().expect("a path"), true, false, node).await?;
+            sized.push(lake.hot.usage().1);
+            drop(lake);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert_eq!(sized, [1 << 30, 4 << 30], "half of each node's own machine");
         Ok(())
     }
 
