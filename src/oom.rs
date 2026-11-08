@@ -573,7 +573,7 @@ mod tests {
     }
 
     fn req(since: Instant, noted: usize) -> Running {
-        Running { since, noted, stop: Some(futures::future::AbortHandle::new_pair().0), stopped: false, resting: false, used: None, left: None, first_try: None }
+        Running { since, noted, stop: Some(futures::future::AbortHandle::new_pair().0), stopped: false, resting: false, used: None, left: None, first_try: None, metrics: Default::default() }
     }
 
     // A request that has allocated `used` bytes so far (its meter's counter).
