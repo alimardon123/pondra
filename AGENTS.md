@@ -2335,7 +2335,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    named for whom it goes to (`net::Policy`: the lake's nodes, a URL someone other than the admin
    named, this machine's own child, a service someone named), never a client made at its site: the
    policy is the security choice, made once, and a URL a statement names gets its policy from
-   `net::for_endpoint`.
+   `net::for_endpoint`. A store's HTTP client is the same factory's (`Net::connector`, by the same
+   policy), except a lake's own bucket's, which is its budget's (`budget::Budget`).
 
 302. **Every setting is read through `env.rs`, from one table of names** (ADR-061 §8): what the
    process was given (`open`'s options, the command line's flags: `env::give`), else the
@@ -2743,7 +2744,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `harness.py lateral`.
 
 405. **A temporary secret only an admin or the node's owner made reaches past the public internet**
-   (`public.rs`, `ext::temporary`, `For::Public`): anyone else's is refused `PROVIDER credential_chain`
+   (`net::Connector`, `ext::temporary`, `For::Public`): anyone else's is refused `PROVIDER credential_chain`
    (the node's own credentials) and `TYPE kafka` when made. Its stores ask only public addresses: one
    written in the URL or as an endpoint is checked at build and at each statement (`net::check`), a
    name as it resolves (`Names`: refused if any address isn't public), every redirect, and never

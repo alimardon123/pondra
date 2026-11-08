@@ -226,7 +226,6 @@ mod rules;
 #[cfg(feature = "doors")] mod ci;
 #[cfg(feature = "doors")] mod project;
 #[cfg(feature = "lake")] mod protect;
-#[cfg(feature = "lake")] mod public;
 #[cfg(feature = "lake")] mod query;
 #[cfg(feature = "lake")] mod read_iceberg;
 #[cfg(feature = "lake")] mod ranges;
