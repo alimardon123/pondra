@@ -2954,9 +2954,12 @@ impl<T> Parsed<T> {
         same_bytes(held, raw).then(|| m.clone())
     }
 
-    /// Keeps `m`, parsed from `raw`, unless it alone is charged more than the byte bound.
+    /// Keeps `m`, parsed from `raw`, unless it alone is charged more than the byte bound. It keeps its own copy of `raw`: the
+    /// bytes may be a slice of a larger buffer (on a follower, a frame of its leader's commit stream; on a leader, a block the
+    /// store read), and a kept slice holds that whole buffer for as long as the entry lives, far past its charge. Its
+    /// followers' memory grew ~1.7 MB a minute on the 11-07 soak days, by ~17 KB of frame buffer per segment entry kept.
     fn put(&mut self, key: &str, raw: &Bytes, m: &Arc<T>) {
-        let _ = self.by_key.put(key.to_string(), (raw.clone(), m.clone()), (self.charge)(raw.len()));
+        let _ = self.by_key.put(key.to_string(), (Bytes::copy_from_slice(raw), m.clone()), (self.charge)(raw.len()));
     }
 }
 
@@ -2969,9 +2972,8 @@ impl<T: Send + Sync> crate::ledger::Charged for Mutex<Parsed<T>> {
     fn gives_back(&self) -> bool { true }
 }
 
-/// Whether two buffers hold the same bytes. A buffer held by `Parsed` is never freed, and `Bytes` never
-/// change, so the same start and length is the same content; any other pair is compared, which is cheap
-/// next to a parse.
+/// Whether two buffers hold the same bytes. `Bytes` never change, so the same start and length is the same content; any
+/// other pair is compared, which is cheap next to a parse (`Parsed` keeps its own copy, so a lookup compares).
 fn same_bytes(a: &Bytes, b: &Bytes) -> bool {
     (a.as_ptr() == b.as_ptr() && a.len() == b.len()) || a == b
 }
@@ -4239,6 +4241,23 @@ pub fn partitions() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A parsed entry keeps a copy of its raw bytes, never a slice of the buffer they came in: a follower's come in its
+    /// leader's stream frames, and a kept slice would hold the frame's whole buffer while the entry lives (the 11-07 soak
+    /// days' followers grew ~1.7 MB a minute so, with 65,536 segment entries kept). Found again by its bytes.
+    #[test]
+    fn a_parsed_entry_keeps_a_copy_not_the_buffer_it_came_in() {
+        let frame = Bytes::from(vec![7u8; 1 << 20]);
+        let raw = frame.slice(10..90);
+        let mut parsed = Parsed::<u32>::new(4, 1 << 20, |raw| raw);
+        parsed.put("k", &raw, &Arc::new(1));
+        let (held, _) = parsed.by_key.get("k").expect("kept");
+        assert_eq!(held, &raw);
+        assert_ne!(held.as_ptr(), raw.as_ptr(), "its own copy, not a slice of the frame");
+        drop(frame);
+        assert_eq!(parsed.get("k", &raw).as_deref(), Some(&1), "found again by its bytes");
+        assert_eq!(parsed.get("k", &Bytes::from_static(&[8; 80])), None, "other bytes: parsed again");
+    }
 
     #[test]
     fn placed_changes_with_the_order_an_insert_fills() {
