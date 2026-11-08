@@ -10,7 +10,8 @@
 //! The tree passes (`pattern::rewrite`, `pg_casts::rewrite`, `friendly::rewrite`, the measures) are still named in
 //! `front::expand`: they take the host, whose futures aren't boxed yet (step 8's PR 9 brings them here).
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
-use datafusion::sql::sqlparser::ast::Expr;
+use datafusion::sql::sqlparser::ast::{Expr, Statement};
+use datafusion::sql::sqlparser::dialect::Dialect;
 use datafusion::sql::sqlparser::parser::{Parser, ParserError};
 use std::borrow::Cow;
 use std::sync::OnceLock;
@@ -53,6 +54,9 @@ pub struct Parse {
 pub enum Hook {
     /// At the start of an expression (sqlparser's `Dialect::parse_prefix`).
     Prefix(fn(&mut Parser) -> Option<Result<Expr, ParserError>>),
+    /// At the start of a statement (sqlparser's `Dialect::parse_statement`), with the dialect, for a parse of its parts
+    /// in which the other hooks read too.
+    Statement(fn(&dyn Dialect, &mut Parser) -> Option<Result<Statement, ParserError>>),
 }
 
 /// A pass: its name (`module.look`), its place (its run's phase, and its order in it: no two passes of a phase share
@@ -520,6 +524,8 @@ pub(crate) mod tests {
                 (Phase::Wants, "text.names_a_type"),
                 (Phase::Parse, "friendly.comprehension"),
                 (Phase::Parse, "friendly.lambda"),
+                (Phase::Parse, "friendly.pivot"),
+                (Phase::Parse, "friendly.unpivot"),
             ]
         );
     }
