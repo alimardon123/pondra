@@ -265,12 +265,12 @@ fn kinds_of(names: impl Iterator<Item = &'static str>) -> Vec<&'static str> {
 /// takes cache bytes back first, and spills only if they don't come back. Every cache is inside it, except one the user
 /// gave a budget of its own (`Charged::inside`), which keeps that budget beside it with the memory watch behind it. With
 /// `PONDRA_MEMORY_GB` set it is the whole line, queries and caches together, as DuckDB's `memory_limit` is (`hard`): a
-/// spilling operator the caches didn't make room for spills at once. Unset, the queries keep their own line (a third of the
-/// machine's memory, which leaves room for what their reservations don't count, `array_agg` and the like) inside a whole
-/// line at the memory watch's trim line (`oom::trim_line`), and a grow past it takes what the caches give back and goes on
-/// within its share, as before: spilling sooner than today would change what a query does by default. So the budgets no
-/// longer add up past the machine's memory, and a query grows into what the caches hold rather than the watch stopping it
-/// there. What the caches hold is read at the watch's looks (`note`) and lowered by what each grow takes back, so a grow
+/// spilling operator the caches didn't make room for spills at once. Unset, the queries' line is the whole line, at the
+/// memory watch's trim line (`oom::trim_line`, `store::memory_limit`), and a grow past what the caches leave takes what they
+/// give back and goes on within its share: the caches give way to the queries, and what the reservations don't count
+/// (`array_agg` and the like) has the room between the trim line and the stop line. So the budgets no longer add up past
+/// the machine's memory, and a query grows into what the caches hold rather than spilling beside them or the watch
+/// stopping it there. What the caches hold is read at the watch's looks (`note`) and lowered by what each grow takes back, so a grow
 /// reads one number and locks no cache to read it; it takes bytes back only from a cache it finds free
 /// (`Charged::give_back`), and never waits on a reader. Memory that can't spill is held to its share alone on either line.
 ///

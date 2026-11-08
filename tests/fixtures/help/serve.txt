@@ -50,7 +50,7 @@ Options:
           [default: 1000]
 
       --memory-gb <MEMORY_GB>
-          Memory for queries and every cache together, in GB (also PONDRA_MEMORY_GB; default: queries a third of the machine's), except a cache given its own budget (PONDRA_HOT_GB, PONDRA_CACHE_MB, PONDRA_PAGES_MB, PONDRA_FILES_CACHE_MB, PONDRA_FUNCTION_CACHE_MB). A query that needs more takes it from the caches, then sorts, joins and aggregations spill
+          Memory for queries and every cache together, in GB (also PONDRA_MEMORY_GB; default: 72% of the machine's, the caches giving way to queries), except a cache given its own budget (PONDRA_HOT_GB, PONDRA_CACHE_MB, PONDRA_PAGES_MB, PONDRA_FILES_CACHE_MB, PONDRA_FUNCTION_CACHE_MB). A query that needs more takes it from the caches, then sorts, joins and aggregations spill
 
       --retain-secs <RETAIN_SECS>
           Seconds to keep consumed log segments and replaced files before deleting them
