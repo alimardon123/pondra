@@ -155,6 +155,7 @@ pub(crate) fn hosting() -> bool { SUPERVISOR.lock().unwrap_or_else(PoisonError::
 /// A guest's (`Options::guest`) ends with its statement. Every lake the node opens, and its member, is handed it.
 pub struct Native {
     guest: bool,
+    settings: crate::settings::Values, // (the node's, which the processes it starts are handed: `lead_elsewhere`)
 }
 
 /// A node's state as the code below the hosts sees it, with this host's lifecycle: a guest's when `guest`.
@@ -162,7 +163,7 @@ pub fn native(guest: bool) -> Arc<crate::node_state::NodeState> { native_with(gu
 
 /// `native`, the node starting with `settings` (`Options::settings`).
 pub(crate) fn native_with(guest: bool, settings: crate::settings::Values) -> Arc<crate::node_state::NodeState> {
-    crate::node_state::NodeState::starting(Arc::new(Native { guest }), settings)
+    crate::node_state::NodeState::starting(Arc::new(Native { guest, settings: settings.clone() }), settings)
 }
 
 impl crate::lifecycle::Lifecycle for Native {
@@ -177,7 +178,7 @@ impl crate::lifecycle::Lifecycle for Native {
     fn one_off(&self) -> bool { self.guest }
     fn owns_process(&self) -> bool { !hosted() }
     fn program(&self) -> anyhow::Result<PathBuf> { exe() }
-    fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir)) }
+    fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir, &self.settings)) }
 }
 
 /// A page's lifecycle (redesign §8): what ends is the page's member, never its worker. A stop ends the member, which
@@ -279,15 +280,15 @@ pub fn exe() -> anyhow::Result<PathBuf> {
 /// A node never leads another lake itself: that lake's catalog writer would outlive the moment in the node, and a
 /// later leader of it would fence it out.
 #[cfg(feature = "doors")]
-pub async fn lead_once(dir: &str) -> anyhow::Result<()> {
+pub async fn lead_once(dir: &str, values: &crate::settings::Values) -> anyhow::Result<()> {
     // (another process would lead a lake of its own memory, gone when it ends)
     anyhow::ensure!(!crate::memory_lake::in_memory(dir), "{dir} is in a process's memory, where a lake is made by opening it (pondra.open(), pondra :memory:) and led by that process alone: attach or make a database in a folder or a bucket");
-    run::lead_once(dir).await
+    run::lead_once(dir, values).await
 }
 
 /// A page starts no process, so it leads no lake but its own.
 #[cfg(not(feature = "doors"))]
-pub async fn lead_once(_dir: &str) -> anyhow::Result<()> {
+pub async fn lead_once(_dir: &str, _values: &crate::settings::Values) -> anyhow::Result<()> {
     Err(crate::codes::coded("0A000", "a page leads no lake: a browser starts no processes (a node leads one in a process of its own)"))
 }
 

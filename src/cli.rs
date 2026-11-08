@@ -114,6 +114,10 @@ pub(crate) enum Cmd {
         /// node ends, however it ends (a node `connect()` starts beside a Python or JavaScript program, the shell).
         #[arg(long)]
         stop_with_stdin: bool,
+        /// Take the node's settings from the first line of standard input, as the Pondra process that starts it hands them
+        /// (`settings::Line`: the shell's node, `pondra lead`).
+        #[arg(long, hide = true)]
+        settings_stdin: bool,
         /// End, as on SIGTERM, once nobody has used this node for this many seconds and it has
         /// nothing left to tier (also PONDRA_IDLE_EXIT_SECS): no HTTP or Flight request on its way,
         /// no Postgres or Kafka connection open, no run. A platform that starts it again on the next
@@ -209,6 +213,9 @@ pub(crate) enum Cmd {
     Lead {
         #[arg(long)]
         dir: String,
+        /// (as `serve`'s: the node that asks hands it its settings)
+        #[arg(long, hide = true)]
+        settings_stdin: bool,
     },
     /// Run a SQL file — its statements in order, `$name` taking the value of `--name` — on a node
     /// of the lake started for it (`pondra run load.sql lake --day 2026-09-27`), or on a node
@@ -308,6 +315,16 @@ fn run_help(file: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The settings the Pondra process that started this one handed it (`--settings-stdin`, `settings::Line`): the first line
+/// of standard input. Whatever follows it stays in the input's buffer, for `--stop-with-stdin`, which reads the same input
+/// to its end.
+fn take_settings() -> anyhow::Result<()> {
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(|e| anyhow::anyhow!("--settings-stdin: reading standard input: {e}"))?;
+    anyhow::ensure!(line.ends_with('\n'), "--settings-stdin: standard input ended before its line of settings");
+    env::hand(settings::Line::read(&line)?)
+}
+
 /// Ctrl-C, SIGTERM (how schedulers and `kill` stop a process), or with `stdin`, standard input
 /// closing (on every OS alike, and even when the program that started this one was killed).
 pub(crate) async fn stopped(stdin: bool) {
@@ -362,6 +379,14 @@ impl ::log::Log for ErrorLines {
 static ERROR_LINES: ErrorLines = ErrorLines;
 
 pub fn main() {
+    // (a node a Pondra process starts is handed its settings on the first line of its input, before anything here reads
+    // one: the runtime's threads, the memory line. `settings::Line`)
+    if std::env::args().skip(1).any(|a| a == "--settings-stdin") {
+        if let Err(e) = take_settings() {
+            eprintln!("Error: {}", ext::said(&e));
+            std::process::exit(1);
+        }
+    }
     crate::machine::install(std::sync::Arc::new(crate::os::Os::default())); // (the program's machine and network, before anything reads them)
     crate::net::install(std::sync::Arc::new(crate::os::Net::default()));
     if ::log::set_logger(&ERROR_LINES).is_ok() {
@@ -446,7 +471,7 @@ async fn run() -> anyhow::Result<()> {
         return shell::run(&lake).await;
     };
     match cmd {
-        Cmd::Serve { path, dir, databases, default, addr, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, ack, replicas, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, stop_with_stdin, idle_exit, python } => {
+        Cmd::Serve { path, dir, databases, default, addr, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, ack, replicas, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, stop_with_stdin, settings_stdin: _, idle_exit, python } => {
             // The flags that are settings (`settings.rs`) are given to the process at once, before anything reads them, and
             // its children get them too (a folder of lakes' databases, `pondra lead`). A setting not on the command line is
             // the environment's, else its default, as anywhere.
@@ -632,7 +657,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::Lead { dir } => write::lead_only(&dir, &node::native(false)).await?,
+        Cmd::Lead { dir, .. } => write::lead_only(&dir, &node::native(false)).await?,
         Cmd::Backup { lake, to, retention_days } => sql_on_guest(&lake, &backup_sql(&to, retention_days), &[]).await?,
         Cmd::Restore { from, to, at } => {
             let at = at.as_deref().map(backup::instant).transpose()?;

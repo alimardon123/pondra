@@ -1,6 +1,6 @@
 //! Every setting a node reads, through one function from one table (ADR-061 §8; the table is `settings.rs`). A setting is what
-//! the process was given (`open`'s options, the command line's flags), else its environment, and an
-//! empty value is no value. Nothing here sets the environment: in a library the host runs threads of
+//! the process was given (`open`'s options, the command line's flags), else what the Pondra process that started it handed
+//! it (`settings::Line`), else its environment, and an empty value is no value. Nothing here sets the environment: in a library the host runs threads of
 //! its own (Jupyter, any Python), and `set_var` beside them is a data race. The browser has no
 //! environment and reads the same table. `tools/per_node_check.py` fails a `PONDRA_*` name read
 //! anywhere else, and a name read that isn't in the table.
@@ -15,6 +15,10 @@ use Who::*;
 
 /// What the process was given, by its full names, fixed by the first `give`.
 static GIVEN: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+
+/// What the Pondra process that started this one handed it (`settings::Line`), by full names: where its environment's
+/// would be, since that process left none of them there.
+static HANDED: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 
 /// Who a full name is for, or None for a name nothing reads.
 pub fn who(name: &str) -> Option<Who> {
@@ -47,11 +51,23 @@ pub fn give<K: AsRef<str>, V: Into<String>>(options: impl IntoIterator<Item = (K
     Ok(())
 }
 
-/// A setting, or None: what the process was given (empty there is None too, the environment unread),
-/// else the environment.
+/// Takes the settings the process that started this one handed it (`settings::Line`, read by `Line::read`), once and
+/// before anything reads one.
+pub fn hand(values: BTreeMap<String, String>) -> anyhow::Result<()> {
+    anyhow::ensure!(HANDED.set(values).is_ok(), "a process is handed its settings once");
+    Ok(())
+}
+
+/// What the process was given or handed for `name`, if either holds it (an empty value is there too: unset).
+fn held(name: &str) -> Option<&'static String> {
+    GIVEN.get().and_then(|g| g.get(name)).or_else(|| HANDED.get().and_then(|h| h.get(name)))
+}
+
+/// A setting, or None: what the process was given, else handed (empty there is None too, the environment unread), else
+/// the environment.
 pub fn get(name: &str) -> Option<String> {
     debug_assert!(who(name).is_some(), "{name} isn't in settings.rs");
-    match GIVEN.get().and_then(|g| g.get(name)) {
+    match held(name) {
         Some(v) => Some(v.clone()),
         None => std::env::var(name).ok(),
     }
@@ -61,7 +77,7 @@ pub fn get(name: &str) -> Option<String> {
 /// A setting that may be a path in the environment's own encoding (a folder, a list of files).
 pub fn os(name: &str) -> Option<OsString> {
     debug_assert!(who(name).is_some(), "{name} isn't in settings.rs");
-    match GIVEN.get().and_then(|g| g.get(name)) {
+    match held(name) {
         Some(v) => Some(OsString::from(v)),
         None => std::env::var_os(name),
     }
@@ -181,10 +197,11 @@ pub fn is_set(name: &str) -> bool {
     get(name).is_some()
 }
 
-/// What the process was given, for the Pondra processes it starts (a folder of lakes' databases,
-/// `pondra lead`, the program run again to rejoin): as their environment, they read what it reads.
+/// What the process was handed and given (the given last, which wins), for the Pondra processes it starts with an
+/// environment (a folder of lakes' databases, the program run again to rejoin): as their environment, they read what it
+/// reads. One started with a line takes its node's (`settings::Line`).
 pub fn given() -> impl Iterator<Item = (&'static String, &'static String)> {
-    GIVEN.get().into_iter().flatten()
+    HANDED.get().into_iter().flatten().chain(GIVEN.get().into_iter().flatten())
 }
 
 /// `memory_gb`, `memory-gb` and `PONDRA_MEMORY_GB` are one name: the last.

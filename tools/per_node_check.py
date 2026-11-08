@@ -65,6 +65,7 @@ PROCESS = {
     "ledger.rs:ROOTS": "the process's memory, every node's budget held on it (redesign step 2, review change 4): one root for the sizes its machine and settings gave, so one in any process but a test's",
     "library.rs:R": "a library's runtime, kept for the next open: its threads are the process's, as the queries' runtime's are",
     "env.rs:GIVEN": "what the process was given (open's options, the command line's flags): fixed by its first open (ADR-061 §8)",
+    "env.rs:HANDED": "what the Pondra process that started this one handed it (`settings::Line`), read once before anything: where its environment's would be",
     "ext.rs:BLOB": "a page's store of its tab's blob: URLs, the browser's fetch (`blob_with`): set once a module, as its allocator is",
     "engine.rs:SUBSTR": "a function's definition",
     "fit.rs:ANALYZER": "the analyzer's rules, DataFusion's and Pondra's, for a point change's SET: no state, nothing of a lake",

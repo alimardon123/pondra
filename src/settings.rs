@@ -15,7 +15,7 @@ pub enum Who {
     /// The command line's own (`pondra sql`, the project commands): the environment only.
     Command,
     /// Set by the program that starts a node (the shell, `connect()`, a folder of lakes, a service
-    /// manager): the environment only.
+    /// manager): its environment, or the line a Pondra process hands the node it starts (`Line`).
     Starter,
     /// A test's hook into the node: the environment only, and left out of the docs.
     Test,
@@ -412,6 +412,55 @@ impl Values {
     pub(crate) fn of(values: &[(&'static str, &str)]) -> Values { Values(values.iter().map(|(k, v)| (*k, v.to_string())).collect()) }
 }
 
+/// What a Pondra process hands one it starts as its settings (`pondra serve --settings-stdin`, `pondra lead`): one JSON
+/// object of names and values, the first line of the child's standard input, taken before anything in it reads a setting
+/// (`env::hand`). It holds every setting but the command line's: the node's `Values`, and the process's own
+/// (`Scope::Process`), which the child, a process of its own, takes as its first open. The child's environment holds none of
+/// these names (`hand`), so a setting the line leaves out reaches it no other way.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Line(std::collections::BTreeMap<&'static str, String>);
+
+impl Line {
+    /// A node's values and its process's own settings now.
+    pub fn of(values: &Values) -> Line {
+        let process = all().iter().filter(|s| s.scope == Scope::Process).filter_map(|s| crate::env::get(s.var).map(|v| (s.var, v)));
+        Line(values.0.clone().into_iter().chain(process).collect())
+    }
+
+    /// With a setting of the child's own: the shell's key for its node, the places `pondra lead` reaches.
+    pub fn with(mut self, var: &'static str, value: impl Into<String>) -> Line {
+        debug_assert!(find(var).is_some_and(|s| s.who != Who::Command), "{var} isn't a setting a line carries");
+        self.0.insert(var, value.into());
+        self
+    }
+
+    /// Readies a process about to start (its `serve` or `lead` arguments given) to take this line, and gives the line to
+    /// write to its standard input once it has started: `--settings-stdin`, its input a pipe, and none of a line's names in
+    /// its environment (`env_clear` would take PATH and the rest with them).
+    pub fn hand(&self, cmd: &mut std::process::Command) -> String {
+        cmd.arg("--settings-stdin").stdin(std::process::Stdio::piped());
+        for s in all().iter().filter(|s| s.who != Who::Command) {
+            cmd.env_remove(s.var);
+        }
+        serde_json::to_string(&self.0).expect("names and text") + "\n"
+    }
+
+    /// A line as its child reads it, by full names: refused, naming why, unless it is one object of text values whose
+    /// names are all a line's.
+    pub fn read(text: &str) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        let values: std::collections::BTreeMap<String, String> = serde_json::from_str(text.trim_end())
+            .map_err(|e| anyhow::anyhow!("--settings-stdin: the first line of standard input isn't one JSON object of names and text values ({e})"))?;
+        for name in values.keys() {
+            match find(name).map(|s| s.who) {
+                Some(Who::Command) => anyhow::bail!("--settings-stdin: {name} is the command line's, not handed to a node"),
+                None => anyhow::bail!("--settings-stdin: {name} isn't a setting of this build"),
+                Some(_) => {}
+            }
+        }
+        Ok(values)
+    }
+}
+
 /// Every setting of this build, in the order its extensions added them.
 pub fn all() -> &'static [Setting] {
     &crate::registry::get().section::<Settings>().all
@@ -447,6 +496,38 @@ mod tests {
         let off = crate::node_state::NodeState::starting(crate::lifecycle::unhosted(), Values::of(&[("PONDRA_SERVE_STORE", "0")]));
         assert!(on.settings.flag("PONDRA_SERVE_STORE") && !off.settings.flag("PONDRA_SERVE_STORE"));
         assert!(off.settings.is_set("PONDRA_SERVE_STORE") && !Values::default().is_set("PONDRA_SERVE_STORE"));
+    }
+
+    /// A line holds a node's values and a setting of the child's own, reads back as one object by full names, and
+    /// leaves the child's environment none of a line's names.
+    #[test]
+    fn a_line_is_the_childs_settings_alone() {
+        let line = Line::of(&Values::of(&[("PONDRA_MEMORY_GB", "2")])).with("PONDRA_OWNER_KEY", "a-key-of-sixteen-chars");
+        let mut cmd = std::process::Command::new("pondra");
+        cmd.args(["serve", "--lake", "l"]).env("PONDRA_MEMORY_GB", "9").env("PONDRA_SPILL_GB", "1").env("PONDRA_JOB", "j").env("PATH", "/bin");
+        let text = line.hand(&mut cmd);
+        assert!(text.ends_with('\n') && text.trim_end().lines().count() == 1, "one line: {text}");
+        let read = Line::read(&text).unwrap();
+        assert_eq!(read.get("PONDRA_MEMORY_GB").map(String::as_str), Some("2"));
+        assert_eq!(read.get("PONDRA_OWNER_KEY").map(String::as_str), Some("a-key-of-sixteen-chars"));
+        assert!(read.keys().all(|k| find(k).is_some_and(|s| s.who != Who::Command)));
+        assert_eq!(cmd.get_args().last().and_then(|a| a.to_str()), Some("--settings-stdin"));
+        let envs: std::collections::BTreeMap<_, _> = cmd.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect();
+        assert_eq!(envs["PONDRA_MEMORY_GB"], None, "a line's names leave the child's environment");
+        assert_eq!(envs["PONDRA_SPILL_GB"], None, "even one the line leaves out");
+        assert_eq!((envs["PONDRA_JOB"].as_deref(), envs["PATH"].as_deref()), (Some("j"), Some("/bin")), "the rest stay");
+    }
+
+    /// A child refuses a line that isn't one, naming why: not an object, a value that isn't text, the command line's
+    /// setting, a name nothing reads.
+    #[test]
+    fn a_line_refuses_what_isnt_a_childs_setting() {
+        let why = |text: &str| Line::read(text).expect_err(text).to_string();
+        assert!(why("not json\n").contains("isn't one JSON object"));
+        assert!(why("{\"PONDRA_MEMORY_GB\": 2}\n").contains("text values"));
+        assert!(why("{\"PONDRA_JOB\": \"1\"}\n").contains("PONDRA_JOB is the command line's"));
+        assert!(why("{\"PONDRA_NOTHING_AT_ALL\": \"1\"}\n").contains("PONDRA_NOTHING_AT_ALL isn't a setting"));
+        assert_eq!(Line::read("{}\n").unwrap().len(), 0);
     }
 
     #[test]
