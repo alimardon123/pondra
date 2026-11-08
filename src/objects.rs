@@ -160,6 +160,10 @@ impl Kinds {
 /// The objects' own records beside their kinds' (`records`).
 pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "cm/", owner: "objects", holds: "comments: on an object (cm/kind/name) or a column (cm/column/table/column)" }];
 
+/// The kinds' prefixes whose records say who may do what: users and roles (with their grants, passwords and tokens) and
+/// identity providers. A commit writing one moves the catalog's rights version (`records::Rights`).
+pub const RIGHTS: &[&str] = &["u/", "ip/"];
+
 /// The extension that adds the core's kinds.
 pub static CATALOG: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "catalog",
@@ -173,6 +177,7 @@ pub static CATALOG: crate::registry::BuiltIn = crate::registry::BuiltIn {
         for p in [crate::records::PREFIXES, crate::store::PREFIXES, crate::log::PREFIXES, crate::format::PREFIXES, crate::replica::PREFIXES, PREFIXES] {
             prefixes.add(p);
         }
+        r.section_mut::<crate::records::Rights>().add(RIGHTS);
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "kinds", columns: COLUMNS, rows });
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "prefixes", columns: crate::records::COLUMNS, rows: crate::records::rows });
     },

@@ -3188,7 +3188,7 @@ pub struct Catalog {
     follows: bool,                // follower / read-only node that gets the commit stream
     mirror: AtomicBool,           // the overlay holds the whole catalog (but inline data): read only it
     loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
-    rights: AtomicU64,            // the last commit that changed who may do what (`RIGHTS`, `rights_version`)
+    rights: AtomicU64,            // the last commit that changed who may do what (`moves_rights`, `rights_version`)
     metas: Arc<Mutex<Parsed<TableMeta>>>, // tables' entries as parsed (`parsed`)
     segs: Arc<Mutex<Parsed<Segment>>>,    // log segments' entries as parsed (`segments`)
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
@@ -3234,13 +3234,13 @@ impl Delta {
 /// A commit's key that says nothing a read sees changed (retention's marks: `tier::expire`).
 pub const QUIET: &str = "quiet";
 
-/// The keys a principal is made from: users, roles, their grants, passwords and tokens (`users::user_key`), identity
-/// providers (`sso::key`), the lake's own signing keys (`users::KEYS`) and its mark of being served with tokens
-/// (`users::SIGNED`). A commit that puts or deletes one moves the rights version (`Catalog::rights_version`).
-const RIGHTS: [&str; 4] = ["u/", "ip/", "z/auth", "z/signed"];
-
-/// Does a commit change who may do what (`RIGHTS`)?
-fn moves_rights(d: &Delta) -> bool { d.puts.iter().map(|(k, _)| k).chain(&d.deletes).any(|k| RIGHTS.iter().any(|r| k.starts_with(r))) }
+/// Does a commit change who may do what? It does when it puts or deletes a key a principal is made from, which its owner
+/// marks as it registers its prefix (`records::Rights`): this floor names none of them. The rights version moves then
+/// (`Catalog::rights_version`).
+fn moves_rights(d: &Delta) -> bool {
+    let Some(rights) = crate::registry::get().find::<crate::records::Rights>() else { return false };
+    d.puts.iter().map(|(k, _)| k).chain(&d.deletes).any(|k| rights.moves(k))
+}
 
 /// The node's own records, which its writer appends (`history::writer`) and no remembered answer
 /// reads (`App::remembers`): the statements' history and the audit log.
@@ -3750,7 +3750,7 @@ impl Catalog {
         }
     }
 
-    /// The rights version: the last commit that changed who may do what (`RIGHTS`), or that may have (commits that never
+    /// The rights version: the last commit that changed who may do what (`moves_rights`), or that may have (commits that never
     /// arrived, a snapshot read whole). A session makes its principal again when this moved since the principal was made
     /// (`auth::Principal::epoch`): one load at each statement, and no timer.
     pub fn rights_version(&self) -> u64 { self.rights.load(Relaxed) }

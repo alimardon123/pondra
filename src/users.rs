@@ -28,6 +28,8 @@ pub const PREFIXES: &[crate::records::Prefix] = &[
     crate::records::Prefix { prefix: KEYS, owner: "users", holds: "the lake's own keys: sessions' signing key, and the nodes' key" },
     crate::records::Prefix { prefix: SIGNED, owner: "users", holds: "set once the lake has been served with tokens" },
 ];
+/// Those that say who may do what (both): a commit writing one moves the catalog's rights version (`records::Rights`).
+pub const RIGHTS: &[&str] = &[KEYS, SIGNED];
 /// The names the three tokens sign in as over Postgres and Kafka: no user may take them.
 pub const BUILT_IN: [&str; 3] = ["admin", "writer", "reader"];
 
