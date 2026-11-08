@@ -5702,4 +5702,18 @@ mod tests {
         assert!(!ttl(864_000).past_ttl(&date, now)?, "ten days' TTL keeps it");
         Ok(())
     }
+
+    /// Two nodes that open one lake in memory share its store, and each counts only its own requests (`counted`).
+    #[tokio::test]
+    async fn two_opens_of_one_store_count_apart() {
+        let url = format!("memory://counted-{}", uuid::Uuid::new_v4().simple());
+        let held = crate::memory_lake::store(&url);
+        let (one, other) = (NodeState::unhosted(), NodeState::unhosted());
+        let (a, b) = (counted(held.clone(), &one.metrics), counted(held, &other.metrics));
+        a.put(&Path::from("x"), Bytes::from_static(b"1").into()).await.unwrap();
+        assert_eq!(&b.get(&Path::from("x")).await.unwrap().bytes().await.unwrap()[..], b"1", "one store under both");
+        let counts = |n: &NodeState| (n.metrics.object_writes.load(Relaxed), n.metrics.object_reads.load(Relaxed));
+        assert_eq!((counts(&one), counts(&other)), ((1, 0), (0, 1)));
+        crate::memory_lake::forget_memory(&url);
+    }
 }
