@@ -1070,7 +1070,7 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
 }
 
 /// `DROP TABLE`: the table leaves the catalog at once. Refused while a view or task reads it or it
-/// is a view's own. It is kept to be undropped for its `retention` (a day unless set: ADR-043),
+/// is a view's own. It is kept to be undropped for its `retention` (7 days unless set: ADR-043),
 /// its rows in the log sent to files first, so nothing of it is left in a log that moves on; with
 /// PURGE, or `retention = '0 seconds'`, it isn't, and its files go once a day old
 /// (`tier::collect_orphans`). It leaves the shares that hand it out (`shares::tables_moved`).
@@ -1185,7 +1185,7 @@ pub(crate) fn left_shares(mut out: Value, shares: Vec<String>) -> Value {
 }
 
 /// How long a table's past is kept unless its `retention` says: read as it was, or undropped.
-pub const KEEP_MS: u64 = 24 * 3_600_000;
+pub const KEEP_MS: u64 = 7 * 24 * 3_600_000; // (7 days, as Delta keeps a table's past; a day before 2026-11-08)
 
 /// A dropped table, kept while it can be undropped (`dt/{name}/{at_ms}`, ADR-043): its entries as
 /// they were when it was dropped, every row in files. `tier::expire` lets it go after `keep_ms`;
