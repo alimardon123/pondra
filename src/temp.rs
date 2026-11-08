@@ -355,7 +355,7 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool, scope: &crate::right
                 return Ok(Some(j!({"view": name, "temporary": true, "exists": true}))); // (IF NOT EXISTS)
             }
             ensure!(*replace || !has(&s, name, false), "temporary view {name} exists (CREATE OR REPLACE TEMP VIEW replaces it)");
-            let expanded = crate::routines::expand_temp_view(&app.lake, sql).await.with_context(|| format!("temporary view {name}"))?; // (as it is read: its functions' bodies in their places, `query.rs`)
+            let expanded = crate::routines::expand_temp_view(&app.lake, sql, scope).await.with_context(|| format!("temporary view {name}"))?; // (as it is read: its functions' bodies in their places, `query.rs`)
             crate::engine::sql(&crate::query::session_for(&app.lake, &expanded, "", None, scope).await?, &crate::sys::planned(&expanded)?).await.with_context(|| format!("temporary view {name}"))?; // (it plans)
             with(&s, true, |x| Ok(x.views.insert(name.clone(), sql.clone())))?;
             return Ok(Some(j!({"view": name, "temporary": true})));

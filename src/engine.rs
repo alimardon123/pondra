@@ -33,7 +33,7 @@ pub fn with_catalog(mut state: datafusion::execution::SessionState, catalog: Arc
 
 /// `ctx`, which reads files by their path or URL as tables (`FROM 'jan.parquet'`): DataFusion's `enable_url_table`,
 /// with the session's own state changed in place, where DataFusion builds the whole state again (7% of a short
-/// query). Every caller's session is its statement's own (`query::session`), so no other session sees the change.
+/// query). Every caller's session is its statement's own (`query::session_for`), so no other session sees the change.
 pub fn with_files(ctx: SessionContext) -> SessionContext {
     use datafusion::catalog::{DynamicFileCatalog, UrlTableFactory};
     let factory = Arc::new(datafusion::datasource::dynamic_file::DynamicListTableFactory::new(Default::default()));
@@ -49,7 +49,7 @@ pub fn with_files(ctx: SessionContext) -> SessionContext {
 
 /// The session every query starts from: DataFusion's, with Pondra's rules and planners, and every function set in the
 /// registry (`Functions`): the engine's own, Spark's, Postgres's, MATCH_RECOGNIZE's, the AI functions. A node's
-/// statements add the lake's own (`Lake::made`, `query::session_at`).
+/// statements add the lake's own (`Lake::made`, `query::session_for`).
 pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     let config = crate::optimize::config(config.with_information_schema(true));
     let state = SessionStateBuilder::new().with_config(config).with_runtime_env(rt).with_default_features();

@@ -401,7 +401,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool, scope: &cra
         rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: scope.shows_code().then(|| crate::views::shown(&v.sql)), identity: Default::default(), constraints: scope.shows_code().then(|| v.facts.clone()).unwrap_or_default(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
     }
     // A user granted some tables sees those, and of one granted by columns those columns, as at every other
-    // listing (`ddl::listed`, invariant 382). Postgres's pg_class names every table; Pondra names none its
+    // listing (`ddl::listed_for`, invariant 382). Postgres's pg_class names every table; Pondra names none its
     // reader may not read, so a BI tool's table list is the user's.
     if !scope.whole() {
         rels.retain_mut(|r| match scope.columns(&crate::text::join(&r.schema, &r.name)) {

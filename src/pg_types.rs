@@ -74,13 +74,13 @@ fn marked(schema: &SchemaRef, marks: &[Option<Ty>]) -> SchemaRef {
 /// The shape of the answer `sql` gives: which types its columns are, in order (a query's, or a write's
 /// RETURNING; none when none is, or when it can't tell), and the Postgres names of its columns. A catalog
 /// query gets names only, as before: its types are never traced. The statement is parsed once for both.
-pub async fn columns(lake: &Lake, sql: &str) -> Shape {
+pub async fn columns(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Shape {
     let Some(stmt) = one(sql) else { return Shape::default() };
     let names = pg_names::of(&stmt);
     if crate::pg_catalog::wanted(sql) {
         return Shape { types: vec![], names };
     }
-    let known = known(lake, &stmt).await;
+    let known = known(&crate::host::Asking::of(lake, scope), &stmt).await; // (names and types, traced for the asker)
     let types: Vec<Option<Ty>> = Trace::new(&known).statement(&stmt).map(|c| c.into_iter().map(|(_, t)| t).collect()).unwrap_or_default();
     Shape { types, names }
 }
@@ -88,11 +88,11 @@ pub async fn columns(lake: &Lake, sql: &str) -> Shape {
 /// Which of `sql`'s parameters are uuids, by their number less one (`$1` is 0): one cast to uuid, one
 /// a uuid column is compared with in any expression (a WHERE, a join's ON, an item, a CASE), an INSERT's
 /// value for a uuid column, an UPDATE's `SET c = $1`.
-pub async fn params(lake: &Lake, sql: &str) -> Vec<usize> {
+pub async fn params(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Vec<usize> {
     if !sql.contains('$') {
         return vec![];
     }
-    let Some((stmt, known)) = read(lake, sql).await else { return vec![] };
+    let Some((stmt, known)) = read(lake, sql, scope).await else { return vec![] };
     let t = Trace::new(&known);
     t.statement(&stmt);
     let _ = crate::walk::visit_expressions(&stmt, |e| {
@@ -108,11 +108,11 @@ pub async fn params(lake: &Lake, sql: &str) -> Vec<usize> {
 
 /// `sql` parsed, with the columns of every table and view it names. None for one with nothing to trace:
 /// a query of Postgres's catalog (never a uuid there), or one that doesn't parse as one statement.
-async fn read(lake: &Lake, sql: &str) -> Option<(Statement, Known)> {
+async fn read(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Option<(Statement, Known)> {
     if crate::pg_catalog::wanted(sql) {
         return None;
     }
     let stmt = one(sql)?;
-    let known = known(lake, &stmt).await;
+    let known = known(&crate::host::Asking::of(lake, scope), &stmt).await; // (names and types, traced for the asker)
     Some((stmt, known))
 }

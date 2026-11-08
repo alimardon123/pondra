@@ -84,7 +84,7 @@ async fn space(app: &crate::app::App, ns: &str) -> Result<(Vec<String>, std::syn
 }
 
 /// The namespaces the caller may see: an attached lake's only as `space` would open them (under its own sign-in, and
-/// not for a user granted some tables), as SQL's listings (`ddl::listed`, S27).
+/// not for a user granted some tables), as SQL's listings (`ddl::listed_for`, S27).
 async fn namespaces(axum::extract::State(app): axum::extract::State<crate::app::App>) -> axum::Json<Value> {
     let mut seen = vec![];
     for (parts, lake, _) in spaces(&app).await {

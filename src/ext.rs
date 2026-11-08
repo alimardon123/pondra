@@ -183,7 +183,7 @@ pub async fn view_write(lake: &Lake, stmt: &crate::write::Stmt, scope: &crate::r
         Stmt::InsertInto(_, n, q) => (q, n.clone()),
         _ => bail!("{name} is a view of files (CREATE EXTERNAL TABLE): UPDATE, DELETE and ALTER change a lake's tables; INSERT adds a file to a view of a folder"),
     };
-    let expanded = crate::routines::expand_stored(lake, &view.sql).await?;
+    let expanded = crate::routines::expand_stored(lake, &view.sql, scope).await?;
     let spec = match &self::names(&expanded)[..] {
         [one] => spec(one).context("its files")?,
         _ => bail!("{name}: a view of several reads"),
@@ -1948,10 +1948,11 @@ mod tests {
     /// One statement as `pondra sql` runs it (`cli.rs`), for a caller that is the program that started the node or not:
     /// its rows, or its error.
     async fn run(lake: &Lake, owner: bool, sql: &str) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
-        let expanded = crate::routines::expand(lake, sql).await?;
+        let node = &crate::auth::Principal::node().scope;
+        let expanded = crate::routines::expand(lake, sql, node).await?;
         let planned = crate::sys::planned(&expanded)?;
         scope(owner, async {
-            anyhow::Ok(crate::engine::with_files(crate::query::session(lake, &expanded, "").await?).sql(&planned).await?.collect().await?)
+            anyhow::Ok(crate::engine::with_files(crate::query::session_for(lake, &expanded, "", None, node).await?).sql(&planned).await?.collect().await?)
         })
         .await
     }

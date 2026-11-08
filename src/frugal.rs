@@ -122,7 +122,7 @@ fn rewritten(plan: &LogicalPlan, config: &dyn OptimizerConfig) -> Result<Option<
         return Ok(None);
     }
     let Some((keys, calls)) = whole(window) else { return Ok(None) };
-    // The input is read twice (`build`), both reads at the one end the session fixed (`session_at`, invariant 265),
+    // The input is read twice (`build`), both reads at the one end the session fixed (`session_for`, invariant 265),
     // so under ingest they see the same commit.
     if any_node(plan, differs_by_reading)? {
         return Ok(None);
@@ -191,7 +191,7 @@ fn read_alone(plan: &LogicalPlan) -> Result<bool> {
 }
 
 /// Whether a scan, read a second time, gives the same rows as cheaply: one of the lake's own tables, which a query reads
-/// as of one commit however often it reads it (`session_at`, invariant 265), from its hot columns once they are read; or
+/// as of one commit however often it reads it (`session_for`, invariant 265), from its hot columns once they are read; or
 /// a table held in memory. Files named by path or URL (`read_parquet('s3://…/*')`, a CSV folder, a web page) are
 /// fetched again, so a window over them that has the memory it needs is cheaper left as it is (audit 11-01 M12); the
 /// frugal retry still rewrites it, as one listing serves the whole statement (`ext::LISTED`).

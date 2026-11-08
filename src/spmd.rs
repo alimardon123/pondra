@@ -512,23 +512,24 @@ async fn planned(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn Exec
 /// The slice's query, its tables standing for just their parts.
 async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::prelude::DataFrame)> {
     // (as the node's own: a query spreads only when its caller sees everything, `App::here_only`)
-    let ctx = session_for(lake, &s.sql, "", None, &crate::auth::Principal::node().scope).await?;
+    let node = &crate::auth::Principal::node().scope;
+    let ctx = session_for(lake, &s.sql, "", None, node).await?;
     // The whole tables, log tails and changed rows (`{t}$deleted`) as the coordinator saw them:
     // this node must have seen the log that far.
     let mut hwm = lake.hwm.subscribe();
     let _ = tokio::time::timeout(Duration::from_secs(10), async { while lake.visible() < s.upto && hwm.changed().await.is_ok() {} }).await;
     ensure!(lake.visible() >= s.upto, "this node is behind the lake ({} < {})", lake.visible(), s.upto);
-    let views = crate::query::stored_views(lake, &s.sql, false).await?;
+    let views = crate::query::stored_views(lake, &s.sql, false, node).await?;
     let text = views.iter().fold(s.sql.clone(), |t, (_, v)| format!("{t} {v}"));
-    let deleted = crate::query::names_deleted(&text); // (as `session_at` decides)
-    let sys_cols = crate::sys::mentioned(&text); // (a query naming `_row_id`: its tables get their system columns, as `session_at` gives them)
+    let deleted = crate::query::names_deleted(&text); // (as `session_for` decides)
+    let sys_cols = crate::sys::mentioned(&text); // (a query naming `_row_id`: its tables get their system columns, as `session_for` gives them)
     let sys = |m: TableMeta| if sys_cols { crate::sys::with_sys(&m) } else { m };
     {
         for (t, meta) in &s.whole {
             let meta = Arc::new(sys(meta.clone()));
             let mut inner = crate::query::named(&ctx, crate::query::table_view_once(lake, &ctx, t, meta.clone(), Some(s.upto)).await?, &meta, deleted)?;
             if let Some(h) = &meta.history {
-                inner = crate::views::history_view(&ctx, inner, h, sys_cols).await?; // (as `session_at` reads it)
+                inner = crate::views::history_view(&ctx, inner, h, sys_cols).await?; // (as `session_for` reads it)
             }
             ctx.deregister_table(table_ref(t))?;
             ctx.register_table(table_ref(t), Arc::new(WholeTable { inner, name: t.clone(), size: totals(&meta) }))?;
@@ -577,7 +578,7 @@ async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::p
         ctx.deregister_table(table_ref(&p.table))?;
         ctx.register_table(table_ref(&p.table), table)?;
     }
-    crate::query::register_views(&ctx, crate::query::stored_views(lake, &s.sql, false).await?, true, false).await?; // (over the shares)
+    crate::query::register_views(&ctx, crate::query::stored_views(lake, &s.sql, false, node).await?, true, false).await?; // (over the shares)
     let df = crate::engine::sql(&ctx, &s.sql).await?;
     Ok((ctx, df))
 }
@@ -1510,7 +1511,7 @@ impl ExecutionPlan for Received {
 async fn read(lake: &Lake, sql: &str) -> Result<Option<Vec<String>>> {
     let Some(named) = tables(sql) else { return Ok(None) };
     let mut out = vec![];
-    for (_, v) in crate::query::stored_views(lake, sql, false).await? {
+    for (_, v) in crate::query::stored_views(lake, sql, false, &crate::auth::Principal::node().scope).await? { // (the node's own, as `shared`: names, never rows)
         out.extend(tables(&v).unwrap_or_default());
     }
     let mut seen = std::collections::HashSet::new();

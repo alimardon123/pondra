@@ -19,6 +19,7 @@
 //! - **A script** is several statements with `$name` parameters: a request to `POST /sql`, a file
 //!   `pondra run` sends, a procedure's body (`split`, `prepare`, then `one` each in turn).
 use crate::auth::Role;
+use crate::rights::Scope;
 use crate::ddl::Ddl;
 use crate::app::App;
 use crate::store::{json, Lake};
@@ -453,7 +454,7 @@ pub async fn listed(lake: &Lake) -> Result<Arc<HashMap<String, Routine>>> {
 /// values, or `{"sql": "…"}` for an expression), macro calls replaced by their bodies, and the
 /// request's own `views` (a client's frames, by name) by theirs. Text that needs none of it is
 /// left as it is (and so is text sqlparser can't read).
-pub async fn prepare(lake: &Lake, sql: &str, params: &HashMap<String, Value>, views: &HashMap<String, String>) -> Result<String> {
+pub async fn prepare(lake: &Lake, sql: &str, params: &HashMap<String, Value>, views: &HashMap<String, String>, scope: &Scope) -> Result<String> {
     let values = crate::vars::values(params); // (the variables there are, the values given over them: `vars.rs`)
     let numbered = values.keys().any(|k| k.starts_with(|c: char| c.is_ascii_digit())); // ($1 only when given: else a PREPARE's own)
     let sql = match crate::vars::uses(sql) || !values.is_empty() && sql.contains('$') { // (a value given may be for spark_sql('…')'s text)
@@ -465,7 +466,7 @@ pub async fn prepare(lake: &Lake, sql: &str, params: &HashMap<String, Value>, vi
     };
     let sql = crate::path::door(lake, &sql, &views.keys().cloned().collect()).await?; // (the session's search path: `path.rs`; a client's frames are views, not tables)
     // (a macro's body brings its `current_*` in as its caller's session has them: `door` kept them in its body)
-    Ok(crate::path::currents(lake, &crate::front::expand(lake, &sql, views).await?))
+    Ok(crate::path::currents(lake, &crate::front::expand(&crate::host::Asking::of(lake, scope), &sql, views).await?))
 }
 
 /// Is `sql` a `CREATE` of a task, procedure, function or macro? Its `$name`s are its own
@@ -608,10 +609,10 @@ fn quote(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
 ///
 /// The current session's search path is written in first (`path.rs`), so every door, a task's body
 /// and a spread query see full names. Stored SQL is read with `expand_stored` instead.
-pub async fn expand(lake: &Lake, sql: &str) -> Result<String> {
+pub async fn expand(lake: &Lake, sql: &str, scope: &Scope) -> Result<String> {
     crate::dialect_stmts::hint_refused(sql)?; // (MySQL's `/*! … */`, before the path prints the text back without it: 11-07 audit M2)
     let sql = crate::path::door(lake, sql, &std::collections::HashSet::new()).await?;
-    Ok(crate::path::currents(lake, &crate::front::expand(lake, &sql, &HashMap::new()).await?)) // (a macro's `current_*`: its caller's, as `prepare`)
+    Ok(crate::path::currents(lake, &crate::front::expand(&crate::host::Asking::of(lake, scope), &sql, &HashMap::new()).await?)) // (a macro's `current_*`: its caller's, as `prepare`)
 }
 
 /// `expand` for SQL that is already stored (a view's, a file's query): read as it was made, without
@@ -619,13 +620,13 @@ pub async fn expand(lake: &Lake, sql: &str) -> Result<String> {
 /// path reads `t` as public, whoever reads it. Its `current_schema()` and the like are its reader's
 /// (`path::currents`), as Postgres reads a view's. Its functions are the lake's: a session's temporary one of the same
 /// name never changes it (`temp::stored`), so it reads the same for every reader and may be kept for them.
-pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> { crate::temp::stored(read_stored(lake, sql)).await }
+pub async fn expand_stored(lake: &Lake, sql: &str, scope: &Scope) -> Result<String> { crate::temp::stored(read_stored(lake, sql, scope)).await }
 
 /// `expand_stored` for a temporary view: the session's own, so it calls the session's temporary functions too.
-pub async fn expand_temp_view(lake: &Lake, sql: &str) -> Result<String> { read_stored(lake, sql).await }
+pub async fn expand_temp_view(lake: &Lake, sql: &str, scope: &Scope) -> Result<String> { read_stored(lake, sql, scope).await }
 
-async fn read_stored(lake: &Lake, sql: &str) -> Result<String> {
-    Ok(crate::path::currents(lake, &crate::front::expand(lake, &crate::path::currents(lake, sql), &HashMap::new()).await?))
+async fn read_stored(lake: &Lake, sql: &str, scope: &Scope) -> Result<String> {
+    Ok(crate::path::currents(lake, &crate::front::expand(&crate::host::Asking::of(lake, scope), &crate::path::currents(lake, sql), &HashMap::new()).await?))
 }
 
 /// `SHOW <kind>s [LIKE 'pattern']` for a kind an extension adds (`objects::Kind::shown`: `SHOW CONNECTIONS`): its
@@ -1134,7 +1135,7 @@ async fn prepared(app: &App, name: &str, args: &[FunctionArg], who: Who) -> Resu
         false => {
             let about = || format!("{name}'s arguments");
             // (made ready as SQL that comes in, as a variable's value is: a cast to jsonb or uuid is the one the lake holds)
-            let sql = prepare(&app.lake, &format!("SELECT {}", select.collect::<Vec<_>>().join(", ")), &HashMap::new(), &HashMap::new()).await.with_context(about)?;
+            let sql = prepare(&app.lake, &format!("SELECT {}", select.collect::<Vec<_>>().join(", ")), &HashMap::new(), &HashMap::new(), &who.scope).await.with_context(about)?;
             let rows = app.query(&sql, Some("0"), &who.scope).await.with_context(about)?;
             datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?
         }
@@ -1299,34 +1300,34 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
 
 /// Does `sql` call a Python function that may answer differently each time (so its result mustn't
 /// be remembered)? In a view it reads too.
-pub async fn volatile(lake: &Lake, sql: &str) -> bool {
+pub async fn volatile(lake: &Lake, sql: &str, scope: &Scope) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
-    if crate::extension::calls(lake, sql, |f| f.volatile).await {
+    if crate::extension::calls(lake, sql, |f| f.volatile, scope).await {
         return true; // (an extension's function that says it may answer the same arguments differently: `extension.rs`)
     }
     let Ok(all) = listed(lake).await else { return true };
-    reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind != Kind::Procedure && !r.cacheable())).await
+    reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind != Kind::Procedure && !r.cacheable()), scope).await
 }
 
 /// Does `sql` read a Python table function, itself or through a view? Then it runs on one node:
 /// each would call it.
-pub async fn pinned(lake: &Lake, sql: &str) -> bool {
+pub async fn pinned(lake: &Lake, sql: &str, scope: &Scope) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
-    if crate::extension::calls(lake, sql, |f| !f.columns.is_empty()).await {
+    if crate::extension::calls(lake, sql, |f| !f.columns.is_empty(), scope).await {
         return true; // (an extension's table function, as a Python one: `extension.rs`)
     }
     let Ok(all) = listed(lake).await else { return false };
-    reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind == Kind::Table && r.python())).await
+    reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind == Kind::Table && r.python()), scope).await
 }
 
 /// Does `sql`, or a stored view it reads, name one of these routines? The views are looked at only
 /// when there is one to find (most lakes have no Python function).
-async fn reads_any<'a>(lake: &Lake, sql: &str, routines: impl Iterator<Item = (&'a String, &'a Routine)>) -> bool {
+async fn reads_any<'a>(lake: &Lake, sql: &str, routines: impl Iterator<Item = (&'a String, &'a Routine)>, scope: &Scope) -> bool {
     let names: Vec<&String> = routines.map(|(n, _)| n).collect();
     if names.is_empty() || names.iter().any(|n| crate::text::mentions(sql, n)) {
         return !names.is_empty();
     }
-    match with_views(lake, sql).await {
+    match with_views(lake, sql, scope).await {
         Ok(text) => names.iter().any(|n| crate::text::mentions(&text, n)),
         Err(_) => true,
     }
@@ -1334,9 +1335,9 @@ async fn reads_any<'a>(lake: &Lake, sql: &str, routines: impl Iterator<Item = (&
 
 /// A query's text with the SQL of every stored view it reads, one in another too (macros
 /// expanded): what a query asks for (`now()`, files, a Python function) may be in a view of it.
-pub async fn with_views(lake: &Lake, sql: &str) -> Result<String> {
+pub async fn with_views(lake: &Lake, sql: &str, scope: &Scope) -> Result<String> {
     let mut text = sql.to_string();
-    for (_, v) in crate::query::stored_views(lake, sql, false).await? {
+    for (_, v) in crate::query::stored_views(lake, sql, false, scope).await? {
         text.push(' ');
         text.push_str(&v);
     }
@@ -1359,7 +1360,7 @@ mod tests {
             ("SELECT id, [y * 2 FOR y IN l IF y > 0] AS d FROM t", "SELECT id, array_transform(array_filter(l, y -> (y > 0)), y -> (y * 2)) AS d FROM t"),
             ("SELECT [x FOR x IN [1, 2]] AS v", "SELECT array_transform((make_array(1, 2)), x -> (x)) AS v"), // (an array literal as make_array: `pg_casts`)
         ] {
-            let got = expand(&lake, sql).await.unwrap();
+            let got = expand(&lake, sql, &crate::auth::Principal::node().scope).await.unwrap();
             assert_eq!(got, want, "{sql}");
             assert!(crate::parsed::generic(&got).is_ok(), "{got}");
         }

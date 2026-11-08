@@ -7,8 +7,10 @@ passes the asker's scope to planning as an argument, so each of these places is 
 (outside `#[cfg(test)] mod`s, comments and strings), by file:
 
   reads  a read of the task's caller: `rights::scope()` or `auth::current()` outside auth.rs and rights.rs
-  node   a place that runs work as the node's own: `as_node(` or `panics::own(` (a loop of the node's own) outside
-         auth.rs and panics.rs, which define them
+  node   a place that runs work as the node's own: `as_node(` or `panics::own(` (a loop of the node's own), or that
+         plans or lists as the node's own, `Principal::node()` (a view's run, the lake's own definitions a column's
+         move rewrites, a count over every row), outside auth.rs and panics.rs, which define them. The baseline names
+         each file's, so a new one shows in review.
   whole  a whole scope made by name: `Scope::everything()` outside rights.rs
   unscoped  a planning session made for the task's caller: a call of `query::session` or `query::session_at`, which
          read it, where `query::session_for` is given the scope (M8 piece 3b retires them)
@@ -30,7 +32,7 @@ from layers import strip_comments  # noqa: E402
 
 KINDS = {
     "reads": (re.compile(r"\b(?:rights::scope|auth::current)\(\)"), {"auth.rs", "rights.rs"}),
-    "node": (re.compile(r"\b(?:as_node|panics::own)\("), {"auth.rs", "panics.rs"}),
+    "node": (re.compile(r"\b(?:as_node|panics::own)\(|\bPrincipal::node\(\)"), {"auth.rs", "panics.rs"}),
     "whole": (re.compile(r"\bScope::everything\(\)"), {"rights.rs"}),
 }
 WRAPPERS = ("session", "session_at")  # (query.rs's, which plan for the task's caller: `unscoped`)
@@ -56,7 +58,7 @@ def unscoped(rel, text):
 
 def code(path):
     text = open(path, encoding="utf-8").read()
-    m = re.search(r"#\[cfg\(test\)\]\s*mod\s", text)
+    m = re.search(r"#\[cfg\((?:all\()?test\b[^\]]*\]\s*mod\s", text)  # (`#[cfg(test)] mod`, `#[cfg(all(test, …))] mod`)
     return strip_comments(text[: m.start()] if m else text)
 
 

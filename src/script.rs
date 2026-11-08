@@ -739,7 +739,7 @@ impl<'a> Runner<'a> {
 
     /// `sql` (a query, its loops' rows already in place), its `$name`s bound: one row.
     async fn select(&self, sql: &str) -> Result<RecordBatch> {
-        let sql = crate::routines::prepare(&self.app.lake, &self.dotted(sql), &HashMap::new(), self.views).await?;
+        let sql = crate::routines::prepare(&self.app.lake, &self.dotted(sql), &HashMap::new(), self.views, &self.who.scope).await?;
         let rows = crate::vars::answer(self.app, &sql, &self.who.scope).await?;
         ensure!(!rows.is_empty(), "no answer");
         let row = datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?;
@@ -754,7 +754,7 @@ impl<'a> Runner<'a> {
     async fn truth(&self, cond: &str) -> Result<bool> {
         // (in a WHERE, where DataFusion plans EXISTS and IN as joins: not in a SELECT's list)
         let sql = self.ready(&format!("SELECT 1 AS t WHERE ({cond})")).await?;
-        let sql = crate::routines::prepare(&self.app.lake, &sql, &HashMap::new(), self.views).await?;
+        let sql = crate::routines::prepare(&self.app.lake, &sql, &HashMap::new(), self.views, &self.who.scope).await?;
         let rows = crate::vars::answer(self.app, &sql, &self.who.scope).await.with_context(|| format!("the condition {}", short(cond)))?;
         Ok(rows.iter().any(|b| b.num_rows() > 0))
     }
@@ -785,7 +785,7 @@ impl<'a> Runner<'a> {
                 s
             }
             Some(_) => s, // (`DECLARE $day …`, `$day = …`: worked out by `one`)
-            None => crate::routines::prepare(&self.app.lake, &s, &HashMap::new(), self.views).await?,
+            None => crate::routines::prepare(&self.app.lake, &s, &HashMap::new(), self.views, &self.who.scope).await?,
         };
         self.last = Box::pin(crate::routines::one(self.app, &s, self.who.clone(), job)).await?;
         Ok(())
@@ -1045,7 +1045,7 @@ impl Step for Loop {
         Box::pin(async move {
             if let Kind::For(var, query, parallel) = &self.kind {
                 r.at = at;
-                let q = crate::routines::prepare(&r.app.lake, &r.ready(query).await?, &HashMap::new(), r.views).await?;
+                let q = crate::routines::prepare(&r.app.lake, &r.ready(query).await?, &HashMap::new(), r.views, &r.who.scope).await?;
                 let batches = Box::pin(r.app.query(&q, None, &r.who.scope)).await.with_context(|| format!("FOR {var} IN ({})", short(query)))?;
                 if let Some(width) = parallel {
                     return r.parallel(var, &batches, width, &self.body, &path, &self.label).await;
@@ -1405,7 +1405,7 @@ impl Step for Execute {
                     Box::pin(crate::routines::script(r.app, &text, &given, r.views, r.who.clone(), job)).await.with_context(|| format!("EXECUTE IMMEDIATE {}", short(&text)))?
                 }
                 (None, Some(call)) => {
-                    let call = crate::routines::prepare(&r.app.lake, &r.ready(call).await?, &HashMap::new(), r.views).await?;
+                    let call = crate::routines::prepare(&r.app.lake, &r.ready(call).await?, &HashMap::new(), r.views, &r.who.scope).await?;
                     Box::pin(crate::routines::one(r.app, &call, r.who.clone(), job)).await?
                 }
                 _ => unreachable!("an EXECUTE runs SQL or a CALL"),
