@@ -136,5 +136,5 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     if !expands && !friendly && !typed && !patterned {
         return as_written();
     }
-    Ok(crate::text::text(&stmts))
+    Ok(crate::text::text_kept(stmts)) // (kept as the printed text's parse: the engine plans from the tree, `parsed::keep`)
 }

@@ -125,17 +125,32 @@ pub fn control(sql: &str) -> Option<&'static str> {
 #[cfg_attr(not(feature = "lake"), allow(dead_code))]
 pub(crate) fn text(stmts: &[Statement]) -> String { stmts.iter().map(sql).collect::<Vec<_>>().join(";\n") }
 
+/// `stmts` as SQL text (`text`), kept as that text's parse (`parsed::keep`) when each prints as itself: the next look and
+/// the engine (`engine::planned`) take the tree rather than parse the text again (step 8's one parse). A statement written
+/// with a fix for the reader (a doubled minus, a macro's `()`) parses back to another tree: then the text is parsed again.
+pub(crate) fn text_kept(stmts: Vec<Statement>) -> String {
+    let parts = stmts.iter().map(printed).collect::<Vec<_>>();
+    let text = parts.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join(";\n");
+    if parts.iter().all(|(_, itself)| *itself) {
+        crate::parsed::keep(&text, stmts);
+    }
+    text
+}
+
 /// A statement as SQL text again. sqlparser writes `- -3` (or `- $x`, `$x` bound to -3) as `--3`,
 /// which reads back as a comment, so a minus before anything written with a minus first gets
 /// parentheses.
-pub fn sql(s: &Statement) -> String {
+pub fn sql(s: &Statement) -> String { printed(s).0 }
+
+/// A statement as SQL text (`sql`), and whether that is its own `Display`: false when the text has a fix for the reader.
+fn printed(s: &Statement) -> (String, bool) {
     // (sqlparser writes a macro with no parameters as `CREATE MACRO m AS …`, which it doesn't read back: its `()` kept)
     if let Statement::CreateMacro { args: None, .. } = s {
         let mut s = s.clone();
         if let Statement::CreateMacro { args, .. } = &mut s {
             *args = Some(vec![]);
         }
-        return sql(&s);
+        return (printed(&s).0, false);
     }
     let twice = |e: &Expr| matches!(e, Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } if expr.to_string().starts_with('-'));
     let mut doubled = false;
@@ -144,7 +159,7 @@ pub fn sql(s: &Statement) -> String {
         ControlFlow::<()>::Continue(())
     });
     if !doubled {
-        return s.to_string();
+        return (s.to_string(), true);
     }
     let mut s = s.clone();
     let _ = crate::walk::visit_expressions_mut(&mut s, |e| {
@@ -153,7 +168,7 @@ pub fn sql(s: &Statement) -> String {
         }
         ControlFlow::<()>::Continue(())
     });
-    s.to_string()
+    (s.to_string(), false)
 }
 
 pub const PUBLIC: &str = "public";
