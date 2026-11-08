@@ -366,7 +366,7 @@ fn lock_of(lake: &Arc<Lake>) -> Option<Arc<tokio::sync::Mutex<()>>> {
 /// committed the rows (`leader`), or refused them. The guard of `TURN` is taken when the future is first polled: a
 /// producer that awaits its batches in order (Flight, Kafka) sends them in order, one answered before the next goes.
 pub fn queue(lake: Arc<Lake>, table: String, src: Src, batch: RecordBatch) -> Result<impl Future<Output = Result<Ack>> + use<>> {
-    crate::metrics::add(&crate::metrics::ROWS_IN, batch.num_rows() as u64);
+    crate::metrics::add(&lake.node.metrics.rows_in, batch.num_rows() as u64);
     let to = lake.to.get().cloned().ok_or_else(|| anyhow::anyhow!("no leader for {table} yet"))?;
     Ok(async move {
         let _turn = TURN.lock().await; // (held until the answer)
