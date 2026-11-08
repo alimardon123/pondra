@@ -119,7 +119,7 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
           counts in the query memory: invariant 414); keys_below.rs (a join's keys cut the rows an aggregate under it
-          groups: invariant 437); reuse.rs (a subplan that appears more than once alike runs once: invariant 477); or_ranges.rs (an OR of ranges of one column that meet as one
+          groups: invariant 437); reuse.rs (a subplan that appears more than once alike runs once: invariant 477); eager.rs (a grouping by a dimension's text columns groups the big table by its keys first: invariant 478); or_ranges.rs (an OR of ranges of one column that meet as one
           range: invariant 438); zeros_in.rs (a float IN list's zero, a CASE's and NULLIF's, answer as `=` does: invariant 448); round 35 served.rs (a lake's store over HTTP:
           pondra://host:port, ADR-072 §8, invariant 299); replace.rs (CREATE OR REPLACE TABLE: a staged table filled, then put
           in the old one's place in one commit: invariant 425); round 36 statement.rs (one statement's
@@ -3208,6 +3208,18 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (q14 3.75 -> 2.01, q36 1.10 -> 0.34, q47 1.81 -> 0.67, q23 3.21 -> 2.17, q64 2.37 -> 1.95, q65 0.70 -> 0.37),
    TPC-H q15 1.01 -> 0.55; the queries flagged slower hold no copy and are as fast run interleaved; the same answers.
    `cargo test --lib reuse::`
+478. **A grouping by a dimension's text columns groups the big table by its keys first** (`eager.rs`, eager aggregation).
+   An aggregate over inner joins whose grouping names two text columns or more, or grouping sets, from whole tables
+   that give no aggregate an argument and join by equalities (the dimensions), is planned as a grouping of the rest by
+   the columns the dimensions join on and its own grouped columns (all of fixed width), the dimensions joined to those
+   groups, and the grouping done again: a sum of sums (never a float's: its one sum is rounded once, `fsum.rs`), a sum
+   of counts (0 for none), a least of least values, a greatest of greatest, an integer's average as its sum over its
+   count. A grouping with no aggregate (a DISTINCT, which would be grouped again and again), DISTINCT, FILTER or ORDER BY
+   inside an aggregate, any other aggregate, a filtered dimension, and one text column alone (TPC-DS q05 was 8% slower)
+   leave the plan as it was. It looks through a projection of columns as they are (the join order puts one over the
+   joins it reorders) and runs just after the join order. At SF10 in process against main: TPC-DS q22 3.46 -> 0.42 s,
+   q86 0.079 -> 0.070, q23 1.89 -> 1.80; every other TPC-H and TPC-DS plan as it was; the same answers.
+   `cargo test --lib eager::`
 
 ```bash
 cargo build --release
