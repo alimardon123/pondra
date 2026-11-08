@@ -290,4 +290,22 @@ mod tests {
         let user = folder.parent().expect("the user's folder, which holds the process's");
         assert_eq!(std::fs::metadata(user).unwrap().permissions().mode() & 0o777, 0o700);
     }
+
+    /// A bucket counts on its job's node: what one node sends another counts as the receiver's wire bytes alone.
+    #[tokio::test]
+    async fn two_nodes_buckets_count_apart() {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        use std::sync::atomic::Ordering::Relaxed;
+        let (one, other) = (crate::node_state::NodeState::unhosted(), crate::node_state::NodeState::unhosted());
+        let job = format!("counted-{}", uuid::Uuid::new_v4().simple());
+        let mut sent = Spill::new(dir(&job).unwrap(), "sent".into(), &other.metrics);
+        sent.push(RecordBatch::try_from_iter([("v", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef)]).unwrap()).unwrap();
+        let pieces = sent.count();
+        let body = sent.framed().map(|f| f.map(bytes::Bytes::from).map_err(anyhow::Error::from)).boxed();
+        let got = Spill::take(dir(&job).unwrap(), "got".into(), &mut Frames::new(body), pieces, &one.metrics).await.unwrap();
+        assert_eq!(got.count(), 1);
+        assert!(one.metrics.wire.load(Relaxed) > 0, "the receiver's");
+        assert_eq!(other.metrics.wire.load(Relaxed), 0, "not the sender's");
+        clear(&job);
+    }
 }
