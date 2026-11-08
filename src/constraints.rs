@@ -164,7 +164,7 @@ pub async fn held(lake: &Lake, table: &str, meta: &TableMeta, keys: &RecordBatch
     let cols = names.iter().map(|c| format!("t.{}", q(c))).collect::<Vec<_>>().join(", ");
     let on = names.iter().map(|c| format!("t.{0} = n.{0}", q(c))).collect::<Vec<_>>().join(" AND ");
     let sql = format!("SELECT {cols} FROM {} AS t JOIN __pondra_keys AS n ON {on} LIMIT 1", crate::write::sql_name(table));
-    let ctx = crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?;
+    let ctx = crate::query::session_for(lake, &sql, "", Some(lake.visible()), &crate::auth::Principal::node().scope).await?; // (the leader's check: every row, granted or not)
     ctx.register_batch("__pondra_keys", keys.clone())?;
     let found = crate::engine::sql(&ctx, &sql).await?.collect().await?;
     Ok(found.iter().find(|b| b.num_rows() > 0).map(|b| shown(b.columns(), 0)))
@@ -190,7 +190,7 @@ async fn kept(lake: &Lake, table: &str, meta: &TableMeta, columns: &[String], ol
         sql += &format!(" AND NOT EXISTS (SELECT 1 FROM __pondra_new AS w WHERE {same})"); // (a key's new version replaces its row)
     }
     sql += " LIMIT 1";
-    let ctx = crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?;
+    let ctx = crate::query::session_for(lake, &sql, "", Some(lake.visible()), &crate::auth::Principal::node().scope).await?; // (the leader's check: every row, granted or not)
     ctx.register_batch("__pondra_new", new.clone())?;
     if let Some(o) = old.filter(|o| o.num_rows() > 0) {
         let ids = o.column_by_name(crate::text::ROW_ID).cloned().ok_or_else(|| anyhow::anyhow!("the replaced rows carry no {}", crate::text::ROW_ID))?;

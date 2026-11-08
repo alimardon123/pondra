@@ -37,35 +37,34 @@ tokio::task_local! {
 
 /// The parts of `objects`, and only of these: the caller's rights decided which objects were
 /// listed, so no other object is read. A view that won't plan has no column rows (no error).
-pub async fn parts(lake: &Lake, objects: &[Object]) -> Result<Vec<PartRow>> {
+pub async fn parts(lake: &Lake, objects: &[Object], scope: &crate::rights::Scope) -> Result<Vec<PartRow>> {
     let depth = LISTING.try_with(|d| *d).unwrap_or(0);
     ensure!(depth < 4, "pondra.parts: views that search the catalog they are in (asked {depth} deep)");
-    LISTING.scope(depth + 1, parts_of(lake, objects)).await
+    LISTING.scope(depth + 1, parts_of(lake, objects, scope)).await
 }
 
 /// Each object's parts, read from its own lake (`lakes`: this one and those attached that the
 /// caller may use). Each lake's routines are listed once.
-async fn parts_of(lake: &Lake, objects: &[Object]) -> Result<Vec<PartRow>> {
+async fn parts_of(lake: &Lake, objects: &[Object], scope: &crate::rights::Scope) -> Result<Vec<PartRow>> {
     let lakes: HashMap<String, Arc<Lake>> = lakes(lake).await.into_iter().collect();
     let here = crate::ddl::lake_name(lake);
-    let scope = crate::rights::scope();
     let mut routines = HashMap::new();
     let mut out = vec![];
     // Every view's columns are planned in one session: a session a view took 3 ms each (200 views, 0.6 s).
     let views: Vec<String> = objects.iter().filter(|o| matches!(o.kind, "view" | "external table")).map(|o| reached_as(o, &here)).collect();
     let session = match views.is_empty() {
         true => None,
-        false => session_for(lake, &views).await,
+        false => session_for(lake, &views, scope).await,
     };
     for o in objects {
         let Some(l) = lakes.get(&o.lake) else { continue };
         let partial = match matches!(o.kind, "table" | "view" | "materialized view" | "external table") {
-            true => partial_columns(&scope, o, &here),
+            true => partial_columns(scope, o, &here),
             false => None,
         };
         let more = match o.kind {
-            "table" | "materialized view" => stored_parts(l, o, partial.as_ref()).await?,
-            "view" | "external table" => view_parts(session.as_ref(), l, o, &here, partial.as_ref()).await?,
+            "table" | "materialized view" => stored_parts(l, o, partial.as_ref(), scope).await?,
+            "view" | "external table" => view_parts(session.as_ref(), l, o, &here, partial.as_ref(), scope).await?,
             "function" | "macro" | "table function" | "procedure" => {
                 if !routines.contains_key(&o.lake) {
                     routines.insert(o.lake.clone(), crate::routines::listed(l).await?);
@@ -101,7 +100,7 @@ fn partial_columns(scope: &crate::rights::Scope, o: &Object, here: &str) -> Opti
 /// A table's or materialized view's parts: its columns (under their SQL names, with their comments),
 /// its key, its links and checks, and a materialized view's expectations. `partial`: the columns a
 /// limited caller may see (`partial_columns`), and then nothing else.
-async fn stored_parts(l: &Lake, o: &Object, partial: Option<&HashSet<String>>) -> Result<Vec<PartRow>> {
+async fn stored_parts(l: &Lake, o: &Object, partial: Option<&HashSet<String>>, scope: &crate::rights::Scope) -> Result<Vec<PartRow>> {
     let local = o.local();
     let Some(meta) = l.cat.meta(&table_key(&local)).await? else { return Ok(vec![]) };
     let d = meta.described();
@@ -121,7 +120,7 @@ async fn stored_parts(l: &Lake, o: &Object, partial: Option<&HashSet<String>>) -
         out.push(part(o, "column", name.clone(), Some(ty), comment, None));
     }
     // A materialized view's facts and expectations are its definition: a caller who may not see code is not shown them.
-    if partial.is_some() || (o.kind == "materialized view" && !crate::rights::scope().shows_code()) {
+    if partial.is_some() || (o.kind == "materialized view" && !scope.shows_code()) {
         return Ok(out);
     }
     if !d.key.is_empty() {
@@ -156,7 +155,7 @@ async fn column_comments(l: &Lake, local: &str) -> Result<HashMap<String, String
 
 /// A stored view's or external table's columns, as its query names and types them now, with their
 /// comments, planned in `session` (every view's, made once) under the name it is reached by there.
-async fn view_parts(session: Option<&SessionContext>, l: &Lake, o: &Object, here: &str, partial: Option<&HashSet<String>>) -> Result<Vec<PartRow>> {
+async fn view_parts(session: Option<&SessionContext>, l: &Lake, o: &Object, here: &str, partial: Option<&HashSet<String>>, scope: &crate::rights::Scope) -> Result<Vec<PartRow>> {
     let local = o.local();
     let columns = match session {
         Some(ctx) => columns_in(ctx, &reached_as(o, here)).await.unwrap_or_default(), // (a view that won't plan has no columns to list)
@@ -178,7 +177,7 @@ async fn view_parts(session: Option<&SessionContext>, l: &Lake, o: &Object, here
     }).collect();
     // A view's key facts are listed as a table's are, unless a limited caller may not see the columns they name, or the
     // code they are written in (`views::code_for_caller`: a link names the table it refers to).
-    if partial.is_none() && crate::rights::scope().shows_code() {
+    if partial.is_none() && scope.shows_code() {
         for c in stored.iter().flat_map(|v| &v.facts) {
             let link = c.kind == crate::constraints::Kind::ForeignKey;
             out.push(part(o, if link { "link" } else { "key" }, c.name.clone(), None, None, Some(c.def(&ident))));
@@ -197,8 +196,8 @@ fn reached_as(o: &Object, here: &str) -> String {
 
 /// One session with every view of `views` in it (None if it can't be made). (Boxed, as `columns_in`
 /// is: making it expands the views' SQL, which may search the catalog, which comes back here.)
-fn session_for<'a>(lake: &'a Lake, views: &'a [String]) -> BoxFuture<'a, Option<SessionContext>> {
-    Box::pin(async move { crate::query::session(lake, &format!("SELECT * FROM {}", views.join(", ")), "").await.ok() })
+fn session_for<'a>(lake: &'a Lake, views: &'a [String], scope: &'a crate::rights::Scope) -> BoxFuture<'a, Option<SessionContext>> {
+    Box::pin(async move { crate::query::session_for(lake, &format!("SELECT * FROM {}", views.join(", ")), "", None, scope).await.ok() })
 }
 
 /// A relation's columns, as a query in `ctx` names and types them. Planned, not run (`LIMIT 0`).
@@ -306,8 +305,9 @@ pub async fn functions_in(lake: &Lake, sql: &str) -> Result<String> {
     if calls.is_empty() {
         return Ok(sql.to_string());
     }
-    let all = list(lake).await?;
-    let pieces = parts(lake, &all).await?;
+    let scope = crate::rights::scope(); // (the statement's caller: M8 piece 3b passes it)
+    let all = list(lake, &scope).await?;
+    let pieces = parts(lake, &all, &scope).await?;
     let mut out = String::new();
     let mut last = 0;
     for (at, text, kind) in calls {

@@ -2074,11 +2074,10 @@ fn span(rows: &[RecordBatch], c: &str, within_secs: u64) -> Option<(i64, i64)> {
 /// its expectations, and `error`: the last error of its runs on the node that runs them, once two
 /// in a row failed; NULL while they work) and `pondra.expectations` (a row per expectation, with the
 /// rows that broke it: `counts`, the rows of `pondra$expectations`). What a user may read only.
-pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'static str, std::sync::Arc<dyn datafusion::catalog::TableProvider>)>> {
+pub async fn system(lake: &Lake, counts: Vec<RecordBatch>, scope: &crate::rights::Scope) -> Result<Vec<(&'static str, std::sync::Arc<dyn datafusion::catalog::TableProvider>)>> {
     use datafusion::arrow::array::{Array, AsArray, Int64Array, StringArray};
     use datafusion::datasource::MemTable;
     let mut views = in_order(lake.cat.scan::<View>("v/", "v0").await?);
-    let scope = crate::rights::scope();
     views.retain(|(name, v)| scope.sees(crate::rights::Object::Table(v.shown(name))));
     let (mut kinds, mut histories) = (vec![], std::collections::HashSet::new());
     for (name, v) in &views {

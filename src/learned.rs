@@ -472,7 +472,7 @@ async fn read(lake: &crate::store::Lake, since: i64) -> anyhow::Result<Vec<(i64,
     use datafusion::arrow::array::{Array, AsArray};
     use datafusion::arrow::datatypes::{DataType, TimestampMicrosecondType};
     use datafusion::prelude::{col, lit};
-    let ctx = crate::query::session(lake, "SELECT * FROM pondra.history", "").await?;
+    let ctx = crate::query::session_for(lake, "SELECT * FROM pondra.history", "", None, &crate::auth::Principal::node().scope).await?;
     let after = lit(ScalarValue::TimestampMicrosecond(Some(since), Some("UTC".into())));
     let rows = ctx.table("pondra.history").await?.filter(col("learned").is_not_null().and(col("at").gt(after)))?.select_columns(&["at", "learned"])?.collect().await?;
     let mut out = vec![];

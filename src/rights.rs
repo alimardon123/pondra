@@ -289,6 +289,18 @@ impl Scope {
     /// principal is made).
     pub fn granted(access: std::sync::Arc<crate::users::Access>) -> Scope { Scope(Some(access)) }
 
+    /// The scope a planning session was made for (`query::session_for`): the session carries it to everything planned in it
+    /// (a `SessionConfig` extension), so no planning reads the task's caller. A session made without one sees nothing: it
+    /// never falls back to whole (M8 piece 3).
+    pub fn of_session(config: &datafusion::prelude::SessionConfig) -> Scope {
+        config.get_extension::<Scope>().map_or_else(Scope::nothing, |s| (*s).clone())
+    }
+
+    /// Give `ctx` this scope, for everything planned in it to read (`of_session`).
+    pub fn onto(&self, ctx: &datafusion::prelude::SessionContext) {
+        ctx.state_ref().write().config_mut().set_extension(std::sync::Arc::new(self.clone()));
+    }
+
     /// A user's own quota (`users::quota`); None: whole, which has none.
     pub fn limits(&self) -> Option<crate::users::Limits> { self.0.as_ref().map(|a| a.limits) }
 

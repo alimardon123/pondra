@@ -127,7 +127,10 @@ pub struct Listed {
 }
 
 /// Every table and view of this lake and the lakes attached to it, lake by lake.
-pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> {
+pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> { listed_for(lake, &crate::rights::scope()).await } // (the task's caller: M8 piece 3b passes it)
+
+/// `listed`, as `scope` may see it (a planning session's: `query::session_for`).
+pub async fn listed_for(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<Listed>> {
     let mut all = vec![];
     let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().clone();
     for (catalog, l) in std::iter::once((lake_name(lake), lake.arc())).chain(attached) {
@@ -144,15 +147,14 @@ pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> {
             let (schema, table) = split(name);
             let found = materialized.get(name).or_else(|| materialized.get(name.trim_end_matches("_final"))).or_else(|| materialized.get(&crate::once::open(name)));
             let kind = if found.is_some() { "materialized view" } else { "table" };
-            let sql = crate::views::code_for_caller(|| found.filter(|s| !s.is_empty()).cloned()).flatten();
+            let sql = scope.shows_code().then(|| found.filter(|s| !s.is_empty()).cloned()).flatten();
             all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: table.into(), kind, meta: Some(m.described()), sql });
         }
         for (k, v) in l.cat.scan::<StoredView>("q/", "q0").await? {
             let (schema, view) = split(&k[2..]);
-            all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: crate::views::code_for_caller(|| crate::views::shown(&v.sql)) });
+            all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: scope.shows_code().then(|| crate::views::shown(&v.sql)) });
         }
     }
-    let scope = crate::rights::scope();
     if !scope.whole() {
         let here = lake_name(lake);
         // (a user's: what it may read, at every listing: S27; another lake's by the grants naming it, as its reads ask)

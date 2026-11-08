@@ -455,9 +455,9 @@ pub async fn recipient_of(lake: &Lake, token: &str) -> Result<Option<(String, Re
 
 /// `pondra.shares` (a row a table shared; a share with none, one with no table) and
 /// `pondra.recipients`: an admin's (a user's grants show none).
-pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
+pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
     use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray, TimestampMicrosecondArray};
-    let mine = crate::rights::scope().sees(crate::rights::Object::Lake);
+    let mine = scope.sees(crate::rights::Object::Lake);
     let all = if mine { shares(lake).await? } else { vec![] };
     let (said, told) = if mine { (notes(lake, "share").await?, notes(lake, "recipient").await?) } else { Default::default() };
     let rows: Vec<(&String, &Share, Option<&Shared>)> = all.iter().flat_map(|(n, s)| {
