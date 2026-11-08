@@ -26,8 +26,12 @@ pub fn of(e: &anyhow::Error) -> &'static str {
 /// again, where the write passes once the disk or the bucket is back (11-08 audit L10; only Kafka told them apart, 11-06
 /// audit L5). None for a file or an object that isn't there, known by its words still: asked for again, it isn't there;
 /// and for an `io::Error` a library made with words of its own and no OS error (DataFusion's spill past its limit, 53100).
+/// A store's error is read by its kind (`store`), and a `Generic` one by what it carries first: Pondra carries a store's
+/// own error inside DataFusion's (`bridge::err`), and a web server's "lists nothing" is no fault of the machine's.
 fn machine(e: &anyhow::Error) -> Option<&'static str> {
     use std::io::ErrorKind as K;
+    #[cfg_attr(not(feature = "lake"), allow(unused_mut))]
+    let mut bucket = None; // (a store's Generic error: the bucket's own, unless what it carries says otherwise)
     for c in e.chain() {
         if let Some(io) = c.downcast_ref::<std::io::Error>() {
             return match io.kind() {
@@ -40,15 +44,39 @@ fn machine(e: &anyhow::Error) -> Option<&'static str> {
         }
         #[cfg(feature = "lake")] // (the bucket's: SlateDB's and Pondra's own object_store, and DataFusion's, a UNIQUE check on the leader's, 11-07 audit L7)
         {
-            if let Some(s) = c.downcast_ref::<object_store::Error>() {
-                return (!matches!(s, object_store::Error::NotFound { .. })).then_some("58030");
-            }
-            if let Some(s) = c.downcast_ref::<object_store_df::Error>() {
-                return (!matches!(s, object_store_df::Error::NotFound { .. })).then_some("58030");
+            match c.downcast_ref::<object_store::Error>().map(store).or_else(|| c.downcast_ref::<object_store_df::Error>().map(store_df)) {
+                Some(Some(code)) => return code,
+                Some(None) => bucket = Some("58030"),
+                None => {}
             }
         }
     }
-    None
+    bucket
+}
+
+/// A store's error by its kind: Some(code), or Some(None) when its words say (an object that isn't there, a path or a
+/// setting a caller wrote, a write a condition refused); None, a `Generic` one: what it carries, else the bucket's.
+#[cfg(feature = "lake")]
+fn store(e: &object_store::Error) -> Option<Option<&'static str>> {
+    use object_store::Error as E;
+    match e {
+        E::Generic { .. } => None,
+        E::NotSupported { .. } | E::NotImplemented { .. } => Some(Some("0A000")), // feature_not_supported (the store can't: a web server lists nothing)
+        E::NotFound { .. } | E::InvalidPath { .. } | E::AlreadyExists { .. } | E::Precondition { .. } | E::NotModified { .. } | E::UnknownConfigurationKey { .. } => Some(None),
+        _ => Some(Some("58030")), // (refused by the bucket, its credentials, a task lost: the machine's)
+    }
+}
+
+/// `store`, for DataFusion's object_store (0.13).
+#[cfg(feature = "lake")]
+fn store_df(e: &object_store_df::Error) -> Option<Option<&'static str>> {
+    use object_store_df::Error as E;
+    match e {
+        E::Generic { .. } => None,
+        E::NotSupported { .. } | E::NotImplemented { .. } => Some(Some("0A000")),
+        E::NotFound { .. } | E::InvalidPath { .. } | E::AlreadyExists { .. } | E::Precondition { .. } | E::NotModified { .. } | E::UnknownConfigurationKey { .. } => Some(None),
+        _ => Some(Some("58030")),
+    }
 }
 
 /// An error in words: its causes after it, each said once, DataFusion's and Arrow's labels taken off, and the files it
@@ -446,6 +474,13 @@ mod tests {
         assert_eq!(super::of(&anyhow::Error::from(datafusion::error::DataFusionError::ObjectStore(Box::new(bucket()))).context("a UNIQUE check")), "58030");
         let coded = object_store::Error::Generic { store: "memory", source: Box::new(super::Coded("53100", "this process's spills may take 1 MB".into())) };
         assert_eq!(super::of(&anyhow::Error::from(coded)), "53100", "a bucket's error that Pondra coded keeps its code");
+        // (a store's own error inside one DataFusion's carries, `bridge::err`: what it is, not what carries it. A web
+        // server lists nothing, which a page's read of a folder asks: 0A000, as its words say, not the machine's)
+        let inside = |e: object_store::Error| anyhow::Error::from(datafusion::error::DataFusionError::ObjectStore(Box::new(object_store_df::Error::Generic { store: "outside the lake", source: Box::new(e) })));
+        assert_eq!(super::of(&inside(object_store::Error::NotSupported { source: "a web server lists nothing".into() })), "0A000");
+        assert_eq!(super::of(&inside(object_store::Error::NotImplemented { operation: "copy".into(), implementer: "web".into() })), "0A000");
+        assert_eq!(super::of(&inside(object_store::Error::PermissionDenied { path: "x".into(), source: "Permission denied".into() })), "58030");
+        assert_eq!(super::of(&inside(object_store::Error::Generic { store: "S3", source: "connection reset".into() })), "58030", "the bucket's own");
         assert_eq!(super::of(&anyhow::anyhow!("permission denied for table t")), "42501", "Pondra's own words still read");
     }
 
