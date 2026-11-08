@@ -3194,7 +3194,7 @@ pub struct Catalog {
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
     closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
     life: Life,                   // what a fence restarts: its lake's (`fatal`)
-    written: Mutex<Vec<(&'static str, Instant, std::collections::HashSet<String>)>>, // leader: each round that follows the tables committed (`written`): its last read of them all, and the ones since
+    written: Mutex<Vec<(&'static str, Instant, std::collections::HashSet<String>)>>, // each round that follows the tables committed (`written`): its last read of them all, and the ones since
 }
 
 /// A scan in progress: the streamed changes it may still lay over its (older) view stay.
@@ -3583,6 +3583,13 @@ impl Catalog {
             self.mirror.store(false, Relaxed);
             self.hold.fetch_max(d.id - 1, Relaxed);
             self.rights.fetch_max(d.id, Relaxed); // (any of them may have changed who may do what)
+            self.written.lock().unwrap().clear(); // (the tables those wrote are unknown: each round's next look reads every table)
+        }
+        {
+            let mut written = self.written.lock().unwrap(); // (the tables this commit writes, for each round that follows them)
+            for (_, _, tables) in written.iter_mut() {
+                tables.extend(d.puts.iter().map(|(k, _)| k.as_str()).chain(d.deletes.iter().map(String::as_str)).filter_map(|k| k.strip_prefix("t/")).map(str::to_string));
+            }
         }
         if let Some((_, v)) = d.puts.iter().find(|(k, _)| k == "n") {
             self.last_n.fetch_max(serde_json::from_slice(v).unwrap_or(1), Relaxed);
@@ -3706,6 +3713,7 @@ impl Catalog {
         self.streamed.fetch_max(c, Relaxed);
         self.loud.fetch_max(c, Relaxed);
         self.rights.fetch_max(c, Relaxed); // (a whole snapshot: what changed in it isn't told apart)
+        self.written.lock().unwrap().clear(); // (…nor which tables: each round's next look reads every table)
         self.last_n.fetch_max(n, Relaxed);
         self.mirror.store(true, Relaxed);
         Ok(())
@@ -3740,10 +3748,11 @@ impl Catalog {
 
     pub fn is_writer(&self) -> bool { self.kv.is_writer() }
 
-    /// The tables (their `t/` names) this leader committed since `who` last asked, or None when `who` is to read every
-    /// table instead: the first time it asks, and once `sweep` has passed since it last did (a table this missed waits
-    /// at most that). A round that follows them (`tier::refresh`, `delta::publish_named`) reads only these between
-    /// sweeps: a commit's work follows its write set, not the number of tables (designs/redesign/redesign.md §4).
+    /// The tables (their `t/` names) committed since `who` last asked (`apply`: this leader's commits, or those a
+    /// follower was streamed), or None when `who` is to read every table instead: the first time it asks, once `sweep`
+    /// has passed since it last did (a table this missed waits at most that), and after a gap in a follower's stream. A
+    /// round that follows them (`tier::refresh`, `delta::publish_named`) reads only these between sweeps: a commit's work
+    /// follows its write set, not the number of tables (designs/redesign/redesign.md §4).
     pub fn written(&self, who: &'static str, sweep: std::time::Duration) -> Option<std::collections::HashSet<String>> {
         let mut written = self.written.lock().unwrap();
         match written.iter_mut().find(|(w, ..)| *w == who) {
@@ -4143,12 +4152,6 @@ impl Catalog {
         puts.push(("c".to_string(), Bytes::from(json(&*id))));
         let handle = self.kv.write(&puts, deletes).await.map_err(|e| self.fenced(e))?;
         let t2 = commit_stage("kv write", t1);
-        {
-            let mut written = self.written.lock().unwrap(); // (the tables this commit writes, for each round that follows them)
-            for (_, _, tables) in written.iter_mut() {
-                tables.extend(puts.iter().map(|(k, _)| k.as_str()).chain(deletes.iter().map(String::as_str)).filter_map(|k| k.strip_prefix("t/")).map(str::to_string));
-            }
-        }
         if let Some((_, v)) = puts.iter().find(|(k, _)| k == "n") {
             self.last_n.store(serde_json::from_slice(v)?, Relaxed);
         }
