@@ -353,7 +353,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     let log = (!reader).then(|| Arc::new(log::Log::start(lake.clone(), Duration::from_millis(s.flush_ms), to)));
     crate::store::trace("the sequencer");
     python::init(s.python.clone());
-    let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone() };
+    let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone(), tables: Default::default() };
     if let Some(ledger) = lake.ledger() {
         ledger.charge("answers", Arc::downgrade(&app.results) as std::sync::Weak<dyn crate::ledger::Charged>); // (the remembered answers: `/metrics`' `cache_bytes`)
         // (the node's caches of what the lake's own floor doesn't reach, charged once whatever lakes it opens: the answers
