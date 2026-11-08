@@ -59,7 +59,7 @@ pub async fn set_location(lake: &Lake, database: &str, to: &str) -> anyhow::Resu
     crate::ext::owners_only(&to, format!("ALTER DATABASE … SET LOCATION {to}: a path on the server's own disk, which only the node's owner moves a lake into (the `pondra` shell, `pondra sql`, `connect()` of a lake): move it to a bucket (s3://, gs://, az://)"))?; // (the asker's context: `ddl_here` runs in the request)
     crate::backup::apart(lake, &to)?;
     crate::ext::reach_place(lake, &to).await?; // (a bucket: the secret whose scope covers it)
-    let dest = crate::store::open_store(&to)?.1;
+    let dest = crate::store::counted(crate::store::open_store(&to)?.1, &lake.node.metrics); // (its requests the node's: `Counted`)
     refuse_torn(&dest, &to).await?; // (a move that didn't finish there: named, before the place is called holding other things)
     anyhow::ensure!(crate::backup::empty(&to).await?, "{to} holds other things: move into a new place (or an empty folder)");
     let metas: Vec<ObjectMeta> = lake.store.list(None).try_collect().await.context("listing the lake")?; // (before the mark: a failure here leaves the place as it was)

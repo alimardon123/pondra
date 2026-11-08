@@ -15,7 +15,7 @@
 //!
 //! A lake moves out of memory with `memory::set_location` (the host's: `ALTER DATABASE … SET LOCATION`,
 //! `db.save`), which is refused at a place a move didn't finish (`refuse_torn`).
-use crate::store::{Counted, Store};
+use crate::store::Store;
 use futures::future::ready;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
@@ -86,12 +86,12 @@ pub fn forget_memory(url: &str) { MEMORY.lock().unwrap_or_else(PoisonError::into
 
 /// The store of the lake held in memory at `url`: the same one for every open of it, made on the first.
 pub fn store(url: &str) -> Store {
-    MEMORY.lock().unwrap_or_else(PoisonError::into_inner).entry(url.trim_end_matches('/').to_string()).or_insert_with(|| Arc::new(Counted(Arc::new(Held::new())))).clone()
+    MEMORY.lock().unwrap_or_else(PoisonError::into_inner).entry(url.trim_end_matches('/').to_string()).or_insert_with(|| Arc::new(Held::new())).clone()
 }
 
 /// Holds `given` (a page's private folder, OPFS) as the lake in memory at `url`, so every open of `url` gives it
 /// (`store`), as it gives a lake made in memory; `forget_memory` lets it go, its objects staying where they are.
-pub fn give(url: &str, given: Store) { MEMORY.lock().unwrap_or_else(PoisonError::into_inner).insert(url.trim_end_matches('/').to_string(), Arc::new(Counted(given))); }
+pub fn give(url: &str, given: Store) { MEMORY.lock().unwrap_or_else(PoisonError::into_inner).insert(url.trim_end_matches('/').to_string(), given); }
 
 /// The bytes past which a lake's files and log go to disk: `PONDRA_MEMORY_LAKE_GB`, else a quarter of
 /// the machine's memory (4 GB where it can't say).
