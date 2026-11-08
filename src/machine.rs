@@ -11,8 +11,15 @@ use std::sync::{Arc, OnceLock};
 /// A machine, as its host reads it.
 pub trait Machine: Send + Sync {
     /// The memory this process may use, if the machine says: its RAM, less where a container or a cgroup limits the
-    /// process. None where it isn't read (a page, whose memory is its device's line).
+    /// process. None where it isn't read (a page, whose memory is its device's line: `line`).
     fn ram(&self) -> Option<usize>;
+
+    /// The memory line the platform holds this process to, where it draws one itself: a page's device, since a phone's
+    /// browser gives a module less than a desktop's. None natively, where the core draws the line from `ram` (`oom::line`);
+    /// on a page whose device doesn't say, the line is the page's own (`env::PAGE_LINE`).
+    fn line(&self) -> Option<usize> {
+        None
+    }
 
     /// This process's resident memory now, if the OS says (on a page, the bytes its program reads).
     fn resident(&self) -> Option<usize>;

@@ -642,7 +642,7 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
     let need = crate::auth::Auth::needed("/cluster/log", "GET"); // (a superuser's own sign-in, as `guard` lets it follow the stream)
     let revoked = until_revoked(app.clone(), operator, header, move |p| p.role >= need && p.scope.whole());
     let cat = &app.lake.cat;
-    let streamed = operator.then(|| crate::format::Streamed::to(crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
+    let streamed = operator.then(|| crate::format::Streamed::to(&app.lake, crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
     // (a joined page's tab, which says no format as the nodes' own client does (`cluster::http`), is a use of the node while it
     // follows, as its other requests are; the nodes' streams never end while a cluster runs, so they aren't: `idle.rs`, 11-03 audit M7)
     let page = (!headers.contains_key("x-pondra-format")).then(|| app.lake.node.idle.begin());
