@@ -29,6 +29,19 @@ const SQL_SERVER_SETS: &[&str] = &["NOCOUNT", "ANSI_NULLS", "QUOTED_IDENTIFIER",
 /// The words for MySQL's `SET @v = …` (`set.rs` says them too, for a SET it reads).
 pub(crate) fn user_variable(v: &str) -> String { format!("SET @{v} is MySQL's for a variable: here a variable is ${v} = …, and ${v} reads it") }
 
+/// The front's pass of this module (`passes.rs`): `refused`, triggered by MySQL's `/*!` and by a word or a bracket of
+/// `refusal`'s look.
+pub(crate) fn pass() -> crate::passes::Pass {
+    crate::passes::Pass {
+        name: "dialect_stmts.refused",
+        order: 20,
+        words: vec!["desc", "describe", "explain", "show", "clustered", "nonclustered", "set", "prepare", "declare", "delete", "update", "alter", "apply", "output", "flatten", "database",
+            "schema", "user", "current_user", "session_user", "system_user", "replace", "option", "stream", "pragma", "upsert", "extension", "pivot", "unpivot"],
+        marks: vec![&["/*!"], &["]", "."], &[".", "["], &["[dbo]"], &["from", "["], &["join", "["], &["into", "["], &["update", "["], &["table", "["]],
+        run: crate::passes::Run::Refuse(refused),
+    }
+}
+
 /// Refused (0A000) with what to write, when a statement of `sql` is one of these.
 pub fn refused(sql: &str) -> anyhow::Result<()> {
     match refusal(sql) {

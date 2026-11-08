@@ -302,6 +302,10 @@ fn make<'a>(lake: &'a Lake, tree: Value) -> BoxFuture<'a, Result<Value>> {
             if !m.replace {
                 return Ok(j!({"connection": m.name, "unchanged": true}));
             }
+            let had: Definition = lake.cat.get(&key(&m.name)).await?.unwrap_or_else(|| d.clone());
+            if had.ty != d.ty {
+                not_attached(lake, &m.name, &format!("CREATE OR REPLACE CONNECTION {} TYPE {}", m.name, d.ty)).await?;
+            }
         }
         lake.cat.commit(vec![(key(&m.name), json(&d))], &[]).await?;
         Ok(j!({"connection": m.name}))
@@ -327,6 +331,7 @@ fn change<'a>(lake: &'a Lake, tree: Value) -> BoxFuture<'a, Result<Value>> {
             return Ok(j!({"connection": a.name, "exists": false}));
         };
         if let Some(to) = a.rename {
+            not_attached(lake, &a.name, &format!("ALTER CONNECTION {} RENAME TO {to}", a.name)).await?;
             if lake.cat.get::<Value>(&key(&to)).await?.is_some() {
                 return Err(coded("42710", format!("connection {to} already exists")));
             }
@@ -345,6 +350,15 @@ fn change<'a>(lake: &'a Lake, tree: Value) -> BoxFuture<'a, Result<Value>> {
     })
 }
 
+/// A connection a database is attached over (`ATTACH shop`) keeps its name and its type while it is: DETACH comes first.
+async fn not_attached(lake: &Lake, name: &str, then: &str) -> Result<()> {
+    let over = crate::ext::attached_over(lake, name).await?;
+    match over.first() {
+        None => Ok(()),
+        Some(db) => Err(coded("2BP01", format!("database {} is attached over connection {name}: DETACH {db}, then {then}", over.join(", ")))),
+    }
+}
+
 #[derive(Deserialize)]
 struct Dropped {
     name: String,
@@ -360,6 +374,7 @@ fn remove<'a>(lake: &'a Lake, tree: Value) -> BoxFuture<'a, Result<Value>> {
             }
             return Ok(j!({"connection": d.name, "dropped": false}));
         }
+        not_attached(lake, &d.name, &format!("DROP CONNECTION {}", d.name)).await?;
         lake.cat.commit(vec![], &[key(&d.name)]).await?;
         Ok(j!({"connection": d.name, "dropped": true}))
     })
@@ -527,6 +542,46 @@ mod tests {
         assert_eq!(said("ATTACH 's3://b' AS x (TYPE iceberg, FORMAT x)").await.1, "ATTACH … (TYPE iceberg) has no option format: endpoint, secret, read_only, endpoint_type, access_delegation_mode");
         assert_eq!(said("ATTACH 's3://b' AS x (TYPE delta, URL 's3://c')").await.1, "ATTACH … (TYPE delta) has no option url: secret, read_only", "its url is ATTACH's own");
         assert_eq!(run(&lake, "ATTACH 's3://b/t' AS x (TYPE delta, READ_ONLY)").await.unwrap()[0]["type"], "delta");
+        Ok(())
+    }
+
+    /// A connection that holds tables is attached by its name (`ATTACH shop [AS name]`): checked as ATTACH 'url' … (TYPE t) is,
+    /// read with the connection's url and options as they are now, and the connection keeps its name and type while it is.
+    #[tokio::test]
+    async fn a_connections_tables_are_attached_by_its_name() -> Result<()> {
+        let lake = lake().await?;
+        let over = |name: &'static str| {
+            let lake = lake.clone();
+            async move { crate::ext::attached(&lake).await.unwrap().into_iter().find(|(n, _)| n == name).map(|(_, a)| a).expect("attached") }
+        };
+        assert_eq!(code(run(&lake, "ATTACH shop").await).0, "42704");
+        run(&lake, "CREATE CONNECTION shop TYPE delta WITH (url = 's3://b/tables/', read_only = true)").await.unwrap();
+        assert_eq!(run(&lake, "ATTACH DATABASE shop AS sales").await.unwrap()[0], j!({"attached": "sales", "type": "delta", "url": "s3://b/tables"}));
+        let a = over("sales").await;
+        assert_eq!((a.kind.as_str(), a.url.as_str(), a.connection.as_deref(), a.options.get("read_only").map(String::as_str)), ("delta", "s3://b/tables", Some("shop"), Some("true")));
+        let shown = crate::objects::list(&lake).await?.into_iter().find(|o| o.kind == "database" && o.name == "sales").and_then(|o| o.definition);
+        assert_eq!(shown.as_deref(), Some("ATTACH shop AS sales"), "SHOW CREATE DATABASE names the connection, not its url");
+        // (it follows the connection: ALTER CONNECTION … SET and RESET)
+        run(&lake, "ALTER CONNECTION shop SET (url = 's3://c/t')").await.unwrap();
+        run(&lake, "ALTER CONNECTION shop RESET (read_only)").await.unwrap();
+        let a = over("sales").await;
+        assert_eq!((a.url.as_str(), a.options.get("read_only")), ("s3://c/t", None));
+        // (the connection keeps its name and its type while a database is attached over it)
+        let said = "database sales is attached over connection shop: DETACH sales, then";
+        assert_eq!(code(run(&lake, "DROP CONNECTION shop").await), ("2BP01".into(), format!("{said} DROP CONNECTION shop")));
+        assert_eq!(code(run(&lake, "ALTER CONNECTION shop RENAME TO store").await), ("2BP01".into(), format!("{said} ALTER CONNECTION shop RENAME TO store")));
+        assert_eq!(code(run(&lake, "CREATE OR REPLACE CONNECTION shop TYPE kafka WITH (url = 'kafka://b:9092')").await).0, "2BP01");
+        run(&lake, "CREATE OR REPLACE CONNECTION shop TYPE delta WITH (url = 's3://d/t')").await.unwrap();
+        assert_eq!(over("sales").await.url, "s3://d/t");
+        // (with no AS, it is attached by the connection's name; a connection's options are its own; one for files isn't attached)
+        run(&lake, "ATTACH shop").await.unwrap();
+        assert_eq!(over("shop").await.connection.as_deref(), Some("shop"));
+        assert!(code(run(&lake, "ATTACH shop AS x (TYPE delta)").await).1.starts_with("ATTACH shop [AS name]: a connection's options are its own"));
+        run(&lake, "CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://b/drop')").await.unwrap();
+        assert!(code(run(&lake, "ATTACH drop_zone").await).1.starts_with("ATTACH … (TYPE s3): delta, iceberg, kafka or share"));
+        run(&lake, "DETACH sales").await.unwrap();
+        run(&lake, "DETACH shop").await.unwrap();
+        run(&lake, "DROP CONNECTION shop").await.unwrap();
         Ok(())
     }
 

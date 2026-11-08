@@ -24,6 +24,7 @@ pub struct Prefix {
 pub const EXTENSIONS: &str = "ex/";
 
 /// The prefix an installed extension keeps its records under.
+#[cfg_attr(not(test), allow(dead_code))] // (step 15's installed extensions take it)
 pub fn of_extension(name: &str) -> String {
     format!("{EXTENSIONS}{name}/")
 }
@@ -85,6 +86,7 @@ fn all_of(r: &Registry) -> Vec<Listed> {
 
 /// Whose `key` is: the owner of the prefix it's under, or None when nobody registered one. (A walk of the registry's
 /// prefixes, for a check or a tool: no hot path asks.)
+#[cfg_attr(not(test), allow(dead_code))] // (the checks ask it so far)
 pub fn owner(key: &str) -> Option<String> {
     all_of(crate::registry::get()).into_iter().find(|p| covers(p.prefix, key)).map(|p| p.owner)
 }

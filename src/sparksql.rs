@@ -22,6 +22,15 @@ pub fn mentions(sql: &str) -> bool {
     sql.to_ascii_lowercase().contains("spark_sql")
 }
 
+/// The front's pass of this module (`passes.rs`): `inline`, triggered by `spark_sql`.
+pub(crate) fn pass() -> crate::passes::Pass {
+    fn run(sql: &str) -> Result<std::borrow::Cow<'_, str>> {
+        let out = inline(sql)?;
+        Ok(if out == sql { std::borrow::Cow::Borrowed(sql) } else { std::borrow::Cow::Owned(out) })
+    }
+    crate::passes::Pass { name: "sparksql.inline", order: 10, words: vec![], marks: vec![&["spark_sql"]], run: crate::passes::Run::Text(run) }
+}
+
 /// Every `spark_sql('…')` in a FROM, replaced by its query turned into Pondra's SQL.
 pub fn inline(sql: &str) -> Result<String> {
     if !mentions(sql) {

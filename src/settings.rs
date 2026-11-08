@@ -324,6 +324,7 @@ pub const CORE: &[Setting] = &[
     test("PONDRA_TEST_FORMAT", Int, No),
     test("PONDRA_TEST_NO_GATE", Switch, No),
     test("PONDRA_TEST_ONE_PARSE", Switch, No),
+    test("PONDRA_TEST_PASSES", Switch, No),
     test("PONDRA_TEST_PANICS", Bool, No),
 ];
 

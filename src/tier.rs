@@ -712,6 +712,76 @@ async fn caught_up(lake: &Lake, table: &str, after: u64, upto: u64, rows: u64) -
     Ok(())
 }
 
+/// What a tiering round needs of one table (`App::tier_all`), kept from round to round.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Brief {
+    /// The log segment it is tiered to (`TableMeta::tiered`): the oldest of them is where the round reads the log from.
+    pub tiered: u64,
+    /// Files to merge or seal: 8 or more, or one that is a tenth or more deleted rows (`maintain` rewrites them).
+    pub untidy: bool,
+    /// Changed rows that may wait in its files (`purge` says whether it's time).
+    pub changed: bool,
+}
+
+impl Brief {
+    pub fn of(m: &TableMeta) -> Brief {
+        let heavy = m.files.iter().any(|f| f.deleted > 0 && f.deleted * 10 >= f.rows);
+        Brief { tiered: m.tiered, untidy: m.files.len() >= 8 || heavy, changed: m.changed && m.purged() < m.tiered }
+    }
+}
+
+/// How often a leader's rounds read every table again (`refresh`, `delta::publish_named`): between sweeps they read only
+/// the tables committed since their last round, so a table a round missed waits at most this.
+pub const SWEEP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A sweep reads this many tables' entries at a time.
+const SWEEP_PAGE: usize = 1000;
+
+/// The tables a leader's tiering rounds look at, each by its `Brief` (`App::tables`).
+pub type Tables = BTreeMap<String, Brief>;
+
+/// Brings `tables` up to date for a round: every table's entry at a leader's first round and once a `SWEEP` (a page at
+/// a time, so no lock is held across it), and otherwise only the entries of the tables committed since the last round
+/// (`Catalog::written`). Its reads follow what changed, not how many tables the lake holds (the write-set rule:
+/// designs/redesign/redesign.md §4). A table committed while it reads is in the next round's set.
+pub async fn refresh(lake: &Lake, tables: &std::sync::Mutex<Tables>) -> Result<()> {
+    let read = async {
+        match lake.cat.written("tier", SWEEP) {
+            Some(names) => {
+                for name in names {
+                    let brief = lake.cat.meta(&table_key(&name)).await?.map(|m| Brief::of(&m));
+                    let mut t = tables.lock().unwrap();
+                    match brief {
+                        Some(b) => t.insert(name, b),
+                        None => t.remove(&name), // (dropped, or renamed away)
+                    };
+                }
+            }
+            None => {
+                let (mut of, mut from) = (Tables::new(), "t/".to_string());
+                loop {
+                    let (page, _) = lake.cat.scan_page(&from, "t0", SWEEP_PAGE, |_| true).await?;
+                    for (key, raw) in &page {
+                        let meta: std::sync::Arc<TableMeta> = lake.cat.parsed(key, raw)?;
+                        of.insert(key[2..].to_string(), Brief::of(&meta));
+                    }
+                    match page.last() {
+                        Some((key, _)) if page.len() == SWEEP_PAGE => from = format!("{key}\0"),
+                        _ => break,
+                    }
+                }
+                *tables.lock().unwrap() = of;
+            }
+        }
+        anyhow::Ok(())
+    };
+    let read = read.await;
+    if read.is_err() {
+        lake.cat.missed("tier"); // (the next round reads every table)
+    }
+    read
+}
+
 /// Retention: drop log segments that every table and every streaming task has consumed, and
 /// files replaced by compaction, once older than `grace_ms` (readers holding an older snapshot
 /// may still use them). Catalog first, then the objects: a crash leaves only unreferenced objects.
@@ -1269,6 +1339,41 @@ mod tests {
         }
         assert!(!entry.stats.contains_key("long"));
         assert_eq!(entry.nulls, Some(vec!["i".to_string()]));
+    }
+
+    /// A round reads every table once, then only the ones committed since (`refresh`, `Catalog::written`): a table made,
+    /// one changed and one dropped are what it learns, and one it wasn't told of keeps its old brief until a sweep. A
+    /// round that failed part way reads every table next (`missed`), as one does once a sweep is due.
+    #[tokio::test]
+    async fn a_round_reads_only_the_tables_committed_since_the_last() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-rounds-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        for t in ["a", "b", "c"] {
+            crate::write::create_table(&lake, t, r#"{"columns": [["x", "Int64"]]}"#).await?;
+        }
+        let tables = std::sync::Mutex::new(Tables::new());
+        let names = |t: &std::sync::Mutex<Tables>| t.lock().unwrap().keys().cloned().collect::<Vec<_>>();
+        refresh(&lake, &tables).await?;
+        assert_eq!(names(&tables), ["a", "b", "c"]);
+        tables.lock().unwrap().get_mut("a").unwrap().tiered = 999; // (a brief only a sweep corrects)
+        let mut b = lake.cat.get::<TableMeta>(&table_key("b")).await?.unwrap();
+        b.tiered = 7;
+        lake.cat.commit(vec![(table_key("b"), json(&b))], &[table_key("c")]).await?;
+        crate::write::create_table(&lake, "d", r#"{"columns": [["x", "Int64"]]}"#).await?;
+        refresh(&lake, &tables).await?;
+        assert_eq!(names(&tables), ["a", "b", "d"]);
+        let briefs = tables.lock().unwrap().clone();
+        assert_eq!((briefs["a"].tiered, briefs["b"].tiered), (999, 7), "only the tables committed were read");
+        lake.cat.missed("tier");
+        refresh(&lake, &tables).await?;
+        assert_ne!(tables.lock().unwrap()["a"].tiered, 999, "a round after a failed one reads every table");
+        lake.cat.again("tier", ["a".to_string()]);
+        assert_eq!(lake.cat.written("tier", SWEEP), Some(["a".to_string()].into()));
+        assert_eq!(lake.cat.written("tier", std::time::Duration::ZERO), None, "a sweep is due");
+        assert_eq!(lake.cat.written("other", SWEEP), None, "a round's first call reads every table");
+        lake.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     /// A streamed write's batches go to its files in order, each file put once it holds `max_rows`, while the next batch

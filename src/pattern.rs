@@ -46,6 +46,17 @@ const NAVIGATIONS: &[&str] = &["first", "last", "prev", "next", "classifier", "m
 /// The refusal of CLASSIFIER() inside a navigation of a DEFINE, with the way to write it.
 const CLASSIFIER_IN_NAV: &str = "CLASSIFIER() inside a navigation isn't supported in a DEFINE yet: test CLASSIFIER() on its own, as CLASSIFIER() = 'b'";
 
+/// The front's passes of this module (`passes.rs`): `refused`, `text` and `wanted`, each triggered by `MATCH_RECOGNIZE`.
+pub(crate) fn passes() -> Vec<crate::passes::Pass> {
+    use crate::passes::{Pass, Run};
+    fn run(sql: &str) -> Result<Cow<'_, str>> { Ok(text(sql)) }
+    vec![
+        Pass { name: "pattern.refused", order: 30, words: vec!["match_recognize"], marks: vec![], run: Run::Refuse(refused) },
+        Pass { name: "pattern.text", order: 50, words: vec!["match_recognize"], marks: vec![], run: Run::Text(run) },
+        Pass { name: "pattern.wanted", order: 70, words: vec!["match_recognize"], marks: vec![], run: Run::Wants(wanted) },
+    ]
+}
+
 /// Whether `sql` may hold a `MATCH_RECOGNIZE`: a look before anything is parsed.
 pub fn wanted(sql: &str) -> bool {
     static WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bmatch_recognize\b").expect("a regex"));

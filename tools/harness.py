@@ -21776,20 +21776,23 @@ def registry():
 
 
 def connections():
-    """Connections (redesign step 4, pieces 2-4): a connection's files are written and read by its name, '@drop/…', in every
+    """Connections (redesign step 4, pieces 2-5): a connection's files are written and read by its name, '@drop/…', in every
     statement that takes a path (COPY … TO, FROM, a reader, a LOCATION, COPY INTO), through the store its definition makes,
     which follows ALTER CONNECTION. A user reads through it with READ on it, and no USAGE on any secret; a name that isn't a
-    connection, or one that holds tables, is refused by name."""
+    connection, or one that holds tables, is refused by name. A connection that holds tables is attached by its name
+    (ATTACH shop AS sales), read where the connection says, and kept while a database is attached over it."""
     import base64
     lake, drop, later = new_lake(), new_lake(), new_lake()
     kind = "s3" if A.s3 else "folder"  # (a folder's for a lake in a folder; in a bucket, the node's own credentials, lent)
-    node = Node(lake, A.port, admin_token="adm").start()
-    def as_(auth, q):
+    key = uuid.uuid4().hex
+    node = Node(lake, A.port, admin_token="adm", env={"PONDRA_OWNER_KEY": key}).start()
+    def as_(auth, q, more=None):
         try:
-            return call(A.port, "POST", "/sql", q.encode(), headers={"Authorization": auth})
+            return call(A.port, "POST", "/sql", q.encode(), headers={"Authorization": auth, **(more or {})})
         except Exception as e:
             return f"ERROR {e}"
     adm = lambda q: as_("Bearer adm", q)
+    own = lambda q: as_("Bearer adm", q, {"x-pondra-owner": key})  # (another engine's tables in a folder here are the node's owner's to read, as ATTACH's are)
     checks = {}
     made = adm(f"CREATE CONNECTION drop TYPE {kind} WITH (url = '{drop}')")
     wrote = [adm("COPY (SELECT 1 AS id, 'a' AS name UNION ALL SELECT 2, 'b') TO '@drop/out/rows.parquet'"),
@@ -21819,10 +21822,22 @@ def connections():
     adm("COPY (SELECT 9 AS id) TO '@drop/x.parquet'")
     moved = [adm("SELECT id FROM '@drop/x.parquet'"), adm(count)]
     checks["ALTER CONNECTION … SET (url = …): its paths follow it"] = moved[0] == [{"id": 9}] and "ERROR" in str(moved[1])
+    wh, wh2 = new_lake(), new_lake()
+    own(f"COPY (SELECT 1 AS id) TO '{wh}/s/t/' (FORMAT delta)")
+    own(f"COPY (SELECT 1 AS id UNION ALL SELECT 2) TO '{wh2}/s/t/' (FORMAT delta)")
+    adm(f"CREATE OR REPLACE CONNECTION shop TYPE delta WITH (url = '{wh}')")
+    tables = {"attached": adm("ATTACH shop AS sales"), "one": own("SELECT count(*) AS n FROM sales.s.t")}
+    adm(f"ALTER CONNECTION shop SET (url = '{wh2}')")
+    tables |= {"two": own("SELECT count(*) AS n FROM sales.s.t"), "shown": adm("SHOW CREATE DATABASE sales"), "kept": adm("DROP CONNECTION shop")}
+    adm("DETACH sales")
+    tables["dropped"] = adm("DROP CONNECTION shop")
+    checks["ATTACH shop AS sales: a connection's tables, read where it says, after ALTER CONNECTION too; DROP CONNECTION waits for DETACH"] = \
+        tables["one"] == [{"n": 1}] and tables["two"] == [{"n": 2}] and "ATTACH shop AS sales" in str(tables["shown"]) \
+        and "DETACH sales" in str(tables["kept"]) and "ERROR" not in str(tables["dropped"])
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"connections": checks, "ok": ok, "info": {"made": made, "wrote": wrote, "read": read, "csv": csv, "ext": ext, "loaded": loaded,
-                                                                "refused": refused, "granted": granted, "write": write, "nope": nope, "shop": shop, "moved": moved}}, indent=1, default=str))
+                                                                "refused": refused, "granted": granted, "write": write, "nope": nope, "shop": shop, "moved": moved, "tables": tables}}, indent=1, default=str))
     if not ok:
         sys.exit(1)
 
@@ -24125,6 +24140,9 @@ def use_path():
     sql(A.port, "INSERT INTO crm.w VALUES (1, 'x'), (2, 'x')")
     sql(A.port, "CREATE VIEW crm.here AS SELECT current_schema() AS s")
     on_follower = lambda body: call(A.port + 1, "POST", "/sql", body, headers=f)
+    # (once the follower has the view: until then it can't tell the view says current_schema(), and the leader reads it
+    # as public's, `path::session_view`)
+    until(lambda: _try(lambda: on_follower(b"SELECT s FROM here")), [{"s": "crm"}], 15)
     on_follower(b"UPDATE w SET s = (SELECT s FROM here) WHERE id = 1")
     on_follower(b"MERGE INTO w USING (SELECT 2 AS id, s FROM here) AS src ON w.id = src.id WHEN MATCHED THEN UPDATE SET s = src.s || '-m'")
     info["follower's change through a view"] = sql(A.port, "SELECT id, s FROM crm.w ORDER BY id")
