@@ -358,16 +358,18 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone(), tables: Default::default() };
     if let Some(ledger) = lake.ledger() {
         ledger.charge("answers", Arc::downgrade(&app.results) as std::sync::Weak<dyn crate::ledger::Charged>); // (the remembered answers: `/metrics`' `cache_bytes`)
-        // (the node's caches of what the lake's own floor doesn't reach, charged once whatever lakes it opens: the logs and
-        // manifests of Delta and Iceberg tables read, and what lookups keep (the statements worked out as point queries and
-        // the log tails' keys))
-        for (name, cache) in [("delta_logs", crate::read_delta::logs()), ("iceberg_manifests", crate::read_iceberg::manifests()), ("point_plans", crate::serve::points()), ("tail_keys", crate::serve::tail_keys())] {
+        // (the node's caches of what the lake's own floor doesn't reach, charged once whatever lakes it opens: what lookups
+        // keep (the statements worked out as point queries and the log tails' keys))
+        for (name, cache) in [("point_plans", crate::serve::points()), ("tail_keys", crate::serve::tail_keys())] {
             ledger.charge(name, Arc::downgrade(&cache));
         }
         // (the lake's state its doors use, made as it starts, so `/metrics` names it before its first use: the answers kept
-        // for their pages, and its functions' answers; each is charged to the lake's line as it is made, `Lake::state`)
+        // for their pages, its functions' answers, and the logs and manifests of the Delta and Iceberg tables it reads; each
+        // is charged to the lake's line as it is made, `Lake::state`)
         lake.state::<crate::pages::Pages>()?;
         lake.state::<crate::pyfn::Answered>()?;
+        lake.state::<crate::read_delta::Logs>()?;
+        lake.state::<crate::read_iceberg::Manifests>()?;
     }
     crate::constraints::share_lock(&app.lake, app.lock.clone()); // a checked append of this lake takes this lock (`constraints::leader`); the Log is reachable only through the App
     learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
@@ -663,7 +665,8 @@ pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) 
     if let Some(given) = store {
         crate::memory_lake::give(&url, given); // (a kept page's objects stay in its folder when the page closes: `end_page` forgets the URL only)
     }
-    let store = crate::memory_lake::store(&url);
+    let node = crate::node_state::NodeState::new(life.clone());
+    let store = crate::store::counted(crate::memory_lake::store(&url), &node.metrics); // (its term's claims and marks the page's: `Counted`)
     let lead = if owned { crate::members::Alone::lead_owned(&store).await } else { crate::members::Alone::lead(&store).await };
     let (alone, marks) = match lead {
         Ok(led) => led,
@@ -677,7 +680,7 @@ pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) 
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open(&url, true, false, crate::node_state::NodeState::new(life.clone())).await?;
+        let l = crate::store::Lake::open(&url, true, false, node).await?;
         lake = Some(l.clone());
         start_app(l, alone.clone(), None, &start).await
     }

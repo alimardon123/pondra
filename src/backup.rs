@@ -253,7 +253,7 @@ async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Op
 /// writer is closed on every path, a panic's too, so no writer of another lake stays in this node for that
 /// lake's next leader to fence.
 async fn take_here(to: &str, t: Take, node: &std::sync::Arc<crate::node_state::NodeState>) -> Result<Value> {
-    let store = crate::store::open_store(to)?.1;
+    let store = crate::store::counted(crate::store::open_store(to)?.1, &node.metrics); // (its requests the node's: `Counted`)
     // (a term none holds, or that another one-off writer holds: waited for; a node serving the backup refuses)
     let term = crate::terms::claim_one_off(&store, |t| {
         ensure!(t.addr.is_empty(), "{to} is served by a node, which can't read a lake in this process's memory: back up somewhere else, or stop that node");
