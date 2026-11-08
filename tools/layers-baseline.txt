@@ -64,7 +64,7 @@ ext -> kafka_client  2
 ext -> read_delta  2
 ext -> read_iceberg  1
 ext -> sharing_client  2
-ext -> wasm32  10
+ext -> wasm32  6
 extension -> crypto  3
 extension -> wasm32  27
 facts -> measures  2
