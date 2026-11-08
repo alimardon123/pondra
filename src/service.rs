@@ -111,7 +111,7 @@ async fn status(name: &str) -> Result<()> {
     // (a node with tokens names the cluster's members to a token only: this shell's, if it has one)
     let given = |v: &str| std::env::var(v).ok().filter(|t| !t.is_empty());
     let token = given("PONDRA_TOKEN").or_else(|| given("PONDRA_ADMIN_TOKEN"));
-    let mut asking = reqwest::Client::new().get(format!("http://127.0.0.1:{port}/stats")).timeout(std::time::Duration::from_secs(3));
+    let mut asking = crate::net::process().client(crate::net::Policy::Local).get(format!("http://127.0.0.1:{port}/stats")).timeout(std::time::Duration::from_secs(3));
     if let Some(t) = token {
         asking = asking.bearer_auth(t);
     }

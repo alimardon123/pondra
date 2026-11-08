@@ -86,16 +86,12 @@ pub fn move_lake(m: Move) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether this process runs its node as a library: set by the first library's open (`host`), never by
-/// the program. What the process is, so it outlives each node.
-static HOSTED: AtomicBool = AtomicBool::new(false);
-
 /// Where a node's restarts and failures are sent: the supervisor of the node open now, if any (a library's, `host`, or
 /// `pondra serve`'s, `supervise`). One node is open at a time in a process.
 static SUPERVISOR: Mutex<Option<mpsc::UnboundedSender<Event>>> = Mutex::new(None);
 
 /// Is this process a library's (`host`), not the program's?
-pub fn hosted() -> bool { HOSTED.load(SeqCst) }
+pub fn hosted() -> bool { crate::machine::hosted() }
 
 /// What a node's supervisor is told: a restart or a failure from the node's own work, or the close of the node
 /// (a library's `Opened`).
@@ -131,7 +127,7 @@ pub(crate) fn host(tx: mpsc::UnboundedSender<Event>) -> anyhow::Result<()> {
         anyhow::ensure!(s.is_none(), "a node is open in this process already: close it first (one at a time)");
         *s = Some(tx);
     }
-    HOSTED.store(true, SeqCst);
+    crate::machine::set_hosted(); // (what the process is, from its first library's open: it outlives each node)
     Ok(())
 }
 
@@ -280,7 +276,7 @@ pub fn exe() -> anyhow::Result<PathBuf> {
 #[cfg(feature = "doors")]
 pub async fn lead_once(dir: &str) -> anyhow::Result<()> {
     // (another process would lead a lake of its own memory, gone when it ends)
-    anyhow::ensure!(!crate::memory::in_memory(dir), "{dir} is in a process's memory, where a lake is made by opening it (pondra.open(), pondra :memory:) and led by that process alone: attach or make a database in a folder or a bucket");
+    anyhow::ensure!(!crate::memory_lake::in_memory(dir), "{dir} is in a process's memory, where a lake is made by opening it (pondra.open(), pondra :memory:) and led by that process alone: attach or make a database in a folder or a bucket");
     run::lead_once(dir).await
 }
 
@@ -635,10 +631,10 @@ pub fn unclaim_page() {
 /// task that follows a joined page's node's stream (`open_joined`), aborted at the page's end (`end_page`).
 pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, ended: Arc<AtomicBool>, superuser: AtomicBool, pub(crate) life: Arc<PageLife> }
 
-/// Takes the module's page (`PAGED`) for a page's member, and sets the device line its queries hold (`env::device_line`). A
-/// freed page's member may still be closing in the background, which sets PAGED back when it has ended: then this waits for
-/// it, 10 ms at a time, for 30 s at most, and is refused 55006 after that.
-async fn claim_paged(line: Option<usize>) -> anyhow::Result<()> {
+/// Takes the module's page (`PAGED`) for a page's member. A freed page's member may still be closing in the background,
+/// which sets PAGED back when it has ended: then this waits for it, 10 ms at a time, for 30 s at most, and is refused 55006
+/// after that.
+async fn claim_paged() -> anyhow::Result<()> {
     // (`swap` checks and sets at once, so two opens can't both take it)
     let mut sleeps = 0;
     while PAGED.swap(true, SeqCst) {
@@ -648,25 +644,24 @@ async fn claim_paged(line: Option<usize>) -> anyhow::Result<()> {
         sleeps += 1;
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    crate::env::set_device_line(line); // (its lake's queries hold the page's share of it: `store::memory_limit`)
     Ok(())
 }
 
 /// Opens a page's member (`Paged`), its lake on `store` when one is given (a kept page's folder), else in memory, and its
-/// queries holding the page's share of its device's `line` (`claim_paged`). Set back if the open fails.
-pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>, life: Arc<PageLife>) -> anyhow::Result<Paged> {
-    claim_paged(line).await?;
-    let url = crate::memory::place(":memory:");
+/// queries holding the page's share of its device's line (`store::memory_limit`). Set back if the open fails.
+pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) -> anyhow::Result<Paged> {
+    claim_paged().await?;
+    let url = crate::memory_lake::place(":memory:");
     let owned = store.is_some(); // (a given store is a kept page's folder, under its Web Lock: no other writer, so its term is taken at once)
     if let Some(given) = store {
-        crate::memory::give(&url, given); // (a kept page's objects stay in its folder when the page closes: `end_page` forgets the URL only)
+        crate::memory_lake::give(&url, given); // (a kept page's objects stay in its folder when the page closes: `end_page` forgets the URL only)
     }
-    let store = crate::memory::store(&url);
+    let store = crate::memory_lake::store(&url);
     let lead = if owned { crate::members::Alone::lead_owned(&store).await } else { crate::members::Alone::lead(&store).await };
     let (alone, marks) = match lead {
         Ok(led) => led,
         Err(e) => {
-            crate::memory::forget_memory(&url);
+            crate::memory_lake::forget_memory(&url);
             PAGED.store(false, SeqCst);
             return Err(e);
         }
@@ -707,7 +702,7 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
     if term > 0 {
         crate::terms::release(store, term).await; // (a joined page claimed no term: `open_joined`'s is 0, and its store takes no write)
     }
-    crate::memory::forget_memory(url);
+    crate::memory_lake::forget_memory(url);
     crate::reset::reset();
     PAGED.store(false, SeqCst); // (last: the next `open_page` starts once the statics are set back)
 }
@@ -718,11 +713,11 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
 /// 3 s (a node's is 250 ms, but each of a page's is a request). It claims no term and writes nothing to the cluster, so closing
 /// it changes nothing there. The sign-in's end stops both loops and sets `ended` (a 401 or 403 from the node, or the refresh's
 /// closed error).
-pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, line: Option<usize>, life: Arc<PageLife>) -> anyhow::Result<Paged> {
-    claim_paged(line).await?;
-    let url = crate::memory::place(":memory:");
-    crate::memory::give(&url, store);
-    let store = crate::memory::store(&url);
+pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, life: Arc<PageLife>) -> anyhow::Result<Paged> {
+    claim_paged().await?;
+    let url = crate::memory_lake::place(":memory:");
+    crate::memory_lake::give(&url, store);
+    let store = crate::memory_lake::store(&url);
     let node = node.trim_end_matches('/').to_string();
     crate::dial::set_page(node.clone(), auth.to_string()); // (the page's calls go to this node, with this sign-in: `dial::Paged`)
     let members: Arc<dyn Members> = Arc::new(crate::members::Joined::new(&node));
@@ -741,7 +736,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
             let (superuser, slug) = whoami(&node, auth).await; // (the sign-in's: a superuser's joins stage their rows, `page::joined_part`)
             crate::dial::set_page_slug(slug);
             let (following, refreshing) = (Arc::downgrade(&app.lake), Arc::downgrade(&app.lake));
-            let (http, auth) = (reqwest::Client::new(), auth.to_string());
+            let (http, auth) = (app.lake.node.net.client(crate::net::Policy::ENDPOINT), auth.to_string()); // (the join's sign-in alone: no token of ours)
             let ended = Arc::new(AtomicBool::new(false)); // (the sign-in ended: neither loop asks again)
             let (said, refreshed) = (ended.clone(), ended.clone());
             let open = move || -> futures::future::BoxFuture<'static, Result<crate::fetch::Response, crate::members::Open>> {
@@ -788,7 +783,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
 /// decides whether the page's INSERTs are its own to stage (`page::joined_part`), and its slug, the folder it stages them in
 /// (`auth::slug`). Not known (no answer in 10 s, or a sign-in refused): neither.
 async fn whoami(node: &str, auth: &str) -> (bool, Option<String>) {
-    let asked = crate::fetch::send(crate::ext::bare().get(format!("{node}/whoami")).header(reqwest::header::AUTHORIZATION, auth));
+    let asked = crate::fetch::send(crate::net::process().client(crate::net::Policy::ENDPOINT).get(format!("{node}/whoami")).header(reqwest::header::AUTHORIZATION, auth));
     let answer = async {
         let r = asked.await.ok().filter(|r| r.status().is_success())?;
         let who: serde_json::Value = r.json().await.ok()?;

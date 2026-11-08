@@ -71,8 +71,9 @@ impl Drop for Open {
     fn drop(&mut self) { OPEN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); }
 }
 
-/// The answers end once the caller may no longer have them: its sign-in revoked, expired, or no longer a reader, checked
-/// every 5 s (`server::until_revoked`) whether or not they change; each answer is as its sign-in and grants are then (`lines`).
+/// The answers end once the caller may no longer have them: its sign-in revoked, expired, or no longer a reader, asked again
+/// once the lake's rights move (`server::until_revoked`) whether or not they change; each answer is as its sign-in and grants
+/// are then (`lines`).
 pub async fn live(State(app): State<App>, Query(p): Query<Params>, headers: axum::http::HeaderMap, body: bytes::Bytes) -> Response {
     let every = Duration::from_millis(p.every_ms.unwrap_or(100).max(10));
     let revoked = crate::server::until_revoked(app.clone(), crate::auth::operator(), header(&headers), |p| p.role >= crate::auth::Role::Read);

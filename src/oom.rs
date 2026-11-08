@@ -46,28 +46,46 @@ const FIRST: Duration = Duration::from_millis(200);
 /// below it.
 const RATE: f64 = 8.0 * (1u64 << 30) as f64;
 
-crate::per_node!(static SEEN: AtomicUsize = AtomicUsize::new(0));
-// (the watch is waiting: a request that starts then has no reading until the watch's next look gives it one)
-crate::per_node!(static IDLE: AtomicBool = AtomicBool::new(false));
-// (the watch runs in this process: the hot columns may then sit beside the query memory, `Hot::room_for`)
-crate::per_node!(static WATCHING: AtomicBool = AtomicBool::new(false));
-// (a wake-up holding no data: a request started, or the hot columns grew, so the watch looks again now)
-crate::per_node!(static WAKE: tokio::sync::Notify = tokio::sync::Notify::new(); clear = |_| ());
+/// The process's memory watch (redesign step 2): one a process, as the memory it reads is and the line it holds the
+/// process to (`ledger::Root`). It starts at the first node's start (`start`) and lives as long as the process, so
+/// a node that stops ends nothing another node in the process goes by. (Not in a root: a test's lake gets a root of
+/// its own sizes, and the process still has one watch.)
+struct Watch {
+    /// The resident memory read last (0 before the first look).
+    seen: AtomicUsize,
+    /// The watch is waiting: a request that starts then has no reading until the watch's next look gives it one.
+    idle: AtomicBool,
+    /// The watch runs in this process: the hot columns may then sit beside the query memory (`Hot::room_for`).
+    watching: AtomicBool,
+    /// A wake-up holding no data: a request started, or the hot columns grew, so the watch looks again now.
+    wake: tokio::sync::Notify,
+    /// The loop started (`start`): once a process.
+    started: std::sync::Once,
+}
+
+static WATCH: Watch = Watch {
+    seen: AtomicUsize::new(0),
+    idle: AtomicBool::new(false),
+    watching: AtomicBool::new(false),
+    wake: tokio::sync::Notify::const_new(),
+    started: std::sync::Once::new(),
+};
 
 /// The node's memory line in bytes: `PONDRA_MEMORY_MAX_GB`, else 85% of the machine's or container's
 /// memory. None when it is 0 (off), or in a host's process, where the memory is the host's.
 pub fn line() -> Option<usize> {
-    // (a page's line is its device's, and it has one only where its memory is read: `store::resident`)
+    // (a page's line is its device's, and it has one only where its memory is read: `Machine::resident`, a page's `Device`)
     if cfg!(target_arch = "wasm32") {
-        return crate::store::resident().and_then(|_| line_on(crate::env::device_line()));
+        let device = crate::machine::process();
+        return device.resident().and_then(|_| line_on(device.line()));
     }
-    if crate::node::hosted() {
+    if crate::machine::hosted() {
         return None;
     }
-    crate::env::memory_line(crate::store::ram().map(|ram| (ram as f64 * 0.85) as usize))
+    crate::env::memory_line(crate::machine::process().ram().map(|ram| (ram as f64 * 0.85) as usize))
 }
 
-/// The memory line on a page's device, which has `device` bytes (`Options::line`, or the one its member was opened with): the
+/// The memory line on a page's device, which gives the module `device` bytes (its machine's line, `Machine::line`): the
 /// device's, else `env::PAGE_LINE`, through `PONDRA_MEMORY_MAX_GB` as `env::memory_line` takes it.
 pub(crate) fn line_on(device: Option<usize>) -> Option<usize> {
     crate::env::memory_line(Some(device.unwrap_or(crate::env::PAGE_LINE)))
@@ -100,10 +118,10 @@ pub(crate) async fn polled<T>(reading: impl Fn() -> usize, line: usize, f: impl 
 /// `usize::MAX`, not read yet: a request that starts then takes the watch's next reading as its own
 /// (`panics::note`), and `pick` passes it over until then.
 pub fn seen() -> usize {
-    if IDLE.load(Relaxed) {
+    if WATCH.idle.load(Relaxed) {
         usize::MAX
     } else {
-        SEEN.load(Relaxed)
+        WATCH.seen.load(Relaxed)
     }
 }
 
@@ -137,7 +155,7 @@ pub(crate) async fn come_back(_: usize) -> bool {
 /// line the machine would have (85% of its memory): the host's memory isn't ours to stop queries for,
 /// but our own cache is ours to drop.
 pub fn trim_line() -> Option<usize> {
-    line().or_else(|| Some(crate::store::ram()? / 20 * 17)).map(of_line)
+    line().or_else(|| Some(crate::machine::process().ram()? / 20 * 17)).map(of_line)
 }
 
 /// 85% of a line, or 320 MB under it where that is lower, and never under 70% of it. With the default line
@@ -154,19 +172,19 @@ fn of_line(line: usize) -> usize {
 
 /// Does the watch run in this process (`start`)? Where it doesn't, nothing gives the hot columns back.
 pub fn watching() -> bool {
-    WATCHING.load(Relaxed)
+    WATCH.watching.load(Relaxed)
 }
 
 /// Wakes the watch, so it looks again now. `notify_one` keeps a wake sent between a look and the wait
 /// after it, so none is lost.
 pub fn wake() {
-    WAKE.notify_one()
+    WATCH.wake.notify_one()
 }
 
-/// Takes about `bytes` back from the node's caches (`ledger::Ledger::give_back`), and says how many bytes came back. The
+/// Takes about `bytes` back from the caches of every node in the process (`ledger::budgets`, `Ledger::give_back_kind`), and says how many bytes came back. The
 /// watch gives them back past [`trim_line`], before it stops any query. A lake opened outside a node (`pondra sql`,
 /// `pondra catalog`, `pondra backup`) holds its caches to their own budgets alone, since no watch runs in its process.
-/// A kind at a time across the node's lines, so a line's ranges never go before another's hot columns (11-06 audit L7).
+/// A kind at a time across the nodes' budgets, so a budget's ranges never go before another's hot columns (11-06 audit L7).
 fn give_back(bytes: usize) -> usize {
     let ledgers = crate::store::ledgers();
     let mut kinds: Vec<&'static str> = vec![];
@@ -187,20 +205,27 @@ fn give_back(bytes: usize) -> usize {
     freed
 }
 
-/// Starts the watch, when the process can say how much memory it holds and the caches can be given
-/// back (`trim_line`). The line is checked only where there is one (a node's own process). It runs on a thread of
-/// its own (`panics::alone`), which a node stopped ends, as its other loops end.
+/// Starts the process's watch (`Watch`), when the process can say how much memory it holds and the caches can be given
+/// back (`trim_line`): at the first node's start, once a process. The line is checked only where there is one (a node's
+/// own process). It runs on a thread of its own (`panics::alone`) for as long as the process: a node that stops ends its
+/// own loops, not the process's watch, which then reads the caches and requests of the nodes still running (none: it
+/// waits, and looks every 30 s).
 pub fn start() {
     // (a page's one thread can't run this loop beside a query: a page's requests are watched at each poll instead, `panics::work`)
     if cfg!(target_arch = "wasm32") {
         return;
     }
+    WATCH.started.call_once(watch);
+}
+
+/// The watch's loop (`start`).
+fn watch() {
     let Some(trim) = trim_line() else { return };
-    if crate::store::resident().is_none() {
+    if crate::machine::process().resident().is_none() {
         return;
     }
     let line = line(); // (None in a host's process: there the watch only gives the cache back)
-    WATCHING.store(true, Relaxed);
+    WATCH.watching.store(true, Relaxed);
     if line.is_some() {
         // DataFusion's spawned work charges the request that spawned it, as the request's own polls do (`charge`).
         // (A tracer a program embedding the library set first is kept: its error is ignored.)
@@ -211,8 +236,8 @@ pub fn start() {
         let mut said = false; // the line for this stretch over the line, said once
         loop {
             let mut settling = false; // (a stop this watch made still holds, or its request is still ending)
-            let resident = crate::store::resident().unwrap_or(0);
-            SEEN.store(resident, Relaxed); // (what the OS says: `noted` and `pick` compare it)
+            let resident = crate::machine::process().resident().unwrap_or(0);
+            WATCH.seen.store(resident, Relaxed); // (what the OS says: `noted` and `pick` compare it)
             for ledger in crate::store::ledgers() {
                 ledger.note(); // (what the caches hold, which a query's grow goes by until the next look: `ledger::Ledger`)
             }
@@ -226,8 +251,8 @@ pub fn start() {
                     // The pages just freed would stay resident for seconds (`purge`), so they are handed back now:
                     // the reading after it is what the process holds, and the watch goes by that alone.
                     purge();
-                    felt = crate::store::resident().unwrap_or(felt);
-                    SEEN.store(felt, Relaxed);
+                    felt = crate::machine::process().resident().unwrap_or(felt);
+                    WATCH.seen.store(felt, Relaxed);
                     crate::panics::note(felt);
                 }
             }
@@ -239,8 +264,8 @@ pub fn start() {
                     // over ten seconds: handed back now, the node is under its line again before the next query comes
                     // (stopped median, then string_agg at once: killed with the stop's memory still resident, B50 10-31).
                     purge();
-                    felt = crate::store::resident().unwrap_or(felt);
-                    SEEN.store(felt, Relaxed);
+                    felt = crate::machine::process().resident().unwrap_or(felt);
+                    WATCH.seen.store(felt, Relaxed);
                     crate::panics::note(felt);
                 }
                 if felt < line {
@@ -275,9 +300,9 @@ pub fn start() {
                 Some(line) if crate::panics::running() => tokio::time::sleep(every(felt, trim, line, settling)).await,
                 _ => {
                     let timer = if crate::store::ledgers().iter().any(|l| l.givable()) { Duration::from_secs(2) } else { Duration::from_secs(30) };
-                    IDLE.store(true, Relaxed);
-                    let _ = tokio::time::timeout(timer, WAKE.notified()).await;
-                    IDLE.store(false, Relaxed);
+                    WATCH.idle.store(true, Relaxed);
+                    let _ = tokio::time::timeout(timer, WATCH.wake.notified()).await;
+                    WATCH.idle.store(false, Relaxed);
                 }
             }
         }

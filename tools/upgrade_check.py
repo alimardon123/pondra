@@ -50,7 +50,7 @@ def since(v, first):
 # ---------------------------------------------------------------- releases
 
 def releases(first):
-    """Every release on GitHub since `first`, oldest first: [(version, URL of this platform's binary)]."""
+    """Every release on GitHub since `first`, oldest first: [(version, the API's URL of this platform's binary)]."""
     os_name = {"linux": "linux", "darwin": "macos", "win32": "windows"}.get(sys.platform, sys.platform)
     arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
     plain = {"Accept": "application/vnd.github+json"}
@@ -77,7 +77,7 @@ def releases(first):
         # (the npm package of this platform: every release has one, 0.22.0's first among them)
         asset = next((a for a in r["assets"] if a["name"] == f"pondra-{os_name}-{arch}-{v}.tgz"), None)
         if asset:
-            found.append((v, asset["browser_download_url"]))
+            found.append((v, asset["url"]))  # (the API's route to it: `fetched`)
     return sorted(found, key=lambda r: version(r[0]))
 
 
@@ -98,11 +98,16 @@ def binary(v, url, cache):
 
 
 def fetched(url):
-    """A release's package, asked again when GitHub's download answers a server error or the
-    connection fails (a 500 there once failed the upgrade job half way, its lakes all fine)."""
+    """A release's package, through the API's route to the asset (`url`, which redirects to the asset's own host),
+    asked again when GitHub answers a server error or the connection fails (a 500 once failed the upgrade job half way,
+    its lakes all fine). Not github.com's download link: on 11-08 that answered 502 and 504 for hours while this route
+    answered. The token goes to the API alone, not to the host it redirects to."""
+    req = urllib.request.Request(url, headers={"Accept": "application/octet-stream"})
+    if os.environ.get("GITHUB_TOKEN"):
+        req.add_unredirected_header("Authorization", f"Bearer {os.environ['GITHUB_TOKEN']}")
     for wait in (2, 4, 8, 16, None):
         try:
-            return urllib.request.urlopen(url, timeout=600).read()
+            return urllib.request.urlopen(req, timeout=600).read()
         except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
             if wait is None or (isinstance(e, urllib.error.HTTPError) and e.code < 500):
                 raise

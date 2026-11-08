@@ -13,6 +13,11 @@ pub mod finish;
 pub mod env;
 // What a node's host does when the node must stop or start again, and what the code below it may ask of its form.
 pub mod lifecycle;
+pub mod machine;
+// How a node's calls out reach the network: one client factory, with the policy named by whom a call goes to.
+#[cfg(feature = "lake")] pub mod net;
+// Space of this process's own on this machine's disk: the folders its spills go to.
+#[cfg(feature = "lake")] pub mod scratch;
 // The node as the code below the hosts sees it: its lifecycle, and what its stop waits for and refuses.
 pub mod node_state;
 // The one place a feature says what it adds (designs/redesign/redesign.md §6): `built_in` below lists the build's extensions.
@@ -104,6 +109,7 @@ mod held;
 mod keys_below;
 mod late_rows;
 mod median;
+mod reuse;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
 mod data_file;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
@@ -118,6 +124,7 @@ mod rules;
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
 // Feature `server`, on by default; every module the node is made of is one of these.
 #[cfg(feature = "doors")] pub mod cli;
+#[cfg(feature = "doors")] mod os; // (the native machine: the program's and a library's process install it)
 #[cfg(feature = "lake")] mod adopt;
 #[cfg(feature = "lake")] mod app;
 #[cfg(feature = "lake")] mod audit;
@@ -192,6 +199,7 @@ mod rules;
 #[cfg(feature = "lake")] mod log;
 #[cfg(feature = "lake")] mod manifest;
 #[cfg(feature = "lake")] pub mod memory;
+#[cfg(feature = "lake")] pub mod memory_lake;
 #[cfg(feature = "lake")] pub mod members;
 #[cfg(feature = "lake")] pub mod node;
 #[cfg(feature = "lake")] mod objects;
@@ -223,7 +231,6 @@ mod rules;
 #[cfg(feature = "doors")] mod ci;
 #[cfg(feature = "doors")] mod project;
 #[cfg(feature = "lake")] mod protect;
-#[cfg(feature = "lake")] mod public;
 #[cfg(feature = "lake")] mod query;
 #[cfg(feature = "lake")] mod read_iceberg;
 #[cfg(feature = "lake")] mod ranges;
@@ -258,6 +265,7 @@ mod rules;
 #[cfg(feature = "lake")] mod vend;
 #[cfg(feature = "lake")] mod vars;
 #[cfg(feature = "lake")] mod views;
+#[cfg(feature = "lake")] mod rejects; // (the rows views' expectations drop, kept for review: `pondra.rejects`)
 #[cfg(feature = "lake")] mod write;
 // The registry's statements section: a statement an extension adds, read by `write::parse` at one place.
 #[cfg(feature = "lake")] pub mod statements;

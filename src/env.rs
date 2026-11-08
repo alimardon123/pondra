@@ -73,15 +73,10 @@ pub fn parse<T: FromStr>(name: &str) -> Option<T> {
     get(name)?.trim().parse().ok()
 }
 
-/// The cores this process has: the machine's (its cgroup's, as the standard library reads them), else 2; 1 on a page, which
-/// has one thread. Every count of threads, turns or partitions starts from it (`PONDRA_CORES` is the query planner's own,
-/// `store::partitions`).
-pub fn cores() -> usize {
-    #[cfg(target_arch = "wasm32")]
-    return 1;
-    #[cfg(not(target_arch = "wasm32"))]
-    std::thread::available_parallelism().map_or(2, |n| n.get())
-}
+/// The cores this process has, as its machine says (`Machine::cores`: its cgroup's, as the standard library reads them,
+/// else 2; 1 on a page, which has one thread). Every count of threads, turns or partitions starts from it (`PONDRA_CORES`
+/// is the query planner's own, `store::partitions`).
+pub fn cores() -> usize { crate::machine::process().cores() }
 
 /// A setting read as a `T`, else its default in the table (`settings.rs`): one that isn't set, or doesn't read as a `T`.
 pub fn value<T: FromStr>(name: &str) -> T {
@@ -140,7 +135,7 @@ pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
 /// hold no line of their own then, and a grow past it takes cache bytes back before it spills, as DuckDB's `memory_limit`
 /// holds its buffers and its operators to one number. A cache given a budget of its own (`PONDRA_HOT_GB`, `PONDRA_CACHE_MB`)
 /// keeps it beside the line (`ledger::Charged::inside`). Unset, the whole line is the memory watch's trim line, and the queries
-/// may hold all of it too, the caches giving way (`store::whole_line`), but a spiller isn't refused for a reader's moment in
+/// may hold all of it too, the caches giving way (`store::root_whole`), but a spiller isn't refused for a reader's moment in
 /// a cache.
 pub fn memory_whole() -> Option<usize> {
     gib("PONDRA_MEMORY_GB")
@@ -156,26 +151,11 @@ pub fn raise_memory() -> &'static str {
 /// footprint and for a last step that grows within one poll.
 pub const PAGE_LINE: usize = 3 << 30;
 
-/// The most query memory a page holds (`query_memory`): two thirds of its line (`memory_line` of its device's, else
-/// `PAGE_LINE`; of `PAGE_LINE` when the watch is off, so the pool is never empty). The page's own pool takes it with its
-/// device's line, and a page's lake (`store::memory_limit`) with the one its member was opened with (`device_line`).
-pub fn page_query_memory(device: Option<usize>) -> usize {
-    query_memory(|| memory_line(Some(device.unwrap_or(PAGE_LINE))).unwrap_or(PAGE_LINE) / 3 * 2)
-}
-
-crate::per_node!(
-    /// The line a page's device has (`page::Options::line`), in bytes, which its member's lake holds to as the page's own
-    /// pool does (`store::memory_limit`); 0: its device didn't say. Set as the member opens (`node::open_page`).
-    static DEVICE_LINE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0));
-
-/// Says the line a page's device has (`DEVICE_LINE`), or that it said none.
-pub fn set_device_line(line: Option<usize>) {
-    DEVICE_LINE.store(line.unwrap_or(0), std::sync::atomic::Ordering::Relaxed)
-}
-
-/// The line a page's device has, as its member was opened with; None: its device didn't say (`PAGE_LINE`).
-pub fn device_line() -> Option<usize> {
-    Some(DEVICE_LINE.load(std::sync::atomic::Ordering::Relaxed)).filter(|&line| line > 0)
+/// The query memory a page's process holds (`store::root_line`): two thirds of its line (`memory_line` of its device's,
+/// `Machine::line`, else `PAGE_LINE`; of `PAGE_LINE` when the watch is off, so the pool is never empty). A page's own
+/// `memory_gb` is its budget on it (`query_memory`, `store::memory_limit`).
+pub fn page_line_share(device: Option<usize>) -> usize {
+    memory_line(Some(device.unwrap_or(PAGE_LINE))).unwrap_or(PAGE_LINE) / 3 * 2
 }
 
 /// A setting in seconds (fractions too), else its default in the table: one that is negative or not a number is the

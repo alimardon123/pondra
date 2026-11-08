@@ -238,7 +238,7 @@ async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Op
     };
     let out = tokio::select! {
         // (a lake held in this process's memory is taken here: no `pondra lead` of its own can reach it)
-        out = async { if crate::memory::in_memory(&source.url) { take_here(&to, take, &lake.node).await } else { Box::pin(crate::write::send(&to, Request::Ddl(Ddl::Backup(take)), &lake.node)).await } } => out, // (boxed: `send` leads back here through `deliver`)
+        out = async { if crate::memory_lake::in_memory(&source.url) { take_here(&to, take, &lake.node).await } else { Box::pin(crate::write::send(&to, Request::Ddl(Ddl::Backup(take)), &lake.node)).await } } => out, // (boxed: `send` leads back here through `deliver`)
         _ = renew => unreachable!(),
     };
     if let Err(e) = ask(Ddl::Unpin { lake: pin.clone() }).await {

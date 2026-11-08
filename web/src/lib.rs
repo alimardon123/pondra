@@ -8,9 +8,11 @@ use pondra::page::Node;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
+mod device;
 mod fetch;
 mod heap;
 mod js;
+mod net;
 mod node;
 mod opfs;
 mod spill;
@@ -47,7 +49,7 @@ impl Page {
         set_panic_hook();
         let given = Given::read(&opts)?;
         give(given.settings)?;
-        let page = pondra::page::Page::claim(&options(None, given.node)).map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        let page = claim(&options(None, given.node))?;
         Ok(Page(page, None, spill::start()))
     }
 
@@ -78,7 +80,7 @@ impl Page {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(opfs::Opfs::new(folder));
         // (claimed first, so a page refused its claim opens no spill file; if the page can't be kept, it and `held` drop with
         // this return, and the folder is let go)
-        let claimed = pondra::page::Page::claim(&options(Some(store), given.node)).map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        let claimed = claim(&options(Some(store), given.node))?;
         let mut page = Page(claimed, Some(held), spill::start());
         page.open_now().await?;
         Ok(page)
@@ -99,7 +101,7 @@ impl Page {
         let node = node::node(join.node().to_string(), Some(session));
         let options = pondra::page::Options { joined: Some(join), ..options(None, Some(node)) };
         // (claimed first, as `kept` is: see there)
-        let claimed = pondra::page::Page::claim(&options).map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        let claimed = claim(&options)?;
         let mut page = Page(claimed, None, spill::start());
         page.open_now().await?;
         Ok(page)
@@ -281,11 +283,18 @@ fn give(settings: Vec<(String, String)>) -> Result<(), JsValue> {
     pondra::env::give(settings).map_err(|e| JsValue::from_str(&format!("{e:#}")))
 }
 
-/// A page's options: its member's lake is kept in `store` (a kept page's folder; None is memory, as `new` has it),
-/// `node` (`node.rs`) answers the tables the page doesn't have, and the bytes its allocator holds (`heap::live`) are
-/// watched against the line its device has (`device_line`).
+/// Claims the module's page (`pondra::page::Page::claim`), the page's platform installed first: its device, as the machine
+/// the core reads (`device.rs`).
+fn claim(options: &pondra::page::Options) -> Result<pondra::page::Page, JsValue> {
+    device::install();
+    pondra::page::Page::claim(options).map_err(|e| JsValue::from_str(&format!("{e:#}")))
+}
+
+/// A page's options: its member's lake is kept in `store` (a kept page's folder; None is memory, as `new` has it), and
+/// `node` (`node.rs`) answers the tables the page doesn't have. Its memory is its device's (`device.rs`), which the core
+/// reads as its machine: the bytes its allocator holds, watched against the line the device has.
 fn options(store: Option<Arc<dyn object_store::ObjectStore>>, node: Option<Node>) -> pondra::page::Options {
-    pondra::page::Options { store, node, memory: Some(Arc::new(heap::live)), line: device_line(), ..Default::default() }
+    pondra::page::Options { store, node, ..Default::default() }
 }
 
 /// Refuses `node` and `token` in a join's options by name: a join's node is its `url`, and its sign-in its `session`.
@@ -303,46 +312,14 @@ fn joined_keys_refused(opts: &JsValue) -> Result<(), JsValue> {
 
 const GIB: f64 = (1u64 << 30) as f64;
 
-/// The memory line a page has on this device (`page::Options::line`; `memory_max_gb` is taken over it), or None for the
-/// page's own 3 GiB. A phone's browser refuses to grow a module's memory well before 3 GiB, and the page would trap there
-/// instead of stopping the query that grew it (53200). A browser that says how much memory its device has
-/// (`navigator.deviceMemory`, in GiB, which Chrome rounds down to a power of two and gives as 8 at most) gives three
-/// eighths of it, so 8 keeps 3 GiB; one that doesn't say (Safari, Firefox) on a device whose pointer is a finger (`(pointer:
-/// coarse)`: a phone or a tablet), or in a worker (no `matchMedia`) whose browser says it is a phone's or a tablet's
-/// (`navigator.userAgent`), gives 1 GiB. Elsewhere (a desktop's Firefox or Safari, Node) the page keeps its own.
-fn device_line() -> Option<usize> {
-    let global = JsValue::from(js_sys::global());
-    let said = js::get(&global, "navigator").and_then(|navigator| js::get(&navigator, "deviceMemory")).ok().and_then(|gib| gib.as_f64());
-    let gib = match said {
-        Some(gib) if gib > 0.0 => gib * 3.0 / 8.0,
-        _ if coarse_pointer(&global) || mobile_agent(&global) => 1.0,
-        _ => return None,
-    };
-    Some((gib.min(3.0) * GIB) as usize)
-}
-
-/// Whether the device's main pointer is a finger (`matchMedia('(pointer: coarse)')`). A worker has no `matchMedia`: false.
-fn coarse_pointer(global: &JsValue) -> bool {
-    let Ok(match_media) = js::function(global, "matchMedia") else { return false };
-    let Ok(query) = match_media.call1(global, &"(pointer: coarse)".into()) else { return false };
-    js::get(&query, "matches").ok().and_then(|matches| matches.as_bool()) == Some(true)
-}
-
-/// Whether the browser says it is a phone's or a tablet's (`navigator.userAgent`), which a worker can read where it has no
-/// `matchMedia`. (An iPad's Safari says it is a desktop's.)
-fn mobile_agent(global: &JsValue) -> bool {
-    let agent = js::get(global, "navigator").and_then(|navigator| js::get(&navigator, "userAgent")).ok().and_then(|a| a.as_string()).unwrap_or_default();
-    ["Mobi", "Android", "iPhone", "iPad"].iter().any(|m| agent.contains(m))
-}
-
-/// Sets the panic hook once: a panic says why, not just "unreachable". It gives the core the page's store of a web origin
-/// too (`fetch.rs`): a statement that names a web address reads it through the browser's `fetch`, in every page, and the
-/// core keeps the first store given. And the page's store of its blob URLs, the tab's own files (`fetch::Blob`).
+/// Sets the panic hook once: a panic says why, not just "unreachable". It installs the page's `Net` too (`net.rs`): every
+/// call out, and a statement that names a web address, goes through the browser's `fetch`, in every page. And it gives the
+/// core the page's store of its blob URLs, the tab's own files (`fetch::Blob`).
 fn set_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| {
         std::panic::set_hook(Box::new(|p| error(&p.to_string())));
-        pondra::page::web_with(Box::new(|origin: &str| Arc::new(fetch::Fetch::new(origin)) as Arc<dyn object_store::ObjectStore>));
+        net::install();
         pondra::page::blob_with(Arc::new(fetch::Blob));
     });
 }

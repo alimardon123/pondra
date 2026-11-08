@@ -128,7 +128,7 @@ async fn leads_writes_and_lets_go(lake_text: &str, lake: &Path) {
 /// A guest that only reads a lake in this process's memory reads a new, empty one (`pondra sql --dir :memory: "SELECT 1"`):
 /// nobody else wrote it, so there is no lake to find, and a folder's "holds no lake yet" would be wrong there.
 async fn a_guest_reads_a_new_lake_in_memory() {
-    let guest = open(Options::guest(&pondra::memory::place(":memory:"), vec![], Guest::Reads)).await;
+    let guest = open(Options::guest(&pondra::memory_lake::place(":memory:"), vec![], Guest::Reads)).await;
     let answer = sql(&guest, "SELECT 1 AS x").await;
     assert_eq!(answer.0, 200, "a statement on a new lake in memory runs: {}", answer.1);
     finish(guest).await;

@@ -641,6 +641,18 @@ jobs:
           path: dist
       - name: linux-x64's binary
         run: mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
+      # (dbt-core 2's parser is an sdist whose build downloads its wheel from github.com's release
+      # downloads, which answered 502 and 504 for hours on 11-08 while the API's route to the same
+      # asset answered: the wheel comes that way first, and pip, finding it installed, builds nothing.
+      # Where that fails, pip still builds it from the sdist)
+      - name: dbt's parser, through GitHub's API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=$(curl -fsS https://pypi.org/pypi/dbt-core-experimental-parser/json | python -c 'import json, sys; print(json.load(sys.stdin)["info"]["version"])') &&
+            gh release download "v$v" -R dbt-labs/dbt -p "dbt_core_experimental_parser-$v-py3-none-manylinux_2_28_x86_64.whl" -D parser &&
+            pip install parser/*.whl ||
+            echo "::notice::dbt's parser wasn't fetched through the API: pip builds it from its sdist"
       - run: pip install ./python/dbt-pondra dbt-tests-adapter pytest && pip list | grep -i '^dbt'
       - name: dbt's adapter suite on a node
         env:

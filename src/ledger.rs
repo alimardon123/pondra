@@ -3,7 +3,8 @@
 //! - `ByteLru`, the one cache bounded by bytes. Each of the node's caches of that shape (a map, a running byte total, and a
 //!   loop that drops the least recently used past a bound) was written by hand about ten times, each with its own total to
 //!   get right; they all use this one now, so a bound is set, read and later reclaimed in one way.
-//! - `Ledger`, the one line for query memory, and `LakePool`, a lake's share of it as DataFusion's `MemoryPool`.
+//! - `Root`, the process's memory, and `Ledger`, a node's budget on it: its line for query memory, and `LakePool`, a lake's
+//!   share of it as DataFusion's `MemoryPool`.
 //! - `Charged`, a cache the ledger counts: what it holds, and memory it gives back when the node needs it. The lakes on a
 //!   line charge their caches to it, so the node's memory watch takes memory back from all of them in one way.
 
@@ -291,14 +292,30 @@ pub struct Ledger {
     born: Instant,         // (what `noted` counts from)
     noted: AtomicU64,      // the last look (`note`), in ms since `born`: `NEVER` before the first
     caches: Mutex<Vec<(&'static str, Weak<dyn Charged>)>>, // what the node keeps on this line, by name (`charge`), in the order they give back
+    root: Arc<Root>,       // the process's memory, which this node's budget is on (`Root`)
 }
 
 impl Ledger {
     /// A ledger whose queries hold `line` at most, inside `whole` with the caches (`line` itself when the setting is the whole
-    /// line). A `hard` whole line refuses a spiller's grow the caches don't make room for; a soft one only takes cache bytes back.
-    pub fn new(line: usize, whole: usize, hard: bool) -> Arc<Ledger> {
-        Arc::new(Ledger { line, whole, hard, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0), cached: AtomicUsize::new(0), dry: AtomicBool::new(false), born: Instant::now(), noted: AtomicU64::new(NEVER), caches: Default::default() })
+    /// line), alone on a root of its own sizes: a test's. A `hard` whole line refuses a spiller's grow the caches don't make
+    /// room for; a soft one only takes cache bytes back.
+    #[cfg(test)]
+    pub fn new(line: usize, whole: usize, hard: bool) -> Arc<Ledger> { Ledger::on(&Root::new(line, whole), line, whole, hard) }
+
+    /// A node's budget on `root`, as `new` takes its sizes: the node's lakes share it, and the root holds it to what the
+    /// process's other nodes leave (`line_now`, `over`).
+    pub fn on(root: &Arc<Root>, line: usize, whole: usize, hard: bool) -> Arc<Ledger> {
+        let made = Arc::new(Ledger { line, whole, hard, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0), cached: AtomicUsize::new(0), dry: AtomicBool::new(false), born: Instant::now(), noted: AtomicU64::new(NEVER), caches: Default::default(), root: root.clone() });
+        let mut nodes = root.nodes.lock().unwrap_or_else(PoisonError::into_inner);
+        nodes.retain(|n| n.strong_count() > 0);
+        nodes.push(Arc::downgrade(&made));
+        drop(nodes);
+        made
     }
+
+    /// The root this budget is on: the process's memory.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn root(&self) -> &Arc<Root> { &self.root }
 
     /// A new lake's pool on this line.
     pub fn pool(self: &Arc<Self>) -> Arc<LakePool> { Arc::new(LakePool { ledger: self.clone(), part: Default::default() }) }
@@ -312,17 +329,36 @@ impl Ledger {
     pub fn cached(&self) -> usize { self.cached.load(Relaxed) }
 
     /// A cache inside the whole line holds `bytes` more since the last look (`note`): a hot load's decode, while it runs.
-    pub fn cache_grew(&self, bytes: usize) { self.cached.fetch_add(bytes, Relaxed); }
+    pub fn cache_grew(&self, bytes: usize) { self.cached_to(|held| held.saturating_add(bytes)); }
 
     /// A cache inside the whole line holds `bytes` less since the last look, of what it said it grew (`cache_grew`).
-    pub fn cache_shrank(&self, bytes: usize) { let _ = self.cached.fetch_update(Relaxed, Relaxed, |held| Some(held.saturating_sub(bytes))); }
+    pub fn cache_shrank(&self, bytes: usize) { self.cached_to(|held| held.saturating_sub(bytes)); }
+
+    /// Sets what the caches are counted as holding (`cached`) to `to` of it, and the root's by as much, so the root's is
+    /// every node's together.
+    fn cached_to(&self, to: impl Fn(usize) -> usize) {
+        let was = self.cached.fetch_update(Relaxed, Relaxed, |held| Some(to(held))).unwrap_or_else(|held| held);
+        self.root.moved(&self.root.cached, was, to(was));
+    }
+
+    /// Adds `bytes` to what the queries hold, here and on the root.
+    fn reserve(&self, bytes: usize) {
+        self.reserved.fetch_add(bytes, Relaxed);
+        self.root.reserved.fetch_add(bytes, Relaxed);
+    }
+
+    /// Takes `bytes` off what the queries hold, here and on the root.
+    fn release(&self, bytes: usize) {
+        self.reserved.fetch_sub(bytes, Relaxed);
+        self.root.reserved.fetch_sub(bytes, Relaxed);
+    }
 
     /// Reads what the caches inside the whole line hold now (`Charged::inside`), for the grows to go by until the next look,
     /// and says it. The node's memory watch reads it at each of its looks (`oom.rs`), so a grow never locks a cache to read it.
     pub fn note(&self) -> usize {
         self.noted.store(self.now(), Relaxed);
         let held = self.charged().iter().filter(|(_, c)| c.inside()).map(|(_, c)| c.held()).sum();
-        self.cached.store(held, Relaxed);
+        self.cached_to(|_| held);
         self.dry.store(false, Relaxed);
         held
     }
@@ -343,7 +379,21 @@ impl Ledger {
     pub fn reserved(&self) -> usize { self.reserved.load(Relaxed) }
 
     /// A lake's share now: the line over the lakes running queries, at least one.
-    pub fn share(&self) -> usize { self.line / self.busy.load(Relaxed).max(1) }
+    pub fn share(&self) -> usize { self.line_now(true) / self.busy.load(Relaxed).max(1) }
+
+    /// The node's line now: its own, less what the process's other nodes hold past the root's line. A spiller's is at
+    /// least the node's even share of the root while other nodes run queries too, as a lake's share is within its node, so
+    /// it spills there rather than being refused for what another node holds, and the other node's spillers are held to
+    /// theirs at their next grow. A node alone on its root has its own line, whatever the root's: one node in a process,
+    /// every node until several run in one, holds what it held before the root.
+    fn line_now(&self, spills: bool) -> usize {
+        let others = self.root.reserved().saturating_sub(self.reserved());
+        if others == 0 {
+            return self.line;
+        }
+        let free = self.root.line.saturating_sub(others);
+        self.line.min(if spills { free.max(self.root.share()) } else { free })
+    }
 
     /// Counts `cache` on this line, under `name`, for as long as it lives: `/metrics`' `cache_bytes` reads it by that name,
     /// and the node's memory watch takes memory back from it before it stops a query (`oom.rs`). Caches give back by kind,
@@ -403,8 +453,25 @@ impl Ledger {
     /// across the node's lines (`oom.rs`).
     pub fn give_back_kind(&self, kind: &str, bytes: usize) -> usize { self.take(bytes, false, Some(kind)) }
 
-    /// Takes about `bytes` back from the caches inside the whole line alone: a query's grow past it.
-    fn make_room(&self, bytes: usize) -> usize { self.take(bytes, true, None) }
+    /// Takes cache bytes back for a query's grow past a whole line, from the caches inside the lines alone, and says whether
+    /// that came back short: `own` past this node's line, from its own caches; `root` past the root's, from its own caches
+    /// first, then from the other nodes' by what they hold, the most first, so a busy node doesn't empty a quiet
+    /// neighbour's caches while its own still hold bytes.
+    fn make_room(&self, own: usize, root: usize) -> bool {
+        let mut freed = self.take(own.max(root), true, None);
+        let short = freed < own;
+        if freed < root {
+            let mut others: Vec<Arc<Ledger>> = self.root.nodes().into_iter().filter(|n| !std::ptr::eq(n.as_ref(), self)).collect();
+            others.sort_by_key(|n| std::cmp::Reverse(n.cached()));
+            for other in others {
+                if freed >= root {
+                    break;
+                }
+                freed += other.take(root - freed, true, None);
+            }
+        }
+        short || freed < root
+    }
 
     fn take(&self, bytes: usize, inside_only: bool, kind: Option<&str>) -> usize {
         let (mut freed, mut inside) = (0, 0);
@@ -420,15 +487,101 @@ impl Ledger {
             freed += got;
             inside += if counted { got } else { 0 };
         }
-        let _ = self.cached.fetch_update(Relaxed, Relaxed, |held| Some(held.saturating_sub(inside)));
+        self.cached_to(|held| held.saturating_sub(inside));
         freed
     }
 
-    /// How far the queries holding `additional` bytes more would pass the whole line, beside what the caches hold: what the
-    /// caches give back first, from those a reader isn't holding (`give_back`).
-    fn over(&self, additional: usize) -> usize {
-        self.reserved().saturating_add(additional).saturating_add(self.cached()).saturating_sub(self.whole)
+    /// How far the queries holding `additional` bytes more would pass the node's whole line, beside what its caches hold,
+    /// and how far past the root's, beside every node's: what the caches give back first, from those a reader isn't
+    /// holding (`make_room`). A node alone on its root goes by its own line alone, as `line_now` does.
+    fn over(&self, additional: usize) -> (usize, usize) {
+        let past = |reserved: usize, cached: usize, whole: usize| reserved.saturating_add(additional).saturating_add(cached).saturating_sub(whole);
+        let own = past(self.reserved(), self.cached(), self.whole);
+        let (reserved, cached) = (self.root.reserved(), self.root.cached());
+        let others = reserved.saturating_sub(self.reserved()).saturating_add(cached.saturating_sub(self.cached()));
+        (own, if others == 0 { 0 } else { past(reserved, cached, self.root.whole) })
     }
+}
+
+impl Drop for Ledger {
+    fn drop(&mut self) {
+        // (a node's budget gone: what it counted is no longer the root's)
+        self.root.moved(&self.root.cached, self.cached.load(Relaxed), 0);
+        self.root.moved(&self.root.reserved, self.reserved.load(Relaxed), 0);
+    }
+}
+
+// ---------------------------------------------------------------- the process's memory
+
+/// The process's memory (redesign step 2, review change 4): its line for every node's queries together, and its whole
+/// line for them and every node's caches. Each node's budget (`Ledger`) is on it, as a child reservation is on its pool, so
+/// two nodes in one process together hold no more than the process's line (`Ledger::line_now`), and past its whole line a
+/// grow takes cache bytes back from any node's caches before it spills (`Ledger::make_room`). Its sizes are the machine's
+/// and `PONDRA_MEMORY_MAX_GB`'s (`store::root_line`, `store::root_whole`); a node's own `PONDRA_MEMORY_GB` is its budget.
+#[derive(Debug)]
+pub struct Root {
+    line: usize,           // every node's queries together, at most
+    whole: usize,          // every node's queries and caches together (`usize::MAX`: none known)
+    reserved: AtomicUsize, // every node's queries' reservations together
+    cached: AtomicUsize,   // what every node's caches are counted as holding (`Ledger::cached`), together
+    busy: AtomicUsize,     // nodes with a lake running queries now
+    nodes: Mutex<Vec<Weak<Ledger>>>, // the nodes' budgets on it (`Ledger::on`)
+}
+
+impl Root {
+    /// A root of `line` for the queries and `whole` for them and the caches.
+    pub fn new(line: usize, whole: usize) -> Arc<Root> {
+        Arc::new(Root { line, whole, reserved: AtomicUsize::new(0), cached: AtomicUsize::new(0), busy: AtomicUsize::new(0), nodes: Default::default() })
+    }
+
+    pub fn line(&self) -> usize { self.line }
+
+    pub fn whole(&self) -> usize { self.whole }
+
+    /// Every node's queries' reservations now.
+    pub fn reserved(&self) -> usize { self.reserved.load(Relaxed) }
+
+    /// What every node's caches were counted as holding at their last looks, less what grows took back since.
+    pub fn cached(&self) -> usize { self.cached.load(Relaxed) }
+
+    /// A node's even share of the line while several run queries.
+    fn share(&self) -> usize { self.line / self.busy.load(Relaxed).max(1) }
+
+    /// The nodes' budgets alive now: the memory watch's walk (`oom.rs`) and a grow's past the whole line (`make_room`).
+    pub fn nodes(&self) -> Vec<Arc<Ledger>> {
+        self.nodes.lock().unwrap_or_else(PoisonError::into_inner).iter().filter_map(Weak::upgrade).collect()
+    }
+
+    /// Moves `count` by what one node's count moved, from `was` to `now`.
+    fn moved(&self, count: &AtomicUsize, was: usize, now: usize) {
+        match now.cmp(&was) {
+            std::cmp::Ordering::Greater => count.fetch_add(now - was, Relaxed),
+            std::cmp::Ordering::Less => count.fetch_sub(was - now, Relaxed),
+            std::cmp::Ordering::Equal => 0,
+        };
+    }
+}
+
+// (the process's memory: one root for the sizes its settings and machine gave at its start, so one in any process but a
+// test's, whose lakes opened under other settings get a root of their own)
+static ROOTS: Mutex<Vec<Weak<Root>>> = Mutex::new(Vec::new());
+
+/// The process's root of `line` and `whole` (`store::lake_pool`): the one there is, else a new one.
+pub fn root(line: usize, whole: usize) -> Arc<Root> {
+    let mut roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
+    roots.retain(|r| r.strong_count() > 0);
+    if let Some(root) = roots.iter().filter_map(Weak::upgrade).find(|r| (r.line, r.whole) == (line, whole)) {
+        return root;
+    }
+    let made = Root::new(line, whole);
+    roots.push(Arc::downgrade(&made));
+    made
+}
+
+/// Every node's budget in the process now, on every root: what the memory watch takes memory back from (`oom.rs`).
+pub fn budgets() -> Vec<Arc<Ledger>> {
+    let roots: Vec<Arc<Root>> = ROOTS.lock().unwrap_or_else(PoisonError::into_inner).iter().filter_map(Weak::upgrade).collect();
+    roots.iter().flat_map(|r| r.nodes()).collect()
 }
 
 /// One lake's pool of query memory: `FairSpillPool`'s rules over the lake's share of its ledger's line (`Ledger`).
@@ -470,8 +623,9 @@ impl LakePool {
     /// theirs at their next grow, and spill.
     fn room(&self, p: &Part, spills: bool) -> usize {
         let l = &self.ledger;
-        let free = l.line.saturating_sub(l.reserved().saturating_sub(p.spillable + p.unspillable));
-        if spills { free.max(l.share()) } else { free }
+        let line = l.line_now(spills); // (the node's line, less what other nodes hold past the root's)
+        let free = line.saturating_sub(l.reserved().saturating_sub(p.spillable + p.unspillable));
+        if spills { free.max(line / l.busy.load(Relaxed).max(1)) } else { free }
     }
 
     /// The refusal of a grow, which a spilling operator answers by spilling and any other query by stopping.
@@ -522,8 +676,8 @@ impl MemoryPool for LakePool {
 
     fn register(&self, c: &MemoryConsumer) {
         let mut p = self.part();
-        if p.consumers == 0 {
-            self.ledger.busy.fetch_add(1, Relaxed);
+        if p.consumers == 0 && self.ledger.busy.fetch_add(1, Relaxed) == 0 {
+            self.ledger.root.busy.fetch_add(1, Relaxed); // (the node's first lake running queries)
         }
         p.consumers += 1;
         p.spillers += usize::from(c.can_spill());
@@ -533,21 +687,21 @@ impl MemoryPool for LakePool {
         let mut p = self.part();
         p.consumers = p.consumers.saturating_sub(1);
         p.spillers = p.spillers.saturating_sub(usize::from(c.can_spill()));
-        if p.consumers == 0 {
-            self.ledger.busy.fetch_sub(1, Relaxed);
+        if p.consumers == 0 && self.ledger.busy.fetch_sub(1, Relaxed) == 1 {
+            self.ledger.root.busy.fetch_sub(1, Relaxed); // (its last)
         }
     }
 
     fn grow(&self, r: &MemoryReservation, additional: usize) {
         *self.part().of(r) += additional;
-        self.ledger.reserved.fetch_add(additional, Relaxed);
+        self.ledger.reserve(additional);
     }
 
     fn shrink(&self, r: &MemoryReservation, shrink: usize) {
         let mut p = self.part();
         let held = p.of(r);
         *held = held.saturating_sub(shrink);
-        self.ledger.reserved.fetch_sub(shrink, Relaxed);
+        self.ledger.release(shrink);
     }
 
     fn try_grow(&self, r: &MemoryReservation, additional: usize) -> Result<()> {
@@ -557,8 +711,8 @@ impl MemoryPool for LakePool {
         if additional > available {
             return Err(self.refused(r, additional, available, room));
         }
-        let over = self.ledger.over(additional);
-        if over > 0 {
+        let (own, root) = self.ledger.over(additional);
+        if own.max(root) > 0 {
             // A take-back that came back short (a reader in a cache, or bytes a cache can't give back: a table's tail, the
             // footers) isn't asked for again until the memory watch's next look, so a query growing near the line doesn't
             // walk the caches at every grow for bytes that aren't there.
@@ -566,7 +720,7 @@ impl MemoryPool for LakePool {
             if !short {
                 // (the cache bytes go outside the lake's lock, so its other grows don't wait on them; then its share is read again)
                 drop(p);
-                short = self.ledger.make_room(over) < over;
+                short = self.ledger.make_room(own, root);
                 if short {
                     self.ledger.dry.store(true, Relaxed);
                 }
@@ -587,7 +741,7 @@ impl MemoryPool for LakePool {
             }
         }
         *p.of(r) += additional;
-        self.ledger.reserved.fetch_add(additional, Relaxed);
+        self.ledger.reserve(additional);
         Ok(())
     }
 
@@ -995,5 +1149,53 @@ mod tests {
         ledger.note();
         s.try_grow(50).expect("once the reader is done, the grow after the next look takes the cache bytes back");
         assert_eq!((cache.held(), ledger.cached(), ledger.reserved()), (10, 10, 90));
+    }
+
+    /// Two nodes in one process together hold no more than its line (review change 4): each has a budget of 100 on a root of
+    /// 150, so the second's memory that can't spill is held to what the first leaves of the root, though its own budget
+    /// has room; a spiller there has its node's even share of the root and spills past it; and a node alone on its root has
+    /// its own budget, whatever the root's, as before the root.
+    #[test]
+    fn two_nodes_on_one_root_hold_no_more_than_its_line() {
+        let root = Root::new(150, usize::MAX);
+        let (a, b) = (Ledger::on(&root, 100, usize::MAX, false), Ledger::on(&root, 100, usize::MAX, false));
+        let (pa, pb) = (a.pool(), b.pool());
+        let held_a = consumer(&pa, "a", false);
+        held_a.try_grow(100).expect("a node alone on its root has its whole budget");
+        let held_b = consumer(&pb, "b", false);
+        assert!(held_b.try_grow(51).is_err(), "what a holds leaves b 50 of the root");
+        held_b.try_grow(50).expect("b's 50");
+        assert_eq!((root.reserved(), a.reserved(), b.reserved()), (150, 100, 50));
+        drop(held_b);
+        let spills = consumer(&pb, "b's sort", true);
+        spills.try_grow(75).expect("a spiller has its node's even share of the root, 150 over two nodes");
+        assert!(spills.try_grow(1).is_err(), "and spills past it");
+        drop((held_a, spills));
+        assert_eq!(root.reserved(), 0, "all given back, on the root too");
+        let alone = Ledger::on(&Root::new(50, usize::MAX), 100, usize::MAX, false);
+        consumer(&alone.pool(), "alone", false).try_grow(100).expect("a node alone on its root holds its budget past the root's line");
+    }
+
+    /// Past the root's whole line, a grow takes cache bytes back from its own node's caches first, then from the other
+    /// nodes' by what they hold, the most first, instead of every node's caches growing past it (review change 4; the
+    /// redesign thread's order, 11-08: a busy node doesn't empty a quiet neighbour's caches while its own hold bytes).
+    #[test]
+    fn past_the_roots_whole_line_a_grow_takes_its_own_nodes_caches_first_then_the_fullest_others() {
+        let root = Root::new(1000, 300);
+        let [a, b, c] = [0; 3].map(|_| Ledger::on(&root, 1000, usize::MAX, false));
+        let (ca, cb, cc) = (charged_cache(&a, 10, 10), charged_cache(&b, 5, 10), charged_cache(&c, 12, 10));
+        for node in [&a, &b, &c] {
+            node.note();
+        }
+        assert_eq!(root.cached(), 270, "the root counts every node's caches");
+        let q = consumer(&a.pool(), "a's query", false);
+        q.try_grow(100).expect("100 past what the caches leave of 300: a's own caches give the 70");
+        assert_eq!((ca.held(), cb.held(), cc.held()), (30, 50, 120), "a's own first, the others untouched");
+        q.try_grow(130).expect("130 more: a's last 30, then 100 of the fullest other node's");
+        assert_eq!((ca.held(), cb.held(), cc.held()), (0, 50, 20), "c held the most, b keeps its 50");
+        assert_eq!((root.cached(), root.reserved()), (70, 230));
+        drop(q);
+        drop(c);
+        assert_eq!(root.cached(), 50, "a node's budget gone, its caches no longer count on the root");
     }
 }

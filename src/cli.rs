@@ -362,6 +362,8 @@ impl ::log::Log for ErrorLines {
 static ERROR_LINES: ErrorLines = ErrorLines;
 
 pub fn main() {
+    crate::machine::install(std::sync::Arc::new(crate::os::Os::default())); // (the program's machine and network, before anything reads them)
+    crate::net::install(std::sync::Arc::new(crate::os::Net::default()));
     if ::log::set_logger(&ERROR_LINES).is_ok() {
         ::log::set_max_level(::log::LevelFilter::Error);
     }
@@ -437,7 +439,7 @@ async fn run() -> anyhow::Result<()> {
     store::inherit(); // (a lake led for a moment, reached as the process that asked reaches it)
     let Some(cmd) = cli.cmd else {
         let given = cli.lake.is_some();
-        let lake = crate::memory::place(&cli.lake.unwrap_or_else(|| "lake".into())); // (`pondra :memory:`: a lake in the node's memory)
+        let lake = crate::memory_lake::place(&cli.lake.unwrap_or_else(|| "lake".into())); // (`pondra :memory:`: a lake in the node's memory)
         opened(&lake, given).await?;
         return shell::run(&lake).await;
     };
@@ -451,7 +453,7 @@ async fn run() -> anyhow::Result<()> {
             given.extend(idle_exit.map(|s| ("PONDRA_IDLE_EXIT_SECS", s.to_string())));
             env::give(given)?;
             // A lake, or a folder of lakes (each a database: `dbserver.rs`), by what the path holds.
-            let (path, dir) = (path.map(|p| crate::memory::place(&p)), dir.map(|d| crate::memory::place(&d))); // (`:memory:`: in this process's memory)
+            let (path, dir) = (path.map(|p| crate::memory_lake::place(&p)), dir.map(|d| crate::memory_lake::place(&d))); // (`:memory:`: in this process's memory)
             // (a node that serves its lake's store: checked before anything is opened; a folder of lakes is never
             // served that way, and `--lakes` names none: `served.rs`)
             let serving = env::flag("PONDRA_SERVE_STORE");
@@ -638,16 +640,16 @@ async fn run() -> anyhow::Result<()> {
             // (the leader's work: a node that runs the lake is asked; with nobody leading, this process leads for the
             // moment, as a one-off write does, tiers the log, writes the catalog down, and ends, so a lake no node
             // serves can be kept tidy by a scheduled `pondra sql --dir … CHECKPOINT`)
-            let dir = crate::memory::place(&dir);
+            let dir = crate::memory_lake::place(&dir);
             let store = store::open_store(&dir)?.1;
             match terms::latest(&store).await? {
                 Some(t) if !t.addr.is_empty() && terms::alive(&store, &t).await => {
-                    println!("{}", cluster::http().post(crate::tls::url(&format!("{}/sql", t.addr))).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)
+                    println!("{}", crate::net::process().client(crate::net::Policy::Cluster).post(crate::tls::url(&format!("{}/sql", t.addr))).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)
                 }
                 _ => sql_on_guest(&dir, &query, &attached).await?,
             }
         }
-        Cmd::Sql { dir, query, attach: attached } => sql_on_guest(&crate::memory::place(&dir), &query, &attached).await?, // (`:memory:`: in this process's memory, as `serve`'s)
+        Cmd::Sql { dir, query, attach: attached } => sql_on_guest(&crate::memory_lake::place(&dir), &query, &attached).await?, // (`:memory:`: in this process's memory, as `serve`'s)
         Cmd::Token { dir, user, name } => {
             let here = node::native(false); // (a command of its own, not a guest: as `pondra lead`)
             let Ok(lake) = store::Lake::open(&dir, false, false, here.clone()).await else { anyhow::bail!("no lake at {dir} (pondra token takes a lake's folder, or its s3:// prefix)") };

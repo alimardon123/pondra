@@ -213,8 +213,8 @@ async fn call(embed: bool, inputs: &[&str], model: &str) -> anyhow::Result<Vec<V
     let secs = crate::env::value("PONDRA_AI_TIMEOUT_SECS");
     let mut wait = Duration::from_millis(500);
     for tries in 1.. {
-        let req = crate::ext::bare().post(format!("{}/{path}", url.trim_end_matches('/'))).json(&body); // (not the nodes' client: its token is theirs alone)
-        let mut req = crate::fetch::timeout(req, Duration::from_secs(secs));
+        let req = crate::net::process().client(crate::net::Policy::ENDPOINT).post(format!("{}/{path}", url.trim_end_matches('/'))).json(&body); // (not the nodes' client: its token is theirs alone)
+        let mut req = crate::net::timeout(req, Duration::from_secs(secs));
         if let Some(key) = crate::env::get("PONDRA_AI_KEY") {
             req = req.bearer_auth(key);
         }

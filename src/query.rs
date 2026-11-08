@@ -455,8 +455,8 @@ pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &Tabl
 /// `name` as the request being served may read it: as it is for a token or a superuser; for a user
 /// granted some tables, `Guarded`. None, as if it weren't there, when it may read none of it and is listing, or doesn't
 /// know it is there (`Scope::knows`): a statement naming it is told no such table (42P01), not refused, nor told its
-/// columns. The views over it are still planned against it (`unlisted`, `register_views`).
-fn guarded(name: &str, t: Arc<dyn TableProvider>, listing: bool) -> Option<Arc<dyn TableProvider>> {
+/// columns. The views over it are still planned against it (`unlisted`, `register_views`). `asked`: the statement.
+fn guarded(name: &str, t: Arc<dyn TableProvider>, listing: bool, asked: &Arc<str>) -> Option<Arc<dyn TableProvider>> {
     let scope = crate::rights::scope();
     if scope.whole() {
         return Some(t);
@@ -468,12 +468,12 @@ fn guarded(name: &str, t: Arc<dyn TableProvider>, listing: bool) -> Option<Arc<d
         }
         return None;
     }
-    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: None }))
+    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: None, shown: false, asked: asked.clone() }))
 }
 
 /// An attached lake's table `name` as the request being served may read it: not at all when that
 /// lake signs in on its own (`locked`, why); for a user granted some tables, by grants naming it.
-fn across(name: &str, t: Arc<dyn TableProvider>, listing: bool, locked: &Option<String>) -> Option<Arc<dyn TableProvider>> {
+fn across(name: &str, t: Arc<dyn TableProvider>, listing: bool, locked: &Option<String>, asked: &Arc<str>) -> Option<Arc<dyn TableProvider>> {
     let scope = crate::rights::scope();
     let columns = match locked {
         Some(_) => None,
@@ -486,23 +486,49 @@ fn across(name: &str, t: Arc<dyn TableProvider>, listing: bool, locked: &Option<
         }
         return None; // (as `guarded`: a table it doesn't know is there isn't, for it)
     }
-    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: locked.clone() }))
+    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: locked.clone(), shown: false, asked: asked.clone() }))
 }
 
-/// A table as a user granted some of it reads it (`users.rs`): planned as the table is (its
-/// columns are no secret, as in Postgres), but a scan of a column it may not read is refused, the
-/// columns its filters use included; and every scan, if it may read none (or `why` not).
-#[derive(Debug)]
+/// A table as a user granted some of it reads it (`users.rs`): planned as the table is, so that a statement naming a
+/// column it may not read is refused for that column, not told it isn't there; a scan of such a column is refused, the
+/// columns its filters use included, and every scan, if it may read none (or `why` not). The refusal names the columns
+/// the statement (`asked`) names itself: of `SELECT *` none, for they may be ones it is shown nowhere, as Postgres names
+/// none. `shown`: as a statement that shows its columns sees it (DESCRIBE, SHOW COLUMNS, `information_schema`: `shown`),
+/// with only the columns it may read.
+#[derive(Debug, Clone)]
 struct Guarded {
     inner: Arc<dyn TableProvider>,
     name: String,
     columns: Option<Option<std::collections::HashSet<String>>>,
     why: Option<String>,
+    shown: bool,
+    asked: Arc<str>,
+}
+
+/// Does `sql` name `column` itself: a word of it, not inside a string?
+fn names_column(sql: &str, column: &str) -> bool {
+    use datafusion::sql::sqlparser::tokenizer::Token;
+    let Some(tokens) = crate::text::tokens(sql) else { return false };
+    let named = tokens.solid_refs().into_iter().any(|t| match t {
+        Token::Word(w) if w.quote_style.is_none() => w.value.eq_ignore_ascii_case(column),
+        Token::Word(w) => w.value == column,
+        _ => false,
+    });
+    named
 }
 
 #[async_trait::async_trait]
 impl TableProvider for Guarded {
-    fn schema(&self) -> SchemaRef { self.inner.schema() }
+    fn schema(&self) -> SchemaRef {
+        let all = self.inner.schema();
+        match (self.shown, &self.columns) {
+            (false, _) | (true, Some(None)) => all,
+            (true, these) => {
+                let these = these.as_ref().and_then(|c| c.as_ref()); // (none, when it may read none)
+                Arc::new(Schema::new_with_metadata(all.fields().iter().filter(|f| these.is_some_and(|c| c.contains(f.name()))).cloned().collect::<Vec<_>>(), all.metadata().clone()))
+            }
+        }
+    }
     fn table_type(&self) -> datafusion::datasource::TableType { self.inner.table_type() }
     fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> { None } // (a view's plan would read around the check)
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
@@ -513,11 +539,42 @@ impl TableProvider for Guarded {
         }).collect())
     }
     async fn scan(&self, state: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        let denied = |what: String| datafusion::error::DataFusionError::Plan(self.why.clone().unwrap_or_else(|| format!("permission denied: SELECT{what} on {} (GRANT SELECT ON {} TO …)", self.name, self.name)));
-        let Some(columns) = &self.columns else { return Err(denied(String::new())) };
+        let projection = self.checked(projection, filters)?;
+        self.inner.scan(state, projection.as_ref(), filters, limit).await
+    }
+}
+
+impl Guarded {
+    /// May a scan read `projection` (of this table's columns as shown) and the columns `filters` name? The inner table's
+    /// projection if so; refused as `SELECT` of the columns it may not read if not. Asked as a plan is run (`scan`) and as
+    /// it is only described (`described`), so describing a query is refused as running it is.
+    fn checked(&self, projection: Option<&Vec<usize>>, filters: &[Expr]) -> datafusion::error::Result<Option<Vec<usize>>> {
+        let denied = |not: &[String]| {
+            let named: Vec<&str> = not.iter().filter(|c| names_column(&self.asked, c)).map(String::as_str).collect(); // (the ones it asked for by name)
+            let what = if named.is_empty() { String::new() } else { format!(" ({})", named.join(", ")) };
+            datafusion::error::DataFusionError::Plan(self.why.clone().unwrap_or_else(|| format!("permission denied: SELECT{what} on {} (GRANT SELECT ON {} TO …)", self.name, self.name)))
+        };
+        let Some(columns) = &self.columns else { return Err(denied(&[])) };
+        // (shown: its columns are the ones it may read, by place; the inner table's by name)
+        let shown;
+        let projection = match self.shown {
+            true => {
+                let (these, all) = (self.schema(), self.inner.schema());
+                let places: Vec<usize> = projection.cloned().unwrap_or_else(|| (0..these.fields().len()).collect());
+                // (a statement that also lists columns, reading every column it may read of a table that has more: `SELECT *`
+                // as far as this can tell, refused as it is anywhere else, never answered with fewer columns)
+                if places.len() == these.fields().len() && these.fields().len() < all.fields().len() {
+                    return Err(denied(&[]));
+                }
+                shown = places.iter().map(|&i| all.index_of(these.field(i).name())).collect::<std::result::Result<Vec<usize>, _>>()?;
+                Some(&shown)
+            }
+            false => projection,
+        };
+        let projection = projection.cloned();
         if let Some(allowed) = columns {
             let schema = self.inner.schema();
-            let mut used: Vec<String> = match projection {
+            let mut used: Vec<String> = match &projection {
                 Some(p) => p.iter().map(|&i| schema.field(i).name().clone()).collect(),
                 None => schema.fields().iter().map(|f| f.name().clone()).collect(),
             };
@@ -526,10 +583,10 @@ impl TableProvider for Guarded {
             not.sort();
             not.dedup();
             if !not.is_empty() {
-                return Err(denied(format!(" ({})", not.join(", "))));
+                return Err(denied(&not));
             }
         }
-        self.inner.scan(state, projection, filters, limit).await
+        Ok(projection)
     }
 }
 
@@ -1296,6 +1353,28 @@ pub fn run_schema(ctx: &SessionContext, plan: &datafusion::logical_expr::Logical
     Ok(state.analyzer().execute_and_check(plan.clone(), state.config_options(), |_, _| {})?.schema().clone())
 }
 
+/// `run_schema`, for a statement described to its caller and not run (Flight's GetFlightInfo, Postgres's Describe): each
+/// scan of a table it reads in part is asked, as the optimizer leaves it, what running it asks (`Guarded::checked`), so a
+/// description is refused as the statement's run would be, never told the columns it may not read (11-08 audit M6). A
+/// statement that reads only what it may costs one optimizer pass more, and none for a caller whose scope is whole.
+pub fn described(ctx: &SessionContext, plan: &datafusion::logical_expr::LogicalPlan) -> Result<datafusion::common::DFSchemaRef> {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    if !crate::rights::scope().whole() {
+        let optimized = ctx.state().optimize(plan)?;
+        optimized.apply_with_subqueries(|node| {
+            if let datafusion::logical_expr::LogicalPlan::TableScan(scan) = node {
+                if let Ok(p) = datafusion::datasource::source_as_provider(&scan.source) {
+                    if let Some(g) = p.downcast_ref::<Guarded>() {
+                        g.checked(scan.projection.as_ref(), &scan.filters)?;
+                    }
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+    }
+    run_schema(ctx, plan)
+}
+
 /// A table of this lake in a session: `t` in the default schema (`public`), `s.t` in schema `s`,
 /// exactly as named (SQL folds unquoted names to lower case; a name that isn't must be quoted).
 pub fn table_ref(name: &str) -> datafusion::common::TableReference {
@@ -1399,6 +1478,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
     crate::udf::register(lake, &ctx).await?; // the lake's own functions (`POST /functions/…`)
     crate::pyfn::register(lake, &ctx).await?; // …and its Python functions (`CREATE FUNCTION … LANGUAGE python`)
     let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)
+    let asked: Arc<str> = Arc::from(if crate::rights::scope().whole() { "" } else { sql }); // (what a refusal of a column may name: `Guarded`)
     let mut temps = crate::temp::views(sql); // (the session's own: over the lake's of the same name)
     for (_, v) in temps.iter_mut() {
         let expanded = crate::routines::expand_temp_view(lake, v).await?; // (read as a stored view is: the door's rewrites, with the tables' types now; the text was kept as written)
@@ -1448,11 +1528,11 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
             if let Some(h) = &meta.history {
                 t = crate::views::history_view(&ctx, t, h, crate::sys::mentioned(&text)).await?; // (each version's __start_at and __end_at, as it is read)
             }
-            match guarded(name, t.clone(), listing) {
+            match guarded(name, t.clone(), listing, &asked) {
                 Some(t) => {
                     ctx.register_table(table_ref(name), t)?;
                 }
-                None => unlisted.push((name.to_string(), Arc::new(Guarded { inner: t, name: name.to_string(), columns: None, why: None }) as Arc<dyn TableProvider>)),
+                None => unlisted.push((name.to_string(), Arc::new(Guarded { inner: t, name: name.to_string(), columns: None, why: None, shown: false, asked: asked.clone() }) as Arc<dyn TableProvider>)),
             }
         }
     }
@@ -1469,7 +1549,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
     }
     for name in crate::past_names::names(&text) {
         let (table, t, attached) = crate::past::table(lake, &ctx, &name, upto, crate::sys::mentioned(&text)).await?; // (`t AT (…)`: ADR-043)
-        let t = if attached { across(&table, t, false, &None) } else { guarded(&table, t, false) }; // (an attached lake's: the grants naming it)
+        let t = if attached { across(&table, t, false, &None, &asked) } else { guarded(&table, t, false, &asked) }; // (an attached lake's: the grants naming it)
         if let Some(t) = t {
             ctx.register_table(datafusion::common::TableReference::bare(name), t)?;
         }
@@ -1498,7 +1578,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
             }
             let meta = other.cat.parsed(&key, &raw)?;
             let view = named(&ctx, table_view(&other, &ctx, name, &meta, named_sys, upto).await?, &meta, names_deleted(&text))?;
-            let Some(view) = across(&format!("{ns}.{name}"), view, listing, &locked) else { continue };
+            let Some(view) = across(&format!("{ns}.{name}"), view, listing, &locked, &asked) else { continue };
             let (s, t) = split(name);
             if old && s == PUBLIC {
                 default.schema(&ns).expect("registered").register_table(t.to_string(), view.clone())?;
@@ -1549,6 +1629,9 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
                 system.register_table(name.into(), table)?;
             }
         }
+        if text.to_lowercase().contains("pondra.rejects") {
+            system.register_table("rejects".into(), crate::rejects::shown(lake, &ctx, upto).await?)?; // (the rows views' expectations dropped, of the objects the caller may read: `rejects.rs`)
+        }
         if crate::vars::mentioned(&text) {
             system.register_table("variables".into(), crate::vars::table()?)?; // (the session's or the run's: `vars.rs`)
         }
@@ -1584,7 +1667,40 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
             ctx.deregister_table(datafusion::common::TableReference::bare(n))?; // (files its views read: theirs, not tables to list)
         }
     }
+    if (listing || shows_columns(sql)) && !crate::rights::scope().whole() {
+        shown(&ctx).await?; // (a table granted in part, as DESCRIBE or a listing shows it: the columns its user may read)
+    }
     Ok(ctx)
+}
+
+/// Does a statement show tables' columns (DESCRIBE, SHOW COLUMNS), reading none of their rows?
+fn shows_columns(sql: &str) -> bool {
+    match crate::text::head(sql).as_str() {
+        "describe" | "desc" => true,
+        "show" => crate::text::contains_ci(sql, "columns"),
+        _ => false,
+    }
+}
+
+/// `ctx`'s tables as a statement that shows their columns (DESCRIBE, SHOW COLUMNS, `information_schema`) shows them to a
+/// user granted some of them: one granted in part, or one it holds another privilege on, with the columns it may read
+/// (`Guarded::shown`), and so with no name of one it may not. The views over it were planned against all of its columns
+/// first (`register_views`), so a view granted whole reads what it reads.
+async fn shown(ctx: &SessionContext) -> Result<()> {
+    for c in ctx.catalog_names() {
+        let Some(catalog) = ctx.catalog(&c) else { continue };
+        for s in catalog.schema_names() {
+            let Some(schema) = catalog.schema(&s) else { continue };
+            for t in schema.table_names() {
+                let Some(p) = schema.table(&t).await? else { continue };
+                let Some(g) = p.downcast_ref::<Guarded>().filter(|g| !matches!(g.columns, Some(None))) else { continue };
+                let shown = Arc::new(Guarded { shown: true, ..g.clone() });
+                schema.deregister_table(&t)?;
+                schema.register_table(t, shown)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A memory pool for one statement, over the lake's (which every statement shares): what its operators reserve goes
@@ -1686,6 +1802,7 @@ pub async fn stored_views(lake: &Lake, sql: &str, listing: bool) -> Result<Vec<(
 /// against, and taken out after, as a table is (`session`'s `unlisted`).
 pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String)>, strict: bool, listing: bool) -> Result<()> {
     let (mut failed, mut planned_only) = (None, vec![]);
+    let asked: Arc<str> = Arc::from(""); // (a view granted in part: its refusals name no column)
     while !views.is_empty() {
         let before = views.len();
         let mut left = vec![];
@@ -1694,11 +1811,11 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
                 Ok(df) => {
                     ctx.deregister_table(table_ref(&name))?;
                     let view = Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext_names::readable(&sql)))); // (its files as SQL named them)
-                    match guarded(&name, view.clone(), listing) {
+                    match guarded(&name, view.clone(), listing, &asked) {
                         Some(v) => ctx.register_table(table_ref(&name), v)?,
                         None => {
                             planned_only.push(table_ref(&name));
-                            ctx.register_table(table_ref(&name), Arc::new(Guarded { inner: view, name: name.clone(), columns: None, why: None }))?
+                            ctx.register_table(table_ref(&name), Arc::new(Guarded { inner: view, name: name.clone(), columns: None, why: None, shown: false, asked: asked.clone() }))?
                         }
                     };
                 }

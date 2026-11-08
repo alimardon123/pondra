@@ -135,7 +135,7 @@ fn refused(text: &'static str) -> Response {
 /// node of a `pondra://` lake opens it with that token too.
 pub fn checked(dir: &str, reader: bool, admin: bool, serving: bool) -> anyhow::Result<()> {
     anyhow::ensure!(!(serving && reader), "--serve-store: the node that serves a lake's store leads it, and a --reader never leads");
-    anyhow::ensure!(!(serving && dir.contains("://") && !crate::memory::in_memory(dir)), "--serve-store serves a lake on this machine (a folder, or :memory:): {dir} is reached by its own URL");
+    anyhow::ensure!(!(serving && dir.contains("://") && !crate::memory_lake::in_memory(dir)), "--serve-store serves a lake on this machine (a folder, or :memory:): {dir} is reached by its own URL");
     anyhow::ensure!(!(serving && !admin), "--serve-store needs --admin-token (or PONDRA_ADMIN_TOKEN), the same on every node: the nodes open the store with it");
     anyhow::ensure!(!(crate::store::served(dir) && !admin), "a node of {dir} opens its store with the admin token its holder has: set --admin-token (or PONDRA_ADMIN_TOKEN)");
     Ok(())
@@ -413,7 +413,7 @@ pub async fn wait_up(at: &str) {
     let url = crate::tls::url(&format!("{at}/healthz"));
     let mut said = false;
     loop {
-        if crate::cluster::http().get(url.as_str()).timeout(Duration::from_secs(2)).send().await.is_ok() {
+        if crate::net::process().client(crate::net::Policy::Cluster).get(url.as_str()).timeout(Duration::from_secs(2)).send().await.is_ok() {
             return;
         }
         if !std::mem::replace(&mut said, true) {

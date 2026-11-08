@@ -54,6 +54,7 @@ pub struct Rest {
     auth: Auth,
     vended: bool,                                   // ask for the table's files' credentials (ACCESS_DELEGATION_MODE)
     keys: Option<BTreeMap<String, String>>,         // an AWS catalog's secret: its tables' files are read with it too
+    http: reqwest::Client,                          // (as the caller reaches the catalog: `ext::reach`)
 }
 
 enum Auth {
@@ -83,7 +84,9 @@ pub async fn open(lake: &Lake, url: &str, options: &BTreeMap<String, String>) ->
         Auth::Token(_) => None,
     };
     let vended = o("access_delegation_mode").is_none_or(|m| m != "none");
-    let mut rest = Rest { base: format!("{url}/v1/"), auth, vended, keys };
+    // (an attachment's endpoint is an admin's; any other the caller reaches as its secret does)
+    let policy = if attached.is_some() { crate::net::Policy::ENDPOINT } else { crate::ext::reach_service(lake, url).await? };
+    let mut rest = Rest { base: format!("{url}/v1/"), auth, vended, keys, http: lake.node.net.client(policy) };
     // The catalog's own prefix (Glue's `catalogs/{account}`, S3 Tables' bucket ARN): from its config.
     let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>().replace('+', "%20");
     let mut config = format!("{url}/v1/config");
@@ -126,7 +129,7 @@ impl Rest {
     /// A request to the catalog, signed as it wants, and its answer.
     pub async fn send(&self, method: reqwest::Method, url: &str, body: Option<&Value>) -> Result<(reqwest::StatusCode, Value)> {
         let bytes = body.map(serde_json::to_vec).transpose()?.unwrap_or_default();
-        let mut r = crate::ext::web().request(method.clone(), url);
+        let mut r = crate::net::timeout(self.http.request(method.clone(), url), std::time::Duration::from_secs(60));
         if body.is_some() {
             r = r.header("content-type", "application/json");
         }
@@ -328,6 +331,22 @@ async fn credential(keys: &BTreeMap<String, String>) -> Result<AwsCredential> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A REST catalog at an address inside the node's network is refused to a caller who may not reach inside it (one
+    /// whose own temporary secret names it, or none), before anything is asked; the program that started the node
+    /// reaches it. A guard for when step 6 makes ATTACH a right: today every ATTACH is an admin's (`auth.rs`).
+    #[tokio::test]
+    async fn a_catalog_at_a_private_address_is_refused_to_a_caller_outside() {
+        let lake = Lake::open(&format!("memory://private-catalog-{}", uuid::Uuid::new_v4().simple()), true, false, crate::node_state::NodeState::unhosted()).await.unwrap();
+        let none = BTreeMap::new();
+        for at in ["http://10.0.0.5:8181", "http://169.254.169.254", "http://localhost:8181"] {
+            let e = crate::ext::scope(false, open(&lake, at, &none)).await.err().unwrap_or_else(|| panic!("{at} opened"));
+            assert!(e.to_string().contains("a temporary secret reaches only the public internet"), "{at}: {e}");
+        }
+        // (the owner's is asked: nothing answers there, so it fails reaching it, not by the policy)
+        let e = crate::ext::scope(true, open(&lake, "http://127.0.0.1:9", &none)).await.err().expect("nothing listens on port 9");
+        assert!(!e.to_string().contains("public internet"), "the owner reaches inside: {e:#}");
+    }
 
     #[test]
     fn regions() {

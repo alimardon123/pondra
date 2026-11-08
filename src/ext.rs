@@ -391,7 +391,7 @@ fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
         None => return Err(crate::codes::coded("42501", format!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): read it there, or from a bucket (s3://, gs://, az://, https://)"))),
         Some(_) => match covering(secrets, u) {
             None => return Err(crate::codes::coded("42501", uncovered(u))),
-            Some((_, s)) if s.temporary && !s.trusted => crate::public::check(&url::Url::parse(u)?)?, // (`register` holds its store to the public internet)
+            Some((_, s)) if s.temporary && !s.trusted => crate::net::check(&url::Url::parse(u)?)?, // (`register` holds its store to the public internet)
             Some(_) => {}
         },
     }
@@ -663,27 +663,12 @@ pub(crate) enum For {
     Lake,
     /// Files outside the lakes, with an admin's secret, a catalog's, or the node's own credentials.
     Files,
-    /// Files read with a temporary secret its maker brought: the public internet only (`public.rs`).
+    /// Files read with a temporary secret its maker brought: the public internet only (`net::Connector`).
     Public,
 }
 
-/// A page's store of a web origin (`web_with`), on wasm32 only.
-#[cfg(target_arch = "wasm32")]
-pub type Web = Box<dyn Fn(&str) -> Arc<dyn object_store::ObjectStore> + Send + Sync>;
-#[cfg(target_arch = "wasm32")]
-static WEB: std::sync::OnceLock<Web> = std::sync::OnceLock::new();
-
-/// Gives a page's store of a web origin, the browser's `fetch` (web/'s `fetch.rs`), which `build` uses for an http(s) URL
-/// with no bearer token. A browser's server may hide `Content-Range` and lists no folder (WebDAV's PROPFIND), where
-/// object_store's HTTP client needs both: the page's store reads a part from the range it asked and refuses a listing by
-/// name. Set once per module; a later call changes nothing.
-#[cfg(target_arch = "wasm32")]
-pub fn web_with(web: Web) {
-    let _ = WEB.set(web);
-}
-
 /// A page's store of its blob URLs, the tab's own files (web/'s `fetch.rs`, `Blob`): one store for every blob, since a blob's
-/// stand-in names its URL (`ext_names::blob_of`). Set once per module, as `web_with` is.
+/// stand-in names its URL (`ext_names::blob_of`). Set once per module.
 #[cfg(target_arch = "wasm32")]
 static BLOB: std::sync::OnceLock<Arc<dyn object_store::ObjectStore>> = std::sync::OnceLock::new();
 
@@ -700,8 +685,11 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
     let public = to == For::Public;
     let get = |k: &str| p.and_then(|p| p.get(k)).cloned();
     // (an endpoint or host written as an address is refused here; a name, as it resolves)
-    let reach = |u: &str| if public { crate::public::check(&url::Url::parse(u).with_context(|| format!("endpoint {u}"))?) } else { Ok(()) };
+    let reach = |u: &str| if public { crate::net::check(&url::Url::parse(u).with_context(|| format!("endpoint {u}"))?) } else { Ok(()) };
     reach(url.as_str())?;
+    // (the store's client, by its policy: a reader's own temporary secret's is `Public`'s, any other the admin's)
+    let policy = if public { crate::net::Policy::Public } else { crate::net::Policy::ENDPOINT };
+    let connector = |headers: object_store::HeaderMap| crate::net::process().connector(policy, headers);
     let chain = p.is_none() || get("provider").as_deref() == Some("credential_chain");
     let bucket = url.host_str().context("no bucket in the URL")?.to_string();
     let home = format!("{}://{bucket}", url.scheme());
@@ -716,11 +704,18 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
             reach(&e)?;
             b = b.with_allow_http(e.starts_with("http://")).with_endpoint(e);
         }
-        if public {
-            b = b.with_http_connector(crate::public::Connector::default());
+        if !lake {
+            b = b.with_http_connector(connector(Default::default()));
         }
         if let Some(r) = get("region") {
             b = b.with_region(r);
+        }
+        // (a customer's KMS key: each object written is encrypted with it, SSE-KMS. Without one the bucket still
+        // encrypts at rest, with its own keys. From the environment `AWS_SSE_KMS_KEY_ID` alone is enough: on its own
+        // it would be ignored, short of `AWS_SERVER_SIDE_ENCRYPTION`)
+        let from_env = || chain.then(|| std::env::var("AWS_SSE_KMS_KEY_ID").ok()).flatten().filter(|_| std::env::var_os("AWS_SERVER_SIDE_ENCRYPTION").is_none());
+        if let Some(k) = get("kms_key_id").or_else(from_env) {
+            b = b.with_sse_kms_encryption(k);
         }
         match (get("key_id"), get("secret")) {
             (Some(k), Some(s)) => b = b.with_access_key_id(k).with_secret_access_key(s),
@@ -748,12 +743,10 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
                 reach(&e)?;
                 b = b.with_config(K::Client(object_store::ClientConfigKey::AllowHttp), e.starts_with("http://").to_string()).with_base_url(&e);
             }
-            if public {
-                b = b.with_http_connector(crate::public::Connector::default());
-            }
-            if lake {
-                b = b.with_config(K::Client(object_store::ClientConfigKey::PoolIdleTimeout), "15s").with_http_connector(crate::budget::Budget::of(&home));
-            }
+            b = match lake {
+                true => b.with_config(K::Client(object_store::ClientConfigKey::PoolIdleTimeout), "15s").with_http_connector(crate::budget::Budget::of(&home)),
+                false => b.with_http_connector(connector(Default::default())),
+            };
             Arc::new(b.build()?)
         }
         "az" | "azure" | "abfs" | "abfss" => {
@@ -770,18 +763,16 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
                     b = b.with_config(key, v);
                 }
             }
-            if lake {
-                b = b.with_config(K::Client(object_store::ClientConfigKey::PoolIdleTimeout), "15s").with_http_connector(crate::budget::Budget::of(&home));
-            }
-            if public {
-                b = b.with_http_connector(crate::public::Connector::default());
-            }
+            b = match lake {
+                true => b.with_config(K::Client(object_store::ClientConfigKey::PoolIdleTimeout), "15s").with_http_connector(crate::budget::Budget::of(&home)),
+                false => b.with_http_connector(connector(Default::default())),
+            };
             Arc::new(b.build()?)
         }
         "http" | "https" => {
-            #[cfg(target_arch = "wasm32")]
-            if let (None, Some(web)) = (get("bearer_token"), WEB.get()) {
-                return Ok(web(&url.origin().ascii_serialization())); // (a page's own fetch: `web_with`)
+            // (a web address with no secret of its own, where the platform reads one itself: a page, through its browser's fetch)
+            if let (None, Some(web)) = (get("bearer_token"), crate::net::process().web(policy, &url.origin().ascii_serialization())) {
+                return Ok(web);
             }
             let mut options = object_store::ClientOptions::new().with_allow_http(url.scheme() == "http");
             let mut headers = object_store::HeaderMap::new();
@@ -790,7 +781,7 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
                 options = options.with_default_headers(headers.clone());
             }
             let b = HttpBuilder::new().with_url(url.as_str()).with_client_options(options);
-            Arc::new(if public { b.with_http_connector(crate::public::Connector { headers }) } else { b }.build()?)
+            Arc::new(b.with_http_connector(connector(headers)).build()?)
         }
         "blob" => bail!("a blob: URL is a browser tab's own file: only that tab's page reads it"), // (`register_blob` reads one; no store is built for it)
         s => bail!("{s}:// isn't read (s3, r2, gs, az, abfss, https)"),
@@ -928,27 +919,16 @@ pub async fn secret_for(lake: &Lake, url: &str) -> Result<Option<BTreeMap<String
     covering(&list(lake).await?, url).map(|(n, s)| open(&n, &s)).transpose()
 }
 
-/// A client for other engines' services (REST catalogs): Pondra's own tokens never go there.
-pub fn web() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    #[cfg(not(target_arch = "wasm32"))]
-    let client = || reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build().expect("an HTTP client");
-    #[cfg(target_arch = "wasm32")]
-    let client = reqwest::Client::new; // (a page's fetch keeps the browser's own time limits)
-    CLIENT.get_or_init(client)
+/// How the node reaches `url`, a service a statement names (a REST catalog's endpoint, its token server), for this
+/// caller (`net::for_endpoint`): inside the node's network for the program that started it, on a page (`reads_any_url`),
+/// and through a secret an admin made (`inside`); through a reader's own temporary secret, the public internet alone.
+pub(crate) async fn reach_service(lake: &Lake, url: &str) -> Result<crate::net::Policy> {
+    let inside = reads_any_url() || covering(&list(lake).await?, url).is_some_and(|(_, s)| inside(&s));
+    crate::net::for_endpoint(&url::Url::parse(url).with_context(|| url.to_string())?, inside)
 }
 
-/// A client with no token of its own, and no time limit. It is a second client only because it differs
-/// from `web()` in one thing, which is `web()`'s 60 s timeout: dbserver streams whole answers through it,
-/// and ai.rs sets its own timeout per request.
-pub fn bare() -> &'static reqwest::Client {
-    static BARE: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    #[cfg(not(target_arch = "wasm32"))]
-    let client = || reqwest::Client::builder().build().unwrap_or_default();
-    #[cfg(target_arch = "wasm32")]
-    let client = reqwest::Client::new; // (as `web()`: a page's fetch keeps the browser's own time limits)
-    BARE.get_or_init(client)
-}
+/// Does a secret reach inside the node's network? One an admin made, or a temporary one an admin trusts (`register`).
+fn inside(s: &Secret) -> bool { !s.temporary || s.trusted }
 
 /// A recipient's token for a Delta Sharing server, from the secret of TYPE share covering it.
 pub async fn share_token(lake: &Lake, endpoint: &str) -> Result<Option<String>> {
@@ -1038,7 +1018,10 @@ pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
     let at = p.get("oauth2_server_uri").cloned().unwrap_or_else(|| format!("{url}/v1/oauth/tokens"));
     let form = [("grant_type", "client_credentials"), ("client_id", id), ("client_secret", pass), ("scope", p.get("oauth2_scope").map_or("catalog", String::as_str))];
     let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(form).finish();
-    let r = crate::fetch::send(web().post(&at).header("content-type", "application/x-www-form-urlencoded").body(body)).await.with_context(|| format!("asking {at} for a token"))?;
+    // (the token server the secret names: inside the network as the secret reaches)
+    let policy = crate::net::for_endpoint(&url::Url::parse(&at).with_context(|| at.clone())?, reads_any_url() || inside(&secret))?;
+    let ask = lake.node.net.client(policy).post(&at).header("content-type", "application/x-www-form-urlencoded").body(body);
+    let r = crate::fetch::send(crate::net::timeout(ask, std::time::Duration::from_secs(60))).await.with_context(|| format!("asking {at} for a token"))?;
     let status = r.status();
     let body: serde_json::Value = r.json().await.unwrap_or_default();
     ensure!(status.is_success(), "{at} gave no token ({status}): {}", body["error_description"].as_str().or(body["error"].as_str()).unwrap_or(""));
@@ -1064,7 +1047,7 @@ pub struct Secret {
     #[serde(skip)]
     pub temporary: bool, // (CREATE TEMPORARY SECRET: the session's, in memory: `temp.rs`)
     #[serde(skip)]
-    pub trusted: bool, // (a temporary one an admin or the node's owner made: it reaches what they may; anyone else's, the public internet: `public.rs`)
+    pub trusted: bool, // (a temporary one an admin or the node's owner made: it reaches what they may; anyone else's, the public internet: `net::Policy::Public`)
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lent: bool, // (a key a branch was lent to read its base with: `reach_base` alone, never a statement: ADR-058)
 }
@@ -1074,7 +1057,7 @@ pub(crate) fn secret_key(name: &str) -> String { format!("e/{name}") }
 /// Each type's settings (DuckDB's names), and the URL schemes it serves.
 fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
     Ok(match t {
-        "s3" | "r2" => (&["key_id", "secret", "region", "session_token", "endpoint", "url_style", "use_ssl", "account_id", "provider", "scope"], &["s3", "r2"]),
+        "s3" | "r2" => (&["key_id", "secret", "region", "kms_key_id", "session_token", "endpoint", "url_style", "use_ssl", "account_id", "provider", "scope"], &["s3", "r2"]),
         "gcs" => (&["key_id", "secret", "service_account_key", "endpoint", "provider", "scope"], &["gs", "gcs"]),
         "azure" => (&["connection_string", "account_name", "account_key", "sas_token", "tenant_id", "client_id", "client_secret", "endpoint", "use_emulator", "provider", "scope"], &["az", "azure", "abfs", "abfss"]),
         "http" => (&["bearer_token", "scope"], &["http", "https"]),
@@ -1443,7 +1426,7 @@ fn made(name: &str, mut params: BTreeMap<String, String>) -> Result<Secret> {
 /// queries before the lake's of the same scope, never written anywhere. One made by anyone but an
 /// admin or the node's owner reads with its own keys, on the public internet: not with the node's
 /// credentials (S37), not a topic (its brokers name others to connect to), and not an address of
-/// the node's own network (`public.rs`, S6).
+/// the node's own network (`net::Policy::Public`, S6).
 pub fn temporary(name: &str, params: BTreeMap<String, String>) -> Result<Secret> {
     let trusted = owner() || crate::auth::current().is_none_or(|p| p.role >= crate::auth::Role::Admin);
     if !trusted {
@@ -1836,6 +1819,46 @@ impl datafusion::catalog::TableProvider for Secrets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bucket's KMS key (`KMS_KEY_ID`, DuckDB's name, beside `REGION`) encrypts each object written with it: the
+    /// write asks the bucket for SSE-KMS with that key. Without one, the write asks for nothing, and the bucket's own
+    /// encryption at rest holds.
+    #[tokio::test]
+    async fn a_kms_key_encrypts_each_object_written_with_it() -> Result<()> {
+        use object_store::ObjectStoreExt as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let heard = tokio::spawn(async move {
+            let mut said = Vec::new();
+            while said.len() < 2 {
+                let (mut c, _) = listener.accept().await?;
+                let mut got = Vec::new();
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut buf = [0; 4096];
+                    let n = c.read(&mut buf).await?;
+                    anyhow::ensure!(n > 0, "the request ended before its headers did");
+                    got.extend_from_slice(&buf[..n]);
+                }
+                said.push(String::from_utf8_lossy(&got).to_lowercase());
+                c.write_all(b"HTTP/1.1 200 OK\r\nETag: \"e\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+            }
+            anyhow::Ok(said)
+        });
+        let key = "arn:aws:kms:eu-west-1:111122223333:key/k1";
+        for kms in [Some(key), None] {
+            let mut p: BTreeMap<String, String> = [("key_id", "k"), ("secret", "s"), ("region", "eu-west-1"), ("endpoint", endpoint.as_str())].map(|(k, v)| (k.to_string(), v.to_string())).into();
+            p.extend(kms.map(|k| ("kms_key_id".to_string(), k.to_string())));
+            build(&url::Url::parse("s3://b/lake")?, Some(&p), For::Files)?.put(&object_store::path::Path::from("lake/o"), b"x".to_vec().into()).await?;
+        }
+        let said = heard.await??;
+        assert!(said[0].starts_with("put "), "{}", said[0]);
+        assert!(said[0].contains("x-amz-server-side-encryption: aws:kms\r\n"), "{}", said[0]);
+        assert!(said[0].contains(&format!("x-amz-server-side-encryption-aws-kms-key-id: {key}\r\n")), "{}", said[0]);
+        assert!(!said[1].contains("x-amz-server-side-encryption"), "no key, no header: {}", said[1]);
+        assert!(kind("s3")?.0.contains(&"kms_key_id") && kind("r2")?.0.contains(&"kms_key_id"), "a secret takes it");
+        Ok(())
+    }
 
     #[test]
     fn copy_to_stdout_and_from_stdin_off_the_port_are_refused_by_name() {

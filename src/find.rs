@@ -91,7 +91,7 @@ fn part(o: &Object, kind: &'static str, name: String, ty: Option<String>, commen
 /// name columns (keys, links, checks, expectations). Empty when it may read none.
 fn partial_columns(scope: &crate::rights::Scope, o: &Object, here: &str) -> Option<HashSet<String>> {
     let catalog = if o.lake == here { o.local() } else { format!("{}.{}", o.lake, o.local()) };
-    match scope.columns(&catalog) {
+    match if o.lake == here { scope.columns(&catalog) } else { scope.named("select", &catalog) } {
         Some(None) => None,
         Some(Some(cols)) => Some(cols),
         None => Some(HashSet::new()),

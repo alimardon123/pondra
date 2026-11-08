@@ -11,6 +11,9 @@ column base
 dialect base
 env base
 lifecycle base
+machine base
+net base
+scratch base
 node_state base
 ledger base
 memo base
@@ -35,7 +38,7 @@ fetch platform
 jemalloc platform
 joined platform
 origins platform
-public platform
+os platform
 served platform
 store_wire platform
 tls platform
@@ -134,10 +137,12 @@ protect engine
 query engine
 ranges engine
 reach engine
+rejects engine
 replace engine
 request_body engine
 rerun engine
 returning engine
+reuse engine
 routines engine
 rules engine
 runs engine
@@ -235,6 +240,7 @@ lib hosts
 library hosts
 main hosts
 memory hosts
+memory_lake catalog
 node hosts
 page hosts
 project hosts

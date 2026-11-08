@@ -124,7 +124,7 @@ fn tools() -> Value {
         {"name": "list_tables", "annotations": {"readOnlyHint": true}, "inputSchema": args(json!({}), &[]),
          "description": "Every table and view, as SQL names it (schema.table in a schema other than public; attached lakes' as lake.table or lake.schema.table): \
              its columns; its kind — append, upsert (a primary key: the newest row per key wins), merge (rows per key combine, e.g. sum) \
-             or view (a stored query); and for views, their SQL."},
+             or view (a stored query), or null when you may not read its key; and for views, their SQL."},
         {"name": "query", "annotations": {"readOnlyHint": true}, "inputSchema": args(sql.clone(), &["sql"]),
          "description": format!("Run one SQL query and get its rows as JSON (the first {ROWS}, and the total). \
              `WHERE key = …` on an upsert table is a fast point lookup. Vector search: ORDER BY cosine_distance(embedding, [0.1, …]) LIMIT k. \
@@ -186,6 +186,11 @@ async fn call(app: &App, role: Role, params: &Value) -> Result<Value, Value> {
 /// wrote for a job becomes something an agent can do, with the agent's token's rights.
 async fn procedures(app: &App) -> Vec<Value> {
     let Ok(all) = crate::routines::listed(&app.lake).await else { return vec![] };
+    // (what COMMENT ON PROCEDURE says of it; else its body's first line, if a comment, to a caller who may see its code:
+    // a user with grants isn't shown a routine's body, so not its first line either)
+    let notes: std::collections::HashMap<String, String> =
+        app.lake.cat.scan::<String>("cm/routine/", "cm/routine0").await.unwrap_or_default().into_iter().map(|(k, v)| (k["cm/routine/".len()..].to_string(), v)).collect();
+    let code = crate::rights::scope().shows_code();
     let kind = |t: Option<&str>| match t.unwrap_or_default().split('(').next().unwrap_or_default().to_uppercase().as_str() {
         "BIGINT" | "INT" | "INTEGER" | "SMALLINT" | "TINYINT" => "integer",
         "DOUBLE" | "REAL" | "FLOAT" | "DECIMAL" | "NUMERIC" => "number",
@@ -195,7 +200,8 @@ async fn procedures(app: &App) -> Vec<Value> {
     let mut out: Vec<Value> = all.iter().filter(|(_, r)| r.kind == crate::expander::Kind::Procedure).map(|(name, r)| {
         let props: serde_json::Map<String, Value> = r.params.iter().map(|p| (p.name.clone(), json!({"type": kind(p.ty.as_deref()), "description": p.ty}))).collect();
         let required: Vec<&str> = r.params.iter().filter(|p| p.default.is_none()).map(|p| p.name.as_str()).collect();
-        let about = r.body.lines().map(str::trim).find(|l| !l.is_empty()).filter(|l| l.starts_with("--") || l.starts_with('#')).map(|l| l.trim_start_matches(['-', '#', ' ']).to_string());
+        let first = || r.body.lines().map(str::trim).find(|l| !l.is_empty()).filter(|l| l.starts_with("--") || l.starts_with('#')).map(|l| l.trim_start_matches(['-', '#', ' ']).to_string());
+        let about = notes.get(name.as_str()).cloned().or_else(|| code.then(first).flatten());
         json!({"name": tool(name), "annotations": {"readOnlyHint": false}, "inputSchema": {"type": "object", "properties": props, "required": required},
                "description": format!("{} (the stored procedure {name}, LANGUAGE {}: CALL {name}(…))", about.unwrap_or_else(|| "A job this lake's owner wrote".into()), r.language)})
     }).collect();
@@ -224,7 +230,10 @@ fn lakes(app: &App) -> Vec<(String, Arc<Lake>)> {
 /// May the request being served read `name`, a table or view of the lake `prefix` names? A user
 /// with grants sees only what it may SELECT, as `pondra.tables` lists it.
 fn may_see(prefix: &str, name: &str) -> bool {
-    crate::rights::scope().sees(crate::rights::Object::Table(&format!("{prefix}{name}")))
+    match prefix.is_empty() {
+        true => crate::rights::scope().sees(crate::rights::Object::Table(name)),
+        false => crate::rights::scope().sees_named(&format!("{prefix}{name}")), // (another lake's: the grants naming it)
+    }
 }
 
 /// A column's type as SQL names it, for an agent that writes SQL: as `SHOW CREATE` writes it (`types::shown`), so it
@@ -253,8 +262,11 @@ async fn list(app: &App) -> Result<Value> {
             .flatten();
             let reads = |c: &str| shown.as_ref().is_none_or(|s| s.contains(c));
             let columns: Vec<Value> = m.columns().filter(|(c, _)| *c != "_deleted" && reads(c)).map(|(c, t)| json!({"name": c, "type": sql_type(&m, c, t)})).collect();
-            let key: Vec<&String> = m.key.iter().filter(|c| reads(c)).collect();
-            let merge: std::collections::BTreeMap<&String, &String> = m.merge.iter().filter(|(c, _)| reads(c)).collect();
+            // (a key it may not read all of: no kind, key or merge either, which would say there is one)
+            let keyed = m.key.iter().all(|c| reads(c));
+            let kind = keyed.then_some(kind);
+            let key: Vec<&String> = m.key.iter().filter(|_| keyed).collect();
+            let merge: std::collections::BTreeMap<&String, &String> = m.merge.iter().filter(|(c, _)| keyed && reads(c)).collect();
             let view = crate::views::code_for_caller(|| views.iter().find(|(k, _)| &k[2..] == name).map(|(_, v)| v.sql.clone())).flatten();
             tables.push(json!({"table": format!("{prefix}{name}"), "kind": kind, "key": key, "merge": merge, "columns": columns, "view": view}));
         }

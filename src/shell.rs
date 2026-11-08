@@ -45,7 +45,7 @@ pub(crate) fn start(dir: &str) -> Result<(Child, String, String, std::path::Path
 /// one until its mark is old (invariant 17), then leads; a statement sent meanwhile would be
 /// refused (57P03: it doesn't yet hold what the lake's leader had, invariant 197).
 pub(crate) async fn up(base: &str, node: &mut Child, log: &Path) -> Result<reqwest::Client> {
-    let (http, started, mut said) = (reqwest::Client::builder().no_proxy().tls_certs_only([]).build()?, Instant::now(), false);
+    let (http, started, mut said) = (crate::net::process().client(crate::net::Policy::Local), Instant::now(), false);
     while !http.get(format!("{base}/ready")).send().await.is_ok_and(|r| r.status().is_success()) {
         if node.try_wait()?.is_some() || started.elapsed() > Duration::from_secs(120) {
             bail!("the node didn't start: {}", std::fs::read_to_string(log).unwrap_or_default());
@@ -74,7 +74,7 @@ pub async fn script(dir: &str, url: Option<&str>, token: Option<&str>, body: ser
         Ok(format!("{heard}{}\n", text.trim_end()))
     };
     if let Some(url) = url {
-        return send(reqwest::Client::new(), url.trim_end_matches('/').to_string(), String::new()).await;
+        return send(crate::net::process().client(crate::net::Policy::ENDPOINT), url.trim_end_matches('/').to_string(), String::new()).await;
     }
     let (mut node, base, key, log) = start(dir)?;
     let r = match up(&base, &mut node, &log).await {

@@ -391,7 +391,7 @@ pub async fn planned(ctx: &SessionContext, sql: &str) -> anyhow::Result<LogicalP
         Some(stmt) => state.statement_to_plan(stmt).await,
         None => state.create_logical_plan(sql).await,
     }
-    .map_err(|e| crate::pattern::reworded(e, sql))
+    .map_err(|e| crate::pattern::reworded(crate::rights::said(e), sql))
 }
 
 /// `kept`, the front's parse of `sql`, is the statement DataFusion parses `sql` to with the session's settings: an error
