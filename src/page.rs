@@ -74,8 +74,9 @@ fn blob_refused() -> anyhow::Error {
 const JOINED_TRANSACTION: &str = "a page that joined a node runs each statement on its own: run a transaction through a client of the node";
 /// The name a kept table's rows have in the requests that import it (`import_table`): a request's table, as `imported_said` names it.
 const KEPT_ROWS: &str = "the kept rows";
-/// How a page is made: the store its member keeps its lake in, how it asks its node, how it watches its memory, and the line
-/// its device has.
+/// How a page is made: the store its member keeps its lake in and how it asks its node. Its memory is its device's, which the
+/// program that runs the page installs as the module's machine (`machine::install`; `web/`'s `device.rs`): the core reads its
+/// live bytes as the machine's resident memory, and the line its device has as the machine's line (`Machine::line`).
 pub struct Options {
     /// The store a page's member on the core's lake keeps its lake in (`open_lake`): a browser gives its private folder (OPFS), so
     /// the page's tables are there again after a reload. It must be the page's alone (a kept page's folder, under its Web Lock): the
@@ -85,12 +86,6 @@ pub struct Options {
     /// The page's node (B5): asked for the tables the page doesn't have, with the rows of its own tables a query names.
     /// None asks no node: a query over a table the page lacks is 42P01, as it is on a page with no node.
     pub node: Option<Node>,
-    /// The page's live heap bytes, read by the program that runs the page (`web/` counts its allocator's). The watch reads
-    /// it at each poll of a query and stops the query that grows the page past its line (`Watch`). None watches nothing.
-    pub memory: Option<Memory>,
-    /// The memory line the program that runs the page found for its device, in bytes (`web/`: a phone's browser gives a
-    /// page less than a desktop's), taken when `PONDRA_MEMORY_MAX_GB` isn't set (`oom::line_on`). None: `env::PAGE_LINE`.
-    pub line: Option<usize>,
     /// The node the page joins (`Join`): the page follows its lake, reads its own tables from it, and sends each write to
     /// `node`. A joined page has no `store`. A body that isn't plain text is not routed, so its write fails 25006 on the page.
     /// None: a page of its own.
@@ -138,21 +133,23 @@ impl std::fmt::Debug for Join {
     }
 }
 
-/// The page's live heap bytes, as the program that runs the page reads them (`Options::memory`).
-pub type Memory = Arc<dyn Fn() -> usize + Send + Sync>;
-
-/// A page's memory watch: what it reads its live bytes with, and the line past which the query that grew them is stopped
-/// (`oom::polled`). A page's line is set by `PONDRA_MEMORY_MAX_GB`, else by its device (`oom::line_on`).
+/// A page's memory watch: the line past which the query that grew the page's live bytes (its machine's resident memory) is
+/// stopped (`oom::polled`). A page's line is set by `PONDRA_MEMORY_MAX_GB`, else by its device (`oom::line_on`).
 struct Watch {
-    live: Memory,
     line: usize,
 }
 
 impl Watch {
+    /// The page's watch on `device` (the module's machine), where it reads its live bytes (`Machine::resident`) and its line
+    /// (`Machine::line`, through `oom::line_on`) isn't 0.
+    fn of(device: &dyn crate::machine::Machine) -> Option<Watch> {
+        device.resident().and(crate::oom::line_on(device.line())).map(|line| Watch { line })
+    }
+
     /// The bytes a query may grow the page by now: to its line, and at least the tenth of the line `oom::polled` lets any
     /// query grow, so a page past its line still takes a small answer.
     fn room(&self) -> usize {
-        self.line.saturating_sub((self.live)()).max(self.line / 10)
+        self.line.saturating_sub(crate::machine::process().resident().unwrap_or(0)).max(self.line / 10)
     }
 }
 
@@ -179,7 +176,7 @@ pub struct Sent {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { store: None, node: None, memory: None, line: None, joined: None, say: None }
+        Options { store: None, node: None, joined: None, say: None }
     }
 }
 
@@ -197,9 +194,8 @@ pub struct Page {
     holds_claim: bool, // (the module's page is this page's: `close` and `ending` clear it, and give the module's page back)
     member: tokio::sync::OnceCell<crate::node::Paged>, // (the page's member on the core's lake: opened by its first request, or by `open_lake`)
     store: Option<crate::store::Store>, // (the store the member keeps its lake in, as `Options::store` gave it)
-    line: Option<usize>, // (the device's line the member's queries hold, as `Options::line` gave it)
     node: Option<Node>,
-    watch: Option<Watch>, // (the page's memory watch: none when the page was given no `memory`, or its line is 0)
+    watch: Option<Watch>, // (the page's memory watch: none when its machine reads no live bytes, or its line is 0)
     unread: Vec<(String, String)>, // (the kept files `import_kept` couldn't read, each as its path and the words of why)
     joined: Option<Join>, // (the node this page follows, as `Options::joined` gave it: its member is a follower, and its writes go there)
     say: Option<fn(&str)>, // (where its member says its lines, as `Options::say` gave it)
@@ -394,15 +390,15 @@ impl Page {
 
     /// A page on the core's lake: the module's one page, claimed now (`node::claim_page`, refused 55006 while a live page holds
     /// it). Its member on the core's lake opens at its first request (`member`), and keeps its lake in `store`. Its memory is
-    /// watched when `memory` is given. `open_lake` also opens the member now, and imports a folder kept by 0.35/0.36.
+    /// watched where its machine reads its live bytes (`Watch::of`). `open_lake` also opens the member now, and imports a folder kept by 0.35/0.36.
     pub fn claim(options: &Options) -> anyhow::Result<Page> {
         if options.joined.is_some() {
             anyhow::ensure!(options.store.is_none(), "a page that joined a node keeps no folder of its own");
             anyhow::ensure!(options.node.is_some(), "a page that joined a node sends its writes to its node: it needs one");
         }
         crate::node::claim_page()?;
-        let watch = options.memory.as_ref().zip(crate::oom::line_on(options.line)).map(|(live, line)| Watch { live: live.clone(), line });
-        Ok(Page { holds_claim: true, member: Default::default(), store: options.store.clone(), line: options.line, node: options.node.clone(), watch, unread: vec![], joined: options.joined.clone(), say: options.say })
+        let watch = Watch::of(crate::machine::process());
+        Ok(Page { holds_claim: true, member: Default::default(), store: options.store.clone(), node: options.node.clone(), watch, unread: vec![], joined: options.joined.clone(), say: options.say })
     }
 
     /// `claim`, with the member opened now (`open_now`), so an open's error is this call's. A folder kept by 0.35/0.36 in
@@ -438,9 +434,9 @@ impl Page {
                 match &self.joined {
                     Some(j) => {
                         let auth = format!("Bearer {}", j.session);
-                        crate::node::open_joined(j.node(), &auth, Arc::new(crate::joined::Joined::new(j.node(), &auth)), self.line, crate::node::PageLife::new(self.say)).await
+                        crate::node::open_joined(j.node(), &auth, Arc::new(crate::joined::Joined::new(j.node(), &auth)), crate::node::PageLife::new(self.say)).await
                     }
-                    None => crate::node::open_page(self.store.clone(), self.line, crate::node::PageLife::new(self.say)).await,
+                    None => crate::node::open_page(self.store.clone(), crate::node::PageLife::new(self.say)).await,
                 }
             })
             .await
@@ -1372,6 +1368,29 @@ mod tests {
         let over = within(3 * 1024 * 1024, 1).unwrap_err();
         assert_eq!(crate::codes::of(&over), "54000");
         assert!(crate::codes::words(&over).contains("web_send_mb"), "{over:#}");
+    }
+
+    /// A page's watch is its machine's: none where the machine reads no live bytes (a unit test's, a native process with no
+    /// device), and else on the line its device has, or the page's own where the device doesn't say.
+    #[test]
+    fn a_pages_watch_reads_its_line_from_its_machine() {
+        struct Device(Option<usize>, Option<usize>); // (its live bytes and its line)
+        impl crate::machine::Machine for Device {
+            fn ram(&self) -> Option<usize> { None }
+            fn line(&self) -> Option<usize> { self.1 }
+            fn resident(&self) -> Option<usize> { self.0 }
+            fn cores(&self) -> usize { 1 }
+            fn space(&self, _: &std::path::Path) -> Option<(u64, u64)> { None }
+        }
+        assert!(Watch::of(&Device(None, Some(1 << 30))).is_none(), "a machine that reads no live bytes watches nothing");
+        assert!(Watch::of(crate::machine::process()).is_none(), "a unit test's machine reads none either");
+        let line = |d: Device| Watch::of(&d).map(|w| w.line);
+        assert_eq!(line(Device(Some(0), Some(1 << 30))), crate::oom::line_on(Some(1 << 30)));
+        assert_eq!(line(Device(Some(0), None)), crate::oom::line_on(None));
+        if crate::env::gib("PONDRA_MEMORY_MAX_GB").is_none() {
+            assert_eq!(line(Device(Some(0), Some(1 << 30))), Some(1 << 30), "the device's line, as it said it");
+            assert_eq!(line(Device(Some(0), None)), Some(crate::env::PAGE_LINE), "the page's own where the device doesn't say");
+        }
     }
 
     #[test]

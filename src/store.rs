@@ -1911,9 +1911,9 @@ fn whole_line() -> usize {
 }
 
 /// A page's lake holds what the page's own pool does (`env::page_query_memory`, of its device's line): its memory is its
-/// line, not a machine's (`ram` is None there, and 4 GiB is past a 32-bit `usize`).
+/// line (`Machine::line`), not a machine's (`ram` is None there, and 4 GiB is past a 32-bit `usize`).
 #[cfg(target_arch = "wasm32")]
-pub fn memory_limit() -> usize { crate::env::page_query_memory(crate::env::device_line()) }
+pub fn memory_limit() -> usize { crate::env::page_query_memory(crate::machine::process().line()) }
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
 
