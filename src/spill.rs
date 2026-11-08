@@ -7,7 +7,7 @@
 //! the wire (length-prefixed, `Frames`); a partition of the next step reads a `chain` of them, in
 //! node order, so the same query adds up the same rows the same way every time. Everything a job
 //! wrote goes when the job does.
-use crate::reset::Once;
+use crate::node_state::NodeState;
 use anyhow::{Context, Result};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -23,21 +23,16 @@ fn piece() -> usize {
     crate::env::value::<usize>("PONDRA_SPILL_MB") << 20
 }
 
-/// Where a node keeps what it spills: `shuffle` in the process's own spill folder (`store::spill_folder`: this
+/// Where node `here` keeps what it spills: `shuffle` in the process's own spill folder (`store::spill_folder`: this
 /// user's alone, locked while the process lives, swept once it ends), one folder per job and node (`<job>-<node id>`).
-/// The node's own id is in the path because two nodes in one process share that folder, and they name their buckets
-/// the same way: without it they would write over each other's rows (invariant 30). Being the process's, no other
-/// user can read the rows, and nothing sweeps a job while its process lives. An empty job names the `shuffle` folder
-/// itself (measuring). Err when the process has no spill folder.
-pub fn dir(job: &str) -> std::io::Result<PathBuf> {
-    crate::per_node!(static ME: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None));
-    let me = ME.get_or(|| uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string());
-    let base = crate::store::spill_folder()?.join("shuffle");
-    Ok(match job.is_empty() {
-        true => base,
-        false => base.join(format!("{job}-{me}")),
-    })
-}
+/// The node's own id (`NodeState::id`) is in the path because two nodes in one process share that folder, and they
+/// name their buckets the same way: without it they would write over each other's rows (invariant 30). Being the
+/// process's, no other user can read the rows, and nothing sweeps a job while its process lives. Err when the process
+/// has no spill folder.
+pub fn dir(job: &str, here: &NodeState) -> std::io::Result<PathBuf> { Ok(shuffles()?.join(format!("{job}-{}", here.id))) }
+
+/// The `shuffle` folder itself, every node's here.
+fn shuffles() -> std::io::Result<PathBuf> { Ok(crate::store::spill_folder()?.join("shuffle")) }
 
 /// One node's rows for one other node, in pieces. Cloning one costs nothing (the pieces are
 /// files, or batches behind an Arc), so a bucket can be read again if a step has to be retried;
@@ -245,29 +240,36 @@ impl PartitionStream for Chain {
 
 /// Held while a job's spilled results are being sent: what it wrote goes when it is dropped,
 /// whether the stream finished or the reader walked away.
-pub struct Gone(pub String);
+pub struct Gone(pub String, pub Arc<NodeState>);
 
 impl Drop for Gone {
-    fn drop(&mut self) { clear(&self.0) }
+    fn drop(&mut self) { clear(&self.0, &self.1) }
 }
 
-/// Everything a job spilled here.
-pub fn clear(job: &str) {
-    if let Ok(path) = dir(job) {
+/// Everything a job spilled on node `here`.
+pub fn clear(job: &str, here: &NodeState) {
+    if let Ok(path) = dir(job, here) {
         let _ = std::fs::remove_dir_all(path);
     }
 }
 
-/// Bytes under this node's shuffle scratch (for `/metrics`).
-pub fn held() -> u64 {
-    fn walk(p: &Path) -> u64 {
-        let Ok(entries) = std::fs::read_dir(p) else { return 0 };
-        entries.flatten().map(|e| match e.path().is_dir() {
-            true => walk(&e.path()),
-            false => e.metadata().map(|m| m.len()).unwrap_or(0),
-        }).sum()
-    }
-    dir("").map(|base| walk(&base)).unwrap_or(0)
+/// Bytes under this process's shuffle scratch, every node's here (what the process holds: `store::others_held`).
+pub fn held() -> u64 { shuffles().map(|base| walk(&base)).unwrap_or(0) }
+
+/// Bytes under node `here`'s shuffle scratch, its jobs' folders alone (for `/metrics`).
+pub fn held_by(here: &NodeState) -> u64 {
+    let Ok(entries) = shuffles().and_then(std::fs::read_dir) else { return 0 };
+    let mine = format!("-{}", here.id);
+    entries.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(&mine)).map(|e| walk(&e.path())).sum()
+}
+
+/// Bytes under folder `p`, all the way down.
+fn walk(p: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(p) else { return 0 };
+    entries.flatten().map(|e| match e.path().is_dir() {
+        true => walk(&e.path()),
+        false => e.metadata().map(|m| m.len()).unwrap_or(0),
+    }).sum()
 }
 
 #[cfg(test)]
@@ -277,9 +279,10 @@ mod tests {
     #[test]
     fn a_jobs_folder_is_inside_the_process_spill_folder() {
         let folder = crate::store::spill_folder().expect("this process's spill folder");
-        let job = dir("j").expect("a job's folder");
+        let node = NodeState::unhosted();
+        let job = dir("j", &node).expect("a job's folder");
         assert_eq!(job.parent(), Some(folder.join("shuffle").as_path()), "{}", job.display());
-        assert!(job.file_name().unwrap().to_string_lossy().starts_with("j-"), "named by the job and the node's id");
+        assert_eq!(job.file_name().unwrap().to_string_lossy(), format!("j-{}", node.id), "named by the job and the node's id");
     }
 
     #[cfg(unix)]
@@ -296,16 +299,37 @@ mod tests {
     async fn two_nodes_buckets_count_apart() {
         use datafusion::arrow::array::{ArrayRef, Int64Array};
         use std::sync::atomic::Ordering::Relaxed;
-        let (one, other) = (crate::node_state::NodeState::unhosted(), crate::node_state::NodeState::unhosted());
+        let (one, other) = (NodeState::unhosted(), NodeState::unhosted());
         let job = format!("counted-{}", uuid::Uuid::new_v4().simple());
-        let mut sent = Spill::new(dir(&job).unwrap(), "sent".into(), &other.metrics);
+        let mut sent = Spill::new(dir(&job, &other).unwrap(), "sent".into(), &other.metrics);
         sent.push(RecordBatch::try_from_iter([("v", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef)]).unwrap()).unwrap();
         let pieces = sent.count();
         let body = sent.framed().map(|f| f.map(bytes::Bytes::from).map_err(anyhow::Error::from)).boxed();
-        let got = Spill::take(dir(&job).unwrap(), "got".into(), &mut Frames::new(body), pieces, &one.metrics).await.unwrap();
+        let got = Spill::take(dir(&job, &one).unwrap(), "got".into(), &mut Frames::new(body), pieces, &one.metrics).await.unwrap();
         assert_eq!(got.count(), 1);
         assert!(one.metrics.wire.load(Relaxed) > 0, "the receiver's");
         assert_eq!(other.metrics.wire.load(Relaxed), 0, "not the sender's");
-        clear(&job);
+        clear(&job, &one);
+        clear(&job, &other);
+    }
+
+    /// Two nodes in one process run one job (a cluster's, in a test): each spills into a folder of its own, its disk
+    /// gauge counts that folder alone, and clearing one's leaves the other's.
+    #[test]
+    fn two_nodes_jobs_keep_apart() {
+        let (one, other) = (NodeState::unhosted(), NodeState::unhosted());
+        let job = format!("apart-{}", uuid::Uuid::new_v4().simple());
+        let (a, b) = (dir(&job, &one).unwrap(), dir(&job, &other).unwrap());
+        assert_ne!(a, b, "a folder each");
+        for (d, n) in [(&a, 10), (&b, 3)] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("out-0.arrow"), vec![0u8; n]).unwrap();
+        }
+        assert_eq!((held_by(&one), held_by(&other)), (10, 3), "each its own folder's bytes");
+        clear(&job, &other);
+        assert!(!b.exists() && a.exists(), "the other's folder gone, this one's kept");
+        assert_eq!((held_by(&one), held_by(&other)), (10, 0));
+        clear(&job, &one);
+        assert!(!a.exists());
     }
 }

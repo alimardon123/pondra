@@ -595,7 +595,7 @@ async fn commit(State(app): State<App>, body: Bytes) -> Result<Json<crate::log::
 /// This node's share of a distributed query, sent a piece at a time (a big share is on disk).
 async fn stage(State(app): State<App>, Json(slice): Json<crate::spmd::Slice>) -> Result<Response, E> {
     let (shape, parts) = crate::spmd::stage(&app.lake, &slice).await?;
-    let done = slice.shuffle.is_none().then(|| crate::spill::Gone(slice.id.clone()));
+    let done = slice.shuffle.is_none().then(|| crate::spill::Gone(slice.id.clone(), app.lake.node.clone()));
     Ok(Body::from_stream(crate::spmd::reply(&shape, parts, done)).into_response())
 }
 
@@ -621,12 +621,12 @@ struct BucketParams {
 }
 
 /// A shuffle bucket this node keeps for another node (see `spmd.rs`).
-async fn bucket(Query(p): Query<BucketParams>) -> Result<Response, E> {
+async fn bucket(State(app): State<App>, Query(p): Query<BucketParams>) -> Result<Response, E> {
     if p.drop {
-        crate::spmd::forget(&p.id);
+        crate::spmd::forget(&app.lake, &p.id);
         return Ok(Body::empty().into_response());
     }
-    let buckets = crate::spmd::bucket(&p.id, p.exchange, p.to, p.part)?;
+    let buckets = crate::spmd::bucket(&app.lake, &p.id, p.exchange, p.to, p.part)?;
     Ok(Body::from_stream(crate::spmd::reply("", buckets, None)).into_response()) // (a piece at a time: a big bucket is on disk)
 }
 
