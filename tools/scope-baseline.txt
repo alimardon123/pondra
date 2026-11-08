@@ -1,4 +1,6 @@
 # tools/scope_check.py's counts on main: each may only fall (`--write-baseline` after one does).
+# (a count's note says why it stays. Tests aren't counted: oom.rs's reads the task's caller, as it proves a task
+# DataFusion spawns keeps it)
 node apply.rs 1
 node backup.rs 2
 node branch.rs 2
@@ -30,13 +32,13 @@ reads apply.rs 5
 reads audit.rs 3
 reads branch.rs 7
 reads change.rs 1
-reads ext.rs 5
+reads ext.rs 4
 reads extension.rs 1
 reads files.rs 1
 reads history.rs 2
 reads path.rs 1
 reads protect.rs 1
-reads python.rs 1
+reads python.rs 1  # (python::ask: a Python function's error, its lines cut, raised in DataFusion's batches, where only the task carries its caller)
 reads routines.rs 1
 reads rules/rows.rs 1
 reads seq.rs 1

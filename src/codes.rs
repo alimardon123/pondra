@@ -162,8 +162,8 @@ const DISABLED: &str = "(nothing spills to disk: PONDRA_SPILL_GB is 0)";
 
 /// A worker's error without the code it quotes, for a caller not shown it (S27): `failure` in worker.py ends it
 /// with `  line 3: <the line>` for each place in the body, which become `  line 3`. Here for a procedure (and its
-/// run's log) and in `ext::said` for every door, since a function's batches may run where no caller is known, and in
-/// `codes::of`, so no quoted line picks an error's code.
+/// run's log), for a door's caller not shown code (`told`), in `ext::said`, which names no caller, and in `codes::of`,
+/// so no quoted line picks an error's code.
 pub fn unquoted(error: &str) -> String {
     let line = |l: &str| match l.strip_prefix("  line ").and_then(|r| r.split_once(": ")) {
         Some((n, _)) if n.chars().all(|c| c.is_ascii_digit()) => format!("  line {n}"),
