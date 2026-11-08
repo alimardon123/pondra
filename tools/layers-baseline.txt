@@ -274,7 +274,7 @@ store -> in_task  1
 store -> locks  1
 store -> oom  2
 store -> panics  4
-store -> query  5
+store -> query  4
 store -> rules  14
 store -> seq  3
 store -> serve  2
