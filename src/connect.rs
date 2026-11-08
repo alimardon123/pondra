@@ -418,7 +418,7 @@ mod tests {
             let kept: Definition = lake.cat.get(&key("drop_zone")).await?.expect("kept");
             assert_eq!(kept, Definition { ty: "s3".into(), options: [("url".to_string(), j!("s3://bucket/incoming"))].into() });
             // (the core lists and shows it with no edit of its own: `Kind::shown`)
-            let all = crate::objects::list(&lake).await?;
+            let all = crate::objects::list(&lake, &crate::auth::Principal::node().scope).await?;
             let o = all.iter().find(|o| o.kind == "connection").expect("listed");
             assert_eq!((o.name.as_str(), o.definition.as_deref()), ("drop_zone", Some("CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://bucket/incoming')")));
             assert_eq!(code(run(&lake, "CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://other')").await).0, "42710");
@@ -436,12 +436,12 @@ mod tests {
             crate::objects::apply(&lake, crate::objects::Op::Comment { kind: "connection".into(), name: "drop_zone".into(), text: Some("the partner's drop".into()), if_exists: false }).await?;
             run(&lake, "ALTER CONNECTION drop_zone RENAME TO landing").await.unwrap();
             assert!(lake.cat.get::<Value>(&key("drop_zone")).await?.is_none());
-            let o = crate::objects::list(&lake).await?.into_iter().find(|o| o.kind == "connection").expect("listed");
+            let o = crate::objects::list(&lake, &crate::auth::Principal::node().scope).await?.into_iter().find(|o| o.kind == "connection").expect("listed");
             assert_eq!((o.name.as_str(), o.comment.as_deref()), ("landing", Some("the partner's drop")));
             assert_eq!(code(run(&lake, "ALTER CONNECTION drop_zone SET (url = 's3://x')").await).0, "42704");
             assert_eq!(run(&lake, "ALTER CONNECTION IF EXISTS drop_zone SET (url = 's3://x')").await.unwrap()[0]["exists"], false);
             run(&lake, "DROP CONNECTION landing").await.unwrap();
-            assert!(crate::objects::list(&lake).await?.iter().all(|o| o.kind != "connection"));
+            assert!(crate::objects::list(&lake, &crate::auth::Principal::node().scope).await?.iter().all(|o| o.kind != "connection"));
             assert!(lake.cat.scan::<String>("cm/", "cm0").await?.is_empty(), "its comment went with it");
             assert_eq!(code(run(&lake, "DROP CONNECTION landing").await).0, "42704");
             assert_eq!(run(&lake, "DROP CONNECTION IF EXISTS landing").await.unwrap()[0]["dropped"], false);
@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(run(&lake, "ATTACH DATABASE shop AS sales").await.unwrap()[0], j!({"attached": "sales", "type": "delta", "url": "s3://b/tables"}));
         let a = over("sales").await;
         assert_eq!((a.kind.as_str(), a.url.as_str(), a.connection.as_deref(), a.options.get("read_only").map(String::as_str)), ("delta", "s3://b/tables", Some("shop"), Some("true")));
-        let shown = crate::objects::list(&lake).await?.into_iter().find(|o| o.kind == "database" && o.name == "sales").and_then(|o| o.definition);
+        let shown = crate::objects::list(&lake, &crate::auth::Principal::node().scope).await?.into_iter().find(|o| o.kind == "database" && o.name == "sales").and_then(|o| o.definition);
         assert_eq!(shown.as_deref(), Some("ATTACH shop AS sales"), "SHOW CREATE DATABASE names the connection, not its url");
         // (it follows the connection: ALTER CONNECTION … SET and RESET)
         run(&lake, "ALTER CONNECTION shop SET (url = 's3://c/t')").await.unwrap();

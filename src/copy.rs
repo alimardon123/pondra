@@ -897,7 +897,7 @@ pub async fn gone(lake: &Lake, folders: &[String]) -> Result<Vec<String>> {
 /// `pondra.loads`, a system table (`query.rs`, as `pondra.tables` is): each file loaded into a
 /// table the caller may read, with its version and rows and when it was loaded. Named only where
 /// the text names it.
-pub async fn tables(lake: &Lake, text: &str) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
+pub async fn tables(lake: &Lake, text: &str, scope: &crate::rights::Scope) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
     use datafusion::arrow::array::{ArrayRef, StringArray, TimestampMillisecondArray, UInt64Array};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
@@ -912,7 +912,6 @@ pub async fn tables(lake: &Lake, text: &str) -> Result<Vec<(&'static str, Arc<dy
         by_folder.entry(folder).or_default().push((schema.to_string(), table.to_string()));
     }
     let (mut schema, mut table, mut file, mut version, mut rows, mut at) = (vec![], vec![], vec![], vec![], vec![], vec![]);
-    let scope = crate::rights::scope();
     for (key, e) in lake.cat.scan::<Entry>("ld/", "ld0").await? {
         let folder = key[3..].rsplit_once('/').map_or("", |(f, _)| f);
         for (s, t) in by_folder.get(folder).into_iter().flatten() {

@@ -34,7 +34,7 @@ enum At {
 /// first change after then replaced, if the row was made by then.
 /// `attached`: the table is an attached lake's (`b.t AT (…)`, read as `SELECT … FROM b.t` reads it: that lake's sign-in and
 /// newest commit, and only the grants that name it).
-pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u64>, sys: bool) -> Result<(String, Arc<dyn TableProvider>, bool)> {
+pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u64>, sys: bool, scope: &crate::rights::Scope) -> Result<(String, Arc<dyn TableProvider>, bool)> {
     use crate::text::{CREATED, ROW_ID, UPDATED, VERSION};
     let spec = Spec::of(name)?;
     let t = &spec.table;
@@ -46,7 +46,6 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
     };
     // (a table or view the caller holds nothing on is one that isn't there, before anything is said of it: that it is a view,
     // keyed, or when it was made, as a plain read says "no table": 11-08 audit M4)
-    let scope = crate::rights::scope();
     ensure!(if attached { scope.knows_named(&named) } else { scope.knows(&named) }, "no table {t}");
     let upto = match &other {
         Some(o) => {
