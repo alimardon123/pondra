@@ -1859,6 +1859,7 @@ pub struct Lake {
     pub groups: Arc<crate::serve::Groups>,     // decoded row groups for key lookups
     pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
     pub(crate) manifests: Arc<crate::manifest::Kept>, // its tables' manifests and lists, decompressed (`manifest::object`)
+    pub(crate) format: crate::format::Held, // what this process holds of its format: made here, what `raise` saw (`format.rs`)
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
     cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
     pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
@@ -2462,10 +2463,10 @@ impl Lake {
         let (torn, cat) = tokio::join!(async { if check_torn { crate::memory::refuse_torn(&store, &url).await } else { Ok(()) } }, opening);
         torn?;
         let cat = cat?;
-        crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
+        let format = crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory)), manifests: crate::manifest::kept(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), life });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory)), manifests: crate::manifest::kept(), format, attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), life });
         for (name, cache) in lake.caches() {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
