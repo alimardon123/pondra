@@ -109,6 +109,8 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
                   crate::runs::PREFIXES, crate::tasks::PREFIXES, crate::users::PREFIXES, crate::views::PREFIXES] {
             r.section_mut::<crate::records::Prefixes>().add(p);
         }
+        #[cfg(feature = "lake")]
+        r.section_mut::<crate::records::Rights>().add(crate::users::RIGHTS);
     },
 };
 

@@ -63,6 +63,38 @@ impl Prefixes {
     }
 }
 
+/// The registry's section of the prefixes whose records say who may do what: a commit that writes under one moves the
+/// catalog's rights version (`store::Catalog::rights_version`). Each owner marks its own as it registers them (the user
+/// and role kinds' `u/` and the identity providers' `ip/`: `objects::RIGHTS`; the lake's keys: `users::RIGHTS`), and
+/// the catalog reads the marks, so no list of them is kept anywhere else.
+#[derive(Default)]
+pub struct Rights(Vec<&'static str>);
+
+impl Section for Rights {
+    const NAME: &'static str = "rights";
+
+    /// A mark is of a prefix a kind or a module registers: one nobody registers would cover no record its owner writes.
+    fn check(&self, r: &Registry) -> Result<(), String> {
+        let all = all_of(r);
+        match self.0.iter().find(|m| !all.iter().any(|p| p.prefix == **m)) {
+            Some(m) => Err(format!("{m:?} is marked as saying who may do what, but no kind or module registers it")),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Rights {
+    /// A module's prefixes whose records say who may do what (each one it, or its kinds, registers).
+    pub fn add(&mut self, prefixes: &[&'static str]) {
+        self.0.extend_from_slice(prefixes);
+    }
+
+    /// Does a commit that writes `key` change who may do what?
+    pub fn moves(&self, key: &str) -> bool {
+        self.0.iter().any(|p| covers(p, key))
+    }
+}
+
 /// A prefix as listed: a kind's names its kinds together (a family shares one prefix).
 pub struct Listed {
     pub prefix: &'static str,
@@ -152,6 +184,34 @@ mod tests {
     #[should_panic(expected = "test's prefix \"s/\" overlaps store's \"s/\"")]
     fn a_prefix_registered_twice_is_refused() {
         Registry::build(&[&crate::objects::CATALOG, &Adds(&[Prefix { prefix: "s/", owner: "test", holds: "segments again" }])]);
+    }
+
+    #[test]
+    fn the_rights_are_marked_by_their_owners() {
+        let r = crate::registry::get();
+        let mut marked = r.section::<Rights>().0.clone();
+        marked.sort();
+        assert_eq!(marked, ["ip/", "u/", "z/auth", "z/signed"], "users and roles, identity providers, the lake's keys and its signed mark");
+        let rights = r.section::<Rights>();
+        for (key, moves) in [("u/ann", true), ("ip/acme", true), ("z/auth", true), ("z/signed", true), ("z/authx", false), ("t/orders", false), ("c", false)] {
+            assert_eq!(rights.moves(key), moves, "{key}");
+        }
+    }
+
+    struct Marks(&'static [&'static str]);
+    impl Extension for Marks {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+        fn register(&self, r: &mut Registry) {
+            r.section_mut::<Rights>().add(self.0)
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "\"zz/\" is marked as saying who may do what, but no kind or module registers it")]
+    fn a_mark_nobody_registers_is_refused() {
+        Registry::build(&[&crate::objects::CATALOG, &Marks(&["zz/"])]);
     }
 
     #[test]
