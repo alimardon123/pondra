@@ -539,6 +539,16 @@ impl TableProvider for Guarded {
         }).collect())
     }
     async fn scan(&self, state: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        let projection = self.checked(projection, filters)?;
+        self.inner.scan(state, projection.as_ref(), filters, limit).await
+    }
+}
+
+impl Guarded {
+    /// May a scan read `projection` (of this table's columns as shown) and the columns `filters` name? The inner table's
+    /// projection if so; refused as `SELECT` of the columns it may not read if not. Asked as a plan is run (`scan`) and as
+    /// it is only described (`described`), so describing a query is refused as running it is.
+    fn checked(&self, projection: Option<&Vec<usize>>, filters: &[Expr]) -> datafusion::error::Result<Option<Vec<usize>>> {
         let denied = |not: &[String]| {
             let named: Vec<&str> = not.iter().filter(|c| names_column(&self.asked, c)).map(String::as_str).collect(); // (the ones it asked for by name)
             let what = if named.is_empty() { String::new() } else { format!(" ({})", named.join(", ")) };
@@ -561,9 +571,10 @@ impl TableProvider for Guarded {
             }
             false => projection,
         };
+        let projection = projection.cloned();
         if let Some(allowed) = columns {
             let schema = self.inner.schema();
-            let mut used: Vec<String> = match projection {
+            let mut used: Vec<String> = match &projection {
                 Some(p) => p.iter().map(|&i| schema.field(i).name().clone()).collect(),
                 None => schema.fields().iter().map(|f| f.name().clone()).collect(),
             };
@@ -575,7 +586,7 @@ impl TableProvider for Guarded {
                 return Err(denied(&not));
             }
         }
-        self.inner.scan(state, projection, filters, limit).await
+        Ok(projection)
     }
 }
 
@@ -1340,6 +1351,28 @@ pub fn read_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
 pub fn run_schema(ctx: &SessionContext, plan: &datafusion::logical_expr::LogicalPlan) -> Result<datafusion::common::DFSchemaRef> {
     let state = ctx.state();
     Ok(state.analyzer().execute_and_check(plan.clone(), state.config_options(), |_, _| {})?.schema().clone())
+}
+
+/// `run_schema`, for a statement described to its caller and not run (Flight's GetFlightInfo, Postgres's Describe): each
+/// scan of a table it reads in part is asked, as the optimizer leaves it, what running it asks (`Guarded::checked`), so a
+/// description is refused as the statement's run would be, never told the columns it may not read (11-08 audit M6). A
+/// statement that reads only what it may costs one optimizer pass more, and none for a caller whose scope is whole.
+pub fn described(ctx: &SessionContext, plan: &datafusion::logical_expr::LogicalPlan) -> Result<datafusion::common::DFSchemaRef> {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    if !crate::rights::scope().whole() {
+        let optimized = ctx.state().optimize(plan)?;
+        optimized.apply_with_subqueries(|node| {
+            if let datafusion::logical_expr::LogicalPlan::TableScan(scan) = node {
+                if let Ok(p) = datafusion::datasource::source_as_provider(&scan.source) {
+                    if let Some(g) = p.downcast_ref::<Guarded>() {
+                        g.checked(scan.projection.as_ref(), &scan.filters)?;
+                    }
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+    }
+    run_schema(ctx, plan)
 }
 
 /// A table of this lake in a session: `t` in the default schema (`public`), `s.t` in schema `s`,

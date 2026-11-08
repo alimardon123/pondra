@@ -1175,7 +1175,9 @@ impl FlightService for Door {
             let app = &self.0 .0;
             allowed(app, &req, Role::Read)?;
             let mut infos = vec![];
-            for (key, _) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k) && crate::rights::may_here(crate::rights::Action::Select, crate::rights::Object::Table(&k[2..])).is_ok()) {
+            // (each a flight of `SELECT *`: listed for a table it may read every column of, as its ticket would be refused
+            // naming none for one granted in part, and its info would be: 11-08 audit M6)
+            for (key, _) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k) && crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&k[2..])).is_ok()) {
                 let table = &key[2..];
                 // (the schema its ticket streams, planned as DoGet runs it: a table's strings are Utf8View, not the table's Utf8)
                 let sql = format!("SELECT * FROM {}", crate::write::sql_name(table));
@@ -1236,7 +1238,7 @@ impl FlightService for Door {
                     let name = crate::auth::catalog_name(&table);
                     crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&name)).map_err(denied)?; // (a stream of rows: every column, as `/watch` needs)
                     // (the rows come after this call's scope has ended: its sign-in is checked again, and the table's whole rows
-                    // with it, so a REVOKE, a DROP USER or a session's end stops them within 5 s, as at `/watch`: 11-03 audit H1)
+                    // with it, so a REVOKE, a DROP USER or a session's end stops them within a second, as at `/watch`: 11-03 audit H1)
                     let header = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
                     let revoked = crate::server::until_revoked(app.clone(), crate::auth::operator(), header, move |p| {
                         crate::rights::may(p, crate::rights::Action::SelectAll, crate::rights::Object::Table(&name)).is_ok()

@@ -357,7 +357,7 @@ async fn write_columns(app: &App, sql: &str) -> Result<Option<SchemaRef>> {
 pub(crate) async fn planned(app: &App, sql: &str) -> Result<SchemaRef> {
     let ctx = crate::query::session(&app.lake, sql, "").await?;
     let df = crate::engine::sql(&ctx, &crate::sys::planned(sql)?).await?;
-    Ok(Arc::new(crate::answer::arrow_schema(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow())))
+    Ok(Arc::new(crate::answer::arrow_schema(crate::query::described(&ctx, df.logical_plan())?.as_arrow()))) // (refused as its run would be)
 }
 
 /// A CTE named like a temporary table or view, or a stored view, would be read in place of the CTE: refused, before anything runs.

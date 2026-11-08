@@ -841,7 +841,7 @@ impl Backend {
         let sql = crate::sys::planned(sql).map_err(user_error)?;
         let ctx = self.session(&sql, user).await?;
         let df = crate::engine::sql(&ctx, &sql).await.map_err(user_error)?;
-        Ok(Arc::new(crate::query::run_schema(&ctx, df.logical_plan()).map_err(user_error)?.as_arrow().clone()))
+        Ok(Arc::new(crate::query::described(&ctx, df.logical_plan()).map_err(user_error)?.as_arrow().clone())) // (refused as its run would be)
     }
 
     /// A session for `sql`; with Postgres's catalog, its functions and its `information_schema`
@@ -1717,7 +1717,13 @@ impl ExtendedQueryHandler for Backend {
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
         let sql = pg_dialect(&self.app.lake, &stmt.statement.sql, "");
-        let out = crate::temp::SESSION.scope(Some(self.session.clone()), async { Ok(DescribeStatementResponse::new(self.types(&stmt.statement).await.to_vec(), self.describe(&sql, &stmt.statement.sql, &Format::UnifiedText).await?.0)) }).await; // (its temporary tables too)
+        // (as whoever signed in, as the statement will run: its grants decide what it is told, 11-08 audit M6)
+        let who = match self.signed().await {
+            Ok(who) => who,
+            Err(e) => return self.noted(&stmt.statement.sql, Err(e)).await,
+        };
+        let described = async { Ok(DescribeStatementResponse::new(self.types(&stmt.statement).await.to_vec(), self.describe(&sql, &stmt.statement.sql, &Format::UnifiedText).await?.0)) };
+        let out = crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(who, described)).await; // (its temporary tables too)
         self.noted(&stmt.statement.sql, out).await
     }
 
@@ -1730,14 +1736,18 @@ impl ExtendedQueryHandler for Backend {
             return Ok(DescribePortalResponse::new(fields));
         }
         let mut sent = statement.sql.clone(); // (what the history says it ran: the statement with its values, once bound)
-        let out = crate::temp::SESSION.scope(Some(self.session.clone()), async {
+        let who = match self.signed().await {
+            Ok(who) => who,
+            Err(e) => return self.noted(&sent, Err(e)).await,
+        };
+        let described = async {
             let inferred = self.types(statement).await;
             sent = bind(portal, inferred)?;
             let (fields, columns) = self.describe(&pg_dialect(&self.app.lake, &sent, ""), &sent, &portal.result_column_format).await?;
             statement.keep(columns);
             Ok(DescribePortalResponse::new(fields))
-        })
-        .await;
+        };
+        let out = crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(who, described)).await; // (as whoever signed in, as above)
         self.noted(&sent, out).await
     }
 }
