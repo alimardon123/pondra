@@ -171,6 +171,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
 /// gave the lake's totals), and what publishing each table in an open format keeps. One scrape is five lines a table,
 /// so it is an endpoint of its own, scraped by whoever wants each table's numbers. They come from the same map
 /// (`tier::refresh`), except the published state, which reads each published table's record.
+#[cfg(feature = "doors")]
 pub async fn tables(app: &App) -> anyhow::Result<String> {
     let mut out = String::new();
     let mut metric = |name: &str, help: &str, samples: &[(String, f64)]| {
