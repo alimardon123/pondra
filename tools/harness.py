@@ -12167,12 +12167,13 @@ def guarded():
         "a user's files": ask(P, json.dumps({"table": "orders", "job": "g5", "columns": [], "files": []}), path="/cluster/files", auth=bob, headers={"Content-Type": "application/json"}),
     }
     info["users"] = said
-    # (bob holds nothing on hr: for him it is a table that isn't there; carol reads orders, and is refused writing it)
+    # (bob holds nothing on hr: for him it is a table that isn't there; carol reads orders, and is refused writing it; bob may not
+    # make a table, so one that isn't there is "no table made", as hr is, never asked to be made: 11-08 audit M5)
     checks["a user's rows through /append and /insert as its grants say (reads too); another table, a new table, the audit log: refused"] = \
         isinstance(said["append, granted"], dict) and "ERROR 404: b'no table hr'" == said["append, not granted"] and "written by Pondra alone" in said["append to the audit log"] \
         and "needs more rights" in said["append, read but not granted"] \
         and isinstance(said["insert, granted"], dict) and "ERROR 404" in said["insert, reading what it may not"] and "hr' not found" in said["insert, reading what it may not"] \
-        and "ERROR 404: b'no table hr'" == said["insert, not granted"] and "may not change the lake's tables" in said["insert making a table"] \
+        and "ERROR 404: b'no table hr'" == said["insert, not granted"] and "ERROR 404: b'no table made'" == said["insert making a table"] \
         and until(lambda: ask(P, "SELECT id FROM orders ORDER BY id", auth=boss), [{"id": 7}, {"id": 8}], 10) == [{"id": 7}, {"id": 8}] \
         and ask(P, "SELECT count(*) AS n FROM hr", auth=boss) == [{"n": 1}]
     checks["…and never through the nodes' own routes (/cluster/commit, /cluster/files)"] = \
