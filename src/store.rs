@@ -1851,7 +1851,7 @@ pub fn memory_limit() -> usize {
 }
 
 /// The process's line for every node's queries together (`ledger::Root`): its whole line (`root_whole`) where there is one,
-/// else 4 GiB; on a page, two thirds of its device's line (`env::page_line_share`). A node's own `PONDRA_MEMORY_GB` is its
+/// else 4 GiB; on a page, its device's line's trim line, as a node's is (`env::page_line_share`). A node's own `PONDRA_MEMORY_GB` is its
 /// budget on it (`memory_limit`), never the process's.
 fn root_line() -> usize {
     #[cfg(target_arch = "wasm32")]

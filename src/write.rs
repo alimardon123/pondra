@@ -2048,7 +2048,9 @@ fn stage_job(job: &str) -> String {
 /// node's. A refusal keeps its SQLSTATE: the node's own for the rows, and 28000 or 42501 for the sign-in and the staged files.
 async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], query: &str, job: &str, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
     let lake = &app.lake;
-    let slug = crate::dial::page_slug().ok_or_else(|| crate::codes::coded("42501", "a joined page stages its rows under its user's folder, and its node gave it none"))?;
+    let Some((joined, slug)) = app.members.joined().and_then(|j| Some((j, j.slug()?))) else {
+        return Err(crate::codes::coded("42501", "a joined page stages its rows under its user's folder, and its node gave it none"));
+    };
     let stage = stage_job(job);
     let ctx = session_for(lake, query, "", None, scope).await?;
     let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
@@ -2092,7 +2094,8 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
         _ => None,
     };
     let call = crate::dial::Call::json(format!("/insert/{}?job={stage}&staged=1", percent_encoding::utf8_percent_encode(table, percent_encoding::NON_ALPHANUMERIC)), &j!({"columns": names, "files": files, "placed": placed}))?;
-    let reply = crate::dial::call(&app.members.leader().addr, call).await?;
+    // (the page's own dial, with its own sign-in: a node's carries the nodes' key)
+    let reply = crate::dial::Dial::call(&crate::dial::Joined { node: joined.node(), auth: joined.auth() }, joined.node(), call).await?;
     if reply.ok() {
         return reply.json().await;
     }

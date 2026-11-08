@@ -144,10 +144,10 @@ fn line_of(set: Option<usize>, own: Option<usize>) -> Option<usize> {
 }
 
 /// How much memory queries may hold in DataFusion's pool: `PONDRA_MEMORY_GB`, else the form's share (`own`: the memory
-/// watch's trim line on a node, `store::memory_limit`, two thirds of its line on a page). What the pool counts is the big
+/// watch's trim line, `of_line`, on a node and on a page alike: `store::memory_limit`). What the pool counts is the big
 /// hash tables and sort buffers, not the decoding and the batches in flight around them, so the share leaves the rest of
-/// the line for those. Past it a
-/// node's pool spills to disk; a page's, with no disk, refuses the query.
+/// the line for those. Past it a node's pool spills to disk, and a page's to its spill file in a Worker; a page with none
+/// refuses the query.
 pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
     memory_whole().unwrap_or_else(own)
 }
@@ -172,11 +172,25 @@ pub fn raise_memory() -> &'static str {
 /// footprint and for a last step that grows within one poll.
 pub const PAGE_LINE: usize = 3 << 30;
 
-/// The query memory a page's process holds (`store::root_line`): two thirds of its line (`memory_line` of its device's,
-/// `Machine::line`, else `PAGE_LINE`; of `PAGE_LINE` when the watch is off, so the pool is never empty). A page's own
-/// `memory_gb` is its budget on it (`query_memory`, `store::memory_limit`).
+/// The query memory a page's process holds (`store::root_line`): its line's trim line, as a node's is (`of_line` of
+/// `memory_line` of its device's, `Machine::line`, else `PAGE_LINE`; of `PAGE_LINE` when the watch is off, so the pool is
+/// never empty). A page's own `memory_gb` is its budget on it (`query_memory`, `store::memory_limit`).
 pub fn page_line_share(device: Option<usize>) -> usize {
-    memory_line(Some(device.unwrap_or(PAGE_LINE))).unwrap_or(PAGE_LINE) / 3 * 2
+    of_line(memory_line(Some(device.unwrap_or(PAGE_LINE))).unwrap_or(PAGE_LINE))
+}
+
+/// 85% of a line, or 320 MB under it where that is lower, and never under 70% of it: the trim line, past which a node's
+/// watch gives its caches back before it stops a query at the line (`oom::trim_line`), and the queries' share of the
+/// line on a node and on a page alike (`store::root_line`). With the default line
+/// (85% of RAM) on a machine of 3 GB or more, 72% of RAM: the hot columns take up to half of RAM (`Hot::new`),
+/// so queries have a fifth of RAM beside them before any column is given back, and an eighth more before the
+/// line, where a query is stopped. (At seven tenths of the line, 60% of RAM, the columns were given back as
+/// soon as a query took a tenth: TPC-H's and ClickBench's columns came and went.) Under a small line, 15% of
+/// it was too near: a query growing as fast as the watch looks for (`oom::RATE`, 320 MB in 40 ms) passed a 1 GB line
+/// by 11% while the columns were being given back (`harness hot`, on a GitHub runner); 320 MB under it is
+/// what it grows in the 40 ms the trim and its purge take.
+pub fn of_line(line: usize) -> usize {
+    line.saturating_sub(320 << 20).clamp(line / 10 * 7, line / 20 * 17)
 }
 
 /// A setting in seconds (fractions too), else its default in the table: one that is negative or not a number is the
@@ -278,6 +292,14 @@ mod tests {
         give([("memory_gb", "4"), ("spill_mb", "7")]).unwrap();
         let changed = give([("memory_gb", "8"), ("cache_gb", "2"), ("skew_mb", "12")]).unwrap_err().to_string();
         assert!(changed.contains("cache_gb (not set), memory_gb (4 now) can't change"), "{changed}");
+    }
+
+    /// A page's query share is its line's trim line, as a node's is (audit 11-08 L4): 85% of its own 3 GiB, and seven tenths
+    /// of a phone's 1 GiB.
+    #[test]
+    fn a_pages_share_is_its_lines_trim_line_as_a_nodes_is() {
+        assert_eq!(of_line(PAGE_LINE), PAGE_LINE / 20 * 17);
+        assert_eq!(of_line(1 << 30), (1 << 30) / 10 * 7);
     }
 
     /// The line is the setting's, else the form's own; 0 turns the watch off.
