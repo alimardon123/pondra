@@ -6,7 +6,7 @@
 //! `web/` wraps it for a browser.
 
 #[cfg(target_arch = "wasm32")]
-pub use crate::ext::{blob_with, web_with, Web}; // (a page gives its store of a web origin: its browser's fetch; of its blob URLs: its own files)
+pub use crate::ext::blob_with; // (a page gives its store of its blob URLs: its own files; of a web origin, its `Net`'s: `net::Net::web`)
 use crate::request_body;
 use anyhow::Context;
 use futures::TryStreamExt;

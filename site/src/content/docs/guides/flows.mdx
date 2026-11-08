@@ -83,6 +83,17 @@ silver  has_buyer    keep          1
 silver  positive     drop          1
 ```
 
+The rows a `DROP ROW` expectation left out are kept in `pondra.rejects`, each with the rule it broke,
+the row as JSON, the write that brought it and when, for the view's retention: a dropped row can
+be looked at, fixed and written again.
+
+<Ways sql={`SELECT rule, row, run FROM pondra.rejects WHERE object = 'silver' ORDER BY time`} />
+
+```text
+rule      row                                    run
+positive  {"id":7,"region":"r1","amount":-3}     nightly-load
+```
+
 ```sql
 CREATE MATERIALIZED VIEW strict (CONSTRAINT small CHECK (amount < 1000)) AS SELECT id, amount FROM orders;
 ```
