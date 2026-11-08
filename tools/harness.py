@@ -22214,6 +22214,83 @@ await db.close?.();"""
 
 
 
+def rejects():
+    """Rows dropped are kept for review (`pondra.rejects`, G2): each row a materialized view's expectation leaves out (ON
+    VIOLATION DROP ROW) is kept, in the commit that writes the view's other rows, with its object, the rule it broke (the
+    first, of two), why, the row as JSON, the run that brought it (a statement's job, an /append's producer, a bulk INSERT's
+    job, the view's filling) and when, while the view still leaves it out. A view's rejects are shown for its retention. A
+    user with grants sees the rejects of the views it may read in whole; a superuser all of them."""
+    import base64
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=0.5).start()
+    basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+    boss, ann, bob = basic("boss", "boss-password-1"), basic("ann", "ann-password-1"), basic("bob", "bob-password-1")
+    def ask(auth, q, path="/sql"):
+        try:
+            return call(A.port, "POST", path, q.encode() if isinstance(q, str) else q, headers={"Authorization": auth} if auth else {})
+        except Exception as e:
+            return f"ERROR {e}"
+    checks, info = {}, {}
+    for q in ["CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER", "CREATE TABLE orders (id BIGINT, buyer VARCHAR, amount BIGINT)",
+              "INSERT INTO orders VALUES (1, 'u1', -5), (2, 'u2', 10)"]:
+        info.setdefault("setup", []).append(ask(None, q))
+    for q in ["""CREATE MATERIALIZED VIEW silver (
+                   CONSTRAINT positive CHECK (amount > 0) ON VIOLATION DROP ROW,
+                   CONSTRAINT small CHECK (amount < 1000) ON VIOLATION DROP ROW,
+                   CONSTRAINT not_x CHECK (buyer <> 'x') ON VIOLATION DROP ROW,
+                   CONSTRAINT has_buyer EXPECT (buyer IS NOT NULL)
+                 ) AS SELECT id, buyer, amount FROM orders""",
+              "CREATE MATERIALIZED VIEW bronze (CONSTRAINT tiny CHECK (amount < 100) ON VIOLATION DROP ROW) AS SELECT id, amount FROM orders",
+              "CREATE MATERIALIZED VIEW kept_all (CONSTRAINT counted EXPECT (amount > 0)) AS SELECT id, amount FROM orders",
+              "CREATE USER ann PASSWORD 'ann-password-1'", "CREATE USER bob PASSWORD 'bob-password-1'",
+              "GRANT SELECT ON silver TO ann", "GRANT SELECT (id) ON silver TO bob", "GRANT SELECT ON bronze TO bob"]:
+        info.setdefault("setup", []).append(ask(boss, q))
+    time.sleep(1.5)  # (each view filled from the rows already there)
+    info["load"] = call(A.port, "POST", "/sql?job=load-1", b"INSERT INTO orders VALUES (3, NULL, -7), (4, 'u4', 5000), (5, 'x', -1), (6, 'u6', 50)", headers={"Authorization": boss})
+    body = "".join(json.dumps(r) + "\n" for r in [{"id": 7, "buyer": "u7", "amount": 0}, {"id": 8, "buyer": "u8", "amount": 20}]).encode()
+    info["append"] = call(A.port, "POST", "/append/orders?producer=feed&seq=1", body, headers={"Authorization": boss})
+    info["bulk"] = call(A.port, "POST", "/sql?job=bulk-1", b"INSERT INTO orders SELECT value, 'b', -value FROM range(100000, 120000)", headers={"Authorization": boss})
+    time.sleep(1.5)
+    rows = lambda auth, where="": ask(auth, f"SELECT object, rule, reason, row, run, time FROM pondra.rejects {where} ORDER BY object, row")
+    every = rows(boss)
+    small = [r for r in every if isinstance(r, dict) and not (r["run"] or "").startswith("bulk")] if isinstance(every, list) else every
+    info["rejects"] = small
+    silver = ask(boss, "SELECT id FROM silver ORDER BY id")
+    ids = lambda rs: sorted(json.loads(r["row"])["id"] for r in rs)
+    of = lambda o: [r for r in every if r["object"] == o] if isinstance(every, list) else []
+    checks["the view still leaves the rows out"] = isinstance(silver, list) and [r["id"] for r in silver] == [2, 6, 8]
+    checks["every row silver left out is kept, once: the orders not in silver"] = ids(of("silver")) == sorted([1, 3, 4, 5, 7] + list(range(100000, 120000)))
+    want = {1: ("positive", "CHECK (amount > 0)"), 3: ("positive", "CHECK (amount > 0)"), 4: ("small", "CHECK (amount < 1000)"), 5: ("positive", "CHECK (amount > 0)"), 7: ("positive", "CHECK (amount > 0)")}
+    got = {json.loads(r["row"])["id"]: (r["rule"], r["reason"]) for r in of("silver") if json.loads(r["row"])["id"] < 100000}
+    checks["each names the rule that left it out and its condition; a row that broke two, the first"] = got == want
+    by_id = {json.loads(r["row"])["id"]: r for r in of("silver")}
+    checks["the row as JSON: its columns, a NULL left out"] = json.loads(by_id.get(3, {}).get("row", "{}")) == {"id": 3, "amount": -7} and json.loads(by_id.get(4, {}).get("row", "{}")) == {"id": 4, "buyer": "u4", "amount": 5000}
+    runs = {i: by_id.get(i, {}).get("run") for i in (1, 3, 7, 100000)}
+    checks["the run: the statement's job, the /append's producer, the bulk INSERT's job, the view's filling"] = \
+        (runs[3], runs[7], runs[100000]) == ("load-1", "feed", "bulk-1") and str(runs[1]).startswith("fill:")
+    checks["when: a time, now"] = all(r.get("time") for r in of("silver"))
+    checks["bronze's own rules, its own rows"] = ids(of("bronze")) == [4] and {r["rule"] for r in of("bronze")} == {"tiny"}
+    checks["an expectation that keeps its rows keeps none here"] = of("kept_all") == []
+    exp = ask(boss, "SELECT expectation, failed_rows FROM pondra.expectations WHERE view = 'silver' ORDER BY expectation")
+    info["expectations"] = exp
+    checks["pondra.expectations still counts them"] = isinstance(exp, list) and {r["expectation"]: r["failed_rows"] for r in exp}.get("small") == 1
+    # (rights: ann reads silver whole, bob only its id, and bronze whole)
+    a, b = rows(ann), rows(bob)
+    info["ann"], info["bob"] = (a[:3] if isinstance(a, list) else a), (b[:3] if isinstance(b, list) else b)
+    checks["a user with grants sees the rejects of the views it reads whole"] = isinstance(a, list) and {r["object"] for r in a} == {"silver"} and len(a) == len(of("silver"))
+    checks["not those of a view it reads in part, nor of one it holds nothing on"] = isinstance(b, list) and {r["object"] for r in b} == {"bronze"}
+    # (retention: a view's rejects are shown while its retention lasts)
+    info["retain0"] = ask(boss, "ALTER TABLE silver SET (retention = '0 seconds')")
+    gone = rows(boss, "WHERE object = 'silver'")
+    info["retain7"] = ask(boss, "ALTER TABLE silver SET (retention = '7 days')")
+    back = rows(boss, "WHERE object = 'silver'")
+    checks["a view's rejects are held for its retention"] = gone == [] and isinstance(back, list) and len(back) == len(of("silver"))
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"rejects": checks, "ok": ok, **({} if ok else {"info": info})}, indent=1, default=str))
+    sys.exit(0 if ok else 1)
+
+
 def listings():
     """Step 6's gate for rights (`rights::Scope`): every door's listing shows a user with grants exactly the tables and views
     it may read, and of a table granted in part only the columns granted; a superuser all of them. The doors' listings:
@@ -29983,7 +30060,7 @@ SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 175, "scal
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, connections, find, listings, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, onerow, jsonfns, recursive, extensions, synced, agents)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, connections, find, listings, rejects, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, onerow, jsonfns, recursive, extensions, synced, agents)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -30184,7 +30261,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "listings", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "onerow", "jsonfns", "recursive", "extensions", "synced", "agents"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "listings", "rejects", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "onerow", "jsonfns", "recursive", "extensions", "synced", "agents"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -30197,7 +30274,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "listings": listings, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "onerow": onerow, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "listings": listings, "rejects": rejects, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "onerow": onerow, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

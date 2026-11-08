@@ -1,6 +1,6 @@
 ---
 title: System columns and tables
-description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.objects, pondra.kinds, pondra.parts, pondra.find, pondra.dropped, pondra.flows, pondra.expectations, pondra.functions and pondra.settings tables.
+description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.objects, pondra.kinds, pondra.parts, pondra.find, pondra.dropped, pondra.flows, pondra.expectations, pondra.rejects, pondra.functions and pondra.settings tables.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -405,6 +405,22 @@ DROP TABLE IF EXISTS scratch;
 `pondra.expectations` has a row per expectation: `view`, `expectation`, `condition`,
 `on_violation` (`keep`, `drop` or `fail`) and `failed_rows`, the rows that broke it, counted in the
 commits that wrote the view's rows.
+
+`pondra.rejects` keeps each row an expectation left out (`ON VIOLATION DROP ROW`), written in the
+commit that wrote the view's other rows, so nothing dropped is lost:
+
+| Column | What it is |
+|---|---|
+| `id` | the kept row's own id |
+| `object` | the view that left the row out |
+| `rule` | the expectation it broke (the first, if it broke more than one) |
+| `reason` | that expectation's condition: `CHECK (amount > 0)` |
+| `row` | the row, as JSON (a `NULL` left out) |
+| `run` | the write that brought it: a statement's job (a task's is `pondra.runs.job`), an `/append`'s producer, or `fill:…` for rows already there when the view was made |
+| `time` | when it was left out |
+
+A view's rows are kept for its `retention` (7 days unless set, as for undropping it). A user with grants
+sees the rows of the views it may read in whole.
 
 ```sql
 SELECT name, follows, kind FROM pondra.flows WHERE name = 'sold_by_item';

@@ -1448,6 +1448,15 @@
    "created Timestamp(\u00b5s, \"UTC\")",
    "expires Timestamp(\u00b5s, \"UTC\")"
   ],
+  "pondra.rejects": [
+   "id Utf8",
+   "object Utf8",
+   "rule Utf8",
+   "reason Utf8",
+   "row Utf8",
+   "run Utf8",
+   "time Timestamp(\u00b5s, \"UTC\")"
+  ],
   "pondra.routines": [
    "name Utf8",
    "kind Utf8",

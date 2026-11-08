@@ -806,6 +806,9 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
     if !expect.is_empty() && lake.cat.get::<TableMeta>(&table_key(EXPECTED)).await?.is_none() {
         puts.push((table_key(EXPECTED), json(&expected_table(lake))));
     }
+    if expect.iter().any(|e| e.on != OnViolation::Keep) {
+        puts.extend(crate::rejects::made(lake, meta.retention_secs).await?); // (the rows they drop are kept there)
+    }
     if let Some(e) = &mut emit {
         let is_time = meta.columns().any(|(c, t)| *c == e.window && t.starts_with("Timestamp"));
         ensure!(meta.key.contains(&e.window) && is_time, "emit: the window column must be a GROUP BY timestamp (date_bin(…) AS {})", e.window);
@@ -906,15 +909,17 @@ fn let_in(v: &View, rows: RecordBatch) -> Result<RecordBatch> {
     })
 }
 
-/// A view's new rows through its expectations: the rows it keeps, and a row of
-/// `pondra$expectations` per expectation some broke. A `FAIL` one refuses the write (`filling`:
-/// rows that were there when the view was made can't be refused any more: they are dropped).
-fn expected(view: &str, v: &View, rows: RecordBatch, filling: bool) -> Result<(RecordBatch, Option<RecordBatch>)> {
+/// A view's new rows through its expectations: the rows it keeps, a row of `pondra$expectations` per
+/// expectation some broke, and the rows it left out, as `pondra$rejects` keeps them (each with the
+/// first expectation that left it out; `run`, the job that brought them). A `FAIL` one refuses the
+/// write (`filling`: rows that were there when the view was made can't be refused any more: they are
+/// dropped, and kept as rejects too).
+fn expected(view: &str, v: &View, rows: RecordBatch, filling: bool, run: &str) -> Result<(RecordBatch, Option<RecordBatch>, Option<RecordBatch>)> {
     use datafusion::arrow::array::{Int64Array, StringArray};
     if v.expect.is_empty() || rows.num_rows() == 0 {
-        return Ok((rows, None));
+        return Ok((rows, None, None));
     }
-    let (mut keep, mut failed) = (vec![true; rows.num_rows()], vec![]);
+    let (mut keep, mut failed, mut why) = (vec![true; rows.num_rows()], vec![], vec![None::<&Expect>; rows.num_rows()]);
     for e in &v.expect {
         let bad = crate::rules::fit::breaking(crate::defaults::base(), &rows, &e.check)?;
         let n = bad.true_count();
@@ -925,12 +930,16 @@ fn expected(view: &str, v: &View, rows: RecordBatch, filling: bool) -> Result<(R
             return Err(anyhow::Error::new(crate::codes::Violation(format!("new row for relation \"{view}\" violates check constraint \"{}\": CHECK ({})", e.name, e.check), "23514")));
         }
         if e.on != OnViolation::Keep {
-            keep.iter_mut().zip(bad.values().iter()).for_each(|(k, b)| *k &= !b);
+            for (i, b) in bad.values().iter().enumerate() {
+                if b && keep[i] {
+                    (keep[i], why[i]) = (false, Some(e));
+                }
+            }
         }
         failed.push((e, n as i64));
     }
     if failed.is_empty() {
-        return Ok((rows, None));
+        return Ok((rows, None, None));
     }
     let text = |f: &dyn Fn(&(&Expect, i64)) -> String| std::sync::Arc::new(failed.iter().map(f).map(Some).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
     let id = v.fill.as_ref().map_or("", |f| f.id.as_str());
@@ -941,8 +950,15 @@ fn expected(view: &str, v: &View, rows: RecordBatch, filling: bool) -> Result<(R
         ("action", text(&|(e, _)| e.on.word().to_string())),
         ("failed", std::sync::Arc::new(failed.iter().map(|(_, n)| *n).collect::<Int64Array>())),
     ])?;
+    if keep.iter().all(|k| *k) {
+        return Ok((rows, Some(counts), None));
+    }
+    let left: Vec<bool> = keep.iter().map(|k| !k).collect();
+    let reasons: Vec<(&str, String)> = why.iter().flatten().map(|e| (e.name.as_str(), format!("CHECK ({})", e.check))).collect();
+    let reasons: Vec<(&str, &str)> = reasons.iter().map(|(r, c)| (*r, c.as_str())).collect();
+    let rejected = crate::rejects::keep(v.shown(view), run, &reasons, &datafusion::arrow::compute::filter_record_batch(&rows, &left.into())?)?;
     let kept = datafusion::arrow::compute::filter_record_batch(&rows, &keep.into())?;
-    Ok((kept, Some(counts)))
+    Ok((kept, Some(counts), Some(rejected)))
 }
 
 /// A session view: the SQL runs over each closed session's rows, grouped by session too, so its
@@ -1504,44 +1520,70 @@ pub(crate) fn alone(p: &LogicalPlan, grouped: bool) -> bool {
 /// A view of a view takes the rows that view derives here (ADR-036 §1: a flow, bronze → silver
 /// → gold, in one flush, so in one commit): views go after the views they follow (`in_order`).
 /// Expectations keep, drop or refuse each view's new rows (`expected`), counted in
-/// `pondra$expectations`.
-pub async fn derive(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>) -> Result<Vec<(String, RecordBatch)>> {
-    let (mut out, mut made) = (vec![], BTreeMap::<String, Vec<RecordBatch>>::new());
+/// `pondra$expectations`; the rows they drop go to `pondra$rejects` with the run that brought them.
+/// `runs` names each batch of `new` (same table, same place): its producer, whose job it names (`rejects::run`).
+/// A view that drops rows works out each run's rows on their own, so each reject names its own; any
+/// other view takes a table's new rows at once, as it did, and its rows name the runs it had.
+pub async fn derive(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>, runs: &BTreeMap<String, Vec<String>>) -> Result<Vec<(String, RecordBatch)>> {
+    let (mut out, mut made) = (vec![], BTreeMap::<String, Vec<(RecordBatch, String)>>::new());
+    let fed = |t: &str| -> Option<Vec<(RecordBatch, String)>> {
+        let named = runs.get(t);
+        new.get(t).map(|b| b.iter().enumerate().map(|(i, b)| (b.clone(), named.and_then(|r| r.get(i)).map_or(String::new(), |p| crate::rejects::run(p).to_string()))).collect())
+    };
     for (target, v) in in_order(lake.cat.scan::<View>("v/", "v0").await?) {
         if !v.inline() {
             continue; // (sessions are cut as they close; stream joins and views kept by key run once rows commit)
         }
         let gone_from = crate::sys::deleted(&v.source);
-        let rows: Vec<&Vec<RecordBatch>> = [new.get(&v.source), made.get(&v.source)].into_iter().flatten().collect();
-        let gone: Vec<&Vec<RecordBatch>> = [new.get(&gone_from), made.get(&gone_from)].into_iter().flatten().collect();
+        let rows: Vec<Vec<(RecordBatch, String)>> = [fed(&v.source), made.get(&v.source).cloned()].into_iter().flatten().collect();
+        let gone: Vec<Vec<RecordBatch>> = [fed(&gone_from), made.get(&gone_from).cloned()].into_iter().flatten().map(|r| r.into_iter().map(|(b, _)| b).collect()).collect();
         if rows.is_empty() && gone.is_empty() {
             continue;
         }
         let meta: TableMeta = lake.cat.get(&table_key(&target)).await?.context("view without table")?;
+        // (a view made before `pondra$rejects` was keeps them once the table is there: `rejects::made`)
+        let keeps = v.expect.iter().any(|e| e.on != OnViolation::Keep) && lake.cat.meta(&table_key(crate::rejects::TABLE)).await?.is_some();
         let mut parts = vec![];
         for rows in rows {
-            let (kept, failed) = expected(&target, &v, view_rows(lake, &v, &meta, rows, false).await?, false)?;
-            parts.push((target.clone(), kept));
-            parts.extend(failed.map(|f| (EXPECTED.to_string(), f)));
-            if let Some(o) = &v.once {
-                parts.extend(crate::once::late(lake, &target, &v, o, rows).await?.map(|l| (EXPECTED.to_string(), l))); // (rows for groups already kept)
+            for (run, rows) in by_run(rows, keeps) {
+                let (kept, failed, rejected) = expected(&target, &v, view_rows(lake, &v, &meta, &rows, false).await?, false, &run)?;
+                parts.push((target.clone(), kept, run.clone()));
+                parts.extend(failed.map(|f| (EXPECTED.to_string(), f, String::new())));
+                parts.extend(rejected.filter(|_| keeps).map(|r| (crate::rejects::TABLE.to_string(), r, String::new())));
+                if let Some(o) = &v.once {
+                    parts.extend(crate::once::late(lake, &target, &v, o, &rows).await?.map(|l| (EXPECTED.to_string(), l, String::new()))); // (rows for groups already kept)
+                }
             }
         }
         for gone in gone {
             match () {
-                _ if !meta.merge.is_empty() => parts.push((target.clone(), negated(&view_rows(lake, &v, &meta, gone, false).await?, &meta)?)),
-                _ if v.ids => parts.push((crate::sys::deleted(&target), let_in(&v, view_rows(lake, &v, &meta, gone, true).await?)?)),
+                _ if !meta.merge.is_empty() => parts.push((target.clone(), negated(&view_rows(lake, &v, &meta, &gone, false).await?, &meta)?, String::new())),
+                _ if v.ids => parts.push((crate::sys::deleted(&target), let_in(&v, view_rows(lake, &v, &meta, &gone, true).await?)?, String::new())),
                 _ => {}
             }
         }
-        for (t, b) in parts {
-            if b.num_rows() > 0 && t != EXPECTED {
-                made.entry(t.clone()).or_default().push(b.clone()); // (for the views that follow this one)
+        for (t, b, run) in parts {
+            if b.num_rows() > 0 && t != EXPECTED && t != crate::rejects::TABLE {
+                made.entry(t.clone()).or_default().push((b.clone(), run)); // (for the views that follow this one)
             }
             out.push((t, b));
         }
     }
     Ok(out)
+}
+
+/// A table's new rows as a view works them out: each run's on its own for a view that drops rows
+/// (`apart`), so each reject names its run; else all at once, named by the runs they came from.
+fn by_run(rows: Vec<(RecordBatch, String)>, apart: bool) -> Vec<(String, Vec<RecordBatch>)> {
+    let mut runs = BTreeMap::<String, Vec<RecordBatch>>::new();
+    match apart && !rows.is_empty() {
+        true => rows.into_iter().for_each(|(b, r)| runs.entry(r).or_default().push(b)),
+        false => {
+            let named: std::collections::BTreeSet<String> = rows.iter().map(|(_, r)| r.clone()).filter(|r| !r.is_empty()).collect();
+            runs.insert(named.into_iter().collect::<Vec<_>>().join(", "), rows.into_iter().map(|(b, _)| b).collect());
+        }
+    }
+    runs.into_iter().collect()
 }
 
 /// Views, each after the view it follows (by table name, without the `v/`).
@@ -1695,7 +1737,7 @@ pub async fn fill_all(lake: &Lake, seq: &crate::log::Sequencer, log: &crate::log
 }
 
 /// Fills view `name` (`v`) from its source's rows up to `upto`, once: its rows appended under `producer` (`fill:{name}`),
-/// seq 1, and the rows its expectations refused under `{producer}:expect`.
+/// seq 1, the counts of the rows its expectations refused under `{producer}:expect`, and those rows under `{producer}:rejects`.
 async fn fill_one(lake: &Lake, log: &crate::log::Log, name: &str, v: &View, upto: u64, producer: String) -> Result<()> {
     // The source as it was at `upto`: its rows (and changes) from then, none from after.
     // (with each row's `_version`: a row-by-row view's row keeps its source row's, so a change
@@ -1714,9 +1756,15 @@ async fn fill_one(lake: &Lake, log: &crate::log::Log, name: &str, v: &View, upto
         true => view_rows(lake, v, &meta, &rows, false).await?,
         false => RecordBatch::new_empty(meta.schema()?),
     };
-    let (out, failed) = expected(name, v, out, true)?;
+    let run = v.fill.as_ref().map_or(String::new(), |f| format!("fill:{}", f.id)); // (the rows already there, brought by the view's filling)
+    let (out, failed, rejected) = expected(name, v, out, true, &run)?;
     if let Some(failed) = failed {
         log.append(EXPECTED.into(), crate::log::Src { producer: format!("{producer}:expect"), seq: 1, prev: None }, failed).await?; // (once, as the filling is)
+    }
+    if let Some(rejected) = rejected.filter(|r| r.num_rows() > 0) {
+        if lake.cat.meta(&table_key(crate::rejects::TABLE)).await?.is_some() {
+            log.append(crate::rejects::TABLE.into(), crate::log::Src { producer: format!("{producer}:rejects"), seq: 1, prev: None }, rejected).await?;
+        }
     }
     log.append(name.to_string(), crate::log::Src { producer, seq: 1, prev: None }, out).await?;
     Ok(())
@@ -2092,6 +2140,42 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
 mod tests {
     use super::*;
     use crate::auth::{Principal, Role, WHO};
+
+    /// A view's expectations leave rows out, and each is kept as a reject (`rejects::keep`) naming the first rule that left
+    /// it out, its condition and the run; one that keeps its rows counts them and keeps no reject. A view that drops rows
+    /// works out each run's rows on their own; any other view all at once, named by the runs they came from.
+    #[test]
+    fn a_dropped_row_is_kept_naming_its_first_rule_and_its_run() -> Result<()> {
+        use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+        let e = |name: &str, check: &str, on| Expect { name: name.into(), check: check.into(), on };
+        let v = View { source: "t".into(), sql: String::new(), emit: None, sessions: None, ids: false, join: None, fill: None, once: None, written: None, rerun: None, matches: None, from: vec![], authored: None,
+            expect: vec![e("positive", "amount > 0", OnViolation::Drop), e("small", "amount < 10", OnViolation::Drop), e("seen", "amount <> 5", OnViolation::Keep)] };
+        let rows = RecordBatch::try_from_iter(vec![("id", Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef), ("amount", Arc::new(Int64Array::from(vec![-1, 5, 50, 2])) as ArrayRef)])?;
+        let (kept, counts, rejected) = expected("v", &v, rows.clone(), false, "load-1")?;
+        let ids = |b: &RecordBatch| b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec();
+        assert_eq!(ids(&kept), [2, 4], "-1 and 50 left out, 5 kept and counted");
+        let text = |b: &RecordBatch, c: &str| b.column_by_name(c).unwrap().as_any().downcast_ref::<StringArray>().unwrap().iter().map(|v| v.unwrap_or_default().to_string()).collect::<Vec<_>>();
+        assert_eq!(text(&counts.unwrap(), "expectation"), ["positive", "small", "seen"]);
+        let rejected = rejected.expect("rows left out");
+        assert_eq!(text(&rejected, "object"), ["v", "v"]);
+        assert_eq!(text(&rejected, "rule"), ["positive", "small"]);
+        assert_eq!(text(&rejected, "reason"), ["CHECK (amount > 0)", "CHECK (amount < 10)"]);
+        assert_eq!(text(&rejected, "row"), [r#"{"id":1,"amount":-1}"#, r#"{"id":3,"amount":50}"#]);
+        assert_eq!(text(&rejected, "run"), ["load-1", "load-1"]);
+        let both = RecordBatch::try_from_iter(vec![("id", Arc::new(Int64Array::from(vec![9])) as ArrayRef), ("amount", Arc::new(Int64Array::from(vec![-20])) as ArrayRef)])?;
+        let (_, _, rejected) = expected("v", &v, both, false, "")?;
+        assert_eq!(text(&rejected.unwrap(), "rule"), ["positive"], "a row that broke two rules names the first");
+        let keeps = View { expect: vec![e("seen", "amount <> 5", OnViolation::Keep)], ..v.clone() };
+        let (kept, counts, rejected) = expected("v", &keeps, rows.clone(), false, "")?;
+        assert!(kept.num_rows() == 4 && counts.is_some() && rejected.is_none(), "an expectation that keeps its rows keeps no reject");
+        let fed = vec![(rows.clone(), "a".to_string()), (rows.clone(), "b".to_string()), (rows.clone(), "a".to_string())];
+        let apart: Vec<(String, usize)> = by_run(fed.clone(), true).into_iter().map(|(r, b)| (r, b.len())).collect();
+        assert_eq!(apart, [("a".to_string(), 2), ("b".to_string(), 1)]);
+        let together: Vec<(String, usize)> = by_run(fed, false).into_iter().map(|(r, b)| (r, b.len())).collect();
+        assert_eq!(together, [("a, b".to_string(), 3)]);
+        assert_eq!(by_run(vec![], true).len(), 1, "no rows: one part all the same, as a flush carries one for each view");
+        Ok(())
+    }
 
     /// A view's CTEs and the plain views it reads are written in as subqueries, so it follows their table: a CTE read by
     /// another, its column names under any alias, a table inside a CTE that has the CTE's name, a plain view over a plain
