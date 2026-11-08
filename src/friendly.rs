@@ -4,9 +4,10 @@
 //! (`routines::expand`), as `FROM`-first and `ASOF JOIN` already are. A view, a frame, a spread
 //! query and every door then get plain SQL.
 //!
-//! - In the text, before it is parsed (`text`): `LAMBDA x: …` and list comprehensions
-//!   (`[x * 2 FOR x IN l IF x > 0]`) as `x -> …`; DuckDB's `PIVOT` and `UNPIVOT` statements as the
-//!   standard's; DuckDB's `ASOF JOIN … ON a.t >= b.t` as Snowflake's; `USING SAMPLE`.
+//! - In the text, before it is parsed (`text`): `LAMBDA x: …` as `x -> …`; DuckDB's `PIVOT` and `UNPIVOT` statements as
+//!   the standard's; DuckDB's `ASOF JOIN … ON a.t >= b.t` as Snowflake's; `USING SAMPLE`.
+//! - In the parse, a hook of the fallback dialect (`dialect.rs`): list comprehensions (`[x * 2 FOR x IN l IF x > 0]`)
+//!   as `array_transform(…, x -> …)`.
 //! - In the syntax tree (`rewrite`): `FETCH FIRST`, `ORDER BY ALL`, `({…}).a`, `max_by` and
 //!   `arg_max`, `string_split`, `::json`, `json_extract`, `payload->>'$.a'`, `PIVOT`, `UNPIVOT`, `TABLESAMPLE` (which
 //!   DataFusion ignored), `COLUMNS(…)`, `* RENAME`, a select's alias in its WHERE.
@@ -44,7 +45,7 @@ const TAKES_BYTEA: &[&str] = crate::pg_bytea::TAKES_BYTEA;
 /// The front's passes of this module (`passes.rs`): the text's rewrite, and the three looks `wanted` makes, each with a
 /// trigger that holds every text its look finds.
 pub(crate) fn passes() -> Vec<crate::passes::Pass> {
-    use crate::passes::{Pass, Run};
+    use crate::passes::{Hook, Parse, Pass, Run};
     let tables = DUCKDB_TYPES.iter().map(|(n, _)| *n).chain(OTHER_TYPES.iter().map(|(n, _, _)| *n)).chain(crate::dialect_fns::OURS.iter().map(|(n, _, _)| *n)).chain(TAKES_BYTEA.iter().copied());
     let mut forms = vec![
         "fetch", "all", "max_by", "min_by", "arg_max", "arg_min", "string_split", "str_split", "json", "jsonb", "json_value", "get_json_object", "tablesample", "sample", "pondra_sample",
@@ -72,6 +73,17 @@ pub(crate) fn passes() -> Vec<crate::passes::Pass> {
             run: Run::Wants(wants_marked),
         },
         Pass { name: "friendly.aliases", order: 30, words: vec!["where", "delete", "update"], marks: vec![], run: Run::Wants(wants_aliases) },
+        Pass {
+            name: "friendly.comprehension",
+            order: 10,
+            words: vec!["for"],
+            marks: vec![],
+            run: Run::Parse(Parse {
+                claims: "[",
+                reads: &["SELECT [x * 2 FOR x IN [1, 2, 3]] AS v", "SELECT [x FOR x IN l IF x > 1] FROM t", "SELECT [[y FOR y IN x] FOR x IN [[1, 2], [3]]] AS v"],
+                hook: Hook::Prefix(comprehension),
+            }),
+        },
     ]
 }
 
@@ -140,12 +152,11 @@ fn alias_after_table(sql: &str) -> bool {
 
 /// `sql` with what the parser can't read as it is written turned into what it can.
 pub fn text(sql: &str) -> Result<Cow<'_, str>> {
-    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b").expect("a regex"));
+    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b").expect("a regex"));
     if !LOOK.is_match(sql) {
         return Ok(Cow::Borrowed(sql));
     }
     let mut s = statements(sql)?.unwrap_or_else(|| sql.to_string());
-    s = comprehensions(&s)?;
     // (each pass reads the text as the passes before it left it, tokenized again only after one of them changed it: a
     // `top` that is only a word in a string costs one tokenize, audit 11-02 L13)
     let passes = [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias];
@@ -221,40 +232,64 @@ fn lambda_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
     Ok(edits)
 }
 
-/// List comprehensions, `[expr FOR x IN list IF cond]`, as `array_transform(array_filter(list,
-/// x -> cond), x -> expr)`, inside out.
-fn comprehensions(sql: &str) -> Result<String> {
-    let Some(t) = Tokens::of(sql) else { return Ok(sql.to_string()) };
-    for i in (0..t.toks.len()).filter(|&i| t.toks[i] == Token::LBracket) {
-        let (mut depth, mut parts) = (0i32, Vec::new());
-        let mut close = None;
-        for j in i + 1..t.toks.len() {
-            match &t.toks[j] {
-                Token::LBracket | Token::LParen | Token::LBrace => depth += 1,
-                Token::RBracket if depth == 0 => {
-                    close = Some(j);
-                    break;
-                }
-                Token::RBracket | Token::RParen | Token::RBrace => depth -= 1,
-                Token::Word(w) if depth == 0 && w.quote_style.is_none() && matches!(w.keyword, Keyword::FOR | Keyword::IN | Keyword::IF) => parts.push((w.keyword, j)),
-                _ => {}
+/// A list comprehension, `[expr FOR x IN list IF cond]`, read by the fallback dialect (`dialect.rs`) as
+/// `array_transform(array_filter(list, x -> (cond)), x -> (expr))` (`array_transform((list), x -> (expr))` without IF):
+/// the tree GenericDialect reads that text to, so the tree passes and the engine take it as they took the text.
+/// None when the bracket is not one: the dialect reads it as an array.
+fn comprehension(p: &mut Parser) -> Option<Result<Expr, datafusion::sql::sqlparser::parser::ParserError>> {
+    use datafusion::sql::sqlparser::parser::ParserError;
+    if p.peek_token_ref().token != Token::LBracket {
+        return None;
+    }
+    // (a comprehension from its FOR on: up to it, an array's first element as well)
+    let body = match p.maybe_parse(|p| {
+        p.expect_token(&Token::LBracket)?;
+        let body = p.parse_expr()?;
+        p.expect_keyword_is(Keyword::FOR)?;
+        Ok(body)
+    }) {
+        Ok(Some(body)) => body,
+        Ok(None) => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    // (said where the name should be, as sqlparser says where it stopped)
+    let one_name = |at| ParserError::ParserError(format!("a list comprehension takes one name: [… FOR x IN list]{at}"));
+    let read = |p: &mut Parser| -> Result<Expr, ParserError> {
+        let at = p.peek_token_ref().span.start;
+        let var = match p.parse_identifier() {
+            Ok(v) if v.quote_style.is_none() && v.value.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && v.value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => v,
+            _ => return Err(one_name(at)),
+        };
+        if !p.parse_keyword(Keyword::IN) {
+            return Err(one_name(p.peek_token_ref().span.start));
+        }
+        let list = p.parse_expr()?;
+        let cond = match p.parse_keyword(Keyword::IF) {
+            true => Some(p.parse_expr()?),
+            false => None,
+        };
+        p.expect_token(&Token::RBracket)?;
+        let var = Expr::Identifier(var);
+        Ok(match cond {
+            Some(cond) => templated("array_transform(array_filter($_1, $_2 -> ($_3)), $_2 -> ($_4))", &[list, var, cond, body.clone()]),
+            None => templated("array_transform(($_1), $_2 -> ($_3))", &[list, var, body.clone()]),
+        })
+    };
+    Some(read(p))
+}
+
+/// `template`, read by GenericDialect, with each `$_n` the nth of `parts`, as it stands (`expander::around` groups them).
+fn templated(template: &str, parts: &[Expr]) -> Expr {
+    let mut e = crate::expander::parse_expr(template).expect("a template that parses");
+    let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
+        if let Expr::Value(ValueWithSpan { value: Value::Placeholder(p), .. }) = x {
+            if let Some(part) = p.strip_prefix("$_").and_then(|n| n.parse::<usize>().ok()).and_then(|n| parts.get(n.wrapping_sub(1))) {
+                *x = part.clone();
             }
         }
-        let Some(close) = close else { continue };
-        let [(Keyword::FOR, f), (Keyword::IN, n), rest @ ..] = parts.as_slice() else { continue };
-        let var = t.span(*f + 1, *n).trim();
-        ensure!(Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("a regex").is_match(var), "a list comprehension takes one name: [… FOR x IN list]");
-        let cond = rest.iter().find(|(k, _)| *k == Keyword::IF).map(|(_, c)| *c);
-        let list = comprehensions(t.span(*n + 1, cond.unwrap_or(close)).trim())?;
-        let body = comprehensions(t.span(i + 1, *f))?;
-        let list = match cond {
-            Some(c) => format!("array_filter({list}, {var} -> ({}))", comprehensions(t.span(c + 1, close).trim())?),
-            None => format!("({list})"),
-        };
-        let done = format!("array_transform({list}, {var} -> ({}))", body.trim());
-        return Ok(format!("{}{done}{}", &sql[..t.start[i]], comprehensions(&sql[t.end(close)..])?));
-    }
-    Ok(sql.to_string())
+        ControlFlow::<()>::Continue(())
+    });
+    e
 }
 
 /// DuckDB's `a ASOF [LEFT] JOIN b ON a.k = b.k AND a.t >= b.t`, marked for `asof::as_of`, which
@@ -2241,8 +2276,11 @@ mod tests {
     #[test]
     fn texts() {
         assert_eq!(text("SELECT list_transform(l, LAMBDA x: x + 1)").unwrap(), "SELECT list_transform(l, x -> x + 1)");
-        assert_eq!(text("SELECT [x * 2 FOR x IN l IF x > 1] FROM t").unwrap(), "SELECT array_transform(array_filter(l, x -> (x > 1)), x -> (x * 2)) FROM t");
-        assert_eq!(text("SELECT [[y FOR y IN x] FOR x IN l]").unwrap(), "SELECT array_transform((l), x -> (array_transform((x), y -> (y))))");
+        // (list comprehensions are the fallback dialect's: `dialect::tests`)
+        assert_eq!(text("SELECT [x * 2 FOR x IN l IF x > 1] FROM t").unwrap(), "SELECT [x * 2 FOR x IN l IF x > 1] FROM t");
+        let read = |sql| crate::parsed::read(sql).unwrap();
+        assert_eq!(read("SELECT [x * 2 FOR x IN l IF x > 1] FROM t"), read("SELECT array_transform(array_filter(l, x -> (x > 1)), x -> (x * 2)) FROM t"));
+        assert_eq!(read("SELECT [[y FOR y IN x] FOR x IN l]"), read("SELECT array_transform((l), x -> (array_transform((x), y -> (y))))"));
         assert!(text("SELECT * FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts").unwrap().contains("MATCH_CONDITION (pondra_duckdb_asof) ON"));
         assert!(text("SELECT * FROM t ASOF LEFT JOIN q ON t.ts >= q.ts").unwrap().contains("ASOF JOIN q MATCH_CONDITION (pondra_duckdb_asof_left) ON"));
         assert_eq!(text("SELECT * FROM t USING SAMPLE 10% WHERE x > 1").unwrap(), "SELECT * FROM t WHERE pondra_sample('10%') AND x > 1");
