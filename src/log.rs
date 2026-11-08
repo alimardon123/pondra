@@ -629,7 +629,7 @@ impl Sequencer {
             while let Some(first) = rx.recv().await {
                 let waited = Instant::now();
                 let slot = in_flight.clone().acquire_owned().await.expect("never closed");
-                crate::store::commit_stage("slot", waited); // (COMMITS_IN_FLIGHT not yet durable: `PONDRA_TRACE_COMMIT`)
+                lake.cat.stage("slot", waited); // (COMMITS_IN_FLIGHT not yet durable: `PONDRA_TRACE_COMMIT`)
                 // Backpressure: wait while tiering can catch up, the lake's lock free (tiering takes it)
                 // or held by tiering. Whoever else holds it (a change, a file commit, a view's fill, a
                 // rename's hold) may be waiting for this very round, and tiering for them.
@@ -996,7 +996,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
     if takes == Some(true) {
         puts.push((crate::store::QUIET.into(), json(&true))); // (remembered answers stay, unless something else here is loud)
     }
-    let t0 = crate::store::commit_stage("built", start);
+    let t0 = lake.cat.stage("built", start);
     let durable = lake.cat.write(puts, &dropped).await?;
     // (the job marks this commit deleted: forgotten once the delete is written, so the cache holds
     // them until then; `copy::entries`)
@@ -1011,7 +1011,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
             }
             ms.push(t0.elapsed().as_secs_f64() * 1e3);
             drop(ms);
-            crate::store::commit_stage("commit", t0); // (from `order` to here: the commit /stats times)
+            lake.cat.stage("commit", t0); // (from `order` to here: the commit /stats times)
             maybe_crash("after_commit", &*lake.life);
             lake.advance(hwm);
             for (reply, outcome) in replies {

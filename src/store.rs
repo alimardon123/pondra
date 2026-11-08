@@ -2503,9 +2503,9 @@ impl Lake {
             }
         });
         while let Some((handle, d, done, sent)) = writes.recv().await {
-            let t = commit_stage("queued", sent);
             let Some(lake) = me.upgrade() else { return };
             let cat = &lake.cat;
+            let t = cat.stage("queued", sent);
             let need = cat.replicas.saturating_sub(1);
             if need > 0 {
                 cat.send(Frame::Change(d.clone())); // followers keep it and say so
@@ -2529,7 +2529,7 @@ impl Lake {
                     _ = acked.changed() => {}
                 }
             }
-            let t = commit_stage("durable", t);
+            let t = cat.stage("durable", t);
             if need == 0 {
                 cat.send(Frame::Change(d.clone()));
             }
@@ -2538,7 +2538,7 @@ impl Lake {
             cat.send(Frame::Committed(d.id));
             let _ = to_bucket.send((handle, d.id));
             let _ = done.send(());
-            commit_stage("applied", t);
+            cat.stage("applied", t);
         }
     }
 
@@ -3200,6 +3200,7 @@ pub struct Catalog {
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
     closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
     life: Life,                   // what a fence restarts: its lake's (`fatal`)
+    stages: Arc<Stages>,          // where its commits spend their time, with `PONDRA_TRACE_COMMIT` (`stage`)
     written: Mutex<Vec<(&'static str, Instant, std::collections::HashSet<String>)>>, // each round that follows the tables committed (`written`): its last read of them all, and the ones since
 }
 
@@ -3219,7 +3220,7 @@ impl Drop for Pin<'_> {
 }
 
 type Recent = Arc<Mutex<(VecDeque<(Instant, Frame)>, usize)>>;
-type Write = (Arc<dyn Written>, Arc<Delta>, oneshot::Sender<()>, Instant); // (when it was handed to `commits`: `commit_stage`)
+type Write = (Arc<dyn Written>, Arc<Delta>, oneshot::Sender<()>, Instant); // (when it was handed to `commits`: `Catalog::stage`)
 
 /// One committed catalog write.
 pub struct Delta {
@@ -3426,6 +3427,9 @@ impl Catalog {
     /// opening began, for `PONDRA_TRACE_START`.
     async fn writer(kv: Arc<dyn Kv>, since: Instant, life: Life) -> Result<Self> {
         let mut cat = Self::new(kv, life);
+        if traced_commits() {
+            Stages::sample_lag(Arc::downgrade(&cat.stages)); // (a leader's commits are what it times)
+        }
         cat.replicas = crate::env::value("PONDRA_REPLICAS");
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
         let c = cat.get::<u64>("c").await?.unwrap_or(0);
@@ -3482,7 +3486,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud, rights) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, rights, metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default(), life, written: Default::default() }
+        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, rights, metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default(), life, stages: Arc::new(Stages::new()), written: Default::default() }
     }
 
     /// What the catalog's block caches hold, in bytes.
@@ -4187,11 +4191,11 @@ impl Catalog {
         let puts = listed(self, puts).await?;
         let mut puts: Vec<(String, Bytes)> = puts.into_iter().map(|(k, v)| (k, v.into())).collect();
         let mut id = self.order.lock().await;
-        let t1 = commit_stage("order", t0);
+        let t1 = self.stage("order", t0);
         // The commit number is the last put: the store takes the puts as they are, and the `Delta` keeps the same list.
         puts.push(("c".to_string(), Bytes::from(json(&*id))));
         let handle = self.kv.write(&puts, deletes).await.map_err(|e| self.fenced(e))?;
-        let t2 = commit_stage("kv write", t1);
+        let t2 = self.stage("kv write", t1);
         if let Some((_, v)) = puts.iter().find(|(k, _)| k == "n") {
             self.last_n.store(serde_json::from_slice(v)?, Relaxed);
         }
@@ -4228,49 +4232,62 @@ async fn listed(cat: &Catalog, mut puts: Vec<(String, Vec<u8>)>) -> Result<Vec<(
     Ok(puts)
 }
 
-/// `PONDRA_TRACE_COMMIT=1`: where a leader's commits spend their time. Each stage is the time since the one before it
-/// (`since`); once a minute one line on stderr gives each stage's p50 and p95 over that minute, and how late a 10 ms
-/// sleep woke (`lag`: the runtime's own wait, which every stage pays when the node's cores are busy). Returns now, the
-/// next stage's start.
-pub fn commit_stage(stage: &'static str, since: Instant) -> Instant {
-    type Stages = Mutex<(Instant, Vec<(&'static str, Vec<f64>)>)>;
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = crate::env::is_set("PONDRA_TRACE_COMMIT");
-        if on {
-            crate::panics::spawn(async {
-                loop {
-                    let t = Instant::now();
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    commit_stage("lag", t + Duration::from_millis(10));
-                }
-            });
+/// `PONDRA_TRACE_COMMIT=1`: where a leader's commits spend their time, its catalog's own (`Catalog::stage`). Each stage
+/// is the time since the one before it; once a minute one line on stderr gives each stage's p50 and p95 over that minute,
+/// and how late a 10 ms sleep woke (`lag`: the runtime's own wait, which every stage pays when the node's cores are busy).
+struct Stages(Mutex<(Instant, Vec<(&'static str, Vec<f64>)>)>);
+
+/// Is `PONDRA_TRACE_COMMIT` set? (Read once: a setting.)
+fn traced_commits() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env::is_set("PONDRA_TRACE_COMMIT"));
+    *ON
+}
+
+impl Stages {
+    fn new() -> Stages { Stages(Mutex::new((Instant::now(), vec![]))) }
+
+    /// A stage took from `since` to now; returns now, the next stage's start.
+    fn stage(&self, stage: &'static str, since: Instant) -> Instant {
+        let now = Instant::now();
+        if !traced_commits() {
+            return now;
         }
-        on
-    });
-    crate::per_node!(static STAGES: Stages = Mutex::new((Instant::now(), vec![])); clear = |s| *s.lock().unwrap_or_else(|e| e.into_inner()) = (Instant::now(), vec![]));
-    let now = Instant::now();
-    if !*ON {
-        return now;
+        let mut s = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ms = now.saturating_duration_since(since).as_secs_f64() * 1e3;
+        match s.1.iter_mut().find(|(n, _)| *n == stage) {
+            Some((_, v)) => v.push(ms),
+            None => s.1.push((stage, vec![ms])),
+        }
+        if now - s.0 >= Duration::from_secs(60) {
+            let line: Vec<String> = s.1.iter_mut().map(|(n, v)| {
+                v.sort_by(f64::total_cmp);
+                let q = |p: f64| v[((v.len() - 1) as f64 * p) as usize];
+                format!("{n} {:.3}/{:.3} ({})", q(0.5), q(0.95), v.len())
+            }).collect();
+            eprintln!("commit stages p50/p95 ms (count): {}", line.join(", "));
+            *s = (now, vec![]);
+        }
+        now
     }
-    let mut s = STAGES.lock().unwrap();
-    let ms = now.saturating_duration_since(since).as_secs_f64() * 1e3;
-    match s.1.iter_mut().find(|(n, _)| *n == stage) {
-        Some((_, v)) => v.push(ms),
-        None => s.1.push((stage, vec![ms])),
+
+    /// How late a 10 ms sleep wakes, as the `lag` stage, while the catalog is (weak: it ends with it).
+    fn sample_lag(stages: Weak<Stages>) {
+        crate::panics::spawn(async move {
+            loop {
+                let t = Instant::now();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let Some(s) = stages.upgrade() else { return };
+                s.stage("lag", t + Duration::from_millis(10));
+            }
+        });
     }
-    if now - s.0 >= Duration::from_secs(60) {
-        let line: Vec<String> = s.1.iter_mut().map(|(n, v)| {
-            v.sort_by(f64::total_cmp);
-            let q = |p: f64| v[((v.len() - 1) as f64 * p) as usize];
-            format!("{n} {:.3}/{:.3} ({})", q(0.5), q(0.95), v.len())
-        }).collect();
-        eprintln!("commit stages p50/p95 ms (count): {}", line.join(", "));
-        *s = (now, vec![]);
-    }
-    now
 }
 
 impl Catalog {
+    /// A commit's stage took from `since` to now, with `PONDRA_TRACE_COMMIT` (`Stages`); returns now, the next stage's
+    /// start.
+    pub(crate) fn stage(&self, stage: &'static str, since: Instant) -> Instant { self.stages.stage(stage, since) }
+
     /// `fatal`, unless this node's own stop closed the catalog: then the write or read in flight
     /// fails and the stop goes on to give up the term. Restarting there led the term again, and its
     /// followers waited out the lease (`upgrade_check.py rolling`: a batch waited 5.8 s).
