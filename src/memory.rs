@@ -1,17 +1,5 @@
-//! A lake held in this process's memory (`memory://…`, DuckDB's `:memory:`), and its spill to disk.
-//!
-//! Everything stays in memory below the budget. Past it, the bulk of a lake (its files and its log:
-//! `data/` and `log/`) goes to a folder of this process's on disk (`spill_base`), so loading more
-//! than the memory holds no longer ends the process. The catalog and `files/` (replaced by
-//! their version: `PutMode::Update`) stay in memory: they are small, and a local folder can't take
-//! an update.
-//!
-//! What spills is one budget for everything this process spills: `PONDRA_SPILL_GB`, else the disk's room, shared
-//! with the queries' and the shuffles' spills (`store::others_held`). The lakes in memory count their bytes on
-//! disk and their reserved bytes together (`Spilled`, one for the process), so the spill disk is counted once for
-//! all of them. The room a lake keeps on its disk is kept either way. Past either, the write is refused by name
-//! (53100), and a write that would pass it reserves its bytes first, so writes racing for the last of the room
-//! can't both take it.
+//! A lake in this process's memory moving out of it, and the program's end. The lake itself, its budget and its spill
+//! past it are the catalog's (`memory_lake`); the folders it spills to are the base's (`scratch`).
 //!
 //! A lake moves out of memory with `set_location` (`ALTER DATABASE … SET LOCATION`, `db.save`): its objects
 //! are copied to the target while the node serves, the host stops the node, `settle` makes the target equal
