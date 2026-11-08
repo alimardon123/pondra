@@ -311,9 +311,6 @@ pub const MOMENTS: &str = "pondra_moments";
 /// Adds `pondra_moments` to a session.
 pub fn register(ctx: &datafusion::prelude::SessionContext) {
     ctx.register_udaf(AggregateUDF::from(Moments::default()));
-    // (Postgres's and DuckDB's name for the sample variance, which DataFusion calls `var`)
-    let var = datafusion::functions_aggregate::variance::var_samp_udaf();
-    ctx.register_udaf(var.as_ref().clone().with_aliases(["variance"]));
 }
 
 fn moment_fields() -> Fields {

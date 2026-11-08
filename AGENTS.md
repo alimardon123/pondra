@@ -332,7 +332,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 - **`sum` over DOUBLE is order-independent** (`fsum.rs`): it replaces DataFusion's `sum` in every
   session; Float64 sums carry a second double with the rounding errors (state: two columns),
   other types go to DataFusion's. **`avg` over a DECIMAL is rounded at its last place** (`avg.rs`),
-  where DataFusion's cut it off.
+  where DataFusion's cut it off. **`var`, `stddev` and `avg` over DOUBLE are order-independent too** (`fvar.rs`): their
+  state is the count and fsum's sums of the values and of their squares (each square split exactly in two), worked out
+  once at the end in double-double; a group of one value answers 0. Over a cast of 32-bit or smaller integers (an
+  INTEGER column's) the sums are kept as exact i128s (`fvar::Wholes`), as quick as a plain sum, in the same state
+  columns. DISTINCT, and windows whose frames slide, stay DataFusion's.
 - **Rows that change** (round 19, ADR-020, `change.rs`, `sys.rs`). Every row has system columns:
   `_row_id` (stamped as it enters the log or a bulk INSERT's files, from blocks of ids the leader
   hands out as commit numbers: `Ids`, `Flush::reserve`), `_version` (its commit), `_created_at`,
@@ -647,10 +651,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    leader release its term, so the next process on the lake leads at once. A parent killed
    outright closes the pipe too. `anywhere_check.py`'s "second shell starts at once" and "the
    lake reopens at once… for writes" fail when a node is killed instead.
-47. **Float sums keep their error term everywhere** (`fsum.rs`). A sum of DOUBLEs is a pair (sum,
-   error) in every state: partial aggregates, what crosses the nodes, windows. An operator that
-   added partial sums as plain doubles would bring back order-dependent answers (TPC-H q15's
-   `= max(...)`); `harness.py sums` compares with `math.fsum` on every node.
+47. **Float sums keep their error term everywhere** (`fsum.rs`, `fvar.rs`). A sum of DOUBLEs is a pair (sum,
+   error) in every state: partial aggregates, what crosses the nodes, windows; so are a variance's and an average's
+   sums (`fvar::Moments`). An operator that added partial sums as plain doubles would bring back order-dependent answers
+   (TPC-H q15's `= max(...)`, TPC-DS q39's `stddev_samp / avg`: 11-08 audit H5); `harness.py sums` compares with
+   `math.fsum` on every node; `cargo test --lib fvar::`.
 48. **The Linux release binary needs nothing newer than glibc 2.17.** A dependency that links a
    newer glibc symbol stops the wheel from installing on older systems.
    `anywhere_check.py --docker` runs the binary on CentOS 7 and Ubuntu 22.04; check `objdump -T
