@@ -61,7 +61,6 @@ ext -> catalogs  9
 ext -> crypto  8
 ext -> fetch  1
 ext -> kafka_client  2
-ext -> public  4
 ext -> read_delta  2
 ext -> read_iceberg  1
 ext -> sharing_client  2
@@ -76,7 +75,7 @@ files -> panics  1
 find -> measures  1
 flight -> server  1
 flight -> sso  3
-flight -> tls  6
+flight -> tls  4
 format -> panics  2
 friendly -> pg_bytea  5
 front -> measures  5
@@ -146,7 +145,7 @@ metrics -> hot  1
 metrics -> jemalloc  1
 metrics -> spill  1
 metrics -> store  1
-net -> wasm32  9
+net -> wasm32  11
 node -> wasm32  1
 objects -> authored  2
 objects -> branch  2
@@ -189,7 +188,6 @@ pg -> sso  6
 pg -> tls  6
 pg_json_sets -> measures  1
 protect -> apply  4
-public -> wasm32  4
 python -> memory  1
 python -> node  1
 python -> wasm32  14

@@ -663,7 +663,7 @@ pub(crate) enum For {
     Lake,
     /// Files outside the lakes, with an admin's secret, a catalog's, or the node's own credentials.
     Files,
-    /// Files read with a temporary secret its maker brought: the public internet only (`public.rs`).
+    /// Files read with a temporary secret its maker brought: the public internet only (`net::Connector`).
     Public,
 }
 
@@ -702,6 +702,9 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
     // (an endpoint or host written as an address is refused here; a name, as it resolves)
     let reach = |u: &str| if public { crate::net::check(&url::Url::parse(u).with_context(|| format!("endpoint {u}"))?) } else { Ok(()) };
     reach(url.as_str())?;
+    // (the store's client, by its policy: a reader's own temporary secret's is `Public`'s, any other the admin's)
+    let policy = if public { crate::net::Policy::Public } else { crate::net::Policy::ENDPOINT };
+    let connector = |headers: object_store::HeaderMap| crate::net::process().connector(policy, headers);
     let chain = p.is_none() || get("provider").as_deref() == Some("credential_chain");
     let bucket = url.host_str().context("no bucket in the URL")?.to_string();
     let home = format!("{}://{bucket}", url.scheme());
@@ -716,8 +719,8 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
             reach(&e)?;
             b = b.with_allow_http(e.starts_with("http://")).with_endpoint(e);
         }
-        if public {
-            b = b.with_http_connector(crate::public::Connector::default());
+        if !lake {
+            b = b.with_http_connector(connector(Default::default()));
         }
         if let Some(r) = get("region") {
             b = b.with_region(r);
@@ -755,12 +758,10 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
                 reach(&e)?;
                 b = b.with_config(K::Client(object_store::ClientConfigKey::AllowHttp), e.starts_with("http://").to_string()).with_base_url(&e);
             }
-            if public {
-                b = b.with_http_connector(crate::public::Connector::default());
-            }
-            if lake {
-                b = b.with_config(K::Client(object_store::ClientConfigKey::PoolIdleTimeout), "15s").with_http_connector(crate::budget::Budget::of(&home));
-            }
+            b = match lake {
+                true => b.with_config(K::Client(object_store::ClientConfigKey::PoolIdleTimeout), "15s").with_http_connector(crate::budget::Budget::of(&home)),
+                false => b.with_http_connector(connector(Default::default())),
+            };
             Arc::new(b.build()?)
         }
         "az" | "azure" | "abfs" | "abfss" => {
@@ -777,12 +778,10 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
                     b = b.with_config(key, v);
                 }
             }
-            if lake {
-                b = b.with_config(K::Client(object_store::ClientConfigKey::PoolIdleTimeout), "15s").with_http_connector(crate::budget::Budget::of(&home));
-            }
-            if public {
-                b = b.with_http_connector(crate::public::Connector::default());
-            }
+            b = match lake {
+                true => b.with_config(K::Client(object_store::ClientConfigKey::PoolIdleTimeout), "15s").with_http_connector(crate::budget::Budget::of(&home)),
+                false => b.with_http_connector(connector(Default::default())),
+            };
             Arc::new(b.build()?)
         }
         "http" | "https" => {
@@ -797,7 +796,7 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
                 options = options.with_default_headers(headers.clone());
             }
             let b = HttpBuilder::new().with_url(url.as_str()).with_client_options(options);
-            Arc::new(if public { b.with_http_connector(crate::public::Connector { headers }) } else { b }.build()?)
+            Arc::new(b.with_http_connector(connector(headers)).build()?)
         }
         "blob" => bail!("a blob: URL is a browser tab's own file: only that tab's page reads it"), // (`register_blob` reads one; no store is built for it)
         s => bail!("{s}:// isn't read (s3, r2, gs, az, abfss, https)"),
@@ -1063,7 +1062,7 @@ pub struct Secret {
     #[serde(skip)]
     pub temporary: bool, // (CREATE TEMPORARY SECRET: the session's, in memory: `temp.rs`)
     #[serde(skip)]
-    pub trusted: bool, // (a temporary one an admin or the node's owner made: it reaches what they may; anyone else's, the public internet: `public.rs`)
+    pub trusted: bool, // (a temporary one an admin or the node's owner made: it reaches what they may; anyone else's, the public internet: `net::Policy::Public`)
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lent: bool, // (a key a branch was lent to read its base with: `reach_base` alone, never a statement: ADR-058)
 }
@@ -1442,7 +1441,7 @@ fn made(name: &str, mut params: BTreeMap<String, String>) -> Result<Secret> {
 /// queries before the lake's of the same scope, never written anywhere. One made by anyone but an
 /// admin or the node's owner reads with its own keys, on the public internet: not with the node's
 /// credentials (S37), not a topic (its brokers name others to connect to), and not an address of
-/// the node's own network (`public.rs`, S6).
+/// the node's own network (`net::Policy::Public`, S6).
 pub fn temporary(name: &str, params: BTreeMap<String, String>) -> Result<Secret> {
     let trusted = owner() || crate::auth::current().is_none_or(|p| p.role >= crate::auth::Role::Admin);
     if !trusted {
