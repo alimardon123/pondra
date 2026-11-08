@@ -3366,23 +3366,7 @@ fn field(f: &mut Bytes) -> Result<Bytes> {
     next(f, n)
 }
 
-crate::per_node!(
-    /// When the node open now began its start (`trace_from_now`): what `trace`'s times count from.
-    static TRACED_FROM: std::sync::Mutex<Option<datafusion::common::instant::Instant>> = std::sync::Mutex::new(None));
-
-/// The node's start begins now, for `trace` (`Node::start`).
-pub fn trace_from_now() { *TRACED_FROM.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(datafusion::common::instant::Instant::now()); }
-
-/// A cold start's steps and their times, with `PONDRA_TRACE_START` (`tools/cold_trace.sh`, C5): since the node's start
-/// began (`trace_from_now`), nothing before it.
-pub fn trace(what: &str) {
-    let from = *TRACED_FROM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let (Some(since), true) = (from, crate::env::is_set("PONDRA_TRACE_START")) {
-        eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
-    }
-}
-
-/// `trace`'s line, timed from `since`: the catalog's open times its own steps.
+/// A start's line (`NodeState::trace`), timed from `since`: the catalog's open times its own steps.
 pub fn trace_since(what: &str, since: datafusion::common::instant::Instant) {
     if crate::env::is_set("PONDRA_TRACE_START") {
         eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
