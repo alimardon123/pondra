@@ -15,7 +15,7 @@ use crate::fsum::{add, add_partial, error_of};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Float64Array, Int64Array, PrimitiveArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{
-    ArrowPrimitiveType, DataType, Decimal128Type, Field, FieldRef, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt8Type,
+    ArrowPrimitiveType, DataType, Decimal128Type, Field, FieldRef, Float64Type, Int32Type, Int64Type,
 };
 use datafusion::common::{internal_err, Result, ScalarValue};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
@@ -742,21 +742,11 @@ impl<S: Sums> Wholes<S> {
     }
 
     /// Rows of whole numbers (`whole`) into `groups`.
-    fn put_values(&mut self, values: &dyn Array, groups: &[usize], filter: Option<&BooleanArray>) -> Result<()> {
-        macro_rules! put {
-            ($t:ty) => {
-                self.put_all::<$t>(values.as_primitive(), groups, filter)
-            };
-        }
-        match values.data_type() {
-            DataType::Null => {}
-            DataType::Int8 => put!(Int8Type),
-            DataType::Int16 => put!(Int16Type),
-            DataType::Int32 => put!(Int32Type),
-            DataType::UInt8 => put!(UInt8Type),
-            DataType::UInt16 => put!(UInt16Type),
-            DataType::UInt32 => put!(UInt32Type),
-            other => return internal_err!("{other} is not a whole number type"),
+    fn put_values(&mut self, values: &ArrayRef, groups: &[usize], filter: Option<&BooleanArray>) -> Result<()> {
+        match native(values)? {
+            None => {}
+            Some(v) if v.data_type() == &DataType::Int32 => self.put_all(v.as_primitive::<Int32Type>(), groups, filter),
+            Some(v) => self.put_all(v.as_primitive::<Int64Type>(), groups, filter),
         }
         Ok(())
     }
@@ -818,58 +808,56 @@ impl<S: Sums> GroupsAccumulator for Wholes<S> {
 
     /// Rows as states of one value each (when grouping first doesn't pay).
     fn convert_to_state(&self, values: &[ArrayRef], filter: Option<&BooleanArray>) -> Result<Vec<ArrayRef>> {
-        macro_rules! rows {
-            ($t:ty) => {
-                if S::SQUARES {
-                    row_states::<$t, true>(values[0].as_primitive(), filter)
-                } else {
-                    row_states::<$t, false>(values[0].as_primitive(), filter)
-                }
-            };
-        }
-        Ok(match values[0].data_type() {
-            DataType::Null => {
+        Ok(match native(&values[0])? {
+            None => {
                 let mut none = Self::new(self.of); // (no values: each row's state is of none)
                 none.grow(values[0].len());
                 none.states(0..values[0].len())
             }
-            DataType::Int8 => rows!(Int8Type),
-            DataType::Int16 => rows!(Int16Type),
-            DataType::Int32 => rows!(Int32Type),
-            DataType::UInt8 => rows!(UInt8Type),
-            DataType::UInt16 => rows!(UInt16Type),
-            DataType::UInt32 => rows!(UInt32Type),
-            other => return internal_err!("{other} is not a whole number type"),
+            Some(v) if v.data_type() == &DataType::Int32 => row_states(v.as_primitive::<Int32Type>(), filter, S::SQUARES),
+            Some(v) => row_states(v.as_primitive::<Int64Type>(), filter, S::SQUARES),
         })
     }
 
     fn size(&self) -> usize { self.g.capacity() * size_of::<S>() }
 }
 
-/// A whole number (`whole`) as an i64: exact, for a DOUBLE cast from one too (and one instruction, where to an i128 is
-/// a call).
+/// Whole numbers as one of the two types their loops are for (`put_all`, `row_states`): INT as it is, the narrower ones as
+/// INT, and UInt32 as BIGINT (a square still below 2⁶⁴); none for NULLs. Two loops where there were seven: the page's
+/// download stays within its budget (`tools/web_check.mjs`).
+fn native(values: &ArrayRef) -> Result<Option<ArrayRef>> {
+    Ok(match values.data_type() {
+        DataType::Null => None,
+        DataType::Int32 => Some(values.clone()),
+        DataType::UInt32 => Some(cast(values, &DataType::Int64)?),
+        t if is_whole(t) => Some(cast(values, &DataType::Int32)?),
+        other => return internal_err!("{other} is not a whole number type"),
+    })
+}
+
 /// Rows as the states of one value each, as `Wholes::states` gives them (`convert_to_state`: when grouping first
 /// doesn't pay, every row), straight into the columns; a row not kept (NULL, or not the FILTER's) is a state of none.
-fn row_states<T: ArrowPrimitiveType, const SQUARES: bool>(values: &PrimitiveArray<T>, filter: Option<&BooleanArray>) -> Vec<ArrayRef>
+fn row_states<T: ArrowPrimitiveType>(values: &PrimitiveArray<T>, filter: Option<&BooleanArray>, squared: bool) -> Vec<ArrayRef>
 where
     T::Native: AsWhole,
 {
     let (len, all) = (values.len(), values.null_count() == 0 && filter.is_none());
     let (mut count, mut sum) = (Vec::with_capacity(len), Vec::with_capacity(len));
-    let mut squares = Vec::with_capacity(if SQUARES { len } else { 0 });
+    let mut squares = Vec::with_capacity(if squared { len } else { 0 });
     for (i, &x) in values.values().iter().enumerate() {
         let k = all || (values.is_valid(i) && kept(filter, i));
         let x = if k { x.whole() } else { 0 };
         count.push(k as i64);
         sum.push(x as i128);
-        if SQUARES {
+        if squared {
             squares.push((x.unsigned_abs() * x.unsigned_abs()) as i128); // (each below 2³²: below 2⁶⁴)
         }
     }
     let (count, sum): (ArrayRef, ArrayRef) = (Arc::new(Int64Array::from(count)), exact(sum));
-    if SQUARES { vec![count, sum, exact(squares)] } else { vec![count, sum] }
+    if squared { vec![count, sum, exact(squares)] } else { vec![count, sum] }
 }
 
+/// A whole number (`native`'s) as an i64: one instruction, where to an i128 is a call.
 trait AsWhole: Copy {
     fn whole(self) -> i64;
 }
@@ -877,7 +865,7 @@ trait AsWhole: Copy {
 macro_rules! whole_as_i64 {
     ($($t:ty),*) => { $(impl AsWhole for $t { #[inline(always)] fn whole(self) -> i64 { self as i64 } })* };
 }
-whole_as_i64!(i8, i16, i32, u8, u16, u32);
+whole_as_i64!(i32, i64);
 
 /// One group's whole numbers (no GROUP BY, and a window over frames that don't slide: its answer asked after each
 /// row), as `Wholes` keeps them.
