@@ -448,7 +448,7 @@ mod tests {
         let schema = &schema;
         let told = move |p: Principal| crate::auth::WHO.scope(p, async move { super::said(field_not_found(Some("t"), "car", schema)).to_string() });
         let ann = user(&[("select", On::Table("t".into()), &["id"])]);
-        assert_eq!(told(ann).await, "Schema error: No field named car.");
+        assert_eq!(told(ann).await, "Schema error: No field named t.car.", "the column as the statement named it, and no other");
         let admin = told(Principal::token(Role::Admin)).await;
         assert!(admin.contains("Did you mean 't.card'?") && admin.contains("Valid fields are t.id, t.card."), "{admin}");
         assert_eq!(crate::codes::of(&anyhow::Error::new(super::said(field_not_found(Some("t"), "car", schema)))), "42703"); // (no caller: whole)
