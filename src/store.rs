@@ -3993,6 +3993,40 @@ impl Catalog {
         }
     }
 
+    /// The records at `keys` as of one commit, and that commit: a statement's tables and views, which it reads together
+    /// (`query::named_records`). With the whole catalog in memory, under one hold of its lock; otherwise each read and the
+    /// reads checked to be of one commit (`moved_since`), and read again if they aren't (three tries; then 40001, as a
+    /// statement whose reads raced a commit says it).
+    pub async fn get_many(&self, keys: &[String]) -> Result<(Vec<Option<Bytes>>, u64)> {
+        crate::metrics::add(&crate::metrics::CATALOG_READS, keys.len() as u64); // (each record looked up, there or not)
+        if self.mirror.load(Relaxed) {
+            let o = self.overlay.lock().unwrap(); // (`apply` changes it and `streamed` together under it)
+            return Ok((keys.iter().map(|k| o.get(k).and_then(|(_, v)| v.clone())).collect(), self.streamed.load(Relaxed)));
+        }
+        let wanted: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+        for _ in 0..3 {
+            let since = self.commit_now().await?;
+            let mut got = Vec::with_capacity(keys.len());
+            for k in keys {
+                got.push(self.get_raw_uncounted(k).await?);
+            }
+            let at = self.commit_now().await?;
+            if !self.moved_since("", "\u{10ffff}", since, at, |k| wanted.contains(k)) {
+                return Ok((got, at));
+            }
+        }
+        Err(crate::codes::coded("40001", "could not serialize access: the catalog changed while the statement read its tables three times: run it again"))
+    }
+
+    /// The commit this node's catalog reads are as of now: the leader's last committed one (its whole catalog in
+    /// memory: its last applied), a follower's last streamed one or its view's.
+    pub async fn commit_now(&self) -> Result<u64> {
+        match self.kv.is_writer() && !self.mirror.load(Relaxed) {
+            true => Ok(self.committed()),
+            false => self.at_now().await,
+        }
+    }
+
     /// The commit a read takes right now, when it lays nothing over our view: the mirror's last streamed commit, else the view's.
     async fn at_now(&self) -> Result<u64> {
         if self.mirror.load(Relaxed) {
