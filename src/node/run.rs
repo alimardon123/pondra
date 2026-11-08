@@ -194,7 +194,7 @@ impl Node {
         crate::served::checked(&dir, start.reader, start.auth.admin_set(), serve_store)?; // (who may serve or open a store: `served.rs`)
         crate::origins::check()?; // (a page's origins that aren't origins stop the node here, before it joins or serves: `origins.rs`)
         let owner = start.auth.owner_key().map(str::to_string); // (what `ask` signs with)
-        let (_, store, _) = store::open_store(&dir)?;
+        let store = store::counted(store::open_store(&dir)?.1, &here.metrics); // (its terms, marks and members' requests the node's: `Counted`)
         let tr = |what: &str| here.trace(what); // (timed from this start: `NodeState::trace`)
         let addr = advertise.unwrap_or_else(|| listen.clone()); // (how others reach it: its cluster name)
         if lives {
