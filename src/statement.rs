@@ -121,10 +121,9 @@ pub(crate) fn is_write(sql: &str) -> bool {
 /// Step 2's inside, on a statement already expanded (`run` makes it, inside `audit::statement`): the key lookup, the
 /// remembered answer or the run. Postgres's door enters here too, with its own text and its own audit.
 pub(crate) async fn query<W: Wire>(app: &App, one: &str, how: &How<'_>, files: bool, wire: &W) -> Result<Answer<W::Own>> {
-    let limited = crate::auth::limited().is_some(); // (a user granted some tables: planned as it may read them, never answered from what another read, nor kept: its grants may change)
-    if wire.takes_point_json() && !crate::temp::mentioned(one) && !limited {
+    if wire.takes_point_json() && !crate::temp::mentioned(one) {
         if let Some(body) = crate::serve::point_sql(&app.lake, one).await? {
-            return Ok(Answer::Kept(body.into())); // a key lookup: no planning
+            return Ok(Answer::Kept(body.into())); // a key lookup: no planning (of the columns its caller may read: `serve::point`)
         }
     }
     // The program that started the node (`files`) has its answers remembered apart, run with its
@@ -138,7 +137,8 @@ pub(crate) async fn query<W: Wire>(app: &App, one: &str, how: &How<'_>, files: b
         crate::query::mark("answer kept?");
         return Ok(run_once(app, how, one, files, wire).await?.1);
     };
-    let key = format!("{kept}|{}|{}|{one}", how.spread.unwrap_or(""), if files { "owner" } else { "" });
+    // (a user granted some tables: kept under what it may read, `Scope::key`, so an answer made under other grants is never its)
+    let key = format!("{kept}|{}|{}|{}|{one}", how.spread.unwrap_or(""), if files { "owner" } else { "" }, crate::rights::scope().key());
     let stale = how.stale.filter(|_| how.after.is_none()); // (read-your-writes wins)
     Ok(match app.remembered(key, one, version, stale, || run_once(app, how, one, files, wire)).await? {
         Kept::Bytes(body) => Answer::Kept(body),
@@ -257,6 +257,7 @@ pub(crate) async fn scoped<F: std::future::Future>(session: Option<String>, vars
 /// `statement::run` (the session, the owner's files, …): server.rs's `sql`, moved.
 pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, headers: http::HeaderMap, body: Bytes) -> Said {
     let files = owner(&app.auth, &headers); // (the program that started this node: its files, and URLs no secret covers)
+    let node = app.lake.node.clone(); // (its rest, run on after the answer is handed over, is still in flight: `panics::work`)
     let session = match crate::temp::of(&headers) { // (its temporary tables: `temp.rs`)
         Ok(session) => session,
         Err(e) => return Said { reply: Err(e), heard: vec![], session: None }, // (a session name that isn't one: refused, saying what one is)
@@ -283,7 +284,7 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, headers: http:
             // Its answer goes in pieces as its plan makes them (`query::send_rest`): the rest of the request, the
             // pieces and the statement's end, is polled on the queries' runtime while its client reads; the plan's
             // partition tasks stay where the prefix spawned them. The node may still stop it for memory (`oom.rs`).
-            crate::panics::aside(crate::panics::work(true, go));
+            crate::panics::aside(crate::panics::work(&node, true, go));
             return Said { reply: Ok(Reply::Rendered(Rendered::Pieces(h))), heard: vec![], session };
         }
     };

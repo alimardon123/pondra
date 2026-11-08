@@ -315,7 +315,7 @@ async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<M
                         Some(m) = moves.recv() => {
                             // The lake moves: its requests answered, the node stopped, its objects settled on the
                             // target, and the node started there. A move is not a restart, so it is not counted.
-                            crate::drain::drain().await;
+                            node.drain().await;
                             set(State::Restarting(format!("moving the lake to {}", m.to)));
                             node.stop().await;
                             if let Err(e) = crate::memory::settle(&m).await {
@@ -345,7 +345,7 @@ async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<M
                         }
                         Some(Event::Close) | None => {
                             let t0 = std::time::Instant::now();
-                            crate::drain::drain().await; // (its requests in flight answered: the router stays till then)
+                            node.drain().await; // (its requests in flight answered: the router stays till then)
                             if crate::env::is_set("PONDRA_TRACE_START") {
                                 eprintln!("stop: drained {:.2} s", t0.elapsed().as_secs_f64());
                             }

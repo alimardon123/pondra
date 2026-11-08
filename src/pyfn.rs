@@ -407,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn each_lake_keeps_its_own_functions_answers() -> Result<()> {
         use crate::ledger::Charged;
-        let open = || async { Lake::open(&format!("memory://answers-{}", uuid::Uuid::new_v4().simple()), true, false, crate::lifecycle::unhosted()).await };
+        let open = || async { Lake::open(&format!("memory://answers-{}", uuid::Uuid::new_v4().simple()), true, false, crate::node_state::NodeState::unhosted()).await };
         let (a, b) = (open().await?, open().await?);
         let (kept, other) = (a.state::<Answered>()?, b.state::<Answered>()?);
         assert!(Arc::ptr_eq(&kept, &a.state::<Answered>()?) && !Arc::ptr_eq(&kept, &other), "one a lake, its own");

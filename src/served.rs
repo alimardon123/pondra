@@ -1041,7 +1041,7 @@ mod tests {
 
     /// The user a page's requests are for in these tests (its slug is `616c69`).
     fn ali() -> crate::auth::Principal {
-        crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Admin, access: None, door: "http", from: None, operator: false, epoch: 0, until: None }
+        crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Admin, scope: Default::default(), door: "http", from: None, operator: false, epoch: 0, until: None }
     }
 
     /// A request as a user's: the guard sets the principal, which `files_door` reads.

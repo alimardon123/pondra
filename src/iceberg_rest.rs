@@ -76,7 +76,7 @@ async fn space(app: &crate::app::App, ns: &str) -> Result<(Vec<String>, std::syn
     let found = spaces(app).await.into_iter().find(|(p, _, _)| *p == parts).ok_or_else(|| missing(&format!("namespace {}", parts.join(".")), "NoSuchNamespaceException"))?;
     if !std::sync::Arc::ptr_eq(&found.1, &app.lake) {
         crate::users::across(&found.1, &found.0[0]).await.map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
-        if crate::auth::limited().is_some() {
+        if !crate::rights::scope().whole() {
             return Err(refused(403, "ForbiddenException", format!("permission denied: {} is another database: its tables are read through it (the database {})", found.0[0], found.0[0])));
         }
     }
@@ -88,7 +88,7 @@ async fn space(app: &crate::app::App, ns: &str) -> Result<(Vec<String>, std::syn
 async fn namespaces(axum::extract::State(app): axum::extract::State<crate::app::App>) -> axum::Json<Value> {
     let mut seen = vec![];
     for (parts, lake, _) in spaces(&app).await {
-        if std::sync::Arc::ptr_eq(&lake, &app.lake) || (crate::auth::limited().is_none() && crate::users::across(&lake, &parts[0]).await.is_ok()) {
+        if std::sync::Arc::ptr_eq(&lake, &app.lake) || (crate::rights::scope().whole() && crate::users::across(&lake, &parts[0]).await.is_ok()) {
             seen.push(parts);
         }
     }
@@ -138,9 +138,9 @@ fn quoted(n: &str) -> String {
 async fn tables(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::extract::Path(ns): axum::extract::Path<String>) -> Reply {
     let (parts, lake, schema) = space(&app, &ns).await?;
     let published = lake.cat.scan::<Published>("i/", "i0").await.unwrap_or_default();
-    let limited = crate::auth::limited();
+    let scope = crate::rights::scope();
     let ids: Vec<Value> = published.iter().filter(|(k, p)| p.version > 0 && crate::text::split(&k[2..]).0 == schema)
-        .filter(|(k, _)| limited.as_ref().is_none_or(|a| a.may("select", &k[2..])))
+        .filter(|(k, _)| scope.sees(crate::rights::Object::Table(&k[2..])))
         .map(|(k, _)| json!({"namespace": parts, "name": crate::text::split(&k[2..]).1})).collect();
     Ok(axum::Json(json!({"identifiers": ids})))
 }
@@ -456,7 +456,7 @@ async fn commit(app: &crate::app::App, lake: &std::sync::Arc<Lake>, commits: Vec
     let files: Vec<String> = commits.iter().flat_map(|c| c.written.iter().flat_map(|f| f.paths())).collect();
     let out = match std::sync::Arc::ptr_eq(lake, &app.lake) {
         true => app.record_iceberg(commits).await,
-        false => crate::write::send(&lake.url, crate::write::Request::Iceberg(commits), &lake.life).await,
+        false => crate::write::send(&lake.url, crate::write::Request::Iceberg(commits), &lake.node).await,
     };
     out.map_err(|e| {
         let (raw, e) = (format!("{e:#}"), crate::ext::said(&e)); // (the words are matched raw, sent as said)

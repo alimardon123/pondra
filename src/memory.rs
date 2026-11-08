@@ -878,7 +878,7 @@ pub async fn set_location(lake: &Lake, database: &str, to: &str) -> anyhow::Resu
     // (answered once the host has begun to stop the node: a statement sent next waits for the move, rather
     // than being answered by the node it is about to leave)
     for _ in 0..5000 {
-        if crate::drain::draining() {
+        if lake.node.drain.draining() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
