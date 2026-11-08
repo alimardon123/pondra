@@ -283,7 +283,7 @@ async fn planned(lake: &Lake, source: &str, o: &Once) -> Result<Planned> {
     let t = src.schema()?.field_with_name(&o.time)?.data_type().clone();
     let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(&o.time, t, true)]));
     let df = datafusion::common::DFSchema::try_from(schema.as_ref().clone())?;
-    let ctx = crate::query::session(lake, "", "").await?;
+    let ctx = crate::query::session_for(lake, "", "", None, &crate::auth::Principal::node().scope).await?;
     let e = ctx.parse_sql_expr(&o.bucket, &df).and_then(crate::optimize::whole_literals)?;
     let p = (ctx.create_physical_expr(e, &df)?, schema);
     PLANNED.lock().unwrap().insert(key, p.clone());
@@ -322,7 +322,7 @@ pub async fn emit(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, o: &
     if hi.is_null() || (done > 0 && lo == hi) {
         return Ok(());
     }
-    let ctx = crate::query::session(lake, "", "").await?;
+    let ctx = crate::query::session_for(lake, "", "", None, &crate::auth::Principal::node().scope).await?;
     let meta: Arc<TableMeta> = Arc::new(lake.cat.get(&table_key(view)).await?.with_context(|| format!("no table {view}"))?);
     let open = crate::query::table_view_once(lake, &ctx, view, meta.clone(), None).await?;
     ctx.register_table("__open", crate::query::named(&ctx, open, &meta, false)?)?;

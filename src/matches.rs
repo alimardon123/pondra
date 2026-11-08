@@ -5,7 +5,7 @@
 //! rows are counted in `pondra$expectations` and never matched. The leader runs it (`views::emit_all`). A run reads about
 //! `PONDRA_MATCH_RUN_ROWS` new rows, and a catch-up goes on in steps.
 use crate::log::{Append, Outcome, Sequencer, Src};
-use crate::query::{over_ctx, session, session_at, table_ref};
+use crate::query::{over_ctx, session, session_for, table_ref};
 use crate::store::*;
 use crate::text::{ROW_ID, VERSION};
 use crate::views::{Options, View, EXPECTED};
@@ -333,7 +333,7 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     // S: the source's rows in (W0, W], as they are at `at`, with their ids and versions. The run decides up to the cut.
     let names: Vec<String> = src.columns().map(|(c, _)| c.to_string()).collect();
     let read = format!("SELECT {}, {ROW_ID}, {VERSION} FROM {}", crate::objects::list_sql(&names), crate::write::sql_name(&v.source));
-    let sctx = session_at(lake, &read, "", Some(at)).await?;
+    let sctx = session_for(lake, &read, "", Some(at), &crate::auth::Principal::node().scope).await?;
     let table = sctx.table(table_ref(&v.source)).await?;
     let w_mark = w;
     let mut points = CUTS.lock().unwrap().remove(&dkey).unwrap_or_default();
@@ -443,7 +443,7 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     let view_schema = view_meta.schema()?;
     let view_rows = match &m.outer {
         Some(outer) => {
-            let octx = session(lake, outer, "__matches").await?;
+            let octx = session_for(lake, outer, "__matches", None, &crate::auth::Principal::node().scope).await?;
             octx.register_table("__matches", Arc::new(MemTable::try_new(match_schema.clone(), vec![vec![all_matches]])?))?;
             let rows: Vec<RecordBatch> = crate::engine::sql(&octx, outer).await?.collect().await?;
             rows_as(&view_schema, &rows)?
@@ -659,7 +659,7 @@ fn held_schema_of(cols: &[(String, DataType)]) -> SchemaRef { Arc::new(Schema::n
 /// them, or with `keys`, only the rows of those keys.
 async fn read_state(lake: &Lake, name: &str, at: u64, keys: Option<&RecordBatch>) -> Result<Vec<RecordBatch>> {
     let meta: Arc<TableMeta> = Arc::new(table_meta(lake, name).await?);
-    let ctx = session(lake, "", "").await?;
+    let ctx = session_for(lake, "", "", None, &crate::auth::Principal::node().scope).await?;
     let provider = crate::query::table_view_once(lake, &ctx, name, meta.clone(), Some(at)).await?;
     ctx.register_table("__state", crate::query::named(&ctx, provider, &meta, false)?)?;
     match keys {

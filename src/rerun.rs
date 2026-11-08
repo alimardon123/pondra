@@ -22,7 +22,7 @@
 //! (producer `rerun:{view}`, seq the commit it read up to, `prev` the one before): a run is
 //! applied once, whichever leader runs it. Nothing is held between runs.
 use crate::codes::coded;
-use crate::query::{session_at, table_ref};
+use crate::query::{session_for, table_ref};
 use crate::store::*;
 use crate::text::{CREATED, ROW_ID, VERSION};
 use crate::views::View;
@@ -1010,7 +1010,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
 /// out), under its `WHERE`, each key once.
 async fn touched(lake: &Lake, v: &View, done: u64, now: u64) -> Result<Vec<RecordBatch>> {
     let joins = v.rerun.as_ref().map_or(&[][..], |r| &r.joins);
-    let ctx = session_at(lake, &v.sql, "", Some(now)).await?;
+    let ctx = session_for(lake, &v.sql, "", Some(now), &crate::auth::Principal::node().scope).await?;
     if !joins.is_empty() {
         // (windows over a join: each table's changed rows' columns equal to the keys, as the keys' types)
         let plan = crate::engine::sql(&ctx, &crate::sys::planned(&v.sql)?).await?.into_unoptimized_plan();
@@ -1056,7 +1056,7 @@ fn in_place_of(scan: &LogicalPlan, rows: &LogicalPlan) -> Result<LogicalPlan> {
 /// `{source}$deleted`, and the rows file commits took out.
 async fn changed(lake: &Lake, source: &str, after: u64, upto: u64) -> Result<DataFrame> {
     let meta: TableMeta = lake.cat.get(&table_key(source)).await?.with_context(|| format!("no table {source}"))?;
-    let ctx = session_at(lake, &format!("SELECT {VERSION} FROM {}", crate::write::sql_name(source)), "", Some(upto)).await?;
+    let ctx = session_for(lake, &format!("SELECT {VERSION} FROM {}", crate::write::sql_name(source)), "", Some(upto), &crate::auth::Principal::node().scope).await?;
     let within = |df: DataFrame| df.filter(ident(VERSION).gt(lit(after as i64)).and(ident(VERSION).lt_eq(lit(upto as i64))));
     let new = within(ctx.table(table_ref(source)).await?)?;
     let columns: Vec<(String, DataType)> = meta.logical_columns().iter().map(|(c, _)| Ok((c.clone(), new.schema().field_with_unqualified_name(c)?.data_type().clone()))).collect::<Result<_>>()?;
@@ -1104,7 +1104,7 @@ fn key(i: usize) -> Expr { Expr::Column(Column::new(Some(TOUCHED), format!("__k{
 /// The view's rows as of `now`: of the touched keys only (their rows, and nothing else, go into
 /// the `GROUP BY` or the windows), or of every key.
 async fn worked_out(lake: &Lake, v: &View, now: u64, touched: Option<&Touched>) -> Result<Vec<RecordBatch>> {
-    let ctx = session_at(lake, &v.sql, "", Some(now)).await?;
+    let ctx = session_for(lake, &v.sql, "", Some(now), &crate::auth::Principal::node().scope).await?;
     let plan = crate::engine::sql(&ctx, &crate::sys::planned(&v.sql)?).await?.into_unoptimized_plan();
     let plan = match touched {
         Some(t) => {
@@ -1190,7 +1190,7 @@ fn kept_as_written(ctx: &SessionContext) {
 /// `_created_at` and `_version`.
 async fn old_rows(lake: &Lake, view: &str, keys: &[String], touched: Option<&Touched>, at: u64) -> Result<Vec<RecordBatch>> {
     let sql = format!("SELECT *, {ROW_ID}, {CREATED}, {VERSION} FROM {}", crate::write::sql_name(view));
-    let ctx = session_at(lake, &sql, "", Some(at)).await?;
+    let ctx = session_for(lake, &sql, "", Some(at), &crate::auth::Principal::node().scope).await?;
     let mut plan = ctx.sql(&crate::sys::hide(&sql)).await?.into_unoptimized_plan(); // (`*` without the system columns)
     if let Some(t) = touched {
         kept_as_written(&ctx);
