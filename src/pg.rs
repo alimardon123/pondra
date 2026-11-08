@@ -162,8 +162,9 @@ impl Startup {
             };
             if crate::ddl::database(lake, &db).await.map_err(said)?.is_some() {
                 let sql = format!("USE DATABASE {}", crate::objects::ident(&db));
-                let into = crate::set::statement(lake, &sql);
-                crate::temp::SESSION.scope(Some(self.backend.session.clone()), crate::auth::WHO.scope(self.backend.who(), into)).await.map_err(said)?;
+                let who = self.backend.who();
+                let into = crate::set::statement(lake, &sql, &who.scope);
+                crate::temp::SESSION.scope(Some(self.backend.session.clone()), crate::auth::WHO.scope(who.clone(), into)).await.map_err(said)?;
             }
         }
         finish(client, &self.cancels).await
@@ -472,7 +473,7 @@ impl Backend {
             eprintln!("pg {user}: {sql}");
         }
         let _busy = crate::txn::next(&self.app, &sql).await.map_err(user_error)?; // (a failed transaction takes nothing but its end; READ COMMITTED reads the newest commit; the guard keeps the transaction busy while this runs)
-        if let Some(b) = crate::txn::locked_read(&self.app, &sql).await.map_err(user_error)? {
+        if let Some(b) = crate::txn::locked_read(&self.app, &sql, &self.who().scope).await.map_err(user_error)? {
             let schema = b.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
             let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, &bound).await);
             return Ok(Response::Query(rows(&schema, b, format)?)); // (a locking read in a transaction: the rows it locked)
@@ -493,7 +494,7 @@ impl Backend {
         }
         if crate::set::is(&sql) {
             // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: this connection's (round 31)
-            return match crate::set::statement(&self.app.lake, &sql).await {
+            return match crate::set::statement(&self.app.lake, &sql, &self.who().scope).await {
                 Ok(crate::set::Done::Said(kind)) => Ok(Response::Execution(tag(&kind, None))),
                 Ok(crate::set::Done::Run(sql)) => Box::pin(self.run(user, &sql, format)).await,
                 Err(_) if crate::text::first_word(&sql).to_uppercase().starts_with("DEALLOCATE") => Ok(Response::Execution(tag(&Kind::new("DEALLOCATE"), None))), // (a statement the protocol prepared: pgwire's)
@@ -547,7 +548,7 @@ impl Backend {
             crate::history::parsed(&stmt); // (the history writer takes its table from here: `history::touched`)
             crate::rights::may_run(role, &stmt).map_err(user_error)?;
             let kind = stmt.kind(&sql);
-            let v = crate::write::on_node(&self.app, stmt, None).await.map_err(user_error)?;
+            let v = crate::write::on_node(&self.app, stmt, None, &self.who().scope).await.map_err(user_error)?;
             return Ok(Response::Execution(tag(&kind, Some(v["rows"].as_u64().unwrap_or(0)))));
         }
         let catalog = crate::pg_catalog::wanted(&sql);

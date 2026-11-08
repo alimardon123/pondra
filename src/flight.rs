@@ -1014,6 +1014,7 @@ impl FlightSqlService for Sql {
             _ => cmd.table.clone(),
         };
         let again = req.extensions().get::<Again>().cloned(); // (signed in again as its rights change: `append`)
+        let scope = caller(&req).scope; // (its sign-in's)
         let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(stream_status).peekable();
         let mut exists = self.0.lake.cat.meta(&table_key(&table)).await.map_err(status)?.is_some();
         crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(|e| {
@@ -1028,7 +1029,7 @@ impl FlightSqlService for Sql {
             (true, Ok(IfThere::Replace), _) => {
                 crate::rights::may_as(role, crate::rights::Action::Define, crate::rights::Object::Table(&table)).map_err(denied)?; // (replacing it)
                 let drop = crate::write::parse(&format!("DROP TABLE {}", crate::write::sql_name(&table))).ok_or_else(|| refused("XX000", "DROP TABLE"))?;
-                crate::write::on_node(&self.0, drop, None).await.map_err(status)?;
+                crate::write::on_node(&self.0, drop, None, &scope).await.map_err(status)?;
                 exists = false;
             }
             (false, _, Ok(IfNot::Fail)) => return Err(refused("42P01", format!("no table {table} (mode append): create it first, or use create_append"))),

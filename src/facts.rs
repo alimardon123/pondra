@@ -289,7 +289,7 @@ pub async fn not_a_view(lake: &Lake, table: &str) -> Result<()> {
 
 /// Leader, under the lake's lock: one `ALTER [MATERIALIZED] VIEW [IF EXISTS] v ADD | DROP CONSTRAINT`
 /// of a view's facts. With IF EXISTS a view that isn't there is nothing to change.
-pub async fn apply(lake: &Lake, view: &str, if_exists: bool, change: Change) -> Result<Value> {
+pub async fn apply(lake: &Lake, view: &str, if_exists: bool, change: Change, scope: &crate::rights::Scope) -> Result<Value> {
     if if_exists && !is_view(lake, view).await? && lake.cat.get::<TableMeta>(&table_key(view)).await?.is_none() {
         return Ok(j!({"view": view, "exists": false, "notice": format!("relation \"{view}\" does not exist, skipping")}));
     }
@@ -299,7 +299,7 @@ pub async fn apply(lake: &Lake, view: &str, if_exists: bool, change: Change) -> 
     };
     let dropped = matches!(change, Change::Drop { .. });
     let changed = if let Some(v) = lake.cat.get::<StoredView>(&query_key(view)).await? {
-        let columns = stored_columns(lake, view, &v).await?;
+        let columns = stored_columns(lake, view, &v, scope).await?;
         match made(view, &v.facts, &change, &columns, &[], &[])? {
             Some(facts) => {
                 lake.cat.commit(vec![(query_key(view), json(&StoredView { facts, ..v }))], &[]).await?;
@@ -331,10 +331,10 @@ pub async fn apply(lake: &Lake, view: &str, if_exists: bool, change: Change) -> 
     })
 }
 
-/// A stored view's columns, as its query names them now (planned, not run).
-async fn stored_columns(lake: &Lake, view: &str, v: &StoredView) -> Result<Vec<String>> {
+/// A stored view's columns, as its query names them now (planned for `scope`, the statement's asker; not run).
+async fn stored_columns(lake: &Lake, view: &str, v: &StoredView, scope: &crate::rights::Scope) -> Result<Vec<String>> {
     let sql = format!("SELECT * FROM {} LIMIT 0", crate::write::sql_name(view));
-    let ctx = crate::query::session(lake, &sql, "").await?;
+    let ctx = crate::query::session_for(lake, &sql, "", None, scope).await?;
     let df = crate::engine::sql(&ctx, &sql).await?;
     Ok(shown_columns(&v.sql, df.schema().fields().iter().map(|f| f.name().clone())))
 }

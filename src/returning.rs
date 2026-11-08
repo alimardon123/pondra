@@ -151,7 +151,7 @@ pub async fn run(app: &App, r: &Returning, role: Role, files: bool, scope: &crat
     answer(app, &items, RecordBatch::new_empty(shown.clone()), scope).await?; // (a wrong item refuses the write, as Postgres refuses it)
     crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&table))?; // (RETURNING reads the rows it wrote: SELECT on every column, as Postgres asks)
     let kept = Arc::new(Mutex::new(None));
-    let out = KEPT.scope(kept.clone(), write(app, r, &table, stmt, job.clone(), files)).await?;
+    let out = KEPT.scope(kept.clone(), write(app, r, &table, stmt, job.clone(), files, scope)).await?;
     if out["duplicate"] == true {
         // A job sent again writes nothing, and its first answer's rows aren't kept: no rows would read as nothing written.
         return Err(crate::codes::coded("55000", format!("{} … RETURNING with job {} was applied already, by an earlier send of it: its rows went with that answer and aren't kept, so read them with a SELECT", r.word(), job.unwrap_or_default())));
@@ -185,7 +185,7 @@ fn parsed(r: &Returning) -> Result<Stmt> {
 
 /// The write, run where its rows are worked out on this node: as it always runs, or, for a change the leader would work out
 /// (`write::changes`; a one-row upsert of one key is not one), as a transaction of its own (`txn::alone`).
-async fn write(app: &App, r: &Returning, table: &str, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
+async fn write(app: &App, r: &Returning, table: &str, stmt: Stmt, job: Option<String>, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
     let leaders = match &stmt {
         Stmt::InsertInto(t, ..) => crate::write::changes(&app.lake, &Stmt::Insert(t.clone(), String::new())).await?, // (its columns don't decide it)
         s => crate::write::changes(&app.lake, s).await?,
@@ -196,9 +196,9 @@ async fn write(app: &App, r: &Returning, table: &str, stmt: Stmt, job: Option<St
                 return Ok(serde_json::json!({"duplicate": true})); // (asked first: run again, a row it wrote may refuse it, a key it holds)
             }
         }
-        return crate::txn::alone(app, &r.write, job, files).await;
+        return crate::txn::alone(app, &r.write, job, files, scope).await;
     }
-    crate::write::on_node_as(app, stmt, job, files).await
+    crate::write::on_node_as(app, stmt, job, files, scope).await
 }
 
 /// The table a write changes, as the lake names it, and its columns as RETURNING sees them: as SQL names them, with no

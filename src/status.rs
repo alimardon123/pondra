@@ -100,7 +100,7 @@ fn name_of(key: &str) -> &str { apply::split_key(key).1 }
 async fn view(app: &App, ask: &apply::Ask, who: Who) -> Result<View> {
     let p = apply::project(ask)?;
     let branch = app.lake.cat.get_raw(crate::branch::BASES).await?.is_some();
-    let plan = apply::plan(&app.lake, &p, ask.prune, branch).await?;
+    let plan = apply::plan(&app.lake, &p, ask.prune, branch, &who.scope).await?;
     let all = apply::records(&app.lake).await?;
     let last = apply::last_finished(&all);
     let now = apply::current(&app.lake).await?;
@@ -245,15 +245,17 @@ pub async fn capture(app: &App, ask: &apply::Ask, who: Who) -> Result<serde_json
         captured.push(l);
     }
     if !migrations.is_empty() {
+        let admin = apply::admin_for(&who, applier);
+        let scope = &admin.as_ref().map_or_else(|| who.scope.clone(), |me| me.scope.clone()); // (whom they are recorded as, below)
         let record = async {
             for file in &migrations {
                 let entry = j!({"migration": apply::migration_key(&v.p.name, file)});
-                crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: 0, record: json(&entry) }]), None, false).await?;
+                crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: 0, record: json(&entry) }]), None, false, scope).await?;
             }
             Ok::<(), anyhow::Error>(())
         };
         // (as an apply's statements run: an APPLY holder below admin records them as an admin, under its own name)
-        match apply::admin_for(&who, applier) {
+        match admin {
             Some(me) => crate::auth::WHO.scope(me, record).await?,
             None => record.await?,
         }

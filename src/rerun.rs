@@ -602,7 +602,7 @@ pub(crate) async fn table_columns(lake: &Lake, sql: &str, ctx: &datafusion::prel
 /// Make view `name` run again by key or whole (leader only): its table gets the query's columns,
 /// and its first run works every group out (`ddl::settle` waits for it). `why`: None when asked.
 #[allow(clippy::too_many_arguments)]
-pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &TableMeta, upstream: Option<&View>, plan: &LogicalPlan, how: How, why: Option<String>, lag_secs: Option<u64>, from: Vec<String>, written: Option<String>) -> Result<()> {
+pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &TableMeta, upstream: Option<&View>, plan: &LogicalPlan, how: How, why: Option<String>, lag_secs: Option<u64>, from: Vec<String>, written: Option<String>, scope: &crate::rights::Scope) -> Result<()> {
     let asked = why.is_none();
     let (keys, joins, full, reason) = match how {
         How::ByKey => {
@@ -627,7 +627,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &Tabl
         }
     };
     crate::format::require(lake, 2, "a materialized view that runs its query again (median, count(DISTINCT …), ORDER BY … LIMIT, …)").await?;
-    let ctx = crate::query::session(lake, sql, "").await?; // (the table's columns are the types the query runs with)
+    let ctx = crate::query::session_for(lake, sql, "", None, scope).await?; // (the table's columns are the types the query runs with)
     let (columns, sql_types) = table_columns(lake, sql, &ctx, plan).await?;
     let meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry };
     let r = Rerun { id: uuid::Uuid::new_v4().to_string(), keys, full, reason, asked, lag_secs, joins };

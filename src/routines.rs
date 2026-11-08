@@ -836,7 +836,7 @@ pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<
 
 /// One statement's outcome, a locking read in a transaction (`txn::locked_read`) first: its rows, locked.
 async fn one_or_locked(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
-    match crate::txn::locked_read(app, sql).await? {
+    match crate::txn::locked_read(app, sql, &who.scope).await? {
         Some(rows) => Ok(Outcome::Rows(rows)),
         None => one_of(app, sql, who, job).await,
     }
@@ -892,7 +892,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
     }
     if crate::set::is(sql) {
         // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: the session's (round 31)
-        return match Box::pin(crate::set::statement(&app.lake, sql)).await? {
+        return match Box::pin(crate::set::statement(&app.lake, sql, &who.scope)).await? {
             crate::set::Done::Said(kind) => Ok(Outcome::Done(j!({"command": kind.words()}))),
             crate::set::Done::Run(sql) => Box::pin(one_of(app, &sql, who, job)).await,
         };
@@ -908,7 +908,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
     }
     if let Some(stmt) = crate::write::parse(sql) {
         crate::rights::may_run(who.role, &stmt)?;
-        return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files).await?));
+        return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files, &who.scope).await?));
     }
     if let Some((rows, _)) = Box::pin(crate::txn::point_read(&app.lake, sql)).await? {
         return Ok(Outcome::Rows(rows)); // (a key lookup in a transaction: no planning)

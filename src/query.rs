@@ -1859,8 +1859,8 @@ pub async fn over(lake: &Lake, source: &str, rows: Vec<RecordBatch>, sql: &str) 
 }
 
 /// A session for `sql` where table `source` is just `rows`, as columns `s`.
-pub async fn over_ctx(lake: &Lake, source: &str, s: SchemaRef, rows: Vec<RecordBatch>, sql: &str) -> Result<SessionContext> {
-    let ctx = session(lake, sql, source).await?;
+pub async fn over_ctx(lake: &Lake, source: &str, s: SchemaRef, rows: Vec<RecordBatch>, sql: &str, scope: &crate::rights::Scope) -> Result<SessionContext> {
+    let ctx = session_for(lake, sql, source, None, scope).await?;
     let rows = rows.iter().map(|b| conform(b, &s)).collect::<Result<Vec<_>>>()?;
     ctx.register_table(table_ref(source), Arc::new(MemTable::try_new(s, vec![rows])?))?;
     Ok(ctx)
@@ -1899,13 +1899,13 @@ mod tests {
             use crate::store::Lake;
             let dir = std::env::temp_dir().join(format!("pondra-named-{}", uuid::Uuid::new_v4()));
             let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
-            apply(&lake, Ddl::CreateSchema { name: "s".into(), if_not_exists: false }).await?;
+            apply(&lake, Ddl::CreateSchema { name: "s".into(), if_not_exists: false }, &crate::auth::Principal::node().scope).await?;
             for t in ["a", "b", "s.c", "MiXed", "x-y", "unused", "a$new-0123abcd"] {
                 crate::write::create_table(&lake, t, r#"{"columns": [["x", "Int64"]]}"#).await?;
             }
             let view = |name: &str, sql: &str| Ddl::CreateView { name: name.into(), sql: sql.into(), replace: false, facts: None, text: None };
-            apply(&lake, view("v", "SELECT x FROM a")).await?;
-            apply(&lake, view("w", "SELECT v.x FROM v JOIN b ON v.x = b.x")).await?;
+            apply(&lake, view("v", "SELECT x FROM a"), &crate::auth::Principal::node().scope).await?;
+            apply(&lake, view("w", "SELECT v.x FROM v JOIN b ON v.x = b.x"), &crate::auth::Principal::node().scope).await?;
             let registered = |ctx: &SessionContext| -> std::collections::BTreeSet<String> {
                 let c = ctx.catalog(&crate::ddl::lake_name(&lake)).expect("the lake's catalog");
                 c.schema_names().into_iter().filter(|s| s != "information_schema").flat_map(|s| {

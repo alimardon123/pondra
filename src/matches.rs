@@ -5,7 +5,7 @@
 //! rows are counted in `pondra$expectations` and never matched. The leader runs it (`views::emit_all`). A run reads about
 //! `PONDRA_MATCH_RUN_ROWS` new rows, and a catch-up goes on in steps.
 use crate::log::{Append, Outcome, Sequencer, Src};
-use crate::query::{over_ctx, session, session_for, table_ref};
+use crate::query::{over_ctx, session_for, table_ref};
 use crate::store::*;
 use crate::text::{ROW_ID, VERSION};
 use crate::views::{Options, View, EXPECTED};
@@ -58,7 +58,7 @@ pub fn tables(name: &str) -> Vec<String> { vec![held_of(name), resume_of(name)] 
 
 /// `CREATE MATERIALIZED VIEW v AS SELECT … MATCH_RECOGNIZE (…) EMIT FINAL`, as `once::create` hands it over: the query
 /// without EMIT FINAL. Makes the view, `{v}$held` and `{v}$resume` in one commit.
-pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
+pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options, scope: &crate::rights::Scope) -> Result<()> {
     crate::once::final_options(&o, "each match once, when it's decided")?;
     let written = format!("{}\nEMIT FINAL", sql.trim_end());
     if let Some(v) = lake.cat.get::<View>(&crate::views::view_key(name)).await? {
@@ -73,7 +73,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     crate::ddl::unclaimed(lake, name).await?;
 
     // The query as the parser reads it, and its MATCH_RECOGNIZE in open mode; the input is a lake table of this lake.
-    let ctx = session(lake, sql, "").await?;
+    let ctx = session_for(lake, sql, "", None, scope).await?;
     let cols = crate::pattern::open_columns(lake, sql).await?;
     let open = crate::pattern::open(sql, &cols, &ctx.state())?;
     let source = crate::views::followed(lake, &open.table).await?;
@@ -93,7 +93,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     // The view's columns: the plain query's, planned and checked as `rerun::create` plans them.
     let plain = crate::routines::expand(lake, sql).await?;
     let planned = crate::sys::planned(&plain)?.into_owned();
-    let pctx = session(lake, &planned, "").await?;
+    let pctx = session_for(lake, &planned, "", None, scope).await?;
     let plan = crate::engine::sql(&pctx, &planned).await?.logical_plan().clone();
     let (columns, sql_types) = crate::rerun::table_columns(lake, sql, &pctx, &plan).await?;
 
@@ -411,7 +411,7 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     let input = input_of(&in_schema, &cols, &parts, &ids_in, &kid_in, &counts, &stamp(&time_type, w)?)?;
 
     // The matcher in open mode: the matches, and the markers that say what stays held.
-    let ictx = over_ctx(lake, &v.source, in_schema.clone(), input.clone(), &m.inner).await?;
+    let ictx = over_ctx(lake, &v.source, in_schema.clone(), input.clone(), &m.inner, &crate::auth::Principal::node().scope).await?;
     let inner = crate::engine::sql(&ictx, &m.inner).await?;
     let inner_schema: SchemaRef = Arc::new(inner.schema().as_arrow().clone());
     let out: Vec<RecordBatch> = inner.collect().await?;
@@ -914,7 +914,7 @@ mod tests {
         let refused = |o: Options, sql: &str| {
             let (lake, sql) = (lake.clone(), sql.to_string());
             async move {
-                let e = create(&lake, "dips", &sql, o).await.expect_err("a refusal");
+                let e = create(&lake, "dips", &sql, o, &crate::auth::Principal::node().scope).await.expect_err("a refusal");
                 assert_eq!(crate::codes::of(&e), "0A000", "{e}");
                 e.to_string()
             }
@@ -952,10 +952,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
         let lake = lake_with_ticks(&dir).await?;
         let by_minute = "SELECT date_trunc('minute', ts) AS m, count(*) AS n FROM ticks GROUP BY 1";
-        let e = crate::once::create(&lake, "per_min", by_minute, Options { lag_secs: Some(60), ..options() }).await.expect_err("a refusal");
+        let e = crate::once::create(&lake, "per_min", by_minute, Options { lag_secs: Some(60), ..options() }, &crate::auth::Principal::node().scope).await.expect_err("a refusal");
         assert_eq!(crate::codes::of(&e), "0A000", "{e}");
         assert!(e.to_string().contains("each group once"), "{e}");
-        let e = create(&lake, "dips", TICKER, Options { lag_secs: Some(60), ..options() }).await.expect_err("a refusal");
+        let e = create(&lake, "dips", TICKER, Options { lag_secs: Some(60), ..options() }, &crate::auth::Principal::node().scope).await.expect_err("a refusal");
         assert_eq!(crate::codes::of(&e), "0A000", "{e}");
         assert!(e.to_string().contains("each match once"), "{e}");
         lake.cat.close().await?;
@@ -968,9 +968,9 @@ mod tests {
         crate::auth::as_node(async move { // (the node's own work, as a leader's view is made: `auth::as_node`)
             let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
             let lake = lake_with_ticks(&dir).await?;
-            create(&lake, "dips", TICKER, options()).await?;
-            create(&lake, "dips", TICKER, options()).await?;
-            let e = create(&lake, "dips", TICKER, Options { lateness_secs: 60, ..options() }).await.expect_err("a refusal");
+            create(&lake, "dips", TICKER, options(), &crate::auth::Principal::node().scope).await?;
+            create(&lake, "dips", TICKER, options(), &crate::auth::Principal::node().scope).await?;
+            let e = create(&lake, "dips", TICKER, Options { lateness_secs: 60, ..options() }, &crate::auth::Principal::node().scope).await.expect_err("a refusal");
             assert!(e.to_string().contains("already exists, with other SQL or options"), "{e}");
             lake.cat.close().await?;
             let _ = std::fs::remove_dir_all(&dir);
@@ -984,7 +984,7 @@ mod tests {
         crate::auth::as_node(async move { // (the node's own work, as a leader's view is made: `auth::as_node`)
             let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
             let lake = lake_with_ticks(&dir).await?;
-            create(&lake, "dips", TICKER, options()).await?;
+            create(&lake, "dips", TICKER, options(), &crate::auth::Principal::node().scope).await?;
             let live: View = lake.cat.get(&crate::views::view_key("dips")).await?.context("the view")?;
             let m = live.matches.clone().context("a matches view")?;
             let gone = Matches { id: "gone".into(), ..m.clone() };
@@ -1014,7 +1014,7 @@ mod tests {
         crate::auth::as_node(async move { // (the node's own work, as a leader's view is made: `auth::as_node`)
             let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
             let lake = lake_with_ticks(&dir).await?;
-            create(&lake, "dips", TICKER, options()).await?;
+            create(&lake, "dips", TICKER, options(), &crate::auth::Principal::node().scope).await?;
             let view: View = lake.cat.get(&crate::views::view_key("dips")).await?.context("the view")?;
             let m = view.matches.as_ref().context("a matches view")?;
             assert_eq!((m.time.as_str(), m.part.as_slice(), m.within), ("ts", ["symbol".to_string()].as_slice(), false));
@@ -1033,7 +1033,7 @@ mod tests {
             assert_eq!(tables("dips"), ["dips$held", "dips$resume"].map(String::from));
 
             // No PARTITION BY: one key, held by a column that is always true.
-            create(&lake, "all", &TICKER.replace("PARTITION BY symbol ", ""), options()).await?;
+            create(&lake, "all", &TICKER.replace("PARTITION BY symbol ", ""), options(), &crate::auth::Principal::node().scope).await?;
             let resume: TableMeta = lake.cat.get(&table_key("all$resume")).await?.context("resume")?;
             assert_eq!(resume.key, ["__mr_all"]);
             assert_eq!(resume.columns().map(|(c, t)| format!("{c}:{t}")).collect::<Vec<_>>(), ["__mr_all:Boolean", "k:Int64", "m:Int64", "due:Int64", "_deleted:Boolean"]);
@@ -1049,7 +1049,7 @@ mod tests {
         crate::auth::as_node(async move { // (the node's own work, as a leader's view is made: `auth::as_node`)
             let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
             let lake = lake_with_ticks(&dir).await?;
-            create(&lake, "dips", TICKER, options()).await?;
+            create(&lake, "dips", TICKER, options(), &crate::auth::Principal::node().scope).await?;
             let not = crate::views::cannot_follow(&lake, "ticks", false).await?;
             assert!(not.iter().any(|w| w.contains("emits windows, sessions or matches once")), "{not:?}");
             lake.cat.close().await?;

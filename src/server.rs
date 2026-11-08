@@ -2,7 +2,7 @@
 //! writes (tables, views, tasks, bulk inserts, tiering) go to the leader (followers forward them).
 use crate::app::App;
 use crate::log::{decode_flush, Ack, Src};
-use crate::query::{latest_sql, raw, session, tail};
+use crate::query::{latest_sql, raw, tail};
 use crate::store::*;
 use crate::tasks::Task;
 use axum::body::{Body, Bytes};
@@ -906,12 +906,12 @@ struct InsertParams {
 /// Bulk `INSERT INTO name <body SQL>`: this node runs the query and writes the Parquet (no log);
 /// the leader records the files, together with `job` so a retried job is applied once. Creates
 /// the table if missing. With `staged=1` the body is the columns of a joined page's staged rows (`insert_staged`).
-async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, body: String) -> Result<Json<Value>, E> {
-    let start = std::time::Instant::now();
+async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, who: Option<axum::Extension<crate::auth::Principal>>, body: String) -> Result<Json<Value>, E> {
+    let (start, scope) = (std::time::Instant::now(), scope_of(who));
     let (out, unseen) = crate::rights::noting(async {
         match p.staged {
-            Some(1) => insert_staged(&app, &name, &p.job, &body).await,
-            _ => insert_rows(&app, &name, p, body).await,
+            Some(1) => insert_staged(&app, &name, &p.job, &body, &scope).await,
+            _ => insert_rows(&app, &name, p, body, &scope).await,
         }
     })
     .await;
@@ -919,7 +919,7 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
     out
 }
 
-async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> Result<Json<Value>, E> {
+async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String, scope: &crate::rights::Scope) -> Result<Json<Value>, E> {
     ensure!(!app.members.reader(), "read-only node");
     if app.lake.table_meta_if(name).await?.is_none() {
         let define = crate::rights::may_here(crate::rights::Action::Define, crate::rights::Object::Table(name)); // (making a table, as CREATE TABLE does)
@@ -934,10 +934,10 @@ async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> R
     let query = crate::routines::expand(&app.lake, &query).await?;
     // (a table that moved a column: the query's columns fill SQL's first ones, as an INSERT's do: `write::in_sql_order`)
     let query = match app.lake.table_meta_if(name).await? {
-        Some(m) if m.moved() => crate::write::whole_rows_of(&app.lake, name, &m, &crate::write::filled(&app.lake, &m, name, &query).await?, &query).await?,
+        Some(m) if m.moved() => crate::write::whole_rows_of(&app.lake, name, &m, &crate::write::filled(&app.lake, &m, name, &query, scope).await?, &query).await?,
         _ => query,
     };
-    let ctx = session(&app.lake, &query, "").await?;
+    let ctx = crate::query::session_for(&app.lake, &query, "", None, scope).await?;
     match crate::write::write_files(&app.lake, &ctx, &name, &query, &p.job, crate::write::stamp(&app.lake, &name, Some(&app.to())).await?).await? {
         Some(f) => Ok(Json(app.record_files(f).await?)),
         None => Ok(Json(j!({"duplicate": true}))),
@@ -951,7 +951,7 @@ async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> R
 /// staged files are deleted once the INSERT has answered, whatever the answer, or was stopped, so a resend finds none and is
 /// answered by the job. `files` is how many the page staged: the node takes the INSERT only when exactly those are there, so a
 /// file lost on the way (or swept: `tier::collect_orphans`) is a refusal, never a quiet loss of its rows.
-async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<Json<Value>, E> {
+async fn insert_staged(app: &App, name: &str, job: &str, body: &str, scope: &crate::rights::Scope) -> Result<Json<Value>, E> {
     #[derive(Deserialize)]
     struct Staged { columns: Vec<String>, files: u64, #[serde(default)] placed: Option<u64> }
     ensure!(!app.members.reader(), "read-only node");
@@ -984,7 +984,7 @@ async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<J
         (Some(p), Ok((None, table))) => Some((table, p)),
         _ => None,
     };
-    let out = crate::log::placed_as(placed, crate::write::on_node_as(app, stmt, Some(format!("staged:{slug}:{job}")), true)).await;
+    let out = crate::log::placed_as(placed, crate::write::on_node_as(app, stmt, Some(format!("staged:{slug}:{job}")), true, scope)).await;
     unstage.now().await; // (before the answer, so a resend of the same job stages afresh)
     Ok(Json(out?))
 }
@@ -1029,6 +1029,9 @@ async fn unstage(lake: &crate::store::Lake, dir: &str) {
     }
 }
 
+/// Whom a request plans for: the principal its guard signed in (`guard`), or nobody when none did (it sees nothing).
+fn scope_of(who: Option<axum::Extension<crate::auth::Principal>>) -> crate::rights::Scope { who.map_or_else(crate::rights::Scope::nothing, |w| w.0.scope) }
+
 /// Record an INSERT's files (from another node, or a `pondra sql` somewhere else).
 async fn files(State(app): State<App>, Json(f): Json<crate::write::Files>) -> Result<Json<Value>, E> {
     let meta = app.lake.cat.meta(&table_key(f.table())).await?;
@@ -1037,10 +1040,10 @@ async fn files(State(app): State<App>, Json(f): Json<crate::write::Files>) -> Re
 }
 
 /// Body: `{"source": "events", "target": "per_user", "sql": "SELECT … FROM events …"}`.
-async fn create_task(State(app): State<App>, Path(name): Path<String>, body: String) -> Result<Json<Value>, E> {
+async fn create_task(State(app): State<App>, Path(name): Path<String>, who: Option<axum::Extension<crate::auth::Principal>>, body: String) -> Result<Json<Value>, E> {
     let mut task: Task = serde_json::from_str(&body)?;
     task.sql = crate::routines::expand(&app.lake, &task.sql).await?;
-    crate::tasks::create(&app.lake, &name, &task).await?;
+    crate::tasks::create(&app.lake, &name, &task, &scope_of(who)).await?;
     Ok(Json(j!({"task": name})))
 }
 
@@ -1048,23 +1051,23 @@ async fn create_task(State(app): State<App>, Path(name): Path<String>, body: Str
 /// FROM events GROUP BY user`; `?window=w&size_secs=60&lateness_secs=10` also emits each
 /// window of column `w` once, final, to `{name}_final`; `?session=ts&gap_secs=30&lateness_secs=5`
 /// makes it a session view (`views.rs`): `CREATE MATERIALIZED VIEW … WITH (…)` in SQL.
-async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(options): Query<std::collections::BTreeMap<String, String>>, sql: String) -> Result<Json<Value>, E> {
+async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(options): Query<std::collections::BTreeMap<String, String>>, who: Option<axum::Extension<crate::auth::Principal>>, sql: String) -> Result<Json<Value>, E> {
     let (text, sql) = (Some(sql.clone()), crate::routines::expand(&app.lake, &sql).await?); // (as they are now: ADR-023; as written, if it reads so: `authored.rs`)
     let d = crate::ddl::Ddl::CreateMaterialized { name, sql, options, text };
     let out = {
         let _guard = app.lock.lock().await;
-        crate::ddl::apply(&app.lake, d.clone()).await?
+        crate::ddl::apply(&app.lake, d.clone(), &scope_of(who)).await?
     };
     app.settle(&d).await?; // (once it's filled from the rows already there)
     Ok(Json(out))
 }
 
 /// An UPDATE, DELETE or MERGE a follower's SQL asked for (`change.rs`): `[sql, job]`.
-async fn change(State(app): State<App>, Json((sql, job, sent)): Json<(String, String, crate::change::Sent)>) -> Result<Json<Value>, E> {
+async fn change(State(app): State<App>, who: Option<axum::Extension<crate::auth::Principal>>, Json((sql, job, sent)): Json<(String, String, crate::change::Sent)>) -> Result<Json<Value>, E> {
     let seq = app.seq.as_ref().ok_or_else(|| anyhow::anyhow!("not the leader"))?;
     let _guard = app.lock.lock().await;
     let sent = Arc::new(crate::change::unpack(&sent)?); // (what it reads that this node can't: `change::for_leader`)
-    Ok(Json(crate::query::SENT.scope(sent, crate::change::run(&app.lake, seq, &sql, &job)).await?))
+    Ok(Json(crate::query::SENT.scope(sent, crate::change::run(&app.lake, seq, &sql, &job, &scope_of(who))).await?))
 }
 
 /// Whether a request is the cluster's own (the nodes' key, an operator's token, or none on an open
@@ -1080,8 +1083,9 @@ fn cluster_call(app: &App, headers: &HeaderMap) -> bool {
 
 /// A `CREATE`/`DROP` of a schema, view or table that a follower's SQL asked for (`ddl.rs`), and a
 /// branch's pin (ADR-058). A follower sends it to the leader, asked with the caller's own token.
-async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Extension<crate::auth::Role>>, Json(mut d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
+async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Extension<crate::auth::Role>>, who: Option<axum::Extension<crate::auth::Principal>>, Json(mut d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
     crate::backup::sent(&d)?;
+    let scope = &scope_of(who);
     let credential = crate::auth::Credential::of_headers(&headers);
     let key = credential.token().filter(|k| k.starts_with("pb_"));
     if let Some(key) = key {
@@ -1094,11 +1098,11 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
     }
     crate::protect::stamp(&mut d); // (who lifts a protection, when the statement doesn't say)
     let out = match &app.seq {
-        Some(seq) => crate::write::ddl_here(&app.lake, seq, &app.lock, d.clone()).await?,
+        Some(seq) => crate::write::ddl_here(&app.lake, seq, &app.lock, d.clone(), scope).await?,
         None if !app.members.is_leader() => Box::pin(crate::write::send_as(&app.lake.url, crate::write::Request::Ddl(d.clone()), credential.token(), &app.lake.node)).await?, // (the leader makes it)
         None => {
             let _guard = app.lock.lock().await;
-            crate::ddl::apply(&app.lake, d.clone()).await?
+            crate::ddl::apply(&app.lake, d.clone(), scope).await?
         }
     };
     app.settle(&d).await?; // (ATTACH, CREATE DATABASE: the leader too at once, not in a second)

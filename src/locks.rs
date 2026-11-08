@@ -603,7 +603,8 @@ pub type Place = (String, Option<String>, String);
 /// settings it was asked with. `txn`: a transaction's (its COMMIT or ROLLBACK lets the locks go); else an autocommitted
 /// write's, which registers as appending to its table once its keys are its own. `locking`: the write takes row locks at
 /// all. `committed`: READ COMMITTED, where a moved row is read again rather than refused. `wait`: `lock_timeout` (None: as
-/// long as it takes). `taken`: the owner has asked for locks, so their release is due when its statement ends.
+/// long as it takes). `taken`: the owner has asked for locks, so their release is due when its statement ends. `scope`:
+/// whom the write's rows are worked out for (its statement's asker).
 pub struct Locks<'a> {
     pub app: &'a crate::app::App,
     pub name: &'a str,
@@ -614,6 +615,7 @@ pub struct Locks<'a> {
     pub committed: bool,
     pub wait: Option<Duration>,
     pub taken: &'a AtomicBool,
+    pub scope: &'a crate::rights::Scope,
 }
 
 impl Locks<'_> {
