@@ -53,7 +53,10 @@ pub enum Kind {
 /// Where a value holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Scope {
-    /// The process's: what it was given, else its environment.
+    /// The process's: what its first open was given, else its environment, for what a process has one of (its memory
+    /// root and watch, its runtime): every node in the process reads the same value.
+    Process,
+    /// A node's: what it was given, else its process's, read once as it starts (`Values`).
     Node,
     /// A session's: `SET`.
     Session,
@@ -142,6 +145,9 @@ impl Setting {
         Setting { flag: Some(Flag { help, after, shows: None }), ..self }
     }
 
+    /// The same setting, read by what the process has one of (`Scope::Process`): every node in it takes the same value.
+    pub const fn process(self) -> Setting { Setting { scope: Scope::Process, ..self } }
+
     /// Its flag's help shows this default.
     pub const fn shows(self, default: &'static str) -> Setting {
         match self.flag {
@@ -181,7 +187,7 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_ALLOW_UNSIGNED_EXTENSIONS", Bool, No),
     node("PONDRA_AUDIT", List, Is("role,ddl,function")),
     node("PONDRA_AUDIT_DAYS", Days, Is("90")),
-    node("PONDRA_BLOCKING_THREADS", Int, Of(blocking_threads)),
+    node("PONDRA_BLOCKING_THREADS", Int, Of(blocking_threads)).process(), // (the runtime's: `panics::runtime`)
     node("PONDRA_BROADCAST_MB", Mb, Is("64")),
     node("PONDRA_BUCKET_REQUESTS", Int, Is("256")),
     node("PONDRA_CACHE_DIR", Path, No).flag("backlog", "Lakes on object storage: where this node keeps its local SSD copy of recent \
@@ -239,7 +245,7 @@ pub const CORE: &[Setting] = &[
         PONDRA_MEMORY_GB; default: 72% of the machine's, the caches giving way to queries), except a cache given its own budget (PONDRA_HOT_GB, \
         PONDRA_CACHE_MB, PONDRA_PAGES_MB, PONDRA_FILES_CACHE_MB, PONDRA_FUNCTION_CACHE_MB). A query that needs more takes it from the caches, then sorts, joins and aggregations spill."),
     node("PONDRA_MEMORY_LAKE_GB", Gb, No),
-    node("PONDRA_MEMORY_MAX_GB", Gb, No),
+    node("PONDRA_MEMORY_MAX_GB", Gb, No).process(), // (the process's line: its memory root and its watch, `ledger::Root`, `oom`)
     node("PONDRA_PAGES_MB", Mb, Is("256")),
     node("PONDRA_PIN_LEASE_SECS", Secs, Is("1209600")),
     node("PONDRA_PIN_RENEW_SECS", Secs, Is("3600")),
@@ -375,6 +381,37 @@ fn rows(r: &crate::registry::Registry) -> Vec<serde_json::Value> {
     })).collect()
 }
 
+/// A node's settings (`Scope::Node`), read once as it starts (`Values::now`), so one set in the process's environment
+/// later never reaches a node that started without it. A reader with the node at hand reads its own here (`node.settings`);
+/// `env.rs` reads the process's, for a reader with none.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Values(std::collections::BTreeMap<&'static str, String>);
+
+impl Values {
+    /// The process's now: what it was given, else its environment (`env::get`), for every node setting of this build that a
+    /// node reads (not the command line's own).
+    pub fn now() -> Values {
+        let read = |s: &&'static Setting| s.scope == Scope::Node && s.who != Who::Command;
+        Values(all().iter().filter(read).filter_map(|s| crate::env::get(s.var).map(|v| (s.var, v))).collect())
+    }
+
+    /// A setting of the node's, or None when it isn't set (an empty value is none).
+    pub fn get(&self, var: &str) -> Option<&str> {
+        debug_assert!(find(var).is_some_and(|s| s.scope == Scope::Node), "{var} isn't a node's setting in settings.rs");
+        self.0.get(var).map(String::as_str)
+    }
+
+    /// A switch: on for `1`, `true`, `on` or `yes`, as `env::flag` reads one.
+    pub fn flag(&self, var: &str) -> bool { self.get(var).is_some_and(|v| ["1", "true", "on", "yes"].contains(&v.trim().to_ascii_lowercase().as_str())) }
+
+    /// Is it set at all? For the debug switches and test hooks, which any value turns on (`env::is_set`).
+    pub fn is_set(&self, var: &str) -> bool { self.get(var).is_some() }
+
+    /// These values, for a test's node.
+    #[cfg(test)]
+    pub(crate) fn of(values: &[(&'static str, &str)]) -> Values { Values(values.iter().map(|(k, v)| (*k, v.to_string())).collect()) }
+}
+
 /// Every setting of this build, in the order its extensions added them.
 pub fn all() -> &'static [Setting] {
     &crate::registry::get().section::<Settings>().all
@@ -389,6 +426,28 @@ pub fn find(var: &str) -> Option<&'static Setting> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node's values are its node settings only: never the command line's, nor one the process has one of (its
+    /// memory line, its runtime's threads), which every node in a process shares.
+    #[test]
+    fn a_nodes_values_are_its_node_settings_alone() {
+        for var in Values::now().0.keys() {
+            let s = find(var).expect("a value of the table's");
+            assert!(s.scope == Scope::Node && s.who != Who::Command, "{var} isn't a node's to read");
+        }
+        for var in ["PONDRA_MEMORY_MAX_GB", "PONDRA_BLOCKING_THREADS"] {
+            assert_eq!(find(var).map(|s| s.scope), Some(Scope::Process), "{var} is the process's");
+        }
+    }
+
+    /// A node reads the values it started with, not its process's: two nodes in one process can differ.
+    #[test]
+    fn a_node_reads_the_values_it_started_with() {
+        let on = crate::node_state::NodeState::starting(crate::lifecycle::unhosted(), Values::of(&[("PONDRA_SERVE_STORE", "yes")]));
+        let off = crate::node_state::NodeState::starting(crate::lifecycle::unhosted(), Values::of(&[("PONDRA_SERVE_STORE", "0")]));
+        assert!(on.settings.flag("PONDRA_SERVE_STORE") && !off.settings.flag("PONDRA_SERVE_STORE"));
+        assert!(off.settings.is_set("PONDRA_SERVE_STORE") && !Values::default().is_set("PONDRA_SERVE_STORE"));
+    }
 
     #[test]
     fn each_once() {
@@ -434,7 +493,7 @@ mod tests {
                 Text | List | Url => !v.is_empty(),
             };
             assert!(ok, "{}'s default {v:?} isn't a {:?}", s.var, s.kind);
-            assert_eq!((s.scope, s.change), (Scope::Node, Change::Start), "{}: every node setting is fixed at its start, until step 2", s.var);
+            assert!(matches!((s.scope, s.change), (Scope::Node | Scope::Process, Change::Start)), "{}: every node setting is fixed at its start, until step 2", s.var);
         }
     }
 }

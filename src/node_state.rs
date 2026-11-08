@@ -18,6 +18,11 @@ pub struct NodeState {
     /// The clients its calls out are made with, by whom each goes to: its process's host's (`net::install`), or its own.
     #[cfg(feature = "lake")]
     pub net: std::sync::Arc<dyn crate::net::Net>,
+    /// The space it spills into past its memory: its process's host's (`scratch::install`), or this machine's folders.
+    #[cfg(feature = "lake")]
+    pub scratch: std::sync::Arc<dyn crate::scratch::Scratch>,
+    /// Its settings, read once as it started (`settings::Values`).
+    pub settings: crate::settings::Values,
     /// What its drain refuses and waits for (`drain.rs`).
     pub drain: Drain,
     /// What counts as a use of it, for `--idle-exit` (`idle.rs`).
@@ -30,12 +35,18 @@ pub struct NodeState {
 }
 
 impl NodeState {
-    /// A node's state, before its doors open: not draining, nothing in flight, on its process's machine.
-    pub fn new(life: Life) -> Arc<NodeState> { NodeState::on(life, crate::machine::installed()) }
+    /// A node's state, before its doors open: not draining, nothing in flight, on its process's machine, with its process's
+    /// settings as they are now.
+    pub fn new(life: Life) -> Arc<NodeState> { NodeState::starting(life, crate::settings::Values::now()) }
+
+    /// A node's state with the settings it starts with (`node::Options::settings`).
+    pub fn starting(life: Life, settings: crate::settings::Values) -> Arc<NodeState> { NodeState::make(life, crate::machine::installed(), settings) }
 
     /// A node's state on a machine of its own (the sim's member: one with little memory, say).
-    pub fn on(life: Life, machine: crate::machine::Mach) -> Arc<NodeState> {
-        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), began: datafusion::common::instant::Instant::now() })
+    pub fn on(life: Life, machine: crate::machine::Mach) -> Arc<NodeState> { NodeState::make(life, machine, crate::settings::Values::now()) }
+
+    fn make(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values) -> Arc<NodeState> {
+        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, drain: Drain::default(), idle: Idle::default(), line: Default::default(), began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).
@@ -44,7 +55,7 @@ impl NodeState {
     /// A cold start's step and its time since this node's start began, with `PONDRA_TRACE_START` (`tools/cold_trace.sh`,
     /// C5). The catalog's open times its own steps (`store::trace_since`).
     pub fn trace(&self, what: &str) {
-        if crate::env::is_set("PONDRA_TRACE_START") {
+        if self.settings.is_set("PONDRA_TRACE_START") {
             eprintln!("start: {what} {:.2} s", self.began.elapsed().as_secs_f64());
         }
     }
