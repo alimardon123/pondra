@@ -62,6 +62,7 @@ PROCESS = {
     "defaults.rs:BASE": "the functions every session has, with no tables, for CHECK, DEFAULT and expectation expressions: nothing of a lake (what registers one gets a copy)",
     "dbserver.rs:KEY": "the key a lakes server gives its databases' nodes (`client_key`): one a process, made once",
     "delta.rs:ONE": LOCK,
+    "ledger.rs:ROOTS": "the process's memory, every node's budget held on it (redesign step 2, review change 4): one root for the sizes its machine and settings gave, so one in any process but a test's",
     "library.rs:R": "a library's runtime, kept for the next open: its threads are the process's, as the queries' runtime's are",
     "env.rs:GIVEN": "what the process was given (open's options, the command line's flags): fixed by its first open (ADR-061 §8)",
     "ext.rs:WEB": "a page's store of a web origin, the browser's fetch (`web_with`): set once a module, as its allocator is",
