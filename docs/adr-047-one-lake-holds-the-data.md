@@ -157,7 +157,7 @@ prod, deploy 41 (git 3f2a9c1) → git 8e01d77
   ↻ flow       gold.revenue             built beside the old one from 1.2 B rows, then swapped in
   ↻ follows    gold.revenue_by_region   built with it (reads gold.revenue)
   ▶ migration  2026-10-03-backfill-channel.sql   runs once
-  ! table      sales.legacy             no longer in the project: kept (--prune drops it, UNDROP for a day)
+  ! table      sales.legacy             no longer in the project: kept (--prune drops it, UNDROP for 7 days)
   ✓ tests      12 queries, 3 expectations
 ```
 

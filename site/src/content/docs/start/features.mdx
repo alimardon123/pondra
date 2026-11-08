@@ -802,7 +802,7 @@ SELECT count(*) AS n FROM ledger;
 
 ### Drop and undrop a table
 
-`DROP TABLE` keeps the table for a day, or for its `retention`, so `UNDROP TABLE` brings it back with every row and version. [A table's past](/pondra/guides/past/#bring-back-a-dropped-table)
+`DROP TABLE` keeps the table for 7 days, or for its `retention`, so `UNDROP TABLE` brings it back with every row and version. [A table's past](/pondra/guides/past/#bring-back-a-dropped-table)
 
 ```sql
 ALTER TABLE ledger SET (retention = '2 hours');
