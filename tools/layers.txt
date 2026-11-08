@@ -101,6 +101,7 @@ friendly engine
 front engine
 frugal engine
 fsum engine
+fvar engine
 guard engine
 held engine
 history engine

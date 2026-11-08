@@ -159,6 +159,7 @@ fn own(mut ctx: SessionContext) -> SessionContext {
     ctx.register_udf(JSON_TEXT.as_ref().clone()); // pondra_json_text(x): a union (json_get's answer) as its text
     crate::asof::register(&ctx); // (ASOF JOIN's marker)
     crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
+    crate::fvar::register(&ctx); // var, stddev (and avg, below) over DOUBLE: the same answer in any order
     crate::avg::register(&ctx); // avg(DECIMAL): rounded at its last place
     crate::string_agg::register(&ctx); // string_agg: one group's string held to a share of the query memory
     crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
