@@ -338,6 +338,10 @@ pub struct Attached {
     pub url: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub options: BTreeMap<String, String>,
+    /// The connection it was attached over (`ATTACH shop`), whose url and options it reads as they are now: kept beside them,
+    /// which are what they were when it was attached (a node of a build before connections reads those).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
 }
 
 /// The table of files a name of an attached catalog is (None: not one of theirs).

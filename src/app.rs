@@ -24,6 +24,7 @@ pub struct App {
     pub results: Arc<Results>,       // recent query results (see `Results`)
     pub replica: Option<Arc<crate::replica::ReplicaLog>>, // what this follower holds for the leader
     pub auth: Arc<crate::auth::Auth>,
+    pub tables: Arc<tokio::sync::Mutex<crate::tier::Tables>>, // what this node knows of each table: for the leader's tiering rounds and /metrics (`tier::refresh`)
 }
 
 /// Recent query results. By default a result is reused only at exactly the catalog version it
@@ -189,7 +190,7 @@ impl App {
     /// the session's own: the other nodes read it with no session, as its reader's path says. And
     /// so do a session's queries while it holds temporary secrets, which only this node has.
     pub async fn here_only(&self, query: &str) -> bool {
-        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::called(query).is_some() || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::set::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || crate::auth::limited().is_some()
+        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::called(query).is_some() || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::set::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || !crate::rights::scope().whole()
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await)
     }
 
@@ -311,28 +312,40 @@ impl App {
         }
     }
 
+    /// The count of the lake's tables and their lines of `/metrics` (`metrics::render`, `tier::metric_lines`), from what
+    /// this node knows of each, brought up to date first (`tier::refresh`): a scrape reads what changed since the last.
+    pub async fn table_lines(&self, per_table: bool) -> anyhow::Result<(usize, [Vec<(String, f64)>; 4])> {
+        crate::tier::refresh(&self.lake, &self.tables).await?;
+        let tables = self.tables.lock().await;
+        Ok((tables.len(), crate::tier::metric_lines(&tables, per_table)))
+    }
+
     /// Tier the tables with at least `min_rows` rows in the log (0: all of them), publish them
     /// for other engines, then expire what everything has consumed (leader).
     pub async fn tier_all(&self, min_rows: u64) -> anyhow::Result<u64> {
         if crate::backup::frozen(&self.lake) {
             return crate::backup::tend(&self.lake).await.map(|_| 0); // (its tables never change: only its clones' pins are kept)
         }
+        crate::tier::refresh(&self.lake, &self.tables).await?; // (what changed since the last round, before the lock: `tier::refresh`)
         let _guard = self.lock.lock().await;
         let _tiering = self.seq.as_ref().map(|s| s.tiering()); // (writers paused by backpressure stay paused: `log::Pace`)
         let start = datafusion::common::instant::Instant::now();
         let hwm = *self.lake.hwm.borrow();
-        let tables = self.lake.cat.scan::<TableMeta>("t/", "t0").await?;
-        let backlog = crate::tier::backlog(&self.lake, tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(hwm), None).await?;
+        let from = self.tables.lock().await.values().map(|b| b.tiered).min().unwrap_or(hwm);
+        let backlog = crate::tier::backlog(&self.lake, from, None).await?;
         let nodes = if self.members.nodes().is_empty() { vec![self.members.me().to_string()] } else { self.members.nodes() };
-        // Up to 4 tables at once: on object storage each round is a few storage round trips, so
-        // tables side by side finish in the time of one (memory stays bounded: ≤4M rows a job).
-        let busy: Vec<String> = tables.iter().map(|(k, _)| k[2..].to_string()).filter(|t| backlog.get(t).copied().unwrap_or(0) >= min_rows).collect();
-        // Tables with files to merge or seal, busy or not (bulk INSERTs don't go through the log).
-        let heavy = |m: &TableMeta| m.files.iter().any(|f| f.deleted > 0 && f.deleted * 10 >= f.rows); // (`tier::maintain` rewrites them)
-        let untidy = tables.iter().filter(|(k, m)| (m.files.len() >= 8 || heavy(m)) && !busy.contains(&k[2..].to_string())).map(|(k, _)| k[2..].to_string());
-        let untidy: Vec<String> = busy.iter().cloned().chain(untidy).collect();
-        // (tables whose changed rows may wait in files: `tier::purge` says whether it's time)
-        let changed: Vec<String> = tables.iter().filter(|(_, m)| m.changed && m.purged() < m.tiered).map(|(k, _)| k[2..].to_string()).collect();
+        let (busy, untidy, changed) = {
+            let tables = self.tables.lock().await;
+            // Up to 4 tables at once: on object storage each round is a few storage round trips, so
+            // tables side by side finish in the time of one (memory stays bounded: ≤4M rows a job).
+            let busy: Vec<String> = backlog.iter().filter(|(t, rows)| **rows >= min_rows && tables.contains_key(*t)).map(|(t, _)| t.clone()).collect();
+            // Tables with files to merge or seal, busy or not (bulk INSERTs don't go through the log).
+            let untidy = tables.iter().filter(|(t, b)| b.untidy && !busy.contains(*t)).map(|(t, _)| t.clone());
+            let untidy: Vec<String> = busy.iter().cloned().chain(untidy).collect();
+            // (tables whose changed rows may wait in files: `tier::purge` says whether it's time)
+            let changed: Vec<String> = tables.iter().filter(|(_, b)| b.changed).map(|(t, _)| t.clone()).collect();
+            (busy, untidy, changed)
+        };
         if untidy.is_empty() && changed.is_empty() {
             return Ok(0); // (the pressure check, most of the time: don't hold the lock for nothing)
         }
@@ -505,8 +518,7 @@ pub(crate) enum Kept<T> {
 impl App {
     /// The version an answer to `query` is remembered under (`Results`), as HTTP and the Postgres port
     /// remember them: same query, same catalog version, same answer. None when it may answer otherwise
-    /// next time, or for a user granted some tables (planned as it may read them, never answered from
-    /// what another read, nor kept: its grants may change).
+    /// next time. A user granted some tables has its answers kept under what it may read (`Scope::key`).
     pub(crate) async fn remembers(&self, query: &str) -> Option<u64> {
         let asks = |text: &str| {
             // (AT (OFFSET => -n) is n seconds before now: a moment that moves. Expanded, a table as it was
@@ -516,7 +528,7 @@ impl App {
             let q = text.to_lowercase();
             (q.contains("offset") && OFFSET.is_match(text)) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "session_user", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.flows", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since; a view's failing runs, `pondra.flows`' `error`, commit nothing)
         };
-        let volatile = crate::auth::limited().is_some() || asks(query) || crate::pg_catalog::asked(query) // (Postgres's catalog: another answer to the same text)
+        let volatile = asks(query) || crate::pg_catalog::asked(query) // (Postgres's catalog: another answer to the same text)
             || crate::temp::mentioned(query) || crate::temp::called(query).is_some() // (the session's temporary tables change without a commit, and its functions are its own)
             || crate::set::any() // (and its settings may change the answer)
             || crate::routines::with_views(&self.lake, query).await.map_or(true, |t| t.len() > query.len() && asks(&t)) // (and so may a view it reads: `now()`, files)

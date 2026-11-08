@@ -6,6 +6,7 @@
 //! own calls, a model's API) asks the process's (`process`). A request sets its own time limit (`timeout`): a
 //! client has none.
 use anyhow::{Result, ensure};
+use object_store::client::{ClientOptions, HttpClient, HttpConnector};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, OnceLock};
 
@@ -37,6 +38,64 @@ impl Policy {
 pub trait Net: Send + Sync {
     /// The client for `policy`: pooled, one per policy per node.
     fn client(&self, policy: Policy) -> reqwest::Client;
+
+    /// object_store's HTTP connector for a store reached by `policy`, `headers` sent with every request (an http secret's
+    /// bearer token): a store a reader's own temporary secret makes is `Public`'s, any other the admin's (`Endpoint`).
+    /// A lake's own bucket has the lake's budget instead (`budget::Budget`).
+    fn connector(&self, policy: Policy, headers: reqwest::header::HeaderMap) -> StoreConnector { StoreConnector(Arc::new(Connector { policy, headers })) }
+}
+
+/// A store's connector from a `Net` (`Net::connector`), as object_store's builders take one.
+#[derive(Clone, Debug)]
+pub struct StoreConnector(pub Arc<dyn HttpConnector>);
+
+impl HttpConnector for StoreConnector {
+    fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> { self.0.connect(options) }
+}
+
+/// A store's HTTP client for its policy (`Net::connector`). `Public`'s is made as object_store makes its own
+/// (`ClientOptions::client`) for what a temporary secret can set, with names resolved and redirects checked as that
+/// policy's are (`guarded`) and never a proxy: whoever makes one names any URL and any endpoint with it, and without
+/// this the node would fetch for them what only it can reach (the cloud's metadata address, its own network and ports).
+/// Any other policy's is object_store's own, from the store's options: the environment's proxy and the system's
+/// certificates, as `Endpoint`'s are (no store is this machine's or the nodes'). On a page `Public`'s is the page's
+/// fetch, which resolves names and follows redirects itself, under CORS.
+#[derive(Debug)]
+pub struct Connector {
+    policy: Policy,
+    headers: reqwest::header::HeaderMap,
+}
+
+impl HttpConnector for Connector {
+    fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
+        if self.policy != Policy::Public {
+            return object_store::client::ReqwestConnector::default().connect(options);
+        }
+        let client = self.public(options).map_err(|e| object_store::Error::Generic { store: "outside", source: Box::new(e) })?;
+        Ok(HttpClient::new(client))
+    }
+}
+
+impl Connector {
+    /// `Public`'s store client (`connect`), plain HTTP too where the store's options allow it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn public(&self, options: &ClientOptions) -> reqwest::Result<reqwest::Client> {
+        let http = options.get_config_value(&object_store::client::ClientConfigKey::AllowHttp).as_deref() == Some("true");
+        guarded(reqwest::Client::builder())
+            .user_agent(concat!("pondra/", env!("CARGO_PKG_VERSION")))
+            .default_headers(self.headers.clone())
+            .connect_timeout(std::time::Duration::from_secs(5)) // (object_store's own defaults)
+            .timeout(std::time::Duration::from_secs(30))
+            .http1_only()
+            .no_gzip().no_brotli().no_zstd().no_deflate() // (sizes are read from Content-Length)
+            .https_only(!http)
+            .build()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn public(&self, _: &ClientOptions) -> reqwest::Result<reqwest::Client> {
+        reqwest::Client::builder().user_agent(concat!("pondra/", env!("CARGO_PKG_VERSION"))).default_headers(self.headers.clone()).build()
+    }
 }
 
 /// The policy a URL a statement names gets (review change 7): `Endpoint` for an asker who may reach inside the node's
@@ -171,7 +230,7 @@ pub fn check(url: &url::Url) -> Result<()> {
 
 /// What makes a client reach only the public internet: names checked as they resolve (`Names`), each redirect checked
 /// (`redirects`), and never a proxy, which would resolve the names itself, past `Names`' check (audit 10-30 M8). The
-/// `Public` policy's client is made with it, and so is a store's that a reader's temporary secret reaches (`public.rs`).
+/// `Public` policy's client is made with it, and so is a store's that a reader's temporary secret reaches (`Connector`).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn guarded(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     b.dns_resolver(Names).redirect(redirects()).no_proxy()
@@ -264,6 +323,19 @@ pub(crate) fn reaches_no_proxy(test: &str, asks: impl FnOnce()) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store a reader's temporary secret makes never goes through a proxy the environment names, which would resolve
+    /// the names itself, past the `Public` policy's resolver (audit 10-30 M8); an admin's store is object_store's own.
+    #[test]
+    fn a_temporary_secrets_store_goes_through_no_proxy() {
+        reaches_no_proxy("net::tests::a_temporary_secrets_store_goes_through_no_proxy", || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let store = Connector { policy: Policy::Public, headers: Default::default() };
+            let asked = runtime.block_on(async { store.public(&ClientOptions::new().with_allow_http(true)).unwrap().get("http://nothing.invalid/x.csv").send().await });
+            assert!(asked.is_err(), "nothing.invalid doesn't resolve");
+        });
+        assert!(Clients::new().connector(Policy::ENDPOINT, Default::default()).connect(&ClientOptions::new()).is_ok(), "an admin's store: object_store's own client");
+    }
 
     #[test]
     fn only_the_public_internet() {

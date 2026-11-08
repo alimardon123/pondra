@@ -536,7 +536,7 @@ pub async fn ask(packages: &str, kind: Use, head: Value, parts: Vec<Vec<u8>>, li
         Ok(a) => {
             lent.give();
             match a.0.get("error").and_then(Value::as_str) {
-                Some(e) if crate::auth::shows_code() => Err(raised(e.to_string())),
+                Some(e) if crate::rights::scope().shows_code() => Err(raised(e.to_string())),
                 Some(e) => Err(raised(crate::codes::unquoted(e))), // (S27: a caller not shown the routine's code isn't shown its lines in an error)
                 None => Ok(a),
             }

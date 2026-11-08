@@ -531,7 +531,7 @@ tokio::task_local! {
 
 /// Run `go` with its errors quoting none of the code they come from: a statement is named by its
 /// number (and line, in a block), a condition or a query as `…`. A stored procedure called by a user who isn't shown
-/// its code (`auth::shows_code`) runs so, or a failed call would show that user what listings hide.
+/// its code (`rights::Scope::shows_code`) runs so, or a failed call would show that user what listings hide.
 pub async fn unshown<T>(go: impl std::future::Future<Output = T>) -> T { UNSHOWN.scope((), go).await }
 
 fn quoted() -> bool { UNSHOWN.try_with(|_| ()).is_err() }

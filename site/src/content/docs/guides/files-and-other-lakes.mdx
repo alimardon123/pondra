@@ -198,7 +198,7 @@ SELECT * FROM secrets();
 ```
 
 `CREATE SECRET` takes `TYPE s3` (or `r2`), `gcs`, `azure`, `http` (a bearer token), `iceberg` (a REST
-catalog), `kafka` or `generic`. A secret's `SCOPE` is the URL prefix it covers, and a URL uses the secret
+catalog), `kafka` or `generic`. An `s3` secret's `KMS_KEY_ID` encrypts what is written to the bucket with that KMS key ([Security](/pondra/guides/security/#tls)). A secret's `SCOPE` is the URL prefix it covers, and a URL uses the secret
 with the longest matching scope. A URL no secret covers is refused, except to the program that started
 the node (the shell, or a lake's `connect()`), which reads it with the node's own environment (`AWS_*`, Google's and
 Azure's). Secrets are kept in the lake encrypted, with a key only the nodes hold (`PONDRA_SECRET_KEY`, or

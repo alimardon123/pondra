@@ -210,12 +210,12 @@ async fn request(app: &App, me: &Broker, who: &mut crate::auth::Principal, said:
     let done = |body: Vec<u8>| -> Reply { async move { Some(frame(corr, body)) }.boxed() };
     Ok(match key {
         API_VERSIONS => done(api_versions(if supported { ver } else { 0 }, supported)),
-        METADATA => done(metadata(app, me, ver, &mut r).await?),
+        METADATA => done(metadata(app, me, ver, &mut r, who).await?),
         SASL_HANDSHAKE => done(sasl_handshake(&mut r)?),
         SASL_AUTHENTICATE => done(sasl_authenticate(app, who, said, peer, ver, &mut r).await?),
         INIT_PRODUCER_ID => done(init_producer_id(&mut r)?),
         PRODUCE => produce(app, who, ver, &mut r).await?.map(move |body| body.map(|b| frame(corr, b))).boxed(),
-        LIST_OFFSETS => done(list_offsets(app, ver, &mut r).await?),
+        LIST_OFFSETS => done(list_offsets(app, ver, &mut r, who).await?),
         FIND_COORDINATOR => done(find_coordinator(app, me, ver, &mut r).await?),
         JOIN_GROUP => join_group(app, ver, &mut r).await?.map(move |b| Some(frame(corr, b))).boxed(),
         SYNC_GROUP => sync_group(app, ver, &mut r).await?.map(move |b| Some(frame(corr, b))).boxed(),
@@ -269,7 +269,8 @@ fn api_versions(ver: i16, supported: bool) -> Vec<u8> {
 /// signed-in request of 126 MB made a node of 3.7 GB, and each name was looked for through every table: security pass 2.)
 const ASKED: i32 = 10_000;
 
-async fn metadata(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
+/// The topics `who` knows of are the tables it holds a privilege on (`rights::Scope::knows`): another is no topic, for it.
+async fn metadata(app: &App, me: &Broker, ver: i16, r: &mut Rd, who: &crate::auth::Principal) -> Result<Vec<u8>> {
     let asked: Option<Vec<String>> = match r.i32()? {
         -1 => None, // all topics
         n => {
@@ -277,7 +278,7 @@ async fn metadata(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Result<Vec<u8
             Some((0..n).map(|_| r.str()).collect::<Result<_>>()?)
         }
     };
-    let tables: std::collections::BTreeSet<String> = app.lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(k, _)| k[2..].to_string()).filter(|t| !crate::sys::hidden(t)).collect();
+    let tables: std::collections::BTreeSet<String> = app.lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(k, _)| k[2..].to_string()).filter(|t| !crate::sys::hidden(t) && who.scope.knows(t)).collect();
     let topics: Vec<(String, bool)> = match asked {
         None => tables.into_iter().map(|t| (t, true)).collect(),
         Some(names) => names.into_iter().map(|n| (n.clone(), tables.contains(&n))).collect(),
@@ -441,7 +442,7 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
         let name = r.str()?;
         let meta = app.lake.cat.meta(&table_key(&name)).await?; // (the stored entry: its JSON fields are SQL's names too, ADR-022)
         let rules = meta.as_ref().map(|m| m.rules());
-        let not_yours = format!("this {} may not write {name}", if who.access.is_some() { "user" } else { "token" });
+        let not_yours = format!("this {} may not write {name}", if who.scope.whole() { "token" } else { "user" });
         let may = crate::writer::may(Some(who), &crate::auth::catalog_name(&name), None, false).map_err(|e| e.to_string()); // (the row doors' one check)
         let mut parts = vec![];
         for _ in 0..r.len()? {
@@ -451,7 +452,10 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
             let outcome = match (&meta, &rules, index) {
                 _ if may.is_err() => {
                     load.end(may.clone().err());
-                    ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(not_yours.clone())))
+                    match who.scope.knows(&crate::auth::catalog_name(&name)) {
+                        true => ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(not_yours.clone()))),
+                        false => ready((UNKNOWN_TOPIC, -1, None)), // (one it doesn't know of: as one that isn't there, `metadata`)
+                    }
                 }
                 (Some(meta), Some(Ok(rules)), 0) => queue(app, who, &name, meta, rules, &records).await,
                 (Some(_), Some(Err(e)), 0) => {
@@ -726,7 +730,7 @@ fn row<'a>(t: &crate::rules::Table, key: Option<&'a [u8]>, value: Option<&'a [u8
         }
         v
     };
-    let numbers = |v: &Value| v.as_object().is_some_and(|o| o.values().any(Value::is_number));
+    let numbers = |v: &Value| v.is_object() && has_number(v);
     let mut path = vec![];
     let mut v = unwrap(match value.filter(|v| !v.is_empty()) {
         Some(v) => serde_json::from_slice(v)?,
@@ -784,27 +788,61 @@ fn sent_at<'a>(json: &'a [u8], path: &[&str]) -> Option<&'a str> {
     Some(at.get())
 }
 
+/// Is there a number anywhere in `v`, a struct's field or an array's item too?
+fn has_number(v: &Value) -> bool {
+    match v {
+        Value::Number(_) => true,
+        Value::Array(a) => a.iter().any(has_number),
+        Value::Object(o) => o.values().any(has_number),
+        _ => false,
+    }
+}
+
 /// A row as a line of JSON for `from_json`, each number in it as the record sent it (`sent`: the row's own text).
 /// A `Value` holds a number as an f64, sure of only 15 significant digits, and a DECIMAL(38, 18) takes 38: so
 /// 0.123456789012345678 is written as it came, not as 0.12345678901234568, as a record of plain rows is read.
-/// A number changed on the way (a time in another unit) is written as it is now.
+/// A struct's fields and an array's items are walked beside their text the same way, so a `STRUCT<amount
+/// DECIMAL(38, 18)>` or an `ARRAY<DECIMAL(38, 18)>` keeps its digits too. A number changed on the way (a time in
+/// another unit) is written as it is now.
 fn write_row(out: &mut Vec<u8>, v: &Value, sent: Option<&str>) -> Result<()> {
-    let (Value::Object(o), Some(sent)) = (v, sent.and_then(|s| serde_json::from_str::<HashMap<String, &RawValue>>(s).ok())) else {
-        return Ok(serde_json::to_writer(out, v)?);
-    };
-    out.push(b'{');
-    for (i, (k, x)) in o.iter().enumerate() {
-        if i > 0 {
-            out.push(b',');
+    let sent = sent.and_then(|s| serde_json::from_str::<&RawValue>(s).ok());
+    write_sent(out, v, sent)
+}
+
+/// `v`, each number in it as `sent` (its text in the record, where it was found) has it.
+fn write_sent(out: &mut Vec<u8>, v: &Value, sent: Option<&RawValue>) -> Result<()> {
+    let Some(sent) = sent.filter(|_| has_number(v)) else { return Ok(serde_json::to_writer(out, v)?) };
+    match v {
+        Value::Number(_) => match serde_json::from_str::<Value>(sent.get()) {
+            Ok(y) if y == *v => out.extend_from_slice(sent.get().as_bytes()),
+            _ => serde_json::to_writer(out, v)?,
+        },
+        Value::Object(o) => {
+            let fields = serde_json::from_str::<HashMap<String, &RawValue>>(sent.get()).ok();
+            out.push(b'{');
+            for (i, (k, x)) in o.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                serde_json::to_writer(&mut *out, k)?;
+                out.push(b':');
+                write_sent(out, x, fields.as_ref().and_then(|f| f.get(k).copied()))?;
+            }
+            out.push(b'}');
         }
-        serde_json::to_writer(&mut *out, k)?;
-        out.push(b':');
-        match sent.get(k).map(|r| r.get()) {
-            Some(r) if x.is_number() && serde_json::from_str::<Value>(r).is_ok_and(|y| y == *x) => out.extend_from_slice(r.as_bytes()),
-            _ => serde_json::to_writer(&mut *out, x)?,
+        Value::Array(a) => {
+            let items = serde_json::from_str::<Vec<&RawValue>>(sent.get()).ok().filter(|items| items.len() == a.len());
+            out.push(b'[');
+            for (i, x) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write_sent(out, x, items.as_ref().map(|items| items[i]))?;
+            }
+            out.push(b']');
         }
+        _ => serde_json::to_writer(out, v)?,
     }
-    out.push(b'}');
     Ok(())
 }
 
@@ -907,7 +945,7 @@ fn decimal(x: &Value, scale: i64) -> Result<String> {
 
 /// Offsets: the earliest one still in the log, the next one to be written (-1), or the first at
 /// or after a time.
-async fn list_offsets(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
+async fn list_offsets(app: &App, ver: i16, r: &mut Rd, who: &crate::auth::Principal) -> Result<Vec<u8>> {
     r.i32()?; // replica
     if ver >= 2 {
         r.i8()?; // isolation level
@@ -920,7 +958,7 @@ async fn list_offsets(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     w.put_i32(n as i32);
     for _ in 0..n {
         let name = r.str()?;
-        let exists = app.lake.cat.meta(&table_key(&name)).await?.is_some();
+        let exists = app.lake.cat.meta(&table_key(&name)).await?.is_some() && who.scope.knows(&crate::auth::catalog_name(&name)); // (one it doesn't know of isn't, for it: `metadata`)
         put_str(&mut w, &name);
         let parts = r.len()?;
         w.put_i32(parts as i32);
@@ -1033,6 +1071,7 @@ async fn fetch(app: &App, ver: i16, req: FetchReq, who: &crate::auth::Principal)
                 // earliest offset it had cached from before those segments expired, in a loop.)
                 let (offset, end) = (offset.max(crate::log::ord(first, 0)), crate::log::ord(visible + 1, 0));
                 let (error, records) = match &meta {
+                    Some(_) if !who.scope.knows(&crate::auth::catalog_name(name)) => (UNKNOWN_TOPIC, vec![]), // (as one that isn't there: `metadata`)
                     Some(_) if crate::rights::may(who, crate::rights::Action::SelectAll, crate::rights::Object::Table(name)).is_err() => (TOPIC_AUTHORIZATION_FAILED, vec![]),
                     Some(meta) if index == 0 && offset <= end => (0, read(app, name, meta, offset, visible, limit.min(budget)).await?),
                     Some(_) if index == 0 => (OFFSET_OUT_OF_RANGE, vec![]),
@@ -1702,10 +1741,13 @@ mod tests {
         use datafusion::arrow::datatypes::Field;
         let column = |name: &str| crate::rules::Column { name: name.into(), stored: name.into(), not_null: false, default: None, always: false, held: None, labels: None };
         let fields = vec![Field::new("id", DataType::Int64, true), Field::new("amount", DataType::Decimal128(38, 18), true), Field::new("big", DataType::Decimal128(38, 2), true),
-                          Field::new("ms", DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None), true), Field::new("_deleted", DataType::Boolean, true)];
+                          Field::new("ms", DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None), true), Field::new("_deleted", DataType::Boolean, true),
+                          // (a struct's field and an array's items: walked beside their text too)
+                          Field::new("line", DataType::Struct(vec![Field::new("amount", DataType::Decimal128(38, 18), true)].into()), true),
+                          Field::new("amounts", DataType::List(Arc::new(Field::new("item", DataType::Decimal128(38, 18), true))), true)];
         let t = crate::rules::Table {
-            schema: Arc::new(Schema::new(fields)), columns: ["id", "amount", "big", "ms", "_deleted"].map(column).to_vec(), key: vec!["id".into()], key_checked: true,
-            unique: vec![], checks: vec![], mapped: false, order: ["id", "amount", "big", "ms", "_deleted"].map(String::from).to_vec(), planned: Default::default(),
+            schema: Arc::new(Schema::new(fields)), columns: ["id", "amount", "big", "ms", "_deleted", "line", "amounts"].map(column).to_vec(), key: vec!["id".into()], key_checked: true,
+            unique: vec![], checks: vec![], mapped: false, order: ["id", "amount", "big", "ms", "_deleted", "line", "amounts"].map(String::from).to_vec(), planned: Default::default(),
         };
         let rec = |key: Option<&str>, value: Option<&str>| Rec { key: key.map(|k| Bytes::from(k.to_string())), value: value.map(|v| Bytes::from(v.to_string())), ts: 0 };
         let decimal = r#"{"type": "bytes", "name": "org.apache.kafka.connect.data.Decimal", "parameters": {"scale": "18"}, "field": "amount"}"#;
@@ -1714,7 +1756,7 @@ mod tests {
             // Kafka Connect's JSON, `decimal.format=NUMERIC`: the Decimal as a JSON number, beside a time in milliseconds.
             rec(None, Some(&format!(r#"{{"schema": {{"type": "struct", "fields": [{decimal}, {ms}]}}, "payload": {{"id": 1, "amount": 0.123456789012345678, "big": 12345678901234567.89, "ms": 1000}}}}"#))),
             // Debezium's envelope without its schema, and a plain row in the same batch.
-            rec(None, Some(r#"{"before": null, "after": {"id": 2, "amount": 1.000000000000000001, "big": 99999999999999999999.99}, "op": "c"}"#)),
+            rec(None, Some(r#"{"before": null, "after": {"id": 2, "amount": 1.000000000000000001, "big": 99999999999999999999.99, "line": {"amount": 0.987654321098765432}, "amounts": [0.111111111111111111, 2]}, "op": "c"}"#)),
             rec(None, Some(r#"{"id": 3, "amount": 0.333333333333333333}"#)),
             // A tombstone: the key's number as sent too.
             rec(Some("12345678901234567"), None),
@@ -1724,6 +1766,12 @@ mod tests {
         assert_eq!(text("amount"), [Some("0.123456789012345678".into()), Some("1.000000000000000001".into()), Some("0.333333333333333333".into()), None]);
         assert_eq!(text("big"), [Some("12345678901234567.89".into()), Some("99999999999999999999.99".into()), None, None]);
         assert_eq!(batch.column_by_name("id").unwrap().as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().unwrap().values().to_vec(), [1, 2, 3, 12345678901234567]);
+        // (inside a struct and an array, as sent too)
+        let line = batch.column_by_name("line").unwrap().as_struct().column(0).as_any().downcast_ref::<Decimal128Array>().unwrap().value_as_string(1);
+        assert_eq!(line, "0.987654321098765432");
+        let amounts = batch.column_by_name("amounts").unwrap().as_list::<i32>().value(1);
+        let amounts = amounts.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!((0..amounts.len()).map(|i| amounts.value_as_string(i)).collect::<Vec<_>>(), ["0.111111111111111111", "2.000000000000000000"]);
         // (a number changed on the way is written as it is now: milliseconds as the column's microseconds)
         assert_eq!(batch.column_by_name("ms").unwrap().as_any().downcast_ref::<datafusion::arrow::array::TimestampMicrosecondArray>().unwrap().value(0), 1_000_000);
         // A row's text is found by its place in the record, and a number in a pretty-printed record keeps its digits.
@@ -1733,6 +1781,9 @@ mod tests {
         let mut line = vec![];
         write_row(&mut line, &serde_json::json!({"x": 1500.0, "y": "a"}), Some(r#"{"x": 1.5e3}"#)).unwrap();
         assert_eq!(String::from_utf8(line).unwrap(), r#"{"x":1.5e3,"y":"a"}"#);
+        let mut line = vec![];
+        write_row(&mut line, &serde_json::json!({"a": [1500.0], "s": {"t": [0.1, "a"], "x": 1500.0}}), Some(r#"{"s": {"x": 1.5e3, "t": [1e-1, "a"]}, "a": [1.5e3]}"#)).unwrap();
+        assert_eq!(String::from_utf8(line).unwrap(), r#"{"a":[1.5e3],"s":{"t":[1e-1,"a"],"x":1.5e3}}"#, "at every depth");
     }
 
     #[test]

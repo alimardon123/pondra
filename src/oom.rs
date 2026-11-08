@@ -59,7 +59,8 @@ crate::per_node!(static WAKE: tokio::sync::Notify = tokio::sync::Notify::new(); 
 pub fn line() -> Option<usize> {
     // (a page's line is its device's, and it has one only where its memory is read: `Machine::resident`, a page's `Device`)
     if cfg!(target_arch = "wasm32") {
-        return crate::machine::process().resident().and_then(|_| line_on(crate::env::device_line()));
+        let device = crate::machine::process();
+        return device.resident().and_then(|_| line_on(device.line()));
     }
     if crate::machine::hosted() {
         return None;
@@ -67,7 +68,7 @@ pub fn line() -> Option<usize> {
     crate::env::memory_line(crate::machine::process().ram().map(|ram| (ram as f64 * 0.85) as usize))
 }
 
-/// The memory line on a page's device, which has `device` bytes (`Options::line`, or the one its member was opened with): the
+/// The memory line on a page's device, which gives the module `device` bytes (its machine's line, `Machine::line`): the
 /// device's, else `env::PAGE_LINE`, through `PONDRA_MEMORY_MAX_GB` as `env::memory_line` takes it.
 pub(crate) fn line_on(device: Option<usize>) -> Option<usize> {
     crate::env::memory_line(Some(device.unwrap_or(crate::env::PAGE_LINE)))

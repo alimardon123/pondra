@@ -116,7 +116,8 @@ address the other nodes reach it at.
 
 ### Memory
 
-A node uses a third of its memory for queries and spills to disk beyond that. In a container it reads
+A node's queries and caches share 72% of its memory: the caches give way when a query needs the room, and a query
+spills to disk beyond that. In a container it reads
 that memory from the container's limit, so give the container one (`--memory`). Without a limit it sees
 the host's memory. `--memory-gb` or `PONDRA_MEMORY_GB` sets the figure yourself.
 
@@ -163,7 +164,8 @@ These variables, set in your shell or in a `.env` file beside the compose file, 
 | `PONDRA_ADMIN_TOKEN`, `PONDRA_WRITE_TOKEN`, `PONDRA_READ_TOKEN`, `PONDRA_SECRET_KEY` | unset | passed to the nodes when you set them |
 
 For a lake in a bucket the file also passes on `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-`AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_ENDPOINT` (for R2 or MinIO) and `AWS_ALLOW_HTTP`:
+`AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_ENDPOINT` (for R2 or MinIO), `AWS_ALLOW_HTTP` and `AWS_SSE_KMS_KEY_ID` (your own KMS
+key for what the lake writes):
 
 ```bash norun
 # .env, beside compose.yaml

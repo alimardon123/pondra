@@ -236,7 +236,7 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_MATCH_HELD_ROWS", Int, Is("1000000")),
     node("PONDRA_MATCH_RUN_ROWS", Int, Is("1000000")),
     node("PONDRA_MEMORY_GB", Gb, No).flag("task-ms", "Memory for queries and every cache together, in GB (also \
-        PONDRA_MEMORY_GB; default: queries a third of the machine's), except a cache given its own budget (PONDRA_HOT_GB, \
+        PONDRA_MEMORY_GB; default: 72% of the machine's, the caches giving way to queries), except a cache given its own budget (PONDRA_HOT_GB, \
         PONDRA_CACHE_MB, PONDRA_PAGES_MB, PONDRA_FILES_CACHE_MB, PONDRA_FUNCTION_CACHE_MB). A query that needs more takes it from the caches, then sorts, joins and aggregations spill."),
     node("PONDRA_MEMORY_LAKE_GB", Gb, No),
     node("PONDRA_MEMORY_MAX_GB", Gb, No),
@@ -324,6 +324,7 @@ pub const CORE: &[Setting] = &[
     test("PONDRA_TEST_FORMAT", Int, No),
     test("PONDRA_TEST_NO_GATE", Switch, No),
     test("PONDRA_TEST_ONE_PARSE", Switch, No),
+    test("PONDRA_TEST_PASSES", Switch, No),
     test("PONDRA_TEST_PANICS", Bool, No),
 ];
 

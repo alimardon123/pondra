@@ -18,6 +18,7 @@ use crate::members::Members;
 use crate::store::{Catalog, Lake};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,28 +84,47 @@ impl std::fmt::Display for Newer {
 
 impl std::error::Error for Newer {}
 
-crate::per_node!(
-    /// Did this process make its lake (open it to write with nothing ever committed there)?
-    static MADE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
+/// What this process holds of a lake's format beside its record: the lake's own (`Lake::format`), never one for the node
+/// or the process, since a process holds lakes side by side (an attached one, `serve --lakes`, a backup it takes, a
+/// program's two), and what one lake is says nothing of another (invariant 301).
+#[derive(Default)]
+pub struct Held {
+    /// Did this process make the lake (open it to write with nothing ever committed there)? No release older than this
+    /// build has read it.
+    made: bool,
+    /// What `raise` saw: 0 when it doesn't run for the lake here, 1 while it takes its first look, then the newest format
+    /// every node knows, plus 2.
+    ready: AtomicU32,
+    /// One commit of the format at a time (`set`).
+    one: tokio::sync::Mutex<()>,
+    /// The lake's commit streams open to other nodes, by the format each knows (`Streamed`; read-only nodes don't
+    /// heartbeat: their stream is how the leader knows they are there).
+    streams: Streams,
+}
 
-/// Did this process make its lake? (No release older than this build has read it.)
-pub fn made() -> bool { MADE.load(std::sync::atomic::Ordering::Relaxed) }
+/// Open commit streams by the format each knows: a count of each.
+type Streams = Arc<std::sync::Mutex<std::collections::BTreeMap<u32, usize>>>;
 
-/// Refuse a lake newer than this build; its format otherwise.
-pub async fn check(cat: &Catalog, url: &str, writer: bool) -> Result<u32> {
+/// Did this process make the lake? (No release older than this build has read it.)
+pub fn made(lake: &Lake) -> bool { lake.format.made }
+
+impl Held {
+    /// The oldest format a node streaming the lake's commits knows (`Streamed`), if one streams them now.
+    fn streamed(&self) -> Option<u32> { self.streams.lock().unwrap().keys().next().copied() }
+}
+
+/// Refuse a lake newer than this build; what this process holds of its format otherwise, made here or not.
+pub async fn check(cat: &Catalog, url: &str, writer: bool) -> Result<Held> {
     let s = of(cat).await?;
     anyhow::ensure!(s.format <= known(), Newer { url: url.into(), stamp: (s.format, s.by) });
-    if writer && cat.get::<u64>("c").await?.is_none() {
-        MADE.store(true, std::sync::atomic::Ordering::Relaxed); // (every commit writes `c`)
-    }
-    Ok(s.format)
+    let made = writer && cat.get::<u64>("c").await?.is_none(); // (every commit writes `c`)
+    Ok(Held { made, ..Held::default() })
 }
 
 /// Commit the lake's format, one at a time and never back: a lake this process made gets the mark
 /// (`raise`) while its keys may already have moved it on (`require`).
 async fn set(lake: &Lake, to: u32) -> Result<()> {
-    static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _one = ONE.lock().await;
+    let _one = lake.format.one.lock().await;
     if of(&lake.cat).await?.format >= to {
         return Ok(());
     }
@@ -113,11 +133,6 @@ async fn set(lake: &Lake, to: u32) -> Result<()> {
     lake.node.life.say(&format!("the lake is format {to} now (Pondra {VERSION})"));
     Ok(())
 }
-
-crate::per_node!(
-    /// What `raise` saw: 0 when it doesn't run in this process, 1 while it takes its first look, then
-    /// the newest format every node knows, plus 2.
-    static READY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0));
 
 /// Leader: before writing something an older release would read wrongly (`what`), move the lake to
 /// format `n`, or refuse by name while a node that doesn't know `n` runs. A leader that only just
@@ -129,10 +144,10 @@ pub async fn require(lake: &Lake, n: u32, what: &str) -> Result<()> {
         return Ok(());
     }
     let started = datafusion::common::instant::Instant::now();
-    while READY.load(Relaxed) == 1 && started.elapsed() < Duration::from_secs(15) {
+    while lake.format.ready.load(Relaxed) == 1 && started.elapsed() < Duration::from_secs(15) {
         tokio::time::sleep(Duration::from_millis(100)).await; // (the first look: `raise`)
     }
-    let ready = match READY.load(Relaxed) {
+    let ready = match lake.format.ready.load(Relaxed) {
         0 => known(),
         1 => 0, // (no look in 15 s: refused, never guessed)
         r => r - 2,
@@ -151,28 +166,24 @@ pub fn said(headers: &http::HeaderMap) -> (String, u32) {
     (get("x-pondra-version").unwrap_or_default(), get("x-pondra-format").and_then(|f| f.parse().ok()).unwrap_or(0))
 }
 
-crate::per_node!(
-    /// Commit streams open to other nodes, by the format each knows (read-only nodes don't
-    /// heartbeat: their stream is how the leader knows they are there).
-    static STREAMS: std::sync::Mutex<std::collections::BTreeMap<u32, usize>> = std::sync::Mutex::new(std::collections::BTreeMap::new()));
-
-/// Held by a commit stream for as long as it is open.
-pub struct Streamed(u32);
+/// Held by a commit stream of a lake for as long as it is open: the node at its other end knows `format` (`Held::streams`).
+pub struct Streamed(Streams, u32);
 
 impl Streamed {
-    pub fn to(format: u32) -> Streamed {
-        *STREAMS.lock().unwrap().entry(format).or_default() += 1;
-        Streamed(format)
+    pub fn to(lake: &Lake, format: u32) -> Streamed {
+        let streams = lake.format.streams.clone();
+        *streams.lock().unwrap().entry(format).or_default() += 1;
+        Streamed(streams, format)
     }
 }
 
 impl Drop for Streamed {
     fn drop(&mut self) {
-        let mut s = STREAMS.lock().unwrap();
-        if let Some(n) = s.get_mut(&self.0) {
+        let mut s = self.0.lock().unwrap();
+        if let Some(n) = s.get_mut(&self.1) {
             *n -= 1;
             if *n == 0 {
-                s.remove(&self.0);
+                s.remove(&self.1);
             }
         }
     }
@@ -187,17 +198,17 @@ pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>) {
     use std::sync::atomic::Ordering::Relaxed;
     crate::panics::spawn(async move {
         let mut marked = false;
-        if MADE.load(Relaxed) {
-            READY.store(known() + 2, Relaxed);
+        if lake.format.made {
+            lake.format.ready.store(known() + 2, Relaxed);
             marked = set(&lake, first()).await.map_err(|e| eprintln!("the lake's format: {e:#}")).is_ok();
         } else {
-            READY.store(1, Relaxed); // (looking: `require` waits for it)
+            lake.format.ready.store(1, Relaxed); // (looking: `require` waits for it)
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
         loop {
-            let streamed = STREAMS.lock().unwrap().keys().next().copied();
+            let streamed = lake.format.streamed();
             let ready = [Some(known()), members.least_known(), streamed].into_iter().flatten().min().unwrap_or_default();
-            READY.store(ready + 2, Relaxed);
+            lake.format.ready.store(ready + 2, Relaxed);
             if !marked && ready >= BASE {
                 let done = match of(&lake.cat).await {
                     Ok(s) if s.format >= BASE => Ok(()),
@@ -232,7 +243,7 @@ fn first() -> u32 { if known() >= LISTS { LISTS } else { BASE } }
 /// was refused it). Such a lake moves on only by its server's leader, which knows its nodes' releases (`raise`), or by
 /// `require`, for what needs the lists; until then its entries keep format 5's shape, which every reader reads.
 pub async fn alone(lake: &Lake) -> Result<()> {
-    if known() >= LISTS && moves_alone(&lake.url, made()) {
+    if known() >= LISTS && moves_alone(&lake.url, lake.format.made) {
         set(lake, LISTS).await?;
     }
     Ok(())
@@ -278,6 +289,53 @@ mod tests {
         for bucket in ["s3://bucket/lake", "gs://b/l", "az://c/l", "abfss://c@a.dfs.core.windows.net/l"] {
             assert!(!moves_alone(bucket, true) && !moves_alone(bucket, false), "{bucket}");
         }
+    }
+
+    /// What this process holds of a lake's format is the lake's own (invariant 301): a lake made here says so, and a
+    /// folder's lake made before, opened beside it, doesn't, so a form alone moves the first on and leaves the second as a
+    /// release before left it (11-07 audit L2). Under one static for the process, the second was taken for one made here.
+    #[tokio::test]
+    async fn a_lake_made_here_says_so_and_one_made_before_beside_it_doesnt() -> Result<()> {
+        let dir = |n: &str| std::env::temp_dir().join(format!("pondra-made-{n}-{}", uuid::Uuid::new_v4()));
+        let (before, here) = (dir("before"), dir("here"));
+        let (b, h) = (before.to_str().expect("a path"), here.to_str().expect("a path"));
+        let old = Lake::open(b, true, false, crate::node_state::NodeState::unhosted()).await?;
+        old.cat.commit(vec![(KEY.into(), serde_json::to_vec(&Stamp { format: 5, by: "0.80.0".into() })?)], &[]).await?; // (as 0.80 left it)
+        old.cat.close().await?;
+        drop(old);
+        let new = Lake::open(h, true, false, crate::node_state::NodeState::unhosted()).await?;
+        let old = Lake::open(b, true, false, crate::node_state::NodeState::unhosted()).await?;
+        assert!(made(&new) && !made(&old));
+        alone(&new).await?;
+        alone(&old).await?;
+        assert_eq!((of(&new.cat).await?.format, of(&old.cat).await?.format), (LISTS, 5), "the lake made here moves on, the other stays");
+        for (lake, d) in [(new, here), (old, before)] {
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(d);
+        }
+        Ok(())
+    }
+
+    /// A lake's commit streams count for its own format alone (invariant 301): a node of format 5 streaming one lake holds
+    /// back that lake's raise (`raise`), not a lake beside it, and it counts no more once its stream ends. Under one static
+    /// for the node, a follower of either lake held back both.
+    #[tokio::test]
+    async fn a_lakes_commit_streams_are_its_own() -> Result<()> {
+        let dir = |n: &str| std::env::temp_dir().join(format!("pondra-streams-{n}-{}", uuid::Uuid::new_v4()));
+        let (one, two) = (dir("one"), dir("two"));
+        let a = Lake::open(one.to_str().expect("a path"), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let b = Lake::open(two.to_str().expect("a path"), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let (old, newer) = (Streamed::to(&a, 5), Streamed::to(&a, 7));
+        assert_eq!((a.format.streamed(), b.format.streamed()), (Some(5), None), "a's streams are a's alone");
+        drop(old);
+        assert_eq!(a.format.streamed(), Some(7), "an ended stream counts no more");
+        drop(newer);
+        assert_eq!(a.format.streamed(), None);
+        for (lake, d) in [(a, one), (b, two)] {
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(d);
+        }
+        Ok(())
     }
 
     /// Format 6 is one small commit: a format-5 lake's entries stay in their shape and answer as before, and each becomes

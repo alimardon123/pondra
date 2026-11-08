@@ -119,7 +119,7 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
           counts in the query memory: invariant 414); keys_below.rs (a join's keys cut the rows an aggregate under it
-          groups: invariant 437); or_ranges.rs (an OR of ranges of one column that meet as one
+          groups: invariant 437); reuse.rs (a subplan that appears more than once alike runs once: invariant 477); or_ranges.rs (an OR of ranges of one column that meet as one
           range: invariant 438); zeros_in.rs (a float IN list's zero, a CASE's and NULLIF's, answer as `=` does: invariant 448); round 35 served.rs (a lake's store over HTTP:
           pondra://host:port, ADR-072 §8, invariant 299); replace.rs (CREATE OR REPLACE TABLE: a staged table filled, then put
           in the old one's place in one commit: invariant 425); round 36 statement.rs (one statement's
@@ -2335,7 +2335,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    named for whom it goes to (`net::Policy`: the lake's nodes, a URL someone other than the admin
    named, this machine's own child, a service someone named), never a client made at its site: the
    policy is the security choice, made once, and a URL a statement names gets its policy from
-   `net::for_endpoint`.
+   `net::for_endpoint`. A store's HTTP client is the same factory's (`Net::connector`, by the same
+   policy), except a lake's own bucket's, which is its budget's (`budget::Budget`).
 
 302. **Every setting is read through `env.rs`, from one table of names** (ADR-061 §8): what the
    process was given (`open`'s options, the command line's flags: `env::give`), else the
@@ -2743,7 +2744,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `harness.py lateral`.
 
 405. **A temporary secret only an admin or the node's owner made reaches past the public internet**
-   (`public.rs`, `ext::temporary`, `For::Public`): anyone else's is refused `PROVIDER credential_chain`
+   (`net::Connector`, `ext::temporary`, `For::Public`): anyone else's is refused `PROVIDER credential_chain`
    (the node's own credentials) and `TYPE kafka` when made. Its stores ask only public addresses: one
    written in the URL or as an endpoint is checked at build and at each statement (`net::check`), a
    name as it resolves (`Names`: refused if any address isn't public), every redirect, and never
@@ -2751,7 +2752,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the store's `Connector` is made with). A REST catalog or its token server that such a secret names
    is reached with that policy too (`ext::reach_service`). A session holding one runs its queries on
    its node (`temp::holds_secrets` in `App::here_only`): a spread query's shares have no session and
-   would register stores without it. `harness.py reached`, `cargo test --lib net:: public::`.
+   would register stores without it. `harness.py reached`, `cargo test --lib net::`.
 
 406. **A scope covers a URL whole or followed by `/`, `?` or `#`** (`ext::within`, wherever a secret's
    scope is matched): `http://127.0.0.1:979` isn't port 9790, `s3://data` isn't `s3://data-other`.
@@ -3178,6 +3179,28 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and the leader refuses them with 40001 when the table's is another (`Ack::moved`, `write::record`): run again, by the new
    order. A page's staged INSERT sends its own (`server::insert_staged`). Named columns carry none (11-03 audit M9).
    `cargo test --lib store::tests::placed`; `harness.py colorder`
+
+477. **A subplan that appears more than once alike runs once** (`reuse.rs`). A query that names a CTE more than once
+   is planned with a copy at each use, and each copy read and grouped its tables again. `Reuse` finds the subplans
+   whose text is the same at two uses or more, once the filters are pushed down (uses the filters reach differently
+   aren't alike), with what each scan reads where its text doesn't say (`source`: rows in memory, a transaction's
+   writes or a VALUES list, show only their batch counts, so two such tables are told apart by their arrays, and a
+   scan Pondra doesn't know is alike only to itself), and wraps each that groups, joins or windows and gives a small part of what it reads (an eighth at
+   most, or a grouping at its top) in a `ReuseExec`: the first use to run a partition runs the one copy and holds its
+   rows, counted in the query memory (each buffer once: an aggregate gives one batch's slices), and every use reads
+   them, until the plan goes (a read past the uses counted, a plan run again, gets the same rows); past the memory
+   they go to disk and every use reads them there. A partition being held is kept in its slot, not in the use running
+   it: a use dropped halfway (an anti join whose build side is empty drops its probe side) leaves it to the next use,
+   which goes on from there, and a run that fails tells every use why. No use runs its own copy beside the one that
+   ran (a scan's partitions share its files out as they run, so one partition of a second copy, run alone, reads them
+   all, and an exchange gives each partition out once). A plan reset to run again (`fresh`'s kept plans, a recursive
+   query's rounds) drops its `ReuseExec`s and runs each use's own copy. A held copy takes no dynamic filter from above, so a use on a hash join's probe side whose grouping the join's
+   keys would cut (`keys_below`) keeps its own copy, unless the build side is a whole table or holds another use of
+   the same copy (q23's `frequent_ss_items`, wanted for 4,200 items of 102,000). It runs just before `KeysBelow`, and
+   not on a spread query's slices. At SF10 in process against main (#642 and most memory): TPC-DS 68.6 -> 64.9 s
+   (q14 3.75 -> 2.01, q36 1.10 -> 0.34, q47 1.81 -> 0.67, q23 3.21 -> 2.17, q64 2.37 -> 1.95, q65 0.70 -> 0.37),
+   TPC-H q15 1.01 -> 0.55; the queries flagged slower hold no copy and are as fast run interleaved; the same answers.
+   `cargo test --lib reuse::`
 
 ```bash
 cargo build --release

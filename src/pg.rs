@@ -407,7 +407,7 @@ fn said(e: &PgWireError) -> String {
 }
 
 fn user_error(e: anyhow::Error) -> PgWireError {
-    let (_, code, words) = crate::codes::answer(&e, crate::auth::shows_code()); // (the code and words every door gives)
+    let (_, code, words) = crate::codes::answer(&e, crate::rights::scope().shows_code()); // (the code and words every door gives)
     PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), code.into(), words)))
 }
 
@@ -453,8 +453,8 @@ impl Backend {
                 return Ok(Response::Query(rows(&schema, b, format)?)); // (in a transaction: its own version, or its snapshot's)
             }
         }
-        if reader && crate::auth::limited().is_none() && !crate::txn::open() && !crate::temp::mentioned(sql) {
-            // A key lookup: the serving path, before anything else (ADR-036 §6), as `/lookup` answers it.
+        if reader && !crate::txn::open() && !crate::temp::mentioned(sql) {
+            // A key lookup: the serving path, before anything else (ADR-036 §6), as `/lookup` answers it (of what its caller may read).
             let t0 = std::time::Instant::now();
             if let Some(p) = crate::serve::point(&self.app.lake, sql.trim().trim_end_matches(';')).await.map_err(user_error)? {
                 let t1 = t0.elapsed();
@@ -830,7 +830,7 @@ impl Backend {
             };
             Ok((keep, batches)) // (its own caller takes the batches as they are: never decoded again)
         };
-        match self.app.remembered(format!("pg|{sql}"), sql, version, None, run).await? {
+        match self.app.remembered(format!("pg|{}|{sql}", crate::rights::scope().key()), sql, version, None, run).await? {
             Kept::Bytes(b) => crate::query::read_ipc(&b),
             Kept::Own(batches) => Ok(batches),
         }
@@ -841,7 +841,7 @@ impl Backend {
         let sql = crate::sys::planned(sql).map_err(user_error)?;
         let ctx = self.session(&sql, user).await?;
         let df = crate::engine::sql(&ctx, &sql).await.map_err(user_error)?;
-        Ok(Arc::new(crate::query::run_schema(&ctx, df.logical_plan()).map_err(user_error)?.as_arrow().clone()))
+        Ok(Arc::new(crate::query::described(&ctx, df.logical_plan()).map_err(user_error)?.as_arrow().clone())) // (refused as its run would be)
     }
 
     /// A session for `sql`; with Postgres's catalog, its functions and its `information_schema`
@@ -1717,7 +1717,13 @@ impl ExtendedQueryHandler for Backend {
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
         let sql = pg_dialect(&self.app.lake, &stmt.statement.sql, "");
-        let out = crate::temp::SESSION.scope(Some(self.session.clone()), async { Ok(DescribeStatementResponse::new(self.types(&stmt.statement).await.to_vec(), self.describe(&sql, &stmt.statement.sql, &Format::UnifiedText).await?.0)) }).await; // (its temporary tables too)
+        // (as whoever signed in, as the statement will run: its grants decide what it is told, 11-08 audit M6)
+        let who = match self.signed().await {
+            Ok(who) => who,
+            Err(e) => return self.noted(&stmt.statement.sql, Err(e)).await,
+        };
+        let described = async { Ok(DescribeStatementResponse::new(self.types(&stmt.statement).await.to_vec(), self.describe(&sql, &stmt.statement.sql, &Format::UnifiedText).await?.0)) };
+        let out = crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(who, described)).await; // (its temporary tables too)
         self.noted(&stmt.statement.sql, out).await
     }
 
@@ -1730,14 +1736,18 @@ impl ExtendedQueryHandler for Backend {
             return Ok(DescribePortalResponse::new(fields));
         }
         let mut sent = statement.sql.clone(); // (what the history says it ran: the statement with its values, once bound)
-        let out = crate::temp::SESSION.scope(Some(self.session.clone()), async {
+        let who = match self.signed().await {
+            Ok(who) => who,
+            Err(e) => return self.noted(&sent, Err(e)).await,
+        };
+        let described = async {
             let inferred = self.types(statement).await;
             sent = bind(portal, inferred)?;
             let (fields, columns) = self.describe(&pg_dialect(&self.app.lake, &sent, ""), &sent, &portal.result_column_format).await?;
             statement.keep(columns);
             Ok(DescribePortalResponse::new(fields))
-        })
-        .await;
+        };
+        let out = crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(who, described)).await; // (as whoever signed in, as above)
         self.noted(&sent, out).await
     }
 }
@@ -1771,7 +1781,7 @@ impl Backend {
 
     /// `param_types`, but for uuids (`pg_types`), which are text to the planner.
     async fn inferred(&self, sql: &str) -> Vec<Type> {
-        if let (None, Ok(Some(p))) = (crate::auth::limited(), crate::serve::point(&self.app.lake, sql).await) {
+        if let Ok(Some(p)) = crate::serve::point(&self.app.lake, sql).await {
             return p.parameters(sql).iter().map(|t| pg_type(t, FieldFormat::Text).0).collect(); // (a key lookup's: its key's types, unplanned)
         }
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
@@ -1850,10 +1860,7 @@ impl Backend {
                 });
             }
         }
-        let point = match crate::auth::limited() {
-            None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.types().into()))), // (a key lookup's columns, unplanned, first)
-            Some(_) => None,
-        };
+        let point = crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.types().into()))); // (a key lookup's columns, unplanned, first)
         if point.is_none() && (session_command(sql).is_some() || crate::set::is(sql) || crate::vars::change(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some() || crate::script::is(sql)) {
             return Ok((vec![], Columns::None)); // (a COPY's columns come with its data)
         }

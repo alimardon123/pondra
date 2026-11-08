@@ -122,9 +122,10 @@ fn line_of(set: Option<usize>, own: Option<usize>) -> Option<usize> {
     set.or(own).filter(|&bytes| bytes > 0)
 }
 
-/// How much memory queries may hold in DataFusion's pool: `PONDRA_MEMORY_GB`, else the form's share (`own`: a third of the
-/// machine's memory on a node, two thirds of its line on a page). What the pool counts is the big hash tables and sort buffers,
-/// not the decoding and the batches in flight around them, so the share leaves the rest of the line for those. Past it a
+/// How much memory queries may hold in DataFusion's pool: `PONDRA_MEMORY_GB`, else the form's share (`own`: the memory
+/// watch's trim line on a node, `store::memory_limit`, two thirds of its line on a page). What the pool counts is the big
+/// hash tables and sort buffers, not the decoding and the batches in flight around them, so the share leaves the rest of
+/// the line for those. Past it a
 /// node's pool spills to disk; a page's, with no disk, refuses the query.
 pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
     memory_whole().unwrap_or_else(own)
@@ -134,7 +135,8 @@ pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
 /// hold no line of their own then, and a grow past it takes cache bytes back before it spills, as DuckDB's `memory_limit`
 /// holds its buffers and its operators to one number. A cache given a budget of its own (`PONDRA_HOT_GB`, `PONDRA_CACHE_MB`)
 /// keeps it beside the line (`ledger::Charged::inside`). Unset, the whole line is the memory watch's trim line, and the queries
-/// keep their own share inside it (`store::whole_line`).
+/// may hold all of it too, the caches giving way (`store::whole_line`), but a spiller isn't refused for a reader's moment in
+/// a cache.
 pub fn memory_whole() -> Option<usize> {
     gib("PONDRA_MEMORY_GB")
 }
@@ -150,25 +152,10 @@ pub fn raise_memory() -> &'static str {
 pub const PAGE_LINE: usize = 3 << 30;
 
 /// The most query memory a page holds (`query_memory`): two thirds of its line (`memory_line` of its device's, else
-/// `PAGE_LINE`; of `PAGE_LINE` when the watch is off, so the pool is never empty). The page's own pool takes it with its
-/// device's line, and a page's lake (`store::memory_limit`) with the one its member was opened with (`device_line`).
+/// `PAGE_LINE`; of `PAGE_LINE` when the watch is off, so the pool is never empty), as a page's lake takes it
+/// (`store::memory_limit`) with its device's line (`Machine::line`).
 pub fn page_query_memory(device: Option<usize>) -> usize {
     query_memory(|| memory_line(Some(device.unwrap_or(PAGE_LINE))).unwrap_or(PAGE_LINE) / 3 * 2)
-}
-
-crate::per_node!(
-    /// The line a page's device has (`page::Options::line`), in bytes, which its member's lake holds to as the page's own
-    /// pool does (`store::memory_limit`); 0: its device didn't say. Set as the member opens (`node::open_page`).
-    static DEVICE_LINE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0));
-
-/// Says the line a page's device has (`DEVICE_LINE`), or that it said none.
-pub fn set_device_line(line: Option<usize>) {
-    DEVICE_LINE.store(line.unwrap_or(0), std::sync::atomic::Ordering::Relaxed)
-}
-
-/// The line a page's device has, as its member was opened with; None: its device didn't say (`PAGE_LINE`).
-pub fn device_line() -> Option<usize> {
-    Some(DEVICE_LINE.load(std::sync::atomic::Ordering::Relaxed)).filter(|&line| line > 0)
 }
 
 /// A setting in seconds (fractions too), else its default in the table: one that is negative or not a number is the

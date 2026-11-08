@@ -712,6 +712,113 @@ async fn caught_up(lake: &Lake, table: &str, after: u64, upto: u64, rows: u64) -
     Ok(())
 }
 
+/// What a tiering round needs of one table (`App::tier_all`), and its sizes, which `/metrics` adds up (`metrics::render`),
+/// kept from round to round.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Brief {
+    /// The log segment it is tiered to (`TableMeta::tiered`): the oldest of them is where the round reads the log from.
+    pub tiered: u64,
+    /// Files to merge or seal: 8 or more, or one that is a tenth or more deleted rows (`maintain` rewrites them).
+    pub untidy: bool,
+    /// Changed rows that may wait in its files (`purge` says whether it's time).
+    pub changed: bool,
+    /// Its Parquet files: those its entry lists, and those in its manifests (`TableMeta::sealed`).
+    pub inline: u64,
+    pub sealed: u64,
+    /// The rows and bytes in all of them.
+    pub rows: u64,
+    pub bytes: u64,
+    /// The size of its entry: what every commit to it writes.
+    pub entry: u64,
+}
+
+impl Brief {
+    pub fn of(m: &TableMeta) -> Brief {
+        let heavy = m.files.iter().any(|f| f.deleted > 0 && f.deleted * 10 >= f.rows);
+        let (sealed, rows, bytes) = m.sealed.as_ref().map_or((0, 0, 0), |s| (s.files, s.rows, s.bytes));
+        Brief {
+            tiered: m.tiered,
+            untidy: m.files.len() >= 8 || heavy,
+            changed: m.changed && m.purged() < m.tiered,
+            inline: m.files.len() as u64,
+            sealed,
+            rows: rows + m.files.iter().map(|f| f.rows).sum::<u64>(),
+            bytes: bytes + m.files.iter().map(|f| f.bytes).sum::<u64>(),
+            entry: json(m).len() as u64,
+        }
+    }
+}
+
+/// The `/metrics` lines of the tables' files (inline, sealed), rows, bytes and entry bytes (`metrics::render`): the lake's
+/// totals (`GET /metrics`), or a line for each table (`per_table`: `GET /metrics/tables`).
+pub fn metric_lines(tables: &Tables, per_table: bool) -> [Vec<(String, f64)>; 4] {
+    const LINES: [(usize, &str, fn(&Brief) -> u64); 5] =
+        [(0, "where=\"inline\"", |b| b.inline), (0, "where=\"sealed\"", |b| b.sealed), (1, "", |b| b.rows), (2, "", |b| b.bytes), (3, "", |b| b.entry)];
+    let labels = |table: Option<&str>, more: &str| {
+        let all: Vec<String> = table.map(|t| format!("table=\"{t}\"")).into_iter().chain((!more.is_empty()).then(|| more.to_string())).collect();
+        if all.is_empty() { String::new() } else { format!("{{{}}}", all.join(",")) }
+    };
+    let mut samples: [Vec<(String, f64)>; 4] = Default::default();
+    match per_table {
+        true => tables.iter().for_each(|(t, b)| LINES.iter().for_each(|(i, more, get)| samples[*i].push((labels(Some(t.as_str()), more), get(b) as f64)))),
+        false => LINES.iter().for_each(|(i, more, get)| samples[*i].push((labels(None, more), tables.values().map(get).sum::<u64>() as f64))),
+    }
+    samples
+}
+
+/// How often a leader's rounds read every table again (`refresh`, `delta::publish_named`): between sweeps they read only
+/// the tables committed since their last round, so a table a round missed waits at most this.
+pub const SWEEP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A sweep reads this many tables' entries at a time.
+const SWEEP_PAGE: usize = 1000;
+
+/// The tables a node knows, each by its `Brief` (`App::tables`): what a leader's tiering rounds look at, and what
+/// `/metrics` adds up on every node.
+pub type Tables = BTreeMap<String, Brief>;
+
+/// Brings `tables` up to date for a round or a scrape: every table's entry at the first and once a `SWEEP` (a page at a
+/// time, so no lock is held across it), and otherwise only the entries of the tables committed since the last
+/// (`Catalog::written`: on a follower, those it was streamed). Its reads follow what changed, not how many tables the
+/// lake holds (the write-set rule: designs/redesign/redesign.md §4). A table committed while it reads is in the next
+/// set. One at a time: a leader's round and a scrape share the map.
+pub async fn refresh(lake: &Lake, tables: &tokio::sync::Mutex<Tables>) -> Result<()> {
+    let mut t = tables.lock().await;
+    let read = async {
+        match lake.cat.written("tier", SWEEP) {
+            Some(names) => {
+                for name in names {
+                    match lake.cat.meta(&table_key(&name)).await? {
+                        Some(m) => t.insert(name, Brief::of(&m)),
+                        None => t.remove(&name), // (dropped, or renamed away)
+                    };
+                }
+            }
+            None => {
+                let (mut of, mut from) = (Tables::new(), "t/".to_string());
+                loop {
+                    let (page, _) = lake.cat.scan_page(&from, "t0", SWEEP_PAGE, |_| true).await?;
+                    for (key, raw) in &page {
+                        let meta: std::sync::Arc<TableMeta> = lake.cat.parsed(key, raw)?;
+                        of.insert(key[2..].to_string(), Brief::of(&meta));
+                    }
+                    match page.last() {
+                        Some((key, _)) if page.len() == SWEEP_PAGE => from = format!("{key}\0"),
+                        _ => break,
+                    }
+                }
+                *t = of;
+            }
+        }
+        anyhow::Ok(())
+    };
+    let read = read.await;
+    if read.is_err() {
+        lake.cat.missed("tier"); // (the next round reads every table)
+    }
+    read
+}
+
 /// Retention: drop log segments that every table and every streaming task has consumed, and
 /// files replaced by compaction, once older than `grace_ms` (readers holding an older snapshot
 /// may still use them). Catalog first, then the objects: a crash leaves only unreferenced objects.
@@ -1269,6 +1376,58 @@ mod tests {
         }
         assert!(!entry.stats.contains_key("long"));
         assert_eq!(entry.nulls, Some(vec!["i".to_string()]));
+    }
+
+    /// A round reads every table once, then only the ones committed since (`refresh`, `Catalog::written`): a table made,
+    /// one changed and one dropped are what it learns, and one it wasn't told of keeps its old brief until a sweep. A
+    /// round that failed part way reads every table next (`missed`), as one does once a sweep is due.
+    /// `GET /metrics` says the lake's totals of its tables' files, rows and sizes, and `GET /metrics/tables` a line for
+    /// each table, in the same names.
+    #[test]
+    fn the_tables_lines_are_the_lakes_totals_or_one_for_each_table() {
+        let brief = |n: u64| Brief { inline: n, sealed: 10 * n, rows: 100 * n, bytes: 1000 * n, entry: 7 * n, ..Default::default() };
+        let tables: Tables = [("a".to_string(), brief(1)), ("b.c".to_string(), brief(2))].into();
+        let [files, rows, bytes, entry] = metric_lines(&tables, false);
+        assert_eq!(files, [("{where=\"inline\"}".to_string(), 3.0), ("{where=\"sealed\"}".to_string(), 30.0)]);
+        assert_eq!((rows, bytes, entry), (vec![(String::new(), 300.0)], vec![(String::new(), 3000.0)], vec![(String::new(), 21.0)]));
+        let [files, rows, ..] = metric_lines(&tables, true);
+        let line = |l: &str, v: f64| (l.to_string(), v);
+        assert_eq!(files, [line("{table=\"a\",where=\"inline\"}", 1.0), line("{table=\"a\",where=\"sealed\"}", 10.0),
+            line("{table=\"b.c\",where=\"inline\"}", 2.0), line("{table=\"b.c\",where=\"sealed\"}", 20.0)]);
+        assert_eq!(rows, [line("{table=\"a\"}", 100.0), line("{table=\"b.c\"}", 200.0)]);
+        let [files, ..] = metric_lines(&Tables::new(), false);
+        assert_eq!(files, [("{where=\"inline\"}".to_string(), 0.0), ("{where=\"sealed\"}".to_string(), 0.0)], "a lake with no tables: zeros");
+    }
+
+    #[tokio::test]
+    async fn a_round_reads_only_the_tables_committed_since_the_last() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-rounds-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        for t in ["a", "b", "c"] {
+            crate::write::create_table(&lake, t, r#"{"columns": [["x", "Int64"]]}"#).await?;
+        }
+        let tables = tokio::sync::Mutex::new(Tables::new());
+        refresh(&lake, &tables).await?;
+        assert_eq!(tables.lock().await.keys().cloned().collect::<Vec<_>>(), ["a", "b", "c"]);
+        tables.lock().await.get_mut("a").unwrap().tiered = 999; // (a brief only a sweep corrects)
+        let mut b = lake.cat.get::<TableMeta>(&table_key("b")).await?.unwrap();
+        b.tiered = 7;
+        lake.cat.commit(vec![(table_key("b"), json(&b))], &[table_key("c")]).await?;
+        crate::write::create_table(&lake, "d", r#"{"columns": [["x", "Int64"]]}"#).await?;
+        refresh(&lake, &tables).await?;
+        let briefs = tables.lock().await.clone();
+        assert_eq!(briefs.keys().cloned().collect::<Vec<_>>(), ["a", "b", "d"]);
+        assert_eq!((briefs["a"].tiered, briefs["b"].tiered), (999, 7), "only the tables committed were read");
+        lake.cat.missed("tier");
+        refresh(&lake, &tables).await?;
+        assert_ne!(tables.lock().await["a"].tiered, 999, "a round after a failed one reads every table");
+        lake.cat.again("tier", ["a".to_string()]);
+        assert_eq!(lake.cat.written("tier", SWEEP), Some(["a".to_string()].into()));
+        assert_eq!(lake.cat.written("tier", std::time::Duration::ZERO), None, "a sweep is due");
+        assert_eq!(lake.cat.written("other", SWEEP), None, "a round's first call reads every table");
+        lake.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     /// A streamed write's batches go to its files in order, each file put once it holds `max_rows`, while the next batch

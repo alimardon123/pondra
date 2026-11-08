@@ -91,6 +91,7 @@ pub fn router(app: App) -> Router {
         }))
         .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::objects::listed(&app.lake).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
+        .route("/metrics/tables", get(|State(app): State<App>| async move { crate::metrics::tables(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
         .route("/cluster/log", get(feed))
         .route("/cluster/kv", get(kv))
@@ -236,7 +237,7 @@ async fn list_functions(State(app): State<App>) -> Result<Json<Value>, E> {
 /// (a user granted some tables needs the first three to call one, never the body: S27).
 async fn routines_shown(State(app): State<App>) -> Result<Json<Value>, E> {
     let all = crate::routines::listed(&app.lake).await?;
-    if crate::auth::shows_code() {
+    if crate::rights::scope().shows_code() {
         return Ok(Json(j!(*all)));
     }
     let mut hidden = (*all).clone();
@@ -366,7 +367,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let who = who.at("http", from);
     // (a branch's pin: a user granted CLONE may ask for it, and `ddl` lets nothing else of theirs through: ADR-058)
     let pin = req.uri().path() == "/cluster/ddl";
-    let cloning = pin && who.access.as_ref().is_some_and(|a| a.clones().is_some());
+    let cloning = pin && who.scope.clones().is_some();
     if who.role < needed && !cloning {
         return match who.role {
             crate::auth::Role::None if header.is_none() && app.auth.owned() => (StatusCode::UNAUTHORIZED, "this node answers only the program that started it (the shell, connect()): open the console from the link it printed, or start the node with --admin-token to connect other tools").into_response(),
@@ -501,7 +502,7 @@ async fn whoami(State(app): State<App>) -> Json<Value> {
         crate::auth::Role::Read => "read",
         crate::auth::Role::None => "none",
     };
-    Json(j!({"user": p.name, "role": role, "superuser": p.role == crate::auth::Role::Admin && p.access.is_none(), "slug": crate::auth::slug(&p), "open": app.open().await}))
+    Json(j!({"user": p.name, "role": role, "superuser": p.superuser(), "slug": crate::auth::slug(&p), "open": app.open().await}))
 }
 
 /// Followers forward metadata writes to the leader, unchanged. The leader checks the caller's own sign-in (security pass 3,
@@ -639,9 +640,9 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
     let operator = nodes_own(&app).await; // (read now: the stream is polled after this request's scope has ended)
     let header = headers.get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
     let need = crate::auth::Auth::needed("/cluster/log", "GET"); // (a superuser's own sign-in, as `guard` lets it follow the stream)
-    let revoked = until_revoked(app.clone(), operator, header, move |p| p.role >= need && p.access.is_none());
+    let revoked = until_revoked(app.clone(), operator, header, move |p| p.role >= need && p.scope.whole());
     let cat = &app.lake.cat;
-    let streamed = operator.then(|| crate::format::Streamed::to(crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
+    let streamed = operator.then(|| crate::format::Streamed::to(&app.lake, crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
     // (a joined page's tab, which says no format as the nodes' own client does (`cluster::http`), is a use of the node while it
     // follows, as its other requests are; the nodes' streams never end while a cluster runs, so they aren't: `idle.rs`, 11-03 audit M7)
     let page = (!headers.contains_key("x-pondra-format")).then(|| app.lake.node.idle.begin());
@@ -674,22 +675,34 @@ async fn records(State(app): State<App>, headers: axum::http::HeaderMap, Json(ba
 
 /// Resolves once the caller of an answer that goes on (the commit stream, `/watch`, a live query, Flight's follow stream) may no longer have it: its
 /// sign-in revoked, expired, or changed so that `still` refuses it (a grant taken back, a superuser no more); a caller that
-/// came in with nothing signed, at an open node, once the node is open no more. Checked every 5 s, as `guard` checks a
-/// request (a password is hashed at most once a minute: `users::password_ok` remembers it against its verifier), so such an
-/// answer ends within that (11-01 audit H4 for the commit stream; 11-02 H3 for the rest; 11-03 H1 for Flight). A node, a token and the program
-/// that started this node never end.
-pub(crate) async fn until_revoked(app: App, operator: bool, header: Option<String>, still: impl Fn(&crate::auth::Principal) -> bool + Send) {
-    if operator {
-        return futures::future::pending().await;
-    }
-    loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        let signed = match &header {
-            Some(h) => crate::users::who(&app.lake, &app.auth, &crate::auth::Credential::of_header(Some(h))).await.is_some_and(|p| still(&p)),
-            None => false,
-        };
-        if !signed && !app.open().await {
-            return;
+/// came in with nothing signed, at an open node, once the node is open no more. Each second it asks `Principal::stale`, a
+/// version compare, and signs in again only once that moved (a REVOKE, a DROP USER, a token or session ended), as a Postgres
+/// connection does at its next statement and a Kafka client at its next request: so such an answer ends within a second of the
+/// change, and a stream whose rights don't move costs no catalog read or password check (11-08 audit M7; 11-01 H4, 11-02 H3
+/// and 11-03 H1 before). The caller is read now, in the request's scope, since the stream is polled after it. A node, a
+/// token and the program that started this node never end.
+pub(crate) fn until_revoked(app: App, operator: bool, header: Option<String>, still: impl Fn(&crate::auth::Principal) -> bool + Send + 'static) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let who = crate::auth::current();
+    async move {
+        if operator || who.as_ref().is_some_and(|w| w.operator) {
+            return futures::future::pending().await;
+        }
+        let mut who = who.unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None)); // (nothing signed: asked once the rights move)
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if !who.stale(&app.lake) {
+                continue;
+            }
+            let epoch = app.lake.cat.rights_version(); // (before it is asked again, as at sign-in: a change meanwhile is seen next time)
+            let signed = match &header {
+                Some(h) => crate::users::who(&app.lake, &app.auth, &crate::auth::Credential::of_header(Some(h))).await.filter(|p| still(p)),
+                None => None,
+            };
+            who = match signed {
+                Some(p) => crate::auth::Principal { epoch: p.epoch.max(epoch), ..p },
+                None if app.open().await => crate::auth::Principal { epoch, ..who }, // (an open node's anyone, until it signs its users in)
+                None => return,
+            };
         }
     }
 }
@@ -842,8 +855,8 @@ struct AppendParams {
 /// Body: NDJSON rows, or an Arrow IPC stream (content-type application/vnd.apache.arrow.stream).
 async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
     let start = std::time::Instant::now();
-    let out = append_rows(&app, &name, p, headers, body).await;
-    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
+    let (out, unseen) = crate::rights::noting(append_rows(&app, &name, p, headers, body)).await;
+    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.to_string()), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -893,18 +906,27 @@ struct InsertParams {
 /// the table if missing. With `staged=1` the body is the columns of a joined page's staged rows (`insert_staged`).
 async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, body: String) -> Result<Json<Value>, E> {
     let start = std::time::Instant::now();
-    let out = match p.staged {
-        Some(1) => insert_staged(&app, &name, &p.job, &body).await,
-        _ => insert_rows(&app, &name, p, body).await,
-    };
-    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
+    let (out, unseen) = crate::rights::noting(async {
+        match p.staged {
+            Some(1) => insert_staged(&app, &name, &p.job, &body).await,
+            _ => insert_rows(&app, &name, p, body).await,
+        }
+    })
+    .await;
+    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
 async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> Result<Json<Value>, E> {
     ensure!(!app.members.reader(), "read-only node");
     if app.lake.table_meta_if(name).await?.is_none() {
-        crate::rights::may_here(crate::rights::Action::Define, crate::rights::Object::Table(name))?; // (making a table, as CREATE TABLE does)
+        let define = crate::rights::may_here(crate::rights::Action::Define, crate::rights::Object::Table(name)); // (making a table, as CREATE TABLE does)
+        if define.is_err() && !crate::rights::scope().whole() {
+            // (a user with grants who may not make it is told there is no such table, as of one it holds nothing on, so the code
+            // never tells a missing table from a hidden one: 11-08 audit M5)
+            return Err(crate::codes::coded("42P01", format!("no table {name}")).into());
+        }
+        define?;
     }
     crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name))?; // (its INSERT grant, as SQL's)
     let query = crate::routines::expand(&app.lake, &query).await?;
@@ -1222,12 +1244,12 @@ fn pieces(h: crate::query::Handed, node: &crate::node_state::NodeState) -> Body 
 /// `GET /sql/pages/{id}?from=10000&rows=10000`: more rows of an answer the console was sent
 /// (`pages.rs`), as `typed` has them; with `&format=csv|tsv|ndjson|parquet|xlsx`, every row of it as
 /// a file to download (`render`), not run again. 410 once it is no longer kept (run it again).
-async fn page(Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
+async fn page(State(app): State<App>, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
     let num = |k: &str, or: usize| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(or);
     let (from, rows, format) = (num("from", 0), num("rows", crate::answer::SHOWN).clamp(1, crate::answer::MOST), q.get("format").map(String::as_str).filter(|f| *f != "typed"));
     let got = match format {
-        Some(f) => crate::pages::page(&id, 0, usize::MAX).map(|b| crate::answer::render(&b, Some(f), crate::pages::keep)),
-        None => crate::pages::page(&id, from, rows).map(|b| crate::answer::typed(&b, rows, crate::pages::keep).map(bytes::Bytes::from)),
+        Some(f) => crate::pages::page(&app.lake, &id, 0, usize::MAX).map(|b| crate::answer::render(&b, Some(f), &|rows| crate::pages::keep(&app.lake, rows))),
+        None => crate::pages::page(&app.lake, &id, from, rows).map(|b| crate::answer::typed(&b, rows, &|rows| crate::pages::keep(&app.lake, rows)).map(bytes::Bytes::from)),
     };
     match got {
         Some(Ok(body)) => ([("content-type", crate::answer::content_type(format))], body).into_response(),
@@ -1252,7 +1274,7 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
         return (StatusCode::FORBIDDEN, crate::ext::said(&e)).into_response(); // (a user's: the whole rows)
     }
     // (the rows come after this request's scope has ended: its sign-in is checked again, and the table's whole rows with it, so
-    // a REVOKE, a DROP USER or a session's end stops them within 5 s: 11-02 audit H3)
+    // a REVOKE, a DROP USER or a session's end stops them within a second: 11-02 audit H3, 11-08 M7)
     let (operator, header) = caller(&headers);
     let table = name.clone();
     let revoked = until_revoked(app.clone(), operator, header, move |p| {
@@ -1383,7 +1405,7 @@ impl IntoResponse for E {
 /// An error as a response: its words are the body, its SQLSTATE the `x-pondra-sqlstate` header, and its status the one
 /// its code stands for, unless the caller gives its own (a database server answers its own errors this way too).
 pub fn error_response(status: Option<StatusCode>, e: &anyhow::Error) -> Response {
-    let (mapped, code, told) = crate::codes::answer(e, crate::auth::shows_code()); // (Postgres's SQLSTATE, for any client: ADR-036 §4; the words its caller may see)
+    let (mapped, code, told) = crate::codes::answer(e, crate::rights::scope().shows_code()); // (Postgres's SQLSTATE, for any client: ADR-036 §4; the words its caller may see)
     let status = status.unwrap_or_else(|| StatusCode::from_u16(mapped).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
     (status, [("x-pondra-sqlstate", code)], told).into_response()
 }

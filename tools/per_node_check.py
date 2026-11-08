@@ -69,7 +69,6 @@ PROCESS = {
     "engine.rs:SUBSTR": "a function's definition",
     "fit.rs:ANALYZER": "the analyzer's rules, DataFusion's and Pondra's, for a point change's SET: no state, nothing of a lake",
     "flight.rs:INFO": "what Flight SQL says of the server: constants",
-    "format.rs:ONE": LOCK,
     "history.rs:L": SETTING + " (PONDRA_LEARN_MS)",
     "history.rs:ON": SETTING + " (PONDRA_HISTORY)",
     "history.rs:R": SETTING + " (PONDRA_HISTORY_RATE)",

@@ -1,6 +1,7 @@
 //! A page's member on the core's lake (designs/page-p3.md, pieces 1, 5 and 6): its lake is kept in the store the page is given,
 //! so its tables are there again after a reopen; `GET /objects` is the lake's listing; a page on no store starts fresh; a folder
-//! kept by 0.36 is imported once on open; one page at a time in a process; and a kept lake's term is taken at once.
+//! kept by 0.36 is imported once on open; one page at a time in a process; a kept lake's term is taken at once; and a page
+//! whose lake stopped answers why until it opens again.
 //! `cargo test --test page_lake`.
 #![cfg(feature = "server")]
 #![recursion_limit = "256"] // (as the program's: a node's futures are deep)
@@ -236,7 +237,27 @@ async fn steps() {
     assert_eq!(body.lines().nth(1), Some("files/a b.csv"), "step 10: the file is listed under its decoded name: {body}");
     let bad = third.request("PUT", "/files/%FF.csv", &[], bytes::Bytes::from_static(b"x")).await;
     assert_eq!((bad.status, String::from_utf8_lossy(&bad.body).into_owned()), (400, "Invalid UTF-8 in `path`".to_string()), "step 10: a name that isn't UTF-8 is a 400 that says so");
+
+    // 11. A page whose lake stopped (its lifecycle's stop: a joined page's lake moved past this build) answers every request with why,
+    // 57P01, and the page lives on; closed, the module's page opens again. A restart answers 57P03 (redesign step 2, `node::PageLife`).
+    let life = third.lifecycle().expect("step 11: the page's member is open, with its lifecycle");
+    life.stop("a test's stop".into());
+    for _ in 0..2 {
+        let (status, sqlstate, body) = sql(&third, "SELECT 1").await;
+        assert_eq!((status, sqlstate.as_deref()), (503, Some("57P01")), "step 11: every request after the stop: {body}");
+        assert!(body.contains("a test's stop") && body.contains("open it again"), "step 11: why, and the way out: {body}");
+    }
     third.close().await;
+    let mut page = Page::open_lake(&Options::default()).await.expect("step 11: the module's page opens again after a stop");
+    let (status, _, body) = sql(&page, "SELECT 1").await;
+    assert_eq!(status, 200, "step 11: the new page answers: {body}");
+    let life = page.lifecycle().expect("step 11: the new page's lifecycle");
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| life.restart("a test's restart", &[]))).expect_err("step 11: a restart doesn't return");
+    assert!(unwound.downcast_ref::<pondra::lifecycle::Restarting>().is_some(), "step 11: it unwinds with Restarting");
+    let (status, sqlstate, body) = sql(&page, "SELECT 1").await;
+    assert_eq!((status, sqlstate.as_deref()), (503, Some("57P03")), "step 11: a restart: {body}");
+    assert!(body.contains("a test's restart"), "step 11: {body}");
+    page.close().await;
 }
 
 /// The 0.36 fixture (`tests/fixtures/page-0.36`: the `types/`, `tables/` and `views/` files the old engine wrote), put into `to`,

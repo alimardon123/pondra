@@ -210,7 +210,7 @@ fn role_oid(name: &str) -> u32 { if name == BOOTSTRAP { 10 } else { oid("u", nam
 /// The users and roles of the lake the caller may see. A limited caller sees what `users::principal`
 /// lets it name: itself, the roles it is a member of (and theirs), and public.
 fn members_of(all: &[(String, crate::users::User)], user: &str) -> Vec<Member> {
-    let visible = crate::auth::limited().map(|_| {
+    let visible = (!crate::rights::scope().whole()).then(|| {
         let mut seen = BTreeSet::new();
         let mut todo = vec![user.to_string(), "public".to_string()];
         while let Some(n) = todo.pop() {
@@ -402,8 +402,9 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
     // A user granted some tables sees those, and of one granted by columns those columns, as at every other
     // listing (`ddl::listed`, invariant 382). Postgres's pg_class names every table; Pondra names none its
     // reader may not read, so a BI tool's table list is the user's.
-    if let Some(a) = crate::auth::limited() {
-        rels.retain_mut(|r| match a.columns("select", &crate::text::join(&r.schema, &r.name)) {
+    let scope = crate::rights::scope();
+    if !scope.whole() {
+        rels.retain_mut(|r| match scope.columns(&crate::text::join(&r.schema, &r.name)) {
             None => false,
             Some(None) => true,
             Some(Some(these)) => {
@@ -761,7 +762,7 @@ fn tables(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'static str, A
             let names: Vec<String> = r.params.iter().map(|p| p.name.clone()).collect();
             vec![o(*oid), s(name.clone()), o(schema_oid(schema)), o(owner), o(lang), f4(100.0), f4(if r.kind == Kind::Table { 1000.0 } else { 0.0 }), o(0), s("-"), s(kind), b(false), b(false), b(false),
                 b(r.kind == Kind::Table), s("v"), s("u"), i2(r.params.len() as i16), i2(r.params.iter().filter(|p| p.default.is_some()).count() as i16), o(rettype),
-                ScalarValue::List(ScalarValue::new_list_nullable(&args, &OID)), n(), n(), texts(&names), n(), n(), if crate::auth::shows_code() { s(r.body.clone()) } else { n() }, n(), n(), n(), n()]
+                ScalarValue::List(ScalarValue::new_list_nullable(&args, &OID)), n(), n(), texts(&names), n(), n(), if crate::rights::scope().shows_code() { s(r.body.clone()) } else { n() }, n(), n(), n(), n()]
         }).chain(type_functions().into_iter().map(|f| vec![o(oid("tf", &f)), s(f.clone()), o(11), o(10), o(12), f4(1.0), f4(0.0), o(0), s("-"), s("f"), b(false), b(false), b(true),
             b(false), s("i"), s("s"), i2(1), i2(0), o(0), ScalarValue::List(ScalarValue::new_list_nullable(&[o(0)], &OID)), n(), n(), n(), n(), n(), s(f), n(), n(), n(), n()])).collect());
     add!("pg_database", &[("oid", OID), ("datname", TEXT), ("datdba", OID), ("encoding", INT4), ("datlocprovider", TEXT), ("datistemplate", BOOL), ("datallowconn", BOOL),
@@ -965,7 +966,7 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
         l.routines.iter().map(|(oid, schema, name, r)| {
             let procedure = r.kind == crate::expander::Kind::Procedure;
             vec![db(), s(schema.clone()), s(format!("{name}_{oid}")), db(), s(schema.clone()), s(name.clone()), s(if procedure { "PROCEDURE" } else { "FUNCTION" }), r.returns.clone().map_or(n(), s),
-                s(if r.language == "python" { "EXTERNAL" } else { "SQL" }), if crate::auth::shows_code() { s(r.body.clone()) } else { n() }, s(if r.language.is_empty() { "SQL".to_string() } else { r.language.to_uppercase() }), s("NO")]
+                s(if r.language == "python" { "EXTERNAL" } else { "SQL" }), if crate::rights::scope().shows_code() { s(r.body.clone()) } else { n() }, s(if r.language.is_empty() { "SQL".to_string() } else { r.language.to_uppercase() }), s("NO")]
         }).collect());
     add!("sequences", &[("sequence_catalog", TEXT), ("sequence_schema", TEXT), ("sequence_name", TEXT), ("data_type", TEXT), ("numeric_precision", INT4),
         ("numeric_precision_radix", INT4), ("numeric_scale", INT4), ("start_value", TEXT), ("minimum_value", TEXT), ("maximum_value", TEXT), ("increment", TEXT), ("cycle_option", TEXT)],
@@ -1319,7 +1320,7 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
     ctx.register_udf(udf("pg_stat_get_numscans", |_| DataType::Int64, |_, n| Ok(Arc::new(datafusion::arrow::array::Int64Array::from(vec![0; n])))));
     ctx.register_udf(udf("pg_tablespace_location", to_text, |_, n| Ok(texts_out((0..n).map(|_| Some(String::new()))))));
     // A routine's CREATE statement, as `SHOW CREATE` writes it. A caller who may not see code gets NULL.
-    let code = crate::auth::shows_code();
+    let code = crate::rights::scope().shows_code();
     let lk = l.clone();
     ctx.register_udf(udf("pg_get_functiondef", to_text, move |a, n| {
         let ids = int_arg(&a[0])?;

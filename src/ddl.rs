@@ -152,9 +152,10 @@ pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> {
             all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: crate::views::code_for_caller(|| crate::views::shown(&v.sql)) });
         }
     }
-    if let Some(a) = crate::auth::limited() {
+    let scope = crate::rights::scope();
+    if !scope.whole() {
         let here = lake_name(lake);
-        all.retain(|o| a.may("select", &if o.lake == here { join(&o.schema, &o.name) } else { format!("{}.{}", o.lake, join(&o.schema, &o.name)) })); // (a user's: what it may read, at every listing: S27)
+        all.retain(|o| scope.sees(crate::rights::Object::Table(&if o.lake == here { join(&o.schema, &o.name) } else { format!("{}.{}", o.lake, join(&o.schema, &o.name)) }))); // (a user's: what it may read, at every listing: S27)
     }
     Ok(all)
 }
@@ -283,7 +284,14 @@ pub enum Ddl {
     CreateRoutine { name: String, routine: crate::expander::Routine, replace: bool }, // CREATE MACRO, CREATE PROCEDURE (ADR-023)
     DropRoutine { name: String, if_exists: bool },
     CreateSecret { name: String, params: std::collections::BTreeMap<String, String>, replace: bool, if_not_exists: bool }, // (ADR-026: `ext.rs`)
-    AttachOutside { name: String, url: String, kind: String, options: std::collections::BTreeMap<String, String> }, // another engine's tables (`ext.rs`)
+    AttachOutside {
+        name: String,
+        url: String,
+        kind: String,
+        options: std::collections::BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection: Option<String>, // (`ATTACH shop`: a connection's tables, its url, type and options read from it)
+    }, // another engine's tables (`ext.rs`)
     DropSecret { name: String, if_exists: bool },
     FetchExtension { name: String, from: String, version: Option<String> }, // INSTALL name FROM 'file or URL': the node that got it reads the file, then sends the record (`extension.rs`)
     InstallExtension { name: String, record: crate::extension::Installed }, // the record of an extension, kept by the leader (ADR-075 §6: `extension.rs`)
@@ -665,11 +673,14 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::HistoryLog => crate::history::create_log(lake).await,
         Ddl::Users(c) => crate::users::apply(lake, c).await,
         Ddl::Shares(c) => crate::shares::apply(lake, c).await,
-        Ddl::AttachOutside { name, url, kind, options } => {
+        Ddl::AttachOutside { name, url, kind, options, connection } => {
             not_system(&name, "attach it under another name")?;
             ensure!(!has_schema(lake, &name).await?, "a schema here is called {name}: attach under another name");
             ensure!(lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_none(), "{name} is an attached lake: attach under another name");
-            crate::ext::attach(lake, &name, &url, &kind, options).await
+            match connection {
+                Some(c) => crate::ext::attach_connection(lake, &name, &c).await,
+                None => crate::ext::attach(lake, &name, &url, &kind, options).await,
+            }
         }
         Ddl::Detach { name, if_exists } => {
             if crate::ext::detach(lake, &name).await? {
@@ -1059,7 +1070,7 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
 }
 
 /// `DROP TABLE`: the table leaves the catalog at once. Refused while a view or task reads it or it
-/// is a view's own. It is kept to be undropped for its `retention` (a day unless set: ADR-043),
+/// is a view's own. It is kept to be undropped for its `retention` (7 days unless set: ADR-043),
 /// its rows in the log sent to files first, so nothing of it is left in a log that moves on; with
 /// PURGE, or `retention = '0 seconds'`, it isn't, and its files go once a day old
 /// (`tier::collect_orphans`). It leaves the shares that hand it out (`shares::tables_moved`).
@@ -1174,7 +1185,7 @@ pub(crate) fn left_shares(mut out: Value, shares: Vec<String>) -> Value {
 }
 
 /// How long a table's past is kept unless its `retention` says: read as it was, or undropped.
-pub const KEEP_MS: u64 = 24 * 3_600_000;
+pub const KEEP_MS: u64 = 7 * 24 * 3_600_000; // (7 days, as Delta keeps a table's past; a day before 2026-11-08)
 
 /// A dropped table, kept while it can be undropped (`dt/{name}/{at_ms}`, ADR-043): its entries as
 /// they were when it was dropped, every row in files. `tier::expire` lets it go after `keep_ms`;

@@ -175,6 +175,50 @@ impl crate::lifecycle::Lifecycle for Native {
     fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir)) }
 }
 
+/// A page's lifecycle (redesign §8): what ends is the page's member, never its worker. A stop ends the member, which
+/// answers every request with why from then on (`Paged::stopped`, 57P01), until the page closes and the module's page is
+/// claimed again. A restart is a stop said as one (57P03), and then the task that asked unwinds with [`Restarting`]. A page
+/// can't unwind (the page's std is built to abort), so there the module traps, and the program that runs the page opens
+/// it again: a kept page's tables are in its folder, and an in-memory page's are gone.
+pub struct PageLife {
+    stopped: Mutex<Option<(&'static str, String)>>, // (the SQLSTATE and the words every request answers once the member ended)
+    say: Option<fn(&str)>,
+}
+
+impl PageLife {
+    /// A page's lifecycle, saying its lines with `say` (`page::Options::say`), or nowhere.
+    pub fn new(say: Option<fn(&str)>) -> Arc<PageLife> { Arc::new(PageLife { stopped: Mutex::new(None), say }) }
+
+    /// The SQLSTATE and the words of how the member ended (`stop`, `restart`), or None while it lives.
+    pub fn stopped(&self) -> Option<(&'static str, String)> { self.stopped.lock().unwrap_or_else(PoisonError::into_inner).clone() }
+
+    fn end(&self, code: &'static str, words: String) {
+        if let Some(say) = self.say {
+            say(&words)
+        }
+        self.stopped.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert((code, words)); // (the first end is the one said)
+    }
+}
+
+impl crate::lifecycle::Lifecycle for PageLife {
+    fn stop(&self, why: String) { self.end("57P01", format!("this page's lake stopped ({why}): close the page and open it again")) }
+    fn restart(&self, why: &str, _: &[(&str, String)]) -> ! {
+        self.end("57P03", Restarting(why.to_string()).to_string());
+        std::panic::resume_unwind(Box::new(Restarting(why.to_string())))
+    }
+    fn say(&self, line: &str) {
+        if let Some(say) = self.say {
+            say(line)
+        }
+    }
+    fn one_off(&self) -> bool { false }
+    fn owns_process(&self) -> bool { true } // (the page's worker is its own: no host shares it)
+    fn program(&self) -> anyhow::Result<PathBuf> { anyhow::bail!("a page has no pondra program to start") }
+    fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move { anyhow::bail!("a page leads its own lake only, not {dir}") })
+    }
+}
+
 /// The node starts again to rejoin its cluster (`Lifecycle::restart`), with settings of the command line's own for the
 /// next run (`pondra sql`'s job and its tries: `env.rs`), on top of what this process was given. A guest sent back five times gives up: its statement
 /// fails, saying why. In a library the node is halted and started again in place: the supervisor is told, and the
@@ -256,7 +300,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     let (addr, dir) = (members.me(), lake.url.as_str()); // (what the first user's message names: this member, and its lake)
     let l = lake.clone();
     ddl::sync(&l, lives).await?;
-    crate::store::trace("attachments synced");
+    lake.node.trace("attachments synced");
     if lives {
         every(Duration::from_secs(1), move || { let l = l.clone(); async move { ddl::sync(&l, true).await } });
         let l = lake.clone();
@@ -264,7 +308,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     }
     // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
     // a new leader first commits what they hold from the previous one.
-    crate::store::trace("warming");
+    lake.node.trace("warming");
     let recovered = match (leader, &replica) {
         (true, Some(own)) => {
             // (the members are asked with the nodes' key: one that just restarted holds an
@@ -293,7 +337,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
         }
         None => {}
     }
-    crate::store::trace("followers' changes recovered");
+    lake.node.trace("followers' changes recovered");
     let lock: Arc<tokio::sync::Mutex<()>> = Default::default(); // (the lake's: everything that rewrites table metadata)
     let pace = (s.tier_secs > 0.0).then(|| log::Pace { rows: s.backlog, lock: lock.clone() }); // rows waiting to be tiered
     let seq = if leader { Some(log::Sequencer::start(lake.clone(), pace).await?) } else { None };
@@ -303,17 +347,21 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     };
     let _ = lake.to.set(to.clone()); // (a follower's sequences' values: the leader's sequencer)
     let log = (!reader).then(|| Arc::new(log::Log::start(lake.clone(), Duration::from_millis(s.flush_ms), to)));
-    crate::store::trace("the sequencer");
+    lake.node.trace("the sequencer");
     python::init(s.python.clone());
-    let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone() };
+    let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone(), tables: Default::default() };
     if let Some(ledger) = lake.ledger() {
         ledger.charge("answers", Arc::downgrade(&app.results) as std::sync::Weak<dyn crate::ledger::Charged>); // (the remembered answers: `/metrics`' `cache_bytes`)
-        // (the node's caches of what the lake's own floor doesn't reach, charged once whatever lakes it opens: the answers
-        // kept for their pages, the logs and manifests of Delta and Iceberg tables read, what lookups keep (the
-        // statements worked out as point queries and the log tails' keys), and the functions' answers)
-        for (name, cache) in [("pages", crate::pages::kept()), ("delta_logs", crate::read_delta::logs()), ("iceberg_manifests", crate::read_iceberg::manifests()), ("point_plans", crate::serve::points()), ("tail_keys", crate::serve::tail_keys()), ("function_answers", crate::pyfn::kept())] {
+        // (the node's caches of what the lake's own floor doesn't reach, charged once whatever lakes it opens: the logs and
+        // manifests of Delta and Iceberg tables read, and what lookups keep (the statements worked out as point queries and
+        // the log tails' keys))
+        for (name, cache) in [("delta_logs", crate::read_delta::logs()), ("iceberg_manifests", crate::read_iceberg::manifests()), ("point_plans", crate::serve::points()), ("tail_keys", crate::serve::tail_keys())] {
             ledger.charge(name, Arc::downgrade(&cache));
         }
+        // (the lake's state its doors use, made as it starts, so `/metrics` names it before its first use: the answers kept
+        // for their pages, and its functions' answers; each is charged to the lake's line as it is made, `Lake::state`)
+        lake.state::<crate::pages::Pages>()?;
+        lake.state::<crate::pyfn::Answered>()?;
     }
     crate::constraints::share_lock(&app.lake, app.lock.clone()); // a checked append of this lake takes this lock (`constraints::leader`); the Log is reachable only through the App
     learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
@@ -581,12 +629,12 @@ pub fn unclaim_page() {
 /// term it leads, 0 for a joined page, which claims none (`open_joined`); `marks` keeps that term alive (a finished task for one).
 /// `ended` is the sign-in a joined page follows its node with has ended (`ended`); an own page's never does. `follow` is the
 /// task that follows a joined page's node's stream (`open_joined`), aborted at the page's end (`end_page`).
-pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, ended: Arc<AtomicBool>, superuser: AtomicBool }
+pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, ended: Arc<AtomicBool>, superuser: AtomicBool, pub(crate) life: Arc<PageLife> }
 
-/// Takes the module's page (`PAGED`) for a page's member, and sets the device line its queries hold (`env::device_line`). A
-/// freed page's member may still be closing in the background, which sets PAGED back when it has ended: then this waits for
-/// it, 10 ms at a time, for 30 s at most, and is refused 55006 after that.
-async fn claim_paged(line: Option<usize>) -> anyhow::Result<()> {
+/// Takes the module's page (`PAGED`) for a page's member. A freed page's member may still be closing in the background,
+/// which sets PAGED back when it has ended: then this waits for it, 10 ms at a time, for 30 s at most, and is refused 55006
+/// after that.
+async fn claim_paged() -> anyhow::Result<()> {
     // (`swap` checks and sets at once, so two opens can't both take it)
     let mut sleeps = 0;
     while PAGED.swap(true, SeqCst) {
@@ -596,14 +644,13 @@ async fn claim_paged(line: Option<usize>) -> anyhow::Result<()> {
         sleeps += 1;
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    crate::env::set_device_line(line); // (its lake's queries hold the page's share of it: `store::memory_limit`)
     Ok(())
 }
 
 /// Opens a page's member (`Paged`), its lake on `store` when one is given (a kept page's folder), else in memory, and its
-/// queries holding the page's share of its device's `line` (`claim_paged`). Set back if the open fails.
-pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) -> anyhow::Result<Paged> {
-    claim_paged(line).await?;
+/// queries holding the page's share of its device's line (`store::memory_limit`). Set back if the open fails.
+pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) -> anyhow::Result<Paged> {
+    claim_paged().await?;
     let url = crate::memory_lake::place(":memory:");
     let owned = store.is_some(); // (a given store is a kept page's folder, under its Web Lock: no other writer, so its term is taken at once)
     if let Some(given) = store {
@@ -623,7 +670,7 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open(&url, true, false, native(false)).await?; // (a page's: it lives, as a server's node)
+        let l = crate::store::Lake::open(&url, true, false, crate::node_state::NodeState::new(life.clone())).await?;
         lake = Some(l.clone());
         start_app(l, alone.clone(), None, &start).await
     }
@@ -631,7 +678,7 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
     match made {
         Ok(app) => {
             keep(&app, &start);
-            Ok(Paged { app, url, term, marks, follow: None, ended: Default::default(), superuser: AtomicBool::new(false) })
+            Ok(Paged { app, url, term, marks, follow: None, ended: Default::default(), superuser: AtomicBool::new(false), life })
         }
         Err(e) => {
             end_page(marks, None, lake, &store, term, &url).await; // (a failed open leaves nothing running)
@@ -666,8 +713,8 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
 /// 3 s (a node's is 250 ms, but each of a page's is a request). It claims no term and writes nothing to the cluster, so closing
 /// it changes nothing there. The sign-in's end stops both loops and sets `ended` (a 401 or 403 from the node, or the refresh's
 /// closed error).
-pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, line: Option<usize>) -> anyhow::Result<Paged> {
-    claim_paged(line).await?;
+pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, life: Arc<PageLife>) -> anyhow::Result<Paged> {
+    claim_paged().await?;
     let url = crate::memory_lake::place(":memory:");
     crate::memory_lake::give(&url, store);
     let store = crate::memory_lake::store(&url);
@@ -679,7 +726,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open_on(&url, true, kv, native(false)).await?;
+        let l = crate::store::Lake::open_on(&url, true, kv, crate::node_state::NodeState::new(life.clone())).await?;
         lake = Some(l.clone());
         start_app(l, members, None, &start).await
     }
@@ -722,7 +769,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
                     }
                 }
             });
-            Ok(Paged { app, url, term: 0, marks, follow: Some(follow), ended, superuser: AtomicBool::new(superuser) })
+            Ok(Paged { app, url, term: 0, marks, follow: Some(follow), ended, superuser: AtomicBool::new(superuser), life })
         }
         Err(e) => {
             end_page(marks, None, lake, &store, 0, &url).await; // (a failed open leaves nothing running)
@@ -763,6 +810,12 @@ impl Paged {
     /// Whether the sign-in a joined page follows its node with has ended (`open_joined`): its requests are then refused.
     pub fn ended(&self) -> bool {
         self.ended.load(SeqCst)
+    }
+
+    /// The SQLSTATE and the words of how the member's lake ended (its lifecycle's stop or restart: `PageLife`), or None while
+    /// it lives. Every request is answered with them from then on.
+    pub fn stopped(&self) -> Option<(&'static str, String)> {
+        self.life.stopped()
     }
 
     /// Says the sign-in has ended, as a node refusing it does (`page::Page::ask`): the page answers 28000 from then on.
@@ -812,5 +865,34 @@ mod tests {
         super::unclaim_page();
         super::claim_page().expect("the page is claimable again once it is given back");
         super::unclaim_page();
+    }
+
+    /// A page's lifecycle keeps how its member ended: a stop's 57P01 with why and the way out, said to the page's console;
+    /// a restart's 57P03, after which the task that asked unwinds with `Restarting`. The first end is the one kept. It has no
+    /// program and leads no other lake. (No page is claimed or opened here: `page::tests` says why. tests/page_lake.rs step 11
+    /// runs a page through it.)
+    #[test]
+    fn a_page_life_keeps_its_first_end_and_unwinds_on_a_restart() {
+        use crate::lifecycle::Lifecycle;
+        static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        fn said(line: &str) { SAID.lock().unwrap().push(line.to_string()) }
+        let stopped = super::PageLife::new(Some(said));
+        assert!(stopped.stopped().is_none(), "a member that lives has not ended");
+        stopped.stop("a test's stop".into());
+        let (code, words) = stopped.stopped().expect("a stop is kept");
+        assert_eq!(code, "57P01");
+        assert!(words.contains("a test's stop") && words.contains("open it again"), "{words}");
+        assert_eq!(SAID.lock().unwrap().as_slice(), [words.clone()], "the stop is said to the page's console");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stopped.restart("a later restart", &[]))).expect_err("a restart doesn't return");
+        assert!(unwound.downcast_ref::<super::Restarting>().is_some(), "it unwinds with Restarting");
+        assert_eq!(stopped.stopped().map(|(c, _)| c), Some("57P01"), "the first end is the one kept");
+        let restarted = super::PageLife::new(None);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| restarted.restart("a test's restart", &[])));
+        let (code, words) = restarted.stopped().expect("a restart is kept");
+        assert_eq!(code, "57P03");
+        assert!(words.contains("a test's restart"), "{words}");
+        assert!(restarted.program().is_err() && !restarted.one_off() && restarted.owns_process());
+        let elsewhere = futures::executor::block_on(restarted.lead_elsewhere("s3://b/l")).expect_err("a page leads its own lake only");
+        assert!(elsewhere.to_string().contains("s3://b/l"), "{elsewhere}");
     }
 }

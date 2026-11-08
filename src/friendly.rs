@@ -4,9 +4,10 @@
 //! (`routines::expand`), as `FROM`-first and `ASOF JOIN` already are. A view, a frame, a spread
 //! query and every door then get plain SQL.
 //!
-//! - In the text, before it is parsed (`text`): `LAMBDA x: …` and list comprehensions
-//!   (`[x * 2 FOR x IN l IF x > 0]`) as `x -> …`; DuckDB's `PIVOT` and `UNPIVOT` statements as the
-//!   standard's; DuckDB's `ASOF JOIN … ON a.t >= b.t` as Snowflake's; `USING SAMPLE`.
+//! - In the text, before it is parsed (`text`): DuckDB's `ASOF JOIN … ON a.t >= b.t` as Snowflake's; `USING SAMPLE`.
+//! - In the parse, hooks of the fallback dialect (`dialect.rs`): list comprehensions (`[x * 2 FOR x IN l IF x > 0]`) as
+//!   `array_transform(…, x -> …)`, `LAMBDA x: …` as `x -> …`, and DuckDB's `PIVOT` and `UNPIVOT` statements as the
+//!   standard's (`reordered`).
 //! - In the syntax tree (`rewrite`): `FETCH FIRST`, `ORDER BY ALL`, `({…}).a`, `max_by` and
 //!   `arg_max`, `string_split`, `::json`, `json_extract`, `payload->>'$.a'`, `PIVOT`, `UNPIVOT`, `TABLESAMPLE` (which
 //!   DataFusion ignored), `COLUMNS(…)`, `* RENAME`, a select's alias in its WHERE.
@@ -19,7 +20,10 @@
 use crate::expander::grouped; // (a call written as an expression: in parentheses inside an operator)
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::sql::sqlparser::ast::*;
-use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
+use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect};
+use datafusion::sql::sqlparser::parser::{Parser, ParserError};
+use datafusion::sql::sqlparser::tokenizer::{Location, Token, TokenWithSpan};
+use datafusion::sql::sqlparser::keywords::Keyword;
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -31,8 +35,92 @@ pub(crate) fn query(sql: &str) -> Result<Query> { Ok(*Parser::new(&GenericDialec
 pub(crate) fn quote(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
 fn name(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 
-/// Whether `sql` may hold any of them: a look before anything is parsed.
-pub fn wanted(sql: &str) -> bool {
+/// Whether `sql` may hold any of them: a look before anything is parsed. The front asks its three parts (`passes`), each
+/// only where its trigger is in the text; this module's tests ask the three at once.
+#[cfg(test)]
+fn wanted(sql: &str) -> bool {
+    wants_forms(sql) || wants_marked(sql) || wants_aliases(sql)
+}
+
+/// Postgres's bytea-only functions (`pg_bytea`), whose string literal reads as a bytea: a look's and a trigger's.
+const TAKES_BYTEA: &[&str] = crate::pg_bytea::TAKES_BYTEA;
+
+/// The front's passes of this module (`passes.rs`): the text's rewrite, and the three looks `wanted` makes, each with a
+/// trigger that holds every text its look finds.
+pub(crate) fn passes() -> Vec<crate::passes::Pass> {
+    use crate::passes::{Hook, Parse, Pass, Run};
+    let tables = DUCKDB_TYPES.iter().map(|(n, _)| *n).chain(OTHER_TYPES.iter().map(|(n, _, _)| *n)).chain(crate::dialect_fns::OURS.iter().map(|(n, _, _)| *n)).chain(TAKES_BYTEA.iter().copied());
+    let mut forms = vec![
+        "fetch", "all", "max_by", "min_by", "arg_max", "arg_min", "string_split", "str_split", "json", "jsonb", "json_value", "get_json_object", "tablesample", "sample", "pondra_sample",
+        "pivot", "unpivot", "rename", "apply", "list_apply", "array_apply", "columns", "filter", "list", "split", "lateral", "strftime", "strptime", "epoch", "regexp_extract", "datediff",
+        "date_diff", "dateadd", "date_add", "date_sub", "timestampadd", "timeadd", "group_concat", "array_agg", "iff", "iif", "zeroifnull", "decode", "array_construct", "array_size",
+        "object_construct", "isnull", "charindex", "convert", "try_convert", "getdate", "sysdatetime", "eomonth", "datepart", "curdate", "unix_timestamp", "unix_seconds", "timestamp_seconds",
+        "str_to_date", "date_format", "timestampdiff", "countif", "date", "date_trunc", "timestamp_trunc", "datetime_trunc", "timestamp_diff", "datetime_diff", "format_date", "format_timestamp",
+        "format_datetime", "parse_date", "parse_timestamp", "parse_datetime", "transform", "format", "top", "int64", "float64", "number", "byteint", "within", "safe", "materialized",
+        "timestamp_ntz", "time",
+    ];
+    forms.extend(tables);
+    vec![
+        Pass { name: "friendly.text", order: 40, words: vec!["for", "asof", "sample", "tblproperties", "top"], marks: vec![&["@@"]], run: Run::Text(text) },
+        // (`json_extract…` is a word's start, so a mark; `).a`, Snowflake's `payload:page`)
+        Pass { name: "friendly.forms", order: 10, words: forms, marks: vec![&["json_extract"], &[")", "."], &[":"]], run: Run::Wants(wants_forms) },
+        Pass {
+            name: "friendly.marked",
+            order: 20,
+            words: vec!["bytea", "character"],
+            // (`(a, b) IN (SELECT …)` and its NOT IN, `CHAR VARYING`, `DEFAULT VALUES`, `ESCAPE '…'`, an array literal or
+            // `ARRAY[`, a JSONPath after `->` or `->>`, a national string `N'…'`)
+            marks: vec![&["+0'"], &["+1'"], &["+2'"], &["+3'"], &["+4'"], &["+5'"], &["+6'"], &["+7'"], &["+8'"], &["+9'"], &["-0'"], &["-1'"], &["-2'"], &["-3'"], &["-4'"], &["-5'"], &["-6'"], &["-7'"], &["-8'"], &["-9'"],
+                &["0e"], &["1e"], &["2e"], &["3e"], &["4e"], &["5e"], &["6e"], &["7e"], &["8e"], &["9e"], &[")", "in"], &[")", "not"], &["char", "varying"], &["default", "values"], &["escape", "'"],
+                &["["], &["->", "'$"], &["->>", "'$"], &["n'"]],
+            run: Run::Wants(wants_marked),
+        },
+        Pass { name: "friendly.aliases", order: 30, words: vec!["where", "delete", "update"], marks: vec![], run: Run::Wants(wants_aliases) },
+        Pass {
+            name: "friendly.comprehension",
+            order: 10,
+            words: vec!["for"],
+            marks: vec![],
+            run: Run::Parse(Parse {
+                claims: "[",
+                reads: &["SELECT [x * 2 FOR x IN [1, 2, 3]] AS v", "SELECT [x FOR x IN l IF x > 1] FROM t", "SELECT [[y FOR y IN x] FOR x IN [[1, 2], [3]]] AS v"],
+                hook: Hook::Prefix(comprehension),
+            }),
+        },
+        Pass {
+            name: "friendly.pivot",
+            order: 30,
+            words: vec!["pivot"],
+            marks: vec![],
+            run: Run::Parse(Parse {
+                claims: "pivot",
+                reads: &["PIVOT t ON g USING sum(x) GROUP BY id", "PIVOT t ON g IN ('a', 'b') USING sum(x) AS s ORDER BY 1 LIMIT 3", "PIVOT (SELECT * FROM t) ON g"],
+                hook: Hook::Statement(pivot_statement),
+            }),
+        },
+        Pass {
+            name: "friendly.unpivot",
+            order: 40,
+            words: vec!["unpivot"],
+            marks: vec![],
+            run: Run::Parse(Parse { claims: "unpivot", reads: &["UNPIVOT t ON a, b INTO NAME k VALUE v ORDER BY 1", "UNPIVOT t ON a, b"], hook: Hook::Statement(unpivot_statement) }),
+        },
+        Pass {
+            name: "friendly.lambda",
+            order: 20,
+            words: vec!["lambda"],
+            marks: vec![],
+            run: Run::Parse(Parse {
+                claims: "lambda",
+                reads: &["SELECT list_transform(l, LAMBDA x: x + 1) FROM t", "SELECT list_reduce(l, LAMBDA a, b: a + b) FROM t"],
+                hook: Hook::Prefix(lambda_words),
+            }),
+        },
+    ]
+}
+
+/// Another database's word, function or type, a dbt view in parentheses, or a call Pondra refuses by name.
+fn wants_forms(sql: &str) -> bool {
     // (the last alternatives: BigQuery's `SAFE.f(`, and Snowflake's `payload:page` (a colon after a word or a closing
     // bracket, then a letter, `_`, a quote or `[`: not `x::INT`, nor `a = :p`, a parameter))
     static WORDS: LazyLock<Regex> = LazyLock::new(|| {
@@ -51,6 +139,13 @@ pub fn wanted(sql: &str) -> bool {
     // (a materialized view whose query is in parentheses, dbt's `AS (SELECT …)`: nothing else in its
     // text is a friendly form, so `unparen` is what it needs)
     static PAREN_VIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*create\s+(?:or\s+replace\s+)?materialized\s+view\b.*?\bas\s*\(").expect("a regex"));
+    // (a call of one of Postgres's bytea-only functions, whose string literal `expression` reads as a bytea)
+    static BYTEA_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", TAKES_BYTEA.join("|"))).expect("a regex"));
+    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || BYTEA_CALL.is_match(sql) || OURS_CALL.is_match(sql) || TYPES.is_match(sql)
+}
+
+/// A form a rewrite takes that a symbol marks: a zone, an exponent, a bytea, an array literal, a JSONPath.
+fn wants_marked(sql: &str) -> bool {
     // (the forms the rewrites below take: a timestamp's one-digit zone, a number with an exponent, a bytea
     // literal in either of its forms (matched by the word, since the escape form has no `\x` to match),
     // `(a, b) IN (SELECT …)`, a character type's Postgres name, DEFAULT VALUES, LIKE … ESCAPE, an array literal
@@ -59,9 +154,12 @@ pub fn wanted(sql: &str) -> bool {
     static MORE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|\bbytea\b|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\[|->>?\s*'\$|(?:^|[^\w'])[nN]'"#).expect("a regex")
     });
-    // (a call of one of Postgres's bytea-only functions, whose string literal `expression` reads as a bytea)
-    static BYTEA_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::pg_bytea::TAKES_BYTEA.join("|"))).expect("a regex"));
-    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || BYTEA_CALL.is_match(sql) || OURS_CALL.is_match(sql) || TYPES.is_match(sql) || alias_in_where(sql) || alias_after_table(sql)
+    MORE.is_match(sql)
+}
+
+/// A select's alias read in its WHERE, or a DELETE's or UPDATE's table with one.
+fn wants_aliases(sql: &str) -> bool {
+    alias_in_where(sql) || alias_after_table(sql)
 }
 
 /// Whether a name given with `AS` comes up again after a WHERE (a select's alias it may use).
@@ -86,15 +184,14 @@ fn alias_after_table(sql: &str) -> bool {
 
 /// `sql` with what the parser can't read as it is written turned into what it can.
 pub fn text(sql: &str) -> Result<Cow<'_, str>> {
-    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b").expect("a regex"));
+    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b").expect("a regex"));
     if !LOOK.is_match(sql) {
         return Ok(Cow::Borrowed(sql));
     }
-    let mut s = statements(sql)?.unwrap_or_else(|| sql.to_string());
-    s = comprehensions(&s)?;
+    let mut s = sql.to_string();
     // (each pass reads the text as the passes before it left it, tokenized again only after one of them changed it: a
     // `top` that is only a word in a string costs one tokenize, audit 11-02 L13)
-    let passes = [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias];
+    let passes = [asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias];
     let mut next = 0;
     while next < passes.len() {
         let Some(t) = Tokens::of(&s) else { break };
@@ -138,69 +235,267 @@ impl<'a> Tokens<'a> {
     }
 }
 
-/// DuckDB's `LAMBDA x, y: body` as `(x, y) -> body`.
-fn lambda_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
-    let mut edits = Vec::new();
-    for i in (0..t.toks.len()).filter(|&i| t.word(i, Keyword::LAMBDA)) {
-        let (mut j, mut params) = (t.next(i), Vec::new());
-        let parens = t.toks.get(j) == Some(&Token::LParen);
-        if parens {
-            j = t.next(j);
-        }
-        while let Some(Token::Word(w)) = t.toks.get(j) {
-            params.push(w.to_string());
-            j = t.next(j);
-            if t.toks.get(j) != Some(&Token::Comma) {
-                break;
-            }
-            j = t.next(j);
-        }
-        if parens && t.toks.get(j) == Some(&Token::RParen) {
-            j = t.next(j);
-        }
-        if params.is_empty() || t.toks.get(j) != Some(&Token::Colon) {
-            continue;
-        }
-        let params = if params.len() == 1 { params[0].clone() } else { format!("({})", params.join(", ")) };
-        edits.push((t.start[i], t.end(j), format!("{params} ->")));
+/// DuckDB's `LAMBDA x, y: body`, read by the fallback dialect (`dialect.rs`) as `(x, y) -> body`: the tree GenericDialect
+/// reads the old text pass's `(x, y) -> body` to, JSON's arrow at its precedence, which `lambdas` takes as a lambda where
+/// the query is planned (`lambda` gives the body what follows an AND or OR, as it does for `x -> …`). None when the word is
+/// not one: the dialect reads it as a name. (At the start of an expression the arrow takes what follows it there: `a +
+/// LAMBDA x: x` is `a + (x -> x)`, where the text read `(a + x) -> x`; no function takes either.) `LAMBDA (x): …` is not
+/// one: DuckDB refuses it, and GenericDialect reads it as a call of `lambda`, so no hook is asked.
+fn lambda_words(p: &mut Parser) -> Option<Result<Expr, datafusion::sql::sqlparser::parser::ParserError>> {
+    use datafusion::sql::sqlparser::dialect::{Dialect, Precedence};
+    if !matches!(&p.peek_token_ref().token, Token::Word(w) if w.keyword == Keyword::LAMBDA) {
+        return None;
     }
-    Ok(edits)
+    let mut params = match p.maybe_parse(|p| {
+        p.expect_keyword_is(Keyword::LAMBDA)?;
+        let params = p.parse_comma_separated(|p| p.parse_identifier())?;
+        p.expect_token(&Token::Colon)?;
+        Ok(params)
+    }) {
+        Ok(Some(params)) => params,
+        Ok(None) => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    let left = match params.len() {
+        1 => Expr::Identifier(params.remove(0)),
+        _ => Expr::Tuple(params.into_iter().map(Expr::Identifier).collect()),
+    };
+    let arrow = GenericDialect {}.prec_value(Precedence::PgOther);
+    Some(p.parse_subexpr(arrow).map(|body| Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::Arrow, right: Box::new(body) }))
 }
 
-/// List comprehensions, `[expr FOR x IN list IF cond]`, as `array_transform(array_filter(list,
-/// x -> cond), x -> expr)`, inside out.
-fn comprehensions(sql: &str) -> Result<String> {
-    let Some(t) = Tokens::of(sql) else { return Ok(sql.to_string()) };
-    for i in (0..t.toks.len()).filter(|&i| t.toks[i] == Token::LBracket) {
-        let (mut depth, mut parts) = (0i32, Vec::new());
-        let mut close = None;
-        for j in i + 1..t.toks.len() {
-            match &t.toks[j] {
-                Token::LBracket | Token::LParen | Token::LBrace => depth += 1,
-                Token::RBracket if depth == 0 => {
-                    close = Some(j);
-                    break;
+/// A list comprehension, `[expr FOR x IN list IF cond]`, read by the fallback dialect (`dialect.rs`) as
+/// `array_transform(array_filter(list, x -> (cond)), x -> (expr))` (`array_transform((list), x -> (expr))` without IF):
+/// the tree GenericDialect reads that text to, so the tree passes and the engine take it as they took the text.
+/// None when the bracket is not one: the dialect reads it as an array.
+fn comprehension(p: &mut Parser) -> Option<Result<Expr, datafusion::sql::sqlparser::parser::ParserError>> {
+    use datafusion::sql::sqlparser::parser::ParserError;
+    if p.peek_token_ref().token != Token::LBracket {
+        return None;
+    }
+    // (a comprehension from its FOR on: up to it, an array's first element as well)
+    let body = match p.maybe_parse(|p| {
+        p.expect_token(&Token::LBracket)?;
+        let body = p.parse_expr()?;
+        p.expect_keyword_is(Keyword::FOR)?;
+        Ok(body)
+    }) {
+        Ok(Some(body)) => body,
+        Ok(None) => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    // (said where the name should be, as sqlparser says where it stopped)
+    let one_name = |at| ParserError::ParserError(format!("a list comprehension takes one name: [… FOR x IN list]{at}"));
+    let read = |p: &mut Parser| -> Result<Expr, ParserError> {
+        let at = p.peek_token_ref().span.start;
+        let var = match p.parse_identifier() {
+            Ok(v) if v.quote_style.is_none() && v.value.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && v.value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => v,
+            _ => return Err(one_name(at)),
+        };
+        if !p.parse_keyword(Keyword::IN) {
+            return Err(one_name(p.peek_token_ref().span.start));
+        }
+        let list = p.parse_expr()?;
+        let cond = match p.parse_keyword(Keyword::IF) {
+            true => Some(p.parse_expr()?),
+            false => None,
+        };
+        p.expect_token(&Token::RBracket)?;
+        let var = Expr::Identifier(var);
+        Ok(match cond {
+            Some(cond) => templated("array_transform(array_filter($_1, $_2 -> ($_3)), $_2 -> ($_4))", &[list, var, cond, body.clone()]),
+            None => templated("array_transform(($_1), $_2 -> ($_3))", &[list, var, body.clone()]),
+        })
+    };
+    Some(read(p))
+}
+
+/// DuckDB's PIVOT statement, read by the fallback dialect as the standard's (`reordered`).
+fn pivot_statement(d: &dyn Dialect, p: &mut Parser) -> Option<Result<Statement, ParserError>> { reordered(d, p, Keyword::PIVOT) }
+
+/// DuckDB's UNPIVOT statement, read by the fallback dialect as the standard's (`reordered`).
+fn unpivot_statement(d: &dyn Dialect, p: &mut Parser) -> Option<Result<Statement, ParserError>> { reordered(d, p, Keyword::UNPIVOT) }
+
+/// DuckDB's PIVOT and UNPIVOT statements as the standard's table factors, their tokens put in that order and read once
+/// by the dialect (so the other hooks read in them too). The tree is the one GenericDialect reads that text to, which the
+/// tree passes take as they took the old text pass's (a PIVOT's ANY asks the data, `rewrite`):
+/// - `PIVOT rel ON col [IN (v, …)] [USING aggs] [GROUP BY g, …] [ORDER BY …] [LIMIT …]` as `SELECT * FROM rel PIVOT
+///   (aggs FOR col IN (v, … | ANY)) [ORDER BY …] [LIMIT …]`, `count(*)` when USING doesn't say, and with a GROUP BY its
+///   source narrowed to `(SELECT g, …, col, the columns aggs name FROM rel) AS __pivot`, as the standard groups by the
+///   columns it is given;
+/// - `UNPIVOT rel ON a, … [INTO NAME n VALUE v] [ORDER BY …] [LIMIT …]` as `SELECT * FROM rel UNPIVOT (v FOR n IN (a,
+///   …)) [ORDER BY …] [LIMIT …]`, `name` and `value` when INTO doesn't say.
+///
+/// None when the statement's first word is not `word`.
+fn reordered(d: &dyn Dialect, p: &mut Parser, word: Keyword) -> Option<Result<Statement, ParserError>> {
+    if !matches!(&p.peek_token_ref().token, Token::Word(w) if w.keyword == word) {
+        return None;
+    }
+    let first = p.next_token();
+    // (the statement's tokens, to its `;`, left for the parser, or its end)
+    let (mut toks, mut depth) = (Vec::new(), 0i32);
+    loop {
+        match p.peek_token_ref().token {
+            Token::EOF => break,
+            Token::SemiColon if depth == 0 => break,
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ => {}
+        }
+        toks.push(p.next_token());
+    }
+    let end = toks.last().unwrap_or(&first).span.end;
+    Some(reorder(d, word == Keyword::PIVOT, &toks, end))
+}
+
+fn reorder(d: &dyn Dialect, pivot: bool, toks: &[TokenWithSpan], end: Location) -> Result<Statement, ParserError> {
+    use Keyword::{BY, GROUP, INTO, LIMIT, ON, ORDER, USING};
+    let is = |i: usize, k: Keyword| matches!(toks.get(i).map(|t| &t.token), Some(Token::Word(w)) if w.keyword == k);
+    let word = |s: &str| TokenWithSpan::wrap(Token::make_word(s, None));
+    let keyword = |s: &str| TokenWithSpan::wrap(Token::make_keyword(s));
+    let token = |t: Token| TokenWithSpan::wrap(t);
+    // the statement's clauses, each where its words are at the top level, in their order
+    let words: &[&[Keyword]] = match pivot {
+        true => &[&[ON], &[USING], &[GROUP, BY], &[ORDER, BY], &[LIMIT]],
+        false => &[&[ON], &[INTO], &[ORDER, BY], &[LIMIT]],
+    };
+    let mut found: Vec<Option<(usize, usize)>> = vec![None; words.len()]; // (its words, its body)
+    let mut depth = 0i32;
+    for k in 0..toks.len() {
+        match toks[k].token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ if depth == 0 => {
+                for (w, ws) in words.iter().enumerate() {
+                    if found[w..].iter().all(Option::is_none) && ws.iter().enumerate().all(|(n, &x)| is(k + n, x)) {
+                        found[w] = Some((k, k + ws.len()));
+                    }
                 }
-                Token::RBracket | Token::RParen | Token::RBrace => depth -= 1,
-                Token::Word(w) if depth == 0 && w.quote_style.is_none() && matches!(w.keyword, Keyword::FOR | Keyword::IN | Keyword::IF) => parts.push((w.keyword, j)),
-                _ => {}
+            }
+            _ => {}
+        }
+    }
+    let ends: Vec<usize> = (0..words.len()).map(|w| found[w + 1..].iter().flatten().map(|f| f.0).next().unwrap_or(toks.len())).collect();
+    let part = |w: usize| found[w].map(|(_, from)| &toks[from..ends[w]]);
+    let tail = |from: usize| (from..words.len()).filter_map(|w| found[w].map(|(at, _)| &toks[at..ends[w]])).flatten().cloned().collect::<Vec<_>>();
+    let said = |what: &str| ParserError::ParserError(format!("{what}{end}"));
+    let Some((on_at, _)) = found[0] else {
+        return Err(said(match pivot {
+            true => "PIVOT: ON names the column (PIVOT orders ON item USING sum(amount))",
+            false => "UNPIVOT: ON names the columns (UNPIVOT orders ON qty, amount INTO NAME field VALUE value)",
+        }));
+    };
+    let rel = &toks[..on_at];
+    let on = part(0).unwrap_or_default();
+    // (a part read alone: an expression, or the select items of a query)
+    let sub = |t: Vec<TokenWithSpan>| Parser::new(d).with_tokens_with_locations(t);
+    let mut out = vec![keyword("SELECT"), token(Token::Mul), keyword("FROM")];
+    if !pivot {
+        let (mut n, mut v) = (word("name"), word("value"));
+        if let Some(into) = part(1) {
+            let named = |t: &TokenWithSpan, s: &str| matches!(&t.token, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(s));
+            match into {
+                [a, x @ TokenWithSpan { token: Token::Word(_), .. }, b, y @ TokenWithSpan { token: Token::Word(_), .. }] if named(a, "name") && named(b, "value") => (n, v) = (x.clone(), y.clone()),
+                _ => return Err(said("UNPIVOT … INTO NAME n VALUE v")),
             }
         }
-        let Some(close) = close else { continue };
-        let [(Keyword::FOR, f), (Keyword::IN, n), rest @ ..] = parts.as_slice() else { continue };
-        let var = t.span(*f + 1, *n).trim();
-        ensure!(Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("a regex").is_match(var), "a list comprehension takes one name: [… FOR x IN list]");
-        let cond = rest.iter().find(|(k, _)| *k == Keyword::IF).map(|(_, c)| *c);
-        let list = comprehensions(t.span(*n + 1, cond.unwrap_or(close)).trim())?;
-        let body = comprehensions(t.span(i + 1, *f))?;
-        let list = match cond {
-            Some(c) => format!("array_filter({list}, {var} -> ({}))", comprehensions(t.span(c + 1, close).trim())?),
-            None => format!("({list})"),
+        out.extend(rel.iter().cloned());
+        out.extend([keyword("UNPIVOT"), token(Token::LParen), v, keyword("FOR"), n, keyword("IN"), token(Token::LParen)]);
+        out.extend(on.iter().cloned());
+        out.extend([token(Token::RParen), token(Token::RParen)]);
+        out.extend(tail(2));
+    } else {
+        let mut read = sub(on.to_vec());
+        let col = read.parse_expr().and_then(|e| match read.peek_token_ref().token {
+            Token::EOF => Ok(e),
+            _ => read.expected_ref("the end of PIVOT's ON", read.peek_token_ref()),
+        })?;
+        // (`col IN (v, …)`: its column, and the values in its parentheses; a column: ANY)
+        let (col, col_toks, values) = match col {
+            Expr::InList { expr, negated: false, .. } => {
+                let mut depth = 0;
+                let at = (0..on.len()).filter(|&i| {
+                    depth += matches!(on[i].token, Token::LParen) as i32 - matches!(on[i].token, Token::RParen) as i32;
+                    depth == 0 && matches!(&on[i].token, Token::Word(w) if w.keyword == Keyword::IN)
+                });
+                let at = at.last().unwrap_or(on.len());
+                (*expr, &on[..at], on.get(at + 2..on.len().saturating_sub(1)).unwrap_or_default().to_vec())
+            }
+            e @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => (e, on, vec![keyword("ANY")]),
+            _ => return Err(said("PIVOT … ON one column (and IN its values); a pivot on several columns isn't taken yet")),
         };
-        let done = format!("array_transform({list}, {var} -> ({}))", body.trim());
-        return Ok(format!("{}{done}{}", &sql[..t.start[i]], comprehensions(&sql[t.end(close)..])?));
+        let using = part(1).map(<[_]>::to_vec).unwrap_or_else(|| vec![word("count"), token(Token::LParen), token(Token::Mul), token(Token::RParen)]);
+        match part(2) {
+            // (the columns it is grouped by, its column, and the ones its aggregates name, each once)
+            Some(group) => {
+                let mut cols: Vec<(String, Vec<TokenWithSpan>)> = Vec::new();
+                let mut add = |key: String, t: Vec<TokenWithSpan>| {
+                    if !cols.iter().any(|(k, _)| *k == key) {
+                        cols.push((key, t));
+                    }
+                };
+                let mut depth = 0;
+                for g in group.split(|t| {
+                    depth += matches!(t.token, Token::LParen) as i32 - matches!(t.token, Token::RParen) as i32;
+                    depth == 0 && t.token == Token::Comma
+                }) {
+                    let key = sub(g.to_vec()).parse_expr().map(|e| e.to_string()).unwrap_or_else(|_| g.iter().map(|t| t.to_string()).collect());
+                    add(key, g.to_vec());
+                }
+                add(col.to_string(), col_toks.to_vec());
+                let aggs = sub([keyword("SELECT")].into_iter().chain(using.iter().cloned()).collect()).parse_query()?;
+                let _ = crate::walk::visit_expressions(&*aggs, |e| {
+                    let parts = match e {
+                        Expr::Identifier(i) => std::slice::from_ref(i),
+                        Expr::CompoundIdentifier(is) => is.as_slice(),
+                        _ => return ControlFlow::<()>::Continue(()),
+                    };
+                    let t = parts.iter().enumerate().flat_map(|(n, i)| (n > 0).then(|| token(Token::Period)).into_iter().chain([TokenWithSpan::new(Token::make_word(&i.value, i.quote_style), i.span)])).collect();
+                    add(e.to_string(), t);
+                    ControlFlow::Continue(())
+                });
+                out.extend([token(Token::LParen), keyword("SELECT")]);
+                for (n, (_, t)) in cols.into_iter().enumerate() {
+                    if n > 0 {
+                        out.push(token(Token::Comma));
+                    }
+                    out.extend(t);
+                }
+                out.push(keyword("FROM"));
+                out.extend(rel.iter().cloned());
+                out.extend([token(Token::RParen), keyword("AS"), word("__pivot")]);
+            }
+            None => out.extend(rel.iter().cloned()),
+        }
+        out.extend([keyword("PIVOT"), token(Token::LParen)]);
+        out.extend(using);
+        out.push(keyword("FOR"));
+        out.extend(col_toks.iter().cloned());
+        out.extend([keyword("IN"), token(Token::LParen)]);
+        out.extend(values);
+        out.extend([token(Token::RParen), token(Token::RParen)]);
+        out.extend(tail(3));
     }
-    Ok(sql.to_string())
+    let mut read = sub(out);
+    let statement = read.parse_statement()?;
+    match read.peek_token_ref().token {
+        Token::EOF => Ok(statement),
+        _ => read.expected_ref("the end of the statement", read.peek_token_ref()),
+    }
+}
+
+/// `template`, read by GenericDialect, with each `$_n` the nth of `parts`, as it stands (`expander::around` groups them).
+fn templated(template: &str, parts: &[Expr]) -> Expr {
+    let mut e = crate::expander::parse_expr(template).expect("a template that parses");
+    let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
+        if let Expr::Value(ValueWithSpan { value: Value::Placeholder(p), .. }) = x {
+            if let Some(part) = p.strip_prefix("$_").and_then(|n| n.parse::<usize>().ok()).and_then(|n| parts.get(n.wrapping_sub(1))) {
+                *x = part.clone();
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    e
 }
 
 /// DuckDB's `a ASOF [LEFT] JOIN b ON a.k = b.k AND a.t >= b.t`, marked for `asof::as_of`, which
@@ -378,91 +673,6 @@ fn top_alias(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
         }
     }
     Ok(edits)
-}
-
-/// DuckDB's `PIVOT t ON g [IN (…)] [USING agg] [GROUP BY …]` and `UNPIVOT t ON a, b [INTO NAME n
-/// VALUE v]` statements, as the standard's `SELECT * FROM t PIVOT (…)` and `UNPIVOT (…)`.
-fn statements(sql: &str) -> Result<Option<String>> {
-    let Some(t) = Tokens::of(sql) else { return Ok(None) };
-    let first = (0..t.toks.len()).find(|&i| !matches!(t.toks[i], Token::Whitespace(_))).unwrap_or(t.toks.len());
-    let pivot = t.word(first, Keyword::PIVOT);
-    if !pivot && !t.word(first, Keyword::UNPIVOT) {
-        return Ok(None);
-    }
-    // the statement's clauses, each where its first word is at the top level
-    let words: &[&[Keyword]] = match pivot {
-        true => &[&[Keyword::ON], &[Keyword::USING], &[Keyword::GROUP, Keyword::BY], &[Keyword::ORDER, Keyword::BY], &[Keyword::LIMIT]],
-        false => &[&[Keyword::ON], &[Keyword::INTO], &[Keyword::ORDER, Keyword::BY], &[Keyword::LIMIT]],
-    };
-    let mut found: Vec<Option<(usize, usize)>> = vec![None; words.len()];
-    let (mut depth, mut k) = (0i32, t.next(first));
-    while k < t.toks.len() {
-        match &t.toks[k] {
-            Token::LParen => depth += 1,
-            Token::RParen => depth -= 1,
-            _ if depth == 0 => {
-                for (w, ws) in words.iter().enumerate() {
-                    let mut at = k;
-                    let whole = ws.iter().enumerate().all(|(n, &kw)| {
-                        if n > 0 {
-                            at = t.next(at);
-                        }
-                        t.word(at, kw)
-                    });
-                    if whole && found[w].is_none() && found[w..].iter().all(Option::is_none) {
-                        found[w] = Some((k, t.next(at)));
-                    }
-                }
-            }
-            _ => {}
-        }
-        k += 1;
-    }
-    let ends: Vec<usize> = (0..words.len()).map(|w| found[w + 1..].iter().flatten().map(|f| f.0).next().unwrap_or(t.toks.len())).collect();
-    let part = |w: usize| found[w].map(|(_, from)| t.span(from, ends[w]).trim().trim_end_matches(';').trim().to_string());
-    let Some((on_at, _)) = found[0] else { bail!("{}: ON names the column ({})", if pivot { "PIVOT" } else { "UNPIVOT" }, if pivot { "PIVOT orders ON item USING sum(amount)" } else { "UNPIVOT orders ON qty, amount INTO NAME field VALUE value" }) };
-    let rel = t.span(t.next(first), on_at).trim().to_string();
-    let tail = |from: usize| (from..words.len()).filter_map(|w| found[w].map(|(at, _)| t.span(at, ends[w]).trim().trim_end_matches(';').trim().to_string())).collect::<Vec<_>>().join(" ");
-    if !pivot {
-        let on = part(0).unwrap_or_default();
-        let (mut n, mut v) = ("name".to_string(), "value".to_string());
-        if let Some(into) = part(1) {
-            static INTO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?is)^name\s+("[^"]+"|\w+)\s+value\s+("[^"]+"|\w+)$"#).expect("a regex"));
-            let m = INTO.captures(&into).context("UNPIVOT … INTO NAME n VALUE v")?;
-            (n, v) = (m[1].to_string(), m[2].to_string());
-        }
-        return Ok(Some(format!("SELECT * FROM {rel} UNPIVOT ({v} FOR {n} IN ({on})) {}", tail(2))));
-    }
-    let on = expr(&part(0).unwrap_or_default()).context("PIVOT … ON a column")?;
-    let (col, values) = match on {
-        Expr::InList { expr, list, negated: false } => (*expr, list.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ")),
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => (on, "ANY".to_string()),
-        _ => bail!("PIVOT … ON one column (and IN its values); a pivot on several columns isn't taken yet"),
-    };
-    let using = part(1).unwrap_or_else(|| "count(*)".into());
-    let source = match part(2) {
-        Some(group) => {
-            let aggs = query(&format!("SELECT {using}"))?;
-            let mut cols: Vec<String> = Vec::new();
-            for e in group.split(',').map(str::trim).filter(|g| !g.is_empty()).map(String::from).chain([col.to_string()]) {
-                if !cols.contains(&e) {
-                    cols.push(e);
-                }
-            }
-            let _ = crate::walk::visit_expressions(&aggs, |e| {
-                if let Expr::Identifier(_) | Expr::CompoundIdentifier(_) = e {
-                    let e = e.to_string();
-                    if !cols.contains(&e) {
-                        cols.push(e);
-                    }
-                }
-                ControlFlow::<()>::Continue(())
-            });
-            format!("(SELECT {} FROM {rel}) AS __pivot", cols.join(", "))
-        }
-        None => rel,
-    };
-    Ok(Some(format!("SELECT * FROM {source} PIVOT ({using} FOR {col} IN ({values})) {}", tail(3))))
 }
 
 // ---------------------------------------------------------------- the tree
@@ -1473,6 +1683,16 @@ fn expression(e: &mut Expr) -> Result<()> {
             let Value::NationalStringLiteral(s) = std::mem::replace(v, Value::Null) else { unreachable!() };
             *v = Value::SingleQuotedString(s);
         }
+        // (`LAMBDA (x): …`, which GenericDialect reads as a call of lambda and a path, so no hook is asked for it: DuckDB
+        // refuses it too, as its LAMBDA's names have no parentheses)
+        Expr::JsonAccess { value, .. } if matches!(&**value, Expr::Function(f) if f.name.to_string().eq_ignore_ascii_case("lambda")) => {
+            let Expr::Function(f) = &**value else { unreachable!() };
+            let names = match &f.args {
+                FunctionArguments::List(l) => l.args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "),
+                _ => "x".to_string(),
+            };
+            return Err(crate::codes::coded("42601", format!("a LAMBDA's names take no parentheses: LAMBDA {names}: …")));
+        }
         // (Snowflake's `payload:page::STRING`: DataFusion can't plan it, and Pondra's JSON is text, so it is refused with
         // the forms that read it: `->>` for a key, json_extract_string for a path. The path is written as it was)
         Expr::JsonAccess { value, path } => {
@@ -1561,7 +1781,7 @@ fn expression(e: &mut Expr) -> Result<()> {
                 // (Postgres's bytea-only functions read a string literal as their first argument as a bytea, of any
                 // arity: `sha256('\x01')` hashes the byte 0x01, and `encode('\x01', 'hex')` is `01`, as Postgres does;
                 // a column or any other expression is left as it is)
-                (fname, _) if crate::pg_bytea::TAKES_BYTEA.contains(&fname) => {
+                (fname, _) if TAKES_BYTEA.contains(&fname) => {
                     if let Some(Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })) = a.first() {
                         let bytes = crate::pg_bytea::parse(s).map_err(|e| crate::codes::coded(e.code, e.message))?;
                         let lit = expr(&crate::pg_bytea::sql(&bytes))?;
@@ -2184,17 +2404,54 @@ fn lambda(e: &Expr) -> Option<Expr> {
 mod tests {
     use super::*;
 
+    /// DuckDB's PIVOT and UNPIVOT statements read as the old text pass wrote them (`reordered`), its clauses in any case,
+    /// a FROM item of any kind, with a hook's form inside; and refused where it refused them, said where the parse stopped.
+    #[test]
+    fn pivot_statements_read_as_the_text_pass_wrote() {
+        for (sql, wrote) in [
+            ("PIVOT t ON g USING sum(x) GROUP BY id", "SELECT * FROM (SELECT id, g, x FROM t) AS __pivot PIVOT (sum(x) FOR g IN (ANY))"),
+            ("PIVOT t ON g IN ('a', 'b') USING sum(x) AS s ORDER BY 1 LIMIT 3", "SELECT * FROM t PIVOT (sum(x) AS s FOR g IN ('a', 'b')) ORDER BY 1 LIMIT 3"),
+            ("PIVOT (SELECT * FROM t) ON g", "SELECT * FROM (SELECT * FROM t) PIVOT (count(*) FOR g IN (ANY))"),
+            ("PIVOT t ON g", "SELECT * FROM t PIVOT (count(*) FOR g IN (ANY))"),
+            ("pivot t on g using sum(x) as total, max(y) group by id, k order by id", "SELECT * FROM (SELECT id, k, g, x, y FROM t) AS __pivot PIVOT (sum(x) as total, max(y) FOR g IN (ANY)) order by id"),
+            ("PIVOT t ON t.g USING sum(t.x) GROUP BY t.id, t.g", "SELECT * FROM (SELECT t.id, t.g, t.x FROM t) AS __pivot PIVOT (sum(t.x) FOR t.g IN (ANY))"),
+            ("PIVOT t ON g IN (1, 2) USING count(*) GROUP BY id LIMIT 5", "SELECT * FROM (SELECT id, g FROM t) AS __pivot PIVOT (count(*) FOR g IN (1, 2)) LIMIT 5"),
+            ("PIVOT s.t AS a ON g USING avg(x)", "SELECT * FROM s.t AS a PIVOT (avg(x) FOR g IN (ANY))"),
+            ("PIVOT t ON g USING max(cardinality(list_filter(l, LAMBDA x: x > 1)))", "SELECT * FROM t PIVOT (max(cardinality(list_filter(l, x -> x > 1))) FOR g IN (ANY))"),
+            ("PIVOT t ON g USING sum(x) GROUP BY coalesce(a, b), id", "SELECT * FROM (SELECT coalesce(a, b), id, g, x FROM t) AS __pivot PIVOT (sum(x) FOR g IN (ANY))"),
+            ("UNPIVOT t ON a, b INTO NAME k VALUE v ORDER BY 1", "SELECT * FROM t UNPIVOT (v FOR k IN (a, b)) ORDER BY 1"),
+            ("UNPIVOT t ON a, b", "SELECT * FROM t UNPIVOT (value FOR name IN (a, b))"),
+            ("unpivot (SELECT * FROM t) on a, b into name \"K\" value v limit 2", "SELECT * FROM (SELECT * FROM t) UNPIVOT (v FOR \"K\" IN (a, b)) limit 2"),
+            ("UNPIVOT t ON a ORDER BY 1 LIMIT 3; SELECT 1", "SELECT * FROM t UNPIVOT (value FOR name IN (a)) ORDER BY 1 LIMIT 3; SELECT 1"),
+        ] {
+            assert_eq!(crate::parsed::read(sql).unwrap(), Parser::parse_sql(&GenericDialect {}, wrote).unwrap(), "{sql}");
+        }
+        for (sql, said) in [
+            ("PIVOT t USING sum(x)", "PIVOT: ON names the column (PIVOT orders ON item USING sum(amount)) at Line: 1, Column: 21"),
+            ("PIVOT t ON g, h", "PIVOT's ON"),
+            ("PIVOT t ON g + 1", "PIVOT … ON one column (and IN its values); a pivot on several columns isn't taken yet at Line: 1, Column: 17"),
+            ("UNPIVOT t ON a INTO k v", "UNPIVOT … INTO NAME n VALUE v at Line: 1, Column: 24"),
+        ] {
+            let e = crate::parsed::read(sql).unwrap_err().to_string();
+            assert!(e.contains(said), "{sql}: {e}");
+        }
+    }
+
     #[test]
     fn texts() {
-        assert_eq!(text("SELECT list_transform(l, LAMBDA x: x + 1)").unwrap(), "SELECT list_transform(l, x -> x + 1)");
-        assert_eq!(text("SELECT [x * 2 FOR x IN l IF x > 1] FROM t").unwrap(), "SELECT array_transform(array_filter(l, x -> (x > 1)), x -> (x * 2)) FROM t");
-        assert_eq!(text("SELECT [[y FOR y IN x] FOR x IN l]").unwrap(), "SELECT array_transform((l), x -> (array_transform((x), y -> (y))))");
+        // (list comprehensions and LAMBDA are the fallback dialect's: `dialect::tests`)
+        assert_eq!(text("SELECT [x * 2 FOR x IN l IF x > 1] FROM t").unwrap(), "SELECT [x * 2 FOR x IN l IF x > 1] FROM t");
+        assert_eq!(text("SELECT list_transform(l, LAMBDA x: x + 1)").unwrap(), "SELECT list_transform(l, LAMBDA x: x + 1)");
+        let read = |sql| crate::parsed::read(sql).unwrap();
+        assert_eq!(read("SELECT list_transform(l, LAMBDA x: x + 1)"), read("SELECT list_transform(l, x -> x + 1)"));
+        assert_eq!(read("SELECT [x * 2 FOR x IN l IF x > 1] FROM t"), read("SELECT array_transform(array_filter(l, x -> (x > 1)), x -> (x * 2)) FROM t"));
+        assert_eq!(read("SELECT [[y FOR y IN x] FOR x IN l]"), read("SELECT array_transform((l), x -> (array_transform((x), y -> (y))))"));
         assert!(text("SELECT * FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts").unwrap().contains("MATCH_CONDITION (pondra_duckdb_asof) ON"));
         assert!(text("SELECT * FROM t ASOF LEFT JOIN q ON t.ts >= q.ts").unwrap().contains("ASOF JOIN q MATCH_CONDITION (pondra_duckdb_asof_left) ON"));
         assert_eq!(text("SELECT * FROM t USING SAMPLE 10% WHERE x > 1").unwrap(), "SELECT * FROM t WHERE pondra_sample('10%') AND x > 1");
         assert_eq!(text("SELECT * FROM t USING SAMPLE 5 ROWS").unwrap(), "SELECT * FROM t WHERE pondra_sample('5 ROWS') ");
-        assert_eq!(text("PIVOT t ON g USING sum(x) GROUP BY id").unwrap(), "SELECT * FROM (SELECT id, g, x FROM t) AS __pivot PIVOT (sum(x) FOR g IN (ANY)) ");
-        assert_eq!(text("UNPIVOT t ON a, b INTO NAME k VALUE v ORDER BY 1").unwrap(), "SELECT * FROM t UNPIVOT (v FOR k IN (a, b)) ORDER BY 1");
+        // (DuckDB's PIVOT and UNPIVOT statements are the fallback dialect's: `pivot_hooks_read_as_the_old_pass_wrote`)
+        assert_eq!(text("PIVOT t ON g USING sum(x) GROUP BY id").unwrap(), "PIVOT t ON g USING sum(x) GROUP BY id");
         assert_eq!(text("SELECT 'a lambda: no', 1").unwrap(), "SELECT 'a lambda: no', 1");
         assert_eq!(
             text("ALTER TABLE t SET TBLPROPERTIES (write.delete.mode = 'merge-on-read', 'a.b' = '1', c = 2)").unwrap(),
@@ -2447,6 +2704,8 @@ mod tests {
         // (Snowflake's path, and BigQuery's SAFE. prefix, refused with what to write)
         let refusal = call("p:a.b").unwrap_err();
         assert!(crate::codes::of(&refusal) == "0A000" && refusal.to_string().contains("p->>'a'") && refusal.to_string().contains("json_extract_string(p, '$.a.b')"), "{refusal:#}");
+        let refusal = call("LAMBDA (x, i): x").unwrap_err();
+        assert!(crate::codes::of(&refusal) == "42601" && refusal.to_string().contains("LAMBDA x, i: …"), "{refusal:#}");
         let refusal = call("SAFE.PARSE_DATE('%Y', s)").unwrap_err();
         assert!(crate::codes::of(&refusal) == "0A000" && refusal.to_string().contains("SAFE.PARSE_DATE(…) is BigQuery's"), "{refusal:#}");
         // (the look: a colon after a word and before a letter is a path, not `x::INT` nor a parameter `:p`)
@@ -2477,3 +2736,4 @@ mod tests {
         assert!(lambdas("SELECT j -> 'a' FROM t").is_none());
     }
 }
+

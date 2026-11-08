@@ -29,7 +29,7 @@ you get depends on the key:
 | Option | Value | For | Meaning |
 |---|---|---|---|
 | `publish` | `delta`, `iceberg` or `(delta, iceberg)` | all | also write the table as Delta Lake or Iceberg, for other engines. Default: none, or what `--publish` says |
-| `retention` | `'7 days'`, `'12 hours'`, `'0 seconds'` | all | how long the table's past is kept: read as it was with `t AT (…)`, and, dropped, brought back with `UNDROP TABLE`. Default: a day |
+| `retention` | `'7 days'`, `'12 hours'`, `'0 seconds'` | all | how long the table's past is kept: read as it was with `t AT (…)`, and, dropped, brought back with `UNDROP TABLE`. Default: 7 days |
 
 An option name that isn't in this table is refused when you `CREATE` the table, and the error names
 it. In `CREATE TABLE t … AS SELECT …`, the clauses and `WITH` come before `AS`.

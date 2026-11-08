@@ -3,8 +3,6 @@
 #[cfg(feature = "doors")]
 use crate::app::App;
 #[cfg(feature = "doors")]
-use crate::store::{table_key, TableMeta};
-#[cfg(feature = "doors")]
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -156,28 +154,44 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
             metric("mark_expiries", "gauge", "expiry keys (g/) waiting: each goes with its mark once its window is up", &one(expiries as f64));
         }
     }
-    let tables = app.lake.cat.scan::<TableMeta>("t/", "t0").await?;
-    let (mut files, mut rows, mut bytes, mut entry) = (vec![], vec![], vec![], vec![]);
-    for (key, m) in &tables {
-        let t = &key[table_key("").len()..];
-        let s = m.sealed.clone().unwrap_or_default();
-        files.push((format!("{{table=\"{t}\",where=\"inline\"}}"), m.files.len() as f64));
-        files.push((format!("{{table=\"{t}\",where=\"sealed\"}}"), s.files as f64));
-        rows.push((format!("{{table=\"{t}\"}}"), (s.rows + m.files.iter().map(|f| f.rows).sum::<u64>()) as f64));
-        bytes.push((format!("{{table=\"{t}\"}}"), (s.bytes + m.files.iter().map(|f| f.bytes).sum::<u64>()) as f64));
-        entry.push((format!("{{table=\"{t}\"}}"), crate::store::json(m).len() as f64));
-    }
-    metric("table_files", "gauge", "Parquet files: listed in the catalog entry, or in manifests", &files);
-    metric("table_rows", "gauge", "rows in Parquet files", &rows);
-    metric("table_bytes", "gauge", "bytes of Parquet files", &bytes);
-    metric("table_entry_bytes", "gauge", "size of the table's catalog entry (what every commit to it writes)", &entry);
-    // What publishing a table in an open format keeps (it names manifests, not files: ADR-012).
+    // The tables' files, rows and sizes, from what this node knows of each (`tier::refresh`: the tables committed since
+    // its last look, and every table once a minute), so a scrape's reads follow what changed, not how many tables the
+    // lake holds. The lake's totals here, so a lake of thousands of tables is still a few series; a line for each table
+    // is `GET /metrics/tables` (`tables`).
+    let (count, [files, rows, bytes, entry]) = app.table_lines(false).await?;
+    metric("tables", "gauge", "tables in the catalog", &one(count as f64));
+    metric("table_files", "gauge", "Parquet files of the lake's tables: listed in the catalog entries, or in manifests (each table's: GET /metrics/tables)", &files);
+    metric("table_rows", "gauge", "rows in the lake's tables' Parquet files", &rows);
+    metric("table_bytes", "gauge", "bytes of the lake's tables' Parquet files", &bytes);
+    metric("table_entry_bytes", "gauge", "size of the lake's tables' catalog entries (what every commit to one writes)", &entry);
+    Ok(out)
+}
+
+/// `GET /metrics/tables`: `render`'s table lines for each table, labelled `table` (as `/metrics` gave them before it
+/// gave the lake's totals), and what publishing each table in an open format keeps. One scrape is five lines a table,
+/// so it is an endpoint of its own, scraped by whoever wants each table's numbers. They come from the same map
+/// (`tier::refresh`), except the published state, which reads each published table's record.
+#[cfg(feature = "doors")]
+pub async fn tables(app: &App) -> anyhow::Result<String> {
+    let mut out = String::new();
+    let mut metric = |name: &str, help: &str, samples: &[(String, f64)]| {
+        let _ = writeln!(out, "# HELP pondra_{name} {help}\n# TYPE pondra_{name} gauge");
+        for (labels, v) in samples {
+            let _ = writeln!(out, "pondra_{name}{labels} {v}");
+        }
+    };
+    let (_, [files, rows, bytes, entry]) = app.table_lines(true).await?;
+    metric("table_files", "Parquet files of each table: listed in the catalog entry, or in manifests", &files);
+    metric("table_rows", "rows in each table's Parquet files", &rows);
+    metric("table_bytes", "bytes of each table's Parquet files", &bytes);
+    metric("table_entry_bytes", "size of each table's catalog entry (what every commit to it writes)", &entry);
+    // (publishing names manifests, not files: ADR-012)
     let mut published = vec![];
     for (format, prefix) in [("delta", "x/"), ("iceberg", "i/")] {
         for (key, v) in app.lake.cat.scan::<serde_json::Value>(prefix, &format!("{prefix}\u{10ffff}")).await? {
             published.push((format!("{{table=\"{}\",format=\"{format}\"}}", &key[prefix.len()..]), crate::store::json(&v).len() as f64));
         }
     }
-    metric("published_state_bytes", "gauge", "size of what the catalog keeps about a published table", &published);
+    metric("published_state_bytes", "size of what the catalog keeps about a published table", &published);
     Ok(out)
 }

@@ -77,9 +77,10 @@ pub struct Routines {
 
 /// The front:
 pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String>) -> Result<String> {
-    crate::kept::refused(sql)?; // (1.1's statements, refused by name at every door in the same words: `kept.rs`)
-    crate::dialect_stmts::refused(sql)?; // (another database's statement for what Pondra writes otherwise, in every form: `dialect_stmts.rs`)
-    crate::pattern::refused(sql)?; // (MATCH_RECOGNIZE's SUBSET, and a materialized view over one of a subquery: refused by name with what to write, `pattern.rs`)
+    // (the registry's passes, each where its trigger is in the text, `passes.rs`: first the refusals, by name and with what
+    // to write (1.1's statements, `kept.rs`; another database's, `dialect_stmts.rs`; MATCH_RECOGNIZE's SUBSET, `pattern.rs`))
+    let passes = crate::passes::get();
+    passes.refuse(sql)?;
     let sql = &match host.own(sql).await? {
         Own::Answer(q) => return Ok(q),
         Own::Go(sql) => sql,
@@ -88,11 +89,10 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     if let Some(q) = crate::friendly::summarize(host, sql).await? {
         return Ok(q);
     }
-    let sql = &crate::sparksql::inline(sql)?; // (`spark_sql('…')`: Spark SQL as Pondra's, then expanded as any)
-    let sql = &crate::diff::diffs(sql)?; // (`pondra.diff('prod.t', 'dev.t')`: rows apart, ADR-047)
-    let sql = &crate::past_names::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
-    let sql = &crate::friendly::text(sql)?.into_owned(); // (`PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON: as SQL that parses)
-    let sql = &crate::pattern::text(sql).into_owned(); // (FINAL and RUNNING before a measure: as calls that parse; a subquery before MATCH_RECOGNIZE: as a CTE)
+    // (then the text's passes, in order: `spark_sql('…')` as Pondra's SQL; `pondra.diff('prod.t', 'dev.t')`, ADR-047;
+    // `t AT (VERSION => n)`, ADR-043; `PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON; FINAL and RUNNING before a
+    // measure, a subquery before MATCH_RECOGNIZE: each as SQL that parses)
+    let sql = &passes.text(sql)?.into_owned();
     let marked = crate::measures::text(sql); // (`sum(x) AS MEASURE revenue`: an alias that parses, ADR-065 §3)
     let sql: &str = &marked;
     let Routines { own: all, lake } = host.routines().await?;
@@ -103,17 +103,28 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     let as_written = || Ok(crate::expander::named_apart(sql).unwrap_or_else(|| sql.to_string()));
     let measure_views = host.measure_views(sql).await?;
     let measured = crate::measures::wanted(sql, &measure_views); // (a view with measures read, or a measure named)
-    if !expands && !measured && !crate::friendly::wanted(sql) && !crate::pattern::wanted(sql) && !crate::text::names_a_type(sql) {
+    if !expands && !measured && !passes.wants(sql)? { // (a tree pass's look: friendly's forms, MATCH_RECOGNIZE, a type of one's own)
         return as_written();
     }
     // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
     static LEADING_FROM: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*from\b").expect("a regex"));
-    let parsed = crate::parsed::generic(sql).or_else(|e| match LEADING_FROM.is_match(sql) { // (parsed once for the front's looks: `parsed.rs`)
-        true => Parser::parse_sql(&GenericDialect {}, &format!("SELECT * {sql}")),
+    // (parsed once for the front's looks, `parsed.rs`; a text generic refuses read with the fallback dialect's hooks)
+    let parsed = crate::parsed::read(sql).or_else(|e| match LEADING_FROM.is_match(sql) {
+        true => {
+            let all = format!("SELECT * {sql}");
+            Parser::parse_sql(&GenericDialect {}, &all).or_else(|_| crate::dialect::parse(&all).0).map_err(|_| e)
+        }
         false => Err(e),
     });
-    let Ok(mut stmts) = parsed else { return if expands { Ok(sql.to_string()) } else { as_written() } };
+    let mut stmts = match parsed {
+        Ok(stmts) => stmts,
+        // (the fallback read further than generic did: its error, which DataFusion's parse of the text never gives)
+        Err(e) if crate::parsed::generic(sql).err().is_some_and(|g| g != e) => return Err(datafusion::error::DataFusionError::SQL(Box::new(e), None).into()),
+        Err(_) => return if expands { Ok(sql.to_string()) } else { as_written() },
+    };
+    // (a tree only the fallback dialect read, or the FROM-first reading: printed, as nothing after the front reads the text)
+    let read_apart = crate::parsed::generic(sql).is_err();
     let name = host.name();
     let me = format!("{name}.");
     // Measures first, at the query's own grain (ADR-065 §3): what they put in (a view's FROM, its macros) is expanded below.
@@ -133,8 +144,8 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     let typed = crate::pg_casts::rewrite(host, &mut stmts).await?; // (JSON's set functions, uuid and json casts, pg_typeof, a lateral generate_series, array literals, an enum's casts as text)
     // DuckDB's and Snowflake's forms (`friendly.rs`): a text sent on as it was when none is in it
     let friendly = crate::friendly::rewrite(host, &mut stmts).await?;
-    if !expands && !friendly && !typed && !patterned {
+    if !expands && !friendly && !typed && !patterned && !read_apart {
         return as_written();
     }
-    Ok(crate::text::text(&stmts))
+    Ok(crate::text::text_kept(stmts)) // (kept as the printed text's parse: the engine plans from the tree, `parsed::keep`)
 }

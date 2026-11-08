@@ -71,8 +71,9 @@ impl Drop for Open {
     fn drop(&mut self) { OPEN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); }
 }
 
-/// The answers end once the caller may no longer have them: its sign-in revoked, expired, or no longer a reader, checked
-/// every 5 s (`server::until_revoked`) whether or not they change; each answer is as its sign-in and grants are then (`lines`).
+/// The answers end once the caller may no longer have them: its sign-in revoked, expired, or no longer a reader, asked again
+/// once the lake's rights move (`server::until_revoked`) whether or not they change; each answer is as its sign-in and grants
+/// are then (`lines`).
 pub async fn live(State(app): State<App>, Query(p): Query<Params>, headers: axum::http::HeaderMap, body: bytes::Bytes) -> Response {
     let every = Duration::from_millis(p.every_ms.unwrap_or(100).max(10));
     let revoked = crate::server::until_revoked(app.clone(), crate::auth::operator(), header(&headers), |p| p.role >= crate::auth::Role::Read);
@@ -147,10 +148,10 @@ fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::
             // password changed, and the answer is refused, which ends them: 11-02 audit H3. The nodes' own and an open
             // node's caller, signed in by nothing, stay as they came)
             let who = match (&w.header, w.who.operator) {
-                (Some(h), false) => crate::users::who(&w.app.lake, &w.app.auth, &crate::auth::Credential::of_header(Some(h))).await.map(|p| p.at(w.who.door, w.who.from)).unwrap_or_else(|| crate::auth::Principal { name: w.who.name.clone(), role: crate::auth::Role::None, access: Some(Default::default()), door: w.who.door, from: w.who.from, operator: false, epoch: 0, until: None }), // (gone: nothing)
+                (Some(h), false) => crate::users::who(&w.app.lake, &w.app.auth, &crate::auth::Credential::of_header(Some(h))).await.map(|p| p.at(w.who.door, w.who.from)).unwrap_or_else(|| crate::auth::Principal { name: w.who.name.clone(), role: crate::auth::Role::None, scope: crate::rights::Scope::granted(Default::default()), door: w.who.door, from: w.who.from, operator: false, epoch: 0, until: None }), // (gone: nothing)
                 _ => w.who.clone(),
             };
-            let rows = crate::temp::SESSION.scope(w.session.clone(), crate::auth::WHO.scope(who, w.app.query(&w.sql, None))).await.and_then(|b| crate::answer::render(&b, None, crate::pages::keep));
+            let rows = crate::temp::SESSION.scope(w.session.clone(), crate::auth::WHO.scope(who, w.app.query(&w.sql, None))).await.and_then(|b| crate::answer::render(&b, None, &|rows| crate::pages::keep(&w.app.lake, rows)));
             let rows = match rows {
                 Ok(r) => r,
                 Err(e) => return Some((Ok(error(e, &w.tag)), None)),

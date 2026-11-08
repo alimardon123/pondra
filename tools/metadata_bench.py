@@ -27,10 +27,11 @@ T2000 = 946684800  # 2000-01-01 in seconds
 
 def metrics(port):
     out = {}
-    for line in call(port, "GET", "/metrics").decode().splitlines():
-        if line and not line.startswith("#"):
-            name, v = line.rsplit(" ", 1)
-            out[name] = float(v)
+    for path in ("/metrics", "/metrics/tables"):  # (the node's, then a line for each table)
+        for line in call(port, "GET", path).decode().splitlines():
+            if line and not line.startswith("#"):
+                name, v = line.rsplit(" ", 1)
+                out[name] = float(v)
     return out
 
 
