@@ -192,8 +192,7 @@ impl Node {
         crate::origins::check()?; // (a page's origins that aren't origins stop the node here, before it joins or serves: `origins.rs`)
         let owner = start.auth.owner_key().map(str::to_string); // (what `ask` signs with)
         let (_, store, _) = store::open_store(&dir)?;
-        store::trace_from_now();
-        let tr = store::trace;
+        let tr = |what: &str| here.trace(what); // (timed from this start: `NodeState::trace`)
         let addr = advertise.unwrap_or_else(|| listen.clone()); // (how others reach it: its cluster name)
         if lives {
             sharing::set_endpoint(&addr); // (where a recipient's profile points: `sharing.rs`)

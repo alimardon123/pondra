@@ -10,6 +10,8 @@
 //! The tree passes (`pattern::rewrite`, `pg_casts::rewrite`, `friendly::rewrite`, the measures) are still named in
 //! `front::expand`: they take the host, whose futures aren't boxed yet (step 8's PR 9 brings them here).
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use datafusion::sql::sqlparser::ast::Expr;
+use datafusion::sql::sqlparser::parser::{Parser, ParserError};
 use std::borrow::Cow;
 use std::sync::OnceLock;
 
@@ -22,6 +24,8 @@ pub enum Phase {
     Text,
     /// Before the parse: whether one of the front's tree passes may have something to do in the text.
     Wants,
+    /// In the parse: a hook of the fallback dialect (`dialect.rs`), which reads a form in a text GenericDialect refuses.
+    Parse,
 }
 
 /// What a pass does: today's function of its module, unchanged.
@@ -30,6 +34,25 @@ pub enum Run {
     Refuse(fn(&str) -> anyhow::Result<()>),
     Text(for<'a> fn(&'a str) -> anyhow::Result<Cow<'a, str>>),
     Wants(fn(&str) -> bool),
+    Parse(Parse),
+}
+
+/// A hook of the fallback dialect: the token or keyword it claims (one hook a claim), the texts it reads (each one
+/// GenericDialect refuses: a test holds it to that, so a sqlparser that starts reading one fails it, and the hook yields
+/// or goes), and its parse.
+#[derive(Clone, Copy, Debug)]
+pub struct Parse {
+    pub claims: &'static str,
+    #[cfg_attr(not(test), allow(dead_code))] // (read by its test: `dialect::tests`)
+    pub reads: &'static [&'static str],
+    pub hook: Hook,
+}
+
+/// Where a hook reads, and its read: None leaves the parser where it was, for the dialect's own reading.
+#[derive(Clone, Copy, Debug)]
+pub enum Hook {
+    /// At the start of an expression (sqlparser's `Dialect::parse_prefix`).
+    Prefix(fn(&mut Parser) -> Option<Result<Expr, ParserError>>),
 }
 
 /// A pass: its name (`module.look`), its place (its run's phase, and its order in it: no two passes of a phase share
@@ -51,6 +74,7 @@ impl Pass {
             Run::Refuse(_) => Phase::Refuse,
             Run::Text(_) => Phase::Text,
             Run::Wants(_) => Phase::Wants,
+            Run::Parse(_) => Phase::Parse,
         }
     }
 }
@@ -76,6 +100,11 @@ impl Passes {
         assert!(self.all.iter().all(|p| p.name != pass.name), "two passes are named {}", pass.name);
         if let Some(other) = self.all.iter().find(|p| p.phase() == pass.phase() && p.order == pass.order) {
             panic!("passes {} and {} both take order {} of {:?}", other.name, pass.name, pass.order, pass.phase());
+        }
+        if let Run::Parse(h) = pass.run {
+            if let Some(other) = self.all.iter().find(|p| matches!(p.run, Run::Parse(o) if o.claims.eq_ignore_ascii_case(h.claims))) {
+                panic!("hooks {} and {} both claim {}", other.name, pass.name, h.claims);
+            }
         }
         assert!(self.all.len() < 128, "at most 128 passes: `Fired` is a u128");
         self.all.push(pass);
@@ -135,22 +164,43 @@ impl Passes {
         Ok(out)
     }
 
-    /// Whether any `Wants` pass has something to do in `sql`, each asked only when its trigger fired.
+    /// Whether any `Wants` pass has something to do in `sql`, each asked only when its trigger fired; or, when a hook's
+    /// trigger fired, whether GenericDialect refuses the text, so the front reads it with the fallback dialect.
     pub fn wants(&self, sql: &str) -> anyhow::Result<bool> {
         let fired = self.fired(sql);
         let mut wanted = false;
         for (i, p) in self.all.iter().enumerate() {
-            let Run::Wants(f) = p.run else { continue };
-            match fired.has(i) {
-                true => wanted = wanted || f(sql),
-                false if checked() => anyhow::ensure!(!f(sql), "{}", missed(p, sql)),
-                false => {}
+            match (p.run, fired.has(i)) {
+                (Run::Wants(f), true) => wanted = wanted || f(sql),
+                (Run::Wants(f), false) if checked() => anyhow::ensure!(!f(sql), "{}", missed(p, sql)),
+                (Run::Parse(_), true) => wanted = wanted || crate::parsed::generic(sql).is_err(),
+                _ => {}
             }
             if wanted && !checked() {
                 return Ok(true);
             }
         }
+        if checked() && !wanted && crate::parsed::generic(sql).is_err() {
+            self.hooks_fired(sql, &crate::dialect::parse(sql).1)?; // (a hook that would read the text: its trigger fired)
+        }
         Ok(wanted)
+    }
+
+    /// The fallback dialect's hooks, in their order.
+    pub fn hooks(&self) -> impl Iterator<Item = (&'static str, Parse)> + '_ {
+        self.all.iter().filter_map(|p| match p.run {
+            Run::Parse(h) => Some((p.name, h)),
+            _ => None,
+        })
+    }
+
+    /// Each hook in `used` (the ones that read part of `sql`) had its trigger fired there: else the error that names it.
+    pub fn hooks_fired(&self, sql: &str, used: &[&str]) -> anyhow::Result<()> {
+        let fired = self.fired(sql);
+        for (i, p) in self.all.iter().enumerate().filter(|(_, p)| used.contains(&p.name)) {
+            anyhow::ensure!(fired.has(i), "{}", missed(p, sql));
+        }
+        Ok(())
     }
 }
 
@@ -161,7 +211,7 @@ pub fn get() -> &'static Passes {
 
 /// Whether a pass whose trigger didn't fire is run anyway, and its having something to do refused (`missed`): in a debug
 /// build, and in a node started with `PONDRA_TEST_PASSES` (the gates' runs).
-fn checked() -> bool {
+pub(crate) fn checked() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| cfg!(debug_assertions) || crate::env::is_set("PONDRA_TEST_PASSES"));
     *ON
 }
@@ -262,7 +312,7 @@ fn follows(b: &[u8], mut at: usize, rest: &[&str]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn refuse_none(_: &str) -> anyhow::Result<()> { Ok(()) }
@@ -274,6 +324,7 @@ mod tests {
             Phase::Refuse => Run::Refuse(refuse_none),
             Phase::Text => Run::Text(text_none),
             Phase::Wants => Run::Wants(wants_none),
+            Phase::Parse => Run::Parse(Parse { claims: name, reads: &[], hook: Hook::Prefix(|_| None) }),
         };
         Pass { name, order, words: words.to_vec(), marks: marks.to_vec(), run }
     }
@@ -311,6 +362,17 @@ mod tests {
         s.add(pass("c.three", Phase::Text, 5, &["y"], &[]));
     }
 
+    /// Two hooks can't claim one token or keyword: the fallback dialect would ask only the first.
+    #[test]
+    #[should_panic(expected = "hooks a.one and b.two both claim [")]
+    fn two_hooks_claiming_one_token_are_refused() {
+        let hook = |claims| Run::Parse(Parse { claims, reads: &[], hook: Hook::Prefix(|_| None) });
+        let mut s = Passes::default();
+        s.add(Pass { name: "a.one", order: 1, words: vec!["x"], marks: vec![], run: hook("[") });
+        s.add(Pass { name: "c.three", order: 3, words: vec!["x"], marks: vec![], run: hook("lambda") });
+        s.add(Pass { name: "b.two", order: 2, words: vec!["x"], marks: vec![], run: hook("[") });
+    }
+
     /// Every pass of this build is quiet where its trigger is not in the text: a refusal lets the text go, a text pass gives
     /// it back as it was, a look finds nothing. Over a corpus of the SQL this repository holds (its tests' strings, the
     /// harness's, the conformance files, the docs' examples, TPC-H, the answers recorded from Postgres), each pass on the
@@ -322,6 +384,7 @@ mod tests {
             Run::Refuse(f) => f(sql).is_ok(),
             Run::Text(f) => f(sql).is_ok_and(|t| t == sql),
             Run::Wants(f) => !f(sql),
+            Run::Parse(_) => true, // (a hook reads in the parse: `dialect::tests`)
         };
         let corpus = corpus();
         assert!(corpus.len() > 5000, "the corpus is the repository's SQL: {} texts", corpus.len());
@@ -360,7 +423,7 @@ mod tests {
 
     /// The repository's SQL: string literals that start as a statement does in src/ and tools/harness.py, the records of
     /// tests/forms/*.slt, the docs' sql blocks, TPC-H's queries and the texts recorded from Postgres (tools/pg16).
-    fn corpus() -> Vec<String> {
+    pub(crate) fn corpus() -> Vec<String> {
         use std::collections::BTreeSet;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
@@ -455,6 +518,7 @@ mod tests {
                 (Phase::Wants, "friendly.aliases"),
                 (Phase::Wants, "pattern.wanted"),
                 (Phase::Wants, "text.names_a_type"),
+                (Phase::Parse, "friendly.comprehension"),
             ]
         );
     }

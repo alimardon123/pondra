@@ -19,6 +19,8 @@ pub struct NodeState {
     pub drain: Drain,
     /// What counts as a use of it, for `--idle-exit` (`idle.rs`).
     pub idle: Idle,
+    /// When its start began: what `PONDRA_TRACE_START`'s times count from (`trace`).
+    began: datafusion::common::instant::Instant,
 }
 
 impl NodeState {
@@ -26,10 +28,20 @@ impl NodeState {
     pub fn new(life: Life) -> Arc<NodeState> { NodeState::on(life, crate::machine::installed()) }
 
     /// A node's state on a machine of its own (the sim's member: one with little memory, say).
-    pub fn on(life: Life, machine: crate::machine::Mach) -> Arc<NodeState> { Arc::new(NodeState { life, machine, drain: Drain::default(), idle: Idle::default() }) }
+    pub fn on(life: Life, machine: crate::machine::Mach) -> Arc<NodeState> {
+        Arc::new(NodeState { life, machine, drain: Drain::default(), idle: Idle::default(), began: datafusion::common::instant::Instant::now() })
+    }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).
     pub fn unhosted() -> Arc<NodeState> { NodeState::new(crate::lifecycle::unhosted()) }
+
+    /// A cold start's step and its time since this node's start began, with `PONDRA_TRACE_START` (`tools/cold_trace.sh`,
+    /// C5). The catalog's open times its own steps (`store::trace_since`).
+    pub fn trace(&self, what: &str) {
+        if crate::env::is_set("PONDRA_TRACE_START") {
+            eprintln!("start: {what} {:.2} s", self.began.elapsed().as_secs_f64());
+        }
+    }
 }
 
 /// The HTTP door's state, in order: not opened, serving, closing (its streams end and its answers go out), closed.

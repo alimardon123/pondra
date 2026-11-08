@@ -156,24 +156,42 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     }
     // The tables' files, rows and sizes, from what this node knows of each (`tier::refresh`: the tables committed since
     // its last look, and every table once a minute), so a scrape's reads follow what changed, not how many tables the
-    // lake holds. The lake's totals, or with PONDRA_METRICS_TABLES a line for each table (a lake of thousands of tables
-    // would be too many series for most scrapers).
-    let per_table = crate::env::flag("PONDRA_METRICS_TABLES");
-    let (count, [files, rows, bytes, entry]) = app.table_lines(per_table).await?;
-    let each = if per_table { "each table's" } else { "the lake's tables'" };
+    // lake holds. The lake's totals here, so a lake of thousands of tables is still a few series; a line for each table
+    // is `GET /metrics/tables` (`tables`).
+    let (count, [files, rows, bytes, entry]) = app.table_lines(false).await?;
     metric("tables", "gauge", "tables in the catalog", &one(count as f64));
-    metric("table_files", "gauge", &format!("Parquet files of {each}: listed in the catalog entry, or in manifests (a line for each table with PONDRA_METRICS_TABLES)"), &files);
-    metric("table_rows", "gauge", &format!("rows in {each} Parquet files"), &rows);
-    metric("table_bytes", "gauge", &format!("bytes of {each} Parquet files"), &bytes);
-    metric("table_entry_bytes", "gauge", &format!("size of {each} catalog entries (what every commit to one writes)"), &entry);
-    // What publishing a table in an open format keeps (it names manifests, not files: ADR-012), with PONDRA_METRICS_TABLES:
-    // it reads each published table's record.
+    metric("table_files", "gauge", "Parquet files of the lake's tables: listed in the catalog entries, or in manifests (each table's: GET /metrics/tables)", &files);
+    metric("table_rows", "gauge", "rows in the lake's tables' Parquet files", &rows);
+    metric("table_bytes", "gauge", "bytes of the lake's tables' Parquet files", &bytes);
+    metric("table_entry_bytes", "gauge", "size of the lake's tables' catalog entries (what every commit to one writes)", &entry);
+    Ok(out)
+}
+
+/// `GET /metrics/tables`: `render`'s table lines for each table, labelled `table` (as `/metrics` gave them before it
+/// gave the lake's totals), and what publishing each table in an open format keeps. One scrape is five lines a table,
+/// so it is an endpoint of its own, scraped by whoever wants each table's numbers. They come from the same map
+/// (`tier::refresh`), except the published state, which reads each published table's record.
+#[cfg(feature = "doors")]
+pub async fn tables(app: &App) -> anyhow::Result<String> {
+    let mut out = String::new();
+    let mut metric = |name: &str, help: &str, samples: &[(String, f64)]| {
+        let _ = writeln!(out, "# HELP pondra_{name} {help}\n# TYPE pondra_{name} gauge");
+        for (labels, v) in samples {
+            let _ = writeln!(out, "pondra_{name}{labels} {v}");
+        }
+    };
+    let (_, [files, rows, bytes, entry]) = app.table_lines(true).await?;
+    metric("table_files", "Parquet files of each table: listed in the catalog entry, or in manifests", &files);
+    metric("table_rows", "rows in each table's Parquet files", &rows);
+    metric("table_bytes", "bytes of each table's Parquet files", &bytes);
+    metric("table_entry_bytes", "size of each table's catalog entry (what every commit to it writes)", &entry);
+    // (publishing names manifests, not files: ADR-012)
     let mut published = vec![];
-    for (format, prefix) in [("delta", "x/"), ("iceberg", "i/")].into_iter().filter(|_| per_table) {
+    for (format, prefix) in [("delta", "x/"), ("iceberg", "i/")] {
         for (key, v) in app.lake.cat.scan::<serde_json::Value>(prefix, &format!("{prefix}\u{10ffff}")).await? {
             published.push((format!("{{table=\"{}\",format=\"{format}\"}}", &key[prefix.len()..]), crate::store::json(&v).len() as f64));
         }
     }
-    metric("published_state_bytes", "gauge", "size of what the catalog keeps about a published table (with PONDRA_METRICS_TABLES)", &published);
+    metric("published_state_bytes", "size of what the catalog keeps about a published table", &published);
     Ok(out)
 }

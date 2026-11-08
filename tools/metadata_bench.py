@@ -27,10 +27,11 @@ T2000 = 946684800  # 2000-01-01 in seconds
 
 def metrics(port):
     out = {}
-    for line in call(port, "GET", "/metrics").decode().splitlines():
-        if line and not line.startswith("#"):
-            name, v = line.rsplit(" ", 1)
-            out[name] = float(v)
+    for path in ("/metrics", "/metrics/tables"):  # (the node's, then a line for each table)
+        for line in call(port, "GET", path).decode().splitlines():
+            if line and not line.startswith("#"):
+                name, v = line.rsplit(" ", 1)
+                out[name] = float(v)
     return out
 
 
@@ -50,7 +51,7 @@ def timed(f, n=5):
 def main():
     lake = harness.new_lake()
     port = A.port
-    node = Node(lake, port, env={"PONDRA_METRICS_TABLES": "on"}, **({"publish": "delta,iceberg"} if A.publish else {})).start()  # (a line of /metrics for each table)
+    node = Node(lake, port, **({"publish": "delta,iceberg"} if A.publish else {})).start()
     sql(port, "CREATE TABLE events (id BIGINT, ts TIMESTAMP, v DOUBLE, name VARCHAR)")
     columns = [["id", "Int64"], ["ts", "Timestamp(Microsecond, None)"], ["v", "Float64"], ["name", "Utf8"]] # (as created above)
     now, appended = int(time.time()), [0]
@@ -135,7 +136,7 @@ def main():
     day_files = m2["pondra_files_scanned_total"] - m1["pondra_files_scanned_total"]
     # A restarted node: nothing cached.
     node.kill()
-    node = Node(lake, port, env={"PONDRA_METRICS_TABLES": "on"}, **({"publish": "delta,iceberg"} if A.publish else {})).start()  # (a line of /metrics for each table)
+    node = Node(lake, port, **({"publish": "delta,iceberg"} if A.publish else {})).start()
     s = time.time()
     cold = query(8)
     cold_ms = round((time.time() - s) * 1000, 1)

@@ -4319,7 +4319,7 @@ def scale():
     iso = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     lake = new_lake()
     port = A.port
-    node = Node(lake, port, tier_secs=0.5, env={"PONDRA_METRICS_TABLES": "on"}).start()  # (`ev`'s files below: a line for each table)
+    node = Node(lake, port, tier_secs=0.5).start()
     q = lambda s, p=port: sql(p, s)
     refused = [_raises(lambda s=s: q(s)) for s in (
         "CREATE TABLE bad1 (id BIGINT, ts TIMESTAMP) WITH (partition_by = 'week(ts)')",
@@ -4349,13 +4349,13 @@ def scale():
         expect(base + r * 3600)
     n_rows, total = sum(days.values()), 200 * 100 * 1.0 + 60 * 50 * 2.0 + 100
     for _ in range(40):  # tiering, merges and sealing settle
-        m = metrics_of(port)
+        m = {**metrics_of(port), **metrics_of(port, path="/metrics/tables")}  # (`ev`'s files: a line for each table)
         if m.get("pondra_untiered_rows", 1) == 0 and m['pondra_table_files{table="ev",where="inline"}'] <= 128:
             break
         time.sleep(0.5)
     call(port, "POST", "/tier")
     time.sleep(2)
-    m = metrics_of(port)
+    m = metrics_of(port, path="/metrics/tables")
     inline, sealed = m['pondra_table_files{table="ev",where="inline"}'], m['pondra_table_files{table="ev",where="sealed"}']
     per_day = {r["d"]: r["n"] for r in q("SELECT CAST(date_trunc('day', ts) AS VARCHAR) AS d, count(*) AS n FROM ev GROUP BY 1")}
     per_day = {d.replace(" ", "T")[:19]: n for d, n in per_day.items()}
@@ -5205,9 +5205,9 @@ def shuffle_checks(port):
     return out
 
 
-def metrics_of(port, headers=None):
+def metrics_of(port, headers=None, path="/metrics"):
     out = {}
-    for line in call(port, "GET", "/metrics", headers=headers).decode().splitlines():
+    for line in call(port, "GET", path, headers=headers).decode().splitlines():
         if line and not line.startswith("#"):
             name, v = line.rsplit(" ", 1)
             out[name] = float(v)
@@ -8520,7 +8520,7 @@ def hot():
     settle, with a query memory too small for a quarter of it to hold the table (`hot::Hot::new`)."""
     import re
     lake = new_lake()
-    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1", "PONDRA_METRICS_TABLES": "on"}).start()  # (`m`'s files below)
+    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1"}).start()
     q = lambda s: sql(A.port, s)
     skipped = lambda: float(g.group(1)) if (g := re.search(rb"\npondra_hot_batches_skipped_total (\S+)", call(A.port, "GET", "/metrics"))) else 0.0
     t0, n = 1767225600, 200000
@@ -8602,7 +8602,7 @@ def hot():
                 with_m = hot_settled(A.port)
             q(f"INSERT INTO m SELECT value + {f * 50000} AS a, 'm' || value AS s FROM range(0, 50000)")
         deadline = time.time() + 60
-        while metrics_of(A.port)['pondra_table_files{table="m",where="inline"}'] != 1 and time.time() < deadline:
+        while metrics_of(A.port, path="/metrics/tables")['pondra_table_files{table="m",where="inline"}'] != 1 and time.time() < deadline:
             time.sleep(0.5)  # (the merge has committed: one file, and nothing is read in between)
         after = hot_settled(A.port)
         seen["merged files' columns"] = {"before": held, "with them": with_m, "after the merge": after}
@@ -11004,9 +11004,11 @@ def users():
         "users": as_(A.port, ann, "CREATE USER eve PASSWORD 'eve-password-1'"),
         "wrong": as_(A.port, basic("ann", "not-her-password"), "SELECT 1 AS x"),
     }
-    checks["a user reads the columns granted (its roles' and public's); *, a filter on another column, another table: refused, saying why"] = \
+    # (ann holds nothing on hr: for her it is a table that isn't there, `harness.py listings`)
+    gone = lambda r, t="hr": "permission denied" not in str(r) and (f"no table {t}" in str(r) or f"{t}' not found" in str(r))
+    checks["a user reads the columns granted (its roles' and public's); *, a filter on another column: refused, saying why; a table it holds nothing on isn't there"] = \
         said["cols"] == [{"id": 1, "item": "tea"}, {"id": 2, "item": "cake"}] and "permission denied: SELECT (card) on sales.orders" in said["star"] \
-        and "permission denied: SELECT (card)" in said["filter"] and "permission denied: SELECT on hr" in said["other"] and said["count"] == [{"n": 2}] and said["public"] == [{"text": "hello"}]
+        and "permission denied: SELECT (card)" in said["filter"] and gone(said["other"]) and said["count"] == [{"n": 2}] and said["public"] == [{"text": "hello"}]
     checks["...writes only as granted; lists only what it may read; makes no users; a wrong password refused"] = "permission denied: INSERT on sales.orders" in said["write"] \
         and said["listed"] == [{"name": "notes"}, {"name": "orders"}] and said["info"] == [{"table_name": "notes"}, {"table_name": "orders"}] and "superuser" in said["users"] and said["wrong"].startswith("ERROR 401")
     # A schema's tables, later ones too; writes through a follower (the nodes' own key between them)
@@ -11014,13 +11016,13 @@ def users():
     wrote = [as_(A.port + 1, bob, "INSERT INTO sales.refunds VALUES (1, 2.5)"), as_(A.port + 1, bob, "INSERT INTO hr VALUES (2, 1.0)"), as_(A.port, bob, "UPDATE sales.orders SET amount = 0")]
     later = until(lambda: as_(A.port + 1, bob, "SELECT id FROM sales.refunds"), [{"id": 1}], 10)
     checks["a schema's grant covers its later tables; a follower forwards a user's writes (the nodes' own key), refusing the rest"] = \
-        wrote[0] == {"rows": 1} and "permission denied: INSERT on hr" in wrote[1] and "permission denied: UPDATE on sales.orders" in wrote[2] and later == [{"id": 1}]
+        wrote[0] == {"rows": 1} and gone(wrote[1]) and "permission denied: UPDATE on sales.orders" in wrote[2] and later == [{"id": 1}]
     # A procedure started without waiting runs with its caller's grants, as a CALL does
     as_(A.port, boss, "CREATE PROCEDURE leak() LANGUAGE sql AS $$ INSERT INTO sales.refunds SELECT id, salary FROM hr $$")
     called = as_(A.port, bob, "CALL leak()")
     started = as_(A.port, bob, "SELECT pondra.start('leak') AS r")
     run = until(lambda: as_(A.port, boss, f"SELECT status FROM pondra.runs WHERE id = '{started[0]['r']}'") if isinstance(started, list) else None, [{"status": "failed"}], 20)
-    checks["a procedure started without waiting (pondra.start) has its caller's grants, as a CALL has"] = "permission denied: SELECT on hr" in str(called) \
+    checks["a procedure started without waiting (pondra.start) has its caller's grants, as a CALL has"] = gone(called) \
         and run == [{"status": "failed"}] and as_(A.port, boss, "SELECT count(*) AS n FROM sales.refunds") == [{"n": 1}]
     # S27: a user is shown only the tables it may read, and no routine's code (an admin sees it all)
     as_(A.port, boss, "CREATE TASK tick SCHEDULE '1 hour' AS SELECT 1")  # (a task whose statement no user is shown)
@@ -11128,14 +11130,16 @@ def users():
         and rows == [[(1, "tea"), (2, "cake")], [(100.0,)], [("4111",), ("5500",)]]
     # Kafka: SASL/PLAIN; producing needs INSERT, consuming every column
     from kafka import KafkaConsumer, KafkaProducer
-    from kafka.errors import TopicAuthorizationFailedError
+    from kafka.errors import KafkaTimeoutError, TopicAuthorizationFailedError
     sasl = lambda u, p: dict(bootstrap_servers=f"127.0.0.1:{A.port + 20}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN", sasl_plain_username=u, sasl_plain_password=p)
     def produce(u, p, topic):
-        pr = KafkaProducer(value_serializer=lambda v: json.dumps(v).encode(), **sasl(u, p))
+        pr = KafkaProducer(value_serializer=lambda v: json.dumps(v).encode(), max_block_ms=3000, **sasl(u, p))
         try:
             return pr.send(topic, {"id": 7, "amount": 1.0}).get(timeout=15) and "ok"
         except TopicAuthorizationFailedError:
             return "refused"
+        except KafkaTimeoutError:
+            return "no such topic"  # (its metadata never names it: as for a topic that isn't there)
         finally:
             pr.close()
     def consume(u, p, topic):
@@ -11146,8 +11150,11 @@ def users():
             return "refused"
         finally:
             c.close()
-    kafka_said = [produce("bob", "bob-password-1", "sales.refunds"), produce("ann", "ann-password-1", "sales.refunds"), consume("bob", "bob-password-1", "sales.refunds"), consume("ann", "ann-password-1", "sales.orders")]
-    checks["Kafka: SASL/PLAIN as a user; producing needs INSERT; consuming a table needs SELECT on every column"] = kafka_said == ["ok", "refused", 2, "refused"]
+    # (ann reads some of sales.orders, so it is a topic she knows of; she holds nothing on sales.refunds, a topic that isn't there for her)
+    kafka_said = [produce("bob", "bob-password-1", "sales.refunds"), produce("ann", "ann-password-1", "sales.orders"), consume("bob", "bob-password-1", "sales.refunds"),
+                  consume("ann", "ann-password-1", "sales.orders"), produce("ann", "ann-password-1", "sales.refunds"), produce("ann", "ann-password-1", "sales.nope")]
+    checks["Kafka: SASL/PLAIN as a user; producing needs INSERT; consuming a table needs SELECT on every column; a table it holds nothing on is a topic that isn't there"] = \
+        kafka_said == ["ok", "refused", 2, "refused", "no such topic", "no such topic"]
     # Flight: the handshake turns a user's name and password into a session
     import pyarrow.flight as fl
     client = fl.FlightClient(f"grpc://127.0.0.1:{A.port + 30}")
@@ -11201,7 +11208,8 @@ def users():
     listed_names = sorted(t["table"] for t in json.loads(listed["content"][0]["text"])["tables"]) if isinstance(listed, dict) and "content" in listed else listed
     checks["MCP list_tables shows a user only the tables it may read, as pondra.tables does"] = listed_names == ["notes", "sales.orders"]
     changes = {t: tool_result("changes", {"table": t, "after": 0}) for t in ("hr", "sales.orders", "notes")}
-    checks["MCP changes refuses a table the user may not read (every column)"] = denied(changes["hr"]) and denied(changes["sales.orders"]) \
+    checks["MCP changes refuses a table the user may not read (every column), and one it holds nothing on isn't there"] = \
+        isinstance(changes["hr"], dict) and changes["hr"].get("isError") is True and gone(json.dumps(changes["hr"])) and denied(changes["sales.orders"]) \
         and isinstance(changes["notes"], dict) and changes["notes"].get("isError") is False and "hello" in json.dumps(changes["notes"])
     # Flight's log stream needs every column too: a user granted some of a table's is refused, a user granted all of notes is served
     def log_stream(table):
@@ -11232,9 +11240,11 @@ def users():
     revoked = [until(lambda: "permission denied" in str(as_(port, ann, "SELECT item FROM sales.orders")), True, 10) for port in (A.port, A.port + 1)]
     still = as_(A.port, ann, "SELECT id FROM sales.orders ORDER BY id")
     as_(A.port, boss, "REVOKE analyst FROM ann")
-    no_role = until(lambda: "permission denied" in str(as_(A.port + 1, ann, "SELECT id FROM sales.orders")), True, 10)
+    # (with its role gone, ann holds nothing on sales.orders: for her it isn't there now)
+    not_there = lambda r: "permission denied" not in str(r) and any(w in str(r) for w in ("not found", "no table", "does not exist"))
+    no_role = until(lambda: not_there(as_(A.port + 1, ann, "SELECT id FROM sales.orders")), True, 10)
     grants = as_(A.port, boss, "SELECT grantee, privilege, on_name, columns FROM pondra.grants ORDER BY grantee, privilege, on_name")
-    ann_revoked = "permission denied" in str(ann_said("SELECT item FROM sales.orders ORDER BY id"))  # (its very next statement: no wait)
+    ann_revoked = not_there(ann_said("SELECT item FROM sales.orders ORDER BY id"))  # (its very next statement: no wait)
     as_(A.port, boss, "DROP USER ann")
     gone = [until(lambda: str(as_(port, ann, "SELECT 1 AS x")).startswith("ERROR 401"), True, 10) for port in (A.port, A.port + 1)]
     ann_last = [str(ann_said("SELECT 1 AS x"))]  # (what its open connection is told at its next statement: FATAL, then closed)
@@ -11272,8 +11282,8 @@ def users():
     except psycopg.Error as e:
         copy_out["end"] = f"{e.sqlstate} {e}"
     copy_out["rows"] = copied_n()
-    checks["a REVOKE in the middle of a long COPY stops it at its next chunk (42501), and the chunks before it stay written"] = \
-        copy_out["first"] is True and copy_out["end"].startswith("42501") and "permission denied" in copy_out["end"] and 0 < (copy_out["rows"] or 0) < 68000 or copy_out
+    checks["a REVOKE in the middle of a long COPY stops it at its next chunk (42P01: its user holds nothing on the table now), and the chunks before it stay written"] = \
+        copy_out["first"] is True and copy_out["end"].startswith("42P01") and "no table copied" in copy_out["end"] and 0 < (copy_out["rows"] or 0) < 68000 or copy_out  # (bob holds nothing on it now: a table that isn't there)
     # W50: a user granted a view (and a materialized view) alone is shown their names, columns and rows, not their queries,
     # the base table's name or the filter; a listing shows the view as a read does; the server's folder is an admin's
     vee_pw = "vee-password-1"
@@ -12076,6 +12086,7 @@ def guarded():
     said = {
         "append, granted": ask(P, rows, path="/append/orders", auth=bob),
         "append, not granted": ask(P, json.dumps({"id": 2, "salary": 1e6}), path="/append/hr", auth=bob),
+        "append, read but not granted": ask(P, rows, path="/append/orders", auth=carol),  # (carol may write nothing: refused at the door)
         "append to the audit log": ask(P, "{}", path="/append/pondra$audit", auth=boss),
         "insert, granted": ask(P, "SELECT 8 AS id, 2.0 AS amount", path="/insert/orders?job=g1", auth=bob),
         "insert, reading what it may not": ask(P, "SELECT id, salary AS amount FROM hr", path="/insert/orders?job=g2", auth=bob),
@@ -12085,10 +12096,12 @@ def guarded():
         "a user's files": ask(P, json.dumps({"table": "orders", "job": "g5", "columns": [], "files": []}), path="/cluster/files", auth=bob, headers={"Content-Type": "application/json"}),
     }
     info["users"] = said
+    # (bob holds nothing on hr: for him it is a table that isn't there; carol reads orders, and is refused writing it)
     checks["a user's rows through /append and /insert as its grants say (reads too); another table, a new table, the audit log: refused"] = \
-        isinstance(said["append, granted"], dict) and "permission denied: INSERT on hr" in said["append, not granted"] and "written by Pondra alone" in said["append to the audit log"] \
-        and isinstance(said["insert, granted"], dict) and "permission denied: SELECT" in said["insert, reading what it may not"] \
-        and "permission denied: INSERT on hr" in said["insert, not granted"] and "may not change the lake's tables" in said["insert making a table"] \
+        isinstance(said["append, granted"], dict) and "ERROR 404: b'no table hr'" == said["append, not granted"] and "written by Pondra alone" in said["append to the audit log"] \
+        and "needs more rights" in said["append, read but not granted"] \
+        and isinstance(said["insert, granted"], dict) and "ERROR 404" in said["insert, reading what it may not"] and "hr' not found" in said["insert, reading what it may not"] \
+        and "ERROR 404: b'no table hr'" == said["insert, not granted"] and "may not change the lake's tables" in said["insert making a table"] \
         and until(lambda: ask(P, "SELECT id FROM orders ORDER BY id", auth=boss), [{"id": 7}, {"id": 8}], 10) == [{"id": 7}, {"id": 8}] \
         and ask(P, "SELECT count(*) AS n FROM hr", auth=boss) == [{"n": 1}]
     checks["…and never through the nodes' own routes (/cluster/commit, /cluster/files)"] = \
@@ -12234,8 +12247,8 @@ def guarded():
         "its own": ask(P + 1, "UPDATE orders SET amount = 5.0 WHERE id = 7", auth=bob),
     }
     info["forwarded"] = forwarded
-    checks["a change a follower forwards runs as its user: a read it may not make refused, its own change made"] = \
-        "permission denied: SELECT on hr" in str(forwarded["reads what it may not"]) and isinstance(forwarded["its own"], dict) and forwarded["its own"].get("updated") == 1 \
+    checks["a change a follower forwards runs as its user: a read of a table it holds nothing on answered as of one that isn't there, its own change made"] = \
+        "hr' not found" in str(forwarded["reads what it may not"]) and isinstance(forwarded["its own"], dict) and forwarded["its own"].get("updated") == 1 \
         and until(lambda: ask(P, "SELECT amount FROM orders WHERE id = 7", auth=boss), [{"amount": 5.0}], 10) == [{"amount": 5.0}]
     # A page of an answer is its asker's: another user's request for its id is as if it were gone (pages.rs)
     typed = ask(P, "SELECT id FROM orders ORDER BY id", path="/sql?format=typed", auth=bob)
@@ -12255,8 +12268,9 @@ def guarded():
         and isinstance(signed, dict) and names <= set(signed)
     # Rows through /append and /insert are in the audit log while writes are audited (PONDRA_AUDIT, above), and
     # refused ones always. The log's lines reach it a moment later, in batches.
+    # (a table its sender holds nothing on is told it isn't there, and written here as the refusal it is: `rights::noting`)
     expect = {("INSERT INTO orders (rows through /append)", "ok"), ("INSERT INTO hr (rows through /append)", "refused"),
-              ("INSERT INTO orders (rows through /insert)", "ok"), ("INSERT INTO hr (rows through /insert)", "refused")}
+              ("INSERT INTO orders (rows through /insert)", "ok"), ("INSERT INTO orders (rows through /insert)", "refused"), ("INSERT INTO hr (rows through /insert)", "refused")}
     def audited():
         got = ask(P, "SELECT statement, outcome FROM pondra.audit WHERE statement LIKE '%rows through%' ORDER BY at", auth=boss)
         return {(r["statement"], r["outcome"]) for r in got} if isinstance(got, list) else set()
@@ -12300,7 +12314,9 @@ def guarded():
         prod.flush(10)
         return reports
     said["kafka produce, granted"] = produce("orders", "bob", "bob-password-1")
-    said["kafka produce, not granted"] = produce("hr", "bob", "bob-password-1")
+    said["kafka produce, not granted"] = produce("hr", "bob", "bob-password-1")  # (bob holds nothing on hr: a topic that isn't there, for him)
+    said["kafka produce, to a topic that isn't there"] = produce("nope", "bob", "bob-password-1")
+    said["kafka produce, read but not granted"] = produce("orders", "carol", "carol-password-1")
     def get(table, auth):
         """The first chunk of a table's rows as a user, over Flight's DoGet: STREAMED, or the error it got."""
         try:
@@ -12328,8 +12344,9 @@ def guarded():
     info["doors"] = {k: str(v)[:300] for k, v in said.items()}  # (short: the info is printed when a check fails)
     checks["Flight's DoPut and Kafka's produce take a user's rows as its grants say: another table, the lake's records: refused"] = \
         isinstance(said["flight put, granted"], list) and len(said["flight put, granted"]) > 0 and said["flight put, granted"][0].get("rows") == 1 \
-        and "permission denied: INSERT on hr" in said["flight put, not granted"] and "written by Pondra alone" in said["flight put to the audit log, by a superuser"] \
-        and said["kafka produce, granted"] == ["None"] and "TOPIC_AUTHORIZATION_FAILED" in str(said["kafka produce, not granted"]) \
+        and "no table hr" in said["flight put, not granted"] and "not found" in said["flight put, not granted"] and "written by Pondra alone" in said["flight put to the audit log, by a superuser"] \
+        and said["kafka produce, granted"] == ["None"] and said["kafka produce, not granted"] == said["kafka produce, to a topic that isn't there"] != ["None"] \
+        and "TOPIC_AUTHORIZATION_FAILED" in str(said["kafka produce, read but not granted"]) \
         and ask(P, "SELECT count(*) AS n FROM hr", auth=boss) == [{"n": 1}]  # (nothing went into hr)
     checks["a hidden table's rows (pondra$audit) stream to a superuser only: Flight's DoGet and /watch refuse a user granted every table"] = \
         "is Pondra's own" in said["flight get the audit log, carol"] and said["watch the audit log, carol"].startswith("403") and "is Pondra's own" in said["watch the audit log, carol"]
@@ -12345,13 +12362,14 @@ def guarded():
         except Exception as e:
             return f"ERROR {e}"
     said["COPY, granted"], said["COPY, not granted"] = copy_rows("orders"), copy_rows("hr")
+    # (a Kafka client sends no rows for a topic that isn't there for it, so Kafka's line for hr is carol's refused orders)
     loads = {(f"INSERT INTO {t} (rows through {door})", outcome) for door in ("Flight DoPut", "Kafka produce", "COPY FROM STDIN")
-             for t, outcome in (("orders", "ok"), ("hr", "refused"))}
+             for t, outcome in (("orders", "ok"), ("hr", "refused")) if (door, t) != ("Kafka produce", "hr")}
     def loads_audited():
         got = ask(P, "SELECT \"user\", statement, outcome FROM pondra.audit WHERE statement LIKE '%rows through%' ORDER BY at", auth=boss)
         return {(r["statement"], r["outcome"]) for r in got if r["user"] == "bob"} if isinstance(got, list) else set()
     checks["a load through Flight's DoPut, Kafka's produce or COPY FROM STDIN is in the audit log as its user's, and a refused one always"] = \
-        until(lambda: loads <= loads_audited(), True, 15) and said["COPY, granted"] == "ok" and "permission denied" in said["COPY, not granted"]
+        until(lambda: loads <= loads_audited(), True, 15) and said["COPY, granted"] == "ok" and "no table hr" in said["COPY, not granted"]
     info["audit_loads"] = {"lines": sorted(loads_audited()), "copies": [said["COPY, granted"], said["COPY, not granted"]]}
     # S11: a keyed table's loads replace the rows of a key it holds, so every row door asks UPDATE for them too (as
     # Postgres asks it for ON CONFLICT DO UPDATE), and rows marked deleted (`_deleted`, a Kafka tombstone) ask DELETE;
@@ -12531,9 +12549,9 @@ def guarded():
     kc.close()
     info["H3"] = {"streams": {k: {x: str(y)[:200] for x, y in s.items()} for k, s in h3.items()}, "said": [str(x)[:200] for x in h3_said],
                   "ended after s": h3_ended, "kafka fetched": [kafka_before, kafka_at_once, kafka_after]}
-    checks["/watch, a live query and a Kafka consumer end when their sign-in may no longer have them: REVOKE, DROP USER and NOSUPERUSER end each within 12 s, and the consumer's very next fetch is refused (11-02 H3)"] = \
+    checks["/watch, a live query and a Kafka consumer end when their sign-in may no longer have them: REVOKE, DROP USER and NOSUPERUSER end each within 12 s, and the consumer's very next fetch is served nothing more (11-02 H3)"] = \
         h3_flowing is True and not any(str(x).startswith("ERROR") for x in h3_said) and set(h3_ended) == set(h3) \
-        and all(v <= 12 for v in h3_ended.values()) and isinstance(kafka_before, int) and kafka_before >= 1 and kafka_at_once == kafka_after == "refused"
+        and all(v <= 12 for v in h3_ended.values()) and isinstance(kafka_before, int) and kafka_before >= 1 and kafka_at_once == kafka_after == 0  # (hana holds nothing on stock now: a topic that isn't there, served neither new row)
     checks["Flight's follow stream ends when its sign-in may no longer read the table: REVOKE ends it within 12 s, telling the client to sign in again (11-03 H1)"] = \
         h3_flowing is True and h3_ended.get("flight follow", 99) <= 12 and "sign in again" in h3["flight follow"].get("error", "")
     # M8: a joined page's own statements are written by its node, as the sign-in's (`POST /cluster/records`, page_records.rs): a
@@ -13552,8 +13570,8 @@ def sso():
             all(isinstance(v, str) and phrase_of[w] in v for w, v in flight_said.items())
         eve_t = token_for(eve)
         eve_who, eve_read = whoami(bearer_of(eve_t)), read_t(bearer_of(eve_t))
-        checks["a token for eve@acme.com (made here, granted nothing on t) signs in, and its SELECT of t is refused: permission denied"] = \
-            eve_who == (200, eve) and eve_read[0] != 200 and "permission denied" in str(eve_read[1])
+        checks["a token for eve@acme.com (made here, granted nothing on t) signs in, and its SELECT of t is answered as of a table that isn't there"] = \
+            eve_who == (200, eve) and eve_read[0] == 404 and "not found" in str(eve_read[1])
         mismatch = whoami({"Authorization": basic(ana, eve_t)})
         checks["Basic as ana with eve's token is refused (401): a token signs in only the user it names"] = mismatch[0] == 401
 
@@ -13575,7 +13593,7 @@ def sso():
         others = {w: (whoami(bearer_of(t)), read_t(bearer_of(t))) for w, t in (("no groups", cy_none), ("nosuchrole", cy_nosuch), ("boss, a login user", cy_boss))}
         info["USERS any: the other tokens"] = {w: [who, rd[0], str(rd[1])[:120]] for w, (who, rd) in others.items()}
         checks["…without groups, or naming nosuchrole or boss (a login user), cy signs in but reads nothing of t"] = \
-            all(who == (200, cy) and rd[0] != 200 and "permission denied" in str(rd[1]) for who, rd in others.values())
+            all(who == (200, cy) and rd[0] == 404 and "not found" in str(rd[1]) for who, rd in others.values())  # (as of a table that isn't there)
 
         # 7. Keys. A provider's keys are kept an hour, and asked again when a token names a kid they lack, at most once a
         # minute: a new key signs in once a minute has passed since the node last asked, and a key the provider drops
@@ -18272,8 +18290,8 @@ def remembered():
     catalog version, from any connection, runs once (`pondra_queries_total`), and a commit makes the next one
     run again with the new rows. Never what may answer otherwise: a transaction's reads (its own writes), now(),
     random(), a temporary table, a session with a DataFusion setting. A user granted some tables has its answers
-    remembered under what it may read: it is refused a table another user's remembered answer read, as is a user
-    granted fewer columns, or one a REVOKE took the table from; and its key lookups are answered of the columns it may
+    remembered under what it may read: it is told a table another user's remembered answer read isn't there (it holds
+    no privilege on it), a user granted fewer columns is refused, a REVOKE is another key; and its key lookups are answered of the columns it may
     read. Each connection sends the answer in its own formats (text, binary) and parameters are part of the text a
     prepared statement runs."""
     import psycopg
@@ -18364,11 +18382,11 @@ def remembered():
         refused = e.sqlstate
     ann_n = ann.execute("SELECT count(*) FROM r_t").fetchall()[0][0]
     info["a user granted r_t, asking what a superuser's answer read"] = refused
-    checks["a user granted some tables is refused a table another user's remembered answer read (42501), and reads its own"] = boss_n == [2, 2] and refused == "42501" and ann_n == 1001
+    checks["a user granted some tables is told a table another user's remembered answer read isn't there (42P01: it holds no privilege on it), and reads its own"] = boss_n == [2, 2] and refused == "42P01" and ann_n == 1001
 
     # 8. A user granted some tables has its own answers remembered, under what it may read (`rights::Scope::key`): asked
     # again, run once. Another user granted fewer columns is refused the same text, as it would be; a REVOKE is another key,
-    # so the user revoked is refused too, never given what it was answered before. A key lookup answers a user what it
+    # so the user revoked is told the table isn't there (it holds no privilege on it now), never given what it was answered before. A key lookup answers a user what it
     # may read, unplanned; a column it may not read is refused, with SELECT * too, over HTTP and the port.
     import base64
     hdr = lambda u, pw: {"Authorization": "Basic " + base64.b64encode(f"{u}:{pw}".encode()).decode()}
@@ -18402,7 +18420,7 @@ def remembered():
     boss.execute("REVOKE SELECT ON r_t FROM r_ann")
     revoked = (sqlstate(ann, K), http(hdr("r_ann", "ann-password-1"), K))
     info["the user revoked, asking the text its own answer is kept for"] = revoked
-    checks["after a REVOKE the user is refused the text its own answer was kept for (42501), over the port and HTTP"] = revoked[0] == "42501" and "permission denied" in str(revoked[1])
+    checks["after a REVOKE the user is told the table its own answer was kept for isn't there (42P01), over the port and HTTP"] = revoked[0] == "42P01" and "not found" in str(revoked[1])
     boss.execute("GRANT SELECT ON r_t TO r_ann")
     cat_h = hdr("r_cat", "cat-password-1")
     before = ran()
@@ -22119,11 +22137,14 @@ def listings():
     pondra.tables, pondra.objects, information_schema.tables and SHOW TABLES over HTTP, GET /objects, MCP's list_tables,
     Iceberg REST's tables, Postgres's pg_class, pg_tables and information_schema.tables, Flight SQL's GetTables (ADBC's
     get_objects), and pondra.find. Their columns: pondra.parts, Postgres's information_schema.columns and pg_attribute, MCP's
-    list_tables and Flight SQL's GetTables."""
+    list_tables and Flight SQL's GetTables. And a table or view it holds no privilege on is not there for it: a read or a
+    write naming it, at every door (HTTP, Postgres, Flight SQL, MCP, /lookup, /append, /insert, Iceberg REST, Kafka), is
+    answered as one naming a table that isn't there, and Kafka's topics are the tables it knows of; one it knows of is
+    refused, 42501."""
     import base64, psycopg
     import adbc_driver_flightsql.dbapi as adbc
     lake = new_lake()
-    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}", flight=f"127.0.0.1:{A.port + 30}").start()
+    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}", flight=f"127.0.0.1:{A.port + 30}", kafka=f"127.0.0.1:{A.port + 31}").start()
     basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
     boss = basic("boss", "boss-password-1")
     def ask(auth, q, method="POST", path="/sql"):
@@ -22230,6 +22251,82 @@ def listings():
         for door, v in got["columns"].items():
             checks[f"{door} shows {role} exactly the columns it may read"] = v == columns[who]
         checks[f"pondra.find finds for {role} exactly the objects and columns it may read"] = got["pondra.find"] == found[who]
+
+    # The gate's other half (`rights::Scope::knows`): a table or view a user holds no privilege on is, for it, not there. A
+    # statement naming it, at every door, is answered as one naming a table that isn't there: the same code and words but
+    # for the name, never "permission denied", and nothing names its columns. One it knows of (a column of it is granted)
+    # but may not read or write that way is refused, 42501.
+    import re
+    ann = basic("ann", "ann-password-1")
+    def as_ann(s, method="POST", path="/sql"):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request(method, path, s.encode(), {"Authorization": ann})
+        r = c.getresponse()
+        return f"{r.status} {r.read().decode(errors='replace')[:400]}"
+    def pg_says(s):
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=ann password=ann-password-1 dbname=lake", connect_timeout=10, autocommit=True) as c:
+                c.execute(s)
+                return "answered"
+        except psycopg.Error as e:
+            return f"{e.sqlstate} {e.diag.message_primary}"
+    def flight_says(s):
+        try:
+            conn = adbc.connect(f"grpc://127.0.0.1:{A.port + 30}", db_kwargs={"username": "ann", "password": "ann-password-1"})
+            try:
+                cur = conn.cursor()
+                cur.execute(s)
+                cur.fetchall()
+                return "answered"
+            finally:
+                conn.close()
+        except Exception as e:
+            return re.sub(r"\. Detail:.*|\[.*?\]", "", str(e))[:400]
+    def mcp_says(s, tool):
+        r = as_ann(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {"sql": s}}}), path="/mcp")
+        return r
+    statements = {"SELECT *": "SELECT * FROM {t}", "a column that isn't": "SELECT nope FROM {t}", "a key's row": "SELECT * FROM {t} WHERE id = 1",
+                  "by its schema": "SELECT count(*) FROM public.{t}", "INSERT": "INSERT INTO {t} VALUES (1, 2.0)", "UPDATE": "UPDATE {t} SET salary = 1",
+                  "DELETE": "DELETE FROM {t}"}
+    writes = {"INSERT", "UPDATE", "DELETE"}
+    doors = {"HTTP": lambda s, w: as_ann(s), "Postgres": lambda s, w: pg_says(s), "Flight SQL": lambda s, w: flight_says(s), "MCP": lambda s, w: mcp_says(s, "write" if w else "query")}
+    routes = {"GET /lookup": lambda t: as_ann("", "GET", f"/lookup/{t}/1"), "POST /append": lambda t: as_ann('{"id": 1, "salary": 2.0}', "POST", f"/append/{t}"),
+              "POST /insert": lambda t: as_ann("SELECT 1 AS id, 2.0 AS salary", "POST", f"/insert/{t}"), "Iceberg REST's table": lambda t: as_ann("", "GET", f"/v1/namespaces/default/tables/{t}")}
+    unseen = {}
+    for (hidden, gone) in [("hr", "zz_gone"), ("pay", "zz_gone")]:
+        same = lambda a, b: re.sub(rf"\b{hidden}\b", "<t>", a) == re.sub(rf"\b{gone}\b", "<t>", b)
+        for what, s in statements.items():
+            if hidden == "pay" and what in writes | {"a key's row"}:
+                continue
+            for door, ask_ in doors.items():
+                a, b = ask_(s.format(t=hidden), what in writes), ask_(s.format(t=gone), what in writes)
+                unseen[f"{door}, {what}, {hidden}"] = (a, b)
+                checks[f"{door}: {what} of {hidden}, which ann holds no privilege on, is answered as of a table that isn't there"] = same(a, b) and "permission denied" not in a \
+                    and "salary" not in a and a != "answered"
+        if hidden == "hr":
+            for route, ask_ in routes.items():
+                a, b = ask_(hidden), ask_(gone)
+                unseen[f"{route}, {hidden}"] = (a, b)
+                checks[f"{route} of hr, which ann holds no privilege on, is answered as of a table that isn't there"] = same(a, b) and "permission denied" not in a and "salary" not in a
+    # (Kafka: its topics are the tables it knows of; a record for one it doesn't is for a topic that isn't there)
+    import confluent_kafka as ck, confluent_kafka.admin
+    sasl = lambda u, p: {"bootstrap.servers": f"127.0.0.1:{A.port + 31}", "security.protocol": "SASL_PLAINTEXT", "sasl.mechanisms": "PLAIN", "sasl.username": u, "sasl.password": p}
+    topics = {u: set(ck.admin.AdminClient(sasl(u, p)).list_topics(timeout=15).topics) for u, p in [("ann", "ann-password-1"), ("boss", "boss-password-1")]}
+    unseen["Kafka's topics"] = {u: sorted(t) for u, t in topics.items()}
+    checks["Kafka's topics are the tables each knows of: ann's notes and sales.orders, the superuser's hr too"] = topics == {"ann": {"notes", "sales.orders"}, "boss": {"notes", "sales.orders", "hr"}}
+    def produced(topic):
+        errors = []
+        prod = ck.Producer({**sasl("ann", "ann-password-1"), "message.timeout.ms": 6000})
+        prod.produce(topic, value=b'{"id": 1, "salary": 2.0}', on_delivery=lambda err, msg: errors.append(err.name() if err else "delivered"))
+        prod.flush(15)
+        return errors
+    by_kafka = (produced("hr"), produced("zz_gone"))
+    unseen["Kafka produce, hr and zz_gone"] = by_kafka
+    checks["Kafka: a record ann produces to hr is answered as one to a topic that isn't there"] = by_kafka[0] == by_kafka[1] and by_kafka[0] != ["delivered"] and "AUTHORIZATION" not in str(by_kafka[0])
+    known = {door: ask_("SELECT card FROM sales.orders", False) for door, ask_ in doors.items()} | {f"{door}, DELETE": ask_("DELETE FROM sales.orders", True) for door, ask_ in doors.items()}
+    unseen["known"] = known
+    checks["a table ann knows of (some columns granted) is refused what it may not do, 42501, at every door"] = all("permission denied" in v or "42501" in v for v in known.values())
+    info["unseen"] = unseen
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"listings": checks, "ok": ok, **({} if ok else {"info": info})}, indent=1, default=str))
@@ -24716,7 +24813,7 @@ def cursors():
         with psycopg.connect(f"host=127.0.0.1 port={pg} user=ann password=ann-password-1 dbname=lake") as c:
             allowed = first_error(c, "DECLARE g CURSOR FOR SELECT id FROM own", "FETCH 1 FROM g")
             refused = first_error(c, "DECLARE g CURSOR FOR SELECT id FROM big")
-        checks["DECLARE is checked against the caller's grants: a table it may read works, one it may not is 42501"] = allowed is None and refused == "42501"
+        checks["DECLARE is checked against the caller's grants: a table it may read works, one it holds nothing on isn't there (42P01)"] = allowed is None and refused == "42P01"
         info["grants"] = {"allowed": allowed, "refused": refused}
     finally:
         node.kill()
