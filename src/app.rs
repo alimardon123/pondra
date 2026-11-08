@@ -24,7 +24,7 @@ pub struct App {
     pub results: Arc<Results>,       // recent query results (see `Results`)
     pub replica: Option<Arc<crate::replica::ReplicaLog>>, // what this follower holds for the leader
     pub auth: Arc<crate::auth::Auth>,
-    pub tables: Arc<std::sync::Mutex<crate::tier::Tables>>, // what the leader's tiering rounds know of each table (`tier::refresh`)
+    pub tables: Arc<tokio::sync::Mutex<crate::tier::Tables>>, // what this node knows of each table: for the leader's tiering rounds and /metrics (`tier::refresh`)
 }
 
 /// Recent query results. By default a result is reused only at exactly the catalog version it
@@ -312,6 +312,14 @@ impl App {
         }
     }
 
+    /// The count of the lake's tables and their lines of `/metrics` (`metrics::render`, `tier::metric_lines`), from what
+    /// this node knows of each, brought up to date first (`tier::refresh`): a scrape reads what changed since the last.
+    pub async fn table_lines(&self, per_table: bool) -> anyhow::Result<(usize, [Vec<(String, f64)>; 4])> {
+        crate::tier::refresh(&self.lake, &self.tables).await?;
+        let tables = self.tables.lock().await;
+        Ok((tables.len(), crate::tier::metric_lines(&tables, per_table)))
+    }
+
     /// Tier the tables with at least `min_rows` rows in the log (0: all of them), publish them
     /// for other engines, then expire what everything has consumed (leader).
     pub async fn tier_all(&self, min_rows: u64) -> anyhow::Result<u64> {
@@ -323,11 +331,11 @@ impl App {
         let _tiering = self.seq.as_ref().map(|s| s.tiering()); // (writers paused by backpressure stay paused: `log::Pace`)
         let start = datafusion::common::instant::Instant::now();
         let hwm = *self.lake.hwm.borrow();
-        let from = self.tables.lock().unwrap().values().map(|b| b.tiered).min().unwrap_or(hwm);
+        let from = self.tables.lock().await.values().map(|b| b.tiered).min().unwrap_or(hwm);
         let backlog = crate::tier::backlog(&self.lake, from, None).await?;
         let nodes = if self.members.nodes().is_empty() { vec![self.members.me().to_string()] } else { self.members.nodes() };
         let (busy, untidy, changed) = {
-            let tables = self.tables.lock().unwrap();
+            let tables = self.tables.lock().await;
             // Up to 4 tables at once: on object storage each round is a few storage round trips, so
             // tables side by side finish in the time of one (memory stays bounded: ≤4M rows a job).
             let busy: Vec<String> = backlog.iter().filter(|(t, rows)| **rows >= min_rows && tables.contains_key(*t)).map(|(t, _)| t.clone()).collect();
