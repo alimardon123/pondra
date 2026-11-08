@@ -311,6 +311,7 @@ EXCEPTIONS = {
     "names apart": "a SELECT list naming two items alike (`count(1), count(1)`, a call and its call over a cast), which DataFusion refuses and Pondra answers, naming the second apart (invariant 175)",
     "IN outside a WHERE": "`x IN (SELECT …)` and `EXISTS (…)` in a SELECT list, a CASE or an aggregate, which DataFusion can't run and Pondra answers with SQL's NULLs",
     "avg rounded": "`avg` over a DECIMAL rounds its last place, as Postgres and DuckDB do; DataFusion cuts it off",
+    "a DECIMAL quotient": "a quotient of DECIMALs keeps 16 places, rounded, as Postgres's does (71/3.0 is 23.6666666666666667); DataFusion keeps the dividend's places and 4 more, cut off, so the type it names and the places it shows differ",
     "Postgres's base64": "`encode(…, 'base64')` writes its padding, as Postgres does (DataFusion leaves it off), and `decode(…, 'base64')` reads as Postgres does, refusing a short last group or padding inside a group, which DataFusion takes",
 }
 # Postgres 16's base64 refusals, by their words (src/pg_bytea.rs's unbase64).
@@ -319,9 +320,9 @@ RUNNER_FUNCTIONS = {"async_abs"}  # (async_udf.slt's: registered by the runner)
 MADE = re.compile(r"\s*(?:create\s+(?:or\s+replace\s+)?(?:(?:temp|temporary|external|unbounded|materialized)\s+)*(?:table|view)\s+(?:if\s+not\s+exists\s+)?|select\b.*?\binto\s+)(\"[^\"]+\"|[\w.]+)", re.I | re.S)
 
 
-def exception(sql, why, made, pattern=""):
+def exception(sql, why, made, pattern="", answer=None):
     """The named exception a failed record is, if any (`made`: the tables the file makes; `pattern`: the error
-    the record expects)."""
+    the record expects; `answer`: a query's rows, the rows it wants and its header)."""
     explain = re.match(r"\s*explain\b", sql, re.I)
     if why == "an error was expected" and (re.search(r"unique expression names|duplicate unqualified field name", pattern) or twice(sql)):
         return "names apart"
@@ -355,7 +356,40 @@ def exception(sql, why, made, pattern=""):
         return "an order not asked for"
     if re.search(r"'base64", sql, re.I) and (why.startswith("answer differs") and only_padding(why) or any(w in why for w in BASE64_WORDS)):
         return "Postgres's base64"
+    if why.startswith("answer differs") and "/" in re.sub(r"'[^']*'", "''", sql) and quotient_places(*answer or ((), (), ())):
+        return "a DECIMAL quotient"
     return None
+
+
+DECIMAL_TYPE = re.compile(r"Decimal128\(\d+, \d+\)")
+NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def quotient_places(rows, expected, header):
+    """Whether an answer differs from the one wanted only as a DECIMAL quotient's places do: each word is the one
+    wanted, a Decimal128 type where one is wanted, or a number with more places that is the wanted one to the wanted
+    one's places (DataFusion cuts its quotient off there, Pondra rounds at 16)."""
+    got = [DECIMAL_TYPE.sub("Decimal128", " ".join(r)).split() for r in rows]
+    want = [DECIMAL_TYPE.sub("Decimal128", e).split() for e in expected]
+    if not want or len(got) != len(want) or any(len(g) != len(w) for g, w in zip(got, want)):
+        return False
+    if any(w in header[1:] for w in ("rowsort", "valuesort")):  # (paired by value: a number with more places can sort elsewhere as text)
+        key = lambda ws: [(0, float(w), "") if NUMBER.fullmatch(w) else (1, 0.0, w) for w in ws]
+        got, want = sorted(got, key=key), sorted(want, key=key)
+    places = lambda n: len(n.partition(".")[2])
+
+    def close(g, w):
+        if g == w:
+            return True
+        if not (NUMBER.fullmatch(g) and NUMBER.fullmatch(w)) or places(g) <= places(w):
+            return False
+        return abs(float(g) - float(w)) < 10 ** -places(w)
+
+    # (a Decimal128 type that differs is a quotient's: Pondra's has 16 places)
+    types = [(g, w) for r, e in zip(rows, expected) for g, w in zip(DECIMAL_TYPE.findall(" ".join(r)), DECIMAL_TYPE.findall(e))]
+    if any(g != w and not g.endswith(", 16)") for g, w in types):
+        return False
+    return all(close(g, w) for gs, ws in zip(got, want) for g, w in zip(gs, ws))
 
 
 def only_padding(why):
@@ -410,6 +444,7 @@ def run_file(path, port, spread):
     for kind, header, sql, expected, line in all_records:
         counts["records"] += 1
         wants_error = header[:1] == ["error"] or (kind == "query" and header[:1] == ["error"])
+        rows = None
         try:
             if kind == "statement":
                 harness.call(port, "POST", "/sql", sql.encode(), timeout=A.timeout, headers=headers)
@@ -430,7 +465,7 @@ def run_file(path, port, spread):
                     counts["error_text_differs"] += 1
             else:
                 ok, why = False, text
-        named = None if ok else exception(sql, why, made, " ".join(header[1:]) if header[:1] == ["error"] else "")
+        named = None if ok else exception(sql, why, made, " ".join(header[1:]) if header[:1] == ["error"] else "", (rows, expected, header) if rows is not None else None)
         counts["passed" if ok else "excepted" if named else "failed"] += 1
         if not ok:
             failures.append({"file": os.path.basename(path), "line": line, "sql": sql[:300], "why": why[:500], **({"exception": named} if named else {})})
