@@ -182,10 +182,8 @@ impl Default for Options {
 
 /// The words of a write the site's browser storage can't keep, because its quota is full (`codes::FULL`, which `web/` reads here).
 pub use crate::codes::FULL;
-/// What a page's spill file (`web/`'s `spill.rs`, in a Worker) is made of: the factory the core spills through (`give_spills`,
-/// taken back by `take_spills`), DataFusion's spill file it makes, and the errors its reads and writes give.
-#[cfg(target_arch = "wasm32")]
-pub use crate::store::{give_spills, take_spills};
+/// What a page's spill file (`web/`'s `spill.rs`, in a Worker) is made of: the factory the core spills through (its platform's
+/// `scratch::Scratch::spills`), DataFusion's spill file it makes, and the errors its reads and writes give.
 pub use datafusion::error::{DataFusionError, Result as DataFusionResult};
 pub use datafusion::execution::spill_file::{SpillFile, SpillWriter, TempFileFactory};
 
@@ -415,7 +413,7 @@ impl Page {
 
     /// The member opened (`member`), and the kept folder imported into it (`import_kept`, which runs its statements through
     /// the member, so it is set first): what `open_lake` does at once. A page claimed with `claim` alone opens its lake here, when
-    /// its spill file (`give_spills`) must be given first, since the lake keeps the factory it had when it opened.
+    /// its spill file (its platform's `scratch::Scratch::spills`) must be open first, since the lake keeps the factory it had when it opened.
     pub async fn open_now(&mut self) -> anyhow::Result<()> {
         self.member().await?;
         match self.store.clone() {

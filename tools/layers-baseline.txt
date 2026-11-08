@@ -175,7 +175,7 @@ once -> pattern  1
 oom -> jemalloc  2
 oom -> wasm32  5
 optimize -> wasm32  1
-page -> wasm32  4
+page -> wasm32  3
 page_records -> dial  4
 panics -> node  1
 panics -> wasm32  11
@@ -289,7 +289,7 @@ store -> sys  3
 store -> types  2
 store -> users  2
 store -> views  1
-store -> wasm32  17
+store -> wasm32  15
 store -> write  1
 store_wire -> store  1
 temp -> python  2
