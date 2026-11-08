@@ -135,8 +135,8 @@ pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
 /// hold no line of their own then, and a grow past it takes cache bytes back before it spills, as DuckDB's `memory_limit`
 /// holds its buffers and its operators to one number. A cache given a budget of its own (`PONDRA_HOT_GB`, `PONDRA_CACHE_MB`)
 /// keeps it beside the line (`ledger::Charged::inside`). Unset, the whole line is the memory watch's trim line, and the queries
-/// may hold all of it too, the caches giving way (`store::root_whole`), but a spiller isn't refused for a reader's moment in
-/// a cache.
+/// may hold all of it too, the caches giving way (`store::root_whole`); on either line, a spiller they don't make room for
+/// spills.
 pub fn memory_whole() -> Option<usize> {
     gib("PONDRA_MEMORY_GB")
 }

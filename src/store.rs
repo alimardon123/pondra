@@ -1874,14 +1874,14 @@ pub(crate) fn ledgers() -> Vec<Arc<crate::ledger::Ledger>> {
 
 /// A new lake's pool for its queries: its share of its node's budget (`NodeState::line`), which every lake of the node
 /// shares, made with the node's first lake on the process's root (`ledger::root`). The budget is the node's
-/// `PONDRA_MEMORY_GB` where it is set, its queries and caches together, and a spiller it has no room for spills (`hard`);
-/// else the root's lines, past whose whole line a grow takes cache bytes back and goes on within its share.
+/// `PONDRA_MEMORY_GB` where it is set, its queries and caches together; else the root's lines. Past the whole line a grow
+/// takes cache bytes back, and a spiller they don't make room for spills.
 fn lake_pool(node: &NodeState) -> Arc<crate::ledger::LakePool> {
     let budget = node.line.get_or_init(|| {
         let root = crate::ledger::root(root_line(), root_whole());
         match crate::env::memory_whole() {
-            Some(set) => crate::ledger::Ledger::on(&root, set, set, true),
-            None => crate::ledger::Ledger::on(&root, root.line(), root.whole(), false),
+            Some(set) => crate::ledger::Ledger::on(&root, set, set),
+            None => crate::ledger::Ledger::on(&root, root.line(), root.whole()),
         }
     });
     budget.pool()

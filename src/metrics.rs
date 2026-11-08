@@ -49,6 +49,10 @@ impl Drop for Now {
 
 pub fn add(c: &AtomicU64, n: u64) { c.fetch_add(n, Relaxed); }
 
+/// A label's value as the Prometheus text format writes it, between its quotes: a backslash, a double quote and a line
+/// break escaped. A table may be named any of them (`"a\"b"`), and one unescaped broke the whole scrape (11-08 audit L6).
+pub fn label(v: &str) -> String { v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n") }
+
 crate::per_node!(
     /// Background loops that fail without failing a request (tiering, publishing, window emission,
     /// streaming tasks, checkpoints): counted here, so a stall that otherwise shows only on stderr is
@@ -189,7 +193,7 @@ pub async fn tables(app: &App) -> anyhow::Result<String> {
     let mut published = vec![];
     for (format, prefix) in [("delta", "x/"), ("iceberg", "i/")] {
         for (key, v) in app.lake.cat.scan::<serde_json::Value>(prefix, &format!("{prefix}\u{10ffff}")).await? {
-            published.push((format!("{{table=\"{}\",format=\"{format}\"}}", &key[prefix.len()..]), crate::store::json(&v).len() as f64));
+            published.push((format!("{{table=\"{}\",format=\"{format}\"}}", label(&key[prefix.len()..])), crate::store::json(&v).len() as f64));
         }
     }
     metric("published_state_bytes", "size of what the catalog keeps about a published table", &published);
