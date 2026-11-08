@@ -34,12 +34,12 @@ pub struct Format {
 
 /// An answer's bytes from its parts: its schema, its rows and its status. These are the parts of step 8's answer
 /// stream, so the stream takes the entries as they are.
-type Encode = fn(&SchemaRef, &[RecordBatch], &Status) -> Result<Vec<u8>>;
+type Encode = fn(&SchemaRef, &[RecordBatch], &Status<'_>) -> Result<Vec<u8>>;
 
 /// What an answer says besides its rows. Step 8's stream adds what a statement that isn't a query says (the rows it
 /// changed, its notices, its tag); today it says where a typed answer's rows are kept for its later pages.
-pub struct Status {
-    pub keep: Keep,
+pub struct Status<'a> {
+    pub keep: Keep<'a>,
 }
 
 /// The formats, JSON first: an answer is JSON when no format is named, or one this build doesn't have.
@@ -351,13 +351,13 @@ fn first(batches: &[RecordBatch], n: usize) -> Vec<RecordBatch> {
     })).collect()
 }
 
-/// What keeps an answer's rows for its later pages and says the id they are kept under (`pages::keep` on a node; a
-/// page keeps none). Only the console's typed answer asks it.
-pub type Keep = fn(&[RecordBatch]) -> Option<String>;
+/// What keeps an answer's rows for its later pages and says the id they are kept under (`pages::keep` on a node, by the
+/// lake the answer came from; a page keeps none). Only the console's typed answer asks it.
+pub type Keep<'a> = &'a (dyn Fn(&[RecordBatch]) -> Option<String> + Sync);
 
 /// Rows as `?format=` asks: JSON, a text table, or Arrow IPC (straight into pandas, Polars and
 /// DuckDB, no JSON parsing); or a file of them to download: CSV, TSV, NDJSON, Parquet, Excel.
-pub fn render(batches: &[RecordBatch], format: Option<&str>, keep: Keep) -> anyhow::Result<bytes::Bytes> {
+pub fn render(batches: &[RecordBatch], format: Option<&str>, keep: Keep<'_>) -> anyhow::Result<bytes::Bytes> {
     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
     Ok(bytes::Bytes::from((self::format(format).whole)(&schema, batches, &Status { keep })?))
 }
@@ -401,7 +401,7 @@ pub const MOST: usize = 100_000;
 /// first `shown` rows as lists in the columns' order (two columns may share a name: a join's), how
 /// many rows there were, and the id it is kept under (`pages.rs`): its other pages, and every row
 /// downloaded, are read from there (`page`), not run again.
-pub fn typed(batches: &[RecordBatch], shown: usize, keep: Keep) -> anyhow::Result<Vec<u8>> {
+pub fn typed(batches: &[RecordBatch], shown: usize, keep: Keep<'_>) -> anyhow::Result<Vec<u8>> {
     let columns: Vec<Value> = batches.first().map(|b| b.schema().fields().iter().map(|f| j!({"name": f.name(), "type": type_name(f.data_type())})).collect()).unwrap_or_default();
     let mut left = shown;
     let mut written = vec![];
@@ -763,8 +763,8 @@ mod tests {
         assert_eq!(content_type(Some("csv")), "text/csv; charset=utf-8");
         // (every format writes an answer with no rows, and one with rows)
         for f in FORMATS {
-            render(&[], Some(f.name), |_| None).unwrap_or_else(|e| panic!("{}: no rows: {e}", f.name));
-            assert!(!render(&[sample(3)], Some(f.name), |_| None).unwrap().is_empty(), "{}", f.name);
+            render(&[], Some(f.name), &|_| None).unwrap_or_else(|e| panic!("{}: no rows: {e}", f.name));
+            assert!(!render(&[sample(3)], Some(f.name), &|_| None).unwrap().is_empty(), "{}", f.name);
         }
     }
 
@@ -775,20 +775,20 @@ mod tests {
             // (cut as a door cuts them: the batch as its format sends it, in `pieces`)
             let parts = pieces([Encoding::new(f).lean(batch.clone())]);
             assert!(parts.len() > 1, "{f:?}: a piece is about PIECE of Arrow: {} pieces", parts.len());
-            let whole = render(&[batch.clone()], f, |_| None).unwrap();
+            let whole = render(&[batch.clone()], f, &|_| None).unwrap();
             assert!(written(f, &parts) == whole.as_ref(), "{f:?}: the pieces are not the answer render writes");
         }
         // Arrow: the pieces and the whole decode to the rows as they are sent (a view as its string).
         let sent = as_sent(batch.clone(), Some("arrow"));
         let decoded = |bytes: &[u8]| -> Vec<RecordBatch> { StreamReader::try_new(Cursor::new(bytes), None).unwrap().map(|b| b.unwrap()).collect() };
         let same = |bs: &[RecordBatch]| concat_batches(&sent.schema(), bs).unwrap();
-        let whole = render(&[batch.clone()], Some("arrow"), |_| None).unwrap();
+        let whole = render(&[batch.clone()], Some("arrow"), &|_| None).unwrap();
         assert_eq!(same(&decoded(&written(Some("arrow"), &pieces([sent.clone()])))), sent);
         assert_eq!(same(&decoded(&whole)), sent);
         // An empty batch: JSON's [] and CSV's header alone, whole or in pieces.
         let empty = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true), Field::new("b", DataType::Utf8, true)])));
-        assert_eq!(render(&[empty.clone()], None, |_| None).unwrap().as_ref(), b"[]");
-        assert_eq!(render(&[empty.clone()], Some("csv"), |_| None).unwrap().as_ref(), b"a,b\n");
+        assert_eq!(render(&[empty.clone()], None, &|_| None).unwrap().as_ref(), b"[]");
+        assert_eq!(render(&[empty.clone()], Some("csv"), &|_| None).unwrap().as_ref(), b"a,b\n");
         assert_eq!(written(None, &piece_rows(&empty)), b"[]");
         assert_eq!(written(Some("csv"), &piece_rows(&empty)), b"a,b\n");
     }

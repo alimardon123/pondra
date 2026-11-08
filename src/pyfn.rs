@@ -56,9 +56,13 @@ fn plain(t: &DataType) -> DataType {
     }
 }
 
+/// Python functions, as an extension: what a lake keeps for them (`Answered`, the lake's state for them: `lake_state.rs`).
+pub static PYTHON: crate::registry::BuiltIn = crate::registry::BuiltIn { name: "python", requires: &[], register: |r| r.section_mut::<crate::lake_state::Registered>().add::<Answered>() };
+
 /// Register the lake's Python functions in a session (on every node: they are in the catalog).
 pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
     let all = crate::routines::listed(lake).await?;
+    let answers = lake.state::<Answered>()?; // (made at the lake's first session, so its line shows it from then on)
     for (name, r) in all.iter().filter(|(_, r)| r.python() && r.kind != Kind::Procedure) {
         let mut args = vec![];
         for p in &r.params {
@@ -74,7 +78,7 @@ pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
                 for (c, t) in crate::expander::columns_of(r.returns.as_deref().unwrap_or_default())? {
                     fields.push(Field::new(c, arrow_of(&t).await?, true));
                 }
-                ctx.register_udtf(name, Arc::new(TableFn { name: name.clone(), routine, args, schema: Arc::new(Schema::new(fields)) }));
+                ctx.register_udtf(name, Arc::new(TableFn { name: name.clone(), routine, args, schema: Arc::new(Schema::new(fields)), answers: answers.clone() }));
             }
             _ => {
                 let returns = arrow_of(r.returns.as_deref().context("RETURNS")?).await?;
@@ -83,7 +87,7 @@ pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
                     false => Signature::new(TypeSignature::Any(args.len()), Volatility::Volatile),
                 };
                 let signature = if args.is_empty() { Signature::nullary(Volatility::Volatile) } else { signature };
-                ctx.register_udf(AsyncScalarUDF::new(Arc::new(Function { name: name.clone(), routine, returns, signature })).into_scalar_udf());
+                ctx.register_udf(AsyncScalarUDF::new(Arc::new(Function { name: name.clone(), routine, returns, signature, answers: answers.clone() })).into_scalar_udf());
             }
         }
     }
@@ -119,6 +123,7 @@ struct Function {
     routine: Arc<Routine>,
     returns: DataType,
     signature: Signature,
+    answers: Arc<Answered>, // (its lake's)
 }
 
 impl PartialEq for Function {
@@ -156,7 +161,7 @@ impl AsyncScalarUDFImpl for Function {
                 Some(_) => keys(&self.name, &self.routine, &arrays, asked)?,
                 None => vec![],
             };
-            let kept: Vec<Option<ArrayRef>> = keys.iter().map(|k| ANSWERS.lock().unwrap().value(k)).collect();
+            let kept: Vec<Option<ArrayRef>> = keys.iter().map(|k| self.answers.0.lock().unwrap().value(k)).collect();
             let missing: Vec<u32> = (0..asked as u32).filter(|&i| kept.get(i as usize).is_none_or(Option::is_none)).collect();
             let arrays = match missing.len() == asked {
                 true => arrays,
@@ -175,7 +180,7 @@ impl AsyncScalarUDFImpl for Function {
             anyhow::ensure!(column.len() == missing.len(), "{} values back for {} rows", column.len(), missing.len());
             let column = match cache {
                 Some(secs) => {
-                    let mut answers = ANSWERS.lock().unwrap();
+                    let mut answers = self.answers.0.lock().unwrap();
                     for (at, &i) in missing.iter().enumerate() {
                         answers.keep(keys[i as usize].clone(), Kept::Value(datafusion::arrow::compute::take(&column, &datafusion::arrow::array::UInt32Array::from(vec![at as u32]), None)?), secs);
                     }
@@ -237,6 +242,7 @@ struct TableFn {
     routine: Arc<Routine>,
     args: Vec<Option<DataType>>,
     schema: SchemaRef,
+    answers: Arc<Answered>, // (its lake's)
 }
 
 impl TableFunctionImpl for TableFn {
@@ -254,7 +260,7 @@ impl TableFunctionImpl for TableFn {
                 _ => v,
             });
         }
-        Ok(Arc::new(Called { name: self.name.clone(), routine: self.routine.clone(), values, schema: self.schema.clone() }))
+        Ok(Arc::new(Called { name: self.name.clone(), routine: self.routine.clone(), values, schema: self.schema.clone(), answers: self.answers.clone() }))
     }
 }
 
@@ -264,6 +270,7 @@ struct Called {
     routine: Arc<Routine>,
     values: Vec<ScalarValue>,
     schema: SchemaRef,
+    answers: Arc<Answered>,
 }
 
 #[async_trait::async_trait]
@@ -278,12 +285,12 @@ impl TableProvider for Called {
                 Some(_) => keys(&self.name, &self.routine, &arrays, 1)?.pop(),
                 None => None,
             };
-            if let Some(rows) = key.as_ref().and_then(|k| ANSWERS.lock().unwrap().rows(k)) {
+            if let Some(rows) = key.as_ref().and_then(|k| self.answers.0.lock().unwrap().rows(k)) {
                 return anyhow::Ok(rows);
             }
             let rows = ask(&self.name, &self.routine, true, batch(&self.routine, arrays, 1)?, self.schema.clone()).await?;
             if let (Some(k), Some(secs)) = (key, self.routine.with.cache) {
-                ANSWERS.lock().unwrap().keep(k, Kept::Rows(rows.clone()), secs);
+                self.answers.0.lock().unwrap().keep(k, Kept::Rows(rows.clone()), secs);
             }
             anyhow::Ok(rows)
         };
@@ -294,10 +301,10 @@ impl TableProvider for Called {
 
 // ---------------------------------------------------------------- answers kept (ADR-028)
 
-/// Answers of functions made `WITH (cache = '…')`, on this node: by the function's definition (a
-/// replaced function never reuses an old answer) and its argument values, each for the function's
-/// lifetime, within `PONDRA_FUNCTION_CACHE_MB` (256), least recently used out first. Only calls
-/// that succeeded are kept. The caller isn't in the key: a function sees only its arguments.
+/// Answers of functions made `WITH (cache = '…')`, kept by the lake whose functions they are (`Answered`): by the
+/// function's definition (a replaced function never reuses an old answer) and its argument values, each for the
+/// function's lifetime, within `PONDRA_FUNCTION_CACHE_MB` (256), least recently used out first. Only calls that
+/// succeeded are kept. The caller isn't in the key: a function sees only its arguments.
 struct Answers {
     kept: crate::ledger::ByteLru<Vec<u8>, (datafusion::common::instant::Instant, Kept)>, // (each charged its key and its answer)
 }
@@ -316,17 +323,29 @@ impl Kept {
     }
 }
 
-crate::per_node!(static ANSWERS: Arc<Mutex<Answers>> = Arc::new(Mutex::new(Answers { kept: crate::ledger::ByteLru::new(answers_bytes()) })); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).kept.clear());
-
 fn answers_bytes() -> usize { crate::env::value::<usize>("PONDRA_FUNCTION_CACHE_MB") << 20 }
 
-/// The functions' answers kept, as the node's line counts them (`cache_bytes{cache="function_answers"}`, 11-07 audit M4).
-pub fn kept() -> Arc<dyn crate::ledger::Charged> { ANSWERS.clone() }
+/// A lake's functions' answers: the lake's state for them (`Lake::state`), charged to its line as `cache_bytes{cache="function_answers"}`
+/// (11-07 audit M4).
+pub(crate) struct Answered(Mutex<Answers>);
 
-impl crate::ledger::Charged for Mutex<Answers> {
-    fn held(&self) -> usize { self.lock().unwrap_or_else(|e| e.into_inner()).kept.bytes() }
+impl crate::lake_state::LakeState for Answered {
+    const NAME: &'static str = "function_answers";
+    const ABOUT: &'static str = "the answers of its Python functions made WITH (cache = '…'), by each function's definition and arguments";
 
-    fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(self, |a| &mut a.kept, bytes) }
+    fn make() -> Self { Answered(Mutex::new(Answers { kept: crate::ledger::ByteLru::new(answers_bytes()) })) }
+
+    fn cache(self: Arc<Self>) -> Option<Arc<dyn crate::ledger::Charged>> { Some(self) }
+}
+
+impl std::fmt::Debug for Answered {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "Answered") }
+}
+
+impl crate::ledger::Charged for Answered {
+    fn held(&self) -> usize { self.0.lock().unwrap_or_else(|e| e.into_inner()).kept.bytes() }
+
+    fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(&self.0, |a| &mut a.kept, bytes) }
 
     fn gives_back(&self) -> bool { true }
 
@@ -376,4 +395,30 @@ fn keys(name: &str, r: &Routine, arrays: &[ArrayRef], rows: usize) -> Result<Vec
     }
     let converted = RowConverter::new(arrays.iter().map(|a| SortField::new(a.data_type().clone())).collect())?.convert_columns(arrays)?;
     Ok((0..rows).map(|i| [head.as_slice(), converted.row(i).data()].concat()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A function's answers are its lake's state (`lake_state.rs`, invariant 301): made once a lake, never another lake's, so
+    /// two lakes in one process with the same function, called with the same arguments, keep their own, and the line
+    /// counts what the lake that kept one holds.
+    #[tokio::test]
+    async fn each_lake_keeps_its_own_functions_answers() -> Result<()> {
+        use crate::ledger::Charged;
+        let open = || async { Lake::open(&format!("memory://answers-{}", uuid::Uuid::new_v4().simple()), true, false, crate::lifecycle::unhosted()).await };
+        let (a, b) = (open().await?, open().await?);
+        let (kept, other) = (a.state::<Answered>()?, b.state::<Answered>()?);
+        assert!(Arc::ptr_eq(&kept, &a.state::<Answered>()?) && !Arc::ptr_eq(&kept, &other), "one a lake, its own");
+        let r: Routine = serde_json::from_value(json!({"kind": "macro", "params": [], "body": "return 1", "language": "python"}))?;
+        let arrays: Vec<ArrayRef> = vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![7]))];
+        let key = keys("f", &r, &arrays, 1)?.remove(0);
+        kept.0.lock().unwrap().keep(key.clone(), Kept::Value(arrays[0].clone()), 60);
+        assert!(kept.0.lock().unwrap().value(&key).is_some(), "lake a keeps its answer");
+        assert!(other.0.lock().unwrap().value(&key).is_none(), "lake b, with the same function and arguments, doesn't have it");
+        assert!(kept.held() > 0 && other.held() == 0);
+        assert!(a.ledger().expect("a lake's line").held_by_name().iter().any(|(name, bytes)| *name == "function_answers" && *bytes > 0), "on the lake's line, by its name");
+        Ok(())
+    }
 }
