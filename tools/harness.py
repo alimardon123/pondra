@@ -10938,11 +10938,13 @@ def _users_mcp_errors(checks, port, admin, names):
         url = f"http://127.0.0.1:{web.server_address[1]}/data.csv"
         call(port, "POST", "/sql", f"CREATE SECRET mcp_web (TYPE http, BEARER_TOKEN 'x', SCOPE 'http://127.0.0.1:{web.server_address[1]}')".encode(), headers={"Authorization": admin})
         call(port, "POST", "/sql", f"GRANT USAGE ON SECRET mcp_web TO {ann}".encode(), headers={"Authorization": admin})
-        file_error = mcp_text(ann, "query", {"sql": f"SELECT nope FROM read_csv('{url}')"})  # (no such column: the planner names the file's fields)
+        # (no such column: the planner names the file's fields to a superuser; to a user with grants, no field at all, `rights::said`)
+        file_error = {who: mcp_text(who, "query", {"sql": f"SELECT nope FROM read_csv('{url}')"}) for who in (ann, boss)}
     finally:
         web.shutdown()
         web.server_close()
-    checks["…an error naming a file shows it by its SQL name, never ext:…"] = "ext:" not in file_error and url in file_error
+    checks["…an error naming a file shows it by its SQL name, never ext:…"] = all("ext:" not in e for e in file_error.values()) and url in file_error[boss] \
+        and "No field named nope" in file_error[ann]
 
 
 def users():
@@ -11006,8 +11008,9 @@ def users():
     }
     # (ann holds nothing on hr: for her it is a table that isn't there, `harness.py listings`)
     gone = lambda r, t="hr": "permission denied" not in str(r) and (f"no table {t}" in str(r) or f"{t}' not found" in str(r))
+    # (* is refused naming no column: they may be ones it may not read; a filter is refused naming the column it names)
     checks["a user reads the columns granted (its roles' and public's); *, a filter on another column: refused, saying why; a table it holds nothing on isn't there"] = \
-        said["cols"] == [{"id": 1, "item": "tea"}, {"id": 2, "item": "cake"}] and "permission denied: SELECT (card) on sales.orders" in said["star"] \
+        said["cols"] == [{"id": 1, "item": "tea"}, {"id": 2, "item": "cake"}] and "permission denied: SELECT on sales.orders" in said["star"] and "card" not in said["star"] \
         and "permission denied: SELECT (card)" in said["filter"] and gone(said["other"]) and said["count"] == [{"n": 2}] and said["public"] == [{"text": "hello"}]
     checks["...writes only as granted; lists only what it may read; makes no users; a wrong password refused"] = "permission denied: INSERT on sales.orders" in said["write"] \
         and said["listed"] == [{"name": "notes"}, {"name": "orders"}] and said["info"] == [{"table_name": "notes"}, {"table_name": "orders"}] and "superuser" in said["users"] and said["wrong"].startswith("ERROR 401")
@@ -18431,8 +18434,9 @@ def remembered():
     hidden = [sqlstate(cat, "SELECT k, hidden FROM r_kv WHERE k = 2"), sqlstate(cat, "SELECT * FROM r_kv WHERE k = 2"),
               http(cat_h, "SELECT k, hidden FROM r_kv WHERE k = 1"), http(cat_h, "SELECT * FROM r_kv WHERE k = 1"), http(cat_h, "SELECT v FROM r_kv WHERE k = 1 AND hidden = 'h1'")]
     info["a key lookup of a column not granted"] = hidden
+    # (the refusal names the column the statement names; SELECT * names none, `query::Guarded`)
     checks["a key lookup of a column it may not read is refused (42501), SELECT * too, over the port and HTTP"] = hidden[:2] == ["42501", "42501"] \
-        and all("permission denied" in str(h) and "hidden" in str(h) for h in hidden[2:])
+        and all("permission denied" in str(h) for h in hidden[2:]) and "hidden" in str(hidden[2]) and "hidden" in str(hidden[4]) and "hidden" not in str(hidden[3])
     cat.close(); ann.close(); boss.close()
 
     node.kill()
@@ -22136,11 +22140,12 @@ def listings():
     it may read, and of a table granted in part only the columns granted; a superuser all of them. The doors' listings:
     pondra.tables, pondra.objects, information_schema.tables and SHOW TABLES over HTTP, GET /objects, MCP's list_tables,
     Iceberg REST's tables, Postgres's pg_class, pg_tables and information_schema.tables, Flight SQL's GetTables (ADBC's
-    get_objects), and pondra.find. Their columns: pondra.parts, Postgres's information_schema.columns and pg_attribute, MCP's
-    list_tables and Flight SQL's GetTables. And a table or view it holds no privilege on is not there for it: a read or a
-    write naming it, at every door (HTTP, Postgres, Flight SQL, MCP, /lookup, /append, /insert, Iceberg REST, Kafka), is
+    get_objects), and pondra.find. Their columns: pondra.parts, information_schema.columns, SHOW COLUMNS and DESCRIBE over
+    HTTP, Postgres's information_schema.columns, pg_attribute and DESCRIBE, MCP's list_tables and Flight SQL's GetTables.
+    And a table or view it holds no privilege on is not there for it: a read or a write naming it, DESCRIBE and SHOW
+    COLUMNS too, at every door (HTTP, Postgres, Flight SQL, MCP, /lookup, /append, /insert, Iceberg REST, Kafka), is
     answered as one naming a table that isn't there, and Kafka's topics are the tables it knows of; one it knows of is
-    refused, 42501."""
+    refused, 42501. A column that isn't there, of a table it reads in part, is said naming none it may not read."""
     import base64, psycopg
     import adbc_driver_flightsql.dbapi as adbc
     lake = new_lake()
@@ -22208,6 +22213,20 @@ def listings():
                     return str(r)[:300]
                 got |= {("public" if i["namespace"] == ["default"] else i["namespace"][0], i["name"]) for i in r["identifiers"]}
             return got
+        def described(q, each):
+            # (DESCRIBE t or SHOW COLUMNS FROM t of each table: the columns of those it may describe; one not there for it, none)
+            got = set()
+            for t in ("sales.orders", "notes", "hr"):
+                r = each(q.format(t=t))
+                if isinstance(r, (list, set)):
+                    got |= {(t.split(".")[-1], c) for c in r}
+            return got
+        def over_http(s):
+            r = ask(auth, s)
+            return [x["column_name"] for x in r] if isinstance(r, list) else str(r)
+        def over_pg(s):
+            r = pg(s)
+            return [x[0] for x in r] if isinstance(r, set) else r
         def finds(rows):
             got = [rows(f"SELECT kind, object, name FROM pondra.find('{w}') WHERE kind IN ('column', 'view', 'table')", lambda x: (x["kind"], x["object"], x["name"])) for w in ("item", "card", "salary")]
             return next((g for g in got if isinstance(g, str)), None) or set().union(*got)
@@ -22232,7 +22251,11 @@ def listings():
             },
             "columns": {
                 "pondra.parts": rows("SELECT object, name FROM pondra.parts WHERE kind = 'column' AND object IN ('orders', 'notes', 'hr')", lambda x: (x["object"], x["name"])),
+                "HTTP information_schema.columns": rows("SELECT table_name AS t, column_name AS c FROM information_schema.columns WHERE table_name IN ('orders', 'notes', 'hr')", lambda x: (x["t"], x["c"])),
+                "HTTP SHOW COLUMNS": described("SHOW COLUMNS FROM {t}", over_http),
+                "HTTP DESCRIBE": described("DESCRIBE {t}", over_http),
                 "Postgres information_schema.columns": pg("SELECT table_name, column_name FROM information_schema.columns WHERE table_name IN ('orders', 'notes', 'hr')"),
+                "Postgres DESCRIBE": described("DESCRIBE {t}", over_pg),
                 "Postgres pg_attribute": pg("SELECT c.relname, a.attname FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON a.attrelid = c.oid WHERE c.relname IN ('orders', 'notes', 'hr') AND a.attnum > 0"),
                 "MCP list_tables": {(split(t["table"])[1], c["name"]) for t in by_mcp for c in t.get("columns", [])} if isinstance(by_mcp, list) else by_mcp,
                 "Flight SQL GetTables": {(t, c) for _, t, k, c in by_flight if k == "TABLE"} if isinstance(by_flight, list) else by_flight,
@@ -22287,7 +22310,7 @@ def listings():
         return r
     statements = {"SELECT *": "SELECT * FROM {t}", "a column that isn't": "SELECT nope FROM {t}", "a key's row": "SELECT * FROM {t} WHERE id = 1",
                   "by its schema": "SELECT count(*) FROM public.{t}", "INSERT": "INSERT INTO {t} VALUES (1, 2.0)", "UPDATE": "UPDATE {t} SET salary = 1",
-                  "DELETE": "DELETE FROM {t}"}
+                  "DELETE": "DELETE FROM {t}", "DESCRIBE": "DESCRIBE {t}", "SHOW COLUMNS": "SHOW COLUMNS FROM {t}"}
     writes = {"INSERT", "UPDATE", "DELETE"}
     doors = {"HTTP": lambda s, w: as_ann(s), "Postgres": lambda s, w: pg_says(s), "Flight SQL": lambda s, w: flight_says(s), "MCP": lambda s, w: mcp_says(s, "write" if w else "query")}
     routes = {"GET /lookup": lambda t: as_ann("", "GET", f"/lookup/{t}/1"), "POST /append": lambda t: as_ann('{"id": 1, "salary": 2.0}', "POST", f"/append/{t}"),
@@ -22301,8 +22324,9 @@ def listings():
             for door, ask_ in doors.items():
                 a, b = ask_(s.format(t=hidden), what in writes), ask_(s.format(t=gone), what in writes)
                 unseen[f"{door}, {what}, {hidden}"] = (a, b)
+                # (Postgres has no SHOW COLUMNS: the port answers it as SHOW of a setting, the same for any table)
                 checks[f"{door}: {what} of {hidden}, which ann holds no privilege on, is answered as of a table that isn't there"] = same(a, b) and "permission denied" not in a \
-                    and "salary" not in a and a != "answered"
+                    and "salary" not in a and (a != "answered" or (door, what) == ("Postgres", "SHOW COLUMNS"))
         if hidden == "hr":
             for route, ask_ in routes.items():
                 a, b = ask_(hidden), ask_(gone)
@@ -22326,6 +22350,38 @@ def listings():
     known = {door: ask_("SELECT card FROM sales.orders", False) for door, ask_ in doors.items()} | {f"{door}, DELETE": ask_("DELETE FROM sales.orders", True) for door, ask_ in doors.items()}
     unseen["known"] = known
     checks["a table ann knows of (some columns granted) is refused what it may not do, 42501, at every door"] = all("permission denied" in v or "42501" in v for v in known.values())
+    # (a column that isn't there, of a table ann reads in part: said naming none of its others, which may be ones it may not
+    # read: not card, nor the nearest, card; a superuser is told them)
+    missing = {f"{door}, {s}": ask_(s, False) for door, ask_ in doors.items() for s in ("SELECT car FROM sales.orders", "SELECT o.nope FROM sales.orders o")}
+    unseen["a column that isn't"] = missing
+    boss_told = ask(boss, "SELECT car FROM sales.orders")
+    checks["a column that isn't there, of a table ann reads in part, is said naming none of its columns, at every door; a superuser is told the nearest"] = \
+        all(v != "answered" and ("car" in v or "nope" in v) and "card" not in v and "amount" not in v for v in missing.values()) and "card" in str(boss_told)
+    # (SELECT * of a table ann reads in part: refused at every door, naming no column, and never answered with fewer
+    # columns, a statement that also lists columns included; one naming only columns it may read, answered)
+    star = {door: ask_("SELECT * FROM sales.orders", False) for door, ask_ in doors.items()}
+    mixed = {door: ask_("SELECT * FROM sales.orders, (SELECT count(*) AS n FROM information_schema.columns) c", False) for door, ask_ in doors.items() if door in ("HTTP", "Postgres")}
+    plain = {door: ask_("SELECT id FROM sales.orders WHERE item <> 'information_schema'", False) for door, ask_ in doors.items() if door in ("HTTP", "Postgres")}
+    unseen["SELECT *"] = (star, mixed, plain)
+    checks["SELECT * of a table ann reads in part is refused at every door naming none of its columns, and never answered with fewer columns, in a statement that lists columns too"] = \
+        all(("permission denied" in v or "42501" in v) and "card" not in v and "amount" not in v for v in list(star.values()) + list(mixed.values())) \
+        and plain["HTTP"].startswith("200 ") and plain["Postgres"] == "answered"
+    # (a view granted whole over a column ann may not read: planned, and DESCRIBE, SHOW COLUMNS and information_schema show its
+    # columns; its rows are read as ann, refused at its base table as before (W50); an INSERT naming a column that isn't
+    # there, of a table ann may write but reads in part, names none of the others)
+    for q in ["CREATE VIEW sales.card_ids AS SELECT id, card FROM sales.orders", "GRANT SELECT ON sales.card_ids TO ann", "GRANT INSERT ON sales.orders TO ann"]:
+        ask(boss, q)
+    names = lambda r: [x["column_name"] for x in r] if isinstance(r, list) else str(r)[:300]
+    view = {"DESCRIBE": names(ask(ann, "DESCRIBE sales.card_ids")), "SHOW COLUMNS": names(ask(ann, "SHOW COLUMNS FROM sales.card_ids")),
+            "information_schema": names(ask(ann, "SELECT column_name FROM information_schema.columns WHERE table_name = 'card_ids' ORDER BY ordinal_position")),
+            "rows": as_ann("SELECT * FROM sales.card_ids")}
+    unseen["a view granted whole"] = view
+    checks["a view granted whole over a column ann may not read is planned and shown with its columns (DESCRIBE, SHOW COLUMNS, information_schema); its rows are refused at its base table, naming no column"] = \
+        view["DESCRIBE"] == view["SHOW COLUMNS"] == view["information_schema"] == ["id", "card"] and "permission denied" in view["rows"] and "card" not in view["rows"]
+    inserted = {door: ask_("INSERT INTO sales.orders (id, nope) VALUES (9, 1)", True) for door, ask_ in doors.items()}
+    unseen["INSERT, a column that isn't"] = inserted
+    checks["an INSERT naming a column that isn't there, of a table ann may write but reads in part, names none of its other columns, at every door"] = \
+        all(v != "answered" and "nope" in v and "card" not in v and "amount" not in v for v in inserted.values())
     info["unseen"] = unseen
     node.kill()
     ok = all(checks.values())
