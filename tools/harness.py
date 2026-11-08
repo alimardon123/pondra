@@ -12628,8 +12628,8 @@ def guarded():
         h3_flowing is True and h3_ended.get("flight follow", 99) <= 12 and "sign in again" in h3["flight follow"].get("error", "")
     # (each is asked again the moment the lake's rights move, a second at most, not every 5 s whether or not they did: 11-08 M7.
     # The no-longer-superuser's live query ends at its next answer, which the INSERT 6 s on brings)
-    checks["/watch, a live query and Flight's follow stream end within 4 s of the REVOKE or DROP USER that ends their sign-in (11-08 M7)"] = \
-        h3_flowing is True and all(h3_ended.get(k, 99) <= 4 for k in ("watch", "live, dropped", "flight follow"))
+    checks["/watch, a live query and Flight's follow stream end within 2.5 s of the REVOKE or DROP USER that ends their sign-in (11-08 M7)"] = \
+        h3_flowing is True and all(h3_ended.get(k, 99) <= 2.5 for k in ("watch", "live, dropped", "flight follow"))
     # M8: a joined page's own statements are written by its node, as the sign-in's (`POST /cluster/records`, page_records.rs): a
     # superuser's sign-in only (never the nodes' key, nor a user with grants), at most 256 lines, under the node's own class and
     # words, and kept as a history row whatever the audit classes say. Node a's classes here have no read (`role,ddl,function,write`).
