@@ -104,10 +104,14 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             passes.add(p);
         }
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "functions", columns: FUNCTION_COLUMNS, rows: functions });
-        #[cfg(feature = "lake")] // (what a lake keeps for the engine's doors: the answers kept for their pages, and a joined page's unsent statements, `lake_state.rs`)
+        #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: the answers kept for their doors' pages, a joined page's unsent statements and a node's count of them, and its file stores and catalogs' tokens)
         {
-            r.section_mut::<crate::lake_state::Registered>().add::<crate::pages::Pages>();
-            r.section_mut::<crate::lake_state::Registered>().add::<crate::page_records::Unsent>();
+            let states = r.section_mut::<crate::lake_state::Registered>();
+            states.add::<crate::pages::Pages>();
+            states.add::<crate::page_records::Unsent>();
+            states.add::<crate::page_records::Counted>();
+            states.add::<crate::ext::Stores>();
+            states.add::<crate::ext::Tokens>();
         }
         #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)
         for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,
