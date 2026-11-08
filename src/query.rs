@@ -1629,6 +1629,9 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
                 system.register_table(name.into(), table)?;
             }
         }
+        if text.to_lowercase().contains("pondra.rejects") {
+            system.register_table("rejects".into(), crate::rejects::shown(lake, &ctx, upto).await?)?; // (the rows views' expectations dropped, of the objects the caller may read: `rejects.rs`)
+        }
         if crate::vars::mentioned(&text) {
             system.register_table("variables".into(), crate::vars::table()?)?; // (the session's or the run's: `vars.rs`)
         }

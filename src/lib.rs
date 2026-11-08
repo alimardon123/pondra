@@ -261,6 +261,7 @@ mod rules;
 #[cfg(feature = "lake")] mod vend;
 #[cfg(feature = "lake")] mod vars;
 #[cfg(feature = "lake")] mod views;
+#[cfg(feature = "lake")] mod rejects; // (the rows views' expectations drop, kept for review: `pondra.rejects`)
 #[cfg(feature = "lake")] mod write;
 // The registry's statements section: a statement an extension adds, read by `write::parse` at one place.
 #[cfg(feature = "lake")] pub mod statements;

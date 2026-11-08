@@ -147,7 +147,7 @@ pub async fn file(lake: &Lake, seq: &crate::log::Sequencer, commits: &[FileCommi
         added.push(with_ids(lake, seq, &c.added).await?);
     }
     loop {
-        let (mut filings, mut marks, mut followed) = (vec![], vec![], std::collections::BTreeMap::new());
+        let (mut filings, mut marks, mut followed, mut followed_by) = (vec![], vec![], std::collections::BTreeMap::new(), std::collections::BTreeMap::new());
         let inline = crate::views::inline(lake).await?;
         for (c, added) in commits.iter().zip(&added) {
             let mut meta = match lake.cat.get::<TableMeta>(&table_key(&c.table)).await? {
@@ -164,6 +164,7 @@ pub async fn file(lake: &Lake, seq: &crate::log::Sequencer, commits: &[FileCommi
             crate::sketch::add(&mut meta, &mut files);
             if inline.by_source.contains_key(&c.table) {
                 followed.insert(c.table.clone(), rows(lake, &meta, &files, false).await?);
+                followed_by.insert(c.table.clone(), format!("job:{}", c.job)); // (the run its views' dropped rows name)
                 let mut old = rows(lake, &meta, &gone, true).await?;
                 for (f, deletes) in &hit {
                     for b in rows_deleted(lake, &meta, f, deletes, &sys_schema(&meta, true)?).await? {
@@ -187,7 +188,7 @@ pub async fn file(lake: &Lake, seq: &crate::log::Sequencer, commits: &[FileCommi
             };
             filings.push(Filing { table: c.table.clone(), meta, added: files, removed: gone, deleted: hit, also: record, gone: lost });
         }
-        let mut flush = crate::log::pack_with(lake, &marks, followed).await?;
+        let mut flush = crate::log::pack_with(lake, &marks, followed, followed_by).await?;
         flush.filed = filings;
         match seq.submit(flush).await? {
             Outcome::Acks(a) if a.iter().any(|a| a.duplicate) => return Ok(None),
