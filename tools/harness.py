@@ -22411,7 +22411,7 @@ def listings():
                 ask(boss, q)
             def wes_insert(t):
                 c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
-                c.request("POST", f"/insert/{t}", b"SELECT 1 AS id, 2.0 AS salary", {"Authorization": basic("wes", "wes-password-1")})
+                c.request("POST", f"/insert/{t}?job=wes-1", b"SELECT 1 AS id, 2.0 AS salary", {"Authorization": basic("wes", "wes-password-1")})
                 r = c.getresponse()
                 return f"{r.status} {r.getheader('x-pondra-sqlstate')} {r.read().decode(errors='replace')[:400]}"
             a, b = wes_insert(hidden), wes_insert(gone)
