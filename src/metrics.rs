@@ -229,4 +229,20 @@ mod tests {
         assert!(n.failures().iter().all(|(_, n)| *n == 0));
         assert_eq!(super::get(&crate::node_state::NodeState::unhosted().metrics.queries), 0);
     }
+
+    /// Two nodes that open one lake in memory share its store, and each counts only its own requests (`store::counted`).
+    #[tokio::test]
+    async fn two_opens_of_one_store_count_apart() {
+        use object_store::{path::Path, ObjectStore};
+        let url = format!("memory://counted-{}", uuid::Uuid::new_v4().simple());
+        let held = crate::memory_lake::store(&url);
+        let (one, other) = (crate::node_state::NodeState::unhosted(), crate::node_state::NodeState::unhosted());
+        let (a, b) = (crate::store::counted(held.clone(), &one.metrics), crate::store::counted(held, &other.metrics));
+        a.put(&Path::from("x"), bytes::Bytes::from_static(b"1").into()).await.unwrap();
+        assert_eq!(&b.get(&Path::from("x")).await.unwrap().bytes().await.unwrap()[..], b"1", "one store under both");
+        let (m, n) = (&one.metrics, &other.metrics);
+        assert_eq!((super::get(&m.object_writes), super::get(&m.object_reads)), (1, 0));
+        assert_eq!((super::get(&n.object_writes), super::get(&n.object_reads)), (0, 1));
+        crate::memory_lake::forget_memory(&url);
+    }
 }
