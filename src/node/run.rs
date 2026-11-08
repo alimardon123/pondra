@@ -54,6 +54,8 @@ pub(crate) struct Held {
     /// Set by a guest that only reads: its catalog closes in a task of its own, which the answer doesn't wait for (a
     /// reader owes nothing: no term, nothing to make durable, and the close waits on its poller's cycle in flight).
     detach: OnceLock<()>,
+    /// The node's state (`node_state.rs`), set as its start begins: what its drain and its door's close act on.
+    node: OnceLock<Arc<crate::node_state::NodeState>>,
 }
 
 impl Held {
@@ -79,7 +81,9 @@ impl Held {
         }
         // (after the checkpoint, as a leader's followers may still call the door until then; before the tasks end, so
         // the answers the door is writing go out whole first)
-        crate::drain::close_door().await;
+        if let Some(node) = self.node.get() {
+            crate::drain::close_door(node).await;
+        }
         tr("door");
         panics::abort_all();
         tr("tasks");
@@ -114,6 +118,8 @@ pub struct Node {
     owner: Option<String>,
     /// A guest's App, for `finish`: what it drains and waits for before it stops.
     guest: Option<app::App>,
+    /// What `--idle-exit` looks at for work left (`idle::ended`).
+    work: crate::idle::Work,
 }
 
 /// A guest that reads opens its lake beside its term look (`Node::start`): this is that open, made at the same time as the
@@ -132,10 +138,10 @@ fn close_after(open: tokio::task::JoinHandle<anyhow::Result<Arc<store::Lake>>>) 
 }
 
 impl Beside {
-    fn start(dir: &str, guest: Option<Guest>, life: &crate::lifecycle::Life) -> Beside {
+    fn start(dir: &str, guest: Option<Guest>, here: &Arc<crate::node_state::NodeState>) -> Beside {
         Beside(matches!(guest, Some(Guest::Reads)).then(|| {
-            let (dir, life) = (dir.to_string(), life.clone());
-            panics::untracked(async move { store::Lake::open_polled(&dir, false, false, store::READER_ONE_SNAPSHOT, life).await })
+            let (dir, here) = (dir.to_string(), here.clone());
+            panics::untracked(async move { store::Lake::open_polled(&dir, false, false, store::READER_ONE_SNAPSHOT, here).await })
         }))
     }
 
@@ -170,7 +176,9 @@ impl Node {
         // (a guest answers one program's statements and ends: none of the loops and doors a node that lives keeps, so
         // every `lives` below keeps them for a node that lives only)
         let lives = guest.is_none();
-        let life = crate::node::native(!lives); // (what this node does when it must stop or start again: its lakes and its member hold it)
+        // (what this node does when it must stop or start again, and what its stop waits for: its lakes and its member hold it)
+        let here = crate::node::native(!lives);
+        let _ = held.node.set(here.clone()); // (a stop drains and closes this node's door: `Held::stop`)
         if lives {
             // (the spill folders of processes that ended, swept beside the start and not on it: a crashed one's may be
             // gigabytes, and a cold start waits for nothing but what serving needs, invariant 182)
@@ -201,10 +209,10 @@ impl Node {
         }
         // (a guest that reads begins its lake's open here, beside the term look: the look and the open are each requests to
         // the bucket, and the start waits for the later of them, not for both in turn)
-        let mut beside = Beside::start(&dir, guest, &life);
+        let mut beside = Beside::start(&dir, guest, &here);
         let cluster = match guest {
-            None => cluster::Cluster::join(&store, &addr, start.reader, !store::served(&dir), serve_store, life.clone()).await?,
-            Some(g) => cluster::Cluster::guest(&store, g, !store::served(&dir), life.clone()).await.map_err(|e| e.context(dir.clone()))?,
+            None => cluster::Cluster::join(&store, &addr, start.reader, !store::served(&dir), serve_store, here.life.clone()).await?,
+            Some(g) => cluster::Cluster::guest(&store, g, !store::served(&dir), here.life.clone()).await.map_err(|e| e.context(dir.clone()))?,
         };
         // (a guest that reads is a reader from here on: no log, whose history and audit lines would go to a leader it doesn't have)
         let reader = start.reader || cluster.reader;
@@ -239,7 +247,7 @@ impl Node {
         };
         let opened = match beside.keep(streamed).await {
             Some(lake) => lake,
-            None => store::Lake::open_polled(&dir, leader, streamed, poll, life.clone()).await,
+            None => store::Lake::open_polled(&dir, leader, streamed, poll, here.clone()).await,
         };
         let lake = match opened {
             // (a lake a newer Pondra wrote, or a place a move didn't finish: this binary must not lead or serve it,
@@ -255,14 +263,14 @@ impl Node {
             Err(e) if leader => {
                 eprintln!("opening the lake as leader failed: {e:#}"); // e.g. a newer leader fenced us
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                life.restart("opening the lake as leader failed", &[])
+                here.life.restart("opening the lake as leader failed", &[])
             }
             // A new lake whose first leader hasn't made the catalog yet (nodes started
             // together), or never will (it died first): look again, until it has or its
             // mark goes stale and this node takes over.
             Err(e) if ["failed to find latest transactional object", store::Lake::NO_LAKE].iter().any(|m| format!("{e:#}").contains(m)) => {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                life.restart("the lake has no catalog yet: its leader is still making it", &[])
+                here.life.restart("the lake has no catalog yet: its leader is still making it", &[])
             }
             lake => lake?,
         };
@@ -339,31 +347,45 @@ impl Node {
         }
         if lives {
             let role = if reader { "reader" } else if leader { "leader" } else { "follower" };
-            life.say(&format!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n));
+            here.life.say(&format!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n));
         }
         // No Nagle: a small answer goes out at once, not after the client's delayed ACK (the
         // Postgres, Kafka and Flight ports do the same).
         tr("listening");
         let listener = match lives {
-            true => Some(tls::Doors::bind(&listen, tls::Door::Http).await?), // (TLS too: `tls.rs`)
+            true => Some(tls::Doors::bind(&listen, tls::Door::Http).await?.for_node(here.clone())), // (TLS too: `tls.rs`)
             false => None,
         };
         node::keep(&app, &start);
         let guest_app = (!lives).then(|| app.clone());
+        let work = crate::idle::Work::of(&app);
         // (the HTTP door, a loop the node can't do without: a panic in it aborts, as invariant 178 says; `serving` waits on it)
         let router = server::router(app);
         let served = listener.map(|listener| {
-            let door = router.clone();
+            let (door, here) = (router.clone(), here.clone());
             panics::spawn(async move {
                 // (closing once `drain::close_door` runs: no new connections, each one's answer finished, then the serve ends)
-                drain::door_open();
-                let out = axum::serve(listener, door.into_make_service_with_connect_info::<tls::Peer>()).with_graceful_shutdown(drain::closing()).await.map_err(anyhow::Error::from); // (who asks: `console::save_settings`)
-                drain::door_closed();
+                here.drain.door_open();
+                let out = axum::serve(listener, door.into_make_service_with_connect_info::<tls::Peer>()).with_graceful_shutdown(here.drain.closing()).await.map_err(anyhow::Error::from); // (who asks: `console::save_settings`)
+                here.drain.door_closed();
                 out
             })
         });
-        Ok(Node { held, served, router, owner, guest: guest_app })
+        Ok(Node { held, served, router, owner, guest: guest_app, work })
     }
+
+    /// The node's state (`node_state.rs`): its lifecycle, its drain and its uses.
+    fn here(&self) -> &Arc<crate::node_state::NodeState> { self.held.node.get().expect("a started node's state") }
+
+    /// Drains the node before its stop (`drain::drain`): it stops being ready, turns new requests away, and waits for the
+    /// ones in flight.
+    pub(crate) async fn drain(&self) { crate::drain::drain(self.here()).await }
+
+    /// A second signal while draining: the stop doesn't wait for the door (`Drain::hurry`).
+    pub(crate) fn hurry(&self) { self.here().drain.hurry() }
+
+    /// Resolves once nobody has used the node for `secs` and it has nothing left to do (`idle::ended`, `--idle-exit`).
+    pub(crate) fn idle(&self, secs: f64) -> impl std::future::Future<Output = ()> + Send + 'static { crate::idle::ended(secs, self.here().clone(), self.work.clone()) }
 
     /// What the HTTP door serves, for a request made in this process (`library::Opened::ask`).
     pub(crate) fn router(&self) -> axum::Router { self.router.clone() }

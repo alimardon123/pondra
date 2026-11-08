@@ -649,7 +649,7 @@ impl Page {
         let who = lake_principal();
         let format = p.format.clone();
         let asked = map.clone(); // (a stop fails the session the statement ran in: the headers name it, `failed_for_memory`)
-        let said = match crate::panics::work(true, crate::auth::WHO.scope(who, Box::pin(crate::statement::sql(paged.app.clone(), p, crate::auth::Role::Admin, map, body)))).await {
+        let said = match crate::panics::work(&paged.app.lake.node, true, crate::auth::WHO.scope(who, Box::pin(crate::statement::sql(paged.app.clone(), p, crate::auth::Role::Admin, map, body)))).await {
             Ok(said) => said,
             Err(words) => {
                 if words == crate::oom::OOM || words == crate::oom::PAGE_OOM {
@@ -1418,7 +1418,7 @@ mod tests {
         assert!(format!("{e:#}").contains("sends its writes to its node"), "{e:#}");
         // (both are refused before the module's page is claimed, so this test never takes it: `node.rs`'s claim test does)
         let dir = std::env::temp_dir().join(format!("pondra-joined-{}", uuid::Uuid::new_v4()));
-        let made = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let made = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let _sequencer = crate::log::Sequencer::start(made.clone(), None).await?;
         let lake = &made;
         // a table with no key, one with a PRIMARY KEY, and one with a UNIQUE: a superuser's query INSERT into any of them is the page's to

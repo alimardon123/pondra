@@ -383,7 +383,8 @@ pub fn queue(lake: Arc<Lake>, table: String, src: Src, batch: RecordBatch) -> Re
 pub async fn leader(lake: Arc<Lake>, seq: Arc<Sequencer>, table: String, src: Src, batch: RecordBatch) -> Result<Ack> {
     // (no lock yet: this process's router isn't made, so the node is still starting; a retry reaches it)
     let lock = lock_of(&lake).ok_or_else(|| anyhow::anyhow!("{table}: the node is still starting, catching up with its leader: try again"))?;
-    let task = crate::panics::task(crate::panics::door(async move {
+    let node = lake.node.clone();
+    let task = crate::panics::task(crate::panics::door(&node, async move {
         let _one = lock.lock().await;
         append(&lake, &seq, &table, src, batch).await
     }));
@@ -481,7 +482,7 @@ mod tests {
 
     async fn fresh() -> Result<(std::path::PathBuf, Arc<Lake>)> {
         let dir = std::env::temp_dir().join(format!("pondra-shaped-key-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         Ok((dir, lake))
     }
 

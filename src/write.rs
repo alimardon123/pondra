@@ -9,7 +9,8 @@ use crate::log::{decode_flush, encode_flush, pack, Append, Outcome, Sequencer, S
 use crate::query::session;
 use crate::answer::schema;
 use crate::store::*;
-use crate::lifecycle::{Life, Lifecycle};
+use crate::lifecycle::Lifecycle;
+use crate::node_state::NodeState;
 use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 use datafusion::arrow::compute::concat_batches;
@@ -1913,7 +1914,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
             crate::dial::signed(lake).await; // (the nodes' key, before a user's change goes to the leader)
             return post_as(&app.members.leader().addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
         };
-        let out = deliver(&o.url, Some(Request::Change(sql, job.clone(), sent)), &job, false, &lake.life).await?;
+        let out = deliver(&o.url, Some(Request::Change(sql, job.clone(), sent)), &job, false, &lake.node).await?;
         seen_there(&o, Some(producer_key(&format!("sql:{job}")))).await;
         return Ok(out);
     }
@@ -1923,7 +1924,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         crate::users::across_write(&other, &attached_as(&stmt), &table, &stmt).await?; // (that lake's own sign-in)
         let req = prepare(lake, &other, &table, &stmt, &job, files).await?;
         let mark = req.as_ref().and_then(|r| request_mark(r, &job));
-        let out = deliver(&other.url, req, &job, false, &lake.life).await;
+        let out = deliver(&other.url, req, &job, false, &lake.node).await;
         if out.is_ok() {
             seen_there(&other, mark).await;
         }
@@ -2354,8 +2355,8 @@ pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request
 /// (or nothing, when someone leads it already: they answer the bell). No reader of the lake is
 /// opened and no statement run, so a node's CREATE DATABASE, a branch's first commit and a write
 /// to a lake nobody leads pay for one lead, not two and four catalogs opened.
-pub async fn lead_only(dir: &str, life: &Life) -> Result<()> {
-    deliver(dir, None, "", true, life).await.map(drop)
+pub async fn lead_only(dir: &str, node: &Arc<NodeState>) -> Result<()> {
+    deliver(dir, None, "", true, node).await.map(drop)
 }
 
 /// A write of a guest whose lake's leader is alive but doesn't answer from this machine (`Cluster::guest`, `by_inbox`): the
@@ -2446,7 +2447,7 @@ async fn through_bucket_one(lake: &Arc<Lake>, stmt: Stmt, statement_job: &str, f
     };
     let mark = request_mark(&req, statement_job);
     // (the process's job, not the statement's: a run started over again keeps it, and gives each statement its part again)
-    let out = deliver(&target.url, Some(req), job(), true, &lake.life).await?;
+    let out = deliver(&target.url, Some(req), job(), true, &lake.node).await?;
     seen_there(&target, mark).await;
     Ok(out)
 }
@@ -2471,29 +2472,29 @@ tokio::task_local! {
 }
 
 /// `send`, with `key` as its `Authorization` when given.
-pub async fn send_as(dir: &str, req: Request, key: Option<&str>, life: &Life) -> Result<Value> {
+pub async fn send_as(dir: &str, req: Request, key: Option<&str>, node: &Arc<NodeState>) -> Result<Value> {
     match key {
-        Some(k) => BEARER.scope(k.to_string(), send(dir, req, life)).await,
-        None => send(dir, req, life).await,
+        Some(k) => BEARER.scope(k.to_string(), send(dir, req, node)).await,
+        None => send(dir, req, node).await,
     }
 }
 
-/// Have the leader of the lake at `dir` record `req` (made on this node), however it's reached. `life`: the node's that
+/// Have the leader of the lake at `dir` record `req` (made on this node), however it's reached. `node`: the node that
 /// asks, which leads the lake elsewhere for a moment when nobody does.
-pub async fn send(dir: &str, req: Request, life: &Life) -> Result<Value> { deliver(dir, Some(req), "", false, life).await }
+pub async fn send(dir: &str, req: Request, node: &Arc<NodeState>) -> Result<Value> { deliver(dir, Some(req), "", false, node).await }
 
 /// Have the leader of the lake at `dir` record `req`, through the bucket alone: its inbox, or this
 /// process leading for a moment when nobody does. For a caller with no token (`pondra token`, which
 /// the leader would refuse over HTTP): whoever can write the bucket owns the lake (invariant 18).
-pub async fn through_bucket(dir: &str, req: Request, life: &Life) -> Result<Value> {
-    BUCKET.scope((), deliver(dir, Some(req), job(), true, life)).await
+pub async fn through_bucket(dir: &str, req: Request, node: &Arc<NodeState>) -> Result<Value> {
+    BUCKET.scope((), deliver(dir, Some(req), job(), true, node)).await
 }
 
 /// Have the leader of the lake at `dir` record a write: over HTTP, through the bucket inbox if it
 /// can't be reached, or, when nobody leads, by leading for a moment: here (`one_off`: a `pondra
 /// sql` process, which ends right after), or, from a node, in a `pondra sql` of its own. `req` None is
 /// nothing to record (`lead_only`): the lake is led for the moment, and its inbox answered.
-async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool, life: &Life) -> Result<Value> {
+async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool, node: &Arc<NodeState>) -> Result<Value> {
     if let Some(r) = crate::store::reach_of(dir).filter(|r| r.read_only) {
         return across(dir, &r, req).await; // (a lake on another server: ADR-058)
     }
@@ -2523,17 +2524,17 @@ async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool, 
             }
             Holder::Free(_) if !one_off => {
                 let Some(r) = &req else { return Ok(j!({"duplicate": true})) };
-                if let Some(v) = crate::inbox::send(&store, r, Some((dir, life)), None).await? {
+                if let Some(v) = crate::inbox::send(&store, r, Some((dir, &node.life)), None).await? {
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }
             Holder::Free(t) => {
                 let Some(term) = claim(&store, t.map_or(1, |t| t.n + 1), "").await? else { continue };
-                return match lead(dir, &store, term.n, &mut req, life).await {
+                return match lead(dir, &store, term.n, &mut req, node).await {
                     // Another one-off writer took the catalog while this one was leading (both
                     // found the lake idle). Start over with the same job: whoever wins records it
                     // once, and the rest go through them.
-                    Err(e) if fenced(&e) && tries() < 5 => start_over("fenced while writing", job, &**life),
+                    Err(e) if fenced(&e) && tries() < 5 => start_over("fenced while writing", job, &*node.life),
                     // (members this machine can't reach hold acknowledged changes: they choose a leader, and the write goes to it)
                     Err(e) if e.downcast_ref::<crate::replica::Unreached>().is_some() => {
                         eprintln!("{e:#}");
@@ -2744,16 +2745,16 @@ pub(crate) fn start_over(why: &str, job: &str, life: &dyn Lifecycle) -> ! {
 
 /// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go, however it ends.
 /// `req` None records nothing (`lead_only`); it is taken once the lake is ours (left for another leader if it isn't).
-async fn lead(dir: &str, store: &Store, term: u64, req: &mut Option<Request>, life: &Life) -> Result<Value> {
+async fn lead(dir: &str, store: &Store, term: u64, req: &mut Option<Request>, node: &Arc<NodeState>) -> Result<Value> {
     let marks = crate::terms::mark_every(store.clone(), term);
-    let out = led(dir, term, req, life).await;
+    let out = led(dir, term, req, node).await;
     marks.abort(); // (its mark stops before the term is let go, so no mark lands after it)
     release(store, term).await; // the next writer or node doesn't have to wait
     out
 }
 
-async fn led(dir: &str, term: u64, req: &mut Option<Request>, life: &Life) -> Result<Value> {
-    let lake = Lake::open(dir, true, false, life.clone()).await?; // (the catalog's writer: fences any older one)
+async fn led(dir: &str, term: u64, req: &mut Option<Request>, node: &Arc<NodeState>) -> Result<Value> {
+    let lake = Lake::open(dir, true, false, node.clone()).await?; // (the catalog's writer: fences any older one)
     if let Err(e) = crate::replica::recover(&lake, "", term, None).await {
         let _ = lake.cat.close().await; // (refused, it leads nothing: no writer of ours stays for the next leader to fence)
         return Err(e);
@@ -2810,7 +2811,7 @@ mod tests {
             b.column_by_name(column).and_then(|c| c.as_any().downcast_ref::<StringArray>().map(|s| s.value(0).to_string())).expect("a text value")
         }
         let dir = std::env::temp_dir().join(format!("pondra-shaped-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let meta = { let mut entry = TableMeta::made(crate::store::Made { columns: vec![("id".into(), "Int64".into()), ("n".into(), "Int32".into()), ("j".into(), "Utf8".into()), ("d".into(), "Utf8".into())], not_null: vec!["id".into(), "n".into()], defaults: [("d".to_string(), "'x'".to_string())].into(), sql_types: [("j".to_string(), "jsonb".to_string())].into(), ..Default::default() }); entry.key = vec!["id".into()]; entry.checks = vec![("t_n_check".into(), "n >= 0".into())]; entry.ids = true; entry };
         let t = Arc::new(meta.to_rules()?);
         let one = of(&lake, &t, r#"VALUES (1, 5, '{"b":1,"a":2}')"#, How::Insert).await?;

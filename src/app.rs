@@ -401,7 +401,7 @@ impl App {
         }
         // (a one-off writer that leads for this, `pondra sql --dir … CHECKPOINT` on a lake no node serves, compacts the
         // catalog's level 0 first, so the round's flushes don't wait on it: nobody else runs its compactor)
-        let one_off = self.lake.life.one_off();
+        let one_off = self.lake.node.life.one_off();
         if one_off {
             self.lake.cat.tidy(8, Duration::from_secs(60), false).await?;
         }
@@ -490,7 +490,7 @@ impl App {
     /// filled from the rows already there, and a view kept by key works its groups out, before its CREATE answers. (Its
     /// CREATE waited ten minutes, and the view lacked those rows until a node led the lake.)
     pub(crate) async fn settle(&self, d: &crate::ddl::Ddl) -> anyhow::Result<()> {
-        if !(self.lake.life.one_off() && self.seq.is_some()) {
+        if !(self.lake.node.life.one_off() && self.seq.is_some()) {
             return crate::ddl::settle(&self.lake, d).await;
         }
         let tasks = async {

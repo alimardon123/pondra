@@ -75,8 +75,6 @@ files -> auth  4
 files -> ext  1
 files -> panics  1
 find -> measures  1
-flight -> drain  15
-flight -> idle  2
 flight -> server  1
 flight -> sso  3
 flight -> tls  6
@@ -102,8 +100,6 @@ inbox -> write  1
 joined -> ext  1
 joined -> store  1
 kafka -> dial  5
-kafka -> drain  4
-kafka -> idle  1
 kafka -> reset  1
 kafka -> sso  3
 kafka -> tls  5
@@ -123,9 +119,7 @@ kv -> panics  3
 kv -> wasm32  6
 lake_files -> ext_names  1
 lib -> wasm32  2
-live -> drain  2
 locks -> dial  2
-locks -> drain  3
 log -> adopt  1
 log -> backup  4
 log -> constraints  3
@@ -152,7 +146,7 @@ metrics -> budget  1
 metrics -> hot  1
 metrics -> jemalloc  1
 metrics -> spill  1
-metrics -> store  4
+metrics -> store  2
 node -> wasm32  1
 objects -> authored  2
 objects -> branch  2
@@ -188,13 +182,10 @@ oom -> wasm32  5
 optimize -> wasm32  1
 page -> wasm32  5
 page_records -> dial  4
-panics -> drain  1
 panics -> node  1
 panics -> wasm32  11
 path -> pg_json  1
 path -> sparksql  1
-pg -> drain  5
-pg -> idle  1
 pg -> sso  6
 pg -> tls  6
 pg_json_sets -> measures  1
@@ -232,7 +223,6 @@ rules -> pg_json  1
 rules -> pg_json_make  6
 runs -> apply  1
 runs -> crypto  2
-runs -> idle  2
 runs -> reset  1
 scan -> wasm32  2
 serve -> pg_casts  1
@@ -243,10 +233,8 @@ served -> store  4
 server -> apply  5
 server -> cluster  6
 server -> console  4
-server -> drain  7
 server -> iceberg  1
 server -> iceberg_rest  1
-server -> idle  4
 server -> kafka  1
 server -> mcp  2
 server -> memory  1
@@ -322,7 +310,6 @@ terms -> wasm32  1
 text -> pg_json_make  1
 tier -> delta  1
 tier -> dial  2
-tls -> drain  1
 tls -> panics  2
 types -> pg_casts  1
 udf -> wasm32  4

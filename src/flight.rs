@@ -49,9 +49,9 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     let service = FlightServiceServer::new(Door(Sql(app.clone()))).max_decoding_message_size(1 << 30).max_encoding_message_size(1 << 30);
     let doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Flight).await?; // (TLS too: `tls.rs`)
     // (it closes with the HTTP door, gracefully: the answers being written go out whole, and the node's stop waits for its
-    // connections to close, `drain::Serving`, as an answer's last messages may still be in one when its stream has ended)
-    let _serving = crate::drain::Serving::new();
-    tonic::transport::Server::builder().add_service(Gate { app, inner: service }).serve_with_incoming_shutdown(doors.stream(), crate::drain::closing()).await?;
+    // connections to close, `Drain::serving`, as an answer's last messages may still be in one when its stream has ended)
+    let (_serving, closing) = (app.lake.node.drain.serving(), app.lake.node.drain.closing());
+    tonic::transport::Server::builder().add_service(Gate { app, inner: service }).serve_with_incoming_shutdown(doors.stream(), closing).await?;
     Ok(())
 }
 
@@ -80,7 +80,7 @@ impl tower::Service<http::Request<tonic::body::Body>> for Gate {
     fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> { std::task::Poll::Ready(Ok(())) }
 
     fn call(&mut self, mut req: http::Request<tonic::body::Body>) -> Self::Future {
-        let (app, mut inner, used) = (self.app.clone(), self.inner.clone(), crate::idle::Use::new()); // (a call is a use of the node until its answer is sent: `idle.rs`)
+        let (app, mut inner, used) = (self.app.clone(), self.inner.clone(), self.app.lake.node.idle.begin()); // (a call is a use of the node until its answer is sent: `idle.rs`)
         Box::pin(async move {
             // (a header that isn't text can't be read, and is refused as HTTP refuses it: not taken for no credential)
             let (credential, sent) = (crate::auth::Credential::of_headers(req.headers()), req.headers().contains_key("authorization"));
@@ -97,7 +97,7 @@ impl tower::Service<http::Request<tonic::body::Body>> for Gate {
             }
             req.extensions_mut().insert(who);
             let answer = tower::Service::call(&mut inner, req).await;
-            Ok(answer?.map(|body| tonic::body::Body::new(crate::idle::kept(body, used))))
+            Ok(answer?.map(|body| tonic::body::Body::new(crate::node_state::kept(body, used))))
         })
     }
 }
@@ -395,7 +395,7 @@ fn rows_of(got: Answer<Encoded>) -> Result<Vec<RecordBatch>, Status> {
 async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<&[u8]>, descriptor: FlightDescriptor) -> Result<Response<FlightInfo>, Status> {
     let pool = app.lake.rt.memory_pool.clone();
     let (app, sql) = (app.clone(), sql.to_string());
-    let batches = worked(txn, async move {
+    let batches = worked(app.lake.node.clone(), txn, async move {
         let req = crate::routines::Request { sql, ..Default::default() };
         let how = How { job: None, spread: None, after: None, stale: None };
         rows_of(statement::run(&app, req, how, who, &FlightWire).await.map_err(status)?)
@@ -439,12 +439,12 @@ async fn answer(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown
 /// caller (`auth::carried`, which a spawned task would lose), and through `panics::work`, where the memory
 /// watch (`oom.rs`) may stop a query that grew the node, and a long one moves to the queries' runtime
 /// (invariant 231). A statement the node stopped for memory fails its transaction, as on HTTP and Postgres.
-async fn worked<T: Send + 'static>(txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>> + Send + 'static) -> Result<T, Status> {
+async fn worked<T: Send + 'static>(node: Arc<crate::node_state::NodeState>, txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>> + Send + 'static) -> Result<T, Status> {
     prune_kept(); // (every Flight call that runs work lets go of the kept answers that expired, not only a script's)
     let session = txn.map(in_txn).transpose()?;
     let failing = session.clone();
     let f = crate::auth::carried(in_session(session, f));
-    match crate::panics::work(true, f).await {
+    match crate::panics::work(&node, true, f).await {
         Ok(out) => out,
         Err(m) => {
             if m == crate::oom::OOM {
@@ -458,20 +458,21 @@ async fn worked<T: Send + 'static>(txn: Option<&[u8]>, f: impl std::future::Futu
 }
 
 /// What a statement's work hands its Flight stream: its whole answer, or the pieces its plan made (`query::Handed`), with the
-/// count its body holds until the last piece is read (`drain::Busy`).
+/// count its body holds until the last piece is read (`Drain::carried`).
 enum Sent {
-    Whole(Flown, crate::drain::Busy),
-    Pieces(crate::query::Handed, crate::drain::Busy),
+    Whole(Flown, crate::node_state::Busy),
+    Pieces(crate::query::Handed, crate::node_state::Busy),
 }
 
 /// A statement's answer as Flight data. Its work (`f`, which runs in `query::PIECES`, so a query may hand its answer to the
 /// stream in pieces as its plan makes them) is `worked` as every statement is, and the answer is then its whole form
 /// (`whole`, or `sent_as_kept` for the bytes the results cache keeps) or its pieces (`piece_stream`).
-async fn answered<F>(txn: Option<&[u8]>, f: F) -> Result<Out<FlightData>, Status>
+async fn answered<F>(node: Arc<crate::node_state::NodeState>, txn: Option<&[u8]>, f: F) -> Result<Out<FlightData>, Status>
 where
     F: std::future::Future<Output = Result<Flown, Status>> + Send + 'static,
 {
-    let sent = worked(txn, async move {
+    let held = node.clone(); // (the body's count, and the rest of the statement's, are this node's)
+    let sent = worked(node, txn, async move {
         let (hand, mut handed) = tokio::sync::oneshot::channel();
         // (`worked` gives this future its transaction's session and who asked, once for the statement. When its answer is handed
         // over, the rest runs aside: then those two go on it, and only then, as an HTTP request's do)
@@ -480,13 +481,13 @@ where
         tokio::select! {
             biased;
             done = &mut go => match handed.try_recv() {
-                Ok(h) => Ok(Sent::Pieces(h, crate::drain::Busy::carried())), // (handed as the statement ended: its rows still come in pieces)
-                Err(_) => done.map(|flown| Sent::Whole(flown, crate::drain::Busy::carried())), // (its messages are written as the client reads them, as the pieces' are)
+                Ok(h) => Ok(Sent::Pieces(h, held.drain.carried())), // (handed as the statement ended: its rows still come in pieces)
+                Err(_) => done.map(|flown| Sent::Whole(flown, held.drain.carried())), // (its messages are written as the client reads them, as the pieces' are)
             },
             Ok(h) = &mut handed => {
                 // (the rest of the statement runs on the queries' runtime while the client reads its pieces, as the request that asked)
-                crate::panics::aside(crate::panics::work(true, crate::auth::carried(in_session(session, go))));
-                Ok(Sent::Pieces(h, crate::drain::Busy::carried()))
+                crate::panics::aside(crate::panics::work(&held, true, crate::auth::carried(in_session(session, go))));
+                Ok(Sent::Pieces(h, held.drain.carried()))
             }
         }
     })
@@ -502,7 +503,7 @@ where
 /// Arrow encoder on `schema` (`answer::Encoding::with_schema`), each step's messages as the step is written. With no batches,
 /// the schema and the end. An encoding error ends the stream with its status. `busy` is held until the stream ends or is
 /// dropped, as `piece_stream`'s is.
-fn whole(schema: SchemaRef, batches: Vec<RecordBatch>, busy: crate::drain::Busy) -> Out<FlightData> {
+fn whole(schema: SchemaRef, batches: Vec<RecordBatch>, busy: crate::node_state::Busy) -> Out<FlightData> {
     // (at most one piece: the answer is encoded at once, its piece then its end, as the stream below writes them, and is
     // sent as those messages; an encoding error ends it after the messages before it, as the stream does)
     let mut pieces = crate::answer::pieces(batches.into_iter().map(|b| crate::answer::as_sent(b, Some("arrow"))));
@@ -539,7 +540,7 @@ fn whole(schema: SchemaRef, batches: Vec<RecordBatch>, busy: crate::drain::Busy)
 }
 
 /// Messages already made, as a Flight stream that holds `busy` until it ends or is dropped.
-fn held(out: Vec<Result<FlightData, Status>>, busy: crate::drain::Busy) -> Out<FlightData> {
+fn held(out: Vec<Result<FlightData, Status>>, busy: crate::node_state::Busy) -> Out<FlightData> {
     Box::pin(futures::stream::unfold((futures::stream::iter(out), busy), |(mut out, busy)| async move {
         match out.next().await {
             Some(item) => Some((item, (out, busy))),
@@ -549,14 +550,14 @@ fn held(out: Vec<Result<FlightData, Status>>, busy: crate::drain::Busy) -> Out<F
 }
 
 /// A kept answer's Arrow stream as Flight data: its messages as they are (`messages`), holding `busy` as `whole` does.
-fn sent_as_kept(bytes: Bytes, busy: crate::drain::Busy) -> Out<FlightData> {
+fn sent_as_kept(bytes: Bytes, busy: crate::node_state::Busy) -> Out<FlightData> {
     held(messages(bytes).map_or_else(|e| vec![Err(status(e))], |data| data.into_iter().map(Ok).collect()), busy)
 }
 
 /// A statement's answer in pieces, as its plan made them (`query::Handed`): the first piece's messages, then each piece as the
 /// door's body takes it. `busy` is held until the stream ends. A piece that fails, or a channel that closes before the answer's
 /// end, ends the stream with its status: a cut answer is never taken for a whole one.
-fn piece_stream(h: crate::query::Handed, busy: crate::drain::Busy) -> Out<FlightData> {
+fn piece_stream(h: crate::query::Handed, busy: crate::node_state::Busy) -> Out<FlightData> {
     let crate::query::Handed { first, rest, ended, stop } = h;
     let pieces = futures::stream::try_unfold((Some(first), rest, ended, busy), |(first, mut rest, ended, busy)| async move {
         let bytes = match first {
@@ -894,7 +895,7 @@ impl FlightSqlService for Sql {
         if crate::write::parse(&q.query).is_some() {
             // A write sent as a query (DB-API's `execute`): done now; the ticket reads back the count.
             let (app, sql) = (self.0.clone(), q.query.clone());
-            let rows = worked(txn, async move { write(&app, role, &sql).await }).await?;
+            let rows = worked(app.lake.node.clone(), txn, async move { write(&app, role, &sql).await }).await?;
             let ticket = TicketStatementQuery { statement_handle: format!("rows:{rows}").into_bytes().into() };
             return info(&crate::answer::arrow_schema(&rows_schema()), ticket.as_any().encode_to_vec(), req.into_inner());
         }
@@ -914,7 +915,7 @@ impl FlightSqlService for Sql {
         let app = self.0.clone();
         let who = crate::routines::Who { role, files: false, depth: 0 };
         // (boxed: a statement's future is large, and each layer of `answered`'s and `worked`'s would copy it by value)
-        Ok(Response::new(answered(txn, Box::pin(async move { answer(&app, &sql, who).await })).await?))
+        Ok(Response::new(answered(app.lake.node.clone(), txn, Box::pin(async move { answer(&app, &sql, who).await })).await?))
     }
 
     async fn do_action_begin_transaction(&self, _: ActionBeginTransactionRequest, req: Request<Action>) -> Result<ActionBeginTransactionResult, Status> {
@@ -935,7 +936,7 @@ impl FlightSqlService for Sql {
         let session = in_txn(&q.transaction_id)?;
         // (no statement text: COMMIT and ROLLBACK take none, only BEGIN's modes do)
         let app = self.0.clone();
-        let out = worked(Some(&q.transaction_id[..]), async move { crate::txn::protocol(&app, word).await.map_err(status) }).await;
+        let out = worked(app.lake.node.clone(), Some(&q.transaction_id[..]), async move { crate::txn::protocol(&app, word).await.map_err(status) }).await;
         crate::temp::end(&session); // (the session ends with its transaction, committed or not)
         let (tag, _) = out?;
         if word == "COMMIT" && tag == "ROLLBACK" {
@@ -948,7 +949,7 @@ impl FlightSqlService for Sql {
     async fn do_put_statement_update(&self, cmd: CommandStatementUpdate, req: Request<PeekableFlightDataStream>) -> Result<i64, Status> {
         let role = allowed(&self.0, &req, Role::Write)?;
         let (app, sql) = (self.0.clone(), cmd.query.clone());
-        worked(cmd.transaction_id.as_deref(), async move { write(&app, role, &sql).await }).await
+        worked(app.lake.node.clone(), cmd.transaction_id.as_deref(), async move { write(&app, role, &sql).await }).await
     }
 
     async fn do_put_statement_ingest(&self, cmd: CommandStatementIngest, req: Request<PeekableFlightDataStream>) -> Result<i64, Status> {
@@ -1176,7 +1177,7 @@ impl FlightService for Door {
                 (Some(sql), _) => {
                     let app = app.clone();
                     let who = crate::routines::Who { role, files: false, depth: 0 };
-                    Ok(Response::new(answered(None, Box::pin(async move { query(&app, &sql, who).await })).await?))
+                    Ok(Response::new(answered(app.lake.node.clone(), None, Box::pin(async move { query(&app, &sql, who).await })).await?))
                 }
                 (None, Some(table)) => {
                     let name = crate::auth::catalog_name(&table);
@@ -1277,12 +1278,12 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(plan), vec![cast(&strings, &dict)?, view])?;
         let names_and_types = |s: &Schema| s.fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect::<Vec<_>>();
 
-        let sent: Vec<FlightData> = whole(schema.clone(), vec![batch], crate::drain::Busy::new()).try_collect().await?;
+        let sent: Vec<FlightData> = whole(schema.clone(), vec![batch], crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
         let streamed = arrow_flight::utils::flight_data_to_batches(&sent)?;
         assert_eq!(names_and_types(streamed[0].schema().as_ref()), names_and_types(&schema));
         assert_eq!(streamed[0].column(0).data_type(), &DataType::Utf8, "a dictionary arrives as its values");
 
-        let empty: Vec<FlightData> = whole(schema.clone(), vec![], crate::drain::Busy::new()).try_collect().await?;
+        let empty: Vec<FlightData> = whole(schema.clone(), vec![], crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
         assert_eq!(empty.len(), 1, "the schema alone");
         assert_eq!(names_and_types(&Schema::try_from(&empty[0])?), names_and_types(&schema));
         Ok(())
@@ -1296,8 +1297,8 @@ mod tests {
         let view: ArrayRef = Arc::new(StringViewArray::from(vec!["x", "y"]));
         let batch = RecordBatch::try_new(Arc::new(plan), vec![cast(&strings, &dict)?, view])?;
         let kept = crate::answer::render(&[batch.clone()], Some("arrow"), &|_| None)?;
-        let a: Vec<FlightData> = sent_as_kept(kept, crate::drain::Busy::new()).try_collect().await?;
-        let b: Vec<FlightData> = whole(Arc::new(first_announced(&[batch.clone()])), vec![batch], crate::drain::Busy::new()).try_collect().await?;
+        let a: Vec<FlightData> = sent_as_kept(kept, crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
+        let b: Vec<FlightData> = whole(Arc::new(first_announced(&[batch.clone()])), vec![batch], crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
         assert_eq!(a.len(), b.len());
         for (x, y) in a.iter().zip(&b) {
             assert_eq!(x.data_header, y.data_header);
