@@ -303,10 +303,10 @@ async fn sql_as(app: App, p: SqlParams, role: crate::auth::Role, headers: http::
     let depth = headers.get("x-pondra-depth").filter(|_| lent).and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0);
     let who = Who { role, files: owner(&app.auth, &headers), depth };
     let how = How { job: p.job.as_deref(), spread: p.spread.as_deref(), after: p.after, stale: p.stale_ms.map(Duration::from_millis) };
-    Ok(match crate::statement::run(&app, req, how, who, &HttpWire(&p)).await? {
+    Ok(match crate::statement::run(&app, req, how, who, &HttpWire(&p, &app.lake)).await? {
         Answer::Kept(body) => Reply::Rendered(Rendered::Whole(body)),
         Answer::Own(r) => Reply::Rendered(r),
-        Answer::Rows(batches) => Reply::Rendered(answer(&batches, &p)?),
+        Answer::Rows(batches) => Reply::Rendered(answer(&batches, &p, &app.lake)?),
         Answer::Done(v) => Reply::Done(v),
         Answer::Sent => Reply::Rendered(Rendered::Sent),
     })
@@ -314,7 +314,7 @@ async fn sql_as(app: App, p: SqlParams, role: crate::auth::Role, headers: http::
 
 /// HTTP's encoding of an answer, for `statement::run`: JSON (or the format `?format=` names), with the console's typed
 /// first page of `?rows=` rows.
-struct HttpWire<'a>(&'a SqlParams);
+struct HttpWire<'a>(&'a SqlParams, &'a crate::store::Lake);
 
 impl Wire for HttpWire<'_> {
     type Own = Rendered;
@@ -327,7 +327,7 @@ impl Wire for HttpWire<'_> {
         })
     }
     fn encode(&self, rows: Vec<RecordBatch>) -> Result<(Option<Bytes>, Rendered)> {
-        let r = answer(&rows, self.0)?;
+        let r = answer(&rows, self.0, self.1)?;
         let keep = match &r {
             Rendered::Whole(b) => Some(b.clone()),
             Rendered::Pieces(_) | Rendered::Sent => None, // (a big answer: sent to its own caller only)
@@ -344,11 +344,12 @@ impl Wire for HttpWire<'_> {
 
 /// Rows as `p` asks: `render`'s, a typed answer's first page as many rows as `?rows=` says, or, from
 /// `PONDRA_STREAM_MB` of Arrow up, in pieces (`query::hand_out`).
-fn answer(batches: &[RecordBatch], p: &SqlParams) -> Result<Rendered> {
+fn answer(batches: &[RecordBatch], p: &SqlParams, lake: &crate::store::Lake) -> Result<Rendered> {
+    let keep = |b: &[RecordBatch]| crate::pages::keep(lake, b); // (a typed answer's rows, kept by its lake for their later pages)
     match (p.format.as_deref(), p.rows) {
-        (Some("typed"), Some(n)) => Ok(Rendered::Whole(crate::answer::typed(batches, n.clamp(1, crate::answer::MOST), crate::pages::keep)?.into())),
+        (Some("typed"), Some(n)) => Ok(Rendered::Whole(crate::answer::typed(batches, n.clamp(1, crate::answer::MOST), &keep)?.into())),
         (format, _) if crate::answer::streams(format) && big(batches) => Ok(Rendered::Pieces(crate::query::hand_out(batches.to_vec(), format, crate::query::take_held())?)),
-        (format, _) => Ok(Rendered::Whole(crate::answer::render(batches, format, crate::pages::keep)?)),
+        (format, _) => Ok(Rendered::Whole(crate::answer::render(batches, format, &keep)?)),
     }
 }
 

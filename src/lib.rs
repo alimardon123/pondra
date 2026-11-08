@@ -36,6 +36,9 @@ pub mod text;
 // The memory ledger: the one byte-bounded cache every bounded cache of the node uses (`ByteLru`).
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its caches are the lake's)
 mod ledger;
+// What an engine or an extension module keeps for one lake, by its type (invariant 301): `Lake::state`.
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (a lake holds them)
+mod lake_state;
 // A table's columns as one list, each with its id (the redesign's step 1b).
 pub mod column;
 // A value made once beside what it is made from (a table entry's rules and column list).
@@ -294,6 +297,8 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &apply::PROJECT,
         #[cfg(feature = "lake")]
         &udf::UDF,
+        #[cfg(feature = "lake")]
+        &pyfn::PYTHON,
     ];
     BUILT_IN
 }

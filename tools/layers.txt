@@ -15,6 +15,7 @@ ledger base
 memo base
 metrics base
 parsed base
+lake_state base
 passes base
 lists base
 registry base
