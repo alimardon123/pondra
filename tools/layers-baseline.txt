@@ -146,7 +146,7 @@ metrics -> budget  1
 metrics -> hot  1
 metrics -> jemalloc  1
 metrics -> spill  1
-metrics -> store  4
+metrics -> store  2
 node -> wasm32  1
 objects -> auth  11
 objects -> authored  2
