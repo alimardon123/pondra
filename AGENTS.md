@@ -2752,7 +2752,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the store's `Connector` is made with). A REST catalog or its token server that such a secret names
    is reached with that policy too (`ext::reach_service`). A session holding one runs its queries on
    its node (`temp::holds_secrets` in `App::here_only`): a spread query's shares have no session and
-   would register stores without it. `harness.py reached`, `cargo test --lib net:: public::`.
+   would register stores without it. `harness.py reached`, `cargo test --lib net::`.
 
 406. **A scope covers a URL whole or followed by `/`, `?` or `#`** (`ext::within`, wherever a secret's
    scope is matched): `http://127.0.0.1:979` isn't port 9790, `s3://data` isn't `s3://data-other`.
