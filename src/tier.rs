@@ -750,7 +750,7 @@ impl Brief {
 }
 
 /// The `/metrics` lines of the tables' files (inline, sealed), rows, bytes and entry bytes (`metrics::render`): the lake's
-/// totals, or a line for each table (`per_table`).
+/// totals (`GET /metrics`), or a line for each table (`per_table`: `GET /metrics/tables`).
 pub fn metric_lines(tables: &Tables, per_table: bool) -> [Vec<(String, f64)>; 4] {
     const LINES: [(usize, &str, fn(&Brief) -> u64); 5] =
         [(0, "where=\"inline\"", |b| b.inline), (0, "where=\"sealed\"", |b| b.sealed), (1, "", |b| b.rows), (2, "", |b| b.bytes), (3, "", |b| b.entry)];
@@ -1381,8 +1381,8 @@ mod tests {
     /// A round reads every table once, then only the ones committed since (`refresh`, `Catalog::written`): a table made,
     /// one changed and one dropped are what it learns, and one it wasn't told of keeps its old brief until a sweep. A
     /// round that failed part way reads every table next (`missed`), as one does once a sweep is due.
-    /// `/metrics` says the lake's totals of its tables' files, rows and sizes by default, and a line for each table with
-    /// PONDRA_METRICS_TABLES, in the same names.
+    /// `GET /metrics` says the lake's totals of its tables' files, rows and sizes, and `GET /metrics/tables` a line for
+    /// each table, in the same names.
     #[test]
     fn the_tables_lines_are_the_lakes_totals_or_one_for_each_table() {
         let brief = |n: u64| Brief { inline: n, sealed: 10 * n, rows: 100 * n, bytes: 1000 * n, entry: 7 * n, ..Default::default() };

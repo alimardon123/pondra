@@ -283,6 +283,7 @@
   "GET /live",
   "GET /lookup/{name}/{key}",
   "GET /metrics",
+  "GET /metrics/tables",
   "GET /objects",
   "GET /python",
   "GET /ready",

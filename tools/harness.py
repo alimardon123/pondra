@@ -4319,7 +4319,7 @@ def scale():
     iso = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     lake = new_lake()
     port = A.port
-    node = Node(lake, port, tier_secs=0.5, env={"PONDRA_METRICS_TABLES": "on"}).start()  # (`ev`'s files below: a line for each table)
+    node = Node(lake, port, tier_secs=0.5).start()
     q = lambda s, p=port: sql(p, s)
     refused = [_raises(lambda s=s: q(s)) for s in (
         "CREATE TABLE bad1 (id BIGINT, ts TIMESTAMP) WITH (partition_by = 'week(ts)')",
@@ -4349,13 +4349,13 @@ def scale():
         expect(base + r * 3600)
     n_rows, total = sum(days.values()), 200 * 100 * 1.0 + 60 * 50 * 2.0 + 100
     for _ in range(40):  # tiering, merges and sealing settle
-        m = metrics_of(port)
+        m = {**metrics_of(port), **metrics_of(port, path="/metrics/tables")}  # (`ev`'s files: a line for each table)
         if m.get("pondra_untiered_rows", 1) == 0 and m['pondra_table_files{table="ev",where="inline"}'] <= 128:
             break
         time.sleep(0.5)
     call(port, "POST", "/tier")
     time.sleep(2)
-    m = metrics_of(port)
+    m = metrics_of(port, path="/metrics/tables")
     inline, sealed = m['pondra_table_files{table="ev",where="inline"}'], m['pondra_table_files{table="ev",where="sealed"}']
     per_day = {r["d"]: r["n"] for r in q("SELECT CAST(date_trunc('day', ts) AS VARCHAR) AS d, count(*) AS n FROM ev GROUP BY 1")}
     per_day = {d.replace(" ", "T")[:19]: n for d, n in per_day.items()}
@@ -5205,9 +5205,9 @@ def shuffle_checks(port):
     return out
 
 
-def metrics_of(port, headers=None):
+def metrics_of(port, headers=None, path="/metrics"):
     out = {}
-    for line in call(port, "GET", "/metrics", headers=headers).decode().splitlines():
+    for line in call(port, "GET", path, headers=headers).decode().splitlines():
         if line and not line.startswith("#"):
             name, v = line.rsplit(" ", 1)
             out[name] = float(v)
@@ -8520,7 +8520,7 @@ def hot():
     settle, with a query memory too small for a quarter of it to hold the table (`hot::Hot::new`)."""
     import re
     lake = new_lake()
-    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1", "PONDRA_METRICS_TABLES": "on"}).start()  # (`m`'s files below)
+    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1"}).start()
     q = lambda s: sql(A.port, s)
     skipped = lambda: float(g.group(1)) if (g := re.search(rb"\npondra_hot_batches_skipped_total (\S+)", call(A.port, "GET", "/metrics"))) else 0.0
     t0, n = 1767225600, 200000
@@ -8602,7 +8602,7 @@ def hot():
                 with_m = hot_settled(A.port)
             q(f"INSERT INTO m SELECT value + {f * 50000} AS a, 'm' || value AS s FROM range(0, 50000)")
         deadline = time.time() + 60
-        while metrics_of(A.port)['pondra_table_files{table="m",where="inline"}'] != 1 and time.time() < deadline:
+        while metrics_of(A.port, path="/metrics/tables")['pondra_table_files{table="m",where="inline"}'] != 1 and time.time() < deadline:
             time.sleep(0.5)  # (the merge has committed: one file, and nothing is read in between)
         after = hot_settled(A.port)
         seen["merged files' columns"] = {"before": held, "with them": with_m, "after the merge": after}

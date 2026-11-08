@@ -240,7 +240,6 @@ pub const CORE: &[Setting] = &[
         PONDRA_CACHE_MB, PONDRA_PAGES_MB, PONDRA_FILES_CACHE_MB, PONDRA_FUNCTION_CACHE_MB). A query that needs more takes it from the caches, then sorts, joins and aggregations spill."),
     node("PONDRA_MEMORY_LAKE_GB", Gb, No),
     node("PONDRA_MEMORY_MAX_GB", Gb, No),
-    node("PONDRA_METRICS_TABLES", Bool, No), // (`metrics::render`: a line for each table, not the lake's totals)
     node("PONDRA_PAGES_MB", Mb, Is("256")),
     node("PONDRA_PIN_LEASE_SECS", Secs, Is("1209600")),
     node("PONDRA_PIN_RENEW_SECS", Secs, Is("3600")),
