@@ -3171,7 +3171,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 477. **A subplan that appears more than once alike runs once** (`reuse.rs`). A query that names a CTE more than once
    is planned with a copy at each use, and each copy read and grouped its tables again. `Reuse` finds the subplans
    whose text is the same at two uses or more, once the filters are pushed down (uses the filters reach differently
-   aren't alike), and wraps each that groups, joins or windows and gives a small part of what it reads (an eighth at
+   aren't alike), with what each scan reads where its text doesn't say (`source`: rows in memory, a transaction's
+   writes or a VALUES list, show only their batch counts, so two such tables are told apart by their arrays, and a
+   scan Pondra doesn't know is alike only to itself), and wraps each that groups, joins or windows and gives a small part of what it reads (an eighth at
    most, or a grouping at its top) in a `ReuseExec`: the first use to run a partition runs the one copy and holds its
    rows, counted in the query memory, and every use reads them; past the memory nothing is held and each use runs its
    own. A held copy takes no dynamic filter from above, so a use on a hash join's probe side whose grouping the join's

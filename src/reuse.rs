@@ -21,10 +21,14 @@ use datafusion::common::{DataFusionError, Result, Statistics};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::buffer::BufferExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::empty::EmptyExec;
+use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion::physical_plan::execution_plan::{replace_children_if_necessary, CardinalityEffect};
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::HashJoinExec;
@@ -111,10 +115,35 @@ impl PhysicalOptimizerRule for Reuse {
     }
 }
 
-/// A subplan as text, every detail of each of its nodes: two subplans of one text read the same tables the same way
-/// and give the same rows.
+/// A subplan as text, every detail of each of its nodes, with what each of its scans reads where the text doesn't say
+/// (`source`): two subplans of one key read the same rows the same way and give the same rows.
 fn key(p: &Arc<dyn ExecutionPlan>) -> String {
-    displayable(p.as_ref()).indent(true).to_string()
+    let mut text = displayable(p.as_ref()).indent(true).to_string();
+    for leaf in leaves(p) {
+        text.push_str(&source(&leaf));
+    }
+    text
+}
+
+/// What a scan reads, where its text doesn't say: its columns, and where rows held in memory are. A scan of files names
+/// them, with its columns and filters. Rows in memory (a table made in memory, a transaction's own writes, a VALUES
+/// list) show only how many batches they are, so two such tables of one shape would read alike: their batches' arrays
+/// tell them apart. A scan of one empty row or of none gives the same rows wherever it is; any other is alike only to itself.
+fn source(leaf: &Arc<dyn ExecutionPlan>) -> String {
+    let columns: Vec<String> = leaf.schema().fields().iter().map(|f| format!("{}: {}", f.name(), f.data_type())).collect();
+    let at = match leaf.downcast_ref::<DataSourceExec>().map(|s| s.data_source()) {
+        Some(s) if s.downcast_ref::<FileScanConfig>().is_some() => String::new(),
+        Some(s) => match s.downcast_ref::<MemorySourceConfig>() {
+            Some(m) => {
+                let arrays = m.partitions().iter().flatten().map(|b| (b.num_rows(), b.columns().iter().map(|c| Arc::as_ptr(c) as *const () as usize).collect()));
+                format!("{:?}", arrays.collect::<Vec<(usize, Vec<usize>)>>())
+            }
+            None => format!("{:p}", Arc::as_ptr(leaf) as *const ()),
+        },
+        None if leaf.is::<PlaceholderRowExec>() || leaf.is::<EmptyExec>() => String::new(),
+        None => format!("{:p}", Arc::as_ptr(leaf) as *const ()),
+    };
+    format!("\n[{}] {at}", columns.join(", "))
 }
 
 /// Is `p` worth holding: it groups, joins or windows, reads nothing that changes from one run of it to the next, and
@@ -426,6 +455,28 @@ mod tests {
         let plain = session(Arc::new(RuntimeEnv::default()), false).await?;
         plain.sql("CREATE TABLE few AS SELECT v AS item, v % 3 AS kind FROM generate_series(1, 30) AS t(v)").await?.collect().await?;
         assert_eq!(got, answer(&plain, sql).await?.0);
+        Ok(())
+    }
+
+    /// Two tables in memory of one shape plan alike, their scans showing only how many batches they hold, and are two
+    /// tables: each is grouped on its own (`source`). (A transaction's writes are such a table, and a VALUES list.)
+    #[tokio::test]
+    async fn tables_in_memory_alike_are_two() -> Result<()> {
+        let sql = "SELECT 'a' AS t, item, count(*) AS n FROM a GROUP BY item UNION ALL SELECT 'b', item, count(*) FROM b GROUP BY item ORDER BY 1, 2";
+        let mut answers = vec![];
+        for reuse in [true, false] {
+            let ctx = session(Arc::new(RuntimeEnv::default()), reuse).await?;
+            ctx.sql("CREATE TABLE a AS SELECT v % 3 AS item FROM generate_series(1, 300) AS t(v)").await?.collect().await?;
+            ctx.sql("CREATE TABLE b AS SELECT v % 5 AS item FROM generate_series(1, 300) AS t(v)").await?.collect().await?;
+            let (got, plan) = answer(&ctx, sql).await?;
+            assert!(!plan.contains("ReuseExec"), "{plan}");
+            answers.push(got);
+            // (the control: one table named twice is held)
+            let (_, plan) = answer(&ctx, &sql.replace("FROM b", "FROM a")).await?;
+            assert_eq!(plan.contains("ReuseExec: uses=2"), reuse, "{plan}");
+        }
+        assert_eq!(answers[0], answers[1]);
+        assert_eq!(answers[0].lines().filter(|l| l.starts_with("| b ")).count(), 5, "b's five items: {}", answers[0]);
         Ok(())
     }
 
