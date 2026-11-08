@@ -130,6 +130,16 @@ mod tests {
         ] {
             assert_eq!(crate::parsed::read(sql), generic(wrote), "{sql}");
         }
+        // (DuckDB's LAMBDA, read as the old text pass's arrow: an AND after the body is the lambda's at planning, `lambda`)
+        for (sql, wrote) in [
+            ("SELECT list_transform(l, LAMBDA x: x + 1) FROM t", "SELECT list_transform(l, x -> x + 1) FROM t"),
+            ("SELECT list_reduce(l, LAMBDA a, b: a + b) FROM t", "SELECT list_reduce(l, (a, b) -> a + b) FROM t"),
+            ("SELECT list_transform(l, LAMBDA x: x * 3), lambda FROM t", "SELECT list_transform(l, x -> x * 3), lambda FROM t"),
+            ("SELECT list_filter(l, LAMBDA x: x > 1 AND x < 5) FROM t", "SELECT list_filter(l, x -> x > 1 AND x < 5) FROM t"),
+            ("SELECT list_transform(l, LAMBDA x: [y FOR y IN x]) FROM t", "SELECT list_transform(l, x -> array_transform((x), y -> (y))) FROM t"),
+        ] {
+            assert_eq!(crate::parsed::read(sql), generic(wrote), "{sql}");
+        }
         // (an array is an array: the hook leaves it to the dialect)
         assert_eq!(parse("SELECT [1, 2] AS a, [x, y][1] AS b").0, generic("SELECT [1, 2] AS a, [x, y][1] AS b"));
     }
