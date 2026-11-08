@@ -13,7 +13,6 @@ auth -> origins  1
 auth -> wasm32  2
 branch -> crypto  2
 branch -> extension  1
-branch -> memory  1
 budget -> log  2
 cache -> bridge  10
 cache -> panics  1
@@ -138,7 +137,6 @@ memory_lake -> wasm32  10
 metrics -> ai  3
 metrics -> app  1
 metrics -> budget  1
-metrics -> hot  1
 metrics -> jemalloc  1
 metrics -> spill  1
 metrics -> store  1
@@ -229,7 +227,6 @@ server -> iceberg  1
 server -> iceberg_rest  1
 server -> kafka  1
 server -> mcp  2
-server -> memory  1
 server -> origins  2
 server -> python  10
 server -> served  2
