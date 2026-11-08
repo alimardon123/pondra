@@ -253,19 +253,19 @@ pub fn aside<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> 
 
 /// Start a loop that must keep its pace whatever the queries do (the memory watch) on a thread of its own: on the
 /// node's runtime, a query's partitions busy on every core held its timer back past the moment it had to look (the
-/// hot memory-line check passed its line now and then). Ended with the node, as [`task`]'s are.
+/// hot memory-line check passed its line now and then). It is the process's, not a node's (`oom::Watch`): no node's
+/// stop ends it, as [`task`]'s are ended.
 pub fn alone<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
     #[cfg(not(target_arch = "wasm32"))]
-    let task = {
+    {
         static R: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
         let watch = R.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).thread_name("pondra-watch").enable_all().build().expect("a runtime")
         });
         watch.spawn(f)
-    };
+    }
     #[cfg(target_arch = "wasm32")]
-    let task = tokio::task::spawn(f); // (a page has one loop, and the watch runs on it)
-    tracked(task)
+    tokio::task::spawn(f) // (a page has one loop, and the watch runs on it)
 }
 
 /// How long a request runs before the ones after it go to the queries' runtime: under load a

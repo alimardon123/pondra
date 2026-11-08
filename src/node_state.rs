@@ -22,6 +22,9 @@ pub struct NodeState {
     pub drain: Drain,
     /// What counts as a use of it, for `--idle-exit` (`idle.rs`).
     pub idle: Idle,
+    /// Its budget of the process's memory (`ledger::Ledger` on the process's `ledger::Root`): the line its lakes' queries
+    /// and caches share, made as its first lake opens (`store::lake_pool`).
+    pub(crate) line: std::sync::OnceLock<Arc<crate::ledger::Ledger>>,
     /// When its start began: what `PONDRA_TRACE_START`'s times count from (`trace`).
     began: datafusion::common::instant::Instant,
 }
@@ -32,7 +35,7 @@ impl NodeState {
 
     /// A node's state on a machine of its own (the sim's member: one with little memory, say).
     pub fn on(life: Life, machine: crate::machine::Mach) -> Arc<NodeState> {
-        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), drain: Drain::default(), idle: Idle::default(), began: datafusion::common::instant::Instant::now() })
+        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).

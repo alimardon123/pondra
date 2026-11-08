@@ -1865,55 +1865,54 @@ impl std::fmt::Debug for Lake {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "Lake({})", self.url) }
 }
 
-/// How much memory queries may use on this node: `PONDRA_MEMORY_GB`, else the whole line they share with the caches
-/// (`whole_line`: the memory watch's trim line, 72% of RAM on a machine of 3 GB or more), as DuckDB's `memory_limit` is 80%
+/// How much memory queries may use on this node: `PONDRA_MEMORY_GB`, else the process's line (`root_line`), the whole line
+/// they share with the caches (the memory watch's trim line, 72% of RAM on a machine of 3 GB or more), as DuckDB's `memory_limit` is 80%
 /// of RAM by default. Past it, sorts, aggregations and joins spill to temporary files, or the query stops with an error: a
 /// query never takes the node down. A grow past what the caches leave takes their bytes back first: the caches give way
 /// to the queries. What the reservations don't count (the Parquet decoding and the batches in flight around the big hash
 /// tables and sort buffers, `array_agg`) runs in the room between the trim line and the stop line, with the watch and its
 /// once-more-holding-less retry behind it. (A third of RAM, before, left room the caches took anyway, and spilled TPC-DS
 /// q67's last aggregation 8 times at SF10 on 15 GB: 12.6 s, against 5.7 s at 10 GB and DataFusion's 6.3 s.)
-#[cfg(not(target_arch = "wasm32"))]
 pub fn memory_limit() -> usize {
-    crate::env::query_memory(|| Some(whole_line()).filter(|&w| w < usize::MAX).unwrap_or(4 << 30))
+    crate::env::query_memory(root_line)
 }
 
-crate::per_node!(
-    /// The node's line for query memory (`ledger::Ledger`), by its queries' line, its whole line and whether that is the
-    /// user's (`PONDRA_MEMORY_GB`): every lake the node opens shares it. (By size, so a lake opened after the setting
-    /// changed, or a test's with memory of its own, gets a line of its own.)
-    static LEDGERS: Mutex<HashMap<(usize, usize, bool), Weak<crate::ledger::Ledger>>> = Default::default());
+/// The process's line for every node's queries together (`ledger::Root`): its whole line (`root_whole`) where there is one,
+/// else 4 GiB; on a page, two thirds of its device's line (`env::page_line_share`). A node's own `PONDRA_MEMORY_GB` is its
+/// budget on it (`memory_limit`), never the process's.
+fn root_line() -> usize {
+    #[cfg(target_arch = "wasm32")]
+    return crate::env::page_line_share(crate::machine::process().line());
+    #[cfg(not(target_arch = "wasm32"))]
+    Some(root_whole()).filter(|&w| w < usize::MAX).unwrap_or(4 << 30)
+}
 
-/// The node's lines now (`LEDGERS`): the memory watch takes memory back from the caches charged to them (`oom.rs`).
+/// The process's whole line, for every node's queries and caches together (`ledger::Root`): the memory watch's trim line
+/// (`oom::trim_line`, of the machine's memory or `PONDRA_MEMORY_MAX_GB`), or none (`usize::MAX`) where it isn't known.
+fn root_whole() -> usize {
+    crate::oom::trim_line().unwrap_or(usize::MAX)
+}
+
+/// Every node's budget in the process now (`ledger::budgets`): the memory watch takes memory back from the caches charged
+/// to them (`oom.rs`).
 pub(crate) fn ledgers() -> Vec<Arc<crate::ledger::Ledger>> {
-    LEDGERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().filter_map(Weak::upgrade).collect()
+    crate::ledger::budgets()
 }
 
-/// A new lake's pool for its queries: its share of the node's line (`memory_limit`), which every lake of the node shares.
-fn lake_pool() -> Arc<crate::ledger::LakePool> {
-    let key = (memory_limit(), whole_line(), crate::env::memory_whole().is_some());
-    let mut lines = LEDGERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    lines.retain(|_, l| l.strong_count() > 0);
-    let ledger = lines.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
-        let made = crate::ledger::Ledger::new(key.0, key.1, key.2);
-        lines.insert(key, Arc::downgrade(&made));
-        made
+/// A new lake's pool for its queries: its share of its node's budget (`NodeState::line`), which every lake of the node
+/// shares, made with the node's first lake on the process's root (`ledger::root`). The budget is the node's
+/// `PONDRA_MEMORY_GB` where it is set, its queries and caches together, and a spiller it has no room for spills (`hard`);
+/// else the root's lines, past whose whole line a grow takes cache bytes back and goes on within its share.
+fn lake_pool(node: &NodeState) -> Arc<crate::ledger::LakePool> {
+    let budget = node.line.get_or_init(|| {
+        let root = crate::ledger::root(root_line(), root_whole());
+        match crate::env::memory_whole() {
+            Some(set) => crate::ledger::Ledger::on(&root, set, set, true),
+            None => crate::ledger::Ledger::on(&root, root.line(), root.whole(), false),
+        }
     });
-    ledger.pool()
+    budget.pool()
 }
-
-/// The whole line a node's queries and caches share (`ledger::Ledger`), which is the queries' line too (`memory_limit`):
-/// `PONDRA_MEMORY_GB` when it is set, and a spiller it has no room for spills; else the memory watch's trim line
-/// (`oom::trim_line`), past which a grow takes cache bytes back and goes on within its share; none (`usize::MAX`) where
-/// neither is known.
-fn whole_line() -> usize {
-    crate::env::memory_whole().or_else(crate::oom::trim_line).unwrap_or(usize::MAX)
-}
-
-/// A page's lake holds what the page's own pool does (`env::page_query_memory`, of its device's line): its memory is its
-/// line (`Machine::line`), not a machine's (`ram` is None there, and 4 GiB is past a 32-bit `usize`).
-#[cfg(target_arch = "wasm32")]
-pub fn memory_limit() -> usize { crate::env::page_query_memory(crate::machine::process().line()) }
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
 
@@ -2314,7 +2313,7 @@ impl Lake {
         let (url, store, bucket) = open_store(url)?;
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
         let local = bucket.is_none() || memory;
-        let pool = lake_pool();
+        let pool = lake_pool(&node);
         let ledger = pool.ledger().clone();
         // (spills go to `spill_disk`; no listing kept past its statement: DataFusion's own cache of
         // them would hide a file added to a folder outside the lake, ADR-026)
@@ -4691,24 +4690,29 @@ mod tests {
         Ok(())
     }
 
-    /// Two lakes a node opens share its one line for query memory (`ledger::Ledger`): each lake's pool is its share of
-    /// it, and each lake's `memory` reads the line and what every lake holds on it.
+    /// Two lakes a node opens share its one budget for query memory (`ledger::Ledger`): each lake's pool is its share of
+    /// it, and each lake's `memory` reads the line and what every lake holds on it. Another node's lake has a budget of its
+    /// own, on the same process's root (`ledger::Root`), which counts both.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_lakes_of_a_node_share_its_one_line_for_queries() -> Result<()> {
         use datafusion::execution::memory_pool::MemoryConsumer;
-        let dirs = [0, 1].map(|_| std::env::temp_dir().join(format!("pondra-ledger-{}", uuid::Uuid::new_v4())));
-        let a = Lake::open(dirs[0].to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
-        let b = Lake::open(dirs[1].to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let dirs = [0, 1, 2].map(|_| std::env::temp_dir().join(format!("pondra-ledger-{}", uuid::Uuid::new_v4())));
+        let node = crate::node_state::NodeState::unhosted();
+        let a = Lake::open(dirs[0].to_str().unwrap(), true, false, node.clone()).await?;
+        let b = Lake::open(dirs[1].to_str().unwrap(), true, false, node.clone()).await?;
+        let other = Lake::open(dirs[2].to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let ledger = |l: &Lake| l.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
-        assert!(Arc::ptr_eq(&ledger(&a), &ledger(&b)), "one line for both");
+        assert!(Arc::ptr_eq(&ledger(&a), &ledger(&b)), "one budget for both");
+        assert!(Arc::ptr_eq(node.line.get().expect("made with the node's first lake"), &ledger(&a)), "the node's");
+        assert!(!Arc::ptr_eq(&ledger(&a), &ledger(&other)) && Arc::ptr_eq(ledger(&a).root(), ledger(&other).root()), "another node's: its own, on the one root");
         let held = MemoryConsumer::new("a test's").register(&a.rt.memory_pool);
         held.try_grow(1 << 20)?;
-        // (other tests' lakes may hold some of the same line meanwhile: what a holds is the least it reads)
-        assert_eq!(b.memory().1, memory_limit());
-        assert!(b.memory().0 >= 1 << 20, "a's reservation counts on the line b reads");
+        assert_eq!(b.memory(), (1 << 20, memory_limit()), "a's reservation counts on the budget b reads");
         assert_eq!(b.rt.memory_pool.reserved(), 0, "and not in b's own pool");
+        assert_eq!(other.memory().0, 0, "nor on the other node's budget");
+        assert!(ledger(&other).root().reserved() >= 1 << 20, "but on the root (other tests' lakes may hold some of it meanwhile)");
         drop(held);
-        for (lake, dir) in [a, b].into_iter().zip(&dirs) {
+        for (lake, dir) in [a, b, other].into_iter().zip(&dirs) {
             lake.cat.close().await?;
             let _ = std::fs::remove_dir_all(dir);
         }
