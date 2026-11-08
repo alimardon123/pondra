@@ -1755,18 +1755,25 @@ pub fn retrying(ctx: &SessionContext) -> bool {
 /// and `COPY … TO` a file or a Delta or Iceberg table (`copy::copy_to`). Not a Kafka topic (records sent are sent),
 /// and not the shares of a spread query or COPY: when one fails, the coordinator runs it again from its own node.
 pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(ctx: &SessionContext, work: impl Fn(SessionContext) -> F) -> Result<T> {
-    let mut one_part = false;
+    let (mut one_part, mut stopped) = (false, false);
     match crate::panics::first_try(work(ctx.clone()), |r| matches!(r, Err(e) if exhausted(e) && handed().is_none())).await {
         Ok(Err(e)) if exhausted(&e) && handed().is_none() => one_part = merging_a_sort(&e),
         Ok(r) => return r,
-        Err(crate::panics::Stopped::Again) if handed().is_none() => {} // (the watch stopped the first try, and its memory has gone)
+        Err(crate::panics::Stopped::Again) if handed().is_none() => stopped = true, // (the watch stopped the first try, and its memory has gone)
         Err(_) => {
             // (stopped on its first try and not run again: its memory stayed over the line, or half its answer was sent)
             crate::metrics::add(&crate::metrics::STOPPED_FOR_MEMORY, 1);
             anyhow::bail!(crate::oom::OOM)
         }
     }
-    let copy = SessionContext::new_with_state(ctx.state()); // (`state` copies the options: `frugal` changes only the copy's)
+    let mut state = ctx.state(); // (it copies the options: `frugal` changes only the copy's)
+    if stopped {
+        // (the pool never refused the first try, so the retry holds half its room: else it grows as far, and is stopped again)
+        let pool = crate::ledger::Halved::new(state.runtime_env().memory_pool.clone());
+        let rt = RuntimeEnvBuilder::from_runtime_env(state.runtime_env()).with_memory_pool(pool).build_arc()?;
+        state = datafusion::execution::SessionStateBuilder::new_from_existing(state).with_runtime_env(rt).build();
+    }
+    let copy = SessionContext::new_with_state(state);
     frugal(&copy);
     if one_part {
         copy.state_ref().write().config_mut().options_mut().execution.target_partitions = 1;
@@ -2084,7 +2091,7 @@ mod tests {
     /// not marked busy, B's share would be the whole line.
     #[test]
     fn a_statement_through_its_peak_pool_marks_its_lake_busy() {
-        let ledger = crate::ledger::Ledger::new(100, usize::MAX, false);
+        let ledger = crate::ledger::Ledger::new(100, usize::MAX);
         let (a, b): (Arc<dyn MemoryPool>, Arc<dyn MemoryPool>) = (ledger.pool(), ledger.pool());
         let ctx = SessionContext::new_with_config_rt(datafusion::prelude::SessionConfig::new(), RuntimeEnvBuilder::new().with_memory_pool(a).build_arc().unwrap());
         let peak = peak_pool(&ctx);
