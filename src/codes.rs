@@ -13,8 +13,42 @@ pub fn of(e: &anyhow::Error) -> &'static str {
     if let Some(c) = e.chain().find_map(|c| c.downcast_ref::<Coded>()) {
         return c.0;
     }
+    if let Some(code) = machine(e) {
+        return code;
+    }
     // (without the lines a Python routine's error quotes, for every caller: they are its code, not what went wrong, so they never pick the code)
     by_words(&unquoted(&words(e)))
+}
+
+/// The code of `e`, which no typed error coded, when it is the machine's or the bucket's own (the OS's, object_store's):
+/// io_error (58030), or disk_full (53100), which a client retries. Its words are never read for one: the OS's
+/// "Permission denied" or "Read-only file system" would read as a refusal (42501, 25006), which a client doesn't send
+/// again, where the write passes once the disk or the bucket is back (11-08 audit L10; only Kafka told them apart, 11-06
+/// audit L5). None for a file or an object that isn't there, known by its words still: asked for again, it isn't there;
+/// and for an `io::Error` a library made with words of its own and no OS error (DataFusion's spill past its limit, 53100).
+fn machine(e: &anyhow::Error) -> Option<&'static str> {
+    use std::io::ErrorKind as K;
+    for c in e.chain() {
+        if let Some(io) = c.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                K::NotFound => None,
+                K::StorageFull => Some("53100"),
+                K::PermissionDenied | K::ReadOnlyFilesystem => Some("58030"),
+                _ if io.raw_os_error().is_some() => Some("58030"),
+                _ => None,
+            };
+        }
+        #[cfg(feature = "lake")] // (the bucket's: SlateDB's and Pondra's own object_store, and DataFusion's, a UNIQUE check on the leader's, 11-07 audit L7)
+        {
+            if let Some(s) = c.downcast_ref::<object_store::Error>() {
+                return (!matches!(s, object_store::Error::NotFound { .. })).then_some("58030");
+            }
+            if let Some(s) = c.downcast_ref::<object_store_df::Error>() {
+                return (!matches!(s, object_store_df::Error::NotFound { .. })).then_some("58030");
+            }
+        }
+    }
+    None
 }
 
 /// An error in words: its causes after it, each said once, DataFusion's and Arrow's labels taken off, and the files it
@@ -395,6 +429,24 @@ mod tests {
         let quoted = Parser::parse_sql(&GenericDialect {}, "SELECT \"a\" FROM").unwrap_err();
         let e = anyhow::Error::from(datafusion::error::DataFusionError::SQL(Box::new(quoted), None));
         assert!(!super::words(&e).contains("\\") && super::words(&e).matches("syntax error").count() == 1, "{}", super::words(&e));
+    }
+
+    #[test]
+    fn the_machines_own_errors_are_retried_whatever_their_words_say() {
+        // (11-08 audit L10: the OS's words read as a refusal, 42501 or 25006, at Postgres, HTTP and Flight)
+        let os = |kind, words: &str| anyhow::Error::from(std::io::Error::new(kind, words.to_string())).context("writing t's file");
+        assert_eq!(super::of(&os(std::io::ErrorKind::PermissionDenied, "Permission denied (os error 13)")), "58030");
+        assert_eq!(super::of(&os(std::io::ErrorKind::ReadOnlyFilesystem, "Read-only file system (os error 30)")), "58030");
+        assert_eq!(super::of(&os(std::io::ErrorKind::StorageFull, "No space left on device (os error 28)")), "53100");
+        assert_eq!(super::of(&os(std::io::ErrorKind::NotFound, "no table nope")), "42P01", "a file that isn't there: by its words");
+        assert_eq!(super::of(&anyhow::Error::from(std::io::Error::from_raw_os_error(5))), "58030", "any other OS error");
+        let spilled = std::io::Error::other("The used disk space during the spilling process has exceeded the allowable limit of 0.0 B");
+        assert_eq!(super::of(&anyhow::Error::from(spilled)), "53100", "a library's own words in an io::Error, with no OS error: read");
+        let bucket = || object_store_df::Error::PermissionDenied { path: "t/1".into(), source: "Permission denied".into() };
+        assert_eq!(super::of(&anyhow::Error::from(datafusion::error::DataFusionError::ObjectStore(Box::new(bucket()))).context("a UNIQUE check")), "58030");
+        let coded = object_store::Error::Generic { store: "memory", source: Box::new(super::Coded("53100", "this process's spills may take 1 MB".into())) };
+        assert_eq!(super::of(&anyhow::Error::from(coded)), "53100", "a bucket's error that Pondra coded keeps its code");
+        assert_eq!(super::of(&anyhow::anyhow!("permission denied for table t")), "42501", "Pondra's own words still read");
     }
 
     #[test]
