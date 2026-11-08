@@ -1858,6 +1858,9 @@ pub struct Lake {
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
     pub groups: Arc<crate::serve::Groups>,     // decoded row groups for key lookups
     pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
+    pub(crate) manifests: Arc<crate::manifest::Kept>, // its tables' manifests and lists, decompressed (`manifest::object`)
+    pub(crate) format: crate::format::Held, // what this process holds of its format: made here, what `raise` saw (`format.rs`)
+    states: crate::lake_state::States, // what engine and extension modules keep for it, by type (`state`)
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
     cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
     pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
@@ -2461,15 +2464,14 @@ impl Lake {
         let (torn, cat) = tokio::join!(async { if check_torn { crate::memory::refuse_torn(&store, &url).await } else { Ok(()) } }, opening);
         torn?;
         let cat = cat?;
-        crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
+        let format = crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), life });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory)), manifests: crate::manifest::kept(), format, states: Default::default(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), life });
         for (name, cache) in lake.caches() {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
         ledger.charge("facts", Arc::downgrade(&crate::query::facts_kept())); // (the node's, charged once whatever lakes it opens)
-        ledger.charge("manifests", Arc::downgrade(&crate::manifest::kept())); // (the node's too: see `node::start_app` for the rest)
         ledger.charge("files", Arc::downgrade(&crate::cache::outside())); // (the process's, of files outside the lakes)
         crate::oom::wake();
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
@@ -2753,13 +2755,17 @@ impl Lake {
         Some(self.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>()?.ledger())
     }
 
+    /// What module `P` keeps for this lake (`lake_state.rs`): made the first time it is asked for, charged to the lake's
+    /// line when it is a cache, and stopped when the lake goes. Refused when no extension of this build registered `P`.
+    pub(crate) fn state<P: crate::lake_state::LakeState>(&self) -> Result<Arc<P>> { self.states.get(self.ledger()) }
+
     /// This lake's caches, each by the name `/metrics` gives it, in the order they give memory back when the node needs it
     /// (`ledger::Charged`; each is charged to the lake's line as it opens). The hot columns go first, decoded again from
     /// the files when they are read; then the row groups for lookups and the tables' tails, read again from the files and
     /// the log; then the bucket's byte ranges, fetched again. The log's decoded rows, the catalog's blocks and DataFusion's
     /// footers and statistics keep what they hold by rules of their own, and say what that is.
     pub fn caches(&self) -> Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> {
-        let mut caches: Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> = vec![("hot", self.hot.clone()), ("lookups", self.groups.clone()), ("tails", self.tails.clone())];
+        let mut caches: Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> = vec![("hot", self.hot.clone()), ("lookups", self.groups.clone()), ("tails", self.tails.clone()), ("manifests", self.manifests.clone())];
         if let Some(ranges) = &self.cached {
             caches.push(("ranges", ranges.clone())); // (a lake on a bucket: a local or in-memory one reads its store directly)
         }
@@ -3990,6 +3996,40 @@ impl Catalog {
         }
     }
 
+    /// The records at `keys` as of one commit, and that commit: a statement's tables and views, which it reads together
+    /// (`query::named_records`). With the whole catalog in memory, under one hold of its lock; otherwise each read and the
+    /// reads checked to be of one commit (`moved_since`), and read again if they aren't (three tries; then 40001, as a
+    /// statement whose reads raced a commit says it).
+    pub async fn get_many(&self, keys: &[String]) -> Result<(Vec<Option<Bytes>>, u64)> {
+        crate::metrics::add(&crate::metrics::CATALOG_READS, keys.len() as u64); // (each record looked up, there or not)
+        if self.mirror.load(Relaxed) {
+            let o = self.overlay.lock().unwrap(); // (`apply` changes it and `streamed` together under it)
+            return Ok((keys.iter().map(|k| o.get(k).and_then(|(_, v)| v.clone())).collect(), self.streamed.load(Relaxed)));
+        }
+        let wanted: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+        for _ in 0..3 {
+            let since = self.commit_now().await?;
+            let mut got = Vec::with_capacity(keys.len());
+            for k in keys {
+                got.push(self.get_raw_uncounted(k).await?);
+            }
+            let at = self.commit_now().await?;
+            if !self.moved_since("", "\u{10ffff}", since, at, |k| wanted.contains(k)) {
+                return Ok((got, at));
+            }
+        }
+        Err(crate::codes::coded("40001", "could not serialize access: the catalog changed while the statement read its tables three times: run it again"))
+    }
+
+    /// The commit this node's catalog reads are as of now: the leader's last committed one (its whole catalog in
+    /// memory: its last applied), a follower's last streamed one or its view's.
+    pub async fn commit_now(&self) -> Result<u64> {
+        match self.kv.is_writer() && !self.mirror.load(Relaxed) {
+            true => Ok(self.committed()),
+            false => self.at_now().await,
+        }
+    }
+
     /// The commit a read takes right now, when it lays nothing over our view: the mirror's last streamed commit, else the view's.
     async fn at_now(&self) -> Result<u64> {
         if self.mirror.load(Relaxed) {
@@ -4747,7 +4787,7 @@ mod tests {
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         let ledger = lake.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
         let names: Vec<&str> = lake.caches().iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, ["hot", "lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments"], "a local lake has no cache of a bucket's ranges");
+        assert_eq!(names, ["hot", "lookups", "tails", "manifests", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments"], "a local lake has no cache of a bucket's ranges");
         let _ = lake.tails.lock().unwrap().put("t".into(), vec![], 4096);
         // (other tests' lakes may be charged to the same line meanwhile: what this lake holds is the least it reads)
         assert!(ledger.held() >= 4096, "the line counts the tails");
@@ -4758,8 +4798,8 @@ mod tests {
         }
         assert!(freed >= 4096 && lake.tails.held() == 0, "the tails give their memory back");
         assert!(!lake.cached_bytes().iter().any(|(name, _)| *name == "hot"), "the hot columns are `hot_bytes`");
-        // (`/metrics` reads the line's list by name: the node's planning facts and manifests are on it beside the lake's caches;
-        // a node's start charges its kept pages and outside tables' logs and manifests, `node::start_app`)
+        // (`/metrics` reads the line's list by name: the node's planning facts are on it beside the lake's caches, its manifests
+        // among them; a node's start charges its kept pages and outside tables' logs and manifests, `node::start_app`)
         let metrics: Vec<&str> = lake.cached_bytes().iter().map(|(name, _)| *name).collect();
         assert!(["lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments", "facts", "manifests", "files"].iter().all(|n| metrics.contains(n)), "{metrics:?}");
         lake.cat.close().await?;
