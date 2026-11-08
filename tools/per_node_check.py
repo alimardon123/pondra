@@ -118,6 +118,7 @@ PROCESS = {
     "service.rs:CONFIG": "the Windows service's file, set by its entry point once a process",
     "scratch.rs:MADE": "the spill folders this process made and hasn't removed: a folder of a static (`store::SPILLS`) outlives a node until the program ends, when `scratch::leave` removes what is left; `sweep` skips them",
     "memory_lake.rs:MEMORY": "the lakes held in this process's memory: a node restarting in place finds its own; the library's close lets it go (`forget_memory`), and the program's end (`memory::leave`) empties the map",
+    "memory_lake.rs:COUNTED": "the counted opens of the lakes in this process's memory, which `held_in_memory` knows as their lake's store: weak both, as long as `MEMORY` holds the lake, and no node's (an open outlives no lake)",
     "memory_lake.rs:PROCESS": "the spill disk is the machine's: every lake in memory in this process counts its bytes on disk in one count (a lake that goes gives its bytes back in its drop)",
     "oom.rs:POINTERS": "a thread's own allocation counters (jemalloc's), found once a thread: they belong to the thread, not to a node",
     "oom.rs:TEST_ALLOCATOR": "the unit tests' allocator, jemalloc as the node's (main.rs), so the meter has counters to read",
