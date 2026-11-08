@@ -108,7 +108,7 @@ pub fn lake_name(lake: &Lake) -> String {
 
 /// `lake_name` of a lake at `url`. A lake in memory is `memory://<id>`, whose id would show in every name and error.
 fn name_of(url: &str) -> String {
-    if crate::memory::in_memory(url) {
+    if crate::memory_lake::in_memory(url) {
         return "memory".into();
     }
     url.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("lake").to_lowercase()
@@ -721,7 +721,7 @@ pub async fn attachable(lake: &Lake, name: &str, fresh: bool) -> Result<()> {
 /// Nothing there yet (no catalog): a new, empty lake is made there, as DuckDB's ATTACH makes a
 /// new database file.
 async fn lake_dir(dir: &str, life: &dyn crate::lifecycle::Lifecycle) -> Result<(String, bool)> {
-    let dir = &crate::memory::place(dir); // (`:memory:`: a new lake in memory, which only opening makes: `Lifecycle::lead_elsewhere`)
+    let dir = &crate::memory_lake::place(dir); // (`:memory:`: a new lake in memory, which only opening makes: `Lifecycle::lead_elsewhere`)
     if !dir.contains("://") {
         std::fs::create_dir_all(dir).with_context(|| format!("no folder {dir}"))?;
     }
@@ -774,7 +774,7 @@ pub async fn delete_lake(dir: &str) -> Result<()> {
 }
 
 pub async fn has_catalog(dir: &str) -> Result<bool> {
-    if (!dir.contains("://") && !std::path::Path::new(dir).exists()) || (crate::memory::in_memory(dir) && !crate::memory::memory_held(dir)) {
+    if (!dir.contains("://") && !std::path::Path::new(dir).exists()) || (crate::memory_lake::in_memory(dir) && !crate::memory_lake::memory_held(dir)) {
         return Ok(false); // (asking a lake in memory that nothing here opened would make an empty one)
     }
     let store = crate::store::open_store(dir)?.1;
@@ -887,7 +887,7 @@ crate::per_node!(
 /// it. A catalog in a folder, in memory or on a node is the machine's own, or the admin token's. A place no door knows is
 /// refused everywhere (`store::place`).
 pub(crate) fn openable(home: &str, dir: &str) -> Result<()> {
-    let place = crate::store::place(&crate::memory::place(dir))?;
+    let place = crate::store::place(&crate::memory_lake::place(dir))?;
     if matches!(crate::store::place(home), Ok(crate::store::Place::Bucket)) && matches!(place, crate::store::Place::Served | crate::store::Place::Folder) {
         let what = if place == crate::store::Place::Served { "a node's lake, opened with this node's admin token" } else { "a folder on this machine" };
         return Err(crate::codes::coded("42501", format!("{dir} is {what}, which only a node's owner names, and this database's catalog is in a bucket, which whoever may write the bucket can change: attach it with --attach on the nodes that should open it")));

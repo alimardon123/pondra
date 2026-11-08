@@ -2406,7 +2406,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    A node in a library prints nothing when all goes well: a slow statement too goes only to `pondra.history`
    (`history::ended`; `inprocess_check.py` p).
 308. **A lake held in memory keeps its catalog there and its bulk on disk past its budget, and none of it
-   outlives the lake** (`memory::Held`): past `PONDRA_MEMORY_LAKE_GB` its new `data/` and `log/` objects go
+   outlives the lake** (`memory_lake::Held`): past `PONDRA_MEMORY_LAKE_GB` its new `data/` and `log/` objects go
    to `pondra-memory-{uid}/{pid}-{hex}` (0700, a lock file held), under `PONDRA_CACHE_DIR`, else the
    temporary directory unless that is tmpfs, else the user's cache folder. An object is in one tier only:
    writing it to one takes the other's copy away. The folder goes when the lake is let go, and one whose
@@ -2903,12 +2903,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    sizes a GROUP BY by its column's distinct values (3 groups), and a join builds those".
 
 419. **A node spills to a disk with room, as much as it has room for, and says so by name past it** (`store::spill_disk`,
-   `memory::spill_base`, `memory::Folder`, `spill::dir`). A query's spills (DataFusion's) and a shuffle's go under
+   `scratch::spill_base`, `scratch::Folder`, `spill::dir`). A query's spills (DataFusion's) and a shuffle's go under
    `PONDRA_SPILL_DIR`, else `PONDRA_CACHE_DIR`, else the temporary folder unless it is held in memory (tmpfs: /tmp on
    Fedora and Arch, where a spill frees nothing), then the user's cache folder. A query's go in a folder of the
    process's own (`pondra-spill-{uid}/{pid}-…`, the user's folder 0700, its lock file held; a shuffle's in its
    `shuffle/`), and the folders of processes that ended are swept when the next process makes its own: a node killed
-   mid-spill left them for good. One helper makes every folder that is this user's alone (`memory::own_dir`: the
+   mid-spill left them for good. One helper makes every folder that is this user's alone (`scratch::own_dir`: the
    spill folders, and in the temporary folder the term locks of invariant 370 and Python's packages); a shuffle used
    to share one folder a machine, open to other users and swept by age while its job ran. A node may spill
    `PONDRA_SPILL_GB`, by default the disk's free space when the lake opens less what a lake keeps for itself

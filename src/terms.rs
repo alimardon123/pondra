@@ -72,7 +72,7 @@ pub async fn latest(store: &Store) -> Result<Option<Term>> {
 /// empty for a `pondra sql` INSERT recording its files: nothing to follow, just wait for it.)
 pub async fn claim(store: &Store, n: u64, addr: &str) -> Result<Option<Term>> {
     // (its id goes into the record: a process here can tell when we're gone; none reaches a lake in our memory)
-    let lock = if crate::memory::held_in_memory(store) { None } else { new_lock() };
+    let lock = if crate::memory_lake::held_in_memory(store) { None } else { new_lock() };
     let bell = answers_bell(addr, crate::env::value("PONDRA_REPLICAS"));
     let term = Term { n, addr: addr.into(), lock: lock.as_ref().map(|(id, ..)| id.clone()).unwrap_or_default(), bell };
     let lock = lock.map(|(_, path, f)| (path, f));
@@ -249,7 +249,7 @@ impl Ear {
     async fn before(store: &Store, t: &Term) -> Option<((String, u64, String), Path, (chrono::DateTime<chrono::Utc>, Option<String>))> {
         // (its own claim, or one made on this machine by this user: the lock file decides, `gone_here`. A lake in this
         // process's memory has no claimer elsewhere)
-        let here = HELD.lock().unwrap().contains_key(&t.n) || lock_path(t).is_some_and(|p| p.exists()) || crate::memory::held_in_memory(store);
+        let here = HELD.lock().unwrap().contains_key(&t.n) || lock_path(t).is_some_and(|p| p.exists()) || crate::memory_lake::held_in_memory(store);
         let key = rung_key(store, t);
         let lately = RUNG.lock().unwrap().get(&key).copied().flatten().is_some_and(|at| at.elapsed() < RUNG_AGAIN);
         if !t.bell || here || lately {
@@ -337,7 +337,7 @@ crate::per_node!(
 
 /// This user's folder of claim lock files, in the temp folder: per user on macOS and Windows, and
 /// named by the user's id on Linux, where `/tmp` is shared. Made 0700, and used only while it is
-/// ours alone, so no other user can take a lock away (and make a live leader look gone): `memory::own_dir`.
+/// ours alone, so no other user can take a lock away (and make a live leader look gone): `scratch::own_dir`.
 /// Its base is the temp folder, never the spill folder: every process on the machine must find the
 /// same one (invariant 370). None: the claims go on without locks, and the mark decides.
 /// A page (wasm32) has no temp folder (`temp_dir` panics there), so there are none.
@@ -345,7 +345,7 @@ pub(crate) fn lock_dir() -> Option<PathBuf> {
     if cfg!(target_arch = "wasm32") {
         return None;
     }
-    crate::memory::own_dir(&std::env::temp_dir(), "pondra-terms").ok()
+    crate::scratch::own_dir(&std::env::temp_dir(), "pondra-terms").ok()
 }
 
 /// Where term `t`'s lock file would be here: its id is trusted only as 32 hex characters (it comes
@@ -547,7 +547,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-prune-{}", uuid::Uuid::new_v4().simple()));
         let folder = crate::store::open_store(&dir.to_string_lossy()).unwrap().1;
         let url = format!("memory://prune-{}", uuid::Uuid::new_v4().simple());
-        let memory = crate::memory::store(&url);
+        let memory = crate::memory_lake::store(&url);
         for store in [folder.clone(), memory.clone()] {
             // (40 terms; each leader marked alive and never let go, a crash's marks too; three terms stepped down)
             for n in 1..=40u64 {
@@ -569,7 +569,7 @@ mod tests {
             assert_eq!(latest(&store).await.unwrap().map(|t| t.n), Some(41), "latest answers the newest");
             release(&store, 41).await;
         }
-        crate::memory::forget_memory(&url);
+        crate::memory_lake::forget_memory(&url);
         std::fs::remove_dir_all(&dir).ok();
     }
 

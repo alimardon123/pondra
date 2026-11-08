@@ -16,6 +16,8 @@ pub mod lifecycle;
 pub mod machine;
 // How a node's calls out reach the network: one client factory, with the policy named by whom a call goes to.
 #[cfg(feature = "lake")] pub mod net;
+// Space of this process's own on this machine's disk: the folders its spills go to.
+#[cfg(feature = "lake")] pub mod scratch;
 // The node as the code below the hosts sees it: its lifecycle, and what its stop waits for and refuses.
 pub mod node_state;
 // The one place a feature says what it adds (designs/redesign/redesign.md §6): `built_in` below lists the build's extensions.
@@ -196,6 +198,7 @@ mod rules;
 #[cfg(feature = "lake")] mod log;
 #[cfg(feature = "lake")] mod manifest;
 #[cfg(feature = "lake")] pub mod memory;
+#[cfg(feature = "lake")] pub mod memory_lake;
 #[cfg(feature = "lake")] pub mod members;
 #[cfg(feature = "lake")] pub mod node;
 #[cfg(feature = "lake")] mod objects;

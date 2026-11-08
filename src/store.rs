@@ -1527,11 +1527,11 @@ pub(crate) fn own_cache_budget() -> bool { crate::env::get("PONDRA_CACHE_MB").is
 
 /// The folder the node's SSD tiers and replica logs go under: `PONDRA_CACHE_DIR` when set (the operator's own
 /// choice), else `pondra-cache-{uid}` in the temp dir, made 0700 and used only while it is this user's alone
-/// (`memory::own_dir`: the temp dir is shared, so a folder with a predictable name may be another user's).
+/// (`scratch::own_dir`: the temp dir is shared, so a folder with a predictable name may be another user's).
 pub(crate) fn cache_base() -> std::io::Result<std::path::PathBuf> {
     match crate::env::get("PONDRA_CACHE_DIR") {
         Some(dir) => Ok(std::path::PathBuf::from(dir)),
-        None => crate::memory::own_dir(&std::env::temp_dir(), "pondra-cache"),
+        None => crate::scratch::own_dir(&std::env::temp_dir(), "pondra-cache"),
     }
 }
 
@@ -1565,18 +1565,18 @@ pub fn short_of_room(dir: &std::path::Path) -> Option<(u64, u64)> {
     crate::machine::process().space(dir).map(|(free, total)| (free, lake_keeps(total))).filter(|(free, keep)| free < keep)
 }
 
-/// The folder of this process's spills, DataFusion's and a shuffle's (`spill::dir`): a `memory::Folder` of
+/// The folder of this process's spills, DataFusion's and a shuffle's (`spill::dir`): a `scratch::Folder` of
 /// this process's own, made by the first spill that needs one. A static's end runs no destructor, so the
 /// folder goes when the program ends through `memory::leave` (which `cli.rs` calls before each exit); where
 /// that can't remove it (Windows, while its lock file is open), it stays for the next process's sweep. A
 /// folder that can't be made is remembered as the reason why.
-static SPILLS: std::sync::OnceLock<Result<crate::memory::Folder, String>> = std::sync::OnceLock::new();
+static SPILLS: std::sync::OnceLock<Result<crate::scratch::Folder, String>> = std::sync::OnceLock::new();
 
 /// The folder of this process's spills (`SPILLS`), made on first use. Its error when there is none: DataFusion's
 /// spills then go to the OS temp folder, and a shuffle fails with the reason.
 pub(crate) fn spill_folder() -> std::io::Result<&'static std::path::Path> {
     let folder = SPILLS.get_or_init(|| {
-        crate::memory::Folder::make("spill").map_err(|e| {
+        crate::scratch::Folder::make("spill").map_err(|e| {
             eprintln!("no spill folder of this process's ({e}): queries spill to the temporary folder, shuffles fail");
             e.to_string()
         })
@@ -1591,7 +1591,7 @@ pub(crate) fn spill_folder() -> std::io::Result<&'static std::path::Path> {
 pub(crate) fn spill_gb() -> Option<f64> { crate::env::parse::<f64>("PONDRA_SPILL_GB").filter(|gb| *gb >= 0.0) }
 
 /// The bytes that may spill under `dir`: `PONDRA_SPILL_GB` when set, else `dir`'s disk's free space less `lake_keeps`; None with no `dir`.
-/// The lakes in memory spill under the same setting and room, counted with these (`memory::spilled`, `others_held`).
+/// The lakes in memory spill under the same setting and room, counted with these (`memory_lake::spilled`, `others_held`).
 pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
     match spill_gb() {
         Some(gb) => Some(gb_bytes(gb)),
@@ -1603,7 +1603,7 @@ pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
 /// OS temp folder, which is held in memory on many Linux systems, where a spill frees nothing. The
 /// first spill makes the folder and DataFusion's own directory in it (`Spills`): a lake that never
 /// spills makes neither, so nothing is written when it opens. The folder is the user's own, under the
-/// disk with the room (`memory::spill_base`), and folders of processes that ended are swept from it.
+/// disk with the room (`scratch::spill_base`), and folders of processes that ended are swept from it.
 /// The cap is the free space when the first spill makes the disk, less the room a lake keeps, or the
 /// setting in GB; it is looked at again as queries start (`spill_room`). `0` turns spilling off: a
 /// query that needs it is refused (53200). A negative setting is no setting.
@@ -1761,8 +1761,8 @@ fn room_cap(gb: Option<f64>, used: u64, shuffled: u64, disk: Option<(u64, u64)>)
 /// (without it, the disk's free room already says what they hold). (Each was given the whole setting, so a window's sorts
 /// and a GROUP BY spilling beside them could take twice it: audit 11-01 M13.)
 fn set_room(gb: Option<f64>) {
-    let shuffled = gb.map_or(0, |_| crate::spill::held() + crate::memory::spilled());
-    let disk = crate::machine::process().space(&crate::memory::spill_base()); // (the disk the folder is, or would be on: not made here, the first spill makes it)
+    let shuffled = gb.map_or(0, |_| crate::spill::held() + crate::memory_lake::spilled());
+    let disk = crate::machine::process().space(&crate::scratch::spill_base()); // (the disk the folder is, or would be on: not made here, the first spill makes it)
     let managers = live_spillers();
     let all: u64 = managers.iter().map(|m| m.used_disk_space()).sum();
     for manager in managers {
@@ -1804,7 +1804,7 @@ pub(crate) fn piece_fits(gb: Option<f64>, held: u64, bytes: u64, disk: Option<(u
 }
 
 /// What this process spills, other than its lakes in memory: the shuffles' pieces (`spill::held`) and the queries' spill
-/// disks (`live_spillers`). The lakes' bytes come with `memory::spilled`, so one check sees all of it.
+/// disks (`live_spillers`). The lakes' bytes come with `memory_lake::spilled`, so one check sees all of it.
 pub(crate) fn others_held() -> u64 { crate::spill::held() + live_spillers().iter().map(|m| m.used_disk_space()).sum::<u64>() }
 
 /// Whether a shuffle's piece of `bytes` fits on the spill disk now: `Spill::write` asks before it writes one.
@@ -1812,7 +1812,7 @@ pub(crate) fn others_held() -> u64 { crate::spill::held() + live_spillers().iter
 pub(crate) fn spill_fits(bytes: u64) -> Result<()> {
     let Ok(folder) = spill_folder() else { return Ok(()) };
     let gb = spill_gb();
-    let held = gb.map_or(0, |_| others_held() + crate::memory::spilled());
+    let held = gb.map_or(0, |_| others_held() + crate::memory_lake::spilled());
     match piece_fits(gb, held, bytes, crate::machine::process().space(folder)) {
         true => Ok(()),
         false => Err(no_room(bytes, gb)),
@@ -2013,7 +2013,7 @@ pub fn reach_of(url: &str) -> Option<Reach> {
 pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
     if in_memory(url) {
         let url = url.trim_end_matches('/').to_string();
-        let held = crate::memory::store(&url);
+        let held = crate::memory_lake::store(&url);
         return Ok((url.clone(), held.clone(), Some((url, held)))); // (DataFusion reads its files at their URLs, as a bucket's)
     }
     #[cfg(feature = "doors")]
@@ -2090,7 +2090,7 @@ fn folder(_: &str) -> Result<(String, Store, Option<(String, Store)>)> {
 
 // Lakes held in this process's memory (`memory://`, DuckDB's `:memory:`) live in `memory.rs`, which
 // spills their files to disk past a budget.
-use crate::memory::in_memory;
+use crate::memory_lake::in_memory;
 
 /// Is `url` a lake served by the node that holds it (`pondra://host:port`, ADR-072 §8)?
 pub fn served(url: &str) -> bool { url.starts_with("pondra://") }
@@ -2300,7 +2300,7 @@ impl Lake {
         Self::open_with(url, writer, streamed, poll, None, node).await
     }
 
-    /// A reader of the lake at `url` (a memory URL whose store is given: `memory::give`) whose catalog is `kv`, a node's
+    /// A reader of the lake at `url` (a memory URL whose store is given: `memory_lake::give`) whose catalog is `kv`, a node's
     /// over `kv::remote` for a joined page (designs/l2-page-joins-cluster.md, J5). Nothing polls `kv`, and the lake's torn
     /// move is not checked here: the node that serves the catalog checks it.
     pub(crate) async fn open_on(url: &str, streamed: bool, kv: Arc<dyn Kv>, node: Arc<NodeState>) -> Result<Arc<Lake>> {
@@ -2362,7 +2362,7 @@ impl Lake {
         };
         // (the place's torn check runs beside the catalog's opening, so a bucket pays no extra round trip; `join`
         // and not `try_join`: a failure of one must not drop the other half way, with SlateDB's tasks still running)
-        let (torn, cat) = tokio::join!(async { if check_torn { crate::memory::refuse_torn(&store, &url).await } else { Ok(()) } }, opening);
+        let (torn, cat) = tokio::join!(async { if check_torn { crate::memory_lake::refuse_torn(&store, &url).await } else { Ok(()) } }, opening);
         torn?;
         let cat = cat?;
         let format = crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
@@ -4424,7 +4424,7 @@ mod tests {
         }
         assert_eq!(got, ["g/00", "g/01", "g/02", "g/06", "g/07", "g/08", "g/09", "g/11"], "the kept keys, once each, in order");
         assert!(ats.iter().all(|&a| a == lake.cat.committed()) && ats.len() == 4, "three pages and the empty one, all as of the one commit");
-        crate::memory::forget_memory(&url);
+        crate::memory_lake::forget_memory(&url);
         Ok(())
     }
 
@@ -4446,7 +4446,7 @@ mod tests {
         assert!(!lake.cat.moved_since("g/", "g0", since, mid, all), "one past both reads is in neither");
         assert!(!lake.cat.moved_since("g/", "g0", since, now, |k: &str| k != "g/2"), "one the reader may not see doesn't");
         assert!(lake.cat.moved_since("x/", "x0", now, now + 2, all), "commits `recent` doesn't hold can't be told apart");
-        crate::memory::forget_memory(&url);
+        crate::memory_lake::forget_memory(&url);
         Ok(())
     }
 

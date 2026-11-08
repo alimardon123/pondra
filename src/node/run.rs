@@ -39,7 +39,7 @@ impl Options {
         // (a lake in this process's memory is new: nobody wrote it, so a guest that only reads leads it, and reads its empty
         // catalog, as `pondra sql --dir :memory: "SELECT 1"` asks; a reader would find no lake there. An empty folder is still
         // refused, which catches a mistyped path)
-        let guest = if crate::memory::in_memory(dir) { Guest::Writes } else { guest };
+        let guest = if crate::memory_lake::in_memory(dir) { Guest::Writes } else { guest };
         let auth = auth::Auth::from_env().owned_by(Some(uuid::Uuid::new_v4().simple().to_string()));
         Options { dir: dir.into(), listen: String::new(), advertise: None, start: Start { tier_secs: 0.0, auth: Arc::new(auth), ..Start::default() },
                   pg: None, kafka: None, kafka_advertise: None, flight: None, attach, attach_found: None, guest: Some(guest) }
@@ -71,7 +71,7 @@ impl Held {
         let t0 = std::time::Instant::now();
         let tr = |w: &str| if crate::env::is_set("PONDRA_TRACE_START") { eprintln!("stop: {w} {:.2} s", t0.elapsed().as_secs_f64()) };
         // (a lake in memory goes with its node: no other node will read what it made durable)
-        if let (Some(_), Some(l)) = (term, lake.filter(|l| !crate::memory::in_memory(&l.url))) {
+        if let (Some(_), Some(l)) = (term, lake.filter(|l| !crate::memory_lake::in_memory(&l.url))) {
             // (what it committed in the bucket, with replicated acks too; the catalog's
             // memtable written out: the next leader replays no WAL, C5)
             let _ = tokio::time::timeout(Duration::from_secs(10), l.cat.wait_durable(l.cat.committed())).await;
@@ -186,7 +186,7 @@ impl Node {
         if lives {
             // (the spill folders of processes that ended, swept beside the start and not on it: a crashed one's may be
             // gigabytes, and a cold start waits for nothing but what serving needs, invariant 182)
-            std::thread::spawn(crate::memory::sweep_all);
+            std::thread::spawn(crate::scratch::sweep_all);
         }
         let serve_store = lives && crate::env::flag("PONDRA_SERVE_STORE"); // (read once, here: the checks, the cluster and the store's door all take this start's answer)
         crate::served::checked(&dir, start.reader, start.auth.admin_set(), serve_store)?; // (who may serve or open a store: `served.rs`)
@@ -255,7 +255,7 @@ impl Node {
         let lake = match opened {
             // (a lake a newer Pondra wrote, or a place a move didn't finish: this binary must not lead or serve it,
             // nor hold the term; and a restart would find the same place again)
-            Err(e) if e.downcast_ref::<format::Newer>().is_some() || crate::memory::torn(&e) => {
+            Err(e) if e.downcast_ref::<format::Newer>().is_some() || crate::memory_lake::torn(&e) => {
                 if leader {
                     terms::release(&store, cluster.leader.n).await;
                 }
@@ -293,7 +293,7 @@ impl Node {
         }
         // The lakes attached in SQL (`ATTACH … AS …`), and later ATTACHes and DETACHes.
         tr("lakes attached");
-        let replica = if !lives || reader || crate::memory::in_memory(&dir) { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr)?)?) }; // (a lake in memory has no followers to hold changes for; a guest is on no network)
+        let replica = if !lives || reader || crate::memory_lake::in_memory(&dir) { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr)?)?) }; // (a lake in memory has no followers to hold changes for; a guest is on no network)
         let app = node::start_app(lake.clone(), cluster.clone(), replica.clone(), &start).await?;
         tr("the app");
         if leader && !lives {
