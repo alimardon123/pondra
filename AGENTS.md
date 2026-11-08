@@ -3175,8 +3175,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    writes or a VALUES list, show only their batch counts, so two such tables are told apart by their arrays, and a
    scan Pondra doesn't know is alike only to itself), and wraps each that groups, joins or windows and gives a small part of what it reads (an eighth at
    most, or a grouping at its top) in a `ReuseExec`: the first use to run a partition runs the one copy and holds its
-   rows, counted in the query memory, and every use reads them; past the memory nothing is held and each use runs its
-   own. A held copy takes no dynamic filter from above, so a use on a hash join's probe side whose grouping the join's
+   rows, counted in the query memory (each buffer once: an aggregate gives one batch's slices), and every use reads
+   them; past the memory they go to disk and every use reads them there. No use runs its own copy beside the one that
+   ran (a scan's partitions share its files out as they run, so one partition of a second copy, run alone, reads them
+   all, and an exchange gives each partition out once). A plan reset to run again (`fresh`'s kept plans, a recursive
+   query's rounds) drops its `ReuseExec`s and runs each use's own copy. A held copy takes no dynamic filter from above, so a use on a hash join's probe side whose grouping the join's
    keys would cut (`keys_below`) keeps its own copy, unless the build side is a whole table or holds another use of
    the same copy (q23's `frequent_ss_items`, wanted for 4,200 items of 102,000). It runs just before `KeysBelow`, and
    not on a spread query's slices. At SF10 in process against main (#642 and most memory): TPC-DS 68.6 -> 64.9 s
