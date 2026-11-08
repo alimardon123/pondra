@@ -284,7 +284,14 @@ pub enum Ddl {
     CreateRoutine { name: String, routine: crate::expander::Routine, replace: bool }, // CREATE MACRO, CREATE PROCEDURE (ADR-023)
     DropRoutine { name: String, if_exists: bool },
     CreateSecret { name: String, params: std::collections::BTreeMap<String, String>, replace: bool, if_not_exists: bool }, // (ADR-026: `ext.rs`)
-    AttachOutside { name: String, url: String, kind: String, options: std::collections::BTreeMap<String, String> }, // another engine's tables (`ext.rs`)
+    AttachOutside {
+        name: String,
+        url: String,
+        kind: String,
+        options: std::collections::BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection: Option<String>, // (`ATTACH shop`: a connection's tables, its url, type and options read from it)
+    }, // another engine's tables (`ext.rs`)
     DropSecret { name: String, if_exists: bool },
     FetchExtension { name: String, from: String, version: Option<String> }, // INSTALL name FROM 'file or URL': the node that got it reads the file, then sends the record (`extension.rs`)
     InstallExtension { name: String, record: crate::extension::Installed }, // the record of an extension, kept by the leader (ADR-075 §6: `extension.rs`)
@@ -666,11 +673,14 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::HistoryLog => crate::history::create_log(lake).await,
         Ddl::Users(c) => crate::users::apply(lake, c).await,
         Ddl::Shares(c) => crate::shares::apply(lake, c).await,
-        Ddl::AttachOutside { name, url, kind, options } => {
+        Ddl::AttachOutside { name, url, kind, options, connection } => {
             not_system(&name, "attach it under another name")?;
             ensure!(!has_schema(lake, &name).await?, "a schema here is called {name}: attach under another name");
             ensure!(lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_none(), "{name} is an attached lake: attach under another name");
-            crate::ext::attach(lake, &name, &url, &kind, options).await
+            match connection {
+                Some(c) => crate::ext::attach_connection(lake, &name, &c).await,
+                None => crate::ext::attach(lake, &name, &url, &kind, options).await,
+            }
         }
         Ddl::Detach { name, if_exists } => {
             if crate::ext::detach(lake, &name).await? {

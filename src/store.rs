@@ -1858,6 +1858,7 @@ pub struct Lake {
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
     pub groups: Arc<crate::serve::Groups>,     // decoded row groups for key lookups
     pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
+    pub(crate) manifests: Arc<crate::manifest::Kept>, // its tables' manifests and lists, decompressed (`manifest::object`)
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
     cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
     pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
@@ -2464,12 +2465,11 @@ impl Lake {
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), life });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory)), manifests: crate::manifest::kept(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), life });
         for (name, cache) in lake.caches() {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
         ledger.charge("facts", Arc::downgrade(&crate::query::facts_kept())); // (the node's, charged once whatever lakes it opens)
-        ledger.charge("manifests", Arc::downgrade(&crate::manifest::kept())); // (the node's too: see `node::start_app` for the rest)
         ledger.charge("files", Arc::downgrade(&crate::cache::outside())); // (the process's, of files outside the lakes)
         crate::oom::wake();
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
@@ -2759,7 +2759,7 @@ impl Lake {
     /// the log; then the bucket's byte ranges, fetched again. The log's decoded rows, the catalog's blocks and DataFusion's
     /// footers and statistics keep what they hold by rules of their own, and say what that is.
     pub fn caches(&self) -> Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> {
-        let mut caches: Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> = vec![("hot", self.hot.clone()), ("lookups", self.groups.clone()), ("tails", self.tails.clone())];
+        let mut caches: Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> = vec![("hot", self.hot.clone()), ("lookups", self.groups.clone()), ("tails", self.tails.clone()), ("manifests", self.manifests.clone())];
         if let Some(ranges) = &self.cached {
             caches.push(("ranges", ranges.clone())); // (a lake on a bucket: a local or in-memory one reads its store directly)
         }
@@ -3188,12 +3188,13 @@ pub struct Catalog {
     follows: bool,                // follower / read-only node that gets the commit stream
     mirror: AtomicBool,           // the overlay holds the whole catalog (but inline data): read only it
     loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
-    rights: AtomicU64,            // the last commit that changed who may do what (`RIGHTS`, `rights_version`)
+    rights: AtomicU64,            // the last commit that changed who may do what (`moves_rights`, `rights_version`)
     metas: Arc<Mutex<Parsed<TableMeta>>>, // tables' entries as parsed (`parsed`)
     segs: Arc<Mutex<Parsed<Segment>>>,    // log segments' entries as parsed (`segments`)
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
     closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
     life: Life,                   // what a fence restarts: its lake's (`fatal`)
+    written: Mutex<Vec<(&'static str, Instant, std::collections::HashSet<String>)>>, // each round that follows the tables committed (`written`): its last read of them all, and the ones since
 }
 
 /// A scan in progress: the streamed changes it may still lay over its (older) view stay.
@@ -3234,13 +3235,13 @@ impl Delta {
 /// A commit's key that says nothing a read sees changed (retention's marks: `tier::expire`).
 pub const QUIET: &str = "quiet";
 
-/// The keys a principal is made from: users, roles, their grants, passwords and tokens (`users::user_key`), identity
-/// providers (`sso::key`), the lake's own signing keys (`users::KEYS`) and its mark of being served with tokens
-/// (`users::SIGNED`). A commit that puts or deletes one moves the rights version (`Catalog::rights_version`).
-const RIGHTS: [&str; 4] = ["u/", "ip/", "z/auth", "z/signed"];
-
-/// Does a commit change who may do what (`RIGHTS`)?
-fn moves_rights(d: &Delta) -> bool { d.puts.iter().map(|(k, _)| k).chain(&d.deletes).any(|k| RIGHTS.iter().any(|r| k.starts_with(r))) }
+/// Does a commit change who may do what? It does when it puts or deletes a key a principal is made from, which its owner
+/// marks as it registers its prefix (`records::Rights`): this floor names none of them. The rights version moves then
+/// (`Catalog::rights_version`).
+fn moves_rights(d: &Delta) -> bool {
+    let Some(rights) = crate::registry::get().find::<crate::records::Rights>() else { return false };
+    d.puts.iter().map(|(k, _)| k).chain(&d.deletes).any(|k| rights.moves(k))
+}
 
 /// The node's own records, which its writer appends (`history::writer`) and no remembered answer
 /// reads (`App::remembers`): the statements' history and the audit log.
@@ -3475,7 +3476,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud, rights) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, rights, metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default(), life }
+        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, rights, metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default(), life, written: Default::default() }
     }
 
     /// What the catalog's block caches hold, in bytes.
@@ -3582,6 +3583,13 @@ impl Catalog {
             self.mirror.store(false, Relaxed);
             self.hold.fetch_max(d.id - 1, Relaxed);
             self.rights.fetch_max(d.id, Relaxed); // (any of them may have changed who may do what)
+            self.written.lock().unwrap().clear(); // (the tables those wrote are unknown: each round's next look reads every table)
+        }
+        {
+            let mut written = self.written.lock().unwrap(); // (the tables this commit writes, for each round that follows them)
+            for (_, _, tables) in written.iter_mut() {
+                tables.extend(d.puts.iter().map(|(k, _)| k.as_str()).chain(d.deletes.iter().map(String::as_str)).filter_map(|k| k.strip_prefix("t/")).map(str::to_string));
+            }
         }
         if let Some((_, v)) = d.puts.iter().find(|(k, _)| k == "n") {
             self.last_n.fetch_max(serde_json::from_slice(v).unwrap_or(1), Relaxed);
@@ -3705,6 +3713,7 @@ impl Catalog {
         self.streamed.fetch_max(c, Relaxed);
         self.loud.fetch_max(c, Relaxed);
         self.rights.fetch_max(c, Relaxed); // (a whole snapshot: what changed in it isn't told apart)
+        self.written.lock().unwrap().clear(); // (…nor which tables: each round's next look reads every table)
         self.last_n.fetch_max(n, Relaxed);
         self.mirror.store(true, Relaxed);
         Ok(())
@@ -3739,6 +3748,38 @@ impl Catalog {
 
     pub fn is_writer(&self) -> bool { self.kv.is_writer() }
 
+    /// The tables (their `t/` names) committed since `who` last asked (`apply`: this leader's commits, or those a
+    /// follower was streamed), or None when `who` is to read every table instead: the first time it asks, once `sweep`
+    /// has passed since it last did (a table this missed waits at most that), and after a gap in a follower's stream. A
+    /// round that follows them (`tier::refresh`, `delta::publish_named`) reads only these between sweeps: a commit's work
+    /// follows its write set, not the number of tables (designs/redesign/redesign.md §4).
+    pub fn written(&self, who: &'static str, sweep: std::time::Duration) -> Option<std::collections::HashSet<String>> {
+        let mut written = self.written.lock().unwrap();
+        match written.iter_mut().find(|(w, ..)| *w == who) {
+            Some((_, swept, tables)) if swept.elapsed() < sweep => Some(std::mem::take(tables)),
+            Some((_, swept, tables)) => {
+                (*swept, *tables) = (Instant::now(), Default::default());
+                None
+            }
+            None => {
+                written.push((who, Instant::now(), Default::default()));
+                None
+            }
+        }
+    }
+
+    /// Tables `who` took (`written`) and must look at again next time: the ones its round failed on.
+    pub fn again(&self, who: &'static str, tables: impl IntoIterator<Item = String>) {
+        if let Some((.., kept)) = self.written.lock().unwrap().iter_mut().find(|(w, ..)| *w == who) {
+            kept.extend(tables);
+        }
+    }
+
+    /// `who` didn't finish reading what `written` gave it (an error part way): its next call reads every table.
+    pub fn missed(&self, who: &'static str) {
+        self.written.lock().unwrap().retain(|(w, ..)| *w != who);
+    }
+
     /// The catalog version every read here reflects right now — on the leader (durable commits)
     /// or a node that holds the whole catalog in memory — or `None` where reads mix our view with
     /// the stream. A read that starts after this sees at least this version (never older). Quiet
@@ -3750,7 +3791,7 @@ impl Catalog {
         }
     }
 
-    /// The rights version: the last commit that changed who may do what (`RIGHTS`), or that may have (commits that never
+    /// The rights version: the last commit that changed who may do what (`moves_rights`), or that may have (commits that never
     /// arrived, a snapshot read whole). A session makes its principal again when this moved since the principal was made
     /// (`auth::Principal::epoch`): one load at each statement, and no timer.
     pub fn rights_version(&self) -> u64 { self.rights.load(Relaxed) }
@@ -4706,7 +4747,7 @@ mod tests {
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         let ledger = lake.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
         let names: Vec<&str> = lake.caches().iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, ["hot", "lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments"], "a local lake has no cache of a bucket's ranges");
+        assert_eq!(names, ["hot", "lookups", "tails", "manifests", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments"], "a local lake has no cache of a bucket's ranges");
         let _ = lake.tails.lock().unwrap().put("t".into(), vec![], 4096);
         // (other tests' lakes may be charged to the same line meanwhile: what this lake holds is the least it reads)
         assert!(ledger.held() >= 4096, "the line counts the tails");
@@ -4717,8 +4758,8 @@ mod tests {
         }
         assert!(freed >= 4096 && lake.tails.held() == 0, "the tails give their memory back");
         assert!(!lake.cached_bytes().iter().any(|(name, _)| *name == "hot"), "the hot columns are `hot_bytes`");
-        // (`/metrics` reads the line's list by name: the node's planning facts and manifests are on it beside the lake's caches;
-        // a node's start charges its kept pages and outside tables' logs and manifests, `node::start_app`)
+        // (`/metrics` reads the line's list by name: the node's planning facts are on it beside the lake's caches, its manifests
+        // among them; a node's start charges its kept pages and outside tables' logs and manifests, `node::start_app`)
         let metrics: Vec<&str> = lake.cached_bytes().iter().map(|(name, _)| *name).collect();
         assert!(["lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments", "facts", "manifests", "files"].iter().all(|n| metrics.contains(n)), "{metrics:?}");
         lake.cat.close().await?;

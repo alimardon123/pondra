@@ -31,8 +31,52 @@ pub(crate) fn query(sql: &str) -> Result<Query> { Ok(*Parser::new(&GenericDialec
 pub(crate) fn quote(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
 fn name(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 
-/// Whether `sql` may hold any of them: a look before anything is parsed.
-pub fn wanted(sql: &str) -> bool {
+/// Whether `sql` may hold any of them: a look before anything is parsed. The front asks its three parts (`passes`), each
+/// only where its trigger is in the text; this module's tests ask the three at once.
+#[cfg(test)]
+fn wanted(sql: &str) -> bool {
+    wants_forms(sql) || wants_marked(sql) || wants_aliases(sql)
+}
+
+/// Postgres's bytea-only functions (`pg_bytea`), whose string literal reads as a bytea: a look's and a trigger's.
+const TAKES_BYTEA: &[&str] = crate::pg_bytea::TAKES_BYTEA;
+
+/// The front's passes of this module (`passes.rs`): the text's rewrite, and the three looks `wanted` makes, each with a
+/// trigger that holds every text its look finds.
+pub(crate) fn passes() -> Vec<crate::passes::Pass> {
+    use crate::passes::{Pass, Run};
+    let tables = DUCKDB_TYPES.iter().map(|(n, _)| *n).chain(OTHER_TYPES.iter().map(|(n, _, _)| *n)).chain(crate::dialect_fns::OURS.iter().map(|(n, _, _)| *n)).chain(TAKES_BYTEA.iter().copied());
+    let mut forms = vec![
+        "fetch", "all", "max_by", "min_by", "arg_max", "arg_min", "string_split", "str_split", "json", "jsonb", "json_value", "get_json_object", "tablesample", "sample", "pondra_sample",
+        "pivot", "unpivot", "rename", "apply", "list_apply", "array_apply", "columns", "filter", "list", "split", "lateral", "strftime", "strptime", "epoch", "regexp_extract", "datediff",
+        "date_diff", "dateadd", "date_add", "date_sub", "timestampadd", "timeadd", "group_concat", "array_agg", "iff", "iif", "zeroifnull", "decode", "array_construct", "array_size",
+        "object_construct", "isnull", "charindex", "convert", "try_convert", "getdate", "sysdatetime", "eomonth", "datepart", "curdate", "unix_timestamp", "unix_seconds", "timestamp_seconds",
+        "str_to_date", "date_format", "timestampdiff", "countif", "date", "date_trunc", "timestamp_trunc", "datetime_trunc", "timestamp_diff", "datetime_diff", "format_date", "format_timestamp",
+        "format_datetime", "parse_date", "parse_timestamp", "parse_datetime", "transform", "format", "top", "int64", "float64", "number", "byteint", "within", "safe", "materialized",
+        "timestamp_ntz", "time",
+    ];
+    forms.extend(tables);
+    vec![
+        Pass { name: "friendly.text", order: 40, words: vec!["lambda", "for", "pivot", "unpivot", "asof", "sample", "tblproperties", "top"], marks: vec![&["@@"]], run: Run::Text(text) },
+        // (`json_extract…` is a word's start, so a mark; `).a`, Snowflake's `payload:page`)
+        Pass { name: "friendly.forms", order: 10, words: forms, marks: vec![&["json_extract"], &[")", "."], &[":"]], run: Run::Wants(wants_forms) },
+        Pass {
+            name: "friendly.marked",
+            order: 20,
+            words: vec!["bytea", "character"],
+            // (`(a, b) IN (SELECT …)` and its NOT IN, `CHAR VARYING`, `DEFAULT VALUES`, `ESCAPE '…'`, an array literal or
+            // `ARRAY[`, a JSONPath after `->` or `->>`, a national string `N'…'`)
+            marks: vec![&["+0'"], &["+1'"], &["+2'"], &["+3'"], &["+4'"], &["+5'"], &["+6'"], &["+7'"], &["+8'"], &["+9'"], &["-0'"], &["-1'"], &["-2'"], &["-3'"], &["-4'"], &["-5'"], &["-6'"], &["-7'"], &["-8'"], &["-9'"],
+                &["0e"], &["1e"], &["2e"], &["3e"], &["4e"], &["5e"], &["6e"], &["7e"], &["8e"], &["9e"], &[")", "in"], &[")", "not"], &["char", "varying"], &["default", "values"], &["escape", "'"],
+                &["["], &["->", "'$"], &["->>", "'$"], &["n'"]],
+            run: Run::Wants(wants_marked),
+        },
+        Pass { name: "friendly.aliases", order: 30, words: vec!["where", "delete", "update"], marks: vec![], run: Run::Wants(wants_aliases) },
+    ]
+}
+
+/// Another database's word, function or type, a dbt view in parentheses, or a call Pondra refuses by name.
+fn wants_forms(sql: &str) -> bool {
     // (the last alternatives: BigQuery's `SAFE.f(`, and Snowflake's `payload:page` (a colon after a word or a closing
     // bracket, then a letter, `_`, a quote or `[`: not `x::INT`, nor `a = :p`, a parameter))
     static WORDS: LazyLock<Regex> = LazyLock::new(|| {
@@ -51,6 +95,13 @@ pub fn wanted(sql: &str) -> bool {
     // (a materialized view whose query is in parentheses, dbt's `AS (SELECT …)`: nothing else in its
     // text is a friendly form, so `unparen` is what it needs)
     static PAREN_VIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*create\s+(?:or\s+replace\s+)?materialized\s+view\b.*?\bas\s*\(").expect("a regex"));
+    // (a call of one of Postgres's bytea-only functions, whose string literal `expression` reads as a bytea)
+    static BYTEA_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", TAKES_BYTEA.join("|"))).expect("a regex"));
+    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || BYTEA_CALL.is_match(sql) || OURS_CALL.is_match(sql) || TYPES.is_match(sql)
+}
+
+/// A form a rewrite takes that a symbol marks: a zone, an exponent, a bytea, an array literal, a JSONPath.
+fn wants_marked(sql: &str) -> bool {
     // (the forms the rewrites below take: a timestamp's one-digit zone, a number with an exponent, a bytea
     // literal in either of its forms (matched by the word, since the escape form has no `\x` to match),
     // `(a, b) IN (SELECT …)`, a character type's Postgres name, DEFAULT VALUES, LIKE … ESCAPE, an array literal
@@ -59,9 +110,12 @@ pub fn wanted(sql: &str) -> bool {
     static MORE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|\bbytea\b|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\[|->>?\s*'\$|(?:^|[^\w'])[nN]'"#).expect("a regex")
     });
-    // (a call of one of Postgres's bytea-only functions, whose string literal `expression` reads as a bytea)
-    static BYTEA_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::pg_bytea::TAKES_BYTEA.join("|"))).expect("a regex"));
-    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || BYTEA_CALL.is_match(sql) || OURS_CALL.is_match(sql) || TYPES.is_match(sql) || alias_in_where(sql) || alias_after_table(sql)
+    MORE.is_match(sql)
+}
+
+/// A select's alias read in its WHERE, or a DELETE's or UPDATE's table with one.
+fn wants_aliases(sql: &str) -> bool {
+    alias_in_where(sql) || alias_after_table(sql)
 }
 
 /// Whether a name given with `AS` comes up again after a WHERE (a select's alias it may use).
@@ -1561,7 +1615,7 @@ fn expression(e: &mut Expr) -> Result<()> {
                 // (Postgres's bytea-only functions read a string literal as their first argument as a bytea, of any
                 // arity: `sha256('\x01')` hashes the byte 0x01, and `encode('\x01', 'hex')` is `01`, as Postgres does;
                 // a column or any other expression is left as it is)
-                (fname, _) if crate::pg_bytea::TAKES_BYTEA.contains(&fname) => {
+                (fname, _) if TAKES_BYTEA.contains(&fname) => {
                     if let Some(Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })) = a.first() {
                         let bytes = crate::pg_bytea::parse(s).map_err(|e| crate::codes::coded(e.code, e.message))?;
                         let lit = expr(&crate::pg_bytea::sql(&bytes))?;

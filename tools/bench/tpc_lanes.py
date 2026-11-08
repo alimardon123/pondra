@@ -211,6 +211,43 @@ def serialized(table):
     return sink.getvalue().to_pybytes()
 
 
+def cpu_seconds(pid):
+    """A process's CPU time so far, all its threads', user and system (/proc/<pid>/stat; None where there is none)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+class Busy:
+    """How busy the engine's cores were through one timed run, from its process's CPU time sampled every 0.1 s or so:
+    `share`, its CPU seconds over the run's core-seconds (1.0: every core busy throughout), and `half_idle`, the share
+    of the run's time with fewer than half the cores busy (the Pivot review's P3, redesign step 11 brief §D)."""
+
+    def __init__(self, pid, cores):
+        self.pid, self.cores = pid, cores
+        self.t0 = self.t = time.monotonic()
+        self.cpu0 = self.cpu = cpu_seconds(pid)
+        self.half_idle = 0.0
+
+    def sample(self):
+        t, cpu = time.monotonic(), cpu_seconds(self.pid)
+        if cpu is None or self.cpu is None:
+            return
+        if t > self.t and (cpu - self.cpu) / (t - self.t) < self.cores / 2:
+            self.half_idle += t - self.t
+        self.t, self.cpu = t, cpu
+
+    def done(self):
+        self.sample()
+        wall = self.t - self.t0
+        if self.cpu0 is None or self.cpu is None or wall <= 0:
+            return None
+        return {"share": round((self.cpu - self.cpu0) / (wall * self.cores), 3), "half_idle": round(self.half_idle / wall, 3)}
+
+
 def one_query(engine, sql, tables, args):
     """Best of `iters` timed runs in one fresh process (each run limited to `timeout` s), with what failed if any."""
     ctx = multiprocessing.get_context("spawn")
@@ -225,11 +262,14 @@ def one_query(engine, sql, tables, args):
     proc = ctx.Process(target=measure, args=(engine, sql, tables, args.threads, args.iters, 1, results, args.pondra_python))
     proc.start()
     times, rows, kept, deadline, status = [], None, None, None, "ok"
+    cores, busy, run = args.threads or os.cpu_count(), [], None  # (the engine's process: the child's, or Pivot's server)
     try:
         while True:
             try:
                 msg = results.get(timeout=0.1)
             except queue.Empty:
+                if run is not None:
+                    run.sample()
                 if deadline is not None and time.monotonic() > deadline:
                     status = f"timeout ({args.timeout:g} s)"
                     break
@@ -243,6 +283,7 @@ def one_query(engine, sql, tables, args):
                     continue
             if "started" in msg:
                 deadline = time.monotonic() + args.timeout
+                run = Busy(server.pid if server is not None else proc.pid, cores) if msg["started"] >= 1 else None  # (the timed runs)
             elif "error" in msg:
                 status = msg["error"]
                 break
@@ -250,6 +291,8 @@ def one_query(engine, sql, tables, args):
                 deadline = None
                 if not msg["warm"]:
                     times.append(msg["s"])
+                    busy.append(run.done() if run is not None else None)
+                run = None
                 rows = msg["rows"]
                 if msg["answer"] is not None:
                     kept = msg["answer"]
@@ -260,7 +303,8 @@ def one_query(engine, sql, tables, args):
         if server is not None:
             server.kill()
             server.wait()
-    return {"status": status, "best_s": min(times) if times else None, "times_s": times, "rows": rows}, kept
+    best = min(range(len(times)), key=times.__getitem__) if times else None
+    return {"status": status, "best_s": times[best] if times else None, "times_s": times, "rows": rows, "busy": busy[best] if times else None, "cores": cores}, kept
 
 
 def run(args):
@@ -389,6 +433,15 @@ def report(args):
                 cells.append("" if r is None else (f"{r['best_s']:.3f}" if r["best_s"] is not None else "x") + ("" if checked.get((e, q), True) else " ≠"))
             text.append(f"| {q} | " + " | ".join(cells) + " |")
         text.append("")
+        busy = [e for e in engines if any(by[e].get(q, {}).get("busy") for q in queries)]
+        if busy:
+            text.append("Per query, the best run's cores busy (its CPU over its core-seconds) / time with fewer than half busy:\n")
+            text.append("| query | " + " | ".join(busy) + " |")
+            text.append("|---|" + "---|" * len(busy))
+            for q in queries:
+                b = [by[e].get(q, {}).get("busy") for e in busy]
+                text.append(f"| {q} | " + " | ".join("" if x is None else f"{x['share']:.0%} / {x['half_idle']:.0%}" for x in b) + " |")
+            text.append("")
     print("\n".join(text))
     if args.md:
         Path(args.md).write_text("\n".join(text) + "\n")

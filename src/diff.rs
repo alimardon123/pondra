@@ -1,6 +1,15 @@
 //! `pondra.diff('a', 'b')` in a FROM: table b's rows that differ from a's (ADR-047), written as SQL where SQL comes in.
 use anyhow::{bail, Result};
 
+/// The front's pass of this module (`passes.rs`): `diffs`, triggered by `pondra.diff`.
+pub(crate) fn pass() -> crate::passes::Pass {
+    fn run(sql: &str) -> Result<std::borrow::Cow<'_, str>> {
+        let out = diffs(sql)?;
+        Ok(if out == sql { std::borrow::Cow::Borrowed(sql) } else { std::borrow::Cow::Owned(out) })
+    }
+    crate::passes::Pass { name: "diff.diffs", order: 20, words: vec![], marks: vec![&["pondra.diff"]], run: crate::passes::Run::Text(run) }
+}
+
 /// `pondra.diff('a', 'b')` in a FROM: the rows of table b that differ from a's, in the change
 /// feed's words (`_change_type`: insert, delete, update_preimage, update_postimage). A branch's
 /// rows keep their `_row_id` and `_version` (ADR-020), so the rows both hold alike match.
