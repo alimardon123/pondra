@@ -48,7 +48,7 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     let cancel = Arc::new(DefaultCancelHandler::new(cancels.clone()));
     loop {
         let (socket, _) = listener.accept().await?;
-        if crate::drain::draining() {
+        if app.lake.node.drain.draining() {
             continue; // (stopping: a new connection goes to another node, `drain.rs`)
         }
         let tls = tls.clone();
@@ -57,7 +57,7 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
         let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), again: Default::default(), copy: Default::default(), me: me.clone() });
         let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: cancels.clone() };
         let pg = Arc::new(Pg(backend, Arc::new(startup), cancel.clone()));
-        let used = crate::idle::Use::new(); // (an open connection is a use of the node: `idle.rs`)
+        let used = app.lake.node.idle.begin(); // (an open connection is a use of the node: `idle.rs`)
         crate::panics::task(async move {
             let _used = used;
             let _ = socket.set_nodelay(true);
@@ -407,7 +407,7 @@ fn said(e: &PgWireError) -> String {
 }
 
 fn user_error(e: anyhow::Error) -> PgWireError {
-    let (_, code, words) = crate::codes::answer(&e, crate::auth::shows_code()); // (the code and words every door gives)
+    let (_, code, words) = crate::codes::answer(&e, crate::rights::scope().shows_code()); // (the code and words every door gives)
     PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), code.into(), words)))
 }
 
@@ -453,8 +453,8 @@ impl Backend {
                 return Ok(Response::Query(rows(&schema, b, format)?)); // (in a transaction: its own version, or its snapshot's)
             }
         }
-        if reader && crate::auth::limited().is_none() && !crate::txn::open() && !crate::temp::mentioned(sql) {
-            // A key lookup: the serving path, before anything else (ADR-036 §6), as `/lookup` answers it.
+        if reader && !crate::txn::open() && !crate::temp::mentioned(sql) {
+            // A key lookup: the serving path, before anything else (ADR-036 §6), as `/lookup` answers it (of what its caller may read).
             let t0 = std::time::Instant::now();
             if let Some(p) = crate::serve::point(&self.app.lake, sql.trim().trim_end_matches(';')).await.map_err(user_error)? {
                 let t1 = t0.elapsed();
@@ -577,7 +577,7 @@ impl Backend {
             let session = Some(me.session.clone());
             crate::routines::with_notices(crate::temp::SESSION.scope(session, crate::auth::WHO.scope(who, me.caught(&u, &q, &f)))).await
         };
-        let (out, heard) = crate::panics::work(true, Box::pin(run)).await.unwrap_or_else(|m| (Err(user_error(anyhow::anyhow!(m))), vec![])); // (stoppable for memory: `oom.rs`)
+        let (out, heard) = crate::panics::work(&self.app.lake.node, true, Box::pin(run)).await.unwrap_or_else(|m| (Err(user_error(anyhow::anyhow!(m))), vec![])); // (stoppable for memory: `oom.rs`)
         for n in heard {
             let _ = client.feed(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
         }
@@ -589,11 +589,11 @@ impl Backend {
 
     /// `run`, a panic in it answered as an error (`panics.rs`); in a transaction, an error fails it.
     async fn caught(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
-        if crate::drain::draining() {
+        if self.app.lake.node.drain.draining() {
             // (stopping: the statement goes to another node, as a new connection does; `drain.rs`)
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), "57P01".into(), "this node is stopping: connect to another node".into()))));
         }
-        let run = async { crate::panics::door(Box::pin(self.run(user, sql, format))).await.unwrap_or_else(|m| Err(user_error(anyhow::anyhow!(m)))) };
+        let run = async { crate::panics::door(&self.app.lake.node, Box::pin(self.run(user, sql, format))).await.unwrap_or_else(|m| Err(user_error(anyhow::anyhow!(m)))) };
         let out = crate::audit::statement(&self.app, sql, run).await;
         if let Err(e) = &out {
             if crate::text::control(sql).is_none() {
@@ -830,7 +830,7 @@ impl Backend {
             };
             Ok((keep, batches)) // (its own caller takes the batches as they are: never decoded again)
         };
-        match self.app.remembered(format!("pg|{sql}"), sql, version, None, run).await? {
+        match self.app.remembered(format!("pg|{}|{sql}", crate::rights::scope().key()), sql, version, None, run).await? {
             Kept::Bytes(b) => crate::query::read_ipc(&b),
             Kept::Own(batches) => Ok(batches),
         }
@@ -1588,7 +1588,7 @@ impl SimpleQueryHandler for Backend {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         // (pgwire writes the answer's rows inside this call, so the drain counts the call until they are written)
-        let _busy = crate::drain::Busy::new();
+        let _busy = self.app.lake.node.drain.busy();
         let out = self._on_query(client, query).await;
         self.cancelled(&out);
         out
@@ -1626,9 +1626,9 @@ impl ExtendedQueryHandler for Backend {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         // (pgwire writes the rows this Execute sends inside this call, so the drain counts the call until they are written)
-        let _busy = crate::drain::Busy::new();
+        let _busy = self.app.lake.node.drain.busy();
         let out = self._on_execute(&mut Corked::new(client), message).await;
-        if crate::drain::draining() {
+        if self.app.lake.node.drain.draining() {
             client.flush().await?; // (a node stopping writes the rows now, while the drain still counts this call)
         }
         self.cancelled(&out);
@@ -1771,7 +1771,7 @@ impl Backend {
 
     /// `param_types`, but for uuids (`pg_types`), which are text to the planner.
     async fn inferred(&self, sql: &str) -> Vec<Type> {
-        if let (None, Ok(Some(p))) = (crate::auth::limited(), crate::serve::point(&self.app.lake, sql).await) {
+        if let Ok(Some(p)) = crate::serve::point(&self.app.lake, sql).await {
             return p.parameters(sql).iter().map(|t| pg_type(t, FieldFormat::Text).0).collect(); // (a key lookup's: its key's types, unplanned)
         }
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
@@ -1850,10 +1850,7 @@ impl Backend {
                 });
             }
         }
-        let point = match crate::auth::limited() {
-            None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.types().into()))), // (a key lookup's columns, unplanned, first)
-            Some(_) => None,
-        };
+        let point = crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.types().into()))); // (a key lookup's columns, unplanned, first)
         if point.is_none() && (session_command(sql).is_some() || crate::set::is(sql) || crate::vars::change(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some() || crate::script::is(sql)) {
             return Ok((vec![], Columns::None)); // (a COPY's columns come with its data)
         }

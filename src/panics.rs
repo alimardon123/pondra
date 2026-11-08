@@ -12,9 +12,15 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use datafusion::common::instant::Instant;
 
-/// Run a request: `Err` (the panic's message) if it panicked.
-pub async fn door<T>(f: impl Future<Output = T>) -> Result<T, String> {
-    let _busy = crate::drain::Busy::new(); // (a node stopping waits for it: `drain.rs`)
+/// Run a request of `node`'s: `Err` (the panic's message) if it panicked. It is counted in flight as it comes (its node
+/// stopping waits for it: `drain.rs`), and the future holds no borrow of the node.
+pub fn door<T>(node: &crate::node_state::NodeState, f: impl Future<Output = T>) -> impl Future<Output = Result<T, String>> {
+    caught(node.drain.busy(), f)
+}
+
+/// `door`, with its place in its node's count of requests in flight already taken.
+async fn caught<T>(busy: crate::node_state::Busy, f: impl Future<Output = T>) -> Result<T, String> {
+    let _busy = busy;
     AssertUnwindSafe(f).catch_unwind().await.map_err(|p| said(&*p))
 }
 
@@ -31,14 +37,19 @@ pub async fn door<T>(f: impl Future<Output = T>) -> Result<T, String> {
 /// polls' allocations are counted to it (`oom::charge`), so the watch stops the one that grew the node. A page (wasm32) has no
 /// watch loop, so it watches each poll of one instead (`oom::polled`), and answers its own [`crate::oom::PAGE_OOM`].
 /// Any other request is not wrapped, and runs where it came in or on the queries' runtime, as the others do.
-pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
+pub fn work<T: Send + 'static>(node: &crate::node_state::NodeState, stoppable: bool, f: impl Future<Output = T> + Send + 'static) -> impl Future<Output = Result<T, String>> + Send + 'static {
+    worked(node.drain.busy(), stoppable, f) // (counted as it comes, as `door` counts it)
+}
+
+/// `work`, with its place in its node's count of requests in flight already taken.
+async fn worked<T: Send + 'static>(busy: crate::node_state::Busy, stoppable: bool, f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
     use futures::future::{Aborted, Either};
     use std::sync::atomic::Ordering::Relaxed;
     // (a page's one thread runs no watch loop beside a request, so each poll of a stoppable one is watched: `oom::polled`)
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(line) = stoppable.then(crate::oom::line).flatten() {
-            return door(crate::oom::polled(|| crate::store::resident().unwrap_or(0), line, f)).await?.map_err(|()| crate::oom::PAGE_OOM.to_string());
+            return caught(busy, crate::oom::polled(|| crate::store::resident().unwrap_or(0), line, f)).await?.map_err(|()| crate::oom::PAGE_OOM.to_string());
         }
     }
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -82,9 +93,9 @@ pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T>
     crate::oom::wake(); // (the watch looks now, once this request is in RUNNING: it may be one to stop)
     let mut stop = Stop(id, None);
     let out = if !long {
-        door(f).await
+        caught(busy, f).await
     } else {
-        apart(door(f), &mut stop.1).await
+        apart(caught(busy, f), &mut stop.1).await
     };
     match out? {
         Ok(v) => Ok(v),
@@ -399,23 +410,24 @@ mod tests {
     #[test]
     fn a_stop_takes_a_stoppable_request_and_answers_out_of_memory() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a runtime");
+        let node = crate::node_state::NodeState::unhosted();
         rt.block_on(async {
             let later = || Instant::now() + std::time::Duration::from_secs(2); // (a request that has run a second or more)
-            let asked = tokio::spawn(work(false, std::future::pending::<()>()));
+            let asked = tokio::spawn(work(&node, false, std::future::pending::<()>()));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert_eq!(stop_one(later(), 0), None, "a request that may not be stopped is passed over");
             asked.abort();
-            let stoppable = tokio::spawn(work(true, std::future::pending::<()>()));
+            let stoppable = tokio::spawn(work(&node, true, std::future::pending::<()>()));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert_eq!(stop_one(later(), 0), Some(false), "a stoppable request is stopped");
             assert_eq!(stoppable.await.expect("the task ends"), Err(crate::oom::OOM.to_string()));
             assert_eq!(stop_one(later(), 0), None, "a stopped request is not stopped again");
-            assert_eq!(work(true, async { 5 }).await, Ok(5), "a request that ends on its own answers");
+            assert_eq!(work(&node, true, async { 5 }).await, Ok(5), "a request that ends on its own answers");
             // A stopped request whose spawned work still runs holds the stop until that work has ended: the cheap
             // request beside it is not stopped meanwhile, and is once the work is done (and the memory still over).
-            let cheap = tokio::spawn(work(true, std::future::pending::<()>()));
+            let cheap = tokio::spawn(work(&node, true, std::future::pending::<()>()));
             let (done, held) = tokio::sync::oneshot::channel::<()>();
-            let grower = tokio::spawn(work(true, async move {
+            let grower = tokio::spawn(work(&node, true, async move {
                 let used = crate::oom::counter().expect("a stoppable request's counter");
                 tokio::spawn(async move {
                     let _used = used; // (as a DataFusion task holds it: `oom::TRACER`)
@@ -443,7 +455,7 @@ mod tests {
             // A request in a first try: the stop takes the try, the request goes on to its second, and a stop then
             // takes the request. A first try inside another isn't one of its own, and outside a request it just runs.
             let (tried, mut told) = tokio::sync::watch::channel(0);
-            let twice = tokio::spawn(work(true, async move {
+            let twice = tokio::spawn(work(&node, true, async move {
                 let first = first_try(async {
                     assert_eq!(first_try(async { 1 }, |_| false).await, Ok(1), "a try inside a first try runs as it is");
                     let _ = tried.send(1);
@@ -462,7 +474,7 @@ mod tests {
             // A first try that ends in a way its caller tries again (the pool refused it) is answered as it ended, once its
             // memory has gone, and its request may then be stopped whole, as after a stopped try.
             let (tried, mut told) = tokio::sync::watch::channel(0);
-            let refused = tokio::spawn(work(true, async move {
+            let refused = tokio::spawn(work(&node, true, async move {
                 let first = first_try(async { 8 }, |n| *n == 8).await;
                 let _ = tried.send(1);
                 std::future::pending::<()>().await;

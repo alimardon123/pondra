@@ -108,10 +108,10 @@ pub async fn serve(app: App, addr: String, advertise: String) -> Result<()> {
     let me = Arc::new(Broker { id, host: host.into(), port: port.parse()? });
     ME.set_once(serde_json::json!({"id": me.id, "host": me.host, "port": me.port}));
     while let Some((socket, _)) = doors.next().await {
-        if crate::drain::draining() {
+        if app.lake.node.drain.draining() {
             continue; // (a node stopping takes no new client: the socket closes, and the client tries another broker)
         }
-        let (app, me, used) = (app.clone(), me.clone(), crate::idle::Use::new()); // (an open connection is a use of the node: `idle.rs`)
+        let (app, me, used) = (app.clone(), me.clone(), app.lake.node.idle.begin()); // (an open connection is a use of the node: `idle.rs`)
         crate::panics::task(async move {
             let _used = used;
             conn(app, me, socket).await.map_err(|e| eprintln!("kafka client: {e:#}"))
@@ -128,14 +128,14 @@ type Reply = BoxFuture<'static, Option<Vec<u8>>>; // a response frame, or None (
 /// A node stopping (`drain.rs`) takes no request after the drain began: the connection closes once the answers to
 /// those it took are written, and the client sends the next one to another broker (it was never applied, so a
 /// producer that isn't idempotent writes it once). Each request it took that changes something (a produce, an offset
-/// commit) holds the drain (`drain::Busy`) until its answer is written, so an acknowledged write is never cut off
+/// commit) holds the drain (`Drain::busy`) until its answer is written, so an acknowledged write is never cut off
 /// before its client hears of it and sends it again. A fetch's long poll and a group's join wait on others, not on
 /// the node, and aren't held: cut off, they lose nothing, and held they would hold the drain for their whole wait.
 async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()> {
     let peer = socket.peer();
     let from = Some(peer.addr);
     let (mut rd, mut wr) = tokio::io::split(socket);
-    let (tx, mut rx) = mpsc::channel::<(Reply, Option<crate::drain::Busy>)>(64);
+    let (tx, mut rx) = mpsc::channel::<(Reply, Option<crate::node_state::Busy>)>(64);
     let writer = crate::panics::task(async move {
         while let Some((reply, busy)) = rx.recv().await {
             if let Some(frame) = reply.await {
@@ -157,8 +157,8 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
         let mut buf = vec![0; size as usize];
         rd.read_exact(&mut buf).await?;
         let key = buf.get(..2).map_or(-1, |k| i16::from_be_bytes([k[0], k[1]]));
-        let busy = matches!(key, PRODUCE | OFFSET_COMMIT).then(crate::drain::Busy::new);
-        if crate::drain::draining() || busy.as_ref().is_some_and(|b| !b.counted()) {
+        let busy = matches!(key, PRODUCE | OFFSET_COMMIT).then(|| app.lake.node.drain.busy());
+        if app.lake.node.drain.draining() || busy.as_ref().is_some_and(|b| !b.counted()) {
             break; // (stopping: not taken, see above)
         }
         let reply = request(&app, &me, &mut who, &mut said, &peer, Bytes::from(buf)).await?;
@@ -441,7 +441,7 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
         let name = r.str()?;
         let meta = app.lake.cat.meta(&table_key(&name)).await?; // (the stored entry: its JSON fields are SQL's names too, ADR-022)
         let rules = meta.as_ref().map(|m| m.rules());
-        let not_yours = format!("this {} may not write {name}", if who.access.is_some() { "user" } else { "token" });
+        let not_yours = format!("this {} may not write {name}", if who.scope.whole() { "token" } else { "user" });
         let may = crate::writer::may(Some(who), &crate::auth::catalog_name(&name), None, false).map_err(|e| e.to_string()); // (the row doors' one check)
         let mut parts = vec![];
         for _ in 0..r.len()? {

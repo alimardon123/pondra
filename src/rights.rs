@@ -125,16 +125,16 @@ impl From<Refusal> for anyhow::Error {
 
 /// May `who` do `action` to `object`?
 pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusal> {
-    let superuser = who.role == Role::Admin && who.access.is_none();
+    let superuser = who.superuser();
     // (a role first: a token's, and a user's for what no grant names)
     let need = action.role();
-    if (who.access.is_none() || action.privilege().is_none()) && who.role < need {
+    if (who.scope.whole() || action.privilege().is_none()) && who.role < need {
         let needs = match need {
             Role::Admin => "an admin token, or a superuser",
             Role::Write => "a write token, or a user granted a write",
             _ => "a token, or a user's sign-in",
         };
-        return Err(Refusal::new(format!("this {} may not {}: it needs {needs}", if who.access.is_some() { "user" } else { "token" }, action.words())));
+        return Err(Refusal::new(format!("this {} may not {}: it needs {needs}", if who.scope.whole() { "token" } else { "user" }, action.words())));
     }
     let Object::Table(name) = object else { return Ok(()) };
     let table = catalog_name(name);
@@ -146,7 +146,7 @@ pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusa
     if crate::sys::hidden(&table) && action == Action::SelectAll && !superuser {
         return Err(Refusal::new(format!("permission denied: {table} is Pondra's own, and its rows stream to a superuser only")));
     }
-    let (Some(a), Some(privilege)) = (&who.access, action.privilege()) else { return Ok(()) };
+    let (Some(a), Some(privilege)) = (&who.scope.0, action.privilege()) else { return Ok(()) };
     let granted = match action {
         Action::SelectAll => a.columns(privilege, &table) == Some(None),
         _ => a.may(privilege, &table),
@@ -201,7 +201,7 @@ pub fn may_run(role: Role, stmt: &Stmt) -> anyhow::Result<()> {
     let Some(&first) = actions.first() else { return Ok(()) };
     let who = as_role(role, first)?;
     // (CLONE is enough to make a branch, and its owner drops it: `branch::door` checks)
-    if who.access.is_some() && matches!(stmt, Stmt::Ddl(ds) if ds.len() == 1 && matches!(ds[0], crate::ddl::Ddl::CreateDatabase { clone: Some(_), .. } | crate::ddl::Ddl::DropDatabase { .. })) {
+    if !who.scope.whole() && matches!(stmt, Stmt::Ddl(ds) if ds.len() == 1 && matches!(ds[0], crate::ddl::Ddl::CreateDatabase { clone: Some(_), .. } | crate::ddl::Ddl::DropDatabase { .. })) {
         return Ok(());
     }
     let object = if table.is_empty() { Object::Lake } else { Object::Table(&table) };
@@ -209,6 +209,84 @@ pub fn may_run(role: Role, stmt: &Stmt) -> anyhow::Result<()> {
         may(&who, action, object)?;
     }
     Ok(())
+}
+
+/// What the request being served may see and read (design v2.1 §5, step 6 piece 2): everything (`whole`: a token, a
+/// superuser, an open node, the node's own work), or what a user's grants name. Listings ask `sees`, planning asks
+/// `columns`, the key lookup asks `reads`, the results cache keeps an answer under `key`, and nothing outside this module
+/// reads a user's grants.
+#[derive(Clone, Default)]
+pub struct Scope(Option<std::sync::Arc<crate::users::Access>>);
+
+/// The scope of the request being served: its principal's (`Principal::scope`).
+pub fn scope() -> Scope { crate::auth::current().map(|p| p.scope).unwrap_or_default() }
+
+impl Scope {
+    /// What a user who isn't a superuser may see: what `access` grants it (`users::principal_with` makes it once, as the
+    /// principal is made).
+    pub fn granted(access: std::sync::Arc<crate::users::Access>) -> Scope { Scope(Some(access)) }
+
+    /// A user's own quota (`users::quota`); None: whole, which has none.
+    pub fn limits(&self) -> Option<crate::users::Limits> { self.0.as_ref().map(|a| a.limits) }
+
+    /// Everything: no grants narrow it.
+    pub fn whole(&self) -> bool { self.0.is_none() }
+
+    /// What an answer kept for it is kept under, beside its text (`App::remembers`, the Postgres port's too): what it
+    /// holds, its grants and its names, never who holds it. So a GRANT or a REVOKE makes another key, and no answer made
+    /// under other grants is ever given; "" when whole, as every token's and superuser's answers are kept today.
+    pub fn key(&self) -> &str { self.0.as_ref().map_or("", |a| a.key()) }
+
+    /// May it read these columns of `table` (as the catalog names it)? A key lookup asks before it answers without
+    /// planning (`serve::point`), as `query::Guarded` asks of a plan's scan: every column it returns and its key's.
+    pub fn reads<'a>(&self, table: &str, mut columns: impl Iterator<Item = &'a str>) -> bool {
+        match self.columns(table) {
+            None => false,
+            Some(None) => true,
+            Some(Some(granted)) => columns.all(|c| granted.contains(c)),
+        }
+    }
+
+    /// Does it see `object`? A table or view (as the catalog names it, `l.t` for another lake's) when it may read any of
+    /// its columns (SELECT, S27); the lake's own records (its users, identity providers, shares) when it is whole.
+    pub fn sees(&self, object: Object) -> bool {
+        match (&self.0, object) {
+            (None, _) => true,
+            (Some(a), Object::Table(t)) => a.may("select", t),
+            (Some(_), Object::Lake) => false,
+        }
+    }
+
+    /// The columns of `table` (as the catalog names it) it reads: None, none; Some(None), every column; Some(these).
+    pub fn columns(&self, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.0.as_ref().map_or(Some(None), |a| a.columns("select", table)) }
+
+    /// The same, for a table of another lake attached here (`l.t`, `l.s.t`): only grants naming it count; ON ALL TABLES
+    /// and ON SCHEMA are this lake's. `privilege` as `Action::privilege` names it.
+    pub fn named(&self, privilege: &str, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.0.as_ref().map_or(Some(None), |a| a.named(privilege, table)) }
+
+    /// May it use the secret `name` (GRANT USAGE ON SECRET)?
+    pub fn secret(&self, name: &str) -> bool { self.0.as_ref().is_none_or(|a| a.secret(name)) }
+
+    /// May it use the object `name` of an extension's `kind` for `privilege` (`READ` on a connection)? Whole: always.
+    pub fn may_use(&self, kind: &str, name: &str, privilege: &str) -> bool { self.0.as_ref().is_none_or(|a| a.may_use(kind, name, privilege)) }
+
+    /// The schemas a user granted CLONE may branch (ADR-058): None, no CLONE grant (and a whole scope, which needs none);
+    /// Some(none), every schema (CLONE ON DATABASE); Some(these), CLONE ON SCHEMA.
+    pub fn clones(&self) -> Option<Vec<String>> { self.0.as_ref().and_then(|a| a.clones()) }
+
+    /// May it branch `db`, a database attached here, through its attachment (GRANT CLONE ON DATABASE db)?
+    pub fn clones_of(&self, db: &str) -> bool { self.0.as_ref().is_none_or(|a| a.clones_of(db)) }
+
+    /// Is it a user granted APPLY on this database (`apply::applier`)? A whole scope applies by its role instead: false.
+    pub fn applies(&self) -> bool { self.0.as_ref().is_some_and(|a| a.applies()) }
+
+    /// Is it shown routines' code, tasks' statements and views' queries (S27): a token, a superuser, an open node,
+    /// and a user who could hold them anyway (APPLY deploys them, CLONE ON DATABASE copies them into a branch it
+    /// owns)? A user granted some tables is shown their names and parameters only.
+    pub fn shows_code(&self) -> bool { self.0.as_ref().is_none_or(|a| a.applies() || a.clones().is_some_and(|s| s.is_empty())) }
+
+    /// The names whose grants it has: a user's own, its roles' and public's. None: whole.
+    pub fn names(&self) -> Option<&std::collections::HashSet<String>> { self.0.as_ref().map(|a| &a.names) }
 }
 
 /// The table a write changes (as the catalog names it; empty: the lake's) and what it asks to do to it.
@@ -247,7 +325,7 @@ mod tests {
 
     fn user(grants: &[(&str, On, &[&str])]) -> Principal {
         let grants = grants.iter().map(|(p, on, cols)| Grant { privilege: p.to_string(), on: on.clone(), columns: cols.iter().map(|c| c.to_string()).collect() }).collect();
-        Principal { name: "ann".into(), access: Some(Arc::new(Access::granted(grants))), ..Principal::of(Role::Read) }
+        Principal { name: "ann".into(), scope: Scope::granted(Arc::new(Access::granted(grants))), ..Principal::of(Role::Read) }
     }
 
     fn said(r: Result<(), Refusal>) -> String { r.err().map(|r| r.text).unwrap_or_else(|| "ok".into()) }
@@ -330,6 +408,39 @@ mod tests {
         })
         .await;
         assert_eq!(node, ("ok".to_string(), "pondra$audit is written by Pondra alone".to_string(), "ok".to_string()));
+    }
+
+    /// An answer is kept under what its scope holds (`Scope::key`): the same grants and names in any order are one key;
+    /// another column, table, privilege or name is another, and so is a REVOKE; a whole scope's is "" and no granted one's
+    /// is. A key lookup reads only what it may (`Scope::reads`).
+    #[test]
+    fn a_scope_is_kept_by_what_it_holds() {
+        let scope = |grants: &[(&str, On, &[&str])], names: &[&str]| {
+            let mut a = Access::granted(grants.iter().map(|(p, on, cols)| Grant { privilege: p.to_string(), on: on.clone(), columns: cols.iter().map(|c| c.to_string()).collect() }).collect());
+            a.names = names.iter().map(|n| n.to_string()).collect();
+            Scope::granted(Arc::new(a))
+        };
+        let t = || On::Table("t".into());
+        let ann = scope(&[("select", t(), &["a", "b"]), ("select", On::Table("u".into()), &[])], &["ann", "analyst", "public"]);
+        let same = scope(&[("select", On::Table("u".into()), &[]), ("select", t(), &["a", "b"]), ("select", t(), &["a", "b"])], &["public", "analyst", "ann"]);
+        assert_eq!(ann.key(), same.key(), "the same grants and names, in another order and one twice: one key");
+        assert_eq!(ann.key().len(), 32);
+        let others = [
+            scope(&[("select", t(), &["a"]), ("select", On::Table("u".into()), &[])], &["ann", "analyst", "public"]), // (a column fewer)
+            scope(&[("select", t(), &["a", "b"])], &["ann", "analyst", "public"]),                                      // (a REVOKE of u)
+            scope(&[("select", t(), &["a", "b"]), ("insert", On::Table("u".into()), &[])], &["ann", "analyst", "public"]), // (another privilege)
+            scope(&[("select", t(), &["a", "b"]), ("select", On::Table("u".into()), &[])], &["bob", "analyst", "public"]), // (another name)
+            scope(&[], &[]),
+        ];
+        for (i, o) in others.iter().enumerate() {
+            assert_ne!(o.key(), ann.key(), "{i}");
+            assert!(others[..i].iter().all(|p| p.key() != o.key()), "{i}");
+        }
+        assert_eq!(Scope::default().key(), "");
+        assert!(others.iter().chain([&ann]).all(|s| !s.key().is_empty()), "a granted scope never shares a whole one's answers");
+        let read = |s: &Scope, table: &str, cols: &[&str]| s.reads(table, cols.iter().copied());
+        assert!(read(&ann, "t", &["a", "b"]) && read(&ann, "u", &["x", "y"]) && read(&Scope::default(), "v", &["z"]));
+        assert!(!read(&ann, "t", &["a", "c"]) && !read(&ann, "v", &[]), "a column not granted, or a table: SQL answers it, refusing");
     }
 
     /// A write asks of its table what SQL's own would, and rows written ask UPDATE and DELETE as they need them.

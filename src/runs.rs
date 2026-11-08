@@ -82,7 +82,7 @@ struct Line {
 
 /// A call being logged: its line, written as it starts and again as it ends; one dropped before it
 /// ended (its caller went, its task's time ran out) ends as `stopped`, never `running` for good.
-pub struct Run(Option<(App, Line)>, #[allow(dead_code)] crate::idle::Use); // (a run is a use of its node: `idle.rs`)
+pub struct Run(Option<(App, Line)>, #[allow(dead_code)] crate::node_state::Use); // (a run is a use of its node: `idle.rs`)
 
 impl Drop for Run {
     fn drop(&mut self) {
@@ -104,7 +104,7 @@ impl Run {
         let caller = CALLER.try_with(|c| c.clone()).unwrap_or_else(|_| format!("{role:?}").to_lowercase());
         let line = Line { id: id.unwrap_or_else(new_id), routine: routine.into(), caller, node: app.members.me().to_string(), job: job.map(String::from), args: cut(args), started: now_ms(), ended: None, status: "running", notices: None, error: None };
         log(app, line.clone(), None);
-        Run(Some((app.clone(), line)), crate::idle::Use::new())
+        Run(Some((app.clone(), line)), app.lake.node.idle.begin())
     }
 
     /// The call's line, ended; the answer says when it is in the log (a task waits for it before
@@ -1150,7 +1150,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("returns", r(&|_, r| r.returns.clone())),
         ("volatility", r(&|_, r| (r.kind != Kind::Procedure).then(|| r.with.volatility.clone().unwrap_or_else(|| if r.python() { "volatile" } else { "as its body" }.into())))),
         ("options", r(&|_, r| Some(serde_json::to_string(&r.with).unwrap_or_default()).filter(|o| o != "{}"))),
-        ("body", r(&|_, r| crate::auth::shows_code().then(|| r.body.clone()))), // (a routine's code: S27)
+        ("body", r(&|_, r| crate::rights::scope().shows_code().then(|| r.body.clone()))), // (a routine's code: S27)
     ])?;
     let all = tasks(lake).await?;
     let mut ticks = vec![];
@@ -1165,7 +1165,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("schedule", t(&|_, (_, x)| Some(x.schedule.clone()).filter(|s| !s.is_empty()))),
         ("after", t(&|_, (_, x)| Some(x.after.join(", ")).filter(|s| !s.is_empty()))),
         ("when", t(&|_, (_, x)| x.when.clone())),
-        ("statement", t(&|_, (_, x)| crate::auth::shows_code().then(|| x.sql.clone()))), // (a task's statement: S27)
+        ("statement", t(&|_, (_, x)| crate::rights::scope().shows_code().then(|| x.sql.clone()))), // (a task's statement: S27)
         ("options", t(&|_, (_, x)| (!x.with.plain()).then(|| serde_json::to_string(&x.with).unwrap_or_default()))),
         ("state", t(&|_, (_, x)| Some(if x.suspended { "suspended" } else { "started" }.into()))),
         ("last_tick", at(&|i, _| ticks[i].as_ref().map(|t| t.at))),
@@ -1192,9 +1192,8 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
     ])?;
     // (dropped tables that UNDROP TABLE can still bring back: ADR-043)
     let mut gone = crate::ddl::dropped(lake).await?;
-    if let Some(a) = crate::auth::limited() {
-        gone.retain(|(n, _)| a.may("select", n));
-    }
+    let scope = crate::rights::scope();
+    gone.retain(|(n, _)| scope.sees(crate::rights::Object::Table(n)));
     let g = |f: &dyn Fn(&crate::ddl::Dropped) -> u64| Arc::new(gone.iter().map(|(_, d)| Some(f(d) as i64)).collect::<Int64Array>()) as ArrayRef;
     let when = |f: &dyn Fn(&crate::ddl::Dropped) -> u64| Arc::new(gone.iter().map(|(_, d)| Some(f(d) as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef;
     let dropped = RecordBatch::try_from_iter(vec![
@@ -1292,7 +1291,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_task_remembers_whether_its_owner_made_it() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-task-owner-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         // (what the wire says is no say: `owner` is signed where CREATE TASK runs, by its owner's program)
         let sent = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), owner: Some("theirs".into()), ..Default::default() };
         create_task(&lake, "theirs", sent, false).await?;
@@ -1312,10 +1311,10 @@ mod tests {
         assert!(!owners(&lake, Some(mark.as_str()), &stored.what("theirs")), "the mark is of its own name");
         assert!(holds(Task { suspended: true, ..stored.clone() }), "a suspended task is still the owner's");
         // (a reader of the same lake with another program's key, or with none, verifies no mark of this one)
-        let other = Lake::open(dir.to_str().unwrap(), false, false, crate::lifecycle::unhosted()).await?;
+        let other = Lake::open(dir.to_str().unwrap(), false, false, crate::node_state::NodeState::unhosted()).await?;
         let _ = other.owner_key.set("k2".into());
         assert!(!owners(&other, Some(mark.as_str()), &stored.what("mine")), "another program's key signs no mark of this owner's");
-        let none = Lake::open(dir.to_str().unwrap(), false, false, crate::lifecycle::unhosted()).await?;
+        let none = Lake::open(dir.to_str().unwrap(), false, false, crate::node_state::NodeState::unhosted()).await?;
         assert!(!owners(&none, Some(mark.as_str()), &stored.what("mine")), "a lake with no owner's key verifies no mark");
         Ok(())
     }
@@ -1323,7 +1322,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_asked_run_is_the_owners_only_when_the_owner_asked() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-tick-owner-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let _ = lake.owner_key.set("k1".into());
         let mut owned = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), ..Default::default() };
         owned.owner = signed(&lake, &owned.what("owned"));
@@ -1350,7 +1349,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_owners_run_reads_only_the_owners_results() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-result-owner-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let _ = lake.owner_key.set("k1".into());
         let up = |owner: Option<String>| Tick { at: 7, done: true, status: Some("ok".into()), result: Some("42".into()), owner, ..Default::default() };
         let sql = "SELECT pondra.result('up')";

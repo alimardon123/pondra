@@ -11,6 +11,7 @@ column base
 dialect base
 env base
 lifecycle base
+node_state base
 ledger base
 memo base
 metrics base

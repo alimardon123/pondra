@@ -105,7 +105,7 @@ mod tests {
     fn xs(bs: &[RecordBatch]) -> Vec<i64> { bs.iter().flat_map(|b| b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()).collect() }
 
     async fn lake() -> Arc<Lake> {
-        Lake::open(&format!("memory://pages-{}", uuid::Uuid::new_v4().simple()), true, false, crate::lifecycle::unhosted()).await.expect("a lake in memory")
+        Lake::open(&format!("memory://pages-{}", uuid::Uuid::new_v4().simple()), true, false, crate::node_state::NodeState::unhosted()).await.expect("a lake in memory")
     }
 
     #[tokio::test]

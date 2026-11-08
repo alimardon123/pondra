@@ -288,7 +288,7 @@ pub async fn fetch(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl) -
             let _guard = lock.lock().await;
             crate::ddl::apply(lake, install).await
         }
-        None => Box::pin(crate::write::send(&lake.url, Request::Ddl(install), &lake.life)).await,
+        None => Box::pin(crate::write::send(&lake.url, Request::Ddl(install), &lake.node)).await,
     }
 }
 
@@ -981,7 +981,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_installed_extension_is_kept_until_uninstalled() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-extension-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let e = keep(&lake, "words", "/data/words-0.1.txt", None, b"text".to_vec()).await.err().unwrap();
         assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("22023", "words-0.1.txt is not a WebAssembly file".to_string()));
         let e = keep(&lake, "words", "/data/module.wasm", None, b"\0asm\x01\0\0\0".to_vec()).await.err().unwrap();
@@ -1047,7 +1047,7 @@ mod tests {
     async fn an_installed_extensions_functions_answer_in_a_query() -> Result<()> {
         use datafusion::arrow::array::{AsArray, Int64Array};
         let dir = std::env::temp_dir().join(format!("pondra-extension-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         // (each node asks the switch as it loads a part, the node this test is included: `unsigned_allowed`)
         std::env::set_var("PONDRA_ALLOW_UNSIGNED_EXTENSIONS", "true");
         let record = keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec()).await?;

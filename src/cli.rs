@@ -530,7 +530,6 @@ async fn run() -> anyhow::Result<()> {
             // (`--idle-exit`: once nobody has used the node for that long and it has nothing left to do, it stops as on
             // SIGTERM: `idle.rs`)
             let quiet = env::secs("PONDRA_IDLE_EXIT_SECS");
-            let mut idle = Box::pin(crate::idle::ended(quiet.as_secs_f64()));
             let mut moves = node::mover(); // (a lake moving to another place: `memory::set_location`)
             // (the node's own work failing, `node::stop`: the node is stopped as on SIGTERM but with no drain, as a library's
             // host stops it, so a leader gives up its term and the next node leads at once; then the process ends with 1)
@@ -557,13 +556,14 @@ async fn run() -> anyhow::Result<()> {
                         failed_stop(held.stop()).await;
                     }
                 };
+                let mut idle = Box::pin(node.idle(quiet.as_secs_f64())); // (this node's uses, counted from its start)
                 tokio::select! {
                     served = node.serving() => {
                         served?;
                         break;
                     }
                     _ = async { tokio::select! { _ = &mut stop => {}, _ = &mut idle => eprintln!("nobody has used this node for {quiet:?} and it has nothing left to do: it stops (--idle-exit)") } } => {
-                        tokio::select! { _ = drain::drain() => {}, _ = stopped(false) => drain::hurry() }
+                        tokio::select! { _ = node.drain() => {}, _ = stopped(false) => node.hurry() }
                         node.stop().await;
                         crate::memory::leave();
                         std::process::exit(0);
@@ -575,7 +575,7 @@ async fn run() -> anyhow::Result<()> {
                         failed_stop(node.stop()).await;
                     }
                     Some(m) = moves.recv() => {
-                        drain::drain().await;
+                        node.drain().await;
                         node.stop().await;
                         while failures.try_recv().is_ok() {} // (what the stopped node's work said is no failure of the next one's)
                         if let Err(e) = crate::memory::settle(&m).await {
@@ -649,19 +649,19 @@ async fn run() -> anyhow::Result<()> {
         }
         Cmd::Sql { dir, query, attach: attached } => sql_on_guest(&crate::memory::place(&dir), &query, &attached).await?, // (`:memory:`: in this process's memory, as `serve`'s)
         Cmd::Token { dir, user, name } => {
-            let life = node::native(false); // (a command of its own, not a guest: as `pondra lead`)
-            let Ok(lake) = store::Lake::open(&dir, false, false, life.clone()).await else { anyhow::bail!("no lake at {dir} (pondra token takes a lake's folder, or its s3:// prefix)") };
+            let here = node::native(false); // (a command of its own, not a guest: as `pondra lead`)
+            let Ok(lake) = store::Lake::open(&dir, false, false, here.clone()).await else { anyhow::bail!("no lake at {dir} (pondra token takes a lake's folder, or its s3:// prefix)") };
             let no_user = lake.cat.scan_raw("u/", "u0").await?.is_empty();
             drop(lake); // (what follows opens it as it needs: through the inbox, or leading for a moment)
             if user == "pondra" && no_user {
                 // (a lake with no user yet, as a follower on the network finds it: its first user, as a leader makes it)
                 let first = users::Change::Create { name: user.clone(), login: true, if_not_exists: true, verifier: None, superuser: true, limits: Default::default() };
-                write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(first)), &life).await?;
+                write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(first)), &here).await?;
             }
             let (token, hash) = users::new_token(&user);
             let name = name.unwrap_or_else(|| format!("token-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())));
             let change = users::Change::CreateToken { name: name.clone(), user: user.clone(), expires_secs: None, hash: Some(hash) };
-            write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(change)), &life).await?; // (only the hash goes)
+            write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(change)), &here).await?; // (only the hash goes)
             println!("{token}"); // (alone on stdout: `T=$(pondra token --dir lake)`)
             eprintln!("a token for {user} (shown once; DROP TOKEN {name} FOR {user} takes it back)");
         }
@@ -681,7 +681,7 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
     let query = match extension::row(query) { Some(row) => row?, None => query.to_string() };
     let reads = statement::single_statement(&query).is_some_and(|one| statement::plain_statement(&one)) || matches!(write::parse(&query), Some(write::Stmt::CopyTo(..)));
     let guest = if reads { node::Guest::Reads } else { node::Guest::Writes };
-    let life = node::native(true); // (a guest's, as its node's: a run again gives up after five)
+    let life = node::native(true).life.clone(); // (a guest's, as its node's: a run again gives up after five)
     let node = match node::Node::open(node::Options::guest(dir, attached.to_vec(), guest)).await {
         Ok(node) => node,
         // (fenced out by a newer writer while it started, before its statement ran: run again, as a write fenced later is)
