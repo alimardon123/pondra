@@ -478,7 +478,7 @@ async fn part(lake: &Lake, name: &str, r: &Installed) -> Result<Arc<crate::wasm:
 }
 
 /// The functions of the lake's installed extensions that `text` names (the query and the views it reads), in its session
-/// (`query::session_at`): each a scalar function by its own name, run by its extension's part. An extension no query names
+/// (`query::session_for`): each a scalar function by its own name, run by its extension's part. An extension no query names
 /// is never loaded, so one whose file can't be read fails only the queries that call it. On every node a spread query
 /// reaches, its session registers the same, from the same records.
 #[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
@@ -513,13 +513,13 @@ pub async fn functions(lake: &Lake, _: &datafusion::prelude::SessionContext, tex
 /// Does `sql`, or a view it reads, call one of the installed extensions' functions that `which` picks? The views are read
 /// only when an extension has such a function and `sql` alone doesn't name it (most lakes have no extension).
 #[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
-pub async fn calls(lake: &Lake, sql: &str, which: impl Fn(&Described) -> bool) -> bool {
+pub async fn calls(lake: &Lake, sql: &str, which: impl Fn(&Described) -> bool, scope: &crate::rights::Scope) -> bool {
     let Ok(installed) = listed(lake).await else { return true };
     let names: Vec<&str> = installed.iter().flat_map(|(_, r)| &r.functions).filter(|f| which(f)).map(|f| f.name.as_str()).collect();
     if names.is_empty() || names.iter().any(|n| crate::text::mentions(sql, n)) {
         return !names.is_empty();
     }
-    match crate::routines::with_views(lake, sql).await {
+    match crate::routines::with_views(lake, sql, scope).await {
         Ok(text) => names.iter().any(|n| crate::text::mentions(&text, n)),
         Err(_) => true,
     }
@@ -1055,7 +1055,7 @@ mod tests {
         let run = |sql: &'static str| {
             let lake = &lake;
             async move {
-                let ctx = crate::query::session(lake, sql, "").await?;
+                let ctx = crate::query::session_for(lake, sql, "", None, &crate::auth::Principal::node().scope).await?;
                 anyhow::Ok(ctx.sql(sql).await?.collect().await?)
             }
         };

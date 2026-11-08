@@ -225,12 +225,12 @@ impl WithWrites {
 /// Runs a WITH that writes: the checks that need the node, then its steps and rest in one transaction (the caller's, or one of
 /// its own: `txn::as_one`). A statement with no step to run first is a lone write, and runs as one.
 pub async fn run(app: &App, w: &WithWrites, who: Who, job: Option<String>) -> Result<Outcome> {
-    names(app, w).await?;
+    names(app, w, &who.scope).await?;
     if w.steps.is_empty() {
         return Box::pin(routines::one_of(app, &w.rest, who, job)).await; // (a lone write: its own checks, and its job's)
     }
     temps(w)?;
-    clash(&w.parts, &reads_with_views(app, w).await?)?;
+    clash(&w.parts, &reads_with_views(app, w, &who.scope).await?)?;
     if let (Some(j), false) = (&job, crate::txn::open()) {
         for p in &w.parts {
             if let Some(wr) = &p.write {
@@ -360,12 +360,12 @@ pub(crate) async fn planned(app: &App, sql: &str, scope: &crate::rights::Scope) 
 }
 
 /// A CTE named like a temporary table or view, or a stored view, would be read in place of the CTE: refused, before anything runs.
-async fn names(app: &App, w: &WithWrites) -> Result<()> {
+async fn names(app: &App, w: &WithWrites, scope: &crate::rights::Scope) -> Result<()> {
     if w.names.is_empty() {
         return Ok(());
     }
     let (tables, views) = crate::temp::listed();
-    let stored = crate::query::stored_views(&app.lake, &w.sql, false).await?;
+    let stored = crate::query::stored_views(&app.lake, &w.sql, false, scope).await?;
     for n in &w.names {
         let temp = tables.iter().any(|(t, _)| t == n) || views.iter().any(|(v, _)| v == n);
         if temp || stored.iter().any(|(v, _)| v == n) {
@@ -386,7 +386,7 @@ fn temps(w: &WithWrites) -> Result<()> {
 
 /// What each part reads, as `clash` checks it: its own names, and those of the views it names (stored or temporary, and the views
 /// those name), as the views' text reads them.
-async fn reads_with_views(app: &App, w: &WithWrites) -> Result<Vec<Vec<String>>> {
+async fn reads_with_views(app: &App, w: &WithWrites, scope: &crate::rights::Scope) -> Result<Vec<Vec<String>>> {
     let mut out = vec![];
     for (p, text) in w.parts.iter().zip(w.texts()) {
         let temps = crate::temp::views(text);
@@ -395,7 +395,7 @@ async fn reads_with_views(app: &App, w: &WithWrites) -> Result<Vec<Vec<String>>>
             all.push(' ');
             all.push_str(v);
         }
-        let stored = crate::query::stored_views(&app.lake, &all, false).await?;
+        let stored = crate::query::stored_views(&app.lake, &all, false, scope).await?;
         let mut reads = p.reads.clone();
         for v in temps.iter().map(|(_, v)| v).chain(stored.iter().map(|(_, v)| v)) {
             reads.extend(pg_relations(v));

@@ -63,7 +63,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
             register(lake, to).await?;
         }
     }
-    let query = crate::routines::expand(lake, query).await?; // (the files, macros and FROM-first queries it reads)
+    let query = crate::routines::expand(lake, query, scope).await?; // (the files, macros and FROM-first queries it reads)
     if to.starts_with("kafka://") {
         let df = crate::engine::sql(&crate::query::session_for(lake, &query, "", None, scope).await?, &query).await?;
         return crate::kafka_client::copy_to(lake, df, to, options).await; // (rows as records: a topic's; not retried, as records sent are sent)
@@ -345,7 +345,7 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
     };
     ensure!(meta.key.is_empty(), "{table} is a keyed table: INSERT INTO {table} SELECT … FROM '…' upserts each run");
     let folder = meta.folder(&name).to_string();
-    let (shown, positional, pieces) = plan(lake, from, options).await?;
+    let (shown, positional, pieces) = plan(lake, from, options, scope).await?;
     let known: BTreeMap<String, Entry> = lake.cat.scan::<Entry>(&format!("ld/{folder}/"), &format!("ld/{folder}0")).await?.into_iter().collect();
     if app.seq.is_some() {
         expire(app, &known).await?; // (the leader keeps the records as far as the retention: the next statement finds them gone)
@@ -374,7 +374,7 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
                 if types.is_empty() {
                     p.query
                 } else {
-                    crate::routines::expand(lake, &reader_query(format, &p.url, reader, &types)).await?
+                    crate::routines::expand(lake, &reader_query(format, &p.url, reader, &types), scope).await?
                 }
             }
             _ => p.query,
@@ -413,7 +413,7 @@ struct Piece {
 
 /// The source's files, as `(what to show, headerless CSV?, the files)`. A path's reader is its
 /// FORMAT, else its extension's, with the options given; a query's is its file reference's own.
-async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) -> Result<(String, bool, Vec<Piece>)> {
+async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>, scope: &crate::rights::Scope) -> Result<(String, bool, Vec<Piece>)> {
     let (shown, spec, query_of, dialect) = match from {
         Source::Path(p) => {
             // (a relative path is the owner's folder's, made whole here; a client's is read as `objects` maps it: the lake's files)
@@ -429,7 +429,7 @@ async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) ->
         }
         Source::Query(q) => {
             ensure!(options.keys().all(|k| k == "force"), "COPY INTO (SELECT …): the reader's options go in the query: read_csv('…', header => true)");
-            let expanded = crate::routines::expand(lake, q).await?;
+            let expanded = crate::routines::expand(lake, q, scope).await?;
             let names = crate::ext_names::names(&expanded);
             ensure!(names.len() == 1, "COPY INTO (SELECT …) names {} files: one outside source (FROM 'path'), loaded file by file", names.len());
             let spec = crate::ext_names::spec(&names[0]).context("COPY INTO (SELECT …): its FROM is a file")?;
@@ -454,7 +454,7 @@ async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) ->
             }
             (None, Source::Path(_)) => unreachable!("a path has its reader"),
         };
-        let query = crate::routines::expand(lake, &query).await?;
+        let query = crate::routines::expand(lake, &query, scope).await?;
         let version = o.e_tag.clone().unwrap_or_else(|| format!("{}-{}", o.size, o.last_modified.timestamp_millis()));
         pieces.push(Piece { url, version, modified: o.last_modified.timestamp_millis().max(0) as u64, query, reader: query_of.clone(), dialect });
     }

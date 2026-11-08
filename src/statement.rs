@@ -60,7 +60,7 @@ pub async fn run<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire:
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
     }
     if req.params.is_empty() && req.tables.is_empty() && req.views.is_empty() {
-        if let Some((sent, one)) = plain_of(app, &req.sql).await? {
+        if let Some((sent, one)) = plain_of(app, &req.sql, &who.scope).await? {
             if !crate::txn::open() {
                 crate::query::mark("request read and checked");
                 return audit::statement(app, &sent, query(app, &one, &how, who.files, &who.scope, wire)).await; // (the audit log and history keep it as it was sent)
@@ -100,10 +100,10 @@ pub(crate) fn plain_statement(one: &str) -> bool {
 /// A plain query's text as sent, and the statement it runs as (its `$name`s and macros expanded, `vars::bound` and
 /// `expand`): the pair when `sql` is one plain statement (`single_statement`, `plain_statement`); None for a script, a
 /// change or a write, which `run` runs whole. Flight plans a query from the second half without running it.
-pub(crate) async fn plain_of(app: &App, sql: &str) -> Result<Option<(String, String)>> {
+pub(crate) async fn plain_of(app: &App, sql: &str, scope: &crate::rights::Scope) -> Result<Option<(String, String)>> {
     let Some(sent) = single_statement(sql) else { return Ok(None) };
     crate::query::mark("one statement");
-    let one = routines::expand(&app.lake, &crate::vars::bound(&sent)?).await?; // (`$name`: the session's variables)
+    let one = routines::expand(&app.lake, &crate::vars::bound(&sent)?, scope).await?; // (`$name`: the session's variables)
     crate::query::mark("front");
     let plain = plain_statement(&one);
     crate::query::mark("classified");
@@ -131,7 +131,7 @@ pub(crate) async fn query<W: Wire>(app: &App, one: &str, how: &How<'_>, files: b
     // rights: a file here it reads is named in the statement as expanded, or in a view it reads, and
     // so never remembered.
     let remembered = match wire.kept_as() {
-        Some(kept) => app.remembers(one).await.map(|version| (kept, version)),
+        Some(kept) => app.remembers(one, scope).await.map(|version| (kept, version)),
         None => None,
     };
     let Some((kept, version)) = remembered else {
@@ -141,7 +141,7 @@ pub(crate) async fn query<W: Wire>(app: &App, one: &str, how: &How<'_>, files: b
     // (a user granted some tables: kept under what it may read, `Scope::key`, so an answer made under other grants is never its)
     let key = format!("{kept}|{}|{}|{}|{one}", how.spread.unwrap_or(""), if files { "owner" } else { "" }, scope.key());
     let stale = how.stale.filter(|_| how.after.is_none()); // (read-your-writes wins)
-    Ok(match app.remembered(key, one, version, stale, || run_once(app, how, one, files, scope, wire)).await? {
+    Ok(match app.remembered(key, one, version, stale, scope, || run_once(app, how, one, files, scope, wire)).await? {
         Kept::Bytes(body) => Answer::Kept(body),
         Kept::Own(answer) => answer,
     })

@@ -697,7 +697,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    segment ever has it. `harness.py changes`: "an UPDATE or MERGE keeps a row's _row_id; ids are
    unique".
 56. **A change is the leader's, under the lake's lock, from one snapshot** (`change::run`: every
-   query of it `session_at(upto)`). Two nodes changing the same rows at once would each start
+   query of it `session_for` at `upto`). Two nodes changing the same rows at once would each start
    from the other's old version. `harness.py changes`: "three nodes changing the same rows at
    once: every change counts".
 57. **What follows a table follows its changes, or the change is refused** (`views::can_follow`,
@@ -816,7 +816,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `order_by` then the last `_ord` (`latest_sql`); lookups and point queries go through SQL
    (`harness.py dedup`).
 80. **A keyed table's `_deleted` is shown only to a query that names it, decided alike on every
-   node** (`query::names_deleted` over the query and the stored views it reads, in `session_at` and
+   node** (`query::names_deleted` over the query and the stored views it reads, in `session_for` and
    `spmd::plan`): nodes that disagreed would plan the query differently.
 81. **A frame puts its sort in every step that keeps order** (`Frame._order`, `_step`, and
    `trailing_order` for SQL given to `con.sql`): DataFusion drops the `ORDER BY` of a CTE or a
@@ -1373,7 +1373,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`Request::read`, `server::append_rows`). A refusal a follower forwards from its leader keeps the
    leader's code (`write::post_as`, `codes::received`). `harness.py constraints`, `ddlgaps`.
 186. **A transaction is a session's, kept where the session is, and one commit** (`txn.rs`, ADR-036
-   §5): every read in it goes through `query::session_at`, which takes its snapshot and its overlay
+   §5): every read in it goes through `query::session_for`, which takes its snapshot and its overlay
    (`txn::overlaid`); a new path that reads tables for a session must too, or refuse inside a
    transaction. Writes are kept by `txn::keep`, and `COMMIT` is `Request::Txn` → `commit_here`
    under the lake's lock: the conflict check (40001), then `change::appends` for every table, one
@@ -1386,7 +1386,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    table is `txn::point_change`, in a transaction or not.
 188. **A session's settings are checked as they are set, and travel with its queries only**
    (`set.rs`, round 31): `SET datafusion.*` is validated against DataFusion's options and
-   applied in `query::session_at` (and `write::declared`); a session that has any runs its queries
+   applied in `query::session_for` (and `write::declared`); a session that has any runs its queries
    on its own node and never from `Results`. Postgres's undotted names are kept for `SHOW`;
    `datafusion.runtime.*` is refused. A script sent without a session gets one of its own
    (`temp::of_script`, `#` in its id: no client can name it), ended with the script.
@@ -1436,7 +1436,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    only by columns it kept. PySpark's `spark.sql` sends its queries this way, its writes as
    Pondra's SQL. `harness.py sparksql` (its "by a column it leaves out" fails without the first).
 197. **A node that just started answers only once it holds what its leader had** (`cluster::catch_up`,
-   `Lake::caught_up`, in `query::session_at` and `write::on_node_as`): restarted after a failover,
+   `Lake::caught_up`, in `query::session_for` and `write::on_node_as`): restarted after a failover,
    its catalog view reads no WAL, and what the new leader took over from the old one's is flushed a
    moment after it leads, so a table made just before the kill was "not found" there. Only a node
    reading the commit stream catches up (a view that replays the WAL has it all). It asks its leader
@@ -1701,7 +1701,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    159); the shares' columns must agree, and the leader records every file in one commit with the
    job's mark, so a retried job writes nothing. A share that fails leaves its files to the orphan
    sweep, and this node writes it all. A spread query that names a system column gets them in its
-   tables, as `session_at` gives them (`spmd::shared`: it fell back to one node). A history view
+   tables, as `session_for` gives them (`spmd::shared`: it fell back to one node). A history view
    (invariant 183) is never sliced (`spmd::sliceable`: a version's `__end_at` is the next version's,
    in whichever file) and every node reads it through `views::history_view`: a spread read counted
    its deleted versions (since round 33). `harness.py insert`: "every node writes its share" (the
@@ -1993,7 +1993,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    behind the entries an attached lake's changed row went missing (336 of 607 reads on main
    2801b4d); with an entry read before a table's first UPDATE and its log read past it, a leader too
    kept both versions. `harness.py attached` (55 wrong reads on 0.33.0). And a query fixes that end once
-   for every table it reads (`session_at`: this lake's, and each attached lake's after its `settle`), so a
+   for every table it reads (`session_for`: this lake's, and each attached lake's after its `settle`), so a
    self-join or a window read twice sees one commit under ingest: `harness.py tails`' pairs (1,296 wrong of
    1,562 reads on the build before, 0 now) and `attached` (3 of 429 before, 0 of 418).
 266. **In a protected database, a project's objects change only through an apply by a holder of
