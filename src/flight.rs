@@ -23,6 +23,7 @@ use crate::auth::Role;
 use crate::app::App;
 use crate::statement::{self, Answer, How, Wire};
 use crate::store::{table_key, TableMeta};
+use crate::tls::Peer;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
@@ -84,7 +85,7 @@ impl tower::Service<http::Request<tonic::body::Body>> for Gate {
         Box::pin(async move {
             // (a header that isn't text can't be read, and is refused as HTTP refuses it: not taken for no credential)
             let (credential, sent) = (crate::auth::Credential::of_headers(req.headers()), req.headers().contains_key("authorization"));
-            let peer = req.extensions().get::<crate::tls::Peer>().copied();
+            let peer = req.extensions().get::<Peer>().copied();
             let again = Again { credential: credential.clone(), sent, peer }; // (for a call that outlives a change of who may do what: `Again`)
             let who = match sign_in(&app, credential, sent, peer).await {
                 Ok(who) => who,
@@ -113,7 +114,7 @@ const SIGN_IN: &str = "sign in: a token, or a user's name and password (handshak
 struct Again {
     credential: crate::auth::Credential,
     sent: bool,
-    peer: Option<crate::tls::Peer>,
+    peer: Option<Peer>,
 }
 
 /// `again`'s caller now, if `who` is stale: signed in again, with the rights version read before (so a change meanwhile
@@ -226,7 +227,7 @@ fn allowed<T>(_: &App, _: &Request<T>, need: Role) -> Result<Role, Status> {
 /// Who a call is, from its `authorization`: a token, or a user's token or session (`Bearer`:
 /// `users::who`); or a name and password (`Basic`: what ADBC's and pyarrow's handshakes send). With
 /// nothing that needs a sign-in, anyone is an admin. A wrong password is an error, said at once.
-async fn sign_in(app: &App, credential: crate::auth::Credential, sent: bool, peer: Option<crate::tls::Peer>) -> Result<crate::auth::Principal, Status> {
+async fn sign_in(app: &App, credential: crate::auth::Credential, sent: bool, peer: Option<Peer>) -> Result<crate::auth::Principal, Status> {
     let from = peer.map(|p| p.addr);
     if let Some(why) = credential.malformed() {
         crate::audit::refused(app, "", "flight", from, "sign in", &why).await;
@@ -261,7 +262,7 @@ async fn sign_in(app: &App, credential: crate::auth::Credential, sent: bool, pee
 /// `pt_` token), checked as every door checks one. A password crosses only TLS from another machine
 /// (`tls.rs`; no peer at all refuses one), and failed sign-ins are counted per address and name
 /// (`auth::guessing`), each costing 400 ms. None on a node nothing locks.
-async fn password_sign_in(app: &App, user: &str, password: &str, peer: Option<crate::tls::Peer>) -> Result<Option<crate::auth::Principal>, Status> {
+async fn password_sign_in(app: &App, user: &str, password: &str, peer: Option<Peer>) -> Result<Option<crate::auth::Principal>, Status> {
     let role = app.auth.token_role(password);
     if role > Role::None {
         return Ok(Some(crate::auth::Principal::token(role)));
