@@ -22231,8 +22231,8 @@ def rejects():
         except Exception as e:
             return f"ERROR {e}"
     checks, info = {}, {}
-    for q in ["CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER", "CREATE TABLE orders (id BIGINT, buyer VARCHAR, amount BIGINT)",
-              "INSERT INTO orders VALUES (1, 'u1', -5), (2, 'u2', 10)"]:
+    for q in ["CREATE TABLE orders (id BIGINT, buyer VARCHAR, amount BIGINT)", "INSERT INTO orders VALUES (1, 'u1', -5), (2, 'u2', 10)",
+              "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:  # (an open node until its first user)
         info.setdefault("setup", []).append(ask(None, q))
     for q in ["""CREATE MATERIALIZED VIEW silver (
                    CONSTRAINT positive CHECK (amount > 0) ON VIOLATION DROP ROW,

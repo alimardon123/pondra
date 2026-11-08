@@ -1637,6 +1637,9 @@ pub async fn inline(lake: &Lake) -> Result<std::sync::Arc<Inline>> {
         if !v.expect.is_empty() || v.once.is_some() {
             i.tables.insert(EXPECTED.into()); // (their counts, and late rows')
         }
+        if v.expect.iter().any(|e| e.on != OnViolation::Keep) {
+            i.tables.insert(crate::rejects::TABLE.into()); // (the rows they drop: `derive`)
+        }
         if v.fill.as_ref().is_some_and(|f| f.upto.is_none() && !BOUNDED.lock().unwrap().contains(&f.id)) {
             i.unbounded.push((t, v));
         }
