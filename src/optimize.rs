@@ -1293,6 +1293,7 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let post = rules.iter().position(|r| r.name() == "FilterPushdown(Post)").unwrap_or(rules.len());
     rules.insert(post + 1, Arc::new(crate::keys_below::KeysUnused)); // (a `KeysExec` no filter came down to goes again)
     rules.insert(post, Arc::new(crate::keys_below::KeysBelow)); // (just before: the joins' dynamic filters come down to it)
+    rules.insert(post, Arc::new(crate::reuse::Reuse)); // (before the joins' dynamic filters come down, which a held copy takes none of: `reuse::keyed`)
     rules
 }
 

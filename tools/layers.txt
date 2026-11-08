@@ -137,6 +137,7 @@ replace engine
 request_body engine
 rerun engine
 returning engine
+reuse engine
 routines engine
 rules engine
 runs engine

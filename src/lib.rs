@@ -103,6 +103,7 @@ mod held;
 mod keys_below;
 mod late_rows;
 mod median;
+mod reuse;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
 mod data_file;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)

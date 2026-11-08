@@ -119,7 +119,7 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
           counts in the query memory: invariant 414); keys_below.rs (a join's keys cut the rows an aggregate under it
-          groups: invariant 437); or_ranges.rs (an OR of ranges of one column that meet as one
+          groups: invariant 437); reuse.rs (a subplan that appears more than once alike runs once: invariant 477); or_ranges.rs (an OR of ranges of one column that meet as one
           range: invariant 438); zeros_in.rs (a float IN list's zero, a CASE's and NULLIF's, answer as `=` does: invariant 448); round 35 served.rs (a lake's store over HTTP:
           pondra://host:port, ADR-072 §8, invariant 299); replace.rs (CREATE OR REPLACE TABLE: a staged table filled, then put
           in the old one's place in one commit: invariant 425); round 36 statement.rs (one statement's
@@ -3167,6 +3167,20 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and the leader refuses them with 40001 when the table's is another (`Ack::moved`, `write::record`): run again, by the new
    order. A page's staged INSERT sends its own (`server::insert_staged`). Named columns carry none (11-03 audit M9).
    `cargo test --lib store::tests::placed`; `harness.py colorder`
+
+477. **A subplan that appears more than once alike runs once** (`reuse.rs`). A query that names a CTE more than once
+   is planned with a copy at each use, and each copy read and grouped its tables again. `Reuse` finds the subplans
+   whose text is the same at two uses or more, once the filters are pushed down (uses the filters reach differently
+   aren't alike), and wraps each that groups, joins or windows and gives a small part of what it reads (an eighth at
+   most, or a grouping at its top) in a `ReuseExec`: the first use to run a partition runs the one copy and holds its
+   rows, counted in the query memory, and every use reads them; past the memory nothing is held and each use runs its
+   own. A held copy takes no dynamic filter from above, so a use on a hash join's probe side whose grouping the join's
+   keys would cut (`keys_below`) keeps its own copy, unless the build side is a whole table or holds another use of
+   the same copy (q23's `frequent_ss_items`, wanted for 4,200 items of 102,000). It runs just before `KeysBelow`, and
+   not on a spread query's slices. At SF10 in process against main (#642 and most memory): TPC-DS 68.6 -> 64.9 s
+   (q14 3.75 -> 2.01, q36 1.10 -> 0.34, q47 1.81 -> 0.67, q23 3.21 -> 2.17, q64 2.37 -> 1.95, q65 0.70 -> 0.37),
+   TPC-H q15 1.01 -> 0.55; the queries flagged slower hold no copy and are as fast run interleaved; the same answers.
+   `cargo test --lib reuse::`
 
 ```bash
 cargo build --release
