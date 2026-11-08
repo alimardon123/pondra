@@ -483,7 +483,7 @@ pub fn check(sql: &str) -> Result<bool> {
     if !sql.to_lowercase().contains("pondra.audit") {
         return Ok(false);
     }
-    let superuser = crate::auth::current().is_none_or(|p| p.role == crate::auth::Role::Admin && p.access.is_none());
+    let superuser = crate::auth::current().is_none_or(|p| p.superuser());
     anyhow::ensure!(superuser, "permission denied: pondra.audit is the superusers'");
     Ok(true)
 }

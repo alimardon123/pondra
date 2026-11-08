@@ -518,7 +518,7 @@ async fn set(lake: &Lake, name: &str, value: i64, called: bool) -> Result<i64> {
 /// A sequence moves for a writer only: a read token's queries never take its values.
 fn may_write(name: &str) -> Result<()> {
     match crate::auth::current() {
-        Some(p) if p.access.is_none() && p.role < crate::auth::Role::Write => bail!("permission denied for sequence {name}: nextval and setval are a writer's"),
+        Some(p) if p.scope.whole() && p.role < crate::auth::Role::Write => bail!("permission denied for sequence {name}: nextval and setval are a writer's"),
         _ => Ok(()),
     }
 }

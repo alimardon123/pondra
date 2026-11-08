@@ -189,21 +189,21 @@ impl PruningStatistics for View<'_> {
 
 // ---------------------------------------------------------------- reading
 
-crate::per_node!(
-    /// Decompressed metadata objects, newest used kept, up to 256 MB (they never change), charged to the node's line,
-    /// which takes them back when it needs the memory (`kept`).
-    static CACHE: Arc<Mutex<crate::ledger::ByteLru<String, Arc<Vec<u8>>>>> = Arc::new(Mutex::new(crate::ledger::ByteLru::new(CACHE_BYTES))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+/// A lake's decompressed metadata objects (its tables' manifests and lists), newest used kept, up to 256 MB (they never
+/// change), charged to the lake's line, which takes them back when it needs the memory (`Lake::caches`). The lake's own
+/// (`Lake::manifests`): a path is the lake's, so two lakes in a process never share an entry.
+pub type Kept = Mutex<crate::ledger::ByteLru<String, Arc<Vec<u8>>>>;
 
-/// The tables' manifests and lists kept, as the node's line counts them (`cache_bytes{cache="manifests"}`).
-pub fn kept() -> Arc<dyn crate::ledger::Charged> { CACHE.clone() }
+/// A lake's empty cache of its manifests and lists (`Lake::open`).
+pub fn kept() -> Arc<Kept> { Arc::new(Mutex::new(crate::ledger::ByteLru::new(CACHE_BYTES))) }
 const CACHE_BYTES: usize = 256 << 20;
 
 async fn object(lake: &Lake, path: &str) -> Result<Arc<Vec<u8>>> {
-    if let Some(b) = CACHE.lock().unwrap().get(path) {
+    if let Some(b) = lake.manifests.lock().unwrap().get(path) {
         return Ok(b.clone());
     }
     let b = Arc::new(zstd::decode_all(&lake.object(path).await?[..])?);
-    let left = CACHE.lock().unwrap().put(path.to_string(), b.clone(), b.len());
+    let left = lake.manifests.lock().unwrap().put(path.to_string(), b.clone(), b.len());
     drop(left); // (let go of outside the lock)
     Ok(b)
 }
@@ -367,4 +367,30 @@ pub async fn unseal(lake: &Lake, table: &str, meta: &mut TableMeta, mut list: Ve
     }
     meta.garbage.extend(old.map(|o| (o.list, now)));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// A lake's manifests are its own (`Lake::manifests`): the same path in two lakes of one process reads each lake's object,
+    /// and what one lake reads is kept in its cache alone. (They were the node's, keyed by path alone: a second lake with an
+    /// object at the same path read the first one's.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_same_path_in_two_lakes_reads_each_lakes_own_object() -> anyhow::Result<()> {
+        use crate::ledger::Charged;
+        let dirs = [0, 1].map(|_| std::env::temp_dir().join(format!("pondra-manifests-{}", uuid::Uuid::new_v4())));
+        let a = crate::store::Lake::open(dirs[0].to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let b = crate::store::Lake::open(dirs[1].to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let path = "tables/t/list-of-a-test.zst";
+        for (lake, words) in [(&a, "a's"), (&b, "b's")] {
+            lake.put(path, zstd::encode_all(words.as_bytes(), 3)?).await?;
+        }
+        assert_eq!(super::object(&a, path).await?.as_slice(), b"a's");
+        assert!(a.manifests.held() > 0 && b.manifests.held() == 0, "a's read is kept in a's cache alone");
+        assert_eq!(super::object(&b, path).await?.as_slice(), b"b's", "b reads its own object at the same path");
+        for (lake, dir) in [a, b].into_iter().zip(&dirs) {
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        Ok(())
+    }
 }

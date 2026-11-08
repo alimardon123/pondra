@@ -4319,7 +4319,7 @@ def scale():
     iso = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     lake = new_lake()
     port = A.port
-    node = Node(lake, port, tier_secs=0.5).start()
+    node = Node(lake, port, tier_secs=0.5, env={"PONDRA_METRICS_TABLES": "on"}).start()  # (`ev`'s files below: a line for each table)
     q = lambda s, p=port: sql(p, s)
     refused = [_raises(lambda s=s: q(s)) for s in (
         "CREATE TABLE bad1 (id BIGINT, ts TIMESTAMP) WITH (partition_by = 'week(ts)')",
@@ -8520,7 +8520,7 @@ def hot():
     settle, with a query memory too small for a quarter of it to hold the table (`hot::Hot::new`)."""
     import re
     lake = new_lake()
-    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1"}).start()
+    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1", "PONDRA_METRICS_TABLES": "on"}).start()  # (`m`'s files below)
     q = lambda s: sql(A.port, s)
     skipped = lambda: float(g.group(1)) if (g := re.search(rb"\npondra_hot_batches_skipped_total (\S+)", call(A.port, "GET", "/metrics"))) else 0.0
     t0, n = 1767225600, 200000
@@ -18271,9 +18271,11 @@ def remembered():
     """The Postgres port answers a repeated query as HTTP does (`App::remembers`): the same text at the same
     catalog version, from any connection, runs once (`pondra_queries_total`), and a commit makes the next one
     run again with the new rows. Never what may answer otherwise: a transaction's reads (its own writes), now(),
-    random(), a temporary table, a session with a DataFusion setting; nor for a user granted some tables, who
-    is refused a table another user's remembered answer read. Each connection sends the answer in its own
-    formats (text, binary) and parameters are part of the text a prepared statement runs."""
+    random(), a temporary table, a session with a DataFusion setting. A user granted some tables has its answers
+    remembered under what it may read: it is refused a table another user's remembered answer read, as is a user
+    granted fewer columns, or one a REVOKE took the table from; and its key lookups are answered of the columns it may
+    read. Each connection sends the answer in its own formats (text, binary) and parameters are part of the text a
+    prepared statement runs."""
     import psycopg
     lake = new_lake()
     pg = A.port + 10
@@ -18363,6 +18365,57 @@ def remembered():
     ann_n = ann.execute("SELECT count(*) FROM r_t").fetchall()[0][0]
     info["a user granted r_t, asking what a superuser's answer read"] = refused
     checks["a user granted some tables is refused a table another user's remembered answer read (42501), and reads its own"] = boss_n == [2, 2] and refused == "42501" and ann_n == 1001
+
+    # 8. A user granted some tables has its own answers remembered, under what it may read (`rights::Scope::key`): asked
+    # again, run once. Another user granted fewer columns is refused the same text, as it would be; a REVOKE is another key,
+    # so the user revoked is refused too, never given what it was answered before. A key lookup answers a user what it
+    # may read, unplanned; a column it may not read is refused, with SELECT * too, over HTTP and the port.
+    import base64
+    hdr = lambda u, pw: {"Authorization": "Basic " + base64.b64encode(f"{u}:{pw}".encode()).decode()}
+    boss_h = hdr("r_boss", "boss-password-1")
+    ran = lambda: metrics_of(A.port, headers=boss_h).get("pondra_queries_total", 0)
+    for s in ["CREATE USER r_cat PASSWORD 'cat-password-1'", "GRANT SELECT (id) ON r_t TO r_cat", "CREATE TABLE r_kv (k BIGINT PRIMARY KEY, v VARCHAR, hidden VARCHAR)",
+              "INSERT INTO r_kv VALUES (1, 'one', 'h1'), (2, 'two', 'h2')", "GRANT SELECT (k, v) ON r_kv TO r_cat"]:
+        boss.execute(s)
+    cat = psycopg.connect(f"host=127.0.0.1 port={pg} user=r_cat password=cat-password-1 dbname=lake", autocommit=True)
+    def sqlstate(conn, s):
+        try:
+            conn.execute(s).fetchall()
+            return None
+        except psycopg.Error as e:
+            return e.sqlstate
+    def http(who, s):
+        try:
+            return call(A.port, "POST", "/sql", s.encode(), headers=who)
+        except Exception as e:
+            return f"ERROR {e}"
+    K = f"SELECT sum(amount) AS s FROM r_t WHERE id % 5 = 0 -- {uuid.uuid4()}"
+    before = ran()
+    kept = [ann.execute(K).fetchall() for _ in range(3)] + [http(hdr("r_ann", "ann-password-1"), K) for _ in range(2)]
+    runs = ran() - before
+    info["a user with grants, asking one query five times over the port and HTTP: runs"] = runs
+    checks["a user granted some tables asks one query again, over the port and HTTP: run once per door, the same answer"] = runs == 2 and kept[0] == kept[1] == kept[2] \
+        and kept[0][0][0] == 150752.0 and kept[3] == kept[4] == [{"s": 150752.0}]
+    fewer = (sqlstate(cat, K), http(hdr("r_cat", "cat-password-1"), K))
+    info["a user granted only r_t's id, asking the text another user's answer is kept for"] = fewer
+    checks["a user granted fewer columns is refused the text another user's answer is kept for (42501), over the port and HTTP"] = fewer[0] == "42501" and "permission denied" in str(fewer[1])
+    boss.execute("REVOKE SELECT ON r_t FROM r_ann")
+    revoked = (sqlstate(ann, K), http(hdr("r_ann", "ann-password-1"), K))
+    info["the user revoked, asking the text its own answer is kept for"] = revoked
+    checks["after a REVOKE the user is refused the text its own answer was kept for (42501), over the port and HTTP"] = revoked[0] == "42501" and "permission denied" in str(revoked[1])
+    boss.execute("GRANT SELECT ON r_t TO r_ann")
+    cat_h = hdr("r_cat", "cat-password-1")
+    before = ran()
+    looked = [cat.execute("SELECT k, v FROM r_kv WHERE k = 2").fetchall(), http(cat_h, "SELECT k, v FROM r_kv WHERE k = 1"), http(cat_h, "SELECT v FROM r_kv WHERE k = 2")]
+    planned = ran() - before
+    info["a key lookup by a user granted r_kv's k and v: planned"] = planned
+    checks["a key lookup by a user granted its columns is answered unplanned, over the port and HTTP"] = planned == 0 and looked == [[(2, "two")], [{"k": 1, "v": "one"}], [{"v": "two"}]]
+    hidden = [sqlstate(cat, "SELECT k, hidden FROM r_kv WHERE k = 2"), sqlstate(cat, "SELECT * FROM r_kv WHERE k = 2"),
+              http(cat_h, "SELECT k, hidden FROM r_kv WHERE k = 1"), http(cat_h, "SELECT * FROM r_kv WHERE k = 1"), http(cat_h, "SELECT v FROM r_kv WHERE k = 1 AND hidden = 'h1'")]
+    info["a key lookup of a column not granted"] = hidden
+    checks["a key lookup of a column it may not read is refused (42501), SELECT * too, over the port and HTTP"] = hidden[:2] == ["42501", "42501"] \
+        and all("permission denied" in str(h) and "hidden" in str(h) for h in hidden[2:])
+    cat.close(); ann.close(); boss.close()
 
     node.kill()
     ok = all(checks.values())
@@ -21776,20 +21829,23 @@ def registry():
 
 
 def connections():
-    """Connections (redesign step 4, pieces 2-4): a connection's files are written and read by its name, '@drop/…', in every
+    """Connections (redesign step 4, pieces 2-5): a connection's files are written and read by its name, '@drop/…', in every
     statement that takes a path (COPY … TO, FROM, a reader, a LOCATION, COPY INTO), through the store its definition makes,
     which follows ALTER CONNECTION. A user reads through it with READ on it, and no USAGE on any secret; a name that isn't a
-    connection, or one that holds tables, is refused by name."""
+    connection, or one that holds tables, is refused by name. A connection that holds tables is attached by its name
+    (ATTACH shop AS sales), read where the connection says, and kept while a database is attached over it."""
     import base64
     lake, drop, later = new_lake(), new_lake(), new_lake()
     kind = "s3" if A.s3 else "folder"  # (a folder's for a lake in a folder; in a bucket, the node's own credentials, lent)
-    node = Node(lake, A.port, admin_token="adm").start()
-    def as_(auth, q):
+    key = uuid.uuid4().hex
+    node = Node(lake, A.port, admin_token="adm", env={"PONDRA_OWNER_KEY": key}).start()
+    def as_(auth, q, more=None):
         try:
-            return call(A.port, "POST", "/sql", q.encode(), headers={"Authorization": auth})
+            return call(A.port, "POST", "/sql", q.encode(), headers={"Authorization": auth, **(more or {})})
         except Exception as e:
             return f"ERROR {e}"
     adm = lambda q: as_("Bearer adm", q)
+    own = lambda q: as_("Bearer adm", q, {"x-pondra-owner": key})  # (another engine's tables in a folder here are the node's owner's to read, as ATTACH's are)
     checks = {}
     made = adm(f"CREATE CONNECTION drop TYPE {kind} WITH (url = '{drop}')")
     wrote = [adm("COPY (SELECT 1 AS id, 'a' AS name UNION ALL SELECT 2, 'b') TO '@drop/out/rows.parquet'"),
@@ -21819,10 +21875,22 @@ def connections():
     adm("COPY (SELECT 9 AS id) TO '@drop/x.parquet'")
     moved = [adm("SELECT id FROM '@drop/x.parquet'"), adm(count)]
     checks["ALTER CONNECTION … SET (url = …): its paths follow it"] = moved[0] == [{"id": 9}] and "ERROR" in str(moved[1])
+    wh, wh2 = new_lake(), new_lake()
+    own(f"COPY (SELECT 1 AS id) TO '{wh}/s/t/' (FORMAT delta)")
+    own(f"COPY (SELECT 1 AS id UNION ALL SELECT 2) TO '{wh2}/s/t/' (FORMAT delta)")
+    adm(f"CREATE OR REPLACE CONNECTION shop TYPE delta WITH (url = '{wh}')")
+    tables = {"attached": adm("ATTACH shop AS sales"), "one": own("SELECT count(*) AS n FROM sales.s.t")}
+    adm(f"ALTER CONNECTION shop SET (url = '{wh2}')")
+    tables |= {"two": own("SELECT count(*) AS n FROM sales.s.t"), "shown": adm("SHOW CREATE DATABASE sales"), "kept": adm("DROP CONNECTION shop")}
+    adm("DETACH sales")
+    tables["dropped"] = adm("DROP CONNECTION shop")
+    checks["ATTACH shop AS sales: a connection's tables, read where it says, after ALTER CONNECTION too; DROP CONNECTION waits for DETACH"] = \
+        tables["one"] == [{"n": 1}] and tables["two"] == [{"n": 2}] and "ATTACH shop AS sales" in str(tables["shown"]) \
+        and "DETACH sales" in str(tables["kept"]) and "ERROR" not in str(tables["dropped"])
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"connections": checks, "ok": ok, "info": {"made": made, "wrote": wrote, "read": read, "csv": csv, "ext": ext, "loaded": loaded,
-                                                                "refused": refused, "granted": granted, "write": write, "nope": nope, "shop": shop, "moved": moved}}, indent=1, default=str))
+                                                                "refused": refused, "granted": granted, "write": write, "nope": nope, "shop": shop, "moved": moved, "tables": tables}}, indent=1, default=str))
     if not ok:
         sys.exit(1)
 
@@ -22043,6 +22111,129 @@ await db.close?.();"""
         sys.exit(1)
     return f"{sum(bool(v) for v in checks.values())} of {len(checks)} find checks"
 
+
+
+def listings():
+    """Step 6's gate for rights (`rights::Scope`): every door's listing shows a user with grants exactly the tables and views
+    it may read, and of a table granted in part only the columns granted; a superuser all of them. The doors' listings:
+    pondra.tables, pondra.objects, information_schema.tables and SHOW TABLES over HTTP, GET /objects, MCP's list_tables,
+    Iceberg REST's tables, Postgres's pg_class, pg_tables and information_schema.tables, Flight SQL's GetTables (ADBC's
+    get_objects), and pondra.find. Their columns: pondra.parts, Postgres's information_schema.columns and pg_attribute, MCP's
+    list_tables and Flight SQL's GetTables."""
+    import base64, psycopg
+    import adbc_driver_flightsql.dbapi as adbc
+    lake = new_lake()
+    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}", flight=f"127.0.0.1:{A.port + 30}").start()
+    basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+    boss = basic("boss", "boss-password-1")
+    def ask(auth, q, method="POST", path="/sql"):
+        try:
+            return call(A.port, method, path, q.encode() if isinstance(q, str) else q, headers={"Authorization": auth} if auth else {})
+        except Exception as e:
+            return f"ERROR {e}"
+    for q in ["CREATE SCHEMA sales", "CREATE TABLE sales.orders (id BIGINT, item VARCHAR, amount DOUBLE, card VARCHAR) WITH (publish = 'iceberg')",
+              "CREATE TABLE hr (id BIGINT, salary DOUBLE) WITH (publish = 'iceberg')", "CREATE TABLE notes (id BIGINT, text VARCHAR) WITH (publish = 'iceberg')",
+              "INSERT INTO sales.orders VALUES (1, 'tea', 2.5, '4111')", "INSERT INTO hr VALUES (1, 100.0)", "INSERT INTO notes VALUES (1, 'hello')",
+              "CREATE VIEW sales.cards AS SELECT id, card FROM sales.orders", "CREATE VIEW pay AS SELECT salary FROM hr", "CREATE VIEW items AS SELECT id, item FROM sales.orders",
+              "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:
+        ask(None, q)
+    for q in ["CREATE USER ann PASSWORD 'ann-password-1'", "CREATE ROLE analyst", "GRANT SELECT (id, item, amount) ON sales.orders TO analyst", "GRANT analyst TO ann",
+              "GRANT SELECT ON notes TO public", "GRANT SELECT ON items TO ann"]:
+        ask(boss, q)
+    # (what each may read: ann, notes (public's grant), three columns of sales.orders (its role's) and the view items (its own); not hr,
+    # pay or sales.cards, nor sales.orders' card)
+    tables = {"ann": {("public", "notes"), ("sales", "orders")}, "boss": {("public", "notes"), ("sales", "orders"), ("public", "hr")}}
+    views = {"ann": {("public", "items")}, "boss": {("public", "items"), ("public", "pay"), ("sales", "cards")}}
+    columns = {"ann": {("orders", "id"), ("orders", "item"), ("orders", "amount"), ("notes", "id"), ("notes", "text")},
+               "boss": {("orders", "id"), ("orders", "item"), ("orders", "amount"), ("orders", "card"), ("notes", "id"), ("notes", "text"), ("hr", "id"), ("hr", "salary")}}
+    # (pondra.find of item, card and salary: the columns so named it may read, an object so named, and, for a caller shown
+    # definitions, an object whose definition names it; a table granted in part has none to show)
+    item = {("column", "orders", "item"), ("column", "items", "item"), ("view", "items", "items")}
+    found = {"ann": item, "boss": item | {("table", "orders", "orders"), ("column", "orders", "card"), ("column", "cards", "card"), ("view", "cards", "cards"),
+                                          ("column", "hr", "salary"), ("column", "pay", "salary"), ("table", "hr", "hr"), ("view", "pay", "pay")}}
+    ours = lambda pairs: {(s, t) for s, t in pairs if s in ("public", "sales")}
+    def listed(who, password):
+        auth = basic(who, password)
+        def rows(q, f):
+            r = ask(auth, q)
+            return {f(x) for x in r} if isinstance(r, list) else str(r)[:300]
+        def pg(q):
+            try:
+                with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user={who} password={password} dbname=lake", connect_timeout=10) as c:
+                    return set(c.execute(q).fetchall())
+            except Exception as e:
+                return f"ERROR {e}"
+        def flight():
+            try:
+                conn = adbc.connect(f"grpc://127.0.0.1:{A.port + 30}", db_kwargs={"username": who, "password": password})
+                try:
+                    got = conn.adbc_get_objects(depth="all").read_all().to_pylist()
+                finally:
+                    conn.close()
+                return [(s["db_schema_name"], t["table_name"], t["table_type"], c["column_name"]) for g in got for s in g["catalog_db_schemas"] for t in (s["db_schema_tables"] or []) for c in (t["table_columns"] or [])]
+            except Exception as e:
+                return f"ERROR {e}"
+        def mcp():
+            r = ask(auth, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_tables", "arguments": {}}}), path="/mcp")
+            try:
+                return json.loads(r["result"]["content"][0]["text"])["tables"]
+            except Exception:
+                return str(r)[:300]
+        def iceberg():
+            got = set()
+            for ns in ("default", "sales"):
+                r = ask(auth, b"", method="GET", path=f"/v1/namespaces/{ns}/tables")
+                if not isinstance(r, dict):
+                    return str(r)[:300]
+                got |= {("public" if i["namespace"] == ["default"] else i["namespace"][0], i["name"]) for i in r["identifiers"]}
+            return got
+        def finds(rows):
+            got = [rows(f"SELECT kind, object, name FROM pondra.find('{w}') WHERE kind IN ('column', 'view', 'table')", lambda x: (x["kind"], x["object"], x["name"])) for w in ("item", "card", "salary")]
+            return next((g for g in got if isinstance(g, str)), None) or set().union(*got)
+        objects = ask(auth, b"", method="GET", path="/objects")
+        by_flight, by_mcp = flight(), mcp()
+        split = lambda n: ("sales", n[6:]) if n.startswith("sales.") else ("public", n)
+        return {
+            "tables": {
+                "pondra.tables": rows("SELECT schema, name FROM pondra.tables", lambda x: (x["schema"], x["name"])),
+                "pondra.objects": rows("SELECT schema, name FROM pondra.objects WHERE kind IN ('table', 'view')", lambda x: (x["schema"], x["name"])),
+                "information_schema.tables": rows("SELECT table_schema AS s, table_name AS t FROM information_schema.tables WHERE table_schema IN ('public', 'sales')", lambda x: (x["s"], x["t"])),
+                "SHOW TABLES": rows("SHOW TABLES", lambda x: (x["table_schema"], x["table_name"])),
+                "GET /objects": {(o["schema"], o["name"]) for o in objects["objects"]} if isinstance(objects, dict) else str(objects)[:300],
+                "MCP list_tables": {split(t["table"]) for t in by_mcp} if isinstance(by_mcp, list) else by_mcp,
+                "Postgres pg_class": pg("SELECT n.nspname, c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname IN ('public', 'sales') AND c.relkind IN ('r', 'v', 'm')"),
+                "Postgres information_schema.tables": pg("SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema IN ('public', 'sales')"),
+                "Flight SQL GetTables": {(s, t) for s, t, _, _ in by_flight} if isinstance(by_flight, list) else by_flight,
+            },
+            "only tables": {
+                "Postgres pg_tables": pg("SELECT schemaname, tablename FROM pg_catalog.pg_tables WHERE schemaname IN ('public', 'sales')"),
+                "Iceberg REST": iceberg(),
+            },
+            "columns": {
+                "pondra.parts": rows("SELECT object, name FROM pondra.parts WHERE kind = 'column' AND object IN ('orders', 'notes', 'hr')", lambda x: (x["object"], x["name"])),
+                "Postgres information_schema.columns": pg("SELECT table_name, column_name FROM information_schema.columns WHERE table_name IN ('orders', 'notes', 'hr')"),
+                "Postgres pg_attribute": pg("SELECT c.relname, a.attname FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON a.attrelid = c.oid WHERE c.relname IN ('orders', 'notes', 'hr') AND a.attnum > 0"),
+                "MCP list_tables": {(split(t["table"])[1], c["name"]) for t in by_mcp for c in t.get("columns", [])} if isinstance(by_mcp, list) else by_mcp,
+                "Flight SQL GetTables": {(t, c) for _, t, k, c in by_flight if k == "TABLE"} if isinstance(by_flight, list) else by_flight,
+            },
+            "pondra.find": finds(rows),
+        }
+    checks, info = {}, {}
+    for who, password in [("ann", "ann-password-1"), ("boss", "boss-password-1")]:
+        got = listed(who, password)
+        info[who] = {part: {door: sorted(v) if isinstance(v, set) else v for door, v in doors.items()} if isinstance(doors, dict) else sorted(doors) if isinstance(doors, set) else doors for part, doors in got.items()}
+        role = "a user with grants" if who == "ann" else "a superuser"
+        for door, v in got["tables"].items():
+            checks[f"{door} shows {role} exactly the tables and views it may read"] = isinstance(v, set) and ours(v) == tables[who] | views[who]
+        for door, v in got["only tables"].items():
+            checks[f"{door} shows {role} exactly the tables it may read"] = v == tables[who]
+        for door, v in got["columns"].items():
+            checks[f"{door} shows {role} exactly the columns it may read"] = v == columns[who]
+        checks[f"pondra.find finds for {role} exactly the objects and columns it may read"] = got["pondra.find"] == found[who]
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"listings": checks, "ok": ok, **({} if ok else {"info": info})}, indent=1, default=str))
+    return ok
 
 def measures():
     """Measures in views (ADR-065 §3, L5-3): `AS MEASURE` in a view's SELECT, `MEASURE(m)` at each query's own grain, against the GROUP BY written by hand, at every door; the refusals; what it costs."""
@@ -24125,6 +24316,9 @@ def use_path():
     sql(A.port, "INSERT INTO crm.w VALUES (1, 'x'), (2, 'x')")
     sql(A.port, "CREATE VIEW crm.here AS SELECT current_schema() AS s")
     on_follower = lambda body: call(A.port + 1, "POST", "/sql", body, headers=f)
+    # (once the follower has the view: until then it can't tell the view says current_schema(), and the leader reads it
+    # as public's, `path::session_view`)
+    until(lambda: _try(lambda: on_follower(b"SELECT s FROM here")), [{"s": "crm"}], 15)
     on_follower(b"UPDATE w SET s = (SELECT s FROM here) WHERE id = 1")
     on_follower(b"MERGE INTO w USING (SELECT 2 AS id, s FROM here) AS src ON w.id = src.id WHEN MATCHED THEN UPDATE SET s = src.s || '-m'")
     info["follower's change through a view"] = sql(A.port, "SELECT id, s FROM crm.w ORDER BY id")
@@ -29493,7 +29687,7 @@ SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 175, "scal
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, connections, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, onerow, jsonfns, recursive, extensions, synced, agents)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, connections, find, listings, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, onerow, jsonfns, recursive, extensions, synced, agents)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -29694,7 +29888,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "onerow", "jsonfns", "recursive", "extensions", "synced", "agents"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "listings", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "onerow", "jsonfns", "recursive", "extensions", "synced", "agents"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -29707,7 +29901,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "onerow": onerow, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "listings": listings, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "onerow": onerow, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

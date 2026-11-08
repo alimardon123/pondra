@@ -441,7 +441,7 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
         let name = r.str()?;
         let meta = app.lake.cat.meta(&table_key(&name)).await?; // (the stored entry: its JSON fields are SQL's names too, ADR-022)
         let rules = meta.as_ref().map(|m| m.rules());
-        let not_yours = format!("this {} may not write {name}", if who.access.is_some() { "user" } else { "token" });
+        let not_yours = format!("this {} may not write {name}", if who.scope.whole() { "token" } else { "user" });
         let may = crate::writer::may(Some(who), &crate::auth::catalog_name(&name), None, false).map_err(|e| e.to_string()); // (the row doors' one check)
         let mut parts = vec![];
         for _ in 0..r.len()? {

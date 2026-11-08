@@ -145,7 +145,7 @@ fn sqlstate(code: tonic::Code) -> &'static str {
 /// every door tells them (`codes::answer`).
 fn status(e: impl Into<anyhow::Error>) -> Status {
     let e = e.into();
-    let (_, code, words) = crate::codes::answer(&e, crate::auth::shows_code()); // (the code and words every door gives)
+    let (_, code, words) = crate::codes::answer(&e, crate::rights::scope().shows_code()); // (the code and words every door gives)
     let mut s = Status::new(grpc(code), words);
     s.metadata_mut().insert("x-pondra-sqlstate", tonic::metadata::MetadataValue::from_static(code));
     s
@@ -369,7 +369,7 @@ impl Wire for FlightWire {
     fn kept_as(&self) -> Option<Cow<'_, str>> { Some(Cow::Borrowed("arrow")) }
     fn encode(&self, rows: Vec<RecordBatch>) -> anyhow::Result<(Option<bytes::Bytes>, Encoded)> {
         let small = !rows.is_empty() && rows.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= crate::app::Results::BIGGEST;
-        let keep = small.then(|| crate::answer::render(&rows, Some("arrow"), crate::pages::keep)).transpose()?;
+        let keep = small.then(|| crate::answer::render(&rows, Some("arrow"), &|_| None)).transpose()?; // (Arrow keeps nothing for pages: only a typed answer does)
         Ok(match keep {
             Some(bytes) => (Some(bytes.clone()), Encoded::Kept(bytes)),
             None => (None, Encoded::Rows(rows)),
@@ -1070,15 +1070,21 @@ impl FlightSqlService for Sql {
 
     async fn do_get_tables(&self, q: CommandGetTables, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
         allowed(&self.0, &req, Role::Read)?;
-        let (mut b, lake) = (q.into_builder(), &self.0.lake);
+        let (mut b, lake, scope) = (q.into_builder(), &self.0.lake, crate::rights::scope());
+        // (a user's: the tables and views it may read, and of one granted in part those columns, as every listing: S27)
+        let reads = |shown: &Option<std::collections::HashSet<String>>, c: &str| shown.as_ref().is_none_or(|s| s.contains(c));
         for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
+            let Some(shown) = scope.columns(&key[2..]) else { continue };
             let (schema, table) = crate::text::split(&key[2..]);
-            let columns = crate::answer::schema(&meta.sql_columns()).map_err(status)?; // (SQL's order)
+            let columns: Vec<_> = meta.sql_columns().into_iter().filter(|(c, _)| reads(&shown, c)).collect();
+            let columns = crate::answer::schema(&columns).map_err(status)?; // (SQL's order)
             b.append(crate::ddl::lake_name(lake), schema, table, "TABLE", &columns).map_err(status)?;
         }
         for (key, _) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await.map_err(status)? {
+            let Some(shown) = scope.columns(&key[2..]) else { continue };
             let (schema, view) = crate::text::split(&key[2..]);
             if let Ok(columns) = plan_schema(&self.0, &format!("SELECT * FROM {}", crate::write::sql_name(&key[2..]))).await {
+                let columns = Schema::new(columns.fields().iter().filter(|f| reads(&shown, f.name())).cloned().collect::<Vec<_>>());
                 b.append(crate::ddl::lake_name(lake), schema, view, "VIEW", &columns).map_err(status)?;
             }
         }
@@ -1290,7 +1296,7 @@ mod tests {
         let strings: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
         let view: ArrayRef = Arc::new(StringViewArray::from(vec!["x", "y"]));
         let batch = RecordBatch::try_new(Arc::new(plan), vec![cast(&strings, &dict)?, view])?;
-        let kept = crate::answer::render(&[batch.clone()], Some("arrow"), |_| None)?;
+        let kept = crate::answer::render(&[batch.clone()], Some("arrow"), &|_| None)?;
         let a: Vec<FlightData> = sent_as_kept(kept, crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
         let b: Vec<FlightData> = whole(Arc::new(first_announced(&[batch.clone()])), vec![batch], crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
         assert_eq!(a.len(), b.len());

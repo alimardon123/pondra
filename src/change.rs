@@ -331,7 +331,7 @@ impl Merge {
         }
         let plain = |c: &str| c != "_deleted" && !crate::text::NAMES.contains(&c) && stored.columns().any(|(n, _)| n == c);
         let distinct = |cs: &[String]| cs.iter().enumerate().all(|(i, c)| !cs[..i].contains(c));
-        if !crate::txn::point_table(name, stored) || stored.ttl.is_some() || !stored.ids || crate::constraints::checked(stored) || crate::auth::limited().is_some() {
+        if !crate::txn::point_table(name, stored) || stored.ttl.is_some() || !stored.ids || crate::constraints::checked(stored) || !crate::rights::scope().whole() {
             return None;
         }
         let width = u.row?;

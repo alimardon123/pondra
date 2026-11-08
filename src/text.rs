@@ -125,17 +125,32 @@ pub fn control(sql: &str) -> Option<&'static str> {
 #[cfg_attr(not(feature = "lake"), allow(dead_code))]
 pub(crate) fn text(stmts: &[Statement]) -> String { stmts.iter().map(sql).collect::<Vec<_>>().join(";\n") }
 
+/// `stmts` as SQL text (`text`), kept as that text's parse (`parsed::keep`) when each prints as itself: the next look and
+/// the engine (`engine::planned`) take the tree rather than parse the text again (step 8's one parse). A statement written
+/// with a fix for the reader (a doubled minus, a macro's `()`) parses back to another tree: then the text is parsed again.
+pub(crate) fn text_kept(stmts: Vec<Statement>) -> String {
+    let parts = stmts.iter().map(printed).collect::<Vec<_>>();
+    let text = parts.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join(";\n");
+    if parts.iter().all(|(_, itself)| *itself) {
+        crate::parsed::keep(&text, stmts);
+    }
+    text
+}
+
 /// A statement as SQL text again. sqlparser writes `- -3` (or `- $x`, `$x` bound to -3) as `--3`,
 /// which reads back as a comment, so a minus before anything written with a minus first gets
 /// parentheses.
-pub fn sql(s: &Statement) -> String {
+pub fn sql(s: &Statement) -> String { printed(s).0 }
+
+/// A statement as SQL text (`sql`), and whether that is its own `Display`: false when the text has a fix for the reader.
+fn printed(s: &Statement) -> (String, bool) {
     // (sqlparser writes a macro with no parameters as `CREATE MACRO m AS …`, which it doesn't read back: its `()` kept)
     if let Statement::CreateMacro { args: None, .. } = s {
         let mut s = s.clone();
         if let Statement::CreateMacro { args, .. } = &mut s {
             *args = Some(vec![]);
         }
-        return sql(&s);
+        return (printed(&s).0, false);
     }
     let twice = |e: &Expr| matches!(e, Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } if expr.to_string().starts_with('-'));
     let mut doubled = false;
@@ -144,7 +159,7 @@ pub fn sql(s: &Statement) -> String {
         ControlFlow::<()>::Continue(())
     });
     if !doubled {
-        return s.to_string();
+        return (s.to_string(), true);
     }
     let mut s = s.clone();
     let _ = crate::walk::visit_expressions_mut(&mut s, |e| {
@@ -153,7 +168,7 @@ pub fn sql(s: &Statement) -> String {
         }
         ControlFlow::<()>::Continue(())
     });
-    s.to_string()
+    (s.to_string(), false)
 }
 
 pub const PUBLIC: &str = "public";
@@ -289,6 +304,19 @@ pub const JSON_MAKERS: &[&str] = &["to_json", "to_jsonb", "row_to_json", "json_b
 pub fn makes_json(sql: &str) -> bool {
     static CALL: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(&format!(r"(?i)\b(?:{})\s*\(", JSON_MAKERS.join("|"))).expect("a regex"));
     CALL.is_match(sql)
+}
+
+/// The front's pass for `names_a_type` (`passes.rs`): triggered by an array type's `[]`, a set function, a JSON maker, `||`,
+/// a string, `::`, a cast, and the enum functions.
+pub(crate) fn types_pass() -> crate::passes::Pass {
+    let mut words = vec!["generate_series", "range", "unnest", "enum_range", "enum_first", "enum_last", "pg_typeof", "cast", "try_cast", "safe_cast"];
+    for j in ["json", "jsonb"] {
+        for f in ["array_elements", "array_elements_text", "each", "each_text", "object_keys", "to_record", "to_recordset"] {
+            words.push(Box::leak(format!("{j}_{f}").into_boxed_str()));
+        }
+    }
+    words.extend(JSON_MAKERS.iter().copied());
+    crate::passes::Pass { name: "text.names_a_type", order: 80, words, marks: vec![&["[]"], &["||"], &["'"], &["::"]], run: crate::passes::Run::Wants(names_a_type) }
 }
 
 /// Could `sql` name a type of one's own, in a cast or one of the enum functions? (Only then is

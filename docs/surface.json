@@ -431,6 +431,7 @@
   "pondra_table_entry_bytes",
   "pondra_table_files",
   "pondra_table_rows",
+  "pondra_tables",
   "pondra_untiered_rows",
   "pondra_visible_segment",
   "pondra_wire_bytes_total"

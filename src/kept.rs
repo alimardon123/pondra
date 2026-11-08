@@ -258,6 +258,14 @@ pub fn pipeline_part(word: &str, next: Option<&str>) -> Option<&'static str> {
 /// the name a Flight server's function is registered under (`POST /functions/<name>`).
 pub fn function_named(name: &str) -> Option<&'static str> { FUNCTIONS.iter().find(|(kept, _)| name.eq_ignore_ascii_case(kept)).map(|(_, says)| *says) }
 
+/// The front's pass of this module (`passes.rs`): `refused`, triggered by a statement's first word, a kept type's name, or
+/// a kept function's (a lock's `advisory`, `pg_notify`).
+pub(crate) fn pass() -> crate::passes::Pass {
+    let words = HEADS.iter().copied().chain(["step", "parallel", "wait"]).chain(TYPES.iter().map(|(n, _)| *n)).collect();
+    let marks = ["advisory", "pg_notify"].into_iter().chain(FUNCTIONS.iter().map(|(n, _)| *n)).map(|m| -> &'static [&'static str] { Box::leak(Box::new([m])) }).collect();
+    crate::passes::Pass { name: "kept.refused", order: 10, words, marks, run: crate::passes::Run::Refuse(refused) }
+}
+
 /// The refusal for `sql` (0A000) if it is one of 1.1's statements: `refusal`, as an error every door answers.
 pub fn refused(sql: &str) -> anyhow::Result<()> {
     match refusal(sql) {
