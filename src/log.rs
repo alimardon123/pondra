@@ -442,7 +442,7 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                 let mut kept = vec![];
                 for a in pending.drain(..) {
                     let rows = BTreeMap::from([(a.table.clone(), vec![a.batch.clone()])]);
-                    match crate::views::derive(lake, &rows).await {
+                    match crate::views::derive(lake, &rows, &BTreeMap::new()).await {
                         Err(e) if crate::views::refused(&e) => drop(a.ack.send(Err(format!("{e:#}").into()))),
                         _ => kept.push(a),
                     }
@@ -502,11 +502,12 @@ pub fn moved(table: &str) -> String {
 }
 
 /// Encode the producers' batches and their views' output into one flush.
-pub async fn pack(lake: &Lake, pending: &[Append]) -> Result<Flush> { pack_with(lake, pending, BTreeMap::new()).await }
+pub async fn pack(lake: &Lake, pending: &[Append]) -> Result<Flush> { pack_with(lake, pending, BTreeMap::new(), BTreeMap::new()).await }
 
 /// `pack`, the views deriving from `followed` too: rows a file commit puts into tables (and a
-/// change's old ones, under `{t}$deleted`), which the flush doesn't carry itself.
-pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<String, Vec<RecordBatch>>) -> Result<Flush> {
+/// change's old ones, under `{t}$deleted`), which the flush doesn't carry itself; `followed_by`, the
+/// producer whose commit put each table's there (`job:{job}`), as an append's is its `src.producer`.
+pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<String, Vec<RecordBatch>>, followed_by: BTreeMap<String, String>) -> Result<Flush> {
     let (mut data, mut parts) = (vec![], vec![]);
     let mut add = |table: &str, batch: &RecordBatch, src: Option<Src>, placed: Option<u64>| -> Result<()> {
         let off = data.len() as u64;
@@ -516,6 +517,8 @@ pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<Strin
         parts.push(Part { table: table.into(), off, len: data.len() as u64 - off, rows: batch.num_rows() as u64, src, placed });
         Ok(())
     };
+    // (each batch's producer, in its place: a view names the run its dropped rows came with, `views::derive`)
+    let mut by: BTreeMap<String, Vec<String>> = followed.iter().map(|(t, b)| (t.clone(), vec![followed_by.get(t).cloned().unwrap_or_default(); b.len()])).collect();
     let mut by_table = followed;
     let mut metas: BTreeMap<String, Option<Arc<TableMeta>>> = BTreeMap::new(); // (the log keeps columns under their stored names: ADR-022)
     for a in pending {
@@ -528,8 +531,9 @@ pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<Strin
         };
         add(&a.table, &stored, Some(a.src.clone()), a.placed)?;
         by_table.entry(a.table.clone()).or_default().push(a.batch.clone());
+        by.entry(a.table.clone()).or_default().push(a.src.producer.clone());
     }
-    for (table, batch) in crate::views::derive(lake, &by_table).await? {
+    for (table, batch) in crate::views::derive(lake, &by_table, &by).await? {
         add(&table, &batch, None, None)?;
     }
     let mut f = Flush { parts, ..Default::default() };

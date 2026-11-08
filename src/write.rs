@@ -257,6 +257,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             m.order = order.or(m.order);
             m.properties = properties.unwrap_or(m.properties);
             m.retention_secs = retention.or(m.retention_secs);
+            if reretain {
+                crate::rejects::retain(lake, retention).await?; // (its dropped rows are held as long: `pondra.rejects`)
+            }
             if let Some(publish) = publish.filter(|_| republish) {
                 let dropped: Vec<String> = m.publish.iter().filter(|f| !publish.contains(f)).cloned().collect();
                 m.publish = publish;

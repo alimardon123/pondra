@@ -667,23 +667,8 @@ pub(crate) enum For {
     Public,
 }
 
-/// A page's store of a web origin (`web_with`), on wasm32 only.
-#[cfg(target_arch = "wasm32")]
-pub type Web = Box<dyn Fn(&str) -> Arc<dyn object_store::ObjectStore> + Send + Sync>;
-#[cfg(target_arch = "wasm32")]
-static WEB: std::sync::OnceLock<Web> = std::sync::OnceLock::new();
-
-/// Gives a page's store of a web origin, the browser's `fetch` (web/'s `fetch.rs`), which `build` uses for an http(s) URL
-/// with no bearer token. A browser's server may hide `Content-Range` and lists no folder (WebDAV's PROPFIND), where
-/// object_store's HTTP client needs both: the page's store reads a part from the range it asked and refuses a listing by
-/// name. Set once per module; a later call changes nothing.
-#[cfg(target_arch = "wasm32")]
-pub fn web_with(web: Web) {
-    let _ = WEB.set(web);
-}
-
 /// A page's store of its blob URLs, the tab's own files (web/'s `fetch.rs`, `Blob`): one store for every blob, since a blob's
-/// stand-in names its URL (`ext_names::blob_of`). Set once per module, as `web_with` is.
+/// stand-in names its URL (`ext_names::blob_of`). Set once per module.
 #[cfg(target_arch = "wasm32")]
 static BLOB: std::sync::OnceLock<Arc<dyn object_store::ObjectStore>> = std::sync::OnceLock::new();
 
@@ -785,9 +770,9 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
             Arc::new(b.build()?)
         }
         "http" | "https" => {
-            #[cfg(target_arch = "wasm32")]
-            if let (None, Some(web)) = (get("bearer_token"), WEB.get()) {
-                return Ok(web(&url.origin().ascii_serialization())); // (a page's own fetch: `web_with`)
+            // (a web address with no secret of its own, where the platform reads one itself: a page, through its browser's fetch)
+            if let (None, Some(web)) = (get("bearer_token"), crate::net::process().web(policy, &url.origin().ascii_serialization())) {
+                return Ok(web);
             }
             let mut options = object_store::ClientOptions::new().with_allow_http(url.scheme() == "http");
             let mut headers = object_store::HeaderMap::new();

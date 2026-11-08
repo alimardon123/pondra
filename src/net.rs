@@ -43,6 +43,12 @@ pub trait Net: Send + Sync {
     /// bearer token): a store a reader's own temporary secret makes is `Public`'s, any other the admin's (`Endpoint`).
     /// A lake's own bucket has the lake's budget instead (`budget::Budget`).
     fn connector(&self, policy: Policy, headers: reqwest::header::HeaderMap) -> StoreConnector { StoreConnector(Arc::new(Connector { policy, headers })) }
+
+    /// The store of a web origin (`https://host`, with no secret of its own) through the platform's own fetch, where it has
+    /// one: a page's, whose browser's server may hide `Content-Range` and lists no folder (WebDAV's PROPFIND), where
+    /// object_store's HTTP client needs both (web/'s `fetch.rs`). None by default: a node reads a web URL with
+    /// object_store's HTTP client on `connector`'s (`ext::build`).
+    fn web(&self, _policy: Policy, _origin: &str) -> Option<Arc<dyn object_store::ObjectStore>> { None }
 }
 
 /// A store's connector from a `Net` (`Net::connector`), as object_store's builders take one.
