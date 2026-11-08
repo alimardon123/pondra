@@ -3056,6 +3056,7 @@ dependencies = [
  "js-sys",
  "object_store 0.14.2",
  "pondra",
+ "reqwest",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",

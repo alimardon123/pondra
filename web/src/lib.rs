@@ -12,6 +12,7 @@ mod device;
 mod fetch;
 mod heap;
 mod js;
+mod net;
 mod node;
 mod opfs;
 mod spill;
@@ -311,14 +312,14 @@ fn joined_keys_refused(opts: &JsValue) -> Result<(), JsValue> {
 
 const GIB: f64 = (1u64 << 30) as f64;
 
-/// Sets the panic hook once: a panic says why, not just "unreachable". It gives the core the page's store of a web origin
-/// too (`fetch.rs`): a statement that names a web address reads it through the browser's `fetch`, in every page, and the
-/// core keeps the first store given. And the page's store of its blob URLs, the tab's own files (`fetch::Blob`).
+/// Sets the panic hook once: a panic says why, not just "unreachable". It installs the page's `Net` too (`net.rs`): every
+/// call out, and a statement that names a web address, goes through the browser's `fetch`, in every page. And it gives the
+/// core the page's store of its blob URLs, the tab's own files (`fetch::Blob`).
 fn set_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| {
         std::panic::set_hook(Box::new(|p| error(&p.to_string())));
-        pondra::page::web_with(Box::new(|origin: &str| Arc::new(fetch::Fetch::new(origin)) as Arc<dyn object_store::ObjectStore>));
+        net::install();
         pondra::page::blob_with(Arc::new(fetch::Blob));
     });
 }
