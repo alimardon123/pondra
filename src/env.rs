@@ -123,7 +123,12 @@ pub fn or<T: FromStr>(name: &str, default: T) -> T {
 /// A setting in GB (fractions too) as bytes of 2^30, or None when it isn't set: the one conversion every memory setting
 /// shares, so `PONDRA_MEMORY_GB=2` is the same 2 GiB wherever it is read.
 pub fn gib(name: &str) -> Option<usize> {
-    parse::<f64>(name).map(|gb| (gb * (1u64 << 30) as f64) as usize)
+    parse::<f64>(name).map(gb_bytes)
+}
+
+/// GB (fractions too) as bytes of 2^30: `gib`'s conversion, and a node's own settings' (`settings::Values::gib`).
+pub(crate) fn gb_bytes(gb: f64) -> usize {
+    (gb * (1u64 << 30) as f64) as usize
 }
 
 /// The memory line in bytes, past which the watch stops the query that grew memory: `PONDRA_MEMORY_MAX_GB`, else the form's
@@ -152,7 +157,7 @@ pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
 /// holds its buffers and its operators to one number. A cache given a budget of its own (`PONDRA_HOT_GB`, `PONDRA_CACHE_MB`)
 /// keeps it beside the line (`ledger::Charged::inside`). Unset, the whole line is the memory watch's trim line, and the queries
 /// may hold all of it too, the caches giving way (`store::root_whole`); on either line, a spiller they don't make room for
-/// spills.
+/// spills. This is the process's, for a reader with no node at hand: a node's budget reads its own (`store::lake_pool`).
 pub fn memory_whole() -> Option<usize> {
     gib("PONDRA_MEMORY_GB")
 }
