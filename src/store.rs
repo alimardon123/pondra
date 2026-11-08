@@ -1890,7 +1890,7 @@ impl std::fmt::Debug for Lake {
 /// q67's last aggregation 8 times at SF10 on 15 GB: 12.6 s, against 5.7 s at 10 GB and DataFusion's 6.3 s.)
 #[cfg(not(target_arch = "wasm32"))]
 pub fn memory_limit() -> usize {
-    crate::env::query_memory(|| crate::oom::trim_line().unwrap_or(4 << 30))
+    crate::env::query_memory(|| Some(whole_line()).filter(|&w| w < usize::MAX).unwrap_or(4 << 30))
 }
 
 crate::per_node!(
