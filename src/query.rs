@@ -1757,7 +1757,7 @@ pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(ctx: &Sessi
         Err(crate::panics::Stopped::Again) if handed().is_none() => stopped = true, // (the watch stopped the first try, and its memory has gone)
         Err(_) => {
             // (stopped on its first try and not run again: its memory stayed over the line, or half its answer was sent)
-            crate::metrics::add(&crate::metrics::STOPPED_FOR_MEMORY, 1);
+            crate::panics::stopped_for_memory(); // (on the request's node)
             anyhow::bail!(crate::oom::OOM)
         }
     }
