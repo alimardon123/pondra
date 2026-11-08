@@ -482,7 +482,7 @@ pub async fn call(app: &App, name: &str, args: &[FunctionArg], who: Who) -> Resu
         select.push(format!("CAST(({}) AS VARCHAR) AS message", given[1]));
     }
     select.extend(a.named.iter().map(|(n, e)| format!("({e}) AS {n}")));
-    let rows = app.query(&format!("SELECT {}", select.join(", ")), None).await?;
+    let rows = app.query(&format!("SELECT {}", select.join(", ")), None, &who.scope).await?;
     let v = crate::apply::rows_json(&rows, 1)?.into_iter().next().unwrap_or_default();
     let folder = folder_of(v["folder"].as_str().unwrap_or_default())?;
     if verb != "git_status" {

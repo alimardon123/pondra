@@ -641,7 +641,8 @@ impl Page {
         let who = lake_principal();
         let format = p.format.clone();
         let asked = map.clone(); // (a stop fails the session the statement ran in: the headers name it, `failed_for_memory`)
-        let said = match crate::panics::work(&paged.app.lake.node, true, crate::auth::WHO.scope(who, Box::pin(crate::statement::sql(paged.app.clone(), p, crate::auth::Role::Admin, map, body)))).await {
+        let scope = who.scope.clone();
+        let said = match crate::panics::work(&paged.app.lake.node, true, crate::auth::WHO.scope(who, Box::pin(crate::statement::sql(paged.app.clone(), p, crate::auth::Role::Admin, scope, map, body)))).await {
             Ok(said) => said,
             Err(words) => {
                 if words == crate::oom::OOM || words == crate::oom::PAGE_OOM {

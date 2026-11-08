@@ -63,8 +63,8 @@ fn names_catalog(sql: &str) -> bool {
 /// A query over Postgres's catalog, as the Postgres port answers it: the catalog's tables and functions in
 /// its session, `user` as `current_user`, and over tables that are always empty, no rows with the columns
 /// asked for (whatever DataFusion made of it). `sql` is as `rewrite` left it.
-pub async fn answer(lake: &Lake, sql: &str, user: &str) -> Result<Vec<RecordBatch>> {
-    let ctx = crate::query::session(lake, sql, "").await?;
+pub async fn answer(lake: &Lake, sql: &str, user: &str, scope: &crate::rights::Scope) -> Result<Vec<RecordBatch>> {
+    let ctx = crate::query::session_for(lake, sql, "", None, scope).await?;
     register(&ctx, lake, user, sql).await?;
     match async { crate::engine::collect(crate::engine::sql(&ctx, sql).await?).await }.await { // (no rows: its columns as they run)
         Ok(batches) => Ok(batches),
@@ -77,10 +77,10 @@ pub async fn answer(lake: &Lake, sql: &str, user: &str) -> Result<Vec<RecordBatc
 
 /// `answer` for a request over HTTP that speaks Postgres (`asked`): its SQL rewritten as the port rewrites
 /// it, its principal as `current_user`, the session's schema as `current_schema()`.
-pub async fn over_http(lake: &Lake, sql: &str) -> Result<Vec<RecordBatch>> {
+pub async fn over_http(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Result<Vec<RecordBatch>> {
     let user = crate::auth::name();
     let schema = crate::path::current(lake).map_or_else(|| "public".to_string(), |p| p.schema().to_string());
-    answer(lake, &rewrite(sql, &user, &schema), &user).await
+    answer(lake, &rewrite(sql, &user, &schema), &user, scope).await
 }
 
 /// Does this query read Postgres's catalog, or say something only Postgres says?

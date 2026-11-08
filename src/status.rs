@@ -218,8 +218,8 @@ pub async fn status(app: &App, ask: &apply::Ask, who: Who) -> Result<serde_json:
 /// table or column gets a migration, recorded as run in this database, where it already is.
 pub async fn capture(app: &App, ask: &apply::Ask, who: Who) -> Result<serde_json::Value> {
     let applier = apply::applier();
-    apply::authorize(app, who, applier).await?;
-    let v = view(app, ask, who).await?;
+    apply::authorize(app, who.clone(), applier).await?;
+    let v = view(app, ask, who.clone()).await?;
     // A name chooses the lines it is the name of (a renamed table's old or new name).
     let named = |l: &Line, n: &str| l.name == n || l.to.as_deref() == Some(n);
     let changes: Vec<&Line> = v.lines.iter().filter(|l| l.state != "apply").collect();
@@ -253,7 +253,7 @@ pub async fn capture(app: &App, ask: &apply::Ask, who: Who) -> Result<serde_json
             Ok::<(), anyhow::Error>(())
         };
         // (as an apply's statements run: an APPLY holder below admin records them as an admin, under its own name)
-        match apply::admin_for(who, applier) {
+        match apply::admin_for(&who, applier) {
             Some(me) => crate::auth::WHO.scope(me, record).await?,
             None => record.await?,
         }

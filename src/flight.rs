@@ -356,7 +356,7 @@ async fn query(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown,
     }
     let req = crate::routines::Request { sql: sql.to_string(), ..Default::default() };
     let how = How { job: None, spread: None, after: None, stale: None };
-    let got = statement::run(app, req, how, who, &FlightWire).await.map_err(status)?;
+    let got = statement::run(app, req, how, who.clone(), &FlightWire).await.map_err(status)?;
     if matches!(got, Answer::Sent) {
         return Ok(Flown::Batches(Arc::new(Schema::empty()), vec![]));
     }
@@ -367,7 +367,7 @@ async fn query(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown,
     let schema = match batches.is_empty() {
         false => first_announced(&batches),
         true => match statement::plain_of(app, sql).await.map_err(status)? {
-            Some((_, one)) => planned(app, &one).await.map_err(status)?,
+            Some((_, one)) => planned(app, &one, &who.scope).await.map_err(status)?,
             None => Schema::empty(),
         },
     };
@@ -443,9 +443,9 @@ async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<&[u8]
 
 /// The columns a query will answer with, for its flight's info: bound and expanded as every door does (`$name`s from
 /// the session, macros, `FROM t`, `pondra.git_status`), then planned, not run.
-async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> { planned(app, &crate::routines::expand(&app.lake, &crate::vars::bound(sql)?).await?).await }
+async fn plan_schema(app: &App, sql: &str, scope: &crate::rights::Scope) -> anyhow::Result<Schema> { planned(app, &crate::routines::expand(&app.lake, &crate::vars::bound(sql)?).await?, scope).await }
 
-async fn planned(app: &App, sql: &str) -> anyhow::Result<Schema> { Ok(crate::with_writes::planned(app, sql).await?.as_ref().clone()) }
+async fn planned(app: &App, sql: &str, scope: &crate::rights::Scope) -> anyhow::Result<Schema> { Ok(crate::with_writes::planned(app, sql, scope).await?.as_ref().clone()) }
 
 /// A write's answer, as its ticket and its flight's info give it: one row, `rows`, the count written.
 fn rows_schema() -> Schema { Schema::new(vec![Field::new("rows", DataType::Int64, false)]) }
@@ -626,12 +626,11 @@ fn prune_kept() { KEPT.lock().unwrap().retain(|_, (_, at, _)| at.elapsed() < KEP
 /// A write sent as SQL: a CREATE, INSERT, UPDATE, DELETE or ALTER (or a CALL). Returns the rows written. It runs as every
 /// door runs a statement (`statement::run`): its `$name`s bound from the session (a Flight transaction's `DECLARE $x` is
 /// one: audit 10-31 L9), its macros expanded, audited, checked against the caller's role.
-async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
+async fn write(app: &App, who: crate::routines::Who, sql: &str) -> Result<i64, Status> {
     no_sql_transaction(sql)?;
     if !statement::is_write(sql) {
         return Err(refused("22023", "not a write statement"));
     }
-    let who = crate::routines::Who { role, files: false, depth: 0 };
     let req = crate::routines::Request { sql: sql.to_string(), ..Default::default() };
     let how = How { job: None, spread: None, after: None, stale: None };
     let returning = crate::returning::of(sql).is_some();
@@ -938,7 +937,7 @@ impl FlightSqlService for Sql {
         let role = allowed(&self.0, &req, Role::Read)?;
         no_sql_transaction(&q.query)?;
         let txn = q.transaction_id.as_deref(); // (the transaction the statement runs in, if it names one)
-        let who = crate::routines::Who { role, files: false, depth: 0 };
+        let who = crate::routines::Who { role, files: false, depth: 0, scope: caller(&req).scope }; // (planned for its sign-in)
         if crate::routines::runs_procedure(&q.query) || crate::returning::of(&q.query).is_some() {
             // A CALL (or DO), or a write with RETURNING: run now, as every door runs one; the ticket reads back what it answered.
             return kept(&self.0, &q.query, who, txn, req.into_inner()).await;
@@ -946,7 +945,7 @@ impl FlightSqlService for Sql {
         if crate::write::parse(&q.query).is_some() {
             // A write sent as a query (DB-API's `execute`): done now; the ticket reads back the count.
             let (app, sql) = (self.0.clone(), q.query.clone());
-            let rows = worked(app.lake.node.clone(), txn, async move { write(&app, role, &sql).await }).await?;
+            let rows = worked(app.lake.node.clone(), txn, async move { write(&app, who, &sql).await }).await?;
             let ticket = TicketStatementQuery { statement_handle: format!("rows:{rows}").into_bytes().into() };
             return info(&crate::answer::arrow_schema(&rows_schema()), ticket.as_any().encode_to_vec(), req.into_inner());
         }
@@ -954,7 +953,7 @@ impl FlightSqlService for Sql {
         let Some((_, one)) = within(txn, async { statement::plain_of(&self.0, &q.query).await.map_err(status) }).await? else {
             return kept(&self.0, &q.query, who, txn, req.into_inner()).await;
         };
-        let schema = within(txn, async { planned(&self.0, &one).await.map_err(status) }).await?;
+        let schema = within(txn, async { planned(&self.0, &one, &who.scope).await.map_err(status) }).await?;
         let ticket = TicketStatementQuery { statement_handle: handle(&q.query, txn).into() };
         info(&schema, ticket.as_any().encode_to_vec(), req.into_inner())
     }
@@ -964,7 +963,7 @@ impl FlightSqlService for Sql {
         let (txn, sql) = unhandle(&t.statement_handle);
         let sql = String::from_utf8(sql.to_vec()).map_err(status)?;
         let app = self.0.clone();
-        let who = crate::routines::Who { role, files: false, depth: 0 };
+        let who = crate::routines::Who { role, files: false, depth: 0, scope: caller(&req).scope };
         // (boxed: a statement's future is large, and each layer of `answered`'s and `worked`'s would copy it by value)
         Ok(Response::new(answered(app.lake.node.clone(), txn, Box::pin(async move { answer(&app, &sql, who).await })).await?))
     }
@@ -1000,7 +999,8 @@ impl FlightSqlService for Sql {
     async fn do_put_statement_update(&self, cmd: CommandStatementUpdate, req: Request<PeekableFlightDataStream>) -> Result<i64, Status> {
         let role = allowed(&self.0, &req, Role::Write)?;
         let (app, sql) = (self.0.clone(), cmd.query.clone());
-        worked(app.lake.node.clone(), cmd.transaction_id.as_deref(), async move { write(&app, role, &sql).await }).await
+        let who = crate::routines::Who { role, files: false, depth: 0, scope: caller(&req).scope };
+        worked(app.lake.node.clone(), cmd.transaction_id.as_deref(), async move { write(&app, who, &sql).await }).await
     }
 
     async fn do_put_statement_ingest(&self, cmd: CommandStatementIngest, req: Request<PeekableFlightDataStream>) -> Result<i64, Status> {
@@ -1136,7 +1136,7 @@ impl FlightSqlService for Sql {
         for (key, _) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await.map_err(status)? {
             let Some(shown) = scope.columns(&key[2..]) else { continue };
             let (schema, view) = crate::text::split(&key[2..]);
-            if let Ok(columns) = plan_schema(&self.0, &format!("SELECT * FROM {}", crate::write::sql_name(&key[2..]))).await {
+            if let Ok(columns) = plan_schema(&self.0, &format!("SELECT * FROM {}", crate::write::sql_name(&key[2..])), &scope).await {
                 let columns = Schema::new(columns.fields().iter().filter(|f| reads(&shown, f.name())).cloned().collect::<Vec<_>>());
                 b.append(crate::ddl::lake_name(lake), schema, view, "VIEW", &columns).map_err(status)?;
             }
@@ -1182,7 +1182,7 @@ impl FlightService for Door {
                 // (the schema its ticket streams, planned as DoGet runs it: a table's strings are Utf8View, not the table's Utf8)
                 let sql = format!("SELECT * FROM {}", crate::write::sql_name(table));
                 let ticket = serde_json::json!({"sql": sql}).to_string();
-                let schema = plan_schema(app, &sql).await.map_err(status)?;
+                let schema = plan_schema(app, &sql, &caller(&req).scope).await.map_err(status)?;
                 infos.push(Ok(FlightInfo::new().try_with_schema(&schema).map_err(status)?.with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(ticket))).with_descriptor(FlightDescriptor::new_path(vec![table.to_string()]))));
             }
             Ok(Response::new(Box::pin(futures::stream::iter(infos)) as Self::ListFlightsStream))
@@ -1196,7 +1196,7 @@ impl FlightService for Door {
             let app = &self.0 .0;
             allowed(app, &req, Role::Read)?;
             let schema = match (&json.sql, &json.table) {
-                (Some(sql), _) => plan_schema(app, sql).await.map_err(status)?,
+                (Some(sql), _) => plan_schema(app, sql, &caller(&req).scope).await.map_err(status)?,
                 (None, Some(table)) => {
                     // Its schema names every column: a user needs SELECT on all of them, as its log stream does (checked before the table is looked up, so an unreadable one isn't told apart).
                     crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(table)).map_err(denied)?;
@@ -1231,7 +1231,7 @@ impl FlightService for Door {
             match (json.sql, json.table) {
                 (Some(sql), _) => {
                     let app = app.clone();
-                    let who = crate::routines::Who { role, files: false, depth: 0 };
+                    let who = crate::routines::Who { role, files: false, depth: 0, scope: caller(&req).scope };
                     Ok(Response::new(answered(app.lake.node.clone(), None, Box::pin(async move { query(&app, &sql, who).await })).await?))
                 }
                 (None, Some(table)) => {

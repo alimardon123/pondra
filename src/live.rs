@@ -151,7 +151,8 @@ fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::
                 (Some(h), false) => crate::users::who(&w.app.lake, &w.app.auth, &crate::auth::Credential::of_header(Some(h))).await.map(|p| p.at(w.who.door, w.who.from)).unwrap_or_else(|| crate::auth::Principal { name: w.who.name.clone(), role: crate::auth::Role::None, scope: crate::rights::Scope::granted(Default::default()), door: w.who.door, from: w.who.from, operator: false, epoch: 0, until: None }), // (gone: nothing)
                 _ => w.who.clone(),
             };
-            let rows = crate::temp::SESSION.scope(w.session.clone(), crate::auth::WHO.scope(who, w.app.query(&w.sql, None))).await.and_then(|b| crate::answer::render(&b, None, &|rows| crate::pages::keep(&w.app.lake, rows)));
+            let scope = who.scope.clone();
+            let rows = crate::temp::SESSION.scope(w.session.clone(), crate::auth::WHO.scope(who, w.app.query(&w.sql, None, &scope))).await.and_then(|b| crate::answer::render(&b, None, &|rows| crate::pages::keep(&w.app.lake, rows)));
             let rows = match rows {
                 Ok(r) => r,
                 Err(e) => return Some((Ok(error(e, &w.tag)), None)),

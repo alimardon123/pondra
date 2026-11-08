@@ -407,6 +407,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         _ => who,
     };
     req.extensions_mut().insert(who.role);
+    req.extensions_mut().insert(who.clone()); // (the principal itself, for a door that plans for it: `routines::Who`)
     let heavy = queries(req.uri().path());
     let stoppable = stoppable(req.uri().path(), req.uri().query()); // (a query the node may stop for memory: `oom.rs`)
     // (a stopped statement fails its session's transaction: who asked, and the headers `temp::of` reads the session from)
@@ -1153,10 +1154,10 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
 /// `POST /sql`: statements (SQL, or JSON with `$name` parameters, or that and tables of the
 /// caller's own: `routines::Request`), run in order; the last one's answer. A single query as it
 /// was sent may be answered from `Results`.
-async fn sql(State(app): State<App>, Query(p): Query<crate::statement::SqlParams>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
+async fn sql(State(app): State<App>, Query(p): Query<crate::statement::SqlParams>, role: axum::Extension<crate::auth::Role>, who: axum::Extension<crate::auth::Principal>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let format = p.format.clone(); // (an answer handed to the door in pieces is sent in this format)
     let node = app.lake.node.clone(); // (an answer in pieces is in flight until its last piece is read: `pieces`)
-    let said = crate::statement::sql(app, p, role.0, headers, body).await;
+    let said = crate::statement::sql(app, p, role.0, who.0.scope, headers, body).await;
     let mut r = match said.reply {
         Ok(crate::statement::Reply::Rendered(r)) => respond(r, format.as_deref(), &node),
         Ok(crate::statement::Reply::Done(v)) => Json(v).into_response(),
@@ -1195,7 +1196,7 @@ async fn secret(State(app): State<App>, Path(name): Path<String>, headers: axum:
 /// `POST /plan`, `/apply`, `/test`, `/status`, `/capture`: a project's files planned here, applied, its tests run,
 /// what differs from the database, or what writing it into the files takes (ADR-047 §4, ADR-060 §7), each with the
 /// same body.
-async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, Json(ask): Json<crate::apply::Ask>) -> Result<Json<Value>, E> {
+async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extension<crate::auth::Role>, who: axum::Extension<crate::auth::Principal>, headers: axum::http::HeaderMap, Json(ask): Json<crate::apply::Ask>) -> Result<Json<Value>, E> {
     use crate::apply::Verb;
     let verb = match uri.path().rsplit('/').next() {
         Some("plan") => Verb::Plan,
@@ -1204,7 +1205,7 @@ async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extensi
         Some("capture") => Verb::Capture,
         _ => Verb::Apply,
     };
-    let who = crate::routines::Who { role: role.0, files: crate::statement::owner(&app.auth, &headers), depth: 0 };
+    let who = crate::routines::Who { role: role.0, files: crate::statement::owner(&app.auth, &headers), depth: 0, scope: who.0.scope };
     Ok(Json(crate::apply::ask(&app, verb, ask, who).await?))
 }
 
