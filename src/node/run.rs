@@ -508,7 +508,9 @@ pub(crate) fn exec_again(guest: bool, carried: &[(&str, String)]) -> ! {
         carry.push(("PONDRA_JOB", crate::write::job().to_string()));
         carry.push(("PONDRA_TRIES", (crate::write::tries() + 1).to_string()));
     }
-    cmd.args(args).envs(crate::env::given()).envs(carry.iter().map(|(k, v)| (k, v)));
+    // (its settings by its environment: an exec keeps this process's input, whose line of settings was taken, so the
+    // program run again isn't asked for another, `--settings-stdin`)
+    cmd.args(args.filter(|a| a != "--settings-stdin")).envs(crate::env::given()).envs(carry.iter().map(|(k, v)| (k, v)));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -527,11 +529,17 @@ pub(crate) fn exec_again(guest: bool, carried: &[(&str, String)]) -> ! {
 }
 
 /// Leads the lake at `dir` in a `pondra lead` process of its own, which answers the lake's inbox and ends
-/// (`node::lead_once` says why it is not the node itself).
-pub(crate) async fn lead_once(dir: &str) -> anyhow::Result<()> {
-    let out = tokio::process::Command::new(crate::node::exe()?).args(["lead", "--dir", dir]).envs(crate::env::given())
-        .env_remove("PONDRA_JOB").env_remove("PONDRA_TRIES").env(crate::store::REACH_VAR, crate::store::reaches()) // (the keys this node reaches other places with)
-        .stdin(std::process::Stdio::null()).output().await?;
+/// (`node::lead_once` says why it is not the node itself). It is handed the node's `values` (`settings::Line`).
+pub(crate) async fn lead_once(dir: &str, values: &crate::settings::Values) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut cmd = tokio::process::Command::new(crate::node::exe()?);
+    cmd.args(["lead", "--dir", dir]).env_remove("PONDRA_JOB").env_remove("PONDRA_TRIES").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let line = crate::settings::Line::of(values).with(crate::store::REACH_VAR, crate::store::reaches()).hand(cmd.as_std_mut()); // (and the keys this node reaches other places with)
+    let mut child = cmd.spawn()?;
+    let mut input = child.stdin.take().expect("a pipe");
+    let _ = input.write_all(line.as_bytes()).await; // (one that ended at once says why on its stderr, below)
+    drop(input);
+    let out = child.wait_with_output().await?;
     anyhow::ensure!(out.status.success(), "couldn't lead the lake at {dir}: {}", String::from_utf8_lossy(&out.stderr).trim());
     Ok(())
 }

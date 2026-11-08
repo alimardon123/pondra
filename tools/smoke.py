@@ -2,7 +2,8 @@
 """A first run of a freshly built binary, on each OS it is built for (CI's build job): the shell
 takes statements on its input, a node serves SQL, schemas and views work, and the node knows the
 machine's memory and its own (on Windows and macOS there is no /proc to read them from); an
-extension's .wasm built once on Linux runs here; the shell attaches the lakes beside its own, for that session, and `FROM t` reads every column.
+extension's .wasm built once on Linux runs here; the shell attaches the lakes beside its own, for that session, and `FROM t` reads every column;
+a node a Pondra process starts takes the settings it is handed on its input (`settings::Line`).
 
   python3 tools/smoke.py path/to/pondra[.exe]
 
@@ -75,6 +76,42 @@ def main():
     finally:
         node.terminate()
         node.wait(timeout=30)
+    # A node a Pondra process starts (the shell's, `pondra lead`) is handed its settings on the first line of its input,
+    # not in its environment (`settings::Line`): here the key that reads this machine's files, as the shell's node is
+    # handed its. The rest of its input closing still stops it (`--stop-with-stdin`); a line that isn't one stops it at once.
+    key, handed_port = "a-key-handed-on-the-line", 8098
+    handed = subprocess.Popen([BIN, "serve", "--dir", os.path.join(work, "handed"), "--addr", f"127.0.0.1:{handed_port}", "--stop-with-stdin", "--settings-stdin"],
+                              stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log, env={k: v for k, v in os.environ.items() if not k.startswith("PONDRA_")})
+    stopped = False
+    try:
+        handed.stdin.write(json.dumps({"PONDRA_OWNER_KEY": key}).encode() + b"\n")
+        handed.stdin.flush()
+        for _ in range(600):
+            try:
+                call(handed_port, "/stats")
+                break
+            except OSError:
+                time.sleep(0.1)
+
+        def files(owner):
+            asked = urllib.request.Request(f"http://127.0.0.1:{handed_port}/sql", data=f"SELECT count(*) AS n FROM '{csv}'".encode(), headers={"x-pondra-owner": owner})
+            try:
+                with direct.open(asked, timeout=30) as r:
+                    return json.loads(r.read())
+            except urllib.error.HTTPError:
+                return None
+        checks["a node takes the settings it is handed on its input: the key it was handed reads this machine's files, another doesn't"] = \
+            files(key) == [{"n": 4}] and files("not-the-key-it-was-handed") is None
+        handed.stdin.close()
+        stopped = handed.wait(timeout=30) == 0
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        handed.kill()
+        handed.wait(timeout=30)
+    checks["…and stops when the rest of its input closes"] = stopped
+    bad = subprocess.run([BIN, "serve", "--dir", os.path.join(work, "bad"), "--settings-stdin"], input="memory_gb=2\n", capture_output=True, text=True, timeout=60)
+    checks["a line of settings that isn't one stops the node at once, naming why"] = bad.returncode != 0 and "--settings-stdin" in bad.stderr
     # The shell attaches the other lakes in its folder, for as long as it runs (ADR-024): here
     # `lake` (the node's, just stopped) and `other` (CREATE DATABASE's) beside `shell`.
     beside = subprocess.run([BIN, "shell"], cwd=work, input=".databases\nFROM lake.sales.orders ORDER BY id;\n", capture_output=True, text=True, timeout=180)
@@ -99,7 +136,7 @@ def main():
     ok = all(checks.values())
     print(json.dumps({"smoke": checks, "platform": sys.platform, "ok": ok}, indent=1))
     if not ok:
-        print(shell.stdout, shell.stderr, ext.stdout, ext.stderr, beside.stdout, beside.stderr, elsewhere.stdout, typo.stderr, full.stderr, open(log.name).read()[-2000:], file=sys.stderr)
+        print(shell.stdout, shell.stderr, ext.stdout, ext.stderr, beside.stdout, beside.stderr, elsewhere.stdout, typo.stderr, full.stderr, bad.stderr, open(log.name).read()[-2000:], file=sys.stderr)
         sys.exit(1)
 
 

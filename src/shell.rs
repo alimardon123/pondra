@@ -29,13 +29,12 @@ pub(crate) fn start(dir: &str) -> Result<(Child, String, String, std::path::Path
     let log = std::env::temp_dir().join(format!("pondra-shell-{port}.log"));
     let key = uuid::Uuid::new_v4().to_string();
     let here = std::env::current_dir()?.to_string_lossy().to_string(); // (its lakes: this one's databases)
-    let node = Command::new(std::env::current_exe()?)
-        .args(["serve", "--dir", dir, "--addr", &format!("127.0.0.1:{port}"), "--stop-with-stdin", "--attach-found", &here, "--python", "auto"])
-        .env("PONDRA_OWNER_KEY", &key)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(std::fs::File::create(&log)?)
-        .spawn()?;
+    let mut node = Command::new(std::env::current_exe()?);
+    node.args(["serve", "--dir", dir, "--addr", &format!("127.0.0.1:{port}"), "--stop-with-stdin", "--attach-found", &here, "--python", "auto"]);
+    // (this process's settings, and the key, handed on the first line of the node's input: `settings::Line`)
+    let line = crate::settings::Line::of(&crate::settings::Values::now()).with("PONDRA_OWNER_KEY", key.clone()).hand(&mut node);
+    let mut node = node.stdout(Stdio::null()).stderr(std::fs::File::create(&log)?).spawn()?;
+    let _ = node.stdin.as_mut().expect("a pipe").write_all(line.as_bytes()); // (a node that ended at once says why in its log: `up`)
     Ok((node, format!("http://127.0.0.1:{port}"), key, log))
 }
 
