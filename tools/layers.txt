@@ -88,6 +88,7 @@ dialect_fns engine
 dialect_stmts engine
 diff engine
 divide engine
+eager engine
 engine engine
 expander engine
 explain engine

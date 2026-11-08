@@ -147,9 +147,10 @@ async fn drop_function(State(app): State<App>, Path(name): Path<String>) -> Resu
 /// exists is refused (409), unless `If-Match` names the version `GET` gave: then it is replaced,
 /// if nobody replaced it meanwhile (412 if so; ADR-034). Each save is kept as a version too
 /// (`files::keep`, ADR-035 §8).
-async fn put_file(State(app): State<App>, Path(path): Path<String>, headers: HeaderMap, body: Bytes) -> Result<Response, E> {
+async fn put_file(State(app): State<App>, Path(path): Path<String>, who: Option<axum::Extension<crate::auth::Principal>>, headers: HeaderMap, body: Bytes) -> Result<Response, E> {
     let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
-    Ok(filed(crate::files::put(&app.lake, &path, if_match, body).await?))
+    let role = who.map_or(crate::auth::Role::None, |w| w.0.role);
+    Ok(filed(crate::files::put(&app.lake, &path, if_match, body, role).await?))
 }
 
 /// A `Filed` as the node's HTTP answer: its status, its content type and, when it is the file's bytes, its version as
@@ -235,9 +236,9 @@ async fn list_functions(State(app): State<App>) -> Result<Json<Value>, E> {
 
 /// `GET /routines`: every routine's name, parameters and result; its code only to whoever is shown code
 /// (a user granted some tables needs the first three to call one, never the body: S27).
-async fn routines_shown(State(app): State<App>) -> Result<Json<Value>, E> {
+async fn routines_shown(State(app): State<App>, who: Option<axum::Extension<crate::auth::Principal>>) -> Result<Json<Value>, E> {
     let all = crate::routines::listed(&app.lake).await?;
-    if crate::rights::scope().shows_code() {
+    if scope_of(who).shows_code() {
         return Ok(Json(j!(*all)));
     }
     let mut hidden = (*all).clone();
@@ -298,7 +299,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         // (no role, and a whole scope: `ddl` lets nothing but its own pin through, and asks it no grant)
         let who = crate::auth::Principal { scope: crate::rights::Scope::everything(), ..crate::auth::Principal::of(crate::auth::Role::None) }.at("http", from);
         return match crate::panics::door(&app.lake.node, crate::auth::WHO.scope(who, next.run(req))).await {
-            Ok(r) => r,
+            Ok(r) => told_to(true, r), // (a whole scope is shown code)
             Err(m) => E(anyhow::anyhow!(m)).into_response(),
         };
     }
@@ -414,6 +415,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let asked = stoppable.then(|| (who.clone(), req.headers().clone()));
     // (a Python procedure of an apply calls back with its lent token: those calls are the apply's, as its statements are)
     let applying = crate::auth::lent_applying(token);
+    let shows_code = who.scope.shows_code(); // (an error's full words, or the words without its quoted lines: `told_to`)
     let run = crate::auth::WHO.scope(who, next.run(req));
     let run = async move {
         match applying {
@@ -422,7 +424,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         }
     };
     match if heavy { crate::panics::work(&app.lake.node, stoppable, run).await } else { crate::panics::door(&app.lake.node, run).await } {
-        Ok(r) => r,
+        Ok(r) => told_to(shows_code, r),
         Err(m) => {
             if let (true, Some((who, headers))) = (m == crate::oom::OOM, asked) {
                 crate::statement::failed_for_memory(who, &headers); // (the node stopped the statement: its transaction fails, as an error's does)
@@ -470,7 +472,7 @@ async fn protected_resource(State(app): State<App>, headers: axum::http::HeaderM
 
 /// `POST /login` `{"user", "password"}`: a session (`{"token": "ps_…", "until": ms}`) to send as
 /// `Authorization: Bearer …` until it ends (`PONDRA_SESSION_HOURS`); the console's sign-in.
-async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
+async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, who: Option<axum::Extension<crate::auth::Principal>>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let b: Value = serde_json::from_slice(&body).unwrap_or_default(); // (JSON, whatever its content type says)
     let (user, password) = (b["user"].as_str().unwrap_or_default(), b["password"].as_str().unwrap_or_default());
     if !peer.may_send_password() {
@@ -485,7 +487,7 @@ async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::e
     }
     if !crate::users::password_ok(&app.lake, user, password).await {
         crate::auth::guessed(ip, user);
-        crate::audit::refused_by(&app, user, "http", crate::auth::current().and_then(|p| p.from), ip, "sign in", "wrong user name or password").await;
+        crate::audit::refused_by(&app, user, "http", who.as_ref().and_then(|w| w.0.from), ip, "sign in", "wrong user name or password").await;
         tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
         return (StatusCode::UNAUTHORIZED, "wrong user name or password").into_response();
     }
@@ -496,8 +498,8 @@ async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::e
 }
 
 /// `GET /whoami`: who this request signs in as, and what it may do.
-async fn whoami(State(app): State<App>) -> Json<Value> {
-    let p = crate::auth::current().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None));
+async fn whoami(State(app): State<App>, who: Option<axum::Extension<crate::auth::Principal>>) -> Json<Value> {
+    let p = who.map_or_else(|| crate::auth::Principal::of(crate::auth::Role::None), |w| w.0);
     let role = match p.role {
         crate::auth::Role::Admin => "admin",
         crate::auth::Role::Write => "write",
@@ -638,11 +640,11 @@ async fn job(State(app): State<App>, Json(job): Json<crate::tier::Job>) -> Resul
 /// stream from its own node, and the leader serves one stream per follower, not per page. A caller that isn't one of
 /// the nodes (`nodes_own`) gets each change's readable keys only (`for_caller`). Its sign-in revoked or expired, the
 /// stream ends (`until_revoked`).
-async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
+async fn feed(State(app): State<App>, who: Option<axum::Extension<crate::auth::Principal>>, headers: axum::http::HeaderMap) -> Response {
     let operator = nodes_own(&app).await; // (read now: the stream is polled after this request's scope has ended)
     let header = headers.get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
     let need = crate::auth::Auth::needed("/cluster/log", "GET"); // (a superuser's own sign-in, as `guard` lets it follow the stream)
-    let revoked = until_revoked(app.clone(), operator, header, move |p| p.role >= need && p.scope.whole());
+    let revoked = until_revoked(app.clone(), who.map(|w| w.0), operator, header, move |p| p.role >= need && p.scope.whole());
     let cat = &app.lake.cat;
     let streamed = operator.then(|| crate::format::Streamed::to(&app.lake, crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
     // (a joined page's tab, which says no format as the nodes' own client does (`cluster::http`), is a use of the node while it
@@ -661,10 +663,10 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
 /// `POST /cluster/records`: a joined page's own statements, which this node writes as its own (`page_records::record`), under the
 /// sign-in's name, as the door `page-reported` (`page_records::REPORTED`). Only a superuser's own sign-in sends them (`page_records::refusal`: never the nodes' key, a
 /// user with grants, or a procedure's lent token); a batch past `BATCH_LINES` lines is 413.
-async fn records(State(app): State<App>, headers: axum::http::HeaderMap, Json(batch): Json<crate::page_records::Batch>) -> Response {
+async fn records(State(app): State<App>, headers: axum::http::HeaderMap, who: Option<axum::Extension<crate::auth::Principal>>, Json(batch): Json<crate::page_records::Batch>) -> Response {
     let credential = crate::auth::Credential::of_headers(&headers);
     let token = credential.token();
-    let Some(who) = crate::auth::current() else { return (StatusCode::FORBIDDEN, "a joined page's lines need a sign-in").into_response() };
+    let Some(axum::Extension(who)) = who else { return (StatusCode::FORBIDDEN, "a joined page's lines need a sign-in").into_response() };
     if let Some(why) = crate::page_records::refusal(&who, token) {
         return (StatusCode::FORBIDDEN, why).into_response();
     }
@@ -681,10 +683,9 @@ async fn records(State(app): State<App>, headers: axum::http::HeaderMap, Json(ba
 /// version compare, and signs in again only once that moved (a REVOKE, a DROP USER, a token or session ended), as a Postgres
 /// connection does at its next statement and a Kafka client at its next request: so such an answer ends within a second of the
 /// change, and a stream whose rights don't move costs no catalog read or password check (11-08 audit M7; 11-01 H4, 11-02 H3
-/// and 11-03 H1 before). The caller is read now, in the request's scope, since the stream is polled after it. A node, a
-/// token and the program that started this node never end.
-pub(crate) fn until_revoked(app: App, operator: bool, header: Option<String>, still: impl Fn(&crate::auth::Principal) -> bool + Send + 'static) -> impl std::future::Future<Output = ()> + Send + 'static {
-    let who = crate::auth::current();
+/// and 11-03 H1 before). `who` is the caller its door signed in, given now, since the stream is polled after the request. A
+/// node, a token and the program that started this node never end.
+pub(crate) fn until_revoked(app: App, who: Option<crate::auth::Principal>, operator: bool, header: Option<String>, still: impl Fn(&crate::auth::Principal) -> bool + Send + 'static) -> impl std::future::Future<Output = ()> + Send + 'static {
     async move {
         if operator || who.as_ref().is_some_and(|w| w.operator) {
             return futures::future::pending().await;
@@ -907,10 +908,11 @@ struct InsertParams {
 /// the leader records the files, together with `job` so a retried job is applied once. Creates
 /// the table if missing. With `staged=1` the body is the columns of a joined page's staged rows (`insert_staged`).
 async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, who: Option<axum::Extension<crate::auth::Principal>>, body: String) -> Result<Json<Value>, E> {
-    let (start, scope) = (std::time::Instant::now(), scope_of(who));
+    let who = who.map_or_else(|| crate::auth::Principal::of(crate::auth::Role::None), |w| w.0);
+    let (start, scope) = (std::time::Instant::now(), who.scope.clone());
     let (out, unseen) = crate::rights::noting(async {
         match p.staged {
-            Some(1) => insert_staged(&app, &name, &p.job, &body, &scope).await,
+            Some(1) => insert_staged(&app, &name, &p.job, &body, &who).await,
             _ => insert_rows(&app, &name, p, body, &scope).await,
         }
     })
@@ -923,7 +925,7 @@ async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String, scop
     ensure!(!app.members.reader(), "read-only node");
     if app.lake.table_meta_if(name).await?.is_none() {
         let define = crate::rights::may_here(crate::rights::Action::Define, crate::rights::Object::Table(name)); // (making a table, as CREATE TABLE does)
-        if define.is_err() && !crate::rights::scope().whole() {
+        if define.is_err() && !scope.whole() {
             // (a user with grants who may not make it is told there is no such table, as of one it holds nothing on, so the code
             // never tells a missing table from a hidden one: 11-08 audit M5)
             return Err(crate::codes::coded("42P01", format!("no table {name}")).into());
@@ -951,12 +953,11 @@ async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String, scop
 /// staged files are deleted once the INSERT has answered, whatever the answer, or was stopped, so a resend finds none and is
 /// answered by the job. `files` is how many the page staged: the node takes the INSERT only when exactly those are there, so a
 /// file lost on the way (or swept: `tier::collect_orphans`) is a refusal, never a quiet loss of its rows.
-async fn insert_staged(app: &App, name: &str, job: &str, body: &str, scope: &crate::rights::Scope) -> Result<Json<Value>, E> {
+async fn insert_staged(app: &App, name: &str, job: &str, body: &str, who: &crate::auth::Principal) -> Result<Json<Value>, E> {
     #[derive(Deserialize)]
     struct Staged { columns: Vec<String>, files: u64, #[serde(default)] placed: Option<u64> }
     ensure!(!app.members.reader(), "read-only node");
-    let who = crate::auth::current().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None));
-    let Some(slug) = crate::auth::slug(&who) else { return Err(crate::codes::coded("42501", "a staged INSERT is a user's: its sign-in has no name to stage under").into()) };
+    let Some(slug) = crate::auth::slug(who) else { return Err(crate::codes::coded("42501", "a staged INSERT is a user's: its sign-in has no name to stage under").into()) };
     if !crate::auth::staged_job(job) {
         return Err(crate::codes::coded("22023", "a staged INSERT's job is letters, digits and hyphens, 64 at most").into()); // (invalid_parameter_value)
     }
@@ -984,7 +985,7 @@ async fn insert_staged(app: &App, name: &str, job: &str, body: &str, scope: &cra
         (Some(p), Ok((None, table))) => Some((table, p)),
         _ => None,
     };
-    let out = crate::log::placed_as(placed, crate::write::on_node_as(app, stmt, Some(format!("staged:{slug}:{job}")), true, scope)).await;
+    let out = crate::log::placed_as(placed, crate::write::on_node_as(app, stmt, Some(format!("staged:{slug}:{job}")), true, &who.scope)).await;
     unstage.now().await; // (before the answer, so a resend of the same job stages afresh)
     Ok(Json(out?))
 }
@@ -1277,7 +1278,7 @@ struct WatchParams {
 
 /// New rows of a table as NDJSON, pushed the moment they commit (a view's rows included); with
 /// `?changes=true`, its changes: UPDATE's and DELETE's too, with the rows' system columns.
-async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query<WatchParams>, headers: HeaderMap) -> Response {
+async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query<WatchParams>, who: Option<axum::Extension<crate::auth::Principal>>, headers: HeaderMap) -> Response {
     if let Err(e) = crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&name)) {
         return (StatusCode::FORBIDDEN, crate::ext::said(&e)).into_response(); // (a user's: the whole rows)
     }
@@ -1285,7 +1286,7 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
     // a REVOKE, a DROP USER or a session's end stops them within a second: 11-02 audit H3, 11-08 M7)
     let (operator, header) = caller(&headers);
     let table = name.clone();
-    let revoked = until_revoked(app.clone(), operator, header, move |p| {
+    let revoked = until_revoked(app.clone(), who.map(|w| w.0), operator, header, move |p| {
         crate::rights::may(p, crate::rights::Action::SelectAll, crate::rights::Object::Table(&table)).is_ok()
     });
     let hwm = app.lake.hwm.subscribe();
@@ -1344,7 +1345,7 @@ async fn ready(State(app): State<App>) -> Response {
     }
 }
 
-async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<Value> {
+async fn stats(State(app): State<App>, who: Option<axum::Extension<crate::auth::Principal>>, headers: axum::http::HeaderMap) -> Json<Value> {
     let members = &app.members;
     let role = if members.reader() { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
     let mut s = j!({"lake": crate::ddl::lake_name(&app.lake), "role": role, "leader": members.leader().addr, "term": members.leader().n, "nodes": members.nodes(),
@@ -1372,7 +1373,7 @@ async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<V
         s["commit_ms_p50"] = j!(pct(0.5));
         s["commit_ms_p95"] = j!(pct(0.95));
     }
-    if crate::auth::current().is_none_or(|p| p.role == crate::auth::Role::None) {
+    if who.is_none_or(|w| w.0.role == crate::auth::Role::None) {
         // (the cluster's names and addresses are a signed-in caller's; the rest is a probe's)
         if let Some(o) = s.as_object_mut() {
             for k in ["lake", "leader", "nodes", "releases"] {
@@ -1412,8 +1413,53 @@ impl IntoResponse for E {
 
 /// An error as a response: its words are the body, its SQLSTATE the `x-pondra-sqlstate` header, and its status the one
 /// its code stands for, unless the caller gives its own (a database server answers its own errors this way too).
+/// The words are told as to a caller not shown code (`codes::unquoted`), and the full ones ride along as `Told` for
+/// `guard`, which knows who asked: an answer made away from a request is never told more than that.
 pub fn error_response(status: Option<StatusCode>, e: &anyhow::Error) -> Response {
-    let (mapped, code, told) = crate::codes::answer(e, crate::rights::scope().shows_code()); // (Postgres's SQLSTATE, for any client: ADR-036 §4; the words its caller may see)
+    let (mapped, code, full) = crate::codes::answer(e, true); // (Postgres's SQLSTATE, for any client: ADR-036 §4)
+    let told = crate::codes::unquoted(&full);
     let status = status.unwrap_or_else(|| StatusCode::from_u16(mapped).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
-    (status, [("x-pondra-sqlstate", code)], told).into_response()
+    let mut r = (status, [("x-pondra-sqlstate", code)], told.clone()).into_response();
+    if full != told {
+        r.extensions_mut().insert(Told(full));
+    }
+    r
+}
+
+/// An error's full words, kept on its response until `guard` knows whether its caller is shown them (`told_to`).
+#[derive(Clone)]
+struct Told(String);
+
+/// `r` as its caller is told it: an error's full words to a caller shown code, the words without its quoted lines to
+/// any other (`error_response`).
+fn told_to(shows_code: bool, mut r: Response) -> Response {
+    match (shows_code, r.extensions_mut().remove::<Told>()) {
+        (true, Some(Told(full))) => {
+            let (mut parts, _) = r.into_parts();
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            Response::from_parts(parts, axum::body::Body::from(full))
+        }
+        _ => r,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    async fn said(r: axum::response::Response) -> String { String::from_utf8(axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap() }
+
+    /// An error's quoted lines (a procedure's traceback) are told only to a caller shown code, and cut for any other: the
+    /// guard decides by the principal it signed in (`told_to`), and an answer made away from it is told as to no one.
+    #[tokio::test]
+    async fn an_errors_full_words_are_told_only_to_a_caller_shown_code() {
+        let e = anyhow::anyhow!("ValueError: bad row\n  line 3: rate = 42");
+        assert_eq!(said(super::error_response(None, &e)).await, "ValueError: bad row\n  line 3");
+        assert_eq!(said(super::told_to(false, super::error_response(None, &e))).await, "ValueError: bad row\n  line 3");
+        let full = super::told_to(true, super::error_response(None, &e));
+        assert_eq!(full.headers()["x-pondra-sqlstate"], crate::codes::of(&e));
+        assert_eq!(said(full).await, "ValueError: bad row\n  line 3: rate = 42");
+        // (no quoted line: the same words either way, and nothing kept beside them)
+        let plain = super::error_response(None, &anyhow::anyhow!("no table t"));
+        assert!(plain.extensions().get::<super::Told>().is_none());
+        assert_eq!(said(super::told_to(true, plain)).await, "no table t");
+    }
 }
