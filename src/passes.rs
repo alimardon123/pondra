@@ -519,6 +519,7 @@ pub(crate) mod tests {
                 (Phase::Wants, "pattern.wanted"),
                 (Phase::Wants, "text.names_a_type"),
                 (Phase::Parse, "friendly.comprehension"),
+                (Phase::Parse, "friendly.lambda"),
             ]
         );
     }

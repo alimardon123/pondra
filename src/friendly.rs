@@ -4,10 +4,10 @@
 //! (`routines::expand`), as `FROM`-first and `ASOF JOIN` already are. A view, a frame, a spread
 //! query and every door then get plain SQL.
 //!
-//! - In the text, before it is parsed (`text`): `LAMBDA x: …` as `x -> …`; DuckDB's `PIVOT` and `UNPIVOT` statements as
-//!   the standard's; DuckDB's `ASOF JOIN … ON a.t >= b.t` as Snowflake's; `USING SAMPLE`.
-//! - In the parse, a hook of the fallback dialect (`dialect.rs`): list comprehensions (`[x * 2 FOR x IN l IF x > 0]`)
-//!   as `array_transform(…, x -> …)`.
+//! - In the text, before it is parsed (`text`): DuckDB's `PIVOT` and `UNPIVOT` statements as the standard's; DuckDB's
+//!   `ASOF JOIN … ON a.t >= b.t` as Snowflake's; `USING SAMPLE`.
+//! - In the parse, hooks of the fallback dialect (`dialect.rs`): list comprehensions (`[x * 2 FOR x IN l IF x > 0]`) as
+//!   `array_transform(…, x -> …)`, and `LAMBDA x: …` as `x -> …`.
 //! - In the syntax tree (`rewrite`): `FETCH FIRST`, `ORDER BY ALL`, `({…}).a`, `max_by` and
 //!   `arg_max`, `string_split`, `::json`, `json_extract`, `payload->>'$.a'`, `PIVOT`, `UNPIVOT`, `TABLESAMPLE` (which
 //!   DataFusion ignored), `COLUMNS(…)`, `* RENAME`, a select's alias in its WHERE.
@@ -58,7 +58,7 @@ pub(crate) fn passes() -> Vec<crate::passes::Pass> {
     ];
     forms.extend(tables);
     vec![
-        Pass { name: "friendly.text", order: 40, words: vec!["lambda", "for", "pivot", "unpivot", "asof", "sample", "tblproperties", "top"], marks: vec![&["@@"]], run: Run::Text(text) },
+        Pass { name: "friendly.text", order: 40, words: vec!["for", "pivot", "unpivot", "asof", "sample", "tblproperties", "top"], marks: vec![&["@@"]], run: Run::Text(text) },
         // (`json_extract…` is a word's start, so a mark; `).a`, Snowflake's `payload:page`)
         Pass { name: "friendly.forms", order: 10, words: forms, marks: vec![&["json_extract"], &[")", "."], &[":"]], run: Run::Wants(wants_forms) },
         Pass {
@@ -82,6 +82,17 @@ pub(crate) fn passes() -> Vec<crate::passes::Pass> {
                 claims: "[",
                 reads: &["SELECT [x * 2 FOR x IN [1, 2, 3]] AS v", "SELECT [x FOR x IN l IF x > 1] FROM t", "SELECT [[y FOR y IN x] FOR x IN [[1, 2], [3]]] AS v"],
                 hook: Hook::Prefix(comprehension),
+            }),
+        },
+        Pass {
+            name: "friendly.lambda",
+            order: 20,
+            words: vec!["lambda"],
+            marks: vec![],
+            run: Run::Parse(Parse {
+                claims: "lambda",
+                reads: &["SELECT list_transform(l, LAMBDA x: x + 1) FROM t", "SELECT list_reduce(l, LAMBDA a, b: a + b) FROM t"],
+                hook: Hook::Prefix(lambda_words),
             }),
         },
     ]
@@ -152,14 +163,14 @@ fn alias_after_table(sql: &str) -> bool {
 
 /// `sql` with what the parser can't read as it is written turned into what it can.
 pub fn text(sql: &str) -> Result<Cow<'_, str>> {
-    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b").expect("a regex"));
+    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b").expect("a regex"));
     if !LOOK.is_match(sql) {
         return Ok(Cow::Borrowed(sql));
     }
     let mut s = statements(sql)?.unwrap_or_else(|| sql.to_string());
     // (each pass reads the text as the passes before it left it, tokenized again only after one of them changed it: a
     // `top` that is only a word in a string costs one tokenize, audit 11-02 L13)
-    let passes = [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias];
+    let passes = [asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias];
     let mut next = 0;
     while next < passes.len() {
         let Some(t) = Tokens::of(&s) else { break };
@@ -203,33 +214,33 @@ impl<'a> Tokens<'a> {
     }
 }
 
-/// DuckDB's `LAMBDA x, y: body` as `(x, y) -> body`.
-fn lambda_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
-    let mut edits = Vec::new();
-    for i in (0..t.toks.len()).filter(|&i| t.word(i, Keyword::LAMBDA)) {
-        let (mut j, mut params) = (t.next(i), Vec::new());
-        let parens = t.toks.get(j) == Some(&Token::LParen);
-        if parens {
-            j = t.next(j);
-        }
-        while let Some(Token::Word(w)) = t.toks.get(j) {
-            params.push(w.to_string());
-            j = t.next(j);
-            if t.toks.get(j) != Some(&Token::Comma) {
-                break;
-            }
-            j = t.next(j);
-        }
-        if parens && t.toks.get(j) == Some(&Token::RParen) {
-            j = t.next(j);
-        }
-        if params.is_empty() || t.toks.get(j) != Some(&Token::Colon) {
-            continue;
-        }
-        let params = if params.len() == 1 { params[0].clone() } else { format!("({})", params.join(", ")) };
-        edits.push((t.start[i], t.end(j), format!("{params} ->")));
+/// DuckDB's `LAMBDA x, y: body`, read by the fallback dialect (`dialect.rs`) as `(x, y) -> body`: the tree GenericDialect
+/// reads the old text pass's `(x, y) -> body` to, JSON's arrow at its precedence, which `lambdas` takes as a lambda where
+/// the query is planned (`lambda` gives the body what follows an AND or OR, as it does for `x -> …`). None when the word is
+/// not one: the dialect reads it as a name. (At the start of an expression the arrow takes what follows it there: `a +
+/// LAMBDA x: x` is `a + (x -> x)`, where the text read `(a + x) -> x`; no function takes either.) `LAMBDA (x): …` is not
+/// one: DuckDB refuses it, and GenericDialect reads it as a call of `lambda`, so no hook is asked.
+fn lambda_words(p: &mut Parser) -> Option<Result<Expr, datafusion::sql::sqlparser::parser::ParserError>> {
+    use datafusion::sql::sqlparser::dialect::{Dialect, Precedence};
+    if !matches!(&p.peek_token_ref().token, Token::Word(w) if w.keyword == Keyword::LAMBDA) {
+        return None;
     }
-    Ok(edits)
+    let mut params = match p.maybe_parse(|p| {
+        p.expect_keyword_is(Keyword::LAMBDA)?;
+        let params = p.parse_comma_separated(|p| p.parse_identifier())?;
+        p.expect_token(&Token::Colon)?;
+        Ok(params)
+    }) {
+        Ok(Some(params)) => params,
+        Ok(None) => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    let left = match params.len() {
+        1 => Expr::Identifier(params.remove(0)),
+        _ => Expr::Tuple(params.into_iter().map(Expr::Identifier).collect()),
+    };
+    let arrow = GenericDialect {}.prec_value(Precedence::PgOther);
+    Some(p.parse_subexpr(arrow).map(|body| Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::Arrow, right: Box::new(body) }))
 }
 
 /// A list comprehension, `[expr FOR x IN list IF cond]`, read by the fallback dialect (`dialect.rs`) as
@@ -1562,6 +1573,16 @@ fn expression(e: &mut Expr) -> Result<()> {
             let Value::NationalStringLiteral(s) = std::mem::replace(v, Value::Null) else { unreachable!() };
             *v = Value::SingleQuotedString(s);
         }
+        // (`LAMBDA (x): …`, which GenericDialect reads as a call of lambda and a path, so no hook is asked for it: DuckDB
+        // refuses it too, as its LAMBDA's names have no parentheses)
+        Expr::JsonAccess { value, .. } if matches!(&**value, Expr::Function(f) if f.name.to_string().eq_ignore_ascii_case("lambda")) => {
+            let Expr::Function(f) = &**value else { unreachable!() };
+            let names = match &f.args {
+                FunctionArguments::List(l) => l.args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "),
+                _ => "x".to_string(),
+            };
+            return Err(crate::codes::coded("42601", format!("a LAMBDA's names take no parentheses: LAMBDA {names}: …")));
+        }
         // (Snowflake's `payload:page::STRING`: DataFusion can't plan it, and Pondra's JSON is text, so it is refused with
         // the forms that read it: `->>` for a key, json_extract_string for a path. The path is written as it was)
         Expr::JsonAccess { value, path } => {
@@ -2275,10 +2296,11 @@ mod tests {
 
     #[test]
     fn texts() {
-        assert_eq!(text("SELECT list_transform(l, LAMBDA x: x + 1)").unwrap(), "SELECT list_transform(l, x -> x + 1)");
-        // (list comprehensions are the fallback dialect's: `dialect::tests`)
+        // (list comprehensions and LAMBDA are the fallback dialect's: `dialect::tests`)
         assert_eq!(text("SELECT [x * 2 FOR x IN l IF x > 1] FROM t").unwrap(), "SELECT [x * 2 FOR x IN l IF x > 1] FROM t");
+        assert_eq!(text("SELECT list_transform(l, LAMBDA x: x + 1)").unwrap(), "SELECT list_transform(l, LAMBDA x: x + 1)");
         let read = |sql| crate::parsed::read(sql).unwrap();
+        assert_eq!(read("SELECT list_transform(l, LAMBDA x: x + 1)"), read("SELECT list_transform(l, x -> x + 1)"));
         assert_eq!(read("SELECT [x * 2 FOR x IN l IF x > 1] FROM t"), read("SELECT array_transform(array_filter(l, x -> (x > 1)), x -> (x * 2)) FROM t"));
         assert_eq!(read("SELECT [[y FOR y IN x] FOR x IN l]"), read("SELECT array_transform((l), x -> (array_transform((x), y -> (y))))"));
         assert!(text("SELECT * FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts").unwrap().contains("MATCH_CONDITION (pondra_duckdb_asof) ON"));
@@ -2539,6 +2561,8 @@ mod tests {
         // (Snowflake's path, and BigQuery's SAFE. prefix, refused with what to write)
         let refusal = call("p:a.b").unwrap_err();
         assert!(crate::codes::of(&refusal) == "0A000" && refusal.to_string().contains("p->>'a'") && refusal.to_string().contains("json_extract_string(p, '$.a.b')"), "{refusal:#}");
+        let refusal = call("LAMBDA (x, i): x").unwrap_err();
+        assert!(crate::codes::of(&refusal) == "42601" && refusal.to_string().contains("LAMBDA x, i: …"), "{refusal:#}");
         let refusal = call("SAFE.PARSE_DATE('%Y', s)").unwrap_err();
         assert!(crate::codes::of(&refusal) == "0A000" && refusal.to_string().contains("SAFE.PARSE_DATE(…) is BigQuery's"), "{refusal:#}");
         // (the look: a colon after a word and before a letter is a path, not `x::INT` nor a parameter `:p`)
@@ -2569,3 +2593,4 @@ mod tests {
         assert!(lambdas("SELECT j -> 'a' FROM t").is_none());
     }
 }
+
