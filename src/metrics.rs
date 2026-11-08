@@ -3,8 +3,6 @@
 #[cfg(feature = "doors")]
 use crate::app::App;
 #[cfg(feature = "doors")]
-use crate::store::{table_key, TableMeta};
-#[cfg(feature = "doors")]
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -21,6 +19,8 @@ crate::per_node!(pub static OBJECT_WRITES: AtomicU64 = AtomicU64::new(0)); // ob
 crate::per_node!(pub static OBJECT_LISTS: AtomicU64 = AtomicU64::new(0)); // …lists…
 crate::per_node!(pub static OBJECT_DELETES: AtomicU64 = AtomicU64::new(0)); // …deletes…
 crate::per_node!(pub static OBJECT_READS: AtomicU64 = AtomicU64::new(0)); // …and reads (GET and HEAD)
+crate::per_node!(pub static CATALOG_READS: AtomicU64 = AtomicU64::new(0)); // catalog records this node read (a lookup, there or not, or each a scan gave)…
+crate::per_node!(pub static CATALOG_WRITES: AtomicU64 = AtomicU64::new(0)); // …and put or deleted (the write-set rule: designs/redesign/redesign.md §4)
 crate::per_node!(pub static SPILLED: AtomicU64 = AtomicU64::new(0)); // shuffle bytes written to this node's disk
 crate::per_node!(pub static SKEW: AtomicU64 = AtomicU64::new(0)); // the worst bucket/average seen in a shuffle, x100
 crate::per_node!(pub static SKEW_SPLITS: AtomicU64 = AtomicU64::new(0)); // hot partitions of shuffled joins shared out
@@ -106,6 +106,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("shuffled_queries_total", "counter", "…of them with a shuffle", &one(get(&SHUFFLED)));
     metric("ranged_queries_total", "counter", "…of them with their tables sliced by a key's ranges", &one(get(&RANGED)));
     metric("files_scanned_total", "counter", "Parquet files queries read", &one(get(&FILES_SCANNED)));
+    metric("catalog_records_total", "counter", "catalog records this node read and wrote", &[("{op=\"read\"}".to_string(), get(&CATALOG_READS)), ("{op=\"write\"}".to_string(), get(&CATALOG_WRITES))]);
     metric("files_skipped_total", "counter", "Parquet files queries skipped by min/max, unopened", &one(get(&FILES_SKIPPED)));
     let requests = [("write", &OBJECT_WRITES), ("list", &OBJECT_LISTS), ("delete", &OBJECT_DELETES), ("read", &OBJECT_READS)].map(|(op, c)| (format!("{{op=\"{op}\"}}"), get(c)));
     metric("object_requests_total", "counter", "requests this process made of its bucket, past the SSD tier: writes (a multipart upload's start, parts and end each one), lists, deletes and reads, as a bucket bills and rate-limits them", &requests);
@@ -153,28 +154,26 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
             metric("mark_expiries", "gauge", "expiry keys (g/) waiting: each goes with its mark once its window is up", &one(expiries as f64));
         }
     }
-    let tables = app.lake.cat.scan::<TableMeta>("t/", "t0").await?;
-    let (mut files, mut rows, mut bytes, mut entry) = (vec![], vec![], vec![], vec![]);
-    for (key, m) in &tables {
-        let t = &key[table_key("").len()..];
-        let s = m.sealed.clone().unwrap_or_default();
-        files.push((format!("{{table=\"{t}\",where=\"inline\"}}"), m.files.len() as f64));
-        files.push((format!("{{table=\"{t}\",where=\"sealed\"}}"), s.files as f64));
-        rows.push((format!("{{table=\"{t}\"}}"), (s.rows + m.files.iter().map(|f| f.rows).sum::<u64>()) as f64));
-        bytes.push((format!("{{table=\"{t}\"}}"), (s.bytes + m.files.iter().map(|f| f.bytes).sum::<u64>()) as f64));
-        entry.push((format!("{{table=\"{t}\"}}"), crate::store::json(m).len() as f64));
-    }
-    metric("table_files", "gauge", "Parquet files: listed in the catalog entry, or in manifests", &files);
-    metric("table_rows", "gauge", "rows in Parquet files", &rows);
-    metric("table_bytes", "gauge", "bytes of Parquet files", &bytes);
-    metric("table_entry_bytes", "gauge", "size of the table's catalog entry (what every commit to it writes)", &entry);
-    // What publishing a table in an open format keeps (it names manifests, not files: ADR-012).
+    // The tables' files, rows and sizes, from what this node knows of each (`tier::refresh`: the tables committed since
+    // its last look, and every table once a minute), so a scrape's reads follow what changed, not how many tables the
+    // lake holds. The lake's totals, or with PONDRA_METRICS_TABLES a line for each table (a lake of thousands of tables
+    // would be too many series for most scrapers).
+    let per_table = crate::env::flag("PONDRA_METRICS_TABLES");
+    let (count, [files, rows, bytes, entry]) = app.table_lines(per_table).await?;
+    let each = if per_table { "each table's" } else { "the lake's tables'" };
+    metric("tables", "gauge", "tables in the catalog", &one(count as f64));
+    metric("table_files", "gauge", &format!("Parquet files of {each}: listed in the catalog entry, or in manifests (a line for each table with PONDRA_METRICS_TABLES)"), &files);
+    metric("table_rows", "gauge", &format!("rows in {each} Parquet files"), &rows);
+    metric("table_bytes", "gauge", &format!("bytes of {each} Parquet files"), &bytes);
+    metric("table_entry_bytes", "gauge", &format!("size of {each} catalog entries (what every commit to one writes)"), &entry);
+    // What publishing a table in an open format keeps (it names manifests, not files: ADR-012), with PONDRA_METRICS_TABLES:
+    // it reads each published table's record.
     let mut published = vec![];
-    for (format, prefix) in [("delta", "x/"), ("iceberg", "i/")] {
+    for (format, prefix) in [("delta", "x/"), ("iceberg", "i/")].into_iter().filter(|_| per_table) {
         for (key, v) in app.lake.cat.scan::<serde_json::Value>(prefix, &format!("{prefix}\u{10ffff}")).await? {
             published.push((format!("{{table=\"{}\",format=\"{format}\"}}", &key[prefix.len()..]), crate::store::json(&v).len() as f64));
         }
     }
-    metric("published_state_bytes", "gauge", "size of what the catalog keeps about a published table", &published);
+    metric("published_state_bytes", "gauge", "size of what the catalog keeps about a published table (with PONDRA_METRICS_TABLES)", &published);
     Ok(out)
 }

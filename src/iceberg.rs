@@ -21,6 +21,9 @@ use std::collections::BTreeMap;
 
 const HISTORY: usize = 100; // snapshots (and metadata files) kept
 
+/// The Iceberg metadata's records in the catalog (`records`).
+pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "i/", owner: "iceberg", holds: "a table's published Iceberg metadata (delta::state_key)" }];
+
 /// What the Iceberg metadata says right now (kept in the catalog under `i/{table}`).
 ///
 /// One Iceberg manifest per Pondra manifest: ours are immutable, so a sealed manifest's files are

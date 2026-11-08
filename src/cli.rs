@@ -326,6 +326,16 @@ pub(crate) async fn stopped(stdin: bool) {
     tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = closed => {} }
 }
 
+/// `pondra serve`'s node failed (`node::stop`, which said why): it is stopped, `stop` (a leader's term given back, so
+/// the next node leads at once, invariant 210), within 30 s as a library's host bounds it, and the process ends with 1.
+async fn failed_stop(stop: impl std::future::Future<Output = ()>) -> ! {
+    if tokio::time::timeout(std::time::Duration::from_secs(30), stop).await.is_err() {
+        eprintln!("the node's stop took over 30 s: it ends now");
+    }
+    crate::memory::leave(); // (what this process made goes first: `process::exit` runs no destructor)
+    std::process::exit(1)
+}
+
 /// Does a node listen beyond this machine: `--addr`, or `--pg`, `--kafka` or `--flight` when given, on
 /// anything but 127.0.0.1, localhost or [::1]?
 fn on_network(addr: &str, others: [&Option<String>; 3]) -> bool {
@@ -522,6 +532,9 @@ async fn run() -> anyhow::Result<()> {
             let quiet = env::secs("PONDRA_IDLE_EXIT_SECS");
             let mut idle = Box::pin(crate::idle::ended(quiet.as_secs_f64()));
             let mut moves = node::mover(); // (a lake moving to another place: `memory::set_location`)
+            // (the node's own work failing, `node::stop`: the node is stopped as on SIGTERM but with no drain, as a library's
+            // host stops it, so a leader gives up its term and the next node leads at once; then the process ends with 1)
+            let mut failures = node::supervise();
             let mut options = node::Options { dir, listen: addr, advertise, start: node::Start { reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, python, auth }, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest: None };
             loop {
                 let held = Arc::new(node::Held::default()); // (what the start takes, given back by a stop: `node.rs`)
@@ -540,6 +553,9 @@ async fn run() -> anyhow::Result<()> {
                         crate::memory::leave();
                         std::process::exit(0);
                     }
+                    Some(node::Event::Failed(_)) = failures.recv() => {
+                        failed_stop(held.stop()).await;
+                    }
                 };
                 tokio::select! {
                     served = node.serving() => {
@@ -555,9 +571,13 @@ async fn run() -> anyhow::Result<()> {
                     // The lake moves: its requests answered and the node stopped, its objects settled on the
                     // target, and the node started again there, on the same port. A move that fails leaves
                     // the lake in memory: the node starts again on it, on the same port, and says why.
+                    Some(node::Event::Failed(_)) = failures.recv() => {
+                        failed_stop(node.stop()).await;
+                    }
                     Some(m) = moves.recv() => {
                         drain::drain().await;
                         node.stop().await;
+                        while failures.try_recv().is_ok() {} // (what the stopped node's work said is no failure of the next one's)
                         if let Err(e) = crate::memory::settle(&m).await {
                             crate::memory::move_failed(&m.to, &e);
                             continue;
@@ -592,24 +612,27 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Workspace { cmd } => sync::command(cmd).await?,
         Cmd::Project(cmd) => project::command(cmd).await?,
         Cmd::Catalog { dir, prefix } => {
-            let lake = store::Lake::open(&dir, false, false).await?;
+            let lake = store::Lake::open(&dir, false, false, node::native(false)).await?;
             match prefix.starts_with("d/") {
                 true => match lake.cat.get_raw(&prefix).await? {
                     Some(b) => println!("{prefix}: {} bytes", b.len()), // inline data: binary
                     None => println!("{prefix}: not in the catalog"),
                 },
                 false => {
-                    for (k, v) in lake.cat.scan::<serde_json::Value>(&prefix, &format!("{prefix}\u{10ffff}")).await? {
-                        println!("{k} {v}");
+                    for (k, v) in lake.cat.scan_raw(&prefix, &format!("{prefix}\u{10ffff}")).await? {
+                        match serde_json::from_slice::<serde_json::Value>(&v) {
+                            Ok(v) => println!("{k} {v}"),
+                            Err(_) => println!("{k} ({} bytes)", v.len()), // (inline data, under every prefix's scan: binary)
+                        }
                     }
                 }
             }
         }
-        Cmd::Lead { dir } => write::lead_only(&dir).await?,
+        Cmd::Lead { dir } => write::lead_only(&dir, &node::native(false)).await?,
         Cmd::Backup { lake, to, retention_days } => sql_on_guest(&lake, &backup_sql(&to, retention_days), &[]).await?,
         Cmd::Restore { from, to, at } => {
             let at = at.as_deref().map(backup::instant).transpose()?;
-            println!("{}", serde_json::to_string_pretty(&backup::restore(&from, &to, at).await?)?);
+            println!("{}", serde_json::to_string_pretty(&backup::restore(&from, &to, at, &node::native(false)).await?)?);
         }
         Cmd::Sql { dir, query, attach: attached } if write::checkpoint(&query) => {
             // (the leader's work: a node that runs the lake is asked; with nobody leading, this process leads for the
@@ -626,18 +649,19 @@ async fn run() -> anyhow::Result<()> {
         }
         Cmd::Sql { dir, query, attach: attached } => sql_on_guest(&crate::memory::place(&dir), &query, &attached).await?, // (`:memory:`: in this process's memory, as `serve`'s)
         Cmd::Token { dir, user, name } => {
-            let Ok(lake) = store::Lake::open(&dir, false, false).await else { anyhow::bail!("no lake at {dir} (pondra token takes a lake's folder, or its s3:// prefix)") };
+            let life = node::native(false); // (a command of its own, not a guest: as `pondra lead`)
+            let Ok(lake) = store::Lake::open(&dir, false, false, life.clone()).await else { anyhow::bail!("no lake at {dir} (pondra token takes a lake's folder, or its s3:// prefix)") };
             let no_user = lake.cat.scan_raw("u/", "u0").await?.is_empty();
             drop(lake); // (what follows opens it as it needs: through the inbox, or leading for a moment)
             if user == "pondra" && no_user {
                 // (a lake with no user yet, as a follower on the network finds it: its first user, as a leader makes it)
                 let first = users::Change::Create { name: user.clone(), login: true, if_not_exists: true, verifier: None, superuser: true, limits: Default::default() };
-                write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(first))).await?;
+                write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(first)), &life).await?;
             }
             let (token, hash) = users::new_token(&user);
             let name = name.unwrap_or_else(|| format!("token-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())));
             let change = users::Change::CreateToken { name: name.clone(), user: user.clone(), expires_secs: None, hash: Some(hash) };
-            write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(change))).await?; // (only the hash goes)
+            write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(change)), &life).await?; // (only the hash goes)
             println!("{token}"); // (alone on stdout: `T=$(pondra token --dir lake)`)
             eprintln!("a token for {user} (shown once; DROP TOKEN {name} FOR {user} takes it back)");
         }
@@ -657,10 +681,11 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
     let query = match extension::row(query) { Some(row) => row?, None => query.to_string() };
     let reads = statement::single_statement(&query).is_some_and(|one| statement::plain_statement(&one)) || matches!(write::parse(&query), Some(write::Stmt::CopyTo(..)));
     let guest = if reads { node::Guest::Reads } else { node::Guest::Writes };
+    let life = node::native(true); // (a guest's, as its node's: a run again gives up after five)
     let node = match node::Node::open(node::Options::guest(dir, attached.to_vec(), guest)).await {
         Ok(node) => node,
         // (fenced out by a newer writer while it started, before its statement ran: run again, as a write fenced later is)
-        Err(e) if write::fenced(&e) && write::tries() < 5 => write::start_over("fenced while starting", write::job()),
+        Err(e) if write::fenced(&e) && write::tries() < 5 => write::start_over("fenced while starting", write::job(), &*life),
         Err(e) => return Err(e),
     };
     // (the answer is read, and the node finished, on every path: a leader's term is given back whatever the answer)
@@ -681,13 +706,13 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
             if let Err(e) = finished {
                 eprintln!("the guest didn't end cleanly before the run again: {e:#}");
             }
-            write::start_over("fenced while writing", write::job());
+            write::start_over("fenced while writing", write::job(), &*life);
         }
         return Err(err);
     }
     // (fenced out as it finished, before what it wrote was durable: run again, and the job says whether it was recorded)
     if finished.as_ref().is_err_and(|e| write::fenced(e) && write::tries() < 5) {
-        write::start_over("fenced while finishing", write::job());
+        write::start_over("fenced while finishing", write::job(), &*life);
     }
     finished?;
     print!("{heard}");

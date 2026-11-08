@@ -36,7 +36,7 @@ kind, make the same trade: SQL, functions and containers, never the planner.
 | ADR-031: extensions as WebAssembly components, `INSTALL`/`LOAD`, a WIT world `pondra:extension@1`, kept in the lake, sandboxed, grants at `LOAD` | proposed, not built |
 | ADR-035 §6: a plugin is a package of extensions, console modules, Python packages and SQL | proposed, not built |
 | The console registers everything through `window.pondra` (`register.view`, `.doc`, `.renderer`, `.action`, `.objectKind`, `.jobKind`, `.setting`, `.command`, …), its own parts as an extension's (invariant 145); `PONDRA_CONSOLE_EXTENSIONS` loads more scripts (`examples/console-extension.js`) | built |
-| One registry of kinds (`objects::KINDS`, prefix, verbs, `on_clone`, `project`); AGENTS.md: a plugin's entries name their origin, live under `pl/{plugin}/`, take no word in use | built (origin not yet) |
+| One registry of kinds (`objects::KINDS`, prefix, verbs, `on_clone`, `project`); AGENTS.md: a plugin's entries name their origin, live under `ex/{extension}/` (`records::of_extension`, a prefix no other may start: the registry refuses an overlap when it is built), take no word in use | built (origin not yet) |
 | ADR-060 §9: a tool's objects are `KINDS` entries; its files claim a project folder | rule, built with the first tool |
 | The doors behind one request API (ADR-072 §3), all kept by ADR-068; BI tools on the Postgres port: Metabase, Superset, Grafana, Tableau, DBeaver, Power BI (`harness.py bi`, L3) | built |
 | Functions in SQL, in Python (warm workers, `packages =` installed with uv), over Flight (ADR-013) | built |

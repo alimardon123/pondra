@@ -300,6 +300,9 @@ impl Scope {
     /// May it use the secret `name` (GRANT USAGE ON SECRET)?
     pub fn secret(&self, name: &str) -> bool { self.0.as_ref().is_none_or(|a| a.secret(name)) }
 
+    /// May it use the object `name` of an extension's `kind` for `privilege` (`READ` on a connection)? Whole: always.
+    pub fn may_use(&self, kind: &str, name: &str, privilege: &str) -> bool { self.0.as_ref().is_none_or(|a| a.may_use(kind, name, privilege)) }
+
     /// The schemas a user granted CLONE may branch (ADR-058): None, no CLONE grant (and a whole scope, which needs none);
     /// Some(none), every schema (CLONE ON DATABASE); Some(these), CLONE ON SCHEMA.
     pub fn clones(&self) -> Option<Vec<String>> { self.0.as_ref().and_then(|a| a.clones()) }

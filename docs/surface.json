@@ -396,6 +396,7 @@
   "pondra_bucket_turns",
   "pondra_bucket_turns_most",
   "pondra_cache_bytes",
+  "pondra_catalog_records_total",
   "pondra_catalog_unflushed_seconds",
   "pondra_commit_ms",
   "pondra_files_scanned_total",
@@ -430,6 +431,7 @@
   "pondra_table_entry_bytes",
   "pondra_table_files",
   "pondra_table_rows",
+  "pondra_tables",
   "pondra_untiered_rows",
   "pondra_visible_segment",
   "pondra_wire_bytes_total"
@@ -1432,6 +1434,11 @@
    "name Utf8",
    "comment Utf8",
    "definition Utf8"
+  ],
+  "pondra.prefixes": [
+   "prefix Utf8",
+   "owner Utf8",
+   "holds Utf8"
   ],
   "pondra.recipients": [
    "name Utf8",

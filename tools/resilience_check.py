@@ -86,6 +86,13 @@ def stats(nd):
         return None
 
 
+def steps(nd, since):
+    """A node's start since `since` (its log's length then), step by step: the `start:` lines `PONDRA_TRACE_START`
+    writes, and why it restarted."""
+    text = open(nd.log, errors="replace").read()[since:]
+    return [line[:200] for line in text.splitlines() if line.startswith(("start: ", "stop: ", "restarting", "stopping"))][-40:]
+
+
 def one_leader(nodes):
     """The leading node, when every node is up and follows it."""
     s = [stats(nd) for nd in nodes]
@@ -439,6 +446,7 @@ def catalog(a):
         lead = until(lambda: one_leader(nodes), 60)
         i, t0, load.phase = nodes.index(lead), time.time(), "a 409 to the catalog compactor"
         said, term = os.path.getsize(lead.log), stats(lead)["term"]
+        logged = {nd.port: os.path.getsize(nd.log) for nd in nodes}
         # (as on R2: a compaction's read of its input failed it, then the compactor's next read of its boundary)
         c.proxies[i].set(conflict=["GET /catalog/compacted/", "GET /catalog/gc/compactions.boundary"])
         until(lambda: c.proxies[i].counts.get("conflict") == 2, 60)
@@ -448,7 +456,16 @@ def catalog(a):
         again = until(lambda: (n := one_leader([nd for nd in nodes if nd.alive()])) and stats(n)["term"] > term, 60)
         info["the 409: roles"] = c.timeline.since(t0)
         info["the 409: the leader's log"] = [line[:300] for line in open(lead.log, errors="replace").read()[said:].splitlines() if "slatedb" in line or "catalog" in line][:8]
+        if again and (now := one_leader([nd for nd in nodes if nd.alive()])):
+            # (where the next leader's start went: its steps, `PONDRA_TRACE_START`; on 11-07 one took 24 s to lead)
+            info["the 409: the next leader's start"] = steps(now, logged[now.port])
         check("…the compactor's failure stops the leader: the next term is led within a minute", bool(again), c.timeline.since(t0))
+        # (stopped as on SIGTERM, without the drain: its catalog checkpointed and its term given back, so the next node
+        # leads at once and replays no WAL, invariant 210. Ended at once instead, the next one waited out the lease and
+        # replayed up to 5 s of the catalog's WAL: 24 s to lead on 11-07)
+        stopped = [line for line in steps(lead, said) if line.startswith(("stop: ", "stopping"))]
+        check("…and the stopped leader checkpointed its catalog and gave up its term", any(line.startswith("stop: checkpoint") for line in stopped)
+              and any(line.startswith("stop: term") for line in stopped), stopped)
         took = load.stall(t0, time.time())
         info["the 409: the longest wait for an ack (s)"] = took
         check("…and writes went on: no ack waited 30 s", took < 30, took)

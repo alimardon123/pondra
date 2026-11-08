@@ -87,3 +87,41 @@ ATTACH 's3://bucket/tables' AS t (TYPE s3)
 
 statement ok
 DROP CONNECTION tables
+
+# A connection's files are reached by its name, '@name/…' (piece 4): a name that isn't a connection, or one that holds
+# tables, is refused by name, on every form.
+statement ok
+CREATE CONNECTION shop TYPE delta WITH (url = 's3://bucket/tables')
+
+statement error no connection nope: '@nope/…' reads a connection's files
+SELECT * FROM '@nope/x.csv'
+
+statement error connection shop holds tables, not files
+SELECT * FROM '@shop/x.parquet'
+
+statement ok
+DROP CONNECTION shop
+
+# A connection that holds tables is attached by its name (piece 5), shown by it, and kept while it is attached.
+statement ok
+CREATE CONNECTION shop TYPE delta WITH (url = 's3://bucket/tables', read_only = true)
+
+statement ok
+ATTACH shop AS sales
+
+query T
+SHOW CREATE DATABASE sales
+----
+ATTACH shop AS sales;
+
+statement error 2BP01 database sales is attached over connection shop: DETACH sales, then DROP CONNECTION shop
+DROP CONNECTION shop
+
+statement error ATTACH shop \[AS name\]: a connection's options are its own
+ATTACH shop AS other (TYPE delta)
+
+statement ok
+DETACH sales
+
+statement ok
+DROP CONNECTION shop

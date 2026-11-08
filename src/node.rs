@@ -2,9 +2,10 @@
 //! with its signals and standard input around it; a library will start and stop one in its own process.
 //! A guest (`Options::guest`) is a node a program starts for its own statements: it answers them and ends.
 //!
-//! This file is the lake half: what a node is made of that a page has too (`stop`, `say`, the guest's and the moves'
-//! state), a host's state (`hosted`, `host`, the supervisor's events), and what a node does to start again
-//! (`restart`, `restart_with`), the program's own path (`exe`) and the lead of a lake nobody leads (`lead_once`).
+//! This file is the lake half: what a node is made of that a page has too (`stop`, the moves' state), a host's state
+//! (`hosted`, `host`, the supervisor's events), and what a node does when it must stop or start again (`Native`, the
+//! `Lifecycle` every lake it opens is handed), the program's own path (`exe`) and the lead of a lake nobody leads
+//! (`lead_once`).
 //! The doors half is `node/run.rs`.
 use crate::{app, backup, branch, ddl, ext, feeds, format, learned, log, panics, python, replica, runs, spmd, store, terms, users, views};
 use std::future::Future;
@@ -18,26 +19,7 @@ use crate::members::Members;
 #[cfg(feature = "doors")] pub use run::{Node, Options};
 #[cfg(feature = "doors")] pub(crate) use run::{request, Held};
 
-/// What a guest is for. A guest that reads claims nothing; one that writes may record, so it leads a lake nobody leads.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Guest {
-    /// It only reads: it follows a leader that answers, or reads beside one that doesn't, or nobody's, and claims nothing.
-    Reads,
-    /// It may record writes, so it leads a lake nobody leads (`Cluster::guest`).
-    Writes,
-}
-
-crate::per_node!(
-    /// Is the node open in this process a guest? Set at its start, set back when it stops: `restart_with`
-    /// keeps a guest's job, and a guest's lock file counts as gone at once.
-    static GUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
-
-/// Is the node open in this process a guest (`Options::guest`)?
-pub(crate) fn is_guest() -> bool { GUEST.load(std::sync::atomic::Ordering::SeqCst) }
-
-/// Marks the node being started a guest or not (`Node::start`).
-#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (only the doors half starts a node)
-pub(crate) fn set_guest(on: bool) { GUEST.store(on, std::sync::atomic::Ordering::SeqCst) }
+pub use crate::lifecycle::{Guest, Restarting};
 
 /// What a member's start takes besides its lake: `pondra serve`'s flags for the lake (the node's `Options` holds one),
 /// a library's, a guest's.
@@ -61,24 +43,18 @@ impl Default for Start {
 }
 
 /// The node stops, for good, with this reason, when its own work can't go on (a vital loop's panic, the catalog's
-/// compactor, a lake a newer Pondra wrote). In a library the node stops and the host's process stays: `failed`
-/// says why, and this returns. In the program the process ends with status 1, as a supervisor expects of a stop and
-/// with no core: what it made goes first (an exit runs no destructor).
+/// compactor, a lake a newer Pondra wrote). Where a host supervises the node, it is told (`failed`) and this returns:
+/// it stops the node as it stops it on a close, so a leader makes what it committed durable, checkpoints its catalog
+/// and gives up its term, and the next node leads at once (invariant 210). A library's host then stays; `pondra serve`
+/// then ends with status 1 (`cli.rs`). Elsewhere (a guest, a command of the command line's) the process ends here with
+/// status 1, as a supervisor expects of a stop and with no core: what it made goes first (an exit runs no destructor).
 pub(crate) fn stop(why: String) {
-    if hosted() {
+    if hosted() || supervised() {
         return failed(why);
     }
     eprintln!("stopping: {why}");
     crate::memory::leave();
     std::process::exit(1)
-}
-
-/// A line the node says on stderr when all goes well (a node is up, a lake's format moved on). A library's host and a
-/// `pondra sql` guest's shell show only trouble, so there it is not said.
-pub(crate) fn say(line: impl std::fmt::Display) {
-    if !hosted() && !is_guest() {
-        eprintln!("{line}");
-    }
 }
 
 /// A lake moving to another place (`memory::set_location`): the host stops the node, settles the lake's
@@ -114,8 +90,8 @@ pub fn move_lake(m: Move) -> anyhow::Result<()> {
 /// the program. What the process is, so it outlives each node.
 static HOSTED: AtomicBool = AtomicBool::new(false);
 
-/// Where a node's restarts and failures are sent: the supervisor of the node open now, if any. One node is open at a
-/// time in a process.
+/// Where a node's restarts and failures are sent: the supervisor of the node open now, if any (a library's, `host`, or
+/// `pondra serve`'s, `supervise`). One node is open at a time in a process.
 static SUPERVISOR: Mutex<Option<mpsc::UnboundedSender<Event>>> = Mutex::new(None);
 
 /// Is this process a library's (`host`), not the program's?
@@ -125,7 +101,7 @@ pub fn hosted() -> bool { HOSTED.load(SeqCst) }
 /// (a library's `Opened`).
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's supervisor is the doors half's)
 pub(crate) enum Event {
-    /// Halt the node and start it again (`restart_with`).
+    /// Halt the node and start it again (`Lifecycle::restart`).
     Restart(String),
     /// Stop the node and say why until it is opened again.
     Failed(String),
@@ -139,8 +115,8 @@ pub(crate) fn send(e: Event) {
     }
 }
 
-/// In a library, the node stops with this reason (a vital loop's panic, the compactor, a lake that moved past this
-/// build), and every request is answered with it until the node is opened again.
+/// The node's supervisor is told it stops with this reason (a vital loop's panic, the compactor, a lake that moved past
+/// this build). A library's then answers every request with it until the node is opened again; `pondra serve`'s ends.
 pub fn failed(why: String) {
     eprintln!("stopping: {why}");
     send(Event::Failed(why));
@@ -159,6 +135,18 @@ pub(crate) fn host(tx: mpsc::UnboundedSender<Event>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pondra serve`'s end of its nodes' failures (`stop`), taken once, before it starts its first node. Not `host`: the
+/// process is still the program's (`hosted` stays false), so a restart still runs the program again.
+#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the command line's serve takes it)
+pub(crate) fn supervise() -> mpsc::UnboundedReceiver<Event> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    *SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx);
+    rx
+}
+
+/// Is a supervisor told of this process's node's failures (`host`, `supervise`)?
+fn supervised() -> bool { SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|s| !s.is_closed()) }
+
 /// Takes the supervisor back: the library's node is closed, or its open failed.
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's close calls it)
 pub(crate) fn unhost() { SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).take(); }
@@ -167,30 +155,81 @@ pub(crate) fn unhost() { SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inne
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's open of a lake from JSON asks it first)
 pub(crate) fn hosting() -> bool { SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).is_some() }
 
-/// What a node restarting in place unwinds with ([`restart_with`]): `panics::spawn` lets it go, and
-/// `panics::door` answers the request 57P03, as a node catching up does.
-#[derive(Debug)]
-pub struct Restarting(pub String);
+/// The lifecycle of a node in this process (`lifecycle::Lifecycle`): the program's, a library's (`hosted`) or a page's.
+/// A guest's (`Options::guest`) ends with its statement. Every lake the node opens, and its member, is handed it.
+pub struct Native {
+    guest: bool,
+}
 
-impl std::fmt::Display for Restarting {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the node is restarting to rejoin the cluster ({}), catching up with its leader: try again, or ask another node", self.0)
+/// A node's lifecycle, a guest's when `guest`.
+pub fn native(guest: bool) -> crate::lifecycle::Life { Arc::new(Native { guest }) }
+
+impl crate::lifecycle::Lifecycle for Native {
+    fn stop(&self, why: String) { stop(why) }
+    fn restart(&self, why: &str, carried: &[(&str, String)]) -> ! { restart_with(self.guest, why, carried) }
+    /// (a library's host and a `pondra sql` guest's shell show only trouble, so there it is not said)
+    fn say(&self, line: &str) {
+        if !hosted() && !self.guest {
+            eprintln!("{line}");
+        }
+    }
+    fn one_off(&self) -> bool { self.guest }
+    fn owns_process(&self) -> bool { !hosted() }
+    fn program(&self) -> anyhow::Result<PathBuf> { exe() }
+    fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir)) }
+}
+
+/// A page's lifecycle (redesign §8): what ends is the page's member, never its worker. A stop ends the member, which
+/// answers every request with why from then on (`Paged::stopped`, 57P01), until the page closes and the module's page is
+/// claimed again. A restart is a stop said as one (57P03), and then the task that asked unwinds with [`Restarting`]. A page
+/// can't unwind (the page's std is built to abort), so there the module traps, and the program that runs the page opens
+/// it again: a kept page's tables are in its folder, and an in-memory page's are gone.
+pub struct PageLife {
+    stopped: Mutex<Option<(&'static str, String)>>, // (the SQLSTATE and the words every request answers once the member ended)
+    say: Option<fn(&str)>,
+}
+
+impl PageLife {
+    /// A page's lifecycle, saying its lines with `say` (`page::Options::say`), or nowhere.
+    pub fn new(say: Option<fn(&str)>) -> Arc<PageLife> { Arc::new(PageLife { stopped: Mutex::new(None), say }) }
+
+    /// The SQLSTATE and the words of how the member ended (`stop`, `restart`), or None while it lives.
+    pub fn stopped(&self) -> Option<(&'static str, String)> { self.stopped.lock().unwrap_or_else(PoisonError::into_inner).clone() }
+
+    fn end(&self, code: &'static str, words: String) {
+        if let Some(say) = self.say {
+            say(&words)
+        }
+        self.stopped.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert((code, words)); // (the first end is the one said)
     }
 }
 
-/// The node must start again, to rejoin its cluster: `restart_with`, with nothing carried.
-pub fn restart(why: &str) -> ! {
-    restart_with(why, &[])
+impl crate::lifecycle::Lifecycle for PageLife {
+    fn stop(&self, why: String) { self.end("57P01", format!("this page's lake stopped ({why}): close the page and open it again")) }
+    fn restart(&self, why: &str, _: &[(&str, String)]) -> ! {
+        self.end("57P03", Restarting(why.to_string()).to_string());
+        std::panic::resume_unwind(Box::new(Restarting(why.to_string())))
+    }
+    fn say(&self, line: &str) {
+        if let Some(say) = self.say {
+            say(line)
+        }
+    }
+    fn one_off(&self) -> bool { false }
+    fn owns_process(&self) -> bool { true } // (the page's worker is its own: no host shares it)
+    fn program(&self) -> anyhow::Result<PathBuf> { anyhow::bail!("a page has no pondra program to start") }
+    fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move { anyhow::bail!("a page leads its own lake only, not {dir}") })
+    }
 }
 
-/// `restart`, with settings of the command line's own for the next run (`pondra sql`'s job and its
-/// tries: `env.rs`), on top of what this process was given. A guest sent back five times gives up: its statement
+/// The node starts again to rejoin its cluster (`Lifecycle::restart`), with settings of the command line's own for the
+/// next run (`pondra sql`'s job and its tries: `env.rs`), on top of what this process was given. A guest sent back five times gives up: its statement
 /// fails, saying why. In a library the node is halted and started again in place: the supervisor is told, and the
 /// task that asked unwinds, past the panic hook (a host's error reporting sees no panic for a takeover). In the
 /// program the same binary runs again (`run::exec_again`). On a page there is no program to run again, so a restart
 /// is a stop until the page decides otherwise (L2's answer in the design).
-pub fn restart_with(why: &str, carried: &[(&str, String)]) -> ! {
-    let guest = is_guest();
+fn restart_with(guest: bool, why: &str, carried: &[(&str, String)]) -> ! {
     if guest && crate::write::tries() >= 5 {
         eprintln!("gave up after 5 restarts: {why}"); // (a guest that is sent back five times is a statement that fails: it says why)
         crate::memory::leave();
@@ -210,9 +249,10 @@ pub fn restart_with(why: &str, carried: &[(&str, String)]) -> ! {
         std::panic::resume_unwind(Box::new(Restarting(why.to_string())))
     }
     #[cfg(feature = "doors")]
-    run::exec_again(carried);
+    run::exec_again(guest, carried);
     #[cfg(not(feature = "doors"))]
     {
+        let _ = carried; // (a page carries nothing: nothing runs again)
         stop(format!("{why}")); // (a page: a restart is a stop, until the page decides otherwise)
         unreachable!("stop ends an unhosted process")
     }
@@ -257,7 +297,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     if let Some(key) = s.auth.owner_key() {
         let _ = lake.owner_key.set(key.to_string()); // (whose tasks this process runs with its owner's files: `runs::signed`)
     }
-    let lives = !is_guest();
+    let lives = !lake.life.one_off();
     let leader = members.is_leader();
     let term = members.leader().n;
     let reader = s.reader || members.reader();
@@ -294,7 +334,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
         Some(Err(e)) if e.downcast_ref::<replica::Unreached>().is_some() => {
             eprintln!("{e:#}");
             crate::terms::newer_claimed(&lake.store, term).await;
-            restart("not leading past members this node can't reach")
+            lake.life.restart("not leading past members this node can't reach", &[])
         }
         Some(r) => {
             r?;
@@ -313,7 +353,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     let log = (!reader).then(|| Arc::new(log::Log::start(lake.clone(), Duration::from_millis(s.flush_ms), to)));
     crate::store::trace("the sequencer");
     python::init(s.python.clone());
-    let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone() };
+    let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone(), tables: Default::default() };
     if let Some(ledger) = lake.ledger() {
         ledger.charge("answers", Arc::downgrade(&app.results) as std::sync::Weak<dyn crate::ledger::Charged>); // (the remembered answers: `/metrics`' `cache_bytes`)
         // (the node's caches of what the lake's own floor doesn't reach, charged once whatever lakes it opens: the answers
@@ -350,7 +390,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
 /// The member's own loops over its App, each as a node that lives keeps it (none for a guest): the leader's keys,
 /// tasks, tiering, checkpoints and emission, a follower's catalog refresh, streaming tasks, the store's upkeep.
 pub fn keep(app: &crate::app::App, s: &Start) {
-    let lives = !is_guest();
+    let lives = !app.lake.life.one_off();
     let leader = app.seq.is_some();
     crate::idle::serving(&app.lake, leader, app.replica.as_ref()); // (what `--idle-exit` waits for: `idle.rs`)
     let reader = s.reader || app.members.reader();
@@ -590,7 +630,7 @@ pub fn unclaim_page() {
 /// term it leads, 0 for a joined page, which claims none (`open_joined`); `marks` keeps that term alive (a finished task for one).
 /// `ended` is the sign-in a joined page follows its node with has ended (`ended`); an own page's never does. `follow` is the
 /// task that follows a joined page's node's stream (`open_joined`), aborted at the page's end (`end_page`).
-pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, ended: Arc<AtomicBool>, superuser: AtomicBool }
+pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, ended: Arc<AtomicBool>, superuser: AtomicBool, pub(crate) life: Arc<PageLife> }
 
 /// Takes the module's page (`PAGED`) for a page's member, and sets the device line its queries hold (`env::device_line`). A
 /// freed page's member may still be closing in the background, which sets PAGED back when it has ended: then this waits for
@@ -611,7 +651,7 @@ async fn claim_paged(line: Option<usize>) -> anyhow::Result<()> {
 
 /// Opens a page's member (`Paged`), its lake on `store` when one is given (a kept page's folder), else in memory, and its
 /// queries holding the page's share of its device's `line` (`claim_paged`). Set back if the open fails.
-pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) -> anyhow::Result<Paged> {
+pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>, life: Arc<PageLife>) -> anyhow::Result<Paged> {
     claim_paged(line).await?;
     let url = crate::memory::place(":memory:");
     let owned = store.is_some(); // (a given store is a kept page's folder, under its Web Lock: no other writer, so its term is taken at once)
@@ -632,7 +672,7 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open(&url, true, false).await?;
+        let l = crate::store::Lake::open(&url, true, false, life.clone()).await?;
         lake = Some(l.clone());
         start_app(l, alone.clone(), None, &start).await
     }
@@ -640,7 +680,7 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
     match made {
         Ok(app) => {
             keep(&app, &start);
-            Ok(Paged { app, url, term, marks, follow: None, ended: Default::default(), superuser: AtomicBool::new(false) })
+            Ok(Paged { app, url, term, marks, follow: None, ended: Default::default(), superuser: AtomicBool::new(false), life })
         }
         Err(e) => {
             end_page(marks, None, lake, &store, term, &url).await; // (a failed open leaves nothing running)
@@ -675,7 +715,7 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
 /// 3 s (a node's is 250 ms, but each of a page's is a request). It claims no term and writes nothing to the cluster, so closing
 /// it changes nothing there. The sign-in's end stops both loops and sets `ended` (a 401 or 403 from the node, or the refresh's
 /// closed error).
-pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, line: Option<usize>) -> anyhow::Result<Paged> {
+pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, line: Option<usize>, life: Arc<PageLife>) -> anyhow::Result<Paged> {
     claim_paged(line).await?;
     let url = crate::memory::place(":memory:");
     crate::memory::give(&url, store);
@@ -688,7 +728,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open_on(&url, true, kv).await?;
+        let l = crate::store::Lake::open_on(&url, true, kv, life.clone()).await?;
         lake = Some(l.clone());
         start_app(l, members, None, &start).await
     }
@@ -731,7 +771,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
                     }
                 }
             });
-            Ok(Paged { app, url, term: 0, marks, follow: Some(follow), ended, superuser: AtomicBool::new(superuser) })
+            Ok(Paged { app, url, term: 0, marks, follow: Some(follow), ended, superuser: AtomicBool::new(superuser), life })
         }
         Err(e) => {
             end_page(marks, None, lake, &store, 0, &url).await; // (a failed open leaves nothing running)
@@ -772,6 +812,12 @@ impl Paged {
     /// Whether the sign-in a joined page follows its node with has ended (`open_joined`): its requests are then refused.
     pub fn ended(&self) -> bool {
         self.ended.load(SeqCst)
+    }
+
+    /// The SQLSTATE and the words of how the member's lake ended (its lifecycle's stop or restart: `PageLife`), or None while
+    /// it lives. Every request is answered with them from then on.
+    pub fn stopped(&self) -> Option<(&'static str, String)> {
+        self.life.stopped()
     }
 
     /// Says the sign-in has ended, as a node refusing it does (`page::Page::ask`): the page answers 28000 from then on.
@@ -821,5 +867,34 @@ mod tests {
         super::unclaim_page();
         super::claim_page().expect("the page is claimable again once it is given back");
         super::unclaim_page();
+    }
+
+    /// A page's lifecycle keeps how its member ended: a stop's 57P01 with why and the way out, said to the page's console;
+    /// a restart's 57P03, after which the task that asked unwinds with `Restarting`. The first end is the one kept. It has no
+    /// program and leads no other lake. (No page is claimed or opened here: `page::tests` says why. tests/page_lake.rs step 11
+    /// runs a page through it.)
+    #[test]
+    fn a_page_life_keeps_its_first_end_and_unwinds_on_a_restart() {
+        use crate::lifecycle::Lifecycle;
+        static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        fn said(line: &str) { SAID.lock().unwrap().push(line.to_string()) }
+        let stopped = super::PageLife::new(Some(said));
+        assert!(stopped.stopped().is_none(), "a member that lives has not ended");
+        stopped.stop("a test's stop".into());
+        let (code, words) = stopped.stopped().expect("a stop is kept");
+        assert_eq!(code, "57P01");
+        assert!(words.contains("a test's stop") && words.contains("open it again"), "{words}");
+        assert_eq!(SAID.lock().unwrap().as_slice(), [words.clone()], "the stop is said to the page's console");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stopped.restart("a later restart", &[]))).expect_err("a restart doesn't return");
+        assert!(unwound.downcast_ref::<super::Restarting>().is_some(), "it unwinds with Restarting");
+        assert_eq!(stopped.stopped().map(|(c, _)| c), Some("57P01"), "the first end is the one kept");
+        let restarted = super::PageLife::new(None);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| restarted.restart("a test's restart", &[])));
+        let (code, words) = restarted.stopped().expect("a restart is kept");
+        assert_eq!(code, "57P03");
+        assert!(words.contains("a test's restart"), "{words}");
+        assert!(restarted.program().is_err() && !restarted.one_off() && restarted.owns_process());
+        let elsewhere = futures::executor::block_on(restarted.lead_elsewhere("s3://b/l")).expect_err("a page leads its own lake only");
+        assert!(elsewhere.to_string().contains("s3://b/l"), "{elsewhere}");
     }
 }

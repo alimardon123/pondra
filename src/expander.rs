@@ -1,5 +1,5 @@
 //! Macros, views, files, other engines' tables and FROM first, expanded in a statement's syntax tree: the front's middle pass, in every build.
-use crate::text::{args, ident, object, text};
+use crate::text::{args, ident, object};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::sql::sqlparser::ast::{self, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Statement, TableFactor, VisitorMut};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
@@ -226,7 +226,7 @@ pub(crate) fn named_apart(sql: &str) -> Option<String> {
     for s in stmts.iter_mut().filter(|s| !matches!(s, Statement::CreateMacro { .. })) {
         let _ = crate::walk::visit_mut(s, &mut names);
     }
-    names.0.then(|| text(&stmts))
+    names.0.then(|| crate::text::text_kept(stmts)) // (the tree kept as its text's parse: `parsed::keep`)
 }
 
 /// VALUES that may hold a subquery (`values_apart`).

@@ -102,8 +102,12 @@ pub(crate) fn plain_statement(one: &str) -> bool {
 /// change or a write, which `run` runs whole. Flight plans a query from the second half without running it.
 pub(crate) async fn plain_of(app: &App, sql: &str) -> Result<Option<(String, String)>> {
     let Some(sent) = single_statement(sql) else { return Ok(None) };
+    crate::query::mark("one statement");
     let one = routines::expand(&app.lake, &crate::vars::bound(&sent)?).await?; // (`$name`: the session's variables)
-    Ok(plain_statement(&one).then_some((sent, one)))
+    crate::query::mark("front");
+    let plain = plain_statement(&one);
+    crate::query::mark("classified");
+    Ok(plain.then_some((sent, one)))
 }
 
 /// Changes data, the lake or a transaction (INSERT, CREATE, CALL, EXECUTE TASK, CHECKPOINT, BEGIN…) in any of `sql`'s

@@ -108,6 +108,7 @@ PROCESS = {
     "engine.rs:JSON_TEXT": "a function's definition (pondra_json_text), the same for every lake",
     "casts.rs:WHOLE": "a function's definition (pondra_whole), the same for every lake",
     "multiply.rs:MULTIPLY": "a function's definition (pondra_multiply), the same for every lake",
+    "divide.rs:DIVIDE": "a function's definitions (pondra_divide, Postgres's places and Spark's), the same for every lake",
     "reset.rs:USED": "what reset() sets back: every per-node static used since the process started",
     "runs.rs:WAKE": SIGNAL,
     "runs.rs:WRITTEN": SIGNAL,
@@ -143,7 +144,7 @@ PROCESS = {
     "tls.rs:PROXIES": SETTING + " (PONDRA_TRUSTED_PROXIES)",
     "tls.rs:TLS": SETTING + " (PONDRA_TLS_*)",
     "users.rs:MAKING": LOCK,
-    "write.rs:JOB": "`pondra sql`'s job: the process's, carried through its restarts (`node::restart_with`)",
+    "write.rs:JOB": "`pondra sql`'s job: the process's, carried through its restarts (`Lifecycle::restart`)",
 }
 
 # What a value nothing can change is made of: anything else (a crate's own type, a session, a client,
@@ -394,7 +395,7 @@ def walks():
 
 def poisoned(found):
     """A process's lock read with `.unwrap()`: a library's node restarting in place unwinds through
-    whatever lock it holds (`node::restart`), and the next start must still read it."""
+    whatever lock it holds (`Lifecycle::restart`), and the next start must still read it."""
     bad = []
     for rel, line, name, ty, how, value in found:
         if how != "static" or f"{rel.rsplit('/', 1)[-1]}:{name}" not in PROCESS or not re.search(r"(?<!tokio::sync::)\b(Mutex|RwLock)<", ty):

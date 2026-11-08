@@ -29,6 +29,36 @@ pub(crate) fn generic(sql: &str) -> Result<Vec<Statement>, ParserError> {
     (*parsed).clone() // (copied outside the lock: another statement's look waits for no copy)
 }
 
+/// `sql`'s parse when one of the last few looks made it (`generic`), and None when none did: nothing is parsed here. The
+/// engine plans a query from it rather than parse the text again (`engine::planned`).
+pub(crate) fn already(sql: &str) -> Option<Parsed> {
+    LAST.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(text, _)| text == sql).map(|(_, parsed)| parsed.clone())
+}
+
+/// `stmts` kept as `sql`'s parse, for a tree that `sql` is its text of (`text::text_kept`): a look or the engine that then
+/// asks for `sql`'s parse takes them, and the text is not parsed again. It parses back to the same statements (sqlparser's
+/// `Display`). Under the one-parse check (`checked`) each tree kept is held to the text's own parse here, and the one the
+/// engine plans from to DataFusion's parse of the text too (`engine::datafusions_parse`).
+pub(crate) fn keep(sql: &str, stmts: Vec<Statement>) {
+    if sql.len() > LONGEST {
+        return;
+    }
+    if checked() {
+        let theirs = Parser::parse_sql(&GenericDialect {}, sql);
+        // (a panic: a request's is answered as an error, so a gate's run names the text; keep says nothing to its caller)
+        assert!(theirs.as_ref().is_ok_and(|t| *t == stmts), "one parse: a tree kept is not its text's parse, for {sql}\nthe tree: {stmts:?}\nthe text's: {theirs:?}");
+    }
+    kept(&LAST, sql, |_| Arc::new(Ok(stmts)));
+}
+
+/// Whether the front's trees are checked against the parse of their text (`keep`, `engine::datafusions_parse`): in a
+/// debug build, and in a node started with `PONDRA_TEST_ONE_PARSE` (the gates' runs: DataFusion's SQL tests, TPC-H,
+/// TPC-DS, the random queries, the harness).
+pub(crate) fn checked() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| cfg!(debug_assertions) || crate::env::is_set("PONDRA_TEST_ONE_PARSE"));
+    *ON
+}
+
 /// What `make` makes of `sql`, kept with it among the last `KEPT` texts of `last` (the caller leaves out a text past
 /// `LONGEST`): made once while the text is among them. The lock is held for the look and the keeping, never for `make`.
 pub(crate) fn kept<T: Clone>(last: &Mutex<VecDeque<(String, T)>>, sql: &str, make: impl FnOnce(&str) -> T) -> T {

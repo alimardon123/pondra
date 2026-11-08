@@ -1073,7 +1073,7 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
     crate::protect::stamp(&mut d); // (who lifts a protection, when the statement doesn't say)
     let out = match &app.seq {
         Some(seq) => crate::write::ddl_here(&app.lake, seq, &app.lock, d.clone()).await?,
-        None if !app.members.is_leader() => Box::pin(crate::write::send_as(&app.lake.url, crate::write::Request::Ddl(d.clone()), credential.token())).await?, // (the leader makes it)
+        None if !app.members.is_leader() => Box::pin(crate::write::send_as(&app.lake.url, crate::write::Request::Ddl(d.clone()), credential.token(), &app.lake.life)).await?, // (the leader makes it)
         None => {
             let _guard = app.lock.lock().await;
             crate::ddl::apply(&app.lake, d.clone()).await?

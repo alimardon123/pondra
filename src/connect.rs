@@ -3,7 +3,7 @@
 //! the whole extension: its kind, its statements and its types, each an entry in the registry, so the core lists,
 //! shows, describes and grants connections with no edit of its own. Its credentials stay in a secret, which it names;
 //! SHOW CREATE and `pondra.objects` show that name, never a value.
-use crate::connections::{ConnectionType, ConnectionTypes, Holds, SECRET, URL};
+use crate::connections::{key, ConnectionType, ConnectionTypes, Definition, Holds, SECRET, URL};
 use crate::objects::{Kind, Kinds, OnClone};
 use crate::registry::BuiltIn;
 use crate::statements::{Parsed, Right, Run, Statement, Statements};
@@ -12,7 +12,7 @@ use crate::codes::coded;
 use anyhow::Result;
 use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
 use futures::future::BoxFuture;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json as j, Value};
 use std::collections::BTreeMap;
 
@@ -37,7 +37,7 @@ const KIND: Kind = Kind {
     name: "connection",
     family: "connection",
     verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"],
-    prefix: "cn/",
+    prefix: crate::connections::PREFIX,
     privileges: &["READ", "WRITE"],
     on_clone: OnClone::Copy, // (a branch keeps the definition; its secret is the branch's own, made there)
     project: Some("connections come to a project's files in a later step: make them in the database (CREATE CONNECTION …)"),
@@ -58,24 +58,29 @@ const DROP: Statement = Statement { words: &["DROP", "CONNECTION"], parse: dropp
 /// messages is its own extension's entry (`delta`, `iceberg`, `kafka`, `share`), so ATTACH and CREATE CONNECTION list the
 /// same types.
 static TYPES: &[&ConnectionType] = &[
-    &ConnectionType { name: "s3", holds: Holds::Files, options: &[URL, SECRET], schemes: &["s3"], secret_types: &["s3", "r2"], about: "an S3 bucket, or one that speaks S3 (R2, MinIO): url = 's3://bucket/folder'" },
-    &ConnectionType { name: "gcs", holds: Holds::Files, options: &[URL, SECRET], schemes: &["gs"], secret_types: &["gcs"], about: "a Google Cloud Storage bucket: url = 'gs://bucket/folder'" },
-    &ConnectionType { name: "azure", holds: Holds::Files, options: &[URL, SECRET], schemes: &["az", "abfs", "abfss"], secret_types: &["azure"], about: "an Azure Blob Storage or Data Lake container: url = 'az://container/folder'" },
-    &ConnectionType { name: "folder", holds: Holds::Files, options: &[URL], schemes: &[""], secret_types: &[], about: "a folder on the machine, for a lake in a folder: url = '/data/drop'" },
-    &ConnectionType { name: "pondra", holds: Holds::Files, options: &[URL, SECRET], schemes: &["pondra"], secret_types: &["pondra"], about: "the store another Pondra node serves: url = 'pondra://host:7070/folder'" },
+    &ConnectionType { name: "s3", holds: Holds::Files, options: &[URL, SECRET], schemes: &["s3"], secret_types: &["s3", "r2"], about: "an S3 bucket, or one that speaks S3 (R2, MinIO): url = 's3://bucket/folder'", open: Some(bucket) },
+    &ConnectionType { name: "gcs", holds: Holds::Files, options: &[URL, SECRET], schemes: &["gs"], secret_types: &["gcs"], about: "a Google Cloud Storage bucket: url = 'gs://bucket/folder'", open: Some(bucket) },
+    &ConnectionType { name: "azure", holds: Holds::Files, options: &[URL, SECRET], schemes: &["az", "abfs", "abfss"], secret_types: &["azure"], about: "an Azure Blob Storage or Data Lake container: url = 'az://container/folder'", open: Some(bucket) },
+    &ConnectionType { name: "folder", holds: Holds::Files, options: &[URL], schemes: &[""], secret_types: &[], about: "a folder on the machine, for a lake in a folder: url = '/data/drop'", open: FOLDER },
+    &ConnectionType { name: "pondra", holds: Holds::Files, options: &[URL, SECRET], schemes: &["pondra"], secret_types: &["pondra"], about: "the store another Pondra node serves: url = 'pondra://host:7070/folder'", open: None }, // (its files through a path come with the served store's reach: piece 5)
 ];
 
-/// A connection as the catalog keeps it (`cn/<name>`): its type and its options, the secret's name among them.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct Definition {
-    #[serde(rename = "type")]
-    pub ty: String,
-    pub options: BTreeMap<String, Value>,
+/// A bucket's files: its store, signed with the secret's settings (none: the node's own credentials, which the admin who made
+/// the connection lends with it), under the folder its url names.
+fn bucket(url: &str, secret: Option<&BTreeMap<String, String>>) -> Result<std::sync::Arc<dyn object_store::ObjectStore>> {
+    let u = url::Url::parse(url)?;
+    let root = url::Url::parse(&format!("{}://{}", u.scheme(), u.host_str().unwrap_or_default()))?;
+    let store = crate::ext::build(&root, secret, crate::ext::For::Files)?;
+    let folder = u.path().trim_matches('/');
+    Ok(match folder.is_empty() {
+        true => store,
+        false => std::sync::Arc::new(object_store::prefix::PrefixStore::new(store, folder)),
+    })
 }
 
-fn key(name: &str) -> String {
-    format!("{}{name}", KIND.prefix)
-}
+/// A folder's files, on this machine: opened as a lake's folder is (`store::open_store`: made if it isn't there, for
+/// COPY … TO '@drop/out/'), which a page refuses by name, having no folders.
+const FOLDER: Option<crate::connections::Opener> = Some(|url, _| Ok(crate::store::open_store(url.strip_prefix("file://").unwrap_or(url))?.1));
 
 /// SHOW CREATE CONNECTION's statement: its options as they were given, the secret by its name.
 fn shown(name: &str, def: &Value) -> String {
@@ -297,6 +302,10 @@ fn make<'a>(lake: &'a Lake, tree: Value) -> BoxFuture<'a, Result<Value>> {
             if !m.replace {
                 return Ok(j!({"connection": m.name, "unchanged": true}));
             }
+            let had: Definition = lake.cat.get(&key(&m.name)).await?.unwrap_or_else(|| d.clone());
+            if had.ty != d.ty {
+                not_attached(lake, &m.name, &format!("CREATE OR REPLACE CONNECTION {} TYPE {}", m.name, d.ty)).await?;
+            }
         }
         lake.cat.commit(vec![(key(&m.name), json(&d))], &[]).await?;
         Ok(j!({"connection": m.name}))
@@ -322,6 +331,7 @@ fn change<'a>(lake: &'a Lake, tree: Value) -> BoxFuture<'a, Result<Value>> {
             return Ok(j!({"connection": a.name, "exists": false}));
         };
         if let Some(to) = a.rename {
+            not_attached(lake, &a.name, &format!("ALTER CONNECTION {} RENAME TO {to}", a.name)).await?;
             if lake.cat.get::<Value>(&key(&to)).await?.is_some() {
                 return Err(coded("42710", format!("connection {to} already exists")));
             }
@@ -340,6 +350,15 @@ fn change<'a>(lake: &'a Lake, tree: Value) -> BoxFuture<'a, Result<Value>> {
     })
 }
 
+/// A connection a database is attached over (`ATTACH shop`) keeps its name and its type while it is: DETACH comes first.
+async fn not_attached(lake: &Lake, name: &str, then: &str) -> Result<()> {
+    let over = crate::ext::attached_over(lake, name).await?;
+    match over.first() {
+        None => Ok(()),
+        Some(db) => Err(coded("2BP01", format!("database {} is attached over connection {name}: DETACH {db}, then {then}", over.join(", ")))),
+    }
+}
+
 #[derive(Deserialize)]
 struct Dropped {
     name: String,
@@ -355,6 +374,7 @@ fn remove<'a>(lake: &'a Lake, tree: Value) -> BoxFuture<'a, Result<Value>> {
             }
             return Ok(j!({"connection": d.name, "dropped": false}));
         }
+        not_attached(lake, &d.name, &format!("DROP CONNECTION {}", d.name)).await?;
         lake.cat.commit(vec![], &[key(&d.name)]).await?;
         Ok(j!({"connection": d.name, "dropped": true}))
     })
@@ -366,7 +386,7 @@ mod tests {
     use crate::write::Stmt;
 
     async fn lake() -> Result<std::sync::Arc<Lake>> {
-        Lake::open(&format!("memory://connections-{}", uuid::Uuid::new_v4().simple()), true, false).await
+        Lake::open(&format!("memory://connections-{}", uuid::Uuid::new_v4().simple()), true, false, crate::lifecycle::unhosted()).await
     }
 
     /// One statement through the core's one path: `write::parse`, then the leader's `ddl::apply`. Err: its refusal, with its code.
@@ -448,6 +468,58 @@ mod tests {
         Ok(())
     }
 
+    /// A connection's files are reached by its name (`'@drop_zone/…'`, read at `cn://drop_zone/…`): through a store made
+    /// from its definition, made again when it changes, after READ or WRITE on it; the caller needs no USAGE on its secret.
+    #[tokio::test]
+    async fn a_connections_files_are_reached_by_its_name() -> Result<()> {
+        use object_store_df::ObjectStoreExt as _;
+        let dir = std::env::temp_dir().join(format!("pondra-cn-{}", uuid::Uuid::new_v4().simple()));
+        let lake = Lake::open(dir.join("lake").to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let (drop, later) = (dir.join("drop"), dir.join("later"));
+        run(&lake, &format!("CREATE CONNECTION drop_zone TYPE folder WITH (url = '{}')", drop.display())).await.unwrap();
+        // (the paths that take one: a file reference, a reader's list, COPY's source and target, a LOCATION)
+        let q = crate::routines::expand(&lake, "SELECT * FROM '@drop_zone/in/*.csv' JOIN read_parquet(['@Drop_Zone/a.parquet', 's3://b/c.parquet']) ON true").await?;
+        let mut urls: Vec<String> = crate::ext_names::names(&q).iter().filter_map(|n| crate::ext_names::spec(n)).flat_map(|s| s.urls).collect();
+        urls.sort();
+        assert_eq!(urls, ["cn://drop_zone/a.parquet", "cn://drop_zone/in/*.csv", "s3://b/c.parquet"]);
+        assert!(matches!(crate::ext::statement("COPY (SELECT 1 AS a) TO '@drop_zone/out/'"), Some(Stmt::CopyTo(_, to, _)) if to == "cn://drop_zone/out/"));
+        assert!(matches!(crate::ext::statement("COPY INTO t FROM '@drop_zone/in/*.csv'"), Some(Stmt::CopyInto(_, crate::copy::Source::Path(p), _)) if p == "cn://drop_zone/in/*.csv"));
+        assert_eq!(crate::connections::place("@drop_zone"), Some("cn://drop_zone/".into()));
+        assert_eq!(crate::connections::place("@/x"), None);
+        // (its store: the folder, then the one its url is changed to)
+        let (store, path) = crate::ext::store(&lake, "cn://drop_zone/in/a.csv").await?;
+        store.put(&path, bytes::Bytes::from_static(b"a\n1\n").into()).await?;
+        assert_eq!(std::fs::read_to_string(drop.join("in/a.csv"))?, "a\n1\n");
+        run(&lake, &format!("ALTER CONNECTION drop_zone SET (url = '{}')", later.display())).await.unwrap();
+        let (store, path) = crate::ext::store(&lake, "cn://drop_zone/b.csv").await?;
+        store.put(&path, bytes::Bytes::from_static(b"b").into()).await?;
+        assert!(later.join("b.csv").exists() && !drop.join("b.csv").exists());
+        let refused = |url: &'static str| {
+            let lake = lake.clone();
+            async move { crate::ext::store(&lake, url).await.map(|_| ()).unwrap_err() }
+        };
+        let e = refused("cn://nope/x.csv").await;
+        assert_eq!((crate::codes::of(&e), e.to_string().starts_with("no connection nope")), ("42704", true));
+        run(&lake, "CREATE CONNECTION shop TYPE delta WITH (url = 's3://b/tables')").await.unwrap();
+        assert_eq!(refused("cn://shop/x").await.to_string(), "connection shop holds tables, not files: '@shop/…' reads files");
+        // (READ to read, WRITE to write: a user's grants, not its secrets')
+        run(&lake, "CREATE USER ana").await.unwrap();
+        let may = |privilege: &'static str| {
+            let lake = lake.clone();
+            async move {
+                let ana = crate::users::principal(&lake, "ana").await.unwrap();
+                crate::auth::WHO.scope(ana, async { crate::ext::through("cn://drop_zone/a.csv", privilege) }).await
+            }
+        };
+        let e = may("READ").await.unwrap_err();
+        assert_eq!((crate::codes::of(&e), e.to_string()), ("42501", "'@drop_zone/…': READ on connection drop_zone isn't granted to this user (an admin grants it: GRANT READ ON CONNECTION drop_zone TO …)".into()));
+        run(&lake, "GRANT READ ON CONNECTION drop_zone TO ana").await.unwrap();
+        may("READ").await?;
+        assert!(may("WRITE").await.is_err(), "READ isn't WRITE");
+        _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// A type for tables is its own extension's entry (`read_delta`, `catalogs`, `kafka_client`, `sharing_client`), and
     /// ATTACH reads the same entries: its TYPE list and each type's options are CREATE CONNECTION's.
     #[tokio::test]
@@ -470,6 +542,46 @@ mod tests {
         assert_eq!(said("ATTACH 's3://b' AS x (TYPE iceberg, FORMAT x)").await.1, "ATTACH … (TYPE iceberg) has no option format: endpoint, secret, read_only, endpoint_type, access_delegation_mode");
         assert_eq!(said("ATTACH 's3://b' AS x (TYPE delta, URL 's3://c')").await.1, "ATTACH … (TYPE delta) has no option url: secret, read_only", "its url is ATTACH's own");
         assert_eq!(run(&lake, "ATTACH 's3://b/t' AS x (TYPE delta, READ_ONLY)").await.unwrap()[0]["type"], "delta");
+        Ok(())
+    }
+
+    /// A connection that holds tables is attached by its name (`ATTACH shop [AS name]`): checked as ATTACH 'url' … (TYPE t) is,
+    /// read with the connection's url and options as they are now, and the connection keeps its name and type while it is.
+    #[tokio::test]
+    async fn a_connections_tables_are_attached_by_its_name() -> Result<()> {
+        let lake = lake().await?;
+        let over = |name: &'static str| {
+            let lake = lake.clone();
+            async move { crate::ext::attached(&lake).await.unwrap().into_iter().find(|(n, _)| n == name).map(|(_, a)| a).expect("attached") }
+        };
+        assert_eq!(code(run(&lake, "ATTACH shop").await).0, "42704");
+        run(&lake, "CREATE CONNECTION shop TYPE delta WITH (url = 's3://b/tables/', read_only = true)").await.unwrap();
+        assert_eq!(run(&lake, "ATTACH DATABASE shop AS sales").await.unwrap()[0], j!({"attached": "sales", "type": "delta", "url": "s3://b/tables"}));
+        let a = over("sales").await;
+        assert_eq!((a.kind.as_str(), a.url.as_str(), a.connection.as_deref(), a.options.get("read_only").map(String::as_str)), ("delta", "s3://b/tables", Some("shop"), Some("true")));
+        let shown = crate::objects::list(&lake).await?.into_iter().find(|o| o.kind == "database" && o.name == "sales").and_then(|o| o.definition);
+        assert_eq!(shown.as_deref(), Some("ATTACH shop AS sales"), "SHOW CREATE DATABASE names the connection, not its url");
+        // (it follows the connection: ALTER CONNECTION … SET and RESET)
+        run(&lake, "ALTER CONNECTION shop SET (url = 's3://c/t')").await.unwrap();
+        run(&lake, "ALTER CONNECTION shop RESET (read_only)").await.unwrap();
+        let a = over("sales").await;
+        assert_eq!((a.url.as_str(), a.options.get("read_only")), ("s3://c/t", None));
+        // (the connection keeps its name and its type while a database is attached over it)
+        let said = "database sales is attached over connection shop: DETACH sales, then";
+        assert_eq!(code(run(&lake, "DROP CONNECTION shop").await), ("2BP01".into(), format!("{said} DROP CONNECTION shop")));
+        assert_eq!(code(run(&lake, "ALTER CONNECTION shop RENAME TO store").await), ("2BP01".into(), format!("{said} ALTER CONNECTION shop RENAME TO store")));
+        assert_eq!(code(run(&lake, "CREATE OR REPLACE CONNECTION shop TYPE kafka WITH (url = 'kafka://b:9092')").await).0, "2BP01");
+        run(&lake, "CREATE OR REPLACE CONNECTION shop TYPE delta WITH (url = 's3://d/t')").await.unwrap();
+        assert_eq!(over("sales").await.url, "s3://d/t");
+        // (with no AS, it is attached by the connection's name; a connection's options are its own; one for files isn't attached)
+        run(&lake, "ATTACH shop").await.unwrap();
+        assert_eq!(over("shop").await.connection.as_deref(), Some("shop"));
+        assert!(code(run(&lake, "ATTACH shop AS x (TYPE delta)").await).1.starts_with("ATTACH shop [AS name]: a connection's options are its own"));
+        run(&lake, "CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://b/drop')").await.unwrap();
+        assert!(code(run(&lake, "ATTACH drop_zone").await).1.starts_with("ATTACH … (TYPE s3): delta, iceberg, kafka or share"));
+        run(&lake, "DETACH sales").await.unwrap();
+        run(&lake, "DETACH shop").await.unwrap();
+        run(&lake, "DROP CONNECTION shop").await.unwrap();
         Ok(())
     }
 

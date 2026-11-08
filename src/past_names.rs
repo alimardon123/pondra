@@ -22,6 +22,12 @@ impl Spec {
     }
 }
 
+/// The front's pass of this module (`passes.rs`): `syntax`, triggered by `AS OF` and `=>`.
+pub(crate) fn pass() -> crate::passes::Pass {
+    fn run(sql: &str) -> anyhow::Result<Cow<'_, str>> { Ok(syntax(sql)) }
+    crate::passes::Pass { name: "past_names.syntax", order: 30, words: vec![], marks: vec![&["as", "of"], &["=>"]], run: crate::passes::Run::Text(run) }
+}
+
 /// `t AT (VERSION => …)` → `pondra_at(t, version => …) AS t`, outside strings and comments: the
 /// parser takes no `AT` after a table (only Snowflake's and Databricks' dialects do).
 pub fn syntax(sql: &str) -> Cow<'_, str> {

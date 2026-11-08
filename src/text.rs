@@ -125,17 +125,32 @@ pub fn control(sql: &str) -> Option<&'static str> {
 #[cfg_attr(not(feature = "lake"), allow(dead_code))]
 pub(crate) fn text(stmts: &[Statement]) -> String { stmts.iter().map(sql).collect::<Vec<_>>().join(";\n") }
 
+/// `stmts` as SQL text (`text`), kept as that text's parse (`parsed::keep`) when each prints as itself: the next look and
+/// the engine (`engine::planned`) take the tree rather than parse the text again (step 8's one parse). A statement written
+/// with a fix for the reader (a doubled minus, a macro's `()`) parses back to another tree: then the text is parsed again.
+pub(crate) fn text_kept(stmts: Vec<Statement>) -> String {
+    let parts = stmts.iter().map(printed).collect::<Vec<_>>();
+    let text = parts.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join(";\n");
+    if parts.iter().all(|(_, itself)| *itself) {
+        crate::parsed::keep(&text, stmts);
+    }
+    text
+}
+
 /// A statement as SQL text again. sqlparser writes `- -3` (or `- $x`, `$x` bound to -3) as `--3`,
 /// which reads back as a comment, so a minus before anything written with a minus first gets
 /// parentheses.
-pub fn sql(s: &Statement) -> String {
+pub fn sql(s: &Statement) -> String { printed(s).0 }
+
+/// A statement as SQL text (`sql`), and whether that is its own `Display`: false when the text has a fix for the reader.
+fn printed(s: &Statement) -> (String, bool) {
     // (sqlparser writes a macro with no parameters as `CREATE MACRO m AS …`, which it doesn't read back: its `()` kept)
     if let Statement::CreateMacro { args: None, .. } = s {
         let mut s = s.clone();
         if let Statement::CreateMacro { args, .. } = &mut s {
             *args = Some(vec![]);
         }
-        return sql(&s);
+        return (printed(&s).0, false);
     }
     let twice = |e: &Expr| matches!(e, Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } if expr.to_string().starts_with('-'));
     let mut doubled = false;
@@ -144,7 +159,7 @@ pub fn sql(s: &Statement) -> String {
         ControlFlow::<()>::Continue(())
     });
     if !doubled {
-        return s.to_string();
+        return (s.to_string(), true);
     }
     let mut s = s.clone();
     let _ = crate::walk::visit_expressions_mut(&mut s, |e| {
@@ -153,7 +168,7 @@ pub fn sql(s: &Statement) -> String {
         }
         ControlFlow::<()>::Continue(())
     });
-    s.to_string()
+    (s.to_string(), false)
 }
 
 pub const PUBLIC: &str = "public";
@@ -291,6 +306,19 @@ pub fn makes_json(sql: &str) -> bool {
     CALL.is_match(sql)
 }
 
+/// The front's pass for `names_a_type` (`passes.rs`): triggered by an array type's `[]`, a set function, a JSON maker, `||`,
+/// a string, `::`, a cast, and the enum functions.
+pub(crate) fn types_pass() -> crate::passes::Pass {
+    let mut words = vec!["generate_series", "range", "unnest", "enum_range", "enum_first", "enum_last", "pg_typeof", "cast", "try_cast", "safe_cast"];
+    for j in ["json", "jsonb"] {
+        for f in ["array_elements", "array_elements_text", "each", "each_text", "object_keys", "to_record", "to_recordset"] {
+            words.push(Box::leak(format!("{j}_{f}").into_boxed_str()));
+        }
+    }
+    words.extend(JSON_MAKERS.iter().copied());
+    crate::passes::Pass { name: "text.names_a_type", order: 80, words, marks: vec![&["[]"], &["||"], &["'"], &["::"]], run: crate::passes::Run::Wants(names_a_type) }
+}
+
 /// Could `sql` name a type of one's own, in a cast or one of the enum functions? (Only then is
 /// it parsed for one: the built-in types' names are left alone.) A cast to uuid, json or jsonb,
 /// an array type, a set function (which may read a column: `lateral::functions`), a JSON maker's
@@ -338,12 +366,59 @@ pub fn names_a_type(sql: &str) -> bool {
     const BUILT_IN: &[&str] = &["int", "integer", "bigint", "smallint", "tinyint", "int2", "int4", "int8", "hugeint", "ubigint", "uinteger", "usmallint", "utinyint", "float", "float4",
         "float8", "real", "double", "decimal", "numeric", "dec", "text", "varchar", "char", "character", "string", "bpchar", "bool", "boolean", "date", "time", "timestamp", "timestamptz",
         "datetime", "interval", "json", "jsonb", "uuid", "bytea", "blob", "binary", "varbinary", "bytes", "regclass", "regtype", "regproc", "regnamespace", "oid", "name", "variant", "bit"];
+    // (a name after AS is a type only in a cast's parentheses: `SELECT x AS mood` names a column, `CAST(x AS mood)` a type)
+    // (and only a text with a cast's call is tokenized to tell, once for all its AS: most have none)
+    static CAST_CALL: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:try_|safe_)?cast\s*\(").expect("a regex"));
+    let calls = std::cell::OnceCell::new();
+    let mut casts: Option<Casts> = None;
+    let mut a_type = |c: &regex::Captures| c.get(0).is_some_and(|m| m.as_str().starts_with("::") || (*calls.get_or_init(|| CAST_CALL.is_match(sql)) && casts.get_or_insert_with(|| Casts::of(sql)).as_at(m.start())));
     NAMED.captures_iter(sql).any(|c| match (c.get(1), c.get(2)) {
         _ if c.get(3).is_some() => c.get(3).is_some_and(|s| !is_uuid(s.as_str())), // (`'A0EE…'`: read as a uuid where one is compared with it or written into one)
         (None, _) => true, // (enum_range(…), pg_typeof(…))
-        (Some(_), Some(_)) => true,
-        (Some(n), None) => ["uuid", "json", "jsonb"].iter().any(|t| n.as_str().eq_ignore_ascii_case(t)) || !BUILT_IN.contains(&n.as_str().to_lowercase().as_str()), // (a cast to uuid, json or jsonb: written as text)
+        (Some(_), Some(_)) => a_type(&c),
+        // (a built-in type's name is looked at first: `CAST(x AS VARCHAR)` asks nothing more; uuid, json and jsonb are written as text)
+        (Some(n), None) => (["uuid", "json", "jsonb"].iter().any(|t| n.as_str().eq_ignore_ascii_case(t)) || !BUILT_IN.contains(&n.as_str().to_lowercase().as_str())) && a_type(&c),
     })
+}
+
+/// Whether each `AS` of a text, asked in the order they come, is a cast's (`CAST(x AS t)`, `TRY_CAST`, `SAFE_CAST`): the
+/// innermost parenthesis open there follows one of those words. Not an alias's, a CREATE's or a WITH query's. The tokens are
+/// walked once for all of them: walked from the start for each, a `pondra.find` over 1,000 tables (a VALUES of nine casts a
+/// row, past `parsed::LONGEST` so tokenized for each too) took minutes. When the tokenizer refuses the text, yes, so the
+/// parser is the one to say.
+struct Casts {
+    tokens: Option<std::sync::Arc<Tokens>>,
+    next: usize,     // (the first token not walked yet)
+    open: Vec<bool>, // (each open parenthesis: a cast's?)
+    after_cast: bool, // (the last token walked, whitespace aside, is the word cast, try_cast or safe_cast)
+}
+
+impl Casts {
+    fn of(sql: &str) -> Casts {
+        Casts { tokens: tokens(sql), next: 0, open: vec![], after_cast: false }
+    }
+
+    /// Whether the `AS` at byte `at` is a cast's: `at` comes after every place asked before.
+    fn as_at(&mut self, at: usize) -> bool {
+        let Some(t) = &self.tokens else { return true };
+        while self.next < t.toks.len() && t.start[self.next] < at {
+            match &t.toks[self.next] {
+                Token::Whitespace(_) => {}
+                Token::LParen => {
+                    self.open.push(self.after_cast);
+                    self.after_cast = false;
+                }
+                Token::RParen => {
+                    self.open.pop();
+                    self.after_cast = false;
+                }
+                Token::Word(w) => self.after_cast = w.quote_style.is_none() && ["cast", "try_cast", "safe_cast"].iter().any(|k| w.value.eq_ignore_ascii_case(k)),
+                _ => self.after_cast = false,
+            }
+            self.next += 1;
+        }
+        self.open.last().copied().unwrap_or(false)
+    }
 }
 
 /// An expression's place in its statement, which tells it from another of the same text.
@@ -896,6 +971,30 @@ mod tests {
             assert!(names_a_type(sql), "{sql}");
         }
         assert!(names_a_type("SELECT json_agg(x) FROM t") && names_a_type("SELECT * FROM generate_series(1, t.n)") && names_a_type("SELECT * FROM jsonb_each(t.doc)") && names_a_type("SELECT '{a}'::text[]"));
+    }
+
+    #[test]
+    fn a_name_after_as_is_a_type_only_in_a_cast() {
+        // (a column's or a table's alias, a CREATE's AS and a WITH query's name send no statement through the parser)
+        for sql in ["SELECT 77 AS k", "SELECT g AS mood, count(*) AS n FROM t AS a GROUP BY g", "SELECT x AS uuid FROM t", "CREATE TABLE c AS SELECT 1",
+            "WITH q AS MATERIALIZED (SELECT 1) SELECT * FROM q", "SELECT CAST(x AS INT) AS mood FROM t", "SELECT f(x) AS mood FROM t", "SELECT 'cast(x as mood)' AS a"] {
+            assert!(!names_a_type(sql), "{sql}");
+        }
+        for sql in ["SELECT CAST(x AS mood) FROM t", "SELECT try_cast(x AS mood)", "SELECT SAFE_CAST(x AS s.mood)", "SELECT CAST((x) AS mood)", "SELECT CAST(f(x, y) AS mood) AS m",
+            "SELECT upper(CAST(CAST(x AS mood) AS TEXT))", "SELECT x::mood AS m", "SELECT CAST(x AS uuid) AS id", "SELECT CAST(x AS jsonb)"] {
+            assert!(names_a_type(sql), "{sql}");
+        }
+        assert!(names_a_type("SELECT CAST(x AS mood), 'open"), "the tokenizer refuses an unclosed string: the parser is the one to say");
+        assert!(names_a_type("SELECT CAST(a AS INT) AS m1, f(CAST(b AS s.mood)) AS m2"), "the second cast, after an alias");
+        assert!(!names_a_type("SELECT CAST(CAST(a AS INT) AS TEXT) AS mood, (b) AS m, CAST((c) AS VARCHAR) AS t"));
+        // (a long text with an AS in each of thousands of items, as `pondra.find`'s rows are: its tokens walked once, not once an AS)
+        let items: Vec<String> = (0..6000).map(|i| format!("CAST(f(a, '{i}') AS VARCHAR) AS c{i}")).collect();
+        let long = format!("SELECT {} FROM t", items.join(", "));
+        assert!(long.len() > crate::parsed::LONGEST);
+        let started = std::time::Instant::now();
+        assert!(!names_a_type(&long), "built-in types and aliases only");
+        assert!(names_a_type(&format!("{long} WHERE CAST(x AS mood) = 'happy'")), "and a type of one's own at its end");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     #[test]
