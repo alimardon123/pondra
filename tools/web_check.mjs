@@ -39,8 +39,9 @@ const lake = args.includes('--lake')
   : resolve(dirname(fileURLToPath(import.meta.url)), '../web/lake');
 const sizes = args.includes('--sizes');
 // The most a page may download (`--sizes`: the module at brotli 11, as a server sends it), designs/page-same-core.md P4. It
-// moves down with each cut, never up without a reason in the commit that moves it.
-const BROTLI_BUDGET = 9_200_000;
+// moves down with each cut, never up without a reason in the commit that moves it. 9.2 → 9.206 MB: eager aggregation
+// (`eager.rs`, 6.2 KB), a rule every form's planner runs (TPC-DS q22 3.46 → 0.42 s), the room above main kept as it was.
+const BROTLI_BUDGET = 9_206_000;
 // The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
 const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows
