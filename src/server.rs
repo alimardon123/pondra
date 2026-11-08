@@ -1223,12 +1223,12 @@ fn pieces(h: crate::query::Handed) -> Body {
 /// `GET /sql/pages/{id}?from=10000&rows=10000`: more rows of an answer the console was sent
 /// (`pages.rs`), as `typed` has them; with `&format=csv|tsv|ndjson|parquet|xlsx`, every row of it as
 /// a file to download (`render`), not run again. 410 once it is no longer kept (run it again).
-async fn page(Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
+async fn page(State(app): State<App>, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
     let num = |k: &str, or: usize| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(or);
     let (from, rows, format) = (num("from", 0), num("rows", crate::answer::SHOWN).clamp(1, crate::answer::MOST), q.get("format").map(String::as_str).filter(|f| *f != "typed"));
     let got = match format {
-        Some(f) => crate::pages::page(&id, 0, usize::MAX).map(|b| crate::answer::render(&b, Some(f), crate::pages::keep)),
-        None => crate::pages::page(&id, from, rows).map(|b| crate::answer::typed(&b, rows, crate::pages::keep).map(bytes::Bytes::from)),
+        Some(f) => crate::pages::page(&app.lake, &id, 0, usize::MAX).map(|b| crate::answer::render(&b, Some(f), &|rows| crate::pages::keep(&app.lake, rows))),
+        None => crate::pages::page(&app.lake, &id, from, rows).map(|b| crate::answer::typed(&b, rows, &|rows| crate::pages::keep(&app.lake, rows)).map(bytes::Bytes::from)),
     };
     match got {
         Some(Ok(body)) => ([("content-type", crate::answer::content_type(format))], body).into_response(),

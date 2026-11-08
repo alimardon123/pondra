@@ -886,7 +886,7 @@ async fn keys(lake: &Lake) -> Result<Keys> {
             ensure!(lake.cat.is_writer(), "the lake's keys aren't made yet: its leader makes them when it starts");
             // (sealed from the first write when no release older than format 3 can read the lake; otherwise
             // in the clear, and `seal_keys` seals them once every node can read them sealed)
-            let fresh = crate::format::made() || crate::format::of(&lake.cat).await?.format >= SEALED;
+            let fresh = crate::format::made(lake) || crate::format::of(&lake.cat).await?.format >= SEALED;
             let kept = match crate::ext::shared_master() && fresh {
                 true => {
                     crate::format::require(lake, SEALED, "the lake's own keys, sealed").await?;

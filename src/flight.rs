@@ -369,7 +369,7 @@ impl Wire for FlightWire {
     fn kept_as(&self) -> Option<Cow<'_, str>> { Some(Cow::Borrowed("arrow")) }
     fn encode(&self, rows: Vec<RecordBatch>) -> anyhow::Result<(Option<bytes::Bytes>, Encoded)> {
         let small = !rows.is_empty() && rows.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= crate::app::Results::BIGGEST;
-        let keep = small.then(|| crate::answer::render(&rows, Some("arrow"), crate::pages::keep)).transpose()?;
+        let keep = small.then(|| crate::answer::render(&rows, Some("arrow"), &|_| None)).transpose()?; // (Arrow keeps nothing for pages: only a typed answer does)
         Ok(match keep {
             Some(bytes) => (Some(bytes.clone()), Encoded::Kept(bytes)),
             None => (None, Encoded::Rows(rows)),
@@ -1295,7 +1295,7 @@ mod tests {
         let strings: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
         let view: ArrayRef = Arc::new(StringViewArray::from(vec!["x", "y"]));
         let batch = RecordBatch::try_new(Arc::new(plan), vec![cast(&strings, &dict)?, view])?;
-        let kept = crate::answer::render(&[batch.clone()], Some("arrow"), |_| None)?;
+        let kept = crate::answer::render(&[batch.clone()], Some("arrow"), &|_| None)?;
         let a: Vec<FlightData> = sent_as_kept(kept, crate::drain::Busy::new()).try_collect().await?;
         let b: Vec<FlightData> = whole(Arc::new(first_announced(&[batch.clone()])), vec![batch], crate::drain::Busy::new()).try_collect().await?;
         assert_eq!(a.len(), b.len());
