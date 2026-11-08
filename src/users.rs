@@ -1557,11 +1557,11 @@ pub async fn sign_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password
 }
 
 /// `SHOW USERS`, `SHOW GRANTS [TO name]`: what `pondra.users` and `pondra.grants` hold.
-pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
+pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
     use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray, TimestampMicrosecondArray};
     use datafusion::datasource::MemTable;
     let mut all = lake.cat.scan::<User>("u/", "u0").await?;
-    if let Some(names) = crate::rights::scope().names() {
+    if let Some(names) = scope.names() {
         all.retain(|(k, _)| names.contains(&k[2..])); // (a user's: itself and its roles)
     }
     let s = |f: &dyn Fn(&String, &User) -> Option<String>| Arc::new(all.iter().map(|(k, u)| f(&k[2..].to_string(), u)).collect::<StringArray>()) as ArrayRef;
@@ -1588,7 +1588,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
     ])?;
     let mem = |b: RecordBatch| -> Result<Arc<dyn datafusion::catalog::TableProvider>> { Ok(Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };
     let mut out = vec![("users", mem(users)?), ("grants", mem(grants)?)];
-    out.extend(crate::shares::tables(lake).await?); // (`pondra.shares`, `pondra.recipients`)
+    out.extend(crate::shares::tables(lake, scope).await?); // (`pondra.shares`, `pondra.recipients`)
     Ok(out)
 }
 

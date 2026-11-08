@@ -830,7 +830,9 @@ impl Backend {
             };
             Ok((keep, batches)) // (its own caller takes the batches as they are: never decoded again)
         };
-        match self.app.remembered(format!("pg|{}|{sql}", crate::rights::scope().key()), sql, version, None, run).await? {
+        let who = self.signed().await?;
+        let key = who.scope.key(); // (what its sign-in may read: `Scope::key`)
+        match self.app.remembered(format!("pg|{key}|{sql}"), sql, version, None, run).await? {
             Kept::Bytes(b) => crate::query::read_ipc(&b),
             Kept::Own(batches) => Ok(batches),
         }
@@ -847,7 +849,8 @@ impl Backend {
     /// A session for `sql`; with Postgres's catalog, its functions and its `information_schema`
     /// when it reads them (`pg_catalog.rs`).
     async fn session(&self, sql: &str, user: &str) -> PgWireResult<datafusion::prelude::SessionContext> {
-        let ctx = crate::query::session(&self.app.lake, sql, "").await.map_err(user_error)?;
+        let who = self.signed().await?; // (planned for its sign-in: `query::session_for`)
+        let ctx = crate::query::session_for(&self.app.lake, sql, "", None, &who.scope).await.map_err(user_error)?;
         if crate::pg_catalog::wanted(sql) {
             crate::pg_catalog::register(&ctx, &self.app.lake, if user.is_empty() { "pondra" } else { user }, sql).await.map_err(user_error)?;
         }

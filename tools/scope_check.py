@@ -10,6 +10,8 @@ passes the asker's scope to planning as an argument, so each of these places is 
   node   a place that runs work as the node's own: `as_node(` or `panics::own(` (a loop of the node's own) outside
          auth.rs and panics.rs, which define them
   whole  a whole scope made by name: `Scope::everything()` outside rights.rs
+  unscoped  a planning session made for the task's caller: a call of `query::session` or `query::session_at`, which
+         read it, where `query::session_for` is given the scope (M8 piece 3b retires them)
 
 With --baseline, a count above tools/scope-baseline.txt's, or a file the baseline doesn't name, fails: each may only fall.
 
@@ -31,6 +33,25 @@ KINDS = {
     "node": (re.compile(r"\b(?:as_node|panics::own)\("), {"auth.rs", "panics.rs"}),
     "whole": (re.compile(r"\bScope::everything\(\)"), {"rights.rs"}),
 }
+WRAPPERS = ("session", "session_at")  # (query.rs's, which plan for the task's caller: `unscoped`)
+QUALIFIED = re.compile(r"\bquery::(?:session|session_at)\(")
+IMPORTED = re.compile(r"use crate::query::(?:\{([^}]*)\}|(\w+));")
+DESCRIBED = dict({k: p.pattern for k, (p, _) in KINDS.items()}, unscoped="query::session( or query::session_at(")
+
+
+def unscoped(rel, text):
+    """The calls of query.rs's wrappers in `text`: by their path, or by the name a `use crate::query::…` brought in (in
+    query.rs, by name), never a function of the same name of the file's own, nor the wrappers' own lines."""
+    names = set(WRAPPERS) if rel == "query.rs" else set()
+    for m in IMPORTED.finditer(text):
+        names |= {w.strip() for w in (m.group(1) or m.group(2)).split(",")} & set(WRAPPERS)
+    n = 0
+    for line in text.split("\n"):
+        if re.search(r"\bfn (?:session|session_at)\(", line):
+            continue
+        n += len(QUALIFIED.findall(line))
+        n += sum(len(re.findall(rf"(?<![\w.:]){w}\(", line)) for w in names)
+    return n
 
 
 def code(path):
@@ -53,6 +74,9 @@ def counts():
                     n = len(pattern.findall(text))
                     if n:
                         out[(kind, rel)] += n
+            n = unscoped(rel, text)
+            if n:
+                out[("unscoped", rel)] += n
     return out
 
 
@@ -78,7 +102,7 @@ def main():
     totals = Counter()
     for (kind, _), n in now.items():
         totals[kind] += n
-    print(", ".join(f"{kind} {totals[kind]}" for kind in KINDS))
+    print(", ".join(f"{kind} {totals[kind]}" for kind in DESCRIBED))
     if "--baseline" not in sys.argv:
         for (kind, rel), n in sorted(now.items()):
             print(f"  {kind} {rel} {n}")
@@ -86,7 +110,7 @@ def main():
     base = load()
     rose = [(k, r, n, base.get((k, r), 0)) for (k, r), n in sorted(now.items()) if n > base.get((k, r), 0)]
     for kind, rel, n, was in rose:
-        print(f"src/{rel}: {n} {kind}, the baseline has {was}: {KINDS[kind][0].pattern} may only fall (tools/scope_check.py)")
+        print(f"src/{rel}: {n} {kind}, the baseline has {was}: {DESCRIBED[kind]} may only fall (tools/scope_check.py)")
     fell = sum(1 for key, n in base.items() if now.get(key, 0) < n)
     if fell:
         print(f"({fell} counts fell below the baseline: --write-baseline records them)")

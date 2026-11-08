@@ -190,6 +190,7 @@ struct Lakes {
     routines: Vec<(u32, String, String, crate::expander::Routine)>, // oid, schema, name
     visible: Vec<String>, // (this lake's schemas on the session's search path: `path.rs`; public when none is set)
     members: Vec<Member>, // the users and roles the caller may see (`pg_roles`, `pg_auth_members`, the grants)
+    code: bool, // (the caller may see code: a routine's body, `Scope::shows_code`)
 }
 
 /// A user or role of the lake, as far as the catalog reads it.
@@ -209,8 +210,8 @@ fn role_oid(name: &str) -> u32 { if name == BOOTSTRAP { 10 } else { oid("u", nam
 
 /// The users and roles of the lake the caller may see. A limited caller sees what `users::principal`
 /// lets it name: itself, the roles it is a member of (and theirs), and public.
-fn members_of(all: &[(String, crate::users::User)], user: &str) -> Vec<Member> {
-    let visible = (!crate::rights::scope().whole()).then(|| {
+fn members_of(all: &[(String, crate::users::User)], user: &str, whole: bool) -> Vec<Member> {
+    let visible = (!whole).then(|| {
         let mut seen = BTreeSet::new();
         let mut todo = vec![user.to_string(), "public".to_string()];
         while let Some(n) = todo.pop() {
@@ -339,7 +340,7 @@ fn held_types(l: &TableMeta) -> impl Iterator<Item = (String, (u32, i32))> + '_ 
     })
 }
 
-async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<Lakes> {
+async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool, scope: &crate::rights::Scope) -> Result<Lakes> {
     let schemas = crate::ddl::schemas(lake).await?;
     // (a materialized view's query as it was written: `pg_matviews.definition` and `pg_get_viewdef`, as `View::query` gives it)
     let mvs: BTreeMap<String, String> = lake.cat.scan::<serde_json::Value>("v/", "v0").await?.into_iter().map(|(k, v)| {
@@ -347,7 +348,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         (k[2..].to_string(), sql.to_string())
     }).collect();
     let types = enum_types(lake).await?;
-    let members = members_of(&lake.cat.scan::<crate::users::User>("u/", "u0").await?, user);
+    let members = members_of(&lake.cat.scan::<crate::users::User>("u/", "u0").await?, user, scope.whole());
     // COMMENT ON, as `objects.rs` keeps it (`cm/relation/{name}`, `cm/column/{name}/{stored column}`).
     let notes: BTreeMap<String, String> = lake.cat.scan::<String>("cm/", "cm0").await?.into_iter().map(|(k, v)| (k[3..].to_string(), v)).collect();
     let mut rels = vec![];
@@ -373,13 +374,13 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         let typed = enums.chain(held_types(&l)).collect();
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = l.columns().filter_map(|(c, _)| Some((c.to_string(), notes.get(&format!("column/{name}/{}", m.stored(c)?))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: crate::views::code_for_caller(|| mvs.get(name).cloned()).flatten(), identity: l.list().columns.iter().filter_map(|c| Some((c.name.clone(), c.identity.clone()?))).collect(), constraints: if kind == 'm' { crate::views::code_for_caller(|| l.constraints.clone()).unwrap_or_default() } else { l.constraints.clone() }, checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: scope.shows_code().then(|| mvs.get(name).cloned()).flatten(), identity: l.list().columns.iter().filter_map(|c| Some((c.name.clone(), c.identity.clone()?))).collect(), constraints: if kind == 'm' { scope.shows_code().then(|| l.constraints.clone()).unwrap_or_default() } else { l.constraints.clone() }, checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
     }
     let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
     // (a view's columns are its query's: planned only when a client asks for columns, in a
     // session that has every table)
     let every = match columns && !views.is_empty() {
-        true => Some(crate::query::session(lake, "information_schema", "").await?),
+        true => Some(crate::query::session_for(lake, "information_schema", "", None, scope).await?),
         false => None,
     };
     for (k, v) in views {
@@ -397,12 +398,11 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         };
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = cols.iter().filter_map(|(c, ..)| Some((c.clone(), notes.get(&format!("column/{name}/{c}"))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: crate::views::code_for_caller(|| crate::views::shown(&v.sql)), identity: Default::default(), constraints: crate::views::code_for_caller(|| v.facts.clone()).unwrap_or_default(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: scope.shows_code().then(|| crate::views::shown(&v.sql)), identity: Default::default(), constraints: scope.shows_code().then(|| v.facts.clone()).unwrap_or_default(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
     }
     // A user granted some tables sees those, and of one granted by columns those columns, as at every other
     // listing (`ddl::listed`, invariant 382). Postgres's pg_class names every table; Pondra names none its
     // reader may not read, so a BI tool's table list is the user's.
-    let scope = crate::rights::scope();
     if !scope.whole() {
         rels.retain_mut(|r| match scope.columns(&crate::text::join(&r.schema, &r.name)) {
             None => false,
@@ -464,7 +464,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
     let mut all_schemas: Vec<(u32, String)> = vec![(11, "pg_catalog".into()), (13_000, "information_schema".into())];
     all_schemas.extend(schemas.iter().map(|s| (schema_oid(s), s.clone())));
     all_schemas.push((schema_oid(TEMP), TEMP.into()));
-    Ok(Lakes { indexes, database, databases, user: user.into(), schemas: all_schemas, rels, sequences, types, routines, visible: crate::path::schemas_here(lake), members })
+    Ok(Lakes { indexes, database, databases, user: user.into(), schemas: all_schemas, rels, sequences, types, routines, visible: crate::path::schemas_here(lake), members, code: scope.shows_code() })
 }
 
 /// A column's default as Postgres shows it: a text column's string literal gets the `::text` that
@@ -762,7 +762,7 @@ fn tables(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'static str, A
             let names: Vec<String> = r.params.iter().map(|p| p.name.clone()).collect();
             vec![o(*oid), s(name.clone()), o(schema_oid(schema)), o(owner), o(lang), f4(100.0), f4(if r.kind == Kind::Table { 1000.0 } else { 0.0 }), o(0), s("-"), s(kind), b(false), b(false), b(false),
                 b(r.kind == Kind::Table), s("v"), s("u"), i2(r.params.len() as i16), i2(r.params.iter().filter(|p| p.default.is_some()).count() as i16), o(rettype),
-                ScalarValue::List(ScalarValue::new_list_nullable(&args, &OID)), n(), n(), texts(&names), n(), n(), if crate::rights::scope().shows_code() { s(r.body.clone()) } else { n() }, n(), n(), n(), n()]
+                ScalarValue::List(ScalarValue::new_list_nullable(&args, &OID)), n(), n(), texts(&names), n(), n(), if l.code { s(r.body.clone()) } else { n() }, n(), n(), n(), n()]
         }).chain(type_functions().into_iter().map(|f| vec![o(oid("tf", &f)), s(f.clone()), o(11), o(10), o(12), f4(1.0), f4(0.0), o(0), s("-"), s("f"), b(false), b(false), b(true),
             b(false), s("i"), s("s"), i2(1), i2(0), o(0), ScalarValue::List(ScalarValue::new_list_nullable(&[o(0)], &OID)), n(), n(), n(), n(), n(), s(f), n(), n(), n(), n()])).collect());
     add!("pg_database", &[("oid", OID), ("datname", TEXT), ("datdba", OID), ("encoding", INT4), ("datlocprovider", TEXT), ("datistemplate", BOOL), ("datallowconn", BOOL),
@@ -966,7 +966,7 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
         l.routines.iter().map(|(oid, schema, name, r)| {
             let procedure = r.kind == crate::expander::Kind::Procedure;
             vec![db(), s(schema.clone()), s(format!("{name}_{oid}")), db(), s(schema.clone()), s(name.clone()), s(if procedure { "PROCEDURE" } else { "FUNCTION" }), r.returns.clone().map_or(n(), s),
-                s(if r.language == "python" { "EXTERNAL" } else { "SQL" }), if crate::rights::scope().shows_code() { s(r.body.clone()) } else { n() }, s(if r.language.is_empty() { "SQL".to_string() } else { r.language.to_uppercase() }), s("NO")]
+                s(if r.language == "python" { "EXTERNAL" } else { "SQL" }), if l.code { s(r.body.clone()) } else { n() }, s(if r.language.is_empty() { "SQL".to_string() } else { r.language.to_uppercase() }), s("NO")]
         }).collect());
     add!("sequences", &[("sequence_catalog", TEXT), ("sequence_schema", TEXT), ("sequence_name", TEXT), ("data_type", TEXT), ("numeric_precision", INT4),
         ("numeric_precision_radix", INT4), ("numeric_scale", INT4), ("start_value", TEXT), ("minimum_value", TEXT), ("maximum_value", TEXT), ("increment", TEXT), ("cycle_option", TEXT)],
@@ -1320,7 +1320,7 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
     ctx.register_udf(udf("pg_stat_get_numscans", |_| DataType::Int64, |_, n| Ok(Arc::new(datafusion::arrow::array::Int64Array::from(vec![0; n])))));
     ctx.register_udf(udf("pg_tablespace_location", to_text, |_, n| Ok(texts_out((0..n).map(|_| Some(String::new()))))));
     // A routine's CREATE statement, as `SHOW CREATE` writes it. A caller who may not see code gets NULL.
-    let code = crate::rights::scope().shows_code();
+    let code = l.code;
     let lk = l.clone();
     ctx.register_udf(udf("pg_get_functiondef", to_text, move |a, n| {
         let ids = int_arg(&a[0])?;
@@ -1346,6 +1346,7 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
 /// Postgres's catalog, its functions and its `information_schema` in `ctx`, for a client logged in as `user`.
 pub async fn register(ctx: &SessionContext, lake: &Lake, user: &str, sql: &str) -> Result<()> {
     let lower = sql.to_lowercase();
+    let scope = crate::rights::Scope::of_session(ctx.state_ref().read().config()); // (whose the session is: what its catalog shows)
     // (a view's columns: its `attnum`s and a key's `conkey`, which name them, need them too)
     let columns = ["pg_attribute", "pg_constraint", "information_schema", "columns"].iter().any(|w| lower.contains(w));
     // (and the log's rows only for SQL that sizes tables: they cost a read of the log tail's entries)
@@ -1356,12 +1357,12 @@ pub async fn register(ctx: &SessionContext, lake: &Lake, user: &str, sql: &str) 
         Some(p) if p.database() != p.here => {
             let db = p.database();
             let shown = crate::ddl::database(lake, db).await?.ok_or_else(|| anyhow::anyhow!("no database {db}"))?;
-            let mut l = lakes(&shown, user, columns, counts).await?;
+            let mut l = lakes(&shown, user, columns, counts, &scope).await?;
             l.database = db.to_string(); // (the name it is attached by here, not its own lake's folder's)
             l.databases = std::iter::once(crate::ddl::lake_name(lake)).chain(lake.attached.read().unwrap().iter().map(|(n, _)| n.clone())).collect();
             l
         }
-        _ => lakes(lake, user, columns, counts).await?,
+        _ => lakes(lake, user, columns, counts, &scope).await?,
     };
     let l = Arc::new(l);
     let catalog = ctx.catalog(&crate::ddl::lake_name(lake)).expect("the lake's catalog");
@@ -1440,7 +1441,7 @@ fn regproc(e: &ast::Expr) -> bool {
 
 fn boolean(e: &ast::Expr) -> bool {
     static NAMES: std::sync::LazyLock<std::collections::HashSet<String>> = std::sync::LazyLock::new(|| {
-        let empty = Lakes { database: String::new(), databases: vec![], user: String::new(), schemas: vec![], rels: vec![], sequences: vec![], types: vec![], routines: vec![], indexes: vec![], visible: vec![], members: vec![] };
+        let empty = Lakes { database: String::new(), databases: vec![], user: String::new(), schemas: vec![], rels: vec![], sequences: vec![], types: vec![], routines: vec![], indexes: vec![], visible: vec![], members: vec![], code: false };
         tables(&empty, &|_| true).unwrap_or_default().iter().flat_map(|(_, t)| datafusion::datasource::TableProvider::schema(t.as_ref()).fields().iter().filter(|f| *f.data_type() == DataType::Boolean).map(|f| f.name().clone()).collect::<Vec<_>>()).collect()
     });
     let name = match e {
@@ -2053,7 +2054,7 @@ mod tests {
             indexes: vec![], database: "lake".into(), databases: vec!["lake".into()], user: "u".into(),
             schemas: vec![(2200, "public".into()), (oid("n", "crm"), "crm".into())],
             rels: vec![rel("sales", 'r', 20000), rel("crm.customers", 'r', 2), rel("sales_by_region", 'v', 0), rel("mv", 'm', 4)],
-            sequences: vec![sequence], types: vec![], routines: vec![], visible: vec!["public".into()], members: members_of(&users, "u"),
+            sequences: vec![sequence], types: vec![], routines: vec![], visible: vec!["public".into()], members: members_of(&users, "u", false), code: true,
         }
     }
 
@@ -2078,6 +2079,29 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The catalog a session shows is its scope's (`Scope::of_session`): one made without a scope names no table, never every
+    /// one (M8 piece 3), and the same lake's in a session given the node's scope names it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_catalog_in_a_session_without_a_scope_names_no_table() -> anyhow::Result<()> {
+        crate::auth::as_node(async move {
+            let dir = std::env::temp_dir().join(format!("pondra-pgscope-{}", uuid::Uuid::new_v4()));
+            let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            crate::write::create_table(&lake, "a", r#"{"columns": [["x", "Int64"]]}"#).await?;
+            let pg_class = "SELECT relname FROM pg_catalog.pg_class WHERE relname = 'a'";
+            let bare = lake.session();
+            register(&bare, &lake, "pondra", pg_class).await?;
+            assert!(column(&bare, pg_class).await.is_empty(), "no scope: no table, though the task is the node's own");
+            let given = lake.session();
+            crate::auth::Principal::node().scope.onto(&given);
+            register(&given, &lake, "pondra", pg_class).await?;
+            assert_eq!(column(&given, pg_class).await, vec!["a"], "the node's scope: every table");
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(())
+        })
+        .await
     }
 
     #[tokio::test]
