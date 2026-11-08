@@ -40,8 +40,19 @@ impl Dialect for Fallback {
 
     fn parse_prefix(&self, parser: &mut Parser) -> Option<Result<Expr, ParserError>> {
         for (name, h) in &self.hooks {
-            let Hook::Prefix(read) = h.hook;
+            let Hook::Prefix(read) = h.hook else { continue };
             if let Some(read) = read(parser) {
+                self.used.borrow_mut().push(name);
+                return Some(read);
+            }
+        }
+        None
+    }
+
+    fn parse_statement(&self, parser: &mut Parser) -> Option<Result<Statement, ParserError>> {
+        for (name, h) in &self.hooks {
+            let Hook::Statement(read) = h.hook else { continue };
+            if let Some(read) = read(self, parser) {
                 self.used.borrow_mut().push(name);
                 return Some(read);
             }
