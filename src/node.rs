@@ -304,7 +304,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     let (addr, dir) = (members.me(), lake.url.as_str()); // (what the first user's message names: this member, and its lake)
     let l = lake.clone();
     ddl::sync(&l, lives).await?;
-    crate::store::trace("attachments synced");
+    lake.node.trace("attachments synced");
     if lives {
         every(Duration::from_secs(1), move || { let l = l.clone(); async move { ddl::sync(&l, true).await } });
         let l = lake.clone();
@@ -312,7 +312,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     }
     // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
     // a new leader first commits what they hold from the previous one.
-    crate::store::trace("warming");
+    lake.node.trace("warming");
     let recovered = match (leader, &replica) {
         (true, Some(own)) => {
             // (the members are asked with the nodes' key: one that just restarted holds an
@@ -341,7 +341,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
         }
         None => {}
     }
-    crate::store::trace("followers' changes recovered");
+    lake.node.trace("followers' changes recovered");
     let lock: Arc<tokio::sync::Mutex<()>> = Default::default(); // (the lake's: everything that rewrites table metadata)
     let pace = (s.tier_secs > 0.0).then(|| log::Pace { rows: s.backlog, lock: lock.clone() }); // rows waiting to be tiered
     let seq = if leader { Some(log::Sequencer::start(lake.clone(), pace).await?) } else { None };
@@ -351,7 +351,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     };
     let _ = lake.to.set(to.clone()); // (a follower's sequences' values: the leader's sequencer)
     let log = (!reader).then(|| Arc::new(log::Log::start(lake.clone(), Duration::from_millis(s.flush_ms), to)));
-    crate::store::trace("the sequencer");
+    lake.node.trace("the sequencer");
     python::init(s.python.clone());
     let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone(), tables: Default::default() };
     if let Some(ledger) = lake.ledger() {
