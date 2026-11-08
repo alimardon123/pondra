@@ -1,6 +1,6 @@
 //! Every setting a node reads, through one function from one table (ADR-061 §8; the table is `settings.rs`). A setting is what
-//! the process was given (`open`'s options, the command line's flags), else its environment, and an
-//! empty value is no value. Nothing here sets the environment: in a library the host runs threads of
+//! the process was given (`open`'s options, the command line's flags), else what the Pondra process that started it handed
+//! it (`settings::Line`), else its environment, and an empty value is no value. Nothing here sets the environment: in a library the host runs threads of
 //! its own (Jupyter, any Python), and `set_var` beside them is a data race. The browser has no
 //! environment and reads the same table. `tools/per_node_check.py` fails a `PONDRA_*` name read
 //! anywhere else, and a name read that isn't in the table.
@@ -15,6 +15,10 @@ use Who::*;
 
 /// What the process was given, by its full names, fixed by the first `give`.
 static GIVEN: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+
+/// What the Pondra process that started this one handed it (`settings::Line`), by full names: where its environment's
+/// would be, since that process left none of them there.
+static HANDED: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 
 /// Who a full name is for, or None for a name nothing reads.
 pub fn who(name: &str) -> Option<Who> {
@@ -47,11 +51,23 @@ pub fn give<K: AsRef<str>, V: Into<String>>(options: impl IntoIterator<Item = (K
     Ok(())
 }
 
-/// A setting, or None: what the process was given (empty there is None too, the environment unread),
-/// else the environment.
+/// Takes the settings the process that started this one handed it (`settings::Line`, read by `Line::read`), once and
+/// before anything reads one.
+pub fn hand(values: BTreeMap<String, String>) -> anyhow::Result<()> {
+    anyhow::ensure!(HANDED.set(values).is_ok(), "a process is handed its settings once");
+    Ok(())
+}
+
+/// What the process was given or handed for `name`, if either holds it (an empty value is there too: unset).
+fn held(name: &str) -> Option<&'static String> {
+    GIVEN.get().and_then(|g| g.get(name)).or_else(|| HANDED.get().and_then(|h| h.get(name)))
+}
+
+/// A setting, or None: what the process was given, else handed (empty there is None too, the environment unread), else
+/// the environment.
 pub fn get(name: &str) -> Option<String> {
     debug_assert!(who(name).is_some(), "{name} isn't in settings.rs");
-    match GIVEN.get().and_then(|g| g.get(name)) {
+    match held(name) {
         Some(v) => Some(v.clone()),
         None => std::env::var(name).ok(),
     }
@@ -61,7 +77,7 @@ pub fn get(name: &str) -> Option<String> {
 /// A setting that may be a path in the environment's own encoding (a folder, a list of files).
 pub fn os(name: &str) -> Option<OsString> {
     debug_assert!(who(name).is_some(), "{name} isn't in settings.rs");
-    match GIVEN.get().and_then(|g| g.get(name)) {
+    match held(name) {
         Some(v) => Some(OsString::from(v)),
         None => std::env::var_os(name),
     }
@@ -107,7 +123,12 @@ pub fn or<T: FromStr>(name: &str, default: T) -> T {
 /// A setting in GB (fractions too) as bytes of 2^30, or None when it isn't set: the one conversion every memory setting
 /// shares, so `PONDRA_MEMORY_GB=2` is the same 2 GiB wherever it is read.
 pub fn gib(name: &str) -> Option<usize> {
-    parse::<f64>(name).map(|gb| (gb * (1u64 << 30) as f64) as usize)
+    parse::<f64>(name).map(gb_bytes)
+}
+
+/// GB (fractions too) as bytes of 2^30: `gib`'s conversion, and a node's own settings' (`settings::Values::gib`).
+pub(crate) fn gb_bytes(gb: f64) -> usize {
+    (gb * (1u64 << 30) as f64) as usize
 }
 
 /// The memory line in bytes, past which the watch stops the query that grew memory: `PONDRA_MEMORY_MAX_GB`, else the form's
@@ -135,8 +156,8 @@ pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
 /// hold no line of their own then, and a grow past it takes cache bytes back before it spills, as DuckDB's `memory_limit`
 /// holds its buffers and its operators to one number. A cache given a budget of its own (`PONDRA_HOT_GB`, `PONDRA_CACHE_MB`)
 /// keeps it beside the line (`ledger::Charged::inside`). Unset, the whole line is the memory watch's trim line, and the queries
-/// may hold all of it too, the caches giving way (`store::root_whole`), but a spiller isn't refused for a reader's moment in
-/// a cache.
+/// may hold all of it too, the caches giving way (`store::root_whole`); on either line, a spiller they don't make room for
+/// spills. This is the process's, for a reader with no node at hand: a node's budget reads its own (`store::lake_pool`).
 pub fn memory_whole() -> Option<usize> {
     gib("PONDRA_MEMORY_GB")
 }
@@ -181,10 +202,11 @@ pub fn is_set(name: &str) -> bool {
     get(name).is_some()
 }
 
-/// What the process was given, for the Pondra processes it starts (a folder of lakes' databases,
-/// `pondra lead`, the program run again to rejoin): as their environment, they read what it reads.
+/// What the process was handed and given (the given last, which wins), for the Pondra processes it starts with an
+/// environment (a folder of lakes' databases, the program run again to rejoin): as their environment, they read what it
+/// reads. One started with a line takes its node's (`settings::Line`).
 pub fn given() -> impl Iterator<Item = (&'static String, &'static String)> {
-    GIVEN.get().into_iter().flatten()
+    HANDED.get().into_iter().flatten().chain(GIVEN.get().into_iter().flatten())
 }
 
 /// `memory_gb`, `memory-gb` and `PONDRA_MEMORY_GB` are one name: the last.

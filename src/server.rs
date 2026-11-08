@@ -1356,7 +1356,7 @@ async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<V
     s["keys"] = j!(crate::users::kept(&app.lake).await); // (the lake's own keys: sealed by its master key, or in the clear)
     // Background jobs that failed, by kind: a rising count is a stall (tiering, publishing, …) that
     // otherwise shows only on this node's stderr.
-    s["background_failures"] = j!(crate::metrics::failures().into_iter().filter(|(_, n)| *n > 0).collect::<std::collections::BTreeMap<_, _>>());
+    s["background_failures"] = j!(app.lake.node.metrics.failures().into_iter().filter(|(_, n)| *n > 0).collect::<std::collections::BTreeMap<_, _>>());
     s["signed"] = j!(crate::users::signed(&app.lake).await); // (served with tokens once: a node without them answers no one unsigned)
     s["move_failed"] = j!(crate::memory::MOVE_FAILED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()); // (a move that failed: the lake stays in memory, and why)
     if let (true, Some(node)) = (members.is_leader(), crate::cluster::of(&app)) {

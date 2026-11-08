@@ -182,7 +182,7 @@ mod tests {
             r.section_mut::<Registered>().add::<Held>();
             r.section_mut::<Registered>().add::<Other>();
         } }]);
-        let line = Ledger::new(1 << 20, 1 << 20, false);
+        let line = Ledger::new(1 << 20, 1 << 20);
         let (a, b) = (States::default(), States::default());
         let held = a.get_in::<Held>(&r, Some(&line)).unwrap();
         assert!(Arc::ptr_eq(&held, &a.get_in::<Held>(&r, Some(&line)).unwrap()), "made once a lake");

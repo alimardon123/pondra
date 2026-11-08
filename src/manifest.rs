@@ -252,8 +252,8 @@ pub async fn pruned(lake: &Lake, meta: &TableMeta, manifests: Option<&[Manifest]
     let mut files: Vec<DataFile> = loaded.into_iter().zip(from_lists).filter(|(_, k)| **k).map(|(f, _)| f).collect();
     files.extend(meta.files.iter().zip(from_entry).filter(|(_, k)| **k).map(|(f, _)| f.clone()));
     let total = listed.iter().map(|m| m.files).sum::<u64>() + meta.files.len() as u64;
-    crate::metrics::add(&crate::metrics::FILES_SCANNED, files.len() as u64);
-    crate::metrics::add(&crate::metrics::FILES_SKIPPED, total - files.len() as u64);
+    crate::metrics::add(&lake.node.metrics.files_scanned, files.len() as u64);
+    crate::metrics::add(&lake.node.metrics.files_skipped, total - files.len() as u64);
     Ok(files)
 }
 

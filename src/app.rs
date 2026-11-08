@@ -209,7 +209,8 @@ impl App {
 
     /// `top`: the query a door sent (it took a turn), whose answer may go to the door in pieces (`query::collect_or_send`).
     async fn run_query(&self, query: &str, spread: Option<&str>, files: bool, top: bool, scope: &crate::rights::Scope) -> anyhow::Result<Vec<RecordBatch>> {
-        use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
+        use crate::metrics::add;
+        let m = &self.lake.node.metrics; // (the node's own counters: `metrics::Metrics`)
         if crate::pg_catalog::asked(query) {
             return crate::pg_catalog::over_http(&self.lake, query, scope).await; // (a request that speaks Postgres, reading its catalog: `?catalog=postgres`)
         }
@@ -268,21 +269,21 @@ impl App {
             Ok((out, false))
         };
         let (out, planned) = crate::learned::planning(query, run).await; // (planned with what runs learned, as its runs so far say)
-        add(&QUERIES, 1);
-        add(&QUERY_US, start.elapsed().as_micros() as u64);
+        add(&m.queries, 1);
+        add(&m.query_us, start.elapsed().as_micros() as u64);
         match out {
             Ok((batches, spread)) => {
                 let handed = crate::query::handed(); // (rows sent in pieces: the batches went to the door, which holds none here)
                 if handed.is_none() {
                     crate::learned::ran(query, planned, start.elapsed()); // (never worse: facts that made it slower twice are set aside)
                 }
-                add(&SPREAD, spread as u64);
+                add(&m.spread, spread as u64);
                 crate::history::rows(handed.unwrap_or_else(|| batches.iter().map(|b| b.num_rows() as u64).sum()));
                 let batches = if explained { crate::explain::answered(batches)? } else { batches }; // (files as SQL named them: a node's EXPLAIN and a page's alike)
                 Ok(batches.into_iter().map(crate::answer::compact).collect()) // (an answer kept or sent holds only its own strings)
             }
             Err(e) => {
-                add(&QUERY_ERRORS, 1);
+                add(&m.query_errors, 1);
                 Err(e)
             }
         }
@@ -366,7 +367,7 @@ impl App {
         // round carries on.
         if let Err(e) = crate::delta::publish_all(&self.lake).await { // what other engines read, as soon as it's tiered
             failed.push(format!("publish: {e:#}"));
-            crate::metrics::job_failed("publish");
+            self.lake.node.metrics.job_failed("publish");
         }
         let first_publish = start.elapsed();
         // Then merges and compactions (published too, once done).
@@ -374,7 +375,7 @@ impl App {
         if each(maintain, &mut failed).await.contains(&true) {
             if let Err(e) = crate::delta::publish_all(&self.lake).await {
                 failed.push(format!("publish: {e:#}"));
-                crate::metrics::job_failed("publish");
+                self.lake.node.metrics.job_failed("publish");
             }
         }
         let published = start.elapsed();

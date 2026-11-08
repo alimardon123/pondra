@@ -755,7 +755,7 @@ pub fn metric_lines(tables: &Tables, per_table: bool) -> [Vec<(String, f64)>; 4]
     const LINES: [(usize, &str, fn(&Brief) -> u64); 5] =
         [(0, "where=\"inline\"", |b| b.inline), (0, "where=\"sealed\"", |b| b.sealed), (1, "", |b| b.rows), (2, "", |b| b.bytes), (3, "", |b| b.entry)];
     let labels = |table: Option<&str>, more: &str| {
-        let all: Vec<String> = table.map(|t| format!("table=\"{t}\"")).into_iter().chain((!more.is_empty()).then(|| more.to_string())).collect();
+        let all: Vec<String> = table.map(|t| format!("table=\"{}\"", crate::metrics::label(t))).into_iter().chain((!more.is_empty()).then(|| more.to_string())).collect();
         if all.is_empty() { String::new() } else { format!("{{{}}}", all.join(",")) }
     };
     let mut samples: [Vec<(String, f64)>; 4] = Default::default();
@@ -1397,6 +1397,10 @@ mod tests {
         assert_eq!(rows, [line("{table=\"a\"}", 100.0), line("{table=\"b.c\"}", 200.0)]);
         let [files, ..] = metric_lines(&Tables::new(), false);
         assert_eq!(files, [("{where=\"inline\"}".to_string(), 0.0), ("{where=\"sealed\"}".to_string(), 0.0)], "a lake with no tables: zeros");
+        // (a name with a quote, a backslash or a line break is escaped, as the text format reads it: 11-08 audit L6)
+        let odd: Tables = [("say \"hi\"\\\n".to_string(), brief(1))].into();
+        let [_, rows, ..] = metric_lines(&odd, true);
+        assert_eq!(rows, [line(r#"{table="say \"hi\"\\\n"}"#, 100.0)]);
     }
 
     #[tokio::test]
