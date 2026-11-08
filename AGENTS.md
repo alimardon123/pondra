@@ -2309,9 +2309,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `Node::stop` ends; its writers end first, its Python workers stop, and what `panics::spawn`
    started is aborted. A gauge whose guards count themselves down (`metrics::RUNNING`, `WAITING`)
    stays the process's, and the drain counts each node's requests on a counter of that node's own
-   (`drain::IN_FLIGHT`), as failed sign-ins are counted per node (`auth::Guesses`). SlateDB's tasks
-   outlive its handles, so a catalog let go closes what SlateDB runs for it (`Drop for Catalog`: a
-   reader's polling, a writer's flushing, the compactor and the collector `close` stops too): a lake
+   (`node_state::Drain`, which every lake is handed: `Lake.node`), as failed sign-ins are counted
+   per node (`auth::Guesses`). SlateDB's tasks outlive its handles, so a catalog let go closes what
+   SlateDB runs for it (`Drop for Catalog`: a reader's polling, a writer's flushing, the compactor
+   and the collector `close` stops too): a lake
    opened for a moment (a branch's base, a lake detached) read its manifest four times a second for
    the life of the process. `tools/per_node_check.py` fails a static that is neither `per_node!` nor
    in its list of what outlives a node, with the reason, and a `tokio::spawn` outside `panics.rs`.

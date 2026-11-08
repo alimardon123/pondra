@@ -378,8 +378,8 @@ mod tests {
     async fn the_same_path_in_two_lakes_reads_each_lakes_own_object() -> anyhow::Result<()> {
         use crate::ledger::Charged;
         let dirs = [0, 1].map(|_| std::env::temp_dir().join(format!("pondra-manifests-{}", uuid::Uuid::new_v4())));
-        let a = crate::store::Lake::open(dirs[0].to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
-        let b = crate::store::Lake::open(dirs[1].to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let a = crate::store::Lake::open(dirs[0].to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let b = crate::store::Lake::open(dirs[1].to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let path = "tables/t/list-of-a-test.zst";
         for (lake, words) in [(&a, "a's"), (&b, "b's")] {
             lake.put(path, zstd::encode_all(words.as_bytes(), 3)?).await?;

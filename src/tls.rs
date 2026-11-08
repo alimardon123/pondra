@@ -380,6 +380,8 @@ pub async fn accept(tcp: TcpStream, door: Door) -> std::io::Result<(Conn, Peer)>
 pub struct Doors {
     rx: tokio::sync::mpsc::Receiver<(Conn, Peer)>,
     addr: SocketAddr,
+    /// The node whose HTTP door this is (`for_node`): told when it takes a connection (`Drain::took`).
+    node: Option<std::sync::Arc<crate::node_state::NodeState>>,
 }
 
 impl Doors {
@@ -404,8 +406,11 @@ impl Doors {
                 });
             }
         });
-        Ok(Doors { rx, addr: local })
+        Ok(Doors { rx, addr: local, node: None })
     }
+
+    /// The door is this node's: its drain is told when it takes a connection (`Drain::took`).
+    pub fn for_node(self, node: std::sync::Arc<crate::node_state::NodeState>) -> Doors { Doors { node: Some(node), ..self } }
 
     /// The next connection, handshake done.
     pub async fn next(&mut self) -> Option<(Conn, Peer)> { self.rx.recv().await }
@@ -422,7 +427,9 @@ impl axum::serve::Listener for Doors {
     async fn accept(&mut self) -> (Conn, Peer) {
         match self.next().await {
             Some(c) => {
-                crate::drain::took();
+                if let Some(node) = &self.node {
+                    node.drain.took();
+                }
                 c
             }
             None => std::future::pending().await, // (the accept loop never ends)

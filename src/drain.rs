@@ -24,175 +24,70 @@
 //! A connection is served on a task of its own, which a node's stop doesn't end: in a process that
 //! goes on after the node stops (a library, a lake moved), one still writing past the bound stays up
 //! on the old router until its client goes; a program's exit ends it, as before.
-use futures::{Stream, StreamExt};
-use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Arc, Mutex, RwLock};
+use crate::node_state::{Door, NodeState};
+use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
-crate::per_node!(static DRAINING: AtomicBool = AtomicBool::new(false));
-// (each request holds its own node's count: one that outlives its node's stop counts down that
-// node's, never the next one's in the process)
-crate::per_node!(static IN_FLIGHT: RwLock<Arc<AtomicUsize>> = RwLock::default());
-// The HTTP door's state, one per node as `IN_FLIGHT` is; when this node's drain began (its `PONDRA_DRAIN_SECS`
-// are counted from it); and whether a second signal came.
-crate::per_node!(static DOOR: tokio::sync::watch::Sender<Door> = tokio::sync::watch::channel(Door::Unopened).0);
-crate::per_node!(static DRAIN_START: Mutex<Option<tokio::time::Instant>> = Mutex::new(None));
-// Whether the HTTP door took a connection: only then may a client still be reading an answer's last bytes.
-crate::per_node!(static TOOK: AtomicBool = AtomicBool::new(false));
-crate::per_node!(static HURRIED: AtomicBool = AtomicBool::new(false));
-// The doors besides HTTP's that close with it (Flight: `flight::serve`), counted while each serves, as `IN_FLIGHT` counts.
-crate::per_node!(static SERVING: RwLock<Arc<AtomicUsize>> = RwLock::default());
-
-/// The HTTP door's state, in order: not opened, serving, closing (its streams end and its answers go out), closed.
-#[derive(Clone, Copy, Default, PartialEq, PartialOrd)]
-enum Door {
-    #[default]
-    Unopened,
-    Open,
-    Closing,
-    Closed,
-}
-
-/// This node's requests in flight.
-fn in_flight() -> Arc<AtomicUsize> { IN_FLIGHT.read().unwrap_or_else(|e| e.into_inner()).clone() }
-
-/// Is this node stopping?
-pub fn draining() -> bool { DRAINING.load(SeqCst) }
-
-/// Held by a request's work while it runs (`panics::door`): counted if it came before the drain.
-pub struct Busy(Option<Arc<AtomicUsize>>);
-
-impl Busy {
-    pub fn new() -> Busy {
-        // (counted, then the flag read: with `drain` storing the flag, then reading the count, one of
-        // them sees the other, so no request that came before the drain goes uncounted)
-        let count = in_flight();
-        count.fetch_add(1, SeqCst);
-        if draining() {
-            count.fetch_sub(1, SeqCst);
-            return Busy(None);
-        }
-        Busy(Some(count))
-    }
-
-    /// The request's count, held again by the body of an answer sent in pieces, which goes on after its response: counted
-    /// whatever the drain says, so it is taken only while the request's own `Busy` (`panics::door`) is held.
-    pub fn carried() -> Busy { let count = in_flight(); count.fetch_add(1, SeqCst); Busy(Some(count)) }
-
-    /// Whether it is counted: false for a request that came once the drain began, which a door then doesn't take
-    /// (Kafka's: `kafka::conn`).
-    pub fn counted(&self) -> bool { self.0.is_some() }
-}
-
-impl Drop for Busy {
-    fn drop(&mut self) {
-        if let Some(count) = &self.0 {
-            count.fetch_sub(1, SeqCst);
-        }
-    }
-}
-
-/// Requests a draining node still takes: the cluster's own (a leader's followers, a query's other
-/// nodes) and the health checks.
-pub fn still_taken(path: &str) -> bool { path.starts_with("/cluster/") || matches!(path, "/healthz" | "/ready" | "/stats" | "/metrics") }
-
-/// Drain: stop being ready, wait out the grace, then for the requests in flight (bounded).
-pub async fn drain() {
-    DRAINING.store(true, SeqCst);
+/// Drain: stop being ready, wait out the grace, then for the requests in flight (bounded). The node's state says what
+/// is in flight (`node_state::Drain`): a door asks it, never this module.
+pub async fn drain(node: &NodeState) {
+    let d = &node.drain;
+    d.begin();
     tokio::time::sleep(crate::env::secs("PONDRA_DRAIN_GRACE_SECS")).await;
-    let (start, most, count) = (tokio::time::Instant::now(), crate::env::secs("PONDRA_DRAIN_SECS"), in_flight());
-    *DRAIN_START.lock().unwrap_or_else(|e| e.into_inner()) = Some(start); // (the door's wait is what is left of `most`: `door_bound`)
-    while count.load(SeqCst) > 0 && start.elapsed() < most {
+    let (start, most) = (tokio::time::Instant::now(), crate::env::secs("PONDRA_DRAIN_SECS"));
+    *d.started.lock().unwrap_or_else(|e| e.into_inner()) = Some(start); // (the door's wait is what is left of `most`: `door_bound`)
+    while d.in_flight() > 0 && start.elapsed() < most {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let left = count.load(SeqCst);
+    let left = d.in_flight();
     if left > 0 {
         eprintln!("stopping with {left} request{} still running after {:?} (PONDRA_DRAIN_SECS)", if left == 1 { "" } else { "s" }, most);
     }
     crate::locks::release_all(); // (the transactions' row locks go to their leaders now: other waits end at once, not at the lease)
 }
 
-/// A second signal while draining: a node stopping now doesn't wait for its door (`close_door`).
-pub fn hurry() { HURRIED.store(true, SeqCst); }
-
-/// The HTTP door is serving (its task, when it starts): `close_door` waits for it to close.
-pub(crate) fn door_open() { DOOR.send_replace(Door::Open); }
-
-/// The HTTP door took a connection (`tls::Doors`): its close waits the 250 ms that let an answer's last bytes out.
-pub(crate) fn took() { TOOK.store(true, SeqCst); }
-
-/// The HTTP door's serve has ended (its task, when it ends).
-pub(crate) fn door_closed() { DOOR.send_replace(Door::Closed); }
-
-/// Held by a door besides HTTP's while it serves (Flight's): `close_door` waits for it to be dropped, as it waits for the HTTP
-/// door to close. The door closes gracefully on `closing`, and its serve returns once its connections have closed: an answer
-/// whose last messages a slow client hasn't read yet is still in its connection when the answer's own `Busy` is dropped.
-pub(crate) struct Serving(Arc<AtomicUsize>);
-
-impl Serving {
-    pub(crate) fn new() -> Serving {
-        let count = SERVING.read().unwrap_or_else(|e| e.into_inner()).clone();
-        count.fetch_add(1, SeqCst);
-        Serving(count)
-    }
-}
-
-impl Drop for Serving {
-    fn drop(&mut self) { self.0.fetch_sub(1, SeqCst); }
-}
-
-/// Resolves once this node's door starts closing. Takes this node's receiver when it is called.
-pub fn closing() -> impl Future<Output = ()> + Send + 'static {
-    let mut door = DOOR.subscribe();
-    async move { drop(door.wait_for(|d| *d >= Door::Closing).await) } // (its guard isn't Send: dropped here)
-}
-
-/// The stream, ended once the door starts closing. A stream that never ends by itself (a commit feed, a watch, a live
-/// query's lines) would hold a graceful close for its whole bound; its client reconnects, as it does when a node goes.
-pub fn endless<S: Stream + Send + 'static>(s: S) -> impl Stream<Item = S::Item> + Send { s.take_until(closing()) }
-
 /// How long `close_door` waits: what is left of the drain's `PONDRA_DRAIN_SECS`, a second when no drain ran (a
 /// library's stop after a failure), nothing after a second signal.
-fn door_bound() -> Duration {
-    if HURRIED.load(SeqCst) {
+fn door_bound(node: &NodeState) -> Duration {
+    if node.drain.hurried.load(SeqCst) {
         return Duration::ZERO;
     }
-    match *DRAIN_START.lock().unwrap_or_else(|e| e.into_inner()) {
+    match *node.drain.started.lock().unwrap_or_else(|e| e.into_inner()) {
         Some(start) => crate::env::secs("PONDRA_DRAIN_SECS").saturating_sub(start.elapsed()),
         None => Duration::from_secs(1),
     }
 }
 
 /// Closes the HTTP door (`Held::stop`, once the leader has checkpointed): the streams that never end by themselves end
-/// (`endless`), and the answers being written go out whole. Returns once the door has closed or `door_bound` has passed,
-/// and at least 250 ms after it began, which lets the last bytes hyper holds reach the client, when the door took a
-/// connection (a library's, asked in its process, mostly takes none: its close took 0.26 s for this wait alone).
-pub async fn close_door() {
-    let opened = *DOOR.borrow() != Door::Unopened;
+/// (`Drain::endless`), and the answers being written go out whole. Returns once the door has closed or `door_bound` has
+/// passed, and at least 250 ms after it began, which lets the last bytes hyper holds reach the client, when the door took
+/// a connection (a library's, asked in its process, mostly takes none: its close took 0.26 s for this wait alone).
+pub async fn close_door(node: &NodeState) {
+    let d = &node.drain;
+    let opened = *d.door.borrow() != Door::Unopened;
     if !opened {
         return; // (no door was opened: a node that failed to start, or a program with no HTTP door)
     }
     let started = tokio::time::Instant::now();
-    DOOR.send_if_modified(|d| {
-        let serving = *d == Door::Open;
+    d.door.send_if_modified(|door| {
+        let serving = *door == Door::Open;
         if serving {
-            *d = Door::Closing;
+            *door = Door::Closing;
         }
         serving
     });
-    let bound = door_bound();
-    let mut door = DOOR.subscribe();
-    let others = SERVING.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let bound = door_bound(node);
+    let mut door = d.door.subscribe();
+    let others = d.others.clone();
     let shut = tokio::time::timeout(bound, async {
         drop(door.wait_for(|d| *d == Door::Closed).await);
         while others.load(SeqCst) > 0 {
-            tokio::time::sleep(Duration::from_millis(20)).await; // (Flight's door: its connections closing, `Serving`)
+            tokio::time::sleep(Duration::from_millis(20)).await; // (Flight's door: its connections closing, `Drain::serving`)
         }
     })
     .await
     .is_ok();
-    if !HURRIED.load(SeqCst) && TOOK.load(SeqCst) {
+    if !d.hurried.load(SeqCst) && d.took.load(SeqCst) {
         tokio::time::sleep_until(started + Duration::from_millis(250)).await;
     }
     if !shut {
