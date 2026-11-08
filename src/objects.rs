@@ -1142,7 +1142,7 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str, scope: &Scope) -> Result<V
 
 /// `SHOW CREATE <kind> name`: the statements that make it again (its comments too), as one row.
 /// None for any other statement.
-pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
+pub async fn show_create(lake: &Lake, sql: &str, scope: &Scope) -> Result<Option<String>> {
     static SHOW: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(&format!(r"(?is)^\s*show\s+create\s+({})\s+(.+?)\s*;?\s*$", *KIND_WORDS)).expect("a regex"));
     if !sql.trim_start().get(..4).is_some_and(|w| w.eq_ignore_ascii_case("show")) {
         return Ok(None);
@@ -1163,8 +1163,7 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
             return Ok(Some(format!("SELECT {} AS definition", literal(&format!("{made};"))))); // (the session's own)
         }
     }
-    let scope = crate::rights::scope(); // (the statement's caller: M8 piece 3b passes it)
-    let all = list(lake, &scope).await?;
+    let all = list(lake, scope).await?;
     let schema = |o: &Object, s: &str| o.schema.as_deref().unwrap_or(PUBLIC) == s;
     let found = all.iter().filter(|o| {
         o.family() == wanted.family && (o.kind == wanted.name || matches!(wanted.name, "table" | "function")) && match parts[..] {
@@ -1199,7 +1198,7 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
     if o.family() == "relation" && o.lake == here {
         let meta = lake.cat.meta(&table_key(&o.local())).await?;
         let view = match meta {
-            None => view_columns(lake, &o.local(), &scope).await?,
+            None => view_columns(lake, &o.local(), scope).await?,
             Some(_) => None,
         };
         for (k, text) in lake.cat.scan::<String>(&format!("cm/column/{}/", o.local()), &format!("cm/column/{}0", o.local())).await? {
@@ -1273,9 +1272,9 @@ pub fn kinds() -> Value { Value::Array(rows(crate::registry::get())) }
 /// each table and view of this lake and the lakes attached to it — its kind, key, layout, formats and size, and a view's
 /// definition — read from the catalog alone, no query run (ADR-032); and where the lake's own files are, for
 /// `read_csv('…/files/x.csv')`. Columns come from `information_schema`, as every client reads them.
-pub async fn listed(lake: &crate::store::Lake) -> anyhow::Result<serde_json::Value> {
+pub async fn listed(lake: &crate::store::Lake, scope: &Scope) -> anyhow::Result<serde_json::Value> {
     let mut all = vec![];
-    for o in crate::ddl::listed(lake).await? {
+    for o in crate::ddl::listed_for(lake, scope).await? {
         let (catalog, schema, name) = (&o.lake, &o.schema, &o.name);
         let Some(m) = o.meta else {
             all.push(serde_json::json!({"catalog": catalog, "schema": schema, "name": name, "kind": if o.kind == "external table" { "files" } else { o.kind }, "sql": o.sql}));

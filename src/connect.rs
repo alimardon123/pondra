@@ -481,7 +481,7 @@ mod tests {
         let (drop, later) = (dir.join("drop"), dir.join("later"));
         run(&lake, &format!("CREATE CONNECTION drop_zone TYPE folder WITH (url = '{}')", drop.display())).await.unwrap();
         // (the paths that take one: a file reference, a reader's list, COPY's source and target, a LOCATION)
-        let q = crate::routines::expand(&lake, "SELECT * FROM '@drop_zone/in/*.csv' JOIN read_parquet(['@Drop_Zone/a.parquet', 's3://b/c.parquet']) ON true").await?;
+        let q = crate::routines::expand(&lake, "SELECT * FROM '@drop_zone/in/*.csv' JOIN read_parquet(['@Drop_Zone/a.parquet', 's3://b/c.parquet']) ON true", &crate::auth::Principal::node().scope).await?;
         let mut urls: Vec<String> = crate::ext_names::names(&q).iter().filter_map(|n| crate::ext_names::spec(n)).flat_map(|s| s.urls).collect();
         urls.sort();
         assert_eq!(urls, ["cn://drop_zone/a.parquet", "cn://drop_zone/in/*.csv", "s3://b/c.parquet"]);

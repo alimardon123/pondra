@@ -481,10 +481,10 @@ pub(crate) async fn replaced(lake: &Lake, table: &str) -> Result<Option<String>>
 /// write in a WITH (`WITH m AS (DELETE … RETURNING *)`), which runs once, is refused (0A000). A query with a
 /// MATCH_RECOGNIZE stays as written too: `pattern.rs` reads its input as written (a CTE, or a subquery it refuses by name).
 #[cfg(test)] // (the tests' way in: `create` takes `writing_in`'s plain views too)
-pub(crate) async fn written_in(lake: &Lake, sql: &str) -> Result<String> { Ok(writing_in(lake, sql).await?.0) }
+pub(crate) async fn written_in(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Result<String> { Ok(writing_in(lake, sql, scope).await?.0) }
 
 /// `written_in`, with the plain views written in, by their names in the catalog (each once, in order).
-async fn writing_in(lake: &Lake, sql: &str) -> Result<(String, Vec<String>)> {
+async fn writing_in(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Result<(String, Vec<String>)> {
     use datafusion::sql::sqlparser::ast::{Query, Statement, TableAlias, TableFactor, VisitorMut};
     use std::collections::HashMap;
     use std::ops::ControlFlow;
@@ -493,7 +493,7 @@ async fn writing_in(lake: &Lake, sql: &str) -> Result<(String, Vec<String>)> {
     }
     let Ok(mut parsed) = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::GenericDialect {}, sql) else { return Ok((sql.to_string(), vec![])) };
     let [Statement::Query(q)] = &mut parsed[..] else { return Ok((sql.to_string(), vec![])) };
-    let views: HashMap<String, String> = crate::query::stored_views(lake, sql, false).await?.into_iter().collect();
+    let views: HashMap<String, String> = crate::query::stored_views(lake, sql, false, scope).await?.into_iter().collect();
     if q.with.is_none() && views.is_empty() {
         return Ok((sql.to_string(), vec![])); // (nothing to write in: the text as written)
     }
@@ -591,7 +591,7 @@ pub(crate) async fn followed(lake: &Lake, table: &str) -> Result<String> {
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
 pub async fn create(lake: &Lake, name: &str, sql: &str, mut o: Options, scope: &crate::rights::Scope) -> Result<()> {
-    let (written_in, from) = writing_in(lake, sql).await?; // (its CTEs and the plain views it reads, as subqueries: a view follows a table)
+    let (written_in, from) = writing_in(lake, sql, scope).await?; // (its CTEs and the plain views it reads, as subqueries: a view follows a table)
     o.from = from.clone(); // (made with what `as_written` sets after it, so the view is whole in its first commit)
     o.written = (written_in != sql).then(|| sql.to_string());
     Box::pin(made(lake, name, &written_in, sql, o, scope)).await?;
@@ -793,7 +793,7 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
     // (a uuid, json or jsonb column, as CREATE TABLE … AS keeps it; a view with a last step holds partial columns, which the query doesn't give)
     let sql_types = if finish.is_none() {
         let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
-        crate::write::query_types(lake, written, &names).await
+        crate::write::query_types(lake, written, &names, scope).await
     } else {
         Default::default()
     };
@@ -823,7 +823,7 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
         ensure!(meta.key.contains(&o.column), "EMIT FINAL: {} is the view's window, so it is one of its GROUP BY columns", o.column);
         let columns: Vec<(String, String)> = shown.iter().filter(|(c, _)| c != "_deleted").cloned().collect(); // (finished, if it is)
         let shown_names: Vec<String> = shown.iter().map(|(c, _)| c.clone()).collect();
-        let sql_types = crate::write::query_types(lake, written, &shown_names).await;
+        let sql_types = crate::write::query_types(lake, written, &shown_names, scope).await;
         puts.push((table_key(&o.into), json(&{ let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry })));
         if lake.cat.get::<TableMeta>(&table_key(EXPECTED)).await?.is_none() && !puts.iter().any(|(k, _)| *k == table_key(EXPECTED)) {
             puts.push((table_key(EXPECTED), json(&expected_table(lake))));
@@ -982,7 +982,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     ensure!(s.keys.iter().all(|k| out.field_with_unqualified_name(k).is_ok()), "a session view SELECTs its GROUP BY columns, as they are named");
     let columns: Vec<(String, String)> = out.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
-    let sql_types = crate::write::query_types(lake, &with, &names).await;
+    let sql_types = crate::write::query_types(lake, &with, &names, scope).await;
     let meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry };
     let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None, from, authored: None };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
@@ -1961,7 +1961,7 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     j.tables = tables;
     let now = lake.visible();
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
-    let sql_types = crate::write::query_types(lake, sql, &names).await;
+    let sql_types = crate::write::query_types(lake, sql, &names, scope).await;
     let meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = now; entry };
     let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written, rerun: None, matches: None, from, authored: None };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await
@@ -2190,7 +2190,8 @@ mod tests {
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let view = |sql: &str| json(&crate::ddl::StoredView { sql: sql.into(), external: false, facts: vec![], authored: None });
         lake.cat.commit(vec![(crate::ddl::query_key("vx"), view("SELECT x FROM a WHERE x > 1")), (crate::ddl::query_key("vy"), view("SELECT x FROM vx"))], &[]).await?;
-        let w = |sql: &'static str| written_in(&lake, sql);
+        let node = crate::auth::Principal::node().scope;
+        let w = |sql: &'static str| written_in(&lake, sql, &node);
         assert_eq!(w("SELECT x FROM a").await?, "SELECT x FROM a");
         assert_eq!(w("WITH t AS (SELECT x FROM a) SELECT count(*) AS n FROM t").await?, "SELECT count(*) AS n FROM (SELECT x FROM a) AS t");
         assert_eq!(first_table(&w("WITH t AS (SELECT x FROM a) SELECT count(*) AS n FROM t").await?)?, "a");
@@ -2199,8 +2200,8 @@ mod tests {
         assert_eq!(w("WITH a AS (SELECT x FROM a) SELECT x FROM a").await?, "SELECT x FROM (SELECT x FROM a) AS a", "inside it, a is the table");
         assert_eq!(w("SELECT x FROM vy").await?, "SELECT x FROM (SELECT x FROM (SELECT x FROM a WHERE x > 1) AS vx) AS vy");
         assert_eq!(first_table(&w("SELECT x FROM vy").await?)?, "a");
-        assert_eq!(writing_in(&lake, "SELECT x FROM vy JOIN vx USING (x)").await?.1, ["vy", "vx"], "the plain views written in, each once");
-        assert!(writing_in(&lake, "WITH vx AS (SELECT 1 AS x) SELECT x FROM vx").await?.1.is_empty(), "a CTE is no plain view");
+        assert_eq!(writing_in(&lake, "SELECT x FROM vy JOIN vx USING (x)", &crate::auth::Principal::node().scope).await?.1, ["vy", "vx"], "the plain views written in, each once");
+        assert!(writing_in(&lake, "WITH vx AS (SELECT 1 AS x) SELECT x FROM vx", &crate::auth::Principal::node().scope).await?.1.is_empty(), "a CTE is no plain view");
         let recursive = "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r";
         assert_eq!(w(recursive).await?, recursive);
         let pattern = "WITH t AS (SELECT * FROM a WHERE x > 1) SELECT * FROM t MATCH_RECOGNIZE (ORDER BY x PATTERN (b+) DEFINE b AS true) m";

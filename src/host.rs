@@ -4,6 +4,7 @@ use crate::ext_names::Attached;
 use crate::front::{Host, Own, Relation};
 use crate::measures::Definition;
 use crate::pg_trace::Ty;
+use crate::rights::Scope;
 use crate::store::{Lake, TableMeta};
 use crate::ddl;
 use anyhow::Result;
@@ -11,62 +12,82 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-impl Host for Lake {
-    fn name(&self) -> String { crate::ddl::lake_name(self) }
+/// A lake as the front's host for one statement: what it keeps is the lake's, and what the front's passes ask before they
+/// can write theirs (`Host::ask`: a PIVOT's values, the columns `COLUMNS(…)` reads), and the node's own statements it
+/// answers (`SHOW CREATE`, `pondra.find`), are planned and listed for `scope`, the statement's asker, as the statement is.
+/// The front names no scope (it runs where there is none, `front.rs`): the host carries it.
+#[derive(Clone)]
+pub struct Asking {
+    pub lake: Arc<Lake>,
+    pub scope: Scope,
+}
+
+impl Asking {
+    /// `lake` as the host of a statement planned for `scope`.
+    pub fn of(lake: &Lake, scope: &Scope) -> Asking { Asking { lake: lake.arc(), scope: scope.clone() } }
+}
+
+impl Host for Asking {
+    fn name(&self) -> String { crate::ddl::lake_name(&self.lake) }
 
     // (A free function, not the method's body: its awaits reach the front again through queries, and
     // a method's future is checked against the trait's `+ Send` while its own type is still being made,
     // which the compiler reports as a cycle (E0391). `own` below is the same pass.)
-    fn own(&self, sql: &str) -> impl Future<Output = Result<Own>> + Send { own(self, sql) }
+    fn own(&self, sql: &str) -> impl Future<Output = Result<Own>> + Send { own(&self.lake, sql, &self.scope) }
 
     async fn routines(&self) -> Result<crate::front::Routines> {
-        let lake = crate::routines::listed(self).await?;
+        let lake = crate::routines::listed(&self.lake).await?;
         Ok(crate::front::Routines { own: crate::temp::routines(lake.clone()), lake }) // (the session's temporary ones over the lake's, for the statement's own text)
     }
 
-    async fn attached(&self) -> Result<Vec<(String, Attached)>> { crate::ext::attached(self).await }
+    async fn attached(&self) -> Result<Vec<(String, Attached)>> { crate::ext::attached(&self.lake).await }
 
     async fn columns(&self, tables: BTreeSet<String>) -> Result<HashMap<String, Vec<String>>> {
         let mut out = HashMap::new();
         for n in tables {
-            if let Some(m) = self.cat.meta(&crate::store::table_key(&n)).await? {
+            if let Some(m) = self.lake.cat.meta(&crate::store::table_key(&n)).await? {
                 out.insert(n, m.sql_order().into_iter().chain(crate::text::NAMES.map(String::from)).collect()); // (SQL's order, as `*` reads them)
             }
         }
         Ok(out)
     }
 
-    async fn measure_views(&self, sql: &str) -> Result<Arc<HashMap<String, Arc<Definition>>>> { measure_views(self, sql).await }
+    async fn measure_views(&self, sql: &str) -> Result<Arc<HashMap<String, Arc<Definition>>>> { measure_views(&self.lake, sql).await }
 
-    async fn relation(&self, name: &str) -> Option<Relation<Self>> { relation(self, name).await }
+    async fn relation(&self, name: &str) -> Option<Relation<Self>> {
+        Some(match relation(&self.lake, name).await? {
+            Relation::Columns(c) => Relation::Columns(c),
+            Relation::View { sql, lake } => Relation::View { sql, lake: lake.map(|lake| Arc::new(Asking { lake, scope: self.scope.clone() })) }, // (another lake's view: traced there, for the same asker)
+        })
+    }
 
-    async fn enum_labels(&self, name: &str) -> Option<Vec<String>> { crate::types::labels(self, name).await }
+    async fn enum_labels(&self, name: &str) -> Option<Vec<String>> { crate::types::labels(&self.lake, name).await }
 
     // (The one below wraps a free function for the same reason as `own`: its pass asks queries.)
-    fn ask(&self, sql: &str) -> impl Future<Output = Result<datafusion::prelude::DataFrame>> + Send { ask_of(self, sql) }
+    fn ask(&self, sql: &str) -> impl Future<Output = Result<datafusion::prelude::DataFrame>> + Send { ask_of(&self.lake, sql, &self.scope) }
 
     // (a node's watch is its own, `oom.rs`: the frame is collected as it is)
     async fn collect(&self, frame: datafusion::prelude::DataFrame) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>> { Ok(frame.collect().await?) }
 }
 
-/// What the front's passes ask, planned as the node plans a query: expanded, ASOF JOIN's marker, the caller's session.
-async fn ask_of(lake: &Lake, sql: &str) -> Result<datafusion::prelude::DataFrame> {
-    let sql = crate::routines::expand(lake, sql).await?;
+/// What the front's passes ask, planned as the node plans a query: expanded, ASOF JOIN's marker, for the statement's asker.
+async fn ask_of(lake: &Lake, sql: &str, scope: &Scope) -> Result<datafusion::prelude::DataFrame> {
+    let sql = crate::routines::expand(lake, sql, scope).await?;
     let sql = crate::sys::planned(&sql)?.into_owned();
-    let ctx = crate::query::session(lake, &sql, "").await?;
+    let ctx = crate::query::session_for(lake, &sql, "", None, scope).await?;
     crate::engine::sql(&ctx, &sql).await
 }
 
 /// The node's own statements, asked before anything else (`Host::own`): the six passes of the
 /// front, in their order.
-async fn own(lake: &Lake, sql: &str) -> Result<Own> {
+async fn own(lake: &Lake, sql: &str, scope: &Scope) -> Result<Own> {
     let sql = &crate::vars::parameters_in(lake, sql).await?; // (`pondra.parameters('etl/orders.sql')`: a file's parameters, as rows)
-    let sql = &crate::find::functions_in(lake, sql).await?; // (`pondra.find('revenue')`: the catalog searched, as rows)
+    let sql = &crate::find::functions_in(lake, sql, scope).await?; // (`pondra.find('revenue')`: the catalog searched, as rows)
     let sql = &crate::git::status_in(lake, sql).await?; // (`pondra.git_status('sales')`: a Git folder's local changes, as rows)
     if let Some(q) = crate::routines::show(sql) {
         return Ok(Own::Answer(q));
     }
-    if let Some(q) = crate::objects::show_create(lake, sql).await? {
+    if let Some(q) = crate::objects::show_create(lake, sql, scope).await? {
         return Ok(Own::Answer(q)); // (`SHOW CREATE TABLE t`: the statements that make it again)
     }
     let sql = &crate::past::restore(lake, sql).await?.unwrap_or_else(|| sql.to_string()); // (`RESTORE TABLE t TO VERSION AS OF n`: a MERGE, ADR-043)

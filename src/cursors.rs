@@ -172,7 +172,7 @@ async fn declare_as(app: &App, name: &str, hold: bool, query: &str, scope: &crat
         Some(b) => b.schema(),
         None => planned(app, query, scope).await?,
     };
-    let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&app.lake, query).await); // (its uuids, for the Postgres port)
+    let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&app.lake, query, scope).await); // (its uuids, for the Postgres port)
     let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
     let mut all = CURSORS.lock().unwrap(); // (the budget is checked under the lock the insert takes: two DECLAREs can't both pass it)
     let held: usize = all.values().flat_map(|cs| cs.values()).map(|c| c.bytes).sum();

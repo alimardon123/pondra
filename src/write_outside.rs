@@ -55,7 +55,7 @@ impl Rows {
             Some(names) => crate::rules::rows::rows_for(&name, columns, &names, &query, &|_| None)?,
             None => query,
         };
-        let query = crate::routines::expand(lake, &query).await?;
+        let query = crate::routines::expand(lake, &query, &scope).await?;
         crate::engine::sql(&crate::query::session_for(lake, &query, "", None, &scope).await?, &query).await
     }
 }

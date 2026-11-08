@@ -952,8 +952,8 @@ pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::Fi
 /// … AS` keeps them and a view's table does too (`pg_types::columns`). A query that gives another number of columns
 /// than `names` gives none: a type matched to the wrong name would be a guess. (A view kept as partial rows is no
 /// query's columns: its caller passes none, `finish.rs`.)
-pub async fn query_types(lake: &Lake, sql: &str, names: &[String]) -> BTreeMap<String, String> {
-    let shape = crate::pg_types::columns(lake, sql).await;
+pub async fn query_types(lake: &Lake, sql: &str, names: &[String], scope: &crate::rights::Scope) -> BTreeMap<String, String> {
+    let shape = crate::pg_types::columns(lake, sql, scope).await;
     if shape.types.len() != names.len() {
         return BTreeMap::new();
     }
@@ -988,7 +988,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
             match c.columns.is_empty() {
                 true => {
                     let names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
-                    sql_types.extend(query_types(from, &sql, &names).await);
+                    sql_types.extend(query_types(from, &sql, &names, scope).await);
                     fields
                 }
                 false => {
@@ -2048,7 +2048,9 @@ fn stage_job(job: &str) -> String {
 /// node's. A refusal keeps its SQLSTATE: the node's own for the rows, and 28000 or 42501 for the sign-in and the staged files.
 async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], query: &str, job: &str, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
     let lake = &app.lake;
-    let slug = crate::dial::page_slug().ok_or_else(|| crate::codes::coded("42501", "a joined page stages its rows under its user's folder, and its node gave it none"))?;
+    let Some((joined, slug)) = app.members.joined().and_then(|j| Some((j, j.slug()?))) else {
+        return Err(crate::codes::coded("42501", "a joined page stages its rows under its user's folder, and its node gave it none"));
+    };
     let stage = stage_job(job);
     let ctx = session_for(lake, query, "", None, scope).await?;
     let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
@@ -2092,7 +2094,8 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
         _ => None,
     };
     let call = crate::dial::Call::json(format!("/insert/{}?job={stage}&staged=1", percent_encoding::utf8_percent_encode(table, percent_encoding::NON_ALPHANUMERIC)), &j!({"columns": names, "files": files, "placed": placed}))?;
-    let reply = crate::dial::call(&app.members.leader().addr, call).await?;
+    // (the page's own dial, with its own sign-in: a node's carries the nodes' key)
+    let reply = crate::dial::Dial::call(&crate::dial::Joined { node: joined.node(), auth: joined.auth() }, joined.node(), call).await?;
     if reply.ok() {
         return reply.json().await;
     }

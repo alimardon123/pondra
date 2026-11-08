@@ -1,6 +1,6 @@
 //! A joined page's own statements, recorded by its node (audit 11-01 M8). A page that joined a node keeps no records of its own:
 //! what it runs on its lake (its reads of the lake, and the INSERTs it stages) leaves its lines on the node it joined, under the
-//! sign-in's name, as the door `page-reported` (`REPORTED`), from the request's address. `history::ended` hands each statement to `add`; a sender
+//! sign-in's name, as the door `page-reported` (`REPORTED`), from the request's address. `history::ended` hands each statement to `add`, which keeps it on the page's lake (`Unsent`); a sender
 //! started with the page's member (`node::open_joined`, `run`) posts what waits to `POST /cluster/records` once a second, and
 //! `node::Paged::close` posts what is left once (`flush`). The node writes each line as its own (`record`): its audit line when
 //! the class is written there, and its history row.
@@ -14,6 +14,7 @@
 use crate::app::App;
 use crate::auth::Principal;
 use crate::dial::Dial;
+use crate::store::Lake;
 use crate::{audit, history};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -119,16 +120,29 @@ impl Buffer {
     }
 }
 
-// What this page holds unsent: a per-node static, so the page's close (`reset`) sets it back.
-crate::per_node!(static BUFFER: std::sync::Mutex<Buffer> = std::sync::Mutex::new(Buffer::default()));
+/// What a joined page holds unsent, kept on its lake (`lake_state.rs`): made at its first statement, gone with its lake.
+#[derive(Default)]
+pub struct Unsent(std::sync::Mutex<Buffer>);
 
-fn buffer() -> std::sync::MutexGuard<'static, Buffer> {
-    BUFFER.lock().unwrap_or_else(|e| e.into_inner())
+impl crate::lake_state::LakeState for Unsent {
+    const NAME: &'static str = "page_records";
+    const ABOUT: &'static str = "a joined page's own statements, held until its node has them";
+    fn make() -> Self {
+        Unsent::default()
+    }
+}
+
+impl Unsent {
+    fn buffer(&self) -> std::sync::MutexGuard<'_, Buffer> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// A statement a joined page ran has ended: kept for its node (`history::ended` on a page). Nothing is sent here.
-pub(crate) fn add(sql: &str, outcome: &str, error: Option<String>, took: Duration) {
-    buffer().push(line(sql, outcome, error, took));
+pub(crate) fn add(lake: &Lake, sql: &str, outcome: &str, error: Option<String>, took: Duration) {
+    if let Ok(unsent) = lake.state::<Unsent>() {
+        unsent.buffer().push(line(sql, outcome, error, took));
+    }
 }
 
 /// What became of a batch sent to the node.
@@ -141,16 +155,16 @@ enum Sent {
     Ended,
 }
 
-async fn send(node: &str, batch: Batch) -> Sent {
+async fn send(to: &crate::dial::Joined<'_>, unsent: &Unsent, batch: Batch) -> Sent {
     let Ok(call) = crate::dial::Call::json("/cluster/records", &batch) else { return Sent::Kept(batch) };
-    // (`dial::Paged` and not `dial::call`: a build with doors dials with the nodes' key, which the node refuses here)
-    match crate::dial::Paged.call(node, call.timeout(Duration::from_secs(5))).await {
+    // (the page's own dial and not `dial::call`: a build with doors dials with the nodes' key, which the node refuses here)
+    match to.call(to.node, call.timeout(Duration::from_secs(5))).await {
         Ok(reply) => match reply.status {
             200..=299 => Sent::Took,
             401 | 403 => Sent::Ended,
             // (a 4xx: a size or a shape the node won't take, as a 413 is; sent again, it would be refused again and hold back the rest)
             400..=499 => {
-                buffer().dropped += batch.lines.len() as u64;
+                unsent.buffer().dropped += batch.lines.len() as u64;
                 Sent::Took
             }
             _ => Sent::Kept(batch),
@@ -159,21 +173,22 @@ async fn send(node: &str, batch: Batch) -> Sent {
     }
 }
 
-/// Sends what waits to the node the page joined, batch after batch. A batch that doesn't reach the node is kept and the sweep
-/// ends; false when the sign-in ended.
-async fn sweep() -> bool {
-    let Some((node, _)) = crate::dial::page_node() else { return true };
+/// Sends what the joined page `members` holds waits to its node, batch after batch. A batch that doesn't reach the node is kept
+/// and the sweep ends; false when the sign-in ended.
+async fn sweep(members: &dyn crate::members::Members, lake: &Lake) -> bool {
+    let (Some(joined), Ok(unsent)) = (members.joined(), lake.state::<Unsent>()) else { return true };
+    let to = crate::dial::Joined { node: joined.node(), auth: joined.auth() };
     loop {
-        let next = buffer().take();
+        let next = unsent.buffer().take();
         let Some(batch) = next else { return true };
-        match send(&node, batch).await {
+        match send(&to, &unsent, batch).await {
             Sent::Took => {}
             Sent::Kept(batch) => {
-                buffer().give_back(batch);
+                unsent.buffer().give_back(batch);
                 return true;
             }
             Sent::Ended => {
-                let mut b = buffer();
+                let mut b = unsent.buffer();
                 (b.ended, b.lines, b.dropped) = (true, VecDeque::new(), 0);
                 return false;
             }
@@ -182,21 +197,25 @@ async fn sweep() -> bool {
 }
 
 /// The page's sender, started with its member (`node::open_joined`): each second, what waits goes to the node. It ends with the
-/// member (`abort_all`), or when the sign-in ends.
-pub(crate) async fn run() {
-    let mut ticks = tokio::time::interval(EVERY);
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        ticks.tick().await;
-        if !sweep().await {
-            return;
+/// member (`abort_all`), with its lake, or when the sign-in ends.
+pub(crate) fn run(app: &App) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let (members, lake) = (app.members.clone(), std::sync::Arc::downgrade(&app.lake)); // (weak: the sender keeps no lake alive)
+    async move {
+        let mut ticks = tokio::time::interval(EVERY);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let Some(lake) = lake.upgrade() else { return };
+            if !sweep(&*members, &lake).await {
+                return;
+            }
         }
     }
 }
 
 /// Sends what waits once, as the page closes (`node::Paged::close`, which allows it 2 s): no retry.
-pub(crate) async fn flush() {
-    let _ = sweep().await;
+pub(crate) async fn flush(app: &App) {
+    let _ = sweep(&*app.members, &app.lake).await;
 }
 
 /// Why a sign-in may not send a page's lines to this node, if it may not: only a superuser's own sign-in does. Not the nodes' key
@@ -274,8 +293,17 @@ impl Cap {
     }
 }
 
-// The node's count of each sign-in's page: a per-node static, set back when the node stops.
-crate::per_node!(static COUNTS: std::sync::Mutex<Cap> = std::sync::Mutex::new(Cap::default()));
+/// The node's count of each sign-in's page, kept on the lake it records them in (`lake_state.rs`).
+#[derive(Default)]
+pub struct Counted(std::sync::Mutex<Cap>);
+
+impl crate::lake_state::LakeState for Counted {
+    const NAME: &'static str = "page_counts";
+    const ABOUT: &'static str = "the lines each sign-in's joined page sent this minute, which the node records up to its cap";
+    fn make() -> Self {
+        Counted::default()
+    }
+}
 
 /// A statement as the node records it: its class (the node's own `audit::class`, not the page's word for it), its outcome (one
 /// of the four words, else `failed`), its text and error cut as a page's are, and its time, clamped to a day.
@@ -308,7 +336,8 @@ fn recorded(line: Line) -> Recorded {
 /// line (when its class is written here, or it was refused) and its history row, under `who`'s name as the door `REPORTED`.
 /// Lines past the sign-in's `CAP` a minute are not written; the minutes that ended with lines not written are noted by the node.
 pub async fn record(app: &App, who: &Principal, batch: Batch) {
-    let admit = COUNTS.lock().unwrap_or_else(|e| e.into_inner()).admit(&who.name, crate::log::now_ms(), batch.lines.len(), usize::try_from(batch.dropped).unwrap_or(usize::MAX));
+    let Ok(counted) = app.lake.state::<Counted>() else { return }; // (registered with the engine's: never refused)
+    let admit = counted.0.lock().unwrap_or_else(|e| e.into_inner()).admit(&who.name, crate::log::now_ms(), batch.lines.len(), usize::try_from(batch.dropped).unwrap_or(usize::MAX));
     for e in admit.ended {
         if e.capped > 0 {
             audit::page_note(app, format!("{} statements of {}'s page were not recorded (more than {CAP} a minute)", e.capped, e.user));

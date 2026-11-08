@@ -826,7 +826,7 @@ impl TableProvider for HotFiles {
             self.lake.hot.load(self.lake.clone(), f.clone(), schema.fields().to_vec(), deletes, gate.clone()); // (in the background: the next read has the file)
         }
         if !held.is_empty() {
-            let source = HotSource::new(schema.clone(), held, state.config().target_partitions().max(1), self.known.clone());
+            let source = HotSource::new(schema.clone(), held, state.config().target_partitions().max(1), self.known.clone(), self.lake.node.metrics.clone());
             if !source.parts.is_empty() {
                 plans.push(DataSourceExec::from_data_source(source));
             }
@@ -964,11 +964,14 @@ struct HotSource {
     known: Arc<HashMap<String, Known>>,
     /// The pruning predicate built from `predicate`, once it is (`None`: it couldn't be built, so every batch is kept).
     pruning: Arc<std::sync::OnceLock<Option<Arc<PruningPredicate>>>>,
+    /// Its node's counters: the batches its scans skip are counted there (`Metrics::hot_skipped`).
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl HotSource {
-    /// A source reading `schema`'s columns of `files`, their batches dealt to `n` partitions (`deal`).
-    fn new(schema: SchemaRef, files: Vec<Held>, n: usize, known: Arc<HashMap<String, Known>>) -> HotSource {
+    /// A source reading `schema`'s columns of `files`, their batches dealt to `n` partitions (`deal`), on the node whose
+    /// counters are `metrics`.
+    fn new(schema: SchemaRef, files: Vec<Held>, n: usize, known: Arc<HashMap<String, Known>>, metrics: Arc<crate::metrics::Metrics>) -> HotSource {
         let parts = deal(&files, n);
         HotSource {
             projected_schema: schema.clone(),
@@ -981,6 +984,7 @@ impl HotSource {
             predicate: None,
             known,
             pruning: Default::default(),
+            metrics,
         }
     }
 
@@ -1043,6 +1047,7 @@ impl DataSource for HotSource {
                     next: 0,
                     gap: 1,
                     stats: Default::default(),
+                    metrics: self.metrics.clone(),
                 })
             }
             _ => None,
@@ -1222,10 +1227,6 @@ fn top_first(p: &Arc<dyn ExecutionPlan>, order: &[datafusion::physical_expr::Phy
     }
 }
 
-crate::per_node!(
-    /// Batches scans skipped by their ranges (`/metrics`).
-    pub static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
-
 /// Which of a partition's batches its scan's predicate may match, worked out again when a dynamic
 /// filter in it moves. A predicate with no dynamic filter is built into its pruning predicate once for the whole scan
 /// and shared by its partitions (`shared`); one with a dynamic filter is built again as the filter moves.
@@ -1240,6 +1241,7 @@ struct Skip {
     next: usize, // (the batch from which a moved filter is looked at again)
     gap: usize,
     stats: Mutex<HashMap<String, Option<Ranges>>>, // (the partition's ranges of a column, made when first asked)
+    metrics: Arc<crate::metrics::Metrics>, // (its node's: the batches skipped are counted there)
 }
 
 impl Skip {
@@ -1264,7 +1266,7 @@ impl Skip {
         }
         let keep = self.keep.as_ref().and_then(|k| k.get(i)).copied().unwrap_or(true);
         if !keep {
-            SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.hot_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         keep
     }
@@ -1532,7 +1534,7 @@ mod tests {
         // Batch i goes to partition i % 2 in turn: file 0's batches 0 and 2 and file 1's batch 1, then file 0's 1 and file 1's 0.
         assert_eq!(deal(&files, 2), vec![vec![(0, 0), (0, 2), (1, 1)], vec![(0, 1), (1, 0)]]);
 
-        let source = HotSource::new(schema, files, 2, Default::default());
+        let source = HotSource::new(schema, files, 2, Default::default(), Default::default());
         let rows = |source: &dyn DataSource, p: usize| -> Vec<i64> {
             let stream = source.open(p, Arc::new(datafusion::execution::TaskContext::default())).unwrap();
             let batches = futures::executor::block_on(datafusion::physical_plan::common::collect(stream)).unwrap();
@@ -1564,7 +1566,8 @@ mod tests {
         // Batches 0 and 2 go to partition 0 (0..4 and 8..12), batches 1 and 3 to partition 1 (4..8 and 12..16).
         assert_eq!(deal(&files, 2), vec![vec![(0, 0), (1, 0)], vec![(0, 1), (1, 1)]]);
 
-        let source = HotSource::new(schema.clone(), files, 2, Default::default());
+        let metrics: Arc<crate::metrics::Metrics> = Default::default(); // (its node's counters)
+        let source = HotSource::new(schema.clone(), files, 2, Default::default(), metrics.clone());
         // The filter `i >= 12`, pushed into the source: a static predicate on a column with ranges, so it takes it.
         let filter = binary(col("i", &schema).unwrap(), Operator::GtEq, lit(12i64), &schema).unwrap();
         let pushed = source.try_pushdown_filters(vec![filter], &datafusion::common::config::ConfigOptions::default()).unwrap();
@@ -1580,6 +1583,7 @@ mod tests {
         assert_eq!(rows(filtered, 0), Vec::<i64>::new()); // (0..4 and 8..12 are below 12: both skipped)
         assert_eq!(rows(filtered, 1), [12, 13, 14, 15]); // (4..8 is skipped; 12..16 is kept whole, as no filter above it runs here)
         assert!(matches!(filtered.pruning.get(), Some(Some(_)))); // (built by the first partition read, and the second shares it)
+        assert_eq!(metrics.hot_skipped.load(std::sync::atomic::Ordering::Relaxed), 3, "the three batches skipped, counted on the source's node");
     }
 
     #[test]

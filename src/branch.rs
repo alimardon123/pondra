@@ -801,7 +801,7 @@ pub async fn databases(lake: &Lake) -> Result<datafusion::arrow::record_batch::R
     let mut rows = vec![];
     let mut lifts = vec![]; // (protected, lifted_at in µs, lifted_by), per row: a lifted protection shows until it is set again
     // (why this lake's last move out of memory failed, as it stayed in memory; NULL otherwise)
-    let failed = crate::memory::MOVE_FAILED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let failed = lake.node.move_failed.get().cloned();
     for (name, l) in &all {
         let b = l.cat.get::<Bases>(BASES).await.ok().flatten();
         let branches = l.cat.scan::<Pin>("pn/", "pn0").await.map(|p| p.len()).unwrap_or(0);

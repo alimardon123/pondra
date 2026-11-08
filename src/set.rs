@@ -33,7 +33,7 @@ pub fn is(sql: &str) -> bool {
 /// What Postgres's tools send that has nothing to do here (dbt and BI tools send both): `ANALYZE
 /// [t]`, since statistics are kept with every write, and `REFRESH MATERIALIZED VIEW v`, since a
 /// view is current as rows arrive. Refused for a name that isn't one.
-async fn current(lake: &Lake, sql: &str) -> Result<Option<Done>> {
+async fn current(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Result<Option<Done>> {
     let name = {
         let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql)?;
         let word = |p: &mut Parser, w: &str| crate::routines::word(p, w);
@@ -51,7 +51,7 @@ async fn current(lake: &Lake, sql: &str) -> Result<Option<Done>> {
     let l = other.as_deref().unwrap_or(lake);
     let (schema, view) = crate::text::split(&local);
     let here = crate::ddl::lake_name(l);
-    let found = crate::ddl::listed(l).await?.into_iter().any(|t| t.lake == here && t.schema == schema && t.name == view && t.kind == "materialized view");
+    let found = crate::ddl::listed_for(l, scope).await?.into_iter().any(|t| t.lake == here && t.schema == schema && t.name == view && t.kind == "materialized view");
     ensure!(found, "REFRESH MATERIALIZED VIEW {name}: there is no materialized view of that name");
     Ok(Some(Done::Said(Kind::new("REFRESH MATERIALIZED VIEW"))))
 }
@@ -70,7 +70,7 @@ pub async fn statement(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> 
         crate::routines::heard(&said.notice);
         return Ok(Done::Said(Kind::new(said.tag)));
     }
-    if let Some(done) = current(lake, sql).await? {
+    if let Some(done) = current(lake, sql, scope).await? {
         return Ok(done);
     }
     let session = crate::temp::current();

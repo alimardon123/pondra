@@ -126,10 +126,8 @@ pub struct Listed {
     pub sql: Option<String>,     // (a view's definition; a materialized view's query: for a caller who may see code, `views::code_for_caller`)
 }
 
-/// Every table and view of this lake and the lakes attached to it, lake by lake.
-pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> { listed_for(lake, &crate::rights::scope()).await } // (the task's caller: M8 piece 3b passes it)
-
-/// `listed`, as `scope` may see it (a planning session's: `query::session_for`).
+/// Every table and view of this lake and the lakes attached to it, lake by lake, as `scope` may see them (the asker's, or
+/// a planning session's: `query::session_for`).
 pub async fn listed_for(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<Listed>> {
     let mut all = vec![];
     let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().clone();
@@ -558,7 +556,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
             ensure!(outside.is_empty(), "a materialized view follows the rows its tables take in, and files outside the lake take none: read them into a table (CREATE TABLE … AS, INSERT … SELECT) and follow that, or make a stored view (CREATE VIEW)");
             crate::views::create(lake, &name, &sql, crate::views::options(&options)?, scope).await?;
             let unwritten = match text {
-                Some(text) => !written_as(lake, &name, &text, &sql).await? && crate::authored::commented(&text), // (its query as written, comments kept: `authored.rs`)
+                Some(text) => !written_as(lake, &name, &text, &sql, scope).await? && crate::authored::commented(&text), // (its query as written, comments kept: `authored.rs`)
                 None => false,
             };
             crate::views::forget(lake); // (the sequencer holds flushes to it from its next commit)
@@ -1059,12 +1057,12 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
         made_from(lake, &name, "replace").await?;
     }
     crate::facts::measures_checked(lake, &sql).await?; // (a view with measures: its shape, and each join onto a key: ADR-065 §3)
-    let expanded = crate::routines::expand(lake, &sql).await?; // (kept as written: macros are read when it is used)
+    let expanded = crate::routines::expand(lake, &sql, scope).await?; // (kept as written: macros are read when it is used)
     let planned = crate::sys::planned(&expanded)?;
     let df = crate::engine::sql(&crate::query::session_for(lake, &planned, "", None, scope).await?, &planned).await.context(if external { "reading its files" } else { "the view's query" })?; // (it plans)
     let facts = crate::facts::settled(lake, &name, &sql, df.schema(), facts, replace).await?; // (its key facts: `facts.rs`)
     let (authored, unkept) = match text {
-        Some(text) if crate::authored::proved(lake, &text, &sql, false).await => (Some(crate::authored::Authored { text, of: sql.clone() }), false),
+        Some(text) if crate::authored::proved(lake, &text, &sql, false, scope).await => (Some(crate::authored::Authored { text, of: sql.clone() }), false),
         Some(text) => (None, crate::authored::commented(&text)),
         None => (None, false),
     };
@@ -1687,9 +1685,10 @@ async fn published_after_move(lake: &Lake, m: &TableMeta, readers: &[String]) ->
 /// A view's query's outputs, as it plans now: (name, type, may be NULL), in its order. Planned as the node's own: a query
 /// the lake keeps (or one a column's move rewrote from it), whose shape is the lake's, whoever moves the column.
 async fn view_outputs(lake: &Lake, sql: &str) -> Result<Vec<(String, datafusion::arrow::datatypes::DataType, bool)>> {
-    let expanded = crate::routines::expand(lake, sql).await?;
+    let node = &crate::auth::Principal::node().scope;
+    let expanded = crate::routines::expand(lake, sql, node).await?;
     let planned = crate::sys::planned(&expanded)?;
-    let df = crate::engine::sql(&crate::query::session_for(lake, &planned, "", None, &crate::auth::Principal::node().scope).await?, &planned).await?;
+    let df = crate::engine::sql(&crate::query::session_for(lake, &planned, "", None, node).await?, &planned).await?;
     Ok(df.schema().fields().iter().map(|f| (f.name().clone(), f.data_type().clone(), f.is_nullable())).collect())
 }
 
@@ -1758,16 +1757,16 @@ async fn place_view_column(lake: &Lake, name: &str, column: &str, place: &Place)
 async fn authored_moved(lake: &Lake, was: &Option<crate::authored::Authored>, query: &str, order: &[usize], now: &str, materialized: bool) -> (Option<crate::authored::Authored>, Option<&'static str>) {
     let Some(text) = crate::authored::Authored::of(was, query) else { return (None, None) };
     match crate::authored::moved(text, order) {
-        Some(t) if crate::authored::proved(lake, &t, now, materialized).await => (Some(crate::authored::Authored { text: t, of: now.to_string() }), None),
+        Some(t) if crate::authored::proved(lake, &t, now, materialized, &crate::auth::Principal::node().scope).await => (Some(crate::authored::Authored { text: t, of: now.to_string() }), None),
         _ => (None, Some(crate::authored::UNMOVED)),
     }
 }
 
 /// A materialized view's query as its author wrote it, kept once it is proved to be the query the view keeps (`authored.rs`).
-async fn written_as(lake: &Lake, name: &str, text: &str, sql: &str) -> Result<bool> {
+async fn written_as(lake: &Lake, name: &str, text: &str, sql: &str, scope: &crate::rights::Scope) -> Result<bool> {
     let key = crate::views::view_key(name);
     let Some(mut v) = lake.cat.get::<crate::views::View>(&key).await? else { return Ok(false) };
-    if v.query() != sql || !crate::authored::proved(lake, text, sql, true).await {
+    if v.query() != sql || !crate::authored::proved(lake, text, sql, true, scope).await {
         return Ok(false);
     }
     v.authored = Some(crate::authored::Authored { text: text.to_string(), of: sql.to_string() });
@@ -1878,7 +1877,7 @@ async fn reorder_materialized(lake: &Lake, name: &str, mut v: crate::views::View
     v.written = Some(written).filter(|w| *w != v.sql || v.written.is_some());
     // (its query as written: the statement's own when it is made again (CREATE OR REPLACE), else its columns moved too)
     let (authored, notice) = match text {
-        Some(t) if crate::authored::proved(lake, &t, v.query(), true).await => (Some(crate::authored::Authored { text: t, of: v.query().to_string() }), None),
+        Some(t) if crate::authored::proved(lake, &t, v.query(), true, &crate::auth::Principal::node().scope).await => (Some(crate::authored::Authored { text: t, of: v.query().to_string() }), None),
         Some(t) => (None, crate::authored::commented(&t).then_some(crate::authored::UNKEPT)),
         None => authored_moved(lake, &authored, &query, order, v.query(), true).await,
     };
@@ -2089,16 +2088,17 @@ pub(crate) async fn keep_readers(lake: &Lake, name: &str, column: &str, was: Vec
 /// of those columns stands for it): how a query reads once those tables' columns have moved, before they do. As the node's
 /// own, as `view_outputs`: the queries of what reads a table, kept by the lake.
 async fn outputs_over(lake: &Lake, sql: &str, over: &[(String, Vec<(String, String)>)]) -> Result<Vec<String>> {
-    let expanded = crate::routines::expand(lake, sql).await?;
+    let node = &crate::auth::Principal::node().scope;
+    let expanded = crate::routines::expand(lake, sql, node).await?;
     let planned = crate::sys::planned(&expanded)?;
-    let ctx = crate::query::session_for(lake, &planned, "", None, &crate::auth::Principal::node().scope).await?;
+    let ctx = crate::query::session_for(lake, &planned, "", None, node).await?;
     for (t, columns) in over {
         let table = crate::query::table_ref(t);
         let _ = ctx.deregister_table(table.clone());
         ctx.register_table(table, Arc::new(datafusion::datasource::MemTable::try_new(crate::answer::schema(columns)?, vec![vec![]])?))?;
     }
     // (a plain view was planned with the session, over the tables as they were: planned again, over these)
-    let views = crate::query::stored_views(lake, &planned, false).await?.into_iter().filter(|(v, _)| !over.iter().any(|(t, _)| t == v)).collect();
+    let views = crate::query::stored_views(lake, &planned, false, node).await?.into_iter().filter(|(v, _)| !over.iter().any(|(t, _)| t == v)).collect();
     crate::query::register_views(&ctx, views, false, false).await?;
     let df = crate::engine::sql(&ctx, &planned).await?;
     Ok(df.schema().fields().iter().map(|f| f.name().clone()).collect())
@@ -2247,6 +2247,47 @@ mod tests {
         assert!(lake.cat.get::<TableMeta>(&table_key("t")).await?.is_some(), "another job's table was dropped");
         apply(&lake, drop("job-a"), &crate::auth::Principal::node().scope).await?;
         assert!(lake.cat.get::<TableMeta>(&table_key("t")).await?.is_none(), "the job's own table was kept");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A column's move keeps what reads its table reading as it did, planned as the node's own whoever moves it
+    /// (`keep_readers`, `outputs_over`): the lake's definitions, the same for every asker. A mover who may read `t` and not
+    /// `s` moves `t`'s column under a materialized view of both; the move goes, the view runs its query with `t` read as it
+    /// was, and the move's answer names the view and holds no row of either table. The same mover's own new view of `s` plans for them, and is
+    /// refused. At a door, a mover granted SELECT only is refused before the move starts (`rights::may_run`, which
+    /// `routines::one_of` and Postgres's `run` ask): an ALTER needs an admin token or a superuser, who sees every table, so
+    /// the move below, asked of `apply` itself, is the lake's part for an asker a later grant (an owner's ALTER) may make.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_columns_move_keeps_a_view_its_mover_may_not_read() -> Result<()> {
+        use crate::users::{Access, Grant, On};
+        let dir = std::env::temp_dir().join(format!("pondra-mover-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let node = &crate::auth::Principal::node().scope;
+        crate::write::create_table(&lake, "t", r#"{"columns": [["a", "Int64"], ["b", "Int64"]]}"#).await?;
+        crate::write::create_table(&lake, "s", r#"{"columns": [["c", "Utf8"]]}"#).await?;
+        let view = |name: &str, sql: &str| Ddl::CreateView { name: name.into(), sql: sql.into(), replace: false, facts: None, text: None };
+        let materialized = Ddl::CreateMaterialized { name: "v".into(), sql: "SELECT * FROM t WHERE b > (SELECT count(*) FROM s)".into(), options: Default::default(), text: None };
+        apply(&lake, materialized, node).await?;
+        let made = lake.cat.get::<crate::views::View>(&crate::views::view_key("v")).await?.expect("v");
+        let fill = made.fill.clone().map(|f| crate::views::Fill { upto: Some(0), ..f }); // (as the sequencer sets it: `views::bound`)
+        lake.cat.commit(vec![(crate::views::view_key("v"), json(&crate::views::View { fill, ..made }))], &[]).await?;
+        let mover = crate::rights::Scope::granted(std::sync::Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec![] }])));
+        let at_a_door = crate::auth::Principal { name: "mover".into(), role: crate::auth::Role::Read, scope: mover.clone(), door: "test", from: None, operator: false, epoch: 0, until: None };
+        let stmt = crate::write::parse("ALTER TABLE t ALTER COLUMN b FIRST").expect("an ALTER");
+        let refused = crate::auth::WHO.scope(at_a_door, async { crate::rights::may_run(crate::auth::Role::Read, &stmt) }).await.expect_err("a SELECT-only mover is refused at a door");
+        assert!(refused.to_string().contains("it needs an admin token, or a superuser"), "{refused}");
+        let out = apply(&lake, Ddl::AlterColumn { table: "t".into(), column: "b".into(), change: Change::Place(Place::First) }, &mover).await?;
+        assert_eq!(out, j!({"table": "t", "altered": {"column": "b", "place": "FIRST"}, "readers": ["materialized view v lists its columns in the new order, its rows kept"]}), "the move goes, names its reader, and answers no row");
+        let v = lake.cat.get::<crate::views::View>(&crate::views::view_key("v")).await?.expect("v is kept");
+        let names: Vec<String> = view_outputs(&lake, &v.sql).await?.into_iter().map(|(c, ..)| c).collect();
+        assert_eq!(names, ["a", "b"], "v runs as it did, t read as it was: {}", v.sql);
+        let t = lake.cat.get::<TableMeta>(&table_key("t")).await?.expect("t");
+        assert_eq!(t.sql_names(), ["b", "a"], "t lists its columns in the new order");
+        let refused = format!("{:#}", apply(&lake, view("w", "SELECT * FROM s"), &mover).await.expect_err("the mover's own view of s plans for them"));
+        assert!(refused.contains("not found") || refused.contains("no table"), "s isn't there, for the mover: {refused}");
+        assert!(lake.cat.get_raw(&query_key("w")).await?.is_none(), "and no view w is made");
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
