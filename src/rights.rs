@@ -136,6 +136,27 @@ pub async fn noting<F: std::future::Future>(f: F) -> (F::Output, bool) {
 /// The request being served was told that a table it holds no privilege on isn't there (`noting`).
 pub fn told_unseen() { let _ = UNSEEN.try_with(|u| u.store(true, std::sync::atomic::Ordering::Relaxed)); }
 
+/// A statement's planning error as the request being served is told it. A column that isn't there is said without the
+/// columns that are (DataFusion lists them, or the nearest one, "Did you mean …"), unless the scope is whole: they may
+/// be columns it may not read, which no answer names (`query::Guarded::shown`).
+pub fn said(e: datafusion::error::DataFusionError) -> datafusion::error::DataFusionError {
+    use datafusion::{common::SchemaError, error::DataFusionError};
+    if scope().whole() {
+        return e;
+    }
+    let missing = match e.find_root() {
+        DataFusionError::SchemaError(s, _) => match s.as_ref() {
+            SchemaError::FieldNotFound { field, valid_fields } if !valid_fields.is_empty() => Some(field.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    match missing {
+        Some(field) => DataFusionError::SchemaError(Box::new(SchemaError::FieldNotFound { field, valid_fields: vec![] }), Box::new(None)),
+        None => e,
+    }
+}
+
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.text) }
 }
@@ -415,6 +436,22 @@ mod tests {
         assert_eq!(said(may(&Principal::token(Role::Admin), Action::SelectAll, audit)), "ok");
         assert_eq!(said(may(&Principal::token(Role::Write), Action::SelectAll, audit)), "permission denied: pondra$audit is Pondra's own, and its rows stream to a superuser only");
         assert_eq!(said(may(&all, Action::SelectAll, audit)), "permission denied: pondra$audit is Pondra's own, and its rows stream to a superuser only");
+    }
+
+    /// A column that isn't there is said without the columns that are, to a user with grants: they may be ones it may not
+    /// read (`super::said`). A token and a superuser are told them, and the nearest.
+    #[tokio::test]
+    async fn a_missing_column_names_no_other_to_a_user_with_grants() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::{field_not_found, DFSchema};
+        let schema = DFSchema::try_from_qualified_schema("t", &Schema::new(vec![Field::new("id", DataType::Int64, true), Field::new("card", DataType::Utf8, true)])).unwrap();
+        let schema = &schema;
+        let told = move |p: Principal| crate::auth::WHO.scope(p, async move { super::said(field_not_found(Some("t"), "car", schema)).to_string() });
+        let ann = user(&[("select", On::Table("t".into()), &["id"])]);
+        assert_eq!(told(ann).await, "Schema error: No field named t.car.", "the column as the statement named it, and no other");
+        let admin = told(Principal::token(Role::Admin)).await;
+        assert!(admin.contains("Did you mean 't.card'?") && admin.contains("Valid fields are t.id, t.card."), "{admin}");
+        assert_eq!(crate::codes::of(&anyhow::Error::new(super::said(field_not_found(Some("t"), "car", schema)))), "42703"); // (no caller: whole)
     }
 
     /// Work with no caller is refused, not given an admin's rights: work a request spawns without `auth::carried` loses

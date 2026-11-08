@@ -127,7 +127,9 @@ pub(crate) fn says_default(q: &ast::Query) -> bool { matches!(q.body.as_ref(), a
 pub fn rows_for(table: &str, columns: &[String], names: &[String], query: &str, default: &dyn Fn(&str) -> Option<String>) -> Result<String> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
     if let Some(n) = names.iter().find(|n| !columns.contains(n)) {
-        return Err(crate::codes::coded("42703", format!("column \"{n}\" of relation \"{table}\" does not exist (its columns: {})", columns.join(", "))));
+        // (its columns, unless the scope is a user's with grants: they may be ones it may not read, which no answer names)
+        let listed = if crate::rights::scope().whole() { format!(" (its columns: {})", columns.join(", ")) } else { String::new() };
+        return Err(crate::codes::coded("42703", format!("column \"{n}\" of relation \"{table}\" does not exist{listed}")));
     }
     if let Some((_, n)) = names.iter().enumerate().find(|(i, n)| names[..*i].contains(n)) {
         return Err(crate::codes::coded("42701", format!("column \"{n}\" specified more than once (INSERT INTO {table})")));
