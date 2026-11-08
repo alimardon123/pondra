@@ -589,9 +589,10 @@ pub fn writer<L: Send + Sync + 'static>(app: &App, table: &'static str, make: cr
 crate::per_node!(static WRITERS: Mutex<Vec<tokio::task::JoinHandle<()>>> = Mutex::new(Vec::new()));
 crate::per_node!(static ENDING: tokio::sync::watch::Sender<bool> = tokio::sync::watch::channel(false).0);
 
-/// Starts one of this node's log writers, kept for `end_writers`.
+/// Starts one of this node's log writers, kept for `end_writers`: the node's own work (`auth::as_node`), whoever's lines
+/// it writes.
 pub(crate) fn keep(run: impl std::future::Future<Output = ()> + Send + 'static) {
-    let task = crate::panics::spawn(run);
+    let task = crate::panics::own(run);
     WRITERS.lock().unwrap().push(task);
 }
 

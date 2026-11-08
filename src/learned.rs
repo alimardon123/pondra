@@ -450,7 +450,7 @@ fn refresh() {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
-    crate::panics::task(async move {
+    crate::panics::task(crate::auth::as_node(async move { // (the node's own work: every row of the history, `read`)
         let _done = done;
         // (rows reach the history a second or so after their runs, in any order: a minute back again)
         match read(&lake, since.saturating_sub(60_000_000)).await {
@@ -464,7 +464,7 @@ fn refresh() {
             }
             Err(e) => eprintln!("reading what runs learned: {e:#}"),
         }
-    });
+    }));
 }
 
 /// The facts in the history's rows after `since` (µs), every row: work no door started runs as the node.

@@ -194,7 +194,7 @@ jobs:
           if [ "$FULL" = true ] && [ "$release" = false ]; then echo "macOS Intel is built on a version commit (the one a release tags) or a run started by hand." >> "$GITHUB_STEP_SUMMARY"; fi
           code=false; unit=false; harness=false; docs=false; site=false; deploy=false; full=false
           if has "$bin|$pkg|$self"; then code=true; fi
-          if has "$bin|^tests/|^tools/per_node_check\.py\$|^tools/layers(\.py|\.txt|-baseline\.txt)\$|$self"; then unit=true; fi
+          if has "$bin|^tests/|^tools/per_node_check\.py\$|^tools/layers(\.py|\.txt|-baseline\.txt)\$|^tools/scope(_check\.py|-baseline\.txt)\$|$self"; then unit=true; fi
           # (a check, or what one starts: tools/bench/, tools/cloud/, tools/soak.py and tools/train*.py are the benches', the
           # soak's and the merge train's own: train.yml tests the train's)
           if [ "$code" = true ] || [ "$files" = ALL ] || grep -qE '^tools/[^/]+$' <<< "$(grep -vxE 'tools/(soak|train|train_test)\.py' <<< "$files")"; then harness=true; fi
@@ -505,6 +505,7 @@ jobs:
           save-if: ${{ needs.plan.outputs.event != 'pull_request' }} # (main's caches only, as the build's)
       - run: python3 tools/per_node_check.py # (a node leaves nothing of itself in its process: the source alone, ADR-061)
       - run: python3 tools/layers.py --baseline # (no new use across the redesign's floors: tools/layers.txt; designs/redesign/redesign.md §1)
+      - run: python3 tools/scope_check.py --baseline # (no new read of the task's caller, nor node work or whole scope by name: each count may only fall, 11-08 audit M8)
       # Two lakes one after the other in one process, and the library's four checks.
       - run: cargo test --release --test node_twice --test node_library
       # (on main, the workspace too: the cache this job saves is the one a pull request's linux-x64

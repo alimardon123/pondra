@@ -168,15 +168,16 @@ impl From<Refusal> for anyhow::Error {
 /// May `who` do `action` to `object`?
 pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusal> {
     let superuser = who.superuser();
-    // (a role first: a token's, and a user's for what no grant names)
+    // (a role first: a token's, a user's for what no grant names, and whoever isn't signed in, which sees nothing)
     let need = action.role();
-    if (who.scope.whole() || action.privilege().is_none()) && who.role < need {
+    let token = who.scope.whole() || who.role == Role::None;
+    if (token || action.privilege().is_none()) && who.role < need {
         let needs = match need {
             Role::Admin => "an admin token, or a superuser",
             Role::Write => "a write token, or a user granted a write",
             _ => "a token, or a user's sign-in",
         };
-        return Err(Refusal::new(format!("this {} may not {}: it needs {needs}", if who.scope.whole() { "token" } else { "user" }, action.words())));
+        return Err(Refusal::new(format!("this {} may not {}: it needs {needs}", if token { "token" } else { "user" }, action.words())));
     }
     let Object::Table(name) = object else { return Ok(()) };
     let table = catalog_name(name);
@@ -212,7 +213,7 @@ pub fn may_here(action: Action, object: Object) -> anyhow::Result<()> { Ok(may(&
 fn served(action: Action) -> Result<Principal, Refusal> {
     match crate::auth::current() {
         Some(p) => Ok(p),
-        None if crate::auth::node_work() => Ok(Principal::token(Role::Admin)),
+        None if crate::auth::node_work() => Ok(Principal::node()),
         None => Err(nobody(action)),
     }
 }
@@ -257,16 +258,33 @@ pub fn may_run(role: Role, stmt: &Stmt) -> anyhow::Result<()> {
 }
 
 /// What the request being served may see and read (design v2.1 §5, step 6 piece 2): everything (`whole`: a token, a
-/// superuser, an open node, the node's own work), or what a user's grants name. Listings ask `sees`, planning asks
-/// `columns`, the key lookup asks `reads`, the results cache keeps an answer under `key`, and nothing outside this module
-/// reads a user's grants.
-#[derive(Clone, Default)]
+/// superuser, an open node, the node's own work), what a user's grants name, or nothing (whoever isn't signed in, and work
+/// no one asked for). Listings ask `sees`, planning asks `columns`, the key lookup asks `reads`, the results cache keeps an
+/// answer under `key`, and nothing outside this module reads a user's grants. There is no default: each scope is made as
+/// one of these, by name.
+#[derive(Clone)]
 pub struct Scope(Option<std::sync::Arc<crate::users::Access>>);
 
-/// The scope of the request being served: its principal's (`Principal::scope`).
-pub fn scope() -> Scope { crate::auth::current().map(|p| p.scope).unwrap_or_default() }
+/// The scope of the request being served: its principal's (`Principal::scope`), or the node's own work's (`auth::as_node`:
+/// `Principal::node`'s, whole). Work with neither sees nothing (M8): work a request started and lost its caller on the way
+/// (spawned without `auth::carried`) reads no table and lists none, as `may_here` refuses it every right.
+pub fn scope() -> Scope {
+    match crate::auth::current() {
+        Some(p) => p.scope,
+        None if crate::auth::node_work() => crate::auth::Principal::node().scope,
+        None => Scope::nothing(),
+    }
+}
 
 impl Scope {
+    /// Everything, this lake's and the lakes attached to it: a token's, a superuser's, an open node's, and the node's own
+    /// work's (`auth::Principal::node`). `tools/scope_check.py` counts where one is made.
+    pub fn everything() -> Scope { Scope(None) }
+
+    /// Nothing: no table, column, name or code. Whoever isn't signed in (`Principal::of(Role::None)`), and work with no
+    /// caller that isn't the node's own (`scope`).
+    pub fn nothing() -> Scope { Scope(Some(std::sync::Arc::new(Default::default()))) }
+
     /// What a user who isn't a superuser may see: what `access` grants it (`users::principal_with` makes it once, as the
     /// principal is made).
     pub fn granted(access: std::sync::Arc<crate::users::Access>) -> Scope { Scope(Some(access)) }
@@ -486,6 +504,27 @@ mod tests {
         assert_eq!(node, ("ok".to_string(), "pondra$audit is written by Pondra alone".to_string(), "ok".to_string()));
     }
 
+    /// What work with no caller sees: nothing (11-08 audit M8), as it may do nothing. No table, column or name, no code,
+    /// and no answer kept under a whole scope's key. The node's own work (`as_node`) sees everything, as
+    /// `Principal::node`; so does a token, and whoever isn't signed in sees nothing.
+    #[tokio::test]
+    async fn work_with_no_caller_sees_nothing() {
+        use crate::auth::{as_node, WHO};
+        let sees = |s: &Scope| (s.whole(), s.sees(Object::Table("t")), s.columns("t").is_some(), s.reads("t", ["a"].into_iter()), s.shows_code(), s.key().is_empty());
+        let nothing = (false, false, false, false, false, false);
+        let everything = (true, true, true, true, true, true);
+        assert_eq!(sees(&scope()), nothing, "no caller, not the node's own work");
+        assert_eq!(sees(&tokio::spawn(async { scope() }).await.unwrap()), nothing);
+        assert_eq!(sees(&as_node(async { scope() }).await), everything);
+        assert_eq!(sees(&Principal::node().scope), everything);
+        assert_eq!(sees(&WHO.scope(Principal::token(Role::Read), async { scope() }).await), everything);
+        assert_eq!(sees(&Principal::of(Role::None).scope), nothing, "nobody signed in");
+        assert!(Principal::of(Role::Read).scope.whole() && Principal::of(Role::Admin).scope.whole());
+        let ann = Principal { name: "ann".into(), scope: Scope::granted(Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec![] }]))), ..Principal::of(Role::Read) };
+        let (here, spawned) = WHO.scope(ann, async { (scope(), crate::panics::aside(async { scope() }).await.unwrap()) }).await;
+        assert_eq!((sees(&here).1, sees(&spawned).1), (true, false), "a task spawned without its caller sees nothing of its caller's");
+    }
+
     /// An answer is kept under what its scope holds (`Scope::key`): the same grants and names in any order are one key;
     /// another column, table, privilege or name is another, and so is a REVOKE; a whole scope's is "" and no granted one's
     /// is. A key lookup reads only what it may (`Scope::reads`).
@@ -512,10 +551,10 @@ mod tests {
             assert_ne!(o.key(), ann.key(), "{i}");
             assert!(others[..i].iter().all(|p| p.key() != o.key()), "{i}");
         }
-        assert_eq!(Scope::default().key(), "");
+        assert_eq!(Scope::everything().key(), "");
         assert!(others.iter().chain([&ann]).all(|s| !s.key().is_empty()), "a granted scope never shares a whole one's answers");
         let read = |s: &Scope, table: &str, cols: &[&str]| s.reads(table, cols.iter().copied());
-        assert!(read(&ann, "t", &["a", "b"]) && read(&ann, "u", &["x", "y"]) && read(&Scope::default(), "v", &["z"]));
+        assert!(read(&ann, "t", &["a", "b"]) && read(&ann, "u", &["x", "y"]) && read(&Scope::everything(), "v", &["z"]));
         assert!(!read(&ann, "t", &["a", "c"]) && !read(&ann, "v", &[]), "a column not granted, or a table: SQL answers it, refusing");
     }
 
