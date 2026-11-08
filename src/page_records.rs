@@ -293,8 +293,17 @@ impl Cap {
     }
 }
 
-// The node's count of each sign-in's page: a per-node static, set back when the node stops.
-crate::per_node!(static COUNTS: std::sync::Mutex<Cap> = std::sync::Mutex::new(Cap::default()));
+/// The node's count of each sign-in's page, kept on the lake it records them in (`lake_state.rs`).
+#[derive(Default)]
+pub struct Counted(std::sync::Mutex<Cap>);
+
+impl crate::lake_state::LakeState for Counted {
+    const NAME: &'static str = "page_counts";
+    const ABOUT: &'static str = "the lines each sign-in's joined page sent this minute, which the node records up to its cap";
+    fn make() -> Self {
+        Counted::default()
+    }
+}
 
 /// A statement as the node records it: its class (the node's own `audit::class`, not the page's word for it), its outcome (one
 /// of the four words, else `failed`), its text and error cut as a page's are, and its time, clamped to a day.
@@ -327,7 +336,8 @@ fn recorded(line: Line) -> Recorded {
 /// line (when its class is written here, or it was refused) and its history row, under `who`'s name as the door `REPORTED`.
 /// Lines past the sign-in's `CAP` a minute are not written; the minutes that ended with lines not written are noted by the node.
 pub async fn record(app: &App, who: &Principal, batch: Batch) {
-    let admit = COUNTS.lock().unwrap_or_else(|e| e.into_inner()).admit(&who.name, crate::log::now_ms(), batch.lines.len(), usize::try_from(batch.dropped).unwrap_or(usize::MAX));
+    let Ok(counted) = app.lake.state::<Counted>() else { return }; // (registered with the engine's: never refused)
+    let admit = counted.0.lock().unwrap_or_else(|e| e.into_inner()).admit(&who.name, crate::log::now_ms(), batch.lines.len(), usize::try_from(batch.dropped).unwrap_or(usize::MAX));
     for e in admit.ended {
         if e.capped > 0 {
             audit::page_note(app, format!("{} statements of {}'s page were not recorded (more than {CAP} a minute)", e.capped, e.user));
