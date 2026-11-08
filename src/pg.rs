@@ -407,22 +407,28 @@ fn said(e: &PgWireError) -> String {
     }
 }
 
-fn user_error(e: anyhow::Error) -> PgWireError {
-    let (_, code, words) = crate::codes::answer(&e, crate::rights::scope().shows_code()); // (the code and words every door gives)
+/// An error as a client reads it: the SQLSTATE and words every door gives, a routine's code quoted in them only for a
+/// caller who may see code (`shows_code`: the connection's sign-in's, `Backend::err`).
+fn worded(e: anyhow::Error, shows_code: bool) -> PgWireError {
+    let (_, code, words) = crate::codes::answer(&e, shows_code);
     PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), code.into(), words)))
 }
+
+/// An error whose words quote no routine's code (a COPY's form, a parameter's value, a value's cast): the same for every
+/// caller, said as to one who may not see code.
+fn plain(e: anyhow::Error) -> PgWireError { worded(e, false) }
 
 impl Backend {
     /// Run one statement the way `POST /sql` does, for a client whose role comes from its user name.
     async fn run(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
-        crate::dialect_stmts::refused(sql).map_err(user_error)?; // (as every door refuses them: `dialect_stmts.rs`)
+        crate::dialect_stmts::refused(sql).map_err(self.err())?; // (as every door refuses them: `dialect_stmts.rs`)
         if let Some(c) = crate::vars::change(sql) {
             // DECLARE $day …, $day = …: this connection's variable (`vars.rs`)
             let kind = c.kind();
-            Box::pin(crate::vars::apply(&self.app, c, &self.who().scope)).await.map_err(user_error)?;
+            Box::pin(crate::vars::apply(&self.app, c, &self.who().scope)).await.map_err(self.err())?;
             return Ok(Response::Execution(tag(&kind, None)));
         }
-        let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: its value; `$1` is the protocol's)
+        let bound = crate::vars::bound(sql).map_err(self.err())?; // (`$day`: its value; `$1` is the protocol's)
         let bound = self.placed(bound.into_owned()).await?; // (the session's search path: full names, ahead of the key lookup)
         let sql: &str = &bound;
         // (dbt's leading comment is no part of the statement; nothing below changes one of these, so it is answered first:
@@ -435,7 +441,7 @@ impl Backend {
             // BEGIN, COMMIT, ROLLBACK: this connection's transaction (ADR-036 §5)
             let answer = crate::txn::command(&self.app, word, statement).await;
             crate::cursors::sweep(); // (a COMMIT or ROLLBACK ends the cursors without HOLD: their answers go now, refused or not)
-            let (words, warning) = answer.map_err(user_error)?;
+            let (words, warning) = answer.map_err(self.err())?;
             warning.iter().for_each(|w| crate::routines::heard(&format!("WARNING: {w}")));
             // (the client sees each one in ReadyForQuery's status: a savepoint leaves the transaction open, ROLLBACK TO
             // reopens it after a failure, and only BEGIN and COMMIT or ROLLBACK start and end it)
@@ -446,9 +452,9 @@ impl Backend {
                 Some(crate::answer::Txn::Ended) => Response::TransactionEnd(tag(&kind, None)),
             });
         }
-        let reader = crate::auth::current().is_some_and(|p| p.role >= crate::auth::Role::Read);
+        let reader = self.who().role >= crate::auth::Role::Read;
         if reader && crate::txn::open() && crate::txn::gate(&self.app.lake, sql).is_ok() {
-            if let Some((b, p)) = crate::txn::point_read(&self.app.lake, sql).await.map_err(user_error)? {
+            if let Some((b, p)) = crate::txn::point_read(&self.app.lake, sql).await.map_err(self.err())? {
                 let schema = b.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
                 let schema = crate::pg_types::typed(&schema, &p.types().into()); // (its columns' types, as outside a transaction: no second parse)
                 return Ok(Response::Query(rows(&schema, b, format)?)); // (in a transaction: its own version, or its snapshot's)
@@ -457,9 +463,9 @@ impl Backend {
         if reader && !crate::txn::open() && !crate::temp::mentioned(sql) {
             // A key lookup: the serving path, before anything else (ADR-036 §6), as `/lookup` answers it (of what its caller may read).
             let t0 = std::time::Instant::now();
-            if let Some(p) = crate::serve::point(&self.app.lake, sql.trim().trim_end_matches(';')).await.map_err(user_error)? {
+            if let Some(p) = crate::serve::point(&self.app.lake, sql.trim().trim_end_matches(';')).await.map_err(self.err())? {
                 let t1 = t0.elapsed();
-                if let Some(b) = p.rows(&self.app.lake).await.map_err(user_error)? {
+                if let Some(b) = p.rows(&self.app.lake).await.map_err(self.err())? {
                     if trace() {
                         eprintln!("pg point: parse {} µs, row {} µs", t1.as_micros(), (t0.elapsed() - t1).as_micros());
                     }
@@ -467,13 +473,13 @@ impl Backend {
                 }
             }
         }
-        let sql = crate::routines::expand(&self.app.lake, sql, &self.who().scope).await.map_err(user_error)?; // (macros: ADR-023)
-        let sql = crate::sys::planned(&pg_dialect(&self.app.lake, &sql, user)).map_err(user_error)?.into_owned();
+        let sql = crate::routines::expand(&self.app.lake, sql, &self.who().scope).await.map_err(self.err())?; // (macros: ADR-023)
+        let sql = crate::sys::planned(&pg_dialect(&self.app.lake, &sql, user)).map_err(self.err())?.into_owned();
         if debug() {
             eprintln!("pg {user}: {sql}");
         }
-        let _busy = crate::txn::next(&self.app, &sql).await.map_err(user_error)?; // (a failed transaction takes nothing but its end; READ COMMITTED reads the newest commit; the guard keeps the transaction busy while this runs)
-        if let Some(b) = crate::txn::locked_read(&self.app, &sql, &self.who().scope).await.map_err(user_error)? {
+        let _busy = crate::txn::next(&self.app, &sql).await.map_err(self.err())?; // (a failed transaction takes nothing but its end; READ COMMITTED reads the newest commit; the guard keeps the transaction busy while this runs)
+        if let Some(b) = crate::txn::locked_read(&self.app, &sql, &self.who().scope).await.map_err(self.err())? {
             let schema = b.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
             let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, &bound, &self.who().scope).await);
             return Ok(Response::Query(rows(&schema, b, format)?)); // (a locking read in a transaction: the rows it locked)
@@ -481,8 +487,8 @@ impl Backend {
         if let Some(cmd) = crate::cursors::of(&sql) {
             // DECLARE, FETCH, MOVE, CLOSE: this connection's cursors (cursors.rs). Before the settings and
             // session commands, which read CLOSE as their own.
-            let role = crate::auth::current().map_or(crate::auth::Role::None, |p| p.role);
-            return Ok(match crate::cursors::run(&self.app, cmd.map_err(user_error)?, role, &self.who().scope).await.map_err(user_error)? {
+            let role = self.who().role;
+            return Ok(match crate::cursors::run(&self.app, cmd.map_err(self.err())?, role, &self.who().scope).await.map_err(self.err())? {
                 crate::cursors::Answer::Rows(batches) => {
                     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
                     let mut answer = rows(&schema, batches, format)?;
@@ -498,7 +504,7 @@ impl Backend {
                 Ok(crate::set::Done::Said(kind)) => Ok(Response::Execution(tag(&kind, None))),
                 Ok(crate::set::Done::Run(sql)) => Box::pin(self.run(user, &sql, format)).await,
                 Err(_) if crate::text::first_word(&sql).to_uppercase().starts_with("DEALLOCATE") => Ok(Response::Execution(tag(&Kind::new("DEALLOCATE"), None))), // (a statement the protocol prepared: pgwire's)
-                Err(e) => Err(user_error(e)),
+                Err(e) => Err(self.err()(e)),
             };
         }
         if let Some(r) = session_command(&sql) {
@@ -507,13 +513,13 @@ impl Backend {
         if let Some(copy) = Copy::of(&sql) {
             return self.copy_out(copy?).await;
         }
-        let role = crate::auth::current().map_or(crate::auth::Role::None, |p| p.role);
+        let role = self.who().role;
         if role < crate::auth::Role::Read {
-            return Err(user_error(crate::codes::coded("28000", "sign in first")));
+            return Err(self.err()(crate::codes::coded("28000", "sign in first")));
         }
         if crate::routines::runs_procedure(&sql) {
             let who = crate::routines::Who { role, files: false, depth: 0, scope: self.who().scope }; // (planned for its sign-in)
-            return match crate::routines::one(&self.app, &sql, who, None).await.map_err(user_error)? {
+            return match crate::routines::one(&self.app, &sql, who, None).await.map_err(self.err())? {
                 crate::routines::Outcome::Rows(batches) => {
                     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
                     Ok(Response::Query(rows(&schema, batches, format)?))
@@ -523,9 +529,9 @@ impl Backend {
         }
         if let Some(w) = crate::with_writes::of(&sql) {
             // a WITH that writes (`WITH m AS (DELETE … RETURNING *) INSERT …`): its steps, then its answer, under its command's tag
-            let w = w.map_err(user_error)?;
+            let w = w.map_err(self.err())?;
             let who = crate::routines::Who { role, files: false, depth: 0, scope: self.who().scope }; // (planned for its sign-in)
-            return Ok(match Box::pin(crate::with_writes::run(&self.app, &w, who, None)).await.map_err(user_error)? {
+            return Ok(match Box::pin(crate::with_writes::run(&self.app, &w, who, None)).await.map_err(self.err())? {
                 crate::routines::Outcome::Rows(batches) => {
                     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
                     let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, &bound, &self.who().scope).await);
@@ -538,7 +544,7 @@ impl Backend {
         }
         if let Some(r) = crate::returning::of(&sql) {
             // INSERT, UPDATE or DELETE … RETURNING: the rows it wrote, under its command's tag (`INSERT 0 3`)
-            let b = Box::pin(crate::returning::run(&self.app, &r, role, false, &self.who().scope, None)).await.map_err(user_error)?;
+            let b = Box::pin(crate::returning::run(&self.app, &r, role, false, &self.who().scope, None)).await.map_err(self.err())?;
             let schema = crate::pg_types::typed(&b.schema(), &crate::pg_types::columns(&self.app.lake, &bound, &self.who().scope).await);
             let mut answer = rows(&schema, vec![b], format)?;
             answer.command_tag = r.kind().prefix();
@@ -546,15 +552,15 @@ impl Backend {
         }
         if let Some(stmt) = crate::write::parse(&sql) {
             crate::history::parsed(&stmt); // (the history writer takes its table from here: `history::touched`)
-            crate::rights::may_run(role, &stmt).map_err(user_error)?;
+            crate::rights::may_run(role, &stmt).map_err(self.err())?;
             let kind = stmt.kind(&sql);
-            let v = crate::write::on_node(&self.app, stmt, None, &self.who().scope).await.map_err(user_error)?;
+            let v = crate::write::on_node(&self.app, stmt, None, &self.who().scope).await.map_err(self.err())?;
             return Ok(Response::Execution(tag(&kind, Some(v["rows"].as_u64().unwrap_or(0)))));
         }
         let catalog = crate::pg_catalog::wanted(&sql);
         let batches = match catalog {
-            true => crate::pg_catalog::answer(&self.app.lake, &sql, if user.is_empty() { "pondra" } else { user }, &self.who().scope).await.map_err(user_error)?,
-            false => self.answer(&sql).await.map_err(user_error)?,
+            true => crate::pg_catalog::answer(&self.app.lake, &sql, if user.is_empty() { "pondra" } else { user }, &self.who().scope).await.map_err(self.err())?,
+            false => self.answer(&sql).await.map_err(self.err())?,
         };
         let schema = match batches.first() {
             Some(b) => b.schema(),
@@ -578,7 +584,7 @@ impl Backend {
             let session = Some(me.session.clone());
             crate::routines::with_notices(crate::temp::SESSION.scope(session, crate::auth::WHO.scope(who, me.caught(&u, &q, &f)))).await
         };
-        let (out, heard) = crate::panics::work(&self.app.lake.node, true, Box::pin(run)).await.unwrap_or_else(|m| (Err(user_error(anyhow::anyhow!(m))), vec![])); // (stoppable for memory: `oom.rs`)
+        let (out, heard) = crate::panics::work(&self.app.lake.node, true, Box::pin(run)).await.unwrap_or_else(|m| (Err(self.err()(anyhow::anyhow!(m))), vec![])); // (stoppable for memory: `oom.rs`)
         for n in heard {
             let _ = client.feed(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
         }
@@ -594,7 +600,7 @@ impl Backend {
             // (stopping: the statement goes to another node, as a new connection does; `drain.rs`)
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), "57P01".into(), "this node is stopping: connect to another node".into()))));
         }
-        let run = async { crate::panics::door(&self.app.lake.node, Box::pin(self.run(user, sql, format))).await.unwrap_or_else(|m| Err(user_error(anyhow::anyhow!(m)))) };
+        let run = async { crate::panics::door(&self.app.lake.node, Box::pin(self.run(user, sql, format))).await.unwrap_or_else(|m| Err(self.err()(anyhow::anyhow!(m)))) };
         let out = crate::audit::statement(&self.app, sql, run).await;
         if let Err(e) = &out {
             if crate::text::control(sql).is_none() {
@@ -605,6 +611,12 @@ impl Backend {
     }
 
     /// Whoever signed in on this connection (nobody, before).
+    /// An error in the words this connection's sign-in may read (`worded`).
+    fn err(&self) -> impl Fn(anyhow::Error) -> PgWireError + Send + Sync + 'static {
+        let shows = self.who().scope.shows_code();
+        move |e| worded(e, shows)
+    }
+
     fn who(&self) -> crate::auth::Principal { self.who.lock().unwrap().clone().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None)) }
 
     /// Signed in as `who`, checked again as `again` says (the nodes' own and an open lake's anyone: never).
@@ -678,7 +690,7 @@ impl Backend {
             None if c.columns.is_empty() => format!("SELECT * FROM {}", c.table),
             None => format!("SELECT {} FROM {}", c.columns.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", "), c.table),
         };
-        let batches = self.app.query(&sql, None, &self.who().scope).await.map_err(user_error)?;
+        let batches = self.app.query(&sql, None, &self.who().scope).await.map_err(self.err())?;
         let schema = match batches.first() {
             Some(b) => b.schema(),
             None => self.schema(&sql, "").await?,
@@ -724,26 +736,26 @@ impl Backend {
 
     /// `copy_in`'s checks: the COPY with its table resolved, and how many columns it sends.
     async fn copy_begun<C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send>(&self, client: &mut C, c: Copy) -> PgWireResult<(Copy, usize)> {
-        let refuse = |why: &str| Err(user_error(anyhow::anyhow!("{why}")));
+        let refuse = |why: &str| Err(self.err()(anyhow::anyhow!("{why}")));
         if c.query.is_some() || c.format == "binary" {
             return refuse("COPY FROM STDIN takes a table, in text or CSV");
         }
-        crate::write::parse(&format!("INSERT INTO {} SELECT 1", c.table)).ok_or_else(|| user_error(anyhow::anyhow!("COPY: no table {}", c.table)))?; // (a name SQL takes)
-        crate::writer::may(None, &crate::auth::catalog_name(&c.table), None, deletes(&c)).map_err(user_error)?; // (the caller's rights before anything else: the row doors' one check)
+        crate::write::parse(&format!("INSERT INTO {} SELECT 1", c.table)).ok_or_else(|| self.err()(anyhow::anyhow!("COPY: no table {}", c.table)))?; // (a name SQL takes)
+        crate::writer::may(None, &crate::auth::catalog_name(&c.table), None, deletes(&c)).map_err(self.err())?; // (the caller's rights before anything else: the row doors' one check)
         // In a transaction the rows go to the log as they come, not into the transaction's kept writes (as DDL does,
         // ADR-067 §7): READ ONLY and a failed transaction refuse the COPY (25006, 25P02), and a notice says it ran at once.
-        crate::txn::gate(&self.app.lake, &format!("COPY {} FROM STDIN", c.table)).map_err(user_error)?;
+        crate::txn::gate(&self.app.lake, &format!("COPY {} FROM STDIN", c.table)).map_err(self.err())?;
         if crate::txn::open() {
             let note = "COPY ran at once: it isn't part of a transaction here, and ROLLBACK won't undo it";
             let _ = client.feed(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), note.into()).into())).await; // (written with CopyInResponse: `told`)
         }
-        let (other, table) = crate::ddl::resolve(&self.app.lake, &c.table).await.map_err(user_error)?;
+        let (other, table) = crate::ddl::resolve(&self.app.lake, &c.table).await.map_err(self.err())?;
         if other.is_some() {
             return refuse("COPY into an attached lake: INSERT INTO it instead");
         }
         // (the caller's rights first, as every row door asks them (`writer::may`), and again for each chunk (`load`): a
         // keyed table's rows replace their keys', UPDATE too; a `_deleted` column named may delete them: S11)
-        let writer = crate::writer::Writer::open(&self.app, None, &table, crate::rules::How::Load, deletes(&c)).await.map_err(|r| user_error(r.into()))?;
+        let writer = crate::writer::Writer::open(&self.app, None, &table, crate::rules::How::Load, deletes(&c)).await.map_err(|r| self.err()(r.into()))?;
         let n = if c.columns.is_empty() { writer.rules().width() } else { c.columns.len() };
         Ok((Copy { table, ..c }, n))
     }
@@ -754,12 +766,12 @@ impl Backend {
         if p.ended {
             return Ok(());
         }
-        let err = |e: anyhow::Error| user_error(e);
+        let err = self.err();
         let csv = p.copy.format == "csv";
         let cut = if all { p.data.len() } else { p.ends.end(&p.data, csv) };
         let mut chunk: Vec<u8> = p.data.drain(..cut).collect();
         p.ends.taken(cut);
-        if let Some(end) = crate::pg_copy::data_end(&chunk, csv).map_err(err)? {
+        if let Some(end) = crate::pg_copy::data_end(&chunk, csv).map_err(&err)? {
             chunk.truncate(end);
             p.ended = true;
             p.data.clear(); // (what comes after the marker is not read)
@@ -790,15 +802,15 @@ impl Backend {
                 let batches = reader.build(std::io::Cursor::new(lines.as_bytes())).map_err(|e| err(copy_refused(&given, e)))?.collect::<Result<Vec<_>, _>>().map_err(|e| err(copy_refused(&given, e)))?;
                 batches.iter().map(|b| b.columns().to_vec()).collect()
             }
-            false => vec![crate::pg_copy::text_columns(text, &given, delimiter, &null, header).map_err(err)?],
+            false => vec![crate::pg_copy::text_columns(text, &given, delimiter, &null, header).map_err(&err)?],
         };
         for cols in sets {
             // (a set with no rows is nothing to load: the CSV reader gives no batch for it)
             if cols.first().is_none_or(|c| c.is_empty()) {
                 continue;
             }
-            let b = crate::pg_copy::typed(cols, &schema).map_err(err)?;
-            let b = crate::rules::typed::spelled(&rules, b, true).map_err(err)?; // (`'A0EE…'` in a uuid column as Postgres reads it)
+            let b = crate::pg_copy::typed(cols, &schema).map_err(&err)?;
+            let b = crate::rules::typed::spelled(&rules, b, true).map_err(&err)?; // (`'A0EE…'` in a uuid column as Postgres reads it)
             let left_out = rules.left_out(&given); // (the columns not given take their DEFAULT, or are null)
             let src = crate::log::Src { producer: format!("copy:{}", p.job), seq: p.seq + 1, prev: None };
             // (each set is committed as it comes, as before: a set refused leaves the ones before it written. Without a column
@@ -806,7 +818,7 @@ impl Backend {
             let placed = p.copy.columns.is_empty().then(|| (p.copy.table.clone(), writer.meta().placed()));
             let queued = crate::log::placed_as(placed, writer.put(crate::rules::Rows::Named(b, left_out), src)).await.map_err(|r| err(r.into()))?;
             let rows = queued.rows.rows().num_rows() as u64;
-            queued.ack.await.map_err(err)?;
+            queued.ack.await.map_err(&err)?;
             p.rows += rows;
             p.seq += 1;
         }
@@ -841,19 +853,19 @@ impl Backend {
 
     /// A query's result columns, without running it.
     async fn schema(&self, sql: &str, user: &str) -> PgWireResult<Arc<Schema>> {
-        let sql = crate::sys::planned(sql).map_err(user_error)?;
+        let sql = crate::sys::planned(sql).map_err(self.err())?;
         let ctx = self.session(&sql, user).await?;
-        let df = crate::engine::sql(&ctx, &sql).await.map_err(user_error)?;
-        Ok(Arc::new(crate::query::described(&ctx, df.logical_plan()).map_err(user_error)?.as_arrow().clone())) // (refused as its run would be)
+        let df = crate::engine::sql(&ctx, &sql).await.map_err(self.err())?;
+        Ok(Arc::new(crate::query::described(&ctx, df.logical_plan()).map_err(self.err())?.as_arrow().clone())) // (refused as its run would be)
     }
 
     /// A session for `sql`; with Postgres's catalog, its functions and its `information_schema`
     /// when it reads them (`pg_catalog.rs`).
     async fn session(&self, sql: &str, user: &str) -> PgWireResult<datafusion::prelude::SessionContext> {
         let who = self.signed().await?; // (planned for its sign-in: `query::session_for`)
-        let ctx = crate::query::session_for(&self.app.lake, sql, "", None, &who.scope).await.map_err(user_error)?;
+        let ctx = crate::query::session_for(&self.app.lake, sql, "", None, &who.scope).await.map_err(self.err())?;
         if crate::pg_catalog::wanted(sql) {
-            crate::pg_catalog::register(&ctx, &self.app.lake, if user.is_empty() { "pondra" } else { user }, sql).await.map_err(user_error)?;
+            crate::pg_catalog::register(&ctx, &self.app.lake, if user.is_empty() { "pondra" } else { user }, sql).await.map_err(self.err())?;
         }
         Ok(ctx)
     }
@@ -967,7 +979,7 @@ fn fields(schema: &Schema, format: &dyn Fn(usize) -> FieldFormat) -> (Arc<Vec<Fi
 fn each_row<T>(b: &RecordBatch, types: &[DataType], mut row: impl FnMut(&[ArrayRef], usize) -> PgWireResult<T>) -> Vec<PgWireResult<T>> {
     match b.columns().iter().zip(types).map(|(c, t)| cast(c, t)).collect::<Result<Vec<_>, _>>() {
         Ok(cols) => (0..b.num_rows()).map(|i| row(&cols, i)).collect(),
-        Err(e) => vec![Err(user_error(e.into()))],
+        Err(e) => vec![Err(plain(e.into()))],
     }
 }
 
@@ -1279,10 +1291,10 @@ impl Copy {
         }
         let parsed = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::PostgreSqlDialect {}, sql);
         let Ok(Some(Statement::Copy { source, to, target, options, legacy_options, .. })) = parsed.map(|mut s| s.pop()) else {
-            return Some(Err(user_error(crate::pg_copy::not_one_byte(sql).unwrap_or_else(|| anyhow::anyhow!("COPY: can't read {sql}")))));
+            return Some(Err(plain(crate::pg_copy::not_one_byte(sql).unwrap_or_else(|| anyhow::anyhow!("COPY: can't read {sql}")))));
         };
         if !matches!((to, &target), (true, CopyTarget::Stdout) | (false, CopyTarget::Stdin)) {
-            return Some(Err(user_error(anyhow::anyhow!("COPY reads and writes the client's files: psql's \\copy, or COPY … TO STDOUT / FROM STDIN"))));
+            return Some(Err(plain(anyhow::anyhow!("COPY reads and writes the client's files: psql's \\copy, or COPY … TO STDOUT / FROM STDIN"))));
         }
         let mut c = Copy { table: String::new(), columns: vec![], query: None, to, format: "text".into(), header: false, delimiter: None, null: None };
         match source {
@@ -1343,12 +1355,12 @@ impl CopyHandler for Backend {
     {
         let mut p = {
             let mut copy = self.copy.lock().unwrap();
-            let Some(p) = copy.as_mut() else { return Err(user_error(anyhow::anyhow!("COPY data without a COPY"))) };
+            let Some(p) = copy.as_mut() else { return Err(self.err()(anyhow::anyhow!("COPY data without a COPY"))) };
             if !p.ended {
                 p.data.extend_from_slice(&data.data); // (what follows the end marker is not gathered)
                 let end = p.ends.end(&p.data, p.copy.format == "csv"); // (each byte is looked at once, as it comes)
                 if p.data.len() - end > LONGEST_ROW {
-                    let e = user_error(crate::codes::coded("54000", "a row of COPY data is longer than 64 MB"));
+                    let e = self.err()(crate::codes::coded("54000", "a row of COPY data is longer than 64 MB"));
                     p.load.end(Some(said(&e)));
                     *copy = None; // (dropped: nothing more is gathered, and the connection goes on)
                     return Err(e);
@@ -1374,7 +1386,7 @@ impl CopyHandler for Backend {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let Some(mut p) = self.copy.lock().unwrap().take() else { return Err(user_error(anyhow::anyhow!("COPY done without a COPY"))) };
+        let Some(mut p) = self.copy.lock().unwrap().take() else { return Err(self.err()(anyhow::anyhow!("COPY done without a COPY"))) };
         let loaded = self.load(&mut p, true).await;
         p.load.end(loaded.as_ref().err().map(said));
         loaded?;
@@ -1569,7 +1581,7 @@ fn bind(portal: &Portal<Prepared>, inferred: &[Type]) -> PgWireResult<String> {
             Type::FLOAT8_ARRAY => list(portal.parameter::<Vec<Option<f64>>>(i, &t)?),
             Type::INT4_ARRAY => list(portal.parameter::<Vec<Option<i32>>>(i, &t)?),
             Type::INT8_ARRAY => list(portal.parameter::<Vec<Option<i64>>>(i, &t)?),
-            _ => crate::pg_values::value(&t, portal.parameters[i].as_deref(), portal.parameter_format.is_binary(i)).map_err(user_error)?,
+            _ => crate::pg_values::value(&t, portal.parameters[i].as_deref(), portal.parameter_format.is_binary(i)).map_err(plain)?,
         };
         values.push(v.unwrap_or_else(|| "NULL".into()));
     }
@@ -1815,7 +1827,7 @@ impl Backend {
     /// and drivers' catalog queries go on as sent.
     async fn placed(&self, sql: String) -> PgWireResult<String> {
         match crate::path::current(&self.app.lake) {
-            Some(_) => crate::path::door(&self.app.lake, &sql, &Default::default()).await.map_err(user_error),
+            Some(_) => crate::path::door(&self.app.lake, &sql, &Default::default()).await.map_err(self.err()),
             None => Ok(sql),
         }
     }
@@ -1829,7 +1841,7 @@ impl Backend {
         let written = self.placed(written.to_string()).await?;
         if let Some(cmd) = crate::cursors::of(sql) {
             // FETCH's columns are its cursor's (which a DECLARE may change); DECLARE, MOVE and CLOSE send no rows.
-            let columns = crate::cursors::columns(&cmd.map_err(user_error)?).map_err(user_error)?;
+            let columns = crate::cursors::columns(&cmd.map_err(self.err())?).map_err(self.err())?;
             return Ok((columns.map_or(vec![], |s| described(&s, format)), Columns::Each));
         }
         if let Some((_, column)) = show_column(sql) {
@@ -1840,10 +1852,10 @@ impl Backend {
         if crate::returning::of(sql).is_some() {
             // (its columns as `run` answers them: the same text, its macros and Postgres's forms written out)
             let marks = crate::pg_types::columns(&self.app.lake, &written, &self.who().scope).await; // (its uuids, from the statement as written)
-            let sql = crate::vars::bound(sql).map_err(user_error)?;
-            let sql = crate::routines::expand(&self.app.lake, &sql, &self.who().scope).await.map_err(user_error)?;
+            let sql = crate::vars::bound(sql).map_err(self.err())?;
+            let sql = crate::routines::expand(&self.app.lake, &sql, &self.who().scope).await.map_err(self.err())?;
             if let Some(r) = crate::returning::of(&pg_dialect(&self.app.lake, &sql, "")) {
-                let schema = crate::returning::columns(&self.app, &r, &self.who().scope).await.map_err(user_error)?;
+                let schema = crate::returning::columns(&self.app, &r, &self.who().scope).await.map_err(self.err())?;
                 let schema = crate::pg_types::typed(&schema, &marks);
                 return Ok((described(&schema, format), Columns::Kept { schema, given: false }));
             }
@@ -1851,12 +1863,12 @@ impl Backend {
         if crate::with_writes::of(sql).is_some() {
             // (a WITH that writes: its columns as `run` answers them, with each `$i` read as NULL, as a plain statement's are planned)
             let marks = crate::pg_types::columns(&self.app.lake, &written, &self.who().scope).await; // (its uuids, from the statement as written)
-            let sql = crate::vars::bound(sql).map_err(user_error)?;
-            let sql = crate::routines::expand(&self.app.lake, &sql, &self.who().scope).await.map_err(user_error)?;
+            let sql = crate::vars::bound(sql).map_err(self.err())?;
+            let sql = crate::routines::expand(&self.app.lake, &sql, &self.who().scope).await.map_err(self.err())?;
             let probe = crate::pg_values::substitute(&sql, &vec!["NULL".to_string(); (1..).take_while(|i| sql.contains(&format!("${i}"))).count()]); // (each `$i` once: `$1` is not the start of `$10`)
             if let Some(w) = crate::with_writes::of(&pg_dialect(&self.app.lake, &probe, "")) {
-                let w = w.map_err(user_error)?;
-                return Ok(match crate::with_writes::columns(&self.app, &w, &self.who().scope).await.map_err(user_error)? {
+                let w = w.map_err(self.err())?;
+                return Ok(match crate::with_writes::columns(&self.app, &w, &self.who().scope).await.map_err(self.err())? {
                     Some(schema) => {
                         let schema = crate::pg_types::typed(&schema, &marks);
                         (described(&schema, format), Columns::Kept { schema, given: false })
@@ -1873,8 +1885,8 @@ impl Backend {
             Some(_) => Default::default(),
             None => crate::pg_types::columns(&self.app.lake, &written, &self.who().scope).await, // (its uuids, from the statement as written, as `run` has them)
         };
-        let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: the connection's variable)
-        let bound = crate::routines::expand(&self.app.lake, &bound, &self.who().scope).await.map_err(user_error)?; // (macros, DuckDB's forms: as `run` has them)
+        let bound = crate::vars::bound(sql).map_err(self.err())?; // (`$day`: the connection's variable)
+        let bound = crate::routines::expand(&self.app.lake, &bound, &self.who().scope).await.map_err(self.err())?; // (macros, DuckDB's forms: as `run` has them)
         let sql: &str = &bound;
         let schema = match point {
             Some(s) => s,
