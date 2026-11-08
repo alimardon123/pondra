@@ -1880,15 +1880,17 @@ impl std::fmt::Debug for Lake {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "Lake({})", self.url) }
 }
 
-/// How much memory queries may use on this node (`PONDRA_MEMORY_GB`, else a third of RAM). Past
-/// it, sorts, aggregations and joins spill to temporary files, or the query stops with an error:
-/// a query never takes the node down. (A third, not half: what DataFusion counts here is the big
-/// hash tables and sort buffers, not the Parquet decoding and the batches in flight around them,
-/// so the node's own memory runs ahead of this number.) The queries and the caches fit one whole
-/// line together (`whole_line`): `PONDRA_MEMORY_GB` itself when it is set.
+/// How much memory queries may use on this node: `PONDRA_MEMORY_GB`, else the whole line they share with the caches
+/// (`whole_line`: the memory watch's trim line, 72% of RAM on a machine of 3 GB or more), as DuckDB's `memory_limit` is 80%
+/// of RAM by default. Past it, sorts, aggregations and joins spill to temporary files, or the query stops with an error: a
+/// query never takes the node down. A grow past what the caches leave takes their bytes back first: the caches give way
+/// to the queries. What the reservations don't count (the Parquet decoding and the batches in flight around the big hash
+/// tables and sort buffers, `array_agg`) runs in the room between the trim line and the stop line, with the watch and its
+/// once-more-holding-less retry behind it. (A third of RAM, before, left room the caches took anyway, and spilled TPC-DS
+/// q67's last aggregation 8 times at SF10 on 15 GB: 12.6 s, against 5.7 s at 10 GB and DataFusion's 6.3 s.)
 #[cfg(not(target_arch = "wasm32"))]
 pub fn memory_limit() -> usize {
-    crate::env::query_memory(|| ram().map_or(4 << 30, |r| r / 3))
+    crate::env::query_memory(|| crate::oom::trim_line().unwrap_or(4 << 30))
 }
 
 crate::per_node!(
@@ -1915,9 +1917,10 @@ fn lake_pool() -> Arc<crate::ledger::LakePool> {
     ledger.pool()
 }
 
-/// The whole line a node's queries and caches share (`ledger::Ledger`): `PONDRA_MEMORY_GB` when it is set, which is then
-/// the queries' line too, and a spiller it has no room for spills; else the memory watch's trim line (`oom::trim_line`),
-/// past which a grow takes cache bytes back and goes on within its share; none (`usize::MAX`) where neither is known.
+/// The whole line a node's queries and caches share (`ledger::Ledger`), which is the queries' line too (`memory_limit`):
+/// `PONDRA_MEMORY_GB` when it is set, and a spiller it has no room for spills; else the memory watch's trim line
+/// (`oom::trim_line`), past which a grow takes cache bytes back and goes on within its share; none (`usize::MAX`) where
+/// neither is known.
 fn whole_line() -> usize {
     crate::env::memory_whole().or_else(crate::oom::trim_line).unwrap_or(usize::MAX)
 }
