@@ -20,7 +20,7 @@
 //!   of `gap_secs` between them, each emitted once, when the watermark passes its last row plus
 //!   the gap. A row that falls inside a session already emitted is late, and left out.
 use crate::codes::coded;
-use crate::query::{first_table, over, session, session_at};
+use crate::query::{first_table, over, session_for};
 use crate::reset::Once as _;
 use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
@@ -590,11 +590,11 @@ pub(crate) async fn followed(lake: &Lake, table: &str) -> Result<String> {
 
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
-pub async fn create(lake: &Lake, name: &str, sql: &str, mut o: Options) -> Result<()> {
+pub async fn create(lake: &Lake, name: &str, sql: &str, mut o: Options, scope: &crate::rights::Scope) -> Result<()> {
     let (written_in, from) = writing_in(lake, sql).await?; // (its CTEs and the plain views it reads, as subqueries: a view follows a table)
     o.from = from.clone(); // (made with what `as_written` sets after it, so the view is whole in its first commit)
     o.written = (written_in != sql).then(|| sql.to_string());
-    Box::pin(made(lake, name, &written_in, sql, o)).await?;
+    Box::pin(made(lake, name, &written_in, sql, o, scope)).await?;
     if written_in != sql {
         as_written(lake, name, sql, from).await?;
     }
@@ -626,9 +626,9 @@ pub(crate) async fn made_from(lake: &Lake, name: &str) -> Result<Vec<String>> {
 }
 
 /// `create`'s view, of its query with its CTEs and plain views written in (`sql`); `as_written` is the query as written.
-pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o: Options) -> Result<()> {
+pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o: Options, scope: &crate::rights::Scope) -> Result<()> {
     if o.once {
-        return crate::once::create(lake, name, sql, o).await; // (`EMIT FINAL`)
+        return crate::once::create(lake, name, sql, o, scope).await; // (`EMIT FINAL`)
     }
     let Options { mut emit, sessions, join, expect, history, delete_when, keep, refresh, lag_secs, from, written: query_written, .. } = o;
     // (a history view's deletes: a column of its rows saying which versions end their key)
@@ -676,16 +676,16 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
     if let Some(s) = sessions {
         ensure!(emit.is_none() && join.is_none(), "a view emits windows or sessions, or joins streams: one of them");
         ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: sessions are cut from rows, so make {name} from {source}'s own source");
-        return create_sessions(lake, name, sql, source, &src, s, from).await;
+        return create_sessions(lake, name, sql, source, &src, s, from, scope).await;
     }
     if let Some(j) = join {
         ensure!(emit.is_none(), "a view emits windows or joins streams, not both");
         ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: streams are joined row by row, so make {name} from {source}'s own source");
         ensure!(refresh.is_none() && lag_secs.is_none(), "a stream join pairs rows as they arrive: not by key or with a lag");
-        return create_join(lake, name, sql, source, j, from, query_written).await;
+        return create_join(lake, name, sql, source, j, from, query_written, scope).await;
     }
     let planned = crate::sys::planned(sql)?;
-    let ctx = session(lake, &planned, "").await?;
+    let ctx = session_for(lake, &planned, "", None, scope).await?;
     let plan = crate::engine::sql(&ctx, &planned).await?.logical_plan().clone();
     // (a table's columns are the types the query runs with, not the planner's: it types `1e15` as a negative scale)
     let typed = |p: &LogicalPlan| -> Result<Vec<(String, String)>> { Ok(crate::query::run_schema(&ctx, p)?.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect()) };
@@ -694,7 +694,7 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
     // Its query run again (ADR-056, ADR-059) when asked, or when the rows alone can't keep it: by
     // key when it can be (`median`, …), else whole (`ORDER BY … LIMIT`, a window, `now()`, …).
     let plain = emit.is_none() && keep.is_none() && history.is_none() && expect.is_empty();
-    let rerun = |how: crate::rerun::How, why: Option<String>| crate::rerun::create(lake, name, written, &source, &src, upstream.as_ref(), &plan, how, why, lag_secs, from.clone(), query_written.clone());
+    let rerun = |how: crate::rerun::How, why: Option<String>| crate::rerun::create(lake, name, written, &source, &src, upstream.as_ref(), &plan, how, why, lag_secs, from.clone(), query_written.clone(), scope);
     let whole = |why: String| rerun(crate::rerun::How::Full, Some(format!("{why}: the whole query is run again")));
     if let Some(how) = refresh.filter(|r| *r != Refresh::Incremental) {
         ensure!(plain, "a view that runs its query again writes its rows as it works them out: not with windows, EMIT FINAL, history or expectations");
@@ -707,7 +707,7 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
     // A GROUP BY whose answers need a last step (avg, HAVING, …): its table keeps the partial
     // query's rows, and reads finish them (`finish.rs`).
     let kept = async {
-        let (sql, planned, plan, finish) = match finished(lake, &ctx, sql, &plan).await? {
+        let (sql, planned, plan, finish) = match finished(lake, &ctx, sql, &plan, scope).await? {
             Some((partial_sql, partial_plan, f, ordered)) => {
                 ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: a view of it adds up its sums and counts (a rollup), or make {name} from {source}'s own source");
                 ensure!(emit.is_none(), "a window view of avg, HAVING or an expression over aggregates: write it as GROUP BY <a time bucket> … EMIT FINAL");
@@ -800,7 +800,7 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
     let mut meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types: sql_types.clone(), ..Default::default() }); entry.key = key; entry.merge = merge; entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry.made = Some((lake.visible(), crate::log::now_ms())); entry.history = history; entry.finish = finish.clone(); entry };
     meta.publish = meta.publish.iter().filter(|f| crate::delta::refused(&meta, f).is_none()).cloned().collect(); // (said by `ddl`: `delta::left_out`)
     if !expect.is_empty() {
-        expectations(lake, name, &source, &planned, &meta, &expect).await?;
+        expectations(lake, name, &source, &planned, &meta, &expect, scope).await?;
     }
     let mut puts = vec![(table_key(name), json(&meta))];
     if !expect.is_empty() && lake.cat.get::<TableMeta>(&table_key(EXPECTED)).await?.is_none() {
@@ -842,13 +842,13 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
 /// A GROUP BY query whose answers need a last step, split (`finish.rs`): the query its table keeps,
 /// planned; how reads finish it, each column as the query types it; and whether it orders or cuts
 /// its answers (ORDER BY, LIMIT).
-async fn finished(lake: &Lake, ctx: &datafusion::prelude::SessionContext, sql: &str, plan: &LogicalPlan) -> Result<Option<(String, LogicalPlan, crate::finish::Finish, bool)>> {
+async fn finished(lake: &Lake, ctx: &datafusion::prelude::SessionContext, sql: &str, plan: &LogicalPlan, scope: &crate::rights::Scope) -> Result<Option<(String, LogicalPlan, crate::finish::Finish, bool)>> {
     use datafusion::arrow::datatypes::DataType;
     let names: Vec<String> = plan.schema().fields().iter().map(|f| f.name().clone()).collect();
     let aggregates = ctx.state().aggregate_functions().keys().cloned().collect();
     let Some(split) = crate::finish::split(sql, &names, &aggregates)? else { return Ok(None) };
     let planned = crate::sys::planned(&split.partial)?;
-    let partial = crate::engine::sql(&session(lake, &planned, "").await?, &planned).await?.logical_plan().clone();
+    let partial = crate::engine::sql(&session_for(lake, &planned, "", None, scope).await?, &planned).await?.logical_plan().clone();
     let schema = std::sync::Arc::new(crate::query::run_schema(ctx, &partial)?.as_arrow().clone());
     let decimal = |c: &str| schema.field_with_name(c).is_ok_and(|f| matches!(f.data_type(), DataType::Decimal128(..) | DataType::Decimal256(..)));
     // (planned over an empty table of the partial rows: a column typed otherwise than the query's is cast)
@@ -876,7 +876,7 @@ pub(crate) fn expected_table(lake: &Lake) -> TableMeta {
 
 /// A new view's expectations: each a condition over its columns; and one that fails a write
 /// (`FAIL`) refuses the view if rows already there break it (they would fill it).
-async fn expectations(lake: &Lake, name: &str, source: &str, planned: &str, meta: &TableMeta, expect: &[Expect]) -> Result<()> {
+async fn expectations(lake: &Lake, name: &str, source: &str, planned: &str, meta: &TableMeta, expect: &[Expect], scope: &crate::rights::Scope) -> Result<()> {
     let empty = RecordBatch::new_empty(meta.schema()?);
     let mut names = std::collections::HashSet::new();
     for e in expect {
@@ -884,7 +884,7 @@ async fn expectations(lake: &Lake, name: &str, source: &str, planned: &str, meta
         crate::rules::fit::breaking(crate::defaults::base(), &empty, &e.check).with_context(|| format!("expectation {} of {name}: CHECK ({})", e.name, e.check))?;
         if e.on == OnViolation::Fail {
             let sql = format!("SELECT count(*) AS n FROM ({planned}) AS _v WHERE NOT ({})", e.check);
-            let rows = crate::engine::sql(&session(lake, &sql, "").await?, &sql).await?.collect().await?;
+            let rows = crate::engine::sql(&session_for(lake, &sql, "", None, scope).await?, &sql).await?.collect().await?;
             let n = rows.first().and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>()).map_or(0, |c| c.value(0));
             ensure!(n == 0, "{n} of the rows {source} has now would break expectation {} of {name}, CHECK ({}): fix them first, or make it ON VIOLATION DROP ROW", e.name, e.check);
         }
@@ -963,11 +963,11 @@ fn expected(view: &str, v: &View, rows: RecordBatch, filling: bool, run: &str) -
 
 /// A session view: the SQL runs over each closed session's rows, grouped by session too, so its
 /// table gets the SQL's columns and `session_start`, `session_end`.
-async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src: &TableMeta, mut s: Sessions, from: Vec<String>) -> Result<()> {
+async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src: &TableMeta, mut s: Sessions, from: Vec<String>, scope: &crate::rights::Scope) -> Result<()> {
     ensure!(timestamp(src, &s.time), "sessions: {} is not a timestamp column of {source}", s.time);
     ensure!(s.gap_secs > 0, "sessions: the gap must be at least a second");
     let with = sessionized(sql)?;
-    let ctx = crate::query::over_ctx(lake, &source, extended(src, &s.time)?, vec![], &with).await?;
+    let ctx = crate::query::over_ctx(lake, &source, extended(src, &s.time)?, vec![], &with, scope).await?;
     let plan = crate::engine::sql(&ctx, &with).await?.logical_plan().clone();
     let Some(LogicalPlan::Aggregate(agg)) = top_aggregate(&plan) else { bail!("a session view is SELECT … FROM {source} GROUP BY <its key columns>") };
     for g in &agg.group_expr {
@@ -1351,7 +1351,7 @@ fn quoted(c: &str) -> String { format!("\"{}\"", c.replace('"', "\"\"")) }
 async fn emit(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, e: &Emit) -> Result<()> {
     let time = match &e.time {
         Some(t) => t.clone(),
-        None => event_time(crate::engine::sql(&session(lake, &v.sql, "").await?, &crate::sys::planned(&v.sql)?).await?.logical_plan(), &e.window).context("a window view whose window has no event-time column")?,
+        None => event_time(crate::engine::sql(&session_for(lake, &v.sql, "", None, &crate::auth::Principal::node().scope).await?, &crate::sys::planned(&v.sql)?).await?.logical_plan(), &e.window).context("a window view whose window has no event-time column")?,
     };
     // (a window starting at or before `upto` has ended: the watermark, with the window's size and lateness as its lateness)
     let Some(upto) = watermark(lake, &v.source, &time, e.size_secs + e.lateness_secs, None).await? else { return Ok(()) };
@@ -1379,7 +1379,7 @@ async fn emit(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, e: &Emit
                     cols.collect::<Vec<_>>().join(", "), quoted(view))
         }
     };
-    let rows = crate::engine::sql(&session(lake, &sql, "").await?, &sql).await?.collect().await?;
+    let rows = crate::engine::sql(&session_for(lake, &sql, "", None, &crate::auth::Principal::node().scope).await?, &sql).await?.collect().await?;
     append(lake, log, &final_table, crate::log::Src { producer, seq: upto as u64, prev: Some(done) }, rows).await
 }
 
@@ -1418,7 +1418,7 @@ async fn sessions(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, s: &
          SELECT * EXCLUDE (_new, _sid), min({t}) OVER (PARTITION BY {by}, _sid) AS session_start, max({t}) OVER (PARTITION BY {by}, _sid) + {gap} AS session_end FROM _ids",
         view_ = quoted(view), source = quoted(&v.source), wm = at(wm),
     );
-    let rows = crate::engine::sql(&session(lake, &sql, "").await?, &sql).await?.collect().await?;
+    let rows = crate::engine::sql(&session_for(lake, &sql, "", None, &crate::auth::Principal::node().scope).await?, &sql).await?.collect().await?;
     let (mut closed, mut open) = (vec![], wm);
     for b in &rows {
         let (start, end) = (micros(b, "session_start")?, micros(b, "session_end")?);
@@ -1428,7 +1428,7 @@ async fn sessions(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, s: &
     }
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&v.source)).await?.context("a session view without its source")?.logical();
     let with = sessionized(&v.sql)?;
-    let out = crate::engine::sql(&crate::query::over_ctx(lake, &v.source, extended(&src, &s.time)?, closed, &with).await?, &with).await?.collect().await?;
+    let out = crate::engine::sql(&crate::query::over_ctx(lake, &v.source, extended(&src, &s.time)?, closed, &with, &crate::auth::Principal::node().scope).await?, &with).await?.collect().await?;
     append(lake, log, view, crate::log::Src { producer, seq: wm as u64, prev: Some(done) }, out).await?;
     // Read from a gap before the earliest open session: a row that comes later, behind the
     // watermark, still belongs to a session that ends after it (its own, or an open one it reaches
@@ -1499,9 +1499,10 @@ pub async fn row_views(lake: &Lake, table: &str) -> Result<Vec<(String, TableMet
     Ok(out)
 }
 
+/// The view's query as planned: what it reads is its definition's, whoever asks (the node's own scope).
 async fn plan(lake: &Lake, v: &View) -> Result<LogicalPlan> {
     let planned = crate::sys::planned(&v.sql)?;
-    Ok(crate::engine::sql(&session(lake, &planned, "").await?, &planned).await?.into_unoptimized_plan())
+    Ok(crate::engine::sql(&session_for(lake, &planned, "", None, &crate::auth::Principal::node().scope).await?, &planned).await?.into_unoptimized_plan())
 }
 
 /// Does a view read its source alone, row by row: projections and filters over one table, no
@@ -1754,7 +1755,7 @@ async fn fill_one(lake: &Lake, log: &crate::log::Log, name: &str, v: &View, upto
         bail!("{} was tiered past where {name}'s filling ends while the filling failed: its rows from before that end are folded with later ones now, so DROP {name} and make it again", v.source);
     }
     let sql = format!("SELECT *, \"{}\", \"{}\", \"{v2}\" FROM {} WHERE \"{v2}\" <= {upto}", crate::text::ROW_ID, crate::text::CREATED, crate::write::sql_name(&v.source), v2 = crate::text::VERSION);
-    let rows = crate::engine::sql(&session_at(lake, &sql, "", Some(upto)).await?, &crate::sys::planned(&sql)?).await?.collect().await?;
+    let rows = crate::engine::sql(&session_for(lake, &sql, "", Some(upto), &crate::auth::Principal::node().scope).await?, &crate::sys::planned(&sql)?).await?.collect().await?;
     let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;
     let out = match rows.iter().any(|b| b.num_rows() > 0) {
         true => view_rows(lake, v, &meta, &rows, false).await?,
@@ -1923,10 +1924,10 @@ fn top_aggregate(plan: &LogicalPlan) -> Option<&LogicalPlan> {
 
 /// A stream join view: its two tables (both of this lake, append tables), its columns from the
 /// query, and where it starts (rows written from now on, paired with whatever the other side has).
-async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: Join, from: Vec<String>, written: Option<String>) -> Result<()> {
+async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: Join, from: Vec<String>, written: Option<String>, scope: &crate::rights::Scope) -> Result<()> {
     use datafusion::common::tree_node::TreeNode;
     let planned = crate::sys::planned(sql)?;
-    let ctx = session(lake, &planned, "").await?;
+    let ctx = session_for(lake, &planned, "", None, scope).await?;
     let plan = crate::engine::sql(&ctx, &planned).await?.into_unoptimized_plan();
     let mut scans = vec![];
     plan.apply(|p| {
@@ -2000,7 +2001,7 @@ async fn join(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, j: &Join
         return Ok(());
     }
     let (a, b) = (&j.tables[0], &j.tables[1]);
-    let rows = session_at(lake, &format!("SELECT {VERSION} FROM {a}, {b}"), "", Some(now)).await?; // (with their system columns)
+    let rows = session_for(lake, &format!("SELECT {VERSION} FROM {a}, {b}"), "", Some(now), &crate::auth::Principal::node().scope).await?; // (with their system columns)
     let (new_a, new_b) = (versions(&rows, a, Some(done), now).await?.collect().await?, versions(&rows, b, Some(done), now).await?.collect().await?);
     if new_a.iter().chain(&new_b).all(|b| b.num_rows() == 0) {
         return Ok(()); // (nothing new on either side: no run, no commit)
@@ -2030,7 +2031,7 @@ async fn join(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, j: &Join
         }
         // The view's SQL over the fresh rows of one table and the other's rows, each with its own
         // columns only (the system columns stay out of the view's `*`).
-        let ctx = session_at(lake, &v.sql, "", Some(now)).await?;
+        let ctx = session_for(lake, &v.sql, "", Some(now), &crate::auth::Principal::node().scope).await?;
         for (i, df) in [(fresh, rows.read_batches(fresh_rows.clone())?), (other_i, other.clone())] {
             let t = &j.tables[i];
             let meta: TableMeta = lake.cat.get(&table_key(t)).await?.with_context(|| format!("no table {t}"))?;

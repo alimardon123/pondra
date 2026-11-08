@@ -1873,13 +1873,13 @@ pub(crate) fn ledgers() -> Vec<Arc<crate::ledger::Ledger>> {
 }
 
 /// A new lake's pool for its queries: its share of its node's budget (`NodeState::line`), which every lake of the node
-/// shares, made with the node's first lake on the process's root (`ledger::root`). The budget is the node's
-/// `PONDRA_MEMORY_GB` where it is set, its queries and caches together; else the root's lines. Past the whole line a grow
-/// takes cache bytes back, and a spiller they don't make room for spills.
+/// shares, made with the node's first lake on the process's root (`ledger::root`). The budget is the node's own
+/// `PONDRA_MEMORY_GB` (`NodeState::settings`, as it started) where it is set, its queries and caches together; else the
+/// root's lines. Past the whole line a grow takes cache bytes back, and a spiller they don't make room for spills.
 fn lake_pool(node: &NodeState) -> Arc<crate::ledger::LakePool> {
     let budget = node.line.get_or_init(|| {
         let root = crate::ledger::root(root_line(), root_whole());
-        match crate::env::memory_whole() {
+        match node.settings.gib("PONDRA_MEMORY_GB") { // (the node's own budget, as it started: two nodes in a process may differ)
             Some(set) => crate::ledger::Ledger::on(&root, set, set),
             None => crate::ledger::Ledger::on(&root, root.line(), root.whole()),
         }
@@ -4690,6 +4690,21 @@ mod tests {
             let _ = std::fs::remove_dir_all(dir);
         }
         Ok(())
+    }
+
+    /// A node's budget is its own `PONDRA_MEMORY_GB`, as it started (`NodeState::settings`), not its process's: two nodes in one
+    /// process given different ones hold different budgets, on the one root, and a node given none goes by the root's lines.
+    #[test]
+    fn two_nodes_given_different_memory_hold_different_budgets_on_one_root() {
+        let start = |given: &[(&'static str, &str)]| crate::node_state::NodeState::starting(crate::lifecycle::unhosted(), crate::settings::Values::of(given));
+        let (one, half, none) = (start(&[("PONDRA_MEMORY_GB", "1")]), start(&[("PONDRA_MEMORY_GB", "0.5")]), start(&[]));
+        let budget = |node: &NodeState| lake_pool(node).ledger().clone();
+        let (a, b, c) = (budget(&one), budget(&half), budget(&none));
+        assert_eq!((a.line(), a.whole()), (1 << 30, 1 << 30), "1 GB: its queries and caches together");
+        assert_eq!((b.line(), b.whole()), (1 << 29, 1 << 29), "0.5 GB, beside it in the same process");
+        assert_eq!((c.line(), c.whole()), (c.root().line(), c.root().whole()), "none given: the root's lines");
+        assert!(Arc::ptr_eq(a.root(), b.root()) && Arc::ptr_eq(a.root(), c.root()), "every node's budget on the process's one root");
+        assert!(Arc::ptr_eq(&budget(&one), &a), "a node's lakes share the budget its first one made");
     }
 
     /// A lake's caches are charged to its line as it opens, so the node's memory watch takes memory back from them all:

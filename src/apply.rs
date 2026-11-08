@@ -708,7 +708,7 @@ pub async fn declared(lake: &Lake) -> Result<BTreeMap<String, String>> {
 }
 
 /// The plan for `p` here, as the database is now.
-pub(crate) async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Plan> {
+pub(crate) async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool, scope: &crate::rights::Scope) -> Result<Plan> {
     let all = records(lake).await?;
     let after = all.last().map_or(0, |r| r.n);
     // What each project's last finished apply left declared, and who owns what.
@@ -755,7 +755,7 @@ pub(crate) async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) ->
             continue;
         };
         if d.kind.is("table") {
-            match table_change(lake, d, cur.meta.as_ref().expect("a table's meta")).await {
+            match table_change(lake, d, cur.meta.as_ref().expect("a table's meta"), scope).await {
                 Ok(sql) if sql.is_empty() => {}
                 Ok(sql) => steps.push(step("~", &sql.iter().map(|s| s.splitn(4, ' ').nth(3).unwrap_or_default()).collect::<Vec<_>>().join("; "), sql)), // (ALTER TABLE t ADD COLUMN c: ADD COLUMN c)
                 Err(e) if !pending.is_empty() => steps.push(step("!", &format!("{} (checked again after the migrations)", crate::ext::said(&e)), vec![])),
@@ -944,12 +944,12 @@ async fn followers<'a>(lake: &Lake, objects: &'a [Declared], name: &str) -> Resu
 
 /// What makes the table as declared from the table as it is: columns added at the end, widened
 /// types, options; or why not.
-async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<String>> {
+async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta, scope: &crate::rights::Scope) -> Result<Vec<String>> {
     let Some(crate::write::Stmt::Create(c)) = crate::write::parse(&d.sql) else { bail!("not a CREATE TABLE Pondra reads") };
     if c.query.is_some() {
         return Ok(vec![]); // (CREATE TABLE … AS: made once, from its query)
     }
-    let spec: Value = serde_json::from_str(&crate::write::create_spec(&c, lake, false).await?)?;
+    let spec: Value = serde_json::from_str(&crate::write::create_spec(&c, lake, false, scope).await?)?;
     let pairs = |v: &Value| -> Vec<(String, String)> { serde_json::from_value(v.clone()).unwrap_or_default() };
     let (columns, opts) = match spec.is_array() {
         true => (pairs(&spec), Value::Null),
@@ -1047,7 +1047,7 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<St
 pub async fn ask(app: &App, verb: Verb, ask: Ask, who: Who) -> Result<Value> {
     let applier = applier();
     if verb == Verb::Apply {
-        authorize(app, who, applier).await?;
+        authorize(app, who.clone(), applier).await?;
     }
     if verb == Verb::Status {
         return crate::status::status(app, &ask, who).await;
@@ -1062,7 +1062,7 @@ pub async fn ask(app: &App, verb: Verb, ask: Ask, who: Who) -> Result<Value> {
         return Ok(j!({"tests": tests, "ok": ok}));
     }
     let branch = app.lake.cat.get_raw(crate::branch::BASES).await?.is_some();
-    let plan = plan(&app.lake, &p, ask.prune, branch).await?;
+    let plan = plan(&app.lake, &p, ask.prune, branch, &who.scope).await?;
     if verb == Verb::Plan {
         return Ok(j!({"plan": plan, "project": p.name, "ok": plan.refused.is_empty()}));
     }
@@ -1093,11 +1093,12 @@ pub(crate) async fn authorize(app: &App, who: Who, applier: bool) -> Result<()> 
 /// An apply that succeeded: its statements (`making`), then the database protected when the project's
 /// environment says so and it isn't yet (`[env.prod] protected = true`). An apply that failed protects nothing.
 async fn apply(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, applier: bool) -> Result<Value> {
-    let record = making(app, p, plan, ask, who, applier).await?;
+    let record = making(app, p, plan, ask, who.clone(), applier).await?;
     let protects = p.protect && !crate::protect::protected(&app.lake).await?;
     if protects {
+        let scope = who.scope.clone();
         let protect = crate::ddl::Ddl::Protect { database: crate::ddl::lake_name(&app.lake), on: true, by: caller(who) };
-        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![protect]), None, false).await?;
+        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![protect]), None, false, &scope).await?;
     }
     let mut out = j!({"apply": record.n, "status": record.status, "steps": record.steps, "tests": record.tests, "ok": record.status == "ok"});
     if protects {
@@ -1111,8 +1112,11 @@ async fn apply(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, applier
 /// its own name: making the project true takes an admin's statements, and the record keeps who asked.
 /// This span is also where that admin right ends: a procedure it starts would outlive it (`routines::start`).
 async fn making(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, applier: bool) -> Result<Record> {
-    let admin = admin_for(who, applier);
-    let as_who = if admin.is_some() { Who { role: crate::auth::Role::Admin, ..who } } else { who };
+    let admin = admin_for(&who, applier);
+    let as_who = match &admin {
+        Some(me) => Who { role: crate::auth::Role::Admin, scope: me.scope.clone(), ..who }, // (its statements plan as the admin's: whole)
+        None => who,
+    };
     let span = crate::protect::APPLYING.scope((), claim_to_record(app, p, plan, ask, as_who));
     match admin {
         Some(me) => crate::auth::WHO.scope(me, span).await,
@@ -1122,14 +1126,15 @@ async fn making(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, applie
 
 /// The admin an APPLY holder below admin acts as for an apply's statements, and for the migrations `capture`
 /// records as run: making the project true takes an admin's statements, and the record keeps who asked.
-pub(crate) fn admin_for(who: Who, applier: bool) -> Option<crate::auth::Principal> {
+pub(crate) fn admin_for(who: &Who, applier: bool) -> Option<crate::auth::Principal> {
     crate::auth::current().filter(|_| applier && who.role < crate::auth::Role::Admin).map(|me| crate::auth::Principal { role: crate::auth::Role::Admin, scope: crate::rights::Scope::everything(), operator: false, ..me })
 }
 
 /// The claim, the apply's statements (`statements`), and its record's end (`making`'s span).
 async fn claim_to_record(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who) -> Result<Record> {
-    let mut record = Record { project: p.name.clone(), env: ask.env.clone(), commit: ask.commit.clone(), who: caller(who), started_ms: crate::log::now_ms(), status: "running".into(), new: plan.new, ..Default::default() };
-    let claimed = crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: true, after: plan.after, record: json(&record) }]), None, false).await?;
+    let scope = &who.scope.clone();
+    let mut record = Record { project: p.name.clone(), env: ask.env.clone(), commit: ask.commit.clone(), who: caller(who.clone()), started_ms: crate::log::now_ms(), status: "running".into(), new: plan.new, ..Default::default() };
+    let claimed = crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: true, after: plan.after, record: json(&record) }]), None, false, scope).await?;
     // (the leader's answer keeps `keep`'s old key, "deploy": see there)
     record.n = claimed["deploy"].as_u64().context("an apply number")?;
     keep_files(&app.lake, record.n, &ask.files).await?;
@@ -1141,7 +1146,7 @@ async fn claim_to_record(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Wh
         record.error = Some(crate::ext::said(e));
     }
     record.ended_ms = Some(crate::log::now_ms());
-    crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: record.n, record: json(&record) }]), None, false).await?;
+    crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: record.n, record: json(&record) }]), None, false, scope).await?;
     out?;
     Ok(record)
 }
@@ -1162,7 +1167,7 @@ async fn statements(app: &App, p: &Project, plan: &Plan, record: &mut Record, wh
     let added: Vec<&Step> = plan.steps.iter().take(ran.unwrap_or(0)).collect();
     for (i, s) in added.iter().enumerate() {
         for (j, sql) in s.sql.iter().enumerate() {
-            crate::routines::script(app, sql, &values, &none, who, Some(format!("{job}:a{i}.{j}"))).await.with_context(|| format!("{} {}: {}", s.kind, s.name, first_line(sql)))?;
+            crate::routines::script(app, sql, &values, &none, who.clone(), Some(format!("{job}:a{i}.{j}"))).await.with_context(|| format!("{} {}: {}", s.kind, s.name, first_line(sql)))?;
         }
         record.steps.push(j!({"mark": s.mark, "kind": s.kind, "name": s.name, "what": s.what}));
     }
@@ -1171,7 +1176,7 @@ async fn statements(app: &App, p: &Project, plan: &Plan, record: &mut Record, wh
     for m in &once {
         // (each under a job of its own, so one run again writes once)
         if let Some(sql) = m.sql.first() {
-            crate::routines::script(app, sql, &values, &none, who, Some(format!("{}:{}:{}", m.kind, p.name, m.name))).await.with_context(|| format!("{} {}", m.kind, m.name))?;
+            crate::routines::script(app, sql, &values, &none, who.clone(), Some(format!("{}:{}:{}", m.kind, p.name, m.name))).await.with_context(|| format!("{} {}", m.kind, m.name))?;
         }
         let what = match (m.kind.as_str(), m.sql.is_empty()) {
             ("seed", _) => "loaded",
@@ -1179,19 +1184,19 @@ async fn statements(app: &App, p: &Project, plan: &Plan, record: &mut Record, wh
             _ => "ran",
         };
         if m.kind == "migration" {
-            crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: record.n, record: json(&j!({"migration": migration_key(&p.name, &m.name)})) }]), None, false).await?;
+            crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: record.n, record: json(&j!({"migration": migration_key(&p.name, &m.name)})) }]), None, false, &who.scope).await?;
         }
         record.steps.push(j!({"mark": m.mark, "kind": m.kind, "name": m.name, "what": what}));
     }
     if !once.is_empty() {
         let branch = app.lake.cat.get_raw(crate::branch::BASES).await?.is_some();
-        let again = plan_again(&app.lake, p, plan, branch).await?;
+        let again = plan_again(&app.lake, p, plan, branch, &who.scope).await?;
         ensure!(again.refused.is_empty(), "after the migrations, the plan refuses: {}", again.refused.join("; "));
         steps = again.steps;
     }
     for (i, s) in steps.iter().filter(|s| s.mark != "▶" && s.mark != "!").enumerate() {
         for (j, sql) in s.sql.iter().enumerate() {
-            crate::routines::script(app, sql, &values, &none, who, Some(format!("{job}:b{i}.{j}"))).await.with_context(|| format!("{} {}: {}", s.kind, s.name, first_line(sql)))?;
+            crate::routines::script(app, sql, &values, &none, who.clone(), Some(format!("{job}:b{i}.{j}"))).await.with_context(|| format!("{} {}: {}", s.kind, s.name, first_line(sql)))?;
         }
         record.steps.push(j!({"mark": s.mark, "kind": s.kind, "name": s.name, "what": s.what}));
     }
@@ -1210,8 +1215,8 @@ async fn statements(app: &App, p: &Project, plan: &Plan, record: &mut Record, wh
 }
 
 /// The plan after the migrations ran: what remains of the one shown.
-async fn plan_again(lake: &Lake, p: &Project, shown: &Plan, branch: bool) -> Result<Plan> {
-    let mut again = plan(lake, p, shown.steps.iter().any(|s| s.mark == "-"), branch).await?;
+async fn plan_again(lake: &Lake, p: &Project, shown: &Plan, branch: bool, scope: &crate::rights::Scope) -> Result<Plan> {
+    let mut again = plan(lake, p, shown.steps.iter().any(|s| s.mark == "-"), branch, scope).await?;
     again.steps.retain(|s| s.mark != "▶");
     Ok(again)
 }
@@ -1220,7 +1225,7 @@ async fn plan_again(lake: &Lake, p: &Project, shown: &Plan, branch: bool) -> Res
 async fn tests(app: &App, p: &Project, who: Who) -> Result<Vec<Value>> {
     let (mut out, none) = (vec![], HashMap::new());
     for (file, sql) in &p.tests {
-        let got = crate::routines::script(app, sql, &p.values, &none, who, None).await;
+        let got = crate::routines::script(app, sql, &p.values, &none, who.clone(), None).await;
         out.push(match got {
             Ok(Outcome::Rows(rows)) => {
                 let n: usize = rows.iter().map(|b| b.num_rows()).sum();
@@ -1254,7 +1259,7 @@ async fn beat(app: App, n: u64) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         let alive = Record { n, status: "alive".into(), started_ms: crate::log::now_ms(), ..Default::default() };
-        let _ = crate::write::on_node_as(&app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: n, record: json(&alive) }]), None, false).await;
+        let _ = crate::write::on_node_as(&app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: n, record: json(&alive) }]), None, false, &crate::auth::Principal::node().scope).await; // (its heartbeat: the node's own record)
     }
 }
 
@@ -1353,7 +1358,7 @@ pub async fn call(app: &App, name: &str, args: &[datafusion::sql::sqlparser::ast
     }
     let mut select = vec![format!("CAST(({}) AS VARCHAR) AS folder", a.given[0])];
     select.extend(a.named.iter().map(|(n, e)| format!("({e}) AS {n}")));
-    let rows = app.query(&format!("SELECT {}", select.join(", ")), None).await?;
+    let rows = app.query(&format!("SELECT {}", select.join(", ")), None, &who.scope).await?;
     let v = rows_json(&rows, 1)?.into_iter().next().unwrap_or_default();
     let folder = crate::lake_files::under_files(v["folder"].as_str().unwrap_or_default())?;
     let folder = format!("{}/", folder.trim_end_matches('/'));

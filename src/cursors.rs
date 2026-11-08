@@ -146,13 +146,13 @@ fn missing(name: &str) -> anyhow::Error { coded("34000", format!("cursor \"{name
 fn session() -> String { crate::temp::current().unwrap_or_default() }
 
 /// Runs a cursor statement in the current session, as `role` (signed in, as a query is).
-pub async fn run(app: &App, cmd: Cmd, role: Role) -> Result<Answer> {
+pub async fn run(app: &App, cmd: Cmd, role: Role, scope: &crate::rights::Scope) -> Result<Answer> {
     if role < Role::Read {
         return Err(coded("28000", "sign in first"));
     }
     sweep();
     match cmd {
-        Cmd::Declare { name, hold, query } => declare_as(app, &name, hold, &query).await,
+        Cmd::Declare { name, hold, query } => declare_as(app, &name, hold, &query, scope).await,
         Cmd::Fetch { name, rows } => fetch(&name, rows, false),
         Cmd::Move { name, rows } => fetch(&name, rows, true),
         Cmd::Close(name) => close_as(name),
@@ -160,17 +160,17 @@ pub async fn run(app: &App, cmd: Cmd, role: Role) -> Result<Answer> {
 }
 
 /// `DECLARE`: the query runs now, as the caller, and its answer is kept under the name.
-async fn declare_as(app: &App, name: &str, hold: bool, query: &str) -> Result<Answer> {
+async fn declare_as(app: &App, name: &str, hold: bool, query: &str, scope: &crate::rights::Scope) -> Result<Answer> {
     let session = crate::temp::current().ok_or_else(|| coded("0A000", NO_SESSION))?;
     let in_txn = match hold {
         true => None,
         false => Some(txn::id().ok_or_else(|| coded("25P01", "DECLARE CURSOR can only be used in transaction blocks"))?),
     };
     free(&session, name)?; // (before the query runs: a name taken is answered at once)
-    let batches = app.query(query, None).await?;
+    let batches = app.query(query, None, scope).await?;
     let schema = match batches.first() {
         Some(b) => b.schema(),
-        None => planned(app, query).await?,
+        None => planned(app, query, scope).await?,
     };
     let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&app.lake, query).await); // (its uuids, for the Postgres port)
     let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
@@ -213,9 +213,9 @@ fn refused(held: usize, needs: usize) -> anyhow::Error {
 }
 
 /// The columns of a query that returned no rows, from its plan.
-async fn planned(app: &App, query: &str) -> Result<SchemaRef> {
+async fn planned(app: &App, query: &str, scope: &crate::rights::Scope) -> Result<SchemaRef> {
     let sql = crate::sys::planned(query)?.into_owned();
-    let ctx = crate::query::session(&app.lake, &sql, "").await?;
+    let ctx = crate::query::session_for(&app.lake, &sql, "", None, scope).await?;
     let df = crate::engine::sql(&ctx, &sql).await?;
     Ok(Arc::new(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow().clone()))
 }

@@ -394,10 +394,11 @@ fn in_another<'a>(lake: &Lake, d: &'a Ddl) -> Option<(&'static str, &'a str)> {
 }
 
 /// Leader: carry one out (under the lake's lock). Comments follow what it renames, and go with
-/// what it drops (`objects::follow`).
-pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
+/// what it drops (`objects::follow`). `scope`: its asker's, whom a new definition's query is planned for (a view's, a
+/// materialized view's, a task's); what the lake keeps already (the views a column's move reads) plans as the node's own.
+pub async fn apply(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<Value> {
     let moves = crate::objects::moves(&d);
-    let out = carry_out(lake, d).await?;
+    let out = carry_out(lake, d, scope).await?;
     if moves {
         crate::objects::follow(lake, &out).await?;
         crate::index::follow(lake, &out).await?;
@@ -405,7 +406,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
     Ok(out)
 }
 
-async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
+async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<Value> {
     if let Some((what, name)) = in_another(lake, &d) {
         let db = name.split('.').next().unwrap_or_default();
         return Err(crate::codes::coded("0A000", format!("{what} {name}: {db} is an attached lake, whose tables, views and routines are made, dropped and changed from a node of that lake (from here, its rows are written and its tables made with CREATE TABLE)")));
@@ -447,7 +448,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             if there {
                 return Ok(j!({"name": name, "exists": true}));
             }
-            Box::pin(apply(lake, *then)).await
+            Box::pin(apply(lake, *then, scope)).await
         }
         Ddl::Replacing { name, then } => {
             let here = new_name(lake, &name).await?;
@@ -460,7 +461,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             if lake.cat.get::<Value>(&crate::views::view_key(&here)).await?.is_some() || lake.cat.get::<Value>(&once).await?.is_some() || lake.cat.get::<Value>(&crate::feeds::feed_key(&here)).await?.is_some() {
                 drop_view(lake, &name, true).await?; // (refused, saying so, while another view follows it)
             }
-            Box::pin(apply(lake, *then)).await
+            Box::pin(apply(lake, *then, scope)).await
         }
         Ddl::DetachView { name } => detach_view(lake, &new_name(lake, &name).await?).await,
         Ddl::PlaceViewColumn { view, column, place, materialized } => {
@@ -470,7 +471,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
                 true => place_materialized_column(lake, &name, &column, &place).await,
             }
         }
-        Ddl::Object(op) => crate::objects::apply(lake, op).await,
+        Ddl::Object(op) => crate::objects::apply(lake, op, scope).await,
         Ddl::Entry { words, tree, .. } => crate::statements::carry_out(lake, &words, tree).await,
         Ddl::Sequence(c) => crate::seq::apply(lake, c).await,
         Ddl::Index(c) => crate::index::apply(lake, c).await,
@@ -484,7 +485,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::ViewFacts { view, if_exists, change } => {
             let (other, view) = resolve(lake, &view).await?;
             ensure!(other.is_none(), "{view} is an attached lake's: change its facts from a node of that lake");
-            crate::facts::apply(lake, &view, if_exists, change).await
+            crate::facts::apply(lake, &view, if_exists, change, scope).await
         }
         Ddl::CreateSchema { name, if_not_exists } => {
             check(&name)?;
@@ -526,7 +527,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::DropTable { name, if_exists, purge, made_by } => drop_table(lake, &name, if_exists, purge, made_by.as_deref()).await,
         Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?).await,
         Ddl::Clone { name, from } => clone(lake, &new_name(lake, &name).await?, &from).await,
-        Ddl::CreateView { name, sql, replace, facts, text } => create_view(lake, &name, sql, replace, false, facts, text).await,
+        Ddl::CreateView { name, sql, replace, facts, text } => create_view(lake, &name, sql, replace, false, facts, text, scope).await,
         Ddl::CreateExternal { name, sql, replace, if_not_exists } => {
             let name = new_name(lake, &name).await?;
             let taken = lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_some()
@@ -535,7 +536,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
                 return Ok(j!({"table": name, "unchanged": true}));
             }
             ensure!(replace || !taken, "{name} already exists (CREATE OR REPLACE EXTERNAL TABLE, or IF NOT EXISTS)");
-            create_view(lake, &name, sql, replace, true, None, None).await
+            create_view(lake, &name, sql, replace, true, None, None, scope).await
         }
         Ddl::CreateMaterialized { name, sql, mut options, text } => {
             let name = new_name(lake, &name).await?;
@@ -555,7 +556,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             }
             ensure!(!crate::seq::calls(&sql), "a materialized view can't call nextval or setval: its rows are worked out again as its tables change, and would be numbered again (number the rows where they are written: an identity column, or DEFAULT nextval('s'))");
             ensure!(outside.is_empty(), "a materialized view follows the rows its tables take in, and files outside the lake take none: read them into a table (CREATE TABLE … AS, INSERT … SELECT) and follow that, or make a stored view (CREATE VIEW)");
-            crate::views::create(lake, &name, &sql, crate::views::options(&options)?).await?;
+            crate::views::create(lake, &name, &sql, crate::views::options(&options)?, scope).await?;
             let unwritten = match text {
                 Some(text) => !written_as(lake, &name, &text, &sql).await? && crate::authored::commented(&text), // (its query as written, comments kept: `authored.rs`)
                 None => false,
@@ -619,7 +620,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             if has_catalog(&full(&dir)?).await? {
                 ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name})");
             }
-            Box::pin(apply(lake, Ddl::Attach { name, dir, read_only: false, endpoint: None })).await
+            Box::pin(apply(lake, Ddl::Attach { name, dir, read_only: false, endpoint: None }, scope)).await
         }
         Ddl::DropDatabase { name, if_exists } => {
             ensure!(name != lake_name(lake), "this is database {name}: drop it from another one");
@@ -1047,7 +1048,7 @@ pub async fn settle(lake: &Lake, d: &Ddl) -> Result<()> {
 
 /// `CREATE VIEW` (and CREATE EXTERNAL TABLE's view of files): a query by name, planned once here
 /// to be sure it can be, and kept as written.
-async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, external: bool, facts: Option<Vec<crate::constraints::Constraint>>, text: Option<String>) -> Result<Value> {
+async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, external: bool, facts: Option<Vec<crate::constraints::Constraint>>, text: Option<String>, scope: &crate::rights::Scope) -> Result<Value> {
     let name = new_name(lake, name).await?;
     unclaimed(lake, &name).await?;
     ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_none(), "{name} is a table");
@@ -1060,7 +1061,7 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
     crate::facts::measures_checked(lake, &sql).await?; // (a view with measures: its shape, and each join onto a key: ADR-065 §3)
     let expanded = crate::routines::expand(lake, &sql).await?; // (kept as written: macros are read when it is used)
     let planned = crate::sys::planned(&expanded)?;
-    let df = crate::engine::sql(&crate::query::session(lake, &planned, "").await?, &planned).await.context(if external { "reading its files" } else { "the view's query" })?; // (it plans)
+    let df = crate::engine::sql(&crate::query::session_for(lake, &planned, "", None, scope).await?, &planned).await.context(if external { "reading its files" } else { "the view's query" })?; // (it plans)
     let facts = crate::facts::settled(lake, &name, &sql, df.schema(), facts, replace).await?; // (its key facts: `facts.rs`)
     let (authored, unkept) = match text {
         Some(text) if crate::authored::proved(lake, &text, &sql, false).await => (Some(crate::authored::Authored { text, of: sql.clone() }), false),
@@ -1683,11 +1684,12 @@ async fn published_after_move(lake: &Lake, m: &TableMeta, readers: &[String]) ->
     Ok(())
 }
 
-/// A view's query's outputs, as it plans now: (name, type, may be NULL), in its order.
+/// A view's query's outputs, as it plans now: (name, type, may be NULL), in its order. Planned as the node's own: a query
+/// the lake keeps (or one a column's move rewrote from it), whose shape is the lake's, whoever moves the column.
 async fn view_outputs(lake: &Lake, sql: &str) -> Result<Vec<(String, datafusion::arrow::datatypes::DataType, bool)>> {
     let expanded = crate::routines::expand(lake, sql).await?;
     let planned = crate::sys::planned(&expanded)?;
-    let df = crate::engine::sql(&crate::query::session(lake, &planned, "").await?, &planned).await?;
+    let df = crate::engine::sql(&crate::query::session_for(lake, &planned, "", None, &crate::auth::Principal::node().scope).await?, &planned).await?;
     Ok(df.schema().fields().iter().map(|f| (f.name().clone(), f.data_type().clone(), f.is_nullable())).collect())
 }
 
@@ -1915,7 +1917,7 @@ async fn reordered_in_place(lake: &Lake, name: &str, sql: &str, options: &std::c
     if o.once || o.history.is_some() || o.delete_when.is_some() || (asked && o.refresh.is_none()) || serde_json::to_value(&facts)? != serde_json::to_value(&kept)? {
         return Ok(None);
     }
-    if crate::views::create(lake, name, v.query(), o).await.is_err() {
+    if crate::views::create(lake, name, v.query(), o, &crate::auth::Principal::node().scope).await.is_err() { // (its query as the lake keeps it)
         return Ok(None);
     }
     let first = order.iter().enumerate().find(|(i, &p)| *i != p).map_or(names[0].clone(), |(i, _)| now[i].0.clone());
@@ -2084,11 +2086,12 @@ pub(crate) async fn keep_readers(lake: &Lake, name: &str, column: &str, was: Vec
 }
 
 /// The names of `sql`'s outputs, planned with each table of `over` listing its columns as given there (an empty table
-/// of those columns stands for it): how a query reads once those tables' columns have moved, before they do.
+/// of those columns stands for it): how a query reads once those tables' columns have moved, before they do. As the node's
+/// own, as `view_outputs`: the queries of what reads a table, kept by the lake.
 async fn outputs_over(lake: &Lake, sql: &str, over: &[(String, Vec<(String, String)>)]) -> Result<Vec<String>> {
     let expanded = crate::routines::expand(lake, sql).await?;
     let planned = crate::sys::planned(&expanded)?;
-    let ctx = crate::query::session(lake, &planned, "").await?;
+    let ctx = crate::query::session_for(lake, &planned, "", None, &crate::auth::Principal::node().scope).await?;
     for (t, columns) in over {
         let table = crate::query::table_ref(t);
         let _ = ctx.deregister_table(table.clone());
@@ -2239,10 +2242,10 @@ mod tests {
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         crate::write::create_table(&lake, "t", r#"{"columns": [["a", "Int64"]], "made_by": "job-a"}"#).await?;
         let drop = |made_by: &str| Ddl::DropTable { name: "t".into(), if_exists: true, purge: true, made_by: Some(made_by.into()) };
-        let out = apply(&lake, drop("job-b")).await?;
+        let out = apply(&lake, drop("job-b"), &crate::auth::Principal::node().scope).await?;
         assert_eq!(out["dropped"], false, "{out}");
         assert!(lake.cat.get::<TableMeta>(&table_key("t")).await?.is_some(), "another job's table was dropped");
-        apply(&lake, drop("job-a")).await?;
+        apply(&lake, drop("job-a"), &crate::auth::Principal::node().scope).await?;
         assert!(lake.cat.get::<TableMeta>(&table_key("t")).await?.is_none(), "the job's own table was kept");
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);

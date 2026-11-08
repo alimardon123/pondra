@@ -660,9 +660,9 @@ pub async fn first_user(lake: &Lake) -> Result<Option<String>> {
         return Ok(None);
     }
     let user = crate::ddl::Ddl::Users(Change::Create { name: "pondra".into(), login: true, if_not_exists: true, verifier: None, superuser: true, limits: Limits::default() });
-    crate::ddl::apply(lake, user).await?;
+    crate::ddl::apply(lake, user, &crate::auth::Principal::node().scope).await?; // (the node's own, before it serves anyone)
     let token = crate::ddl::Ddl::Users(Change::CreateToken { name: "first".into(), user: "pondra".into(), expires_secs: None, hash: None });
-    let out = crate::ddl::apply(lake, token).await?;
+    let out = crate::ddl::apply(lake, token, &crate::auth::Principal::node().scope).await?;
     Ok(Some(out["token"].as_str().context("the first user's token")?.to_string()))
 }
 

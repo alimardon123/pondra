@@ -168,12 +168,12 @@ static WRITTEN: tokio::sync::Notify = tokio::sync::Notify::const_new();
 /// Wait for run `id` to end (`AWAIT 'id'`, the id `pondra.start` gave): its error if it failed, or
 /// if its node stopped under it. Looked for again as this node writes its lines, and every second
 /// for another node's; a run not in the log after 10 s is no run.
-pub async fn wait(app: &App, id: &str) -> Result<()> {
+pub async fn wait(app: &App, id: &str, scope: &crate::rights::Scope) -> Result<()> {
     let sql = format!("SELECT status, error FROM pondra.runs WHERE id = '{}'", id.replace('\'', "''"));
     let since = datafusion::common::instant::Instant::now();
     loop {
         let written = WRITTEN.notified(); // (woken by any write from here on)
-        let rows = Box::pin(app.query(&sql, Some("0"))).await?;
+        let rows = Box::pin(app.query(&sql, Some("0"), scope)).await?;
         if let Some(b) = rows.iter().find(|b| b.num_rows() > 0) {
             let text = |i: usize| -> Result<Option<String>> {
                 let c = datafusion::arrow::compute::cast(b.column(i), &datafusion::arrow::datatypes::DataType::Utf8)?;
@@ -231,7 +231,7 @@ async fn write(app: App, mut rx: tokio::sync::mpsc::UnboundedReceiver<Sent>) {
 
 async fn append(app: &App, producer: &str, seq: u64, lines: &[Line], made: &mut bool) -> Result<()> {
     if !*made && app.lake.cat.get::<TableMeta>(&table_key(TABLE)).await?.is_none() {
-        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::RunLog]), None, false).await?;
+        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::RunLog]), None, false, &crate::auth::Principal::node().scope).await?; // (the run log's table: the node's own)
     }
     *made = true;
     let schema = crate::answer::schema(&columns())?;
@@ -320,7 +320,7 @@ async fn stopped(app: &App, since: u64, whose: Option<&str>) -> Result<HashSet<S
     }
     let live = app.members.nodes();
     let only = whose.map(|n| format!(" AND node = '{}'", n.replace('\'', "''"))).unwrap_or_default();
-    let batches = app.query(&format!("SELECT id, routine, caller, node, job, args, started FROM pondra.runs WHERE status = 'running'{only}"), None).await?;
+    let batches = app.query(&format!("SELECT id, routine, caller, node, job, args, started FROM pondra.runs WHERE status = 'running'{only}"), None, &crate::auth::Principal::node().scope).await?;
     for b in &batches {
         let text = |i: usize| datafusion::arrow::compute::cast(b.column(i), &datafusion::arrow::datatypes::DataType::Utf8);
         let (id, routine, caller, node, job, args) = (text(0)?, text(1)?, text(2)?, text(3)?, text(4)?, text(5)?);
@@ -611,7 +611,7 @@ pub fn execute_of(sql: &str) -> Option<(String, Vec<(String, String)>)> {
 /// is left to the task's own DECLARE, which says it is required. One that fails stops there, and it
 /// and the rest are left out: the task's own DECLARE works them out when it runs, and its error is the
 /// run's.
-async fn values(app: &App, task: &Task, given: HashMap<String, serde_json::Value>) -> HashMap<String, serde_json::Value> {
+async fn values(app: &App, task: &Task, given: HashMap<String, serde_json::Value>, scope: &crate::rights::Scope) -> HashMap<String, serde_json::Value> {
     let mut out = given.clone();
     let parameters: Vec<_> = crate::vars::parameters(&task.sql).into_iter().filter(|p| p.declared).collect();
     let worked_out = crate::vars::own(given.clone(), async {
@@ -621,7 +621,7 @@ async fn values(app: &App, task: &Task, given: HashMap<String, serde_json::Value
             }
             let name = p.name.clone();
             let change = crate::vars::Change::Declare { name: name.clone(), ty: p.ty, default: p.default, parameter: true };
-            if crate::vars::apply(app, change).await.is_err() {
+            if crate::vars::apply(app, change, scope).await.is_err() {
                 break;
             }
             let Some(var) = crate::vars::get(&name) else { break };
@@ -642,7 +642,7 @@ pub async fn execute(app: &App, name: String, args: Vec<(String, String)>, who: 
     let mut params = HashMap::new();
     if !args.is_empty() {
         let select = args.iter().map(|(k, v)| format!("({v}) AS \"{k}\"")).collect::<Vec<_>>().join(", ");
-        let rows = Box::pin(app.query(&format!("SELECT {select}"), Some("0"))).await?;
+        let rows = Box::pin(app.query(&format!("SELECT {select}"), Some("0"), &who.scope)).await?;
         let row = datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?;
         params = crate::routines::values_of(&row)?;
     }
@@ -651,9 +651,9 @@ pub async fn execute(app: &App, name: String, args: Vec<(String, String)>, who: 
         None => None,
     };
     if let Some(task) = task {
-        params = values(app, &task, params).await;
+        params = values(app, &task, params, &who.scope).await;
     }
-    Ok(Outcome::Done(crate::write::on_node_as(app, asked(params), None, who.files).await?))
+    Ok(Outcome::Done(crate::write::on_node_as(app, asked(params), None, who.files, &who.scope).await?))
 }
 
 /// Leader: claim a tick now for `EXECUTE TASK` (the scheduler runs it, and what follows it).
@@ -829,7 +829,7 @@ impl Drop for Ran {
 /// try within `timeout`; then its line in the run log, then the tick marked done, with how it went.
 async fn run_tick(app: &App, name: &str, task: &Task, tick: Tick) {
     let job = format!("task:{name}:{}", tick.at);
-    let who = Who { role: Role::Admin, files: false, depth: 0 };
+    let who = Who { role: Role::Admin, files: false, depth: 0, scope: crate::auth::Principal::node().scope }; // (the schedule's: the node's own)
     let none = RecordBatch::new_empty(Arc::new(datafusion::arrow::datatypes::Schema::empty()));
     let id = format!("task-{name}-{}", tick.at); // (a tick run again after a failover is the same run: its row, ended)
     let run = CALLER.sync_scope("schedule".into(), || Run::start(app, name, Role::Admin, Some(&job), &none, Some(id)));
@@ -838,7 +838,7 @@ async fn run_tick(app: &App, name: &str, task: &Task, tick: Tick) {
         None => Ok(false),
         Some(cond) => {
             let check = format!("SELECT 1 AS t WHERE ({})", results(&app.lake, cond, tick.at).await);
-            let (out, said) = crate::routines::with_notices(CALLER.scope(caller.clone(), crate::routines::script(app, &check, &tick.params, &views, who, None))).await;
+            let (out, said) = crate::routines::with_notices(CALLER.scope(caller.clone(), crate::routines::script(app, &check, &tick.params, &views, who.clone(), None))).await;
             heard.extend(said);
             out.map(|o| !matches!(o, Outcome::Rows(b) if b.iter().any(|b| b.num_rows() > 0))).map_err(|e| e.context("WHEN"))
         }
@@ -850,7 +850,7 @@ async fn run_tick(app: &App, name: &str, task: &Task, tick: Tick) {
             let sql = results(&app.lake, &task.sql, tick.at).await;
             let mut tries = 0;
             loop {
-                let go = CALLER.scope(caller.clone(), crate::routines::script(app, &sql, &tick.params, &views, who, Some(job.clone())));
+                let go = CALLER.scope(caller.clone(), crate::routines::script(app, &sql, &tick.params, &views, who.clone(), Some(job.clone())));
                 let (out, said) = crate::routines::with_notices(async {
                     match task.with.timeout {
                         Some(s) => tokio::time::timeout(Duration::from_secs(s), go).await.unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {s} s"))),
@@ -881,7 +881,7 @@ async fn run_tick(app: &App, name: &str, task: &Task, tick: Tick) {
         eprintln!("task {name}, tick {}: {e:#}", tick.at);
         if let Some(p) = &task.with.on_failure {
             let call = format!("CALL {p}('{}', '{}')", name.replace('\'', "''"), format!("{e:#}").replace('\'', "''"));
-            let (said, more) = crate::routines::with_notices(CALLER.scope(caller.clone(), crate::routines::script(app, &call, &HashMap::new(), &views, who, None))).await;
+            let (said, more) = crate::routines::with_notices(CALLER.scope(caller.clone(), crate::routines::script(app, &call, &HashMap::new(), &views, who.clone(), None))).await;
             heard.extend(more);
             if let Err(f) = said {
                 heard.push(format!("on_failure {p}: {f:#}"));
@@ -942,7 +942,7 @@ async fn due(app: &App, name: &str, task: &Task) -> Result<Option<Tick>> {
             }
             let after = last.as_ref().map_or(task.created_ms, |t| t.at.max(task.created_ms));
             let Some(at) = latest(&every(&task.schedule)?, after, now_ms()) else { return Ok(None) };
-            let params = tokio::time::timeout(Duration::from_secs(30), crate::ext::scope(mine, values(app, task, HashMap::new()))).await.unwrap_or_default(); // (a timeout: no values, and the task's own DECLARE works them out)
+            let params = tokio::time::timeout(Duration::from_secs(30), crate::ext::scope(mine, values(app, task, HashMap::new(), &crate::auth::Principal::node().scope))).await.unwrap_or_default(); // (a timeout: no values, and the task's own DECLARE works them out)
             let mut tick = Tick { at, params, ..Default::default() };
             tick.owner = mine.then(|| signed(lake, &tick.what(name))).flatten();
             tick

@@ -133,10 +133,11 @@ async fn set_not_null(lake: &Lake, table: &str, column: &str, stored: &str, mut 
     Ok(json!({"table": table, "column": column, "not_null": true}))
 }
 
-/// The rows of `table` whose `column` is NULL, at the lake's visible commit.
+/// The rows of `table` whose `column` is NULL, at the lake's visible commit: every row, as the node's own reads them (a NOT
+/// NULL holds for the rows its asker may not read too, as a UNIQUE's check reads them: `constraints.rs`).
 async fn count_nulls(lake: &Lake, table: &str, column: &str) -> Result<i64> {
     let sql = format!("SELECT count(*) AS n FROM {} WHERE \"{}\" IS NULL", crate::write::sql_name(table), column.replace('"', "\"\""));
-    let ctx = crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?;
+    let ctx = crate::query::session_for(lake, &sql, "", Some(lake.visible()), &crate::auth::Principal::node().scope).await?;
     let found = crate::engine::sql(&ctx, &sql).await?.collect().await?;
     Ok(found.first().and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>()).map_or(0, |a| a.value(0)))
 }
