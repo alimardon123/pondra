@@ -310,7 +310,7 @@ EXCEPTIONS = {
     "UPDATE … FROM": "`UPDATE t SET … FROM other WHERE …`, which DataFusion refuses and Pondra runs, as Postgres does",
     "names apart": "a SELECT list naming two items alike (`count(1), count(1)`, a call and its call over a cast), which DataFusion refuses and Pondra answers, naming the second apart (invariant 175)",
     "IN outside a WHERE": "`x IN (SELECT …)` and `EXISTS (…)` in a SELECT list, a CASE or an aggregate, which DataFusion can't run and Pondra answers with SQL's NULLs",
-    "avg rounded": "`avg` over a DECIMAL rounds its last place, as Postgres and DuckDB do; DataFusion cuts it off",
+    "avg rounded": "`avg` over a DECIMAL answers as sum / count does: in the quotient's type (15 places for a DECIMAL(15, 2)), its last place rounded, as Postgres's is; DataFusion keeps the input's places and 4 more, cut off",
     "a DECIMAL quotient": "a quotient of DECIMALs keeps 16 places, rounded, as Postgres's does (71/3.0 is 23.6666666666666667); DataFusion keeps the dividend's places and 4 more, cut off, so the type it names and the places it shows differ",
     "Postgres's base64": "`encode(…, 'base64')` writes its padding, as Postgres does (DataFusion leaves it off), and `decode(…, 'base64')` reads as Postgres does, refusing a short last group or padding inside a group, which DataFusion takes",
 }
@@ -328,7 +328,7 @@ def exception(sql, why, made, pattern="", answer=None):
         return "names apart"
     if why == "an error was expected" and re.search(r"does not support logical expression (InSubquery|Exists)", pattern):
         return "IN outside a WHERE"
-    if why.startswith("answer differs") and re.search(r"\bavg\s*\(", sql, re.I) and last_place(why):
+    if why.startswith("answer differs") and re.search(r"\bavg\s*\(", sql, re.I) and (last_place(why) or quotient_places(*answer or ((), (), ()), typed=lambda g: True)):
         return "avg rounded"
     if why == "an error was expected" and re.search(r"interval\s+'[^']*'\s*[*/]|[*]\s*interval\s+'", sql, re.I):
         return "interval arithmetic"
@@ -365,10 +365,11 @@ DECIMAL_TYPE = re.compile(r"Decimal128\(\d+, \d+\)")
 NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
 
 
-def quotient_places(rows, expected, header):
+def quotient_places(rows, expected, header, typed=lambda g: g.endswith(", 16)")):
     """Whether an answer differs from the one wanted only as a DECIMAL quotient's places do: each word is the one
     wanted, a Decimal128 type where one is wanted, or a number with more places that is the wanted one to the wanted
-    one's places (DataFusion cuts its quotient off there, Pondra rounds at 16)."""
+    one's places (DataFusion cuts its quotient off there, Pondra rounds at 16). `typed`: a Decimal128 type that may stand
+    for the one wanted (a quotient's has 16 places; an average's, its sum over its count's)."""
     got = [DECIMAL_TYPE.sub("Decimal128", " ".join(r)).split() for r in rows]
     want = [DECIMAL_TYPE.sub("Decimal128", e).split() for e in expected]
     if not want or len(got) != len(want) or any(len(g) != len(w) for g, w in zip(got, want)):
@@ -387,7 +388,7 @@ def quotient_places(rows, expected, header):
 
     # (a Decimal128 type that differs is a quotient's: Pondra's has 16 places)
     types = [(g, w) for r, e in zip(rows, expected) for g, w in zip(DECIMAL_TYPE.findall(" ".join(r)), DECIMAL_TYPE.findall(e))]
-    if any(g != w and not g.endswith(", 16)") for g, w in types):
+    if any(g != w and not typed(g) for g, w in types):
         return False
     return all(close(g, w) for gs, ws in zip(got, want) for g, w in zip(gs, ws))
 
