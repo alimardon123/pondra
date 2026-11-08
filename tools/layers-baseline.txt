@@ -158,7 +158,7 @@ objects -> index  3
 objects -> once  2
 objects -> protect  1
 objects -> query  1
-objects -> rights  7
+objects -> rights  6
 objects -> routines  2
 objects -> runs  3
 objects -> seq  3
@@ -259,7 +259,6 @@ statement -> pg_catalog  1
 statement -> python  1
 store -> adopt  1
 store -> audit  2
-store -> auth  1
 store -> backup  6
 store -> branch  4
 store -> bridge  1
@@ -279,7 +278,7 @@ store -> in_task  1
 store -> locks  1
 store -> oom  2
 store -> panics  4
-store -> query  6
+store -> query  5
 store -> rules  14
 store -> seq  3
 store -> serve  2

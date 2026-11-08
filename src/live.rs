@@ -110,10 +110,10 @@ async fn watch(app: &App, headers: &axum::http::HeaderMap, sql: Option<&str>, ki
             None => crate::routines::Request::read(kind, body)?,
         };
         anyhow::ensure!(req.tables.is_empty(), "a live query reads the lake: rows sent with it would never change");
-        let sql = crate::routines::prepare(&app.lake, &req.sql, &req.params, &req.views).await?;
-        anyhow::ensure!(crate::routines::split(&sql).len() == 1 && crate::write::parse(&sql).is_none(), "a live query is one query");
-        let (tables, others) = reads(app, &sql).await?;
         let who = crate::auth::current().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::Admin));
+        let sql = crate::routines::prepare(&app.lake, &req.sql, &req.params, &req.views, &who.scope).await?;
+        anyhow::ensure!(crate::routines::split(&sql).len() == 1 && crate::write::parse(&sql).is_none(), "a live query is one query");
+        let (tables, others) = reads(app, &sql, &who.scope).await?;
         anyhow::Ok(Watch { seen: app.lake.visible(), app: app.clone(), sql, tables, others, print: None, answer: None, next: Instant::now(), every, session, who, header: header(headers), temps: 0, tag, _open: Open::new() })
     })
     .await
@@ -174,9 +174,9 @@ fn error(e: anyhow::Error, tag: &str) -> bytes::Bytes { format!("{{{tag}\"error\
 
 /// The tables `sql` reads here (itself and through its views, the session's too) and the attached
 /// lakes it names.
-async fn reads(app: &App, sql: &str) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+async fn reads(app: &App, sql: &str, scope: &crate::rights::Scope) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let temps = crate::temp::views(sql).into_iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
-    let views = crate::query::stored_views(&app.lake, &temps, false).await?;
+    let views = crate::query::stored_views(&app.lake, &temps, false, scope).await?;
     let text = views.iter().fold(temps, |t, (_, s)| format!("{t} {s}"));
     let tables = app.lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(k, _)| k[2..].to_string()).filter(|t| crate::text::mentions(&text, t)).collect();
     let others = app.lake.attached.read().unwrap().iter().map(|(n, _)| n.clone()).filter(|n| crate::text::mentions(&text, n)).collect();

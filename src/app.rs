@@ -193,7 +193,7 @@ impl App {
 
     /// `here_only`, for a query planned for `scope`.
     pub async fn here_only_for(&self, query: &str, scope: &crate::rights::Scope) -> bool {
-        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::called(query).is_some() || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::set::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || !scope.whole()
+        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::called(query).is_some() || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::set::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query, scope).await || !scope.whole()
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await)
     }
 
@@ -519,10 +519,27 @@ pub(crate) enum Kept<T> {
 }
 
 impl App {
+    /// What a remembered answer to `sql` depends on: this lake's catalog, and those of the attached
+    /// lakes it may read, itself or through the views it reads for `scope` (and which lakes are attached).
+    /// None: nothing to remember it by.
+    async fn version_for(&self, sql: &str, scope: &crate::rights::Scope) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.lake.cat.version()?.hash(&mut h);
+        let mut text = sql.to_string();
+        if !self.lake.attached.read().unwrap().is_empty() {
+            crate::query::stored_views(&self.lake, sql, false, scope).await.ok()?.iter().for_each(|(_, v)| text.push_str(&format!(" {v}")));
+        }
+        for (name, other) in self.lake.attached.read().unwrap().iter().filter(|(n, _)| crate::text::mentions(&text, n)) {
+            (name, other.cat.version()?, crate::auth::operator()).hash(&mut h); // (whoever runs the nodes may read what a user may not: `users::across`)
+        }
+        Some(h.finish())
+    }
+
     /// The version an answer to `query` is remembered under (`Results`), as HTTP and the Postgres port
     /// remember them: same query, same catalog version, same answer. None when it may answer otherwise
     /// next time. A user granted some tables has its answers kept under what it may read (`Scope::key`).
-    pub(crate) async fn remembers(&self, query: &str) -> Option<u64> {
+    pub(crate) async fn remembers(&self, query: &str, scope: &crate::rights::Scope) -> Option<u64> {
         let asks = |text: &str| {
             // (AT (OFFSET => -n) is n seconds before now: a moment that moves. Expanded, a table as it was
             // is named `"at:…"`, which holds its AT (…) as written: `past_names::spelled`)
@@ -534,12 +551,12 @@ impl App {
         let volatile = asks(query) || crate::pg_catalog::asked(query) // (Postgres's catalog: another answer to the same text)
             || crate::temp::mentioned(query) || crate::temp::called(query).is_some() // (the session's temporary tables change without a commit, and its functions are its own)
             || crate::set::any() // (and its settings may change the answer)
-            || crate::routines::with_views(&self.lake, query).await.map_or(true, |t| t.len() > query.len() && asks(&t)) // (and so may a view it reads: `now()`, files)
-            || crate::routines::volatile(&self.lake, query).await // (a Python function may answer differently each time)
+            || crate::routines::with_views(&self.lake, query, scope).await.map_or(true, |t| t.len() > query.len() && asks(&t)) // (and so may a view it reads: `now()`, files)
+            || crate::routines::volatile(&self.lake, query, scope).await // (a Python function may answer differently each time)
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await); // (a view's current_schema() is its reader's: not one answer for every session)
         match volatile {
             true => None,
-            false => self.lake.version_for(query).await,
+            false => self.version_for(query, scope).await,
         }
     }
 
@@ -549,7 +566,7 @@ impl App {
     /// and the bytes to keep and share, when it has them; one that leaves none (an error, or a big
     /// answer) leaves each caller it covered to run on its own. Its own caller takes its answer as it
     /// is: the Postgres port never decodes the bytes it just encoded.
-    pub(crate) async fn remembered<T, F, Fut>(&self, key: String, query: &str, version: u64, stale: Option<Duration>, run: F) -> anyhow::Result<Kept<T>>
+    pub(crate) async fn remembered<T, F, Fut>(&self, key: String, query: &str, version: u64, stale: Option<Duration>, scope: &crate::rights::Scope, run: F) -> anyhow::Result<Kept<T>>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<(Option<bytes::Bytes>, T)>>,
@@ -568,7 +585,7 @@ impl App {
             return Ok(Kept::Bytes(body.clone()));
         }
         (slot.0, slot.1) = (flight.0.load(std::sync::atomic::Ordering::Relaxed), None);
-        let version = self.lake.version_for(query).await; // (read after `covers`: this run reads at least this)
+        let version = self.version_for(query, scope).await; // (read after `covers`: this run reads at least this)
         crate::query::mark("answer kept?");
         let run = run();
         tokio::pin!(run);

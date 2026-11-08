@@ -181,17 +181,18 @@ pub(crate) fn reprint(q: &str) -> Option<String> { Parser::new(&GenericDialect {
 /// in Pondra's words (another database's forms: `friendly.rs`), once read so. A text that calls a routine isn't taken
 /// in that second way: the query keeps the routine's body as it was, and the text would read as the routine is now.
 #[cfg(feature = "lake")]
-pub async fn proved(lake: &crate::store::Lake, text: &str, query: &str, materialized: bool) -> bool {
+pub async fn proved(lake: &crate::store::Lake, text: &str, query: &str, materialized: bool, scope: &crate::rights::Scope) -> bool {
     if reprint(text).as_deref() == Some(query) {
         return true;
     }
     use crate::front::Host;
-    let Ok(routines) = lake.routines().await else { return false };
+    let host = crate::host::Asking::of(lake, scope);
+    let Ok(routines) = host.routines().await else { return false };
     if routines.own.keys().any(|n| crate::text::mentions(text, n)) {
         return false;
     }
     let kind = if materialized { "MATERIALIZED VIEW" } else { "VIEW" };
-    let Ok(read) = crate::front::expand(lake, &format!("CREATE {kind} pondra_authored AS {text}"), &std::collections::HashMap::new()).await else { return false };
+    let Ok(read) = crate::front::expand(&host, &format!("CREATE {kind} pondra_authored AS {text}"), &std::collections::HashMap::new()).await else { return false };
     matches!(Parser::parse_sql(&GenericDialect {}, &read).as_deref(), Ok([ast::Statement::CreateView(v)]) if v.query.to_string() == query)
 }
 

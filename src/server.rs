@@ -89,7 +89,7 @@ pub fn router(app: App) -> Router {
                 None => crate::apply::export_here(&app.lake).await?,
             }))
         }))
-        .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::objects::listed(&app.lake).await?)) }))
+        .route("/objects", get(|State(app): State<App>, who: Option<axum::Extension<crate::auth::Principal>>| async move { Ok::<_, E>(Json(crate::objects::listed(&app.lake, &scope_of(who)).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/metrics/tables", get(|State(app): State<App>| async move { crate::metrics::tables(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
@@ -931,7 +931,7 @@ async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String, scop
         define?;
     }
     crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name))?; // (its INSERT grant, as SQL's)
-    let query = crate::routines::expand(&app.lake, &query).await?;
+    let query = crate::routines::expand(&app.lake, &query, scope).await?;
     // (a table that moved a column: the query's columns fill SQL's first ones, as an INSERT's do: `write::in_sql_order`)
     let query = match app.lake.table_meta_if(name).await? {
         Some(m) if m.moved() => crate::write::whole_rows_of(&app.lake, name, &m, &crate::write::filled(&app.lake, &m, name, &query, scope).await?, &query).await?,
@@ -1042,8 +1042,9 @@ async fn files(State(app): State<App>, Json(f): Json<crate::write::Files>) -> Re
 /// Body: `{"source": "events", "target": "per_user", "sql": "SELECT … FROM events …"}`.
 async fn create_task(State(app): State<App>, Path(name): Path<String>, who: Option<axum::Extension<crate::auth::Principal>>, body: String) -> Result<Json<Value>, E> {
     let mut task: Task = serde_json::from_str(&body)?;
-    task.sql = crate::routines::expand(&app.lake, &task.sql).await?;
-    crate::tasks::create(&app.lake, &name, &task, &scope_of(who)).await?;
+    let scope = scope_of(who);
+    task.sql = crate::routines::expand(&app.lake, &task.sql, &scope).await?;
+    crate::tasks::create(&app.lake, &name, &task, &scope).await?;
     Ok(Json(j!({"task": name})))
 }
 
@@ -1052,11 +1053,12 @@ async fn create_task(State(app): State<App>, Path(name): Path<String>, who: Opti
 /// window of column `w` once, final, to `{name}_final`; `?session=ts&gap_secs=30&lateness_secs=5`
 /// makes it a session view (`views.rs`): `CREATE MATERIALIZED VIEW … WITH (…)` in SQL.
 async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(options): Query<std::collections::BTreeMap<String, String>>, who: Option<axum::Extension<crate::auth::Principal>>, sql: String) -> Result<Json<Value>, E> {
-    let (text, sql) = (Some(sql.clone()), crate::routines::expand(&app.lake, &sql).await?); // (as they are now: ADR-023; as written, if it reads so: `authored.rs`)
+    let scope = scope_of(who);
+    let (text, sql) = (Some(sql.clone()), crate::routines::expand(&app.lake, &sql, &scope).await?); // (as they are now: ADR-023; as written, if it reads so: `authored.rs`)
     let d = crate::ddl::Ddl::CreateMaterialized { name, sql, options, text };
     let out = {
         let _guard = app.lock.lock().await;
-        crate::ddl::apply(&app.lake, d.clone(), &scope_of(who)).await?
+        crate::ddl::apply(&app.lake, d.clone(), &scope).await?
     };
     app.settle(&d).await?; // (once it's filled from the rows already there)
     Ok(Json(out))

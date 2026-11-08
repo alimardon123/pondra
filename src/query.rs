@@ -1390,7 +1390,7 @@ pub fn table_ref(name: &str) -> datafusion::common::TableReference {
 /// (`Catalog::get_many`), and the rounds are checked to be of one commit (`Catalog::moved_since`), all read again if not.
 /// A statement's reads follow what it names, not how many tables the lake holds (the write-set rule:
 /// designs/redesign/redesign.md §4). None: a text the parser doesn't take (it reads every table and view, as before).
-pub async fn named_records(lake: &Lake, ctx: &SessionContext, texts: &[&str]) -> Result<Option<Named>> {
+pub async fn named_records(lake: &Lake, ctx: &SessionContext, texts: &[&str], scope: &crate::rights::Scope) -> Result<Option<Named>> {
     let state = ctx.state();
     let (dialect, catalog) = (state.config().options().sql_parser.dialect.clone(), state.config().options().catalog.clone());
     let refers = |sql: &str| -> Option<Vec<String>> {
@@ -1434,7 +1434,7 @@ pub async fn named_records(lake: &Lake, ctx: &SessionContext, texts: &[&str]) ->
                     }
                     Some((_, name)) => {
                         let v: crate::ddl::StoredView = serde_json::from_slice(&raw)?;
-                        let sql = crate::routines::expand_stored(lake, &v.sql).await?; // (macros as they are now, as `stored_views`)
+                        let sql = crate::routines::expand_stored(lake, &v.sql, scope).await?; // (macros as they are now, as `stored_views`)
                         pending.push(sql.clone());
                         named.views.push((name.to_string(), sql));
                     }
@@ -1456,24 +1456,19 @@ pub struct Named {
 }
 
 /// A session with every table and stored view `sql` names registered (`named_records`: the names its parse refers
-/// to, read at one commit), except `except`, which the caller registers itself. A lake is a catalog of schemas (`ddl.rs`):
-/// this one is the default catalog, and also goes by its own name; each attached lake is a
-/// catalog by the name it was attached as, and — unless a schema here has that name — its
-/// `public` tables are also that schema's (`name.table`, from before schemas).
-pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionContext> { session_at(lake, sql, except, None).await }
-
-/// `session`, this lake's tables as of log segment `upto` (every query in it reads the same rows).
-pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>) -> Result<SessionContext> {
-    session_for(lake, sql, except, upto, &crate::rights::scope()).await // (the task's caller, until its callers say whose: M8 piece 3b)
-}
-
-/// `session_at`, planned for `scope`: the session carries it (`Scope::onto`), and what is registered in it (the tables it
-/// may read, the system tables, a listing's columns) is what `scope` may see. No planning in it reads the task's caller.
+/// to, read at one commit), except `except`, which the caller registers itself, as of log segment `upto` when given
+/// (every query in it reads the same rows). A lake is a catalog of schemas (`ddl.rs`): this one is the default catalog,
+/// and also goes by its own name; each attached lake is a catalog by the name it was attached as, and — unless a schema
+/// here has that name — its `public` tables are also that schema's (`name.table`, from before schemas).
+///
+/// Planned for `scope`, the statement's asker, which every caller names: the session carries it (`Scope::onto`), and what
+/// is registered in it (the tables it may read, the system tables, a listing's columns) is what `scope` may see. No
+/// planning in it reads the task's caller.
 pub async fn session_for(lake: &Lake, sql: &str, except: &str, upto: Option<u64>, scope: &crate::rights::Scope) -> Result<SessionContext> {
     session_reading(lake, sql, except, upto, false, scope).await
 }
 
-/// `session_at`, every table and view read and their names matched against the text's words when `scan` (as every
+/// `session_for`, every table and view read and their names matched against the text's words when `scan` (as every
 /// statement did before `named_records`: the oracle its test checks against).
 async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>, scan: bool, scope: &crate::rights::Scope) -> Result<SessionContext> {
     use crate::text::{mentions, split, PUBLIC};
@@ -1488,17 +1483,17 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
     let asked: Arc<str> = Arc::from(if scope.whole() { "" } else { sql }); // (what a refusal of a column may name: `Guarded`)
     let mut temps = crate::temp::views(sql); // (the session's own: over the lake's of the same name)
     for (_, v) in temps.iter_mut() {
-        let expanded = crate::routines::expand_temp_view(lake, v).await?; // (read as a stored view is: the door's rewrites, with the tables' types now; the text was kept as written)
+        let expanded = crate::routines::expand_temp_view(lake, v, scope).await?; // (read as a stored view is: the door's rewrites, with the tables' types now; the text was kept as written)
         *v = expanded;
     }
     let seen = temps.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
     // (the tables and views it names, and theirs, read at one commit; a listing, or a statement the parser doesn't take,
     // reads every table and view as before)
     let texts: Vec<&str> = std::iter::once(sql).chain(temps.iter().map(|(_, s)| s.as_str())).collect();
-    let found = if listing || scan { None } else { named_records(lake, &ctx, &texts).await? };
+    let found = if listing || scan { None } else { named_records(lake, &ctx, &texts, scope).await? };
     let mut views = match &found {
         Some(n) => n.views.clone(),
-        None => stored_views(lake, &seen, listing).await?, // (their tables are wanted too)
+        None => stored_views(lake, &seen, listing, scope).await?, // (their tables are wanted too)
     };
     views.retain(|(n, _)| !temps.iter().any(|(m, _)| m == n));
     views.extend(temps);
@@ -1785,7 +1780,7 @@ fn merging_a_sort(e: &anyhow::Error) -> bool {
 }
 
 /// The stored views (`CREATE VIEW`) `sql` names, and the ones they name; every one for a listing.
-pub async fn stored_views(lake: &Lake, sql: &str, listing: bool) -> Result<Vec<(String, String)>> {
+pub async fn stored_views(lake: &Lake, sql: &str, listing: bool, scope: &crate::rights::Scope) -> Result<Vec<(String, String)>> {
     let (mut text, mut views) = (sql.to_string(), vec![]);
     let stored = lake.cat.scan_raw("q/", "q0").await?; // (decoded and expanded only when named: every query paid for every view)
     loop {
@@ -1796,7 +1791,7 @@ pub async fn stored_views(lake: &Lake, sql: &str, listing: bool) -> Result<Vec<(
         }
         for (k, raw) in more {
             let v: crate::ddl::StoredView = serde_json::from_slice(raw)?;
-            let sql = crate::routines::expand_stored(lake, &v.sql).await?; // (macros as they are now; the path it was made under is in its text)
+            let sql = crate::routines::expand_stored(lake, &v.sql, scope).await?; // (macros as they are now; the path it was made under is in its text)
             text.push_str(&format!(" {sql}"));
             views.push((k[2..].to_string(), sql));
         }
@@ -1899,6 +1894,7 @@ mod tests {
             use crate::store::Lake;
             let dir = std::env::temp_dir().join(format!("pondra-named-{}", uuid::Uuid::new_v4()));
             let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            let node = &crate::auth::Principal::node().scope;
             apply(&lake, Ddl::CreateSchema { name: "s".into(), if_not_exists: false }, &crate::auth::Principal::node().scope).await?;
             for t in ["a", "b", "s.c", "MiXed", "x-y", "unused", "a$new-0123abcd"] {
                 crate::write::create_table(&lake, t, r#"{"columns": [["x", "Int64"]]}"#).await?;
@@ -1925,7 +1921,7 @@ mod tests {
                 ("SELECT * FROM \"a$new-0123abcd\"", &["a$new-0123abcd"]),
             ];
             for (sql, names) in cases {
-                let (named, scanned) = (session_at(&lake, sql, "", None).await?, session_reading(&lake, sql, "", None, true, &crate::auth::Principal::node().scope).await?);
+                let (named, scanned) = (session_for(&lake, sql, "", None, node).await?, session_reading(&lake, sql, "", None, true, node).await?);
                 let (mine, theirs) = (registered(&named), registered(&scanned));
                 assert_eq!(mine, names.iter().map(|n| n.to_string()).collect(), "{sql}: what it registered");
                 assert!(mine.is_subset(&theirs), "{sql}: {mine:?} beyond the scan's {theirs:?}");
@@ -1936,10 +1932,10 @@ mod tests {
                 assert_eq!(answer(named).await?, answer(scanned).await?, "{sql}: the answer");
             }
             // (a table named unquoted as it is called, and looked up by that name after: `views::join`)
-            let ctx = session_at(&lake, "SELECT x FROM MiXed, b", "", None).await?;
+            let ctx = session_for(&lake, "SELECT x FROM MiXed, b", "", None, node).await?;
             assert!(ctx.table(table_ref("MiXed")).await.is_ok() && ctx.table(table_ref("b")).await.is_ok(), "{:?}", registered(&ctx));
             let unparsed = "SELECT * FROM a WHERE x = ANY(:list"; // (the parser doesn't take it: every table, as before)
-            let ctx = session_at(&lake, unparsed, "", None).await?;
+            let ctx = session_for(&lake, unparsed, "", None, node).await?;
             assert!(registered(&ctx).contains("a") && !registered(&ctx).contains("b"), "{:?}", registered(&ctx));
             lake.cat.close().await?;
             let _ = std::fs::remove_dir_all(&dir);

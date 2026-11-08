@@ -952,8 +952,8 @@ pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::Fi
 /// … AS` keeps them and a view's table does too (`pg_types::columns`). A query that gives another number of columns
 /// than `names` gives none: a type matched to the wrong name would be a guess. (A view kept as partial rows is no
 /// query's columns: its caller passes none, `finish.rs`.)
-pub async fn query_types(lake: &Lake, sql: &str, names: &[String]) -> BTreeMap<String, String> {
-    let shape = crate::pg_types::columns(lake, sql).await;
+pub async fn query_types(lake: &Lake, sql: &str, names: &[String], scope: &crate::rights::Scope) -> BTreeMap<String, String> {
+    let shape = crate::pg_types::columns(lake, sql, scope).await;
     if shape.types.len() != names.len() {
         return BTreeMap::new();
     }
@@ -988,7 +988,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
             match c.columns.is_empty() {
                 true => {
                     let names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
-                    sql_types.extend(query_types(from, &sql, &names).await);
+                    sql_types.extend(query_types(from, &sql, &names, scope).await);
                     fields
                 }
                 false => {
