@@ -675,22 +675,34 @@ async fn records(State(app): State<App>, headers: axum::http::HeaderMap, Json(ba
 
 /// Resolves once the caller of an answer that goes on (the commit stream, `/watch`, a live query, Flight's follow stream) may no longer have it: its
 /// sign-in revoked, expired, or changed so that `still` refuses it (a grant taken back, a superuser no more); a caller that
-/// came in with nothing signed, at an open node, once the node is open no more. Checked every 5 s, as `guard` checks a
-/// request (a password is hashed at most once a minute: `users::password_ok` remembers it against its verifier), so such an
-/// answer ends within that (11-01 audit H4 for the commit stream; 11-02 H3 for the rest; 11-03 H1 for Flight). A node, a token and the program
-/// that started this node never end.
-pub(crate) async fn until_revoked(app: App, operator: bool, header: Option<String>, still: impl Fn(&crate::auth::Principal) -> bool + Send) {
-    if operator {
-        return futures::future::pending().await;
-    }
-    loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        let signed = match &header {
-            Some(h) => crate::users::who(&app.lake, &app.auth, &crate::auth::Credential::of_header(Some(h))).await.is_some_and(|p| still(&p)),
-            None => false,
-        };
-        if !signed && !app.open().await {
-            return;
+/// came in with nothing signed, at an open node, once the node is open no more. Each second it asks `Principal::stale`, a
+/// version compare, and signs in again only once that moved (a REVOKE, a DROP USER, a token or session ended), as a Postgres
+/// connection does at its next statement and a Kafka client at its next request: so such an answer ends within a second of the
+/// change, and a stream whose rights don't move costs no catalog read or password check (11-08 audit M7; 11-01 H4, 11-02 H3
+/// and 11-03 H1 before). The caller is read now, in the request's scope, since the stream is polled after it. A node, a
+/// token and the program that started this node never end.
+pub(crate) fn until_revoked(app: App, operator: bool, header: Option<String>, still: impl Fn(&crate::auth::Principal) -> bool + Send + 'static) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let who = crate::auth::current();
+    async move {
+        if operator || who.as_ref().is_some_and(|w| w.operator) {
+            return futures::future::pending().await;
+        }
+        let mut who = who.unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None)); // (nothing signed: asked once the rights move)
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if !who.stale(&app.lake) {
+                continue;
+            }
+            let epoch = app.lake.cat.rights_version(); // (before it is asked again, as at sign-in: a change meanwhile is seen next time)
+            let signed = match &header {
+                Some(h) => crate::users::who(&app.lake, &app.auth, &crate::auth::Credential::of_header(Some(h))).await.filter(|p| still(p)),
+                None => None,
+            };
+            who = match signed {
+                Some(p) => crate::auth::Principal { epoch: p.epoch.max(epoch), ..p },
+                None if app.open().await => crate::auth::Principal { epoch, ..who }, // (an open node's anyone, until it signs its users in)
+                None => return,
+            };
         }
     }
 }
@@ -908,7 +920,13 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
 async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> Result<Json<Value>, E> {
     ensure!(!app.members.reader(), "read-only node");
     if app.lake.table_meta_if(name).await?.is_none() {
-        crate::rights::may_here(crate::rights::Action::Define, crate::rights::Object::Table(name))?; // (making a table, as CREATE TABLE does)
+        let define = crate::rights::may_here(crate::rights::Action::Define, crate::rights::Object::Table(name)); // (making a table, as CREATE TABLE does)
+        if define.is_err() && !crate::rights::scope().whole() {
+            // (a user with grants who may not make it is told there is no such table, as of one it holds nothing on, so the code
+            // never tells a missing table from a hidden one: 11-08 audit M5)
+            return Err(crate::codes::coded("42P01", format!("no table {name}")).into());
+        }
+        define?;
     }
     crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name))?; // (its INSERT grant, as SQL's)
     let query = crate::routines::expand(&app.lake, &query).await?;
@@ -1256,7 +1274,7 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
         return (StatusCode::FORBIDDEN, crate::ext::said(&e)).into_response(); // (a user's: the whole rows)
     }
     // (the rows come after this request's scope has ended: its sign-in is checked again, and the table's whole rows with it, so
-    // a REVOKE, a DROP USER or a session's end stops them within 5 s: 11-02 audit H3)
+    // a REVOKE, a DROP USER or a session's end stops them within a second: 11-02 audit H3, 11-08 M7)
     let (operator, header) = caller(&headers);
     let table = name.clone();
     let revoked = until_revoked(app.clone(), operator, header, move |p| {

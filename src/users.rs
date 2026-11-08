@@ -119,7 +119,7 @@ fn granted_kind(word: &str) -> Option<&'static crate::objects::Kind> {
 #[serde(tag = "do", rename_all = "snake_case")]
 pub enum Change {
     Create { name: String, login: bool, if_not_exists: bool, verifier: Option<Verifier>, superuser: bool, #[serde(default)] limits: Limits },
-    Alter { name: String, verifier: Option<Verifier>, superuser: Option<bool>, #[serde(default)] limits: Limits },
+    Alter { name: String, verifier: Option<Verifier>, superuser: Option<bool>, #[serde(default)] limits: Limits, #[serde(default)] login: Option<bool> },
     Drop { name: String, if_exists: bool },
     Grant { privileges: Vec<String>, on: On, columns: Vec<String>, to: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] database: Option<String> },
     Revoke { privileges: Vec<String>, on: On, columns: Vec<String>, from: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] database: Option<String> },
@@ -311,8 +311,11 @@ fn parse(mut w: Words) -> Result<Change> {
             Ok(match verb.as_str() {
                 "create" => Change::Create { name, login: login2.unwrap_or(login), if_not_exists, verifier, superuser: superuser.unwrap_or(false), limits },
                 _ => {
-                    ensure!(verifier.is_some() || superuser.is_some() || limits != Limits::default(), "ALTER USER {name} PASSWORD '…' | SUPERUSER | NOSUPERUSER | MAX_QUERIES n | STATEMENT_TIMEOUT '…'");
-                    Change::Alter { name, verifier, superuser, limits }
+                    // (a usage error, 42601, as Postgres's syntax errors are: 11-08 audit M12)
+                    if verifier.is_none() && superuser.is_none() && login2.is_none() && limits == Limits::default() {
+                        return Err(crate::codes::coded("42601", format!("ALTER USER {name} PASSWORD '…' | SUPERUSER | NOSUPERUSER | LOGIN | NOLOGIN | MAX_QUERIES n | STATEMENT_TIMEOUT '…'")));
+                    }
+                    Change::Alter { name, verifier, superuser, limits, login: login2 }
                 }
             })
         }
@@ -497,8 +500,11 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             lake.cat.commit(vec![put(&name, &u)], &[]).await?;
             j!({ if login { "user" } else { "role" }: name })
         }
-        Change::Alter { name, verifier, superuser, limits } => {
+        Change::Alter { name, verifier, superuser, limits, login } => {
             let mut u = must(&name, get(&name).await?)?;
+            if let Some(l) = login {
+                u.login = l; // (NOLOGIN: it signs in no more, its sessions end at their next statement, as after DROP USER)
+            }
             if verifier.is_some() {
                 u.verifier = verifier;
             }
@@ -1627,6 +1633,7 @@ mod tests {
                 _ => panic!(),
             },
             Some(crate::write::Stmt::Invalid(e)) => j!({"error": e}),
+            Some(crate::write::Stmt::Refused(code, e)) => j!({"error": e, "code": code}),
             _ => j!(null),
         };
         assert_eq!(p("CREATE USER ann PASSWORD 'longenough'")["do"], "create");
@@ -1646,6 +1653,15 @@ mod tests {
         assert_eq!(p("CREATE TOKEN ci FOR USER ann EXPIRES IN '30 days'")["expires_secs"], 30 * 86400);
         assert_eq!(p("DROP TOKEN ci FOR ann")["do"], "drop_token");
         assert_eq!(p("DROP USER IF EXISTS ann")["if_exists"], true);
+        // (NOLOGIN alone, and beside another option, is kept; nothing to change is a usage error, 42601: 11-08 audit M12)
+        assert_eq!(p("ALTER USER ana NOLOGIN")["login"], false);
+        let both = p("ALTER USER ana NOLOGIN SUPERUSER");
+        assert_eq!((both["login"].clone(), both["superuser"].clone()), (j!(false), j!(true)));
+        assert_eq!(p("ALTER ROLE analyst LOGIN")["login"], true);
+        assert_eq!(p("ALTER USER ana PASSWORD 'longenough'")["login"], j!(null));
+        let none = p("ALTER USER ana");
+        assert_eq!(none["code"], "42601");
+        assert!(none["error"].as_str().unwrap().contains("NOLOGIN"));
         assert_eq!(p("CREATE TABLE t (a INT)"), j!(null));
         assert_eq!(p("CREATE SECRET s (TYPE s3)"), j!(null));
     }

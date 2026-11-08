@@ -11231,6 +11231,26 @@ def users():
     infos = [table_info("sales.orders"), table_info("notes")]
     checks["Flight's GetFlightInfo of a table refuses a user granted only some columns (no column names), and serves one it may read"] = \
         "permission denied" in str(infos[0]) and "text" in infos[1]
+    # …and describing a query is refused as running it is (11-08 audit M6): GetFlightInfo of SELECT * and Postgres's Describe of
+    # it name no column ann may not read, and ListFlights lists a flight (a SELECT *) only of a table she may read whole
+    def sql_info(q):
+        try:
+            return client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": q})), opts).schema.names
+        except Exception as e:
+            return f"ERROR {e}"
+    def pg_described(q):
+        with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=ann password=ann-password-1 dbname=lake", connect_timeout=10, autocommit=True) as c:
+            r = c.pgconn.prepare(b"s1", q.encode())  # (refused at Parse or at Describe: either way, before any row)
+            if r.status == psycopg.pq.ExecStatus.COMMAND_OK:
+                r = c.pgconn.describe_prepared(b"s1")
+            return [r.fname(i).decode() for i in range(r.nfields)] if r.status == psycopg.pq.ExecStatus.COMMAND_OK else f"ERROR {r.error_message.decode(errors='replace')}"
+    described = {"flight *": sql_info("SELECT * FROM sales.orders"), "flight cols": sql_info("SELECT id, item FROM sales.orders"),
+                 "pg *": pg_described("SELECT * FROM sales.orders"), "pg cols": pg_described("SELECT id, item FROM sales.orders"),
+                 "flights": sorted(f.descriptor.path[0].decode() for f in client.list_flights(options=opts))}
+    shown_info["described"] = {k: str(v)[:200] for k, v in described.items()}
+    checks["describing SELECT * of a table granted in part is refused as running it is (Flight's GetFlightInfo, Postgres's Describe), naming no column; ListFlights lists only tables read whole (M6)"] = \
+        all(str(described[k]).startswith("ERROR") and "permission denied" in str(described[k]) and "card" not in str(described[k]) for k in ("flight *", "pg *")) \
+        and described["flight cols"] == described["pg cols"] == ["id", "item"] and "sales.orders" not in described["flights"] and "notes" in described["flights"] or described
     # Revoked and dropped: at once, on the leader and a follower
     ann_pg = psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=ann password=ann-password-1 dbname=lake", connect_timeout=10, autocommit=True)  # (open across the REVOKE and the DROP)
     def ann_said(q):
@@ -11320,6 +11340,21 @@ def users():
     checks["a REVOKE in the middle of a Flight DoPut stops it at its next batch (42P01), a DROP USER ends it (28000), and the batches before stay written"] = \
         put_said["revoked"][0] == 1 and "no table flown" in str(put_said["revoked"][1]) and put_said["dropped"][0] == 1 \
         and "signed out" in str(put_said["dropped"][1]) and put_said["rows"] == [{"n": 2}] or put_said
+    # ALTER USER … NOLOGIN, alone or beside another option, keeps it from signing in; nothing to change is a usage error, 42601 (11-08 audit M12)
+    as_(A.port, boss, "CREATE USER nol PASSWORD 'nol-password-1'")
+    nol = basic("nol", "nol-password-1")
+    nol_said = {"before": as_(A.port, nol, "SELECT 1 AS x"), "nologin": as_(A.port, boss, "ALTER USER nol NOLOGIN SUPERUSER")}
+    nol_said["after"] = as_(A.port, nol, "SELECT 1 AS x")
+    nol_said["login"] = as_(A.port, boss, "ALTER USER nol LOGIN")
+    nol_said["again"] = as_(A.port, nol, "SELECT current_user AS u")
+    c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=30)
+    c.request("POST", "/sql", b"ALTER USER nol", {"Authorization": boss})
+    r = c.getresponse()
+    nol_said["nothing"] = (r.status, r.getheader("x-pondra-sqlstate"), r.read().decode(errors="replace")[:200])
+    shown_info["nologin"] = {k: str(v)[:200] for k, v in nol_said.items()}
+    checks["ALTER USER … NOLOGIN, beside SUPERUSER too, keeps a user from signing in, LOGIN lets it again; ALTER USER with nothing to change is 42601 (M12)"] = \
+        nol_said["before"] == [{"x": 1}] and str(nol_said["after"]).startswith("ERROR 401") and nol_said["again"] == [{"u": "nol"}] \
+        and nol_said["nothing"][:2] == (400, "42601") or nol_said
     # W50: a user granted a view (and a materialized view) alone is shown their names, columns and rows, not their queries,
     # the base table's name or the filter; a listing shows the view as a read does; the server's folder is an admin's
     vee_pw = "vee-password-1"
@@ -12132,12 +12167,13 @@ def guarded():
         "a user's files": ask(P, json.dumps({"table": "orders", "job": "g5", "columns": [], "files": []}), path="/cluster/files", auth=bob, headers={"Content-Type": "application/json"}),
     }
     info["users"] = said
-    # (bob holds nothing on hr: for him it is a table that isn't there; carol reads orders, and is refused writing it)
+    # (bob holds nothing on hr: for him it is a table that isn't there; carol reads orders, and is refused writing it; bob may not
+    # make a table, so one that isn't there is "no table made", as hr is, never asked to be made: 11-08 audit M5)
     checks["a user's rows through /append and /insert as its grants say (reads too); another table, a new table, the audit log: refused"] = \
         isinstance(said["append, granted"], dict) and "ERROR 404: b'no table hr'" == said["append, not granted"] and "written by Pondra alone" in said["append to the audit log"] \
         and "needs more rights" in said["append, read but not granted"] \
         and isinstance(said["insert, granted"], dict) and "ERROR 404" in said["insert, reading what it may not"] and "hr' not found" in said["insert, reading what it may not"] \
-        and "ERROR 404: b'no table hr'" == said["insert, not granted"] and "may not change the lake's tables" in said["insert making a table"] \
+        and "ERROR 404: b'no table hr'" == said["insert, not granted"] and "ERROR 404: b'no table made'" == said["insert making a table"] \
         and until(lambda: ask(P, "SELECT id FROM orders ORDER BY id", auth=boss), [{"id": 7}, {"id": 8}], 10) == [{"id": 7}, {"id": 8}] \
         and ask(P, "SELECT count(*) AS n FROM hr", auth=boss) == [{"n": 1}]
     checks["…and never through the nodes' own routes (/cluster/commit, /cluster/files)"] = \
@@ -12590,6 +12626,10 @@ def guarded():
         and all(v <= 12 for v in h3_ended.values()) and isinstance(kafka_before, int) and kafka_before >= 1 and kafka_at_once == kafka_after == 0  # (hana holds nothing on stock now: a topic that isn't there, served neither new row)
     checks["Flight's follow stream ends when its sign-in may no longer read the table: REVOKE ends it within 12 s, telling the client to sign in again (11-03 H1)"] = \
         h3_flowing is True and h3_ended.get("flight follow", 99) <= 12 and "sign in again" in h3["flight follow"].get("error", "")
+    # (each is asked again the moment the lake's rights move, a second at most, not every 5 s whether or not they did: 11-08 M7.
+    # The no-longer-superuser's live query ends at its next answer, which the INSERT 6 s on brings)
+    checks["/watch, a live query and Flight's follow stream end within 2.5 s of the REVOKE or DROP USER that ends their sign-in (11-08 M7)"] = \
+        h3_flowing is True and all(h3_ended.get(k, 99) <= 2.5 for k in ("watch", "live, dropped", "flight follow"))
     # M8: a joined page's own statements are written by its node, as the sign-in's (`POST /cluster/records`, page_records.rs): a
     # superuser's sign-in only (never the nodes' key, nor a user with grants), at most 256 lines, under the node's own class and
     # words, and kept as a history row whatever the audit classes say. Node a's classes here have no read (`role,ddl,function,write`).
@@ -22343,11 +22383,21 @@ def listings():
         return r
     statements = {"SELECT *": "SELECT * FROM {t}", "a column that isn't": "SELECT nope FROM {t}", "a key's row": "SELECT * FROM {t} WHERE id = 1",
                   "by its schema": "SELECT count(*) FROM public.{t}", "INSERT": "INSERT INTO {t} VALUES (1, 2.0)", "UPDATE": "UPDATE {t} SET salary = 1",
-                  "DELETE": "DELETE FROM {t}", "DESCRIBE": "DESCRIBE {t}", "SHOW COLUMNS": "SHOW COLUMNS FROM {t}"}
+                  "DELETE": "DELETE FROM {t}", "DESCRIBE": "DESCRIBE {t}", "SHOW COLUMNS": "SHOW COLUMNS FROM {t}",
+                  "AT (…)": "SELECT * FROM {t} AT (VERSION => 1)"}  # (a past read says nothing of it: not a view, keyed, or when made, 11-08 audit M4)
     writes = {"INSERT", "UPDATE", "DELETE"}
     doors = {"HTTP": lambda s, w: as_ann(s), "Postgres": lambda s, w: pg_says(s), "Flight SQL": lambda s, w: flight_says(s), "MCP": lambda s, w: mcp_says(s, "write" if w else "query")}
     routes = {"GET /lookup": lambda t: as_ann("", "GET", f"/lookup/{t}/1"), "POST /append": lambda t: as_ann('{"id": 1, "salary": 2.0}', "POST", f"/append/{t}"),
               "POST /insert": lambda t: as_ann("SELECT 1 AS id, 2.0 AS salary", "POST", f"/insert/{t}"), "Iceberg REST's table": lambda t: as_ann("", "GET", f"/v1/namespaces/default/tables/{t}")}
+    def pg_describe(s):
+        """Postgres's Describe of `s`, prepared and not run (the extended protocol's Parse, then Describe): its columns, or its error."""
+        with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=ann password=ann-password-1 dbname=lake", connect_timeout=10, autocommit=True) as c:
+            r = c.pgconn.prepare(b"d1", s.encode())
+            if r.status == psycopg.pq.ExecStatus.COMMAND_OK:
+                r = c.pgconn.describe_prepared(b"d1")
+            if r.status == psycopg.pq.ExecStatus.COMMAND_OK:
+                return "columns " + ", ".join(r.fname(i).decode() for i in range(r.nfields))
+            return f"{r.error_field(psycopg.pq.DiagnosticField.SQLSTATE).decode()} {r.error_field(psycopg.pq.DiagnosticField.MESSAGE_PRIMARY).decode()}"
     unseen = {}
     for (hidden, gone) in [("hr", "zz_gone"), ("pay", "zz_gone")]:
         same = lambda a, b: re.sub(rf"\b{hidden}\b", "<t>", a) == re.sub(rf"\b{gone}\b", "<t>", b)
@@ -22360,11 +22410,33 @@ def listings():
                 # (Postgres has no SHOW COLUMNS: the port answers it as SHOW of a setting, the same for any table)
                 checks[f"{door}: {what} of {hidden}, which ann holds no privilege on, is answered as of a table that isn't there"] = same(a, b) and "permission denied" not in a \
                     and "salary" not in a and (a != "answered" or (door, what) == ("Postgres", "SHOW COLUMNS"))
+        # (Postgres's Describe of a statement, not run, as the connection's user: it was planned with no sign-in, which
+        # described every table's columns, 11-08 audit M6)
+        for what in ("SELECT *", "a key's row"):
+            if hidden == "pay" and what == "a key's row":
+                continue
+            a, b = pg_describe(statements[what].format(t=hidden)), pg_describe(statements[what].format(t=gone))
+            unseen[f"Postgres Describe, {what}, {hidden}"] = (a, b)
+            checks[f"Postgres's Describe of {what} of {hidden}, which ann holds no privilege on, is answered as of a table that isn't there"] = \
+                same(a, b) and not a.startswith("columns") and "salary" not in a
         if hidden == "hr":
             for route, ask_ in routes.items():
                 a, b = ask_(hidden), ask_(gone)
                 unseen[f"{route}, {hidden}"] = (a, b)
                 checks[f"{route} of hr, which ann holds no privilege on, is answered as of a table that isn't there"] = same(a, b) and "permission denied" not in a and "salary" not in a
+            # (and to a user who may write but not make tables: a missing table isn't asked to be made first, 42501, while a hidden
+            # one is "no table", so the code never tells them apart: 11-08 audit M5)
+            for q in ["CREATE USER wes PASSWORD 'wes-password-1'", "GRANT INSERT ON notes TO wes"]:
+                ask(boss, q)
+            def wes_insert(t):
+                c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+                c.request("POST", f"/insert/{t}?job=wes-1", b"SELECT 1 AS id, 2.0 AS salary", {"Authorization": basic("wes", "wes-password-1")})
+                r = c.getresponse()
+                return f"{r.status} {r.getheader('x-pondra-sqlstate')} {r.read().decode(errors='replace')[:400]}"
+            a, b = wes_insert(hidden), wes_insert(gone)
+            unseen["POST /insert, a writer"] = (a, b)
+            checks["POST /insert of hr, by a user who may write another table but not make one, is answered as of a table that isn't there (42P01)"] = \
+                same(a, b) and "42P01" in a and "permission denied" not in a and "may not" not in a
     # (Kafka: its topics are the tables it knows of; a record for one it doesn't is for a topic that isn't there)
     import confluent_kafka as ck, confluent_kafka.admin
     sasl = lambda u, p: {"bootstrap.servers": f"127.0.0.1:{A.port + 31}", "security.protocol": "SASL_PLAINTEXT", "sasl.mechanisms": "PLAIN", "sasl.username": u, "sasl.password": p}

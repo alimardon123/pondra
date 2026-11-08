@@ -432,6 +432,8 @@ long it took (`ms`) and the node that wrote it.
 
 ## TLS
 
+**Encryption at rest and in transit.** The bucket encrypts every object at rest: S3, R2, Google Cloud Storage and Azure all do by default, with their own keys. To use your own KMS key on S3, give the lake's nodes `AWS_SSE_KMS_KEY_ID`, or give a secret `KMS_KEY_ID` beside its `REGION` for another bucket: each object written is then encrypted with that key. In transit, the doors and the nodes speak TLS, as below.
+
 With a certificate and its key, every door takes TLS on its own port: HTTPS, Postgres's
 `sslmode=require`, Kafka's `security.protocol=SSL` and Flight's `grpc+tls`. A plain connection is
 then taken only from the node's own machine (`PONDRA_TLS=optional` takes it from anywhere), so a
