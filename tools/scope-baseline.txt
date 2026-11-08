@@ -39,7 +39,6 @@ reads iceberg_rest.rs 3
 reads live.rs 1
 reads mcp.rs 5
 reads path.rs 1
-reads pg.rs 4
 reads protect.rs 1
 reads python.rs 1
 reads routines.rs 1

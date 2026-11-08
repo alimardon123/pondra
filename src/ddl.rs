@@ -2256,7 +2256,9 @@ mod tests {
     /// (`keep_readers`, `outputs_over`): the lake's definitions, the same for every asker. A mover who may read `t` and not
     /// `s` moves `t`'s column under a materialized view of both; the move goes, the view runs its query with `t` read as it
     /// was, and the move's answer names the view and holds no row of either table. The same mover's own new view of `s` plans for them, and is
-    /// refused.
+    /// refused. At a door, a mover granted SELECT only is refused before the move starts (`rights::may_run`, which
+    /// `routines::one_of` and Postgres's `run` ask): an ALTER needs an admin token or a superuser, who sees every table, so
+    /// the move below, asked of `apply` itself, is the lake's part for an asker a later grant (an owner's ALTER) may make.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_columns_move_keeps_a_view_its_mover_may_not_read() -> Result<()> {
         use crate::users::{Access, Grant, On};
@@ -2272,6 +2274,10 @@ mod tests {
         let fill = made.fill.clone().map(|f| crate::views::Fill { upto: Some(0), ..f }); // (as the sequencer sets it: `views::bound`)
         lake.cat.commit(vec![(crate::views::view_key("v"), json(&crate::views::View { fill, ..made }))], &[]).await?;
         let mover = crate::rights::Scope::granted(std::sync::Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec![] }])));
+        let at_a_door = crate::auth::Principal { name: "mover".into(), role: crate::auth::Role::Read, scope: mover.clone(), door: "test", from: None, operator: false, epoch: 0, until: None };
+        let stmt = crate::write::parse("ALTER TABLE t ALTER COLUMN b FIRST").expect("an ALTER");
+        let refused = crate::auth::WHO.scope(at_a_door, async { crate::rights::may_run(crate::auth::Role::Read, &stmt) }).await.expect_err("a SELECT-only mover is refused at a door");
+        assert!(refused.to_string().contains("it needs an admin token, or a superuser"), "{refused}");
         let out = apply(&lake, Ddl::AlterColumn { table: "t".into(), column: "b".into(), change: Change::Place(Place::First) }, &mover).await?;
         assert_eq!(out, j!({"table": "t", "altered": {"column": "b", "place": "FIRST"}, "readers": ["materialized view v lists its columns in the new order, its rows kept"]}), "the move goes, names its reader, and answers no row");
         let v = lake.cat.get::<crate::views::View>(&crate::views::view_key("v")).await?.expect("v is kept");
