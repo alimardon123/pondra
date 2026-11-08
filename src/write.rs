@@ -1535,9 +1535,7 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
     let live: Vec<(String, String)> = meta.live().map(|(s, _, t)| (s.to_string(), t.to_string())).collect(); // (dropped columns aren't written)
     let listed = |c: &[(String, String)]| c.iter().map(|(n, t)| format!("{} {}", meta.name_of(n), crate::objects::sql_type(t))).collect::<Vec<_>>().join(", ");
     if types(&live) != types(&f.columns) {
-        // (40001, as a move's: a column added, dropped or retyped while they were written, so they are written again. The
-        // words say so too, since a node that sent them reads the code from them)
-        return Err(crate::codes::coded("40001", format!("could not serialize the INSERT into {}: its rows' columns ({}) aren't the table's ({}), in order and type, since it changed while they were written. Run it again", f.table, listed(&f.columns), listed(&live))));
+        return Err(unplaced(&f.table, &f.columns, listed(&f.columns), listed(&live)));
     }
     ensure!(f.placed.is_none_or(|placed| meta.places(placed)), crate::log::moved(&f.table)); // (a move the node hadn't seen: `log::placed_for`)
     let rows: u64 = f.files.iter().map(|f| f.rows).sum();
@@ -1546,6 +1544,18 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
         Some(_) => j!({"rows": rows}),
         None => j!({"duplicate": true}),
     })
+}
+
+/// What `record` says of rows whose columns (`given`, as their node typed them) aren't the table's. 40001, as a move's, when
+/// the table can have changed under them: a column added, dropped or retyped while they were written, so they are written
+/// again (the words say so too, since a node that sent them reads the code from them). But a type this node doesn't read
+/// is no move: the node that wrote them names types otherwise (another version), and run again its INSERT would be
+/// refused the same way forever, so it is XX000, which no client runs again.
+fn unplaced(table: &str, given: &[(String, String)], theirs: String, ours: String) -> anyhow::Error {
+    match given.iter().find(|(_, t)| crate::answer::dtype(t).is_err()) {
+        Some((_, t)) => crate::codes::coded("XX000", format!("the INSERT into {table} was written by a node that names a type {t}, which the leader doesn't read: its rows' columns ({theirs}) aren't the table's ({ours}). Nodes of two versions write together: upgrade them alike")),
+        None => crate::codes::coded("40001", format!("could not serialize the INSERT into {table}: its rows' columns ({theirs}) aren't the table's ({ours}), in order and type, since it changed while they were written. Run it again")),
+    }
 }
 
 /// What `record` says of files written with their rows' system columns once something follows
@@ -2800,6 +2810,19 @@ async fn led(dir: &str, term: u64, req: &mut Option<Request>, node: &Arc<NodeSta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rows whose columns aren't the table's: 40001 where the table can have moved under them, and XX000, never run again,
+    /// where their node names a type the leader doesn't read (11-08 audit L14).
+    #[test]
+    fn rows_unplaced_are_run_again_only_after_a_move() {
+        let col = |n: &str, t: &str| (n.to_string(), t.to_string());
+        let moved = unplaced("t", &[col("a", "Int64")], "a bigint".into(), "a bigint, b text".into());
+        assert_eq!(crate::codes::of(&moved), "40001", "{moved}");
+        assert!(moved.to_string().ends_with("Run it again"), "{moved}");
+        let other = unplaced("t", &[col("a", "Int64"), col("b", "Utf9")], "a bigint, b Utf9".into(), "a bigint, b text".into());
+        assert_eq!(crate::codes::of(&other), "XX000", "{other}");
+        assert!(!other.to_string().contains("Run it again") && other.to_string().contains("Utf9"), "{other}");
+    }
 
     #[test]
     fn a_query_is_a_write_only_as_select_into() {
