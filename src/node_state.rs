@@ -18,6 +18,9 @@ pub struct NodeState {
     /// The clients its calls out are made with, by whom each goes to: its process's host's (`net::install`), or its own.
     #[cfg(feature = "lake")]
     pub net: std::sync::Arc<dyn crate::net::Net>,
+    /// The space it spills into past its memory: its process's host's (`scratch::install`), or this machine's folders.
+    #[cfg(feature = "lake")]
+    pub scratch: std::sync::Arc<dyn crate::scratch::Scratch>,
     /// What its drain refuses and waits for (`drain.rs`).
     pub drain: Drain,
     /// What counts as a use of it, for `--idle-exit` (`idle.rs`).
@@ -32,7 +35,7 @@ impl NodeState {
 
     /// A node's state on a machine of its own (the sim's member: one with little memory, say).
     pub fn on(life: Life, machine: crate::machine::Mach) -> Arc<NodeState> {
-        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), drain: Drain::default(), idle: Idle::default(), began: datafusion::common::instant::Instant::now() })
+        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), drain: Drain::default(), idle: Idle::default(), began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).

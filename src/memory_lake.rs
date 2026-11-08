@@ -142,12 +142,13 @@ type FolderStore = object_store::local::LocalFileSystem;
 #[cfg(target_arch = "wasm32")]
 type FolderStore = InMemory;
 
-/// The folder spilled objects go to: a `Folder` of this process's own, which goes when the lake does.
+/// The folder spilled objects go to: the platform's `"memory"` space (natively a `Folder` of this process's own), which goes
+/// when the lake does.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // (a page's `Disk::make` refuses: none is made there)
 #[derive(Debug)]
 struct Disk {
     store: FolderStore,
-    folder: crate::scratch::Folder,
+    space: crate::scratch::Space,
 }
 
 impl Held {
@@ -301,13 +302,13 @@ impl Inner {
     /// `on_disk` are read after `reserved` (SeqCst): a landing is on disk before its reservation goes, so it is
     /// counted once, in one or the other, never in neither.
     fn claim(&self, disk: &Disk, bytes: u64) -> Result<(), String> {
-        if let Some((free, keep)) = crate::store::short_of_room(&disk.folder.path) {
+        if let Some((free, keep)) = crate::store::short_of_room(&disk.space.dir) {
             return Err(format!("the disk a lake in memory spills to has {} MB free, and a lake keeps {} MB", free >> 20, keep >> 20));
         }
         let gb = self.setting();
         let others = gb.map_or(0, |_| crate::store::others_held()); // (the queries' and the shuffles' spills count under the setting only)
         let fits = |reserved: u64| {
-            let room = crate::machine::process().space(&disk.folder.path).map(|(free, total)| (free.saturating_sub(reserved), total));
+            let room = crate::machine::process().space(&disk.space.dir).map(|(free, total)| (free.saturating_sub(reserved), total));
             crate::store::piece_fits(gb, others + self.spilled.on_disk.load(SeqCst) + reserved, bytes, room)
         };
         self.spilled
@@ -405,9 +406,9 @@ impl Disk {
     /// A lake's spill folder, made on the first object that spills.
     #[cfg(not(target_arch = "wasm32"))]
     fn make() -> object_store::Result<Disk> {
-        let folder = crate::scratch::Folder::make("memory").map_err(spill_failed)?;
-        let store = FolderStore::new_with_prefix(&folder.path)?;
-        Ok(Disk { store, folder })
+        let space = crate::scratch::process().space("memory").map_err(spill_failed)?;
+        let store = FolderStore::new_with_prefix(&space.dir)?;
+        Ok(Disk { store, space })
     }
 
     /// A page's lake in memory doesn't spill: it has no folder, so a write past its budget is refused here, where a node
@@ -674,7 +675,7 @@ mod tests {
         let path = {
             let h = Held::with_budget(0); // every file spills at once
             h.put(&Path::from("data/t/a"), bytes(1)).await.unwrap();
-            let path = h.0.tier.get().unwrap().folder.path.clone();
+            let path = h.0.tier.get().unwrap().space.dir.clone();
             assert!(path.join(crate::scratch::LOCK_FILE).exists());
             path
         };
