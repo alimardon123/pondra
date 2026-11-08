@@ -726,8 +726,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lif
     crate::memory_lake::give(&url, store);
     let store = crate::memory_lake::store(&url);
     let node = node.trim_end_matches('/').to_string();
-    crate::dial::set_page(node.clone(), auth.to_string()); // (the page's calls go to this node, with this sign-in: `dial::Paged`)
-    let members: Arc<dyn Members> = Arc::new(crate::members::Joined::new(&node));
+    let members: Arc<dyn Members> = Arc::new(crate::members::Joined::new(&node, auth)); // (the page's calls go to this node, with this sign-in: `dial::Joined`)
     let kv: Arc<dyn crate::kv::Kv> = Arc::new(crate::kv::remote::Remote::new(&node, auth));
     let marks = crate::panics::task(async {}); // (a joined page claims no term, so it runs no mark: this task is finished)
     let start = Start::default();
@@ -741,7 +740,9 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lif
     match made {
         Ok(app) => {
             let (superuser, slug) = whoami(&node, auth).await; // (the sign-in's: a superuser's joins stage their rows, `page::joined_part`)
-            crate::dial::set_page_slug(slug);
+            if let (Some(slug), Some(joined)) = (slug, app.members.joined()) {
+                joined.set_slug(slug);
+            }
             let (following, refreshing) = (Arc::downgrade(&app.lake), Arc::downgrade(&app.lake));
             let (http, auth) = (app.lake.node.net.client(crate::net::Policy::ENDPOINT), auth.to_string()); // (the join's sign-in alone: no token of ours)
             let ended = Arc::new(AtomicBool::new(false)); // (the sign-in ended: neither loop asks again)
@@ -762,7 +763,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lif
                 })
             };
             let follow = panics::spawn(crate::members::follow(following, open, |_, _| {}, || {}, false)); // (a page relays nothing: its node's feed is its stream)
-            panics::spawn(crate::page_records::run()); // (the page's own statements go to this node each second: `abort_all` ends it)
+            panics::spawn(crate::page_records::run(&app)); // (the page's own statements go to this node each second: `abort_all` ends it)
             panics::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -809,8 +810,8 @@ impl Paged {
     /// Asks the node again whether the sign-in is a superuser's, after it refused a staged write with a 403 (`page::own_answer`):
     /// a user demoted since the join takes the page's own INSERTs no more, and they go whole to the node.
     pub async fn ask_superuser_again(&self) {
-        if let Some((node, auth)) = crate::dial::page_node() {
-            self.superuser.store(whoami(&node, &auth).await.0, SeqCst);
+        if let Some(joined) = self.app.members.joined() {
+            self.superuser.store(whoami(joined.node(), joined.auth()).await.0, SeqCst);
         }
     }
 
@@ -833,9 +834,9 @@ impl Paged {
     /// Ends the page's member (`end_page`), so another `open_page` starts afresh.
     pub async fn close(self) {
         let Paged { app, url, term, marks, follow, .. } = self;
+        let _ = tokio::time::timeout(Duration::from_secs(2), crate::page_records::flush(&app)).await; // (what the page's statements wait to go to its node: once, within 2 s)
         let lake = app.lake.clone();
         drop(app);
-        let _ = tokio::time::timeout(Duration::from_secs(2), crate::page_records::flush()).await; // (what the page's statements wait to go to its node: once, within 2 s)
         end_page(marks, follow, Some(lake.clone()), &lake.store, term, &url).await;
     }
 }

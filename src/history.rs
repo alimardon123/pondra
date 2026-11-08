@@ -323,7 +323,7 @@ struct Line {
 /// keeps the row with the sign-in's name (`page_ended`).
 pub fn ended(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note) {
     if !app.members.keeps_records() {
-        return crate::page_records::add(sql, outcome, error, took);
+        return crate::page_records::add(&app.lake, sql, outcome, error, took);
     }
     record(app, class, sql, outcome, error, took, note, false)
 }

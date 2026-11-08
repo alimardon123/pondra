@@ -104,8 +104,11 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             passes.add(p);
         }
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "functions", columns: FUNCTION_COLUMNS, rows: functions });
-        #[cfg(feature = "lake")] // (what a lake keeps for the engine's doors: the answers kept for their pages, `lake_state.rs`)
-        r.section_mut::<crate::lake_state::Registered>().add::<crate::pages::Pages>();
+        #[cfg(feature = "lake")] // (what a lake keeps for the engine's doors: the answers kept for their pages, and a joined page's unsent statements, `lake_state.rs`)
+        {
+            r.section_mut::<crate::lake_state::Registered>().add::<crate::pages::Pages>();
+            r.section_mut::<crate::lake_state::Registered>().add::<crate::page_records::Unsent>();
+        }
         #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)
         for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,
                   crate::runs::PREFIXES, crate::tasks::PREFIXES, crate::users::PREFIXES, crate::views::PREFIXES] {
