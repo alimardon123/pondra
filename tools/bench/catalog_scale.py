@@ -3,9 +3,9 @@
 100,000 tables before it is changed"). It grows one lake's catalog in steps (1,000, 5,000, 10,000 and
 20,000 tables, each made by CREATE TABLE … AS SELECT: one file each) and at each step measures:
 
-- what one commit reads and writes: `pondra_catalog_records_total` around one INSERT into one table and one
-  CREATE TABLE, the least of five tries, less what reading /metrics reads itself (its per-table rows read every
-  table's record: shown as `metrics_scrape_reads`); a node's own rounds read records too, shown as the idle rate;
+- what one statement reads and writes: `pondra_catalog_records_total` around one INSERT into one table, one SELECT
+  of one table (`select`) and one CREATE TABLE, the least of five tries, less what reading /metrics reads itself
+  (`metrics_scrape_reads`); a node's own rounds read records too, shown as the idle rate;
 - the leader's resident memory;
 - a follower's start (to its first answer), its resident memory once settled, and its first query's latency;
 - the point lookup's p50 and p99 (GET /lookup on a keyed table of 100,000 rows), on the leader and the follower.
@@ -117,10 +117,24 @@ def scrape(port):
     return min(tries)
 
 
+def quiet(port, base, secs=0.3, most=20):
+    """Wait until the node reads nothing of its own for `secs` (its rounds tiering new tables read records while a
+    SELECT, which takes no lock they take, is timed), or `most` looks."""
+    r0, _ = records(port)
+    for _ in range(most):
+        time.sleep(secs)
+        r1, _ = records(port)
+        if r1 - r0 - base[0] <= 0:
+            return
+        r0 = r1
+
+
 def per_commit(port, statement, base):
-    """The records one commit reads and writes: the least of five, less what reading /metrics read (`scrape`)."""
+    """The records one commit reads and writes: the least of five, each in a quiet moment, less what reading /metrics
+    read (`scrape`)."""
     tries = []
     for i in range(5):
+        quiet(port, base)
         r0, w0 = records(port)
         t0 = time.perf_counter()
         sql(port, statement(i))
@@ -189,6 +203,7 @@ try:
         row["metrics_scrape_reads"] = int(base[0])
         row["leader_idle_reads_per_s"] = idle_rate(A.port, base)
         row["commit_insert"] = per_commit(A.port, lambda i: f"INSERT INTO t{(i * 7919) % n:06d} VALUES (-1)", base)
+        row["select"] = per_commit(A.port, lambda i: f"SELECT count(*) FROM t{(i * 104729) % n:06d}", base)  # (a statement's reads: the tables it names)
         row["commit_create"] = per_commit(A.port, lambda i: f"CREATE TABLE probe_{n}_{i} (x BIGINT)", base)
         row["leader_rss_mb"] = rss_settled(leader.pid)
         row["leader_lookup"] = lookups(A.port)
