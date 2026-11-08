@@ -11,8 +11,11 @@
 //! rows as it reads (q95's `ws_wh`, web_sales joined to itself) is cheaper run twice, the joins above it filtering its
 //! scans as they run, than held whole. A held copy takes no filter from above it (a filter the joins above learn as they
 //! run is one use's own), so the copies are found before those are pushed down (`optimize::physical_rules`); and a use
-//! whose join learns such a filter for its grouping keeps its own copy (`keyed`: q23's `frequent_ss_items`). What
-//! doesn't fit in the query's memory goes to disk, as a sort's rows do, and each use reads it from there: one copy runs
+//! whose join learns such a filter for its grouping keeps its own copy (`keyed`: q23's `frequent_ss_items`). The rows
+//! stay held until the plan goes, for each read of them: a read past the uses counted (a plan run again) gets the same
+//! rows, never a second run of the copy. A partition being held is kept where every use finds it: a use dropped
+//! halfway (an anti join whose build side is empty drops its probe side) leaves it to the next. What doesn't fit in the query's memory goes to disk, as a sort's rows do, and
+//! each use reads it from there: one copy runs
 //! every partition, so no use runs its own beside it (a scan's partitions share its files out as they run, and a
 //! partition of a second copy, run alone, would read them all). A plan reset to run again (`fresh`'s kept plans, a
 //! recursive query's rounds) runs each use's own copy, as without this. A spread query's slices (`optimize::spread`)
@@ -255,7 +258,7 @@ fn groups_at_top(p: &Arc<dyn ExecutionPlan>) -> bool {
 }
 
 /// What the uses of one held subplan share: the copy that runs, each partition's rows once a use has run it, and how
-/// many uses there are (`Reuse` counts them). One copy runs every partition, whichever use asks first: a copy's
+/// many uses there are (`Reuse` counts them: shown in the plan). One copy runs every partition, whichever use asks first: a copy's
 /// exchanges run all of their input for any partition of it, so partitions run by two copies would run it twice.
 #[derive(Debug, Default)]
 struct Held {
@@ -275,25 +278,96 @@ impl Held {
 enum Part {
     #[default]
     Unrun,
-    Kept(Rows, usize), // its rows, and how many uses have read them
-    Done,              // every use has read it, and its rows are gone (or its run failed)
+    Running(Box<Running>), // being held: a use that goes away (its join's build side empty) leaves it to the next
+    Kept(Rows),            // its rows, for every use that reads it, until the plan goes
+    Failed(String),        // its run failed, and why: it isn't run again
 }
 
-/// A partition's rows: in the query's memory until the last use has read them, or on disk where they didn't fit.
+/// A partition being held, kept in its slot rather than in the use running it: a use's stream dropped halfway (a join
+/// whose build side is empty drops its probe side's) leaves the copy's stream and the rows so far for the next use to go
+/// on from, and the copy's partition is never run twice.
+struct Running {
+    stream: SendableRecordBatchStream,
+    held: Option<Holding>,
+}
+
+/// What a partition being held has so far.
+enum Holding {
+    Memory { batches: Vec<RecordBatch>, counter: RecordBatchMemoryCounter, reservation: MemoryReservation },
+    Disk(ToDisk),
+}
+
+/// A spill file being written (DataFusion's, which counts it against the query's disk): a batch appends it, and none
+/// finishes the file. (DataFusion doesn't name its type outside its crate.)
+type ToDisk = Box<dyn FnMut(Option<&RecordBatch>) -> Result<Option<Arc<dyn SpillFile>>> + Send>;
+
+impl std::fmt::Debug for Running {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Running")
+    }
+}
+
+impl Running {
+    fn new(stream: SendableRecordBatchStream, p: usize, ctx: &Arc<TaskContext>) -> Running {
+        let reservation = MemoryConsumer::new(format!("ReuseExec[{p}]")).register(ctx.memory_pool());
+        Running { stream, held: Some(Holding::Memory { batches: vec![], counter: RecordBatchMemoryCounter::new(), reservation }) }
+    }
+
+    /// The rest of the partition's rows held: in the query's memory, each buffer counted once (an aggregate gives one
+    /// batch's slices), or on disk once they don't fit. Each step is kept here as it is taken, so this may be dropped at
+    /// any await and taken up again.
+    async fn finish(&mut self, p: usize, ctx: &Arc<TaskContext>) -> Result<Rows> {
+        while let Some(batch) = self.stream.next().await {
+            let batch = batch?;
+            let full = match self.held.as_mut() {
+                Some(Holding::Memory { counter, reservation, .. }) => reservation.try_grow(counter.count_batch(&batch)).is_err(),
+                _ => false,
+            };
+            match self.held.as_mut() {
+                Some(Holding::Memory { batches, .. }) if full => {
+                    let mut file = spill(ctx, self.stream.schema(), p).create_in_progress_file(&format!("ReuseExec[{p}]"))?;
+                    let mut file: ToDisk = Box::new(move |b| match b {
+                        Some(b) => file.append_batch(b).map(|_| None),
+                        None => file.finish(),
+                    });
+                    for b in batches.iter().chain(std::iter::once(&batch)) {
+                        file(Some(b))?;
+                    }
+                    self.held = Some(Holding::Disk(file)); // (the batches held, and their memory, go)
+                }
+                Some(Holding::Memory { batches, .. }) => batches.push(batch),
+                Some(Holding::Disk(file)) => {
+                    file(Some(&batch))?;
+                }
+                None => return Err(DataFusionError::Internal("ReuseExec: a partition held twice".into())),
+            }
+        }
+        Ok(match self.held.take() {
+            Some(Holding::Memory { batches, reservation, .. }) => Rows::Held(Arc::new(Kept { batches, _reservation: reservation })),
+            Some(Holding::Disk(mut file)) => match file(None)? {
+                Some(file) => Rows::Spilled(Arc::new(Spilled(file))),
+                None => Rows::Held(Arc::new(Kept { batches: vec![], _reservation: MemoryConsumer::new("ReuseExec").register(ctx.memory_pool()) })),
+            },
+            None => return Err(DataFusionError::Internal("ReuseExec: a partition held twice".into())),
+        })
+    }
+}
+
+/// A partition's rows: in the query's memory, or on disk where they didn't fit.
 #[derive(Debug, Clone)]
 enum Rows {
     Held(Arc<Kept>),
     Spilled(Arc<Spilled>),
 }
 
-/// A partition's rows, counted in the query's memory until the last use has read them.
+/// A partition's rows, counted in the query's memory while they are held.
 #[derive(Debug)]
 struct Kept {
     batches: Vec<RecordBatch>,
     _reservation: MemoryReservation,
 }
 
-/// A partition's rows on disk (gone with the last use that reads them).
+/// A partition's rows on disk (gone with the plan, and the last read of them).
 struct Spilled(Arc<dyn SpillFile>);
 
 impl std::fmt::Debug for Spilled {
@@ -382,23 +456,28 @@ async fn take(own: Arc<dyn ExecutionPlan>, held: Arc<Held>, p: usize, ctx: Arc<T
     let mut slot = part.lock().await;
     if matches!(*slot, Part::Unrun) {
         let input = held.input.get_or_init(|| own.clone()).clone();
-        *slot = Part::Done; // (until it is held: a run that fails is not run again)
-        *slot = Part::Kept(hold(input.execute(p, ctx.clone())?, p, &ctx).await?, 0);
+        match input.execute(p, ctx.clone()) {
+            Ok(stream) => *slot = Part::Running(Box::new(Running::new(stream, p, &ctx))),
+            Err(e) => {
+                *slot = Part::Failed(e.to_string());
+                return Err(e);
+            }
+        }
     }
-    let uses = held.uses.load(Relaxed).max(1);
-    let rows = match std::mem::take(&mut *slot) {
-        Part::Kept(rows, taken) if taken + 1 < uses => {
-            *slot = Part::Kept(rows.clone(), taken + 1);
-            rows
+    if let Part::Running(run) = &mut *slot {
+        match run.finish(p, &ctx).await {
+            Ok(rows) => *slot = Part::Kept(rows),
+            Err(e) => {
+                *slot = Part::Failed(e.to_string()); // (every other use is told the same: the copy isn't run again)
+                return Err(e);
+            }
         }
-        Part::Kept(rows, _) => {
-            *slot = Part::Done; // (every use has its rows: they go once the last has read them)
-            rows
-        }
-        other => {
-            *slot = other;
-            return Err(DataFusionError::Internal(format!("ReuseExec: partition {p} is gone: its run failed, or each of its {uses} uses has read it")));
-        }
+    }
+    // (every read of it gets the same rows: a plan run again reads them again, and isn't the run that held them)
+    let rows = match &*slot {
+        Part::Kept(rows) => rows.clone(),
+        Part::Failed(why) => return Err(DataFusionError::Execution(format!("{why} (ReuseExec: partition {p}'s run, which its uses share)"))),
+        _ => return Err(DataFusionError::Internal(format!("ReuseExec: partition {p} neither run nor held"))),
     };
     drop(slot);
     match rows {
@@ -408,33 +487,6 @@ async fn take(own: Arc<dyn ExecutionPlan>, held: Arc<Held>, p: usize, ctx: Arc<T
         }
         Rows::Spilled(file) => spill(&ctx, schema, p).read_spill_as_stream(file.0.clone(), None),
     }
-}
-
-/// Partition `p`'s rows, from `stream`: held in the query's memory, each buffer counted once (an aggregate gives one
-/// batch's slices), or on disk once they don't fit.
-async fn hold(mut stream: SendableRecordBatchStream, p: usize, ctx: &Arc<TaskContext>) -> Result<Rows> {
-    let reservation = MemoryConsumer::new(format!("ReuseExec[{p}]")).register(ctx.memory_pool());
-    let mut counter = RecordBatchMemoryCounter::new();
-    let mut batches = vec![];
-    while let Some(batch) = stream.next().await {
-        let batch = batch?;
-        if reservation.try_grow(counter.count_batch(&batch)).is_err() {
-            let mut file = spill(ctx, stream.schema(), p).create_in_progress_file(&format!("ReuseExec[{p}]"))?;
-            for batch in batches.iter().chain(std::iter::once(&batch)) {
-                file.append_batch(batch)?;
-            }
-            drop((batches, reservation));
-            while let Some(batch) = stream.next().await {
-                file.append_batch(&batch?)?;
-            }
-            return Ok(match file.finish()? {
-                Some(file) => Rows::Spilled(Arc::new(Spilled(file))),
-                None => Rows::Held(Arc::new(Kept { batches: vec![], _reservation: MemoryConsumer::new("ReuseExec").register(ctx.memory_pool()) })),
-            });
-        }
-        batches.push(batch);
-    }
-    Ok(Rows::Held(Arc::new(Kept { batches, _reservation: reservation })))
 }
 
 /// Where a partition's rows that don't fit in memory go: the query's disk, as a sort's.
@@ -546,7 +598,8 @@ mod tests {
     }
 
     /// What doesn't fit in the query's memory goes to disk, and every use reads every row from the one copy that ran:
-    /// the second use's own copy (here an empty one) is never run, whichever use asks for a partition first.
+    /// the second use's own copy (here an empty one) is never run, whichever use asks for a partition first. A read
+    /// past the uses counted (a plan run again) gets the same rows, the copy not run again.
     #[tokio::test]
     async fn too_big_to_hold_goes_to_disk() -> Result<()> {
         let ctx = session(Arc::new(RuntimeEnv::default()), true).await?;
@@ -567,14 +620,44 @@ mod tests {
                 for (i, (plan, rows)) in order.into_iter().enumerate() {
                     *rows += plan.execute(p, task.clone())?.try_collect::<Vec<_>>().await?.iter().map(|b| b.num_rows()).sum::<usize>();
                     if i == 0 {
-                        let spilled = matches!(&*held.part(p).try_lock().unwrap(), Part::Kept(Rows::Spilled(_), 1));
+                        let spilled = matches!(&*held.part(p).try_lock().unwrap(), Part::Kept(Rows::Spilled(_)));
                         assert_eq!(spilled, limit < 1 << 20, "memory limit {limit}, partition {p}");
                     }
                 }
             }
             assert_eq!((first, second), (200_000, 200_000), "memory limit {limit}");
-            assert!(held.parts.lock().unwrap().values().all(|p| matches!(*p.try_lock().unwrap(), Part::Done)), "every row read: gone");
-            assert!(one.execute(0, task.clone())?.try_collect::<Vec<_>>().await.is_err(), "a third read is refused, not run again");
+            let mut again = 0;
+            for p in 0..parts {
+                again += two.execute(p, task.clone())?.try_collect::<Vec<_>>().await?.iter().map(|b| b.num_rows()).sum::<usize>();
+            }
+            assert_eq!(again, 200_000, "a third read, memory limit {limit}");
+        }
+        Ok(())
+    }
+
+    /// A use that goes away while its partition is being held (a join whose build side is empty drops its probe side)
+    /// leaves it to the next use, which goes on from where it was: the copy's partitions run once, and every other use
+    /// reads every group.
+    #[tokio::test]
+    async fn a_use_that_goes_away_leaves_its_partition_to_the_next() -> Result<()> {
+        let ctx = session(Arc::new(RuntimeEnv::default()), true).await?;
+        let input = ctx.sql("SELECT item, sum(amount) AS total FROM sales GROUP BY item").await?.create_physical_plan().await?;
+        let parts = input.properties().partitioning.partition_count();
+        let held = Arc::new(Held::default());
+        held.uses.store(3, Relaxed);
+        let task = ctx.task_ctx();
+        let uses: Vec<Arc<dyn ExecutionPlan>> = (0..3).map(|_| Arc::new(ReuseExec { input: input.clone(), held: held.clone() }) as _).collect();
+        for p in 0..parts {
+            let mut gone = uses[0].execute(p, task.clone())?;
+            assert!(futures::poll!(gone.next()).is_pending(), "partition {p}: its exchange's rows not in yet");
+        }
+        assert!(held.parts.lock().unwrap().values().all(|p| matches!(*p.try_lock().unwrap(), Part::Running(_))), "each left halfway");
+        for u in &uses[1..] {
+            let mut groups = 0;
+            for p in 0..parts {
+                groups += u.execute(p, task.clone())?.try_collect::<Vec<_>>().await?.iter().map(|b| b.num_rows()).sum::<usize>();
+            }
+            assert_eq!(groups, 1000);
         }
         Ok(())
     }

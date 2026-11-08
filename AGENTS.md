@@ -3176,7 +3176,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    scan Pondra doesn't know is alike only to itself), and wraps each that groups, joins or windows and gives a small part of what it reads (an eighth at
    most, or a grouping at its top) in a `ReuseExec`: the first use to run a partition runs the one copy and holds its
    rows, counted in the query memory (each buffer once: an aggregate gives one batch's slices), and every use reads
-   them; past the memory they go to disk and every use reads them there. No use runs its own copy beside the one that
+   them, until the plan goes (a read past the uses counted, a plan run again, gets the same rows); past the memory
+   they go to disk and every use reads them there. A partition being held is kept in its slot, not in the use running
+   it: a use dropped halfway (an anti join whose build side is empty drops its probe side) leaves it to the next use,
+   which goes on from there, and a run that fails tells every use why. No use runs its own copy beside the one that
    ran (a scan's partitions share its files out as they run, so one partition of a second copy, run alone, reads them
    all, and an exchange gives each partition out once). A plan reset to run again (`fresh`'s kept plans, a recursive
    query's rounds) drops its `ReuseExec`s and runs each use's own copy. A held copy takes no dynamic filter from above, so a use on a hash join's probe side whose grouping the join's
