@@ -334,9 +334,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   other types go to DataFusion's. **`avg` over a DECIMAL is rounded at its last place** (`avg.rs`),
   where DataFusion's cut it off. **`var`, `stddev` and `avg` over DOUBLE are order-independent too** (`fvar.rs`): their
   state is the count and fsum's sums of the values and of their squares (each square split exactly in two), worked out
-  once at the end in double-double; a group of one value answers 0. Over a cast of 32-bit or smaller integers (an
-  INTEGER column's) the sums are kept as exact i128s (`fvar::Wholes`), as quick as a plain sum, in the same state
-  columns. DISTINCT, and windows whose frames slide, stay DataFusion's.
+  once at the end in double-double; a group of one value answers 0. Integers of 32 bits or fewer are taken as they
+  are, not cast to DOUBLE (`fvar::with_wholes`), and summed as exact i128s (`fvar::Wholes`), their state a count and
+  DECIMAL(38,0) sums (as many columns as DataFusion's own): a plain sum's speed, and no shared cast for CSE to take out
+  below the aggregate. DISTINCT, and windows whose frames
+  slide, stay DataFusion's (whole numbers cast on their way in: `fvar::as_double`).
 - **Rows that change** (round 19, ADR-020, `change.rs`, `sys.rs`). Every row has system columns:
   `_row_id` (stamped as it enters the log or a bulk INSERT's files, from blocks of ids the leader
   hands out as commit numbers: `Ids`, `Flush::reserve`), `_version` (its commit), `_created_at`,
