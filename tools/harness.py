@@ -22389,6 +22389,15 @@ def listings():
     doors = {"HTTP": lambda s, w: as_ann(s), "Postgres": lambda s, w: pg_says(s), "Flight SQL": lambda s, w: flight_says(s), "MCP": lambda s, w: mcp_says(s, "write" if w else "query")}
     routes = {"GET /lookup": lambda t: as_ann("", "GET", f"/lookup/{t}/1"), "POST /append": lambda t: as_ann('{"id": 1, "salary": 2.0}', "POST", f"/append/{t}"),
               "POST /insert": lambda t: as_ann("SELECT 1 AS id, 2.0 AS salary", "POST", f"/insert/{t}"), "Iceberg REST's table": lambda t: as_ann("", "GET", f"/v1/namespaces/default/tables/{t}")}
+    def pg_describe(s):
+        """Postgres's Describe of `s`, prepared and not run (the extended protocol's Parse, then Describe): its columns, or its error."""
+        with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=ann password=ann-password-1 dbname=lake", connect_timeout=10, autocommit=True) as c:
+            r = c.pgconn.prepare(b"d1", s.encode())
+            if r.status == psycopg.pq.ExecStatus.COMMAND_OK:
+                r = c.pgconn.describe_prepared(b"d1")
+            if r.status == psycopg.pq.ExecStatus.COMMAND_OK:
+                return "columns " + ", ".join(r.fname(i).decode() for i in range(r.nfields))
+            return f"{r.error_field(psycopg.pq.DiagnosticField.SQLSTATE).decode()} {r.error_field(psycopg.pq.DiagnosticField.MESSAGE_PRIMARY).decode()}"
     unseen = {}
     for (hidden, gone) in [("hr", "zz_gone"), ("pay", "zz_gone")]:
         same = lambda a, b: re.sub(rf"\b{hidden}\b", "<t>", a) == re.sub(rf"\b{gone}\b", "<t>", b)
@@ -22401,6 +22410,15 @@ def listings():
                 # (Postgres has no SHOW COLUMNS: the port answers it as SHOW of a setting, the same for any table)
                 checks[f"{door}: {what} of {hidden}, which ann holds no privilege on, is answered as of a table that isn't there"] = same(a, b) and "permission denied" not in a \
                     and "salary" not in a and (a != "answered" or (door, what) == ("Postgres", "SHOW COLUMNS"))
+        # (Postgres's Describe of a statement, not run, as the connection's user: it was planned with no sign-in, which
+        # described every table's columns, 11-08 audit M6)
+        for what in ("SELECT *", "a key's row"):
+            if hidden == "pay" and what == "a key's row":
+                continue
+            a, b = pg_describe(statements[what].format(t=hidden)), pg_describe(statements[what].format(t=gone))
+            unseen[f"Postgres Describe, {what}, {hidden}"] = (a, b)
+            checks[f"Postgres's Describe of {what} of {hidden}, which ann holds no privilege on, is answered as of a table that isn't there"] = \
+                same(a, b) and not a.startswith("columns") and "salary" not in a
         if hidden == "hr":
             for route, ask_ in routes.items():
                 a, b = ask_(hidden), ask_(gone)
