@@ -85,6 +85,7 @@ impl tower::Service<http::Request<tonic::body::Body>> for Gate {
             // (a header that isn't text can't be read, and is refused as HTTP refuses it: not taken for no credential)
             let (credential, sent) = (crate::auth::Credential::of_headers(req.headers()), req.headers().contains_key("authorization"));
             let peer = req.extensions().get::<crate::tls::Peer>().copied();
+            let again = Again { credential: credential.clone(), sent, peer }; // (for a call that outlives a change of who may do what: `Again`)
             let who = match sign_in(&app, credential, sent, peer).await {
                 Ok(who) => who,
                 Err(refused) => return Ok(refused.into_http()),
@@ -96,6 +97,7 @@ impl tower::Service<http::Request<tonic::body::Body>> for Gate {
                 req = req.map(|body| tonic::body::Body::new(http_body_util::Limited::new(body, 64 << 10)));
             }
             req.extensions_mut().insert(who);
+            req.extensions_mut().insert(again);
             let answer = tower::Service::call(&mut inner, req).await;
             Ok(answer?.map(|body| tonic::body::Body::new(crate::node_state::kept(body, used))))
         })
@@ -103,6 +105,34 @@ impl tower::Service<http::Request<tonic::body::Body>> for Gate {
 }
 
 const SIGN_IN: &str = "sign in: a token, or a user's name and password (handshake)";
+
+/// What a call signed in with, so a stream that outlives a change of who may do what signs in again (`Principal::stale`:
+/// a REVOKE, a DROP USER, a token revoked, a sign-in that ended), as Postgres's connections and Kafka's do: a DoPut goes on
+/// as whoever that signs in now, or stops (`append`).
+#[derive(Clone)]
+struct Again {
+    credential: crate::auth::Credential,
+    sent: bool,
+    peer: Option<crate::tls::Peer>,
+}
+
+/// `again`'s caller now, if `who` is stale: signed in again, with the rights version read before (so a change meanwhile
+/// is seen at the next batch), or refused, 28000, once it no longer signs in. None while `who` is current, or a token's.
+async fn signed_again(app: &App, who: &crate::auth::Principal, again: &Again) -> Option<Result<crate::auth::Principal, Status>> {
+    if who.operator || !who.stale(&app.lake) {
+        return None;
+    }
+    let epoch = app.lake.cat.rights_version();
+    Some(match sign_in(app, again.credential.clone(), again.sent, again.peer).await {
+        Ok(p) if p.role > Role::None => Ok(crate::auth::Principal { epoch: p.epoch.max(epoch), ..p }),
+        // (signed in before, so whatever stops it now ends its session, as Postgres says it: `pg::signed_again`)
+        _ => {
+            let why = "it can't sign in any more (dropped, NOLOGIN, its password changed, or its token revoked or ended)";
+            crate::audit::refused(app, &who.name, "flight", who.from, "sign in again", why).await;
+            Err(refused("28000", format!("user \"{}\" is signed out: {why}", who.name)))
+        }
+    })
+}
 
 /// The gRPC status of a SQLSTATE (Flight SQL's errors), by its kind (`codes::kind`).
 fn grpc(code: &str) -> tonic::Code {
@@ -668,38 +698,58 @@ fn unhandle(handle: &[u8]) -> (Option<&[u8]>, &[u8]) {
 
 /// Appends batches to `table` through the log, pipelined: each is queued as it arrives and
 /// answered with its ack when committed. `producer` + `first`: batch i is seq `first + i`.
-fn append(app: &App, table: String, producer: String, first: u64, batches: impl Stream<Item = Result<RecordBatch, Status>> + Send + 'static) -> Result<Out<PutResult>, Status> {
+/// Before each batch, a caller whose rights changed signs in again (`again`, `signed_again`) and the
+/// writer is opened again as it is now, so a REVOKE, a DROP USER or a token's end stops a load at its
+/// next batch (`writer.rs`), as it stops a COPY's next chunk and a Kafka client's next request.
+fn append(app: &App, table: String, producer: String, first: u64, batches: impl Stream<Item = Result<RecordBatch, Status>> + Send + 'static, again: Option<Again>) -> Result<Out<PutResult>, Status> {
     let log = app.log.clone().ok_or_else(|| refused("25006", "read-only node"))?;
     if !producer.is_empty() && first == 0 {
         return Err(refused("22023", crate::log::SEQ_FROM_1)); // (0 is "nothing yet": its batch would be taken for a retry)
     }
-    let (app, again, table2) = (app.clone(), log.clone(), table.clone());
-    let who = crate::auth::current(); // (the caller, for its grants in the task below: a task keeps no task-local)
+    let (app, log2, table2) = (app.clone(), log.clone(), table.clone());
+    let mut who = crate::auth::current(); // (the caller, for its grants in the task below: a task keeps no task-local)
     let mut load = crate::writer::Load::new(&app, who.clone(), "Flight DoPut", &table); // (its line in the audit log, as its acks end)
     let (acks_tx, mut acks_rx) = tokio::sync::mpsc::channel::<Result<crate::writer::Queued, Status>>(256);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel(); // (acks are small; a client may read them only at the end)
     crate::panics::task(async move {
         let mut batches = std::pin::pin!(batches);
         // (a rights refusal is said as the writer's scope says it: `shows_code`)
-        let denied_as = |e: anyhow::Error| match &who {
+        let denied_as = |who: &Option<crate::auth::Principal>, e: anyhow::Error| match who {
             Some(w) => crate::auth::WHO.sync_scope(w.clone(), || denied(e)),
             None => denied(e),
         };
         // (a keyed table's rows replace their keys', and rows marked _deleted delete them: S11)
-        let writer = match crate::writer::Writer::open(&app, who.clone(), &table, crate::rules::How::Load, false).await {
+        let opened = |who: Option<crate::auth::Principal>| crate::writer::Writer::open(&app, who, &table, crate::rules::How::Load, false);
+        let opened_or = |who: &Option<crate::auth::Principal>, w: Result<crate::writer::Writer, crate::writer::Refused>| match w {
+            Ok(w) => Ok(w),
+            Err(crate::writer::Refused::Rights(e)) => Err(denied_as(who, e)),
+            Err(_) => Err(refused("42P01", format!("no table {table}"))), // (SQL's names: ADR-022)
+        };
+        let mut writer = match opened_or(&who, opened(who.clone()).await) {
             Ok(w) => w,
-            Err(crate::writer::Refused::Rights(e)) => {
-                let _ = acks_tx.send(Err(denied_as(e))).await;
-                return;
-            }
-            Err(_) => {
-                // (SQL's names: ADR-022)
-                let _ = acks_tx.send(Err(refused("42P01", format!("no table {table}")))).await;
+            Err(e) => {
+                let _ = acks_tx.send(Err(e)).await;
                 return;
             }
         };
         let mut i = 0;
         while let Some(b) = batches.next().await {
+            // (who may do what changed since the last batch: signed in again, and the writer opened again as it is now)
+            if let (Some(w), Some(a)) = (&who, &again) {
+                let now = match signed_again(&app, w, a).await {
+                    None => Ok(None),
+                    Some(Ok(p)) => opened_or(&Some(p.clone()), opened(Some(p.clone())).await).map(|w| Some((p, w))),
+                    Some(Err(e)) => Err(e),
+                };
+                match now {
+                    Ok(None) => {}
+                    Ok(Some((p, w))) => (who, writer) = (Some(p), w),
+                    Err(e) => {
+                        let _ = acks_tx.send(Err(e)).await;
+                        break;
+                    }
+                }
+            }
             let queued = match b {
                 Ok(b) => {
                     // (the batch's rows, shaped for the table: a column it leaves out takes its DEFAULT)
@@ -708,7 +758,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
                     let (seq, prev) = if producer.is_empty() { (0, None) } else { (first + i, (i > 0).then(|| first + i - 1)) };
                     let src = crate::log::Src { producer: producer.clone(), seq, prev };
                     writer.put(crate::rules::Rows::Named(b, left_out), src).await.map_err(|r| match r {
-                        crate::writer::Refused::Rights(e) => denied_as(e),
+                        crate::writer::Refused::Rights(e) => denied_as(&who, e),
                         r => status(anyhow::Error::from(r)),
                     })
                 }
@@ -721,7 +771,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
             i += 1;
         }
     });
-    let (log, table) = (again, table2);
+    let (log, table) = (log2, table2);
     crate::panics::task(async move {
         while let Some(queued) = acks_rx.recv().await {
             let acked = match queued {
@@ -962,6 +1012,7 @@ impl FlightSqlService for Sql {
             Some(schema) if !schema.is_empty() => crate::text::join(schema, &cmd.table), // (ADBC's db_schema_name)
             _ => cmd.table.clone(),
         };
+        let again = req.extensions().get::<Again>().cloned(); // (signed in again as its rights change: `append`)
         let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(stream_status).peekable();
         let mut exists = self.0.lake.cat.meta(&table_key(&table)).await.map_err(status)?.is_some();
         crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(|e| {
@@ -992,7 +1043,7 @@ impl FlightSqlService for Sql {
             let columns: Vec<(String, String)> = schema.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
             crate::write::define(&self.0, &table, &serde_json::json!(columns).to_string()).await.map_err(status)?;
         }
-        let mut acks = append(&self.0, table, String::new(), 0, batches)?;
+        let mut acks = append(&self.0, table, String::new(), 0, batches, again)?;
         let mut rows = 0i64;
         while let Some(ack) = acks.next().await {
             let ack: serde_json::Value = serde_json::from_slice(&ack?.app_metadata).unwrap_or_default();
@@ -1003,6 +1054,7 @@ impl FlightSqlService for Sql {
 
     async fn do_put_fallback(&self, req: Request<PeekableFlightDataStream>, _: Any) -> Result<Response<Out<PutResult>>, Status> {
         allowed(&self.0, &req, Role::Write)?;
+        let again = req.extensions().get::<Again>().cloned(); // (signed in again as its rights change: `append`)
         // A path descriptor: [table] or [table, producer, first seq].
         let mut input = req.into_inner();
         let first = std::pin::Pin::new(&mut input).peek().await.cloned().transpose()?.and_then(|d| d.flight_descriptor);
@@ -1017,7 +1069,7 @@ impl FlightSqlService for Sql {
             denied(e)
         })?; // (the row doors' one check, before a batch is read)
         let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(input.map_err(Into::into)).map_err(stream_status);
-        Ok(Response::new(append(&self.0, table, producer, seq, batches)?))
+        Ok(Response::new(append(&self.0, table, producer, seq, batches, again)?))
     }
 
     async fn get_flight_info_sql_info(&self, q: CommandGetSqlInfo, req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
