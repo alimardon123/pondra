@@ -25,7 +25,7 @@ read. A user who signs in with `POST /login` gets a token of their own, sent the
 | Role | May |
 |---|---|
 | none | the console's page and files, `GET /stats`, `GET /healthz`, `GET /ready`, `POST /login`, `GET /whoami`, `GET /sso` and its sign-in's routes (`/sso/{provider}/start`, `/sso/callback`, `POST /sso/token`), `GET /.well-known/oauth-protected-resource`, `/console/settings`, and a procedure's `GET /secrets/{name}` (its lent token only) |
-| read | run queries (`POST /sql`, `GET /sql/pages/{id}`), look up keys, watch, live queries, read files, end a session, `GET /objects`, `GET /kinds`, `GET /routines`, `GET /metrics`, the projects' `plan`, `test`, `status` and `export`, the Iceberg catalog's reads, MCP's reads, the Delta Sharing door |
+| read | run queries (`POST /sql`, `GET /sql/pages/{id}`), look up keys, watch, live queries, read files, end a session, `GET /objects`, `GET /kinds`, `GET /routines`, `GET /metrics`, `GET /metrics/tables`, the projects' `plan`, `test`, `status` and `export`, the Iceberg catalog's reads, MCP's reads, the Delta Sharing door |
 | write | also append rows, insert, put, restore and delete files, write with `POST /sql`, and commit to the Iceberg catalog |
 | admin | also create tables, views, tasks and functions, `POST /tier`, Python (`/python`, `/sessions/{id}/python`), `GET /functions`, making and dropping databases in a folder of lakes, DDL in `POST /sql` (`CREATE`, `ALTER`, `DROP`, `COPY … TO`), `DO` blocks, and `apply` |
 
@@ -434,7 +434,8 @@ project answers `500`, with the reason.
 | `GET /objects` | read | the lake's objects, and the lakes attached to it, as `{"objects": [...], "files": ...}`. Each object has `catalog`, `schema`, `name` and `kind` (`table`, `view`, `materialized view`, or `files` for [a view of files](/pondra/sql/statements/)); a table adds its `rows`, `bytes`, `files`, `key`, `partition`, `cluster`, `publish`, `not_null` and `defaults`, a view its `sql`. `files` says where the lake's own files are, for `read_csv('…')`. What the console's catalog shows |
 | `GET /kinds` | read | every kind of object, part and pattern, one row each, as [`pondra.kinds`](/pondra/sql/system-tables/#every-object) lists them: `[{"kind", "is", "family", "inside", "statements", "privileges", "on_clone", "in_project", "undrop", "secret", "lists", "about", "also"}]`; a column that doesn't apply is `null`. The [glossary](/pondra/sql/glossary/) says what each one is |
 | `GET /export` | read | the project files that describe this database: a map of path to text, `pondra.toml` and an `objects/` file for each object. `?database=NAME` exports an attached database as this node sees it (`pondra diff` reads it that way) |
-| `GET /metrics` | read | Prometheus metrics, as text |
+| `GET /metrics` | read | Prometheus metrics, as text. A lake's tables are its totals (`pondra_tables`, `pondra_table_files`, `pondra_table_rows`, `pondra_table_bytes`, `pondra_table_entry_bytes`), so a lake of thousands of tables is still a few lines |
+| `GET /metrics/tables` | read | the same table metrics for each table, labelled `table` (and `pondra_table_files` by `where`: `inline` or `sealed`), and `pondra_published_state_bytes` for each table published as Delta or Iceberg (labelled `format`): five lines a table, so scrape it on its own where you want each table's numbers |
 | `POST /tier` | admin | write the log into Parquet now: `{"rows_tiered": N}` |
 | `DELETE /sessions/{id}` | read | end a session: its temporary tables and views go, and so does its Python: `{"ended": true}` (`false` if it had none) |
 | `GET /sessions/{id}/python` | admin | the session's Python (a console page's cells): `{"running", "busy", "variables": [{"name", "type", "size", "look"}], "python": {"python", "version"}}` |

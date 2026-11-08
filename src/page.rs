@@ -95,6 +95,10 @@ pub struct Options {
     /// `node`. A joined page has no `store`. A body that isn't plain text is not routed, so its write fails 25006 on the page.
     /// None: a page of its own.
     pub joined: Option<Join>,
+    /// Where the page's member says its lines (a lake's format moved on, why it stopped), as a node writes them to its log.
+    /// None says them nowhere. `web/` gives none: under Node a page's console is the program's stdout, which a caller reads
+    /// as its own (`web_check.mjs`'s children answer in JSON there). Why a page stopped is in its answers.
+    pub say: Option<fn(&str)>,
 }
 
 /// A page's join of a node (J5b): the node whose lake it follows, and the sign-in it follows it with. A page joins with an
@@ -137,20 +141,6 @@ impl std::fmt::Debug for Join {
 /// The page's live heap bytes, as the program that runs the page reads them (`Options::memory`).
 pub type Memory = Arc<dyn Fn() -> usize + Send + Sync>;
 
-/// A page's machine (`machine::Machine`), installed by its first claim when its program reads its live bytes: its memory
-/// is its device's line, not a machine's (`ram` is None, and 4 GiB is past a 32-bit `usize`), its resident memory the
-/// bytes its program reads, its cores one. (The web platform's, which moves beside the page's other platform parts.)
-#[cfg(target_arch = "wasm32")]
-struct Device(Memory);
-
-#[cfg(target_arch = "wasm32")]
-impl crate::machine::Machine for Device {
-    fn ram(&self) -> Option<usize> { None }
-    fn resident(&self) -> Option<usize> { Some((self.0)()) }
-    fn cores(&self) -> usize { 1 }
-    fn space(&self, _: &std::path::Path) -> Option<(u64, u64)> { None }
-}
-
 /// A page's memory watch: what it reads its live bytes with, and the line past which the query that grew them is stopped
 /// (`oom::polled`). A page's line is set by `PONDRA_MEMORY_MAX_GB`, else by its device (`oom::line_on`).
 struct Watch {
@@ -189,7 +179,7 @@ pub struct Sent {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { store: None, node: None, memory: None, line: None, joined: None }
+        Options { store: None, node: None, memory: None, line: None, joined: None, say: None }
     }
 }
 
@@ -212,6 +202,7 @@ pub struct Page {
     watch: Option<Watch>, // (the page's memory watch: none when the page was given no `memory`, or its line is 0)
     unread: Vec<(String, String)>, // (the kept files `import_kept` couldn't read, each as its path and the words of why)
     joined: Option<Join>, // (the node this page follows, as `Options::joined` gave it: its member is a follower, and its writes go there)
+    say: Option<fn(&str)>, // (where its member says its lines, as `Options::say` gave it)
 }
 
 /// What a request answers, as ADR-061's contract says: a status, its headers (the node's names, in lower case) and its
@@ -410,12 +401,8 @@ impl Page {
             anyhow::ensure!(options.node.is_some(), "a page that joined a node sends its writes to its node: it needs one");
         }
         crate::node::claim_page()?;
-        #[cfg(target_arch = "wasm32")]
-        if let Some(live) = &options.memory {
-            crate::machine::install(Arc::new(Device(live.clone()))); // (the core's watch reads the page's memory as this page's program does: once a process, as its allocator is)
-        }
         let watch = options.memory.as_ref().zip(crate::oom::line_on(options.line)).map(|(live, line)| Watch { live: live.clone(), line });
-        Ok(Page { holds_claim: true, member: Default::default(), store: options.store.clone(), line: options.line, node: options.node.clone(), watch, unread: vec![], joined: options.joined.clone() })
+        Ok(Page { holds_claim: true, member: Default::default(), store: options.store.clone(), line: options.line, node: options.node.clone(), watch, unread: vec![], joined: options.joined.clone(), say: options.say })
     }
 
     /// `claim`, with the member opened now (`open_now`), so an open's error is this call's. A folder kept by 0.35/0.36 in
@@ -451,9 +438,9 @@ impl Page {
                 match &self.joined {
                     Some(j) => {
                         let auth = format!("Bearer {}", j.session);
-                        crate::node::open_joined(j.node(), &auth, Arc::new(crate::joined::Joined::new(j.node(), &auth)), self.line).await
+                        crate::node::open_joined(j.node(), &auth, Arc::new(crate::joined::Joined::new(j.node(), &auth)), self.line, crate::node::PageLife::new(self.say)).await
                     }
-                    None => crate::node::open_page(self.store.clone(), self.line).await,
+                    None => crate::node::open_page(self.store.clone(), self.line, crate::node::PageLife::new(self.say)).await,
                 }
             })
             .await
@@ -482,6 +469,13 @@ impl Page {
         self.member.take().map(|paged| paged.close())
     }
 
+    /// The lifecycle of the page's member, once it has opened: what stops its lake (a joined page's lake moved past this
+    /// build: `format::watch`) or starts it again. tests/page_lake.rs stops a page's lake with it.
+    #[doc(hidden)]
+    pub fn lifecycle(&self) -> Option<crate::lifecycle::Life> {
+        self.member.get().map(|m| m.life.clone() as crate::lifecycle::Life)
+    }
+
     /// `close`, for a build with no core's lake: nothing was opened, so nothing ends.
     /// One request, as a node answers it (ADR-061): `method` and `path` (its query for `format=`, and nothing else
     /// here), the request's `headers` (any case of name) and `body`. Every failure is an answer too, with its SQLSTATE. The
@@ -503,6 +497,10 @@ impl Page {
         }
         if let Err(e) = self.member().await {
             return failed(e);
+        }
+        // (a member whose lake stopped answers how, by its SQLSTATE: 57P03 a restart, which a new page gets past, 57P01 a stop)
+        if let Some((code, words)) = self.member.get().and_then(crate::node::Paged::stopped) {
+            return failed(crate::codes::coded(code, words));
         }
         match (method, route) {
             ("POST", "/sql") => self.lake_sql(query, headers, body).await,

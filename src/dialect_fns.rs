@@ -22,7 +22,7 @@ use std::sync::LazyLock;
 use datafusion::sql::sqlparser::ast::{Expr, ValueWithSpan};
 
 /// Other databases' functions Pondra doesn't have, as (name, whose, what to write). `call` refuses each by name, and
-/// `friendly::wanted` looks for them, so the list is kept in one place.
+/// `friendly`'s look (its `forms` pass) looks for them, so the list is kept in one place.
 pub(crate) const OURS: &[(&str, &str, &str)] = &[
     ("parse_json", "Snowflake", "JSON is text here: payload->>'a', json_extract(payload, '$.a.b')"),
     ("try_parse_json", "Snowflake", "JSON is text here: payload->>'a', json_extract(payload, '$.a.b')"),

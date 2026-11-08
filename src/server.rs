@@ -91,6 +91,7 @@ pub fn router(app: App) -> Router {
         }))
         .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::objects::listed(&app.lake).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
+        .route("/metrics/tables", get(|State(app): State<App>| async move { crate::metrics::tables(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
         .route("/cluster/log", get(feed))
         .route("/cluster/kv", get(kv))
@@ -236,7 +237,7 @@ async fn list_functions(State(app): State<App>) -> Result<Json<Value>, E> {
 /// (a user granted some tables needs the first three to call one, never the body: S27).
 async fn routines_shown(State(app): State<App>) -> Result<Json<Value>, E> {
     let all = crate::routines::listed(&app.lake).await?;
-    if crate::auth::shows_code() {
+    if crate::rights::scope().shows_code() {
         return Ok(Json(j!(*all)));
     }
     let mut hidden = (*all).clone();
@@ -366,7 +367,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let who = who.at("http", from);
     // (a branch's pin: a user granted CLONE may ask for it, and `ddl` lets nothing else of theirs through: ADR-058)
     let pin = req.uri().path() == "/cluster/ddl";
-    let cloning = pin && who.access.as_ref().is_some_and(|a| a.clones().is_some());
+    let cloning = pin && who.scope.clones().is_some();
     if who.role < needed && !cloning {
         return match who.role {
             crate::auth::Role::None if header.is_none() && app.auth.owned() => (StatusCode::UNAUTHORIZED, "this node answers only the program that started it (the shell, connect()): open the console from the link it printed, or start the node with --admin-token to connect other tools").into_response(),
@@ -501,7 +502,7 @@ async fn whoami(State(app): State<App>) -> Json<Value> {
         crate::auth::Role::Read => "read",
         crate::auth::Role::None => "none",
     };
-    Json(j!({"user": p.name, "role": role, "superuser": p.role == crate::auth::Role::Admin && p.access.is_none(), "slug": crate::auth::slug(&p), "open": app.open().await}))
+    Json(j!({"user": p.name, "role": role, "superuser": p.superuser(), "slug": crate::auth::slug(&p), "open": app.open().await}))
 }
 
 /// Followers forward metadata writes to the leader, unchanged. The leader checks the caller's own sign-in (security pass 3,
@@ -639,7 +640,7 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
     let operator = nodes_own(&app).await; // (read now: the stream is polled after this request's scope has ended)
     let header = headers.get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
     let need = crate::auth::Auth::needed("/cluster/log", "GET"); // (a superuser's own sign-in, as `guard` lets it follow the stream)
-    let revoked = until_revoked(app.clone(), operator, header, move |p| p.role >= need && p.access.is_none());
+    let revoked = until_revoked(app.clone(), operator, header, move |p| p.role >= need && p.scope.whole());
     let cat = &app.lake.cat;
     let streamed = operator.then(|| crate::format::Streamed::to(crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
     // (a joined page's tab, which says no format as the nodes' own client does (`cluster::http`), is a use of the node while it
@@ -842,8 +843,8 @@ struct AppendParams {
 /// Body: NDJSON rows, or an Arrow IPC stream (content-type application/vnd.apache.arrow.stream).
 async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
     let start = std::time::Instant::now();
-    let out = append_rows(&app, &name, p, headers, body).await;
-    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
+    let (out, unseen) = crate::rights::noting(append_rows(&app, &name, p, headers, body)).await;
+    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.to_string()), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -893,11 +894,14 @@ struct InsertParams {
 /// the table if missing. With `staged=1` the body is the columns of a joined page's staged rows (`insert_staged`).
 async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, body: String) -> Result<Json<Value>, E> {
     let start = std::time::Instant::now();
-    let out = match p.staged {
-        Some(1) => insert_staged(&app, &name, &p.job, &body).await,
-        _ => insert_rows(&app, &name, p, body).await,
-    };
-    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
+    let (out, unseen) = crate::rights::noting(async {
+        match p.staged {
+            Some(1) => insert_staged(&app, &name, &p.job, &body).await,
+            _ => insert_rows(&app, &name, p, body).await,
+        }
+    })
+    .await;
+    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -1222,12 +1226,12 @@ fn pieces(h: crate::query::Handed, node: &crate::node_state::NodeState) -> Body 
 /// `GET /sql/pages/{id}?from=10000&rows=10000`: more rows of an answer the console was sent
 /// (`pages.rs`), as `typed` has them; with `&format=csv|tsv|ndjson|parquet|xlsx`, every row of it as
 /// a file to download (`render`), not run again. 410 once it is no longer kept (run it again).
-async fn page(Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
+async fn page(State(app): State<App>, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
     let num = |k: &str, or: usize| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(or);
     let (from, rows, format) = (num("from", 0), num("rows", crate::answer::SHOWN).clamp(1, crate::answer::MOST), q.get("format").map(String::as_str).filter(|f| *f != "typed"));
     let got = match format {
-        Some(f) => crate::pages::page(&id, 0, usize::MAX).map(|b| crate::answer::render(&b, Some(f), crate::pages::keep)),
-        None => crate::pages::page(&id, from, rows).map(|b| crate::answer::typed(&b, rows, crate::pages::keep).map(bytes::Bytes::from)),
+        Some(f) => crate::pages::page(&app.lake, &id, 0, usize::MAX).map(|b| crate::answer::render(&b, Some(f), &|rows| crate::pages::keep(&app.lake, rows))),
+        None => crate::pages::page(&app.lake, &id, from, rows).map(|b| crate::answer::typed(&b, rows, &|rows| crate::pages::keep(&app.lake, rows)).map(bytes::Bytes::from)),
     };
     match got {
         Some(Ok(body)) => ([("content-type", crate::answer::content_type(format))], body).into_response(),
@@ -1383,7 +1387,7 @@ impl IntoResponse for E {
 /// An error as a response: its words are the body, its SQLSTATE the `x-pondra-sqlstate` header, and its status the one
 /// its code stands for, unless the caller gives its own (a database server answers its own errors this way too).
 pub fn error_response(status: Option<StatusCode>, e: &anyhow::Error) -> Response {
-    let (mapped, code, told) = crate::codes::answer(e, crate::auth::shows_code()); // (Postgres's SQLSTATE, for any client: ADR-036 §4; the words its caller may see)
+    let (mapped, code, told) = crate::codes::answer(e, crate::rights::scope().shows_code()); // (Postgres's SQLSTATE, for any client: ADR-036 §4; the words its caller may see)
     let status = status.unwrap_or_else(|| StatusCode::from_u16(mapped).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
     (status, [("x-pondra-sqlstate", code)], told).into_response()
 }

@@ -263,7 +263,7 @@ fn located(l: &str) -> Result<String> {
 // ---------------------------------------------------------------- the table they make
 
 /// An error in words for whoever sent the statement, as this caller may see it (`codes::told`).
-pub fn said(e: &anyhow::Error) -> String { crate::codes::told(e, crate::auth::shows_code()) }
+pub fn said(e: &anyhow::Error) -> String { crate::codes::told(e, crate::rights::scope().shows_code()) }
 
 /// Does this table read files on the node's machine? (Such a query stays on it.)
 pub fn local(table: &str) -> bool { spec(table).is_some_and(|s| s.format == "share" || s.urls.iter().any(|u| scheme(u).is_none_or(|s| s == "file"))) } // (a share's links: as its node got them)
@@ -403,7 +403,7 @@ fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
 /// lend: the caller needs no USAGE on it.
 pub(crate) fn through(u: &str, privilege: &str) -> Result<()> {
     let name = crate::connections::named_in(u).unwrap_or_default();
-    ensure!(owner() || crate::auth::limited().is_none_or(|a| a.may_use("connection", name, privilege)),
+    ensure!(owner() || crate::rights::scope().may_use("connection", name, privilege),
         crate::codes::coded("42501", format!("'@{name}/…': {privilege} on connection {name} isn't granted to this user (an admin grants it: GRANT {privilege} ON CONNECTION {name} TO …)")));
     Ok(())
 }
@@ -805,7 +805,38 @@ fn attached_key(n: &str) -> String { format!("o/{n}") }
 pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "o/", owner: "ext", holds: "a database attached from another engine's catalog (attached_key)" }];
 
 pub async fn attached(lake: &Lake) -> Result<Vec<(String, Attached)>> {
-    Ok(lake.cat.scan::<Attached>("o/", "o0").await?.into_iter().map(|(k, a)| (k[2..].to_string(), a)).collect())
+    let mut all: Vec<(String, Attached)> = lake.cat.scan::<Attached>("o/", "o0").await?.into_iter().map(|(k, a)| (k[2..].to_string(), a)).collect();
+    for (_, a) in all.iter_mut().filter(|(_, a)| a.connection.is_some()) {
+        // (attached over a connection: its url and options as the connection has them now, ALTER CONNECTION's too)
+        let Some(d) = lake.cat.get::<crate::connections::Definition>(&crate::connections::key(a.connection.as_deref().unwrap_or_default())).await? else { continue };
+        let (url, options) = of_connection(&d);
+        let declared = crate::connections::find(&d.ty).map(|t| t.option_names()).unwrap_or_default();
+        a.url = url.trim_end_matches('/').to_string();
+        a.options.retain(|k, _| !declared.contains(&k.as_str())); // (what ATTACH added, a share's token, stays)
+        a.options.extend(options);
+    }
+    Ok(all)
+}
+
+/// A connection's url and its other options, as ATTACH takes them (text).
+fn of_connection(d: &crate::connections::Definition) -> (String, BTreeMap<String, String>) {
+    let text = |v: &serde_json::Value| v.as_str().map_or_else(|| v.to_string(), str::to_string);
+    let url = d.options.get("url").map(text).unwrap_or_default();
+    (url, d.options.iter().filter(|(k, _)| *k != "url").map(|(k, v)| (k.clone(), text(v))).collect())
+}
+
+/// The databases attached over the connection `name` (`ATTACH name`), by their names here.
+pub async fn attached_over(lake: &Lake, name: &str) -> Result<Vec<String>> {
+    Ok(lake.cat.scan::<Attached>("o/", "o0").await?.into_iter().filter(|(_, a)| a.connection.as_deref() == Some(name)).map(|(k, _)| k[2..].to_string()).collect())
+}
+
+/// Leader: `ATTACH shop [AS name]`, a connection's tables as a database: checked as ATTACH 'url' … (TYPE t, …) is, with the
+/// connection's type, url and options, and read through the connection from then on (`attached`).
+pub async fn attach_connection(lake: &Lake, name: &str, connection: &str) -> Result<serde_json::Value> {
+    let d: crate::connections::Definition = lake.cat.get(&crate::connections::key(connection)).await?
+        .ok_or_else(|| crate::codes::coded("42704", format!("no connection {connection}: ATTACH {connection} attaches a connection's tables (CREATE CONNECTION {connection} TYPE delta WITH (url = '…'))")))?;
+    let (url, options) = of_connection(&d);
+    attach_as(lake, name, &url, &d.ty, options, Some(connection)).await
 }
 
 /// Is this attached as another engine's tables?
@@ -822,6 +853,10 @@ pub async fn outside_target(lake: &Lake, name: &str) -> Result<Option<String>> {
 
 /// Leader: keep an attachment of another engine's tables.
 pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>) -> Result<serde_json::Value> {
+    attach_as(lake, name, url, kind, options, None).await
+}
+
+async fn attach_as(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>, connection: Option<&str>) -> Result<serde_json::Value> {
     crate::ddl::check(name)?;
     // (its TYPE and its options are a connection type's, from the registry: ATTACH and CREATE CONNECTION list the same ones)
     use crate::connections::attached as attachable;
@@ -868,7 +903,7 @@ pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTr
         let found = list(lake).await?.into_iter().find(|(n, _)| n == secret).with_context(|| format!("no secret {secret}"))?;
         ensure!(covering(&[found.clone()], &at).is_some(), "secret {secret}'s SCOPE doesn't cover {at} (CREATE OR REPLACE SECRET {secret} (…, SCOPE '{at}'))");
     }
-    let a = Attached { kind: kind.into(), url: url.trim_end_matches('/').into(), options };
+    let a = Attached { kind: kind.into(), url: url.trim_end_matches('/').into(), options, connection: connection.map(str::to_string) };
     if let Some(had) = lake.cat.get::<Attached>(&attached_key(name)).await? {
         ensure!(had.url == a.url && had.kind == a.kind, "{name} is attached already, to {}", had.url);
         return Ok(serde_json::json!({"attached": name, "unchanged": true}));
@@ -1121,6 +1156,22 @@ fn attach_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Optio
     let usage = "ATTACH 's3://bucket/tables' AS name (TYPE delta), or ATTACH 'https://catalog' AS name (TYPE iceberg)";
     let _ = p.parse_keyword(Keyword::DATABASE);
     let _ = p.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+    if matches!(p.peek_token().token, Token::Word(_)) {
+        // (`ATTACH shop [AS name]`: a connection's tables, by its name)
+        let connection = crate::text::ident(&p.parse_identifier().ok()?);
+        let name = match p.parse_keyword(Keyword::AS) {
+            true => match p.parse_identifier() {
+                Ok(n) => crate::text::ident(&n),
+                Err(_) => return Some(crate::write::Stmt::Invalid(format!("ATTACH {connection} AS name"))),
+            },
+            false => connection.clone(),
+        };
+        while p.consume_token(&Token::SemiColon) {}
+        if p.peek_token().token != Token::EOF {
+            return Some(crate::write::Stmt::Invalid(format!("ATTACH {connection} [AS name]: a connection's options are its own (ALTER CONNECTION {connection} SET (…))")));
+        }
+        return Some(crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::AttachOutside { name, url: String::new(), kind: String::new(), options: BTreeMap::new(), connection: Some(connection) }]));
+    }
     let url = p.parse_literal_string().ok()?;
     let _ = p.parse_keyword(Keyword::AS);
     let name = p.parse_identifier().ok()?.value.to_lowercase();
@@ -1168,7 +1219,7 @@ fn attach_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Optio
         options.insert("token".into(), token.to_string());
         url = endpoint.to_string();
     }
-    Some(crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::AttachOutside { name, url, kind, options }]))
+    Some(crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::AttachOutside { name, url, kind, options, connection: None }]))
 }
 
 /// `COPY (query) TO 'url' (FORMAT parquet, PARTITION_BY (a, b), HEADER true, DELIMITER ';')` or
@@ -1437,7 +1488,7 @@ pub async fn list(lake: &Lake) -> Result<Vec<(String, Secret)>> {
 
 /// May the request being served use this secret? Its own temporary one, or one a user is granted
 /// USAGE on (`GRANT USAGE ON SECRET`); a token's or a superuser's, any but a key lent to read a base.
-pub(crate) fn usable(name: &str, s: &Secret) -> bool { !s.lent && (s.temporary || crate::auth::limited().is_none_or(|a| a.secret(name))) }
+pub(crate) fn usable(name: &str, s: &Secret) -> bool { !s.lent && (s.temporary || crate::rights::scope().secret(name)) }
 
 /// The secret for a URL: the longest scope that is a prefix of it (no scope: every URL of its
 /// type's schemes).
@@ -1847,7 +1898,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-own-stage-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let stage = format!("{}/stage", lake.url.trim_end_matches('/'));
-        let ali = crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Write, access: None, door: "http", from: None, operator: false, epoch: 0, until: None };
+        let ali = crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Write, scope: Default::default(), door: "http", from: None, operator: false, epoch: 0, until: None };
         assert!(!own_stage(&lake, &format!("{stage}/616c69/j1/*.parquet")), "with no sign-in, none");
         crate::auth::WHO
             .scope(ali, async {

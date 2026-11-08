@@ -15,8 +15,8 @@ later. Nothing could read the table as of an earlier commit. The data was mostly
 ## Decision
 
 **1. Retention per table.** `WITH (retention = '7 days')` sets how long a table's past is kept, and
-`ALTER TABLE … SET (retention = …)` changes it (`TableMeta::retention_secs`). The default is a day,
-as Snowflake's. `'0 seconds'` keeps nothing.
+`ALTER TABLE … SET (retention = …)` changes it (`TableMeta::retention_secs`). The default is 7 days,
+as Delta keeps a table's old files (a day, Snowflake's, until 2026-11-08). `'0 seconds'` keeps nothing.
 
 **2. `DROP TABLE` keeps the table; `UNDROP TABLE` brings it back.**
 
@@ -70,7 +70,7 @@ made (`past_from`). An `AT` clone is `CREATE TABLE c AS SELECT * FROM t AT (…)
 ## Consequences
 
 - A `DROP TABLE` costs a tiering of the table's log rows (usually none: tiering runs every 10 s).
-- A dropped table's files stay a day longer than before, as they do in Snowflake.
+- A dropped table's files stay 7 days longer than before (its retention), unless the table says otherwise.
 - A table made under the name of one still kept gets a folder of its own (`name__2`), as a table
   made under a renamed one's old name already did.
 - Old lakes need nothing new. A dropped table's entry is a new catalog prefix, `dt/`, which older

@@ -293,7 +293,7 @@ Memory under saturation is bounded by how many rows may wait in the log for tier
 | 500,000 | 33,000 events a second | 18 ms / 36 ms | 0.35 GB |
 
 Lower it for less memory and lower latency. Raise it to absorb longer bursts. Queries and the caches have
-one budget, `--memory-gb` (unset: a third of the machine's memory for queries), and sorts, aggregations and joins
+one budget, `--memory-gb` (unset: 72% of the machine's memory, the caches giving way to queries), and sorts, aggregations and joins
 that need more than the caches can give back spill to disk.
 
 ## More than one machine

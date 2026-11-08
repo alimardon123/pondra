@@ -1843,6 +1843,9 @@ pub struct Lake {
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
     pub groups: Arc<crate::serve::Groups>,     // decoded row groups for key lookups
     pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
+    pub(crate) manifests: Arc<crate::manifest::Kept>, // its tables' manifests and lists, decompressed (`manifest::object`)
+    pub(crate) format: crate::format::Held, // what this process holds of its format: made here, what `raise` saw (`format.rs`)
+    states: crate::lake_state::States, // what engine and extension modules keep for it, by type (`state`)
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
     cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
     pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
@@ -1862,15 +1865,17 @@ impl std::fmt::Debug for Lake {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "Lake({})", self.url) }
 }
 
-/// How much memory queries may use on this node (`PONDRA_MEMORY_GB`, else a third of RAM). Past
-/// it, sorts, aggregations and joins spill to temporary files, or the query stops with an error:
-/// a query never takes the node down. (A third, not half: what DataFusion counts here is the big
-/// hash tables and sort buffers, not the Parquet decoding and the batches in flight around them,
-/// so the node's own memory runs ahead of this number.) The queries and the caches fit one whole
-/// line together (`whole_line`): `PONDRA_MEMORY_GB` itself when it is set.
+/// How much memory queries may use on this node: `PONDRA_MEMORY_GB`, else the whole line they share with the caches
+/// (`whole_line`: the memory watch's trim line, 72% of RAM on a machine of 3 GB or more), as DuckDB's `memory_limit` is 80%
+/// of RAM by default. Past it, sorts, aggregations and joins spill to temporary files, or the query stops with an error: a
+/// query never takes the node down. A grow past what the caches leave takes their bytes back first: the caches give way
+/// to the queries. What the reservations don't count (the Parquet decoding and the batches in flight around the big hash
+/// tables and sort buffers, `array_agg`) runs in the room between the trim line and the stop line, with the watch and its
+/// once-more-holding-less retry behind it. (A third of RAM, before, left room the caches took anyway, and spilled TPC-DS
+/// q67's last aggregation 8 times at SF10 on 15 GB: 12.6 s, against 5.7 s at 10 GB and DataFusion's 6.3 s.)
 #[cfg(not(target_arch = "wasm32"))]
 pub fn memory_limit() -> usize {
-    crate::env::query_memory(|| crate::machine::process().ram().map_or(4 << 30, |r| r / 3))
+    crate::env::query_memory(|| Some(whole_line()).filter(|&w| w < usize::MAX).unwrap_or(4 << 30))
 }
 
 crate::per_node!(
@@ -1897,9 +1902,10 @@ fn lake_pool() -> Arc<crate::ledger::LakePool> {
     ledger.pool()
 }
 
-/// The whole line a node's queries and caches share (`ledger::Ledger`): `PONDRA_MEMORY_GB` when it is set, which is then
-/// the queries' line too, and a spiller it has no room for spills; else the memory watch's trim line (`oom::trim_line`),
-/// past which a grow takes cache bytes back and goes on within its share; none (`usize::MAX`) where neither is known.
+/// The whole line a node's queries and caches share (`ledger::Ledger`), which is the queries' line too (`memory_limit`):
+/// `PONDRA_MEMORY_GB` when it is set, and a spiller it has no room for spills; else the memory watch's trim line
+/// (`oom::trim_line`), past which a grow takes cache bytes back and goes on within its share; none (`usize::MAX`) where
+/// neither is known.
 fn whole_line() -> usize {
     crate::env::memory_whole().or_else(crate::oom::trim_line).unwrap_or(usize::MAX)
 }
@@ -2360,15 +2366,14 @@ impl Lake {
         let (torn, cat) = tokio::join!(async { if check_torn { crate::memory::refuse_torn(&store, &url).await } else { Ok(()) } }, opening);
         torn?;
         let cat = cat?;
-        crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
+        let format = crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory, node.machine.ram())), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), node });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory, node.machine.ram())), manifests: crate::manifest::kept(), format, states: Default::default(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), node });
         for (name, cache) in lake.caches() {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
         ledger.charge("facts", Arc::downgrade(&crate::query::facts_kept())); // (the node's, charged once whatever lakes it opens)
-        ledger.charge("manifests", Arc::downgrade(&crate::manifest::kept())); // (the node's too: see `node::start_app` for the rest)
         ledger.charge("files", Arc::downgrade(&crate::cache::outside())); // (the process's, of files outside the lakes)
         crate::oom::wake();
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
@@ -2400,9 +2405,9 @@ impl Lake {
             }
         });
         while let Some((handle, d, done, sent)) = writes.recv().await {
-            let t = commit_stage("queued", sent);
             let Some(lake) = me.upgrade() else { return };
             let cat = &lake.cat;
+            let t = cat.stage("queued", sent);
             let need = cat.replicas.saturating_sub(1);
             if need > 0 {
                 cat.send(Frame::Change(d.clone())); // followers keep it and say so
@@ -2426,7 +2431,7 @@ impl Lake {
                     _ = acked.changed() => {}
                 }
             }
-            let t = commit_stage("durable", t);
+            let t = cat.stage("durable", t);
             if need == 0 {
                 cat.send(Frame::Change(d.clone()));
             }
@@ -2435,7 +2440,7 @@ impl Lake {
             cat.send(Frame::Committed(d.id));
             let _ = to_bucket.send((handle, d.id));
             let _ = done.send(());
-            commit_stage("applied", t);
+            cat.stage("applied", t);
         }
     }
 
@@ -2652,13 +2657,17 @@ impl Lake {
         Some(self.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>()?.ledger())
     }
 
+    /// What module `P` keeps for this lake (`lake_state.rs`): made the first time it is asked for, charged to the lake's
+    /// line when it is a cache, and stopped when the lake goes. Refused when no extension of this build registered `P`.
+    pub(crate) fn state<P: crate::lake_state::LakeState>(&self) -> Result<Arc<P>> { self.states.get(self.ledger()) }
+
     /// This lake's caches, each by the name `/metrics` gives it, in the order they give memory back when the node needs it
     /// (`ledger::Charged`; each is charged to the lake's line as it opens). The hot columns go first, decoded again from
     /// the files when they are read; then the row groups for lookups and the tables' tails, read again from the files and
     /// the log; then the bucket's byte ranges, fetched again. The log's decoded rows, the catalog's blocks and DataFusion's
     /// footers and statistics keep what they hold by rules of their own, and say what that is.
     pub fn caches(&self) -> Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> {
-        let mut caches: Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> = vec![("hot", self.hot.clone()), ("lookups", self.groups.clone()), ("tails", self.tails.clone())];
+        let mut caches: Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> = vec![("hot", self.hot.clone()), ("lookups", self.groups.clone()), ("tails", self.tails.clone()), ("manifests", self.manifests.clone())];
         if let Some(ranges) = &self.cached {
             caches.push(("ranges", ranges.clone())); // (a lake on a bucket: a local or in-memory one reads its store directly)
         }
@@ -2945,9 +2954,12 @@ impl<T> Parsed<T> {
         same_bytes(held, raw).then(|| m.clone())
     }
 
-    /// Keeps `m`, parsed from `raw`, unless it alone is charged more than the byte bound.
+    /// Keeps `m`, parsed from `raw`, unless it alone is charged more than the byte bound. It keeps its own copy of `raw`: the
+    /// bytes may be a slice of a larger buffer (on a follower, a frame of its leader's commit stream; on a leader, a block the
+    /// store read), and a kept slice holds that whole buffer for as long as the entry lives, far past its charge. Its
+    /// followers' memory grew ~1.7 MB a minute on the 11-07 soak days, by ~17 KB of frame buffer per segment entry kept.
     fn put(&mut self, key: &str, raw: &Bytes, m: &Arc<T>) {
-        let _ = self.by_key.put(key.to_string(), (raw.clone(), m.clone()), (self.charge)(raw.len()));
+        let _ = self.by_key.put(key.to_string(), (Bytes::copy_from_slice(raw), m.clone()), (self.charge)(raw.len()));
     }
 }
 
@@ -2960,9 +2972,8 @@ impl<T: Send + Sync> crate::ledger::Charged for Mutex<Parsed<T>> {
     fn gives_back(&self) -> bool { true }
 }
 
-/// Whether two buffers hold the same bytes. A buffer held by `Parsed` is never freed, and `Bytes` never
-/// change, so the same start and length is the same content; any other pair is compared, which is cheap
-/// next to a parse.
+/// Whether two buffers hold the same bytes. `Bytes` never change, so the same start and length is the same content; any
+/// other pair is compared, which is cheap next to a parse (`Parsed` keeps its own copy, so a lookup compares).
 fn same_bytes(a: &Bytes, b: &Bytes) -> bool {
     (a.as_ptr() == b.as_ptr() && a.len() == b.len()) || a == b
 }
@@ -3087,12 +3098,15 @@ pub struct Catalog {
     follows: bool,                // follower / read-only node that gets the commit stream
     mirror: AtomicBool,           // the overlay holds the whole catalog (but inline data): read only it
     loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
-    rights: AtomicU64,            // the last commit that changed who may do what (`RIGHTS`, `rights_version`)
+    rights: AtomicU64,            // the last commit that changed who may do what (`moves_rights`, `rights_version`)
+    marks: Option<&'static crate::records::Rights>, // the prefixes that do, as the registry has them: read once, here
     metas: Arc<Mutex<Parsed<TableMeta>>>, // tables' entries as parsed (`parsed`)
     segs: Arc<Mutex<Parsed<Segment>>>,    // log segments' entries as parsed (`segments`)
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
     closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
     life: Life,                   // what a fence restarts: its lake's (`fatal`)
+    stages: Arc<Stages>,          // where its commits spend their time, with `PONDRA_TRACE_COMMIT` (`stage`)
+    written: Mutex<Vec<(&'static str, Instant, std::collections::HashSet<String>)>>, // each round that follows the tables committed (`written`): its last read of them all, and the ones since
 }
 
 /// A scan in progress: the streamed changes it may still lay over its (older) view stay.
@@ -3111,7 +3125,7 @@ impl Drop for Pin<'_> {
 }
 
 type Recent = Arc<Mutex<(VecDeque<(Instant, Frame)>, usize)>>;
-type Write = (Arc<dyn Written>, Arc<Delta>, oneshot::Sender<()>, Instant); // (when it was handed to `commits`: `commit_stage`)
+type Write = (Arc<dyn Written>, Arc<Delta>, oneshot::Sender<()>, Instant); // (when it was handed to `commits`: `Catalog::stage`)
 
 /// One committed catalog write.
 pub struct Delta {
@@ -3133,13 +3147,13 @@ impl Delta {
 /// A commit's key that says nothing a read sees changed (retention's marks: `tier::expire`).
 pub const QUIET: &str = "quiet";
 
-/// The keys a principal is made from: users, roles, their grants, passwords and tokens (`users::user_key`), identity
-/// providers (`sso::key`), the lake's own signing keys (`users::KEYS`) and its mark of being served with tokens
-/// (`users::SIGNED`). A commit that puts or deletes one moves the rights version (`Catalog::rights_version`).
-const RIGHTS: [&str; 4] = ["u/", "ip/", "z/auth", "z/signed"];
-
-/// Does a commit change who may do what (`RIGHTS`)?
-fn moves_rights(d: &Delta) -> bool { d.puts.iter().map(|(k, _)| k).chain(&d.deletes).any(|k| RIGHTS.iter().any(|r| k.starts_with(r))) }
+/// Does a commit change who may do what? It does when it puts or deletes a key a principal is made from, which its owner
+/// marks as it registers its prefix (`records::Rights`): this floor names none of them. The rights version moves then
+/// (`Catalog::rights_version`). `marks` are the registry's, which the catalog reads once, as it is made: the registry
+/// never changes once built, so a commit checks a short list and never looks in the registry.
+fn moves_rights(marks: Option<&crate::records::Rights>, d: &Delta) -> bool {
+    marks.is_some_and(|m| d.puts.iter().map(|(k, _)| k).chain(&d.deletes).any(|k| m.moves(k)))
+}
 
 /// The node's own records, which its writer appends (`history::writer`) and no remembered answer
 /// reads (`App::remembers`): the statements' history and the audit log.
@@ -3254,23 +3268,7 @@ fn field(f: &mut Bytes) -> Result<Bytes> {
     next(f, n)
 }
 
-crate::per_node!(
-    /// When the node open now began its start (`trace_from_now`): what `trace`'s times count from.
-    static TRACED_FROM: std::sync::Mutex<Option<datafusion::common::instant::Instant>> = std::sync::Mutex::new(None));
-
-/// The node's start begins now, for `trace` (`Node::start`).
-pub fn trace_from_now() { *TRACED_FROM.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(datafusion::common::instant::Instant::now()); }
-
-/// A cold start's steps and their times, with `PONDRA_TRACE_START` (`tools/cold_trace.sh`, C5): since the node's start
-/// began (`trace_from_now`), nothing before it.
-pub fn trace(what: &str) {
-    let from = *TRACED_FROM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let (Some(since), true) = (from, crate::env::is_set("PONDRA_TRACE_START")) {
-        eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
-    }
-}
-
-/// `trace`'s line, timed from `since`: the catalog's open times its own steps.
+/// A start's line (`NodeState::trace`), timed from `since`: the catalog's open times its own steps.
 pub fn trace_since(what: &str, since: datafusion::common::instant::Instant) {
     if crate::env::is_set("PONDRA_TRACE_START") {
         eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
@@ -3318,6 +3316,9 @@ impl Catalog {
     /// opening began, for `PONDRA_TRACE_START`.
     async fn writer(kv: Arc<dyn Kv>, since: Instant, life: Life) -> Result<Self> {
         let mut cat = Self::new(kv, life);
+        if traced_commits() {
+            Stages::sample_lag(Arc::downgrade(&cat.stages)); // (a leader's commits are what it times)
+        }
         cat.replicas = crate::env::value("PONDRA_REPLICAS");
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
         let c = cat.get::<u64>("c").await?.unwrap_or(0);
@@ -3374,7 +3375,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud, rights) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, rights, metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default(), life }
+        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, rights, marks: crate::registry::get().find::<crate::records::Rights>(), metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default(), life, stages: Arc::new(Stages::new()), written: Default::default() }
     }
 
     /// What the catalog's block caches hold, in bytes.
@@ -3481,6 +3482,13 @@ impl Catalog {
             self.mirror.store(false, Relaxed);
             self.hold.fetch_max(d.id - 1, Relaxed);
             self.rights.fetch_max(d.id, Relaxed); // (any of them may have changed who may do what)
+            self.written.lock().unwrap().clear(); // (the tables those wrote are unknown: each round's next look reads every table)
+        }
+        {
+            let mut written = self.written.lock().unwrap(); // (the tables this commit writes, for each round that follows them)
+            for (_, _, tables) in written.iter_mut() {
+                tables.extend(d.puts.iter().map(|(k, _)| k.as_str()).chain(d.deletes.iter().map(String::as_str)).filter_map(|k| k.strip_prefix("t/")).map(str::to_string));
+            }
         }
         if let Some((_, v)) = d.puts.iter().find(|(k, _)| k == "n") {
             self.last_n.fetch_max(serde_json::from_slice(v).unwrap_or(1), Relaxed);
@@ -3499,7 +3507,7 @@ impl Catalog {
         if !quiet(d) {
             self.loud.fetch_max(d.id, Relaxed);
         }
-        if moves_rights(d) {
+        if moves_rights(self.marks, d) {
             self.rights.fetch_max(d.id, Relaxed);
         }
     }
@@ -3604,6 +3612,7 @@ impl Catalog {
         self.streamed.fetch_max(c, Relaxed);
         self.loud.fetch_max(c, Relaxed);
         self.rights.fetch_max(c, Relaxed); // (a whole snapshot: what changed in it isn't told apart)
+        self.written.lock().unwrap().clear(); // (…nor which tables: each round's next look reads every table)
         self.last_n.fetch_max(n, Relaxed);
         self.mirror.store(true, Relaxed);
         Ok(())
@@ -3638,6 +3647,38 @@ impl Catalog {
 
     pub fn is_writer(&self) -> bool { self.kv.is_writer() }
 
+    /// The tables (their `t/` names) committed since `who` last asked (`apply`: this leader's commits, or those a
+    /// follower was streamed), or None when `who` is to read every table instead: the first time it asks, once `sweep`
+    /// has passed since it last did (a table this missed waits at most that), and after a gap in a follower's stream. A
+    /// round that follows them (`tier::refresh`, `delta::publish_named`) reads only these between sweeps: a commit's work
+    /// follows its write set, not the number of tables (designs/redesign/redesign.md §4).
+    pub fn written(&self, who: &'static str, sweep: std::time::Duration) -> Option<std::collections::HashSet<String>> {
+        let mut written = self.written.lock().unwrap();
+        match written.iter_mut().find(|(w, ..)| *w == who) {
+            Some((_, swept, tables)) if swept.elapsed() < sweep => Some(std::mem::take(tables)),
+            Some((_, swept, tables)) => {
+                (*swept, *tables) = (Instant::now(), Default::default());
+                None
+            }
+            None => {
+                written.push((who, Instant::now(), Default::default()));
+                None
+            }
+        }
+    }
+
+    /// Tables `who` took (`written`) and must look at again next time: the ones its round failed on.
+    pub fn again(&self, who: &'static str, tables: impl IntoIterator<Item = String>) {
+        if let Some((.., kept)) = self.written.lock().unwrap().iter_mut().find(|(w, ..)| *w == who) {
+            kept.extend(tables);
+        }
+    }
+
+    /// `who` didn't finish reading what `written` gave it (an error part way): its next call reads every table.
+    pub fn missed(&self, who: &'static str) {
+        self.written.lock().unwrap().retain(|(w, ..)| *w != who);
+    }
+
     /// The catalog version every read here reflects right now — on the leader (durable commits)
     /// or a node that holds the whole catalog in memory — or `None` where reads mix our view with
     /// the stream. A read that starts after this sees at least this version (never older). Quiet
@@ -3649,7 +3690,7 @@ impl Catalog {
         }
     }
 
-    /// The rights version: the last commit that changed who may do what (`RIGHTS`), or that may have (commits that never
+    /// The rights version: the last commit that changed who may do what (`moves_rights`), or that may have (commits that never
     /// arrived, a snapshot read whole). A session makes its principal again when this moved since the principal was made
     /// (`auth::Principal::epoch`): one load at each statement, and no timer.
     pub fn rights_version(&self) -> u64 { self.rights.load(Relaxed) }
@@ -3848,6 +3889,40 @@ impl Catalog {
         }
     }
 
+    /// The records at `keys` as of one commit, and that commit: a statement's tables and views, which it reads together
+    /// (`query::named_records`). With the whole catalog in memory, under one hold of its lock; otherwise each read and the
+    /// reads checked to be of one commit (`moved_since`), and read again if they aren't (three tries; then 40001, as a
+    /// statement whose reads raced a commit says it).
+    pub async fn get_many(&self, keys: &[String]) -> Result<(Vec<Option<Bytes>>, u64)> {
+        crate::metrics::add(&crate::metrics::CATALOG_READS, keys.len() as u64); // (each record looked up, there or not)
+        if self.mirror.load(Relaxed) {
+            let o = self.overlay.lock().unwrap(); // (`apply` changes it and `streamed` together under it)
+            return Ok((keys.iter().map(|k| o.get(k).and_then(|(_, v)| v.clone())).collect(), self.streamed.load(Relaxed)));
+        }
+        let wanted: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+        for _ in 0..3 {
+            let since = self.commit_now().await?;
+            let mut got = Vec::with_capacity(keys.len());
+            for k in keys {
+                got.push(self.get_raw_uncounted(k).await?);
+            }
+            let at = self.commit_now().await?;
+            if !self.moved_since("", "\u{10ffff}", since, at, |k| wanted.contains(k)) {
+                return Ok((got, at));
+            }
+        }
+        Err(crate::codes::coded("40001", "could not serialize access: the catalog changed while the statement read its tables three times: run it again"))
+    }
+
+    /// The commit this node's catalog reads are as of now: the leader's last committed one (its whole catalog in
+    /// memory: its last applied), a follower's last streamed one or its view's.
+    pub async fn commit_now(&self) -> Result<u64> {
+        match self.kv.is_writer() && !self.mirror.load(Relaxed) {
+            true => Ok(self.committed()),
+            false => self.at_now().await,
+        }
+    }
+
     /// The commit a read takes right now, when it lays nothing over our view: the mirror's last streamed commit, else the view's.
     async fn at_now(&self) -> Result<u64> {
         if self.mirror.load(Relaxed) {
@@ -4005,11 +4080,11 @@ impl Catalog {
         let puts = listed(self, puts).await?;
         let mut puts: Vec<(String, Bytes)> = puts.into_iter().map(|(k, v)| (k, v.into())).collect();
         let mut id = self.order.lock().await;
-        let t1 = commit_stage("order", t0);
+        let t1 = self.stage("order", t0);
         // The commit number is the last put: the store takes the puts as they are, and the `Delta` keeps the same list.
         puts.push(("c".to_string(), Bytes::from(json(&*id))));
         let handle = self.kv.write(&puts, deletes).await.map_err(|e| self.fenced(e))?;
-        let t2 = commit_stage("kv write", t1);
+        let t2 = self.stage("kv write", t1);
         if let Some((_, v)) = puts.iter().find(|(k, _)| k == "n") {
             self.last_n.store(serde_json::from_slice(v)?, Relaxed);
         }
@@ -4046,49 +4121,62 @@ async fn listed(cat: &Catalog, mut puts: Vec<(String, Vec<u8>)>) -> Result<Vec<(
     Ok(puts)
 }
 
-/// `PONDRA_TRACE_COMMIT=1`: where a leader's commits spend their time. Each stage is the time since the one before it
-/// (`since`); once a minute one line on stderr gives each stage's p50 and p95 over that minute, and how late a 10 ms
-/// sleep woke (`lag`: the runtime's own wait, which every stage pays when the node's cores are busy). Returns now, the
-/// next stage's start.
-pub fn commit_stage(stage: &'static str, since: Instant) -> Instant {
-    type Stages = Mutex<(Instant, Vec<(&'static str, Vec<f64>)>)>;
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = crate::env::is_set("PONDRA_TRACE_COMMIT");
-        if on {
-            crate::panics::spawn(async {
-                loop {
-                    let t = Instant::now();
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    commit_stage("lag", t + Duration::from_millis(10));
-                }
-            });
+/// `PONDRA_TRACE_COMMIT=1`: where a leader's commits spend their time, its catalog's own (`Catalog::stage`). Each stage
+/// is the time since the one before it; once a minute one line on stderr gives each stage's p50 and p95 over that minute,
+/// and how late a 10 ms sleep woke (`lag`: the runtime's own wait, which every stage pays when the node's cores are busy).
+struct Stages(Mutex<(Instant, Vec<(&'static str, Vec<f64>)>)>);
+
+/// Is `PONDRA_TRACE_COMMIT` set? (Read once: a setting.)
+fn traced_commits() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env::is_set("PONDRA_TRACE_COMMIT"));
+    *ON
+}
+
+impl Stages {
+    fn new() -> Stages { Stages(Mutex::new((Instant::now(), vec![]))) }
+
+    /// A stage took from `since` to now; returns now, the next stage's start.
+    fn stage(&self, stage: &'static str, since: Instant) -> Instant {
+        let now = Instant::now();
+        if !traced_commits() {
+            return now;
         }
-        on
-    });
-    crate::per_node!(static STAGES: Stages = Mutex::new((Instant::now(), vec![])); clear = |s| *s.lock().unwrap_or_else(|e| e.into_inner()) = (Instant::now(), vec![]));
-    let now = Instant::now();
-    if !*ON {
-        return now;
+        let mut s = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ms = now.saturating_duration_since(since).as_secs_f64() * 1e3;
+        match s.1.iter_mut().find(|(n, _)| *n == stage) {
+            Some((_, v)) => v.push(ms),
+            None => s.1.push((stage, vec![ms])),
+        }
+        if now - s.0 >= Duration::from_secs(60) {
+            let line: Vec<String> = s.1.iter_mut().map(|(n, v)| {
+                v.sort_by(f64::total_cmp);
+                let q = |p: f64| v[((v.len() - 1) as f64 * p) as usize];
+                format!("{n} {:.3}/{:.3} ({})", q(0.5), q(0.95), v.len())
+            }).collect();
+            eprintln!("commit stages p50/p95 ms (count): {}", line.join(", "));
+            *s = (now, vec![]);
+        }
+        now
     }
-    let mut s = STAGES.lock().unwrap();
-    let ms = now.saturating_duration_since(since).as_secs_f64() * 1e3;
-    match s.1.iter_mut().find(|(n, _)| *n == stage) {
-        Some((_, v)) => v.push(ms),
-        None => s.1.push((stage, vec![ms])),
+
+    /// How late a 10 ms sleep wakes, as the `lag` stage, while the catalog is (weak: it ends with it).
+    fn sample_lag(stages: Weak<Stages>) {
+        crate::panics::spawn(async move {
+            loop {
+                let t = Instant::now();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let Some(s) = stages.upgrade() else { return };
+                s.stage("lag", t + Duration::from_millis(10));
+            }
+        });
     }
-    if now - s.0 >= Duration::from_secs(60) {
-        let line: Vec<String> = s.1.iter_mut().map(|(n, v)| {
-            v.sort_by(f64::total_cmp);
-            let q = |p: f64| v[((v.len() - 1) as f64 * p) as usize];
-            format!("{n} {:.3}/{:.3} ({})", q(0.5), q(0.95), v.len())
-        }).collect();
-        eprintln!("commit stages p50/p95 ms (count): {}", line.join(", "));
-        *s = (now, vec![]);
-    }
-    now
 }
 
 impl Catalog {
+    /// A commit's stage took from `since` to now, with `PONDRA_TRACE_COMMIT` (`Stages`); returns now, the next stage's
+    /// start.
+    pub(crate) fn stage(&self, stage: &'static str, since: Instant) -> Instant { self.stages.stage(stage, since) }
+
     /// `fatal`, unless this node's own stop closed the catalog: then the write or read in flight
     /// fails and the stop goes on to give up the term. Restarting there led the term again, and its
     /// followers waited out the lease (`upgrade_check.py rolling`: a batch waited 5.8 s).
@@ -4153,6 +4241,23 @@ pub fn partitions() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A parsed entry keeps a copy of its raw bytes, never a slice of the buffer they came in: a follower's come in its
+    /// leader's stream frames, and a kept slice would hold the frame's whole buffer while the entry lives (the 11-07 soak
+    /// days' followers grew ~1.7 MB a minute so, with 65,536 segment entries kept). Found again by its bytes.
+    #[test]
+    fn a_parsed_entry_keeps_a_copy_not_the_buffer_it_came_in() {
+        let frame = Bytes::from(vec![7u8; 1 << 20]);
+        let raw = frame.slice(10..90);
+        let mut parsed = Parsed::<u32>::new(4, 1 << 20, |raw| raw);
+        parsed.put("k", &raw, &Arc::new(1));
+        let (held, _) = parsed.by_key.get("k").expect("kept");
+        assert_eq!(held, &raw);
+        assert_ne!(held.as_ptr(), raw.as_ptr(), "its own copy, not a slice of the frame");
+        drop(frame);
+        assert_eq!(parsed.get("k", &raw).as_deref(), Some(&1), "found again by its bytes");
+        assert_eq!(parsed.get("k", &Bytes::from_static(&[8; 80])), None, "other bytes: parsed again");
+    }
 
     #[test]
     fn placed_changes_with_the_order_an_insert_fills() {
@@ -4230,7 +4335,7 @@ mod tests {
             (&["c"], &["p/sql:1"], false),
             (&["e/stripe", "v/u_view"], &[], false),
         ] {
-            assert_eq!(moves_rights(&d(puts, deletes)), moves, "{puts:?} {deletes:?}");
+            assert_eq!(moves_rights(crate::registry::get().find::<crate::records::Rights>(), &d(puts, deletes)), moves, "{puts:?} {deletes:?}");
         }
     }
 
@@ -4619,7 +4724,7 @@ mod tests {
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let ledger = lake.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
         let names: Vec<&str> = lake.caches().iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, ["hot", "lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments"], "a local lake has no cache of a bucket's ranges");
+        assert_eq!(names, ["hot", "lookups", "tails", "manifests", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments"], "a local lake has no cache of a bucket's ranges");
         let _ = lake.tails.lock().unwrap().put("t".into(), vec![], 4096);
         // (other tests' lakes may be charged to the same line meanwhile: what this lake holds is the least it reads)
         assert!(ledger.held() >= 4096, "the line counts the tails");
@@ -4630,8 +4735,8 @@ mod tests {
         }
         assert!(freed >= 4096 && lake.tails.held() == 0, "the tails give their memory back");
         assert!(!lake.cached_bytes().iter().any(|(name, _)| *name == "hot"), "the hot columns are `hot_bytes`");
-        // (`/metrics` reads the line's list by name: the node's planning facts and manifests are on it beside the lake's caches;
-        // a node's start charges its kept pages and outside tables' logs and manifests, `node::start_app`)
+        // (`/metrics` reads the line's list by name: the node's planning facts are on it beside the lake's caches, its manifests
+        // among them; a node's start charges its kept pages and outside tables' logs and manifests, `node::start_app`)
         let metrics: Vec<&str> = lake.cached_bytes().iter().map(|(name, _)| *name).collect();
         assert!(["lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments", "facts", "manifests", "files"].iter().all(|n| metrics.contains(n)), "{metrics:?}");
         lake.cat.close().await?;

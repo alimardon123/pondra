@@ -360,7 +360,7 @@ materialized view or a task follows the table, and for a materialized view. Writ
 appends wait a moment while the name moves (for `SWAP WITH`, a kept `DROP` and `CLONE` too), and rows
 sent to the old name afterwards (over HTTP, Kafka or Flight) are refused with `no table t`.
 
-A dropped table is kept for a day, or for its `retention`, and `UNDROP TABLE t` brings it back as it
+A dropped table is kept for 7 days, or for its `retention`, and `UNDROP TABLE t` brings it back as it
 was: every row, with its ids and versions. `pondra.dropped` lists the tables that can still come back
 (see [system tables](/pondra/sql/system-tables/#dropped-tables)). `UNDROP` takes the table
 dropped last under that name, and is refused while another table has the name: rename that one first.

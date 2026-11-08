@@ -223,9 +223,9 @@ impl View {
 pub fn shown(sql: &str) -> String { crate::pattern::shown(&crate::measures::written(sql)).into_owned() }
 
 /// What a caller may see of a view's query, or of a name or expression taken from it: `text`, for a caller who may see
-/// code (`auth::shows_code`), and nothing for any other user. A view's query names the tables under it and the filters
+/// code (`rights::Scope::shows_code`), and nothing for any other user. A view's query names the tables under it and the filters
 /// that keep rows out, so a user granted only the view is not shown them, as a routine's code is not (S27).
-pub fn code_for_caller<T>(text: impl FnOnce() -> T) -> Option<T> { crate::auth::shows_code().then(text) }
+pub fn code_for_caller<T>(text: impl FnOnce() -> T) -> Option<T> { crate::rights::scope().shows_code().then(text) }
 
 /// The producers a view's rows are written under (what goes when it is dropped or detached).
 pub fn producers(name: &str) -> Vec<String> {
@@ -2026,9 +2026,8 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
     use datafusion::arrow::array::{Array, AsArray, Int64Array, StringArray};
     use datafusion::datasource::MemTable;
     let mut views = in_order(lake.cat.scan::<View>("v/", "v0").await?);
-    if let Some(a) = crate::auth::limited() {
-        views.retain(|(name, v)| a.may("select", v.shown(name)));
-    }
+    let scope = crate::rights::scope();
+    views.retain(|(name, v)| scope.sees(crate::rights::Object::Table(v.shown(name))));
     let (mut kinds, mut histories) = (vec![], std::collections::HashSet::new());
     for (name, v) in &views {
         let meta = lake.cat.meta(&table_key(name)).await?;
@@ -2129,7 +2128,7 @@ mod tests {
     #[tokio::test]
     async fn a_view_query_is_shown_to_a_caller_who_may_see_code_only() {
         // a user granted tables (no APPLY, no CLONE) is shown no view's query; an admin is shown it
-        let reader = Principal { access: Some(std::sync::Arc::new(crate::users::Access::default())), ..Principal::of(Role::Read) };
+        let reader = Principal { scope: crate::rights::Scope::granted(Default::default()), ..Principal::of(Role::Read) };
         let query = |who: Principal| WHO.scope(who, async { code_for_caller(|| "SELECT id FROM t WHERE region = 'EU'".to_string()) });
         assert_eq!(query(reader).await, None);
         assert_eq!(query(Principal::of(Role::Admin)).await.as_deref(), Some("SELECT id FROM t WHERE region = 'EU'"));

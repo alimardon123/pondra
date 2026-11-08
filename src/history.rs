@@ -623,7 +623,7 @@ pub(crate) async fn end_writers() {
 /// `pondra.history` as the caller may read it: every row for an admin, their own for anyone else.
 pub fn visible(ctx: &datafusion::prelude::SessionContext, table: Arc<dyn datafusion::catalog::TableProvider>) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
     use datafusion::prelude::{col, lit};
-    match crate::auth::current().filter(|p| p.role < crate::auth::Role::Admin || p.access.is_some()) {
+    match crate::auth::current().filter(|p| !p.superuser()) {
         None => Ok(table),
         Some(p) => Ok(ctx.read_table(table)?.filter(col("user").eq(lit(p.name)))?.into_view()),
     }
