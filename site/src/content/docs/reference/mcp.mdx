@@ -14,8 +14,8 @@ read [AI agents (MCP)](/pondra/guides/agents/).
 
 | Tool | Arguments | Does |
 |---|---|---|
-| `list_tables` | none | every table and view: its name (`schema.table` outside `public`, `lake.table` for an attached lake), its columns and their types, its kind, and a view's SQL. The kind is `append`, `upsert` (a primary key: the newest row per key wins), `merge` (rows per key combine, as `sum`) or `view` |
-| `query` | `sql` | runs one query and answers `{"rows": […], "total_rows": N}`: the first 1000 rows, and the count of all. A statement that writes, or is `BEGIN`, `COMMIT` or `ROLLBACK`, is refused (`SQLSTATE 25006`): `this changes data or a transaction: use the write tool` |
+| `list_tables` | none | every table and view: its name (`schema.table` outside `public`, `lake.table` for an attached lake), its columns and their types, its kind, and a view's SQL. The kind is `append`, `upsert` (a primary key: the newest row per key wins), `merge` (rows per key combine, as `sum`) or `view`; it is `null`, with no key, to a user who may not read every key column |
+| `query` | `sql` | runs one query and answers `{"rows": […], "total_rows": N}`: the first 1000 rows, and the count of all. A statement that writes, calls `nextval` or `setval`, or is `BEGIN`, `COMMIT` or `ROLLBACK`, is refused (`SQLSTATE 25006`): `this changes data or a transaction: use the write tool` |
 | `write` | `sql`, `job` (optional) | runs `INSERT`, `UPDATE`, `DELETE` (on any table) and `CALL`, `CREATE`, `ALTER` or `DROP` of tables, views, materialized views and schemas, and `BEGIN`, `COMMIT` and `ROLLBACK`. Outside a transaction, a write is committed and durable when it answers. `job` is an id for the write: sent again with the same id, it is applied once. Inside a session's transaction, it is committed at `COMMIT` ([below](#sessions-and-transactions)) |
 | `changes` | `table`, `after` (optional) | what was committed to a table after a position: every insert, update and delete, about 1000 rows at a time, and the `position` to ask from next |
 | `find` | `text`, `kind` (optional) | finds tables, views, columns, keys, links, routines and every other object or part by its name, comment or definition, and Pondra's concepts by other products' names: the rows `pondra.find(text)` gives in SQL |
@@ -36,7 +36,7 @@ A stored procedure is a tool of its own, with the rights of the agent's token.
 |---|---|
 | name | the procedure's name. A `.` becomes `__`, and a name that is one of the four tools above gets `call_` in front |
 | arguments | the procedure's parameters. `BIGINT`, `INT`, `INTEGER`, `SMALLINT` and `TINYINT` are `integer`; `DOUBLE`, `REAL`, `FLOAT`, `DECIMAL` and `NUMERIC` are `number`; `BOOLEAN` and `BOOL` are `boolean`; anything else is `string`. A parameter with a default is optional |
-| description | the first line of the body, if it is a comment (`--` or `#`) |
+| description | its `COMMENT ON PROCEDURE`; with none, the first line of the body, if it is a comment (`--` or `#`), to a token or a superuser. A user with grants isn't shown a routine's body, so it gets only the comment |
 | annotations | `readOnlyHint` is `false`: a procedure may write |
 
 The tool runs `CALL name(k => v, …)`. Its answer is the procedure's rows, or its outcome, and

@@ -155,7 +155,11 @@ pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> {
     let scope = crate::rights::scope();
     if !scope.whole() {
         let here = lake_name(lake);
-        all.retain(|o| scope.sees(crate::rights::Object::Table(&if o.lake == here { join(&o.schema, &o.name) } else { format!("{}.{}", o.lake, join(&o.schema, &o.name)) }))); // (a user's: what it may read, at every listing: S27)
+        // (a user's: what it may read, at every listing: S27; another lake's by the grants naming it, as its reads ask)
+        all.retain(|o| match o.lake == here {
+            true => scope.sees(crate::rights::Object::Table(&join(&o.schema, &o.name))),
+            false => scope.sees_named(&format!("{}.{}", o.lake, join(&o.schema, &o.name))),
+        });
     }
     Ok(all)
 }

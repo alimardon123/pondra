@@ -324,7 +324,7 @@ fn relations(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
             // (a column a user may not read is not shown by name either: a definition names every column, so a
             // user granted only some of them gets none)
             let catalog = if o.lake == here { local.clone() } else { format!("{}.{local}", o.lake) };
-            let partial = scope.columns(&catalog) != Some(None);
+            let partial = (if o.lake == here { scope.columns(&catalog) } else { scope.named("select", &catalog) }) != Some(None); // (another lake's: the grants naming it)
             let def = match o.kind {
                 "table" => o.meta.as_ref().map(|m| table_sql(&named, m)),
                 "view" => o.sql.as_ref().map(|s| {
@@ -363,7 +363,8 @@ fn indexes(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
         let mut all = vec![];
         for (name, l) in lakes(lake).await {
             for (k, i) in l.cat.scan::<crate::index::Index>("ix/", "ix0").await? {
-                if !crate::rights::scope().sees(crate::rights::Object::Table(&if name == here { i.table.clone() } else { format!("{name}.{}", i.table) })) {
+                let scope = crate::rights::scope();
+                if !(if name == here { scope.sees(crate::rights::Object::Table(&i.table)) } else { scope.sees_named(&format!("{name}.{}", i.table)) }) {
                     continue;
                 }
                 let meta = l.cat.meta(&table_key(&i.table)).await?;

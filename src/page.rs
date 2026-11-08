@@ -581,7 +581,7 @@ impl Page {
         match part {
             Part::Query { sent, names, format } => {
                 // (a joined page's write is in its lake before its answer: `seen_node_commit`)
-                let wrote = self.joined.is_some() && (crate::statement::is_write(&sent) || crate::seq::calls(&sent));
+                let wrote = self.joined.is_some() && crate::statement::is_write(&sent); // (a call of nextval too)
                 let asked = self.lake_request(&sent, &names, &format, &session).await?;
                 let answered = self.ask(asked).await?;
                 if let (true, Some(paged)) = (wrote, self.member.get()) {
@@ -1105,7 +1105,7 @@ async fn joined_part(lake: &crate::store::Lake, sql: &str, format_query: String,
     if superuser && own_insert(lake, &expanded).await? {
         return Ok(Routed::Own);
     }
-    if crate::statement::is_write(&expanded) || crate::seq::calls(&expanded) {
+    if crate::statement::is_write(&expanded) { // (a call of nextval too)
         if crate::ext_names::names(&expanded).iter().any(|n| names_blob(n)) {
             return Err(match superuser {
                 true => blob_refused(), // (a write the node runs, or a call of nextval, may not name a tab's file: `BLOB_ON_PAGE`)
