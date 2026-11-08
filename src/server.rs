@@ -295,7 +295,8 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         if req.uri().path() != "/cluster/ddl" {
             return (StatusCode::UNAUTHORIZED, "a branch's key renews its pin, and opens nothing else").into_response();
         }
-        let who = crate::auth::Principal::of(crate::auth::Role::None).at("http", from);
+        // (no role, and a whole scope: `ddl` lets nothing but its own pin through, and asks it no grant)
+        let who = crate::auth::Principal { scope: crate::rights::Scope::everything(), ..crate::auth::Principal::of(crate::auth::Role::None) }.at("http", from);
         return match crate::panics::door(&app.lake.node, crate::auth::WHO.scope(who, next.run(req))).await {
             Ok(r) => r,
             Err(m) => E(anyhow::anyhow!(m)).into_response(),

@@ -43,14 +43,14 @@ pub(crate) fn add(hi: &mut f64, lo: &mut f64, v: f64) {
 /// carry a NaN error, so the error is left out then: the partial's sum is infinite or NaN either way,
 /// and it merges to an infinite sum, not a NaN.
 #[inline]
-fn add_partial(hi: &mut f64, lo: &mut f64, p_hi: f64, p_lo: f64) {
+pub(crate) fn add_partial(hi: &mut f64, lo: &mut f64, p_hi: f64, p_lo: f64) {
     add(hi, lo, p_hi);
     add(hi, lo, if p_hi.is_finite() { p_lo } else { 0.0 });
 }
 
 /// The rounding error a sum hands on in a state: 0 once the sum isn't finite, since `lo` may be NaN then.
 #[inline]
-fn error_of(hi: f64, lo: f64) -> f64 {
+pub(crate) fn error_of(hi: f64, lo: f64) -> f64 {
     if hi.is_finite() { lo } else { 0.0 }
 }
 

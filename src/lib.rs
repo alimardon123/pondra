@@ -27,6 +27,7 @@ pub mod settings;
 pub mod lists;
 pub mod reset;
 pub mod fsum;
+pub mod fvar;
 pub mod avg;
 mod string_agg;
 pub mod casts;

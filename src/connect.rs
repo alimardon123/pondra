@@ -412,39 +412,42 @@ mod tests {
 
     #[tokio::test]
     async fn a_connection_is_made_shown_changed_renamed_and_dropped() -> Result<()> {
-        let lake = lake().await?;
-        run(&lake, "CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://bucket/incoming')").await.unwrap();
-        let kept: Definition = lake.cat.get(&key("drop_zone")).await?.expect("kept");
-        assert_eq!(kept, Definition { ty: "s3".into(), options: [("url".to_string(), j!("s3://bucket/incoming"))].into() });
-        // (the core lists and shows it with no edit of its own: `Kind::shown`)
-        let all = crate::objects::list(&lake).await?;
-        let o = all.iter().find(|o| o.kind == "connection").expect("listed");
-        assert_eq!((o.name.as_str(), o.definition.as_deref()), ("drop_zone", Some("CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://bucket/incoming')")));
-        assert_eq!(code(run(&lake, "CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://other')").await).0, "42710");
-        assert_eq!(run(&lake, "CREATE CONNECTION IF NOT EXISTS drop_zone TYPE s3 WITH (url = 's3://other')").await.unwrap()[0]["unchanged"], true);
-        run(&lake, "CREATE OR REPLACE CONNECTION drop_zone TYPE s3 WITH (url = 's3://other/in')").await.unwrap();
-        // (its grants are its kind's privileges, through the core's GRANT: `users::On::Object`)
-        run(&lake, "CREATE ROLE analyst").await.unwrap();
-        run(&lake, "GRANT READ ON CONNECTION drop_zone TO analyst").await.unwrap();
-        assert_eq!(code(run(&lake, "GRANT USAGE ON CONNECTION drop_zone TO analyst").await), ("0LP01".into(), "USAGE: a connection's privileges are READ and WRITE".into()));
-        assert_eq!(code(run(&lake, "GRANT READ ON CONNECTION nope TO analyst").await), ("42704".into(), "no connection nope".into()));
-        run(&lake, "ALTER CONNECTION drop_zone SET (url => 's3://bucket/later')").await.unwrap();
-        assert_eq!(shown("drop_zone", &lake.cat.get::<Value>(&key("drop_zone")).await?.expect("kept")), "CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://bucket/later')");
-        assert_eq!(code(run(&lake, "ALTER CONNECTION drop_zone RESET (url)").await).0, "22023", "url is required");
-        // (a comment follows a rename, and goes with a drop: `objects::follow`)
-        crate::objects::apply(&lake, crate::objects::Op::Comment { kind: "connection".into(), name: "drop_zone".into(), text: Some("the partner's drop".into()), if_exists: false }).await?;
-        run(&lake, "ALTER CONNECTION drop_zone RENAME TO landing").await.unwrap();
-        assert!(lake.cat.get::<Value>(&key("drop_zone")).await?.is_none());
-        let o = crate::objects::list(&lake).await?.into_iter().find(|o| o.kind == "connection").expect("listed");
-        assert_eq!((o.name.as_str(), o.comment.as_deref()), ("landing", Some("the partner's drop")));
-        assert_eq!(code(run(&lake, "ALTER CONNECTION drop_zone SET (url = 's3://x')").await).0, "42704");
-        assert_eq!(run(&lake, "ALTER CONNECTION IF EXISTS drop_zone SET (url = 's3://x')").await.unwrap()[0]["exists"], false);
-        run(&lake, "DROP CONNECTION landing").await.unwrap();
-        assert!(crate::objects::list(&lake).await?.iter().all(|o| o.kind != "connection"));
-        assert!(lake.cat.scan::<String>("cm/", "cm0").await?.is_empty(), "its comment went with it");
-        assert_eq!(code(run(&lake, "DROP CONNECTION landing").await).0, "42704");
-        assert_eq!(run(&lake, "DROP CONNECTION IF EXISTS landing").await.unwrap()[0]["dropped"], false);
-        Ok(())
+        crate::auth::as_node(async move { // (the operator's statements, as `pondra sql` runs them: `auth::as_node`)
+            let lake = lake().await?;
+            run(&lake, "CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://bucket/incoming')").await.unwrap();
+            let kept: Definition = lake.cat.get(&key("drop_zone")).await?.expect("kept");
+            assert_eq!(kept, Definition { ty: "s3".into(), options: [("url".to_string(), j!("s3://bucket/incoming"))].into() });
+            // (the core lists and shows it with no edit of its own: `Kind::shown`)
+            let all = crate::objects::list(&lake).await?;
+            let o = all.iter().find(|o| o.kind == "connection").expect("listed");
+            assert_eq!((o.name.as_str(), o.definition.as_deref()), ("drop_zone", Some("CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://bucket/incoming')")));
+            assert_eq!(code(run(&lake, "CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://other')").await).0, "42710");
+            assert_eq!(run(&lake, "CREATE CONNECTION IF NOT EXISTS drop_zone TYPE s3 WITH (url = 's3://other')").await.unwrap()[0]["unchanged"], true);
+            run(&lake, "CREATE OR REPLACE CONNECTION drop_zone TYPE s3 WITH (url = 's3://other/in')").await.unwrap();
+            // (its grants are its kind's privileges, through the core's GRANT: `users::On::Object`)
+            run(&lake, "CREATE ROLE analyst").await.unwrap();
+            run(&lake, "GRANT READ ON CONNECTION drop_zone TO analyst").await.unwrap();
+            assert_eq!(code(run(&lake, "GRANT USAGE ON CONNECTION drop_zone TO analyst").await), ("0LP01".into(), "USAGE: a connection's privileges are READ and WRITE".into()));
+            assert_eq!(code(run(&lake, "GRANT READ ON CONNECTION nope TO analyst").await), ("42704".into(), "no connection nope".into()));
+            run(&lake, "ALTER CONNECTION drop_zone SET (url => 's3://bucket/later')").await.unwrap();
+            assert_eq!(shown("drop_zone", &lake.cat.get::<Value>(&key("drop_zone")).await?.expect("kept")), "CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://bucket/later')");
+            assert_eq!(code(run(&lake, "ALTER CONNECTION drop_zone RESET (url)").await).0, "22023", "url is required");
+            // (a comment follows a rename, and goes with a drop: `objects::follow`)
+            crate::objects::apply(&lake, crate::objects::Op::Comment { kind: "connection".into(), name: "drop_zone".into(), text: Some("the partner's drop".into()), if_exists: false }).await?;
+            run(&lake, "ALTER CONNECTION drop_zone RENAME TO landing").await.unwrap();
+            assert!(lake.cat.get::<Value>(&key("drop_zone")).await?.is_none());
+            let o = crate::objects::list(&lake).await?.into_iter().find(|o| o.kind == "connection").expect("listed");
+            assert_eq!((o.name.as_str(), o.comment.as_deref()), ("landing", Some("the partner's drop")));
+            assert_eq!(code(run(&lake, "ALTER CONNECTION drop_zone SET (url = 's3://x')").await).0, "42704");
+            assert_eq!(run(&lake, "ALTER CONNECTION IF EXISTS drop_zone SET (url = 's3://x')").await.unwrap()[0]["exists"], false);
+            run(&lake, "DROP CONNECTION landing").await.unwrap();
+            assert!(crate::objects::list(&lake).await?.iter().all(|o| o.kind != "connection"));
+            assert!(lake.cat.scan::<String>("cm/", "cm0").await?.is_empty(), "its comment went with it");
+            assert_eq!(code(run(&lake, "DROP CONNECTION landing").await).0, "42704");
+            assert_eq!(run(&lake, "DROP CONNECTION IF EXISTS landing").await.unwrap()[0]["dropped"], false);
+            Ok(())
+        })
+        .await
     }
 
     #[tokio::test]

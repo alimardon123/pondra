@@ -965,86 +965,98 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_repeated_create_with_other_lateness_is_refused() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
-        let lake = lake_with_ticks(&dir).await?;
-        create(&lake, "dips", TICKER, options()).await?;
-        create(&lake, "dips", TICKER, options()).await?;
-        let e = create(&lake, "dips", TICKER, Options { lateness_secs: 60, ..options() }).await.expect_err("a refusal");
-        assert!(e.to_string().contains("already exists, with other SQL or options"), "{e}");
-        lake.cat.close().await?;
-        let _ = std::fs::remove_dir_all(&dir);
-        Ok(())
+        crate::auth::as_node(async move { // (the node's own work, as a leader's view is made: `auth::as_node`)
+            let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
+            let lake = lake_with_ticks(&dir).await?;
+            create(&lake, "dips", TICKER, options()).await?;
+            create(&lake, "dips", TICKER, options()).await?;
+            let e = create(&lake, "dips", TICKER, Options { lateness_secs: 60, ..options() }).await.expect_err("a refusal");
+            assert!(e.to_string().contains("already exists, with other SQL or options"), "{e}");
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(())
+        })
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forget_drops_the_state_of_a_view_that_is_gone() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
-        let lake = lake_with_ticks(&dir).await?;
-        create(&lake, "dips", TICKER, options()).await?;
-        let live: View = lake.cat.get(&crate::views::view_key("dips")).await?.context("the view")?;
-        let m = live.matches.clone().context("a matches view")?;
-        let gone = Matches { id: "gone".into(), ..m.clone() };
-        let (live_key, gone_key, elsewhere) = (dkey(&lake, "dips", &m), dkey(&lake, "gone", &gone), "elsewhere|dips|1".to_string());
-        for k in [&live_key, &gone_key, &elsewhere] {
-            DUES.lock().unwrap().insert(k.clone(), Dues::default());
-            CUTS.lock().unwrap().insert(k.clone(), vec![(1, true)]);
-        }
-        forget(&lake, &lake.cat.scan::<View>("v/", "v0").await?);
-        {
-            let dues = DUES.lock().unwrap();
-            assert!(dues.contains_key(&live_key) && !dues.contains_key(&gone_key) && dues.contains_key(&elsewhere), "dues");
-        }
-        {
-            let cuts = CUTS.lock().unwrap();
-            assert!(cuts.contains_key(&live_key) && !cuts.contains_key(&gone_key) && cuts.contains_key(&elsewhere), "cut points");
-        }
-        lake.cat.close().await?;
-        let _ = std::fs::remove_dir_all(&dir);
-        Ok(())
+        crate::auth::as_node(async move { // (the node's own work, as a leader's view is made: `auth::as_node`)
+            let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
+            let lake = lake_with_ticks(&dir).await?;
+            create(&lake, "dips", TICKER, options()).await?;
+            let live: View = lake.cat.get(&crate::views::view_key("dips")).await?.context("the view")?;
+            let m = live.matches.clone().context("a matches view")?;
+            let gone = Matches { id: "gone".into(), ..m.clone() };
+            let (live_key, gone_key, elsewhere) = (dkey(&lake, "dips", &m), dkey(&lake, "gone", &gone), "elsewhere|dips|1".to_string());
+            for k in [&live_key, &gone_key, &elsewhere] {
+                DUES.lock().unwrap().insert(k.clone(), Dues::default());
+                CUTS.lock().unwrap().insert(k.clone(), vec![(1, true)]);
+            }
+            forget(&lake, &lake.cat.scan::<View>("v/", "v0").await?);
+            {
+                let dues = DUES.lock().unwrap();
+                assert!(dues.contains_key(&live_key) && !dues.contains_key(&gone_key) && dues.contains_key(&elsewhere), "dues");
+            }
+            {
+                let cuts = CUTS.lock().unwrap();
+                assert!(cuts.contains_key(&live_key) && !cuts.contains_key(&gone_key) && cuts.contains_key(&elsewhere), "cut points");
+            }
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(())
+        })
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_three_tables_have_their_columns_and_keys() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
-        let lake = lake_with_ticks(&dir).await?;
-        create(&lake, "dips", TICKER, options()).await?;
-        let view: View = lake.cat.get(&crate::views::view_key("dips")).await?.context("the view")?;
-        let m = view.matches.as_ref().context("a matches view")?;
-        assert_eq!((m.time.as_str(), m.part.as_slice(), m.within), ("ts", ["symbol".to_string()].as_slice(), false));
-        assert!(!view.inline() && view.once.is_none());
-        assert!(view.written.as_deref().is_some_and(|w| w.ends_with("EMIT FINAL")), "the statement as written");
-        let out: TableMeta = lake.cat.get(&table_key("dips")).await?.context("the view's table")?;
-        assert_eq!(out.columns().map(|(c, _)| c).collect::<Vec<_>>(), ["symbol", "start_ts"]);
-        let held: TableMeta = lake.cat.get(&table_key("dips$held")).await?.context("held")?;
-        assert_eq!(held.key, ["__mr_row"]);
-        assert_eq!(held.columns().map(|(c, _)| c).collect::<Vec<_>>(), ["symbol", "ts", "price", "__mr_row", "_deleted"]);
-        let resume: TableMeta = lake.cat.get(&table_key("dips$resume")).await?.context("resume")?;
-        assert_eq!(resume.key, ["symbol"]);
-        assert_eq!(resume.columns().map(|(c, _)| c).collect::<Vec<_>>(), ["symbol", "k", "m", "due", "_deleted"]);
-        assert!(lake.cat.get::<TableMeta>(&table_key(EXPECTED)).await?.is_some());
-        assert_eq!(producers("dips"), ["match:dips", "match:dips$held", "match:dips$resume", "match:dips$late"].map(String::from));
-        assert_eq!(tables("dips"), ["dips$held", "dips$resume"].map(String::from));
+        crate::auth::as_node(async move { // (the node's own work, as a leader's view is made: `auth::as_node`)
+            let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
+            let lake = lake_with_ticks(&dir).await?;
+            create(&lake, "dips", TICKER, options()).await?;
+            let view: View = lake.cat.get(&crate::views::view_key("dips")).await?.context("the view")?;
+            let m = view.matches.as_ref().context("a matches view")?;
+            assert_eq!((m.time.as_str(), m.part.as_slice(), m.within), ("ts", ["symbol".to_string()].as_slice(), false));
+            assert!(!view.inline() && view.once.is_none());
+            assert!(view.written.as_deref().is_some_and(|w| w.ends_with("EMIT FINAL")), "the statement as written");
+            let out: TableMeta = lake.cat.get(&table_key("dips")).await?.context("the view's table")?;
+            assert_eq!(out.columns().map(|(c, _)| c).collect::<Vec<_>>(), ["symbol", "start_ts"]);
+            let held: TableMeta = lake.cat.get(&table_key("dips$held")).await?.context("held")?;
+            assert_eq!(held.key, ["__mr_row"]);
+            assert_eq!(held.columns().map(|(c, _)| c).collect::<Vec<_>>(), ["symbol", "ts", "price", "__mr_row", "_deleted"]);
+            let resume: TableMeta = lake.cat.get(&table_key("dips$resume")).await?.context("resume")?;
+            assert_eq!(resume.key, ["symbol"]);
+            assert_eq!(resume.columns().map(|(c, _)| c).collect::<Vec<_>>(), ["symbol", "k", "m", "due", "_deleted"]);
+            assert!(lake.cat.get::<TableMeta>(&table_key(EXPECTED)).await?.is_some());
+            assert_eq!(producers("dips"), ["match:dips", "match:dips$held", "match:dips$resume", "match:dips$late"].map(String::from));
+            assert_eq!(tables("dips"), ["dips$held", "dips$resume"].map(String::from));
 
-        // No PARTITION BY: one key, held by a column that is always true.
-        create(&lake, "all", &TICKER.replace("PARTITION BY symbol ", ""), options()).await?;
-        let resume: TableMeta = lake.cat.get(&table_key("all$resume")).await?.context("resume")?;
-        assert_eq!(resume.key, ["__mr_all"]);
-        assert_eq!(resume.columns().map(|(c, t)| format!("{c}:{t}")).collect::<Vec<_>>(), ["__mr_all:Boolean", "k:Int64", "m:Int64", "due:Int64", "_deleted:Boolean"]);
-        lake.cat.close().await?;
-        let _ = std::fs::remove_dir_all(&dir);
-        Ok(())
+            // No PARTITION BY: one key, held by a column that is always true.
+            create(&lake, "all", &TICKER.replace("PARTITION BY symbol ", ""), options()).await?;
+            let resume: TableMeta = lake.cat.get(&table_key("all$resume")).await?.context("resume")?;
+            assert_eq!(resume.key, ["__mr_all"]);
+            assert_eq!(resume.columns().map(|(c, t)| format!("{c}:{t}")).collect::<Vec<_>>(), ["__mr_all:Boolean", "k:Int64", "m:Int64", "due:Int64", "_deleted:Boolean"]);
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(())
+        })
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_and_delete_on_the_source_are_refused_while_it_follows_it() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
-        let lake = lake_with_ticks(&dir).await?;
-        create(&lake, "dips", TICKER, options()).await?;
-        let not = crate::views::cannot_follow(&lake, "ticks", false).await?;
-        assert!(not.iter().any(|w| w.contains("emits windows, sessions or matches once")), "{not:?}");
-        lake.cat.close().await?;
-        let _ = std::fs::remove_dir_all(&dir);
-        Ok(())
+        crate::auth::as_node(async move { // (the node's own work, as a leader's view is made: `auth::as_node`)
+            let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
+            let lake = lake_with_ticks(&dir).await?;
+            create(&lake, "dips", TICKER, options()).await?;
+            let not = crate::views::cannot_follow(&lake, "ticks", false).await?;
+            assert!(not.iter().any(|w| w.contains("emits windows, sessions or matches once")), "{not:?}");
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(())
+        })
+        .await
     }
 
     #[test]
