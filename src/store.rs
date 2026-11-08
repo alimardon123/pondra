@@ -1851,7 +1851,7 @@ pub fn memory_limit() -> usize {
 }
 
 /// The process's line for every node's queries together (`ledger::Root`): its whole line (`root_whole`) where there is one,
-/// else 4 GiB; on a page, two thirds of its device's line (`env::page_line_share`). A node's own `PONDRA_MEMORY_GB` is its
+/// else 4 GiB; on a page, its device's line's trim line, as a node's is (`env::page_line_share`). A node's own `PONDRA_MEMORY_GB` is its
 /// budget on it (`memory_limit`), never the process's.
 fn root_line() -> usize {
     #[cfg(target_arch = "wasm32")]
@@ -2553,23 +2553,6 @@ impl Lake {
     /// Note that segments up to `hwm` are committed (wakes tasks and watchers).
     pub fn advance(&self, hwm: u64) {
         self.hwm.send_if_modified(|h| std::mem::replace(h, (*h).max(hwm)) < hwm);
-    }
-
-    /// What a remembered answer to `sql` depends on: this lake's catalog, and those of the attached
-    /// lakes it may read, itself or through the views it reads (and which lakes are attached).
-    /// None: nothing to remember it by.
-    pub async fn version_for(&self, sql: &str) -> Option<u64> {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.cat.version()?.hash(&mut h);
-        let mut text = sql.to_string();
-        if !self.attached.read().unwrap().is_empty() {
-            crate::query::stored_views(self, sql, false).await.ok()?.iter().for_each(|(_, v)| text.push_str(&format!(" {v}")));
-        }
-        for (name, other) in self.attached.read().unwrap().iter().filter(|(n, _)| crate::text::mentions(&text, n)) {
-            (name, other.cat.version()?, crate::auth::operator()).hash(&mut h); // (whoever runs the nodes may read what a user may not: `users::across`)
-        }
-        Some(h.finish())
     }
 
     /// Read another lake as `name.table` in this one's queries (its bucket's reader goes into our

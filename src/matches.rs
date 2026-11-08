@@ -74,7 +74,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options, scope: &crat
 
     // The query as the parser reads it, and its MATCH_RECOGNIZE in open mode; the input is a lake table of this lake.
     let ctx = session_for(lake, sql, "", None, scope).await?;
-    let cols = crate::pattern::open_columns(lake, sql).await?;
+    let cols = crate::pattern::open_columns(&crate::host::Asking::of(lake, scope), sql).await?;
     let open = crate::pattern::open(sql, &cols, &ctx.state())?;
     let source = crate::views::followed(lake, &open.table).await?;
     takes(source == open.table, format!("{}: a view follows the table by its name in this lake: write {source}", open.table))?;
@@ -91,11 +91,11 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options, scope: &crat
     takes(part.iter().all(|(c, _)| !["k", "m", "due", "_deleted"].contains(&c.as_str())), format!("a PARTITION BY column named k, m, due or _deleted can't be kept beside the view's own counts: rename it in {source}"))?;
 
     // The view's columns: the plain query's, planned and checked as `rerun::create` plans them.
-    let plain = crate::routines::expand(lake, sql).await?;
+    let plain = crate::routines::expand(lake, sql, scope).await?;
     let planned = crate::sys::planned(&plain)?.into_owned();
     let pctx = session_for(lake, &planned, "", None, scope).await?;
     let plan = crate::engine::sql(&pctx, &planned).await?.logical_plan().clone();
-    let (columns, sql_types) = crate::rerun::table_columns(lake, sql, &pctx, &plan).await?;
+    let (columns, sql_types) = crate::rerun::table_columns(lake, sql, &pctx, &plan, scope).await?;
 
     // The three tables. `$held` is keyed by its source row's id; `$resume` by the PARTITION BY columns (none: one key).
     let mut held_cols = src.to_columns();

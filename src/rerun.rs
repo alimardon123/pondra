@@ -589,13 +589,13 @@ impl Unfollow {
 
 /// A view's columns as its plan runs them, and the SQL types its query keeps (`query_types`). None of the columns may be a
 /// system column's name: the view's own table has those.
-pub(crate) async fn table_columns(lake: &Lake, sql: &str, ctx: &datafusion::prelude::SessionContext, plan: &LogicalPlan) -> Result<(Vec<(String, String)>, std::collections::BTreeMap<String, String>)> {
+pub(crate) async fn table_columns(lake: &Lake, sql: &str, ctx: &datafusion::prelude::SessionContext, plan: &LogicalPlan, scope: &crate::rights::Scope) -> Result<(Vec<(String, String)>, std::collections::BTreeMap<String, String>)> {
     let columns: Vec<(String, String)> = crate::query::run_schema(ctx, plan)?.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
     if let Some((c, _)) = columns.iter().find(|(c, _)| crate::text::NAMES.contains(&c.as_str())) {
         bail!("{c} is a system column of the view's own table: name it something else ({c} AS source{c})");
     }
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
-    let sql_types = crate::write::query_types(lake, sql, &names).await;
+    let sql_types = crate::write::query_types(lake, sql, &names, scope).await;
     Ok((columns, sql_types))
 }
 
@@ -628,7 +628,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &Tabl
     };
     crate::format::require(lake, 2, "a materialized view that runs its query again (median, count(DISTINCT …), ORDER BY … LIMIT, …)").await?;
     let ctx = crate::query::session_for(lake, sql, "", None, scope).await?; // (the table's columns are the types the query runs with)
-    let (columns, sql_types) = table_columns(lake, sql, &ctx, plan).await?;
+    let (columns, sql_types) = table_columns(lake, sql, &ctx, plan, scope).await?;
     let meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry };
     let r = Rerun { id: uuid::Uuid::new_v4().to_string(), keys, full, reason, asked, lag_secs, joins };
     let view = View { source: source.into(), sql: sql.into(), emit: None, sessions: None, ids: false, join: None, fill: None, expect: vec![], once: None, written, rerun: Some(r), matches: None, from, authored: None };

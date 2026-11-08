@@ -296,7 +296,7 @@ fn part_candidate(p: &PartRow) -> Candidate {
 /// `pondra.find('words' [, kind => 'k'])` where SQL comes in: each call becomes its rows, as a
 /// subquery of VALUES (as `vars::parameters_in` does for `pondra.parameters`). The catalog is read
 /// once for all the calls in a statement.
-pub async fn functions_in(lake: &Lake, sql: &str) -> Result<String> {
+pub async fn functions_in(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Result<String> {
     static VIEW: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*create\s+(?:or\s+(?:replace|alter)\s+)?view\b").expect("a regex"));
     if !sql.to_lowercase().contains("pondra.find") || VIEW.is_match(sql) {
         return Ok(sql.to_string()); // (a view keeps its call: it searches the catalog as it is when read)
@@ -305,9 +305,8 @@ pub async fn functions_in(lake: &Lake, sql: &str) -> Result<String> {
     if calls.is_empty() {
         return Ok(sql.to_string());
     }
-    let scope = crate::rights::scope(); // (the statement's caller: M8 piece 3b passes it)
-    let all = list(lake, &scope).await?;
-    let pieces = parts(lake, &all, &scope).await?;
+    let all = list(lake, scope).await?;
+    let pieces = parts(lake, &all, scope).await?;
     let mut out = String::new();
     let mut last = 0;
     for (at, text, kind) in calls {

@@ -1402,7 +1402,7 @@ pub async fn locked_read(app: &crate::app::App, sql: &str, scope: &crate::rights
         return Ok(None);
     }
     // (the door's own text: macros expanded, the path written in, Postgres's weaker locks as `FOR UPDATE`)
-    let expanded = crate::routines::expand(&app.lake, sql).await?;
+    let expanded = crate::routines::expand(&app.lake, sql, scope).await?;
     let Ok(stmts) = Parser::parse_sql(&GenericDialect {}, &expanded) else { return Ok(None) }; // (the door reports the error)
     for stmt in &stmts {
         // (refused by name outside a transaction too: SKIP LOCKED isn't a plain read's, whatever the session)

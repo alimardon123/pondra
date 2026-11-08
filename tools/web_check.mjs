@@ -11,8 +11,8 @@
 // its folder has expected.json (made by tools/web_lake.py): a Delta table a node published, read over a web server that
 // lists nothing, each read compared with the node's own answer for the same bytes. In Chromium a kept page (`Page.kept`,
 // its files and tables in the origin's private file system) is checked with reloads, then the demo page
-// (web/demo/index.html, `demoChecks`) in a browser of its own, and a page in a Worker that spills past its pool to the browser's
-// storage (`spillWorkerChecks`); in Node the kept page is refused by name, and a page past its
+// (web/demo/index.html, `demoChecks`) in a browser of its own, a page in a Worker that spills past its pool to the browser's
+// storage (`spillWorkerChecks`), and one at its default line whose memory must peak under the module's 4 GiB (`fullLineChecks`); in Node the kept page is refused by name, and a page past its
 // memory line is checked in a child process of its own (`memoryChecks`). With `--node-bin` a page joins a follower of a node's
 // lake (`joinRun`): two nodes on one folder, the page's reads and writes, what never reaches it, and a non-superuser's refusal.
 // The 100 MB check (`w4Checks`, W4b, after (c4)) loads a generated CSV from the page's blob into a node's table, and measures
@@ -428,6 +428,49 @@ try {
 }
 `;
 
+// The queries a page in a Worker runs at its default line, with no setting of its own (`fullLineChecks`), each with its
+// answer: a sort of 3 GB of rows (past its share: it spills), two aggregates and two joins whose tables the share holds, and a
+// 200 MB answer. Its query share is its line's trim line, as a node's is (`env::page_line_share`, audit 11-08 L4): what the
+// pool doesn't count (the decoding, the batches in flight, the answer before it is copied out) must still fit under the
+// module's 4 GiB, which a wasm32 memory can't pass.
+const FULL_LINE_QUERIES = [
+  ['sort', "SELECT value, length(p) AS n FROM (SELECT value, p FROM (SELECT value, repeat('x', 200) AS p FROM range(15000000)) ORDER BY value DESC OFFSET 14999999)", 'value,n\n0,200\n'],
+  ['aggregate', "SELECT count(*) AS n FROM (SELECT value % 30000000 AS k, min(repeat('y', 40) || value) AS s FROM range(30000000) GROUP BY 1)", 'n\n30000000\n'],
+  ['join', "SELECT count(*) AS n FROM (SELECT value * 7919 % 12000000 * 1000003 AS k, repeat('j', 100) AS p FROM range(12000000)) a JOIN (SELECT value * 7919 % 12000000 * 1000003 AS k FROM range(12000000)) b ON a.k = b.k", 'n\n12000000\n'],
+  ['aggregate_big', "SELECT count(*) AS n FROM (SELECT value % 50000000 AS k, min(repeat('y', 40) || value) AS s FROM range(50000000) GROUP BY 1)", 'n\n50000000\n'],
+  ['join_big', "SELECT count(*) AS n FROM (SELECT value * 7919 % 20000000 * 1000003 AS k, repeat('j', 100) AS p FROM range(20000000)) a JOIN (SELECT value * 7919 % 20000000 * 1000003 AS k FROM range(20000000)) b ON a.k = b.k", 'n\n20000000\n'],
+  ['answer', "SELECT count(*) AS n FROM range(1)", 'n\n1\n'],
+];
+// The most of its 4 GiB the module may reach in them: past it, one more step that grows the memory could trap the page.
+const FULL_LINE_PEAK_MB = 3840;
+// The Worker's page (`/full-line-worker.js`): its queries in order, each posted with its ms, the bytes it spilled and the
+// module's memory after it (a wasm32 memory never shrinks, so it is the peak so far), then the size of a 200 MB answer.
+const FULL_LINE_WORKER = `
+import init, { Page, spilledBytes } from '/pkg/pondra_web.js';
+const wasm = await init();
+try {
+  const page = new Page({});
+  for (const [name, sql] of ${JSON.stringify(FULL_LINE_QUERIES.map(([name, sql]) => [name, sql]))}) {
+    const before = spilledBytes();
+    const started = performance.now();
+    const big = name === 'answer'; // (its answer is the 200 MB one: the count after it says the page still answers)
+    if (big) {
+      const a = await page.request('POST', '/sql?format=csv', {}, "SELECT value, repeat('z', 100) AS p FROM range(2000000)");
+      if (a.status !== 200) throw new Error('the 200 MB answer: ' + a.status + ' ' + new TextDecoder().decode(a.body).slice(0, 300));
+      postMessage({ answer_mb: Math.round(a.body.length / 2 ** 20) });
+    }
+    const a = await page.request('POST', '/sql?format=csv', {}, sql);
+    const ms = Number((performance.now() - started).toFixed(1));
+    postMessage({ name, status: a.status, headers: a.headers, text: new TextDecoder().decode(a.body), ms, spilled: spilledBytes() - before, memory: wasm.memory.buffer.byteLength });
+  }
+  await page.close();
+  page.free();
+  postMessage({ done: true });
+} catch (e) {
+  postMessage({ error: String(e) });
+}
+`;
+
 // The page's server on 127.0.0.1: the page at `/`, and the --pkg folder's files under `/pkg/`. The .wasm goes as
 // `application/wasm`, which a browser needs to compile it while it streams in.
 async function serveSite() {
@@ -456,6 +499,7 @@ async function servePage(req, res) {
     return send(res, 200, 'text/html; charset=utf-8', await readFile(DEMO, 'utf8'));
   }
   if (pathname === '/spill-worker.js') return send(res, 200, MODULE_TYPES['.js'], SPILL_WORKER);
+  if (pathname === '/full-line-worker.js') return send(res, 200, MODULE_TYPES['.js'], FULL_LINE_WORKER);
   const name = /^\/pkg\/([\w.-]+)$/.exec(pathname)?.[1];
   const type = name && MODULE_TYPES[extname(name)];
   const body = type ? await readFile(join(pkg, name)).catch(() => null) : null;
@@ -784,6 +828,78 @@ async function spillWorkerChecks() {
   } catch (e) {
     failed.push('spill worker');
     console.error(`spill worker: threw ${e}`);
+  } finally {
+    await context?.close();
+    await site.close();
+    await rm(profile, { recursive: true, force: true });
+  }
+}
+
+// A page in a Worker at its default line, with no memory setting of its own: each query past or near its share answers, and
+// the module's memory peaks under FULL_LINE_PEAK_MB of its 4 GiB (audit 11-08 L4: the share is its line's trim line, as a
+// node's is). Chromium only (a Worker with the browser's storage to spill to); it runs about a minute.
+async function fullLineChecks() {
+  const before = failed.length;
+  let chromium;
+  try {
+    chromium = await playwrightChromium();
+  } catch (e) {
+    failed.push('full line');
+    console.error(`full line: ${e}`);
+    return;
+  }
+  const site = await serveSite();
+  const profile = await mkdtemp(join(tmpdir(), 'pondra-web-full-line-'));
+  let context = null;
+  try {
+    context = await chromium.launchPersistentContext(profile, { headless: true });
+    const tab = await context.newPage();
+    watch(tab);
+    const messages = [];
+    await tab.exposeFunction('fullLineReport', (message) => {
+      messages.push(message);
+    });
+    await tab.goto(`http://127.0.0.1:${site.port}/?bare`, { waitUntil: 'commit' });
+    await untilStarted(tab);
+    const device_gb = await tab.evaluate(() => navigator.deviceMemory ?? null);
+    await tab.evaluate(() => {
+      const worker = new Worker('/full-line-worker.js', { type: 'module' });
+      worker.onmessage = (e) => window.fullLineReport(e.data);
+      worker.onerror = (e) => window.fullLineReport({ error: e.message || 'the worker failed' });
+    });
+    const queries = {};
+    let peak = 0;
+    let answer_mb = null;
+    for (const [name, , want] of FULL_LINE_QUERIES) {
+      let m = await nextMessage(messages);
+      if (m && m.answer_mb !== undefined) {
+        answer_mb = m.answer_mb;
+        m = await nextMessage(messages);
+      }
+      if (!m || m.error || m.name !== name) {
+        failed.push(`full line: ${name}`);
+        console.error(`full line: ${name} answered ${m ? JSON.stringify(m.error ?? m.name) : 'nothing within 5 min'}`);
+        break;
+      }
+      judge(`full line: ${name}`, asJudged(m), { status: 200, sqlstate: null, out: want });
+      peak = Math.max(peak, m.memory);
+      queries[name] = { ms: m.ms, spilled_mb: Math.round(m.spilled / 2 ** 20), memory_mb: Math.round(m.memory / 2 ** 20) };
+    }
+    if (!(queries.sort?.spilled_mb > 0)) {
+      failed.push('full line: the sort spilled past its share');
+      console.error(`full line: the sort spilled nothing: ${JSON.stringify(queries.sort ?? null)}`);
+    }
+    const peak_mb = Math.round(peak / 2 ** 20);
+    if (peak_mb > 0 && peak_mb <= FULL_LINE_PEAK_MB) passed++;
+    else {
+      failed.push(`full line: the module's memory peaks under ${FULL_LINE_PEAK_MB} MB`);
+      console.error(`full line: the module's memory peaked at ${peak_mb} MB, past ${FULL_LINE_PEAK_MB} MB of its 4096`);
+    }
+    report.full_line = { device_gb, queries, answer_mb, peak_mb };
+    if (failed.length === before) report.full_line.run = `a page in a Worker at its default line answered each query, its memory peaking at ${peak_mb} MB of 4096`;
+  } catch (e) {
+    failed.push('full line');
+    console.error(`full line: threw ${e}`);
   } finally {
     await context?.close();
     await site.close();
@@ -2227,6 +2343,7 @@ try {
     await keptChecks(await target.tab('kept'), lake);
     await demoChecks(target.page);
     await spillWorkerChecks();
+    await fullLineChecks();
   } else {
     await keptRefused(target.Page);
     await memoryChecks();

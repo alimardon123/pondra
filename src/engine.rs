@@ -33,7 +33,7 @@ pub fn with_catalog(mut state: datafusion::execution::SessionState, catalog: Arc
 
 /// `ctx`, which reads files by their path or URL as tables (`FROM 'jan.parquet'`): DataFusion's `enable_url_table`,
 /// with the session's own state changed in place, where DataFusion builds the whole state again (7% of a short
-/// query). Every caller's session is its statement's own (`query::session`), so no other session sees the change.
+/// query). Every caller's session is its statement's own (`query::session_for`), so no other session sees the change.
 pub fn with_files(ctx: SessionContext) -> SessionContext {
     use datafusion::catalog::{DynamicFileCatalog, UrlTableFactory};
     let factory = Arc::new(datafusion::datasource::dynamic_file::DynamicListTableFactory::new(Default::default()));
@@ -49,7 +49,7 @@ pub fn with_files(ctx: SessionContext) -> SessionContext {
 
 /// The session every query starts from: DataFusion's, with Pondra's rules and planners, and every function set in the
 /// registry (`Functions`): the engine's own, Spark's, Postgres's, MATCH_RECOGNIZE's, the AI functions. A node's
-/// statements add the lake's own (`Lake::made`, `query::session_at`).
+/// statements add the lake's own (`Lake::made`, `query::session_for`).
 pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     let config = crate::optimize::config(config.with_information_schema(true));
     let state = SessionStateBuilder::new().with_config(config).with_runtime_env(rt).with_default_features();
@@ -104,10 +104,14 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             passes.add(p);
         }
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "functions", columns: FUNCTION_COLUMNS, rows: functions });
-        #[cfg(feature = "lake")] // (what a lake keeps for the engine's doors: the answers kept for their pages, and a joined page's unsent statements, `lake_state.rs`)
+        #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: the answers kept for their doors' pages, a joined page's unsent statements and a node's count of them, and its file stores and catalogs' tokens)
         {
-            r.section_mut::<crate::lake_state::Registered>().add::<crate::pages::Pages>();
-            r.section_mut::<crate::lake_state::Registered>().add::<crate::page_records::Unsent>();
+            let states = r.section_mut::<crate::lake_state::Registered>();
+            states.add::<crate::pages::Pages>();
+            states.add::<crate::page_records::Unsent>();
+            states.add::<crate::page_records::Counted>();
+            states.add::<crate::ext::Stores>();
+            states.add::<crate::ext::Tokens>();
         }
         #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)
         for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,

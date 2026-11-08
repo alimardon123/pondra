@@ -366,7 +366,7 @@ async fn query(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown,
     let batches = rows_of(got)?;
     let schema = match batches.is_empty() {
         false => first_announced(&batches),
-        true => match statement::plain_of(app, sql).await.map_err(status)? {
+        true => match statement::plain_of(app, sql, &who.scope).await.map_err(status)? {
             Some((_, one)) => planned(app, &one, &who.scope).await.map_err(status)?,
             None => Schema::empty(),
         },
@@ -443,7 +443,7 @@ async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<&[u8]
 
 /// The columns a query will answer with, for its flight's info: bound and expanded as every door does (`$name`s from
 /// the session, macros, `FROM t`, `pondra.git_status`), then planned, not run.
-async fn plan_schema(app: &App, sql: &str, scope: &crate::rights::Scope) -> anyhow::Result<Schema> { planned(app, &crate::routines::expand(&app.lake, &crate::vars::bound(sql)?).await?, scope).await }
+async fn plan_schema(app: &App, sql: &str, scope: &crate::rights::Scope) -> anyhow::Result<Schema> { planned(app, &crate::routines::expand(&app.lake, &crate::vars::bound(sql)?, scope).await?, scope).await }
 
 async fn planned(app: &App, sql: &str, scope: &crate::rights::Scope) -> anyhow::Result<Schema> { Ok(crate::with_writes::planned(app, sql, scope).await?.as_ref().clone()) }
 
@@ -950,7 +950,7 @@ impl FlightSqlService for Sql {
             return info(&crate::answer::arrow_schema(&rows_schema()), ticket.as_any().encode_to_vec(), req.into_inner());
         }
         // A query is planned here and run by its ticket; a script (several statements) can't be planned, so it runs now, as a CALL does.
-        let Some((_, one)) = within(txn, async { statement::plain_of(&self.0, &q.query).await.map_err(status) }).await? else {
+        let Some((_, one)) = within(txn, async { statement::plain_of(&self.0, &q.query, &who.scope).await.map_err(status) }).await? else {
             return kept(&self.0, &q.query, who, txn, req.into_inner()).await;
         };
         let schema = within(txn, async { planned(&self.0, &one, &who.scope).await.map_err(status) }).await?;

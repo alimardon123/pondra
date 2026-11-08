@@ -158,16 +158,9 @@ pub fn trim_line() -> Option<usize> {
     line().or_else(|| Some(crate::machine::process().ram()? / 20 * 17)).map(of_line)
 }
 
-/// 85% of a line, or 320 MB under it where that is lower, and never under 70% of it. With the default line
-/// (85% of RAM) on a machine of 3 GB or more, 72% of RAM: the hot columns take up to half of RAM (`Hot::new`),
-/// so queries have a fifth of RAM beside them before any column is given back, and an eighth more before the
-/// line, where a query is stopped. (At seven tenths of the line, 60% of RAM, the columns were given back as
-/// soon as a query took a tenth: TPC-H's and ClickBench's columns came and went.) Under a small line, 15% of
-/// it was too near: a query growing as fast as the watch looks for (`RATE`, 320 MB in 40 ms) passed a 1 GB line
-/// by 11% while the columns were being given back (`harness hot`, on a GitHub runner); 320 MB under it is
-/// what it grows in the 40 ms the trim and its purge take.
+/// The trim line under a memory line (`env::of_line`): a page's query share is the same (`env::page_line_share`).
 fn of_line(line: usize) -> usize {
-    line.saturating_sub(320 << 20).clamp(line / 10 * 7, line / 20 * 17)
+    crate::env::of_line(line)
 }
 
 /// Does the watch run in this process (`start`)? Where it doesn't, nothing gives the hot columns back.

@@ -300,7 +300,7 @@ async fn evaluate(app: &App, expr: &str, cast: Option<Cast<'_>>, scope: &crate::
         Some(Cast::Arrow(t)) => format!("arrow_cast(({expr}), '{t}')"),
         None => format!("({expr})"),
     };
-    let sql = crate::routines::prepare(&app.lake, &format!("SELECT {e} AS v"), &HashMap::new(), &HashMap::new()).await?;
+    let sql = crate::routines::prepare(&app.lake, &format!("SELECT {e} AS v"), &HashMap::new(), &HashMap::new(), scope).await?;
     let rows = answer(app, &sql, scope).await?;
     let row = datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?;
     ensure!(row.num_rows() == 1, "a variable holds one value: {expr} gave {} rows", row.num_rows());
@@ -354,7 +354,7 @@ async fn folded(lake: &crate::store::Lake, sql: &str) -> Option<Vec<RecordBatch>
 /// The Arrow type of a default (planned, not run), for a value given in its place; None if it
 /// can't be planned yet (a table it reads made later in the file).
 async fn type_of(app: &App, default: &str, scope: &crate::rights::Scope) -> Option<String> {
-    let sql = crate::routines::prepare(&app.lake, &format!("SELECT ({default}) AS v LIMIT 0"), &HashMap::new(), &HashMap::new()).await.ok()?;
+    let sql = crate::routines::prepare(&app.lake, &format!("SELECT ({default}) AS v LIMIT 0"), &HashMap::new(), &HashMap::new(), scope).await.ok()?;
     let rows = Box::pin(app.query(&sql, Some("0"), scope)).await.ok()?;
     Some(rows.first()?.schema().field(0).data_type().to_string())
 }

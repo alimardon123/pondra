@@ -183,7 +183,7 @@ pub async fn view_write(lake: &Lake, stmt: &crate::write::Stmt, scope: &crate::r
         Stmt::InsertInto(_, n, q) => (q, n.clone()),
         _ => bail!("{name} is a view of files (CREATE EXTERNAL TABLE): UPDATE, DELETE and ALTER change a lake's tables; INSERT adds a file to a view of a folder"),
     };
-    let expanded = crate::routines::expand_stored(lake, &view.sql).await?;
+    let expanded = crate::routines::expand_stored(lake, &view.sql, scope).await?;
     let spec = match &self::names(&expanded)[..] {
         [one] => spec(one).context("its files")?,
         _ => bail!("{name}: a view of several reads"),
@@ -571,19 +571,42 @@ pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
     let secrets = list(lake).await?;
     let secret = covering(&secrets, url);
     let made_with = secret.as_ref().map_or("the node's own".to_string(), |(n, s)| format!("{n}:{}", s.sealed));
-    if MADE.lock().unwrap().get_or_insert_default().get(&root) == Some(&made_with) {
+    let stores = lake.state::<Stores>()?;
+    if stores.with(&root).as_ref() == Some(&made_with) {
         return Ok(());
     }
     let params = secret.as_ref().map(|(n, s)| open(n, s)).transpose()?;
     let to = if secret.as_ref().is_some_and(|(_, s)| s.temporary && !s.trusted) { For::Public } else { For::Files };
     let store = build(&url::Url::parse(&root)?, params.as_ref(), to)?;
     lake.rt.register_object_store(&url::Url::parse(&root)?, Arc::new(crate::cache::CachedStore::files(store))); // (a file's ranges kept by its version)
-    MADE.lock().unwrap().get_or_insert_default().insert(root, made_with);
+    stores.made(root, made_with);
     Ok(())
 }
 
-// (each root's store, and what it was made with: made again when that changes)
-crate::per_node!(static MADE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None));
+/// What each of a lake's file stores was made with (`lake_state.rs`): a root's store (`register`), and a connection's
+/// (`connected`), registered in the lake's runtime, is made again when its secret or its definition changes.
+#[derive(Default)]
+pub struct Stores(Mutex<HashMap<String, String>>);
+
+impl crate::lake_state::LakeState for Stores {
+    const NAME: &'static str = "file_stores";
+    const ABOUT: &'static str = "what each store of the lake's files was made with (its secret, or its connection), so it is made again when that changes";
+    fn make() -> Self {
+        Stores::default()
+    }
+}
+
+impl Stores {
+    /// What the store at `root` was made with, if it was made.
+    fn with(&self, root: &str) -> Option<String> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(root).cloned()
+    }
+
+    /// The store at `root` was made with `with`.
+    fn made(&self, root: String, with: String) {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(root, with);
+    }
+}
 
 /// The store a connection's files are read and written through, `cn://drop`, made from its definition: its type's store for
 /// its url, signed with the secret it names, whose settings never leave the node (the caller needs no USAGE on it: the
@@ -604,14 +627,15 @@ async fn connected(lake: &Lake, url: &str) -> Result<()> {
     };
     let made_with = format!("{}:{}", serde_json::to_string(&d)?, secret.as_ref().map_or("", |(_, s)| s.sealed.as_str()));
     let root = format!("{}://{name}", crate::connections::SCHEME);
-    if MADE.lock().unwrap().get_or_insert_default().get(&root) == Some(&made_with) {
+    let stores = lake.state::<Stores>()?;
+    if stores.with(&root).as_ref() == Some(&made_with) {
         return Ok(());
     }
     let params = secret.as_ref().map(|(n, s)| open(n, s)).transpose()?;
     let at = d.options.get("url").and_then(|u| u.as_str()).with_context(|| format!("connection {name} has no url ({})", made()))?;
     let store = opener(at, params.as_ref())?;
     lake.rt.register_object_store(&url::Url::parse(&root)?, Arc::new(crate::cache::CachedStore::files(store)));
-    MADE.lock().unwrap().get_or_insert_default().insert(root, made_with);
+    stores.made(root, made_with);
     Ok(())
 }
 
@@ -1002,7 +1026,6 @@ pub async fn lent(lake: &Lake, urls: &[String]) -> Result<Vec<(String, Secret)>>
 /// The bearer token for a REST catalog, from the secret covering it: its TOKEN, or one its
 /// CLIENT_ID and CLIENT_SECRET get (OAuth's client credentials), kept until it expires.
 pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
-    crate::per_node!(static TOKENS: Mutex<Option<HashMap<String, (String, datafusion::common::instant::Instant)>>> = Mutex::new(None));
     let Some((name, secret)) = covering(&list(lake).await?, url).filter(|(_, s)| s.kind == "iceberg") else { return Ok(None) };
     let p = open(&name, &secret)?;
     if let Some(t) = p.get("token") {
@@ -1010,10 +1033,9 @@ pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
     }
     let (Some(id), Some(pass)) = (p.get("client_id"), p.get("client_secret")) else { return Ok(None) };
     let key = format!("{name}:{}", secret.sealed);
-    if let Some((t, until)) = TOKENS.lock().unwrap().get_or_insert_default().get(&key) {
-        if datafusion::common::instant::Instant::now() < *until {
-            return Ok(Some(t.clone()));
-        }
+    let tokens = lake.state::<Tokens>()?;
+    if let Some(t) = tokens.live(&key) {
+        return Ok(Some(t));
     }
     let at = p.get("oauth2_server_uri").cloned().unwrap_or_else(|| format!("{url}/v1/oauth/tokens"));
     let form = [("grant_type", "client_credentials"), ("client_id", id), ("client_secret", pass), ("scope", p.get("oauth2_scope").map_or("catalog", String::as_str))];
@@ -1027,8 +1049,34 @@ pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
     ensure!(status.is_success(), "{at} gave no token ({status}): {}", body["error_description"].as_str().or(body["error"].as_str()).unwrap_or(""));
     let t = body["access_token"].as_str().context("a token answer without access_token")?.to_string();
     let life = body["expires_in"].as_u64().unwrap_or(3600).saturating_sub(60);
-    TOKENS.lock().unwrap().get_or_insert_default().insert(key, (t.clone(), datafusion::common::instant::Instant::now() + std::time::Duration::from_secs(life)));
+    tokens.got(key, t.clone(), std::time::Duration::from_secs(life));
     Ok(Some(t))
+}
+
+/// The tokens a lake's REST catalogs gave for their secrets' client credentials (`rest_token`, `lake_state.rs`), each kept
+/// until a minute before it expires, by its secret's name and sealed values (a changed secret asks again).
+#[derive(Default)]
+pub struct Tokens(Mutex<HashMap<String, (String, datafusion::common::instant::Instant)>>);
+
+impl crate::lake_state::LakeState for Tokens {
+    const NAME: &'static str = "catalog_tokens";
+    const ABOUT: &'static str = "the tokens the lake's REST catalogs gave for its secrets' client credentials, each until it expires";
+    fn make() -> Self {
+        Tokens::default()
+    }
+}
+
+impl Tokens {
+    /// The token kept for `key`, while it lives.
+    fn live(&self, key: &str) -> Option<String> {
+        let kept = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        kept.get(key).filter(|(_, until)| datafusion::common::instant::Instant::now() < *until).map(|(t, _)| t.clone())
+    }
+
+    /// `token` was given for `key`, for `life`.
+    fn got(&self, key: String, token: String, life: std::time::Duration) {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, (token, datafusion::common::instant::Instant::now() + life));
+    }
 }
 
 // ---------------------------------------------------------------- secrets
@@ -1912,6 +1960,27 @@ mod tests {
         }
     }
 
+    /// Two lakes in one process each make a bucket's store in their own runtime (`Stores` is the lake's): the second is not
+    /// skipped for the first's, as one per-node list of what was made skipped it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_lakes_each_make_a_buckets_store_in_their_own_runtime() -> Result<()> {
+        let url = "https://example.com/data/x.csv";
+        let mut lakes = vec![];
+        for _ in 0..2 {
+            let dir = std::env::temp_dir().join(format!("pondra-two-stores-{}", uuid::Uuid::new_v4()));
+            let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            register(&lake, url).await?;
+            assert!(lake.rt.object_store(&ListingTableUrl::parse(url)?).is_ok(), "the store is in this lake's runtime");
+            assert_eq!(lake.state::<Stores>()?.with("https://example.com").as_deref(), Some("the node's own"));
+            lakes.push((lake, dir));
+        }
+        for (lake, dir) in lakes {
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn own_file_takes_no_escaped_dot_dot() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-own-file-{}", uuid::Uuid::new_v4()));
@@ -1948,10 +2017,11 @@ mod tests {
     /// One statement as `pondra sql` runs it (`cli.rs`), for a caller that is the program that started the node or not:
     /// its rows, or its error.
     async fn run(lake: &Lake, owner: bool, sql: &str) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
-        let expanded = crate::routines::expand(lake, sql).await?;
+        let node = &crate::auth::Principal::node().scope;
+        let expanded = crate::routines::expand(lake, sql, node).await?;
         let planned = crate::sys::planned(&expanded)?;
         scope(owner, async {
-            anyhow::Ok(crate::engine::with_files(crate::query::session(lake, &expanded, "").await?).sql(&planned).await?.collect().await?)
+            anyhow::Ok(crate::engine::with_files(crate::query::session_for(lake, &expanded, "", None, node).await?).sql(&planned).await?.collect().await?)
         })
         .await
     }
