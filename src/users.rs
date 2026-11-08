@@ -1175,8 +1175,9 @@ async fn token_principal(lake: &Lake, user: &str, until: Option<u64>) -> Option<
 #[derive(Default, Debug)]
 pub struct Access {
     grants: Vec<Grant>,
-    names: HashSet<String>, // (itself, its roles, public: whose grants they are)
+    pub(crate) names: HashSet<String>, // (itself, its roles, public: whose grants they are; `rights::Scope::names`)
     pub limits: Limits,     // (its own)
+    key: std::sync::OnceLock<String>, // (`key`: worked out once, at the first remembered answer)
 }
 
 impl Access {
@@ -1200,6 +1201,18 @@ impl Access {
         some.map(Some)
     }
     pub fn may(&self, privilege: &str, table: &str) -> bool { self.columns(privilege, table).is_some() }
+    /// What it holds, as one name (`rights::Scope::key`): its grants and its names, each in any order, hashed. Not its
+    /// limits, which change no answer.
+    pub fn key(&self) -> &str {
+        self.key.get_or_init(|| {
+            let mut grants: Vec<String> = self.grants.iter().map(|g| serde_json::to_string(g).unwrap_or_default()).collect();
+            grants.sort();
+            grants.dedup();
+            let mut names: Vec<&str> = self.names.iter().map(String::as_str).collect();
+            names.sort();
+            sha256(&serde_json::to_string(&(grants, names)).unwrap_or_default())[..32].to_string() // (JSON: no two contents spell alike)
+        })
+    }
     /// The same, for a table of another lake attached here (`l.t`, `l.s.t`): only grants naming
     /// it count; ON ALL TABLES and ON SCHEMA are this lake's.
     pub fn named(&self, privilege: &str, table: &str) -> Option<Option<HashSet<String>>> {
@@ -1306,13 +1319,13 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
                 grants.extend(u.grants.iter().cloned());
                 todo.extend(u.roles.iter().map(|r| (r.clone(), None, false)));
             }
-            let access = Arc::new(Access { grants, names: seen, limits: me.limits });
+            let access = Arc::new(Access { grants, names: seen, limits: me.limits, ..Default::default() });
             ACCESS.lock().unwrap().insert(id, (version, datafusion::common::instant::Instant::now(), access.clone(), superuser));
             (access, superuser)
         }
     };
     let role = if superuser { Role::Admin } else if access.writes() { Role::Write } else { Role::Read };
-    Ok(Principal { name: user.to_string(), role, access: (!superuser).then_some(access), door: "node", from: None, operator: false, epoch, until: None })
+    Ok(Principal { name: user.to_string(), role, scope: if superuser { Default::default() } else { crate::rights::Scope::granted(access) }, door: "node", from: None, operator: false, epoch, until: None })
 }
 
 /// Seconds as said: `90 seconds`, `5 minutes`, `1 hour`.
@@ -1361,9 +1374,9 @@ pub fn quota() -> Quota {
         Some(v) => pg_duration(&v),
         None => crate::env::get("PONDRA_STATEMENT_TIMEOUT").and_then(|v| pg_duration(&v)),
     };
-    let Some((user, a)) = p.and_then(|p| Some((p.name, p.access?))) else { return Quota { turns: None, timeout: session, user: String::new(), by_session: session.is_some() } };
-    let most = a.limits.max_queries.map(u64::from).or_else(|| crate::env::parse::<u64>("PONDRA_USER_QUERIES")).filter(|n| *n > 0).map(|n| n.min(10_000) as u32);
-    let timeout = a.limits.timeout_secs.map(std::time::Duration::from_secs).or_else(|| crate::env::secs_given("PONDRA_USER_TIMEOUT")).filter(|t| !t.is_zero());
+    let Some((user, limits)) = p.and_then(|p| Some((p.name, p.scope.limits()?))) else { return Quota { turns: None, timeout: session, user: String::new(), by_session: session.is_some() } };
+    let most = limits.max_queries.map(u64::from).or_else(|| crate::env::parse::<u64>("PONDRA_USER_QUERIES")).filter(|n| *n > 0).map(|n| n.min(10_000) as u32);
+    let timeout = limits.timeout_secs.map(std::time::Duration::from_secs).or_else(|| crate::env::secs_given("PONDRA_USER_TIMEOUT")).filter(|t| !t.is_zero());
     // (the shorter of the session's and the user's is in force)
     let (timeout, by_session) = match (session, timeout) {
         (Some(s), Some(t)) if s >= t => (Some(t), false),
@@ -1420,9 +1433,12 @@ pub async fn across(other: &Lake, ns: &str) -> Result<()> {
 /// key reads all of it whoever asks, so here it is read by whoever may use that key's secret (a
 /// user granted USAGE on it), and by tokens, as files under a secret's scope are.
 fn read_only(r: &crate::store::Reach, ns: &str) -> Result<()> {
-    let Some(a) = crate::auth::limited() else { return Ok(()) };
+    let scope = crate::rights::scope();
+    if scope.whole() {
+        return Ok(());
+    }
     match &r.secret {
-        Some(s) if a.secret(s) => Ok(()),
+        Some(s) if scope.secret(s) => Ok(()),
         Some(s) => bail!("permission denied: {ns} is read with the secret {s}: GRANT USAGE ON SECRET {s} TO …"),
         None => bail!("permission denied: {ns} is read with this server's own key: a token's, or an admin's"),
     }
@@ -1432,9 +1448,9 @@ fn read_only(r: &crate::store::Reach, ns: &str) -> Result<()> {
 /// tables, a grant naming it for each privilege the write needs.
 pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::write::Stmt) -> Result<()> {
     across(other, ns).await?;
-    let Some(a) = crate::auth::limited() else { return Ok(()) };
+    let scope = crate::rights::scope();
     let (table, privileges) = (format!("{ns}.{table}"), crate::rights::asks(stmt).1.into_iter().filter_map(crate::rights::Action::privilege).collect::<Vec<_>>());
-    match privileges.iter().find(|p| a.named(p, &table).is_none()) {
+    match privileges.iter().find(|p| scope.named(p, &table).is_none()) {
         Some(p) => bail!("permission denied: {} on {table}, another database's table: GRANT {} ON {table} TO … (ON ALL TABLES and ON SCHEMA are this database's)", p.to_uppercase(), p.to_uppercase()),
         None => Ok(()),
     }
@@ -1532,8 +1548,8 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
     use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray, TimestampMicrosecondArray};
     use datafusion::datasource::MemTable;
     let mut all = lake.cat.scan::<User>("u/", "u0").await?;
-    if let Some(a) = crate::auth::limited() {
-        all.retain(|(k, _)| a.names.contains(&k[2..])); // (a user's: itself and its roles)
+    if let Some(names) = crate::rights::scope().names() {
+        all.retain(|(k, _)| names.contains(&k[2..])); // (a user's: itself and its roles)
     }
     let s = |f: &dyn Fn(&String, &User) -> Option<String>| Arc::new(all.iter().map(|(k, u)| f(&k[2..].to_string(), u)).collect::<StringArray>()) as ArrayRef;
     let users = RecordBatch::try_from_iter(vec![

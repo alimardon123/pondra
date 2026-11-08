@@ -48,7 +48,7 @@ pub async fn parts(lake: &Lake, objects: &[Object]) -> Result<Vec<PartRow>> {
 async fn parts_of(lake: &Lake, objects: &[Object]) -> Result<Vec<PartRow>> {
     let lakes: HashMap<String, Arc<Lake>> = lakes(lake).await.into_iter().collect();
     let here = crate::ddl::lake_name(lake);
-    let limit = crate::auth::limited();
+    let scope = crate::rights::scope();
     let mut routines = HashMap::new();
     let mut out = vec![];
     // Every view's columns are planned in one session: a session a view took 3 ms each (200 views, 0.6 s).
@@ -59,9 +59,9 @@ async fn parts_of(lake: &Lake, objects: &[Object]) -> Result<Vec<PartRow>> {
     };
     for o in objects {
         let Some(l) = lakes.get(&o.lake) else { continue };
-        let partial = match &limit {
-            Some(a) if matches!(o.kind, "table" | "view" | "materialized view" | "external table") => partial_columns(a, o, &here),
-            _ => None,
+        let partial = match matches!(o.kind, "table" | "view" | "materialized view" | "external table") {
+            true => partial_columns(&scope, o, &here),
+            false => None,
         };
         let more = match o.kind {
             "table" | "materialized view" => stored_parts(l, o, partial.as_ref()).await?,
@@ -89,9 +89,9 @@ fn part(o: &Object, kind: &'static str, name: String, ty: Option<String>, commen
 /// it may read them all (or the question doesn't arise). A column it may not read is not shown by
 /// name either, so a caller granted only some columns gets only those, and none of the parts that
 /// name columns (keys, links, checks, expectations). Empty when it may read none.
-fn partial_columns(a: &crate::users::Access, o: &Object, here: &str) -> Option<HashSet<String>> {
+fn partial_columns(scope: &crate::rights::Scope, o: &Object, here: &str) -> Option<HashSet<String>> {
     let catalog = if o.lake == here { o.local() } else { format!("{}.{}", o.lake, o.local()) };
-    match a.columns("select", &catalog) {
+    match scope.columns(&catalog) {
         Some(None) => None,
         Some(Some(cols)) => Some(cols),
         None => Some(HashSet::new()),
@@ -121,7 +121,7 @@ async fn stored_parts(l: &Lake, o: &Object, partial: Option<&HashSet<String>>) -
         out.push(part(o, "column", name.clone(), Some(ty), comment, None));
     }
     // A materialized view's facts and expectations are its definition: a caller who may not see code is not shown them.
-    if partial.is_some() || (o.kind == "materialized view" && !crate::auth::shows_code()) {
+    if partial.is_some() || (o.kind == "materialized view" && !crate::rights::scope().shows_code()) {
         return Ok(out);
     }
     if !d.key.is_empty() {
@@ -178,7 +178,7 @@ async fn view_parts(session: Option<&SessionContext>, l: &Lake, o: &Object, here
     }).collect();
     // A view's key facts are listed as a table's are, unless a limited caller may not see the columns they name, or the
     // code they are written in (`views::code_for_caller`: a link names the table it refers to).
-    if partial.is_none() && crate::auth::shows_code() {
+    if partial.is_none() && crate::rights::scope().shows_code() {
         for c in stored.iter().flat_map(|v| &v.facts) {
             let link = c.kind == crate::constraints::Kind::ForeignKey;
             out.push(part(o, if link { "link" } else { "key" }, c.name.clone(), None, None, Some(c.def(&ident))));

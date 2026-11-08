@@ -263,7 +263,7 @@ fn located(l: &str) -> Result<String> {
 // ---------------------------------------------------------------- the table they make
 
 /// An error in words for whoever sent the statement, as this caller may see it (`codes::told`).
-pub fn said(e: &anyhow::Error) -> String { crate::codes::told(e, crate::auth::shows_code()) }
+pub fn said(e: &anyhow::Error) -> String { crate::codes::told(e, crate::rights::scope().shows_code()) }
 
 /// Does this table read files on the node's machine? (Such a query stays on it.)
 pub fn local(table: &str) -> bool { spec(table).is_some_and(|s| s.format == "share" || s.urls.iter().any(|u| scheme(u).is_none_or(|s| s == "file"))) } // (a share's links: as its node got them)
@@ -403,7 +403,7 @@ fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
 /// lend: the caller needs no USAGE on it.
 pub(crate) fn through(u: &str, privilege: &str) -> Result<()> {
     let name = crate::connections::named_in(u).unwrap_or_default();
-    ensure!(owner() || crate::auth::limited().is_none_or(|a| a.may_use("connection", name, privilege)),
+    ensure!(owner() || crate::rights::scope().may_use("connection", name, privilege),
         crate::codes::coded("42501", format!("'@{name}/…': {privilege} on connection {name} isn't granted to this user (an admin grants it: GRANT {privilege} ON CONNECTION {name} TO …)")));
     Ok(())
 }
@@ -1496,7 +1496,7 @@ pub async fn list(lake: &Lake) -> Result<Vec<(String, Secret)>> {
 
 /// May the request being served use this secret? Its own temporary one, or one a user is granted
 /// USAGE on (`GRANT USAGE ON SECRET`); a token's or a superuser's, any but a key lent to read a base.
-pub(crate) fn usable(name: &str, s: &Secret) -> bool { !s.lent && (s.temporary || crate::auth::limited().is_none_or(|a| a.secret(name))) }
+pub(crate) fn usable(name: &str, s: &Secret) -> bool { !s.lent && (s.temporary || crate::rights::scope().secret(name)) }
 
 /// The secret for a URL: the longest scope that is a prefix of it (no scope: every URL of its
 /// type's schemes).
@@ -1906,7 +1906,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-own-stage-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
         let stage = format!("{}/stage", lake.url.trim_end_matches('/'));
-        let ali = crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Write, access: None, door: "http", from: None, operator: false, epoch: 0, until: None };
+        let ali = crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Write, scope: Default::default(), door: "http", from: None, operator: false, epoch: 0, until: None };
         assert!(!own_stage(&lake, &format!("{stage}/616c69/j1/*.parquet")), "with no sign-in, none");
         crate::auth::WHO
             .scope(ali, async {

@@ -190,7 +190,7 @@ impl App {
     /// the session's own: the other nodes read it with no session, as its reader's path says. And
     /// so do a session's queries while it holds temporary secrets, which only this node has.
     pub async fn here_only(&self, query: &str) -> bool {
-        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::called(query).is_some() || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::set::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || crate::auth::limited().is_some()
+        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::called(query).is_some() || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::set::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || !crate::rights::scope().whole()
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await)
     }
 
@@ -518,8 +518,7 @@ pub(crate) enum Kept<T> {
 impl App {
     /// The version an answer to `query` is remembered under (`Results`), as HTTP and the Postgres port
     /// remember them: same query, same catalog version, same answer. None when it may answer otherwise
-    /// next time, or for a user granted some tables (planned as it may read them, never answered from
-    /// what another read, nor kept: its grants may change).
+    /// next time. A user granted some tables has its answers kept under what it may read (`Scope::key`).
     pub(crate) async fn remembers(&self, query: &str) -> Option<u64> {
         let asks = |text: &str| {
             // (AT (OFFSET => -n) is n seconds before now: a moment that moves. Expanded, a table as it was
@@ -529,7 +528,7 @@ impl App {
             let q = text.to_lowercase();
             (q.contains("offset") && OFFSET.is_match(text)) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "session_user", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.flows", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since; a view's failing runs, `pondra.flows`' `error`, commit nothing)
         };
-        let volatile = crate::auth::limited().is_some() || asks(query) || crate::pg_catalog::asked(query) // (Postgres's catalog: another answer to the same text)
+        let volatile = asks(query) || crate::pg_catalog::asked(query) // (Postgres's catalog: another answer to the same text)
             || crate::temp::mentioned(query) || crate::temp::called(query).is_some() // (the session's temporary tables change without a commit, and its functions are its own)
             || crate::set::any() // (and its settings may change the answer)
             || crate::routines::with_views(&self.lake, query).await.map_or(true, |t| t.len() > query.len() && asks(&t)) // (and so may a view it reads: `now()`, files)
