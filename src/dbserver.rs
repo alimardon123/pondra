@@ -188,7 +188,7 @@ impl Server {
             if let Some(status) = child.try_wait()? {
                 bail!("the node of database {name} stopped as it started ({status})");
             }
-            let up = crate::cluster::http().get(format!("http://127.0.0.1:{http}/stats")).timeout(Duration::from_secs(1)).send().await.is_ok_and(|r| r.status().is_success());
+            let up = crate::net::process().client(crate::net::Policy::Local).get(format!("http://127.0.0.1:{http}/stats")).timeout(Duration::from_secs(1)).send().await.is_ok_and(|r| r.status().is_success());
             if up {
                 break;
             }
@@ -205,7 +205,7 @@ impl Server {
     async fn reap(&self) {
         let idle: Vec<(String, u16)> = self.nodes.lock().await.iter().filter(|(_, n)| n.activity.idle()).map(|(k, n)| (k.clone(), n.http)).collect();
         for (name, http) in idle {
-            let stats: Option<Value> = async { crate::cluster::http().get(format!("http://127.0.0.1:{http}/stats")).send().await.ok()?.json().await.ok() }.await;
+            let stats: Option<Value> = async { crate::net::process().client(crate::net::Policy::Local).get(format!("http://127.0.0.1:{http}/stats")).send().await.ok()?.json().await.ok() }.await;
             if stats.as_ref().and_then(|s| s["untiered_rows"].as_u64()).unwrap_or(0) > 0 {
                 continue; // (it tiers first: another look next time)
             }
@@ -351,7 +351,7 @@ async fn route(s: &Server, name: &str, path: &str, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let query = parts.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
     let url = format!("http://127.0.0.1:{http}{path}{query}");
-    let mut out = crate::ext::bare().request(parts.method, url).body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    let mut out = crate::net::process().client(crate::net::Policy::Local).request(parts.method, url).body(reqwest::Body::wrap_stream(body.into_data_stream()));
     for (k, v) in parts.headers.iter().filter(|(k, _)| !matches!(k.as_str(), "host" | "content-length" | "transfer-encoding" | "connection")) {
         out = out.header(k, v);
     }

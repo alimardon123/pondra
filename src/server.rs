@@ -524,15 +524,16 @@ async fn to_leader(State(app): State<App>, req: Request, next: Next) -> Response
         None if app.open().await => None, // (an open node: as `nodes_own` says)
         None => return (StatusCode::UNAUTHORIZED, "the leader checks the caller's own sign-in: send an Authorization header").into_response(),
     };
-    proxy(&app.members.leader().addr, req, as_caller).await.unwrap_or_else(|e| E(e).into_response())
+    proxy(&app.lake.node.net.client(crate::net::Policy::Cluster), &app.members.leader().addr, req, as_caller).await.unwrap_or_else(|e| E(e).into_response())
 }
 
-/// Sends `req` to the leader at `addr`. `as_caller`: the caller's own `Authorization`, which replaces the node's default one
-/// (`cluster::http`; reqwest fills a default header only when the request lacks it). None: the node's own credential.
-async fn proxy(addr: &str, req: Request, as_caller: Option<HeaderValue>) -> anyhow::Result<Response> {
+/// Sends `req` to the leader at `addr` with `http`, the node's client for its lake's nodes (`net::Policy::Cluster`).
+/// `as_caller`: the caller's own `Authorization`, which replaces the node's default one (reqwest fills a default header
+/// only when the request lacks it). None: the node's own credential.
+async fn proxy(http: &reqwest::Client, addr: &str, req: Request, as_caller: Option<HeaderValue>) -> anyhow::Result<Response> {
     let (parts, body) = req.into_parts();
     let url = crate::tls::url(&format!("{addr}{}", parts.uri.path_and_query().map_or("", |p| p.as_str())));
-    let mut out = crate::cluster::http().request(parts.method, url).body(axum::body::to_bytes(body, usize::MAX).await?);
+    let mut out = http.request(parts.method, url).body(axum::body::to_bytes(body, usize::MAX).await?);
     if let Some(ct) = parts.headers.get("content-type") {
         out = out.header("content-type", ct);
     }

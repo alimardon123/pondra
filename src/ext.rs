@@ -391,7 +391,7 @@ fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
         None => return Err(crate::codes::coded("42501", format!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): read it there, or from a bucket (s3://, gs://, az://, https://)"))),
         Some(_) => match covering(secrets, u) {
             None => return Err(crate::codes::coded("42501", uncovered(u))),
-            Some((_, s)) if s.temporary && !s.trusted => crate::public::check(&url::Url::parse(u)?)?, // (`register` holds its store to the public internet)
+            Some((_, s)) if s.temporary && !s.trusted => crate::net::check(&url::Url::parse(u)?)?, // (`register` holds its store to the public internet)
             Some(_) => {}
         },
     }
@@ -700,7 +700,7 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
     let public = to == For::Public;
     let get = |k: &str| p.and_then(|p| p.get(k)).cloned();
     // (an endpoint or host written as an address is refused here; a name, as it resolves)
-    let reach = |u: &str| if public { crate::public::check(&url::Url::parse(u).with_context(|| format!("endpoint {u}"))?) } else { Ok(()) };
+    let reach = |u: &str| if public { crate::net::check(&url::Url::parse(u).with_context(|| format!("endpoint {u}"))?) } else { Ok(()) };
     reach(url.as_str())?;
     let chain = p.is_none() || get("provider").as_deref() == Some("credential_chain");
     let bucket = url.host_str().context("no bucket in the URL")?.to_string();
@@ -935,27 +935,16 @@ pub async fn secret_for(lake: &Lake, url: &str) -> Result<Option<BTreeMap<String
     covering(&list(lake).await?, url).map(|(n, s)| open(&n, &s)).transpose()
 }
 
-/// A client for other engines' services (REST catalogs): Pondra's own tokens never go there.
-pub fn web() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    #[cfg(not(target_arch = "wasm32"))]
-    let client = || reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build().expect("an HTTP client");
-    #[cfg(target_arch = "wasm32")]
-    let client = reqwest::Client::new; // (a page's fetch keeps the browser's own time limits)
-    CLIENT.get_or_init(client)
+/// How the node reaches `url`, a service a statement names (a REST catalog's endpoint, its token server), for this
+/// caller (`net::for_endpoint`): inside the node's network for the program that started it, on a page (`reads_any_url`),
+/// and through a secret an admin made (`inside`); through a reader's own temporary secret, the public internet alone.
+pub(crate) async fn reach_service(lake: &Lake, url: &str) -> Result<crate::net::Policy> {
+    let inside = reads_any_url() || covering(&list(lake).await?, url).is_some_and(|(_, s)| inside(&s));
+    crate::net::for_endpoint(&url::Url::parse(url).with_context(|| url.to_string())?, inside)
 }
 
-/// A client with no token of its own, and no time limit. It is a second client only because it differs
-/// from `web()` in one thing, which is `web()`'s 60 s timeout: dbserver streams whole answers through it,
-/// and ai.rs sets its own timeout per request.
-pub fn bare() -> &'static reqwest::Client {
-    static BARE: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    #[cfg(not(target_arch = "wasm32"))]
-    let client = || reqwest::Client::builder().build().unwrap_or_default();
-    #[cfg(target_arch = "wasm32")]
-    let client = reqwest::Client::new; // (as `web()`: a page's fetch keeps the browser's own time limits)
-    BARE.get_or_init(client)
-}
+/// Does a secret reach inside the node's network? One an admin made, or a temporary one an admin trusts (`register`).
+fn inside(s: &Secret) -> bool { !s.temporary || s.trusted }
 
 /// A recipient's token for a Delta Sharing server, from the secret of TYPE share covering it.
 pub async fn share_token(lake: &Lake, endpoint: &str) -> Result<Option<String>> {
@@ -1045,7 +1034,10 @@ pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
     let at = p.get("oauth2_server_uri").cloned().unwrap_or_else(|| format!("{url}/v1/oauth/tokens"));
     let form = [("grant_type", "client_credentials"), ("client_id", id), ("client_secret", pass), ("scope", p.get("oauth2_scope").map_or("catalog", String::as_str))];
     let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(form).finish();
-    let r = crate::fetch::send(web().post(&at).header("content-type", "application/x-www-form-urlencoded").body(body)).await.with_context(|| format!("asking {at} for a token"))?;
+    // (the token server the secret names: inside the network as the secret reaches)
+    let policy = crate::net::for_endpoint(&url::Url::parse(&at).with_context(|| at.clone())?, reads_any_url() || inside(&secret))?;
+    let ask = lake.node.net.client(policy).post(&at).header("content-type", "application/x-www-form-urlencoded").body(body);
+    let r = crate::fetch::send(crate::net::timeout(ask, std::time::Duration::from_secs(60))).await.with_context(|| format!("asking {at} for a token"))?;
     let status = r.status();
     let body: serde_json::Value = r.json().await.unwrap_or_default();
     ensure!(status.is_success(), "{at} gave no token ({status}): {}", body["error_description"].as_str().or(body["error"].as_str()).unwrap_or(""));

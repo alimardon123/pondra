@@ -413,7 +413,7 @@ pub async fn wait_up(at: &str) {
     let url = crate::tls::url(&format!("{at}/healthz"));
     let mut said = false;
     loop {
-        if crate::cluster::http().get(url.as_str()).timeout(Duration::from_secs(2)).send().await.is_ok() {
+        if crate::net::process().client(crate::net::Policy::Cluster).get(url.as_str()).timeout(Duration::from_secs(2)).send().await.is_ok() {
             return;
         }
         if !std::mem::replace(&mut said, true) {

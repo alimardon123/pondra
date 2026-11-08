@@ -1,6 +1,7 @@
-//! This machine as its OS says (redesign §8, step 2): the native [`Machine`](crate::machine::Machine), which the program
-//! and a library's process install at their start (`cli::main`, `Node::start`). Linux reads `/proc` and the cgroup's
-//! limit; elsewhere the OS's own calls (sysinfo); the free disk is `statvfs` on Unix.
+//! This machine as its OS says (redesign §8, step 2): the native [`Machine`](crate::machine::Machine) and
+//! [`Net`](crate::net::Net), which the program and a library's process install at their start (`cli::main`,
+//! `Node::start`). Linux reads `/proc` and the cgroup's limit; elsewhere the OS's own calls (sysinfo); the free disk is
+//! `statvfs` on Unix.
 use crate::machine::Machine;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -86,6 +87,23 @@ fn page_size() -> usize {
     4096
 }
 
+/// How this process's nodes reach the network (`net::Net`): each policy's client as `net::Clients` makes it, and the
+/// lake's nodes' through the lake's TLS, with the node's token and who calls (`cluster::http`). That token is chosen
+/// per request from the node once the node holds its cluster state (step 2, PR 9).
+#[derive(Default)]
+pub struct Net {
+    clients: crate::net::Clients,
+}
+
+impl crate::net::Net for Net {
+    fn client(&self, policy: crate::net::Policy) -> reqwest::Client {
+        match policy {
+            crate::net::Policy::Cluster => crate::cluster::http(),
+            other => crate::net::Net::client(&self.clients, other),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +131,44 @@ mod tests {
         assert!(os.ram().is_some_and(|b| b > 0) && os.cores() >= 1);
         let (free, total) = os.space(&std::env::temp_dir().join("not-made-yet")).expect("the temp folder's disk");
         assert!(total > 0 && free <= total, "free {free} of {total}");
+    }
+
+    /// The lake's nodes are called with the node's token, and nothing else this node calls out to is: not a service
+    /// someone named, nor this machine's own child. In a child of this test binary, since the token is the environment's.
+    #[test]
+    fn only_the_nodes_are_sent_the_nodes_token() {
+        use crate::net::Policy;
+        const CHILD: &str = "PONDRA_TEST_TOKEN_CHILD";
+        const NAME: &str = "os::tests::only_the_nodes_are_sent_the_nodes_token";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", NAME, "--test-threads=1"]).env(CHILD, "1").env("PONDRA_ADMIN_TOKEN", "the-nodes-token").env_remove("PONDRA_TOKEN");
+            let out = child.output().unwrap();
+            assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"), "the child's own check: {}", String::from_utf8_lossy(&out.stdout));
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = format!("http://{}/", listener.local_addr().unwrap());
+            // (each request answered with the Authorization it carried, or "none")
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut s, _)) = listener.accept().await else { return };
+                    let mut b = [0u8; 4096];
+                    let n = s.read(&mut b).await.unwrap_or(0);
+                    let asked = String::from_utf8_lossy(&b[..n]).to_string();
+                    let auth = asked.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.trim().to_string()));
+                    let said = auth.unwrap_or_else(|| "none".into());
+                    let _ = s.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{said}", said.len()).as_bytes()).await;
+                }
+            });
+            let net = Net::default();
+            for (policy, sent) in [(Policy::Cluster, "Bearer the-nodes-token"), (Policy::ENDPOINT, "none"), (Policy::Endpoint { origin_only: true }, "none"), (Policy::Local, "none")] {
+                let got = crate::net::Net::client(&net, policy).get(&at).send().await.unwrap().text().await.unwrap();
+                assert_eq!(got, sent, "{policy:?}");
+            }
+        });
     }
 }

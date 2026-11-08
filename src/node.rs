@@ -737,7 +737,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
             let (superuser, slug) = whoami(&node, auth).await; // (the sign-in's: a superuser's joins stage their rows, `page::joined_part`)
             crate::dial::set_page_slug(slug);
             let (following, refreshing) = (Arc::downgrade(&app.lake), Arc::downgrade(&app.lake));
-            let (http, auth) = (reqwest::Client::new(), auth.to_string());
+            let (http, auth) = (app.lake.node.net.client(crate::net::Policy::ENDPOINT), auth.to_string()); // (the join's sign-in alone: no token of ours)
             let ended = Arc::new(AtomicBool::new(false)); // (the sign-in ended: neither loop asks again)
             let (said, refreshed) = (ended.clone(), ended.clone());
             let open = move || -> futures::future::BoxFuture<'static, Result<crate::fetch::Response, crate::members::Open>> {
@@ -784,7 +784,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
 /// decides whether the page's INSERTs are its own to stage (`page::joined_part`), and its slug, the folder it stages them in
 /// (`auth::slug`). Not known (no answer in 10 s, or a sign-in refused): neither.
 async fn whoami(node: &str, auth: &str) -> (bool, Option<String>) {
-    let asked = crate::fetch::send(crate::ext::bare().get(format!("{node}/whoami")).header(reqwest::header::AUTHORIZATION, auth));
+    let asked = crate::fetch::send(crate::net::process().client(crate::net::Policy::ENDPOINT).get(format!("{node}/whoami")).header(reqwest::header::AUTHORIZATION, auth));
     let answer = async {
         let r = asked.await.ok().filter(|r| r.status().is_success())?;
         let who: serde_json::Value = r.json().await.ok()?;

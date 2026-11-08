@@ -2330,7 +2330,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the process's resident memory, a disk's free room) is read through `machine::Machine`, never
    `/proc` or the OS below the hosts: the host installs it once (`machine::install`; natively
    `os::Os`, on a page its device's) and a node's state holds it (`NodeState::machine`), so the
-   sim can give each member a machine of its own.
+   sim can give each member a machine of its own. A call out is made with a client of
+   `net::Net` (`NodeState::net`, installed as the machine is; natively `os::Net`), by the policy
+   named for whom it goes to (`net::Policy`: the lake's nodes, a URL someone other than the admin
+   named, this machine's own child, a service someone named), never a client made at its site: the
+   policy is the security choice, made once, and a URL a statement names gets its policy from
+   `net::for_endpoint`.
 
 302. **Every setting is read through `env.rs`, from one table of names** (ADR-061 §8): what the
    process was given (`open`'s options, the command line's flags: `env::give`), else the
@@ -2740,11 +2745,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 405. **A temporary secret only an admin or the node's owner made reaches past the public internet**
    (`public.rs`, `ext::temporary`, `For::Public`): anyone else's is refused `PROVIDER credential_chain`
    (the node's own credentials) and `TYPE kafka` when made. Its stores ask only public addresses: one
-   written in the URL or as an endpoint is checked at build and at each statement (`public::check`), a
-   name as it resolves (`Names`: refused if any address isn't public) and every redirect (`Connector`).
-   A session holding one runs its queries on its node (`temp::holds_secrets` in `App::here_only`): a
-   spread query's shares have no session and would register stores without it. Behind an `HTTP(S)_PROXY`
-   the proxy resolves names. `harness.py reached`.
+   written in the URL or as an endpoint is checked at build and at each statement (`net::check`), a
+   name as it resolves (`Names`: refused if any address isn't public), every redirect, and never
+   through a proxy, which would resolve the names itself (`net::guarded`, the `Public` policy's, which
+   the store's `Connector` is made with). A REST catalog or its token server that such a secret names
+   is reached with that policy too (`ext::reach_service`). A session holding one runs its queries on
+   its node (`temp::holds_secrets` in `App::here_only`): a spread query's shares have no session and
+   would register stores without it. `harness.py reached`, `cargo test --lib net:: public::`.
 
 406. **A scope covers a URL whole or followed by `/`, `?` or `#`** (`ext::within`, wherever a secret's
    scope is matched): `http://127.0.0.1:979` isn't port 9790, `s3://data` isn't `s3://data-other`.

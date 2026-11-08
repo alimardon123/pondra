@@ -4,7 +4,6 @@
 //! and reads the answer here, the same on both. (The cluster's own calls are the cluster's.)
 use futures::Stream;
 use std::future::Future;
-use std::time::Duration;
 
 /// An answer, its body not read yet.
 pub struct Response(reqwest::Response);
@@ -12,15 +11,6 @@ pub struct Response(reqwest::Response);
 /// `req` sent.
 pub fn send(req: reqwest::RequestBuilder) -> impl Future<Output = reqwest::Result<Response>> + Send {
     sent(async move { req.send().await.map(Response) })
-}
-
-/// `req` with a time limit. A page's fetch keeps the browser's own limits.
-pub fn timeout(req: reqwest::RequestBuilder, limit: Duration) -> reqwest::RequestBuilder {
-    #[cfg(not(target_arch = "wasm32"))]
-    let req = req.timeout(limit);
-    #[cfg(target_arch = "wasm32")]
-    let _ = limit;
-    req
 }
 
 /// Did `e` fail before an answer came, other than by its time limit (worth trying again)?

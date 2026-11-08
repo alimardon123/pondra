@@ -47,7 +47,7 @@ const RESTARTS: usize = 3;
 impl Remote {
     /// The catalog of the node at `node`, read with the sign-in `auth`.
     pub(crate) fn new(node: &str, auth: &str) -> Remote {
-        Remote { node: node.trim_end_matches('/').to_string(), auth: auth.to_string(), http: reqwest::Client::new() }
+        Remote { node: node.trim_end_matches('/').to_string(), auth: auth.to_string(), http: crate::net::process().client(crate::net::Policy::ENDPOINT) }
     }
 
     /// One `GET` of the node's `/cluster/kv` at `url`, its answer as `T`. A refusal is its status and the node's words.

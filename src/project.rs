@@ -419,7 +419,7 @@ pub(crate) fn token(given: Option<String>, url: Option<&str>) -> Option<String> 
 /// A node at `base`, as it is. Nothing is started.
 fn node_at(at: &Where, base: String) -> Node {
     let token = token(at.token.clone(), Some(&base));
-    Node { http: reqwest::Client::new(), base, token, owner: at.owner.clone().unwrap_or_default(), child: None }
+    Node { http: crate::net::process().client(crate::net::Policy::ENDPOINT), base, token, owner: at.owner.clone().unwrap_or_default(), child: None }
 }
 
 /// The node an environment is served by. A lake's node is started for the command and stopped when it ends.
@@ -605,7 +605,7 @@ async fn login(url: Option<String>, project: &str, token: Option<String>, user: 
 /// server with several databases and no default answers 404 at its root: the sign-in then goes to the first of
 /// `dbs` that answers.
 async fn sign_in(base: &str, dbs: &[String], token: Option<String>, user: Option<String>, provider: Option<&str>) -> Result<String> {
-    let http = reqwest::Client::new();
+    let http = crate::net::process().client(crate::net::Policy::ENDPOINT);
     let api = answering(&http, base, dbs).await?;
     let token = match (token, user) {
         (Some(t), _) => t,

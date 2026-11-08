@@ -40,8 +40,8 @@ pub struct Joined {
 
 impl Joined {
     pub fn new(node: &str, auth: &str) -> Joined {
-        // (`bare`: no token of its own and no time limit, so a whole file streams through it; the sign-in is this store's own)
-        Joined { node: node.to_string(), auth: auth.to_string(), http: crate::ext::bare().clone() }
+        // (no token of ours and no time limit, so a whole file streams through it; the sign-in is this store's own)
+        Joined { node: node.to_string(), auth: auth.to_string(), http: crate::net::process().client(crate::net::Policy::ENDPOINT) }
     }
 
     /// The node's address as a message names it, `host:port` with no scheme, as `Served` names its node.
