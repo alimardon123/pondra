@@ -2506,7 +2506,7 @@ async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool, 
     if let Some(r) = crate::store::reach_of(dir).filter(|r| r.read_only) {
         return across(dir, &r, req).await; // (a lake on another server: ADR-058)
     }
-    let store = open_store(dir)?.1;
+    let store = crate::store::counted(open_store(dir)?.1, &node.metrics); // (its requests the node's: `Counted`)
     loop {
         match holder(&store).await? {
             // (another `pondra sql` is recording: wait)

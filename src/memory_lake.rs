@@ -15,7 +15,7 @@
 //!
 //! A lake moves out of memory with `memory::set_location` (the host's: `ALTER DATABASE … SET LOCATION`,
 //! `db.save`), which is refused at a place a move didn't finish (`refuse_torn`).
-use crate::store::{Counted, Store};
+use crate::store::Store;
 use futures::future::ready;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
@@ -67,8 +67,28 @@ pub fn in_memory(url: &str) -> bool { url.starts_with("memory://") }
 /// Is a lake held in this process's memory at `url`? (Opening one there makes it.)
 pub fn memory_held(url: &str) -> bool { MEMORY.lock().unwrap_or_else(PoisonError::into_inner).contains_key(url.trim_end_matches('/')) }
 
-/// Is `store` a lake held in this process's memory? Every open of one gives the same store.
-pub fn held_in_memory(store: &Store) -> bool { MEMORY.lock().unwrap_or_else(PoisonError::into_inner).values().any(|s| Arc::ptr_eq(s, store)) }
+/// The counted opens of the lakes held here (`store::counted`), each with the store it counts the requests of: an open
+/// is its node's, so it is a store of its own, and `held_in_memory` knows it as its lake's by this list. Weak both, so
+/// neither stays for it: an entry goes once either has gone. (Not `per_node!`, as `MEMORY` isn't: an open outlives no
+/// lake here, and a restart in place keeps its lake.)
+static COUNTED: std::sync::LazyLock<Mutex<Vec<(std::sync::Weak<dyn object_store::ObjectStore>, std::sync::Weak<dyn object_store::ObjectStore>)>>> = std::sync::LazyLock::new(Default::default);
+
+/// `open`, which counts the requests of `store`, is that store still: a lake held in memory's, if it is one.
+pub(crate) fn counts(open: &Store, store: &Store) {
+    if held_in_memory(store) {
+        let mut counted = COUNTED.lock().unwrap_or_else(PoisonError::into_inner);
+        counted.retain(|(o, s)| o.strong_count() > 0 && s.strong_count() > 0);
+        counted.push((Arc::downgrade(open), Arc::downgrade(store)));
+    }
+}
+
+/// Is `store` a lake held in this process's memory? Every open of one gives the same store, and a counted open of it
+/// (`counts`) is that store too: a term claimed through one is this process's, with no lock file (`terms::claim`).
+pub fn held_in_memory(store: &Store) -> bool {
+    let held = |s: &Store| MEMORY.lock().unwrap_or_else(PoisonError::into_inner).values().any(|h| Arc::ptr_eq(h, s));
+    let inner = COUNTED.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(o, _)| std::ptr::addr_eq(o.as_ptr(), Arc::as_ptr(store))).and_then(|(_, s)| s.upgrade());
+    held(store) || inner.is_some_and(|s| held(&s))
+}
 
 /// A lake's place as given: `:memory:` (DuckDB's word) is a new lake in this process's memory.
 pub fn place(lake: &str) -> String {
@@ -86,12 +106,12 @@ pub fn forget_memory(url: &str) { MEMORY.lock().unwrap_or_else(PoisonError::into
 
 /// The store of the lake held in memory at `url`: the same one for every open of it, made on the first.
 pub fn store(url: &str) -> Store {
-    MEMORY.lock().unwrap_or_else(PoisonError::into_inner).entry(url.trim_end_matches('/').to_string()).or_insert_with(|| Arc::new(Counted(Arc::new(Held::new())))).clone()
+    MEMORY.lock().unwrap_or_else(PoisonError::into_inner).entry(url.trim_end_matches('/').to_string()).or_insert_with(|| Arc::new(Held::new())).clone()
 }
 
 /// Holds `given` (a page's private folder, OPFS) as the lake in memory at `url`, so every open of `url` gives it
 /// (`store`), as it gives a lake made in memory; `forget_memory` lets it go, its objects staying where they are.
-pub fn give(url: &str, given: Store) { MEMORY.lock().unwrap_or_else(PoisonError::into_inner).insert(url.trim_end_matches('/').to_string(), Arc::new(Counted(given))); }
+pub fn give(url: &str, given: Store) { MEMORY.lock().unwrap_or_else(PoisonError::into_inner).insert(url.trim_end_matches('/').to_string(), given); }
 
 /// The bytes past which a lake's files and log go to disk: `PONDRA_MEMORY_LAKE_GB`, else a quarter of
 /// the machine's memory (4 GB where it can't say).

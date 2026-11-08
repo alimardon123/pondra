@@ -174,12 +174,12 @@ fn refuse_kept(path: &str) -> anyhow::Result<()> {
 /// unless `if_match` names the version `GET` gave: then it is replaced, if nobody replaced it meanwhile
 /// (412 if so; ADR-034). Each save is kept as a version too (`keep`, ADR-035 §8). A `.py` is an admin's to save,
 /// and a path Pondra keeps is refused. Both doors call it.
-pub async fn put(lake: &Lake, path: &str, if_match: Option<&str>, body: bytes::Bytes) -> anyhow::Result<Filed> {
+pub async fn put(lake: &Lake, path: &str, if_match: Option<&str>, body: bytes::Bytes, role: crate::auth::Role) -> anyhow::Result<Filed> {
     let (path, bytes) = (under_files(path)?, body.len());
     refuse_kept(&path)?;
     // (the HTTP door's gate (`Auth::needed`) asks the same of the raw path; this asks it of the name the store keeps, so the
-    // two can't disagree. No request at all (the node's own work) is let through)
-    if crate::auth::py_name(&stored_name(&path)) && crate::auth::current().is_some_and(|p| p.role < crate::auth::Role::Admin) {
+    // two can't disagree. `role` is its door's caller's)
+    if crate::auth::py_name(&stored_name(&path)) && role < crate::auth::Role::Admin {
         return Err(crate::codes::coded("42501", format!("{path}: code a node runs is saved by an admin")));
     }
     let expect = if_match.map(|v| v.trim_matches('"').to_string());

@@ -665,7 +665,8 @@ pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) 
     if let Some(given) = store {
         crate::memory_lake::give(&url, given); // (a kept page's objects stay in its folder when the page closes: `end_page` forgets the URL only)
     }
-    let store = crate::memory_lake::store(&url);
+    let node = crate::node_state::NodeState::new(life.clone());
+    let store = crate::store::counted(crate::memory_lake::store(&url), &node.metrics); // (its term's claims and marks the page's: `Counted`)
     let lead = if owned { crate::members::Alone::lead_owned(&store).await } else { crate::members::Alone::lead(&store).await };
     let (alone, marks) = match lead {
         Ok(led) => led,
@@ -679,7 +680,7 @@ pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) 
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open(&url, true, false, crate::node_state::NodeState::new(life.clone())).await?;
+        let l = crate::store::Lake::open(&url, true, false, node).await?;
         lake = Some(l.clone());
         start_app(l, alone.clone(), None, &start).await
     }

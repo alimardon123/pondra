@@ -7,8 +7,8 @@ use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// A node's own counters (`NodeState::metrics`): what `/metrics` and `/stats` say of it. Two nodes in one process count
-/// apart, and a node's start begins them at 0. (The store's and the shuffle's counters below are still the process's, for
-/// one node at a time, until they move: l7-wip/step2-pr8-metrics-plan.md.)
+/// apart, and a node's start begins them at 0. (The shuffle's counters below are still the process's, for one node at a
+/// time, until they move: l7-wip/step2-pr8-metrics-plan.md.)
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub rows_in: AtomicU64,       // rows this node took into the log, by any door
@@ -22,6 +22,12 @@ pub struct Metrics {
     pub files_scanned: AtomicU64, // append-table files queries opened…
     pub files_skipped: AtomicU64, // …and skipped by their min/max
     pub hot_skipped: AtomicU64,   // batches of hot columns scans skipped by their ranges (`hot::Skip`)
+    pub object_writes: AtomicU64,  // object-store requests its lakes made (`store::Counted`, on each lake's open): writes…
+    pub object_lists: AtomicU64,   // …lists…
+    pub object_deletes: AtomicU64, // …deletes…
+    pub object_reads: AtomicU64,   // …and reads (GET and HEAD)
+    pub catalog_reads: AtomicU64,  // catalog records it read (a lookup, there or not, or each a scan gave)…
+    pub catalog_writes: AtomicU64, // …and put or deleted (the write-set rule: designs/redesign/redesign.md §4)
     /// Background loops that fail without failing a request, by `JOBS`: counted here, so a stall that otherwise shows only
     /// on stderr is visible in `/metrics` and `/stats`.
     failed: [AtomicU64; JOBS.len()],
@@ -41,12 +47,6 @@ impl Metrics {
     pub fn failures(&self) -> Vec<(&'static str, u64)> { JOBS.iter().zip(&self.failed).map(|(k, c)| (*k, c.load(Relaxed))).collect() }
 }
 
-crate::per_node!(pub static OBJECT_WRITES: AtomicU64 = AtomicU64::new(0)); // object-store requests this process made (`store::Counted`): writes…
-crate::per_node!(pub static OBJECT_LISTS: AtomicU64 = AtomicU64::new(0)); // …lists…
-crate::per_node!(pub static OBJECT_DELETES: AtomicU64 = AtomicU64::new(0)); // …deletes…
-crate::per_node!(pub static OBJECT_READS: AtomicU64 = AtomicU64::new(0)); // …and reads (GET and HEAD)
-crate::per_node!(pub static CATALOG_READS: AtomicU64 = AtomicU64::new(0)); // catalog records this node read (a lookup, there or not, or each a scan gave)…
-crate::per_node!(pub static CATALOG_WRITES: AtomicU64 = AtomicU64::new(0)); // …and put or deleted (the write-set rule: designs/redesign/redesign.md §4)
 crate::per_node!(pub static SPILLED: AtomicU64 = AtomicU64::new(0)); // shuffle bytes written to this node's disk
 crate::per_node!(pub static SKEW: AtomicU64 = AtomicU64::new(0)); // the worst bucket/average seen in a shuffle, x100
 crate::per_node!(pub static RECEIVED: AtomicU64 = AtomicU64::new(0)); // shuffle bytes this node's steps read (its share of the work)
@@ -122,9 +122,9 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("shuffled_queries_total", "counter", "…of them with a shuffle", &one(get(&m.shuffled)));
     metric("ranged_queries_total", "counter", "…of them with their tables sliced by a key's ranges", &one(get(&m.ranged)));
     metric("files_scanned_total", "counter", "Parquet files queries read", &one(get(&m.files_scanned)));
-    metric("catalog_records_total", "counter", "catalog records this node read and wrote", &[("{op=\"read\"}".to_string(), get(&CATALOG_READS)), ("{op=\"write\"}".to_string(), get(&CATALOG_WRITES))]);
+    metric("catalog_records_total", "counter", "catalog records this node read and wrote", &[("{op=\"read\"}".to_string(), get(&m.catalog_reads)), ("{op=\"write\"}".to_string(), get(&m.catalog_writes))]);
     metric("files_skipped_total", "counter", "Parquet files queries skipped by min/max, unopened", &one(get(&m.files_skipped)));
-    let requests = [("write", &OBJECT_WRITES), ("list", &OBJECT_LISTS), ("delete", &OBJECT_DELETES), ("read", &OBJECT_READS)].map(|(op, c)| (format!("{{op=\"{op}\"}}"), get(c)));
+    let requests = [("write", &m.object_writes), ("list", &m.object_lists), ("delete", &m.object_deletes), ("read", &m.object_reads)].map(|(op, c)| (format!("{{op=\"{op}\"}}"), get(c)));
     metric("object_requests_total", "counter", "requests this process made of its bucket, past the SSD tier: writes (a multipart upload's start, parts and end each one), lists, deletes and reads, as a bucket bills and rate-limits them", &requests);
     metric("background_failures_total", "counter", "background jobs (tiering, publishing, emission, tasks, checkpoints) that failed; a rising count is a stall to look at", &m.failures().iter().map(|(k, n)| (format!("{{job=\"{k}\"}}"), *n as f64)).collect::<Vec<_>>());
     let turns = crate::budget::turns();
