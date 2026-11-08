@@ -151,8 +151,33 @@ mod tests {
         ] {
             assert_eq!(crate::parsed::read(sql), generic(wrote), "{sql}");
         }
+        // (a FOR in parentheses is its function's: the bracket's own decides)
+        let sub = "SELECT [substring(s FROM 1 FOR 2) FOR s IN l] AS v";
+        assert_eq!(crate::parsed::read(sub), generic("SELECT array_transform((l), s -> (substring(s FROM 1 FOR 2))) AS v"));
         // (an array is an array: the hook leaves it to the dialect)
-        assert_eq!(parse("SELECT [1, 2] AS a, [x, y][1] AS b").0, generic("SELECT [1, 2] AS a, [x, y][1] AS b"));
+        for sql in ["SELECT [1, 2] AS a, [x, y][1] AS b", "SELECT [substring(s FROM 1 FOR 2), 'x'] AS a, [{'k': 1}, [2]] AS b, [] AS c"] {
+            assert_eq!(parse(sql).0, generic(sql), "{sql}");
+        }
+    }
+
+    /// A bracket is read once (`friendly::comprehends`), so nested ones take time in proportion to the text, with or
+    /// without a FOR in each: reading each one's first element twice doubled the time at each, 2^24 steps at 24.
+    #[test]
+    fn nested_brackets_are_read_once() {
+        for depth in [20, 24] {
+            let (open, plain) = ("[".repeat(depth), "]".repeat(depth));
+            for sql in [
+                format!("SELECT {open}1{plain} +"),
+                format!("SELECT {open}1{}", ", 1 FOR x IN l]".repeat(depth)),
+                format!("SELECT {open}1{}", " j FOR x IN l]".repeat(depth)),
+            ] {
+                let t = std::time::Instant::now();
+                assert!(parse(&sql).0.is_err(), "{sql}");
+                assert!(t.elapsed() < std::time::Duration::from_millis(500), "{depth} brackets: {:?} for {sql}", t.elapsed());
+            }
+        }
+        let deep = format!("SELECT {}x * 2{} AS v", "[".repeat(16), " FOR x IN l]".repeat(16)); // (each one's body the next)
+        assert!(parse(&deep).0.is_ok(), "{deep}");
     }
 
     /// When both refuse, the error is the one of the parse that read further: a missing `]` after a comprehension points
