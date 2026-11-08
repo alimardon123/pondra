@@ -377,14 +377,16 @@ pub fn main() {
     let work = std::thread::Builder::new().name("pondra".into()).stack_size(8 << 20).spawn(|| {
         // Few blocking threads, gone after a second idle (`panics::runtime`): kept alive, each held
         // the memory its work had used, and a node under steady writes grew for as long as it ran.
-        panics::runtime().build().expect("a runtime").block_on(async {
+        // (the command is the program's own work, its operator's: `pondra sql`'s statements, and a node's start before
+        // its loops and doors begin, run as the node's: `auth::as_node`. A request a door serves is its caller's)
+        panics::runtime().build().expect("a runtime").block_on(crate::auth::as_node(async {
             // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
             if let Err(e) = run().await {
                 eprintln!("Error: {}", ext::said(&e));
                 crate::memory::leave(); // (what this process made goes first: `process::exit` runs no destructor)
                 std::process::exit(1);
             }
-        })
+        }))
     });
     let panicked = work.expect("a thread to work on").join().is_err();
     crate::memory::leave(); // (`main` returns, or exits below, past statics no destructor runs for: what it made goes now)

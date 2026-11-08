@@ -1338,7 +1338,7 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
         }
     };
     let role = if superuser { Role::Admin } else if access.writes() { Role::Write } else { Role::Read };
-    Ok(Principal { name: user.to_string(), role, scope: if superuser { Default::default() } else { crate::rights::Scope::granted(access) }, door: "node", from: None, operator: false, epoch, until: None })
+    Ok(Principal { name: user.to_string(), role, scope: if superuser { crate::rights::Scope::everything() } else { crate::rights::Scope::granted(access) }, door: "node", from: None, operator: false, epoch, until: None })
 }
 
 /// Seconds as said: `90 seconds`, `5 minutes`, `1 hour`.

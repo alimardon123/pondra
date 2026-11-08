@@ -37,8 +37,17 @@ impl Principal {
             Role::Read => "reader",
             Role::None => "",
         };
-        Principal { name: name.into(), role, scope: Default::default(), door: "node", from: None, operator: false, epoch: 0, until: None }
+        // (nobody signed in sees nothing: whole is a role's that is something, `rights::Scope`)
+        let scope = match role {
+            Role::None => crate::rights::Scope::nothing(),
+            _ => crate::rights::Scope::everything(),
+        };
+        Principal { name: name.into(), role, scope, door: "node", from: None, operator: false, epoch: 0, until: None }
     }
+
+    /// The node's own work's (`as_node`: what no request asked for, a task's tick, a view's refresh, the history's
+    /// writer): an admin token's, over everything. With a token's and a superuser's sign-in, the only whole scope.
+    pub fn node() -> Principal { Principal::token(Role::Admin) }
 
     /// An admin token's rights, or a superuser's: an admin whose scope is whole.
     pub fn superuser(&self) -> bool { self.role == Role::Admin && self.scope.whole() }
@@ -67,8 +76,10 @@ tokio::task_local! {
     static NODE: ();
 }
 
-/// `f` as the node's own work: with no principal set, `rights::may` decides what it asks as an admin token's. Work with
-/// neither is refused, so work a request starts and loses its caller (spawned without `carried`) gets no rights.
+/// `f` as the node's own work (`Principal::node`): with no principal set, `rights::may` decides what it asks as an admin
+/// token's, and `rights::scope` is whole. Work with neither is refused and sees nothing, so work a request starts and loses
+/// its caller (spawned without `carried`) gets no rights. Each loop of the node's says so where it starts: a spawned task
+/// keeps no task-local (`tools/scope_check.py` counts them).
 pub async fn as_node<F: std::future::Future>(f: F) -> F::Output { NODE.scope((), f).await }
 
 /// Is this the node's own work (`as_node`)?
@@ -716,7 +727,7 @@ mod tests {
     /// other key, a token's and a caller with no name are all refused.
     #[test]
     fn a_page_stages_only_its_own_files() {
-        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, scope: Default::default(), door: "http", from: None, operator: false, epoch: 0, until: None };
+        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, scope: crate::rights::Scope::everything(), door: "http", from: None, operator: false, epoch: 0, until: None };
         assert_eq!(slug(&user("ali")).as_deref(), Some("616c69"), "a user's slug is its name in hex");
         assert!(slug(&Principal::token(Role::Admin)).is_none(), "a token has no slug");
         let long = format!("stage/616c69/{}/0.parquet", "j".repeat(65));

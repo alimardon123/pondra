@@ -80,7 +80,7 @@ pub async fn send(store: &Store, r: &Request, wake: Option<(&str, &crate::lifecy
 /// `rings`, `terms::listen`), every 30 s anyway, and once at start: requests may have waited
 /// for a leader.
 pub fn serve(lake: Arc<Lake>, seq: Arc<Sequencer>, lock: Arc<Mutex<()>>, mut rings: tokio::sync::watch::Receiver<u64>) {
-    crate::panics::spawn(async move {
+    crate::panics::own(async move { // (the node's own work, as a one-off writer's own statement was)
         loop {
             if let Err(e) = drain(&lake, &seq, &lock, false).await {
                 eprintln!("inbox: {e:#}");

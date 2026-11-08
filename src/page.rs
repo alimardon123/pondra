@@ -430,7 +430,7 @@ impl Page {
     async fn member(&self) -> anyhow::Result<&crate::node::Paged> {
         anyhow::ensure!(self.holds_claim, "this page is closed");
         self.member
-            .get_or_try_init(|| async {
+            .get_or_try_init(|| crate::auth::as_node(async { // (a member's start is the node's own work, whichever request asks first)
                 match &self.joined {
                     Some(j) => {
                         let auth = format!("Bearer {}", j.session);
@@ -438,7 +438,7 @@ impl Page {
                     }
                     None => crate::node::open_page(self.store.clone(), crate::node::PageLife::new(self.say)).await,
                 }
-            })
+            }))
             .await
     }
 
@@ -1416,7 +1416,7 @@ mod tests {
         // (planning needs more than a test thread's stack, as `tests/page_lake.rs`'s does)
         std::thread::Builder::new()
             .stack_size(32 << 20)
-            .spawn(|| tokio::runtime::Builder::new_multi_thread().thread_stack_size(32 << 20).enable_all().build().unwrap().block_on(joined_steps()).unwrap())
+            .spawn(|| tokio::runtime::Builder::new_multi_thread().thread_stack_size(32 << 20).enable_all().build().unwrap().block_on(crate::auth::as_node(joined_steps())).unwrap()) // (the page member's own work: `auth::as_node`)
             .unwrap()
             .join()
             .unwrap();

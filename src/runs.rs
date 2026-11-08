@@ -263,7 +263,7 @@ async fn append(app: &App, producer: &str, seq: u64, lines: &[Line], made: &mut 
 /// node goes, not every 30 s: a month of a task every second is millions of rows. A run that ends
 /// after all writes its row again: the newest row is its row.)
 pub fn mark_stopped(app: App) {
-    crate::panics::spawn(async move {
+    crate::panics::own(async move { // (the node's own work)
         let since = now_ms();
         if crate::backup::frozen(&app.lake) {
             return; // (a backup runs nothing, and writes no run log: ADR-070)
@@ -775,7 +775,7 @@ static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 /// Leader: run the tasks as their ticks come, for as long as this node leads (a new leader is a
 /// new process). Nothing to do costs a look at the catalog's version twice a second.
 pub fn schedule(app: App) {
-    crate::panics::spawn(async move {
+    crate::panics::own(async move { // (the node's own work; each tick, its task's: `run_tick`)
         let running: Arc<Mutex<HashSet<String>>> = Default::default();
         loop {
             tokio::select! {

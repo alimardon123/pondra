@@ -215,6 +215,10 @@ pub fn start() {
     if cfg!(target_arch = "wasm32") {
         return;
     }
+    // DataFusion's spawned work runs as the request that spawned it, and charges it where there is a line, as the
+    // request's own polls do (`charge`: with no line, no request is charged). (A tracer a program embedding the library
+    // set first is kept: its error is ignored.)
+    let _ = datafusion::common::runtime::set_join_set_tracer(&TRACER);
     WATCH.started.call_once(watch);
 }
 
@@ -226,11 +230,6 @@ fn watch() {
     }
     let line = line(); // (None in a host's process: there the watch only gives the cache back)
     WATCH.watching.store(true, Relaxed);
-    if line.is_some() {
-        // DataFusion's spawned work charges the request that spawned it, as the request's own polls do (`charge`).
-        // (A tracer a program embedding the library set first is kept: its error is ignored.)
-        let _ = datafusion::common::runtime::set_join_set_tracer(&TRACER);
-    }
     crate::panics::alone(async move {
         let mut last_stop = None; // when the last stop was made: it holds the watch (`pending`)
         let mut said = false; // the line for this stretch over the line, said once
@@ -453,7 +452,7 @@ pub fn charge<F: Future>(used: Arc<AtomicI64>, f: F) -> impl Future<Output = F::
 }
 
 /// DataFusion's tracer (`datafusion::common::runtime`): a task or a blocking closure it spawns while a
-/// request runs is charged to that request, wherever it runs. Outside a request nothing changes.
+/// request runs is charged to that request, wherever it runs, and a task runs as its caller (`auth::carried`).
 struct Tracer;
 
 static TRACER: Tracer = Tracer;
@@ -464,6 +463,9 @@ impl datafusion::common::runtime::JoinSetTracer for Tracer {
         fut: futures::future::BoxFuture<'static, Box<dyn std::any::Any + Send>>,
     ) -> futures::future::BoxFuture<'static, Box<dyn std::any::Any + Send>> {
         use futures::FutureExt;
+        // (and its caller, as a task it spawns would lose it: a function that asks back mid-query, and an error's words, read
+        // what the query's caller may, `rights::scope`; the node's own query stays the node's: `auth::carried`)
+        let fut = crate::auth::carried(fut).boxed();
         match REQUEST.try_with(Arc::clone) {
             Ok(used) => charge(used, fut).boxed(),
             Err(_) => fut,
@@ -582,6 +584,21 @@ mod tests {
 
     fn runs(list: Vec<(u64, Running)>) -> BTreeMap<u64, Running> {
         list.into_iter().collect()
+    }
+
+    /// A task DataFusion spawns runs as its query's caller (a function that asks back, an error's words: `rights::scope`),
+    /// where a task spawned with nothing lost it; and the node's own query stays the node's.
+    #[tokio::test]
+    async fn a_task_datafusion_spawns_keeps_its_caller() {
+        use datafusion::common::runtime::JoinSetTracer;
+        use futures::FutureExt;
+        let whole = || async { Box::new(crate::rights::scope().whole()) as Box<dyn std::any::Any + Send> }.boxed();
+        let ran = |traced: futures::future::BoxFuture<'static, Box<dyn std::any::Any + Send>>| async { *tokio::spawn(traced).await.unwrap().downcast::<bool>().unwrap() };
+        let token = crate::auth::Principal::token(crate::auth::Role::Read);
+        assert!(!ran(crate::auth::WHO.scope(token.clone(), async { whole() }).await).await, "spawned as is: no caller, nothing");
+        assert!(ran(crate::auth::WHO.scope(token, async { TRACER.trace_future(whole()) }).await).await, "traced: its caller's");
+        assert!(ran(crate::auth::as_node(async { TRACER.trace_future(whole()) }).await).await, "the node's own");
+        assert!(!ran(TRACER.trace_future(whole())).await, "no caller: none");
     }
 
     #[test]

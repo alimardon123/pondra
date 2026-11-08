@@ -384,10 +384,11 @@ pub async fn leader(lake: Arc<Lake>, seq: Arc<Sequencer>, table: String, src: Sr
     // (no lock yet: this process's router isn't made, so the node is still starting; a retry reaches it)
     let lock = lock_of(&lake).ok_or_else(|| anyhow::anyhow!("{table}: the node is still starting, catching up with its leader: try again"))?;
     let node = lake.node.clone();
-    let task = crate::panics::task(crate::panics::door(&node, async move {
+    // (the check is the node's own work, whoever's rows: a UNIQUE or a key reads every row, granted or not: `auth::as_node`)
+    let task = crate::panics::task(crate::panics::door(&node, crate::auth::as_node(async move {
         let _one = lock.lock().await;
         append(&lake, &seq, &table, src, batch).await
-    }));
+    })));
     match task.await {
         Ok(Ok(ack)) => ack,
         Ok(Err(panic)) => Err(anyhow::anyhow!(panic)),

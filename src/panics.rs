@@ -315,6 +315,13 @@ pub fn spawn<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> 
     }))
 }
 
+/// Start a loop of the node's own, as [`spawn`] does: no request asked for it, so it runs as the node's own work
+/// (`auth::as_node`), which a spawned task would otherwise lose. With no caller it would see nothing; this way what it
+/// plans sees what the node holds, whoever's rows it handles (a flush's views, the inbox's statements).
+pub fn own<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
+    spawn(crate::auth::as_node(f))
+}
+
 /// Start a task of the node's whose panic is its own (a connection's, work beside a request): what
 /// `tokio::spawn` was, but ended with the node (`tools/per_node_check.py` fails a `tokio::spawn`).
 pub fn task<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {

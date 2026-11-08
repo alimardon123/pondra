@@ -122,7 +122,7 @@ impl Opened {
         let router = Arc::new(Mutex::new(None));
         let (first, started) = std::sync::mpsc::channel();
         let (st, ro) = (state.clone(), router.clone());
-        let thread = std::thread::Builder::new().name("pondra-supervisor".into()).stack_size(8 << 20).spawn(move || runtime().block_on(supervise(options, st, ro, rx, first)));
+        let thread = std::thread::Builder::new().name("pondra-supervisor".into()).stack_size(8 << 20).spawn(move || runtime().block_on(crate::auth::as_node(supervise(options, st, ro, rx, first)))); // (the node's start: its own work, `auth::as_node`; a request is its caller's)
         let thread = match thread {
             Ok(t) => t,
             Err(e) => {

@@ -388,7 +388,8 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
 }
 
 /// The member's own loops over its App, each as a node that lives keeps it (none for a guest): the leader's keys,
-/// tasks, tiering, checkpoints and emission, a follower's catalog refresh, streaming tasks, the store's upkeep.
+/// tasks, tiering, checkpoints and emission, a follower's catalog refresh, streaming tasks, the store's upkeep. Each is
+/// the node's own work, and says so where it starts (`own`).
 pub fn keep(app: &crate::app::App, s: &Start) {
     let lives = !app.lake.node.life.one_off();
     let leader = app.seq.is_some();
@@ -396,7 +397,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     let lake = app.lake.clone();
     if leader && lives {
         let (l, c, tokens) = (app.lake.clone(), app.members.clone(), app.auth.on()); // (beside serving, not before it: C5)
-        panics::spawn(async move {
+        panics::own(async move {
             let made = users::kept(&l).await == "none";
             match users::make_keys(&l).await {
                 Err(e) => eprintln!("the lake's keys (sessions', the nodes'): {e:#}"), // (sessions' signing key, and the nodes' own: `users.rs`)
@@ -432,7 +433,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
             }
         });
         let (l, c) = (app.lake.clone(), app.members.clone());
-        panics::spawn(async move {
+        panics::own(async move {
             // (a branch's pins in bases on other servers, renewed while it is used here: `branch::lapse`)
             while c.is_leader() {
                 branch::renew(&l).await;
@@ -443,7 +444,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     if lives {
         let l = app.lake.clone();
         let closing = app.lake.node.drain.closing();
-        panics::spawn(async move {
+        panics::own(async move {
             // (a follower's catalog shows the leader's keys once the leader has flushed them)
             let mut said = false;
             for _ in 0..600 {
@@ -482,7 +483,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         // Iceberg tables here at once: `iceberg::Published::location`. Only then: the pass loads every
         // published table's manifests, and a lake that stayed where it was has nothing new for it)
         let (a, l) = (app.clone(), lake.clone());
-        panics::task(async move {
+        panics::task(crate::auth::as_node(async move {
             if !crate::iceberg::elsewhere(&l).await {
                 return;
             }
@@ -490,14 +491,14 @@ pub fn keep(app: &crate::app::App, s: &Start) {
             if let Err(e) = crate::delta::publish_all(&l).await {
                 eprintln!("publishing at start: {e:#}");
             }
-        });
+        }));
     }
     if lives && app.log.is_some() {
         feeds::start(app.clone()); // (other clusters' topics feeding views: none, no work)
     }
     if let (true, Some(seq), Some(log)) = (lives, &app.seq, &app.log) {
         let (lake, log, seq, lock) = (lake.clone(), log.clone(), seq.clone(), app.lock.clone()); // windows, sessions and matches past the watermark, emitted once
-        panics::spawn(async move {
+        panics::own(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 if let Err(e) = views::emit_all(&lake, &log, &seq, &lock).await {
@@ -514,7 +515,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         // The leader's SSD tier learns of objects other nodes wrote from its own commits (and its hot
         // columns of the files they replaced).
         let l = lake.clone();
-        panics::spawn(async move {
+        panics::own(async move {
             let (_, mut commits) = l.cat.subscribe();
             loop {
                 match commits.recv().await {
@@ -534,7 +535,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         // round's own commit, so what it waits past is the version the round left.
         if s.tier_secs > 0.0 {
             let (a, mut hwm, period) = (app.clone(), lake.hwm.subscribe(), Duration::from_secs_f64(s.tier_secs));
-            panics::spawn(async move {
+            panics::own(async move {
                 loop {
                     let (start, before) = (tokio::time::Instant::now(), *hwm.borrow_and_update());
                     let failed = a.tier_all(0).await.inspect_err(|e| eprintln!("background job failed: {e:#}")).is_err();
@@ -577,7 +578,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     }
     if !reader && lives {
         let (a, max_wait) = (app.clone(), Duration::from_millis(s.task_ms));
-        panics::spawn(async move {
+        panics::own(async move {
             let mut commits = a.lake.hwm.subscribe();
             loop {
                 let _ = tokio::time::timeout(max_wait, commits.changed()).await; // new rows, or time's up
@@ -843,7 +844,7 @@ where
     if period.is_zero() {
         return;
     }
-    panics::spawn(async move {
+    panics::own(async move {
         let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
