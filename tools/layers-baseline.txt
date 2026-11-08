@@ -138,7 +138,6 @@ memory_lake -> wasm32  10
 metrics -> ai  3
 metrics -> app  1
 metrics -> budget  1
-metrics -> hot  1
 metrics -> jemalloc  1
 metrics -> spill  1
 metrics -> store  1
