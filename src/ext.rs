@@ -722,6 +722,13 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
         if let Some(r) = get("region") {
             b = b.with_region(r);
         }
+        // (a customer's KMS key: each object written is encrypted with it, SSE-KMS. Without one the bucket still
+        // encrypts at rest, with its own keys. From the environment `AWS_SSE_KMS_KEY_ID` alone is enough: on its own
+        // it would be ignored, short of `AWS_SERVER_SIDE_ENCRYPTION`)
+        let from_env = || chain.then(|| std::env::var("AWS_SSE_KMS_KEY_ID").ok()).flatten().filter(|_| std::env::var_os("AWS_SERVER_SIDE_ENCRYPTION").is_none());
+        if let Some(k) = get("kms_key_id").or_else(from_env) {
+            b = b.with_sse_kms_encryption(k);
+        }
         match (get("key_id"), get("secret")) {
             (Some(k), Some(s)) => b = b.with_access_key_id(k).with_secret_access_key(s),
             _ if !chain => b = b.with_skip_signature(true), // (a secret without keys: a public bucket)
@@ -1074,7 +1081,7 @@ pub(crate) fn secret_key(name: &str) -> String { format!("e/{name}") }
 /// Each type's settings (DuckDB's names), and the URL schemes it serves.
 fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
     Ok(match t {
-        "s3" | "r2" => (&["key_id", "secret", "region", "session_token", "endpoint", "url_style", "use_ssl", "account_id", "provider", "scope"], &["s3", "r2"]),
+        "s3" | "r2" => (&["key_id", "secret", "region", "kms_key_id", "session_token", "endpoint", "url_style", "use_ssl", "account_id", "provider", "scope"], &["s3", "r2"]),
         "gcs" => (&["key_id", "secret", "service_account_key", "endpoint", "provider", "scope"], &["gs", "gcs"]),
         "azure" => (&["connection_string", "account_name", "account_key", "sas_token", "tenant_id", "client_id", "client_secret", "endpoint", "use_emulator", "provider", "scope"], &["az", "azure", "abfs", "abfss"]),
         "http" => (&["bearer_token", "scope"], &["http", "https"]),
@@ -1836,6 +1843,46 @@ impl datafusion::catalog::TableProvider for Secrets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bucket's KMS key (`KMS_KEY_ID`, DuckDB's name, beside `REGION`) encrypts each object written with it: the
+    /// write asks the bucket for SSE-KMS with that key. Without one, the write asks for nothing, and the bucket's own
+    /// encryption at rest holds.
+    #[tokio::test]
+    async fn a_kms_key_encrypts_each_object_written_with_it() -> Result<()> {
+        use object_store::ObjectStoreExt as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let heard = tokio::spawn(async move {
+            let mut said = Vec::new();
+            while said.len() < 2 {
+                let (mut c, _) = listener.accept().await?;
+                let mut got = Vec::new();
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut buf = [0; 4096];
+                    let n = c.read(&mut buf).await?;
+                    anyhow::ensure!(n > 0, "the request ended before its headers did");
+                    got.extend_from_slice(&buf[..n]);
+                }
+                said.push(String::from_utf8_lossy(&got).to_lowercase());
+                c.write_all(b"HTTP/1.1 200 OK\r\nETag: \"e\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+            }
+            anyhow::Ok(said)
+        });
+        let key = "arn:aws:kms:eu-west-1:111122223333:key/k1";
+        for kms in [Some(key), None] {
+            let mut p: BTreeMap<String, String> = [("key_id", "k"), ("secret", "s"), ("region", "eu-west-1"), ("endpoint", endpoint.as_str())].map(|(k, v)| (k.to_string(), v.to_string())).into();
+            p.extend(kms.map(|k| ("kms_key_id".to_string(), k.to_string())));
+            build(&url::Url::parse("s3://b/lake")?, Some(&p), For::Files)?.put(&object_store::path::Path::from("lake/o"), b"x".to_vec().into()).await?;
+        }
+        let said = heard.await??;
+        assert!(said[0].starts_with("put "), "{}", said[0]);
+        assert!(said[0].contains("x-amz-server-side-encryption: aws:kms\r\n"), "{}", said[0]);
+        assert!(said[0].contains(&format!("x-amz-server-side-encryption-aws-kms-key-id: {key}\r\n")), "{}", said[0]);
+        assert!(!said[1].contains("x-amz-server-side-encryption"), "no key, no header: {}", said[1]);
+        assert!(kind("s3")?.0.contains(&"kms_key_id") && kind("r2")?.0.contains(&"kms_key_id"), "a secret takes it");
+        Ok(())
+    }
 
     #[test]
     fn copy_to_stdout_and_from_stdin_off_the_port_are_refused_by_name() {
