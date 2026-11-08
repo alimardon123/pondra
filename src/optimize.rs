@@ -2290,18 +2290,19 @@ struct Size {
     spans: std::collections::HashMap<String, (f64, f64)>, // (a table's columns' least and greatest values, as numbers: for its filters)
     learned: bool, // (its rows are a share of its table a run measured: learned.rs)
     keys: std::collections::HashMap<String, u64>, // (its tables' keys: columns with a value of their own in every row of the table, and how many: `key_values`)
+    bounds: std::collections::HashMap<String, (f64, f64)>, // (its tables' columns' least and greatest values, kept through joins: `key_values`)
 }
 
 impl Size {
     /// The same input cut to `rows` (a filter, or a join that kept some of them).
     fn cut(&self, rows: u64) -> Size {
-        Size { rows, distinct: self.distinct.iter().map(|(c, &n)| (c.clone(), n.min(rows))).collect(), spans: self.spans.clone(), learned: false, keys: self.keys.clone() }
+        Size { rows, distinct: self.distinct.iter().map(|(c, &n)| (c.clone(), n.min(rows))).collect(), spans: self.spans.clone(), learned: false, keys: self.keys.clone(), bounds: self.bounds.clone() }
     }
 
     /// A table's size, its keys found: the columns whose distinct values are as many as its rows.
     fn whole(rows: u64, distinct: std::collections::HashMap<String, u64>, spans: std::collections::HashMap<String, (f64, f64)>) -> Size {
         let keys = distinct.iter().filter(|(_, &n)| n >= rows && rows > 0).map(|(c, &n)| (c.clone(), n)).collect();
-        Size { rows, distinct, spans, learned: false, keys }
+        Size { rows, distinct, bounds: spans.clone(), spans, learned: false, keys }
     }
 
     /// The values `e` may hold when it is a key of its table (`keys`).
@@ -2322,6 +2323,33 @@ impl Size {
             _ => None,
         }
     }
+
+    /// The least and greatest values `e`'s column has in its table (`bounds`).
+    fn bound(&self, e: &Expr) -> Option<(f64, f64)> {
+        match e {
+            Expr::Column(c) => self.bounds.get(&c.name).copied(),
+            Expr::Alias(a) => self.bound(&a.expr),
+            Expr::Cast(c) => self.bound(&c.expr),
+            _ => None,
+        }
+    }
+}
+
+/// Two sides' maps of a column's fact merged by name: a name both sides have, with two different facts, is neither's
+/// (two tables' `id`s): it is left out rather than one side's taken for the other's.
+fn merged<V: Copy + PartialEq>(a: &std::collections::HashMap<String, V>, b: &std::collections::HashMap<String, V>) -> std::collections::HashMap<String, V> {
+    let mut all = a.clone();
+    for (c, v) in b {
+        match all.get(c) {
+            Some(had) if had != v => {
+                all.remove(c);
+            }
+            _ => {
+                all.insert(c.clone(), *v);
+            }
+        }
+    }
+    all
 }
 
 /// The two put together, as a join on `on` leaves them. Of each side only the rows whose key the
@@ -2341,22 +2369,29 @@ fn joined(a: &Size, b: &Size, on: &[(&Expr, &Expr)], rows: u64) -> Size {
         let n = distinct.get(&c).map_or(n, |had| n.min(*had)); // (the same name twice: take the smaller — the join looks no cheaper than it is)
         distinct.insert(c, n);
     }
-    let keys = a.keys.iter().chain(&b.keys).map(|(c, &n)| (c.clone(), n)).collect(); // (a key's values are still among its table's)
-    Size { rows, distinct, spans: Default::default(), learned: false, keys }
+    // (a key's values are still among its table's, and a column's within its table's bounds)
+    Size { rows, distinct, spans: Default::default(), learned: false, keys: merged(&a.keys, &b.keys), bounds: merged(&a.bounds, &b.bounds) }
 }
 
 /// The distinct values each side of a join key counts. Where one side's column is its table's key (a value of its own
-/// in every row: `Size::keys`), the other side's values are among that key's, as a foreign key's are, so it counts no more
-/// than the key has. Their ranges alone can't say so where the key's values are sparse: TPC-H's 15 million order keys run
-/// from 1 to 60 million, so `lineitem`'s order keys counted 60 million values, `orders ⋈ lineitem` looked like 15 million
-/// rows rather than 60, and q9 joined them first, before its parts cut `lineitem` to a twentieth (3.9 s against 2.5).
+/// in every row: `Size::keys`), the other side's values are taken to be among the key's, as a foreign key's are, so they
+/// count no more than the key has, unless their least or greatest lies outside the key's (`Size::bounds`). Their ranges alone
+/// can't say so where the key's values are sparse: TPC-H's 15 million order keys run from 1 to 60 million, so
+/// `lineitem`'s order keys counted 60 million values, `orders ⋈ lineitem` looked like 15 million rows rather than 60, and
+/// q9 joined them first, before its parts cut `lineitem` to a twentieth (3.9 s against 2.5). Values outside the key's
+/// range are not all its (a year's orders, a million keys, against every lineitem's 15 million: 11-08 audit M10), and
+/// then they count as they are. So do a demographics table's 1.9 million keys against `customer`'s current ones,
+/// which can look like a key (500,000 rows over a span of 1.9 million values, where no sketch counted them) but cover
+/// only part of the range (TPC-DS q18, q84). Where either side's bounds are unknown (a renamed or computed column: a CTE's
+/// `sr_store_sk AS ctr_store_sk`), the key's count holds, as it did: held back there, TPC-DS q1 and q65 ran a third slower.
 fn key_values(a: &Size, b: &Size, l: &Expr, r: &Expr) -> (f64, f64) {
     let d = |s: &Size, e: &Expr| s.of(e).unwrap_or(s.rows).max(1) as f64;
+    let outside = |s: &Size, e: &Expr, key: &Size, k: &Expr| matches!((s.bound(e), key.bound(k)), (Some((lo, hi)), Some((klo, khi))) if lo < klo || hi > khi);
     let (mut da, mut db) = (d(a, l), d(b, r));
-    if let Some(k) = a.key(l) {
+    if let Some(k) = a.key(l).filter(|_| !outside(b, r, a, l)) {
         db = db.min(k.max(1) as f64);
     }
-    if let Some(k) = b.key(r) {
+    if let Some(k) = b.key(r).filter(|_| !outside(a, l, b, r)) {
         da = da.min(k.max(1) as f64);
     }
     (da, db)
@@ -2792,6 +2827,20 @@ mod tests {
         let (l, r) = (col("inv_date_sk"), col("d_date_sk"));
         assert_eq!(join_rows(&inventory, &dates, &[(&l, &r)]), 11_745_000);
         assert_eq!(join_rows(&inventory, &dates.cut(365), &[(&l, &r)]), 11_745_000); // (as before: by the year's 365 dates)
+        // A table of a year's orders holds a key, but lineitem's order keys run past it: they aren't all its (11-08 audit
+        // M10), so the join counts its 1 million keys against lineitem's 15 million values, 4 million rows, not 60.
+        let year = table(1_000_000, &[("o_orderkey", 1_000_000, 56_000_001.0, 60_000_000.0)]);
+        let lineitem = table(60_000_000, &[("l_orderkey", 15_000_000, 1.0, 60_000_000.0)]);
+        let (l, r) = (col("o_orderkey"), col("l_orderkey"));
+        assert_eq!(join_rows(&year, &lineitem, &[(&l, &r)]), 4_000_000);
+        // Where the other side's bounds aren't known (a CTE's renamed column), its values are the key's, as before.
+        let renamed = Size { rows: 60_000_000, distinct: [("l_orderkey".to_string(), 15_000_000)].into(), ..Default::default() };
+        assert_eq!(join_rows(&year, &renamed, &[(&l, &r)]), 60_000_000);
+        // Two tables' columns of one name are neither's after their join: each table's `id` a key of its own.
+        let (a, b) = (table(100, &[("id", 100, 1.0, 100.0)]), table(1_000, &[("id", 1_000, 1.0, 1_000.0), ("v", 10, 0.0, 9.0)]));
+        let both = joined(&a, &b, &[], 100_000);
+        assert!(!both.keys.contains_key("id") && !both.bounds.contains_key("id"), "{:?}", both.keys);
+        assert_eq!(both.bounds.get("v"), Some(&(0.0, 9.0)));
     }
 
     /// Customers meet suppliers by nation and suppliers their nation, so customers meet their
