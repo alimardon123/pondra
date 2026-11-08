@@ -129,7 +129,6 @@ PROCESS = {
     "store.rs:SAID": "a warning said once a process: the cache folder under the temp dir is the machine's, so it fails the same for every lake (`cache_base`)",
     "store.rs:SPILLS": "the process's own spill folder, made by the first spill and held until the program ends: `memory::leave` removes it then, or where it can't (Windows, lock open) the next process's sweep does (scratch::sweep)",
     "store.rs:SPILLERS": "the spill disk is the machine's: every lake's spills in this process share its room (held weakly, a lake's goes with it)",
-    "store.rs:SPILL_FACTORY": "a page's spill factory (`give_spills`, wasm32): plain, not per_node!, since a freed page's member closes in the background, and its reset() would wipe the factory of the page made after it (`take_spills` takes it back when its page ends)",
     "store.rs:START": "the clock the spill disk's last look is measured from: the disk is the machine's",
     "store.rs:LOOKED": "when the spill disk was last looked at: the disk is the machine's, so one look serves every lake",
     "extension.rs:PARTS": "extensions' parts loaded in this process, by their file's SHA-256: a part holds no lake's state and its file never changes under its hash, so one serves every node",

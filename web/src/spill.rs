@@ -1,7 +1,8 @@
 //! The page's spill file (designs/l2-page-spill.md, S1): a page in a dedicated Worker spills DataFusion's spill files to the
 //! browser's private file system, as extents of one file written through a sync access handle (`FileSystemSyncAccessHandle`,
-//! which exists only in a Worker). The core takes the factory (`pondra::page::give_spills`) before the page's lake opens, so a
-//! sort, an aggregate or a join past the page's pool spills here, and nothing else changes.
+//! which exists only in a Worker). The page's `Scratch` (`pondra::scratch::Scratch`, installed once a module) gives the core the
+//! file's factory once it is open (`settle`), before the page's lake opens, so a sort, an aggregate or a join past the page's pool
+//! spills here, and nothing else changes. A page has no folder of its own for anything else (`Scratch::space`).
 //!
 //! The file is `.pondra-spill/<uuid>` in the origin's root, one per page. Its open removes the folder's other files: a page
 //! that ended (its tab closed, or crashed) left them, and a file a live Worker holds refuses its removal, so it is left. A
@@ -23,7 +24,7 @@ use futures::channel::oneshot;
 use futures::future::{LocalBoxFuture, Shared};
 use futures::stream::Stream;
 use futures::FutureExt;
-use pondra::page::{give_spills, take_spills, DataFusionError, DataFusionResult, SpillFile, SpillWriter, TempFileFactory, FULL};
+use pondra::page::{DataFusionError, DataFusionResult, SpillFile, SpillWriter, TempFileFactory, FULL};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::io;
@@ -443,6 +444,29 @@ fn available() -> bool {
     js::get(&global, "FileSystemSyncAccessHandle").is_ok_and(|class| !class.is_undefined()) && opfs::available()
 }
 
+/// The page's space past its memory, as the core asks a platform's (`pondra::scratch::Scratch`): DataFusion's spill files go
+/// to the page's spill file once it is open (`GIVEN`), and a page has no folder of its own for any other space.
+struct Scratch;
+
+/// The factory of the open spill file the page's lake spills through: given by `Spills::settle`, taken back by `detach`. The
+/// module's, as its one page is, and not the core's: the core asks it through `Scratch::spills`.
+static GIVEN: Mutex<Option<Arc<dyn TempFileFactory>>> = Mutex::new(None);
+
+impl pondra::scratch::Scratch for Scratch {
+    fn space(&self, kind: &str) -> io::Result<pondra::scratch::Space> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, format!("a page has no folder of its own (for its {kind} space): it spills only through its spill file, in a Worker")))
+    }
+
+    fn spills(&self) -> Option<Arc<dyn TempFileFactory>> {
+        GIVEN.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+}
+
+/// Installs the page's `Scratch` as the process's (`scratch::install`): the first install stays, so a later one changes nothing.
+pub(crate) fn install() {
+    pondra::scratch::install(Arc::new(Scratch));
+}
+
 /// A page's spill file as the page holds it: opening in the background from the page's claim (`start`), given to the core once
 /// it is open (`settle`), and ended with the page (`detach`, then `OpfsSpills::close`).
 pub(crate) struct Spills {
@@ -484,19 +508,25 @@ impl Spills {
     pub(crate) async fn settle(&self) {
         let Some(file) = self.open.clone().await else { return };
         if !self.given.replace(true) {
-            let factory: Arc<dyn TempFileFactory> = file;
-            give_spills(factory);
+            let mut given = GIVEN.lock().unwrap_or_else(PoisonError::into_inner);
+            if given.is_none() {
+                *given = Some(file); // (never another page's: each takes its own back, `detach`)
+            }
         }
     }
 
-    /// The page ends, synchronously (its `close` or its `Drop`): its factory is taken back from the core, and the file it had
+    /// The page ends, synchronously (its `close` or its `Drop`): its factory is taken back (`GIVEN`), and the file it had
     /// opened is returned for the page to close once its member has ended. An open still under way closes its own file when it
     /// finishes (`ended`).
     pub(crate) fn detach(self) -> Option<Arc<OpfsSpills>> {
         self.ended.set(true);
         let file = self.open.clone().now_or_never().flatten()?;
         let factory: Arc<dyn TempFileFactory> = file.clone();
-        take_spills(&factory);
+        let mut given = GIVEN.lock().unwrap_or_else(PoisonError::into_inner);
+        if given.as_ref().is_some_and(|g| Arc::ptr_eq(g, &factory)) {
+            *given = None; // (its own alone: another page's is left be)
+        }
+        drop(given);
         Some(file)
     }
 }
