@@ -1772,7 +1772,7 @@ mod tests {
         use crate::ddl::{apply, Ddl};
         use crate::store::Lake;
         let dir = std::env::temp_dir().join(format!("pondra-named-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         apply(&lake, Ddl::CreateSchema { name: "s".into(), if_not_exists: false }).await?;
         for t in ["a", "b", "s.c", "MiXed", "x-y", "unused", "a$new-0123abcd"] {
             crate::write::create_table(&lake, t, r#"{"columns": [["x", "Int64"]]}"#).await?;

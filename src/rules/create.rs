@@ -708,7 +708,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_statement_the_node_refuses_is_refused_the_same_by_a_page() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-create-refused-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         for (sql, code, words) in REFUSED {
             let c = create(sql);
             let node = node_refusal(&lake, &c).await.unwrap_or_else(|| panic!("the node takes {sql}"));
@@ -752,7 +752,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_page_makes_a_tables_rules_as_the_node_does() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-create-rules-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let _sequencer = crate::log::Sequencer::start(lake.clone(), None).await?;
         for sql in [
             "CREATE TABLE t (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, a TEXT NOT NULL DEFAULT 'x', u UUID, v VARCHAR(5), j JSONB, m ENUM('a','b'), n INT CHECK (n > 0), o INT UNIQUE, p INT, CONSTRAINT pq UNIQUE (p, o), CHECK (n < 100), CHECK (p <> 0), r INT REFERENCES s(x) NOT ENFORCED)",
