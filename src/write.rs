@@ -724,7 +724,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Ok(sql) => sql,
         Err(e) => return Some(Stmt::of_error(&e, format!("{e:#}"))),
     };
-    let parsed = crate::parsed::generic(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (parsed once for the front's looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
+    let parsed = crate::parsed::read(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (as the front reads it, parsed once for its looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
     let parsed = match parsed {
         Ok(mut s) => s.pop()?,
         Err(_) => return None,
@@ -2792,6 +2792,9 @@ mod tests {
         assert!(parse("select * into temp t2 from t").is_some());
         assert!(matches!(parse("SELECT 1; DELETE FROM t"), Some(Stmt::Delete(..))), "several statements are read as before: the last");
         assert!(parse("SELECT 'into' AS w").is_none(), "INTO in a string: read, and no write");
+        // (read as the front reads it: a write with DuckDB's forms in it is one, at Flight's door too, 11-08 audit M3)
+        assert!(matches!(parse("INSERT INTO t SELECT [x FOR x IN l] FROM s"), Some(Stmt::Insert(..))));
+        assert!(matches!(parse("UPDATE t SET l = list_transform(l, LAMBDA x: x + 1)"), Some(Stmt::Update(..))));
     }
     use datafusion::arrow::array::Float64Array;
     use datafusion::arrow::datatypes::{Field, Schema};

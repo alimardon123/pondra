@@ -151,6 +151,17 @@ mod tests {
         ] {
             assert_eq!(crate::parsed::read(sql), generic(wrote), "{sql}");
         }
+        // (outside a function's argument a LAMBDA is grouped, so its tree prints as itself: the text it is kept under,
+        // `text::text_kept`, reads back to it. 11-08 audit L11)
+        for (sql, prints) in [
+            ("SELECT list_transform(l, LAMBDA x: LAMBDA y: x + y) FROM t", "SELECT list_transform(l, x -> (y -> x + y)) FROM t"),
+            ("SELECT a + LAMBDA x: x FROM t", "SELECT a + (x -> x) FROM t"),
+            ("SELECT LAMBDA x: x AS f", "SELECT (x -> x) AS f"),
+        ] {
+            let tree = crate::parsed::read(sql).unwrap();
+            assert_eq!(crate::text::text(&tree), prints, "{sql}");
+            assert_eq!(generic(prints).unwrap(), tree, "{sql}");
+        }
         // (a FOR in parentheses is its function's: the bracket's own decides)
         let sub = "SELECT [substring(s FROM 1 FOR 2) FOR s IN l] AS v";
         assert_eq!(crate::parsed::read(sub), generic("SELECT array_transform((l), s -> (substring(s FROM 1 FOR 2))) AS v"));
