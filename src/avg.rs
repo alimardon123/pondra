@@ -4,8 +4,9 @@
 //! away (half away from zero); the answer keeps DataFusion's type, decimal(p + 4, s + 4).
 //!
 //! Only decimals of up to 24 digits: one place more costs the sum a digit of its room, and at 24
-//! digits it keeps the billion rows DataFusion leaves it at 25. Wider decimals, and every other
-//! type, stay DataFusion's own `avg`.
+//! digits it keeps the billion rows DataFusion leaves it at 25. Wider decimals stay DataFusion's own
+//! `avg`; a DOUBLE's, and an integer's, is the same in any order (`fvar`), integers of 32 bits or
+//! fewer summed exactly as they are.
 //!
 //! A materialized view's `avg` is finished from the sum and the count it keeps (`finish.rs`), by
 //! `pondra_avg_of(sum, count)`, which works it out the same way, so the view and the query agree.
@@ -25,12 +26,15 @@ use std::sync::Arc;
 
 /// Replaces `avg` (and `mean`) in a session, and adds `pondra_avg_of`.
 pub fn register(ctx: &SessionContext) {
-    ctx.register_udaf(AggregateUDF::from(RoundedAvg::default()));
+    let avg = Avg::default();
+    let wholes = crate::fvar::with_wholes(avg.signature());
+    ctx.register_udaf(AggregateUDF::from(RoundedAvg(avg, wholes)));
     ctx.register_udf(ScalarUDF::new_from_impl(AvgOf(Signature::any(2, Volatility::Immutable))));
 }
 
-#[derive(Debug, Default, PartialEq, Eq, Hash)]
-struct RoundedAvg(Avg);
+/// DataFusion's `avg`, and its signature with integers of 32 bits or fewer taken as they are (`fvar::with_wholes`).
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct RoundedAvg(Avg, Signature);
 
 /// The answer's precision and scale, when this one is worked out a place further and rounded.
 fn rounded(args: &AccumulatorArgs) -> Option<(u8, i8)> {
@@ -55,26 +59,48 @@ fn round(v: i128) -> i128 {
 impl AggregateUDFImpl for RoundedAvg {
     fn name(&self) -> &str { "avg" }
     fn aliases(&self) -> &[String] { self.0.aliases() }
-    fn signature(&self) -> &Signature { self.0.signature() }
+    fn signature(&self) -> &Signature { &self.1 }
     fn return_type(&self, types: &[DataType]) -> Result<DataType> { self.0.return_type(types) }
 
     fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        if crate::fvar::steady(&args) {
+            return Ok(crate::fvar::mean_accumulator(&args));
+        }
+        if args.expr_fields.first().is_some_and(|f| crate::fvar::is_whole(f.data_type())) {
+            return crate::fvar::as_double(args, |a| self.0.accumulator(a)); // (DISTINCT)
+        }
         match finer(args, |a| self.0.accumulator(a))? {
             (inner, Some(to)) => Ok(Box::new(Rounded { inner, to })),
             (inner, None) => Ok(inner),
         }
     }
 
-    // The state is the count and the sum, whatever the answer's scale.
-    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> { self.0.state_fields(args) }
+    // The state is the count and the sum, whatever the answer's scale; over DOUBLE, the sum's error too, and over
+    // whole numbers the sum exact (`fvar`).
+    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        let double = |f: &FieldRef| f.data_type() == &DataType::Float64;
+        let input = |f: &FieldRef| double(f) || crate::fvar::is_whole(f.data_type());
+        match !args.is_distinct && double(&args.return_field) && args.input_fields.first().is_some_and(input) {
+            true => Ok(crate::fvar::mean_state(args.name, crate::fvar::is_whole(args.input_fields[0].data_type()))),
+            false => self.0.state_fields(args),
+        }
+    }
 
     fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool { self.0.groups_accumulator_supported(args) }
 
     fn create_groups_accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn GroupsAccumulator>> {
+        if crate::fvar::steady(&args) {
+            return Ok(crate::fvar::mean_groups(&args));
+        }
         match finer(args, |a| self.0.create_groups_accumulator(a))? {
             (inner, Some(to)) => Ok(Box::new(RoundedGroups { inner, to })),
             (inner, None) => Ok(inner),
         }
+    }
+
+    // (a frame that slides takes values back out: over DOUBLE DataFusion's, in its ORDER BY's order)
+    fn create_sliding_accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        if crate::fvar::steady(&args) { crate::fvar::as_double(args, |a| self.0.accumulator(a)) } else { self.accumulator(args) }
     }
 
     // The rest as DataFusion's `avg`.

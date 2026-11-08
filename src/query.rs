@@ -1892,56 +1892,59 @@ mod tests {
     /// staged table named quoted. Only what it reads is registered, where the scan registered every word's table.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_statement_reads_the_tables_it_names_and_plans_as_the_scan_did() -> anyhow::Result<()> {
-        use super::*;
-        use crate::ddl::{apply, Ddl};
-        use crate::store::Lake;
-        let dir = std::env::temp_dir().join(format!("pondra-named-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
-        apply(&lake, Ddl::CreateSchema { name: "s".into(), if_not_exists: false }).await?;
-        for t in ["a", "b", "s.c", "MiXed", "x-y", "unused", "a$new-0123abcd"] {
-            crate::write::create_table(&lake, t, r#"{"columns": [["x", "Int64"]]}"#).await?;
-        }
-        let view = |name: &str, sql: &str| Ddl::CreateView { name: name.into(), sql: sql.into(), replace: false, facts: None, text: None };
-        apply(&lake, view("v", "SELECT x FROM a")).await?;
-        apply(&lake, view("w", "SELECT v.x FROM v JOIN b ON v.x = b.x")).await?;
-        let registered = |ctx: &SessionContext| -> std::collections::BTreeSet<String> {
-            let c = ctx.catalog(&crate::ddl::lake_name(&lake)).expect("the lake's catalog");
-            c.schema_names().into_iter().filter(|s| s != "information_schema").flat_map(|s| {
-                let schema = c.schema(&s).expect("listed");
-                schema.table_names().into_iter().map(move |t| if s == crate::text::PUBLIC { t } else { format!("{s}.{t}") })
-            }).collect()
-        };
-        let cases: [(&str, &[&str]); 9] = [
-            ("SELECT * FROM a", &["a"]),
-            ("SELECT * FROM a JOIN s.c ON a.x = c.x", &["a", "s.c"]),
-            ("SELECT * FROM \"MiXed\"", &["MiXed"]),
-            ("SELECT * FROM \"x-y\"", &["x-y"]),
-            ("SELECT * FROM w", &["a", "b", "v", "w"]),
-            ("WITH a AS (SELECT 1 AS x) SELECT * FROM a", &[]),
-            ("SELECT x FROM b WHERE 'unused' <> 'a'", &["b"]),
-            ("SELECT (SELECT count(*) FROM b) AS n FROM a WHERE x IN (SELECT x FROM s.c)", &["a", "b", "s.c"]),
-            ("SELECT * FROM \"a$new-0123abcd\"", &["a$new-0123abcd"]),
-        ];
-        for (sql, names) in cases {
-            let (named, scanned) = (session_at(&lake, sql, "", None).await?, session_reading(&lake, sql, "", None, true).await?);
-            let (mine, theirs) = (registered(&named), registered(&scanned));
-            assert_eq!(mine, names.iter().map(|n| n.to_string()).collect(), "{sql}: what it registered");
-            assert!(mine.is_subset(&theirs), "{sql}: {mine:?} beyond the scan's {theirs:?}");
-            let answer = |ctx: SessionContext| async move {
-                let batches = crate::engine::sql(&ctx, sql).await?.collect().await?;
-                anyhow::Ok(datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string())
+        crate::auth::as_node(async move { // (planned as the node's own work: `auth::as_node`)
+            use super::*;
+            use crate::ddl::{apply, Ddl};
+            use crate::store::Lake;
+            let dir = std::env::temp_dir().join(format!("pondra-named-{}", uuid::Uuid::new_v4()));
+            let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            apply(&lake, Ddl::CreateSchema { name: "s".into(), if_not_exists: false }).await?;
+            for t in ["a", "b", "s.c", "MiXed", "x-y", "unused", "a$new-0123abcd"] {
+                crate::write::create_table(&lake, t, r#"{"columns": [["x", "Int64"]]}"#).await?;
+            }
+            let view = |name: &str, sql: &str| Ddl::CreateView { name: name.into(), sql: sql.into(), replace: false, facts: None, text: None };
+            apply(&lake, view("v", "SELECT x FROM a")).await?;
+            apply(&lake, view("w", "SELECT v.x FROM v JOIN b ON v.x = b.x")).await?;
+            let registered = |ctx: &SessionContext| -> std::collections::BTreeSet<String> {
+                let c = ctx.catalog(&crate::ddl::lake_name(&lake)).expect("the lake's catalog");
+                c.schema_names().into_iter().filter(|s| s != "information_schema").flat_map(|s| {
+                    let schema = c.schema(&s).expect("listed");
+                    schema.table_names().into_iter().map(move |t| if s == crate::text::PUBLIC { t } else { format!("{s}.{t}") })
+                }).collect()
             };
-            assert_eq!(answer(named).await?, answer(scanned).await?, "{sql}: the answer");
-        }
-        // (a table named unquoted as it is called, and looked up by that name after: `views::join`)
-        let ctx = session_at(&lake, "SELECT x FROM MiXed, b", "", None).await?;
-        assert!(ctx.table(table_ref("MiXed")).await.is_ok() && ctx.table(table_ref("b")).await.is_ok(), "{:?}", registered(&ctx));
-        let unparsed = "SELECT * FROM a WHERE x = ANY(:list"; // (the parser doesn't take it: every table, as before)
-        let ctx = session_at(&lake, unparsed, "", None).await?;
-        assert!(registered(&ctx).contains("a") && !registered(&ctx).contains("b"), "{:?}", registered(&ctx));
-        lake.cat.close().await?;
-        let _ = std::fs::remove_dir_all(&dir);
-        Ok(())
+            let cases: [(&str, &[&str]); 9] = [
+                ("SELECT * FROM a", &["a"]),
+                ("SELECT * FROM a JOIN s.c ON a.x = c.x", &["a", "s.c"]),
+                ("SELECT * FROM \"MiXed\"", &["MiXed"]),
+                ("SELECT * FROM \"x-y\"", &["x-y"]),
+                ("SELECT * FROM w", &["a", "b", "v", "w"]),
+                ("WITH a AS (SELECT 1 AS x) SELECT * FROM a", &[]),
+                ("SELECT x FROM b WHERE 'unused' <> 'a'", &["b"]),
+                ("SELECT (SELECT count(*) FROM b) AS n FROM a WHERE x IN (SELECT x FROM s.c)", &["a", "b", "s.c"]),
+                ("SELECT * FROM \"a$new-0123abcd\"", &["a$new-0123abcd"]),
+            ];
+            for (sql, names) in cases {
+                let (named, scanned) = (session_at(&lake, sql, "", None).await?, session_reading(&lake, sql, "", None, true).await?);
+                let (mine, theirs) = (registered(&named), registered(&scanned));
+                assert_eq!(mine, names.iter().map(|n| n.to_string()).collect(), "{sql}: what it registered");
+                assert!(mine.is_subset(&theirs), "{sql}: {mine:?} beyond the scan's {theirs:?}");
+                let answer = |ctx: SessionContext| async move {
+                    let batches = crate::engine::sql(&ctx, sql).await?.collect().await?;
+                    anyhow::Ok(datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string())
+                };
+                assert_eq!(answer(named).await?, answer(scanned).await?, "{sql}: the answer");
+            }
+            // (a table named unquoted as it is called, and looked up by that name after: `views::join`)
+            let ctx = session_at(&lake, "SELECT x FROM MiXed, b", "", None).await?;
+            assert!(ctx.table(table_ref("MiXed")).await.is_ok() && ctx.table(table_ref("b")).await.is_ok(), "{:?}", registered(&ctx));
+            let unparsed = "SELECT * FROM a WHERE x = ANY(:list"; // (the parser doesn't take it: every table, as before)
+            let ctx = session_at(&lake, unparsed, "", None).await?;
+            assert!(registered(&ctx).contains("a") && !registered(&ctx).contains("b"), "{:?}", registered(&ctx));
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(())
+        })
+        .await
     }
     use super::{exhausted, frugally, keep, peak_pool, retrying, tails, task_with_peak, Facts, FactsMemo, Tail, Tails, TAILS};
     use crate::store::TableMeta;

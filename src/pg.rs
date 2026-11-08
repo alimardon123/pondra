@@ -1701,7 +1701,8 @@ impl ExtendedQueryHandler for Backend {
         if let Some(Ok(c)) = Copy::of(&statement.sql).filter(|c| c.as_ref().is_ok_and(|c| !c.to)) {
             return crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.signed().await?, self.copy_in(client, &user, c))).await;
         }
-        let inferred = crate::temp::SESSION.scope(Some(self.session.clone()), self.types(statement)).await;
+        let who = self.signed().await?; // (a key lookup's and a plan's types, of what it may read: as whoever signed in)
+        let inferred = crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(who, self.types(statement))).await;
         let out = self.told(client, &user, &bind(portal, inferred)?, &portal.result_column_format).await?;
         match statement.answered(&out, &portal.result_column_format) {
             Ok(()) => Ok(out),

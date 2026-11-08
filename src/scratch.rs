@@ -2,10 +2,65 @@
 //! a shuffle's, a lake in memory's past its budget), each locked while it is used and removed when it is let go, and
 //! the folders of processes that ended swept. Plain folders of the user's own (`own_dir`), under the disk that has the
 //! room (`spill_base`).
+//!
+//! What a node spills into is its platform's (`Scratch`): natively these folders (`Folders`), on a page its OPFS
+//! (web/), in the sim memory (step 3). The program and a node's start install one per process (`install`).
+use datafusion::execution::spill_file::TempFileFactory;
 use std::collections::BTreeSet;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
+
+/// A platform's space of this process's own (redesign §8), for what doesn't fit in memory.
+pub trait Scratch: Send + Sync {
+    /// New space for `kind` (`"spill"`: the queries' and the shuffles', `"memory"`: a lake in memory's past its budget),
+    /// this process's alone, and gone when the space drops.
+    fn space(&self, kind: &str) -> std::io::Result<Space>;
+
+    /// DataFusion's spill files for a lake's queries where the platform makes its own (a page's OPFS). None where they go
+    /// to the `"spill"` space's folder, which `store.rs` caps (`Spills`).
+    fn spills(&self) -> Option<Arc<dyn TempFileFactory>> { None }
+}
+
+/// Space of this process's own (`Scratch::space`): a folder, held for as long as the space is.
+#[derive(Debug)]
+pub struct Space {
+    /// Where its files go.
+    pub dir: PathBuf,
+    _held: Box<dyn std::fmt::Debug + Send + Sync>, // (natively its `Folder`: its lock is held, and its drop removes it)
+}
+
+impl Space {
+    /// The space at `dir`, held by `held` (what removes it when dropped).
+    pub fn held(dir: PathBuf, held: impl std::fmt::Debug + Send + Sync + 'static) -> Space { Space { dir, _held: Box::new(held) } }
+}
+
+/// This machine's disk (`Folder`): a locked folder of this process's own for each space, under `spill_base`.
+#[derive(Debug, Default)]
+pub struct Folders;
+
+impl Scratch for Folders {
+    fn space(&self, kind: &str) -> std::io::Result<Space> { Folder::make(kind).map(|f| Space::held(f.path.clone(), f)) }
+}
+
+static INSTALLED: OnceLock<Arc<dyn Scratch>> = OnceLock::new();
+
+// (the space of a process whose host installed none)
+static UNINSTALLED: Folders = Folders;
+
+/// Installs the process's `Scratch`, once: a second install keeps the first, which it answers.
+pub fn install(scratch: Arc<dyn Scratch>) -> Arc<dyn Scratch> { INSTALLED.get_or_init(|| scratch).clone() }
+
+/// The process's `Scratch`, for a spill with no node at hand: the one its host installed, else this machine's folders.
+pub fn process() -> &'static dyn Scratch {
+    match INSTALLED.get() {
+        Some(s) => s.as_ref(),
+        None => &UNINSTALLED,
+    }
+}
+
+/// A node's `Scratch` (`NodeState::new`): the one its process's host installed, else this machine's folders.
+pub fn installed() -> Arc<dyn Scratch> { INSTALLED.get().cloned().unwrap_or_else(|| Arc::new(Folders)) }
 
 /// The lock file in a spill folder. The process that made the folder holds it, so a folder whose
 /// lock another process can take is one its process left behind. It is not an object of the lake.
@@ -205,6 +260,19 @@ pub fn leave() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_space_is_a_locked_folder_of_its_own_that_goes_with_it() {
+        let (a, b) = (Folders.space("spill").unwrap(), Folders.space("spill").unwrap());
+        assert_ne!(a.dir, b.dir, "each space is its own");
+        assert!(a.dir.join(LOCK_FILE).exists() && a.dir.starts_with(spill_base()));
+        assert!(MADE.lock().unwrap().contains(&a.dir), "the program's end removes it if nothing else does");
+        let dir = a.dir.clone();
+        drop(a);
+        assert!(!dir.exists() && !MADE.lock().unwrap().contains(&dir), "a space that drops takes its folder with it");
+        assert!(b.dir.exists(), "and leaves the others be");
+        assert!(Folders.spills().is_none(), "this machine's spill files go to a space's folder (`store::Spills`)");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

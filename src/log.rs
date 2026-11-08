@@ -289,7 +289,8 @@ impl Log {
                 let (lake, to) = (lake.clone(), to.clone());
                 let (done, next) = oneshot::channel();
                 let turn = std::mem::replace(&mut turn, Some(next));
-                crate::panics::spawn(async move {
+                // (the node's own work, whoever's rows: the views each flush derives plan under `auth::as_node`)
+                crate::panics::own(async move {
                     send(&lake, &to, pending, turn, done).await;
                     drop(slot);
                 });

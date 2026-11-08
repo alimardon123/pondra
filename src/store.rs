@@ -1565,24 +1565,24 @@ pub fn short_of_room(dir: &std::path::Path) -> Option<(u64, u64)> {
     crate::machine::process().space(dir).map(|(free, total)| (free, lake_keeps(total))).filter(|(free, keep)| free < keep)
 }
 
-/// The folder of this process's spills, DataFusion's and a shuffle's (`spill::dir`): a `scratch::Folder` of
-/// this process's own, made by the first spill that needs one. A static's end runs no destructor, so the
+/// The folder of this process's spills, DataFusion's and a shuffle's (`spill::dir`): the platform's `"spill"` space
+/// (`scratch::Scratch`, natively a `scratch::Folder` of this process's own), made by the first spill that needs one. A static's end runs no destructor, so the
 /// folder goes when the program ends through `memory::leave` (which `cli.rs` calls before each exit); where
 /// that can't remove it (Windows, while its lock file is open), it stays for the next process's sweep. A
 /// folder that can't be made is remembered as the reason why.
-static SPILLS: std::sync::OnceLock<Result<crate::scratch::Folder, String>> = std::sync::OnceLock::new();
+static SPILLS: std::sync::OnceLock<Result<crate::scratch::Space, String>> = std::sync::OnceLock::new();
 
 /// The folder of this process's spills (`SPILLS`), made on first use. Its error when there is none: DataFusion's
 /// spills then go to the OS temp folder, and a shuffle fails with the reason.
 pub(crate) fn spill_folder() -> std::io::Result<&'static std::path::Path> {
     let folder = SPILLS.get_or_init(|| {
-        crate::scratch::Folder::make("spill").map_err(|e| {
+        crate::scratch::process().space("spill").map_err(|e| {
             eprintln!("no spill folder of this process's ({e}): queries spill to the temporary folder, shuffles fail");
             e.to_string()
         })
     });
     match folder {
-        Ok(folder) => Ok(&folder.path),
+        Ok(space) => Ok(&space.dir),
         Err(why) => Err(std::io::Error::other(why.clone())),
     }
 }
@@ -1639,6 +1639,9 @@ pub fn take_spills(factory: &Arc<dyn TempFileFactory>) {
 fn spill_disk_merging(fan_in: usize) -> DiskManagerBuilder {
     if spill_gb() == Some(0.0) {
         return DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
+    }
+    if let Some(factory) = crate::scratch::process().spills() {
+        return DiskManagerBuilder::default().with_mode(DiskManagerMode::Custom(factory)).with_max_spill_merge_fan_in(fan_in); // (the platform's own: a page's OPFS)
     }
     // (a page on wasm has no folder to spill to: it spills through the factory it gave the core before this lake opened
     // (`give_spills`), and with none it has no disk, so a query past its pool is refused (53200) rather than trapping the module
