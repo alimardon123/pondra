@@ -20,6 +20,11 @@ pub trait Reach: Sync {
         let _ = urls;
         async { Ok(()) }
     }
+    /// What a reader keeps of what it read here (a Delta table's replayed log: `read_delta::Logs`): a node's is its lake's
+    /// state (`Lake::state`). None keeps nothing: each read reads it all again.
+    fn state<P: crate::lake_state::LakeState>(&self) -> Option<Arc<P>> {
+        None
+    }
 }
 
 /// An object's bytes (a log's commit, a manifest), through its store. `Ok(None)`: no object there.
