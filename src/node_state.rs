@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 pub struct NodeState {
     /// What its host does when it must stop or start again.
     pub life: Life,
+    /// The machine it runs on: its process's (`machine::install`), or, for the sim's members, one of its own.
+    pub machine: crate::machine::Mach,
     /// What its drain refuses and waits for (`drain.rs`).
     pub drain: Drain,
     /// What counts as a use of it, for `--idle-exit` (`idle.rs`).
@@ -22,8 +24,13 @@ pub struct NodeState {
 }
 
 impl NodeState {
-    /// A node's state, before its doors open: not draining, nothing in flight.
-    pub fn new(life: Life) -> Arc<NodeState> { Arc::new(NodeState { life, drain: Drain::default(), idle: Idle::default(), began: datafusion::common::instant::Instant::now() }) }
+    /// A node's state, before its doors open: not draining, nothing in flight, on its process's machine.
+    pub fn new(life: Life) -> Arc<NodeState> { NodeState::on(life, crate::machine::installed()) }
+
+    /// A node's state on a machine of its own (the sim's member: one with little memory, say).
+    pub fn on(life: Life, machine: crate::machine::Mach) -> Arc<NodeState> {
+        Arc::new(NodeState { life, machine, drain: Drain::default(), idle: Idle::default(), began: datafusion::common::instant::Instant::now() })
+    }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).
     pub fn unhosted() -> Arc<NodeState> { NodeState::new(crate::lifecycle::unhosted()) }

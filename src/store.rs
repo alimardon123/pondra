@@ -1549,26 +1549,10 @@ fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
     };
     let bytes = match crate::env::gib("PONDRA_CACHE_GB") {
         Some(bytes) => bytes as u64,
-        None => space(&dir).map_or(20 << 30, |(free, _)| (free / 4).min(20 << 30)),
+        None => crate::machine::process().space(&dir).map_or(20 << 30, |(free, _)| (free / 4).min(20 << 30)),
     };
     let dir = dir.join(url.trim_start_matches("s3://").replace(['/', ':', '\\'], "_")); // one folder per lake
     (bytes > 0).then(|| crate::cache::Disk::open(dir, bytes, store.clone()).ok()).flatten()
-}
-
-/// Free and total bytes of the disk that holds `dir` (or its nearest existing parent), where the
-/// platform says.
-pub(crate) fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
-    #[cfg(unix)]
-    {
-        let at = std::ffi::CString::new(dir.ancestors().find(|a| a.exists())?.as_os_str().as_encoded_bytes()).ok()?;
-        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-        (unsafe { libc::statvfs(at.as_ptr(), &mut s) } == 0).then(|| (s.f_bavail as u64 * s.f_frsize as u64, s.f_blocks as u64 * s.f_frsize as u64))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        None
-    }
 }
 
 /// Room a lake on local disk keeps for its own upkeep: a quarter of the disk, 256 MB at most (of
@@ -1578,7 +1562,7 @@ pub(crate) fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
 fn lake_keeps(total: u64) -> u64 { (total / 4).min(256 << 20) }
 
 pub fn short_of_room(dir: &std::path::Path) -> Option<(u64, u64)> {
-    space(dir).map(|(free, total)| (free, lake_keeps(total))).filter(|(free, keep)| free < keep)
+    crate::machine::process().space(dir).map(|(free, total)| (free, lake_keeps(total))).filter(|(free, keep)| free < keep)
 }
 
 /// The folder of this process's spills, DataFusion's and a shuffle's (`spill::dir`): a `memory::Folder` of
@@ -1611,7 +1595,7 @@ pub(crate) fn spill_gb() -> Option<f64> { crate::env::parse::<f64>("PONDRA_SPILL
 pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
     match spill_gb() {
         Some(gb) => Some(gb_bytes(gb)),
-        None => dir.and_then(space).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
+        None => dir.and_then(|d| crate::machine::process().space(d)).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
     }
 }
 
@@ -1778,7 +1762,7 @@ fn room_cap(gb: Option<f64>, used: u64, shuffled: u64, disk: Option<(u64, u64)>)
 /// and a GROUP BY spilling beside them could take twice it: audit 11-01 M13.)
 fn set_room(gb: Option<f64>) {
     let shuffled = gb.map_or(0, |_| crate::spill::held() + crate::memory::spilled());
-    let disk = space(&crate::memory::spill_base()); // (the disk the folder is, or would be on: not made here, the first spill makes it)
+    let disk = crate::machine::process().space(&crate::memory::spill_base()); // (the disk the folder is, or would be on: not made here, the first spill makes it)
     let managers = live_spillers();
     let all: u64 = managers.iter().map(|m| m.used_disk_space()).sum();
     for manager in managers {
@@ -1829,7 +1813,7 @@ pub(crate) fn spill_fits(bytes: u64) -> Result<()> {
     let Ok(folder) = spill_folder() else { return Ok(()) };
     let gb = spill_gb();
     let held = gb.map_or(0, |_| others_held() + crate::memory::spilled());
-    match piece_fits(gb, held, bytes, space(folder)) {
+    match piece_fits(gb, held, bytes, crate::machine::process().space(folder)) {
         true => Ok(()),
         false => Err(no_room(bytes, gb)),
     }
@@ -1930,93 +1914,6 @@ fn whole_line() -> usize {
 /// line, not a machine's (`ram` is None there, and 4 GiB is past a 32-bit `usize`).
 #[cfg(target_arch = "wasm32")]
 pub fn memory_limit() -> usize { crate::env::page_query_memory(crate::env::device_line()) }
-
-/// The machine's memory, if it says: `/proc` on Linux, the OS's own call elsewhere. Less when a
-/// cgroup limits this process (a container, a service with `MemoryMax`): `/proc/meminfo` is the
-/// host's, and a node in a 4 GB container on a 64 GB host sized its queries for 64 and was killed.
-pub fn ram() -> Option<usize> {
-    static RAM: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *RAM.get_or_init(read_ram)
-}
-
-// (a page's memory is its line, which `page.rs` takes from its device: none is the machine's)
-#[cfg(target_arch = "wasm32")]
-fn read_ram() -> Option<usize> {
-    None
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn read_ram() -> Option<usize> {
-    let proc = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| m.lines().find_map(|l| l.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?.trim().parse::<usize>().ok()));
-    proc.map(|kb| (kb << 10).min(cgroup_memory().unwrap_or(usize::MAX))).or_else(|| {
-        let s = sysinfo::System::new_with_specifics(sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()));
-        Some(s.total_memory() as usize).filter(|&b| b > 0)
-    })
-}
-
-/// The least memory limit of this process's cgroups and their parents (v2 `memory.max`, v1
-/// `memory.limit_in_bytes`; "max" or none: no limit). In a container the cgroup is its root.
-#[cfg(not(target_arch = "wasm32"))]
-fn cgroup_memory() -> Option<usize> {
-    let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let limits = groups.lines().filter_map(|line| {
-        let (controllers, path) = line.split_once(':')?.1.split_once(':')?; // "0::/path" (v2), "4:memory:/path" (v1)
-        let (base, file) = match controllers {
-            "" => ("/sys/fs/cgroup", "memory.max"),
-            c if c.split(',').any(|c| c == "memory") => ("/sys/fs/cgroup/memory", "memory.limit_in_bytes"),
-            _ => return None,
-        };
-        let read = |dir: &std::path::Path| std::fs::read_to_string(format!("{base}{}/{file}", dir.display())).ok()?.trim().parse::<usize>().ok();
-        std::path::Path::new(path).ancestors().filter_map(read).min()
-    });
-    limits.min()
-}
-
-/// This process's resident memory, if the OS says.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn resident() -> Option<usize> {
-    let proc = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok());
-    proc.map(|pages| pages * page_size()).or_else(|| {
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
-        let (pid, mut s) = (sysinfo::get_current_pid().ok()?, System::new());
-        s.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), false, ProcessRefreshKind::nothing().with_memory());
-        Some(s.process(pid)?.memory() as usize).filter(|&b| b > 0)
-    })
-}
-
-/// The page's live heap bytes, as the program that runs the page reads them (`page::Options::memory`, which re-exports this).
-pub type Memory = Arc<dyn Fn() -> usize + Send + Sync>;
-
-// A page's live bytes, as the program that runs the page reads them (`page::Options::memory`): process-wide, as the page's allocator is.
-#[cfg(target_arch = "wasm32")]
-static READER: std::sync::OnceLock<Memory> = std::sync::OnceLock::new();
-
-/// Gives the page's live bytes to the core's watch (`oom`): set once, and a second call keeps the first.
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn read_resident_with(reading: Memory) {
-    let _ = READER.set(reading);
-}
-
-/// A page's resident memory is the bytes its program reads (`read_resident_with`), and none until one is given.
-#[cfg(target_arch = "wasm32")]
-pub fn resident() -> Option<usize> {
-    READER.get().map(|reading| reading())
-}
-
-/// The size of a page in bytes, which `/proc/self/statm` counts in: 4 KB, or 64 KB on some arm64 builds
-/// (where a count of pages read as 4 KB pages was 16 times too little). Asked each time: glibc answers
-/// from memory, and a static would be a node's state for nothing.
-#[cfg(not(target_arch = "wasm32"))]
-fn page_size() -> usize {
-    #[cfg(unix)]
-    {
-        let bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if bytes > 0 {
-            return bytes as usize;
-        }
-    }
-    4096
-}
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
 
@@ -2472,7 +2369,7 @@ impl Lake {
         let format = crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory)), manifests: crate::manifest::kept(), format, states: Default::default(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), node });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory, node.machine.ram())), manifests: crate::manifest::kept(), format, states: Default::default(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), node });
         for (name, cache) in lake.caches() {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
@@ -4404,21 +4301,6 @@ mod tests {
         assert_eq!(merge_fan_in(5 << 30, 4), 64, "64 at most");
     }
 
-    /// `resident` counts bytes: `/proc/self/statm` counts pages, and the page size is the OS's (64 KB on
-    /// some arm64 builds), so it agrees with `VmRSS` in kilobytes. (On 4 KB pages the old constant passed
-    /// too; it is the arm64 case this guards.)
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn resident_is_in_bytes_as_the_page_size_says() {
-        let block = vec![1u8; 100 << 20]; // (written, so resident)
-        std::hint::black_box(&block);
-        let ours = resident().expect("resident memory");
-        let status = std::fs::read_to_string("/proc/self/status").expect("the process's status");
-        let kb: usize = status.lines().find_map(|l| l.strip_prefix("VmRSS:")?.trim().strip_suffix("kB")?.trim().parse().ok()).expect("VmRSS");
-        let theirs = kb << 10;
-        assert!(ours.abs_diff(theirs) * 4 <= theirs, "resident {ours} bytes, VmRSS {theirs} bytes");
-    }
-
     /// A commit that changes who may do what moves the rights version (`moves_rights`): users, roles, grants and tokens,
     /// identity providers, the lake's keys and its signed mark, put or deleted. A table's rows or entry don't.
     #[test]
@@ -4606,6 +4488,35 @@ mod tests {
         for dir in &dirs {
             std::fs::remove_dir_all(dir)?;
         }
+        Ok(())
+    }
+
+    /// A lake reads the machine of the node that opened it, not the process's (step 2's gate, and the sim's members):
+    /// of two nodes in one process on machines of 2 and 8 GB, each lake's hot columns may take half its own machine's.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lake_is_sized_by_its_own_nodes_machine() -> Result<()> {
+        struct Sized(usize);
+        impl crate::machine::Machine for Sized {
+            fn ram(&self) -> Option<usize> { Some(self.0) }
+            fn resident(&self) -> Option<usize> { None }
+            fn cores(&self) -> usize { 2 }
+            fn space(&self, _: &std::path::Path) -> Option<(u64, u64)> { None }
+        }
+        if crate::env::parse::<f64>("PONDRA_HOT_GB").is_some() {
+            return Ok(()); // (a budget the user gave is the hot columns' whatever the machine)
+        }
+        let mut sized = vec![];
+        for ram in [2usize << 30, 8 << 30] {
+            let dir = std::env::temp_dir().join(format!("pondra-machine-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir)?;
+            let node = crate::node_state::NodeState::on(crate::lifecycle::unhosted(), Arc::new(Sized(ram)));
+            let lake = Lake::open(dir.to_str().expect("a path"), true, false, node).await?;
+            sized.push(lake.hot.usage().1);
+            drop(lake);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert_eq!(sized, [1 << 30, 4 << 30], "half of each node's own machine");
         Ok(())
     }
 

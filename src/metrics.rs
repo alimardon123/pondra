@@ -136,7 +136,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     // (one line a cache the node's line counts, by its name: `Ledger::charge`)
     let caches: Vec<(String, f64)> = app.lake.cached_bytes().iter().map(|(c, b)| (format!("{{cache=\"{c}\"}}"), *b as f64)).collect();
     metric("cache_bytes", "gauge", "what each bounded cache holds now: objects' byte ranges, decoded log rows, tables' tails, row groups for lookups, the catalog's blocks, Parquet footers, files' statistics, remembered answers, planning facts' manifest lists, tables' manifests, Delta logs and Iceberg manifests read, answers kept for their pages, statements worked out as point queries, the log tails' keys lookups index", &caches);
-    metric("resident_bytes", "gauge", "resident memory of the process", &one(crate::store::resident().unwrap_or(0) as f64));
+    metric("resident_bytes", "gauge", "resident memory of the process", &one(app.lake.node.machine.resident().unwrap_or(0) as f64));
     let held: Vec<(String, f64)> = allocator().into_iter().map(|(k, b)| (format!("{{kind=\"{k}\"}}"), b as f64)).collect();
     if !held.is_empty() {
         metric("allocator_bytes", "gauge", "jemalloc's own count: allocated (what the node holds), active (its pages), resident (those, its free pages not yet given back and its metadata), metadata, retained (address space kept, not resident)", &held);

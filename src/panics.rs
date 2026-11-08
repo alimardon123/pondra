@@ -49,7 +49,7 @@ async fn worked<T: Send + 'static>(busy: crate::node_state::Busy, stoppable: boo
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(line) = stoppable.then(crate::oom::line).flatten() {
-            return caught(busy, crate::oom::polled(|| crate::store::resident().unwrap_or(0), line, f)).await?.map_err(|()| crate::oom::PAGE_OOM.to_string());
+            return caught(busy, crate::oom::polled(|| crate::machine::process().resident().unwrap_or(0), line, f)).await?.map_err(|()| crate::oom::PAGE_OOM.to_string());
         }
     }
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

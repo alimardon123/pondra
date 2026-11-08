@@ -13,6 +13,7 @@ pub mod finish;
 pub mod env;
 // What a node's host does when the node must stop or start again, and what the code below it may ask of its form.
 pub mod lifecycle;
+pub mod machine;
 // The node as the code below the hosts sees it: its lifecycle, and what its stop waits for and refuses.
 pub mod node_state;
 // The one place a feature says what it adds (designs/redesign/redesign.md §6): `built_in` below lists the build's extensions.
@@ -117,6 +118,7 @@ mod rules;
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
 // Feature `server`, on by default; every module the node is made of is one of these.
 #[cfg(feature = "doors")] pub mod cli;
+#[cfg(feature = "doors")] mod os; // (the native machine: the program's and a library's process install it)
 #[cfg(feature = "lake")] mod adopt;
 #[cfg(feature = "lake")] mod app;
 #[cfg(feature = "lake")] mod audit;
