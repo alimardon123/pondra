@@ -302,6 +302,10 @@ impl Scope {
         }
     }
 
+    /// The same, for a table or view of another lake attached here (`l.t`, `l.s.t`): only grants naming it count, as its
+    /// reads ask (`named`). ON ALL TABLES and ON SCHEMA are this lake's, so they show none of another's.
+    pub fn sees_named(&self, table: &str) -> bool { self.0.as_ref().is_none_or(|a| a.named("select", table).is_some()) }
+
     /// Does it know `table` (as the catalog names it) is there? Whole, or holding any privilege on it (SELECT, INSERT,
     /// UPDATE or DELETE, on it, its schema or the lake). A table it doesn't know is answered as one that isn't there,
     /// 42P01, at every door: planning finds no such table, and `may` says "no table", so no answer tells it the table

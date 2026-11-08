@@ -200,7 +200,9 @@ fn read_failed(e: std::io::Error) -> object_store::Error { object_store::Error::
 
 /// The error a spill is refused with: `what` says which limit it passed. Every refusal ends the same way out.
 fn full(what: String) -> object_store::Error {
-    object_store::Error::Generic { store: "memory", source: format!("{what}: raise PONDRA_SPILL_GB or PONDRA_MEMORY_LAKE_GB, or move the lake to a folder (ALTER DATABASE … SET LOCATION)").into() }
+    // (coded: a bucket's error is otherwise the machine's, 58030, whatever its words: `codes::of`)
+    let why = format!("{what}: raise PONDRA_SPILL_GB or PONDRA_MEMORY_LAKE_GB, or move the lake to a folder (ALTER DATABASE … SET LOCATION)");
+    object_store::Error::Generic { store: "memory", source: Box::new(crate::codes::Coded("53100", why)) }
 }
 
 /// A part's future that fails with a refusal (`Upload::put_part`), without sending the part on.

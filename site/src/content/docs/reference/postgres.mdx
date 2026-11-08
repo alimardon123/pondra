@@ -390,5 +390,6 @@ Python and `err.sqlstate` in JavaScript.
 | `22012`, `22003`, `22P02` | division by zero, a number out of range, a value that doesn't cast |
 | `53200`, `53300` | out of memory (an answer bigger than the node's memory for queries too; a `DECLARE` past `PONDRA_CURSORS_MB`); too many queries waiting at once |
 | `0A000` | not supported: `SERIALIZABLE`, `SKIP LOCKED`, a `SCROLL` cursor, advisory locks (`pg_advisory_lock` and the rest) and `LISTEN`/`NOTIFY` (both planned for 1.1, and each refusal says what to use until then), and the other refusals named in the guides |
+| `58030`, `53100` | the machine's or the bucket's own fault: the disk read-only or full, a file the OS won't let the node write, the bucket not answering. Never read as a refusal (`42501`, `25006`) from the OS's words: send it again once the fault has passed |
 | `XX000` | anything else |
 

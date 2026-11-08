@@ -111,11 +111,12 @@ pub(crate) async fn plain_of(app: &App, sql: &str) -> Result<Option<(String, Str
 }
 
 /// Changes data, the lake or a transaction (INSERT, CREATE, CALL, EXECUTE TASK, CHECKPOINT, BEGIN…) in any of `sql`'s
-/// statements: anything but a query, or a setting or variable of the session's own. A read door (MCP's query tool, a
-/// Flight ticket) refuses it by name, as Postgres's read-only transaction does. (What it takes is listed, not what it
-/// refuses, so a statement kind added later is refused until it is called a read.)
+/// statements: anything but a query, or a setting or variable of the session's own, and a query that moves a sequence
+/// (`nextval`, `setval`). A read door (MCP's query tool, a Flight ticket) refuses it by name, as Postgres's read-only
+/// transaction does. (What it takes is listed, not what it refuses, so a statement kind added later is refused until it
+/// is called a read.)
 pub(crate) fn is_write(sql: &str) -> bool {
-    routines::split(sql).iter().any(|one| !(plain_statement(one) || crate::set::is(one) || crate::vars::change(one).is_some()))
+    routines::split(sql).iter().any(|one| crate::seq::calls(one) || !(plain_statement(one) || crate::set::is(one) || crate::vars::change(one).is_some()))
 }
 
 /// Step 2's inside, on a statement already expanded (`run` makes it, inside `audit::statement`): the key lookup, the

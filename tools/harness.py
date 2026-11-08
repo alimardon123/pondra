@@ -10747,6 +10747,12 @@ def server():
     v_notes = _try(lambda: at("hr", "SELECT max(_version) AS v FROM lake.notes", boss)[0]["v"])
     seen["ann_past"] = [at("hr", f"SELECT text FROM {n} AT (VERSION => {v_notes})", ann) for n in ("lake.notes", "lake.public.notes")]
     checks["a grant naming an attached lake's table reads it as it was too, by lake.t and lake.schema.t (AT (VERSION => n))"] = seen["ann_past"] == [[{"text": "hi"}]] * 2
+    # (11-08 audit L7: a grant ON ALL TABLES of hr listed lake's tables too, which its reads refuse; one naming lake.notes lists it)
+    for who, auth in (("bob", bob), ("ann", ann)):
+        seen[f"{who}_lists"] = at("hr", "SELECT lake, name FROM pondra.objects WHERE kind = 'table' ORDER BY lake, name", auth)
+    checks["a grant ON ALL TABLES lists none of another database's tables, as it reads none; a grant naming one lists it (pondra.objects, 11-08 audit L7)"] = \
+        isinstance(seen["bob_lists"], list) and any(r["name"] == "people" for r in seen["bob_lists"]) and not any(r["name"] == "notes" for r in seen["bob_lists"]) \
+        and isinstance(seen["ann_lists"], list) and [r["name"] for r in seen["ann_lists"]] == ["notes"]
     # Whoever runs the nodes (one of their tokens) still reads across; a user of the node's own lake doesn't.
     mine = new_lake()
     subprocess.run([BIN, "sql", "--dir", mine, "CREATE TABLE t AS SELECT 1 AS id"], check=True, capture_output=True)
@@ -22487,6 +22493,38 @@ def listings():
     unseen["INSERT, a column that isn't"] = inserted
     checks["an INSERT naming a column that isn't there, of a table ann may write but reads in part, names none of its other columns, at every door"] = \
         all(v != "answered" and "nope" in v and "card" not in v and "amount" not in v for v in inserted.values())
+    # (11-08 audit L8, L9: MCP's list_tables gives a keyed table's kind only with its key, which ann may not read here; a
+    # query that moves a sequence is a write, refused by MCP's query tool and a Flight ticket, which only read; a
+    # procedure's tool is described by its COMMENT ON, and by its body's first line only to a caller who may see code)
+    for q in ["CREATE TABLE ledger (k BIGINT PRIMARY KEY, v BIGINT)", "GRANT SELECT (v) ON ledger TO ann", "CREATE SEQUENCE ticket_no",
+              "CREATE PROCEDURE noted() LANGUAGE sql AS $$\n-- the body's own line\nSELECT 1;\n$$", "CREATE PROCEDURE told() LANGUAGE sql AS $$\n-- told's body line\nSELECT 1;\n$$",
+              "COMMENT ON PROCEDURE told IS 'Says hello'"]:
+        ask(boss, q)
+    def tables_of(auth):
+        r = ask(auth, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_tables", "arguments": {}}}), path="/mcp")
+        try:
+            return {t["table"]: t for t in json.loads(r["result"]["content"][0]["text"])["tables"]}
+        except Exception:
+            return str(r)[:300]
+    def tools_of(auth):
+        r = ask(auth, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), path="/mcp")
+        try:
+            return {t["name"]: t["description"] for t in r["result"]["tools"]}
+        except Exception:
+            return str(r)[:300]
+    keyed = {who: (lambda ts: ts.get("ledger") if isinstance(ts, dict) else ts)(tables_of(auth)) for who, auth in (("ann", ann), ("boss", boss))}
+    moved = {"MCP": mcp_says("SELECT nextval('ticket_no') AS n", "query"), "MCP setval": mcp_says("SELECT setval('ticket_no', 1) AS n", "query"),
+             "Flight SQL": flight_says("SELECT nextval('ticket_no') AS n")}
+    described = {who: tools_of(auth) for who, auth in (("ann", ann), ("boss", boss))}
+    unseen["L8 L9"] = (keyed, moved, {w: {k: v for k, v in d.items() if k in ("noted", "told")} if isinstance(d, dict) else d for w, d in described.items()})
+    checks["MCP list_tables gives a keyed table's kind only to a caller who may read its key: ann, who reads v, gets null and no key; the superuser upsert and k (11-08 audit L8)"] = \
+        isinstance(keyed["ann"], dict) and keyed["ann"]["kind"] is None and keyed["ann"]["key"] == [] and [c["name"] for c in keyed["ann"]["columns"]] == ["v"] \
+        and isinstance(keyed["boss"], dict) and keyed["boss"]["kind"] == "upsert" and keyed["boss"]["key"] == ["k"]
+    checks["a query that calls nextval or setval is a write: MCP's query tool and a Flight ticket refuse it, 25006 (11-08 audit L9)"] = \
+        all("25006" in moved[k] or "changes data" in moved[k] for k in moved)
+    checks["a procedure's MCP tool is described by its COMMENT ON; its body's first line only to one who may see its code (11-08 audit L9)"] = \
+        all(isinstance(d, dict) for d in described.values()) and "Says hello" in described["ann"]["told"] and "Says hello" in described["boss"]["told"] \
+        and "the body's own line" not in described["ann"]["noted"] and "the body's own line" in described["boss"]["noted"]
     info["unseen"] = unseen
     node.kill()
     ok = all(checks.values())
