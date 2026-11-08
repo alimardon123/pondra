@@ -407,6 +407,12 @@ impl Values {
     /// Is it set at all? For the debug switches and test hooks, which any value turns on (`env::is_set`).
     pub fn is_set(&self, var: &str) -> bool { self.get(var).is_some() }
 
+    /// A setting read as a `T`, or None when it isn't set or doesn't read as one (`env::parse`).
+    pub fn parse<T: std::str::FromStr>(&self, var: &str) -> Option<T> { self.get(var)?.trim().parse().ok() }
+
+    /// A setting in GB (fractions too) as bytes of 2^30, as every memory setting is read (`env::gib`).
+    pub fn gib(&self, var: &str) -> Option<usize> { self.parse::<f64>(var).map(crate::env::gb_bytes) }
+
     /// These values, for a test's node.
     #[cfg(test)]
     pub(crate) fn of(values: &[(&'static str, &str)]) -> Values { Values(values.iter().map(|(k, v)| (*k, v.to_string())).collect()) }
