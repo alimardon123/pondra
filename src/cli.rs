@@ -536,7 +536,7 @@ async fn run() -> anyhow::Result<()> {
             // (the node's own work failing, `node::stop`: the node is stopped as on SIGTERM but with no drain, as a library's
             // host stops it, so a leader gives up its term and the next node leads at once; then the process ends with 1)
             let mut failures = node::supervise();
-            let mut options = node::Options { dir, listen: addr, advertise, start: node::Start { reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, python, auth }, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest: None };
+            let mut options = node::Options { dir, listen: addr, advertise, start: node::Start { reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, python, auth }, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest: None, settings: crate::settings::Values::now() };
             loop {
                 let held = Arc::new(node::Held::default()); // (what the start takes, given back by a stop: `node.rs`)
                 let mut node = tokio::select! {

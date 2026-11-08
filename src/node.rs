@@ -158,7 +158,12 @@ pub struct Native {
 }
 
 /// A node's state as the code below the hosts sees it, with this host's lifecycle: a guest's when `guest`.
-pub fn native(guest: bool) -> Arc<crate::node_state::NodeState> { crate::node_state::NodeState::new(Arc::new(Native { guest })) }
+pub fn native(guest: bool) -> Arc<crate::node_state::NodeState> { native_with(guest, crate::settings::Values::now()) }
+
+/// `native`, the node starting with `settings` (`Options::settings`).
+pub(crate) fn native_with(guest: bool, settings: crate::settings::Values) -> Arc<crate::node_state::NodeState> {
+    crate::node_state::NodeState::starting(Arc::new(Native { guest }), settings)
+}
 
 impl crate::lifecycle::Lifecycle for Native {
     fn stop(&self, why: String) { stop(why) }
