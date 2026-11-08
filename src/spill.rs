@@ -50,12 +50,13 @@ pub struct Spill {
     rows: Vec<RecordBatch>, // the piece being filled
     bytes: usize,
     files: Vec<PathBuf>, // the pieces already written
+    metrics: Arc<crate::metrics::Metrics>, // its job's node's, which count what it writes and takes in
 }
 
 impl Spill {
-    /// A bucket that writes its pieces into `dir` as `{name}-{n}.arrow`.
-    pub fn new(dir: PathBuf, name: String) -> Spill {
-        Spill { dir, name, ..Default::default() }
+    /// A bucket that writes its pieces into `dir` as `{name}-{n}.arrow`, counted into `metrics` (its job's node's).
+    pub fn new(dir: PathBuf, name: String, metrics: &Arc<crate::metrics::Metrics>) -> Spill {
+        Spill { dir, name, metrics: metrics.clone(), ..Default::default() }
     }
 
     pub fn push(&mut self, batch: RecordBatch) -> Result<()> {
@@ -79,7 +80,7 @@ impl Spill {
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join(format!("{}-{}.arrow", self.name, self.files.len()));
         std::fs::write(&path, bytes)?;
-        crate::metrics::add(&crate::metrics::SPILLED, self.bytes as u64);
+        crate::metrics::add(&self.metrics.spilled, self.bytes as u64);
         (self.rows, self.bytes) = (vec![], 0);
         self.files.push(path);
         Ok(())
@@ -128,8 +129,8 @@ impl Spill {
     }
 
     /// The next `n` pieces of a stream that carries several buckets one after another.
-    pub async fn take(dir: PathBuf, name: String, frames: &mut Frames<impl futures::Stream<Item = Result<bytes::Bytes>> + Unpin>, n: usize) -> Result<Spill> {
-        let mut spill = Spill::new(dir, name);
+    pub async fn take(dir: PathBuf, name: String, frames: &mut Frames<impl futures::Stream<Item = Result<bytes::Bytes>> + Unpin>, n: usize, metrics: &Arc<crate::metrics::Metrics>) -> Result<Spill> {
+        let mut spill = Spill::new(dir, name, metrics);
         for _ in 0..n {
             spill.keep(&frames.next().await?.context("the stream ended early")?)?;
         }
@@ -141,7 +142,7 @@ impl Spill {
         if piece.is_empty() {
             return Ok(());
         }
-        crate::metrics::add(&crate::metrics::WIRE, piece.len() as u64);
+        crate::metrics::add(&self.metrics.wire, piece.len() as u64);
         if self.files.is_empty() && piece.len() < self::piece() / 8 && self.rows.is_empty() {
             self.rows = crate::log::decode(piece)?;
             self.bytes = self.rows.iter().map(crate::answer::size).sum();

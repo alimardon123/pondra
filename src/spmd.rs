@@ -165,11 +165,11 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
     let runs = nodes.iter().zip(&slices).map(|(node, s)| async move {
         match node == me {
             true => Ok(vec![]), // below
-            false => timed("its share", node, remote(node, s)).await.map(|(_, parts)| parts),
+            false => timed("its share", node, remote(node, s, &lake.node.metrics)).await.map(|(_, parts)| parts),
         }
     });
     let mine_now = cut.children()[0].clone();
-    let ours = timed("its share", me, drain(&mine_now, stage_ctx(&ctx), &id, "here"));
+    let ours = timed("its share", me, drain(&mine_now, stage_ctx(&ctx), &id, "here", &lake.node.metrics));
     let tail = async {
         let (after, upto) = tail.parts[0].tail.expect("tail");
         match upto > after { true => timed("the log tail", me, stage(lake, &tail)).await.map(|(_, parts)| parts), false => Ok(vec![]) } // no log tail: nothing to do
@@ -414,7 +414,7 @@ pub async fn stage(lake: &Lake, s: &Slice) -> Result<(String, Vec<Spill>)> {
     }
     let (ctx, plan) = plan(lake, s).await?;
     let cut = find_cut(&plan).context("no single-stage plan")?;
-    Ok((String::new(), drain(&cut.children()[0].clone(), stage_ctx(&ctx), &s.job(), "out").await?))
+    Ok((String::new(), drain(&cut.children()[0].clone(), stage_ctx(&ctx), &s.job(), "out", &lake.node.metrics).await?))
 }
 
 /// The task context a stage runs with: what it hands on goes to other nodes, so a partial GROUP BY there hands its rows on
@@ -433,14 +433,14 @@ fn stage_ctx(ctx: &SessionContext) -> Arc<datafusion::execution::TaskContext> {
 
 /// Every partition of `plan` run into a bucket of its own: what this node passes on, held in
 /// memory while it is small and on this node's disk beyond, so a stage's result isn't bounded by
-/// memory (`spill.rs`).
-async fn drain(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::TaskContext>, job: &str, name: &str) -> Result<Vec<Spill>> {
+/// memory (`spill.rs`). Its buckets count into `metrics` (the node's).
+async fn drain(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::TaskContext>, job: &str, name: &str, metrics: &Arc<crate::metrics::Metrics>) -> Result<Vec<Spill>> {
     let dir = crate::spill::dir(job)?;
     let runs = (0..plan.output_partitioning().partition_count()).map(|p| {
         let (plan, ctx, dir) = (plan.clone(), ctx.clone(), dir.clone());
         let name = format!("{name}-{p}");
         async move {
-            let (mut spill, mut rows) = (Spill::new(dir, name), plan.execute(p, ctx)?);
+            let (mut spill, mut rows) = (Spill::new(dir, name, metrics), plan.execute(p, ctx)?);
             while let Some(b) = futures::StreamExt::next(&mut rows).await {
                 spill.push(b?)?;
             }
@@ -459,8 +459,8 @@ async fn timed<T>(what: impl Into<String>, node: &str, f: impl std::future::Futu
 }
 
 /// Another node's share, streamed onto this node's disk piece by piece: the plan's shape first,
-/// then how many buckets follow, then each bucket's piece count and its pieces.
-async fn remote(node: &str, s: &Slice) -> Result<(String, Vec<Spill>)> {
+/// then how many buckets follow, then each bucket's piece count and its pieces, counted into `metrics` (this node's).
+async fn remote(node: &str, s: &Slice, metrics: &Arc<crate::metrics::Metrics>) -> Result<(String, Vec<Spill>)> {
     let res = crate::dial::call(node, crate::dial::Call::json("/cluster/stage", s)?).await?;
     if !res.ok() {
         // (the node's SQLSTATE is kept, as the leader's is for a follower's write: a step out of disk (53100) is told
@@ -472,17 +472,17 @@ async fn remote(node: &str, s: &Slice) -> Result<(String, Vec<Spill>)> {
             None => anyhow::anyhow!("{said}"),
         });
     }
-    read_reply(res, &s.job(), &format!("from-{}", node.replace(':', "_"))).await
+    read_reply(res, &s.job(), &format!("from-{}", node.replace(':', "_")), metrics).await
 }
 
-/// A `reply` read back onto this node's disk, a piece at a time.
-async fn read_reply(res: crate::dial::Reply, job: &str, name: &str) -> Result<(String, Vec<Spill>)> {
+/// A `reply` read back onto this node's disk, a piece at a time, counted into `metrics` (this node's).
+async fn read_reply(res: crate::dial::Reply, job: &str, name: &str, metrics: &Arc<crate::metrics::Metrics>) -> Result<(String, Vec<Spill>)> {
     let mut frames = crate::spill::Frames::new(res.stream());
     let shape = String::from_utf8(frames.next().await?.context("an empty reply")?)?;
     let (dir, mut parts) = (crate::spill::dir(job)?, vec![]);
     for p in 0..frames.count().await? {
         let pieces = frames.count().await?;
-        parts.push(Spill::take(dir.clone(), format!("{name}-{p}"), &mut frames, pieces).await?);
+        parts.push(Spill::take(dir.clone(), format!("{name}-{p}"), &mut frames, pieces, metrics).await?);
     }
     Ok((shape, parts))
 }
@@ -706,7 +706,7 @@ async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: 
                 async move {
                     let once = async |s: &Slice| match i == mine {
                         true => timed(format!("step {step}"), node, stage(lake, s)).await,
-                        false => timed(format!("step {step}"), node, remote(node, s)).await,
+                        false => timed(format!("step {step}"), node, remote(node, s, &lake.node.metrics)).await,
                     };
                     // A step is the same work every time (the buckets it reads are kept until the
                     // job ends), so a node that stumbles — a timeout, a restart mid-step — gets
@@ -795,6 +795,7 @@ struct Job {
     joins: Vec<crate::skew::Join>, // shuffled joins that may share out a hot partition
     at: datafusion::common::instant::Instant,
     done: std::sync::atomic::AtomicBool, // its last step ran here (others may still fetch)
+    metrics: Arc<crate::metrics::Metrics>, // its lake's node's: what its steps spill, take in and wait for
 }
 
 /// A scalar subquery a shuffle answers on the way (`hoist`): its plan, where its answer goes, and
@@ -880,7 +881,7 @@ impl Job {
         if let Some(open) = jobs.get(&id) {
             return Ok(Some(open.clone()));
         }
-        let job = Arc::new(Job { id: id.clone(), ctx, plan, exchanges, cut, shape: shape(&region), buckets: Default::default(), subqueries, joins, at: datafusion::common::instant::Instant::now(), done: Default::default() });
+        let job = Arc::new(Job { id: id.clone(), ctx, plan, exchanges, cut, shape: shape(&region), buckets: Default::default(), subqueries, joins, at: datafusion::common::instant::Instant::now(), done: Default::default(), metrics: lake.node.metrics.clone() });
         jobs.insert(id, job.clone());
         Ok(Some(job))
     }
@@ -1280,7 +1281,7 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
     // write over them (the step's number with an `r` after it).
     let tag = format!("{}{}", sh.step, if sh.again { "r" } else { "" });
     if last {
-        let out = drain(&top, stage_ctx(&job.ctx), &sh.id, &format!("out-{tag}")).await?;
+        let out = drain(&top, stage_ctx(&job.ctx), &sh.id, &format!("out-{tag}"), &job.metrics).await?;
         fails_once(sh, "PONDRA_DEBUG_FAIL_STEP")?;
         job.done.store(true, std::sync::atomic::Ordering::Relaxed); // (the sweep frees its scratch shortly)
         return Ok((job.shape.clone(), out));
@@ -1289,12 +1290,12 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
     // bucket past 64 MB goes to this node's disk as it is filled, so a shuffle isn't bounded by memory.
     let x = &job.exchanges[sh.step];
     let made = match x.plan.output_partitioning().clone() {
-        _ if x.whole => vec![drain(&top, stage_ctx(&job.ctx), &sh.id, &format!("{tag}-all")).await?; sh.nodes.len()], // (every node, every partition)
-        Partitioning::Hash(exprs, parts) => scatter(&top, stage_ctx(&job.ctx), &sh.id, &tag, exprs, sh.nodes.len(), parts, x.own.then_some(sh.me)).await?,
+        _ if x.whole => vec![drain(&top, stage_ctx(&job.ctx), &sh.id, &format!("{tag}-all"), &job.metrics).await?; sh.nodes.len()], // (every node, every partition)
+        Partitioning::Hash(exprs, parts) => scatter(&top, stage_ctx(&job.ctx), &sh.id, &tag, exprs, sh.nodes.len(), parts, x.own.then_some(sh.me), &job.metrics).await?,
         _ => {
             // An all-gather (`everywhere`): every node is sent all of what this one has.
-            let mut all = Spill::new(crate::spill::dir(&sh.id)?, format!("{tag}-gathered"));
-            for part in drain(&top, stage_ctx(&job.ctx), &sh.id, &format!("{tag}-all")).await? {
+            let mut all = Spill::new(crate::spill::dir(&sh.id)?, format!("{tag}-gathered"), &job.metrics);
+            for part in drain(&top, stage_ctx(&job.ctx), &sh.id, &format!("{tag}-all"), &job.metrics).await? {
                 all.absorb(part)?;
             }
             vec![vec![all]; sh.nodes.len()]
@@ -1324,7 +1325,7 @@ async fn received(job: &Job, sh: &Shuffle, top: &Arc<dyn ExecutionPlan>) -> Resu
         let fetches = sh.nodes.iter().enumerate().filter(|(i, _)| !own || *i == sh.me).map(|(i, node)| fetch(job, &sh.id, node, i == sh.me, k, sh.me, None, r));
         let waited = datafusion::common::instant::Instant::now();
         let from = futures::future::try_join_all(fetches).await?;
-        crate::metrics::add(&crate::metrics::WAIT_US, waited.elapsed().as_micros() as u64);
+        crate::metrics::add(&job.metrics.wait_us, waited.elapsed().as_micros() as u64);
         let mut parts: Vec<Vec<Spill>> = (0..x.output_partitioning().partition_count()).map(|q| from.iter().map(|f| f.get(q).cloned().unwrap_or_default()).collect()).collect();
         // A hot partition shared out (`skew.rs`): on its split side, each node keeps the share it
         // hashed there itself; on the other, every node gets all of it — in its own partition of
@@ -1345,7 +1346,7 @@ async fn received(job: &Job, sh: &Shuffle, top: &Arc<dyn ExecutionPlan>) -> Resu
             };
             parts[q].extend(more);
         }
-        replaced.push((x.clone(), Received::new(&x, parts)?));
+        replaced.push((x.clone(), Received::new(&x, parts, &job.metrics)?));
     }
     let top = top.clone().transform_down(|p| match replaced.iter().find(|(x, _)| Arc::ptr_eq(x, &p)) {
         Some((_, input)) => Ok(Transformed::yes(input.clone())),
@@ -1368,13 +1369,13 @@ async fn received(job: &Job, sh: &Shuffle, top: &Arc<dyn ExecutionPlan>) -> Resu
 /// above it find each key where they expect it. The partitions run at once, each filling buckets
 /// of its own; they are joined at the end in partition order, so a bucket's rows are always in
 /// the same order.
-async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::TaskContext>, job: &str, tag: &str, exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>, nodes: usize, parts: usize, only: Option<usize>) -> Result<Vec<Vec<Spill>>> {
+async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::TaskContext>, job: &str, tag: &str, exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>, nodes: usize, parts: usize, only: Option<usize>, metrics: &Arc<crate::metrics::Metrics>) -> Result<Vec<Vec<Spill>>> {
     use datafusion::physical_plan::repartition::BatchPartitioner;
     let (dir, n) = (crate::spill::dir(job)?, nodes * parts);
     let runs = (0..plan.output_partitioning().partition_count()).map(|p| {
         let (plan, ctx, dir, exprs, tag) = (plan.clone(), ctx.clone(), dir.clone(), exprs.clone(), tag.to_string());
         async move {
-            let mut into: Vec<Spill> = (0..n).map(|i| Spill::new(dir.clone(), format!("{tag}-{i}-p{p}"))).collect();
+            let mut into: Vec<Spill> = (0..n).map(|i| Spill::new(dir.clone(), format!("{tag}-{i}-p{p}"), metrics)).collect();
             let (mut split, mut rows) = (BatchPartitioner::try_new(Partitioning::Hash(exprs, n), Default::default(), p, 1)?, plan.execute(p, ctx)?);
             while let Some(b) = futures::StreamExt::next(&mut rows).await {
                 let mut wrote = Ok(());
@@ -1389,7 +1390,7 @@ async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::
             Ok::<_, anyhow::Error>(into)
         }
     });
-    let mut out: Vec<Spill> = (0..n).map(|i| Spill::new(dir.clone(), format!("{tag}-{i}"))).collect();
+    let mut out: Vec<Spill> = (0..n).map(|i| Spill::new(dir.clone(), format!("{tag}-{i}"), metrics)).collect();
     for made in futures::future::try_join_all(runs).await? {
         for (i, s) in made.into_iter().enumerate() {
             out[i].absorb(s)?;
@@ -1400,7 +1401,7 @@ async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::
         by_node[i / parts].push(s);
     }
     if only.is_none() {
-        skew(&by_node);
+        skew(&by_node, metrics);
     }
     Ok(by_node)
 }
@@ -1410,13 +1411,12 @@ async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::
 /// work — the query still answers (a bucket is bounded by disk, not memory), just not in parallel.
 /// `pondra_shuffle_skew` is where that shows, and `GROUP BY` mostly avoids it: every node
 /// aggregates its own rows before the exchange, so a hot key crosses as one row per node.
-fn skew(buckets: &[Vec<Spill>]) {
+fn skew(buckets: &[Vec<Spill>], metrics: &crate::metrics::Metrics) {
     let sizes: Vec<u64> = buckets.iter().map(|b| b.iter().map(|s| s.bytes()).sum()).collect();
     let total: u64 = sizes.iter().sum();
     let (Some(&worst), true) = (sizes.iter().max(), total > 0) else { return };
     let ratio = worst as f64 * sizes.len() as f64 / total as f64;
-    let was = crate::metrics::SKEW.load(std::sync::atomic::Ordering::Relaxed);
-    crate::metrics::SKEW.store(was.max((ratio * 100.0) as u64), std::sync::atomic::Ordering::Relaxed);
+    metrics.skew.fetch_max((ratio * 100.0) as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The shuffles right below `p` (not below another one).
@@ -1447,7 +1447,7 @@ async fn fetch(job: &Job, id: &str, from: &str, local: bool, k: usize, to: usize
     let res = crate::dial::call(from, crate::dial::Call::get(format!("/cluster/shuffle?id={id}&exchange={k}&to={to}{only}"))).await?;
     ensure!(res.ok(), "{from}: {}", res.text().await?);
     let name = format!("in-{k}{r}-{to}-{}{}", from.replace(':', "_"), part.map(|q| format!("-p{q}")).unwrap_or_default());
-    Ok(read_reply(res, id, &name).await?.1)
+    Ok(read_reply(res, id, &name, &job.metrics).await?.1)
 }
 
 /// A bucket's partitions, or just one of them.
@@ -1477,10 +1477,10 @@ struct Received {
 impl Received {
     /// `parts[partition]`: what this node reads for each of the exchange's partitions, in order
     /// (every node's bucket for it, in node order).
-    fn new(x: &Arc<dyn ExecutionPlan>, parts: Vec<Vec<Spill>>) -> Result<Arc<dyn ExecutionPlan>> {
+    fn new(x: &Arc<dyn ExecutionPlan>, parts: Vec<Vec<Spill>>, metrics: &crate::metrics::Metrics) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = x.schema();
         ensure!(parts.iter().flatten().filter_map(|s| s.schema()).all(|s| s.fields() == schema.fields()), "nodes planned the query differently: {schema:?} / {:?}", parts.iter().flatten().filter_map(|s| s.schema()).find(|s| s.fields() != schema.fields()));
-        crate::metrics::add(&crate::metrics::RECEIVED, parts.iter().flatten().map(|s| s.bytes()).sum());
+        crate::metrics::add(&metrics.received, parts.iter().flatten().map(|s| s.bytes()).sum());
         let parts = parts.into_iter().map(|p| crate::spill::chain(p, schema.clone())).collect();
         Ok(Arc::new(Received { props: x.properties().clone(), parts }))
     }

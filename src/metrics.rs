@@ -7,8 +7,7 @@ use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// A node's own counters (`NodeState::metrics`): what `/metrics` and `/stats` say of it. Two nodes in one process count
-/// apart, and a node's start begins them at 0. (The shuffle's counters below are still the process's, for one node at a
-/// time, until they move: l7-wip/step2-pr8-metrics-plan.md.)
+/// apart, and a node's start begins them at 0.
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub rows_in: AtomicU64,       // rows this node took into the log, by any door
@@ -27,6 +26,12 @@ pub struct Metrics {
     pub object_reads: AtomicU64,   // …and reads (GET and HEAD)
     pub catalog_reads: AtomicU64,  // catalog records it read (a lookup, there or not, or each a scan gave)…
     pub catalog_writes: AtomicU64, // …and put or deleted (the write-set rule: designs/redesign/redesign.md §4)
+    pub spilled: AtomicU64,        // shuffle bytes written to this node's disk (`spill::Spill`, with its job's node's)
+    pub skew: AtomicU64,           // the worst bucket/average seen in a shuffle, x100
+    pub received: AtomicU64,       // shuffle bytes this node's steps read (its share of the work)
+    pub wire: AtomicU64,           // bytes other nodes sent this node, compressed as sent (shuffles, gathered results)
+    pub wait_us: AtomicU64,        // time this node's steps waited for other nodes' buckets
+    pub stopped_for_memory: AtomicU64, // queries the node stopped because it was nearly out of memory (`oom.rs`)
     /// Background loops that fail without failing a request, by `JOBS`: counted here, so a stall that otherwise shows only
     /// on stderr is visible in `/metrics` and `/stats`.
     failed: [AtomicU64; JOBS.len()],
@@ -46,12 +51,6 @@ impl Metrics {
     pub fn failures(&self) -> Vec<(&'static str, u64)> { JOBS.iter().zip(&self.failed).map(|(k, c)| (*k, c.load(Relaxed))).collect() }
 }
 
-crate::per_node!(pub static SPILLED: AtomicU64 = AtomicU64::new(0)); // shuffle bytes written to this node's disk
-crate::per_node!(pub static SKEW: AtomicU64 = AtomicU64::new(0)); // the worst bucket/average seen in a shuffle, x100
-crate::per_node!(pub static RECEIVED: AtomicU64 = AtomicU64::new(0)); // shuffle bytes this node's steps read (its share of the work)
-crate::per_node!(pub static WIRE: AtomicU64 = AtomicU64::new(0)); // bytes other nodes sent this node, compressed as sent (shuffles, gathered results)
-crate::per_node!(pub static WAIT_US: AtomicU64 = AtomicU64::new(0)); // time this node's steps waited for other nodes' buckets
-crate::per_node!(pub static STOPPED_FOR_MEMORY: AtomicU64 = AtomicU64::new(0)); // queries the node stopped because it was nearly out of memory (`oom.rs`)
 // (these two are the process's, not a node's: a stopped node's last queries still count themselves
 // down, and set back to 0 under them they would wrap)
 pub static RUNNING: AtomicU64 = AtomicU64::new(0); // queries running here now, each on one of PONDRA_QUERIES' turns
@@ -124,7 +123,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("catalog_records_total", "counter", "catalog records this node read and wrote", &[("{op=\"read\"}".to_string(), get(&m.catalog_reads)), ("{op=\"write\"}".to_string(), get(&m.catalog_writes))]);
     metric("files_skipped_total", "counter", "Parquet files queries skipped by min/max, unopened", &one(get(&m.files_skipped)));
     let requests = [("write", &m.object_writes), ("list", &m.object_lists), ("delete", &m.object_deletes), ("read", &m.object_reads)].map(|(op, c)| (format!("{{op=\"{op}\"}}"), get(c)));
-    metric("object_requests_total", "counter", "requests this process made of its bucket, past the SSD tier: writes (a multipart upload's start, parts and end each one), lists, deletes and reads, as a bucket bills and rate-limits them", &requests);
+    metric("object_requests_total", "counter", "requests this node made of its bucket, past the SSD tier: writes (a multipart upload's start, parts and end each one), lists, deletes and reads, as a bucket bills and rate-limits them", &requests);
     metric("background_failures_total", "counter", "background jobs (tiering, publishing, emission, tasks, checkpoints) that failed; a rising count is a stall to look at", &m.failures().iter().map(|(k, n)| (format!("{{job=\"{k}\"}}"), *n as f64)).collect::<Vec<_>>());
     let turns = crate::budget::turns();
     let label = |b: &str, l: &str| format!("{{bucket=\"{b}\",lake=\"{l}\"}}");
@@ -132,15 +131,15 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("bucket_turns_most", "gauge", "the most requests it had at once there so far", &turns.iter().map(|(b, l, _, m)| (label(b, l), *m as f64)).collect::<Vec<_>>());
     let ai = [("answered", &crate::ai::CALLS), ("failed", &crate::ai::FAILED), ("retried", &crate::ai::RETRIED)].map(|(r, c)| (format!("{{result=\"{r}\"}}"), get(c)));
     metric("ai_requests_total", "counter", "requests ai_complete and ai_embed made to the model's endpoint: answered, failed for good (their rows NULL), tried again", &ai);
-    metric("shuffle_spilled_bytes_total", "counter", "shuffle rows written to this node's disk", &one(get(&SPILLED)));
+    metric("shuffle_spilled_bytes_total", "counter", "shuffle rows written to this node's disk", &one(get(&m.spilled)));
     metric("shuffle_disk_bytes", "gauge", "shuffle buckets on this node's disk now", &one(crate::spill::held() as f64));
-    metric("shuffle_skew", "gauge", "worst bucket vs the average one in a shuffle here (1 = even)", &one(get(&SKEW) / 100.0));
+    metric("shuffle_skew", "gauge", "worst bucket vs the average one in a shuffle here (1 = even)", &one(get(&m.skew) / 100.0));
     metric("skew_splits_total", "counter", "hot partitions of shuffled joins shared out over the nodes", &one(get(&m.skew_splits)));
-    metric("shuffle_received_bytes_total", "counter", "shuffle bytes this node's steps read", &one(get(&RECEIVED)));
-    metric("wire_bytes_total", "counter", "bytes other nodes sent this node, compressed as sent", &one(get(&WIRE)));
-    metric("shuffle_wait_seconds_total", "counter", "time this node's steps waited for other nodes' buckets", &one(get(&WAIT_US) / 1e6));
+    metric("shuffle_received_bytes_total", "counter", "shuffle bytes this node's steps read", &one(get(&m.received)));
+    metric("wire_bytes_total", "counter", "bytes other nodes sent this node, compressed as sent", &one(get(&m.wire)));
+    metric("shuffle_wait_seconds_total", "counter", "time this node's steps waited for other nodes' buckets", &one(get(&m.wait_us) / 1e6));
     let (reserved, limit) = app.lake.memory();
-    metric("queries_stopped_for_memory_total", "counter", "queries stopped (answered 53200) because the node was nearly out of memory (PONDRA_MEMORY_MAX_GB); a first try stopped and run again frugally is not counted, one that can't be run again is", &one(get(&STOPPED_FOR_MEMORY)));
+    metric("queries_stopped_for_memory_total", "counter", "queries stopped (answered 53200) because the node was nearly out of memory (PONDRA_MEMORY_MAX_GB); a first try stopped and run again frugally is not counted, one that can't be run again is", &one(get(&m.stopped_for_memory)));
     metric("memory_limit_bytes", "gauge", "query memory limit (spills beyond it)", &one(limit as f64));
     metric("memory_reserved_bytes", "gauge", "query memory in use", &one(reserved as f64));
     let (hot, hot_max, loading) = app.lake.hot.usage();
