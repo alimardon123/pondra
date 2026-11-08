@@ -23,7 +23,7 @@ const LEAST_STEP: usize = 16 * 1024 * 1024 / PAGE; // (in pages)
 // plain load and store is all it takes: the atomic is only there because a static must be one to be shared.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
-/// The page's live heap bytes: what the program that runs the page reads to watch its memory (`page::Options::memory`).
+/// The page's live heap bytes: the resident memory of the page's device (`device.rs`), which the core watches its memory by.
 pub fn live() -> usize {
     LIVE.load(Relaxed)
 }

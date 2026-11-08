@@ -631,10 +631,10 @@ pub fn unclaim_page() {
 /// task that follows a joined page's node's stream (`open_joined`), aborted at the page's end (`end_page`).
 pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, ended: Arc<AtomicBool>, superuser: AtomicBool, pub(crate) life: Arc<PageLife> }
 
-/// Takes the module's page (`PAGED`) for a page's member, and sets the device line its queries hold (`env::device_line`). A
-/// freed page's member may still be closing in the background, which sets PAGED back when it has ended: then this waits for
-/// it, 10 ms at a time, for 30 s at most, and is refused 55006 after that.
-async fn claim_paged(line: Option<usize>) -> anyhow::Result<()> {
+/// Takes the module's page (`PAGED`) for a page's member. A freed page's member may still be closing in the background,
+/// which sets PAGED back when it has ended: then this waits for it, 10 ms at a time, for 30 s at most, and is refused 55006
+/// after that.
+async fn claim_paged() -> anyhow::Result<()> {
     // (`swap` checks and sets at once, so two opens can't both take it)
     let mut sleeps = 0;
     while PAGED.swap(true, SeqCst) {
@@ -644,14 +644,13 @@ async fn claim_paged(line: Option<usize>) -> anyhow::Result<()> {
         sleeps += 1;
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    crate::env::set_device_line(line); // (its lake's queries hold the page's share of it: `store::memory_limit`)
     Ok(())
 }
 
 /// Opens a page's member (`Paged`), its lake on `store` when one is given (a kept page's folder), else in memory, and its
-/// queries holding the page's share of its device's `line` (`claim_paged`). Set back if the open fails.
-pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>, life: Arc<PageLife>) -> anyhow::Result<Paged> {
-    claim_paged(line).await?;
+/// queries holding the page's share of its device's line (`store::memory_limit`). Set back if the open fails.
+pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) -> anyhow::Result<Paged> {
+    claim_paged().await?;
     let url = crate::memory::place(":memory:");
     let owned = store.is_some(); // (a given store is a kept page's folder, under its Web Lock: no other writer, so its term is taken at once)
     if let Some(given) = store {
@@ -714,8 +713,8 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
 /// 3 s (a node's is 250 ms, but each of a page's is a request). It claims no term and writes nothing to the cluster, so closing
 /// it changes nothing there. The sign-in's end stops both loops and sets `ended` (a 401 or 403 from the node, or the refresh's
 /// closed error).
-pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, line: Option<usize>, life: Arc<PageLife>) -> anyhow::Result<Paged> {
-    claim_paged(line).await?;
+pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, life: Arc<PageLife>) -> anyhow::Result<Paged> {
+    claim_paged().await?;
     let url = crate::memory::place(":memory:");
     crate::memory::give(&url, store);
     let store = crate::memory::store(&url);
