@@ -14,13 +14,27 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-crate::per_node!(
-    /// Manifests already read, by path: a manifest, once written, never changes. The newest 256, each charged its parsed
-    /// entries to the node's line, which takes them back when it needs the memory (`manifests`).
-    static MANIFESTS: Arc<Mutex<crate::ledger::ByteLru<String, Arc<Vec<Value>>>>> = Arc::new(Mutex::new(crate::ledger::ByteLru::new(usize::MAX).with_count(256))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+/// The Iceberg manifests a lake read, by path (its state, `lake_state.rs`): a manifest, once written, never changes. The
+/// newest 256, each charged its parsed entries to the lake's line (`cache_bytes{cache="iceberg_manifests"}`), which takes
+/// them back when it needs the memory.
+pub struct Manifests(Mutex<crate::ledger::ByteLru<String, Arc<Vec<Value>>>>);
 
-/// The Iceberg manifests read, as the node's line counts them (`cache_bytes{cache="iceberg_manifests"}`).
-pub fn manifests() -> Arc<dyn crate::ledger::Charged> { MANIFESTS.clone() }
+impl crate::lake_state::LakeState for Manifests {
+    const NAME: &'static str = "iceberg_manifests";
+    const ABOUT: &'static str = "the manifests of the Iceberg tables it read, by path";
+
+    fn make() -> Self { Manifests(Mutex::new(crate::ledger::ByteLru::new(usize::MAX).with_count(256))) }
+
+    fn cache(self: Arc<Self>) -> Option<Arc<dyn crate::ledger::Charged>> { Some(self) }
+}
+
+impl crate::ledger::Charged for Manifests {
+    fn held(&self) -> usize { crate::ledger::Charged::held(&self.0) }
+
+    fn give_back(&self, bytes: usize) -> usize { crate::ledger::Charged::give_back(&self.0, bytes) }
+
+    fn gives_back(&self) -> bool { true }
+}
 
 /// The table at `url` (a table's folder or a metadata file), at its current snapshot or the one
 /// asked for: `version` (of its metadata), `snapshot_from_id`, `snapshot_from_timestamp`.
@@ -203,12 +217,13 @@ pub async fn resolve_metadata(lake: &Lake, url: &str, at: &str, meta: &Value, op
 
 /// A manifest's entries (read once: a manifest never changes).
 async fn manifest(lake: &Lake, path: String) -> Result<Arc<Vec<Value>>> {
-    if let Some(e) = MANIFESTS.lock().unwrap().get(&path).cloned() {
+    let kept = lake.state::<Manifests>()?;
+    if let Some(e) = kept.0.lock().unwrap_or_else(|e| e.into_inner()).get(&path).cloned() {
         return Ok(e);
     }
     let e = Arc::new(crate::avro::records(&crate::reach::get(lake, &path).await?)?);
     let bytes = e.iter().map(crate::ledger::json_bytes).sum();
-    let left = MANIFESTS.lock().unwrap().put(path, e.clone(), bytes);
+    let left = kept.0.lock().unwrap_or_else(|e| e.into_inner()).put(path, e.clone(), bytes);
     drop(left); // (let go of outside the lock)
     Ok(e)
 }
