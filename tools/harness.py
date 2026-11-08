@@ -11320,6 +11320,21 @@ def users():
     checks["a REVOKE in the middle of a Flight DoPut stops it at its next batch (42P01), a DROP USER ends it (28000), and the batches before stay written"] = \
         put_said["revoked"][0] == 1 and "no table flown" in str(put_said["revoked"][1]) and put_said["dropped"][0] == 1 \
         and "signed out" in str(put_said["dropped"][1]) and put_said["rows"] == [{"n": 2}] or put_said
+    # ALTER USER … NOLOGIN, alone or beside another option, keeps it from signing in; nothing to change is a usage error, 42601 (11-08 audit M12)
+    as_(A.port, boss, "CREATE USER nol PASSWORD 'nol-password-1'")
+    nol = basic("nol", "nol-password-1")
+    nol_said = {"before": as_(A.port, nol, "SELECT 1 AS x"), "nologin": as_(A.port, boss, "ALTER USER nol NOLOGIN SUPERUSER")}
+    nol_said["after"] = as_(A.port, nol, "SELECT 1 AS x")
+    nol_said["login"] = as_(A.port, boss, "ALTER USER nol LOGIN")
+    nol_said["again"] = as_(A.port, nol, "SELECT current_user AS u")
+    c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=30)
+    c.request("POST", "/sql", b"ALTER USER nol", {"Authorization": boss})
+    r = c.getresponse()
+    nol_said["nothing"] = (r.status, r.getheader("x-pondra-sqlstate"), r.read().decode(errors="replace")[:200])
+    shown_info["nologin"] = {k: str(v)[:200] for k, v in nol_said.items()}
+    checks["ALTER USER … NOLOGIN, beside SUPERUSER too, keeps a user from signing in, LOGIN lets it again; ALTER USER with nothing to change is 42601 (M12)"] = \
+        nol_said["before"] == [{"x": 1}] and str(nol_said["after"]).startswith("ERROR 401") and nol_said["again"] == [{"u": "nol"}] \
+        and nol_said["nothing"][:2] == (400, "42601") or nol_said
     # W50: a user granted a view (and a materialized view) alone is shown their names, columns and rows, not their queries,
     # the base table's name or the filter; a listing shows the view as a read does; the server's folder is an admin's
     vee_pw = "vee-password-1"
@@ -12590,6 +12605,10 @@ def guarded():
         and all(v <= 12 for v in h3_ended.values()) and isinstance(kafka_before, int) and kafka_before >= 1 and kafka_at_once == kafka_after == 0  # (hana holds nothing on stock now: a topic that isn't there, served neither new row)
     checks["Flight's follow stream ends when its sign-in may no longer read the table: REVOKE ends it within 12 s, telling the client to sign in again (11-03 H1)"] = \
         h3_flowing is True and h3_ended.get("flight follow", 99) <= 12 and "sign in again" in h3["flight follow"].get("error", "")
+    # (each is asked again the moment the lake's rights move, a second at most, not every 5 s whether or not they did: 11-08 M7.
+    # The no-longer-superuser's live query ends at its next answer, which the INSERT 6 s on brings)
+    checks["/watch, a live query and Flight's follow stream end within 4 s of the REVOKE or DROP USER that ends their sign-in (11-08 M7)"] = \
+        h3_flowing is True and all(h3_ended.get(k, 99) <= 4 for k in ("watch", "live, dropped", "flight follow"))
     # M8: a joined page's own statements are written by its node, as the sign-in's (`POST /cluster/records`, page_records.rs): a
     # superuser's sign-in only (never the nodes' key, nor a user with grants), at most 256 lines, under the node's own class and
     # words, and kept as a history row whatever the audit classes say. Node a's classes here have no read (`role,ddl,function,write`).
@@ -22343,7 +22362,8 @@ def listings():
         return r
     statements = {"SELECT *": "SELECT * FROM {t}", "a column that isn't": "SELECT nope FROM {t}", "a key's row": "SELECT * FROM {t} WHERE id = 1",
                   "by its schema": "SELECT count(*) FROM public.{t}", "INSERT": "INSERT INTO {t} VALUES (1, 2.0)", "UPDATE": "UPDATE {t} SET salary = 1",
-                  "DELETE": "DELETE FROM {t}", "DESCRIBE": "DESCRIBE {t}", "SHOW COLUMNS": "SHOW COLUMNS FROM {t}"}
+                  "DELETE": "DELETE FROM {t}", "DESCRIBE": "DESCRIBE {t}", "SHOW COLUMNS": "SHOW COLUMNS FROM {t}",
+                  "AT (…)": "SELECT * FROM {t} AT (VERSION => 1)"}  # (a past read says nothing of it: not a view, keyed, or when made, 11-08 audit M4)
     writes = {"INSERT", "UPDATE", "DELETE"}
     doors = {"HTTP": lambda s, w: as_ann(s), "Postgres": lambda s, w: pg_says(s), "Flight SQL": lambda s, w: flight_says(s), "MCP": lambda s, w: mcp_says(s, "write" if w else "query")}
     routes = {"GET /lookup": lambda t: as_ann("", "GET", f"/lookup/{t}/1"), "POST /append": lambda t: as_ann('{"id": 1, "salary": 2.0}', "POST", f"/append/{t}"),
@@ -22365,6 +22385,19 @@ def listings():
                 a, b = ask_(hidden), ask_(gone)
                 unseen[f"{route}, {hidden}"] = (a, b)
                 checks[f"{route} of hr, which ann holds no privilege on, is answered as of a table that isn't there"] = same(a, b) and "permission denied" not in a and "salary" not in a
+            # (and to a user who may write but not make tables: a missing table isn't asked to be made first, 42501, while a hidden
+            # one is "no table", so the code never tells them apart: 11-08 audit M5)
+            for q in ["CREATE USER wes PASSWORD 'wes-password-1'", "GRANT INSERT ON notes TO wes"]:
+                ask(boss, q)
+            def wes_insert(t):
+                c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+                c.request("POST", f"/insert/{t}", b"SELECT 1 AS id, 2.0 AS salary", {"Authorization": basic("wes", "wes-password-1")})
+                r = c.getresponse()
+                return f"{r.status} {r.getheader('x-pondra-sqlstate')} {r.read().decode(errors='replace')[:400]}"
+            a, b = wes_insert(hidden), wes_insert(gone)
+            unseen["POST /insert, a writer"] = (a, b)
+            checks["POST /insert of hr, by a user who may write another table but not make one, is answered as of a table that isn't there (42P01)"] = \
+                same(a, b) and "42P01" in a and "permission denied" not in a and "may not" not in a
     # (Kafka: its topics are the tables it knows of; a record for one it doesn't is for a topic that isn't there)
     import confluent_kafka as ck, confluent_kafka.admin
     sasl = lambda u, p: {"bootstrap.servers": f"127.0.0.1:{A.port + 31}", "security.protocol": "SASL_PLAINTEXT", "sasl.mechanisms": "PLAIN", "sasl.username": u, "sasl.password": p}

@@ -40,6 +40,14 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
     let t = &spec.table;
     let (other, local) = crate::ddl::resolve(lake, t).await?;
     let attached = other.is_some();
+    let named = match attached {
+        true => format!("{}.{local}", t.split('.').next().unwrap_or_default()), // (the attached lake's name, then its table's as it keeps it)
+        false => local.clone(),
+    };
+    // (a table or view the caller holds nothing on is one that isn't there, before anything is said of it: that it is a view,
+    // keyed, or when it was made, as a plain read says "no table": 11-08 audit M4)
+    let scope = crate::rights::scope();
+    ensure!(if attached { scope.knows_named(&named) } else { scope.knows(&named) }, "no table {t}");
     let upto = match &other {
         Some(o) => {
             crate::users::across(o, t.split('.').next().unwrap_or_default()).await?; // (a lake that signs in on its own: refused, as its plain reads are)
@@ -114,10 +122,6 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
         };
         out = out.union(old)?;
     }
-    let named = match attached {
-        true => format!("{}.{local}", t.split('.').next().unwrap_or_default()), // (the attached lake's name, then its table's as it keeps it)
-        false => local,
-    };
     Ok((named, crate::query::named(ctx, out.into_view(), &meta, false)?, attached))
 }
 

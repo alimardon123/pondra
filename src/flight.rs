@@ -1236,7 +1236,7 @@ impl FlightService for Door {
                     let name = crate::auth::catalog_name(&table);
                     crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&name)).map_err(denied)?; // (a stream of rows: every column, as `/watch` needs)
                     // (the rows come after this call's scope has ended: its sign-in is checked again, and the table's whole rows
-                    // with it, so a REVOKE, a DROP USER or a session's end stops them within 5 s, as at `/watch`: 11-03 audit H1)
+                    // with it, so a REVOKE, a DROP USER or a session's end stops them within a second, as at `/watch`: 11-03 audit H1)
                     let header = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
                     let revoked = crate::server::until_revoked(app.clone(), crate::auth::operator(), header, move |p| {
                         crate::rights::may(p, crate::rights::Action::SelectAll, crate::rights::Object::Table(&name)).is_ok()
