@@ -39,6 +39,8 @@ pub trait Members: Send + Sync + 'static {
     fn least_known(&self) -> Option<u32> { None }
     /// The concrete member, for a door that needs a node's own (`cluster::of`).
     fn as_any(&self) -> &dyn std::any::Any;
+    /// The node a joined page follows, and as whom (`Joined`); None for any other member.
+    fn joined(&self) -> Option<&Joined> { None }
 }
 
 pub const CUT_OFF_SAYS: &str = "this node leads but can't reach the bucket: another node will lead in a moment, ask it";
@@ -220,15 +222,32 @@ impl Members for Alone {
 /// A page that joined a cluster (`node::open_joined`): a follower that never leads, runs tasks or keeps the lake's records. Its
 /// leader is the node it joined, at term 0 (a term it claims nothing of: the cluster's terms start at 1), so it follows that
 /// node's commit stream rather than a term's. It writes its own rows and files (`page::joined_part`), which its node commits.
+/// It holds what the page is to its node: the sign-in its calls carry (`dial::Joined`) and its user's folder.
 pub struct Joined {
     term: Term,
+    auth: String,
+    slug: std::sync::OnceLock<String>,
 }
 
 impl Joined {
-    /// The member of the lake the cluster at `node` leads (its URL, as `https://host:7000`).
-    pub fn new(node: &str) -> Joined {
-        Joined { term: Term { n: 0, addr: node.trim_end_matches('/').to_string(), lock: String::new(), bell: false } }
+    /// The member of the lake the cluster at `node` leads (its URL, as `https://host:7000`), followed with the sign-in `auth`
+    /// (an `Authorization`: the page's own, never a key or a user of the nodes').
+    pub fn new(node: &str, auth: &str) -> Joined {
+        Joined { term: Term { n: 0, addr: node.trim_end_matches('/').to_string(), lock: String::new(), bell: false }, auth: auth.to_string(), slug: Default::default() }
     }
+
+    /// The node it joined: its origin, with no trailing `/`.
+    pub fn node(&self) -> &str { &self.term.addr }
+
+    /// The `Authorization` its calls to its node carry.
+    pub fn auth(&self) -> &str { &self.auth }
+
+    /// The slug of its user, as its node's `/whoami` said it (`node::open_joined`): the folder its staged rows go in,
+    /// `stage/<slug>/` (`write::stage_insert`). None until the node has said it.
+    pub fn slug(&self) -> Option<&str> { self.slug.get().map(String::as_str) }
+
+    /// Its node said its user's slug (`node::open_joined`): once, for the member's life.
+    pub fn set_slug(&self, slug: String) { let _ = self.slug.set(slug); }
 }
 
 impl Members for Joined {
@@ -238,6 +257,7 @@ impl Members for Joined {
     fn keeps_records(&self) -> bool { false }
     fn nodes(&self) -> Vec<String> { vec![] }
     fn as_any(&self) -> &dyn std::any::Any { self }
+    fn joined(&self) -> Option<&Joined> { Some(self) }
 }
 
 #[cfg(test)]
