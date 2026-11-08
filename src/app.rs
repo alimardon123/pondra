@@ -312,7 +312,7 @@ impl App {
     pub fn to(&self) -> crate::log::To {
         match &self.seq {
             Some(seq) => crate::log::To::Local(seq.clone()),
-            None => crate::log::To::Leader(self.members.leader().addr.clone()),
+            None => crate::log::To::leader(&self.lake, self.members.leader().addr.clone()),
         }
     }
 

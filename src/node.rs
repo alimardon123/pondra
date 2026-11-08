@@ -349,7 +349,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     let seq = if leader { Some(log::Sequencer::start(lake.clone(), pace).await?) } else { None };
     let to = match &seq {
         Some(s) => log::To::Local(s.clone()),
-        None => log::To::Leader(members.leader().addr.clone()),
+        None => log::To::leader(&lake, members.leader().addr.clone()),
     };
     let _ = lake.to.set(to.clone()); // (a follower's sequences' values: the leader's sequencer)
     let log = (!reader).then(|| Arc::new(log::Log::start(lake.clone(), Duration::from_millis(s.flush_ms), to)));

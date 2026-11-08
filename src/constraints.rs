@@ -373,7 +373,7 @@ pub fn queue(lake: Arc<Lake>, table: String, src: Src, batch: RecordBatch) -> Re
         let _turn = TURN.lock().await; // (held until the answer)
         match to {
             To::Local(seq) => leader(lake, seq, table, src, batch).await,
-            To::Leader(addr) => send(&addr, &table, &src, &batch).await,
+            To::Leader(addr, _) => send(&addr, &table, &src, &batch).await,
         }
     })
 }

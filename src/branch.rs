@@ -947,7 +947,7 @@ pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::syn
     }
     lake.cat.commit(puts, &[]).await?;
     crate::views::forget(lake); // (the sequencer's views as they are now: invariant 77)
-    crate::log::forget_producers(fills);
+    crate::log::forget_producers(lake, fills);
     Ok(j!({"refreshed": all, "from": me.base}))
 }
 
