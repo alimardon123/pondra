@@ -1347,7 +1347,7 @@ mod tests {
     #[tokio::test]
     async fn a_round_reads_only_the_tables_committed_since_the_last() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-rounds-{}", uuid::Uuid::new_v4()));
-        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::lifecycle::unhosted()).await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         for t in ["a", "b", "c"] {
             crate::write::create_table(&lake, t, r#"{"columns": [["x", "Int64"]]}"#).await?;
         }

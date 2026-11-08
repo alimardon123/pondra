@@ -671,7 +671,7 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>, 
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open(&url, true, false, life.clone()).await?;
+        let l = crate::store::Lake::open(&url, true, false, crate::node_state::NodeState::new(life.clone())).await?;
         lake = Some(l.clone());
         start_app(l, alone.clone(), None, &start).await
     }
@@ -727,7 +727,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open_on(&url, true, kv, life.clone()).await?;
+        let l = crate::store::Lake::open_on(&url, true, kv, crate::node_state::NodeState::new(life.clone())).await?;
         lake = Some(l.clone());
         start_app(l, members, None, &start).await
     }
