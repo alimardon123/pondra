@@ -1352,7 +1352,7 @@ mod tests {
     /// forms (`front::expand`).
     #[tokio::test]
     async fn a_statement_only_the_fallback_reads_comes_out_as_generic_reads_it() {
-        let lake = Lake::open(&format!("memory://fallback-{}", uuid::Uuid::new_v4().simple()), true, false, crate::lifecycle::unhosted()).await.unwrap();
+        let lake = Lake::open(&format!("memory://fallback-{}", uuid::Uuid::new_v4().simple()), true, false, crate::node_state::NodeState::unhosted()).await.unwrap();
         for (sql, want) in [
             ("SELECT id, [y * 2 FOR y IN l IF y > 0] AS d FROM t", "SELECT id, array_transform(array_filter(l, y -> (y > 0)), y -> (y * 2)) AS d FROM t"),
             ("SELECT [x FOR x IN [1, 2]] AS v", "SELECT array_transform((make_array(1, 2)), x -> (x)) AS v"), // (an array literal as make_array: `pg_casts`)
