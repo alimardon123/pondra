@@ -119,7 +119,7 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
           counts in the query memory: invariant 414); keys_below.rs (a join's keys cut the rows an aggregate under it
-          groups: invariant 437); reuse.rs (a subplan that appears more than once alike runs once: invariant 477); eager.rs (a grouping by a dimension's text columns groups the big table by its keys first: invariant 478); or_ranges.rs (an OR of ranges of one column that meet as one
+          groups: invariant 437); reuse.rs (a subplan that appears more than once alike runs once: invariant 477); eager.rs (a grouping by a dimension's text columns groups the big table by its keys first: invariant 478); undrop.rs (a dropped definition kept, and UNDROP for each kind: invariant 479); or_ranges.rs (an OR of ranges of one column that meet as one
           range: invariant 438); zeros_in.rs (a float IN list's zero, a CASE's and NULLIF's, answer as `=` does: invariant 448); round 35 served.rs (a lake's store over HTTP:
           pondra://host:port, ADR-072 §8, invariant 299); replace.rs (CREATE OR REPLACE TABLE: a staged table filled, then put
           in the old one's place in one commit: invariant 425); round 36 statement.rs (one statement's
@@ -3220,6 +3220,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    joins it reorders) and runs just after the join order. At SF10 in process against main: TPC-DS q22 3.46 -> 0.42 s,
    q86 0.079 -> 0.070, q23 1.89 -> 1.80; every other TPC-H and TPC-DS plan as it was; the same answers.
    `cargo test --lib eager::`
+479. **A dropped definition is kept, and comes back with UNDROP as a table does** (`undrop.rs`, ADR-043 §2b). A drop of
+   a view, an external table, a function, macro or procedure, a task (with its last tick), a type, a secret (still
+   sealed) or a connection puts its records as they were, with the comments on it and its columns, in one
+   `dk/{family}/{name}/{ms}` record in the drop's own commit. `UNDROP <kind> name` puts the newest back, for the kinds
+   whose registry verbs list UNDROP (`objects::Kind`, read by `write::parse`); it is refused while anything of the
+   family has the name, and needs the right that kind's DROP needs (`statements::undrops_entry`: an admin's for a
+   connection). `UNDROP TABLE` brings back a kept external table when no table is kept. Each is kept for the default
+   7 days (`ddl::KEEP_MS`), let go by `tier::expire`; `pondra.dropped` lists it (kind, dropped_by, undrop) to whoever
+   may read a relation of its name, any other kind to the whole. `dk/` is no page's and no branch's.
+   `cargo test --lib undrop::`
 
 ```bash
 cargo build --release

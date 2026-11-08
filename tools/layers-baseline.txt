@@ -147,7 +147,7 @@ objects -> branch  2
 objects -> constraints  1
 objects -> ddl  32
 objects -> engine  1
-objects -> expander  3
+objects -> expander  2
 objects -> ext  3
 objects -> extension  1
 objects -> facts  1

@@ -127,6 +127,56 @@ def history_check(bin, work, port):
         keyed == [(1, "a"), (2, "B")] and rows("SELECT id, v FROM k ORDER BY id") == keyed and log_gone \
         and delta in ([{"id": 1, "v": "a"}, {"id": 2, "v": "B"}], "skipped: no deltalake")
 
+    # Every definition is kept when dropped, and the statement pondra.dropped gives brings it back as it was (undrop.rs):
+    # each kind dropped and undropped 20 times, its comment with it; the newest first; refused while the name is taken.
+    q("CREATE TABLE base (a BIGINT)")
+    made = [
+        ("view", "dv", "CREATE VIEW dv AS SELECT a FROM base"),
+        ("external table", "dx", "CREATE EXTERNAL TABLE dx STORED AS CSV LOCATION '" + os.path.join(work, "dx.csv") + "'"),
+        ("function", "df", "CREATE FUNCTION df(x BIGINT) RETURNS BIGINT AS 'x + 1'"),
+        ("macro", "dm", "CREATE MACRO dm(x) AS x * 2"),
+        ("type", "dty", "CREATE TYPE dty AS ENUM ('a', 'b')"),
+        ("task", "dtask", "CREATE TASK dtask SCHEDULE '1 day' AS SELECT 1"),
+        ("secret", "dsec", "CREATE SECRET dsec (TYPE s3, KEY_ID 'k', SECRET 's')"),
+        ("connection", "dconn", "CREATE CONNECTION dconn TYPE s3 WITH (url = 's3://bucket/incoming')"),
+    ]
+    with open(os.path.join(work, "dx.csv"), "w") as f:
+        f.write("a\n1\n")
+    drops = {"view": "DROP VIEW", "external table": "DROP TABLE", "function": "DROP FUNCTION", "macro": "DROP MACRO", "type": "DROP TYPE",
+             "task": "DROP TASK", "secret": "DROP SECRET", "connection": "DROP CONNECTION"}
+    shown = lambda name: rows(f"SELECT kind, name, comment, definition FROM pondra.objects WHERE name = '{name}'")
+    me = rows("SELECT current_user")[0][0]
+    came_back = {}
+    for kind, name, sql in made:
+        q(sql)
+        if kind == "view":
+            q("COMMENT ON VIEW dv IS 'kept with it'")
+        was = shown(name)
+        ok = bool(was)
+        for _ in range(20):
+            q(f"{drops[kind]} {name}")
+            listed = rows(f"SELECT kind, undrop, dropped_by FROM pondra.dropped WHERE name = '{name}'")
+            ok = ok and shown(name) == [] and listed == [(kind, f"UNDROP {kind.upper()} {name}", me)]
+            q(listed[0][1] if listed else f"UNDROP {kind.upper()} {name}")
+            ok = ok and shown(name) == was
+        came_back[kind] = ok
+    q("DROP VIEW dv")
+    q("CREATE VIEW dv AS SELECT 2 AS two")
+    taken = refused("UNDROP VIEW dv")
+    q("DROP VIEW dv")
+    q("UNDROP VIEW dv")
+    newest = rows("SELECT * FROM dv")
+    q("ALTER VIEW dv RENAME TO dv_newer")
+    q("UNDROP VIEW dv")
+    older = shown("dv")
+    q("DROP TABLE dx")
+    q("UNDROP TABLE dx")  # (DROP TABLE drops an external table too, and UNDROP TABLE brings it back)
+    checks["each kind of definition (view, external table, function, macro, type, task, secret, connection) is kept when dropped and comes back as it was, 20 times; pondra.dropped says how"] = \
+        all(came_back.values()) and len(came_back) == 8 and rows("SELECT count(*) FROM pondra.dropped WHERE kind <> 'table'") == [(0,)]
+    checks["UNDROP of a definition takes the newest, refused while the name is taken; renamed away, the older comes back with its comment"] = \
+        "dv exists" in taken and newest == [(2,)] and older and older[0][2] == "kept with it" and shown("dx") != []
+    print(f"(definitions kept and undropped: {came_back})", file=sys.stderr)
+
     # AT: every state the table was in, by its commit and by its time, against what it was then.
     q("CREATE TABLE h (id BIGINT, v VARCHAR)")
     states = []
