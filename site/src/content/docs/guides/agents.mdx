@@ -100,7 +100,7 @@ tables, views, materialized views and schemas. It is committed and durable when 
 ## Give it a job: procedures
 
 A stored procedure is a tool of its own. Its name is the tool's name, its parameters are the tool's arguments,
-and its first comment line is the tool's description. Write the job as a procedure, and the agent calls it
+and its `COMMENT ON PROCEDURE` (or, for a token, its first comment line) is the tool's description. Write the job as a procedure, and the agent calls it
 with its arguments instead of composing SQL:
 
 ```sql

@@ -585,13 +585,8 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Arc<
 /// is applied once), so only a record that can't succeed is given up on.
 fn failed(e: &anyhow::Error) -> Outcome {
     use crate::codes::Kind::*;
-    // (a code read from an error's words is trusted only when the error isn't the machine's or the bucket's: the OS's
-    // "Read-only file system" or "Permission denied" would read as 25006 or 42501, and a write may pass once the disk or
-    // the bucket is back, so it is retried, 11-06 audit L5; the bucket as DataFusion reads it, a UNIQUE check on the
-    // leader, is object_store 0.13's, 11-07 audit L7)
-    let coded = e.chain().any(|c| c.is::<crate::codes::Coded>() || c.is::<crate::codes::Violation>());
-    let machine = !coded && e.chain().any(|c| c.is::<std::io::Error>() || c.is::<object_store::Error>() || c.is::<object_store_df::Error>());
-    let code = if machine { "58030" } else { crate::codes::of(e) }; // (io_error: Unavailable)
+    // (the machine's or the bucket's own error is io_error, Unavailable, whatever its words would read as: `codes::of`)
+    let code = crate::codes::of(e);
     let error = match crate::codes::kind(code) {
         Missing if matches!(code, "42P01" | "3F000" | "3D000") => UNKNOWN_TOPIC,
         Invalid | Refused | Exists | Missing | Unsupported => INVALID_RECORD,
@@ -1704,6 +1699,8 @@ mod tests {
         assert_eq!(failed(&os(std::io::ErrorKind::PermissionDenied, "Permission denied (os error 13)")).0, REQUEST_TIMED_OUT);
         let bucket = anyhow::Error::from(object_store::Error::NotFound { path: "t/1".into(), source: "gone".into() });
         assert_eq!(failed(&bucket).0, REQUEST_TIMED_OUT);
+        let full = anyhow::Error::from(object_store::Error::Generic { store: "S3", source: "Permission denied".into() });
+        assert_eq!(failed(&full).0, REQUEST_TIMED_OUT);
         // (and the bucket as DataFusion reads it, through object_store 0.13 and DataFusion's own error, 11-07 audit L7)
         let denied = || object_store_df::Error::PermissionDenied { path: "t/1".into(), source: "Permission denied".into() };
         assert_eq!(failed(&anyhow::Error::from(denied())).0, REQUEST_TIMED_OUT);
