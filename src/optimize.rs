@@ -2288,12 +2288,29 @@ struct Size {
     distinct: std::collections::HashMap<String, u64>,
     spans: std::collections::HashMap<String, (f64, f64)>, // (a table's columns' least and greatest values, as numbers: for its filters)
     learned: bool, // (its rows are a share of its table a run measured: learned.rs)
+    keys: std::collections::HashMap<String, u64>, // (its tables' keys: columns with a value of their own in every row of the table, and how many: `key_values`)
 }
 
 impl Size {
     /// The same input cut to `rows` (a filter, or a join that kept some of them).
     fn cut(&self, rows: u64) -> Size {
-        Size { rows, distinct: self.distinct.iter().map(|(c, &n)| (c.clone(), n.min(rows))).collect(), spans: self.spans.clone(), learned: false }
+        Size { rows, distinct: self.distinct.iter().map(|(c, &n)| (c.clone(), n.min(rows))).collect(), spans: self.spans.clone(), learned: false, keys: self.keys.clone() }
+    }
+
+    /// A table's size, its keys found: the columns whose distinct values are as many as its rows.
+    fn whole(rows: u64, distinct: std::collections::HashMap<String, u64>, spans: std::collections::HashMap<String, (f64, f64)>) -> Size {
+        let keys = distinct.iter().filter(|(_, &n)| n >= rows && rows > 0).map(|(c, &n)| (c.clone(), n)).collect();
+        Size { rows, distinct, spans, learned: false, keys }
+    }
+
+    /// The values `e` may hold when it is a key of its table (`keys`).
+    fn key(&self, e: &Expr) -> Option<u64> {
+        match e {
+            Expr::Column(c) => self.keys.get(&c.name).copied(),
+            Expr::Alias(a) => self.key(&a.expr),
+            Expr::Cast(c) => self.key(&c.expr),
+            _ => None,
+        }
     }
 
     fn of(&self, e: &Expr) -> Option<u64> {
@@ -2312,10 +2329,10 @@ impl Size {
 /// `date_dim` by its 261 dates keeps 261 of the dates' weeks, not all 10,436, and a later join on
 /// the week counted as if 2% of inventory met each day of a year (TPC-DS q72).
 fn joined(a: &Size, b: &Size, on: &[(&Expr, &Expr)], rows: u64) -> Size {
-    let d = |s: &Size, e: &Expr| s.of(e).unwrap_or(s.rows).max(1) as f64;
     let (mut met_a, mut met_b) = (1f64, 1f64); // (the share of each side's rows that meets the other)
     for &(l, r) in on {
-        (met_a, met_b) = (met_a.min(d(b, r) / d(a, l)), met_b.min(d(a, l) / d(b, r)));
+        let (da, db) = key_values(a, b, l, r);
+        (met_a, met_b) = (met_a.min(db / da), met_b.min(da / db));
     }
     let left = |s: &Size, met: f64| rows.min((s.rows as f64 * met).ceil() as u64);
     let mut distinct = a.cut(left(a, met_a)).distinct;
@@ -2323,7 +2340,25 @@ fn joined(a: &Size, b: &Size, on: &[(&Expr, &Expr)], rows: u64) -> Size {
         let n = distinct.get(&c).map_or(n, |had| n.min(*had)); // (the same name twice: take the smaller — the join looks no cheaper than it is)
         distinct.insert(c, n);
     }
-    Size { rows, distinct, spans: Default::default(), learned: false }
+    let keys = a.keys.iter().chain(&b.keys).map(|(c, &n)| (c.clone(), n)).collect(); // (a key's values are still among its table's)
+    Size { rows, distinct, spans: Default::default(), learned: false, keys }
+}
+
+/// The distinct values each side of a join key counts. Where one side's column is its table's key (a value of its own
+/// in every row: `Size::keys`), the other side's values are among that key's, as a foreign key's are, so it counts no more
+/// than the key has. Their ranges alone can't say so where the key's values are sparse: TPC-H's 15 million order keys run
+/// from 1 to 60 million, so `lineitem`'s order keys counted 60 million values, `orders ⋈ lineitem` looked like 15 million
+/// rows rather than 60, and q9 joined them first, before its parts cut `lineitem` to a twentieth (3.9 s against 2.5).
+fn key_values(a: &Size, b: &Size, l: &Expr, r: &Expr) -> (f64, f64) {
+    let d = |s: &Size, e: &Expr| s.of(e).unwrap_or(s.rows).max(1) as f64;
+    let (mut da, mut db) = (d(a, l), d(b, r));
+    if let Some(k) = a.key(l) {
+        db = db.min(k.max(1) as f64);
+    }
+    if let Some(k) = b.key(r) {
+        da = da.min(k.max(1) as f64);
+    }
+    (da, db)
 }
 
 /// How many rows a join of `a` and `b` on `on` leaves: every row of one side meets the rows of the
@@ -2339,11 +2374,11 @@ fn join_rows(a: &Size, b: &Size, on: &[(&Expr, &Expr)]) -> u64 {
     if on.is_empty() {
         return (ra * rb).min(u64::MAX as f64) as u64; // a cross join
     }
-    let spread: f64 = on.iter().map(|(l, r)| {
-        let d = |s: &Size, e: &Expr, rows: f64| s.of(e).map_or(rows, |n| n as f64);
-        d(a, l, ra).max(d(b, r, rb)).max(1.0)
+    let widest: f64 = on.iter().map(|(l, r)| {
+        let (da, db) = key_values(a, b, l, r);
+        da.max(db).max(1.0)
     }).fold(1.0, f64::max);
-    (ra * rb / spread).max(1.0).min(u64::MAX as f64) as u64
+    (ra * rb / widest).max(1.0).min(u64::MAX as f64) as u64
 }
 
 /// Which inputs each key's two sides read (a bit an input), for a key every column of which is in
@@ -2633,7 +2668,7 @@ fn size(plan: &LogicalPlan) -> Option<Size> {
             let columns = || s.source.schema().fields().iter().zip(&stats.column_statistics).map(|(f, c)| (f.name().clone(), c)).collect::<Vec<_>>();
             let distinct = columns().into_iter().filter_map(|(f, c)| Some((f, *c.distinct_count.get_value()? as u64))).collect();
             let spans = columns().into_iter().filter_map(|(f, c)| Some((f, (number(c.min_value.get_value()?)?, number(c.max_value.get_value()?)?)))).collect();
-            let whole = Size { rows: *stats.num_rows.get_value()? as u64, distinct, spans, learned: false };
+            let whole = Size::whole(*stats.num_rows.get_value()? as u64, distinct, spans);
             whole.cut(whole.rows.min(s.fetch.unwrap_or(usize::MAX) as u64)) // (its filters are counted by the Filter above it: a lake's tables take them inexactly)
         }
         LogicalPlan::Filter(f) => {
@@ -2675,7 +2710,7 @@ mod tests {
     /// A table's size: its rows, and each column's (name, distinct values, least, greatest).
     fn table(rows: u64, columns: &[(&str, u64, f64, f64)]) -> Size {
         let distinct = columns.iter().map(|c| (c.0.to_string(), c.1)).collect();
-        Size { rows, distinct, spans: columns.iter().map(|c| (c.0.to_string(), (c.2, c.3))).collect(), learned: false }
+        Size::whole(rows, distinct, columns.iter().map(|c| (c.0.to_string(), (c.2, c.3))).collect())
     }
 
     /// A month of 200 years of dates is a month of them (both ends of the range together), a year
@@ -2737,6 +2772,25 @@ mod tests {
         let both = joined(&inventory, &dates, &[(&l, &r)], join_rows(&inventory, &dates, &[(&l, &r)]));
         assert_eq!(both.rows, 11_745_000);
         assert_eq!((both.distinct["d_week_seq"], both.distinct["d_date_sk"], both.distinct["inv_date_sk"]), (261, 261, 261));
+    }
+
+    /// A foreign key's values are among its key's: every `lineitem` row meets its order, though the order keys are 15
+    /// million values spread over 1 to 60 million (TPC-H q9), and orders cut to 2 million keep 2/15 of `lineitem`. A
+    /// join on a column that is no table's key counts as it did: inventory's 261 dates against every date.
+    #[test]
+    fn a_foreign_key_meets_its_key() {
+        let orders = table(15_000_000, &[("o_orderkey", 15_000_000, 1.0, 60_000_000.0)]);
+        let lineitem = table(60_000_000, &[("l_orderkey", 60_000_000, 1.0, 60_000_000.0), ("l_partkey", 2_000_000, 1.0, 2_000_000.0)]);
+        let (l, r) = (col("o_orderkey"), col("l_orderkey"));
+        assert_eq!(join_rows(&orders, &lineitem, &[(&l, &r)]), 60_000_000);
+        assert_eq!(join_rows(&orders.cut(2_000_000), &lineitem, &[(&l, &r)]), 8_000_000);
+        let both = joined(&orders, &lineitem, &[(&l, &r)], 60_000_000);
+        assert_eq!(both.distinct["l_partkey"], 2_000_000); // (all of lineitem met an order: none of its parts is lost)
+        let inventory = table(11_745_000, &[("inv_date_sk", 261, 2_450_815.0, 2_452_635.0)]);
+        let dates = table(73_049, &[("d_date_sk", 73_049, 2_415_022.0, 2_488_070.0)]);
+        let (l, r) = (col("inv_date_sk"), col("d_date_sk"));
+        assert_eq!(join_rows(&inventory, &dates, &[(&l, &r)]), 11_745_000);
+        assert_eq!(join_rows(&inventory, &dates.cut(365), &[(&l, &r)]), 11_745_000); // (as before: by the year's 365 dates)
     }
 
     /// Customers meet suppliers by nation and suppliers their nation, so customers meet their

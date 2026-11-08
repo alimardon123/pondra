@@ -362,6 +362,7 @@ impl ::log::Log for ErrorLines {
 static ERROR_LINES: ErrorLines = ErrorLines;
 
 pub fn main() {
+    crate::machine::install(std::sync::Arc::new(crate::os::Os::default())); // (the program's machine, before anything reads it)
     if ::log::set_logger(&ERROR_LINES).is_ok() {
         ::log::set_max_level(::log::LevelFilter::Error);
     }

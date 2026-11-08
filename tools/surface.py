@@ -334,7 +334,7 @@ def collect_node(bin_path):
             out["sql_functions"] = sorted({str(next(iter(r.values()))).lower() for r in rows})  # the name comes first
             out["system_tables"], how["system_tables"] = system_tables(base)
             out["kinds"] = sorted({k["kind"] for k in json.loads(get(base, "/kinds"))})
-            out["metrics"] = sorted(set(re.findall(r"^# TYPE (\S+) ", get(base, "/metrics"), re.M)))
+            out["metrics"] = sorted(set(re.findall(r"^# TYPE (\S+) ", get(base, "/metrics") + get(base, "/metrics/tables"), re.M)))
         finally:
             stop_node(proc)
     return out, how

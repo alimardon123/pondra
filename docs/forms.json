@@ -11,6 +11,6 @@
  "server_only": {
   "doors: a page answers through its one request API, with no sockets, servers, certificates or sign-ins": {"modules": ["console", "dbserver", "flight", "iceberg_rest", "kafka", "live", "mcp", "origins", "pg", "pg_values", "served", "server", "sharing", "sso_flow", "tls"]},
   "more than one node: a page is one": {"modules": ["cluster", "sync"]},
-  "the program and its machine: commands, a service, a node's life in a process": {"modules": ["ci", "cli", "jemalloc", "library", "project", "service", "shell"]}
+  "the program and its machine: commands, a service, a node's life in a process": {"modules": ["ci", "cli", "jemalloc", "library", "os", "project", "service", "shell"]}
  }
 }

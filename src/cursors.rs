@@ -189,11 +189,11 @@ async fn declare_as(app: &App, name: &str, hold: bool, query: &str) -> Result<An
 }
 
 /// The most the node's cursors may hold together, in bytes. `PONDRA_CURSORS_MB` sets it. Unset, it is a
-/// quarter of the node's memory (`store::ram`, which knows a container's limit) or 1024 MB, whichever is
+/// quarter of the node's memory (`Machine::ram`, which knows a container's limit) or 1024 MB, whichever is
 /// less, and 1024 MB when the memory is unknown: a node in a 1 GB container mustn't hold 1 GB of cursors.
 /// Nothing held is dropped to make room; a client is still reading each cursor.
 fn budget() -> usize {
-    let default = crate::store::ram().map_or(1 << 30, |ram| (ram / 4).min(1 << 30));
+    let default = crate::machine::process().ram().map_or(1 << 30, |ram| (ram / 4).min(1 << 30));
     crate::env::parse::<usize>("PONDRA_CURSORS_MB").map_or(default, |mb| mb << 20)
 }
 

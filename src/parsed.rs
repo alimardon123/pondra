@@ -29,6 +29,43 @@ pub(crate) fn generic(sql: &str) -> Result<Vec<Statement>, ParserError> {
     (*parsed).clone() // (copied outside the lock: another statement's look waits for no copy)
 }
 
+/// `sql` read as the front reads it: as `generic` parses it, and a text generic refuses parsed again with the fallback
+/// dialect's hooks (`dialect.rs`), which read only texts generic refuses. When both refuse, the error of the one that
+/// read further into the text (a typo inside a hook's form points there), generic's on a tie. Not kept: generic's own
+/// answer for the text is its refusal.
+pub(crate) fn read(sql: &str) -> Result<Vec<Statement>, ParserError> {
+    let refused = match generic(sql) {
+        Ok(stmts) => return Ok(stmts),
+        Err(e) => e,
+    };
+    let (theirs, used) = crate::dialect::parse(sql);
+    if crate::passes::checked() && theirs.is_ok() {
+        // (a panic: a request's is answered as an error, so a gate's run names the hook whose trigger is short)
+        if let Err(e) = crate::passes::get().hooks_fired(sql, &used) {
+            panic!("{e}");
+        }
+    }
+    match theirs {
+        Ok(stmts) => Ok(stmts),
+        Err(e) if reached(&e) > reached(&refused) => Err(e),
+        Err(_) => Err(refused),
+    }
+}
+
+/// Where in the text a parse error stood, as sqlparser says it (`at Line: l, Column: c`; the text's end for `found:
+/// EOF`), to compare two errors: (0, 0) when it says nowhere.
+fn reached(e: &ParserError) -> (u64, u64) {
+    let said = e.to_string();
+    if said.contains("found: EOF") {
+        return (u64::MAX, u64::MAX);
+    }
+    let at = |key: &str| said.rsplit_once(key).and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok());
+    match (at("at Line: "), at(", Column: ")) {
+        (Some(l), Some(c)) => (l, c),
+        _ => (0, 0),
+    }
+}
+
 /// `sql`'s parse when one of the last few looks made it (`generic`), and None when none did: nothing is parsed here. The
 /// engine plans a query from it rather than parse the text again (`engine::planned`).
 pub(crate) fn already(sql: &str) -> Option<Parsed> {

@@ -347,7 +347,7 @@ optimizing; performance first):
   level now); a full disk given room acks again within a second. `resilience_check.py disk` passes
   on 64 MB and 32 MB.
 - **A table's past** (ADR-043, PR #13, `tools/history_check.py` 12 of 12): a dropped table is kept
-  for its retention (a day unless the table says otherwise) and `UNDROP TABLE` brings it back;
+  for its retention (7 days unless the table says otherwise) and `UNDROP TABLE` brings it back;
   `SELECT … FROM t AT (VERSION => n | TIMESTAMP => '…' | OFFSET => -3600)` reads an append table as
   it was, anywhere a table goes, equal to a model of 13 states; `RESTORE TABLE t TO VERSION AS OF n`
   puts it back in one change (ids kept, undone by another); `CREATE TABLE c CLONE t` copies no file.

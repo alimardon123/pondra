@@ -113,6 +113,48 @@ pub struct Refusal {
 
 impl Refusal {
     fn new(text: String) -> Refusal { Refusal { code: "42501", text } }
+
+    /// A table the principal doesn't know is there (`Scope::knows`), answered as one that isn't: 42P01, in the words a
+    /// write to a table that isn't there has. The audit log still writes it as refused (`told_unseen`).
+    fn unseen(table: &str) -> Refusal {
+        told_unseen();
+        Refusal { code: "42P01", text: format!("no table {table}") }
+    }
+}
+
+tokio::task_local! {
+    /// Around a statement the audit log writes (`noting`): set when it was told that a table it holds no privilege on
+    /// isn't there. Its asker can't tell that from a table that isn't, and the audit log writes it as the refusal it is.
+    static UNSEEN: std::sync::atomic::AtomicBool;
+}
+
+/// `f`, and whether it was told that a table it holds no privilege on isn't there (`Refusal::unseen`, `query::guarded`).
+pub async fn noting<F: std::future::Future>(f: F) -> (F::Output, bool) {
+    UNSEEN.scope(Default::default(), async { (f.await, UNSEEN.with(|u| u.load(std::sync::atomic::Ordering::Relaxed))) }).await
+}
+
+/// The request being served was told that a table it holds no privilege on isn't there (`noting`).
+pub fn told_unseen() { let _ = UNSEEN.try_with(|u| u.store(true, std::sync::atomic::Ordering::Relaxed)); }
+
+/// A statement's planning error as the request being served is told it. A column that isn't there is said without the
+/// columns that are (DataFusion lists them, or the nearest one, "Did you mean …"), unless the scope is whole: they may
+/// be columns it may not read, which no answer names (`query::Guarded::shown`).
+pub fn said(e: datafusion::error::DataFusionError) -> datafusion::error::DataFusionError {
+    use datafusion::{common::SchemaError, error::DataFusionError};
+    if scope().whole() {
+        return e;
+    }
+    let missing = match e.find_root() {
+        DataFusionError::SchemaError(s, _) => match s.as_ref() {
+            SchemaError::FieldNotFound { field, valid_fields } if !valid_fields.is_empty() => Some(field.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    match missing {
+        Some(field) => DataFusionError::SchemaError(Box::new(SchemaError::FieldNotFound { field, valid_fields: vec![] }), Box::new(None)),
+        None => e,
+    }
 }
 
 impl std::fmt::Display for Refusal {
@@ -153,6 +195,9 @@ pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusa
     };
     if granted {
         return Ok(());
+    }
+    if !a.knows(&table) {
+        return Err(Refusal::unseen(&table)); // (never "permission denied": that would say it is there)
     }
     let p = privilege.to_uppercase();
     let what = if action == Action::SelectAll { format!("{p} on every column of") } else { format!("{p} on") };
@@ -257,6 +302,15 @@ impl Scope {
         }
     }
 
+    /// Does it know `table` (as the catalog names it) is there? Whole, or holding any privilege on it (SELECT, INSERT,
+    /// UPDATE or DELETE, on it, its schema or the lake). A table it doesn't know is answered as one that isn't there,
+    /// 42P01, at every door: planning finds no such table, and `may` says "no table", so no answer tells it the table
+    /// exists, nor its columns. One it knows but may not read or write is refused, 42501.
+    pub fn knows(&self, table: &str) -> bool { self.0.as_ref().is_none_or(|a| a.knows(table)) }
+
+    /// The same, for a table of another lake attached here (`l.t`, `l.s.t`): only grants naming it count (`named`).
+    pub fn knows_named(&self, table: &str) -> bool { self.0.as_ref().is_none_or(|a| a.knows_named(table)) }
+
     /// The columns of `table` (as the catalog names it) it reads: None, none; Some(None), every column; Some(these).
     pub fn columns(&self, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.0.as_ref().map_or(Some(None), |a| a.columns("select", table)) }
 
@@ -359,7 +413,9 @@ mod tests {
         assert_eq!(said(may(&ann, Action::Insert, t)), "ok");
         assert_eq!(said(may(&ann, Action::Update, t)), "permission denied: UPDATE on t (GRANT UPDATE ON t TO ann)");
         assert_eq!(said(may(&ann, Action::Lock, t)), "permission denied: UPDATE on t (GRANT UPDATE ON t TO ann)");
-        assert_eq!(said(may(&ann, Action::Delete, Object::Table("u"))), "permission denied: DELETE on u (GRANT DELETE ON u TO ann)");
+        assert_eq!(said(may(&ann, Action::Delete, Object::Table("s.u"))), "permission denied: DELETE on s.u (GRANT DELETE ON s.u TO ann)"); // (it knows s.u: SELECT on s)
+        assert_eq!(said(may(&ann, Action::Delete, Object::Table("u"))), "no table u"); // (no privilege on u: as if it weren't there)
+        assert_eq!((may(&ann, Action::SelectAll, Object::Table("u")).unwrap_err().code, may(&ann, Action::Insert, Object::Table("u")).unwrap_err().code), ("42P01", "42P01"));
         assert!(said(may(&ann, Action::Define, t)).starts_with("this user may not change the lake's tables"));
         assert_eq!(said(may(&ann, Action::Export, Object::Lake)), "this user may not write files outside the lake: it needs an admin token, or a superuser");
         assert_eq!(said(may(&ann, Action::Write, Object::Lake)), "this user may not write: it needs a write token, or a user granted a write"); // (a reader's role)
@@ -380,6 +436,22 @@ mod tests {
         assert_eq!(said(may(&Principal::token(Role::Admin), Action::SelectAll, audit)), "ok");
         assert_eq!(said(may(&Principal::token(Role::Write), Action::SelectAll, audit)), "permission denied: pondra$audit is Pondra's own, and its rows stream to a superuser only");
         assert_eq!(said(may(&all, Action::SelectAll, audit)), "permission denied: pondra$audit is Pondra's own, and its rows stream to a superuser only");
+    }
+
+    /// A column that isn't there is said without the columns that are, to a user with grants: they may be ones it may not
+    /// read (`super::said`). A token and a superuser are told them, and the nearest.
+    #[tokio::test]
+    async fn a_missing_column_names_no_other_to_a_user_with_grants() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::{field_not_found, DFSchema};
+        let schema = DFSchema::try_from_qualified_schema("t", &Schema::new(vec![Field::new("id", DataType::Int64, true), Field::new("card", DataType::Utf8, true)])).unwrap();
+        let schema = &schema;
+        let told = move |p: Principal| crate::auth::WHO.scope(p, async move { super::said(field_not_found(Some("t"), "car", schema)).to_string() });
+        let ann = user(&[("select", On::Table("t".into()), &["id"])]);
+        assert_eq!(told(ann).await, "Schema error: No field named t.car.", "the column as the statement named it, and no other");
+        let admin = told(Principal::token(Role::Admin)).await;
+        assert!(admin.contains("Did you mean 't.card'?") && admin.contains("Valid fields are t.id, t.card."), "{admin}");
+        assert_eq!(crate::codes::of(&anyhow::Error::new(super::said(field_not_found(Some("t"), "car", schema)))), "42703"); // (no caller: whole)
     }
 
     /// Work with no caller is refused, not given an admin's rights: work a request spawns without `auth::carried` loses

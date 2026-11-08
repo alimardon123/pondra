@@ -85,7 +85,7 @@ impl Load {
 impl Drop for Load {
     fn drop(&mut self) {
         let error = self.end.take().unwrap_or_else(|| Some("the client went away before the load ended".into()));
-        let line = || crate::audit::rows(&self.app, self.door, &self.table, error, self.start.elapsed());
+        let line = || crate::audit::rows(&self.app, self.door, &self.table, error, false, self.start.elapsed());
         match self.who.clone() {
             Some(w) => crate::auth::WHO.sync_scope(w, line),
             None => line(),

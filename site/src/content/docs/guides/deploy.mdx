@@ -116,7 +116,8 @@ address the other nodes reach it at.
 
 ### Memory
 
-A node uses a third of its memory for queries and spills to disk beyond that. In a container it reads
+A node's queries and caches share 72% of its memory: the caches give way when a query needs the room, and a query
+spills to disk beyond that. In a container it reads
 that memory from the container's limit, so give the container one (`--memory`). Without a limit it sees
 the host's memory. `--memory-gb` or `PONDRA_MEMORY_GB` sets the figure yourself.
 
