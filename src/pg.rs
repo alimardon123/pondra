@@ -841,7 +841,7 @@ impl Backend {
         let sql = crate::sys::planned(sql).map_err(user_error)?;
         let ctx = self.session(&sql, user).await?;
         let df = crate::engine::sql(&ctx, &sql).await.map_err(user_error)?;
-        Ok(Arc::new(crate::query::run_schema(&ctx, df.logical_plan()).map_err(user_error)?.as_arrow().clone()))
+        Ok(Arc::new(crate::query::described(&ctx, df.logical_plan()).map_err(user_error)?.as_arrow().clone())) // (refused as its run would be)
     }
 
     /// A session for `sql`; with Postgres's catalog, its functions and its `information_schema`

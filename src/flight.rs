@@ -1175,7 +1175,9 @@ impl FlightService for Door {
             let app = &self.0 .0;
             allowed(app, &req, Role::Read)?;
             let mut infos = vec![];
-            for (key, _) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k) && crate::rights::may_here(crate::rights::Action::Select, crate::rights::Object::Table(&k[2..])).is_ok()) {
+            // (each a flight of `SELECT *`: listed for a table it may read every column of, as its ticket would be refused
+            // naming none for one granted in part, and its info would be: 11-08 audit M6)
+            for (key, _) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k) && crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&k[2..])).is_ok()) {
                 let table = &key[2..];
                 // (the schema its ticket streams, planned as DoGet runs it: a table's strings are Utf8View, not the table's Utf8)
                 let sql = format!("SELECT * FROM {}", crate::write::sql_name(table));

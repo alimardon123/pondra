@@ -11231,6 +11231,26 @@ def users():
     infos = [table_info("sales.orders"), table_info("notes")]
     checks["Flight's GetFlightInfo of a table refuses a user granted only some columns (no column names), and serves one it may read"] = \
         "permission denied" in str(infos[0]) and "text" in infos[1]
+    # …and describing a query is refused as running it is (11-08 audit M6): GetFlightInfo of SELECT * and Postgres's Describe of
+    # it name no column ann may not read, and ListFlights lists a flight (a SELECT *) only of a table she may read whole
+    def sql_info(q):
+        try:
+            return client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": q})), opts).schema.names
+        except Exception as e:
+            return f"ERROR {e}"
+    def pg_described(q):
+        with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=ann password=ann-password-1 dbname=lake", connect_timeout=10, autocommit=True) as c:
+            r = c.pgconn.prepare(b"s1", q.encode())  # (refused at Parse or at Describe: either way, before any row)
+            if r.status == psycopg.pq.ExecStatus.COMMAND_OK:
+                r = c.pgconn.describe_prepared(b"s1")
+            return [r.fname(i).decode() for i in range(r.nfields)] if r.status == psycopg.pq.ExecStatus.COMMAND_OK else f"ERROR {r.error_message.decode(errors='replace')}"
+    described = {"flight *": sql_info("SELECT * FROM sales.orders"), "flight cols": sql_info("SELECT id, item FROM sales.orders"),
+                 "pg *": pg_described("SELECT * FROM sales.orders"), "pg cols": pg_described("SELECT id, item FROM sales.orders"),
+                 "flights": sorted(f.descriptor.path[0].decode() for f in client.list_flights(options=opts))}
+    shown_info["described"] = {k: str(v)[:200] for k, v in described.items()}
+    checks["describing SELECT * of a table granted in part is refused as running it is (Flight's GetFlightInfo, Postgres's Describe), naming no column; ListFlights lists only tables read whole (M6)"] = \
+        all(str(described[k]).startswith("ERROR") and "permission denied" in str(described[k]) and "card" not in str(described[k]) for k in ("flight *", "pg *")) \
+        and described["flight cols"] == described["pg cols"] == ["id", "item"] and "sales.orders" not in described["flights"] and "notes" in described["flights"] or described
     # Revoked and dropped: at once, on the leader and a follower
     ann_pg = psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=ann password=ann-password-1 dbname=lake", connect_timeout=10, autocommit=True)  # (open across the REVOKE and the DROP)
     def ann_said(q):
