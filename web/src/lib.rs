@@ -8,6 +8,7 @@ use pondra::page::Node;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
+mod device;
 mod fetch;
 mod heap;
 mod js;
@@ -47,7 +48,7 @@ impl Page {
         set_panic_hook();
         let given = Given::read(&opts)?;
         give(given.settings)?;
-        let page = pondra::page::Page::claim(&options(None, given.node)).map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        let page = claim(&options(None, given.node))?;
         Ok(Page(page, None, spill::start()))
     }
 
@@ -78,7 +79,7 @@ impl Page {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(opfs::Opfs::new(folder));
         // (claimed first, so a page refused its claim opens no spill file; if the page can't be kept, it and `held` drop with
         // this return, and the folder is let go)
-        let claimed = pondra::page::Page::claim(&options(Some(store), given.node)).map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        let claimed = claim(&options(Some(store), given.node))?;
         let mut page = Page(claimed, Some(held), spill::start());
         page.open_now().await?;
         Ok(page)
@@ -99,7 +100,7 @@ impl Page {
         let node = node::node(join.node().to_string(), Some(session));
         let options = pondra::page::Options { joined: Some(join), ..options(None, Some(node)) };
         // (claimed first, as `kept` is: see there)
-        let claimed = pondra::page::Page::claim(&options).map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        let claimed = claim(&options)?;
         let mut page = Page(claimed, None, spill::start());
         page.open_now().await?;
         Ok(page)
@@ -279,6 +280,13 @@ fn give(settings: Vec<(String, String)>) -> Result<(), JsValue> {
         return Ok(());
     }
     pondra::env::give(settings).map_err(|e| JsValue::from_str(&format!("{e:#}")))
+}
+
+/// Claims the module's page (`pondra::page::Page::claim`), the page's platform installed first: its device, as the machine
+/// the core reads (`device.rs`).
+fn claim(options: &pondra::page::Options) -> Result<pondra::page::Page, JsValue> {
+    device::install();
+    pondra::page::Page::claim(options).map_err(|e| JsValue::from_str(&format!("{e:#}")))
 }
 
 /// A page's options: its member's lake is kept in `store` (a kept page's folder; None is memory, as `new` has it),

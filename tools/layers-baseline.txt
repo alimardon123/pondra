@@ -180,7 +180,7 @@ once -> pattern  1
 oom -> jemalloc  2
 oom -> wasm32  5
 optimize -> wasm32  1
-page -> wasm32  7
+page -> wasm32  4
 page_records -> dial  4
 panics -> node  1
 panics -> wasm32  11

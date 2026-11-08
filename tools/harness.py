@@ -11287,6 +11287,39 @@ def users():
     copy_out["rows"] = copied_n()
     checks["a REVOKE in the middle of a long COPY stops it at its next chunk (42P01: its user holds nothing on the table now), and the chunks before it stay written"] = \
         copy_out["first"] is True and copy_out["end"].startswith("42P01") and "no table copied" in copy_out["end"] and 0 < (copy_out["rows"] or 0) < 68000 or copy_out  # (bob holds nothing on it now: a table that isn't there)
+    # …and a Flight DoPut's too (11-08 audit H2): its caller signs in again before each batch once the lake's rights moved, so a
+    # REVOKE stops it at its next batch (42P01, as COPY's), a DROP USER ends it (28000), and the batches before stay written
+    import pyarrow as pa, pyarrow.flight as fl
+    for q in ["CREATE TABLE flown (a BIGINT)", "GRANT INSERT ON flown TO bob", "CREATE USER flo PASSWORD 'flo-password-1'", "GRANT INSERT ON flown TO flo"]:
+        as_(A.port, boss, q)
+    one = lambda n: pa.record_batch([pa.array([n], pa.int64())], names=["a"])
+    def flown(who, then):
+        """bob's (or flo's) DoPut: a batch, acked; `then`; a batch more. (the acks, the error the second got)"""
+        w, r = fl.FlightClient(f"grpc://127.0.0.1:{A.port + 30}").do_put(fl.FlightDescriptor.for_path("flown"), one(0).schema,
+                                                                       options=fl.FlightCallOptions(headers=[(b"authorization", who.encode())]))
+        acks, err = [], None
+        try:
+            w.write_batch(one(1))
+            acks.append(json.loads(r.read().to_pybytes()))
+            then()
+            w.write_batch(one(2))
+            w.done_writing()
+            while (buf := r.read()) is not None:
+                acks.append(json.loads(buf.to_pybytes()))
+        except (fl.FlightError, pa.ArrowException) as e:
+            err = str(e)
+        try:
+            w.close()
+        except (fl.FlightError, pa.ArrowException) as e:
+            err = err or str(e)
+        return len(acks), err
+    put_said = {"revoked": flown(bob, lambda: as_(A.port, boss, "REVOKE INSERT ON flown FROM bob")),
+                "dropped": flown(basic("flo", "flo-password-1"), lambda: as_(A.port, boss, "DROP USER flo")),
+                "rows": as_(A.port, boss, "SELECT count(*) AS n FROM flown")}
+    shown_info["flight put across a REVOKE"] = put_said
+    checks["a REVOKE in the middle of a Flight DoPut stops it at its next batch (42P01), a DROP USER ends it (28000), and the batches before stay written"] = \
+        put_said["revoked"][0] == 1 and "no table flown" in str(put_said["revoked"][1]) and put_said["dropped"][0] == 1 \
+        and "signed out" in str(put_said["dropped"][1]) and put_said["rows"] == [{"n": 2}] or put_said
     # W50: a user granted a view (and a materialized view) alone is shown their names, columns and rows, not their queries,
     # the base table's name or the filter; a listing shows the view as a read does; the server's folder is an admin's
     vee_pw = "vee-password-1"
