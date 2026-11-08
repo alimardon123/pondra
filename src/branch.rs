@@ -231,7 +231,7 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
     ensure!(same_kind(&dir, &base), "a branch lives where its base does: {base} is {}", if crate::store::served(&base) { "a node's lake" } else if base.contains("://") { "in a bucket" } else { "a folder on this machine" });
     if crate::ddl::has_catalog(&dir).await? {
         ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name} CLONE {})", of.from);
-        return Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None })).await;
+        return Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None }, &crate::auth::Principal::node().scope)).await; // (an ATTACH plans nothing)
     }
     // The maker's record, as this lake has it: the branch makes it a superuser (`make`). Only a
     // user of this database has one; a token's name has none, and so no owner.
@@ -286,7 +286,7 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
             return Err(e.context(format!("cloning {}", of.from)));
         }
     };
-    let attached = Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None })).await?;
+    let attached = Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None }, &crate::auth::Principal::node().scope)).await?;
     Ok(j!({"database": name, "cloned": of.from, "tables": made["tables"], "dir": attached["dir"]}))
 }
 

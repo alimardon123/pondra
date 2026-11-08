@@ -754,12 +754,14 @@ impl Request {
 }
 
 /// Who a statement runs for: the caller's rights (`files`: it may read files on this machine,
-/// `statement::owner`), and how deep in procedures calling procedures it is.
-#[derive(Clone, Copy)]
+/// `statement::owner`), what it plans for (`scope`: the principal's its door signed in, M8 piece 3b; step 8's session
+/// carries it), and how deep in procedures calling procedures it is.
+#[derive(Clone)]
 pub struct Who {
     pub role: Role,
     pub files: bool,
     pub depth: u32,
+    pub scope: crate::rights::Scope,
 }
 
 pub enum Outcome {
@@ -834,7 +836,7 @@ pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<
 
 /// One statement's outcome, a locking read in a transaction (`txn::locked_read`) first: its rows, locked.
 async fn one_or_locked(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
-    match crate::txn::locked_read(app, sql).await? {
+    match crate::txn::locked_read(app, sql, &who.scope).await? {
         Some(rows) => Ok(Outcome::Rows(rows)),
         None => one_of(app, sql, who, job).await,
     }
@@ -843,7 +845,7 @@ async fn one_or_locked(app: &App, sql: &str, who: Who, job: Option<String>) -> R
 pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
     if let Some(cmd) = crate::cursors::of(sql) {
         // DECLARE, FETCH, MOVE, CLOSE: the session's cursors (cursors.rs). Before the script's check: DECLARE reads as one.
-        return Ok(match crate::cursors::run(app, cmd?, who.role).await? {
+        return Ok(match crate::cursors::run(app, cmd?, who.role, &who.scope).await? {
             crate::cursors::Answer::Rows(batches) => Outcome::Rows(batches),
             crate::cursors::Answer::Done(kind, rows) => Outcome::Done(j!({"command": kind.tag(rows)})),
         });
@@ -852,7 +854,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
         return Box::pin(crate::script::run(app, sql, &HashMap::new(), who, job)).await; // (a block, a branch, a loop, PRINT…: ADR-045)
     }
     if let Some(c) = crate::vars::change(sql) {
-        return Box::pin(crate::vars::apply(app, c)).await; // (DECLARE $day …, $day = …: the scope's variable)
+        return Box::pin(crate::vars::apply(app, c, &who.scope)).await; // (DECLARE $day …, $day = …: the scope's variable)
     }
     if crate::write::checkpoint(sql) {
         crate::rights::may_as(who.role, crate::rights::Action::Write, crate::rights::Object::Lake)?;
@@ -868,7 +870,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
         if crate::git::is_own(&name) {
             return Box::pin(crate::git::call(app, &name, &args, who)).await; // (a Git folder of the workspace: ADR-060 §8)
         }
-        let (local, r, row) = Box::pin(prepared(app, &name, &args, who)).await?;
+        let (local, r, row) = Box::pin(prepared(app, &name, &args, who.clone())).await?;
         return Box::pin(run(app, local, r, row, who, job, None)).await;
     }
     if let Some((name, args, column)) = start_of(sql) {
@@ -890,30 +892,30 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
     }
     if crate::set::is(sql) {
         // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: the session's (round 31)
-        return match Box::pin(crate::set::statement(&app.lake, sql)).await? {
+        return match Box::pin(crate::set::statement(&app.lake, sql, &who.scope)).await? {
             crate::set::Done::Said(kind) => Ok(Outcome::Done(j!({"command": kind.words()}))),
             crate::set::Done::Run(sql) => Box::pin(one_of(app, &sql, who, job)).await,
         };
     }
-    if let Some(steps) = Box::pin(steps(app, sql, who)).await? {
+    if let Some(steps) = Box::pin(steps(app, sql, who.clone())).await? {
         return Box::pin(run_steps(app, steps, who, job)).await; // (several statements: an ALTER's actions, a DROP's views)
     }
     if let Some(w) = crate::with_writes::of(sql) {
         return Box::pin(crate::with_writes::run(app, &w?, who, job)).await; // (a WITH that writes: its writes in one transaction, then its answer)
     }
     if let Some(r) = crate::returning::of(sql) {
-        return Ok(Outcome::Rows(vec![Box::pin(crate::returning::run(app, &r, who.role, who.files, job)).await?])); // (INSERT … RETURNING: the rows it wrote)
+        return Ok(Outcome::Rows(vec![Box::pin(crate::returning::run(app, &r, who.role, who.files, &who.scope, job)).await?])); // (INSERT … RETURNING: the rows it wrote)
     }
     if let Some(stmt) = crate::write::parse(sql) {
         crate::rights::may_run(who.role, &stmt)?;
-        return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files).await?));
+        return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files, &who.scope).await?));
     }
     if let Some((rows, _)) = Box::pin(crate::txn::point_read(&app.lake, sql)).await? {
         return Ok(Outcome::Rows(rows)); // (a key lookup in a transaction: no planning)
     }
     Ok(Outcome::Rows(match who.files {
-        true => app.query_as(&crate::sys::planned(sql)?, Some("0"), true).await?, // (a file here: this node only)
-        false => app.query(sql, None).await?,
+        true => app.query_as(&crate::sys::planned(sql)?, Some("0"), true, &who.scope).await?, // (a file here: this node only)
+        false => app.query(sql, None, &who.scope).await?,
     }))
 }
 
@@ -1028,7 +1030,7 @@ async fn run_steps(app: &App, steps: Vec<(String, Option<String>)>, who: Who, jo
         if let Some(n) = notice {
             heard(n);
         }
-        last = Some(Box::pin(one_of(app, step, who, job.as_ref().map(|j| format!("{j}:{i}")))).await?);
+        last = Some(Box::pin(one_of(app, step, who.clone(), job.as_ref().map(|j| format!("{j}:{i}")))).await?);
     }
     last.context("no statement to run")
 }
@@ -1133,7 +1135,7 @@ async fn prepared(app: &App, name: &str, args: &[FunctionArg], who: Who) -> Resu
             let about = || format!("{name}'s arguments");
             // (made ready as SQL that comes in, as a variable's value is: a cast to jsonb or uuid is the one the lake holds)
             let sql = prepare(&app.lake, &format!("SELECT {}", select.collect::<Vec<_>>().join(", ")), &HashMap::new(), &HashMap::new()).await.with_context(about)?;
-            let rows = app.query(&sql, Some("0")).await.with_context(about)?;
+            let rows = app.query(&sql, Some("0"), &who.scope).await.with_context(about)?;
             datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?
         }
     };
@@ -1180,12 +1182,12 @@ fn start<'a>(app: &'a App, name: &'a str, args: &'a [FunctionArg], column: &'a s
         let (app2, id2) = (app.clone(), id.clone());
         if crate::workspace::is_run(name) {
             let args = args.to_vec();
-            crate::workspace::arguments(app, &args).await?; // (its mistakes: said now, not only in the log)
+            crate::workspace::arguments(app, &args, &who.scope).await?; // (its mistakes: said now, not only in the log)
             crate::panics::task(crate::auth::carried(async move {
                 let _ = Box::pin(crate::workspace::run(&app2, &args, who, job, Some(id2))).await;
             }));
         } else {
-            let (local, r, row) = Box::pin(prepared(app, name, args, who)).await?;
+            let (local, r, row) = Box::pin(prepared(app, name, args, who.clone())).await?;
             crate::panics::task(crate::auth::carried(async move {
                 let _ = Box::pin(run(&app2, local, r, row, who, job, Some(id2))).await; // (its outcome: the run log's)
             }));

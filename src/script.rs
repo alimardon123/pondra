@@ -613,7 +613,7 @@ impl<'a> Runner<'a> {
         })
         .await;
         match ours {
-            None => crate::runs::wait(self.app, id).await,
+            None => crate::runs::wait(self.app, id, &self.who.scope).await,
             Some(None) => Ok(()),
             Some(Some(said)) => {
                 let mut s = self.started();
@@ -633,7 +633,7 @@ impl<'a> Runner<'a> {
     /// and job, the loops' rows in force, nothing else.
     fn child(&self) -> Runner<'a> {
         let (blocks, caught, last) = (vec![], self.caught.clone(), Outcome::Done(serde_json::json!({})));
-        Runner { app: self.app, who: self.who, job: self.job.clone(), views: self.views, blocks, nested: self.nested + 1, sole: false, whole: false, rows: self.rows.clone(), caught, at: self.at, last, started: Default::default() }
+        Runner { app: self.app, who: self.who.clone(), job: self.job.clone(), views: self.views, blocks, nested: self.nested + 1, sole: false, whole: false, rows: self.rows.clone(), caught, at: self.at, last, started: Default::default() }
     }
 
     /// `FOR … PARALLEL n`: up to `n` passes at once, each with a copy of the variables (what it sets
@@ -740,7 +740,7 @@ impl<'a> Runner<'a> {
     /// `sql` (a query, its loops' rows already in place), its `$name`s bound: one row.
     async fn select(&self, sql: &str) -> Result<RecordBatch> {
         let sql = crate::routines::prepare(&self.app.lake, &self.dotted(sql), &HashMap::new(), self.views).await?;
-        let rows = crate::vars::answer(self.app, &sql).await?;
+        let rows = crate::vars::answer(self.app, &sql, &self.who.scope).await?;
         ensure!(!rows.is_empty(), "no answer");
         let row = datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?;
         ensure!(row.num_rows() == 1, "one value, not {} rows", row.num_rows());
@@ -755,7 +755,7 @@ impl<'a> Runner<'a> {
         // (in a WHERE, where DataFusion plans EXISTS and IN as joins: not in a SELECT's list)
         let sql = self.ready(&format!("SELECT 1 AS t WHERE ({cond})")).await?;
         let sql = crate::routines::prepare(&self.app.lake, &sql, &HashMap::new(), self.views).await?;
-        let rows = crate::vars::answer(self.app, &sql).await.with_context(|| format!("the condition {}", short(cond)))?;
+        let rows = crate::vars::answer(self.app, &sql, &self.who.scope).await.with_context(|| format!("the condition {}", short(cond)))?;
         Ok(rows.iter().any(|b| b.num_rows() > 0))
     }
 
@@ -787,14 +787,14 @@ impl<'a> Runner<'a> {
             Some(_) => s, // (`DECLARE $day …`, `$day = …`: worked out by `one`)
             None => crate::routines::prepare(&self.app.lake, &s, &HashMap::new(), self.views).await?,
         };
-        self.last = Box::pin(crate::routines::one(self.app, &s, self.who, job)).await?;
+        self.last = Box::pin(crate::routines::one(self.app, &s, self.who.clone(), job)).await?;
         Ok(())
     }
 
     /// Set `$name` from a one-row column (`INTO`): cast to its declared type, if it has one.
     async fn set(&self, name: &str, col: &dyn Array) -> Result<()> {
         let v = crate::vars::of_column(col)?;
-        Box::pin(crate::vars::apply(self.app, crate::vars::Change::Set { name: name.to_string(), value: v.sql })).await?;
+        Box::pin(crate::vars::apply(self.app, crate::vars::Change::Set { name: name.to_string(), value: v.sql }, &self.who.scope)).await?;
         Ok(())
     }
 
@@ -1046,7 +1046,7 @@ impl Step for Loop {
             if let Kind::For(var, query, parallel) = &self.kind {
                 r.at = at;
                 let q = crate::routines::prepare(&r.app.lake, &r.ready(query).await?, &HashMap::new(), r.views).await?;
-                let batches = Box::pin(r.app.query(&q, None)).await.with_context(|| format!("FOR {var} IN ({})", short(query)))?;
+                let batches = Box::pin(r.app.query(&q, None, &r.who.scope)).await.with_context(|| format!("FOR {var} IN ({})", short(query)))?;
                 if let Some(width) = parallel {
                     return r.parallel(var, &batches, width, &self.body, &path, &self.label).await;
                 }
@@ -1119,7 +1119,7 @@ impl Step for Async {
             ensure!(!crate::txn::open(), "ASYNC runs outside a transaction (it would share it): COMMIT first");
             let handle = self.1.as_ref().map(|_| crate::runs::new_id());
             if let (Some(name), Some(h)) = (&self.1, &handle) {
-                Box::pin(crate::vars::apply(r.app, crate::vars::Change::Set { name: name.clone(), value: format!("'{h}'") })).await?;
+                Box::pin(crate::vars::apply(r.app, crate::vars::Change::Set { name: name.clone(), value: format!("'{h}'") }, &r.who.scope)).await?;
             }
             let (step, mut child, own) = (self.0.clone(), r.child(), crate::vars::snapshot());
             let h = handle.clone();
@@ -1402,11 +1402,11 @@ impl Step for Execute {
                             given.insert((i + 1).to_string(), serde_json::json!({"sql": crate::vars::of_column(col.as_ref())?.sql}));
                         }
                     }
-                    Box::pin(crate::routines::script(r.app, &text, &given, r.views, r.who, job)).await.with_context(|| format!("EXECUTE IMMEDIATE {}", short(&text)))?
+                    Box::pin(crate::routines::script(r.app, &text, &given, r.views, r.who.clone(), job)).await.with_context(|| format!("EXECUTE IMMEDIATE {}", short(&text)))?
                 }
                 (None, Some(call)) => {
                     let call = crate::routines::prepare(&r.app.lake, &r.ready(call).await?, &HashMap::new(), r.views).await?;
-                    Box::pin(crate::routines::one(r.app, &call, r.who, job)).await?
+                    Box::pin(crate::routines::one(r.app, &call, r.who.clone(), job)).await?
                 }
                 _ => unreachable!("an EXECUTE runs SQL or a CALL"),
             };
@@ -1417,7 +1417,7 @@ impl Step for Execute {
                     match first {
                         Some(b) if i < b.num_columns() => r.set(name, b.column(i).slice(0, 1).as_ref()).await?,
                         Some(b) => bail!("INTO ${name}: the answer has {} columns (one variable per column: INTO $a, $b for two columns)", b.num_columns()),
-                        None => Box::pin(crate::vars::apply(r.app, crate::vars::Change::Set { name: name.clone(), value: "NULL".into() })).await.map(|_| ())?,
+                        None => Box::pin(crate::vars::apply(r.app, crate::vars::Change::Set { name: name.clone(), value: "NULL".into() }, &r.who.scope)).await.map(|_| ())?,
                     }
                 }
             }

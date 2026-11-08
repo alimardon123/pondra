@@ -19,12 +19,12 @@ pub fn is_run(name: &str) -> bool { matches!(name.to_ascii_lowercase().as_str(),
 const USAGE: &str = "run('etl/orders.sql', day => DATE '2026-09-29'): the file, then its parameters by name";
 
 /// The file's path and its parameters' values (one row), worked out once, as the caller.
-pub async fn arguments(app: &App, args: &[FunctionArg]) -> Result<(String, RecordBatch)> {
+pub async fn arguments(app: &App, args: &[FunctionArg], scope: &crate::rights::Scope) -> Result<(String, RecordBatch)> {
     let a = crate::text::args("run", args)?;
     let [file] = &a.given[..] else { bail!(USAGE) };
     let mut select = vec![format!("CAST(({file}) AS VARCHAR) AS \"file to run\"")];
     select.extend(a.named.iter().map(|(n, e)| format!("({e}) AS \"{}\"", n.replace('"', "\"\""))));
-    let rows = app.query(&format!("SELECT {}", select.join(", ")), Some("0")).await.context("run's arguments")?;
+    let rows = app.query(&format!("SELECT {}", select.join(", ")), Some("0"), scope).await.context("run's arguments")?;
     let row = datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?;
     let path = datafusion::arrow::compute::cast(row.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?; // (VARCHAR is Utf8View)
     let path = path.as_any().downcast_ref::<StringArray>().filter(|p| !p.is_null(0)).map(|p| p.value(0).to_string()).context(USAGE)?;
@@ -34,7 +34,7 @@ pub async fn arguments(app: &App, args: &[FunctionArg]) -> Result<(String, Recor
 /// Run a file of the lake's, logged: its outcome is its last statement's, expression's or cell's.
 pub async fn run(app: &App, args: &[FunctionArg], who: Who, job: Option<String>, id: Option<String>) -> Result<Outcome> {
     ensure!(who.depth < 16, "run: files running files 16 deep (a loop?)");
-    let (path, row) = arguments(app, args).await?;
+    let (path, row) = arguments(app, args, &who.scope).await?;
     let path = match crate::lake_files::under_files(&path)? {
         p if p.starts_with("files/notebooks/") && p.matches('/').count() == 2 && !p.ends_with(".ipynb") => latest(app, &p).await?, // (a notebook by name: its newest version)
         p => p,
@@ -74,8 +74,8 @@ pub async fn run(app: &App, args: &[FunctionArg], who: Who, job: Option<String>,
                     let all = cells_py(&text);
                     let (head, rest) = all.split_at(at + 1);
                     let lines = |c: &[(bool, String)]| c.iter().map(|c| c.1.as_str()).collect::<Vec<_>>().join("\n");
-                    python(app, &path, &lines(head), None, &session, inner, None, &mut heard).await?;
-                    python(app, &path, "", Some(&row), &session, inner, None, &mut heard).await?;
+                    python(app, &path, &lines(head), None, &session, inner.clone(), None, &mut heard).await?;
+                    python(app, &path, "", Some(&row), &session, inner.clone(), None, &mut heard).await?;
                     let padded = "\n".repeat(head.iter().map(|c| c.1.split('\n').count()).sum::<usize>()) + &lines(rest); // (its lines numbered as in the file)
                     python(app, &path, &padded, None, &session, inner, job, &mut heard).await
                 }
@@ -159,23 +159,23 @@ async fn cells(app: &App, path: &str, text: &str, row: &RecordBatch, session: &s
     let (mut last, mut pending) = (Outcome::Done(j!({"ran": path})), row.num_columns() > 0);
     for (i, c) in all.iter().enumerate() {
         if pending && c.python && at.map_or(true, |a| i > a) {
-            python(app, path, "", Some(row), session, who, None, heard).await?; // (the values given, over the parameters cell's defaults)
+            python(app, path, "", Some(row), session, who.clone(), None, heard).await?; // (the values given, over the parameters cell's defaults)
             pending = false;
         }
         let (name, job) = (format!("{path}, cell {}", i + 1), job.as_ref().map(|j| format!("{j}:c{i}")));
         let ran_python = all[..i].iter().any(|c| c.python);
         let query = crate::write::parse(&c.code).is_none() && crate::routines::split(&c.code).len() == 1;
         last = match c.python {
-            true => python(app, &name, &c.code, None, session, who, job, heard).await,
+            true => python(app, &name, &c.code, None, session, who.clone(), job, heard).await,
             // (a query naming a table of the run's Python: through Python, which sends it along)
             false if query && ran_python && python_tables(session, &c.code).await => {
                 let v = c.name.as_deref().unwrap_or("_sql");
-                python(app, &name, &format!("{v} = db.sql({})\n{v}", j!(c.code.trim())), None, session, who, job, heard).await
+                python(app, &name, &format!("{v} = db.sql({})\n{v}", j!(c.code.trim())), None, session, who.clone(), job, heard).await
             }
             false => {
-                let out = Box::pin(crate::routines::script(app, &c.code, &HashMap::new(), &HashMap::new(), who, job)).await; // (`$name`: the run's variables and values)
+                let out = Box::pin(crate::routines::script(app, &c.code, &HashMap::new(), &HashMap::new(), who.clone(), job)).await; // (`$name`: the run's variables and values)
                 if let (Ok(_), Some(v), true) = (&out, &c.name, query && all[i + 1..].iter().any(|c| c.python)) {
-                    python(app, &name, &format!("{v} = db.sql({})", j!(c.code.trim())), None, session, who, None, heard).await?; // (its answer, a frame, for the Python cells after it)
+                    python(app, &name, &format!("{v} = db.sql({})", j!(c.code.trim())), None, session, who.clone(), None, heard).await?; // (its answer, a frame, for the Python cells after it)
                 }
                 out
             }

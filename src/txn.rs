@@ -853,7 +853,7 @@ async fn insert_rows(l: &Locks<'_>, stored: &Arc<TableMeta>, query: &str, snapsh
     let lake = &l.app.lake;
     passes(l, snapshot, |at| async move {
         // (`Load`: the rows' keys are looked at after the locks, `key_check` and `key_check_over`, as before: R8)
-        let rows = crate::write::rows_of(lake, lake, &stored.rules()?, l.name, query, Some(at), files, crate::rules::How::Load).await?;
+        let rows = crate::write::rows_of(lake, lake, &stored.rules()?, l.name, query, Some(at), files, crate::rules::How::Load, l.scope).await?;
         // (over `LOCK_MAX` rows nothing is locked, `passes`, so their keys' text would be made for nothing)
         let keys = if rows.rows().num_rows() > LOCK_MAX { vec![] } else { write_keys(l.meta, &[], std::slice::from_ref(rows.rows()))? };
         Ok((rows, keys))
@@ -866,7 +866,7 @@ async fn insert_rows(l: &Locks<'_>, stored: &Arc<TableMeta>, query: &str, snapsh
 async fn changing(l: &Locks<'_>, rules: &Arc<crate::rules::Table>, stmt: &Stmt, snapshot: u64) -> Result<Changed> {
     let (lake, name, meta) = (&l.app.lake, l.name, l.meta);
     let ((old, new), at, keys) = passes(l, snapshot, |at| async move {
-        let (old, new) = crate::change::rows_of(lake, name, meta, rules, stmt, at).await?;
+        let (old, new) = crate::change::rows_of(lake, name, meta, rules, stmt, at, l.scope).await?;
         let mut keys = write_keys(meta, &old, &new)?;
         if let (true, Stmt::Merge(m)) = (meta.key.is_empty(), stmt) {
             // (an INSERT … ON CONFLICT on an append table locks the values of its conflict target it writes: a second one for
@@ -907,7 +907,7 @@ async fn point(l: &Locks<'_>, key: &[String], set_to: &[(String, String)], snaps
 async fn upsert_point(l: &Locks<'_>, stored: &Arc<TableMeta>, rules: &Arc<crate::rules::Table>, m: &crate::change::Merge, p: &crate::change::PointUpsert, snapshot: u64) -> Result<Option<Changed>> {
     let (lake, name, meta) = (&l.app.lake, l.name, l.meta);
     let Some(query) = m.upsert_query() else { return Ok(None) };
-    let proposed = crate::change::proposed_rows(lake, name, stored, rules, &p.given, query, snapshot).await?;
+    let proposed = crate::change::proposed_rows(lake, name, stored, rules, &p.given, query, snapshot, l.scope).await?;
     let inserted = inserted_row(meta, &proposed)?;
     let Ok(mut keys) = keys_of(&proposed, &meta.key) else { return Ok(None) };
     let Some(key) = keys.pop() else { return Ok(None) };
@@ -1025,7 +1025,7 @@ pub async fn refuse_change(lake: &Lake, name: &str, meta: &TableMeta, stmt: &Stm
 
 /// A statement's kept writes of a transaction: an INSERT's rows, an UPDATE's or DELETE's changes, all under the transaction's
 /// own locks. Outside a transaction (none open) they are None: the statement goes to the leader.
-pub async fn statement(app: &crate::app::App, stmt: &Stmt, files: bool) -> Result<Option<Value>> {
+pub async fn statement(app: &crate::app::App, stmt: &Stmt, files: bool, scope: &crate::rights::Scope) -> Result<Option<Value>> {
     // (every write comes here, whatever its text: a comment or a `WITH` in front of it doesn't get it past READ ONLY)
     // (the snapshot and the id are read together: a statement that outlives its transaction is refused at `keep`, ADR-067 §1)
     let began = began_id();
@@ -1058,7 +1058,7 @@ pub async fn statement(app: &crate::app::App, stmt: &Stmt, files: bool) -> Resul
     // INSERT … ON CONFLICT lock their rows as an UPDATE does: a counter's upsert waits for the one holding it, as Postgres's does)
     let locking = rc && !crate::constraints::checked(&stored);
     let taken = AtomicBool::new(false);
-    let l = Locks { app, name: &name, meta: &meta, owner: id.clone(), txn: true, locking, committed: rc, wait: lock_wait(), taken: &taken };
+    let l = Locks { app, name: &name, meta: &meta, owner: id.clone(), txn: true, locking, committed: rc, wait: lock_wait(), taken: &taken, scope };
     let (old, new, at, keys) = match insert {
         Some(query) => {
             let (rows, at, keys) = insert_rows(&l, &stored, &query, snapshot, files).await?;
@@ -1088,19 +1088,19 @@ pub async fn statement(app: &crate::app::App, stmt: &Stmt, files: bool) -> Resul
 /// takes no lake lock and no session state. The producer is the job's (`sql:{job}`), so a retried one is a duplicate. MERGE and
 /// a MERGE comes here only as a one-row upsert of one key (`change::Merge::point_upsert`), and tables with an enforced UNIQUE
 /// don't (`write::changes`, `write::run_listed`).
-pub async fn autocommit(app: &crate::app::App, stmt: &Stmt, job: &str) -> Result<Value> {
+pub async fn autocommit(app: &crate::app::App, stmt: &Stmt, job: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let owner = format!("auto-{}", uuid::Uuid::new_v4().simple());
     let taken = AtomicBool::new(false);
     let mut hold = Hold::new((app.lake.url.clone(), leader_of(app), owner.clone()));
-    let out = autocommit_as(app, stmt, job, &owner, &taken, &mut hold).await;
+    let out = autocommit_as(app, stmt, job, &owner, &taken, &mut hold, scope).await;
     // (after its append's answer, or its refusal: its locks go only if it took any, and a dropped statement's went on the drop)
     hold.finish(taken.load(Ordering::SeqCst));
     out
 }
 
-async fn autocommit_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &str, taken: &AtomicBool, hold: &mut Hold) -> Result<Value> {
+async fn autocommit_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &str, taken: &AtomicBool, hold: &mut Hold, scope: &crate::rights::Scope) -> Result<Value> {
     if matches!(stmt, Stmt::Insert(..)) {
-        return insert_as(app, stmt, job, owner, taken, hold).await;
+        return insert_as(app, stmt, job, owner, taken, hold, scope).await;
     }
     let lake = &app.lake;
     let name = stmt.table();
@@ -1121,7 +1121,7 @@ async fn autocommit_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &st
             return Err(crate::codes::coded("40001", format!("could not serialize access: materialized view {v} is still being filled from {name}'s rows")));
         }
     }
-    let l = Locks { app, name: &name, meta: &meta, owner: owner.to_string(), txn: false, locking: true, committed: true, wait: lock_wait(), taken };
+    let l = Locks { app, name: &name, meta: &meta, owner: owner.to_string(), txn: false, locking: true, committed: true, wait: lock_wait(), taken, scope };
     let (old, new, _, _) = change(&l, &stored, stmt, lake.visible()).await?;
     if upsert {
         if old.iter().any(|b| b.num_rows() > 0) {
@@ -1165,7 +1165,7 @@ async fn autocommit_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &st
 /// keys. An INSERT takes rows back from no one, so none of an UPDATE's or DELETE's checks apply (`refuse_change`,
 /// `views::can_follow`, `views::filling`). `key_check` runs under the locks; over `LOCK_MAX` keys no lock is taken, and the check
 /// still runs (the documented limit).
-async fn insert_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &str, taken: &AtomicBool, hold: &mut Hold) -> Result<Value> {
+async fn insert_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &str, taken: &AtomicBool, hold: &mut Hold, scope: &crate::rights::Scope) -> Result<Value> {
     let lake = &app.lake;
     if crate::write::sent(lake, job).await? {
         return Ok(j!({"duplicate": true}));
@@ -1175,7 +1175,7 @@ async fn insert_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &str, t
     let meta = stored.logical_ref();
     let sql = crate::write::rows_sql(&meta, stmt)?;
     let files = crate::change::FILES.try_with(|f| *f).unwrap_or(false);
-    let l = Locks { app, name: &name, meta: &meta, owner: owner.to_string(), txn: false, locking: true, committed: true, wait: lock_wait(), taken };
+    let l = Locks { app, name: &name, meta: &meta, owner: owner.to_string(), txn: false, locking: true, committed: true, wait: lock_wait(), taken, scope };
     let (rows, _, _) = insert_rows(&l, &stored, &sql, lake.visible(), files).await?;
     // (the lock's grant brought this node up to its leader's commit, so a retry whose append landed while it waited is seen
     // here: the check before the locks can't see it, and the key check would meet the job's own rows)
@@ -1397,7 +1397,7 @@ impl Visitor for Locking {
 /// A locking read in a transaction (ADR-067 §3): a single table's `SELECT … FOR UPDATE` (or `FOR SHARE`, the same locks
 /// here) locks the rows it returns. It runs with their keys appended to its columns, so `ORDER BY 1` means what it says.
 /// Outside a transaction, and for any other statement, None: a plain read.
-pub async fn locked_read(app: &crate::app::App, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
+pub async fn locked_read(app: &crate::app::App, sql: &str, scope: &crate::rights::Scope) -> Result<Option<Vec<RecordBatch>>> {
     if !LOCKING.is_match(sql) {
         return Ok(None);
     }
@@ -1408,7 +1408,7 @@ pub async fn locked_read(app: &crate::app::App, sql: &str) -> Result<Option<Vec<
         // (refused by name outside a transaction too: SKIP LOCKED isn't a plain read's, whatever the session)
         if let Some((q, lock)) = lock_clause(stmt)? {
             let Some(open) = with_txn(|t| (t.level, t.read_only, t.snapshot)) else { return Ok(None) }; // (outside one, a locking read is a plain read)
-            return Ok(Some(lock_select(app, open, q, lock).await?));
+            return Ok(Some(lock_select(app, open, q, lock, scope).await?));
         }
     }
     Ok(None)
@@ -1435,7 +1435,7 @@ fn lock_clause(stmt: &Statement) -> Result<Option<(&Query, &LockClause)>> {
 
 /// One locking read in the transaction (`locked_read`): its rows are locked (waited for as `lock_timeout` says; at once with
 /// NOWAIT) and returned as they are under the locks. The answer's rows are the last run's, without the key columns.
-async fn lock_select(app: &crate::app::App, (level, ro, snapshot): (Level, bool, u64), q: &Query, lock: &LockClause) -> Result<Vec<RecordBatch>> {
+async fn lock_select(app: &crate::app::App, (level, ro, snapshot): (Level, bool, u64), q: &Query, lock: &LockClause, scope: &crate::rights::Scope) -> Result<Vec<RecordBatch>> {
     let lake = &app.lake;
     if ro {
         let word = if matches!(lock.lock_type, LockType::Share) { "SELECT FOR SHARE" } else { "SELECT FOR UPDATE" };
@@ -1472,13 +1472,13 @@ async fn lock_select(app: &crate::app::App, (level, ro, snapshot): (Level, bool,
     let nowait = matches!(lock.nonblock, Some(NonBlock::Nowait));
     let wait = if nowait { Some(Duration::ZERO) } else { lock_wait() };
     let taken = AtomicBool::new(false);
-    let l = Locks { app, name: table_name, meta: &meta, owner: id, txn: true, locking: true, committed: level == Level::Committed, wait, taken: &taken };
+    let l = Locks { app, name: table_name, meta: &meta, owner: id, txn: true, locking: true, committed: level == Level::Committed, wait, taken: &taken, scope };
     // (no pass cap: a pass that repeats locks a key it hadn't held, and one that adds none ends the passes (`passes`); a job
     // queue's workers wait their turn as Postgres's FOR UPDATE makes them, rather than failing with 40001 after a few tries)
     let (rows, at, keys) = passes(&l, snapshot, |at| {
         let text = &text;
         async move {
-            let (schema, batches) = run_at(lake, text, at).await?;
+            let (schema, batches) = run_at(lake, text, at, scope).await?;
             let (rows, keys) = split_keys(&schema, &batches, n, append)?;
             if keys.len() > LOCK_MAX {
                 return Err(too_many(table_name));
@@ -1506,8 +1506,8 @@ fn with_keys(q: &Query, cols: &[String]) -> Query {
 
 /// The query's rows as of commit `at`, as this node sees them (a session's own writes over them), and their columns (an
 /// empty answer keeps them: `split_keys`).
-async fn run_at(lake: &Lake, text: &str, at: u64) -> Result<(Schema, Vec<RecordBatch>)> {
-    let ctx = crate::query::session_at(lake, text, "", Some(at)).await?;
+async fn run_at(lake: &Lake, text: &str, at: u64, scope: &crate::rights::Scope) -> Result<(Schema, Vec<RecordBatch>)> {
+    let ctx = crate::query::session_for(lake, text, "", Some(at), scope).await?;
     let df = crate::engine::sql(&ctx, &crate::asof::as_of(text)?).await?;
     let rows = crate::engine::collect(df).await?; // (never empty: an answer with no rows keeps its columns as they run)
     Ok((rows[0].schema().as_ref().clone(), rows))
@@ -1669,10 +1669,10 @@ pub async fn committed(lake: &Lake, job: &str, table: &str) -> Result<bool> {
 /// returned, and they still land in one commit. A COMMIT refused with 40001 runs it again, three times at most, since nothing
 /// has been answered yet (as Postgres works an UPDATE out again on the newest version of a row it waited for). A job names the
 /// transaction's commit, so its commit sent again is a duplicate.
-pub async fn alone(app: &crate::app::App, sql: &str, job: Option<String>, files: bool) -> Result<Value> {
+pub async fn alone(app: &crate::app::App, sql: &str, job: Option<String>, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
     let out = as_one(app, job, move || async move {
         let stmt = crate::write::parse(sql).context("not a write")?;
-        Box::pin(crate::write::on_node_as(app, stmt, None, files)).await // (refused: the session's end rolls it back)
+        Box::pin(crate::write::on_node_as(app, stmt, None, files, scope)).await // (refused: the session's end rolls it back)
     })
     .await?;
     Ok(out.unwrap_or_else(|| j!({"duplicate": true})))

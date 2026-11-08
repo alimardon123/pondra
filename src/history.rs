@@ -565,7 +565,7 @@ pub fn writer<L: Send + Sync + 'static>(app: &App, table: &'static str, make: cr
                 let append = async {
                     let rows = batch(&app, &lines)?;
                     if !made && app.lake.cat.get::<TableMeta>(&table_key(table)).await?.is_none_or(|m| m.columns().len() < rows.num_columns()) {
-                        crate::write::on_node_as(&app, crate::write::Stmt::Ddl(vec![make.clone()]), None, false).await?; // (made, or given the columns this build adds)
+                        crate::write::on_node_as(&app, crate::write::Stmt::Ddl(vec![make.clone()]), None, false, &crate::auth::Principal::node().scope).await?; // (made, or given the columns this build adds)
                     }
                     made = true;
                     app.log()?.append(table.into(), crate::log::Src { producer: producer.clone(), seq, prev: None }, rows).await

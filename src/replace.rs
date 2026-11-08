@@ -21,7 +21,7 @@ use serde_json::{json as j, Value};
 /// in `name`'s place in one commit (`Ddl::ReplaceTable`). Until then `name` is as it was, so a failed or stopped statement
 /// leaves it so. A retry whose replace went through answers as a duplicate; a retry whose rows went into a table that was let
 /// go is refused by name (its job's rows are recorded, so they would not be written again).
-pub(crate) async fn replacing<F>(run: &F, lake: &Lake, c: &ast::CreateTable, name: &str, job: &str, files: bool, armed: &mut (dyn FnMut(&str) + Send)) -> Result<Value>
+pub(crate) async fn replacing<F>(run: &F, lake: &Lake, c: &ast::CreateTable, name: &str, job: &str, files: bool, armed: &mut (dyn FnMut(&str) + Send), scope: &crate::rights::Scope) -> Result<Value>
 where
     F: Fn(Stmt) -> futures::future::BoxFuture<'static, Result<Value>>,
 {
@@ -34,7 +34,7 @@ where
     replaceable(lake, name).await?; // (refused before any query runs)
     let staged = crate::sys::staged(name, job);
     let existed = lake.cat.get::<TableMeta>(&table_key(&staged)).await?.is_some(); // (a node left this job's staged table: its rows are in it)
-    let spec = made_by_job(create_spec(c, lake, files).await?, job)?;
+    let spec = made_by_job(create_spec(c, lake, files, scope).await?, job)?;
     let mut out = run(Stmt::Define(staged.clone(), spec)).await.map_err(|e| named(e, &staged, name))?;
     armed(&staged);
     if let Some(q) = &c.query {

@@ -336,13 +336,13 @@ pub fn views(sql: &str) -> Vec<(String, String)> {
 }
 
 /// A statement about the session's temporary tables or views, carried out here (None: not one).
-pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Value>> {
+pub async fn statement(app: &App, stmt: &Stmt, files: bool, scope: &crate::rights::Scope) -> Result<Option<Value>> {
     let session = current();
     match stmt {
         Stmt::Create(c) if c.temporary => {
             // (in an open transaction it runs at once too, as DDL does: `txn::temp_at_once` refuses REPEATABLE READ and says so)
             let note = crate::txn::temp_at_once()?;
-            let out = create(app, &session.context(NO_SESSION)?, c, files).await?;
+            let out = create(app, &session.context(NO_SESSION)?, c, files, scope).await?;
             if let (Some(n), false) = (note, out["unchanged"] == true) {
                 crate::routines::heard(&n); // (IF NOT EXISTS left it as it was: nothing ran)
             }
@@ -356,7 +356,7 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
             }
             ensure!(*replace || !has(&s, name, false), "temporary view {name} exists (CREATE OR REPLACE TEMP VIEW replaces it)");
             let expanded = crate::routines::expand_temp_view(&app.lake, sql).await.with_context(|| format!("temporary view {name}"))?; // (as it is read: its functions' bodies in their places, `query.rs`)
-            crate::engine::sql(&crate::query::session(&app.lake, &expanded, "").await?, &crate::sys::planned(&expanded)?).await.with_context(|| format!("temporary view {name}"))?; // (it plans)
+            crate::engine::sql(&crate::query::session_for(&app.lake, &expanded, "", None, scope).await?, &crate::sys::planned(&expanded)?).await.with_context(|| format!("temporary view {name}"))?; // (it plans)
             with(&s, true, |x| Ok(x.views.insert(name.clone(), sql.clone())))?;
             return Ok(Some(j!({"view": name, "temporary": true})));
         }
@@ -417,14 +417,14 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
     }
     let s = session.context(NO_SESSION)?;
     Ok(Some(match stmt {
-        Stmt::Insert(t, q) => insert(app, &s, t, None, q, files).await?,
-        Stmt::InsertInto(t, names, q) => insert(app, &s, t, Some(names), q, files).await?,
-        _ => change(app, &s, &stmt.table(), stmt).await?,
+        Stmt::Insert(t, q) => insert(app, &s, t, None, q, files, scope).await?,
+        Stmt::InsertInto(t, names, q) => insert(app, &s, t, Some(names), q, files, scope).await?,
+        _ => change(app, &s, &stmt.table(), stmt, scope).await?,
     }))
 }
 
 /// `CREATE [OR REPLACE] TEMP TABLE name (columns) | AS query`.
-async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result<Value> {
+async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
     let name = crate::text::object(&c.name);
     ensure!(!name.contains('.'), "{name}: a temporary table's name has no schema (it is the session's)");
     ensure!(!(c.or_replace && c.if_not_exists), "CREATE OR REPLACE TEMP TABLE … IF NOT EXISTS: one or the other");
@@ -432,7 +432,7 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
         ensure!(c.if_not_exists, "temporary table {name} exists");
         return Ok(j!({"table": name, "temporary": true, "unchanged": true}));
     }
-    let spec: Value = serde_json::from_str(&crate::write::create_spec(c, &app.lake, files).await?)?;
+    let spec: Value = serde_json::from_str(&crate::write::create_spec(c, &app.lake, files, scope).await?)?;
     let key: Vec<String> = serde_json::from_value(spec["key"].clone()).unwrap_or_default(); // (PRIMARY KEY: checked as rows come, `check_key`)
     ensure!(spec["merge"].as_object().is_none_or(|m| m.is_empty()), "{name}: a merge table is a lake table's (a temporary table keeps its rows as they come)");
     ensure!(spec["enums"].as_object().is_none_or(|e| e.is_empty()), "{name}: a temporary table's columns are plain types (an enum column is a lake table's)");
@@ -458,14 +458,14 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
     let rules = Arc::new(meta.to_rules()?);
     with(s, true, |x| Ok(x.tables.insert(name.clone(), Table { meta, rules, rows: vec![], next: 1, version: 0 })))?;
     let rows = match &c.query {
-        Some(q) => insert(app, s, &name, None, &q.to_string(), files).await?["rows"].clone(),
+        Some(q) => insert(app, s, &name, None, &q.to_string(), files, scope).await?["rows"].clone(),
         None => j!(0),
     };
     Ok(j!({"table": name, "temporary": true, "rows": rows}))
 }
 
 /// `INSERT INTO name [(columns)] query`.
-async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query: &str, files: bool) -> Result<Value> {
+async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query: &str, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
     let (meta, rules) = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| (t.meta.clone(), t.rules.clone())).with_context(|| format!("no temporary table {name}"))?;
     let query = match names {
         Some(n) => {
@@ -475,7 +475,7 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
         }
         None => query.to_string(),
     };
-    let ctx = crate::query::session(&app.lake, &query, "").await?;
+    let ctx = crate::query::session_for(&app.lake, &query, "", None, scope).await?;
     let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
     let rows = crate::write::rows(&app.lake, &ctx, &rules, name, &query, crate::rules::How::Load).await?; // (Load: its key is checked over all its rows, `check_key`: R6)
     let n = rows.rows().num_rows();
@@ -484,9 +484,9 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
 }
 
 /// UPDATE, DELETE or MERGE: what changes, worked out as for a lake table, shaped for the table's rules, applied here.
-async fn change(app: &App, s: &str, name: &str, stmt: &Stmt) -> Result<Value> {
+async fn change(app: &App, s: &str, name: &str, stmt: &Stmt, scope: &crate::rights::Scope) -> Result<Value> {
     let (meta, rules) = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| (t.meta.clone(), t.rules.clone())).with_context(|| format!("no temporary table {name}"))?; // (its key: an ON CONFLICT without a column list is on it)
-    let (old, new) = crate::change::rows_of(&app.lake, name, &meta, &rules, stmt, app.lake.visible()).await?;
+    let (old, new) = crate::change::rows_of(&app.lake, name, &meta, &rules, stmt, app.lake.visible(), scope).await?;
     let count = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
     let inserted: usize = new.iter().map(|b| b.column_by_name(crate::text::ROW_ID).map_or(b.num_rows(), |c| c.null_count())).sum();
     let (replaced, added) = (count(&old), count(&new));

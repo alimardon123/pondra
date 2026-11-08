@@ -21,11 +21,12 @@ use std::sync::Arc;
 const FILE_BYTES: usize = 128 << 20; // (a file this big is closed, and another started)
 
 /// INSERT INTO `table` (a table of files: `ext_names::attached_table`; SQL names it `name`) the rows of `query`, into the
-/// columns `names` lists (`INSERT INTO t (b, a) …`), or into each column in turn.
-pub async fn insert(lake: &Lake, table: &str, name: &str, names: Option<Vec<String>>, query: &str, job: &str) -> Result<Value> {
+/// columns `names` lists (`INSERT INTO t (b, a) …`), or into each column in turn. `scope`: whom the query plans for (its
+/// statement's asker).
+pub async fn insert(lake: &Lake, table: &str, name: &str, names: Option<Vec<String>>, query: &str, job: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let spec = crate::ext_names::spec(table).context("not another engine's table")?;
     crate::ext::check(lake, &spec).await?; // (written by whoever may read it: a secret covering it, or the node's owner)
-    let rows = Rows::Insert { name: name.to_string(), names, query: query.to_string() };
+    let rows = Rows::Insert { name: name.to_string(), names, query: query.to_string(), scope: scope.clone() };
     match spec.format.as_str() {
         "delta" => delta(lake, spec.urls[0].trim_end_matches('/'), rows, job, false).await,
         "iceberg" => iceberg(lake, &spec, rows, job, false).await,
@@ -37,25 +38,25 @@ pub async fn insert(lake: &Lake, table: &str, name: &str, names: Option<Vec<Stri
 /// table's schema. A column list is placed in that schema (`rows_for`: the columns it leaves out are NULL, as the format
 /// keeps no DEFAULT, and a NOT NULL one is refused by `Fit`), the one the rows are written by: read apart from it, a column
 /// another engine moved or dropped in between would take another's values. A guest's INSERT, through the inbox, is placed
-/// where it is sent (`write::run`, `columns`).
+/// where it is sent (`write::run`, `columns`), planned for the INSERT's asker.
 pub enum Rows {
     Planned(datafusion::prelude::DataFrame),
-    Insert { name: String, names: Option<Vec<String>>, query: String },
+    Insert { name: String, names: Option<Vec<String>>, query: String, scope: crate::rights::Scope },
 }
 
 impl Rows {
     /// The rows, as a query of the table's columns in its order (`columns`, as SQL names them).
     async fn frame(self, lake: &Lake, columns: &[String]) -> Result<datafusion::prelude::DataFrame> {
-        let (name, names, query) = match self {
+        let (name, names, query, scope) = match self {
             Rows::Planned(df) => return Ok(df),
-            Rows::Insert { name, names, query } => (name, names, query),
+            Rows::Insert { name, names, query, scope } => (name, names, query, scope),
         };
         let query = match names {
             Some(names) => crate::rules::rows::rows_for(&name, columns, &names, &query, &|_| None)?,
             None => query,
         };
         let query = crate::routines::expand(lake, &query).await?;
-        crate::engine::sql(&crate::query::session(lake, &query, "").await?, &query).await
+        crate::engine::sql(&crate::query::session_for(lake, &query, "", None, &scope).await?, &query).await
     }
 }
 

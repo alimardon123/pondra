@@ -63,7 +63,7 @@ pub async fn run<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire:
         if let Some((sent, one)) = plain_of(app, &req.sql).await? {
             if !crate::txn::open() {
                 crate::query::mark("request read and checked");
-                return audit::statement(app, &sent, query(app, &one, &how, who.files, wire)).await; // (the audit log and history keep it as it was sent)
+                return audit::statement(app, &sent, query(app, &one, &how, who.files, &who.scope, wire)).await; // (the audit log and history keep it as it was sent)
             }
         }
     }
@@ -121,7 +121,7 @@ pub(crate) fn is_write(sql: &str) -> bool {
 
 /// Step 2's inside, on a statement already expanded (`run` makes it, inside `audit::statement`): the key lookup, the
 /// remembered answer or the run. Postgres's door enters here too, with its own text and its own audit.
-pub(crate) async fn query<W: Wire>(app: &App, one: &str, how: &How<'_>, files: bool, wire: &W) -> Result<Answer<W::Own>> {
+pub(crate) async fn query<W: Wire>(app: &App, one: &str, how: &How<'_>, files: bool, scope: &crate::rights::Scope, wire: &W) -> Result<Answer<W::Own>> {
     if wire.takes_point_json() && !crate::temp::mentioned(one) {
         if let Some(body) = crate::serve::point_sql(&app.lake, one).await? {
             return Ok(Answer::Kept(body.into())); // a key lookup: no planning (of the columns its caller may read: `serve::point`)
@@ -136,12 +136,12 @@ pub(crate) async fn query<W: Wire>(app: &App, one: &str, how: &How<'_>, files: b
     };
     let Some((kept, version)) = remembered else {
         crate::query::mark("answer kept?");
-        return Ok(run_once(app, how, one, files, wire).await?.1);
+        return Ok(run_once(app, how, one, files, scope, wire).await?.1);
     };
     // (a user granted some tables: kept under what it may read, `Scope::key`, so an answer made under other grants is never its)
-    let key = format!("{kept}|{}|{}|{}|{one}", how.spread.unwrap_or(""), if files { "owner" } else { "" }, crate::rights::scope().key());
+    let key = format!("{kept}|{}|{}|{}|{one}", how.spread.unwrap_or(""), if files { "owner" } else { "" }, scope.key());
     let stale = how.stale.filter(|_| how.after.is_none()); // (read-your-writes wins)
-    Ok(match app.remembered(key, one, version, stale, || run_once(app, how, one, files, wire)).await? {
+    Ok(match app.remembered(key, one, version, stale, || run_once(app, how, one, files, scope, wire)).await? {
         Kept::Bytes(body) => Answer::Kept(body),
         Kept::Own(answer) => answer,
     })
@@ -150,13 +150,13 @@ pub(crate) async fn query<W: Wire>(app: &App, one: &str, how: &How<'_>, files: b
 /// One run of the query, as `remembered` runs it for everyone asking at the same moment: the answer encoded for the wire
 /// (inside the statement's audit), with the bytes to keep when it has them; `Sent` when the plan already handed the
 /// answer to the door.
-async fn run_once<W: Wire>(app: &App, how: &How<'_>, one: &str, files: bool, wire: &W) -> Result<(Option<Bytes>, Answer<W::Own>)> {
+async fn run_once<W: Wire>(app: &App, how: &How<'_>, one: &str, files: bool, scope: &crate::rights::Scope, wire: &W) -> Result<(Option<Bytes>, Answer<W::Own>)> {
     let batches = {
         // (an answer in a format that streams may be sent to the door from its plan: `query::collect_or_send`)
         let _armed = wire.pieces(one).map(crate::query::arm);
         match files {
-            true => app.query_as(&crate::sys::planned(one)?, Some("0"), true).await?, // (a file here: this node only)
-            false => app.query(one, how.spread).await?,
+            true => app.query_as(&crate::sys::planned(one)?, Some("0"), true, scope).await?, // (a file here: this node only)
+            false => app.query(one, how.spread, scope).await?,
         }
     };
     if crate::query::handed().is_some() {
@@ -254,9 +254,9 @@ pub(crate) async fn scoped<F: std::future::Future>(session: Option<String>, vars
     crate::vars::within(vars, temp::SESSION.scope(session, f)).await
 }
 
-/// One `/sql` request (its query, its headers, its body), for `role`, with every step a `/sql` takes around
-/// `statement::run` (the session, the owner's files, …): server.rs's `sql`, moved.
-pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, headers: http::HeaderMap, body: Bytes) -> Said {
+/// One `/sql` request (its query, its headers, its body), for `role`, planned for `scope` (its principal's), with every
+/// step a `/sql` takes around `statement::run` (the session, the owner's files, …): server.rs's `sql`, moved.
+pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, scope: crate::rights::Scope, headers: http::HeaderMap, body: Bytes) -> Said {
     let files = owner(&app.auth, &headers); // (the program that started this node: its files, and URLs no secret covers)
     let node = app.lake.node.clone(); // (its rest, run on after the answer is handed over, is still in flight: `panics::work`)
     let session = match crate::temp::of(&headers) { // (its temporary tables: `temp.rs`)
@@ -270,7 +270,7 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, headers: http:
     };
     let vars = crate::auth::lent_vars(crate::auth::Credential::of_headers(&headers).token()); // (Python code a run lent a connection to: the run's variables)
     let (hand, mut handed) = tokio::sync::oneshot::channel(); // (the door's end of an answer in pieces: `query::Pieces`)
-    let statement = crate::query::PIECES.scope(crate::query::Pieces::new(hand), sql_as(app, p, role, headers, body));
+    let statement = crate::query::PIECES.scope(crate::query::Pieces::new(hand), sql_as(app, p, role, scope, headers, body));
     // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
     let go = crate::query::HELD.scope(Default::default(), scoped(session.clone(), vars.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(statement)))));
     // (`guard` gave this request its principal and its apply flag, outside this handler: a request whose answer is
@@ -296,13 +296,13 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, headers: http:
 }
 
 /// `sql`'s statement, as HTTP asks it: its text as its content type says (`routines::Request`), how it asks (`How`), and who.
-async fn sql_as(app: App, p: SqlParams, role: crate::auth::Role, headers: http::HeaderMap, body: Bytes) -> anyhow::Result<Reply> {
+async fn sql_as(app: App, p: SqlParams, role: crate::auth::Role, scope: crate::rights::Scope, headers: http::HeaderMap, body: Bytes) -> anyhow::Result<Reply> {
     let kind = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
     let req = crate::routines::Request::read(kind, &body)?;
     // (a Python procedure's own calls, through the token lent to it; anyone else's is a first call)
     let lent = crate::auth::lent(crate::auth::Credential::of_headers(&headers).token()).is_some();
     let depth = headers.get("x-pondra-depth").filter(|_| lent).and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0);
-    let who = Who { role, files: owner(&app.auth, &headers), depth };
+    let who = Who { role, files: owner(&app.auth, &headers), depth, scope };
     let how = How { job: p.job.as_deref(), spread: p.spread.as_deref(), after: p.after, stale: p.stale_ms.map(Duration::from_millis) };
     Ok(match crate::statement::run(&app, req, how, who, &HttpWire(&p, &app.lake)).await? {
         Answer::Kept(body) => Reply::Rendered(Rendered::Whole(body)),

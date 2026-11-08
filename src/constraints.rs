@@ -260,7 +260,8 @@ pub async fn apply(lake: &Lake, table: &str, change: Change) -> Result<serde_jso
                 let cols = c.columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
                 let given = c.columns.iter().map(|c| format!("{} IS NOT NULL", q(c))).collect::<Vec<_>>().join(" AND ");
                 let sql = format!("SELECT {cols} FROM {} WHERE {given} GROUP BY {cols} HAVING count(*) > 1 LIMIT 1", crate::write::sql_name(table));
-                let found = async { crate::engine::sql(&crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?, &sql).await?.collect().await.map_err(anyhow::Error::from) }.await;
+                // (every row, granted or not: the node's own scope, as the leader's checks of a write are, `held`)
+                let found = async { crate::engine::sql(&crate::query::session_for(lake, &sql, "", Some(lake.visible()), &crate::auth::Principal::node().scope).await?, &sql).await?.collect().await.map_err(anyhow::Error::from) }.await;
                 let twice = match &found {
                     Ok(found) => found.iter().find(|b| b.num_rows() > 0).map(|b| shown(b.columns(), 0)),
                     Err(_) => None,
@@ -277,7 +278,7 @@ pub async fn apply(lake: &Lake, table: &str, change: Change) -> Result<serde_jso
         Change::AddCheck(name, cond) => {
             ensure!(!taken(&m, &name), "constraint \"{name}\" for relation \"{table}\" already exists");
             let sql = format!("SELECT count(*) AS n FROM {} WHERE NOT ({cond})", crate::write::sql_name(table));
-            let found = crate::engine::sql(&crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?, &sql).await?.collect().await?;
+            let found = crate::engine::sql(&crate::query::session_for(lake, &sql, "", Some(lake.visible()), &crate::auth::Principal::node().scope).await?, &sql).await?.collect().await?;
             let n = found.first().and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|a| a.value(0))).unwrap_or(0);
             if n > 0 {
                 return Err(anyhow::Error::new(crate::codes::Violation(format!("check constraint \"{name}\" of relation \"{table}\" is violated by {n} row{}", if n == 1 { "" } else { "s" }), "23514")));

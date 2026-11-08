@@ -143,15 +143,15 @@ impl Returning {
 
 /// Runs the write and answers its rows as its RETURNING asks. Everything that can refuse it is checked before anything is
 /// written: the write itself, the table, the items, and that the caller may read the table's rows.
-pub async fn run(app: &App, r: &Returning, role: Role, files: bool, job: Option<String>) -> Result<RecordBatch> {
+pub async fn run(app: &App, r: &Returning, role: Role, files: bool, scope: &crate::rights::Scope, job: Option<String>) -> Result<RecordBatch> {
     let stmt = parsed(r)?;
     crate::rights::may_run(role, &stmt)?;
     let (table, shown) = target(app, r, &stmt).await?;
     let items = r.items();
-    answer(app, &items, RecordBatch::new_empty(shown.clone())).await?; // (a wrong item refuses the write, as Postgres refuses it)
+    answer(app, &items, RecordBatch::new_empty(shown.clone()), scope).await?; // (a wrong item refuses the write, as Postgres refuses it)
     crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&table))?; // (RETURNING reads the rows it wrote: SELECT on every column, as Postgres asks)
     let kept = Arc::new(Mutex::new(None));
-    let out = KEPT.scope(kept.clone(), write(app, r, &table, stmt, job.clone(), files)).await?;
+    let out = KEPT.scope(kept.clone(), write(app, r, &table, stmt, job.clone(), files, scope)).await?;
     if out["duplicate"] == true {
         // A job sent again writes nothing, and its first answer's rows aren't kept: no rows would read as nothing written.
         return Err(crate::codes::coded("55000", format!("{} … RETURNING with job {} was applied already, by an earlier send of it: its rows went with that answer and aren't kept, so read them with a SELECT", r.word(), job.unwrap_or_default())));
@@ -164,14 +164,14 @@ pub async fn run(app: &App, r: &Returning, role: Role, files: bool, job: Option<
         Kind::Insert | Kind::Update => kept.new,
     };
     let rows = rows.iter().map(|b| crate::query::conform(b, &shown)).collect::<Result<Vec<_>>>()?;
-    answer(app, &items, concat_batches(&shown, &rows)?).await
+    answer(app, &items, concat_batches(&shown, &rows)?, scope).await
 }
 
 /// The columns the answer will have, worked out without writing (a Postgres Describe).
-pub async fn columns(app: &App, r: &Returning) -> Result<SchemaRef> {
+pub async fn columns(app: &App, r: &Returning, scope: &crate::rights::Scope) -> Result<SchemaRef> {
     let stmt = parsed(r)?;
     let (_, shown) = target(app, r, &stmt).await?;
-    Ok(answer(app, &r.items(), RecordBatch::new_empty(shown)).await?.schema())
+    Ok(answer(app, &r.items(), RecordBatch::new_empty(shown), scope).await?.schema())
 }
 
 fn parsed(r: &Returning) -> Result<Stmt> {
@@ -185,7 +185,7 @@ fn parsed(r: &Returning) -> Result<Stmt> {
 
 /// The write, run where its rows are worked out on this node: as it always runs, or, for a change the leader would work out
 /// (`write::changes`; a one-row upsert of one key is not one), as a transaction of its own (`txn::alone`).
-async fn write(app: &App, r: &Returning, table: &str, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
+async fn write(app: &App, r: &Returning, table: &str, stmt: Stmt, job: Option<String>, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
     let leaders = match &stmt {
         Stmt::InsertInto(t, ..) => crate::write::changes(&app.lake, &Stmt::Insert(t.clone(), String::new())).await?, // (its columns don't decide it)
         s => crate::write::changes(&app.lake, s).await?,
@@ -196,9 +196,9 @@ async fn write(app: &App, r: &Returning, table: &str, stmt: Stmt, job: Option<St
                 return Ok(serde_json::json!({"duplicate": true})); // (asked first: run again, a row it wrote may refuse it, a key it holds)
             }
         }
-        return crate::txn::alone(app, &r.write, job, files).await;
+        return crate::txn::alone(app, &r.write, job, files, scope).await;
     }
-    crate::write::on_node_as(app, stmt, job, files).await
+    crate::write::on_node_as(app, stmt, job, files, scope).await
 }
 
 /// The table a write changes, as the lake names it, and its columns as RETURNING sees them: as SQL names them, with no
@@ -223,7 +223,7 @@ async fn target(app: &App, r: &Returning, stmt: &Stmt) -> Result<(String, Schema
 
 /// `rows` as the items ask. Columns and `*` are picked from them; anything else is a query over them, run here and never
 /// remembered (`query::SENT`, beside the tables the request sent).
-async fn answer(app: &App, items: &[SelectItem], rows: RecordBatch) -> Result<RecordBatch> {
+async fn answer(app: &App, items: &[SelectItem], rows: RecordBatch, scope: &crate::rights::Scope) -> Result<RecordBatch> {
     if let Some(picks) = picks(items, &rows.schema()) {
         let schema = Schema::new(picks.iter().map(|(i, n)| rows.schema().field(*i).clone().with_name(n)).collect::<Vec<_>>());
         return Ok(RecordBatch::try_new(Arc::new(schema), picks.iter().map(|(i, _)| rows.column(*i).clone()).collect())?);
@@ -232,7 +232,7 @@ async fn answer(app: &App, items: &[SelectItem], rows: RecordBatch) -> Result<Re
     let schema = rows.schema();
     let mut sent = crate::query::SENT.try_with(|t| t.as_ref().clone()).unwrap_or_default();
     sent.push((ROWS.to_string(), vec![rows]));
-    let batches = crate::query::SENT.scope(Arc::new(sent), app.query(&sql, None)).await
+    let batches = crate::query::SENT.scope(Arc::new(sent), app.query(&sql, None, scope)).await
         .map_err(|e| anyhow::anyhow!("RETURNING: {}", e.to_string().replace(&format!("{ROWS}."), "")))?; // (its errors name the table's columns, not ours)
     let Some(first) = batches.first() else { bail!("RETURNING over {schema:?}: no columns") };
     Ok(concat_batches(&first.schema(), &batches)?)

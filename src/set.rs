@@ -62,8 +62,9 @@ pub enum Done {
     Run(String),        // an `EXECUTE`: this statement, run as if sent
 }
 
-/// Carry out a `SET`, `RESET`, `PREPARE`, `EXECUTE` or `DEALLOCATE` for the current session.
-pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
+/// Carry out a `SET`, `RESET`, `PREPARE`, `EXECUTE` or `DEALLOCATE` for the current session. `scope`: the asker's, whom a
+/// PREPARE's query plans for (the rest plan nothing).
+pub async fn statement(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Result<Done> {
     if let Some(said) = crate::extension::statement(lake, sql).await {
         let said = said?; // (DuckDB's INSTALL and LOAD: no session needed; the notice goes to the client as the others do)
         crate::routines::heard(&said.notice);
@@ -152,7 +153,7 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
         Statement::Prepare { name, statement, .. } => {
             let name = name.value.to_lowercase();
             if !matches!(*statement, Statement::Insert(_) | Statement::Update(..) | Statement::Delete(_) | Statement::Merge(..)) {
-                let ctx = crate::query::session(lake, &statement.to_string(), "").await?;
+                let ctx = crate::query::session_for(lake, &statement.to_string(), "", None, scope).await?;
                 ctx.execute_logical_plan(ctx.state().create_logical_plan(sql).await?).await?; // (its parameters and their types agree; its tables are there)
             }
             crate::temp::with(&session()?, false, |s| Ok(s.prepared.insert(name, sql.to_string())))?;

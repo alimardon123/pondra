@@ -12,7 +12,7 @@
 //! `s % n`-th live node and only ever touches its own keys, so shards never conflict.
 use crate::log::{Log, Src};
 use crate::members::Members;
-use crate::query::{over, session, tail};
+use crate::query::{over, session_for, tail};
 use crate::answer::schema;
 use crate::store::*;
 use anyhow::{bail, Context, Result};
@@ -113,11 +113,11 @@ async fn target_rows(lake: &Lake, task: &Task, rows: &RecordBatch) -> Result<Rec
 
 /// Register a task (leader only): its SQL must plan, and the target table is created from the
 /// query's output columns if it doesn't exist yet.
-pub async fn create(lake: &Lake, name: &str, task: &Task) -> Result<()> {
+pub async fn create(lake: &Lake, name: &str, task: &Task, scope: &crate::rights::Scope) -> Result<()> {
     if task.shards > 1 && task.shard_by.is_none() {
         bail!("shard_by is required with shards > 1");
     }
-    let ctx = session(lake, &task.sql, "").await?;
+    let ctx = session_for(lake, &task.sql, "", None, scope).await?;
     let df = crate::engine::sql(&ctx, &crate::sys::planned(&task.sql)?).await?;
     let out = crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow().clone(); // (the types as the query runs, not as the planner first typed them: the table takes them)
     let mut puts = vec![(task_key(name), json(task))];

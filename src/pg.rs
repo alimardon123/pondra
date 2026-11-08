@@ -162,8 +162,9 @@ impl Startup {
             };
             if crate::ddl::database(lake, &db).await.map_err(said)?.is_some() {
                 let sql = format!("USE DATABASE {}", crate::objects::ident(&db));
-                let into = crate::set::statement(lake, &sql);
-                crate::temp::SESSION.scope(Some(self.backend.session.clone()), crate::auth::WHO.scope(self.backend.who(), into)).await.map_err(said)?;
+                let who = self.backend.who();
+                let into = crate::set::statement(lake, &sql, &who.scope);
+                crate::temp::SESSION.scope(Some(self.backend.session.clone()), crate::auth::WHO.scope(who.clone(), into)).await.map_err(said)?;
             }
         }
         finish(client, &self.cancels).await
@@ -418,7 +419,7 @@ impl Backend {
         if let Some(c) = crate::vars::change(sql) {
             // DECLARE $day …, $day = …: this connection's variable (`vars.rs`)
             let kind = c.kind();
-            Box::pin(crate::vars::apply(&self.app, c)).await.map_err(user_error)?;
+            Box::pin(crate::vars::apply(&self.app, c, &self.who().scope)).await.map_err(user_error)?;
             return Ok(Response::Execution(tag(&kind, None)));
         }
         let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: its value; `$1` is the protocol's)
@@ -472,7 +473,7 @@ impl Backend {
             eprintln!("pg {user}: {sql}");
         }
         let _busy = crate::txn::next(&self.app, &sql).await.map_err(user_error)?; // (a failed transaction takes nothing but its end; READ COMMITTED reads the newest commit; the guard keeps the transaction busy while this runs)
-        if let Some(b) = crate::txn::locked_read(&self.app, &sql).await.map_err(user_error)? {
+        if let Some(b) = crate::txn::locked_read(&self.app, &sql, &self.who().scope).await.map_err(user_error)? {
             let schema = b.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
             let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, &bound).await);
             return Ok(Response::Query(rows(&schema, b, format)?)); // (a locking read in a transaction: the rows it locked)
@@ -481,7 +482,7 @@ impl Backend {
             // DECLARE, FETCH, MOVE, CLOSE: this connection's cursors (cursors.rs). Before the settings and
             // session commands, which read CLOSE as their own.
             let role = crate::auth::current().map_or(crate::auth::Role::None, |p| p.role);
-            return Ok(match crate::cursors::run(&self.app, cmd.map_err(user_error)?, role).await.map_err(user_error)? {
+            return Ok(match crate::cursors::run(&self.app, cmd.map_err(user_error)?, role, &self.who().scope).await.map_err(user_error)? {
                 crate::cursors::Answer::Rows(batches) => {
                     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
                     let mut answer = rows(&schema, batches, format)?;
@@ -493,7 +494,7 @@ impl Backend {
         }
         if crate::set::is(&sql) {
             // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: this connection's (round 31)
-            return match crate::set::statement(&self.app.lake, &sql).await {
+            return match crate::set::statement(&self.app.lake, &sql, &self.who().scope).await {
                 Ok(crate::set::Done::Said(kind)) => Ok(Response::Execution(tag(&kind, None))),
                 Ok(crate::set::Done::Run(sql)) => Box::pin(self.run(user, &sql, format)).await,
                 Err(_) if crate::text::first_word(&sql).to_uppercase().starts_with("DEALLOCATE") => Ok(Response::Execution(tag(&Kind::new("DEALLOCATE"), None))), // (a statement the protocol prepared: pgwire's)
@@ -511,7 +512,7 @@ impl Backend {
             return Err(user_error(crate::codes::coded("28000", "sign in first")));
         }
         if crate::routines::runs_procedure(&sql) {
-            let who = crate::routines::Who { role, files: false, depth: 0 };
+            let who = crate::routines::Who { role, files: false, depth: 0, scope: self.who().scope }; // (planned for its sign-in)
             return match crate::routines::one(&self.app, &sql, who, None).await.map_err(user_error)? {
                 crate::routines::Outcome::Rows(batches) => {
                     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
@@ -523,7 +524,7 @@ impl Backend {
         if let Some(w) = crate::with_writes::of(&sql) {
             // a WITH that writes (`WITH m AS (DELETE … RETURNING *) INSERT …`): its steps, then its answer, under its command's tag
             let w = w.map_err(user_error)?;
-            let who = crate::routines::Who { role, files: false, depth: 0 };
+            let who = crate::routines::Who { role, files: false, depth: 0, scope: self.who().scope }; // (planned for its sign-in)
             return Ok(match Box::pin(crate::with_writes::run(&self.app, &w, who, None)).await.map_err(user_error)? {
                 crate::routines::Outcome::Rows(batches) => {
                     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
@@ -537,7 +538,7 @@ impl Backend {
         }
         if let Some(r) = crate::returning::of(&sql) {
             // INSERT, UPDATE or DELETE … RETURNING: the rows it wrote, under its command's tag (`INSERT 0 3`)
-            let b = Box::pin(crate::returning::run(&self.app, &r, role, false, None)).await.map_err(user_error)?;
+            let b = Box::pin(crate::returning::run(&self.app, &r, role, false, &self.who().scope, None)).await.map_err(user_error)?;
             let schema = crate::pg_types::typed(&b.schema(), &crate::pg_types::columns(&self.app.lake, &bound).await);
             let mut answer = rows(&schema, vec![b], format)?;
             answer.command_tag = r.kind().prefix();
@@ -547,12 +548,12 @@ impl Backend {
             crate::history::parsed(&stmt); // (the history writer takes its table from here: `history::touched`)
             crate::rights::may_run(role, &stmt).map_err(user_error)?;
             let kind = stmt.kind(&sql);
-            let v = crate::write::on_node(&self.app, stmt, None).await.map_err(user_error)?;
+            let v = crate::write::on_node(&self.app, stmt, None, &self.who().scope).await.map_err(user_error)?;
             return Ok(Response::Execution(tag(&kind, Some(v["rows"].as_u64().unwrap_or(0)))));
         }
         let catalog = crate::pg_catalog::wanted(&sql);
         let batches = match catalog {
-            true => crate::pg_catalog::answer(&self.app.lake, &sql, if user.is_empty() { "pondra" } else { user }).await.map_err(user_error)?,
+            true => crate::pg_catalog::answer(&self.app.lake, &sql, if user.is_empty() { "pondra" } else { user }, &self.who().scope).await.map_err(user_error)?,
             false => self.answer(&sql).await.map_err(user_error)?,
         };
         let schema = match batches.first() {
@@ -677,7 +678,7 @@ impl Backend {
             None if c.columns.is_empty() => format!("SELECT * FROM {}", c.table),
             None => format!("SELECT {} FROM {}", c.columns.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", "), c.table),
         };
-        let batches = self.app.query(&sql, None).await.map_err(user_error)?;
+        let batches = self.app.query(&sql, None, &self.who().scope).await.map_err(user_error)?;
         let schema = match batches.first() {
             Some(b) => b.schema(),
             None => self.schema(&sql, "").await?,
@@ -821,17 +822,17 @@ impl Backend {
             true => None,
             false => self.app.remembers(sql).await,
         };
-        let Some(version) = version else { return self.app.query(sql, None).await };
+        let scope = self.signed().await?.scope; // (what its sign-in may read: planned for it, and its answer kept under its key)
+        let Some(version) = version else { return self.app.query(sql, None, &scope).await };
         let run = || async {
-            let batches = self.app.query(sql, None).await?;
+            let batches = self.app.query(sql, None, &scope).await?;
             let keep = match batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= crate::app::Results::BIGGEST {
                 true => Some(crate::answer::ipc(&batches)?.into()),
                 false => None, // (a big answer: `Results` keeps none past `Results::BIGGEST`, nor encodes it to find out)
             };
             Ok((keep, batches)) // (its own caller takes the batches as they are: never decoded again)
         };
-        let who = self.signed().await?;
-        let key = who.scope.key(); // (what its sign-in may read: `Scope::key`)
+        let key = scope.key(); // (`Scope::key`)
         match self.app.remembered(format!("pg|{key}|{sql}"), sql, version, None, run).await? {
             Kept::Bytes(b) => crate::query::read_ipc(&b),
             Kept::Own(batches) => Ok(batches),
@@ -1842,7 +1843,7 @@ impl Backend {
             let sql = crate::vars::bound(sql).map_err(user_error)?;
             let sql = crate::routines::expand(&self.app.lake, &sql).await.map_err(user_error)?;
             if let Some(r) = crate::returning::of(&pg_dialect(&self.app.lake, &sql, "")) {
-                let schema = crate::returning::columns(&self.app, &r).await.map_err(user_error)?;
+                let schema = crate::returning::columns(&self.app, &r, &self.who().scope).await.map_err(user_error)?;
                 let schema = crate::pg_types::typed(&schema, &marks);
                 return Ok((described(&schema, format), Columns::Kept { schema, given: false }));
             }
@@ -1855,7 +1856,7 @@ impl Backend {
             let probe = crate::pg_values::substitute(&sql, &vec!["NULL".to_string(); (1..).take_while(|i| sql.contains(&format!("${i}"))).count()]); // (each `$i` once: `$1` is not the start of `$10`)
             if let Some(w) = crate::with_writes::of(&pg_dialect(&self.app.lake, &probe, "")) {
                 let w = w.map_err(user_error)?;
-                return Ok(match crate::with_writes::columns(&self.app, &w).await.map_err(user_error)? {
+                return Ok(match crate::with_writes::columns(&self.app, &w, &self.who().scope).await.map_err(user_error)? {
                     Some(schema) => {
                         let schema = crate::pg_types::typed(&schema, &marks);
                         (described(&schema, format), Columns::Kept { schema, given: false })

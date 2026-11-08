@@ -20,7 +20,7 @@
 //! be split is decided operator by operator (`spread`): only what stays correct run this way runs
 //! this way, and anything else runs on one node.
 use crate::manifest::Manifest;
-use crate::query::{session, table_ref, Pruned};
+use crate::query::{session_for, table_ref, Pruned};
 use crate::spill::Spill;
 use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
@@ -511,7 +511,8 @@ async fn planned(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn Exec
 
 /// The slice's query, its tables standing for just their parts.
 async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::prelude::DataFrame)> {
-    let ctx = session(lake, &s.sql, "").await?;
+    // (as the node's own: a query spreads only when its caller sees everything, `App::here_only`)
+    let ctx = session_for(lake, &s.sql, "", None, &crate::auth::Principal::node().scope).await?;
     // The whole tables, log tails and changed rows (`{t}$deleted`) as the coordinator saw them:
     // this node must have seen the log that far.
     let mut hwm = lake.hwm.subscribe();

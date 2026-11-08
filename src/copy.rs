@@ -39,7 +39,7 @@ impl Target {
 /// is there. A folder that holds files already takes `OVERWRITE` (replace them) or `APPEND`
 /// (DuckDB's). With the secret covering it (an admin's statement anyway: `rights::may_run`), or, on
 /// the node's machine, from its owner. `nodes`: the cluster's live members, `me` among them.
-pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<String, String>, nodes: &[String], me: &str) -> Result<serde_json::Value> {
+pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<String, String>, nodes: &[String], me: &str, scope: &crate::rights::Scope) -> Result<serde_json::Value> {
     if let Some(k) = options.iter().find(|(k, v)| !KNOWN.contains(&k.as_str()) && writer(k, v).is_none()) {
         bail!("COPY … TO has no option {}: {} (or DataFusion's writers' own: 'format.data_page_row_count_limit', …)", k.0, KNOWN.join(", "));
     }
@@ -65,7 +65,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     }
     let query = crate::routines::expand(lake, query).await?; // (the files, macros and FROM-first queries it reads)
     if to.starts_with("kafka://") {
-        let df = crate::engine::sql(&crate::query::session(lake, &query, "").await?, &query).await?;
+        let df = crate::engine::sql(&crate::query::session_for(lake, &query, "", None, scope).await?, &query).await?;
         return crate::kafka_client::copy_to(lake, df, to, options).await; // (rows as records: a topic's; not retried, as records sent are sent)
     }
     ensure!(!options.contains_key("key"), "KEY is a Kafka topic's (COPY … TO 'kafka://brokers/topic')");
@@ -75,7 +75,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     };
     if format == "delta" || format == "iceberg" {
         ensure!(!options.contains_key("partition_by"), "COPY … TO as {format}: PARTITION_BY (a partitioned {format} table): not yet");
-        let ctx = crate::query::session(lake, &query, "").await?;
+        let ctx = crate::query::session_for(lake, &query, "", None, scope).await?;
         let (append, overwrite) = (on("append"), on("overwrite"));
         // (one job for both tries: a first try the memory watch stopped while its commit was in flight may have committed, and
         // its retry then finds that commit by the job and answers it a duplicate, rather than appending the rows again)
@@ -129,7 +129,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
             }
         }
     }
-    let ctx = crate::query::session(lake, &query, "").await?; // (made once: a try that runs out of memory retries on a copy of it)
+    let ctx = crate::query::session_for(lake, &query, "", None, scope).await?; // (made once: a try that runs out of memory retries on a copy of it)
     let stopped = std::sync::Mutex::new(HashSet::new()); // (the writes of the tries stopped: `write_of`)
     let rows = crate::query::frugally(&ctx, |ctx| {
         let (query, target, kept, stopped) = (&query, &target, &kept, &stopped);
@@ -330,7 +330,7 @@ pub struct Entry {
 /// is written after the commit that records its rows, follows the rows' folder through renames,
 /// swaps and drops, and goes with its job mark after the retention window, when a file older than
 /// that isn't loaded again unless FORCE. `harness.py loads`.
-pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap<String, String>) -> Result<serde_json::Value> {
+pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap<String, String>, scope: &crate::rights::Scope) -> Result<serde_json::Value> {
     let lake = &app.lake;
     if let Some(k) = options.keys().find(|k| !LOAD_KNOWN.contains(&k.as_str())) {
         bail!("COPY INTO has no option {k}: {} (the reader's options, as read_csv takes them)", LOAD_KNOWN.join(", "));
@@ -360,7 +360,7 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
         if !force && (done || old) {
             continue;
         }
-        let (given, names) = columns_of(lake, &p.query, positional, &cols, table, &p.url).await?;
+        let (given, names) = columns_of(lake, &p.query, positional, &cols, table, &p.url, scope).await?;
         if names.is_empty() {
             // (a file with no rows: an empty one, or of blank lines, reads no columns; nothing is written or recorded for it)
             loaded.push(serde_json::json!({"file": p.url, "version": p.version, "rows": 0}));
@@ -383,10 +383,10 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
         // (a headerless CSV's columns fill the table's by this node's order, which the leader checks: a node that hadn't seen a
         // move yet would fill the old one, as an INSERT without a column list would, `log::placed_for`: 11-07 audit M1)
         let placed = positional.then(|| (name.clone(), meta.placed()));
-        let insert = crate::write::on_node_as(app, Stmt::InsertInto(table.to_string(), names, query.clone()), Some(job_of(&load)), owner());
+        let insert = crate::write::on_node_as(app, Stmt::InsertInto(table.to_string(), names, query.clone()), Some(job_of(&load)), owner(), scope);
         let out = match crate::log::placed_as(placed, insert).await {
             Ok(out) => out,
-            Err(e) => return Err(refused_at(lake, &query, &p.url, p.dialect, e).await),
+            Err(e) => return Err(refused_at(lake, &query, &p.url, p.dialect, e, scope).await),
         };
         if let Some(rows) = out["rows"].as_u64() {
             loaded.push(serde_json::json!({"file": p.url, "version": p.version, "rows": rows}));
@@ -500,12 +500,12 @@ fn typed_columns(given: &[(String, DataType)], names: &[String], table_types: &B
 /// refusal; the later partitions are stopped there. The line is then the file's first cell of that column with that text
 /// (`line_of`), when the file's reader is one `dialect` describes. Without one, or when the bytes can't be read, the file
 /// alone: never a line that may be wrong. Any other error is kept as it is.
-async fn refused_at(lake: &Lake, query: &str, file: &str, dialect: Option<Dialect>, e: anyhow::Error) -> anyhow::Error {
+async fn refused_at(lake: &Lake, query: &str, file: &str, dialect: Option<Dialect>, e: anyhow::Error, scope: &crate::rights::Scope) -> anyhow::Error {
     if !matches!(crate::codes::of(&e), "22P02" | "22003") {
         return e;
     }
     let read = async {
-        let ctx = crate::query::session(lake, query, "").await?;
+        let ctx = crate::query::session_for(lake, query, "", None, scope).await?;
         {
             // (each partition reads only its own byte range, as planned: with the sharing of files between partitions on, a
             // partition takes whichever range is next, so a partition's order is not the file's)
@@ -826,8 +826,8 @@ impl Cells {
 
 /// The columns a file's query gives, each with its inferred type, and the table's names they load into: by name, or by
 /// position for a headerless CSV. Refused by name: a column the table lacks, with both ways out.
-async fn columns_of(lake: &Lake, query: &str, positional: bool, cols: &[String], table: &str, url: &str) -> Result<(Vec<(String, DataType)>, Vec<String>)> {
-    let df = crate::engine::sql(&crate::query::session(lake, query, "").await?, query).await?;
+async fn columns_of(lake: &Lake, query: &str, positional: bool, cols: &[String], table: &str, url: &str, scope: &crate::rights::Scope) -> Result<(Vec<(String, DataType)>, Vec<String>)> {
+    let df = crate::engine::sql(&crate::query::session_for(lake, query, "", None, scope).await?, query).await?;
     let given: Vec<(String, DataType)> = df.schema().fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect();
     if positional {
         ensure!(given.len() <= cols.len(), "{url} has {} columns, {table} has {}", given.len(), cols.len());
