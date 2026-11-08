@@ -2104,7 +2104,11 @@ pub fn bucket_url(url: &str) -> Option<String> {
 pub(crate) struct Counted(Store, Arc<crate::metrics::Metrics>);
 
 /// `store`, its requests counted into `metrics` (a node's: `NodeState::metrics`).
-pub(crate) fn counted(store: Store, metrics: &Arc<crate::metrics::Metrics>) -> Store { Arc::new(Counted(store, metrics.clone())) }
+pub(crate) fn counted(store: Store, metrics: &Arc<crate::metrics::Metrics>) -> Store {
+    let open: Store = Arc::new(Counted(store.clone(), metrics.clone()));
+    crate::memory_lake::counts(&open, &store); // (a lake in memory's, it is still that lake's store: `held_in_memory`)
+    open
+}
 
 impl std::fmt::Display for Counted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
@@ -5714,6 +5718,8 @@ mod tests {
         assert_eq!(&b.get(&Path::from("x")).await.unwrap().bytes().await.unwrap()[..], b"1", "one store under both");
         let counts = |n: &NodeState| (n.metrics.object_writes.load(Relaxed), n.metrics.object_reads.load(Relaxed));
         assert_eq!((counts(&one), counts(&other)), ((1, 0), (0, 1)));
+        assert!(crate::memory_lake::held_in_memory(&a) && crate::memory_lake::held_in_memory(&b), "each still the lake in memory's store (no lock file for its terms)");
         crate::memory_lake::forget_memory(&url);
+        assert!(!crate::memory_lake::held_in_memory(&a), "nor once the lake is let go");
     }
 }
