@@ -1241,7 +1241,7 @@ impl FlightService for Door {
                     // (the rows come after this call's scope has ended: its sign-in is checked again, and the table's whole rows
                     // with it, so a REVOKE, a DROP USER or a session's end stops them within a second, as at `/watch`: 11-03 audit H1)
                     let header = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
-                    let revoked = crate::server::until_revoked(app.clone(), crate::auth::operator(), header, move |p| {
+                    let revoked = crate::server::until_revoked(app.clone(), Some(caller(&req)), crate::auth::operator(), header, move |p| {
                         crate::rights::may(p, crate::rights::Action::SelectAll, crate::rights::Object::Table(&name)).is_ok()
                     });
                     Ok(Response::new(log_stream(app.clone(), table, json.after, json.columns, json.follow, revoked).await?))

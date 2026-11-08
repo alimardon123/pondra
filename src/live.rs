@@ -74,9 +74,10 @@ impl Drop for Open {
 /// The answers end once the caller may no longer have them: its sign-in revoked, expired, or no longer a reader, asked again
 /// once the lake's rights move (`server::until_revoked`) whether or not they change; each answer is as its sign-in and grants
 /// are then (`lines`).
-pub async fn live(State(app): State<App>, Query(p): Query<Params>, headers: axum::http::HeaderMap, body: bytes::Bytes) -> Response {
+pub async fn live(State(app): State<App>, Query(p): Query<Params>, who: Option<axum::Extension<crate::auth::Principal>>, headers: axum::http::HeaderMap, body: bytes::Bytes) -> Response {
     let every = Duration::from_millis(p.every_ms.unwrap_or(100).max(10));
-    let revoked = crate::server::until_revoked(app.clone(), crate::auth::operator(), header(&headers), |p| p.role >= crate::auth::Role::Read);
+    let who = who.map_or_else(|| crate::auth::Principal::of(crate::auth::Role::None), |w| w.0); // (its door's sign-in: the guard puts one on every request)
+    let revoked = crate::server::until_revoked(app.clone(), Some(who.clone()), crate::auth::operator(), header(&headers), |p| p.role >= crate::auth::Role::Read);
     let kind = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
     if let Ok(Many { queries }) = serde_json::from_slice::<Many>(&body) {
         let mut all = Vec::with_capacity(queries.len());
@@ -88,21 +89,21 @@ pub async fn live(State(app): State<App>, Query(p): Query<Params>, headers: axum
             };
             let one = serde_json::to_vec(&serde_json::json!({"sql": q.sql, "params": q.params})).unwrap_or_default();
             let tag = format!("\"id\":{},", serde_json::Value::from(q.id));
-            all.push(match watch(&app, &h, None, "application/json", &one, every, tag.clone()).await {
+            all.push(match watch(&app, &who, &h, None, "application/json", &one, every, tag.clone()).await {
                 Ok(w) => lines(w).boxed(),
                 Err(e) => futures::stream::once(async move { Ok(error(e, &tag)) }).boxed(),
             });
         }
         return ([("content-type", "application/x-ndjson")], Body::from_stream(app.lake.node.drain.endless(futures::stream::select_all(all).take_until(revoked)))).into_response();
     }
-    match watch(&app, &headers, p.sql.as_deref(), &kind, &body, every, String::new()).await {
+    match watch(&app, &who, &headers, p.sql.as_deref(), &kind, &body, every, String::new()).await {
         Ok(w) => ([("content-type", "application/x-ndjson")], Body::from_stream(app.lake.node.drain.endless(lines(w).take_until(revoked)))).into_response(),
         Err(e) => (axum::http::StatusCode::BAD_REQUEST, crate::ext::said(&e)).into_response(),
     }
 }
 
 /// A live query made ready: its SQL prepared, the tables it reads found, as its session and caller.
-async fn watch(app: &App, headers: &axum::http::HeaderMap, sql: Option<&str>, kind: &str, body: &[u8], every: Duration, tag: String) -> anyhow::Result<Watch> {
+async fn watch(app: &App, who: &crate::auth::Principal, headers: &axum::http::HeaderMap, sql: Option<&str>, kind: &str, body: &[u8], every: Duration, tag: String) -> anyhow::Result<Watch> {
     let session = crate::temp::of(headers)?;
     crate::temp::SESSION.scope(session.clone(), async {
         let req = match sql {
@@ -110,7 +111,7 @@ async fn watch(app: &App, headers: &axum::http::HeaderMap, sql: Option<&str>, ki
             None => crate::routines::Request::read(kind, body)?,
         };
         anyhow::ensure!(req.tables.is_empty(), "a live query reads the lake: rows sent with it would never change");
-        let who = crate::auth::current().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::Admin));
+        let who = who.clone();
         let sql = crate::routines::prepare(&app.lake, &req.sql, &req.params, &req.views, &who.scope).await?;
         anyhow::ensure!(crate::routines::split(&sql).len() == 1 && crate::write::parse(&sql).is_none(), "a live query is one query");
         let (tables, others) = reads(app, &sql, &who.scope).await?;
