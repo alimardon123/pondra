@@ -103,7 +103,7 @@ async fn namespace(axum::extract::State(app): axum::extract::State<crate::app::A
 /// `POST /v1/namespaces`: `CREATE SCHEMA`, run as the caller (DDL: an admin's), in this lake: an
 /// attached lake's schemas are made by its own nodes, as in SQL. Its properties are none but
 /// `owner` (Spark's, the caller as in SQL); another is refused by name, since a schema keeps none.
-async fn create_namespace(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, body: bytes::Bytes) -> Reply {
+async fn create_namespace(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(who): axum::Extension<crate::auth::Principal>, body: bytes::Bytes) -> Reply {
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the namespace: {e}")))?;
     let parts: Vec<String> = asked["namespace"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
     if let Some(p) = asked["properties"].as_object().and_then(|p| p.keys().find(|k| *k != "owner")) {
@@ -115,18 +115,18 @@ async fn create_namespace(axum::extract::State(app): axum::extract::State<crate:
     let [s] = &parts[..] else {
         return Err(bad(format!("namespace {}: a schema of this database is one part; an attached database's schemas are made by its own nodes", parts.join("."))));
     };
-    as_caller(&app, role, &format!("CREATE SCHEMA {}", quoted(s)), false).await?;
+    as_caller(&app, &who, &format!("CREATE SCHEMA {}", quoted(s)), false).await?;
     Ok(axum::Json(json!({"namespace": parts, "properties": {}})))
 }
 
 /// `DELETE /v1/namespaces/{ns}`: `DROP SCHEMA`, as the caller. One that holds anything is `409
 /// NamespaceNotEmptyException`, as the REST specification has it (`as_caller`).
-async fn drop_namespace(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path(ns): axum::extract::Path<String>) -> Result<axum::http::StatusCode, Refusal> {
+async fn drop_namespace(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(who): axum::Extension<crate::auth::Principal>, axum::extract::Path(ns): axum::extract::Path<String>) -> Result<axum::http::StatusCode, Refusal> {
     let (parts, lake, schema) = space(&app, &ns).await?;
     if !std::sync::Arc::ptr_eq(&lake, &app.lake) {
         return Err(bad(format!("namespace {} is {}'s, an attached database: its schemas are dropped by its own nodes", parts.join("."), parts[0])));
     }
-    as_caller(&app, role, &format!("DROP SCHEMA {}", quoted(&schema)), true).await?;
+    as_caller(&app, &who, &format!("DROP SCHEMA {}", quoted(&schema)), true).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -157,8 +157,8 @@ fn sql_name(app: &crate::app::App, parts: &[String], lake: &std::sync::Arc<Lake>
 
 /// A statement for the catalog's table changes, run as the caller (DDL: an admin's). `drops_namespace`: the namespace DELETE route, whose
 /// 2BP01 is a namespace that isn't empty.
-async fn as_caller(app: &crate::app::App, role: crate::auth::Role, sql: &str, drops_namespace: bool) -> Result<(), Refusal> {
-    let who = crate::routines::Who { role, files: false, depth: 0 };
+async fn as_caller(app: &crate::app::App, who: &crate::auth::Principal, sql: &str, drops_namespace: bool) -> Result<(), Refusal> {
+    let who = crate::routines::Who { role: who.role, files: false, depth: 0, scope: who.scope.clone() };
     Box::pin(crate::routines::one(app, sql, who, None)).await.map(|_| ()).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), drops_namespace))
 }
 
@@ -182,12 +182,12 @@ fn exception(code: &str, words: String, drops_namespace: bool) -> Refusal {
 /// day or hour), its write order as `cluster_by` (columns sorted ascending), published as Iceberg
 /// (and anything else its `publish` property names). The metadata answered is its first
 /// version's. What Pondra's tables can't be is refused by name.
-async fn create(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path(ns): axum::extract::Path<String>, body: bytes::Bytes) -> Reply {
+async fn create(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(who): axum::Extension<crate::auth::Principal>, axum::extract::Path(ns): axum::extract::Path<String>, body: bytes::Bytes) -> Reply {
     let (parts, lake, schema) = space(&app, &ns).await?;
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the table: {e}")))?;
     let table = asked["name"].as_str().filter(|n| !n.is_empty()).ok_or_else(|| bad("a table without its name".into()))?;
     let sql = create_sql(&sql_name(&app, &parts, &lake, &schema, table), &asked).map_err(|e| bad(crate::ext::said(&e)))?;
-    as_caller(&app, role, &sql, false).await?;
+    as_caller(&app, &who, &sql, false).await?;
     let name = crate::text::join(&schema, table);
     for _ in 0..600 {
         if let Ok(v) = loaded(&lake, &name).await {
@@ -345,15 +345,15 @@ fn schema_sql(name: &str, meta: &Value, asked: &Value) -> Result<Vec<String>> {
 
 /// `DELETE /v1/namespaces/{ns}/tables/{table}`: `DROP TABLE`, its files with it (the catalog's
 /// `purgeRequested` or not: a Pondra table's files are its own).
-async fn drop_table(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>) -> Result<axum::http::StatusCode, Refusal> {
+async fn drop_table(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(who): axum::Extension<crate::auth::Principal>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>) -> Result<axum::http::StatusCode, Refusal> {
     let (parts, lake, schema) = space(&app, &ns).await?;
     loaded(&lake, &crate::text::join(&schema, &table)).await.map_err(|_| missing(&format!("table {}.{table}", parts.join(".")), "NoSuchTableException"))?;
-    as_caller(&app, role, &format!("DROP TABLE {}", sql_name(&app, &parts, &lake, &schema, &table)), false).await?;
+    as_caller(&app, &who, &format!("DROP TABLE {}", sql_name(&app, &parts, &lake, &schema, &table)), false).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// `POST /v1/tables/rename`: `ALTER TABLE … RENAME TO`, within its lake and schema.
-async fn rename(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, body: bytes::Bytes) -> Result<axum::http::StatusCode, Refusal> {
+async fn rename(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(who): axum::Extension<crate::auth::Principal>, body: bytes::Bytes) -> Result<axum::http::StatusCode, Refusal> {
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the rename: {e}")))?;
     let ns = |v: &Value| v["namespace"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join("\u{1f}");
     let (from, to) = (&asked["source"], &asked["destination"]);
@@ -364,7 +364,7 @@ async fn rename(axum::extract::State(app): axum::extract::State<crate::app::App>
     }
     loaded(&lake, &crate::text::join(&schema, name)).await.map_err(|_| missing(&format!("table {}.{name}", parts.join(".")), "NoSuchTableException"))?;
     let sql = format!("ALTER TABLE {} RENAME TO \"{}\"", sql_name(&app, &parts, &lake, &schema, name), new.replace('"', "\"\""));
-    as_caller(&app, role, &sql, false).await?;
+    as_caller(&app, &who, &sql, false).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -388,7 +388,7 @@ async fn load(axum::extract::State(app): axum::extract::State<crate::app::App>, 
 /// commit asserts and commits it through the log, the views and tasks that follow the table taking
 /// it as they take the log's rows, and the table's next version is published under the writer's
 /// snapshot id. Anything else is refused by name.
-async fn update(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>, body: bytes::Bytes) -> Reply {
+async fn update(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(who): axum::Extension<crate::auth::Principal>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>, body: bytes::Bytes) -> Reply {
     let (parts, lake, schema) = space(&app, &ns).await?;
     let name = crate::text::join(&schema, &table);
     crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name)).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), false))?;
@@ -405,7 +405,7 @@ async fn update(axum::extract::State(app): axum::extract::State<crate::app::App>
         };
         sql.extend(properties_sql(&target, &updates));
         for s in &sql {
-            as_caller(&app, role, s, false).await?;
+            as_caller(&app, &who, s, false).await?;
         }
         let version = current["metadata"]["last-sequence-number"].as_u64().unwrap_or(0);
         for _ in 0..200 {

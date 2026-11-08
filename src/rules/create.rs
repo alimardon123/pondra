@@ -682,7 +682,7 @@ mod tests {
 
     /// The node's refusal for `c`: its spec's (`create_spec`), else its table's (`create_table`), in the words it has.
     async fn node_refusal(lake: &Lake, c: &ast::CreateTable) -> Option<anyhow::Error> {
-        let spec = match crate::write::create_spec(c, lake, false).await {
+        let spec = match crate::write::create_spec(c, lake, false, &crate::auth::Principal::node().scope).await {
             Ok(spec) => spec,
             Err(e) => return Some(e),
         };
@@ -766,7 +766,7 @@ mod tests {
             let c = create(sql);
             let name = object(&c.name);
             let page = Table::of_create(&c, &planned(&lake, &c).await?, &|_| None)?;
-            let spec = crate::write::create_spec(&c, &lake, false).await?;
+            let spec = crate::write::create_spec(&c, &lake, false, &crate::auth::Principal::node().scope).await?;
             crate::write::create_table(&lake, &name, &spec).await?;
             let node = lake.cat.get::<TableMeta>(&table_key(&name)).await?.expect("the table is made").to_rules()?;
             assert_eq!(page, node, "{sql}");

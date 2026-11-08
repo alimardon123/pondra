@@ -172,7 +172,7 @@ async fn shard(app: App, view: String, p: i32) -> Result<()> {
 async fn over(lake: &Lake, feed: &Feed, batch: datafusion::arrow::record_batch::RecordBatch) -> Result<(datafusion::prelude::SessionContext, datafusion::prelude::DataFrame)> {
     const HERE: &str = "__pondra_records";
     let sql = feed.sql.replace(&format!("\"{}\"", feed.topic), &format!("\"{HERE}\"")); // (the session never lists the topic)
-    let ctx = crate::query::session(lake, &sql, "").await?;
+    let ctx = crate::query::session_for(lake, &sql, "", None, &crate::auth::Principal::node().scope).await?;
     ctx.register_batch(HERE, batch)?;
     let df = crate::engine::sql(&ctx, &sql).await?;
     Ok((ctx, df))

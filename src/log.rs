@@ -359,7 +359,7 @@ impl Log {
             None => batch,
         };
         let (ack, rx) = oneshot::channel();
-        crate::metrics::add(&crate::metrics::ROWS_IN, batch.num_rows() as u64);
+        crate::metrics::add(&self.lake.node.metrics.rows_in, batch.num_rows() as u64);
         let placed = placed_for(&table);
         self.tx.send(Append { table, src, batch, ack, placed }).await.map_err(|_| anyhow!("log closed"))?;
         Ok(Either::Left(async move {

@@ -244,36 +244,35 @@ pub async fn run(app: &App, w: &WithWrites, who: Who, job: Option<String>) -> Re
     if crate::txn::open() {
         return steps(app, w, who).await;
     }
-    let out = crate::txn::as_one(app, job.clone(), move || steps(app, w, who)).await?;
+    let out = crate::txn::as_one(app, job.clone(), move || steps(app, w, who.clone())).await?;
     out.ok_or_else(|| applied(job.as_deref().unwrap_or_default()))
 }
 
 /// The columns the answer will have, worked out without writing (a Postgres Describe). Each plain CTE is planned, and each write
 /// with RETURNING answers its columns, under the rows of the parts before it; the rest answers its planned columns (a query), its
 /// RETURNING's (a write with one), or none (a write without one).
-pub async fn columns(app: &App, w: &WithWrites) -> Result<Option<SchemaRef>> {
+pub async fn columns(app: &App, w: &WithWrites, scope: &crate::rights::Scope) -> Result<Option<SchemaRef>> {
     let mut sent = crate::query::SENT.try_with(|t| t.as_ref().clone()).unwrap_or_default();
     for step in &w.steps {
-        let scope = Arc::new(sent.clone());
+        let given = Arc::new(sent.clone());
         match step {
             Step::Write { name, sql, returns, columns: cols } => {
                 if !*returns {
                     continue;
                 }
-                let Some(schema) = crate::query::SENT.scope(scope, write_columns(app, sql)).await? else { continue };
+                let Some(schema) = crate::query::SENT.scope(given, write_columns(app, sql, scope)).await? else { continue };
                 sent.push((name.clone(), renamed(vec![RecordBatch::new_empty(schema)], name, cols)?));
             }
             Step::Rows { name, sql } => {
-                let schema = crate::query::SENT.scope(scope, planned(app, sql)).await?;
+                let schema = crate::query::SENT.scope(given, planned(app, sql, scope)).await?;
                 sent.push((name.clone(), vec![RecordBatch::new_empty(schema)]));
             }
         }
     }
-    let scope = Arc::new(sent);
-    crate::query::SENT.scope(scope, async {
+    crate::query::SENT.scope(Arc::new(sent), async {
         match w.rest_writes() {
-            true => write_columns(app, &w.rest).await,
-            false => Ok(Some(planned(app, &w.rest).await?)),
+            true => write_columns(app, &w.rest, scope).await,
+            false => Ok(Some(planned(app, &w.rest, scope).await?)),
         }
     })
     .await
@@ -287,7 +286,7 @@ async fn steps(app: &App, w: &WithWrites, who: Who) -> Result<Outcome> {
         let scope = Arc::new(sent.clone());
         match step {
             Step::Write { name, sql, returns, columns } => {
-                let out = crate::query::SENT.scope(scope, Box::pin(routines::one_of(app, sql, who, None))).await?;
+                let out = crate::query::SENT.scope(scope, Box::pin(routines::one_of(app, sql, who.clone(), None))).await?;
                 if *returns {
                     let rows = match out {
                         Outcome::Rows(rows) => rows,
@@ -297,7 +296,7 @@ async fn steps(app: &App, w: &WithWrites, who: Who) -> Result<Outcome> {
                 }
             }
             Step::Rows { name, sql } => {
-                let rows = crate::query::SENT.scope(scope, rows_of(app, sql, who)).await?;
+                let rows = crate::query::SENT.scope(scope, rows_of(app, sql, who.clone())).await?;
                 sent.push((name.clone(), rows));
             }
         }
@@ -315,8 +314,8 @@ async fn steps(app: &App, w: &WithWrites, who: Who) -> Result<Outcome> {
 /// A query's rows as `routines::one_of` answers one: with this node's files when its caller may read them (`files`).
 async fn rows_of(app: &App, sql: &str, who: Who) -> Result<Vec<RecordBatch>> {
     match who.files {
-        true => app.query_as(&crate::sys::planned(sql)?, Some("0"), true).await,
-        false => app.query(sql, None).await,
+        true => app.query_as(&crate::sys::planned(sql)?, Some("0"), true, &who.scope).await,
+        false => app.query(sql, None, &who.scope).await,
     }
 }
 
@@ -343,19 +342,19 @@ fn renamed(rows: Vec<RecordBatch>, name: &str, names: &[String]) -> Result<Vec<R
 
 /// The columns a write answers with, worked out without writing: a WITH's own (`columns`), a RETURNING's, and none for a write
 /// without one.
-async fn write_columns(app: &App, sql: &str) -> Result<Option<SchemaRef>> {
+async fn write_columns(app: &App, sql: &str, scope: &crate::rights::Scope) -> Result<Option<SchemaRef>> {
     if let Some(w) = of(sql) {
-        return Box::pin(columns(app, &w?)).await;
+        return Box::pin(columns(app, &w?, scope)).await;
     }
     match returning::of(sql) {
-        Some(r) => Ok(Some(returning::columns(app, &r).await?)),
+        Some(r) => Ok(Some(returning::columns(app, &r, scope).await?)),
         None => Ok(None),
     }
 }
 
 /// The schema a query answers with, planned and not run (here, and for Flight's empty answers and its plans: `flight.rs`).
-pub(crate) async fn planned(app: &App, sql: &str) -> Result<SchemaRef> {
-    let ctx = crate::query::session(&app.lake, sql, "").await?;
+pub(crate) async fn planned(app: &App, sql: &str, scope: &crate::rights::Scope) -> Result<SchemaRef> {
+    let ctx = crate::query::session_for(&app.lake, sql, "", None, scope).await?;
     let df = crate::engine::sql(&ctx, &crate::sys::planned(sql)?).await?;
     Ok(Arc::new(crate::answer::arrow_schema(crate::query::described(&ctx, df.logical_plan())?.as_arrow()))) // (refused as its run would be)
 }

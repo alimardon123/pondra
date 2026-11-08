@@ -2,7 +2,6 @@
 //! kept for them, tiering, and the tasks and views filled from the log. The doors (`server.rs` and the rest) hold one
 //! and call into it.
 use crate::log::{Log, Sequencer};
-use crate::query::session;
 use crate::store::*;
 use crate::tier::{expire, tier_table};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -164,12 +163,13 @@ async fn each<'a, T>(jobs: Vec<impl std::future::Future<Output = (&'a String, an
 impl App {
     pub fn log(&self) -> anyhow::Result<&Log> { self.log.as_deref().ok_or_else(|| anyhow::anyhow!("read-only node")) }
 
-    /// Run a query: across the cluster when the tables are big (`spread`: "1" always, "0" never).
-    pub async fn query(&self, query: &str, spread: Option<&str>) -> anyhow::Result<Vec<RecordBatch>> {
-        match self.query_as(&crate::sys::planned(query)?, spread, false).await {
+    /// Run a query for `scope` (its asker's: `routines::Who`): across the cluster when the tables are big (`spread`: "1"
+    /// always, "0" never).
+    pub async fn query(&self, query: &str, spread: Option<&str>, scope: &crate::rights::Scope) -> anyhow::Result<Vec<RecordBatch>> {
+        match self.query_as(&crate::sys::planned(query)?, spread, false, scope).await {
             // (`*` left as it is when `sys::hide`'s EXCLUDE names a column its table lacks: a
             // stored view's, say)
-            Err(e) if crate::query::handed().is_none() && [crate::sys::mentioned, crate::query::names_deleted].iter().any(|m| m(query) && m(&format!("{e:#}"))) => self.query_as(&crate::asof::as_of(query)?, spread, false).await, // (an answer half sent is never run again)
+            Err(e) if crate::query::handed().is_none() && [crate::sys::mentioned, crate::query::names_deleted].iter().any(|m| m(query) && m(&format!("{e:#}"))) => self.query_as(&crate::asof::as_of(query)?, spread, false, scope).await, // (an answer half sent is never run again)
             r => r,
         }
     }
@@ -179,8 +179,8 @@ impl App {
     /// running a query — is made on the heap, here: a caller waiting for it holds a pointer, so
     /// procedures calling procedures 16 deep don't run out of stack.
     #[inline(never)]
-    pub fn query_as<'a>(&'a self, query: &'a str, spread: Option<&'a str>, files: bool) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<RecordBatch>>> {
-        Box::pin(crate::ext::listing(self.query_listed(query, spread, files))) // (every door: files listed once a statement)
+    pub fn query_as<'a>(&'a self, query: &'a str, spread: Option<&'a str>, files: bool, scope: &'a crate::rights::Scope) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<RecordBatch>>> {
+        Box::pin(crate::ext::listing(self.query_listed(query, spread, files, scope))) // (every door: files listed once a statement)
     }
 
     /// Whether `query` must run on this node alone: rows sent with the request are here only; so are
@@ -189,33 +189,37 @@ impl App {
     /// the query is planned, here. So does a view that says `current_schema()` read under a path of
     /// the session's own: the other nodes read it with no session, as its reader's path says. And
     /// so do a session's queries while it holds temporary secrets, which only this node has.
-    pub async fn here_only(&self, query: &str) -> bool {
-        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::called(query).is_some() || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::set::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || !crate::rights::scope().whole()
+    pub async fn here_only(&self, query: &str) -> bool { self.here_only_for(query, &crate::rights::scope()).await }
+
+    /// `here_only`, for a query planned for `scope`.
+    pub async fn here_only_for(&self, query: &str, scope: &crate::rights::Scope) -> bool {
+        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::called(query).is_some() || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::set::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || !scope.whole()
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await)
     }
 
     /// A query on one of the node's turns (`TURNS`): a query run inside another one this task runs
     /// (a procedure's, a view's) is served by the turn its caller holds, never waiting for one.
-    async fn query_listed(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
+    async fn query_listed(&self, query: &str, spread: Option<&str>, files: bool, scope: &crate::rights::Scope) -> anyhow::Result<Vec<RecordBatch>> {
         if TURN.try_with(|_| ()).is_ok() {
-            return self.run_query(query, spread, files, false).await; // (a query inside another one: never the door's answer)
+            return self.run_query(query, spread, files, false, scope).await; // (a query inside another one: never the door's answer)
         }
         let _turn = turn().await?; // (held until the answer is made)
-        TURN.scope((), self.run_query(query, spread, files, true)).await
+        TURN.scope((), self.run_query(query, spread, files, true, scope)).await
     }
 
     /// `top`: the query a door sent (it took a turn), whose answer may go to the door in pieces (`query::collect_or_send`).
-    async fn run_query(&self, query: &str, spread: Option<&str>, files: bool, top: bool) -> anyhow::Result<Vec<RecordBatch>> {
-        use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
+    async fn run_query(&self, query: &str, spread: Option<&str>, files: bool, top: bool, scope: &crate::rights::Scope) -> anyhow::Result<Vec<RecordBatch>> {
+        use crate::metrics::add;
+        let m = &self.lake.node.metrics; // (the node's own counters: `metrics::Metrics`)
         if crate::pg_catalog::asked(query) {
-            return crate::pg_catalog::over_http(&self.lake, query).await; // (a request that speaks Postgres, reading its catalog: `?catalog=postgres`)
+            return crate::pg_catalog::over_http(&self.lake, query, scope).await; // (a request that speaks Postgres, reading its catalog: `?catalog=postgres`)
         }
         let start = datafusion::common::instant::Instant::now();
         crate::history::read_at(self.lake.visible()); // (its answer again: `t AT (VERSION => n)`)
         let explained = crate::explain::asked(query);
         let top = top && !explained; // (an explained query's operators' rows are kept whole)
         let run = async {
-            let nodes = if spread == Some("0") || self.here_only(query).await { vec![] } else { self.members.nodes() };
+            let nodes = if spread == Some("0") || self.here_only_for(query, scope).await { vec![] } else { self.members.nodes() };
             // (boxed, and only with nodes to spread over: its future is 300 KB, which every query on one node carried)
             let spread_out = match nodes.len() > 1 {
                 true => Box::pin(crate::spmd::query(&self.lake, &nodes, self.members.me(), query, spread == Some("1"))).await,
@@ -231,7 +235,7 @@ impl App {
                 Err(e) => eprintln!("distributed query failed, running it here: {e:#}"),
             }
             let here = datafusion::common::instant::Instant::now();
-            let ctx = session(&self.lake, query, "").await?;
+            let ctx = crate::query::session_for(&self.lake, query, "", None, scope).await?;
             crate::query::mark("session with its tables");
             let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
             crate::explain::prepare(&ctx, query); // (each operator's expected rows: `explain::expected`)
@@ -265,21 +269,21 @@ impl App {
             Ok((out, false))
         };
         let (out, planned) = crate::learned::planning(query, run).await; // (planned with what runs learned, as its runs so far say)
-        add(&QUERIES, 1);
-        add(&QUERY_US, start.elapsed().as_micros() as u64);
+        add(&m.queries, 1);
+        add(&m.query_us, start.elapsed().as_micros() as u64);
         match out {
             Ok((batches, spread)) => {
                 let handed = crate::query::handed(); // (rows sent in pieces: the batches went to the door, which holds none here)
                 if handed.is_none() {
                     crate::learned::ran(query, planned, start.elapsed()); // (never worse: facts that made it slower twice are set aside)
                 }
-                add(&SPREAD, spread as u64);
+                add(&m.spread, spread as u64);
                 crate::history::rows(handed.unwrap_or_else(|| batches.iter().map(|b| b.num_rows() as u64).sum()));
                 let batches = if explained { crate::explain::answered(batches)? } else { batches }; // (files as SQL named them: a node's EXPLAIN and a page's alike)
                 Ok(batches.into_iter().map(crate::answer::compact).collect()) // (an answer kept or sent holds only its own strings)
             }
             Err(e) => {
-                add(&QUERY_ERRORS, 1);
+                add(&m.query_errors, 1);
                 Err(e)
             }
         }
@@ -363,7 +367,7 @@ impl App {
         // round carries on.
         if let Err(e) = crate::delta::publish_all(&self.lake).await { // what other engines read, as soon as it's tiered
             failed.push(format!("publish: {e:#}"));
-            crate::metrics::job_failed("publish");
+            self.lake.node.metrics.job_failed("publish");
         }
         let first_publish = start.elapsed();
         // Then merges and compactions (published too, once done).
@@ -371,7 +375,7 @@ impl App {
         if each(maintain, &mut failed).await.contains(&true) {
             if let Err(e) = crate::delta::publish_all(&self.lake).await {
                 failed.push(format!("publish: {e:#}"));
-                crate::metrics::job_failed("publish");
+                self.lake.node.metrics.job_failed("publish");
             }
         }
         let published = start.elapsed();

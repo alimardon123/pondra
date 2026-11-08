@@ -20,7 +20,7 @@
 //! be split is decided operator by operator (`spread`): only what stays correct run this way runs
 //! this way, and anything else runs on one node.
 use crate::manifest::Manifest;
-use crate::query::{session, table_ref, Pruned};
+use crate::query::{session_for, table_ref, Pruned};
 use crate::spill::Spill;
 use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
@@ -511,7 +511,8 @@ async fn planned(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn Exec
 
 /// The slice's query, its tables standing for just their parts.
 async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::prelude::DataFrame)> {
-    let ctx = session(lake, &s.sql, "").await?;
+    // (as the node's own: a query spreads only when its caller sees everything, `App::here_only`)
+    let ctx = session_for(lake, &s.sql, "", None, &crate::auth::Principal::node().scope).await?;
     // The whole tables, log tails and changed rows (`{t}$deleted`) as the coordinator saw them:
     // this node must have seen the log that far.
     let mut hwm = lake.hwm.subscribe();
@@ -697,7 +698,7 @@ async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: 
         let (mut last, mut sizes): (Vec<Spill>, HashMap<usize, Vec<Vec<Vec<u64>>>>) = (vec![], HashMap::new());
         for step in 0..=job.exchanges.len() {
             let splits = crate::skew::splits(&job.joins, step, &sizes); // (hot partitions of what this step joins)
-            crate::metrics::add(&crate::metrics::SKEW_SPLITS, splits.len() as u64);
+            crate::metrics::add(&lake.node.metrics.skew_splits, splits.len() as u64);
             let runs = nodes.iter().enumerate().zip(slices).map(|((i, node), s)| {
                 let mut s = s.clone();
                 let sh = s.shuffle.as_mut().expect("a shuffle");
@@ -755,9 +756,9 @@ async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: 
     if out.is_err() {
         abandon(nodes, &nodes[mine], &id).await; // (the nodes that kept buckets for it let them go now)
     }
-    crate::metrics::add(&crate::metrics::SHUFFLED, (out.is_ok() && !job.exchanges.is_empty()) as u64);
+    crate::metrics::add(&lake.node.metrics.shuffled, (out.is_ok() && !job.exchanges.is_empty()) as u64);
     let ranged = slices[mine].shuffle.as_ref().is_some_and(|sh| sh.how == How::Ranged);
-    crate::metrics::add(&crate::metrics::RANGED, (out.is_ok() && ranged) as u64);
+    crate::metrics::add(&lake.node.metrics.ranged, (out.is_ok() && ranged) as u64);
     JOBS.lock().unwrap().remove(&id); // (all steps done: nobody fetches from here any more)
     crate::spill::clear(&id);
     out

@@ -36,7 +36,9 @@ pub async fn run(lake: &Lake, source: &str, s: SchemaRef, rows: &[RecordBatch], 
         keep(key, (plan, task)); // (the plan taken out, not the copy that ran: that one holds these rows; a run that failed keeps none)
         return Ok((schema, out));
     }
-    let ctx = crate::query::session(lake, sql, source).await?;
+    // (planned as the node's own work: a view's, a task's or a feed's rows, which read what its definition reads, whoever
+    // wrote them; and a plan kept here is taken by every run, so it is one scope's)
+    let ctx = crate::query::session_for(lake, sql, source, None, &crate::auth::Principal::node().scope).await?;
     let alone = registered_none(&ctx);
     let table: Arc<dyn TableProvider> = match alone {
         true => {

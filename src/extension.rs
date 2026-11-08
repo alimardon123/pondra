@@ -286,7 +286,7 @@ pub async fn fetch(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl) -
     match lock {
         Some(lock) => {
             let _guard = lock.lock().await;
-            crate::ddl::apply(lake, install).await
+            crate::ddl::apply(lake, install, &crate::auth::Principal::node().scope).await // (its record, kept by the node: nothing planned)
         }
         None => Box::pin(crate::write::send(&lake.url, Request::Ddl(install), &lake.node)).await,
     }

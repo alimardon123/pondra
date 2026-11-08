@@ -6,7 +6,6 @@
 //! A session: `initialize` gives the client an `Mcp-Session-Id`, and the tool calls that send it
 //! back share one session, so a `write` of `BEGIN` is a transaction the next calls are in, until
 //! `COMMIT`, `ROLLBACK`, or `DELETE /mcp` with the id (`txn.rs`, `temp.rs`).
-use crate::auth::Role;
 use crate::app::App;
 use crate::store::{Lake, TableMeta};
 use crate::views::View;
@@ -23,7 +22,7 @@ use std::sync::Arc;
 
 const ROWS: usize = 1000; // at most this many rows per answer: an agent reads them all
 
-pub async fn handle(State(app): State<App>, Extension(role): Extension<Role>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn handle(State(app): State<App>, Extension(who): Extension<crate::auth::Principal>, headers: HeaderMap, body: Bytes) -> Response {
     let Ok(req) = serde_json::from_slice::<Value>(&body) else {
         return Json(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "not JSON"}})).into_response();
     };
@@ -61,7 +60,7 @@ pub async fn handle(State(app): State<App>, Extension(role): Extension<Role>, he
             let all = [tools().as_array().cloned().unwrap_or_default(), crate::find::mcp_tools(), procedures(&app).await].concat();
             json!({"tools": all})
         }
-        "tools/call" => match crate::temp::SESSION.scope(session, call(&app, role, params)).await {
+        "tools/call" => match crate::temp::SESSION.scope(session, call(&app, &who, params)).await {
             Ok(result) => result,
             Err(error) => return Json(json!({"jsonrpc": "2.0", "id": id, "error": error})).into_response(), // (no such tool: a protocol error)
         },
@@ -148,15 +147,15 @@ fn tools() -> Value {
 /// A tool's answer (its JSON, as text) as its result, or the JSON-RPC error for a tool the server doesn't have
 /// (-32602, Invalid params, with its SQLSTATE 42883 in `data`). A tool that fails is a result with
 /// `isError`, its message carrying the SQLSTATE: the agent sees it and can act on it.
-async fn call(app: &App, role: Role, params: &Value) -> Result<Value, Value> {
+async fn call(app: &App, who: &crate::auth::Principal, params: &Value) -> Result<Value, Value> {
     let arg = |k: &str| params["arguments"][k].as_str().unwrap_or_default();
     let out = match params["name"].as_str().unwrap_or_default() {
         "list_tables" => list(app).await.map(|v| v.to_string()),
-        "query" => query(app, role, arg("sql")).await,
-        "write" => write(app, role, arg("sql"), params["arguments"]["job"].as_str()).await,
+        "query" => query(app, who, arg("sql")).await,
+        "write" => write(app, who, arg("sql"), params["arguments"]["job"].as_str()).await,
         "changes" => changes(app, arg("table"), params["arguments"]["after"].as_u64()).await,
         name if crate::find::is_tool(name) => match crate::find::mcp_sql(name, &params["arguments"]) {
-            Ok(sql) => query(app, role, &sql).await,
+            Ok(sql) => query(app, who, &sql).await,
             Err(e) => Err(e),
         },
         other => {
@@ -165,7 +164,7 @@ async fn call(app: &App, role: Role, params: &Value) -> Result<Value, Value> {
             };
             let given = params["arguments"].as_object().into_iter().flatten().map(|(k, v)| Ok(format!("{k} => {}", crate::routines::literal(v)?))).collect::<Result<Vec<_>>>();
             match given {
-                Ok(given) => called(app, role, &format!("CALL {name}({})", given.join(", ")), None).await,
+                Ok(given) => called(app, who, &format!("CALL {name}({})", given.join(", ")), None).await,
                 Err(e) => Err(e),
             }
         }
@@ -283,13 +282,13 @@ async fn list(app: &App) -> Result<Value> {
 /// A query's rows as JSON. Never a write (the write tool's, and BEGIN, COMMIT and ROLLBACK too). Run as every door runs a
 /// statement (`statement::run`): in a session it reads the transaction's snapshot and its own writes, and `$name`s are
 /// the session's variables; several statements run as a script.
-async fn query(app: &App, role: Role, sql: &str) -> Result<String> {
+async fn query(app: &App, who: &crate::auth::Principal, sql: &str) -> Result<String> {
     if crate::statement::is_write(sql) {
         return Err(crate::codes::coded("25006", "this changes data or a transaction: use the write tool")); // (a read-only tool: Postgres's read_only_sql_transaction)
     }
     let req = crate::routines::Request { sql: sql.to_string(), ..Default::default() };
     let how = crate::statement::How { job: None, spread: None, after: None, stale: None };
-    let who = crate::routines::Who { role, files: false, depth: 0 };
+    let who = crate::routines::Who { role: who.role, files: false, depth: 0, scope: who.scope.clone() };
     match crate::statement::run(app, req, how, who, &McpWire).await? {
         crate::statement::Answer::Own(text) => Ok(text),
         crate::statement::Answer::Done(v) => Ok(v.to_string()),
@@ -334,22 +333,22 @@ impl Rows {
 
 /// The write tool's SQL, run as POST /sql runs it (`run`): one statement or several, a
 /// transaction's BEGIN … COMMIT in its session, and `job`, so a retry is applied once.
-async fn write(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<String> {
-    let (out, heard) = crate::routines::with_notices(run(app, role, sql, job.map(String::from))).await;
+async fn write(app: &App, who: &crate::auth::Principal, sql: &str, job: Option<&str>) -> Result<String> {
+    let (out, heard) = crate::routines::with_notices(run(app, who, sql, job.map(String::from))).await;
     answer(out, heard)
 }
 
 /// `sql` as POST /sql runs it (`routines::script`), as `role`: each statement audited once, by the
 /// runner. Sent with no session, a script of several statements is one of its own, which ends
 /// with it (a transaction left open too), as POST /sql makes it.
-async fn run(app: &App, role: Role, sql: &str, job: Option<String>) -> Result<crate::routines::Outcome> {
+async fn run(app: &App, who: &crate::auth::Principal, sql: &str, job: Option<String>) -> Result<crate::routines::Outcome> {
     // A transaction word alone, with no session, has nothing to hold it: refused by name. Several statements in one call
     // (BEGIN; …; COMMIT) run as one script, in a session of their own, so they are a transaction.
     let parts = crate::routines::split(sql).len();
     if crate::temp::current().is_none() && parts == 1 && crate::text::control(sql).is_some() {
         return Err(crate::codes::coded("0A000", "a transaction needs a session: send initialize and keep the Mcp-Session-Id it gives"));
     }
-    let who = crate::routines::Who { role, files: false, depth: 0 };
+    let who = crate::routines::Who { role: who.role, files: false, depth: 0, scope: who.scope.clone() };
     let own = (crate::temp::current().is_none() && parts > 1).then(crate::temp::of_script);
     // (named, so the future borrows values that live as long as it does)
     let (params, views) = (HashMap::new(), HashMap::new());
@@ -363,8 +362,8 @@ async fn run(app: &App, role: Role, sql: &str, job: Option<String>) -> Result<cr
 }
 
 /// A procedure's answer, as a tool's: its rows or outcome, and what it printed (`notices`).
-async fn called(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<String> {
-    let who = crate::routines::Who { role, files: false, depth: 0 };
+async fn called(app: &App, who: &crate::auth::Principal, sql: &str, job: Option<&str>) -> Result<String> {
+    let who = crate::routines::Who { role: who.role, files: false, depth: 0, scope: who.scope.clone() };
     let (out, heard) = crate::routines::with_notices(crate::routines::one(app, sql, who, job.map(String::from))).await;
     answer(out, heard)
 }

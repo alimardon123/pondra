@@ -172,7 +172,7 @@ pub fn external(c: &datafusion::sql::parser::CreateExternalTable) -> Result<crat
 /// the folder (`COPY … TO '…/' (APPEND)`, in its format, its folders' keys as folders), as
 /// DataFusion's external tables take it: the query, where, and COPY's options. Any other write to
 /// a view is refused (it would make a table by that name). None: not a view.
-pub async fn view_write(lake: &Lake, stmt: &crate::write::Stmt) -> Result<Option<(String, String, BTreeMap<String, String>)>> {
+pub async fn view_write(lake: &Lake, stmt: &crate::write::Stmt, scope: &crate::rights::Scope) -> Result<Option<(String, String, BTreeMap<String, String>)>> {
     use crate::write::Stmt;
     let (Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..)) = stmt else { return Ok(None) };
     let Ok((None, name)) = crate::ddl::resolve(lake, t).await else { return Ok(None) };
@@ -194,7 +194,7 @@ pub async fn view_write(lake: &Lake, stmt: &crate::write::Stmt) -> Result<Option
     };
     // Its columns, in order and by type: the rows go as the view reads them (the files' order is
     // CSV's, their names Parquet's and JSON's).
-    let ctx = crate::query::session(lake, &format!("SELECT * FROM {}", crate::write::sql_name(&name)), "").await?;
+    let ctx = crate::query::session_for(lake, &format!("SELECT * FROM {}", crate::write::sql_name(&name)), "", None, scope).await?;
     let fields = ctx.sql(&format!("SELECT * FROM {} LIMIT 0", crate::write::sql_name(&name))).await?.schema().fields().clone();
     let given: Vec<String> = if names.is_empty() { fields.iter().map(|f| f.name().clone()).collect() } else { names };
     if let Some(n) = given.iter().find(|n| !fields.iter().any(|f| f.name() == *n)) {

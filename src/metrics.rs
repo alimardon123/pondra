@@ -6,15 +6,40 @@ use crate::app::App;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-crate::per_node!(pub static ROWS_IN: AtomicU64 = AtomicU64::new(0)); // rows this node took into the log, by any door
-crate::per_node!(pub static QUERIES: AtomicU64 = AtomicU64::new(0)); // SQL queries run here (HTTP, Postgres, MCP, Flight)
-crate::per_node!(pub static QUERY_ERRORS: AtomicU64 = AtomicU64::new(0));
-crate::per_node!(pub static QUERY_US: AtomicU64 = AtomicU64::new(0)); // their total time
-crate::per_node!(pub static SPREAD: AtomicU64 = AtomicU64::new(0)); // queries run across the cluster from here
-crate::per_node!(pub static SHUFFLED: AtomicU64 = AtomicU64::new(0)); // …of them with a shuffle
-crate::per_node!(pub static RANGED: AtomicU64 = AtomicU64::new(0)); // …of them with their tables sliced by a key's ranges
-crate::per_node!(pub static FILES_SCANNED: AtomicU64 = AtomicU64::new(0)); // append-table files queries opened…
-crate::per_node!(pub static FILES_SKIPPED: AtomicU64 = AtomicU64::new(0)); // …and skipped by their min/max
+/// A node's own counters (`NodeState::metrics`): what `/metrics` and `/stats` say of it. Two nodes in one process count
+/// apart, and a node's start begins them at 0. (The store's and the shuffle's counters below are still the process's, for
+/// one node at a time, until they move: l7-wip/step2-pr8-metrics-plan.md.)
+#[derive(Debug, Default)]
+pub struct Metrics {
+    pub rows_in: AtomicU64,       // rows this node took into the log, by any door
+    pub queries: AtomicU64,       // SQL queries run here (HTTP, Postgres, MCP, Flight)
+    pub query_errors: AtomicU64,
+    pub query_us: AtomicU64,      // their total time
+    pub spread: AtomicU64,        // queries run across the cluster from here
+    pub shuffled: AtomicU64,      // …of them with a shuffle
+    pub ranged: AtomicU64,        // …of them with their tables sliced by a key's ranges
+    pub skew_splits: AtomicU64,   // hot partitions of shuffled joins shared out
+    pub files_scanned: AtomicU64, // append-table files queries opened…
+    pub files_skipped: AtomicU64, // …and skipped by their min/max
+    /// Background loops that fail without failing a request, by `JOBS`: counted here, so a stall that otherwise shows only
+    /// on stderr is visible in `/metrics` and `/stats`.
+    failed: [AtomicU64; JOBS.len()],
+}
+
+/// The background loops a node counts the failures of: tiering, publishing, window emission, streaming tasks, checkpoints.
+const JOBS: [&str; 5] = ["tiering", "publish", "emission", "tasks", "checkpoint"];
+
+impl Metrics {
+    pub fn job_failed(&self, job: &str) {
+        if let Some(i) = JOBS.iter().position(|j| *j == job) {
+            self.failed[i].fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Each background loop and how often it failed.
+    pub fn failures(&self) -> Vec<(&'static str, u64)> { JOBS.iter().zip(&self.failed).map(|(k, c)| (*k, c.load(Relaxed))).collect() }
+}
+
 crate::per_node!(pub static OBJECT_WRITES: AtomicU64 = AtomicU64::new(0)); // object-store requests this process made (`store::Counted`): writes…
 crate::per_node!(pub static OBJECT_LISTS: AtomicU64 = AtomicU64::new(0)); // …lists…
 crate::per_node!(pub static OBJECT_DELETES: AtomicU64 = AtomicU64::new(0)); // …deletes…
@@ -23,7 +48,6 @@ crate::per_node!(pub static CATALOG_READS: AtomicU64 = AtomicU64::new(0)); // ca
 crate::per_node!(pub static CATALOG_WRITES: AtomicU64 = AtomicU64::new(0)); // …and put or deleted (the write-set rule: designs/redesign/redesign.md §4)
 crate::per_node!(pub static SPILLED: AtomicU64 = AtomicU64::new(0)); // shuffle bytes written to this node's disk
 crate::per_node!(pub static SKEW: AtomicU64 = AtomicU64::new(0)); // the worst bucket/average seen in a shuffle, x100
-crate::per_node!(pub static SKEW_SPLITS: AtomicU64 = AtomicU64::new(0)); // hot partitions of shuffled joins shared out
 crate::per_node!(pub static RECEIVED: AtomicU64 = AtomicU64::new(0)); // shuffle bytes this node's steps read (its share of the work)
 crate::per_node!(pub static WIRE: AtomicU64 = AtomicU64::new(0)); // bytes other nodes sent this node, compressed as sent (shuffles, gathered results)
 crate::per_node!(pub static WAIT_US: AtomicU64 = AtomicU64::new(0)); // time this node's steps waited for other nodes' buckets
@@ -49,23 +73,12 @@ impl Drop for Now {
 
 pub fn add(c: &AtomicU64, n: u64) { c.fetch_add(n, Relaxed); }
 
+#[cfg(test)]
+fn get(c: &AtomicU64) -> u64 { c.load(Relaxed) }
+
 /// A label's value as the Prometheus text format writes it, between its quotes: a backslash, a double quote and a line
 /// break escaped. A table may be named any of them (`"a\"b"`), and one unescaped broke the whole scrape (11-08 audit L6).
 pub fn label(v: &str) -> String { v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n") }
-
-crate::per_node!(
-    /// Background loops that fail without failing a request (tiering, publishing, window emission,
-    /// streaming tasks, checkpoints): counted here, so a stall that otherwise shows only on stderr is
-    /// visible in `/metrics` and `/stats`.
-    static BG_FAILS: [(&str, AtomicU64); 5] =
-    [("tiering", AtomicU64::new(0)), ("publish", AtomicU64::new(0)), ("emission", AtomicU64::new(0)), ("tasks", AtomicU64::new(0)), ("checkpoint", AtomicU64::new(0))];
-    clear = |all| all.iter().for_each(|(_, c)| c.store(0, Relaxed)));
-
-pub fn job_failed(job: &str) {
-    if let Some((_, c)) = BG_FAILS.iter().find(|(k, _)| *k == job) {
-        c.fetch_add(1, Relaxed);
-    }
-}
 
 /// jemalloc's count of what it holds, when it keeps one (built with its statistics: the `heap-profile` build), else
 /// nothing. Beside the process's resident memory it says whether the heap grew or pages were held, and how much of
@@ -82,9 +95,6 @@ pub fn allocator() -> Vec<(&'static str, u64)> {
 #[cfg(all(feature = "doors", not(all(target_os = "linux", target_env = "gnu"))))]
 pub fn allocator() -> Vec<(&'static str, u64)> { vec![] }
 
-/// Each background job and how many times it has failed (for `/metrics` and `/stats`).
-pub fn failures() -> Vec<(&'static str, u64)> { BG_FAILS.iter().map(|(k, c)| (*k, c.load(Relaxed))).collect() }
-
 #[cfg(feature = "doors")]
 pub async fn render(app: &App) -> anyhow::Result<String> {
     let mut out = String::new();
@@ -96,25 +106,26 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     };
     let one = |v: f64| vec![(String::new(), v)];
     let get = |c: &AtomicU64| c.load(Relaxed) as f64;
+    let m = &app.lake.node.metrics; // (the node's own: `Metrics`)
     let role = if app.members.reader() { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
     metric("role", "gauge", "1 for this node's role", &[(format!("{{role=\"{role}\"}}"), 1.0)]);
     metric("nodes", "gauge", "live nodes in the cluster", &one(app.members.nodes().len() as f64));
     metric("visible_segment", "gauge", "newest log segment readable here", &one(app.lake.visible() as f64));
-    metric("rows_in_total", "counter", "rows taken into the log here", &one(get(&ROWS_IN)));
-    metric("queries_total", "counter", "SQL queries run here", &one(get(&QUERIES)));
-    metric("query_errors_total", "counter", "SQL queries that failed", &one(get(&QUERY_ERRORS)));
+    metric("rows_in_total", "counter", "rows taken into the log here", &one(get(&m.rows_in)));
+    metric("queries_total", "counter", "SQL queries run here", &one(get(&m.queries)));
+    metric("query_errors_total", "counter", "SQL queries that failed", &one(get(&m.query_errors)));
     metric("queries_running", "gauge", "SQL queries running here now, each on one of PONDRA_QUERIES' turns", &one(get(&RUNNING)));
     metric("queries_waiting", "gauge", "SQL queries waiting here for a turn", &one(get(&WAITING)));
-    metric("query_seconds_total", "counter", "time spent in SQL queries", &one(get(&QUERY_US) / 1e6));
-    metric("spread_queries_total", "counter", "queries run across the cluster from here", &one(get(&SPREAD)));
-    metric("shuffled_queries_total", "counter", "…of them with a shuffle", &one(get(&SHUFFLED)));
-    metric("ranged_queries_total", "counter", "…of them with their tables sliced by a key's ranges", &one(get(&RANGED)));
-    metric("files_scanned_total", "counter", "Parquet files queries read", &one(get(&FILES_SCANNED)));
+    metric("query_seconds_total", "counter", "time spent in SQL queries", &one(get(&m.query_us) / 1e6));
+    metric("spread_queries_total", "counter", "queries run across the cluster from here", &one(get(&m.spread)));
+    metric("shuffled_queries_total", "counter", "…of them with a shuffle", &one(get(&m.shuffled)));
+    metric("ranged_queries_total", "counter", "…of them with their tables sliced by a key's ranges", &one(get(&m.ranged)));
+    metric("files_scanned_total", "counter", "Parquet files queries read", &one(get(&m.files_scanned)));
     metric("catalog_records_total", "counter", "catalog records this node read and wrote", &[("{op=\"read\"}".to_string(), get(&CATALOG_READS)), ("{op=\"write\"}".to_string(), get(&CATALOG_WRITES))]);
-    metric("files_skipped_total", "counter", "Parquet files queries skipped by min/max, unopened", &one(get(&FILES_SKIPPED)));
+    metric("files_skipped_total", "counter", "Parquet files queries skipped by min/max, unopened", &one(get(&m.files_skipped)));
     let requests = [("write", &OBJECT_WRITES), ("list", &OBJECT_LISTS), ("delete", &OBJECT_DELETES), ("read", &OBJECT_READS)].map(|(op, c)| (format!("{{op=\"{op}\"}}"), get(c)));
     metric("object_requests_total", "counter", "requests this process made of its bucket, past the SSD tier: writes (a multipart upload's start, parts and end each one), lists, deletes and reads, as a bucket bills and rate-limits them", &requests);
-    metric("background_failures_total", "counter", "background jobs (tiering, publishing, emission, tasks, checkpoints) that failed; a rising count is a stall to look at", &failures().iter().map(|(k, n)| (format!("{{job=\"{k}\"}}"), *n as f64)).collect::<Vec<_>>());
+    metric("background_failures_total", "counter", "background jobs (tiering, publishing, emission, tasks, checkpoints) that failed; a rising count is a stall to look at", &m.failures().iter().map(|(k, n)| (format!("{{job=\"{k}\"}}"), *n as f64)).collect::<Vec<_>>());
     let turns = crate::budget::turns();
     let label = |b: &str, l: &str| format!("{{bucket=\"{b}\",lake=\"{l}\"}}");
     metric("bucket_turns", "gauge", "requests this node may have at once at a bucket, or at another lake in it it reads (a branch's base: a quarter)", &turns.iter().map(|(b, l, n, _)| (label(b, l), *n as f64)).collect::<Vec<_>>());
@@ -124,7 +135,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("shuffle_spilled_bytes_total", "counter", "shuffle rows written to this node's disk", &one(get(&SPILLED)));
     metric("shuffle_disk_bytes", "gauge", "shuffle buckets on this node's disk now", &one(crate::spill::held() as f64));
     metric("shuffle_skew", "gauge", "worst bucket vs the average one in a shuffle here (1 = even)", &one(get(&SKEW) / 100.0));
-    metric("skew_splits_total", "counter", "hot partitions of shuffled joins shared out over the nodes", &one(get(&SKEW_SPLITS)));
+    metric("skew_splits_total", "counter", "hot partitions of shuffled joins shared out over the nodes", &one(get(&m.skew_splits)));
     metric("shuffle_received_bytes_total", "counter", "shuffle bytes this node's steps read", &one(get(&RECEIVED)));
     metric("wire_bytes_total", "counter", "bytes other nodes sent this node, compressed as sent", &one(get(&WIRE)));
     metric("shuffle_wait_seconds_total", "counter", "time this node's steps waited for other nodes' buckets", &one(get(&WAIT_US) / 1e6));
@@ -198,4 +209,24 @@ pub async fn tables(app: &App) -> anyhow::Result<String> {
     }
     metric("published_state_bytes", "size of what the catalog keeps about a published table", &published);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Two nodes in one process count apart: a query, a row and a failed publish on one leave the other's at 0, and a
+    /// node starts at 0 whatever ran before it.
+    #[test]
+    fn two_nodes_count_apart() {
+        let (one, other) = (crate::node_state::NodeState::unhosted(), crate::node_state::NodeState::unhosted());
+        super::add(&one.metrics.queries, 1);
+        super::add(&one.metrics.rows_in, 3);
+        one.metrics.job_failed("publish");
+        one.metrics.job_failed("no such job");
+        let (m, n) = (&one.metrics, &other.metrics);
+        assert_eq!((super::get(&m.queries), super::get(&m.rows_in)), (1, 3));
+        assert_eq!(m.failures().iter().filter(|(_, n)| *n > 0).collect::<Vec<_>>(), [&("publish", 1)]);
+        assert_eq!((super::get(&n.queries), super::get(&n.rows_in)), (0, 0));
+        assert!(n.failures().iter().all(|(_, n)| *n == 0));
+        assert_eq!(super::get(&crate::node_state::NodeState::unhosted().metrics.queries), 0);
+    }
 }

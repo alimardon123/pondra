@@ -397,10 +397,10 @@ fn qualified(e: &ast::Expr) -> Option<(String, String)> {
 /// `s.id` a DECIMAL compares as decimals and matches no row, but the value inserted is cast to the key's type (2.5 becomes
 /// 2, a row that's there): so such a MERGE's keys are checked by lookups, as a plain INSERT's are. The source's types are
 /// those its columns have, planned with `LIMIT 0`.
-async fn compared_as_keys(lake: &Lake, meta: &TableMeta, sources: &[(String, (String, String))], m: &Merge, upto: u64) -> Result<bool> {
+async fn compared_as_keys(lake: &Lake, meta: &TableMeta, sources: &[(String, (String, String))], m: &Merge, upto: u64, scope: &crate::rights::Scope) -> Result<bool> {
     let cols: Vec<String> = sources.iter().map(|(_, (a, c))| format!("{}.{}", q(a), q(c))).collect();
     let sql = format!("SELECT {} FROM {} LIMIT 0", cols.join(", "), m.source);
-    let ctx = session(lake, &sql, upto).await?;
+    let ctx = session(lake, &sql, upto, scope).await?;
     let df = ctx.sql(&sql).await?;
     let schema = crate::query::run_schema(&ctx, df.logical_plan())?; // (the types the query gives: a literal's as the analyzer types it)
     let fields = schema.fields();
@@ -489,8 +489,8 @@ tokio::task_local! {
 
 /// A session for the change's queries, as of `upto`. Under a MERGE's clauses (`PROPOSED`), it holds the proposed rows as
 /// `__pondra_proposed`, registered as `query::SENT`'s tables are.
-async fn session(lake: &Lake, sql: &str, upto: u64) -> Result<datafusion::prelude::SessionContext> {
-    let ctx = crate::query::session_at(lake, sql, "", Some(upto)).await?;
+async fn session(lake: &Lake, sql: &str, upto: u64, scope: &crate::rights::Scope) -> Result<datafusion::prelude::SessionContext> {
+    let ctx = crate::query::session_for(lake, sql, "", Some(upto), scope).await?;
     let ctx = if FILES.try_with(|f| *f).unwrap_or(false) { crate::engine::with_files(ctx) } else { ctx };
     if let Ok(rows) = PROPOSED.try_with(|r| r.clone()) {
         ctx.deregister_table(PROPOSED_TABLE)?;
@@ -503,10 +503,10 @@ async fn session(lake: &Lake, sql: &str, upto: u64) -> Result<datafusion::prelud
 /// `write::rows_of` with `How::Load`: shaped for the table's rules as of `at`). Both paths of an upsert take them from here:
 /// `txn::upsert_point` for a one-row upsert, before its locks, and `merge`. `meta` is the table as SQL names it, `rules` its
 /// rules, `given` the columns the rows give (`Upsert::given`).
-pub(crate) async fn proposed_rows(lake: &Lake, name: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, given: &[String], query: &str, at: u64) -> Result<RecordBatch> {
+pub(crate) async fn proposed_rows(lake: &Lake, name: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, given: &[String], query: &str, at: u64, scope: &crate::rights::Scope) -> Result<RecordBatch> {
     let sql = crate::write::whole_rows_of(lake, name, meta, given, query).await?;
     let files = FILES.try_with(|f| *f).unwrap_or(false); // (as the planned MERGE reads its files: `session`)
-    Ok(crate::write::rows_of(lake, lake, rules, name, &sql, Some(at), files, crate::rules::How::Load).await?.into_rows())
+    Ok(crate::write::rows_of(lake, lake, rules, name, &sql, Some(at), files, crate::rules::How::Load, scope).await?.into_rows())
 }
 
 /// `rows` keeping each conflict key's first row, in the rows' order, and every row NULL in a conflict column (NULLs never
@@ -522,7 +522,7 @@ fn first_of_each(rows: &RecordBatch, on: &[String]) -> Result<RecordBatch> {
 
 /// Leader: carry out an UPDATE or DELETE of an append table, or a MERGE into any table (`sql`),
 /// under the lake's lock. A retried `job` changes nothing twice.
-pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<Value> {
+pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let stmt = crate::write::parse(sql).context("not an UPDATE, DELETE or MERGE")?;
     let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
     if let Some(other) = other {
@@ -557,12 +557,12 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
     }
     let (old, new) = match (point, &stmt) {
         (Some(p), _) => p,
-        (None, crate::write::Stmt::Insert(_, query)) => (vec![], vec![inserted(lake, &table, &stored, query, upto).await?]),
+        (None, crate::write::Stmt::Insert(_, query)) => (vec![], vec![inserted(lake, &table, &stored, query, upto, scope).await?]),
         (None, crate::write::Stmt::InsertInto(t, names, query)) => {
             let query = crate::write::whole_rows(lake, t, names, query).await?;
-            (vec![], vec![inserted(lake, &table, &stored, &query, upto).await?])
+            (vec![], vec![inserted(lake, &table, &stored, &query, upto, scope).await?])
         }
-        (None, _) => rows_of(lake, &table, &meta, &stored.rules()?, &stmt, upto).await?,
+        (None, _) => rows_of(lake, &table, &meta, &stored.rules()?, &stmt, upto, scope).await?,
     };
     // Only a change that takes rows back asks what follows the table: one of no rows is answered as
     // Postgres does (DELETE 0), and one that only adds rows (an INSERT, a MERGE that matched none)
@@ -584,7 +584,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
         crate::write::Stmt::Insert(..) | crate::write::Stmt::InsertInto(..) => true,
         crate::write::Stmt::Merge(m) if m.upsert.is_some() => !m.on_key(&meta),
         crate::write::Stmt::Merge(m) => match m.key_sources(&meta) {
-            Some(sources) => !(m.on_key(&meta) && compared_as_keys(lake, &meta, &sources, m, upto).await?),
+            Some(sources) => !(m.on_key(&meta) && compared_as_keys(lake, &meta, &sources, m, upto, scope).await?),
             None => true,
         },
         _ => false,
@@ -599,23 +599,23 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
 
 /// A plain INSERT's rows into `table` (one with an enforced UNIQUE: `constraints.rs`), as of `upto`, shaped once
 /// (`write::rows`, `How::Insert`: no key twice among them).
-async fn inserted(lake: &Lake, table: &str, stored: &std::sync::Arc<TableMeta>, query: &str, upto: u64) -> Result<RecordBatch> {
+async fn inserted(lake: &Lake, table: &str, stored: &std::sync::Arc<TableMeta>, query: &str, upto: u64, scope: &crate::rights::Scope) -> Result<RecordBatch> {
     let rules = stored.rules()?;
-    Ok(crate::write::rows(lake, &session(lake, query, upto).await?, &rules, table, query, crate::rules::How::Insert).await?.into_rows())
+    Ok(crate::write::rows(lake, &session(lake, query, upto, scope).await?, &rules, table, query, crate::rules::How::Insert).await?.into_rows())
 }
 
 /// What an UPDATE, DELETE or MERGE of `table` changes, as of commit `upto`: the old versions of
 /// the rows it replaces (with their `_row_id`, `_created_at` and `_version`), and the new versions
 /// (keeping their `_row_id` and `_created_at`) and new rows. A temporary table's too (`temp.rs`). `rules` are the table's,
 /// as its entry gives them (`TableMeta::rules`): a MERGE's proposed rows are shaped for them.
-pub async fn rows_of(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, stmt: &crate::write::Stmt, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+pub async fn rows_of(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, stmt: &crate::write::Stmt, upto: u64, scope: &crate::rights::Scope) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
     Ok(match stmt {
         crate::write::Stmt::Update(_, set, cond) => {
             crate::txn::refuse_change(lake, table, meta, stmt).await?;
-            update(lake, table, meta, set, cond, upto).await?
+            update(lake, table, meta, set, cond, upto, scope).await?
         }
-        crate::write::Stmt::Delete(_, cond) => (select(lake, table, meta, &[], &format!("FROM {} {}", from(table), filter(cond)), upto).await?.0, vec![]),
-        crate::write::Stmt::Merge(m) => merge(lake, table, meta, rules, m, upto).await?,
+        crate::write::Stmt::Delete(_, cond) => (select(lake, table, meta, &[], &format!("FROM {} {}", from(table), filter(cond)), upto, scope).await?.0, vec![]),
+        crate::write::Stmt::Merge(m) => merge(lake, table, meta, rules, m, upto, scope).await?,
         _ => bail!("not an UPDATE, DELETE or MERGE"),
     })
 }
@@ -624,21 +624,21 @@ fn from(table: &str) -> String { format!("{} AS {}", crate::write::sql_name(tabl
 
 fn filter(cond: &Option<String>) -> String { cond.as_ref().map(|w| format!("WHERE {w}")).unwrap_or_default() }
 
-async fn update(lake: &Lake, table: &str, meta: &TableMeta, set: &[(String, String)], cond: &Option<String>, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+async fn update(lake: &Lake, table: &str, meta: &TableMeta, set: &[(String, String)], cond: &Option<String>, upto: u64, scope: &crate::rights::Scope) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
     ensure!(set.iter().all(|(c, _)| meta.columns().any(|(n, _)| n == c) && c != "_deleted"), "UPDATE sets the table's own columns");
     ensure!(set.iter().all(|(c, _)| !crate::text::NAMES.contains(&c.as_str())), "system columns can't be set");
-    select(lake, table, meta, set, &format!("FROM {} {}", from(table), filter(cond)), upto).await
+    select(lake, table, meta, set, &format!("FROM {} {}", from(table), filter(cond)), upto, scope).await
 }
 
 /// The old versions of the rows `rest` (FROM … WHERE …) selects, and, with `set`, their new ones.
-async fn select(lake: &Lake, table: &str, meta: &TableMeta, set: &[(String, String)], rest: &str, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
-    select_as(lake, meta, Some(set).filter(|s| !s.is_empty()), None, rest, upto, &q(table.rsplit('.').next().unwrap_or(table))).await
+async fn select(lake: &Lake, table: &str, meta: &TableMeta, set: &[(String, String)], rest: &str, upto: u64, scope: &crate::rights::Scope) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+    select_as(lake, meta, Some(set).filter(|s| !s.is_empty()), None, rest, upto, &q(table.rsplit('.').next().unwrap_or(table)), scope).await
 }
 
 /// One query of a change: target rows (old versions: `a`'s columns), and their new versions
 /// (`set`) or new rows (`insert`: values for the table's columns).
 #[allow(clippy::too_many_arguments)]
-async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)]>, insert: Option<&[String]>, rest: &str, upto: u64, a: &str) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)]>, insert: Option<&[String]>, rest: &str, upto: u64, a: &str, scope: &crate::rights::Scope) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
     let cols: Vec<&str> = meta.columns().map(|(c, _)| c).collect();
     let mut items = vec![];
     if insert.is_none() {
@@ -657,7 +657,7 @@ async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)
         items.extend(cols.iter().zip(values).map(|(c, v)| format!("({}) AS {}", crate::rules::rows::value(meta, c, v), q(&format!("__n_{c}")))));
     }
     let sql = format!("SELECT {} {rest}", items.join(", "));
-    let ctx = session(lake, &sql, upto).await?;
+    let ctx = session(lake, &sql, upto, scope).await?;
     let batches = crate::engine::sql(&ctx, &crate::asof::as_of(&sql)?).await?.collect().await?;
     let Some(first) = batches.first() else { return Ok((vec![], vec![])) };
     let all = concat_batches(&first.schema(), &batches)?;
@@ -685,7 +685,7 @@ fn part(all: &RecordBatch, meta: &TableMeta, prefix: &str, ids: bool) -> Result<
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?)
 }
 
-async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, m: &Merge, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, m: &Merge, upto: u64, scope: &crate::rights::Scope) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
     let what = if m.upsert.is_some() { "INSERT … ON CONFLICT" } else { "MERGE" };
     // (read from the statement before `m` is rebound to the MERGE it becomes below, whose `upsert` is None)
     let upsert = m.upsert.is_some();
@@ -696,7 +696,7 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
         Some(u) => {
             let given = u.given(meta, &m.target)?; // (its width and conflict columns are checked before its rows are worked out)
             let on = u.on_columns(meta, &m.target)?;
-            let mut rows = proposed_rows(lake, table, meta, rules, &given, &u.query, upto).await?;
+            let mut rows = proposed_rows(lake, table, meta, rules, &given, &u.query, upto, scope).await?;
             // (one row of VALUES, an ORM's upsert, can't repeat a key: its rows aren't looked at for one)
             if !crate::rules::rows::one_row(&u.query) && crate::rules::keys::twice(&rows, &on, &[])?.is_some() {
                 // A DO UPDATE refuses a key a second time, as Postgres does; Postgres lets a second row through when the first
@@ -717,7 +717,7 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
     // however many match it, as Postgres does. An upsert's keys are unique by now (`first_of_each`, or refused above).
     if !m.semi && !upsert {
         let twice = format!("SELECT {a}.{} FROM {t} JOIN {s} ON {on} GROUP BY 1 HAVING count(*) > 1 LIMIT 1", q(ROW_ID));
-        let ctx = session(lake, &twice, upto).await?;
+        let ctx = session(lake, &twice, upto, scope).await?;
         if ctx.sql(&twice).await?.count().await? > 0 {
             if merge_stmt {
                 return Err(crate::codes::coded("21000", "MERGE command cannot affect row a second time: ensure that not more than one source row matches any one target row"));
@@ -747,9 +747,9 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
                         return Err(crate::codes::coded("0A000", format!("{what}: UPDATE of {table}'s key column {c} isn't taken here: delete the row, then insert it with its new key")));
                     }
                     ensure!(set.iter().all(|(c, _)| meta.columns().any(|(n, _)| n == c) && !crate::text::NAMES.contains(&c.as_str())), "{}: UPDATE sets the table's own columns", what);
-                    select_as(lake, meta, Some(set), None, &rest, upto, &a).await?
+                    select_as(lake, meta, Some(set), None, &rest, upto, &a, scope).await?
                 }
-                (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a).await?,
+                (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a, scope).await?,
                 (Action::Insert(columns, values), _) => {
                     // (no list: the table's first columns, as many as the values, as an INSERT's: `write::implicit`)
                     let given = if columns.is_empty() { crate::write::implicit(&meta.sql_names(), Some(values.len())).to_vec() } else { columns.clone() }; // (SQL's order)
@@ -760,7 +760,7 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
                     ensure!(given.iter().all(|c| meta.columns().any(|(n, _)| n == c)), "MERGE: INSERT names the table's own columns");
                     // (a column the clause leaves out takes its default, as `select_as` gives it: NULL with none)
                     let values: Vec<String> = meta.columns().map(|(c, _)| given.iter().position(|g| g == c).map_or("DEFAULT".into(), |i| values[i].clone())).collect();
-                    select_as(lake, meta, None, Some(&values), &rest, upto, &a).await?
+                    select_as(lake, meta, None, Some(&values), &rest, upto, &a, scope).await?
                 }
             };
             old.extend(o);
@@ -1042,7 +1042,7 @@ pub type Sent = Vec<(String, String)>;
 /// leader: the target as that lake names it, and each other relation it reads that the leader
 /// can't — another lake's table or view, a file or table function here, this session's temporary
 /// tables — read here and sent with it, as `__sent_1`, … (under the name the statement gave it).
-pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str, sql: &str, files: bool) -> Result<(String, Sent)> {
+pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str, sql: &str, files: bool, scope: &crate::rights::Scope) -> Result<(String, Sent)> {
     use datafusion::sql::sqlparser::{ast::*, dialect::GenericDialect, parser::Parser};
     use std::collections::{HashMap, HashSet};
     use std::ops::ControlFlow;
@@ -1104,7 +1104,7 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
         };
         if here {
             let read = format!("SELECT * FROM {k}");
-            let ctx = crate::query::session(query, &read, "").await?;
+            let ctx = crate::query::session_for(query, &read, "", None, scope).await?;
             let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
             let batches = ctx.sql(&crate::sys::planned(&read)?).await?.collect().await.with_context(|| format!("reading {k} for the change"))?;
             let alias = if rows_of_call { None } else { name.0.last().and_then(|p| p.as_ident()).map(|i| i.value.clone()) }; // (a table's name stays its rows' name)

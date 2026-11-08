@@ -898,10 +898,10 @@ fn comment_of(rest: &str) -> Result<(String, Option<String>)> {
 }
 
 /// Leader: carry one out (under the lake's lock).
-pub async fn apply(lake: &Lake, op: Op) -> Result<Value> {
+pub async fn apply(lake: &Lake, op: Op, scope: &Scope) -> Result<Value> {
     match op {
-        Op::Comment { kind, name, text, if_exists } => comment(lake, &kind, &name, text, if_exists).await,
-        Op::OrAlterTable { name, sql } => or_alter(lake, &name, &sql).await,
+        Op::Comment { kind, name, text, if_exists } => comment(lake, &kind, &name, text, if_exists, scope).await,
+        Op::OrAlterTable { name, sql } => or_alter(lake, &name, &sql, scope).await,
     }
 }
 
@@ -945,7 +945,7 @@ async fn there(lake: &Lake, key: &str) -> Result<bool> {
     })
 }
 
-async fn comment(lake: &Lake, word: &str, name: &str, text: Option<String>, if_exists: bool) -> Result<Value> {
+async fn comment(lake: &Lake, word: &str, name: &str, text: Option<String>, if_exists: bool, scope: &Scope) -> Result<Value> {
     let key = match word {
         "column" => {
             let (table, column) = name.rsplit_once('.').context("COMMENT ON COLUMN table.column")?;
@@ -953,7 +953,7 @@ async fn comment(lake: &Lake, word: &str, name: &str, text: Option<String>, if_e
             let meta = lake.cat.get::<TableMeta>(&table_key(&table)).await?.filter(|_| !crate::sys::hidden(&table));
             let stored = match &meta {
                 Some(m) => m.stored(column).map(str::to_string),
-                None => view_columns(lake, &table).await?.and_then(|c| c.into_iter().find(|c| c == column)),
+                None => view_columns(lake, &table, scope).await?.and_then(|c| c.into_iter().find(|c| c == column)),
             };
             match stored {
                 Some(s) => format!("column/{table}/{s}"),
@@ -978,15 +978,16 @@ async fn comment(lake: &Lake, word: &str, name: &str, text: Option<String>, if_e
     Ok(j!({word: name, "comment": text}))
 }
 
-/// A (stored) view's columns as its query names them now, or None for no such view. (Boxed: planning
+/// A (stored) view's columns as its query names them now, or None for no such view, planned for `scope` (the statement's
+/// asker). (Boxed: planning
 /// it expands SQL, which may show a SHOW CREATE, which comes back here.)
-fn view_columns<'a>(lake: &'a Lake, view: &'a str) -> BoxFuture<'a, Result<Option<Vec<String>>>> {
+fn view_columns<'a>(lake: &'a Lake, view: &'a str, scope: &'a Scope) -> BoxFuture<'a, Result<Option<Vec<String>>>> {
     Box::pin(async move {
         if lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(view)).await?.is_none() {
             return Ok(None);
         }
         let sql = format!("SELECT * FROM {} LIMIT 0", name_sql(view));
-        let df = crate::engine::sql(&crate::query::session(lake, &sql, "").await?, &sql).await?;
+        let df = crate::engine::sql(&crate::query::session_for(lake, &sql, "", None, scope).await?, &sql).await?;
         Ok(Some(df.schema().fields().iter().map(|f| f.name().clone()).collect()))
     })
 }
@@ -1041,11 +1042,11 @@ pub async fn follow(lake: &Lake, out: &Value) -> Result<()> {
 /// added at the end, types widened, its layout and options as written (one left out is taken
 /// away). What would lose rows or change what they mean is refused, with the statement that does
 /// it on purpose.
-async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
+async fn or_alter(lake: &Lake, name: &str, sql: &str, scope: &Scope) -> Result<Value> {
     use crate::write::{parse, Stmt};
     let Some(Stmt::Create(create)) = parse(sql) else { bail!("CREATE OR ALTER TABLE: a table's columns") };
     let table = local(lake, name, "relation").await?;
-    let spec = crate::write::create_spec(&create, lake, false).await?;
+    let spec = crate::write::create_spec(&create, lake, false, scope).await?;
     let Some(old) = lake.cat.get::<TableMeta>(&table_key(&table)).await? else {
         let out = crate::write::create_table(lake, &table, &spec).await?;
         return Ok(j!({"table": out["table"], "created": true}));
@@ -1100,7 +1101,7 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
     for ((c, t), (_, new)) in was.iter().zip(&columns) {
         if crate::answer::dtype(t).ok() != crate::answer::dtype(new).ok() || sql_types.get(c) != old.col(c).and_then(|h| h.held.as_ref()) {
             let written = create.columns.iter().find(|d| d.name.value == *c || d.name.value.to_lowercase() == *c).map_or_else(|| sql_type(new), |d| d.data_type.to_string());
-            Box::pin(crate::ddl::apply(lake, Ddl::AlterColumn { table: table.clone(), column: c.clone(), change: crate::ddl::Change::Type(written) })).await?;
+            Box::pin(crate::ddl::apply(lake, Ddl::AlterColumn { table: table.clone(), column: c.clone(), change: crate::ddl::Change::Type(written) }, scope)).await?;
             changed.push(format!("{c} {}", sql_type(new)));
         }
     }
@@ -1198,7 +1199,7 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
     if o.family() == "relation" && o.lake == here {
         let meta = lake.cat.meta(&table_key(&o.local())).await?;
         let view = match meta {
-            None => view_columns(lake, &o.local()).await?,
+            None => view_columns(lake, &o.local(), &scope).await?,
             Some(_) => None,
         };
         for (k, text) in lake.cat.scan::<String>(&format!("cm/column/{}/", o.local()), &format!("cm/column/{}0", o.local())).await? {

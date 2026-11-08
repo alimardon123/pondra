@@ -238,7 +238,7 @@ pub fn names(sql: &str) -> Vec<String> {
 
 /// Carry out a `DECLARE`, an assignment or a `RESET VARIABLE`: the value worked out once, as the
 /// caller, and kept.
-pub async fn apply(app: &App, c: Change) -> Result<Outcome> {
+pub async fn apply(app: &App, c: Change, scope: &crate::rights::Scope) -> Result<Outcome> {
     let (name, var) = match c {
         Change::Reset(name) => {
             take(&name);
@@ -248,7 +248,7 @@ pub async fn apply(app: &App, c: Change) -> Result<Outcome> {
         Change::Set { name, value } => {
             ensure!(!value.is_empty(), "${name} = what? (`${name} = current_date - 1`)");
             let declared = vars(|m| m.get(&name).and_then(|v| v.declared.clone()))?;
-            let v = evaluate(app, &value, declared.as_deref().map(Cast::Sql)).await.with_context(|| match &declared {
+            let v = evaluate(app, &value, declared.as_deref().map(Cast::Sql), scope).await.with_context(|| match &declared {
                 Some(t) => format!("${name} is {t}"),
                 None => format!("${name}"),
             })?;
@@ -266,17 +266,17 @@ pub async fn apply(app: &App, c: Change) -> Result<Outcome> {
             let v = match (given, &default) {
                 (Some(given), _) => {
                     let arrow = match (&ty, &default) {
-                        (None, Some(d)) => type_of(app, d).await, // (cast to its default's type)
+                        (None, Some(d)) => type_of(app, d, scope).await, // (cast to its default's type)
                         _ => None,
                     };
                     let to = ty.as_deref().map(Cast::Sql).or(arrow.as_deref().map(Cast::Arrow));
-                    evaluate(app, &crate::routines::literal(&given)?.to_string(), to).await.with_context(|| format!("the value given for ${name}"))?
+                    evaluate(app, &crate::routines::literal(&given)?.to_string(), to, scope).await.with_context(|| format!("the value given for ${name}"))?
                 }
-                (None, Some(d)) => evaluate(app, d, ty.as_deref().map(Cast::Sql)).await.with_context(|| format!("${name}"))?,
-                (None, None) if !parameter => evaluate(app, "NULL", ty.as_deref().map(Cast::Sql)).await?, // (its own, no value yet: NULL, as SQL's DECLARE)
+                (None, Some(d)) => evaluate(app, d, ty.as_deref().map(Cast::Sql), scope).await.with_context(|| format!("${name}"))?,
+                (None, None) if !parameter => evaluate(app, "NULL", ty.as_deref().map(Cast::Sql), scope).await?, // (its own, no value yet: NULL, as SQL's DECLARE)
                 (None, None) => match (vars(|m| m.get(&name).cloned())?, &ty) {
                     (Some(v), None) => v,
-                    (Some(v), Some(t)) => evaluate(app, &v.sql, Some(Cast::Sql(t))).await.with_context(|| format!("${name}"))?,
+                    (Some(v), Some(t)) => evaluate(app, &v.sql, Some(Cast::Sql(t)), scope).await.with_context(|| format!("${name}"))?,
                     (None, _) => bail!("no value for ${name}: DECLARE PARAMETER ${name} has no default, so it must be given (CALL run('…', {name} => …), pondra run … --{name} …, or the bar above the file)"),
                 },
             };
@@ -294,14 +294,14 @@ enum Cast<'a> {
 }
 
 /// `expr`, worked out once (its `$name`s bound), cast as asked: one value.
-async fn evaluate(app: &App, expr: &str, cast: Option<Cast<'_>>) -> Result<Var> {
+async fn evaluate(app: &App, expr: &str, cast: Option<Cast<'_>>, scope: &crate::rights::Scope) -> Result<Var> {
     let e = match cast {
         Some(Cast::Sql(t)) => format!("CAST(({expr}) AS {t})"),
         Some(Cast::Arrow(t)) => format!("arrow_cast(({expr}), '{t}')"),
         None => format!("({expr})"),
     };
     let sql = crate::routines::prepare(&app.lake, &format!("SELECT {e} AS v"), &HashMap::new(), &HashMap::new()).await?;
-    let rows = answer(app, &sql).await?;
+    let rows = answer(app, &sql, scope).await?;
     let row = datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?;
     ensure!(row.num_rows() == 1, "a variable holds one value: {expr} gave {} rows", row.num_rows());
     var_of(&row)
@@ -310,11 +310,11 @@ async fn evaluate(app: &App, expr: &str, cast: Option<Cast<'_>>) -> Result<Var> 
 /// What `sql` answers. One that reads nothing (a script's `IF $i < 10`, `$i = $i + 1`) is planned
 /// and its values folded, as DataFusion folds constants, with no query run; anything else (a
 /// table, an aggregate, a function that may answer otherwise next time) runs as a query.
-pub async fn answer(app: &App, sql: &str) -> Result<Vec<RecordBatch>> {
+pub async fn answer(app: &App, sql: &str, scope: &crate::rights::Scope) -> Result<Vec<RecordBatch>> {
     if let Some(rows) = folded(&app.lake, sql).await {
         return Ok(rows);
     }
-    Box::pin(app.query(sql, Some("0"))).await
+    Box::pin(app.query(sql, Some("0"), scope)).await
 }
 
 async fn folded(lake: &crate::store::Lake, sql: &str) -> Option<Vec<RecordBatch>> {
@@ -353,9 +353,9 @@ async fn folded(lake: &crate::store::Lake, sql: &str) -> Option<Vec<RecordBatch>
 
 /// The Arrow type of a default (planned, not run), for a value given in its place; None if it
 /// can't be planned yet (a table it reads made later in the file).
-async fn type_of(app: &App, default: &str) -> Option<String> {
+async fn type_of(app: &App, default: &str, scope: &crate::rights::Scope) -> Option<String> {
     let sql = crate::routines::prepare(&app.lake, &format!("SELECT ({default}) AS v LIMIT 0"), &HashMap::new(), &HashMap::new()).await.ok()?;
-    let rows = Box::pin(app.query(&sql, Some("0"))).await.ok()?;
+    let rows = Box::pin(app.query(&sql, Some("0"), scope)).await.ok()?;
     Some(rows.first()?.schema().field(0).data_type().to_string())
 }
 
