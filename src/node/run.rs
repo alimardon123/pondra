@@ -24,6 +24,9 @@ pub struct Options {
     pub(crate) guest: Option<Guest>,
     /// Its settings, read once: its process's as it is opened (`settings::Values::now`), after its flags are given.
     pub(crate) settings: crate::settings::Values,
+    /// Why its lake's last move out of memory failed (`memory::move_failed`): its host starts it again on the lake in
+    /// memory after one, and it says why (`NodeState::move_failed`). None once a move lands.
+    pub(crate) move_failed: Option<String>,
 }
 
 impl Options {
@@ -31,7 +34,7 @@ impl Options {
     /// library opens (ADR-061 §2).
     pub fn local(dir: &str, listen: &str) -> Options {
         Options { dir: dir.into(), listen: listen.into(), advertise: None, start: Start::default(),
-                  pg: None, kafka: None, kafka_advertise: None, flight: None, attach: vec![], attach_found: None, guest: None, settings: crate::settings::Values::now() }
+                  pg: None, kafka: None, kafka_advertise: None, flight: None, attach: vec![], attach_found: None, guest: None, settings: crate::settings::Values::now(), move_failed: None }
     }
 
     /// A guest for `dir`: the node a program starts for its own statements, which answers them and ends. No
@@ -44,7 +47,7 @@ impl Options {
         let guest = if crate::memory_lake::in_memory(dir) { Guest::Writes } else { guest };
         let auth = auth::Auth::from_env().owned_by(Some(uuid::Uuid::new_v4().simple().to_string()));
         Options { dir: dir.into(), listen: String::new(), advertise: None, start: Start { tier_secs: 0.0, auth: Arc::new(auth), ..Start::default() },
-                  pg: None, kafka: None, kafka_advertise: None, flight: None, attach, attach_found: None, guest: Some(guest), settings: crate::settings::Values::now() }
+                  pg: None, kafka: None, kafka_advertise: None, flight: None, attach, attach_found: None, guest: Some(guest), settings: crate::settings::Values::now(), move_failed: None }
     }
 }
 
@@ -174,7 +177,7 @@ impl Node {
     /// Everything `pondra serve` did before it served, then the HTTP door served on a task of its own.
     /// `held` takes what this start takes (the term, then the lake), so a stop during the start gives it back.
     pub(crate) async fn start(o: Options, held: Arc<Held>) -> anyhow::Result<Node> {
-        let Options { dir, listen, advertise, start, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest, settings } = o;
+        let Options { dir, listen, advertise, start, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest, settings, move_failed } = o;
         // (a guest answers one program's statements and ends: none of the loops and doors a node that lives keeps, so
         // every `lives` below keeps them for a node that lives only)
         let lives = guest.is_none();
@@ -185,6 +188,9 @@ impl Node {
         // (what this node does when it must stop or start again, and what its stop waits for: its lakes and its member hold it)
         let here = crate::node::native_with(!lives, settings);
         let _ = held.node.set(here.clone()); // (a stop drains and closes this node's door: `Held::stop`)
+        if let Some(why) = move_failed {
+            let _ = here.move_failed.set(why); // (its lake stayed in memory: `/stats` and `pondra.databases` say why)
+        }
         if lives {
             // (the spill folders of processes that ended, swept beside the start and not on it: a crashed one's may be
             // gigabytes, and a cold start waits for nothing but what serving needs, invariant 182)
