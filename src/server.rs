@@ -91,6 +91,7 @@ pub fn router(app: App) -> Router {
         }))
         .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::objects::listed(&app.lake).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
+        .route("/metrics/tables", get(|State(app): State<App>| async move { crate::metrics::tables(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
         .route("/cluster/log", get(feed))
         .route("/cluster/kv", get(kv))

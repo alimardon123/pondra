@@ -8,6 +8,7 @@
 answer base
 codes base
 column base
+dialect base
 env base
 lifecycle base
 node_state base
