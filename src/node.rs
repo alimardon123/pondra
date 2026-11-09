@@ -885,9 +885,12 @@ mod tests {
     /// The write-set rule (designs/redesign/redesign.md §4, step 5 piece 10e): a statement reads and writes the catalog
     /// records of what it names, not of every table. Among 2,000 tables, each reads and writes fewer than 50. (Here, with
     /// the node: a test in `write` may not start one, a floor below.)
-    #[tokio::test]
-    async fn a_statement_reads_and_writes_only_its_write_set() {
-        crate::auth::as_node(async {
+    #[test]
+    fn a_statement_reads_and_writes_only_its_write_set() {
+        // (on a node's runtime, whose threads have the 8 MB a request has: a CREATE TABLE AS SELECT's path takes about
+        // 2.5 MB in a release build, past the 2 MB of a test's own thread)
+        let rt = crate::spawns::runtime().build().unwrap();
+        rt.block_on(rt.spawn(crate::auth::as_node(async {
             let (app, marks) = lake_app().await;
             let (lake, counts) = (app.lake.clone(), app.lake.node.metrics.clone()); // (this lake's own counters: its node's)
             let spec = r#"{"columns": [["id", "Int64"], ["a", "Int64"]]}"#;
@@ -920,8 +923,8 @@ mod tests {
             }
             marks.abort(); // (a dropped handle aborts nothing: its mark would land again after the lake is gone)
             crate::memory_lake::forget_memory(&lake.url);
-        })
-        .await
+        })))
+        .unwrap();
     }
 
     /// The folder records the catalog keeps (`ddl::folder_hook`, step 5 piece 10c) say what every table says

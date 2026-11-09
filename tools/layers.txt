@@ -66,6 +66,8 @@ replica catalog
 scan catalog
 sketch catalog
 store catalog
+frozen catalog
+naming catalog
 pins catalog
 table_record catalog
 terms catalog
@@ -124,6 +126,7 @@ lateral_join engine
 late_rows engine
 layout engine
 learned engine
+lifted engine
 literals engine
 locks engine
 median engine

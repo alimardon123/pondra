@@ -106,6 +106,7 @@ mod pg_oids;
 mod pg_casts;
 mod pg_trace;
 pub mod pg_bytea;
+mod lifted;
 mod one_row;
 mod optimize;
 mod or_ranges;
@@ -261,6 +262,8 @@ mod table_record;
 #[cfg(feature = "lake")] mod status;
 #[cfg(feature = "lake")] mod kv;
 #[cfg(feature = "lake")] mod store;
+#[cfg(feature = "lake")] mod frozen; // (a backup takes writes from its runs alone: ADR-070)
+#[cfg(feature = "lake")] mod naming; // (what a lake and its objects may be called)
 #[cfg(feature = "lake")] mod pins;
 #[cfg(feature = "lake")] mod store_wire;
 #[cfg(feature = "doors")] mod sync;

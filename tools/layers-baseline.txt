@@ -107,7 +107,6 @@ lake_files -> ext_names  1
 lib -> wasm32  2
 locks -> dial  2
 log -> adopt  1
-log -> backup  4
 log -> constraints  3
 log -> copy  2
 log -> defaults  1
@@ -239,18 +238,14 @@ sso_flow -> crypto  2
 sso_flow -> tls  1
 statement -> pg_catalog  1
 statement -> python  1
-store -> audit  2
-store -> backup  6
-store -> branch  4
 store -> bridge  1
 store -> budget  2
 store -> copy  1
-store -> ddl  4
+store -> ddl  1
 store -> delta  1
 store -> engine  1
 store -> ext  2
 store -> finish  1
-store -> history  2
 store -> hot  2
 store -> in_task  1
 store -> locks  1
@@ -262,7 +257,6 @@ store -> serve  2
 store -> served  1
 store -> sys  1
 store -> types  2
-store -> users  2
 store -> wasm32  15
 store -> write  1
 store_wire -> store  1
