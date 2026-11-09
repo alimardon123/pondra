@@ -1540,10 +1540,12 @@ mod tests {
 
     #[test]
     fn statements() {
-        let p = |s: &str| match statement(s) {
+        // (read as the front reads it: CREATE, ALTER and DROP by the section's entries, GRANT and REVOKE by `statement`; null
+        // for a statement not users')
+        let p = |s: &str| match crate::statements::matched(s).or_else(|| statement(s)) {
             Some(crate::write::Stmt::Ddl(d)) => match &d[0] {
                 crate::ddl::Ddl::Users(c) => serde_json::to_value(c).unwrap(),
-                _ => panic!(),
+                _ => j!(null),
             },
             Some(crate::write::Stmt::Invalid(e)) => j!({"error": e}),
             Some(crate::write::Stmt::Refused(code, e)) => j!({"error": e, "code": code}),

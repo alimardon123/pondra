@@ -535,8 +535,10 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'
 mod tests {
     use super::*;
 
+    /// `sql`'s change, read as the front reads it (`write::parse`): CREATE, ALTER and DROP by the section's entries, GRANT
+    /// and REVOKE on SHARE by `statement`.
     fn change(sql: &str) -> Change {
-        match statement(sql) {
+        match crate::write::parse(sql) {
             Some(crate::write::Stmt::Ddl(mut d)) => match d.remove(0) {
                 crate::ddl::Ddl::Shares(c) => c,
                 _ => panic!("not a share's"),

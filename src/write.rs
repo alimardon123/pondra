@@ -2910,6 +2910,7 @@ pub(crate) mod was {
 
     /// A statement as these tests compare two: what it says, in words.
     fn shown(s: &Option<Stmt>) -> String {
+        static SALTED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#""verifier":\{[^{}]*\}"#).expect("a regex"));
         match s {
             None => "none".into(),
             Some(Stmt::UndropFile(p)) => format!("undrop file {p}"),
@@ -2921,7 +2922,8 @@ pub(crate) mod was {
             Some(Stmt::Delete(t, w)) => format!("delete {t} {w:?}"),
             Some(Stmt::AddColumn(t, c, ty, quiet, at)) => format!("add column {t} {c} {ty} {quiet} {}", serde_json::to_string(at).unwrap_or_default()),
             Some(Stmt::SetOptions(t, o)) => format!("set options {t} {o:?}"),
-            Some(Stmt::Ddl(d)) => format!("ddl {}", serde_json::to_string(d).unwrap_or_default()),
+            // (a password's verifier is salted afresh each time it is made: one password read twice shows as one)
+            Some(Stmt::Ddl(d)) => format!("ddl {}", SALTED.replace_all(&serde_json::to_string(d).unwrap_or_default(), r#""verifier":"…""#)),
             Some(Stmt::Merge(m)) => format!("merge {}", m.sql),
             Some(Stmt::Invalid(e)) => format!("invalid {e}"),
             Some(Stmt::Refused(c, e)) => format!("refused {c} {e}"),
@@ -2949,6 +2951,9 @@ pub(crate) mod was {
     fn every_text_reads_as_before() {
         let placeholder = regex::Regex::new(r"\{[\w:?#]*\}").expect("a regex"); // (a format string's `{}`: no SQL)
         let texts = crate::passes::tests::texts("|backup|restore|export|import|undrop");
+        // (texts the replaced readers misread, each refused now by its family's reader: a CLONE of no table, which the
+        // parser read as a table of no columns)
+        let misread = [("CREATE TABLE c CLONE", "invalid expected a name at the end (CREATE TABLE c [SHALLOW] CLONE t)")];
         let (mut same, mut core, mut refused_now, mut differ) = (0, 0, vec![], vec![]);
         for sql in texts.iter().filter(|t| one(t) && !placeholder.is_match(t)) {
             let (now, then) = (shown(&super::parse(sql)), shown(&was(sql)));
@@ -2958,12 +2963,15 @@ pub(crate) mod was {
                 same += 1;
             } else if by_core && then == "none" && (now.starts_with("invalid ") || now.starts_with("refused ")) {
                 refused_now.push((sql.clone(), now));
+            } else if misread.contains(&(sql.as_str(), now.as_str())) {
+                refused_now.push((sql.clone(), now));
             } else {
                 differ.push((sql.clone(), then, now));
             }
         }
         assert!(differ.is_empty(), "{} of {} texts read otherwise, the first: {:#?}", differ.len(), same + differ.len(), &differ[..differ.len().min(10)]);
         assert!(core >= 20, "the entries PR 8 moved read {core} texts of the corpus: too few to hold them to it");
+        assert!(misread.iter().all(|(t, _)| refused_now.iter().any(|(s, _)| s == t)), "each misread text is in the corpus, refused now");
         eprintln!("{same} texts read as before; {core} by the entries PR 8 moved; {} refused now by their family's reader: {refused_now:#?}", refused_now.len());
         for sql in [
             "CREATE OR REPLACE SCHEMA s", "create or replace user u password 'x'", "CREATE OR REPLACE ROLE r", "CREATE OR REPLACE SHARE s",
