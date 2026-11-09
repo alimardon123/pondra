@@ -1,7 +1,8 @@
 //! The parts of a table's catalog record (`store::TableMeta`) whose rules the floors above apply: what a write's rules
-//! see of it (`Table`, made by `TableMeta::to_rules`), its constraints, the files an `ext:` table reads, and a history
-//! view's key. The types are the catalog's, as the record that holds them is; what they mean is their owners'
-//! (`rules`, `constraints`, `ext_names`, `views`), whose code reads and makes them and names them as their own.
+//! see of it (`Table`, made by `TableMeta::to_rules`), its constraints, the files an `ext:` table reads, a history
+//! view's key, its columns' identities and enums, and a view's last step. The types are the catalog's, as the record
+//! that holds them is; what they mean is their owners' (`rules`, `constraints`, `ext_names`, `views`, `seq`, `types`,
+//! `finish`), whose code reads and makes them and names them as their own.
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::physical_expr::PhysicalExpr;
 use serde::{Deserialize, Serialize};
@@ -115,3 +116,45 @@ pub struct History {
     pub deletes: bool,
 }
 
+/// How a view's answers come from its table's merged rows: `sql` reads them as `__partial`, and
+/// answers `columns` (what listings, `pg_catalog` and MCP show of the view: `TableMeta::described`). What it means is
+/// `finish`'s.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Finish {
+    pub sql: String,
+    #[serde(default)]
+    pub columns: Vec<(String, String)>,
+}
+
+/// An identity column, as its table keeps it (its column's `identity`, `store::Col`). How it is said and numbered is
+/// `rules::create`'s and `seq`'s.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Identity {
+    pub always: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared: Vec<Opt>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sequence: String,
+}
+
+/// One option as written (`INCREMENT BY 2`, `NO MAXVALUE`, `AS integer`); a later one of a kind wins.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Opt {
+    As(String),
+    Increment(i64),
+    Min(Option<i64>),
+    Max(Option<i64>),
+    Start(i64),
+    Cache(i64),
+    Cycle(bool),
+}
+
+/// An enum column, as its table keeps it: the labels it takes, and the type it is of (none for
+/// `ENUM('a', 'b')` written in the column). What it takes is `types`'s.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Enum {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub of: Option<String>,
+    pub labels: Vec<String>,
+}

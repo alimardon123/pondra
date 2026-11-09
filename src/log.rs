@@ -1142,11 +1142,11 @@ pub fn encode_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
 /// The bytes of values per row slice of a batch: a batch takes one slice per this many, up to `slices_here`.
 const SLICE: usize = 8 << 20;
 
-/// The most row slices a batch takes on this machine: the node's own core budget (`store::partitions`, which
-/// `PONDRA_CORES` sets, capped by memory). One on a page: a thread spawn panics on wasm32.
+/// The most row slices a batch takes on this machine: the process's core budget (`store::partitions_of`, which
+/// `PONDRA_CORES` sets, capped by the process's memory for queries). One on a page: a thread spawn panics on wasm32.
 #[cfg(not(target_arch = "wasm32"))]
 fn slices_here() -> usize {
-    crate::store::partitions()
+    crate::store::partitions_of(crate::store::memory_limit())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1515,7 +1515,7 @@ mod tests {
     /// for the rest.
     #[test]
     fn kept_ms_is_by_kind_and_job() {
-        let (named, retry) = (crate::copy::retention_ms(), retry_ms());
+        let (named, retry) = (crate::store::retention_ms(), retry_ms());
         assert_eq!(retry, 2 * crate::locks::lease().as_secs().max(60) * 1000, "twice the lease, at least a minute");
         assert!(auto_job().starts_with("auto-"));
         assert_eq!(kept_ms(&format!("sql:{}", auto_job()), 0), retry, "a client's own id (log::auto_job)");
@@ -1664,7 +1664,7 @@ mod tests {
         let mut s = Seq::start(&lake, 0).await?;
         s.send(0, &[("kafka:z", 1)]).await;
         assert_eq!(expiry(&lake, retry_ms(), "sql:auto-py-a-1").await, Some(1), "a retry-window mark, due its window from the pass");
-        assert_eq!(expiry(&lake, crate::copy::retention_ms(), "sql:nightly").await, Some(3), "a named job's mark, due the named window");
+        assert_eq!(expiry(&lake, crate::store::retention_ms(), "sql:nightly").await, Some(3), "a named job's mark, due the named window");
         assert_eq!(expiry(&lake, retry_ms(), "kafka:k").await, None, "kept for good: no key");
         assert_eq!(lake.cat.get::<serde_json::Value>(OLD_MARKS).await?, Some(serde_json::json!("Done")), "the pass is finished");
         s.send(1, &[("kafka:z", 2)]).await;

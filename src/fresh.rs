@@ -49,7 +49,7 @@ impl Charged for Plans {
 /// table it reads, or a function that may answer otherwise next time (`now()`), plans it afresh.
 pub async fn run(lake: &Lake, source: &str, s: SchemaRef, rows: &[RecordBatch], sql: &str, kind: &str, prepare: impl FnOnce(LogicalPlan) -> Result<LogicalPlan>) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     let rows = rows.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?;
-    let parts = if rows.iter().map(|b| b.num_rows()).sum::<usize>() < 1 << 17 { 1 } else { crate::store::partitions() }; // (a flush's rows: one; a view's filling: every core)
+    let parts = if rows.iter().map(|b| b.num_rows()).sum::<usize>() < 1 << 17 { 1 } else { lake.partitions() }; // (a flush's rows: one; a view's filling: every core)
     let functions = lake.cat.scan_raw("f/", "f0").await?; // (a function replaced is planned again)
     let (plans, key) = (lake.state::<Plans>()?, format!("{kind}\0{sql}\0{:?}\0{parts}\0{:x}", s.fields(), fingerprint(&functions)));
     // (a kept plan is taken out while it runs, so two runs at once never share its operators' state, a window's held
