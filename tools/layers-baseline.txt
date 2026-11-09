@@ -93,7 +93,6 @@ inbox -> panics  2
 inbox -> write  1
 joined -> store  1
 kafka -> dial  5
-kafka -> reset  1
 kafka -> sso  3
 kafka -> tls  5
 kafka_client -> crypto  7
@@ -237,12 +236,10 @@ shares -> crypto  1
 shares -> delta  2
 sharing -> byte_range  1
 sharing -> read_delta  3
-sharing -> reset  1
 sharing -> tls  2
 sharing_client -> byte_range  1
 sharing_client -> fetch  4
 sharing_client -> read_delta  1
-sharing_client -> reset  1
 spmd -> dial  9
 sso -> crypto  6
 sso -> fetch  1
