@@ -254,6 +254,7 @@ mod rules;
 #[cfg(feature = "lake")] mod status;
 #[cfg(feature = "lake")] mod kv;
 #[cfg(feature = "lake")] mod store;
+#[cfg(feature = "lake")] mod pins;
 #[cfg(feature = "lake")] mod store_wire;
 #[cfg(feature = "doors")] mod sync;
 #[cfg(feature = "lake")] mod sys;
