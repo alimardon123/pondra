@@ -3238,7 +3238,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    materialized view is kept as the statement that makes it again (`Kept::made`, `objects::materialized_sql`): UNDROP
    runs it for the asker, so its rows are its sources' as they are then, and it follows new writes from there. Its
    UNDROP (its schema's too) answers once it is filled, as its CREATE does (`ddl::settle`). Only a DROP keeps one: a view
-   replaced, or one refused as it was made, isn't kept (`drop_view`'s `keep`), nor is a topic's view. `cargo test --lib undrop::`
+   replaced, or one refused as it was made, isn't kept (`drop_view`'s `keep`), nor is a topic's view. A dropped
+   database (one `pondra serve` serves, or a branch) keeps its folder as it was under a mark at its root
+   (`undrop::LAKE_MARK`, the truth every node reads): out of `ddl::lakes_in` and refused an attach or a node, until
+   `UNDROP DATABASE` takes the mark off (the server's `POST /databases/{name}/undrop`). A new database of its name lets it
+   go (that CREATE's notice says so); the server's ten-minute sweep, and a branch's base's hourly one, delete it once its
+   time is up, and a branch's pins keep its bases' files until then. `DROP DATABASE d PURGE` deletes it at once.
+   `cargo test --lib undrop::`
 
 ```bash
 cargo build --release
