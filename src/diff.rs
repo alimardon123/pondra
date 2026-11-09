@@ -5,6 +5,11 @@
 //! Either side is a table's or a view's name, as a string (`'prod.sales.orders'`), or a query (`(SELECT …)`).
 //! - Two tables match by their rows' `_row_id` and `_version` (ADR-020): a branch's rows keep both, so the rows both hold
 //!   alike match, and a row whose version moved is an update. The answer keeps both columns.
+//! - Two sides with a key match by it (Trellis T1b): the key `key => 'c1, c2'` names, else the one a side declares (a
+//!   table's PRIMARY KEY, or a view's PRIMARY KEY … NOT ENFORCED fact; `pondra.parts` lists both). A row of b's whose key
+//!   a lacks is an insert, one of a's whose key b lacks a delete, and a key both hold with another value in any other
+//!   column an update. Keys match NULL to NULL, and a side holding one key twice is refused (`21000`) unless the engine
+//!   keeps that key. Two tables match by row unless `key =>` is given.
 //! - Any other two match whole, as multisets: a row of b's that a lacks, or has fewer copies of, is an insert (once for
 //!   each copy more), and one of a's that b lacks a delete. They have no update rows.
 //!
@@ -15,6 +20,7 @@
 use crate::front::Host;
 use anyhow::Result;
 use datafusion::arrow::datatypes::DataType;
+use datafusion::common::ScalarValue;
 use datafusion::sql::sqlparser::ast::{self, Expr, Statement, TableFactor, Value, VisitorMut};
 use std::ops::ControlFlow;
 
@@ -54,6 +60,25 @@ impl Side {
     }
 }
 
+/// A call's arguments: its two sides, and the key's columns when `key =>` names them.
+#[derive(Clone, Debug, PartialEq)]
+struct Call {
+    a: Side,
+    b: Side,
+    key: Option<Vec<String>>,
+}
+
+/// How a call's two sides are matched.
+#[derive(Clone, Debug, PartialEq)]
+enum Match {
+    /// Two tables, by their rows' `_row_id` and `_version`.
+    Rows,
+    /// By these columns' values.
+    Key(Vec<String>),
+    /// Whole, as multisets.
+    Whole,
+}
+
 /// Each `pondra.diff(a, b)` in `stmts` as the query that answers it, innermost first (a side's query may diff too).
 /// Whether there was one.
 pub async fn rewrite<H: Host>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
@@ -65,8 +90,8 @@ pub async fn rewrite<H: Host>(host: &H, stmts: &mut [Statement]) -> Result<bool>
                 return Err(e);
             }
         }
-        let Some((a, b)) = first.found else { return Ok(any) };
-        let answer = crate::expander::parse_query(&Box::pin(answer_of(host, &a, &b)).await?)?; // (its sides are asked through the front again)
+        let Some(call) = first.found else { return Ok(any) };
+        let answer = crate::expander::parse_query(&Box::pin(answer_of(host, &call)).await?)?; // (its sides are asked through the front again)
         let mut put = Put { answer: Some(answer) };
         for s in stmts.iter_mut() {
             if let ControlFlow::Break(e) = crate::walk::visit_mut(s, &mut put) {
@@ -82,7 +107,7 @@ fn is_diff(t: &TableFactor) -> bool { matches!(t, TableFactor::Table { name, arg
 
 /// The first call to `pondra.diff` in the walk's order (a call's sides before it), with its sides.
 struct First {
-    found: Option<(Side, Side)>,
+    found: Option<Call>,
 }
 
 impl VisitorMut for First {
@@ -93,7 +118,7 @@ impl VisitorMut for First {
             return ControlFlow::Continue(());
         }
         let TableFactor::Table { args: Some(args), .. } = t else { return ControlFlow::Continue(()) };
-        match sides(&args.args) {
+        match call(&args.args) {
             Ok(s) => {
                 self.found = Some(s);
                 ControlFlow::Continue(())
@@ -122,13 +147,21 @@ impl VisitorMut for Put {
     }
 }
 
-/// A call's two sides: each a string naming a table or a view, or a query.
-fn sides(args: &[ast::FunctionArg]) -> Result<(Side, Side)> {
+/// A call's arguments: two sides, each a string naming a table or a view, or a query; and `key => 'c1, c2'`.
+fn call(args: &[ast::FunctionArg]) -> Result<Call> {
     static NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"^[\w"$]+(\.[\w"$]+){0,2}$"#).expect("a regex"));
-    const FORM: &str = "pondra.diff takes two sides, each a table's or a view's name or a query: pondra.diff('prod.sales.orders', 'dev.sales.orders')";
+    const FORM: &str = "pondra.diff takes two sides, each a table's or a view's name or a query, and a key: pondra.diff('prod.sales.orders', 'dev.sales.orders' [, key => 'id'])";
     let a = crate::text::args("pondra.diff", args)?;
-    if let Some((n, _)) = a.named.first() {
-        return Err(crate::codes::coded("42883", format!("pondra.diff has no argument {n}: {FORM}"))); // (as Postgres names a call it has no function for)
+    let mut key = None;
+    for (n, e) in &a.named {
+        match (n.to_ascii_lowercase().as_str(), e) {
+            ("key", Expr::Value(v)) if matches!(&v.value, Value::SingleQuotedString(_)) => {
+                let Value::SingleQuotedString(k) = &v.value else { unreachable!() };
+                key = Some(names(k).ok_or_else(|| crate::codes::coded("22023", format!("pondra.diff's key => names the key's columns: key => 'id, day', not '{k}'")))?);
+            }
+            ("key", _) => return Err(crate::codes::coded("22023", format!("pondra.diff's key => names the key's columns as text: key => 'id, day', not {e}"))),
+            _ => return Err(crate::codes::coded("42883", format!("pondra.diff has no argument {n}: {FORM}"))), // (as Postgres names a call it has no function for)
+        }
     }
     let side = |e: &Expr| -> Result<Side> {
         match e {
@@ -141,9 +174,29 @@ fn sides(args: &[ast::FunctionArg]) -> Result<(Side, Side)> {
         }
     };
     match a.given[..] {
-        [x, y] => Ok((side(x)?, side(y)?)),
+        [x, y] => Ok(Call { a: side(x)?, b: side(y)?, key }),
         _ => Err(crate::codes::coded("42883", FORM)),
     }
+}
+
+/// The column names a list says, `id, "Day"`, each as SQL reads it (bare, or in double quotes); None if one is empty.
+fn names(list: &str) -> Option<Vec<String>> {
+    let mut out = vec![];
+    let (mut name, mut quoted, mut chars) = (String::new(), false, list.chars().peekable());
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                chars.next();
+                name.push('"');
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => out.push(std::mem::take(&mut name)),
+            c => name.push(c),
+        }
+    }
+    out.push(name);
+    let out: Vec<String> = out.iter().map(|n| n.trim().to_string()).collect();
+    (!quoted && out.iter().all(|n| !n.is_empty())).then_some(out)
 }
 
 /// A side's columns, with their types, as `SELECT *` gives them, and whether it is a table whose rows keep their
@@ -161,10 +214,81 @@ async fn columns_of<H: Host>(host: &H, side: &Side) -> Result<(Vec<(String, Data
 }
 
 /// The query that answers `pondra.diff(a, b)`.
-async fn answer_of<H: Host>(host: &H, a: &Side, b: &Side) -> Result<String> {
+async fn answer_of<H: Host>(host: &H, call: &Call) -> Result<String> {
+    let (a, b) = (&call.a, &call.b);
     let ((of_a, rows_a), (of_b, rows_b)) = (columns_of(host, a).await?, columns_of(host, b).await?);
     let cols = alike(a, &of_a, b, &of_b)?;
-    Ok(answer(&a.from(), &b.from(), &cols, rows_a && rows_b))
+    let how = match &call.key {
+        None if rows_a && rows_b => Match::Rows,
+        given => {
+            let (kept_a, kept_b) = (declared(host, a).await?, declared(host, b).await?);
+            let key = match (given, &kept_a, &kept_b) {
+                (Some(k), _, _) => Some(k.clone()),
+                (None, Some((x, _)), Some((y, _))) if x != y => {
+                    return Err(crate::codes::coded("42P10", format!("pondra.diff matches rows by one key, and {}'s is ({}) and {}'s ({}): key => '{}' picks one", a.shown(), x.join(", "), b.shown(), y.join(", "), y.join(", "))));
+                }
+                (None, Some((x, _)), _) | (None, None, Some((x, _))) => Some(x.clone()),
+                (None, None, None) => None,
+            };
+            match key {
+                Some(key) => {
+                    if let Some(c) = key.iter().find(|c| !cols.contains(c)) {
+                        return Err(crate::codes::coded("42703", format!("pondra.diff's key: {c} is not a column of the two sides ({})", cols.join(", "))));
+                    }
+                    // (a side whose engine keeps this key holds each value once already: the other is counted)
+                    for (side, kept) in [(a, &kept_a), (b, &kept_b)] {
+                        if !matches!(kept, Some((k, true)) if *k == key) {
+                            once_each(host, side, &key).await?;
+                        }
+                    }
+                    Match::Key(key)
+                }
+                None => Match::Whole,
+            }
+        }
+    };
+    Ok(answer(&a.from(), &b.from(), &cols, &how))
+}
+
+/// A side's declared key, when it is a table's or a view's name: its PRIMARY KEY's columns (a table's key, or a fact
+/// said NOT ENFORCED), and whether the engine keeps it. Read from `pondra.parts`, which lists every database's objects.
+async fn declared<H: Host>(host: &H, side: &Side) -> Result<Option<(Vec<String>, bool)>> {
+    let Side::Name(n) = side else { return Ok(None) };
+    let Some(parts) = name_parts(n) else { return Ok(None) };
+    let text = |s: &String| Value::SingleQuotedString(s.clone()).to_string();
+    let (lake, schema, object) = match &parts[..] {
+        [l, s, o] => (text(l), text(s), text(o)),
+        [s, o] => ("current_database()".into(), text(s), text(o)),
+        [o] => ("current_database()".into(), "current_schema()".into(), text(o)),
+        _ => return Ok(None),
+    };
+    let sql = format!("SELECT definition FROM pondra.parts WHERE kind = 'key' AND lake = {lake} AND schema = {schema} AND object = {object} AND starts_with(definition, 'PRIMARY KEY (')");
+    let Ok(frame) = host.ask(&sql).await else { return Ok(None) }; // (a host that lists no parts declares no key)
+    let batches = host.collect(frame).await?;
+    let Some(def) = batches.iter().find(|b| b.num_rows() > 0).map(|b| ScalarValue::try_from_array(b.column(0), 0)).transpose()? else { return Ok(None) };
+    let def = def.to_string();
+    let Some((list, rest)) = def.strip_prefix("PRIMARY KEY (").and_then(|d| d.rsplit_once(')')) else { return Ok(None) };
+    Ok(names(list).map(|k| (k, rest.trim().is_empty()))) // (a fact ends NOT ENFORCED)
+}
+
+/// A name's parts, each as SQL reads it: `prod."Sales".orders` is prod, Sales, orders.
+fn name_parts(name: &str) -> Option<Vec<String>> { names(&name.replace('.', ",")).filter(|p| p.len() <= 3) }
+
+/// Refuses a side that holds one key's values on more than one row (`21000`, Postgres's for more rows than one where
+/// one was meant), naming the first: a keyed match pairs one row of a side with one of the other.
+async fn once_each<H: Host>(host: &H, side: &Side, key: &[String]) -> Result<()> {
+    let k = key.iter().map(|c| ast::Ident::with_quote('"', c).to_string()).collect::<Vec<_>>().join(", ");
+    let batches = host.collect(host.ask(&format!("SELECT {k} FROM {} x GROUP BY {k} HAVING count(*) > 1 LIMIT 1", side.from())).await?).await?;
+    let Some(b) = batches.iter().find(|b| b.num_rows() > 0) else { return Ok(()) };
+    let mut shown = vec![];
+    for (i, c) in key.iter().enumerate() {
+        let v = ScalarValue::try_from_array(b.column(i), 0)?;
+        shown.push(match v.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View if !v.is_null() => format!("{c} = {}", Value::SingleQuotedString(v.to_string())),
+            _ => format!("{c} = {v}"),
+        });
+    }
+    Err(crate::codes::coded("21000", format!("pondra.diff matches rows by their key ({}), and {} holds {} on more than one row: key => names columns that tell its rows apart", key.join(", "), side.shown(), shown.join(", "))))
 }
 
 /// b's columns, when a has the same ones of the same types: else `42804`, naming the first that differs, in b's order
@@ -189,32 +313,51 @@ fn alike(a: &Side, of_a: &[(String, DataType)], b: &Side, of_b: &[(String, DataT
     Ok(of_b.iter().map(|(c, _)| c.clone()).collect())
 }
 
-/// The answer over `a` and `b` (what a FROM reads), of the columns `cols`: matched by `_row_id` and `_version` when
-/// `by_row`, else whole, as multisets.
-fn answer(a: &str, b: &str, cols: &[String], by_row: bool) -> String {
+/// The answer over `a` and `b` (what a FROM reads), of the columns `cols`, matched as `how` says.
+fn answer(a: &str, b: &str, cols: &[String], how: &Match) -> String {
     let q = |c: &String| ast::Ident::with_quote('"', c).to_string();
     let list = |t: &str| cols.iter().map(|c| format!("{t}{}", q(c))).collect::<Vec<_>>().join(", ");
     let none = "CAST(NULL AS VARCHAR[])";
-    if !by_row {
-        let (l, ins, del) = (list(""), format!("SELECT {} FROM {b} y EXCEPT ALL SELECT {} FROM {a} x", list("y."), list("x.")), format!("SELECT {} FROM {a} x EXCEPT ALL SELECT {} FROM {b} y", list("x."), list("y.")));
-        return format!("SELECT 'insert' AS _change_type, {l}, {none} AS _changed FROM ({ins}) d UNION ALL SELECT 'delete', {l}, {none} FROM ({del}) d");
-    }
-    // (each column's name in a one-name list when its two values differ, an empty one when not, all put together)
-    let changed = {
-        let each: Vec<String> = cols.iter().map(|c| format!("CASE WHEN x.{0} IS DISTINCT FROM y.{0} THEN [{1}] ELSE CAST([] AS VARCHAR[]) END", q(c), Value::SingleQuotedString(c.clone()))).collect();
+    // (each named column's name in a one-name list when its two values differ, an empty one when not, all put together)
+    let changed = |of: &[&String]| {
+        let each: Vec<String> = of.iter().map(|c| format!("CASE WHEN x.{0} IS DISTINCT FROM y.{0} THEN [{1}] ELSE CAST([] AS VARCHAR[]) END", q(c), Value::SingleQuotedString(c.to_string()))).collect();
         match each.len() {
             1 => each[0].clone(),
             _ => format!("array_concat({})", each.join(", ")),
         }
     };
     let (x, y) = (list("x."), list("y."));
-    let moved = format!("FROM {a} x JOIN {b} y ON x._row_id = y._row_id AND x._version <> y._version");
-    format!(
-        "SELECT 'insert' AS _change_type, {y}, y._row_id, y._version, {none} AS _changed FROM {b} y WHERE NOT EXISTS (SELECT 1 FROM {a} x WHERE x._row_id = y._row_id) \
-         UNION ALL SELECT 'update_preimage', {x}, x._row_id, x._version, {changed} {moved} \
-         UNION ALL SELECT 'update_postimage', {y}, y._row_id, y._version, {changed} {moved} \
-         UNION ALL SELECT 'delete', {x}, x._row_id, x._version, {none} FROM {a} x WHERE NOT EXISTS (SELECT 1 FROM {b} y WHERE y._row_id = x._row_id)"
-    )
+    let key = match how {
+        Match::Whole => {
+            let (l, ins, del) = (list(""), format!("SELECT {y} FROM {b} y EXCEPT ALL SELECT {x} FROM {a} x"), format!("SELECT {x} FROM {a} x EXCEPT ALL SELECT {y} FROM {b} y"));
+            return format!("SELECT 'insert' AS _change_type, {l}, {none} AS _changed FROM ({ins}) d UNION ALL SELECT 'delete', {l}, {none} FROM ({del}) d");
+        }
+        Match::Key(key) => key,
+        Match::Rows => {
+            let changed = changed(&cols.iter().collect::<Vec<_>>());
+            let moved = format!("FROM {a} x JOIN {b} y ON x._row_id = y._row_id AND x._version <> y._version");
+            return format!(
+                "SELECT 'insert' AS _change_type, {y}, y._row_id, y._version, {none} AS _changed FROM {b} y WHERE NOT EXISTS (SELECT 1 FROM {a} x WHERE x._row_id = y._row_id) \
+                 UNION ALL SELECT 'update_preimage', {x}, x._row_id, x._version, {changed} {moved} \
+                 UNION ALL SELECT 'update_postimage', {y}, y._row_id, y._version, {changed} {moved} \
+                 UNION ALL SELECT 'delete', {x}, x._row_id, x._version, {none} FROM {a} x WHERE NOT EXISTS (SELECT 1 FROM {b} y WHERE y._row_id = x._row_id)"
+            );
+        }
+    };
+    // (a key one side lacks: its rows joined to the other's keys, each with a mark, find no mark; keys match NULL to NULL)
+    let on = key.iter().map(|k| format!("(x.{0} IS NOT DISTINCT FROM y.{0})", q(k))).collect::<Vec<_>>().join(" AND ");
+    let keys = |t: &str| key.iter().map(|k| format!("{t}.{}", q(k))).collect::<Vec<_>>().join(", ");
+    let (keys_a, keys_b) = (format!("(SELECT {}, true AS __diff_m FROM {a} x0) x", keys("x0")), format!("(SELECT {}, true AS __diff_m FROM {b} y0) y", keys("y0")));
+    let mut arms = vec![format!("SELECT 'insert' AS _change_type, {y}, {none} AS _changed FROM {b} y LEFT JOIN {keys_a} ON {on} WHERE x.__diff_m IS NULL")];
+    let rest: Vec<&String> = cols.iter().filter(|c| !key.contains(c)).collect();
+    if !rest.is_empty() {
+        let (changed, differs) = (changed(&rest), rest.iter().map(|c| format!("(x.{0} IS DISTINCT FROM y.{0})", q(c))).collect::<Vec<_>>().join(" OR "));
+        let both = format!("FROM {a} x JOIN {b} y ON {on} WHERE {differs}");
+        arms.push(format!("SELECT 'update_preimage', {x}, {changed} {both}"));
+        arms.push(format!("SELECT 'update_postimage', {y}, {changed} {both}"));
+    }
+    arms.push(format!("SELECT 'delete', {x}, {none} FROM {a} x LEFT JOIN {keys_b} ON {on} WHERE y.__diff_m IS NULL"));
+    arms.join(" UNION ALL ")
 }
 
 #[cfg(test)]
@@ -223,14 +366,16 @@ mod tests {
     use datafusion::arrow::util::display::array_value_to_string;
     use datafusion::prelude::SessionContext;
 
-    /// A session holding `t`, `u` (a branch of t: two rows changed, one gone, one new) and `w` (t's rows, by value,
-    /// with no row ids: a copy).
+    /// A session holding `t`, `u` (a branch of t: two rows changed, one gone, one new), `w` (t's rows, by value, with no
+    /// row ids: a copy), and `ka` and `kb`, by an id (NULL on one row of each).
     async fn ctx() -> SessionContext {
         let ctx = SessionContext::new_with_state(datafusion::execution::SessionStateBuilder::new().with_default_features().with_analyzer_rules(crate::optimize::analyzer_rules()).build());
         for sql in [
             "CREATE TABLE t AS SELECT * FROM (VALUES (1, 'a', 10, 1, 1), (2, 'b', 20, 2, 1), (3, 'c', 30, 3, 1), (4, 'd', 40, 4, 1)) AS v(id, name, n, _row_id, _version)",
             "CREATE TABLE u AS SELECT * FROM (VALUES (1, 'a', 10, 1, 1), (2, 'B', 20, 2, 2), (3, 'C', 31, 3, 2), (5, 'e', 50, 5, 1)) AS v(id, name, n, _row_id, _version)",
             "CREATE TABLE w AS SELECT * FROM (VALUES (1, 'a', 10), (2, 'b', 20), (2, 'b', 20), (3, 'c', 30)) AS v(id, name, n)",
+            "CREATE TABLE ka AS SELECT * FROM (VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (4, 'd', 40), (NULL, 'z', 0)) AS v(id, name, n)",
+            "CREATE TABLE kb AS SELECT * FROM (VALUES (1, 'a', 10), (2, 'B', 20), (3, 'c', 31), (5, 'e', 50), (NULL, 'z', 1)) AS v(id, name, n)",
         ] {
             ctx.sql(sql).await.unwrap().collect().await.unwrap();
         }
@@ -252,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn two_tables_match_by_row_and_name_what_changed() {
         let ctx = ctx().await;
-        let sql = format!("SELECT _change_type, id, name, n, _changed FROM ({}) d", answer("t", "u", &cols(), true));
+        let sql = format!("SELECT _change_type, id, name, n, _changed FROM ({}) d", answer("t", "u", &cols(), &Match::Rows));
         assert_eq!(
             rows(&ctx, &sql).await,
             [
@@ -270,28 +415,60 @@ mod tests {
     async fn other_sides_match_whole_counting_copies() {
         let ctx = ctx().await;
         // (w holds b twice and t once: one insert; t's d is not in w: a delete; no update rows)
-        let sql = format!("SELECT _change_type, id, name, n, _changed FROM ({}) d", answer("(SELECT id, name, n FROM t)", "w", &cols(), false));
+        let sql = format!("SELECT _change_type, id, name, n, _changed FROM ({}) d", answer("(SELECT id, name, n FROM t)", "w", &cols(), &Match::Whole));
         assert_eq!(rows(&ctx, &sql).await, ["delete 4 d 40 NULL", "insert 2 b 20 NULL"]);
         // (one column, and a row whose version moved with it unchanged: an update that names no column)
         let one = ["n".to_string()];
         assert_eq!(
-            rows(&ctx, &format!("SELECT _change_type, n, _changed FROM ({}) d", answer("t", "u", &one, true))).await,
+            rows(&ctx, &format!("SELECT _change_type, n, _changed FROM ({}) d", answer("t", "u", &one, &Match::Rows))).await,
             ["delete 40 NULL", "insert 50 NULL", "update_postimage 20 []", "update_postimage 31 [n]", "update_preimage 20 []", "update_preimage 30 [n]"]
         );
     }
 
+    #[tokio::test]
+    async fn sides_with_a_key_match_by_it() {
+        let ctx = ctx().await;
+        let keyed = |key: &[&str]| format!("SELECT _change_type, id, name, n, _changed FROM ({}) d", answer("ka", "kb", &cols(), &Match::Key(key.iter().map(|k| k.to_string()).collect())));
+        // (a key b lacks, one a lacks, two changed rows each naming what changed, and NULL keys matched to each other)
+        assert_eq!(
+            rows(&ctx, &keyed(&["id"])).await,
+            [
+                "delete 4 d 40 NULL",
+                "insert 5 e 50 NULL",
+                "update_postimage 2 B 20 [name]",
+                "update_postimage 3 c 31 [n]",
+                "update_postimage NULL z 1 [n]",
+                "update_preimage 2 b 20 [name]",
+                "update_preimage 3 c 30 [n]",
+                "update_preimage NULL z 0 [n]",
+            ]
+        );
+        // (a key of two columns: b's B is another key, so a delete and an insert; a key of every column has no updates)
+        assert_eq!(
+            rows(&ctx, &keyed(&["id", "name"])).await,
+            ["delete 2 b 20 NULL", "delete 4 d 40 NULL", "insert 2 B 20 NULL", "insert 5 e 50 NULL", "update_postimage 3 c 31 [n]", "update_postimage NULL z 1 [n]", "update_preimage 3 c 30 [n]", "update_preimage NULL z 0 [n]"]
+        );
+        assert_eq!(rows(&ctx, &keyed(&["id", "name", "n"])).await.len(), 8);
+    }
+
     #[test]
     fn sides_are_names_or_queries_and_the_columns_must_agree() {
-        let parsed = |sql: &str| -> Result<(Side, Side)> {
+        let parsed = |sql: &str| -> Result<Call> {
             let q = crate::expander::parse_query(sql).unwrap();
             let ast::SetExpr::Select(s) = *q.body else { panic!() };
             let TableFactor::Table { args: Some(args), .. } = &s.from[0].relation else { panic!() };
-            sides(&args.args)
+            call(&args.args)
         };
-        assert_eq!(parsed("SELECT * FROM pondra.diff('prod.sales.orders', (SELECT 1 AS a))").unwrap(), (Side::Name("prod.sales.orders".into()), Side::Query("SELECT 1 AS a".into())));
-        assert!(parsed("SELECT * FROM pondra.diff('a', 'b', key => 'id')").unwrap_err().to_string().contains("no argument key"));
+        assert_eq!(parsed("SELECT * FROM pondra.diff('prod.sales.orders', (SELECT 1 AS a))").unwrap(), Call { a: Side::Name("prod.sales.orders".into()), b: Side::Query("SELECT 1 AS a".into()), key: None });
+        assert_eq!(parsed(r#"SELECT * FROM pondra.diff('a', 'b', key => 'id, "Day"')"#).unwrap().key, Some(vec!["id".to_string(), "Day".to_string()]));
+        assert!(parsed("SELECT * FROM pondra.diff('a', 'b', keys => 'id')").unwrap_err().to_string().contains("no argument keys"));
+        assert_eq!(crate::codes::of(&parsed("SELECT * FROM pondra.diff('a', 'b', key => 'id,')").unwrap_err()), "22023");
+        assert_eq!(crate::codes::of(&parsed("SELECT * FROM pondra.diff('a', 'b', key => 1)").unwrap_err()), "22023");
         assert!(parsed("SELECT * FROM pondra.diff('a; DROP TABLE t', 'b')").is_err());
         assert!(parsed("SELECT * FROM pondra.diff('a')").is_err());
+        assert_eq!(names(r#"a, "b,c", "say ""hi""""#), Some(vec!["a".to_string(), "b,c".to_string(), r#"say "hi""#.to_string()]));
+        assert_eq!(names(r#""open"#), None);
+        assert_eq!(name_parts(r#"prod."Sales".orders"#), Some(vec!["prod".to_string(), "Sales".to_string(), "orders".to_string()]));
         let (a, b) = (Side::Name("prod.v".into()), Side::Name("dev.v".into()));
         let int = |c: &str| (c.to_string(), DataType::Int64);
         let text = |c: &str, t: DataType| (c.to_string(), t);

@@ -10555,8 +10555,10 @@ def movereaders():
 
 def diffs():
     """`pondra.diff(a, b)` over views and queries (Trellis T1, `diff.rs`): two views, a table and a query, a table's past
-    and its present. Sides other than two tables match whole, as multisets, so each answer is DuckDB's `b EXCEPT ALL a` as
-    inserts and `a EXCEPT ALL b` as deletes, each copy counted, with no `_changed`. (Two tables match by their rows' ids,
+    and its present. Sides other than two tables, with no key, match whole, as multisets, so each answer is DuckDB's
+    `b EXCEPT ALL a` as inserts and `a EXCEPT ALL b` as deletes, each copy counted, with no `_changed`. Sides with a key (a
+    table's, a view's PRIMARY KEY … NOT ENFORCED, or `key =>`) match by it, with update rows naming what changed; a key
+    held twice (21000), a key column the sides lack (42703) and two declared keys (42P10) are refused. (Two tables match by their rows' ids,
     a branch's: environments_check.py, where an update names the columns it changed.) The answer has b's columns in b's
     order; sides of other columns are refused with 42804, naming the first."""
     import duckdb
@@ -10614,6 +10616,37 @@ def diffs():
     same("a table's past and its present", f"(SELECT * FROM t VERSION AS OF {first})", "'t'", duck_a="SELECT * FROM t_past")
     checks["the past's diff is the three writes"] = key([r[:-1] for r in info["a table's past and its present"]]) == \
         key([("delete", 1, 10, "a"), ("delete", 6, 40, None), ("insert", 1, 11, "a"), ("insert", 7, 20, "b")])
+    # Keys (Trellis T1b): a table's key, a view's fact, `key =>`; then update rows, naming what changed
+    for s_ in ["CREATE TABLE kt (id BIGINT PRIMARY KEY, n BIGINT, s TEXT)", "INSERT INTO kt SELECT id, n, s FROM t",
+               "CREATE TABLE kt2 (id BIGINT PRIMARY KEY, n BIGINT, s TEXT)", "INSERT INTO kt2 SELECT id, n, s FROM t",
+               "CREATE VIEW kv (PRIMARY KEY (id) NOT ENFORCED) AS SELECT id, CASE WHEN id = 2 THEN 21 ELSE n END AS n, s FROM t WHERE id <> 4 UNION ALL SELECT 8, 80, 'h'",
+               "CREATE VIEW kv2 (PRIMARY KEY (id, s) NOT ENFORCED) AS SELECT id, n, s FROM t"]:
+        sql(A.port, s_)
+    key = lambda rows: sorted(rows, key=repr)
+    keyed = {
+        "a table's key and a view's fact, the same": ("'kt'", "'kv'", [("delete", 4, 30, "c", None), ("insert", 8, 80, "h", None), ("update_postimage", 2, 21, "b", ["n"]), ("update_preimage", 2, 20, "b", ["n"])]),
+        "a view's fact against a query": ("'kv'", "(SELECT id, n, s FROM t WHERE id <> 8)", [("delete", 8, 80, "h", None), ("insert", 4, 30, "c", None), ("update_postimage", 2, 20, "b", ["n"]), ("update_preimage", 2, 21, "b", ["n"])]),
+        "key => on two queries": ("(SELECT id, n, s FROM t)", "(SELECT id, n + 1 AS n, s FROM t WHERE id < 3), key => 'id'",
+                                  [("delete", 3, 20, "b", None), ("delete", 4, 30, "c", None), ("delete", 5, 40, None, None), ("delete", 7, 20, "b", None),
+                                   ("update_postimage", 1, 12, "a", ["n"]), ("update_postimage", 2, 21, "b", ["n"]), ("update_preimage", 1, 11, "a", ["n"]), ("update_preimage", 2, 20, "b", ["n"])]),
+        "key => on two tables, which else match by row": ("'kt'", "'kt2', key => 'id'", []),
+    }
+    for name, (a, b, want) in keyed.items():
+        got = diffed(a, b)
+        info[f"keyed: {name}"] = got
+        checks[f"keyed, {name}: inserts, deletes and updates naming what changed"] = key(got) == key(want)
+    sql(A.port, "UPDATE kt2 SET n = 0, s = 'x' WHERE id = 1")
+    moved = diffed("'kt'", "'kt2', key => 'id'")
+    info["keyed: kt2 changed"] = moved
+    checks["keyed: an update names both columns it changed"] = key(moved) == key([("update_postimage", 1, 0, "x", ["n", "s"]), ("update_preimage", 1, 11, "a", ["n", "s"])])
+    for name, text, code, said in [
+        ("a key held on two rows of a side", "SELECT * FROM pondra.diff((SELECT n, s FROM t), (SELECT n, s FROM t), key => 'n')", "21000", "holds n = 20 on more than one row"),
+        ("a key column the sides lack", "SELECT * FROM pondra.diff('kt', 'kv', key => 'nope')", "42703", "nope is not a column of the two sides"),
+        ("two sides declaring other keys", "SELECT * FROM pondra.diff('kv', 'kv2')", "42P10", "kv's is (id) and kv2's (id, s): key => 'id, s' picks one"),
+    ]:
+        status, state, body = _sqlstate_of(A.port, text)
+        info[f"refused: {name}"] = [status, state, body[:300]]
+        checks[f"refused, {name}: {code}, saying so"] = status >= 400 and state == code and said in body
     # Refusals
     status, state, body = _sqlstate_of(A.port, "SELECT * FROM pondra.diff('low', 't')")
     info["other columns"] = [status, state, body[:300]]
