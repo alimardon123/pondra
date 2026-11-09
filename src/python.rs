@@ -360,7 +360,7 @@ impl Pool {
         lent.worker = Some(spawn(self.path.as_deref()).await?);
         let _idle = self.idle.lock().unwrap(); // (the reaper decides to stop under this lock)
         if !self.reaping.swap(true, Ordering::SeqCst) {
-            crate::spawns::spawn(reap(self.clone()));
+            crate::spawns::for_statics(reap(self.clone()));
         }
         Ok(lent)
     }
@@ -383,7 +383,7 @@ async fn spawn(path: Option<&str>) -> Result<Worker> {
     let said = Arc::new(Mutex::new(VecDeque::new()));
     if let Some(err) = child.stderr.take() {
         let said = said.clone();
-        crate::spawns::task(async move {
+        crate::spawns::for_statics(async move {
             // Read to its end whatever it writes (bytes that aren't UTF-8, a line with no end): a
             // reader that stopped would leave its pipe full, and the worker stuck writing to it.
             let (mut err, mut line) = (BufReader::new(err), Vec::new());
@@ -610,7 +610,7 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
     let slot = {
         let mut all = KERNELS.lock().unwrap();
         if all.is_empty() {
-            crate::spawns::spawn(reap_kernels()); // (only while there are some)
+            crate::spawns::for_statics(reap_kernels()); // (only while there are some)
         }
         let e = all.entry(session.to_string()).or_insert_with(|| (Slot::default(), Instant::now()));
         e.1 = Instant::now();

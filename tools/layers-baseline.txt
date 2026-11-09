@@ -229,7 +229,7 @@ sharing -> tls  2
 sharing_client -> byte_range  1
 sharing_client -> fetch  4
 sharing_client -> read_delta  1
-spawns -> wasm32  10
+spawns -> wasm32  8
 spmd -> dial  9
 sso -> crypto  6
 sso -> fetch  1

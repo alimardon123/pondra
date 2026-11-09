@@ -64,13 +64,12 @@ pub(crate) struct Held {
 }
 
 impl Held {
-    /// Ends every task the node started but the one asking: its own (`NodeState::tasks`), and those still started on the
-    /// process's list (`spawns::spawn`, `spawns::task`: redesign step 5 piece 7b's second half moves them to the node's).
+    /// Ends every task the node started but the one asking (`NodeState::tasks`). The loops of its statics end as they are
+    /// set back, last (`spawns::for_statics`, `reset::reset`).
     pub(crate) fn abort_tasks(&self) {
         if let Some(node) = self.node.get() {
             node.tasks.abort_all();
         }
-        crate::spawns::abort_all();
     }
 
     /// What a node does once drained (`drain.rs`, which the program runs first, with a second signal
@@ -249,7 +248,7 @@ impl Node {
             if lives {
                 cluster.clone().keep_alive(store.clone(), &dir, &here); // (beside the catalog's opening, not before it: C5)
             } else {
-                let _ = terms::mark_every(store.clone(), cluster.leader.n);
+                let _ = terms::mark_every(&here.tasks, store.clone(), cluster.leader.n);
             }
         }
         // Read-only nodes follow the leader's commit stream too (when a live one is there to ask),
@@ -376,7 +375,7 @@ impl Node {
         // Postgres, Kafka and Flight ports do the same).
         tr("listening");
         let listener = match lives {
-            true => Some(tls::Doors::bind(&listen, tls::Door::Http).await?.for_node(here.clone())), // (TLS too: `tls.rs`)
+            true => Some(tls::Doors::bind(&listen, tls::Door::Http, &here.tasks, crate::auth::Door).await?.for_node(here.clone())), // (TLS too: `tls.rs`)
             false => None,
         };
         node::keep(&app, &start);
