@@ -22738,6 +22738,18 @@ def listings():
     unseen["M2"] = {**{q: [w for w in words if w in v] for q, v in named["ann"].items()}, "the superuser lacks": [w for w in words if not any(w in v for v in named["boss"].values())]}
     checks["of a table ann reads in part, pg_catalog and information_schema name no column ann may not read: no key, index, CHECK, foreign key or comment over one; the superuser sees them all (11-09 audit M2)"] = \
         not any(w in v for v in named["ann"].values() for w in words) and all(any(w in v for v in named["boss"].values()) for w in words)
+    # (a probe that reads no rows, `LIMIT 0` or `WHERE 1=0` as JDBC and Spark send, was planned with no scan, where the
+    # columns are checked: it named every column of ledger and its type, k too, at every door, 11-09 audit M1)
+    probes = {"LIMIT 0": "SELECT * FROM ledger LIMIT 0", "WHERE 1=0": "SELECT * FROM ledger WHERE 1=0", "a join on FALSE": "SELECT * FROM ledger a JOIN ledger b ON FALSE"}
+    probed = {f"{door}, {what}": ask_(s, False) for what, s in probes.items() for door, ask_ in doors.items()}
+    probed.update({f"Postgres Describe, {what}": pg_describe(s) for what, s in probes.items()})
+    own = {door: ask_("SELECT v FROM ledger WHERE 1=0", False) for door, ask_ in doors.items()}
+    own["Postgres Describe"] = pg_describe("SELECT v FROM ledger WHERE 1=0")
+    unseen["M1"] = (probed, own)
+    checks["a probe of no rows of ledger (LIMIT 0, WHERE 1=0, a join on FALSE), of which ann reads v only, is refused at every door and by Postgres's Describe, as a read of its rows is (11-09 audit M1)"] = \
+        all("permission denied" in a and not a.startswith("columns") for a in probed.values())
+    checks["the probe of v, which ann may read, answers no rows at every door, and Postgres's Describe names v only (11-09 audit M1)"] = \
+        all("permission denied" not in a and not a.startswith(("4", "5")) and '"isError":true' not in a.replace(" ", "") for a in own.values()) and own["Postgres Describe"] == "columns v"
     info["unseen"] = unseen
     node.kill()
     ok = all(checks.values())
