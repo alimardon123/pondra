@@ -103,7 +103,7 @@ pub(crate) fn read(w: &mut crate::words::Words) -> anyhow::Result<Stmt> {
             true
         };
         let name = w.name()?;
-        let mut renamed = crate::words::Words(w.0.clone());
+        let mut renamed = w.clone();
         if renamed.is("rename") && renamed.is("to") {
             if let Ok(to) = renamed.name() {
                 if renamed.done().is_ok() {

@@ -4,13 +4,16 @@
 //! of a statement family onto them (l6/step8-pr8-plan.md).
 use anyhow::{bail, Result};
 
-/// A statement's tokens, last first (`next` takes the one after those taken), and where each is in the text.
-#[derive(Default)]
-pub struct Words(pub(crate) Vec<W>, Spans);
+/// A statement's tokens, last first (`next` takes the one after those taken), and the text they are of.
+#[derive(Clone, Default)]
+pub struct Words(pub(crate) Vec<W>, Text);
 
-/// Where each of a statement's words starts and ends in its text, in order: which are written together (`joined`).
-#[derive(Default)]
-pub(crate) struct Spans {
+/// The text a statement's words are of, and where each starts and ends in it, in order: for a reader that hands what
+/// follows some words to a parser of its own (`rest`), as COMMENT ON's name and text and CREATE OR ALTER's statement
+/// are, and for one that reads words written together as one (`joined`).
+#[derive(Clone, Default)]
+pub(crate) struct Text {
+    sql: std::sync::Arc<str>,
     starts: Vec<usize>,
     ends: Vec<usize>,
 }
@@ -58,11 +61,11 @@ impl Words {
             ends.push(end);
         }
         out.reverse(); // (taken from the end: the next is the last)
-        Some(Words(out, Spans { starts, ends }))
+        Some(Words(out, Text { sql: sql.into(), starts, ends }))
     }
     /// Whether the word `k` after the next is written right after the one before it, with no space or comment between.
     fn tight(&self, k: usize) -> bool {
-        let Spans { starts, ends } = &self.1;
+        let Text { starts, ends, .. } = &self.1;
         let i = starts.len() - self.0.len() + k; // (its place among all the statement's words)
         i > 0 && i < starts.len() && starts[i] == ends[i - 1]
     }
@@ -102,6 +105,15 @@ impl Words {
         self.0.truncate(self.0.len() - n);
         Ok(name)
     }
+    /// Where the next word starts in the statement's text (its length, when every word is taken).
+    pub(crate) fn at(&self) -> usize {
+        let Text { sql, starts, .. } = &self.1;
+        starts.len().checked_sub(self.0.len()).and_then(|i| starts.get(i)).copied().unwrap_or(sql.len())
+    }
+    /// The statement's text.
+    pub(crate) fn sql(&self) -> &str { &self.1.sql }
+    /// The text from the next word on, as it is written.
+    pub(crate) fn rest(&self) -> &str { &self.sql()[self.at()..] }
     pub(crate) fn peek_word(&self) -> Option<String> { self.0.last().map(|w| w.word()) }
     pub(crate) fn next(&mut self) -> Option<W> { self.0.pop() }
     /// The next word, if it is `w` (taken).

@@ -135,12 +135,13 @@ pub struct Statements {
 pub const CORE: &str = "core";
 
 /// The leading words of the statements the core reads outside this section today (`write::parse`'s readers and its
-/// match on sqlparser's tree), after a CREATE's `OR REPLACE`, `OR ALTER`, `TEMP` or `TEMPORARY`: an extension's entry
-/// may not begin with one, so no extension takes a core statement over with longer words. Each goes as its whole family
-/// becomes a core entry (PR 8b-8d), which the same check covers (`ALTER DATABASE`, USER, ROLE, TOKEN, SHARE, RECIPIENT, IDENTITY PROVIDER and SEQUENCE have).
+/// match on sqlparser's tree), after a CREATE's `OR REPLACE`, `TEMP` or `TEMPORARY`: an extension's entry may not begin
+/// with one, so no extension takes a core statement over with longer words. Each goes as its whole family becomes a core
+/// entry (PR 8b-8d), which the same check covers (`ALTER DATABASE`, USER, ROLE, TOKEN, SHARE, RECIPIENT, IDENTITY
+/// PROVIDER, SEQUENCE and COMMENT have; every `CREATE OR ALTER` is the core's entry's).
 const CORE_WORDS: &[&[&str]] = &[
     &["SELECT"], &["WITH"], &["VALUES"], &["TABLE"], &["FROM"], &["INSERT"], &["UPDATE"], &["DELETE"], &["MERGE"], &["TRUNCATE"],
-    &["GRANT"], &["REVOKE"], &["COMMENT"], &["COPY"], &["ATTACH"], &["DETACH"], &["UNDROP"], &["BACKUP"], &["RESTORE"],
+    &["GRANT"], &["REVOKE"], &["COPY"], &["ATTACH"], &["DETACH"], &["UNDROP"], &["BACKUP"], &["RESTORE"],
     &["INSTALL"], &["LOAD"], &["UNINSTALL"], &["CALL"], &["DO"], &["SET"], &["RESET"], &["SHOW"], &["DESCRIBE"], &["USE"],
     &["EXPLAIN"], &["BEGIN"], &["START"], &["COMMIT"], &["ROLLBACK"], &["END"], &["CHECKPOINT"], &["EXPORT"], &["IMPORT"],
     &["CREATE", "TABLE"], &["CREATE", "EXTERNAL"], &["CREATE", "VIEW"], &["CREATE", "MATERIALIZED"], &["CREATE", "SCHEMA"],
@@ -155,10 +156,11 @@ const CORE_WORDS: &[&[&str]] = &[
     &["DROP", "TYPE"],
 ];
 
-/// `words` without a CREATE's `OR REPLACE`, `OR ALTER`, `TEMP` or `TEMPORARY` after its first word.
+/// `words` without a CREATE's `OR REPLACE`, `TEMP` or `TEMPORARY` after its first word. (`OR ALTER` stays: the core's
+/// `CREATE OR ALTER *` reads each, so an extension's `CREATE OR ALTER x` begins as it does.)
 fn plain_words(words: &[&'static str]) -> Vec<&'static str> {
     let Some((&"CREATE", mut rest)) = words.split_first() else { return words.to_vec() };
-    if let ["OR", "REPLACE" | "ALTER", more @ ..] = rest {
+    if let ["OR", "REPLACE", more @ ..] = rest {
         rest = more;
     }
     if let ["TEMP" | "TEMPORARY", more @ ..] = rest {

@@ -546,8 +546,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(s) = kinds.then(|| crate::routines::statement(sql)).flatten() {
         return Some(s); // (CREATE FUNCTION and PROCEDURE as Postgres writes them, CREATE TASK, DROP TASK, DROP MACRO)
     }
-    if let Some(s) = kinds.then(|| crate::objects::statement(sql)).flatten() {
-        return Some(s); // (COMMENT ON, CREATE OR ALTER TABLE | VIEW: the registry's)
+    #[cfg(test)]
+    if let Some(s) = kinds.then(|| was::objects(sql)).flatten() {
+        return Some(s); // (COMMENT ON, CREATE OR ALTER TABLE | VIEW: the statements section's entries)
     }
     #[cfg(test)]
     if let Some(s) = kinds.then(|| was::seq(sql)).flatten() {
@@ -2804,6 +2805,9 @@ pub(crate) mod was {
     /// `seq::statement`, where `parse` read it.
     pub(super) fn seq(sql: &str) -> Option<Stmt> { old().then(|| crate::seq::statement(sql)).flatten() }
 
+    /// `objects::statement`, where `parse` read it.
+    pub(super) fn objects(sql: &str) -> Option<Stmt> { old().then(|| crate::objects::statement(sql)).flatten() }
+
     /// Row 4, where `parse` read it.
     pub(super) fn no_replace(sql: &str) -> Option<Stmt> {
         if !old() {
@@ -3005,6 +3009,11 @@ pub(crate) mod was {
             "CREATE OR REPLACE SEQUENCE IF NOT EXISTS s", "CREATE TEMP SEQUENCE s", "CREATE SEQUENCE s START x", "CREATE SEQUENCE s OWNED BY t.c", "CREATE SEQUENCE s MINVALUE 10 MAXVALUE 1",
             "ALTER SEQUENCE s RESTART", "ALTER SEQUENCE IF EXISTS s RESTART WITH 7 INCREMENT 2", "ALTER SEQUENCE s RENAME TO t", "ALTER SEQUENCE s", "ALTER SEQUENCE s RENAME TO t u",
             "DROP SEQUENCE s", "DROP SEQUENCE IF EXISTS a, b.c CASCADE", "DROP SEQUENCE", "drop sequence s;",
+            "COMMENT ON TABLE sales.Orders IS 'one row per order'", "comment if exists on materialized view v is null",
+            "COMMENT ON COLUMN t.\"Amount\" IS $$in euros$$", "COMMENT ON IDENTITY PROVIDER p IS ''", "COMMENT ON TABLE t IS 42",
+            "COMMENT ON TABLE t", "COMMENT ON TABLE t IS 'x' extra", "COMMENT ON VIEW /* the view */ v IS 'x';",
+            "CREATE OR ALTER TABLE t (a BIGINT) CLUSTER BY (a)", "create or alter view v as select 1", "CREATE OR ALTER TABLE t AS SELECT 1",
+            "CREATE OR ALTER MATERIALIZED VIEW v AS SELECT 1", "CREATE OR ALTER FUNCTION f() RETURNS INT AS 'select 1'", "CREATE OR ALTER TABLE t ",
         ] {
             assert_eq!(shown(&super::parse(sql)), shown(&was(sql)), "{sql}");
             assert!(crate::statements::moved(sql), "{sql}: an entry's");

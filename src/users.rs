@@ -156,7 +156,7 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
 }
 
 /// CREATE, ALTER and DROP USER, ROLE and TOKEN, by their words: the statements section's entries' reader.
-pub(crate) fn read(w: &mut Words) -> Result<crate::write::Stmt> { Ok(said(std::mem::replace(w, Words::default()))) }
+pub(crate) fn read(w: &mut Words) -> Result<crate::write::Stmt> { Ok(said(std::mem::take(w))) }
 
 fn said(words: Words) -> crate::write::Stmt {
     use crate::write::Stmt;

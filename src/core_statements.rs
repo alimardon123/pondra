@@ -66,6 +66,9 @@ static ENTRIES: &[Statement] = &[
     entry(&["CREATE", "OR", "REPLACE", "TEMPORARY", "SEQUENCE"], crate::seq::read, "refused: a sequence is the lake's"),
     entry(&["ALTER", "SEQUENCE"], crate::seq::read, "a sequence's options, its next value (RESTART) or its name"),
     entry(&["DROP", "SEQUENCE"], crate::seq::read, "drops sequences"),
+    entry(&["COMMENT", "ON"], comment, "a comment on an object (COMMENT ON TABLE t IS 'text'), or none (IS NULL)"),
+    entry(&["COMMENT", "IF", "EXISTS", "ON"], comment, "a comment on an object, where it is there"),
+    entry(&["CREATE", "OR", "ALTER", "*"], or_alter, "a table made or altered to the columns given, a view made anew"),
 ];
 
 /// A reader's own words for a form written wrong, after what it found: what a statement of the form is.
@@ -287,6 +290,64 @@ fn portable(_: &mut Words) -> Result<Stmt> {
     Ok(Stmt::Invalid("EXPORT DATABASE and IMPORT DATABASE are not supported yet: BACKUP DATABASE TO 'place' copies a database (RESTORE DATABASE name FROM 'place' brings it back), and COPY t TO 'dir/t.parquet' (FORMAT parquet) writes a table's rows".into()))
 }
 
+/// `COMMENT [IF EXISTS] ON <kind> name IS 'text' | NULL`: the kind is the longest of the kinds' words that the next
+/// words are, and its name and text are read as SQL (`objects::comment_of`), which the leader carries out (`objects::apply`).
+fn comment(w: &mut Words) -> Result<Stmt> {
+    w.expect("comment")?;
+    let if_exists = w.is("if") && {
+        w.expect("exists")?;
+        true
+    };
+    w.expect("on")?;
+    let mut kinds: Vec<&str> = crate::objects::all_kinds().map(|k| k.name).chain(["column"]).collect();
+    kinds.sort_by_key(|k| std::cmp::Reverse(k.len()));
+    let Some(kind) = kinds.into_iter().find(|k| w.begins(&k.split(' ').collect::<Vec<_>>())) else {
+        return Ok(Stmt::Invalid(format!("COMMENT ON <kind> name IS 'text' | NULL: expected a kind of object (TABLE, COLUMN, VIEW, …) {}", w.near())));
+    };
+    for _ in kind.split(' ') {
+        w.next();
+    }
+    Ok(match crate::objects::comment_of(w.rest()) {
+        Ok((name, text)) => Stmt::Ddl(vec![Ddl::Object(crate::objects::Op::Comment { kind: kind.to_string(), name, text, if_exists })]),
+        Err(e) => Stmt::Invalid(format!("COMMENT ON {} name IS 'text' | NULL: {}", kind.to_uppercase(), crate::ext::said(&e))),
+    })
+}
+
+/// `CREATE OR ALTER TABLE | VIEW …`: a view is made anew, as it holds nothing to keep; a table is made or altered to the
+/// columns given (`Op::OrAlterTable`, the statement as `CREATE TABLE`); another kind is refused.
+fn or_alter(w: &mut Words) -> Result<Stmt> {
+    w.expect("create")?;
+    let or = w.at();
+    w.expect_all(&["or", "alter"])?;
+    let (sql, at) = (w.sql(), w.at());
+    let (create, rest) = (crate::text::first_word(&sql[..or]).to_string(), sql[at..].to_string()); // (`CREATE ` as written, and what follows OR ALTER)
+    let mut what = match w.next() {
+        Some(W::Word(x, _)) => x.to_uppercase(),
+        _ => bail!("CREATE OR ALTER TABLE | VIEW name …"),
+    };
+    if what != "VIEW" && w.is("view") {
+        what.push_str(" VIEW"); // (`MATERIALIZED VIEW`)
+    }
+    Ok(match what.as_str() {
+        "VIEW" => {
+            let anew = format!("{create}OR REPLACE {rest}");
+            crate::write::parse(&anew).unwrap_or_else(|| Stmt::Invalid(crate::parsed::generic(&anew).err().map_or("CREATE OR ALTER VIEW name AS SELECT …".into(), |e| e.to_string())))
+        }
+        "TABLE" => {
+            let plain = format!("{create}{rest}");
+            match crate::write::parse(&plain) {
+                Some(Stmt::Create(t)) if t.query.is_none() && t.like.is_none() && !t.or_replace && !t.if_not_exists && !t.temporary => {
+                    Stmt::Ddl(vec![Ddl::Object(crate::objects::Op::OrAlterTable { name: crate::text::object(&t.name), sql: plain })])
+                }
+                Some(Stmt::Invalid(e)) => Stmt::Invalid(e),
+                Some(Stmt::Refused(c, e)) => Stmt::Refused(c, e),
+                _ => Stmt::Invalid("CREATE OR ALTER TABLE takes the table's columns (… AS SELECT makes it anew: CREATE OR REPLACE TABLE)".into()),
+            }
+        }
+        kind => Stmt::Refused("0A000", format!("CREATE OR ALTER takes a table or a view; a {} is made anew with CREATE OR REPLACE {kind}", kind.to_lowercase())),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,7 +357,30 @@ mod tests {
     #[test]
     fn the_core_entries_on_stand_ins_are_counted() {
         let s = crate::registry::get().section::<Statements>();
-        assert_eq!((ENTRIES.len(), s.stand_ins()), (39, 51), "the core's 39, the sharing extension's 8 and the identity providers' 4");
+        assert_eq!((ENTRIES.len(), s.stand_ins()), (42, 54), "the core's 42, the sharing extension's 8 and the identity providers' 4");
+    }
+
+    /// COMMENT ON and CREATE OR ALTER, as `write::parse` reads them (each was `objects::statement`'s).
+    #[test]
+    fn comments_and_or_alter() {
+        use serde_json::json as j;
+        let ddl = |s: &str| match crate::write::parse(s) {
+            Some(Stmt::Ddl(d)) => serde_json::to_value(&d[0]).unwrap(),
+            Some(Stmt::Invalid(e) | Stmt::Refused(_, e)) => j!({"error": e}),
+            _ => j!(null),
+        };
+        assert_eq!(ddl("COMMENT ON TABLE sales.Orders IS 'one row per order'")["text"], "one row per order");
+        assert_eq!(ddl("comment on materialized view v is null")["kind"], "materialized view");
+        assert_eq!((ddl("COMMENT ON SHARE acme IS 'for Acme'")["kind"].clone(), ddl("comment on recipient acme_corp is null")["kind"].clone()), (j!("share"), j!("recipient")));
+        assert_eq!(ddl("COMMENT IF EXISTS ON COLUMN t.\"Amount\" IS $$in euros$$")["name"], "t.Amount");
+        assert_eq!(ddl("COMMENT ON TASK nightly IS ''")["text"], j!(null));
+        assert!(ddl("COMMENT ON TABLE t IS 42")["error"].is_string());
+        assert_eq!(ddl("COMMENT ON SECRETS s IS 'x'")["error"], "COMMENT ON <kind> name IS 'text' | NULL: expected a kind of object (TABLE, COLUMN, VIEW, …) near secrets");
+        assert_eq!(ddl("CREATE OR ALTER TABLE t (a BIGINT) CLUSTER BY (a)")["do"], "or_alter_table");
+        assert!(ddl("CREATE OR ALTER TABLE t AS SELECT 1")["error"].is_string());
+        assert!(ddl("CREATE OR ALTER MATERIALIZED VIEW v AS SELECT 1")["error"].as_str().unwrap().contains("CREATE OR REPLACE MATERIALIZED VIEW"));
+        assert!(ddl("CREATE OR ALTER VIEW v AS SELEC")["error"].is_string(), "the parser's words for the view made anew");
+        assert_eq!(ddl("SELECT 1"), j!(null));
     }
 
     /// A lake on disk is named after its folder (`pondra-ab12`), and ALTER DATABASE, CLONE, BACKUP and RESTORE take the
