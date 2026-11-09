@@ -42,10 +42,8 @@ node txn.rs 1
 node users.rs 2
 node views.rs 9
 node write.rs 1
-reads audit.rs 1
 reads engine.rs 1
 reads ext.rs 3
-reads history.rs 1
 reads iceberg.rs 1
 reads iceberg_rest.rs 3
 reads path.rs 1

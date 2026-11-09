@@ -1127,7 +1127,7 @@ async fn making(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, applie
 /// The admin an APPLY holder below admin acts as for an apply's statements, and for the migrations `capture`
 /// records as run: making the project true takes an admin's statements, and the record keeps who asked.
 pub(crate) fn admin_for(who: &Who, applier: bool) -> Option<crate::auth::Principal> {
-    who.by.clone().filter(|_| applier && who.role < crate::auth::Role::Admin).map(|me| crate::auth::Principal { role: crate::auth::Role::Admin, scope: crate::rights::Scope::everything(), operator: false, ..me })
+    who.by.clone().filter(|_| applier && who.role < crate::auth::Role::Admin).map(|me| crate::auth::Principal { role: crate::auth::Role::Admin, scope: crate::rights::Scope::everything(), operator: false, ..me }.asking()) // (asked again: its scope is a superuser's, as the WHO the apply runs in)
 }
 
 /// The claim, the apply's statements (`statements`), and its record's end (`making`'s span).

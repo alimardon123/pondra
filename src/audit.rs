@@ -484,13 +484,13 @@ fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(crate::answer::schema(&columns())?, arrays)?)
 }
 
-/// Is `sql` about the audit log, and may the caller read it (a superuser)?
-pub fn check(sql: &str) -> Result<bool> {
+/// Is `sql` about the audit log, and may `scope` read it (the planning session's: a superuser's, `Scope::superuser`)? A
+/// scope made without a principal is no one's, and is refused.
+pub fn check(sql: &str, scope: &crate::rights::Scope) -> Result<bool> {
     if !sql.to_lowercase().contains("pondra.audit") {
         return Ok(false);
     }
-    let superuser = crate::auth::current().is_none_or(|p| p.superuser());
-    anyhow::ensure!(superuser, "permission denied: pondra.audit is the superusers'");
+    anyhow::ensure!(scope.superuser(), "permission denied: pondra.audit is the superusers'");
     Ok(true)
 }
 
