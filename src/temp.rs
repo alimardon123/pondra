@@ -215,7 +215,7 @@ impl Sessions {
             self.changes.send_modify(|v| *v += 1);
         }
         if first {
-            crate::spawns::spawn(reap(Arc::downgrade(self))); // (only while there are sessions)
+            crate::spawns::for_statics(reap(Arc::downgrade(self))); // (only while there are sessions)
         }
         Ok(out)
     }

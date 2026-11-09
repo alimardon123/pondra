@@ -26,6 +26,9 @@ pub struct Principal {
     pub epoch: u64,
     /// When its credential ends (ms since the epoch): a user's token's expiry, a session's, an identity provider's token's.
     pub until: Option<u64>,
+    /// Asked at a door that reads only (MCP's query tool, a Flight ticket: `reading`), so nothing it runs moves a
+    /// sequence, wherever the call is: in its text, a view's query or a macro's (`seq::may_move`).
+    pub reads: bool,
 }
 
 impl Principal {
@@ -42,7 +45,7 @@ impl Principal {
             Role::None => crate::rights::Scope::nothing(),
             _ => crate::rights::Scope::everything(),
         };
-        Principal { name: name.into(), role, scope, door: "node", from: None, operator: false, epoch: 0, until: None }
+        Principal { name: name.into(), role, scope, door: "node", from: None, operator: false, epoch: 0, until: None, reads: false }
     }
 
     /// The node's own work's (`as_node`: what no request asked for, a task's tick, a view's refresh, the history's
@@ -57,6 +60,31 @@ impl Principal {
     pub fn stale(&self, lake: &crate::store::Lake) -> bool {
         self.epoch != lake.cat.rights_version() || self.until.is_some_and(|u| u <= crate::log::now_ms())
     }
+
+    /// Who this is now, for a session or stream that outlives a change of who may do what: every door asks it before its
+    /// next piece of work (Flight's DoPut at each batch, HTTP's streams each second, Postgres at each statement, Kafka at
+    /// each request; 11-09 audit M6). None while it is current (`stale`, a version compare) or never ends (the operator).
+    /// Else whoever `sign_in` signs in now, the door's own way, at this one's door and address, with the rights version
+    /// read before it was asked, so a change meanwhile is seen next time; or why it signs in no more, kept in the audit
+    /// log (a user's: nothing signed in, nothing kept), and worded to it by `signed_out`.
+    pub async fn again<F: std::future::Future<Output = std::result::Result<Principal, String>>>(&self, app: &crate::app::App, sign_in: impl FnOnce() -> F) -> Option<std::result::Result<Principal, String>> {
+        if self.operator || !self.stale(&app.lake) {
+            return None;
+        }
+        let epoch = app.lake.cat.rights_version(); // (before it is asked, as at sign-in)
+        Some(match sign_in().await {
+            Ok(p) => Ok(Principal { epoch: p.epoch.max(epoch), ..p.at(self.door, self.from) }),
+            Err(why) => {
+                if !self.name.is_empty() {
+                    crate::audit::refused(app, &self.name, self.door, self.from, "sign in again", &why).await;
+                }
+                Err(why)
+            }
+        })
+    }
+
+    /// `again`'s refusal, as every door words it (SQLSTATE 28000).
+    pub fn signed_out(&self, why: &str) -> String { format!("user \"{}\" is signed out: {why}", self.name) }
 
     /// A token's (one of the nodes', or their key), or the program's that started the node: its
     /// role over everything, this lake's and the lakes attached to it.
@@ -138,6 +166,7 @@ impl crate::spawns::Carry for Carried {
 
 /// A door's connection, as a task it starts (`spawns::Tasks::spawn_as`): no principal of its own, since each request
 /// on it sets the one it signed in as (`WHO`), and work outside one sees nothing.
+#[derive(Clone, Copy)]
 pub struct Door;
 
 impl crate::spawns::Carry for Door {
@@ -146,6 +175,16 @@ impl crate::spawns::Carry for Door {
         F::Output: Send,
     {
         f
+    }
+}
+
+/// `f` as asked at a door that reads only (MCP's query tool, a Flight ticket): its caller marked `reads`, so nothing it
+/// runs moves a sequence, wherever the call is (11-09 audit H1: the door's own look at the text finds no `nextval` a
+/// view's query or a macro holds). Work it hands on keeps the mark, as it keeps its caller (`carried`).
+pub async fn reading<F: std::future::Future>(f: F) -> F::Output {
+    match current() {
+        Some(p) => WHO.scope(Principal { reads: true, ..p }, f).await,
+        None => f.await, // (no caller: nothing moves a sequence anyway, `seq::may_move`, but the node's own work, which no door asks)
     }
 }
 
@@ -781,7 +820,7 @@ mod tests {
     /// other key, a token's and a caller with no name are all refused.
     #[test]
     fn a_page_stages_only_its_own_files() {
-        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, scope: crate::rights::Scope::everything(), door: "http", from: None, operator: false, epoch: 0, until: None };
+        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, scope: crate::rights::Scope::everything(), door: "http", from: None, operator: false, epoch: 0, until: None, reads: false };
         assert_eq!(slug(&user("ali")).as_deref(), Some("616c69"), "a user's slug is its name in hex");
         assert!(slug(&Principal::token(Role::Admin)).is_none(), "a token has no slug");
         let long = format!("stage/616c69/{}/0.parquet", "j".repeat(65));

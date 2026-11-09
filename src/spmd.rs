@@ -139,7 +139,7 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
     let id = uuid::Uuid::new_v4().to_string(); // (the folder every node spills this query's results into)
     let learned = crate::learned::of(&tables); // (the facts this plan uses, sent to every node: `learned.rs`)
     let (whole, upto) = (whole(lake, &tables, &[&main]).await?, lake.visible());
-    let slice = |parts| Slice { sql: sql.into(), parts, shuffle: None, id: id.clone(), whole: whole.clone(), upto, partitions: partitions(), ext: ext.clone(), learned: learned.clone() };
+    let slice = |parts| Slice { sql: sql.into(), parts, shuffle: None, id: id.clone(), whole: whole.clone(), upto, partitions: lake.partitions(), ext: ext.clone(), learned: learned.clone() };
     let slices: Vec<Slice> = parts.into_iter().map(|p| slice(vec![p])).collect();
     let (ctx, plan) = plan(lake, &slices[mine]).await?;
     // Gather when everything below the plan's first gather splits over the nodes as it is (each
@@ -235,7 +235,7 @@ async fn writers<'a>(lake: &Lake, nodes: &'a [String], me: &str, sql: &str) -> R
     let id = uuid::Uuid::new_v4().to_string();
     let learned = crate::learned::of(&tables); // (the facts this plan uses, sent to every node: `learned.rs`)
     let (whole, upto) = (whole(lake, &tables, &[&main]).await?, lake.visible());
-    let slice = |parts| Slice { sql: sql.into(), parts, shuffle: None, id: id.clone(), whole: whole.clone(), upto, partitions: partitions(), ext: ext.clone(), learned: learned.clone() };
+    let slice = |parts| Slice { sql: sql.into(), parts, shuffle: None, id: id.clone(), whole: whole.clone(), upto, partitions: lake.partitions(), ext: ext.clone(), learned: learned.clone() };
     let mut shares: Vec<(&str, Slice)> = nodes.iter().map(String::as_str).zip(deal(lake, &meta, &main, nodes.len()).await?.into_iter().map(|p| slice(vec![p]))).collect();
     let (_, plan) = plan(lake, &shares[mine].1).await?;
     let mut exchanges = vec![];
@@ -665,7 +665,7 @@ async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tabl
         let big: Vec<(String, TableMeta)> = appends.into_iter().filter(|(t, m)| cut(t, m)).collect();
         let id = uuid::Uuid::new_v4().to_string();
         let shuffle = |me| Some(Shuffle { id: id.clone(), nodes: nodes.to_vec(), me, step: 0, how, splits: vec![], again: false });
-        let mut slices: Vec<Slice> = (0..nodes.len()).map(|me| Slice { sql: sql.into(), parts: vec![], shuffle: shuffle(me), id: id.clone(), whole: vec![], upto, partitions: partitions(), ext: ext.clone(), learned: learned.clone() }).collect();
+        let mut slices: Vec<Slice> = (0..nodes.len()).map(|me| Slice { sql: sql.into(), parts: vec![], shuffle: shuffle(me), id: id.clone(), whole: vec![], upto, partitions: lake.partitions(), ext: ext.clone(), learned: learned.clone() }).collect();
         for (t, meta) in &big {
             let parts = match scheme.as_ref().filter(|s| s.columns.contains_key(t)) {
                 Some(s) => crate::ranges::parts(lake, meta, t, s, nodes.len(), (meta.tiered, upto)).await?, // (every node reads the log tail through its range)

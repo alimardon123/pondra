@@ -145,10 +145,19 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         }
         #[cfg(feature = "lake")] // (what a lake does as it opens: `store::OpenHooks`)
         r.section_mut::<crate::store::OpenHooks>().add("branch bases", |lake| Box::pin(crate::branch::load(lake)));
+        #[cfg(feature = "lake")] // (a lake's sessions, and the memory watch it tells of its caches: `store::EngineHooks`)
+        {
+            *r.section_mut::<crate::store::EngineHooks>() = crate::store::EngineHooks { session: Some(session), on_a_page: Some(crate::in_task::planned), roots: Some(crate::oom::roots), wake: Some(crate::oom::wake) };
+        }
         #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: each says what its state holds, `LakeState::ABOUT`)
         {
             let states = r.section_mut::<crate::lake_state::Registered>();
+            states.add_at_open::<crate::hot::Hot>(); // (caches every query reads: made as the lake opens, and charged in this order, `Lake::caches`)
+            states.add_at_open::<crate::serve::Groups>();
+            states.add_at_open::<std::sync::Mutex<crate::query::Tails>>();
+            states.add::<crate::seq::Blocks>();
             states.add::<crate::pages::Pages>();
+            states.add::<crate::readings::Readings>();
             states.add::<crate::page_records::Unsent>();
             states.add::<crate::page_records::Counted>();
             states.add::<crate::ext::Stores>();
@@ -180,7 +189,7 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         #[cfg(feature = "lake")]
         r.section_mut::<crate::records::Rights>().add(crate::users::RIGHTS);
         #[cfg(feature = "lake")] // (who still reads a lake's old files: `pins`)
-        for p in [crate::branch::readers(), crate::tasks::readers(), crate::rerun::readers()] {
+        for p in [crate::branch::readers(), crate::tasks::readers(), crate::rerun::readers(), crate::readings::readers()] {
             r.section_mut::<crate::pins::Pins>().add(p);
         }
         #[cfg(feature = "lake")] // (what the catalog keeps with its entries: the folders each table uses)
@@ -593,9 +602,9 @@ fn analyze_output(exec: &AnalyzeExec, schema: &SchemaRef, rows: usize, duration:
 /// the lake's own functions in each.
 #[cfg(feature = "lake")]
 impl crate::store::Lake {
-    /// A fresh SQL session on the shared runtime (`partitions()` of them).
+    /// A fresh SQL session on the shared runtime, in its node's partitions (`Lake::partitions`).
     pub fn session(&self) -> SessionContext {
-        self.session_with(crate::store::partitions())
+        self.session_with(self.partitions())
     }
 
     /// A session with a fixed number of partitions: 1 for point lookups, where splitting the work

@@ -22,6 +22,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
+import { readdirSync, readFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
@@ -38,37 +39,14 @@ const lake = args.includes('--lake')
   ? resolve(args[args.indexOf('--lake') + 1])
   : resolve(dirname(fileURLToPath(import.meta.url)), '../web/lake');
 const sizes = args.includes('--sizes');
-// How the line below moves: the module's brotli stays the gate, with at least 3 KB of room above main, since a change of
-// layout alone moves it by 1-2 KB (once by 62 KB, 11-09); and the line moves down only with cuts measured in the
-// module's own wasm bytes.
-// The most a page may download (`--sizes`: the module at brotli 11, as a server sends it), designs/page-same-core.md P4. It
-// moves down with each cut, never up without a reason in the commit that moves it. 9.2 → 9.206 MB: eager aggregation
-// (`eager.rs`, 6.2 KB), a rule every form's planner runs (TPC-DS q22 3.46 → 0.42 s), the room above main kept as it was.
-// 9.206 → 9.216 MB: UNDROP for every kind of definition (`undrop.rs`, 9.6 KB over main's 9,204,641 at 4f7aaf47): a page's
-// lake keeps a dropped view, routine, task, type, secret or connection and brings it back, as every form's does.
-// 9.216 → 9.222 MB: UNDROP of a schema dropped with CASCADE and of a materialized view (6.2 KB over main's 9,214,326 at
-// 3d5a4f49, measured on CI): a page's lake brings back a schema with what it held, and a view made again from its query.
-// 9.222 → 9.2255 MB: avg of a DECIMAL as sum / count (`avg.rs`, 3.2 KB over main's 9,214,186 at 366b20c8, measured on
-// CI): a page's average answers as its sum over its count does, in type and digits, as every form's does.
-// 9.2255 → 9.2305 MB: who did it, named by argument (M8 3d-2a, step 6): a routine's `Who` carries its sign-in and each
-// stamp takes it, and the page's member names its session for its own principal (5.0 KB over main's 9,221,388 at
-// f1a23198, measured on CI), the room above main kept as it was.
-// 9.2305 → 9.2442 MB: a dropped database kept in its folder and UNDROP DATABASE (13.7 KB over main's 9,224,889 at
-// caedf432: 9,238,567 at f0045f19, measured on CI), the room above main kept as it was: the page builds the same ddl as
-// every form, a database's drop and undrop with it.
-// 9.2442 → 9.2517 MB: UNDROP FILE (UNDROP for every kind, files): a page's lake lists a deleted file in `pondra.dropped`
-// and brings it back, as every form's does (5.3 KB over main's 9,228,372 at ed42156e, measured on CI), and the room
-// above main back to 3 KB, which the moves since had left at 0.9 KB (main's 9,243,289 at bb80824c).
-// 9.2517 → 9.3115 MB: the module's code order, not its code. #709 into main's bb80824c (eb0efea, measured on CI): its wasm
-// 128 B and its gzip 193 B over main's, its brotli 62.5 KB over (9,305,835): brotli's 4 MB window finds fewer matches
-// when the same code lands in another order. #716 lands at the same 9.306 MB with 4.2 KB of wasm of its own.
-// (On main's 9,245,764 at ff11c95b, with that order: about 9,308,400, the room above it 3 KB.)
-// 9.3115 → 9.3155 MB: the catalog's hooks and the folder records (`store::CatalogHook`, `ddl::folder_hook`, 4.0 KB over
-// main's 9,224,889 at caedf432: 9,228,850 at 7490f43b, measured on CI), the room above main kept at 3 KB: a page's
-// CREATE TABLE reads one folder's records, not every table, as every form's does.
-// 9.3155 → 9.3167 MB: a lake's Kafka door, Kafka clients and sharing door keep their state as the lake's (step 2, PR 12c:
-// 1.2 KB over main's 9,243,289 at bb80824c, 9,244,454 measured on CI), the room above main kept as it was.
-const BROTLI_BUDGET = 9_316_700;
+// The most a page may download (`--sizes`: the module at brotli 11, as a server sends it), designs/page-same-core.md P4:
+// the sum of tools/web-budget/'s files, each a signed number of bytes on its first line and why below it. A pull request
+// that moves the line adds a file of its own, never edits another's: two in the train then never touch the same line
+// (11-09: #708, #709, #712 and #713 each raised one constant, and each knocked the next off the train).
+// How the line moves: the module's brotli stays the gate, with at least 3 KB of room above main, since a change of layout
+// alone moves it by 1-2 KB (once by 62 KB, 11-09); a raise names what its bytes buy, measured on CI; and the line moves
+// down only with cuts measured in the module's own wasm bytes.
+const BROTLI_BUDGET = budgetOf(resolve(dirname(fileURLToPath(import.meta.url)), 'web-budget'));
 // The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
 const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows
@@ -2387,6 +2365,16 @@ try {
 } finally {
   await target.close();
 }
+// The page's budget: the sum of `dir`'s files' first lines (bytes, `_` or `,` between digits allowed, a sign for a cut).
+function budgetOf(dir) {
+  let sum = 0;
+  for (const name of readdirSync(dir).filter(n => n.endsWith('.txt')).sort()) {
+    const first = readFileSync(join(dir, name), 'utf8').split('\n')[0].trim().replace(/[_,]/g, '');
+    if (!/^[+-]?\d+$/.test(first)) throw new Error(`tools/web-budget/${name}: its first line is to be a number of bytes, not "${first}"`);
+    sum += Number(first);
+  }
+  return sum;
+}
 const result = {
   ok: failed.length === 0, checks: passed, failed, open_ms: target.open_ms, series_10m_ms, wasm_bytes: wasm.length,
   browser: target.version, // (absent in Node: JSON leaves out an undefined value)
@@ -2400,7 +2388,7 @@ if (sizes) {
   result.brotli_budget = BROTLI_BUDGET;
   if (result.brotli_bytes > BROTLI_BUDGET) {
     result.ok = false;
-    result.failed.push(`the module's brotli is ${result.brotli_bytes} bytes, over its budget of ${BROTLI_BUDGET}`);
+    result.failed.push(`the module's brotli is ${result.brotli_bytes} bytes, over its budget of ${BROTLI_BUDGET} (tools/web-budget/)`);
   }
 }
 console.log(JSON.stringify(result));

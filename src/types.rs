@@ -41,14 +41,7 @@ pub struct Type {
     pub labels: Vec<String>,
 }
 
-/// An enum column, as its table keeps it: the labels it takes, and the type it is of (none for
-/// `ENUM('a', 'b')` written in the column).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Enum {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub of: Option<String>,
-    pub labels: Vec<String>,
-}
+pub use crate::table_record::Enum;
 
 impl Enum {
     /// The column's type as SQL writes it: its type's name, or `ENUM('a', 'b')`.
@@ -60,7 +53,19 @@ impl Enum {
     }
 }
 
-/// `CREATE TYPE … AS ENUM`, `ALTER TYPE`, `DROP TYPE`, or None for anything else.
+/// `CREATE [OR REPLACE] TYPE`, `ALTER TYPE` and `DROP TYPE`: the statements section's entries' reader (`core_statements.rs`,
+/// step 8 PR 8c2).
+pub(crate) fn read(w: &mut crate::words::Words) -> Result<Stmt> {
+    let verb = w.next().map(|v| v.word()).unwrap_or_default();
+    Ok(match crate::rules::types::read(&verb, w) {
+        Ok(c) => Stmt::Ddl(vec![crate::ddl::Ddl::Type(c)]),
+        Err(why) => Stmt::Invalid(why),
+    })
+}
+
+/// `CREATE TYPE … AS ENUM`, `ALTER TYPE`, `DROP TYPE`, or None for anything else: as `write::parse` read them before they
+/// were the statements section's entries (`write::was`).
+#[cfg(test)]
 pub fn statement(sql: &str) -> Option<Stmt> {
     crate::rules::types::change(sql).map(|r| match r {
         Ok(c) => Stmt::Ddl(vec![crate::ddl::Ddl::Type(c)]),

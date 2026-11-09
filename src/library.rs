@@ -5,7 +5,7 @@
 //! failure stops it and says why to every request after, until it is opened again.
 //!
 //! The places that exec, abort or exit ask the node's [`Lifecycle`](crate::lifecycle::Lifecycle) instead, which the
-//! host implements (`node::Native`: here a restart unwinds and a stop fails the node, `spawns::spawn`, `format::watch`,
+//! host implements (`node::Native`: here a restart unwinds and a stop fails the node, `Tasks::spawn_node`, `format::watch`,
 //! the catalog's compactor). The node's host state is kept in `node.rs`, beside the rest of the node.
 //! Helpers the node starts (`pondra lead`, Python looked for beside it) are the program the packages give
 //! ([`exe`](crate::node::exe)), never the host's own executable.
@@ -16,7 +16,7 @@
 //! process: the console in a browser, Python's workers calling back, other processes on the lake.
 use crate::node::{Event, Held, Node, Options, Restarting};
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, atomic::{AtomicBool, Ordering::SeqCst}};
 use std::time::{Duration, Instant};
 use futures::FutureExt;
 use tokio::sync::mpsc;
@@ -38,7 +38,7 @@ pub struct Opened {
     state: Arc<Mutex<State>>,
     /// The node's router while it runs (`Node::router`): what [`Opened::ask`] calls.
     router: Arc<Mutex<Option<axum::Router>>>,
-    events: mpsc::UnboundedSender<Event>,
+    host: crate::node::Host, // (its node's host: a close is told to it, as the node's failures are)
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The key that makes a request the owner's (invariant 61), given by its host (`pondra.open` gives its
     /// connection's) or made at open: what [`Opened::ask`] signs with.
@@ -107,6 +107,22 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     R.get_or_init(|| crate::spawns::runtime().thread_name("pondra").build().expect("a runtime"))
 }
 
+/// Is a node open in this process as a library's? `Opened::open` claims it and its close lets it go. One at a time: a
+/// halt resets every node's statics (`reset::reset`), and the machine and network the first start installs are the process's.
+static OPEN: AtomicBool = AtomicBool::new(false);
+
+const ONE_AT_A_TIME: &str = "a node is open in this process already: close it first (one at a time)";
+
+/// The process's one library node is this one, and the process is a host program's from now on; refused while another is open.
+fn claim() -> anyhow::Result<()> {
+    anyhow::ensure!(!OPEN.swap(true, SeqCst), "{ONE_AT_A_TIME}");
+    crate::machine::set_hosted(); // (what the process is, from its first library's open: it outlives each node)
+    Ok(())
+}
+
+/// The library's node is closed, or its open failed: another may open.
+fn release() { OPEN.store(false, SeqCst) }
+
 /// Pauses between tries to start again; five restarts within a minute of each other is giving up.
 const PAUSES: [f64; 5] = [0.5, 1.0, 2.0, 4.0, 8.0];
 
@@ -116,21 +132,22 @@ impl Opened {
     pub fn open(mut options: Options) -> anyhow::Result<Opened> {
         options.dir = crate::memory_lake::place(&options.dir); // (`:memory:`: a new lake in this process's memory)
         let memory = crate::memory_lake::in_memory(&options.dir).then(|| options.dir.clone());
-        let (events, rx) = mpsc::unbounded_channel();
-        crate::node::host(events.clone())?;
+        claim()?;
+        let (host, told) = crate::node::Host::new();
+        options.host = Some(host.clone()); // (every start of the node is under this supervisor: `Lifecycle::stop`, `restart`, `move_lake`)
         let state = Arc::new(Mutex::new(State::Starting));
         let router = Arc::new(Mutex::new(None));
         let (first, started) = std::sync::mpsc::channel();
         let (st, ro) = (state.clone(), router.clone());
-        let thread = std::thread::Builder::new().name("pondra-supervisor".into()).stack_size(8 << 20).spawn(move || runtime().block_on(crate::auth::as_node(supervise(options, st, ro, rx, first)))); // (the node's start: its own work, `auth::as_node`; a request is its caller's)
+        let thread = std::thread::Builder::new().name("pondra-supervisor".into()).stack_size(8 << 20).spawn(move || runtime().block_on(crate::auth::as_node(supervise(options, st, ro, told, first)))); // (the node's start: its own work, `auth::as_node`; a request is its caller's)
         let thread = match thread {
             Ok(t) => t,
             Err(e) => {
-                crate::node::unhost();
+                release();
                 return Err(e.into());
             }
         };
-        let opened = Opened { state, router, events, thread: Mutex::new(Some(thread)), owner: None, memory };
+        let opened = Opened { state, router, host, thread: Mutex::new(Some(thread)), owner: None, memory };
         match started.recv() {
             Ok(Ok(())) => Ok(opened),
             Ok(Err(why)) => Err(anyhow::anyhow!(why)), // (`opened` dropped: closed)
@@ -144,11 +161,11 @@ impl Opened {
     /// Drains the node (its requests in flight answered), stops it, and ends its supervisor. Again
     /// is nothing.
     pub fn close(&self) {
-        let _ = self.events.send(Event::Close);
+        self.host.tell(Event::Close);
         let thread = self.thread.lock().unwrap_or_else(PoisonError::into_inner).take();
         if let Some(t) = thread {
             let _ = t.join();
-            crate::node::unhost();
+            release();
         }
         if let Some(lake) = &self.memory {
             crate::memory_lake::forget_memory(lake);
@@ -180,7 +197,7 @@ impl Opened {
             None => vec![],
         };
         // (one at a time, said before any setting is given: a refused open changes nothing)
-        anyhow::ensure!(!crate::node::hosting(), "a node is open in this process already: close it first (one at a time)");
+        anyhow::ensure!(!OPEN.load(SeqCst), "{ONE_AT_A_TIME}");
         crate::env::give(o.into_iter().map(|(k, v)| (if k == "launcher" { "PONDRA_LAUNCHER".into() } else { k }, text(v))))?;
         crate::tls::init()?; // (a certificate that can't be read: said now)
         let mut options = Options::local(&lake, &addr);
@@ -285,7 +302,8 @@ fn halt(held: &Held, node: Option<Node>) {
     crate::reset::reset();
 }
 
-async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<Mutex<Option<axum::Router>>>, mut events: mpsc::UnboundedReceiver<Event>, first: std::sync::mpsc::Sender<Result<(), String>>) {
+async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<Mutex<Option<axum::Router>>>, told: crate::node::Told, first: std::sync::mpsc::Sender<Result<(), String>>) {
+    let crate::node::Told { mut events, mut moves } = told; // (its nodes': their failures, restarts and the close; their lakes' moves)
     // (the router is there exactly while the node runs: a request at any other time is told why)
     let set = |s: State| {
         let mut r = router.lock().unwrap_or_else(PoisonError::into_inner);
@@ -296,7 +314,6 @@ async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<M
     };
     let mut first = Some(first);
     let mut restarts: Vec<Instant> = vec![];
-    let mut moves = crate::node::mover(); // (a lake moving to another place: `memory::set_location`)
     loop {
         set(State::Starting);
         // (a start can be told to restart by a task it started, or unwind with `Restarting` itself)

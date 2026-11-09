@@ -7,7 +7,6 @@
 use crate::text::{ident, object};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::sql::sqlparser::ast;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use super::{Column, Table};
@@ -125,18 +124,7 @@ fn deferred(c: &Option<ast::ConstraintCharacteristics>) -> Result<()> {
 
 // ---------------------------------------------------------------- identity columns (`seq.rs`)
 
-/// One option as written (`INCREMENT BY 2`, `NO MAXVALUE`, `AS integer`); a later one of a kind wins.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Opt {
-    As(String),
-    Increment(i64),
-    Min(Option<i64>),
-    Max(Option<i64>),
-    Start(i64),
-    Cache(i64),
-    Cycle(bool),
-}
+pub use crate::table_record::{Identity, Opt};
 
 impl Opt {
     pub fn rank(&self) -> usize { [matches!(self, Opt::As(_)), matches!(self, Opt::Increment(_)), matches!(self, Opt::Min(_)), matches!(self, Opt::Max(_)), matches!(self, Opt::Start(_)), matches!(self, Opt::Cache(_)), matches!(self, Opt::Cycle(_))].iter().position(|m| *m).unwrap_or(0) }
@@ -222,9 +210,11 @@ pub fn options(given: &[ast::SequenceOptions]) -> Result<Vec<Opt>> {
 
 /// A sequence's options as Postgres takes them, in any order (`START 10 INCREMENT 5`, `INCREMENT BY
 /// 5 START WITH 10`), checked; with `alter`, `RESTART [[WITH] n]` too.
-pub fn parse_options(text: &str, alter: bool) -> Result<(Vec<Opt>, Option<Option<i64>>)> {
+pub fn parse_options(text: &str, alter: bool) -> Result<(Vec<Opt>, Option<Option<i64>>)> { options_in(text.split_whitespace().map(str::to_uppercase).collect(), alter) }
+
+/// `parse_options` of the options' words, upper-cased, one a word (`["START", "WITH", "-5"]`).
+pub fn options_in(words: Vec<String>, alter: bool) -> Result<(Vec<Opt>, Option<Option<i64>>)> {
     const USAGE: &str = "[AS smallint | integer | bigint] [INCREMENT [BY] n] [MINVALUE n | NO MINVALUE] [MAXVALUE n | NO MAXVALUE] [START [WITH] n] [CACHE n] [[NO] CYCLE]";
-    let words: Vec<String> = text.split_whitespace().map(str::to_uppercase).collect();
     let (mut out, mut restart, mut i) = (vec![], None, 0);
     let number = |i: usize| -> Result<i64> {
         let w = words.get(i).with_context(|| format!("a number after {}", words[i - 1]))?;
@@ -293,16 +283,6 @@ pub fn in_order(sql: &str) -> Option<String> {
         Err(_) => c[0].to_string(), // (the parser says what's wrong)
     });
     (out != sql).then(|| out.into_owned())
-}
-
-/// An identity column, as its table keeps it (its column's `identity`, `store::Col`).
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-pub struct Identity {
-    pub always: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub declared: Vec<Opt>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub sequence: String,
 }
 
 impl Identity {

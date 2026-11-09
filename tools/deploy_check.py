@@ -152,7 +152,9 @@ def image(a):
               all(l.split()[0] == "65532" for l in owners.splitlines()) and "600 /data/.pondra/secret.key" in owners, owners)
         query_memory = metric(port, "pondra_memory_limit_bytes", token)  # (a node on the network answers /metrics to a token only)
         info["query memory in a 1 GB container (bytes)"] = query_memory
-        check("its queries are sized by the container's memory, not the host's", query_memory and query_memory <= limit / 2, query_memory)
+        # (queries and the caches share the memory line, 72% of the machine's memory, the caches giving way: #643.
+        # In a 1 GB container that is the container's: about 0.6 GB on 11-09, where the host's would be 11 GB)
+        check("its queries are sized by the container's memory, not the host's", query_memory and query_memory <= limit * 0.72, query_memory)
         key = look("sha256sum /data/.pondra/secret.key")
         t0 = time.time()
         run("docker", "stop", "-t", "30", name)

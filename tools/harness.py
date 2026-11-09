@@ -10841,6 +10841,19 @@ def server():
     checks["a grant ON ALL TABLES lists none of another database's tables, as it reads none; a grant naming one lists it (pondra.objects, 11-08 audit L7)"] = \
         isinstance(seen["bob_lists"], list) and any(r["name"] == "people" for r in seen["bob_lists"]) and not any(r["name"] == "notes" for r in seen["bob_lists"]) \
         and isinstance(seen["ann_lists"], list) and [r["name"] for r in seen["ann_lists"]] == ["notes"]
+    # (11-09 audit L1: under USE of an attached lake, pg_catalog lists its tables by the grants naming them, lake.t, as its
+    # reads are: bob's ON ALL TABLES of hr lists none of lake's tables; ann's grant naming lake.notes lists notes)
+    def under_use(auth, who):
+        h = {"Authorization": "Basic " + base64.b64encode(auth.encode()).decode(), "x-pondra-session": f"audit-l1-{who}"}
+        try:
+            call(port, "POST", "/db/hr/sql", b"USE lake", headers=h)
+            return call(port, "POST", "/db/hr/sql", b"SELECT relname FROM pg_class WHERE relkind = 'r' ORDER BY relname", headers=h)
+        except Exception as e:
+            return f"ERROR {e}"
+    for who, auth in (("bob", bob), ("ann", ann)):
+        seen[f"{who}_use"] = under_use(auth, who)
+    checks["under USE of an attached lake, pg_class lists its tables by the grants naming them: bob's ON ALL TABLES of hr lists none, ann's naming lake.notes lists notes (11-09 audit L1)"] = \
+        seen["bob_use"] == [] and isinstance(seen["ann_use"], list) and [r["relname"] for r in seen["ann_use"]] == ["notes"]
     # Whoever runs the nodes (one of their tokens) still reads across; a user of the node's own lake doesn't.
     mine = new_lake()
     subprocess.run([BIN, "sql", "--dir", mine, "CREATE TABLE t AS SELECT 1 AS id"], check=True, capture_output=True)
@@ -16572,10 +16585,12 @@ def waits():
         first == [(1,)] and waited_q and got_q["code"] == "ok"
 
     # Two workers, one on each node, take jobs with SELECT … LIMIT 1 FOR UPDATE, across tiered files: every job is
-    # taken once and all 40 are done.
-    sql(LP, "CREATE TABLE jobs (id BIGINT PRIMARY KEY, status VARCHAR)")
+    # taken once and all 40 are done. (On the first lake's nodes, with the default lease and idle end. Under the 2 s
+    # ones above, a busy runner can stall a worker's transaction past them, and a lock lost that way is refused at
+    # COMMIT with 40001, as the lease's own checks say: a follower's worker got that once in CI.)
+    sql(A.port, "CREATE TABLE jobs (id BIGINT PRIMARY KEY, status VARCHAR)")
     for lo in range(1, 41, 10):
-        sql(LP, f"INSERT INTO jobs SELECT value, 'new' FROM range({lo}, {lo + 10})")
+        sql(A.port, f"INSERT INTO jobs SELECT value, 'new' FROM range({lo}, {lo + 10})")
         time.sleep(0.7)  # (the leader tiers between the inserts: several files)
     taken, worker_errors = {"a": [], "b": []}, []
     def worker(name, port):
@@ -16592,11 +16607,11 @@ def waits():
                 taken[name].append(row[0])
         except Exception as e:  # (a worker that fails says so: the check below fails, rather than the other one finishing alone)
             worker_errors.append(f"{name}: {e}")
-    ws = [threading.Thread(target=worker, args=(n, p)) for n, p in (("a", LP + 100), ("b", FP + 100))]
+    ws = [threading.Thread(target=worker, args=(n, p)) for n, p in (("a", pga), ("b", pgb))]
     [w.start() for w in ws]
     [w.join(300) for w in ws]
     checks["two workers on two nodes take jobs with SELECT … LIMIT 1 FOR UPDATE across tiered files: each job taken once, all 40 done"] = \
-        sorted(taken["a"] + taken["b"]) == list(range(1, 41)) and sql(LP, "SELECT count(*) AS n FROM jobs WHERE status = 'done'")[0]["n"] == 40 and not worker_errors
+        sorted(taken["a"] + taken["b"]) == list(range(1, 41)) and sql(A.port, "SELECT count(*) AS n FROM jobs WHERE status = 'done'")[0]["n"] == 40 and not worker_errors
     info["job_workers_errors"] = worker_errors
 
     # INSERT, then an UPDATE that waits for another commit on its row: it commits, without 40001.
@@ -22372,8 +22387,9 @@ def rejects():
     """Rows dropped are kept for review (`pondra.rejects`, G2): each row a materialized view's expectation leaves out (ON
     VIOLATION DROP ROW) is kept, in the commit that writes the view's other rows, with its object, the rule it broke (the
     first, of two), why, the row as JSON, the run that brought it (a statement's job, an /append's producer, a bulk INSERT's
-    job, the view's filling) and when, while the view still leaves it out. A view's rejects are shown for its retention. A
-    user with grants sees the rejects of the views it may read in whole; a superuser all of them."""
+    job, the view's filling) and when, while the view still leaves it out. A view's rejects are shown for its retention, and
+    are its own: a view made again under its name has none of the earlier one's. A user with grants sees the rejects of the
+    views it may read in whole; a superuser all of them."""
     import base64
     lake = new_lake()
     node = Node(lake, A.port, tier_secs=0.5).start()
@@ -22439,6 +22455,27 @@ def rejects():
     info["retain7"] = ask(boss, "ALTER TABLE silver SET (retention = '7 days')")
     back = rows(boss, "WHERE object = 'silver'")
     checks["a view's rejects are held for its retention"] = gone == [] and isinstance(back, list) and len(back) == len(of("silver"))
+    # (a view's rejects are its own, not its name's: one made again under the name starts with none of the earlier one's, and
+    # an UNDROP, which makes the view again from its query, keeps its filling's once; 11-09 audit M3)
+    for q in ["DROP MATERIALIZED VIEW bronze",
+              "CREATE MATERIALIZED VIEW bronze (CONSTRAINT huge CHECK (amount < 10000) ON VIOLATION DROP ROW) AS SELECT id, amount FROM orders",
+              "GRANT SELECT ON bronze TO bob", "DROP MATERIALIZED VIEW silver", "UNDROP MATERIALIZED VIEW silver"]:
+        info.setdefault("again", []).append(ask(boss, q))
+    again, till = [], time.time() + 20
+    while time.time() < till:  # (silver filled again from the rows there)
+        again = rows(boss)
+        if isinstance(again, list) and len([r for r in again if r["object"] == "silver" and str(r["run"]).startswith("fill:")]) >= len(of("silver")):
+            break
+        time.sleep(0.5)
+    time.sleep(1)
+    again = rows(boss)
+    of_again = lambda o: [r for r in again if r["object"] == o] if isinstance(again, list) else []
+    bob_again = rows(bob)
+    info["again_rows"], info["bob_again"] = len(again) if isinstance(again, list) else again, (bob_again[:3] if isinstance(bob_again, list) else bob_again)
+    checks["a view made again under its name has none of the earlier one's rejects, for a reader granted it nor a superuser (11-09 audit M3)"] = \
+        isinstance(again, list) and of_again("bronze") == [] and bob_again == []
+    checks["an UNDROP makes the view again from its query: its rejects are its filling's, each once (11-09 audit M3)"] = \
+        len(of("silver")) > 0 and ids(of_again("silver")) == ids(of("silver")) and all(str(r["run"]).startswith("fill:") for r in of_again("silver"))
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"rejects": checks, "ok": ok, **({} if ok else {"info": info})}, indent=1, default=str))
@@ -22769,6 +22806,48 @@ def listings():
     stopped = lambda v: "permission denied for sequence" in v
     checks["a sequence moves for a writer of a table that takes from it: ann, granted only INSERT on tickets, numbers its rows and takes its next value, but sets none and moves no other sequence, at every door (11-09 audit H1)"] = \
         all(went(d["INSERT"]) and went(d["nextval"]) and stopped(d["setval"]) and stopped(d["nextval, another"]) and stopped(d["setval, another"]) for d in seqs.values())
+    # (11-09 audit M2: of a table ann reads in part, the catalog names no column ann may not read: not its key, an index, a
+    # CHECK, a foreign key or a comment over one)
+    for q in ["CREATE TABLE owners (owner_key BIGINT PRIMARY KEY)",
+              "CREATE TABLE vault (vault_id BIGINT PRIMARY KEY, secret_amount DOUBLE CHECK (secret_amount > 0), open_note TEXT, owner_ref BIGINT REFERENCES owners (owner_key) NOT ENFORCED)",
+              "CREATE INDEX vault_by_amount ON vault (secret_amount)", "COMMENT ON COLUMN vault.secret_amount IS 'hush hush'",
+              "GRANT SELECT (open_note, owner_ref) ON vault TO ann"]:
+        ask(boss, q)
+    listings = ["SELECT * FROM pg_indexes WHERE tablename = 'vault'", "SELECT * FROM information_schema.key_column_usage WHERE table_name = 'vault'",
+                "SELECT * FROM information_schema.constraint_column_usage", "SELECT * FROM information_schema.table_constraints WHERE table_name = 'vault'",
+                "SELECT * FROM pg_constraint", "SELECT * FROM pg_description", "SELECT * FROM pg_index"]
+    def pg_rows(user, password, q):
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user={user} password={password} dbname=lake", connect_timeout=10, autocommit=True) as c:
+                return str(c.execute(q).fetchall())
+        except psycopg.Error as e:
+            return f"{e.sqlstate} {e.diag.message_primary}"
+    named = {who: {q: pg_rows(who, f"{who}-password-1", q) for q in listings} for who in ("ann", "boss")}
+    words = ["vault_id", "secret_amount", "hush hush", "vault_by_amount", "owner_key", "vault_owner_ref_fkey", "vault_pkey"]
+    unseen["M2"] = {**{q: [w for w in words if w in v] for q, v in named["ann"].items()}, "the superuser lacks": [w for w in words if not any(w in v for v in named["boss"].values())]}
+    checks["of a table ann reads in part, pg_catalog and information_schema name no column ann may not read: no key, index, CHECK, foreign key or comment over one; the superuser sees them all (11-09 audit M2)"] = \
+        not any(w in v for v in named["ann"].values() for w in words) and all(any(w in v for v in named["boss"].values()) for w in words)
+    # (a probe that reads no rows, `LIMIT 0` or `WHERE 1=0` as JDBC and Spark send, was planned with no scan, where the
+    # columns are checked: it named every column of ledger and its type, k too, at every door, 11-09 audit M1)
+    probes = {"LIMIT 0": "SELECT * FROM ledger LIMIT 0", "WHERE 1=0": "SELECT * FROM ledger WHERE 1=0", "a join on FALSE": "SELECT * FROM ledger a JOIN ledger b ON FALSE"}
+    probed = {f"{door}, {what}": ask_(s, False) for what, s in probes.items() for door, ask_ in doors.items()}
+    probed.update({f"Postgres Describe, {what}": pg_describe(s) for what, s in probes.items()})
+    own = {door: ask_("SELECT v FROM ledger WHERE 1=0", False) for door, ask_ in doors.items()}
+    own["Postgres Describe"] = pg_describe("SELECT v FROM ledger WHERE 1=0")
+    unseen["M1"] = (probed, own)
+    checks["a probe of no rows of ledger (LIMIT 0, WHERE 1=0, a join on FALSE), of which ann reads v only, is refused at every door and by Postgres's Describe, as a read of its rows is (11-09 audit M1)"] = \
+        all("permission denied" in a and not a.startswith("columns") for a in probed.values())
+    checks["the probe of v, which ann may read, answers no rows at every door, and Postgres's Describe names v only (11-09 audit M1)"] = \
+        all("permission denied" not in a and not a.startswith(("4", "5")) and '"isError":true' not in a.replace(" ", "") for a in own.values()) and own["Postgres Describe"] == "columns v"
+    # (and a door that reads only, MCP's query tool or a Flight ticket, moves none for anyone, wherever the call is: a view's
+    # query holds a nextval the statement's text doesn't. HTTP, which writes, still numbers through the view for ann)
+    for q in ["CREATE VIEW next_ticket AS SELECT nextval('tickets_id_seq') AS n", "GRANT SELECT ON next_ticket TO ann"]:
+        ask(boss, q)
+    through = {door: doors[door]("SELECT n FROM next_ticket", False) for door in ("Flight SQL", "MCP", "HTTP")}
+    unseen["H1, read doors"] = through
+    reads_only = lambda v: "read-only transaction" in v and "nextval" in v
+    checks["a door that reads only, MCP's query tool and a Flight ticket, moves no sequence through a view's query either; HTTP still does for ann, a writer of tickets (11-09 audit H1)"] = \
+        reads_only(through["Flight SQL"]) and reads_only(through["MCP"]) and went(through["HTTP"])
     info["unseen"] = unseen
     node.kill()
     ok = all(checks.values())
