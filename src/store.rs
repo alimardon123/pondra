@@ -890,10 +890,10 @@ pub struct TableMeta {
     /// UNIQUE, and PRIMARY KEY and FOREIGN KEY said NOT ENFORCED, by stored column names
     /// (`constraints.rs`, ADR-057): an enforced UNIQUE has every write checked on the leader.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub constraints: Vec<crate::constraints::Constraint>,
+    pub constraints: Vec<crate::table_record::Constraint>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ext: Option<crate::ext_names::Spec>,
+    pub ext: Option<crate::table_record::Spec>,
     /// Another engine's table (`scan.rs`): what matches its files' columns to its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outside: Option<crate::scan::Table>,
@@ -904,7 +904,7 @@ pub struct TableMeta {
     /// A history view's table (SCD type 2, ADR-036 §8): every version of each key as it came;
     /// reads give each its `__start_at` and `__end_at` (`views::history_view`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub history: Option<crate::views::History>,
+    pub history: Option<crate::table_record::History>,
     /// A GROUP BY view's table whose answers need a last step (avg, stddev, HAVING, …: ADR-055):
     /// its columns are what adds up, and reads give the view's columns from them (`finish.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -932,7 +932,7 @@ pub struct TableMeta {
     pub shares: Vec<String>,
     /// The rules made from this parse, once (`rules`): never in the catalog, and a clone starts without them.
     #[serde(skip)]
-    pub rules: crate::memo::Memo<crate::rules::Table>,
+    pub rules: crate::memo::Memo<crate::table_record::Table>,
     /// Its column list (`cols`), made once for an entry read from the catalog: a clone's is empty, as `rules`' is.
     #[serde(skip)]
     pub column_memo: crate::memo::Memo<crate::column::Columns>,
@@ -1197,16 +1197,21 @@ impl TableMeta {
     /// The table of `of`'s replaced rows (`sys::deleted`) takes its columns: the same list, `_old_version` after it.
     pub fn follow_columns(&mut self, of: &TableMeta) { self.set_list(Stored::replaced(of.list()), self.record.listed) }
 
-    /// The table a write's rules see (`rules::Table`), made from the rule fields alone: never `files` or the
+    /// Does a plain INSERT into this table have its key checked on the leader (`constraints.rs`)? A keyed table's key is
+    /// its PRIMARY KEY: a plain INSERT of a key the table holds is refused. A GROUP BY view's table (`merge`) combines a
+    /// key's rows by design, so it has no such refusal.
+    pub fn key_checked(&self) -> bool { !self.key.is_empty() && self.merge.is_empty() }
+
+    /// The table a write's rules see (`table_record::Table`), made from the rule fields alone: never `files` or the
     /// statistics. Each column SQL sees (`live`, the one mapping of stored names to SQL's) takes its rules by its
     /// stored name, as the entry keeps them.
-    pub fn to_rules(&self) -> Result<crate::rules::Table> {
+    pub fn to_rules(&self) -> Result<crate::table_record::Table> {
         let columns = self
             .list()
             .columns
             .iter()
             .filter(|c| !c.dropped)
-            .map(|c| crate::rules::Column {
+            .map(|c| crate::table_record::Column {
                 name: c.name.clone(),
                 stored: c.stored_name().to_string(),
                 not_null: c.not_null,
@@ -1216,15 +1221,15 @@ impl TableMeta {
                 labels: c.labels.as_ref().map(|e| (e.of.clone(), e.labels.clone())),
             })
             .collect();
-        Ok(crate::rules::Table {
+        Ok(crate::table_record::Table {
             schema: crate::answer::schema(&self.logical_columns())?,
             columns,
             key: self.key.iter().map(|c| self.name_of(c).to_string()).collect(),
-            key_checked: crate::constraints::key_checked(self),
+            key_checked: self.key_checked(),
             unique: self
                 .constraints
                 .iter()
-                .filter(|c| c.enforced && c.kind == crate::constraints::Kind::Unique)
+                .filter(|c| c.enforced && c.kind == crate::table_record::Kind::Unique)
                 .map(|c| (c.name.clone(), c.columns.iter().map(|s| self.name_of(s).to_string()).collect()))
                 .collect(),
             checks: self.checks.clone(),
@@ -1236,7 +1241,7 @@ impl TableMeta {
 
     /// The rules of this entry, made once per parse and kept beside it: `Catalog::parsed` hands out one `Arc` per
     /// entry's bytes, so a write takes them with no lookup. An owned or changed entry calls `to_rules` instead.
-    pub fn rules(self: &Arc<Self>) -> Result<Arc<crate::rules::Table>> {
+    pub fn rules(self: &Arc<Self>) -> Result<Arc<crate::table_record::Table>> {
         self.rules.get_or_try_init(|| self.to_rules())
     }
 
@@ -1853,18 +1858,25 @@ pub fn memory_limit() -> usize {
 
 /// The process's line for every node's queries together (`ledger::Root`): its whole line (`root_whole`) where there is one,
 /// else 4 GiB; on a page, its device's line's trim line, as a node's is (`env::page_line_share`). A node's own `PONDRA_MEMORY_GB` is its
-/// budget on it (`memory_limit`), never the process's.
+/// budget on it (`memory_limit`), never the process's. Where no stop line watches the process (a host's, whose memory is the
+/// host's, or `PONDRA_MEMORY_MAX_GB=0`), the queries keep a third of the machine's memory at most (`oom::roots`).
 fn root_line() -> usize {
     #[cfg(target_arch = "wasm32")]
     return crate::env::page_line_share(crate::machine::process().line());
     #[cfg(not(target_arch = "wasm32"))]
-    Some(root_whole()).filter(|&w| w < usize::MAX).unwrap_or(4 << 30)
+    match roots() {
+        (Some(whole), Some(third)) => whole.min(third),
+        (whole, third) => whole.or(third).unwrap_or(4 << 30),
+    }
 }
+
+/// The memory watch's lines for the process (`oom::roots`): its trim line, and a third of its memory where no stop line watches it.
+fn roots() -> (Option<usize>, Option<usize>) { crate::oom::roots() }
 
 /// The process's whole line, for every node's queries and caches together (`ledger::Root`): the memory watch's trim line
 /// (`oom::trim_line`, of the machine's memory or `PONDRA_MEMORY_MAX_GB`), or none (`usize::MAX`) where it isn't known.
 fn root_whole() -> usize {
-    crate::oom::trim_line().unwrap_or(usize::MAX)
+    roots().0.unwrap_or(usize::MAX)
 }
 
 /// Every node's budget in the process now (`ledger::budgets`): the memory watch takes memory back from the caches charged
@@ -2018,7 +2030,7 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     let turns = || crate::budget::Budget::of(&root);
     let mut whole: Store = match (params, scheme) {
         (Some(_), _) => crate::ext::build(&url::Url::parse(&root)?, params, crate::ext::For::Lake)?,
-        (None, "s3") => Arc::new(AmazonS3Builder::from_env().with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
+        (None, "s3") => Arc::new(with_kms(AmazonS3Builder::from_env(), sse_kms_from_env()).with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
         (None, "gs") => Arc::new(GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket).with_config(GoogleConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
         (None, _) => Arc::new(MicrosoftAzureBuilder::from_env().with_url(&root).with_config(AzureConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
     };
@@ -2029,6 +2041,23 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     // (the bucket's client, which scans and the SSD tier's misses go through, is counted apart:
     // each request goes through one of the two)
     Ok((url.trim_end_matches('/').to_string(), store, Some((root, whole))))
+}
+
+/// The customer's KMS key for the lake's own bucket, from the environment (`AWS_SSE_KMS_KEY_ID`): each object the lake
+/// writes there (its tables, its catalog, its backups) is encrypted with it, SSE-KMS. Without one the bucket still encrypts
+/// at rest, with its own keys. On its own object_store would ignore the variable, short of `AWS_SERVER_SIDE_ENCRYPTION`,
+/// which then says it all (`from_env` reads both). Only the lake's buckets take it (`ext::build`'s `For::Lake`): a bucket
+/// reached otherwise, maybe another account's, is sent a key only its own secret names (`kms_key_id`).
+pub(crate) fn sse_kms_from_env() -> Option<String> {
+    std::env::var("AWS_SSE_KMS_KEY_ID").ok().filter(|k| !k.is_empty() && std::env::var_os("AWS_SERVER_SIDE_ENCRYPTION").is_none())
+}
+
+/// `b` encrypting what it writes with `key`, when there is one (`sse_kms_from_env`, or a secret's `kms_key_id`).
+pub(crate) fn with_kms(b: AmazonS3Builder, key: Option<String>) -> AmazonS3Builder {
+    match key {
+        Some(k) => b.with_sse_kms_encryption(k),
+        None => b,
+    }
 }
 
 /// A folder's store, made if it isn't there.
@@ -2361,7 +2390,7 @@ impl Lake {
         crate::oom::wake();
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
-            crate::panics::spawn(Lake::commits(Arc::downgrade(&lake), writes, lake.node.life.clone())); // (weak: a lake opened in a process goes when its last handle does)
+            crate::spawns::spawn(Lake::commits(Arc::downgrade(&lake), writes, lake.node.life.clone())); // (weak: a lake opened in a process goes when its last handle does)
         }
         Ok(lake)
     }
@@ -2376,7 +2405,7 @@ impl Lake {
     async fn commits(me: std::sync::Weak<Self>, mut writes: mpsc::UnboundedReceiver<Write>, life: Life) {
         let (to_bucket, mut in_bucket) = mpsc::unbounded_channel::<(Arc<dyn Written>, u64)>();
         let (lake, lives) = (me.clone(), life.clone());
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             while let Some((handle, id)) = in_bucket.recv().await {
                 if let Err(e) = handle.durable().await {
                     eprintln!("catalog commit failed: {e}");
@@ -3070,6 +3099,8 @@ pub struct Catalog {
     metas: Arc<Mutex<Parsed<TableMeta>>>, // tables' entries as parsed (`parsed`)
     segs: Arc<Mutex<Parsed<Segment>>>,    // log segments' entries as parsed (`segments`)
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
+    kept: AtomicBool,             // leader: each write keeps its catalog hooks' records (`keep_records`)
+    whole: AtomicBool,            // and they are whole and durable, so a reader may take them for the entries (`records_kept`)
     closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
     life: Life,                   // what a fence restarts: its lake's (`fatal`)
     metrics: Arc<crate::metrics::Metrics>, // its node's, which count its records read and written
@@ -3135,8 +3166,16 @@ const RECORDS: [&str; 2] = [crate::history::TABLE, crate::audit::TABLE];
 /// `log::commit`, marked too). Counting them, every remembered answer was forgotten every second on
 /// a lake nobody wrote to, again 50 ms after each `CREATE TABLE`, and once just after a new lake served.
 /// Producers' expiries and the old marks' pass (`log::EXPIRY`), and the marks they delete (`p/`), count
-/// neither way: a commit is as quiet as it is without them.
+/// neither way: a commit is as quiet as it is without them. So do the catalog hooks' records (`CatalogHook`), which
+/// follow their entries (the audit log's table made puts its folder's), and a commit of records alone is quiet
+/// (`keep_records` at a leader's start): no answer reads them.
 fn quiet(d: &Delta) -> bool {
+    let hooks = catalog_hooks();
+    let record = |k: &str| hooks.iter().any(|h| k.starts_with(h.records));
+    if d.puts.iter().any(|(k, _)| record(k)) || d.deletes.iter().any(|k| record(k)) {
+        let rest = Delta { id: d.id, puts: d.puts.iter().filter(|(k, _)| !record(k)).cloned().collect(), deletes: d.deletes.iter().filter(|k| !record(k)).cloned().collect() };
+        return (rest.deletes.is_empty() && rest.puts.iter().all(|(k, _)| k == "c")) || quiet(&rest);
+    }
     let hex = |id: &str| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit());
     let expiry = |k: &str| k.starts_with(crate::log::EXPIRY);
     let unread = |k: &str| {
@@ -3273,7 +3312,7 @@ impl Drop for Catalog {
             return; // (no runtime: it ended, and SlateDB's tasks with it)
         }
         let kv = self.kv.clone();
-        crate::panics::task(async move {
+        crate::spawns::task(async move {
             let _ = kv.close().await;
         });
     }
@@ -3344,7 +3383,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud, rights) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, rights, marks: crate::registry::get().find::<crate::records::Rights>(), metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), closing: Default::default(), life, metrics: node.metrics.clone(), stages: Arc::new(Stages::new()), written: Default::default() }
+        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, rights, marks: crate::registry::get().find::<crate::records::Rights>(), metas: Arc::new(Mutex::new(Parsed::new(PARSED_COUNT, PARSED_BYTES, |raw| raw))), segs: Arc::new(Mutex::new(Parsed::new(SEGMENTS_COUNT, SEGMENTS_BYTES, segment_charge))), frozen: Default::default(), kept: Default::default(), whole: Default::default(), closing: Default::default(), life, metrics: node.metrics.clone(), stages: Arc::new(Stages::new()), written: Default::default() }
     }
 
     /// What the catalog's block caches hold, in bytes.
@@ -4048,22 +4087,147 @@ impl Catalog {
         let t0 = Instant::now();
         let puts = listed(self, puts).await?;
         let mut puts: Vec<(String, Bytes)> = puts.into_iter().map(|(k, v)| (k, v.into())).collect();
+        let mut deletes = deletes.to_vec();
         let mut id = self.order.lock().await;
         let t1 = self.stage("order", t0);
+        if self.kept.load(Relaxed) {
+            self.hooked(&mut puts, &mut deletes).await?; // (in the write order: each entry's old value is the one this replaces)
+        }
+        self.ordered(&mut id, writes, puts, deletes, t1).await
+    }
+
+    /// A write, in its place in the order (`id`, the order's lock held): numbered, written, and sent on to commit.
+    async fn ordered(&self, id: &mut u64, writes: &mpsc::UnboundedSender<Write>, mut puts: Vec<(String, Bytes)>, deletes: Vec<String>, t1: Instant) -> Result<oneshot::Receiver<()>> {
         // The commit number is the last put: the store takes the puts as they are, and the `Delta` keeps the same list.
         puts.push(("c".to_string(), Bytes::from(json(&*id))));
-        let handle = self.kv.write(&puts, deletes).await.map_err(|e| self.fenced(e))?;
+        let handle = self.kv.write(&puts, &deletes).await.map_err(|e| self.fenced(e))?;
         let t2 = self.stage("kv write", t1);
         if let Some((_, v)) = puts.iter().find(|(k, _)| k == "n") {
             self.last_n.store(serde_json::from_slice(v)?, Relaxed);
         }
         let (done, rx) = oneshot::channel();
-        let _ = writes.send((handle, Arc::new(Delta { id: *id, puts, deletes: deletes.to_vec() }), done, t2));
+        let _ = writes.send((handle, Arc::new(Delta { id: *id, puts, deletes }), done, t2));
         *id += 1;
         Ok(rx)
     }
+
+    /// This write's catalog hooks' records (`CatalogHook`): for each entry it puts or deletes that a hook reads, the records
+    /// its old value had and its new one hasn't are deleted, and the new one's put. The old value is the memtable's, a write
+    /// still in flight included: this runs in the write order, so it is the one this write replaces.
+    async fn hooked(&self, puts: &mut Vec<(String, Bytes)>, deletes: &mut Vec<String>) -> Result<()> {
+        let hooks = catalog_hooks();
+        let read = |k: &str| hooks.iter().any(|h| h.reads.iter().any(|p| k.starts_with(p)));
+        // (a key both put and deleted ends deleted: `Kv::write`)
+        let mut changed: BTreeMap<String, Option<Bytes>> = puts.iter().filter(|(k, _)| read(k)).map(|(k, v)| (k.clone(), Some(v.clone()))).collect();
+        changed.extend(deletes.iter().filter(|k| read(k)).map(|k| (k.clone(), None)));
+        let (mut put, mut gone) = (vec![], vec![]);
+        for (key, new) in changed {
+            let old = self.kv.get(&key, false).await.map_err(|e| self.fenced(e))?;
+            crate::metrics::add(&self.metrics.catalog_reads, 1);
+            for h in hooks.iter().filter(|h| h.reads.iter().any(|p| key.starts_with(p))) {
+                let before = old.as_ref().map(|o| (h.derive)(&key, o)).unwrap_or_default();
+                let after = new.as_ref().map(|n| (h.derive)(&key, n)).unwrap_or_default();
+                gone.extend(before.iter().filter(|(k, _)| !after.iter().any(|(a, _)| a == k)).map(|(k, _)| k.clone()));
+                put.extend(after.into_iter().filter(|(k, v)| !before.iter().any(|(b, w)| b == k && w == v)).map(|(k, v)| (k, Bytes::from(v))));
+            }
+        }
+        crate::metrics::add(&self.metrics.catalog_writes, (put.len() + gone.len()) as u64);
+        puts.extend(put);
+        deletes.extend(gone);
+        Ok(())
+    }
+
+    /// A leader's start: every catalog hook's records made again from the entries as they are, in one write, and kept by
+    /// every write from then on (`hooked`). A release without the hook may have led the lake meanwhile, writing entries
+    /// and not their records, and a lake from before has none: so each leader makes them whole once. It reads every entry
+    /// the hooks read, in the write order: writes wait for it, once.
+    pub async fn keep_records(&self) -> Result<()> {
+        let hooks = catalog_hooks();
+        let (true, Some(writes), false) = (self.kv.is_writer(), &self.writes, hooks.is_empty()) else { return Ok(()) };
+        let t0 = Instant::now();
+        let mut id = self.order.lock().await;
+        let (mut puts, mut deletes) = (vec![], vec![]);
+        for h in hooks {
+            let mut all: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            for p in h.reads {
+                for (k, v) in self.kv.scan(range_of(p), false).await.map_err(|e| self.fenced(e))? {
+                    all.extend((h.derive)(&k, &v));
+                }
+            }
+            let held = self.kv.scan(range_of(h.records), false).await.map_err(|e| self.fenced(e))?;
+            deletes.extend(held.keys().filter(|k| !all.contains_key(*k)).cloned());
+            puts.extend(all.into_iter().filter(|(k, v)| held.get(k).is_none_or(|b| b.as_ref() != v.as_slice())).map(|(k, v)| (k, Bytes::from(v))));
+        }
+        let mut durable = None;
+        if !puts.is_empty() || !deletes.is_empty() {
+            crate::metrics::add(&self.metrics.catalog_writes, (puts.len() + deletes.len()) as u64);
+            let t1 = self.stage("records", t0);
+            durable = Some(self.ordered(&mut id, writes, puts, deletes, t1).await?);
+        }
+        self.kept.store(true, Relaxed); // (under the order's lock: every write after this one keeps them)
+        drop(id);
+        if let Some(durable) = durable {
+            durable.await?; // (a reader reads what is durable: until then it reads the entries)
+        }
+        self.whole.store(true, Relaxed);
+        Ok(())
+    }
+
+    /// Are the catalog hooks' records whole and durable here (`keep_records`), so a reader may take them for the entries
+    /// they index?
+    pub fn records_kept(&self) -> bool { self.whole.load(Relaxed) }
 }
 
+
+/// Records kept with the catalog's entries (redesign step 5, piece 10c): a feature that looks entries of some prefixes up
+/// by something other than their key registers one, and each write of such an entry writes its records in the same
+/// commit, from the entry's old and new values (`Catalog::hooked`). `ddl`'s keeps the folders each table uses (`fu/`).
+#[derive(Clone, Copy)]
+pub struct CatalogHook {
+    pub name: &'static str,
+    /// The prefixes of the entries it reads.
+    pub reads: &'static [&'static str],
+    /// The prefix of its own records: every key under it is one of them, and no entry it reads is.
+    pub records: &'static str,
+    /// An entry's records (key and value): none for one it can't read.
+    pub derive: fn(&str, &[u8]) -> Vec<(String, Vec<u8>)>,
+}
+
+/// The registry's catalog hooks.
+#[derive(Default)]
+pub struct CatalogHooks(Vec<CatalogHook>);
+
+impl crate::registry::Section for CatalogHooks {
+    const NAME: &'static str = "catalog hooks";
+    fn check(&self, _: &crate::registry::Registry) -> std::result::Result<(), String> {
+        for (i, h) in self.0.iter().enumerate() {
+            if let Some(o) = self.0.iter().enumerate().find(|(j, o)| *j != i && o.reads.iter().chain([&o.records]).any(|p| p.starts_with(h.records) || h.records.starts_with(p))) {
+                return Err(format!("{}'s records ({}) are under {}'s", h.name, h.records, o.1.name));
+            }
+            if h.reads.iter().any(|p| p.starts_with(h.records) || h.records.starts_with(p)) {
+                return Err(format!("{} reads its own records ({})", h.name, h.records));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CatalogHooks {
+    pub fn add(&mut self, hook: CatalogHook) {
+        self.0.push(hook);
+    }
+}
+
+/// This build's catalog hooks (none in a build without an extension that adds one).
+fn catalog_hooks() -> &'static [CatalogHook] {
+    crate::registry::get().find::<CatalogHooks>().map_or(&[], |h| &h.0)
+}
+
+/// The keys under `prefix` (one that ends in `/`), as a range of the store's.
+fn range_of(prefix: &str) -> std::ops::Range<Vec<u8>> {
+    let end = format!("{}0", prefix.strip_suffix('/').unwrap_or(prefix)); // ('0' follows '/')
+    prefix.as_bytes().to_vec()..end.into_bytes()
+}
 
 /// Each table entry is written in its lake's shape (redesign 1b, piece 6b): the one place that is chosen. Once the lake is
 /// format 6 (`format::LISTS`), an entry still in format 5's (read before the raise, or new: `Record`) is written as its
@@ -4130,7 +4294,7 @@ impl Stages {
 
     /// How late a 10 ms sleep wakes, as the `lag` stage, while the catalog is (weak: it ends with it).
     fn sample_lag(stages: Weak<Stages>) {
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             loop {
                 let t = Instant::now();
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4334,6 +4498,13 @@ mod tests {
         assert!(!quiet_of(&[("d/3", "x"), ("s/3", &user), (QUIET, "true"), ("c", "9")]), "a table's rows, marked");
         assert!(!quiet_of(&[("p/audit-x", "1"), ("c", "9")]), "a producer only named like the audit log's");
         assert!(!quiet_of(&[("d/3", "x"), ("s/3", &audit), (&audit_p, "1"), ("v/a_view", "{}"), ("c", "9")]), "the audit log's rows with a view's entry");
+        // A catalog hook's records follow their entries (the engine's folder records, `fu/`): as quiet as the entries.
+        for h in catalog_hooks() {
+            let record = format!("{}x/pondra$audit", h.records);
+            assert!(quiet_of(&[("t/pondra$audit", "{}"), (&record, "own"), ("c", "9")]), "the audit log's table made, with its {} records", h.name);
+            assert!(!quiet_of(&[("t/r_t", "{}"), (&record, "own"), ("c", "9")]), "a table's entry, with its {} records", h.name);
+            assert!(quiet_of(&[(&record, "own"), ("c", "9")]), "{} records alone (`keep_records`)", h.name);
+        }
         // Expiries, the old marks' marker and the marks they delete count neither way (`log::EXPIRY`).
         let expiry = |due: u64, p: &str| format!("{}{due:020}/{p}", crate::log::EXPIRY);
         let quiet_with = |puts: &[(&str, &str)], deletes: &[&str]| quiet(&Delta { id: 9, puts: puts.iter().map(|(k, v)| (k.to_string(), Bytes::from(v.to_string()))).collect(), deletes: deletes.iter().map(|k| k.to_string()).collect() });
@@ -4931,7 +5102,7 @@ mod tests {
         let col = |c: &str, t: &str| (c.to_string(), t.to_string());
         let set = |v: &[(&str, &str)]| v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<String, String>>();
         let id = |always: bool, seq: &str| Identity { always, declared: vec![], sequence: seq.into() };
-        let unique = |name: &str, c: &str, enforced: bool| crate::constraints::Constraint { name: name.into(), kind: crate::constraints::Kind::Unique, columns: vec![c.into()], references: None, enforced };
+        let unique = |name: &str, c: &str, enforced: bool| crate::table_record::Constraint { name: name.into(), kind: crate::table_record::Kind::Unique, columns: vec![c.into()], references: None, enforced };
         let mut t = TableMeta::made(Made {
             columns: vec![col("id", "Int64"), col("seq_no", "Int64"), col("c_code", "Utf8"), col("c_status", "Utf8"), col("owner", "Utf8"), col("total", "Int64"), col("doc", "Utf8"), col("gone", "Utf8"), col("_deleted", "Boolean")],
             names: set(&[("c_code", "code"), ("c_status", "status")]),
@@ -4964,15 +5135,15 @@ mod tests {
     fn to_rules_maps_the_rule_fields_as_logical_does() -> Result<()> {
         let m = with_rules();
         let (t, l) = (m.to_rules()?, m.logical());
-        let plain = |name: &str, stored: &str| crate::rules::Column { name: name.into(), stored: stored.into(), not_null: false, default: None, always: false, held: None, labels: None };
+        let plain = |name: &str, stored: &str| crate::table_record::Column { name: name.into(), stored: stored.into(), not_null: false, default: None, always: false, held: None, labels: None };
         let want = vec![
-            crate::rules::Column { not_null: true, default: Some("nextval('orders_id_seq')".into()), ..plain("id", "id") },
-            crate::rules::Column { default: Some("nextval('orders_seq_no_seq')".into()), always: true, ..plain("seq_no", "seq_no") },
-            crate::rules::Column { not_null: true, held: Some("varchar(3)".into()), ..plain("code", "c_code") },
-            crate::rules::Column { labels: Some((Some("order_status".into()), vec!["open".into(), "shipped".into()])), ..plain("status", "c_status") },
-            crate::rules::Column { held: Some("uuid".into()), ..plain("owner", "owner") },
-            crate::rules::Column { default: Some("0".into()), ..plain("total", "total") },
-            crate::rules::Column { held: Some("json".into()), ..plain("doc", "doc") },
+            crate::table_record::Column { not_null: true, default: Some("nextval('orders_id_seq')".into()), ..plain("id", "id") },
+            crate::table_record::Column { default: Some("nextval('orders_seq_no_seq')".into()), always: true, ..plain("seq_no", "seq_no") },
+            crate::table_record::Column { not_null: true, held: Some("varchar(3)".into()), ..plain("code", "c_code") },
+            crate::table_record::Column { labels: Some((Some("order_status".into()), vec!["open".into(), "shipped".into()])), ..plain("status", "c_status") },
+            crate::table_record::Column { held: Some("uuid".into()), ..plain("owner", "owner") },
+            crate::table_record::Column { default: Some("0".into()), ..plain("total", "total") },
+            crate::table_record::Column { held: Some("json".into()), ..plain("doc", "doc") },
             plain("_deleted", "_deleted"),
         ];
         assert_eq!(t.columns, want);

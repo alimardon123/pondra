@@ -292,7 +292,8 @@ RESTORE TABLE prices TO TIMESTAMP AS OF $before;
 | Change options | `ALTER TABLE t SET (publish = delta, retention = '7 days')` |
 | Empty | `TRUNCATE [TABLE] t` |
 | Drop | `DROP TABLE [IF EXISTS] t [, t2 …] [PURGE]` |
-| Bring back a dropped table | `UNDROP TABLE t` |
+| Bring back what was dropped | `UNDROP TABLE t`, `UNDROP VIEW v`, `UNDROP FUNCTION f`, … (`pondra.dropped` lists each) |
+| Bring back a deleted file | `UNDROP FILE 'notes/a.txt'` |
 | Copy a table without copying files | `CREATE TABLE [IF NOT EXISTS] c [SHALLOW] CLONE t` |
 | Publish a table written beside another | `ALTER TABLE t SWAP WITH u`: the two exchange names in one commit, alike but for their rows (files, row ids and past go with them; comments, indexes, grants and views stay with the names). Refused for a published or shared table, one a materialized view or a task follows, or tables that differ in more than their rows ([write, audit, publish](/pondra/guides/tables/#write-audit-publish)) |
 | Put a table back as it was | `RESTORE TABLE t TO VERSION AS OF n`, or `TO TIMESTAMP AS OF '…'` |
@@ -362,7 +363,7 @@ sent to the old name afterwards (over HTTP, Kafka or Flight) are refused with `n
 
 A dropped table is kept for 7 days, or for its `retention`, and `UNDROP TABLE t` brings it back as it
 was: every row, with its ids and versions. `pondra.dropped` lists the tables that can still come back
-(see [system tables](/pondra/sql/system-tables/#dropped-tables)). `UNDROP` takes the table
+(see [system tables](/pondra/sql/system-tables/#dropped-objects-and-deleted-files)). `UNDROP` takes the table
 dropped last under that name, and is refused while another table has the name: rename that one first.
 `DROP TABLE … PURGE`, or `retention = '0 seconds'`, keeps nothing.
 
@@ -871,7 +872,7 @@ SELECT taxed(100) AS t;
 | Write a topic | `COPY (SELECT …) TO 'kafka://brokers/topic' (FORMAT json, KEY col)` |
 | Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| pondra \| git \| generic, KEY value, …, SCOPE 'url')`; `TYPE pondra, TOKEN '…', SCOPE 'https://…'` is how a lake attached `READ_ONLY` asks its own server's leader to pin a branch; `TYPE git, TOKEN '…', SCOPE 'https://github.com/acme'` is a person's token for [Git folders](/pondra/guides/git/), sent only to the repositories its `SCOPE` covers and never used to read files |
 | A session's own | `CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…)`: in the node's memory for this session only, used before the lake's |
-| Drop a secret | `DROP [TEMPORARY] SECRET [IF EXISTS] name` |
+| Drop a secret | `DROP [TEMPORARY] SECRET [IF EXISTS] name [PURGE]`: kept sealed for 7 days for `UNDROP SECRET name`; `PURGE` keeps nothing and lets go of the copies earlier drops of the name kept, for a key that leaked |
 | Install an extension | `[FORCE] INSTALL name FROM 'path or URL' [VERSION 'v']`: a WebAssembly component, kept in the lake by its SHA-256; `VERSION` must be the one the file says |
 | List and drop extensions | `SHOW EXTENSIONS [LIKE 'pattern']` (or `SELECT * FROM extensions()`), `UNINSTALL [IF EXISTS] name` |
 

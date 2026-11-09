@@ -156,12 +156,12 @@ pub async fn recover(lake: &Lake, me: &str, term: u64, own: Option<&ReplicaLog>)
     let deadline = Instant::now() + Duration::from_secs(20);
     for peer in members.iter().filter(|p| *p != me) {
         loop {
-            match crate::dial::call(peer, crate::dial::Call::get(format!("/cluster/replica?after={in_bucket}&term={term}")).timeout(Duration::from_secs(5))).await.and_then(crate::dial::Reply::checked) {
+            match crate::dial::call(&lake.node, peer, crate::dial::Call::get(format!("/cluster/replica?after={in_bucket}&term={term}")).timeout(Duration::from_secs(5))).await.and_then(crate::dial::Reply::checked) {
                 Ok(r) => break merge(&r.bytes().await?).context("replica from a peer")?,
                 Err(_) if Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(250)).await,
                 Err(e) if fresh => {
-                    crate::terms::step_down(&lake.store, term).await; // (not alive, whatever a mark in flight says)
-                    crate::terms::release(&lake.store, term).await;
+                    crate::terms::step_down(&lake.store, term, &lake.node.claims).await; // (not alive, whatever a mark in flight says)
+                    crate::terms::release(&lake.store, term, &lake.node.claims).await;
                     return Err(Unreached(format!("{peer} holds this lake's acknowledged changes and can't be reached from here ({e}); its members lead it")).into());
                 }
                 Err(e) => break eprintln!("recovering without {peer}: {e}"), // (then only it held what it held)
@@ -207,7 +207,7 @@ pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefi
 /// (with everything it helped commit in the bucket) before it leaves the list, so a new leader
 /// always knows everyone it has to ask.
 pub fn members(lake: Arc<Lake>, members: Arc<dyn Members>) {
-    crate::panics::spawn(async move {
+    crate::spawns::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let live: Vec<String> = members.nodes().into_iter().filter(|n| *n != members.me()).collect();

@@ -166,7 +166,7 @@ pub const fn starter(var: &'static str, kind: Kind, unset: Unset) -> Setting { o
 pub const fn test(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Test, kind, unset) }
 
 // The defaults worked out when read.
-fn blocking_threads() -> String { // (tokio's own on Windows, where a child's pipes are read on blocking threads: `panics::runtime`)
+fn blocking_threads() -> String { // (tokio's own on Windows, where a child's pipes are read on blocking threads: `spawns::runtime`)
     if cfg!(windows) { 512 } else { 16.max(4 * crate::env::cores()) }.to_string()
 }
 fn cores() -> String { crate::env::cores().to_string() }
@@ -187,7 +187,7 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_ALLOW_UNSIGNED_EXTENSIONS", Bool, No),
     node("PONDRA_AUDIT", List, Is("role,ddl,function")),
     node("PONDRA_AUDIT_DAYS", Days, Is("90")),
-    node("PONDRA_BLOCKING_THREADS", Int, Of(blocking_threads)).process(), // (the runtime's: `panics::runtime`)
+    node("PONDRA_BLOCKING_THREADS", Int, Of(blocking_threads)).process(), // (the runtime's: `spawns::runtime`)
     node("PONDRA_BROADCAST_MB", Mb, Is("64")),
     node("PONDRA_BUCKET_REQUESTS", Int, Is("256")),
     node("PONDRA_CACHE_DIR", Path, No).flag("backlog", "Lakes on object storage: where this node keeps its local SSD copy of recent \
@@ -383,8 +383,23 @@ fn rows(r: &crate::registry::Registry) -> Vec<serde_json::Value> {
 /// A node's settings (`Scope::Node`), read once as it starts (`Values::now`), so one set in the process's environment
 /// later never reaches a node that started without it. A reader with the node at hand reads its own here (`node.settings`);
 /// `env.rs` reads the process's, for a reader with none.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Values(std::collections::BTreeMap<&'static str, String>);
+
+impl std::fmt::Debug for Values {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.debug_tuple("Values").field(&Shown(&self.0)).finish() }
+}
+
+/// Settings as `Debug` shows them: a secret's value never (`Kind::Secret`: the admin's and the read and write tokens, the
+/// secret and owner keys), nor that of a name this build doesn't know, whatever prints them (11-09 audit L6).
+struct Shown<'a>(&'a std::collections::BTreeMap<&'static str, String>);
+
+impl std::fmt::Debug for Shown<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let secret = |var: &str| find(var).is_none_or(|s| s.kind == Kind::Secret);
+        f.debug_map().entries(self.0.iter().map(|(var, v)| (var, if secret(var) { "(secret)" } else { v.as_str() }))).finish()
+    }
+}
 
 impl Values {
     /// The process's now: what it was given, else its environment (`env::get`), for every node setting of this build that a
@@ -422,8 +437,12 @@ impl Values {
 /// (`env::hand`). It holds every setting but the command line's: the node's `Values`, and the process's own
 /// (`Scope::Process`), which the child, a process of its own, takes as its first open. The child's environment holds none of
 /// these names (`hand`), so a setting the line leaves out reaches it no other way.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Line(std::collections::BTreeMap<&'static str, String>);
+
+impl std::fmt::Debug for Line {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.debug_tuple("Line").field(&Shown(&self.0)).finish() }
+}
 
 impl Line {
     /// A node's values and its process's own settings now.
@@ -480,6 +499,17 @@ pub fn find(var: &str) -> Option<&'static Setting> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node's settings never show a secret's value, whatever prints them (11-09 audit L6).
+    #[test]
+    fn settings_show_no_secret() {
+        let held = |pairs: &[(&'static str, &str)]| pairs.iter().map(|(k, v)| (*k, v.to_string())).collect::<std::collections::BTreeMap<_, _>>();
+        let m = held(&[("PONDRA_ADMIN_TOKEN", "tok-1234"), ("PONDRA_SECRET_KEY", "key-5678"), ("PONDRA_MEMORY_GB", "4")]);
+        for shown in [format!("{:?}", Values(m.clone())), format!("{:?}", Line(m))] {
+            assert!(!shown.contains("tok-1234") && !shown.contains("key-5678"), "{shown}");
+            assert!(shown.contains("PONDRA_ADMIN_TOKEN") && shown.contains("\"4\""), "the names, and what isn't secret: {shown}");
+        }
+    }
 
     /// A node's values are its node settings only: never the command line's, nor one the process has one of (its
     /// memory line, its runtime's threads), which every node in a process shares.

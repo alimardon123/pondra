@@ -122,6 +122,8 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add::<crate::tasks::Kept>();
             states.add::<crate::fresh::Plans>();
             states.add::<crate::once::Buckets>();
+            states.add::<crate::routines::Kept>();
+            states.add::<crate::learned::Kept>();
         }
         #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)
         for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::undrop::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,
@@ -130,6 +132,8 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         }
         #[cfg(feature = "lake")]
         r.section_mut::<crate::records::Rights>().add(crate::users::RIGHTS);
+        #[cfg(feature = "lake")] // (what the catalog keeps with its entries: the folders each table uses)
+        r.section_mut::<crate::store::CatalogHooks>().add(crate::ddl::folder_hook());
         #[cfg(feature = "lake")] // (what the log's commits call: a view's rows, derived as its sources' are packed)
         r.section_mut::<crate::log::CommitHooks>().add(crate::views::hook());
     },

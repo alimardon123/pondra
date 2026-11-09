@@ -118,19 +118,7 @@ impl OnViolation {
     }
 }
 
-/// History kept per key (SCD type 2, ADR-036 §8): `WITH (history = 'id', sequence_by = 'ts'
-/// [, delete_when = 'op = ''D'''])`. The view keeps every version of each key as it arrives (an
-/// append view: writers on any node need no coordination); a read gives each version its
-/// `__start_at` (its `sequence_by`) and `__end_at` (the next version's, NULL for the current one),
-/// worked out then, so versions that arrive out of order still make the right history. A version
-/// `delete_when` holds for ends its key's history and isn't shown (`__delete`).
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct History {
-    pub key: Vec<String>,
-    pub sequence_by: String,
-    #[serde(default)]
-    pub deletes: bool,
-}
+pub use crate::table_record::History;
 
 /// A history view's table as it is read: its versions, each with `__start_at` and `__end_at`.
 pub async fn history_view(ctx: &datafusion::prelude::SessionContext, base: std::sync::Arc<dyn datafusion::catalog::TableProvider>, h: &History, sys: bool) -> Result<std::sync::Arc<dyn datafusion::catalog::TableProvider>> {
@@ -1234,7 +1222,7 @@ where
     let Some(turn) = turn(lake, name, of, what) else { return };
     let (lake, name) = (lake.clone(), name.to_string());
     // (a view's run is the node's own work, as its refresh is, whoever reads it after: `auth::as_node`)
-    crate::panics::aside(crate::auth::as_node(async move {
+    crate::spawns::aside(crate::auth::as_node(async move {
         let _slot = slot(&lake).await;
         let out = match lake.cat.get::<View>(&view_key(&name)).await {
             Ok(Some(v)) => bounded(run(lake.clone(), name.clone(), v)).await,

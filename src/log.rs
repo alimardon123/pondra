@@ -261,13 +261,14 @@ pub const SEQ_FROM_1: &str = "a producer's batches count from seq=1 (seq 0 would
 #[derive(Clone)]
 pub enum To {
     Local(Arc<Sequencer>),
-    /// The leader's address, and its lake's bell for a flush the leader didn't take (`Kept::untaken`).
-    Leader(String, Arc<tokio::sync::Notify>),
+    /// The leader's address, and its lake's bell for a flush the leader didn't take (`Kept::untaken`), and the node that sends
+    /// to it.
+    Leader(String, Arc<tokio::sync::Notify>, Arc<crate::node_state::NodeState>),
 }
 
 impl To {
     /// The leader at `addr`, for lake `lake`'s flushes.
-    pub fn leader(lake: &Lake, addr: String) -> To { To::Leader(addr, lake.log.untaken.clone()) }
+    pub fn leader(lake: &Lake, addr: String) -> To { To::Leader(addr, lake.log.untaken.clone(), lake.node.clone()) }
 
     /// A commit number of its own, its time, and a block of row ids (`Sequencer::reserve`).
     pub async fn reserve(&self) -> Result<Reserved> { self.ask(Flush { reserve: 1, block: true, ..Default::default() }).await }
@@ -289,7 +290,7 @@ impl To {
     async fn outcome(&self, f: Flush) -> Result<Outcome> {
         Ok(match self {
             To::Local(seq) => seq.submit(f).await?,
-            To::Leader(addr, untaken) => led(addr, dial::call(addr, dial::Call::post("/cluster/commit", encode_flush(&f)?)).await.inspect_err(|_| untaken.notify_one())?)?.checked()?.json().await?,
+            To::Leader(addr, untaken, node) => led(addr, dial::call(&node, addr, dial::Call::post("/cluster/commit", encode_flush(&f)?)).await.inspect_err(|_| untaken.notify_one())?)?.checked()?.json().await?,
         })
     }
 }
@@ -333,7 +334,7 @@ impl Log {
         let (tx, mut rx) = mpsc::channel::<Append>(100_000);
         let me = lake.clone();
         let (to, slots) = (Arc::new(to), Arc::new(tokio::sync::Semaphore::new(FLUSHES_IN_FLIGHT)));
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             let (mut last, mut turn) = (tokio::time::Instant::now(), None);
             while let Some(first) = rx.recv().await {
                 // While all flush slots are busy, appends queue up; then they all go in one flush.
@@ -453,8 +454,8 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                     unanswered = false;
                     anyhow::Ok(outcome)
                 }
-                To::Leader(addr, untaken) => {
-                    let request = dial::call(addr, dial::Call::post("/cluster/commit", encode_flush(&f)?));
+                To::Leader(addr, untaken, node) => {
+                    let request = dial::call(&node, addr, dial::Call::post("/cluster/commit", encode_flush(&f)?));
                     drop(done.take()); // (sent in order; over HTTP they may still arrive out of order, rarely)
                     unanswered = true;
                     let response = request.await.inspect_err(|_| untaken.notify_one())?; // (its follow loop looks now: `cluster.rs`)
@@ -686,7 +687,7 @@ impl Sequencer {
         let (me, held, tiering) = (lake.clone(), Held::default(), Arc::new(std::sync::atomic::AtomicUsize::new(0)));
         let (holds, tiers) = (held.clone(), tiering.clone());
         let mut producers = Producers::start(&lake, now_ms).await?;
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             let mut sequences = crate::seq::Held::default(); // (the counters it moved: it alone writes them)
             let in_flight = Arc::new(tokio::sync::Semaphore::new(COMMITS_IN_FLIGHT));
             let disk = (!lake.url.contains("://")).then(|| std::path::PathBuf::from(&lake.url)); // (a lake on local disk)
@@ -1083,7 +1084,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
     forget_producers(lake, dropped.iter().filter_map(|k| k.strip_prefix("p/job:").map(|j| format!("job:{j}"))));
     producers.remember(seqs);
     let (lake, ms, hwm) = (lake.clone(), ms.clone(), *next - 1);
-    crate::panics::spawn(async move {
+    crate::spawns::spawn(async move {
         if durable.await.is_ok() {
             let mut ms = ms.lock().unwrap();
             if ms.len() >= 10_000 {

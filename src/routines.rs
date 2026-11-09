@@ -431,19 +431,31 @@ pub async fn drop(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
     Ok(j!({r.what(): name, "dropped": true}))
 }
 
+/// What a lake keeps for its functions and procedures (invariant 301): them by name, as of the catalog's version they
+/// were read at (`listed`).
+#[derive(Default)]
+pub struct Kept(Mutex<Option<(u64, Arc<HashMap<String, Routine>>)>>);
+
+impl crate::lake_state::LakeState for Kept {
+    const NAME: &'static str = "routines";
+    const ABOUT: &'static str = "its functions, macros and procedures by name, as of the catalog's version they were read at";
+    fn make() -> Self {
+        Kept::default()
+    }
+}
+
 /// This lake's functions and procedures, by name: read again only after a commit (every query asks).
 pub async fn listed(lake: &Lake) -> Result<Arc<HashMap<String, Routine>>> {
-    type Seen = Mutex<HashMap<String, (u64, Arc<HashMap<String, Routine>>)>>;
-    crate::per_node!(static SEEN: Seen = Default::default());
+    let kept = lake.state::<Kept>()?;
     let version = lake.cat.version();
-    if let (Some(v), Some((at, all))) = (version, SEEN.lock().unwrap().get(&lake.url)) {
+    if let (Some(v), Some((at, all))) = (version, &*kept.0.lock().unwrap()) {
         if *at == v {
             return Ok(all.clone());
         }
     }
     let all: Arc<HashMap<String, Routine>> = Arc::new(lake.cat.scan::<Routine>("r/", "r0").await?.into_iter().map(|(k, r)| (k[2..].to_string(), r)).collect());
     if let Some(v) = version {
-        SEEN.lock().unwrap().insert(lake.url.clone(), (v, all.clone()));
+        *kept.0.lock().unwrap() = Some((v, all.clone()));
     }
     Ok(all)
 }
@@ -1197,12 +1209,12 @@ fn start<'a>(app: &'a App, name: &'a str, args: &'a [FunctionArg], column: &'a s
         if crate::workspace::is_run(name) {
             let args = args.to_vec();
             crate::workspace::arguments(app, &args, &who.scope).await?; // (its mistakes: said now, not only in the log)
-            crate::panics::task(crate::auth::carried(async move {
+            crate::spawns::task(crate::auth::carried(async move {
                 let _ = Box::pin(crate::workspace::run(&app2, &args, who, job, Some(id2))).await;
             }));
         } else {
             let (local, r, row) = Box::pin(prepared(app, name, args, who.clone())).await?;
-            crate::panics::task(crate::auth::carried(async move {
+            crate::spawns::task(crate::auth::carried(async move {
                 let _ = Box::pin(run(&app2, local, r, row, who, job, Some(id2))).await; // (its outcome: the run log's)
             }));
         }

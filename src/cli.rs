@@ -400,11 +400,11 @@ pub fn main() {
     // get 2 MB, which procedures calling procedures 16 deep overflowed in the release build (only
     // the pages a thread touches are memory).
     let work = std::thread::Builder::new().name("pondra".into()).stack_size(8 << 20).spawn(|| {
-        // Few blocking threads, gone after a second idle (`panics::runtime`): kept alive, each held
+        // Few blocking threads, gone after a second idle (`spawns::runtime`): kept alive, each held
         // the memory its work had used, and a node under steady writes grew for as long as it ran.
         // (the command is the program's own work, its operator's: `pondra sql`'s statements, and a node's start before
         // its loops and doors begin, run as the node's: `auth::as_node`. A request a door serves is its caller's)
-        panics::runtime().build().expect("a runtime").block_on(crate::auth::as_node(async {
+        crate::spawns::runtime().build().expect("a runtime").block_on(crate::auth::as_node(async {
             // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
             if let Err(e) = run().await {
                 eprintln!("Error: {}", crate::codes::told(&e, true)); // (to its operator, run as the node's: shown a routine's code)
@@ -670,7 +670,7 @@ async fn run() -> anyhow::Result<()> {
             let dir = crate::memory_lake::place(&dir);
             let store = store::open_store(&dir)?.1;
             match terms::latest(&store).await? {
-                Some(t) if !t.addr.is_empty() && terms::alive(&store, &t).await => {
+                Some(t) if !t.addr.is_empty() && terms::alive(&store, &t, None).await => {
                     println!("{}", crate::net::process().client(crate::net::Policy::Cluster).post(crate::tls::url(&format!("{}/sql", t.addr))).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)
                 }
                 _ => sql_on_guest(&dir, &query, &attached).await?,

@@ -90,13 +90,13 @@ impl Held {
             crate::drain::close_door(node).await;
         }
         tr("door");
-        panics::abort_all();
+        crate::spawns::abort_all();
         tr("tasks");
         if let Some(l) = lake {
             if self.detach.get().is_some() {
                 // (untracked: the next `abort_all` of this process must not stop a close half done)
                 let l = l.clone();
-                panics::untracked(async move { let _ = l.cat.close().await; });
+                crate::spawns::untracked(async move { let _ = l.cat.close().await; });
                 tr("catalog (detached)");
             } else {
                 let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.close()).await;
@@ -104,7 +104,9 @@ impl Held {
             }
         }
         if let Some((store, n)) = term {
-            terms::step_down(store, *n).await;
+            if let Some(node) = self.node.get() {
+                terms::step_down(store, *n, &node.claims).await; // (the node's claims: `Claims`)
+            }
             tr("term");
         }
     }
@@ -135,7 +137,7 @@ struct Beside(Option<tokio::task::JoinHandle<anyhow::Result<Arc<store::Lake>>>>)
 /// A speculative open nothing keeps: it finishes, then its catalog closes, in a task of its own (untracked, so no
 /// `abort_all` cuts the close short, and the poller stops with the close).
 fn close_after(open: tokio::task::JoinHandle<anyhow::Result<Arc<store::Lake>>>) {
-    panics::untracked(async move {
+    crate::spawns::untracked(async move {
         if let Ok(Ok(lake)) = open.await {
             let _ = lake.cat.close().await;
         }
@@ -146,7 +148,7 @@ impl Beside {
     fn start(dir: &str, guest: Option<Guest>, here: &Arc<crate::node_state::NodeState>) -> Beside {
         Beside(matches!(guest, Some(Guest::Reads)).then(|| {
             let (dir, here) = (dir.to_string(), here.clone());
-            panics::untracked(async move { store::Lake::open_polled(&dir, false, false, store::READER_ONE_SNAPSHOT, here).await })
+            crate::spawns::untracked(async move { store::Lake::open_polled(&dir, false, false, store::READER_ONE_SNAPSHOT, here).await })
         }))
     }
 
@@ -222,8 +224,8 @@ impl Node {
         // the bucket, and the start waits for the later of them, not for both in turn)
         let mut beside = Beside::start(&dir, guest, &here);
         let cluster = match guest {
-            None => cluster::Cluster::join(&store, &addr, start.reader, !store::served(&dir), serve_store, here.life.clone()).await?,
-            Some(g) => cluster::Cluster::guest(&store, g, !store::served(&dir), here.life.clone()).await.map_err(|e| e.context(dir.clone()))?,
+            None => cluster::Cluster::join(&store, &addr, start.reader, !store::served(&dir), serve_store, here.clone()).await?,
+            Some(g) => cluster::Cluster::guest(&store, g, !store::served(&dir), here.clone()).await.map_err(|e| e.context(dir.clone()))?,
         };
         // (a guest that reads is a reader from here on: no log, whose history and audit lines would go to a leader it doesn't have)
         let reader = start.reader || cluster.reader;
@@ -265,7 +267,7 @@ impl Node {
             // nor hold the term; and a restart would find the same place again)
             Err(e) if e.downcast_ref::<format::Newer>().is_some() || crate::memory_lake::torn(&e) => {
                 if leader {
-                    terms::release(&store, cluster.leader.n).await;
+                    terms::release(&store, cluster.leader.n, &here.claims).await;
                 }
                 return Err(e);
             }
@@ -317,17 +319,17 @@ impl Node {
         }
         if let Some(pg_addr) = pg {
             let a = app.clone();
-            panics::spawn(async move { pg::serve(a, pg_addr).await.map_err(|e| eprintln!("postgres protocol: {e:#}")) });
+            crate::spawns::spawn(async move { pg::serve(a, pg_addr).await.map_err(|e| eprintln!("postgres protocol: {e:#}")) });
         }
         if let Some(kafka_addr) = kafka {
             let port = kafka_addr.rsplit_once(':').map_or("9092", |(_, p)| p).to_string();
             let advertise = kafka_advertise.unwrap_or_else(|| format!("{}:{port}", addr.rsplit_once(':').map_or("127.0.0.1", |(h, _)| h)));
             let a = app.clone();
-            panics::spawn(async move { kafka::serve(a, kafka_addr, advertise).await.map_err(|e| eprintln!("kafka protocol: {e:#}")) });
+            crate::spawns::spawn(async move { kafka::serve(a, kafka_addr, advertise).await.map_err(|e| eprintln!("kafka protocol: {e:#}")) });
         }
         if let Some(flight_addr) = flight {
             let a = app.clone();
-            panics::spawn(async move { flight::serve(a, flight_addr).await.map_err(|e| eprintln!("flight: {e:#}")) });
+            crate::spawns::spawn(async move { flight::serve(a, flight_addr).await.map_err(|e| eprintln!("flight: {e:#}")) });
         }
         if let (true, Some(seq)) = (lives, &app.seq) {
             inbox::serve(lake.clone(), seq.clone(), app.lock.clone(), cluster.rings()); // writers that can't reach us
@@ -375,7 +377,7 @@ impl Node {
         let router = server::router(app);
         let served = listener.map(|listener| {
             let (door, here) = (router.clone(), here.clone());
-            panics::spawn(async move {
+            crate::spawns::spawn(async move {
                 // (closing once `drain::close_door` runs: no new connections, each one's answer finished, then the serve ends)
                 here.drain.door_open();
                 let out = axum::serve(listener, door.into_make_service_with_connect_info::<tls::Peer>()).with_graceful_shutdown(here.drain.closing()).await.map_err(anyhow::Error::from); // (who asks: `console::save_settings`)
@@ -452,6 +454,9 @@ impl Node {
             Ok(node) => Ok(node),
             Err(e) => {
                 held.stop().await;
+                if let Some(node) = held.node.get() {
+                    node.claims.clear(); // (its claims' locks let go as it stops: `Claims`)
+                }
                 reset::reset();
                 Err(e)
             }
@@ -467,6 +472,9 @@ impl Node {
             history::end_writers(lake).await;
         }
         self.held.stop().await;
+        if let Some(node) = self.held.node.get() {
+            node.claims.clear(); // (its claims' locks let go as it stops: `Claims`)
+        }
         reset::reset();
     }
 }
@@ -495,7 +503,7 @@ pub(crate) async fn attach(home: &store::Lake, spec: &str, me: &str, follow: boo
     ddl::database_name(name)?; // (the names the catalog attached keep working; a new `--attach _x=` is refused)
     let leader = crate::terms::latest(&crate::store::open_store(dir)?.1).await?.map(|t| t.addr).filter(|a| !a.is_empty());
     let live = match (&leader, follow) {
-        (Some(a), true) => crate::dial::call(a, crate::dial::Call::get("/cluster/leader").timeout(Duration::from_secs(2))).await.is_ok(),
+        (Some(a), true) => crate::dial::call(&home.node, a, crate::dial::Call::get("/cluster/leader").timeout(Duration::from_secs(2))).await.is_ok(),
         _ => false,
     };
     let other = ddl::attach(home, name, dir, follow, live).await?;

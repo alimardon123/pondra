@@ -617,6 +617,9 @@ fn wide_split(s: i128) -> (f64, f64) {
 #[inline(never)]
 fn wide_double(x: i128) -> f64 { x as f64 }
 
+/// The average of `n` whole numbers whose exact sum is `s`, as `avg` of them answers it (`whole_answer`): None for none.
+pub(crate) fn whole_mean(s: i128, n: i64) -> Option<f64> { whole_answer(Of::Mean, n, s, 0) }
+
 /// The answer worked out of whole numbers' count and exact sums (`Wholes`).
 fn whole_answer(of: Of, n: i64, s1: i128, s2: i128) -> Option<f64> {
     match of {
