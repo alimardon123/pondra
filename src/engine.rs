@@ -587,9 +587,9 @@ fn analyze_output(exec: &AnalyzeExec, schema: &SchemaRef, rows: usize, duration:
 /// the lake's own functions in each.
 #[cfg(feature = "lake")]
 impl crate::store::Lake {
-    /// A fresh SQL session on the shared runtime (`partitions()` of them).
+    /// A fresh SQL session on the shared runtime, in its node's partitions (`Lake::partitions`).
     pub fn session(&self) -> SessionContext {
-        self.session_with(crate::store::partitions())
+        self.session_with(self.partitions())
     }
 
     /// A session with a fixed number of partitions: 1 for point lookups, where splitting the work
