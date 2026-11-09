@@ -135,7 +135,16 @@ impl Writer {
     /// table's types, and its checks run. Then the caller's rights again, now that it is known whether any row is
     /// marked `_deleted`. Then the log's queue.
     pub async fn put(&self, rows: Rows, src: Src) -> Result<Queued, Refused> {
-        let shaped = crate::rules::shape(&self.rules, &self.table, rows, self.how, &crate::defaults::Node(&self.app.lake)).await.map_err(Refused::Rows)?;
+        // (its DEFAULTs run as its caller, so an identity's or a default's `nextval` moves its sequence for whoever may move
+        // it, `seq::may_move`: a door that holds its caller in hand, not in scope, as Postgres's COPY between its messages
+        // does, has it here)
+        let node = crate::defaults::Node(&self.app.lake);
+        let shape = crate::rules::shape(&self.rules, &self.table, rows, self.how, &node);
+        let shaped = match &self.who {
+            Some(who) => crate::auth::WHO.scope(who.clone(), shape).await,
+            None => shape.await,
+        }
+        .map_err(Refused::Rows)?;
         let marked = shaped.rows().column_by_name("_deleted").and_then(|c| c.as_any().downcast_ref::<datafusion::arrow::array::BooleanArray>()).is_some_and(|d| d.true_count() > 0);
         may(self.who.as_ref(), &crate::auth::catalog_name(&self.table), Some(&self.meta), self.deletes || marked).map_err(Refused::Rights)?;
         let log = self.app.log().map_err(Refused::Log)?;
