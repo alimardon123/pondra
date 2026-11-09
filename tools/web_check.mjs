@@ -52,7 +52,10 @@ const sizes = args.includes('--sizes');
 // 9.2255 → 9.2305 MB: who did it, named by argument (M8 3d-2a, step 6): a routine's `Who` carries its sign-in and each
 // stamp takes it, and the page's member names its session for its own principal (5.0 KB over main's 9,221,388 at
 // f1a23198, measured on CI), the room above main kept as it was.
-const BROTLI_BUDGET = 9_230_500;
+// 9.2305 → 9.237 MB: UNDROP FILE (UNDROP for every kind, files): a page's lake lists a deleted file in `pondra.dropped`
+// and brings it back, as every form's does (5.3 KB over main's 9,228,372 at ed42156e, measured on CI), and the room
+// above main back to 3 KB, which main's own growth since the last move had left at 2.1 KB.
+const BROTLI_BUDGET = 9_237_000;
 // The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
 const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows
