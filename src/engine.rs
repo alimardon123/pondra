@@ -136,6 +136,8 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         for p in [crate::branch::readers(), crate::tasks::readers(), crate::rerun::readers()] {
             r.section_mut::<crate::pins::Pins>().add(p);
         }
+        #[cfg(feature = "lake")] // (what the catalog keeps with its entries: the folders each table uses)
+        r.section_mut::<crate::store::CatalogHooks>().add(crate::ddl::folder_hook());
         #[cfg(feature = "lake")] // (what the log's commits call: a view's rows, derived as its sources' are packed)
         r.section_mut::<crate::log::CommitHooks>().add(crate::views::hook());
     },

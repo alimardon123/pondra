@@ -241,15 +241,6 @@ pub(crate) fn stop_one(now: Instant, margin: usize) -> Option<bool> {
     Some(false)
 }
 
-/// Counts a stop that the request this task's work is part of doesn't come back from (`query::frugally`: its first try
-/// stopped and not run again) on the request's node, whose counters its entry holds. Outside a request, nothing.
-pub(crate) fn stopped_for_memory() {
-    let Ok(id) = REQUEST.try_with(|id| *id) else { return };
-    if let Some(r) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
-        crate::metrics::add(&r.metrics.stopped_for_memory, 1);
-    }
-}
-
 /// How long a request runs before the ones after it go to the queries' runtime: under load a
 /// query's time grows as the cores are shared, so dashboards beside writers pass it at once.
 const LONG: std::time::Duration = std::time::Duration::from_millis(10);

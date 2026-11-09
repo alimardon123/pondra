@@ -250,13 +250,11 @@ store -> backup  6
 store -> branch  4
 store -> bridge  1
 store -> budget  2
-store -> constraints  5
 store -> copy  1
 store -> ddl  4
 store -> delta  1
 store -> engine  2
 store -> ext  3
-store -> ext_names  1
 store -> extension  1
 store -> finish  1
 store -> history  2
@@ -265,7 +263,7 @@ store -> in_task  1
 store -> locks  1
 store -> oom  2
 store -> query  4
-store -> rules  14
+store -> rules  1
 store -> seq  3
 store -> serve  2
 store -> served  1
@@ -273,7 +271,6 @@ store -> spill  2
 store -> sys  3
 store -> types  2
 store -> users  2
-store -> views  1
 store -> wasm32  15
 store -> write  1
 store_wire -> store  1

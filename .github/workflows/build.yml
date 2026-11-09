@@ -311,6 +311,7 @@ jobs:
       - run: bash tools/web_build.sh
       - run: node tools/web_check.mjs --sizes
       - uses: actions/upload-artifact@v6 # (the forms check's page: not pondra-…, which release.yml takes)
+        if: ${{ !cancelled() }} # (kept when its check fails too, to compare a module byte for byte; the forms check takes it only from a web job that passed)
         with:
           name: web-pkg
           path: |

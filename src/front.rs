@@ -92,9 +92,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     // (then the text's passes, in order: `spark_sql('…')` as Pondra's SQL; `pondra.diff('prod.t', 'dev.t')`, ADR-047;
     // `t AT (VERSION => n)`, ADR-043; `PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON; FINAL and RUNNING before a
     // measure, a subquery before MATCH_RECOGNIZE: each as SQL that parses)
-    let sql = &passes.text(sql)?.into_owned();
-    let marked = crate::measures::text(sql); // (`sum(x) AS MEASURE revenue`: an alias that parses, ADR-065 §3)
-    let sql: &str = &marked;
+    let sql: &str = &passes.text(sql)?.into_owned();
     let Routines { own: all, lake } = host.routines().await?;
     let outside = host.attached().await?;
     let named = |n: &String| crate::text::mentions(sql, n);
@@ -125,6 +123,8 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     };
     // (a tree only the fallback dialect read, or the FROM-first reading: printed, as nothing after the front reads the text)
     let read_apart = crate::parsed::generic(sql).is_err();
+    // (a view's `sum(x) AS MEASURE revenue`, which the fallback dialect reads as an alias, ADR-065 §3: `measures::passes`)
+    let measured = measured || (read_apart && crate::measures::marked(&stmts));
     let name = host.name();
     let me = format!("{name}.");
     // Measures first, at the query's own grain (ADR-065 §3): what they put in (a view's FROM, its macros) is expanded below.
