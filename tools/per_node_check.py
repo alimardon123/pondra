@@ -156,7 +156,8 @@ PLAIN = {"std", "sync", "collections", "time", "path", "num", "borrow", "regex",
          "str", "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
          "i128", "isize", "f32", "f64", "Duration", "PathBuf", "Path", "Regex", "Value", "Bytes", "Cow",
          "NonZeroUsize", "static",
-         "crate", "registry", "BuiltIn"}  # (a built-in extension's `registry::BuiltIn`: its names and a function, nothing to change)
+         "crate", "registry", "BuiltIn",  # (a built-in extension's `registry::BuiltIn`: its names and a function, nothing to change)
+         "languages", "Language"}  # (a language of the registry's, `languages::Language`: its names and a function too)
 # Where a `"PONDRA_…"` name isn't a setting anything reads, by file, with the reason.
 NOT_READ = {
     "ci.rs": "GitHub secrets' names, which `pondra ci init` sets for a repository's workflows",

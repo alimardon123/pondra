@@ -591,9 +591,12 @@ one script's (statements sent together over HTTP).
   (`0A000`) naming what to write there: the query as CSV (`POST /sql?format=csv`) or `COPY … TO 's3://…'`, and
   `COPY INTO t FROM 'path or URL'` or `POST /append/t`. So is Postgres's `COPY t FROM 'file'`, a file of its own
   server's: `COPY INTO t FROM 'path or URL'` loads one.
-- `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`) gives the session Spark's
-  functions where Spark and DataFusion share a name ([Spark's functions](/pondra/sql/functions/#sparks-functions)),
-  and `'duckdb'` takes DuckDB's `STRUCT(a INT)` in `CREATE TABLE`.
+- `SET language = 'spark'` makes Spark SQL the session's language: its statements are read with Spark's grammar,
+  with Spark's functions where Spark and DataFusion share a name ([Spark's functions](/pondra/sql/functions/#sparks-functions)).
+  `SET language = 'pondra'` (or `RESET language`) gives Pondra's SQL back, and `SHOW language` shows which it is.
+  `'databricks'` names Spark SQL too, and so does `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`).
+  Another language is refused (`22023`), naming those there are. `datafusion.sql_parser.dialect = 'duckdb'` takes
+  DuckDB's `STRUCT(a INT)` in `CREATE TABLE`.
 - A prepared statement can be a query or a write. `EXECUTE` puts its values where `$1`, `$2`, …
   were, each cast to the type `PREPARE` gave, and runs it as if it were sent.
 - `PREPARE` and [`EXECUTE IMMEDIATE`](#scripts) both bind values as `$1`, `$2`, …, never pasted into

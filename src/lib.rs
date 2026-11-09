@@ -71,6 +71,7 @@ mod multiply;
 mod divide;
 mod sparksql;
 mod parsed;
+mod languages;
 mod dialect;
 mod passes;
 mod past_names;

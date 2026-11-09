@@ -1,5 +1,5 @@
 //! Spark's functions in every session (the `spark` extension's function set), beside the Spark SQL it reads
-//! (`sparksql.rs`).
+//! (`sparksql.rs`, a language of the registry's).
 use datafusion::arrow::datatypes::{DataType, FieldRef};
 use datafusion::common::config::ConfigOptions;
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
@@ -19,6 +19,7 @@ pub static SPARK: crate::registry::BuiltIn = crate::registry::BuiltIn {
     register: |r| {
         r.section_mut::<crate::engine::Functions>().add("spark", add);
         r.section_mut::<crate::passes::Passes>().add(crate::sparksql::pass());
+        r.section_mut::<crate::languages::Languages>().add(&crate::sparksql::LANGUAGE);
     },
 };
 

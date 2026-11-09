@@ -104,6 +104,27 @@ pub(crate) fn read(sql: &str) -> Result<Vec<Statement>, ParserError> {
     }
 }
 
+/// Pondra's SQL, a language of the registry's (`languages.rs`): the core's, read as the front reads a statement (`pondra`).
+pub(crate) static LANGUAGE: crate::languages::Language = crate::languages::Language { name: "pondra", names: &[], parse: statements, inline: None, about: "Pondra's SQL" };
+
+fn statements(sql: &str) -> anyhow::Result<Vec<Statement>> {
+    Ok(pondra(sql)?)
+}
+
+/// `sql` as Pondra's SQL: as `read` reads it, and DuckDB's FROM first with clauses after it (`FROM t WHERE …`) as
+/// `SELECT * FROM t WHERE …`; `read`'s error when neither reads it.
+pub(crate) fn pondra(sql: &str) -> Result<Vec<Statement>, ParserError> {
+    static LEADING_FROM: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*from\b").expect("a regex"));
+    read(sql).or_else(|e| match LEADING_FROM.is_match(sql) {
+        true => {
+            let all = format!("SELECT * {sql}");
+            Parser::parse_sql(&GenericDialect {}, &all).or_else(|_| crate::dialect::parse(&all).0).map_err(|_| e)
+        }
+        false => Err(e),
+    })
+}
+
 /// Where in the text a parse error stood, as sqlparser says it (`at Line: l, Column: c`; the text's end for `found:
 /// EOF`), to compare two errors: (0, 0) when it says nowhere.
 fn reached(e: &ParserError) -> (u64, u64) {

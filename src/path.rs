@@ -173,7 +173,7 @@ pub async fn door(lake: &Lake, sql: &str, skip: &HashSet<String>) -> Result<Stri
             return Err(coded("0A000", in_other(what, kind, path.database())));
         }
     }
-    let inlined = crate::sparksql::inline(sql)?; // (`spark_sql('…')` first: its text is placed like any SQL's)
+    let inlined = crate::languages::inline(sql)?; // (`spark_sql('…')` first: its text is placed like any SQL's)
     let sql = inlined.as_str();
     if let Some(out) = head(lake, &path, sql, &HEADS).await? {
         return Ok(out);

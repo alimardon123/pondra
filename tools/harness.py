@@ -23356,16 +23356,32 @@ def sparksql():
             F.col("x").cast("bigint").alias("b"))), key=lambda r: r["x"])]),
     }
     # A session in Spark's dialect (SET names it, as a client's does) cuts a cast; the session beside it rounds.
+    refused = {}
     dialect = {"x-pondra-session": "harness-sparksql-dialect"}
     call(A.port, "POST", "/sql", b"SET datafusion.sql_parser.dialect = 'spark'", headers=dialect)
     got["dialect cast"] = call(A.port, "POST", "/sql", b"SELECT CAST(2.7 AS INT) AS a, CAST(-2.7 AS BIGINT) AS b", headers=dialect)
+    # The session's language (step 8, PR 7): SET language names Spark SQL as the dialect's setting does, SHOW says which,
+    # and Pondra's SQL comes back; a language there is none of is refused, naming those there are.
+    language = {"x-pondra-session": "harness-sparksql-language"}
+    said = lambda s: call(A.port, "POST", "/sql", s.encode(), headers=language)
+    said("SET language = 'Spark'")
+    got["language"] = [said("SHOW language"), said("SELECT CAST(2.7 AS INT) AS a"), call(A.port, "POST", "/sql", b"SHOW language", headers=dialect)]
+    said("SET language TO pondra")
+    got["language"] += [said("SHOW language"), said("SELECT CAST(2.7 AS INT) AS a")]
+    said("SET language = 'databricks'")
+    said("RESET language")
+    got["language"] += [said("SHOW language"), q("SHOW language")]
+    c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+    c.request("POST", "/sql", b"SET language = 'cobol'", language)
+    r = c.getresponse()
+    refused["a language there is none of"] = f"{r.getheader('x-pondra-sqlstate')} {r.read().decode()}"
     q("CREATE VIEW floors AS SELECT * FROM spark_sql('SELECT id, floor(d) AS f FROM people')")
     got["view"] = q("SELECT sum(f) AS s FROM floors")
-    refused = {
+    refused.update({
         "a statement that isn't a query": _raises_text(lambda: q("SELECT * FROM spark_sql('INSERT INTO people SELECT * FROM people')")),
         "posexplode": _raises_text(lambda: q("SELECT * FROM spark_sql('SELECT id, p, x FROM people LATERAL VIEW posexplode(xs) v AS p, x')")),
         "a lateral view over a join": _raises_text(lambda: q("SELECT * FROM spark_sql('SELECT * FROM people a JOIN people b ON a.id = b.id LATERAL VIEW explode(a.xs) v AS x')")),
-    }
+    })
     info.update(got=got, refused=refused)
     checks['"text" is a string, `name` a name'] = got["text"] == [{"s": "hi", "name": "ann"}]
     checks["floor and ceil answer as Spark's (whole numbers, BIGINT), and Pondra's own SQL as before (a DOUBLE)"] = \
@@ -23385,7 +23401,10 @@ def sparksql():
         and got["sorted out"] == ["dee", "ann", "cy", "bob", "bob", "cy", "ann", "dee"] and got["args"] == [3, 4] and got["frame"] == [{"n": 3}]
     checks["spark_sql('…') from any door, and a view over it"] = got["door"] == [{"f": 2, "t": "Int64"}] and got["view"] == [{"s": 6}]
     checks["refused by name: " + ", ".join(refused)] = "takes a query" in refused["a statement that isn't a query"] and "posexplode" in refused["posexplode"] \
-        and "over a join" in refused["a lateral view over a join"]
+        and "over a join" in refused["a lateral view over a join"] \
+        and refused["a language there is none of"].startswith("22023 ") and "pondra (Pondra's SQL) or spark (Spark SQL)" in refused["a language there is none of"]
+    checks["SET language = 'spark' is the dialect's setting, SHOW language says which, SET language TO pondra and RESET give Pondra's SQL back"] = \
+        got["language"] == [[{"language": "spark"}], [{"a": 2}], [{"language": "spark"}], [{"language": "pondra"}], [{"a": 3}], [{"language": "pondra"}], [{"language": "pondra"}]]
     checks["a cast to an integer cuts the fraction toward zero in Spark's dialect (spark_sql, a session's SET, the frames' cast; 2.7 is 2, -2.7 is -2), and rounds in Pondra's SQL (3, -3)"] = \
         [(str(r["c"]), r["d"]) for r in got["spark cast"]] == [("9007199254740993", 3)] and [(r["a"], r["b"]) for r in got["spark cast"]] == [(2, -2)] \
         and got["plain cast"] == [{"a": 3, "b": -3}] and got["dialect cast"] == [{"a": 2, "b": -2}] and got["frame cast"] == [(-2, -2), (2, 2)]

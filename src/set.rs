@@ -190,6 +190,7 @@ fn name(n: &str) -> String {
     match n.to_lowercase().as_str() {
         "timezone" | "time.zone" | "time zone" => "datafusion.execution.time_zone".into(),
         "threads" | "worker_threads" => "datafusion.execution.target_partitions".into(), // (DuckDB's: how many parts a query runs in at once)
+        "language" => DIALECT.into(), // (the session's language, kept as DataFusion's parse of it until step 8's PR 7b: `dialect_of`)
         n => n.into(),
     }
 }
@@ -247,6 +248,10 @@ fn one_way(n: &str, value: &str) -> Option<(&'static str, String)> {
 
 fn set(session: &str, variable: &str, value: String) -> Result<()> {
     let n = name(variable);
+    let value = match variable.trim().eq_ignore_ascii_case("language") {
+        true => dialect_of(&value)?,
+        false => value,
+    };
     if let Some(v) = n.strip_prefix('@') {
         return Err(crate::codes::coded("0A000", crate::dialect_stmts::user_variable(v)));
     }
@@ -312,13 +317,35 @@ pub async fn apply(ctx: SessionContext) -> Result<SessionContext> {
     Ok(SessionContext::new_with_state(spark.build()))
 }
 
+const DIALECT: &str = "datafusion.sql_parser.dialect";
+
+/// DataFusion's SQL dialect the session set (or the node: `PONDRA_SQL_OPTIONS`).
+fn dialect_set() -> Option<String> {
+    let session = crate::temp::current().and_then(|s| crate::temp::with(&s, false, |s| Ok(s.settings.get(DIALECT).cloned())).ok().flatten());
+    session.or_else(|| crate::env::get("PONDRA_SQL_OPTIONS")?.split(',').find_map(|kv| Some(kv.trim().split_once('=').filter(|(k, _)| *k == DIALECT)?.1.to_string())))
+}
+
 /// The SQL dialect the session set (or the node: `PONDRA_SQL_OPTIONS`), for a statement the
 /// generic parser doesn't take (DuckDB's `STRUCT(a INT)`, …).
 pub fn dialect() -> Option<Box<dyn datafusion::sql::sqlparser::dialect::Dialect>> {
-    const KEY: &str = "datafusion.sql_parser.dialect";
-    let session = crate::temp::current().and_then(|s| crate::temp::with(&s, false, |s| Ok(s.settings.get(KEY).cloned())).ok().flatten());
-    let node = || crate::env::get("PONDRA_SQL_OPTIONS")?.split(',').find_map(|kv| Some(kv.trim().split_once('=').filter(|(k, _)| *k == KEY)?.1.to_string()));
-    datafusion::sql::sqlparser::dialect::dialect_from_str(session.or_else(node)?)
+    datafusion::sql::sqlparser::dialect::dialect_from_str(dialect_set()?)
+}
+
+/// The session's language (`languages.rs`): `SET language = 'spark'` (or DataFusion's dialect `spark` or `databricks`,
+/// which names it too), else the node's (`PONDRA_SQL_OPTIONS`), else Pondra's SQL.
+pub fn language() -> &'static str {
+    dialect_set().and_then(|d| crate::languages::get().named(&d)).map_or(crate::parsed::LANGUAGE.name, |l| l.name)
+}
+
+/// The language `SET language` names, as it is kept until step 8's PR 7b moves a session onto its language's parse:
+/// DataFusion's parse of it, which for Pondra's SQL is DataFusion's generic and for another language DataFusion's of its
+/// name (`spark`). A name no language has is refused, naming those there are.
+fn dialect_of(value: &str) -> Result<String> {
+    let languages = crate::languages::get();
+    let Some(l) = languages.named(value) else {
+        return Err(crate::codes::coded("22023", format!("invalid value for parameter \"language\": \"{value}\" (the languages are {})", languages.listed())));
+    };
+    Ok((if std::ptr::eq(l, &crate::parsed::LANGUAGE) { "generic" } else { l.name }).to_string())
 }
 
 /// `SHOW name` of a Postgres setting the session keeps: one row, its column named as the setting,
@@ -330,6 +357,9 @@ pub fn show(sql: &str) -> Option<String> {
     }
     static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^\s*show\s+([a-z_][a-z0-9_]*)\s*;?\s*$").expect("a regex"));
     let n = SHOW.captures(sql)?[1].to_lowercase();
+    if n == "language" {
+        return Some(format!("SELECT '{}' AS language", language()));
+    }
     if name(&n).contains('.') {
         return None;
     }
