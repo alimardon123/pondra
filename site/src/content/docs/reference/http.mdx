@@ -485,7 +485,8 @@ pondra_role{role="leader"} 1
 | any other path | as on a node | the default database's (`--default`) |
 | `GET /databases` | read | the databases: `[{"name", "running", "default"}]` |
 | `POST /databases` | admin | make one: `{"name": "hr"}`, as `CREATE DATABASE hr`; `400` with the reason if it can't |
-| `DELETE /databases/{name}` | admin | drop one, folder and all, as `DROP DATABASE`; `?if_exists=true` is quiet about one that isn't there. `400` with the reason if it can't |
+| `DELETE /databases/{name}` | admin | drop one, as `DROP DATABASE`: its folder is kept as it was for 7 days, under a mark (`pondra.dropped` lists it); `?purge=true` deletes it at once, as `DROP DATABASE … PURGE`; `?if_exists=true` is quiet about one that isn't there. `400` with the reason if it can't |
+| `POST /databases/{name}/undrop` | admin | bring a dropped one back, as `UNDROP DATABASE`: its mark taken off, served again. `400` with the reason if it can't (none kept under the name) |
 | `GET /console/…` | none | the console's files and settings, as on a node. `GET /` lists every database |
 
 A database's node starts when its first request comes. If it can't start, the request answers `404`

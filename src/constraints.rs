@@ -373,7 +373,7 @@ pub fn queue(lake: Arc<Lake>, table: String, src: Src, batch: RecordBatch) -> Re
         let _turn = TURN.lock().await; // (held until the answer)
         match to {
             To::Local(seq) => leader(lake, seq, table, src, batch).await,
-            To::Leader(addr, _) => send(&addr, &table, &src, &batch).await,
+            To::Leader(addr, _, _) => send(&lake.node, &addr, &table, &src, &batch).await,
         }
     })
 }
@@ -438,8 +438,8 @@ const ANSWERS: [&str; 6] = ["23505", "23514", "23502", "22P02", "42P01", "40001"
 /// A checked append to the leader over HTTP (`/cluster/checked`). A refusal is the leader's own words
 /// with the SQLSTATE its `x-pondra-sqlstate` header carries (`server::E` writes it), so a client on
 /// this node sees exactly what a client on the leader sees.
-async fn send(addr: &str, table: &str, src: &Src, batch: &RecordBatch) -> Result<Ack> {
-    let res = crate::dial::call(addr, crate::dial::Call::post("/cluster/checked", encode(table, src, batch)?)).await?;
+async fn send(node: &crate::node_state::NodeState, addr: &str, table: &str, src: &Src, batch: &RecordBatch) -> Result<Ack> {
+    let res = crate::dial::call(node, addr, crate::dial::Call::post("/cluster/checked", encode(table, src, batch)?)).await?;
     if res.ok() {
         return Ok(res.json().await?);
     }

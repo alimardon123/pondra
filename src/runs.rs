@@ -1144,9 +1144,10 @@ pub fn mentioned(sql: &str) -> bool {
     ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.shares", "pondra.recipients", "pondra.audit", "pondra.history", "pondra.loads", "pondra.learned", "pondra.flows", "pondra.expectations", "pondra.rejects", "pondra.variables", "pondra.dropped", "pondra.objects", "pondra.parts", "pondra.databases", "pondra.applies"].iter().any(|t| s.contains(t))
 }
 
-/// `pondra.routines`, `pondra.tasks`, `pondra.tables` and `pondra.dropped`, as they are now. `pondra.dropped` lists the
-/// lake's deleted files only when `text` reads it, as finding them lists the files' notes.
-pub async fn tables(lake: &Lake, text: &str, scope: &crate::rights::Scope) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
+/// `pondra.routines`, `pondra.tasks`, `pondra.tables` and `pondra.dropped`, as they are now. `sql`: the statement that reads
+/// them (the databases dropped beside this one and the lake's deleted files are listed only for one that names
+/// `pondra.dropped`: finding them lists their folder and the files' notes).
+pub async fn tables(lake: &Lake, scope: &crate::rights::Scope, sql: &str) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
     use datafusion::datasource::MemTable;
     let all = crate::routines::listed(lake).await?;
     let mut names: Vec<&String> = all.keys().collect();
@@ -1223,8 +1224,11 @@ pub async fn tables(lake: &Lake, text: &str, scope: &crate::rights::Scope) -> Re
         bytes: Some(d.meta.files.iter().map(|f| f.bytes).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.bytes)),
         kind: "table".into(), at_ms: d.at_ms, until: d.at_ms + d.keep_ms, by: d.by, name,
     }).collect();
-    gone.extend(crate::undrop::all(lake).await?.into_iter().map(|(name, k)| Gone { kind: k.kind.clone(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
-    if text.to_lowercase().contains("pondra.dropped") {
+    // (a database's own record keeps only its attachment here: its folder's mark is what lists it, `undrop::LAKE_MARK`)
+    gone.extend(crate::undrop::all(lake).await?.into_iter().filter(|(_, k)| k.kind != "database").map(|(name, k)| Gone { kind: k.kind.clone(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
+    if sql.to_lowercase().contains("pondra.dropped") {
+        let beside = crate::undrop::lakes_kept(&crate::ddl::folder_of(&lake.url)).await.unwrap_or_default(); // (a folder that won't list: none)
+        gone.extend(beside.into_iter().map(|(name, _, k)| Gone { kind: "database".into(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
         // (deleted files a version of which is kept (`files::deleted`): a file has no rows, and its bytes are its newest version's)
         gone.extend(crate::files::deleted(lake).await?.into_iter().map(|f| Gone { kind: "file".into(), at_ms: f.at_ms, until: f.kept_until(), rows: None, bytes: Some(f.bytes), by: f.by, name: f.path }));
     }

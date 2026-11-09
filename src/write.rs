@@ -854,7 +854,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             ast::ObjectType::Schema => Some(Ddl::DropSchema { name, if_exists, cascade }),
             ast::ObjectType::Table => Some(Ddl::DropTable { name, if_exists, purge, made_by: None }),
             ast::ObjectType::View | ast::ObjectType::MaterializedView => Some(Ddl::DropView { name, if_exists }),
-            ast::ObjectType::Database => Some(Ddl::DropDatabase { name: name.to_lowercase(), if_exists }),
+            ast::ObjectType::Database => Some(Ddl::DropDatabase { name: name.to_lowercase(), if_exists, purge }),
             _ => None,
         }).collect::<Option<Vec<_>>>()?),
         Statement::CreateView(v) if v.materialized => {
@@ -1011,7 +1011,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
 /// Create a table (or change it: a spec sent again) from any node: the leader does it.
 pub async fn define(app: &crate::app::App, name: &str, spec: &str) -> Result<Value> {
     let out: Value = match app.seq {
-        None => post(&app.members.leader().addr, &Request::Table(name.into(), spec.into())).await?, // (the leader's refusal, by name)
+        None => post(&app.lake.node, &app.members.leader().addr, &Request::Table(name.into(), spec.into())).await?, // (the leader's refusal, by name)
         Some(_) => {
             let _guard = app.lock.lock().await;
             create_table(&app.lake, name, spec).await?
@@ -1742,7 +1742,7 @@ pub async fn seen_here(app: &crate::app::App) {
         return; // (a joined page's member: its node keeps the records, and answers its writes once its own view holds them)
     }
     let leader = &app.members.leader().addr;
-    let ask = |path: &'static str| async move { crate::dial::call(leader, crate::dial::Call::get(path).timeout(std::time::Duration::from_secs(2))).await };
+    let ask = |path: &'static str| async move { crate::dial::call(&app.lake.node, leader, crate::dial::Call::get(path).timeout(std::time::Duration::from_secs(2))).await };
     let cap = std::time::Duration::from_secs(5);
     let Ok(r) = ask("/cluster/committed").await else { return };
     match r.status {
@@ -1981,7 +1981,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files, scope).await?;
         let Some(o) = other else {
             crate::dial::signed(lake).await; // (the nodes' key, before a user's change goes to the leader)
-            return post_as(&app.members.leader().addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
+            return post_as(&lake.node, &app.members.leader().addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
         };
         let out = deliver(&o.url, Some(Request::Change(sql, job.clone(), sent)), &job, false, &lake.node).await?;
         seen_there(&o, Some(producer_key(&format!("sql:{job}")))).await;
@@ -2161,7 +2161,7 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
     };
     let call = crate::dial::Call::json(format!("/insert/{}?job={stage}&staged=1", percent_encoding::utf8_percent_encode(table, percent_encoding::NON_ALPHANUMERIC)), &j!({"columns": names, "files": files, "placed": placed}))?;
     // (the page's own dial, with its own sign-in: a node's carries the nodes' key)
-    let reply = crate::dial::Dial::call(&crate::dial::Joined { node: joined.node(), auth: joined.auth() }, joined.node(), call).await?;
+    let reply = crate::dial::Dial::call(&crate::dial::Joined { node: joined.node(), auth: joined.auth() }, &app.lake.node, joined.node(), call).await?;
     if reply.ok() {
         return reply.json().await;
     }
@@ -2496,7 +2496,7 @@ async fn ddl_listed(app: &crate::app::App, ddls: Vec<crate::ddl::Ddl>, job: &str
             _ if app.members.by_inbox() => through_bucket_one(lake, Stmt::Ddl(vec![d.clone()]), job, files, scope).await?,
             _ => match &app.seq {
                 Some(seq) => ddl_here(lake, seq, &app.lock, d.clone(), scope).await?,
-                None => post(&app.members.leader().addr, &Request::Ddl(d.clone())).await?,
+                None => post(&app.lake.node, &app.members.leader().addr, &Request::Ddl(d.clone())).await?,
             },
         };
         app.settle(&d).await?;
@@ -2570,40 +2570,40 @@ pub async fn through_bucket(dir: &str, req: Request, node: &Arc<NodeState>) -> R
 /// nothing to record (`lead_only`): the lake is led for the moment, and its inbox answered.
 async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool, node: &Arc<NodeState>) -> Result<Value> {
     if let Some(r) = crate::store::reach_of(dir).filter(|r| r.read_only) {
-        return across(dir, &r, req).await; // (a lake on another server: ADR-058)
+        return across(dir, &r, req, node).await; // (a lake on another server: ADR-058)
     }
     let store = crate::store::counted(open_store(dir)?.1, &node.metrics); // (its requests the node's: `Counted`)
     loop {
-        match holder(&store).await? {
+        match holder(&store, Some(&node.claims)).await? {
             // (another `pondra sql` is recording: wait)
-            Holder::Recording(t) => wait_for(&store, &t).await,
+            Holder::Recording(t) => wait_for(&store, &t, Some(&node.claims)).await,
             Holder::Led(t) => {
                 let Some(r) = &req else {
                     // (the lake is led, so its inbox is answered: unless its leader elsewhere doesn't mark itself when rung)
-                    if crate::terms::deaf(&store, &t).await {
+                    if crate::terms::deaf(&store, &t, Some(&node.claims)).await {
                         continue;
                     }
                     return Ok(j!({"duplicate": true}));
                 };
                 // (test hook PONDRA_NO_DIRECT: act as if the leader were out of reach; `through_bucket` never goes over HTTP)
                 let direct = !crate::env::is_set("PONDRA_NO_DIRECT") && BUCKET.try_with(|_| ()).is_err();
-                match if direct { Some(post(&t.addr, r).await) } else { None } {
+                match if direct { Some(post(node, &t.addr, r).await) } else { None } {
                     Some(Ok(v)) => return summary(matches!(r, Request::Flush(_)), v),
                     Some(Err(e)) if !crate::dial::unreached(&e) => return Err(e),
                     _ => {} // this machine can't reach the leader: through the bucket
                 }
-                if let Some(v) = crate::inbox::send(&store, r, None, Some(&t)).await? {
+                if let Some(v) = crate::inbox::send(&store, r, None, Some(&t), Some(&node.claims)).await? {
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }
             Holder::Free(_) if !one_off => {
                 let Some(r) = &req else { return Ok(j!({"duplicate": true})) };
-                if let Some(v) = crate::inbox::send(&store, r, Some((dir, &node.life)), None).await? {
+                if let Some(v) = crate::inbox::send(&store, r, Some((dir, &node.life)), None, Some(&node.claims)).await? {
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }
             Holder::Free(t) => {
-                let Some(term) = claim(&store, t.map_or(1, |t| t.n + 1), "").await? else { continue };
+                let Some(term) = claim(&store, t.map_or(1, |t| t.n + 1), "", &node.claims).await? else { continue };
                 return match lead(dir, &store, term.n, &mut req, node).await {
                     // Another one-off writer took the catalog while this one was leading (both
                     // found the lake idle). Start over with the same job: whoever wins records it
@@ -2683,7 +2683,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
 /// records them with their lineage instead (the inbox, or no leader yet).
 pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
     let t = latest(&lake.store).await.ok()??;
-    if t.addr.is_empty() || !alive(&lake.store, &t).await || crate::env::is_set("PONDRA_NO_DIRECT") {
+    if t.addr.is_empty() || !alive(&lake.store, &t, Some(&lake.node.claims)).await || crate::env::is_set("PONDRA_NO_DIRECT") {
         return None;
     }
     crate::log::To::leader(lake, t.addr).reserve().await.ok()
@@ -2713,7 +2713,7 @@ pub(crate) fn read_only_refused(dir: &str) -> anyhow::Error {
 /// A lake on another server, read here with a read-only key (ADR-058): nothing here writes its
 /// bucket (no inbox, no term claimed), and only a branch's pin goes to its leader, at its
 /// ENDPOINT, with the pondra secret's token or the branch's own key.
-async fn across(dir: &str, r: &crate::store::Reach, req: Option<Request>) -> Result<Value> {
+async fn across(dir: &str, r: &crate::store::Reach, req: Option<Request>, node: &NodeState) -> Result<Value> {
     let Some(req @ Request::Ddl(crate::ddl::Ddl::Pin { .. } | crate::ddl::Ddl::Unpin { .. })) = req else {
         return Err(read_only_refused(dir));
     };
@@ -2727,14 +2727,14 @@ async fn across(dir: &str, r: &crate::store::Reach, req: Option<Request>) -> Res
         None => {
             let store = open_store(dir)?.1;
             match latest(&store).await? {
-                Some(t) if !t.addr.is_empty() && alive(&store, &t).await => crate::dial::url(&t.addr),
+                Some(t) if !t.addr.is_empty() && alive(&store, &t, Some(&node.claims)).await => crate::dial::url(&t.addr),
                 _ => bail!("nobody leads {dir}"),
             }
         }
     };
     let (path, body) = req.http()?;
     let call = crate::dial::Call::post(path, body).as_json().bearer(token);
-    let res = crate::dial::call(&at, call).await
+    let res = crate::dial::call(node, &at, call).await
         .with_context(|| format!("{dir}'s leader doesn't answer at {at}: a branch is pinned while its base's server is up"))?;
     if !res.ok() {
         bail!("{dir}'s leader at {at}: {}", res.text().await?);
@@ -2742,11 +2742,11 @@ async fn across(dir: &str, r: &crate::store::Reach, req: Option<Request>) -> Res
     Ok(res.json().await?)
 }
 
-pub async fn post(addr: &str, r: &Request) -> Result<Value> { post_as(addr, r, None).await }
+pub async fn post(node: &NodeState, addr: &str, r: &Request) -> Result<Value> { post_as(node, addr, r, None).await }
 
 /// `post`, naming the user a change is for to this lake's own leader, which runs it as them
 /// (`auth::AS_USER`). Never to another lake's: it has users of its own.
-async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value> {
+async fn post_as(node: &NodeState, addr: &str, r: &Request, user: Option<String>) -> Result<Value> {
     let (path, body) = r.http()?;
     let mut call = crate::dial::Call::post(path, body).as_json();
     if let Ok(k) = BEARER.try_with(|k| k.clone()) {
@@ -2755,7 +2755,7 @@ async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value>
     if let Some(user) = user {
         call = call.as_user(user);
     }
-    let res = crate::dial::call(addr, call).await?;
+    let res = crate::dial::call(node, addr, call).await?;
     if res.status == 401 {
         bail!("the leader at {addr} asks for a sign-in: set PONDRA_TOKEN to one of the lake's tokens ({})", res.text().await?);
     }
@@ -2823,7 +2823,7 @@ async fn lead(dir: &str, store: &Store, term: u64, req: &mut Option<Request>, no
     let marks = crate::terms::mark_every(store.clone(), term);
     let out = led(dir, term, req, node).await;
     marks.abort(); // (its mark stops before the term is let go, so no mark lands after it)
-    release(store, term).await; // the next writer or node doesn't have to wait
+    release(store, term, &node.claims).await; // the next writer or node doesn't have to wait
     out
 }
 
