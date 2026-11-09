@@ -63,7 +63,7 @@ pub async fn run(app: &App, args: &[FunctionArg], who: Who, job: Option<String>,
     let mut heard = vec![];
     let values = crate::routines::values_of(&row)?;
     let session = format!("run-{}", crate::runs::new_id());
-    let _ends = Ends(session.clone());
+    let _ends = Ends(session.clone(), std::sync::Arc::downgrade(&app.lake));
     let (none, no_views) = (HashMap::new(), HashMap::new());
     let out = crate::vars::own(values, async { // (the run's variables, from the values given: every cell's, and its Python's `db.vars`)
         match kind.as_str() {
@@ -91,10 +91,14 @@ pub async fn run(app: &App, args: &[FunctionArg], who: Who, job: Option<String>,
 
 /// A run's own Python session, ended with the run, also when its caller stops waiting for it (a
 /// task's time ran out, a client went): its worker stops then, not after an hour idle, mid-cell.
-struct Ends(String);
+struct Ends(String, std::sync::Weak<crate::store::Lake>); // (its lake, weakly: a run holds no lake)
 
 impl Drop for Ends {
-    fn drop(&mut self) { crate::python::end_session(&self.0); }
+    fn drop(&mut self) {
+        if let Some(lake) = self.1.upgrade() {
+            crate::python::end_session(&lake, &self.0);
+        }
+    }
 }
 
 /// A notebook by name: `notebooks/<name>.ipynb` (its versions kept with it, ADR-035 §8), or, saved
@@ -168,7 +172,7 @@ async fn cells(app: &App, path: &str, text: &str, row: &RecordBatch, session: &s
         last = match c.python {
             true => python(app, &name, &c.code, None, session, who.clone(), job, heard).await,
             // (a query naming a table of the run's Python: through Python, which sends it along)
-            false if query && ran_python && python_tables(session, &c.code).await => {
+            false if query && ran_python && python_tables(&app.lake, session, &c.code).await => {
                 let v = c.name.as_deref().unwrap_or("_sql");
                 python(app, &name, &format!("{v} = db.sql({})\n{v}", j!(c.code.trim())), None, session, who.clone(), job, heard).await
             }
@@ -186,8 +190,8 @@ async fn cells(app: &App, path: &str, text: &str, row: &RecordBatch, session: &s
 }
 
 /// Does `sql` name a table the session's Python holds (pandas, Polars, Arrow, a frame)?
-async fn python_tables(session: &str, sql: &str) -> bool {
-    let Ok(v) = crate::python::variables(session).await else { return false };
+async fn python_tables(lake: &crate::store::Lake, session: &str, sql: &str) -> bool {
+    let Ok(v) = crate::python::variables(lake, session).await else { return false };
     v["variables"].as_array().into_iter().flatten().any(|v| {
         let (name, kind) = (v["name"].as_str().unwrap_or_default(), v["type"].as_str().unwrap_or_default());
         ["pandas.", "polars.", "pyarrow.", "pondra.frame."].iter().any(|p| kind.starts_with(p)) && crate::text::mentions(sql, name)
@@ -208,7 +212,7 @@ async fn python(app: &App, name: &str, code: &str, vars: Option<&RecordBatch>, s
         crate::routines::heard(&n);
         heard.push(n);
     };
-    let (answer, parts) = crate::python::ask_session(session, head, parts, None, &mut notice).await.map_err(|e| anyhow::anyhow!("{}", lease.redact(&format!("{e:#}"))))?;
+    let (answer, parts) = crate::python::ask_session(&app.lake, session, head, parts, None, &mut notice).await.map_err(|e| anyhow::anyhow!("{}", lease.redact(&format!("{e:#}"))))?;
     match answer["kind"].as_str() {
         Some("rows") => Ok(Outcome::Rows(crate::query::read_ipc(parts.first().context("no rows")?)?)),
         Some("images") => Ok(Outcome::Done(j!({"ran": name, "images": answer["images"]}))),

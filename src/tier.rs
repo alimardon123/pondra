@@ -503,6 +503,20 @@ fn replace(meta: &mut TableMeta, old: &[DataFile], new: Vec<DataFile>) {
     meta.files.extend(new.into_iter().map(|f| DataFile { sketch: Default::default(), ..f })); // (rows the table's sketches already saw)
 }
 
+/// A lake's tiering rounds: where the next round of jobs starts, the floors seen lately, and the orphan sweep's progress.
+#[derive(Default)]
+pub struct Rounds {
+    next: AtomicUsize,
+    floors: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>,
+    swept: std::sync::Mutex<(u64, std::collections::HashMap<String, u64>)>,
+}
+
+impl crate::lake_state::LakeState for Rounds {
+    const NAME: &'static str = "tier";
+    const ABOUT: &'static str = "its tiering rounds: the next node a job goes to, the floors of the last minutes, and what the orphan sweep looked at";
+    fn make() -> Self { Rounds::default() }
+}
+
 /// Data work the leader deals out. It names its inputs exactly (the table as the leader sees
 /// it), so a node whose catalog view lags can't work from an older file list.
 #[derive(Serialize, Deserialize)]
@@ -531,7 +545,7 @@ enum Kind {
 /// commits nothing, so what its other jobs wrote goes at once: left to the orphan sweep (a day
 /// on), a disk the lake had filled filled again with the files of the rounds that failed on it.
 async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result<Vec<DataFile>> {
-    crate::per_node!(static NEXT: AtomicUsize = AtomicUsize::new(0));
+    let rounds = lake.state::<Rounds>()?;
     let paths = |f: &DataFile| std::iter::once(f.path.clone()).chain(f.delete_files().cloned()).collect::<Vec<_>>();
     // (a `Positions` job hands its files back with a delete file more: never theirs to delete)
     let given: std::collections::HashSet<String> = jobs.iter().flat_map(|j| match &j.kind {
@@ -539,7 +553,7 @@ async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result
         Kind::Fold { .. } | Kind::Compact { .. } => vec![],
     }).collect();
     let runs = jobs.into_iter().map(|job| {
-        let node = &nodes[NEXT.fetch_add(1, Relaxed) % nodes.len()];
+        let node = &nodes[rounds.next.fetch_add(1, Relaxed) % nodes.len()];
         async move {
             if node == me {
                 return run_job(lake, job).await;
@@ -938,11 +952,9 @@ pub async fn expire_with(lake: &Lake, grace_ms: u64, briefs: &Tables, pass: Opti
     let floor = crate::pins::floor(lake, held).await?;
     // Only segments that were ALREADY below the floor `grace_ms` ago: a query that read a table's
     // metadata just before it was tiered may still be reading them.
-    // (each lake's own: a process may hold more than one, and one lake's floor says nothing of another's segments)
-    crate::per_node!(static FLOORS: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<(u64, u64)>>> = Default::default());
+    let rounds = lake.state::<Rounds>()?;
     let floor = {
-        let mut all = FLOORS.lock().unwrap();
-        let floors = all.entry(lake.url.clone()).or_default();
+        let mut floors = rounds.floors.lock().unwrap();
         floors.push_back((crate::log::now_ms(), floor));
         while floors.len() > 1 && floors[1].0 <= cutoff {
             floors.pop_front();
@@ -1051,12 +1063,12 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     use futures::TryStreamExt;
     const HOUR: u64 = 3_600_000;
     const DAY: u64 = 24 * HOUR;
-    crate::per_node!(static SWEPT: std::sync::Mutex<(u64, std::collections::HashMap<String, u64>)> = Default::default());
+    let rounds = lake.state::<Rounds>()?;
     let now = crate::log::now_ms();
-    if now - SWEPT.lock().unwrap().0 < HOUR {
+    if now - rounds.swept.lock().unwrap().0 < HOUR {
         return Ok(());
     }
-    SWEPT.lock().unwrap().0 = now;
+    rounds.swept.lock().unwrap().0 = now;
     crate::pins::sweep(lake).await?; // (readers gone: the pins of branches deleted)
     // An object that was there when a reader started may be one of its files (a branch's, of a table dropped
     // since, purged): it stays while that reader reads (`pins`, ADR-047).
@@ -1092,7 +1104,7 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     let gone = listed.common_prefixes.iter().map(|p| p.to_string()).filter(|p| !folders.contains_key(p));
     let parts: Vec<String> = std::iter::once("log".to_string()).chain(folders.keys().cloned()).chain(gone).collect();
     let due: Vec<String> = {
-        let swept = &SWEPT.lock().unwrap().1;
+        let swept = &rounds.swept.lock().unwrap().1;
         let mut due: Vec<(u64, String)> = parts.iter().map(|p| (swept.get(p).copied().unwrap_or(0), p.clone())).filter(|(at, _)| now - at >= DAY).collect();
         due.sort();
         due.into_iter().take(parts.len().div_ceil(24).max(1)).map(|(_, p)| p).collect()
@@ -1130,7 +1142,7 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
                 let _ = object_store::ObjectStoreExt::delete(&lake.store, &o.location).await; // (by the listed path itself)
             }
         }
-        SWEPT.lock().unwrap().1.insert(part, now);
+        rounds.swept.lock().unwrap().1.insert(part, now);
     }
     Ok(())
 }

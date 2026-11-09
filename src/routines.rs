@@ -393,7 +393,7 @@ async fn check(lake: &Lake, name: &str, r: &Routine) -> Result<()> {
     if r.python() && r.with.packages.is_empty() && crate::python::found().await {
         // (compiled by a worker now, so a mistake is found when it's made, with its line; one
         // with packages when it is first used: they are installed then, not under the DDL lock)
-        crate::python::ask(&r.with.packages, crate::python::Use::Procedure { nested: true }, j!({"op": "check", "name": name, "body": r.body, "entry": r.with.entry, "params": names(r)}), vec![], Some(std::time::Duration::from_secs(600)), &mut |_| {}).await.with_context(|| name.to_string())?;
+        crate::python::ask(lake, &r.with.packages, crate::python::Use::Procedure { nested: true }, j!({"op": "check", "name": name, "body": r.body, "entry": r.with.entry, "params": names(r)}), vec![], Some(std::time::Duration::from_secs(600)), &mut |_| {}).await.with_context(|| name.to_string())?;
     }
     Ok(())
 }
@@ -1314,9 +1314,9 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
             let mut head = head;
             head["op"] = j!("cell");
             head["session"] = j!(session);
-            crate::python::ask_session(&session, head, parts, limit, &mut notice).await
+            crate::python::ask_session(&app.lake, &session, head, parts, limit, &mut notice).await
         }
-        _ => crate::python::ask(&r.with.packages, kind, head, parts, limit, &mut notice).await,
+        _ => crate::python::ask(&app.lake, &r.with.packages, kind, head, parts, limit, &mut notice).await,
     };
     let (answer, parts) = asked.map_err(|e| {
         let said = format!("{whose}{}", lease.redact(&format!("{e:#}")));

@@ -228,7 +228,7 @@ impl App {
             };
             match spread_out {
                 Ok(Some(batches)) => {
-                    crate::guard::ran_spread(query, start.elapsed());
+                    crate::guard::ran_spread(&self.lake, query, start.elapsed());
                     crate::history::spread(nodes.len());
                     return Ok((batches, true));
                 }
@@ -265,7 +265,7 @@ impl App {
                     true => crate::spmd::reads_sql(&self.lake, query).await.unwrap_or(0),
                     false => 0,
                 };
-                crate::guard::ran_here(query, bytes, took);
+                crate::guard::ran_here(&self.lake, query, bytes, took);
             }
             Ok((out, false))
         };
