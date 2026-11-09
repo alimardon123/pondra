@@ -292,7 +292,7 @@ async fn password_sign_in(app: &App, user: &str, password: &str, peer: Option<Pe
     if !by_token && !peer.is_some_and(|p| p.may_send_password()) {
         return Err(refused("28000", crate::tls::PASSWORD_PLAIN));
     }
-    if let Some(wait) = crate::auth::guessing(ip, user) {
+    if let Some(wait) = crate::auth::guessing(&app.lake, ip, user) {
         let why = crate::auth::guessing_says(user, wait);
         crate::audit::refused(app, user, "flight", from, "sign in", &why).await;
         tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (as a wrong guess does)
@@ -302,7 +302,7 @@ async fn password_sign_in(app: &App, user: &str, password: &str, peer: Option<Pe
         Some(p) if p.role > Role::None => Ok(Some(p)),
         _ => {
             if !by_token {
-                crate::auth::guessed(ip, user); // (a token isn't guessed: it is random)
+                crate::auth::guessed(&app.lake, ip, user); // (a token isn't guessed: it is random)
             }
             // (a provider's refusal says why, 28000; a wrong password is 28P01, as Postgres says it)
             let (code, why) = match if by_token { crate::sso::why(&app.lake, password).await } else { None } {
@@ -373,7 +373,7 @@ async fn query(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown,
     let req = crate::routines::Request { sql: sql.to_string(), ..Default::default() };
     let how = How { job: None, spread: None, after: None, stale: None };
     let w = Worded::of(&who.scope);
-    let got = statement::run(app, req, how, who.clone(), &FlightWire).await.map_err(w.err())?;
+    let got = crate::auth::reading(statement::run(app, req, how, who.clone(), &FlightWire)).await.map_err(w.err())?; // (nothing it runs moves a sequence: a view's nextval neither)
     if matches!(got, Answer::Sent) {
         return Ok(Flown::Batches(Arc::new(Schema::empty()), vec![]));
     }

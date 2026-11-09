@@ -319,7 +319,10 @@ People may also sign in with the company's account instead of a password: add it
 Once a user who signs in exists, a node with no tokens set refuses whoever doesn't sign in, too.
 Listings show a user what it may read: `information_schema.tables`, `pondra.tables`, the console's
 Data tree. A stream of a table's rows (Kafka, Flight's log, `/watch`, a key lookup, another engine
-through the Iceberg catalog) needs every column of it.
+through the Iceberg catalog) needs every column of it. SELECT on all of a materialized view also shows
+the rows its expectations left out, every column of each, in
+[`pondra.rejects`](/pondra/sql/system-tables/#flows-and-expectations): a view of
+`CHECK (region = 'EU') ON VIOLATION DROP ROW` shows its readers every non-EU row too.
 
 ## Secrets
 

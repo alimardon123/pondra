@@ -61,7 +61,6 @@ PROCESS = {
     "constraints.rs:TURN": LOCK,
     "defaults.rs:BASE": "the functions every session has, with no tables, for CHECK, DEFAULT and expectation expressions: nothing of a lake (what registers one gets a copy)",
     "dbserver.rs:KEY": "the key a lakes server gives its databases' nodes (`client_key`): one a process, made once",
-    "delta.rs:ONE": LOCK,
     "ledger.rs:ROOTS": "the process's memory, every node's budget held on it (redesign step 2, review change 4): one root for the sizes its machine and settings gave, so one in any process but a test's",
     "library.rs:OPEN": "whether a library's node is open in the process: one at a time, since a halt resets every node's statics (`reset::reset`)",
     "library.rs:R": "a library's runtime, kept for the next open: its threads are the process's, as the queries' runtime's are",
@@ -124,6 +123,8 @@ PROCESS = {
     "oom.rs:POINTERS": "a thread's own allocation counters (jemalloc's), found once a thread: they belong to the thread, not to a node",
     "oom.rs:TEST_ALLOCATOR": "the unit tests' allocator, jemalloc as the node's (main.rs), so the meter has counters to read",
     "oom.rs:TRACER": "DataFusion's one join-set tracer for the process, set once: it reads the task-local of whichever request spawns",
+    "sso.rs:KEYS": "each identity provider's published keys, by its issuer's url: public, and the same for any node here",
+    "sso.rs:FETCHING": "one fetch at a time of an issuer's keys, by its url: the same for any node here",
     "store.rs:MS": SETTING + " (PONDRA_LOCK_LEASE_SECS: the retry window, `store::retry_ms`)",
     "store.rs:NAMED": SETTING + " (PONDRA_LOAD_RETENTION_SECS: a named job's window, `store::retention_ms`)",
     "store.rs:ONE": LOCK,
@@ -146,7 +147,6 @@ PROCESS = {
     "tls.rs:KEY": SETTING + " (PONDRA_CLIENT_KEY, which the lakes server gives each database's node)",
     "tls.rs:PROXIES": SETTING + " (PONDRA_TRUSTED_PROXIES)",
     "tls.rs:TLS": SETTING + " (PONDRA_TLS_*)",
-    "users.rs:MAKING": LOCK,
     "write.rs:JOB": "`pondra sql`'s job: the process's, carried through its restarts (`Lifecycle::restart`)",
 }
 
