@@ -314,6 +314,8 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &kafka_client::KAFKA,
         #[cfg(feature = "lake")]
         &sharing_client::SHARING,
+        #[cfg(feature = "lake")]
+        &sso::SSO,
         &sparksql::SPARK,
         &engine::ENGINE,
         #[cfg(feature = "lake")]

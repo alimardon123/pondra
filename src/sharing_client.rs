@@ -15,6 +15,8 @@ pub static SHARING: crate::registry::BuiltIn = crate::registry::BuiltIn {
         r.section_mut::<crate::lake_state::Registered>().add::<Endpoint>(); // (and what a lake keeps for its own door)
         #[cfg(feature = "doors")]
         r.section_mut::<crate::lake_state::Registered>().add::<crate::sharing::Used>();
+        let s = r.section_mut::<crate::statements::Statements>();
+        crate::shares::ENTRIES.iter().for_each(|e| s.add(e));
     },
 };
 

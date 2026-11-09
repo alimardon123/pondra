@@ -142,25 +142,35 @@ const PRIVILEGES: [&str; 7] = ["select", "insert", "update", "delete", "usage", 
 /// `CREATE USER|ROLE`, `ALTER USER|ROLE`, `DROP USER|ROLE`, `GRANT`, `REVOKE`, `CREATE TOKEN`,
 /// `DROP TOKEN`, as a write the leader carries out; None for anything else.
 pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
-    use crate::write::Stmt;
     let words = Words::of(sql)?;
     let first = words.peek_word()?;
-    if !matches!(first.as_str(), "create" | "alter" | "drop" | "grant" | "revoke") {
-        return None;
-    }
     let second = words.0.iter().rev().nth(1).map(|t| t.word()).unwrap_or_default(); // (the words are kept last first)
     let ours = match first.as_str() {
         "grant" | "revoke" => true,
-        _ => matches!(second.as_str(), "user" | "role" | "token"),
+        // (CREATE, ALTER and DROP USER, ROLE and TOKEN: the statements section's entries, `core_statements.rs`; read here
+        // too only as `write::was` reads, before PR 8 moved them)
+        "create" | "alter" | "drop" => entries_skipped() && matches!(second.as_str(), "user" | "role" | "token"),
+        _ => false,
     };
-    if !ours {
-        return None;
-    }
-    Some(match parse(words) {
+    ours.then(|| said(words))
+}
+
+/// CREATE, ALTER and DROP USER, ROLE and TOKEN, by their words: the statements section's entries' reader.
+pub(crate) fn read(w: &mut Words) -> Result<crate::write::Stmt> { Ok(said(std::mem::replace(w, Words(vec![])))) }
+
+fn said(words: Words) -> crate::write::Stmt {
+    use crate::write::Stmt;
+    match parse(words) {
         Ok(change) => Stmt::Ddl(vec![crate::ddl::Ddl::Users(change)]),
         Err(e) => Stmt::of_error(&e, e.to_string()), // (a coded refusal keeps its code: `0LP01` for a privilege its kind lacks)
-    })
+    }
 }
+
+/// Are the statements section's core entries skipped, as `write::was` reads a text before PR 8 moved its readers?
+#[cfg(test)]
+fn entries_skipped() -> bool { crate::write::was::old() }
+#[cfg(not(test))]
+fn entries_skipped() -> bool { false }
 
 fn parse(mut w: Words) -> Result<Change> {
     let verb = w.next().map(|x| x.word()).unwrap_or_default();

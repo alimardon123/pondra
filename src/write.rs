@@ -531,13 +531,14 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     // them without being read again by each (every statement is read here more than once).
     let kinds = matches!(head.as_str(), "create" | "alter" | "drop" | "grant" | "revoke" | "comment" | "copy" | "attach");
     if let Some(s) = kinds.then(|| crate::shares::statement(sql)).flatten() {
-        return Some(s); // (CREATE SHARE and RECIPIENT, GRANT SELECT ON SHARE: `shares.rs`, before users' GRANT)
+        return Some(s); // (GRANT SELECT ON SHARE: `shares.rs`, before users' GRANT; SHARE and RECIPIENT are the sharing extension's entries)
     }
     if let Some(s) = kinds.then(|| crate::users::statement(sql)).flatten() {
-        return Some(s); // (CREATE USER and ROLE, GRANT, REVOKE, CREATE TOKEN: `users.rs`)
+        return Some(s); // (GRANT and REVOKE: `users.rs`, until step 6 reads GRANT once; USER, ROLE and TOKEN are entries)
     }
-    if let Some(s) = kinds.then(|| crate::sso::statement(sql)).flatten() {
-        return Some(s); // (CREATE and DROP IDENTITY PROVIDER: `sso.rs`)
+    #[cfg(test)]
+    if let Some(s) = kinds.then(|| was::sso(sql)).flatten() {
+        return Some(s);
     }
     if let Some(s) = kinds.then(|| crate::ext::statement(sql)).flatten() {
         return Some(s); // (CREATE SECRET: values of any kind; DROP SECRET)
@@ -2796,6 +2797,9 @@ pub(crate) mod was {
         s
     }
 
+    /// Row 6, `sso::statement`, where `parse` read it.
+    pub(super) fn sso(sql: &str) -> Option<Stmt> { old().then(|| crate::sso::statement(sql)).flatten() }
+
     /// Row 4, where `parse` read it.
     pub(super) fn no_replace(sql: &str) -> Option<Stmt> {
         if !old() {
@@ -2948,7 +2952,7 @@ pub(crate) mod was {
         let (mut same, mut core, mut refused_now, mut differ) = (0, 0, vec![], vec![]);
         for sql in texts.iter().filter(|t| one(t) && !placeholder.is_match(t)) {
             let (now, then) = (shown(&super::parse(sql)), shown(&was(sql)));
-            let by_core = crate::statements::read_by(sql) == Some(crate::statements::CORE);
+            let by_core = crate::statements::moved(sql);
             core += usize::from(by_core);
             if now == then {
                 same += 1;
@@ -2959,8 +2963,8 @@ pub(crate) mod was {
             }
         }
         assert!(differ.is_empty(), "{} of {} texts read otherwise, the first: {:#?}", differ.len(), same + differ.len(), &differ[..differ.len().min(10)]);
-        assert!(core >= 20, "the core's entries read {core} texts of the corpus: too few to hold them to it");
-        eprintln!("{same} texts read as before; {core} by the core's entries; {} refused now by their family's reader: {refused_now:#?}", refused_now.len());
+        assert!(core >= 20, "the entries PR 8 moved read {core} texts of the corpus: too few to hold them to it");
+        eprintln!("{same} texts read as before; {core} by the entries PR 8 moved; {} refused now by their family's reader: {refused_now:#?}", refused_now.len());
         for sql in [
             "CREATE OR REPLACE SCHEMA s", "create or replace user u password 'x'", "CREATE OR REPLACE ROLE r", "CREATE OR REPLACE SHARE s",
             "CREATE OR REPLACE RECIPIENT r", "CREATE OR REPLACE DATABASE d", "-- a comment\nCREATE OR REPLACE SCHEMA s",
@@ -2975,9 +2979,17 @@ pub(crate) mod was {
             "BACKUP DATABASE TO 's3://b/x'", "BACKUP DATABASE prod TO '/b' WITH (retention_days = 3)", "BACKUP DATABASE prod TO '/b' WITH (retention_days = 99999999999999999999999)",
             "BACKUP DATABASE prod", "BACKUP DATABASE prod TO '/b' WITH (days = 3)", "RESTORE DATABASE p FROM '/b'", "RESTORE DATABASE p FROM '/b' LOCATION '/c' AT (TIMESTAMP => '2026-10-12 03:00:00')",
             "RESTORE DATABASE p FROM '/b' AT (TIMESTAMP => 'soon')", "RESTORE DATABASE p", "EXPORT DATABASE 'd'", "import database 'd' (format parquet)",
+            "CREATE USER u PASSWORD 'secret123'", "create user if not exists \"U\" with password 'secret123' superuser", "CREATE USER u PASSWORD 'short'",
+            "CREATE ROLE IF NOT EXISTS r", "ALTER USER u WITH PASSWORD 'longer123'", "ALTER ROLE r SUPERUSER", "DROP USER IF EXISTS u", "DROP ROLE r",
+            "CREATE TOKEN t", "ALTER TOKEN t", "DROP TOKEN t", "DROP TOKEN",
+            "CREATE SHARE s", "CREATE SHARE IF NOT EXISTS s COMMENT = 'x'", "CREATE RECIPIENT r EXPIRES IN '90 days'", "ALTER SHARE s ADD TABLE t",
+            "ALTER SHARE s REMOVE TABLE t", "ALTER RECIPIENT r ROTATE TOKEN", "DROP SHARE IF EXISTS s", "DROP RECIPIENT r", "CREATE SHARE",
+            "CREATE OR REPLACE SHARE s", "create or replace recipient r", "CREATE IDENTITY PROVIDER p (ISSUER 'https://x', CLIENT_ID 'c')",
+            "CREATE OR REPLACE IDENTITY PROVIDER p (ISSUER 'https://x')", "ALTER IDENTITY PROVIDER p (LABEL 'x')", "DROP IDENTITY PROVIDER IF EXISTS p",
+            "DROP IDENTITY PROVIDER",
         ] {
             assert_eq!(shown(&super::parse(sql)), shown(&was(sql)), "{sql}");
-            assert_eq!(crate::statements::read_by(sql), Some(crate::statements::CORE), "{sql}");
+            assert!(crate::statements::moved(sql), "{sql}: an entry's");
         }
         // (the forms the parser refused, now each family's reader's)
         for (sql, said) in [

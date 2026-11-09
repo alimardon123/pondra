@@ -137,7 +137,7 @@ pub const CORE: &str = "core";
 /// The leading words of the statements the core reads outside this section today (`write::parse`'s readers and its
 /// match on sqlparser's tree), after a CREATE's `OR REPLACE`, `OR ALTER`, `TEMP` or `TEMPORARY`: an extension's entry
 /// may not begin with one, so no extension takes a core statement over with longer words. Each goes as its whole family
-/// becomes a core entry (PR 8b-8d), which the same check covers (`ALTER DATABASE` has).
+/// becomes a core entry (PR 8b-8d), which the same check covers (`ALTER DATABASE`, USER, ROLE, TOKEN, SHARE, RECIPIENT and IDENTITY PROVIDER have).
 const CORE_WORDS: &[&[&str]] = &[
     &["SELECT"], &["WITH"], &["VALUES"], &["TABLE"], &["FROM"], &["INSERT"], &["UPDATE"], &["DELETE"], &["MERGE"], &["TRUNCATE"],
     &["GRANT"], &["REVOKE"], &["COMMENT"], &["COPY"], &["ATTACH"], &["DETACH"], &["UNDROP"], &["BACKUP"], &["RESTORE"],
@@ -145,15 +145,12 @@ const CORE_WORDS: &[&[&str]] = &[
     &["EXPLAIN"], &["BEGIN"], &["START"], &["COMMIT"], &["ROLLBACK"], &["END"], &["CHECKPOINT"], &["EXPORT"], &["IMPORT"],
     &["CREATE", "TABLE"], &["CREATE", "EXTERNAL"], &["CREATE", "VIEW"], &["CREATE", "MATERIALIZED"], &["CREATE", "SCHEMA"],
     &["CREATE", "DATABASE"], &["CREATE", "FUNCTION"], &["CREATE", "PROCEDURE"], &["CREATE", "MACRO"], &["CREATE", "TASK"],
-    &["CREATE", "PIPELINE"], &["CREATE", "USER"], &["CREATE", "ROLE"], &["CREATE", "TOKEN"], &["CREATE", "SHARE"],
-    &["CREATE", "RECIPIENT"], &["CREATE", "IDENTITY"], &["CREATE", "SECRET"], &["CREATE", "PERSISTENT"],
+    &["CREATE", "PIPELINE"], &["CREATE", "SECRET"], &["CREATE", "PERSISTENT"],
     &["CREATE", "SEQUENCE"], &["CREATE", "INDEX"], &["CREATE", "UNIQUE"], &["CREATE", "TYPE"],
     &["ALTER", "TABLE"], &["ALTER", "VIEW"], &["ALTER", "MATERIALIZED"], &["ALTER", "SCHEMA"],
-    &["ALTER", "TASK"], &["ALTER", "USER"], &["ALTER", "ROLE"], &["ALTER", "SHARE"], &["ALTER", "RECIPIENT"],
-    &["ALTER", "IDENTITY"], &["ALTER", "SEQUENCE"], &["ALTER", "INDEX"], &["ALTER", "TYPE"],
+    &["ALTER", "TASK"], &["ALTER", "SEQUENCE"], &["ALTER", "INDEX"], &["ALTER", "TYPE"],
     &["DROP", "TABLE"], &["DROP", "VIEW"], &["DROP", "MATERIALIZED"], &["DROP", "SCHEMA"], &["DROP", "DATABASE"],
-    &["DROP", "FUNCTION"], &["DROP", "PROCEDURE"], &["DROP", "MACRO"], &["DROP", "TASK"], &["DROP", "USER"],
-    &["DROP", "ROLE"], &["DROP", "TOKEN"], &["DROP", "SHARE"], &["DROP", "RECIPIENT"], &["DROP", "IDENTITY"],
+    &["DROP", "FUNCTION"], &["DROP", "PROCEDURE"], &["DROP", "MACRO"], &["DROP", "TASK"],
     &["DROP", "SECRET"], &["DROP", "PERSISTENT"], &["DROP", "TEMPORARY"], &["DROP", "SEQUENCE"], &["DROP", "INDEX"],
     &["DROP", "TYPE"],
 ];
@@ -209,7 +206,7 @@ impl Statements {
         let first = crate::text::head(sql).to_ascii_uppercase();
         let entries = self.by_first.get(first.as_str())?;
         let words = Words::of(sql)?;
-        let s = entries.iter().filter(|s| words.begins(s.words) && !before_core(s)).max_by_key(|s| s.words.len()).copied()?;
+        let s = entries.iter().filter(|s| words.begins(s.words) && !moved_skipped(s)).max_by_key(|s| s.words.len()).copied()?;
         Some((s, words))
     }
 
@@ -244,15 +241,15 @@ fn matched_in(r: &Registry, sql: &str, offered: fn(Need) -> bool) -> Option<crat
     Some(read.unwrap_or_else(|e| Stmt::of_error(&e, format!("{e:#}"))))
 }
 
-/// The extension whose entry reads `sql`, if one does.
+/// Is `sql` read by an entry PR 8 moved in (a reader of the core's statement, `Read::Core`)?
 #[cfg(test)]
-pub(crate) fn read_by(sql: &str) -> Option<&'static str> { crate::registry::get().find::<Statements>()?.of(sql).map(|(s, _)| s.extension) }
+pub(crate) fn moved(sql: &str) -> bool { crate::registry::get().find::<Statements>().and_then(|s| s.of(sql)).is_some_and(|(s, _)| matches!(s.read, Read::Core(_))) }
 
-/// Is `s` a core entry while `write::was` reads a text as the readers PR 8 replaced did?
+/// Is `s` an entry PR 8 moved in, while `write::was` reads a text as the readers it replaced did (so it is skipped)?
 #[cfg(test)]
-fn before_core(s: &Statement) -> bool { s.extension == CORE && crate::write::was::old() }
+fn moved_skipped(s: &Statement) -> bool { matches!(s.read, Read::Core(_)) && crate::write::was::old() }
 #[cfg(not(test))]
-fn before_core(_: &Statement) -> bool { false }
+fn moved_skipped(_: &Statement) -> bool { false }
 
 /// Leader: carry out an extension's statement, as `write::parse` read it.
 pub(crate) async fn carry_out(lake: &Lake, words: &str, tree: Value) -> Result<Value> {

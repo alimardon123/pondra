@@ -31,8 +31,6 @@ static ENTRIES: &[Statement] = &[
     entry(&["CREATE", "OR", "REPLACE", "DATABASE"], no_replace, "refused: replacing a database would drop everything in it"),
     entry(&["CREATE", "OR", "REPLACE", "USER"], no_replace, "refused: replacing a user would drop the rights given to it"),
     entry(&["CREATE", "OR", "REPLACE", "ROLE"], no_replace, "refused: replacing a role would drop the rights given to it"),
-    entry(&["CREATE", "OR", "REPLACE", "SHARE"], no_replace, "refused: replacing a share would drop its tables and grants"),
-    entry(&["CREATE", "OR", "REPLACE", "RECIPIENT"], no_replace, "refused: replacing a recipient would drop its token and shares"),
     entry(&["ALTER", "VIEW", "*", "RENAME"], rename_view, "renames a view (dbt's ALTER VIEW v RENAME TO w)"),
     entry(&["ALTER", "VIEW", "IF", "EXISTS", "*", "RENAME"], rename_view, "renames a view"),
     entry(&["ALTER", "MATERIALIZED", "VIEW", "*", "RENAME"], rename_view, "renames a materialized view"),
@@ -51,6 +49,15 @@ static ENTRIES: &[Statement] = &[
     entry(&["RESTORE", "DATABASE"], restore, "a database brought back from a backup (ADR-070)"),
     entry(&["EXPORT", "DATABASE"], portable, "refused by name: BACKUP DATABASE and COPY are the ways"),
     entry(&["IMPORT", "DATABASE"], portable, "refused by name: RESTORE DATABASE and COPY are the ways"),
+    entry(&["CREATE", "USER"], crate::users::read, "a user, who signs in (ADR-035)"),
+    entry(&["CREATE", "ROLE"], crate::users::read, "a role: a user who can't sign in, whose grants its members have"),
+    entry(&["ALTER", "USER"], crate::users::read, "a user's password, superuser, sign-in and limits"),
+    entry(&["ALTER", "ROLE"], crate::users::read, "a role's superuser, sign-in and limits"),
+    entry(&["DROP", "USER"], crate::users::read, "drops a user"),
+    entry(&["DROP", "ROLE"], crate::users::read, "drops a role"),
+    entry(&["CREATE", "TOKEN"], crate::users::read, "a token a user signs in with"),
+    entry(&["ALTER", "TOKEN"], crate::users::read, "a token, read as DROP TOKEN is"),
+    entry(&["DROP", "TOKEN"], crate::users::read, "drops a token"),
 ];
 
 /// A reader's own words for a form written wrong, after what it found: what a statement of the form is.
@@ -69,18 +76,18 @@ fn if_not_exists(w: &mut Words) -> Result<bool> {
 /// A database's name: one part (`b`, `"B"`), unquoted in lower case, as `text::object_of` reads one.
 fn database(w: &mut Words) -> Result<String> { w.part().map_err(|_| anyhow::anyhow!("expected a database's name {}", w.near())) }
 
-/// `CREATE OR REPLACE SCHEMA | DATABASE | USER | ROLE | SHARE | RECIPIENT`, where replacing one would lose what it holds:
-/// refused, saying why.
+/// `CREATE OR REPLACE SCHEMA | DATABASE | USER | ROLE`, where replacing one would lose what it holds: refused, saying why
+/// (and SHARE and RECIPIENT, the sharing extension's: `shares::ENTRIES`).
 fn no_replace(w: &mut Words) -> Result<Stmt> {
     w.expect_all(&["create", "or", "replace"])?;
-    let kind = w.next().map(|k| k.word().to_uppercase()).unwrap_or_default();
-    let lost = match kind.as_str() {
-        "USER" | "ROLE" => "the rights given to it",
-        "SHARE" => "its tables and grants",
-        "RECIPIENT" => "its token and the shares granted to it",
-        _ => "everything in it",
-    };
-    Ok(Stmt::Invalid(format!("CREATE OR REPLACE {kind}: replacing one would drop {lost}; CREATE {kind} IF NOT EXISTS leaves one that is there as it is")))
+    let kind = w.next().map(|k| k.word()).unwrap_or_default();
+    Ok(replacing(&kind, if matches!(kind.as_str(), "user" | "role") { "the rights given to it" } else { "everything in it" }))
+}
+
+/// The refusal of a `CREATE OR REPLACE kind`, which would lose what one holds (`lost`).
+pub(crate) fn replacing(kind: &str, lost: &str) -> Stmt {
+    let kind = kind.to_uppercase();
+    Stmt::Invalid(format!("CREATE OR REPLACE {kind}: replacing one would drop {lost}; CREATE {kind} IF NOT EXISTS leaves one that is there as it is"))
 }
 
 /// `ALTER [MATERIALIZED] VIEW [IF EXISTS] v RENAME TO w` (dbt's): the parser takes only ALTER VIEW … AS. (A view that
@@ -280,6 +287,6 @@ mod tests {
     #[test]
     fn the_core_entries_on_stand_ins_are_counted() {
         let s = crate::registry::get().section::<Statements>();
-        assert_eq!((s.stand_ins(), ENTRIES.len()), (24, 24));
+        assert_eq!((ENTRIES.len(), s.stand_ins()), (31, 43), "the core's 31, the sharing extension's 8 and the identity providers' 4");
     }
 }

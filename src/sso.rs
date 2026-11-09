@@ -66,6 +66,7 @@ impl Provider {
 
 /// `CREATE [OR REPLACE] IDENTITY PROVIDER [IF NOT EXISTS] name (…)`, `DROP IDENTITY PROVIDER [IF EXISTS]
 /// name`; None for anything else.
+#[cfg(test)]
 pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     use crate::write::Stmt;
     let w = Words::of(sql)?;
@@ -81,6 +82,36 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     Some(match parse(w) {
         Ok(c) => Stmt::Ddl(vec![crate::ddl::Ddl::Users(c)]),
         Err(e) => Stmt::Invalid(format!("{e:#}")),
+    })
+}
+
+/// The identity providers' extension: its statements in the registry's statements section, by their words (step 8, PR
+/// 8b). The core carries them out (`Ddl::Users`), so they stand in for their run and right until it has its own.
+pub static SSO: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "sso",
+    requires: &[],
+    register: |r| {
+        let s = r.section_mut::<crate::statements::Statements>();
+        ENTRIES.iter().for_each(|e| s.add(e));
+    },
+};
+
+static ENTRIES: &[crate::statements::Statement] = &[
+    entry(&["CREATE", "IDENTITY", "PROVIDER"], "an identity provider whose tokens sign users in (ADR-062)"),
+    entry(&["CREATE", "OR", "REPLACE", "IDENTITY", "PROVIDER"], "an identity provider, in place of one of its name"),
+    entry(&["ALTER", "IDENTITY", "PROVIDER"], "an identity provider's options"),
+    entry(&["DROP", "IDENTITY", "PROVIDER"], "drops an identity provider"),
+];
+
+const fn entry(words: &'static [&'static str], about: &'static str) -> crate::statements::Statement {
+    use crate::statements::{Read, Right, Run};
+    crate::statements::Statement { words, read: Read::Core(read), run: Run::Stmt, right: Right::FromStmt, needs: &[], about, extension: "sso" }
+}
+
+fn read(w: &mut Words) -> Result<crate::write::Stmt> {
+    Ok(match parse(std::mem::replace(w, Words(vec![]))) {
+        Ok(c) => crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Users(c)]),
+        Err(e) => crate::write::Stmt::Invalid(format!("{e:#}")),
     })
 }
 
