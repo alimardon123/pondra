@@ -56,11 +56,15 @@ const sizes = args.includes('--sizes');
 // 9.2305 → 9.2442 MB: a dropped database kept in its folder and UNDROP DATABASE (13.7 KB over main's 9,224,889 at
 // caedf432: 9,238,567 at f0045f19, measured on CI), the room above main kept as it was: the page builds the same ddl as
 // every form, a database's drop and undrop with it.
-// 9.2442 → 9.3099 MB: the module's code order, not its code. #709 into main's bb80824c (eb0efea, measured on CI): its wasm
+// 9.2442 → 9.2517 MB: UNDROP FILE (UNDROP for every kind, files): a page's lake lists a deleted file in `pondra.dropped`
+// and brings it back, as every form's does (5.3 KB over main's 9,228,372 at ed42156e, measured on CI), and the room
+// above main back to 3 KB, which the moves since had left at 0.9 KB (main's 9,243,289 at bb80824c).
+// 9.2517 → 9.3123 MB: the module's code order, not its code. #709 into main's bb80824c (eb0efea, measured on CI): its wasm
 // 128 B and its gzip 193 B over main's, its brotli 62.5 KB over (9,305,835): brotli's 4 MB window finds fewer matches
 // when the same code lands in another order. #716 lands at the same 9.306 MB with 4.2 KB of wasm of its own.
-// (Here: #716's 9,306,734 at its merge into bb80824c, the room above main kept as it was.)
-const BROTLI_BUDGET = 9_309_900;
+// (Here: #716's 9,306,734 at its merge into bb80824c; on main's 9,245,764 at ff11c95b, with that order, about
+// 9,309,200, the room above it 3 KB.)
+const BROTLI_BUDGET = 9_312_300;
 // The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
 const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows
