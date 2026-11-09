@@ -1122,25 +1122,6 @@ fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
     })
 }
 
-/// `COPY … INTO`, Pondra's `COPY` forms and `ATTACH … (TYPE …)`, parsed here, or None for any other statement: as
-/// `write::parse` read them before the statements section's entries did (`attach`, `copy`, `copy_into`; `write::was`).
-#[cfg(test)]
-pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser};
-    if let Some(load) = copy_into_statement(&mut Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?) {
-        return Some(load);
-    }
-    let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
-    if let Some(copy) = copy_statement(&mut p) {
-        return Some(copy);
-    }
-    let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
-    if p.parse_keyword(Keyword::ATTACH) {
-        return attach_statement(&mut p);
-    }
-    None
-}
-
 /// ATTACH, every form: the statements section's ATTACH entry (`core_statements.rs`). Its walk reads the options and a
 /// connection's name (`attach_statement`), and sqlparser's tree `ATTACH [DATABASE] 'dir' AS name` with none, SQLite's
 /// words: another lake. What neither reads is refused as DataFusion's planner refused it before: in the parser's words,

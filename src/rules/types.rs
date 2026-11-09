@@ -94,57 +94,6 @@ fn altered(w: &mut Words) -> Result<Result<Change, String>> {
     Ok(Ok(Change::Add { name, label, if_not_exists, before, after }))
 }
 
-/// `CREATE TYPE … AS ENUM`, `ALTER TYPE` or `DROP TYPE` as the change it is; `Err` with the words a statement of one of them
-/// is refused in when it is wrong; None for any other statement: as `write::parse` read them before they were the
-/// statements section's entries (`write::was`).
-#[cfg(test)]
-pub fn change(sql: &str) -> Option<Result<Change, String>> {
-    use datafusion::sql::sqlparser::ast::{self, Statement};
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
-    use std::sync::LazyLock;
-    static WORD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(CREATE(\s+OR\s+REPLACE)?|ALTER|DROP)\s+TYPE\b").expect("a regex"));
-    static UNLESS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+TYPE\s+)IF\s+NOT\s+EXISTS\s+").expect("a regex"));
-    static DROP: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*DROP\s+TYPE\s+(IF\s+EXISTS\s+)?(.+?)(\s+(CASCADE|RESTRICT))?\s*;?\s*$"#).expect("a regex"));
-    let first = crate::text::first_word(sql);
-    let c = WORD.captures(first)?;
-    let word = c[1].to_uppercase();
-    if c.get(2).is_some() {
-        return Some(Err("CREATE OR REPLACE TYPE: a type's columns keep their labels (ALTER TYPE … ADD VALUE adds one)".into()));
-    }
-    if word == "DROP" {
-        // (CASCADE and RESTRICT are the same here: a drop never takes a column with it, so a type a column
-        // uses is refused by name whichever is written, and one no column uses is dropped either way)
-        let d = DROP.captures(first)?;
-        let names = d[2].split(',').map(|n| crate::text::object_of(n.trim())).collect();
-        return Some(Ok(Change::Drop { names, if_exists: d.get(1).is_some() }));
-    }
-    let unless = UNLESS.is_match(first);
-    let text = UNLESS.replace(first, "$1");
-    let parsed = Parser::parse_sql(&GenericDialect {}, &text).map(|mut s| s.pop());
-    Some(match parsed {
-        Ok(Some(Statement::CreateType { name, representation: Some(ast::UserDefinedTypeRepresentation::Enum { labels }) })) => {
-            Ok(Change::Create { name: crate::text::object(&name), labels: labels.iter().map(|l| l.value.clone()).collect(), if_not_exists: unless })
-        }
-        Ok(Some(Statement::CreateType { .. })) | Err(_) if word.starts_with("CREATE") => Err("CREATE TYPE [IF NOT EXISTS] name AS ENUM ('label', …): enums are the types kept (a composite, a range or another type's alias isn't)".into()),
-        Ok(Some(Statement::AlterType(a))) => {
-            let name = crate::text::object(&a.name);
-            match a.operation {
-                ast::AlterTypeOperation::Rename(r) => Ok(Change::Rename { name, to: crate::text::ident(&r.new_name) }),
-                ast::AlterTypeOperation::AddValue(v) => {
-                    let (before, after) = match v.position {
-                        Some(ast::AlterTypeAddValuePosition::Before(n)) => (Some(n.value), None),
-                        Some(ast::AlterTypeAddValuePosition::After(n)) => (None, Some(n.value)),
-                        None => (None, None),
-                    };
-                    Ok(Change::Add { name, label: v.value.value, if_not_exists: v.if_not_exists, before, after })
-                }
-                ast::AlterTypeOperation::RenameValue(_) => Err("ALTER TYPE … RENAME VALUE: rows keep the text they were written with (files are never rewritten); add the new label, UPDATE the rows to it".into()),
-            }
-        }
-        _ => Err("ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label' [BEFORE | AFTER 'label'] | RENAME TO new_name".into()),
-    })
-}
-
 /// The refusal a CREATE TYPE meets when its type is there already.
 pub fn exists(name: &str) -> String { format!("type \"{name}\" already exists") }
 

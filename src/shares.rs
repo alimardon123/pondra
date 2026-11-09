@@ -72,19 +72,13 @@ pub enum Change {
 
 // ---------------------------------------------------------------- statements
 
-/// `CREATE | ALTER | DROP SHARE`, `CREATE | ALTER | DROP RECIPIENT`, `GRANT | REVOKE SELECT ON
-/// SHARE s TO | FROM RECIPIENT r`, `GRANT | REVOKE SELECT ON TABLE t TO | FROM SHARE s`; None for
-/// anything else (before `users.rs`, which takes every other GRANT).
+/// `GRANT | REVOKE SELECT ON SHARE s TO | FROM RECIPIENT r`, `GRANT | REVOKE SELECT ON TABLE t TO | FROM SHARE s`; None
+/// for anything else (before `users.rs`, which takes every other GRANT until step 6 reads GRANT once). CREATE, ALTER and
+/// DROP SHARE and RECIPIENT are the sharing extension's entries (`ENTRIES`).
 pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     let mut w = Words::of(sql)?;
     let words: Vec<String> = w.0.iter().rev().map(W::word).collect();
-    let ours = match words.first()?.as_str() {
-        // (CREATE, ALTER and DROP SHARE and RECIPIENT: the sharing extension's entries, `ENTRIES`; read here too only as
-        // `write::was` reads, before PR 8 moved them)
-        "create" | "alter" | "drop" => entries_skipped() && matches!(words.get(1).map(String::as_str), Some("share" | "recipient")),
-        "grant" | "revoke" => words.windows(2).any(|p| matches!(p[0].as_str(), "on" | "to" | "from") && p[1] == "share"),
-        _ => false,
-    };
+    let ours = matches!(words.first()?.as_str(), "grant" | "revoke") && words.windows(2).any(|p| matches!(p[0].as_str(), "on" | "to" | "from") && p[1] == "share");
     ours.then(|| said(&mut w))
 }
 
@@ -94,11 +88,6 @@ fn said(w: &mut Words) -> crate::write::Stmt {
         Err(e) => crate::write::Stmt::Invalid(e.to_string()),
     }
 }
-
-#[cfg(test)]
-fn entries_skipped() -> bool { crate::write::was::old() }
-#[cfg(not(test))]
-fn entries_skipped() -> bool { false }
 
 /// The sharing extension's statements in the registry's statements section, by their words (step 8, PR 8b). The core
 /// carries them out (`Ddl::Shares`), so they stand in for their run and right until the extension has its own.

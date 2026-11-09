@@ -220,7 +220,7 @@ impl Statements {
         let first = crate::text::head(sql).to_ascii_uppercase();
         let entries = self.by_first.get(first.as_str())?;
         let words = Words::of(sql)?;
-        let s = entries.iter().filter(|s| words.begins(s.words) && !moved_skipped(s) && !shadowed(entries, s.words, &words)).max_by_key(|s| s.words.len()).copied()?;
+        let s = entries.iter().filter(|s| words.begins(s.words) && !shadowed(entries, s.words, &words)).max_by_key(|s| s.words.len()).copied()?;
         Some((s, words))
     }
 
@@ -258,16 +258,6 @@ fn matched_in(r: &Registry, sql: &str, offered: fn(Need) -> bool) -> Option<crat
     };
     Some(read.unwrap_or_else(|e| Stmt::of_error(&e, format!("{e:#}"))))
 }
-
-/// Is `sql` read by an entry PR 8 moved in (a reader of the core's statement, `Read::Core` or `Read::Tree`)?
-#[cfg(test)]
-pub(crate) fn moved(sql: &str) -> bool { crate::registry::get().find::<Statements>().and_then(|s| s.of(sql)).is_some_and(|(s, _)| matches!(s.read, Read::Core(_) | Read::Tree(_))) }
-
-/// Is `s` an entry PR 8 moved in, while `write::was` reads a text as the readers it replaced did (so it is skipped)?
-#[cfg(test)]
-fn moved_skipped(s: &Statement) -> bool { matches!(s.read, Read::Core(_) | Read::Tree(_)) && crate::write::was::old() }
-#[cfg(not(test))]
-fn moved_skipped(_: &Statement) -> bool { false }
 
 /// Leader: carry out an extension's statement, as `write::parse` read it.
 pub(crate) async fn carry_out(lake: &Lake, words: &str, tree: Value) -> Result<Value> {

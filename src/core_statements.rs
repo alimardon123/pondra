@@ -2,7 +2,8 @@
 //! core reads by its words, with one reader a family, found by its leading words as an extension's statement is. Their
 //! run and right are the stand-ins `Run::Stmt` and `Right::FromStmt` (the `write::Stmt` read carries itself out, and
 //! `rights::asks` decides its right) until each family has its own. A family generic reads every form of is read from
-//! sqlparser's tree instead (PR 8c), and the rest of `write::parse`'s readers join in 8b-8d.
+//! sqlparser's tree instead (PR 8c). What `write::parse` reads outside the section is GRANT and REVOKE (until step 6),
+//! the text rewrites (counted) and sqlparser's tree.
 use crate::ddl::Ddl;
 use crate::statements::{Read, Right, Run, Statement, Statements, CORE};
 use crate::words::{Words, W};
@@ -474,7 +475,7 @@ mod tests {
     use super::*;
 
     /// Every core entry stands in for its run and right until its family has its own: the count grows as PR 8 moves the
-    /// core's families in, and falls as each gets them (l6/step8-pr8-plan.md). An entry's texts: `write::was`'s test.
+    /// core's families in, and falls as each gets them (l6/step8-pr8-plan.md).
     #[test]
     fn the_core_entries_on_stand_ins_are_counted() {
         let s = crate::registry::get().section::<Statements>();
