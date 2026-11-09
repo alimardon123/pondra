@@ -3136,8 +3136,16 @@ const RECORDS: [&str; 2] = [crate::history::TABLE, crate::audit::TABLE];
 /// `log::commit`, marked too). Counting them, every remembered answer was forgotten every second on
 /// a lake nobody wrote to, again 50 ms after each `CREATE TABLE`, and once just after a new lake served.
 /// Producers' expiries and the old marks' pass (`log::EXPIRY`), and the marks they delete (`p/`), count
-/// neither way: a commit is as quiet as it is without them.
+/// neither way: a commit is as quiet as it is without them. So do the catalog hooks' records (`CatalogHook`), which
+/// follow their entries (the audit log's table made puts its folder's), and a commit of records alone is quiet
+/// (`keep_records` at a leader's start): no answer reads them.
 fn quiet(d: &Delta) -> bool {
+    let hooks = catalog_hooks();
+    let record = |k: &str| hooks.iter().any(|h| k.starts_with(h.records));
+    if d.puts.iter().any(|(k, _)| record(k)) || d.deletes.iter().any(|k| record(k)) {
+        let rest = Delta { id: d.id, puts: d.puts.iter().filter(|(k, _)| !record(k)).cloned().collect(), deletes: d.deletes.iter().filter(|k| !record(k)).cloned().collect() };
+        return (rest.deletes.is_empty() && rest.puts.iter().all(|(k, _)| k == "c")) || quiet(&rest);
+    }
     let hex = |id: &str| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit());
     let expiry = |k: &str| k.starts_with(crate::log::EXPIRY);
     let unread = |k: &str| {
@@ -4460,6 +4468,13 @@ mod tests {
         assert!(!quiet_of(&[("d/3", "x"), ("s/3", &user), (QUIET, "true"), ("c", "9")]), "a table's rows, marked");
         assert!(!quiet_of(&[("p/audit-x", "1"), ("c", "9")]), "a producer only named like the audit log's");
         assert!(!quiet_of(&[("d/3", "x"), ("s/3", &audit), (&audit_p, "1"), ("v/a_view", "{}"), ("c", "9")]), "the audit log's rows with a view's entry");
+        // A catalog hook's records follow their entries (the engine's folder records, `fu/`): as quiet as the entries.
+        for h in catalog_hooks() {
+            let record = format!("{}x/pondra$audit", h.records);
+            assert!(quiet_of(&[("t/pondra$audit", "{}"), (&record, "own"), ("c", "9")]), "the audit log's table made, with its {} records", h.name);
+            assert!(!quiet_of(&[("t/r_t", "{}"), (&record, "own"), ("c", "9")]), "a table's entry, with its {} records", h.name);
+            assert!(quiet_of(&[(&record, "own"), ("c", "9")]), "{} records alone (`keep_records`)", h.name);
+        }
         // Expiries, the old marks' marker and the marks they delete count neither way (`log::EXPIRY`).
         let expiry = |due: u64, p: &str| format!("{}{due:020}/{p}", crate::log::EXPIRY);
         let quiet_with = |puts: &[(&str, &str)], deletes: &[&str]| quiet(&Delta { id: 9, puts: puts.iter().map(|(k, v)| (k.to_string(), Bytes::from(v.to_string()))).collect(), deletes: deletes.iter().map(|k| k.to_string()).collect() });
