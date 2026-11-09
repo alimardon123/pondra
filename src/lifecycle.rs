@@ -39,6 +39,26 @@ pub trait Lifecycle: Send + Sync {
     /// Leads the lake at `dir` for a moment, making it if nothing is there yet, in a process of its own: for a lake nobody
     /// leads, and for a writer whose leader is gone (`inbox::send`).
     fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>>;
+
+    /// Can the node's lake move to another place (`memory::set_location`): is there a host that stops the node, settles
+    /// the lake there and starts the node on it? None but a library's or `pondra serve`'s node can.
+    fn movable(&self) -> bool { false }
+
+    /// Hands a move to the host, which answers for it once the node has begun to stop. Refused (`NO_MOVE`) where the node
+    /// has no host to take it.
+    fn move_lake(&self, _m: Move) -> anyhow::Result<()> { anyhow::bail!(NO_MOVE) }
+}
+
+/// Why a lake can't move where its node has no host that restarts it ([`Lifecycle::move_lake`]).
+pub const NO_MOVE: &str = "this node can't move its lake: it was started without a host that restarts it";
+
+/// A lake moving to another place (`memory::set_location`): the host stops the node, settles the lake's objects there
+/// (`memory::settle`) and starts the node again on `to`. `copied` is what the first pass copied, by path, each with the
+/// e-tag it had in the lake when it was read (`memory::Copied`).
+pub struct Move {
+    pub from: String,
+    pub to: String,
+    pub copied: std::collections::BTreeMap<String, Option<String>>,
 }
 
 /// What a node restarting in place unwinds with ([`Lifecycle::restart`]): `Tasks::spawn_node` lets it go, and `panics::door`
