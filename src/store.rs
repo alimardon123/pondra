@@ -1887,8 +1887,8 @@ pub fn memory_limit() -> usize {
 
 /// The process's line for every node's queries together (`ledger::Root`): its whole line (`root_whole`) where there is one,
 /// else 4 GiB; on a page, its device's line's trim line, as a node's is (`env::page_line_share`). A node's own `PONDRA_MEMORY_GB` is its
-/// budget on it (`memory_limit`), never the process's. Where no stop line watches the process (a host's, whose memory is the
-/// host's, or `PONDRA_MEMORY_MAX_GB=0`), the queries keep a third of the machine's memory at most (`oom::roots`).
+/// budget on it (`memory_limit`), never the process's. Where no stop line watches the process (`PONDRA_MEMORY_MAX_GB=0`), the
+/// queries keep a third of the machine's memory at most (`oom::roots`).
 fn root_line() -> usize {
     #[cfg(target_arch = "wasm32")]
     return crate::env::page_line_share(crate::machine::process().line());
