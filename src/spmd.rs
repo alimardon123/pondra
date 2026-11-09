@@ -129,7 +129,7 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
     // Whether it pays (`guard.rs`), unless it is to spread anyway: the slowest link, what it reads.
     let guard = match force {
         true => None,
-        false => match crate::guard::slowest(&lake.node, nodes, me).await {
+        false => match crate::guard::slowest(lake, nodes, me).await {
             Some(link) => Some((link, reads(lake, &tables).await?)),
             None => return Ok(refused("a node's link can't be measured")),
         },
@@ -156,7 +156,7 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
     };
     if let Some((link, read)) = guard {
         let moved = crate::guard::bytes_out(&cut.children()[0]).unwrap_or(3 * read) * (nodes.len() as u64 - 1) / nodes.len() as u64;
-        if !crate::guard::pays(sql, link, moved, 0, read, nodes.len()) {
+        if !crate::guard::pays(lake, sql, link, moved, 0, read, nodes.len()) {
             return Ok(refused("it wouldn't pay"));
         }
     }
@@ -679,7 +679,7 @@ async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tabl
         let whole = whole(lake, tables, &sliced).await?;
         slices.iter_mut().for_each(|s| s.whole = whole.clone());
         if let Some(job) = Job::open(lake, &slices[mine]).await? {
-            if guard.is_some_and(|(link, read)| !job.pays(sql, link, read, nodes.len())) {
+            if guard.is_some_and(|(link, read)| !job.pays(lake, sql, link, read, nodes.len())) {
                 forget(lake, &job.id);
                 return Ok(refused("it wouldn't pay"));
             }
@@ -915,7 +915,7 @@ impl Job {
     /// Does running it across `n` nodes pay (`guard.rs`), for a query reading `read` bytes? What
     /// its exchanges move — a hash exchange's rows but the share each node keeps, an all-gather's
     /// to every other node, a whole table's own keys nothing — and what reaches the coordinator.
-    fn pays(&self, sql: &str, link: crate::guard::Link, read: u64, n: usize) -> bool {
+    fn pays(&self, lake: &Lake, sql: &str, link: crate::guard::Link, read: u64, n: usize) -> bool {
         let (n, out) = (n as u64, |p: &Arc<dyn ExecutionPlan>| crate::guard::bytes_out(p).unwrap_or(3 * read));
         let moved: u64 = self.exchanges.iter().map(|x| match (x.own, x.whole) {
             (true, _) => 0,
@@ -923,7 +923,7 @@ impl Job {
             _ => out(&x.plan) * (n - 1) / n,
         }).sum();
         let last = self.cut.as_ref().map_or(self.plan.clone(), |c| c.children()[0].clone());
-        crate::guard::pays(sql, link, moved + out(&last) * (n - 1) / n, self.exchanges.len(), read, n as usize)
+        crate::guard::pays(lake, sql, link, moved + out(&last) * (n - 1) / n, self.exchanges.len(), read, n as usize)
     }
 
     /// Done here for half a minute (the others have fetched what they need), or given up on ten
