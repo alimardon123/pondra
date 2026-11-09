@@ -441,9 +441,13 @@ fn renames(sql: &str) -> Vec<(String, String)> {
 
 /// `GRANT … TO r` → `REVOKE … FROM r`.
 fn revoke(sql: &str) -> String {
+    let (sql, rows) = match crate::users::rows_of(sql) {
+        Some((grant, rows)) => (grant.trim_end(), format!(" WHERE {rows}")), // (that grant's filter only: `REVOKE … WHERE`)
+        None => (sql, String::new()),
+    };
     let at = sql.to_lowercase().rfind(" to ").unwrap_or(sql.len());
     let body = sql.trim()[5..at.min(sql.trim().len())].trim();
-    format!("REVOKE {body} FROM {}", sql[at..].trim()[2..].trim())
+    format!("REVOKE {body} FROM {}{rows}", sql[at..].trim()[2..].trim())
 }
 
 // ---------------------------------------------------------------- the database as files
@@ -547,7 +551,8 @@ async fn grants(lake: &Lake) -> Result<Vec<String>> {
                 On::Database(d) => format!("DATABASE {}", ident(d)), // (CLONE on a database attached here: the project's attachments are exported too)
                 On::Object { kind, name } => format!("{} {}", kind.to_uppercase(), ident(name)), // (an extension's kind: `GRANT READ ON CONNECTION shop`)
             };
-            out.push(format!("GRANT {}{columns} ON {on} TO {}", g.privilege.to_uppercase(), ident(&k[2..])));
+            let rows = g.rows.as_ref().map_or(String::new(), |r| format!(" WHERE {r}")); // (its filter on rows, as kept)
+            out.push(format!("GRANT {}{columns} ON {on} TO {}{rows}", g.privilege.to_uppercase(), ident(&k[2..])));
         }
     }
     Ok(out)
@@ -1459,6 +1464,7 @@ mod tests {
         let all = ordered(vec![d("index", "by_day", ""), d("sequence", "n", ""), d("table", "orders", ""), d("type", "mood", "")]);
         assert_eq!(all.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["n", "mood", "orders", "by_day"]); // (a sequence or type before the tables that use it; an index after its table)
         assert_eq!(revoke("GRANT SELECT ON TABLE t TO analyst"), "REVOKE SELECT ON TABLE t FROM analyst");
+        assert_eq!(revoke("GRANT SELECT ON TABLE t TO analyst WHERE note = 'to do'"), "REVOKE SELECT ON TABLE t FROM analyst WHERE note = 'to do'", "that filter's grant only");
         assert_eq!(or_replace("CREATE VIEW v AS SELECT 1"), "CREATE OR REPLACE VIEW v AS SELECT 1");
         assert_eq!(quoted("sales.order"), "sales.\"order\"");
     }
