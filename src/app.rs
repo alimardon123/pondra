@@ -351,17 +351,16 @@ impl App {
             let untidy = tables.iter().filter(|(t, b)| b.untidy && !busy.contains(*t)).map(|(t, _)| t.clone());
             let untidy: Vec<String> = busy.iter().cloned().chain(untidy).collect();
             // (tables whose changed rows may wait in files: `tier::purge` says whether it's time. Those whose tombstones were
-            // tiered since their last purge, or are this round; one with a purge to settle; and once an hour each, for the
-            // old rows past its retention. Not every changed table every round: an idle one's mark stays, `tier::expire`)
-            crate::per_node!(static SETTLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
+            // tiered since their last purge, or are this round; one whose purges settle (`tier::Brief::settles`), or whose
+            // purged tombstones' files are past its retention while it has some (`kept_until`). Not every changed table every
+            // round: an idle one's mark stays, `tier::expire`)
             let now = crate::log::now_ms();
-            let hourly = now - SETTLED.load(std::sync::atomic::Ordering::Relaxed) >= 3_600_000;
-            if hourly {
-                SETTLED.store(now, std::sync::atomic::Ordering::Relaxed);
-            }
             let due = |t: &str, b: &crate::tier::Brief| {
-                let d = crate::sys::deleted(t);
-                hourly || busy.contains(&d) || tables.get(&d).is_some_and(|d| b.purged < d.tiered) || b.settles.is_some_and(|at| now >= at + self.retain_ms)
+                let d = tables.get(&crate::sys::deleted(t));
+                busy.contains(&crate::sys::deleted(t))
+                    || d.is_some_and(|d| b.purged < d.tiered)
+                    || b.settles.is_some_and(|at| now >= at + self.retain_ms)
+                    || b.kept_until.is_some_and(|at| now >= at) && d.is_some_and(|d| d.inline + d.sealed > 0)
             };
             let changed: Vec<String> = tables.iter().filter(|(t, b)| b.changed && due(t, b)).map(|(t, _)| t.clone()).collect();
             (busy, untidy, changed)
