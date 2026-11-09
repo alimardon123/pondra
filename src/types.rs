@@ -63,16 +63,6 @@ pub(crate) fn read(w: &mut crate::words::Words) -> Result<Stmt> {
     })
 }
 
-/// `CREATE TYPE … AS ENUM`, `ALTER TYPE`, `DROP TYPE`, or None for anything else: as `write::parse` read them before they
-/// were the statements section's entries (`write::was`).
-#[cfg(test)]
-pub fn statement(sql: &str) -> Option<Stmt> {
-    crate::rules::types::change(sql).map(|r| match r {
-        Ok(c) => Stmt::Ddl(vec![crate::ddl::Ddl::Type(c)]),
-        Err(why) => Stmt::Invalid(why),
-    })
-}
-
 /// Leader: carry one out.
 pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
     match c {

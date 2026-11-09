@@ -510,7 +510,7 @@ class Train:
             say(f"{' '.join(f'#{p.number}' for p in joining[:6 - len(riders)])} joined the train: cutting it again")
             self.waiting = False
             return self.cut(riders + joining[:6 - len(riders)])
-        if joining and len(ends) < CARS and self.slots() < int(os.environ.get("SLOTS") or 3):
+        if joining and len(ends) < CARS and self.slots() < int(os.environ.get("SLOTS") or 6):
             return self.stack(riders, joining, first, tip)
         return say("waiting: run going")
 
@@ -585,7 +585,7 @@ class Train:
             self.cancel({"id": run_id})
         if not prs:
             return self.set_riding([])   # nothing queued: no PR may keep riding a train that isn't there
-        if self.slots(stopped) >= int(os.environ.get("SLOTS") or 3):
+        if self.slots(stopped) >= int(os.environ.get("SLOTS") or 6):
             return say("waiting: runs going")
         git("checkout", "-B", "train", "origin/main")
         base = git("rev-parse", "origin/main")

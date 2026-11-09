@@ -87,6 +87,16 @@ COLUMNS = {
     "orders": [("order_id", "INTEGER"), ("customer_id", "INTEGER"), ("store_id", "INTEGER"), ("ordered_at", "TIMESTAMP"), ("status", "VARCHAR")],
     "order_items": [("order_id", "INTEGER"), ("line", "INTEGER"), ("product_id", "INTEGER"), ("quantity", "INTEGER"), ("unit_price", "DECIMAL(10,2)"), ("discount", "DECIMAL(4,2)")],
     "returns": [("order_id", "INTEGER"), ("line", "INTEGER"), ("returned_on", "DATE"), ("reason", "VARCHAR")],
+    # (a change log copied from elsewhere, as a mailing tool's export or a database's CDC lands: one row per change, not
+    # per subscription; its comment says so: reviews/lakebase-cdf-2026-11-09.md C3)
+    "newsletter_changes": [("customer_id", "INTEGER"), ("plan", "VARCHAR"), ("change", "VARCHAR"), ("seq", "INTEGER")],
+}
+
+# What each table is, as COMMENT ON TABLE says it on every engine (Pondra's `about`, which its MCP door lists).
+ABOUT = {
+    "newsletter_changes": "A change log copied from the mailing tool: one row per change to a customer's newsletter "
+                          "subscription (change is insert, update or delete), in seq order. A customer's subscription now "
+                          "is their row with the highest seq; a customer whose latest row is a delete is not subscribed.",
 }
 
 
@@ -127,7 +137,28 @@ def shop(seed=7):
             if status == "delivered" and r.random() < 0.06:
                 reason = None if r.random() < 0.1 else r.choice(["damaged", "wrong item", "changed mind", "late"])
                 returns.append((o, line, orders[-1][3].date() + datetime.timedelta(days=r.randrange(3, 31)), reason))
-    return {"customers": customers, "products": products, "stores": stores, "orders": orders, "order_items": items, "returns": returns}
+    # The newsletter's change log, from a stream of its own (the tables above stay as they were for a seed): a customer
+    # subscribes, may change plan, may leave, and may come back.
+    n, changes, seq = random.Random(seed + 1), [], 0
+    for c in range(1, 301):
+        if n.random() < 0.45:
+            seq += n.randrange(1, 4)
+            plan = n.choice(["weekly", "deals"])
+            changes.append([c, plan, "insert", seq])
+            for _ in range(n.choices([0, 1, 2], weights=[60, 30, 10])[0]):
+                seq += n.randrange(1, 4)
+                plan = "deals" if plan == "weekly" else "weekly"
+                changes.append([c, plan, "update", seq])
+            if n.random() < 0.3:
+                seq += n.randrange(1, 4)
+                changes.append([c, plan, "delete", seq])
+                if n.random() < 0.3:
+                    seq += n.randrange(1, 4)
+                    changes.append([c, plan, "insert", seq])
+    n.shuffle(changes)  # (a log copied out of order: seq, not the rows' order, says which change came last)
+    news = [tuple(row) for row in changes]
+    return {"customers": customers, "products": products, "stores": stores, "orders": orders, "order_items": items, "returns": returns,
+            "newsletter_changes": news}
 
 
 def literal(v):
@@ -148,6 +179,8 @@ def statements(data, batch=500):
     """The data as CREATE TABLE and multi-row INSERT statements every engine takes."""
     for table, cols in COLUMNS.items():
         yield f"CREATE TABLE {table} ({', '.join(f'{c} {t}' for c, t in cols)})"
+        if table in ABOUT:
+            yield f"COMMENT ON TABLE {table} IS {literal(ABOUT[table])}"
         rows = data[table]
         for lo in range(0, len(rows), batch):
             yield f"INSERT INTO {table} VALUES " + ", ".join("(" + ", ".join(literal(v) for v in row) + ")" for row in rows[lo:lo + batch])

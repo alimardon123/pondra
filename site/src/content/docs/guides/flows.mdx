@@ -190,6 +190,35 @@ The current version of each key is the one whose `__end_at` is NULL
 (`WHERE __end_at IS NULL`). The view's rows are worked out as it is read, so a materialized view
 can't follow it; a stored view can.
 
+### A change log from elsewhere
+
+A change log copied out of another system is not a table of its rows: each of its rows is one
+change to a key. Lakebase's `lb_<table>_history`, an OLake history mode and Debezium's events
+written to files all have this shape. Counting its rows counts changes, and the current state is
+left for you to build. A history view builds it in one statement. Leave out the before images,
+order the versions by the log's own sequence, and end a key at its delete:
+
+```sql
+CREATE TABLE lb_accounts_history (id BIGINT, plan VARCHAR, _pg_change_type VARCHAR, _sort_by BIGINT);
+INSERT INTO lb_accounts_history VALUES (1, 'basic', 'insert', 1), (2, 'basic', 'insert', 1),
+  (1, 'basic', 'update_preimage', 2), (1, 'pro', 'update_postimage', 2), (2, 'basic', 'delete', 3);
+CREATE MATERIALIZED VIEW accounts WITH (history = 'id', sequence_by = '_sort_by', delete_when = '_pg_change_type = ''delete''')
+  AS SELECT id, plan, _pg_change_type, _sort_by FROM lb_accounts_history WHERE _pg_change_type <> 'update_preimage';
+```
+
+The log holds five rows, and one account is there now:
+
+<Ways sql={`SELECT id, plan FROM accounts WHERE __end_at IS NULL`} />
+
+```text
+id  plan
+1   pro
+```
+
+Say what such a table is in its comment (`COMMENT ON TABLE lb_accounts_history IS 'one row per
+change …'`). An agent reads it in the MCP door's `list_tables`, and counts accounts rather than
+changes.
+
 ## The flow
 
 `pondra.flows` lists every materialized view: what it follows, its kind, what else it reads
@@ -199,12 +228,13 @@ its tables to what follows it.
 <Ways sql={`SELECT name, follows, kind, expectations FROM pondra.flows ORDER BY name`} />
 
 ```text
-name       follows           kind       expectations
-by_region  gold              aggregate  0
-customers  customer_changes  history    0
-gold       silver            aggregate  0
-silver     orders            rows       2
-strict     orders            rows       1
+name       follows              kind       expectations
+accounts   lb_accounts_history  history    0
+by_region  gold                 aggregate  0
+customers  customer_changes     history    0
+gold       silver               aggregate  0
+silver     orders               rows       2
+strict     orders               rows       1
 ```
 
 <Aside>

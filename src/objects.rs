@@ -844,38 +844,6 @@ static KIND_WORDS: LazyLock<String> = LazyLock::new(|| {
     words.iter().map(|w| w.replace(' ', r"\s+")).collect::<Vec<_>>().join("|")
 });
 
-/// `COMMENT ON …`, `CREATE OR ALTER TABLE | VIEW …`, or None for anything else: as `write::parse` read them before they
-/// were the statements section's entries (`write::was`).
-#[cfg(test)]
-pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
-    use crate::write::Stmt;
-    static COMMENT: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(&format!(r"(?is)^\s*comment\s+(if\s+exists\s+)?on\s+({})\s+(.*)$", *KIND_WORDS)).expect("a regex"));
-    static OR_ALTER: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*create\s+)or\s+alter\s+(\w+(?:\s+view)?)\b").expect("a regex"));
-    let first = crate::text::first_word(sql);
-    if let Some(c) = COMMENT.captures(first) {
-        let kind = c[2].split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-        return Some(match comment_of(&c[3]) {
-            Ok((name, text)) => Stmt::Ddl(vec![Ddl::Object(Op::Comment { kind, name, text, if_exists: c.get(1).is_some() })]),
-            Err(e) => Stmt::Invalid(format!("COMMENT ON {} name IS 'text' | NULL: {}", kind.to_uppercase(), crate::ext::said(&e))),
-        });
-    }
-    let c = OR_ALTER.captures(first)?;
-    let what = c[2].split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
-    let plain = format!("{}{}", &c[1], &first[c.get(0).expect("a match").end() - c[2].len()..]);
-    match what.as_str() {
-        "VIEW" => crate::write::parse(&plain.replacen(&c[1], &format!("{}OR REPLACE ", &c[1]), 1)), // (a view holds nothing to keep)
-        "TABLE" => Some(match crate::write::parse(&plain) {
-            Some(Stmt::Create(t)) if t.query.is_none() && t.like.is_none() && !t.or_replace && !t.if_not_exists && !t.temporary => {
-                Stmt::Ddl(vec![Ddl::Object(Op::OrAlterTable { name: crate::text::object(&t.name), sql: plain })])
-            }
-            Some(Stmt::Invalid(e)) => Stmt::Invalid(e),
-            Some(Stmt::Refused(c, e)) => Stmt::Refused(c, e),
-            _ => Stmt::Invalid("CREATE OR ALTER TABLE takes the table's columns (… AS SELECT makes it anew: CREATE OR REPLACE TABLE)".into()),
-        }),
-        w => Some(Stmt::Refused("0A000", format!("CREATE OR ALTER takes a table or a view; a {} is made anew with CREATE OR REPLACE {w}", w.to_lowercase()))),
-    }
-}
-
 /// `name IS 'text' | NULL`: the name as SQL resolves it, and the text (None: no comment).
 pub(crate) fn comment_of(rest: &str) -> Result<(String, Option<String>)> {
     let mut p = Parser::new(&GenericDialect {}).try_with_sql(rest)?;

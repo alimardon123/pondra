@@ -64,27 +64,6 @@ impl Provider {
 
 // ---------------------------------------------------------------- statements
 
-/// `CREATE [OR REPLACE] IDENTITY PROVIDER [IF NOT EXISTS] name (…)`, `DROP IDENTITY PROVIDER [IF EXISTS]
-/// name`; None for anything else.
-#[cfg(test)]
-pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
-    use crate::write::Stmt;
-    let w = Words::of(sql)?;
-    let first: Vec<String> = w.0.iter().rev().take(5).map(W::word).collect(); // (the words are kept last first)
-    let at = match first.first()?.as_str() {
-        "create" if first.get(1).is_some_and(|s| s == "or") => 3,
-        "create" | "drop" | "alter" => 1,
-        _ => return None,
-    };
-    if first.get(at).map(String::as_str) != Some("identity") || first.get(at + 1).map(String::as_str) != Some("provider") {
-        return None;
-    }
-    Some(match parse(w) {
-        Ok(c) => Stmt::Ddl(vec![crate::ddl::Ddl::Users(c)]),
-        Err(e) => Stmt::Invalid(format!("{e:#}")),
-    })
-}
-
 /// The identity providers' extension (ADR-074): its statements in the registry's statements section, by their words
 /// (step 8, PR 8b), and the lake's providers as a state of the lake (`Providers`, step 2 PR 10a). The core carries the
 /// statements out (`Ddl::Users`), so they stand in for their run and right until it has its own.
@@ -728,7 +707,7 @@ mod tests {
 
     #[test]
     fn statements() {
-        let p = |s: &str| match statement(s) {
+        let p = |s: &str| match crate::statements::matched(s) { // (as the front reads it: the sso extension's entries)
             Some(crate::write::Stmt::Ddl(d)) => match &d[0] {
                 crate::ddl::Ddl::Users(c) => serde_json::to_value(c).unwrap(),
                 _ => panic!(),
@@ -754,7 +733,7 @@ mod tests {
         ] {
             assert!(p(sql)["error"].as_str().unwrap_or_default().contains(says), "{sql}: {}", p(sql));
         }
-        assert_eq!(p("CREATE USER ann"), j!(null)); // (users' own)
+        assert_eq!((p("CREATE USER ann")["do"].as_str(), p("CREATE USER ann").get("provider")), (Some("create"), None)); // (the users' entry's, not a provider's)
         assert!(shaped("eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJ4In0.c2ln") && !shaped("pt_abc") && !shaped("eyJ.a") && !shaped("a password with spaces"));
         assert!(!p("CREATE IDENTITY PROVIDER g (ISSUER 'https://i', CLIENT_ID 'x', POSTGRES 'password')")["provider"].as_object().unwrap().contains_key("postgres_oauth"));
     }

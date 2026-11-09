@@ -410,7 +410,7 @@ pub fn constraints(sql: &str) -> Result<Option<(String, Vec<Expect>)>> {
             ["ON", "VIOLATION", "FAIL"] | ["ON", "VIOLATION", "FAIL", "UPDATE"] => OnViolation::Fail,
             _ => bail!("after {} (…): ON VIOLATION DROP ROW, or ON VIOLATION FAIL", word(k)),
         };
-        let check = crate::pg_json::expression(&text(start + 1, end - 1)).into_owned(); // (grouped once, here: every write runs it)
+        let check = crate::grouping::expression(&text(start + 1, end - 1)).into_owned(); // (grouped once, here: every write runs it)
         expect.push(Expect { name: name.unwrap_or_else(|| format!("expectation_{}", expect.len() + 1)), check, on });
     }
     if expect.is_empty() {

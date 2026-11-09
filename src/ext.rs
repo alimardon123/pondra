@@ -1122,23 +1122,64 @@ fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
     })
 }
 
-/// `CREATE [OR REPLACE] [PERSISTENT] SECRET [IF NOT EXISTS] name (TYPE t, KEY value, …)` and
-/// `DROP SECRET [IF EXISTS] name [PURGE]`, parsed here: a value is a string, a word or a number.
-pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
+/// ATTACH, every form: the statements section's ATTACH entry (`core_statements.rs`). Its walk reads the options and a
+/// connection's name (`attach_statement`), and sqlparser's tree `ATTACH [DATABASE] 'dir' AS name` with none, SQLite's
+/// words: another lake. What neither reads is refused as DataFusion's planner refused it before: in the parser's words,
+/// or as a statement it doesn't take.
+pub(crate) fn read_attach(sql: &str) -> Result<crate::write::Stmt> {
+    use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, keywords::Keyword, parser::Parser};
+    let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql)?;
+    p.expect_keyword(Keyword::ATTACH)?;
+    if let Some(s) = attach_statement(&mut p) {
+        return Ok(s);
+    }
+    Ok(match crate::parsed::generic(sql)?.pop() {
+        Some(ast::Statement::AttachDatabase { schema_name, database_file_name: ast::Expr::Value(ast::ValueWithSpan { value: ast::Value::SingleQuotedString(dir) | ast::Value::DoubleQuotedString(dir), .. }), .. }) => {
+            crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Attach { name: crate::text::ident(&schema_name), dir, read_only: false, endpoint: None }])
+        }
+        Some(s) => crate::write::Stmt::Refused("0A000", format!("This feature is not implemented: Unsupported SQL statement: {s}")),
+        None => bail!("ATTACH 'dir' AS name"),
+    })
+}
+
+/// COPY to files, every form but COPY INTO: the statements section's COPY entry. Its walk reads `COPY (query) | t TO
+/// 'url' …` and refuses COPY FROM and TO STDIN | STDOUT by name (`copy_statement`). A COPY the walk doesn't place is
+/// DataFusion's own (`Stmt::Theirs`), planned as a query is, so its planner words it as before (a table that isn't
+/// there, a clause before TO). But one that names no format for its files, which that planner refuses only as an
+/// internal error (XX000), is refused here by its form.
+pub(crate) fn copy(sql: &str) -> Result<crate::write::Stmt> {
+    use datafusion::sql::parser::{CopyToSource, DFParserBuilder, Statement as DF};
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    if let Some(s) = Parser::new(&GenericDialect {}).try_with_sql(sql).ok().and_then(|mut p| copy_statement(&mut p)) {
+        return Ok(s);
+    }
+    let parsed = DFParserBuilder::new(sql).build().and_then(|mut p| p.parse_statements()).ok();
+    if let Some([DF::CopyTo(c)]) = parsed.as_ref().map(|all| all.iter().collect::<Vec<_>>()).as_deref() {
+        // (as DataFusion's planner finds it: a format it has after STORED AS, else the path's extension)
+        let known = c.stored_as.as_deref().is_some_and(|f| ["parquet", "csv", "json", "arrow", "avro"].iter().any(|k| k.eq_ignore_ascii_case(f)));
+        let named = known || std::path::Path::new(&c.target).extension().is_some();
+        if !named {
+            let what = match &c.source { CopyToSource::Relation(t) => t.to_string(), CopyToSource::Query(q) => format!("({q})") };
+            return Ok(crate::write::Stmt::Refused("0A000", format!("COPY {what} TO '{}' names no format for its files: COPY {what} TO '{}' (FORMAT parquet), or STORED AS parquet after the path", c.target, c.target)));
+        }
+    }
+    Ok(crate::write::Stmt::Theirs)
+}
+
+/// `COPY INTO t FROM …`: the statements section's COPY INTO entry (`copy_into_statement`).
+pub(crate) fn copy_into(sql: &str) -> Result<crate::write::Stmt> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    copy_into_statement(&mut Parser::new(&GenericDialect {}).try_with_sql(sql)?).context("COPY INTO t FROM 'path'")
+}
+
+/// `CREATE [OR REPLACE] [PERSISTENT | TEMP] SECRET [IF NOT EXISTS] name (TYPE t, KEY value, …)` and `DROP [PERSISTENT |
+/// TEMPORARY] SECRET [IF EXISTS] name [PURGE]`, parsed here: a value is a string, a word or a number. The statements section's
+/// SECRET entries read with it (`core_statements.rs`); None: no SECRET statement.
+pub fn secret(sql: &str) -> Option<crate::write::Stmt> {
     use crate::ddl::Ddl;
     use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
-    if let Some(load) = copy_into_statement(&mut Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?) {
-        return Some(load);
-    }
-    let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
-    if let Some(copy) = copy_statement(&mut p) {
-        return Some(copy);
-    }
     let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
     let invalid = |e: String| Some(crate::write::Stmt::Invalid(e));
-    if p.parse_keyword(Keyword::ATTACH) {
-        return attach_statement(&mut p);
-    }
     if p.parse_keyword(Keyword::DROP) {
         let _ = p.parse_one_of_keywords(&[Keyword::PERSISTENT, Keyword::TEMPORARY]);
         if !p.parse_keyword(Keyword::SECRET) {
@@ -1954,15 +1995,15 @@ mod tests {
 
     #[test]
     fn copy_to_stdout_and_from_stdin_off_the_port_are_refused_by_name() {
-        let said = |sql: &str| match statement(sql) {
-            Some(crate::write::Stmt::Refused(code, words)) => (code, words),
+        let said = |sql: &str| match copy(sql) {
+            Ok(crate::write::Stmt::Refused(code, words)) => (code, words),
             _ => panic!("{sql}: not refused"),
         };
         let (code, words) = said("COPY (SELECT id FROM customers) TO STDOUT WITH (FORMAT csv, HEADER true)");
         assert!(code == "0A000" && words.contains("POST /sql?format=csv"), "{words}");
         assert!(said("COPY orders (id, amount) FROM STDIN").1.contains("COPY INTO orders FROM 'path or URL' loads files, and POST /append/orders"));
         assert!(said("COPY orders FROM '/srv/orders.csv'").1.starts_with("COPY orders FROM a file reads a file of Postgres's own server"));
-        assert!(matches!(statement("COPY orders TO 's3://b/o.parquet' (FORMAT parquet)"), Some(crate::write::Stmt::CopyTo(..))), "a COPY to a file is as it was");
+        assert!(matches!(copy("COPY orders TO 's3://b/o.parquet' (FORMAT parquet)"), Ok(crate::write::Stmt::CopyTo(..))), "a COPY to a file is as it was");
     }
 
     #[test]

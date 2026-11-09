@@ -136,7 +136,7 @@ objects -> constraints  1
 objects -> ddl  32
 objects -> engine  1
 objects -> expander  2
-objects -> ext  3
+objects -> ext  2
 objects -> extension  1
 objects -> facts  1
 objects -> find  2
@@ -155,7 +155,7 @@ objects -> temp  1
 objects -> types  5
 objects -> users  2
 objects -> views  5
-objects -> write  8
+objects -> write  4
 once -> matches  1
 once -> pattern  1
 oom -> jemalloc  2
@@ -164,7 +164,6 @@ optimize -> wasm32  1
 page -> wasm32  3
 page_records -> dial  4
 panics -> wasm32  3
-path -> pg_json  1
 path -> sparksql  1
 pg -> sso  6
 pg -> tls  6
@@ -187,7 +186,6 @@ returning -> pg_types  1
 routines -> apply  3
 routines -> extension  3
 routines -> git  3
-routines -> pg_json  2
 routines -> pyfn  2
 routines -> python  8
 routines -> sparksql  1
@@ -237,12 +235,8 @@ sso_flow -> crypto  2
 sso_flow -> tls  1
 statement -> pg_catalog  1
 statement -> python  1
-store -> bridge  1
-store -> budget  2
 store -> ddl  1
-store -> ext  2
 store -> rules  1
-store -> served  1
 store -> types  1
 store -> wasm32  15
 store -> write  1
@@ -262,7 +256,6 @@ views -> delta  1
 views -> matches  4
 views -> measures  1
 views -> pattern  1
-views -> pg_json  1
 with_writes -> pg_types  2
 workspace -> python  4
 write -> crypto  1
@@ -274,7 +267,6 @@ write -> memory  1
 write -> pattern  1
 write -> pg_types  1
 write -> shares  1
-write -> sso  1
 write -> store_wire  1
 write -> write_outside  2
 write_outside -> avro  3

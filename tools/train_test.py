@@ -655,8 +655,8 @@ def cars_at_most_two(path):
     with Scenario(os.path.join(path, "slots")) as sc:
         sc.riders()
         sc.add_run(9, sc.tip(), status="in_progress", conclusion=None)
-        sc.add_run(20, "0" * 40, event="pull_request", branch="pr-x", status="in_progress", conclusion=None)
-        sc.add_run(21, "0" * 40, event="pull_request", branch="pr-y", status="queued", conclusion=None)
+        for n, branch in enumerate(["pr-v", "pr-w", "pr-x", "pr-y", "pr-z"]):  # (with the train's, the six slots)
+            sc.add_run(20 + n, "0" * 40, event="pull_request", branch=branch, status="in_progress" if n == 0 else "queued", conclusion=None)
         sc.open_pr(3, "third", {"c.txt": "three\n"})
         with old_train():
             out = sc.step()
@@ -826,21 +826,20 @@ def main_moved_mid_run(path):
 
 @case
 def slots_taken(path):
-    """Three other PR runs going (the slots when CI_SLOTS isn't set): nothing is cut."""
+    """Six other PR runs going (the slots when CI_SLOTS isn't set): nothing is cut."""
     with Scenario(path) as sc:
         sc.open_pr(1, "first", {"a.txt": "one\n"})
-        sc.add_run(20, "0" * 40, event="pull_request", branch="pr-x", status="in_progress", conclusion=None)
-        sc.add_run(21, "0" * 40, event="pull_request", branch="pr-y", status="queued", conclusion=None)
-        sc.add_run(22, "0" * 40, event="pull_request", branch="pr-z", status="queued", conclusion=None)
+        for n, branch in enumerate(["pr-u", "pr-v", "pr-w", "pr-x", "pr-y", "pr-z"]):
+            sc.add_run(20 + n, "0" * 40, event="pull_request", branch=branch, status="in_progress" if n == 0 else "queued", conclusion=None)
         before = sc.state()
         out = sc.step()
-        expect(sc.state() == before and sc.tip() is None, "a train was cut while three runs went")
+        expect(sc.state() == before and sc.tip() is None, "a train was cut while six runs went")
         expect("waiting: runs going" in out, out)
 
 
 @case
 def slots_from_variable(path):
-    """Two other PR runs going: CI_SLOTS = 2 (the workflows' SLOTS) holds the train, the default of three cuts it."""
+    """Two other PR runs going: CI_SLOTS = 2 (the workflows' SLOTS) holds the train, the default of six cuts it."""
     with Scenario(path) as sc:
         sc.open_pr(1, "first", {"a.txt": "one\n"})
         sc.add_run(20, "0" * 40, event="pull_request", branch="pr-x", status="in_progress", conclusion=None)

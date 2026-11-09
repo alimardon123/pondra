@@ -129,7 +129,8 @@ fn tools() -> Value {
         {"name": "list_tables", "annotations": {"readOnlyHint": true}, "inputSchema": args(json!({}), &[]),
          "description": "Every table and view, as SQL names it (schema.table in a schema other than public; attached lakes' as lake.table or lake.schema.table): \
              its columns; its kind — append, upsert (a primary key: the newest row per key wins), merge (rows per key combine, e.g. sum) \
-             or view (a stored query), or null when you may not read its key; and for views, their SQL."},
+             or view (a stored query), or null when you may not read its key; for views, their SQL; and `about`, what its owner \
+             wrote of it (COMMENT ON TABLE), such as that each row is one change to a key rather than the key's current row."},
         {"name": "query", "annotations": {"readOnlyHint": true}, "inputSchema": args(sql.clone(), &["sql"]),
          "description": format!("Run one SQL query and get its rows as JSON (the first {ROWS}, and the total). \
              `WHERE key = …` on an upsert table is a fast point lookup. Vector search: ORDER BY cosine_distance(embedding, [0.1, …]) LIMIT k. \
@@ -253,6 +254,9 @@ async fn list(app: &App, scope: &crate::rights::Scope) -> Result<Value> {
             continue; // (another database that signs in on its own: not even its names, as `pondra.tables`)
         }
         let views = lake.cat.scan::<View>("v/", "v0").await?;
+        // (what COMMENT ON TABLE or VIEW says of each: an agent reads a table's meaning there, a change log's for one)
+        let about: std::collections::BTreeMap<String, String> =
+            lake.cat.scan::<String>("cm/relation/", "cm/relation0").await?.into_iter().map(|(k, v)| (k["cm/relation/".len()..].to_string(), v)).collect();
         for (key, m) in lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
             let name = &key[2..];
             if !may_see(scope, &prefix, name) {
@@ -274,13 +278,13 @@ async fn list(app: &App, scope: &crate::rights::Scope) -> Result<Value> {
             let key: Vec<&String> = m.key.iter().filter(|_| keyed).collect();
             let merge: std::collections::BTreeMap<&String, &String> = m.merge.iter().filter(|(c, _)| keyed && reads(c)).collect();
             let view = scope.shows_code().then(|| views.iter().find(|(k, _)| &k[2..] == name).map(|(_, v)| v.sql.clone())).flatten(); // (a view's code: `views::code_for_caller`)
-            tables.push(json!({"table": format!("{prefix}{name}"), "kind": kind, "key": key, "merge": merge, "columns": columns, "view": view}));
+            tables.push(json!({"table": format!("{prefix}{name}"), "kind": kind, "key": key, "merge": merge, "columns": columns, "view": view, "about": about.get(name)}));
         }
         for (key, v) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await? {
             if !may_see(scope, &prefix, &key[2..]) {
                 continue;
             }
-            tables.push(json!({"table": format!("{prefix}{}", &key[2..]), "kind": "view", "view": scope.shows_code().then(|| crate::views::shown(&v.sql))})); // (CREATE VIEW: run when read)
+            tables.push(json!({"table": format!("{prefix}{}", &key[2..]), "kind": "view", "view": scope.shows_code().then(|| crate::views::shown(&v.sql)), "about": about.get(&key[2..])})); // (CREATE VIEW: run when read)
         }
     }
     Ok(json!({"tables": tables}))
