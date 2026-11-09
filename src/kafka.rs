@@ -111,7 +111,8 @@ pub async fn serve(app: App, addr: String, advertise: String) -> Result<()> {
             continue; // (a node stopping takes no new client: the socket closes, and the client tries another broker)
         }
         let (app, me, used) = (app.clone(), me.clone(), app.lake.node.idle.begin()); // (an open connection is a use of the node: `idle.rs`)
-        crate::spawns::task(async move {
+        let node = app.lake.node.clone();
+        node.tasks.spawn_as(crate::auth::Door, async move {
             let _used = used;
             conn(app, me, socket).await.map_err(|e| eprintln!("kafka client: {e:#}"))
         });
@@ -135,7 +136,7 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
     let from = Some(peer.addr);
     let (mut rd, mut wr) = tokio::io::split(socket);
     let (tx, mut rx) = mpsc::channel::<(Reply, Option<crate::node_state::Busy>)>(64);
-    let writer = crate::spawns::task(async move {
+    let writer = app.lake.node.tasks.spawn_as(crate::auth::Door, async move {
         while let Some((reply, busy)) = rx.recv().await {
             if let Some(frame) = reply.await {
                 wr.write_all(&frame).await?;

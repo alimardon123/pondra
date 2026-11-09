@@ -622,7 +622,7 @@ impl crate::lake_state::LakeState for Writers {
 /// Starts one of `lake`'s log writers, kept for `end_writers`: the node's own work (`auth::as_node`), whoever's lines
 /// it writes.
 pub(crate) fn keep(lake: &Lake, run: impl std::future::Future<Output = ()> + Send + 'static) {
-    kept(lake, crate::panics::own(run));
+    kept(lake, lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, run));
 }
 
 /// `keep`'s part that isn't its task's: one copy for every writer.
