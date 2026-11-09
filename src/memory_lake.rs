@@ -7,7 +7,7 @@
 //! an update.
 //!
 //! What spills is one budget for everything this process spills: `PONDRA_SPILL_GB`, else the disk's room, shared
-//! with the queries' and the shuffles' spills (`store::others_held`). The lakes in memory count their bytes on
+//! with the queries' and the shuffles' spills (`ledger::room`). The lakes in memory count their bytes on
 //! disk and their reserved bytes together (`Spilled`, one for the process), so the spill disk is counted once for
 //! all of them. The room a lake keeps on its disk is kept either way. Past either, the write is refused by name
 //! (53100), and a write that would pass it reserves its bytes first, so writes racing for the last of the room
@@ -50,10 +50,17 @@ impl Spilled {
 }
 
 /// The spilled bytes of this process's lakes in memory: the one `Spilled` every lake made by `Held::with_budget` counts in.
-static PROCESS: std::sync::LazyLock<Arc<Spilled>> = std::sync::LazyLock::new(Arc::default);
+/// It is on the spill disk's room list (`ledger::holds`) from its first use, so every spill's check counts it.
+static PROCESS: std::sync::LazyLock<Arc<Spilled>> = std::sync::LazyLock::new(|| {
+    let spilled = Arc::<Spilled>::default();
+    crate::ledger::holds(&(spilled.clone() as Arc<dyn crate::ledger::Holds>));
+    spilled
+});
 
-/// What the lakes in this process's memory take of the spill disk, on disk or reserved for spills in flight.
-pub(crate) fn spilled() -> u64 { PROCESS.total() }
+/// What the lakes in memory take of the spill disk, on disk or reserved for spills in flight (`ledger::room`).
+impl crate::ledger::Holds for Spilled {
+    fn held(&self) -> u64 { self.total() }
+}
 
 /// The program's end (`memory::leave`): every lake held in this process's memory goes, and its spill folder with it.
 pub(crate) fn forget_all() {
@@ -318,7 +325,7 @@ impl Inner {
 
     /// Adds `bytes` to what is reserved for spills in flight, if they fit; else says why not. The one check for
     /// `reserve` and `Reserved::grow`. Under the setting, everything this process spills must stay within it: the
-    /// others' bytes (`store::others_held`) and the lakes' (`on_disk` and `reserved`). Without it, the bytes in flight
+    /// others' bytes (`ledger::others_hold`) and the lakes' (`on_disk` and `reserved`). Without it, the bytes in flight
     /// come off the disk's free room, which counts only what has landed. The check and the reservation are one
     /// `fetch_update` on `reserved`, so writes racing for the last of the room can't both take it. The room and
     /// `on_disk` are read after `reserved` (SeqCst): a landing is on disk before its reservation goes, so it is
@@ -328,7 +335,7 @@ impl Inner {
             return Err(format!("the disk a lake in memory spills to has {} MB free, and a lake keeps {} MB", free >> 20, keep >> 20));
         }
         let gb = self.setting();
-        let others = gb.map_or(0, |_| crate::store::others_held()); // (the queries' and the shuffles' spills count under the setting only)
+        let others = gb.map_or(0, |_| crate::ledger::others_hold(&*self.spilled)); // (the queries' and the shuffles' spills count under the setting only)
         let fits = |reserved: u64| {
             let room = crate::machine::process().space(&disk.space.dir).map(|(free, total)| (free.saturating_sub(reserved), total));
             crate::store::piece_fits(gb, others + self.spilled.on_disk.load(SeqCst) + reserved, bytes, room)
@@ -338,7 +345,7 @@ impl Inner {
             .fetch_update(SeqCst, SeqCst, |reserved| fits(reserved).then_some(reserved + bytes))
             .map(|_| ())
             .map_err(|_| match gb {
-                Some(gb) => format!("this process's spills may take {:.1} MB of disk and hold {} MB there", gb * 1024.0, (crate::store::others_held() + self.spilled.total()) >> 20),
+                Some(gb) => format!("this process's spills may take {:.1} MB of disk and hold {} MB there", gb * 1024.0, (crate::ledger::others_hold(&*self.spilled) + self.spilled.total()) >> 20),
                 None => format!("the disk a lake in memory spills to has no room for {} MB more beside the spills in flight", bytes >> 20),
             })
     }

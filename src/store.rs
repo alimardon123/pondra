@@ -1603,7 +1603,7 @@ pub(crate) fn spill_folder() -> std::io::Result<&'static std::path::Path> {
 pub(crate) fn spill_gb() -> Option<f64> { crate::env::parse::<f64>("PONDRA_SPILL_GB").filter(|gb| *gb >= 0.0) }
 
 /// The bytes that may spill under `dir`: `PONDRA_SPILL_GB` when set, else `dir`'s disk's free space less `lake_keeps`; None with no `dir`.
-/// The lakes in memory spill under the same setting and room, counted with these (`memory_lake::spilled`, `others_held`).
+/// The lakes in memory spill under the same setting and room, counted with these (`ledger::room`).
 pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
     match spill_gb() {
         Some(gb) => Some(gb_bytes(gb)),
@@ -1679,8 +1679,8 @@ pub(crate) fn window_sorts(ctx: Arc<datafusion::execution::TaskContext>) -> Arc<
 
 /// DataFusion's spill disk for one lake, made by its first spill (`TempFileFactory`): the same manager `spill_disk`
 /// would have built when the lake opened, in the spill folder (or the OS temp folder, where there is none), with
-/// `fan_in` and the cap of `spill_cap`. `made` holds it once it is built, or the reason it could not be. It is
-/// registered (`register_spiller`) when it is made, so `spill_room` caps it and `spill_fits` counts what it holds.
+/// `fan_in` and the cap of `spill_cap`. `made` holds it once it is built, or the reason it could not be. It goes on the
+/// spill disk's room list (`ledger::holds`) when it is made, so `spill_room` caps it and `spill_fits` counts what it holds.
 struct Spills {
     fan_in: usize,
     made: std::sync::OnceLock<Result<Arc<DiskManager>, String>>,
@@ -1700,7 +1700,9 @@ impl TempFileFactory for Spills {
                 None => builder,
             };
             let disk = Arc::new(builder.build().map_err(|e| e.to_string())?);
-            register_spiller(&disk);
+            if spill_gb() != Some(0.0) {
+                crate::ledger::holds(&(disk.clone() as Arc<dyn crate::ledger::Holds>)); // (a disabled one has no cap to set: left out)
+            }
             Ok(disk)
         });
         match made {
@@ -1713,23 +1715,11 @@ impl TempFileFactory for Spills {
 /// `gb` gibibytes, in bytes.
 fn gb_bytes(gb: f64) -> u64 { (gb * (1u64 << 30) as f64) as u64 }
 
-/// The disk managers that hold this process's lakes' spill files (one for each lake, made by its first spill: `Spills`),
-/// held weakly: a lake that goes takes its manager with it. `register_spiller` adds each one (unless spilling is off),
-/// `spill_room` sets their caps, `spill_fits` counts what they hold.
-static SPILLERS: Mutex<Vec<Weak<DiskManager>>> = Mutex::new(Vec::new());
-
-/// Adds a spill disk to `SPILLERS`, once `Spills` has made it. A disabled one has no cap to set, so it is left out.
-fn register_spiller(disk: &Arc<DiskManager>) {
-    if spill_gb() != Some(0.0) {
-        SPILLERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Arc::downgrade(disk));
-    }
-}
-
-/// The disk managers still alive, the dead ones dropped from `SPILLERS`.
-fn live_spillers() -> Vec<Arc<DiskManager>> {
-    let mut spillers = SPILLERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    spillers.retain(|w| w.strong_count() > 0);
-    spillers.iter().filter_map(Weak::upgrade).collect()
+/// A lake's query spill disk holds room on the process's spill disk (`ledger::room`), and takes its cap from it (`set_room`).
+impl crate::ledger::Holds for DiskManager {
+    fn held(&self) -> u64 { self.used_disk_space() }
+    fn cap(&self, bytes: u64) { let _ = self.set_max_temp_directory_size(bytes); } // (a disabled manager refuses: none is on the list)
+    fn capped(&self) -> bool { true }
 }
 
 /// The cap of one disk manager that holds `used` bytes of spills, given the setting and what shuffles hold
@@ -1743,20 +1733,22 @@ fn room_cap(gb: Option<f64>, used: u64, shuffled: u64, disk: Option<(u64, u64)>)
     }
 }
 
-/// Sets every live lake's cap from the disk as it is now (`room_cap`). Under the setting, the shuffles, the lakes in
-/// memory and the other spill disks (a window's sorts have their own: `window_sorts`) take their bytes out of it first
-/// (without it, the disk's free room already says what they hold). (Each was given the whole setting, so a window's sorts
-/// and a GROUP BY spilling beside them could take twice it: audit 11-01 M13.)
+/// Sets the cap of each lake's spill disk from the disk as it is now (`room_cap`). Under the setting, everything else on
+/// the spill disk's room list (`ledger::room`: the shuffles, the lakes in memory, the other lakes' spill disks) takes its
+/// bytes out of it first (without it, the disk's free room already says what they hold). A window's sorts have a disk of
+/// their own (`window_sorts`). (Each was given the whole setting, so a window's sorts and a GROUP BY spilling beside them
+/// could take twice it: audit 11-01 M13.)
 fn set_room(gb: Option<f64>) {
-    let shuffled = gb.map_or(0, |_| crate::spill::held() + crate::memory_lake::spilled());
+    let room = crate::ledger::room();
+    if !room.iter().any(|(holder, _)| holder.capped()) {
+        return; // (no query spill disk made yet, so nothing to size and no disk to look at: a page never makes one, though its lakes in memory are on the list)
+    }
     let disk = crate::machine::process().space(&crate::scratch::spill_base()); // (the disk the folder is, or would be on: not made here, the first spill makes it)
-    let managers = live_spillers();
-    let all: u64 = managers.iter().map(|m| m.used_disk_space()).sum();
-    for manager in managers {
-        let used = manager.used_disk_space();
-        let others = gb.map_or(0, |_| all.saturating_sub(used));
-        if let Some(cap) = room_cap(gb, used, shuffled + others, disk) {
-            let _ = manager.set_max_temp_directory_size(cap); // (a disabled manager refuses: none is registered)
+    let all: u64 = room.iter().map(|(_, held)| held).sum();
+    for (holder, used) in &room {
+        let others = gb.map_or(0, |_| all.saturating_sub(*used));
+        if let Some(cap) = room_cap(gb, *used, others, disk) {
+            holder.cap(cap); // (one with no cap of its own takes none: a shuffle's pieces, a lake in memory)
         }
     }
 }
@@ -1774,9 +1766,6 @@ pub(crate) fn spill_room() {
         return;
     }
     LOOKED.store(now, Relaxed);
-    if live_spillers().is_empty() {
-        return; // (no spill disk made yet, so nothing to size and no disk to look at: a page never makes one)
-    }
     set_room(spill_gb());
 }
 
@@ -1790,16 +1779,12 @@ pub(crate) fn piece_fits(gb: Option<f64>, held: u64, bytes: u64, disk: Option<(u
     }
 }
 
-/// What this process spills, other than its lakes in memory: the shuffles' pieces (`spill::held`) and the queries' spill
-/// disks (`live_spillers`). The lakes' bytes come with `memory_lake::spilled`, so one check sees all of it.
-pub(crate) fn others_held() -> u64 { crate::spill::held() + live_spillers().iter().map(|m| m.used_disk_space()).sum::<u64>() }
-
 /// Whether a shuffle's piece of `bytes` fits on the spill disk now: `Spill::write` asks before it writes one.
 /// No spill folder: it fits, and the write fails with its own error.
 pub(crate) fn spill_fits(bytes: u64) -> Result<()> {
     let Ok(folder) = spill_folder() else { return Ok(()) };
     let gb = spill_gb();
-    let held = gb.map_or(0, |_| others_held() + crate::memory_lake::spilled());
+    let held = gb.map_or(0, |_| crate::ledger::room_held()); // (everything this process spills: `ledger::room`)
     match piece_fits(gb, held, bytes, crate::machine::process().space(folder)) {
         true => Ok(()),
         false => Err(no_room(bytes, gb)),
@@ -2009,60 +1994,14 @@ impl Tail {
     }
 }
 
-/// How this process reaches a lake on another server (ADR-058): the settings of the bucket key it
-/// is read with (a secret's, `ext::build`; None: the environment's), whether nothing here may write
-/// it, and where its leader is asked (a URL, with a TYPE pondra secret's token).
-#[derive(Clone, Default, Debug, Serialize, Deserialize)]
-pub struct Reach {
-    pub read_only: bool,
-    pub params: Option<BTreeMap<String, String>>,
-    pub endpoint: Option<String>,
-    pub token: Option<String>,
-    pub secret: Option<String>, // (the bucket secret's name: who may use it reads the lake here, `users::across`)
-}
-
-crate::per_node!(static REACH: std::sync::RwLock<BTreeMap<String, Reach>> = std::sync::RwLock::new(BTreeMap::new()));
-
-/// Say how `url` (a lake) is reached. Asked again (an attachment and a branch of it in one
-/// process), what the new one leaves out is kept, and read-only stays read-only.
-pub fn reach_by(url: &str, r: Reach) {
-    let mut all = REACH.write().unwrap();
-    let old = all.remove(url.trim_end_matches('/')).unwrap_or_default();
-    let read_only = old.read_only || r.read_only;
-    all.insert(url.trim_end_matches('/').to_string(), Reach { read_only, params: r.params.or(old.params), endpoint: r.endpoint.or(old.endpoint), token: r.token.or(old.token), secret: r.secret.or(old.secret) });
-}
-
-/// What this process knows of how to reach other places, for a process it starts to lead one of them
-/// for a moment (`node::lead_once`): it holds the same keys, so a backup in another bucket is written
-/// with the secret that reaches it (ADR-070).
-pub const REACH_VAR: &str = "PONDRA_REACH";
-
-pub fn reaches() -> String { serde_json::to_string(&*REACH.read().unwrap()).unwrap_or_default() }
-
-/// The places the process that started this one could reach (`REACH_VAR`), as it reached them.
-pub fn inherit() {
-    let Some(text) = crate::env::get(REACH_VAR) else { return };
-    match serde_json::from_str::<BTreeMap<String, Reach>>(&text) {
-        Ok(all) => all.into_iter().for_each(|(url, r)| reach_by(&url, r)),
-        Err(e) => eprintln!("{REACH_VAR}: {e}"),
-    }
-}
-
-/// How `url`, or a lake it is in, is reached (the longest registered prefix: `url` itself, or a
-/// path under it).
-pub fn reach_of(url: &str) -> Option<Reach> {
-    let url = url.trim_end_matches('/');
-    let all = REACH.read().unwrap();
-    all.iter().filter(|(k, _)| url.strip_prefix(k.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/')))
-        .max_by_key(|(k, _)| k.len()).map(|(_, r)| r.clone())
-}
-
 /// Open a lake's object store. For a bucket (`s3://`, `gs://`, `az://`, `abfss://`), also returns
 /// the bucket-level client that query scans use (DataFusion addresses objects by their full path
 /// in the bucket). Credentials and endpoints come from the environment, as each cloud's own tools
 /// read them: `AWS_*` (`AWS_ENDPOINT` for R2 and MinIO), `GOOGLE_*`, `AZURE_*`. A lake on another
-/// server is read with the key its attachment names (`reach_of`), and a read-only one refuses writes.
-pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
+/// server is read with the key its attachment names (`reaches`: the node's, `NodeState::reaches`), and a read-only one
+/// refuses writes. With no `reaches` (a place no statement named: a folder, a lake's own bucket before any node opened it),
+/// a bucket is read as the environment says.
+pub fn open_store(url: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<(String, Store, Option<(String, Store)>)> {
     if in_memory(url) {
         let url = url.trim_end_matches('/').to_string();
         let held = crate::memory_lake::store(&url);
@@ -2087,7 +2026,7 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     let (scheme, rest) = url.split_once("://").filter(|(s, _)| BUCKETS.contains(s)).expect("(a bucket: `place` refused any other URL)");
     let (bucket, prefix) = rest.trim_end_matches('/').split_once('/').unwrap_or((rest, ""));
     let root = format!("{scheme}://{bucket}");
-    let reach = reach_of(url);
+    let reach = reaches.and_then(|r| r.of(url));
     let params = reach.as_ref().and_then(|r| r.params.as_ref());
     // Idle connections are dropped after 15 s rather than reused: through proxies and NATs that
     // silently forget idle connections, a reused one hung a PUT for the full 30 s timeout on R2.
@@ -2387,7 +2326,7 @@ impl Lake {
 
     /// `open_polled` and `open_on`: a reader's catalog is `given` when one is, else `kv::reader` on the lake's store.
     async fn open_with(url: &str, writer: bool, streamed: bool, poll: Duration, given: Option<Arc<dyn Kv>>, node: Arc<NodeState>) -> Result<Arc<Lake>> {
-        let (url, store, bucket) = open_store(url)?;
+        let (url, store, bucket) = open_store(url, Some(&node.reaches))?;
         // (what the lake reads and writes, counted into its node's metrics: `Counted`)
         let (store, bucket) = (counted(store, &node.metrics), bucket.map(|(root, whole)| (root, counted(whole, &node.metrics))));
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
@@ -2769,7 +2708,7 @@ impl Lake {
         match (bucket_url(url), &self.cached) {
             (Some(bucket), Some(ours)) if bucket_url(&self.url).as_ref() == Some(&bucket) => ours.add_lake(url[bucket.len()..].trim_start_matches('/')),
             (Some(bucket), _) => {
-                if let Ok((_, _, Some((root, whole)))) = open_store(url) {
+                if let Ok((_, _, Some((root, whole)))) = open_store(url, Some(&self.node.reaches)) {
                     let prefix = url[root.len()..].trim_start_matches('/').to_string();
                     let whole = counted(whole, &self.node.metrics);
                     self.rt.register_object_store(&url::Url::parse(&bucket)?, Arc::new(crate::cache::CachedStore::new(whole, cache_mb() << 20, None, &prefix)));
@@ -2789,7 +2728,7 @@ impl Lake {
             None => anyhow::bail!("no base {id} in this branch"),
         };
         anyhow::ensure!(url.contains("://") || std::path::Path::new(&url).exists(), "this branch's base {url} is gone");
-        let store = counted(open_store(&url)?.1, &self.node.metrics);
+        let store = counted(open_store(&url, Some(&self.node.reaches))?.1, &self.node.metrics);
         if let Some(b) = self.bases.write().unwrap().get_mut(id) {
             b.1 = Some(store.clone());
         }
@@ -4469,7 +4408,7 @@ mod tests {
         assert_eq!(place("pondra://h:1").unwrap(), Place::Served);
         for url in ["https://../../x", "file:///a", "r2://b"] {
             assert_eq!(crate::codes::of(&place(url).unwrap_err()), "22023", "{url} is no place a lake can be");
-            assert!(open_store(url).is_err(), "{url} is refused before a folder is made of it");
+            assert!(open_store(url, None).is_err(), "{url} is refused before a folder is made of it");
         }
     }
 
@@ -4658,7 +4597,7 @@ mod tests {
             fn one_off(&self) -> bool { false }
             fn owns_process(&self) -> bool { false }
             fn program(&self) -> anyhow::Result<std::path::PathBuf> { anyhow::bail!("a test starts no helpers") }
-            fn lead_elsewhere<'a>(&'a self, _: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+            fn lead_elsewhere<'a>(&'a self, _: &'a str, _: &'a crate::reaches::Reaches) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
                 Box::pin(async { anyhow::bail!("a test leads no other lake") })
             }
         }
@@ -5102,7 +5041,8 @@ mod tests {
         let folder = spill_folder().expect("this process's spill folder");
         let manager = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![folder.to_path_buf()])).with_max_temp_directory_size(0).build().expect("a disk manager");
         let manager = Arc::new(manager);
-        SPILLERS.lock().unwrap().push(Arc::downgrade(&manager));
+        crate::ledger::holds(&(manager.clone() as Arc<dyn crate::ledger::Holds>));
+        assert!(crate::ledger::Holds::capped(&*manager), "a query spill disk takes a cap: with one on the list, the disk is looked at");
         set_room(None);
         let cap = manager.max_temp_directory_size();
         assert!(cap >= manager.used_disk_space() + (1 << 20), "a cap of {cap} with the disk's room");
