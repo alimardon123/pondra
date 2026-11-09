@@ -139,20 +139,11 @@ const PRIVILEGES: [&str; 7] = ["select", "insert", "update", "delete", "usage", 
 
 // ---------------------------------------------------------------- statements
 
-/// `CREATE USER|ROLE`, `ALTER USER|ROLE`, `DROP USER|ROLE`, `GRANT`, `REVOKE`, `CREATE TOKEN`,
-/// `DROP TOKEN`, as a write the leader carries out; None for anything else.
+/// `GRANT` and `REVOKE`, as a write the leader carries out; None for anything else. (CREATE, ALTER and DROP USER, ROLE
+/// and TOKEN are the statements section's entries, `read`; GRANT is read here until step 6 reads it once.)
 pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     let words = Words::of(sql)?;
-    let first = words.peek_word()?;
-    let second = words.0.iter().rev().nth(1).map(|t| t.word()).unwrap_or_default(); // (the words are kept last first)
-    let ours = match first.as_str() {
-        "grant" | "revoke" => true,
-        // (CREATE, ALTER and DROP USER, ROLE and TOKEN: the statements section's entries, `core_statements.rs`; read here
-        // too only as `write::was` reads, before PR 8 moved them)
-        "create" | "alter" | "drop" => entries_skipped() && matches!(second.as_str(), "user" | "role" | "token"),
-        _ => false,
-    };
-    ours.then(|| said(words))
+    matches!(words.peek_word()?.as_str(), "grant" | "revoke").then(|| said(words))
 }
 
 /// CREATE, ALTER and DROP USER, ROLE and TOKEN, by their words: the statements section's entries' reader.
@@ -165,12 +156,6 @@ fn said(words: Words) -> crate::write::Stmt {
         Err(e) => Stmt::of_error(&e, e.to_string()), // (a coded refusal keeps its code: `0LP01` for a privilege its kind lacks)
     }
 }
-
-/// Are the statements section's core entries skipped, as `write::was` reads a text before PR 8 moved its readers?
-#[cfg(test)]
-fn entries_skipped() -> bool { crate::write::was::old() }
-#[cfg(not(test))]
-fn entries_skipped() -> bool { false }
 
 fn parse(mut w: Words) -> Result<Change> {
     let verb = w.next().map(|x| x.word()).unwrap_or_default();

@@ -136,7 +136,7 @@ objects -> constraints  1
 objects -> ddl  32
 objects -> engine  1
 objects -> expander  2
-objects -> ext  3
+objects -> ext  2
 objects -> extension  1
 objects -> facts  1
 objects -> find  2
@@ -155,7 +155,7 @@ objects -> temp  1
 objects -> types  5
 objects -> users  2
 objects -> views  5
-objects -> write  8
+objects -> write  4
 once -> matches  1
 once -> pattern  1
 oom -> jemalloc  2
@@ -271,7 +271,6 @@ write -> memory  1
 write -> pattern  1
 write -> pg_types  1
 write -> shares  1
-write -> sso  1
 write -> store_wire  1
 write -> write_outside  2
 write_outside -> avro  3

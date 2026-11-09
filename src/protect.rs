@@ -112,7 +112,7 @@ fn touched(stmt: &Stmt) -> Vec<Touch> {
         Stmt::Create(c) => vec![Touch::Object(crate::text::object(&c.name))],
         Stmt::Define(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => vec![Touch::Object(t.clone())],
         Stmt::Ddl(ds) => ds.iter().flat_map(ddl_touches).collect(),
-        Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) | Stmt::UndropFile(_) => vec![],
+        Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) | Stmt::Theirs | Stmt::UndropFile(_) => vec![],
     }
 }
 

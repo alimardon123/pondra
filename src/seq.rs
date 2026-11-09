@@ -139,53 +139,6 @@ pub(crate) fn read(w: &mut crate::words::Words) -> anyhow::Result<Stmt> {
     })
 }
 
-/// `CREATE [OR REPLACE] SEQUENCE`, `ALTER SEQUENCE`, `DROP SEQUENCE`, or None for anything else: as `write::parse` read
-/// them before they were the statements section's entries (`write::was`).
-#[cfg(test)]
-pub fn statement(sql: &str) -> Option<Stmt> {
-    use std::sync::LazyLock;
-    static CREATE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*CREATE\s+(OR\s+REPLACE\s+)?((?:TEMP|TEMPORARY)\s+)?SEQUENCE\s+(IF\s+NOT\s+EXISTS\s+)?([\w."$-]+)(.*?)\s*;?\s*$"#).expect("a regex"));
-    static ALTER: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+SEQUENCE\s+(IF\s+EXISTS\s+)?([\w."$-]+)(.*?)\s*;?\s*$"#).expect("a regex"));
-    static DROP: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*DROP\s+SEQUENCE\b").expect("a regex"));
-    static RENAME: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*RENAME\s+TO\s+([\w."$-]+)\s*$"#).expect("a regex"));
-    let first = crate::text::first_word(sql);
-    let invalid = |e: anyhow::Error| Stmt::Invalid(format!("{e:#}"));
-    if let Some(c) = CREATE.captures(first) {
-        if c.get(2).is_some() {
-            return Some(Stmt::Invalid("CREATE TEMPORARY SEQUENCE isn't taken yet: a sequence is the lake's (CREATE SEQUENCE)".into()));
-        }
-        let (replace, if_not_exists) = (c.get(1).is_some(), c.get(3).is_some());
-        return Some(match crate::rules::create::parse_options(&c[5], false) {
-            _ if replace && if_not_exists => Stmt::Invalid("CREATE OR REPLACE SEQUENCE … IF NOT EXISTS: one or the other".into()),
-            Ok((declared, _)) => Stmt::Ddl(vec![crate::ddl::Ddl::Sequence(Change::Create { name: object_of(&c[4]), declared, replace, if_not_exists })]),
-            Err(e) => invalid(e),
-        });
-    }
-    if let Some(c) = ALTER.captures(first) {
-        let (if_exists, name, rest) = (c.get(1).is_some(), object_of(&c[2]), c[3].to_string());
-        if let Some(r) = RENAME.captures(&rest) {
-            return Some(Stmt::Ddl(vec![crate::ddl::Ddl::Sequence(Change::Alter { name, declared: vec![], restart: None, rename: Some(object_of(&r[1])), if_exists })]));
-        }
-        return Some(match crate::rules::create::parse_options(&rest, true) {
-            Ok((declared, None)) if declared.is_empty() => {
-                Stmt::Invalid(format!("ALTER SEQUENCE {name}: what to change (RESTART [WITH n], INCREMENT BY n, MINVALUE n, MAXVALUE n, START WITH n, CACHE n, [NO] CYCLE, AS type, RENAME TO name)"))
-            }
-            Ok((declared, restart)) => Stmt::Ddl(vec![crate::ddl::Ddl::Sequence(Change::Alter { name, declared, restart, rename: None, if_exists })]),
-            Err(e) => invalid(e),
-        });
-    }
-    if DROP.is_match(first) {
-        let parsed = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::GenericDialect {}, sql).map(|mut s| s.pop());
-        return Some(match parsed {
-            Ok(Some(datafusion::sql::sqlparser::ast::Statement::Drop { object_type: datafusion::sql::sqlparser::ast::ObjectType::Sequence, names, if_exists, .. })) => {
-                Stmt::Ddl(vec![crate::ddl::Ddl::Sequence(Change::Drop { names: names.iter().map(crate::text::object).collect(), if_exists })])
-            }
-            _ => Stmt::Invalid("DROP SEQUENCE [IF EXISTS] name [, …]".into()),
-        });
-    }
-    None
-}
-
 pub use crate::text::object_of;
 
 /// Leader: carry one out (under the lake's lock); the counters move in the sequencer (`Held`).
