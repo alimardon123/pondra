@@ -1853,18 +1853,25 @@ pub fn memory_limit() -> usize {
 
 /// The process's line for every node's queries together (`ledger::Root`): its whole line (`root_whole`) where there is one,
 /// else 4 GiB; on a page, its device's line's trim line, as a node's is (`env::page_line_share`). A node's own `PONDRA_MEMORY_GB` is its
-/// budget on it (`memory_limit`), never the process's.
+/// budget on it (`memory_limit`), never the process's. Where no stop line watches the process (a host's, whose memory is the
+/// host's, or `PONDRA_MEMORY_MAX_GB=0`), the queries keep a third of the machine's memory at most (`oom::roots`).
 fn root_line() -> usize {
     #[cfg(target_arch = "wasm32")]
     return crate::env::page_line_share(crate::machine::process().line());
     #[cfg(not(target_arch = "wasm32"))]
-    Some(root_whole()).filter(|&w| w < usize::MAX).unwrap_or(4 << 30)
+    match roots() {
+        (Some(whole), Some(third)) => whole.min(third),
+        (whole, third) => whole.or(third).unwrap_or(4 << 30),
+    }
 }
+
+/// The memory watch's lines for the process (`oom::roots`): its trim line, and a third of its memory where no stop line watches it.
+fn roots() -> (Option<usize>, Option<usize>) { crate::oom::roots() }
 
 /// The process's whole line, for every node's queries and caches together (`ledger::Root`): the memory watch's trim line
 /// (`oom::trim_line`, of the machine's memory or `PONDRA_MEMORY_MAX_GB`), or none (`usize::MAX`) where it isn't known.
 fn root_whole() -> usize {
-    crate::oom::trim_line().unwrap_or(usize::MAX)
+    roots().0.unwrap_or(usize::MAX)
 }
 
 /// Every node's budget in the process now (`ledger::budgets`): the memory watch takes memory back from the caches charged
