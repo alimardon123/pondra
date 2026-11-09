@@ -135,7 +135,7 @@ pub async fn statement(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Dd
             let to = crate::ddl::full(&dir.unwrap_or_else(|| crate::ddl::beside(&lake.url, &name)))?;
             apart(lake, &to)?;
             for place in [&crate::ddl::full(&from)?, &to] {
-                crate::ext::reach_place(lake, place).await?; // (a backup in another bucket: the secret that reaches it)
+                crate::ext::reach_place(lake, place, scope).await?; // (a backup in another bucket: the secret that reaches it)
             }
             let mut out = restore(&from, &to, at, &lake.node).await?;
             let attach = Ddl::Attach { name: name.clone(), dir: to, read_only: false, endpoint: None };
@@ -186,7 +186,7 @@ async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Op
     let to = crate::ddl::full(to)?;
     crate::ext::owners_only(&to, format!("BACKUP … TO {to}: a path on the server's own disk, which only the node's owner backs up into (the `pondra` shell, `pondra sql`, `connect()` of a lake): back up to a bucket (s3://, gs://, az://)"))?;
     apart(lake, &to)?;
-    crate::ext::reach_place(lake, &to).await?; // (another bucket or provider: the secret whose SCOPE covers it)
+    crate::ext::reach_place(lake, &to, scope).await?; // (another bucket or provider: the secret whose SCOPE covers it)
     let fresh = empty(&to, Some(&lake.node.reaches)).await?; // (nothing there yet: this run makes the lake)
     ensure!(fresh || crate::ddl::has_catalog(&to, Some(&lake.node.reaches)).await?, "{to} holds other things: back up into a new place (or an empty folder)");
     let pin = format!("{to}#backup");

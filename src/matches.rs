@@ -669,8 +669,9 @@ fn held_schema_of(cols: &[(String, DataType)]) -> SchemaRef { Arc::new(Schema::n
 /// them, or with `keys`, only the rows of those keys.
 async fn read_state(lake: &Lake, name: &str, at: u64, keys: Option<&RecordBatch>) -> Result<Vec<RecordBatch>> {
     let meta: Arc<TableMeta> = Arc::new(table_meta(lake, name).await?);
-    let ctx = session_for(lake, "", "", None, &crate::auth::Principal::node().scope).await?;
-    let provider = crate::query::table_view_once(lake, &ctx, name, meta.clone(), Some(at)).await?;
+    let node = crate::auth::Principal::node().scope; // (the node's own work)
+    let ctx = session_for(lake, "", "", None, &node).await?;
+    let provider = crate::query::table_view_once(lake, &ctx, name, meta.clone(), Some(at), &node).await?;
     ctx.register_table("__state", crate::query::named(&ctx, provider, &meta, false)?)?;
     match keys {
         None => Ok(ctx.table("__state").await?.collect().await?),

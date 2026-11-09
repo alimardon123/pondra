@@ -216,9 +216,9 @@ fn clean(path: &str) -> bool { path.split('/').all(|p| !p.is_empty() && p != "."
 /// A repository's git secret: the one named, else the one whose SCOPE is the longest covering the
 /// repository; either must be one the caller may use (USAGE) and must cover it, so a token goes only
 /// where an admin said it may. Returns the secret's name, its token and its provider.
-pub async fn git_token(lake: &Lake, repository: &str, name: Option<&str>) -> Result<(String, String, String)> {
+pub async fn git_token(lake: &Lake, repository: &str, name: Option<&str>, scope: &crate::rights::Scope) -> Result<(String, String, String)> {
     let all = ext::list(lake).await?;
-    let mut covering: Vec<(&String, usize)> = all.iter().filter(|(n, s)| s.kind == "git" && ext::usable(n, s)).filter_map(|(n, s)| {
+    let mut covering: Vec<(&String, usize)> = all.iter().filter(|(n, s)| s.kind == "git" && ext::usable(n, s, scope)).filter_map(|(n, s)| {
         s.scope.as_deref().filter(|scope| within(scope, repository)).map(|scope| (n, scope.trim_end_matches('/').len()))
     }).collect();
     covering.sort_by_key(|(_, len)| std::cmp::Reverse(*len));
@@ -236,7 +236,7 @@ pub async fn git_token(lake: &Lake, repository: &str, name: Option<&str>) -> Res
             best.clone()
         }
     };
-    let values = ext::reveal(lake, &name).await?;
+    let values = ext::reveal(lake, &name, scope).await?;
     let token = values.get("token").cloned().with_context(|| format!("git secret {name} has no TOKEN"))?;
     let provider = values.get("provider").cloned().unwrap_or_else(|| "github".into());
     Ok((name, token, provider))
@@ -248,8 +248,8 @@ fn within(scope: &str, url: &str) -> bool {
     url == scope || url.starts_with(&format!("{scope}/"))
 }
 
-async fn host_for(lake: &Lake, repository: &str, secret: Option<&str>) -> Result<Box<dyn Host>> {
-    let (_, token, provider) = git_token(lake, repository, secret).await?;
+async fn host_for(lake: &Lake, repository: &str, secret: Option<&str>, scope: &crate::rights::Scope) -> Result<Box<dyn Host>> {
+    let (_, token, provider) = git_token(lake, repository, secret, scope).await?;
     // (a service the admin named: a git secret's token goes only where its SCOPE, an admin's, says)
     host(&provider, repository, &token, lake.node.net.client(crate::net::Policy::ENDPOINT))
 }
@@ -491,31 +491,31 @@ pub async fn call(app: &App, name: &str, args: &[FunctionArg], who: Who) -> Resu
     let (lake, secret) = (&app.lake, text(&v, "secret"));
     Ok(match verb {
         "git_status" => Outcome::Rows(vec![batch(&status(lake, &folder).await?)?]),
-        "git_checkout" => Outcome::Done(checkout(lake, &folder, &v, secret, who.name()).await?),
-        "git_commit" => Outcome::Done(commit(lake, &folder, &v, secret, who.name()).await?),
-        "git_pull" => Outcome::Done(pull(lake, &folder, secret, who.name()).await?),
-        _ => Outcome::Done(pull_request(lake, &folder, &v, secret).await?),
+        "git_checkout" => Outcome::Done(checkout(lake, &folder, &v, secret, who.name(), &who.scope).await?),
+        "git_commit" => Outcome::Done(commit(lake, &folder, &v, secret, who.name(), &who.scope).await?),
+        "git_pull" => Outcome::Done(pull(lake, &folder, secret, who.name(), &who.scope).await?),
+        _ => Outcome::Done(pull_request(lake, &folder, &v, secret, &who.scope).await?),
     })
 }
 
 /// `git_checkout`: the first checkout of a folder, or (a Git folder) its switch to another branch.
-async fn checkout(lake: &Lake, folder: &str, v: &Value, secret: Option<String>, by: &str) -> Result<Value> {
+async fn checkout(lake: &Lake, folder: &str, v: &Value, secret: Option<String>, by: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let repository = text(v, "repository").map(|r| normal(&r));
     let branch = text(v, "branch");
     if let Some(b) = &branch {
         ensure!(branch_ok(b), "{b}: a branch's name is letters, digits and - _ . /");
     }
     match record_of(lake, folder).await? {
-        None => first(lake, folder, repository, branch, secret, by).await,
-        Some((record, read_at)) => switch(lake, folder, record, &read_at, repository, branch, secret, by).await,
+        None => first(lake, folder, repository, branch, secret, by, scope).await,
+        Some((record, read_at)) => switch(lake, folder, record, &read_at, repository, branch, secret, by, scope).await,
     }
 }
 
 /// The first checkout: the branch's files, then the record (written last).
-async fn first(lake: &Lake, folder: &str, repository: Option<String>, branch: Option<String>, secret: Option<String>, by: &str) -> Result<Value> {
+async fn first(lake: &Lake, folder: &str, repository: Option<String>, branch: Option<String>, secret: Option<String>, by: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let repository = repository.context("the first checkout names its repository: git_checkout('sales', repository => 'https://github.com/acme/sales')")?;
     ensure!(listed(lake, folder).await?.is_empty(), "{folder} holds files already: check a repository out into an empty folder");
-    let host = host_for(lake, &repository, secret.as_deref()).await?;
+    let host = host_for(lake, &repository, secret.as_deref(), scope).await?;
     let branch = match branch {
         Some(b) => b,
         None => host.default_branch().await?,
@@ -532,7 +532,7 @@ async fn first(lake: &Lake, folder: &str, repository: Option<String>, branch: Op
 /// A Git folder's checkout: the same branch answers unchanged; another repository is refused; another
 /// branch is checked out over the folder (refused with local changes), or made at the record's commit
 /// when the repository lacks it, the local changes carried over as `git switch -c` does.
-async fn switch(lake: &Lake, folder: &str, mut record: Record, read_at: &str, repository: Option<String>, branch: Option<String>, secret: Option<String>, by: &str) -> Result<Value> {
+async fn switch(lake: &Lake, folder: &str, mut record: Record, read_at: &str, repository: Option<String>, branch: Option<String>, secret: Option<String>, by: &str, scope: &crate::rights::Scope) -> Result<Value> {
     if let Some(r) = &repository {
         ensure!(*r == record.repository, "{folder} is a Git folder of {}: check {r} out into another folder", record.repository);
     }
@@ -540,7 +540,7 @@ async fn switch(lake: &Lake, folder: &str, mut record: Record, read_at: &str, re
     if branch == record.branch {
         return Ok(json!({"folder": folder, "branch": branch, "unchanged": true}));
     }
-    let host = host_for(lake, &record.repository, secret.as_deref()).await?;
+    let host = host_for(lake, &record.repository, secret.as_deref(), scope).await?;
     let made = match host.head(&branch).await? {
         Some(commit) => {
             let local = changes(&record.files, &ids_of(lake, folder).await?);
@@ -563,7 +563,7 @@ async fn switch(lake: &Lake, folder: &str, mut record: Record, read_at: &str, re
 
 /// `git_commit`: the folder's local changes (or only `paths`) on top of the record's commit, moved
 /// onto the branch, fast-forward only. The record then holds the new commit and the committed paths' ids.
-async fn commit(lake: &Lake, folder: &str, v: &Value, secret: Option<String>, by: &str) -> Result<Value> {
+async fn commit(lake: &Lake, folder: &str, v: &Value, secret: Option<String>, by: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let message = text(v, "message").context("git_commit('sales', 'what changed'): the message")?;
     let (mut record, read_at) = need_record(lake, folder).await?;
     let local = changes(&record.files, &ids_of(lake, folder).await?);
@@ -577,7 +577,7 @@ async fn commit(lake: &Lake, folder: &str, v: &Value, secret: Option<String>, by
         }
     };
     ensure!(!picked.is_empty(), "nothing to commit in {folder}");
-    let host = host_for(lake, &record.repository, secret.as_deref()).await?;
+    let host = host_for(lake, &record.repository, secret.as_deref(), scope).await?;
     let head = host.head(&record.branch).await?.with_context(|| format!("{} has no branch {}", record.repository, record.branch))?;
     ensure!(head == record.commit, "{}", moved_on(&record, folder));
     let mut blobs = vec![];
@@ -604,9 +604,9 @@ async fn commit(lake: &Lake, folder: &str, v: &Value, secret: Option<String>, by
 
 /// `git_pull`: the branch's new commits written into the folder. A path changed both here and on the
 /// branch (to different things) is refused by name, and nothing changes.
-async fn pull(lake: &Lake, folder: &str, secret: Option<String>, by: &str) -> Result<Value> {
+async fn pull(lake: &Lake, folder: &str, secret: Option<String>, by: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let (mut record, read_at) = need_record(lake, folder).await?;
-    let host = host_for(lake, &record.repository, secret.as_deref()).await?;
+    let host = host_for(lake, &record.repository, secret.as_deref(), scope).await?;
     let head = host.head(&record.branch).await?.with_context(|| format!("{} has no branch {}", record.repository, record.branch))?;
     if head == record.commit {
         return Ok(json!({"pulled": 0}));
@@ -634,10 +634,10 @@ async fn pull(lake: &Lake, folder: &str, secret: Option<String>, by: &str) -> Re
 
 /// `git_pull_request`: a pull request from the record's branch into `base` (the repository's default
 /// branch by default).
-async fn pull_request(lake: &Lake, folder: &str, v: &Value, secret: Option<String>) -> Result<Value> {
+async fn pull_request(lake: &Lake, folder: &str, v: &Value, secret: Option<String>, scope: &crate::rights::Scope) -> Result<Value> {
     let title = text(v, "title").context("git_pull_request('sales', title => '…')")?;
     let (record, _) = need_record(lake, folder).await?;
-    let host = host_for(lake, &record.repository, secret.as_deref()).await?;
+    let host = host_for(lake, &record.repository, secret.as_deref(), scope).await?;
     let base = match text(v, "base") {
         Some(b) => b,
         None => host.default_branch().await?,

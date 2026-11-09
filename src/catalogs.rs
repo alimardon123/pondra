@@ -66,7 +66,7 @@ enum Auth {
 
 /// The catalog `spec` names: an attachment's (`catalog` in its options: its endpoint, how it signs,
 /// whether it vends), else the one at its URL, with the token its covering secret gets.
-pub async fn open(lake: &Lake, url: &str, options: &BTreeMap<String, String>) -> Result<Rest> {
+pub async fn open(lake: &Lake, url: &str, options: &BTreeMap<String, String>, scope: &crate::rights::Scope) -> Result<Rest> {
     let attached = match options.get("catalog") {
         Some(name) => Some(attachment(lake, name, url).await?),
         None => None,
@@ -75,11 +75,11 @@ pub async fn open(lake: &Lake, url: &str, options: &BTreeMap<String, String>) ->
     let auth = match o("endpoint_type") {
         Some(t) => {
             let name = o("secret").with_context(|| format!("{t}: attached without its SECRET"))?;
-            let keys = aws_keys(lake, &name).await?;
+            let keys = aws_keys(lake, &name, scope).await?;
             let region = region(attached.as_ref().map_or("", |a| a.url.as_str()), &keys)?;
             Auth::Aws { service: service(&t)?, region, keys }
         }
-        None => Auth::Token(crate::ext::rest_token(lake, url).await?),
+        None => Auth::Token(crate::ext::rest_token(lake, url, scope).await?),
     };
     let keys = match &auth {
         Auth::Aws { keys, .. } => Some(keys.clone()),
@@ -87,7 +87,7 @@ pub async fn open(lake: &Lake, url: &str, options: &BTreeMap<String, String>) ->
     };
     let vended = o("access_delegation_mode").is_none_or(|m| m != "none");
     // (an attachment's endpoint is an admin's; any other the caller reaches as its secret does)
-    let policy = if attached.is_some() { crate::net::Policy::ENDPOINT } else { crate::ext::reach_service(lake, url).await? };
+    let policy = if attached.is_some() { crate::net::Policy::ENDPOINT } else { crate::ext::reach_service(lake, url, scope).await? };
     let mut rest = Rest { base: format!("{url}/v1/"), auth, vended, keys, http: lake.node.net.client(policy) };
     // The catalog's own prefix (Glue's `catalogs/{account}`, S3 Tables' bucket ARN): from its config.
     let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>().replace('+', "%20");
@@ -114,10 +114,10 @@ async fn attachment(lake: &Lake, name: &str, url: &str) -> Result<Attached> {
 /// Is `url` the endpoint of the AWS catalog attached as `name`, signed with a secret this caller may
 /// use? Its secret covers its buckets, not its endpoint, so using that secret is the right to read
 /// through it (`ext::check`); one the caller may not use is refused by name.
-pub async fn signed(lake: &Lake, name: &str, url: &str) -> Result<bool> {
+pub async fn signed(lake: &Lake, name: &str, url: &str, scope: &crate::rights::Scope) -> Result<bool> {
     let a = attachment(lake, name, url).await?;
     let Some(secret) = a.options.get("secret").filter(|_| a.options.contains_key("endpoint_type")) else { return Ok(false) };
-    aws_keys(lake, secret).await?;
+    aws_keys(lake, secret, scope).await?;
     Ok(true)
 }
 
@@ -276,12 +276,12 @@ pub fn rehome(d: &Delegated, m: &mut TableMeta) {
 pub fn is_delegated(path: &str) -> bool { path.starts_with("delegated://") }
 
 /// A node's share of a spread query over a catalog's table: its files' store, from the catalog.
-pub async fn prime(lake: &Lake, spec: &Spec, m: &TableMeta) -> Result<()> {
+pub async fn prime(lake: &Lake, spec: &Spec, m: &TableMeta, scope: &crate::rights::Scope) -> Result<()> {
     if !m.files.iter().any(|f: &DataFile| is_delegated(&f.path)) {
         return Ok(());
     }
     let url = spec.urls[0].trim_end_matches('/');
-    open(lake, url, &spec.options).await?.load(lake, url, &spec.options).await.map(|_| ())
+    open(lake, url, &spec.options, scope).await?.load(lake, url, &spec.options).await.map(|_| ())
 }
 
 // ---------------------------------------------------------------- AWS
@@ -311,9 +311,9 @@ pub fn region(warehouse: &str, keys: &BTreeMap<String, String>) -> Result<String
 }
 
 /// The settings of the TYPE s3 secret an AWS catalog was attached with, if this caller may use it.
-pub async fn aws_keys(lake: &Lake, name: &str) -> Result<BTreeMap<String, String>> {
+pub async fn aws_keys(lake: &Lake, name: &str, scope: &crate::rights::Scope) -> Result<BTreeMap<String, String>> {
     let (n, s) = crate::ext::list(lake).await?.into_iter().find(|(n, _)| n == name).with_context(|| format!("no secret {name}"))?;
-    ensure!(crate::ext::usable(&n, &s), "secret {name} isn't yours to use (an admin grants it: GRANT USAGE ON SECRET {name} TO …)");
+    ensure!(crate::ext::usable(&n, &s, scope), "secret {name} isn't yours to use (an admin grants it: GRANT USAGE ON SECRET {name} TO …)");
     ensure!(matches!(s.kind.as_str(), "s3" | "r2"), "secret {name} is TYPE {}: an AWS catalog is reached with a TYPE s3 secret", s.kind);
     crate::ext::reveal_secret(&n, &s)
 }
@@ -342,11 +342,11 @@ mod tests {
         let lake = Lake::open(&format!("memory://private-catalog-{}", uuid::Uuid::new_v4().simple()), true, false, crate::node_state::NodeState::unhosted()).await.unwrap();
         let none = BTreeMap::new();
         for at in ["http://10.0.0.5:8181", "http://169.254.169.254", "http://localhost:8181"] {
-            let e = crate::ext::scope(false, open(&lake, at, &none)).await.err().unwrap_or_else(|| panic!("{at} opened"));
+            let e = crate::ext::scope(false, open(&lake, at, &none, &crate::rights::Scope::everything())).await.err().unwrap_or_else(|| panic!("{at} opened"));
             assert!(e.to_string().contains("a temporary secret reaches only the public internet"), "{at}: {e}");
         }
         // (the owner's is asked: nothing answers there, so it fails reaching it, not by the policy)
-        let e = crate::ext::scope(true, open(&lake, "http://127.0.0.1:9", &none)).await.err().expect("nothing listens on port 9");
+        let e = crate::ext::scope(true, open(&lake, "http://127.0.0.1:9", &none, &crate::rights::Scope::everything())).await.err().expect("nothing listens on port 9");
         assert!(!e.to_string().contains("public internet"), "the owner reaches inside: {e:#}");
     }
 

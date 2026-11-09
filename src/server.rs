@@ -604,21 +604,24 @@ async fn commit(State(app): State<App>, body: Bytes) -> Result<Json<crate::log::
 }
 
 /// This node's share of a distributed query, sent a piece at a time (a big share is on disk).
-async fn stage(State(app): State<App>, Json(slice): Json<crate::spmd::Slice>) -> Result<Response, E> {
-    let (shape, parts) = crate::spmd::stage(&app.lake, &slice).await?;
+async fn stage(State(app): State<App>, who: Option<axum::Extension<crate::auth::Principal>>, Json(slice): Json<crate::spmd::Slice>) -> Result<Response, E> {
+    let who = signed_of(who);
+    let (shape, parts) = crate::spmd::stage(&app.lake, &slice, &who.scope).await?;
     let done = slice.shuffle.is_none().then(|| crate::spill::Gone(slice.id.clone(), app.lake.node.clone()));
     Ok(Body::from_stream(crate::spmd::reply(&shape, parts, done)).into_response())
 }
 
 /// This node's share of an `INSERT … SELECT`, written into the table's folder (see `spmd::insert`):
 /// its columns and files.
-async fn insert_share(State(app): State<App>, Json((slice, table, stamp)): Json<(crate::spmd::Slice, String, Option<crate::log::Reserved>)>) -> Result<Json<(crate::spmd::Columns, Vec<crate::store::DataFile>)>, E> {
-    Ok(Json(crate::spmd::insert_share(&app.lake, &slice, &table, stamp).await?))
+async fn insert_share(State(app): State<App>, who: Option<axum::Extension<crate::auth::Principal>>, Json((slice, table, stamp)): Json<(crate::spmd::Slice, String, Option<crate::log::Reserved>)>) -> Result<Json<(crate::spmd::Columns, Vec<crate::store::DataFile>)>, E> {
+    let who = signed_of(who);
+    Ok(Json(crate::spmd::insert_share(&app.lake, &slice, &table, stamp, &who.scope).await?))
 }
 
 /// This node's share of a `COPY … TO` a folder, written (see `spmd::copy`): how many rows.
-async fn copy(State(app): State<App>, Json((slice, target)): Json<(crate::spmd::Slice, crate::copy::Target)>) -> Result<Json<u64>, E> {
-    Ok(Json(crate::spmd::copy_share(&app.lake, &slice, &target).await?))
+async fn copy(State(app): State<App>, who: Option<axum::Extension<crate::auth::Principal>>, Json((slice, target)): Json<(crate::spmd::Slice, crate::copy::Target)>) -> Result<Json<u64>, E> {
+    let who = signed_of(who);
+    Ok(Json(crate::spmd::copy_share(&app.lake, &slice, &target, &who.scope).await?))
 }
 
 #[derive(Deserialize)]
@@ -642,8 +645,9 @@ async fn bucket(State(app): State<App>, Query(p): Query<BucketParams>) -> Result
 }
 
 /// A share of the leader's data work (tiering, merging, compaction): the files written.
-async fn job(State(app): State<App>, Json(job): Json<crate::tier::Job>) -> Result<Json<Vec<DataFile>>, E> {
-    Ok(Json(crate::tier::run_job(&app.lake, job).await?))
+async fn job(State(app): State<App>, who: Option<axum::Extension<crate::auth::Principal>>, Json(job): Json<crate::tier::Job>) -> Result<Json<Vec<DataFile>>, E> {
+    let who = signed_of(who);
+    Ok(Json(crate::tier::run_job(&app.lake, job, &who.scope).await?))
 }
 
 /// The commit stream (see `Frame`): who leads, then the recent frames, then every new one. A follower's are the leader's
@@ -1142,7 +1146,8 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
 /// `SELECT … WHERE key = …`. Upsert tables skip SQL entirely (`serve.rs`); merge tables combine
 /// the key's partial rows with a filter + GROUP BY on one thread. Composite keys are
 /// comma-separated, in the key's column order.
-async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)>) -> Result<Response, E> {
+async fn lookup(State(app): State<App>, who: Option<axum::Extension<crate::auth::Principal>>, Path((name, key)): Path<(String, String)>) -> Result<Response, E> {
+    let who = signed_of(who);
     crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&name))?; // (a user's: the whole row)
     let lake = &app.lake;
     let meta = lake.table_meta(&name).await?;
@@ -1165,7 +1170,7 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
         });
     }
     let (ctx, where_) = (lake.session_with(1), where_.join(" AND "));
-    ctx.register_table("__raw", raw(lake, &ctx, &name, &meta, None).await?.into_view())?;
+    ctx.register_table("__raw", raw(lake, &ctx, &name, &meta, None, &who.scope).await?.into_view())?;
     let cols = meta.columns().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
     let sql = match meta.merge.is_empty() {
         // Upsert table: the newest version of the key wins (no window over the whole table).
@@ -1210,13 +1215,14 @@ fn held_session(mut r: Response, session: Option<&str>, at: Option<&crate::temp:
 /// `GET /secrets/{name}`: a secret's values (`CREATE SECRET`), for a Python procedure's own code
 /// (`pondra.secret`) and nothing else: the token must be one lent to a procedure while it runs.
 /// The values are kept out of what that procedure says (its notices, its error, the run log).
-async fn secret(State(app): State<App>, Path(name): Path<String>, headers: axum::http::HeaderMap) -> Result<Json<Value>, E> {
+async fn secret(State(app): State<App>, who: Option<axum::Extension<crate::auth::Principal>>, Path(name): Path<String>, headers: axum::http::HeaderMap) -> Result<Json<Value>, E> {
+    let who = signed_of(who);
     let credential = crate::auth::Credential::of_headers(&headers);
     let token = credential.token();
     if crate::auth::lent(&app.lake, token).is_none() {
         return Err(E(crate::codes::coded("42501", "only a procedure's code reads a secret: pondra.secret(name), in a Python procedure")));
     }
-    let values = crate::ext::reveal(&app.lake, &name.to_lowercase()).await?;
+    let values = crate::ext::reveal(&app.lake, &name.to_lowercase(), &who.scope).await?;
     crate::auth::revealed(&app.lake, token, values.iter().filter(|(k, _)| *k != "type" && *k != "scope").map(|(_, v)| v.clone()));
     Ok(Json(j!(values)))
 }

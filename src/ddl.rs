@@ -589,7 +589,7 @@ async fn carry_out(lake: &Lake, d: Ddl, by: &crate::auth::Principal) -> Result<V
             let (dir, created) = match read_only {
                 true => {
                     let dir = full(&dir)?;
-                    crate::ext::reach(lake, &dir, true, endpoint.as_deref()).await?; // (its key and its server, before it is opened)
+                    crate::ext::reach(lake, &dir, true, endpoint.as_deref(), &by.scope).await?; // (its key and its server, before it is opened)
                     dropped_here(&dir, &name, Some(&lake.node.reaches)).await?; // (read with that key: this node's own may not reach its bucket)
                     if !has_catalog(&dir, Some(&lake.node.reaches)).await? {
                         return Err(crate::codes::coded("58P01", format!("{dir} holds no lake: a READ_ONLY attachment reads one that is there")));
@@ -609,7 +609,7 @@ async fn carry_out(lake: &Lake, d: Ddl, by: &crate::auth::Principal) -> Result<V
             })
         }
         Ddl::CreateDatabase { name, if_not_exists, dir, clone: Some(of) } => crate::branch::create(lake, &name, if_not_exists, dir, of, by).await,
-        Ddl::Branch(m) => crate::branch::make(lake, m).await,
+        Ddl::Branch(m) => crate::branch::make(lake, m, &by.scope).await,
         Ddl::Pin { lake: branch, ms, lease } => crate::branch::pin(lake, &branch, ms, lease, Some(by)).await,
         Ddl::Unpin { lake: branch } => crate::branch::unpin(lake, &branch).await,
         Ddl::Refresh { .. } => bail!("ALTER DATABASE … REFRESH is done by its database's leader (write::handle)"),
@@ -714,8 +714,8 @@ async fn carry_out(lake: &Lake, d: Ddl, by: &crate::auth::Principal) -> Result<V
             ensure!(!has_schema(lake, &name).await?, "a schema here is called {name}: attach under another name");
             ensure!(lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_none(), "{name} is an attached lake: attach under another name");
             match connection {
-                Some(c) => crate::ext::attach_connection(lake, &name, &c).await,
-                None => crate::ext::attach(lake, &name, &url, &kind, options).await,
+                Some(c) => crate::ext::attach_connection(lake, &name, &c, &by.scope).await,
+                None => crate::ext::attach(lake, &name, &url, &kind, options, &by.scope).await,
             }
         }
         Ddl::Detach { name, if_exists } => {
@@ -1041,7 +1041,7 @@ pub async fn sync(lake: &Lake, follow: bool) -> Result<()> {
             continue;
         }
         if a.read_only {
-            if let Err(e) = crate::ext::reach(lake, &a.dir, true, a.endpoint.as_deref()).await {
+            if let Err(e) = crate::ext::reach(lake, &a.dir, true, a.endpoint.as_deref(), &crate::auth::Principal::node().scope).await {
                 eprintln!("attaching {name} ({}): {e:#}", a.dir);
                 continue;
             }

@@ -3,16 +3,16 @@
 # DataFusion spawns keeps it)
 node apply.rs 1
 node backup.rs 2
-node branch.rs 2
+node branch.rs 3
 node cache.rs 1
 node cli.rs 1
 node cluster.rs 7
 node constraints.rs 5
 node dbserver.rs 2
-node ddl.rs 6
+node ddl.rs 7
 node defaults.rs 1
 node extension.rs 1
-node feeds.rs 3
+node feeds.rs 4
 node files.rs 1
 node format.rs 2
 node fresh.rs 1
@@ -38,12 +38,12 @@ node server.rs 1
 node spmd.rs 2
 node store.rs 3
 node terms.rs 1
+node tier.rs 1
 node txn.rs 1
 node users.rs 2
 node views.rs 9
 node write.rs 1
 reads engine.rs 1
-reads ext.rs 3
 reads iceberg.rs 1
 reads iceberg_rest.rs 3
 reads path.rs 1

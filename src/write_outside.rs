@@ -25,7 +25,7 @@ const FILE_BYTES: usize = 128 << 20; // (a file this big is closed, and another 
 /// statement's asker).
 pub async fn insert(lake: &Lake, table: &str, name: &str, names: Option<Vec<String>>, query: &str, job: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let spec = crate::ext_names::spec(table).context("not another engine's table")?;
-    crate::ext::check(lake, &spec).await?; // (written by whoever may read it: a secret covering it, or the node's owner)
+    crate::ext::check(lake, &spec, scope).await?; // (written by whoever may read it: a secret covering it, or the node's owner)
     let rows = Rows::Insert { name: name.to_string(), names, query: query.to_string() };
     match spec.format.as_str() {
         "delta" => delta(lake, spec.urls[0].trim_end_matches('/'), rows, job, false, scope).await,
@@ -62,13 +62,13 @@ impl Rows {
 
 /// The columns of another engine's table (`ext_names` spec `target`), as SQL names them, in the table's order: what a guest's
 /// INSERT that names some of them fills the rest of with NULL (`write::run`'s column list), as its format keeps no DEFAULT.
-pub async fn columns(lake: &Lake, target: &str) -> Result<Vec<String>> {
+pub async fn columns(lake: &Lake, target: &str, scope: &crate::rights::Scope) -> Result<Vec<String>> {
     let spec = crate::ext_names::spec(target).context("not another engine's table")?;
-    crate::ext::check(lake, &spec).await?; // (its columns are read by whoever may write it, as its rows are: `insert`)
+    crate::ext::check(lake, &spec, scope).await?; // (its columns are read by whoever may write it, as its rows are: `insert`)
     let url = spec.urls[0].trim_end_matches('/');
     Ok(match spec.format.as_str() {
-        "delta" => read_delta::schema(url, &read_delta::replay(lake, url, None).await?.metadata)?.0.into_iter().map(|(_, logical, _)| logical).collect(),
-        "iceberg" => crate::read_iceberg::schema_of(&crate::read_iceberg::current(lake, url, &spec.options).await?.1)?.1.into_iter().map(|(n, ..)| n).collect(),
+        "delta" => read_delta::schema(url, &read_delta::replay(&crate::ext::Asking { lake, scope }, url, None).await?.metadata)?.0.into_iter().map(|(_, logical, _)| logical).collect(),
+        "iceberg" => crate::read_iceberg::schema_of(&crate::read_iceberg::current(lake, url, &spec.options, scope).await?.1)?.1.into_iter().map(|(n, ..)| n).collect(),
         f => bail!("INSERT into {f} files: into a table attached as delta or iceberg"),
     })
 }
@@ -87,7 +87,7 @@ const DELTA_WRITES: &[&str] = &["appendOnly", "invariants", "checkConstraints", 
 pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, df: datafusion::prelude::DataFrame, to: &str, format: &str, append: bool, overwrite: bool, job: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let root = crate::ddl::full(to)?; // (a folder named relatively: from where the node runs; Iceberg's location is absolute)
     let root = root.as_str();
-    let (store, dir) = crate::ext::store(lake, &format!("{root}/")).await?;
+    let (store, dir) = crate::ext::store(lake, &format!("{root}/"), scope).await?;
     let there: Vec<object_store_df::ObjectMeta> = match futures::TryStreamExt::try_collect(store.list(Some(&dir))).await {
         Err(object_store_df::Error::NotFound { .. }) => vec![],
         r => r?,
@@ -109,9 +109,9 @@ pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, 
                 }
                 _ => ("metadata/v1.metadata.json", crate::iceberg::empty(root, &columns, now).with_context(|| format!("COPY … TO {to}: a column's type has no Iceberg equivalent"))?.to_string()),
             };
-            ensure!(put_new(lake, &format!("{root}/{file}"), body.into_bytes()).await?, "COPY … TO {to}: another writer made a table there at the same time");
+            ensure!(put_new(lake, &format!("{root}/{file}"), body.into_bytes(), scope).await?, "COPY … TO {to}: another writer made a table there at the same time");
             if format == "iceberg" {
-                let (store, hint) = crate::ext::store(lake, &format!("{root}/metadata/version-hint.text")).await?;
+                let (store, hint) = crate::ext::store(lake, &format!("{root}/metadata/version-hint.text"), scope).await?;
                 object_store_df::ObjectStoreExt::put(&store, &hint, "1".into()).await?;
             }
         }
@@ -126,9 +126,9 @@ pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, 
 /// Rows into a Delta table: added, or (`replace`) instead of its rows.
 async fn delta(lake: &Lake, root: &str, rows: Rows, job: &str, replace: bool, scope: &crate::rights::Scope) -> Result<Value> {
     let app = format!("pondra:{job}");
-    let log = read_delta::replay(lake, root, None).await?;
+    let log = read_delta::replay(&crate::ext::Asking { lake, scope }, root, None).await?;
     if let Some(&v) = log.txns.get(&app) {
-        return delta_duplicate(lake, root, &app, v).await;
+        return delta_duplicate(lake, root, &app, v, scope).await;
     }
     delta_writable(root, &log)?;
     let (columns, partitions, mapped) = read_delta::schema(root, &log.metadata)?;
@@ -162,7 +162,7 @@ async fn delta(lake: &Lake, root: &str, rows: Rows, job: &str, replace: bool, sc
         }).collect())
     };
     let keep: Vec<usize> = (0..target.len()).filter(|i| !partition_at.contains(i)).collect();
-    let written = write_files(lake, root, "", df, &fit, Arc::new(Schema::new(file_fields)), &keep, &parts).await?;
+    let written = write_files(lake, root, "", df, &fit, Arc::new(Schema::new(file_fields)), &keep, &parts, scope).await?;
     let rows: u64 = written.iter().map(|w| w.rows).sum();
     let bytes: u64 = written.iter().map(|w| w.bytes).sum();
     let now = crate::log::now_ms();
@@ -177,7 +177,7 @@ async fn delta(lake: &Lake, root: &str, rows: Rows, job: &str, replace: bool, sc
                               "isBlindAppend": !replace, "engineInfo": format!("Pondra/{}", env!("CARGO_PKG_VERSION")), "txnId": uuid::Uuid::new_v4().to_string(),
                               "operationMetrics": {"numFiles": written.len().to_string(), "numOutputRows": rows.to_string(), "numOutputBytes": bytes.to_string()}});
         if last.metadata["configuration"]["delta.enableInCommitTimestamps"].as_str() == Some("true") {
-            info["inCommitTimestamp"] = json!(now.max(previous_ict(lake, root, version - 1).await? + 1)); // (its commits' times only grow)
+            info["inCommitTimestamp"] = json!(now.max(previous_ict(lake, root, version - 1, scope).await? + 1)); // (its commits' times only grow)
         }
         // (replacing the rows: every file the table has now is removed, deletion vector and all)
         let removes = last.live().filter(|_| replace).map(|a| {
@@ -189,13 +189,13 @@ async fn delta(lake: &Lake, root: &str, rows: Rows, job: &str, replace: bool, sc
         });
         let actions = std::iter::once(json!({"commitInfo": info})).chain([json!({"txn": {"appId": app, "version": 0, "lastUpdated": now}})]).chain(removes).chain(adds.iter().cloned());
         let body = actions.map(|a| a.to_string()).collect::<Vec<_>>().join("\n") + "\n";
-        match put_new(lake, &format!("{root}/_delta_log/{version:020}.json"), body.into_bytes()).await? {
+        match put_new(lake, &format!("{root}/_delta_log/{version:020}.json"), body.into_bytes(), scope).await? {
             true => return Ok(json!({"rows": rows, "version": version})),
             false => {
                 // Another writer took this version: after it, unless it changed what we wrote for.
-                let newer = read_delta::replay(lake, root, None).await?;
+                let newer = read_delta::replay(&crate::ext::Asking { lake, scope }, root, None).await?;
                 if let Some(&v) = newer.txns.get(&app) {
-                    return delta_duplicate(lake, root, &app, v).await;
+                    return delta_duplicate(lake, root, &app, v, scope).await;
                 }
                 ensure!(newer.metadata["schemaString"] == last.metadata["schemaString"] && newer.metadata["partitionColumns"] == last.metadata["partitionColumns"] && newer.protocol == last.protocol,
                         "{root}: the table's schema or protocol changed while this INSERT wrote: run it again");
@@ -209,8 +209,8 @@ async fn delta(lake: &Lake, root: &str, rows: Rows, job: &str, replace: bool, sc
 /// The answer to a job whose commit is in the log at `version`: its rows as that commit wrote them, so a retry's `COPY n` is
 /// the rows its committed try wrote. A checkpoint names a txn's version only as the checkpoint's own, so the commit there is
 /// read only if it holds this job's txn; `rows` is left out (not 0) when it can't be read.
-async fn delta_duplicate(lake: &Lake, root: &str, app: &str, version: u64) -> Result<Value> {
-    let actions = read_delta::commit_at(lake, root, version).await?.unwrap_or_default();
+async fn delta_duplicate(lake: &Lake, root: &str, app: &str, version: u64, scope: &crate::rights::Scope) -> Result<Value> {
+    let actions = read_delta::commit_at(&crate::ext::Asking { lake, scope }, root, version).await?.unwrap_or_default();
     let rows = actions.iter().any(|a| a["txn"]["appId"].as_str() == Some(app)).then(|| commit_rows(&actions)).flatten();
     Ok(match rows {
         Some(rows) => json!({"rows": rows, "version": version, "duplicate": true}),
@@ -295,11 +295,11 @@ fn read_delta_fields(metadata: &Value) -> Result<HashMap<String, Value>> {
 }
 
 /// The last commit's in-commit timestamp (Delta's `inCommitTimestamp`), or 0.
-async fn previous_ict(lake: &Lake, root: &str, version: i64) -> Result<u64> {
+async fn previous_ict(lake: &Lake, root: &str, version: i64, scope: &crate::rights::Scope) -> Result<u64> {
     if version < 0 {
         return Ok(0);
     }
-    let body = crate::reach::get(lake, &format!("{root}/_delta_log/{version:020}.json")).await?;
+    let body = crate::reach::get(&crate::ext::Asking { lake, scope }, &format!("{root}/_delta_log/{version:020}.json")).await?;
     let first: Value = serde_json::from_slice(body.split(|b| *b == b'\n').next().unwrap_or_default()).unwrap_or_default();
     Ok(first["commitInfo"]["inCommitTimestamp"].as_u64().unwrap_or(0))
 }
@@ -396,7 +396,7 @@ pub struct Written {
 
 /// The rows as Parquet files under `root` (in `dir`, then each partition's folder): the columns
 /// `keep` of each batch, as `schema`; files closed at `FILE_BYTES`.
-pub async fn write_files(lake: &Lake, root: &str, dir: &str, df: datafusion::prelude::DataFrame, fit: &Fit, schema: SchemaRef, keep: &[usize], parts: &(dyn Fn(&RecordBatch) -> Result<Vec<Part>> + Send + Sync)) -> Result<Vec<Written>> {
+pub async fn write_files(lake: &Lake, root: &str, dir: &str, df: datafusion::prelude::DataFrame, fit: &Fit, schema: SchemaRef, keep: &[usize], parts: &(dyn Fn(&RecordBatch) -> Result<Vec<Part>> + Send + Sync), scope: &crate::rights::Scope) -> Result<Vec<Written>> {
     use datafusion::parquet::basic::Compression;
     use datafusion::parquet::file::properties::WriterProperties;
     let props = || WriterProperties::builder().set_compression(Compression::SNAPPY).build(); // (read by every engine)
@@ -416,17 +416,17 @@ pub async fn write_files(lake: &Lake, root: &str, dir: &str, df: datafusion::pre
             w.1 += piece.num_rows() as u64;
             if w.0.bytes_written() + w.0.in_progress_size() > FILE_BYTES {
                 let (writer, rows, values) = open.remove(&p.folder).expect("open");
-                out.push(finish(lake, root, &format!("{dir}{}", p.folder), writer, rows, values, &schema).await?);
+                out.push(finish(lake, root, &format!("{dir}{}", p.folder), writer, rows, values, &schema, scope).await?);
             }
         }
     }
     for (folder, (writer, rows, values)) in open {
-        out.push(finish(lake, root, &format!("{dir}{folder}"), writer, rows, values, &schema).await?);
+        out.push(finish(lake, root, &format!("{dir}{folder}"), writer, rows, values, &schema, scope).await?);
     }
     Ok(out)
 }
 
-async fn finish(lake: &Lake, root: &str, folder: &str, w: ArrowWriter<Vec<u8>>, rows: u64, values: Value, schema: &SchemaRef) -> Result<Written> {
+async fn finish(lake: &Lake, root: &str, folder: &str, w: ArrowWriter<Vec<u8>>, rows: u64, values: Value, schema: &SchemaRef, scope: &crate::rights::Scope) -> Result<Written> {
     use datafusion::parquet::arrow::arrow_reader::statistics::StatisticsConverter;
     let mut w = w;
     let footer = w.finish()?;
@@ -446,7 +446,7 @@ async fn finish(lake: &Lake, root: &str, folder: &str, w: ArrowWriter<Vec<u8>>, 
     }
     let path = format!("{folder}pondra-{}.parquet", uuid::Uuid::new_v4());
     let bytes = buf.len() as u64;
-    ensure!(put_new(lake, &format!("{root}/{path}"), buf).await?, "{root}/{path} is there already");
+    ensure!(put_new(lake, &format!("{root}/{path}"), buf, scope).await?, "{root}/{path} is there already");
     Ok(Written { path, bytes, rows, values, ranges, nulls })
 }
 
@@ -486,8 +486,8 @@ fn delta_not_null(metadata: &Value) -> Result<std::collections::HashSet<String>>
 }
 
 /// Write an object only if nothing is there: false if something is (another writer won).
-pub async fn put_new(lake: &Lake, url: &str, body: Vec<u8>) -> Result<bool> {
-    let (store, path) = crate::ext::store(lake, url).await?;
+pub async fn put_new(lake: &Lake, url: &str, body: Vec<u8>, scope: &crate::rights::Scope) -> Result<bool> {
+    let (store, path) = crate::ext::store(lake, url, scope).await?;
     let opts = object_store_df::PutOptions { mode: object_store_df::PutMode::Create, ..Default::default() };
     match store.put_opts(&path, body.into(), opts).await {
         Ok(_) => Ok(true),
@@ -504,7 +504,7 @@ pub async fn put_new(lake: &Lake, url: &str, body: Vec<u8>) -> Result<bool> {
 /// …`replace`: the snapshot holds only the new files (an overwrite).
 pub async fn iceberg(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &str, replace: bool, scope: &crate::rights::Scope) -> Result<Value> {
     let url = spec.urls[0].trim_end_matches('/');
-    let (at, meta, d) = crate::read_iceberg::current(lake, url, &spec.options).await?;
+    let (at, meta, d) = crate::read_iceberg::current(lake, url, &spec.options, scope).await?;
     crate::catalogs::within(d, written(lake, spec, rows, job, replace, at, meta, scope)).await
 }
 
@@ -522,7 +522,7 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &s
     ensure!(format == 2, "{url}: Iceberg format v{format} tables aren't written yet (v2 are)");
     let location = meta["location"].as_str().context("a table without its location")?.trim_end_matches('/').to_string();
     // (named by the table's metadata, wherever it likes: written only where the caller may write, as its files are read)
-    crate::ext::check_urls(lake, &[format!("{location}/data/").as_str(), format!("{location}/metadata/").as_str()]).await?;
+    crate::ext::check_urls(lake, &[format!("{location}/data/").as_str(), format!("{location}/metadata/").as_str()], scope).await?;
     let (schema_json, columns) = crate::read_iceberg::schema_of(&meta)?;
     let df = rows.frame(lake, &columns.iter().map(|(n, ..)| n.clone()).collect::<Vec<_>>(), scope).await?;
     let required: Vec<Option<String>> = columns.iter().map(|(n, ..)| schema_json["fields"].as_array().into_iter().flatten().any(|f| f["name"] == n.as_str() && f["required"] == true).then(|| n.clone())).collect();
@@ -550,7 +550,7 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &s
         Ok(groups.into_iter().map(|(folder, (rows, values))| Part { folder, rows: UInt32Array::from(rows), values }).collect())
     };
     let keep: Vec<usize> = (0..target.len()).collect();
-    let written = write_files(lake, &location, "data/", df, &fit, Arc::new(Schema::new(target.clone())), &keep, &parts).await?;
+    let written = write_files(lake, &location, "data/", df, &fit, Arc::new(Schema::new(target.clone())), &keep, &parts, scope).await?;
     let rows: u64 = written.iter().map(|w| w.rows).sum();
     let ids: HashMap<&str, i64> = columns.iter().map(|(n, id, _)| (n.as_str(), *id)).collect();
     let wrote_for = (meta["current-schema-id"].clone(), spec_id); // (the schema and spec the files are written by)
@@ -576,15 +576,15 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &s
         let manifest = crate::avro::write(&crate::iceberg::entry_schema_with(partition_avro.clone()), &avro_meta, &entries)?;
         let manifest_path = format!("{location}/metadata/{}-m0.avro", uuid::Uuid::new_v4());
         let manifest_len = manifest.len();
-        ensure!(put_new(lake, &manifest_path, manifest).await?, "{manifest_path} is there already");
+        ensure!(put_new(lake, &manifest_path, manifest, scope).await?, "{manifest_path} is there already");
         // The manifest list: the current snapshot's manifests, and the new one.
         let current = meta["current-snapshot-id"].as_i64().filter(|id| *id >= 0);
         let snapshot = |id: i64| meta["snapshots"].as_array().into_iter().flatten().find(|s| s["snapshot-id"].as_i64() == Some(id)).cloned();
         let mut list = match current.and_then(snapshot).filter(|_| !replace) {
             Some(s) => {
                 let list = s["manifest-list"].as_str().context("a snapshot without its manifest list")?;
-                crate::ext::check_url(lake, list).await?; // (named by the table's metadata, wherever it likes: the caller's to read, as `read_iceberg` asks)
-                crate::avro::records(&crate::reach::get(lake, list).await?)?
+                crate::ext::check_url(lake, list, scope).await?; // (named by the table's metadata, wherever it likes: the caller's to read, as `read_iceberg` asks)
+                crate::avro::records(&crate::reach::get(&crate::ext::Asking { lake, scope }, list).await?)?
             }
             None => vec![],
         };
@@ -595,14 +595,14 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &s
         let list_meta = [("snapshot-id", snapshot_id.to_string()), ("parent-snapshot-id", current.map_or("null".into(), |c| c.to_string())), ("sequence-number", seq.to_string()), ("format-version", "2".into())];
         let list_body = crate::avro::write(&list_schema, &list_meta, &list)?;
         let list_path = format!("{location}/metadata/snap-{snapshot_id}-1-{}.avro", uuid::Uuid::new_v4());
-        ensure!(put_new(lake, &list_path, list_body).await?, "{list_path} is there already");
+        ensure!(put_new(lake, &list_path, list_body, scope).await?, "{list_path} is there already");
         let total = |k: &str, add: u64| -> String { (current.and_then(snapshot).filter(|_| !replace).and_then(|s| s["summary"][k].as_str().and_then(|v| v.parse::<u64>().ok())).unwrap_or(0) + add).to_string() };
         let snap = json!({"snapshot-id": snapshot_id, "parent-snapshot-id": current, "sequence-number": seq, "timestamp-ms": now, "manifest-list": list_path,
                           "schema-id": meta["current-schema-id"], "summary": {"operation": if replace { "overwrite" } else { "append" }, "added-data-files": written.len().to_string(), "added-records": rows.to_string(),
                           "added-files-size": written.iter().map(|w| w.bytes).sum::<u64>().to_string(), "total-records": total("total-records", rows),
                           "total-data-files": total("total-data-files", written.len() as u64), "pondra.job": job}});
         let committed = match rest {
-            true => crate::read_iceberg::rest_commit(lake, url, &spec.options, current, &snap).await?,
+            true => crate::read_iceberg::rest_commit(lake, url, &spec.options, current, &snap, scope).await?,
             false => {
                 let mut next = meta.clone();
                 next["last-sequence-number"] = json!(seq);
@@ -612,7 +612,7 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &s
                 push(&mut next, "snapshot-log", json!({"snapshot-id": snapshot_id, "timestamp-ms": now}));
                 push(&mut next, "metadata-log", json!({"metadata-file": at, "timestamp-ms": meta["last-updated-ms"]}));
                 next["refs"]["main"] = json!({"snapshot-id": snapshot_id, "type": "branch"});
-                crate::read_iceberg::commit_file(lake, url, &at, &next).await?
+                crate::read_iceberg::commit_file(lake, url, &at, &next, scope).await?
             }
         };
         if committed {
@@ -620,7 +620,7 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &s
         }
         // Another writer committed first: on top of theirs (our files stay; the lists are new), unless it changed what we
         // wrote for (the files' columns and partitions are the schema's and spec's we read), as a Delta table's INSERT is.
-        (at, meta, _) = crate::read_iceberg::current(lake, url, &spec.options).await?;
+        (at, meta, _) = crate::read_iceberg::current(lake, url, &spec.options, scope).await?;
         if let Some(s) = done(&meta, job) {
             return Ok(iceberg_duplicate(s));
         }

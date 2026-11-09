@@ -184,7 +184,8 @@ pub fn rebase_file(f: &mut crate::store::DataFile, id: &str) {
 }
 
 /// Lake::open: the bases a branch reads, so its paths resolve (`Lake::full`, `Lake::object`). A base
-/// on another server is read with the bucket key its branch keeps (ADR-058).
+/// on another server is read with the bucket key its branch keeps (ADR-058), as the node's own work: the branch's maker
+/// was asked for it when the branch was made (`make`), and the lake is opened once for whoever asks next.
 pub async fn load(lake: &Lake) -> Result<()> {
     if let Some(b) = lake.cat.get::<Bases>(BASES).await? {
         // (a backup keeps its bases' files as its own, under `data/_bases` (`backup::place`): one whose catalog names a base
@@ -201,7 +202,7 @@ pub async fn load(lake: &Lake) -> Result<()> {
         };
         for (id, base) in b.lakes {
             if base.read_only {
-                crate::ext::reach_base(&lake.node.reaches, &secrets, &base.url, base.endpoint.as_deref())?;
+                crate::ext::reach_base(&lake.node.reaches, &secrets, &base.url, base.endpoint.as_deref(), &crate::auth::Principal::node().scope)?;
             }
             lake.add_base(&id, &base.url)?;
         }
@@ -633,14 +634,14 @@ pub async fn seal_keys(lake: &Lake) -> Result<()> {
 /// its own branches), the base's files listed where they are, its log tail copied, and the
 /// counters (commits, segments, row ids) carried on, so rows keep their `_row_id` and `_version`
 /// and what the branch writes numbers after them.
-pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
+pub async fn make(lake: &Lake, m: Make, scope: &crate::rights::Scope) -> Result<Value> {
     if let Some(b) = lake.cat.get::<Bases>(BASES).await? {
         ensure!(b.base == m.base, "{} is a branch of {} already", lake.url, b.base);
         return Ok(j!({"branch": lake.url, "of": m.base, "unchanged": true})); // (asked again: done)
     }
     ensure!(lake.cat.scan_raw("t/", "t0").await?.is_empty(), "{} holds tables: a branch is made into a new database", lake.url);
     for b in m.lakes.values().filter(|b| b.read_only) {
-        crate::ext::reach_base(&lake.node.reaches, &m.secrets, &b.url, b.endpoint.as_deref())?; // (its key and its leader, before it is read)
+        crate::ext::reach_base(&lake.node.reaches, &m.secrets, &b.url, b.endpoint.as_deref(), scope)?; // (its key and its leader, before it is read)
     }
     let base = Lake::open(&m.base, false, false, lake.node.clone()).await.with_context(|| format!("opening {}", m.base))?;
     let id = id_of(&m.base);
@@ -918,7 +919,7 @@ pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::syn
     for t in &all {
         let mut meta: TableMeta = serde_json::from_slice(&snap[&table_key(t)]).with_context(|| t.clone())?;
         let tail = match meta.tiered < end {
-            true => crate::tier::fold_into(&base, lake, t, &meta, meta.tiered, end).await?,
+            true => crate::tier::fold_into(&base, lake, t, &meta, meta.tiered, end, &asker.scope).await?,
             false => vec![],
         };
         listed(&mut meta, &id);

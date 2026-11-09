@@ -1793,7 +1793,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         Stmt::InsertInto(t, names, query) => match crate::ext::outside_target(&app.lake, &t).await? {
             // (another engine's table: its writer places the list in the schema it writes by, `write_outside::Rows`; a guest's,
             // sent through the inbox, is placed here: the columns the list leaves out are NULL, as its format keeps no DEFAULT)
-            Some(target) if inbox => Stmt::Insert(t.clone(), crate::rules::rows::rows_for(&t, &crate::write_outside::columns(&app.lake, &target).await?, &names, &query, &|_| None, &by.scope)?),
+            Some(target) if inbox => Stmt::Insert(t.clone(), crate::rules::rows::rows_for(&t, &crate::write_outside::columns(&app.lake, &target, &by.scope).await?, &names, &query, &|_| None, &by.scope)?),
             Some(_) => Stmt::InsertInto(t, names, query),
             None => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query, &by.scope).await?),
         },
@@ -1919,7 +1919,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
             // A CREATE TABLE … AS FROM a Parquet file keeps its row groups, or the rows are written as always (`keep_load`).
             let to = app.to();
             let stamped = stamp(lake, &table, Some(&to)).await?;
-            let f = match crate::keep_load::kept(lake, lake, &table, query, &job, stored.as_ref(), stamped).await {
+            let f = match crate::keep_load::kept(&crate::ext::Asking { lake, scope: &by.scope }, lake, &table, query, &job, stored.as_ref(), stamped).await {
                 Some(f) => Some(f),
                 None => {
                     match everywhere(app, &table, query, &job, stamped, &to, files || meta.is_none(), &by.scope).await? {
@@ -2131,7 +2131,7 @@ async fn everywhere(app: &crate::app::App, table: &str, query: &str, job: &str, 
     if recorded(&app.lake, job).await? {
         return Ok(Some(None));
     }
-    match crate::spmd::insert(&app.lake, &app.members.nodes(), app.members.me(), &query, table, stamp.map(|r| (r, to))).await {
+    match crate::spmd::insert(&app.lake, &app.members.nodes(), app.members.me(), &query, table, stamp.map(|r| (r, to)), scope).await {
         Ok(Some((columns, files))) => Ok(Some(Some(Files { table: table.into(), job: job.into(), columns, files, placed: crate::log::placed_for(table) }))),
         Ok(None) => Ok(None),
         Err(e) => {
@@ -2368,7 +2368,7 @@ async fn ddl_listed(app: &crate::app::App, ddls: Vec<crate::ddl::Ddl>, job: &str
         crate::branch::door(lake, &mut d, by).await?;
         out = match &d {
             crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. } => crate::backup::statement(lake, lock, d.clone(), &by.scope).await?,
-            crate::ddl::Ddl::FetchExtension { .. } => crate::extension::fetch(lake, lock, d.clone(), &by.name).await?,
+            crate::ddl::Ddl::FetchExtension { .. } => crate::extension::fetch(lake, lock, d.clone(), &by.name, &by.scope).await?,
             _ if app.members.by_inbox() => through_bucket_one(lake, Stmt::Ddl(vec![d.clone()]), job, files, &by.scope).await?,
             _ => match &app.seq {
                 Some(seq) => ddl_here(lake, seq, &app.lock, d.clone(), by).await?,
@@ -2543,7 +2543,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
         }
         (_, Stmt::Insert(_, sql)) => {
             let stamped = stamp(target, table, None).await?;
-            if let Some(f) = crate::keep_load::kept(query, target, table, sql, job, stored.as_ref(), stamped).await {
+            if let Some(f) = crate::keep_load::kept(&crate::ext::Asking { lake: query, scope }, target, table, sql, job, stored.as_ref(), stamped).await {
                 return Ok(Some(Request::Files(f))); // (a Parquet file's row groups kept: `keep_load`)
             }
             let ctx = open(session_for(query, sql, "", None, scope).await?);
@@ -2571,7 +2571,7 @@ pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
 pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>, d: crate::ddl::Ddl, by: &crate::auth::Principal) -> Result<Value> {
     match d {
         crate::ddl::Ddl::Refresh { database, tables } => crate::branch::refresh(lake, seq, lock, database, tables, by).await,
-        crate::ddl::Ddl::SetLocation { database, to } => crate::memory::set_location(lake, &database, &to).await, // (copies outside the lake's lock: `memory.rs`)
+        crate::ddl::Ddl::SetLocation { database, to } => crate::memory::set_location(lake, &database, &to, &by.scope).await, // (copies outside the lake's lock: `memory.rs`)
         d @ (crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. }) => crate::backup::statement(lake, Some(lock), d, &by.scope).await, // (a request the leader takes: its own owner, beside its lock)
         d => {
             let _guard = lock.lock().await;
