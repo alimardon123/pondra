@@ -313,6 +313,8 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &sharing_client::SHARING,
         &sparksql::SPARK,
         &engine::ENGINE,
+        #[cfg(feature = "lake")]
+        &extension::EXT_HOST,
         &pg_functions::POSTGRES,
         &matcher::MATCH_RECOGNIZE,
         &measures::SEMANTIC,

@@ -13,7 +13,6 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::disk_manager::{DiskManager, DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::spill_file::{SpillFile, TempFileFactory};
-use datafusion::prelude::{SessionConfig, SessionContext};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
@@ -1833,7 +1832,7 @@ pub struct Lake {
     pub owner_key: std::sync::OnceLock<String>, // the key of the program that started this process's node on the lake (`Auth::owner_key`): what its owner's tasks are signed with (`runs::signed`)
     pub sequences: tokio::sync::Mutex<HashMap<String, crate::seq::Block>>, // the sequences' values this node hands out (`seq::next`)
     bases: std::sync::RwLock<BTreeMap<String, (String, Option<Store>)>>, // a branch's bases (ADR-047): id -> place, and its store once read
-    sessions: Mutex<std::collections::HashMap<usize, datafusion::execution::SessionState>>, // (`session_with`'s, made once a partition count)
+    pub(crate) sessions: Mutex<std::collections::HashMap<usize, datafusion::execution::SessionState>>, // (`engine.rs`'s `Lake::session_with`'s, made once a partition count)
     me: std::sync::Weak<Lake>,
     /// The node it is open in, or the program or test that opened it (`node_state.rs`): its lifecycle, which its catalog's
     /// fence and its vital loops' failures stop or restart, and its doors' drain.
@@ -2606,33 +2605,12 @@ impl Lake {
         Ok(())
     }
 
-    /// A fresh SQL session on the shared runtime (`partitions()` of them).
-    pub fn session(&self) -> SessionContext {
-        self.session_with(partitions())
-    }
-
-    /// A session with a fixed number of partitions: 1 for point lookups, where splitting the work
-    /// costs more than it saves and many queries run at once. Its functions, planners and rules
-    /// are the same for every query, so they are made once (`made`) and copied; each copy gets
-    /// catalogs of its own, so the tables a query registers are its alone.
-    pub fn session_with(&self, partitions: usize) -> SessionContext {
-        spill_room(); // (the spill disk's room as it is now: `Spills` looked at it once, when the first spill made the disk)
-        let state = self.sessions.lock().unwrap().entry(partitions).or_insert_with(|| self.made(partitions).state()).clone();
-        let catalog = datafusion::execution::SessionStateDefaults::default_catalog(state.config(), state.table_factories(), state.runtime_env());
-        let ctx = crate::engine::with_catalog(state, Arc::new(catalog));
-        crate::files::register(&ctx, self.arc()); // files('…'), file_read(path) (here, not in what is kept: the lake would keep itself)
-        crate::seq::register(&ctx, self.arc()); // nextval, currval, setval
-        crate::ext::register_secrets(&ctx, self.arc()); // secrets()
-        crate::extension::register(&ctx, self.arc()); // extensions() (SHOW EXTENSIONS)
-        ctx
-    }
-
     /// A session made from nothing, with everything every query's session has: every function set in the registry
     /// (`engine::session`). On a page every plan it makes runs its partitions in the page's task, as the page's own
     /// session's do (`in_task::planned`): a page has no runtime to start a partition's task on, and a plan of one
     /// partition still merges more than one below it. Plans made by hand from it (`fresh.rs`) are planned by it too.
-    fn made(&self, partitions: usize) -> SessionContext {
-        let config = SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::text::PUBLIC);
+    pub(crate) fn made(&self, partitions: usize) -> datafusion::prelude::SessionContext {
+        let config = datafusion::prelude::SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::text::PUBLIC);
         let ctx = crate::engine::session(config, self.rt.clone());
         #[cfg(target_arch = "wasm32")]
         let ctx = crate::in_task::planned(ctx);
@@ -2872,40 +2850,6 @@ impl Lake {
             c.keep(table, n, rows.clone());
         }
         Ok(rows)
-    }
-
-    /// Rows of `table` a file commit gives the log's readers (`Segment::files`): its files' rows as
-    /// they were then, with their system columns (stored names), from the `from`-th on and `rows`
-    /// of them at most; `removed`: the rows of the files it took out.
-    pub async fn filed_rows(&self, seg: &Segment, table: &str, removed: bool, from: u64, rows: u64) -> Result<Vec<RecordBatch>> {
-        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
-        let meta = crate::sys::with_sys(&meta);
-        let schema = meta.schema()?;
-        let (ctx, end, mut at, mut out) = (self.session(), from.saturating_add(rows), 0u64, vec![]);
-        for f in if removed { &filed.removed } else { &filed.added } {
-            let (lo, hi) = (at.max(from), (at + f.rows).min(end));
-            if lo < hi {
-                out.extend(crate::lake_scan::file_rows(self, &ctx, f, &meta, &schema, crate::lake_scan::Pick::Range(lo - at, hi - at)).await?.collect().await?);
-            }
-            at += f.rows;
-            if at >= end {
-                break;
-            }
-        }
-        out.iter().map(|b| crate::query::conform(b, &schema)).collect()
-    }
-
-    /// Rows of `table` a file commit deleted by position (`Filed::deleted`), with their system
-    /// columns (stored names): each file's rows at the places its new deletes name.
-    pub async fn deleted_rows(&self, seg: &Segment, table: &str) -> Result<Vec<RecordBatch>> {
-        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
-        let meta = crate::sys::with_sys(&meta);
-        let schema = meta.schema()?;
-        let mut out = vec![];
-        for (f, deletes) in &filed.deleted {
-            out.extend(crate::adopt::rows_deleted(self, &meta, f, deletes, &schema).await?);
-        }
-        out.iter().map(|b| crate::query::conform(b, &schema)).collect()
     }
 
     pub async fn delete(&self, path: &str) {

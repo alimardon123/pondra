@@ -60,6 +60,9 @@ jobs:
       - name: Random queries against DuckDB, three nodes and partitions (9 minutes, seed = the date)
         env:
           PONDRA_BIN: ${{ github.workspace }}/bin/pondra
+          # (the front's own checks, as env.rs names this run among the gates': among them each query a node reads
+          # prints as a text that reads back as it means, `parsed::generic`)
+          PONDRA_TEST_CHECKS: "1"
         run: python3 tools/random_sql.py --secs 540 --queries 100000000 --seed "$SEED" --out random.json
       - name: Malformed input at every door (24 s a door, seed = the date)
         if: (success() || failure()) && steps.bin.outcome == 'success' # (whatever the queries found)

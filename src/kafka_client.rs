@@ -21,6 +21,9 @@ pub static KAFKA: crate::registry::BuiltIn = crate::registry::BuiltIn {
         r.section_mut::<crate::records::Prefixes>().add(crate::feeds::PREFIXES);
         #[cfg(feature = "doors")] // (the lake's own Kafka door: its consumer groups read the log, `pins`)
         r.section_mut::<crate::pins::Pins>().add(crate::kafka::readers());
+        r.section_mut::<crate::lake_state::Registered>().add::<Clients>(); // (what a lake keeps for the clusters it reads, and for its own door)
+        #[cfg(feature = "doors")]
+        r.section_mut::<crate::lake_state::Registered>().add::<crate::kafka::Brokers>();
     },
 };
 
@@ -525,17 +528,30 @@ pub fn parse(url: &str) -> Result<(String, String)> {
     Ok((brokers.to_string(), topic.to_string()))
 }
 
+/// What a lake keeps for the Kafka clusters it reads (invariant 301): a client of each, by its brokers and the secret
+/// covering them.
+#[derive(Default)]
+pub struct Clients(std::sync::Mutex<HashMap<String, Arc<Client>>>);
+
+impl crate::lake_state::LakeState for Clients {
+    const NAME: &'static str = "kafka_clients";
+    const ABOUT: &'static str = "a client of each Kafka cluster it reads, by its brokers and the secret covering them";
+    fn make() -> Self {
+        Clients::default()
+    }
+}
+
 /// A client of the cluster at `url`, with the secret covering it (kept: its connections too).
 pub async fn client(lake: &crate::store::Lake, url: &str) -> Result<Arc<Client>> {
-    crate::per_node!(static CLIENTS: std::sync::Mutex<HashMap<String, Arc<Client>>> = Default::default());
     let (brokers, _) = parse(url)?;
     let secret = crate::ext::secret_for(lake, url).await?;
     let key = format!("{brokers}|{}", secret.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()).unwrap_or_default());
-    if let Some(c) = CLIENTS.lock().unwrap().get(&key) {
+    let kept = lake.state::<Clients>()?;
+    if let Some(c) = kept.0.lock().unwrap().get(&key) {
         return Ok(c.clone());
     }
     let c = Arc::new(Client::new(Settings::of(&brokers, secret.as_ref())?));
-    CLIENTS.lock().unwrap().insert(key, c.clone());
+    kept.0.lock().unwrap().insert(key, c.clone());
     Ok(c)
 }
 
