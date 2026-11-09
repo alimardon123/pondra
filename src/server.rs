@@ -58,7 +58,7 @@ pub fn router(app: App) -> Router {
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
         .route("/live", get(crate::live::live).post(crate::live::live))
-        .route("/sessions/{id}", axum::routing::delete(|Path(id): Path<String>| async move { Json(j!({"ended": crate::temp::end(&crate::temp::id(&id))})) }))
+        .route("/sessions/{id}", axum::routing::delete(|Path(id): Path<String>, who: Option<axum::Extension<crate::auth::Principal>>| async move { Json(j!({"ended": crate::temp::end(&crate::temp::id(&who.map(|w| w.0.name).unwrap_or_default(), &id))})) }))
         .route("/sessions/{id}/python", get(session_python).delete(session_python).post(session_python))
         .route("/python", get(list_pythons).put(choose_python))
         .route("/python/format", post(format_python))
@@ -185,8 +185,8 @@ async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result
 /// `GET /sessions/{id}/python`: the variables a session's Python holds, as the console's panel
 /// lists them (none, if it has none yet); `DELETE`: stop it (its variables go; the session's
 /// temporary tables stay), as a notebook's kernel is restarted. An admin's, as Python is.
-async fn session_python(method: axum::http::Method, Path(id): Path<String>, role: axum::Extension<crate::auth::Role>) -> Result<Json<Value>, E> {
-    let id = crate::temp::id(&id); // (as the client's requests name it: its user's)
+async fn session_python(method: axum::http::Method, Path(id): Path<String>, role: axum::Extension<crate::auth::Role>, who: Option<axum::Extension<crate::auth::Principal>>) -> Result<Json<Value>, E> {
+    let id = crate::temp::id(&who.map(|w| w.0.name).unwrap_or_default(), &id); // (as the client's requests name it: its user's)
     if *role < crate::auth::Role::Admin {
         return Err(E(crate::codes::coded("42501", "a session's Python is an admin's, as DO is")));
     }
@@ -528,12 +528,14 @@ async fn to_leader(State(app): State<App>, req: Request, next: Next) -> Response
         None if app.open().await => None, // (an open node: as `nodes_own` says)
         None => return (StatusCode::UNAUTHORIZED, "the leader checks the caller's own sign-in: send an Authorization header").into_response(),
     };
-    proxy(&app.lake.node.net.client(crate::net::Policy::Cluster), &app.members.leader().addr, req, as_caller).await.unwrap_or_else(|e| E(e).into_response())
+    // (the node's own credential is its token, its lake's key when this process has none, which the process's client lacks)
+    let auth = as_caller.or_else(|| app.lake.node.token().and_then(|t| format!("Bearer {t}").parse().ok()));
+    proxy(&app.lake.node.net.client(crate::net::Policy::Cluster), &app.members.leader().addr, req, auth).await.unwrap_or_else(|e| E(e).into_response())
 }
 
-/// Sends `req` to the leader at `addr` with `http`, the node's client for its lake's nodes (`net::Policy::Cluster`).
-/// `as_caller`: the caller's own `Authorization`, which replaces the node's default one (reqwest fills a default header
-/// only when the request lacks it). None: the node's own credential.
+/// Sends `req` to the leader at `addr` with `http`, the process's client for its lake's nodes (`net::Policy::Cluster`).
+/// `as_caller`: the `Authorization` it goes with (the caller's own, or the node's), which replaces the client's default one
+/// (reqwest fills a default header only when the request lacks it). None: the client's own.
 async fn proxy(http: &reqwest::Client, addr: &str, req: Request, as_caller: Option<HeaderValue>) -> anyhow::Result<Response> {
     let (parts, body) = req.into_parts();
     let url = crate::tls::url(&format!("{addr}{}", parts.uri.path_and_query().map_or("", |p| p.as_str())));
@@ -857,9 +859,10 @@ struct AppendParams {
 
 /// Body: NDJSON rows, or an Arrow IPC stream (content-type application/vnd.apache.arrow.stream).
 async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, who: Option<axum::Extension<crate::auth::Principal>>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
-    let (start, scope) = (std::time::Instant::now(), scope_of(who));
+    let who = who.map_or_else(|| crate::auth::Principal::of(crate::auth::Role::None), |w| w.0);
+    let (start, scope) = (std::time::Instant::now(), who.scope.clone());
     let (out, unseen) = crate::rights::noting(append_rows(&app, &name, p, headers, body)).await;
-    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
+    crate::audit::rows(&app, &who, "/append", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -917,7 +920,7 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
         }
     })
     .await;
-    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
+    crate::audit::rows(&app, &who, "/insert", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -1164,7 +1167,7 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
 async fn sql(State(app): State<App>, Query(p): Query<crate::statement::SqlParams>, role: axum::Extension<crate::auth::Role>, who: axum::Extension<crate::auth::Principal>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let format = p.format.clone(); // (an answer handed to the door in pieces is sent in this format)
     let node = app.lake.node.clone(); // (an answer in pieces is in flight until its last piece is read: `pieces`)
-    let said = crate::statement::sql(app, p, role.0, who.0.scope, headers, body).await;
+    let said = crate::statement::sql(app, p, role.0, who.0, headers, body).await;
     let mut r = match said.reply {
         Ok(crate::statement::Reply::Rendered(r)) => respond(r, format.as_deref(), &node),
         Ok(crate::statement::Reply::Done(v)) => Json(v).into_response(),
@@ -1212,7 +1215,7 @@ async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extensi
         Some("capture") => Verb::Capture,
         _ => Verb::Apply,
     };
-    let who = crate::routines::Who { role: role.0, files: crate::statement::owner(&app.auth, &headers), depth: 0, scope: who.0.scope };
+    let who = crate::routines::Who::signed(who.0, role.0, crate::statement::owner(&app.auth, &headers));
     Ok(Json(crate::apply::ask(&app, verb, ask, who).await?))
 }
 

@@ -213,12 +213,9 @@ pub fn get() -> &'static Passes {
     crate::registry::get().section::<Passes>()
 }
 
-/// Whether a pass whose trigger didn't fire is run anyway, and its having something to do refused (`missed`): in a debug
-/// build, and in a node started with `PONDRA_TEST_PASSES` (the gates' runs).
-pub(crate) fn checked() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| cfg!(debug_assertions) || crate::env::is_set("PONDRA_TEST_PASSES"));
-    *ON
-}
+/// Whether a pass whose trigger didn't fire is run anyway, and its having something to do refused (`missed`):
+/// `env::front_checked`.
+pub(crate) fn checked() -> bool { crate::env::front_checked() }
 
 fn missed(p: &Pass, sql: &str) -> String {
     format!("passes: {} had something to do in a text its trigger missed (its words and marks are short of its look): {sql}", p.name)

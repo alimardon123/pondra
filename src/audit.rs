@@ -12,6 +12,7 @@
 //! A statement's quoted values are written as `'***'` when it makes a user, a token or a secret.
 //! Rows reach the log a moment later, in batches, from a writer on each node: nothing waits for it.
 use crate::app::App;
+use crate::auth::Principal;
 use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::Result;
 use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
@@ -256,12 +257,12 @@ impl Refusal for tonic::Status {
 
 /// A statement dropped before it ended, its client gone (a Stop, a closed tab, a timeout): a row of
 /// the history all the same, `stopped`.
-struct Stopped<'a>(Option<(&'a App, &'static str, &'a str, Instant)>);
+struct Stopped<'a>(Option<(&'a App, Option<&'a Principal>, &'static str, &'a str, Instant)>);
 
 impl Drop for Stopped<'_> {
     fn drop(&mut self) {
-        if let Some((app, class, sql, start)) = self.0.take() {
-            crate::history::ended(app, class, sql, "stopped", Some("its client stopped waiting".into()), start.elapsed(), Default::default());
+        if let Some((app, by, class, sql, start)) = self.0.take() {
+            crate::history::ended(app, by, class, sql, "stopped", Some("its client stopped waiting".into()), start.elapsed(), Default::default());
         }
     }
 }
@@ -271,10 +272,10 @@ impl Drop for Stopped<'_> {
 fn refusal(m: &str) -> bool { ["permission denied", "needs a", "needs more rights", "sign in", "quota:"].iter().any(|r| m.contains(r)) }
 
 /// Run one statement a door was sent, within its user's quota (`users::Quota`), writing what
-/// came of it when its class is written (and a refusal always). The lake it was sent to is in
-/// scope while it runs (`ext::rooted`): every door's statement passes here, so each stores a
+/// came of it when its class is written (and a refusal always), as `by` did it (its door's sign-in; none: the node). The lake it was
+/// sent to is in scope while it runs (`ext::rooted`): every door's statement passes here, so each stores a
 /// client's relative LOCATION as the same file of the lake's.
-pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, f: impl Future<Output = std::result::Result<T, E>>) -> std::result::Result<T, E> {
+pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, by: Option<&Principal>, sql: &str, f: impl Future<Output = std::result::Result<T, E>>) -> std::result::Result<T, E> {
     if INSIDE.try_with(|_| ()).is_ok() {
         return f.await;
     }
@@ -282,7 +283,7 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
         return Err(E::refusal("57P03", crate::members::CUT_OFF_SAYS.into())); // (cannot_connect_now: every door's clients retry elsewhere)
     }
     let (class, start, quota) = (class(sql), Instant::now(), crate::users::quota());
-    let mut stopped = Stopped(Some((app, class, sql, start)));
+    let mut stopped = Stopped(Some((app, by, class, sql, start)));
     let ((out, note), unseen) = crate::rights::noting(crate::history::noted(crate::ext::rooted(&app.lake.url, INSIDE.scope((), crate::authored::door(sql, async {
         let _turn = quota.turn().await.map_err(|m| E::refusal("53000", m))?; // (insufficient_resources)
         let flag = Arc::new(AtomicBool::new(false)); // (set if the work is dropped first: a timeout drops it, inside the timeout)
@@ -308,26 +309,26 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
     // failed in its own history, as for a table that isn't: `rights::noting`)
     let logged = if out.is_err() && unseen { "refused" } else { outcome };
     if on() && (written(class) || logged == "refused") {
-        log(app, class, redacted(sql, class), logged, message.clone(), Some(took.as_millis() as i64));
+        log(app, by, class, redacted(sql, class), logged, message.clone(), Some(took.as_millis() as i64));
     }
-    crate::history::ended(app, class, sql, outcome, message, took, note); // (`pondra.history`)
+    crate::history::ended(app, by, class, sql, outcome, message, took, note); // (`pondra.history`)
     out
 }
 
 /// Rows a door took that takes rows, not SQL (`/append`, `/insert`): a line of the audit log as the
 /// INSERT it stands for, when writes are written (`PONDRA_AUDIT=…,write`), and always when refused.
 /// Not a statement, so not in `pondra.history` (an append can come thousands of times a second).
-/// Rows for a table its sender holds no privilege on, or reading one (`unseen`: `rights::noting`), told it isn't there,
-/// are refused too.
-pub fn rows(app: &App, door: &str, table: &str, error: Option<String>, unseen: bool, took: std::time::Duration) {
-    let refused = error.as_deref().is_some_and(|m| refusal(m) || unseen || !crate::rights::scope().knows(&crate::auth::catalog_name(table)));
+/// Rows for a table its sender (`by`) holds no privilege on, or reading one (`unseen`: `rights::noting`), told it isn't
+/// there, are refused too.
+pub fn rows(app: &App, by: &Principal, door: &str, table: &str, error: Option<String>, unseen: bool, took: std::time::Duration) {
+    let refused = error.as_deref().is_some_and(|m| refusal(m) || unseen || !by.scope.knows(&crate::auth::catalog_name(table)));
     let outcome = match (&error, refused) {
         (None, _) => "ok",
         (_, true) => "refused",
         _ => "failed",
     };
     if on() && (written("write") || refused) {
-        log(app, "write", format!("INSERT INTO {table} (rows through {door})"), outcome, error, Some(took.as_millis() as i64));
+        log(app, Some(by), "write", format!("INSERT INTO {table} (rows through {door})"), outcome, error, Some(took.as_millis() as i64));
     }
 }
 
@@ -421,9 +422,9 @@ fn knocked(client: Option<Option<std::net::IpAddr>>, now_ms: u64) -> (Option<boo
 /// A statement a joined page ran, as its node writes it (`page_records::record`, under the sign-in's name, as the door
 /// `page-reported`): its line when its class is written, and always when refused.
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the node's half: `server::records`)
-pub(crate) fn page_statement(app: &App, class: &'static str, sql: &str, outcome: &'static str, message: Option<String>, ms: i64) {
+pub(crate) fn page_statement(app: &App, by: &Principal, class: &'static str, sql: &str, outcome: &'static str, message: Option<String>, ms: i64) {
     if kept(classes(), class, outcome) {
-        log(app, class, redacted(sql, class), outcome, message, Some(ms));
+        log(app, Some(by), class, redacted(sql, class), outcome, message, Some(ms));
     }
 }
 
@@ -448,10 +449,10 @@ pub fn shared(app: &App, recipient: &str, from: Option<std::net::SocketAddr>, wh
     }
 }
 
-fn log(app: &App, class: &'static str, statement: String, outcome: &'static str, message: Option<String>, ms: Option<i64>) {
-    let who = crate::auth::current();
-    let user = who.as_ref().map_or(String::new(), |p| p.name.clone());
-    let (door, from) = who.as_ref().map_or(("node", None), |p| (p.door, p.from.map(|a| a.to_string())));
+/// A line, as `by` did it (none: the node).
+fn log(app: &App, by: Option<&Principal>, class: &'static str, statement: String, outcome: &'static str, message: Option<String>, ms: Option<i64>) {
+    let user = by.map_or(String::new(), |p| p.name.clone());
+    let (door, from) = by.map_or(("node", None), |p| (p.door, p.from.map(|a| a.to_string())));
     write(app, Line { at: crate::log::now_ms(), user, door, from, class, statement, outcome, message, ms });
 }
 

@@ -122,6 +122,8 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add::<crate::tasks::Kept>();
             states.add::<crate::fresh::Plans>();
             states.add::<crate::once::Buckets>();
+            states.add::<crate::routines::Kept>();
+            states.add::<crate::learned::Kept>();
         }
         #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)
         for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::undrop::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,
@@ -184,7 +186,6 @@ fn own(mut ctx: SessionContext) -> SessionContext {
     crate::avg::register(&ctx); // avg(DECIMAL): as sum / count answers it
     crate::string_agg::register(&ctx); // string_agg: one group's string held to a share of the query memory
     crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
-    crate::one_row::register(&ctx); // pondra_one_row(s): a scalar subquery's one row, or 21000
     crate::dialect_fns::register(&ctx); // safe_divide(a, b): BigQuery's, typed by its arguments
     crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
     crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
