@@ -185,15 +185,15 @@ async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result
 /// `GET /sessions/{id}/python`: the variables a session's Python holds, as the console's panel
 /// lists them (none, if it has none yet); `DELETE`: stop it (its variables go; the session's
 /// temporary tables stay), as a notebook's kernel is restarted. An admin's, as Python is.
-async fn session_python(method: axum::http::Method, Path(id): Path<String>, role: axum::Extension<crate::auth::Role>) -> Result<Json<Value>, E> {
+async fn session_python(State(app): State<App>, method: axum::http::Method, Path(id): Path<String>, role: axum::Extension<crate::auth::Role>) -> Result<Json<Value>, E> {
     let id = crate::temp::id(&id); // (as the client's requests name it: its user's)
     if *role < crate::auth::Role::Admin {
         return Err(E(crate::codes::coded("42501", "a session's Python is an admin's, as DO is")));
     }
     Ok(Json(match method {
-        axum::http::Method::DELETE => j!({"restarted": crate::python::end_session(&id)}),
-        axum::http::Method::POST => j!({"done": crate::python::interrupt(&id)}), // (interrupt its running cell)
-        _ => crate::python::variables(&id).await?,
+        axum::http::Method::DELETE => j!({"restarted": crate::python::end_session(&app.lake, &id)}),
+        axum::http::Method::POST => j!({"done": crate::python::interrupt(&app.lake, &id)}), // (interrupt its running cell)
+        _ => crate::python::variables(&app.lake, &id).await?,
     }))
 }
 
@@ -221,10 +221,10 @@ async fn choose_python(axum::extract::ConnectInfo(peer): axum::extract::ConnectI
 
 /// `POST /python/format` `{"code": …}`: the code formatted by the node's Python, as ruff (or black)
 /// formats it: the console's Format for Python files and cells. The code is only read, never run.
-async fn format_python(Json(b): Json<Value>) -> Result<Json<Value>, E> {
+async fn format_python(State(app): State<App>, Json(b): Json<Value>) -> Result<Json<Value>, E> {
     crate::python::ready("Formatting Python uses the node's Python (its ruff or black)")?;
     let head = j!({"op": "format", "code": b["code"].as_str().unwrap_or_default()});
-    let (said, _) = crate::python::ask("", crate::python::Use::Function, head, vec![], Some(std::time::Duration::from_secs(30)), &mut |_| {}).await?;
+    let (said, _) = crate::python::ask(&app.lake, "", crate::python::Use::Function, head, vec![], Some(std::time::Duration::from_secs(30)), &mut |_| {}).await?;
     Ok(Json(j!({"code": said["code"]})))
 }
 
@@ -1352,7 +1352,7 @@ async fn stats(State(app): State<App>, who: Option<axum::Extension<crate::auth::
     let members = &app.members;
     let role = if members.reader() { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
     let mut s = j!({"lake": crate::ddl::lake_name(&app.lake), "role": role, "leader": members.leader().addr, "term": members.leader().n, "nodes": members.nodes(),
-                    "hwm": *app.lake.hwm.borrow(), "shard_runs": crate::tasks::SHARD_RUNS.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(),
+                    "hwm": *app.lake.hwm.borrow(), "shard_runs": crate::tasks::SHARD_RUNS.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(&app.lake),
                     "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
     s["version"] = j!(crate::format::VERSION);
     s["owner"] = j!(crate::statement::owner(&app.lake, &app.auth, &headers)); // (asked with its key: is this the node the asker started? `local()` on a port another node holds)

@@ -144,11 +144,21 @@ pub struct Sessions {
     pub(crate) cursors: Mutex<HashMap<String, HashMap<String, crate::cursors::Cursor>>>,
     /// The leases its procedures' code was lent, by token (`auth::lend`): a token is good at this node alone.
     pub(crate) leases: Mutex<HashMap<String, crate::auth::Lent>>,
+    /// Who keeps something of its sessions' (`Keeps`): weak, gone with them.
+    keepers: Mutex<Vec<std::sync::Weak<dyn Keeps>>>,
+}
+
+/// What an extension keeps for a node's sessions (a session's own Python: `python::Workers`): asked whether it holds a
+/// session's (which then keeps to this node), and told when one ends.
+pub trait Keeps: Send + Sync {
+    fn holds(&self, session: &str) -> bool;
+    /// The session ended: let go of what it kept (true: it kept something).
+    fn end(&self, session: &str) -> bool;
 }
 
 impl Default for Sessions {
     fn default() -> Self {
-        Sessions { all: Default::default(), changes: tokio::sync::watch::channel(0).0, book: Default::default(), cursors: Default::default(), leases: Default::default() }
+        Sessions { all: Default::default(), changes: tokio::sync::watch::channel(0).0, book: Default::default(), cursors: Default::default(), leases: Default::default(), keepers: Default::default() }
     }
 }
 
@@ -240,15 +250,15 @@ impl Sessions {
         let kept = self.all.lock().unwrap().get(session).is_some_and(|x| {
             !(x.tables.is_empty() && x.views.is_empty() && x.routines.is_empty() && x.secrets.is_empty() && x.settings.is_empty() && x.prepared.is_empty() && x.variables.is_empty())
         });
-        kept || crate::txn::held(self, session) || crate::python::held(session)
+        kept || crate::txn::held(self, session) || self.keepers().iter().any(|k| k.holds(session))
     }
 
     /// End a session: its temporary tables and views are gone, and its Python (`python::ask_session`).
     pub fn end(&self, session: &str) -> bool {
         crate::txn::end(self, session); // (its transaction, if open: rolled back)
         crate::cursors::end(self, session); // (its cursors go with it: `cursors.rs`)
-        let python = crate::python::end_session(session); // (its Python's variables too)
-        let gone = self.all.lock().unwrap().remove(session).is_some() || python;
+        let kept = self.keepers().iter().fold(false, |any, k| k.end(session) || any); // (what an extension kept of it: its Python's variables)
+        let gone = self.all.lock().unwrap().remove(session).is_some() || kept;
         if gone {
             self.changes.send_modify(|v| *v += 1);
         }
@@ -257,6 +267,12 @@ impl Sessions {
 
     /// Any of its sessions' temporary tables or views changed (`live.rs` waits on it).
     pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> { self.changes.subscribe() }
+
+    /// An extension that keeps something of the node's sessions' (asked by `holds`, told by `end`), weakly.
+    pub fn keep(&self, k: std::sync::Weak<dyn Keeps>) { self.keepers.lock().unwrap().push(k); }
+
+    /// The keepers still there (the lock is let go before any is asked).
+    fn keepers(&self) -> Vec<Arc<dyn Keeps>> { self.keepers.lock().unwrap().iter().filter_map(std::sync::Weak::upgrade).collect() }
 }
 
 /// How long a session may sit unused (`PONDRA_SESSION_IDLE_SECS`, 3600).

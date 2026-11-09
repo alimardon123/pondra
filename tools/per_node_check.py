@@ -113,6 +113,7 @@ PROCESS = {
     "pg_json_sets.rs:SETS": "the JSON set functions' names and columns, built into the binary",
     "pyfn.rs:SEEN": "SQL type names worked out by a session with nothing of a lake",
     "python.rs:BUSY": LOCK,
+    "python.rs:CHOICE": "how many times this machine's Python was chosen (`choose`), which is the machine's: each lake's workers start again on the new one",
     "python.rs:CHOSEN": "the Python chosen in the console: the machine's, kept in python.txt beside the console's settings",
     "python.rs:EXE": SETTING + " (--python)",
     "python.rs:LOOKING": LOCK,

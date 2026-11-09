@@ -287,7 +287,6 @@ store -> views  1
 store -> wasm32  15
 store -> write  1
 store_wire -> store  1
-temp -> python  2
 terms -> panics  1
 terms -> wasm32  1
 text -> pg_json_make  1

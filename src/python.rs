@@ -169,10 +169,7 @@ pub async fn choose(path: &str) -> Result<Value> {
         let _ = f.parent().map(std::fs::create_dir_all);
         let _ = std::fs::write(f, path);
     }
-    POOLS.lock().unwrap().clear(); // (idle workers stop; busy ones finish first)
-    for s in KERNELS.lock().unwrap().drain().map(|(s, _)| s).collect::<Vec<_>>() {
-        PIDS.lock().unwrap().remove(&s);
-    }
+    CHOICE.fetch_add(1, Ordering::SeqCst); // (each lake's workers start again on it at their next use: `Workers::fresh`)
     Ok(probe)
 }
 
@@ -270,13 +267,65 @@ struct Pool {
     reaping: AtomicBool,
 }
 
-crate::per_node!(static POOLS: Mutex<HashMap<String, Arc<Pool>>> = Default::default());
+/// How many times this machine's Python was chosen (`choose`): each lake's workers start again on a new one at their next use.
+static CHOICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A lake's Python workers: the pools by package list, and each session's own (`ask_session`).
+#[derive(Default)]
+pub struct Workers {
+    pools: Mutex<HashMap<String, Arc<Pool>>>,
+    /// Each session's worker's process id: an interrupt reaches it while a cell holds its slot.
+    pids: Mutex<HashMap<String, u32>>,
+    kernels: Mutex<HashMap<String, (Slot, Instant)>>,
+    chosen: std::sync::atomic::AtomicU64, // (the `CHOICE` its workers started on)
+    joined: std::sync::atomic::AtomicBool, // (told its node's sessions it keeps theirs: `temp::Keeps`)
+}
+
+impl crate::lake_state::LakeState for Workers {
+    const NAME: &'static str = "python";
+    const ABOUT: &'static str = "its Python workers: the pools by package list, and each session's own";
+    fn make() -> Self { Workers::default() }
+}
+
+impl crate::temp::Keeps for Workers {
+    fn holds(&self, session: &str) -> bool { self.kernels.lock().unwrap().contains_key(session) }
+    fn end(&self, session: &str) -> bool { end_in(self, session) }
+}
+
+impl std::fmt::Debug for Workers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("Workers").finish_non_exhaustive() }
+}
+
+/// A lake's Python workers (made at its first use, which tells the lake's sessions it keeps theirs).
+pub fn at(lake: &crate::store::Lake) -> Result<Arc<Workers>> {
+    let w = lake.state::<Workers>()?;
+    if !w.joined.load(Ordering::Relaxed) && !w.joined.swap(true, Ordering::SeqCst) { // (read first: every query's session asks, `pyfn::register`)
+        if let Some(s) = crate::temp::sessions(lake) {
+            let weak: std::sync::Weak<dyn crate::temp::Keeps> = Arc::downgrade(&w) as std::sync::Weak<dyn crate::temp::Keeps>;
+            s.keep(weak);
+        }
+    }
+    w.fresh();
+    Ok(w)
+}
+
+impl Workers {
+    /// A new Python chosen since its workers started: they stop (idle ones now, busy ones when done), and start again on it.
+    fn fresh(&self) {
+        let now = CHOICE.load(Ordering::SeqCst);
+        if self.chosen.swap(now, Ordering::SeqCst) != now {
+            self.pools.lock().unwrap().clear();
+            for s in self.kernels.lock().unwrap().drain().map(|(s, _)| s).collect::<Vec<_>>() {
+                self.pids.lock().unwrap().remove(&s);
+            }
+        }
+    }
+}
 
 /// The pool for these packages, installed on this node the first time they are asked for.
-async fn pool(packages: &str) -> Result<Arc<Pool>> {
+async fn pool(w: &Workers, packages: &str) -> Result<Arc<Pool>> {
     let key = packages.split(',').map(str::trim).filter(|p| !p.is_empty()).collect::<Vec<_>>().join(",");
-    if let Some(p) = POOLS.lock().unwrap().get(&key) {
+    if let Some(p) = w.pools.lock().unwrap().get(&key) {
         return Ok(p.clone());
     }
     let path = match key.is_empty() {
@@ -285,7 +334,7 @@ async fn pool(packages: &str) -> Result<Arc<Pool>> {
     };
     let procedures = crate::env::value::<u64>("PONDRA_PROCEDURES").max(1) as usize;
     let fresh = Arc::new(Pool { path, idle: Mutex::new(vec![]), functions: Arc::new(Semaphore::new(crate::env::cores())), procedures: Arc::new(Semaphore::new(procedures)), busy: AtomicUsize::new(0), reaping: AtomicBool::new(false) });
-    Ok(POOLS.lock().unwrap().entry(key).or_insert(fresh).clone())
+    Ok(w.pools.lock().unwrap().entry(key).or_insert(fresh).clone())
 }
 
 /// A routine's packages, into a folder of this node's keyed by the list (uv when it is there,
@@ -463,9 +512,11 @@ async fn reap(pool: Arc<Pool>) {
 }
 
 /// The workers running now on this node (idle or busy, sessions' too), for `/stats` and the tests.
-pub fn workers() -> usize {
-    let pooled: usize = POOLS.lock().unwrap().values().map(|p| p.idle.lock().unwrap().len() + p.busy.load(Ordering::SeqCst)).sum();
-    pooled + KERNELS.lock().unwrap().values().filter(|k| k.0.try_lock().map_or(true, |k| k.is_some())).count()
+pub fn workers(lake: &crate::store::Lake) -> usize { at(lake).map_or(0, |w| workers_in(&w)) }
+
+fn workers_in(w: &Workers) -> usize {
+    let pooled: usize = w.pools.lock().unwrap().values().map(|p| p.idle.lock().unwrap().len() + p.busy.load(Ordering::SeqCst)).sum();
+    pooled + w.kernels.lock().unwrap().values().filter(|k| k.0.try_lock().map_or(true, |k| k.is_some())).count()
 }
 
 /// A worker's resident memory in MB (Linux; elsewhere unknown).
@@ -512,8 +563,13 @@ async fn recv(w: &mut Worker) -> Result<(Value, Vec<Vec<u8>>)> {
 /// A request to a worker of `packages`' pool, and its answer. Notices it sends first (a
 /// procedure's prints) go to `notice`. Past `limit` (if any) the worker is stopped, as it is if it
 /// dies; the request then fails with the reason, and the next one gets a new worker.
-pub async fn ask(packages: &str, kind: Use, head: Value, parts: Vec<Vec<u8>>, limit: Option<Duration>, notice: &mut (dyn FnMut(String) + Send)) -> Result<(Value, Vec<Vec<u8>>)> {
-    let mut lent = pool(packages).await?.take(kind).await?;
+pub async fn ask(lake: &crate::store::Lake, packages: &str, kind: Use, head: Value, parts: Vec<Vec<u8>>, limit: Option<Duration>, notice: &mut (dyn FnMut(String) + Send)) -> Result<(Value, Vec<Vec<u8>>)> {
+    ask_on(&*at(lake)?, packages, kind, head, parts, limit, notice).await
+}
+
+/// `ask`, on these workers (a lake's Python function holds its lake's: `pyfn.rs`).
+pub(crate) async fn ask_on(w: &Workers, packages: &str, kind: Use, head: Value, parts: Vec<Vec<u8>>, limit: Option<Duration>, notice: &mut (dyn FnMut(String) + Send)) -> Result<(Value, Vec<Vec<u8>>)> {
+    let mut lent = pool(w, packages).await?.take(kind).await?;
     let w = lent.worker.as_mut().expect("a worker");
     let exchange = async {
         send(w, &head, &parts).await?;
@@ -564,28 +620,29 @@ struct Kernel {
     worker: Worker,
     busy: bool, // a cell sent, its answer not read: its request went away (the page's Stop) before it came
     session: String,
+    at: std::sync::Weak<Workers>, // (its lake's)
 }
 
 /// A session's worker gone (stopped, restarted, reaped, its session ended) takes its process id out
-/// of `PIDS`, so an interrupt never reaches whatever process has that id next.
+/// of its lake's `pids`, so an interrupt never reaches whatever process has that id next.
 impl Drop for Kernel {
     fn drop(&mut self) {
-        let mut pids = PIDS.lock().unwrap();
-        if pids.get(&self.session).is_some_and(|p| Some(*p) == self.worker.child.id()) {
-            pids.remove(&self.session);
+        if let Some(w) = self.at.upgrade() {
+            let mut pids = w.pids.lock().unwrap();
+            if pids.get(&self.session).is_some_and(|p| Some(*p) == self.worker.child.id()) {
+                pids.remove(&self.session);
+            }
         }
     }
 }
 
-crate::per_node!(
-    /// Each session's worker's process id: an interrupt reaches it while a cell holds its slot.
-    static PIDS: Mutex<HashMap<String, u32>> = Default::default());
-
 /// Interrupt `session`'s running cell: its worker gets SIGINT, and the cell ends with
 /// `KeyboardInterrupt`, its variables kept, as a notebook's kernel does. Windows has no such
 /// signal for another process: the worker is stopped instead, its variables with it. What was done.
-pub fn interrupt(session: &str) -> &'static str {
-    let Some(pid) = PIDS.lock().unwrap().get(session).copied() else { return "none" };
+pub fn interrupt(lake: &crate::store::Lake, session: &str) -> &'static str { at(lake).map_or("none", |w| interrupt_in(&w, session)) }
+
+fn interrupt_in(w: &Workers, session: &str) -> &'static str {
+    let Some(pid) = w.pids.lock().unwrap().get(session).copied() else { return "none" };
     #[cfg(unix)]
     {
         unsafe { libc::kill(pid as i32, libc::SIGINT) };
@@ -594,23 +651,23 @@ pub fn interrupt(session: &str) -> &'static str {
     #[cfg(not(unix))]
     {
         let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
-        end_session(session);
+        end_in(w, session);
         "restarted"
     }
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Kernel>>>;
-crate::per_node!(static KERNELS: Mutex<HashMap<String, (Slot, Instant)>> = Default::default());
-
-/// Has the session a Python of its own here (its `DO` blocks' variables)?
-pub fn held(session: &str) -> bool { KERNELS.lock().unwrap().contains_key(session) }
 
 /// A cell of `session`'s, on its worker (made now if it has none), and its answer.
-pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit: Option<Duration>, notice: &mut (dyn FnMut(String) + Send)) -> Result<(Value, Vec<Vec<u8>>)> {
+pub async fn ask_session(lake: &crate::store::Lake, session: &str, head: Value, parts: Vec<Vec<u8>>, limit: Option<Duration>, notice: &mut (dyn FnMut(String) + Send)) -> Result<(Value, Vec<Vec<u8>>)> {
+    ask_session_on(&at(lake)?, session, head, parts, limit, notice).await
+}
+
+async fn ask_session_on(w: &Arc<Workers>, session: &str, head: Value, parts: Vec<Vec<u8>>, limit: Option<Duration>, notice: &mut (dyn FnMut(String) + Send)) -> Result<(Value, Vec<Vec<u8>>)> {
     let slot = {
-        let mut all = KERNELS.lock().unwrap();
+        let mut all = w.kernels.lock().unwrap();
         if all.is_empty() {
-            crate::panics::spawn(reap_kernels()); // (only while there are some)
+            crate::panics::spawn(reap_kernels(Arc::downgrade(w))); // (only while there are some)
         }
         let e = all.entry(session.to_string()).or_insert_with(|| (Slot::default(), Instant::now()));
         e.1 = Instant::now();
@@ -619,7 +676,7 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
     let mut kernel = slot.lock().await; // (a session's cells, one after another)
     let _slot = match holding() { // (as a procedure: the node's slots for them; a run inside one holds its caller's)
         true => None,
-        false => Some(pool("").await?.procedures.clone().acquire_owned().await?),
+        false => Some(pool(w, "").await?.procedures.clone().acquire_owned().await?),
     };
     if kernel.as_mut().is_some_and(|k| k.worker.child.try_wait().ok().flatten().is_some()) {
         *kernel = None;
@@ -643,16 +700,16 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
     if kernel.is_none() {
         let worker = spawn(None).await?;
         if let Some(pid) = worker.child.id() {
-            PIDS.lock().unwrap().insert(session.to_string(), pid);
+            w.pids.lock().unwrap().insert(session.to_string(), pid);
         }
-        *kernel = Some(Kernel { worker, busy: false, session: session.to_string() });
+        *kernel = Some(Kernel { worker, busy: false, session: session.to_string(), at: Arc::downgrade(w) });
     }
     kernel.as_mut().expect("a kernel").busy = true;
-    let w = &mut kernel.as_mut().expect("a kernel").worker;
+    let io = &mut kernel.as_mut().expect("a kernel").worker;
     let exchange = async {
-        send(w, &head, &parts).await?;
+        send(io, &head, &parts).await?;
         loop {
-            let (h, parts) = recv(w).await?;
+            let (h, parts) = recv(io).await?;
             match h.get("notice").and_then(Value::as_str) {
                 Some(n) => notice(n.to_string()),
                 None => return anyhow::Ok((h, parts)),
@@ -676,7 +733,7 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
         *kernel = None;
         notice(format!("this session's Python grew past {} MB and was stopped: the next cell starts with no variables", crate::env::value::<u64>("PONDRA_WORKER_MB")));
     }
-    KERNELS.lock().unwrap().entry(session.to_string()).and_modify(|e| e.1 = Instant::now());
+    w.kernels.lock().unwrap().entry(session.to_string()).and_modify(|e| e.1 = Instant::now());
     match answer.0.get("error").and_then(Value::as_str) {
         Some(e) => Err(raised(e.to_string())),
         None => Ok(answer),
@@ -685,8 +742,10 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
 
 /// The variables a session's worker holds: name, type, size and a short look at each, or none if
 /// it has no worker yet; `busy` while a cell runs (nothing waits for it).
-pub async fn variables(session: &str) -> Result<Value> {
-    let Some(slot) = KERNELS.lock().unwrap().get(session).map(|k| k.0.clone()) else { return Ok(json!({"running": false, "variables": []})) };
+pub async fn variables(lake: &crate::store::Lake, session: &str) -> Result<Value> { variables_in(&*at(lake)?, session).await }
+
+async fn variables_in(w: &Workers, session: &str) -> Result<Value> {
+    let Some(slot) = w.kernels.lock().unwrap().get(session).map(|k| k.0.clone()) else { return Ok(json!({"running": false, "variables": []})) };
     let Ok(mut kernel) = slot.try_lock() else { return Ok(json!({"running": true, "busy": true, "variables": []})) };
     let Some(k) = kernel.as_mut() else { return Ok(json!({"running": false, "variables": []})) };
     if k.busy {
@@ -703,20 +762,57 @@ pub async fn variables(session: &str) -> Result<Value> {
 }
 
 /// A session ended: its worker stops (once a cell it runs is done).
-pub fn end_session(session: &str) -> bool {
-    PIDS.lock().unwrap().remove(session);
-    KERNELS.lock().unwrap().remove(session).is_some()
+pub fn end_session(lake: &crate::store::Lake, session: &str) -> bool { at(lake).is_ok_and(|w| end_in(&w, session)) }
+
+fn end_in(w: &Workers, session: &str) -> bool {
+    w.pids.lock().unwrap().remove(session);
+    w.kernels.lock().unwrap().remove(session).is_some()
 }
 
-/// Sessions' workers idle for `PONDRA_SESSION_IDLE_SECS` stop; once there are none, this stops.
-async fn reap_kernels() {
+/// Sessions' workers idle for `PONDRA_SESSION_IDLE_SECS` stop; once there are none, this stops. It holds its lake's
+/// workers by a weak handle: once the lake's are gone (it stopped), this stops too.
+async fn reap_kernels(w: std::sync::Weak<Workers>) {
     let idle = crate::env::secs("PONDRA_SESSION_IDLE_SECS");
     loop {
         tokio::time::sleep(idle.min(Duration::from_secs(30))).await;
-        let mut all = KERNELS.lock().unwrap();
-        all.retain(|_, (k, used)| used.elapsed() < idle || k.try_lock().is_err()); // (one running a cell stays)
-        if all.is_empty() {
+        let Some(w) = w.upgrade() else { return }; // (its lake went)
+        let empty = {
+            let mut all = w.kernels.lock().unwrap();
+            all.retain(|_, (k, used)| used.elapsed() < idle || k.try_lock().is_err()); // (one running a cell stays)
+            all.is_empty()
+        };
+        if empty {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each lake keeps its own Python (`Workers`, its lake's state): a session's worker of one lake is none of another's,
+    /// and a session's end stops its own lake's Python alone.
+    #[tokio::test]
+    async fn each_lake_keeps_its_own_python() -> anyhow::Result<()> {
+        let dir = |n: &str| std::env::temp_dir().join(format!("pondra-two-pythons-{n}-{}", uuid::Uuid::new_v4()));
+        let (da, db) = (dir("a"), dir("b"));
+        let a = crate::store::Lake::open(da.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let b = crate::store::Lake::open(db.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let (wa, wb) = (at(&a)?, at(&b)?);
+        assert!(Arc::ptr_eq(&wa, &at(&a)?) && !Arc::ptr_eq(&wa, &wb), "one lake, its own workers");
+        wa.pids.lock().unwrap().insert("s".to_string(), 1u32);
+        wb.pids.lock().unwrap().insert("s".to_string(), 1u32);
+        wa.kernels.lock().unwrap().insert("s".to_string(), (Slot::default(), Instant::now()));
+        assert!(crate::temp::sessions(&a).unwrap().holds("s"), "a keeps its session's Python");
+        assert!(!crate::temp::sessions(&b).unwrap().holds("s"), "b's session of that name is its own: not held by a's");
+        crate::temp::sessions(&a).unwrap().end("s");
+        assert!(!wa.pids.lock().unwrap().contains_key("s"), "a's session ended with its Python");
+        assert!(wb.pids.lock().unwrap().contains_key("s"), "b's session of that name is its own");
+        a.cat.close().await?;
+        b.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&da);
+        let _ = std::fs::remove_dir_all(&db);
+        Ok(())
     }
 }
