@@ -1349,7 +1349,7 @@ async fn stats(State(app): State<App>, who: Option<axum::Extension<crate::auth::
     let members = &app.members;
     let role = if members.reader() { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
     let mut s = j!({"lake": crate::ddl::lake_name(&app.lake), "role": role, "leader": members.leader().addr, "term": members.leader().n, "nodes": members.nodes(),
-                    "hwm": *app.lake.hwm.borrow(), "shard_runs": crate::tasks::SHARD_RUNS.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(),
+                    "hwm": *app.lake.hwm.borrow(), "shard_runs": app.lake.state::<crate::tasks::Kept>().map_or(0, |k| k.shard_runs.load(std::sync::atomic::Ordering::Relaxed)), "python_workers": crate::python::workers(),
                     "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
     s["version"] = j!(crate::format::VERSION);
     s["owner"] = j!(crate::statement::owner(&app.auth, &headers)); // (asked with its key: is this the node the asker started? `local()` on a port another node holds)

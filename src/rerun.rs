@@ -723,12 +723,30 @@ struct Pace {
 
 const STILL: Duration = Duration::from_secs(1);
 
-crate::per_node!(static PACE: Mutex<BTreeMap<(String, String), Pace>> = Mutex::new(BTreeMap::new()));
+/// What a lake's views that run their query again keep (its state, `lake_state.rs`): each one's pace here (`turn`), and its
+/// tables with the newest commit that changed each and when it was made, as far as the log has been looked at (`look`):
+/// brought up to date from the commits since the last look (the first look starts at the log's end, and it is let go
+/// while no view runs again).
+#[derive(Default)]
+pub struct Kept {
+    pace: Mutex<BTreeMap<String, Pace>>, // (by view)
+    changed: Mutex<Option<(u64, HashMap<String, (u64, u64)>)>>,
+}
+
+impl crate::lake_state::LakeState for Kept {
+    const NAME: &'static str = "rerun";
+    const ABOUT: &'static str = "the pace of each of its views that runs its query again, and its tables' newest changes as far as the log has been looked at";
+
+    fn make() -> Self {
+        Kept::default()
+    }
+}
 
 /// A view's turn to run, given back when the run ends (or panics). `due`: a timed view's time to
 /// run though nothing it reads here changed.
 struct Turn {
-    key: (String, String),
+    kept: Arc<Kept>,
+    view: String,
     due: bool,
     waited: std::sync::atomic::AtomicU64, // µs: the run's waits (`waiting`), left out of what it took
     upto: std::sync::atomic::AtomicU64, // the commit the run is as of
@@ -736,7 +754,7 @@ struct Turn {
 
 impl Drop for Turn {
     fn drop(&mut self) {
-        if let Some(p) = PACE.lock().unwrap().get_mut(&self.key) {
+        if let Some(p) = self.kept.pace.lock().unwrap().get_mut(&self.view) {
             let waited = Duration::from_micros(self.waited.load(std::sync::atomic::Ordering::Relaxed));
             (p.running, p.took) = (false, p.started.map_or(Duration::ZERO, |s| s.elapsed().saturating_sub(waited)));
             p.ended = crate::log::now_ms();
@@ -755,9 +773,9 @@ async fn waiting<T>(waited: &std::sync::atomic::AtomicU64, f: impl std::future::
 impl Turn {
     /// How the run went: an error is logged when it is new, not at every try.
     fn ended(&self, r: &Result<()>) {
-        let mut pace = PACE.lock().unwrap();
-        let Some(p) = pace.get_mut(&self.key) else { return };
-        p.failed.note(&format!("materialized view {}", self.key.1), r.as_ref().err().map(|e| format!("{e:#}")));
+        let mut pace = self.kept.pace.lock().unwrap();
+        let Some(p) = pace.get_mut(&self.view) else { return };
+        p.failed.note(&format!("materialized view {}", self.view), r.as_ref().err().map(|e| format!("{e:#}")));
         if r.is_ok() {
             p.upto = p.upto.max(self.upto.load(std::sync::atomic::Ordering::Relaxed));
         }
@@ -766,9 +784,9 @@ impl Turn {
 
 /// `changed`: the newest commit that changed a table the view follows, and when it was made.
 fn turn(lake: &Lake, view: &str, r: &Rerun, changed: Option<(u64, u64)>) -> Option<Turn> {
-    let mut pace = PACE.lock().unwrap();
-    let key = (lake.url.clone(), view.to_string());
-    let p = pace.entry(key.clone()).or_default();
+    let kept = lake.state::<Kept>().ok()?;
+    let mut pace = kept.pace.lock().unwrap();
+    let p = pace.entry(view.to_string()).or_default();
     if p.of != r.id {
         if p.running {
             return None; // (the old view's run is still going: the new one waits for it to end)
@@ -791,14 +809,16 @@ fn turn(lake: &Lake, view: &str, r: &Rerun, changed: Option<(u64, u64)>) -> Opti
     if due {
         p.timed = p.started;
     }
-    Some(Turn { key, due, waited: Default::default(), upto: Default::default() })
+    drop(pace);
+    Some(Turn { kept, view: view.to_string(), due, waited: Default::default(), upto: Default::default() })
 }
 
 /// Why a view's runs keep failing on this node (two in a row), if they do: making it says so
 /// instead of waiting for a first run that won't come. `of`: the view's `identity`.
 pub fn failing(lake: &Lake, view: &str, of: &str) -> Option<String> {
-    let pace = PACE.lock().unwrap();
-    pace.get(&(lake.url.clone(), view.to_string())).filter(|p| p.of == of).and_then(|p| p.failed.failing())
+    let kept = lake.state::<Kept>().ok()?;
+    let pace = kept.pace.lock().unwrap();
+    pace.get(view).filter(|p| p.of == of).and_then(|p| p.failed.failing())
 }
 
 /// Leader: start a run of every view that runs its query again whose turn it is, each in a task of
@@ -807,13 +827,14 @@ pub fn failing(lake: &Lake, view: &str, of: &str) -> Option<String> {
 /// again at a later turn.
 pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &Arc<tokio::sync::Mutex<()>>) -> Result<()> {
     let views: Vec<(String, View)> = lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.rerun.is_some()).map(|(k, v)| (k[2..].to_string(), v)).collect();
+    let kept = lake.state::<Kept>()?;
     {
         // (a dropped view's pace goes too, before the early return below)
         let names: std::collections::HashSet<&str> = views.iter().map(|(name, _)| name.as_str()).collect();
-        PACE.lock().unwrap_or_else(|e| e.into_inner()).retain(|(url, view), _| url != &lake.url || names.contains(view.as_str()));
+        kept.pace.lock().unwrap_or_else(|e| e.into_inner()).retain(|view, _| names.contains(view.as_str()));
     }
     if views.is_empty() {
-        CHANGED.lock().unwrap().remove(&lake.url);
+        *kept.changed.lock().unwrap() = None;
         return Ok(());
     }
     look(lake).await?;
@@ -829,21 +850,17 @@ pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &
     Ok(())
 }
 
-crate::per_node!(
-    /// Each lake's tables, with the newest commit that changed each and when it was made, as far as the
-    /// log has been looked at: brought up to date from the commits since the last look (the first look
-    /// starts at the log's end, and a lake no view runs again for is let go).
-    static CHANGED: Mutex<BTreeMap<String, (u64, HashMap<String, (u64, u64)>)>> = Mutex::new(BTreeMap::new()));
-
+/// Brings `lake`'s tables' newest changes up to date (`Kept::changed`).
 async fn look(lake: &Lake) -> Result<()> {
+    let kept = lake.state::<Kept>()?;
     let now = lake.visible();
-    let from = CHANGED.lock().unwrap().entry(lake.url.clone()).or_insert_with(|| (now, HashMap::new())).0;
+    let from = kept.changed.lock().unwrap().get_or_insert_with(|| (now, HashMap::new())).0;
     if now <= from {
         return Ok(());
     }
     let segments = lake.cat.segments(&seg_key(from + 1), &seg_key(now + 1)).await?;
-    let mut seen = CHANGED.lock().unwrap();
-    let (upto, at) = seen.get_mut(&lake.url).context("let go meanwhile")?;
+    let mut seen = kept.changed.lock().unwrap();
+    let (upto, at) = seen.as_mut().context("let go meanwhile")?;
     for (key, s) in segments {
         let n: u64 = key[2..].parse()?;
         for t in s.parts.keys().chain(s.files.keys()).filter(|t| moved(&s, t)) {
@@ -856,8 +873,9 @@ async fn look(lake: &Lake) -> Result<()> {
 
 /// The newest commit that changed any of `tables` (`moved`), and when it was made.
 fn last_change(lake: &Lake, tables: &[String]) -> Option<(u64, u64)> {
-    let seen = CHANGED.lock().unwrap();
-    let at = &seen.get(&lake.url)?.1;
+    let kept = lake.state::<Kept>().ok()?;
+    let seen = kept.changed.lock().unwrap();
+    let at = &seen.as_ref()?.1;
     tables.iter().flat_map(|t| [at.get(t), at.get(&crate::sys::deleted(t))]).flatten().max().copied()
 }
 
@@ -1371,12 +1389,11 @@ mod tests {
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let made = |id: &str| Rerun { id: id.into(), keys: vec![], full: None, reason: String::new(), asked: false, lag_secs: None, joins: vec![] };
         let (a, b) = (made("a"), made("b"));
-        let key = (lake.url.clone(), "v".to_string());
         let t = turn(&lake, "v", &a, None).expect("a's first turn");
         assert!(turn(&lake, "v", &b, None).is_none(), "while a's run is going, b's waits for it to end");
         t.ended(&Err(anyhow::anyhow!("boom")));
         drop(t);
-        PACE.lock().unwrap().get_mut(&key).expect("a's pace").started = None; // (past a's pace)
+        lake.state::<Kept>()?.pace.lock().unwrap().get_mut("v").expect("a's pace").started = None; // (past a's pace)
         let t = turn(&lake, "v", &a, None).expect("a's next turn");
         t.ended(&Err(anyhow::anyhow!("boom")));
         drop(t);

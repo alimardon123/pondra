@@ -15,8 +15,20 @@ use datafusion::prelude::SessionContext;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-type Kept = (Arc<dyn ExecutionPlan>, Arc<TaskContext>);
-crate::per_node!(static PLANS: Mutex<BTreeMap<String, Vec<Kept>>> = Mutex::new(BTreeMap::new()));
+type Plan = (Arc<dyn ExecutionPlan>, Arc<TaskContext>);
+
+/// What a lake keeps for its flushes (invariant 301): each query's plans over a flush's new rows, kept to run again
+/// (`keep`), by `{kind}\0{sql}\0{columns}\0{parts}\0{functions}`.
+#[derive(Default)]
+pub struct Plans(Mutex<BTreeMap<String, Vec<Plan>>>);
+
+impl crate::lake_state::LakeState for Plans {
+    const NAME: &'static str = "fresh";
+    const ABOUT: &'static str = "the plans of its views' and feeds' queries over a flush's new rows, kept to run again";
+    fn make() -> Self {
+        Plans::default()
+    }
+}
 
 /// `sql` with table `source` standing for just `rows` (as columns `s`), `prepare` given its logical
 /// plan first (a row-by-row view carries its ids through it; `kind` names what it does). Another
@@ -25,15 +37,15 @@ pub async fn run(lake: &Lake, source: &str, s: SchemaRef, rows: &[RecordBatch], 
     let rows = rows.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?;
     let parts = if rows.iter().map(|b| b.num_rows()).sum::<usize>() < 1 << 17 { 1 } else { crate::store::partitions() }; // (a flush's rows: one; a view's filling: every core)
     let functions = lake.cat.scan_raw("f/", "f0").await?; // (a function replaced is planned again)
-    let key = format!("{}\0{kind}\0{sql}\0{:?}\0{parts}\0{:x}", lake.url, s.fields(), fingerprint(&functions));
+    let (plans, key) = (lake.state::<Plans>()?, format!("{kind}\0{sql}\0{:?}\0{parts}\0{:x}", s.fields(), fingerprint(&functions)));
     // (a kept plan is taken out while it runs, so two runs at once never share its operators' state, a window's held
     // rows among it: a run that finds none plans afresh. Taken out here, not cloned: the lock is not held while it runs)
-    let taken = PLANS.lock().unwrap().get_mut(&key).and_then(Vec::pop);
+    let taken = plans.0.lock().unwrap().get_mut(&key).and_then(Vec::pop);
     if let Some((plan, task)) = taken {
         let renewed = renew(&plan, &rows)?;
         let schema = renewed.schema();
         let out = datafusion::physical_plan::collect(renewed, task.clone()).await?;
-        keep(key, (plan, task)); // (the plan taken out, not the copy that ran: that one holds these rows; a run that failed keeps none)
+        keep(&plans, key, (plan, task)); // (the plan taken out, not the copy that ran: that one holds these rows; a run that failed keeps none)
         return Ok((schema, out));
     }
     // (planned as the node's own work: a view's, a task's or a feed's rows, which read what its definition reads, whoever
@@ -56,15 +68,15 @@ pub async fn run(lake: &Lake, source: &str, s: SchemaRef, rows: &[RecordBatch], 
     let out = datafusion::physical_plan::collect(physical.clone(), task.clone()).await?;
     if alone && steady(&plan) {
         // (kept only now that its run succeeded: the copy kept shares the windows' state with `physical`, which ran)
-        keep(key, (renew(&physical, &[])?, task)); // (holding none of these rows)
+        keep(&plans, key, (renew(&physical, &[])?, kept_task(&task))); // (holding none of these rows, nor its lake)
     }
     Ok((physical.schema(), out))
 }
 
 /// Keeps a plan for the next run of its key, at most 8 a key (writes packed side by side each find one, and plan
 /// nothing); every key is dropped past 512 (views dropped and fillings leave theirs: a bound, not a policy).
-fn keep(key: String, kept: Kept) {
-    let mut plans = PLANS.lock().unwrap();
+fn keep(plans: &Plans, key: String, kept: Plan) {
+    let mut plans = plans.0.lock().unwrap();
     if !plans.contains_key(&key) && plans.len() >= 512 {
         plans.clear();
     }
@@ -72,6 +84,15 @@ fn keep(key: String, kept: Kept) {
     if of_key.len() < 8 {
         of_key.push(kept);
     }
+}
+
+/// `task` as a kept plan runs in it: with only the functions that always answer alike. One that may answer otherwise can
+/// hold its lake (`file_read`, `nextval`: `Lake::session_with`), and a kept plan is its lake's state (`Plans`), so the
+/// lake would keep itself. (A kept plan calls none of them: `steady`.)
+fn kept_task(task: &TaskContext) -> Arc<TaskContext> {
+    let scalar = task.scalar_functions().iter().filter(|(_, f)| f.signature().volatility == Volatility::Immutable).map(|(k, f)| (k.clone(), f.clone())).collect();
+    Arc::new(TaskContext::new(task.task_id(), task.session_id(), task.session_config().clone(), scalar, task.higher_order_functions().clone(),
+                              task.aggregate_functions().clone(), task.window_functions().clone(), task.runtime_env()))
 }
 
 fn fingerprint(raw: &BTreeMap<String, bytes::Bytes>) -> u64 {
@@ -156,5 +177,37 @@ impl ExecutionPlan for FreshExec {
     fn with_new_children(self: Arc<Self>, _: Vec<Arc<dyn ExecutionPlan>>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> { Ok(self) }
     fn execute(&self, _: usize, _: Arc<TaskContext>) -> datafusion::error::Result<SendableRecordBatchStream> {
         Ok(Box::pin(MemoryStream::try_new(self.rows.clone(), self.schema.clone(), self.projection.clone())?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    /// A plan kept for a lake's flushes is its lake's state, and the lake still goes with its last handle: what is kept
+    /// holds none of the functions that hold their lake (`kept_task`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_kept_plan_keeps_not_its_lake() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-fresh-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let s: SchemaRef = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let rows = [RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])?];
+        let (_, out) = crate::auth::as_node(run(&lake, "t", s.clone(), &rows, "SELECT sum(x) AS n FROM t", "", Ok)).await?;
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(lake.state::<Plans>()?.0.lock().unwrap().len(), 1, "the plan is kept");
+        lake.cat.close().await?;
+        let gone = Arc::downgrade(&lake);
+        drop(lake);
+        for _ in 0..100 {
+            if gone.upgrade().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gone.upgrade().is_none(), "the lake is still held");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }
