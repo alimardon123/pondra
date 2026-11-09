@@ -828,6 +828,7 @@ fn ddl_names(d: &crate::ddl::Ddl) -> Vec<String> {
     use crate::ddl::Ddl;
     match d {
         Ddl::DropTable { name, .. } | Ddl::DropView { name, .. } | Ddl::RenameTable { name, .. } | Ddl::Undrop { name } | Ddl::Clone { name, .. } => vec![name.clone()],
+        Ddl::UndropKept { kind, name } if crate::objects::kind(kind).is_some_and(|k| k.family == "relation") => vec![name.clone()],
         Ddl::AlterColumn { table, .. } | Ddl::Constraint { table, .. } => vec![table.clone()],
         Ddl::Object(crate::objects::Op::OrAlterTable { name, .. }) => vec![name.clone()], // (CREATE OR ALTER TABLE changes a table's shape)
         Ddl::Swap { name, with } => vec![name.clone(), with.clone()],

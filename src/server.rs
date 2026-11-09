@@ -858,10 +858,10 @@ struct AppendParams {
 }
 
 /// Body: NDJSON rows, or an Arrow IPC stream (content-type application/vnd.apache.arrow.stream).
-async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
-    let start = std::time::Instant::now();
+async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, who: Option<axum::Extension<crate::auth::Principal>>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
+    let (start, scope) = (std::time::Instant::now(), scope_of(who));
     let (out, unseen) = crate::rights::noting(append_rows(&app, &name, p, headers, body)).await;
-    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.to_string()), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
+    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -919,7 +919,7 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
         }
     })
     .await;
-    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
+    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -1351,7 +1351,7 @@ async fn stats(State(app): State<App>, who: Option<axum::Extension<crate::auth::
     let members = &app.members;
     let role = if members.reader() { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
     let mut s = j!({"lake": crate::ddl::lake_name(&app.lake), "role": role, "leader": members.leader().addr, "term": members.leader().n, "nodes": members.nodes(),
-                    "hwm": *app.lake.hwm.borrow(), "shard_runs": crate::tasks::SHARD_RUNS.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(),
+                    "hwm": *app.lake.hwm.borrow(), "shard_runs": app.lake.state::<crate::tasks::Kept>().map_or(0, |k| k.shard_runs.load(std::sync::atomic::Ordering::Relaxed)), "python_workers": crate::python::workers(),
                     "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
     s["version"] = j!(crate::format::VERSION);
     s["owner"] = j!(crate::statement::owner(&app.auth, &headers)); // (asked with its key: is this the node the asker started? `local()` on a port another node holds)
@@ -1403,8 +1403,12 @@ pub struct E(anyhow::Error);
 impl<T: Into<anyhow::Error>> From<T> for E {
     fn from(e: T) -> Self { E(e.into()) }
 }
+impl E {
+    /// The words its caller is told (`codes::told`), so the audit log says what the client was told.
+    fn told(&self, scope: &crate::rights::Scope) -> String { crate::codes::told(&self.0, scope.shows_code()) }
+}
 impl std::fmt::Display for E {
-    // (the words a client is sent, so the audit log says what the client was told: `ext::said`)
+    // (as told a client not shown code: `ext::said`)
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", crate::ext::said(&self.0)) }
 }
 impl IntoResponse for E {
