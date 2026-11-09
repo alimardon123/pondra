@@ -2212,6 +2212,25 @@ pub(crate) fn flatten(plan: &LogicalPlan, equality: NullEquality, leaves: &mut V
     }
 }
 
+/// `flatten`, through the projections of columns as they are that sit between the joins once they are ordered (TPC-DS
+/// q04's customer, joined to its sales below the date's join): for a rule that makes the joins again from the leaves,
+/// which then give every column the projections passed on (`eager`).
+pub(crate) fn flatten_through(plan: &LogicalPlan, equality: NullEquality, leaves: &mut Vec<LogicalPlan>, keys: &mut Vec<(Expr, Expr)>, filters: &mut Vec<Expr>) {
+    match plan {
+        LogicalPlan::Projection(p) if p.expr.iter().all(|e| matches!(e, Expr::Column(_))) && matches!(p.input.as_ref(), LogicalPlan::Join(j) if flat(j, equality)) => {
+            flatten_through(&p.input, equality, leaves, keys, filters)
+        }
+        LogicalPlan::Join(j) if flat(j, equality) => {
+            let (on, rest) = equalities(j);
+            keys.extend(on);
+            filters.extend(rest);
+            flatten_through(&j.left, equality, leaves, keys, filters);
+            flatten_through(&j.right, equality, leaves, keys, filters);
+        }
+        _ => leaves.push(plan.clone()),
+    }
+}
+
 /// A join's equi-keys — its `on`, and each equality in its condition that pairs a column of
 /// either side — and the rest of its condition. Conditions pushed into a join are not keys until
 /// the next pass (`extract_equijoin_predicate`), and by then projections sit between the joins and
