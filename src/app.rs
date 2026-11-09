@@ -12,6 +12,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// When a lake's retention last ran (`App::tier_all`: every 10 s at most).
+#[derive(Default)]
+pub struct Retention {
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl crate::lake_state::LakeState for Retention {
+    const NAME: &'static str = "retention";
+    const ABOUT: &'static str = "when its retention last ran (every 10 s at most)";
+    fn make() -> Self { Retention::default() }
+}
+
 #[derive(Clone)]
 pub struct App {
     pub lake: Arc<Lake>,
@@ -380,10 +392,10 @@ impl App {
         }
         let published = start.elapsed();
         // Retention every 10 s is plenty, and keeps its deletes off the path to fresh Delta versions.
-        crate::per_node!(static EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
+        let retention = self.lake.state::<Retention>()?;
         let now = crate::log::now_ms();
-        if now - EXPIRED.load(std::sync::atomic::Ordering::Relaxed) >= 10_000 {
-            EXPIRED.store(now, std::sync::atomic::Ordering::Relaxed);
+        if now - retention.last.load(std::sync::atomic::Ordering::Relaxed) >= 10_000 {
+            retention.last.store(now, std::sync::atomic::Ordering::Relaxed);
             expire(&self.lake, self.retain_ms).await?;
         }
         if start.elapsed() >= Duration::from_secs(5) {

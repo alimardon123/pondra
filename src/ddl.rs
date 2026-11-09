@@ -873,13 +873,18 @@ pub async fn attach_found(home: &Lake, folder: &str) -> Vec<String> {
     found
 }
 
-crate::per_node!(
-    /// The lakes this process attached because the catalog said so, per home lake.
-    static FROM_SQL: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new()));
+/// The lakes a home lake attached because its catalog said so, and the attachments it refused.
+#[derive(Default)]
+pub struct Attached {
+    from_sql: std::sync::Mutex<Vec<String>>, // (the names attached because the catalog lists them)
+    refused: std::sync::Mutex<Vec<String>>, // (`key=dir` of each attachment `sync` refused (`openable`), said on the log once)
+}
 
-crate::per_node!(
-    /// The attachments `sync` refused (`openable`), each said on the log once.
-    static REFUSED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new()));
+impl crate::lake_state::LakeState for Attached {
+    const NAME: &'static str = "attached";
+    const ABOUT: &'static str = "the lakes it attached because the catalog said so, and the attachments it refused";
+    fn make() -> Self { Attached::default() }
+}
 
 /// May a node open lake `dir` because the catalog of lake `home` names it? Every node opens what its catalog names, whoever
 /// wrote it there: a node's lake (`pondra://`) with this node's admin token, a folder from this node's own disk. Only a
@@ -900,6 +905,7 @@ pub(crate) fn openable(home: &str, dir: &str) -> Result<()> {
 /// (`DETACH`). Lakes attached with `--attach` stay. One that can't be opened is skipped (and
 /// tried again next time).
 pub async fn sync(lake: &Lake, follow: bool) -> Result<()> {
+    let ours = lake.state::<Attached>()?;
     let listed = lake.cat.scan::<Attachment>("a/", "a0").await?;
     for (key, a) in &listed {
         let name = &key[2..];
@@ -907,8 +913,8 @@ pub async fn sync(lake: &Lake, follow: bool) -> Result<()> {
             continue;
         }
         if let Err(e) = openable(&lake.url, &a.dir) {
-            let seen = (lake.url.clone(), format!("{key}={}", a.dir));
-            let mut refused = REFUSED.lock().unwrap();
+            let seen = format!("{key}={}", a.dir);
+            let mut refused = ours.refused.lock().unwrap();
             if !refused.contains(&seen) {
                 eprintln!("not attaching {name}: {e:#}");
                 refused.push(seen);
@@ -922,14 +928,14 @@ pub async fn sync(lake: &Lake, follow: bool) -> Result<()> {
             }
         }
         match attach(lake, name, &a.dir, follow, false).await {
-            Ok(_) => FROM_SQL.lock().unwrap().push((lake.url.clone(), name.to_string())),
+            Ok(_) => ours.from_sql.lock().unwrap().push(name.to_string()),
             Err(e) => eprintln!("attaching {name} ({}): {e:#}", a.dir),
         }
     }
-    let gone: Vec<String> = FROM_SQL.lock().unwrap().iter().filter(|(u, n)| *u == lake.url && !listed.iter().any(|(k, _)| &k[2..] == n)).map(|(_, n)| n.clone()).collect();
+    let gone: Vec<String> = ours.from_sql.lock().unwrap().iter().filter(|n| !listed.iter().any(|(k, _)| &k[2..] == *n)).cloned().collect();
     if !gone.is_empty() {
         lake.attached.write().unwrap().retain(|(n, _)| !gone.contains(n));
-        FROM_SQL.lock().unwrap().retain(|(u, n)| !(*u == lake.url && gone.contains(n)));
+        ours.from_sql.lock().unwrap().retain(|n| !gone.contains(n));
     }
     Ok(())
 }
