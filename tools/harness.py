@@ -10841,6 +10841,19 @@ def server():
     checks["a grant ON ALL TABLES lists none of another database's tables, as it reads none; a grant naming one lists it (pondra.objects, 11-08 audit L7)"] = \
         isinstance(seen["bob_lists"], list) and any(r["name"] == "people" for r in seen["bob_lists"]) and not any(r["name"] == "notes" for r in seen["bob_lists"]) \
         and isinstance(seen["ann_lists"], list) and [r["name"] for r in seen["ann_lists"]] == ["notes"]
+    # (11-09 audit L1: under USE of an attached lake, pg_catalog lists its tables by the grants naming them, lake.t, as its
+    # reads are: bob's ON ALL TABLES of hr lists none of lake's tables; ann's grant naming lake.notes lists notes)
+    def under_use(auth, who):
+        h = {"Authorization": "Basic " + base64.b64encode(auth.encode()).decode(), "x-pondra-session": f"audit-l1-{who}"}
+        try:
+            call(port, "POST", "/db/hr/sql", b"USE lake", headers=h)
+            return call(port, "POST", "/db/hr/sql", b"SELECT relname FROM pg_class WHERE relkind = 'r' ORDER BY relname", headers=h)
+        except Exception as e:
+            return f"ERROR {e}"
+    for who, auth in (("bob", bob), ("ann", ann)):
+        seen[f"{who}_use"] = under_use(auth, who)
+    checks["under USE of an attached lake, pg_class lists its tables by the grants naming them: bob's ON ALL TABLES of hr lists none, ann's naming lake.notes lists notes (11-09 audit L1)"] = \
+        seen["bob_use"] == [] and isinstance(seen["ann_use"], list) and [r["relname"] for r in seen["ann_use"]] == ["notes"]
     # Whoever runs the nodes (one of their tokens) still reads across; a user of the node's own lake doesn't.
     mine = new_lake()
     subprocess.run([BIN, "sql", "--dir", mine, "CREATE TABLE t AS SELECT 1 AS id"], check=True, capture_output=True)
@@ -22771,6 +22784,39 @@ def listings():
     stopped = lambda v: "permission denied for sequence" in v
     checks["a sequence moves for a writer of a table that takes from it: ann, granted only INSERT on tickets, numbers its rows and takes its next value, but sets none and moves no other sequence, at every door (11-09 audit H1)"] = \
         all(went(d["INSERT"]) and went(d["nextval"]) and stopped(d["setval"]) and stopped(d["nextval, another"]) and stopped(d["setval, another"]) for d in seqs.values())
+    # (11-09 audit M2: of a table ann reads in part, the catalog names no column ann may not read: not its key, an index, a
+    # CHECK, a foreign key or a comment over one)
+    for q in ["CREATE TABLE owners (owner_key BIGINT PRIMARY KEY)",
+              "CREATE TABLE vault (vault_id BIGINT PRIMARY KEY, secret_amount DOUBLE CHECK (secret_amount > 0), open_note TEXT, owner_ref BIGINT REFERENCES owners (owner_key) NOT ENFORCED)",
+              "CREATE INDEX vault_by_amount ON vault (secret_amount)", "COMMENT ON COLUMN vault.secret_amount IS 'hush hush'",
+              "GRANT SELECT (open_note, owner_ref) ON vault TO ann"]:
+        ask(boss, q)
+    listings = ["SELECT * FROM pg_indexes WHERE tablename = 'vault'", "SELECT * FROM information_schema.key_column_usage WHERE table_name = 'vault'",
+                "SELECT * FROM information_schema.constraint_column_usage", "SELECT * FROM information_schema.table_constraints WHERE table_name = 'vault'",
+                "SELECT * FROM pg_constraint", "SELECT * FROM pg_description", "SELECT * FROM pg_index"]
+    def pg_rows(user, password, q):
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user={user} password={password} dbname=lake", connect_timeout=10, autocommit=True) as c:
+                return str(c.execute(q).fetchall())
+        except psycopg.Error as e:
+            return f"{e.sqlstate} {e.diag.message_primary}"
+    named = {who: {q: pg_rows(who, f"{who}-password-1", q) for q in listings} for who in ("ann", "boss")}
+    words = ["vault_id", "secret_amount", "hush hush", "vault_by_amount", "owner_key", "vault_owner_ref_fkey", "vault_pkey"]
+    unseen["M2"] = {**{q: [w for w in words if w in v] for q, v in named["ann"].items()}, "the superuser lacks": [w for w in words if not any(w in v for v in named["boss"].values())]}
+    checks["of a table ann reads in part, pg_catalog and information_schema name no column ann may not read: no key, index, CHECK, foreign key or comment over one; the superuser sees them all (11-09 audit M2)"] = \
+        not any(w in v for v in named["ann"].values() for w in words) and all(any(w in v for v in named["boss"].values()) for w in words)
+    # (a probe that reads no rows, `LIMIT 0` or `WHERE 1=0` as JDBC and Spark send, was planned with no scan, where the
+    # columns are checked: it named every column of ledger and its type, k too, at every door, 11-09 audit M1)
+    probes = {"LIMIT 0": "SELECT * FROM ledger LIMIT 0", "WHERE 1=0": "SELECT * FROM ledger WHERE 1=0", "a join on FALSE": "SELECT * FROM ledger a JOIN ledger b ON FALSE"}
+    probed = {f"{door}, {what}": ask_(s, False) for what, s in probes.items() for door, ask_ in doors.items()}
+    probed.update({f"Postgres Describe, {what}": pg_describe(s) for what, s in probes.items()})
+    own = {door: ask_("SELECT v FROM ledger WHERE 1=0", False) for door, ask_ in doors.items()}
+    own["Postgres Describe"] = pg_describe("SELECT v FROM ledger WHERE 1=0")
+    unseen["M1"] = (probed, own)
+    checks["a probe of no rows of ledger (LIMIT 0, WHERE 1=0, a join on FALSE), of which ann reads v only, is refused at every door and by Postgres's Describe, as a read of its rows is (11-09 audit M1)"] = \
+        all("permission denied" in a and not a.startswith("columns") for a in probed.values())
+    checks["the probe of v, which ann may read, answers no rows at every door, and Postgres's Describe names v only (11-09 audit M1)"] = \
+        all("permission denied" not in a and not a.startswith(("4", "5")) and '"isError":true' not in a.replace(" ", "") for a in own.values()) and own["Postgres Describe"] == "columns v"
     info["unseen"] = unseen
     node.kill()
     ok = all(checks.values())

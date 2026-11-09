@@ -546,14 +546,22 @@ impl TableProvider for Guarded {
     fn table_type(&self) -> datafusion::datasource::TableType { self.inner.table_type() }
     fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> { None } // (a view's plan would read around the check)
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
-        // (inexact: each filter stays above the scan too, so its columns are in what is scanned)
-        Ok(self.inner.supports_filters_pushdown(filters)?.into_iter().map(|p| match p {
+        // (inexact: each filter stays above the scan too, so its columns are in what is scanned; and one that is never
+        // true comes to the scan, which then reads nothing)
+        Ok(self.inner.supports_filters_pushdown(filters)?.into_iter().zip(filters).map(|(p, f)| match p {
             datafusion::logical_expr::TableProviderFilterPushDown::Exact => datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
+            _ if never(f) => datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
             p => p,
         }).collect())
     }
     async fn scan(&self, state: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let projection = self.checked(projection, filters)?;
+        // (a scan kept for its check that reads no rows, `KeepGuarded`: `LIMIT 0`, `WHERE 1=0`, read from no file)
+        if limit == Some(0) || filters.iter().any(never) {
+            let all = self.inner.schema();
+            let schema = match &projection { Some(p) => Arc::new(all.project(p)?), None => all };
+            return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(schema)));
+        }
         self.inner.scan(state, projection.as_ref(), filters, limit).await
     }
 }
@@ -601,6 +609,58 @@ impl Guarded {
             }
         }
         Ok(projection)
+    }
+}
+
+/// Is `filter` never true: FALSE or NULL, as `WHERE 1=0` is once simplified?
+fn never(filter: &Expr) -> bool { matches!(filter, Expr::Literal(datafusion::common::ScalarValue::Boolean(Some(false) | None), _)) }
+
+/// Does `plan` scan a table its reader reads in part or may not read (a `Guarded` one, all of whose columns it may not
+/// read)? Its subqueries aren't looked into: a subquery's columns are never an answer's (its parts that are, a join made of
+/// an `IN` or `EXISTS`, are the plan's own by the time a rule that empties one runs).
+fn reads_guarded(plan: &datafusion::logical_expr::LogicalPlan) -> bool {
+    use datafusion::common::tree_node::TreeNode;
+    plan.exists(|node| {
+        Ok(match node {
+            datafusion::logical_expr::LogicalPlan::TableScan(scan) => datafusion::datasource::source_as_provider(&scan.source).ok().is_some_and(|p| p.downcast_ref::<Guarded>().is_some_and(|g| !matches!(g.columns, Some(None)))),
+            _ => false,
+        })
+    })
+    .unwrap_or(true)
+}
+
+/// One of DataFusion's rules that answers a part of a plan with no rows and no scan (`WHERE 1=0`, `LIMIT 0`, a join on
+/// FALSE, a join an empty input empties: `optimize::rules`), kept from a part that reads a table its reader reads in part
+/// or may not read. Such a table's columns are checked at its scan (`Guarded::checked`), as a plan runs and as it is only
+/// described (`described`), so the part answered with none would name, as its answer's columns, every column of the
+/// table and its type (11-09 audit M1: `WHERE 1=0` is the probe JDBC and Spark send). The part keeps its scan, which then
+/// reads nothing (`Guarded::scan`). Only a part the rule could answer so is looked into (`empties`): any other, and every
+/// part of a plan that reads no such table, is the rule's as before.
+#[derive(Debug)]
+pub(crate) struct KeepGuarded(pub Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>);
+
+impl datafusion::optimizer::OptimizerRule for KeepGuarded {
+    fn name(&self) -> &str { self.0.name() }
+    fn apply_order(&self) -> Option<datafusion::optimizer::optimizer::ApplyOrder> { self.0.apply_order() }
+    fn supports_rewrite(&self) -> bool { true }
+    fn rewrite(&self, plan: datafusion::logical_expr::LogicalPlan, config: &dyn datafusion::optimizer::OptimizerConfig) -> datafusion::error::Result<datafusion::common::tree_node::Transformed<datafusion::logical_expr::LogicalPlan>> {
+        match empties(self.0.name(), &plan) && reads_guarded(&plan) {
+            true => Ok(datafusion::common::tree_node::Transformed::no(plan)),
+            false => self.0.rewrite(plan, config),
+        }
+    }
+}
+
+/// Could DataFusion's rule `rule` answer `plan` with no scan, as it is given it: `eliminate_filter` a filter that is never
+/// true, `eliminate_limit` a `LIMIT 0`, `propagate_empty_relation` a part over an empty one; `eliminate_join`, which walks
+/// the plan itself, any plan (it also drops a joined side whose columns nothing reads). The unit test below asks each.
+fn empties(rule: &str, plan: &datafusion::logical_expr::LogicalPlan) -> bool {
+    use datafusion::logical_expr::{FetchType, LogicalPlan};
+    match rule {
+        "eliminate_filter" => matches!(plan, LogicalPlan::Filter(f) if never(&f.predicate)),
+        "eliminate_limit" => matches!(plan, LogicalPlan::Limit(l) if matches!(l.get_fetch_type(), Ok(FetchType::Literal(Some(0))))),
+        "propagate_empty_relation" => plan.inputs().iter().any(|i| matches!(i, LogicalPlan::EmptyRelation(_))),
+        _ => true,
     }
 }
 
@@ -1381,8 +1441,9 @@ pub fn run_schema(ctx: &SessionContext, plan: &datafusion::logical_expr::Logical
 }
 
 /// `run_schema`, for a statement described to its caller and not run (Flight's GetFlightInfo, Postgres's Describe): each
-/// scan of a table it reads in part is asked, as the optimizer leaves it, what running it asks (`Guarded::checked`), so a
-/// description is refused as the statement's run would be, never told the columns it may not read (11-08 audit M6). A
+/// scan of a table it reads in part is asked, as the optimizer leaves it (which drops none: `KeepGuarded`), what running
+/// it asks (`Guarded::checked`), so a description is refused as the statement's run would be, never told the columns it
+/// may not read (11-08 audit M6). A
 /// statement that reads only what it may costs one optimizer pass more, and none for a caller whose scope is whole.
 pub fn described(ctx: &SessionContext, plan: &datafusion::logical_expr::LogicalPlan) -> Result<datafusion::common::DFSchemaRef> {
     use datafusion::common::tree_node::TreeNodeRecursion;
@@ -2064,6 +2125,61 @@ mod tests {
             assert!(!s.whole() && !s.sees(crate::rights::Object::Table("a")) && !s.shows_code(), "no scope: nothing");
             node.onto(&bare);
             assert!(Scope::of_session(bare.state_ref().read().config()).whole(), "given one: it");
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(())
+        })
+        .await
+    }
+    /// A probe that reads no rows (`LIMIT 0`, `WHERE 1=0`, a join on FALSE) of a table its reader reads in part keeps its
+    /// scan, where the columns are checked: refused, run or described, as the statement that reads rows is, never answered
+    /// with every column's name and type (`KeepGuarded`, 11-09 audit M1). Of the columns it may read it answers no rows,
+    /// and for a reader of the whole table the probe is still planned with no scan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_probe_of_no_rows_is_refused_the_columns_its_reader_may_not_read() -> anyhow::Result<()> {
+        crate::auth::as_node(async move {
+            use super::*;
+            use crate::rights::Scope;
+            use crate::users::{Access, Grant, On};
+            use datafusion::common::tree_node::TreeNode;
+            use datafusion::logical_expr::LogicalPlan;
+            let dir = std::env::temp_dir().join(format!("pondra-probe-{}", uuid::Uuid::new_v4()));
+            let lake = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            crate::write::create_table(&lake, "t", r#"{"columns": [["k", "Int64"], ["v", "Int64"]]}"#).await?;
+            let ann = Scope::granted(Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec!["v".into()] }])));
+            let scans = |p: &LogicalPlan| p.exists(|n| Ok(matches!(n, LogicalPlan::TableScan(_)))).unwrap();
+            let probes = ["SELECT * FROM t LIMIT 0", "SELECT * FROM t WHERE 1 = 0", "SELECT k FROM t WHERE false", "SELECT * FROM t a JOIN t b ON FALSE",
+                "SELECT * FROM t JOIN (SELECT 1 AS x WHERE false) e ON true", "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM t u LIMIT 0)"];
+            for sql in probes {
+                let ctx = session_for(&lake, sql, "", None, &ann).await?;
+                let run = async { anyhow::Ok(crate::engine::sql(&ctx, sql).await?.collect().await?) }.await;
+                assert!(run.as_ref().is_err_and(|e| format!("{e:#}").contains("permission denied")), "{sql} runs: {run:?}");
+                let df = crate::engine::sql(&ctx, sql).await?;
+                let told = described(&ctx, df.logical_plan());
+                assert!(told.as_ref().is_err_and(|e| format!("{e:#}").contains("permission denied")), "{sql} described: {told:?}");
+            }
+            let own = ["SELECT v FROM t LIMIT 0", "SELECT v FROM t WHERE 1 = 0", "SELECT * FROM (SELECT v FROM t) WHERE 1 = 0", "SELECT a.v FROM t a JOIN t b ON FALSE",
+                "SELECT t.v FROM t JOIN (SELECT 1 AS x WHERE false) e ON true"];
+            for sql in own {
+                let ctx = session_for(&lake, sql, "", None, &ann).await?;
+                let df = crate::engine::sql(&ctx, sql).await?;
+                let names: Vec<String> = described(&ctx, df.logical_plan())?.fields().iter().map(|f| f.name().clone()).collect();
+                assert_eq!(names, ["v"], "{sql}");
+                assert!(scans(&ctx.state().optimize(df.logical_plan())?), "{sql}: ann's keeps its scan");
+                if !sql.contains("JOIN") {
+                    let physical = datafusion::physical_plan::displayable(df.clone().create_physical_plan().await?.as_ref()).indent(false).to_string();
+                    assert!(physical.contains("EmptyExec") && !physical.contains("DataSourceExec"), "{sql}: it reads nothing: {physical}");
+                }
+                assert_eq!(df.collect().await?.iter().map(|b| b.num_rows()).sum::<usize>(), 0, "{sql}");
+            }
+            // (and for a reader of the whole table, each probe is planned with no scan, as before)
+            let node = crate::auth::Principal::node().scope;
+            for sql in probes.into_iter().chain(own) {
+                let ctx = session_for(&lake, sql, "", None, &node).await?;
+                let df = crate::engine::sql(&ctx, sql).await?;
+                let main = ctx.state().optimize(df.logical_plan())?;
+                assert!(!scans(&main), "{sql}: a whole reader's has none: {}", main.display_indent());
+            }
             lake.cat.close().await?;
             let _ = std::fs::remove_dir_all(&dir);
             Ok(())
