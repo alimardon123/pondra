@@ -31,7 +31,14 @@ pub fn register(ctx: &SessionContext) {
     let avg = Avg::default();
     let wholes = crate::fvar::with_wholes(avg.signature());
     ctx.register_udaf(AggregateUDF::from(RoundedAvg(avg, wholes)));
-    ctx.register_udf(ScalarUDF::new_from_impl(AvgOf(Signature::any(2, Volatility::Immutable))));
+    ctx.register_udf(AVG_OF.as_ref().clone());
+}
+
+static AVG_OF: std::sync::LazyLock<Arc<ScalarUDF>> = std::sync::LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(AvgOf(Signature::any(2, Volatility::Immutable)))));
+
+/// `pondra_avg_of(sum, count)`: an average from a sum and a count kept apart, as `avg` answers it (`AvgOf`).
+pub(crate) fn avg_of(sum: datafusion::logical_expr::Expr, count: datafusion::logical_expr::Expr) -> datafusion::logical_expr::Expr {
+    datafusion::logical_expr::Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(AVG_OF.clone(), vec![sum, count]))
 }
 
 /// A count as `/` divides by it: a BIGINT meeting a DECIMAL is a DECIMAL(20, 0) (`divide.rs`).
@@ -156,7 +163,7 @@ impl AggregateUDFImpl for RoundedAvg {
         let input = |f: &FieldRef| double(f) || crate::fvar::is_whole(f.data_type());
         match !args.is_distinct && double(&args.return_field) && args.input_fields.first().is_some_and(input) {
             true => Ok(crate::fvar::mean_state(args.name, crate::fvar::is_whole(args.input_fields[0].data_type()))),
-            false => self.0.state_fields(args),
+            false => crate::fvar::as_double_state(args, |a| self.0.state_fields(a)), // (DISTINCT: `as_double`'s)
         }
     }
 
@@ -289,8 +296,9 @@ impl GroupsAccumulator for Averages {
     }
 }
 
-/// A view's finished average (`finish.rs`): a DECIMAL sum over a count, as `avg` answers it (`Quotient`), so in the type
-/// the view's query has. NULL for no rows.
+/// An average from its sum and count kept apart, as `avg` answers it: a view's (`finish.rs`), a DECIMAL sum over a count
+/// (`Quotient`), in the type the view's query has; and the eager rule's (`eager.rs`), a whole sum (BIGINT, or UBIGINT) of
+/// integers of 32 bits or fewer over their count, as a DOUBLE rounded once (`fvar::whole_mean`). NULL for no rows.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct AvgOf(Signature);
 
@@ -301,16 +309,25 @@ impl ScalarUDFImpl for AvgOf {
     fn return_type(&self, types: &[DataType]) -> Result<DataType> {
         match quotient_of(&types[0]) {
             Some(t) => Ok(t),
-            None => plan_err!("pondra_avg_of takes a DECIMAL sum, not {}", types[0]),
+            None if matches!(types[0], DataType::Int64 | DataType::UInt64) => Ok(DataType::Float64),
+            None => plan_err!("pondra_avg_of takes a DECIMAL or whole sum, not {}", types[0]),
         }
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
-        let ([sums, counts], &DataType::Decimal128(_, s)) = (&arrays[..], arrays[0].data_type()) else {
-            return exec_err!("pondra_avg_of takes a DECIMAL sum and a count");
-        };
-        Ok(ColumnarValue::Array(Quotient::new(s, args.return_field.data_type())?.each(sums, counts)?))
+        let [sums, counts] = &arrays[..] else { return exec_err!("pondra_avg_of takes a sum and a count") };
+        match sums.data_type() {
+            &DataType::Decimal128(_, s) => Ok(ColumnarValue::Array(Quotient::new(s, args.return_field.data_type())?.each(sums, counts)?)),
+            DataType::Int64 | DataType::UInt64 => {
+                let (sums, counts) = (cast(sums, &DataType::Decimal128(38, 0))?, cast(counts, &DataType::Int64)?); // (a UBIGINT's too, as an i128)
+                let means: datafusion::arrow::array::Float64Array = sums.as_primitive::<Decimal128Type>().iter().zip(counts.as_primitive::<Int64Type>().iter())
+                    .map(|(s, n)| crate::fvar::whole_mean(s?, n?))
+                    .collect();
+                Ok(ColumnarValue::Array(Arc::new(means)))
+            }
+            t => exec_err!("pondra_avg_of takes a DECIMAL or whole sum, not {t}"),
+        }
     }
 }
 
@@ -332,6 +349,23 @@ mod tests {
         assert_eq!(averaged(&decimal(38, 10)), Some(decimal(38, 14)), "Arrow's s + 4 at 38 digits");
         assert_eq!(averaged(&DataType::Float64), None);
         assert_eq!(quotient_of(&decimal(25, 2)), averaged(&decimal(15, 2)), "a view's kept sum gives its query's type");
+    }
+
+    /// A whole sum over its count (the eager rule's average) is rounded once, as `avg` of the values answers: 2^53 + 1
+    /// as a DOUBLE is 2^53, a third of which is a half away from the exact 3,002,399,751,580,331.
+    #[tokio::test]
+    async fn a_whole_sum_over_its_count_is_rounded_once() -> Result<()> {
+        use datafusion::arrow::datatypes::Float64Type;
+        let ctx = crate::engine::session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        let sql = "SELECT pondra_avg_of(CAST(9007199254740993 AS BIGINT), CAST(3 AS BIGINT)) AS a, \
+                   pondra_avg_of(arrow_cast(9007199254740993, 'UInt64'), CAST(3 AS BIGINT)) AS u, \
+                   pondra_avg_of(CAST(NULL AS BIGINT), CAST(0 AS BIGINT)) AS none, avg(x) AS want FROM (VALUES (3002399751580331)) AS t(x)";
+        let got = ctx.sql(sql).await?.collect().await?;
+        let col = |i: usize| got[0].column(i).as_primitive::<Float64Type>().clone();
+        assert_eq!((col(0).value(0), col(1).value(0)), (3002399751580331.0, 3002399751580331.0), "rounded once");
+        assert!(col(2).is_null(0), "no rows: NULL");
+        assert_eq!(col(3).value(0), col(0).value(0), "as avg answers");
+        Ok(())
     }
 
     /// `avg` and `sum / count` answer alike: one value, per group, DISTINCT, over a sliding frame, and none.

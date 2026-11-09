@@ -109,6 +109,7 @@ PROCESS = {
     "python.rs:PYTHON": "what the process's Python (EXE's or CHOSEN's) said of itself",
     "engine.rs:JSON_TEXT": "a function's definition (pondra_json_text), the same for every lake",
     "casts.rs:WHOLE": "a function's definition (pondra_whole), the same for every lake",
+    "avg.rs:AVG_OF": "a function's definition (pondra_avg_of), the same for every lake",
     "multiply.rs:MULTIPLY": "a function's definition (pondra_multiply), the same for every lake",
     "divide.rs:DIVIDE": "a function's definitions (pondra_divide, Postgres's places and Spark's), the same for every lake",
     "reset.rs:USED": "what reset() sets back: every per-node static used since the process started",
