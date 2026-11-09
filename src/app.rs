@@ -3,7 +3,7 @@
 //! and call into it.
 use crate::log::{Log, Sequencer};
 use crate::store::*;
-use crate::tier::{expire, tier_table};
+use crate::tier::tier_table;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use serde_json::{json as j, Value};
@@ -400,7 +400,9 @@ impl App {
         let now = crate::log::now_ms();
         if now - EXPIRED.load(std::sync::atomic::Ordering::Relaxed) >= 10_000 {
             EXPIRED.store(now, std::sync::atomic::Ordering::Relaxed);
-            expire(&self.lake, self.retain_ms).await?;
+            crate::tier::refresh(&self.lake, &self.tables).await?; // (the round's briefs, as of now: what it tiered and merged)
+            let briefs = self.tables.lock().await.clone();
+            crate::tier::expire_with(&self.lake, self.retain_ms, &briefs).await?;
         }
         if start.elapsed() >= Duration::from_secs(5) {
             // one line when it drags
