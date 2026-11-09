@@ -55,10 +55,13 @@ const sizes = args.includes('--sizes');
 // 9.2305 → 9.2442 MB: a dropped database kept in its folder and UNDROP DATABASE (13.7 KB over main's 9,224,889 at
 // caedf432: 9,238,567 at f0045f19, measured on CI), the room above main kept as it was: the page builds the same ddl as
 // every form, a database's drop and undrop with it.
-// 9.2442 → 9.2482 MB: the catalog's hooks and the folder records (`store::CatalogHook`, `ddl::folder_hook`, 4.0 KB over
-// main's 9,224,889 at caedf432: 9,228,850 at 7490f43b, measured on CI), the room above main kept as it was:
-// a page's CREATE TABLE reads one folder's records, not every table, as every form's does.
-const BROTLI_BUDGET = 9_248_200;
+// 9.2442 → 9.2517 MB: UNDROP FILE (UNDROP for every kind, files): a page's lake lists a deleted file in `pondra.dropped`
+// and brings it back, as every form's does (5.3 KB over main's 9,228,372 at ed42156e, measured on CI), and the room
+// above main back to 3 KB, which the moves since had left at 0.9 KB (main's 9,243,289 at bb80824c).
+// 9.2517 → 9.2528 MB: the catalog's hooks and the folder records (`store::CatalogHook`, `ddl::folder_hook`, 4.0 KB over
+// main's 9,224,889 at caedf432: 9,228,850 at 7490f43b, measured on CI), the room above main kept at 3 KB (main's
+// 9,245,764 at ff11c95b): a page's CREATE TABLE reads one folder's records, not every table, as every form's does.
+const BROTLI_BUDGET = 9_252_800;
 // The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
 const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows
