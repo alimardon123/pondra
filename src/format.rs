@@ -198,7 +198,8 @@ impl Drop for Streamed {
 /// read it. A migration, when a format needs one, goes in the commit that sets it.
 pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>) {
     use std::sync::atomic::Ordering::Relaxed;
-    crate::spawns::spawn(async move {
+    let node = lake.node.clone();
+    node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
         let mut marked = false;
         if lake.format.made {
             lake.format.ready.store(known() + 2, Relaxed);
@@ -265,7 +266,8 @@ fn moves_alone(url: &str, made: bool) -> bool {
 /// unless this node was cut off while the others agreed, `raise`, or it started on such a lake
 /// before its catalog view held the format: it holds it once caught up, invariant 197.)
 pub fn watch(lake: Arc<Lake>) {
-    crate::spawns::spawn(async move {
+    let node = lake.node.clone();
+    node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             if let Err(e) = check(&lake.cat, &lake.url, false).await {

@@ -543,7 +543,7 @@ async fn stamp(lake: &Lake, d: &mut Ddl) -> Result<()> {
 /// Branches as readers of the lake they are made from (`pins`): their pins hold its files, a pin on lease lapses
 /// (`lapse`), and a pin whose branch is gone goes (`sweep`).
 pub fn readers() -> crate::pins::Pin {
-    crate::pins::Pin { name: "branches", held: |l| Box::pin(pins(l)), lapse: Some(|l| Box::pin(lapse(l))), sweep: Some(|l| Box::pin(sweep(l))) }
+    crate::pins::Pin { name: "branches", held: |l| Box::pin(pins(l)), lapse: Some(|l| Box::pin(lapse(l))), sweep: Some(|l| Box::pin(sweep(l))), floor: None }
 }
 
 /// The pins clean-up keeps files for: the oldest and the newest (None: no branch reads this lake).

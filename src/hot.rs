@@ -280,7 +280,8 @@ impl Hot {
             missing
         };
         let hot = self.clone();
-        crate::spawns::spawn(async move {
+        let node = lake.node.clone();
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             let _ = gate.await; // (the scan's query is over: its plan was dropped)
             let _slot = hot.slot.acquire().await;
             // (the room now, not when the scan asked: its query is over, and the next may hold what it left)

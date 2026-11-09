@@ -2447,7 +2447,8 @@ impl Lake {
             opens(&lake).await?; // (a branch's bases, so its files listed there are read: ADR-047)
         }
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
-            crate::spawns::spawn(Lake::commits(Arc::downgrade(&lake), writes, lake.node.life.clone())); // (weak: a lake opened in a process goes when its last handle does)
+            let (weak, n) = (Arc::downgrade(&lake), lake.node.clone());
+            lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move { Lake::commits(weak, writes, n.life.clone(), &n).await }); // (weak: a lake opened in a process goes when its last handle does)
         }
         Ok(lake)
     }
@@ -2459,10 +2460,10 @@ impl Lake {
     /// us out) has an unknown outcome: restart and rejoin; the restart reloads the state.
     /// Both loops hold the lake weakly: the writes' sender is the lake's own (`Catalog::writes`), so
     /// a strong hold would keep a lake opened in a process (a backup taken in it) for ever.
-    async fn commits(me: std::sync::Weak<Self>, mut writes: mpsc::UnboundedReceiver<Write>, life: Life) {
+    async fn commits(me: std::sync::Weak<Self>, mut writes: mpsc::UnboundedReceiver<Write>, life: Life, node: &crate::node_state::NodeState) {
         let (to_bucket, mut in_bucket) = mpsc::unbounded_channel::<(Arc<dyn Written>, u64)>();
         let (lake, lives) = (me.clone(), life.clone());
-        crate::spawns::spawn(async move {
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             while let Some((handle, id)) = in_bucket.recv().await {
                 if let Err(e) = handle.durable().await {
                     eprintln!("catalog commit failed: {e}");
@@ -3327,7 +3328,7 @@ impl Catalog {
     async fn writer(kv: Arc<dyn Kv>, since: Instant, node: &NodeState) -> Result<Self> {
         let mut cat = Self::new(kv, node);
         if traced_commits() {
-            Stages::sample_lag(Arc::downgrade(&cat.stages)); // (a leader's commits are what it times)
+            Stages::sample_lag(Arc::downgrade(&cat.stages), node); // (a leader's commits are what it times)
         }
         cat.replicas = crate::env::value("PONDRA_REPLICAS");
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
@@ -4296,8 +4297,8 @@ impl Stages {
     }
 
     /// How late a 10 ms sleep wakes, as the `lag` stage, while the catalog is (weak: it ends with it).
-    fn sample_lag(stages: Weak<Stages>) {
-        crate::spawns::spawn(async move {
+    fn sample_lag(stages: Weak<Stages>, node: &crate::node_state::NodeState) {
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             loop {
                 let t = Instant::now();
                 tokio::time::sleep(Duration::from_millis(10)).await;
