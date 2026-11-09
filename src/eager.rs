@@ -20,8 +20,10 @@
 //! of a fixed width (grouping by text there would cost what it saves); then the dimensions join those groups, and the
 //! grouping is done again over them, combining what the first one computed: a sum of sums, a sum of counts (0 when
 //! there are none, as a count is), a least of least values, a greatest of greatest, and an average as its sum over its
-//! count (of an integer only: a DECIMAL's average rounds as DataFusion's does, which this doesn't follow). A float is
-//! neither summed nor averaged in two steps: its one sum is rounded once (`fsum.rs`), a sum of sums twice.
+//! count, divided once as `avg` divides (`avg::avg_of`), of an integer of 32 bits or fewer only: its sums are whole
+//! numbers, exact in 64 bits, as the query's `avg` keeps them (`fvar::is_whole`). A BIGINT's sums could pass 64 bits, and
+//! a DECIMAL's average rounds as `avg.rs` does. A float is neither summed nor averaged in two steps: its one sum is
+//! rounded once (`fsum.rs`), a sum of sums twice.
 //! This holds whatever the join keys are: a dimension's row that meets a group meets each of its rows, so each sum is
 //! counted as many times as before. A grouping with no aggregate (a DISTINCT), DISTINCT, FILTER and ORDER BY inside an
 //! aggregate, any other aggregate, and a condition between a dimension and the rest other than an equality, leave the
@@ -71,7 +73,7 @@ enum Part {
     Count(Expr),
     Min(Expr),
     Max(Expr),
-    Avg(Expr), // (of an integer)
+    Avg(Expr), // (of an integer of 32 bits or fewer)
 }
 
 impl Part {
@@ -97,13 +99,13 @@ fn part(e: &Expr, schema: &DFSchema) -> Result<Option<Part>> {
     // (a float's sum is rounded once, exactly (`fsum.rs`): a sum of each group's rounded sums can end a bit away from it,
     // so a float is summed, and an average taken, only as the query wrote it; an integer's sums are exact either way)
     let exact = arg.get_type(schema).is_ok_and(|t| !t.is_floating());
-    let integer = arg.get_type(schema).is_ok_and(|t| t.is_integer());
+    let whole = arg.get_type(schema).is_ok_and(|t| t.is_integer() && crate::fvar::is_whole(&t));
     Ok(match func.name() {
         "sum" if exact => Some(Part::Sum(arg)),
         "count" => Some(Part::Count(arg)),
         "min" => Some(Part::Min(arg)),
         "max" => Some(Part::Max(arg)),
-        "avg" if integer => Some(Part::Avg(arg)),
+        "avg" if whole => Some(Part::Avg(arg)),
         _ => None,
     })
 }
@@ -206,9 +208,9 @@ fn eager(a: &Aggregate) -> Result<Option<LogicalPlan>> {
             Part::Min(x) => cast(take(min(x.clone()), min), want),
             Part::Max(x) => cast(take(max(x.clone()), max), want),
             Part::Avg(x) => {
-                let total = take(sum(cast(x.clone(), DataType::Float64)), sum);
-                let n = take(count(x.clone()), sum);
-                cast(total / cast(n, DataType::Float64), want)
+                let whole = cast(x.clone(), DataType::Int64); // (as the query's sum of it is typed: whole sums, exact in any order)
+                let (total, n) = (take(sum(whole), sum), take(count(x.clone()), sum));
+                cast(crate::avg::avg_of(total, n), want)
             }
         });
     }
@@ -360,7 +362,8 @@ mod tests {
 
     /// A filtered dimension cuts the rows its join keeps: grouping them all first would be work the join saves.
     /// DISTINCT inside an aggregate can't be combined, a DISTINCT of rows has no aggregate to tell its two groupings
-    /// apart, one text column costs about what grouping first does, and nothing is grouped first where nothing is text.
+    /// apart, one text column costs about what grouping first does, nothing is grouped first where nothing is text, and a
+    /// BIGINT's average is taken as the query wrote it (its sums could pass 64 bits).
     #[tokio::test]
     async fn left_as_it_was() -> Result<()> {
         let ctx = session(true).await?;
@@ -370,6 +373,7 @@ mod tests {
             "SELECT DISTINCT brand, sales.day FROM sales, item WHERE sales.item = item.id",
             "SELECT brand, sales.day, sum(qty) FROM sales, item WHERE sales.item = item.id GROUP BY brand, sales.day",
             "SELECT year, sum(price) FROM sales, day WHERE sales.day = day.id GROUP BY year",
+            "SELECT brand, class, avg(sales.day) FROM sales, item WHERE sales.item = item.id GROUP BY brand, class",
         ] {
             let (_, plan) = answer(&ctx, sql).await?;
             assert!(!plan.contains("__eager"), "{sql}: {plan}");
