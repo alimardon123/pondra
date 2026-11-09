@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """The catalog at 100,000 tables (redesign step 5, piece 9: designs/redesign/redesign.md §4, "measured at
-100,000 tables before it is changed"). It grows one lake's catalog in steps (1,000, 5,000, 10,000 and
-20,000 tables, each made by CREATE TABLE … AS SELECT: one file each) and at each step measures:
+100,000 tables before it is changed"). It grows one lake's catalog in steps (1,000, 10,000, 50,000 and
+100,000 tables, each made by CREATE TABLE … AS SELECT: one file each) and at each step measures:
 
 - what one statement reads and writes: `pondra_catalog_records_total` around one INSERT into one table, one SELECT
   of one table (`select`) and one CREATE TABLE, the least of five tries, less what reading /metrics reads itself
-  (`metrics_scrape_reads`); a node's own rounds read records too, shown as the idle rate;
+  (`metrics_scrape_reads`), each try in a quiet moment; a node's own rounds read and write records too, shown as
+  the idle rates;
 - the leader's resident memory;
 - a follower's start (to its first answer), its resident memory once settled, and its first query's latency;
 - the point lookup's p50 and p99 (GET /lookup on a keyed table of 100,000 rows), on the leader and the follower.
@@ -13,11 +14,10 @@
 The write-set rule (§4) says a commit's records may not grow with the tables it doesn't touch: the commit rows
 should read the same at every step. It changes nothing; it is the measure the other pieces are held to.
 
-Today a CREATE TABLE reads every table's record, so making N tables takes time in N squared: the default steps
-stop at 20,000 (about twenty minutes). Step 100,000 (about nine hours today) is run once piece 10 holds commits
-to their write set.
+A CREATE TABLE reads its own records since piece 10c, so the four steps take about half an hour on 4 cores
+(`logs/catalog-scale/`: each run's numbers, and docs/roadmap.md's row "Many tables in one lake").
 
-  catalog_scale.py [--bin target/release/pondra] [--lake DIR | s3://bucket/prefix] [--steps 1000,5000,10000,20000]
+  catalog_scale.py [--bin target/release/pondra] [--lake DIR | s3://bucket/prefix] [--steps 1000,10000,50000,100000]
                    [--workers 8] [--out results.json]
 
 For a bucket, the node takes AWS_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_REGION from the
@@ -29,7 +29,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ap = argparse.ArgumentParser()
 ap.add_argument("--bin", default=os.path.join(HERE, "..", "..", "target", "release", "pondra"))
 ap.add_argument("--lake", default="", help="a folder (made fresh when not given) or s3://bucket/prefix")
-ap.add_argument("--steps", default="1000,5000,10000,20000")
+ap.add_argument("--steps", default="1000,10000,50000,100000")
 ap.add_argument("--workers", type=int, default=8, help="requests making tables at once")
 ap.add_argument("--port", type=int, default=9740)
 ap.add_argument("--lookups", type=int, default=2000)
@@ -118,15 +118,16 @@ def scrape(port):
 
 
 def quiet(port, base, secs=0.3, most=20):
-    """Wait until the node reads nothing of its own for `secs` (its rounds tiering new tables read records while a
-    SELECT, which takes no lock they take, is timed), or `most` looks."""
-    r0, _ = records(port)
+    """Wait until the node reads and writes nothing of its own for `secs` (its rounds tiering new tables read records
+    while a SELECT, which takes no lock they take, is timed; a pass that writes, a sweep's or retention's, would count
+    inside a commit's), or `most` looks."""
+    r0, w0 = records(port)
     for _ in range(most):
         time.sleep(secs)
-        r1, _ = records(port)
-        if r1 - r0 - base[0] <= 0:
+        r1, w1 = records(port)
+        if r1 - r0 - base[0] <= 0 and w1 - w0 - base[1] <= 0:
             return
-        r0 = r1
+        r0, w0 = r1, w1
 
 
 def per_commit(port, statement, base):
@@ -142,15 +143,16 @@ def per_commit(port, statement, base):
         r1, w1 = records(port)
         tries.append((r1 - r0 - base[0], w1 - w0 - base[1], took))
         time.sleep(0.2)
-    best = min(tries)
+    best = min(tries, key=lambda t: (t[0] + t[1], t[2]))  # (the try with the fewest records: the least a background pass added)
     return {"reads": max(0, int(best[0])), "writes": max(0, int(best[1])), "p50_ms": round(statistics.median(t[2] for t in tries) * 1000, 2)}
 
 
 def idle_rate(port, base, secs=5):
-    r0, _ = records(port)
+    """The records an idle node reads and writes a second, its background passes'."""
+    r0, w0 = records(port)
     time.sleep(secs)
-    r1, _ = records(port)
-    return round(max(0.0, r1 - r0 - base[0]) / secs, 1)
+    r1, w1 = records(port)
+    return round(max(0.0, r1 - r0 - base[0]) / secs, 1), round(max(0.0, w1 - w0 - base[1]) / secs, 1)
 
 
 def lookups(port):
@@ -201,7 +203,7 @@ try:
         row = {"tables": n, "tables_made_per_s": rate}
         base = scrape(A.port)
         row["metrics_scrape_reads"] = int(base[0])
-        row["leader_idle_reads_per_s"] = idle_rate(A.port, base)
+        row["leader_idle_reads_per_s"], row["leader_idle_writes_per_s"] = idle_rate(A.port, base)
         row["commit_insert"] = per_commit(A.port, lambda i: f"INSERT INTO t{(i * 7919) % n:06d} VALUES (-1)", base)
         row["select"] = per_commit(A.port, lambda i: f"SELECT count(*) FROM t{(i * 104729) % n:06d}", base)  # (a statement's reads: the tables it names)
         row["commit_create"] = per_commit(A.port, lambda i: f"CREATE TABLE probe_{n}_{i} (x BIGINT)", base)

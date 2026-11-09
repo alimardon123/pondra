@@ -26,6 +26,9 @@ pub struct Principal {
     pub epoch: u64,
     /// When its credential ends (ms since the epoch): a user's token's expiry, a session's, an identity provider's token's.
     pub until: Option<u64>,
+    /// Asked at a door that reads only (MCP's query tool, a Flight ticket: `reading`), so nothing it runs moves a
+    /// sequence, wherever the call is: in its text, a view's query or a macro's (`seq::may_move`).
+    pub reads: bool,
 }
 
 impl Principal {
@@ -42,7 +45,7 @@ impl Principal {
             Role::None => crate::rights::Scope::nothing(),
             _ => crate::rights::Scope::everything(),
         };
-        Principal { name: name.into(), role, scope, door: "node", from: None, operator: false, epoch: 0, until: None }
+        Principal { name: name.into(), role, scope, door: "node", from: None, operator: false, epoch: 0, until: None, reads: false }
     }
 
     /// The node's own work's (`as_node`: what no request asked for, a task's tick, a view's refresh, the history's
@@ -175,14 +178,22 @@ impl crate::spawns::Carry for Door {
     }
 }
 
+/// `f` as asked at a door that reads only (MCP's query tool, a Flight ticket): its caller marked `reads`, so nothing it
+/// runs moves a sequence, wherever the call is (11-09 audit H1: the door's own look at the text finds no `nextval` a
+/// view's query or a macro holds). Work it hands on keeps the mark, as it keeps its caller (`carried`).
+pub async fn reading<F: std::future::Future>(f: F) -> F::Output {
+    match current() {
+        Some(p) => WHO.scope(Principal { reads: true, ..p }, f).await,
+        None => f.await, // (no caller: nothing moves a sequence anyway, `seq::may_move`, but the node's own work, which no door asks)
+    }
+}
+
 /// Is the request being served from whoever runs the nodes (`Principal::token`)? (None: work no
 /// door started, a task's included, is not: whoever made the task may be anyone.)
 pub fn operator() -> bool { current().is_some_and(|p| p.operator) }
 
-/// Does a node in this process take tokens? (Then nothing it serves is open, attached lakes included.)
-pub fn tokens_on() -> bool { TOKENS.load(std::sync::atomic::Ordering::Relaxed) }
-
-crate::per_node!(static TOKENS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
+/// Does node `node` take tokens? (Then nothing it serves is open, attached lakes included.)
+pub fn tokens_on(node: &crate::node_state::NodeState) -> bool { node.tokens.load(std::sync::atomic::Ordering::Relaxed) }
 
 /// The header that carries, with a change a node sends its leader, the user it is for: the leader
 /// runs it as that user, so its subqueries read with the user's grants, as where it came in. Only the
@@ -335,11 +346,7 @@ pub struct Auth {
 
 impl Auth {
     pub fn new(read: Option<String>, write: Option<String>, admin: Option<String>) -> Auth {
-        let auth = Auth { read, write, admin, network: false, owner: None };
-        if auth.on() {
-            TOKENS.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        auth
+        Auth { read, write, admin, network: false, owner: None }
     }
 
     /// The three tokens as the environment gives them (`PONDRA_READ_TOKEN`, `PONDRA_WRITE_TOKEN`, `PONDRA_ADMIN_TOKEN`): what
@@ -523,24 +530,31 @@ const TRIES: usize = 10;
 const MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
 const PAIRS: usize = 10_000; // (the pairs held at once: when full, the one whose newest failure is oldest goes)
 
+// (a node's own: two nodes in one process count apart, ADR-061 §3)
 #[derive(Default)]
 pub struct Guesses {
     failures: std::sync::Mutex<std::collections::HashMap<(std::net::IpAddr, String), std::collections::VecDeque<datafusion::common::instant::Instant>>>,
 }
 
-// (a node's own: two nodes in one process count apart, ADR-061 §3)
-crate::per_node!(static GUESSED: Guesses = Guesses::default(); clear = |g| {
-    let taken = std::mem::take(&mut *g.failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
-    drop(taken);
-});
+impl crate::lake_state::LakeState for Guesses {
+    const NAME: &'static str = "guesses";
+    const ABOUT: &'static str = "the failed sign-ins of each address and user name in the last minute: a node's own, counted at its home lake (ADR-061 §3)";
+    fn make() -> Self { Guesses::default() }
+}
 
 /// Seconds to wait before this address may try this user name again, when it has had ten failures in
 /// the last minute (None: it may try). A door that can't tell the address counts under 0.0.0.0. Each node
 /// counts its own, so a cluster of N nodes allows N times the guesses until 1.1 (redesign step 11's shared state).
-pub fn guessing(addr: Option<std::net::IpAddr>, user: &str) -> Option<u64> { GUESSED.guessing_at(addr, user, datafusion::common::instant::Instant::now()) }
+pub fn guessing(lake: &crate::store::Lake, addr: Option<std::net::IpAddr>, user: &str) -> Option<u64> {
+    lake.state::<Guesses>().ok()?.guessing_at(addr, user, datafusion::common::instant::Instant::now())
+}
 
 /// A failed sign-in of this address and user name, now.
-pub fn guessed(addr: Option<std::net::IpAddr>, user: &str) { GUESSED.guessed_at(addr, user, datafusion::common::instant::Instant::now()) }
+pub fn guessed(lake: &crate::store::Lake, addr: Option<std::net::IpAddr>, user: &str) {
+    if let Ok(g) = lake.state::<Guesses>() {
+        g.guessed_at(addr, user, datafusion::common::instant::Instant::now());
+    }
+}
 
 /// What a sign-in refused for its failures is told, with how long to wait (`guessing`), at every door.
 pub fn guessing_says(user: &str, wait: u64) -> String { format!("too many failed sign-ins for {user} from this address: wait {wait} s") }
@@ -791,7 +805,7 @@ mod tests {
     /// other key, a token's and a caller with no name are all refused.
     #[test]
     fn a_page_stages_only_its_own_files() {
-        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, scope: crate::rights::Scope::everything(), door: "http", from: None, operator: false, epoch: 0, until: None };
+        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, scope: crate::rights::Scope::everything(), door: "http", from: None, operator: false, epoch: 0, until: None, reads: false };
         assert_eq!(slug(&user("ali")).as_deref(), Some("616c69"), "a user's slug is its name in hex");
         assert!(slug(&Principal::token(Role::Admin)).is_none(), "a token has no slug");
         let long = format!("stage/616c69/{}/0.parquet", "j".repeat(65));
@@ -829,6 +843,30 @@ mod tests {
         }
         assert_eq!(g.guessing_at(ip(1), "bo", t), None, "another user from the same address");
         assert_eq!(g.guessing_at(ip(2), "al", t), None, "the same user from another address");
+    }
+
+    /// Two nodes in one process count their failed sign-ins apart (ADR-061 §3): ten at one lake refuse that address and user
+    /// name there, and not at the other.
+    #[tokio::test]
+    async fn two_lakes_count_failed_sign_ins_apart() -> Result<()> {
+        let addr = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut lakes = vec![];
+        for _ in 0..2 {
+            let dir = std::env::temp_dir().join(format!("pondra-two-guesses-{}", uuid::Uuid::new_v4()));
+            let lake = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            lakes.push((lake, dir));
+        }
+        let (a, b) = (&lakes[0].0, &lakes[1].0);
+        for _ in 0..TRIES {
+            guessed(a, addr, "ann");
+        }
+        assert!(guessing(a, addr, "ann").is_some(), "ten failures at a: refused there");
+        assert!(guessing(b, addr, "ann").is_none(), "b counts apart: free there");
+        for (lake, dir) in lakes {
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        Ok(())
     }
 
     #[test]

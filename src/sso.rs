@@ -66,6 +66,7 @@ impl Provider {
 
 /// `CREATE [OR REPLACE] IDENTITY PROVIDER [IF NOT EXISTS] name (…)`, `DROP IDENTITY PROVIDER [IF EXISTS]
 /// name`; None for anything else.
+#[cfg(test)]
 pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     use crate::write::Stmt;
     let w = Words::of(sql)?;
@@ -81,6 +82,38 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     Some(match parse(w) {
         Ok(c) => Stmt::Ddl(vec![crate::ddl::Ddl::Users(c)]),
         Err(e) => Stmt::Invalid(format!("{e:#}")),
+    })
+}
+
+/// The identity providers' extension (ADR-074): its statements in the registry's statements section, by their words
+/// (step 8, PR 8b), and the lake's providers as a state of the lake (`Providers`, step 2 PR 10a). The core carries the
+/// statements out (`Ddl::Users`), so they stand in for their run and right until it has its own.
+pub static SSO: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "sso",
+    requires: &[],
+    register: |r| {
+        let s = r.section_mut::<crate::statements::Statements>();
+        ENTRIES.iter().for_each(|e| s.add(e));
+        r.section_mut::<crate::lake_state::Registered>().add::<Providers>();
+    },
+};
+
+static ENTRIES: &[crate::statements::Statement] = &[
+    entry(&["CREATE", "IDENTITY", "PROVIDER"], "an identity provider whose tokens sign users in (ADR-062)"),
+    entry(&["CREATE", "OR", "REPLACE", "IDENTITY", "PROVIDER"], "an identity provider, in place of one of its name"),
+    entry(&["ALTER", "IDENTITY", "PROVIDER"], "an identity provider's options"),
+    entry(&["DROP", "IDENTITY", "PROVIDER"], "drops an identity provider"),
+];
+
+const fn entry(words: &'static [&'static str], about: &'static str) -> crate::statements::Statement {
+    use crate::statements::{Read, Right, Run};
+    crate::statements::Statement { words, read: Read::Core(read), run: Run::Stmt, right: Right::FromStmt, needs: &[], about, extension: "sso" }
+}
+
+fn read(w: &mut Words) -> Result<crate::write::Stmt> {
+    Ok(match parse(std::mem::take(w)) {
+        Ok(c) => crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Users(c)]),
+        Err(e) => crate::write::Stmt::Invalid(format!("{e:#}")),
     })
 }
 
@@ -215,7 +248,7 @@ pub async fn create(lake: &Lake, name: String, p: Provider, replace: bool, if_no
     let mut puts = vec![(key(&name), json(&p))];
     puts.extend(crate::users::signed_mark(lake).await?);
     lake.cat.commit(puts, &[]).await?;
-    forget();
+    forget(lake);
     remember(&p.issuer, Ok(found));
     let mut out = j!({"identity_provider": name, "issuer": p.issuer, "keys": keys});
     if open {
@@ -231,29 +264,35 @@ pub async fn drop(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
         return Ok(j!({"identity_provider": name, "dropped": false}));
     }
     lake.cat.commit(vec![], &[key(name)]).await?;
-    forget();
+    forget(lake);
     Ok(j!({"identity_provider": name, "dropped": true}))
 }
 
 /// What this node worked out from the providers goes at once (elsewhere, within `users::fresh`'s second).
-fn forget() {
-    ALL.lock().unwrap().clear();
-    crate::users::forget();
+fn forget(lake: &Lake) {
+    if let Ok(p) = lake.state::<Providers>() {
+        *p.0.lock().unwrap() = None;
+    }
+    crate::users::forget(lake);
 }
 
-crate::per_node!(
-    /// The lake's providers as of a catalog version (`users::fresh`): every sign-in by token reads them.
-    static ALL: Mutex<HashMap<String, (Option<u64>, Instant, Arc<Vec<(String, Provider)>>)>> = Default::default());
+/// The lake's identity providers as of a catalog version (`users::fresh`): every sign-in by token reads them.
+#[derive(Default)]
+pub struct Providers(Mutex<Option<(Option<u64>, Instant, Arc<Vec<(String, Provider)>>)>>);
+impl crate::lake_state::LakeState for Providers { const NAME: &'static str = "sso"; const ABOUT: &'static str = "its identity providers, as of a catalog version"; fn make() -> Self { Providers::default() } }
 
 /// The lake's providers, by name.
 pub async fn all(lake: &Lake) -> Result<Arc<Vec<(String, Provider)>>> {
     let version = lake.cat.version();
-    if let Some(c) = ALL.lock().unwrap().get(&lake.url).filter(|c| crate::users::fresh(lake, version, c.0, c.1)) {
-        return Ok(c.2.clone());
+    let providers = lake.state::<Providers>().ok(); // (none: no cache, the providers are read each time)
+    if let Some(c) = providers.as_ref().and_then(|p| p.0.lock().unwrap().clone()).filter(|c| crate::users::fresh(lake, version, c.0, c.1)) {
+        return Ok(c.2);
     }
     let found: Vec<(String, Provider)> = lake.cat.scan::<Provider>("ip/", "ip0").await?.into_iter().map(|(k, p)| (k[3..].to_string(), p)).collect();
     let found = Arc::new(found);
-    ALL.lock().unwrap().insert(lake.url.clone(), (version, Instant::now(), found.clone()));
+    if let Some(p) = &providers {
+        *p.0.lock().unwrap() = Some((version, Instant::now(), found.clone()));
+    }
     Ok(found)
 }
 
@@ -468,12 +507,10 @@ struct Keys {
     asked: Instant,
 }
 
-crate::per_node!(
-    /// Each issuer's keys, as last fetched.
-    static KEYS: Mutex<HashMap<String, Keys>> = Default::default());
-crate::per_node!(
-    /// One fetch at a time an issuer: the sign-ins waiting on it read what it found.
-    static FETCHING: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> = Default::default());
+/// Each issuer's keys, as last fetched.
+static KEYS: std::sync::LazyLock<Mutex<HashMap<String, Keys>>> = std::sync::LazyLock::new(Default::default);
+/// One fetch at a time an issuer: the sign-ins waiting on it read what it found.
+static FETCHING: std::sync::LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = std::sync::LazyLock::new(Default::default);
 
 const HOUR: Duration = Duration::from_secs(3_600);
 const MINUTE: Duration = Duration::from_secs(60);
@@ -492,12 +529,12 @@ async fn key_for(p: &Provider, kid: Option<&str>, alg: &str) -> Result<Jwk> {
         }
     };
     // (the key if any, whether the keys are an hour old or less, and whether the provider may be asked again)
-    let look = || KEYS.lock().unwrap().get(&p.issuer).map(|k| (pick(&k.keys), k.fetched.is_some_and(|f| f.elapsed() < HOUR), k.asked.elapsed() >= MINUTE));
+    let look = || KEYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&p.issuer).map(|k| (pick(&k.keys), k.fetched.is_some_and(|f| f.elapsed() < HOUR), k.asked.elapsed() >= MINUTE));
     if let Some((Some(key), fresh, may)) = look() {
         if !fresh && may {
             // (an hour old: asked again beside this sign-in, which goes on with the key it has, so a key the
             // provider took away stops signing in within the hour, and no sign-in waits on the provider)
-            if let Some(k) = KEYS.lock().unwrap().get_mut(&p.issuer) {
+            if let Some(k) = KEYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(&p.issuer) {
                 k.asked = Instant::now();
             }
             let issuer = p.issuer.clone();
@@ -505,7 +542,7 @@ async fn key_for(p: &Provider, kid: Option<&str>, alg: &str) -> Result<Jwk> {
         }
         return Ok(key);
     }
-    let gate = FETCHING.lock().unwrap().entry(p.issuer.clone()).or_default().clone();
+    let gate = FETCHING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(p.issuer.clone()).or_default().clone();
     let _one = gate.lock().await;
     match look() {
         Some((Some(key), _, _)) => return Ok(key), // (fetched while this one waited)
@@ -521,7 +558,7 @@ async fn key_for(p: &Provider, kid: Option<&str>, alg: &str) -> Result<Jwk> {
 
 /// Keep what a fetch found, the document and its keys (or, when it failed, what there was, asked again in a minute).
 fn remember(issuer: &str, found: Result<(Value, Vec<Jwk>)>) {
-    let mut all = KEYS.lock().unwrap();
+    let mut all = KEYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = Instant::now();
     match found {
         Ok((doc, keys)) => {
@@ -540,11 +577,11 @@ fn remember(issuer: &str, found: Result<(Value, Vec<Jwk>)>) {
 /// sign-ins with the document it had.
 pub(crate) async fn discovery(issuer: &str) -> Result<Value> {
     // (the document, whether it is an hour old or less, and whether the provider may be asked again)
-    let look = || KEYS.lock().unwrap().get(issuer).map(|k| (k.doc.clone(), k.fetched.is_some_and(|f| f.elapsed() < HOUR), k.asked.elapsed() >= MINUTE));
+    let look = || KEYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(issuer).map(|k| (k.doc.clone(), k.fetched.is_some_and(|f| f.elapsed() < HOUR), k.asked.elapsed() >= MINUTE));
     if let Some((doc, true, _)) = look().filter(|(doc, ..)| !doc.is_null()) {
         return Ok(doc);
     }
-    let gate = FETCHING.lock().unwrap().entry(issuer.to_string()).or_default().clone();
+    let gate = FETCHING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(issuer.to_string()).or_default().clone();
     let _one = gate.lock().await;
     match look() {
         Some((doc, fresh, may)) if !doc.is_null() && (fresh || !may) => return Ok(doc), // (fetched while this one waited, or asked less than a minute ago)

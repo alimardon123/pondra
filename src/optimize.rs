@@ -126,6 +126,7 @@ pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     let mut rules = Analyzer::new().rules;
     let at = rules.iter().position(|r| r.name() == "type_coercion").unwrap_or(0);
     rules.insert(at, Arc::new(crate::divide::Quotients)); // (just before: what reads a quotient is typed from its type)
+    rules.insert(at, Arc::new(crate::set_all::SetsAll)); // (INTERSECT ALL and EXCEPT ALL count copies: before type coercion casts the join's columns)
     rules.insert(at, Arc::new(crate::one_row::OneRow)); // (a scalar subquery that reads the outer row and isn't aggregated, or ends in LIMIT 1: one DataFusion runs)
     rules.insert(at, Arc::new(crate::lifted::Lifted)); // (just before: a subquery of the outer row in an aggregate or a window, worked out in a projection under it)
     rules.insert(at, Arc::new(FloatsWin));
