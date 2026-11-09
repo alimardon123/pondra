@@ -648,7 +648,9 @@ def format_check(new_bin, work, port, old=None):
     checks["a lake this build makes starts at its tables' column lists (format 6)"] = until(lambda: fmt(first) == LISTS, 3, step=0.1)
     first.q("CREATE TABLE t (x INT)")
     first.q("INSERT INTO t VALUES (1), (2)")
-    first.q("CREATE MATERIALIZED VIEW means AS SELECT avg(x) AS m FROM t")
+    first.q("CREATE TABLE s (k VARCHAR, x INT)")
+    first.q("INSERT INTO s VALUES ('a', 1), ('a', 2)")
+    first.q("CREATE MATERIALIZED VIEW means AS SELECT k, avg(x) AS m FROM s GROUP BY k")  # (grouped: a view of one row keeps its query otherwise)
     checks["…and a view of averages moves it to format 7, keeping its query's own state"] = \
         until(lambda: fmt(first) == FORMAT, 3, step=0.1) and until(lambda: first.q("SELECT m FROM means") == [{"m": 1.5}], 10)
     first.stop()
