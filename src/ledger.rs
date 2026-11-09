@@ -286,7 +286,9 @@ pub struct Ledger {
     line: usize,           // the queries' line: what their reservations hold together, at most
     whole: usize,          // the whole line: the queries' reservations and the caches together (`usize::MAX`: none known)
     reserved: AtomicUsize, // every lake's reservations together
+    unspillable: AtomicUsize, // what of them can't be spilled
     busy: AtomicUsize,     // lakes with a memory consumer registered now
+    spilling: AtomicUsize, // lakes with a spilling consumer registered now
     cached: AtomicUsize,   // what the caches held at the last look (`note`), less what grows took back since
     dry: AtomicBool,       // a take-back since the last look came back short: grows don't ask the caches again until `note`
     born: Instant,         // (what `noted` counts from)
@@ -305,7 +307,7 @@ impl Ledger {
     /// A node's budget on `root`, as `new` takes its sizes: the node's lakes share it, and the root holds it to what the
     /// process's other nodes leave (`line_now`, `over`).
     pub fn on(root: &Arc<Root>, line: usize, whole: usize) -> Arc<Ledger> {
-        let made = Arc::new(Ledger { line, whole, reserved: AtomicUsize::new(0), busy: AtomicUsize::new(0), cached: AtomicUsize::new(0), dry: AtomicBool::new(false), born: Instant::now(), noted: AtomicU64::new(NEVER), caches: Default::default(), root: root.clone() });
+        let made = Arc::new(Ledger { line, whole, reserved: AtomicUsize::new(0), unspillable: AtomicUsize::new(0), busy: AtomicUsize::new(0), spilling: AtomicUsize::new(0), cached: AtomicUsize::new(0), dry: AtomicBool::new(false), born: Instant::now(), noted: AtomicU64::new(NEVER), caches: Default::default(), root: root.clone() });
         let mut nodes = root.nodes.lock().unwrap_or_else(PoisonError::into_inner);
         nodes.retain(|n| n.strong_count() > 0);
         nodes.push(Arc::downgrade(&made));
@@ -341,16 +343,24 @@ impl Ledger {
         self.root.moved(&self.root.cached, was, to(was));
     }
 
-    /// Adds `bytes` to what the queries hold, here and on the root.
-    fn reserve(&self, bytes: usize) {
+    /// Adds `bytes` to what the queries hold, here and on the root, and to what can't be spilled unless `spills`.
+    fn reserve(&self, bytes: usize, spills: bool) {
         self.reserved.fetch_add(bytes, Relaxed);
         self.root.reserved.fetch_add(bytes, Relaxed);
+        if !spills {
+            self.unspillable.fetch_add(bytes, Relaxed);
+            self.root.unspillable.fetch_add(bytes, Relaxed);
+        }
     }
 
-    /// Takes `bytes` off what the queries hold, here and on the root.
-    fn release(&self, bytes: usize) {
+    /// Takes `bytes` off what the queries hold, here and on the root, and off what can't be spilled unless `spills`.
+    fn release(&self, bytes: usize, spills: bool) {
         self.reserved.fetch_sub(bytes, Relaxed);
         self.root.reserved.fetch_sub(bytes, Relaxed);
+        if !spills {
+            self.unspillable.fetch_sub(bytes, Relaxed);
+            self.root.unspillable.fetch_sub(bytes, Relaxed);
+        }
     }
 
     /// Reads what the caches inside the whole line hold now (`Charged::inside`), for the grows to go by until the next look,
@@ -379,20 +389,29 @@ impl Ledger {
     pub fn reserved(&self) -> usize { self.reserved.load(Relaxed) }
 
     /// A lake's share now: the line over the lakes running queries, at least one.
-    pub fn share(&self) -> usize { self.line_now(true) / self.busy.load(Relaxed).max(1) }
+    pub fn share(&self) -> usize { self.line_now(true, false) / self.busy.load(Relaxed).max(1) }
 
-    /// The node's line now: its own, less what the process's other nodes hold past the root's line. A spiller's is at
-    /// least the node's even share of the root while other nodes run queries too, as a lake's share is within its node, so
-    /// it spills there rather than being refused for what another node holds, and the other node's spillers are held to
-    /// theirs at their next grow. A node alone on its root has its own line, whatever the root's: one node in a process,
-    /// every node until several run in one, holds what it held before the root.
-    fn line_now(&self, spills: bool) -> usize {
+    /// The node's line now, for a consumer that `spills` or not and `holds` memory now or not: its own, held to what the
+    /// process's other nodes leave of the root's line while they run queries too, so the root's line holds where a spiller
+    /// spills (11-09 audit M7). A spiller is held to its node's share of the room for spilling too (`Root::share`, besides
+    /// the node's own memory that can't spill), so a node that grew alone is held to it at its next grow once another node
+    /// runs queries, and spills. A spiller holding nothing yet has its node's share though the other nodes leave less: it
+    /// has nothing to spill, so a refusal would fail its query (a sort's first batch), and that one grow is all it holds
+    /// past the line, until the other nodes' spillers are refused at their next grow and spill. A node alone on its root
+    /// has its own line, whatever the root's: one node in a process, every node until several run in one, holds what it
+    /// held before the root.
+    fn line_now(&self, spills: bool, holds: bool) -> usize {
         let others = self.root.reserved().saturating_sub(self.reserved());
-        if others == 0 {
+        if others == 0 && self.root.busy.load(Relaxed) <= 1 {
             return self.line;
         }
         let free = self.root.line.saturating_sub(others);
-        self.line.min(if spills { free.max(self.root.share()) } else { free })
+        let share = || self.root.share().saturating_add(self.unspillable.load(Relaxed)); // (the lakes' own is taken off theirs)
+        self.line.min(match (spills, holds) {
+            (false, _) => free,
+            (true, true) => free.min(share()),
+            (true, false) => share(),
+        })
     }
 
     /// Counts `cache` on this line, under `name`, for as long as it lives: `/metrics`' `cache_bytes` reads it by that name,
@@ -508,6 +527,7 @@ impl Drop for Ledger {
         // (a node's budget gone: what it counted is no longer the root's)
         self.root.moved(&self.root.cached, self.cached.load(Relaxed), 0);
         self.root.moved(&self.root.reserved, self.reserved.load(Relaxed), 0);
+        self.root.moved(&self.root.unspillable, self.unspillable.load(Relaxed), 0);
     }
 }
 
@@ -523,15 +543,17 @@ pub struct Root {
     line: usize,           // every node's queries together, at most
     whole: usize,          // every node's queries and caches together (`usize::MAX`: none known)
     reserved: AtomicUsize, // every node's queries' reservations together
+    unspillable: AtomicUsize, // what of them can't be spilled
     cached: AtomicUsize,   // what every node's caches are counted as holding (`Ledger::cached`), together
     busy: AtomicUsize,     // nodes with a lake running queries now
+    spilling: AtomicUsize, // nodes with a lake running a spilling consumer now
     nodes: Mutex<Vec<Weak<Ledger>>>, // the nodes' budgets on it (`Ledger::on`)
 }
 
 impl Root {
     /// A root of `line` for the queries and `whole` for them and the caches.
     pub fn new(line: usize, whole: usize) -> Arc<Root> {
-        Arc::new(Root { line, whole, reserved: AtomicUsize::new(0), cached: AtomicUsize::new(0), busy: AtomicUsize::new(0), nodes: Default::default() })
+        Arc::new(Root { line, whole, reserved: AtomicUsize::new(0), unspillable: AtomicUsize::new(0), cached: AtomicUsize::new(0), busy: AtomicUsize::new(0), spilling: AtomicUsize::new(0), nodes: Default::default() })
     }
 
     pub fn line(&self) -> usize { self.line }
@@ -544,8 +566,9 @@ impl Root {
     /// What every node's caches were counted as holding at their last looks, less what grows took back since.
     pub fn cached(&self) -> usize { self.cached.load(Relaxed) }
 
-    /// A node's even share of the line while several run queries.
-    fn share(&self) -> usize { self.line / self.busy.load(Relaxed).max(1) }
+    /// A node's even share of the room for spilling while several run queries: the line less every node's memory that
+    /// can't be spilled, over the nodes with a spiller, as `FairSpillPool` shares its pool among its spillers.
+    fn share(&self) -> usize { self.line.saturating_sub(self.unspillable.load(Relaxed)) / self.spilling.load(Relaxed).max(1) }
 
     /// The nodes' budgets alive now: the memory watch's walk (`oom.rs`) and a grow's past the whole line (`make_room`).
     pub fn nodes(&self) -> Vec<Arc<Ledger>> {
@@ -608,7 +631,7 @@ impl LakePool {
     /// What `r` may grow by within the lake's room (`room`), by `FairSpillPool`'s rules, and the room.
     fn available(&self, p: &Part, r: &MemoryReservation) -> (usize, usize) {
         let spills = r.consumer().can_spill();
-        let room = self.room(p, spills);
+        let room = self.room(p, spills, r.size() > 0);
         let available = match spills {
             // (no spiller past its part of what the lake's unspillable memory leaves of its room)
             true => room.saturating_sub(p.unspillable).checked_div(p.spillers).unwrap_or(room).saturating_sub(r.size()),
@@ -621,9 +644,9 @@ impl LakePool {
     /// SELECT beside it doesn't halve its room (11-06 audit M10). A spiller has at least the lake's even share of the line
     /// (`Ledger::share`) while others hold the rest, as between pools of their own: the other lakes' spillers are held to
     /// theirs at their next grow, and spill.
-    fn room(&self, p: &Part, spills: bool) -> usize {
+    fn room(&self, p: &Part, spills: bool, holds: bool) -> usize {
         let l = &self.ledger;
-        let line = l.line_now(spills); // (the node's line, less what other nodes hold past the root's)
+        let line = l.line_now(spills, holds); // (the node's line, held to what other nodes leave of the root's)
         let free = line.saturating_sub(l.reserved().saturating_sub(p.spillable + p.unspillable));
         if spills { free.max(line / l.busy.load(Relaxed).max(1)) } else { free }
     }
@@ -680,13 +703,23 @@ impl MemoryPool for LakePool {
             self.ledger.root.busy.fetch_add(1, Relaxed); // (the node's first lake running queries)
         }
         p.consumers += 1;
-        p.spillers += usize::from(c.can_spill());
+        if c.can_spill() {
+            p.spillers += 1;
+            if p.spillers == 1 && self.ledger.spilling.fetch_add(1, Relaxed) == 0 {
+                self.ledger.root.spilling.fetch_add(1, Relaxed); // (the node's first lake running a spiller)
+            }
+        }
     }
 
     fn unregister(&self, c: &MemoryConsumer) {
         let mut p = self.part();
         p.consumers = p.consumers.saturating_sub(1);
-        p.spillers = p.spillers.saturating_sub(usize::from(c.can_spill()));
+        if c.can_spill() && p.spillers > 0 {
+            p.spillers -= 1;
+            if p.spillers == 0 && self.ledger.spilling.fetch_sub(1, Relaxed) == 1 {
+                self.ledger.root.spilling.fetch_sub(1, Relaxed); // (its last)
+            }
+        }
         if p.consumers == 0 && self.ledger.busy.fetch_sub(1, Relaxed) == 1 {
             self.ledger.root.busy.fetch_sub(1, Relaxed); // (its last)
         }
@@ -694,14 +727,14 @@ impl MemoryPool for LakePool {
 
     fn grow(&self, r: &MemoryReservation, additional: usize) {
         *self.part().of(r) += additional;
-        self.ledger.reserve(additional);
+        self.ledger.reserve(additional, r.consumer().can_spill());
     }
 
     fn shrink(&self, r: &MemoryReservation, shrink: usize) {
         let mut p = self.part();
         let held = p.of(r);
         *held = held.saturating_sub(shrink);
-        self.ledger.release(shrink);
+        self.ledger.release(shrink, r.consumer().can_spill());
     }
 
     fn try_grow(&self, r: &MemoryReservation, additional: usize) -> Result<()> {
@@ -736,11 +769,11 @@ impl MemoryPool for LakePool {
                 // continue external sort"), and what can't spill (a hash join's build side) would fail its query for a
                 // reader's moment in a cache, so both are held to their share alone, as before, with the memory watch
                 // behind them, and take back what the caches give.
-                return Err(self.refused(r, additional, 0, self.room(&p, true)));
+                return Err(self.refused(r, additional, 0, self.room(&p, true, true)));
             }
         }
         *p.of(r) += additional;
-        self.ledger.reserve(additional);
+        self.ledger.reserve(additional, r.consumer().can_spill());
         Ok(())
     }
 
@@ -750,7 +783,7 @@ impl MemoryPool for LakePool {
         p.spillable + p.unspillable
     }
 
-    fn memory_limit(&self) -> MemoryLimit { MemoryLimit::Finite(self.room(&self.part(), true)) }
+    fn memory_limit(&self) -> MemoryLimit { MemoryLimit::Finite(self.room(&self.part(), true, false)) }
 }
 
 /// A frugal retry's pool when the memory watch stopped its first try (`query::frugally`): the lake's, but held to half
@@ -1233,8 +1266,8 @@ mod tests {
 
     /// Two nodes in one process together hold no more than its line (review change 4): each has a budget of 100 on a root of
     /// 150, so the second's memory that can't spill is held to what the first leaves of the root, though its own budget
-    /// has room; a spiller there has its node's even share of the root and spills past it; and a node alone on its root has
-    /// its own budget, whatever the root's, as before the root.
+    /// has room; a spiller there has what the first's memory that can't spill leaves, not half the root (11-09 audit M7),
+    /// and spills past it; and a node alone on its root has its own budget, whatever the root's, as before the root.
     #[test]
     fn two_nodes_on_one_root_hold_no_more_than_its_line() {
         let root = Root::new(150, usize::MAX);
@@ -1248,12 +1281,46 @@ mod tests {
         assert_eq!((root.reserved(), a.reserved(), b.reserved()), (150, 100, 50));
         drop(held_b);
         let spills = consumer(&pb, "b's sort", true);
-        spills.try_grow(75).expect("a spiller has its node's even share of the root, 150 over two nodes");
-        assert!(spills.try_grow(1).is_err(), "and spills past it");
+        assert!(spills.try_grow(51).is_err(), "a's 100 that can't spill leave b's spiller 50 of the root, not half of it");
+        spills.try_grow(50).expect("b's spiller's 50");
+        assert!(spills.try_grow(1).is_err(), "and it spills past them");
+        assert_eq!(root.reserved(), 150, "the root's line, no more");
         drop((held_a, spills));
         assert_eq!(root.reserved(), 0, "all given back, on the root too");
         let alone = Ledger::on(&Root::new(50, usize::MAX), 100, usize::MAX);
         consumer(&alone.pool(), "alone", false).try_grow(100).expect("a node alone on its root holds its budget past the root's line");
+    }
+
+    /// The root's line holds where a spiller spills (11-09 audit M7): a spiller that grew while its node ran alone is held to
+    /// its node's share at its next grow once another node runs queries, and spills; the other node's spiller, holding
+    /// nothing yet, has nothing to spill, so it takes one grow of its share past what the first leaves, and no more; then the
+    /// two hold the root's line between them, at most.
+    #[test]
+    fn a_spiller_spills_at_the_roots_line() {
+        let root = Root::new(150, usize::MAX);
+        let (a, b) = (Ledger::on(&root, 150, usize::MAX), Ledger::on(&root, 150, usize::MAX));
+        let (pa, pb) = (a.pool(), b.pool());
+        let sort_a = consumer(&pa, "a's sort", true);
+        sort_a.try_grow(140).expect("alone, a's sort has the root");
+        let sort_b = consumer(&pb, "b's sort", true);
+        assert!(sort_b.try_grow(76).is_err(), "no more than b's share, 150 over two nodes with spillers");
+        sort_b.try_grow(30).expect("b's first batch, though a leaves 10: it has nothing to spill");
+        assert_eq!(root.reserved(), 170, "past the line by b's one grow");
+        assert!(sort_b.try_grow(1).is_err(), "and no more: b holds something now, and spills past what a leaves");
+        assert!(sort_a.try_grow(1).is_err(), "a is held to its share, 75, at its next grow");
+        sort_a.shrink(140); // (and spills)
+        assert!(sort_a.try_grow(76).is_err(), "no more than its share again");
+        sort_a.try_grow(75).unwrap();
+        assert!(sort_a.try_grow(1).is_err());
+        sort_b.try_grow(45).expect("b's share, now that a leaves it");
+        assert!(sort_b.try_grow(1).is_err());
+        assert_eq!(root.reserved(), 150, "the root's line between them, no more");
+        drop(sort_b);
+        sort_a.try_grow(75).expect("b done: a alone again has the root");
+        let held = consumer(&pb, "b's hash join", false);
+        assert!(held.try_grow(1).is_err(), "what can't spill has what a leaves, nothing");
+        drop((sort_a, held));
+        assert_eq!((root.reserved(), root.unspillable.load(Relaxed), root.spilling.load(Relaxed), root.busy.load(Relaxed)), (0, 0, 0, 0));
     }
 
     /// Past the root's whole line, a grow takes cache bytes back from its own node's caches first, then from the other
