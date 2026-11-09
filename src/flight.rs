@@ -539,7 +539,7 @@ where
             },
             Ok(h) = &mut handed => {
                 // (the rest of the statement runs on the queries' runtime while the client reads its pieces, as the request that asked)
-                crate::panics::aside(crate::panics::work(&held, true, crate::auth::carried(in_session(session, go))));
+                crate::spawns::aside(crate::panics::work(&held, true, crate::auth::carried(in_session(session, go))));
                 Ok(Sent::Pieces(h, held.drain.carried()))
             }
         }
@@ -733,7 +733,7 @@ fn append(app: &App, who: crate::auth::Principal, table: String, producer: Strin
     let mut load = crate::writer::Load::new(&app, who.clone(), "Flight DoPut", &table); // (its line in the audit log, as its acks end)
     let (acks_tx, mut acks_rx) = tokio::sync::mpsc::channel::<Result<crate::writer::Queued, Status>>(256);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel(); // (acks are small; a client may read them only at the end)
-    crate::panics::task(async move {
+    crate::spawns::task(async move {
         let mut batches = std::pin::pin!(batches);
         // (a refusal is said as the writer's caller is told: `Worded`)
         let worded = |who: &Option<crate::auth::Principal>| who.as_ref().map_or(PLAIN, |w| Worded::of(&w.scope));
@@ -792,7 +792,7 @@ fn append(app: &App, who: crate::auth::Principal, table: String, producer: Strin
         }
     });
     let (log, table) = (log2, table2);
-    crate::panics::task(async move {
+    crate::spawns::task(async move {
         while let Some(queued) = acks_rx.recv().await {
             let acked = match queued {
                 Ok(crate::writer::Queued { ack, src, rows: batch }) => {

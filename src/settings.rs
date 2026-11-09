@@ -166,7 +166,7 @@ pub const fn starter(var: &'static str, kind: Kind, unset: Unset) -> Setting { o
 pub const fn test(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Test, kind, unset) }
 
 // The defaults worked out when read.
-fn blocking_threads() -> String { // (tokio's own on Windows, where a child's pipes are read on blocking threads: `panics::runtime`)
+fn blocking_threads() -> String { // (tokio's own on Windows, where a child's pipes are read on blocking threads: `spawns::runtime`)
     if cfg!(windows) { 512 } else { 16.max(4 * crate::env::cores()) }.to_string()
 }
 fn cores() -> String { crate::env::cores().to_string() }
@@ -187,7 +187,7 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_ALLOW_UNSIGNED_EXTENSIONS", Bool, No),
     node("PONDRA_AUDIT", List, Is("role,ddl,function")),
     node("PONDRA_AUDIT_DAYS", Days, Is("90")),
-    node("PONDRA_BLOCKING_THREADS", Int, Of(blocking_threads)).process(), // (the runtime's: `panics::runtime`)
+    node("PONDRA_BLOCKING_THREADS", Int, Of(blocking_threads)).process(), // (the runtime's: `spawns::runtime`)
     node("PONDRA_BROADCAST_MB", Mb, Is("64")),
     node("PONDRA_BUCKET_REQUESTS", Int, Is("256")),
     node("PONDRA_CACHE_DIR", Path, No).flag("backlog", "Lakes on object storage: where this node keeps its local SSD copy of recent \

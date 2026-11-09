@@ -285,7 +285,7 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, scope: crate::
             // Its answer goes in pieces as its plan makes them (`query::send_rest`): the rest of the request, the
             // pieces and the statement's end, is polled on the queries' runtime while its client reads; the plan's
             // partition tasks stay where the prefix spawned them. The node may still stop it for memory (`oom.rs`).
-            crate::panics::aside(crate::panics::work(&node, true, go));
+            crate::spawns::aside(crate::panics::work(&node, true, go));
             return Said { reply: Ok(Reply::Rendered(Rendered::Pieces(h))), heard: vec![], session };
         }
     };

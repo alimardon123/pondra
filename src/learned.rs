@@ -450,7 +450,7 @@ fn refresh() {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
-    crate::panics::task(crate::auth::as_node(async move { // (the node's own work: every row of the history, `read`)
+    crate::spawns::task(crate::auth::as_node(async move { // (the node's own work: every row of the history, `read`)
         let _done = done;
         // (rows reach the history a second or so after their runs, in any order: a minute back again)
         match read(&lake, since.saturating_sub(60_000_000)).await {

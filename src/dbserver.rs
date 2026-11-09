@@ -250,7 +250,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
     };
     let server: Shared = Arc::new(Server { folder: folder.clone(), addr: addr.clone(), default, options, auth, nodes: Default::default(), starting: Default::default() });
     let s = server.clone();
-    crate::panics::spawn(async move {
+    crate::spawns::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             s.reap().await;
@@ -258,12 +258,12 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
     });
     if let Some(pg) = pg {
         let (s, listener) = (server.clone(), tokio::net::TcpListener::bind(&pg).await.with_context(|| format!("the Postgres port {pg}"))?);
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else { continue };
                 let _ = socket.set_nodelay(true);
                 let s = s.clone();
-                crate::panics::task(async move {
+                crate::spawns::task(async move {
                     if let Err(e) = postgres(&s, socket).await {
                         eprintln!("postgres connection: {e:#}");
                     }

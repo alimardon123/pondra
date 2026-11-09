@@ -310,7 +310,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     if lives {
         every(Duration::from_secs(1), move || { let l = l.clone(); async move { ddl::sync(&l, true).await } });
         let l = lake.clone();
-        crate::panics::task(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
+        crate::spawns::task(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
     }
     // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
     // a new leader first commits what they hold from the previous one.
@@ -492,7 +492,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         // Iceberg tables here at once: `iceberg::Published::location`. Only then: the pass loads every
         // published table's manifests, and a lake that stayed where it was has nothing new for it)
         let (a, l) = (app.clone(), lake.clone());
-        panics::task(crate::auth::as_node(async move {
+        crate::spawns::task(crate::auth::as_node(async move {
             if !crate::iceberg::elsewhere(&l).await {
                 return;
             }
@@ -607,7 +607,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         runs::mark_stopped(app.clone()); // (runs whose node stopped under them: `stopped`)
         if leader {
             let l = app.lake.clone(); // (what it inherited, replayed from the WAL, into every node's view)
-            crate::panics::task(async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
+            crate::spawns::task(async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
         }
     }
 }
@@ -707,7 +707,7 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
     if let Some(follow) = follow {
         follow.abort(); // (the node's stream ends as the page closes, not at the node's next commit)
     }
-    crate::panics::abort_all();
+    crate::spawns::abort_all();
     if let Some(lake) = lake {
         let _ = lake.cat.close().await;
     }
@@ -733,7 +733,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lif
     let node = node.trim_end_matches('/').to_string();
     let members: Arc<dyn Members> = Arc::new(crate::members::Joined::new(&node, auth)); // (the page's calls go to this node, with this sign-in: `dial::Joined`)
     let kv: Arc<dyn crate::kv::Kv> = Arc::new(crate::kv::remote::Remote::new(&node, auth));
-    let marks = crate::panics::task(async {}); // (a joined page claims no term, so it runs no mark: this task is finished)
+    let marks = crate::spawns::task(async {}); // (a joined page claims no term, so it runs no mark: this task is finished)
     let start = Start::default();
     let mut lake = None;
     let made = async {
@@ -767,9 +767,9 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lif
                     }
                 })
             };
-            let follow = panics::spawn(crate::members::follow(following, open, |_, _| {}, || {}, false)); // (a page relays nothing: its node's feed is its stream)
-            panics::spawn(crate::page_records::run(&app)); // (the page's own statements go to this node each second: `abort_all` ends it)
-            panics::spawn(async move {
+            let follow = crate::spawns::spawn(crate::members::follow(following, open, |_, _| {}, || {}, false)); // (a page relays nothing: its node's feed is its stream)
+            crate::spawns::spawn(crate::page_records::run(&app)); // (the page's own statements go to this node each second: `abort_all` ends it)
+            crate::spawns::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     let Some(live) = refreshing.upgrade().filter(|_| !refreshed.load(SeqCst)) else { return };

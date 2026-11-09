@@ -1185,12 +1185,12 @@ fn start<'a>(app: &'a App, name: &'a str, args: &'a [FunctionArg], column: &'a s
         if crate::workspace::is_run(name) {
             let args = args.to_vec();
             crate::workspace::arguments(app, &args, &who.scope).await?; // (its mistakes: said now, not only in the log)
-            crate::panics::task(crate::auth::carried(async move {
+            crate::spawns::task(crate::auth::carried(async move {
                 let _ = Box::pin(crate::workspace::run(&app2, &args, who, job, Some(id2))).await;
             }));
         } else {
             let (local, r, row) = Box::pin(prepared(app, name, args, who.clone())).await?;
-            crate::panics::task(crate::auth::carried(async move {
+            crate::spawns::task(crate::auth::carried(async move {
                 let _ = Box::pin(run(&app2, local, r, row, who, job, Some(id2))).await; // (its outcome: the run log's)
             }));
         }

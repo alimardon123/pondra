@@ -820,7 +820,7 @@ pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &
     for (name, v) in views {
         let Some(turn) = turn(lake, &name, v.rerun.as_ref().expect("filtered"), last_change(lake, &follows(&v))) else { continue };
         let (lake, seq, lock) = (lake.clone(), seq.clone(), lock.clone());
-        crate::panics::aside(crate::auth::as_node(async move { // (the node's own work, as a view's refresh is: `auth::as_node`)
+        crate::spawns::aside(crate::auth::as_node(async move { // (the node's own work, as a view's refresh is: `auth::as_node`)
             let _slot = waiting(&turn.waited, crate::views::slot(&lake)).await; // (waiting for a slot is not the run's time)
             let r = crate::views::bounded(run(&lake, &seq, &lock, &name, &v, &turn)).await;
             turn.ended(&r);

@@ -5,7 +5,7 @@
 //! failure stops it and says why to every request after, until it is opened again.
 //!
 //! The places that exec, abort or exit ask the node's [`Lifecycle`](crate::lifecycle::Lifecycle) instead, which the
-//! host implements (`node::Native`: here a restart unwinds and a stop fails the node, `panics::spawn`, `format::watch`,
+//! host implements (`node::Native`: here a restart unwinds and a stop fails the node, `spawns::spawn`, `format::watch`,
 //! the catalog's compactor). The node's host state is kept in `node.rs`, beside the rest of the node.
 //! Helpers the node starts (`pondra lead`, Python looked for beside it) are the program the packages give
 //! ([`exe`](crate::node::exe)), never the host's own executable.
@@ -101,10 +101,10 @@ pub fn wait<T>(work: impl std::future::Future<Output = T>, within: Option<Durati
 pub fn spawn(work: impl std::future::Future<Output = ()> + Send + 'static) { drop(runtime().spawn(work)); }
 
 /// The runtime a library's nodes run on, made by the first open and kept for the next: its threads
-/// are the process's, as the queries' runtime's are (`panics::queries`).
+/// are the process's, as the queries' runtime's are (`spawns::queries`).
 fn runtime() -> &'static tokio::runtime::Runtime {
     static R: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    R.get_or_init(|| crate::panics::runtime().thread_name("pondra").build().expect("a runtime"))
+    R.get_or_init(|| crate::spawns::runtime().thread_name("pondra").build().expect("a runtime"))
 }
 
 /// Pauses between tries to start again; five restarts within a minute of each other is giving up.
@@ -280,7 +280,7 @@ impl Drop for Opened {
 /// whose file says "restarting", its Python workers) are let go, and its lake with them; nothing waits
 /// on the bucket, and the term isn't given back: a fenced or cut-off node has nothing to make durable.
 fn halt(node: Option<Node>) {
-    crate::panics::abort_all();
+    crate::spawns::abort_all();
     drop(node);
     crate::reset::reset();
 }
@@ -364,7 +364,7 @@ async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<M
                     halt(None);
                     match p.downcast::<Restarting>() {
                         Ok(r) => r.0,
-                        Err(p) => return failed_until_closed(&set, crate::panics::said(&*p), &mut events, first.take()).await,
+                        Err(p) => return failed_until_closed(&set, crate::spawns::said(&*p), &mut events, first.take()).await,
                     }
                 }
             },

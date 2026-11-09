@@ -1192,7 +1192,7 @@ pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<Me
     };
     let first = enc.step(Some(&piece))?;
     let done = ended.clone();
-    crate::panics::aside(async move {
+    crate::spawns::aside(async move {
         let _held = held;
         let written = match write_all(&mut enc, &tx, parts).await {
             Ok(_) => step_to(&mut enc, &tx, None).await,

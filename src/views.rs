@@ -1234,7 +1234,7 @@ where
     let Some(turn) = turn(lake, name, of, what) else { return };
     let (lake, name) = (lake.clone(), name.to_string());
     // (a view's run is the node's own work, as its refresh is, whoever reads it after: `auth::as_node`)
-    crate::panics::aside(crate::auth::as_node(async move {
+    crate::spawns::aside(crate::auth::as_node(async move {
         let _slot = slot(&lake).await;
         let out = match lake.cat.get::<View>(&view_key(&name)).await {
             Ok(Some(v)) => bounded(run(lake.clone(), name.clone(), v)).await,

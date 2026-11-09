@@ -534,7 +534,7 @@ mod tests {
         assert_eq!(sees(&Principal::of(Role::None).scope), nothing, "nobody signed in");
         assert!(Principal::of(Role::Read).scope.whole() && Principal::of(Role::Admin).scope.whole());
         let ann = Principal { name: "ann".into(), scope: Scope::granted(Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec![] }]))), ..Principal::of(Role::Read) };
-        let (here, spawned) = WHO.scope(ann, async { (scope(), crate::panics::aside(async { scope() }).await.unwrap()) }).await;
+        let (here, spawned) = WHO.scope(ann, async { (scope(), crate::spawns::aside(async { scope() }).await.unwrap()) }).await;
         assert_eq!((sees(&here).1, sees(&spawned).1), (true, false), "a task spawned without its caller sees nothing of its caller's");
     }
 

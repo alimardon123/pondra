@@ -838,7 +838,7 @@ pub async fn attach(home: &Lake, name: &str, dir: &str, follow: bool, live: bool
     let other = Lake::open(dir, false, live, home.node.clone()).await?;
     if follow {
         let (home, weak) = (Arc::downgrade(&home.arc()), Arc::downgrade(&other));
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 let (Some(home), Some(other)) = (home.upgrade(), weak.upgrade()) else { return }; // (detached)
