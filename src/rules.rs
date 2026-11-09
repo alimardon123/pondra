@@ -23,48 +23,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
-/// A table as a write's rules see it, made once a version of it is parsed (`TableMeta::to_rules`).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Table {
-    /// The columns as SQL names them, `_deleted` among them: the schema a write's rows are fitted to.
-    pub schema: SchemaRef,
-    /// Each column SQL sees, in order: the dropped ones left out.
-    pub columns: Vec<Column>,
-    /// The primary key's columns, in SQL's names (empty when the table has no key).
-    pub key: Vec<String>,
-    /// Does a plain INSERT check its key (a key, and no merge: `constraints::key_checked`).
-    pub key_checked: bool,
-    /// The enforced UNIQUE constraints: (name, columns in SQL's names).
-    pub unique: Vec<(String, Vec<String>)>,
-    /// The CHECK constraints: (name, condition), as the table keeps them, over SQL's names.
-    pub checks: Vec<(String, String)>,
-    /// Is any column renamed or dropped, so that a stored name is not SQL's.
-    pub mapped: bool,
-    /// SQL's names in SQL's order (`TableMeta::sql_order`): the columns an INSERT without a column list fills, first to
-    /// last. `columns` and `schema` keep the stored order.
-    pub order: Vec<String>,
-    /// `checks` planned for `schema` once, at the first write a CHECK looks at (`checks`), not parsed and planned again at
-    /// every write: three CHECKs cost a one-row INSERT 0.3 ms that way, and 0.6 ms in a transaction, whose COMMIT checks again.
-    pub planned: Planned,
-}
-
-/// `Table::planned`: the session the plans were made in (`SessionContext::session_id`), and each CHECK's plan in the order
-/// `checks` meets them. A clone starts without them, since its checks may be changed; two tables are equal by their other
-/// fields.
-#[derive(Default)]
-pub struct Planned(std::sync::OnceLock<(String, Vec<Option<Arc<dyn PhysicalExpr>>>)>);
-
-impl Clone for Planned {
-    fn clone(&self) -> Self { Planned::default() }
-}
-
-impl PartialEq for Planned {
-    fn eq(&self, _: &Self) -> bool { true }
-}
-
-impl std::fmt::Debug for Planned {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("Planned") }
-}
+pub use crate::table_record::{Column, Planned, Table};
 
 impl Planned {
     /// The plans of `checks` (in this order) for `schema`, made in `base` at the first call. None for a CHECK planned at each
@@ -77,25 +36,6 @@ impl Planned {
             false => vec![None; checks.len()],
         }
     }
-}
-
-/// One column as the rules see it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Column {
-    /// The column's name in SQL.
-    pub name: String,
-    /// The name its files and the log keep it under: a bulk INSERT's stream checks its rows by this.
-    pub stored: String,
-    /// Must a write give it a value (NOT NULL; a key's columns are too).
-    pub not_null: bool,
-    /// The DEFAULT as SQL writes it (an identity's is its `nextval('…')`).
-    pub default: Option<String>,
-    /// Is it GENERATED ALWAYS AS IDENTITY.
-    pub always: bool,
-    /// The SQL type a text column is held as: `uuid`, `json`, `jsonb` or `varchar(n)`.
-    pub held: Option<String>,
-    /// An enum column's type (None for an `ENUM('a', 'b')` written in the column) and its labels.
-    pub labels: Option<(Option<String>, Vec<String>)>,
 }
 
 impl Table {
