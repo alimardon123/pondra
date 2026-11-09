@@ -1144,8 +1144,9 @@ pub fn mentioned(sql: &str) -> bool {
     ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.shares", "pondra.recipients", "pondra.audit", "pondra.history", "pondra.loads", "pondra.learned", "pondra.flows", "pondra.expectations", "pondra.rejects", "pondra.variables", "pondra.dropped", "pondra.objects", "pondra.parts", "pondra.databases", "pondra.applies"].iter().any(|t| s.contains(t))
 }
 
-/// `pondra.routines`, `pondra.tasks` and `pondra.tables`, as they are now.
-pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
+/// `pondra.routines`, `pondra.tasks`, `pondra.tables` and `pondra.dropped`, as they are now. `pondra.dropped` lists the
+/// lake's deleted files only when `text` reads it, as finding them lists the files' notes.
+pub async fn tables(lake: &Lake, text: &str, scope: &crate::rights::Scope) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
     use datafusion::datasource::MemTable;
     let all = crate::routines::listed(lake).await?;
     let mut names: Vec<&String> = all.keys().collect();
@@ -1206,8 +1207,8 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'
         ("key", l(&|o| o.meta.as_ref().filter(|m| !m.key.is_empty()).map(|m| m.key.join(", ")))),
         ("definition", l(&|o| o.sql.clone())),
     ])?;
-    // (what UNDROP can still bring back: dropped tables (ADR-043), and dropped definitions (`undrop.rs`), each with the
-    // statement that does it. A relation is listed to whoever may read one of its name; any other definition to the whole.)
+    // (what UNDROP can still bring back: dropped tables (ADR-043), dropped definitions (`undrop.rs`) and deleted files, each
+    // with the statement that does it. A relation is listed to whoever may read one of its name; anything else to the whole.)
     struct Gone {
         name: String,
         kind: String,
@@ -1223,6 +1224,10 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'
         kind: "table".into(), at_ms: d.at_ms, until: d.at_ms + d.keep_ms, by: d.by, name,
     }).collect();
     gone.extend(crate::undrop::all(lake).await?.into_iter().map(|(name, k)| Gone { kind: k.kind.clone(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
+    if text.to_lowercase().contains("pondra.dropped") {
+        // (deleted files a version of which is kept (`files::deleted`): a file has no rows, and its bytes are its newest version's)
+        gone.extend(crate::files::deleted(lake).await?.into_iter().map(|f| Gone { kind: "file".into(), at_ms: f.at_ms, until: f.kept_until(), rows: None, bytes: Some(f.bytes), by: f.by, name: f.path }));
+    }
     let relation = |kind: &str| crate::objects::kind(kind).is_some_and(|k| k.family == "relation");
     gone.retain(|g| scope.sees(if relation(&g.kind) { crate::rights::Object::Table(&g.name) } else { crate::rights::Object::Lake }));
     let g = |f: &dyn Fn(&Gone) -> Option<u64>| Arc::new(gone.iter().map(|d| f(d).map(|n| n as i64)).collect::<Int64Array>()) as ArrayRef;
