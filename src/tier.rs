@@ -738,11 +738,13 @@ pub struct Brief {
     /// Files to merge or seal: 8 or more, or one that is a tenth or more deleted rows (`maintain` rewrites them).
     pub untidy: bool,
     /// An append table whose rows changed (`TableMeta::changed`): its changed rows may wait in its files, from the
-    /// commits after `purged` (`purge` says whether it's time), and a purge older than the retention may settle
-    /// (`settles`: the second purge's time, which `purge` lets the first go at).
+    /// commits after `purged` (`purge` says whether it's time), and its purges settle (`tier::settle`): the first lets go
+    /// once the second is `retain_ms` old (`settles`: the second's time), and `{t}$deleted`'s files the first covered go
+    /// once the table's retention has passed since it (`kept_until`), its past then kept from them on.
     pub changed: bool,
     pub purged: u64,
     pub settles: Option<u64>,
+    pub kept_until: Option<u64>,
     /// Its Parquet files: those its entry lists, and those in its manifests (`TableMeta::sealed`).
     pub inline: u64,
     pub sealed: u64,
@@ -768,6 +770,7 @@ impl Brief {
             changed: m.changed && m.key.is_empty(),
             purged: m.purged(),
             settles: m.purges.get(1).map(|p| p.1),
+            kept_until: m.purges.first().map(|p| p.1 + m.retention_secs.map_or(crate::ddl::KEEP_MS, |s| s * 1000)),
             inline: m.files.len() as u64,
             sealed,
             rows: rows + m.files.iter().map(|f| f.rows).sum::<u64>(),
