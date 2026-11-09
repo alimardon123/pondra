@@ -262,8 +262,9 @@ fn located(l: &str) -> Result<String> {
 
 // ---------------------------------------------------------------- the table they make
 
-/// An error in words for whoever sent the statement, as this caller may see it (`codes::told`).
-pub fn said(e: &anyhow::Error) -> String { crate::codes::told(e, crate::rights::scope().shows_code()) }
+/// An error in words for a client not shown code (`codes::told`): a Python routine's quoted lines cut. A door that
+/// knows its caller and may answer a routine's error words it for that caller instead (`codes::told(e, scope.shows_code())`).
+pub fn said(e: &anyhow::Error) -> String { crate::codes::told(e, false) }
 
 /// Does this table read files on the node's machine? (Such a query stays on it.)
 pub fn local(table: &str) -> bool { spec(table).is_some_and(|s| s.format == "share" || s.urls.iter().any(|u| scheme(u).is_none_or(|s| s == "file"))) } // (a share's links: as its node got them)
@@ -1868,6 +1869,17 @@ impl datafusion::catalog::TableProvider for Secrets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `said` names no caller, so it words an error as for one not shown code, whoever the task runs as: a routine's
+    /// quoted line is cut even for an admin's task (S27, M8). A door that knows its caller words it with `codes::told`.
+    #[tokio::test]
+    async fn said_fails_closed_whoever_the_task_runs_as() {
+        let e = || anyhow::anyhow!("ZeroDivisionError: division by zero\n  line 2: total = rate / 0");
+        let admin = crate::auth::Principal::of(crate::auth::Role::Admin);
+        assert!(admin.scope.shows_code(), "an admin is shown code");
+        assert_eq!(crate::auth::WHO.scope(admin, async { said(&e()) }).await, "ZeroDivisionError: division by zero\n  line 2");
+        assert_eq!(said(&e()), "ZeroDivisionError: division by zero\n  line 2");
+    }
 
     /// A bucket's KMS key (`KMS_KEY_ID`, DuckDB's name, beside `REGION`) encrypts each object written with it: the
     /// write asks the bucket for SSE-KMS with that key. Without one, the write asks for nothing, and the bucket's own
