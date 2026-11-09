@@ -67,6 +67,12 @@ pub(crate) struct Published {
     /// (Empty: published before this was kept, taken as here.)
     #[serde(default)]
     location: String,
+    /// The oldest version the metadata lists (a sequence number): the last one that let go of a data file the version
+    /// before it named. That file goes after --retain-secs (`TableMeta::discard`, `tier::expire`), so a snapshot from
+    /// before it would fail on read; it isn't listed. The snapshots before it stay kept (`snapshots`, `HISTORY`) for
+    /// the readers already reading them. (0: published before this was kept, or never let a file go.)
+    #[serde(default)]
+    listed_from: u64,
 }
 
 /// An Iceberg manifest this lake wrote.
@@ -231,11 +237,23 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     // each with a delete manifest beside it if rows of its files were deleted by position.
     // A file listed before keeps the sequence number and snapshot that added it (`Published::since`).
     let mut earlier: BTreeMap<String, (u64, i64)> = st.since.clone();
+    // (the data files the last snapshot named that this one may not: those of the manifests that went, and the inline
+    // files when they changed; as Iceberg names them, `lake.full`)
+    let mut before: std::collections::BTreeSet<String> = match inline_changed {
+        true => st.inlined.keys().map(|p| lake.full(p)).collect(),
+        false => Default::default(),
+    };
     for p in &went {
-        for a in [st.manifests.get(p), st.deleting.get(p)].into_iter().flatten() {
+        if let Some(a) = st.manifests.get(p) {
+            let files = listed(lake, &a.path).await?;
+            before.extend(files.iter().map(|(f, _)| f.clone()));
+            earlier.extend(files);
+        }
+        if let Some(a) = st.deleting.get(p) {
             earlier.extend(listed(lake, &a.path).await?);
         }
     }
+    let mut now_named: std::collections::BTreeSet<String> = parts.inline.iter().map(|f| lake.full(&f.path)).collect();
     let (mut written, mut since) = (vec![], BTreeMap::new());
     let mut write = async |of: Option<String>, files: &[DataFile]| -> Result<()> {
         for content in [0, 1].into_iter().filter(|c| *c == 0 || files.iter().any(|f| !f.deletes.is_empty())) {
@@ -248,7 +266,9 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
         Ok(())
     };
     for m in &fresh {
-        write(Some(m.path.clone()), &crate::manifest::files(lake, m).await?).await?;
+        let files = crate::manifest::files(lake, m).await?;
+        now_named.extend(files.iter().map(|f| lake.full(&f.path)));
+        write(Some(m.path.clone()), &files).await?;
     }
     if inline_changed && !parts.inline.is_empty() {
         write(None, &parts.inline).await?;
@@ -289,8 +309,11 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
         snapshot["parent-snapshot-id"] = p;
     }
     st.snapshots.push((snapshot, list));
+    if lets_go(&before, &now_named) || moved {
+        st.listed_from = v;
+    }
     let gone: Vec<(Value, String)> = stale.into_iter().chain(st.snapshots.drain(..st.snapshots.len().saturating_sub(HISTORY))).collect();
-    let body = metadata(lake, meta.folder(table), &st.uuid, v, now, &schema, &layout, meta, &st.snapshots);
+    let body = metadata(lake, meta.folder(table), &st.uuid, v, now, &schema, &layout, meta, listed_from(&st.snapshots, st.listed_from));
     // Written once, never overwritten; if it's there, an attempt that crashed wrote it, and this
     // one's objects are garbage the next round's version replaces.
     lake.put(&format!("{dir}/v{v}.metadata.json"), body.to_string().into_bytes()).await?;
@@ -339,6 +362,18 @@ fn forget(st: &mut Published) -> Vec<(Value, String)> {
     st.deleted.clear();
     st.since.clear();
     std::mem::take(&mut st.snapshots)
+}
+
+/// Whether a version lets go of a data file the version before it named (`before`, as Iceberg names it), which none of
+/// its own files is (`now`): a merge, a rewrite, a file taken out whole. Such a file is deleted once kept past
+/// --retain-secs, so every snapshot from before this version, which names it, would fail on read.
+fn lets_go(before: &std::collections::BTreeSet<String>, now: &std::collections::BTreeSet<String>) -> bool { before.iter().any(|f| !now.contains(f)) }
+
+/// The snapshots the metadata lists: those kept from `from` on (a sequence number: `Published::listed_from`). The
+/// newest is always listed.
+fn listed_from(snapshots: &[(Value, String)], from: u64) -> &[(Value, String)] {
+    let first = snapshots.iter().position(|(s, _)| s["sequence-number"].as_u64().unwrap_or(0) >= from).unwrap_or(snapshots.len().saturating_sub(1));
+    &snapshots[first..]
 }
 
 /// The metadata folder of a table's folder under `data/` (where its versions, snapshot lists and version hint are).
@@ -1137,5 +1172,27 @@ mod tests {
         assert_eq!(got, [(4, "d"), (1, "a"), (2, "bee")]);
         let layout = Layout::of(&{ let mut entry = moved(); entry.partition = Some("b".into()); entry });
         assert_eq!((layout.spec()[0]["source-id"].as_u64(), layout.name.as_str()), (Some(2), "bee"));
+    }
+
+    /// A version lets go of a file only when none of its own is that file: a file moved between our manifests and the
+    /// inline ones (sealed, or back inline) isn't let go; one merged into another, rewritten or taken out is.
+    #[test]
+    fn a_version_lets_go_of_a_file_it_no_longer_names() {
+        let set = |fs: &[&str]| fs.iter().map(|f| f.to_string()).collect::<std::collections::BTreeSet<String>>();
+        assert!(!lets_go(&set(&[]), &set(&["a"])), "an append");
+        assert!(!lets_go(&set(&["a", "b"]), &set(&["a", "b", "c"])), "files sealed into a manifest, and one more");
+        assert!(lets_go(&set(&["a", "b"]), &set(&["ab"])), "a merge");
+        assert!(lets_go(&set(&["a", "b"]), &set(&["b"])), "a file taken out whole");
+    }
+
+    /// The metadata lists the snapshots from the last that let a file go, the newest always; with none such, all kept.
+    #[test]
+    fn the_listing_starts_at_the_last_version_that_let_a_file_go() {
+        let snaps: Vec<(Value, String)> = (1..=5).map(|v| (json!({"snapshot-id": v, "sequence-number": v}), format!("snap-{v}"))).collect();
+        let seqs = |from| listed_from(&snaps, from).iter().map(|(s, _)| s["sequence-number"].as_u64().unwrap()).collect::<Vec<_>>();
+        assert_eq!(seqs(0), [1, 2, 3, 4, 5], "never let a file go: every one kept");
+        assert_eq!(seqs(3), [3, 4, 5]);
+        assert_eq!(seqs(5), [5]);
+        assert_eq!(seqs(9), [5], "the newest, whatever");
     }
 }

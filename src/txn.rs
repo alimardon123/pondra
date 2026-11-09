@@ -697,7 +697,7 @@ fn word_of(stmt: &Stmt) -> &'static str {
         Stmt::Delete(..) => "DELETE",
         Stmt::Merge(_) => "MERGE",
         Stmt::AddColumn(..) | Stmt::SetOptions(..) => "ALTER TABLE",
-        Stmt::CopyTo(..) | Stmt::CopyInto(..) => "COPY",
+        Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::Theirs => "COPY",
         Stmt::UndropFile(_) => "UNDROP FILE",
         Stmt::Ddl(ds) => match ds.first() {
             Some(Ddl::DropTable { .. }) => "DROP TABLE",

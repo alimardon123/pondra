@@ -1145,6 +1145,7 @@ def outside():
     [n.kill() for n in nodes]
     sim.kill()
     server.shutdown()
+    server.server_close()
     shutil.rmtree(web, ignore_errors=True)
     print(json.dumps(checks, indent=1, ensure_ascii=False))
     if not all(checks.values()):
@@ -1378,6 +1379,7 @@ def catalogs():
             p.kill()
         if proxy:
             proxy.shutdown()
+            proxy.server_close()
         shutil.rmtree(here, ignore_errors=True)
     ok = all(checks.values())
     print(json.dumps({"catalogs": checks, "ok": ok}, indent=1, ensure_ascii=False))
@@ -2666,10 +2668,13 @@ def clients():
     # What an agent writes its next SQL from (the agent benchmark's findings): a NULL said as null (not left out), columns
     # typed as SHOW CREATE types them (not Arrow's Int64, Utf8), the dialect named as Pondra's, a parse error said once
     with_null = tool("r-tok", "query", sql="SELECT 1 AS a, CAST(NULL AS INT) AS b")["rows"]
-    docs_types = [c["type"] for t in tool("r-tok", "list_tables")["tables"] if t["table"] == "docs" for c in t["columns"]]
+    admin.sql("COMMENT ON TABLE docs IS 'one row per document'")
+    listed = {t["table"]: t for t in tool("r-tok", "list_tables")["tables"]}
+    docs_types = [c["type"] for c in listed["docs"]["columns"]]
+    abouts = [listed["docs"].get("about"), listed["sales.orders"].get("about", "missing")]
     unparsed = mcp("r-tok", "tools/call", {"name": "query", "arguments": {"sql": "SELEC 1"}})["content"][0]["text"]
-    checks["MCP for agents: a NULL said as null; list_tables types as SHOW CREATE does; Postgres's dialect named; a parse error said once, 42601"] = \
-        with_null == [{"a": 1, "b": None}] and docs_types == ["BIGINT", "VARCHAR", "REAL[]"] and "PostgreSQL's" in init["instructions"] \
+    checks["MCP for agents: a NULL said as null; list_tables types as SHOW CREATE does, with each table's comment as its about; Postgres's dialect named; a parse error said once, 42601"] = \
+        with_null == [{"a": 1, "b": None}] and docs_types == ["BIGINT", "VARCHAR", "REAL[]"] and abouts == ["one row per document", None] and "PostgreSQL's" in init["instructions"] \
         and "DataFusion" not in init["instructions"] and unparsed.startswith("SQLSTATE 42601: syntax error: Expected: ") and unparsed.count("Expected") == 1
     # Raw MCP calls, with the status and headers: (status, headers, the JSON answer or its text)
     def mcp_raw(token, method, params=None, sid=None, verb="POST", port=None):
@@ -7323,6 +7328,7 @@ def writes():
     twice = load_catalog("twice", type="rest", uri=f"http://127.0.0.1:{A.port + 9}", **io).load_table("default.events")
     twice.append(rows(5000, 5010))
     proxy.shutdown()
+    proxy.server_close()  # (its socket too: shutdown() only stops serve_forever, and `objects` starts a node on this port)
     checks["a commit sent twice (a retry after a lost answer) is applied once"] = q("SELECT count(*) AS n FROM events WHERE id >= 5000") == [{"n": 10}]
     cat.load_table("default.sales").append(pa.table({"region": ["eu", "us", "eu"], "amount": [1.0, 2.0, 3.0]}))
     view = until(lambda: q("SELECT region, total FROM by_region ORDER BY region"), [{"region": "eu", "total": 4.0}, {"region": "us", "total": 2.0}], 15)
@@ -11689,6 +11695,7 @@ def secrets():
     without = _raises_text(lambda: adm(read))
     checks["PONDRA_KMS_COMMAND wraps a data key (kms:…); without it, it doesn't open"] = by_kms == [[{"cur": "EUR"}, {"cur": "GBP"}], True] and "PONDRA_KMS_COMMAND" in without
     web.shutdown()
+    web.server_close()
     node.kill()
     kept, keys_info = _lake_keys()
     checks.update(kept)
@@ -11994,6 +12001,7 @@ def sealed():
     for n in nodes:
         n.kill()
     web.shutdown()
+    web.server_close()
     ok = all(checks.values())
     print(json.dumps({"sealed": checks, "ok": ok, "info": info}, indent=1, default=str))
     return ok
@@ -13199,6 +13207,7 @@ def reached():
         "no secret covers" in str(narrow[1]) and narrow[3] == [{"k": "here"}]
     node.kill()
     web.shutdown()
+    web.server_close()
     shutil.rmtree(here, ignore_errors=True)
     ok = all(checks.values())
     print(json.dumps({"reached": checks, "ok": ok, **({} if ok else {"info": info})}, indent=1, default=str))
@@ -21088,7 +21097,7 @@ def jsons():
 
     def in_where():
         """The operators in a WHERE clause find the rows they name, over HTTP and the port, with no parentheses: `doc #>> '{c,d}'
-        IS NULL` is `(doc #>> '{c,d}') IS NULL`, as Postgres 16 groups it (path::door's text, `pg_json::text`)."""
+        IS NULL` is `(doc #>> '{c,d}') IS NULL`, as Postgres 16 groups it (path::door's text, `grouping::text`)."""
         http = [r["id"] for r in q("SELECT id FROM jp WHERE t ?| ARRAY['zz','c'] AND doc #>> '{c,d}' IS NULL ORDER BY id")]
         port = [r[0] for r in pg_rows("SELECT id FROM jp WHERE doc @> '{\"a\": \"x\"}' AND t #>> '{b,0}' = '1' ORDER BY id")]
         info["WHERE with the operators: rows over HTTP, then the port"] = [http, port]
@@ -21311,7 +21320,7 @@ def jsons():
 
 def _jsons_w2(check, url, q, info):
     """Brief W2 (PR #131). The Postgres port types a statement's columns from the text its JSON operators read (`pg_trace::one`
-    runs `pg_json::text` first), so `doc ? 'a'`, `?|`, `?&` and `@>` send doc as jsonb (3802) under Postgres's name for it; and
+    runs `grouping::text` first), so `doc ? 'a'`, `?|`, `?&` and `@>` send doc as jsonb (3802) under Postgres's name for it; and
     COPY … TO STDOUT types its columns as RowDescription does, so a binary COPY sends a jsonb's version byte and a uuid's 16
     bytes. Every expected answer is Postgres 16's on the same rows (a scratch database, dropped after): the rows, the column
     names and type codes, and the three COPY streams, header and trailer included."""
@@ -25607,6 +25616,12 @@ def returning():
                     and rows[0].get("n") == 7 and rows[0].get("id") == one_id("h"))
         check("HTTP: INSERT ... RETURNING * gives one row: its id, name h, n 7", http_return_star)
 
+        def http_return_hooked():  # (a form only the fallback dialect's hooks read: found as any write's RETURNING, 11-09 audit L11)
+            rows = sql(A.port, "INSERT INTO a (name) SELECT array_to_string([x || '!' FOR x IN ['k']], '') RETURNING name, n")
+            info["HTTP INSERT ... [x FOR x IN l] ... RETURNING"] = rows
+            return rows == [{"name": "k!", "n": 7}]
+        check("HTTP: INSERT ... SELECT [x FOR x IN l] ... RETURNING name, n gives the row it wrote", http_return_hooked)
+
         # Item forms, each on a new row (the alias on UPDATE: Pondra's INSERT takes no alias yet).
         def item_column():
             rows = c.execute("INSERT INTO a (name) VALUES ('i1') RETURNING a.id").fetchall()
@@ -26967,6 +26982,7 @@ def friendly():
     checks["INSTALL httpfs over Postgres: its notice reaches the client (a row or a NOTICE)"] = any(said("httpfs", "install") in t for t in told)
     checks["INSTALL spatial over Postgres: refused by name, SQLSTATE 0A000"] = refused == "0A000"
     files.shutdown()
+    files.server_close()
     shutil.rmtree(pq_dir, ignore_errors=True)
     # the docs name the built-in names extension.rs has, each one (sql/index.mdx)
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -27179,7 +27195,7 @@ def dialects():
     FLOOR = {"postgres": 42, "duckdb": 35, "snowflake": 18, "spark": 13, "mysql": 21, "bigquery": 23, "sqlserver": 17}
     XX000 = 0  # (refusals that are internal errors: lower it as they get codes, never raise it)
     lake = new_lake()
-    node = Node(lake, A.port).start()
+    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}").start()
     q = lambda s: sql(A.port, s)
     checks, info = {}, {}
     # Columns named as the system's are: an append table and a keyed one, three rows each, then every kind of change.
@@ -27248,6 +27264,21 @@ def dialects():
            "with a $name": hinted("SELECT /*! 1 + */ 2 AS x, $k AS k", "dialects-hint-var")}
     info["a /*! … */ comment"] = got
     checks["a /*! … */ comment is refused (0A000) over HTTP after USE and with a $name, as it is without (11-07 audit M2)"] = all(st == "0A000" for _, st, _ in got.values())
+    # IS [NOT] DISTINCT FROM's right side ends where Postgres and DuckDB end it (`grouping::text`). sqlparser's generic
+    # dialect read `a IS DISTINCT FROM b OR c` as `a IS DISTINCT FROM (b OR c)`: with booleans a wrong answer, and no error
+    # ([3, 4] and [3, 4] here). Over HTTP, the port and a view's stored text.
+    import psycopg
+    q("CREATE TABLE dfg (id INT, a BOOLEAN, b BOOLEAN, c BOOLEAN)")
+    q("INSERT INTO dfg VALUES (1, true, false, true), (2, true, true, false), (3, NULL, NULL, true), (4, false, NULL, false)")
+    loose = {"a IS DISTINCT FROM b OR c": [1, 3, 4], "a IS NOT DISTINCT FROM b AND c": [3]}  # (DuckDB 2.0's rows)
+    q("CREATE VIEW dfv AS SELECT id FROM dfg WHERE a IS DISTINCT FROM b OR c")
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as conn:
+        got = {w: {"http": [r["id"] for r in q(f"SELECT id FROM dfg WHERE {w} ORDER BY id")],
+                   "port": [r[0] for r in conn.execute(f"SELECT id FROM dfg WHERE {w} ORDER BY id").fetchall()]} for w in loose}
+    got["the view"] = [r["id"] for r in q("SELECT id FROM dfv ORDER BY id")]
+    info["IS DISTINCT FROM before AND and OR"] = got
+    checks["IS [NOT] DISTINCT FROM before AND or OR compares only what Postgres compares: DuckDB 2.0's rows over HTTP, the port and a view"] = \
+        all(got[w] == {"http": want, "port": want} for w, want in loose.items()) and got["the view"] == [1, 3, 4]
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"dialects": checks, "ok": ok, "info": info}, indent=1, default=str))
@@ -28670,7 +28701,8 @@ def publishing():
     left out of that format, and the statement says so; and nothing of theirs is written as Delta or
     Iceberg (a finished view's partial rows were, before). Then the files' ranges: the formats carry
     each file's min and max and NULLs, so every reader (Pondra, DuckDB, delta-rs, PyIceberg) answers
-    a filter as the model does, and a reader skips the files a filter rules out."""
+    a filter as the model does, and a reader skips the files a filter rules out. And the Iceberg view lists only the
+    snapshots whose files are still there: none from before a merge that let files go."""
     import urllib.request
     lake = new_lake()
     node = Node(lake, A.port, tier_secs=0.5, publish="delta,iceberg").start()
@@ -28845,6 +28877,40 @@ def publishing():
         checks["a node reading the table's folder skips the 3 files a filter on id rules out (pondra_files_skipped_total)"] = one == [{"n": 1}] and skipped >= 3
         print(f"publishing: files skipped by read_delta WHERE id = 30: {skipped:g}")
         reader.kill()
+        # The history the Iceberg view lists is the history it can serve (I1, the 11-09 Iceberg review): a merge lets small
+        # files go, deleted after --retain-secs (0 here), so the snapshots from before it, which name them, aren't listed, nor
+        # their metadata files; once the files let go are gone, every snapshot listed reads by its id.
+        hist_lake = new_lake()
+        hist = Node(hist_lake, A.port + 5, tier_secs=0.5, retain_secs=0).start()
+        try:
+            sql(A.port + 5, "CREATE TABLE h (id BIGINT) WITH (publish = 'iceberg')")
+            for k in range(10):  # (a file each: small files merge eight at a time, `tier::class`)
+                sql(A.port + 5, f"INSERT INTO h VALUES ({k})")
+                sql(A.port + 5, "CHECKPOINT")
+            hist_table = lambda: StaticTable.from_metadata(open_check.iceberg_metadata(hist_lake, "h"), properties=open_check.iceberg_props(hist_lake))
+            in_h = lambda p: p[p.index("data/h/"):]
+            def parquet_in_h():  # every Parquet object in the table's folder, at any depth
+                if hist_lake.startswith("s3://"):
+                    return {k for k in lake_objects(hist_lake, "data/h/") if k.endswith(".parquet")}
+                return {in_h(os.path.join(d, f)) for d, _, fs in os.walk(os.path.join(hist_lake, "data", "h")) for f in fs if f.endswith(".parquet")}
+            def named_by_listed():  # the data files the snapshots listed name, each read by its id
+                t = hist_table()
+                return {in_h(f.file.file_path) for s in t.metadata.snapshots for f in t.scan(snapshot_id=s.snapshot_id).plan_files()}
+            sql(A.port + 5, "CREATE TABLE tick (n BIGINT)")
+            def settled():  # (merged, and the small files let go then deleted: only the files the snapshots listed name are left)
+                sql(A.port + 5, "INSERT INTO tick VALUES (1)")  # (retention runs in tiering rounds, which an idle lake doesn't run)
+                return len(parquet_in_h()) < 10 and parquet_in_h() == named_by_listed()
+            merged = until(lambda: _try(settled), True, 90)
+            t = hist_table()
+            first = min(s.sequence_number for s in t.metadata.snapshots)
+            reads = [_try(lambda s=s: t.scan(snapshot_id=s.snapshot_id).to_arrow().num_rows) for s in t.metadata.snapshots]
+            checks["a merge lets small files go: the Iceberg view lists the snapshots from it on, each read by its id once those files are gone (--retain-secs 0)"] = \
+                merged is True and first > 1 and all(r is not None for r in reads) and t.scan().to_arrow().num_rows == 10
+            checks["…and its metadata log names only those snapshots' metadata"] = all(int(e.metadata_file.rsplit("/v", 1)[1].split(".")[0]) >= first for e in t.metadata.metadata_log)
+            if not all(checks.values()):
+                print(f"publishing: history: merged {merged}, first listed {first}, reads {reads}, on disk {sorted(parquet_in_h())}")
+        finally:
+            hist.kill()
     finally:
         node.kill()
     for name, good in checks.items():

@@ -159,7 +159,7 @@ pub fn set_schema(sql: &str) -> Option<String> {
 /// change comes back as it came.
 pub async fn door(lake: &Lake, sql: &str, skip: &HashSet<String>) -> Result<String> {
     crate::dialect_stmts::hint_refused(sql)?; // (MySQL's `/*! … */`: the path prints the text back without it, 11-07 audit M2)
-    let sql = &crate::pg_json::text(sql); // (`doc ->> 'a' = 'x'`, `doc ? 'a'`: Postgres's JSON operators grouped and read as Postgres does)
+    let sql = &crate::grouping::text(sql); // (`doc ->> 'a' = 'x'`, `doc ? 'a'`, `a IS DISTINCT FROM b OR c`: grouped and read as Postgres does)
     if crate::temp::current().is_none() && (is_use(sql) || set_schema(sql).is_some()) {
         return Err(coded("0A000", crate::set::NO_SESSION)); // (Flight SQL and MCP hold no session: refused by name, at once)
     }

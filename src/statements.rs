@@ -14,8 +14,9 @@ use serde_json::Value;
 /// One statement an extension adds, or one family of the core's.
 pub struct Statement {
     /// Its leading words, upper-cased (`["CREATE", "CONNECTION"]`), matched on the statement's tokens: where two
-    /// entries' words both begin a statement, the longer is it. One of them after the first may be `*`, a name (`a`,
-    /// `"A"`, `s.t`), for a form whose telling word comes after one (`CREATE TABLE * CLONE`).
+    /// entries' words both begin a statement, the longer is it. Up to two of them after the first may be `*`, a name
+    /// (`a`, `"A"`, `s.t`), for a form whose telling word comes after one (`CREATE TABLE * CLONE`) or two (`ALTER TABLE *
+    /// ALTER COLUMN * FIRST`); two never side by side.
     pub words: &'static [&'static str],
     /// Its one reader: what the statement says.
     pub read: Read,
@@ -142,20 +143,19 @@ pub const CORE: &str = "core";
 /// match on sqlparser's tree), after a CREATE's `OR REPLACE`, `TEMP` or `TEMPORARY`: an extension's entry may not begin
 /// with one, so no extension takes a core statement over with longer words. Each goes as its whole family becomes a core
 /// entry (PR 8b-8d), which the same check covers (`ALTER DATABASE`, USER, ROLE, TOKEN, SHARE, RECIPIENT, IDENTITY
-/// PROVIDER, SEQUENCE, COMMENT, TYPE and INDEX have; every `CREATE OR ALTER` is the core's entry's).
+/// PROVIDER, SEQUENCE, COMMENT, TYPE, INDEX, SECRET, TASK, CREATE FUNCTION | PROCEDURE, DROP MACRO, COPY and ATTACH
+/// have; every `CREATE OR ALTER` is the core's entry's). `CREATE EXTERNAL` stays: the core's entries read DataFusion's
+/// `EXTERNAL TABLE`, and another word after EXTERNAL is DataFusion's parser's to refuse.
 const CORE_WORDS: &[&[&str]] = &[
     &["SELECT"], &["WITH"], &["VALUES"], &["TABLE"], &["FROM"], &["INSERT"], &["UPDATE"], &["DELETE"], &["MERGE"], &["TRUNCATE"],
-    &["GRANT"], &["REVOKE"], &["COPY"], &["ATTACH"], &["DETACH"], &["UNDROP"], &["BACKUP"], &["RESTORE"],
+    &["GRANT"], &["REVOKE"], &["DETACH"], &["UNDROP"], &["BACKUP"], &["RESTORE"],
     &["INSTALL"], &["LOAD"], &["UNINSTALL"], &["CALL"], &["DO"], &["SET"], &["RESET"], &["SHOW"], &["DESCRIBE"], &["USE"],
     &["EXPLAIN"], &["BEGIN"], &["START"], &["COMMIT"], &["ROLLBACK"], &["END"], &["CHECKPOINT"], &["EXPORT"], &["IMPORT"],
     &["CREATE", "TABLE"], &["CREATE", "EXTERNAL"], &["CREATE", "VIEW"], &["CREATE", "MATERIALIZED"], &["CREATE", "SCHEMA"],
-    &["CREATE", "DATABASE"], &["CREATE", "FUNCTION"], &["CREATE", "PROCEDURE"], &["CREATE", "MACRO"], &["CREATE", "TASK"],
-    &["CREATE", "PIPELINE"], &["CREATE", "SECRET"], &["CREATE", "PERSISTENT"],
+    &["CREATE", "DATABASE"], &["CREATE", "MACRO"], &["CREATE", "PIPELINE"],
     &["ALTER", "TABLE"], &["ALTER", "VIEW"], &["ALTER", "MATERIALIZED"], &["ALTER", "SCHEMA"],
-    &["ALTER", "TASK"],
     &["DROP", "TABLE"], &["DROP", "VIEW"], &["DROP", "MATERIALIZED"], &["DROP", "SCHEMA"], &["DROP", "DATABASE"],
-    &["DROP", "FUNCTION"], &["DROP", "PROCEDURE"], &["DROP", "MACRO"], &["DROP", "TASK"],
-    &["DROP", "SECRET"], &["DROP", "PERSISTENT"], &["DROP", "TEMPORARY"],
+    &["DROP", "FUNCTION"], &["DROP", "PROCEDURE"], &["DROP", "TEMPORARY"],
 ];
 
 /// `words` without a CREATE's `OR REPLACE`, `TEMP` or `TEMPORARY` after its first word. (`OR ALTER` stays: the core's
@@ -171,6 +171,15 @@ fn plain_words(words: &[&'static str]) -> Vec<&'static str> {
     std::iter::once("CREATE").chain(rest.iter().copied()).collect()
 }
 
+/// Whether a name in `words` takes a word that an entry beside it spells there: the word is then that entry's, as a
+/// keyword is, and not a name (`ALTER TABLE t ALTER COLUMN first SET NOT NULL` is no `ALTER TABLE * ALTER * FIRST`
+/// whose column is COLUMN). A name so spelled is written quoted.
+fn shadowed(entries: &[&'static Statement], words: &[&str], sql: &Words) -> bool {
+    words.iter().enumerate().filter(|(_, w)| **w == "*").any(|(i, _)| {
+        entries.iter().any(|o| o.words.len() > i && o.words[i] != "*" && o.words[..i] == words[..i] && sql.begins(&o.words[..=i]))
+    })
+}
+
 /// Whether one entry's words begin with another's (`*` matches any one word in either).
 fn begins_with(words: &[&str], first: &[&str]) -> bool {
     words.len() >= first.len() && words.iter().zip(first).all(|(a, b)| a == b || *a == "*" || *b == "*")
@@ -181,7 +190,7 @@ impl Section for Statements {
 }
 
 impl Statements {
-    /// Adds an entry. Refused when the registry is built: words not upper-cased, a name first or twice, words another
+    /// Adds an entry. Refused when the registry is built: words not upper-cased, a name first, side by side or more than twice, words another
     /// entry has, an extension's words that begin with a core statement's, and a reader, run and right that aren't one
     /// kind's: a reader of the core's statement with both stand-ins, or a reader of what its own run takes, and its
     /// own right.
@@ -190,7 +199,7 @@ impl Statements {
         let stand_in = matches!(s.read, Read::Core(_) | Read::Tree(_));
         assert!(stand_in == matches!(s.run, Run::Stmt) && stand_in == matches!(s.right, Right::FromStmt), "{words}: a reader of the core's statement stands in for its run and right (Read::Core or Read::Tree, Run::Stmt, Right::FromStmt), and one of an extension's own has both (Read::Text, Run::Leader and its right)");
         assert!(!s.words.is_empty() && s.words.iter().all(|w| *w == w.to_uppercase()), "a statement's words are upper-cased: {words}");
-        assert!(s.words[0] != "*" && s.words.iter().filter(|w| **w == "*").count() <= 1, "a statement's words hold at most one name, never first: {words}");
+        assert!(s.words[0] != "*" && s.words.iter().filter(|w| **w == "*").count() <= 2 && !s.words.windows(2).any(|p| p == ["*", "*"]), "a statement's words hold at most two names, never first and never side by side: {words}");
         assert!(self.all.iter().all(|o| o.words != s.words), "two statements are {words}");
         let (core, plain) = (s.extension == CORE, plain_words(s.words));
         if !core {
@@ -204,13 +213,14 @@ impl Statements {
     }
 
     /// The statement `sql` is, by its words: the entry whose words begin it, the longest where two do, and its words. A
-    /// statement whose first word begins no entry is tokenized here not at all. The first word is its letters
-    /// (`text::head`), as the tokenizer ends it, so `COPY(SELECT 1) TO …` is COPY's to read.
+    /// name never takes a word an entry beside it spells there (`shadowed`). A statement whose first word begins no entry
+    /// is tokenized here not at all. The first word is its letters (`text::head`), as the tokenizer ends it, so
+    /// `COPY(SELECT 1) TO …` is COPY's to read.
     fn of(&self, sql: &str) -> Option<(&'static Statement, Words)> {
         let first = crate::text::head(sql).to_ascii_uppercase();
         let entries = self.by_first.get(first.as_str())?;
         let words = Words::of(sql)?;
-        let s = entries.iter().filter(|s| words.begins(s.words) && !moved_skipped(s)).max_by_key(|s| s.words.len()).copied()?;
+        let s = entries.iter().filter(|s| words.begins(s.words) && !shadowed(entries, s.words, &words)).max_by_key(|s| s.words.len()).copied()?;
         Some((s, words))
     }
 
@@ -245,16 +255,6 @@ fn matched_in(r: &Registry, sql: &str) -> Option<crate::write::Stmt> {
     };
     Some(read.unwrap_or_else(|e| Stmt::of_error(&e, format!("{e:#}"))))
 }
-
-/// Is `sql` read by an entry PR 8 moved in (a reader of the core's statement, `Read::Core` or `Read::Tree`)?
-#[cfg(test)]
-pub(crate) fn moved(sql: &str) -> bool { crate::registry::get().find::<Statements>().and_then(|s| s.of(sql)).is_some_and(|(s, _)| matches!(s.read, Read::Core(_) | Read::Tree(_))) }
-
-/// Is `s` an entry PR 8 moved in, while `write::was` reads a text as the readers it replaced did (so it is skipped)?
-#[cfg(test)]
-fn moved_skipped(s: &Statement) -> bool { matches!(s.read, Read::Core(_) | Read::Tree(_)) && crate::write::was::old() }
-#[cfg(not(test))]
-fn moved_skipped(_: &Statement) -> bool { false }
 
 /// Leader: carry out an extension's statement, as `write::parse` read it.
 pub(crate) async fn carry_out(lake: &Lake, words: &str, tree: Value) -> Result<Value> {
@@ -292,6 +292,7 @@ mod tests {
     static THING: Statement = Statement { words: &["MAKE", "THING"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::Admin, needs: &[], about: "makes a thing", extension: "things" };
     static BIG: Statement = Statement { words: &["MAKE", "BIG", "THING"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::Admin, needs: &[], about: "makes a big thing", extension: "things" };
     static COPIED: Statement = Statement { words: &["MAKE", "*", "COPY"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::Admin, needs: &[], about: "copies a thing", extension: "things" };
+    static MOVED: Statement = Statement { words: &["MAKE", "*", "INTO", "*", "NOW"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::Admin, needs: &[], about: "moves a thing", extension: "things" };
     static SERVED: Statement = Statement { words: &["SERVE", "THING"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::Admin, needs: &[Need::Listening], about: "serves a thing", extension: "things" };
     static THINGS: BuiltIn = BuiltIn {
         name: "things",
@@ -302,6 +303,7 @@ mod tests {
             s.add(&BIG);
             s.add(&SERVED);
             s.add(&COPIED);
+            s.add(&MOVED);
         },
     };
 
@@ -332,6 +334,17 @@ mod tests {
         }
         assert!(matched_in(&r, "MAKE COPY").is_none(), "`*` is a name");
         assert!(matched_in(&r, "MAKE 'box' COPY").is_none(), "a string is no name");
+        // (a word an entry beside it spells there is that entry's, as a keyword is: MAKE BIG …, never a thing named big)
+        assert!(matched_in(&r, "MAKE big COPY").is_none(), "BIG is MAKE BIG THING's word, not a name");
+        assert_eq!(entry(matched_in(&r, "MAKE \"big\" COPY")).context("found")?.0, "MAKE * COPY", "quoted, it is a name");
+        assert_eq!(entry(matched_in(&r, "MAKE bigger COPY")).context("found")?.0, "MAKE * COPY", "a word is whole");
+        // (two names, each one whole name: dotted, quoted, both)
+        for sql in ["MAKE s.t INTO \"a b\".c NOW", "make \"a b\".c into lake.s.t now;", "MAKE box INTO \"Other\" /* now */ NOW"] {
+            assert_eq!(entry(matched_in(&r, sql)).with_context(|| sql.to_string())?.0, "MAKE * INTO * NOW", "{sql}");
+        }
+        for sql in ["MAKE s.t INTO a b NOW", "MAKE s.t INTO NOW", "MAKE s.t INTO 'c' NOW", "MAKE INTO c NOW"] {
+            assert!(matched_in(&r, sql).is_none(), "{sql}: a name is one name");
+        }
         assert!(matched_in(&r, "SELECT 1").is_none());
         assert!(matches!(matched_in(&r, "MAKE THING"), Some(Stmt::Invalid(e)) if e == "MAKE THING name"), "its parser's refusal is the answer");
         let url = format!("memory://statements-{}", uuid::Uuid::new_v4().simple());
@@ -401,6 +414,19 @@ mod tests {
         static CORE_THINGS: BuiltIn = BuiltIn { name: CORE, requires: &[], register: |r| r.section_mut::<Statements>().add(&CORE_OK) };
         let r = Registry::build(&[&CORE_THINGS, &THINGS]);
         assert!(matches!(matched_in(&r, "keep /* its words */ core x"), Some(Stmt::Invalid(e)) if e == "a thing"), "the core's reader gives the statement");
+    }
+
+    /// An entry holds at most two names, never first and never side by side: two names together are one statement's words
+    /// no reader could tell apart.
+    #[test]
+    fn an_entrys_names_are_two_at_most() {
+        static FIRST: Statement = Statement { words: &["*", "THING"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::Admin, needs: &[], about: "", extension: "things" };
+        static SIDE: Statement = Statement { words: &["MAKE", "*", "*", "THING"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::Admin, needs: &[], about: "", extension: "things" };
+        static THREE: Statement = Statement { words: &["MAKE", "*", "A", "*", "B", "*"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::Admin, needs: &[], about: "", extension: "things" };
+        for bad in [&FIRST, &SIDE, &THREE] {
+            assert!(std::panic::catch_unwind(|| Statements::default().add(bad)).is_err(), "{}", bad.words.join(" "));
+        }
+        Statements::default().add(&MOVED);
     }
 
     #[test]

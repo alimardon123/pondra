@@ -316,6 +316,7 @@ pub enum Stmt {
     TempSecret(String, std::collections::BTreeMap<String, String>, bool, bool), // CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…): the session's, in memory (`temp.rs`)
     TempRoutine(String, Box<crate::expander::Routine>, bool, bool), // CREATE [OR REPLACE] TEMP MACRO | FUNCTION [IF NOT EXISTS] name …: the session's (`temp.rs`)
     UndropFile(String),                                   // UNDROP FILE 'path': a deleted file back from its versions (`files::undrop`)
+    Theirs,                                               // DataFusion's own statement, planned as a query is: a COPY its walk doesn't place (`ext::copy`); `parse` answers None for it
 }
 
 impl Stmt {
@@ -363,7 +364,7 @@ impl Stmt {
         match self {
             Stmt::Create(c) => object(&c.name),
             Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) | Stmt::CopyInto(t, ..) => t.clone(),
-            Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::UndropFile(_) => String::new(),
+            Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::Theirs | Stmt::UndropFile(_) => String::new(),
             Stmt::TempView(v, ..) | Stmt::TempSecret(v, ..) | Stmt::TempRoutine(v, ..) => v.clone(),
             Stmt::Merge(m) => m.target.clone(),
         }
@@ -521,70 +522,21 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         return Some(s); // (INSTALL name FROM a file or URL, and UNINSTALL: `extension.rs`)
     }
     if let Some(s) = crate::statements::matched(sql) {
-        return Some(s); // (a statement by its words, the registry's statements section: an extension's, and the families of the core's PR 8 has moved, `core_statements.rs`)
+        // (a statement by its words, the registry's statements section: an extension's, and the families of the core's PR 8
+        // has moved, `core_statements.rs`; one its reader says is DataFusion's own, for DataFusion's planner)
+        return (!matches!(s, Stmt::Theirs)).then_some(s);
     }
-    #[cfg(test)]
-    if let Some(s) = was::no_replace(sql) {
+    // GRANT and REVOKE, read by each module whose grant it is until step 6 reads GRANT once: a share's (`shares.rs`) before
+    // the rest (`users.rs`).
+    let grant = matches!(head.as_str(), "grant" | "revoke");
+    if let Some(s) = grant.then(|| crate::shares::statement(sql)).flatten() {
         return Some(s);
     }
-    // The kinds below each begin with one of these words, so a query or a row's change goes past
-    // them without being read again by each (every statement is read here more than once).
-    let kinds = matches!(head.as_str(), "create" | "alter" | "drop" | "grant" | "revoke" | "comment" | "copy" | "attach");
-    if let Some(s) = kinds.then(|| crate::shares::statement(sql)).flatten() {
-        return Some(s); // (GRANT SELECT ON SHARE: `shares.rs`, before users' GRANT; SHARE and RECIPIENT are the sharing extension's entries)
-    }
-    if let Some(s) = kinds.then(|| crate::users::statement(sql)).flatten() {
-        return Some(s); // (GRANT and REVOKE: `users.rs`, until step 6 reads GRANT once; USER, ROLE and TOKEN are entries)
-    }
-    #[cfg(test)]
-    if let Some(s) = kinds.then(|| was::sso(sql)).flatten() {
+    if let Some(s) = grant.then(|| crate::users::statement(sql)).flatten() {
         return Some(s);
     }
-    if let Some(s) = kinds.then(|| crate::ext::statement(sql)).flatten() {
-        return Some(s); // (CREATE SECRET: values of any kind; DROP SECRET)
-    }
-    if let Some(s) = kinds.then(|| crate::routines::statement(sql)).flatten() {
-        return Some(s); // (CREATE FUNCTION and PROCEDURE as Postgres writes them, CREATE TASK, DROP TASK, DROP MACRO)
-    }
-    #[cfg(test)]
-    if let Some(s) = kinds.then(|| was::objects(sql)).flatten() {
-        return Some(s); // (COMMENT ON, CREATE OR ALTER TABLE | VIEW: the statements section's entries)
-    }
-    #[cfg(test)]
-    if let Some(s) = kinds.then(|| was::seq(sql)).flatten() {
-        return Some(s); // (CREATE, ALTER, DROP SEQUENCE: the statements section's entries)
-    }
-    #[cfg(test)]
-    if let Some(s) = kinds.then(|| was::index(sql)).flatten() {
-        return Some(s); // (CREATE, ALTER, DROP INDEX: the statements section's entries)
-    }
-    #[cfg(test)]
-    if let Some(s) = kinds.then(|| was::types(sql)).flatten() {
-        return Some(s); // (CREATE TYPE … AS ENUM, ALTER and DROP TYPE: the statements section's entries)
-    }
-    if let Some(s) = (head == "alter").then(|| placed(sql)).flatten() {
-        return Some(s); // (ALTER TABLE t ALTER COLUMN c FIRST | AFTER b)
-    }
-    if let Some(sql) = kinds.then(|| crate::seq::in_order(sql)).flatten() {
+    if let Some(sql) = matches!(head.as_str(), "create" | "alter").then(|| crate::seq::in_order(sql)).flatten() {
         return parse(&sql); // (an identity's options as the parser takes them)
-    }
-    // DataFusion's CREATE EXTERNAL TABLE (a stored view of files: `ext::external`), in its own words.
-    static EXTERNAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?is)^\s*CREATE\s+(\w+\s+){0,3}EXTERNAL\s+TABLE\b").expect("a regex")
-    });
-    if let Some(m) = (head == "create").then(|| EXTERNAL.find(first_word(sql))).flatten() {
-        use datafusion::sql::parser::{DFParserBuilder, Statement as DF};
-        if m.as_str().split_whitespace().any(|w| w.eq_ignore_ascii_case("temp") || w.eq_ignore_ascii_case("temporary")) {
-            return Some(Stmt::Invalid("CREATE TEMPORARY EXTERNAL TABLE: make a temporary view of the files instead (CREATE TEMP VIEW t AS SELECT * FROM read_parquet('…'))".into()));
-        }
-        return Some(match DFParserBuilder::new(sql).build().and_then(|mut p| p.parse_statements()) {
-            Ok(mut all) if all.len() == 1 => match all.pop_front() {
-                Some(DF::CreateExternalTable(c)) => crate::ext::external(&c).map(|d| Stmt::Ddl(vec![d])).unwrap_or_else(|e| Stmt::Invalid(format!("{e:#}"))),
-                _ => Stmt::Invalid("CREATE EXTERNAL TABLE t … STORED AS … LOCATION '…'".into()),
-            },
-            Ok(all) => Stmt::Invalid(format!("CREATE EXTERNAL TABLE and {} more: send one statement at a time here (or as a script, over HTTP or in the shell)", all.len().saturating_sub(1))),
-            Err(e) => Stmt::Invalid(format!("{e}")),
-        });
     }
     // CREATE MATERIALIZED VIEW v AS SELECT … GROUP BY … EMIT FINAL: each group once, when it's over.
     if let Some(rest) = crate::once::emit_final(sql) {
@@ -621,10 +573,6 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         }
         Ok(None) => {}
         Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
-    }
-    #[cfg(test)]
-    if let Some(s) = was::read(sql, &head) {
-        return Some(s);
     }
     if head == "undrop" {
         return Some(undrop(first_word(sql)));
@@ -812,10 +760,6 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             let text = crate::authored::candidate(&name, false, &sql); // (its query as written: `authored.rs`)
             Stmt::Ddl(vec![unless(v.if_not_exists, &name, "relation", Ddl::CreateView { name: name.clone(), sql, replace: v.or_replace, facts: None, text })])
         }
-        Statement::AttachDatabase { schema_name, database_file_name: ast::Expr::Value(v), .. } => match &v.value {
-            ast::Value::SingleQuotedString(dir) | ast::Value::DoubleQuotedString(dir) => Stmt::Ddl(vec![Ddl::Attach { name: ident(&schema_name), dir: dir.clone(), read_only: false, endpoint: None }]),
-            _ => return None,
-        },
         Statement::CreateDatabase { db_name, if_not_exists, location, clone, .. } => {
             let clone = clone.map(|c| crate::branch::CloneOf { from: object(&c).to_lowercase(), schemas: vec![], data: true, owner: None });
             Stmt::Ddl(vec![Ddl::CreateDatabase { name: object(&db_name).to_lowercase(), if_not_exists, dir: location, clone }])
@@ -962,8 +906,9 @@ fn place(p: &ast::MySQLColumnPosition) -> crate::ddl::Place {
 }
 
 /// `ALTER TABLE t ALTER [COLUMN] c FIRST | AFTER b` (Databricks' and MySQL's words; sqlparser has none): where SQL lists
-/// `c` (`ddl::place_column`); the same of a view and a materialized view (`ddl::place_view_column`). None: not this statement.
-fn placed(sql: &str) -> Option<Stmt> {
+/// `c` (`ddl::place_column`); the same of a view and a materialized view (`ddl::place_view_column`). The statements
+/// section's entries read with it (`core_statements::placed`); None: not this statement.
+pub(crate) fn placed(sql: &str) -> Option<Stmt> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
     let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
     if !p.parse_keyword(Keyword::ALTER) {
@@ -1086,7 +1031,7 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             ensure!(deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
-        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) | Stmt::UndropFile(_) => unreachable!("not a row write here"),
+        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) | Stmt::Theirs | Stmt::UndropFile(_) => unreachable!("not a row write here"),
     }
 }
 
@@ -2778,155 +2723,13 @@ async fn led(dir: &str, term: u64, req: &mut Option<Request>, node: &Arc<NodeSta
 }
 
 
-/// The readers PR 8 has moved into the statements section (`core_statements.rs`), as they were, kept until its last piece
-/// (8d, l6/step8-pr8-plan.md) so a test holds `parse` to read every text of the repository's SQL as they did.
+/// How `parse` reads the families the statements section's core entries hold (step 8, PR 8: `core_statements.rs`).
 #[cfg(test)]
-pub(crate) mod was {
-    use super::{unless, Stmt};
-    use crate::ddl::Ddl;
-    use crate::text::first_word;
+mod section {
+    use super::Stmt;
 
-    thread_local! {
-        static OLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
-    /// Is `parse` reading as it did before PR 8 (`was`), here?
-    pub(crate) fn old() -> bool { OLD.with(|o| o.get()) }
-
-    /// `sql` as `parse` read it before PR 8 moved its readers.
-    pub(crate) fn was(sql: &str) -> Option<Stmt> {
-        OLD.with(|o| o.set(true));
-        let s = super::parse(sql);
-        OLD.with(|o| o.set(false));
-        s
-    }
-
-    /// Row 6, `sso::statement`, where `parse` read it.
-    pub(super) fn sso(sql: &str) -> Option<Stmt> { old().then(|| crate::sso::statement(sql)).flatten() }
-
-    /// `seq::statement`, where `parse` read it.
-    pub(super) fn seq(sql: &str) -> Option<Stmt> { old().then(|| crate::seq::statement(sql)).flatten() }
-
-    /// `objects::statement`, where `parse` read it.
-    pub(super) fn objects(sql: &str) -> Option<Stmt> { old().then(|| crate::objects::statement(sql)).flatten() }
-
-    /// `index::statement`, where `parse` read it.
-    pub(super) fn index(sql: &str) -> Option<Stmt> { old().then(|| crate::index::statement(sql)).flatten() }
-
-    /// `types::statement`, where `parse` read it.
-    pub(super) fn types(sql: &str) -> Option<Stmt> { old().then(|| crate::types::statement(sql)).flatten() }
-
-    /// Row 4, where `parse` read it.
-    pub(super) fn no_replace(sql: &str) -> Option<Stmt> {
-        if !old() {
-            return None;
-        }
-        let head = crate::text::head(sql);
-        static NO_REPLACE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*CREATE\s+OR\s+REPLACE\s+(SCHEMA|DATABASE|USER|ROLE|SHARE|RECIPIENT)\b").expect("a regex"));
-        if let Some(c) = (head == "create").then(|| NO_REPLACE.captures(first_word(sql))).flatten() {
-            let kind = c[1].to_uppercase();
-            let lost = match kind.as_str() {
-                "USER" | "ROLE" => "the rights given to it",
-                "SHARE" => "its tables and grants",
-                "RECIPIENT" => "its token and the shares granted to it",
-                _ => "everything in it",
-            };
-            return Some(Stmt::Invalid(format!("CREATE OR REPLACE {kind}: replacing one would drop {lost}; CREATE {kind} IF NOT EXISTS leaves one that is there as it is")));
-        }
-    None
-    }
-
-    /// Rows 20-31, where `parse` read them.
-    pub(super) fn read(sql: &str, head: &str) -> Option<Stmt> {
-        if !old() {
-            return None;
-        }
-        let name = crate::text::object_of;
-        // `ALTER VIEW v RENAME TO w` (dbt's): the parser takes only ALTER VIEW … AS (`rules::alter::view_rename`).
-        if let Some((from, to)) = (head == "alter").then(|| view_rename(first_word(sql))).flatten() {
-            return Some(Stmt::Ddl(vec![Ddl::RenameTable { name: name(&from), to: name(&to) }]));
-        }
-        // `ALTER MATERIALIZED VIEW v DETACH`: its rows stop following, and stay as a table of that name.
-        static DETACH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+MATERIALIZED\s+VIEW\s+([\w."-]+)\s+DETACH\s*;?\s*$"#).expect("a regex"));
-        if let Some(c) = (head == "alter").then(|| DETACH.captures(first_word(sql))).flatten() {
-            return Some(Stmt::Ddl(vec![Ddl::DetachView { name: name(&c[1]) }]));
-        }
-        // `CREATE TABLE c [SHALLOW] CLONE t` (Snowflake's, Databricks'): a table of t's files as they are now, copying none (ADR-043).
-        static CLONE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?([\w."-]+)\s+(SHALLOW\s+)?CLONE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
-        if let Some(c) = (head == "create").then(|| CLONE.captures(first_word(sql))).flatten() {
-            let d = Ddl::Clone { name: name(&c[2]), from: name(&c[4]) };
-            return Some(Stmt::Ddl(vec![if c.get(1).is_some() { unless(true, &name(&c[2]), "relation", d) } else { d }]));
-        }
-        // `CREATE DATABASE b CLONE a [WITH (schemas = (x, y))] [WITH NO DATA]`: a branch of a, copying none
-        // of its files (ADR-047). (The parser takes `CLONE a` alone.)
-        static DB_CLONE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*CREATE\s+DATABASE\s+(IF\s+NOT\s+EXISTS\s+)?([\w"-]+)\s+(?:LOCATION\s+'((?:[^']|'')*)'\s+)?CLONE\s+([\w"-]+)((?:\s+WITH\s*\(\s*schemas\s*=\s*\([^)]*\)\s*\)|\s+WITH\s+NO\s+DATA)*)\s*;?\s*$"#).expect("a regex"));
-        if let Some(c) = (head == "create").then(|| DB_CLONE.captures(first_word(sql))).flatten() {
-            static SCHEMAS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)schemas\s*=\s*\(([^)]*)\)").expect("a regex"));
-            let tail = c.get(5).map_or("", |m| m.as_str());
-            let schemas = SCHEMAS.captures(tail).map(|s| s[1].split(',').map(|n| name(n.trim())).filter(|n| !n.is_empty()).collect()).unwrap_or_default();
-            let clone = crate::branch::CloneOf { from: name(&c[4]), schemas, data: !regex::Regex::new(r"(?i)WITH\s+NO\s+DATA").expect("a regex").is_match(tail), owner: None };
-            return Some(Stmt::Ddl(vec![Ddl::CreateDatabase { name: name(&c[2]), if_not_exists: c.get(1).is_some(), dir: c.get(3).map(|d| d.as_str().replace("''", "'")), clone: Some(clone) }]));
-        }
-        // `ALTER DATABASE b REFRESH [t, …]`: a branch's tables (all it took from its base, or those
-        // named: a view stands for the tables it reads), and what follows them, as its base has them now (ADR-047).
-        static DB_REFRESH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+DATABASE\s+([\w"-]+)\s+REFRESH((?:\s+[\w".$-]+(?:\s*,\s*[\w".$-]+)*)?)\s*;?\s*$"#).expect("a regex"));
-        if let Some(c) = (head == "alter").then(|| DB_REFRESH.captures(first_word(sql))).flatten() {
-            let tables = c[2].split(',').map(|t| name(t.trim())).filter(|t| !t.is_empty()).collect();
-            return Some(Stmt::Ddl(vec![Ddl::Refresh { database: Some(name(&c[1])), tables }]));
-        }
-        // `ALTER DATABASE b SET LOCATION 'dir'`: a lake held in memory moves there, and goes on there (`memory.rs`).
-        static DB_LOCATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+DATABASE\s+([\w"-]+)\s+SET\s+LOCATION\s+'((?:[^']|'')*)'\s*;?\s*$"#).expect("a regex"));
-        if let Some(c) = (head == "alter").then(|| DB_LOCATION.captures(first_word(sql))).flatten() {
-            return Some(Stmt::Ddl(vec![Ddl::SetLocation { database: name(&c[1]), to: c[2].replace("''", "'") }]));
-        }
-        // `ALTER DATABASE b SET (protected = true | false)`: a database's protection (ADR-058: `protect.rs`).
-        static DB_PROTECT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+DATABASE\s+([\w"-]+)\s+SET\s*\(\s*protected\s*=\s*(true|false)\s*\)\s*;?\s*$"#).expect("a regex"));
-        if let Some(c) = (head == "alter").then(|| DB_PROTECT.captures(first_word(sql))).flatten() {
-            return Some(Stmt::Ddl(vec![Ddl::Protect { database: name(&c[1]), on: c[2].eq_ignore_ascii_case("true"), by: String::new() }]));
-        }
-        // `BACKUP DATABASE [b] TO 'url' [WITH (retention_days = n)]` and `RESTORE DATABASE b FROM 'url'
-        // [LOCATION 'dir'] [AT (TIMESTAMP => '…')]` (ADR-070: a backup is a lake, `backup.rs`).
-        static BACKUP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*BACKUP\s+DATABASE\s+(?:([\w"-]+)\s+)?TO\s+'((?:[^']|'')*)'(?:\s+WITH\s*\(\s*retention_days\s*=\s*(\d+)\s*\))?\s*;?\s*$"#).expect("a regex"));
-        static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*RESTORE\s+DATABASE\s+([\w"-]+)\s+FROM\s+'((?:[^']|'')*)'(?:\s+LOCATION\s+'((?:[^']|'')*)')?(?:\s+AT\s*\(\s*TIMESTAMP\s*=>\s*'((?:[^']|'')*)'\s*\))?\s*;?\s*$"#).expect("a regex"));
-        static BACKUP_ANY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(BACKUP|RESTORE)\s+DATABASE\b").expect("a regex"));
-        let text = |m: Option<regex::Match>| m.map(|m| m.as_str().replace("''", "'"));
-        let backups = matches!(head, "backup" | "restore"); // (a query compiles none of these)
-        if let Some(c) = backups.then(|| BACKUP.captures(first_word(sql))).flatten() {
-            let retention_days = c.get(3).map(|d| d.as_str().parse::<u64>()).transpose();
-            let Ok(retention_days) = retention_days else { return Some(Stmt::Invalid("retention_days is a number of days".into())) };
-            return Some(Stmt::Ddl(vec![Ddl::BackupDatabase { database: c.get(1).map(|n| name(n.as_str())), to: c[2].replace("''", "'"), retention_days }]));
-        }
-        if let Some(c) = backups.then(|| RESTORE.captures(first_word(sql))).flatten() {
-            let at = match text(c.get(4)).map(|t| crate::backup::instant(&t)).transpose() {
-                Ok(at) => at,
-                Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
-            };
-            return Some(Stmt::Ddl(vec![Ddl::RestoreDatabase { name: name(&c[1]), from: c[2].replace("''", "'"), dir: text(c.get(3)), at }]));
-        }
-        if backups && BACKUP_ANY.is_match(first_word(sql)) {
-            return Some(Stmt::Invalid("a backup is written as BACKUP DATABASE [name] TO 'place' [WITH (retention_days = 7)], and restored as RESTORE DATABASE name FROM 'place' [LOCATION 'place'] [AT (TIMESTAMP => '2026-10-12 03:00:00')]".into()));
-        }
-        // DuckDB's `EXPORT DATABASE 'dir'` and `IMPORT DATABASE 'dir'` (a folder of a database's files):
-        // not Pondra's yet, so refused by name with the ways it has, not with the parser's words.
-        static PORTABLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(EXPORT|IMPORT)\s+DATABASE\b").expect("a regex"));
-        if matches!(head, "export" | "import") && PORTABLE.is_match(first_word(sql)) {
-            return Some(Stmt::Invalid("EXPORT DATABASE and IMPORT DATABASE are not supported yet: BACKUP DATABASE TO 'place' copies a database (RESTORE DATABASE name FROM 'place' brings it back), and COPY t TO 'dir/t.parquet' (FORMAT parquet) writes a table's rows".into()));
-        }
-    None
-    }
-
-    /// `rules::alter::view_rename`, as it was.
-    fn view_rename(sql: &str) -> Option<(String, String)> {
-        static VIEW_RENAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r#"(?is)^\s*ALTER\s+(MATERIALIZED\s+)?VIEW\s+(IF\s+EXISTS\s+)?([\w."-]+)\s+RENAME\s+TO\s+([\w."-]+)\s*;?\s*$"#).expect("a regex")
-        });
-        let c = VIEW_RENAME.captures(sql)?;
-        Some((c[3].to_string(), c[4].to_string()))
-    }
-
-    /// A statement as these tests compare two: what it says, in words.
+    /// A statement as these tests show it: what it says, in words.
     fn shown(s: &Option<Stmt>) -> String {
-        static SALTED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#""verifier":\{[^{}]*\}"#).expect("a regex"));
         match s {
             None => "none".into(),
             Some(Stmt::UndropFile(p)) => format!("undrop file {p}"),
@@ -2938,8 +2741,7 @@ pub(crate) mod was {
             Some(Stmt::Delete(t, w)) => format!("delete {t} {w:?}"),
             Some(Stmt::AddColumn(t, c, ty, quiet, at)) => format!("add column {t} {c} {ty} {quiet} {}", serde_json::to_string(at).unwrap_or_default()),
             Some(Stmt::SetOptions(t, o)) => format!("set options {t} {o:?}"),
-            // (a password's verifier is salted afresh each time it is made: one password read twice shows as one)
-            Some(Stmt::Ddl(d)) => format!("ddl {}", SALTED.replace_all(&serde_json::to_string(d).unwrap_or_default(), r#""verifier":"…""#)),
+            Some(Stmt::Ddl(d)) => format!("ddl {}", serde_json::to_string(d).unwrap_or_default()),
             Some(Stmt::Merge(m)) => format!("merge {}", m.sql),
             Some(Stmt::Invalid(e)) => format!("invalid {e}"),
             Some(Stmt::Refused(c, e)) => format!("refused {c} {e}"),
@@ -2948,107 +2750,65 @@ pub(crate) mod was {
             Some(Stmt::TempView(v, q, r, quiet)) => format!("temp view {v} {q} {r} {quiet}"),
             Some(Stmt::TempSecret(n, o, r, quiet)) => format!("temp secret {n} {o:?} {r} {quiet}"),
             Some(Stmt::TempRoutine(n, f, r, quiet)) => format!("temp routine {n} {f:?} {r} {quiet}"),
+            Some(Stmt::Theirs) => "theirs".into(),
         }
     }
 
-    /// One statement, not a script: no `;` before its last word.
-    fn one(sql: &str) -> bool {
-        use datafusion::sql::sqlparser::tokenizer::Token;
-        let Some(t) = crate::text::tokens(sql) else { return false };
-        let solid = t.solid_refs();
-        let last = solid.iter().rposition(|t| !matches!(t, Token::SemiColon)).unwrap_or(0);
-        !solid[..last].iter().any(|t| matches!(t, Token::SemiColon))
-    }
-
-    /// Every text of the repository's SQL reads as the readers PR 8 moved read it (by what it says, `shown`), but where
-    /// those found no statement in a text of a family the statements section now reads: its reader refuses the text,
-    /// saying the family's form. And each family's own forms and refusals read as they did.
-    #[test]
-    fn every_text_reads_as_before() {
-        let placeholder = regex::Regex::new(r"\{[\w:?#]*\}").expect("a regex"); // (a format string's `{}`: no SQL)
-        let texts = crate::passes::tests::texts("|backup|restore|export|import|undrop");
-        // (texts the replaced readers misread, each refused now by its family's reader: a CLONE of no table, which the
-        // parser read as a table of no columns; and harness.py's words for its checks, which the old DROP TYPE regex took
-        // as names of types to drop)
-        let misread = [
-            ("CREATE TABLE c CLONE", "invalid expected a name at the end (CREATE TABLE c [SHALLOW] CLONE t)"),
-            ("DROP TYPE … CASCADE drops a type no column uses (a plain DROP after finds none, 404)", "invalid DROP TYPE [IF EXISTS] name [, …] [CASCADE | RESTRICT]"),
-            // (and 8c's: DROP TYPE's form and two names with no comma, which its regex took as names to drop; and an
-            // enum's label that is a bare word, a string now as in Postgres and DuckDB)
-            ("DROP TYPE [IF EXISTS] name [, …] [CASCADE | RESTRICT]", "invalid DROP TYPE [IF EXISTS] name [, …] [CASCADE | RESTRICT]"),
-            ("DROP TYPE a b", "invalid DROP TYPE [IF EXISTS] name [, …] [CASCADE | RESTRICT]"),
-            ("CREATE TYPE mood AS ENUM (happy)", "invalid CREATE TYPE [IF NOT EXISTS] name AS ENUM ('label', …): enums are the types kept (a composite, a range or another type's alias isn't)"),
-        ];
-        let (mut same, mut core, mut refused_now, mut differ) = (0, 0, vec![], vec![]);
-        for sql in texts.iter().filter(|t| one(t) && !placeholder.is_match(t)) {
-            let (now, then) = (shown(&super::parse(sql)), shown(&was(sql)));
-            let by_core = crate::statements::moved(sql);
-            core += usize::from(by_core);
-            if now == then {
-                same += 1;
-            } else if by_core && then == "none" && (now.starts_with("invalid ") || now.starts_with("refused ")) {
-                refused_now.push((sql.clone(), now));
-            } else if misread.contains(&(sql.as_str(), now.as_str())) {
-                refused_now.push((sql.clone(), now));
-            } else {
-                differ.push((sql.clone(), then, now));
-            }
-        }
-        assert!(differ.is_empty(), "{} of {} texts read otherwise, the first: {:#?}", differ.len(), same + differ.len(), &differ[..differ.len().min(10)]);
-        assert!(core >= 20, "the entries PR 8 moved read {core} texts of the corpus: too few to hold them to it");
-        assert!(misread.iter().all(|(t, _)| refused_now.iter().any(|(s, _)| s == t)), "each misread text is in the corpus, refused now");
-        eprintln!("{same} texts read as before; {core} by the entries PR 8 moved; {} refused now by their family's reader: {refused_now:#?}", refused_now.len());
+    /// What COPY's, ATTACH's and `placed`'s walks pass by went on to DataFusion's planner before PR 8d, which refused each
+    /// (none planned). A COPY's is DataFusion's own still, planned as before (`Stmt::Theirs`), but one that names no
+    /// format, which that planner refuses only as an internal error; ATTACH's and `placed`'s entries refuse each in
+    /// DataFusion's words, with its SQLSTATE, as a door answers either.
+    #[tokio::test]
+    async fn what_the_walks_passed_by_is_refused_as_before() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE t (a INT, b INT)").await?;
+        let options = || datafusion::execution::context::SQLOptions::new().with_allow_ddl(false).with_allow_dml(false).with_allow_statements(false); // (a query's door: `engine::read_only`)
+        let said = |e: anyhow::Error| (crate::codes::of(&e), crate::codes::words(&e));
+        let now = |sql: &str| match super::parse(sql) {
+            Some(Stmt::Invalid(why)) => said(anyhow::anyhow!(why)),
+            Some(Stmt::Refused(code, why)) => said(crate::codes::coded(code, why)), // (as `run_listed` raises each)
+            other => panic!("{sql}: {}", shown(&other)),
+        };
+        // (DataFusion's COPY: no write, so DataFusion's planner plans it and words its refusal, a missing table's too)
         for sql in [
-            "CREATE OR REPLACE SCHEMA s", "create or replace user u password 'x'", "CREATE OR REPLACE ROLE r", "CREATE OR REPLACE SHARE s",
-            "CREATE OR REPLACE RECIPIENT r", "CREATE OR REPLACE DATABASE d", "-- a comment\nCREATE OR REPLACE SCHEMA s",
-            "ALTER VIEW v RENAME TO w", "alter view if exists s.v rename to \"W\"", "alter materialized view if exists \"BigV\" rename to public.w;", "ALTER MATERIALIZED VIEW m RENAME TO n",
-            "ALTER MATERIALIZED VIEW IF EXISTS m RENAME TO n;", "ALTER MATERIALIZED VIEW s.m DETACH", "alter materialized view \"M\" detach ;",
-            "CREATE TABLE c CLONE t", "CREATE TABLE IF NOT EXISTS s.c SHALLOW CLONE lake.s.t", "create table \"C\" clone \"T\"",
-            "CREATE DATABASE b CLONE a", "CREATE DATABASE \"Dev\" CLONE main", "CREATE DATABASE b CLONE a WITH (schemas = ())",
-            "CREATE DATABASE IF NOT EXISTS b LOCATION '/x/y''s' CLONE a WITH (schemas = (s1, \"S2\")) WITH NO DATA",
-            "CREATE DATABASE b CLONE a WITH NO DATA WITH (schemas = (s))", "CREATE DATABASE b LOCATION 'dir'", "CREATE DATABASE IF NOT EXISTS \"B\" LOCATION 'dir'",
-            "ALTER DATABASE b REFRESH", "ALTER DATABASE b REFRESH t, s.u", "ALTER DATABASE \"M\" SET LOCATION '/tmp/x''y'",
-            "ALTER DATABASE pondra-ab12 SET LOCATION '/x'", "alter database pondra-1a2b refresh", "ALTER DATABASE My-Lake_2 SET (protected = true)",
-            "CREATE DATABASE dev-2 CLONE pondra-ab12", "BACKUP DATABASE pondra-ab12 TO '/b'", "RESTORE DATABASE pondra-x9-2 FROM '/b'",
-            "ALTER DATABASE prod SET (protected = false)", "alter database prod set (PROTECTED = TRUE);",
-            "BACKUP DATABASE TO 's3://b/x'", "BACKUP DATABASE prod TO '/b' WITH (retention_days = 3)", "BACKUP DATABASE prod TO '/b' WITH (retention_days = 99999999999999999999999)",
-            "BACKUP DATABASE prod", "BACKUP DATABASE prod TO '/b' WITH (days = 3)", "RESTORE DATABASE p FROM '/b'", "RESTORE DATABASE p FROM '/b' LOCATION '/c' AT (TIMESTAMP => '2026-10-12 03:00:00')",
-            "RESTORE DATABASE p FROM '/b' AT (TIMESTAMP => 'soon')", "RESTORE DATABASE p", "EXPORT DATABASE 'd'", "import database 'd' (format parquet)",
-            "CREATE USER u PASSWORD 'secret123'", "create user if not exists \"U\" with password 'secret123' superuser", "CREATE USER u PASSWORD 'short'",
-            "CREATE ROLE IF NOT EXISTS r", "ALTER USER u WITH PASSWORD 'longer123'", "ALTER ROLE r SUPERUSER", "DROP USER IF EXISTS u", "DROP ROLE r",
-            "CREATE TOKEN t", "ALTER TOKEN t", "DROP TOKEN t", "DROP TOKEN",
-            "CREATE SHARE s", "CREATE SHARE IF NOT EXISTS s COMMENT = 'x'", "CREATE RECIPIENT r EXPIRES IN '90 days'", "ALTER SHARE s ADD TABLE t",
-            "ALTER SHARE s REMOVE TABLE t", "ALTER RECIPIENT r ROTATE TOKEN", "DROP SHARE IF EXISTS s", "DROP RECIPIENT r", "CREATE SHARE",
-            "CREATE OR REPLACE SHARE s", "create or replace recipient r", "CREATE IDENTITY PROVIDER p (ISSUER 'https://x', CLIENT_ID 'c')",
-            "CREATE OR REPLACE IDENTITY PROVIDER p (ISSUER 'https://x')", "ALTER IDENTITY PROVIDER p (LABEL 'x')", "DROP IDENTITY PROVIDER IF EXISTS p",
-            "DROP IDENTITY PROVIDER",
-            "CREATE SEQUENCE s", "CREATE SEQUENCE IF NOT EXISTS s.q START WITH -5 INCREMENT BY -1 MINVALUE -100 MAXVALUE -1", "create or replace sequence \"S\" as smallint cycle",
-            "CREATE OR REPLACE SEQUENCE IF NOT EXISTS s", "CREATE TEMP SEQUENCE s", "CREATE SEQUENCE s START x", "CREATE SEQUENCE s OWNED BY t.c", "CREATE SEQUENCE s MINVALUE 10 MAXVALUE 1",
-            "ALTER SEQUENCE s RESTART", "ALTER SEQUENCE IF EXISTS s RESTART WITH 7 INCREMENT 2", "ALTER SEQUENCE s RENAME TO t", "ALTER SEQUENCE s", "ALTER SEQUENCE s RENAME TO t u",
-            "DROP SEQUENCE s", "DROP SEQUENCE IF EXISTS a, b.c CASCADE", "DROP SEQUENCE", "drop sequence s;",
-            "COMMENT ON TABLE sales.Orders IS 'one row per order'", "comment if exists on materialized view v is null",
-            "COMMENT ON COLUMN t.\"Amount\" IS $$in euros$$", "COMMENT ON IDENTITY PROVIDER p IS ''", "COMMENT ON TABLE t IS 42",
-            "COMMENT ON TABLE t", "COMMENT ON TABLE t IS 'x' extra", "COMMENT ON VIEW /* the view */ v IS 'x';",
-            "CREATE OR ALTER TABLE t (a BIGINT) CLUSTER BY (a)", "create or alter view v as select 1", "CREATE OR ALTER TABLE t AS SELECT 1",
-            "CREATE OR ALTER MATERIALIZED VIEW v AS SELECT 1", "CREATE OR ALTER FUNCTION f() RETURNS INT AS 'select 1'", "CREATE OR ALTER TABLE t ",
-            "CREATE TYPE mood AS ENUM ('sad', 'it''s', 'ok')", "create type if not exists s.\"Mood\" as enum ()", "CREATE OR REPLACE TYPE m AS ENUM ('a')",
-            "CREATE TYPE c AS (a INT)", "CREATE TYPE r AS RANGE (subtype = int4)", "CREATE TYPE m AS ENUM ('a') extra", "ALTER TYPE mood ADD VALUE IF NOT EXISTS 'meh' AFTER 'ok'",
-            "ALTER TYPE mood RENAME TO feeling_t", "ALTER TYPE mood RENAME VALUE 'a' TO 'b'", "ALTER TYPE mood DROP VALUE 'a'", "ALTER TYPE", "DROP TYPE IF EXISTS a, b CASCADE",
-            "drop type s.mood restrict;", "CREATE INDEX IF NOT EXISTS by_id ON orders (id)", "CREATE INDEX ON visits USING hnsw (path)", "CREATE UNIQUE INDEX u ON t (a)",
-            "CREATE UNIQUE INDEX ON visits (lower(path))", "CREATE INDEX clicks_lower_page ON clicks USING brin (lower(page)) WHERE page IS NOT NULL", "CREATE INDEX ON",
-            "ALTER INDEX visits_page_idx RENAME TO visits_path", "ALTER INDEX IF EXISTS s.i RENAME TO s.j", "ALTER INDEX i SET TABLESPACE x", "DROP INDEX IF EXISTS a, b CASCADE",
-            "DROP INDEX", "drop index i;",
+            "COPY t (a) TO 'o.csv'", "copy t (a) to 'o.csv';", "COPY t", "COPY (SELECT 1)", "COPY t TO 1", "COPY t WITH x",
+            "COPY t STORED AS parquet TO 'o.parquet'", "COPY t OPTIONS ('format.has_header' 'true') TO 'o.csv'", "COPY (SELECT 1) STORED AS csv TO 'o.csv'",
+            "COPY nosuch STORED AS parquet TO 'o.parquet'",
         ] {
-            assert_eq!(shown(&super::parse(sql)), shown(&was(sql)), "{sql}");
-            assert!(crate::statements::moved(sql), "{sql}: an entry's");
+            assert!(ctx.sql_with_options(sql, options()).await.is_err(), "{sql}: DataFusion refuses it");
+            assert!(super::parse(sql).is_none(), "{sql}: DataFusion's");
         }
-        // (the forms the parser refused, now each family's reader's)
+        // (one of no format, which DataFusion's planner refuses as an internal error: refused by its form)
+        let sql = "COPY t PARTITIONED BY (a) TO 'o/'";
+        let df: anyhow::Error = ctx.sql_with_options(sql, options()).await.err().context("DataFusion planned it")?.into();
+        assert_eq!(crate::codes::of(&df), "XX000", "{sql}: {df:#}");
+        assert_eq!(now(sql), ("0A000", "COPY t TO 'o/' names no format for its files: COPY t TO 'o/' (FORMAT parquet), or STORED AS parquet after the path".to_string()));
+        assert!(super::parse("COPY t PARTITIONED BY (a) STORED AS parquet TO 'o/'").is_none(), "a format named: DataFusion's");
+        for sql in [
+            "ATTACH 'dir'", "ATTACH 1 AS y", "ATTACH 'dir' AS y extra", "ATTACH IF NOT EXISTS 'dir' AS o", "ATTACH 'dir' y",
+            "ALTER TABLE t ALTER COLUMN b FIRST extra", "ALTER TABLE t ALTER COLUMN b AFTER", "ALTER TABLE t ALTER s.b FIRST",
+            "ALTER VIEW v ALTER b AFTER", "ALTER MATERIALIZED VIEW v ALTER COLUMN b FIRST;x",
+        ] {
+            let df = ctx.sql_with_options(sql, options()).await.err().with_context(|| format!("{sql}: DataFusion planned it"))?;
+            assert_eq!(now(sql), said(df.into()), "{sql}");
+        }
+        // (ALTER COLUMN's COLUMN is no column's name, `statements::shadowed`: no entry takes this, nor the tree, and
+        // DataFusion's planner refuses it as before)
+        assert!(super::parse("ALTER TABLE t ALTER COLUMN FIRST").is_none());
+        Ok(())
+    }
+
+    /// The forms the parser refused before PR 8, each now its family's reader's, in the family's form.
+    #[test]
+    fn a_form_written_wrong_is_refused_in_its_familys_words() {
         for (sql, said) in [
             ("ALTER DATABASE b RENAME TO c", "expected SET near rename (ALTER DATABASE b REFRESH [t, …], SET LOCATION 'dir' or SET (protected = true | false))"),
             ("ALTER DATABASE b SET (protected = maybe)", "protected is true or false (ALTER DATABASE b REFRESH [t, …], SET LOCATION 'dir' or SET (protected = true | false))"),
             ("ALTER VIEW v RENAME w", "expected TO near w (ALTER [MATERIALIZED] VIEW v RENAME TO w)"),
             ("ALTER MATERIALIZED VIEW m DETACH now", "unexpected words near now (ALTER MATERIALIZED VIEW v DETACH)"),
             ("CREATE TABLE c CLONE", "expected a name at the end (CREATE TABLE c [SHALLOW] CLONE t)"),
+            ("ALTER TASK", "ALTER TASK name SUSPEND | RESUME"),
             ("CREATE DATABASE b CLONE a WITH (schemas = s)", "expected ( near s (CREATE DATABASE b [LOCATION 'dir'] [CLONE a [WITH (schemas = (x, y))] [WITH NO DATA]])"),
         ] {
             assert_eq!(shown(&super::parse(sql)), format!("invalid {said}"), "{sql}");
