@@ -213,7 +213,7 @@ impl Worded {
     /// A permission check's refusal (`status`): 42501, unless it carries a code of its own.
     fn denied(self, e: impl Into<anyhow::Error>) -> Status {
         let e = e.into();
-        self.status(match crate::codes::of(&e) { "XX000" => crate::codes::coded("42501", crate::ext::said(&e)), _ => e })
+        self.status(match crate::codes::of(&e) { "XX000" => crate::codes::coded("42501", crate::codes::told(&e, self.0)), _ => e })
     }
 }
 
