@@ -448,7 +448,10 @@ static HEADS: LazyLock<Vec<Head>> = LazyLock::new(|| heads(&[
     (r"show\s+create\s+task", Fam::Task, false),
     (r"summarize", Fam::Relation, false),
     (r"restore\s+table", Fam::Relation, false),
-    (r"undrop\s+(?:table|view|materialized\s+view)", Fam::Relation, false),
+    (r"undrop\s+(?:function|procedure|macro|table\s+function)", Fam::Routine, false), // (before UNDROP TABLE: the first that matches places it)
+    (r"undrop\s+(?:table|view|materialized\s+view|external\s+table)", Fam::Relation, false),
+    (r"undrop\s+task", Fam::Task, false),
+    (r"undrop\s+type", Fam::Type, false),
     (r"alter\s+materialized\s+view", Fam::Relation, false),
     (r"alter\s+sequence", Fam::Relation, false),
     (r"refresh\s+materialized\s+view(?:\s+concurrently)?", Fam::Relation, false),

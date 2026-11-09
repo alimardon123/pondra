@@ -1511,7 +1511,7 @@ pub async fn drop(lake: &Lake, name: &str, if_exists: bool) -> Result<serde_json
         ensure!(if_exists, "no secret {name}");
         return Ok(serde_json::json!({"secret": name, "dropped": false}));
     }
-    lake.cat.commit(vec![], &[secret_key(name)]).await?;
+    lake.cat.commit(crate::undrop::aside(lake, "secret", name, &[secret_key(name)]).await?, &[secret_key(name)]).await?; // (kept sealed, to be undropped)
     Ok(serde_json::json!({"secret": name, "dropped": true}))
 }
 

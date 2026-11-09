@@ -427,7 +427,7 @@ pub async fn drop(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
         ensure!(if_exists, "no function or procedure {name}");
         return Ok(j!({"dropped": false}));
     };
-    lake.cat.commit(vec![], &[key(&name)]).await?;
+    lake.cat.commit(crate::undrop::aside(lake, r.kind_name(), &name, &[key(&name)]).await?, &[key(&name)]).await?; // (kept to be undropped)
     Ok(j!({r.what(): name, "dropped": true}))
 }
 

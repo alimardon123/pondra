@@ -83,6 +83,16 @@ impl Routine {
         }
     }
 
+    /// Its kind, as the registry names it (`objects::Kind`): a procedure, a macro, a table function or a function.
+    pub fn kind_name(&self) -> &'static str {
+        match (self.kind, self.what()) {
+            (Kind::Procedure, _) => "procedure",
+            (_, "macro") => "macro",
+            (Kind::Table, _) => "table function",
+            _ => "function",
+        }
+    }
+
     /// Does a query calling it give the same answer every time (so it may be remembered)?
     pub fn cacheable(&self) -> bool { !self.python() || matches!(self.with.volatility.as_deref(), Some("immutable" | "stable")) }
 }
