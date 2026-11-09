@@ -2,7 +2,6 @@
 //! its tables read as tables, their files fetched by the provider's short-lived links. And where recipients reach this
 //! lake's own door (`endpoint`), which a recipient's profile names. The door itself is `sharing.rs`.
 use crate::byte_range;
-use crate::reset::Once;
 use serde_json::{json as j, Value};
 use std::sync::Arc;
 
@@ -11,7 +10,12 @@ use std::sync::Arc;
 pub static SHARING: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "sharing",
     requires: &[],
-    register: |r| r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES),
+    register: |r| {
+        r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES);
+        r.section_mut::<crate::lake_state::Registered>().add::<Endpoint>(); // (and what a lake keeps for its own door)
+        #[cfg(feature = "doors")]
+        r.section_mut::<crate::lake_state::Registered>().add::<crate::sharing::Used>();
+    },
 };
 
 const TABLES: crate::connections::ConnectionType = {
@@ -27,14 +31,24 @@ const TABLES: crate::connections::ConnectionType = {
     }
 };
 
-crate::per_node!(pub(crate) static ENDPOINT: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None));
+/// Where recipients reach a lake's door, as its node said (invariant 301): `sharing::set_endpoint`.
+#[derive(Default)]
+pub struct Endpoint(pub(crate) std::sync::OnceLock<String>);
 
-/// Where recipients reach the door (a profile's `endpoint`): `PONDRA_SHARING_URL` (a cluster's
-/// address that outlives its nodes), or this node's (`sharing::set_endpoint`).
-pub fn endpoint() -> String {
+impl crate::lake_state::LakeState for Endpoint {
+    const NAME: &'static str = "sharing_endpoint";
+    const ABOUT: &'static str = "where recipients reach its Delta Sharing door, as its node said";
+    fn make() -> Self {
+        Endpoint::default()
+    }
+}
+
+/// Where recipients reach the lake's door (a profile's `endpoint`): `PONDRA_SHARING_URL` (a cluster's
+/// address that outlives its nodes), or its node's (`sharing::set_endpoint`).
+pub fn endpoint(lake: &crate::store::Lake) -> String {
     match crate::env::get("PONDRA_SHARING_URL") {
         Some(u) => u.trim_end_matches('/').to_string(),
-        None => ENDPOINT.current().unwrap_or_else(|| "http://127.0.0.1:8080/delta-sharing".into()),
+        None => lake.state::<Endpoint>().ok().and_then(|at| at.0.get().cloned()).unwrap_or_else(|| "http://127.0.0.1:8080/delta-sharing".into()),
     }
 }
 

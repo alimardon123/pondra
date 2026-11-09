@@ -116,7 +116,7 @@ fn parse(w: &mut Words) -> Result<Change> {
             }
             match kind.as_str() {
                 "share" => Change::CreateShare { name, comment, if_not_exists },
-                _ => Change::CreateRecipient { name, comment, expires_secs, if_not_exists, endpoint: crate::sharing_client::endpoint() },
+                _ => Change::CreateRecipient { name, comment, expires_secs, if_not_exists, endpoint: String::new() }, // (the leader's: `apply`)
             }
         }
         ("drop", _) => {
@@ -176,7 +176,7 @@ fn parse(w: &mut Words) -> Result<Change> {
             w.expect("token")?;
             let expires_secs = if w.is("expires") { w.expect("in")?; Some(span(&w.string()?)?) } else { None };
             w.done()?;
-            Change::RotateToken { name, expires_secs, endpoint: crate::sharing_client::endpoint() }
+            Change::RotateToken { name, expires_secs, endpoint: String::new() } // (the leader's: `apply`)
         }
         _ => bail!("not a statement about shares"),
     })
@@ -277,8 +277,14 @@ pub async fn tables_moved(lake: &Lake, moved: &[(&str, Option<&str>)]) -> Result
     Ok((puts, names))
 }
 
-/// Leader: carry out a change (under the lake's lock).
-pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
+/// Leader: carry out a change (under the lake's lock). A recipient's profile names where it reaches the door: the
+/// leader's, whichever node the statement came to (`sharing_client::endpoint`), unless the change says.
+pub async fn apply(lake: &Lake, mut c: Change) -> Result<Value> {
+    if let Change::CreateRecipient { endpoint, .. } | Change::RotateToken { endpoint, .. } = &mut c {
+        if endpoint.is_empty() {
+            *endpoint = crate::sharing_client::endpoint(lake);
+        }
+    }
     let must = |name: &str, s: Option<Share>| s.ok_or_else(|| anyhow!("no share {name} (CREATE SHARE {name})"));
     let put = |name: &str, s: &Share| (share_key(name), json(s));
     Ok(match c {

@@ -11,9 +11,11 @@
 //! rows as it reads (q95's `ws_wh`, web_sales joined to itself) is cheaper run twice, the joins above it filtering its
 //! scans as they run, than held whole. A held copy takes no filter from above it (a filter the joins above learn as they
 //! run is one use's own), so the copies are found before those are pushed down (`optimize::physical_rules`); and a use
-//! whose join learns such a filter for its grouping keeps its own copy (`keyed`: q23's `frequent_ss_items`). The rows
-//! stay held until the plan goes, for each read of them: a read past the uses counted (a plan run again) gets the same
-//! rows, never a second run of the copy. A partition being held is kept where every use finds it: a use dropped
+//! whose join learns such a filter for its grouping keeps its own copy (`keyed`: q23's `frequent_ss_items`). A
+//! partition's rows stay held until every use counted has started reading them, and go when the last of those reads
+//! ends: later sorts and joins have the memory back (11-09 audit L12). A read past the uses counted (the plan run again,
+//! or a use a later rule copied) reads a fresh copy of the one that ran, run once and held for every such read, as the
+//! first was. A partition being held is kept where every use finds it: a use dropped
 //! halfway (an anti join whose build side is empty drops its probe side) leaves it to the next. What doesn't fit in the query's memory goes to disk, as a sort's rows do, and
 //! each use reads it from there: one copy runs
 //! every partition, so no use runs its own beside it (a scan's partitions share its files out as they run, and a
@@ -287,11 +289,27 @@ struct Held {
     input: std::sync::OnceLock<Arc<dyn ExecutionPlan>>,
     parts: Mutex<HashMap<usize, Arc<tokio::sync::Mutex<Part>>>>,
     uses: AtomicUsize,
+    /// For the reads past the uses counted: a fresh copy of the one that ran, held for every such read (`again`).
+    again: Mutex<Option<Arc<Held>>>,
 }
 
 impl Held {
     fn part(&self, p: usize) -> Arc<tokio::sync::Mutex<Part>> {
         self.parts.lock().unwrap_or_else(PoisonError::into_inner).entry(p).or_default().clone()
+    }
+
+    /// What a read past the uses counted reads (`Part::Read`): the copy that ran, reset to run again
+    /// (`reset_plan_states`), whose partitions are held for every later read and never let go before the plan.
+    fn again(&self) -> Result<Arc<Held>> {
+        let mut again = self.again.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(held) = &*again {
+            return Ok(held.clone());
+        }
+        let ran = self.input.get().cloned().ok_or_else(|| DataFusionError::Internal("ReuseExec: a partition read with no copy run".into()))?;
+        let fresh = datafusion::physical_plan::execution_plan::reset_plan_states(ran)?;
+        let held = Arc::new(Held { input: std::sync::OnceLock::from(fresh), uses: AtomicUsize::new(usize::MAX), ..Held::default() });
+        *again = Some(held.clone());
+        Ok(held)
     }
 }
 
@@ -301,7 +319,8 @@ enum Part {
     #[default]
     Unrun,
     Running(Box<Running>), // being held: a use that goes away (its join's build side empty) leaves it to the next
-    Kept(Rows),            // its rows, for every use that reads it, until the plan goes
+    Kept(Rows, usize),     // its rows, and how many uses have started reading them
+    Read,                  // every use counted has started reading: its rows go when the last of those reads ends
     Failed(String),        // its run failed, and why: it isn't run again
 }
 
@@ -471,37 +490,50 @@ impl ExecutionPlan for ReuseExec {
     }
 }
 
-/// One use's rows of partition `p`: the held ones, once the first use to get here has run it.
-async fn take(own: Arc<dyn ExecutionPlan>, held: Arc<Held>, p: usize, ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+/// One use's rows of partition `p`: the held ones, once the first use to get here has run it; past the uses counted,
+/// a fresh copy's (`Held::again`).
+async fn take(own: Arc<dyn ExecutionPlan>, mut held: Arc<Held>, p: usize, ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
     let schema = own.schema();
-    let part = held.part(p);
-    let mut slot = part.lock().await;
-    if matches!(*slot, Part::Unrun) {
-        let input = held.input.get_or_init(|| own.clone()).clone();
-        match input.execute(p, ctx.clone()) {
-            Ok(stream) => *slot = Part::Running(Box::new(Running::new(stream, p, &ctx))),
-            Err(e) => {
-                *slot = Part::Failed(e.to_string());
-                return Err(e);
+    let rows = loop {
+        let part = held.part(p);
+        let mut slot = part.lock().await;
+        if matches!(*slot, Part::Unrun) {
+            let input = held.input.get_or_init(|| own.clone()).clone();
+            match input.execute(p, ctx.clone()) {
+                Ok(stream) => *slot = Part::Running(Box::new(Running::new(stream, p, &ctx))),
+                Err(e) => {
+                    *slot = Part::Failed(e.to_string());
+                    return Err(e);
+                }
             }
         }
-    }
-    if let Part::Running(run) = &mut *slot {
-        match run.finish(p, &ctx).await {
-            Ok(rows) => *slot = Part::Kept(rows),
-            Err(e) => {
-                *slot = Part::Failed(e.to_string()); // (every other use is told the same: the copy isn't run again)
-                return Err(e);
+        if let Part::Running(run) = &mut *slot {
+            match run.finish(p, &ctx).await {
+                Ok(rows) => *slot = Part::Kept(rows, 0),
+                Err(e) => {
+                    *slot = Part::Failed(e.to_string()); // (every other use is told the same: the copy isn't run again)
+                    return Err(e);
+                }
             }
         }
-    }
-    // (every read of it gets the same rows: a plan run again reads them again, and isn't the run that held them)
-    let rows = match &*slot {
-        Part::Kept(rows) => rows.clone(),
-        Part::Failed(why) => return Err(DataFusionError::Execution(format!("{why} (ReuseExec: partition {p}'s run, which its uses share)"))),
-        _ => return Err(DataFusionError::Internal(format!("ReuseExec: partition {p} neither run nor held"))),
+        // (every use counted reads the same rows; the last to start takes the slot's, so they go once its read ends)
+        match &mut *slot {
+            Part::Kept(rows, started) => {
+                *started += 1;
+                let rows = rows.clone();
+                if *started >= held.uses.load(Relaxed) {
+                    *slot = Part::Read;
+                }
+                break rows;
+            }
+            Part::Read => {
+                drop(slot);
+                held = held.again()?;
+            }
+            Part::Failed(why) => return Err(DataFusionError::Execution(format!("{why} (ReuseExec: partition {p}'s run, which its uses share)"))),
+            _ => return Err(DataFusionError::Internal(format!("ReuseExec: partition {p} neither run nor held"))),
+        }
     };
-    drop(slot);
     match rows {
         Rows::Held(kept) => {
             let rows = (0..kept.batches.len()).map(move |i| Ok(kept.batches[i].clone()));
@@ -658,8 +690,9 @@ mod tests {
     }
 
     /// What doesn't fit in the query's memory goes to disk, and every use reads every row from the one copy that ran:
-    /// the second use's own copy (here an empty one) is never run, whichever use asks for a partition first. A read
-    /// past the uses counted (a plan run again) gets the same rows, the copy not run again.
+    /// the second use's own copy (here an empty one) is never run, whichever use asks for a partition first. Once both
+    /// uses counted have read a partition, its rows go, from memory or disk (11-09 audit L12). A read past the uses
+    /// counted (the plan run again) reads a fresh copy of the one that ran.
     #[tokio::test]
     async fn too_big_to_hold_goes_to_disk() -> Result<()> {
         let ctx = session(Arc::new(RuntimeEnv::default()), true).await?;
@@ -680,17 +713,24 @@ mod tests {
                 for (i, (plan, rows)) in order.into_iter().enumerate() {
                     *rows += plan.execute(p, task.clone())?.try_collect::<Vec<_>>().await?.iter().map(|b| b.num_rows()).sum::<usize>();
                     if i == 0 {
-                        let spilled = matches!(&*held.part(p).try_lock().unwrap(), Part::Kept(Rows::Spilled(_)));
+                        let spilled = matches!(&*held.part(p).try_lock().unwrap(), Part::Kept(Rows::Spilled(_), _));
                         assert_eq!(spilled, limit < 1 << 20, "memory limit {limit}, partition {p}");
                     }
                 }
             }
             assert_eq!((first, second), (200_000, 200_000), "memory limit {limit}");
-            let mut again = 0;
+            assert!(held.parts.lock().unwrap().values().all(|p| matches!(*p.try_lock().unwrap(), Part::Read)), "every partition read by both");
+            let (memory, disk) = (task.memory_pool().reserved(), task.runtime_env().disk_manager.used_disk_space());
+            assert_eq!((memory, disk), (0, 0), "nothing is held once both have read it, memory limit {limit}");
+            let (mut third, mut fourth) = (0, 0);
             for p in 0..parts {
-                again += two.execute(p, task.clone())?.try_collect::<Vec<_>>().await?.iter().map(|b| b.num_rows()).sum::<usize>();
+                for (plan, rows) in [(&two, &mut third), (&one, &mut fourth)] {
+                    *rows += plan.execute(p, task.clone())?.try_collect::<Vec<_>>().await?.iter().map(|b| b.num_rows()).sum::<usize>();
+                }
             }
-            assert_eq!(again, 200_000, "a third read, memory limit {limit}");
+            assert_eq!((third, fourth), (200_000, 200_000), "a third and a fourth read, memory limit {limit}");
+            let again = held.again.lock().unwrap().clone().unwrap();
+            assert!(again.parts.lock().unwrap().values().all(|p| matches!(*p.try_lock().unwrap(), Part::Kept(_, 2))), "both read one fresh copy's rows");
         }
         Ok(())
     }

@@ -81,6 +81,7 @@ struct Server {
     auth: Arc<Auth>,
     nodes: Mutex<HashMap<String, Node>>,
     starting: Mutex<()>, // (one database's node started at a time: two requests don't start two)
+    tasks: crate::spawns::Tasks, // (the server's own loops and connections, ended as it stops; a database's node has its own)
 }
 
 type Shared = Arc<Server>;
@@ -268,9 +269,10 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
             std::fs::canonicalize(&folder)?.to_string_lossy().trim_start_matches(r"\\?\").to_string() // (Windows verbatim prefix)
         }
     };
-    let server: Shared = Arc::new(Server { folder: folder.clone(), addr: addr.clone(), default, options, auth, nodes: Default::default(), starting: Default::default() });
+    let tasks = crate::spawns::Tasks::new(crate::node::native(false).life.clone()); // (a panic in a loop of its own stops the process, as a node's)
+    let server: Shared = Arc::new(Server { folder: folder.clone(), addr: addr.clone(), default, options, auth, nodes: Default::default(), starting: Default::default(), tasks });
     let s = server.clone();
-    crate::spawns::spawn(async move {
+    server.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
         for round in 0u64.. {
             if round % 60 == 0 {
                 crate::undrop::sweep_lakes(&s.folder, crate::log::now_ms()).await; // (every ten minutes: the dropped databases whose time is up)
@@ -281,12 +283,13 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
     });
     if let Some(pg) = pg {
         let (s, listener) = (server.clone(), tokio::net::TcpListener::bind(&pg).await.with_context(|| format!("the Postgres port {pg}"))?);
-        crate::spawns::spawn(async move {
+        server.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else { continue };
                 let _ = socket.set_nodelay(true);
-                let s = s.clone();
-                crate::spawns::task(async move {
+                let s2 = s.clone();
+                s.tasks.spawn_as(crate::auth::Door, async move {
+                    let s = s2;
                     if let Err(e) = postgres(&s, socket).await {
                         eprintln!("postgres connection: {e:#}");
                     }
@@ -311,11 +314,12 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
         .layer(axum::middleware::from_fn_with_state(server.clone(), plain))
         .with_state(server.clone());
     eprintln!("pondra serve: the lakes in {folder} as databases, on {addr}");
-    let listener = crate::tls::Doors::bind(&addr, crate::tls::Door::Http).await?; // (TLS too: `tls.rs`)
+    let listener = crate::tls::Doors::bind(&addr, crate::tls::Door::Http, &server.tasks, crate::auth::Door).await?; // (TLS too: `tls.rs`)
     let stop = async {
         crate::cli::stopped(false).await;
     };
     axum::serve(listener, app.into_make_service_with_connect_info::<crate::tls::Peer>()).with_graceful_shutdown(stop).await?;
+    server.tasks.abort_all(); // (its reaper and doors end before its databases' nodes are let go)
     let nodes: Vec<Node> = server.nodes.lock().await.drain().map(|(_, n)| n).collect();
     for mut n in nodes {
         drop(n.child.stdin.take());

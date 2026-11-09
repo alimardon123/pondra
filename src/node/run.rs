@@ -64,6 +64,14 @@ pub(crate) struct Held {
 }
 
 impl Held {
+    /// Ends every task the node started but the one asking (`NodeState::tasks`). The loops of its statics end as they are
+    /// set back, last (`spawns::for_statics`, `reset::reset`).
+    pub(crate) fn abort_tasks(&self) {
+        if let Some(node) = self.node.get() {
+            node.tasks.abort_all();
+        }
+    }
+
     /// What a node does once drained (`drain.rs`, which the program runs first, with a second signal
     /// racing it): what it committed is made durable, the catalog is checkpointed, and a leader gives up
     /// its term, so the next node leads at once instead of waiting out the lease (invariant 210). A node
@@ -90,7 +98,7 @@ impl Held {
             crate::drain::close_door(node).await;
         }
         tr("door");
-        crate::spawns::abort_all();
+        self.abort_tasks();
         tr("tasks");
         if let Some(l) = lake {
             if self.detach.get().is_some() {
@@ -205,9 +213,6 @@ impl Node {
         let store = store::counted(store::open_store(&dir)?.1, &here.metrics); // (its terms, marks and members' requests the node's: `Counted`)
         let tr = |what: &str| here.trace(what); // (timed from this start: `NodeState::trace`)
         let addr = advertise.unwrap_or_else(|| listen.clone()); // (how others reach it: its cluster name)
-        if lives {
-            sharing::set_endpoint(&addr); // (where a recipient's profile points: `sharing.rs`)
-        }
         if let Some(at) = dir.strip_prefix("pondra://") {
             // (a lake whose node is away, or not up yet: wait for it, as a follower waits for its leader; a guest waits 10 s at most)
             let at = at.trim_end_matches('/');
@@ -241,9 +246,9 @@ impl Node {
             // "Still here", in the bucket, from the start: for machines outside the cluster. (A guest marks its term
             // as `write::lead` does: its task ends with the node.)
             if lives {
-                cluster.clone().keep_alive(store.clone(), &dir); // (beside the catalog's opening, not before it: C5)
+                cluster.clone().keep_alive(store.clone(), &dir, &here); // (beside the catalog's opening, not before it: C5)
             } else {
-                let _ = terms::mark_every(store.clone(), cluster.leader.n);
+                let _ = terms::mark_every(&here.tasks, store.clone(), cluster.leader.n);
             }
         }
         // Read-only nodes follow the leader's commit stream too (when a live one is there to ask),
@@ -288,6 +293,9 @@ impl Node {
             lake => lake?,
         };
         let _ = held.lake.set(lake.clone()); // (a stop from here on makes the lake durable first: `Held::stop`)
+        if lives {
+            sharing::set_endpoint(&lake, &addr); // (where a recipient's profile points: `sharing.rs`)
+        }
         if (guest == Some(Guest::Reads) || cluster.by_inbox()) && !streamed {
             let _ = held.detach.set(()); // (a reader owes nothing: its close is let go, `Held::stop`; an inbox guest's writes are answered before it)
         }
@@ -319,17 +327,17 @@ impl Node {
         }
         if let Some(pg_addr) = pg {
             let a = app.clone();
-            crate::spawns::spawn(async move { pg::serve(a, pg_addr).await.map_err(|e| eprintln!("postgres protocol: {e:#}")) });
+            here.tasks.spawn_node(crate::spawns::Vital::Stop, async move { pg::serve(a, pg_addr).await.map_err(|e| eprintln!("postgres protocol: {e:#}")) });
         }
         if let Some(kafka_addr) = kafka {
             let port = kafka_addr.rsplit_once(':').map_or("9092", |(_, p)| p).to_string();
             let advertise = kafka_advertise.unwrap_or_else(|| format!("{}:{port}", addr.rsplit_once(':').map_or("127.0.0.1", |(h, _)| h)));
             let a = app.clone();
-            crate::spawns::spawn(async move { kafka::serve(a, kafka_addr, advertise).await.map_err(|e| eprintln!("kafka protocol: {e:#}")) });
+            here.tasks.spawn_node(crate::spawns::Vital::Stop, async move { kafka::serve(a, kafka_addr, advertise).await.map_err(|e| eprintln!("kafka protocol: {e:#}")) });
         }
         if let Some(flight_addr) = flight {
             let a = app.clone();
-            crate::spawns::spawn(async move { flight::serve(a, flight_addr).await.map_err(|e| eprintln!("flight: {e:#}")) });
+            here.tasks.spawn_node(crate::spawns::Vital::Stop, async move { flight::serve(a, flight_addr).await.map_err(|e| eprintln!("flight: {e:#}")) });
         }
         if let (true, Some(seq)) = (lives, &app.seq) {
             inbox::serve(lake.clone(), seq.clone(), app.lock.clone(), cluster.rings()); // writers that can't reach us
@@ -344,8 +352,8 @@ impl Node {
             let down = Arc::new(std::sync::atomic::AtomicBool::new(false)); // (is the leader's commit stream down: the mirror says, a reader's watch reads)
             if lives {
                 match reader {
-                    false => cluster.clone().follow(store, lake.log.untaken.clone()),
-                    true => cluster.clone().watch_leader(store, streamed, down.clone()), // a reader never votes or leads
+                    false => cluster.clone().follow(store, lake.log.untaken.clone(), &here),
+                    true => cluster.clone().watch_leader(store, streamed, down.clone(), &here), // a reader never votes or leads
                 }
             }
             if streamed {
@@ -367,7 +375,7 @@ impl Node {
         // Postgres, Kafka and Flight ports do the same).
         tr("listening");
         let listener = match lives {
-            true => Some(tls::Doors::bind(&listen, tls::Door::Http).await?.for_node(here.clone())), // (TLS too: `tls.rs`)
+            true => Some(tls::Doors::bind(&listen, tls::Door::Http, &here.tasks, crate::auth::Door).await?.for_node(here.clone())), // (TLS too: `tls.rs`)
             false => None,
         };
         node::keep(&app, &start);
@@ -377,7 +385,8 @@ impl Node {
         let router = server::router(app);
         let served = listener.map(|listener| {
             let (door, here) = (router.clone(), here.clone());
-            crate::spawns::spawn(async move {
+            let node = here.clone();
+            node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
                 // (closing once `drain::close_door` runs: no new connections, each one's answer finished, then the serve ends)
                 here.drain.door_open();
                 let out = axum::serve(listener, door.into_make_service_with_connect_info::<tls::Peer>()).with_graceful_shutdown(here.drain.closing()).await.map_err(anyhow::Error::from); // (who asks: `console::save_settings`)
@@ -448,8 +457,11 @@ impl Node {
 
     /// Once drained (`drain.rs`, run by the program first): gives back what the node holds (`Held::stop`).
     /// `start` for a library: what the start takes is given back if it fails.
-    pub async fn open(o: Options) -> anyhow::Result<Node> {
-        let held = Arc::new(Held::default());
+    pub async fn open(o: Options) -> anyhow::Result<Node> { Node::open_in(o, Arc::new(Held::default())).await }
+
+    /// [`Node::open`] into `held`, which the caller keeps: a start whose future it drops (a library's supervisor told to
+    /// restart or close meanwhile) still ends the tasks it started (`Held::abort_tasks`).
+    pub(crate) async fn open_in(o: Options, held: Arc<Held>) -> anyhow::Result<Node> {
         match Node::start(o, held.clone()).await {
             Ok(node) => Ok(node),
             Err(e) => {

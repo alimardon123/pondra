@@ -143,7 +143,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("queries_stopped_for_memory_total", "counter", "queries stopped (answered 53200) because the node was nearly out of memory (PONDRA_MEMORY_MAX_GB); a first try stopped and run again frugally is not counted, one that can't be run again is", &one(get(&m.stopped_for_memory)));
     metric("memory_limit_bytes", "gauge", "query memory limit (spills beyond it)", &one(limit as f64));
     metric("memory_reserved_bytes", "gauge", "query memory in use", &one(reserved as f64));
-    let (hot, hot_max, loading) = app.lake.hot.usage();
+    let (hot, hot_max, loading) = app.lake.hot().usage();
     metric("hot_bytes", "gauge", "decoded columns kept in memory (hot.rs)", &one(hot as f64));
     metric("hot_limit_bytes", "gauge", "the most the hot columns may hold (PONDRA_HOT_GB)", &one(hot_max as f64));
     metric("hot_loading_files", "gauge", "files whose columns are being decoded into memory, or wait to be", &one(loading as f64));

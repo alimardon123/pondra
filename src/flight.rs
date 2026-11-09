@@ -48,7 +48,7 @@ type Out<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     // (a message up to 1 GiB, as HTTP takes a batch, but only from a caller `Gate` has signed in)
     let service = FlightServiceServer::new(Door(Sql(app.clone()))).max_decoding_message_size(1 << 30).max_encoding_message_size(1 << 30);
-    let doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Flight).await?; // (TLS too: `tls.rs`)
+    let doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Flight, &app.lake.node.tasks, crate::auth::Door).await?; // (TLS too: `tls.rs`)
     // (it closes with the HTTP door, gracefully: the answers being written go out whole, and the node's stop waits for its
     // connections to close, `Drain::serving`, as an answer's last messages may still be in one when its stream has ended)
     let (_serving, closing) = (app.lake.node.drain.serving(), app.lake.node.drain.closing());
@@ -538,7 +538,7 @@ where
             },
             Ok(h) = &mut handed => {
                 // (the rest of the statement runs on the queries' runtime while the client reads its pieces, as the request that asked)
-                crate::spawns::aside(crate::panics::work(&held, true, crate::auth::carried(in_session(session, go))));
+                held.tasks.aside(crate::auth::caller(), crate::panics::work(&held, true, in_session(session, go)));
                 Ok(Sent::Pieces(h, held.drain.carried()))
             }
         }
@@ -727,7 +727,8 @@ fn append(app: &App, who: crate::auth::Principal, table: String, producer: Strin
     let mut who = Some(who); // (the caller, for its grants in the task below)
     let (acks_tx, mut acks_rx) = tokio::sync::mpsc::channel::<Result<crate::writer::Queued, Status>>(256);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel(); // (acks are small; a client may read them only at the end)
-    crate::spawns::task(async move {
+    let node = app.lake.node.clone();
+    node.tasks.spawn_as(crate::auth::caller(), async move {
         let mut batches = std::pin::pin!(batches);
         // (a refusal is said as the writer's caller is told: `Worded`)
         let worded = |who: &Option<crate::auth::Principal>| who.as_ref().map_or(PLAIN, |w| Worded::of(&w.scope));
@@ -786,7 +787,7 @@ fn append(app: &App, who: crate::auth::Principal, table: String, producer: Strin
         }
     });
     let (log, table) = (log2, table2);
-    crate::spawns::task(async move {
+    node.tasks.spawn_as(crate::auth::caller(), async move {
         while let Some(queued) = acks_rx.recv().await {
             let acked = match queued {
                 Ok(crate::writer::Queued { ack, src, rows: batch }) => {

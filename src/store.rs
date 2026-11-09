@@ -13,7 +13,6 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::disk_manager::{DiskManager, DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::spill_file::{SpillFile, TempFileFactory};
-use datafusion::prelude::{SessionConfig, SessionContext};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
@@ -1525,7 +1524,7 @@ const RECENT_BYTES: usize = 64 << 20; // …within this much memory (past it, a 
 // follower reads from its own view until it has caught up, instead of the leader buffering more)
 
 /// Query read cache in memory, MB (env PONDRA_CACHE_MB, default 1024).
-fn cache_mb() -> usize { crate::env::value("PONDRA_CACHE_MB") }
+pub(crate) fn cache_mb() -> usize { crate::env::value("PONDRA_CACHE_MB") }
 
 /// Did the user give the read caches (a bucket's byte ranges, lookups' row groups) a budget of their own, `PONDRA_CACHE_MB`?
 /// Then they keep it beside the whole line for queries and caches (`ledger::Charged::inside`).
@@ -1544,7 +1543,7 @@ pub(crate) fn cache_base() -> std::io::Result<std::path::PathBuf> {
 /// The local SSD tier for a lake on object storage (`serve --cache-dir/--cache-gb`, or env
 /// PONDRA_CACHE_DIR / PONDRA_CACHE_GB): under `cache_base`, 20 GB, or a quarter of the free disk
 /// if that is less (a notebook's sandbox may have a few GB). 0 GB turns it off.
-fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
+fn disk_tier(url: &str, store: &Store, node: &Arc<NodeState>) -> Option<Arc<crate::cache::Disk>> {
     let dir = match cache_base() {
         Ok(dir) => dir,
         Err(e) => {
@@ -1558,7 +1557,7 @@ fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
         None => crate::machine::process().space(&dir).map_or(20 << 30, |(free, _)| (free / 4).min(20 << 30)),
     };
     let dir = dir.join(url.trim_start_matches("s3://").replace(['/', ':', '\\'], "_")); // one folder per lake
-    (bytes > 0).then(|| crate::cache::Disk::open(dir, bytes, store.clone()).ok()).flatten()
+    (bytes > 0).then(|| crate::cache::Disk::open(dir, bytes, store.clone(), node.clone()).ok()).flatten()
 }
 
 /// Room a lake on local disk keeps for its own upkeep: a quarter of the disk, 256 MB at most (of
@@ -1809,6 +1808,58 @@ fn no_room(bytes: u64, gb: Option<f64>) -> anyhow::Error {
     crate::codes::coded("53100", format!("The shuffle needed {more:.1} MB more on disk than there is room for. {way}"))
 }
 
+/// What a feature does as each lake opens, once its caches are charged and before its writes start (`Lake::open`): a
+/// branch opens its bases, so the files it lists there are read (`branch::load`, ADR-047). The feature registers it, and
+/// the lake doesn't know whose it is.
+#[derive(Default)]
+pub struct OpenHooks(Vec<(&'static str, OpenHook)>);
+
+/// One of `OpenHooks`: the lake as it opens.
+pub type OpenHook = for<'a> fn(&'a Lake) -> futures::future::BoxFuture<'a, Result<()>>;
+
+impl OpenHooks {
+    pub fn add(&mut self, name: &'static str, hook: OpenHook) {
+        self.0.push((name, hook));
+    }
+}
+
+impl crate::registry::Section for OpenHooks {
+    const NAME: &'static str = "open hooks";
+
+    fn check(&self, _: &crate::registry::Registry) -> std::result::Result<(), String> {
+        match self.0.iter().enumerate().find(|(i, (name, _))| self.0[..*i].iter().any(|(n, _)| n == name)) {
+            Some((_, (name, _))) => Err(format!("two open hooks are named {name}")),
+            None => Ok(()),
+        }
+    }
+}
+
+/// `_base/<id>/rest` as (id, rest): a branch's path to a file of its base, which the lake reads there (`Lake::full`,
+/// ADR-047; `branch::rebase` makes one).
+pub fn base_path(path: &str) -> Option<(&str, &str)> { path.strip_prefix("_base/")?.split_once('/') }
+
+/// A block of row ids reserved from the leader: `(block << 32) + n`, n counting up. A node takes a
+/// new block when one runs out (or after a restart: ids are never reused). The log stamps a commit's
+/// rows with them (`log::commit`), and `sys.rs` says what they are.
+#[derive(Default)]
+pub struct Ids(std::sync::Mutex<Option<(u64, u64)>>); // (block, next n)
+
+impl Ids {
+    /// `rows` consecutive ids, if the block has them (else None: reserve a block first).
+    pub fn take(&self, rows: u64) -> Option<i64> {
+        let mut b = self.0.lock().unwrap();
+        let (block, next) = (*b)?;
+        if next + rows > 1 << 32 {
+            *b = None;
+            return None;
+        }
+        *b = Some((block, next + rows));
+        Some(((block << 32) + next) as i64)
+    }
+
+    pub fn refill(&self, block: u64) { *self.0.lock().unwrap() = Some((block, 0)); }
+}
+
 pub struct Lake {
     pub url: String, // absolute local dir or "s3://bucket/prefix" (gs://, az://, abfss:// too; memory://id in this process)
     pub store: Store,
@@ -1817,24 +1868,20 @@ pub struct Lake {
     pub backlog: std::sync::atomic::AtomicU64, // leader: rows in the log not yet tiered (all tables)
     pub rt: Arc<RuntimeEnv>,         // shared by all queries: object store registry + Parquet metadata cache
     tail: Arc<Mutex<Tail>>, // decoded log rows
-    pub tails: Arc<Mutex<crate::query::Tails>>, // tables' tails as queries read them (`query::Tail`): by table, one a form (`of.1`)
     kept: (Arc<Footers>, Arc<FileStatistics>), // DataFusion's caches of Parquet footers and of files' statistics (`rt`'s)
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
-    pub groups: Arc<crate::serve::Groups>,     // decoded row groups for key lookups
-    pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
     pub(crate) manifests: Arc<crate::manifest::Kept>, // its tables' manifests and lists, decompressed (`manifest::object`)
     pub(crate) format: crate::format::Held, // what this process holds of its format: made here, what `raise` saw (`format.rs`)
     pub(crate) log: crate::log::Kept, // what the log keeps for it between commits: producers to forget, a flush its leader didn't take (`log::Kept`)
-    states: crate::lake_state::States, // what engine and extension modules keep for it, by type (`state`)
+    states: crate::lake_state::States, // what engine and extension modules keep for it, by type (`state`): the hot columns, the tables' tails and the lookups' row groups (`hot::Hot`, `query::Tails`, `serve::Groups`), the sequences' blocks (`seq::Blocks`), …
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
     cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
-    pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
+    pub ids: Ids, // the row ids this process stamps rows with (a block reserved from the leader)
     pub caught: watch::Sender<bool>, // false while a node that just started catches up with its leader (`caught_up`)
     pub to: std::sync::OnceLock<crate::log::To>, // where this process's flushes and sequences' values go: its sequencer, or the leader's
     pub owner_key: std::sync::OnceLock<String>, // the key of the program that started this process's node on the lake (`Auth::owner_key`): what its owner's tasks are signed with (`runs::signed`)
-    pub sequences: tokio::sync::Mutex<HashMap<String, crate::seq::Block>>, // the sequences' values this node hands out (`seq::next`)
     bases: std::sync::RwLock<BTreeMap<String, (String, Option<Store>)>>, // a branch's bases (ADR-047): id -> place, and its store once read
-    sessions: Mutex<std::collections::HashMap<usize, datafusion::execution::SessionState>>, // (`session_with`'s, made once a partition count)
+    pub(crate) sessions: Mutex<std::collections::HashMap<usize, datafusion::execution::SessionState>>, // (`engine.rs`'s `Lake::session_with`'s, made once a partition count)
     me: std::sync::Weak<Lake>,
     /// The node it is open in, or the program or test that opened it (`node_state.rs`): its lifecycle, which its catalog's
     /// fence and its vital loops' failures stop or restart, and its doors' drain.
@@ -2322,7 +2369,6 @@ impl Lake {
 
     /// `open_polled` and `open_on`: a reader's catalog is `given` when one is, else `kv::reader` on the lake's store.
     async fn open_with(url: &str, writer: bool, streamed: bool, poll: Duration, given: Option<Arc<dyn Kv>>, node: Arc<NodeState>) -> Result<Arc<Lake>> {
-        let life = node.life.clone();
         let (url, store, bucket) = open_store(url)?;
         // (what the lake reads and writes, counted into its node's metrics: `Counted`)
         let (store, bucket) = (counted(store, &node.metrics), bucket.map(|(root, whole)| (root, counted(whole, &node.metrics))));
@@ -2338,7 +2384,7 @@ impl Lake {
         let kept = (Arc::new(Footers::new(DEFAULT_METADATA_CACHE_LIMIT).with_name("DefaultFileMetadataCache")), Arc::new(FileStatistics::new(DEFAULT_FILE_STATISTICS_MEMORY_LIMIT).with_name("DefaultFileStatisticsCache")));
         let caches = CacheManagerConfig::default().with_list_files_cache_limit(0).with_file_metadata_cache(Some(kept.0.clone())).with_file_statistics_cache(Some(kept.1.clone()));
         let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).with_cache_manager(caches).with_disk_manager_builder(spill_disk(node.scratch.as_ref())).build_arc()?;
-        let disk = bucket.as_ref().filter(|_| !memory).and_then(|_| disk_tier(&url, &store));
+        let disk = bucket.as_ref().filter(|_| !memory).and_then(|_| disk_tier(&url, &store, &node));
         let mut cached_store = None;
         if let Some((bucket_url, held)) = bucket.as_ref().filter(|_| memory) {
             rt.register_object_store(&url::Url::parse(bucket_url)?, Arc::new(crate::bridge::Bridge(held.clone()))); // (in memory already: read as it is)
@@ -2356,7 +2402,7 @@ impl Lake {
             Ok::<_, anyhow::Error>(match writer {
                 true => {
                     let t0 = datafusion::common::instant::Instant::now();
-                    let kv = kv::writer(store.clone(), cache_dir, local, life.clone()).await?;
+                    let kv = kv::writer(store.clone(), cache_dir, local, node.clone()).await?;
                     trace_since("the catalog's writer open", t0);
                     Catalog::writer(kv, t0, &node).await?
                 }
@@ -2382,16 +2428,20 @@ impl Lake {
         let cat = cat?;
         let format = crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory, node.machine.ram())), manifests: crate::manifest::kept(), format, log: Default::default(), states: Default::default(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), node });
+        cat.frozen.store(cat.get::<serde_json::Value>(crate::frozen::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), kept, disk, manifests: crate::manifest::kept(), format, log: Default::default(), states: Default::default(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), node });
+        lake.states.open(crate::registry::get(), &crate::lake_state::Opening { memory, ram: lake.node.machine.ram() }); // (the caches every query reads, charged next among the lake's own)
         for (name, cache) in lake.caches() {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
         ledger.charge("files", Arc::downgrade(&crate::cache::outside())); // (the process's, of files outside the lakes)
         crate::oom::wake();
-        crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
+        for (_, opens) in &crate::registry::get().section::<OpenHooks>().0 {
+            opens(&lake).await?; // (a branch's bases, so its files listed there are read: ADR-047)
+        }
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
-            crate::spawns::spawn(Lake::commits(Arc::downgrade(&lake), writes, lake.node.life.clone())); // (weak: a lake opened in a process goes when its last handle does)
+            let (weak, n) = (Arc::downgrade(&lake), lake.node.clone());
+            lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move { Lake::commits(weak, writes, n.life.clone(), &n).await }); // (weak: a lake opened in a process goes when its last handle does)
         }
         Ok(lake)
     }
@@ -2403,10 +2453,10 @@ impl Lake {
     /// us out) has an unknown outcome: restart and rejoin; the restart reloads the state.
     /// Both loops hold the lake weakly: the writes' sender is the lake's own (`Catalog::writes`), so
     /// a strong hold would keep a lake opened in a process (a backup taken in it) for ever.
-    async fn commits(me: std::sync::Weak<Self>, mut writes: mpsc::UnboundedReceiver<Write>, life: Life) {
+    async fn commits(me: std::sync::Weak<Self>, mut writes: mpsc::UnboundedReceiver<Write>, life: Life, node: &crate::node_state::NodeState) {
         let (to_bucket, mut in_bucket) = mpsc::unbounded_channel::<(Arc<dyn Written>, u64)>();
         let (lake, lives) = (me.clone(), life.clone());
-        crate::spawns::spawn(async move {
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             while let Some((handle, id)) = in_bucket.recv().await {
                 if let Err(e) = handle.durable().await {
                     eprintln!("catalog commit failed: {e}");
@@ -2505,12 +2555,12 @@ impl Lake {
                 }
                 (Some("t/"), disk) => {
                     let decoded = self.tail.lock().unwrap().rows.contains_key(&key[2..]);
-                    if !(decoded || disk.is_some() || self.hot.on()) {
+                    if !(decoded || disk.is_some() || self.states.keep_files()) {
                         continue;
                     }
                     let Ok(m) = serde_json::from_slice::<TableMeta>(value) else { continue };
                     self.tail.lock().unwrap().forget(&key[2..], m.tiered); // (rows now in files: no read asks for them again)
-                    self.hot.forget(&m.garbage);
+                    self.states.files_gone(&m.garbage); // (the hot columns' old files: `LakeState::files_gone`)
                     // (files a tiering round writes; not a bulk load's big files, which only the queries that need them read)
                     if let Some(disk) = disk {
                         m.files.into_iter().filter(|f| f.bytes <= 256 << 20 && !f.path.is_empty() && !f.path.starts_with("_base/")).for_each(|f| disk.fetch_later(f.path));
@@ -2598,8 +2648,8 @@ impl Lake {
     /// runtime too: a query here reads its files).
     pub fn attach(&self, name: &str, other: Arc<Lake>) -> Result<()> {
         let name = &name.to_lowercase(); // (as SQL reads an unquoted name)
-        crate::ddl::check(name)?;
-        anyhow::ensure!(*name != crate::ddl::lake_name(self), "this lake is called {name} already: attach the other under another name");
+        crate::naming::check(name)?;
+        anyhow::ensure!(*name != crate::naming::lake_name(self), "this lake is called {name} already: attach the other under another name");
         match (bucket_url(&other.url), &self.cached) {
             (Some(bucket), Some(ours)) if bucket_url(&self.url).as_ref() == Some(&bucket) => ours.add_lake(other.url[bucket.len()..].trim_start_matches('/')), // (one bucket: our reader, its files cached too)
             (Some(bucket), _) => {
@@ -2616,33 +2666,12 @@ impl Lake {
         Ok(())
     }
 
-    /// A fresh SQL session on the shared runtime (`partitions()` of them).
-    pub fn session(&self) -> SessionContext {
-        self.session_with(partitions())
-    }
-
-    /// A session with a fixed number of partitions: 1 for point lookups, where splitting the work
-    /// costs more than it saves and many queries run at once. Its functions, planners and rules
-    /// are the same for every query, so they are made once (`made`) and copied; each copy gets
-    /// catalogs of its own, so the tables a query registers are its alone.
-    pub fn session_with(&self, partitions: usize) -> SessionContext {
-        spill_room(); // (the spill disk's room as it is now: `Spills` looked at it once, when the first spill made the disk)
-        let state = self.sessions.lock().unwrap().entry(partitions).or_insert_with(|| self.made(partitions).state()).clone();
-        let catalog = datafusion::execution::SessionStateDefaults::default_catalog(state.config(), state.table_factories(), state.runtime_env());
-        let ctx = crate::engine::with_catalog(state, Arc::new(catalog));
-        crate::files::register(&ctx, self.arc()); // files('…'), file_read(path) (here, not in what is kept: the lake would keep itself)
-        crate::seq::register(&ctx, self.arc()); // nextval, currval, setval
-        crate::ext::register_secrets(&ctx, self.arc()); // secrets()
-        crate::extension::register(&ctx, self.arc()); // extensions() (SHOW EXTENSIONS)
-        ctx
-    }
-
     /// A session made from nothing, with everything every query's session has: every function set in the registry
     /// (`engine::session`). On a page every plan it makes runs its partitions in the page's task, as the page's own
     /// session's do (`in_task::planned`): a page has no runtime to start a partition's task on, and a plan of one
     /// partition still merges more than one below it. Plans made by hand from it (`fresh.rs`) are planned by it too.
-    fn made(&self, partitions: usize) -> SessionContext {
-        let config = SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::text::PUBLIC);
+    pub(crate) fn made(&self, partitions: usize) -> datafusion::prelude::SessionContext {
+        let config = datafusion::prelude::SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::naming::lake_name(self), crate::text::PUBLIC);
         let ctx = crate::engine::session(config, self.rt.clone());
         #[cfg(target_arch = "wasm32")]
         let ctx = crate::in_task::planned(ctx);
@@ -2672,7 +2701,8 @@ impl Lake {
     /// the log; then the bucket's byte ranges, fetched again. The log's decoded rows, the catalog's blocks and DataFusion's
     /// footers and statistics keep what they hold by rules of their own, and say what that is.
     pub fn caches(&self) -> Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> {
-        let mut caches: Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> = vec![("hot", self.hot.clone()), ("lookups", self.groups.clone()), ("tails", self.tails.clone()), ("manifests", self.manifests.clone())];
+        let mut caches = self.states.caches(); // (the hot columns, the lookups' row groups and the tables' tails, made as the lake opened: `lake_state::Registered::add_at_open`)
+        caches.push(("manifests", self.manifests.clone()));
         if let Some(ranges) = &self.cached {
             caches.push(("ranges", ranges.clone())); // (a lake on a bucket: a local or in-memory one reads its store directly)
         }
@@ -2699,7 +2729,7 @@ impl Lake {
         if path.contains("://") {
             return path.to_string(); // (a file outside the lake: `ext.rs`)
         }
-        if let Some((id, rest)) = crate::branch::split(path) {
+        if let Some((id, rest)) = base_path(path) {
             if let Some((url, _)) = self.bases.read().unwrap().get(id) {
                 return format!("{url}/{rest}"); // (a branch's file in its base: ADR-047)
             }
@@ -2753,7 +2783,7 @@ impl Lake {
     /// Write an object only if it does not exist yet: data is never overwritten.
     pub async fn put(&self, path: &str, bytes: impl Into<Bytes>) -> Result<()> {
         if self.cat.frozen.load(Relaxed) {
-            return Err(crate::backup::refused(Some(&self.url))); // (a backup's objects are its runs': ADR-070)
+            return Err(crate::frozen::refused(Some(&self.url))); // (a backup's objects are its runs': ADR-070)
         }
         let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
         let bytes: Bytes = bytes.into(); // (a `Vec` or `Bytes` as it is: a page's 232 MB file was held twice while it was put)
@@ -2773,7 +2803,7 @@ impl Lake {
                 return Ok(bytes.into());
             }
         }
-        let bytes = match crate::branch::split(path) {
+        let bytes = match base_path(path) {
             Some((id, rest)) => self.base_store(id)?.get(&Path::from(rest)).await?.bytes().await?, // (a branch's base's: ADR-047)
             None => self.store.get(&Path::from(path)).await?.bytes().await?,
         };
@@ -2786,7 +2816,7 @@ impl Lake {
     /// Where `path` is read whole, past the caches: this lake's bucket, or a branch's base's (a
     /// backup copies through it, a piece at a time).
     pub fn reader(&self, path: &str) -> Result<(Store, Path)> {
-        Ok(match crate::branch::split(path) {
+        Ok(match base_path(path) {
             Some((id, rest)) => (self.base_store(id)?, Path::from(rest)),
             None => (self.store.clone(), Path::from(path)),
         })
@@ -2809,7 +2839,7 @@ impl Lake {
     pub async fn replace(&self, path: &str, bytes: impl Into<Bytes>, expect: &str) -> Result<String> {
         anyhow::ensure!(replaceable(path), "only the lake's files (files/…) are replaced");
         if self.cat.frozen.load(Relaxed) {
-            return Err(crate::backup::refused(Some(&self.url))); // (ADR-070)
+            return Err(crate::frozen::refused(Some(&self.url))); // (ADR-070)
         }
         static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()); // (a store with no conditional put: this node's saves one at a time)
         let _one = ONE.lock().await;
@@ -2843,7 +2873,7 @@ impl Lake {
     pub async fn remove_file(&self, path: &str) -> Result<()> {
         anyhow::ensure!(replaceable(path), "only the lake's files (files/…) are removed this way");
         if self.cat.frozen.load(Relaxed) {
-            return Err(crate::backup::refused(Some(&self.url))); // (ADR-070)
+            return Err(crate::frozen::refused(Some(&self.url))); // (ADR-070)
         }
         self.store.head(&Path::from(path)).await?; // (not there: an error that says so)
         self.store.delete(&Path::from(path)).await?;
@@ -2882,40 +2912,6 @@ impl Lake {
             c.keep(table, n, rows.clone());
         }
         Ok(rows)
-    }
-
-    /// Rows of `table` a file commit gives the log's readers (`Segment::files`): its files' rows as
-    /// they were then, with their system columns (stored names), from the `from`-th on and `rows`
-    /// of them at most; `removed`: the rows of the files it took out.
-    pub async fn filed_rows(&self, seg: &Segment, table: &str, removed: bool, from: u64, rows: u64) -> Result<Vec<RecordBatch>> {
-        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
-        let meta = crate::sys::with_sys(&meta);
-        let schema = meta.schema()?;
-        let (ctx, end, mut at, mut out) = (self.session(), from.saturating_add(rows), 0u64, vec![]);
-        for f in if removed { &filed.removed } else { &filed.added } {
-            let (lo, hi) = (at.max(from), (at + f.rows).min(end));
-            if lo < hi {
-                out.extend(crate::lake_scan::file_rows(self, &ctx, f, &meta, &schema, crate::lake_scan::Pick::Range(lo - at, hi - at)).await?.collect().await?);
-            }
-            at += f.rows;
-            if at >= end {
-                break;
-            }
-        }
-        out.iter().map(|b| crate::query::conform(b, &schema)).collect()
-    }
-
-    /// Rows of `table` a file commit deleted by position (`Filed::deleted`), with their system
-    /// columns (stored names): each file's rows at the places its new deletes name.
-    pub async fn deleted_rows(&self, seg: &Segment, table: &str) -> Result<Vec<RecordBatch>> {
-        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
-        let meta = crate::sys::with_sys(&meta);
-        let schema = meta.schema()?;
-        let mut out = vec![];
-        for (f, deletes) in &filed.deleted {
-            out.extend(crate::adopt::rows_deleted(self, &meta, f, deletes, &schema).await?);
-        }
-        out.iter().map(|b| crate::query::conform(b, &schema)).collect()
     }
 
     pub async fn delete(&self, path: &str) {
@@ -3166,7 +3162,7 @@ fn moves_rights(marks: Option<&crate::records::Rights>, d: &Delta) -> bool {
 
 /// The node's own records, which its writer appends (`history::writer`) and no remembered answer
 /// reads (`App::remembers`): the statements' history and the audit log.
-const RECORDS: [&str; 2] = [crate::history::TABLE, crate::audit::TABLE];
+const RECORDS: [&str; 2] = [crate::records::HISTORY, crate::records::AUDIT];
 
 /// A commit no remembered answer depends on (`Catalog::version`): only the records' rows, their
 /// producers' progress and their tables' entries (`history.rs`, every second on every node; the
@@ -3189,7 +3185,7 @@ fn quiet(d: &Delta) -> bool {
     let hex = |id: &str| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit());
     let expiry = |k: &str| k.starts_with(crate::log::EXPIRY);
     let unread = |k: &str| {
-        k == crate::users::KEYS
+        k == crate::records::LAKE_KEYS
             || RECORDS.iter().any(|t| k.strip_prefix("t/") == Some(t) || k.strip_prefix("p/").and_then(|p| p.strip_prefix(t.trim_start_matches("pondra$"))).and_then(|p| p.strip_prefix('-')).is_some_and(hex))
     };
     let marked = d.puts.iter().any(|(k, _)| k == QUIET);
@@ -3322,8 +3318,8 @@ impl Drop for Catalog {
             return; // (no runtime: it ended, and SlateDB's tasks with it)
         }
         let kv = self.kv.clone();
-        crate::spawns::task(async move {
-            let _ = kv.close().await;
+        crate::spawns::untracked(async move {
+            let _ = kv.close().await; // (a close, which a node's stop must not cut: it ends by itself)
         });
     }
 }
@@ -3334,7 +3330,7 @@ impl Catalog {
     async fn writer(kv: Arc<dyn Kv>, since: Instant, node: &NodeState) -> Result<Self> {
         let mut cat = Self::new(kv, node);
         if traced_commits() {
-            Stages::sample_lag(Arc::downgrade(&cat.stages)); // (a leader's commits are what it times)
+            Stages::sample_lag(Arc::downgrade(&cat.stages), node); // (a leader's commits are what it times)
         }
         cat.replicas = crate::env::value("PONDRA_REPLICAS");
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
@@ -4091,8 +4087,8 @@ impl Catalog {
     pub async fn write(&self, puts: Vec<(String, Vec<u8>)>, deletes: &[String]) -> Result<oneshot::Receiver<()>> {
         let (true, Some(writes)) = (self.kv.is_writer(), &self.writes) else { bail!("read-only node") };
         crate::metrics::add(&self.metrics.catalog_writes, (puts.len() + deletes.len()) as u64); // (records put or deleted)
-        if self.frozen.load(Relaxed) && !crate::backup::may_write(puts.iter().map(|(k, _)| k).chain(deletes)) {
-            return Err(crate::backup::refused(None)); // (whatever door a write came through: ADR-070)
+        if self.frozen.load(Relaxed) && !crate::frozen::may_write(puts.iter().map(|(k, _)| k).chain(deletes)) {
+            return Err(crate::frozen::refused(None)); // (whatever door a write came through: ADR-070)
         }
         let t0 = Instant::now();
         let puts = listed(self, puts).await?;
@@ -4303,8 +4299,8 @@ impl Stages {
     }
 
     /// How late a 10 ms sleep wakes, as the `lag` stage, while the catalog is (weak: it ends with it).
-    fn sample_lag(stages: Weak<Stages>) {
-        crate::spawns::spawn(async move {
+    fn sample_lag(stages: Weak<Stages>, node: &crate::node_state::NodeState) {
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             loop {
                 let t = Instant::now();
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4494,14 +4490,14 @@ mod tests {
         let id = "0123456789abcdef0123456789abcdef";
         let seg = |table: &str| serde_json::json!({"path": "", "parts": {table: [[0, 10, 1]]}, "ts_ms": 1}).to_string();
         let quiet_of = |puts: &[(&str, &str)]| quiet(&Delta { id: 9, puts: puts.iter().map(|(k, v)| (k.to_string(), Bytes::from(v.to_string()))).collect(), deletes: vec![] });
-        let audit = seg(crate::audit::TABLE);
-        let (history, user) = (seg(crate::history::TABLE), seg("r_t"));
+        let audit = seg(crate::records::AUDIT);
+        let (history, user) = (seg(crate::records::HISTORY), seg("r_t"));
         let (audit_p, history_p) = (format!("p/audit-{id}"), format!("p/history-{id}"));
         assert!(quiet_of(&[("t/pondra$audit", "{}"), ("c", "9")]), "the audit log's table made");
         assert!(quiet_of(&[("d/3", "x"), ("s/3", &audit), (&audit_p, "1"), ("n", "4"), ("c", "9")]), "the audit log's rows");
         assert!(quiet_of(&[("d/4", "x"), ("s/4", &history), (&history_p, "1"), ("n", "5"), ("c", "9")]), "the history's rows");
         assert!(quiet_of(&[("n", "4"), ("b", "2"), (QUIET, "true"), ("c", "9")]), "a row-id block taken");
-        assert!(quiet_of(&[(crate::users::KEYS, "{}"), ("c", "9")]), "the lake's own keys");
+        assert!(quiet_of(&[(crate::records::LAKE_KEYS, "{}"), ("c", "9")]), "the lake's own keys");
         assert!(!quiet_of(&[("n", "4"), ("b", "2"), ("c", "9")]), "unmarked numbers are loud");
         assert!(!quiet_of(&[("t/r_t", "{}"), ("c", "9")]), "a table's entry");
         assert!(!quiet_of(&[("d/3", "x"), ("s/3", &user), ("p/sql:1", "1"), ("n", "4"), ("c", "9")]), "a table's rows");
@@ -4608,7 +4604,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-closed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
-        let cat = Catalog::writer(kv::writer(store, None, true, crate::lifecycle::unhosted()).await?, Instant::now(), &NodeState::unhosted()).await?;
+        let cat = { let node = NodeState::unhosted(); Catalog::writer(kv::writer(store, None, true, node.clone()).await?, Instant::now(), &node).await? };
         let _ = cat.write(vec![("t/a".into(), b"1".to_vec())], &[]).await?;
         cat.close().await?;
         assert!(cat.write(vec![("t/b".into(), b"2".to_vec())], &[]).await.is_err());
@@ -4644,7 +4640,8 @@ mod tests {
         for (dir, life) in dirs.iter().zip(&lives) {
             std::fs::create_dir_all(dir)?;
             let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(dir)?));
-            cats.push(Catalog::writer(kv::writer(store, None, true, life.clone()).await?, Instant::now(), &NodeState::new(life.clone())).await?);
+            let node = NodeState::new(life.clone());
+            cats.push(Catalog::writer(kv::writer(store, None, true, node.clone()).await?, Instant::now(), &node).await?);
         }
         cats[0].kv.close().await?; // (closed under the catalog, as a fence closes it: not by its own node's stop)
         let fenced = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(cats[0].write(vec![("t/a".into(), b"1".to_vec())], &[]))).await;
@@ -4681,7 +4678,7 @@ mod tests {
             std::fs::create_dir_all(&dir)?;
             let node = crate::node_state::NodeState::on(crate::lifecycle::unhosted(), Arc::new(Sized(ram)));
             let lake = Lake::open(dir.to_str().expect("a path"), true, false, node).await?;
-            sized.push(lake.hot.usage().1);
+            sized.push(lake.hot().usage().1);
             drop(lake);
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -4742,7 +4739,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-parsed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
-        let cat = Catalog::writer(kv::writer(store, None, true, crate::lifecycle::unhosted()).await?, Instant::now(), &NodeState::unhosted()).await?;
+        let cat = { let node = NodeState::unhosted(); Catalog::writer(kv::writer(store, None, true, node.clone()).await?, Instant::now(), &node).await? };
         let entry = |folder: &str| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&TableMeta { folder: Some(folder.to_string()), ..Default::default() })?)) };
         let raw = entry("x")?;
         let first = cat.parsed("t/a", &raw)?;
@@ -4780,7 +4777,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-segments-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
-        let cat = Catalog::writer(kv::writer(store, None, true, crate::lifecycle::unhosted()).await?, Instant::now(), &NodeState::unhosted()).await?;
+        let cat = { let node = NodeState::unhosted(); Catalog::writer(kv::writer(store, None, true, node.clone()).await?, Instant::now(), &node).await? };
         let seg = |n: u64, rows: u64| -> Result<Bytes> {
             let parts = ["pgbench_accounts", "pgbench_tellers", "pgbench_branches", "pgbench_history"].map(|t| (t.to_string(), vec![(n, 300, rows)]));
             Ok(Bytes::from(serde_json::to_vec(&Segment { path: String::new(), parts: parts.into_iter().collect(), ts_ms: n, files: BTreeMap::new() })?))
@@ -4825,7 +4822,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-recent-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir)?);
-        let cat = Catalog::writer(kv::writer(store, None, true, crate::lifecycle::unhosted()).await?, Instant::now(), &NodeState::unhosted()).await?;
+        let cat = { let node = NodeState::unhosted(); Catalog::writer(kv::writer(store, None, true, node.clone()).await?, Instant::now(), &node).await? };
         let change = |id: u64, key: String, bytes: &'static [u8]| Frame::Change(Arc::new(Delta { id, puts: vec![(key, Bytes::from_static(bytes))], deletes: vec![] }));
         cat.send(change(1, data_key(1), b"rows"));
         assert_eq!(cat.recent_inline(&data_key(1)).as_deref(), Some(&b"rows"[..]));
@@ -4895,7 +4892,7 @@ mod tests {
         let ledger = lake.rt.memory_pool.downcast_ref::<crate::ledger::LakePool>().expect("a lake's pool is its share of the line").ledger().clone();
         let names: Vec<&str> = lake.caches().iter().map(|(name, _)| *name).collect();
         assert_eq!(names, ["hot", "lookups", "tails", "manifests", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments"], "a local lake has no cache of a bucket's ranges");
-        let _ = lake.tails.lock().unwrap().put("t".into(), vec![], 4096);
+        let _ = lake.tails().lock().unwrap().put("t".into(), vec![], 4096);
         // (other tests' lakes may be charged to the same line meanwhile: what this lake holds is the least it reads)
         assert!(ledger.held() >= 4096, "the line counts the tails");
         // (taken back from this lake's caches alone, in the line's order: from the whole line, other tests' would go too)
@@ -4903,7 +4900,7 @@ mod tests {
         for (_, cache) in lake.caches() {
             freed += if freed < 4096 { cache.give_back(4096 - freed) } else { 0 };
         }
-        assert!(freed >= 4096 && lake.tails.held() == 0, "the tails give their memory back");
+        assert!(freed >= 4096 && lake.tails().held() == 0, "the tails give their memory back");
         assert!(!lake.cached_bytes().iter().any(|(name, _)| *name == "hot"), "the hot columns are `hot_bytes`");
         // (`/metrics` reads the line's list by name: the lake's caches, its manifests among them, and the process's files; a
         // lake's state is charged as it is made, and a node's start makes its planning facts, kept pages and outside tables'
