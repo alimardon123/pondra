@@ -23,6 +23,11 @@ const fn entry(words: &'static [&'static str], read: fn(&mut Words) -> Result<St
     Statement { words, read: Read::Core(read), run: Run::Stmt, right: Right::FromStmt, needs: &[], about, extension: CORE }
 }
 
+/// An entry of a family read from sqlparser's tree (`Read::Tree`).
+const fn tree(words: &'static [&'static str], read: fn(&datafusion::sql::sqlparser::ast::Statement) -> Result<Stmt>, about: &'static str) -> Statement {
+    Statement { words, read: Read::Tree(read), run: Run::Stmt, right: Right::FromStmt, needs: &[], about, extension: CORE }
+}
+
 /// Each family's words. A form whose telling word comes after a name (`CREATE TABLE c CLONE t`) is an entry with a name
 /// slot beside its family, which sqlparser's tree reads (rows 35-59 of `write::parse`); a family no other reader takes is
 /// one entry (`ALTER DATABASE`).
@@ -69,6 +74,14 @@ static ENTRIES: &[Statement] = &[
     entry(&["COMMENT", "ON"], comment, "a comment on an object (COMMENT ON TABLE t IS 'text'), or none (IS NULL)"),
     entry(&["COMMENT", "IF", "EXISTS", "ON"], comment, "a comment on an object, where it is there"),
     entry(&["CREATE", "OR", "ALTER", "*"], or_alter, "a table made or altered to the columns given, a view made anew"),
+    tree(&["CREATE", "INDEX"], crate::index::created, "an index, kept as it is written (nothing is built for it)"),
+    tree(&["CREATE", "UNIQUE", "INDEX"], crate::index::created, "a UNIQUE constraint on a table's columns, written as an index"),
+    entry(&["ALTER", "INDEX"], crate::index::read, "renames an index"),
+    entry(&["DROP", "INDEX"], crate::index::read, "drops indexes"),
+    entry(&["CREATE", "TYPE"], crate::types::read, "an enum type (CREATE TYPE mood AS ENUM ('sad', 'ok'))"),
+    entry(&["CREATE", "OR", "REPLACE", "TYPE"], crate::types::read, "refused: a type's columns keep their labels"),
+    entry(&["ALTER", "TYPE"], crate::types::read, "an enum's new label (ADD VALUE) or its name"),
+    entry(&["DROP", "TYPE"], crate::types::read, "drops types"),
 ];
 
 /// A reader's own words for a form written wrong, after what it found: what a statement of the form is.
@@ -357,7 +370,7 @@ mod tests {
     #[test]
     fn the_core_entries_on_stand_ins_are_counted() {
         let s = crate::registry::get().section::<Statements>();
-        assert_eq!((ENTRIES.len(), s.stand_ins()), (42, 54), "the core's 42, the sharing extension's 8 and the identity providers' 4");
+        assert_eq!((ENTRIES.len(), s.stand_ins()), (50, 62), "the core's 50, the sharing extension's 8 and the identity providers' 4");
     }
 
     /// COMMENT ON and CREATE OR ALTER, as `write::parse` reads them (each was `objects::statement`'s).

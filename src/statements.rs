@@ -40,6 +40,10 @@ pub enum Read {
     /// out: shares, identity providers): the statement's words, from its first, to the core's statement. An error is
     /// the statement's refusal, with the SQLSTATE it gives (`write::Stmt::of_error`).
     Core(fn(&mut Words) -> Result<crate::write::Stmt>),
+    /// A core family's reader where sqlparser's generic dialect reads every form of it (`CREATE INDEX`): its tree, to the
+    /// core's statement. There is no `None`, so no second reader takes the family; a text generic refuses is refused
+    /// with the parser's words.
+    Tree(fn(&datafusion::sql::sqlparser::ast::Statement) -> Result<crate::write::Stmt>),
 }
 
 /// What a statement's parser hook read: the object it changes, as the catalog names it, and the rest of what it says,
@@ -138,7 +142,7 @@ pub const CORE: &str = "core";
 /// match on sqlparser's tree), after a CREATE's `OR REPLACE`, `TEMP` or `TEMPORARY`: an extension's entry may not begin
 /// with one, so no extension takes a core statement over with longer words. Each goes as its whole family becomes a core
 /// entry (PR 8b-8d), which the same check covers (`ALTER DATABASE`, USER, ROLE, TOKEN, SHARE, RECIPIENT, IDENTITY
-/// PROVIDER, SEQUENCE and COMMENT have; every `CREATE OR ALTER` is the core's entry's).
+/// PROVIDER, SEQUENCE, COMMENT, TYPE and INDEX have; every `CREATE OR ALTER` is the core's entry's).
 const CORE_WORDS: &[&[&str]] = &[
     &["SELECT"], &["WITH"], &["VALUES"], &["TABLE"], &["FROM"], &["INSERT"], &["UPDATE"], &["DELETE"], &["MERGE"], &["TRUNCATE"],
     &["GRANT"], &["REVOKE"], &["COPY"], &["ATTACH"], &["DETACH"], &["UNDROP"], &["BACKUP"], &["RESTORE"],
@@ -147,13 +151,11 @@ const CORE_WORDS: &[&[&str]] = &[
     &["CREATE", "TABLE"], &["CREATE", "EXTERNAL"], &["CREATE", "VIEW"], &["CREATE", "MATERIALIZED"], &["CREATE", "SCHEMA"],
     &["CREATE", "DATABASE"], &["CREATE", "FUNCTION"], &["CREATE", "PROCEDURE"], &["CREATE", "MACRO"], &["CREATE", "TASK"],
     &["CREATE", "PIPELINE"], &["CREATE", "SECRET"], &["CREATE", "PERSISTENT"],
-    &["CREATE", "INDEX"], &["CREATE", "UNIQUE"], &["CREATE", "TYPE"],
     &["ALTER", "TABLE"], &["ALTER", "VIEW"], &["ALTER", "MATERIALIZED"], &["ALTER", "SCHEMA"],
-    &["ALTER", "TASK"], &["ALTER", "INDEX"], &["ALTER", "TYPE"],
+    &["ALTER", "TASK"],
     &["DROP", "TABLE"], &["DROP", "VIEW"], &["DROP", "MATERIALIZED"], &["DROP", "SCHEMA"], &["DROP", "DATABASE"],
     &["DROP", "FUNCTION"], &["DROP", "PROCEDURE"], &["DROP", "MACRO"], &["DROP", "TASK"],
-    &["DROP", "SECRET"], &["DROP", "PERSISTENT"], &["DROP", "TEMPORARY"], &["DROP", "INDEX"],
-    &["DROP", "TYPE"],
+    &["DROP", "SECRET"], &["DROP", "PERSISTENT"], &["DROP", "TEMPORARY"],
 ];
 
 /// `words` without a CREATE's `OR REPLACE`, `TEMP` or `TEMPORARY` after its first word. (`OR ALTER` stays: the core's
@@ -185,8 +187,8 @@ impl Statements {
     /// own right.
     pub fn add(&mut self, s: &'static Statement) {
         let words = s.words.join(" ");
-        let stand_in = matches!(s.read, Read::Core(_));
-        assert!(stand_in == matches!(s.run, Run::Stmt) && stand_in == matches!(s.right, Right::FromStmt), "{words}: a reader of the core's statement stands in for its run and right (Read::Core, Run::Stmt, Right::FromStmt), and one of an extension's own has both (Read::Text, Run::Leader and its right)");
+        let stand_in = matches!(s.read, Read::Core(_) | Read::Tree(_));
+        assert!(stand_in == matches!(s.run, Run::Stmt) && stand_in == matches!(s.right, Right::FromStmt), "{words}: a reader of the core's statement stands in for its run and right (Read::Core or Read::Tree, Run::Stmt, Right::FromStmt), and one of an extension's own has both (Read::Text, Run::Leader and its right)");
         assert!(!s.words.is_empty() && s.words.iter().all(|w| *w == w.to_uppercase()), "a statement's words are upper-cased: {words}");
         assert!(s.words[0] != "*" && s.words.iter().filter(|w| **w == "*").count() <= 1, "a statement's words hold at most one name, never first: {words}");
         assert!(self.all.iter().all(|o| o.words != s.words), "two statements are {words}");
@@ -239,17 +241,21 @@ fn matched_in(r: &Registry, sql: &str, offered: fn(Need) -> bool) -> Option<crat
     let read = match s.read {
         Read::Text(read) => read(sql).map(|Parsed { object, tree }| Stmt::Ddl(vec![crate::ddl::Ddl::Entry { words, object, tree }])),
         Read::Core(read) => read(&mut said),
+        Read::Tree(read) => match crate::parsed::generic(sql) {
+            Ok(mut tree) => tree.pop().map_or_else(|| Err(anyhow::anyhow!("{words}: no statement")), |t| read(&t)),
+            Err(e) => Err(e.into()),
+        },
     };
     Some(read.unwrap_or_else(|e| Stmt::of_error(&e, format!("{e:#}"))))
 }
 
-/// Is `sql` read by an entry PR 8 moved in (a reader of the core's statement, `Read::Core`)?
+/// Is `sql` read by an entry PR 8 moved in (a reader of the core's statement, `Read::Core` or `Read::Tree`)?
 #[cfg(test)]
-pub(crate) fn moved(sql: &str) -> bool { crate::registry::get().find::<Statements>().and_then(|s| s.of(sql)).is_some_and(|(s, _)| matches!(s.read, Read::Core(_))) }
+pub(crate) fn moved(sql: &str) -> bool { crate::registry::get().find::<Statements>().and_then(|s| s.of(sql)).is_some_and(|(s, _)| matches!(s.read, Read::Core(_) | Read::Tree(_))) }
 
 /// Is `s` an entry PR 8 moved in, while `write::was` reads a text as the readers it replaced did (so it is skipped)?
 #[cfg(test)]
-fn moved_skipped(s: &Statement) -> bool { matches!(s.read, Read::Core(_)) && crate::write::was::old() }
+fn moved_skipped(s: &Statement) -> bool { matches!(s.read, Read::Core(_) | Read::Tree(_)) && crate::write::was::old() }
 #[cfg(not(test))]
 fn moved_skipped(_: &Statement) -> bool { false }
 
