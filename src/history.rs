@@ -320,21 +320,23 @@ struct Line {
 /// A statement a door ran has ended (`audit::statement`): its row, and a line in the node's log
 /// when it was slow. A joined page keeps no rows: its statement goes to its node (`page_records::add`), which
 /// keeps the row with the sign-in's name (`page_ended`).
-pub fn ended(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note) {
+pub fn ended(app: &App, by: Option<&crate::auth::Principal>, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note) {
     if !app.members.keeps_records() {
         return crate::page_records::add(&app.lake, sql, outcome, error, took);
     }
-    record(app, class, sql, outcome, error, took, note, false)
+    record(app, by, class, sql, outcome, error, took, note, false)
 }
 
 /// A joined page's statement, as its node keeps it (`page_records::record`, under the sign-in's name): the row `ended`
 /// keeps, with no line in the node's log for a slow one, and counted against the rate limit whatever its outcome.
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the node's half: `server::records`)
-pub(crate) fn page_ended(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration) {
-    record(app, class, sql, outcome, error, took, Note::default(), true)
+pub(crate) fn page_ended(app: &App, by: &crate::auth::Principal, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration) {
+    record(app, Some(by), class, sql, outcome, error, took, Note::default(), true)
 }
 
-fn record(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note, page: bool) {
+/// A row, as `by` did it (none: the node).
+#[allow(clippy::too_many_arguments)]
+fn record(app: &App, by: Option<&crate::auth::Principal>, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note, page: bool) {
     if !on() || app.log.is_none() || !app.members.keeps_records() {
         return; // (a read-only node writes nothing)
     }
@@ -343,8 +345,7 @@ fn record(app: &App, class: &'static str, sql: &str, outcome: &'static str, erro
     if (page || !slow && outcome == "ok" && note.learned.is_empty()) && history.skipped() {
         return; // (counted: nothing else to do, on the path of every statement)
     }
-    let who = crate::auth::current();
-    let (user, door, from) = who.map_or((String::new(), "node", None), |p| (p.name, p.door, p.from.map(|a| a.to_string())));
+    let (user, door, from) = by.map_or((String::new(), "node", None), |p| (p.name.clone(), p.door, p.from.map(|a| a.to_string())));
     let statement = crate::audit::redacted(sql, class);
     if slow && !page {
         // (a library's host or a `pondra sql` guest doesn't print it: `Lifecycle::say`. It is in pondra.history)

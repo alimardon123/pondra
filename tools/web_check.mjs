@@ -38,6 +38,8 @@ const lake = args.includes('--lake')
   ? resolve(args[args.indexOf('--lake') + 1])
   : resolve(dirname(fileURLToPath(import.meta.url)), '../web/lake');
 const sizes = args.includes('--sizes');
+// How the line below moves: the module's brotli stays the gate, with at least 3 KB of room above main, since a change of
+// layout alone moves it by 1-2 KB; and the line moves down only with cuts measured in the module's own wasm bytes.
 // The most a page may download (`--sizes`: the module at brotli 11, as a server sends it), designs/page-same-core.md P4. It
 // moves down with each cut, never up without a reason in the commit that moves it. 9.2 → 9.206 MB: eager aggregation
 // (`eager.rs`, 6.2 KB), a rule every form's planner runs (TPC-DS q22 3.46 → 0.42 s), the room above main kept as it was.
@@ -47,7 +49,10 @@ const sizes = args.includes('--sizes');
 // 3d5a4f49, measured on CI): a page's lake brings back a schema with what it held, and a view made again from its query.
 // 9.222 → 9.2255 MB: avg of a DECIMAL as sum / count (`avg.rs`, 3.2 KB over main's 9,214,186 at 366b20c8, measured on
 // CI): a page's average answers as its sum over its count does, in type and digits, as every form's does.
-const BROTLI_BUDGET = 9_225_500;
+// 9.2255 → 9.2305 MB: who did it, named by argument (M8 3d-2a, step 6): a routine's `Who` carries its sign-in and each
+// stamp takes it, and the page's member names its session for its own principal (5.0 KB over main's 9,221,388 at
+// f1a23198, measured on CI), the room above main kept as it was.
+const BROTLI_BUDGET = 9_230_500;
 // The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
 const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows

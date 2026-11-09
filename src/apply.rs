@@ -1151,8 +1151,8 @@ async fn claim_to_record(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Wh
     Ok(record)
 }
 
-/// Who an apply is recorded as: the caller's name, else its role's.
-fn caller(who: Who) -> String { crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("{:?}", who.role).to_lowercase()) }
+/// Who an apply is recorded as: the caller's name (`Who::by`), else its role's.
+fn caller(who: Who) -> String { Some(who.name()).filter(|n| !n.is_empty()).map_or_else(|| format!("{:?}", who.role).to_lowercase(), str::to_string) }
 
 /// The apply's statements, then its record of what it left declared, then the tests.
 async fn statements(app: &App, p: &Project, plan: &Plan, record: &mut Record, who: Who, test: bool, secrets: &BTreeMap<String, String>) -> Result<()> {

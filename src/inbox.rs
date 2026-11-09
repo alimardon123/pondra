@@ -28,12 +28,12 @@ pub async fn ring(store: &Store, id: &str) -> bool { store.put(&Path::from(BELL)
 /// `wake`: nobody leads the lake at that place, so once the request is in, a process of its own
 /// leads it for a moment and answers it (`Lifecycle::lead_elsewhere`, of the node that asks). `holder`: the term whose leader is to answer,
 /// which is gone if it doesn't mark itself when the bell rings (`terms::Ear`).
-pub async fn send(store: &Store, r: &Request, wake: Option<(&str, &crate::lifecycle::Life)>, holder: Option<&crate::terms::Term>) -> Result<Option<Value>> {
+pub async fn send(store: &Store, r: &Request, wake: Option<(&str, &crate::lifecycle::Life)>, holder: Option<&crate::terms::Term>, claims: Option<&crate::node_state::Claims>) -> Result<Option<Value>> {
     let (kind, body) = r.inbox()?;
     let id = uuid::Uuid::new_v4();
     let (req, out) = (Path::from(format!("inbox/{id}.{kind}")), Path::from(format!("inbox/{id}.out")));
     store.put(&req, body.into()).await?;
-    let mut ear = crate::terms::Ear::ring(store, holder, &id.to_string()).await;
+    let mut ear = crate::terms::Ear::ring(store, holder, &id.to_string(), claims).await;
     let woke = wake.map(|(dir, life)| {
         let (dir, life) = (dir.to_string(), life.clone());
         crate::spawns::spawn(async move { life.lead_elsewhere(&dir).await })
@@ -68,7 +68,7 @@ pub async fn send(store: &Store, r: &Request, wake: Option<(&str, &crate::lifecy
                 None => {}
             }
         }
-        if tick % 10 == 0 && !matches!(&crate::terms::latest(store).await?, Some(t) if crate::terms::alive(store, t).await) {
+        if tick % 10 == 0 && !matches!(&crate::terms::latest(store).await?, Some(t) if crate::terms::alive(store, t, claims).await) {
             let _ = store.delete(&req).await;
             return Ok(None);
         }

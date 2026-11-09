@@ -875,7 +875,7 @@ async fn expire(app: &App, known: &BTreeMap<String, Entry>) -> Result<()> {
     let _guard = app.lock.lock().await;
     let deletes: Vec<String> = old.iter().flat_map(|(k, e)| [(*k).clone(), producer_key(&format!("job:{}", e.job))]).collect();
     app.lake.cat.commit(vec![(QUIET.into(), json(&true))], &deletes).await?;
-    forget_producers(old.iter().map(|(_, e)| format!("job:{}", e.job)));
+    forget_producers(&app.lake, old.iter().map(|(_, e)| format!("job:{}", e.job)));
     Ok(())
 }
 
@@ -890,7 +890,7 @@ pub async fn gone(lake: &Lake, folders: &[String]) -> Result<Vec<String>> {
             jobs.push(format!("job:{}", e.job));
         }
     }
-    forget_producers(jobs);
+    forget_producers(lake, jobs);
     Ok(keys)
 }
 
