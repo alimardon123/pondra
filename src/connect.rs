@@ -485,8 +485,8 @@ mod tests {
         let mut urls: Vec<String> = crate::ext_names::names(&q).iter().filter_map(|n| crate::ext_names::spec(n)).flat_map(|s| s.urls).collect();
         urls.sort();
         assert_eq!(urls, ["cn://drop_zone/a.parquet", "cn://drop_zone/in/*.csv", "s3://b/c.parquet"]);
-        assert!(matches!(crate::ext::statement("COPY (SELECT 1 AS a) TO '@drop_zone/out/'"), Some(Stmt::CopyTo(_, to, _)) if to == "cn://drop_zone/out/"));
-        assert!(matches!(crate::ext::statement("COPY INTO t FROM '@drop_zone/in/*.csv'"), Some(Stmt::CopyInto(_, crate::copy::Source::Path(p), _)) if p == "cn://drop_zone/in/*.csv"));
+        assert!(matches!(crate::ext::copy("COPY (SELECT 1 AS a) TO '@drop_zone/out/'"), Ok(Stmt::CopyTo(_, to, _)) if to == "cn://drop_zone/out/"));
+        assert!(matches!(crate::ext::copy_into("COPY INTO t FROM '@drop_zone/in/*.csv'"), Ok(Stmt::CopyInto(_, crate::copy::Source::Path(p), _)) if p == "cn://drop_zone/in/*.csv"));
         assert_eq!(crate::connections::place("@drop_zone"), Some("cn://drop_zone/".into()));
         assert_eq!(crate::connections::place("@/x"), None);
         // (its store: the folder, then the one its url is changed to)

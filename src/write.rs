@@ -316,6 +316,7 @@ pub enum Stmt {
     TempSecret(String, std::collections::BTreeMap<String, String>, bool, bool), // CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…): the session's, in memory (`temp.rs`)
     TempRoutine(String, Box<crate::expander::Routine>, bool, bool), // CREATE [OR REPLACE] TEMP MACRO | FUNCTION [IF NOT EXISTS] name …: the session's (`temp.rs`)
     UndropFile(String),                                   // UNDROP FILE 'path': a deleted file back from its versions (`files::undrop`)
+    Theirs,                                               // DataFusion's own statement, planned as a query is: a COPY its walk doesn't place (`ext::copy`); `parse` answers None for it
 }
 
 impl Stmt {
@@ -363,7 +364,7 @@ impl Stmt {
         match self {
             Stmt::Create(c) => object(&c.name),
             Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) | Stmt::CopyInto(t, ..) => t.clone(),
-            Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::UndropFile(_) => String::new(),
+            Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::Theirs | Stmt::UndropFile(_) => String::new(),
             Stmt::TempView(v, ..) | Stmt::TempSecret(v, ..) | Stmt::TempRoutine(v, ..) => v.clone(),
             Stmt::Merge(m) => m.target.clone(),
         }
@@ -521,7 +522,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         return Some(s); // (INSTALL name FROM a file or URL, and UNINSTALL: `extension.rs`)
     }
     if let Some(s) = crate::statements::matched(sql) {
-        return Some(s); // (a statement by its words, the registry's statements section: an extension's, and the families of the core's PR 8 has moved, `core_statements.rs`)
+        // (a statement by its words, the registry's statements section: an extension's, and the families of the core's PR 8
+        // has moved, `core_statements.rs`; one its reader says is DataFusion's own, for DataFusion's planner)
+        return (!matches!(s, Stmt::Theirs)).then_some(s);
     }
     #[cfg(test)]
     if let Some(s) = was::no_replace(sql) {
@@ -540,8 +543,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(s) = kinds.then(|| was::sso(sql)).flatten() {
         return Some(s);
     }
-    if let Some(s) = kinds.then(|| crate::ext::statement(sql)).flatten() {
-        return Some(s); // (COPY … INTO, Pondra's COPY forms, ATTACH … (TYPE …))
+    #[cfg(test)]
+    if let Some(s) = kinds.then(|| was::ext(sql)).flatten() {
+        return Some(s); // (COPY … INTO, Pondra's COPY forms, ATTACH … (TYPE …): the statements section's entries)
     }
     #[cfg(test)]
     if let Some(s) = kinds.then(|| was::secret(sql)).flatten() {
@@ -567,29 +571,16 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(s) = kinds.then(|| was::types(sql)).flatten() {
         return Some(s); // (CREATE TYPE … AS ENUM, ALTER and DROP TYPE: the statements section's entries)
     }
-    if let Some(s) = (head == "alter").then(|| placed(sql)).flatten() {
-        return Some(s); // (ALTER TABLE t ALTER COLUMN c FIRST | AFTER b)
+    #[cfg(test)]
+    if let Some(s) = (head == "alter").then(|| was::placed(sql)).flatten() {
+        return Some(s); // (ALTER TABLE t ALTER COLUMN c FIRST | AFTER b: the statements section's entries)
     }
     if let Some(sql) = kinds.then(|| crate::seq::in_order(sql)).flatten() {
         return parse(&sql); // (an identity's options as the parser takes them)
     }
-    // DataFusion's CREATE EXTERNAL TABLE (a stored view of files: `ext::external`), in its own words.
-    static EXTERNAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?is)^\s*CREATE\s+(\w+\s+){0,3}EXTERNAL\s+TABLE\b").expect("a regex")
-    });
-    if let Some(m) = (head == "create").then(|| EXTERNAL.find(first_word(sql))).flatten() {
-        use datafusion::sql::parser::{DFParserBuilder, Statement as DF};
-        if m.as_str().split_whitespace().any(|w| w.eq_ignore_ascii_case("temp") || w.eq_ignore_ascii_case("temporary")) {
-            return Some(Stmt::Invalid("CREATE TEMPORARY EXTERNAL TABLE: make a temporary view of the files instead (CREATE TEMP VIEW t AS SELECT * FROM read_parquet('…'))".into()));
-        }
-        return Some(match DFParserBuilder::new(sql).build().and_then(|mut p| p.parse_statements()) {
-            Ok(mut all) if all.len() == 1 => match all.pop_front() {
-                Some(DF::CreateExternalTable(c)) => crate::ext::external(&c).map(|d| Stmt::Ddl(vec![d])).unwrap_or_else(|e| Stmt::Invalid(format!("{e:#}"))),
-                _ => Stmt::Invalid("CREATE EXTERNAL TABLE t … STORED AS … LOCATION '…'".into()),
-            },
-            Ok(all) => Stmt::Invalid(format!("CREATE EXTERNAL TABLE and {} more: send one statement at a time here (or as a script, over HTTP or in the shell)", all.len().saturating_sub(1))),
-            Err(e) => Stmt::Invalid(format!("{e}")),
-        });
+    #[cfg(test)]
+    if let Some(s) = (head == "create").then(|| was::external(sql)).flatten() {
+        return Some(s); // (CREATE [OR REPLACE] [UNBOUNDED] EXTERNAL TABLE: the statements section's entries)
     }
     // CREATE MATERIALIZED VIEW v AS SELECT … GROUP BY … EMIT FINAL: each group once, when it's over.
     if let Some(rest) = crate::once::emit_final(sql) {
@@ -817,6 +808,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             let text = crate::authored::candidate(&name, false, &sql); // (its query as written: `authored.rs`)
             Stmt::Ddl(vec![unless(v.if_not_exists, &name, "relation", Ddl::CreateView { name: name.clone(), sql, replace: v.or_replace, facts: None, text })])
         }
+        #[cfg(test)] // (ATTACH 'dir' AS name, as the readers PR 8 replaced read it: `ext::read_attach` now)
         Statement::AttachDatabase { schema_name, database_file_name: ast::Expr::Value(v), .. } => match &v.value {
             ast::Value::SingleQuotedString(dir) | ast::Value::DoubleQuotedString(dir) => Stmt::Ddl(vec![Ddl::Attach { name: ident(&schema_name), dir: dir.clone(), read_only: false, endpoint: None }]),
             _ => return None,
@@ -967,8 +959,9 @@ fn place(p: &ast::MySQLColumnPosition) -> crate::ddl::Place {
 }
 
 /// `ALTER TABLE t ALTER [COLUMN] c FIRST | AFTER b` (Databricks' and MySQL's words; sqlparser has none): where SQL lists
-/// `c` (`ddl::place_column`); the same of a view and a materialized view (`ddl::place_view_column`). None: not this statement.
-fn placed(sql: &str) -> Option<Stmt> {
+/// `c` (`ddl::place_column`); the same of a view and a materialized view (`ddl::place_view_column`). The statements
+/// section's entries read with it (`core_statements::placed`); None: not this statement.
+pub(crate) fn placed(sql: &str) -> Option<Stmt> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
     let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
     if !p.parse_keyword(Keyword::ALTER) {
@@ -1091,7 +1084,7 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             ensure!(deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
-        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) | Stmt::UndropFile(_) => unreachable!("not a row write here"),
+        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) | Stmt::Theirs | Stmt::UndropFile(_) => unreachable!("not a row write here"),
     }
 }
 
@@ -2827,6 +2820,38 @@ pub(crate) mod was {
     /// `types::statement`, where `parse` read it.
     pub(super) fn types(sql: &str) -> Option<Stmt> { old().then(|| crate::types::statement(sql)).flatten() }
 
+    /// `ext::statement`, where `parse` read it (COPY INTO, COPY, ATTACH with options).
+    pub(super) fn ext(sql: &str) -> Option<Stmt> { old().then(|| crate::ext::statement(sql)).flatten() }
+
+    /// `write::placed`, where `parse` read it.
+    pub(super) fn placed(sql: &str) -> Option<Stmt> { old().then(|| super::placed(sql)).flatten() }
+
+    /// CREATE … EXTERNAL TABLE by its regex, where `parse` read it.
+    pub(super) fn external(sql: &str) -> Option<Stmt> {
+        if !old() {
+            return None;
+        }
+        // DataFusion's CREATE EXTERNAL TABLE (a stored view of files: `ext::external`), in its own words.
+        static EXTERNAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?is)^\s*CREATE\s+(\w+\s+){0,3}EXTERNAL\s+TABLE\b").expect("a regex")
+        });
+        if let Some(m) = EXTERNAL.find(first_word(sql)) {
+            use datafusion::sql::parser::{DFParserBuilder, Statement as DF};
+            if m.as_str().split_whitespace().any(|w| w.eq_ignore_ascii_case("temp") || w.eq_ignore_ascii_case("temporary")) {
+                return Some(Stmt::Invalid("CREATE TEMPORARY EXTERNAL TABLE: make a temporary view of the files instead (CREATE TEMP VIEW t AS SELECT * FROM read_parquet('…'))".into()));
+            }
+            return Some(match DFParserBuilder::new(sql).build().and_then(|mut p| p.parse_statements()) {
+                Ok(mut all) if all.len() == 1 => match all.pop_front() {
+                    Some(DF::CreateExternalTable(c)) => crate::ext::external(&c).map(|d| Stmt::Ddl(vec![d])).unwrap_or_else(|e| Stmt::Invalid(format!("{e:#}"))),
+                    _ => Stmt::Invalid("CREATE EXTERNAL TABLE t … STORED AS … LOCATION '…'".into()),
+                },
+                Ok(all) => Stmt::Invalid(format!("CREATE EXTERNAL TABLE and {} more: send one statement at a time here (or as a script, over HTTP or in the shell)", all.len().saturating_sub(1))),
+                Err(e) => Stmt::Invalid(format!("{e}")),
+            });
+        }
+        None
+    }
+
     /// Row 4, where `parse` read it.
     pub(super) fn no_replace(sql: &str) -> Option<Stmt> {
         if !old() {
@@ -2959,6 +2984,7 @@ pub(crate) mod was {
             Some(Stmt::TempView(v, q, r, quiet)) => format!("temp view {v} {q} {r} {quiet}"),
             Some(Stmt::TempSecret(n, o, r, quiet)) => format!("temp secret {n} {o:?} {r} {quiet}"),
             Some(Stmt::TempRoutine(n, f, r, quiet)) => format!("temp routine {n} {f:?} {r} {quiet}"),
+            Some(Stmt::Theirs) => "theirs".into(),
         }
     }
 
@@ -2969,6 +2995,53 @@ pub(crate) mod was {
         let solid = t.solid_refs();
         let last = solid.iter().rposition(|t| !matches!(t, Token::SemiColon)).unwrap_or(0);
         !solid[..last].iter().any(|t| matches!(t, Token::SemiColon))
+    }
+
+    /// What COPY's, ATTACH's and `placed`'s walks passed by went on to DataFusion's planner, which refused each (none
+    /// planned). A COPY's is DataFusion's own still, planned as before (`Stmt::Theirs`), but one that names no format,
+    /// which that planner refuses only as an internal error; ATTACH's and `placed`'s entries refuse each in DataFusion's
+    /// words, with its SQLSTATE, as a door answers either.
+    #[tokio::test]
+    async fn what_the_walks_passed_by_is_refused_as_before() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE t (a INT, b INT)").await?;
+        let options = || datafusion::execution::context::SQLOptions::new().with_allow_ddl(false).with_allow_dml(false).with_allow_statements(false); // (a query's door: `engine::read_only`)
+        let said = |e: anyhow::Error| (crate::codes::of(&e), crate::codes::words(&e));
+        let now = |sql: &str| match super::parse(sql) {
+            Some(Stmt::Invalid(why)) => said(anyhow::anyhow!(why)),
+            Some(Stmt::Refused(code, why)) => said(crate::codes::coded(code, why)), // (as `run_listed` raises each)
+            other => panic!("{sql}: {}", shown(&other)),
+        };
+        // (DataFusion's COPY: no write, so DataFusion's planner plans it and words its refusal, a missing table's too)
+        for sql in [
+            "COPY t (a) TO 'o.csv'", "copy t (a) to 'o.csv';", "COPY t", "COPY (SELECT 1)", "COPY t TO 1", "COPY t WITH x",
+            "COPY t STORED AS parquet TO 'o.parquet'", "COPY t OPTIONS ('format.has_header' 'true') TO 'o.csv'", "COPY (SELECT 1) STORED AS csv TO 'o.csv'",
+            "COPY nosuch STORED AS parquet TO 'o.parquet'",
+        ] {
+            assert_eq!(shown(&was(sql)), "none", "{sql}: its walk passed it by");
+            assert!(ctx.sql_with_options(sql, options()).await.is_err(), "{sql}: DataFusion refuses it");
+            assert!(super::parse(sql).is_none(), "{sql}: DataFusion's");
+        }
+        // (one of no format, which DataFusion's planner refuses as an internal error: refused by its form)
+        let sql = "COPY t PARTITIONED BY (a) TO 'o/'";
+        let df: anyhow::Error = ctx.sql_with_options(sql, options()).await.err().context("DataFusion planned it")?.into();
+        assert_eq!(crate::codes::of(&df), "XX000", "{sql}: {df:#}");
+        assert_eq!(now(sql), ("0A000", "COPY t TO 'o/' names no format for its files: COPY t TO 'o/' (FORMAT parquet), or STORED AS parquet after the path".to_string()));
+        assert!(super::parse("COPY t PARTITIONED BY (a) STORED AS parquet TO 'o/'").is_none(), "a format named: DataFusion's");
+        for sql in [
+            "ATTACH 'dir'", "ATTACH 1 AS y", "ATTACH 'dir' AS y extra", "ATTACH IF NOT EXISTS 'dir' AS o", "ATTACH 'dir' y",
+            "ALTER TABLE t ALTER COLUMN b FIRST extra", "ALTER TABLE t ALTER COLUMN b AFTER", "ALTER TABLE t ALTER s.b FIRST",
+            "ALTER VIEW v ALTER b AFTER", "ALTER MATERIALIZED VIEW v ALTER COLUMN b FIRST;x",
+        ] {
+            assert_eq!(shown(&was(sql)), "none", "{sql}: its walk passed it by");
+            let df = ctx.sql_with_options(sql, options()).await.err().with_context(|| format!("{sql}: DataFusion planned it"))?;
+            assert_eq!(now(sql), said(df.into()), "{sql}");
+        }
+        // (ALTER COLUMN's COLUMN is no column's name, `statements::shadowed`: no entry takes this, nor the tree, and
+        // DataFusion's planner refuses it as before)
+        assert!(super::parse("ALTER TABLE t ALTER COLUMN FIRST").is_none());
+        Ok(())
     }
 
     /// Every text of the repository's SQL reads as the readers PR 8 moved read it (by what it says, `shown`), but where
@@ -2990,6 +3063,18 @@ pub(crate) mod was {
             ("DROP TYPE a b", "invalid DROP TYPE [IF EXISTS] name [, …] [CASCADE | RESTRICT]"),
             ("CREATE TYPE mood AS ENUM (happy)", "invalid CREATE TYPE [IF NOT EXISTS] name AS ENUM ('label', …): enums are the types kept (a composite, a range or another type's alias isn't)"),
         ];
+        // (8d's: CREATE … EXTERNAL TABLE's other leading words, which its regex took, refused now as any other CREATE of
+        // those words is (the redesign thread, 11-09 03:22); a COPY of no format, which DataFusion's planner refused as an
+        // internal error (XX000), refused by its form; and a comment between EXTERNAL TABLE's words, which the regex
+        // didn't take: a word is a token)
+        const TEMP: &str = "invalid CREATE TEMPORARY EXTERNAL TABLE: make a temporary view of the files instead (CREATE TEMP VIEW t AS SELECT * FROM read_parquet('…'))";
+        const LOCATED: &str = "refused 0A000 CREATE TABLE … LOCATION / STORED AS: a lake's tables keep their files in the lake; files elsewhere are CREATE EXTERNAL TABLE t … STORED AS PARQUET LOCATION '…' (a view of them), and a Delta or Iceberg table elsewhere is ATTACH 'url' AS name (TYPE delta | iceberg)";
+        let changed = [
+            ("CREATE GLOBAL TEMPORARY EXTERNAL TABLE x STORED AS PARQUET LOCATION 'x'", TEMP, LOCATED),
+            ("CREATE UNBOUNDED TEMP EXTERNAL TABLE x STORED AS PARQUET LOCATION 'x'", TEMP, "none"),
+            ("COPY t PARTITIONED BY (a) TO 'o/'", "none", "refused 0A000 COPY t TO 'o/' names no format for its files: COPY t TO 'o/' (FORMAT parquet), or STORED AS parquet after the path"),
+        ];
+        let commented = "CREATE /* the files */ EXTERNAL TABLE e STORED AS PARQUET LOCATION 's3://b/x.parquet'";
         let (mut same, mut core, mut refused_now, mut differ) = (0, 0, vec![], vec![]);
         for sql in texts.iter().filter(|t| one(t) && !placeholder.is_match(t)) {
             let (now, then) = (shown(&super::parse(sql)), shown(&was(sql)));
@@ -3001,7 +3086,7 @@ pub(crate) mod was {
                 refused_now.push((sql.clone(), now));
             } else if misread.contains(&(sql.as_str(), now.as_str())) {
                 refused_now.push((sql.clone(), now));
-            } else {
+            } else if !changed.contains(&(sql.as_str(), then.as_str(), now.as_str())) && sql != commented {
                 differ.push((sql.clone(), then, now));
             }
         }
@@ -3057,10 +3142,36 @@ pub(crate) mod was {
             "CREATE PROCEDURE p() AS BEGIN SELECT 1; END", "CREATE OR REPLACE PROCEDURE p() LANGUAGE python AS $$ pass $$",
             "CREATE TASK t SCHEDULE '1 hour' AS INSERT INTO a SELECT 1", "CREATE TASK t", "ALTER TASK t SUSPEND", "alter task s.t resume;", "ALTER TASK t STOP",
             "DROP TASK IF EXISTS t", "DROP MACRO TABLE IF EXISTS m", "drop macro m", "DROP MACRO",
+            "ALTER TABLE t ALTER COLUMN b FIRST", "ALTER TABLE s.t ALTER b AFTER a", "alter table \"S\".\"T u\" alter column \"b c\" after \"A\";",
+            "ALTER VIEW v ALTER COLUMN b FIRST", "ALTER MATERIALIZED VIEW lake.s.m ALTER b AFTER a", "ALTER TABLE t ALTER COLUMN \"first\" FIRST",
+            "ATTACH 'dir' AS o", "ATTACH DATABASE 'dir' AS o2", "attach database 'dir' as \"Y\";", "ATTACH 'dir' AS y (TYPE pondra, READ_ONLY)",
+            "ATTACH 's3://b/t' AS d (TYPE delta)", "ATTACH IF NOT EXISTS 'https://c' AS i (TYPE iceberg, TOKEN 't')", "ATTACH shop", "ATTACH shop AS s",
+            "ATTACH shop AS s (TYPE delta)", "ATTACH '{\"endpoint\": \"https://x\", \"bearerToken\": \"t\"}' AS s (TYPE share)", "ATTACH 'dir' AS y (READ_ONLY = maybe, ENDPOINT)",
+            "ATTACH 'dir' AS y (WHO 'x')",
+            "COPY t TO 's3://b/o.parquet' (FORMAT parquet)", "COPY (SELECT 1 AS x) TO 's3://b/x.csv' (HEADER, DELIMITER ';')",
+            "COPY t TO 's3://b/x/' STORED AS csv PARTITIONED BY (a) OPTIONS ('format.has_header' 'false')", "COPY t TO '@drop/out/' (PARTITION_BY (a, \"B\"))",
+            "COPY t FROM STDIN", "copy t (a, b) from stdin;", "COPY nosuch STORED AS parquet TO 'o.parquet'", "COPY t STORED AS csv TO 'o.csv'", "COPY t TO STDOUT", "COPY t (a) FROM 'f.csv'", "COPY", "COPY (SELECT) TO 'x'", "COPY t TO 'x' (FORMAT)",
+            "COPY INTO t FROM 's3://b/*.csv' (FORMAT csv, HEADER true)", "COPY INTO s.t FROM (SELECT * FROM 's3://b/x.csv')", "COPY INTO t", "COPY INTO t FROM @stage",
+            "COPY INTO t FROM 's3://b/x' FILEFORMAT = CSV", "COPY INTO t FROM 's3://b/x' (FORCE = TRUE)", "copy into t from 'x' (pattern '.*');",
+            "CREATE EXTERNAL TABLE e STORED AS PARQUET LOCATION 's3://b/x.parquet'", "CREATE OR REPLACE EXTERNAL TABLE e STORED AS CSV LOCATION 's3://b/x.csv' OPTIONS ('format.has_header' 'true')",
+            "CREATE UNBOUNDED EXTERNAL TABLE u STORED AS PARQUET LOCATION 's3://b/'", "create or replace unbounded external table u stored as parquet location 's3://b/';",
+            "CREATE EXTERNAL TABLE IF NOT EXISTS e (a INT) STORED AS CSV LOCATION 's3://b/x.csv'", "CREATE EXTERNAL TABLE x", "CREATE EXTERNAL TABLE",
+            "CREATE TEMP EXTERNAL TABLE x STORED AS PARQUET LOCATION 'x'", "CREATE TEMPORARY EXTERNAL TABLE x STORED AS PARQUET LOCATION 'x'",
+            "CREATE OR REPLACE TEMP EXTERNAL TABLE x STORED AS PARQUET LOCATION 'x'", "create or replace temporary external table x stored as parquet location 'x'",
         ] {
             assert_eq!(shown(&super::parse(sql)), shown(&was(sql)), "{sql}");
             assert!(crate::statements::moved(sql), "{sql}: an entry's");
         }
+        // (a column named first or after in ALTER COLUMN's other forms: the tree's, as before, and no entry's)
+        for sql in ["ALTER TABLE t ALTER COLUMN first SET NOT NULL", "alter table s.t alter column after type bigint", "ALTER TABLE t ALTER COLUMN first SET DEFAULT 0"] {
+            assert_eq!(shown(&super::parse(sql)), shown(&was(sql)), "{sql}");
+            assert!(!crate::statements::moved(sql), "{sql}: the tree's");
+        }
+        for (sql, before, now) in changed {
+            assert_eq!((shown(&was(sql)).as_str(), shown(&super::parse(sql)).as_str()), (before, now), "{sql}");
+        }
+        assert!(shown(&was(commented)).starts_with("refused 0A000 CREATE TABLE … LOCATION / STORED AS"), "{}", shown(&was(commented)));
+        assert_eq!(shown(&super::parse(commented)), shown(&super::parse("CREATE EXTERNAL TABLE e STORED AS PARQUET LOCATION 's3://b/x.parquet'")));
         // (the forms the parser refused, now each family's reader's)
         for (sql, said) in [
             ("ALTER DATABASE b RENAME TO c", "expected SET near rename (ALTER DATABASE b REFRESH [t, …], SET LOCATION 'dir' or SET (protected = true | false))"),

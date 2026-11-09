@@ -106,6 +106,31 @@ static ENTRIES: &[Statement] = &[
     entry(&["ALTER", "TASK"], routine, "suspends or resumes a task"),
     entry(&["DROP", "TASK"], routine, "drops a task"),
     entry(&["DROP", "MACRO"], routine, "drops a macro (DuckDB's DROP MACRO [TABLE])"),
+    // (where SQL lists a column: Databricks' and MySQL's words, which sqlparser doesn't read in an ALTER COLUMN, so two
+    // names come before the telling word; ALTER TABLE's other forms are the tree's)
+    entry(&["ALTER", "TABLE", "*", "ALTER", "COLUMN", "*", "FIRST"], placed, "puts a column first in SQL's order"),
+    entry(&["ALTER", "TABLE", "*", "ALTER", "COLUMN", "*", "AFTER"], placed, "puts a column after another in SQL's order"),
+    entry(&["ALTER", "TABLE", "*", "ALTER", "*", "FIRST"], placed, "puts a column first in SQL's order"),
+    entry(&["ALTER", "TABLE", "*", "ALTER", "*", "AFTER"], placed, "puts a column after another in SQL's order"),
+    entry(&["ALTER", "VIEW", "*", "ALTER", "COLUMN", "*", "FIRST"], placed, "puts a view's column first in SQL's order"),
+    entry(&["ALTER", "VIEW", "*", "ALTER", "COLUMN", "*", "AFTER"], placed, "puts a view's column after another"),
+    entry(&["ALTER", "VIEW", "*", "ALTER", "*", "FIRST"], placed, "puts a view's column first in SQL's order"),
+    entry(&["ALTER", "VIEW", "*", "ALTER", "*", "AFTER"], placed, "puts a view's column after another"),
+    entry(&["ALTER", "MATERIALIZED", "VIEW", "*", "ALTER", "COLUMN", "*", "FIRST"], placed, "puts a view's column first in SQL's order"),
+    entry(&["ALTER", "MATERIALIZED", "VIEW", "*", "ALTER", "COLUMN", "*", "AFTER"], placed, "puts a view's column after another"),
+    entry(&["ALTER", "MATERIALIZED", "VIEW", "*", "ALTER", "*", "FIRST"], placed, "puts a view's column first in SQL's order"),
+    entry(&["ALTER", "MATERIALIZED", "VIEW", "*", "ALTER", "*", "AFTER"], placed, "puts a view's column after another"),
+    entry(&["ATTACH"], attach, "another lake's tables, or a Delta, Iceberg or shared table's, or a connection's, by name"),
+    entry(&["COPY"], copy, "a query's rows to files (COPY (SELECT …) TO 's3://…' (FORMAT parquet))"),
+    entry(&["COPY", "INTO"], copy_into, "loads files into a table, each once (COPY INTO t FROM 's3://…/*.csv')"),
+    entry(&["CREATE", "EXTERNAL", "TABLE"], external, "a stored view of files (DataFusion's words)"),
+    entry(&["CREATE", "OR", "REPLACE", "EXTERNAL", "TABLE"], external, "a stored view of files, in place of one of its name"),
+    entry(&["CREATE", "UNBOUNDED", "EXTERNAL", "TABLE"], external, "a stored view of files that grow"),
+    entry(&["CREATE", "OR", "REPLACE", "UNBOUNDED", "EXTERNAL", "TABLE"], external, "a stored view of files that grow, in place of one of its name"),
+    entry(&["CREATE", "TEMP", "EXTERNAL", "TABLE"], temp_external, "refused: a temporary view of the files is the session's"),
+    entry(&["CREATE", "TEMPORARY", "EXTERNAL", "TABLE"], temp_external, "refused: a temporary view of the files is the session's"),
+    entry(&["CREATE", "OR", "REPLACE", "TEMP", "EXTERNAL", "TABLE"], temp_external, "refused: a temporary view of the files is the session's"),
+    entry(&["CREATE", "OR", "REPLACE", "TEMPORARY", "EXTERNAL", "TABLE"], temp_external, "refused: a temporary view of the files is the session's"),
 ];
 
 /// A reader's own words for a form written wrong, after what it found: what a statement of the form is.
@@ -403,6 +428,44 @@ fn routine(w: &mut Words) -> Result<Stmt> {
     }
 }
 
+/// `ALTER TABLE | VIEW | MATERIALIZED VIEW t ALTER [COLUMN] c FIRST | AFTER b`, by its walk of the text (`write::placed`).
+/// sqlparser has MySQL's column place for ADD and MODIFY but not here: when it reads this, the tree does and the entry
+/// holds one name (an upstream proposal, the counted list).
+fn placed(w: &mut Words) -> Result<Stmt> {
+    match crate::write::placed(w.sql()) {
+        Some(s) => Ok(s),
+        None => bail!("{}", unread(w.sql(), "ALTER TABLE t ALTER [COLUMN] c FIRST | AFTER b")),
+    }
+}
+
+/// ATTACH, every form, by ext's walk and then sqlparser's tree (`ext::read_attach`).
+fn attach(w: &mut Words) -> Result<Stmt> { crate::ext::read_attach(w.sql()) }
+
+/// COPY to files, by ext's walk (`ext::copy`); a form it doesn't place is DataFusion's own, planned as before.
+fn copy(w: &mut Words) -> Result<Stmt> { crate::ext::copy(w.sql()) }
+
+/// COPY INTO, by ext's walk (`ext::copy_into`).
+fn copy_into(w: &mut Words) -> Result<Stmt> { crate::ext::copy_into(w.sql()) }
+
+/// `CREATE [OR REPLACE] [UNBOUNDED] EXTERNAL TABLE`, DataFusion's own (a stored view of files: `ext::external`), read by
+/// DataFusion's parser and in its words.
+fn external(w: &mut Words) -> Result<Stmt> {
+    use datafusion::sql::parser::{DFParserBuilder, Statement as DF};
+    Ok(match DFParserBuilder::new(w.sql()).build().and_then(|mut p| p.parse_statements()) {
+        Ok(mut all) if all.len() == 1 => match all.pop_front() {
+            Some(DF::CreateExternalTable(c)) => crate::ext::external(&c).map(|d| Stmt::Ddl(vec![d])).unwrap_or_else(|e| Stmt::Invalid(format!("{e:#}"))),
+            _ => Stmt::Invalid("CREATE EXTERNAL TABLE t … STORED AS … LOCATION '…'".into()),
+        },
+        Ok(all) => Stmt::Invalid(format!("CREATE EXTERNAL TABLE and {} more: send one statement at a time here (or as a script, over HTTP or in the shell)", all.len().saturating_sub(1))),
+        Err(e) => Stmt::Invalid(format!("{e}")),
+    })
+}
+
+/// A TEMP EXTERNAL TABLE, refused by name: the session's view of files is a TEMP VIEW.
+fn temp_external(_: &mut Words) -> Result<Stmt> {
+    Ok(Stmt::Invalid("CREATE TEMPORARY EXTERNAL TABLE: make a temporary view of the files instead (CREATE TEMP VIEW t AS SELECT * FROM read_parquet('…'))".into()))
+}
+
 /// Why a walk found no statement in a text its entry's words begin: the parser's words, or the form.
 fn unread(sql: &str, form: &str) -> String { crate::parsed::generic(sql).err().map_or_else(|| form.to_string(), |e| e.to_string()) }
 
@@ -415,7 +478,20 @@ mod tests {
     #[test]
     fn the_core_entries_on_stand_ins_are_counted() {
         let s = crate::registry::get().section::<Statements>();
-        assert_eq!((ENTRIES.len(), s.stand_ins()), (74, 86), "the core's 74, the sharing extension's 8 and the identity providers' 4");
+        assert_eq!((ENTRIES.len(), s.stand_ins()), (97, 109), "the core's 97, the sharing extension's 8 and the identity providers' 4");
+    }
+
+    /// A column named first or after is a name in ALTER COLUMN's other forms, which are the tree's: no place entry takes
+    /// ALTER COLUMN's COLUMN as the column's name (`statements::shadowed`).
+    #[test]
+    fn a_column_named_first_is_the_trees() {
+        for sql in ["ALTER TABLE t ALTER COLUMN first SET NOT NULL", "alter table s.t alter column after type bigint", "ALTER TABLE t ALTER COLUMN first SET DEFAULT 0", "ALTER VIEW v ALTER COLUMN first SET DEFAULT 1"] {
+            assert!(crate::statements::matched(sql).is_none(), "{sql}: the tree's");
+            assert!(!matches!(crate::write::parse(sql), Some(Stmt::Invalid(e)) if e.contains("FIRST | AFTER")), "{sql}");
+        }
+        for sql in ["ALTER TABLE t ALTER COLUMN first FIRST", "ALTER TABLE t ALTER first AFTER after", "ALTER TABLE t ALTER COLUMN \"column\" FIRST", "alter materialized view m alter column after first"] {
+            assert!(matches!(crate::write::parse(sql), Some(Stmt::Ddl(_))), "{sql}: the place's");
+        }
     }
 
     /// COMMENT ON and CREATE OR ALTER, as `write::parse` reads them (each was `objects::statement`'s).

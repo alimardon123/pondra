@@ -1284,7 +1284,7 @@ impl Copy {
         if !crate::text::first_word(sql).get(..4).is_some_and(|w| w.eq_ignore_ascii_case("copy")) {
             return None;
         }
-        if matches!(crate::ext::statement(sql), Some(crate::write::Stmt::CopyTo(..))) {
+        if matches!(crate::ext::copy(sql), Ok(crate::write::Stmt::CopyTo(..))) {
             return None; // (`COPY … TO 's3://…'`: files anywhere, the statement every door runs: ADR-026)
         }
         let parsed = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::PostgreSqlDialect {}, sql);
