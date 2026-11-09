@@ -378,7 +378,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &m
         }
     } else if !peer.may_send_password() && !crate::users::is_token(&user, &password) {
         Some(PASSWORD_PLAIN.to_string())
-    } else if let Some(wait) = crate::auth::guessing(ip, &user) {
+    } else if let Some(wait) = crate::auth::guessing(&app.lake, ip, &user) {
         Some(crate::auth::guessing_says(&user, wait))
     } else {
         match crate::users::sign_in(&app.lake, &app.auth, &user, &password).await {
@@ -390,7 +390,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &m
             None => {
                 let by_token = crate::users::is_token(&user, &password);
                 if !by_token {
-                    crate::auth::guessed(ip, &user); // (a token isn't guessed: it is random, as on HTTP and Postgres)
+                    crate::auth::guessed(&app.lake, ip, &user); // (a token isn't guessed: it is random, as on HTTP and Postgres)
                 }
                 let why = match by_token {
                     true => crate::sso::why(&app.lake, &password).await, // (an identity provider's says why)

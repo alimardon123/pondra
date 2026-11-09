@@ -867,6 +867,16 @@ fn sealed(k: &Keys) -> Result<Kept> {
     Ok(Kept::Sealed { sealed, key })
 }
 
+/// Each user's turns among the statements it runs at once on this node (its `Limits`), as the lake's state.
+#[derive(Default)]
+pub struct Turns(Mutex<HashMap<String, (u32, Arc<tokio::sync::Semaphore>)>>);
+
+impl crate::lake_state::LakeState for Turns {
+    const NAME: &'static str = "turns";
+    const ABOUT: &'static str = "each user's turns among the statements it runs at once on this node (its `Limits`)";
+    fn make() -> Self { Turns::default() }
+}
+
 /// What this node worked out about its lake's sign-in, kept as the lake's (it was the process's, keyed by the lake's url or
 /// not by lake at all): its keys, whether it is signed, the passwords checked lately, its users' access, and whether anyone
 /// signs in.
@@ -1417,7 +1427,7 @@ fn pg_duration(v: &str) -> Option<std::time::Duration> {
     (micros > 0).then(|| std::time::Duration::from_micros(micros))
 }
 
-pub fn quota() -> Quota {
+pub fn quota(lake: &Lake) -> Quota {
     let p = crate::auth::current();
     // (a session that set `statement_timeout` keeps its own, 0 included; one that set none gets the node's default)
     let session = match crate::set::shown("statement_timeout") {
@@ -1433,14 +1443,14 @@ pub fn quota() -> Quota {
         (Some(s), _) => (Some(s), true),
         (None, t) => (t, false),
     };
-    crate::per_node!(static TURNS: Mutex<HashMap<String, (u32, Arc<tokio::sync::Semaphore>)>> = Default::default());
-    let turns = most.map(|n| {
-        let mut all = TURNS.lock().unwrap();
+    let turns = most.and_then(|n| {
+        let state = lake.state::<Turns>().ok()?;
+        let mut all = state.0.lock().unwrap();
         let e = all.entry(user.clone()).or_insert_with(|| (n, Arc::new(tokio::sync::Semaphore::new(n as usize))));
         if e.0 != n {
             *e = (n, Arc::new(tokio::sync::Semaphore::new(n as usize))); // (changed: the new number from now on)
         }
-        (e.1.clone(), n)
+        Some((e.1.clone(), n))
     });
     Quota { turns, timeout, user, by_session }
 }
@@ -1473,7 +1483,7 @@ pub async fn across(other: &Lake, ns: &str) -> Result<()> {
     if let Some(r) = crate::store::reach_of(&other.url).filter(|r| r.read_only) {
         return read_only(&r, ns);
     }
-    if crate::auth::operator() || !(crate::auth::tokens_on() || any(other).await) {
+    if crate::auth::operator() || !(crate::auth::tokens_on(&other.node) || any(other).await) {
         return Ok(());
     }
     bail!("permission denied: {ns} signs in on its own: its tables are read and written through it (the database {ns}), or with one of the nodes' tokens")

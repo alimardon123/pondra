@@ -477,12 +477,10 @@ struct Keys {
     asked: Instant,
 }
 
-crate::per_node!(
-    /// Each issuer's keys, as last fetched.
-    static KEYS: Mutex<HashMap<String, Keys>> = Default::default());
-crate::per_node!(
-    /// One fetch at a time an issuer: the sign-ins waiting on it read what it found.
-    static FETCHING: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> = Default::default());
+/// Each issuer's keys, as last fetched.
+static KEYS: std::sync::LazyLock<Mutex<HashMap<String, Keys>>> = std::sync::LazyLock::new(Default::default);
+/// One fetch at a time an issuer: the sign-ins waiting on it read what it found.
+static FETCHING: std::sync::LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = std::sync::LazyLock::new(Default::default);
 
 const HOUR: Duration = Duration::from_secs(3_600);
 const MINUTE: Duration = Duration::from_secs(60);
@@ -501,12 +499,12 @@ async fn key_for(p: &Provider, kid: Option<&str>, alg: &str) -> Result<Jwk> {
         }
     };
     // (the key if any, whether the keys are an hour old or less, and whether the provider may be asked again)
-    let look = || KEYS.lock().unwrap().get(&p.issuer).map(|k| (pick(&k.keys), k.fetched.is_some_and(|f| f.elapsed() < HOUR), k.asked.elapsed() >= MINUTE));
+    let look = || KEYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&p.issuer).map(|k| (pick(&k.keys), k.fetched.is_some_and(|f| f.elapsed() < HOUR), k.asked.elapsed() >= MINUTE));
     if let Some((Some(key), fresh, may)) = look() {
         if !fresh && may {
             // (an hour old: asked again beside this sign-in, which goes on with the key it has, so a key the
             // provider took away stops signing in within the hour, and no sign-in waits on the provider)
-            if let Some(k) = KEYS.lock().unwrap().get_mut(&p.issuer) {
+            if let Some(k) = KEYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(&p.issuer) {
                 k.asked = Instant::now();
             }
             let issuer = p.issuer.clone();
@@ -514,7 +512,7 @@ async fn key_for(p: &Provider, kid: Option<&str>, alg: &str) -> Result<Jwk> {
         }
         return Ok(key);
     }
-    let gate = FETCHING.lock().unwrap().entry(p.issuer.clone()).or_default().clone();
+    let gate = FETCHING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(p.issuer.clone()).or_default().clone();
     let _one = gate.lock().await;
     match look() {
         Some((Some(key), _, _)) => return Ok(key), // (fetched while this one waited)
@@ -530,7 +528,7 @@ async fn key_for(p: &Provider, kid: Option<&str>, alg: &str) -> Result<Jwk> {
 
 /// Keep what a fetch found, the document and its keys (or, when it failed, what there was, asked again in a minute).
 fn remember(issuer: &str, found: Result<(Value, Vec<Jwk>)>) {
-    let mut all = KEYS.lock().unwrap();
+    let mut all = KEYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = Instant::now();
     match found {
         Ok((doc, keys)) => {
@@ -549,11 +547,11 @@ fn remember(issuer: &str, found: Result<(Value, Vec<Jwk>)>) {
 /// sign-ins with the document it had.
 pub(crate) async fn discovery(issuer: &str) -> Result<Value> {
     // (the document, whether it is an hour old or less, and whether the provider may be asked again)
-    let look = || KEYS.lock().unwrap().get(issuer).map(|k| (k.doc.clone(), k.fetched.is_some_and(|f| f.elapsed() < HOUR), k.asked.elapsed() >= MINUTE));
+    let look = || KEYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(issuer).map(|k| (k.doc.clone(), k.fetched.is_some_and(|f| f.elapsed() < HOUR), k.asked.elapsed() >= MINUTE));
     if let Some((doc, true, _)) = look().filter(|(doc, ..)| !doc.is_null()) {
         return Ok(doc);
     }
-    let gate = FETCHING.lock().unwrap().entry(issuer.to_string()).or_default().clone();
+    let gate = FETCHING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(issuer.to_string()).or_default().clone();
     let _one = gate.lock().await;
     match look() {
         Some((doc, fresh, may)) if !doc.is_null() && (fresh || !may) => return Ok(doc), // (fetched while this one waited, or asked less than a minute ago)

@@ -292,12 +292,12 @@ impl StartupHandler for Startup {
                 if !token && !crate::tls::may_send_password(client.is_secure(), client.socket_addr()) {
                     return Err(fatal(crate::tls::PASSWORD_PLAIN.into()));
                 }
-                if let Some(wait) = crate::auth::guessing(ip, &user) {
+                if let Some(wait) = crate::auth::guessing(&app.lake, ip, &user) {
                     return Err(guessing_refused(app, &user, from, wait).await);
                 }
                 let Some(who) = crate::users::sign_in(&app.lake, &app.auth, &user, &password).await else {
                     if !token {
-                        crate::auth::guessed(ip, &user); // (a token isn't guessed: it is random)
+                        crate::auth::guessed(&app.lake, ip, &user); // (a token isn't guessed: it is random)
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     if let Some(why) = crate::sso::why(&app.lake, &password).await {
@@ -320,7 +320,7 @@ impl StartupHandler for Startup {
                 match scram.take() {
                     None => {
                         // (refused before SCRAM answers: a user who failed ten times in a minute from this address)
-                        if let Some(wait) = crate::auth::guessing(ip, &user) {
+                        if let Some(wait) = crate::auth::guessing(&app.lake, ip, &user) {
                             return Err(guessing_refused(app, &user, from, wait).await);
                         }
                         let first = m.into_sasl_initial_response()?;
@@ -342,7 +342,7 @@ impl StartupHandler for Startup {
                         let Ok(reply) = exchange.last(&text) else {
                             // (a built-in name's password is its token, random and never guessed)
                             if !crate::users::BUILT_IN.contains(&user.as_str()) {
-                                crate::auth::guessed(ip, &user);
+                                crate::auth::guessed(&app.lake, ip, &user);
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time)
                             return Err(wrong(&user).await);
