@@ -221,8 +221,8 @@ fn same_kind(lake: &str, base: &str) -> bool {
     }
 }
 
-/// `CREATE DATABASE name CLONE from` (this lake's leader, under its lock).
-pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<String>, of: CloneOf) -> Result<Value> {
+/// `CREATE DATABASE name CLONE from` (this lake's leader, under its lock), asked by `asker`, whose base's pin it makes.
+pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<String>, of: CloneOf, asker: &crate::auth::Principal) -> Result<Value> {
     crate::ddl::database_name(name)?;
     crate::ddl::not_system(name, "give the branch another name")?; // (before anything is copied)
     let (base, inherited) = base(lake, &of.from).await?;
@@ -232,7 +232,7 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
     let gone = crate::ddl::let_go(&dir, name, Some(&lake.node.reaches)).await?; // (a dropped one there, kept to be undropped: this one takes its place)
     if crate::ddl::has_catalog(&dir, Some(&lake.node.reaches)).await? {
         ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name} CLONE {})", of.from);
-        return Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None }, &crate::auth::Principal::node().scope)).await; // (an ATTACH plans nothing)
+        return Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None }, &crate::auth::Principal::node())).await; // (an ATTACH plans nothing)
     }
     // The maker's record, as this lake has it: the branch makes it a superuser (`make`). Only a
     // user of this database has one; a token's name has none, and so no owner.
@@ -246,7 +246,7 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
     let mut lakes = inherited.lakes.clone();
     let mut pinned = vec![];
     let made = async {
-        let pinning = pin_in(lake, &base, &dir, None, None, away.is_some()).await;
+        let pinning = pin_in(lake, &base, &dir, None, None, away.is_some(), Some(asker)).await;
         let p = match base == lake.url {
             true => pinning?,
             false => pinning.with_context(|| match &away {
@@ -258,7 +258,7 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
         let schemas = schemas_taken(&of, p.schemas)?; // (refused here, after the pin: the error path lets it go)
         for (id, b) in inherited.lakes.iter() {
             // (the key their pins give this branch, not the one its base gave it)
-            let key = pin_in(lake, &b.url, &dir, Some(b.ms), None, b.away()).await?.key;
+            let key = pin_in(lake, &b.url, &dir, Some(b.ms), None, b.away(), Some(asker)).await?.key;
             if let Some(e) = lakes.get_mut(id) {
                 e.key = key.clone();
                 e.sealed = None; // (the inherited sealed key is the base branch's, never ours)
@@ -287,7 +287,7 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
             return Err(e.context(format!("cloning {}", of.from)));
         }
     };
-    let attached = Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None }, &crate::auth::Principal::node().scope)).await?;
+    let attached = Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None }, &crate::auth::Principal::node())).await?;
     let mut out = j!({"database": name, "cloned": of.from, "tables": made["tables"], "dir": attached["dir"]});
     if let Some(n) = gone {
         out["notice"] = n.into();
@@ -335,10 +335,11 @@ struct Pinned {
 }
 
 /// Pin `branch` in the lake at `at`: here, or through its own leader (invariant 20), with `key` when
-/// it has one (a branch's renewal, `keyed`). `lease`: the branch is on another server (`pin`).
-async fn pin_in(lake: &Lake, at: &str, branch: &str, ms: Option<u64>, key: Option<&str>, lease: bool) -> Result<Pinned> {
+/// it has one (a branch's renewal, `keyed`). `lease`: the branch is on another server (`pin`). `asker`: who asks for it
+/// (None: the node's own).
+async fn pin_in(lake: &Lake, at: &str, branch: &str, ms: Option<u64>, key: Option<&str>, lease: bool, asker: Option<&crate::auth::Principal>) -> Result<Pinned> {
     let v = match at == lake.url {
-        true => pin(lake, branch, ms, lease).await?,
+        true => pin(lake, branch, ms, lease, asker).await?,
         false => Box::pin(crate::write::send_as(at, Request::Ddl(Ddl::Pin { lake: branch.into(), ms, lease }), key, &lake.node)).await?,
     };
     Ok(Pinned {
@@ -359,18 +360,17 @@ async fn unpin_in(lake: &Lake, at: &str, branch: &str, key: Option<&str>) -> Res
 
 /// A base's leader: keep every file live at `ms` (now, less a margin, unless a branch of a branch
 /// carries its own base's on) while `branch` is there. A lease (a branch on another server) goes when
-/// it isn't renewed (`lapse`).
-pub async fn pin(lake: &Lake, branch: &str, ms: Option<u64>, lease: bool) -> Result<Value> {
+/// it isn't renewed (`lapse`). `asker`: who asks for it (None: the node's own renewal, `renew`).
+pub async fn pin(lake: &Lake, branch: &str, ms: Option<u64>, lease: bool, asker: Option<&crate::auth::Principal>) -> Result<Value> {
     let (key, now) = (pin_key(branch), crate::log::now_ms());
     let mut ms = ms.unwrap_or(now.saturating_sub(MARGIN_MS));
     // (a user who may only clone is a server elsewhere's: its pin is a lease, and once one, always)
-    let scope = crate::rights::scope();
-    let mut lease = lease || scope.clones().is_some();
+    let mut lease = lease || asker.is_some_and(|a| a.scope.clones().is_some());
     // (a user who may only clone makes the pins it makes its own: it renews those alone, so it is never given
     // another branch's key, nor makes another's pin a lease)
-    let limited = !scope.whole();
+    let limited = asker.is_some_and(|a| !a.scope.whole());
     let me = match limited {
-        true => crate::auth::current().map(|p| p.name),
+        true => asker.map(|a| a.name.clone()).filter(|n| !n.is_empty()),
         false => None,
     };
     let mut by = me.clone();
@@ -385,7 +385,7 @@ pub async fn pin(lake: &Lake, branch: &str, ms: Option<u64>, lease: bool) -> Res
     lake.cat.commit(vec![(key, json(&Pin { lake: branch.into(), ms, at_ms: now, lease, by }))], &[]).await?;
     let mut out = j!({"pinned": branch, "ms": ms, "at_ms": now, "key": key_for(lake, branch).await?});
     // (a user granted CLONE on some schemas only: the branch takes only those, and says so here)
-    if let Some(s) = scope.clones().filter(|s| !s.is_empty()) {
+    if let Some(s) = asker.and_then(|a| a.scope.clones()).filter(|s| !s.is_empty()) {
         out["schemas"] = j!(s);
     }
     Ok(out)
@@ -448,15 +448,14 @@ pub async fn may(lake: &Lake, d: &Ddl) -> Result<()> {
 /// Where a statement comes in (`write::on_node_listed`, instead of `may`): what a user who isn't a
 /// superuser may branch or drop, and who makes a branch, its owner (ADR-058). CLONE is enough to make
 /// one; a branch is dropped by its owner and by nobody else. Admins and superusers are checked as
-/// before (`may`).
-pub async fn door(lake: &Lake, d: &mut Ddl) -> Result<()> {
+/// before (`may`). `asker`: who sends it, as its door signed it in.
+pub async fn door(lake: &Lake, d: &mut Ddl, asker: &crate::auth::Principal) -> Result<()> {
     places(d)?;
-    let scope = crate::rights::scope();
-    match scope.whole() {
+    match asker.scope.whole() {
         true => may(lake, d).await?,
-        false => user_door(lake, d, &scope).await?,
+        false => user_door(lake, d, asker).await?,
     }
-    stamp(lake, d).await
+    stamp(lake, d, &asker.name).await
 }
 
 /// A node's lake (`pondra://host:port`) is opened with this node's admin token, so ATTACH and CREATE DATABASE name one only
@@ -474,14 +473,14 @@ fn places(d: &Ddl) -> Result<()> {
 
 /// A user who isn't a superuser: its grants decide a branch or a drop (`rights::may_run` lets nothing
 /// else of its through).
-async fn user_door(lake: &Lake, d: &mut Ddl, a: &crate::rights::Scope) -> Result<()> {
+async fn user_door(lake: &Lake, d: &mut Ddl, asker: &crate::auth::Principal) -> Result<()> {
     if let Ddl::CreateDatabase { clone: Some(of), dir, .. } = d {
         // (a branch's files go beside its base's, on its base's server: a folder or a URL named here would be opened with this node's own credentials)
         ensure!(dir.is_none(), crate::codes::coded("42501", "permission denied: a branch made with CLONE lives beside the database it is made on; LOCATION is a superuser's choice"));
-        return clone_as(lake, of, a);
+        return clone_as(lake, of, &asker.scope, &asker.name);
     }
     if let Ddl::DropDatabase { name, if_exists, .. } = d {
-        return drop_as(lake, name.as_str(), *if_exists).await;
+        return drop_as(lake, name.as_str(), *if_exists, &asker.name).await;
     }
     may(lake, d).await
 }
@@ -489,10 +488,9 @@ async fn user_door(lake: &Lake, d: &mut Ddl, a: &crate::rights::Scope) -> Result
 /// A branch of a database, made by a user with CLONE: on this database, as its grants let it (every
 /// schema, or those granted, and only those it names); on a database attached here, by its own grant.
 /// Prod still decides what the attachment's token may pin (`pin`), so `may` isn't asked there.
-fn clone_as(lake: &Lake, of: &mut CloneOf, a: &crate::rights::Scope) -> Result<()> {
+fn clone_as(lake: &Lake, of: &mut CloneOf, a: &crate::rights::Scope, me: &str) -> Result<()> {
     let from = crate::text::database(&of.from);
     let here = crate::ddl::lake_name(lake);
-    let me = crate::auth::current().map(|p| p.name).unwrap_or_default();
     if from != here {
         ensure!(a.clones_of(&from), "permission denied: a branch of {from} here needs CLONE on it (GRANT CLONE ON DATABASE {from} TO {me}, run on {here})");
         return Ok(());
@@ -512,8 +510,7 @@ fn clone_as(lake: &Lake, of: &mut CloneOf, a: &crate::rights::Scope) -> Result<(
 /// A branch dropped by a user who isn't a superuser: by its owner alone (an admin drops any). A
 /// shared one (test, a pull request's) is CI's, so a developer who may clone prod can't drop it. A
 /// database that isn't there is nothing to drop with IF EXISTS.
-async fn drop_as(lake: &Lake, name: &str, if_exists: bool) -> Result<()> {
-    let me = crate::auth::current().map(|p| p.name).unwrap_or_default();
+async fn drop_as(lake: &Lake, name: &str, if_exists: bool, me: &str) -> Result<()> {
     // (attached here, or beside this lake on its server, not yet attached to this node)
     let attached = lake.attached.read().unwrap().iter().find(|(n, _)| *n == name).map(|(_, l)| l.url.clone());
     let url = attached.unwrap_or_else(|| crate::ddl::beside(&lake.url, name));
@@ -530,12 +527,11 @@ async fn drop_as(lake: &Lake, name: &str, if_exists: bool) -> Result<()> {
 }
 
 /// Who makes a branch: a user of this database (not a token's name) is stamped on the statement where
-/// it comes in. `create` reads that user's record, and `make` makes it the branch's superuser.
-async fn stamp(lake: &Lake, d: &mut Ddl) -> Result<()> {
+/// it comes in (`me`, its sender's name). `create` reads that user's record, and `make` makes it the branch's superuser.
+async fn stamp(lake: &Lake, d: &mut Ddl, me: &str) -> Result<()> {
     let Ddl::CreateDatabase { clone: Some(of), .. } = d else { return Ok(()) };
-    let me = crate::auth::current().map(|p| p.name).unwrap_or_default();
-    if !me.is_empty() && lake.cat.get::<crate::users::User>(&crate::users::user_key(&me)).await?.is_some() {
-        of.owner = Some(me);
+    if !me.is_empty() && lake.cat.get::<crate::users::User>(&crate::users::user_key(me)).await?.is_some() {
+        of.owner = Some(me.to_string());
     }
     Ok(())
 }
@@ -607,7 +603,7 @@ pub async fn renew(lake: &Lake) {
         for base in b.lakes.values().filter(|b| b.away()) {
             let renewed = async {
                 let Some(key) = base.key()? else { return Ok(()) };
-                pin_in(&l, &base.url, &b.me, None, Some(&key), true).await.map(|_| ())
+                pin_in(&l, &base.url, &b.me, None, Some(&key), true, None).await.map(|_| ()) // (the node's own renewal)
             };
             if let Err(e) = renewed.await {
                 eprintln!("renewing {}'s pin in {}: {e:#} (a pin let go isn't made again: what the branch reads of it may be gone; DROP DATABASE it and CLONE again)", b.me, base.url);
@@ -853,8 +849,8 @@ pub async fn databases(lake: &Lake) -> Result<datafusion::arrow::record_batch::R
 /// log are written into b's own files, with their ids and versions; b's own rows of them go. b's
 /// counters first move past the base's, so what b writes next numbers after what it took (a newer
 /// keyed file's `ord` is greater: invariant 5). A view of them that b defines otherwise than its
-/// base, or one keeping state of its own (a window, sessions, a stream join), is refused by name.
-pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex<()>, database: Option<String>, tables: Vec<String>) -> Result<Value> {
+/// base, or one keeping state of its own (a window, sessions, a stream join), is refused by name. `asker`: who asks.
+pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex<()>, database: Option<String>, tables: Vec<String>, asker: &crate::auth::Principal) -> Result<Value> {
     if let Some(db) = database.filter(|d| *d != crate::ddl::lake_name(lake)) {
         // (another database's: its own leader does it, and this lake's lock isn't held meanwhile)
         let url = lake.attached.read().unwrap().iter().find(|(n, _)| *n == db).map(|(_, l)| l.url.clone());
@@ -866,7 +862,7 @@ pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::syn
     // files it lists now are newer) shows in it.
     let key = me.lakes.get(&id_of(&me.base)).map(Base::key).transpose()?.flatten();
     let away = me.lakes.get(&id_of(&me.base)).is_some_and(Base::away);
-    let at = pin_in(lake, &me.base, &me.me, None, key.as_deref(), away).await?.at_ms;
+    let at = pin_in(lake, &me.base, &me.me, None, key.as_deref(), away, Some(asker)).await?.at_ms;
     let base = Lake::open(&me.base, false, false, lake.node.clone()).await.with_context(|| format!("opening {}", me.base))?;
     let snap = snapshot(&base, &pin_key(&me.me), at).await?;
     let number = |k: &str| snap.get(k).and_then(|v| serde_json::from_slice::<u64>(v).ok()).unwrap_or(0);

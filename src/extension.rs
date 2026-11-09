@@ -273,7 +273,7 @@ fn key(name: &str) -> String { format!("xt/{name}") }
 /// through the store of the secret that covers it), checked, and kept under its hash, so any node can read it; then the record
 /// goes to the leader: under this node's lock when it leads, else sent to it, as `backup::statement` sends its attach.
 #[cfg(feature = "lake")]
-pub async fn fetch(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl) -> Result<serde_json::Value> {
+pub async fn fetch(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl, by: &str) -> Result<serde_json::Value> {
     let Ddl::FetchExtension { name, from, version } = d else { anyhow::bail!("only INSTALL … FROM is read on the node") };
     if cfg!(target_arch = "wasm32") {
         return Err(coded("0A000", format!("{name}: extensions in the page come after 1.0 (X3 in the plan)")));
@@ -281,12 +281,12 @@ pub async fn fetch(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl) -
     unsigned_allowed(&name)?;
     let max = crate::env::value::<u64>("PONDRA_EXTENSION_FILE_MB") * (1 << 20);
     let bytes = bytes_of(lake, &from, max).await?;
-    let record = keep(lake, &name, &from, version, bytes).await?;
+    let record = keep(lake, &name, &from, version, bytes, by).await?;
     let install = Ddl::InstallExtension { name, record };
     match lock {
         Some(lock) => {
             let _guard = lock.lock().await;
-            crate::ddl::apply(lake, install, &crate::auth::Principal::node().scope).await // (its record, kept by the node: nothing planned)
+            crate::ddl::apply(lake, install, &crate::auth::Principal::node()).await // (its record, kept by the node: nothing planned)
         }
         None => Box::pin(crate::write::send(&lake.url, Request::Ddl(install), &lake.node)).await,
     }
@@ -366,9 +366,9 @@ async fn bytes_of(lake: &Lake, from: &str, max: u64) -> Result<Vec<u8>> {
 /// `ext/<name>/<version>/<sha256>.wasm` (content-addressed: a file already there is kept already); then makes the record of
 /// them, its version and functions as the file says. A file that isn't WebAssembly is refused by its name, one that isn't a
 /// component Pondra can load saying why, a `VERSION` the file doesn't say by both versions, and a function whose name another
-/// function has by that name (`clash`).
+/// function has by that name (`clash`). `by`: who installs it, a name (none: the node's own, "admin").
 #[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
-pub async fn keep(lake: &Lake, name: &str, from: &str, version: Option<String>, bytes: Vec<u8>) -> Result<Installed> {
+pub async fn keep(lake: &Lake, name: &str, from: &str, version: Option<String>, bytes: Vec<u8>, by: &str) -> Result<Installed> {
     let file = file_of(from);
     if !bytes.starts_with(b"\0asm") {
         return Err(coded("22023", format!("{file} is not a WebAssembly file")));
@@ -398,7 +398,7 @@ pub async fn keep(lake: &Lake, name: &str, from: &str, version: Option<String>, 
         sha256,
         bytes: size,
         from: kept_from(from),
-        by: crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "admin".to_string()),
+        by: if by.is_empty() { "admin".to_string() } else { by.to_string() },
         at_ms: crate::log::now_ms(),
         functions,
     })
@@ -406,7 +406,7 @@ pub async fn keep(lake: &Lake, name: &str, from: &str, version: Option<String>, 
 
 /// A page has no host for an extension's part (X3 in the plan: after 1.0); `fetch` refuses before this.
 #[cfg(all(feature = "lake", target_arch = "wasm32"))]
-pub async fn keep(_: &Lake, name: &str, _: &str, _: Option<String>, _: Vec<u8>) -> Result<Installed> {
+pub async fn keep(_: &Lake, name: &str, _: &str, _: Option<String>, _: Vec<u8>, _: &str) -> Result<Installed> {
     Err(coded("0A000", format!("{name}: extensions in the page come after 1.0 (X3 in the plan)")))
 }
 
@@ -990,25 +990,25 @@ mod tests {
     async fn an_installed_extension_is_kept_until_uninstalled() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-extension-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
-        let e = keep(&lake, "words", "/data/words-0.1.txt", None, b"text".to_vec()).await.err().unwrap();
+        let e = keep(&lake, "words", "/data/words-0.1.txt", None, b"text".to_vec(), "").await.err().unwrap();
         assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("22023", "words-0.1.txt is not a WebAssembly file".to_string()));
-        let e = keep(&lake, "words", "/data/module.wasm", None, b"\0asm\x01\0\0\0".to_vec()).await.err().unwrap();
+        let e = keep(&lake, "words", "/data/module.wasm", None, b"\0asm\x01\0\0\0".to_vec(), "").await.err().unwrap();
         assert!(crate::codes::of(&e) == "22023" && format!("{e:#}").contains("not a WebAssembly component"), "{e:#}");
 
-        let first = keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec()).await?;
+        let first = keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec(), "").await?;
         assert_eq!((first.version.as_str(), first.bytes as usize), ("0.1", WORDS.len()), "the version is the file's own");
         assert_eq!(first.functions[0], Described { name: "word_count".into(), arguments: vec!["Utf8".into()], returns: "Int64".into(), volatile: false, columns: vec![] });
-        let e = keep(&lake, "words", "/data/words.wasm", Some("0.2".into()), WORDS.to_vec()).await.err().unwrap();
+        let e = keep(&lake, "words", "/data/words.wasm", Some("0.2".into()), WORDS.to_vec(), "").await.err().unwrap();
         assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("22023", "words.wasm is words 0.1, not 0.2".to_string()));
-        let again = keep(&lake, "words", "https://x.org/words.wasm", Some("0.1".into()), WORDS.to_vec()).await?;
+        let again = keep(&lake, "words", "https://x.org/words.wasm", Some("0.1".into()), WORDS.to_vec(), "").await?;
         assert_eq!(again.sha256, first.sha256, "the same bytes are kept once");
         let out = install(&lake, "words", first.clone()).await?;
         assert_eq!(out["sha256"], serde_json::json!(first.sha256));
         assert_eq!(install(&lake, "words", again).await?["unchanged"], true, "the same file is unchanged");
         let names: Vec<String> = listed(&lake).await?.into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, ["words"]);
-        assert!(keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec()).await.is_ok(), "installed again over itself: its own names");
-        let e = keep(&lake, "words2", "/data/words-0.1.wasm", None, WORDS.to_vec()).await.err().unwrap();
+        assert!(keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec(), "").await.is_ok(), "installed again over itself: its own names");
+        let e = keep(&lake, "words2", "/data/words-0.1.wasm", None, WORDS.to_vec(), "").await.err().unwrap();
         assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("42723", "words2's function word_count: the extension words has a function word_count already".to_string()));
         let upper = Described { name: "upper".into(), arguments: vec!["Utf8".into()], returns: "Utf8".into(), volatile: false, columns: vec![] };
         let e = clash(&lake, "mine", &[upper]).await.err().unwrap();
@@ -1058,7 +1058,7 @@ mod tests {
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         // (each node asks the switch as it loads a part, the node this test is included: `unsigned_allowed`)
         std::env::set_var("PONDRA_ALLOW_UNSIGNED_EXTENSIONS", "true");
-        let record = keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec()).await?;
+        let record = keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec(), "").await?;
         install(&lake, "words", record).await?;
         let run = |sql: &'static str| {
             let lake = &lake;

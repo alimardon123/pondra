@@ -169,7 +169,7 @@ async fn steps() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Steps 7 to 10, in order, on a node of their own (`run_transactions`): a transaction's statements over the node's tables.
+/// Steps 7 to 11, in order, on a node of their own (`run_transactions`): a transaction's statements over the node's tables.
 async fn transactions() {
     let dir = std::env::temp_dir().join(format!("pondra-page-node-tx-{}", std::process::id()));
     let (mut leader, url) = node_in(&dir).await;
@@ -233,6 +233,23 @@ async fn transactions() {
     let (status, _, body) = sql(&page, "SELECT id, name FROM named_orders ORDER BY id").await;
     assert_eq!((status, body.as_str()), (200, "id,name\n1,a\n2,b\n"), "step 10: the view answers from the lake: {body}");
     assert_eq!(asked.load(Ordering::SeqCst), 0, "step 10: no statement over the page's view was sent to the node");
+    page.close().await;
+
+    // 11. A temporary table the page makes is its session's for both its parts: the lake's words make it, and the node's part of a
+    // join over it, decided in the same session, sends its rows, so the join answers as the node's own does (both parts name the
+    // session as the page's principal: M8 piece 3d-2a). Another session id doesn't see it, nor does the node's own session of the
+    // same id, which is another sign-in's.
+    let mut page = Page::open_lake(&Options { node: Some(node_at(url.clone())), ..Default::default() }).await.expect("step 11: a page opens with its node");
+    for text in ["CREATE TEMP TABLE picks (id INT, name TEXT)", "INSERT INTO picks VALUES (1, 'a'), (3, 'c')"] {
+        let (status, _, body) = sql_in(&page, "step-eleven", text).await;
+        assert_eq!(status, 200, "step 11: {text}: {body}");
+    }
+    let (status, sqlstate, body) = sql_in(&page, "step-eleven", &joined("picks")).await;
+    assert_eq!((status, body.as_str()), (200, JOINED), "step 11: the node's part sees the session's temporary table and sends its rows: {body} ({sqlstate:?})");
+    let (status, _, body) = sql_in(&page, "step-eleven-other", "SELECT count(*) AS n FROM picks").await;
+    assert_ne!(status, 200, "step 11: another session doesn't see it: {body}");
+    let r = reqwest::Client::new().post(format!("{url}/sql?format=csv")).header("x-pondra-session", "step-eleven").body("SELECT count(*) AS n FROM picks").send().await.expect("the leader answers");
+    assert_ne!(r.status().as_u16(), 200, "step 11: the node's own session of the same id doesn't see it");
     page.close().await;
 
     leader.kill();
