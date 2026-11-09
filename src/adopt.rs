@@ -394,9 +394,13 @@ async fn take_out(lake: &Lake, table: &str, meta: &mut TableMeta, removed: &[Str
 /// made against the table as Pondra has it: ADR-029 §3.)
 pub async fn stale(lake: &Lake, table: &str) -> Result<bool> {
     let meta: TableMeta = lake.cat.get(&table_key(table)).await?.context("no table")?;
-    let waiting = crate::tier::backlog(lake, meta.tiered, None).await?;
     let deleted = crate::sys::deleted(table);
-    Ok(waiting.get(table).is_some_and(|n| *n > 0) || waiting.get(&deleted).is_some_and(|n| *n > 0) || (meta.changed && meta.purged() < meta.tiered))
+    // (each from its own mark: an idle table's stays where it was, `tier::expire`)
+    let dmark = lake.cat.get::<TableMeta>(&table_key(&deleted)).await?.map(|d| d.tiered);
+    let mark = |t: &str| Some(if t == table { meta.tiered } else if t == deleted { dmark.unwrap_or(meta.tiered) } else { u64::MAX });
+    let waiting = crate::tier::waiting(lake, meta.tiered.min(dmark.unwrap_or(meta.tiered)), None, mark).await?;
+    let changes = meta.changed && dmark.is_some_and(|d| meta.purged() < d); // (tombstones in files, not yet purged)
+    Ok(waiting.get(table).is_some_and(|n| *n > 0) || waiting.get(&deleted).is_some_and(|n| *n > 0) || changes)
 }
 
 /// Files that don't hold their rows' system columns, with the lineage that gives them: ids from
