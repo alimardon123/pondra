@@ -1869,11 +1869,10 @@ pub struct Lake {
     tail: Arc<Mutex<Tail>>, // decoded log rows
     kept: (Arc<Footers>, Arc<FileStatistics>), // DataFusion's caches of Parquet footers and of files' statistics (`rt`'s)
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
-    pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
     pub(crate) manifests: Arc<crate::manifest::Kept>, // its tables' manifests and lists, decompressed (`manifest::object`)
     pub(crate) format: crate::format::Held, // what this process holds of its format: made here, what `raise` saw (`format.rs`)
     pub(crate) log: crate::log::Kept, // what the log keeps for it between commits: producers to forget, a flush its leader didn't take (`log::Kept`)
-    states: crate::lake_state::States, // what engine and extension modules keep for it, by type (`state`): the tables' tails and the lookups' row groups (`query::Tails`, `serve::Groups`), the sequences' blocks (`seq::Blocks`), …
+    states: crate::lake_state::States, // what engine and extension modules keep for it, by type (`state`): the hot columns, the tables' tails and the lookups' row groups (`hot::Hot`, `query::Tails`, `serve::Groups`), the sequences' blocks (`seq::Blocks`), …
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
     cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
     pub ids: Ids, // the row ids this process stamps rows with (a block reserved from the leader)
@@ -2406,8 +2405,8 @@ impl Lake {
         let format = crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::frozen::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), kept, disk, hot: Arc::new(crate::hot::Hot::new(memory, node.machine.ram())), manifests: crate::manifest::kept(), format, log: Default::default(), states: Default::default(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), node });
-        lake.states.open(crate::registry::get()); // (the caches every query reads, charged next among the lake's own)
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), kept, disk, manifests: crate::manifest::kept(), format, log: Default::default(), states: Default::default(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), node });
+        lake.states.open(crate::registry::get(), &crate::lake_state::Opening { memory, ram: lake.node.machine.ram() }); // (the caches every query reads, charged next among the lake's own)
         for (name, cache) in lake.caches() {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
@@ -2522,12 +2521,12 @@ impl Lake {
                 }
                 (Some("t/"), disk) => {
                     let decoded = self.tail.lock().unwrap().rows.contains_key(&key[2..]);
-                    if !(decoded || disk.is_some() || self.hot.on()) {
+                    if !(decoded || disk.is_some() || self.states.keep_files()) {
                         continue;
                     }
                     let Ok(m) = serde_json::from_slice::<TableMeta>(value) else { continue };
                     self.tail.lock().unwrap().forget(&key[2..], m.tiered); // (rows now in files: no read asks for them again)
-                    self.hot.forget(&m.garbage);
+                    self.states.files_gone(&m.garbage); // (the hot columns' old files: `LakeState::files_gone`)
                     // (files a tiering round writes; not a bulk load's big files, which only the queries that need them read)
                     if let Some(disk) = disk {
                         m.files.into_iter().filter(|f| f.bytes <= 256 << 20 && !f.path.is_empty() && !f.path.starts_with("_base/")).for_each(|f| disk.fetch_later(f.path));
@@ -2668,8 +2667,7 @@ impl Lake {
     /// the log; then the bucket's byte ranges, fetched again. The log's decoded rows, the catalog's blocks and DataFusion's
     /// footers and statistics keep what they hold by rules of their own, and say what that is.
     pub fn caches(&self) -> Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> {
-        let mut caches: Vec<(&'static str, Arc<dyn crate::ledger::Charged>)> = vec![("hot", self.hot.clone())];
-        caches.extend(self.states.caches()); // (the lookups' row groups and the tables' tails, made as the lake opened: `lake_state::Registered::add_at_open`)
+        let mut caches = self.states.caches(); // (the hot columns, the lookups' row groups and the tables' tails, made as the lake opened: `lake_state::Registered::add_at_open`)
         caches.push(("manifests", self.manifests.clone()));
         if let Some(ranges) = &self.cached {
             caches.push(("ranges", ranges.clone())); // (a lake on a bucket: a local or in-memory one reads its store directly)
@@ -4503,7 +4501,7 @@ mod tests {
             std::fs::create_dir_all(&dir)?;
             let node = crate::node_state::NodeState::on(crate::lifecycle::unhosted(), Arc::new(Sized(ram)));
             let lake = Lake::open(dir.to_str().expect("a path"), true, false, node).await?;
-            sized.push(lake.hot.usage().1);
+            sized.push(lake.hot().usage().1);
             drop(lake);
             let _ = std::fs::remove_dir_all(&dir);
         }

@@ -257,7 +257,6 @@ store -> delta  1
 store -> engine  1
 store -> ext  2
 store -> finish  1
-store -> hot  2
 store -> in_task  1
 store -> locks  1
 store -> oom  2

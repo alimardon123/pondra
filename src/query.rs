@@ -347,7 +347,7 @@ pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
 /// Parquet files as one read: through the hot columns (`hot.rs`) when they're on, which read a
 /// file with a lineage or deleted rows as `files_once` does.
 async fn read_files(lake: &Lake, ctx: &SessionContext, files: Vec<&DataFile>, meta: &TableMeta, schema: &SchemaRef) -> Result<DataFrame> {
-    if !lake.hot.on() {
+    if !lake.hot().on() {
         return files_once(lake, ctx, &files, meta, schema).await;
     }
     Ok(ctx.read_table(Arc::new(hot_files(lake, files.into_iter().cloned().collect(), meta, schema, Default::default())))?)
@@ -911,7 +911,7 @@ impl TableProvider for Pruned {
             changed = self.lake.cat.get_raw(&crate::store::table_key(&crate::sys::deleted(&self.name))).await.map_err(e)?.is_some();
         }
         let all: Vec<usize> = (0..self.facts.schema.fields().len()).collect();
-        let plain = !changed && range.is_none() && self.meta.key.is_empty() && self.meta.ext.is_none() && self.lake.hot.on();
+        let plain = !changed && range.is_none() && self.meta.key.is_empty() && self.meta.ext.is_none() && self.lake.hot().on();
         let plan = match plain {
             true => {
                 let known = self.sized().1;

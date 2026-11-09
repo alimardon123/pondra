@@ -156,7 +156,7 @@ pub(crate) async fn replace(lake: &Lake, name: &str, staged: &str) -> Result<Val
     // After the commit each step is logged, not returned: the replace has happened.
     dropped.delete(lake).await;
     if let Some(m) = &old {
-        lake.hot.forget(&m.files.iter().map(|f| (f.path.clone(), f.bytes)).chain(m.garbage.iter().cloned()).collect::<Vec<_>>()); // (the old's columns held as its types: the new files share the folder)
+        lake.hot().forget(&m.files.iter().map(|f| (f.path.clone(), f.bytes)).chain(m.garbage.iter().cloned()).collect::<Vec<_>>()); // (the old's columns held as its types: the new files share the folder)
     }
     // The formats the new table publishes: their copies go out now. One left as it was (the round failed, or the new table can't be
     // published yet: a keyed table with several generations) still shows the old table's rows as `name`, and is taken out.

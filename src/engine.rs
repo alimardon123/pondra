@@ -148,7 +148,8 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: each says what its state holds, `LakeState::ABOUT`)
         {
             let states = r.section_mut::<crate::lake_state::Registered>();
-            states.add_at_open::<crate::serve::Groups>(); // (caches every query reads: made as the lake opens, charged in this order after its hot columns, `Lake::caches`)
+            states.add_at_open::<crate::hot::Hot>(); // (caches every query reads: made as the lake opens, and charged in this order, `Lake::caches`)
+            states.add_at_open::<crate::serve::Groups>();
             states.add_at_open::<std::sync::Mutex<crate::query::Tails>>();
             states.add::<crate::seq::Blocks>();
             states.add::<crate::pages::Pages>();
