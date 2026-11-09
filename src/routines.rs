@@ -427,7 +427,7 @@ pub async fn drop(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
         ensure!(if_exists, "no function or procedure {name}");
         return Ok(j!({"dropped": false}));
     };
-    lake.cat.commit(vec![], &[key(&name)]).await?;
+    lake.cat.commit(crate::undrop::aside(lake, r.kind_name(), &name, &[key(&name)]).await?, &[key(&name)]).await?; // (kept to be undropped)
     Ok(j!({r.what(): name, "dropped": true}))
 }
 
@@ -494,9 +494,10 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
         let moment = one.strip_prefix("SELECT ").and_then(|m| m.strip_suffix(" AS __moment")).context("a RESTORE's moment")?;
         return Ok(format!("{head}{moment}"));
     }
+    crate::dialect_stmts::hint_refused(sql)?; // (MySQL's `/*! … */`: binding prints the text back without it, 11-07 audit M2)
     let sql = &crate::sparksql::inline(sql)?; // (a parameter of Spark SQL's is in its text: bound once it is Pondra's)
     let sql = &crate::past_names::syntax(sql); // (`t AT (VERSION => $v)`)
-    let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
+    let mut stmts = crate::parsed::read(sql)?; // (as the front reads it: `[x * $k FOR x IN l]`, `LAMBDA x: x * $k`)
     let values = params.iter().map(|(k, v)| Ok((k.clone(), literal(v)?))).collect::<Result<HashMap<_, _>>>()?;
     let bound = |p: &str| numbered || p.trim_start_matches('$').starts_with(|c: char| c.is_alphabetic() || c == '_');
     named_as_written(&mut stmts, |e| {
@@ -610,7 +611,6 @@ fn quote(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
 /// The current session's search path is written in first (`path.rs`), so every door, a task's body
 /// and a spread query see full names. Stored SQL is read with `expand_stored` instead.
 pub async fn expand(lake: &Lake, sql: &str, scope: &Scope) -> Result<String> {
-    crate::dialect_stmts::hint_refused(sql)?; // (MySQL's `/*! … */`, before the path prints the text back without it: 11-07 audit M2)
     let sql = crate::path::door(lake, sql, &std::collections::HashSet::new()).await?;
     Ok(crate::path::currents(lake, &crate::front::expand(&crate::host::Asking::of(lake, scope), &sql, &HashMap::new()).await?)) // (a macro's `current_*`: its caller's, as `prepare`)
 }
@@ -1471,6 +1471,23 @@ mod tests {
         let refused = |sql: &str| args("f", &call(sql)).err().map(|e| e.to_string()).unwrap_or_default();
         assert!(refused("f(day => 1, 2)").contains("by position come before those by name"));
         assert!(refused("f(day => 1, DAY => 2)").contains("day given twice"));
+    }
+
+    /// The binder reads a text as the front reads it (`parsed::read`), so a `$name` inside DuckDB's forms that only the
+    /// fallback dialect reads is bound (11-08 audit M3), and a text with MySQL's `/*! … */` is refused where binding would
+    /// print it back without the comment (11-08 audit M1).
+    #[test]
+    fn the_binder_reads_what_the_front_reads() {
+        let k = HashMap::from([("k".to_string(), serde_json::json!(2))]);
+        for (sql, reads) in [
+            ("SELECT [x * $k FOR x IN l] AS v FROM t", "SELECT array_transform((l), x -> (x * (2))) AS v FROM t"),
+            ("SELECT list_transform(l, LAMBDA x: x * $k) AS v FROM t", "SELECT list_transform(l, x -> x * (2)) AS v FROM t"), // (a value bound in parentheses, as `literal` writes it)
+        ] {
+            let bound = bind(sql, &k).unwrap();
+            assert_eq!(crate::parsed::generic(&bound), crate::parsed::generic(reads), "{sql} bound as {bound}");
+        }
+        let e = bind("SELECT /*! 1 + */ $k AS x", &k).unwrap_err();
+        assert_eq!(crate::codes::of(&e), "0A000", "{e:#}");
     }
 
     #[test]

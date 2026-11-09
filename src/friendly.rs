@@ -246,6 +246,10 @@ fn lambda_words(p: &mut Parser) -> Option<Result<Expr, datafusion::sql::sqlparse
     if !matches!(&p.peek_token_ref().token, Token::Word(w) if w.keyword == Keyword::LAMBDA) {
         return None;
     }
+    let before_lambda = match p.index() {
+        0 => Token::EOF,
+        _ => p.get_current_token().token.clone(), // (the token read last: `(` or `,` before a function's argument)
+    };
     let mut params = match p.maybe_parse(|p| {
         p.expect_keyword_is(Keyword::LAMBDA)?;
         let params = p.parse_comma_separated(|p| p.parse_identifier())?;
@@ -261,32 +265,32 @@ fn lambda_words(p: &mut Parser) -> Option<Result<Expr, datafusion::sql::sqlparse
         _ => Expr::Tuple(params.into_iter().map(Expr::Identifier).collect()),
     };
     let arrow = GenericDialect {}.prec_value(Precedence::PgOther);
-    Some(p.parse_subexpr(arrow).map(|body| Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::Arrow, right: Box::new(body) }))
+    Some(p.parse_subexpr(arrow).map(|body| {
+        let lambda = Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::Arrow, right: Box::new(body) };
+        // (outside a function's argument the arrow is grouped, so the tree prints as itself, as `text_kept` keeps it:
+        // `a + (x -> x)` and `x -> (y -> x + y)`, where `a + x -> x` would read `(a + x) -> x`)
+        match matches!(before_lambda, Token::LParen | Token::Comma) {
+            true => lambda,
+            false => Expr::Nested(Box::new(lambda)),
+        }
+    }))
 }
 
 /// A list comprehension, `[expr FOR x IN list IF cond]`, read by the fallback dialect (`dialect.rs`) as
 /// `array_transform(array_filter(list, x -> (cond)), x -> (expr))` (`array_transform((list), x -> (expr))` without IF):
 /// the tree GenericDialect reads that text to, so the tree passes and the engine take it as they took the text.
-/// None when the bracket is not one: the dialect reads it as an array.
+/// None when the bracket is not one (`comprehends`): the dialect reads it as an array.
 fn comprehension(p: &mut Parser) -> Option<Result<Expr, datafusion::sql::sqlparser::parser::ParserError>> {
     use datafusion::sql::sqlparser::parser::ParserError;
-    if p.peek_token_ref().token != Token::LBracket {
+    if p.peek_token_ref().token != Token::LBracket || !comprehends(p) {
         return None;
     }
-    // (a comprehension from its FOR on: up to it, an array's first element as well)
-    let body = match p.maybe_parse(|p| {
-        p.expect_token(&Token::LBracket)?;
-        let body = p.parse_expr()?;
-        p.expect_keyword_is(Keyword::FOR)?;
-        Ok(body)
-    }) {
-        Ok(Some(body)) => body,
-        Ok(None) => return None,
-        Err(e) => return Some(Err(e)),
-    };
     // (said where the name should be, as sqlparser says where it stopped)
     let one_name = |at| ParserError::ParserError(format!("a list comprehension takes one name: [… FOR x IN list]{at}"));
     let read = |p: &mut Parser| -> Result<Expr, ParserError> {
+        p.expect_token(&Token::LBracket)?;
+        let body = p.parse_expr()?;
+        p.expect_keyword_is(Keyword::FOR)?;
         let at = p.peek_token_ref().span.start;
         let var = match p.parse_identifier() {
             Ok(v) if v.quote_style.is_none() && v.value.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && v.value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => v,
@@ -303,8 +307,8 @@ fn comprehension(p: &mut Parser) -> Option<Result<Expr, datafusion::sql::sqlpars
         p.expect_token(&Token::RBracket)?;
         let var = Expr::Identifier(var);
         Ok(match cond {
-            Some(cond) => templated("array_transform(array_filter($_1, $_2 -> ($_3)), $_2 -> ($_4))", &[list, var, cond, body.clone()]),
-            None => templated("array_transform(($_1), $_2 -> ($_3))", &[list, var, body.clone()]),
+            Some(cond) => templated("array_transform(array_filter($_1, $_2 -> ($_3)), $_2 -> ($_4))", &[list, var, cond, body]),
+            None => templated("array_transform(($_1), $_2 -> ($_3))", &[list, var, body]),
         })
     };
     Some(read(p))
@@ -482,6 +486,33 @@ fn reorder(d: &dyn Dialect, pivot: bool, toks: &[TokenWithSpan], end: Location) 
         Token::EOF => Ok(statement),
         _ => read.expected_ref("the end of the statement", read.peek_token_ref()),
     }
+}
+
+/// Whether the bracket at `p` is a comprehension: of `,`, `]` and FOR, the first it holds outside the brackets, braces and
+/// parentheses within it is FOR. An array's element holds no FOR there (sqlparser reads one only inside parentheses, as
+/// `substring(s FROM 1 FOR 2)`), so a bracket is read once, as one or the other: reading its first element, finding no
+/// FOR and reading it again as an array doubled the time at each bracket it was nested in (`SELECT [[[…1]]] +`). One
+/// look over its first element, where `p` stays.
+fn comprehends(p: &mut Parser) -> bool {
+    let mut is = false;
+    let _ = p.try_parse(|p| {
+        let mut depth = 0usize;
+        loop {
+            match &p.next_token().token {
+                Token::LBracket | Token::LParen | Token::LBrace => depth += 1,
+                Token::RBracket | Token::RParen | Token::RBrace if depth > 1 => depth -= 1,
+                Token::Word(w) if depth == 1 && w.keyword == Keyword::FOR => {
+                    is = true;
+                    break;
+                }
+                Token::Comma if depth == 1 => break,
+                Token::RBracket | Token::RParen | Token::RBrace | Token::SemiColon | Token::EOF => break,
+                _ => {}
+            }
+        }
+        Err::<(), _>(ParserError::ParserError(String::new())) // (so `try_parse` puts `p` back where it was)
+    });
+    is
 }
 
 /// `template`, read by GenericDialect, with each `$_n` the nth of `parts`, as it stands (`expander::around` groups them).

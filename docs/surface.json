@@ -1348,7 +1348,10 @@
    "dropped_at Timestamp(\u00b5s, \"UTC\")",
    "kept_until Timestamp(\u00b5s, \"UTC\")",
    "rows_in_files Int64",
-   "bytes_in_files Int64"
+   "bytes_in_files Int64",
+   "kind Utf8",
+   "dropped_by Utf8",
+   "undrop Utf8"
   ],
   "pondra.expectations": [
    "view Utf8",

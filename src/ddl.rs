@@ -259,6 +259,7 @@ pub enum Ddl {
     // (made_by: only the table that job made, a failed CREATE TABLE … AS undoing itself; any other table under the name is left)
     DropTable { name: String, if_exists: bool, #[serde(default)] purge: bool, #[serde(default, skip_serializing_if = "Option::is_none")] made_by: Option<String> }, // (PURGE: not kept to be undropped)
     Undrop { name: String },                                                   // UNDROP TABLE (ADR-043)
+    UndropKept { kind: String, name: String },                                 // UNDROP VIEW, FUNCTION, TASK, …: a kept definition (`undrop.rs`)
     Clone { name: String, from: String },                                      // CREATE TABLE c CLONE t: t's files, none copied (ADR-043)
     CreateView { name: String, sql: String, replace: bool, #[serde(default)] facts: Option<Vec<crate::constraints::Constraint>>, #[serde(default, skip_serializing_if = "Option::is_none")] text: Option<String> }, // (None: as before, or kept through OR REPLACE: `facts.rs`; `text`: its query as written, `authored.rs`)
     CreateExternal { name: String, sql: String, replace: bool, if_not_exists: bool }, // DataFusion's CREATE EXTERNAL TABLE: a view of files (`ext::external`)
@@ -373,6 +374,7 @@ fn in_another<'a>(lake: &Lake, d: &'a Ddl) -> Option<(&'static str, &'a str)> {
     let (what, name) = match d {
         Ddl::DropTable { name, .. } => ("DROP TABLE", name),
         Ddl::Undrop { name } => ("UNDROP TABLE", name),
+        Ddl::UndropKept { name, .. } => ("UNDROP", name),
         Ddl::Clone { name, .. } => ("CREATE TABLE … CLONE", name),
         Ddl::CreateView { name, .. } => ("CREATE VIEW", name),
         Ddl::CreateExternal { name, .. } => ("CREATE EXTERNAL TABLE", name),
@@ -418,6 +420,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
     let d = match d {
         Ddl::DropTable { name, if_exists, purge, made_by } => Ddl::DropTable { name: here(name), if_exists, purge, made_by },
         Ddl::Undrop { name } => Ddl::Undrop { name: here(name) },
+        Ddl::UndropKept { kind, name } => Ddl::UndropKept { name: here(name), kind },
         Ddl::Clone { name, from } => Ddl::Clone { name: here(name), from: here(from) },
         Ddl::CreateView { name, sql, replace, facts, text } => Ddl::CreateView { name: here(name), sql, replace, facts, text },
         Ddl::CreateExternal { name, sql, replace, if_not_exists } => Ddl::CreateExternal { name: here(name), sql, replace, if_not_exists },
@@ -524,6 +527,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
         }
         Ddl::DropTable { name, if_exists, purge, made_by } => drop_table(lake, &name, if_exists, purge, made_by.as_deref()).await,
         Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?).await,
+        Ddl::UndropKept { kind, name } => crate::undrop::undrop(lake, &kind, &crate::undrop::named(lake, &kind, &name).await?).await,
         Ddl::Clone { name, from } => clone(lake, &new_name(lake, &name).await?, &from).await,
         Ddl::CreateView { name, sql, replace, facts, text } => create_view(lake, &name, sql, replace, false, facts, text, scope).await,
         Ddl::CreateExternal { name, sql, replace, if_not_exists } => {
@@ -1088,7 +1092,11 @@ pub(crate) async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: 
         }
     }
     if lake.cat.get::<StoredView>(&query_key(name)).await?.is_some_and(|v| v.external) {
-        lake.cat.commit(vec![], &[query_key(name)]).await?; // (CREATE EXTERNAL TABLE's: its files stay)
+        let kept = match purge {
+            true => vec![],
+            false => crate::undrop::aside(lake, "external table", name, &[query_key(name)]).await?,
+        };
+        lake.cat.commit(kept, &[query_key(name)]).await?; // (CREATE EXTERNAL TABLE's: its files stay)
         return Ok(j!({"table": name, "dropped": true}));
     }
     let Some(meta) = lake.cat.get::<TableMeta>(&table_key(name)).await? else {
@@ -1174,7 +1182,7 @@ pub(crate) async fn set_aside(lake: &Lake, name: &str, meta: &TableMeta, kept: b
         let at_ms = crate::log::now_ms();
         let keep_ms = meta.retention_secs.map_or(KEEP_MS, |s| s * 1000);
         let deleted = lake.cat.get::<TableMeta>(&table_key(&crate::sys::deleted(name))).await?;
-        puts.push((format!("dt/{name}/{at_ms:020}"), json(&Dropped { at_ms, keep_ms, meta: meta.clone(), deleted })));
+        puts.push((format!("dt/{name}/{at_ms:020}"), json(&Dropped { at_ms, keep_ms, meta: meta.clone(), deleted, by: crate::auth::name() })));
     }
     let (unshared, from) = crate::shares::tables_moved(lake, &[(name, None)]).await?; // (UNDROP doesn't share it again)
     puts.extend(unshared);
@@ -1202,6 +1210,9 @@ pub struct Dropped {
     pub meta: TableMeta,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted: Option<TableMeta>, // (its changed rows' old versions: `{t}$deleted`)
+    /// Who dropped it (`auth::name`; empty: a release before 2026-11-08 kept it).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub by: String,
 }
 
 /// Every dropped table still kept: (its name, what was kept), oldest first for each name.
@@ -1229,6 +1240,9 @@ async fn undrop(lake: &Lake, name: &str) -> Result<Value> {
     }
     let mut kept: Vec<(String, Dropped)> = lake.cat.scan::<Dropped>(&format!("dt/{name}/"), &format!("dt/{name}0")).await?;
     let Some((key, d)) = kept.pop() else {
+        if crate::undrop::has(lake, "external table", name).await? {
+            return crate::undrop::undrop(lake, "external table", name).await; // (DROP TABLE drops one too)
+        }
         return Err(crate::codes::coded("42P01", format!("no dropped table {name} is kept (pondra.dropped lists those that are)")));
     };
     let at = lake.visible();
@@ -2141,9 +2155,10 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
         crate::log::forget_producers(offsets.into_iter().map(|k| k[2..].to_string())); // (its offsets: made again, it starts over)
         return Ok(left_shares(j!({"view": name, "dropped": true}), from));
     }
-    if lake.cat.get::<StoredView>(&query_key(name)).await?.is_some() {
+    if let Some(v) = lake.cat.get::<StoredView>(&query_key(name)).await? {
         made_from(lake, name, "drop").await?;
-        lake.cat.commit(vec![], &[query_key(name)]).await?;
+        let kept = crate::undrop::aside(lake, if v.external { "external table" } else { "view" }, name, &[query_key(name)]).await?;
+        lake.cat.commit(kept, &[query_key(name)]).await?;
         return Ok(j!({"view": name, "dropped": true}));
     }
     let (shown, open) = (name, crate::once::open(name));

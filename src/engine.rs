@@ -113,9 +113,12 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add::<crate::ext::Stores>();
             states.add::<crate::ext::Tokens>();
             states.add::<crate::spmd::Shuffles>();
+            states.add::<crate::history::History>();
+            states.add::<crate::history::Writers>();
+            states.add::<crate::query::FactsKept>();
         }
         #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)
-        for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,
+        for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::undrop::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,
                   crate::runs::PREFIXES, crate::tasks::PREFIXES, crate::users::PREFIXES, crate::views::PREFIXES] {
             r.section_mut::<crate::records::Prefixes>().add(p);
         }
