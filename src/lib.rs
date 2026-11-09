@@ -39,6 +39,9 @@ pub mod in_task;
 #[cfg(feature = "lake")] pub mod page; // (a page is a member on the core's lake, one per module)
 pub mod request_body;
 pub mod text;
+// A statement's words as its reader takes them (`words.rs`).
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its readers are the lake's)
+mod words;
 // The memory ledger: the one byte-bounded cache every bounded cache of the node uses (`ByteLru`).
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its caches are the lake's)
 mod ledger;
@@ -284,7 +287,7 @@ mod rules;
 /// floors below never name one. The node's own settings come first, so an extension's may build on them. A session gets
 /// their function sets in this order, each seeing the ones before it, and
 /// where two name one function the later one's stays: Spark's first, so Pondra's own and Postgres's stay where Spark
-/// has the name too; MATCH_RECOGNIZE's after the ones its DEFINEs may call.
+/// has the name too; MATCH_RECOGNIZE's after the ones its DEFINEs may call. The semantic layer's adds `AS MEASURE`.
 /// A vital task's panic (`spawns::spawn`) stops the node with its host's stop (`node::stop`). The base's spawns name no
 /// host, so the crate's root joins the two, as it joins the registry to the extensions (`built_in`).
 #[cfg(feature = "lake")]
@@ -309,6 +312,7 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &engine::ENGINE,
         &pg_functions::POSTGRES,
         &matcher::MATCH_RECOGNIZE,
+        &measures::SEMANTIC,
         #[cfg(feature = "lake")]
         &ai::AI,
         #[cfg(feature = "lake")]
