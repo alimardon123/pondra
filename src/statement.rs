@@ -186,8 +186,8 @@ pub struct SqlParams {
 /// Is this request from whoever started the node here (the shell's or `local()`'s `PONDRA_OWNER_KEY`, a
 /// library's host's key: the node's `Auth::owned_by`)? Then its SQL may read files on this machine, as
 /// `pondra sql` may (invariant 21: nobody else's).
-pub(crate) fn owner(auth: &crate::auth::Auth, headers: &http::HeaderMap) -> bool {
-    crate::auth::lent(crate::auth::Credential::of_headers(headers).token()).is_some_and(|l| l.1) // (a Python procedure the owner called)
+pub(crate) fn owner(home: &crate::store::Lake, auth: &crate::auth::Auth, headers: &http::HeaderMap) -> bool {
+    crate::auth::lent(home, crate::auth::Credential::of_headers(headers).token()).is_some_and(|l| l.1) // (a Python procedure the owner called)
         || headers.get("x-pondra-owner").and_then(|h| h.to_str().ok()).is_some_and(|h| auth.is_owner(h))
 }
 
@@ -198,7 +198,7 @@ pub const HELD_SESSION: (&str, &str) = ("x-pondra-session", "held");
 /// A statement the node stopped for memory fails its session's transaction, as an error does (`txn::failed`): the session is
 /// found as `sql` finds it, for the caller that asked. Each door that stops one calls it (HTTP's `guard`, a page's `lake_sql`).
 pub fn failed_for_memory(who: crate::auth::Principal, headers: &http::HeaderMap, lake: &crate::store::Lake) {
-    let session = crate::auth::WHO.sync_scope(who, || crate::temp::of(headers)).ok().flatten();
+    let session = crate::auth::WHO.sync_scope(who, || crate::temp::of(lake, headers)).ok().flatten();
     if let Some(s) = session {
         crate::temp::SESSION.sync_scope(crate::temp::named(lake, Some(s)), || crate::txn::failed(crate::oom::OOM));
     }
@@ -261,9 +261,9 @@ pub(crate) async fn scoped<F: std::future::Future>(session: Option<crate::temp::
 /// One `/sql` request (its query, its headers, its body), for `role`, planned for `scope` (its principal's), with every
 /// step a `/sql` takes around `statement::run` (the session, the owner's files, …): server.rs's `sql`, moved.
 pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, scope: crate::rights::Scope, headers: http::HeaderMap, body: Bytes) -> Said {
-    let files = owner(&app.auth, &headers); // (the program that started this node: its files, and URLs no secret covers)
+    let files = owner(&app.lake, &app.auth, &headers); // (the program that started this node: its files, and URLs no secret covers)
     let node = app.lake.node.clone(); // (its rest, run on after the answer is handed over, is still in flight: `panics::work`)
-    let session = match crate::temp::of(&headers) { // (its temporary tables: `temp.rs`)
+    let session = match crate::temp::of(&app.lake, &headers) { // (its temporary tables: `temp.rs`)
         Ok(session) => session,
         Err(e) => return Said { reply: Err(e), heard: vec![], session: None }, // (a session name that isn't one: refused, saying what one is)
     };
@@ -273,7 +273,7 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, scope: crate::
         Some("postgres") => true,
         Some(other) => return Said { reply: Err(crate::codes::coded("22023", format!("catalog={other}: the catalog a request may ask for is postgres (Postgres's, as the Postgres port answers it)"))), heard: vec![], session: None },
     };
-    let vars = crate::auth::lent_vars(crate::auth::Credential::of_headers(&headers).token()); // (Python code a run lent a connection to: the run's variables)
+    let vars = crate::auth::lent_vars(&app.lake, crate::auth::Credential::of_headers(&headers).token()); // (Python code a run lent a connection to: the run's variables)
     let (hand, mut handed) = tokio::sync::oneshot::channel(); // (the door's end of an answer in pieces: `query::Pieces`)
     let statement = crate::query::PIECES.scope(crate::query::Pieces::new(hand), sql_as(app, p, role, scope, headers, body));
     // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
@@ -305,9 +305,9 @@ async fn sql_as(app: App, p: SqlParams, role: crate::auth::Role, scope: crate::r
     let kind = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
     let req = crate::routines::Request::read(kind, &body)?;
     // (a Python procedure's own calls, through the token lent to it; anyone else's is a first call)
-    let lent = crate::auth::lent(crate::auth::Credential::of_headers(&headers).token()).is_some();
+    let lent = crate::auth::lent(&app.lake, crate::auth::Credential::of_headers(&headers).token()).is_some();
     let depth = headers.get("x-pondra-depth").filter(|_| lent).and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0);
-    let who = Who { role, files: owner(&app.auth, &headers), depth, scope };
+    let who = Who { role, files: owner(&app.lake, &app.auth, &headers), depth, scope };
     let how = How { job: p.job.as_deref(), spread: p.spread.as_deref(), after: p.after, stale: p.stale_ms.map(Duration::from_millis) };
     Ok(match crate::statement::run(&app, req, how, who, &HttpWire(&p, &app.lake)).await? {
         Answer::Kept(body) => Reply::Rendered(Rendered::Whole(body)),

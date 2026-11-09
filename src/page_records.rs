@@ -220,14 +220,14 @@ pub(crate) async fn flush(app: &App) {
 
 /// Why a sign-in may not send a page's lines to this node, if it may not: only a superuser's own sign-in does. Not the nodes' key
 /// or a token of the nodes', a user granted some rights, or a procedure's lent token.
-pub fn refusal(who: &Principal, token: Option<&str>) -> Option<&'static str> {
+pub fn refusal(home: &Lake, who: &Principal, token: Option<&str>) -> Option<&'static str> {
     if who.operator {
         return Some("the nodes' own key and their tokens send no page's lines: a joined page sends its own sign-in's");
     }
     if !who.superuser() {
         return Some("a joined page's lines are sent by a superuser's sign-in only");
     }
-    if crate::auth::lent(token).is_some() {
+    if crate::auth::lent(home, token).is_some() {
         return Some("a procedure's lent token sends no page's lines");
     }
     None
@@ -431,14 +431,19 @@ mod tests {
         assert_eq!(page.role, Role::Admin);
     }
 
-    #[test]
-    fn only_a_superusers_own_sign_in_sends_a_page_lines() {
+    #[tokio::test]
+    async fn only_a_superusers_own_sign_in_sends_a_page_lines() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-refusal-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let boss = Principal { name: "boss".into(), ..Principal::of(Role::Admin) };
-        assert_eq!(refusal(&boss, None), None);
-        assert!(refusal(&Principal::token(Role::Admin), None).is_some(), "the nodes' key or a token of the nodes'");
-        assert!(refusal(&Principal { name: "rd".into(), ..Principal::of(Role::Read) }, None).is_some(), "a reader");
+        assert_eq!(refusal(&lake, &boss, None), None);
+        assert!(refusal(&lake, &Principal::token(Role::Admin), None).is_some(), "the nodes' key or a token of the nodes'");
+        assert!(refusal(&lake, &Principal { name: "rd".into(), ..Principal::of(Role::Read) }, None).is_some(), "a reader");
         let granted = Principal { name: "bob".into(), scope: crate::rights::Scope::granted(Default::default()), ..Principal::of(Role::Admin) };
-        assert!(refusal(&granted, None).is_some(), "a sign-in with grants is not a superuser's");
+        assert!(refusal(&lake, &granted, None).is_some(), "a sign-in with grants is not a superuser's");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]

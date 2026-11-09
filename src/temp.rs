@@ -48,12 +48,12 @@ pub async fn stored<T>(f: impl std::future::Future<Output = T>) -> T { STORED.sc
 /// The session a request names (`x-pondra-session`), or that of the caller whose procedure sent it. A name
 /// that isn't 8 to 128 letters, digits, - or _ is refused and says so: it is never ignored, which would leave
 /// the request in no session at all.
-pub fn of(headers: &http::HeaderMap) -> anyhow::Result<Option<String>> {
+pub fn of(home: &crate::store::Lake, headers: &http::HeaderMap) -> anyhow::Result<Option<String>> {
     let named = match headers.get("x-pondra-session") {
         None => None,
         Some(v) => Some(name(v)?),
     };
-    Ok(crate::auth::lent_session(crate::auth::Credential::of_headers(headers).token()).or(named.map(|n| id(&n)))) // (a procedure's own client names one: its caller's wins)
+    Ok(crate::auth::lent_session(home, crate::auth::Credential::of_headers(headers).token()).or(named.map(|n| id(&n)))) // (a procedure's own client names one: its caller's wins)
 }
 
 /// A session name `x-pondra-session` carries (see `of`): the name, or the reason it is refused (22023).
@@ -140,10 +140,16 @@ pub struct Sessions {
     changes: tokio::sync::watch::Sender<u64>,
     /// Its sessions' transactions (`txn::Book`).
     pub(crate) book: Mutex<crate::txn::Book>,
+    /// Its sessions' cursors, by session and name (`cursors.rs`): their answers are held within one budget, the node's.
+    pub(crate) cursors: Mutex<HashMap<String, HashMap<String, crate::cursors::Cursor>>>,
+    /// The leases its procedures' code was lent, by token (`auth::lend`): a token is good at this node alone.
+    pub(crate) leases: Mutex<HashMap<String, crate::auth::Lent>>,
 }
 
 impl Default for Sessions {
-    fn default() -> Self { Sessions { all: Default::default(), changes: tokio::sync::watch::channel(0).0, book: Default::default() } }
+    fn default() -> Self {
+        Sessions { all: Default::default(), changes: tokio::sync::watch::channel(0).0, book: Default::default(), cursors: Default::default(), leases: Default::default() }
+    }
 }
 
 impl crate::lake_state::LakeState for Sessions {
@@ -240,7 +246,7 @@ impl Sessions {
     /// End a session: its temporary tables and views are gone, and its Python (`python::ask_session`).
     pub fn end(&self, session: &str) -> bool {
         crate::txn::end(self, session); // (its transaction, if open: rolled back)
-        crate::cursors::end(session); // (its cursors go with it: `cursors.rs`)
+        crate::cursors::end(self, session); // (its cursors go with it: `cursors.rs`)
         let python = crate::python::end_session(session); // (its Python's variables too)
         let gone = self.all.lock().unwrap().remove(session).is_some() || python;
         if gone {

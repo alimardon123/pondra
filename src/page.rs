@@ -558,9 +558,9 @@ impl Page {
         }
         let credential = crate::auth::Credential::of_header(request_header(headers, "authorization")); // (`auth::Credential`)
         let token = credential.token();
-        let session = crate::temp::of(&header_map(headers))?;
+        let session = crate::temp::of(&paged.app.lake, &header_map(headers))?;
         let format_query = format.map(|f| format!("format={f}")).unwrap_or_default();
-        let lent = crate::auth::lent_vars(token);
+        let lent = crate::auth::lent_vars(&paged.app.lake, token);
         let who = lake_principal(); // (as the page's requests run: `lake_sql`)
         match joined {
             true => crate::statement::scoped(crate::temp::named(&paged.app.lake, session), lent, Box::pin(joined_part(&paged.app.lake, sql, format_query, paged.superuser(), &who.scope))).await,
