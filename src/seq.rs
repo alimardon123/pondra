@@ -530,7 +530,8 @@ async fn set(lake: &Lake, name: &str, value: i64, called: bool) -> Result<i64> {
 /// A sequence moves for a writer only (11-09 audit H1): a token of role Write or more, a superuser, or a user who may
 /// INSERT or UPDATE a table that takes values from it (`takers`), and UPDATE one for `setval` (`set`), which can make
 /// later rows take values already taken, as Postgres asks UPDATE on the sequence for it. A user granted only SELECT, a
-/// read token, and work that lost its caller never move one; the node's own work does (`auth::as_node`).
+/// read token, and work that lost its caller never move one; the node's own work does (`auth::as_node`). Nor does any
+/// caller at a door that reads only (`auth::reading`), whoever it is.
 async fn may_move(lake: &Lake, name: &str, s: &Sequence, set: bool) -> Result<()> {
     use crate::rights::{Action, Object};
     let call = if set { "setval" } else { "nextval" };
@@ -540,6 +541,10 @@ async fn may_move(lake: &Lake, name: &str, s: &Sequence, set: bool) -> Result<()
         None if crate::auth::node_work() => return Ok(()),
         None => return Err(refused("a writer's, and no one asks")),
     };
+    if p.reads {
+        // (Postgres's words, as a read-only transaction says them: a door that reads only writes nothing, a sequence's move neither)
+        return Err(crate::codes::coded("25006", format!("cannot execute {call}() in a read-only transaction: this door reads only, and {call} moves sequence {name}")));
+    }
     if p.scope.whole() {
         return match p.role >= crate::auth::Role::Write {
             true => Ok(()),
@@ -676,5 +681,37 @@ impl AsyncScalarUDFImpl for Counter {
             out.push(crate::temp::SESSION.scope(session.clone(), set(&self.lake, &object_of(names.value(i)), values.as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(i), called)).await.map_err(err)?);
         }
         Ok(ColumnarValue::Array(Arc::new(Int64Array::from(out))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::auth::{Principal, Role, WHO};
+
+    /// A door that reads only (`auth::reading`) moves no sequence, for whoever asks there, the operator's token too, and
+    /// wherever its caller goes: into work spawned for it (`auth::carried`), as a view's query runs. The same caller moves
+    /// it at any other door, and the node's own work moves it at every one (11-09 audit H1). The harness's `listings`
+    /// reads a view that calls `nextval` through each door.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_door_that_reads_only_moves_no_sequence() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-reads-{}", uuid::Uuid::new_v4()));
+        let lake = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let s = super::Sequence { declared: vec![], last: 0, called: false, version: 0, owned: None };
+        let moves = |set: bool| {
+            let (lake, s) = (lake.clone(), s.clone());
+            async move { super::may_move(&lake, "s", &s, set).await }
+        };
+        let read_only = |r: anyhow::Result<()>, call: &str| r.is_err_and(|e| format!("{e:#}").contains(&format!("cannot execute {call}() in a read-only transaction")));
+        let admin = Principal::token(Role::Admin).at("test", None);
+        for (set, call) in [(false, "nextval"), (true, "setval")] {
+            WHO.scope(admin.clone(), moves(set)).await?;
+            crate::auth::as_node(moves(set)).await?;
+            assert!(read_only(WHO.scope(admin.clone(), crate::auth::reading(moves(set))).await, call), "{call} at a door that reads only");
+            let spawned = WHO.scope(admin.clone(), crate::auth::reading(async { tokio::spawn(crate::auth::carried(moves(set))).await })).await?;
+            assert!(read_only(spawned, call), "{call} in work spawned at a door that reads only");
+        }
+        assert!(WHO.scope(admin.clone(), crate::auth::reading(async { crate::auth::current().is_some_and(|p| p.reads) })).await, "reading marks its caller");
+        assert!(crate::auth::reading(async { crate::auth::current().is_none() }).await, "and makes no caller of none");
+        Ok(())
     }
 }
