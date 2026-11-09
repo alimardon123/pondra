@@ -10,7 +10,7 @@
 //!   reads the old rows as `t`;
 //! - a staged table a node left behind is let go once older than `PONDRA_STAGED_SECS` (`drop_stale_staged`).
 
-use crate::ddl::{drop_table, folder_users, keeps, left_shares, mark, move_entry, no_followers, publishes_alone, query_key, set_aside, still, table_only, StoredView};
+use crate::ddl::{drop_table, keeps, left_shares, mark, move_entry, no_followers, publishes_alone, query_key, set_aside, still, table_only, StoredView};
 use crate::store::{table_key, Lake, TableMeta};
 use crate::write::{create_spec, made_by_job, undo_made, Stmt};
 use anyhow::{ensure, Result};
@@ -116,7 +116,7 @@ pub(crate) async fn replace(lake: &Lake, name: &str, staged: &str) -> Result<Val
     let folder = new.folder(staged).to_string();
     let same_place = match &old {
         Some(m) => folder == m.folder(name),
-        None => !folder_users(lake).await?.get(&folder).is_some_and(|users| users.iter().any(|(user, _)| user != staged)), // (live or kept)
+        None => !crate::ddl::folder_used(lake, &folder).await?.iter().any(|(user, _)| user != staged), // (live or kept)
     };
     ensure!(same_place, "{name} changed while its statement ran: run it again");
     if !new.publish.is_empty() {
