@@ -15,19 +15,11 @@ use datafusion::common::ScalarValue;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::{Accumulator, AggregateUDF, AggregateUDFImpl, Signature, Volatility};
 use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, parser::Parser};
-use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-/// How a view's answers come from its table's merged rows: `sql` reads them as `__partial`, and
-/// answers `columns` (what listings, `pg_catalog` and MCP show of the view: `TableMeta::described`).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Finish {
-    pub sql: String,
-    #[serde(default)]
-    pub columns: Vec<(String, String)>,
-}
+pub use crate::table_record::Finish;
 
 /// The table every finished view's answers are read from.
 pub const PARTIAL: &str = "__partial";

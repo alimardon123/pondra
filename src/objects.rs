@@ -1074,7 +1074,7 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str, scope: &Scope) -> Result<V
     ensure!(checks == old.checks, "{table}'s CHECK constraints can't change yet");
     let constraints: Vec<crate::constraints::Constraint> = serde_json::from_value(s["constraints"].clone()).unwrap_or_default();
     ensure!(constraints == old.constraints, "{table}'s UNIQUE, PRIMARY KEY and FOREIGN KEY constraints change with ALTER TABLE {table} ADD | DROP CONSTRAINT");
-    let enums: BTreeMap<String, crate::types::Enum> = serde_json::from_value(s["enums"].clone()).unwrap_or_default();
+    let enums: BTreeMap<String, crate::table_record::Enum> = serde_json::from_value(s["enums"].clone()).unwrap_or_default();
     if let Some((c, _)) = was.iter().find(|(c, _)| enums.get(c) != old.col(c).and_then(|h| h.labels.as_ref())) {
         bail!("{table}.{c}: a column's enum can't change here (a type takes a new label with ALTER TYPE … ADD VALUE)");
     }

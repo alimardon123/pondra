@@ -1511,7 +1511,7 @@ mod tests {
     /// for the rest.
     #[test]
     fn kept_ms_is_by_kind_and_job() {
-        let (named, retry) = (crate::copy::retention_ms(), retry_ms());
+        let (named, retry) = (crate::store::retention_ms(), retry_ms());
         assert_eq!(retry, 2 * crate::locks::lease().as_secs().max(60) * 1000, "twice the lease, at least a minute");
         assert!(auto_job().starts_with("auto-"));
         assert_eq!(kept_ms(&format!("sql:{}", auto_job()), 0), retry, "a client's own id (log::auto_job)");
@@ -1660,7 +1660,7 @@ mod tests {
         let mut s = Seq::start(&lake, 0).await?;
         s.send(0, &[("kafka:z", 1)]).await;
         assert_eq!(expiry(&lake, retry_ms(), "sql:auto-py-a-1").await, Some(1), "a retry-window mark, due its window from the pass");
-        assert_eq!(expiry(&lake, crate::copy::retention_ms(), "sql:nightly").await, Some(3), "a named job's mark, due the named window");
+        assert_eq!(expiry(&lake, crate::store::retention_ms(), "sql:nightly").await, Some(3), "a named job's mark, due the named window");
         assert_eq!(expiry(&lake, retry_ms(), "kafka:k").await, None, "kept for good: no key");
         assert_eq!(lake.cat.get::<serde_json::Value>(OLD_MARKS).await?, Some(serde_json::json!("Done")), "the pass is finished");
         s.send(1, &[("kafka:z", 2)]).await;

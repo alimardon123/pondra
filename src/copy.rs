@@ -273,14 +273,9 @@ pub enum Source {
 /// The options `COPY INTO` takes: the reader's own (`read_*`'s names) and FORCE.
 const LOAD_KNOWN: &[&str] = &["format", "header", "delim", "sep", "delimiter", "quote", "escape", "comment", "new_line", "all_varchar", "compression", "force"];
 
-/// How long a file's load record is kept, and so how old a file may be and still be loaded again
-/// without FORCE: a file last changed before this window is skipped, as its record may be gone
-/// (Snowflake's 64 days of load metadata). `PONDRA_LOAD_RETENTION_SECS` shortens it, for tests; it is
-/// read once.
-pub(crate) fn retention_ms() -> u64 {
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| crate::env::secs("PONDRA_LOAD_RETENTION_SECS").as_millis() as u64)
-}
+/// How long a file's load record is kept (a named job's mark, `store::retention_ms`), and so how old a file may be and
+/// still be loaded again without FORCE: a file last changed before this window is skipped, as its record may be gone.
+pub(crate) use crate::store::retention_ms;
 
 /// A file loaded into a table, as its job names it (`load:` and this JSON). The folder, not the
 /// table's name, so that renames, swaps and UNDROP keep the loads with the rows they made; `run` is

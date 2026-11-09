@@ -5,7 +5,7 @@
 //! moment it is durable, and they lay those changes over their own (slightly behind) view of the
 //! catalog: every node sees a commit within milliseconds, while the bucket stays the source of truth.
 use anyhow::{bail, Context, Result};
-use crate::{finish::Finish, seq::Identity, types::Enum}; // (catalog uses engine: counted once each, tools/layers.py)
+use crate::table_record::{Enum, Finish, Identity};
 use bytes::Bytes;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -1480,7 +1480,7 @@ pub fn kept_ms(producer: &str, now: u64) -> u64 {
 /// - any other `auto-…` id: the clients' own ids (`log::auto_job`, an older client's `auto-{producer}-{n}`, and the
 ///   Python client's `producer=`, which is the user's own name, so an `auto-` name a user picks lands here too): the
 ///   retry window, whatever follows the prefix;
-/// - any other job: a name a client chose, which is kept for the named window (`copy::retention_ms`).
+/// - any other job: a name a client chose, which is kept for the named window (`retention_ms`).
 fn job_kept(job: &str, now: u64) -> u64 {
     if let Some(until_s) = client_until(job) {
         let left = until_s.saturating_mul(1000).saturating_sub(now);
@@ -1489,7 +1489,14 @@ fn job_kept(job: &str, now: u64) -> u64 {
     if job.starts_with("auto-") {
         return retry_ms();
     }
-    crate::copy::retention_ms()
+    retention_ms()
+}
+
+/// How long a named job's mark is kept (`job_kept`), and so a file's load record (`copy::Load`, whose job is named):
+/// Snowflake's 64 days of load metadata. `PONDRA_LOAD_RETENTION_SECS` shortens it, for tests; it is read once.
+pub fn retention_ms() -> u64 {
+    static NAMED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NAMED.get_or_init(|| crate::env::secs("PONDRA_LOAD_RETENTION_SECS").as_millis() as u64)
 }
 
 /// The most a mark is kept for its client's deadline (`job_kept`): a day.
