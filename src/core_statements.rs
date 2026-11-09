@@ -58,6 +58,14 @@ static ENTRIES: &[Statement] = &[
     entry(&["CREATE", "TOKEN"], crate::users::read, "a token a user signs in with"),
     entry(&["ALTER", "TOKEN"], crate::users::read, "a token, read as DROP TOKEN is"),
     entry(&["DROP", "TOKEN"], crate::users::read, "drops a token"),
+    entry(&["CREATE", "SEQUENCE"], crate::seq::read, "a sequence: numbers in order, nextval('s') (Postgres's)"),
+    entry(&["CREATE", "OR", "REPLACE", "SEQUENCE"], crate::seq::read, "a sequence, in place of one of its name"),
+    entry(&["CREATE", "TEMP", "SEQUENCE"], crate::seq::read, "refused: a sequence is the lake's"),
+    entry(&["CREATE", "TEMPORARY", "SEQUENCE"], crate::seq::read, "refused: a sequence is the lake's"),
+    entry(&["CREATE", "OR", "REPLACE", "TEMP", "SEQUENCE"], crate::seq::read, "refused: a sequence is the lake's"),
+    entry(&["CREATE", "OR", "REPLACE", "TEMPORARY", "SEQUENCE"], crate::seq::read, "refused: a sequence is the lake's"),
+    entry(&["ALTER", "SEQUENCE"], crate::seq::read, "a sequence's options, its next value (RESTART) or its name"),
+    entry(&["DROP", "SEQUENCE"], crate::seq::read, "drops sequences"),
 ];
 
 /// A reader's own words for a form written wrong, after what it found: what a statement of the form is.
@@ -288,7 +296,7 @@ mod tests {
     #[test]
     fn the_core_entries_on_stand_ins_are_counted() {
         let s = crate::registry::get().section::<Statements>();
-        assert_eq!((ENTRIES.len(), s.stand_ins()), (31, 43), "the core's 31, the sharing extension's 8 and the identity providers' 4");
+        assert_eq!((ENTRIES.len(), s.stand_ins()), (39, 51), "the core's 39, the sharing extension's 8 and the identity providers' 4");
     }
 
     /// A lake on disk is named after its folder (`pondra-ab12`), and ALTER DATABASE, CLONE, BACKUP and RESTORE take the

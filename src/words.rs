@@ -50,6 +50,7 @@ impl Words {
                 Token::Eq => W::Sym('='),
                 Token::RArrow => W::Sym('⇒'), // (`=>`)
                 Token::Minus => W::Sym('-'),
+                Token::Plus => W::Sym('+'),
                 Token::SemiColon => continue,
                 _ => W::Sym('?'),
             });
@@ -186,6 +187,31 @@ impl Words {
             }
         }
         true
+    }
+    /// The words still to take as they are written, upper-cased, one a word: a number's sign joined to it (`-5`, `+5`), a
+    /// quoted name and a string in their quotes. For a reader of a list of options word by word (`seq::read`).
+    pub(crate) fn rest_upper(&mut self) -> Vec<String> {
+        let mut out: Vec<String> = vec![];
+        let mut signed = false;
+        while let Some(t) = self.next() {
+            let word = match t {
+                W::Word(w, false) => w.to_uppercase(),
+                W::Word(w, true) => format!("\"{}\"", w.replace('"', "\"\"")).to_uppercase(),
+                W::Str(s) => format!("'{}'", s.replace('\'', "''")).to_uppercase(),
+                W::Num(n) if signed => {
+                    signed = false;
+                    if let Some(last) = out.last_mut() {
+                        last.push_str(&n);
+                    }
+                    continue;
+                }
+                W::Num(n) => n,
+                W::Sym(c) => c.to_string(),
+            };
+            signed = word == "-" || word == "+";
+            out.push(word);
+        }
+        out
     }
     pub(crate) fn done(&self) -> Result<()> { if self.0.is_empty() { Ok(()) } else { bail!("unexpected words {}", self.near()) } }
 }

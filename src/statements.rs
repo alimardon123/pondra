@@ -137,7 +137,7 @@ pub const CORE: &str = "core";
 /// The leading words of the statements the core reads outside this section today (`write::parse`'s readers and its
 /// match on sqlparser's tree), after a CREATE's `OR REPLACE`, `OR ALTER`, `TEMP` or `TEMPORARY`: an extension's entry
 /// may not begin with one, so no extension takes a core statement over with longer words. Each goes as its whole family
-/// becomes a core entry (PR 8b-8d), which the same check covers (`ALTER DATABASE`, USER, ROLE, TOKEN, SHARE, RECIPIENT and IDENTITY PROVIDER have).
+/// becomes a core entry (PR 8b-8d), which the same check covers (`ALTER DATABASE`, USER, ROLE, TOKEN, SHARE, RECIPIENT, IDENTITY PROVIDER and SEQUENCE have).
 const CORE_WORDS: &[&[&str]] = &[
     &["SELECT"], &["WITH"], &["VALUES"], &["TABLE"], &["FROM"], &["INSERT"], &["UPDATE"], &["DELETE"], &["MERGE"], &["TRUNCATE"],
     &["GRANT"], &["REVOKE"], &["COMMENT"], &["COPY"], &["ATTACH"], &["DETACH"], &["UNDROP"], &["BACKUP"], &["RESTORE"],
@@ -146,12 +146,12 @@ const CORE_WORDS: &[&[&str]] = &[
     &["CREATE", "TABLE"], &["CREATE", "EXTERNAL"], &["CREATE", "VIEW"], &["CREATE", "MATERIALIZED"], &["CREATE", "SCHEMA"],
     &["CREATE", "DATABASE"], &["CREATE", "FUNCTION"], &["CREATE", "PROCEDURE"], &["CREATE", "MACRO"], &["CREATE", "TASK"],
     &["CREATE", "PIPELINE"], &["CREATE", "SECRET"], &["CREATE", "PERSISTENT"],
-    &["CREATE", "SEQUENCE"], &["CREATE", "INDEX"], &["CREATE", "UNIQUE"], &["CREATE", "TYPE"],
+    &["CREATE", "INDEX"], &["CREATE", "UNIQUE"], &["CREATE", "TYPE"],
     &["ALTER", "TABLE"], &["ALTER", "VIEW"], &["ALTER", "MATERIALIZED"], &["ALTER", "SCHEMA"],
-    &["ALTER", "TASK"], &["ALTER", "SEQUENCE"], &["ALTER", "INDEX"], &["ALTER", "TYPE"],
+    &["ALTER", "TASK"], &["ALTER", "INDEX"], &["ALTER", "TYPE"],
     &["DROP", "TABLE"], &["DROP", "VIEW"], &["DROP", "MATERIALIZED"], &["DROP", "SCHEMA"], &["DROP", "DATABASE"],
     &["DROP", "FUNCTION"], &["DROP", "PROCEDURE"], &["DROP", "MACRO"], &["DROP", "TASK"],
-    &["DROP", "SECRET"], &["DROP", "PERSISTENT"], &["DROP", "TEMPORARY"], &["DROP", "SEQUENCE"], &["DROP", "INDEX"],
+    &["DROP", "SECRET"], &["DROP", "PERSISTENT"], &["DROP", "TEMPORARY"], &["DROP", "INDEX"],
     &["DROP", "TYPE"],
 ];
 

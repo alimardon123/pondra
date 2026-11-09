@@ -549,8 +549,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(s) = kinds.then(|| crate::objects::statement(sql)).flatten() {
         return Some(s); // (COMMENT ON, CREATE OR ALTER TABLE | VIEW: the registry's)
     }
-    if let Some(s) = kinds.then(|| crate::seq::statement(sql)).flatten() {
-        return Some(s); // (CREATE, ALTER, DROP SEQUENCE)
+    #[cfg(test)]
+    if let Some(s) = kinds.then(|| was::seq(sql)).flatten() {
+        return Some(s); // (CREATE, ALTER, DROP SEQUENCE: the statements section's entries)
     }
     if let Some(s) = kinds.then(|| crate::index::statement(sql)).flatten() {
         return Some(s); // (CREATE, ALTER, DROP INDEX)
@@ -2800,6 +2801,9 @@ pub(crate) mod was {
     /// Row 6, `sso::statement`, where `parse` read it.
     pub(super) fn sso(sql: &str) -> Option<Stmt> { old().then(|| crate::sso::statement(sql)).flatten() }
 
+    /// `seq::statement`, where `parse` read it.
+    pub(super) fn seq(sql: &str) -> Option<Stmt> { old().then(|| crate::seq::statement(sql)).flatten() }
+
     /// Row 4, where `parse` read it.
     pub(super) fn no_replace(sql: &str) -> Option<Stmt> {
         if !old() {
@@ -2997,6 +3001,10 @@ pub(crate) mod was {
             "CREATE OR REPLACE SHARE s", "create or replace recipient r", "CREATE IDENTITY PROVIDER p (ISSUER 'https://x', CLIENT_ID 'c')",
             "CREATE OR REPLACE IDENTITY PROVIDER p (ISSUER 'https://x')", "ALTER IDENTITY PROVIDER p (LABEL 'x')", "DROP IDENTITY PROVIDER IF EXISTS p",
             "DROP IDENTITY PROVIDER",
+            "CREATE SEQUENCE s", "CREATE SEQUENCE IF NOT EXISTS s.q START WITH -5 INCREMENT BY -1 MINVALUE -100 MAXVALUE -1", "create or replace sequence \"S\" as smallint cycle",
+            "CREATE OR REPLACE SEQUENCE IF NOT EXISTS s", "CREATE TEMP SEQUENCE s", "CREATE SEQUENCE s START x", "CREATE SEQUENCE s OWNED BY t.c", "CREATE SEQUENCE s MINVALUE 10 MAXVALUE 1",
+            "ALTER SEQUENCE s RESTART", "ALTER SEQUENCE IF EXISTS s RESTART WITH 7 INCREMENT 2", "ALTER SEQUENCE s RENAME TO t", "ALTER SEQUENCE s", "ALTER SEQUENCE s RENAME TO t u",
+            "DROP SEQUENCE s", "DROP SEQUENCE IF EXISTS a, b.c CASCADE", "DROP SEQUENCE", "drop sequence s;",
         ] {
             assert_eq!(shown(&super::parse(sql)), shown(&was(sql)), "{sql}");
             assert!(crate::statements::moved(sql), "{sql}: an entry's");
