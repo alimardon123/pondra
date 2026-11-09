@@ -1443,7 +1443,7 @@ pub async fn who_at(lake: &Lake, auth: &crate::auth::Auth, credential: &crate::a
         return sign_in(lake, auth, user, password).await;
     }
     if let Some(token) = credential.token() {
-        if let Some(p) = auth.lent_principal(token) {
+        if let Some(p) = auth.lent_principal(lake, token) {
             return Some(p);
         }
         let role = auth.token_role(token);

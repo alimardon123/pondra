@@ -58,7 +58,7 @@ pub fn router(app: App) -> Router {
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
         .route("/live", get(crate::live::live).post(crate::live::live))
-        .route("/sessions/{id}", axum::routing::delete(|Path(id): Path<String>, who: Option<axum::Extension<crate::auth::Principal>>| async move { Json(j!({"ended": crate::temp::end(&crate::temp::id(&who.map(|w| w.0.name).unwrap_or_default(), &id))})) }))
+        .route("/sessions/{id}", axum::routing::delete(|State(app): State<App>, Path(id): Path<String>, who: Option<axum::Extension<crate::auth::Principal>>| async move { Json(j!({"ended": crate::temp::sessions(&app.lake).is_some_and(|at| at.end(&crate::temp::id(&who.map(|w| w.0.name).unwrap_or_default(), &id)))})) }))
         .route("/sessions/{id}/python", get(session_python).delete(session_python).post(session_python))
         .route("/python", get(list_pythons).put(choose_python))
         .route("/python/format", post(format_python))
@@ -339,7 +339,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let mut open = false; // (a node with no tokens and no users: anyone who reaches it is its admin and one of its nodes)
     let who = match signed {
         Some(p) => p,
-        None if crate::statement::owner(&app.auth, req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
+        None if crate::statement::owner(&app.lake, &app.auth, req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
         None if starting && needed == crate::auth::Role::None => crate::auth::Principal::of(crate::auth::Role::None), // (a probe while it catches up: answered, never held)
         // (still catching up after 10 s: its catalog may lack its leader's users, so nobody it can't sign in is let in as an
         // open node's caller: asked again in a moment, as a table it doesn't hold yet is, `Lake::table_meta_if`)
@@ -415,7 +415,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     // (a stopped statement fails its session's transaction: who asked, and the headers `temp::of` reads the session from)
     let asked = stoppable.then(|| (who.clone(), req.headers().clone()));
     // (a Python procedure of an apply calls back with its lent token: those calls are the apply's, as its statements are)
-    let applying = crate::auth::lent_applying(token);
+    let applying = crate::auth::lent_applying(&app.lake, token);
     let shows_code = who.scope.shows_code(); // (an error's full words, or the words without its quoted lines: `told_to`)
     let run = crate::auth::WHO.scope(who, next.run(req));
     let run = async move {
@@ -428,7 +428,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         Ok(r) => told_to(shows_code, r),
         Err(m) => {
             if let (true, Some((who, headers))) = (m == crate::oom::OOM, asked) {
-                crate::statement::failed_for_memory(who, &headers); // (the node stopped the statement: its transaction fails, as an error's does)
+                crate::statement::failed_for_memory(who, &headers, &app.lake); // (the node stopped the statement: its transaction fails, as an error's does)
             }
             E(anyhow::anyhow!(m)).into_response() // (and the node stays up)
         }
@@ -676,7 +676,7 @@ async fn records(State(app): State<App>, headers: axum::http::HeaderMap, who: Op
     let credential = crate::auth::Credential::of_headers(&headers);
     let token = credential.token();
     let Some(axum::Extension(who)) = who else { return (StatusCode::FORBIDDEN, "a joined page's lines need a sign-in").into_response() };
-    if let Some(why) = crate::page_records::refusal(&who, token) {
+    if let Some(why) = crate::page_records::refusal(&app.lake, &who, token) {
         return (StatusCode::FORBIDDEN, why).into_response();
     }
     if batch.lines.len() > crate::page_records::BATCH_LINES {
@@ -1179,22 +1179,23 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
 async fn sql(State(app): State<App>, Query(p): Query<crate::statement::SqlParams>, role: axum::Extension<crate::auth::Role>, who: axum::Extension<crate::auth::Principal>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let format = p.format.clone(); // (an answer handed to the door in pieces is sent in this format)
     let node = app.lake.node.clone(); // (an answer in pieces is in flight until its last piece is read: `pieces`)
+    let sessions = crate::temp::sessions(&app.lake); // (the node's: whether the session holds anything here, `held_session`)
     let said = crate::statement::sql(app, p, role.0, who.0, headers, body).await;
     let mut r = match said.reply {
         Ok(crate::statement::Reply::Rendered(r)) => respond(r, format.as_deref(), &node),
         Ok(crate::statement::Reply::Done(v)) => Json(v).into_response(),
         Err(e) => E::from(e).into_response(),
     };
-    r = held_session(r, said.session.as_deref());
+    r = held_session(r, said.session.as_deref(), sessions.as_deref());
     if let Some(h) = crate::statement::notices(&said.heard).and_then(|t| axum::http::HeaderValue::from_str(&t).ok()) {
         r.headers_mut().insert("x-pondra-notices", h);
     }
     r
 }
 
-/// The header that keeps a client to this node while its session holds temporary tables (`temp::holds`).
-fn held_session(mut r: Response, session: Option<&str>) -> Response {
-    if session.is_some_and(crate::temp::holds) {
+/// The header that keeps a client to this node while its session holds temporary tables (`temp::Sessions::holds`).
+fn held_session(mut r: Response, session: Option<&str>, at: Option<&crate::temp::Sessions>) -> Response {
+    if session.is_some_and(|s| at.is_some_and(|at| at.holds(s))) {
         let (name, value) = crate::statement::HELD_SESSION;
         r.headers_mut().insert(name, axum::http::HeaderValue::from_static(value)); // (a client keeps to this node meanwhile)
     }
@@ -1207,11 +1208,11 @@ fn held_session(mut r: Response, session: Option<&str>) -> Response {
 async fn secret(State(app): State<App>, Path(name): Path<String>, headers: axum::http::HeaderMap) -> Result<Json<Value>, E> {
     let credential = crate::auth::Credential::of_headers(&headers);
     let token = credential.token();
-    if crate::auth::lent(token).is_none() {
+    if crate::auth::lent(&app.lake, token).is_none() {
         return Err(E(crate::codes::coded("42501", "only a procedure's code reads a secret: pondra.secret(name), in a Python procedure")));
     }
     let values = crate::ext::reveal(&app.lake, &name.to_lowercase()).await?;
-    crate::auth::revealed(token, values.iter().filter(|(k, _)| *k != "type" && *k != "scope").map(|(_, v)| v.clone()));
+    crate::auth::revealed(&app.lake, token, values.iter().filter(|(k, _)| *k != "type" && *k != "scope").map(|(_, v)| v.clone()));
     Ok(Json(j!(values)))
 }
 
@@ -1227,7 +1228,7 @@ async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extensi
         Some("capture") => Verb::Capture,
         _ => Verb::Apply,
     };
-    let who = crate::routines::Who::signed(who.0, role.0, crate::statement::owner(&app.auth, &headers));
+    let who = crate::routines::Who::signed(who.0, role.0, crate::statement::owner(&app.lake, &app.auth, &headers));
     Ok(Json(crate::apply::ask(&app, verb, ask, who).await?))
 }
 
@@ -1367,7 +1368,7 @@ async fn stats(State(app): State<App>, who: Option<axum::Extension<crate::auth::
                     "hwm": *app.lake.hwm.borrow(), "shard_runs": app.lake.state::<crate::tasks::Kept>().map_or(0, |k| k.shard_runs.load(std::sync::atomic::Ordering::Relaxed)), "python_workers": crate::python::workers(),
                     "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
     s["version"] = j!(crate::format::VERSION);
-    s["owner"] = j!(crate::statement::owner(&app.auth, &headers)); // (asked with its key: is this the node the asker started? `local()` on a port another node holds)
+    s["owner"] = j!(crate::statement::owner(&app.lake, &app.auth, &headers)); // (asked with its key: is this the node the asker started? `local()` on a port another node holds)
     s["format"] = j!(crate::format::of(&app.lake.cat).await.map(|f| f.format).unwrap_or_default()); // (the lake's: ADR-039)
     s["keys"] = j!(crate::users::kept(&app.lake).await); // (the lake's own keys: sealed by its master key, or in the clear)
     // Background jobs that failed, by kind: a rising count is a stall (tiering, publishing, …) that
