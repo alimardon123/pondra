@@ -50,7 +50,13 @@ as Delta keeps a table's old files (a day, Snowflake's, until 2026-11-08). `'0 s
   views and routines, each kept in its own. It is kept as long as the longest kept of them, and
   never less than 7 days. `UNDROP SCHEMA s` brings the schema back, then each of them still kept,
   tables first; its answer names any that couldn't come back. Until then `UNDROP TABLE s.t` waits
-  for its schema. Materialized views, databases and files come next.
+  for its schema.
+- A materialized view is kept as the statement that makes it again, with its comment. `UNDROP
+  MATERIALIZED VIEW v` runs it, so its rows are worked out again from its sources as they are then
+  (rows written while it was dropped are counted), and it follows new writes from there. The UNDROP
+  answers once the view is filled, as its CREATE does. Keeping its old rows and its place in its
+  sources instead would leave it behind them by what it missed. Only a DROP keeps one: a view
+  replaced by CREATE OR REPLACE isn't kept, nor is a view a topic feeds. Databases and files come next.
 
 **3. `t AT (VERSION => n | TIMESTAMP => t | OFFSET => -s)` reads an append table as it was**
 (`past.rs`). It needs no history in the catalog, because the rows carry it. The table as of `n` is:

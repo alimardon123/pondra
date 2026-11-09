@@ -3231,7 +3231,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    may read a relation of its name, any other kind to the whole. `dk/` is no page's and no branch's. A schema's drop,
    CASCADE too, keeps the schema in one record naming what went with it (`Kept::with`: its tables, views and routines,
    each in its own record), kept as long as the longest kept of them; `UNDROP SCHEMA` brings it back, then each of them
-   still kept, tables first, and its answer names any that isn't (`left`). `cargo test --lib undrop::`
+   still kept (tables, then routines, then what reads them), and its answer names any that isn't (`left`). A
+   materialized view is kept as the statement that makes it again (`Kept::made`, `objects::materialized_sql`): UNDROP
+   runs it for the asker, so its rows are its sources' as they are then, and it follows new writes from there. Its
+   UNDROP (its schema's too) answers once it is filled, as its CREATE does (`ddl::settle`). Only a DROP keeps one: a view
+   replaced, or one refused as it was made, isn't kept (`drop_view`'s `keep`), nor is a topic's view. `cargo test --lib undrop::`
 
 ```bash
 cargo build --release
