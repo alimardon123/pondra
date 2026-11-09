@@ -12136,19 +12136,35 @@ def row_filters():
         and wrote["after keyed"] == [{"id": 1, "region": "eu", "v": 1}, {"id": 2, "region": "us", "v": 0}] \
         and wrote["grants"] == [{"privilege": "DELETE", "on_name": "w", "rows": "v > 5"}, {"privilege": "UPDATE", "on_name": "w", "rows": "region = 'eu'"},
                                 {"privilege": "UPDATE", "on_name": "wk", "rows": "region = 'eu'"}]
+    # A writer's filter on INSERT's rows (piece 5c-2): each row it inserts must meet it, or the INSERT is refused and writes
+    # nothing (VALUES, a SELECT, a MERGE's insert, in a transaction too); a load's rows aren't checked, so it is refused
+    assert "ERROR" not in str(as_(boss, "GRANT INSERT ON w TO dee WHERE region = 'eu'"))
+    d = pg("dee", "dee-password-1")
+    inserted = {"values": n_of(as_(dee, "INSERT INTO w VALUES (5, 'eu', 1)")), "outside": as_(dee, "INSERT INTO w VALUES (6, 'us', 1)"),
+                "one outside": as_(dee, "INSERT INTO w SELECT 7, 'eu', 1 UNION ALL SELECT 8, 'us', 1"),
+                "select": n_of(as_(dee, "INSERT INTO w SELECT value + 10, 'eu', 0 FROM range(3)")),
+                "merge": as_(dee, "MERGE INTO w USING (SELECT 20 AS id) AS s ON w.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, 'us', 0)"),
+                "begun": [pg_said(d, "BEGIN"), pg_said(d, "INSERT INTO w VALUES (30, 'us', 0)"), pg_said(d, "ROLLBACK")],
+                "load": copied("w", "40\tus\t0\n", "dee"), "after": ids(as_(boss, "SELECT id FROM w ORDER BY id"))}
+    d.close()
+    refusal = "new row violates the filter on w's rows of your INSERT grant"
+    checks["a writer's INSERT writes rows its INSERT filter holds only: one outside refuses it (42501), writing nothing"] = \
+        inserted["values"] == 1 and inserted["select"] == 3 and all(inserted[k].startswith("ERROR 403") and refusal in inserted[k] for k in ("outside", "one outside", "merge")) \
+        and "42501" in inserted["begun"][1] and refusal in inserted["begun"][1] and "42501" in inserted["load"] and "with SQL's INSERT" in inserted["load"] \
+        and inserted["after"] == [1, 3, 5, 10, 11, 12]
     # Refused, saying why
     b = pg("boss", "boss-password-1")
     refused = {
         "view": pg_said(b, "GRANT SELECT ON orders_v TO ann WHERE region = 'eu'"),
         "schema": pg_said(b, "GRANT SELECT ON ALL TABLES TO ann WHERE region = 'eu'"),
-        "insert": pg_said(b, "GRANT INSERT ON orders TO ann WHERE region = 'eu'"),
+        "role": pg_said(b, "GRANT staff TO ann WHERE region = 'eu'"),
         "column": pg_said(b, "GRANT SELECT ON orders TO ann WHERE salary > 3"),
         "policy": pg_said(b, "CREATE POLICY mine ON orders FOR SELECT TO ann USING (owner = current_user)"),
         "rls": pg_said(b, "ALTER TABLE orders ENABLE ROW LEVEL SECURITY"),
     }
-    checks["a filter on a view, on every table, for INSERT, or on a column not there: refused, saying why"] = \
+    checks["a filter on a view, on every table, on a role, or on a column not there: refused, saying why"] = \
         refused["view"].startswith("ERROR 0A000") and "is a view" in refused["view"] and refused["schema"].startswith("ERROR 0A000") and "a table's" in refused["schema"] \
-        and refused["insert"].startswith("ERROR 0A000") and "SELECT's" in refused["insert"] and refused["column"].startswith("ERROR 42703") and "no column salary" in refused["column"]
+        and refused["role"].startswith("ERROR 0A000") and "a table's" in refused["role"] and refused["column"].startswith("ERROR 42703") and "no column salary" in refused["column"]
     checks["...Postgres's CREATE POLICY and ROW LEVEL SECURITY: refused, naming GRANT … WHERE"] = all(
         r.startswith("ERROR 0A000") and "GRANT SELECT ON t TO r WHERE" in r for r in [refused["policy"], refused["rls"]])
     # Under a search path: the grant's table is the path's, and its current_user still whoever reads
@@ -12158,7 +12174,7 @@ def row_filters():
     checks["under a search path a grant's table is the path's, and its current_user is whoever reads, not whoever grants"] = \
         placed["bob"] == [2] and placed["grants"] == [{"on_name": "crm.orders", "rows": "owner = current_user"}]
     b.close()
-    info = {"said": said, "pg": [before, widened, narrowed, counted], "keyed": keyed, "wrote": wrote, "refused": refused, "pathed": pathed, "placed": placed}
+    info = {"said": said, "pg": [before, widened, narrowed, counted], "keyed": keyed, "wrote": wrote, "inserted": inserted, "refused": refused, "pathed": pathed, "placed": placed}
     a.kill()
     ok = all(v is True for v in checks.values())
     print(json.dumps({"row_filters": checks, "ok": ok, "info": info}, indent=1, default=str))

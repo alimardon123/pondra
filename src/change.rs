@@ -616,8 +616,8 @@ async fn inserted(lake: &Lake, table: &str, stored: &std::sync::Arc<TableMeta>, 
 ///
 /// A writer a grant's filter on the table's rows holds changes only rows it holds (step 6 piece 5c): UPDATE's (or DELETE's)
 /// rows are read with SELECT's filter and that privilege's together (`Scope::writing`), a MERGE's clause's with its action's,
-/// so a row the filter doesn't hold is left as it is; and each new version must meet UPDATE's filter, or the change is
-/// refused (`row_filter::holds`: Postgres's WITH CHECK, which is its policy's USING when it has none).
+/// so a row the filter doesn't hold is left as it is; and each new version must meet UPDATE's filter, and each row a MERGE
+/// inserts INSERT's, or the change is refused (`row_filter::holds`: Postgres's WITH CHECK, its policy's USING when it has none).
 pub async fn rows_of(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, stmt: &crate::write::Stmt, upto: u64, scope: &crate::rights::Scope) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
     let (old, new) = match stmt {
         crate::write::Stmt::Update(_, set, cond) => {
@@ -628,8 +628,11 @@ pub async fn rows_of(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<cra
         crate::write::Stmt::Merge(m) => merge(lake, table, meta, rules, m, upto, scope).await?,
         _ => bail!("not an UPDATE, DELETE or MERGE"),
     };
-    if let Some(f) = scope.rows("update", table) {
-        crate::row_filter::holds(&lake.session_with(1), table, &new, &f, "UPDATE").await?; // (its new versions: rows a MERGE inserts carry no id)
+    // (its new versions: UPDATE's; the rows a MERGE inserts, which carry no id: INSERT's)
+    for privilege in ["update", "insert"] {
+        if let Some(f) = scope.rows(privilege, table) {
+            crate::row_filter::holds(&lake.session_with(1), table, &new, &f, &privilege.to_uppercase()).await?;
+        }
     }
     Ok((old, new))
 }

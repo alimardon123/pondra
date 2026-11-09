@@ -1240,13 +1240,24 @@ async fn shaped(home: &Lake, t: &Arc<crate::rules::Table>, name: &str, all: Opti
 /// of `lake` as of `upto` (`files`: this machine's files too). `home` is the table's own lake: the one a DEFAULT's `nextval`
 /// takes its values from.
 #[allow(clippy::too_many_arguments)]
+///
+/// A writer a grant's filter on the table's rows for INSERT holds writes rows it holds only: each shaped row must meet it, or
+/// the INSERT is refused, 42501 (`row_filter::holds`, step 6 piece 5c-2: Postgres's WITH CHECK). An upsert's proposed rows
+/// are checked so, whether or not they are inserted, as Postgres checks them. A table of another lake keeps that lake's
+/// rules (`on_node_listed` refuses a filter here on one).
 pub async fn rows_of(lake: &Lake, home: &Lake, t: &Arc<crate::rules::Table>, name: &str, sql: &str, upto: Option<u64>, files: bool, how: crate::rules::How, scope: &crate::rights::Scope) -> Result<crate::rules::Shaped> {
-    if let Some(all) = crate::literals::literal_rows(sql, &t.schema) {
-        return shaped(home, t, name, Some(all), how).await;
+    let rows = match crate::literals::literal_rows(sql, &t.schema) {
+        Some(all) => shaped(home, t, name, Some(all), how).await?,
+        None => {
+            let ctx = crate::query::session_for(lake, sql, "", upto, scope).await?;
+            let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
+            shaped(home, t, name, planned(&ctx, &t.schema, sql).await?, how).await?
+        }
+    };
+    if let Some(f) = scope.rows("insert", name).filter(|_| std::ptr::eq(lake, home)) {
+        crate::row_filter::holds(&lake.session_with(1), name, std::slice::from_ref(rows.rows()), &f, "INSERT").await?;
     }
-    let ctx = crate::query::session_for(lake, sql, "", upto, scope).await?;
-    let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
-    shaped(home, t, name, planned(&ctx, &t.schema, sql).await?, how).await
+    Ok(rows)
 }
 
 /// An INSERT's `VALUES` with each value for a DOUBLE, REAL or DECIMAL column cast to that column's
@@ -1891,6 +1902,9 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     // A table of an attached lake: the work runs here, that lake's leader records it.
     let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
     if let Some(other) = other {
+        if crate::rights::asks(&stmt).1.iter().filter_map(|a| a.privilege()).any(|p| by.scope.rows_named(p, &crate::auth::catalog_name(&stmt.table())).is_some()) {
+            return Err(crate::codes::coded("0A000", format!("{} is another database's: its rows are written there, so a filter on them in a grant here isn't checked: write them with a grant there", stmt.table())));
+        }
         crate::users::across_write(&other, &attached_as(&stmt), &table, &stmt, &by.scope).await?; // (that lake's own sign-in)
         let req = prepare(lake, &other, &table, &stmt, &job, files, &by.scope).await?;
         let mark = req.as_ref().and_then(|r| request_mark(r, &job));
@@ -1934,8 +1948,11 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     if (keyed && matches!(stmt, Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_))) || key_insert {
         return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job, &by.scope))).await;
     }
+    // (an INSERT a filter on the rows its writer may insert holds: its rows are worked out here, so each is checked, `rows_of`:
+    // never written as files, kept as a file's row groups, or spread over the nodes unread)
+    let held = matches!(stmt, Stmt::Insert(..)) && by.scope.rows("insert", &table).is_some();
     let sql = match (&meta, &stmt) {
-        (Some(m), _) if through_log(m, &stmt) || crate::returning::asked() => {
+        (Some(m), _) if through_log(m, &stmt) || crate::returning::asked() || held => {
             // A resend whose job's mark is still kept is answered as the duplicate it is, before its statement runs again (the
             // leader's log would answer the same, once the rows were worked out: `Ack::duplicate`).
             if named && matches!(stmt, Stmt::Insert(..)) && sent(lake, &job).await? {

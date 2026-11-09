@@ -204,6 +204,10 @@ fn may_in(who: &Principal, action: Action, object: Object, sql: bool) -> Result<
     }
     // (a load's rows replace their keys' rows or delete them, unread: a writer some of whose rows its grants hide changes them
     // with SQL, which reads them through the filter, so it never replaces or deletes a row it can't read)
+    // (and a load's new rows aren't checked against a filter on the rows its writer may insert: SQL's INSERT checks them)
+    if granted && !sql && action == Action::Insert && a.rows("insert", &table, false).is_some() {
+        return Err(Refusal::new(format!("permission denied: {table} lets {} insert some rows only (a filter on its rows in a grant): insert them with SQL's INSERT, which checks each", who.name)));
+    }
     if granted && !sql && matches!(action, Action::Update | Action::Delete) && [privilege, "select"].iter().any(|p| a.rows(p, &table, false).is_some()) {
         let held = match a.rows("select", &table, false) {
             Some(_) => format!("shows {} some of its rows only", who.name),
@@ -747,6 +751,11 @@ mod tests {
         assert!(editor.scope.filtered("t") && updater.scope.filtered("t") && !updater.scope.filtered("u") && !Principal::node().scope.filtered("t"));
         assert_eq!(said(may(&updater, Action::Update, Object::Table("t"))), "permission denied: t lets ann update some of its rows only (a filter on its rows in a grant): change them with SQL's UPDATE, DELETE, MERGE or INSERT … ON CONFLICT");
         assert_eq!(said(may_in(&updater, Action::Update, Object::Table("t"), true)), "ok");
+        // (INSERT's, piece 5c-2: a load's new rows are refused, SQL's INSERT checks each)
+        let inserter = as_("ann", &access(vec![grant("select", t(), None), grant("insert", t(), Some("owner = current_user"))]));
+        assert_eq!(said(may(&inserter, Action::Insert, Object::Table("t"))), "permission denied: t lets ann insert some rows only (a filter on its rows in a grant): insert them with SQL's INSERT, which checks each");
+        assert_eq!(said(may_in(&inserter, Action::Insert, Object::Table("t"), true)), "ok");
+        assert!(inserter.scope.filtered("t"));
         assert!(!ann.scope.reads("t", ["owner"].into_iter()), "a key lookup: SQL answers it, through its filter");
         assert!(as_("ann", &plain).scope.reads("t", ["owner"].into_iter()));
     }

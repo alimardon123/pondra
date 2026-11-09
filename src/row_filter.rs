@@ -8,7 +8,6 @@
 use crate::codes::coded;
 use anyhow::{ensure, Result};
 use core::ops::ControlFlow;
-use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DFSchema;
@@ -52,20 +51,26 @@ pub fn filled(text: &str, reader: Option<&str>) -> String {
     }
 }
 
-/// Do a write's new versions of `table`'s rows (`new`, under SQL's names: a row with no `_row_id` is a new row, no version)
-/// all meet `filter`, its writer's filter on them for `privilege` (as `Scope::rows` fills it in)? Else the write is refused,
-/// 42501, naming no value: Postgres's WITH CHECK, which is a policy's USING when it gives none. NULL fails it, as in a WHERE.
-/// `ctx` names the functions it may call: the lake's own session's, as `check`'s.
+/// Do the rows a write gives `table` (`new`, under SQL's names) meet `filter`, its writer's filter on them for `privilege`
+/// (as `Scope::rows` fills it in)? UPDATE's are its new versions (a row with a `_row_id`); INSERT's its new rows (none, or a
+/// NULL one, as a MERGE's inserts beside its updates). Else the write is refused, 42501, naming no value: Postgres's WITH
+/// CHECK, which is a policy's USING when it gives none. NULL fails it, as in a WHERE. `ctx` names the functions it may
+/// call: the lake's own session's, as `check`'s.
 pub async fn holds(ctx: &SessionContext, table: &str, new: &[RecordBatch], filter: &str, privilege: &str) -> Result<()> {
-    let versions: Vec<&RecordBatch> = new.iter().filter(|b| b.num_rows() > 0 && b.column_by_name(crate::text::ROW_ID).is_some()).collect();
-    let Some(first) = versions.first() else { return Ok(()) };
-    let schema = first.schema();
-    let all = concat_batches(&schema, &versions.iter().map(|b| crate::query::conform(b, &schema)).collect::<Result<Vec<_>>>()?)?;
-    ctx.register_batch("__pondra_versions", all)?;
-    let sql = format!("SELECT 1 FROM __pondra_versions WHERE \"{}\" IS NOT NULL AND NOT coalesce(({filter}), false) LIMIT 1", crate::text::ROW_ID);
-    let failed = async { anyhow::Ok(crate::engine::sql(ctx, &sql).await?.collect().await?.iter().any(|b| b.num_rows() > 0)) }.await;
-    ctx.deregister_table("__pondra_versions")?; // (the lake's session is a copy, its tables its own: this one goes with the check)
-    ensure!(!failed?, coded("42501", format!("new row violates the filter on {table}'s rows of your {privilege} grant")));
+    let id = format!("\"{}\"", crate::text::ROW_ID);
+    for b in new.iter().filter(|b| b.num_rows() > 0) {
+        let which = match (privilege == "UPDATE", b.column_by_name(crate::text::ROW_ID).is_some()) {
+            (true, false) => continue, // (new rows only: no version)
+            (true, true) => format!("{id} IS NOT NULL AND "),
+            (false, true) => format!("{id} IS NULL AND "),
+            (false, false) => String::new(),
+        };
+        ctx.register_batch("__pondra_written", b.clone())?;
+        let sql = format!("SELECT 1 FROM __pondra_written WHERE {which}NOT coalesce(({filter}), false) LIMIT 1");
+        let failed = async { anyhow::Ok(crate::engine::sql(ctx, &sql).await?.collect().await?.iter().any(|b| b.num_rows() > 0)) }.await;
+        ctx.deregister_table("__pondra_written")?; // (the lake's session is a copy, its tables its own: this one goes with the check)
+        ensure!(!failed?, coded("42501", format!("new row violates the filter on {table}'s rows of your {privilege} grant")));
+    }
     Ok(())
 }
 
@@ -194,7 +199,12 @@ mod tests {
         assert_eq!(held(vec![batch(&[None], Some(&[Some(1)]))]).await, refused, "NULL fails it");
         assert_eq!(held(vec![batch(&[Some("y")], None), batch(&[Some("y")], Some(&[None]))]).await, "ok", "new rows are INSERT's to check");
         assert_eq!(held(vec![]).await, "ok");
-        assert!(ctx.table_exist("__pondra_versions").is_ok_and(|e| !e), "the check's table goes with it");
+        // (INSERT's: the new rows, piece 5c-2)
+        let inserted = |b: Vec<RecordBatch>| { let ctx = ctx.clone(); async move { said(holds(&ctx, "t", &b, "dept = 'x'", "INSERT").await) } };
+        assert_eq!(inserted(vec![batch(&[Some("x")], None), batch(&[Some("x"), Some("y")], Some(&[None, Some(7)]))]).await, "ok", "a version is UPDATE's to check");
+        assert_eq!(inserted(vec![batch(&[Some("x"), Some("y")], None)]).await, "42501: new row violates the filter on t's rows of your INSERT grant");
+        assert_eq!(inserted(vec![batch(&[Some("y")], Some(&[None]))]).await, "42501: new row violates the filter on t's rows of your INSERT grant", "a MERGE's insert");
+        assert!(ctx.table_exist("__pondra_written").is_ok_and(|e| !e), "the check's table goes with it");
     }
 
     fn t() -> Schema { Schema::new(vec![Field::new("dept", DataType::Utf8, true), Field::new("owner", DataType::Utf8, true), Field::new("n", DataType::Int64, true)]) }
