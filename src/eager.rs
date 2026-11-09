@@ -6,7 +6,8 @@
 //! store sales by a customer's seven text columns and the year: by `ss_customer_sk` and the year first, by hand, 3.32 →
 //! 1.32 s; q04 4.48 → 1.99 s. Their customer table holds a condition that names no column: `'s' = 's'`, what is left of
 //! the outer query's `sale_type = 's'` once it is pushed through the UNION ALL's tag. Such a condition keeps every row or
-//! none, so the table is as whole as one without it.
+//! none, so the table is as whole as one without it. And the join order joins it to its sales below the date's join, with
+//! a projection of columns between the two joins, which the rule looks through (`optimize::flatten_through`).
 //!
 //! It groups first where the grouping it saves hashes several strings a row: two text columns or more, or grouping sets
 //! (ROLLUP, CUBE). By one short text column the extra grouping costs what it saves (TPC-DS q05 was 8% slower).
@@ -125,7 +126,7 @@ fn eager(a: &Aggregate) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     }
     let (mut leaves, mut keys, mut filters) = (vec![], vec![], vec![]);
-    crate::optimize::flatten(input, equality, &mut leaves, &mut keys, &mut filters);
+    crate::optimize::flatten_through(input, equality, &mut leaves, &mut keys, &mut filters);
     let schema = input.schema();
     let Some(parts) = a.aggr_expr.iter().map(|e| part(e, schema)).collect::<Result<Option<Vec<Part>>>>()? else { return Ok(None) };
     let args: Vec<&Column> = parts.iter().flat_map(|p| p.arg().column_refs()).collect();
@@ -361,6 +362,28 @@ mod tests {
         let got = pretty_format_batches(&ctx.execute_logical_plan(rewritten).await?.collect().await?)?.to_string();
         let want = pretty_format_batches(&ctx.execute_logical_plan(plan).await?.collect().await?)?.to_string();
         assert_eq!(got, want);
+        Ok(())
+    }
+
+    /// A projection of columns between two joins (the customer joined to its sales, below the date's join: TPC-DS q04's
+    /// order) ends the tree a join order takes apart, and not the one this rule makes again from its leaves.
+    #[test]
+    fn the_leaves_of_joins_with_columns_between() -> Result<()> {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::logical_expr::{col, table_scan, LogicalPlanBuilder};
+        let t = |name: &str, cols: &[&str]| table_scan(Some(name), &Schema::new(cols.iter().map(|c| Field::new(*c, DataType::Int64, true)).collect::<Vec<_>>()), None)?.build();
+        let bought = LogicalPlanBuilder::from(t("c", &["c_sk", "c_name"])?)
+            .join(t("s", &["s_c", "s_d", "s_x"])?, JoinType::Inner, (vec!["c.c_sk"], vec!["s.s_c"]), None)?
+            .project([col("c.c_name"), col("s.s_d"), col("s.s_x")])?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(bought).join(t("d", &["d_sk", "d_year"])?, JoinType::Inner, (vec!["s.s_d"], vec!["d.d_sk"]), None)?.build()?;
+        let LogicalPlan::Join(top) = &plan else { unreachable!("a join") };
+        let (mut leaves, mut keys, mut filters) = (vec![], vec![], vec![]);
+        crate::optimize::flatten(&plan, top.null_equality, &mut leaves, &mut keys, &mut filters);
+        assert_eq!((leaves.len(), keys.len()), (2, 1), "a projection between the joins ends the tree");
+        let (mut leaves, mut keys, mut filters) = (vec![], vec![], vec![]);
+        crate::optimize::flatten_through(&plan, top.null_equality, &mut leaves, &mut keys, &mut filters);
+        assert_eq!((leaves.len(), keys.len()), (3, 2), "through it: the customers, their sales and the dates, by both keys");
         Ok(())
     }
 
