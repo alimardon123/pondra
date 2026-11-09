@@ -2023,10 +2023,10 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     // it changes, so a change worked out from a snapshot can't overwrite a commit that landed meanwhile. Its producer is
     // the job, so a retry of it is a duplicate. A MERGE gets here only when `changes` took it as a one-row upsert of one
     // key (`point_upsert`, which asked the same question): the other MERGEs and the UNIQUE tables never do.
-    // A plain INSERT into a table whose key is checked (`constraints::key_checked`) is one too: its key must be new, and its
+    // A plain INSERT into a table whose key is checked (`TableMeta::key_checked`) is one too: its key must be new, and its
     // locks make two nodes' INSERTs of one new key wait for each other (`txn::autocommit_as`).
     let keyed = meta.as_ref().is_some_and(|m| !m.key.is_empty());
-    let key_insert = matches!(stmt, Stmt::Insert(..)) && stored.as_ref().is_some_and(|m| crate::constraints::key_checked(m));
+    let key_insert = matches!(stmt, Stmt::Insert(..)) && stored.as_ref().is_some_and(|m| m.key_checked());
     if (keyed && matches!(stmt, Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_))) || key_insert {
         return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job, scope))).await;
     }
@@ -2653,7 +2653,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
             // (an INSERT's keys are looked at below, after `sent`, as before: `Load`)
             let how = if matches!(stmt, Stmt::Insert(..)) { crate::rules::How::Load } else { crate::rules::How::Change };
             let rows = rows_of(query, target, &rules, table, &sql, None, files, how, scope).await?; // (a DEFAULT's sequence is the attached lake's)
-            if let Some(s) = stored.as_ref().filter(|s| matches!(stmt, Stmt::Insert(..)) && crate::constraints::key_checked(s)) {
+            if let Some(s) = stored.as_ref().filter(|s| matches!(stmt, Stmt::Insert(..)) && s.key_checked()) {
                 if sent(target, job).await? {
                     return Ok(None); // (a retry: `deliver` answers it as a duplicate)
                 }
