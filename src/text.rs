@@ -139,7 +139,7 @@ pub(crate) fn text_kept(stmts: Vec<Statement>) -> String {
 
 /// A statement as SQL text again. sqlparser writes `- -3` (or `- $x`, `$x` bound to -3) as `--3`,
 /// which reads back as a comment, so a minus before anything written with a minus first gets
-/// parentheses.
+/// parentheses (`parsed::signed`, which every text's parse has had already: this is for a tree built since).
 pub fn sql(s: &Statement) -> String { printed(s).0 }
 
 /// A statement as SQL text (`sql`), and whether that is its own `Display`: false when the text has a fix for the reader.
@@ -162,12 +162,7 @@ fn printed(s: &Statement) -> (String, bool) {
         return (s.to_string(), true);
     }
     let mut s = s.clone();
-    let _ = crate::walk::visit_expressions_mut(&mut s, |e| {
-        if let (true, Expr::UnaryOp { expr, .. }) = (twice(e), &mut *e) {
-            **expr = Expr::Nested(Box::new(std::mem::replace(&mut **expr, Expr::Value(ast::Value::Null.into()))));
-        }
-        ControlFlow::<()>::Continue(())
-    });
+    crate::parsed::signed(&mut s);
     (s.to_string(), false)
 }
 

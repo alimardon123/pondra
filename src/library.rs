@@ -14,7 +14,7 @@
 //! `capi/`, for Python's `pondra.open`, and its Node-API module for JavaScript's: `designs/l2-step4-open.md`),
 //! answers that stream included. The loopback door the node opens is for what lives outside the host's
 //! process: the console in a browser, Python's workers calling back, other processes on the lake.
-use crate::node::{Event, Node, Options, Restarting};
+use crate::node::{Event, Held, Node, Options, Restarting};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -279,8 +279,8 @@ impl Drop for Opened {
 /// The node in place: what exec does to a process. Its tasks end, its statics (its term's lock file,
 /// whose file says "restarting", its Python workers) are let go, and its lake with them; nothing waits
 /// on the bucket, and the term isn't given back: a fenced or cut-off node has nothing to make durable.
-fn halt(node: Option<Node>) {
-    crate::spawns::abort_all();
+fn halt(held: &Held, node: Option<Node>) {
+    held.abort_tasks();
     drop(node);
     crate::reset::reset();
 }
@@ -300,7 +300,8 @@ async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<M
     loop {
         set(State::Starting);
         // (a start can be told to restart by a task it started, or unwind with `Restarting` itself)
-        let start = AssertUnwindSafe(Node::open(options.clone())).catch_unwind();
+        let held = Arc::new(Held::default()); // (this start's: a start dropped midway still ends what it started, `halt`)
+        let start = AssertUnwindSafe(Node::open_in(options.clone(), held.clone())).catch_unwind();
         let why = tokio::select! {
             started = start => match started {
                 Ok(Ok(node)) => {
@@ -330,7 +331,7 @@ async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<M
                     match next {
                         Some(Event::Restart(why)) => {
                             router.lock().unwrap_or_else(PoisonError::into_inner).take(); // (no request reaches a node being halted)
-                            halt(Some(node));
+                            halt(&held, Some(node));
                             if since.elapsed() >= Duration::from_secs(60) {
                                 restarts.clear(); // (a node that served a minute starts the count again)
                             }
@@ -339,7 +340,7 @@ async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<M
                         Some(Event::Failed(why)) => {
                             set(State::Failed(why.clone())); // (said at once: the stop may wait on the bucket)
                             if tokio::time::timeout(Duration::from_secs(30), node.stop()).await.is_err() {
-                                halt(None);
+                                halt(&held, None);
                             }
                             return failed_until_closed(&set, why, &mut events, first.take()).await;
                         }
@@ -361,7 +362,7 @@ async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<M
                 }
                 Ok(Err(e)) => format!("{e:#}"), // (`Node::open` gave back what it took)
                 Err(p) => {
-                    halt(None);
+                    halt(&held, None);
                     match p.downcast::<Restarting>() {
                         Ok(r) => r.0,
                         Err(p) => return failed_until_closed(&set, crate::spawns::said(&*p), &mut events, first.take()).await,
@@ -370,15 +371,15 @@ async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<M
             },
             e = events.recv() => match e {
                 Some(Event::Restart(why)) => {
-                    halt(None); // (the start's future is dropped: what it took goes with its statics)
+                    halt(&held, None); // (the start's future is dropped: what it took goes with its statics)
                     why
                 }
                 Some(Event::Failed(why)) => {
-                    halt(None);
+                    halt(&held, None);
                     return failed_until_closed(&set, why, &mut events, first.take()).await;
                 }
                 Some(Event::Close) | None => {
-                    halt(None);
+                    halt(&held, None);
                     set(State::Closed);
                     return;
                 }

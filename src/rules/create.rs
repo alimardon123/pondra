@@ -14,24 +14,7 @@ use super::{Column, Table};
 
 // ---------------------------------------------------------------- constraints (`constraints.rs`)
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Constraint {
-    pub name: String,
-    pub kind: Kind,
-    pub columns: Vec<String>, // stored names (SQL's in a table's spec and in `logical()`)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub references: Option<(String, Vec<String>)>, // a foreign key's table and its columns, as written
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub enforced: bool,
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Kind {
-    Unique,
-    PrimaryKey,
-    ForeignKey,
-}
+pub use crate::table_record::{Constraint, Kind};
 
 impl Constraint {
     /// The same constraint with its columns named another way (stored names to SQL's, or back).
@@ -547,7 +530,7 @@ impl Declared {
     /// A WITH option as a list: its comma-separated items, trimmed, the empty ones left out.
     pub fn list(&self, k: &str) -> Option<Vec<String>> { self.options.get(k).map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()) }
 
-    /// Is the table keyed: its key is checked by a plain INSERT, and no MERGE combines its rows (`constraints::key_checked`).
+    /// Is the table keyed: its key is checked by a plain INSERT, and no MERGE combines its rows (`TableMeta::key_checked`).
     pub fn keyed(&self) -> bool { !self.key.is_empty() && self.merge.is_empty() }
 }
 

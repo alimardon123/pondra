@@ -278,7 +278,8 @@ async fn append(app: &App, producer: &str, seq: u64, lines: &[Line], made: &mut 
 /// node goes, not every 30 s: a month of a task every second is millions of rows. A run that ends
 /// after all writes its row again: the newest row is its row.)
 pub fn mark_stopped(app: App) {
-    crate::panics::own(async move { // (the node's own work)
+    let node = app.lake.node.clone();
+    node.tasks.spawn_node(crate::spawns::Vital::Stop, async move { // (the node's own work)
         let since = now_ms();
         if crate::backup::frozen(&app.lake) {
             return; // (a backup runs nothing, and writes no run log: ADR-070)
@@ -477,6 +478,16 @@ pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefi
 fn signed(lake: &Lake, what: &str) -> Option<String> {
     let key = lake.owner_key.get()?;
     Some(crate::text::hex(&crate::crypto::hmac_sha256(key.as_bytes(), format!("{}\x1f{what}", lake.url).as_bytes())))
+}
+
+/// A dropped task's records (`undrop::Kept`) without its owner's marks, its own and its last tick's: undropped by anyone
+/// but the owner (`ext::owner`), it runs as a task they made would, as no one's, never in the owner's scope (`as_owner`).
+pub(crate) fn unmark(records: &mut [(String, serde_json::Value)]) {
+    for (_, v) in records.iter_mut().filter(|(k, _)| k.starts_with("j/") || k.starts_with("jt/")) {
+        if let Some(o) = v.as_object_mut() {
+            o.remove("owner");
+        }
+    }
 }
 
 /// Is `mark` `what` signed by this process's owner (`signed`)? Compared in constant time.
@@ -791,7 +802,8 @@ static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 /// Leader: run the tasks as their ticks come, for as long as this node leads (a new leader is a
 /// new process). Nothing to do costs a look at the catalog's version twice a second.
 pub fn schedule(app: App) {
-    crate::panics::own(async move { // (the node's own work; each tick, its task's: `run_tick`)
+    let node = app.lake.node.clone();
+    node.tasks.spawn_node(crate::spawns::Vital::Stop, async move { // (the node's own work; each tick, its task's: `run_tick`)
         let running: Arc<Mutex<HashSet<String>>> = Default::default();
         loop {
             tokio::select! {
@@ -818,10 +830,11 @@ pub fn schedule(app: App) {
                 running.lock().unwrap().insert(name.clone());
                 let (app, name, task) = (app.clone(), name.clone(), task.clone());
                 let ran = Ran(running.clone(), name.clone()); // (let go even if the tick panics: else it never ran again here)
-                crate::spawns::task(async move {
+                let n = app.lake.node.clone();
+                n.tasks.spawn_node(crate::spawns::Vital::Own, async move {
                     // (as the task's owner, an asked run only when the owner asked: `Tick::as_owner`; the node's own work, which
                     // no request asked for: `auth::as_node`)
-                    crate::auth::as_node(crate::ext::scope(as_owner, run_tick(&app, &name, &task, tick))).await;
+                    crate::ext::scope(as_owner, run_tick(&app, &name, &task, tick)).await;
                     drop(ran);
                 });
             }
@@ -1387,6 +1400,28 @@ mod tests {
         let mut edited = scheduled.clone();
         edited.result = Some("42".into());
         assert!(!edited.as_owner(&lake, "owned", &owned), "a tick whose result changed after it was signed is no one's");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_undropped_task_is_the_owners_only_when_the_owner_undrops_it() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-undrop-owner-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let _ = lake.owner_key.set("k1".into());
+        let scope = crate::rights::Scope::everything();
+        for (by_owner, name) in [(true, "mine"), (false, "taken")] {
+            let task = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), ..Default::default() };
+            crate::ext::scope(true, create_task(&lake, name, task, false)).await?;
+            let mut tick = Tick { at: 1, ..Default::default() };
+            tick.owner = signed(&lake, &tick.what(name));
+            lake.cat.commit(vec![(tick_key(name), json(&tick))], &[]).await?;
+            crate::ext::scope(true, drop_task(&lake, name, false)).await?; // (the owner drops it)
+            crate::ext::scope(by_owner, crate::undrop::undrop(&lake, "task", name, &scope)).await?;
+            let task = lake.cat.get::<Task>(&task_key(name)).await?.context("the task is back")?;
+            let tick = lake.cat.get::<Tick>(&tick_key(name)).await?.context("its tick is back")?;
+            assert_eq!(tick.as_owner(&lake, name, &task), by_owner, "{name}: the owner's again only when the owner undropped it");
+            assert_eq!(task.owner.is_some() && tick.owner.is_some(), by_owner, "{name}: another's UNDROP keeps no mark");
+        }
         Ok(())
     }
 

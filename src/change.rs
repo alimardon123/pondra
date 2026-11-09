@@ -590,7 +590,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str, scope: &cra
         _ => false,
     };
     if let crate::write::Stmt::Merge(m) = &stmt {
-        if !plain && m.upsert.is_none() && crate::constraints::key_checked(&stored) {
+        if !plain && m.upsert.is_none() && stored.key_checked() {
             crate::constraints::distinct_keys(&stored, &table, &new)?;
         }
     }
