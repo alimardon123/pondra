@@ -508,7 +508,7 @@ async fn key_for(p: &Provider, kid: Option<&str>, alg: &str) -> Result<Jwk> {
                 k.asked = Instant::now();
             }
             let issuer = p.issuer.clone();
-            crate::spawns::task(async move { remember(&issuer, fetch(&issuer).await) });
+            crate::spawns::for_statics(async move { remember(&issuer, fetch(&issuer).await) });
         }
         return Ok(key);
     }
