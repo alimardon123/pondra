@@ -17,14 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// Files a query reads as one table: where, in which format, with which options.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Spec {
-    pub urls: Vec<String>,
-    pub format: String, // parquet, csv, json (one object a line)
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub options: BTreeMap<String, String>,
-}
+pub use crate::table_record::Spec;
 
 const PREFIX: &str = "ext:";
 
