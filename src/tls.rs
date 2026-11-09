@@ -389,7 +389,7 @@ impl Doors {
         let listener = TcpListener::bind(addr).await.with_context(|| format!("listening on {addr}"))?;
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let local = listener.local_addr()?;
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             loop {
                 let tcp = match listener.accept().await {
                     Ok((tcp, _)) => tcp,
@@ -399,7 +399,7 @@ impl Doors {
                     }
                 };
                 let tx = tx.clone();
-                crate::panics::task(async move {
+                crate::spawns::task(async move {
                     if let Ok(c) = accept(tcp, door).await {
                         let _ = tx.send(c).await;
                     }
