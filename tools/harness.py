@@ -10776,6 +10776,19 @@ def server():
     checks["a grant ON ALL TABLES lists none of another database's tables, as it reads none; a grant naming one lists it (pondra.objects, 11-08 audit L7)"] = \
         isinstance(seen["bob_lists"], list) and any(r["name"] == "people" for r in seen["bob_lists"]) and not any(r["name"] == "notes" for r in seen["bob_lists"]) \
         and isinstance(seen["ann_lists"], list) and [r["name"] for r in seen["ann_lists"]] == ["notes"]
+    # (11-09 audit L1: under USE of an attached lake, pg_catalog lists its tables by the grants naming them, lake.t, as its
+    # reads are: bob's ON ALL TABLES of hr lists none of lake's tables; ann's grant naming lake.notes lists notes)
+    def under_use(auth, who):
+        h = {"Authorization": "Basic " + base64.b64encode(auth.encode()).decode(), "x-pondra-session": f"audit-l1-{who}"}
+        try:
+            call(port, "POST", "/db/hr/sql", b"USE lake", headers=h)
+            return call(port, "POST", "/db/hr/sql", b"SELECT relname FROM pg_class WHERE relkind = 'r' ORDER BY relname", headers=h)
+        except Exception as e:
+            return f"ERROR {e}"
+    for who, auth in (("bob", bob), ("ann", ann)):
+        seen[f"{who}_use"] = under_use(auth, who)
+    checks["under USE of an attached lake, pg_class lists its tables by the grants naming them: bob's ON ALL TABLES of hr lists none, ann's naming lake.notes lists notes (11-09 audit L1)"] = \
+        seen["bob_use"] == [] and isinstance(seen["ann_use"], list) and [r["relname"] for r in seen["ann_use"]] == ["notes"]
     # Whoever runs the nodes (one of their tokens) still reads across; a user of the node's own lake doesn't.
     mine = new_lake()
     subprocess.run([BIN, "sql", "--dir", mine, "CREATE TABLE t AS SELECT 1 AS id"], check=True, capture_output=True)

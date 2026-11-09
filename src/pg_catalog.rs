@@ -340,7 +340,9 @@ fn held_types(l: &TableMeta) -> impl Iterator<Item = (String, (u32, i32))> + '_ 
     })
 }
 
-async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool, scope: &crate::rights::Scope) -> Result<Lakes> {
+/// `lake`'s catalog as `scope` may see it. `attached`: the name it is attached by here (under `USE`), whose tables only
+/// grants naming them as `name.t` give.
+async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool, scope: &crate::rights::Scope, attached: Option<&str>) -> Result<Lakes> {
     let schemas = crate::ddl::schemas(lake).await?;
     // (a materialized view's query as it was written: `pg_matviews.definition` and `pg_get_viewdef`, as `View::query` gives it)
     let mvs: BTreeMap<String, String> = lake.cat.scan::<serde_json::Value>("v/", "v0").await?.into_iter().map(|(k, v)| {
@@ -405,7 +407,12 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool, scope: &cra
     // reader may not read, so a BI tool's table list is the user's.
     let mut hidden: BTreeMap<u32, Vec<String>> = BTreeMap::new(); // (each relation's columns its reader may not read)
     if !scope.whole() {
-        rels.retain_mut(|r| match scope.columns(&crate::text::join(&r.schema, &r.name)) {
+        // (a lake attached here, under `USE`, is read by the grants naming its tables, `l.t`, as its reads are: 11-09 audit L1)
+        let granted = |table: String| match attached {
+            Some(db) => scope.named("select", &format!("{db}.{table}")),
+            None => scope.columns(&table),
+        };
+        rels.retain_mut(|r| match granted(crate::text::join(&r.schema, &r.name)) {
             None => false,
             Some(None) => true,
             Some(Some(these)) => {
@@ -1384,12 +1391,12 @@ pub async fn register(ctx: &SessionContext, lake: &Lake, user: &str, sql: &str) 
         Some(p) if p.database() != p.here => {
             let db = p.database();
             let shown = crate::ddl::database(lake, db).await?.ok_or_else(|| anyhow::anyhow!("no database {db}"))?;
-            let mut l = lakes(&shown, user, columns, counts, &scope).await?;
+            let mut l = lakes(&shown, user, columns, counts, &scope, Some(db)).await?;
             l.database = db.to_string(); // (the name it is attached by here, not its own lake's folder's)
             l.databases = std::iter::once(crate::ddl::lake_name(lake)).chain(lake.attached.read().unwrap().iter().map(|(n, _)| n.clone())).collect();
             l
         }
-        _ => lakes(lake, user, columns, counts, &scope).await?,
+        _ => lakes(lake, user, columns, counts, &scope, None).await?,
     };
     let l = Arc::new(l);
     let catalog = ctx.catalog(&crate::ddl::lake_name(lake)).expect("the lake's catalog");
