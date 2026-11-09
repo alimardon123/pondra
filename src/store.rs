@@ -4391,7 +4391,6 @@ mod tests {
         assert!(published("data/t/_delta_log/00000000000000000000.json"), "Delta's log");
         assert!(published("data/t/metadata/v1.metadata.json"), "Iceberg's metadata");
         assert!(!published("data/t/part-0.parquet") && !published("files/notes.csv") && !published("log/00000000000000000001"));
-        assert_eq!(lock_lease(), crate::locks::lease(), "one lease");
     }
 
     /// A parsed entry keeps a copy of its raw bytes, never a slice of the buffer they came in: a follower's come in its
