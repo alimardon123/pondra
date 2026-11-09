@@ -53,8 +53,9 @@ pub(crate) fn quotient_type(left: &DataType, right: &DataType, spark: bool) -> O
 }
 
 /// How a quotient at scale `s` is worked out from a dividend at scale s1 and a divisor at s2: (a · 10^up) / (b · 10^down),
-/// rounded, where up − down = s − s1 + s2.
-struct Scaling {
+/// rounded, where up − down = s − s1 + s2. (`avg.rs` divides a sum by a count with it.)
+#[derive(Debug)]
+pub(crate) struct Scaling {
     up: i256,
     down: i256,
     up128: Option<i128>,
@@ -64,7 +65,7 @@ struct Scaling {
 }
 
 impl Scaling {
-    fn new(s1: i8, s2: i8, precision: u8, scale: i8) -> Result<Scaling, ArrowError> {
+    pub(crate) fn new(s1: i8, s2: i8, precision: u8, scale: i8) -> Result<Scaling, ArrowError> {
         let k = i32::from(scale) - i32::from(s1) + i32::from(s2);
         let ten = |n: i32| i256::from_i128(10).pow_checked(n as u32);
         let (up, down) = (ten(k.max(0))?, ten((-k).max(0))?);
@@ -72,7 +73,7 @@ impl Scaling {
     }
 
     /// `a / b`, two values at their scales, at the quotient's scale.
-    fn quotient(&self, a: i128, b: i128) -> Result<i128, ArrowError> {
+    pub(crate) fn quotient(&self, a: i128, b: i128) -> Result<i128, ArrowError> {
         if b == 0 {
             return Err(ArrowError::DivideByZero);
         }
