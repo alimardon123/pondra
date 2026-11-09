@@ -49,7 +49,7 @@ pub fn with_files(ctx: SessionContext) -> SessionContext {
 
 /// The session every query starts from: DataFusion's, with Pondra's rules and planners, and every function set in the
 /// registry (`Functions`): the engine's own, Spark's, Postgres's, MATCH_RECOGNIZE's, the AI functions. A node's
-/// statements add the lake's own (`Lake::made`, `query::session_for`).
+/// statements add the lake's own (`LakeFunctions`, `query::session_for`).
 pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     let config = crate::optimize::config(config.with_information_schema(true));
     let state = SessionStateBuilder::new().with_config(config).with_runtime_env(rt).with_default_features();
@@ -93,6 +93,38 @@ impl Functions {
     }
 }
 
+/// The registry's lake functions section: functions that read or change the lake a session queries (`files('…')`,
+/// `nextval`, `secrets()`, `extensions()`), each added by the module that owns it and given to each of that lake's
+/// sessions (`Lake::session_with`). A session made without a lake (`session`) has none of them.
+#[cfg(feature = "lake")]
+#[derive(Default)]
+pub struct LakeFunctions(Vec<(&'static str, fn(&SessionContext, Arc<crate::store::Lake>))>);
+
+#[cfg(feature = "lake")]
+impl crate::registry::Section for LakeFunctions {
+    const NAME: &'static str = "lake_functions";
+
+    fn check(&self, _: &crate::registry::Registry) -> std::result::Result<(), String> {
+        match self.0.iter().enumerate().find(|(i, (name, _))| self.0[..*i].iter().any(|(n, _)| n == name)) {
+            Some((_, (name, _))) => Err(format!("two sets of a lake's functions are named {name}")),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "lake")]
+impl LakeFunctions {
+    pub fn add(&mut self, name: &'static str, add: fn(&SessionContext, Arc<crate::store::Lake>)) {
+        self.0.push((name, add));
+    }
+
+    /// The sets' names, in the order a lake's session gets them.
+    #[cfg_attr(not(test), allow(dead_code))] // (step 12's generated docs list them)
+    pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.0.iter().map(|(name, _)| *name)
+    }
+}
+
 /// The engine's own functions, as an extension. It lists every set's as `pondra.functions`.
 pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "engine",
@@ -104,6 +136,15 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             passes.add(p);
         }
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "functions", columns: FUNCTION_COLUMNS, rows: functions });
+        #[cfg(feature = "lake")] // (the functions of the lake a session queries: `Lake::session_with`)
+        {
+            let lake = r.section_mut::<LakeFunctions>();
+            lake.add("files", crate::files::register); // files('…'), file_read(path)
+            lake.add("sequences", crate::seq::register); // nextval, currval, setval
+            lake.add("secrets", crate::ext::register_secrets); // secrets()
+        }
+        #[cfg(feature = "lake")] // (what a lake does as it opens: `store::OpenHooks`)
+        r.section_mut::<crate::store::OpenHooks>().add("branch bases", |lake| Box::pin(crate::branch::load(lake)));
         #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: each says what its state holds, `LakeState::ABOUT`)
         {
             let states = r.section_mut::<crate::lake_state::Registered>();
@@ -144,6 +185,12 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         }
         #[cfg(feature = "lake")]
         r.section_mut::<crate::records::Rights>().add(crate::users::RIGHTS);
+        #[cfg(feature = "lake")] // (who still reads a lake's old files: `pins`)
+        for p in [crate::branch::readers(), crate::tasks::readers(), crate::rerun::readers()] {
+            r.section_mut::<crate::pins::Pins>().add(p);
+        }
+        #[cfg(feature = "lake")] // (what the catalog keeps with its entries: the folders each table uses)
+        r.section_mut::<crate::store::CatalogHooks>().add(crate::ddl::folder_hook());
         #[cfg(feature = "lake")] // (what the log's commits call: a view's rows, derived as its sources' are packed)
         r.section_mut::<crate::log::CommitHooks>().add(crate::views::hook());
     },
@@ -197,7 +244,8 @@ fn own(mut ctx: SessionContext) -> SessionContext {
     crate::string_agg::register(&ctx); // string_agg: one group's string held to a share of the query memory
     crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
     crate::dialect_fns::register(&ctx); // safe_divide(a, b): BigQuery's, typed by its arguments
-    crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
+    crate::finish::register(&ctx); // pondra_moments(x): what a view kept for a variance (made before format 7)
+    crate::fvar::register_parts(&ctx); // pondra_mean_parts(x), pondra_var_parts(x): what a view keeps for an average and a variance
     crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
     // `pg_bytea` gives Postgres's bytea functions, `byte_length` among them (DataFusion's other byte functions, sha256
     // and md5, take BINARY as they are); substr is below.
@@ -431,7 +479,10 @@ pub async fn planned(ctx: &SessionContext, sql: &str) -> anyhow::Result<LogicalP
 /// statements are compared, not their plans: DataFusion's planner gives one statement plans that differ run to run where
 /// no answer does (the columns an ORDER BY adds below its projection come out of a hash set, in either order).
 fn datafusions_parse(state: &datafusion::execution::SessionState, sql: &str, kept: &datafusion::sql::parser::Statement) -> anyhow::Result<()> {
-    let theirs = state.sql_to_statement(sql, &state.config().options().sql_parser.dialect);
+    let mut theirs = state.sql_to_statement(sql, &state.config().options().sql_parser.dialect);
+    if let Ok(datafusion::sql::parser::Statement::Statement(s)) = &mut theirs {
+        crate::parsed::signed(s.as_mut()); // (as the front's parse has it: `parsed::signed`)
+    }
     anyhow::ensure!(theirs.as_ref().is_ok_and(|t| t == kept), "one parse: the front's parse of the text is not DataFusion's, for {sql}\nthe front's: {kept}\nDataFusion's: {theirs:?}");
     Ok(())
 }
@@ -544,11 +595,56 @@ fn analyze_output(exec: &AnalyzeExec, schema: &SchemaRef, rows: usize, duration:
     Ok(RecordBatch::try_new(schema.clone(), vec![Arc::new(kinds.finish()), Arc::new(plans.finish())])?)
 }
 
+/// A lake's sessions: the catalog keeps the lake (`store::Lake`), and the engine makes the sessions that query it, with
+/// the lake's own functions in each.
+#[cfg(feature = "lake")]
+impl crate::store::Lake {
+    /// A fresh SQL session on the shared runtime (`partitions()` of them).
+    pub fn session(&self) -> SessionContext {
+        self.session_with(crate::store::partitions())
+    }
+
+    /// A session with a fixed number of partitions: 1 for point lookups, where splitting the work
+    /// costs more than it saves and many queries run at once. Its functions, planners and rules
+    /// are the same for every query, so they are made once (`made`) and copied; each copy gets
+    /// catalogs of its own, so the tables a query registers are its alone.
+    pub fn session_with(&self, partitions: usize) -> SessionContext {
+        crate::store::spill_room(); // (the spill disk's room as it is now: `Spills` looked at it once, when the first spill made the disk)
+        let state = self.sessions.lock().unwrap().entry(partitions).or_insert_with(|| self.made(partitions).state()).clone();
+        let catalog = datafusion::execution::SessionStateDefaults::default_catalog(state.config(), state.table_factories(), state.runtime_env());
+        let ctx = with_catalog(state, Arc::new(catalog));
+        for (_, add) in &crate::registry::get().section::<LakeFunctions>().0 {
+            add(&ctx, self.arc()); // (here, not in what is kept: the lake would keep itself)
+        }
+        ctx
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::util::display::array_value_to_string;
+
+    /// A lake's sessions get the functions of the lake each module adds (`LakeFunctions`): `files('…')`, the sequences',
+    /// `secrets()` and `extensions()`. A session made without a lake has none of them.
+    #[cfg(feature = "lake")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lakes_sessions_have_its_functions() -> anyhow::Result<()> {
+        let names: Vec<_> = crate::registry::get().section::<LakeFunctions>().names().collect();
+        assert_eq!(names, ["files", "sequences", "secrets", "extensions"]);
+        let url = format!("memory://lake-functions-{}", uuid::Uuid::new_v4().simple());
+        let lake = crate::store::Lake::open(&url, true, false, crate::node_state::NodeState::unhosted()).await?;
+        use datafusion::execution::FunctionRegistry;
+        let (ctx, bare) = (lake.session(), session(SessionConfig::new(), Arc::new(RuntimeEnv::default())));
+        for f in ["nextval", "currval", "setval", "file_read"] {
+            assert!(ctx.udf(f).is_ok() && bare.udf(f).is_err(), "{f}");
+        }
+        for f in ["files", "secrets", "extensions"] {
+            assert!(ctx.table_function(f).is_ok() && bare.table_function(f).is_err(), "{f}");
+        }
+        Ok(())
+    }
 
     /// Every session gets the build's function sets, in the order `crate::built_in` lists their extensions, and has
     /// each set's functions (one of each, by a name only it registers).
