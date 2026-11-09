@@ -285,6 +285,8 @@ mod table_record;
 #[cfg(feature = "lake")] mod write;
 // The registry's statements section: a statement an extension adds, read by `write::parse` at one place.
 #[cfg(feature = "lake")] pub mod statements;
+// The core's statement families in that section, each read from its words (step 8, PR 8).
+#[cfg(feature = "lake")] mod core_statements;
 // The registry's connection types section, and the `connections` extension that adds the kind and its statements.
 #[cfg(feature = "lake")] pub mod connections;
 #[cfg(feature = "lake")] mod connect;
@@ -305,6 +307,8 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         #[cfg(feature = "lake")]
         &objects::CATALOG,
         #[cfg(feature = "lake")]
+        &core_statements::CORE_STATEMENTS,
+        #[cfg(feature = "lake")]
         &connect::CONNECTIONS,
         #[cfg(feature = "lake")]
         &read_delta::DELTA,
@@ -314,6 +318,8 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &kafka_client::KAFKA,
         #[cfg(feature = "lake")]
         &sharing_client::SHARING,
+        #[cfg(feature = "lake")]
+        &sso::SSO,
         &sparksql::SPARK,
         &engine::ENGINE,
         #[cfg(feature = "lake")]

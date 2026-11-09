@@ -429,8 +429,11 @@ commit that wrote the view's other rows, so nothing dropped is lost:
 | `run` | the write that brought it: a statement's job (a task's is `pondra.runs.job`), an `/append`'s producer, or `fill:…` for rows already there when the view was made |
 | `time` | when it was left out |
 
-A view's rows are kept for its `retention` (7 days unless set, as for undropping it). A user with grants
-sees the rows of the views it may read in whole.
+A view's rows are kept for its `retention` (7 days unless set, as for undropping it), and they are the
+view's own: a view made again under its name (dropped and made, replaced, or undropped, which makes it
+again from its query) starts with none of the earlier one's. A user with grants sees the rows of the
+views it may read in whole, so a grant of all of a view shows the rows it left out as well, every column
+of each.
 
 ```sql
 SELECT name, follows, kind FROM pondra.flows WHERE name = 'sold_by_item';

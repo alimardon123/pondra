@@ -79,17 +79,52 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     let mut w = Words::of(sql)?;
     let words: Vec<String> = w.0.iter().rev().map(W::word).collect();
     let ours = match words.first()?.as_str() {
-        "create" | "alter" | "drop" => matches!(words.get(1).map(String::as_str), Some("share" | "recipient")),
+        // (CREATE, ALTER and DROP SHARE and RECIPIENT: the sharing extension's entries, `ENTRIES`; read here too only as
+        // `write::was` reads, before PR 8 moved them)
+        "create" | "alter" | "drop" => entries_skipped() && matches!(words.get(1).map(String::as_str), Some("share" | "recipient")),
         "grant" | "revoke" => words.windows(2).any(|p| matches!(p[0].as_str(), "on" | "to" | "from") && p[1] == "share"),
         _ => false,
     };
-    if !ours {
-        return None;
-    }
-    Some(match parse(&mut w) {
+    ours.then(|| said(&mut w))
+}
+
+fn said(w: &mut Words) -> crate::write::Stmt {
+    match parse(w) {
         Ok(change) => crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Shares(change)]),
         Err(e) => crate::write::Stmt::Invalid(e.to_string()),
-    })
+    }
+}
+
+#[cfg(test)]
+fn entries_skipped() -> bool { crate::write::was::old() }
+#[cfg(not(test))]
+fn entries_skipped() -> bool { false }
+
+/// The sharing extension's statements in the registry's statements section, by their words (step 8, PR 8b). The core
+/// carries them out (`Ddl::Shares`), so they stand in for their run and right until the extension has its own.
+pub(crate) static ENTRIES: &[crate::statements::Statement] = &[
+    entry(&["CREATE", "SHARE"], "a share: tables a recipient reads by Delta Sharing (ADR-045)"),
+    entry(&["CREATE", "RECIPIENT"], "a recipient of shares, and its token"),
+    entry(&["ALTER", "SHARE"], "a share's tables: ADD TABLE, REMOVE TABLE"),
+    entry(&["ALTER", "RECIPIENT"], "a recipient's token, rotated"),
+    entry(&["DROP", "SHARE"], "drops a share"),
+    entry(&["DROP", "RECIPIENT"], "drops a recipient"),
+    entry(&["CREATE", "OR", "REPLACE", "SHARE"], "refused: replacing a share would drop its tables and grants"),
+    entry(&["CREATE", "OR", "REPLACE", "RECIPIENT"], "refused: replacing a recipient would drop its token and shares"),
+];
+
+const fn entry(words: &'static [&'static str], about: &'static str) -> crate::statements::Statement {
+    use crate::statements::{Read, Right, Run};
+    crate::statements::Statement { words, read: Read::Core(read), run: Run::Stmt, right: Right::FromStmt, needs: &[], about, extension: "sharing" }
+}
+
+fn read(w: &mut Words) -> Result<crate::write::Stmt> {
+    if w.begins(&["CREATE", "OR", "REPLACE"]) {
+        w.expect_all(&["create", "or", "replace"])?;
+        let kind = w.next().map(|k| k.word()).unwrap_or_default();
+        return Ok(crate::core_statements::replacing(&kind, if kind == "share" { "its tables and grants" } else { "its token and the shares granted to it" }));
+    }
+    Ok(said(w))
 }
 
 fn parse(w: &mut Words) -> Result<Change> {
@@ -500,8 +535,10 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'
 mod tests {
     use super::*;
 
+    /// `sql`'s change, read as the front reads it (`write::parse`): CREATE, ALTER and DROP by the section's entries, GRANT
+    /// and REVOKE on SHARE by `statement`.
     fn change(sql: &str) -> Change {
-        match statement(sql) {
+        match crate::write::parse(sql) {
             Some(crate::write::Stmt::Ddl(mut d)) => match d.remove(0) {
                 crate::ddl::Ddl::Shares(c) => c,
                 _ => panic!("not a share's"),

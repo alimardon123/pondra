@@ -142,25 +142,35 @@ const PRIVILEGES: [&str; 7] = ["select", "insert", "update", "delete", "usage", 
 /// `CREATE USER|ROLE`, `ALTER USER|ROLE`, `DROP USER|ROLE`, `GRANT`, `REVOKE`, `CREATE TOKEN`,
 /// `DROP TOKEN`, as a write the leader carries out; None for anything else.
 pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
-    use crate::write::Stmt;
     let words = Words::of(sql)?;
     let first = words.peek_word()?;
-    if !matches!(first.as_str(), "create" | "alter" | "drop" | "grant" | "revoke") {
-        return None;
-    }
     let second = words.0.iter().rev().nth(1).map(|t| t.word()).unwrap_or_default(); // (the words are kept last first)
     let ours = match first.as_str() {
         "grant" | "revoke" => true,
-        _ => matches!(second.as_str(), "user" | "role" | "token"),
+        // (CREATE, ALTER and DROP USER, ROLE and TOKEN: the statements section's entries, `core_statements.rs`; read here
+        // too only as `write::was` reads, before PR 8 moved them)
+        "create" | "alter" | "drop" => entries_skipped() && matches!(second.as_str(), "user" | "role" | "token"),
+        _ => false,
     };
-    if !ours {
-        return None;
-    }
-    Some(match parse(words) {
+    ours.then(|| said(words))
+}
+
+/// CREATE, ALTER and DROP USER, ROLE and TOKEN, by their words: the statements section's entries' reader.
+pub(crate) fn read(w: &mut Words) -> Result<crate::write::Stmt> { Ok(said(std::mem::replace(w, Words::default()))) }
+
+fn said(words: Words) -> crate::write::Stmt {
+    use crate::write::Stmt;
+    match parse(words) {
         Ok(change) => Stmt::Ddl(vec![crate::ddl::Ddl::Users(change)]),
         Err(e) => Stmt::of_error(&e, e.to_string()), // (a coded refusal keeps its code: `0LP01` for a privilege its kind lacks)
-    })
+    }
 }
+
+/// Are the statements section's core entries skipped, as `write::was` reads a text before PR 8 moved its readers?
+#[cfg(test)]
+fn entries_skipped() -> bool { crate::write::was::old() }
+#[cfg(not(test))]
+fn entries_skipped() -> bool { false }
 
 fn parse(mut w: Words) -> Result<Change> {
     let verb = w.next().map(|x| x.word()).unwrap_or_default();
@@ -1241,7 +1251,7 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
         }
     };
     let role = if superuser { Role::Admin } else if access.writes() { Role::Write } else { Role::Read };
-    Ok(Principal { name: user.to_string(), role, scope: if superuser { crate::rights::Scope::everything() } else { crate::rights::Scope::granted(access) }, door: "node", from: None, operator: false, epoch, until: None })
+    Ok(Principal { name: user.to_string(), role, scope: if superuser { crate::rights::Scope::everything() } else { crate::rights::Scope::granted(access) }, door: "node", from: None, operator: false, epoch, until: None, reads: false })
 }
 
 /// Seconds as said: `90 seconds`, `5 minutes`, `1 hour`.
@@ -1530,10 +1540,12 @@ mod tests {
 
     #[test]
     fn statements() {
-        let p = |s: &str| match statement(s) {
+        // (read as the front reads it: CREATE, ALTER and DROP by the section's entries, GRANT and REVOKE by `statement`; null
+        // for a statement not users')
+        let p = |s: &str| match crate::statements::matched(s).or_else(|| statement(s)) {
             Some(crate::write::Stmt::Ddl(d)) => match &d[0] {
                 crate::ddl::Ddl::Users(c) => serde_json::to_value(c).unwrap(),
-                _ => panic!(),
+                _ => j!(null),
             },
             Some(crate::write::Stmt::Invalid(e)) => j!({"error": e}),
             Some(crate::write::Stmt::Refused(code, e)) => j!({"error": e, "code": code}),

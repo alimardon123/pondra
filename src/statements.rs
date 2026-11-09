@@ -1,15 +1,17 @@
-//! The registry's statements section (designs/redesign/redesign.md §6): a statement an extension adds, by its leading
-//! words. Each entry says its words, its parser hook, what runs it, the right it needs, what a form must offer for it,
-//! and one line on what it does. `write::parse` consults the section at one place, before the statements the core
-//! reads by hand, so an extension's statement needs no edit anywhere else. Step 8's pipeline dispatches every statement
-//! from here; until then only the extensions' own statements are entries (step 4, l1-wip/step4-plan.md).
+//! The registry's statements section (designs/redesign/redesign.md §6): a statement an extension adds, and a family the
+//! core reads, by its leading words. Each entry says its words, its one reader, what runs it, the right it needs, what a
+//! form must offer for it, and one line on what it does. `write::parse` consults the section at one place, before the
+//! statements the core still reads by hand, so an extension's statement needs no edit anywhere else. Step 8's pipeline
+//! dispatches every statement from here: PR 8 moves the core's families in (`core_statements.rs`,
+//! l6/step8-pr8-plan.md).
 use crate::registry::{Registry, Section};
 use crate::store::Lake;
+use crate::words::Words;
 use anyhow::{Context, Result};
 use futures::future::BoxFuture;
 use serde_json::Value;
 
-/// One statement an extension adds.
+/// One statement an extension adds, or one family of the core's.
 pub struct Statement {
     /// Its leading words, upper-cased (`["CREATE", "CONNECTION"]`), matched on the statement's tokens: where two
     /// entries' words both begin a statement, the longer is it. One of them after the first may be `*`, a name (`a`,
@@ -25,16 +27,19 @@ pub struct Statement {
     pub needs: &'static [Need],
     /// One line: what it does.
     pub about: &'static str,
-    /// The extension that adds it.
+    /// The extension that adds it (`CORE` for the core's).
     pub extension: &'static str,
 }
 
 /// An entry's reader: one per family of statements, so no family is read in two places (step 8's PR 8,
-/// l6/step8-pr8-plan.md). Core families join as `Core` (their words) and `Tree` (sqlparser's tree, where generic reads
-/// every form of the family) in PR 8's next pieces.
+/// l6/step8-pr8-plan.md). `Tree` (sqlparser's tree, where generic reads every form of a family) joins in PR 8c.
 pub enum Read {
     /// An extension's reader: the whole statement's text to what it says.
     Text(fn(&str) -> Result<Parsed>),
+    /// A core family's reader (and, until they have runs of their own, a built-in extension's that the core carries
+    /// out: shares, identity providers): the statement's words, from its first, to the core's statement. An error is
+    /// the statement's refusal, with the SQLSTATE it gives (`write::Stmt::of_error`).
+    Core(fn(&mut Words) -> Result<crate::write::Stmt>),
 }
 
 /// What a statement's parser hook read: the object it changes, as the catalog names it, and the rest of what it says,
@@ -48,12 +53,18 @@ pub struct Parsed {
 pub enum Run {
     /// The leader, under the lake's lock, as it carries out the core's DDL: a change to what the lake holds.
     Leader(for<'a> fn(&'a Lake, Value) -> BoxFuture<'a, Result<Value>>),
+    /// A stand-in, for a core family's entry until it has a run of its own: the `write::Stmt` its reader gives carries
+    /// itself out, as every core statement does today. Counted (`stand_ins`).
+    Stmt,
 }
 
 /// The right a statement needs, read where every statement's is (`rights::asks`, which `rights::may` decides).
 pub enum Right {
     /// An admin's: a superuser, or an admin token.
     Admin,
+    /// A stand-in, for a core family's entry until it has a right of its own: `rights::asks` decides it from the
+    /// `write::Stmt` its reader gives, as for every core statement today. Counted (`stand_ins`).
+    FromStmt,
 }
 
 /// The role the extensions' statements in `ds` need (an admin's for one this build has no extension for: the leader
@@ -62,11 +73,12 @@ pub(crate) fn role(ds: &[crate::ddl::Ddl]) -> crate::auth::Role {
     let statements = crate::registry::get().find::<Statements>();
     let right = |words: &str| statements.and_then(|s| s.named(words)).map(|s| &s.right);
     let of = |d: &crate::ddl::Ddl| match d {
+        // (a core entry's statement is the core's own, never an Entry: one sent as an Entry needs the most)
         crate::ddl::Ddl::Entry { words, .. } => match right(words) {
-            Some(Right::Admin) | None => crate::auth::Role::Admin,
+            Some(Right::Admin | Right::FromStmt) | None => crate::auth::Role::Admin,
         },
         crate::ddl::Ddl::UndropKept { kind, .. } => match right(&dropping(kind)) {
-            Some(Right::Admin) | None => crate::auth::Role::Admin,
+            Some(Right::Admin | Right::FromStmt) | None => crate::auth::Role::Admin,
         },
         _ => crate::auth::Role::Admin,
     };
@@ -111,8 +123,8 @@ fn offered(need: Need) -> bool {
     }
 }
 
-/// The registry's statements section: every statement an extension adds, each one's words once, found by its first
-/// word.
+/// The registry's statements section: every statement an extension adds and every family the core reads here, each
+/// one's words once, found by its first word.
 #[derive(Default)]
 pub struct Statements {
     all: Vec<&'static Statement>,
@@ -124,8 +136,8 @@ pub const CORE: &str = "core";
 
 /// The leading words of the statements the core reads outside this section today (`write::parse`'s readers and its
 /// match on sqlparser's tree), after a CREATE's `OR REPLACE`, `OR ALTER`, `TEMP` or `TEMPORARY`: an extension's entry
-/// may not begin with one, so no extension takes a core statement over with longer words. Each goes as its family
-/// becomes a core entry (PR 8b-8d), which the same check covers.
+/// may not begin with one, so no extension takes a core statement over with longer words. Each goes as its whole family
+/// becomes a core entry (PR 8b-8d), which the same check covers (`ALTER DATABASE`, USER, ROLE, TOKEN, SHARE, RECIPIENT and IDENTITY PROVIDER have).
 const CORE_WORDS: &[&[&str]] = &[
     &["SELECT"], &["WITH"], &["VALUES"], &["TABLE"], &["FROM"], &["INSERT"], &["UPDATE"], &["DELETE"], &["MERGE"], &["TRUNCATE"],
     &["GRANT"], &["REVOKE"], &["COMMENT"], &["COPY"], &["ATTACH"], &["DETACH"], &["UNDROP"], &["BACKUP"], &["RESTORE"],
@@ -133,15 +145,12 @@ const CORE_WORDS: &[&[&str]] = &[
     &["EXPLAIN"], &["BEGIN"], &["START"], &["COMMIT"], &["ROLLBACK"], &["END"], &["CHECKPOINT"], &["EXPORT"], &["IMPORT"],
     &["CREATE", "TABLE"], &["CREATE", "EXTERNAL"], &["CREATE", "VIEW"], &["CREATE", "MATERIALIZED"], &["CREATE", "SCHEMA"],
     &["CREATE", "DATABASE"], &["CREATE", "FUNCTION"], &["CREATE", "PROCEDURE"], &["CREATE", "MACRO"], &["CREATE", "TASK"],
-    &["CREATE", "PIPELINE"], &["CREATE", "USER"], &["CREATE", "ROLE"], &["CREATE", "TOKEN"], &["CREATE", "SHARE"],
-    &["CREATE", "RECIPIENT"], &["CREATE", "IDENTITY"], &["CREATE", "SECRET"], &["CREATE", "PERSISTENT"],
+    &["CREATE", "PIPELINE"], &["CREATE", "SECRET"], &["CREATE", "PERSISTENT"],
     &["CREATE", "SEQUENCE"], &["CREATE", "INDEX"], &["CREATE", "UNIQUE"], &["CREATE", "TYPE"],
-    &["ALTER", "TABLE"], &["ALTER", "VIEW"], &["ALTER", "MATERIALIZED"], &["ALTER", "SCHEMA"], &["ALTER", "DATABASE"],
-    &["ALTER", "TASK"], &["ALTER", "USER"], &["ALTER", "ROLE"], &["ALTER", "SHARE"], &["ALTER", "RECIPIENT"],
-    &["ALTER", "IDENTITY"], &["ALTER", "SEQUENCE"], &["ALTER", "INDEX"], &["ALTER", "TYPE"],
+    &["ALTER", "TABLE"], &["ALTER", "VIEW"], &["ALTER", "MATERIALIZED"], &["ALTER", "SCHEMA"],
+    &["ALTER", "TASK"], &["ALTER", "SEQUENCE"], &["ALTER", "INDEX"], &["ALTER", "TYPE"],
     &["DROP", "TABLE"], &["DROP", "VIEW"], &["DROP", "MATERIALIZED"], &["DROP", "SCHEMA"], &["DROP", "DATABASE"],
-    &["DROP", "FUNCTION"], &["DROP", "PROCEDURE"], &["DROP", "MACRO"], &["DROP", "TASK"], &["DROP", "USER"],
-    &["DROP", "ROLE"], &["DROP", "TOKEN"], &["DROP", "SHARE"], &["DROP", "RECIPIENT"], &["DROP", "IDENTITY"],
+    &["DROP", "FUNCTION"], &["DROP", "PROCEDURE"], &["DROP", "MACRO"], &["DROP", "TASK"],
     &["DROP", "SECRET"], &["DROP", "PERSISTENT"], &["DROP", "TEMPORARY"], &["DROP", "SEQUENCE"], &["DROP", "INDEX"],
     &["DROP", "TYPE"],
 ];
@@ -169,9 +178,13 @@ impl Section for Statements {
 
 impl Statements {
     /// Adds an entry. Refused when the registry is built: words not upper-cased, a name first or twice, words another
-    /// entry has, and an extension's words that begin with a core statement's.
+    /// entry has, an extension's words that begin with a core statement's, and a reader, run and right that aren't one
+    /// kind's: a reader of the core's statement with both stand-ins, or a reader of what its own run takes, and its
+    /// own right.
     pub fn add(&mut self, s: &'static Statement) {
         let words = s.words.join(" ");
+        let stand_in = matches!(s.read, Read::Core(_));
+        assert!(stand_in == matches!(s.run, Run::Stmt) && stand_in == matches!(s.right, Right::FromStmt), "{words}: a reader of the core's statement stands in for its run and right (Read::Core, Run::Stmt, Right::FromStmt), and one of an extension's own has both (Read::Text, Run::Leader and its right)");
         assert!(!s.words.is_empty() && s.words.iter().all(|w| *w == w.to_uppercase()), "a statement's words are upper-cased: {words}");
         assert!(s.words[0] != "*" && s.words.iter().filter(|w| **w == "*").count() <= 1, "a statement's words hold at most one name, never first: {words}");
         assert!(self.all.iter().all(|o| o.words != s.words), "two statements are {words}");
@@ -186,15 +199,21 @@ impl Statements {
         self.all.push(s);
     }
 
-    /// The statement `sql` is, by its words: the entry whose words begin it, the longest where two do. A statement whose
-    /// first word begins no entry is tokenized here not at all. The first word is its letters (`text::head`), as the
-    /// tokenizer ends it, so `COPY(SELECT 1) TO …` is COPY's to read.
-    fn of(&self, sql: &str) -> Option<&'static Statement> {
+    /// The statement `sql` is, by its words: the entry whose words begin it, the longest where two do, and its words. A
+    /// statement whose first word begins no entry is tokenized here not at all. The first word is its letters
+    /// (`text::head`), as the tokenizer ends it, so `COPY(SELECT 1) TO …` is COPY's to read.
+    fn of(&self, sql: &str) -> Option<(&'static Statement, Words)> {
         let first = crate::text::head(sql).to_ascii_uppercase();
         let entries = self.by_first.get(first.as_str())?;
-        let words = crate::words::Words::of(sql)?;
-        entries.iter().filter(|s| words.begins(s.words)).max_by_key(|s| s.words.len()).copied()
+        let words = Words::of(sql)?;
+        let s = entries.iter().filter(|s| words.begins(s.words) && !moved_skipped(s)).max_by_key(|s| s.words.len()).copied()?;
+        Some((s, words))
     }
+
+    /// How many entries still stand in for their run or right (`Run::Stmt`, `Right::FromStmt`): it grows as PR 8 moves
+    /// the core's families in, and falls as each gets its own (a test counts them).
+    #[cfg(test)]
+    pub(crate) fn stand_ins(&self) -> usize { self.all.iter().filter(|s| matches!(s.run, Run::Stmt) || matches!(s.right, Right::FromStmt)).count() }
 
     /// The entry with these words, as the leader is sent them.
     fn named(&self, words: &str) -> Option<&'static Statement> {
@@ -202,26 +221,35 @@ impl Statements {
     }
 }
 
-/// `sql` as one of the extensions' statements, for `write::parse`: what the leader carries out, or why it is refused.
-/// None: it is none of theirs.
+/// `sql` as one of the section's statements, for `write::parse`: what it says (an extension's, for the leader to carry
+/// out; the core's, as `write::Stmt`), or why it is refused. None: it is none of theirs.
 pub(crate) fn matched(sql: &str) -> Option<crate::write::Stmt> {
     matched_in(crate::registry::get(), sql, offered)
 }
 
 fn matched_in(r: &Registry, sql: &str, offered: fn(Need) -> bool) -> Option<crate::write::Stmt> {
     use crate::write::Stmt;
-    let s = r.find::<Statements>()?.of(sql)?;
+    let (s, mut said) = r.find::<Statements>()?.of(sql)?;
     let words = s.words.join(" ");
     if let Some(need) = s.needs.iter().find(|n| !offered(**n)) {
         return Some(Stmt::Refused("0A000", format!("{words} needs {}", need.word())));
     }
     let read = match s.read {
-        Read::Text(read) => read(sql).map(|Parsed { object, tree }| match s.run {
-            Run::Leader(_) => Stmt::Ddl(vec![crate::ddl::Ddl::Entry { words, object, tree }]),
-        }),
+        Read::Text(read) => read(sql).map(|Parsed { object, tree }| Stmt::Ddl(vec![crate::ddl::Ddl::Entry { words, object, tree }])),
+        Read::Core(read) => read(&mut said),
     };
     Some(read.unwrap_or_else(|e| Stmt::of_error(&e, format!("{e:#}"))))
 }
+
+/// Is `sql` read by an entry PR 8 moved in (a reader of the core's statement, `Read::Core`)?
+#[cfg(test)]
+pub(crate) fn moved(sql: &str) -> bool { crate::registry::get().find::<Statements>().and_then(|s| s.of(sql)).is_some_and(|(s, _)| matches!(s.read, Read::Core(_))) }
+
+/// Is `s` an entry PR 8 moved in, while `write::was` reads a text as the readers it replaced did (so it is skipped)?
+#[cfg(test)]
+fn moved_skipped(s: &Statement) -> bool { matches!(s.read, Read::Core(_)) && crate::write::was::old() }
+#[cfg(not(test))]
+fn moved_skipped(_: &Statement) -> bool { false }
 
 /// Leader: carry out an extension's statement, as `write::parse` read it.
 pub(crate) async fn carry_out(lake: &Lake, words: &str, tree: Value) -> Result<Value> {
@@ -233,6 +261,7 @@ async fn carry_out_in(r: &Registry, lake: &Lake, words: &str, tree: Value) -> Re
     let s = r.find::<Statements>().and_then(|s| s.named(words)).with_context(|| format!("{words}: this node's build has no extension that adds it"))?;
     match s.run {
         Run::Leader(f) => f(lake, tree).await,
+        Run::Stmt => anyhow::bail!("{words} is the core's: it is carried out as the statement its reader gives"),
     }
 }
 
@@ -322,7 +351,7 @@ mod tests {
     fn no_extension_takes_a_core_statement() {
         static GRANTED: Statement = Statement { words: &["GRANT", "THING"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::Admin, needs: &[], about: "", extension: "things" };
         static TABLED: Statement = Statement { words: &["CREATE", "OR", "REPLACE", "TEMP", "TABLE", "THING"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::Admin, needs: &[], about: "", extension: "things" };
-        static CLONE: Statement = Statement { words: &["CREATE", "THING", "*", "CLONE"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::Admin, needs: &[], about: "", extension: CORE };
+        static CLONE: Statement = Statement { words: &["CREATE", "THING", "*", "CLONE"], read: Read::Core(core_thing), run: Run::Stmt, right: Right::FromStmt, needs: &[], about: "", extension: CORE };
         static LONGER: Statement = Statement { words: &["CREATE", "THING", "*", "CLONE", "NOW"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::Admin, needs: &[], about: "", extension: "things" };
         static NAMED: Statement = Statement { words: &["*", "THING"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::Admin, needs: &[], about: "", extension: "things" };
         let refused = |entries: &[&'static Statement]| {
@@ -337,6 +366,31 @@ mod tests {
         assert!(refused(&[&CLONE, &LONGER]) && refused(&[&LONGER, &CLONE]), "a core entry's words, whichever is added first");
         assert!(refused(&[&NAMED]), "a name never begins an entry");
         assert!(!refused(&[&THING, &BIG, &COPIED, &CLONE]), "words of their own");
+    }
+
+    fn core_thing(_: &mut Words) -> Result<Stmt> { Ok(Stmt::Invalid("a thing".into())) }
+
+    /// A reader of the core's statement stands in for its run and right until its family has its own, and one of what an
+    /// extension's run takes says its right.
+    #[test]
+    fn an_entrys_reader_run_and_right_are_its_kinds() {
+        static CORE_TEXT: Statement = Statement { words: &["MAKE", "CORE"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::FromStmt, needs: &[], about: "", extension: CORE };
+        static CORE_LEADER: Statement = Statement { words: &["MAKE", "CORE"], read: Read::Core(core_thing), run: Run::Leader(made), right: Right::FromStmt, needs: &[], about: "", extension: CORE };
+        static EXT_CORE: Statement = Statement { words: &["MAKE", "OURS"], read: Read::Core(core_thing), run: Run::Stmt, right: Right::Admin, needs: &[], about: "", extension: "things" };
+        static EXT_STAND_IN: Statement = Statement { words: &["MAKE", "OURS"], read: Read::Text(parse_thing), run: Run::Leader(made), right: Right::FromStmt, needs: &[], about: "", extension: "things" };
+        static CORE_OK: Statement = Statement { words: &["KEEP", "CORE"], read: Read::Core(core_thing), run: Run::Stmt, right: Right::FromStmt, needs: &[], about: "", extension: CORE };
+        static EXT_OK: Statement = Statement { words: &["MAKE", "OURS"], read: Read::Core(core_thing), run: Run::Stmt, right: Right::FromStmt, needs: &[], about: "", extension: "things" };
+        for bad in [&CORE_TEXT, &CORE_LEADER, &EXT_CORE, &EXT_STAND_IN] {
+            assert!(std::panic::catch_unwind(|| Statements::default().add(bad)).is_err(), "{}", bad.words.join(" "));
+        }
+        let mut s = Statements::default();
+        s.add(&CORE_OK);
+        s.add(&EXT_OK);
+        s.add(&THING);
+        assert_eq!(s.stand_ins(), 2);
+        static CORE_THINGS: BuiltIn = BuiltIn { name: CORE, requires: &[], register: |r| r.section_mut::<Statements>().add(&CORE_OK) };
+        let r = Registry::build(&[&CORE_THINGS, &THINGS]);
+        assert!(matches!(matched_in(&r, "keep /* its words */ core x", |_| true), Some(Stmt::Invalid(e)) if e == "a thing"), "the core's reader gives the statement");
     }
 
     #[test]
