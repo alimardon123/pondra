@@ -351,9 +351,11 @@ impl Node {
             }
             let down = Arc::new(std::sync::atomic::AtomicBool::new(false)); // (is the leader's commit stream down: the mirror says, a reader's watch reads)
             if lives {
+                let weak = Arc::downgrade(&lake); // (its running statements, said to the leader: their files stay, `readings.rs`)
+                let said: crate::cluster::Said = Arc::new(move || weak.upgrade().map(|l| crate::readings::said(&l)).unwrap_or_default());
                 match reader {
-                    false => cluster.clone().follow(store, lake.log.untaken.clone(), &here),
-                    true => cluster.clone().watch_leader(store, streamed, down.clone(), &here), // a reader never votes or leads
+                    false => cluster.clone().follow(store, lake.log.untaken.clone(), said, &here),
+                    true => cluster.clone().watch_leader(store, streamed, down.clone(), said, &here), // a reader never votes or leads
                 }
             }
             if streamed {

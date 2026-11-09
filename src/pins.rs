@@ -1,7 +1,8 @@
 //! Who still reads a lake's old versions (redesign step 5, piece 13): one list, by kind of reader. A branch made from the
 //! lake reads its files as they were then (`branch`, its `pn/` pins); a streaming task, a view run again and a Kafka
-//! consumer group read the log (`tasks`, `rerun`, `kafka`); a share's recipient, a long query and an outside snapshot
-//! (Iceberg's and Delta's published versions) are kinds that can join them. Expiry (`tier::expire`), the orphan sweep and
+//! consumer group read the log (`tasks`, `rerun`, `kafka`); a statement still running reads the files its view lists
+//! (`readings`, a node's and its followers'); a share's recipient and an outside snapshot (Iceberg's and Delta's published
+//! versions) are kinds that can join them. Expiry (`tier::expire`), the orphan sweep and
 //! a backup's garbage keep what the oldest reader still reads (`held`), each after every kind lets go of its readers that
 //! are gone (`lapse`, each round; `sweep`, hourly), and expiry keeps the log's segments its readers still read (`floor`).
 use crate::registry::Section;
@@ -9,7 +10,9 @@ use crate::store::Lake;
 use anyhow::Result;
 use futures::future::BoxFuture;
 
-/// The oldest and the newest version (commit time, ms) a kind's readers still read in a lake: None when none does.
+/// The oldest and the newest version (commit time, ms) a kind's readers still read in a lake: None when none does. Files
+/// let go of since the oldest stay; objects older than the newest stay from the orphan sweep, since a reader may read one
+/// nothing lists any more (a branch's), and a kind whose readers read only what the catalog lists says 0.
 pub type Held = for<'a> fn(&'a Lake) -> BoxFuture<'a, Result<Option<(u64, u64)>>>;
 
 /// A kind's readers that are gone let go, before the rest are counted.

@@ -153,6 +153,7 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add_at_open::<std::sync::Mutex<crate::query::Tails>>();
             states.add::<crate::seq::Blocks>();
             states.add::<crate::pages::Pages>();
+            states.add::<crate::readings::Readings>();
             states.add::<crate::page_records::Unsent>();
             states.add::<crate::page_records::Counted>();
             states.add::<crate::ext::Stores>();
@@ -178,7 +179,7 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         #[cfg(feature = "lake")]
         r.section_mut::<crate::records::Rights>().add(crate::users::RIGHTS);
         #[cfg(feature = "lake")] // (who still reads a lake's old files: `pins`)
-        for p in [crate::branch::readers(), crate::tasks::readers(), crate::rerun::readers()] {
+        for p in [crate::branch::readers(), crate::tasks::readers(), crate::rerun::readers(), crate::readings::readers()] {
             r.section_mut::<crate::pins::Pins>().add(p);
         }
         #[cfg(feature = "lake")] // (what the catalog keeps with its entries: the folders each table uses)
