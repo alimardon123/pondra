@@ -453,7 +453,7 @@ fn group_keys(plan: &LogicalPlan) -> Vec<String> {
 /// What the rows alone can't keep: the first aggregate that needs every row of its group
 /// (`median`, a DISTINCT, an ordered `string_agg`, …), as "median() needs every row of a group".
 pub fn needs(plan: &LogicalPlan) -> Option<String> {
-    const KEPT: [&str; 13] = ["count", "sum", "min", "max", "avg", "stddev", "stddev_pop", "var", "var_pop", "variance", "bool_and", "bool_or", crate::finish::MOMENTS];
+    const KEPT: [&str; 15] = ["count", "sum", "min", "max", "avg", "stddev", "stddev_pop", "var", "var_pop", "variance", "bool_and", "bool_or", crate::finish::MOMENTS, crate::fvar::MEAN_PARTS, crate::fvar::VAR_PARTS];
     let mut found = None;
     let _ = plan.apply_with_subqueries(|node| {
         if let LogicalPlan::Aggregate(a) = node {
@@ -841,7 +841,7 @@ pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &
     for (name, v) in views {
         let Some(turn) = turn(lake, &name, v.rerun.as_ref().expect("filtered"), last_change(lake, &follows(&v))) else { continue };
         let (lake, seq, lock) = (lake.clone(), seq.clone(), lock.clone());
-        crate::panics::aside(crate::auth::as_node(async move { // (the node's own work, as a view's refresh is: `auth::as_node`)
+        crate::spawns::aside(crate::auth::as_node(async move { // (the node's own work, as a view's refresh is: `auth::as_node`)
             let _slot = waiting(&turn.waited, crate::views::slot(&lake)).await; // (waiting for a slot is not the run's time)
             let r = crate::views::bounded(run(&lake, &seq, &lock, &name, &v, &turn)).await;
             turn.ended(&r);

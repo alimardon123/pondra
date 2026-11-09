@@ -39,6 +39,11 @@ pub trait Net: Send + Sync {
     /// The client for `policy`: pooled, one per policy per node.
     fn client(&self, policy: Policy) -> reqwest::Client;
 
+    /// The client a node calls its lake's other nodes with (`Cluster`'s), signed with `token`: the node's own, its lake's key
+    /// when the process has none (`NodeState::token`), which `client` can't know. A form that reaches the nodes its own way
+    /// answers it; None makes it as a native host does, through the lake's TLS (`cluster::client`; audit 11-09 L5).
+    fn nodes(&self, _token: Option<&str>) -> Option<reqwest::Client> { None }
+
     /// object_store's HTTP connector for a store reached by `policy`, `headers` sent with every request (an http secret's
     /// bearer token): a store a reader's own temporary secret makes is `Public`'s, any other the admin's (`Endpoint`).
     /// A lake's own bucket has the lake's budget instead (`budget::Budget`).

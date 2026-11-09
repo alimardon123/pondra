@@ -100,7 +100,7 @@ pub struct Net {
 impl crate::net::Net for Net {
     fn client(&self, policy: crate::net::Policy) -> reqwest::Client {
         match policy {
-            crate::net::Policy::Cluster => crate::cluster::held(&self.cluster, crate::node_state::process_token()),
+            crate::net::Policy::Cluster => crate::cluster::held(&self.cluster, crate::node_state::process_token(), |t| crate::cluster::for_nodes(self, t)),
             other => crate::net::Net::client(&self.clients, other),
         }
     }

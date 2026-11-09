@@ -80,7 +80,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
         // (one job for both tries: a first try the memory watch stopped while its commit was in flight may have committed, and
         // its retry then finds that commit by the job and answers it a duplicate, rather than appending the rows again)
         let job = uuid::Uuid::new_v4().to_string();
-        return crate::query::frugally(&ctx, |ctx| {
+        return crate::query::frugally(&lake.node, &ctx, |ctx| {
             let (query, format, job) = (&query, &format, &job);
             async move {
                 let df = crate::engine::sql(&ctx, query).await?;
@@ -131,7 +131,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     }
     let ctx = crate::query::session_for(lake, &query, "", None, scope).await?; // (made once: a try that runs out of memory retries on a copy of it)
     let stopped = std::sync::Mutex::new(HashSet::new()); // (the writes of the tries stopped: `write_of`)
-    let rows = crate::query::frugally(&ctx, |ctx| {
+    let rows = crate::query::frugally(&lake.node, &ctx, |ctx| {
         let (query, target, kept, stopped) = (&query, &target, &kept, &stopped);
         async move {
             if crate::query::retrying(&ctx) && target.folder() {
@@ -513,7 +513,7 @@ async fn refused_at(lake: &Lake, query: &str, file: &str, dialect: Option<Dialec
             .await?
             .into_iter()
             .map(|mut part| {
-                crate::panics::task(async move {
+                crate::spawns::task(async move {
                     while let Some(batch) = part.next().await {
                         batch?; // (dropped as it is read: one batch at a time)
                     }
