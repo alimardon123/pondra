@@ -210,7 +210,7 @@ struct Txn {
     read_only: bool,
     snapshot: u64,          // the commit a statement reads at (REPEATABLE READ: the one BEGIN saw)
     ran: bool,              // a statement has run: SET TRANSACTION is refused from now on
-    leader: Option<String>, // a follower's leader, which keeps its locks
+    leader: Option<crate::locks::Leader>, // a follower's leader, which keeps its locks
     protocol: bool,         // Flight SQL began it (BeginTransaction): its end is the protocol's, and SQL's words are refused (`command`)
     locked: bool,           // it holds row locks
     state: State,
@@ -294,8 +294,10 @@ pub fn id() -> Option<String> { with_txn(|t| t.id.clone()) }
 /// Is a write in the session's open transaction pending on `table` (rows it kept)?
 pub fn touched(table: &str) -> bool { with_txn(|t| t.tables.get(table).is_some_and(pending)).unwrap_or(false) }
 
-/// The leader a transaction on this node keeps its locks at (None: this node leads).
-fn leader_of(app: &crate::app::App) -> Option<String> { app.seq.is_none().then(|| app.members.leader().addr.clone()) }
+/// The leader a transaction on this node keeps its locks at, and this node, which calls it (None: this node leads).
+fn leader_of(app: &crate::app::App) -> Option<crate::locks::Leader> {
+    app.seq.is_none().then(|| (app.members.leader().addr.clone(), std::sync::Arc::downgrade(&app.lake.node)))
+}
 
 /// `SHOW` of a transaction's setting (ADR-067 §1): what the open transaction runs at (the session's default outside
 /// one), and the session's defaults. None: not one of these.
@@ -1645,7 +1647,7 @@ async fn commit(app: &crate::app::App, s: &str) -> Result<(&'static str, Option<
     let c = Commit { id: t.id.clone(), job: t.job.clone(), reads: t.reads.clone(), tables, placed, rows };
     let sent = match &app.seq {
         Some(seq) => commit_here(&app.lake, seq, &app.lock, c).await,
-        None => crate::write::post(&app.members.leader().addr, &crate::write::Request::Txn(c)).await,
+        None => crate::write::post(&app.lake.node, &app.members.leader().addr, &crate::write::Request::Txn(c)).await,
     };
     if sent.is_err() {
         release_txn(&t);

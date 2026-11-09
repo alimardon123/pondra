@@ -103,7 +103,7 @@ impl Cluster {
                 // (a leader elsewhere that doesn't answer from here, and didn't mark itself when we rang, is gone: the next
                 // term, once it looks dead. Following it would wait for it instead)
                 Holder::Led(t) => {
-                    if answers(&t).await || !deaf(store, &t, Some(&node.claims)).await {
+                    if answers(&t, &node).await || !deaf(store, &t, Some(&node.claims)).await {
                         break t;
                     }
                 }
@@ -272,7 +272,7 @@ impl Cluster {
                     _ = untaken.notified(), if self.leader_ok() => {}
                 }
                 let url = crate::tls::url(&format!("{}/cluster/beat?from={}", self.leader.addr, self.addr));
-                let answer = http().post(url).timeout(Duration::from_secs(2)).send().await;
+                let answer = http(&self.node).post(url).timeout(Duration::from_secs(2)).send().await;
                 missed = !answer.as_ref().is_ok_and(|r| r.status().is_success() || r.headers().contains_key(CUT_OFF_HEADER)); // (a leader cut off answers: its branch below keeps its pace)
                 if self.may_lead && answer.as_ref().is_ok_and(|r| r.headers().contains_key(CUT_OFF_HEADER)) {
                     // The leader says it can't reach the bucket: no lease to wait out, no peer to
@@ -359,13 +359,13 @@ impl Cluster {
     }
 
     /// Does the leader of our term answer? (A read-only node follows its commit stream only then.)
-    pub async fn leader_alive(&self) -> bool { answers(&self.leader).await }
+    pub async fn leader_alive(&self) -> bool { answers(&self.leader, &self.node).await }
 
     /// Does another member still hear our leader (same term)?
     async fn peer_sees_leader(&self) -> bool {
         let peers = self.view.lock().unwrap().clone(); // the last member list we were given
         for peer in peers.iter().filter(|p| **p != self.addr && **p != self.leader.addr) {
-            let ok = http().get(crate::tls::url(&format!("{peer}/cluster/leader"))).timeout(Duration::from_secs(1)).send().await;
+            let ok = http(&self.node).get(crate::tls::url(&format!("{peer}/cluster/leader"))).timeout(Duration::from_secs(1)).send().await;
             if let Ok(r) = ok {
                 if r.json::<(u64, bool)>().await.is_ok_and(|(term, ok)| ok && term == self.leader.n) {
                     return true;
@@ -416,8 +416,8 @@ impl Members for Cluster {
 pub fn of(app: &crate::app::App) -> Option<&Cluster> { app.members.as_any().downcast_ref::<Cluster>() }
 
 /// Does term `t`'s leader answer from here, as its leader?
-async fn answers(t: &Term) -> bool {
-    let r = http().get(crate::tls::url(&format!("{}/cluster/leader", t.addr))).timeout(Duration::from_secs(2)).send().await;
+async fn answers(t: &Term, node: &crate::node_state::NodeState) -> bool {
+    let r = http(node).get(crate::tls::url(&format!("{}/cluster/leader", t.addr))).timeout(Duration::from_secs(2)).send().await;
     match r {
         Ok(r) => r.json::<(u64, bool)>().await.is_ok_and(|(term, _)| term == t.n),
         Err(_) => false,
@@ -459,7 +459,8 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
         // (its last commit; a leader older than this one tells only its log's end, which a table's commit doesn't move)
         let ask = |path: &str| {
             let url = crate::tls::url(&format!("{}{path}", leader.addr));
-            async move { http().get(&url).timeout(Duration::from_secs(2)).send().await?.error_for_status()?.json::<u64>().await }
+            let node = lake.node.clone();
+            async move { http(&node).get(&url).timeout(Duration::from_secs(2)).send().await?.error_for_status()?.json::<u64>().await }
         };
         let upto = loop {
             // (only a leader that has no such route is asked for its log's end: one that refused this node, before it had
@@ -525,11 +526,12 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     // Acks, coalesced: however many changes arrive meanwhile, one request says "up to here".
     let (held, mut to_ack) = tokio::sync::watch::channel((0u64, 0u64, 0u64)); // term, first, last
     let l = leader.clone();
+    let node = lake.node.clone();
     crate::panics::spawn(async move {
         while to_ack.changed().await.is_ok() {
             let (term, first, upto) = *to_ack.borrow_and_update();
             let url = crate::tls::url(&format!("{l}/cluster/ack?from={me}&term={term}&first={first}&upto={upto}"));
-            let _ = http().post(url).timeout(Duration::from_secs(2)).send().await;
+            let _ = http(&node).post(url).timeout(Duration::from_secs(2)).send().await;
         }
     });
     // The stream is read by `members::follow`, which a joined page reads the same way. What is this node's alone (its replica
@@ -553,11 +555,13 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
         (Frame::Committed(_), _) => {}
     };
     let down_open = down.clone(); // (the stream's: `open` says it is up)
+    let node_open = lake.node.clone();
     let open = move || -> futures::future::BoxFuture<'static, std::result::Result<crate::fetch::Response, members::Open>> {
         let url = crate::tls::url(&format!("{leader}/cluster/log"));
         let down = down_open.clone();
+        let node = node_open.clone();
         Box::pin(async move {
-            match crate::fetch::send(http().get(url)).await.and_then(crate::fetch::Response::error_for_status) {
+            match crate::fetch::send(http(&node).get(url)).await.and_then(crate::fetch::Response::error_for_status) {
                 Ok(r) => {
                     down.store(false, std::sync::atomic::Ordering::Relaxed);
                     Ok(r)
@@ -569,35 +573,38 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     crate::panics::spawn(members::follow(Arc::downgrade(&lake), open, frame, move || down.store(true, std::sync::atomic::Ordering::Relaxed), true));
 }
 
-/// One HTTP client (connection pool) for all node-to-node traffic. It carries this process's
-/// token: a node's is the admin token, else the lake's own key for its nodes (`users::node_key`,
-/// known once the lake is open: the client is made again then); a `pondra sql` writer's is
-/// `PONDRA_TOKEN`.
-pub fn http() -> reqwest::Client {
-    crate::per_node!(static MINE: std::sync::Mutex<Option<(Option<String>, reqwest::Client)>> = std::sync::Mutex::new(None));
-    // (a variable set empty is no token, as `env::get` takes it: compose passes an unset one on empty,
-    // and "Bearer " sent in place of the nodes' key left a follower unable to reach its leader)
-    let token = crate::env::get("PONDRA_TOKEN").or_else(|| crate::env::get("PONDRA_ADMIN_TOKEN")).or_else(crate::dial::node_key);
-    let mut client = MINE.lock().unwrap();
-    if let Some((t, c)) = client.as_ref().filter(|(t, _)| *t == token) {
-        let _ = t;
+/// A client (a connection pool) for calls between nodes, sending `token` (none: unsigned) and who calls (ADR-039).
+pub fn client(token: Option<String>) -> reqwest::Client {
+    let mut headers: reqwest::header::HeaderMap = token.iter().filter_map(|t| format!("Bearer {t}").parse().ok()).map(|v| (reqwest::header::AUTHORIZATION, v)).collect();
+    headers.extend(crate::format::headers().into_iter().filter_map(|(k, v)| Some((reqwest::header::HeaderName::from_static(k), v.parse().ok()?)))); // (who calls: ADR-039)
+    let client = |b: reqwest::ClientBuilder| crate::tls::client(b).default_headers(headers.clone()).build(); // (HTTPS between nodes: `tls.rs`)
+    client(reqwest::Client::builder()).unwrap_or_else(|e| {
+        // (a minimal container image with no CA certificates: nodes talk plain HTTP anyway)
+        eprintln!("HTTPS calls out will fail: {e} (install the ca-certificates package)");
+        client(reqwest::Client::builder().tls_certs_only([])).expect("an HTTP client")
+    })
+}
+
+/// The client node `node` calls its lake's other nodes with: its token (`NodeState::token`: this process's, else its lake's
+/// own key for its nodes, known once the lake is open: the client is made again then). Kept on the node (`Calls`).
+pub fn http(node: &crate::node_state::NodeState) -> reqwest::Client { held(&node.calls.client, node.token()) }
+
+/// The client `kept` holds if it was made with `token`, else one made with it now and kept.
+pub fn held(kept: &std::sync::Mutex<Option<(Option<String>, reqwest::Client)>>, token: Option<String>) -> reqwest::Client {
+    let mut kept = kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, c)) = kept.as_ref().filter(|(t, _)| *t == token) {
         return c.clone();
     }
-    let made = {
-        let mut headers: reqwest::header::HeaderMap = token.iter().filter_map(|t| format!("Bearer {t}").parse().ok()).map(|v| (reqwest::header::AUTHORIZATION, v)).collect();
-        headers.extend(crate::format::headers().into_iter().filter_map(|(k, v)| Some((reqwest::header::HeaderName::from_static(k), v.parse().ok()?)))); // (who calls: ADR-039)
-        let client = |b: reqwest::ClientBuilder| crate::tls::client(b).default_headers(headers.clone()).build(); // (HTTPS between nodes: `tls.rs`)
-        client(reqwest::Client::builder()).unwrap_or_else(|e| {
-            // (a minimal container image with no CA certificates: nodes talk plain HTTP anyway)
-            eprintln!("HTTPS calls out will fail: {e} (install the ca-certificates package)");
-            client(reqwest::Client::builder().tls_certs_only([])).expect("an HTTP client")
-        })
-    };
-    *client = Some((token, made.clone()));
+    let made = client(token.clone());
+    *kept = Some((token, made.clone()));
     made
 }
 
-/// The node's dial: HTTP between nodes, with this process's token (`http()`).
+/// A client with this process's own token (`node_state::process_token`) and no node's key, for a call no node makes: a store's
+/// door's (`served.rs`, whose link is made at its first request, before any lake's key is known).
+pub fn process_http() -> reqwest::Client { client(crate::node_state::process_token()) }
+
+/// The node's dial: HTTP between nodes, signed by the calling node's token (`http`).
 pub struct Http;
 
 impl crate::dial::Dial for Http {
@@ -605,8 +612,8 @@ impl crate::dial::Dial for Http {
         if to.contains("://") { to.to_string() } else { crate::tls::url(to) }
     }
 
-    fn call<'a>(&'a self, to: &'a str, c: crate::dial::Call) -> futures::future::BoxFuture<'a, anyhow::Result<crate::dial::Reply>> {
-        Box::pin(send_call(crate::dial::Dial::url(self, to), c))
+    fn call<'a>(&'a self, node: &'a crate::node_state::NodeState, to: &'a str, c: crate::dial::Call) -> futures::future::BoxFuture<'a, anyhow::Result<crate::dial::Reply>> {
+        Box::pin(send_call(node, crate::dial::Dial::url(self, to), c))
     }
 
     fn unreached(&self, e: &anyhow::Error) -> bool {
@@ -614,15 +621,15 @@ impl crate::dial::Dial for Http {
     }
 }
 
-/// One call over `http()`: the request as the node's own calls have always sent it, and the answer as a `Reply`.
-async fn send_call(url: String, c: crate::dial::Call) -> anyhow::Result<crate::dial::Reply> {
+/// One call over `http(node)`: the request as the node's own calls have always sent it, and the answer as a `Reply`.
+async fn send_call(node: &crate::node_state::NodeState, url: String, c: crate::dial::Call) -> anyhow::Result<crate::dial::Reply> {
     use crate::dial::{Reply, Verb};
     let verb = match c.verb {
         Verb::Get => reqwest::Method::GET,
         Verb::Post => reqwest::Method::POST,
         Verb::Delete => reqwest::Method::DELETE,
     };
-    let mut req = http().request(verb, format!("{url}{}", c.path));
+    let mut req = http(node).request(verb, format!("{url}{}", c.path));
     if c.json {
         req = req.header("content-type", "application/json");
     }

@@ -155,10 +155,10 @@ enum Sent {
     Ended,
 }
 
-async fn send(to: &crate::dial::Joined<'_>, unsent: &Unsent, batch: Batch) -> Sent {
+async fn send(to: &crate::dial::Joined<'_>, from: &crate::node_state::NodeState, unsent: &Unsent, batch: Batch) -> Sent {
     let Ok(call) = crate::dial::Call::json("/cluster/records", &batch) else { return Sent::Kept(batch) };
     // (the page's own dial and not `dial::call`: a build with doors dials with the nodes' key, which the node refuses here)
-    match to.call(to.node, call.timeout(Duration::from_secs(5))).await {
+    match to.call(from, to.node, call.timeout(Duration::from_secs(5))).await {
         Ok(reply) => match reply.status {
             200..=299 => Sent::Took,
             401 | 403 => Sent::Ended,
@@ -181,7 +181,7 @@ async fn sweep(members: &dyn crate::members::Members, lake: &Lake) -> bool {
     loop {
         let next = unsent.buffer().take();
         let Some(batch) = next else { return true };
-        match send(&to, &unsent, batch).await {
+        match send(&to, &lake.node, &unsent, batch).await {
             Sent::Took => {}
             Sent::Kept(batch) => {
                 unsent.buffer().give_back(batch);

@@ -18,6 +18,9 @@ pub struct NodeState {
     /// The clients its calls out are made with, by whom each goes to: its process's host's (`net::install`), or its own.
     #[cfg(feature = "lake")]
     pub net: std::sync::Arc<dyn crate::net::Net>,
+    /// How it calls its lake's other nodes (`Calls`).
+    #[cfg(feature = "lake")]
+    pub calls: Calls,
     /// The space it spills into past its memory: its process's host's (`scratch::install`), or this machine's folders.
     #[cfg(feature = "lake")]
     pub scratch: std::sync::Arc<dyn crate::scratch::Scratch>,
@@ -61,7 +64,7 @@ impl NodeState {
     fn make(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values) -> Arc<NodeState> { NodeState::made(life, machine, settings, Default::default()) }
 
     fn made(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values, claims: Arc<Claims>) -> Arc<NodeState> {
-        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, began: datafusion::common::instant::Instant::now() })
+        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).
@@ -74,6 +77,32 @@ impl NodeState {
             eprintln!("start: {what} {:.2} s", self.began.elapsed().as_secs_f64());
         }
     }
+}
+
+/// How a node calls its lake's other nodes (`cluster::http`): the key they call each other with when no admin token is set
+/// (`users::node_key`, known once its lake is open: `dial::set_node_key`), and the client made with its token (`token`),
+/// made again when the token changes.
+#[cfg(feature = "lake")]
+#[derive(Default)]
+pub struct Calls {
+    pub(crate) key: std::sync::RwLock<Option<String>>,
+    #[cfg(feature = "doors")]
+    pub(crate) client: Mutex<Option<(Option<String>, reqwest::Client)>>,
+}
+
+/// This process's own token for calls between nodes: `PONDRA_TOKEN` (a `pondra sql` writer's), else `PONDRA_ADMIN_TOKEN` (a
+/// node's), else `PONDRA_NODE_KEY`. (A variable set empty is no token, as `env::get` takes it: compose passes an unset one on
+/// empty, and "Bearer " sent in place of the nodes' key left a follower unable to reach its leader)
+#[cfg(feature = "lake")]
+pub fn process_token() -> Option<String> {
+    crate::env::get("PONDRA_TOKEN").or_else(|| crate::env::get("PONDRA_ADMIN_TOKEN")).or_else(|| crate::env::get("PONDRA_NODE_KEY"))
+}
+
+#[cfg(feature = "lake")]
+impl NodeState {
+    /// The token this node calls its lake's other nodes with: this process's own (`process_token`), else its lake's key for
+    /// its nodes, once known.
+    pub fn token(&self) -> Option<String> { process_token().or_else(|| self.calls.key.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()) }
 }
 
 /// The HTTP door's state, in order: not opened, serving, closing (its streams end and its answers go out), closed.

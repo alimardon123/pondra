@@ -960,7 +960,7 @@ pub async fn seal_keys(lake: &Lake) -> Result<()> {
             let k = Keys { session: new_session_key()?, node: new_node_key()?, branches: k.branches.or(Some(k.session)) };
             lake.cat.commit(vec![(KEYS.to_string(), json(&sealed(&k)?))], &[]).await?;
             KEYS_HERE.lock().unwrap().insert(lake.url.clone(), k.clone());
-            crate::dial::set_node_key(k.node);
+            crate::dial::set_node_key(&lake.node, k.node);
             eprintln!("the lake's own keys are sealed by its master key now, made new (the ones in the clear could be read from the bucket): everyone signs in again, and its other nodes take them from the bucket within {} s", NODE_KEY_LOOK.as_secs());
         }
         Some(Kept::Sealed { sealed, key }) => {

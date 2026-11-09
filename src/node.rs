@@ -321,9 +321,9 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
         (true, Some(own)) => {
             // (the members are asked with the nodes' key: one that just restarted holds an
             // unsigned call until it has caught up, and it catches up from this leader)
-            if crate::dial::node_key().is_none() {
+            if crate::dial::node_key(&lake.node).is_none() {
                 if let Some(k) = users::node_key_made(&lake).await {
-                    crate::dial::set_node_key(k);
+                    crate::dial::set_node_key(&lake.node, k);
                 }
             }
             Some(replica::recover(&lake, &addr, term, Some(own)).await)
@@ -453,6 +453,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     }
     if lives {
         let l = app.lake.clone();
+        let node = app.lake.node.clone();
         let closing = app.lake.node.drain.closing();
         panics::own(async move {
             // (a follower's catalog shows the leader's keys once the leader has flushed them)
@@ -460,7 +461,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
             for _ in 0..600 {
                 match users::node_key(&l).await {
                     Ok(k) => {
-                        crate::dial::set_node_key(k); // (nodes call each other with it when no admin token is set: cluster::http)
+                        crate::dial::set_node_key(&node, k); // (nodes call each other with it when no admin token is set: cluster::http)
                         // (and a new one when a leader seals keys that were in the clear: `users::seal_keys`)
                         tokio::pin!(closing);
                         loop {
@@ -468,8 +469,8 @@ pub fn keep(app: &crate::app::App, s: &Start) {
                                 () = &mut closing => return,
                                 () = tokio::time::sleep(users::NODE_KEY_LOOK) => {}
                             }
-                            if let Some(k) = users::sealed_node_key(&l).await.filter(|k| crate::dial::node_key().as_deref() != Some(k)) {
-                                crate::dial::set_node_key(k);
+                            if let Some(k) = users::sealed_node_key(&l).await.filter(|k| crate::dial::node_key(&node).as_deref() != Some(k)) {
+                                crate::dial::set_node_key(&node, k);
                                 eprintln!("this node took the lake's new keys from the bucket");
                             }
                         }

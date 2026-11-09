@@ -292,7 +292,7 @@ impl App {
     /// Record an INSERT's files: here on the leader, or forwarded to it.
     pub async fn record_files(&self, f: crate::write::Files) -> anyhow::Result<Value> {
         let Some(seq) = &self.seq else {
-            let r = crate::dial::call(&self.members.leader().addr, crate::dial::Call::json("/cluster/files", &f)?).await?;
+            let r = crate::dial::call(&self.lake.node, &self.members.leader().addr, crate::dial::Call::json("/cluster/files", &f)?).await?;
             anyhow::ensure!(r.ok(), "leader: {}", r.text().await?);
             return Ok(r.json().await?);
         };
@@ -302,7 +302,7 @@ impl App {
 
     /// Another engine's append (`iceberg_rest::update`), recorded by the leader under the lake's lock.
     pub async fn record_iceberg(&self, c: Vec<crate::iceberg::Commit>) -> anyhow::Result<Value> {
-        let Some(seq) = &self.seq else { return crate::write::post(&self.members.leader().addr, &crate::write::Request::Iceberg(c)).await };
+        let Some(seq) = &self.seq else { return crate::write::post(&self.lake.node, &self.members.leader().addr, &crate::write::Request::Iceberg(c)).await };
         let _guard = self.lock.lock().await;
         let nodes = if self.members.nodes().is_empty() { vec![self.members.me().to_string()] } else { self.members.nodes() };
         crate::iceberg::record(&self.lake, seq, c, &nodes, self.members.me(), self.retain_ms).await
@@ -399,7 +399,7 @@ impl App {
     /// work: a follower asks it).
     pub async fn checkpoint(&self) -> anyhow::Result<Value> {
         if self.seq.is_none() {
-            let r = crate::dial::call(&self.members.leader().addr, crate::dial::Call::post("/sql", "CHECKPOINT")).await?;
+            let r = crate::dial::call(&self.lake.node, &self.members.leader().addr, crate::dial::Call::post("/sql", "CHECKPOINT")).await?;
             anyhow::ensure!(r.ok(), "the leader: {}", r.text().await?);
             return Ok(r.json().await?);
         }

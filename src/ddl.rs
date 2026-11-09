@@ -637,7 +637,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
             }
             let dropped = match (crate::env::get("PONDRA_SERVER_URL"), &bases, &target) {
                 (Some(server), ..) => {
-                    let r = crate::dial::call(&server, crate::dial::Call::delete(format!("/databases/{name}?if_exists={if_exists}"))).await?;
+                    let r = crate::dial::call(&lake.node, &server, crate::dial::Call::delete(format!("/databases/{name}?if_exists={if_exists}"))).await?;
                     let (ok, text) = (r.ok(), r.text().await?);
                     ensure!(ok, "{text}");
                     serde_json::from_str(&text)?

@@ -489,7 +489,7 @@ async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result
             if node == me {
                 return run_job(lake, job).await;
             }
-            let r = crate::dial::call(node, crate::dial::Call::json("/cluster/job", &job)?).await?;
+            let r = crate::dial::call(&lake.node, node, crate::dial::Call::json("/cluster/job", &job)?).await?;
             anyhow::ensure!(r.ok(), "job on {node}: {}", r.text().await?);
             Ok(r.json().await?)
         }

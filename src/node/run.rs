@@ -501,7 +501,7 @@ pub(crate) async fn attach(home: &store::Lake, spec: &str, me: &str, follow: boo
     ddl::database_name(name)?; // (the names the catalog attached keep working; a new `--attach _x=` is refused)
     let leader = crate::terms::latest(&crate::store::open_store(dir)?.1).await?.map(|t| t.addr).filter(|a| !a.is_empty());
     let live = match (&leader, follow) {
-        (Some(a), true) => crate::dial::call(a, crate::dial::Call::get("/cluster/leader").timeout(Duration::from_secs(2))).await.is_ok(),
+        (Some(a), true) => crate::dial::call(&home.node, a, crate::dial::Call::get("/cluster/leader").timeout(Duration::from_secs(2))).await.is_ok(),
         _ => false,
     };
     let other = ddl::attach(home, name, dir, follow, live).await?;
