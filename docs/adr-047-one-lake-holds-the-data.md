@@ -144,7 +144,12 @@ SELECT * FROM pondra.diff('prod.gold.revenue', 'ali_orders.gold.revenue');   -- 
   (a table they see only some columns or rows of is left out, and named), keeps the base's grants, and
   makes its maker its owner. Copying is `CLONE`, a new privilege on a database.
 - **Comparing is cheap.** Rows a branch shares with its base have the same `_row_id` and `_version`
-  (ADR-020), so `pondra.diff` reads only the rows either side changed since the branch was made.
+  (ADR-020), so `pondra.diff` reads only the rows either side changed since the branch was made. An
+  update's two rows name the columns whose values differ (`_changed VARCHAR[]`, NULL on an insert or a
+  delete). Either side may also be a view's name or a query, `pondra.diff('prod.gold.revenue',
+  (SELECT … FROM ali_orders.raw.orders …))`: such sides match whole, as multisets (a row one side holds
+  more copies of is an insert or a delete for each copy more). The two sides must have the same columns
+  (42804 names the first that differs); the answer has the second's, in its order (Trellis T1).
 
 ### 4. Plan and deploy: the project made true in a database
 
