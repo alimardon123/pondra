@@ -155,7 +155,7 @@ objects -> temp  1
 objects -> types  5
 objects -> users  2
 objects -> views  5
-objects -> write  11
+objects -> write  8
 once -> matches  1
 once -> pattern  1
 oom -> jemalloc  2
