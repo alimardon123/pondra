@@ -557,7 +557,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
         Change::CreateProvider { name, provider, replace, if_not_exists } => crate::sso::create(lake, name, provider, replace, if_not_exists).await?,
         Change::DropProvider { name, if_exists } => crate::sso::drop(lake, &name, if_exists).await?,
     };
-    forget();
+    forget(lake);
     if gives_access && exposed(lake).await {
         out["notice"] = EXPOSED.into(); // (told through the door: `write.rs` passes a DDL answer's notice on)
         eprintln!("{EXPOSED}");
@@ -780,16 +780,58 @@ fn sealed(k: &Keys) -> Result<Kept> {
     Ok(Kept::Sealed { sealed, key })
 }
 
-crate::per_node!(static KEYS_HERE: Mutex<HashMap<String, Keys>> = Default::default());
+/// Each user's turns among the statements it runs at once on this node (its `Limits`), as the lake's state.
+#[derive(Default)]
+pub struct Turns(Mutex<HashMap<String, (u32, Arc<tokio::sync::Semaphore>)>>);
+
+impl crate::lake_state::LakeState for Turns {
+    const NAME: &'static str = "turns";
+    const ABOUT: &'static str = "each user's turns among the statements it runs at once on this node (its `Limits`)";
+    fn make() -> Self { Turns::default() }
+}
+
+/// What this node worked out about its lake's sign-in, kept as the lake's (it was the process's, keyed by the lake's url or
+/// not by lake at all): its keys, whether it is signed, the passwords checked lately, its users' access, and whether anyone
+/// signs in.
+#[derive(Default)]
+pub struct SignIns {
+    /// The lake's own keys, once made or read here (`keys`), before the catalog is asked again.
+    keys: Mutex<Option<Keys>>,
+    /// Made once: a request may ask while the leader makes them.
+    making: tokio::sync::Mutex<()>,
+    /// Read as signed (`signed`): kept for good, since a lake that was served with tokens stays so.
+    signed: std::sync::atomic::AtomicBool,
+    /// Read as unsigned, and when (as `any` remembers its answers).
+    unsigned: Mutex<Option<(Option<u64>, datafusion::common::instant::Instant)>>,
+    /// Passwords checked lately (by their hash with the user's name): a minute, so a client that sends
+    /// its password with every request (HTTP Basic) pays for SCRAM's hashing once.
+    verified: Mutex<HashMap<String, datafusion::common::instant::Instant>>,
+    /// Users' access, by name, as of a catalog version (grants change seldom: a check is a lookup).
+    access: Mutex<HashMap<String, (Option<u64>, datafusion::common::instant::Instant, Arc<Access>, bool)>>,
+    /// Whether the lake has a user who signs in, or an identity provider, as of a catalog version (`any`).
+    any: Mutex<Option<(Option<u64>, datafusion::common::instant::Instant, bool)>>,
+}
+
+impl crate::lake_state::LakeState for SignIns {
+    const NAME: &'static str = "users";
+    const ABOUT: &'static str = "what its sign-ins worked out: its keys, whether it is signed, its users' access, the passwords checked lately";
+    fn make() -> Self { SignIns::default() }
+}
+
+/// The lake's sign-in state, when this build keeps it (`None`: nothing is cached, and each answer is worked out again).
+fn sign_ins(lake: &Lake) -> Option<Arc<SignIns>> { lake.state::<SignIns>().ok() }
 
 async fn keys(lake: &Lake) -> Result<Keys> {
-    if let Some(k) = KEYS_HERE.lock().unwrap().get(&lake.url) {
-        return Ok(k.clone());
+    let signs = sign_ins(lake);
+    if let Some(k) = signs.as_ref().and_then(|s| s.keys.lock().unwrap().clone()) {
+        return Ok(k);
     }
-    static MAKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()); // (made once: a request may ask while the leader makes them)
-    let _one = MAKING.lock().await;
-    if let Some(k) = KEYS_HERE.lock().unwrap().get(&lake.url) {
-        return Ok(k.clone());
+    let _one = match &signs {
+        Some(s) => Some(s.making.lock().await), // (made once: a request may ask while the leader makes them)
+        None => None,
+    };
+    if let Some(k) = signs.as_ref().and_then(|s| s.keys.lock().unwrap().clone()) {
+        return Ok(k);
     }
     let found = match lake.cat.get::<Kept>(KEYS).await? {
         // (a follower whose mirror was seeded before the leader's keys were flushed: its commit
@@ -817,7 +859,9 @@ async fn keys(lake: &Lake) -> Result<Keys> {
             k
         }
     };
-    KEYS_HERE.lock().unwrap().insert(lake.url.clone(), k.clone());
+    if let Some(s) = &signs {
+        *s.keys.lock().unwrap() = Some(k.clone());
+    }
     Ok(k)
 }
 
@@ -845,9 +889,11 @@ fn new_node_key() -> Result<String> {
 pub async fn sealed_node_key(lake: &Lake) -> Option<String> {
     let Ok(Some(Kept::Sealed { sealed, key })) = lake.cat.from_view(KEYS).await.ok()?.map(|v| serde_json::from_slice::<Kept>(&v)).transpose() else { return None };
     let k = opened(&sealed, &key).ok()?;
-    let mut here = KEYS_HERE.lock().unwrap();
-    if here.get(&lake.url).is_none_or(|h| h.node != k.node) {
-        here.insert(lake.url.clone(), k.clone());
+    if let Some(s) = sign_ins(lake) {
+        let mut here = s.keys.lock().unwrap();
+        if here.as_ref().is_none_or(|h| h.node != k.node) {
+            *here = Some(k.clone());
+        }
     }
     Some(k.node)
 }
@@ -872,7 +918,9 @@ pub async fn seal_keys(lake: &Lake) -> Result<()> {
             // which last, still renew their pins with the old sessions' key, and let none go: `branch::keyed`)
             let k = Keys { session: new_session_key()?, node: new_node_key()?, branches: k.branches.or(Some(k.session)) };
             lake.cat.commit(vec![(KEYS.to_string(), json(&sealed(&k)?))], &[]).await?;
-            KEYS_HERE.lock().unwrap().insert(lake.url.clone(), k.clone());
+            if let Some(s) = sign_ins(lake) {
+                *s.keys.lock().unwrap() = Some(k.clone());
+            }
             crate::dial::set_node_key(&lake.node, k.node);
             eprintln!("the lake's own keys are sealed by its master key now, made new (the ones in the clear could be read from the bucket): everyone signs in again, and its other nodes take them from the bucket within {} s", NODE_KEY_LOOK.as_secs());
         }
@@ -890,13 +938,6 @@ pub async fn seal_keys(lake: &Lake) -> Result<()> {
     }
     Ok(())
 }
-
-crate::per_node!(
-    /// Lakes read as signed (`signed`): kept for good, since a lake that was served with tokens stays so.
-    static SIGNED_LAKES: Mutex<HashSet<String>> = Default::default());
-crate::per_node!(
-    /// Lakes read as unsigned, and when (as `any` remembers its answers).
-    static UNSIGNED_LAKES: Mutex<HashMap<String, (Option<u64>, datafusion::common::instant::Instant)>> = Default::default());
 
 /// Leader, with a token set: the lake remembers it (once; nothing clears it, `pondra token` is the way back
 /// in). A node started without tokens on such a lake is never open, and makes no user (`signed`).
@@ -916,20 +957,25 @@ pub async fn signed_mark(lake: &Lake) -> Result<Option<(String, Vec<u8>)>> {
 /// so, by a node with no tokens of its own (`server.rs`). A key that can't be read counts as signed, and is
 /// read again next time (as `any` takes users that can't be read).
 pub async fn signed(lake: &Lake) -> bool {
-    if SIGNED_LAKES.lock().unwrap().contains(&lake.url) {
+    let signs = sign_ins(lake);
+    if signs.as_ref().is_some_and(|s| s.signed.load(std::sync::atomic::Ordering::Relaxed)) {
         return true;
     }
     let version = lake.cat.version();
-    if UNSIGNED_LAKES.lock().unwrap().get(&lake.url).is_some_and(|c| fresh(lake, version, c.0, c.1)) {
+    if signs.as_ref().is_some_and(|s| s.unsigned.lock().unwrap().as_ref().is_some_and(|c| fresh(lake, version, c.0, c.1))) {
         return false;
     }
     match lake.cat.get::<Value>(SIGNED).await {
         Ok(Some(_)) => {
-            SIGNED_LAKES.lock().unwrap().insert(lake.url.clone());
+            if let Some(s) = &signs {
+                s.signed.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             true
         }
         Ok(None) => {
-            UNSIGNED_LAKES.lock().unwrap().insert(lake.url.clone(), (version, datafusion::common::instant::Instant::now()));
+            if let Some(s) = &signs {
+                *s.unsigned.lock().unwrap() = Some((version, datafusion::common::instant::Instant::now()));
+            }
             false
         }
         Err(_) => true,
@@ -1040,11 +1086,6 @@ async fn session_principal(lake: &Lake, token: &str) -> Option<Principal> {
     claimed(lake, &crate::sso::Claimed { user: user.into(), roles, provider: name.into(), any: p.any, expires_ms: until }).await.ok()
 }
 
-crate::per_node!(
-    /// Passwords checked lately (by their hash with the user's name): a minute, so a client that sends
-    /// its password with every request (HTTP Basic) pays for SCRAM's hashing once.
-    static VERIFIED: Mutex<HashMap<String, datafusion::common::instant::Instant>> = Default::default());
-
 /// Is this `user`'s password? (Its verifier checked, or remembered as checked.)
 pub async fn password_ok(lake: &Lake, user: &str, password: &str) -> bool {
     let key = sha256(&format!("{user}\0{password}"));
@@ -1052,16 +1093,19 @@ pub async fn password_ok(lake: &Lake, user: &str, password: &str) -> bool {
     // (remembered for a minute only as the verifier it was checked against: a user who may no longer
     // sign in, or whose password changed, is refused at once)
     let key = sha256(&format!("{key}\0{}", u.verifier.as_ref().map(|v| v.stored_key.as_str()).unwrap_or_default()));
-    if u.login && VERIFIED.lock().unwrap().get(&key).is_some_and(|t| t.elapsed().as_secs() < 60) {
+    let signs = sign_ins(lake);
+    if u.login && signs.as_ref().is_some_and(|s| s.verified.lock().unwrap().get(&key).is_some_and(|t| t.elapsed().as_secs() < 60)) {
         return true;
     }
     let ok = u.login && u.verifier.as_ref().is_some_and(|v| v.matches(password));
     if ok {
-        let mut all = VERIFIED.lock().unwrap();
-        if all.len() > 10_000 {
-            all.clear();
+        if let Some(s) = &signs {
+            let mut all = s.verified.lock().unwrap();
+            if all.len() > 10_000 {
+                all.clear();
+            }
+            all.insert(key, datafusion::common::instant::Instant::now());
         }
-        all.insert(key, datafusion::common::instant::Instant::now());
     }
     ok
 }
@@ -1178,14 +1222,14 @@ impl Access {
     fn writes(&self) -> bool { self.grants.iter().any(|g| ["insert", "update", "delete"].contains(&g.privilege.as_str())) }
 }
 
-crate::per_node!(
-    /// Users' access, by name, as of a catalog version (grants change seldom: a check is a lookup).
-    static ACCESS: Mutex<HashMap<String, (Option<u64>, datafusion::common::instant::Instant, Arc<Access>, bool)>> = Default::default());
-
-pub(crate) fn forget() {
-    ACCESS.lock().unwrap().clear();
-    ANY.lock().unwrap().clear();
-    UNSIGNED_LAKES.lock().unwrap().clear();
+/// What this lake's sign-ins worked out goes at once (elsewhere, within `fresh`'s second): its users' access, whether anyone
+/// signs in, and that it reads as unsigned.
+pub(crate) fn forget(lake: &Lake) {
+    if let Some(s) = sign_ins(lake) {
+        s.access.lock().unwrap().clear();
+        *s.any.lock().unwrap() = None;
+        *s.unsigned.lock().unwrap() = None;
+    }
 }
 
 /// The principal `user` signs in as: a superuser's rights are the admin token's; anyone else's
@@ -1211,7 +1255,8 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
     let epoch = lake.cat.rights_version(); // (before its records are read: a change after it moves the version past it)
     let version = lake.cat.version();
     let id = std::iter::once(user).chain(claimed.iter().map(String::as_str)).collect::<Vec<_>>().join("\0"); // (cached by the roles claimed too)
-    let cached = ACCESS.lock().unwrap().get(&id).filter(|c| fresh(lake, version, c.0, c.1)).map(|c| (c.2.clone(), c.3));
+    let signs = sign_ins(lake);
+    let cached = signs.as_ref().and_then(|s| s.access.lock().unwrap().get(&id).filter(|c| fresh(lake, version, c.0, c.1)).map(|c| (c.2.clone(), c.3)));
     let (access, superuser) = match cached {
         Some(c) => c,
         None => {
@@ -1246,7 +1291,9 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
                 todo.extend(u.roles.iter().map(|r| (r.clone(), None, false)));
             }
             let access = Arc::new(Access { grants, names: seen, limits: me.limits, ..Default::default() });
-            ACCESS.lock().unwrap().insert(id, (version, datafusion::common::instant::Instant::now(), access.clone(), superuser));
+            if let Some(s) = &signs {
+                s.access.lock().unwrap().insert(id, (version, datafusion::common::instant::Instant::now(), access.clone(), superuser));
+            }
             (access, superuser)
         }
     };
@@ -1293,7 +1340,7 @@ fn pg_duration(v: &str) -> Option<std::time::Duration> {
     (micros > 0).then(|| std::time::Duration::from_micros(micros))
 }
 
-pub fn quota() -> Quota {
+pub fn quota(lake: &Lake) -> Quota {
     let p = crate::auth::current();
     // (a session that set `statement_timeout` keeps its own, 0 included; one that set none gets the node's default)
     let session = match crate::set::shown("statement_timeout") {
@@ -1309,14 +1356,14 @@ pub fn quota() -> Quota {
         (Some(s), _) => (Some(s), true),
         (None, t) => (t, false),
     };
-    crate::per_node!(static TURNS: Mutex<HashMap<String, (u32, Arc<tokio::sync::Semaphore>)>> = Default::default());
-    let turns = most.map(|n| {
-        let mut all = TURNS.lock().unwrap();
+    let turns = most.and_then(|n| {
+        let state = lake.state::<Turns>().ok()?;
+        let mut all = state.0.lock().unwrap();
         let e = all.entry(user.clone()).or_insert_with(|| (n, Arc::new(tokio::sync::Semaphore::new(n as usize))));
         if e.0 != n {
             *e = (n, Arc::new(tokio::sync::Semaphore::new(n as usize))); // (changed: the new number from now on)
         }
-        (e.1.clone(), n)
+        Some((e.1.clone(), n))
     });
     Quota { turns, timeout, user, by_session }
 }
@@ -1349,7 +1396,7 @@ pub async fn across(other: &Lake, ns: &str) -> Result<()> {
     if let Some(r) = other.node.reaches.of(&other.url).filter(|r| r.read_only) {
         return read_only(&r, ns);
     }
-    if crate::auth::operator() || !(crate::auth::tokens_on() || any(other).await) {
+    if crate::auth::operator() || !(crate::auth::tokens_on(&other.node) || any(other).await) {
         return Ok(());
     }
     bail!("permission denied: {ns} signs in on its own: its tables are read and written through it (the database {ns}), or with one of the nodes' tokens")
@@ -1382,20 +1429,21 @@ pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::wri
     }
 }
 
-crate::per_node!(static ANY: Mutex<HashMap<String, (Option<u64>, datafusion::common::instant::Instant, bool)>> = Default::default());
-
 /// Does the lake have a user who signs in (a password or a token), or an identity provider? Then a
 /// request with nothing signed is refused, as with a token set.
 pub async fn any(lake: &Lake) -> bool {
     let version = lake.cat.version();
-    if let Some(c) = ANY.lock().unwrap().get(&lake.url).filter(|c| fresh(lake, version, c.0, c.1)) {
+    let signs = sign_ins(lake);
+    if let Some(c) = signs.as_ref().and_then(|s| s.any.lock().unwrap().clone()).filter(|c| fresh(lake, version, c.0, c.1)) {
         return c.2;
     }
     let yes = match lake.cat.scan::<User>("u/", "u0").await {
         Ok(all) => all.iter().any(|(_, u)| u.login && (u.verifier.is_some() || !u.tokens.is_empty())) || !crate::sso::all(lake).await.is_ok_and(|p| p.is_empty()),
         Err(_) => return true, // (users that can't be read are taken for ones who sign in, and read again next time: open only when surely so)
     };
-    ANY.lock().unwrap().insert(lake.url.clone(), (version, datafusion::common::instant::Instant::now(), yes));
+    if let Some(s) = &signs {
+        *s.any.lock().unwrap() = Some((version, datafusion::common::instant::Instant::now(), yes));
+    }
     yes
 }
 
@@ -1516,6 +1564,34 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_lakes_keep_their_users_access_apart() -> Result<()> {
+        let mut lakes = vec![];
+        for _ in 0..2 {
+            let dir = std::env::temp_dir().join(format!("pondra-two-users-{}", uuid::Uuid::new_v4()));
+            let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            crate::write::create_table(&lake, "t", r#"{"columns": [["a", "Int64"]]}"#).await?;
+            apply(&lake, Change::Create { name: "ann".into(), login: true, if_not_exists: false, verifier: None, superuser: false, limits: Limits::default() }).await?;
+            lakes.push((lake, dir));
+        }
+        // (a writes, b only reads: the same user, a different role in each lake)
+        let (a, b) = (&lakes[0].0, &lakes[1].0);
+        apply(a, Change::Grant { privileges: vec!["insert".into()], on: On::Table("t".into()), columns: vec![], to: vec!["ann".into()], database: None }).await?;
+        apply(b, Change::Grant { privileges: vec!["select".into()], on: On::Table("t".into()), columns: vec![], to: vec!["ann".into()], database: None }).await?;
+        assert_eq!(principal(a, "ann").await?.role, Role::Write, "a's ann writes in a");
+        assert_eq!(principal(b, "ann").await?.role, Role::Read, "b's ann reads in b, not a's grant");
+        assert_eq!(sign_ins(a).expect("a's sign-ins").access.lock().unwrap().len(), 1, "a kept ann's access");
+        assert_eq!(sign_ins(b).expect("b's sign-ins").access.lock().unwrap().len(), 1, "b kept ann's access");
+        forget(a);
+        assert!(sign_ins(a).expect("a's sign-ins").access.lock().unwrap().is_empty(), "forget clears a's access");
+        assert_eq!(sign_ins(b).expect("b's sign-ins").access.lock().unwrap().len(), 1, "forget(a) leaves b's access kept");
+        for (lake, dir) in lakes {
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        Ok(())
+    }
 
     #[test]
     fn scram_round_trip() {

@@ -328,7 +328,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     // that pair is refused at once, the right password too; a bearer token isn't counted: `auth::guessing`)
     let basic_by = credential.user().map(|name| (name.to_string(), client));
     if let Some((name, ip)) = &basic_by {
-        if let Some(wait) = crate::auth::guessing(*ip, name) {
+        if let Some(wait) = crate::auth::guessing(&app.lake, *ip, name) {
             let why = crate::auth::guessing_says(name, wait);
             crate::audit::refused_by(&app, name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why).await;
             tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does: refused at once, guesses would cost nothing)
@@ -353,7 +353,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         },
         None if header.is_some() => {
             if let Some((name, ip)) = &basic_by {
-                crate::auth::guessed(*ip, name);
+                crate::auth::guessed(&app.lake, *ip, name);
             }
             // (an identity provider's token says why it was refused: expired, another audience, no such user here)
             let why = match credential.secret() {
@@ -480,14 +480,14 @@ async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::e
         return (StatusCode::FORBIDDEN, crate::tls::PASSWORD_PLAIN).into_response(); // (`tls.rs`)
     }
     let ip = Some(peer.client(&headers));
-    if let Some(wait) = crate::auth::guessing(ip, user) {
+    if let Some(wait) = crate::auth::guessing(&app.lake, ip, user) {
         let why = crate::auth::guessing_says(user, wait);
         crate::audit::refused_by(&app, user, "http", Some(peer.addr), ip, "sign in", &why).await;
         tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does)
         return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
     }
     if !crate::users::password_ok(&app.lake, user, password).await {
-        crate::auth::guessed(ip, user);
+        crate::auth::guessed(&app.lake, ip, user);
         crate::audit::refused_by(&app, user, "http", who.as_ref().and_then(|w| w.0.from), ip, "sign in", "wrong user name or password").await;
         tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
         return (StatusCode::UNAUTHORIZED, "wrong user name or password").into_response();
