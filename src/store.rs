@@ -1505,12 +1505,16 @@ pub fn client_until(job: &str) -> Option<u64> {
     (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| digits.parse().unwrap_or(u64::MAX))
 }
 
-/// The retry window (`job_kept`): twice the lease (`locks::lease`, PONDRA_LOCK_LEASE_SECS, 60 s by
-/// default), and at least a minute, so 120 s by default. It has no setting of its own.
+/// The retry window (`job_kept`): twice the lease (`lock_lease`, 60 s by default), and at least a minute, so 120 s by
+/// default. It has no setting of its own.
 pub fn retry_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| 2 * crate::locks::lease().as_secs().max(60) * 1000)
+    *MS.get_or_init(|| 2 * lock_lease().as_secs().max(60) * 1000)
 }
+
+/// How long a row lock is held without its holder saying it still holds it (`PONDRA_LOCK_LEASE_SECS`, ADR-067): the
+/// locks' lease (`locks::lease`), and the base of the retry window (`retry_ms`).
+pub fn lock_lease() -> std::time::Duration { crate::env::secs("PONDRA_LOCK_LEASE_SECS") }
 pub fn data_key(seg: u64) -> String { format!("d/{seg:020}") } // small segments live inside the catalog
 pub fn json<T: Serialize>(v: &T) -> Vec<u8> { serde_json::to_vec(v).expect("serializable") }
 
@@ -1824,6 +1828,40 @@ impl crate::registry::Section for OpenHooks {
     }
 }
 
+/// What the engine gives every lake, registered by it (`engine::ENGINE`): a lake's sessions (`session`, with every
+/// function set: `engine::session`), what a page's sessions add (`on_a_page`: `in_task::planned`), and the memory watch's
+/// lines and wake (`roots`, `wake`: `oom.rs`). With none (a registry without the engine), a session is DataFusion's own,
+/// no line is known, and nothing is woken.
+#[derive(Default)]
+pub struct EngineHooks {
+    pub session: Option<fn(datafusion::prelude::SessionConfig, Arc<RuntimeEnv>) -> datafusion::prelude::SessionContext>,
+    pub on_a_page: Option<fn(datafusion::prelude::SessionContext) -> datafusion::prelude::SessionContext>,
+    pub roots: Option<fn() -> (Option<usize>, Option<usize>)>,
+    pub wake: Option<fn()>,
+}
+
+impl crate::registry::Section for EngineHooks {
+    const NAME: &'static str = "engine hooks";
+}
+
+fn engine() -> Option<&'static EngineHooks> { crate::registry::get().find::<EngineHooks>() }
+
+/// Open-format files an extension publishes in a lake (Delta's logs, Iceberg's metadata): written, never read, so no
+/// disk keeps them (`Lake::put`) and the orphan sweep leaves them (`tier::sweep`). Each extension adds its own.
+#[derive(Default)]
+pub struct Published(Vec<(&'static str, fn(&str) -> bool)>);
+
+impl Published {
+    pub fn add(&mut self, name: &'static str, is: fn(&str) -> bool) { self.0.push((name, is)) }
+}
+
+impl crate::registry::Section for Published {
+    const NAME: &'static str = "published files";
+}
+
+/// Is this one of a lake's published open-format files (`Published`)?
+pub fn published(path: &str) -> bool { crate::registry::get().find::<Published>().is_some_and(|p| p.0.iter().any(|(_, is)| is(path))) }
+
 /// `_base/<id>/rest` as (id, rest): a branch's path to a file of its base, which the lake reads there (`Lake::full`,
 /// ADR-047; `branch::rebase` makes one).
 pub fn base_path(path: &str) -> Option<(&str, &str)> { path.strip_prefix("_base/")?.split_once('/') }
@@ -1908,8 +1946,9 @@ fn root_line() -> usize {
     }
 }
 
-/// The memory watch's lines for the process (`oom::roots`): its trim line, and a third of its memory where no stop line watches it.
-fn roots() -> (Option<usize>, Option<usize>) { crate::oom::roots() }
+/// The memory watch's lines for the process (`oom::roots`, through `EngineHooks`): its trim line, and a third of its memory
+/// where no stop line watches it.
+fn roots() -> (Option<usize>, Option<usize>) { engine().and_then(|e| e.roots).map_or((None, None), |roots| roots()) }
 
 /// The process's whole line, for every node's queries and caches together (`ledger::Root`): the memory watch's trim line
 /// (`oom::trim_line`, of the machine's memory or `PONDRA_MEMORY_MAX_GB`), or none (`usize::MAX`) where it isn't known.
@@ -2379,7 +2418,9 @@ impl Lake {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
         ledger.charge("files", Arc::downgrade(&crate::cache::outside())); // (the process's, of files outside the lakes)
-        crate::oom::wake();
+        if let Some(wake) = engine().and_then(|e| e.wake) {
+            wake(); // (the memory watch, `oom::wake`)
+        }
         for (_, opens) in &crate::registry::get().section::<OpenHooks>().0 {
             opens(&lake).await?; // (a branch's bases, so its files listed there are read: ADR-047)
         }
@@ -2605,15 +2646,21 @@ impl Lake {
     pub fn partitions(&self) -> usize { node_partitions(&self.node) }
 
     /// A session made from nothing, with everything every query's session has: every function set in the registry
-    /// (`engine::session`). On a page every plan it makes runs its partitions in the page's task, as the page's own
-    /// session's do (`in_task::planned`): a page has no runtime to start a partition's task on, and a plan of one
+    /// (`EngineHooks::session`). On a page every plan it makes runs its partitions in the page's task, as the page's own
+    /// session's do (`EngineHooks::on_a_page`): a page has no runtime to start a partition's task on, and a plan of one
     /// partition still merges more than one below it. Plans made by hand from it (`fresh.rs`) are planned by it too.
     pub(crate) fn made(&self, partitions: usize) -> datafusion::prelude::SessionContext {
         let config = datafusion::prelude::SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::naming::lake_name(self), crate::text::PUBLIC);
         let config = config.with_extension(Arc::new(crate::env::NodeMemory(node_memory(&self.node)))); // (what sizes itself by it: `env::NodeMemory`)
-        let ctx = crate::engine::session(config, self.rt.clone());
+        let ctx = match engine().and_then(|e| e.session) {
+            Some(session) => session(config, self.rt.clone()),
+            None => datafusion::prelude::SessionContext::new_with_config_rt(config, self.rt.clone()),
+        };
         #[cfg(target_arch = "wasm32")]
-        let ctx = crate::in_task::planned(ctx);
+        let ctx = match engine().and_then(|e| e.on_a_page) {
+            Some(planned) => planned(ctx),
+            None => ctx,
+        };
         ctx
     }
 
@@ -2729,7 +2776,7 @@ impl Lake {
         let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
         let bytes: Bytes = bytes.into(); // (a `Vec` or `Bytes` as it is: a page's 232 MB file was held twice while it was put)
         self.store.put_opts(&Path::from(path), bytes.clone().into(), opts).await?;
-        if let (Some(disk), false) = (&self.disk, crate::delta::open_format(path) || replaceable(path)) {
+        if let (Some(disk), false) = (&self.disk, published(path) || replaceable(path)) {
             disk.put(path, &bytes); // what a node writes, it keeps
         }
         Ok(())
@@ -4327,6 +4374,17 @@ pub fn node_partitions(node: &NodeState) -> usize { partitions_of(node_memory(no
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine gives every lake its sessions and the memory watch (`EngineHooks`), and Delta and Iceberg say which of
+    /// a lake's files they publish (`Published`): the catalog names none of them.
+    #[test]
+    fn the_engine_and_the_extensions_give_a_lake_what_it_doesnt_name() {
+        let e = engine().expect("the engine registers its hooks");
+        assert!(e.session.is_some() && e.on_a_page.is_some() && e.roots.is_some() && e.wake.is_some());
+        assert!(published("data/t/_delta_log/00000000000000000000.json"), "Delta's log");
+        assert!(published("data/t/metadata/v1.metadata.json"), "Iceberg's metadata");
+        assert!(!published("data/t/part-0.parquet") && !published("files/notes.csv") && !published("log/00000000000000000001"));
+    }
 
     /// A parsed entry keeps a copy of its raw bytes, never a slice of the buffer they came in: a follower's come in its
     /// leader's stream frames, and a kept slice would hold the frame's whole buffer while the entry lives (the 11-07 soak
