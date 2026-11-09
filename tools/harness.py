@@ -25616,6 +25616,12 @@ def returning():
                     and rows[0].get("n") == 7 and rows[0].get("id") == one_id("h"))
         check("HTTP: INSERT ... RETURNING * gives one row: its id, name h, n 7", http_return_star)
 
+        def http_return_hooked():  # (a form only the fallback dialect's hooks read: found as any write's RETURNING, 11-09 audit L11)
+            rows = sql(A.port, "INSERT INTO a (name) SELECT array_to_string([x || '!' FOR x IN ['k']], '') RETURNING name, n")
+            info["HTTP INSERT ... [x FOR x IN l] ... RETURNING"] = rows
+            return rows == [{"name": "k!", "n": 7}]
+        check("HTTP: INSERT ... SELECT [x FOR x IN l] ... RETURNING name, n gives the row it wrote", http_return_hooked)
+
         # Item forms, each on a new row (the alias on UPDATE: Pondra's INSERT takes no alias yet).
         def item_column():
             rows = c.execute("INSERT INTO a (name) VALUES ('i1') RETURNING a.id").fetchall()

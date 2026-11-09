@@ -537,6 +537,17 @@ mod tests {
         assert!(matches!(&unnamed.steps[0], Step::Write { returns: false, .. }));
     }
 
+    /// A form only the fallback dialect's hooks read (a list comprehension) is found as generic's forms are: a write's
+    /// RETURNING (`returning::of`) and a WITH that writes, which the front then reads with the hooks (11-09 audit L11).
+    #[test]
+    fn a_form_the_hooks_read_returns_and_writes_as_any() {
+        let r = crate::returning::of("INSERT INTO t SELECT [x * 2 FOR x IN l] FROM s RETURNING *").expect("a write with RETURNING");
+        assert!(r.write.contains("array_transform") && !r.write.contains("RETURNING"), "{}", r.write);
+        let w = of("WITH w AS (INSERT INTO t SELECT [x FOR x IN l IF x > 0] FROM s RETURNING *) SELECT count(*) AS n FROM w").unwrap().unwrap();
+        assert_eq!(step_names(&w), vec!["w"]);
+        assert!(matches!(&w.steps[0], Step::Write { sql, returns: true, .. } if sql.contains("array_filter")), "{:?}", step_names(&w));
+    }
+
     #[test]
     fn syntactic_refusals_are_0a000() {
         let cases = [
