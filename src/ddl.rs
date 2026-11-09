@@ -460,7 +460,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
             }
             let once = crate::views::view_key(&crate::once::open(&here)); // (EMIT FINAL's)
             if lake.cat.get::<Value>(&crate::views::view_key(&here)).await?.is_some() || lake.cat.get::<Value>(&once).await?.is_some() || lake.cat.get::<Value>(&crate::feeds::feed_key(&here)).await?.is_some() {
-                drop_view(lake, &name, true).await?; // (refused, saying so, while another view follows it)
+                drop_view(lake, &name, true, false).await?; // (refused, saying so, while another view follows it; replaced, not kept)
             }
             Box::pin(apply(lake, *then, scope)).await
         }
@@ -513,21 +513,32 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
                 // (dependent_objects_still_exist, as Postgres answers it: Iceberg REST's NamespaceNotEmptyException reads the code)
                 return Err(crate::codes::coded("2BP01", format!("schema {name} isn't empty ({}): drop them first, or DROP SCHEMA {name} CASCADE", [&views[..], &tables[..], &routines[..]].concat().join(", "))));
             }
+            // (each kept in its own record, and named in the schema's, so UNDROP SCHEMA brings them back with it)
+            let (mut with, mut keep_ms) = (vec![], KEEP_MS);
             for r in &routines {
+                let kind = lake.cat.get::<crate::expander::Routine>(&crate::routines::key(r)).await?.map(|r| r.kind_name());
                 crate::routines::drop(lake, r, true).await?;
+                with.extend(kind.map(|k| (k.to_string(), r.clone())));
             }
             for v in &views {
-                drop_view(lake, v, true).await?;
+                let (_, kind) = drop_view(lake, v, true, true).await?; // (a topic's view isn't kept)
+                with.extend(kind.map(|k| (k.to_string(), v.clone())));
             }
             for t in tables.iter().filter(|t| !views.iter().any(|v| *t == v || **t == format!("{v}_final"))) {
+                let meta = lake.cat.get::<TableMeta>(&table_key(t)).await?;
                 drop_table(lake, t, true, false, None).await?;
+                if let Some(m) = meta.filter(|m| keeps(t, m, false)) {
+                    keep_ms = keep_ms.max(m.retention_secs.map_or(KEEP_MS, |s| s * 1000));
+                    with.push(("table".to_string(), t.clone()));
+                }
             }
-            lake.cat.commit(vec![], &[schema_key(&name)]).await?;
+            let kept = crate::undrop::aside_with(lake, "schema", &name, &[schema_key(&name)], with, keep_ms).await?;
+            lake.cat.commit(kept, &[schema_key(&name)]).await?;
             Ok(j!({"schema": name, "dropped": true}))
         }
         Ddl::DropTable { name, if_exists, purge, made_by } => drop_table(lake, &name, if_exists, purge, made_by.as_deref()).await,
-        Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?).await,
-        Ddl::UndropKept { kind, name } => crate::undrop::undrop(lake, &kind, &crate::undrop::named(lake, &kind, &name).await?).await,
+        Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?, scope).await,
+        Ddl::UndropKept { kind, name } => crate::undrop::undrop(lake, &kind, &crate::undrop::named(lake, &kind, &name).await?, scope).await,
         Ddl::Clone { name, from } => clone(lake, &new_name(lake, &name).await?, &from).await,
         Ddl::CreateView { name, sql, replace, facts, text } => create_view(lake, &name, sql, replace, false, facts, text, scope).await,
         Ddl::CreateExternal { name, sql, replace, if_not_exists } => {
@@ -550,7 +561,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
                     crate::feeds::create(lake, &name, &sql, topic, &options).await?; // (a topic's records, as they arrive)
                     crate::views::forget(lake);
                     if let Err(e) = crate::facts::materialized(lake, &name, facts).await {
-                        drop_view(lake, &name, true).await?; // (refused: nothing made)
+                        drop_view(lake, &name, true, false).await?; // (refused: nothing made, so nothing kept)
                         return Err(e);
                     }
                     return Ok(j!({"view": name, "feed": true}));
@@ -565,7 +576,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
             };
             crate::views::forget(lake); // (the sequencer holds flushes to it from its next commit)
             if let Err(e) = crate::facts::materialized(lake, &name, facts).await {
-                drop_view(lake, &name, true).await?; // (refused: nothing made)
+                drop_view(lake, &name, true, false).await?; // (refused: nothing made, so nothing kept)
                 return Err(e);
             }
             let mut out = j!({"view": name, "materialized": true});
@@ -576,7 +587,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
             }
             Ok(out)
         }
-        Ddl::DropView { name, if_exists } => drop_view(lake, &name, if_exists).await,
+        Ddl::DropView { name, if_exists } => Ok(drop_view(lake, &name, if_exists, true).await?.0),
         Ddl::Attach { name, dir, read_only, endpoint } => {
             attachable(lake, &name, false).await?;
             openable(&lake.url, &dir)?; // (what `sync` would never open is refused here, at once)
@@ -938,8 +949,39 @@ pub async fn sync(lake: &Lake, follow: bool) -> Result<()> {
     Ok(())
 }
 
+/// Once materialized view `name` is filled from the rows already there, or its first run (kept by
+/// key) has worked every group out: refused, saying why, while that fails.
+async fn filled(lake: &Lake, name: &str) -> Result<()> {
+    let name = name.to_string();
+    let open = crate::once::open(&name);
+    let name = if lake.cat.get::<crate::views::View>(&crate::views::view_key(&open)).await?.is_some() { open } else { name }; // (EMIT FINAL's)
+    let (filled, worked) = (crate::store::producer_key(&format!("fill:{name}")), crate::store::producer_key(&crate::rerun::producer(&name)));
+    for _ in 0..12_000 {
+        let view = lake.cat.get::<crate::views::View>(&crate::views::view_key(&name)).await?;
+        let Some(view) = view else { break };
+        let ready = match (&view.fill, &view.rerun) {
+            (Some(_), _) => &filled,
+            (None, Some(_)) => &worked, // (kept by key: its first run works every group out)
+            (None, None) => break,
+        };
+        if lake.cat.get::<u64>(ready).await?.is_some() {
+            break;
+        }
+        if let Some(e) = view.rerun.as_ref().and_then(|_| crate::rerun::failing(lake, &name, crate::views::identity(&view))) {
+            bail!("{name} is made, but its first run fails: {e}");
+        }
+        if let Some(e) = view.fill.as_ref().and_then(|_| crate::views::failing(lake, &name, crate::views::identity(&view))) {
+            // (its filling is tried again, and changes of its source's rows wait for it: DROP it, or fix what it reads)
+            bail!("{name} is made, but filling it from {}'s rows fails: {e}; changes of those rows wait until it is filled, or dropped", view.source);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
 /// After this node sent an `ATTACH` or `DETACH`: once its catalog shows it, as it does here. After
-/// `CREATE MATERIALIZED VIEW`: once it is filled from the rows already there (`views::fill_all`).
+/// `CREATE MATERIALIZED VIEW`, or an UNDROP that makes one again: once it is filled from the rows
+/// already there (`views::fill_all`).
 pub async fn settle(lake: &Lake, d: &Ddl) -> Result<()> {
     match d {
         // (CREATE OR REPLACE makes what it says, so it is waited for as when made plainly; IF NOT
@@ -950,29 +992,18 @@ pub async fn settle(lake: &Lake, d: &Ddl) -> Result<()> {
         _ => {}
     }
     if let Ddl::CreateMaterialized { name, .. } = d {
-        let name = local(lake, name).unwrap_or_default();
-        let open = crate::once::open(&name);
-        let name = if lake.cat.get::<crate::views::View>(&crate::views::view_key(&open)).await?.is_some() { open } else { name }; // (EMIT FINAL's)
-        let (filled, worked) = (crate::store::producer_key(&format!("fill:{name}")), crate::store::producer_key(&crate::rerun::producer(&name)));
-        for _ in 0..12_000 {
-            let view = lake.cat.get::<crate::views::View>(&crate::views::view_key(&name)).await?;
-            let Some(view) = view else { break };
-            let ready = match (&view.fill, &view.rerun) {
-                (Some(_), _) => &filled,
-                (None, Some(_)) => &worked, // (kept by key: its first run works every group out)
-                (None, None) => break,
-            };
-            if lake.cat.get::<u64>(ready).await?.is_some() {
-                break;
-            }
-            if let Some(e) = view.rerun.as_ref().and_then(|_| crate::rerun::failing(lake, &name, crate::views::identity(&view))) {
-                bail!("{name} is made, but its first run fails: {e}");
-            }
-            if let Some(e) = view.fill.as_ref().and_then(|_| crate::views::failing(lake, &name, crate::views::identity(&view))) {
-                // (its filling is tried again, and changes of its source's rows wait for it: DROP it, or fix what it reads)
-                bail!("{name} is made, but filling it from {}'s rows fails: {e}; changes of those rows wait until it is filled, or dropped", view.source);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        return filled(lake, &local(lake, name).unwrap_or_default()).await;
+    }
+    if let Ddl::UndropKept { kind, name } = d {
+        // (made again from its query, alone or in its schema: waited for as when it was made)
+        let name = crate::undrop::named(lake, kind, name).await?;
+        let made: Vec<String> = match kind.as_str() {
+            "materialized view" => vec![name],
+            "schema" => lake.cat.scan::<Value>("v/", "v0").await?.into_iter().map(|(k, _)| k[2..].to_string()).filter(|v| v.contains('.') && split(v).0 == name).collect(),
+            _ => vec![],
+        };
+        for v in made {
+            filled(lake, &v).await?;
         }
         return Ok(());
     }
@@ -1232,7 +1263,7 @@ pub fn retention(text: &str) -> Result<u64> {
 /// `UNDROP TABLE t`: the table dropped last under that name, back as it was. It reads the log from
 /// now on (its rows went to files when it was dropped; the log since may hold another table's of
 /// its name). Refused while something else has the name: rename that first.
-async fn undrop(lake: &Lake, name: &str) -> Result<Value> {
+pub(crate) async fn undrop(lake: &Lake, name: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let taken = lake.cat.get::<TableMeta>(&table_key(name)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(name)).await?.is_some()
         || lake.cat.get::<Value>(&crate::views::view_key(name)).await?.is_some();
     if taken {
@@ -1241,7 +1272,7 @@ async fn undrop(lake: &Lake, name: &str) -> Result<Value> {
     let mut kept: Vec<(String, Dropped)> = lake.cat.scan::<Dropped>(&format!("dt/{name}/"), &format!("dt/{name}0")).await?;
     let Some((key, d)) = kept.pop() else {
         if crate::undrop::has(lake, "external table", name).await? {
-            return crate::undrop::undrop(lake, "external table", name).await; // (DROP TABLE drops one too)
+            return Box::pin(crate::undrop::undrop(lake, "external table", name, scope)).await; // (DROP TABLE drops one too)
         }
         return Err(crate::codes::coded("42P01", format!("no dropped table {name} is kept (pondra.dropped lists those that are)")));
     };
@@ -2145,28 +2176,31 @@ async fn made_from(lake: &Lake, name: &str, what: &str) -> Result<()> {
 }
 
 /// `DROP VIEW` or `DROP MATERIALIZED VIEW`: a stored view, or a live one with its tables and state
-/// (and out of the shares that hand them out).
-async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
+/// (and out of the shares that hand them out). With `keep` (a DROP's, not a view replaced or one
+/// made and then refused) its definition is kept to be undropped, and the kind it is kept as comes
+/// back with what it answers. A topic's view isn't kept: its offsets start over when it is made again.
+async fn drop_view(lake: &Lake, name: &str, if_exists: bool, keep: bool) -> Result<(Value, Option<&'static str>)> {
     if lake.cat.get::<crate::feeds::Feed>(&crate::feeds::feed_key(name)).await?.is_some() {
         let offsets: Vec<String> = lake.cat.scan::<u64>(&crate::store::producer_key(&format!("feed:{name}:")), &crate::store::producer_key(&format!("feed:{name};"))).await?.into_iter().map(|(k, _)| k).collect();
         let gone: Vec<String> = [crate::feeds::feed_key(name), table_key(name)].into_iter().chain(offsets.iter().cloned()).collect();
         let (unshared, from) = crate::shares::tables_moved(lake, &[(name, None)]).await?;
         lake.cat.commit(unshared, &gone).await?;
         crate::log::forget_producers(lake, offsets.into_iter().map(|k| k[2..].to_string())); // (its offsets: made again, it starts over)
-        return Ok(left_shares(j!({"view": name, "dropped": true}), from));
+        return Ok((left_shares(j!({"view": name, "dropped": true}), from), None));
     }
     if let Some(v) = lake.cat.get::<StoredView>(&query_key(name)).await? {
         made_from(lake, name, "drop").await?;
-        let kept = crate::undrop::aside(lake, if v.external { "external table" } else { "view" }, name, &[query_key(name)]).await?;
+        let kind = if v.external { "external table" } else { "view" };
+        let kept = if keep { crate::undrop::aside(lake, kind, name, &[query_key(name)]).await? } else { vec![] };
         lake.cat.commit(kept, &[query_key(name)]).await?;
-        return Ok(j!({"view": name, "dropped": true}));
+        return Ok((j!({"view": name, "dropped": true}), keep.then_some(kind)));
     }
     let (shown, open) = (name, crate::once::open(name));
     let once = lake.cat.get::<crate::views::View>(&crate::views::view_key(name)).await?.is_none() && lake.cat.get::<crate::views::View>(&crate::views::view_key(&open)).await?.is_some();
     let name: &str = if once { &open } else { name }; // (EMIT FINAL's: its entry and partial rows)
     let Some(view) = lake.cat.get::<crate::views::View>(&crate::views::view_key(name)).await? else {
         ensure!(if_exists, "no view {name}");
-        return Ok(j!({"view": name, "dropped": false}));
+        return Ok((j!({"view": name, "dropped": false}), None));
     };
     let kept = view.once.as_ref().map_or(format!("{name}_final"), |o| o.into.clone()); // (what it keeps once)
     // (what follows it by name would be left without rows: a flow is dropped from its end)
@@ -2186,14 +2220,19 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
             copies.push(published);
         }
     }
-    let (unshared, from) = crate::shares::tables_moved(lake, &[(tables[0].as_str(), None), (tables[1].as_str(), None)]).await?;
+    let (mut unshared, from) = crate::shares::tables_moved(lake, &[(tables[0].as_str(), None), (tables[1].as_str(), None)]).await?;
+    // (kept as the statement that makes it again: its rows are worked out from its sources, as they are when it comes back)
+    if keep {
+        let made = crate::objects::materialized_sql(&crate::objects::name_sql(shown), &view, lake.cat.get::<TableMeta>(&table_key(shown)).await?.as_ref());
+        unshared.extend(crate::undrop::aside_made(lake, "materialized view", shown, made).await?);
+    }
     lake.cat.commit(unshared, &gone).await?;
     for published in &copies {
         published.delete(lake).await;
     }
     crate::log::forget_producers(lake, producers); // (a view made again under this name starts over)
     crate::views::forget(lake);
-    Ok(left_shares(j!({"view": shown, "dropped": true}), from))
+    Ok((left_shares(j!({"view": shown, "dropped": true}), from), keep.then_some("materialized view")))
 }
 
 /// `ALTER MATERIALIZED VIEW v DETACH`: the view is gone and its table stays, a table like any
