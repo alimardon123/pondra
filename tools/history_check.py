@@ -106,6 +106,26 @@ def history_check(bin, work, port):
     checks["DROP … PURGE and retention = '0 seconds' keep nothing; a table's retention is how long it's kept (7 days unless set; ALTER TABLE … SET too), then it goes; a bad one refused"] = \
         "no dropped table p" in purged and kept == [("d", 7 * 86400.0), ("r", 2.0)] and "no dropped table r" in let_go and "retention" in bad
 
+    # A deleted file: listed in pondra.dropped with the statement that brings it back, and back with it (its newest version).
+    v = n.call("PUT", "/files/notes/it's.txt", b"one")["version"]
+    n.call("PUT", "/files/notes/it's.txt", b"second", headers={"If-Match": v})
+    files_listed = "SELECT name, undrop FROM pondra.dropped WHERE kind = 'file'"
+    none_yet = rows(files_listed)  # (asked again below: a file's deletion commits nothing, so no answer may be kept for it)
+    n.call("DELETE", "/files/notes/it's.txt")
+    listed_file = rows("SELECT name, kind, dropped_by IS NOT NULL, dropped_at <= now(), coalesce(rows_in_files, -1), bytes_in_files, undrop FROM pondra.dropped WHERE kind = 'file'")
+    listed_again = rows(files_listed)
+    listed_table = rows("SELECT name, kind, undrop FROM pondra.dropped WHERE kind = 'table' AND name = 'd'")
+    q(listed_file[0][6] if listed_file else "SELECT 1")  # (the statement as listed)
+    gone_again = rows(files_listed)
+    back = n.get("/files/notes/it's.txt")
+    file_there, file_none = refused("UNDROP FILE 'notes/it''s.txt'"), refused("UNDROP FILE 'never.txt'")
+    foreign = [refused(s) for s in ["SHOW TABLES DROPPED", "UNDROP TABLE WITH ID '6f1e2c'", "UNDROP VOLUME main.raw.landing", "UNDROP SEQUENCE ids"]]
+    checks["a deleted file: in pondra.dropped (kind file, who, when, its newest version's bytes, its UNDROP), back with UNDROP FILE, each answer as of its asking; refused by name: it is there, none kept, other databases' forms, a kind not kept yet"] = \
+        listed_file == [("notes/it's.txt", "file", True, True, -1, 6, "UNDROP FILE 'notes/it''s.txt'")] and listed_table == [("d", "table", "UNDROP TABLE d")] \
+        and none_yet == [] and listed_again == [("notes/it's.txt", "UNDROP FILE 'notes/it''s.txt'")] and gone_again == [] \
+        and back == b"second" and "is there" in file_there and "no deleted file never.txt" in file_none and "pondra.dropped" in foreign[0] \
+        and "Databricks'" in foreign[1] and "UNDROP FILE" in foreign[2] and "not supported yet" in foreign[3]
+
     # A keyed table, and one published for other engines.
     q("CREATE TABLE k (id BIGINT PRIMARY KEY, v VARCHAR) WITH (publish = 'delta')")
     q("INSERT INTO k VALUES (1, 'a'), (2, 'b'), (3, 'c')")

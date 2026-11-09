@@ -98,6 +98,17 @@ pub(crate) fn as_double(args: AccumulatorArgs, make: impl FnOnce(AccumulatorArgs
     Ok(Box::new(AsDouble(make(AccumulatorArgs { expr_fields: &fields, exprs: &exprs, ..args })?)))
 }
 
+/// The state of the accumulator [`as_double`] makes: its fields for an argument of DOUBLE, as it is fed. (Declared for the
+/// whole numbers it was given, DISTINCT's list was `List(Int32)` and filled with DOUBLEs: across files or partitions the
+/// partial batch was refused, 11-09 audit M10.)
+pub(crate) fn as_double_state(args: StateFieldsArgs, make: impl FnOnce(StateFieldsArgs) -> Result<Vec<FieldRef>>) -> Result<Vec<FieldRef>> {
+    if !args.input_fields.first().is_some_and(|f| is_whole(f.data_type())) {
+        return make(args);
+    }
+    let fields = [Arc::new(args.input_fields[0].as_ref().clone().with_data_type(DataType::Float64))];
+    make(StateFieldsArgs { input_fields: &fields, ..args })
+}
+
 /// An accumulator over DOUBLE fed whole numbers (`as_double`).
 #[derive(Debug)]
 struct AsDouble(Box<dyn Accumulator>);
@@ -136,7 +147,7 @@ impl AggregateUDFImpl for Steady {
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        if args.is_distinct { self.inner.state_fields(args) } else { Ok(state_fields(args.name, self.of, args.input_fields.first().is_some_and(|f| is_whole(f.data_type())))) }
+        if args.is_distinct { as_double_state(args, |a| self.inner.state_fields(a)) } else { Ok(state_fields(args.name, self.of, args.input_fields.first().is_some_and(|f| is_whole(f.data_type())))) }
     }
 
     fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool { !args.is_distinct }
@@ -1433,6 +1444,10 @@ mod tests {
         assert!(plan.contains("stddev(w.i)") && !plan.contains("CAST"), "{plan}");
         assert_eq!(one("SELECT avg(i) a, var_pop(i) b, avg(s) c, var_pop(s) d, avg(u) e, var_pop(u) f FROM w").await?, "| 4.5 | 8.25 | 4.5 | 8.25 | 4.5 | 8.25 |");
         assert_eq!(one("SELECT avg(DISTINCT i) a, var_pop(DISTINCT i) b FROM w").await?, "| 4.5 | 8.25 |");
+        // (DISTINCT beside an aggregate DataFusion's DISTINCT rewrite won't take, over a table in several parts: its partial
+        // states cross partitions, declared as the DOUBLEs they hold, 11-09 audit M10)
+        ctx.sql("CREATE TABLE parts AS SELECT * FROM w UNION ALL SELECT * FROM w UNION ALL SELECT * FROM w").await?.collect().await?;
+        assert_eq!(one("SELECT avg(DISTINCT i) a, avg(v) b, var_pop(DISTINCT s) c, var_pop(v) d FROM parts").await?, "| 4.5 | 500.5 | 8.25 | 83333.25 |");
         let slides = "SELECT max(a) m FROM (SELECT avg(i) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS a FROM w)";
         assert_eq!(one(slides).await?, "| 8.5 |");
         // (DataFusion's, taking values back out: its last digits, the same as over the DOUBLEs)

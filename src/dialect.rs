@@ -22,8 +22,19 @@ pub(crate) struct Fallback {
 /// `sql` parsed with the fallback dialect and this build's hooks, and the names of the hooks that read part of it.
 pub(crate) fn parse(sql: &str) -> (Result<Vec<Statement>, ParserError>, Vec<&'static str>) {
     let d = Fallback { hooks: crate::passes::get().hooks().collect(), used: RefCell::new(vec![]) };
-    let parsed = Parser::parse_sql(&d, sql);
-    (parsed, d.used.into_inner())
+    let mut parsed = Parser::parse_sql(&d, sql);
+    let used = d.used.into_inner();
+    if let Ok(stmts) = &mut parsed {
+        // (an infix hook's form, read as an expression, as generic reads its stored text: `AS MEASURE m`'s alias)
+        for (name, h) in &d.hooks {
+            if let Hook::Infix { settle, .. } = h.hook {
+                if used.contains(name) {
+                    stmts.iter_mut().for_each(settle);
+                }
+            }
+        }
+    }
+    (parsed, used)
 }
 
 /// GenericDialect's own answer to each method it answers otherwise than the trait's default (sqlparser 0.62's
@@ -43,6 +54,24 @@ impl Dialect for Fallback {
         for (name, h) in &self.hooks {
             let Hook::Prefix(read) = h.hook else { continue };
             if let Some(read) = read(parser) {
+                self.used.borrow_mut().push(name);
+                return Some(read);
+            }
+        }
+        None
+    }
+
+    fn get_next_precedence(&self, parser: &Parser) -> Option<Result<u8, ParserError>> {
+        self.hooks.iter().find_map(|(_, h)| match h.hook {
+            Hook::Infix { next, .. } => next(parser).map(Ok),
+            _ => None,
+        })
+    }
+
+    fn parse_infix(&self, parser: &mut Parser, expr: &Expr, _precedence: u8) -> Option<Result<Expr, ParserError>> {
+        for (name, h) in &self.hooks {
+            let Hook::Infix { read, .. } = h.hook else { continue };
+            if let Some(read) = read(parser, expr) {
                 self.used.borrow_mut().push(name);
                 return Some(read);
             }

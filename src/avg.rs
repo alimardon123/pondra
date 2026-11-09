@@ -172,7 +172,7 @@ impl AggregateUDFImpl for RoundedAvg {
         let input = |f: &FieldRef| double(f) || crate::fvar::is_whole(f.data_type());
         match !args.is_distinct && double(&args.return_field) && args.input_fields.first().is_some_and(input) {
             true => Ok(crate::fvar::mean_state(args.name, crate::fvar::is_whole(args.input_fields[0].data_type()))),
-            false => self.0.state_fields(args),
+            false => crate::fvar::as_double_state(args, |a| self.0.state_fields(a)), // (DISTINCT: `as_double`'s)
         }
     }
 

@@ -35,6 +35,10 @@ pub struct Kept {
     /// and routines, dropped with CASCADE. UNDROP brings them back with it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub with: Vec<(String, String)>,
+    /// What its drop took with it and kept nowhere, as UNDROP's answer names it (`left`: kind, name and why): a topic's
+    /// view, whose offsets start over when it is made again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lost: Vec<Value>,
     /// The statement that makes it again, for a kind whose rows are worked out from others' (a materialized view): run
     /// when it comes back, so its rows are its sources' as they are then.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -62,21 +66,35 @@ fn family(kind: &str) -> Result<&'static str> {
 /// The puts that keep `name`, of `kind`, as `keys` hold it now, with the comments on it: they go in the drop's own commit.
 /// A key that holds nothing is left out.
 pub async fn aside(lake: &Lake, kind: &str, name: &str, keys: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
-    aside_with(lake, kind, name, keys, vec![], crate::ddl::KEEP_MS).await
+    aside_with(lake, kind, name, keys, vec![], vec![], crate::ddl::KEEP_MS).await
 }
 
-/// The same, for a drop that took `with` along (kept for `keep_ms`: as long as the longest kept of them, and never less
-/// than the default).
-pub async fn aside_with(lake: &Lake, kind: &str, name: &str, keys: &[String], with: Vec<(String, String)>, keep_ms: u64) -> Result<Vec<(String, Vec<u8>)>> {
-    record(lake, kind, name, keys, with, keep_ms, String::new()).await
+/// The same, for a drop that took `with` along, and `lost` that it kept nowhere (kept for `keep_ms`: as long as the
+/// longest kept of them, and never less than the default).
+pub async fn aside_with(lake: &Lake, kind: &str, name: &str, keys: &[String], with: Vec<(String, String)>, lost: Vec<Value>, keep_ms: u64) -> Result<Vec<(String, Vec<u8>)>> {
+    record(lake, kind, name, keys, with, lost, keep_ms, String::new()).await
+}
+
+/// The puts that keep each of `with` but its tables (which keep their own retention) for `keep_ms` at least: what a drop took
+/// along is kept as long as it is, so a late UNDROP brings back no table without the views and routines beside it.
+pub async fn kept_as_long(lake: &Lake, with: &[(String, String)], keep_ms: u64) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut puts = vec![];
+    for (kind, name) in with.iter().filter(|(kind, _)| kind != "table") {
+        if let Some((k, mut kept)) = copies(lake, kind, name).await?.pop().filter(|(_, c)| c.keep_ms < keep_ms) {
+            kept.keep_ms = keep_ms;
+            puts.push((k, json(&kept)));
+        }
+    }
+    Ok(puts)
 }
 
 /// The puts that keep `name`, of `kind`, as the statement `made` that makes it again, with the comments on it.
 pub async fn aside_made(lake: &Lake, kind: &str, name: &str, made: String) -> Result<Vec<(String, Vec<u8>)>> {
-    record(lake, kind, name, &[], vec![], crate::ddl::KEEP_MS, made).await
+    record(lake, kind, name, &[], vec![], vec![], crate::ddl::KEEP_MS, made).await
 }
 
-async fn record(lake: &Lake, kind: &str, name: &str, keys: &[String], with: Vec<(String, String)>, keep_ms: u64, made: String) -> Result<Vec<(String, Vec<u8>)>> {
+#[allow(clippy::too_many_arguments)]
+async fn record(lake: &Lake, kind: &str, name: &str, keys: &[String], with: Vec<(String, String)>, lost: Vec<Value>, keep_ms: u64, made: String) -> Result<Vec<(String, Vec<u8>)>> {
     let family = family(kind)?;
     let mut records = vec![];
     for k in keys.iter().cloned().chain([format!("cm/{family}/{name}")]) {
@@ -90,7 +108,7 @@ async fn record(lake: &Lake, kind: &str, name: &str, keys: &[String], with: Vec<
     // (later than the name's last kept copy, so two drops in one millisecond keep two)
     let last = lake.cat.scan::<Times>(&format!("{PREFIX}{family}/{name}/"), &format!("{PREFIX}{family}/{name}0")).await?.last().map(|(_, t)| t.at_ms);
     let at_ms = crate::log::now_ms().max(last.map_or(0, |l| l + 1));
-    let kept = Kept { at_ms, keep_ms: keep_ms.max(crate::ddl::KEEP_MS), kind: kind.to_string(), by: crate::auth::name(), records, with, made };
+    let kept = Kept { at_ms, keep_ms: keep_ms.max(crate::ddl::KEEP_MS), kind: kind.to_string(), by: crate::auth::name(), records, with, lost, made };
     Ok(vec![(key(family, name, at_ms), json(&kept))])
 }
 
@@ -106,6 +124,9 @@ async fn copies(lake: &Lake, kind: &str, name: &str) -> Result<Vec<(String, Kept
     Ok(kept)
 }
 
+/// The keys of every kept copy of `name`, of `kind`: a drop with PURGE deletes them in its own commit.
+pub async fn kept_keys(lake: &Lake, kind: &str, name: &str) -> Result<Vec<String>> { Ok(copies(lake, kind, name).await?.into_iter().map(|(k, _)| k).collect()) }
+
 /// Is a copy of `name`, of `kind`, kept?
 pub async fn has(lake: &Lake, kind: &str, name: &str) -> Result<bool> { Ok(!copies(lake, kind, name).await?.is_empty()) }
 
@@ -118,7 +139,7 @@ pub async fn undrop(lake: &Lake, kind: &str, name: &str, scope: &crate::rights::
     let family = family(kind)?;
     let word = kind.to_uppercase();
     let relation = family == "relation";
-    let Some((at, kept)) = copies(lake, kind, name).await?.pop() else {
+    let Some((at, mut kept)) = copies(lake, kind, name).await?.pop() else {
         let code = match family {
             "relation" => "42P01",
             "routine" => "42883",
@@ -138,6 +159,9 @@ pub async fn undrop(lake: &Lake, kind: &str, name: &str, scope: &crate::rights::
             return Err(crate::codes::coded(code, format!("{name} exists: drop or rename it, then UNDROP {word} {name}")));
         }
     }
+    if family == "task" && !crate::ext::owner() {
+        crate::runs::unmark(&mut kept.records); // (the owner's marks are the owner's to bring back: another's UNDROP makes the task theirs, as their CREATE would)
+    }
     let shown = kept.kind.clone();
     if !kept.made.is_empty() {
         let Some(crate::write::Stmt::Ddl(ds)) = crate::write::parse(&kept.made) else {
@@ -150,38 +174,48 @@ pub async fn undrop(lake: &Lake, kind: &str, name: &str, scope: &crate::rights::
     let puts = kept.records.into_iter().map(|(k, v)| (k, json(&v))).collect();
     lake.cat.commit(puts, &[at]).await?;
     let mut out = j!({shown: name, "undropped": true});
+    let mut left = kept.lost;
     if !kept.with.is_empty() {
-        let (back, left) = members(lake, &kept.with, scope).await;
+        let (back, more) = members(lake, &kept.with, scope).await;
         out["with"] = j!(back);
-        if !left.is_empty() {
-            out["left"] = j!(left);
-        }
+        left.extend(more);
+    }
+    if !left.is_empty() {
+        out["left"] = j!(left);
     }
     Ok(out)
 }
 
 /// What a drop took along, brought back after it: tables first, then routines, then what reads them (a schema's views,
-/// a materialized view made again from its query). Each that is still kept comes back, and the answer says why each other
-/// one isn't (its time was up, or its name is taken).
+/// a materialized view made again from its query), in rounds, so one that reads another of them (a materialized view of
+/// the schema's view) comes back once that one has; a round that brings none back ends it. Each that is still kept comes
+/// back, and the answer says why each other one isn't (its time was up, or its name is taken).
 async fn members(lake: &Lake, with: &[(String, String)], scope: &crate::rights::Scope) -> (Vec<String>, Vec<Value>) {
-    let (mut back, mut left) = (vec![], vec![]);
+    let mut back = vec![];
     let mut with: Vec<&(String, String)> = with.iter().collect();
     with.sort_by_key(|(kind, _)| match kind.as_str() {
         "table" => 0,
         k if family(k).is_ok_and(|f| f == "routine") => 1,
         _ => 2,
     });
-    for (kind, name) in with {
-        let out = match kind.as_str() {
-            "table" => Box::pin(crate::ddl::undrop(lake, name, scope)).await, // (boxed: UNDROP TABLE may bring back a kept external table)
-            _ => Box::pin(undrop(lake, kind, name, scope)).await,
-        };
-        match out {
-            Ok(_) => back.push(format!("{kind} {name}")),
-            Err(e) => left.push(j!({"kind": kind, "name": name, "why": format!("{e:#}")})),
+    loop {
+        let (before, mut left) = (back.len(), vec![]);
+        for m in with {
+            let (kind, name) = m;
+            let out = match kind.as_str() {
+                "table" => Box::pin(crate::ddl::undrop(lake, name, scope)).await, // (boxed: UNDROP TABLE may bring back a kept external table)
+                _ => Box::pin(undrop(lake, kind, name, scope)).await,
+            };
+            match out {
+                Ok(_) => back.push(format!("{kind} {name}")),
+                Err(e) => left.push((m, e)),
+            }
         }
+        if left.is_empty() || back.len() == before {
+            return (back, left.into_iter().map(|((kind, name), e)| j!({"kind": kind, "name": name, "why": format!("{e:#}")})).collect());
+        }
+        with = left.into_iter().map(|(m, _)| m).collect();
     }
-    (back, left)
 }
 
 /// The name UNDROP `kind` reads `name` as: placed in its schema, which must be there, for a kind that has schemas (a
@@ -207,8 +241,13 @@ pub async fn expired(lake: &Lake, now: u64) -> Result<Vec<String>> {
     Ok(lake.cat.scan::<Times>(PREFIX, "dk0").await?.into_iter().filter(|(_, t)| now >= t.at_ms.saturating_add(t.keep_ms)).map(|(k, _)| k).collect())
 }
 
-/// The statement that brings it back, as `pondra.dropped` says it.
-pub fn statement(kind: &str, name: &str) -> String { format!("UNDROP {} {}", kind.to_uppercase(), crate::objects::name_sql(name)) }
+/// The statement that brings it back, as `pondra.dropped` says it: a deleted file's names its path, in quotes.
+pub fn statement(kind: &str, name: &str) -> String {
+    match kind {
+        "file" => format!("UNDROP FILE '{}'", name.replace('\'', "''")),
+        _ => format!("UNDROP {} {}", kind.to_uppercase(), crate::objects::name_sql(name)),
+    }
+}
 
 // A dropped database: its folder stays as it was, under a mark at its root (`LAKE_MARK`), out of every listing of
 // databases (`ddl::lakes_in`) and refused to every open by name, until UNDROP DATABASE takes the mark off, or a new
@@ -354,6 +393,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_secret_dropped_with_purge_is_kept_nowhere() {
+        crate::auth::as_node(purged()).await
+    }
+
+    async fn purged() {
+        let lake = lake().await;
+        let make = "CREATE SECRET k (TYPE s3, KEY_ID 'a', SECRET 'b')";
+        let said = |out: Value| (out["dropped"].clone(), out["purged"].clone());
+        run(&lake, make).await.unwrap();
+        run(&lake, "DROP SECRET k").await.unwrap(); // (kept)
+        run(&lake, make).await.unwrap();
+        assert_eq!(said(run(&lake, "DROP SECRET k PURGE").await.unwrap()), (j!(true), j!(1)), "dropped, and the earlier drop's copy let go");
+        assert!(all(&lake).await.unwrap().is_empty(), "neither drop's copy is kept");
+        assert!(lake.cat.get::<Value>("e/k").await.unwrap().is_none());
+        // (a name that is only kept: PURGE lets its copies go)
+        run(&lake, make).await.unwrap();
+        run(&lake, "DROP SECRET k").await.unwrap();
+        assert_eq!(said(run(&lake, "DROP SECRET k PURGE").await.unwrap()), (j!(false), j!(1)));
+        assert!(all(&lake).await.unwrap().is_empty());
+        assert!(format!("{:#}", run(&lake, "DROP SECRET k PURGE").await.unwrap_err()).contains("no secret k"), "nothing is left of k");
+        assert_eq!(said(run(&lake, "DROP SECRET IF EXISTS k PURGE").await.unwrap()), (j!(false), j!(0)));
+    }
+
+    #[tokio::test]
     async fn the_newest_comes_back_and_a_taken_name_is_refused() {
         let lake = lake().await;
         run(&lake, "CREATE VIEW v AS SELECT 1 AS one").await.unwrap();
@@ -405,6 +468,29 @@ mod tests {
         assert_eq!(lake.cat.get::<Value>("r/s.m").await.unwrap(), Some(macro_was), "its macro is back as it was");
         assert_eq!(lake.cat.get::<String>("cm/schema/s").await.unwrap().as_deref(), Some("sales"), "with its comment");
         assert!(all(&lake).await.unwrap().is_empty(), "no kept record is left");
+    }
+
+    /// A schema's members are kept as long as it (its longest kept table), and come back in the order they read each
+    /// other: a materialized view of the schema's own view after that view.
+    #[tokio::test]
+    async fn a_schema_brings_back_what_reads_its_members_as_long_as_it_is_kept() {
+        let lake = lake().await;
+        let _leads = crate::log::Sequencer::start(lake.clone(), None).await.unwrap(); // (a DROP TABLE's entry is moved by the leader)
+        run(&lake, "CREATE SCHEMA s").await.unwrap();
+        crate::write::create_table(&lake, "s.t", r#"{"columns": [["a", "Int64"]], "retention": "30 days"}"#).await.unwrap();
+        run(&lake, "CREATE VIEW s.v AS SELECT a FROM s.t").await.unwrap();
+        run(&lake, "CREATE MATERIALIZED VIEW s.mv AS SELECT a, count(*) AS n FROM s.v GROUP BY a").await.unwrap();
+        run(&lake, "CREATE MACRO s.m(x) AS x + 1").await.unwrap();
+        run(&lake, "DROP SCHEMA s CASCADE").await.unwrap();
+        let month = 30 * 86_400_000;
+        let kept: Vec<(String, u64)> = all(&lake).await.unwrap().into_iter().map(|(n, k)| (format!("{} {n}", k.kind), k.keep_ms)).collect();
+        assert_eq!(kept.len(), 4, "{kept:?}");
+        assert!(kept.iter().all(|(_, ms)| *ms == month), "the schema, its view, materialized view and macro are kept as long as its table: {kept:?}");
+        let out = run(&lake, "UNDROP SCHEMA s").await.unwrap();
+        assert!(out.get("left").is_none(), "{out}");
+        let with: Vec<&str> = out["with"].as_array().unwrap().iter().map(|w| w.as_str().unwrap()).collect();
+        assert_eq!(with, ["table s.t", "macro s.m", "view s.v", "materialized view s.mv"], "what reads another comes back after it");
+        assert!(lake.cat.get::<Value>(&crate::views::view_key("s.mv")).await.unwrap().is_some(), "the materialized view is made again");
     }
 
     /// A materialized view is kept as the statement that makes it again: UNDROP runs it, so its rows are worked out from
@@ -492,7 +578,7 @@ mod tests {
             assert!(matches!(parse(sql), Some(Stmt::Ddl(ds)) if matches!(&ds[..], [Ddl::UndropKept { kind: k, .. }] if k == kind)), "{sql}");
         }
         match parse("UNDROP SEQUENCE s") {
-            Some(Stmt::Invalid(e)) => assert!(e.contains("EXTERNAL TABLE, FUNCTION") && e.contains("DATABASE") && e.contains("SCHEMA") && e.contains("pondra.dropped"), "{e}"),
+            Some(Stmt::Refused("0A000", e)) => assert!(e.contains("EXTERNAL TABLE, FUNCTION") && e.contains("DATABASE") && e.contains("SCHEMA") && e.contains("pondra.dropped"), "{e}"),
             _ => panic!("UNDROP SEQUENCE: refused, naming the kinds"),
         }
     }

@@ -1858,7 +1858,7 @@ def pace():
     """Writes keep their pace while many clients query (`panics::work`): a writer's appends, a
     request at a time, alone and then beside 64 clients each asking an aggregate over 2 million
     rows. On one runtime its acks waited behind the queries' tasks (20-50 times as long). Then
-    beside eight views running their queries again over what it writes (`panics::aside`)."""
+    beside eight views running their queries again over what it writes (`spawns::aside`)."""
     lake = new_lake()
     node = Node(lake, A.port).start()
     q = lambda s: sql(A.port, s)
@@ -1896,7 +1896,7 @@ def pace():
     [r.join(60) for r in readers]
     # Views that run their queries again over what the writer writes, each as often as its pace lets
     # it (kept by key, every group touched by every write: each run reads every row): the leader's
-    # own work, on the queries' runtime too (`panics::aside`).
+    # own work, on the queries' runtime too (`spawns::aside`).
     for i in range(8):
         q(f"CREATE MATERIALIZED VIEW busy{i} AS SELECT id % 50 + {i} AS k, median(id) AS m, count(DISTINCT s) AS d FROM w GROUP BY 1")
     time.sleep(2)
@@ -1923,7 +1923,7 @@ def memory():
     with no reader. On a local lake each file read and write is a blocking task, often enough that
     tokio's pool kept every thread it had started (about 90 on 4 cores), each with its own heap: a
     node grew 180 → 920 MB in ten minutes at this pace while what it held stayed at 80–90 MB. Four
-    blocking threads a core, 16 at least (`panics::runtime`), slowed that; `PONDRA_BLOCKING_THREADS=512`
+    blocking threads a core, 16 at least (`spawns::runtime`), slowed that; `PONDRA_BLOCKING_THREADS=512`
     fails the threads' check. mimalloc still kept what the node freed (190 → 310 MB from the second
     minute to the fourth); jemalloc, the program's allocator on Linux (`main.rs`), gives it back and
     levels off at 120–130 MB by the third, and mimalloc fails the memory check. Its own memory is

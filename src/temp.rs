@@ -154,7 +154,7 @@ pub fn with<T>(session: &str, change: bool, f: impl FnOnce(&mut Session) -> Resu
         CHANGES.send_modify(|v| *v += 1);
     }
     if first {
-        crate::panics::spawn(reap()); // (only while there are sessions)
+        crate::spawns::spawn(reap()); // (only while there are sessions)
     }
     Ok(out)
 }
