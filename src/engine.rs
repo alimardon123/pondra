@@ -143,6 +143,8 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             lake.add("sequences", crate::seq::register); // nextval, currval, setval
             lake.add("secrets", crate::ext::register_secrets); // secrets()
         }
+        #[cfg(feature = "lake")] // (what a lake does as it opens: `store::OpenHooks`)
+        r.section_mut::<crate::store::OpenHooks>().add("branch bases", |lake| Box::pin(crate::branch::load(lake)));
         #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: each says what its state holds, `LakeState::ABOUT`)
         {
             let states = r.section_mut::<crate::lake_state::Registered>();
