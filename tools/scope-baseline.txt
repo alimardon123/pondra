@@ -4,9 +4,11 @@
 node apply.rs 1
 node backup.rs 2
 node branch.rs 2
+node cache.rs 1
 node cli.rs 1
 node cluster.rs 7
 node constraints.rs 5
+node dbserver.rs 2
 node ddl.rs 6
 node defaults.rs 1
 node extension.rs 1
@@ -18,6 +20,8 @@ node history.rs 2
 node hot.rs 1
 node iceberg_rest.rs 1
 node inbox.rs 2
+node kafka.rs 1
+node kv/slate.rs 3
 node learned.rs 2
 node library.rs 1
 node log.rs 4
@@ -33,6 +37,7 @@ node runs.rs 7
 node server.rs 1
 node spmd.rs 2
 node store.rs 3
+node terms.rs 1
 node txn.rs 1
 node users.rs 2
 node views.rs 9

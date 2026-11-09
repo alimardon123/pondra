@@ -676,7 +676,7 @@ pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) 
     let node = crate::node_state::NodeState::new(life.clone());
     let here = node.clone(); // (what a failed open ends: the tasks it started, `end_page`)
     let store = crate::store::counted(crate::memory_lake::store(&url), &node.metrics); // (its term's claims and marks the page's: `Counted`)
-    let lead = if owned { crate::members::Alone::lead_owned(&store, &node.claims).await } else { crate::members::Alone::lead(&store, &node.claims).await };
+    let lead = if owned { crate::members::Alone::lead_owned(&store, &node).await } else { crate::members::Alone::lead(&store, &node).await };
     let (alone, marks) = match lead {
         Ok(led) => led,
         Err(e) => {
@@ -716,7 +716,6 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
         follow.abort(); // (the node's stream ends as the page closes, not at the node's next commit)
     }
     node.tasks.abort_all();
-    crate::spawns::abort_all(); // (what is still started on the process's list: step 5 piece 7b's second half moves it)
     if let Some(lake) = lake {
         let _ = lake.cat.close().await;
     }
@@ -887,7 +886,7 @@ mod tests {
     async fn lake_app() -> (crate::app::App, tokio::task::JoinHandle<()>) {
         let url = format!("memory://catalog-counts-{}", uuid::Uuid::new_v4().simple());
         let node = super::native(true); // (a guest's: `node::start_app` starts no loops)
-        let (alone, marks) = crate::members::Alone::lead(&crate::memory_lake::store(&url), &node.claims).await.unwrap();
+        let (alone, marks) = crate::members::Alone::lead(&crate::memory_lake::store(&url), &node).await.unwrap();
         let lake = crate::store::Lake::open(&url, true, false, node).await.unwrap();
         let app = super::start_app(lake, alone, None, &super::Start::default()).await.unwrap();
         (app, marks)
@@ -896,9 +895,12 @@ mod tests {
     /// The write-set rule (designs/redesign/redesign.md §4, step 5 piece 10e): a statement reads and writes the catalog
     /// records of what it names, not of every table. Among 2,000 tables, each reads and writes fewer than 50. (Here, with
     /// the node: a test in `write` may not start one, a floor below.)
-    #[tokio::test]
-    async fn a_statement_reads_and_writes_only_its_write_set() {
-        crate::auth::as_node(async {
+    #[test]
+    fn a_statement_reads_and_writes_only_its_write_set() {
+        // (on a node's runtime, whose threads have the 8 MB a request has: a CREATE TABLE AS SELECT's path takes about
+        // 2.5 MB in a release build, past the 2 MB of a test's own thread)
+        let rt = crate::spawns::runtime().build().unwrap();
+        rt.block_on(rt.spawn(crate::auth::as_node(async {
             let (app, marks) = lake_app().await;
             let (lake, counts) = (app.lake.clone(), app.lake.node.metrics.clone()); // (this lake's own counters: its node's)
             let spec = r#"{"columns": [["id", "Int64"], ["a", "Int64"]]}"#;
@@ -931,8 +933,8 @@ mod tests {
             }
             marks.abort(); // (a dropped handle aborts nothing: its mark would land again after the lake is gone)
             crate::memory_lake::forget_memory(&lake.url);
-        })
-        .await
+        })))
+        .unwrap();
     }
 
     /// The folder records the catalog keeps (`ddl::folder_hook`, step 5 piece 10c) say what every table says
