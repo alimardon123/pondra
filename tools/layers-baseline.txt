@@ -240,12 +240,7 @@ statement -> python  1
 store -> bridge  1
 store -> budget  2
 store -> ddl  1
-store -> delta  1
-store -> engine  1
 store -> ext  2
-store -> in_task  1
-store -> locks  1
-store -> oom  2
 store -> rules  1
 store -> served  1
 store -> types  1
@@ -255,7 +250,6 @@ store_wire -> store  1
 temp -> python  2
 terms -> wasm32  1
 text -> pg_json_make  1
-tier -> delta  1
 tier -> dial  2
 types -> pg_casts  1
 udf -> wasm32  4

@@ -145,6 +145,10 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         }
         #[cfg(feature = "lake")] // (what a lake does as it opens: `store::OpenHooks`)
         r.section_mut::<crate::store::OpenHooks>().add("branch bases", |lake| Box::pin(crate::branch::load(lake)));
+        #[cfg(feature = "lake")] // (a lake's sessions, and the memory watch it tells of its caches: `store::EngineHooks`)
+        {
+            *r.section_mut::<crate::store::EngineHooks>() = crate::store::EngineHooks { session: Some(session), on_a_page: Some(crate::in_task::planned), roots: Some(crate::oom::roots), wake: Some(crate::oom::wake) };
+        }
         #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: each says what its state holds, `LakeState::ABOUT`)
         {
             let states = r.section_mut::<crate::lake_state::Registered>();
