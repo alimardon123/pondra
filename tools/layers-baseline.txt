@@ -108,7 +108,6 @@ lib -> wasm32  2
 locks -> dial  2
 log -> adopt  1
 log -> constraints  3
-log -> copy  2
 log -> defaults  1
 log -> dial  1
 log -> locks  1
@@ -153,7 +152,7 @@ objects -> shares  7
 objects -> sso  2
 objects -> sys  2
 objects -> temp  1
-objects -> types  6
+objects -> types  5
 objects -> users  2
 objects -> views  5
 objects -> write  11
@@ -240,19 +239,16 @@ statement -> pg_catalog  1
 statement -> python  1
 store -> bridge  1
 store -> budget  2
-store -> copy  1
 store -> ddl  1
 store -> delta  1
 store -> engine  1
 store -> ext  2
-store -> finish  1
 store -> in_task  1
 store -> locks  1
 store -> oom  2
 store -> rules  1
-store -> seq  1
 store -> served  1
-store -> types  2
+store -> types  1
 store -> wasm32  15
 store -> write  1
 store_wire -> store  1

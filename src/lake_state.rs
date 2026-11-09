@@ -71,6 +71,8 @@ pub struct Opening {
     pub memory: bool,
     /// Its node's machine's memory, when it is known (`Machine::ram`).
     pub ram: Option<usize>,
+    /// Its node's memory for queries (`store::node_memory`), which a cache goes by where the machine's memory isn't known.
+    pub queries: usize,
 }
 
 /// The registry's section of a lake's states: every one a lake may keep, as its extensions add them (`add`).
@@ -345,7 +347,7 @@ mod tests {
         let line = Ledger::new(1 << 20, 1 << 20);
         let a = States::default();
         assert!(a.caches().is_empty(), "nothing made yet");
-        let opening = Opening { memory: false, ram: None };
+        let opening = Opening { memory: false, ram: None, queries: 1 << 30 };
         a.open(&r, &opening);
         assert_eq!(a.caches().iter().map(|(name, _)| *name).collect::<Vec<_>>(), ["opened"], "made as the lake opens");
         let opened = a.get_in::<Opened>(&r, Some(&line)).unwrap();

@@ -628,7 +628,7 @@ impl Backend {
     }
 
     /// Whoever signed in, as a statement runs: `who`, its sign-in checked again once who may do what changed since it was
-    /// made, or its credential ended (`Principal::stale`: one load and a compare), with its role and grants as they are now.
+    /// made, or its credential ended (`Principal::again`: one load and a compare), with its role and grants as they are now.
     /// One that no longer signs in ends the connection (FATAL 28000), as Postgres ends a session whose role can't go on.
     async fn signed(&self) -> PgWireResult<crate::auth::Principal> {
         let who = self.who();
@@ -636,16 +636,25 @@ impl Backend {
             return Ok(who);
         }
         let Some(again) = self.again.lock().unwrap().clone() else { return Ok(who) };
-        Box::pin(self.signed_again(again)).await // (boxed: a statement's future doesn't carry a sign-in's)
+        match Box::pin(who.again(&self.app, || self.sign_in_again(again))).await { // (boxed: a statement's future doesn't carry a sign-in's)
+            None => Ok(who),
+            Some(Ok(p)) => {
+                *self.who.lock().unwrap() = Some(p.clone());
+                Ok(p)
+            }
+            Some(Err(why)) => {
+                *self.who.lock().unwrap() = None;
+                Err(fatal(who.signed_out(&why)))
+            }
+        }
     }
 
-    /// `signed`'s check, due: whoever `again` signs in now, kept as who this connection is.
-    async fn signed_again(&self, again: Again) -> PgWireResult<crate::auth::Principal> {
-        let (lake, auth, was) = (&self.app.lake, &self.app.auth, self.who());
-        let epoch = lake.cat.rights_version(); // (before it is asked again, as at sign-in)
-        let now = match &again {
+    /// `signed`'s sign-in, due: whoever `again` signs in now (an open lake's anyone: as it was), or why it can't.
+    async fn sign_in_again(&self, again: Again) -> std::result::Result<crate::auth::Principal, String> {
+        let (lake, auth) = (&self.app.lake, &self.app.auth);
+        match &again {
             Again::Open => match self.app.open().await {
-                true => Ok(was.clone()),
+                true => Ok(self.who()),
                 false => Err("the lake now signs its users in (CREATE USER, or a token): connect again and sign in".into()),
             },
             Again::Token { user, token } => match crate::users::sign_in(lake, auth, user, token).await {
@@ -657,18 +666,6 @@ impl Backend {
                 None => Err("it can't sign in any more (dropped, or NOLOGIN)".into()),
                 Some(_) => Err("its password was changed".into()),
             },
-        };
-        match now {
-            Ok(p) => {
-                let p = crate::auth::Principal { epoch: p.epoch.max(epoch), ..p.at(was.door, was.from) }; // (an open lake's anyone: as it was)
-                *self.who.lock().unwrap() = Some(p.clone());
-                Ok(p)
-            }
-            Err(why) => {
-                *self.who.lock().unwrap() = None;
-                crate::audit::refused(&self.app, &was.name, "postgres", was.from, "sign in again", &why).await;
-                Err(fatal(format!("user \"{}\" is signed out: {why}", was.name)))
-            }
         }
     }
 
