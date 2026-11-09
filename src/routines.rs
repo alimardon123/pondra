@@ -822,6 +822,7 @@ pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<
         warning.iter().for_each(|w| heard(&format!("WARNING: {w}")));
         return Ok(Outcome::Done(j!({"transaction": tag.to_lowercase()})));
     }
+    let shows = who.scope.shows_code(); // (a failed transaction's words, as its caller is told them)
     // (the gate runs inside the audited statement, so a refusal there is audited and fails the transaction too: a write
     // in a READ ONLY one (25006) leaves it failed, and the next statement gets 25P02)
     let out = crate::audit::statement(app, sql, Box::pin(async move {
@@ -830,7 +831,7 @@ pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<
     }))
     .await;
     if let Err(e) = &out {
-        crate::txn::failed(&crate::ext::said(e)); // (in a transaction: it fails with the statement)
+        crate::txn::failed(&crate::codes::told(e, shows)); // (in a transaction: it fails with the statement)
     }
     out
 }

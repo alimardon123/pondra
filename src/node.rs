@@ -364,12 +364,13 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
             ledger.charge(name, Arc::downgrade(&cache));
         }
         // (the lake's state its doors use, made as it starts, so `/metrics` names it before its first use: the answers kept
-        // for their pages, its functions' answers, and the logs and manifests of the Delta and Iceberg tables it reads; each
-        // is charged to the lake's line as it is made, `Lake::state`)
+        // for their pages, its functions' answers, the logs and manifests of the Delta and Iceberg tables it reads, and its
+        // queries' planning facts; each is charged to the lake's line as it is made, `Lake::state`)
         lake.state::<crate::pages::Pages>()?;
         lake.state::<crate::pyfn::Answered>()?;
         lake.state::<crate::read_delta::Logs>()?;
         lake.state::<crate::read_iceberg::Manifests>()?;
+        lake.state::<crate::query::FactsKept>()?;
     }
     crate::constraints::share_lock(&app.lake, app.lock.clone()); // a checked append of this lake takes this lock (`constraints::leader`); the Log is reachable only through the App
     learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
@@ -517,7 +518,8 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     }
     // Finished shuffles are forgotten here, and what they spilled deleted.
     if lives {
-        every(Duration::from_secs(30), || async { spmd::gc(); Ok(()) });
+        let l = lake.clone();
+        every(Duration::from_secs(30), move || { let l = l.clone(); async move { spmd::gc(&l); Ok(()) } });
     }
     if leader && lives {
         // The leader's SSD tier learns of objects other nodes wrote from its own commits (and its hot

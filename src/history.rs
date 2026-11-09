@@ -621,7 +621,11 @@ impl crate::lake_state::LakeState for Writers {
 /// Starts one of `lake`'s log writers, kept for `end_writers`: the node's own work (`auth::as_node`), whoever's lines
 /// it writes.
 pub(crate) fn keep(lake: &Lake, run: impl std::future::Future<Output = ()> + Send + 'static) {
-    let task = crate::panics::own(run);
+    kept(lake, crate::panics::own(run));
+}
+
+/// `keep`'s part that isn't its task's: one copy for every writer.
+fn kept(lake: &Lake, task: tokio::task::JoinHandle<()>) {
     if let Ok(w) = lake.state::<Writers>() {
         w.tasks.lock().unwrap_or_else(|e| e.into_inner()).push(task);
     }
@@ -629,13 +633,11 @@ pub(crate) fn keep(lake: &Lake, run: impl std::future::Future<Output = ()> + Sen
 
 /// A log writer's next line: None once its node is stopping and every line sent before is taken.
 pub(crate) async fn next<L>(lake: &Lake, rx: &mut tokio::sync::mpsc::UnboundedReceiver<L>) -> Option<L> {
-    let Ok(w) = lake.state::<Writers>() else { return rx.recv().await };
-    let mut ending = w.ending.subscribe();
-    drop(w); // (a writer waits holding no more of its lake than it did)
+    let mut ending = watching(lake);
     tokio::select! {
         biased;
         line = rx.recv() => return line,
-        _ = async { drop(ending.wait_for(|e| *e).await) } => {} // (its guard isn't Send: dropped here)
+        _ = stopped(&mut ending) => {}
     }
     rx.close(); // (what was sent before stays to be taken; nothing more comes)
     rx.recv().await
@@ -648,10 +650,20 @@ pub(crate) fn ending(lake: &Lake) -> bool {
 
 /// Waits until `lake`'s node is stopping.
 async fn stopping(lake: &Lake) {
-    let Ok(w) = lake.state::<Writers>() else { return std::future::pending().await };
-    let mut ending = w.ending.subscribe();
-    drop(w);
-    drop(ending.wait_for(|e| *e).await);
+    stopped(&mut watching(lake)).await
+}
+
+/// What says when `lake`'s node is stopping: a writer waits on it holding no more of its lake than it did.
+fn watching(lake: &Lake) -> Option<tokio::sync::watch::Receiver<bool>> {
+    lake.state::<Writers>().ok().map(|w| w.ending.subscribe())
+}
+
+/// Waits until `ending` says its node is stopping: never, with nothing to say it.
+async fn stopped(ending: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match ending {
+        Some(e) => drop(e.wait_for(|e| *e).await), // (its guard isn't Send: dropped here)
+        None => std::future::pending().await,
+    }
 }
 
 /// Writes what `lake`'s log writers were sent, then ends them: `Node::stop`, while the node still

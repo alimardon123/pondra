@@ -133,7 +133,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     let ai = [("answered", &crate::ai::CALLS), ("failed", &crate::ai::FAILED), ("retried", &crate::ai::RETRIED)].map(|(r, c)| (format!("{{result=\"{r}\"}}"), get(c)));
     metric("ai_requests_total", "counter", "requests ai_complete and ai_embed made to the model's endpoint: answered, failed for good (their rows NULL), tried again", &ai);
     metric("shuffle_spilled_bytes_total", "counter", "shuffle rows written to this node's disk", &one(get(&m.spilled)));
-    metric("shuffle_disk_bytes", "gauge", "shuffle buckets on this node's disk now", &one(crate::spill::held() as f64));
+    metric("shuffle_disk_bytes", "gauge", "shuffle buckets on this node's disk now", &one(crate::spill::held_by(&app.lake.node) as f64));
     metric("shuffle_skew", "gauge", "worst bucket vs the average one in a shuffle here (1 = even)", &one(get(&m.skew) / 100.0));
     metric("skew_splits_total", "counter", "hot partitions of shuffled joins shared out over the nodes", &one(get(&m.skew_splits)));
     metric("shuffle_received_bytes_total", "counter", "shuffle bytes this node's steps read", &one(get(&m.received)));

@@ -407,7 +407,7 @@ pub fn main() {
         panics::runtime().build().expect("a runtime").block_on(crate::auth::as_node(async {
             // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
             if let Err(e) = run().await {
-                eprintln!("Error: {}", ext::said(&e));
+                eprintln!("Error: {}", crate::codes::told(&e, true)); // (to its operator, run as the node's: shown a routine's code)
                 crate::memory::leave(); // (what this process made goes first: `process::exit` runs no destructor)
                 std::process::exit(1);
             }

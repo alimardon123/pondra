@@ -245,7 +245,6 @@ sharing_client -> byte_range  1
 sharing_client -> fetch  4
 sharing_client -> read_delta  1
 sharing_client -> reset  1
-spill -> reset  1
 spmd -> dial  9
 sso -> crypto  6
 sso -> fetch  1
@@ -274,7 +273,7 @@ store -> in_task  1
 store -> locks  1
 store -> oom  2
 store -> panics  4
-store -> query  5
+store -> query  4
 store -> rules  14
 store -> seq  3
 store -> serve  2
@@ -307,7 +306,6 @@ views -> matches  4
 views -> measures  1
 views -> pattern  1
 views -> pg_json  1
-views -> reset  1
 with_writes -> pg_types  2
 workspace -> python  4
 write -> crypto  1
