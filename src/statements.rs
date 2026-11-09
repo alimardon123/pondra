@@ -187,9 +187,10 @@ impl Statements {
     }
 
     /// The statement `sql` is, by its words: the entry whose words begin it, the longest where two do. A statement whose
-    /// first word begins no entry is tokenized here not at all.
+    /// first word begins no entry is tokenized here not at all. The first word is its letters (`text::head`), as the
+    /// tokenizer ends it, so `COPY(SELECT 1) TO …` is COPY's to read.
     fn of(&self, sql: &str) -> Option<&'static Statement> {
-        let first = crate::text::first_words(sql, 1).pop()?;
+        let first = crate::text::head(sql).to_ascii_uppercase();
         let entries = self.by_first.get(first.as_str())?;
         let words = crate::words::Words::of(sql)?;
         entries.iter().filter(|s| words.begins(s.words)).max_by_key(|s| s.words.len()).copied()
@@ -285,6 +286,8 @@ mod tests {
         let (words, ..) = entry(matched_in(&r, "-- the longer words win\nMAKE BIG THING crate", every)).context("found")?;
         assert_eq!(words, "MAKE BIG THING");
         assert!(matched_in(&r, "MAKE THINGS x", every).is_none(), "a word is whole");
+        assert_eq!(entry(matched_in(&r, "MAKE/* a */THING t", every)).context("found")?.0, "MAKE THING", "a first word ends where the tokenizer ends it");
+        assert!(matched_in(&r, "MAKER THING x", every).is_none(), "and is whole");
         // (words are tokens: a comment between them, a name where the words hold `*`, quoted or dotted)
         assert_eq!(entry(matched_in(&r, "make /* a */ big\n thing x", every)).context("found")?.0, "MAKE BIG THING");
         for sql in ["MAKE box COPY", "make s.\"Box\" copy", "MAKE lake.s.t COPY now"] {
