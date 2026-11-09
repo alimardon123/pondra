@@ -138,10 +138,12 @@ pub struct Session {
 pub struct Sessions {
     all: Mutex<HashMap<String, Session>>,
     changes: tokio::sync::watch::Sender<u64>,
+    /// Its sessions' transactions (`txn::Book`).
+    pub(crate) book: Mutex<crate::txn::Book>,
 }
 
 impl Default for Sessions {
-    fn default() -> Self { Sessions { all: Default::default(), changes: tokio::sync::watch::channel(0).0 } }
+    fn default() -> Self { Sessions { all: Default::default(), changes: tokio::sync::watch::channel(0).0, book: Default::default() } }
 }
 
 impl crate::lake_state::LakeState for Sessions {
@@ -232,12 +234,12 @@ impl Sessions {
         let kept = self.all.lock().unwrap().get(session).is_some_and(|x| {
             !(x.tables.is_empty() && x.views.is_empty() && x.routines.is_empty() && x.secrets.is_empty() && x.settings.is_empty() && x.prepared.is_empty() && x.variables.is_empty())
         });
-        kept || crate::txn::held(session) || crate::python::held(session)
+        kept || crate::txn::held(self, session) || crate::python::held(session)
     }
 
     /// End a session: its temporary tables and views are gone, and its Python (`python::ask_session`).
     pub fn end(&self, session: &str) -> bool {
-        crate::txn::end(session); // (its transaction, if open: rolled back)
+        crate::txn::end(self, session); // (its transaction, if open: rolled back)
         crate::cursors::end(session); // (its cursors go with it: `cursors.rs`)
         let python = crate::python::end_session(session); // (its Python's variables too)
         let gone = self.all.lock().unwrap().remove(session).is_some() || python;

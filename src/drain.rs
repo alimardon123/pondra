@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
 /// Drain: stop being ready, wait out the grace, then for the requests in flight (bounded). The node's state says what
-/// is in flight (`node_state::Drain`): a door asks it, never this module.
+/// is in flight (`node_state::Drain`): a door asks it, never this module. The row locks of its transactions are let go
+/// by the node after this (`Node::drain` in `node/run.rs`, which has its home lake), not here.
 pub async fn drain(node: &NodeState) {
     let d = &node.drain;
     d.begin();
@@ -43,7 +44,6 @@ pub async fn drain(node: &NodeState) {
     if left > 0 {
         eprintln!("stopping with {left} request{} still running after {:?} (PONDRA_DRAIN_SECS)", if left == 1 { "" } else { "s" }, most);
     }
-    crate::locks::release_all(); // (the transactions' row locks go to their leaders now: other waits end at once, not at the lease)
 }
 
 /// How long `close_door` waits: what is left of the drain's `PONDRA_DRAIN_SECS`, a second when no drain ran (a

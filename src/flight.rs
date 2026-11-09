@@ -494,7 +494,7 @@ async fn answer(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown
 /// (invariant 231). A statement the node stopped for memory fails its transaction, as on HTTP and Postgres.
 async fn worked<T: Send + 'static>(w: Worded, node: Arc<crate::node_state::NodeState>, at: Option<Arc<crate::temp::Sessions>>, txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>> + Send + 'static) -> Result<T, Status> {
     prune_kept(); // (every Flight call that runs work lets go of the kept answers that expired, not only a script's)
-    let session = txn.map(in_txn).transpose()?.and_then(|s| at.map(|at| crate::temp::Named { name: s, at }));
+    let session = txn.map(|id| in_txn(at.as_deref(), id)).transpose()?.and_then(|s| at.map(|at| crate::temp::Named { name: s, at }));
     let failing = session.clone();
     let f = crate::auth::carried(in_session(session, f));
     match crate::panics::work(&node, true, f).await {
@@ -676,10 +676,10 @@ fn no_sql_transaction(sql: &str) -> Result<(), Status> {
 
 /// The session of a transaction a Flight SQL call names (`transaction_id`, from BeginTransaction).
 /// One with no transaction open (ended, timed out, or never begun) is refused by name, never run
-/// outside a transaction.
-fn in_txn(id: &[u8]) -> Result<String, Status> {
+/// outside a transaction. `at` is the node's sessions, whose book holds the transactions (none: none is open).
+fn in_txn(at: Option<&crate::temp::Sessions>, id: &[u8]) -> Result<String, Status> {
     let session = crate::temp::id(&String::from_utf8_lossy(id));
-    match crate::txn::held(&session) {
+    match at.is_some_and(|at| crate::txn::held(at, &session)) {
         true => Ok(session),
         false => Err(refused("25P01", "no transaction is open under that transaction_id: it was ended, or never begun")),
     }
@@ -689,7 +689,7 @@ fn in_txn(id: &[u8]) -> Result<String, Status> {
 /// transaction's snapshot and its own writes, as a POST /sql statement sent with its session does.
 /// Without a transaction id, `f` runs as it always has.
 async fn within<T>(at: Option<Arc<crate::temp::Sessions>>, txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>>) -> Result<T, Status> {
-    in_session(txn.map(in_txn).transpose()?.and_then(|s| at.map(|at| crate::temp::Named { name: s, at })), f).await
+    in_session(txn.map(|id| in_txn(at.as_deref(), id)).transpose()?.and_then(|s| at.map(|at| crate::temp::Named { name: s, at })), f).await
 }
 
 /// `f` in a transaction's session, when there is one (`within` and `worked` both).
@@ -1008,7 +1008,7 @@ impl FlightSqlService for Sql {
             Ok(EndTransaction::Rollback) => "ROLLBACK",
             _ => return Err(refused("22023", "EndTransaction: commit or rollback")),
         };
-        let session = in_txn(&q.transaction_id)?;
+        let session = in_txn(crate::temp::sessions(&self.0.lake).as_deref(), &q.transaction_id)?;
         // (no statement text: COMMIT and ROLLBACK take none, only BEGIN's modes do)
         let (app, w) = (self.0.clone(), worded(&req));
         let home = crate::temp::sessions(&app.lake);

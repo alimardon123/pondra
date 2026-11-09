@@ -765,10 +765,11 @@ pub fn renew_places(holding: Vec<Place>) {
     }
 }
 
-/// The node is stopping (`drain.rs`): the row locks its transactions hold go to their leaders now, so the waits of other
-/// transactions end at once rather than at the lease's end (ADR-067 §4).
-pub fn release_all() {
-    crate::txn::unlock_all().into_iter().for_each(release_place);
+/// The node is stopping (`node/run.rs`: its drain, and a guest's finish): the row locks its transactions hold in its
+/// sessions (`at`) go to their leaders now, so the waits of other transactions end at once rather than at the lease's
+/// end (ADR-067 §4).
+pub fn release_all(at: &crate::temp::Sessions) {
+    crate::txn::unlock_all(at).into_iter().for_each(release_place);
 }
 
 /// A statement's row locks as one owner (ADR-067 §7). Dropped before its append is sent (the statement failed, or was

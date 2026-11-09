@@ -393,7 +393,13 @@ impl Node {
 
     /// Drains the node before its stop (`drain::drain`): it stops being ready, turns new requests away, and waits for the
     /// ones in flight.
-    pub(crate) async fn drain(&self) { crate::drain::drain(self.here()).await }
+    pub(crate) async fn drain(&self) {
+        crate::drain::drain(self.here()).await;
+        // (the transactions' row locks go to their leaders now, as the drain ends: other waits end at once, not at the lease)
+        if let Some(at) = self.held.lake.get().and_then(|l| crate::temp::sessions(l)) {
+            crate::locks::release_all(&at);
+        }
+    }
 
     /// A second signal while draining: the stop doesn't wait for the door (`Drain::hurry`).
     pub(crate) fn hurry(&self) { self.here().drain.hurry() }
@@ -441,7 +447,9 @@ impl Node {
             anyhow::Ok(())
         }
         .await;
-        crate::locks::release_all(); // (the row locks go to their leaders now, as `drain::drain` ends)
+        if let Some(at) = crate::temp::sessions(&app.lake) {
+            crate::locks::release_all(&at); // (the row locks go to their leaders now, as `drain::drain` ends)
+        }
         self.stop().await; // (on every path: an early `?` would leave the term marked, and the next open in this process waiting on it)
         drained
     }
