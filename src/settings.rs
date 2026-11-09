@@ -229,6 +229,7 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_HOT_GB", Gb, No),
     node("PONDRA_INLINE_KB", Kb, Of(inline_kb)),
     node("PONDRA_JOIN_ORDER", Int, Is("2")),
+    node("PONDRA_KAFKA_GROUP_DAYS", Days, Is("7")),
     test("PONDRA_KEEP_AT_ONCE", Int, No),
     test("PONDRA_KEEP_PARQUET", Text, No),
     node("PONDRA_KMS_COMMAND", Text, No),
