@@ -159,6 +159,7 @@ script engine
 seq engine
 serve engine
 set engine
+set_all engine
 skew engine
 spill engine
 spmd engine
