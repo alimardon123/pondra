@@ -2504,17 +2504,17 @@ pub async fn through_bucket(dir: &str, req: Request, node: &Arc<NodeState>) -> R
 /// nothing to record (`lead_only`): the lake is led for the moment, and its inbox answered.
 async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool, node: &Arc<NodeState>) -> Result<Value> {
     if let Some(r) = crate::store::reach_of(dir).filter(|r| r.read_only) {
-        return across(dir, &r, req).await; // (a lake on another server: ADR-058)
+        return across(dir, &r, req, Some(&node.claims)).await; // (a lake on another server: ADR-058)
     }
     let store = crate::store::counted(open_store(dir)?.1, &node.metrics); // (its requests the node's: `Counted`)
     loop {
-        match holder(&store).await? {
+        match holder(&store, Some(&node.claims)).await? {
             // (another `pondra sql` is recording: wait)
-            Holder::Recording(t) => wait_for(&store, &t).await,
+            Holder::Recording(t) => wait_for(&store, &t, Some(&node.claims)).await,
             Holder::Led(t) => {
                 let Some(r) = &req else {
                     // (the lake is led, so its inbox is answered: unless its leader elsewhere doesn't mark itself when rung)
-                    if crate::terms::deaf(&store, &t).await {
+                    if crate::terms::deaf(&store, &t, Some(&node.claims)).await {
                         continue;
                     }
                     return Ok(j!({"duplicate": true}));
@@ -2526,18 +2526,18 @@ async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool, 
                     Some(Err(e)) if !crate::dial::unreached(&e) => return Err(e),
                     _ => {} // this machine can't reach the leader: through the bucket
                 }
-                if let Some(v) = crate::inbox::send(&store, r, None, Some(&t)).await? {
+                if let Some(v) = crate::inbox::send(&store, r, None, Some(&t), Some(&node.claims)).await? {
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }
             Holder::Free(_) if !one_off => {
                 let Some(r) = &req else { return Ok(j!({"duplicate": true})) };
-                if let Some(v) = crate::inbox::send(&store, r, Some((dir, &node.life)), None).await? {
+                if let Some(v) = crate::inbox::send(&store, r, Some((dir, &node.life)), None, Some(&node.claims)).await? {
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }
             Holder::Free(t) => {
-                let Some(term) = claim(&store, t.map_or(1, |t| t.n + 1), "").await? else { continue };
+                let Some(term) = claim(&store, t.map_or(1, |t| t.n + 1), "", &node.claims).await? else { continue };
                 return match lead(dir, &store, term.n, &mut req, node).await {
                     // Another one-off writer took the catalog while this one was leading (both
                     // found the lake idle). Start over with the same job: whoever wins records it
@@ -2617,7 +2617,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
 /// records them with their lineage instead (the inbox, or no leader yet).
 pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
     let t = latest(&lake.store).await.ok()??;
-    if t.addr.is_empty() || !alive(&lake.store, &t).await || crate::env::is_set("PONDRA_NO_DIRECT") {
+    if t.addr.is_empty() || !alive(&lake.store, &t, Some(&lake.node.claims)).await || crate::env::is_set("PONDRA_NO_DIRECT") {
         return None;
     }
     crate::log::To::leader(lake, t.addr).reserve().await.ok()
@@ -2647,7 +2647,7 @@ pub(crate) fn read_only_refused(dir: &str) -> anyhow::Error {
 /// A lake on another server, read here with a read-only key (ADR-058): nothing here writes its
 /// bucket (no inbox, no term claimed), and only a branch's pin goes to its leader, at its
 /// ENDPOINT, with the pondra secret's token or the branch's own key.
-async fn across(dir: &str, r: &crate::store::Reach, req: Option<Request>) -> Result<Value> {
+async fn across(dir: &str, r: &crate::store::Reach, req: Option<Request>, claims: Option<&crate::node_state::Claims>) -> Result<Value> {
     let Some(req @ Request::Ddl(crate::ddl::Ddl::Pin { .. } | crate::ddl::Ddl::Unpin { .. })) = req else {
         return Err(read_only_refused(dir));
     };
@@ -2661,7 +2661,7 @@ async fn across(dir: &str, r: &crate::store::Reach, req: Option<Request>) -> Res
         None => {
             let store = open_store(dir)?.1;
             match latest(&store).await? {
-                Some(t) if !t.addr.is_empty() && alive(&store, &t).await => crate::dial::url(&t.addr),
+                Some(t) if !t.addr.is_empty() && alive(&store, &t, claims).await => crate::dial::url(&t.addr),
                 _ => bail!("nobody leads {dir}"),
             }
         }
@@ -2757,7 +2757,7 @@ async fn lead(dir: &str, store: &Store, term: u64, req: &mut Option<Request>, no
     let marks = crate::terms::mark_every(store.clone(), term);
     let out = led(dir, term, req, node).await;
     marks.abort(); // (its mark stops before the term is let go, so no mark lands after it)
-    release(store, term).await; // the next writer or node doesn't have to wait
+    release(store, term, &node.claims).await; // the next writer or node doesn't have to wait
     out
 }
 

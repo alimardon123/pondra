@@ -21,10 +21,10 @@
 //!   killed and started again takes the next term: only its own restart takes its term back.
 use crate::log::now_ms;
 use crate::members::{self, Members};
-use crate::lifecycle::{Guest, Life};
+use crate::lifecycle::Guest;
 use crate::replica::ReplicaLog;
 use crate::store::{Frame, Lake, Store};
-use crate::terms::{alive, claim, deaf, gone_here, holder, latest, listen, lock_dir, lock_path, mark_alive, open_lock, say, stepped_down, superseded, wait_for, Holder, Term, HELD, LEASE};
+use crate::terms::{alive, claim, deaf, gone_here, holder, latest, listen, lock_dir, lock_path, mark_alive, open_lock, say, stepped_down, superseded, wait_for, Holder, Term, LEASE};
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -55,8 +55,8 @@ pub struct Cluster {
     /// A guest that writes through the bucket's inbox (`inboxed`): it reads as a reader does, and its writes go to the
     /// leader through the inbox, since the leader doesn't answer from here (`write::by_inbox`).
     by_inbox: bool,
-    /// What a move to another term restarts: the node's (`lifecycle.rs`).
-    life: Life,
+    /// The node it is (`node_state.rs`): its lifecycle, and its claims' lock files (`Claims`).
+    node: Arc<crate::node_state::NodeState>,
 }
 
 impl Cluster {
@@ -64,10 +64,10 @@ impl Cluster {
     /// from our own restart: `coming_back`). `may_lead` false: our store is another node's (`pondra://`),
     /// which leads its lake; we follow it, and wait for it, and never claim a term (invariant 299). `serves_store`
     /// is the node's own `--serve-store` (`served.rs`), kept for `cut_off`.
-    pub async fn join(store: &Store, addr: &str, reader: bool, may_lead: bool, serves_store: bool, life: Life) -> Result<Arc<Cluster>> {
+    pub async fn join(store: &Store, addr: &str, reader: bool, may_lead: bool, serves_store: bool, node: Arc<crate::node_state::NodeState>) -> Result<Arc<Cluster>> {
         let (mut said, mut taken_back) = (false, false);
         let leader = loop {
-            let now = match holder(store).await {
+            let now = match holder(store, Some(&node.claims)).await {
                 Ok(h) => h,
                 // (the holder went away since it answered: look again, rather than end the node)
                 Err(_) if !may_lead => {
@@ -91,31 +91,31 @@ impl Cluster {
                 // (`alive`): a new one, below. One we're coming back to after our own restart is taken back: the exec let
                 // go of its lock)
                 Holder::Led(t) | Holder::Free(Some(t)) if t.addr == addr && !stepped_down(store, t.n).await => {
-                    if coming_back(&t) {
-                        relock(&t);
+                    if coming_back(&t, Some(&node.claims)) {
+                        relock(&t, &node);
                         taken_back = true;
                         break t;
                     }
-                    if let Some(t) = claim(store, t.n + 1, addr).await? {
+                    if let Some(t) = claim(store, t.n + 1, addr, &node.claims).await? {
                         break t; // (or someone else just did: look again)
                     }
                 }
                 // (a leader elsewhere that doesn't answer from here, and didn't mark itself when we rang, is gone: the next
                 // term, once it looks dead. Following it would wait for it instead)
                 Holder::Led(t) => {
-                    if answers(&t).await || !deaf(store, &t).await {
+                    if answers(&t).await || !deaf(store, &t, Some(&node.claims)).await {
                         break t;
                     }
                 }
-                Holder::Recording(t) => wait_for(store, &t).await, // a `pondra sql` INSERT is recording: wait
+                Holder::Recording(t) => wait_for(store, &t, Some(&node.claims)).await, // a `pondra sql` INSERT is recording: wait
                 Holder::Free(t) => {
-                    if let Some(t) = claim(store, t.map_or(1, |t| t.n + 1), addr).await? {
+                    if let Some(t) = claim(store, t.map_or(1, |t| t.n + 1), addr, &node.claims).await? {
                         break t; // (or someone else just did: look again)
                     }
                 }
             }
         };
-        Ok(made(addr, leader, reader, may_lead, serves_store, taken_back, life.clone()))
+        Ok(made(addr, leader, reader, may_lead, serves_store, taken_back, node.clone()))
     }
 
     /// A guest's cluster (`node.rs`: a program's node for its own statements, which ends after them). Not `join`:
@@ -128,39 +128,39 @@ impl Cluster {
     /// reads, and a write claims the next term with no address and leads it (invariant 17). `may_lead` false is a store
     /// another node serves (`pondra://`): it is never led, so a write whose holder doesn't answer is an error, not a wait.
     /// A lake on a read-only reach (`write::across`) is refused by `Node::start` before this runs.
-    pub async fn guest(store: &Store, guest: Guest, may_lead: bool, life: Life) -> Result<Arc<Cluster>> {
+    pub async fn guest(store: &Store, guest: Guest, may_lead: bool, node: Arc<crate::node_state::NodeState>) -> Result<Arc<Cluster>> {
         let writes = guest == Guest::Writes;
         let not_led = || anyhow::anyhow!("the node that serves this store doesn't lead it or answer from here, and a write can't go another way: start it, or read");
         loop {
-            match holder(store).await? {
+            match holder(store, Some(&node.claims)).await? {
                 Holder::Led(t) => {
-                    let follower = made("", t.clone(), false, false, false, false, life.clone());
+                    let follower = made("", t.clone(), false, false, false, false, node.clone());
                     if (!writes || !crate::env::is_set("PONDRA_NO_DIRECT")) && follower.leader_alive().await {
                         return Ok(follower);
                     }
                     return match (writes, may_lead) {
-                        (false, _) => Ok(made("", t, true, may_lead, false, false, life.clone())),
+                        (false, _) => Ok(made("", t, true, may_lead, false, false, node.clone())),
                         (true, false) => Err(not_led()),
-                        (true, true) => Ok(inboxed(t, may_lead, life.clone())),
+                        (true, true) => Ok(inboxed(t, may_lead, node.clone())),
                     };
                 }
                 // (another one-off writer is recording: a read reads beside it, a write waits for it to finish)
                 Holder::Recording(t) => {
                     if !writes {
-                        return Ok(made("", t, true, may_lead, false, false, life.clone()));
+                        return Ok(made("", t, true, may_lead, false, false, node.clone()));
                     }
-                    wait_for(store, &t).await;
+                    wait_for(store, &t, Some(&node.claims)).await;
                 }
                 // (nobody alive: a read reads what is there, and a write claims the next term and leads it)
                 Holder::Free(t) => {
                     if !writes {
-                        return Ok(made("", t.unwrap_or(Term { n: 0, addr: String::new(), lock: String::new(), bell: false }), true, may_lead, false, false, life.clone()));
+                        return Ok(made("", t.unwrap_or(Term { n: 0, addr: String::new(), lock: String::new(), bell: false }), true, may_lead, false, false, node.clone()));
                     }
                     if !may_lead {
                         return Err(not_led());
                     }
-                    if let Some(term) = claim(store, t.map_or(1, |t| t.n + 1), "").await? {
-                        return Ok(made("", term, false, true, false, false, life.clone()));
+                    if let Some(term) = claim(store, t.map_or(1, |t| t.n + 1), "", &node.claims).await? {
+                        return Ok(made("", term, false, true, false, false, node.clone()));
                     }
                     // (someone else claimed it just now: look again)
                 }
@@ -229,7 +229,7 @@ impl Cluster {
                     // (a newer term claimed meanwhile: cut off a moment ago, or paused for longer
                     // than a lease. SlateDB's fencing stops our commits; this stops our reads too.)
                     if superseded(&store, me.leader.n).await {
-                        me.life.restart("a newer term has a leader", &[]);
+                        me.node.life.restart("a newer term has a leader", &[]);
                     }
                 }
                 due = Instant::now() + Duration::from_secs(if ok { 10 } else { 0 }); // (C5: a key at most once a second, each look)
@@ -280,10 +280,10 @@ impl Cluster {
                     // seconds (claiming needs it): if the bucket was down for everyone, the leader
                     // reaches it again in those seconds, and keeps leading.
                     match latest(&store).await {
-                        Ok(Some(t)) if t.n > self.leader.n => self.life.restart(&format!("term {} has a newer leader", t.n), &[]),
+                        Ok(Some(t)) if t.n > self.leader.n => self.node.life.restart(&format!("term {} has a newer leader", t.n), &[]),
                         Ok(_) if reached.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(3) => {
-                            if claim(&store, self.leader.n + 1, &self.addr).await.is_ok() {
-                                self.life.restart("the leader can't reach the bucket: the next term was claimed", &[]);
+                            if claim(&store, self.leader.n + 1, &self.addr, &self.node.claims).await.is_ok() {
+                                self.node.life.restart("the leader can't reach the bucket: the next term was claimed", &[]);
                             }
                         }
                         Ok(_) => {}
@@ -296,12 +296,12 @@ impl Cluster {
                     Ok(r) => {
                         let (term, nodes): (u64, Vec<String>) = r.json().await.unwrap_or_default();
                         if term != self.leader.n {
-                            self.life.restart("a new leader answers at the leader's address", &[]);
+                            self.node.life.restart("a new leader answers at the leader's address", &[]);
                         }
                         // (a holder away past the lease may hold another lake now: a lake in memory started
                         // again claims the same first term, so the term alone doesn't tell them apart)
                         if !self.may_lead && !self.leader_ok() {
-                            self.life.restart("its holder answers again after the lease: it may hold another lake now (a lake in memory started again)", &[]);
+                            self.node.life.restart("its holder answers again after the lease: it may hold another lake now (a lake in memory started again)", &[]);
                         }
                         *self.view.lock().unwrap() = nodes;
                         *self.last_ok.lock().unwrap() = Instant::now();
@@ -310,19 +310,19 @@ impl Cluster {
                     // A leader that stepped down is gone for good: the next term at once.
                     Err(_) if self.may_lead && stepped_down(&store, self.leader.n).await => {
                         if !matches!(latest(&store).await, Ok(Some(t)) if t.n > self.leader.n) {
-                            claim(&store, self.leader.n + 1, &self.addr).await.ok();
+                            claim(&store, self.leader.n + 1, &self.addr, &self.node.claims).await.ok();
                         }
-                        self.life.restart("the leader stepped down", &[]);
+                        self.node.life.restart("the leader stepped down", &[]);
                     }
                     // A member that lost the leader takes over after the lease (if no peer still
                     // hears it). One that never reached it — say, outside the cluster's network —
                     // only once the leader is gone (`alive`): it never deposes a live one.
-                    Err(_) if self.may_lead && if self.heard.load(std::sync::atomic::Ordering::Relaxed) { !self.leader_ok() } else { !alive(&store, &self.leader).await || deaf(&store, &self.leader).await } => match latest(&store).await {
-                        Ok(Some(t)) if t.n > self.leader.n => self.life.restart(&format!("term {} has a newer leader", t.n), &[]), // follow it
+                    Err(_) if self.may_lead && if self.heard.load(std::sync::atomic::Ordering::Relaxed) { !self.leader_ok() } else { !alive(&store, &self.leader, Some(&self.node.claims)).await || deaf(&store, &self.leader, Some(&self.node.claims)).await } => match latest(&store).await {
+                        Ok(Some(t)) if t.n > self.leader.n => self.node.life.restart(&format!("term {} has a newer leader", t.n), &[]), // follow it
                         Ok(_) if self.peer_sees_leader().await => {}     // only our link to the leader is down
                         Ok(_) => {
-                            claim(&store, self.leader.n + 1, &self.addr).await.ok(); // we win the term, or someone else does
-                            self.life.restart("the leader stopped answering (and no peer hears it): the next term was claimed", &[]);
+                            claim(&store, self.leader.n + 1, &self.addr, &self.node.claims).await.ok(); // we win the term, or someone else does
+                            self.node.life.restart("the leader stopped answering (and no peer hears it): the next term was claimed", &[]);
                         }
                         Err(_) => {} // can't reach the bucket either: wait
                     },
@@ -344,7 +344,7 @@ impl Cluster {
                 for _ in 0..15 {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     if down.load(std::sync::atomic::Ordering::Relaxed) && matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
-                        self.life.restart("another leads", &[]);
+                        self.node.life.restart("another leads", &[]);
                     }
                 }
                 // Following a leader that has been gone for two checks: reopen reading the
@@ -352,7 +352,7 @@ impl Cluster {
                 // files our view reads) would stay invisible until a new leader appears.
                 gone = if streamed && !self.leader_alive().await { gone + 1 } else { 0 };
                 if gone >= 2 || matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
-                    self.life.restart("the leader is gone or another leads", &[]);
+                    self.node.life.restart("the leader is gone or another leads", &[]);
                 }
             }
         });
@@ -425,18 +425,18 @@ async fn answers(t: &Term) -> bool {
 }
 
 /// A cluster as a node's start decided it (`Cluster::join`, `Cluster::guest`): the term it follows or leads, and what it is.
-fn made(addr: &str, leader: Term, reader: bool, may_lead: bool, serves_store: bool, taken_back: bool, life: Life) -> Arc<Cluster> {
+fn made(addr: &str, leader: Term, reader: bool, may_lead: bool, serves_store: bool, taken_back: bool, node: Arc<crate::node_state::NodeState>) -> Arc<Cluster> {
     let view = Mutex::new(vec![]); // a follower runs no shards until the leader lists it
     // (a node that never leads gets no startup grace: a holder that changed under its name shows at
     // its first answer, not 30 s later, so the restart check in `follow` can fire)
     let last_ok = Mutex::new(if may_lead { Instant::now() + STARTUP } else { Instant::now() }); // until we first hear from the leader
     let (beats, heard) = (Default::default(), Default::default());
-    Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, cut_off: Default::default(), others: Default::default(), may_lead, serves_store, taken_back, rang: tokio::sync::watch::Sender::new(0), by_inbox: false, life })
+    Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, cut_off: Default::default(), others: Default::default(), may_lead, serves_store, taken_back, rang: tokio::sync::watch::Sender::new(0), by_inbox: false, node })
 }
 
 /// A guest that writes through the bucket's inbox (`Cluster::guest`): it reads the lake as a `Reads` guest does, and says so.
-fn inboxed(t: Term, may_lead: bool, life: Life) -> Arc<Cluster> {
-    let mut guest = made("", t, true, may_lead, false, false, life);
+fn inboxed(t: Term, may_lead: bool, node: Arc<crate::node_state::NodeState>) -> Arc<Cluster> {
+    let mut guest = made("", t, true, may_lead, false, false, node);
     Arc::get_mut(&mut guest).expect("made just now: no other handle").by_inbox = true;
     guest
 }
@@ -479,7 +479,7 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
                 tokio::time::sleep(Duration::from_millis(if since.elapsed() < Duration::from_secs(1) { 50 } else { 200 })).await;
                 continue;
             }
-            if !alive(&store, &leader).await {
+            if !alive(&store, &leader, Some(&lake.node.claims)).await {
                 break None;
             }
             let mins = since.elapsed().as_secs() / 60;
@@ -506,7 +506,7 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
             // catalog meanwhile would miss what it committed last (a lone node killed, then the shell).
             None => {
                 let gone = tokio::time::Instant::now() + Duration::from_secs(60);
-                while tokio::time::Instant::now() < gone && !alive(&store, &leader).await {
+                while tokio::time::Instant::now() < gone && !alive(&store, &leader, Some(&lake.node.claims)).await {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 eprintln!("the leader at {} is gone and nobody took over in 60 s: answering from this node's own catalog", leader.addr);
@@ -654,9 +654,9 @@ async fn send_call(url: String, c: crate::dial::Call) -> anyhow::Result<crate::d
 /// one of them took the next term, and both opened the lake as leader, the first fenced by the second
 /// (writes waited 12–15 s on simulated R2 for both). Such a node takes the next term as it starts. A
 /// term with no lock file to look at (an older release's) is taken back, as before.
-fn coming_back(t: &Term) -> bool {
+fn coming_back(t: &Term, claims: Option<&crate::node_state::Claims>) -> bool {
     match lock_path(t) {
-        Some(path) => path.exists() && !gone_here(t),
+        Some(path) => path.exists() && !gone_here(t, claims),
         None => t.lock.is_empty() || lock_dir().is_none(), // (no file named, or no folder here to look in: can't tell)
     }
 }
@@ -664,20 +664,21 @@ fn coming_back(t: &Term) -> bool {
 /// Back after a restart, as the leader of term `t`: take its lock again (the exec, or the old
 /// process's end, let go of it) and clear what it said. Windows may not have let the old process go
 /// yet: then wait for its lock in the background.
-fn relock(t: &Term) {
+fn relock(t: &Term, node: &Arc<crate::node_state::NodeState>) {
     let Some(path) = lock_path(t) else { return };
     let Ok(f) = open_lock(&path) else { return };
     let n = t.n;
     match f.try_lock() {
         Ok(()) => {
             say(&f, "");
-            HELD.lock().unwrap().insert(n, (path, f));
+            node.claims.0.lock().unwrap().insert(n, (path, f));
         }
         Err(std::fs::TryLockError::WouldBlock) => {
+            let node = node.clone();
             std::thread::spawn(move || {
                 if f.lock().is_ok() {
                     say(&f, "");
-                    HELD.lock().unwrap().insert(n, (path, f));
+                    node.claims.0.lock().unwrap().insert(n, (path, f));
                 }
             });
         }

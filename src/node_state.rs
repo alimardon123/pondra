@@ -38,6 +38,8 @@ pub struct NodeState {
     /// A short id of its own, random, made with it: what tells its files in its process's space from another node's
     /// here, which would name them alike (a shuffle's folders: `spill::dir`).
     pub id: String,
+    /// Its claims' lock files (`Claims`), which its lifecycle may hold too (a restart says in them that it is coming back).
+    pub claims: Arc<Claims>,
     /// When its start began: what `PONDRA_TRACE_START`'s times count from (`trace`).
     began: datafusion::common::instant::Instant,
 }
@@ -53,8 +55,13 @@ impl NodeState {
     /// A node's state on a machine of its own (the sim's member: one with little memory, say).
     pub fn on(life: Life, machine: crate::machine::Mach) -> Arc<NodeState> { NodeState::make(life, machine, crate::settings::Values::now()) }
 
-    fn make(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values) -> Arc<NodeState> {
-        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), began: datafusion::common::instant::Instant::now() })
+    /// A node's state whose claims its lifecycle holds too (`node::Native`: a restart says in them that it is coming back).
+    pub fn claiming(life: Life, settings: crate::settings::Values, claims: Arc<Claims>) -> Arc<NodeState> { NodeState::made(life, crate::machine::installed(), settings, claims) }
+
+    fn make(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values) -> Arc<NodeState> { NodeState::made(life, machine, settings, Default::default()) }
+
+    fn made(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values, claims: Arc<Claims>) -> Arc<NodeState> {
+        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).
@@ -238,6 +245,17 @@ impl Idle {
     /// When the last use began or ended ([`Idle::now`]'s count); 0 until the first.
     #[cfg_attr(not(feature = "doors"), allow(dead_code))]
     pub(crate) fn last(&self) -> u64 { self.uses.last.load(SeqCst) }
+}
+
+/// The lock files of the terms a node claimed (`terms::claim`), or took back after a restart (`cluster::relock`): each locked
+/// until the term is let go (`terms::release`), the node stops (`clear`), or the process ends, however it ends: the OS lets
+/// go at whichever comes first. Keyed by term number. (A node holds one claim per term number: one lake at a time.)
+#[derive(Default)]
+pub struct Claims(pub(crate) Mutex<std::collections::BTreeMap<u64, (std::path::PathBuf, std::fs::File)>>);
+
+impl Claims {
+    /// Let go of every claim's lock (the node stops). The files stay, for the next claimer to see it ended.
+    pub fn clear(&self) { self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear() }
 }
 
 /// Held while a use lasts (`Idle::begin`).

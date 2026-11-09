@@ -761,7 +761,7 @@ pub fn full(dir: &str) -> Result<String> {
 pub async fn delete_lake(dir: &str) -> Result<()> {
     let store = crate::store::open_store(dir)?.1;
     if let Some(t) = crate::terms::latest(&store).await? {
-        ensure!(!crate::terms::alive(&store, &t).await, "another process leads the lake at {dir} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
+        ensure!(!crate::terms::alive(&store, &t, None).await, "another process leads the lake at {dir} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
     }
     match dir.contains("://") {
         false => std::fs::remove_dir_all(dir).with_context(|| format!("deleting {dir}"))?,

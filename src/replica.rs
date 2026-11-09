@@ -160,8 +160,8 @@ pub async fn recover(lake: &Lake, me: &str, term: u64, own: Option<&ReplicaLog>)
                 Ok(r) => break merge(&r.bytes().await?).context("replica from a peer")?,
                 Err(_) if Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(250)).await,
                 Err(e) if fresh => {
-                    crate::terms::step_down(&lake.store, term).await; // (not alive, whatever a mark in flight says)
-                    crate::terms::release(&lake.store, term).await;
+                    crate::terms::step_down(&lake.store, term, &lake.node.claims).await; // (not alive, whatever a mark in flight says)
+                    crate::terms::release(&lake.store, term, &lake.node.claims).await;
                     return Err(Unreached(format!("{peer} holds this lake's acknowledged changes and can't be reached from here ({e}); its members lead it")).into());
                 }
                 Err(e) => break eprintln!("recovering without {peer}: {e}"), // (then only it held what it held)
