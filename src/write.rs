@@ -2821,7 +2821,7 @@ pub(crate) fn start_over(why: &str, job: &str, life: &dyn Lifecycle) -> ! {
 /// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go, however it ends.
 /// `req` None records nothing (`lead_only`); it is taken once the lake is ours (left for another leader if it isn't).
 async fn lead(dir: &str, store: &Store, term: u64, req: &mut Option<Request>, node: &Arc<NodeState>) -> Result<Value> {
-    let marks = crate::terms::mark_every(store.clone(), term);
+    let marks = crate::terms::mark_every(&node.tasks, store.clone(), term);
     let out = led(dir, term, req, node).await;
     marks.abort(); // (its mark stops before the term is let go, so no mark lands after it)
     release(store, term, &node.claims).await; // the next writer or node doesn't have to wait

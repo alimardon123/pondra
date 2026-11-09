@@ -101,7 +101,7 @@ struct Broker {
 
 /// Answer Kafka clients on `addr`; tell them to come back to `advertise` (host:port).
 pub async fn serve(app: App, addr: String, advertise: String) -> Result<()> {
-    let mut doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Kafka).await?; // (TLS too: `tls.rs`)
+    let mut doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Kafka, &app.lake.node.tasks, crate::auth::Door).await?; // (TLS too: `tls.rs`)
     let (host, port) = advertise.rsplit_once(':').ok_or_else(|| anyhow!("--kafka-advertise is host:port"))?;
     let id = (advertise.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) & 0x7fff_ffff) as i32; // stable per address
     let me = Arc::new(Broker { id, host: host.into(), port: port.parse()? });
@@ -1282,15 +1282,16 @@ struct Joined {
 }
 
 impl Group {
-    /// Start a rebalance: everyone must join again (they learn it from their heartbeats).
-    fn rebalance(&mut self, kept: &Arc<Brokers>, group: &str, timeout: Duration) {
+    /// Start a rebalance: everyone must join again (they learn it from their heartbeats). Its watch, until every member
+    /// has joined or `timeout` passes, is the node's own (`tasks`): it reads no table.
+    fn rebalance(&mut self, kept: &Arc<Brokers>, group: &str, timeout: Duration, tasks: &crate::spawns::Tasks) {
         if self.joining {
             return;
         }
         (self.joining, self.synced, self.round) = (true, false, self.round + 1);
         self.members.values_mut().for_each(|m| m.joined = false);
         let (kept, group, round, start) = (kept.clone(), group.to_string(), self.round, std::time::Instant::now());
-        crate::spawns::task(async move {
+        tasks.spawn_node(crate::spawns::Vital::Own, async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 let mut groups = kept.groups.lock().unwrap();
@@ -1323,11 +1324,11 @@ impl Group {
     }
 
     /// Drop members silent past their session timeout; someone leaving means a new generation.
-    fn expire(&mut self, kept: &Arc<Brokers>, group: &str) {
+    fn expire(&mut self, kept: &Arc<Brokers>, group: &str, tasks: &crate::spawns::Tasks) {
         let before = self.members.len();
         self.members.retain(|_, m| m.seen.elapsed() < m.session);
         if self.members.len() < before && !self.members.is_empty() {
-            self.rebalance(kept, group, Duration::from_secs(30));
+            self.rebalance(kept, group, Duration::from_secs(30), tasks);
         }
     }
 
@@ -1452,14 +1453,14 @@ async fn join_group(app: &App, ver: i16, r: &mut Rd) -> Result<BoxFuture<'static
     let rx = {
         let mut groups = kept.groups.lock().unwrap();
         let g = groups.entry(group.clone()).or_default();
-        g.expire(&kept, &group);
+        g.expire(&kept, &group, &app.lake.node.tasks);
         if !member.is_empty() && !g.members.contains_key(&member) {
             return Ok(async move { answer(Joined { error: UNKNOWN_MEMBER_ID, member, ..Default::default() }) }.boxed());
         }
         let id = if member.is_empty() { format!("pondra-{}", uuid::Uuid::new_v4()) } else { member };
         let m = g.members.entry(id.clone()).or_insert(Member { protocols: vec![], session, seen: std::time::Instant::now(), joined: false, assignment: Bytes::new() });
         (m.protocols, m.session, m.seen) = (protocols, session, std::time::Instant::now());
-        g.rebalance(&kept, &group, rebalance);
+        g.rebalance(&kept, &group, rebalance, &app.lake.node.tasks);
         g.members.get_mut(&id).expect("just added").joined = true;
         let (tx, rx) = tokio::sync::oneshot::channel();
         g.joins.push((id, tx));
@@ -1530,7 +1531,7 @@ fn heartbeat(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
             let kept = app.lake.state::<Brokers>()?;
             let mut groups = kept.groups.lock().unwrap();
             let g = groups.entry(group.clone()).or_default();
-            g.expire(&kept, &group);
+            g.expire(&kept, &group, &app.lake.node.tasks);
             if let Some(m) = g.members.get_mut(&member) {
                 m.seen = std::time::Instant::now();
             }
@@ -1562,7 +1563,7 @@ fn leave_group(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
         let before = g.members.len();
         g.members.retain(|id, _| !leaving.contains(id));
         if g.members.len() < before && !g.members.is_empty() {
-            g.rebalance(&kept, &group, Duration::from_secs(30));
+            g.rebalance(&kept, &group, Duration::from_secs(30), &app.lake.node.tasks);
         }
     }
     let mut w = vec![];

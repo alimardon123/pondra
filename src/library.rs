@@ -5,7 +5,7 @@
 //! failure stops it and says why to every request after, until it is opened again.
 //!
 //! The places that exec, abort or exit ask the node's [`Lifecycle`](crate::lifecycle::Lifecycle) instead, which the
-//! host implements (`node::Native`: here a restart unwinds and a stop fails the node, `spawns::spawn`, `format::watch`,
+//! host implements (`node::Native`: here a restart unwinds and a stop fails the node, `Tasks::spawn_node`, `format::watch`,
 //! the catalog's compactor). The node's host state is kept in `node.rs`, beside the rest of the node.
 //! Helpers the node starts (`pondra lead`, Python looked for beside it) are the program the packages give
 //! ([`exe`](crate::node::exe)), never the host's own executable.

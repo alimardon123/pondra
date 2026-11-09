@@ -85,6 +85,10 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     for r in rules.iter_mut().filter(|r| r.name() == "eliminate_outer_join") {
         *r = Arc::new(crate::asof::KeepOuter(r.clone()));
     }
+    // (the rules that answer a part with no scan: never one that reads a table its reader reads in part, `KeepGuarded`)
+    for r in rules.iter_mut().filter(|r| matches!(r.name(), "eliminate_filter" | "eliminate_limit" | "propagate_empty_relation" | "eliminate_join")) {
+        *r = Arc::new(crate::query::KeepGuarded(r.clone()));
+    }
     let at = rules.iter().position(|r| r.name() == "push_down_filter").map_or(rules.len(), |i| i + 1);
     let ordered = crate::env::get("PONDRA_JOIN_ORDER").as_deref() != Some("0");
     rules.insert(at, Arc::new(GroupOnlyJoined));

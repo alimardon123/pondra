@@ -238,7 +238,7 @@ async fn take_here(to: &str, t: Take, node: &std::sync::Arc<crate::node_state::N
         Ok(())
     }, &node.claims)
     .await?;
-    let marks = Marks(crate::terms::mark_every(store.clone(), term.n)); // (it answers the bell, as its term says: `terms::deaf`)
+    let marks = Marks(crate::terms::mark_every(&node.tasks, store.clone(), term.n)); // (it answers the bell, as its term says: `terms::deaf`)
     let out = match Lake::open(to, true, false, node.clone()).await {
         Ok(lake) => {
             let run = AssertUnwindSafe(take_led(&lake, t, term.n)).catch_unwind().await;

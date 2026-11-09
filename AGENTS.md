@@ -1331,9 +1331,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    key wraps** (`users.rs`, `ext.rs`): the catalog gives none of them away, and nothing is written in
    the clear. `harness.py users`, `harness.py secrets`.
 178. **A request can't stop a node; the node's own work still can** (`panics.rs`, `spawns.rs`): panics unwind.
-   Start every loop the node can't do without with `spawns::spawn` (a panic in it stops the
-   node, as before), on whichever floor it is: the spawns are the base's, and the crate's root joins a vital panic to
-   the host's stop (`stop_node`); a request's work runs in `panics::door` (HTTP's guard, each Postgres
+   Start every loop the node can't do without on its list, `node.tasks.spawn_node(Vital::Stop, …)` (a panic in it
+   stops the node through its lifecycle), on whichever floor it is: the spawns are the base's; a request's work runs in `panics::door` (HTTP's guard, each Postgres
    statement) or in its connection's own task (Kafka, Flight). Never `panic = "abort"` again; never
    a plain `tokio::spawn` for a loop that commits, tiers or follows. `harness.py safety`,
    `tools/fuzz_doors.py`.
@@ -2322,8 +2321,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 
 301. **A node stopped in a process leaves nothing of itself in it** (`reset.rs`, ADR-061 §3): every
    static that holds a node's or a lake's state is `per_node!`, set back by `reset()` when
-   `Node::stop` ends; its writers end first, its Python workers stop, and what `spawns::spawn`
-   started is aborted. A gauge whose guards count themselves down (`metrics::RUNNING`, `WAITING`)
+   `Node::stop` ends; its writers end first, its Python workers stop, and what its list
+   (`NodeState::tasks`) started is aborted, and the loops of its statics as they are set back (`spawns::for_statics`). A gauge whose guards count themselves down (`metrics::RUNNING`, `WAITING`)
    stays the process's, and the drain counts each node's requests on a counter of that node's own
    (`node_state::Drain`, which every lake is handed: `Lake.node`), as failed sign-ins are counted
    per node (`auth::Guesses`). SlateDB's tasks outlive its handles, so a catalog let go closes what
@@ -2367,7 +2366,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 303. **A node in a library never takes its host's process down** (`library.rs`, ADR-061 §5): what the
    program does by exec, abort or exit, a library does to the node alone. Its `Lifecycle::restart`
    (`node::Native`) halts the node and starts it again in place (its lock file says
-   `restarting`, then a `Restarting` unwind that `spawns::spawn` lets go and a door answers as 57P03);
+   `restarting`, then a `Restarting` unwind that `Tasks::spawn_node` lets go and a door answers as 57P03);
    a vital loop's panic, the catalog's compactor failing and a lake newer than the build stop the
    node with the reason (`node::failed`), and every request is then 57P03 with it until it is
    opened again. A supervisor thread restarts it after 0.5, 1, 2, 4 and 8 s, and gives up after five
