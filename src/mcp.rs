@@ -290,7 +290,7 @@ async fn query(app: &App, who: &crate::auth::Principal, sql: &str) -> Result<Str
     let req = crate::routines::Request { sql: sql.to_string(), ..Default::default() };
     let how = crate::statement::How { job: None, spread: None, after: None, stale: None };
     let who = crate::routines::Who::signed(who.clone(), who.role, false);
-    match crate::statement::run(app, req, how, who, &McpWire).await? {
+    match crate::auth::reading(crate::statement::run(app, req, how, who, &McpWire)).await? { // (nothing it runs moves a sequence: a view's nextval neither)
         crate::statement::Answer::Own(text) => Ok(text),
         crate::statement::Answer::Done(v) => Ok(v.to_string()),
         crate::statement::Answer::Rows(batches) => rows_json(&batches),

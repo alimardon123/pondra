@@ -22387,8 +22387,9 @@ def rejects():
     """Rows dropped are kept for review (`pondra.rejects`, G2): each row a materialized view's expectation leaves out (ON
     VIOLATION DROP ROW) is kept, in the commit that writes the view's other rows, with its object, the rule it broke (the
     first, of two), why, the row as JSON, the run that brought it (a statement's job, an /append's producer, a bulk INSERT's
-    job, the view's filling) and when, while the view still leaves it out. A view's rejects are shown for its retention. A
-    user with grants sees the rejects of the views it may read in whole; a superuser all of them."""
+    job, the view's filling) and when, while the view still leaves it out. A view's rejects are shown for its retention, and
+    are its own: a view made again under its name has none of the earlier one's. A user with grants sees the rejects of the
+    views it may read in whole; a superuser all of them."""
     import base64
     lake = new_lake()
     node = Node(lake, A.port, tier_secs=0.5).start()
@@ -22454,6 +22455,27 @@ def rejects():
     info["retain7"] = ask(boss, "ALTER TABLE silver SET (retention = '7 days')")
     back = rows(boss, "WHERE object = 'silver'")
     checks["a view's rejects are held for its retention"] = gone == [] and isinstance(back, list) and len(back) == len(of("silver"))
+    # (a view's rejects are its own, not its name's: one made again under the name starts with none of the earlier one's, and
+    # an UNDROP, which makes the view again from its query, keeps its filling's once; 11-09 audit M3)
+    for q in ["DROP MATERIALIZED VIEW bronze",
+              "CREATE MATERIALIZED VIEW bronze (CONSTRAINT huge CHECK (amount < 10000) ON VIOLATION DROP ROW) AS SELECT id, amount FROM orders",
+              "GRANT SELECT ON bronze TO bob", "DROP MATERIALIZED VIEW silver", "UNDROP MATERIALIZED VIEW silver"]:
+        info.setdefault("again", []).append(ask(boss, q))
+    again, till = [], time.time() + 20
+    while time.time() < till:  # (silver filled again from the rows there)
+        again = rows(boss)
+        if isinstance(again, list) and len([r for r in again if r["object"] == "silver" and str(r["run"]).startswith("fill:")]) >= len(of("silver")):
+            break
+        time.sleep(0.5)
+    time.sleep(1)
+    again = rows(boss)
+    of_again = lambda o: [r for r in again if r["object"] == o] if isinstance(again, list) else []
+    bob_again = rows(bob)
+    info["again_rows"], info["bob_again"] = len(again) if isinstance(again, list) else again, (bob_again[:3] if isinstance(bob_again, list) else bob_again)
+    checks["a view made again under its name has none of the earlier one's rejects, for a reader granted it nor a superuser (11-09 audit M3)"] = \
+        isinstance(again, list) and of_again("bronze") == [] and bob_again == []
+    checks["an UNDROP makes the view again from its query: its rejects are its filling's, each once (11-09 audit M3)"] = \
+        len(of("silver")) > 0 and ids(of_again("silver")) == ids(of("silver")) and all(str(r["run"]).startswith("fill:") for r in of_again("silver"))
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"rejects": checks, "ok": ok, **({} if ok else {"info": info})}, indent=1, default=str))
@@ -22817,6 +22839,15 @@ def listings():
         all("permission denied" in a and not a.startswith("columns") for a in probed.values())
     checks["the probe of v, which ann may read, answers no rows at every door, and Postgres's Describe names v only (11-09 audit M1)"] = \
         all("permission denied" not in a and not a.startswith(("4", "5")) and '"isError":true' not in a.replace(" ", "") for a in own.values()) and own["Postgres Describe"] == "columns v"
+    # (and a door that reads only, MCP's query tool or a Flight ticket, moves none for anyone, wherever the call is: a view's
+    # query holds a nextval the statement's text doesn't. HTTP, which writes, still numbers through the view for ann)
+    for q in ["CREATE VIEW next_ticket AS SELECT nextval('tickets_id_seq') AS n", "GRANT SELECT ON next_ticket TO ann"]:
+        ask(boss, q)
+    through = {door: doors[door]("SELECT n FROM next_ticket", False) for door in ("Flight SQL", "MCP", "HTTP")}
+    unseen["H1, read doors"] = through
+    reads_only = lambda v: "read-only transaction" in v and "nextval" in v
+    checks["a door that reads only, MCP's query tool and a Flight ticket, moves no sequence through a view's query either; HTTP still does for ann, a writer of tickets (11-09 audit H1)"] = \
+        reads_only(through["Flight SQL"]) and reads_only(through["MCP"]) and went(through["HTTP"])
     info["unseen"] = unseen
     node.kill()
     ok = all(checks.values())

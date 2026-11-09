@@ -26,6 +26,9 @@ pub struct Principal {
     pub epoch: u64,
     /// When its credential ends (ms since the epoch): a user's token's expiry, a session's, an identity provider's token's.
     pub until: Option<u64>,
+    /// Asked at a door that reads only (MCP's query tool, a Flight ticket: `reading`), so nothing it runs moves a
+    /// sequence, wherever the call is: in its text, a view's query or a macro's (`seq::may_move`).
+    pub reads: bool,
 }
 
 impl Principal {
@@ -42,7 +45,7 @@ impl Principal {
             Role::None => crate::rights::Scope::nothing(),
             _ => crate::rights::Scope::everything(),
         };
-        Principal { name: name.into(), role, scope, door: "node", from: None, operator: false, epoch: 0, until: None }
+        Principal { name: name.into(), role, scope, door: "node", from: None, operator: false, epoch: 0, until: None, reads: false }
     }
 
     /// The node's own work's (`as_node`: what no request asked for, a task's tick, a view's refresh, the history's
@@ -172,6 +175,16 @@ impl crate::spawns::Carry for Door {
         F::Output: Send,
     {
         f
+    }
+}
+
+/// `f` as asked at a door that reads only (MCP's query tool, a Flight ticket): its caller marked `reads`, so nothing it
+/// runs moves a sequence, wherever the call is (11-09 audit H1: the door's own look at the text finds no `nextval` a
+/// view's query or a macro holds). Work it hands on keeps the mark, as it keeps its caller (`carried`).
+pub async fn reading<F: std::future::Future>(f: F) -> F::Output {
+    match current() {
+        Some(p) => WHO.scope(Principal { reads: true, ..p }, f).await,
+        None => f.await, // (no caller: nothing moves a sequence anyway, `seq::may_move`, but the node's own work, which no door asks)
     }
 }
 
@@ -792,7 +805,7 @@ mod tests {
     /// other key, a token's and a caller with no name are all refused.
     #[test]
     fn a_page_stages_only_its_own_files() {
-        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, scope: crate::rights::Scope::everything(), door: "http", from: None, operator: false, epoch: 0, until: None };
+        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, scope: crate::rights::Scope::everything(), door: "http", from: None, operator: false, epoch: 0, until: None, reads: false };
         assert_eq!(slug(&user("ali")).as_deref(), Some("616c69"), "a user's slug is its name in hex");
         assert!(slug(&Principal::token(Role::Admin)).is_none(), "a token has no slug");
         let long = format!("stage/616c69/{}/0.parquet", "j".repeat(65));
