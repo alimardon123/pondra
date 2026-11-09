@@ -32,12 +32,8 @@ reads branch.rs 7
 reads change.rs 1
 reads ext.rs 5
 reads extension.rs 1
-reads files.rs 2
-reads flight.rs 4
+reads files.rs 1
 reads history.rs 2
-reads iceberg_rest.rs 3
-reads live.rs 1
-reads mcp.rs 5
 reads path.rs 1
 reads protect.rs 1
 reads python.rs 1
@@ -45,7 +41,6 @@ reads routines.rs 1
 reads rules/rows.rs 1
 reads seq.rs 1
 reads serve.rs 1
-reads server.rs 9
 reads temp.rs 2
 reads users.rs 3
 reads views.rs 1

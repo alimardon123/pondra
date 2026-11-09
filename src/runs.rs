@@ -156,7 +156,7 @@ fn log(app: &App, line: Line, done: Option<tokio::sync::oneshot::Sender<()>>) {
     }
     let tx = crate::reset::Once::get_or(&*WRITER, || {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        crate::history::keep(write(app.clone(), rx));
+        crate::history::keep(&app.lake, write(app.clone(), rx));
         tx
     });
     let _ = tx.send((line, done));
@@ -201,8 +201,8 @@ pub async fn wait(app: &App, id: &str, scope: &crate::rights::Scope) -> Result<(
 async fn write(app: App, mut rx: tokio::sync::mpsc::UnboundedReceiver<Sent>) {
     let producer = format!("runs-{}", new_id());
     let (mut seq, mut made) = (0, false);
-    while let Some((first, done)) = crate::history::next(&mut rx).await {
-        if !crate::history::ending() {
+    while let Some((first, done)) = crate::history::next(&app.lake, &mut rx).await {
+        if !crate::history::ending(&app.lake) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let (mut lines, mut dones) = (vec![first], vec![done]);

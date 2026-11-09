@@ -57,7 +57,7 @@ pub async fn handle(State(app): State<App>, Extension(who): Extension<crate::aut
         }
         "ping" => json!({}),
         "tools/list" => {
-            let all = [tools().as_array().cloned().unwrap_or_default(), crate::find::mcp_tools(), procedures(&app).await].concat();
+            let all = [tools().as_array().cloned().unwrap_or_default(), crate::find::mcp_tools(), procedures(&app, &who.scope).await].concat();
             json!({"tools": all})
         }
         "tools/call" => match crate::temp::SESSION.scope(session, call(&app, &who, params)).await {
@@ -150,10 +150,10 @@ fn tools() -> Value {
 async fn call(app: &App, who: &crate::auth::Principal, params: &Value) -> Result<Value, Value> {
     let arg = |k: &str| params["arguments"][k].as_str().unwrap_or_default();
     let out = match params["name"].as_str().unwrap_or_default() {
-        "list_tables" => list(app).await.map(|v| v.to_string()),
+        "list_tables" => list(app, &who.scope).await.map(|v| v.to_string()),
         "query" => query(app, who, arg("sql")).await,
         "write" => write(app, who, arg("sql"), params["arguments"]["job"].as_str()).await,
-        "changes" => changes(app, arg("table"), params["arguments"]["after"].as_u64()).await,
+        "changes" => changes(app, who, arg("table"), params["arguments"]["after"].as_u64()).await,
         name if crate::find::is_tool(name) => match crate::find::mcp_sql(name, &params["arguments"]) {
             Ok(sql) => query(app, who, &sql).await,
             Err(e) => Err(e),
@@ -173,8 +173,8 @@ async fn call(app: &App, who: &crate::auth::Principal, params: &Value) -> Result
         Ok(text) => (text, false),
         Err(e) => {
             // (a tool error, which the agent sees and can act on: Postgres's code and the words every door gives, a
-            // routine's code cut for a user who may not see it)
-            let (_, code, words) = crate::codes::answer(&e, crate::rights::scope().shows_code());
+            // routine's code cut for a caller who may not see it)
+            let (_, code, words) = crate::codes::answer(&e, who.scope.shows_code());
             (format!("SQLSTATE {code}: {words}"), true)
         }
     };
@@ -182,14 +182,14 @@ async fn call(app: &App, who: &crate::auth::Principal, params: &Value) -> Result
 }
 
 /// Each stored procedure is a tool too, its parameters the tool's (ADR-023): what a lake's owner
-/// wrote for a job becomes something an agent can do, with the agent's token's rights.
-async fn procedures(app: &App) -> Vec<Value> {
+/// wrote for a job becomes something an agent can do, with the agent's token's rights. Described as `scope` is shown them.
+async fn procedures(app: &App, scope: &crate::rights::Scope) -> Vec<Value> {
     let Ok(all) = crate::routines::listed(&app.lake).await else { return vec![] };
     // (what COMMENT ON PROCEDURE says of it; else its body's first line, if a comment, to a caller who may see its code:
     // a user with grants isn't shown a routine's body, so not its first line either)
     let notes: std::collections::HashMap<String, String> =
         app.lake.cat.scan::<String>("cm/routine/", "cm/routine0").await.unwrap_or_default().into_iter().map(|(k, v)| (k["cm/routine/".len()..].to_string(), v)).collect();
-    let code = crate::rights::scope().shows_code();
+    let code = scope.shows_code();
     let kind = |t: Option<&str>| match t.unwrap_or_default().split('(').next().unwrap_or_default().to_uppercase().as_str() {
         "BIGINT" | "INT" | "INTEGER" | "SMALLINT" | "TINYINT" => "integer",
         "DOUBLE" | "REAL" | "FLOAT" | "DECIMAL" | "NUMERIC" => "number",
@@ -226,12 +226,12 @@ fn lakes(app: &App) -> Vec<(String, Arc<Lake>)> {
     [(String::new(), app.lake.clone())].into_iter().chain(attached).collect()
 }
 
-/// May the request being served read `name`, a table or view of the lake `prefix` names? A user
-/// with grants sees only what it may SELECT, as `pondra.tables` lists it.
-fn may_see(prefix: &str, name: &str) -> bool {
+/// May `scope` read `name`, a table or view of the lake `prefix` names? A user with grants sees only what it may
+/// SELECT, as `pondra.tables` lists it.
+fn may_see(scope: &crate::rights::Scope, prefix: &str, name: &str) -> bool {
     match prefix.is_empty() {
-        true => crate::rights::scope().sees(crate::rights::Object::Table(name)),
-        false => crate::rights::scope().sees_named(&format!("{prefix}{name}")), // (another lake's: the grants naming it)
+        true => scope.sees(crate::rights::Object::Table(name)),
+        false => scope.sees_named(&format!("{prefix}{name}")), // (another lake's: the grants naming it)
     }
 }
 
@@ -239,8 +239,9 @@ fn may_see(prefix: &str, name: &str) -> bool {
 /// reads back in a `CREATE TABLE` or a `CAST`: `BIGINT`, `VARCHAR(3)`, `DECIMAL(10, 2)`, `UUID`, an enum's type.
 fn sql_type(m: &TableMeta, column: &str, t: &str) -> String { m.col(column).map_or_else(|| crate::objects::sql_type(t), crate::types::shown) }
 
-async fn list(app: &App) -> Result<Value> {
-    let (mut tables, scope) = (vec![], crate::rights::scope());
+/// The tables and views `scope` may read, here and in the attached lakes (`list_tables`).
+async fn list(app: &App, scope: &crate::rights::Scope) -> Result<Value> {
+    let mut tables = vec![];
     for (prefix, lake) in lakes(app) {
         if !prefix.is_empty() && crate::users::across(&lake, prefix.trim_end_matches('.')).await.is_err() {
             continue; // (another database that signs in on its own: not even its names, as `pondra.tables`)
@@ -248,7 +249,7 @@ async fn list(app: &App) -> Result<Value> {
         let views = lake.cat.scan::<View>("v/", "v0").await?;
         for (key, m) in lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
             let name = &key[2..];
-            if !may_see(&prefix, name) {
+            if !may_see(scope, &prefix, name) {
                 continue;
             }
             let kind = if !m.merge.is_empty() { "merge" } else if !m.key.is_empty() { "upsert" } else { "append" };
@@ -266,14 +267,14 @@ async fn list(app: &App) -> Result<Value> {
             let kind = keyed.then_some(kind);
             let key: Vec<&String> = m.key.iter().filter(|_| keyed).collect();
             let merge: std::collections::BTreeMap<&String, &String> = m.merge.iter().filter(|(c, _)| keyed && reads(c)).collect();
-            let view = crate::views::code_for_caller(|| views.iter().find(|(k, _)| &k[2..] == name).map(|(_, v)| v.sql.clone())).flatten();
+            let view = scope.shows_code().then(|| views.iter().find(|(k, _)| &k[2..] == name).map(|(_, v)| v.sql.clone())).flatten(); // (a view's code: `views::code_for_caller`)
             tables.push(json!({"table": format!("{prefix}{name}"), "kind": kind, "key": key, "merge": merge, "columns": columns, "view": view}));
         }
         for (key, v) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await? {
-            if !may_see(&prefix, &key[2..]) {
+            if !may_see(scope, &prefix, &key[2..]) {
                 continue;
             }
-            tables.push(json!({"table": format!("{prefix}{}", &key[2..]), "kind": "view", "view": crate::views::code_for_caller(|| crate::views::shown(&v.sql))})); // (CREATE VIEW: run when read)
+            tables.push(json!({"table": format!("{prefix}{}", &key[2..]), "kind": "view", "view": scope.shows_code().then(|| crate::views::shown(&v.sql))})); // (CREATE VIEW: run when read)
         }
     }
     Ok(json!({"tables": tables}))
@@ -386,10 +387,10 @@ fn answer(out: Result<crate::routines::Outcome>, heard: Vec<String>) -> Result<S
 fn total(batches: &[RecordBatch]) -> usize { batches.iter().map(RecordBatch::num_rows).sum() }
 
 /// Rows committed after `after`, in steps of doubling size until about `ROWS` are in hand.
-async fn changes(app: &App, table: &str, after: Option<u64>) -> Result<String> {
+async fn changes(app: &App, who: &crate::auth::Principal, table: &str, after: Option<u64>) -> Result<String> {
     let found = lakes(app).into_iter().rev().find_map(|(p, l)| Some((table.strip_prefix(p.as_str())?.to_string(), p, l)));
     let (name, prefix, lake) = found.ok_or_else(|| crate::codes::coded("42P01", format!("no table {table}")))?;
-    crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(table))?; // (a user's: every column of the rows, as `/watch` and Kafka need, before anything is read)
+    crate::rights::may(who, crate::rights::Action::SelectAll, crate::rights::Object::Table(table))?; // (a user's: every column of the rows, as `/watch` and Kafka need, before anything is read)
     if !prefix.is_empty() {
         crate::users::across(&lake, prefix.trim_end_matches('.')).await?; // (an attached lake that signs in on its own: its own sign-in, as queries use)
     }

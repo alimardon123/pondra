@@ -27,6 +27,7 @@ pub static DELTA: crate::registry::BuiltIn = crate::registry::BuiltIn {
     register: |r| {
         r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES);
         r.section_mut::<crate::records::Prefixes>().add(crate::delta::PREFIXES);
+        r.section_mut::<crate::lake_state::Registered>().add::<Logs>();
     },
 };
 
@@ -85,20 +86,41 @@ fn logical(a: &Value) -> String {
     format!("{}|{}{}@{}", a["path"].as_str().unwrap_or_default(), dv["storageType"].as_str().unwrap_or_default(), dv["pathOrInlineDv"].as_str().unwrap_or_default(), dv["offset"])
 }
 
-crate::per_node!(
-    /// Logs already replayed, by table and version: a commit, once written, never changes, so the
-    /// next statement reads only the commits after the newest it knows. The newest 16 tables', each charged its parsed
-    /// actions (`Log::bytes`) to the node's line, which takes them back when it needs the memory (`logs`).
-    static SEEN: Arc<Mutex<ByteLru<String, Arc<Log>>>> = Arc::new(Mutex::new(ByteLru::new(usize::MAX).with_count(16))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+/// The Delta logs a lake replayed, by table (its state, `lake_state.rs`): a commit, once written, never changes, so the
+/// next statement reads only the commits after the newest it knows. The newest 16 tables', each charged its parsed
+/// actions (`Log::bytes`) to the lake's line (`cache_bytes{cache="delta_logs"}`), which takes them back when it needs
+/// the memory.
+pub struct Logs(Mutex<ByteLru<String, Arc<Log>>>);
 
-/// The replayed Delta logs, as the node's line counts them (`cache_bytes{cache="delta_logs"}`).
-pub fn logs() -> Arc<dyn crate::ledger::Charged> { SEEN.clone() }
+impl crate::lake_state::LakeState for Logs {
+    const NAME: &'static str = "delta_logs";
+    const ABOUT: &'static str = "the logs of the Delta tables it read, replayed to their newest version, by table";
 
-/// Keeps a replayed log as the newest `root` knows, charged what it holds; what leaves goes after the lock.
-fn seen(root: &str, log: &Arc<Log>) {
-    let bytes = log.bytes();
-    let left = SEEN.lock().unwrap().put(root.to_string(), log.clone(), bytes);
-    drop(left);
+    fn make() -> Self { Logs(Mutex::new(ByteLru::new(usize::MAX).with_count(16))) }
+
+    fn cache(self: Arc<Self>) -> Option<Arc<dyn crate::ledger::Charged>> { Some(self) }
+}
+
+impl crate::ledger::Charged for Logs {
+    fn held(&self) -> usize { crate::ledger::Charged::held(&self.0) }
+
+    fn give_back(&self, bytes: usize) -> usize { crate::ledger::Charged::give_back(&self.0, bytes) }
+
+    fn gives_back(&self) -> bool { true }
+}
+
+impl Logs {
+    /// The newest log of `root` kept.
+    fn known(&self, root: &str) -> Option<Arc<Log>> { self.0.lock().unwrap_or_else(|e| e.into_inner()).get(root).cloned() }
+
+    /// Keeps a replayed log as the newest `root` knows, charged what it holds; what leaves goes after the lock.
+    fn seen(&self, root: &str, log: &Arc<Log>) {
+        let left = self.0.lock().unwrap_or_else(|e| e.into_inner()).put(root.to_string(), log.clone(), log.bytes());
+        drop(left);
+    }
+
+    /// Forgets what is kept of `root`.
+    fn forget(&self, root: &str) { self.0.lock().unwrap_or_else(|e| e.into_inner()).pop(root); }
 }
 
 /// A table as its log says it at a version: its columns (name and type), the names of its renamed columns, and its
@@ -144,7 +166,8 @@ pub async fn replay(reach: &impl Reach, root: &str, version: Option<i64>) -> Res
         return replay_unlisted(reach, root, version).await; // (a web server lists nothing: the log is read without a listing)
     }
     let (store, dir) = reach.store(&format!("{root}/_delta_log/")).await?;
-    let known = SEEN.lock().unwrap().get(root).cloned();
+    let kept = reach.state::<Logs>();
+    let known = kept.as_ref().and_then(|k| k.known(root));
     // Only what's newer than we know (or than a checkpoint): the log is listed from there.
     let from = known.as_ref().map(|l| l.version).filter(|v| version.is_none_or(|w| *v <= w)).unwrap_or(0);
     let offset = Path::parse(format!("{dir}/{from:020}")).ok();
@@ -198,15 +221,17 @@ pub async fn replay(reach: &impl Reach, root: &str, version: Option<i64>) -> Res
         log.version = v;
     }
     let log = Arc::new(log);
-    if version.is_none() {
-        seen(root, &log);
+    if let (None, Some(kept)) = (version, &kept) {
+        kept.seen(root, &log);
     }
     Ok(log)
 }
 
 /// When what was known is older than every commit left, from the whole listing.
 async fn replay_from_start(reach: &impl Reach, root: &str, version: Option<i64>) -> Result<Arc<Log>> {
-    SEEN.lock().unwrap().pop(root);
+    if let Some(kept) = reach.state::<Logs>() {
+        kept.forget(root);
+    }
     replay(reach, root, version).await
 }
 
@@ -220,11 +245,12 @@ async fn from_checkpoint(reach: &impl Reach, root: &str, version: i64, files: &[
     Ok(log)
 }
 
-/// The log of a web root, which can't list `_delta_log/`: it starts from the newest log known (`SEEN`) or the
+/// The log of a web root, which can't list `_delta_log/`: it starts from the newest log known (`Logs`) or the
 /// checkpoint `_last_checkpoint` names, and reads the commits after its start by name until one isn't there. Only the
 /// latest is kept, as a listed read keeps it.
 async fn replay_unlisted(reach: &impl Reach, root: &str, version: Option<i64>) -> Result<Arc<Log>> {
-    let known = SEEN.lock().unwrap().get(root).cloned();
+    let kept = reach.state::<Logs>();
+    let known = kept.as_ref().and_then(|k| k.known(root));
     if let Some(l) = known.as_ref().filter(|l| Some(l.version) == version) {
         return Ok(l.clone());
     }
@@ -234,8 +260,8 @@ async fn replay_unlisted(reach: &impl Reach, root: &str, version: Option<i64>) -
     let mut log = start(reach, root, known.as_ref(), last.as_ref(), version).await?;
     apply_commits(reach, root, &mut log, version, newest).await?;
     let log = Arc::new(log);
-    if version.is_none() {
-        seen(root, &log);
+    if let (None, Some(kept)) = (version, &kept) {
+        kept.seen(root, &log);
     }
     Ok(log)
 }
@@ -560,10 +586,11 @@ mod tests {
     const METADATA: &str = r#"{"metaData":{"id":"t1","schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true},{\"name\":\"s\",\"type\":\"string\",\"nullable\":true}]}"}}"#;
 
     /// A web server over memory: a listing (a URL ending in `/`) is refused, so a read passes only through the
-    /// list-less path. Its session reads the same store.
+    /// list-less path. Its session reads the same store, and it keeps what is read as a lake does (`Reach::state`).
     struct Web {
         ctx: SessionContext,
         store: Arc<InMemory>,
+        states: crate::lake_state::States,
     }
 
     impl Reach for Web {
@@ -571,6 +598,7 @@ mod tests {
             std::future::ready(self.locate(url))
         }
         fn session(&self) -> SessionContext { self.ctx.clone() }
+        fn state<P: crate::lake_state::LakeState>(&self) -> Option<Arc<P>> { self.states.get::<P>(None).ok() }
     }
 
     impl Web {
@@ -585,7 +613,7 @@ mod tests {
         let ctx = SessionContext::new();
         let store = Arc::new(InMemory::new());
         ctx.register_object_store(&url::Url::parse(ROOT).unwrap(), store.clone());
-        Web { ctx, store }
+        Web { ctx, store, states: Default::default() }
     }
 
     fn add(path: &str) -> String { format!(r#"{{"add":{{"path":"{path}","size":10,"modificationTime":0,"dataChange":true}}}}"#) }
@@ -643,21 +671,26 @@ mod tests {
         assert_eq!(paths(&resolve(&web, &root, None).await.unwrap()), vec![format!("{root}/b.parquet"), format!("{root}/c.parquet")]);
     }
 
-    /// A replayed log is charged what it parsed to the node's line, which can take it back: the next statement replays it
-    /// again, from its commits (11-07: the logs, kept by count alone, were outside `PONDRA_MEMORY_GB`).
+    /// A replayed log is charged what it parsed to its lake's line, which can take it back: the next statement replays it
+    /// again, from its commits (11-07: the logs, kept by count alone, were outside `PONDRA_MEMORY_GB`). Another lake's
+    /// reads keep their own.
     #[tokio::test]
     async fn a_replayed_log_is_charged_to_the_line_and_given_back_when_asked() {
         let web = web();
         let root = format!("{ROOT}/charged");
         put_commits(&web, &root, &[]).await;
+        use crate::ledger::Charged as _;
         let log = replay(&web, &root, None).await.unwrap();
-        let bytes = SEEN.lock().unwrap().iter().find(|(k, _)| **k == root).map(|(_, l)| l.bytes()).expect("kept");
+        let kept = web.state::<Logs>().expect("the delta extension registers its logs");
+        let bytes = kept.known(&root).expect("kept").bytes();
         assert!(bytes > PROTOCOL.len() + METADATA.len(), "its actions as parsed: {bytes}");
         assert_eq!(bytes, log.bytes());
-        assert!(logs().held() >= bytes);
-        assert!(logs().inside());
-        logs().give_back(usize::MAX);
-        assert!(!SEEN.lock().unwrap().contains(&root), "given back");
+        assert_eq!(kept.held(), bytes);
+        assert!(kept.inside());
+        let other = Web { ctx: web.ctx.clone(), store: web.store.clone(), states: Default::default() };
+        assert!(other.state::<Logs>().unwrap().known(&root).is_none(), "another lake's reads keep their own");
+        kept.give_back(usize::MAX);
+        assert!(kept.known(&root).is_none(), "given back");
         assert_eq!(replay(&web, &root, None).await.unwrap().version, 2, "replayed again");
     }
 

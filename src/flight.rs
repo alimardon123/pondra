@@ -172,14 +172,49 @@ fn sqlstate(code: tonic::Code) -> &'static str {
     }
 }
 
-/// An error as a gRPC status: the nearest code to its SQLSTATE, which rides along in `x-pondra-sqlstate`, and its words as
-/// every door tells them (`codes::answer`).
-fn status(e: impl Into<anyhow::Error>) -> Status {
-    let e = e.into();
-    let (_, code, words) = crate::codes::answer(&e, crate::rights::scope().shows_code()); // (the code and words every door gives)
-    let mut s = Status::new(grpc(code), words);
-    s.metadata_mut().insert("x-pondra-sqlstate", tonic::metadata::MetadataValue::from_static(code));
-    s
+/// How a call's errors are worded: with a routine's code to a caller shown it, without to any other (`codes::answer`). Its
+/// handler makes it from the call's caller (`worded`), and a stream built there moves it in, so no answer is worded from
+/// the task's caller. `PLAIN` is for words made away from any request.
+#[derive(Clone, Copy)]
+struct Worded(bool);
+
+/// As a caller who isn't shown code is told.
+const PLAIN: Worded = Worded(false);
+
+/// The call's caller's words (`Worded`).
+fn worded<T>(req: &Request<T>) -> Worded { Worded::of(&caller(req).scope) }
+
+impl Worded {
+    fn of(scope: &crate::rights::Scope) -> Self { Worded(scope.shows_code()) }
+
+    /// An error as a gRPC status: the nearest code to its SQLSTATE, which rides along in `x-pondra-sqlstate`, and its words
+    /// as every door tells them (`codes::answer`).
+    fn status(self, e: impl Into<anyhow::Error>) -> Status {
+        let e = e.into();
+        let (_, code, words) = crate::codes::answer(&e, self.0); // (the code and words every door gives)
+        let mut s = Status::new(grpc(code), words);
+        s.metadata_mut().insert("x-pondra-sqlstate", tonic::metadata::MetadataValue::from_static(code));
+        s
+    }
+
+    /// `status`, to map an error with.
+    fn err<E: Into<anyhow::Error>>(self) -> impl Fn(E) -> Status + Copy { move |e| self.status(e) }
+
+    /// A stream's error as a gRPC status with its SQLSTATE: a status is `coded`, an Arrow error is `status` (its code from
+    /// its words), and any other is `status` of its message.
+    fn stream(self, e: FlightError) -> Status {
+        match e {
+            FlightError::Tonic(s) => coded(*s),
+            FlightError::Arrow(e) => self.status(e),
+            e => self.status(anyhow::anyhow!("{e}")),
+        }
+    }
+
+    /// A permission check's refusal (`status`): 42501, unless it carries a code of its own.
+    fn denied(self, e: impl Into<anyhow::Error>) -> Status {
+        let e = e.into();
+        self.status(match crate::codes::of(&e) { "XX000" => crate::codes::coded("42501", crate::ext::said(&e)), _ => e })
+    }
 }
 
 /// A status with no SQLSTATE of its own gets the one its gRPC code is answered with (`sqlstate`); one that has it is returned as it is.
@@ -191,32 +226,18 @@ fn coded(mut s: Status) -> Status {
     s
 }
 
-/// A stream's error as a gRPC status with its SQLSTATE: a status is `coded`, an Arrow error is `status` (its code from its words), and any other is `status` of its message.
-fn stream_status(e: FlightError) -> Status {
-    match e {
-        FlightError::Tonic(s) => coded(*s),
-        FlightError::Arrow(e) => status(e),
-        e => status(anyhow::anyhow!("{e}")),
-    }
-}
-
 /// A protocol default's stream with each of its errors coded (`coded`), and its refusal too.
 fn coded_stream<T: Send + 'static>(answer: Result<Response<Out<T>>, Status>) -> Result<Response<Out<T>>, Status> {
     answer.map(|r| r.map(|s| Box::pin(s.map_err(coded)) as Out<T>)).map_err(coded)
 }
 
-/// A refusal with its SQLSTATE, as a gRPC status (`status`).
-fn refused(code: &'static str, message: impl Into<String>) -> Status { status(crate::codes::coded(code, message)) }
+/// A refusal with its SQLSTATE, as a gRPC status (`Worded::status`). Its words are Pondra's own, never an error's, so they
+/// are told alike to every caller (`PLAIN`).
+fn refused(code: &'static str, message: impl Into<String>) -> Status { PLAIN.status(crate::codes::coded(code, message)) }
 
-/// A permission check's refusal (`status`): 42501, unless it carries a code of its own.
-fn denied(e: impl Into<anyhow::Error>) -> Status {
-    let e = e.into();
-    status(match crate::codes::of(&e) { "XX000" => crate::codes::coded("42501", crate::ext::said(&e)), _ => e })
-}
-
-/// The caller's role (who it is: `Door` works it out); refused below `need`.
-fn allowed<T>(_: &App, _: &Request<T>, need: Role) -> Result<Role, Status> {
-    let role = crate::auth::current().map_or(Role::None, |p| p.role);
+/// The caller's role (who it is: `Gate` signs it in); refused below `need`.
+fn allowed<T>(_: &App, req: &Request<T>, need: Role) -> Result<Role, Status> {
+    let role = caller(req).role;
     match role {
         _ if role >= need => Ok(role),
         Role::None => Err(refused("28000", SIGN_IN)),
@@ -306,9 +327,9 @@ fn caller<T>(req: &Request<T>) -> crate::auth::Principal {
 }
 
 /// Batches as a Flight stream (the schema first, so an empty result still has columns).
-fn send(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
+fn send(w: Worded, schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
     let stream = futures::stream::iter(batches.into_iter().map(|b| Ok(crate::answer::compact(b))));
-    Box::pin(FlightDataEncoderBuilder::new().with_schema(schema).build(stream).map_err(stream_status))
+    Box::pin(FlightDataEncoderBuilder::new().with_schema(schema).build(stream).map_err(move |e| w.stream(e)))
 }
 
 /// The messages of Arrow IPC stream bytes, as FlightData, without decoding a batch: each message is `0xFFFFFFFF`, an i32 LE
@@ -356,18 +377,19 @@ async fn query(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown,
     }
     let req = crate::routines::Request { sql: sql.to_string(), ..Default::default() };
     let how = How { job: None, spread: None, after: None, stale: None };
-    let got = statement::run(app, req, how, who.clone(), &FlightWire).await.map_err(status)?;
+    let w = Worded::of(&who.scope);
+    let got = statement::run(app, req, how, who.clone(), &FlightWire).await.map_err(w.err())?;
     if matches!(got, Answer::Sent) {
         return Ok(Flown::Batches(Arc::new(Schema::empty()), vec![]));
     }
     if let Answer::Kept(bytes) | Answer::Own(Encoded::Kept(bytes)) = got {
         return Ok(Flown::Ipc(bytes));
     }
-    let batches = rows_of(got)?;
+    let batches = rows_of(w, got)?;
     let schema = match batches.is_empty() {
         false => first_announced(&batches),
-        true => match statement::plain_of(app, sql, &who.scope).await.map_err(status)? {
-            Some((_, one)) => planned(app, &one, &who.scope).await.map_err(status)?,
+        true => match statement::plain_of(app, sql, &who.scope).await.map_err(w.err())? {
+            Some((_, one)) => planned(app, &one, &who.scope).await.map_err(w.err())?,
             None => Schema::empty(),
         },
     };
@@ -411,11 +433,11 @@ impl Wire for FlightWire {
 
 /// A statement's answer as the batches Flight streams: a query's rows, a kept answer read back, or, for a statement
 /// with no rows (`Done`), one row of `rows` 0, as a CALL's answer is.
-fn rows_of(got: Answer<Encoded>) -> Result<Vec<RecordBatch>, Status> {
+fn rows_of(w: Worded, got: Answer<Encoded>) -> Result<Vec<RecordBatch>, Status> {
     match got {
         Answer::Own(Encoded::Rows(batches)) | Answer::Rows(batches) => Ok(batches),
-        Answer::Kept(bytes) | Answer::Own(Encoded::Kept(bytes)) => crate::query::read_ipc(&bytes).map_err(status),
-        Answer::Done(_) => Ok(vec![RecordBatch::try_from_iter([("rows", Arc::new(datafusion::arrow::array::Int64Array::from(vec![0])) as _)]).map_err(status)?]),
+        Answer::Kept(bytes) | Answer::Own(Encoded::Kept(bytes)) => crate::query::read_ipc(&bytes).map_err(w.err()),
+        Answer::Done(_) => Ok(vec![RecordBatch::try_from_iter([("rows", Arc::new(datafusion::arrow::array::Int64Array::from(vec![0])) as _)]).map_err(w.err())?]),
         Answer::Sent => Err(refused("XX000", "an answer handed over in pieces where Flight keeps it whole (a script's)")),
     }
 }
@@ -425,20 +447,20 @@ fn rows_of(got: Answer<Encoded>) -> Result<Vec<RecordBatch>, Status> {
 /// it is kept. The info's schema is the answer's.
 async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<&[u8]>, descriptor: FlightDescriptor) -> Result<Response<FlightInfo>, Status> {
     let pool = app.lake.rt.memory_pool.clone();
-    let (app, sql) = (app.clone(), sql.to_string());
-    let batches = worked(app.lake.node.clone(), txn, async move {
+    let (app, sql, w) = (app.clone(), sql.to_string(), Worded::of(&who.scope));
+    let batches = worked(w, app.lake.node.clone(), txn, async move {
         let req = crate::routines::Request { sql, ..Default::default() };
         let how = How { job: None, spread: None, after: None, stale: None };
-        rows_of(statement::run(&app, req, how, who, &FlightWire).await.map_err(status)?)
+        rows_of(w, statement::run(&app, req, how, who, &FlightWire).await.map_err(w.err())?)
     })
     .await?;
     let schema = first_announced(&batches);
     // (a read token's script could keep answers that no ticket reads: counted here, they are bounded by the query memory)
-    let reserved = crate::query::kept_memory(&pool, &batches).ok_or_else(|| status(crate::query::too_big(crate::query::room_of(&pool))))?;
+    let reserved = crate::query::kept_memory(&pool, &batches).ok_or_else(|| w.status(crate::query::too_big(crate::query::room_of(&pool))))?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     KEPT.lock().unwrap().insert(id.clone(), (batches, std::time::Instant::now(), reserved));
     let ticket = TicketStatementQuery { statement_handle: format!("kept:{id}").into_bytes().into() };
-    info(&schema, ticket.as_any().encode_to_vec(), descriptor)
+    info(w, &schema, ticket.as_any().encode_to_vec(), descriptor)
 }
 
 /// The columns a query will answer with, for its flight's info: bound and expanded as every door does (`$name`s from
@@ -460,7 +482,7 @@ async fn answer(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown
     }
     if let Some(n) = sql.strip_prefix("rows:").and_then(|n| n.parse::<i64>().ok()) {
         let schema = Arc::new(crate::answer::arrow_schema(&rows_schema()));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![n]))]).map_err(status)?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![n]))]).map_err(Worded::of(&who.scope).err())?;
         return Ok(Flown::Batches(schema, vec![batch]));
     }
     query(app, sql, who).await
@@ -470,7 +492,7 @@ async fn answer(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown
 /// caller (`auth::carried`, which a spawned task would lose), and through `panics::work`, where the memory
 /// watch (`oom.rs`) may stop a query that grew the node, and a long one moves to the queries' runtime
 /// (invariant 231). A statement the node stopped for memory fails its transaction, as on HTTP and Postgres.
-async fn worked<T: Send + 'static>(node: Arc<crate::node_state::NodeState>, txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>> + Send + 'static) -> Result<T, Status> {
+async fn worked<T: Send + 'static>(w: Worded, node: Arc<crate::node_state::NodeState>, txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>> + Send + 'static) -> Result<T, Status> {
     prune_kept(); // (every Flight call that runs work lets go of the kept answers that expired, not only a script's)
     let session = txn.map(in_txn).transpose()?;
     let failing = session.clone();
@@ -483,7 +505,7 @@ async fn worked<T: Send + 'static>(node: Arc<crate::node_state::NodeState>, txn:
                     crate::temp::SESSION.sync_scope(Some(s), || crate::txn::failed(&m));
                 }
             }
-            Err(status(anyhow::anyhow!(m)))
+            Err(w.status(anyhow::anyhow!(m)))
         }
     }
 }
@@ -498,12 +520,12 @@ enum Sent {
 /// A statement's answer as Flight data. Its work (`f`, which runs in `query::PIECES`, so a query may hand its answer to the
 /// stream in pieces as its plan makes them) is `worked` as every statement is, and the answer is then its whole form
 /// (`whole`, or `sent_as_kept` for the bytes the results cache keeps) or its pieces (`piece_stream`).
-async fn answered<F>(node: Arc<crate::node_state::NodeState>, txn: Option<&[u8]>, f: F) -> Result<Out<FlightData>, Status>
+async fn answered<F>(w: Worded, node: Arc<crate::node_state::NodeState>, txn: Option<&[u8]>, f: F) -> Result<Out<FlightData>, Status>
 where
     F: std::future::Future<Output = Result<Flown, Status>> + Send + 'static,
 {
     let held = node.clone(); // (the body's count, and the rest of the statement's, are this node's)
-    let sent = worked(node, txn, async move {
+    let sent = worked(w, node, txn, async move {
         let (hand, mut handed) = tokio::sync::oneshot::channel();
         // (`worked` gives this future its transaction's session and who asked, once for the statement. When its answer is handed
         // over, the rest runs aside: then those two go on it, and only then, as an HTTP request's do)
@@ -524,9 +546,9 @@ where
     })
     .await?;
     Ok(match sent {
-        Sent::Whole(Flown::Batches(schema, batches), busy) => whole(schema, batches, busy),
-        Sent::Whole(Flown::Ipc(bytes), busy) => sent_as_kept(bytes, busy),
-        Sent::Pieces(h, busy) => piece_stream(h, busy),
+        Sent::Whole(Flown::Batches(schema, batches), busy) => whole(w, schema, batches, busy),
+        Sent::Whole(Flown::Ipc(bytes), busy) => sent_as_kept(w, bytes, busy),
+        Sent::Pieces(h, busy) => piece_stream(w, h, busy),
     })
 }
 
@@ -534,7 +556,7 @@ where
 /// Arrow encoder on `schema` (`answer::Encoding::with_schema`), each step's messages as the step is written. With no batches,
 /// the schema and the end. An encoding error ends the stream with its status. `busy` is held until the stream ends or is
 /// dropped, as `piece_stream`'s is.
-fn whole(schema: SchemaRef, batches: Vec<RecordBatch>, busy: crate::node_state::Busy) -> Out<FlightData> {
+fn whole(w: Worded, schema: SchemaRef, batches: Vec<RecordBatch>, busy: crate::node_state::Busy) -> Out<FlightData> {
     // (at most one piece: the answer is encoded at once, its piece then its end, as the stream below writes them, and is
     // sent as those messages; an encoding error ends it after the messages before it, as the stream does)
     let mut pieces = crate::answer::pieces(batches.into_iter().map(|b| crate::answer::as_sent(b, Some("arrow"))));
@@ -547,7 +569,7 @@ fn whole(schema: SchemaRef, batches: Vec<RecordBatch>, busy: crate::node_state::
         steps.push(enc.step(None));
         let mut out: Vec<Result<FlightData, Status>> = vec![];
         for step in steps {
-            match step.and_then(|bytes| messages(Bytes::from(bytes))).map_err(status) {
+            match step.and_then(|bytes| messages(Bytes::from(bytes))).map_err(w.err()) {
                 Ok(data) => out.extend(data.into_iter().map(Ok)),
                 Err(e) => {
                     out.push(Err(e));
@@ -558,13 +580,13 @@ fn whole(schema: SchemaRef, batches: Vec<RecordBatch>, busy: crate::node_state::
         return held(out, busy);
     }
     let pieces = pieces.into_iter();
-    let steps = futures::stream::try_unfold((Some((crate::answer::Encoding::with_schema(schema), pieces)), busy), |(state, busy)| async move {
+    let steps = futures::stream::try_unfold((Some((crate::answer::Encoding::with_schema(schema), pieces)), busy), move |(state, busy)| async move {
         let Some((mut enc, mut pieces)) = state else { return Ok::<_, Status>(None) };
         let (step, next) = match pieces.next() {
             Some(piece) => (enc.step(Some(&piece)), Some((enc, pieces))),
             None => (enc.step(None), None),
         };
-        let data = step.and_then(|bytes| messages(Bytes::from(bytes))).map_err(status)?;
+        let data = step.and_then(|bytes| messages(Bytes::from(bytes))).map_err(w.err())?;
         Ok(Some((data, (next, busy))))
     });
     Box::pin(steps.map_ok(|data| futures::stream::iter(data.into_iter().map(Ok))).try_flatten())
@@ -581,26 +603,26 @@ fn held(out: Vec<Result<FlightData, Status>>, busy: crate::node_state::Busy) -> 
 }
 
 /// A kept answer's Arrow stream as Flight data: its messages as they are (`messages`), holding `busy` as `whole` does.
-fn sent_as_kept(bytes: Bytes, busy: crate::node_state::Busy) -> Out<FlightData> {
-    held(messages(bytes).map_or_else(|e| vec![Err(status(e))], |data| data.into_iter().map(Ok).collect()), busy)
+fn sent_as_kept(w: Worded, bytes: Bytes, busy: crate::node_state::Busy) -> Out<FlightData> {
+    held(messages(bytes).map_or_else(|e| vec![Err(w.status(e))], |data| data.into_iter().map(Ok).collect()), busy)
 }
 
 /// A statement's answer in pieces, as its plan made them (`query::Handed`): the first piece's messages, then each piece as the
 /// door's body takes it. `busy` is held until the stream ends. A piece that fails, or a channel that closes before the answer's
 /// end, ends the stream with its status: a cut answer is never taken for a whole one.
-fn piece_stream(h: crate::query::Handed, busy: crate::node_state::Busy) -> Out<FlightData> {
+fn piece_stream(w: Worded, h: crate::query::Handed, busy: crate::node_state::Busy) -> Out<FlightData> {
     let crate::query::Handed { first, rest, ended, stop } = h;
-    let pieces = futures::stream::try_unfold((Some(first), rest, ended, busy), |(first, mut rest, ended, busy)| async move {
+    let pieces = futures::stream::try_unfold((Some(first), rest, ended, busy), move |(first, mut rest, ended, busy)| async move {
         let bytes = match first {
             Some(first) => Bytes::from(first),
             None => match rest.recv().await {
                 Some(Ok(piece)) => piece,
-                Some(Err(e)) => return Err(status(anyhow::anyhow!("{e}"))),
+                Some(Err(e)) => return Err(w.status(anyhow::anyhow!("{e}"))),
                 None if ended.load(std::sync::atomic::Ordering::Acquire) => return Ok(None),
-                None => return Err(status(crate::codes::coded("XX000", "the answer stopped before its end"))),
+                None => return Err(refused("XX000", "the answer stopped before its end")),
             },
         };
-        let data = messages(bytes).map_err(status)?;
+        let data = messages(bytes).map_err(w.err())?;
         Ok(Some((data, (None, rest, ended, busy))))
     });
     let pieces = pieces.map_ok(|data| futures::stream::iter(data.into_iter().map(Ok))).try_flatten();
@@ -633,11 +655,11 @@ async fn write(app: &App, who: crate::routines::Who, sql: &str) -> Result<i64, S
     }
     let req = crate::routines::Request { sql: sql.to_string(), ..Default::default() };
     let how = How { job: None, spread: None, after: None, stale: None };
-    let returning = crate::returning::of(sql).is_some();
-    Ok(match statement::run(app, req, how, who, &FlightWire).await.map_err(status)? {
+    let (returning, w) = (crate::returning::of(sql).is_some(), Worded::of(&who.scope));
+    Ok(match statement::run(app, req, how, who, &FlightWire).await.map_err(w.err())? {
         Answer::Done(v) => v["rows"].as_i64().unwrap_or(0),
         // (sent as an update, a write with RETURNING answers how many rows it wrote; a CALL's rows are its own)
-        got if returning => rows_of(got)?.iter().map(|b| b.num_rows() as i64).sum(),
+        got if returning => rows_of(w, got)?.iter().map(|b| b.num_rows() as i64).sum(),
         _ => 0,
     })
 }
@@ -647,7 +669,7 @@ async fn write(app: &App, who: crate::routines::Who, sql: &str) -> Result<i64, S
 /// the text is checked (`SELECT 1; COMMIT` is a script, and running it would commit).
 fn no_sql_transaction(sql: &str) -> Result<(), Status> {
     match crate::routines::split(sql).iter().any(|one| crate::text::control(one).is_some()) {
-        true => Err(status(crate::codes::coded("0A000", crate::txn::PROTOCOL_OWN))),
+        true => Err(refused("0A000", crate::txn::PROTOCOL_OWN)),
         false => Ok(()),
     }
 }
@@ -659,7 +681,7 @@ fn in_txn(id: &[u8]) -> Result<String, Status> {
     let session = crate::temp::id(&String::from_utf8_lossy(id));
     match crate::txn::held(&session) {
         true => Ok(session),
-        false => Err(status(crate::codes::coded("25P01", "no transaction is open under that transaction_id: it was ended, or never begun"))),
+        false => Err(refused("25P01", "no transaction is open under that transaction_id: it was ended, or never begun")),
     }
 }
 
@@ -700,24 +722,22 @@ fn unhandle(handle: &[u8]) -> (Option<&[u8]>, &[u8]) {
 /// answered with its ack when committed. `producer` + `first`: batch i is seq `first + i`.
 /// Before each batch, a caller whose rights changed signs in again (`again`, `signed_again`) and the
 /// writer is opened again as it is now, so a REVOKE, a DROP USER or a token's end stops a load at its
-/// next batch (`writer.rs`), as it stops a COPY's next chunk and a Kafka client's next request.
-fn append(app: &App, table: String, producer: String, first: u64, batches: impl Stream<Item = Result<RecordBatch, Status>> + Send + 'static, again: Option<Again>) -> Result<Out<PutResult>, Status> {
+/// next batch (`writer.rs`), as it stops a COPY's next chunk and a Kafka client's next request. `who` is the call's caller.
+fn append(app: &App, who: crate::auth::Principal, table: String, producer: String, first: u64, batches: impl Stream<Item = Result<RecordBatch, Status>> + Send + 'static, again: Option<Again>) -> Result<Out<PutResult>, Status> {
     let log = app.log.clone().ok_or_else(|| refused("25006", "read-only node"))?;
     if !producer.is_empty() && first == 0 {
         return Err(refused("22023", crate::log::SEQ_FROM_1)); // (0 is "nothing yet": its batch would be taken for a retry)
     }
     let (app, log2, table2) = (app.clone(), log.clone(), table.clone());
-    let mut who = crate::auth::current(); // (the caller, for its grants in the task below: a task keeps no task-local)
+    let mut who = Some(who); // (the caller, for its grants in the task below)
     let mut load = crate::writer::Load::new(&app, who.clone(), "Flight DoPut", &table); // (its line in the audit log, as its acks end)
     let (acks_tx, mut acks_rx) = tokio::sync::mpsc::channel::<Result<crate::writer::Queued, Status>>(256);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel(); // (acks are small; a client may read them only at the end)
     crate::panics::task(async move {
         let mut batches = std::pin::pin!(batches);
-        // (a rights refusal is said as the writer's scope says it: `shows_code`)
-        let denied_as = |who: &Option<crate::auth::Principal>, e: anyhow::Error| match who {
-            Some(w) => crate::auth::WHO.sync_scope(w.clone(), || denied(e)),
-            None => denied(e),
-        };
+        // (a refusal is said as the writer's caller is told: `Worded`)
+        let worded = |who: &Option<crate::auth::Principal>| who.as_ref().map_or(PLAIN, |w| Worded::of(&w.scope));
+        let denied_as = |who: &Option<crate::auth::Principal>, e: anyhow::Error| worded(who).denied(e);
         // (a keyed table's rows replace their keys', and rows marked _deleted delete them: S11)
         let opened = |who: Option<crate::auth::Principal>| crate::writer::Writer::open(&app, who, &table, crate::rules::How::Load, false);
         let opened_or = |who: &Option<crate::auth::Principal>, w: Result<crate::writer::Writer, crate::writer::Refused>| match w {
@@ -759,7 +779,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
                     let src = crate::log::Src { producer: producer.clone(), seq, prev };
                     writer.put(crate::rules::Rows::Named(b, left_out), src).await.map_err(|r| match r {
                         crate::writer::Refused::Rights(e) => denied_as(&who, e),
-                        r => status(anyhow::Error::from(r)),
+                        r => worded(&who).status(anyhow::Error::from(r)),
                     })
                 }
                 Err(e) => Err(e),
@@ -777,7 +797,8 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
             let acked = match queued {
                 Ok(crate::writer::Queued { ack, src, rows: batch }) => {
                     // (overtaken by the batch after it on the way to the leader, it goes again: `Log::sent_again`)
-                    let ack = log.sent_again(ack.await, &table, &src, &batch).await.map_err(status);
+                    // (an ack's error is the log's, never a routine's: told as to anyone, as this task outlives the call)
+                    let ack = log.sent_again(ack.await, &table, &src, &batch).await.map_err(PLAIN.err());
                     ack.map(|a| {
                         let mut a = serde_json::to_value(a).unwrap_or_default();
                         a["rows"] = batch.rows().num_rows().into();
@@ -820,17 +841,17 @@ impl Json {
 
 /// A table's log as Flight data, from segment `after`: each commit's rows (just `columns`), then
 /// a message with `{"after": N}`. Once `revoked` resolves (`server::until_revoked`), the stream ends with 28000.
-async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option<Vec<String>>, follow: bool, revoked: impl std::future::Future<Output = ()> + Send + 'static) -> Result<Out<FlightData>, Status> {
-    let meta = app.lake.cat.meta(&table_key(&table)).await.map_err(status)?.ok_or_else(|| refused("42P01", format!("no table {table}")))?;
-    let full = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
+async fn log_stream(w: Worded, app: App, table: String, after: Option<u64>, columns: Option<Vec<String>>, follow: bool, revoked: impl std::future::Future<Output = ()> + Send + 'static) -> Result<Out<FlightData>, Status> {
+    let meta = app.lake.cat.meta(&table_key(&table)).await.map_err(w.err())?.ok_or_else(|| refused("42P01", format!("no table {table}")))?;
+    let full = crate::answer::schema(&meta.logical_columns()).map_err(w.err())?;
     let pick: Vec<usize> = match &columns {
         Some(cols) => cols.iter().map(|c| full.index_of(c).map_err(|_| refused("42703", format!("no column {c}")))).collect::<Result<_, _>>()?,
         None => meta.sql_order().iter().filter_map(|c| full.index_of(c).ok()).collect(), // (SQL's order, as `SELECT *` reads them)
     };
-    let schema = Arc::new(full.project(&pick).map_err(status)?);
+    let schema = Arc::new(full.project(&pick).map_err(w.err())?);
     let after = after.unwrap_or_else(|| app.lake.visible());
     let hwm = app.lake.hwm.subscribe();
-    let first = FlightDataEncoderBuilder::new().with_schema(schema.clone()).build(futures::stream::empty()).map_err(stream_status);
+    let first = FlightDataEncoderBuilder::new().with_schema(schema.clone()).build(futures::stream::empty()).map_err(move |e| w.stream(e));
     let chunks = futures::stream::unfold((app, hwm, after, false), move |(app, mut hwm, mut after, done)| {
         let (table, schema, pick) = (table.clone(), schema.clone(), pick.clone());
         async move {
@@ -841,14 +862,14 @@ async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option
                 hwm.borrow_and_update();
                 let now = app.lake.visible();
                 if now > after || !follow {
-                    let rows = crate::query::tail(&app.lake, &table, after, Some(now), false).await.map_err(status);
+                    let rows = crate::query::tail(&app.lake, &table, after, Some(now), false).await.map_err(w.err());
                     if follow && rows.as_ref().is_ok_and(|r| r.iter().all(|b| b.num_rows() == 0)) {
                         after = now; // (commits to other tables: nothing to send while following)
                         continue;
                     }
                     let chunk = rows.and_then(|rows| {
-                        let rows = rows.iter().map(|b| b.project(&pick).map(crate::answer::compact)).collect::<Result<Vec<_>, _>>().map_err(status)?;
-                        let mut data: Vec<Result<FlightData, Status>> = arrow_flight::utils::batches_to_flight_data(&schema, rows).map_err(status)?.into_iter().skip(1).map(Ok).collect(); // (the schema went first)
+                        let rows = rows.iter().map(|b| b.project(&pick).map(crate::answer::compact)).collect::<Result<Vec<_>, _>>().map_err(w.err())?;
+                        let mut data: Vec<Result<FlightData, Status>> = arrow_flight::utils::batches_to_flight_data(&schema, rows).map_err(w.err())?.into_iter().skip(1).map(Ok).collect(); // (the schema went first)
                         data.push(Ok(FlightData { app_metadata: format!("{{\"after\":{now}}}").into_bytes().into(), ..Default::default() }));
                         Ok(data)
                     });
@@ -890,8 +911,8 @@ fn table_types() -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(datafusion::arrow::array::StringArray::from(vec!["TABLE", "VIEW"]))]).expect("a batch")
 }
 
-fn info(schema: &Schema, ticket: Vec<u8>, descriptor: FlightDescriptor) -> Result<Response<FlightInfo>, Status> {
-    let info = FlightInfo::new().try_with_schema(schema).map_err(status)?.with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(ticket))).with_descriptor(descriptor);
+fn info(w: Worded, schema: &Schema, ticket: Vec<u8>, descriptor: FlightDescriptor) -> Result<Response<FlightInfo>, Status> {
+    let info = FlightInfo::new().try_with_schema(schema).map_err(w.err())?.with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(ticket))).with_descriptor(descriptor);
     Ok(Response::new(info))
 }
 
@@ -920,7 +941,7 @@ impl FlightSqlService for Sql {
                     Some(Ok(c)) => crate::users::session_of(&self.0.lake, &c).await, // (a provider's: its session names it, ADR-074 §5)
                     _ => crate::users::session(&self.0.lake, &who.name).await,
                 }
-                .map_err(status)?
+                .map_err(Worded::of(&who.scope).err())?
                 .0,
                 _ => return Err(refused("28P01", "wrong user name or password")),
             },
@@ -938,6 +959,7 @@ impl FlightSqlService for Sql {
         no_sql_transaction(&q.query)?;
         let txn = q.transaction_id.as_deref(); // (the transaction the statement runs in, if it names one)
         let who = crate::routines::Who { role, files: false, depth: 0, scope: caller(&req).scope }; // (planned for its sign-in)
+        let w = Worded::of(&who.scope);
         if crate::routines::runs_procedure(&q.query) || crate::returning::of(&q.query).is_some() {
             // A CALL (or DO), or a write with RETURNING: run now, as every door runs one; the ticket reads back what it answered.
             return kept(&self.0, &q.query, who, txn, req.into_inner()).await;
@@ -945,34 +967,35 @@ impl FlightSqlService for Sql {
         if crate::write::parse(&q.query).is_some() {
             // A write sent as a query (DB-API's `execute`): done now; the ticket reads back the count.
             let (app, sql) = (self.0.clone(), q.query.clone());
-            let rows = worked(app.lake.node.clone(), txn, async move { write(&app, who, &sql).await }).await?;
+            let rows = worked(w, app.lake.node.clone(), txn, async move { write(&app, who, &sql).await }).await?;
             let ticket = TicketStatementQuery { statement_handle: format!("rows:{rows}").into_bytes().into() };
-            return info(&crate::answer::arrow_schema(&rows_schema()), ticket.as_any().encode_to_vec(), req.into_inner());
+            return info(w, &crate::answer::arrow_schema(&rows_schema()), ticket.as_any().encode_to_vec(), req.into_inner());
         }
         // A query is planned here and run by its ticket; a script (several statements) can't be planned, so it runs now, as a CALL does.
-        let Some((_, one)) = within(txn, async { statement::plain_of(&self.0, &q.query, &who.scope).await.map_err(status) }).await? else {
+        let Some((_, one)) = within(txn, async { statement::plain_of(&self.0, &q.query, &who.scope).await.map_err(w.err()) }).await? else {
             return kept(&self.0, &q.query, who, txn, req.into_inner()).await;
         };
-        let schema = within(txn, async { planned(&self.0, &one, &who.scope).await.map_err(status) }).await?;
+        let schema = within(txn, async { planned(&self.0, &one, &who.scope).await.map_err(w.err()) }).await?;
         let ticket = TicketStatementQuery { statement_handle: handle(&q.query, txn).into() };
-        info(&schema, ticket.as_any().encode_to_vec(), req.into_inner())
+        info(w, &schema, ticket.as_any().encode_to_vec(), req.into_inner())
     }
 
     async fn do_get_statement(&self, t: TicketStatementQuery, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
         let role = allowed(&self.0, &req, Role::Read)?;
-        let (txn, sql) = unhandle(&t.statement_handle);
-        let sql = String::from_utf8(sql.to_vec()).map_err(status)?;
+        let ((txn, sql), w) = (unhandle(&t.statement_handle), worded(&req));
+        let sql = String::from_utf8(sql.to_vec()).map_err(w.err())?;
         let app = self.0.clone();
         let who = crate::routines::Who { role, files: false, depth: 0, scope: caller(&req).scope };
         // (boxed: a statement's future is large, and each layer of `answered`'s and `worked`'s would copy it by value)
-        Ok(Response::new(answered(app.lake.node.clone(), txn, Box::pin(async move { answer(&app, &sql, who).await })).await?))
+        Ok(Response::new(answered(w, app.lake.node.clone(), txn, Box::pin(async move { answer(&app, &sql, who).await })).await?))
     }
 
     async fn do_action_begin_transaction(&self, _: ActionBeginTransactionRequest, req: Request<Action>) -> Result<ActionBeginTransactionResult, Status> {
         allowed(&self.0, &req, Role::Read)?;
+        let w = worded(&req);
         let id = format!("fl-{}", uuid::Uuid::new_v4().simple()); // (the client's handle; its session is the caller's own, named by it)
-        crate::temp::with(&crate::temp::id(&id), false, |_| Ok(())).map_err(status)?; // (held as a session: an idle one ends, its transaction rolled back, as `temp::reap` does)
-        crate::temp::SESSION.scope(Some(crate::temp::id(&id)), crate::txn::protocol(&self.0, "BEGIN")).await.map_err(status)?;
+        crate::temp::with(&crate::temp::id(&id), false, |_| Ok(())).map_err(w.err())?; // (held as a session: an idle one ends, its transaction rolled back, as `temp::reap` does)
+        crate::temp::SESSION.scope(Some(crate::temp::id(&id)), crate::txn::protocol(&self.0, "BEGIN")).await.map_err(w.err())?;
         Ok(ActionBeginTransactionResult { transaction_id: id.into_bytes().into() })
     }
 
@@ -985,13 +1008,13 @@ impl FlightSqlService for Sql {
         };
         let session = in_txn(&q.transaction_id)?;
         // (no statement text: COMMIT and ROLLBACK take none, only BEGIN's modes do)
-        let app = self.0.clone();
-        let out = worked(app.lake.node.clone(), Some(&q.transaction_id[..]), async move { crate::txn::protocol(&app, word).await.map_err(status) }).await;
+        let (app, w) = (self.0.clone(), worded(&req));
+        let out = worked(w, app.lake.node.clone(), Some(&q.transaction_id[..]), async move { crate::txn::protocol(&app, word).await.map_err(w.err()) }).await;
         crate::temp::end(&session); // (the session ends with its transaction, committed or not)
         let (tag, _) = out?;
         if word == "COMMIT" && tag == "ROLLBACK" {
             // (a failed transaction's COMMIT rolls back, as in Postgres: a client must learn it did not commit)
-            return Err(status(crate::codes::coded("25P02", "the transaction had failed, so it was rolled back, not committed")));
+            return Err(refused("25P02", "the transaction had failed, so it was rolled back, not committed"));
         }
         Ok(())
     }
@@ -1000,26 +1023,27 @@ impl FlightSqlService for Sql {
         let role = allowed(&self.0, &req, Role::Write)?;
         let (app, sql) = (self.0.clone(), cmd.query.clone());
         let who = crate::routines::Who { role, files: false, depth: 0, scope: caller(&req).scope };
-        worked(app.lake.node.clone(), cmd.transaction_id.as_deref(), async move { write(&app, who, &sql).await }).await
+        worked(Worded::of(&who.scope), app.lake.node.clone(), cmd.transaction_id.as_deref(), async move { write(&app, who, &sql).await }).await
     }
 
     async fn do_put_statement_ingest(&self, cmd: CommandStatementIngest, req: Request<PeekableFlightDataStream>) -> Result<i64, Status> {
-        let role = allowed(&self.0, &req, Role::Write)?;
+        allowed(&self.0, &req, Role::Write)?;
         if cmd.transaction_id.is_some() {
             // (an ingest appends through the log: its rows would commit at once, not with the transaction)
-            return Err(status(crate::codes::coded("0A000", "an ingest inside a transaction isn't taken yet: ingest outside it, or INSERT the rows in it")));
+            return Err(refused("0A000", "an ingest inside a transaction isn't taken yet: ingest outside it, or INSERT the rows in it"));
         }
         let table = match cmd.schema.as_deref() {
             Some(schema) if !schema.is_empty() => crate::text::join(schema, &cmd.table), // (ADBC's db_schema_name)
             _ => cmd.table.clone(),
         };
         let again = req.extensions().get::<Again>().cloned(); // (signed in again as its rights change: `append`)
-        let scope = caller(&req).scope; // (its sign-in's)
-        let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(stream_status).peekable();
-        let mut exists = self.0.lake.cat.meta(&table_key(&table)).await.map_err(status)?.is_some();
-        crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(|e| {
-            crate::writer::Load::refused(&self.0, None, "Flight DoPut", &table, &e); // (in the audit log, as every refusal at a door is)
-            denied(e)
+        let who = caller(&req); // (its sign-in)
+        let w = Worded::of(&who.scope);
+        let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(move |e| w.stream(e)).peekable();
+        let mut exists = self.0.lake.cat.meta(&table_key(&table)).await.map_err(w.err())?.is_some();
+        crate::writer::may(Some(&who), &crate::auth::catalog_name(&table), None, false).map_err(|e| {
+            crate::writer::Load::refused(&self.0, Some(who.clone()), "Flight DoPut", &table, &e); // (in the audit log, as every refusal at a door is)
+            w.denied(e)
         })?; // (the row doors' one check)
         // ADBC's modes: create (fail if there), append (fail if not), replace, create_append.
         use arrow_flight::sql::{TableExistsOption as IfThere, TableNotExistOption as IfNot};
@@ -1027,9 +1051,9 @@ impl FlightSqlService for Sql {
         match (exists, IfThere::try_from(options.if_exists), IfNot::try_from(options.if_not_exist)) {
             (true, Ok(IfThere::Fail), _) => return Err(refused("42P07", format!("{table} exists (mode create): append to it, or replace it"))),
             (true, Ok(IfThere::Replace), _) => {
-                crate::rights::may_as(role, crate::rights::Action::Define, crate::rights::Object::Table(&table)).map_err(denied)?; // (replacing it)
+                crate::rights::may(&who, crate::rights::Action::Define, crate::rights::Object::Table(&table)).map_err(|e| w.denied(e))?; // (replacing it)
                 let drop = crate::write::parse(&format!("DROP TABLE {}", crate::write::sql_name(&table))).ok_or_else(|| refused("XX000", "DROP TABLE"))?;
-                crate::write::on_node(&self.0, drop, None, &scope).await.map_err(status)?;
+                crate::write::on_node(&self.0, drop, None, &who.scope).await.map_err(w.err())?;
                 exists = false;
             }
             (false, _, Ok(IfNot::Fail)) => return Err(refused("42P01", format!("no table {table} (mode append): create it first, or use create_append"))),
@@ -1037,15 +1061,15 @@ impl FlightSqlService for Sql {
         }
         if !exists {
             // ADBC's create modes: a table from the stream's schema (strings as Utf8, times in µs).
-            crate::rights::may_as(role, crate::rights::Action::Define, crate::rights::Object::Table(&table)).map_err(denied)?; // (creating it)
+            crate::rights::may(&who, crate::rights::Action::Define, crate::rights::Object::Table(&table)).map_err(|e| w.denied(e))?; // (creating it)
             let schema = match std::pin::Pin::new(&mut batches).peek().await {
                 Some(Ok(b)) => b.schema(),
                 _ => return Err(refused("22023", "no rows to take the table's columns from")),
             };
             let columns: Vec<(String, String)> = schema.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
-            crate::write::define(&self.0, &table, &serde_json::json!(columns).to_string()).await.map_err(status)?;
+            crate::write::define(&self.0, &table, &serde_json::json!(columns).to_string()).await.map_err(w.err())?;
         }
-        let mut acks = append(&self.0, table, String::new(), 0, batches, again)?;
+        let mut acks = append(&self.0, who, table, String::new(), 0, batches, again)?;
         let mut rows = 0i64;
         while let Some(ack) = acks.next().await {
             let ack: serde_json::Value = serde_json::from_slice(&ack?.app_metadata).unwrap_or_default();
@@ -1057,6 +1081,8 @@ impl FlightSqlService for Sql {
     async fn do_put_fallback(&self, req: Request<PeekableFlightDataStream>, _: Any) -> Result<Response<Out<PutResult>>, Status> {
         allowed(&self.0, &req, Role::Write)?;
         let again = req.extensions().get::<Again>().cloned(); // (signed in again as its rights change: `append`)
+        let who = caller(&req); // (its sign-in)
+        let w = Worded::of(&who.scope);
         // A path descriptor: [table] or [table, producer, first seq].
         let mut input = req.into_inner();
         let first = std::pin::Pin::new(&mut input).peek().await.cloned().transpose()?.and_then(|d| d.flight_descriptor);
@@ -1066,83 +1092,84 @@ impl FlightSqlService for Sql {
             [t, p, s] => (t.clone(), p.clone(), s.parse().map_err(|_| refused("22023", "the first seq is a number"))?),
             _ => return Err(refused("22023", "DoPut to a path: [table] or [table, producer, first seq]")),
         };
-        crate::writer::may(None, &crate::auth::catalog_name(&table), None, false).map_err(|e| {
-            crate::writer::Load::refused(&self.0, None, "Flight DoPut", &table, &e); // (in the audit log, as every refusal at a door is)
-            denied(e)
+        crate::writer::may(Some(&who), &crate::auth::catalog_name(&table), None, false).map_err(|e| {
+            crate::writer::Load::refused(&self.0, Some(who.clone()), "Flight DoPut", &table, &e); // (in the audit log, as every refusal at a door is)
+            w.denied(e)
         })?; // (the row doors' one check, before a batch is read)
-        let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(input.map_err(Into::into)).map_err(stream_status);
-        Ok(Response::new(append(&self.0, table, producer, seq, batches, again)?))
+        let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(input.map_err(Into::into)).map_err(move |e| w.stream(e));
+        Ok(Response::new(append(&self.0, who, table, producer, seq, batches, again)?))
     }
 
     async fn get_flight_info_sql_info(&self, q: CommandGetSqlInfo, req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
-        info(q.clone().into_builder(&INFO).schema().as_ref(), q.as_any().encode_to_vec(), req.into_inner())
+        info(worded(&req), q.clone().into_builder(&INFO).schema().as_ref(), q.as_any().encode_to_vec(), req.into_inner())
     }
 
-    async fn do_get_sql_info(&self, q: CommandGetSqlInfo, _: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
-        let b = q.into_builder(&INFO);
-        let (schema, batch) = (b.schema(), b.build().map_err(status)?);
-        Ok(Response::new(send(schema, vec![batch])))
+    async fn do_get_sql_info(&self, q: CommandGetSqlInfo, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
+        let (b, w) = (q.into_builder(&INFO), worded(&req));
+        let (schema, batch) = (b.schema(), b.build().map_err(w.err())?);
+        Ok(Response::new(send(w, schema, vec![batch])))
     }
 
     async fn get_flight_info_catalogs(&self, q: CommandGetCatalogs, req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
-        info(&q.clone().into_builder().schema(), q.as_any().encode_to_vec(), req.into_inner())
+        info(worded(&req), &q.clone().into_builder().schema(), q.as_any().encode_to_vec(), req.into_inner())
     }
 
     async fn do_get_catalogs(&self, q: CommandGetCatalogs, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
         allowed(&self.0, &req, Role::Read)?;
-        let mut b = q.into_builder();
+        let (mut b, w) = (q.into_builder(), worded(&req));
         b.append(crate::ddl::lake_name(&self.0.lake));
-        Ok(Response::new(send(b.schema(), vec![b.build().map_err(status)?])))
+        Ok(Response::new(send(w, b.schema(), vec![b.build().map_err(w.err())?])))
     }
 
     async fn get_flight_info_schemas(&self, q: CommandGetDbSchemas, req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
-        info(&q.clone().into_builder().schema(), q.as_any().encode_to_vec(), req.into_inner())
+        info(worded(&req), &q.clone().into_builder().schema(), q.as_any().encode_to_vec(), req.into_inner())
     }
 
     async fn do_get_schemas(&self, q: CommandGetDbSchemas, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
         allowed(&self.0, &req, Role::Read)?;
-        let mut b = q.into_builder();
-        for schema in crate::ddl::schemas(&self.0.lake).await.map_err(status)? {
+        let (mut b, w) = (q.into_builder(), worded(&req));
+        for schema in crate::ddl::schemas(&self.0.lake).await.map_err(w.err())? {
             b.append(crate::ddl::lake_name(&self.0.lake), schema);
         }
-        Ok(Response::new(send(b.schema(), vec![b.build().map_err(status)?])))
+        Ok(Response::new(send(w, b.schema(), vec![b.build().map_err(w.err())?])))
     }
 
     async fn get_flight_info_table_types(&self, q: CommandGetTableTypes, req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
-        info(&table_types().schema(), q.as_any().encode_to_vec(), req.into_inner())
+        info(worded(&req), &table_types().schema(), q.as_any().encode_to_vec(), req.into_inner())
     }
 
     async fn do_get_table_types(&self, _: CommandGetTableTypes, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
         allowed(&self.0, &req, Role::Read)?;
         let types = table_types();
-        Ok(Response::new(send(types.schema(), vec![types])))
+        Ok(Response::new(send(worded(&req), types.schema(), vec![types])))
     }
 
     async fn get_flight_info_tables(&self, q: CommandGetTables, req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
-        info(&q.clone().into_builder().schema(), q.as_any().encode_to_vec(), req.into_inner())
+        info(worded(&req), &q.clone().into_builder().schema(), q.as_any().encode_to_vec(), req.into_inner())
     }
 
     async fn do_get_tables(&self, q: CommandGetTables, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
         allowed(&self.0, &req, Role::Read)?;
-        let (mut b, lake, scope) = (q.into_builder(), &self.0.lake, crate::rights::scope());
+        let (mut b, lake, scope) = (q.into_builder(), &self.0.lake, caller(&req).scope);
+        let w = Worded::of(&scope);
         // (a user's: the tables and views it may read, and of one granted in part those columns, as every listing: S27)
         let reads = |shown: &Option<std::collections::HashSet<String>>, c: &str| shown.as_ref().is_none_or(|s| s.contains(c));
-        for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
+        for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(w.err())?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
             let Some(shown) = scope.columns(&key[2..]) else { continue };
             let (schema, table) = crate::text::split(&key[2..]);
             let columns: Vec<_> = meta.sql_columns().into_iter().filter(|(c, _)| reads(&shown, c)).collect();
-            let columns = crate::answer::schema(&columns).map_err(status)?; // (SQL's order)
-            b.append(crate::ddl::lake_name(lake), schema, table, "TABLE", &columns).map_err(status)?;
+            let columns = crate::answer::schema(&columns).map_err(w.err())?; // (SQL's order)
+            b.append(crate::ddl::lake_name(lake), schema, table, "TABLE", &columns).map_err(w.err())?;
         }
-        for (key, _) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await.map_err(status)? {
+        for (key, _) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await.map_err(w.err())? {
             let Some(shown) = scope.columns(&key[2..]) else { continue };
             let (schema, view) = crate::text::split(&key[2..]);
             if let Ok(columns) = plan_schema(&self.0, &format!("SELECT * FROM {}", crate::write::sql_name(&key[2..])), &scope).await {
                 let columns = Schema::new(columns.fields().iter().filter(|f| reads(&shown, f.name())).cloned().collect::<Vec<_>>());
-                b.append(crate::ddl::lake_name(lake), schema, view, "VIEW", &columns).map_err(status)?;
+                b.append(crate::ddl::lake_name(lake), schema, view, "VIEW", &columns).map_err(w.err())?;
             }
         }
-        Ok(Response::new(send(b.schema(), vec![b.build().map_err(status)?])))
+        Ok(Response::new(send(w, b.schema(), vec![b.build().map_err(w.err())?])))
     }
 
     async fn register_sql_info(&self, _: i32, _: &SqlInfo) {}
@@ -1173,18 +1200,18 @@ impl FlightService for Door {
     async fn list_flights(&self, req: Request<Criteria>) -> Result<Response<Self::ListFlightsStream>, Status> {
         let who = caller(&req);
         crate::auth::WHO.scope(who, async move {
-            let app = &self.0 .0;
+            let (app, who) = (&self.0 .0, caller(&req));
             allowed(app, &req, Role::Read)?;
-            let mut infos = vec![];
+            let (w, mut infos) = (Worded::of(&who.scope), vec![]);
             // (each a flight of `SELECT *`: listed for a table it may read every column of, as its ticket would be refused
             // naming none for one granted in part, and its info would be: 11-08 audit M6)
-            for (key, _) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k) && crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&k[2..])).is_ok()) {
+            for (key, _) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(w.err())?.into_iter().filter(|(k, _)| !crate::sys::hidden(k) && crate::rights::may(&who, crate::rights::Action::SelectAll, crate::rights::Object::Table(&k[2..])).is_ok()) {
                 let table = &key[2..];
                 // (the schema its ticket streams, planned as DoGet runs it: a table's strings are Utf8View, not the table's Utf8)
                 let sql = format!("SELECT * FROM {}", crate::write::sql_name(table));
                 let ticket = serde_json::json!({"sql": sql}).to_string();
-                let schema = plan_schema(app, &sql, &caller(&req).scope).await.map_err(status)?;
-                infos.push(Ok(FlightInfo::new().try_with_schema(&schema).map_err(status)?.with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(ticket))).with_descriptor(FlightDescriptor::new_path(vec![table.to_string()]))));
+                let schema = plan_schema(app, &sql, &who.scope).await.map_err(w.err())?;
+                infos.push(Ok(FlightInfo::new().try_with_schema(&schema).map_err(w.err())?.with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(ticket))).with_descriptor(FlightDescriptor::new_path(vec![table.to_string()]))));
             }
             Ok(Response::new(Box::pin(futures::stream::iter(infos)) as Self::ListFlightsStream))
         }).await
@@ -1194,23 +1221,24 @@ impl FlightService for Door {
         let who = caller(&req);
         crate::auth::WHO.scope(who, async move {
             let Some(json) = Json::parse(&req.get_ref().cmd) else { return self.0.get_flight_info(req).await.map_err(coded) };
-            let app = &self.0 .0;
+            let (app, who) = (&self.0 .0, caller(&req));
             allowed(app, &req, Role::Read)?;
+            let w = Worded::of(&who.scope);
             let schema = match (&json.sql, &json.table) {
-                (Some(sql), _) => plan_schema(app, sql, &caller(&req).scope).await.map_err(status)?,
+                (Some(sql), _) => plan_schema(app, sql, &who.scope).await.map_err(w.err())?,
                 (None, Some(table)) => {
                     // Its schema names every column: a user needs SELECT on all of them, as its log stream does (checked before the table is looked up, so an unreadable one isn't told apart).
-                    crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(table)).map_err(denied)?;
-                    let meta = app.lake.cat.meta(&table_key(table)).await.map_err(status)?.ok_or_else(|| refused("42P01", format!("no table {table}")))?;
-                    let full = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
+                    crate::rights::may(&who, crate::rights::Action::SelectAll, crate::rights::Object::Table(table)).map_err(|e| w.denied(e))?;
+                    let meta = app.lake.cat.meta(&table_key(table)).await.map_err(w.err())?.ok_or_else(|| refused("42P01", format!("no table {table}")))?;
+                    let full = crate::answer::schema(&meta.logical_columns()).map_err(w.err())?;
                     let order = meta.sql_order(); // (no columns asked: SQL's order, as the log stream sends them)
                     let pick = json.columns.as_ref().unwrap_or(&order).iter().filter_map(|c| full.index_of(c).ok()).collect::<Vec<_>>();
-                    full.project(&pick).map_err(status)?
+                    full.project(&pick).map_err(w.err())?
                 }
                 _ => return Err(refused("22023", "{\"sql\": …} or {\"table\": …}")),
             };
             let cmd = req.get_ref().cmd.to_vec();
-            info(&schema, cmd, req.into_inner())
+            info(w, &schema, cmd, req.into_inner())
         }).await
     }
 
@@ -1227,24 +1255,25 @@ impl FlightService for Door {
         let who = caller(&req);
         crate::auth::WHO.scope(who, async move {
             let Some(json) = Json::parse(&req.get_ref().ticket) else { return coded_stream(self.0.do_get(req).await) };
-            let app = &self.0 .0;
+            let (app, signed) = (&self.0 .0, caller(&req));
             let role = allowed(app, &req, Role::Read)?;
+            let w = Worded::of(&signed.scope);
             match (json.sql, json.table) {
                 (Some(sql), _) => {
                     let app = app.clone();
-                    let who = crate::routines::Who { role, files: false, depth: 0, scope: caller(&req).scope };
-                    Ok(Response::new(answered(app.lake.node.clone(), None, Box::pin(async move { query(&app, &sql, who).await })).await?))
+                    let who = crate::routines::Who { role, files: false, depth: 0, scope: signed.scope };
+                    Ok(Response::new(answered(w, app.lake.node.clone(), None, Box::pin(async move { query(&app, &sql, who).await })).await?))
                 }
                 (None, Some(table)) => {
                     let name = crate::auth::catalog_name(&table);
-                    crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&name)).map_err(denied)?; // (a stream of rows: every column, as `/watch` needs)
+                    crate::rights::may(&signed, crate::rights::Action::SelectAll, crate::rights::Object::Table(&name)).map_err(|e| w.denied(e))?; // (a stream of rows: every column, as `/watch` needs)
                     // (the rows come after this call's scope has ended: its sign-in is checked again, and the table's whole rows
                     // with it, so a REVOKE, a DROP USER or a session's end stops them within a second, as at `/watch`: 11-03 audit H1)
                     let header = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
-                    let revoked = crate::server::until_revoked(app.clone(), crate::auth::operator(), header, move |p| {
+                    let revoked = crate::server::until_revoked(app.clone(), Some(signed), crate::auth::operator(), header, move |p| {
                         crate::rights::may(p, crate::rights::Action::SelectAll, crate::rights::Object::Table(&name)).is_ok()
                     });
-                    Ok(Response::new(log_stream(app.clone(), table, json.after, json.columns, json.follow, revoked).await?))
+                    Ok(Response::new(log_stream(w, app.clone(), table, json.after, json.columns, json.follow, revoked).await?))
                 }
                 _ => Err(refused("22023", "{\"sql\": …} or {\"table\": …}")),
             }
@@ -1334,12 +1363,12 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(plan), vec![cast(&strings, &dict)?, view])?;
         let names_and_types = |s: &Schema| s.fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect::<Vec<_>>();
 
-        let sent: Vec<FlightData> = whole(schema.clone(), vec![batch], crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
+        let sent: Vec<FlightData> = whole(PLAIN, schema.clone(), vec![batch], crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
         let streamed = arrow_flight::utils::flight_data_to_batches(&sent)?;
         assert_eq!(names_and_types(streamed[0].schema().as_ref()), names_and_types(&schema));
         assert_eq!(streamed[0].column(0).data_type(), &DataType::Utf8, "a dictionary arrives as its values");
 
-        let empty: Vec<FlightData> = whole(schema.clone(), vec![], crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
+        let empty: Vec<FlightData> = whole(PLAIN, schema.clone(), vec![], crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
         assert_eq!(empty.len(), 1, "the schema alone");
         assert_eq!(names_and_types(&Schema::try_from(&empty[0])?), names_and_types(&schema));
         Ok(())
@@ -1353,8 +1382,8 @@ mod tests {
         let view: ArrayRef = Arc::new(StringViewArray::from(vec!["x", "y"]));
         let batch = RecordBatch::try_new(Arc::new(plan), vec![cast(&strings, &dict)?, view])?;
         let kept = crate::answer::render(&[batch.clone()], Some("arrow"), &|_| None)?;
-        let a: Vec<FlightData> = sent_as_kept(kept, crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
-        let b: Vec<FlightData> = whole(Arc::new(first_announced(&[batch.clone()])), vec![batch], crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
+        let a: Vec<FlightData> = sent_as_kept(PLAIN, kept, crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
+        let b: Vec<FlightData> = whole(PLAIN, Arc::new(first_announced(&[batch.clone()])), vec![batch], crate::node_state::NodeState::unhosted().drain.busy()).try_collect().await?;
         assert_eq!(a.len(), b.len());
         for (x, y) in a.iter().zip(&b) {
             assert_eq!(x.data_header, y.data_header);
@@ -1385,9 +1414,20 @@ mod tests {
         }
     }
 
+    /// A call's errors are worded for its caller (`Worded`): a routine's lines in full to a caller shown code, without their
+    /// text to any other, and as to the latter where no request is there to ask (`PLAIN`).
+    #[test]
+    fn a_calls_errors_are_worded_for_its_caller() {
+        let e = || anyhow::anyhow!("ValueError: bad row\n  line 3: rate = 42");
+        assert_eq!(Worded::of(&crate::rights::Scope::everything()).status(e()).message(), "ValueError: bad row\n  line 3: rate = 42");
+        assert_eq!(Worded::of(&crate::rights::Scope::nothing()).status(e()).message(), "ValueError: bad row\n  line 3");
+        assert_eq!(PLAIN.status(e()).message(), "ValueError: bad row\n  line 3");
+        assert_eq!(PLAIN.status(e()).metadata().get("x-pondra-sqlstate").unwrap(), crate::codes::of(&e()));
+    }
+
     #[test]
     fn stream_status_of_an_arrow_error_carries_a_sqlstate() {
         let e = FlightError::Arrow(datafusion::arrow::error::ArrowError::ComputeError("no".into()));
-        assert!(stream_status(e).metadata().contains_key("x-pondra-sqlstate"));
+        assert!(PLAIN.stream(e).metadata().contains_key("x-pondra-sqlstate"));
     }
 }

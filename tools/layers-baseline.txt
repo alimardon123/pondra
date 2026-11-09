@@ -83,7 +83,6 @@ git -> crypto  1
 git -> fetch  1
 guard -> dial  2
 held -> wasm32  1
-history -> reset  1
 host -> git  1
 host -> measures  1
 host -> pg_trace  1

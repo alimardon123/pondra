@@ -25,6 +25,7 @@ pub static ICEBERG: crate::registry::BuiltIn = crate::registry::BuiltIn {
     register: |r| {
         r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES);
         r.section_mut::<crate::records::Prefixes>().add(crate::iceberg::PREFIXES);
+        r.section_mut::<crate::lake_state::Registered>().add::<crate::read_iceberg::Manifests>();
     },
 };
 

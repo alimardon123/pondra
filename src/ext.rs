@@ -671,6 +671,7 @@ impl crate::reach::Reach for Lake {
     fn named(&self, urls: &[&str]) -> impl std::future::Future<Output = Result<()>> + Send {
         check_urls(self, urls)
     }
+    fn state<P: crate::lake_state::LakeState>(&self) -> Option<Arc<P>> { Lake::state::<P>(self).ok() }
 }
 
 /// A table read from another engine's log, as a node's table (its columns, names and files; the rest is the
