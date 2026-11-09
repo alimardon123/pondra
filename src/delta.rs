@@ -259,8 +259,8 @@ pub async fn unpublish(lake: &Lake, table: &str, format: &str) -> Result<()> {
     Ok(())
 }
 
-/// Delta logs and Iceberg metadata: open-format files Pondra writes but never reads.
-pub fn open_format(path: &str) -> bool { path.contains("/_delta_log/") || path.contains("/metadata/") }
+/// Delta's logs: open-format files Pondra writes but never reads (`store::Published`).
+pub fn delta_log(path: &str) -> bool { path.contains("/_delta_log/") }
 
 /// A Decimal128(p, s) column's precision and scale.
 pub fn decimal(t: &str) -> Option<(u8, i8)> {
