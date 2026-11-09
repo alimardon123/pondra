@@ -403,15 +403,34 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool, scope: &cra
     // A user granted some tables sees those, and of one granted by columns those columns, as at every other
     // listing (`ddl::listed_for`, invariant 382). Postgres's pg_class names every table; Pondra names none its
     // reader may not read, so a BI tool's table list is the user's.
+    let mut hidden: BTreeMap<u32, Vec<String>> = BTreeMap::new(); // (each relation's columns its reader may not read)
     if !scope.whole() {
         rels.retain_mut(|r| match scope.columns(&crate::text::join(&r.schema, &r.name)) {
             None => false,
             Some(None) => true,
             Some(Some(these)) => {
+                let gone: Vec<String> = r.columns.iter().map(|(c, ..)| c.clone()).filter(|c| !these.contains(c)).collect();
                 r.columns.retain(|(c, ..)| these.contains(c));
+                // (and what names one: its key, a constraint or CHECK over it, its comment, so no definition names a
+                // column the reader may not read, 11-09 audit M2; its indexes go below)
+                if r.key.iter().any(|k| gone.contains(k)) {
+                    r.key.clear();
+                }
+                r.constraints.retain(|c| !c.columns.iter().any(|k| gone.contains(k)));
+                r.checks.retain(|(_, cond)| !names_any(cond, &gone));
+                r.comments.retain(|c, _| these.contains(c));
+                r.identity.retain(|c, _| these.contains(c));
+                r.typed.retain(|c, _| these.contains(c));
+                hidden.insert(r.oid, gone);
                 true
             }
         });
+        // (a foreign key to a table it may not read, or to columns it may not read of one it reads in part)
+        let norm = |t: &str| crate::text::join(crate::text::split(t).0, crate::text::split(t).1);
+        let seen: BTreeMap<String, Vec<String>> = rels.iter().map(|r| (crate::text::join(&r.schema, &r.name), hidden.get(&r.oid).cloned().unwrap_or_default())).collect();
+        for r in rels.iter_mut() {
+            r.constraints.retain(|c| c.references.as_ref().is_none_or(|(t, cols)| seen.get(&norm(t)).is_some_and(|gone| !cols.iter().any(|k| gone.contains(k)))));
+        }
     }
     // The session's own temporary tables and views, in its temporary schema (as Postgres has them).
     let (temp_tables, temp_views) = crate::temp::listed();
@@ -438,6 +457,9 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool, scope: &cra
     let mut indexes = vec![];
     for (k, i) in lake.cat.scan::<crate::index::Index>("ix/", "ix0").await? {
         let Some(r) = rels.iter().find(|r| r.oid == oid("r", &i.table)) else { continue };
+        if hidden.get(&r.oid).is_some_and(|gone| i.keys.iter().any(|key| names_any(&key.expr, gone))) {
+            continue; // (an index over a column its reader may not read: its definition would name it, 11-09 audit M2)
+        }
         let meta = lake.cat.meta(&crate::store::table_key(&i.table)).await?;
         let name = crate::text::split(&k[3..]).1.to_string();
         let at = i.keys.iter().map(|key| {
@@ -523,6 +545,11 @@ fn n() -> ScalarValue { ScalarValue::Null }
 /// A timestamp with time zone, as `timestamptz` columns are typed.
 fn timestamptz() -> DataType { DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())) }
 /// Columns' places in a relation, numbered from 1 (0: not one of its columns).
+/// Does SQL text `text` name any of `columns` (by its words, as a CHECK's `conkey` is read)?
+fn names_any(text: &str, columns: &[String]) -> bool {
+    text.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).any(|w| columns.iter().any(|c| c.eq_ignore_ascii_case(w)))
+}
+
 fn at_of(r: &Rel, columns: &[String]) -> Vec<i16> { columns.iter().map(|c| r.columns.iter().position(|(n, ..)| n == c).map_or(0, |p| p as i16 + 1)).collect() }
 
 /// The relation a foreign key names, as the lake names tables (`schema.table`, or `table`).

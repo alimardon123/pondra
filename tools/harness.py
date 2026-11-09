@@ -22704,6 +22704,27 @@ def listings():
     stopped = lambda v: "permission denied for sequence" in v
     checks["a sequence moves for a writer of a table that takes from it: ann, granted only INSERT on tickets, numbers its rows and takes its next value, but sets none and moves no other sequence, at every door (11-09 audit H1)"] = \
         all(went(d["INSERT"]) and went(d["nextval"]) and stopped(d["setval"]) and stopped(d["nextval, another"]) and stopped(d["setval, another"]) for d in seqs.values())
+    # (11-09 audit M2: of a table ann reads in part, the catalog names no column ann may not read: not its key, an index, a
+    # CHECK, a foreign key or a comment over one)
+    for q in ["CREATE TABLE owners (owner_key BIGINT PRIMARY KEY)",
+              "CREATE TABLE vault (vault_id BIGINT PRIMARY KEY, secret_amount DOUBLE CHECK (secret_amount > 0), open_note TEXT, owner_ref BIGINT REFERENCES owners (owner_key) NOT ENFORCED)",
+              "CREATE INDEX vault_by_amount ON vault (secret_amount)", "COMMENT ON COLUMN vault.secret_amount IS 'hush hush'",
+              "GRANT SELECT (open_note, owner_ref) ON vault TO ann"]:
+        ask(boss, q)
+    listings = ["SELECT * FROM pg_indexes WHERE tablename = 'vault'", "SELECT * FROM information_schema.key_column_usage WHERE table_name = 'vault'",
+                "SELECT * FROM information_schema.constraint_column_usage", "SELECT * FROM information_schema.table_constraints WHERE table_name = 'vault'",
+                "SELECT * FROM pg_constraint", "SELECT * FROM pg_description", "SELECT * FROM pg_index"]
+    def pg_rows(user, password, q):
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user={user} password={password} dbname=lake", connect_timeout=10, autocommit=True) as c:
+                return str(c.execute(q).fetchall())
+        except psycopg.Error as e:
+            return f"{e.sqlstate} {e.diag.message_primary}"
+    named = {who: {q: pg_rows(who, f"{who}-password-1", q) for q in listings} for who in ("ann", "boss")}
+    words = ["vault_id", "secret_amount", "hush hush", "vault_by_amount", "owner_key", "vault_owner_ref_fkey", "vault_pkey"]
+    unseen["M2"] = {**{q: [w for w in words if w in v] for q, v in named["ann"].items()}, "the superuser lacks": [w for w in words if not any(w in v for v in named["boss"].values())]}
+    checks["of a table ann reads in part, pg_catalog and information_schema name no column ann may not read: no key, index, CHECK, foreign key or comment over one; the superuser sees them all (11-09 audit M2)"] = \
+        not any(w in v for v in named["ann"].values() for w in words) and all(any(w in v for v in named["boss"].values()) for w in words)
     info["unseen"] = unseen
     node.kill()
     ok = all(checks.values())
