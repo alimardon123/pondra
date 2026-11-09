@@ -37,6 +37,7 @@ const COMMITS_IN_FLIGHT: usize = 4; // leader: catalog writes not yet committed
 /// A hook in the log's commits (designs/redesign/redesign.md, step 5 piece 6): a feature that keeps rows of its own in step
 /// with the rows the log takes registers one, and the log calls it without knowing whose it is. `views` registers a
 /// view's rows, derived as its sources' are packed and refused by its expectations.
+#[derive(Clone, Copy)]
 pub struct CommitHook {
     pub name: &'static str,
     /// The rows it adds to a flush, from the rows the flush carries by table (`new`) and each batch's producer (`by`).
@@ -1278,8 +1279,8 @@ mod tests {
         assert_eq!(hooks().iter().map(|h| h.name).collect::<Vec<_>>(), ["views"], "the engine adds the views' hook, and nothing else adds one yet");
         let twice = crate::registry::BuiltIn { name: "twice", requires: &[], register: |r| {
             let hooks = r.section_mut::<CommitHooks>();
-            hooks.add(crate::views::hook());
-            hooks.add(crate::views::hook());
+            hooks.add(super::hooks()[0]); // (the views', as the engine added it)
+            hooks.add(super::hooks()[0]);
         } };
         let built = std::panic::catch_unwind(|| crate::registry::Registry::build(&[&twice]));
         let why = built.err().and_then(|e| e.downcast_ref::<String>().cloned()).unwrap_or_default();
