@@ -10,7 +10,7 @@ use object_store::{path::Path, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use datafusion::common::instant::Instant;
 use crate::node_state::Claims;
 use std::time::Duration;
@@ -254,7 +254,7 @@ impl Ear {
         let held = claims.is_some_and(|c| c.0.lock().unwrap().contains_key(&t.n));
         let here = held || lock_path(t).is_some_and(|p| p.exists()) || crate::memory_lake::held_in_memory(store);
         let key = rung_key(store, t);
-        let lately = RUNG.lock().unwrap().get(&key).copied().flatten().is_some_and(|at| at.elapsed() < RUNG_AGAIN);
+        let lately = RUNG.lock().unwrap_or_else(PoisonError::into_inner).get(&key).copied().flatten().is_some_and(|at| at.elapsed() < RUNG_AGAIN);
         if !t.bell || here || lately {
             return None;
         }
@@ -275,7 +275,7 @@ impl Ear {
             false if self.rang.elapsed() < HEARD => return None,
             false => true,
         };
-        let mut rung = RUNG.lock().unwrap();
+        let mut rung = RUNG.lock().unwrap_or_else(PoisonError::into_inner);
         rung.retain(|_, at| at.is_none_or(|at| at.elapsed() < RUNG_AGAIN)); // (an old answer is let go as one is written; a `None` stays)
         rung.insert(self.key.clone(), (!gone).then(Instant::now));
         Some(gone)
@@ -308,7 +308,7 @@ pub(crate) async fn wait_for(store: &Store, t: &Term, claims: Option<&Claims>) {
 }
 
 /// `deaf` said so of term `t`'s claimer, in this process.
-fn deaf_here(store: &Store, t: &Term) -> bool { RUNG.lock().unwrap().get(&rung_key(store, t)).is_some_and(Option::is_none) }
+fn deaf_here(store: &Store, t: &Term) -> bool { RUNG.lock().unwrap_or_else(PoisonError::into_inner).get(&rung_key(store, t)).is_some_and(Option::is_none) }
 
 /// Is the holder of term `t` alive? A claim made on this machine is alive while its process holds
 /// its lock file; anywhere else, it is alive if it marked itself alive in the last 30 s, and didn't
