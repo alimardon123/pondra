@@ -123,6 +123,7 @@ lateral_join engine
 late_rows engine
 layout engine
 learned engine
+lifted engine
 literals engine
 locks engine
 median engine
