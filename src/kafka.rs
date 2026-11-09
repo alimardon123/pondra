@@ -448,7 +448,7 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
         for _ in 0..r.len()? {
             let (index, records) = (r.i32()?, r.nbytes()?.unwrap_or_default());
             // (each partition's records are a load, with its line in the audit log as its outcome comes: `writer::Load`)
-            let mut load = crate::writer::Load::new(app, Some(who.clone()), "Kafka produce", &name);
+            let mut load = crate::writer::Load::new(app, who.clone(), "Kafka produce", &name);
             let outcome = match (&meta, &rules, index) {
                 _ if may.is_err() => {
                     load.end(may.clone().err());

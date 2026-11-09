@@ -756,13 +756,24 @@ impl Request {
 
 /// Who a statement runs for: the caller's rights (`files`: it may read files on this machine,
 /// `statement::owner`), what it plans for (`scope`: the principal's its door signed in, M8 piece 3b; step 8's session
-/// carries it), and how deep in procedures calling procedures it is.
+/// carries it), how deep in procedures calling procedures it is, and who did it (`by`: the principal its door signed in,
+/// whose name, door and address its stamps and log lines carry, M8 piece 3d; kept when an apply raises its role; none
+/// for the node's own work, a task's tick, which nobody signed in for).
 #[derive(Clone)]
 pub struct Who {
     pub role: Role,
     pub files: bool,
     pub depth: u32,
     pub scope: crate::rights::Scope,
+    pub by: Option<crate::auth::Principal>,
+}
+
+impl Who {
+    /// A first call, as `by`'s door signed it in: its scope, with the door's `role` for it and `files`.
+    pub fn signed(by: crate::auth::Principal, role: Role, files: bool) -> Who { Who { role, files, depth: 0, scope: by.scope.clone(), by: Some(by) } }
+
+    /// The name it is stamped with: its sign-in's (none: the node's own, "").
+    pub fn name(&self) -> &str { self.by.as_ref().map_or("", |p| p.name.as_str()) }
 }
 
 pub enum Outcome {
@@ -816,16 +827,17 @@ pub fn split(text: &str) -> Vec<String> {
 
 /// Run one statement here as the caller could have sent it (the audit log told: `audit.rs`).
 pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
+    let by = who.by.clone(); // (its log lines' and history's: `audit::statement`)
     if let Some(word) = crate::text::control(sql) {
         // BEGIN, COMMIT, ROLLBACK: the session's transaction (ADR-036 §5)
-        let (tag, warning) = crate::audit::statement(app, sql, Box::pin(crate::txn::command(app, word, sql))).await?; // (on the heap: procedures call procedures deep)
+        let (tag, warning) = crate::audit::statement(app, by.as_ref(), sql, Box::pin(crate::txn::command(app, word, sql))).await?; // (on the heap: procedures call procedures deep)
         warning.iter().for_each(|w| heard(&format!("WARNING: {w}")));
         return Ok(Outcome::Done(j!({"transaction": tag.to_lowercase()})));
     }
     let shows = who.scope.shows_code(); // (a failed transaction's words, as its caller is told them)
     // (the gate runs inside the audited statement, so a refusal there is audited and fails the transaction too: a write
     // in a READ ONLY one (25006) leaves it failed, and the next statement gets 25P02)
-    let out = crate::audit::statement(app, sql, Box::pin(async move {
+    let out = crate::audit::statement(app, by.as_ref(), sql, Box::pin(async move {
         let busy = crate::txn::next(app, sql).await?; // (a failed transaction takes nothing but its end; READ COMMITTED reads the newest commit; the guard keeps the transaction busy while this runs)
         crate::txn::began(busy.id(), one_or_locked(app, sql, who, job)).await // (the transaction it began in: a write that outlives it is refused, 25000)
     }))

@@ -1692,7 +1692,7 @@ where
 {
     leader_needed(app)?;
     let caller = crate::temp::SESSION.try_with(|s| s.clone()).ok().flatten();
-    let s = caller.clone().unwrap_or_else(crate::temp::of_script);
+    let s = caller.clone().unwrap_or_else(|| crate::temp::of_script("")); // (a session of its own, which no client names)
     let job = job.map(|j| as_job(&j));
     let run = async {
         let mut tries = 0;

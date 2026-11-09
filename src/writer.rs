@@ -58,7 +58,7 @@ pub fn may(who: Option<&Principal>, table: &str, meta: Option<&TableMeta>, delet
 /// error it met. A load dropped before it ended (its client went away) ends as failed.
 pub struct Load {
     app: App,
-    who: Option<Principal>,
+    who: Principal, // (whose load it is: its audit line's)
     door: &'static str,
     table: String,
     start: datafusion::common::instant::Instant,
@@ -67,8 +67,8 @@ pub struct Load {
 
 impl Load {
     /// A load into `table` through `door`, by `who` (None: the caller in scope).
-    pub fn new(app: &App, who: Option<Principal>, door: &'static str, table: &str) -> Load {
-        Load { app: app.clone(), who: who.or_else(crate::auth::current), door, table: table.to_string(), start: datafusion::common::instant::Instant::now(), end: None }
+    pub fn new(app: &App, who: Principal, door: &'static str, table: &str) -> Load {
+        Load { app: app.clone(), who, door, table: table.to_string(), start: datafusion::common::instant::Instant::now(), end: None }
     }
 
     /// It ended: well, or with `error`. The first end counts.
@@ -77,7 +77,7 @@ impl Load {
     }
 
     /// A load refused before it began: its line now.
-    pub fn refused(app: &App, who: Option<Principal>, door: &'static str, table: &str, error: &anyhow::Error) {
+    pub fn refused(app: &App, who: Principal, door: &'static str, table: &str, error: &anyhow::Error) {
         Load::new(app, who, door, table).end(Some(error.to_string()));
     }
 }
@@ -85,11 +85,7 @@ impl Load {
 impl Drop for Load {
     fn drop(&mut self) {
         let error = self.end.take().unwrap_or_else(|| Some("the client went away before the load ended".into()));
-        let line = || crate::audit::rows(&self.app, self.door, &self.table, error, false, self.start.elapsed());
-        match self.who.clone() {
-            Some(w) => crate::auth::WHO.sync_scope(w, line),
-            None => line(),
-        }
+        crate::audit::rows(&self.app, &self.who, self.door, &self.table, error, false, self.start.elapsed());
     }
 }
 

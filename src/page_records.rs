@@ -347,11 +347,12 @@ pub async fn record(app: &App, who: &Principal, batch: Batch) {
         }
     }
     let lines: Vec<Recorded> = batch.lines.into_iter().take(admit.take).map(recorded).collect();
+    let page = as_page(who);
     crate::auth::WHO
-        .scope(as_page(who), async move {
+        .scope(page.clone(), async move {
             for r in lines {
-                audit::page_statement(app, r.class, &r.statement, r.outcome, r.error.clone(), r.ms);
-                history::page_ended(app, r.class, &r.statement, r.outcome, r.error, Duration::from_millis(r.ms as u64));
+                audit::page_statement(app, &page, r.class, &r.statement, r.outcome, r.error.clone(), r.ms);
+                history::page_ended(app, &page, r.class, &r.statement, r.outcome, r.error, Duration::from_millis(r.ms as u64));
             }
         })
         .await;
