@@ -756,10 +756,6 @@ impl crate::lake_state::LakeState for Listed {
     fn make() -> Self { Listed::default() }
 }
 
-/// Pondra's own extensions, as a built-in one: the lake keeps what `listed` read (`Listed`).
-#[cfg(feature = "lake")]
-pub static EXT_HOST: crate::registry::BuiltIn = crate::registry::BuiltIn { name: "ext_host", requires: &[], register: |r| r.section_mut::<crate::lake_state::Registered>().add::<Listed>() };
-
 /// The installed extensions with their records, by name: read again only after a commit, as `routines::listed` is (every
 /// query asks, some twice).
 #[cfg(feature = "lake")]
@@ -796,12 +792,16 @@ fn file_of(from: &str) -> String {
     from.split(['?', '#']).next().unwrap_or(from).rsplit('/').next().unwrap_or(from).to_string()
 }
 
-/// The host of installed extensions (`ext_host`), as an extension: it gives each lake's sessions `extensions()`.
+/// The host of installed extensions (`ext_host`), as an extension: it gives each lake's sessions `extensions()`, and the
+/// lake keeps what `listed` read (`Listed`).
 #[cfg(feature = "lake")]
 pub static EXT_HOST: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "ext_host",
     requires: &["engine"],
-    register: |r| r.section_mut::<crate::engine::LakeFunctions>().add("extensions", register),
+    register: |r| {
+        r.section_mut::<crate::engine::LakeFunctions>().add("extensions", register);
+        r.section_mut::<crate::lake_state::Registered>().add::<Listed>();
+    },
 };
 
 /// `extensions()`: each extension's name, version, file's hash and size, where it came from, who installed it and when, and
