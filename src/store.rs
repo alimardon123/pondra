@@ -2361,7 +2361,7 @@ impl Lake {
         crate::oom::wake();
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
-            crate::panics::spawn(Lake::commits(Arc::downgrade(&lake), writes, lake.node.life.clone())); // (weak: a lake opened in a process goes when its last handle does)
+            crate::spawns::spawn(Lake::commits(Arc::downgrade(&lake), writes, lake.node.life.clone())); // (weak: a lake opened in a process goes when its last handle does)
         }
         Ok(lake)
     }
@@ -2376,7 +2376,7 @@ impl Lake {
     async fn commits(me: std::sync::Weak<Self>, mut writes: mpsc::UnboundedReceiver<Write>, life: Life) {
         let (to_bucket, mut in_bucket) = mpsc::unbounded_channel::<(Arc<dyn Written>, u64)>();
         let (lake, lives) = (me.clone(), life.clone());
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             while let Some((handle, id)) = in_bucket.recv().await {
                 if let Err(e) = handle.durable().await {
                     eprintln!("catalog commit failed: {e}");
@@ -3273,7 +3273,7 @@ impl Drop for Catalog {
             return; // (no runtime: it ended, and SlateDB's tasks with it)
         }
         let kv = self.kv.clone();
-        crate::panics::task(async move {
+        crate::spawns::task(async move {
             let _ = kv.close().await;
         });
     }
@@ -4130,7 +4130,7 @@ impl Stages {
 
     /// How late a 10 ms sleep wakes, as the `lag` stage, while the catalog is (weak: it ends with it).
     fn sample_lag(stages: Weak<Stages>) {
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             loop {
                 let t = Instant::now();
                 tokio::time::sleep(Duration::from_millis(10)).await;

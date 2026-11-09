@@ -818,7 +818,7 @@ pub fn schedule(app: App) {
                 running.lock().unwrap().insert(name.clone());
                 let (app, name, task) = (app.clone(), name.clone(), task.clone());
                 let ran = Ran(running.clone(), name.clone()); // (let go even if the tick panics: else it never ran again here)
-                crate::panics::task(async move {
+                crate::spawns::task(async move {
                     // (as the task's owner, an asked run only when the owner asked: `Tick::as_owner`; the node's own work, which
                     // no request asked for: `auth::as_node`)
                     crate::auth::as_node(crate::ext::scope(as_owner, run_tick(&app, &name, &task, tick))).await;
