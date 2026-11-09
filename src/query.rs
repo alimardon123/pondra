@@ -184,7 +184,7 @@ async fn tail_rows(lake: &Lake, table: &str, after: u64, upto: Option<u64>, keye
         return Ok(vec![]); // (a slice of a spread query that reads no log)
     }
     let of = (after, format!("{keyed} {sys} {:?}", s.fields()));
-    let kept = lake.tails.lock().unwrap().get(table).and_then(|forms| forms.iter().find(|t| t.of == of).cloned());
+    let kept = lake.tails().lock().unwrap().get(table).and_then(|forms| forms.iter().find(|t| t.of == of).cloned());
     if let (Some(t), Some(u)) = (&kept, upto) {
         if u <= t.through {
             return Ok(t.upto(u));
@@ -196,7 +196,7 @@ async fn tail_rows(lake: &Lake, table: &str, after: u64, upto: Option<u64>, keye
     t.through = t.through.max(seen);
     let rows = t.upto(upto.unwrap_or(u64::MAX));
     if t.bytes <= TAILS {
-        keep(&mut lake.tails.lock().unwrap(), table, Arc::new(t));
+        keep(&mut lake.tails().lock().unwrap(), table, Arc::new(t));
     }
     Ok(rows)
 }
@@ -233,6 +233,22 @@ pub type Tails = crate::ledger::ByteLru<String, Vec<Arc<Tail>>>;
 
 /// An empty `Tails`, holding at most `TAILS`.
 pub fn tails() -> Tails { Tails::new(TAILS) }
+
+/// A lake's tables' tails, made as it opens (`lake_state::Registered::add_at_open`): its caches give memory back in the
+/// order it lists them (`Lake::caches`), and every query of a table reads them.
+impl crate::lake_state::LakeState for std::sync::Mutex<Tails> {
+    const NAME: &'static str = "tails";
+    const ABOUT: &'static str = "tables' tails as queries read them: by table, one a form";
+
+    fn make() -> Self { std::sync::Mutex::new(tails()) }
+
+    fn cache(self: Arc<Self>) -> Option<Arc<dyn crate::ledger::Charged>> { Some(self) }
+}
+
+impl Lake {
+    /// This lake's tables' tails as queries read them (`Tails`).
+    pub fn tails(&self) -> Arc<std::sync::Mutex<Tails>> { self.state::<std::sync::Mutex<Tails>>().expect("the engine keeps a lake's tails (`engine::ENGINE`)") }
+}
 
 /// All rows of a table (files ∪ tail up to `upto`); upsert tables carry `_ord` (0 for files).
 pub async fn raw(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<DataFrame> {
@@ -331,7 +347,7 @@ pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
 /// Parquet files as one read: through the hot columns (`hot.rs`) when they're on, which read a
 /// file with a lineage or deleted rows as `files_once` does.
 async fn read_files(lake: &Lake, ctx: &SessionContext, files: Vec<&DataFile>, meta: &TableMeta, schema: &SchemaRef) -> Result<DataFrame> {
-    if !lake.hot.on() {
+    if !lake.hot().on() {
         return files_once(lake, ctx, &files, meta, schema).await;
     }
     Ok(ctx.read_table(Arc::new(hot_files(lake, files.into_iter().cloned().collect(), meta, schema, Default::default())))?)
@@ -895,7 +911,7 @@ impl TableProvider for Pruned {
             changed = self.lake.cat.get_raw(&crate::store::table_key(&crate::sys::deleted(&self.name))).await.map_err(e)?.is_some();
         }
         let all: Vec<usize> = (0..self.facts.schema.fields().len()).collect();
-        let plain = !changed && range.is_none() && self.meta.key.is_empty() && self.meta.ext.is_none() && self.lake.hot.on();
+        let plain = !changed && range.is_none() && self.meta.key.is_empty() && self.meta.ext.is_none() && self.lake.hot().on();
         let plan = match plain {
             true => {
                 let known = self.sized().1;
