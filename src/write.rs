@@ -2983,6 +2983,8 @@ pub(crate) mod was {
             "CREATE DATABASE IF NOT EXISTS b LOCATION '/x/y''s' CLONE a WITH (schemas = (s1, \"S2\")) WITH NO DATA",
             "CREATE DATABASE b CLONE a WITH NO DATA WITH (schemas = (s))", "CREATE DATABASE b LOCATION 'dir'", "CREATE DATABASE IF NOT EXISTS \"B\" LOCATION 'dir'",
             "ALTER DATABASE b REFRESH", "ALTER DATABASE b REFRESH t, s.u", "ALTER DATABASE \"M\" SET LOCATION '/tmp/x''y'",
+            "ALTER DATABASE pondra-ab12 SET LOCATION '/x'", "alter database pondra-1a2b refresh", "ALTER DATABASE My-Lake_2 SET (protected = true)",
+            "CREATE DATABASE dev-2 CLONE pondra-ab12", "BACKUP DATABASE pondra-ab12 TO '/b'", "RESTORE DATABASE pondra-x9-2 FROM '/b'",
             "ALTER DATABASE prod SET (protected = false)", "alter database prod set (PROTECTED = TRUE);",
             "BACKUP DATABASE TO 's3://b/x'", "BACKUP DATABASE prod TO '/b' WITH (retention_days = 3)", "BACKUP DATABASE prod TO '/b' WITH (retention_days = 99999999999999999999999)",
             "BACKUP DATABASE prod", "BACKUP DATABASE prod TO '/b' WITH (days = 3)", "RESTORE DATABASE p FROM '/b'", "RESTORE DATABASE p FROM '/b' LOCATION '/c' AT (TIMESTAMP => '2026-10-12 03:00:00')",

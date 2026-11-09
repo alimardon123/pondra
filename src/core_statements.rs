@@ -73,8 +73,9 @@ fn if_not_exists(w: &mut Words) -> Result<bool> {
     Ok(true)
 }
 
-/// A database's name: one part (`b`, `"B"`), unquoted in lower case, as `text::object_of` reads one.
-fn database(w: &mut Words) -> Result<String> { w.part().map_err(|_| anyhow::anyhow!("expected a database's name {}", w.near())) }
+/// A database's name: one part (`b`, `"B"`), unquoted in lower case, as `text::object_of` reads one, or written with `-`
+/// as a lake's folder names it (`pondra-ab12`: `Words::joined`).
+fn database(w: &mut Words) -> Result<String> { w.joined().map_err(|_| anyhow::anyhow!("expected a database's name {}", w.near())) }
 
 /// `CREATE OR REPLACE SCHEMA | DATABASE | USER | ROLE`, where replacing one would lose what it holds: refused, saying why
 /// (and SHARE and RECIPIENT, the sharing extension's: `shares::ENTRIES`).
@@ -288,5 +289,25 @@ mod tests {
     fn the_core_entries_on_stand_ins_are_counted() {
         let s = crate::registry::get().section::<Statements>();
         assert_eq!((ENTRIES.len(), s.stand_ins()), (31, 43), "the core's 31, the sharing extension's 8 and the identity providers' 4");
+    }
+
+    /// A lake on disk is named after its folder (`pondra-ab12`), and ALTER DATABASE, CLONE, BACKUP and RESTORE take the
+    /// name so, as their regexes did: written with `-` and no space or comment beside it. A `-` with one ends the name.
+    #[test]
+    fn a_database_is_named_as_its_folder() {
+        let name = |sql: &str| Words::of(sql).and_then(|mut w| w.joined().ok().map(|n| (n, w.near())));
+        let read = |n: &str, near: &str| Some((n.to_string(), near.to_string()));
+        assert_eq!(name("pondra-ab12 SET"), read("pondra-ab12", "near set"));
+        assert_eq!(name("pondra-1a2b SET"), read("pondra-1a2b", "near set"), "a number then a word, as the tokenizer splits them");
+        assert_eq!(name("My-Lake_2-9"), read("my-lake_2-9", "at the end"));
+        assert_eq!(name("\"a-B\" SET"), read("a-B", "near set"));
+        for sql in ["a - b", "a -b", "a- b", "a/* c */-b", "a-"] {
+            assert_eq!(name(sql), read("a", "near -"), "{sql}");
+        }
+        assert_eq!(name("1-a"), None);
+        match crate::write::parse("ALTER DATABASE pondra-ab12 SET LOCATION '/x'") {
+            Some(Stmt::Ddl(d)) => assert!(matches!(&d[..], [Ddl::SetLocation { database, to }] if database == "pondra-ab12" && to == "/x")),
+            _ => panic!("ALTER DATABASE pondra-ab12 SET LOCATION: read"),
+        }
     }
 }

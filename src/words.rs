@@ -4,8 +4,16 @@
 //! of a statement family onto them (l6/step8-pr8-plan.md).
 use anyhow::{bail, Result};
 
-/// A statement's tokens, last first (`next` takes the one after those taken).
-pub struct Words(pub(crate) Vec<W>);
+/// A statement's tokens, last first (`next` takes the one after those taken), and where each is in the text.
+#[derive(Default)]
+pub struct Words(pub(crate) Vec<W>, Spans);
+
+/// Where each of a statement's words starts and ends in its text, in order: which are written together (`joined`).
+#[derive(Default)]
+pub(crate) struct Spans {
+    starts: Vec<usize>,
+    ends: Vec<usize>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum W {
@@ -28,8 +36,8 @@ impl Words {
     pub(crate) fn of(sql: &str) -> Option<Words> {
         use datafusion::sql::sqlparser::tokenizer::Token;
         let tokens = crate::text::tokens(sql)?;
-        let mut out = vec![];
-        for t in tokens.solid_refs() {
+        let (mut out, mut starts, mut ends) = (vec![], vec![], vec![]);
+        for crate::text::Solid { token: t, start, end } in tokens.solid() {
             out.push(match t {
                 Token::Word(w) if w.quote_style.is_some() => W::Word(w.value.clone(), true),
                 Token::Word(w) => W::Word(w.value.to_lowercase(), false),
@@ -41,12 +49,48 @@ impl Words {
                 Token::Period => W::Sym('.'),
                 Token::Eq => W::Sym('='),
                 Token::RArrow => W::Sym('⇒'), // (`=>`)
+                Token::Minus => W::Sym('-'),
                 Token::SemiColon => continue,
                 _ => W::Sym('?'),
             });
+            starts.push(start);
+            ends.push(end);
         }
         out.reverse(); // (taken from the end: the next is the last)
-        Some(Words(out))
+        Some(Words(out, Spans { starts, ends }))
+    }
+    /// Whether the word `k` after the next is written right after the one before it, with no space or comment between.
+    fn tight(&self, k: usize) -> bool {
+        let Spans { starts, ends } = &self.1;
+        let i = starts.len() - self.0.len() + k; // (its place among all the statement's words)
+        i > 0 && i < starts.len() && starts[i] == ends[i - 1]
+    }
+    /// A name that may be written as one word with `-` in it, as a lake's name is its folder's (`pondra-ab12`): the next
+    /// part (`part`), and the words, numbers and `-` written right after it with no space or comment between. A quoted
+    /// part is the whole name, and a `-` ends none.
+    pub(crate) fn joined(&mut self) -> Result<String> {
+        let quoted = matches!(self.0.last(), Some(W::Word(_, true)));
+        let mut name = self.part()?;
+        let piece = |w: Option<&W>| match w {
+            Some(W::Word(w, false)) => Some(w.clone()),
+            Some(W::Num(n)) if n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => Some(n.clone()),
+            _ => None,
+        };
+        while !quoted && self.tight(0) {
+            let n = self.0.len();
+            let dash = matches!(self.0.last(), Some(W::Sym('-'))) && self.tight(1);
+            if let Some(p) = piece(self.0.last()) {
+                name.push_str(&p); // (a word after a number, as the tokenizer splits `1a2b`)
+                self.0.pop();
+            } else if let (true, Some(p)) = (dash, n.checked_sub(2).and_then(|k| piece(self.0.get(k)))) {
+                name.push('-');
+                name.push_str(&p);
+                self.0.truncate(n - 2);
+            } else {
+                break;
+            }
+        }
+        Ok(name)
     }
     pub(crate) fn peek_word(&self) -> Option<String> { self.0.last().map(|w| w.word()) }
     pub(crate) fn next(&mut self) -> Option<W> { self.0.pop() }
