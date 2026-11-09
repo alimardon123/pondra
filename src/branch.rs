@@ -639,7 +639,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     // (what a branch never takes: the kinds the registry marks `Leave` (a secret, a share and a
     // recipient, with their comments: a branch hands nothing to another company), and the catalog's
     // own keys, which no kind has)
-    let mut deny: Vec<String> = ["z/", "x/", "i/", "dt/", "jt/", "pn/", "fd/", "s/", "d/"].iter().map(|p| p.to_string()).collect();
+    let mut deny: Vec<String> = ["z/", "x/", "i/", "dt/", "dk/", "jt/", "pn/", "fd/", "s/", "d/"].iter().map(|p| p.to_string()).collect();
     for k in all_kinds().filter(|k| k.on_clone == OnClone::Leave) {
         deny.push(k.prefix.to_string());
         deny.push(format!("cm/{}/", k.family));
