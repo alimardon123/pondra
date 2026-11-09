@@ -204,8 +204,12 @@ fn may_in(who: &Principal, action: Action, object: Object, sql: bool) -> Result<
     }
     // (a load's rows replace their keys' rows or delete them, unread: a writer some of whose rows its grants hide changes them
     // with SQL, which reads them through the filter, so it never replaces or deletes a row it can't read)
-    if granted && !sql && matches!(action, Action::Update | Action::Delete) && a.rows("select", &table, false).is_some() {
-        return Err(Refusal::new(format!("permission denied: {table} shows {} some of its rows only (a filter on its rows in a grant): change them with SQL's UPDATE, DELETE, MERGE or INSERT … ON CONFLICT", who.name)));
+    if granted && !sql && matches!(action, Action::Update | Action::Delete) && [privilege, "select"].iter().any(|p| a.rows(p, &table, false).is_some()) {
+        let held = match a.rows("select", &table, false) {
+            Some(_) => format!("shows {} some of its rows only", who.name),
+            None => format!("lets {} {privilege} some of its rows only", who.name),
+        };
+        return Err(Refusal::new(format!("permission denied: {table} {held} (a filter on its rows in a grant): change them with SQL's UPDATE, DELETE, MERGE or INSERT … ON CONFLICT")));
     }
     if granted {
         return Ok(());
@@ -281,6 +285,7 @@ pub struct Scope {
     access: Option<std::sync::Arc<crate::users::Access>>,
     asker: Option<std::sync::Arc<Asker>>, // (None: made without a principal, which names no one and is no superuser's)
     key: Option<std::sync::Arc<str>>, // (`key` when its grants filter rows: theirs with its reader filled in; None: `Access::key`)
+    writing: Option<std::sync::Arc<(String, String)>>, // (a write's table and its privilege's filter on its rows, ANDed to SELECT's: `writing`)
 }
 
 /// Who a scope is for, as planning asks it (`pondra.history`'s rows, `pondra.audit`): its principal's name, whether that
@@ -306,15 +311,15 @@ pub fn scope() -> Scope {
 impl Scope {
     /// Everything, this lake's and the lakes attached to it: a token's, a superuser's, an open node's, and the node's own
     /// work's (`auth::Principal::node`). `tools/scope_check.py` counts where one is made.
-    pub fn everything() -> Scope { Scope { access: None, asker: None, key: None } }
+    pub fn everything() -> Scope { Scope { access: None, asker: None, key: None, writing: None } }
 
     /// Nothing: no table, column, name or code. Whoever isn't signed in (`Principal::of(Role::None)`), and work with no
     /// caller that isn't the node's own (`scope`).
-    pub fn nothing() -> Scope { Scope { access: Some(std::sync::Arc::new(Default::default())), asker: None, key: None } }
+    pub fn nothing() -> Scope { Scope { access: Some(std::sync::Arc::new(Default::default())), asker: None, key: None, writing: None } }
 
     /// What a user who isn't a superuser may see: what `access` grants it (`users::principal_with` makes it once, as the
     /// principal is made).
-    pub fn granted(access: std::sync::Arc<crate::users::Access>) -> Scope { Scope { access: Some(access), asker: None, key: None } }
+    pub fn granted(access: std::sync::Arc<crate::users::Access>) -> Scope { Scope { access: Some(access), asker: None, key: None, writing: None } }
 
     /// The scope a planning session was made for (`query::session_for`): the session carries it to everything planned in it
     /// (a `SessionConfig` extension), so no planning reads the task's caller. A session made without one sees nothing: it
@@ -345,7 +350,7 @@ impl Scope {
             filled.dedup();
             crate::users::sha256(&serde_json::to_string(&(a.key(), filled)).unwrap_or_default())[..32].into()
         });
-        Scope { access: self.access.clone(), asker: Some(std::sync::Arc::new(asker)), key }
+        Scope { access: self.access.clone(), asker: Some(std::sync::Arc::new(asker)), key, writing: None }
     }
 
     /// Is it a superuser's (`pondra.audit`, every row of `pondra.history`)? Whole, and its principal an admin. Never whole
@@ -382,6 +387,31 @@ impl Scope {
     pub fn rows_named(&self, privilege: &str, table: &str) -> Option<String> { self.rows_of(privilege, table, true) }
 
     fn rows_of(&self, privilege: &str, table: &str, named: bool) -> Option<String> {
+        let granted = self.granted_rows(privilege, table, named);
+        match self.writing.as_deref() {
+            Some((t, also)) if privilege == "select" && !named && t == table => Some(match granted {
+                Some(read) => format!("({read}) AND ({also})"),
+                None => also.clone(),
+            }),
+            _ => granted,
+        }
+    }
+
+    /// The scope a write reads the rows of `table` it changes with (`change::rows_of`): its SELECT filter on them and
+    /// `privilege`'s (UPDATE's or DELETE's, step 6 piece 5c) together, so it changes only rows both hold, and its own
+    /// conditions run on those only (`query::Guarded`, its barrier). Every read of `table` it plans takes both, a
+    /// subquery's too. Itself when `privilege` has no filter on `table`. Its key is its own: no answer is shared with a read's.
+    pub fn writing(&self, privilege: &str, table: &str) -> Scope {
+        let Some(also) = self.rows(privilege, table) else { return self.clone() };
+        let key = crate::users::sha256(&serde_json::to_string(&(self.key(), privilege, table, &also)).unwrap_or_default())[..32].into();
+        Scope { key: Some(key), writing: Some(std::sync::Arc::new((table.to_string(), also))), ..self.clone() }
+    }
+
+    /// Does a grant filter the rows of `table` it may use, for any privilege? Then a write of it is planned, so each filter
+    /// reads the rows it changes: never a key's row read without planning (`txn::point_change`, `upsert_point`).
+    pub fn filtered(&self, table: &str) -> bool { ["select", "insert", "update", "delete"].iter().any(|p| self.rows(p, table).is_some()) }
+
+    fn granted_rows(&self, privilege: &str, table: &str, named: bool) -> Option<String> {
         let filters = self.access.as_ref()?.rows(privilege, table, named)?;
         let reader = self.asker.as_ref().map(|a| a.name.as_str());
         let filled: Vec<String> = filters.iter().map(|f| crate::row_filter::filled(f, reader)).collect();
@@ -703,6 +733,20 @@ mod tests {
             assert_eq!(said(may_in(&writer, action, Object::Table("t"), true)), "ok", "SQL's change reads them through the filter");
         }
         assert_eq!(said(may(&writer, Action::Insert, Object::Table("t"))), "ok", "a load's new rows change no row");
+
+        // (UPDATE's and DELETE's filters, piece 5c-1: a write reads its rows with SELECT's and its own together)
+        let editor = as_("ann", &access(vec![grant("select", t(), Some("dept = 'x'")), grant("update", t(), Some("owner = current_user")), grant("delete", t(), None)]));
+        let writing = editor.scope.writing("update", "t");
+        assert_eq!(writing.rows("select", "t").as_deref(), Some("(dept = 'x') AND (owner = 'ann')"));
+        assert_eq!(writing.rows("select", "u"), None, "another table's reads are as before");
+        assert_eq!(writing.rows("update", "t").as_deref(), Some("owner = 'ann'"));
+        assert_ne!(writing.key(), editor.scope.key(), "no answer is shared with a read's");
+        assert_eq!(editor.scope.writing("delete", "t").key(), editor.scope.key(), "no filter on DELETE's rows: the scope itself");
+        let updater = as_("ann", &access(vec![grant("select", t(), None), grant("update", t(), Some("owner = current_user"))]));
+        assert_eq!(updater.scope.writing("update", "t").rows("select", "t").as_deref(), Some("owner = 'ann'"));
+        assert!(editor.scope.filtered("t") && updater.scope.filtered("t") && !updater.scope.filtered("u") && !Principal::node().scope.filtered("t"));
+        assert_eq!(said(may(&updater, Action::Update, Object::Table("t"))), "permission denied: t lets ann update some of its rows only (a filter on its rows in a grant): change them with SQL's UPDATE, DELETE, MERGE or INSERT … ON CONFLICT");
+        assert_eq!(said(may_in(&updater, Action::Update, Object::Table("t"), true)), "ok");
         assert!(!ann.scope.reads("t", ["owner"].into_iter()), "a key lookup: SQL answers it, through its filter");
         assert!(as_("ann", &plain).scope.reads("t", ["owner"].into_iter()));
     }

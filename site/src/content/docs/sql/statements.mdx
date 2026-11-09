@@ -943,7 +943,7 @@ offer …`); a later 1.x keeps offering these, so a file built for this one keep
 | Change one | `ALTER USER name [WITH] PASSWORD '…' \| SUPERUSER \| NOSUPERUSER \| MAX_QUERIES n \| STATEMENT_TIMEOUT '…'` (`0`: no limit); `ALTER ROLE` takes the same words |
 | Drop one | `DROP USER [IF EXISTS] name`, `DROP ROLE [IF EXISTS] name` |
 | Grant | `GRANT SELECT [(col, …)] \| INSERT \| UPDATE \| DELETE \| ALL [PRIVILEGES] ON [TABLE] t \| SCHEMA s \| ALL TABLES [IN SCHEMA s] TO name, …` (Snowflake's `TO ROLE name` is the same) |
-| Grant some rows | `GRANT SELECT [(col, …)] ON [TABLE] t TO name, … WHERE condition`: only the rows where `condition` holds, over the table's own columns, literals, immutable functions and `current_user`, the reader ([rows](/pondra/guides/security/#a-grants-rows)) |
+| Grant some rows | `GRANT SELECT [(col, …)] ON [TABLE] t TO name, … WHERE condition`: only the rows where `condition` holds, over the table's own columns, literals, immutable functions and `current_user`, the reader; `GRANT UPDATE` or `DELETE … WHERE condition`: the rows a writer changes, and an UPDATE's new versions ([rows](/pondra/guides/security/#a-grants-rows)) |
 | Grant a secret | `GRANT USAGE ON SECRET s TO name, …` |
 | Let someone branch a database | `GRANT CLONE ON DATABASE d \| SCHEMA s TO name, …`: a user makes branches of it, and owns each (it or an admin drops it); another server's token pins a branch of those schemas and does nothing else |
 | Let a user apply a project | `GRANT APPLY ON DATABASE d TO name, …`: applies to the database (`pondra apply`, `CALL apply`) without being an admin; on a protected database, only a holder or the node's operator may apply ([protected production](/pondra/guides/projects/#protected-production)) |

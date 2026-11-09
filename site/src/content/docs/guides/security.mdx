@@ -349,7 +349,7 @@ print(ann.sql("SELECT id FROM regional ORDER BY id").rows())
   (or `current_role`, `session_user`), which is whoever reads. No subquery, aggregate, window, parameter or function
   that may answer otherwise each time (`random()`, `now()`). It is checked when it is granted, and kept as written
   again from its parse (`pondra.grants` shows it, in the `rows` column).
-- It is a table's, and SELECT's: on a view, a schema, every table, or for INSERT, UPDATE or DELETE it is refused.
+- It is a table's, for SELECT, UPDATE or DELETE: on a view, a schema or every table, or for INSERT, it is refused.
 - A reader's grants on one table add up: the rows any of their filters holds for, and every row if one grant has
   none. Columns add up apart from rows, as in Postgres, so a grant of other columns with no filter shows every row
   of those columns.
@@ -362,6 +362,11 @@ print(ann.sql("SELECT id FROM regional ORDER BY id").rows())
   an insert of a key a hidden row holds is refused as any taken key is (23505), so that row isn't replaced. A load
   whose rows replace their keys' rows (COPY, Flight or Kafka into a keyed table) is refused to them, naming SQL's ways,
   and so is an INSERT into a merge table, whose rows add up by key as they're read.
+- UPDATE's and DELETE's own filters (`GRANT UPDATE ON t TO r WHERE condition`) say which rows a writer changes: its
+  UPDATE or DELETE changes the rows both its SELECT filter and that one hold, and leaves the rest as they are, as
+  Postgres's policy `USING` does; a MERGE's UPDATE and DELETE clauses keep theirs. An UPDATE whose new version its
+  filter doesn't hold is refused (42501), as Postgres's `WITH CHECK`. A subquery of the same table in the statement
+  reads those rows too.
 - `REVOKE … WHERE condition` takes back the grant of that filter only; `REVOKE` without one, every grant of the
   privilege.
 - `CREATE POLICY` and `ALTER TABLE … ROW LEVEL SECURITY` are refused, naming this: a table no grant filters is read

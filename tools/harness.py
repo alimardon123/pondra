@@ -12077,9 +12077,9 @@ def row_filters():
         and keyed["upsert shown"].get("rows") == 1 and keyed["upserted"] == [{"id": 1, "region": "eu", "v": 5}, {"id": 2, "region": "us", "v": 0}]
     # ... nor does a load: its rows replace their keys' rows unread (a keyed table), so it is refused, naming SQL's ways;
     # a load's new rows into a table without a key change no row, so they go in
-    def copied(table, line):
+    def copied(table, line, user="ann"):
         try:
-            with pg("ann", "ann-password-1") as c, c.cursor().copy(f"COPY {table} FROM STDIN") as cp:
+            with pg(user, f"{user}-password-1") as c, c.cursor().copy(f"COPY {table} FROM STDIN") as cp:
                 cp.write(line)
             return "copied"
         except Exception as e:
@@ -12104,6 +12104,38 @@ def row_filters():
     checks["... nor an INSERT into a merge table, whose rows add up by key: refused (42501), in a transaction too"] = \
         keyed["merge table"].startswith("ERROR 403") and "is a merge table" in keyed["merge table"] and "42501" in keyed["merge table begun"][1] \
         and "is a merge table" in keyed["merge table begun"][1] and keyed["summed"] == [{"region": "eu", "amount": 1}, {"region": "us", "amount": 1}]
+    # A writer's filters on UPDATE's and DELETE's rows (piece 5c-1): its UPDATE changes the rows its UPDATE filter holds (and its
+    # SELECT filter, none here) and leaves the rest, and a new version its filter doesn't hold is refused (Postgres's WITH
+    # CHECK); its DELETE takes the rows its DELETE filter holds; a MERGE's clause keeps its action's filter; a one-key UPDATE
+    # is planned, so it holds there too; a load whose rows replace their keys' is refused; pondra.grants shows them
+    for q in ["CREATE USER dee PASSWORD 'dee-password-1'", "CREATE TABLE w (id BIGINT, region VARCHAR, v BIGINT)",
+              "INSERT INTO w VALUES (1, 'eu', 1), (2, 'eu', 9), (3, 'us', 1), (4, 'us', 9)",
+              "CREATE TABLE wk (id BIGINT PRIMARY KEY, region VARCHAR, v BIGINT)", "INSERT INTO wk VALUES (1, 'eu', 0), (2, 'us', 0)",
+              "GRANT SELECT ON w TO dee", "GRANT SELECT ON wk TO dee", "GRANT UPDATE ON w TO dee WHERE region = 'eu'",
+              "GRANT DELETE ON w TO dee WHERE v > 5", "GRANT UPDATE ON wk TO dee WHERE region = 'eu'", "GRANT INSERT ON wk TO dee"]:
+        r = as_(boss, q)
+        assert "ERROR" not in str(r), (q, r)
+    dee = basic("dee", "dee-password-1")
+    n_of = lambda r: r.get("rows") if isinstance(r, dict) else r
+    wrote = {"update": n_of(as_(dee, "UPDATE w SET v = v + 10")), "moved": as_(dee, "UPDATE w SET region = 'us' WHERE id = 1"),
+             "after update": as_(boss, "SELECT id, region, v FROM w ORDER BY id")}
+    wrote.update({"merge": n_of(as_(dee, "MERGE INTO w USING (SELECT 3 AS id UNION ALL SELECT 1) AS s ON w.id = s.id WHEN MATCHED THEN UPDATE SET v = 0")),
+                  "after merge": as_(boss, "SELECT id, v FROM w ORDER BY id")})
+    wrote.update({"delete": n_of(as_(dee, "DELETE FROM w")), "after delete": ids(as_(boss, "SELECT id FROM w ORDER BY id")),
+                  "one key hidden": n_of(as_(dee, "UPDATE wk SET v = 1 WHERE id = 2")), "one key": n_of(as_(dee, "UPDATE wk SET v = 1 WHERE id = 1")),
+                  "load": copied("wk", "2\tus\t5\n", "dee"), "after keyed": as_(boss, "SELECT id, region, v FROM wk ORDER BY id"),
+                  "grants": as_(dee, "SELECT privilege, on_name, rows FROM pondra.grants WHERE grantee = 'dee' AND rows IS NOT NULL ORDER BY privilege, on_name")})
+    checks["a writer's UPDATE changes the rows its UPDATE filter holds only, and a new version outside it is refused (42501)"] = \
+        wrote["update"] == 2 and wrote["moved"].startswith("ERROR 403") and "new row violates the filter on w's rows" in wrote["moved"] \
+        and wrote["after update"] == [{"id": 1, "region": "eu", "v": 11}, {"id": 2, "region": "eu", "v": 19}, {"id": 3, "region": "us", "v": 1}, {"id": 4, "region": "us", "v": 9}]
+    checks["...a MERGE's UPDATE keeps it, and a DELETE takes the rows its DELETE filter holds only"] = \
+        wrote["merge"] == 1 and wrote["after merge"] == [{"id": 1, "v": 0}, {"id": 2, "v": 19}, {"id": 3, "v": 1}, {"id": 4, "v": 9}] \
+        and wrote["delete"] == 2 and wrote["after delete"] == [1, 3]
+    checks["...a one-key UPDATE keeps it too, a load replacing rows is refused naming SQL's ways, and pondra.grants shows them"] = \
+        wrote["one key hidden"] == 0 and wrote["one key"] == 1 and "42501" in wrote["load"] and "with SQL's UPDATE" in wrote["load"] \
+        and wrote["after keyed"] == [{"id": 1, "region": "eu", "v": 1}, {"id": 2, "region": "us", "v": 0}] \
+        and wrote["grants"] == [{"privilege": "DELETE", "on_name": "w", "rows": "v > 5"}, {"privilege": "UPDATE", "on_name": "w", "rows": "region = 'eu'"},
+                                {"privilege": "UPDATE", "on_name": "wk", "rows": "region = 'eu'"}]
     # Refused, saying why
     b = pg("boss", "boss-password-1")
     refused = {
@@ -12126,7 +12158,7 @@ def row_filters():
     checks["under a search path a grant's table is the path's, and its current_user is whoever reads, not whoever grants"] = \
         placed["bob"] == [2] and placed["grants"] == [{"on_name": "crm.orders", "rows": "owner = current_user"}]
     b.close()
-    info = {"said": said, "pg": [before, widened, narrowed, counted], "keyed": keyed, "refused": refused, "pathed": pathed, "placed": placed}
+    info = {"said": said, "pg": [before, widened, narrowed, counted], "keyed": keyed, "wrote": wrote, "refused": refused, "pathed": pathed, "placed": placed}
     a.kill()
     ok = all(v is True for v in checks.values())
     print(json.dumps({"row_filters": checks, "ok": ok, "info": info}, indent=1, default=str))
