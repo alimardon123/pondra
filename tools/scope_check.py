@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from layers import strip_comments  # noqa: E402
 
 KINDS = {
-    "reads": (re.compile(r"\b(?:rights::scope|auth::current)\(\)"), {"auth.rs", "rights.rs"}),
+    "reads": (re.compile(r"\b(?:rights::scope|auth::current)\b"), {"auth.rs", "rights.rs"}),  # (a call, or the function passed as a value)
     "node": (re.compile(r"\b(?:as_node|panics::own)\(|\bPrincipal::node\(\)"), {"auth.rs", "panics.rs"}),
     "whole": (re.compile(r"\bScope::everything\(\)"), {"rights.rs"}),
 }

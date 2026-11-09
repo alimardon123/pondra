@@ -831,7 +831,7 @@ impl Drop for Ran {
 /// try within `timeout`; then its line in the run log, then the tick marked done, with how it went.
 async fn run_tick(app: &App, name: &str, task: &Task, tick: Tick) {
     let job = format!("task:{name}:{}", tick.at);
-    let who = Who { role: Role::Admin, files: false, depth: 0, scope: crate::auth::Principal::node().scope }; // (the schedule's: the node's own)
+    let who = Who { by: None, ..Who::signed(crate::auth::Principal::node(), Role::Admin, false) }; // (the schedule's: the node's own, signed in by no one)
     let none = RecordBatch::new_empty(Arc::new(datafusion::arrow::datatypes::Schema::empty()));
     let id = format!("task-{name}-{}", tick.at); // (a tick run again after a failover is the same run: its row, ended)
     let run = CALLER.sync_scope("schedule".into(), || Run::start(app, name, Role::Admin, Some(&job), &none, Some(id)));

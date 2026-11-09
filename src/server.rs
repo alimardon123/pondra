@@ -58,7 +58,7 @@ pub fn router(app: App) -> Router {
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
         .route("/live", get(crate::live::live).post(crate::live::live))
-        .route("/sessions/{id}", axum::routing::delete(|Path(id): Path<String>| async move { Json(j!({"ended": crate::temp::end(&crate::temp::id(&id))})) }))
+        .route("/sessions/{id}", axum::routing::delete(|Path(id): Path<String>, who: Option<axum::Extension<crate::auth::Principal>>| async move { Json(j!({"ended": crate::temp::end(&crate::temp::id(&who.map(|w| w.0.name).unwrap_or_default(), &id))})) }))
         .route("/sessions/{id}/python", get(session_python).delete(session_python).post(session_python))
         .route("/python", get(list_pythons).put(choose_python))
         .route("/python/format", post(format_python))
@@ -185,8 +185,8 @@ async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result
 /// `GET /sessions/{id}/python`: the variables a session's Python holds, as the console's panel
 /// lists them (none, if it has none yet); `DELETE`: stop it (its variables go; the session's
 /// temporary tables stay), as a notebook's kernel is restarted. An admin's, as Python is.
-async fn session_python(method: axum::http::Method, Path(id): Path<String>, role: axum::Extension<crate::auth::Role>) -> Result<Json<Value>, E> {
-    let id = crate::temp::id(&id); // (as the client's requests name it: its user's)
+async fn session_python(method: axum::http::Method, Path(id): Path<String>, role: axum::Extension<crate::auth::Role>, who: Option<axum::Extension<crate::auth::Principal>>) -> Result<Json<Value>, E> {
+    let id = crate::temp::id(&who.map(|w| w.0.name).unwrap_or_default(), &id); // (as the client's requests name it: its user's)
     if *role < crate::auth::Role::Admin {
         return Err(E(crate::codes::coded("42501", "a session's Python is an admin's, as DO is")));
     }
@@ -857,9 +857,10 @@ struct AppendParams {
 
 /// Body: NDJSON rows, or an Arrow IPC stream (content-type application/vnd.apache.arrow.stream).
 async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, who: Option<axum::Extension<crate::auth::Principal>>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
-    let (start, scope) = (std::time::Instant::now(), scope_of(who));
+    let who = who.map_or_else(|| crate::auth::Principal::of(crate::auth::Role::None), |w| w.0);
+    let (start, scope) = (std::time::Instant::now(), who.scope.clone());
     let (out, unseen) = crate::rights::noting(append_rows(&app, &name, p, headers, body)).await;
-    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
+    crate::audit::rows(&app, &who, "/append", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -917,7 +918,7 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
         }
     })
     .await;
-    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
+    crate::audit::rows(&app, &who, "/insert", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -1164,7 +1165,7 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
 async fn sql(State(app): State<App>, Query(p): Query<crate::statement::SqlParams>, role: axum::Extension<crate::auth::Role>, who: axum::Extension<crate::auth::Principal>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let format = p.format.clone(); // (an answer handed to the door in pieces is sent in this format)
     let node = app.lake.node.clone(); // (an answer in pieces is in flight until its last piece is read: `pieces`)
-    let said = crate::statement::sql(app, p, role.0, who.0.scope, headers, body).await;
+    let said = crate::statement::sql(app, p, role.0, who.0, headers, body).await;
     let mut r = match said.reply {
         Ok(crate::statement::Reply::Rendered(r)) => respond(r, format.as_deref(), &node),
         Ok(crate::statement::Reply::Done(v)) => Json(v).into_response(),
@@ -1212,7 +1213,7 @@ async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extensi
         Some("capture") => Verb::Capture,
         _ => Verb::Apply,
     };
-    let who = crate::routines::Who { role: role.0, files: crate::statement::owner(&app.auth, &headers), depth: 0, scope: who.0.scope };
+    let who = crate::routines::Who::signed(who.0, role.0, crate::statement::owner(&app.auth, &headers));
     Ok(Json(crate::apply::ask(&app, verb, ask, who).await?))
 }
 
