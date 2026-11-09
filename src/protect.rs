@@ -112,7 +112,7 @@ fn touched(stmt: &Stmt) -> Vec<Touch> {
         Stmt::Create(c) => vec![Touch::Object(crate::text::object(&c.name))],
         Stmt::Define(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => vec![Touch::Object(t.clone())],
         Stmt::Ddl(ds) => ds.iter().flat_map(ddl_touches).collect(),
-        Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) => vec![],
+        Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) | Stmt::UndropFile(_) => vec![],
     }
 }
 
@@ -121,6 +121,7 @@ fn ddl_touches(d: &Ddl) -> Vec<Touch> {
     let object = |n: &str| vec![Touch::Object(n.to_string())];
     match d {
         Ddl::UndropKept { kind, name } if kind == "schema" => vec![Touch::Schema(name.clone())],
+        Ddl::UndropKept { kind, .. } if kind == "database" => vec![], // (as a CREATE DATABASE: it changes nothing here)
         Ddl::DropTable { name, .. } | Ddl::Undrop { name } | Ddl::UndropKept { name, .. } | Ddl::Clone { name, .. } | Ddl::CreateView { name, .. } | Ddl::CreateExternal { name, .. }
         | Ddl::CreateMaterialized { name, .. } | Ddl::DropView { name, .. } | Ddl::Attach { name, .. } | Ddl::Detach { name, .. } | Ddl::CreateRoutine { name, .. }
         | Ddl::DropRoutine { name, .. } | Ddl::CreateSecret { name, .. } | Ddl::AttachOutside { name, .. } | Ddl::DropSecret { name, .. } | Ddl::CreateTask { name, .. }

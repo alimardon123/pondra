@@ -518,7 +518,7 @@ async fn refused_at(lake: &Lake, query: &str, file: &str, dialect: Option<Dialec
             .await?
             .into_iter()
             .map(|mut part| {
-                crate::panics::task(async move {
+                crate::spawns::task(async move {
                     while let Some(batch) = part.next().await {
                         batch?; // (dropped as it is read: one batch at a time)
                     }
