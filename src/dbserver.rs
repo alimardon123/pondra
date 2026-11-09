@@ -91,7 +91,7 @@ fn idle() -> Duration { crate::env::secs("PONDRA_DATABASE_IDLE_SECS") }
 /// Does `path` hold lakes rather than be one (`pondra serve data`: each a database)? Not when it
 /// holds one itself, or is new or empty (it becomes a lake).
 pub async fn holds_lakes(path: &str) -> anyhow::Result<bool> {
-    Ok(!is_lake(path).await? && !crate::ddl::lakes_found(path).await.unwrap_or_default().is_empty()) // (dropped ones too: kept, they are still its)
+    Ok(!is_lake(path).await? && !crate::ddl::lakes_found(path, None).await.unwrap_or_default().is_empty()) // (dropped ones too: kept, they are still its)
 }
 
 /// Is there a lake at `dir` (a folder, or a bucket's prefix)? One being made counts: its first
@@ -104,7 +104,7 @@ pub async fn is_lake(dir: &str) -> Result<bool> {
         // other, and a node started at the same moment looked in between)
         return Ok(d.join("catalog").is_dir() || d.join("cluster").is_dir());
     }
-    let store = crate::store::open_store(dir)?.1;
+    let store = crate::store::open_store(dir, None)?.1; // (the database server's own folder or bucket, as the environment reaches it)
     for prefix in ["catalog", "cluster/term"] {
         if futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from(prefix)))).await.transpose()?.is_some() {
             return Ok(true);
@@ -118,7 +118,7 @@ fn place(folder: &str, name: &str) -> String { format!("{}/{name}", folder.trim_
 
 /// The lakes in the folder: its subfolders that hold one, by name.
 async fn databases(folder: &str) -> Vec<String> {
-    match crate::ddl::lakes_in(folder).await {
+    match crate::ddl::lakes_in(folder, None).await {
         Ok(all) => all.into_iter().map(|(n, _)| n).collect(),
         Err(e) => {
             eprintln!("listing the databases in {folder}: {e:#}");
@@ -158,7 +158,7 @@ impl Server {
             }
         }
         let dir = place(&self.folder, name);
-        if let Some(k) = crate::undrop::lake_kept(&dir).await? {
+        if let Some(k) = crate::undrop::lake_kept(&dir, None).await? {
             bail!("database \"{name}\" does not exist: it was dropped, and is kept until {} (UNDROP DATABASE {name} brings it back)", crate::undrop::when(k.until()));
         }
         if !create && !is_lake(&dir).await? {
@@ -231,7 +231,7 @@ impl Server {
     async fn drop_db(&self, name: &str, if_exists: bool, purge: bool, by: &str) -> Result<Value> {
         crate::ddl::check(name)?;
         let dir = place(&self.folder, name);
-        if !is_lake(&dir).await? || crate::undrop::lake_kept(&dir).await?.is_some() {
+        if !is_lake(&dir).await? || crate::undrop::lake_kept(&dir, None).await?.is_some() {
             anyhow::ensure!(if_exists, "database \"{name}\" does not exist");
             return Ok(j!({"database": name, "dropped": false}));
         }
@@ -240,10 +240,10 @@ impl Server {
             let _ = tokio::time::timeout(Duration::from_secs(20), n.child.wait()).await;
         }
         if purge {
-            crate::ddl::delete_lake(&dir).await.with_context(|| format!("database {name}"))?; // (a bucket's prefix: every object under it)
+            crate::ddl::delete_lake(&dir, None).await.with_context(|| format!("database {name}"))?; // (a bucket's prefix: every object under it)
             return Ok(j!({"database": name, "dropped": true}));
         }
-        let kept = crate::undrop::keep_lake(&dir, by).await.with_context(|| format!("database {name}"))?;
+        let kept = crate::undrop::keep_lake(&dir, by, None).await.with_context(|| format!("database {name}"))?;
         Ok(j!({"database": name, "dropped": true, "kept_until": kept.until()}))
     }
 
@@ -252,10 +252,10 @@ impl Server {
     async fn undrop_db(&self, name: &str) -> Result<Value> {
         crate::ddl::check(name)?;
         let dir = place(&self.folder, name);
-        if crate::undrop::lake_kept(&dir).await?.is_none() {
+        if crate::undrop::lake_kept(&dir, None).await?.is_none() {
             return Err(crate::codes::coded("3D000", format!("no dropped database {name} is kept (pondra.dropped lists those that are)")));
         }
-        crate::undrop::unkeep_lake(&dir).await?;
+        crate::undrop::unkeep_lake(&dir, None).await?;
         Ok(j!({"database": name, "undropped": true, "dir": dir}))
     }
 }

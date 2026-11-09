@@ -80,7 +80,7 @@ fn bucket(url: &str, secret: Option<&BTreeMap<String, String>>) -> Result<std::s
 
 /// A folder's files, on this machine: opened as a lake's folder is (`store::open_store`: made if it isn't there, for
 /// COPY … TO '@drop/out/'), which a page refuses by name, having no folders.
-const FOLDER: Option<crate::connections::Opener> = Some(|url, _| Ok(crate::store::open_store(url.strip_prefix("file://").unwrap_or(url))?.1));
+const FOLDER: Option<crate::connections::Opener> = Some(|url, _| Ok(crate::store::open_store(url.strip_prefix("file://").unwrap_or(url), None)?.1));
 
 /// SHOW CREATE CONNECTION's statement: its options as they were given, the secret by its name.
 fn shown(name: &str, def: &Value) -> String {
