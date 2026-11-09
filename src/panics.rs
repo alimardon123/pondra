@@ -5,7 +5,8 @@
 //! - **Doors** run each request in [`door`]: HTTP (`server::guard`), each Postgres statement, and
 //!   each Kafka and Flight connection (its task: a panic ends that connection only); a query's
 //!   request in [`work`], on the queries' runtime when another has run a while.
-//! - **The node's own loops** are started with [`crate::spawns::spawn`]: a panic in one stops the node.
+//! - **The node's own loops** are started with `NodeState::tasks`' `spawn_node(Vital::Stop, …)`: a panic in one stops
+//!   the node.
 //! - DataFusion's own tasks (a query's partitions) hand a panic back to the request that ran them.
 use futures::FutureExt;
 use std::future::Future;
@@ -241,25 +242,9 @@ pub(crate) fn stop_one(now: Instant, margin: usize) -> Option<bool> {
     Some(false)
 }
 
-/// Counts a stop that the request this task's work is part of doesn't come back from (`query::frugally`: its first try
-/// stopped and not run again) on the request's node, whose counters its entry holds. Outside a request, nothing.
-pub(crate) fn stopped_for_memory() {
-    let Ok(id) = REQUEST.try_with(|id| *id) else { return };
-    if let Some(r) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
-        crate::metrics::add(&r.metrics.stopped_for_memory, 1);
-    }
-}
-
 /// How long a request runs before the ones after it go to the queries' runtime: under load a
 /// query's time grows as the cores are shared, so dashboards beside writers pass it at once.
 const LONG: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// Start a loop of the node's own, as [`crate::spawns::spawn`] does: no request asked for it, so it runs as the node's own work
-/// (`auth::as_node`), which a spawned task would otherwise lose. With no caller it would see nothing; this way what it
-/// plans sees what the node holds, whoever's rows it handles (a flush's views, the inbox's statements).
-pub fn own<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
-    crate::spawns::spawn(crate::auth::as_node(f))
-}
 
 /// `pondra_panic()`: a SQL function that panics, for the tests (`PONDRA_TEST_PANICS=1` only).
 pub fn test_function(ctx: &datafusion::prelude::SessionContext) {

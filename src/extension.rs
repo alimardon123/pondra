@@ -780,6 +780,14 @@ fn file_of(from: &str) -> String {
     from.split(['?', '#']).next().unwrap_or(from).rsplit('/').next().unwrap_or(from).to_string()
 }
 
+/// The host of installed extensions (`ext_host`), as an extension: it gives each lake's sessions `extensions()`.
+#[cfg(feature = "lake")]
+pub static EXT_HOST: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "ext_host",
+    requires: &["engine"],
+    register: |r| r.section_mut::<crate::engine::LakeFunctions>().add("extensions", register),
+};
+
 /// `extensions()`: each extension's name, version, file's hash and size, where it came from, who installed it and when, and
 /// whether it is built in (the DuckDB names, with the version `built in`). `SHOW EXTENSIONS` reads it.
 #[cfg(feature = "lake")]

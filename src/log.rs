@@ -334,7 +334,8 @@ impl Log {
         let (tx, mut rx) = mpsc::channel::<Append>(100_000);
         let me = lake.clone();
         let (to, slots) = (Arc::new(to), Arc::new(tokio::sync::Semaphore::new(FLUSHES_IN_FLIGHT)));
-        crate::spawns::spawn(async move {
+        let node = lake.node.clone();
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             let (mut last, mut turn) = (tokio::time::Instant::now(), None);
             while let Some(first) = rx.recv().await {
                 // While all flush slots are busy, appends queue up; then they all go in one flush.
@@ -348,7 +349,8 @@ impl Log {
                 let (done, next) = oneshot::channel();
                 let turn = std::mem::replace(&mut turn, Some(next));
                 // (the node's own work, whoever's rows: the views each flush derives plan under `auth::as_node`)
-                crate::panics::own(async move {
+                let n = lake.node.clone();
+                n.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
                     send(&lake, &to, pending, turn, done).await;
                     drop(slot);
                 });
@@ -399,8 +401,8 @@ impl Log {
     /// The queue both doors use. `made_for` is the table the rows were shaped for, if they were: the rows are checked again
     /// (held forms, then the rules) only when the table is not that one.
     async fn queued(&self, table: String, src: Src, batch: RecordBatch, made_for: Option<Arc<crate::rules::Table>>) -> Result<impl std::future::Future<Output = Result<Ack>> + use<>> {
-        if crate::backup::frozen(&self.lake) {
-            return Err(crate::backup::refused(Some(&self.lake.url))); // (every door's rows: HTTP, Kafka, Flight, COPY)
+        if crate::frozen::frozen(&self.lake) {
+            return Err(crate::frozen::refused(Some(&self.lake.url))); // (every door's rows: HTTP, Kafka, Flight, COPY)
         }
         let batch = match self.lake.cat.meta(&table_key(&table)).await? {
             Some(m) => {
@@ -687,7 +689,8 @@ impl Sequencer {
         let (me, held, tiering) = (lake.clone(), Held::default(), Arc::new(std::sync::atomic::AtomicUsize::new(0)));
         let (holds, tiers) = (held.clone(), tiering.clone());
         let mut producers = Producers::start(&lake, now_ms).await?;
-        crate::spawns::spawn(async move {
+        let node = lake.node.clone();
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             let mut sequences = crate::seq::Held::default(); // (the counters it moved: it alone writes them)
             let in_flight = Arc::new(tokio::sync::Semaphore::new(COMMITS_IN_FLIGHT));
             let disk = (!lake.url.contains("://")).then(|| std::path::PathBuf::from(&lake.url)); // (a lake on local disk)
@@ -906,9 +909,9 @@ impl Producers {
 #[allow(clippy::too_many_arguments)]
 async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &mut Producers, sequences: &mut crate::seq::Held, held: &Held, batch: Vec<(Flush, oneshot::Sender<Outcome>)>, ms: &Arc<Mutex<Vec<f64>>>, slot: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
     let start = Instant::now();
-    if crate::backup::frozen(lake) {
+    if crate::frozen::frozen(lake) {
         // (a backup takes no rows, blocks or sequences' values: only its runs write it, ADR-070)
-        let why = format!("{:#}", crate::backup::refused(Some(&lake.url)));
+        let why = format!("{:#}", crate::frozen::refused(Some(&lake.url)));
         for (_, reply) in batch {
             let _ = reply.send(Outcome::Refused(why.clone()));
         }
@@ -1084,7 +1087,8 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
     forget_producers(lake, dropped.iter().filter_map(|k| k.strip_prefix("p/job:").map(|j| format!("job:{j}"))));
     producers.remember(seqs);
     let (lake, ms, hwm) = (lake.clone(), ms.clone(), *next - 1);
-    crate::spawns::spawn(async move {
+    let node = lake.node.clone();
+    node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
         if durable.await.is_ok() {
             let mut ms = ms.lock().unwrap();
             if ms.len() >= 10_000 {

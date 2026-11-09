@@ -313,7 +313,7 @@ pub async fn insert_share(lake: &Lake, s: &Slice, table: &str, stamp: Option<cra
         crate::ext::prime(lake, &s.ext).await?;
         let (ctx, _) = shared(lake, s).await?;
         // (out of memory, once more frugally, as `write::write_files` does: this share's files are never recorded by the first try)
-        crate::query::frugally(&ctx, |ctx| async move {
+        crate::query::frugally(&lake.node, &ctx, |ctx| async move {
             crate::write::in_order(&ctx); // (planned again, its partitions writing in the order rows come)
             let df = crate::engine::sql(&ctx, &s.sql).await?;
             crate::write::write_rows(lake, &ctx, table, df, stamp).await
@@ -1252,6 +1252,16 @@ fn shape(p: &Arc<dyn ExecutionPlan>) -> String {
         "AggregateExec" | "HashJoinExec" | "AsOfJoinExec" | "SortMergeJoinExec" | "SortExec" | "SortExec(TopK)" | "BoundedWindowAggExec" => displayable(p.as_ref()).one_line().to_string(),
         name => name.to_string(),
     };
+    // (an aggregate's partial state crosses the nodes in its own layout, which a release may change while its plan's line
+    // stays the same: avg's and var's over DOUBLE and small integers did, 11-09 audit M12. In a cluster mid-upgrade the
+    // shapes then differ, and the query runs on one node, ADR-039)
+    let what = match p.downcast_ref::<datafusion::physical_plan::aggregates::AggregateExec>() {
+        Some(a) => {
+            let states = a.aggr_expr().iter().map(|e| e.state_fields().map(|fs| fs.iter().map(|f| f.data_type().to_string()).collect::<Vec<_>>().join(" "))).collect::<datafusion::common::Result<Vec<_>>>();
+            format!("{} states=[{}]", what.trim_end(), states.map_or_else(|e| e.to_string(), |s| s.join(", ")))
+        }
+        None => what,
+    };
     // (a subquery's answer, shown in the line, may differ in its last digit from node to node)
     let what = what.split("scalar_subquery(").enumerate().map(|(i, part)| if i == 0 { part } else { part.split_once(')').map_or(part, |(_, rest)| rest) }).collect::<Vec<_>>().join("scalar_subquery()");
     // (an aggregate's ordering_mode follows from the orders and constants below it, which depend on
@@ -1697,5 +1707,21 @@ mod tests {
         assert_eq!(share(&stage_ctx(&one)), 0.8);
         let set = crate::optimize::config(SessionConfig::new()).set_str("datafusion.execution.skip_partial_aggregation_probe_ratio_threshold", "0.5");
         assert_eq!(share(&stage_ctx(&SessionContext::new_with_config(set))), 0.5);
+    }
+
+    /// The shape every node must plan alike holds each aggregate's partial state: the same line with another layout (a
+    /// release that changed avg's over small integers, 11-09 audit M12) is another shape.
+    #[tokio::test]
+    async fn a_shape_holds_its_aggregates_states() -> Result<()> {
+        let ctx = crate::engine::session(SessionConfig::new().with_target_partitions(2), Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()));
+        ctx.sql("CREATE TABLE t AS SELECT v % 3 AS g, (v % 10)::INT AS i, (v * 1.5)::DOUBLE AS d FROM generate_series(1, 100) AS s(v)").await?.collect().await?;
+        let shaped = |sql: &'static str| {
+            let ctx = ctx.clone();
+            async move { anyhow::Ok(shape(&ctx.sql(sql).await?.create_physical_plan().await?)) }
+        };
+        let (small, double) = (shaped("SELECT g, avg(i) FROM t GROUP BY g").await?, shaped("SELECT g, avg(d) FROM t GROUP BY g").await?);
+        assert!(small.contains("states=[Int64 Decimal128(38, 0)]"), "small integers' exact sum: {small}");
+        assert!(double.contains("states=[Int64 Float64 Float64]"), "a DOUBLE's sum and its error: {double}");
+        Ok(())
     }
 }

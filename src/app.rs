@@ -240,7 +240,7 @@ impl App {
             let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
             crate::explain::prepare(&ctx, query); // (each operator's expected rows: `explain::expected`)
             let peak = &crate::query::peak_pool(&ctx); // (this statement's own memory pool: the peak its cost reports; the closure below runs again on a retry)
-            let out = crate::query::frugally(&ctx, |ctx| async move {
+            let out = crate::query::frugally(&self.lake.node, &ctx, |ctx| async move {
                 let df = crate::engine::sql(&ctx, query).await?;
                 crate::query::mark("parsed to logical plan");
                 let (state, logical) = df.into_parts();
