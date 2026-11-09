@@ -2666,10 +2666,13 @@ def clients():
     # What an agent writes its next SQL from (the agent benchmark's findings): a NULL said as null (not left out), columns
     # typed as SHOW CREATE types them (not Arrow's Int64, Utf8), the dialect named as Pondra's, a parse error said once
     with_null = tool("r-tok", "query", sql="SELECT 1 AS a, CAST(NULL AS INT) AS b")["rows"]
-    docs_types = [c["type"] for t in tool("r-tok", "list_tables")["tables"] if t["table"] == "docs" for c in t["columns"]]
+    admin.sql("COMMENT ON TABLE docs IS 'one row per document'")
+    listed = {t["table"]: t for t in tool("r-tok", "list_tables")["tables"]}
+    docs_types = [c["type"] for c in listed["docs"]["columns"]]
+    abouts = [listed["docs"].get("about"), listed["sales.orders"].get("about", "missing")]
     unparsed = mcp("r-tok", "tools/call", {"name": "query", "arguments": {"sql": "SELEC 1"}})["content"][0]["text"]
-    checks["MCP for agents: a NULL said as null; list_tables types as SHOW CREATE does; Postgres's dialect named; a parse error said once, 42601"] = \
-        with_null == [{"a": 1, "b": None}] and docs_types == ["BIGINT", "VARCHAR", "REAL[]"] and "PostgreSQL's" in init["instructions"] \
+    checks["MCP for agents: a NULL said as null; list_tables types as SHOW CREATE does, with each table's comment as its about; Postgres's dialect named; a parse error said once, 42601"] = \
+        with_null == [{"a": 1, "b": None}] and docs_types == ["BIGINT", "VARCHAR", "REAL[]"] and abouts == ["one row per document", None] and "PostgreSQL's" in init["instructions"] \
         and "DataFusion" not in init["instructions"] and unparsed.startswith("SQLSTATE 42601: syntax error: Expected: ") and unparsed.count("Expected") == 1
     # Raw MCP calls, with the status and headers: (status, headers, the JSON answer or its text)
     def mcp_raw(token, method, params=None, sid=None, verb="POST", port=None):
