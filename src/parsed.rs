@@ -88,13 +88,9 @@ pub(crate) fn keep(sql: &str, stmts: Vec<Statement>) {
     kept(&LAST, sql, |_| Arc::new(Ok(stmts)));
 }
 
-/// Whether the front's trees are checked against the parse of their text (`keep`, `engine::datafusions_parse`): in a
-/// debug build, and in a node started with `PONDRA_TEST_ONE_PARSE` (the gates' runs: DataFusion's SQL tests, TPC-H,
-/// TPC-DS, the random queries, the harness).
-pub(crate) fn checked() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| cfg!(debug_assertions) || crate::env::is_set("PONDRA_TEST_ONE_PARSE"));
-    *ON
-}
+/// Whether the front's trees are checked against the parse of their text (`keep`, `engine::datafusions_parse`):
+/// `env::front_checked`.
+pub(crate) fn checked() -> bool { crate::env::front_checked() }
 
 /// What `make` makes of `sql`, kept with it among the last `KEPT` texts of `last` (the caller leaves out a text past
 /// `LONGEST`): made once while the text is among them. The lock is held for the look and the keeping, never for `make`.

@@ -125,7 +125,11 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
                 in_use(&n, &using)?;
                 gone.push(n);
             }
-            lake.cat.commit(vec![], &gone.iter().map(|n| key(n)).collect::<Vec<_>>()).await?;
+            let mut kept = vec![]; // (each kept to be undropped)
+            for n in &gone {
+                kept.extend(crate::undrop::aside(lake, "type", n, &[key(n)]).await?);
+            }
+            lake.cat.commit(kept, &gone.iter().map(|n| key(n)).collect::<Vec<_>>()).await?;
             Ok(j!({"type": gone.first(), "dropped": gone}))
         }
     }
