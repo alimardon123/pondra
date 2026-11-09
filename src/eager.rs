@@ -4,16 +4,17 @@
 //! grouping), where DuckDB took 0.51 s in all. Grouped by `inv_item_sk` first, the 26.5 M rows are 102,000 groups, and
 //! the names join those (by hand at SF10: 3.70 → 0.42 s; the rule: 3.46 → 0.42 s). TPC-DS q11's `year_total` groups
 //! store sales by a customer's seven text columns and the year: by `ss_customer_sk` and the year first, by hand, 3.32 →
-//! 1.32 s; q04 4.48 → 1.99 s. The rule doesn't reach those yet: what they sum is an expression a projection works out
-//! between the grouping and its joins, and only a projection of columns as they are is looked through.
+//! 1.32 s; q04 4.48 → 1.99 s. Their customer table holds a condition that names no column: `'s' = 's'`, what is left of
+//! the outer query's `sale_type = 's'` once it is pushed through the UNION ALL's tag. Such a condition keeps every row or
+//! none, so the table is as whole as one without it.
 //!
 //! It groups first where the grouping it saves hashes several strings a row: two text columns or more, or grouping sets
 //! (ROLLUP, CUBE). By one short text column the extra grouping costs what it saves (TPC-DS q05 was 8% slower).
 //!
 //! The rule takes an aggregate over a tree of inner joins and splits its inputs in two:
-//! - the dimensions: whole tables (no filter), joined to the rest by equalities only, that give the grouping at least
-//!   one text column and no aggregate an argument. A filtered table would cut the rows the join keeps, and grouping
-//!   them all first would be work the join saves.
+//! - the dimensions: whole tables (no filter, or only one that names no column), joined to the rest by equalities
+//!   only, that give the grouping at least one text column and no aggregate an argument. A filtered table would cut the
+//!   rows the join keeps, and grouping them all first would be work the join saves.
 //! - the rest, which give every argument.
 //!
 //! The rest is grouped first by the columns the dimensions join on and the columns of its own the grouping names, all
@@ -262,11 +263,14 @@ fn joined(mut inputs: Vec<LogicalPlan>, keys: &[(Expr, Expr)], equality: NullEqu
     Ok(Some(left))
 }
 
-/// Is `p` a whole table: a scan with no filter and no limit?
+/// Is `p` a whole table: a scan with no filter and no limit? A condition that names no column, and isn't drawn again for
+/// each row, keeps every row or none (`'s' = 's'`: a UNION ALL's tag, with a filter on it pushed through).
 fn whole(p: &LogicalPlan) -> bool {
+    let constant = |e: &Expr| !e.any_column_refs() && !e.is_volatile();
     match p {
-        LogicalPlan::TableScan(s) => s.filters.is_empty() && s.fetch.is_none(),
+        LogicalPlan::TableScan(s) => s.filters.iter().all(constant) && s.fetch.is_none(),
         LogicalPlan::SubqueryAlias(s) => whole(&s.input),
+        LogicalPlan::Filter(f) => constant(&f.predicate) && whole(&f.input),
         _ => false,
     }
 }
@@ -357,6 +361,24 @@ mod tests {
         let got = pretty_format_batches(&ctx.execute_logical_plan(rewritten).await?.collect().await?)?.to_string();
         let want = pretty_format_batches(&ctx.execute_logical_plan(plan).await?.collect().await?)?.to_string();
         assert_eq!(got, want);
+        Ok(())
+    }
+
+    /// A UNION ALL's branches tagged by a literal, and a filter on the tag outside them (TPC-DS q04's and q11's
+    /// `year_total`): the condition pushed onto the dimension, the table named first, names no column (`'s' = 's'`), so
+    /// the dimension is still whole, its sales are grouped first, and the answers are as they were.
+    #[tokio::test]
+    async fn through_a_tags_condition() -> Result<()> {
+        let (with, without) = (session(true).await?, session(false).await?);
+        let sql = "WITH totals AS (\
+                   SELECT brand, class, year, sum(price) AS total, 's' AS kind FROM item, sales, day \
+                   WHERE sales.item = item.id AND sales.day = day.id GROUP BY brand, class, year \
+                   UNION ALL SELECT brand, class, year, sum(qty) AS total, 'w' AS kind FROM item, sales, day \
+                   WHERE sales.item = item.id AND sales.day = day.id GROUP BY brand, class, year) \
+                   SELECT brand, class, total FROM totals WHERE kind = 's' AND year = 2001 ORDER BY brand, class";
+        let (got, plan) = answer(&with, sql).await?;
+        assert!(plan.contains("__eager_0"), "{plan}");
+        assert_eq!(got, answer(&without, sql).await?.0);
         Ok(())
     }
 
