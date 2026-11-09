@@ -54,7 +54,61 @@ pub enum Change {
     Drop { names: Vec<String>, if_exists: bool },
 }
 
-/// `CREATE INDEX`, `ALTER INDEX … RENAME TO`, `DROP INDEX`, or None for anything else.
+/// `CREATE [UNIQUE] INDEX`, read from sqlparser's tree, which reads each of its forms: the statements section's entries'
+/// reader (`Read::Tree`, step 8 PR 8c2). A UNIQUE index on columns is the table's UNIQUE constraint (`constraints.rs`).
+pub(crate) fn created(s: &ast::Statement) -> Result<Stmt> {
+    Ok(match s {
+        ast::Statement::CreateIndex(c) if c.unique => match crate::constraints::unique_index(c) {
+            Ok(d) => Stmt::Ddl(vec![d]),
+            Err(e) => Stmt::Invalid(format!("{e:#}")),
+        },
+        ast::Statement::CreateIndex(c) => match create(c.clone()) {
+            Ok(c) => Stmt::Ddl(vec![crate::ddl::Ddl::Index(c)]),
+            Err(e) => Stmt::Invalid(format!("{e:#}")),
+        },
+        _ => Stmt::Invalid("CREATE INDEX [IF NOT EXISTS] [name] ON table [USING method] (column [, …]) [WHERE condition]".into()),
+    })
+}
+
+/// `ALTER INDEX [IF EXISTS] name RENAME TO new_name` and `DROP INDEX [IF EXISTS] name [, …] [CASCADE | RESTRICT]` (MySQL's
+/// `ON table` after it, as the parser read it), by their words: the statements section's entries' reader.
+pub(crate) fn read(w: &mut crate::words::Words) -> Result<Stmt> {
+    let ddl = |c: Change| Stmt::Ddl(vec![crate::ddl::Ddl::Index(c)]);
+    let verb = w.next().map(|v| v.word()).unwrap_or_default();
+    let if_exists = |w: &mut crate::words::Words| -> Result<bool> {
+        w.expect("index")?;
+        Ok(w.is("if") && {
+            w.expect("exists")?;
+            true
+        })
+    };
+    if verb == "alter" {
+        let renamed = (|| -> Result<Change> {
+            let if_exists = if_exists(w)?;
+            let name = w.name()?;
+            w.expect_all(&["rename", "to"])?;
+            let to = w.name()?;
+            w.done()?;
+            Ok(Change::Rename { name, to, if_exists })
+        })();
+        return Ok(renamed.map_or_else(|_| Stmt::Invalid("ALTER INDEX [IF EXISTS] name RENAME TO new_name (an index has nothing else to change: nothing is built for it)".into()), ddl));
+    }
+    let dropped = (|| -> Result<Change> {
+        let if_exists = if_exists(w)?;
+        let names = w.names()?;
+        let _ = w.is("cascade") || w.is("restrict");
+        if w.is("on") {
+            w.name()?; // (an index's name is its schema's, whichever table it is on)
+        }
+        w.done()?;
+        Ok(Change::Drop { names, if_exists })
+    })();
+    Ok(dropped.map_or_else(|_| Stmt::Invalid("DROP INDEX [IF EXISTS] name [, …]".into()), ddl))
+}
+
+/// `CREATE [UNIQUE] INDEX`, `ALTER INDEX`, `DROP INDEX`, or None for anything else: as `write::parse` read them before
+/// they were the statements section's entries (`write::was`).
+#[cfg(test)]
 pub fn statement(sql: &str) -> Option<Stmt> {
     use std::sync::LazyLock;
     static CREATE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*CREATE\s+(UNIQUE\s+)?INDEX\b").expect("a regex"));

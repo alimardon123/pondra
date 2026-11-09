@@ -123,6 +123,8 @@ PROCESS = {
     "oom.rs:POINTERS": "a thread's own allocation counters (jemalloc's), found once a thread: they belong to the thread, not to a node",
     "oom.rs:TEST_ALLOCATOR": "the unit tests' allocator, jemalloc as the node's (main.rs), so the meter has counters to read",
     "oom.rs:TRACER": "DataFusion's one join-set tracer for the process, set once: it reads the task-local of whichever request spawns",
+    "sso.rs:KEYS": "each identity provider's published keys, by its issuer's url: public, and the same for any node here",
+    "sso.rs:FETCHING": "one fetch at a time of an issuer's keys, by its url: the same for any node here",
     "store.rs:MS": SETTING + " (PONDRA_LOCK_LEASE_SECS: the retry window, `store::retry_ms`)",
     "store.rs:NAMED": SETTING + " (PONDRA_LOAD_RETENTION_SECS: a named job's window, `store::retention_ms`)",
     "store.rs:ONE": LOCK,
@@ -145,7 +147,6 @@ PROCESS = {
     "tls.rs:KEY": SETTING + " (PONDRA_CLIENT_KEY, which the lakes server gives each database's node)",
     "tls.rs:PROXIES": SETTING + " (PONDRA_TRUSTED_PROXIES)",
     "tls.rs:TLS": SETTING + " (PONDRA_TLS_*)",
-    "users.rs:MAKING": LOCK,
     "write.rs:JOB": "`pondra sql`'s job: the process's, carried through its restarts (`Lifecycle::restart`)",
 }
 
