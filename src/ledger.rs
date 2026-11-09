@@ -474,23 +474,20 @@ impl Ledger {
 
     /// Takes cache bytes back for a query's grow past a whole line, from the caches inside the lines alone, and says whether
     /// that came back short: `own` past this node's line, from its own caches; `root` past the root's, from its own caches
-    /// first, then from the other nodes' by what they hold, the most first, so a busy node doesn't empty a quiet
-    /// neighbour's caches while its own still hold bytes.
+    /// first, so a busy node doesn't empty a quiet neighbour's caches while its own still hold bytes (11-08), then from the
+    /// other nodes' in the order the memory watch takes them in (`give_back_across`).
     fn make_room(&self, own: usize, root: usize) -> bool {
         let mut freed = self.take(own.max(root), true, None);
         let short = freed < own;
         if freed < root {
-            let mut others: Vec<Arc<Ledger>> = self.root.nodes().into_iter().filter(|n| !std::ptr::eq(n.as_ref(), self)).collect();
-            others.sort_by_key(|n| std::cmp::Reverse(n.cached()));
-            for other in others {
-                if freed >= root {
-                    break;
-                }
-                freed += other.take(root - freed, true, None);
-            }
+            let others: Vec<Arc<Ledger>> = self.root.nodes().into_iter().filter(|n| !std::ptr::eq(n.as_ref(), self)).collect();
+            freed += give_back_across(&others, root - freed, true);
         }
         short || freed < root
     }
+
+    /// What this line's caches named `kind` hold now.
+    fn held_of(&self, kind: &str) -> usize { self.charged().iter().filter(|(name, _)| *name == kind).map(|(_, c)| c.held()).sum() }
 
     fn take(&self, bytes: usize, inside_only: bool, kind: Option<&str>) -> usize {
         let (mut freed, mut inside) = (0, 0);
@@ -529,6 +526,33 @@ impl Drop for Ledger {
         self.root.moved(&self.root.reserved, self.reserved.load(Relaxed), 0);
         self.root.moved(&self.root.unspillable, self.unspillable.load(Relaxed), 0);
     }
+}
+
+/// Takes about `bytes` back from the caches charged to `ledgers`, and says how many came back: the one order memory goes
+/// back in across nodes (11-09 audit L4), the memory watch's over every node's (`oom.rs`) and a grow's over the other
+/// nodes' once its own node's caches are spent (`Ledger::make_room`). A kind at a time, in the order the kinds were first
+/// charged, so a node's ranges never go before another's hot columns (11-06 audit L7); within a kind, the node holding
+/// the most of it first, so a quiet node's few aren't emptied while another holds many. `inside_only`: only the caches
+/// inside the lines (`Charged::inside`), as a grow takes.
+pub fn give_back_across(ledgers: &[Arc<Ledger>], bytes: usize, inside_only: bool) -> usize {
+    let mut kinds: Vec<&'static str> = vec![];
+    for kind in ledgers.iter().flat_map(|ledger| ledger.kinds()) {
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    let mut freed = 0;
+    for kind in kinds {
+        let mut holding: Vec<(&Arc<Ledger>, usize)> = ledgers.iter().map(|l| (l, l.held_of(kind))).filter(|(_, held)| *held > 0).collect();
+        holding.sort_by_key(|(_, held)| std::cmp::Reverse(*held));
+        for (ledger, _) in holding {
+            if freed >= bytes {
+                return freed;
+            }
+            freed += ledger.take(bytes - freed, inside_only, Some(kind));
+        }
+    }
+    freed
 }
 
 // ---------------------------------------------------------------- the process's memory
@@ -1083,6 +1107,28 @@ mod tests {
         let charged: Arc<dyn Charged> = c.clone();
         ledger.charge("cache", Arc::downgrade(&charged));
         c
+    }
+
+    /// Memory goes back across nodes in one order, the memory watch's and a grow's alike (11-09 audit L4): a kind at a time,
+    /// in the order the kinds were first charged, and within a kind the node holding the most of it first.
+    #[test]
+    fn caches_give_back_across_nodes_a_kind_at_a_time_the_fullest_first() {
+        let root = Root::new(1000, usize::MAX);
+        let [a, b] = [0; 2].map(|_| Ledger::on(&root, 1000, usize::MAX));
+        let cache = |ledger: &Ledger, name: &'static str, entries: usize| {
+            let c = Arc::new(Mutex::new(ByteLru::new(usize::MAX)));
+            for i in 0..entries {
+                let _ = c.lock().unwrap().put(i, (), 10);
+            }
+            let charged: Arc<dyn Charged> = c.clone();
+            ledger.charge(name, Arc::downgrade(&charged));
+            c
+        };
+        let (hot_a, ranges_a, hot_b) = (cache(&a, "hot", 1), cache(&a, "ranges", 10), cache(&b, "hot", 5));
+        assert_eq!(give_back_across(&[a.clone(), b.clone()], 55, false), 60, "b's hot columns, then a's");
+        assert_eq!((hot_a.held(), ranges_a.held(), hot_b.held()), (0, 100, 0), "a's ranges untouched while any node's hot columns hold bytes");
+        assert_eq!(give_back_across(&[a, b], 30, false), 30);
+        assert_eq!(ranges_a.held(), 70, "then the next kind");
     }
 
     #[test]
