@@ -2357,7 +2357,6 @@ impl Lake {
         for (name, cache) in lake.caches() {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
-        lake.state::<crate::query::PlanFacts>()?; // (its planning facts, charged to its line as they are made: `Lake::state`)
         ledger.charge("files", Arc::downgrade(&crate::cache::outside())); // (the process's, of files outside the lakes)
         crate::oom::wake();
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
@@ -4725,10 +4724,11 @@ mod tests {
         }
         assert!(freed >= 4096 && lake.tails.held() == 0, "the tails give their memory back");
         assert!(!lake.cached_bytes().iter().any(|(name, _)| *name == "hot"), "the hot columns are `hot_bytes`");
-        // (`/metrics` reads the line's list by name: the node's planning facts are on it beside the lake's caches, its manifests
-        // among them; a node's start charges its kept pages and outside tables' logs and manifests, `node::start_app`)
+        // (`/metrics` reads the line's list by name: the lake's caches, its manifests among them, and the process's files; a
+        // lake's state is charged as it is made, and a node's start makes its planning facts, kept pages and outside tables'
+        // logs and manifests, `node::start_app`)
         let metrics: Vec<&str> = lake.cached_bytes().iter().map(|(name, _)| *name).collect();
-        assert!(["lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments", "facts", "manifests", "files"].iter().all(|n| metrics.contains(n)), "{metrics:?}");
+        assert!(["lookups", "tails", "log", "catalog_blocks", "footers", "statistics", "catalog_entries", "catalog_segments", "manifests", "files"].iter().all(|n| metrics.contains(n)), "{metrics:?}");
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

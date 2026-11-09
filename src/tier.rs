@@ -902,6 +902,7 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     let dropped = lake.cat.scan::<Kept>("dt/", "dt0").await?;
     let expired = |d: &Kept| now >= d.at_ms + d.keep_ms && pins.is_none_or(|p| d.at_ms < p.0);
     deletes.extend(dropped.iter().filter(|(_, d)| expired(d)).map(|(k, _)| k.clone()));
+    deletes.extend(crate::undrop::expired(lake, now).await?); // (dropped definitions: no files, so no branch holds them)
     // The loads of a folder let go (copy.rs) with its last table: one no live table or kept drop uses.
     let folder = |k: &str, m: &TableMeta| m.folder.clone().unwrap_or_else(|| k[3..].rsplit_once('/').map_or(k[3..].to_string(), |(n, _)| n.to_string()));
     let used: std::collections::HashSet<String> = tables.iter().map(|(k, m)| m.folder(&k[2..]).to_string()).chain(dropped.iter().filter(|(_, d)| !expired(d)).map(|(k, d)| folder(k, &d.meta))).collect();

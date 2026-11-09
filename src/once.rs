@@ -273,10 +273,22 @@ fn window(s: &ast::Select, src: &TableMeta) -> Result<(String, String, String)> 
 /// A view's bucket, planned once over its time column (per lake and expression).
 type Planned = (Arc<dyn PhysicalExpr>, SchemaRef);
 
+/// What a lake keeps for its `EMIT FINAL` views (invariant 301): each one's bucket, planned once, by its time column and
+/// expression (`planned`).
+#[derive(Default)]
+pub struct Buckets(Mutex<HashMap<(String, String), Planned>>);
+
+impl crate::lake_state::LakeState for Buckets {
+    const NAME: &'static str = "once";
+    const ABOUT: &'static str = "the buckets of its EMIT FINAL views, each planned once over its time column";
+    fn make() -> Self {
+        Buckets::default()
+    }
+}
+
 async fn planned(lake: &Lake, source: &str, o: &Once) -> Result<Planned> {
-    crate::per_node!(static PLANNED: Mutex<HashMap<(String, String, String), Planned>> = Default::default());
-    let key = (lake.url.clone(), o.time.clone(), o.bucket.clone());
-    if let Some(p) = PLANNED.lock().unwrap().get(&key) {
+    let (buckets, key) = (lake.state::<Buckets>()?, (o.time.clone(), o.bucket.clone()));
+    if let Some(p) = buckets.0.lock().unwrap().get(&key) {
         return Ok(p.clone());
     }
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(source)).await?.with_context(|| format!("no table {source}"))?.logical();
@@ -285,8 +297,12 @@ async fn planned(lake: &Lake, source: &str, o: &Once) -> Result<Planned> {
     let df = datafusion::common::DFSchema::try_from(schema.as_ref().clone())?;
     let ctx = crate::query::session_for(lake, "", "", None, &crate::auth::Principal::node().scope).await?;
     let e = ctx.parse_sql_expr(&o.bucket, &df).and_then(crate::optimize::whole_literals)?;
+    use datafusion::common::tree_node::TreeNode as _;
+    let volatile = e.exists(|x| Ok(matches!(x, datafusion::logical_expr::Expr::ScalarFunction(f) if f.func.signature().volatility == datafusion::logical_expr::Volatility::Volatile)))?;
     let p = (ctx.create_physical_expr(e, &df)?, schema);
-    PLANNED.lock().unwrap().insert(key, p.clone());
+    if !volatile {
+        buckets.0.lock().unwrap().insert(key, p.clone()); // (one that calls a volatile function may hold its lake, `nextval`: kept, the lake would keep itself)
+    }
     Ok(p)
 }
 

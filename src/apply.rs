@@ -758,8 +758,8 @@ pub(crate) async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool, sc
             match table_change(lake, d, cur.meta.as_ref().expect("a table's meta"), scope).await {
                 Ok(sql) if sql.is_empty() => {}
                 Ok(sql) => steps.push(step("~", &sql.iter().map(|s| s.splitn(4, ' ').nth(3).unwrap_or_default()).collect::<Vec<_>>().join("; "), sql)), // (ALTER TABLE t ADD COLUMN c: ADD COLUMN c)
-                Err(e) if !pending.is_empty() => steps.push(step("!", &format!("{} (checked again after the migrations)", crate::ext::said(&e)), vec![])),
-                Err(e) => refused.push(format!("table {} ({}): {}", d.name, d.file, crate::ext::said(&e))),
+                Err(e) if !pending.is_empty() => steps.push(step("!", &format!("{} (checked again after the migrations)", crate::codes::told(&e, scope.shows_code())), vec![])),
+                Err(e) => refused.push(format!("table {} ({}): {}", d.name, d.file, crate::codes::told(&e, scope.shows_code()))),
             }
             continue;
         }
@@ -1143,7 +1143,7 @@ async fn claim_to_record(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Wh
     alive.abort();
     if let Err(e) = &out {
         record.status = "failed".into();
-        record.error = Some(crate::ext::said(e));
+        record.error = Some(crate::codes::told(e, scope.shows_code()));
     }
     record.ended_ms = Some(crate::log::now_ms());
     crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: record.n, record: json(&record) }]), None, false, scope).await?;
@@ -1151,8 +1151,8 @@ async fn claim_to_record(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Wh
     Ok(record)
 }
 
-/// Who an apply is recorded as: the caller's name, else its role's.
-fn caller(who: Who) -> String { crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("{:?}", who.role).to_lowercase()) }
+/// Who an apply is recorded as: the caller's name (`Who::by`), else its role's.
+fn caller(who: Who) -> String { Some(who.name()).filter(|n| !n.is_empty()).map_or_else(|| format!("{:?}", who.role).to_lowercase(), str::to_string) }
 
 /// The apply's statements, then its record of what it left declared, then the tests.
 async fn statements(app: &App, p: &Project, plan: &Plan, record: &mut Record, who: Who, test: bool, secrets: &BTreeMap<String, String>) -> Result<()> {
@@ -1236,7 +1236,7 @@ async fn tests(app: &App, p: &Project, who: Who) -> Result<Vec<Value>> {
                 }
             }
             Ok(Outcome::Done(_)) => j!({"test": file, "ok": false, "error": "a test is a query: its rows are the failures"}),
-            Err(e) => j!({"test": file, "ok": false, "error": crate::ext::said(&e)}),
+            Err(e) => j!({"test": file, "ok": false, "error": crate::codes::told(&e, who.scope.shows_code())}),
         });
     }
     Ok(out)

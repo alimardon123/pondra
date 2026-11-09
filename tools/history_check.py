@@ -127,6 +127,112 @@ def history_check(bin, work, port):
         keyed == [(1, "a"), (2, "B")] and rows("SELECT id, v FROM k ORDER BY id") == keyed and log_gone \
         and delta in ([{"id": 1, "v": "a"}, {"id": 2, "v": "B"}], "skipped: no deltalake")
 
+    # Every definition is kept when dropped, and the statement pondra.dropped gives brings it back as it was (undrop.rs):
+    # each kind dropped and undropped 20 times, its comment with it; the newest first; refused while the name is taken.
+    q("CREATE TABLE base (a BIGINT)")
+    made = [
+        ("view", "dv", "CREATE VIEW dv AS SELECT a FROM base"),
+        ("external table", "dx", "CREATE EXTERNAL TABLE dx STORED AS CSV LOCATION '" + os.path.join(work, "dx.csv") + "'"),
+        ("function", "df", "CREATE FUNCTION df(x BIGINT) RETURNS BIGINT AS 'x + 1'"),
+        ("macro", "dm", "CREATE MACRO dm(x) AS x * 2"),
+        ("type", "dty", "CREATE TYPE dty AS ENUM ('a', 'b')"),
+        ("task", "dtask", "CREATE TASK dtask SCHEDULE '1 day' AS SELECT 1"),
+        ("secret", "dsec", "CREATE SECRET dsec (TYPE s3, KEY_ID 'k', SECRET 's')"),
+        ("connection", "dconn", "CREATE CONNECTION dconn TYPE s3 WITH (url = 's3://bucket/incoming')"),
+    ]
+    with open(os.path.join(work, "dx.csv"), "w") as f:
+        f.write("a\n1\n")
+    drops = {"view": "DROP VIEW", "external table": "DROP TABLE", "function": "DROP FUNCTION", "macro": "DROP MACRO", "type": "DROP TYPE",
+             "task": "DROP TASK", "secret": "DROP SECRET", "connection": "DROP CONNECTION"}
+    shown = lambda name: rows(f"SELECT kind, name, comment, definition FROM pondra.objects WHERE name = '{name}'")
+    me = rows("SELECT current_user")[0][0]
+    came_back = {}
+    for kind, name, sql in made:
+        q(sql)
+        if kind == "view":
+            q("COMMENT ON VIEW dv IS 'kept with it'")
+        was = shown(name)
+        ok = bool(was)
+        for _ in range(20):
+            q(f"{drops[kind]} {name}")
+            listed = rows(f"SELECT kind, undrop, dropped_by FROM pondra.dropped WHERE name = '{name}'")
+            ok = ok and shown(name) == [] and listed == [(kind, f"UNDROP {kind.upper()} {name}", me)]
+            q(listed[0][1] if listed else f"UNDROP {kind.upper()} {name}")
+            ok = ok and shown(name) == was
+        came_back[kind] = ok
+    q("DROP VIEW dv")
+    q("CREATE VIEW dv AS SELECT 2 AS two")
+    taken = refused("UNDROP VIEW dv")
+    q("DROP VIEW dv")
+    q("UNDROP VIEW dv")
+    newest = rows("SELECT * FROM dv")
+    q("ALTER VIEW dv RENAME TO dv_newer")
+    q("UNDROP VIEW dv")
+    older = shown("dv")
+    q("DROP TABLE dx")
+    q("UNDROP TABLE dx")  # (DROP TABLE drops an external table too, and UNDROP TABLE brings it back)
+    checks["each kind of definition (view, external table, function, macro, type, task, secret, connection) is kept when dropped and comes back as it was, 20 times; pondra.dropped says how"] = \
+        all(came_back.values()) and len(came_back) == 8 and rows("SELECT count(*) FROM pondra.dropped WHERE kind <> 'table'") == [(0,)]
+    checks["UNDROP of a definition takes the newest, refused while the name is taken; renamed away, the older comes back with its comment"] = \
+        "dv exists" in taken and newest == [(2,)] and older and older[0][2] == "kept with it" and shown("dx") != []
+    print(f"(definitions kept and undropped: {came_back})", file=sys.stderr)
+
+    # A schema dropped with CASCADE is kept with its tables, views and macros in one record; UNDROP SCHEMA brings them all back.
+    q("CREATE SCHEMA sales")
+    q("CREATE TABLE sales.orders (id BIGINT, v VARCHAR)")
+    q("INSERT INTO sales.orders SELECT x, 'o' FROM generate_series(1, 100) AS s(x)")
+    tier()
+    q("INSERT INTO sales.orders VALUES (101, 'log'), (102, 'log')")  # (left in the log)
+    q("CREATE VIEW sales.big AS SELECT * FROM sales.orders WHERE id > 50")
+    q("CREATE MACRO sales.twice(x) AS x * 2")
+    q("CREATE MATERIALIZED VIEW sales.per_v AS SELECT v, count(*) AS n FROM sales.orders GROUP BY v")
+    before = rows("SELECT count(*), max(id) FROM sales.orders")
+    big = rows("SELECT count(*) FROM sales.big")
+    per_v = rows("SELECT v, n FROM sales.per_v ORDER BY v")
+    q("DROP SCHEMA sales CASCADE")
+    gone = refused("SELECT count(*) FROM sales.orders")
+    early = refused("UNDROP TABLE sales.orders")
+    listed = rows("SELECT kind, undrop FROM pondra.dropped WHERE name = 'sales'")
+    q(listed[0][1] if listed else "UNDROP SCHEMA sales")
+    after = rows("SELECT count(*), max(id) FROM sales.orders")
+    big_after = rows("SELECT count(*) FROM sales.big")
+    twice = rows("SELECT sales.twice(21)")
+    per_v_after = rows("SELECT v, n FROM sales.per_v ORDER BY v")  # (made again from its query once its table is back)
+    checks["DROP SCHEMA … CASCADE keeps the schema with its tables, views, materialized views and macros; UNDROP SCHEMA brings "
+           "them all back (rows in the log too), and UNDROP TABLE waits for its schema"] = \
+        bool(gone) and bool(early) and listed == [("schema", "UNDROP SCHEMA sales")] and after == before == [(102, 102)] \
+        and big_after == big == [(52,)] and twice == [(42,)] and per_v_after == per_v == [("log", 2), ("o", 100)]
+    q("DROP SCHEMA sales CASCADE")
+    q("CREATE SCHEMA sales")
+    taken = refused("UNDROP SCHEMA sales")  # (the schema is there: refused)
+    q("DROP SCHEMA sales")
+    q("UNDROP SCHEMA sales")  # (the newest record: the empty schema)
+    newest = rows("SELECT count(*) FROM pondra.dropped WHERE name = 'sales'")  # (the older one, with the tables, is still kept)
+    checks["UNDROP SCHEMA is refused while the schema is there, and brings back the newest"] = "exists" in taken and newest == [(1,)]
+
+    # A materialized view dropped is kept as the statement that makes it again: UNDROP runs it, so its rows are worked out
+    # from clicks as they are then (rows written while it was dropped count), with its comment.
+    q("CREATE TABLE clicks (page VARCHAR, n BIGINT)")
+    q("INSERT INTO clicks VALUES ('a', 1), ('a', 2), ('b', 5)")
+    q("CREATE MATERIALIZED VIEW per_page AS SELECT page, sum(n) AS total, count(*) AS hits FROM clicks GROUP BY page")
+    q("COMMENT ON MATERIALIZED VIEW per_page IS 'by page'")
+    before = rows("SELECT page, total, hits FROM per_page ORDER BY page")
+    q("DROP MATERIALIZED VIEW per_page")
+    gone = refused("SELECT * FROM per_page")
+    listed = rows("SELECT kind, undrop FROM pondra.dropped WHERE name = 'per_page'")
+    q("INSERT INTO clicks VALUES ('b', 10), ('c', 1)")
+    tier()
+    q(listed[0][1] if listed else "UNDROP MATERIALIZED VIEW per_page")
+    after = rows("SELECT page, total, hits FROM per_page ORDER BY page")
+    q("INSERT INTO clicks VALUES ('a', 100)")
+    kept_current = rows("SELECT total FROM per_page WHERE page = 'a'")
+    comment = rows("SELECT comment FROM pondra.objects WHERE name = 'per_page'")
+    checks["DROP MATERIALIZED VIEW keeps it; UNDROP makes it again from its query (rows written while it was dropped counted), "
+           "with its comment, and it follows new writes"] = \
+        before == [("a", 3, 2), ("b", 5, 1)] and bool(gone) and listed == [("materialized view", "UNDROP MATERIALIZED VIEW per_page")] \
+        and after == [("a", 3, 2), ("b", 15, 2), ("c", 1, 1)] and kept_current == [(103,)] and comment == [("by page",)]
+    print(f"(materialized view undropped: before {before}, after {after}, then {kept_current})", file=sys.stderr)
+
     # AT: every state the table was in, by its commit and by its time, against what it was then.
     q("CREATE TABLE h (id BIGINT, v VARCHAR)")
     states = []

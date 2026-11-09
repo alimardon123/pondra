@@ -280,14 +280,14 @@ impl App {
             }
             Ok((out, false))
         };
-        let (out, planned) = crate::learned::planning(query, run).await; // (planned with what runs learned, as its runs so far say)
+        let (out, planned) = crate::learned::planning(&self.lake, query, run).await; // (planned with what runs learned, as its runs so far say)
         add(&m.queries, 1);
         add(&m.query_us, start.elapsed().as_micros() as u64);
         match out {
             Ok((batches, spread)) => {
                 let handed = crate::query::handed(); // (rows sent in pieces: the batches went to the door, which holds none here)
                 if handed.is_none() {
-                    crate::learned::ran(query, planned, start.elapsed()); // (never worse: facts that made it slower twice are set aside)
+                    crate::learned::ran(&self.lake, query, planned, start.elapsed()); // (never worse: facts that made it slower twice are set aside)
                 }
                 add(&m.spread, spread as u64);
                 crate::history::rows(handed.unwrap_or_else(|| batches.iter().map(|b| b.num_rows() as u64).sum()));
