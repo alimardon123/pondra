@@ -1122,7 +1122,7 @@ fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
 }
 
 /// `CREATE [OR REPLACE] [PERSISTENT] SECRET [IF NOT EXISTS] name (TYPE t, KEY value, …)` and
-/// `DROP SECRET [IF EXISTS] name`, parsed here: a value is a string, a word or a number.
+/// `DROP SECRET [IF EXISTS] name [PURGE]`, parsed here: a value is a string, a word or a number.
 pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     use crate::ddl::Ddl;
     use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
@@ -1145,7 +1145,7 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
         }
         let if_exists = p.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
         return match p.parse_identifier() {
-            Ok(n) => Some(crate::write::Stmt::Ddl(vec![Ddl::DropSecret { name: n.value.to_lowercase(), if_exists }])),
+            Ok(n) => Some(crate::write::Stmt::Ddl(vec![Ddl::DropSecret { name: n.value.to_lowercase(), if_exists, purge: p.parse_keyword(Keyword::PURGE) }])),
             Err(e) => invalid(format!("DROP SECRET name: {e}")),
         };
     }
@@ -1507,13 +1507,24 @@ pub async fn create(lake: &Lake, name: &str, params: BTreeMap<String, String>, r
     Ok(serde_json::json!({"secret": name}))
 }
 
-pub async fn drop(lake: &Lake, name: &str, if_exists: bool) -> Result<serde_json::Value> {
-    if lake.cat.get::<Secret>(&secret_key(name)).await?.is_none() {
+/// `DROP SECRET name`: kept sealed, to be undropped. With PURGE, kept nowhere: the copies that earlier drops of the name
+/// kept go in the same commit, so a key that leaked leaves the lake's bucket (a dropped name with PURGE lets those go).
+pub async fn drop(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Result<serde_json::Value> {
+    let kept = if purge { crate::undrop::kept_keys(lake, "secret", name).await? } else { vec![] };
+    let here = lake.cat.get::<Secret>(&secret_key(name)).await?.is_some();
+    if !here && kept.is_empty() {
         ensure!(if_exists, "no secret {name}");
-        return Ok(serde_json::json!({"secret": name, "dropped": false}));
     }
-    lake.cat.commit(crate::undrop::aside(lake, "secret", name, &[secret_key(name)]).await?, &[secret_key(name)]).await?; // (kept sealed, to be undropped)
-    Ok(serde_json::json!({"secret": name, "dropped": true}))
+    let puts = if here && !purge { crate::undrop::aside(lake, "secret", name, &[secret_key(name)]).await? } else { vec![] };
+    let gone: Vec<String> = kept.iter().cloned().chain(here.then(|| secret_key(name))).collect();
+    if !gone.is_empty() {
+        lake.cat.commit(puts, &gone).await?;
+    }
+    let mut out = serde_json::json!({"secret": name, "dropped": here});
+    if purge {
+        out["purged"] = kept.len().into(); // (the copies kept from earlier drops, let go)
+    }
+    Ok(out)
 }
 
 /// The lake's secrets, and the session's temporary ones (which win, by name).
