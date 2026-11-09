@@ -38,6 +38,8 @@ const lake = args.includes('--lake')
   ? resolve(args[args.indexOf('--lake') + 1])
   : resolve(dirname(fileURLToPath(import.meta.url)), '../web/lake');
 const sizes = args.includes('--sizes');
+// How the line below moves: the module's brotli stays the gate, with at least 3 KB of room above main, since a change of
+// layout alone moves it by 1-2 KB; and the line moves down only with cuts measured in the module's own wasm bytes.
 // The most a page may download (`--sizes`: the module at brotli 11, as a server sends it), designs/page-same-core.md P4. It
 // moves down with each cut, never up without a reason in the commit that moves it. 9.2 → 9.206 MB: eager aggregation
 // (`eager.rs`, 6.2 KB), a rule every form's planner runs (TPC-DS q22 3.46 → 0.42 s), the room above main kept as it was.

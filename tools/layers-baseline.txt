@@ -211,7 +211,6 @@ rules -> pg_json  1
 rules -> pg_json_make  6
 runs -> apply  1
 runs -> crypto  2
-runs -> reset  1
 scan -> wasm32  2
 serve -> pg_casts  1
 serve -> pg_types  2
