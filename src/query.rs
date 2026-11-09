@@ -1899,6 +1899,44 @@ pub fn first_table(sql: &str) -> Result<String> {
     }
 }
 
+/// The rows a file commit gave or took, as the log's readers (feeds, CDC, Kafka) read them: worked out by a query of the
+/// commit's files, so the engine's, not the catalog's that keeps the lake.
+impl Lake {
+    /// Rows of `table` a file commit gives the log's readers (`Segment::files`): its files' rows as
+    /// they were then, with their system columns (stored names), from the `from`-th on and `rows`
+    /// of them at most; `removed`: the rows of the files it took out.
+    pub async fn filed_rows(&self, seg: &Segment, table: &str, removed: bool, from: u64, rows: u64) -> Result<Vec<RecordBatch>> {
+        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
+        let meta = crate::sys::with_sys(&meta);
+        let schema = meta.schema()?;
+        let (ctx, end, mut at, mut out) = (self.session(), from.saturating_add(rows), 0u64, vec![]);
+        for f in if removed { &filed.removed } else { &filed.added } {
+            let (lo, hi) = (at.max(from), (at + f.rows).min(end));
+            if lo < hi {
+                out.extend(crate::lake_scan::file_rows(self, &ctx, f, &meta, &schema, crate::lake_scan::Pick::Range(lo - at, hi - at)).await?.collect().await?);
+            }
+            at += f.rows;
+            if at >= end {
+                break;
+            }
+        }
+        out.iter().map(|b| conform(b, &schema)).collect()
+    }
+
+    /// Rows of `table` a file commit deleted by position (`Filed::deleted`), with their system
+    /// columns (stored names): each file's rows at the places its new deletes name.
+    pub async fn deleted_rows(&self, seg: &Segment, table: &str) -> Result<Vec<RecordBatch>> {
+        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
+        let meta = crate::sys::with_sys(&meta);
+        let schema = meta.schema()?;
+        let mut out = vec![];
+        for (f, deletes) in &filed.deleted {
+            out.extend(crate::adopt::rows_deleted(self, &meta, f, deletes, &schema).await?);
+        }
+        out.iter().map(|b| conform(b, &schema)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
