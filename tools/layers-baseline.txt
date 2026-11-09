@@ -306,7 +306,6 @@ views -> matches  4
 views -> measures  1
 views -> pattern  1
 views -> pg_json  1
-views -> reset  1
 with_writes -> pg_types  2
 workspace -> python  4
 write -> crypto  1
