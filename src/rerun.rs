@@ -453,7 +453,7 @@ fn group_keys(plan: &LogicalPlan) -> Vec<String> {
 /// What the rows alone can't keep: the first aggregate that needs every row of its group
 /// (`median`, a DISTINCT, an ordered `string_agg`, …), as "median() needs every row of a group".
 pub fn needs(plan: &LogicalPlan) -> Option<String> {
-    const KEPT: [&str; 13] = ["count", "sum", "min", "max", "avg", "stddev", "stddev_pop", "var", "var_pop", "variance", "bool_and", "bool_or", crate::finish::MOMENTS];
+    const KEPT: [&str; 15] = ["count", "sum", "min", "max", "avg", "stddev", "stddev_pop", "var", "var_pop", "variance", "bool_and", "bool_or", crate::finish::MOMENTS, crate::fvar::MEAN_PARTS, crate::fvar::VAR_PARTS];
     let mut found = None;
     let _ = plan.apply_with_subqueries(|node| {
         if let LogicalPlan::Aggregate(a) = node {
@@ -841,11 +841,12 @@ pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &
     for (name, v) in views {
         let Some(turn) = turn(lake, &name, v.rerun.as_ref().expect("filtered"), last_change(lake, &follows(&v))) else { continue };
         let (lake, seq, lock) = (lake.clone(), seq.clone(), lock.clone());
-        crate::spawns::aside(crate::auth::as_node(async move { // (the node's own work, as a view's refresh is: `auth::as_node`)
+        let node = lake.node.clone();
+        node.tasks.aside(crate::spawns::Node, async move { // (the node's own work, as a view's refresh is: `auth::as_node`)
             let _slot = waiting(&turn.waited, crate::views::slot(&lake)).await; // (waiting for a slot is not the run's time)
             let r = crate::views::bounded(run(&lake, &seq, &lock, &name, &v, &turn)).await;
             turn.ended(&r);
-        }));
+        });
     }
     Ok(())
 }
@@ -877,6 +878,21 @@ fn last_change(lake: &Lake, tables: &[String]) -> Option<(u64, u64)> {
     let seen = kept.changed.lock().unwrap();
     let at = &seen.as_ref()?.1;
     tables.iter().flat_map(|t| [at.get(t), at.get(&crate::sys::deleted(t))]).flatten().max().copied()
+}
+
+/// The views run again as readers of the log (`pins`): one learns there what changed since its last run, and one kept by
+/// key reads there what other engines' commits took out of its source.
+pub fn readers() -> crate::pins::Pin {
+    crate::pins::Pin { name: "views run again", held: |_| Box::pin(async { Ok(None) }), lapse: None, sweep: None, floor: Some(|l, f| Box::pin(floor(l, f))) }
+}
+
+async fn floor(lake: &Lake, mut floor: u64) -> Result<u64> {
+    for (key, v) in lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.rerun.is_some()) {
+        let done = lake.cat.get(&crate::store::producer_key(&producer(&key[2..]))).await?.unwrap_or(0);
+        let follows = follows(&v);
+        floor = crate::pins::behind(lake, done, floor, |s| follows.iter().any(|t| moved(s, t))).await?;
+    }
+    Ok(floor)
 }
 
 /// Has a log segment changed `source`'s rows: rows in (the log's, or a file commit's), old versions
