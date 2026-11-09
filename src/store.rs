@@ -890,10 +890,10 @@ pub struct TableMeta {
     /// UNIQUE, and PRIMARY KEY and FOREIGN KEY said NOT ENFORCED, by stored column names
     /// (`constraints.rs`, ADR-057): an enforced UNIQUE has every write checked on the leader.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub constraints: Vec<crate::constraints::Constraint>,
+    pub constraints: Vec<crate::table_record::Constraint>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ext: Option<crate::ext_names::Spec>,
+    pub ext: Option<crate::table_record::Spec>,
     /// Another engine's table (`scan.rs`): what matches its files' columns to its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outside: Option<crate::scan::Table>,
@@ -904,7 +904,7 @@ pub struct TableMeta {
     /// A history view's table (SCD type 2, ADR-036 §8): every version of each key as it came;
     /// reads give each its `__start_at` and `__end_at` (`views::history_view`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub history: Option<crate::views::History>,
+    pub history: Option<crate::table_record::History>,
     /// A GROUP BY view's table whose answers need a last step (avg, stddev, HAVING, …: ADR-055):
     /// its columns are what adds up, and reads give the view's columns from them (`finish.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -932,7 +932,7 @@ pub struct TableMeta {
     pub shares: Vec<String>,
     /// The rules made from this parse, once (`rules`): never in the catalog, and a clone starts without them.
     #[serde(skip)]
-    pub rules: crate::memo::Memo<crate::rules::Table>,
+    pub rules: crate::memo::Memo<crate::table_record::Table>,
     /// Its column list (`cols`), made once for an entry read from the catalog: a clone's is empty, as `rules`' is.
     #[serde(skip)]
     pub column_memo: crate::memo::Memo<crate::column::Columns>,
@@ -1197,16 +1197,21 @@ impl TableMeta {
     /// The table of `of`'s replaced rows (`sys::deleted`) takes its columns: the same list, `_old_version` after it.
     pub fn follow_columns(&mut self, of: &TableMeta) { self.set_list(Stored::replaced(of.list()), self.record.listed) }
 
-    /// The table a write's rules see (`rules::Table`), made from the rule fields alone: never `files` or the
+    /// Does a plain INSERT into this table have its key checked on the leader (`constraints.rs`)? A keyed table's key is
+    /// its PRIMARY KEY: a plain INSERT of a key the table holds is refused. A GROUP BY view's table (`merge`) combines a
+    /// key's rows by design, so it has no such refusal.
+    pub fn key_checked(&self) -> bool { !self.key.is_empty() && self.merge.is_empty() }
+
+    /// The table a write's rules see (`table_record::Table`), made from the rule fields alone: never `files` or the
     /// statistics. Each column SQL sees (`live`, the one mapping of stored names to SQL's) takes its rules by its
     /// stored name, as the entry keeps them.
-    pub fn to_rules(&self) -> Result<crate::rules::Table> {
+    pub fn to_rules(&self) -> Result<crate::table_record::Table> {
         let columns = self
             .list()
             .columns
             .iter()
             .filter(|c| !c.dropped)
-            .map(|c| crate::rules::Column {
+            .map(|c| crate::table_record::Column {
                 name: c.name.clone(),
                 stored: c.stored_name().to_string(),
                 not_null: c.not_null,
@@ -1216,15 +1221,15 @@ impl TableMeta {
                 labels: c.labels.as_ref().map(|e| (e.of.clone(), e.labels.clone())),
             })
             .collect();
-        Ok(crate::rules::Table {
+        Ok(crate::table_record::Table {
             schema: crate::answer::schema(&self.logical_columns())?,
             columns,
             key: self.key.iter().map(|c| self.name_of(c).to_string()).collect(),
-            key_checked: crate::constraints::key_checked(self),
+            key_checked: self.key_checked(),
             unique: self
                 .constraints
                 .iter()
-                .filter(|c| c.enforced && c.kind == crate::constraints::Kind::Unique)
+                .filter(|c| c.enforced && c.kind == crate::table_record::Kind::Unique)
                 .map(|c| (c.name.clone(), c.columns.iter().map(|s| self.name_of(s).to_string()).collect()))
                 .collect(),
             checks: self.checks.clone(),
@@ -1236,7 +1241,7 @@ impl TableMeta {
 
     /// The rules of this entry, made once per parse and kept beside it: `Catalog::parsed` hands out one `Arc` per
     /// entry's bytes, so a write takes them with no lookup. An owned or changed entry calls `to_rules` instead.
-    pub fn rules(self: &Arc<Self>) -> Result<Arc<crate::rules::Table>> {
+    pub fn rules(self: &Arc<Self>) -> Result<Arc<crate::table_record::Table>> {
         self.rules.get_or_try_init(|| self.to_rules())
     }
 
@@ -4931,7 +4936,7 @@ mod tests {
         let col = |c: &str, t: &str| (c.to_string(), t.to_string());
         let set = |v: &[(&str, &str)]| v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<String, String>>();
         let id = |always: bool, seq: &str| Identity { always, declared: vec![], sequence: seq.into() };
-        let unique = |name: &str, c: &str, enforced: bool| crate::constraints::Constraint { name: name.into(), kind: crate::constraints::Kind::Unique, columns: vec![c.into()], references: None, enforced };
+        let unique = |name: &str, c: &str, enforced: bool| crate::table_record::Constraint { name: name.into(), kind: crate::table_record::Kind::Unique, columns: vec![c.into()], references: None, enforced };
         let mut t = TableMeta::made(Made {
             columns: vec![col("id", "Int64"), col("seq_no", "Int64"), col("c_code", "Utf8"), col("c_status", "Utf8"), col("owner", "Utf8"), col("total", "Int64"), col("doc", "Utf8"), col("gone", "Utf8"), col("_deleted", "Boolean")],
             names: set(&[("c_code", "code"), ("c_status", "status")]),
@@ -4964,15 +4969,15 @@ mod tests {
     fn to_rules_maps_the_rule_fields_as_logical_does() -> Result<()> {
         let m = with_rules();
         let (t, l) = (m.to_rules()?, m.logical());
-        let plain = |name: &str, stored: &str| crate::rules::Column { name: name.into(), stored: stored.into(), not_null: false, default: None, always: false, held: None, labels: None };
+        let plain = |name: &str, stored: &str| crate::table_record::Column { name: name.into(), stored: stored.into(), not_null: false, default: None, always: false, held: None, labels: None };
         let want = vec![
-            crate::rules::Column { not_null: true, default: Some("nextval('orders_id_seq')".into()), ..plain("id", "id") },
-            crate::rules::Column { default: Some("nextval('orders_seq_no_seq')".into()), always: true, ..plain("seq_no", "seq_no") },
-            crate::rules::Column { not_null: true, held: Some("varchar(3)".into()), ..plain("code", "c_code") },
-            crate::rules::Column { labels: Some((Some("order_status".into()), vec!["open".into(), "shipped".into()])), ..plain("status", "c_status") },
-            crate::rules::Column { held: Some("uuid".into()), ..plain("owner", "owner") },
-            crate::rules::Column { default: Some("0".into()), ..plain("total", "total") },
-            crate::rules::Column { held: Some("json".into()), ..plain("doc", "doc") },
+            crate::table_record::Column { not_null: true, default: Some("nextval('orders_id_seq')".into()), ..plain("id", "id") },
+            crate::table_record::Column { default: Some("nextval('orders_seq_no_seq')".into()), always: true, ..plain("seq_no", "seq_no") },
+            crate::table_record::Column { not_null: true, held: Some("varchar(3)".into()), ..plain("code", "c_code") },
+            crate::table_record::Column { labels: Some((Some("order_status".into()), vec!["open".into(), "shipped".into()])), ..plain("status", "c_status") },
+            crate::table_record::Column { held: Some("uuid".into()), ..plain("owner", "owner") },
+            crate::table_record::Column { default: Some("0".into()), ..plain("total", "total") },
+            crate::table_record::Column { held: Some("json".into()), ..plain("doc", "doc") },
             plain("_deleted", "_deleted"),
         ];
         assert_eq!(t.columns, want);

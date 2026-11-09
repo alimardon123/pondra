@@ -121,6 +121,8 @@ mod reach;
 mod read_delta;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (a write's rules: a node makes its table from its entry; a page's come with `shape`)
 mod rules;
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the parts of a table's record the rules read: every form has them)
+mod table_record;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
 // Feature `server`, on by default; every module the node is made of is one of these.

@@ -63,6 +63,7 @@ replica catalog
 scan catalog
 sketch catalog
 store catalog
+table_record catalog
 terms catalog
 files catalog
 

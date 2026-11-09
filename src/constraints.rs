@@ -32,14 +32,9 @@ pub use crate::rules::create::{informational, of, Constraint, Kind};
 /// Does a write to this table have to be checked on the leader (an enforced UNIQUE)?
 pub fn checked(meta: &TableMeta) -> bool { meta.constraints.iter().any(|c| c.enforced) }
 
-/// Does a plain INSERT into this table have its key checked on the leader? A keyed table's key is
-/// its PRIMARY KEY: a plain INSERT of a key the table holds is refused. A GROUP BY view's table
-/// (`merge`) combines a key's rows by design, so it has no such refusal.
-pub fn key_checked(meta: &TableMeta) -> bool { !meta.key.is_empty() && meta.merge.is_empty() }
-
 /// Does `check` have to see this write? Every write to a table with an enforced UNIQUE does; a plain
 /// INSERT does too when its table's key is checked (`key_checked`). Loaders and views pass `plain` false.
-pub fn needs_check(meta: &TableMeta, plain: bool) -> bool { checked(meta) || (plain && key_checked(meta)) }
+pub fn needs_check(meta: &TableMeta, plain: bool) -> bool { checked(meta) || (plain && meta.key_checked()) }
 
 /// Refused at a door that writes rows without the leader's check: another engine's file commit into
 /// a table with an enforced UNIQUE (`adopt.rs`). The loading doors take such rows through `queue`,
@@ -65,7 +60,7 @@ pub fn door(meta: &TableMeta, table: &str) -> Result<()> {
 pub async fn check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&RecordBatch>, new: Option<&RecordBatch>, plain: bool, shaped: bool) -> Result<()> {
     let Some(new) = new.filter(|n| n.num_rows() > 0) else { return Ok(()) };
     let named = meta.logical_ref();
-    if plain && key_checked(meta) {
+    if plain && meta.key_checked() {
         key_check(lake, table, meta, old, new, shaped).await?;
     }
     for c in named.constraints.iter().filter(|c| c.enforced && c.kind == Kind::Unique) {
