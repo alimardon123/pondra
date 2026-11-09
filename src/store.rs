@@ -1591,7 +1591,7 @@ pub(crate) fn spill_folder() -> std::io::Result<&'static std::path::Path> {
 pub(crate) fn spill_gb() -> Option<f64> { crate::env::parse::<f64>("PONDRA_SPILL_GB").filter(|gb| *gb >= 0.0) }
 
 /// The bytes that may spill under `dir`: `PONDRA_SPILL_GB` when set, else `dir`'s disk's free space less `lake_keeps`; None with no `dir`.
-/// The lakes in memory spill under the same setting and room, counted with these (`memory_lake::spilled`, `others_held`).
+/// The lakes in memory spill under the same setting and room, counted with these (`ledger::room`).
 pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
     match spill_gb() {
         Some(gb) => Some(gb_bytes(gb)),
@@ -1665,8 +1665,8 @@ pub(crate) fn window_sorts(ctx: Arc<datafusion::execution::TaskContext>) -> Arc<
 
 /// DataFusion's spill disk for one lake, made by its first spill (`TempFileFactory`): the same manager `spill_disk`
 /// would have built when the lake opened, in the spill folder (or the OS temp folder, where there is none), with
-/// `fan_in` and the cap of `spill_cap`. `made` holds it once it is built, or the reason it could not be. It is
-/// registered (`register_spiller`) when it is made, so `spill_room` caps it and `spill_fits` counts what it holds.
+/// `fan_in` and the cap of `spill_cap`. `made` holds it once it is built, or the reason it could not be. It goes on the
+/// spill disk's room list (`ledger::holds`) when it is made, so `spill_room` caps it and `spill_fits` counts what it holds.
 struct Spills {
     fan_in: usize,
     made: std::sync::OnceLock<Result<Arc<DiskManager>, String>>,
@@ -1686,7 +1686,9 @@ impl TempFileFactory for Spills {
                 None => builder,
             };
             let disk = Arc::new(builder.build().map_err(|e| e.to_string())?);
-            register_spiller(&disk);
+            if spill_gb() != Some(0.0) {
+                crate::ledger::holds(&(disk.clone() as Arc<dyn crate::ledger::Holds>)); // (a disabled one has no cap to set: left out)
+            }
             Ok(disk)
         });
         match made {
@@ -1699,23 +1701,10 @@ impl TempFileFactory for Spills {
 /// `gb` gibibytes, in bytes.
 fn gb_bytes(gb: f64) -> u64 { (gb * (1u64 << 30) as f64) as u64 }
 
-/// The disk managers that hold this process's lakes' spill files (one for each lake, made by its first spill: `Spills`),
-/// held weakly: a lake that goes takes its manager with it. `register_spiller` adds each one (unless spilling is off),
-/// `spill_room` sets their caps, `spill_fits` counts what they hold.
-static SPILLERS: Mutex<Vec<Weak<DiskManager>>> = Mutex::new(Vec::new());
-
-/// Adds a spill disk to `SPILLERS`, once `Spills` has made it. A disabled one has no cap to set, so it is left out.
-fn register_spiller(disk: &Arc<DiskManager>) {
-    if spill_gb() != Some(0.0) {
-        SPILLERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Arc::downgrade(disk));
-    }
-}
-
-/// The disk managers still alive, the dead ones dropped from `SPILLERS`.
-fn live_spillers() -> Vec<Arc<DiskManager>> {
-    let mut spillers = SPILLERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    spillers.retain(|w| w.strong_count() > 0);
-    spillers.iter().filter_map(Weak::upgrade).collect()
+/// A lake's query spill disk holds room on the process's spill disk (`ledger::room`), and takes its cap from it (`set_room`).
+impl crate::ledger::Holds for DiskManager {
+    fn held(&self) -> u64 { self.used_disk_space() }
+    fn cap(&self, bytes: u64) { let _ = self.set_max_temp_directory_size(bytes); } // (a disabled manager refuses: none is on the list)
 }
 
 /// The cap of one disk manager that holds `used` bytes of spills, given the setting and what shuffles hold
@@ -1729,20 +1718,22 @@ fn room_cap(gb: Option<f64>, used: u64, shuffled: u64, disk: Option<(u64, u64)>)
     }
 }
 
-/// Sets every live lake's cap from the disk as it is now (`room_cap`). Under the setting, the shuffles, the lakes in
-/// memory and the other spill disks (a window's sorts have their own: `window_sorts`) take their bytes out of it first
-/// (without it, the disk's free room already says what they hold). (Each was given the whole setting, so a window's sorts
-/// and a GROUP BY spilling beside them could take twice it: audit 11-01 M13.)
+/// Sets the cap of each lake's spill disk from the disk as it is now (`room_cap`). Under the setting, everything else on
+/// the spill disk's room list (`ledger::room`: the shuffles, the lakes in memory, the other lakes' spill disks) takes its
+/// bytes out of it first (without it, the disk's free room already says what they hold). A window's sorts have a disk of
+/// their own (`window_sorts`). (Each was given the whole setting, so a window's sorts and a GROUP BY spilling beside them
+/// could take twice it: audit 11-01 M13.)
 fn set_room(gb: Option<f64>) {
-    let shuffled = gb.map_or(0, |_| crate::spill::held() + crate::memory_lake::spilled());
+    let room = crate::ledger::room();
+    if room.is_empty() {
+        return; // (nothing spilled yet, so nothing to size and no disk to look at: a page never spills to one)
+    }
     let disk = crate::machine::process().space(&crate::scratch::spill_base()); // (the disk the folder is, or would be on: not made here, the first spill makes it)
-    let managers = live_spillers();
-    let all: u64 = managers.iter().map(|m| m.used_disk_space()).sum();
-    for manager in managers {
-        let used = manager.used_disk_space();
-        let others = gb.map_or(0, |_| all.saturating_sub(used));
-        if let Some(cap) = room_cap(gb, used, shuffled + others, disk) {
-            let _ = manager.set_max_temp_directory_size(cap); // (a disabled manager refuses: none is registered)
+    let all: u64 = room.iter().map(|(_, held)| held).sum();
+    for (holder, used) in &room {
+        let others = gb.map_or(0, |_| all.saturating_sub(*used));
+        if let Some(cap) = room_cap(gb, *used, others, disk) {
+            holder.cap(cap); // (one with no cap of its own takes none: a shuffle's pieces, a lake in memory)
         }
     }
 }
@@ -1760,9 +1751,6 @@ pub(crate) fn spill_room() {
         return;
     }
     LOOKED.store(now, Relaxed);
-    if live_spillers().is_empty() {
-        return; // (no spill disk made yet, so nothing to size and no disk to look at: a page never makes one)
-    }
     set_room(spill_gb());
 }
 
@@ -1776,16 +1764,12 @@ pub(crate) fn piece_fits(gb: Option<f64>, held: u64, bytes: u64, disk: Option<(u
     }
 }
 
-/// What this process spills, other than its lakes in memory: the shuffles' pieces (`spill::held`) and the queries' spill
-/// disks (`live_spillers`). The lakes' bytes come with `memory_lake::spilled`, so one check sees all of it.
-pub(crate) fn others_held() -> u64 { crate::spill::held() + live_spillers().iter().map(|m| m.used_disk_space()).sum::<u64>() }
-
 /// Whether a shuffle's piece of `bytes` fits on the spill disk now: `Spill::write` asks before it writes one.
 /// No spill folder: it fits, and the write fails with its own error.
 pub(crate) fn spill_fits(bytes: u64) -> Result<()> {
     let Ok(folder) = spill_folder() else { return Ok(()) };
     let gb = spill_gb();
-    let held = gb.map_or(0, |_| others_held() + crate::memory_lake::spilled());
+    let held = gb.map_or(0, |_| crate::ledger::room_held()); // (everything this process spills: `ledger::room`)
     match piece_fits(gb, held, bytes, crate::machine::process().space(folder)) {
         true => Ok(()),
         false => Err(no_room(bytes, gb)),
@@ -4876,7 +4860,7 @@ mod tests {
         let folder = spill_folder().expect("this process's spill folder");
         let manager = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![folder.to_path_buf()])).with_max_temp_directory_size(0).build().expect("a disk manager");
         let manager = Arc::new(manager);
-        SPILLERS.lock().unwrap().push(Arc::downgrade(&manager));
+        crate::ledger::holds(&(manager.clone() as Arc<dyn crate::ledger::Holds>));
         set_room(None);
         let cap = manager.max_temp_directory_size();
         assert!(cap >= manager.used_disk_space() + (1 << 20), "a cap of {cap} with the disk's room");

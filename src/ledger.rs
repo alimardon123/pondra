@@ -7,6 +7,8 @@
 //!   share of it as DataFusion's `MemoryPool`.
 //! - `Charged`, a cache the ledger counts: what it holds, and memory it gives back when the node needs it. The lakes on a
 //!   line charge their caches to it, so the node's memory watch takes memory back from all of them in one way.
+//! - `Holds`, what holds room on the process's spill disk (step 5, piece 7c): one list (`room`) that a shuffle's pieces,
+//!   each lake's query spills and the lakes in memory are on, so a spill's check counts all of them once.
 
 use datafusion::common::human_readable_size;
 use datafusion::error::{DataFusionError, Result};
@@ -584,6 +586,41 @@ pub fn budgets() -> Vec<Arc<Ledger>> {
     roots.iter().flat_map(|r| r.nodes()).collect()
 }
 
+/// What holds room on the process's spill disk (`Room`): its bytes there now, and the most it may take, for one that
+/// takes a cap.
+pub trait Holds: Send + Sync {
+    /// The bytes it holds on the spill disk now, landed or reserved.
+    fn held(&self) -> u64;
+    /// The most it may hold from now on (a query spill disk's cap: `store::spill_room`). Nothing, for one with no cap of its own.
+    fn cap(&self, _bytes: u64) {}
+}
+
+// (the process's spill disk, one list of what holds room on it: a shuffle's pieces (`spill::Shuffles`), each lake's query
+// spills (`store::Spills`' disk manager), the lakes in memory (`memory_lake::Spilled`). Each is held weakly, so one that
+// goes leaves it, and counted as it is now, so a look sees all of it once)
+static ROOM: Mutex<Vec<Weak<dyn Holds>>> = Mutex::new(Vec::new());
+
+/// `h` holds room on the process's spill disk from now on, for as long as it lives.
+pub fn holds(h: &Arc<dyn Holds>) { ROOM.lock().unwrap_or_else(PoisonError::into_inner).push(Arc::downgrade(h)) }
+
+/// What holds room on the spill disk now, the gone ones dropped: each with what it holds (`Holds::held`, read once).
+pub fn room() -> Vec<(Arc<dyn Holds>, u64)> {
+    let holders: Vec<Arc<dyn Holds>> = {
+        let mut room = ROOM.lock().unwrap_or_else(PoisonError::into_inner);
+        room.retain(|h| h.strong_count() > 0);
+        room.iter().filter_map(Weak::upgrade).collect()
+    };
+    holders.into_iter().map(|h| { let held = h.held(); (h, held) }).collect() // (read after the lock is let go: a count may walk a folder)
+}
+
+/// The bytes everything holds on the spill disk now.
+pub fn room_held() -> u64 { room().iter().map(|(_, held)| held).sum() }
+
+/// The bytes everything but `me` holds on the spill disk now (`me` reads its own count, which changes as it reserves).
+pub fn others_hold(me: &dyn Holds) -> u64 {
+    room().iter().filter(|(h, _)| !std::ptr::addr_eq(Arc::as_ptr(h), me as *const dyn Holds)).map(|(_, held)| held).sum()
+}
+
 /// One lake's pool of query memory: `FairSpillPool`'s rules over the lake's share of its ledger's line (`Ledger`).
 #[derive(Debug)]
 pub struct LakePool {
@@ -821,6 +858,28 @@ impl MemoryPool for Halved {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spill disk is one list of what holds room on it: each holder counted as it is now, `others_hold` everything
+    /// but the one asking, and a holder that goes leaves the list. (Other tests' holders share the list: the sizes here
+    /// are past what any of them spills.)
+    #[test]
+    fn the_spill_disk_is_one_list_of_what_holds_room_on_it() {
+        struct Fixed(u64);
+        impl Holds for Fixed {
+            fn held(&self) -> u64 { self.0 }
+        }
+        let (big, small): (Arc<dyn Holds>, Arc<dyn Holds>) = (Arc::new(Fixed(5 << 40)), Arc::new(Fixed(7)));
+        holds(&big);
+        holds(&small);
+        let on = |h: &Arc<dyn Holds>| room().iter().any(|(r, n)| Arc::ptr_eq(r, h) && *n == h.held());
+        assert!(on(&big) && on(&small), "both are on the list, with what they hold");
+        assert!(room_held() >= (5 << 40) + 7);
+        assert!(others_hold(&*small) >= 5 << 40, "the small one sees the big one");
+        assert!(others_hold(&*big) < 5 << 40, "the big one doesn't count itself");
+        drop(big);
+        assert!(others_hold(&*small) < 5 << 40, "a holder that goes leaves the list");
+        assert!(on(&small));
+    }
 
     fn keys(c: &ByteLru<&'static str, u32>) -> Vec<&'static str> { c.iter().map(|(k, _)| *k).collect() }
 
