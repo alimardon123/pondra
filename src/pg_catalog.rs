@@ -138,7 +138,7 @@ struct Rel {
     typed: BTreeMap<String, (u32, i32)>, // columns of a type their Arrow type doesn't say (SQL's names), with its typmod: an enum's type (an inline ENUM('a') is text), uuid, VARCHAR(n)
     comment: Option<String>, // COMMENT ON the relation (`cm/relation/…`, `objects.rs`)
     comments: BTreeMap<String, String>, // COMMENT ON its columns, by SQL name (`cm/column/…` by the stored name)
-    rows: u64,
+    rows: Option<u64>, // (None: not its reader's to know, as for a table a grant's filter on its rows reads in part)
     bytes: u64,
 }
 
@@ -377,7 +377,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool, scope: &cra
         let typed = enums.chain(held_types(&l)).collect();
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = l.columns().filter_map(|(c, _)| Some((c.to_string(), notes.get(&format!("column/{name}/{}", m.stored(c)?))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: scope.shows_code().then(|| mvs.get(name).cloned()).flatten(), identity: l.list().columns.iter().filter_map(|c| Some((c.name.clone(), c.identity.clone()?))).collect(), constraints: if kind == 'm' { scope.shows_code().then(|| l.constraints.clone()).unwrap_or_default() } else { l.constraints.clone() }, checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: scope.shows_code().then(|| mvs.get(name).cloned()).flatten(), identity: l.list().columns.iter().filter_map(|c| Some((c.name.clone(), c.identity.clone()?))).collect(), constraints: if kind == 'm' { scope.shows_code().then(|| l.constraints.clone()).unwrap_or_default() } else { l.constraints.clone() }, checks: l.checks.clone(), typed, comment, comments, rows: Some(rows + sealed.rows + logged.get(name).copied().unwrap_or(0)), bytes: bytes + sealed.bytes });
     }
     let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
     // (a view's columns are its query's: planned only when a client asks for columns, in a
@@ -401,7 +401,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool, scope: &cra
         };
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = cols.iter().filter_map(|(c, ..)| Some((c.clone(), notes.get(&format!("column/{name}/{c}"))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: scope.shows_code().then(|| crate::views::shown(&v.sql)), identity: Default::default(), constraints: scope.shows_code().then(|| v.facts.clone()).unwrap_or_default(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: scope.shows_code().then(|| crate::views::shown(&v.sql)), identity: Default::default(), constraints: scope.shows_code().then(|| v.facts.clone()).unwrap_or_default(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: Some(0), bytes: 0 });
     }
     // A user granted some tables sees those, and of one granted by columns those columns, as at every other
     // listing (`ddl::listed_for`, invariant 382). Postgres's pg_class names every table; Pondra names none its
@@ -413,6 +413,14 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool, scope: &cra
             Some(db) => scope.named("select", &format!("{db}.{table}")),
             None => scope.columns(&table),
         };
+        // (a table a grant's filter on its rows reads in part: its count and size are its hidden rows' too, so unknown)
+        let filtered = |table: String| match attached {
+            Some(db) => scope.rows_named("select", &format!("{db}.{table}")).is_some(),
+            None => scope.rows("select", &table).is_some(),
+        };
+        for r in rels.iter_mut().filter(|r| r.kind != 'v' && filtered(crate::text::join(&r.schema, &r.name))) {
+            (r.rows, r.bytes) = (None, 0);
+        }
         rels.retain_mut(|r| match granted(crate::text::join(&r.schema, &r.name)) {
             None => false,
             Some(None) => true,
@@ -444,10 +452,10 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool, scope: &cra
     let (temp_tables, temp_views) = crate::temp::listed();
     for (name, meta) in temp_tables {
         // (a temporary table is shown as a lake table is: its key, NOT NULL, defaults and checks)
-        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'r', columns: table_columns(&meta), key: meta.key.clone(), sql: None, identity: Default::default(), constraints: vec![], checks: meta.checks.clone(), typed: held_types(&meta).collect(), comment: None, comments: BTreeMap::new(), rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'r', columns: table_columns(&meta), key: meta.key.clone(), sql: None, identity: Default::default(), constraints: vec![], checks: meta.checks.clone(), typed: held_types(&meta).collect(), comment: None, comments: BTreeMap::new(), rows: Some(0), bytes: 0 });
     }
     for (name, sql) in temp_views {
-        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'v', columns: vec![], key: vec![], sql: Some(sql), identity: Default::default(), constraints: vec![], checks: vec![], typed: BTreeMap::new(), comment: None, comments: BTreeMap::new(), rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'v', columns: vec![], key: vec![], sql: Some(sql), identity: Default::default(), constraints: vec![], checks: vec![], typed: BTreeMap::new(), comment: None, comments: BTreeMap::new(), rows: Some(0), bytes: 0 });
     }
     // Sequences (`sq/`): relations of their own, which an identity column counts by. One whose options
     // don't make sense (none can be made) is left out.
@@ -619,10 +627,10 @@ fn tables(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'static str, A
     let mut classes = vec![];
     for r in &l.rels {
         classes.push(vec![o(r.oid), s(r.name.clone()), o(ns(&r.schema)), o(0), o(0), o(owner), o(if r.kind == 'v' { 0 } else { 2 }), o(r.oid), o(0), i4((r.bytes / 8192) as i32),
-            f4(if r.kind == 'v' { -1.0 } else { r.rows as f32 }), i4(0), o(0), b(!r.key.is_empty() || l.indexes.iter().any(|i| i.table == r.oid)), b(false), s(if r.schema == TEMP { "t" } else { "p" }), s(r.kind.to_string()), i2(r.columns.len() as i16), i2(r.checks.len() as i16),
+            f4(match r.rows { Some(rows) if r.kind != 'v' => rows as f32, _ => -1.0 }), i4(0), o(0), b(!r.key.is_empty() || l.indexes.iter().any(|i| i.table == r.oid)), b(false), s(if r.schema == TEMP { "t" } else { "p" }), s(r.kind.to_string()), i2(r.columns.len() as i16), i2(r.checks.len() as i16),
             b(r.kind == 'v'), b(false), b(false), b(false), b(false), b(true), s("d"), b(false), o(0), o(0), o(0), n(), n(), n()]);
         if !r.key.is_empty() {
-            classes.push(vec![o(oid("i", &format!("{}.{}", r.schema, r.name))), s(format!("{}_pkey", r.name)), o(ns(&r.schema)), o(0), o(0), o(owner), o(403), o(0), o(0), i4(1), f4(r.rows as f32),
+            classes.push(vec![o(oid("i", &format!("{}.{}", r.schema, r.name))), s(format!("{}_pkey", r.name)), o(ns(&r.schema)), o(0), o(0), o(owner), o(403), o(0), o(0), i4(1), f4(r.rows.map_or(-1.0, |rows| rows as f32)),
                 i4(0), o(0), b(false), b(false), s("p"), s("i"), i2(r.key.len() as i16), i2(0), b(false), b(false), b(false), b(false), b(false), b(true), s("n"), b(false), o(0), o(0), o(0), n(), n(), n()]);
         }
     }
@@ -762,7 +770,7 @@ fn tables(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'static str, A
     // Statistics of each table and materialized view. Pondra keeps no counts but its rows, and BI tools
     // size a table by `n_live_tup`; both views list the same rows. (A temporary table is no one's.)
     let stats: Vec<Vec<ScalarValue>> = l.rels.iter().filter(|r| matches!(r.kind, 'r' | 'm') && r.schema != TEMP).map(|r| vec![o(r.oid), s(r.schema.clone()), s(r.name.clone()),
-        i8(0), n(), i8(0), i8(0), n(), i8(0), i8(0), i8(0), i8(0), i8(0), i8(0), i8(r.rows as i64), i8(0), i8(0), i8(0), n(), n(), n(), n(), i8(0), i8(0), i8(0), i8(0)]).collect();
+        i8(0), n(), i8(0), i8(0), n(), i8(0), i8(0), i8(0), i8(0), i8(0), i8(0), r.rows.map_or_else(n, |rows| i8(rows as i64)), i8(0), i8(0), i8(0), n(), n(), n(), n(), i8(0), i8(0), i8(0), i8(0)]).collect();
     add!("pg_stat_user_tables", &stat_columns(), stats.clone());
     add!("pg_stat_all_tables", &stat_columns(), stats);
     add!("pg_sequences", &[("schemaname", TEXT), ("sequencename", TEXT), ("sequenceowner", TEXT), ("data_type", TEXT), ("start_value", INT8), ("min_value", INT8),
@@ -2067,7 +2075,7 @@ mod tests {
             oid: oid("r", name), schema: schema.into(), name: table.into(), kind,
             columns: vec![("id".into(), DataType::Int64, true, None), ("region".into(), DataType::Utf8, false, None)],
             key: vec![], sql: None, identity: BTreeMap::new(), constraints: vec![], checks: vec![], typed: BTreeMap::new(),
-            comment: None, comments: BTreeMap::new(), rows, bytes: if kind == 'v' { 0 } else { 4096 },
+            comment: None, comments: BTreeMap::new(), rows: Some(rows), bytes: if kind == 'v' { 0 } else { 4096 },
         }
     }
 
@@ -2132,6 +2140,38 @@ mod tests {
             crate::auth::Principal::node().scope.onto(&given);
             register(&given, &lake, "pondra", pg_class).await?;
             assert_eq!(column(&given, pg_class).await, vec!["a"], "the node's scope: every table");
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(())
+        })
+        .await
+    }
+
+    /// A table its reader's grant filters the rows of (step 6 piece 5b) is counted unknown for that reader: its rows and its
+    /// size are the hidden rows' too. One the grant gives whole is counted as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_table_a_grant_filters_the_rows_of_is_counted_unknown() -> anyhow::Result<()> {
+        crate::auth::as_node(async move {
+            use crate::users::{Access, Grant, On};
+            let dir = std::env::temp_dir().join(format!("pondra-pgrows-{}", uuid::Uuid::new_v4()));
+            let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            for t in ["a", "b"] {
+                crate::write::create_table(&lake, t, r#"{"columns": [["x", "Int64"]]}"#).await?;
+            }
+            let grant = |t: &str, rows: Option<&str>| Grant { privilege: "select".into(), on: On::Table(t.into()), columns: vec![], rows: rows.map(String::from) };
+            let ctx = lake.session();
+            crate::rights::Scope::granted(Arc::new(Access::granted(vec![grant("a", Some("x > 1")), grant("b", None)]))).onto(&ctx);
+            register(&ctx, &lake, "ann", "SELECT reltuples, n_live_tup FROM pg_class, pg_stat_user_tables").await?;
+            let counted = |t: &str| format!("SELECT c.reltuples, s.n_live_tup, c.relpages FROM pg_catalog.pg_class c JOIN pg_catalog.pg_stat_user_tables s ON s.relid = c.oid WHERE c.relname = '{t}'");
+            let row = |sql: String| {
+                let ctx = ctx.clone();
+                async move {
+                    let batches = ctx.sql(&sql).await.expect("plans").collect().await.expect("runs");
+                    datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap().to_string().lines().nth(3).unwrap().trim_matches('|').split('|').map(|v| v.trim().to_string()).collect::<Vec<_>>()
+                }
+            };
+            assert_eq!(row(counted("a")).await, ["-1.0", "", "0"], "unknown: reltuples -1, n_live_tup NULL (printed empty), no pages");
+            assert_eq!(row(counted("b")).await, ["0.0", "0", "0"], "counted as before");
             lake.cat.close().await?;
             let _ = std::fs::remove_dir_all(&dir);
             Ok(())
