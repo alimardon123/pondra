@@ -156,8 +156,8 @@ fn took(schemas: &[String], name: &str) -> bool {
     schemas.is_empty() || schemas.iter().any(|s| s == name.split_once('.').map_or(crate::text::PUBLIC, |(s, _)| s))
 }
 
-/// `_base/<id>/rest` as (id, rest).
-pub fn split(path: &str) -> Option<(&str, &str)> { path.strip_prefix("_base/")?.split_once('/') }
+/// `_base/<id>/rest` as (id, rest): the lake reads such a path in the base (`store::base_path`).
+pub use crate::store::base_path as split;
 
 /// A base's path as the branch names it: its own files under the base's prefix; a path that
 /// names a lake already (`_base/…`, a URL) stays as it is.
@@ -543,7 +543,7 @@ async fn stamp(lake: &Lake, d: &mut Ddl) -> Result<()> {
 /// Branches as readers of the lake they are made from (`pins`): their pins hold its files, a pin on lease lapses
 /// (`lapse`), and a pin whose branch is gone goes (`sweep`).
 pub fn readers() -> crate::pins::Pin {
-    crate::pins::Pin { name: "branches", held: |l| Box::pin(pins(l)), lapse: Some(|l| Box::pin(lapse(l))), sweep: Some(|l| Box::pin(sweep(l))) }
+    crate::pins::Pin { name: "branches", held: |l| Box::pin(pins(l)), lapse: Some(|l| Box::pin(lapse(l))), sweep: Some(|l| Box::pin(sweep(l))), floor: None }
 }
 
 /// The pins clean-up keeps files for: the oldest and the newest (None: no branch reads this lake).

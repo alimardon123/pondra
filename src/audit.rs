@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use datafusion::common::instant::Instant;
 use std::time::Duration;
 
-pub const TABLE: &str = "pondra$audit";
+pub const TABLE: &str = crate::records::AUDIT;
 
 /// One thing done, or refused.
 struct Line {

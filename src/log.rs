@@ -401,8 +401,8 @@ impl Log {
     /// The queue both doors use. `made_for` is the table the rows were shaped for, if they were: the rows are checked again
     /// (held forms, then the rules) only when the table is not that one.
     async fn queued(&self, table: String, src: Src, batch: RecordBatch, made_for: Option<Arc<crate::rules::Table>>) -> Result<impl std::future::Future<Output = Result<Ack>> + use<>> {
-        if crate::backup::frozen(&self.lake) {
-            return Err(crate::backup::refused(Some(&self.lake.url))); // (every door's rows: HTTP, Kafka, Flight, COPY)
+        if crate::frozen::frozen(&self.lake) {
+            return Err(crate::frozen::refused(Some(&self.lake.url))); // (every door's rows: HTTP, Kafka, Flight, COPY)
         }
         let batch = match self.lake.cat.meta(&table_key(&table)).await? {
             Some(m) => {
@@ -909,9 +909,9 @@ impl Producers {
 #[allow(clippy::too_many_arguments)]
 async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &mut Producers, sequences: &mut crate::seq::Held, held: &Held, batch: Vec<(Flush, oneshot::Sender<Outcome>)>, ms: &Arc<Mutex<Vec<f64>>>, slot: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
     let start = Instant::now();
-    if crate::backup::frozen(lake) {
+    if crate::frozen::frozen(lake) {
         // (a backup takes no rows, blocks or sequences' values: only its runs write it, ADR-070)
-        let why = format!("{:#}", crate::backup::refused(Some(&lake.url)));
+        let why = format!("{:#}", crate::frozen::refused(Some(&lake.url)));
         for (_, reply) in batch {
             let _ = reply.send(Outcome::Refused(why.clone()));
         }

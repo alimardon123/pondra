@@ -143,6 +143,8 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             lake.add("sequences", crate::seq::register); // nextval, currval, setval
             lake.add("secrets", crate::ext::register_secrets); // secrets()
         }
+        #[cfg(feature = "lake")] // (what a lake does as it opens: `store::OpenHooks`)
+        r.section_mut::<crate::store::OpenHooks>().add("branch bases", |lake| Box::pin(crate::branch::load(lake)));
         #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: each says what its state holds, `LakeState::ABOUT`)
         {
             let states = r.section_mut::<crate::lake_state::Registered>();
@@ -172,7 +174,9 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         #[cfg(feature = "lake")]
         r.section_mut::<crate::records::Rights>().add(crate::users::RIGHTS);
         #[cfg(feature = "lake")] // (who still reads a lake's old files: `pins`)
-        r.section_mut::<crate::pins::Pins>().add(crate::branch::readers());
+        for p in [crate::branch::readers(), crate::tasks::readers(), crate::rerun::readers()] {
+            r.section_mut::<crate::pins::Pins>().add(p);
+        }
         #[cfg(feature = "lake")] // (what the catalog keeps with its entries: the folders each table uses)
         r.section_mut::<crate::store::CatalogHooks>().add(crate::ddl::folder_hook());
         #[cfg(feature = "lake")] // (what the log's commits call: a view's rows, derived as its sources' are packed)
