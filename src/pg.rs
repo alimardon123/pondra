@@ -524,7 +524,7 @@ impl Backend {
             return Err(self.err()(crate::codes::coded("28000", "sign in first")));
         }
         if crate::routines::runs_procedure(&sql) {
-            let who = crate::routines::Who { role, files: false, depth: 0, scope: self.who().scope }; // (planned for its sign-in)
+            let who = crate::routines::Who::signed(self.who(), role, false); // (planned for its sign-in)
             return match crate::routines::one(&self.app, &sql, who, None).await.map_err(self.err())? {
                 crate::routines::Outcome::Rows(batches) => {
                     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
@@ -536,7 +536,7 @@ impl Backend {
         if let Some(w) = crate::with_writes::of(&sql) {
             // a WITH that writes (`WITH m AS (DELETE … RETURNING *) INSERT …`): its steps, then its answer, under its command's tag
             let w = w.map_err(self.err())?;
-            let who = crate::routines::Who { role, files: false, depth: 0, scope: self.who().scope }; // (planned for its sign-in)
+            let who = crate::routines::Who::signed(self.who(), role, false); // (planned for its sign-in)
             return Ok(match Box::pin(crate::with_writes::run(&self.app, &w, who, None)).await.map_err(self.err())? {
                 crate::routines::Outcome::Rows(batches) => {
                     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
@@ -607,7 +607,8 @@ impl Backend {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), "57P01".into(), "this node is stopping: connect to another node".into()))));
         }
         let run = async { crate::panics::door(&self.app.lake.node, Box::pin(self.run(user, sql, format))).await.unwrap_or_else(|m| Err(self.err()(anyhow::anyhow!(m)))) };
-        let out = crate::audit::statement(&self.app, sql, run).await;
+        let by = self.who();
+        let out = crate::audit::statement(&self.app, Some(&by), sql, run).await;
         if let Err(e) = &out {
             if crate::text::control(sql).is_none() {
                 crate::txn::failed(&e.to_string());
@@ -734,7 +735,7 @@ impl Backend {
     /// `COPY t FROM STDIN`: what is to come, noted on the connection (`on_copy_data` gathers it). Its line in the audit log
     /// is written when it ends, or now if it is refused (`writer::Load`).
     async fn copy_in<C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send>(&self, client: &mut C, _user: &str, c: Copy) -> PgWireResult<Response> {
-        let mut load = crate::writer::Load::new(&self.app, None, "COPY FROM STDIN", &c.table);
+        let mut load = crate::writer::Load::new(&self.app, self.who(), "COPY FROM STDIN", &c.table);
         let (copy, n) = self.copy_begun(client, c).await.inspect_err(|e| load.end(Some(said(e))))?;
         *self.copy.lock().unwrap() = Some(Pending { copy, data: vec![], ends: Default::default(), rows: 0, seq: 0, job: uuid::Uuid::new_v4().to_string(), ended: false, load });
         Ok(Response::CopyIn(CopyResponse::new(0, n, stream::empty())))
@@ -1781,7 +1782,8 @@ impl Backend {
     /// history and the audit log). Metabase's and DBeaver's catalog queries failed this way, unrecorded.
     async fn noted<T>(&self, sql: &str, out: PgWireResult<T>) -> PgWireResult<T> {
         let Err(e) = out else { return out };
-        let failed = crate::audit::statement(&self.app, sql, async { Err::<T, _>(e) });
+        let by = self.who();
+        let failed = crate::audit::statement(&self.app, Some(&by), sql, async { Err::<T, _>(e) });
         crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(self.who(), failed)).await
     }
 

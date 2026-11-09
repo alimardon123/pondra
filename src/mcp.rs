@@ -27,7 +27,7 @@ pub async fn handle(State(app): State<App>, Extension(who): Extension<crate::aut
         return Json(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "not JSON"}})).into_response();
     };
     let Some(id) = req.get("id").cloned() else { return StatusCode::ACCEPTED.into_response() }; // a notification
-    let session = match named(&headers) {
+    let session = match named(&headers, &who.name) {
         Ok(session) => session,
         Err(refused) => return refused,
     };
@@ -48,7 +48,7 @@ pub async fn handle(State(app): State<App>, Extension(who): Extension<crate::aut
         "initialize" => {
             let raw = format!("mcp-{}", uuid::Uuid::new_v4().simple());
             if let Some(at) = crate::temp::sessions(&app.lake) {
-                let _ = at.with(&crate::temp::id(&raw), false, |_| Ok(())); // (held from now: idle ends it, `reap`)
+                let _ = at.with(&crate::temp::id(&who.name, &raw), false, |_| Ok(())); // (held from now: idle ends it, `reap`)
             }
             minted = Some(raw);
             json!({
@@ -81,10 +81,10 @@ pub async fn handle(State(app): State<App>, Extension(who): Extension<crate::aut
 /// 64 characters) that `initialize` gave. Any other value is a 400. Whether this node still holds
 /// it is `handle`'s check (404). Keyed by the user, as `/sessions/{id}` is, so another user's id is
 /// another session.
-fn named(headers: &HeaderMap) -> Result<Option<String>, Response> {
+fn named(headers: &HeaderMap, user: &str) -> Result<Option<String>, Response> {
     let Some(h) = headers.get("mcp-session-id") else { return Ok(None) };
     match h.to_str().ok().filter(|id| valid(id)) {
-        Some(id) => Ok(Some(crate::temp::id(id))),
+        Some(id) => Ok(Some(crate::temp::id(user, id))),
         None => Err(refused("Mcp-Session-Id: the id initialize gave (mcp- and letters and digits)")),
     }
 }
@@ -101,8 +101,8 @@ fn valid(id: &str) -> bool {
 
 /// `DELETE /mcp` with its `Mcp-Session-Id`: the session ends, its transaction rolled back and its
 /// temporary tables gone, as an MCP client does when it closes. One this node doesn't hold is 404.
-pub async fn end(State(app): State<App>, headers: HeaderMap) -> Response {
-    match named(&headers) {
+pub async fn end(State(app): State<App>, Extension(who): Extension<crate::auth::Principal>, headers: HeaderMap) -> Response {
+    match named(&headers, &who.name) {
         Ok(Some(session)) if crate::temp::sessions(&app.lake).is_some_and(|at| at.live(&session)) => {
             if let Some(at) = crate::temp::sessions(&app.lake) {
                 at.end(&session);
@@ -295,7 +295,7 @@ async fn query(app: &App, who: &crate::auth::Principal, sql: &str) -> Result<Str
     }
     let req = crate::routines::Request { sql: sql.to_string(), ..Default::default() };
     let how = crate::statement::How { job: None, spread: None, after: None, stale: None };
-    let who = crate::routines::Who { role: who.role, files: false, depth: 0, scope: who.scope.clone() };
+    let who = crate::routines::Who::signed(who.clone(), who.role, false);
     match crate::statement::run(app, req, how, who, &McpWire).await? {
         crate::statement::Answer::Own(text) => Ok(text),
         crate::statement::Answer::Done(v) => Ok(v.to_string()),
@@ -355,8 +355,8 @@ async fn run(app: &App, who: &crate::auth::Principal, sql: &str, job: Option<Str
     if crate::temp::current().is_none() && parts == 1 && crate::text::control(sql).is_some() {
         return Err(crate::codes::coded("0A000", "a transaction needs a session: send initialize and keep the Mcp-Session-Id it gives"));
     }
-    let who = crate::routines::Who { role: who.role, files: false, depth: 0, scope: who.scope.clone() };
-    let own = (crate::temp::current().is_none() && parts > 1).then(crate::temp::of_script);
+    let who = crate::routines::Who::signed(who.clone(), who.role, false);
+    let own = (crate::temp::current().is_none() && parts > 1).then(|| crate::temp::of_script(who.name()));
     // (named, so the future borrows values that live as long as it does)
     let (params, views) = (HashMap::new(), HashMap::new());
     let go = crate::routines::script(app, sql, &params, &views, who, job);
@@ -374,7 +374,7 @@ async fn run(app: &App, who: &crate::auth::Principal, sql: &str, job: Option<Str
 
 /// A procedure's answer, as a tool's: its rows or outcome, and what it printed (`notices`).
 async fn called(app: &App, who: &crate::auth::Principal, sql: &str, job: Option<&str>) -> Result<String> {
-    let who = crate::routines::Who { role: who.role, files: false, depth: 0, scope: who.scope.clone() };
+    let who = crate::routines::Who::signed(who.clone(), who.role, false);
     let (out, heard) = crate::routines::with_notices(crate::routines::one(app, sql, who, job.map(String::from))).await;
     answer(out, heard)
 }

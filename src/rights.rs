@@ -389,7 +389,8 @@ pub fn asks(stmt: &Stmt) -> (String, Vec<Action>) {
         Stmt::Create(c) => (catalog_name(&crate::text::object(&c.name)), vec![Action::Define]),
         Stmt::Define(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => (catalog_name(t), vec![Action::Define]),
         // (an extension's statement: the right its entry names, `statements::role`, an admin's for each today)
-        Stmt::Ddl(ds) if ds.iter().any(|d| matches!(d, crate::ddl::Ddl::Entry { .. })) => (String::new(), Action::of_role(crate::statements::role(ds)).into_iter().collect()),
+        // (UNDROP of a kind one of them drops: that DROP's right)
+        Stmt::Ddl(ds) if ds.iter().any(|d| matches!(d, crate::ddl::Ddl::Entry { .. }) || crate::statements::undrops_entry(d)) => (String::new(), Action::of_role(crate::statements::role(ds)).into_iter().collect()),
         Stmt::Ddl(_) => (String::new(), vec![Action::Define]),
         Stmt::CopyTo(..) => (String::new(), vec![Action::Export]),
         // (a statement written wrong, or a temporary object of another session's: its own answer says why)
