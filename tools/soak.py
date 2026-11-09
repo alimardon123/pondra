@@ -15,7 +15,7 @@ and then, and what drifts over time measured.
 
   Each minute it writes a line to --timeline: every node's resident memory (and its anonymous memory by
   kind of mapping: glibc's heaps, thread stacks, the rest, and the rest's huge and lazily freed pages and
-  largest mappings; with jemalloc's statistics built in, its count), its threads, its queries (running, waiting, finished, failed) and the query memory they hold, the
+  largest mappings; with jemalloc's statistics built in, its count), its threads, its queries (running, waiting, finished, failed, the seconds they took, how many spread over the nodes) and the query memory they hold, the
   leader's rows not yet tiered and its commit times, the longest a batch waited for its
   acknowledgement, the lake's objects (a folder's; a bucket's every 30 minutes).
 
@@ -32,7 +32,7 @@ and then, and what drifts over time measured.
   bucket was asked and holds at S3's and R2's list prices (tools/prices.py): dollars a month at this load.
 
 --s3: the lake is s3://$PONDRA_BUCKET/soak-<id> (AWS_* point at R2, MinIO or tools/sim_r2.py),
-deleted at the end unless --keep.
+deleted at the end unless --keep. The nodes' logs stay in the run's folder (/tmp/pondra-soak-*) either way.
 
 Legs (a day where a machine lasts six hours: GitHub's runners, soak.yml): --save ends a leg with
 its checks, stops the nodes (followers, then the leader: drained, stepping down) and writes what
@@ -60,6 +60,29 @@ def status_of(n, key):
             return next(int(l.split()[1]) for l in f if l.startswith(key + ":"))
     except (OSError, StopIteration, AttributeError):
         return None
+
+
+def cpu():
+    """The machine's CPU time so far (Linux /proc/stat, in ticks): (busy, stolen, all), or None. Stolen is
+    what the hypervisor gave another machine: a runner slow for its neighbours, not for Pondra."""
+    try:
+        with open("/proc/stat") as f:
+            t = [int(v) for v in f.readline().split()[1:9]]  # (user nice system idle iowait irq softirq steal)
+        return sum(t) - t[3] - t[4] - t[7], t[7], sum(t)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def machine():
+    """What the soak ran on (Linux): its CPU's model, cores and memory, so legs on different runners can be told apart."""
+    def first(path, key):
+        try:
+            with open(path) as f:
+                return next((l.split(":", 1)[1].strip() for l in f if l.startswith(key)), None)
+        except OSError:
+            return None
+    mem = first("/proc/meminfo", "MemTotal")
+    return {"cpu": first("/proc/cpuinfo", "model name"), "cores": os.cpu_count(), "memory_gb": mem and round(int(mem.split()[0]) / 2**20, 1)}
 
 
 def rss_mb(n, kind="VmRSS"):
@@ -218,6 +241,7 @@ def main():
     timeline, moves, start = open(A.timeline, "w"), [], time.time()
     kinds = [("leader", "term"), ("leader", "kill"), ("follower", "term"), ("follower", "kill")]
     next_move, last_list, samples, last, mark = start + (secs + 1 if A.steady else every), 0, [], {}, start
+    ticks = cpu()
     while time.time() - start < secs:
         time.sleep(max(0, mark + (60 if secs > 600 else 10) - time.time()))
         leader = next((x for x in live if role_or(x, role) == "leader"), None)
@@ -238,12 +262,16 @@ def main():
         reported = {op for ops in counts.values() for op in ops}
         rates = {op: round(deltas[op] / max(span, 1), 1) for op in OPS if op in reported}
         made = deltas["write"]
+        now_ticks = cpu()
+        used = ticks and now_ticks and [b - a for a, b in zip(ticks, now_ticks)]
+        ticks = now_ticks
         if not A.s3 or time.time() - last_list > 1800:
             listed, last_list = objects(lake), time.time()
-        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "requests_per_s": rates, "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "maps_mb": {x.port: maps_mb(x) for x in live}, "threads": {x.port: status_of(x, "Threads") for x in live}, "jemalloc_mb": {p: allocator_mb(g) for p, g in got.items()}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "queries": {p: [int(g.get(f"pondra_queries_{k}", 0)) for k in ("running", "waiting", "total")] + [int(g.get("pondra_query_errors_total", 0))] for p, g in got.items()}, "query_mb": {p: round(g.get("pondra_memory_reserved_bytes", 0) / 2**20) for p, g in got.items()}, "reads": load.reads[0], "hwm": {x.port: hwm_of(x) for x in live}, "pids": {x.port: x.p.pid for x in live}, "images": {x.port: images(x) for x in live},
+        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "requests_per_s": rates, "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "maps_mb": {x.port: maps_mb(x) for x in live}, "threads": {x.port: status_of(x, "Threads") for x in live}, "jemalloc_mb": {p: allocator_mb(g) for p, g in got.items()}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "queries": {p: [int(g.get(f"pondra_queries_{k}", 0)) for k in ("running", "waiting", "total")] + [int(g.get("pondra_query_errors_total", 0))] for p, g in got.items()}, "query_s": {p: round(g.get("pondra_query_seconds_total", 0), 1) for p, g in got.items()}, "spread": {p: int(g.get("pondra_spread_queries_total", 0)) for p, g in got.items()}, "query_mb": {p: round(g.get("pondra_memory_reserved_bytes", 0) / 2**20) for p, g in got.items()}, "reads": load.reads[0], "hwm": {x.port: hwm_of(x) for x in live}, "pids": {x.port: x.p.pid for x in live}, "images": {x.port: images(x) for x in live},
                 "untiered_rows": stats.get("untiered_rows"), "commit_ms_p95": stats.get("commit_ms_p95"),
                 "longest_ack_s": load.longest(mark), "acked": sum(load.acked.values()),
-                "torn": len(load.torn), **({"objects": listed} if listed else {})}
+                "torn": len(load.torn), **({"objects": listed} if listed else {}),
+                **({"cpu_pct": {"busy": round(100 * used[0] / used[2], 1), "stolen": round(100 * used[1] / used[2], 1)}} if used and used[2] else {})}
         for m in moves:  # (a stop's longest wait, once its batches have all been answered)
             if "window" in m and m["window"][1] < mark and not load.waiting(*m["window"]):
                 m["longest_ack_s"] = load.longest(*m.pop("window"))
@@ -277,7 +305,7 @@ def main():
     leader = next(x for x in live if role_or(x, role) == "leader")
     result = load.finish(leader)
     ups.join(30)
-    checks, info = {}, {"moves": moves, **{k: v for k, v in result.items() if k != "reads"}, "reads": result["reads"]}
+    checks, info = {}, {"machine": machine(), "moves": moves, **{k: v for k, v in result.items() if k != "reads"}, "reads": result["reads"]}
     drained = until(lambda: leader.get("/stats")["untiered_rows"] == 0, 120, step=2)
     same = lambda sql: all(x.q(sql) == live[0].q(sql) for x in live)
     kv = {r["k"]: r["v"] for r in live[0].q("SELECT k, v FROM kv")}
@@ -342,8 +370,10 @@ def main():
                    "moves": was["moves"] + len(moves), "legs": legs}, open(A.save, "w"))
     elif not A.keep:
         remove(lake)
-        if ok:
-            shutil.rmtree(work, ignore_errors=True)
+        if ok:  # (the nodes' logs stay, a passed day's last leg's too: soak-leg.yml keeps them beside its results)
+            for p in os.listdir(work):
+                if not p.endswith(".log"):
+                    (shutil.rmtree if os.path.isdir(os.path.join(work, p)) else os.remove)(os.path.join(work, p))
     if not ok:
         print(f"(node logs kept in {work})", file=sys.stderr)
     sys.exit(0 if ok else 1)
