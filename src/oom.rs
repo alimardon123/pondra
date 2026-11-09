@@ -183,28 +183,13 @@ pub fn wake() {
     WATCH.wake.notify_one()
 }
 
-/// Takes about `bytes` back from the caches of every node in the process (`ledger::budgets`, `Ledger::give_back_kind`), and says how many bytes came back. The
-/// watch gives them back past [`trim_line`], before it stops any query. A lake opened outside a node (`pondra sql`,
-/// `pondra catalog`, `pondra backup`) holds its caches to their own budgets alone, since no watch runs in its process.
-/// A kind at a time across the nodes' budgets, so a budget's ranges never go before another's hot columns (11-06 audit L7).
+/// Takes about `bytes` back from the caches of every node in the process (`ledger::budgets`), and says how many bytes came
+/// back: in the one order a grow takes them from other nodes in too (`ledger::give_back_across`: a kind at a time, the
+/// node holding the most of it first). The watch gives them back past [`trim_line`], before it stops any query. A lake
+/// opened outside a node (`pondra catalog`, `pondra backup`) holds its caches to their own budgets alone, since no watch
+/// runs in its process.
 fn give_back(bytes: usize) -> usize {
-    let ledgers = crate::store::ledgers();
-    let mut kinds: Vec<&'static str> = vec![];
-    for kind in ledgers.iter().flat_map(|ledger| ledger.kinds()) {
-        if !kinds.contains(&kind) {
-            kinds.push(kind);
-        }
-    }
-    let mut freed = 0;
-    for kind in kinds {
-        for ledger in &ledgers {
-            if freed >= bytes {
-                return freed;
-            }
-            freed += ledger.give_back_kind(kind, bytes - freed);
-        }
-    }
-    freed
+    crate::ledger::give_back_across(&crate::store::ledgers(), bytes, false)
 }
 
 /// Starts the process's watch (`Watch`), when the process can say how much memory it holds and the caches can be given

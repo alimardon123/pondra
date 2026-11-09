@@ -117,6 +117,29 @@ impl Held {
 }
 
 /// The decoded columns give memory back first when the node needs it (`Lake::caches`): a column is decoded again when it is read.
+/// A lake's hot columns, made as it opens (`lake_state::Registered::add_at_open`), sized by what it says of itself: its
+/// caches give memory back in the order it lists them, these first (`Lake::caches`), and its merges' old files go from it
+/// (`files_gone`).
+impl crate::lake_state::LakeState for Hot {
+    const NAME: &'static str = "hot";
+    const ABOUT: &'static str = "decoded columns of the files queries read lately";
+
+    fn make() -> Self { Hot::new(false, None) } // (a lake that didn't open: its query memory's quarter, as a page's)
+
+    fn make_as_it_opens(opening: &crate::lake_state::Opening) -> Self { Hot::new(opening.memory, opening.ram) }
+
+    fn cache(self: Arc<Self>) -> Option<Arc<dyn crate::ledger::Charged>> { Some(self) }
+
+    fn keeps_files(&self) -> bool { self.on() }
+
+    fn files_gone(&self, files: &[(String, u64)]) { self.forget(files) }
+}
+
+impl Lake {
+    /// This lake's hot columns (`Hot`).
+    pub fn hot(&self) -> Arc<Hot> { self.state::<Hot>().expect("the engine keeps a lake's hot columns (`engine::ENGINE`)") }
+}
+
 impl crate::ledger::Charged for Hot {
     fn held(&self) -> usize { self.usage().0 }
 
@@ -790,13 +813,14 @@ impl TableProvider for HotFiles {
         });
         let deletes = self.meta.key.is_empty(); // (a keyed table's positions are older versions its own reads pass over)
         let (mut held, mut cold) = (vec![], vec![]);
+        let hot = self.lake.hot(); // (once a scan, not once a file)
         for f in &self.files {
             // A scan of no columns reads no data: a plain file is its rows, from the catalog (no lookup, no load).
             if schema.fields().is_empty() && plain_file(f, deletes) {
                 held.push(Held::rows_only(f.rows));
                 continue;
             }
-            match self.lake.hot.get(&key(f, deletes), &schema) {
+            match hot.get(&key(f, deletes), &schema) {
                 Some(h) => held.push(h),
                 None => cold.push(f),
             }
@@ -824,7 +848,7 @@ impl TableProvider for HotFiles {
         }
         drop(holder); // (its copies are in the plan's files: the loads wait for them; with no file to carry it, they start now)
         for f in cold {
-            self.lake.hot.load(self.lake.clone(), f.clone(), schema.fields().to_vec(), deletes, gate.clone()); // (in the background: the next read has the file)
+            hot.load(self.lake.clone(), f.clone(), schema.fields().to_vec(), deletes, gate.clone()); // (in the background: the next read has the file)
         }
         if !held.is_empty() {
             let source = HotSource::new(schema.clone(), held, state.config().target_partitions().max(1), self.known.clone(), self.lake.node.metrics.clone());

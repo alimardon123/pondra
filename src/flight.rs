@@ -48,7 +48,7 @@ type Out<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     // (a message up to 1 GiB, as HTTP takes a batch, but only from a caller `Gate` has signed in)
     let service = FlightServiceServer::new(Door(Sql(app.clone()))).max_decoding_message_size(1 << 30).max_encoding_message_size(1 << 30);
-    let doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Flight).await?; // (TLS too: `tls.rs`)
+    let doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Flight, &app.lake.node.tasks, crate::auth::Door).await?; // (TLS too: `tls.rs`)
     // (it closes with the HTTP door, gracefully: the answers being written go out whole, and the node's stop waits for its
     // connections to close, `Drain::serving`, as an answer's last messages may still be in one when its stream has ended)
     let (_serving, closing) = (app.lake.node.drain.serving(), app.lake.node.drain.closing());

@@ -16,8 +16,9 @@ channel in its type: a table of constants, or a setting read once) need neither.
 here by file, line and name, saying what to do. `--list` prints every static and how it passes.
 
 Two more ways a node outlives its stop fail here too: a task started with `tokio::spawn` (or on a
-runtime's handle) outside `spawns.rs`, which `Node::stop` can't end (start it with `spawns::spawn`
-or `spawns::task`), and `std::env::set_var` anywhere (the environment is the process's: the next
+runtime's handle) outside `spawns.rs`, which `Node::stop` can't end (start it on the node's list,
+`Tasks::spawn_node` or `Tasks::spawn_as`, or with `spawns::for_statics` for a loop of the node's
+statics), and `std::env::set_var` anywhere (the environment is the process's: the next
 node and every child process would read it, and beside a library's host it is a data race).
 
 And a page builds every module but the doors' (ADR-072): std's `Instant` and `SystemTime::now` panic
@@ -290,7 +291,7 @@ def leaks():
             for n, line in enumerate(text.split("\n"), 1):
                 code = line.split("//", 1)[0]
                 if SPAWN.search(code):
-                    bad.append(f"src/{rel}:{n}: a task Node::stop can't end: start it with crate::spawns::task (or spawns::spawn for a loop the node can't do without)")
+                    bad.append(f"src/{rel}:{n}: a task Node::stop can't end: start it on the node's list (node.tasks.spawn_node, or spawn_as for a request's work), or with crate::spawns::for_statics for a loop of the node's statics")
                 if "set_var(" in code:
                     bad.append(f"src/{rel}:{n}: the environment is the process's, not the node's: give a setting with crate::env::give, keep a node's state in a per_node! static, or pass a child process its environment with Command::env")
     return bad

@@ -85,6 +85,10 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     for r in rules.iter_mut().filter(|r| r.name() == "eliminate_outer_join") {
         *r = Arc::new(crate::asof::KeepOuter(r.clone()));
     }
+    // (the rules that answer a part with no scan: never one that reads a table its reader reads in part, `KeepGuarded`)
+    for r in rules.iter_mut().filter(|r| matches!(r.name(), "eliminate_filter" | "eliminate_limit" | "propagate_empty_relation" | "eliminate_join")) {
+        *r = Arc::new(crate::query::KeepGuarded(r.clone()));
+    }
     let at = rules.iter().position(|r| r.name() == "push_down_filter").map_or(rules.len(), |i| i + 1);
     let ordered = crate::env::get("PONDRA_JOIN_ORDER").as_deref() != Some("0");
     rules.insert(at, Arc::new(GroupOnlyJoined));
@@ -2207,6 +2211,25 @@ pub(crate) fn flatten(plan: &LogicalPlan, equality: NullEquality, leaves: &mut V
             filters.extend(rest);
             flatten(&j.left, equality, leaves, keys, filters);
             flatten(&j.right, equality, leaves, keys, filters);
+        }
+        _ => leaves.push(plan.clone()),
+    }
+}
+
+/// `flatten`, through the projections of columns as they are that sit between the joins once they are ordered (TPC-DS
+/// q04's customer, joined to its sales below the date's join): for a rule that makes the joins again from the leaves,
+/// which then give every column the projections passed on (`eager`).
+pub(crate) fn flatten_through(plan: &LogicalPlan, equality: NullEquality, leaves: &mut Vec<LogicalPlan>, keys: &mut Vec<(Expr, Expr)>, filters: &mut Vec<Expr>) {
+    match plan {
+        LogicalPlan::Projection(p) if p.expr.iter().all(|e| matches!(e, Expr::Column(_))) && matches!(p.input.as_ref(), LogicalPlan::Join(j) if flat(j, equality)) => {
+            flatten_through(&p.input, equality, leaves, keys, filters)
+        }
+        LogicalPlan::Join(j) if flat(j, equality) => {
+            let (on, rest) = equalities(j);
+            keys.extend(on);
+            filters.extend(rest);
+            flatten_through(&j.left, equality, leaves, keys, filters);
+            flatten_through(&j.right, equality, leaves, keys, filters);
         }
         _ => leaves.push(plan.clone()),
     }

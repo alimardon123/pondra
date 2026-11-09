@@ -138,6 +138,7 @@ impl crate::spawns::Carry for Carried {
 
 /// A door's connection, as a task it starts (`spawns::Tasks::spawn_as`): no principal of its own, since each request
 /// on it sets the one it signed in as (`WHO`), and work outside one sees nothing.
+#[derive(Clone, Copy)]
 pub struct Door;
 
 impl crate::spawns::Carry for Door {
