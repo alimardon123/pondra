@@ -91,7 +91,7 @@ fn idle() -> Duration { crate::env::secs("PONDRA_DATABASE_IDLE_SECS") }
 /// Does `path` hold lakes rather than be one (`pondra serve data`: each a database)? Not when it
 /// holds one itself, or is new or empty (it becomes a lake).
 pub async fn holds_lakes(path: &str) -> anyhow::Result<bool> {
-    Ok(!is_lake(path).await? && !crate::ddl::lakes_found(path).await.unwrap_or_default().is_empty()) // (dropped ones too: kept, they are still its)
+    Ok(!is_lake(path).await? && !crate::ddl::lakes_found(path, None).await.unwrap_or_default().is_empty()) // (dropped ones too: kept, they are still its)
 }
 
 /// Is there a lake at `dir` (a folder, or a bucket's prefix)? One being made counts: its first
@@ -104,7 +104,7 @@ pub async fn is_lake(dir: &str) -> Result<bool> {
         // other, and a node started at the same moment looked in between)
         return Ok(d.join("catalog").is_dir() || d.join("cluster").is_dir());
     }
-    let store = crate::store::open_store(dir)?.1;
+    let store = crate::store::open_store(dir, None)?.1; // (the database server's own folder or bucket, as the environment reaches it)
     for prefix in ["catalog", "cluster/term"] {
         if futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from(prefix)))).await.transpose()?.is_some() {
             return Ok(true);
@@ -118,7 +118,7 @@ fn place(folder: &str, name: &str) -> String { format!("{}/{name}", folder.trim_
 
 /// The lakes in the folder: its subfolders that hold one, by name.
 async fn databases(folder: &str) -> Vec<String> {
-    match crate::ddl::lakes_in(folder).await {
+    match crate::ddl::lakes_in(folder, None).await {
         Ok(all) => all.into_iter().map(|(n, _)| n).collect(),
         Err(e) => {
             eprintln!("listing the databases in {folder}: {e:#}");
@@ -127,8 +127,14 @@ async fn databases(folder: &str) -> Vec<String> {
     }
 }
 
-/// A port nobody listens on (the OS picks it).
-fn free_port() -> Result<u16> { Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port()) }
+/// Two ports nobody listens on, not the same one (the OS picks them, and both are held until both are known).
+fn free_ports() -> Result<(u16, u16)> {
+    let (a, b) = (std::net::TcpListener::bind("127.0.0.1:0")?, std::net::TcpListener::bind("127.0.0.1:0")?);
+    Ok((a.local_addr()?.port(), b.local_addr()?.port()))
+}
+
+/// Whether another socket holds `port` now: a listener, or a connection out that was given it.
+fn taken(port: u16) -> bool { std::net::TcpListener::bind(("127.0.0.1", port)).is_err() }
 
 impl Server {
     /// The database a request without `/db/` means.
@@ -158,16 +164,38 @@ impl Server {
             }
         }
         let dir = place(&self.folder, name);
-        if let Some(k) = crate::undrop::lake_kept(&dir).await? {
+        if let Some(k) = crate::undrop::lake_kept(&dir, None).await? {
             bail!("database \"{name}\" does not exist: it was dropped, and is kept until {} (UNDROP DATABASE {name} brings it back)", crate::undrop::when(k.until()));
         }
         if !create && !is_lake(&dir).await? {
             bail!("database \"{name}\" does not exist (CREATE DATABASE {name})");
         }
-        let (http, pg) = (free_port()?, free_port()?);
+        // (a port picked here is free until the node binds it, and another process may take it meanwhile: a
+        // connection out is given a port from the same range. A node that stops as it starts while one of its
+        // ports is taken is started again on two others.)
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let (http, pg) = free_ports()?;
+            match self.start(name, &dir, http, pg).await? {
+                Some(child) => {
+                    let activity = Arc::new(Activity { busy: Default::default(), last: std::sync::Mutex::new(Instant::now()) });
+                    let busy = Busy::new(&activity);
+                    self.nodes.lock().await.insert(name.to_string(), Node { http, pg, child, activity });
+                    return Ok((http, pg, busy));
+                }
+                None if attempt < 3 => eprintln!("the node of database {name} couldn't listen on port {http} or {pg}, which another process took: starting it again"),
+                None => bail!("the node of database {name} couldn't listen on port {http} or {pg} three times: another process took them"),
+            }
+        }
+    }
+
+    /// Start database `name`'s node on these ports and wait for it to answer. None: it stopped as it started while
+    /// one of them is taken (`node` starts it again on others).
+    async fn start(&self, name: &str, dir: &str, http: u16, pg: u16) -> Result<Option<tokio::process::Child>> {
         let exe = std::env::current_exe()?;
         let mut cmd = tokio::process::Command::new(exe);
-        cmd.args(["serve", "--dir", &dir, "--addr", &format!("127.0.0.1:{http}"), "--pg", &format!("127.0.0.1:{pg}"), "--attach-found", &self.folder,
+        cmd.args(["serve", "--dir", dir, "--addr", &format!("127.0.0.1:{http}"), "--pg", &format!("127.0.0.1:{pg}"), "--attach-found", &self.folder,
                   "--advertise", &format!("{}/db/{name}", self.addr), "--stop-with-stdin"]);
         if let Some(p) = &self.options.python {
             cmd.args(["--python", p]);
@@ -190,6 +218,9 @@ impl Server {
         let started = Instant::now();
         loop {
             if let Some(status) = child.try_wait()? {
+                if taken(http) || taken(pg) {
+                    return Ok(None);
+                }
                 bail!("the node of database {name} stopped as it started ({status})");
             }
             let up = crate::net::process().client(crate::net::Policy::Local).get(format!("http://127.0.0.1:{http}/stats")).timeout(Duration::from_secs(1)).send().await.is_ok_and(|r| r.status().is_success());
@@ -199,10 +230,7 @@ impl Server {
             anyhow::ensure!(started.elapsed() < Duration::from_secs(120), "the node of database {name} didn't start in two minutes");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let activity = Arc::new(Activity { busy: Default::default(), last: std::sync::Mutex::new(Instant::now()) });
-        let busy = Busy::new(&activity);
-        self.nodes.lock().await.insert(name.to_string(), Node { http, pg, child, activity });
-        Ok((http, pg, busy))
+        Ok(Some(child))
     }
 
     /// Stop the nodes nobody used lately, once they have nothing left to tier.
@@ -231,7 +259,7 @@ impl Server {
     async fn drop_db(&self, name: &str, if_exists: bool, purge: bool, by: &str) -> Result<Value> {
         crate::ddl::check(name)?;
         let dir = place(&self.folder, name);
-        if !is_lake(&dir).await? || crate::undrop::lake_kept(&dir).await?.is_some() {
+        if !is_lake(&dir).await? || crate::undrop::lake_kept(&dir, None).await?.is_some() {
             anyhow::ensure!(if_exists, "database \"{name}\" does not exist");
             return Ok(j!({"database": name, "dropped": false}));
         }
@@ -240,10 +268,10 @@ impl Server {
             let _ = tokio::time::timeout(Duration::from_secs(20), n.child.wait()).await;
         }
         if purge {
-            crate::ddl::delete_lake(&dir).await.with_context(|| format!("database {name}"))?; // (a bucket's prefix: every object under it)
+            crate::ddl::delete_lake(&dir, None).await.with_context(|| format!("database {name}"))?; // (a bucket's prefix: every object under it)
             return Ok(j!({"database": name, "dropped": true}));
         }
-        let kept = crate::undrop::keep_lake(&dir, by).await.with_context(|| format!("database {name}"))?;
+        let kept = crate::undrop::keep_lake(&dir, by, None).await.with_context(|| format!("database {name}"))?;
         Ok(j!({"database": name, "dropped": true, "kept_until": kept.until()}))
     }
 
@@ -252,10 +280,10 @@ impl Server {
     async fn undrop_db(&self, name: &str) -> Result<Value> {
         crate::ddl::check(name)?;
         let dir = place(&self.folder, name);
-        if crate::undrop::lake_kept(&dir).await?.is_none() {
+        if crate::undrop::lake_kept(&dir, None).await?.is_none() {
             return Err(crate::codes::coded("3D000", format!("no dropped database {name} is kept (pondra.dropped lists those that are)")));
         }
-        crate::undrop::unkeep_lake(&dir).await?;
+        crate::undrop::unkeep_lake(&dir, None).await?;
         Ok(j!({"database": name, "undropped": true, "dir": dir}))
     }
 }
@@ -507,4 +535,21 @@ async fn postgres(s: &Server, tcp: tokio::net::TcpStream) -> Result<()> {
     node.write_all(&startup).await?;
     tokio::io::copy_bidirectional(&mut client, &mut node).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_nodes_two_ports_are_free_and_told_apart_from_taken_ones() {
+        let (a, b) = super::free_ports().unwrap();
+        assert_ne!(a, b);
+        assert!(!super::taken(a) && !super::taken(b));
+        let held = std::net::TcpListener::bind(("127.0.0.1", a)).unwrap();
+        assert!(super::taken(a), "a listener holds it");
+        #[cfg(target_os = "linux")]
+        {
+            let out = std::net::TcpStream::connect(held.local_addr().unwrap()).unwrap();
+            assert!(super::taken(out.local_addr().unwrap().port()), "a connection out holds the port it was given");
+        }
+    }
 }
