@@ -142,11 +142,11 @@ pub fn carried<F: std::future::Future>(f: F) -> impl std::future::Future<Output 
 pub struct Carried {
     who: Option<Principal>,
     node: bool,
-    session: Option<String>,
+    session: Option<crate::temp::Named>,
 }
 
 /// The caller now, to carry into work it starts ([`Carried`]).
-pub fn caller() -> Carried { Carried { who: current(), node: node_work(), session: crate::temp::current() } }
+pub fn caller() -> Carried { Carried { who: current(), node: node_work(), session: crate::temp::here() } }
 
 impl crate::spawns::Carry for Carried {
     fn carry<F: std::future::Future + Send + 'static>(self, f: F) -> impl std::future::Future<Output = F::Output> + Send + 'static
@@ -192,10 +192,8 @@ pub async fn reading<F: std::future::Future>(f: F) -> F::Output {
 /// door started, a task's included, is not: whoever made the task may be anyone.)
 pub fn operator() -> bool { current().is_some_and(|p| p.operator) }
 
-/// Does a node in this process take tokens? (Then nothing it serves is open, attached lakes included.)
-pub fn tokens_on() -> bool { TOKENS.load(std::sync::atomic::Ordering::Relaxed) }
-
-crate::per_node!(static TOKENS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
+/// Does node `node` take tokens? (Then nothing it serves is open, attached lakes included.)
+pub fn tokens_on(node: &crate::node_state::NodeState) -> bool { node.tokens.load(std::sync::atomic::Ordering::Relaxed) }
 
 /// The header that carries, with a change a node sends its leader, the user it is for: the leader
 /// runs it as that user, so its subqueries read with the user's grants, as where it came in. Only the
@@ -348,11 +346,7 @@ pub struct Auth {
 
 impl Auth {
     pub fn new(read: Option<String>, write: Option<String>, admin: Option<String>) -> Auth {
-        let auth = Auth { read, write, admin, network: false, owner: None };
-        if auth.on() {
-            TOKENS.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        auth
+        Auth { read, write, admin, network: false, owner: None }
     }
 
     /// The three tokens as the environment gives them (`PONDRA_READ_TOKEN`, `PONDRA_WRITE_TOKEN`, `PONDRA_ADMIN_TOKEN`): what
@@ -384,11 +378,8 @@ impl Auth {
         self.owner.as_ref().is_some_and(|k| crate::crypto::same(k.as_bytes(), key.as_bytes()))
     }
 
-    /// The role a bearer token grants.
+    /// The role a bearer token grants. (A procedure's lent token is its node's: the doors check it with their lake, `lent`.)
     pub fn role(&self, token: Option<&str>) -> Role {
-        if let Some((role, _)) = lent(token) {
-            return role; // (a Python procedure's calls back: its caller's)
-        }
         match self.on() {
             false => Role::Admin,
             true => token.map_or(Role::None, |t| self.token_role(t)),
@@ -406,8 +397,8 @@ impl Auth {
         }
     }
 
-    /// A lent token's principal: its procedure's caller's.
-    pub fn lent_principal(&self, token: &str) -> Option<Principal> { LENT.lock().unwrap().get(token).map(|l| l.who.clone()) }
+    /// A lent token's principal (at `home`): its procedure's caller's.
+    pub fn lent_principal(&self, home: &crate::store::Lake, token: &str) -> Option<Principal> { lent_entry(home, Some(token), |l| l.who.clone()) }
 
     /// The token a Postgres user name stands for (the password it must send).
     pub fn token_for(&self, user: &str) -> Option<String> {
@@ -459,10 +450,11 @@ pub(crate) fn py_name(name: &str) -> bool { name.trim_end_matches(['/', '.', ' '
 
 /// A token lent to a Python procedure for its calls back to the node (`routines::python`): the
 /// rights of whoever called it (and whether it may read files on this machine), until it ends;
-/// and the secrets it has read (`pondra.secret`), kept out of what it says.
-pub struct Lease(pub String);
+/// and the secrets it has read (`pondra.secret`), kept out of what it says. It is held by the
+/// node's sessions it was lent at (a `Weak`: gone with them, and good nowhere else).
+pub struct Lease(pub String, Option<std::sync::Weak<crate::temp::Sessions>>);
 
-struct Lent {
+pub(crate) struct Lent {
     role: Role,
     who: Principal, // (its caller: whose rights it has)
     files: bool,
@@ -480,32 +472,44 @@ pub fn catalog_name(t: &str) -> String {
     }
 }
 
-crate::per_node!(static LENT: std::sync::Mutex<std::collections::HashMap<String, Lent>> = Default::default());
-
-pub fn lend(role: Role, files: bool) -> Lease {
+/// Lends a token to a procedure's code, at `home`'s node (its sessions' leases: `temp::Sessions::leases`). Nothing is lent
+/// where there are no sessions: the Lease's token is then good nowhere.
+pub fn lend(home: &crate::store::Lake, role: Role, files: bool) -> Lease {
     let token = format!("lease-{}", uuid::Uuid::new_v4().simple());
     let who = current().filter(|p| p.role >= role).unwrap_or_else(|| Principal::of(role));
     let applying = crate::protect::applying(); // (an apply's migration calling it: its calls back may change a project's objects, until the call ends)
-    LENT.lock().unwrap().insert(token.clone(), Lent { role, who, files, secrets: vec![], session: crate::temp::current(), vars: crate::vars::lend(), applying });
-    Lease(token)
+    let at = crate::temp::sessions(home);
+    if let Some(at) = &at {
+        at.leases.lock().unwrap().insert(token.clone(), Lent { role, who, files, secrets: vec![], session: crate::temp::current(), vars: crate::vars::lend(), applying });
+    }
+    Lease(token, at.as_ref().map(std::sync::Arc::downgrade))
 }
 
-/// What a lent token allows, while its procedure runs.
-pub fn lent(token: Option<&str>) -> Option<(Role, bool)> { LENT.lock().unwrap().get(token?).map(|l| (l.role, l.files)) }
+/// The lent token's entry at `home`'s node, read by `f` (None: not lent there, or no token).
+fn lent_entry<R>(home: &crate::store::Lake, token: Option<&str>, f: impl FnOnce(&Lent) -> R) -> Option<R> {
+    let at = crate::temp::sessions(home)?;
+    let all = at.leases.lock().unwrap();
+    let l = all.get(token?)?;
+    Some(f(l))
+}
+
+/// What a lent token allows, while its procedure runs (at `home`).
+pub fn lent(home: &crate::store::Lake, token: Option<&str>) -> Option<(Role, bool)> { lent_entry(home, token, |l| (l.role, l.files)) }
 
 /// Whether a lent token's procedure runs inside an apply (`protect::applying`): its requests are the apply's.
-pub fn lent_applying(token: Option<&str>) -> bool { token.is_some_and(|t| LENT.lock().unwrap().get(t).is_some_and(|l| l.applying)) }
+pub fn lent_applying(home: &crate::store::Lake, token: Option<&str>) -> bool { lent_entry(home, token, |l| l.applying).unwrap_or(false) }
 
 /// The session of the caller a lent token's procedure runs for.
-pub fn lent_session(token: Option<&str>) -> Option<String> { LENT.lock().unwrap().get(token?).and_then(|l| l.session.clone()) }
+pub fn lent_session(home: &crate::store::Lake, token: Option<&str>) -> Option<String> { lent_entry(home, token, |l| l.session.clone()).flatten() }
 
 /// The variables of the run a lent token's code runs in (`vars::within`).
-pub fn lent_vars(token: Option<&str>) -> Option<crate::vars::Lent> { LENT.lock().unwrap().get(token?).map(|l| l.vars.clone()) }
+pub fn lent_vars(home: &crate::store::Lake, token: Option<&str>) -> Option<crate::vars::Lent> { lent_entry(home, token, |l| l.vars.clone()) }
 
 /// A secret's values, read by a lent token's procedure: kept, to be blanked out of its notices,
 /// its error and the run log. False: not a lent token (only a procedure's code reads a secret).
-pub fn revealed(token: Option<&str>, values: impl IntoIterator<Item = String>) -> bool {
-    let mut all = LENT.lock().unwrap();
+pub fn revealed(home: &crate::store::Lake, token: Option<&str>, values: impl IntoIterator<Item = String>) -> bool {
+    let Some(at) = crate::temp::sessions(home) else { return false };
+    let mut all = at.leases.lock().unwrap();
     let Some(l) = token.and_then(|t| all.get_mut(t)) else { return false };
     l.secrets.extend(values.into_iter().filter(|v| v.len() >= 4)); // (a port number or `true` isn't worth hiding, and would blank out too much)
     true
@@ -514,7 +518,8 @@ pub fn revealed(token: Option<&str>, values: impl IntoIterator<Item = String>) -
 impl Lease {
     /// `text` with every secret this procedure read replaced by `***`.
     pub fn redact(&self, text: &str) -> String {
-        let all = LENT.lock().unwrap();
+        let Some(at) = self.1.as_ref().and_then(std::sync::Weak::upgrade) else { return text.to_string() };
+        let all = at.leases.lock().unwrap();
         let Some(l) = all.get(&self.0) else { return text.to_string() };
         let mut out = text.replace(&self.0, "***"); // (its token too)
         for s in &l.secrets {
@@ -525,7 +530,11 @@ impl Lease {
 }
 
 impl Drop for Lease {
-    fn drop(&mut self) { LENT.lock().unwrap().remove(&self.0); }
+    fn drop(&mut self) {
+        if let Some(at) = self.1.as_ref().and_then(std::sync::Weak::upgrade) {
+            at.leases.lock().unwrap().remove(&self.0);
+        }
+    }
 }
 
 /// Failed sign-ins per address and user name (S30, invariant 381): ten in a minute, and that pair is
@@ -536,24 +545,31 @@ const TRIES: usize = 10;
 const MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
 const PAIRS: usize = 10_000; // (the pairs held at once: when full, the one whose newest failure is oldest goes)
 
+// (a node's own: two nodes in one process count apart, ADR-061 §3)
 #[derive(Default)]
 pub struct Guesses {
     failures: std::sync::Mutex<std::collections::HashMap<(std::net::IpAddr, String), std::collections::VecDeque<datafusion::common::instant::Instant>>>,
 }
 
-// (a node's own: two nodes in one process count apart, ADR-061 §3)
-crate::per_node!(static GUESSED: Guesses = Guesses::default(); clear = |g| {
-    let taken = std::mem::take(&mut *g.failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
-    drop(taken);
-});
+impl crate::lake_state::LakeState for Guesses {
+    const NAME: &'static str = "guesses";
+    const ABOUT: &'static str = "the failed sign-ins of each address and user name in the last minute: a node's own, counted at its home lake (ADR-061 §3)";
+    fn make() -> Self { Guesses::default() }
+}
 
 /// Seconds to wait before this address may try this user name again, when it has had ten failures in
 /// the last minute (None: it may try). A door that can't tell the address counts under 0.0.0.0. Each node
 /// counts its own, so a cluster of N nodes allows N times the guesses until 1.1 (redesign step 11's shared state).
-pub fn guessing(addr: Option<std::net::IpAddr>, user: &str) -> Option<u64> { GUESSED.guessing_at(addr, user, datafusion::common::instant::Instant::now()) }
+pub fn guessing(lake: &crate::store::Lake, addr: Option<std::net::IpAddr>, user: &str) -> Option<u64> {
+    lake.state::<Guesses>().ok()?.guessing_at(addr, user, datafusion::common::instant::Instant::now())
+}
 
 /// A failed sign-in of this address and user name, now.
-pub fn guessed(addr: Option<std::net::IpAddr>, user: &str) { GUESSED.guessed_at(addr, user, datafusion::common::instant::Instant::now()) }
+pub fn guessed(lake: &crate::store::Lake, addr: Option<std::net::IpAddr>, user: &str) {
+    if let Ok(g) = lake.state::<Guesses>() {
+        g.guessed_at(addr, user, datafusion::common::instant::Instant::now());
+    }
+}
 
 /// What a sign-in refused for its failures is told, with how long to wait (`guessing`), at every door.
 pub fn guessing_says(user: &str, wait: u64) -> String { format!("too many failed sign-ins for {user} from this address: wait {wait} s") }
@@ -842,6 +858,52 @@ mod tests {
         }
         assert_eq!(g.guessing_at(ip(1), "bo", t), None, "another user from the same address");
         assert_eq!(g.guessing_at(ip(2), "al", t), None, "the same user from another address");
+    }
+
+    /// Two nodes in one process count their failed sign-ins apart (ADR-061 §3): ten at one lake refuse that address and user
+    /// name there, and not at the other.
+    #[tokio::test]
+    async fn two_lakes_count_failed_sign_ins_apart() -> Result<()> {
+        let addr = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut lakes = vec![];
+        for _ in 0..2 {
+            let dir = std::env::temp_dir().join(format!("pondra-two-guesses-{}", uuid::Uuid::new_v4()));
+            let lake = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            lakes.push((lake, dir));
+        }
+        let (a, b) = (&lakes[0].0, &lakes[1].0);
+        for _ in 0..TRIES {
+            guessed(a, addr, "ann");
+        }
+        assert!(guessing(a, addr, "ann").is_some(), "ten failures at a: refused there");
+        assert!(guessing(b, addr, "ann").is_none(), "b counts apart: free there");
+        for (lake, dir) in lakes {
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_nodes_lend_their_own_tokens() -> Result<()> {
+        let mut lakes = vec![];
+        for _ in 0..2 {
+            let dir = std::env::temp_dir().join(format!("pondra-two-leases-{}", uuid::Uuid::new_v4()));
+            let lake = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            lakes.push((lake, dir));
+        }
+        let (a, b) = (&lakes[0].0, &lakes[1].0);
+        let lease = lend(a, Role::Read, false);
+        let token = lease.0.clone();
+        assert!(lent(a, Some(token.as_str())).is_some(), "lent at a");
+        assert!(lent(b, Some(token.as_str())).is_none(), "a token is good at its node alone");
+        drop(lease);
+        assert!(lent(a, Some(token.as_str())).is_none(), "its lease ended: good nowhere");
+        for (lake, dir) in lakes {
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        Ok(())
     }
 
     #[test]

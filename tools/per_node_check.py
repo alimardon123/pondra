@@ -123,6 +123,8 @@ PROCESS = {
     "oom.rs:POINTERS": "a thread's own allocation counters (jemalloc's), found once a thread: they belong to the thread, not to a node",
     "oom.rs:TEST_ALLOCATOR": "the unit tests' allocator, jemalloc as the node's (main.rs), so the meter has counters to read",
     "oom.rs:TRACER": "DataFusion's one join-set tracer for the process, set once: it reads the task-local of whichever request spawns",
+    "sso.rs:KEYS": "each identity provider's published keys, by its issuer's url: public, and the same for any node here",
+    "sso.rs:FETCHING": "one fetch at a time of an issuer's keys, by its url: the same for any node here",
     "store.rs:MS": SETTING + " (PONDRA_LOCK_LEASE_SECS: the retry window, `store::retry_ms`)",
     "store.rs:NAMED": SETTING + " (PONDRA_LOAD_RETENTION_SECS: a named job's window, `store::retention_ms`)",
     "store.rs:ONE": LOCK,
@@ -140,12 +142,10 @@ PROCESS = {
     "store.rs:DISKS": "the window sorts' spill disks (`window_sorts`, invariant 423), one for each merge fan-in (PONDRA_SPILL_FAN_IN, else of the node's memory for queries: 4 to 64, so at most 61), made once: the disk is the machine's, as ledger.rs's ROOM says, and holds no node's state",
     "functions.rs:FUNCTIONS": "Spark's functions, made against a session with nothing of a lake",
     "registry.rs:REGISTRY": "the build's extensions, registered once from `crate::built_in` and never changed after: the same for every node, and no section holds a node's state",
-    "temp.rs:CHANGES": "a counter live queries wait on: it only grows, so a waiter never misses a change",
     "tier.rs:SLOTS": SETTING + " (tiering's slots, sized by --memory-gb)",
     "tls.rs:KEY": SETTING + " (PONDRA_CLIENT_KEY, which the lakes server gives each database's node)",
     "tls.rs:PROXIES": SETTING + " (PONDRA_TRUSTED_PROXIES)",
     "tls.rs:TLS": SETTING + " (PONDRA_TLS_*)",
-    "users.rs:MAKING": LOCK,
     "write.rs:JOB": "`pondra sql`'s job: the process's, carried through its restarts (`Lifecycle::restart`)",
 }
 

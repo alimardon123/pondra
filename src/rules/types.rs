@@ -2,11 +2,9 @@
 //! and `DROP TYPE` are read here, and a node keeps the types they make in `types.rs` while a page keeps its own, so the two
 //! forms take the same statements and say the same thing.
 use crate::rules::create::labelled;
+use crate::words::Words;
 use anyhow::{ensure, Context, Result};
-use datafusion::sql::sqlparser::ast::{self, Statement};
-use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -17,50 +15,83 @@ pub enum Change {
     Drop { names: Vec<String>, if_exists: bool },
 }
 
-/// `CREATE TYPE … AS ENUM`, `ALTER TYPE` or `DROP TYPE` as the change it is; `Err` with the words a statement of one of them
-/// is refused in when it is wrong; None for any other statement.
-pub fn change(sql: &str) -> Option<Result<Change, String>> {
-    static WORD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(CREATE(\s+OR\s+REPLACE)?|ALTER|DROP)\s+TYPE\b").expect("a regex"));
-    static UNLESS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+TYPE\s+)IF\s+NOT\s+EXISTS\s+").expect("a regex"));
-    static DROP: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*DROP\s+TYPE\s+(IF\s+EXISTS\s+)?(.+?)(\s+(CASCADE|RESTRICT))?\s*;?\s*$"#).expect("a regex"));
-    let first = crate::text::first_word(sql);
-    let c = WORD.captures(first)?;
-    let word = c[1].to_uppercase();
-    if c.get(2).is_some() {
-        return Some(Err("CREATE OR REPLACE TYPE: a type's columns keep their labels (ALTER TYPE … ADD VALUE adds one)".into()));
+/// `CREATE [OR REPLACE] TYPE … AS ENUM`, `ALTER TYPE` or `DROP TYPE` by its words, after its first (`verb`): the change
+/// it is, or the words a statement of one of them is refused in when it is wrong. A label is a string, as Postgres writes it.
+pub fn read(verb: &str, w: &mut Words) -> Result<Change, String> {
+    const ENUM: &str = "CREATE TYPE [IF NOT EXISTS] name AS ENUM ('label', …): enums are the types kept (a composite, a range or another type's alias isn't)";
+    const ALTER: &str = "ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label' [BEFORE | AFTER 'label'] | RENAME TO new_name";
+    match verb {
+        "create" if w.is("or") => Err("CREATE OR REPLACE TYPE: a type's columns keep their labels (ALTER TYPE … ADD VALUE adds one)".into()),
+        "create" => created(w).map_err(|_| ENUM.into()),
+        // (CASCADE and RESTRICT are the same here: a drop never takes a column with it, so a type a column uses is
+        // refused by name whichever is written, and one no column uses is dropped either way)
+        "drop" => dropped(w).map_err(|_| "DROP TYPE [IF EXISTS] name [, …] [CASCADE | RESTRICT]".into()),
+        _ => altered(w).unwrap_or_else(|_| Err(ALTER.into())),
     }
-    if word == "DROP" {
-        // (CASCADE and RESTRICT are the same here: a drop never takes a column with it, so a type a column
-        // uses is refused by name whichever is written, and one no column uses is dropped either way)
-        let d = DROP.captures(first)?;
-        let names = d[2].split(',').map(|n| crate::text::object_of(n.trim())).collect();
-        return Some(Ok(Change::Drop { names, if_exists: d.get(1).is_some() }));
+}
+
+fn created(w: &mut Words) -> Result<Change> {
+    w.expect("type")?;
+    let if_not_exists = w.is("if") && {
+        w.expect_all(&["not", "exists"])?;
+        true
+    };
+    let name = w.name()?;
+    w.expect_all(&["as", "enum"])?;
+    w.expect_sym('(')?;
+    let mut labels = vec![];
+    while !w.sym(')') {
+        if !labels.is_empty() {
+            w.expect_sym(',')?;
+        }
+        labels.push(w.string()?);
     }
-    let unless = UNLESS.is_match(first);
-    let text = UNLESS.replace(first, "$1");
-    let parsed = Parser::parse_sql(&GenericDialect {}, &text).map(|mut s| s.pop());
-    Some(match parsed {
-        Ok(Some(Statement::CreateType { name, representation: Some(ast::UserDefinedTypeRepresentation::Enum { labels }) })) => {
-            Ok(Change::Create { name: crate::text::object(&name), labels: labels.iter().map(|l| l.value.clone()).collect(), if_not_exists: unless })
+    w.done()?;
+    Ok(Change::Create { name, labels, if_not_exists })
+}
+
+fn dropped(w: &mut Words) -> Result<Change> {
+    w.expect("type")?;
+    let if_exists = w.is("if") && {
+        w.expect("exists")?;
+        true
+    };
+    let names = w.names()?;
+    let _ = w.is("cascade") || w.is("restrict");
+    w.done()?;
+    Ok(Change::Drop { names, if_exists })
+}
+
+/// ALTER TYPE's change, or the refusal of RENAME VALUE (the outer error: the form written wrong).
+fn altered(w: &mut Words) -> Result<Result<Change, String>> {
+    w.expect("type")?;
+    let name = w.name()?;
+    if w.is("rename") {
+        if w.is("value") {
+            w.string()?;
+            w.expect("to")?;
+            w.string()?;
+            w.done()?;
+            return Ok(Err("ALTER TYPE … RENAME VALUE: rows keep the text they were written with (files are never rewritten); add the new label, UPDATE the rows to it".into()));
         }
-        Ok(Some(Statement::CreateType { .. })) | Err(_) if word.starts_with("CREATE") => Err("CREATE TYPE [IF NOT EXISTS] name AS ENUM ('label', …): enums are the types kept (a composite, a range or another type's alias isn't)".into()),
-        Ok(Some(Statement::AlterType(a))) => {
-            let name = crate::text::object(&a.name);
-            match a.operation {
-                ast::AlterTypeOperation::Rename(r) => Ok(Change::Rename { name, to: crate::text::ident(&r.new_name) }),
-                ast::AlterTypeOperation::AddValue(v) => {
-                    let (before, after) = match v.position {
-                        Some(ast::AlterTypeAddValuePosition::Before(n)) => (Some(n.value), None),
-                        Some(ast::AlterTypeAddValuePosition::After(n)) => (None, Some(n.value)),
-                        None => (None, None),
-                    };
-                    Ok(Change::Add { name, label: v.value.value, if_not_exists: v.if_not_exists, before, after })
-                }
-                ast::AlterTypeOperation::RenameValue(_) => Err("ALTER TYPE … RENAME VALUE: rows keep the text they were written with (files are never rewritten); add the new label, UPDATE the rows to it".into()),
-            }
-        }
-        _ => Err("ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label' [BEFORE | AFTER 'label'] | RENAME TO new_name".into()),
-    })
+        w.expect("to")?;
+        let to = w.part()?;
+        w.done()?;
+        return Ok(Ok(Change::Rename { name, to }));
+    }
+    w.expect_all(&["add", "value"])?;
+    let if_not_exists = w.is("if") && {
+        w.expect_all(&["not", "exists"])?;
+        true
+    };
+    let label = w.string()?;
+    let (before, after) = match () {
+        _ if w.is("before") => (Some(w.string()?), None),
+        _ if w.is("after") => (None, Some(w.string()?)),
+        _ => (None, None),
+    };
+    w.done()?;
+    Ok(Ok(Change::Add { name, label, if_not_exists, before, after }))
 }
 
 /// The refusal a CREATE TYPE meets when its type is there already.
@@ -107,11 +138,20 @@ mod tests {
 
     #[test]
     fn a_type_statement_is_read_as_its_change_and_a_wrong_one_refused() {
+        let change = |sql: &str| {
+            let mut w = Words::of(sql)?;
+            let verb = w.next().map(|v| v.word()).unwrap_or_default();
+            matches!(verb.as_str(), "create" | "alter" | "drop").then(|| read(&verb, &mut w))
+        };
         assert_eq!(change("CREATE TYPE mood AS ENUM ('a','b')"), Some(Ok(Change::Create { name: "mood".into(), labels: vec!["a".into(), "b".into()], if_not_exists: false })));
         assert_eq!(change("CREATE TYPE IF NOT EXISTS mood AS ENUM ('a')"), Some(Ok(Change::Create { name: "mood".into(), labels: vec!["a".into()], if_not_exists: true })));
         assert!(matches!(change("CREATE OR REPLACE TYPE m AS ENUM ('a')"), Some(Err(_))));
         assert_eq!(change("DROP TYPE IF EXISTS a, b CASCADE"), Some(Ok(Change::Drop { names: vec!["a".into(), "b".into()], if_exists: true })));
         assert_eq!(change("ALTER TYPE mood ADD VALUE 'c' BEFORE 'a'"), Some(Ok(Change::Add { name: "mood".into(), label: "c".into(), if_not_exists: false, before: Some("a".into()), after: None })));
+        assert_eq!(change("ALTER TYPE mood RENAME TO \"Feeling\""), Some(Ok(Change::Rename { name: "mood".into(), to: "Feeling".into() })));
+        assert!(change("ALTER TYPE mood RENAME VALUE 'a' TO 'b'").is_some_and(|r| r.is_err_and(|e| e.contains("RENAME VALUE: rows keep"))));
+        assert_eq!(change("CREATE TYPE mood AS ENUM (happy)"), Some(Err("CREATE TYPE [IF NOT EXISTS] name AS ENUM ('label', …): enums are the types kept (a composite, a range or another type's alias isn't)".into())), "a label is a string");
+        assert_eq!(change("DROP TYPE a b"), Some(Err("DROP TYPE [IF EXISTS] name [, …] [CASCADE | RESTRICT]".into())));
         assert_eq!(change("SELECT 1"), None);
     }
 

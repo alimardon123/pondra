@@ -73,10 +73,14 @@ pub async fn run<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire:
     let tables = Arc::new(req.tables);
     let script = crate::query::SENT.scope(tables, routines::script(app, &req.sql, &req.params, &req.views, who, how.job.map(str::to_string)));
     let out = match &own {
-        Some(s) => temp::SESSION.scope(Some(s.clone()), script).await,
+        Some(s) => temp::SESSION.scope(temp::named(&app.lake, Some(s.clone())), script).await,
         None => script.await,
     };
-    own.inspect(|s| _ = temp::end(s));
+    own.inspect(|s| {
+        if let Some(at) = temp::sessions(&app.lake) {
+            at.end(s);
+        }
+    });
     Ok(match out? {
         Outcome::Rows(batches) => Answer::Rows(batches),
         Outcome::Done(v) => Answer::Done(v),
@@ -182,21 +186,21 @@ pub struct SqlParams {
 /// Is this request from whoever started the node here (the shell's or `local()`'s `PONDRA_OWNER_KEY`, a
 /// library's host's key: the node's `Auth::owned_by`)? Then its SQL may read files on this machine, as
 /// `pondra sql` may (invariant 21: nobody else's).
-pub(crate) fn owner(auth: &crate::auth::Auth, headers: &http::HeaderMap) -> bool {
-    crate::auth::lent(crate::auth::Credential::of_headers(headers).token()).is_some_and(|l| l.1) // (a Python procedure the owner called)
+pub(crate) fn owner(home: &crate::store::Lake, auth: &crate::auth::Auth, headers: &http::HeaderMap) -> bool {
+    crate::auth::lent(home, crate::auth::Credential::of_headers(headers).token()).is_some_and(|l| l.1) // (a Python procedure the owner called)
         || headers.get("x-pondra-owner").and_then(|h| h.to_str().ok()).is_some_and(|h| auth.is_owner(h))
 }
 
-/// The header a `/sql` answer carries while its session holds temporary tables (`temp::holds`): the client keeps to this
+/// The header a `/sql` answer carries while its session holds temporary tables (`temp::Sessions::holds`): the client keeps to this
 /// node meanwhile. Each door adds it (HTTP's `held_session`, a page's `lake_sql`).
 pub const HELD_SESSION: (&str, &str) = ("x-pondra-session", "held");
 
 /// A statement the node stopped for memory fails its session's transaction, as an error does (`txn::failed`): the session is
 /// found as `sql` finds it, for the caller that asked. Each door that stops one calls it (HTTP's `guard`, a page's `lake_sql`).
-pub fn failed_for_memory(who: crate::auth::Principal, headers: &http::HeaderMap) {
-    let session = crate::temp::of(headers, &who.name).ok().flatten();
+pub fn failed_for_memory(who: crate::auth::Principal, headers: &http::HeaderMap, lake: &crate::store::Lake) {
+    let session = crate::temp::of(lake, headers, &who.name).ok().flatten();
     if let Some(s) = session {
-        crate::temp::SESSION.sync_scope(Some(s), || crate::txn::failed(crate::oom::OOM));
+        crate::temp::SESSION.sync_scope(crate::temp::named(lake, Some(s)), || crate::txn::failed(crate::oom::OOM));
     }
 }
 
@@ -221,7 +225,7 @@ pub fn notices(heard: &[String]) -> Option<String> {
 }
 
 /// What one `/sql` request answers, by any door that reads one (the HTTP door, a page): its reply, the notices its
-/// statements said, and its session, which the door says it holds while it has temporary tables (`temp::holds`).
+/// statements said, and its session, which the door says it holds while it has temporary tables (`temp::Sessions::holds`).
 pub struct Said {
     pub reply: anyhow::Result<Reply>,
     pub heard: Vec<String>,
@@ -250,29 +254,30 @@ pub enum Rendered {
 
 /// `f` in the scope a `/sql` request's statement runs in: its session's temporary tables, views and variables (`session`), and
 /// the variables of the code a lent token runs for (`vars`). A page's fallback (`page::node_part`) reads a statement's names in it too.
-pub(crate) async fn scoped<F: std::future::Future>(session: Option<String>, vars: Option<crate::vars::Lent>, f: F) -> F::Output {
+pub(crate) async fn scoped<F: std::future::Future>(session: Option<crate::temp::Named>, vars: Option<crate::vars::Lent>, f: F) -> F::Output {
     crate::vars::within(vars, temp::SESSION.scope(session, f)).await
 }
 
 /// One `/sql` request (its query, its headers, its body), for `role`, planned for `by`, the principal its door signed in, with every
 /// step a `/sql` takes around `statement::run` (the session, the owner's files, …): server.rs's `sql`, moved.
 pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, by: crate::auth::Principal, headers: http::HeaderMap, body: Bytes) -> Said {
-    let files = owner(&app.auth, &headers); // (the program that started this node: its files, and URLs no secret covers)
+    let files = owner(&app.lake, &app.auth, &headers); // (the program that started this node: its files, and URLs no secret covers)
     let node = app.lake.node.clone(); // (its rest, run on after the answer is handed over, is still in flight: `panics::work`)
-    let session = match crate::temp::of(&headers, &by.name) { // (its temporary tables: `temp.rs`)
+    let session = match crate::temp::of(&app.lake, &headers, &by.name) { // (its temporary tables: `temp.rs`)
         Ok(session) => session,
         Err(e) => return Said { reply: Err(e), heard: vec![], session: None }, // (a session name that isn't one: refused, saying what one is)
     };
+    let named = crate::temp::named(&app.lake, session.clone()); // (its node's sessions: the scope its statement runs in)
     let postgres = match p.catalog.as_deref() {
         None => false,
         Some("postgres") => true,
         Some(other) => return Said { reply: Err(crate::codes::coded("22023", format!("catalog={other}: the catalog a request may ask for is postgres (Postgres's, as the Postgres port answers it)"))), heard: vec![], session: None },
     };
-    let vars = crate::auth::lent_vars(crate::auth::Credential::of_headers(&headers).token()); // (Python code a run lent a connection to: the run's variables)
+    let vars = crate::auth::lent_vars(&app.lake, crate::auth::Credential::of_headers(&headers).token()); // (Python code a run lent a connection to: the run's variables)
     let (hand, mut handed) = tokio::sync::oneshot::channel(); // (the door's end of an answer in pieces: `query::Pieces`)
     let statement = crate::query::PIECES.scope(crate::query::Pieces::new(hand), sql_as(app, p, role, by, headers, body));
     // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
-    let go = crate::query::HELD.scope(Default::default(), scoped(session.clone(), vars.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(statement)))));
+    let go = crate::query::HELD.scope(Default::default(), scoped(named, vars.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(statement)))));
     // (`guard` gave this request its principal and its apply flag, outside this handler: a request whose answer is
     // handed over runs on after it, and its history and audit still need who asked: the rest runs aside as its caller,
     // `auth::caller`)
@@ -301,9 +306,9 @@ async fn sql_as(app: App, p: SqlParams, role: crate::auth::Role, by: crate::auth
     let kind = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
     let req = crate::routines::Request::read(kind, &body)?;
     // (a Python procedure's own calls, through the token lent to it; anyone else's is a first call)
-    let lent = crate::auth::lent(crate::auth::Credential::of_headers(&headers).token()).is_some();
+    let lent = crate::auth::lent(&app.lake, crate::auth::Credential::of_headers(&headers).token()).is_some();
     let depth = headers.get("x-pondra-depth").filter(|_| lent).and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0);
-    let who = Who { depth, ..Who::signed(by, role, owner(&app.auth, &headers)) };
+    let who = Who { depth, ..Who::signed(by, role, owner(&app.lake, &app.auth, &headers)) };
     let how = How { job: p.job.as_deref(), spread: p.spread.as_deref(), after: p.after, stale: p.stale_ms.map(Duration::from_millis) };
     Ok(match crate::statement::run(&app, req, how, who, &HttpWire(&p, &app.lake)).await? {
         Answer::Kept(body) => Reply::Rendered(Rendered::Whole(body)),

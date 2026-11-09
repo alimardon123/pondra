@@ -104,7 +104,7 @@ jobs:
           FULL: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
           MODE: ${{ inputs.mode }}
           PR: ${{ github.event.pull_request.number }}
-          SLOTS: ${{ vars.CI_SLOTS || 3 }} # (ci-slots.yml says why)
+          SLOTS: ${{ vars.CI_SLOTS || 6 }} # (ci-slots.yml says why)
         run: |
           # (linux-x64 pinned: ubuntu-latest becomes 26.04 from 2026-10-19; moved on purpose, after a
           # green run there. macos-13 was retired; Intel images last until 2027.)
@@ -259,7 +259,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - run: |
-          echo "::error title=Waiting for a CI slot::${{ vars.CI_SLOTS || 3 }} other pull requests' CI runs are going, and only that many run at once. This run starts again by itself when one ends (ci-slots.yml): nothing to do."
+          echo "::error title=Waiting for a CI slot::${{ vars.CI_SLOTS || 6 }} other pull requests' CI runs are going, and only that many run at once. This run starts again by itself when one ends (ci-slots.yml): nothing to do."
           exit 1
 
   # The documentation website, built as pages.yml publishes it with each release, so a page that

@@ -91,5 +91,7 @@
    "sql": "SELECT extract(month FROM first) AS month, count(*) FROM (SELECT customer_id, min(ordered_at) AS first FROM orders GROUP BY customer_id) f GROUP BY 1 ORDER BY 1"},
   {"id": "a40", "question": "Which customers from Uzbekistan have no email address on file? Give their names in name order.", "ordered": true,
    "evidence": "Countries are stored as two-letter codes (Uzbekistan is UZ).",
-   "sql": "SELECT name FROM customers WHERE country = 'UZ' AND email IS NULL ORDER BY name"}
+   "sql": "SELECT name FROM customers WHERE country = 'UZ' AND email IS NULL ORDER BY name"},
+  {"id": "a41", "question": "How many customers are subscribed to the newsletter now?",
+   "sql": "SELECT count(*) FROM (SELECT customer_id, change, row_number() OVER (PARTITION BY customer_id ORDER BY seq DESC) AS latest FROM newsletter_changes) c WHERE latest = 1 AND change <> 'delete'"}
 ]

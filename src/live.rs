@@ -104,8 +104,8 @@ pub async fn live(State(app): State<App>, Query(p): Query<Params>, who: Option<a
 
 /// A live query made ready: its SQL prepared, the tables it reads found, as its session and caller.
 async fn watch(app: &App, who: &crate::auth::Principal, headers: &axum::http::HeaderMap, sql: Option<&str>, kind: &str, body: &[u8], every: Duration, tag: String) -> anyhow::Result<Watch> {
-    let session = crate::temp::of(headers, &who.name)?;
-    crate::temp::SESSION.scope(session.clone(), async {
+    let session = crate::temp::of(&app.lake, headers, &who.name)?;
+    crate::temp::SESSION.scope(crate::temp::named(&app.lake, session.clone()), async {
         let req = match sql {
             Some(sql) => crate::routines::Request::read("", sql.as_bytes())?,
             None => crate::routines::Request::read(kind, body)?,
@@ -125,11 +125,11 @@ async fn watch(app: &App, who: &crate::auth::Principal, headers: &axum::http::He
 fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send {
     futures::stream::unfold(Some(w), |state| async move {
         let mut w = state?;
-        let (mut hwm, mut temp) = (w.app.lake.hwm.subscribe(), crate::temp::changes());
+        let (mut hwm, mut temp) = (w.app.lake.hwm.subscribe(), crate::temp::sessions(&w.app.lake).map_or_else(|| tokio::sync::watch::channel(0u64).1, |at| at.changes()));
         loop {
             if w.print.is_some() {
                 tokio::time::sleep_until(w.next.into()).await; // (at most every `every_ms`)
-                if w.app.lake.visible() == w.seen && crate::temp::version(w.session.as_deref()) == w.temps {
+                if w.app.lake.visible() == w.seen && crate::temp::sessions(&w.app.lake).map_or(0, |at| at.version(w.session.as_deref())) == w.temps {
                     let changed = async { tokio::select! { _ = hwm.changed() => {}, _ = temp.changed() => {} } };
                     if tokio::time::timeout(Duration::from_secs(15), changed).await.is_err() {
                         return Some((Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"\n")), Some(w))); // (a line now and then: a client gone is noticed)
@@ -153,7 +153,7 @@ fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::
                 _ => w.who.clone(),
             };
             let scope = who.scope.clone();
-            let rows = crate::temp::SESSION.scope(w.session.clone(), crate::auth::WHO.scope(who, w.app.query(&w.sql, None, &scope))).await.and_then(|b| crate::answer::render(&b, None, &|rows| crate::pages::keep(&w.app.lake, rows)));
+            let rows = crate::temp::SESSION.scope(crate::temp::named(&w.app.lake, w.session.clone()), crate::auth::WHO.scope(who, w.app.query(&w.sql, None, &scope))).await.and_then(|b| crate::answer::render(&b, None, &|rows| crate::pages::keep(&w.app.lake, rows)));
             let rows = match rows {
                 Ok(r) => r,
                 Err(e) => return Some((Ok(error(e, &w.tag, scope.shows_code())), None)),
@@ -206,7 +206,7 @@ async fn print(w: &mut Watch) -> anyhow::Result<u64> {
     for (name, other) in lake.attached.read().unwrap().iter().filter(|(n, _)| w.others.contains(n)) {
         (name, other.cat.version()).hash(&mut h);
     }
-    w.temps = crate::temp::version(w.session.as_deref());
+    w.temps = crate::temp::sessions(&w.app.lake).map_or(0, |at| at.version(w.session.as_deref()));
     w.temps.hash(&mut h);
     w.seen = now;
     Ok(h.finish())

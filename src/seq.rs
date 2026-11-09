@@ -21,7 +21,6 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, Result as DfResult};
 use datafusion::logical_expr::{async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl}, ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast;
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -30,7 +29,7 @@ use datafusion::common::instant::Instant;
 use std::time::Duration;
 
 // (the statement-side parts of an identity column and its options: `rules/create.rs`, which the page reads too)
-pub use crate::rules::create::{in_order, options_sql, parse_options, serial_type, shape, Identity, Opt, Shape};
+pub use crate::rules::create::{in_order, options_sql, serial_type, shape, Identity, Opt, Shape};
 
 type Result<T> = anyhow::Result<T>;
 
@@ -38,7 +37,7 @@ pub fn key(name: &str) -> String { format!("sq/{name}") }
 
 /// The options a `CREATE SEQUENCE` statement declares, or None when it isn't one (an apply compares them).
 pub fn declared(sql: &str) -> Option<Vec<Opt>> {
-    match statement(sql) {
+    match read(&mut crate::words::Words::of(sql)?).ok() {
         Some(Stmt::Ddl(mut d)) => match d.pop() {
             Some(crate::ddl::Ddl::Sequence(Change::Create { declared, .. })) => Some(declared),
             _ => None,
@@ -74,49 +73,70 @@ pub enum Change {
     Drop { names: Vec<String>, if_exists: bool },
 }
 
-/// `CREATE [OR REPLACE] SEQUENCE`, `ALTER SEQUENCE`, `DROP SEQUENCE`, or None for anything else.
-pub fn statement(sql: &str) -> Option<Stmt> {
-    use std::sync::LazyLock;
-    static CREATE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*CREATE\s+(OR\s+REPLACE\s+)?((?:TEMP|TEMPORARY)\s+)?SEQUENCE\s+(IF\s+NOT\s+EXISTS\s+)?([\w."$-]+)(.*?)\s*;?\s*$"#).expect("a regex"));
-    static ALTER: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+SEQUENCE\s+(IF\s+EXISTS\s+)?([\w."$-]+)(.*?)\s*;?\s*$"#).expect("a regex"));
-    static DROP: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*DROP\s+SEQUENCE\b").expect("a regex"));
-    static RENAME: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*RENAME\s+TO\s+([\w."$-]+)\s*$"#).expect("a regex"));
-    let first = crate::text::first_word(sql);
+/// `CREATE [OR REPLACE] SEQUENCE`, `ALTER SEQUENCE` and `DROP SEQUENCE`, by their words: the statements section's
+/// entries' reader (`core_statements.rs`, step 8 PR 8c).
+pub(crate) fn read(w: &mut crate::words::Words) -> anyhow::Result<Stmt> {
+    use crate::ddl::Ddl;
     let invalid = |e: anyhow::Error| Stmt::Invalid(format!("{e:#}"));
-    if let Some(c) = CREATE.captures(first) {
-        if c.get(2).is_some() {
-            return Some(Stmt::Invalid("CREATE TEMPORARY SEQUENCE isn't taken yet: a sequence is the lake's (CREATE SEQUENCE)".into()));
-        }
-        let (replace, if_not_exists) = (c.get(1).is_some(), c.get(3).is_some());
-        return Some(match parse_options(&c[5], false) {
-            _ if replace && if_not_exists => Stmt::Invalid("CREATE OR REPLACE SEQUENCE … IF NOT EXISTS: one or the other".into()),
-            Ok((declared, _)) => Stmt::Ddl(vec![crate::ddl::Ddl::Sequence(Change::Create { name: object_of(&c[4]), declared, replace, if_not_exists })]),
-            Err(e) => invalid(e),
+    let verb = w.next().map(|x| x.word()).unwrap_or_default();
+    if verb == "drop" {
+        let read = |w: &mut crate::words::Words| -> anyhow::Result<Change> {
+            w.expect("sequence")?;
+            let if_exists = w.is("if") && {
+                w.expect("exists")?;
+                true
+            };
+            let names = w.names()?;
+            let _ = w.is("cascade") || w.is("restrict"); // (as the parser reads them, and drops them)
+            w.done()?;
+            Ok(Change::Drop { names, if_exists })
+        };
+        return Ok(match read(w) {
+            Ok(c) => Stmt::Ddl(vec![Ddl::Sequence(c)]),
+            Err(_) => Stmt::Invalid("DROP SEQUENCE [IF EXISTS] name [, …]".into()),
         });
     }
-    if let Some(c) = ALTER.captures(first) {
-        let (if_exists, name, rest) = (c.get(1).is_some(), object_of(&c[2]), c[3].to_string());
-        if let Some(r) = RENAME.captures(&rest) {
-            return Some(Stmt::Ddl(vec![crate::ddl::Ddl::Sequence(Change::Alter { name, declared: vec![], restart: None, rename: Some(object_of(&r[1])), if_exists })]));
+    if verb == "alter" {
+        w.expect("sequence")?;
+        let if_exists = w.is("if") && {
+            w.expect("exists")?;
+            true
+        };
+        let name = w.name()?;
+        let mut renamed = w.clone();
+        if renamed.is("rename") && renamed.is("to") {
+            if let Ok(to) = renamed.name() {
+                if renamed.done().is_ok() {
+                    return Ok(Stmt::Ddl(vec![Ddl::Sequence(Change::Alter { name, declared: vec![], restart: None, rename: Some(to), if_exists })]));
+                }
+            }
         }
-        return Some(match parse_options(&rest, true) {
+        return Ok(match crate::rules::create::options_in(w.rest_upper(), true) {
             Ok((declared, None)) if declared.is_empty() => {
                 Stmt::Invalid(format!("ALTER SEQUENCE {name}: what to change (RESTART [WITH n], INCREMENT BY n, MINVALUE n, MAXVALUE n, START WITH n, CACHE n, [NO] CYCLE, AS type, RENAME TO name)"))
             }
-            Ok((declared, restart)) => Stmt::Ddl(vec![crate::ddl::Ddl::Sequence(Change::Alter { name, declared, restart, rename: None, if_exists })]),
+            Ok((declared, restart)) => Stmt::Ddl(vec![Ddl::Sequence(Change::Alter { name, declared, restart, rename: None, if_exists })]),
             Err(e) => invalid(e),
         });
     }
-    if DROP.is_match(first) {
-        let parsed = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::GenericDialect {}, sql).map(|mut s| s.pop());
-        return Some(match parsed {
-            Ok(Some(ast::Statement::Drop { object_type: ast::ObjectType::Sequence, names, if_exists, .. })) => {
-                Stmt::Ddl(vec![crate::ddl::Ddl::Sequence(Change::Drop { names: names.iter().map(crate::text::object).collect(), if_exists })])
-            }
-            _ => Stmt::Invalid("DROP SEQUENCE [IF EXISTS] name [, …]".into()),
-        });
+    let replace = w.is("or") && {
+        w.expect("replace")?;
+        true
+    };
+    if w.is("temp") || w.is("temporary") {
+        return Ok(Stmt::Invalid("CREATE TEMPORARY SEQUENCE isn't taken yet: a sequence is the lake's (CREATE SEQUENCE)".into()));
     }
-    None
+    w.expect("sequence")?;
+    let if_not_exists = w.is("if") && {
+        w.expect_all(&["not", "exists"])?;
+        true
+    };
+    let name = w.name()?;
+    Ok(match crate::rules::create::options_in(w.rest_upper(), false) {
+        _ if replace && if_not_exists => Stmt::Invalid("CREATE OR REPLACE SEQUENCE … IF NOT EXISTS: one or the other".into()),
+        Ok((declared, _)) => Stmt::Ddl(vec![Ddl::Sequence(Change::Create { name, declared, replace, if_not_exists })]),
+        Err(e) => invalid(e),
+    })
 }
 
 pub use crate::text::object_of;
@@ -571,7 +591,7 @@ async fn takers(lake: &Lake, name: &str) -> Result<Vec<String>> {
 /// `nextval`, `currval` and `setval` in a query's session. `currval` is the session's: the last
 /// value its `nextval` gave.
 pub fn register(ctx: &SessionContext, lake: Arc<Lake>) {
-    let session = crate::temp::current();
+    let session = crate::temp::here();
     ctx.register_udf(AsyncScalarUDF::new(Arc::new(Counter { lake: lake.clone(), setval: false, session: session.clone(), signature: Signature::string(1, Volatility::Volatile) })).into_scalar_udf());
     ctx.register_udf(AsyncScalarUDF::new(Arc::new(Current { lake: lake.clone(), session: session.clone(), signature: Signature::string(1, Volatility::Volatile) })).into_scalar_udf());
     ctx.register_udf(AsyncScalarUDF::new(Arc::new(Counter { lake, setval: true, session: session.clone(), signature: Signature::variadic_any(Volatility::Volatile) })).into_scalar_udf());
@@ -582,7 +602,7 @@ pub fn register(ctx: &SessionContext, lake: Arc<Lake>) {
 #[derive(Debug)]
 struct Current {
     lake: Arc<Lake>,
-    session: Option<String>,
+    session: Option<crate::temp::Named>,
     signature: Signature,
 }
 
@@ -604,7 +624,7 @@ impl ScalarUDFImpl for Current {
 #[async_trait::async_trait]
 impl AsyncScalarUDFImpl for Current {
     async fn invoke_async_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
-        let Some(session) = crate::temp::current().or(self.session.clone()) else { return exec_err!("currval is a session's: a Postgres connection's, or a client's (x-pondra-session)") };
+        let Some(session) = crate::temp::here().or(self.session.clone()) else { return exec_err!("currval is a session's: a Postgres connection's, or a client's (x-pondra-session)") };
         let names = args.args[0].to_array(args.number_rows)?;
         let names = datafusion::arrow::compute::cast(&names, &DataType::Utf8)?;
         let names = names.as_string::<i32>();
@@ -613,7 +633,7 @@ impl AsyncScalarUDFImpl for Current {
         for i in 0..names.len() {
             let name = names.value(i).to_lowercase();
             check_current(&self.lake, &object_of(&name)).await.map_err(err)?;
-            let got = crate::temp::with(&session, false, |x| Ok(x.currval.get(&name).copied())).ok().flatten();
+            let got = session.at.with(&session.name, false, |x| Ok(x.currval.get(&name).copied())).ok().flatten();
             match got {
                 Some(v) => out.push(v),
                 None => return exec_err!("currval of sequence \"{name}\" is not yet defined in this session"),
@@ -628,7 +648,7 @@ impl AsyncScalarUDFImpl for Current {
 struct Counter {
     lake: Arc<Lake>,
     setval: bool,
-    session: Option<String>,
+    session: Option<crate::temp::Named>,
     signature: Signature,
 }
 
@@ -656,7 +676,7 @@ impl AsyncScalarUDFImpl for Counter {
         let err = |e: anyhow::Error| datafusion::error::DataFusionError::External(e.into());
         let names = text(0)?;
         let names = names.as_string::<i32>();
-        let session = crate::temp::current().or(self.session.clone()); // (currval is the session's)
+        let session = crate::temp::here().or(self.session.clone()); // (currval is the session's)
         if !self.setval {
             // (rows of one name, the usual, take their values in one go)
             let mut out = vec![None; rows]; // (a NULL name, a NULL value)

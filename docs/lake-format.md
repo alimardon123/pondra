@@ -270,9 +270,11 @@ Rules for outside readers:
     refused there.
   - Today the node reads an appended file's rows and writes them into the table again.
     ADR-029 (proposed) would take the files as written and only commit them.
-- **Latest version, plus a little history:** 100 Delta versions and 100 Iceberg snapshots are
-  listed. Files replaced by compaction are deleted after `--retain-secs` (60 s by default), so
-  time travel further back than that fails.
+- **Latest version, plus the history still there:** the Iceberg metadata lists the snapshots from
+  the last one that let a file go (a merge, a rewrite) on, so each one listed reads by its id; the
+  files of older ones stay for readers already reading them until `--retain-secs` (60 s by
+  default) passes. The Delta log lists 100 versions, and files replaced by compaction are deleted
+  after `--retain-secs`, so its time travel further back than that fails.
 - **Types:** Int32/64, Float32/64, Utf8, Boolean, Date32, Binary and Decimal128 in both formats;
   Int8/16 in Delta only. A table with any other column type isn't published in that format (yet).
 - **Keyed tables** are published when one file holds one row per key: after each compaction.

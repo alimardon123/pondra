@@ -244,8 +244,10 @@ mod tests {
     }
 
     /// The forms the front still writes in the text before the parse, where sqlparser has no hook to read them, each with
-    /// its pass and the upstream proposal that would end it. A baseline that may only fall: when sqlparser reads one, its
-    /// example parses, this fails, and the pass's part for it is deleted.
+    /// its pass and the upstream proposal that would end it; and ALTER COLUMN's place, which a statement entry with two
+    /// names reads by a walk (`write::placed`). A baseline that may only fall: when sqlparser reads one, its example
+    /// parses, this fails, and the pass's part for it is deleted (for ALTER COLUMN's place, the entry is the tree's, with
+    /// one name).
     #[test]
     fn the_text_forms_left_are_counted_and_still_refused() {
         const LEFT: &[(&str, &str, &str, &str)] = &[
@@ -255,8 +257,9 @@ mod tests {
             ("FOR NO KEY UPDATE, FOR KEY SHARE", "friendly.text", "SELECT * FROM t FOR NO KEY UPDATE", "Postgres's four lock strengths"),
             ("a subquery before MATCH_RECOGNIZE", "pattern.text", "SELECT * FROM (SELECT * FROM t) MATCH_RECOGNIZE (ORDER BY ts PATTERN (a+) DEFINE a AS true)", "MATCH_RECOGNIZE after a derived table"),
             ("FROM t WHERE … (no SELECT)", "front's SELECT * reading", "FROM t WHERE x > 1", "FromFirstNoSelect reading the clauses after FROM"),
+            ("ALTER TABLE t ALTER COLUMN c FIRST | AFTER b", "write::placed", "ALTER TABLE t ALTER COLUMN c AFTER b", "MySQL's column place, which it reads for ADD and MODIFY, in ALTER COLUMN"),
         ];
-        assert!(LEFT.len() <= 6, "the forms left may only fall: {}", LEFT.len());
+        assert!(LEFT.len() <= 7, "the forms left may only fall: {}", LEFT.len());
         for (form, pass, example, upstream) in LEFT {
             assert!(generic(example).is_err(), "sqlparser reads {form} now ({upstream}): delete {pass}'s part for it");
             assert!(parse(example).0.is_err(), "no hook reads {form}: it is {pass}'s");

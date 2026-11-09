@@ -54,44 +54,56 @@ pub enum Change {
     Drop { names: Vec<String>, if_exists: bool },
 }
 
-/// `CREATE INDEX`, `ALTER INDEX … RENAME TO`, `DROP INDEX`, or None for anything else.
-pub fn statement(sql: &str) -> Option<Stmt> {
-    use std::sync::LazyLock;
-    static CREATE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*CREATE\s+(UNIQUE\s+)?INDEX\b").expect("a regex"));
-    static ALTER: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+INDEX\s+(IF\s+EXISTS\s+)?([\w."$-]+)\s+RENAME\s+TO\s+([\w."$-]+)\s*;?\s*$"#).expect("a regex"));
-    static ALTERED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*ALTER\s+INDEX\b").expect("a regex"));
-    static DROP: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*DROP\s+INDEX\b").expect("a regex"));
-    let first = crate::text::first_word(sql);
-    let ddl = |c: Change| Some(Stmt::Ddl(vec![crate::ddl::Ddl::Index(c)]));
-    if CREATE.is_match(first) {
-        return Some(match Parser::parse_sql(&GenericDialect {}, sql).map(|mut s| s.pop()) {
-            Ok(Some(ast::Statement::CreateIndex(c))) if c.unique => match crate::constraints::unique_index(&c) {
-                Ok(d) => Stmt::Ddl(vec![d]),
-                Err(e) => Stmt::Invalid(format!("{e:#}")),
-            },
-            Ok(Some(ast::Statement::CreateIndex(c))) => match create(c) {
-                Ok(c) => return ddl(c),
-                Err(e) => Stmt::Invalid(format!("{e:#}")),
-            },
-            Ok(_) => Stmt::Invalid("CREATE INDEX [IF NOT EXISTS] [name] ON table [USING method] (column [, …]) [WHERE condition]".into()),
-            Err(e) => Stmt::Invalid(format!("{e}")),
-        });
+/// `CREATE [UNIQUE] INDEX`, read from sqlparser's tree, which reads each of its forms: the statements section's entries'
+/// reader (`Read::Tree`, step 8 PR 8c2). A UNIQUE index on columns is the table's UNIQUE constraint (`constraints.rs`).
+pub(crate) fn created(s: &ast::Statement) -> Result<Stmt> {
+    Ok(match s {
+        ast::Statement::CreateIndex(c) if c.unique => match crate::constraints::unique_index(c) {
+            Ok(d) => Stmt::Ddl(vec![d]),
+            Err(e) => Stmt::Invalid(format!("{e:#}")),
+        },
+        ast::Statement::CreateIndex(c) => match create(c.clone()) {
+            Ok(c) => Stmt::Ddl(vec![crate::ddl::Ddl::Index(c)]),
+            Err(e) => Stmt::Invalid(format!("{e:#}")),
+        },
+        _ => Stmt::Invalid("CREATE INDEX [IF NOT EXISTS] [name] ON table [USING method] (column [, …]) [WHERE condition]".into()),
+    })
+}
+
+/// `ALTER INDEX [IF EXISTS] name RENAME TO new_name` and `DROP INDEX [IF EXISTS] name [, …] [CASCADE | RESTRICT]` (MySQL's
+/// `ON table` after it, as the parser read it), by their words: the statements section's entries' reader.
+pub(crate) fn read(w: &mut crate::words::Words) -> Result<Stmt> {
+    let ddl = |c: Change| Stmt::Ddl(vec![crate::ddl::Ddl::Index(c)]);
+    let verb = w.next().map(|v| v.word()).unwrap_or_default();
+    let if_exists = |w: &mut crate::words::Words| -> Result<bool> {
+        w.expect("index")?;
+        Ok(w.is("if") && {
+            w.expect("exists")?;
+            true
+        })
+    };
+    if verb == "alter" {
+        let renamed = (|| -> Result<Change> {
+            let if_exists = if_exists(w)?;
+            let name = w.name()?;
+            w.expect_all(&["rename", "to"])?;
+            let to = w.name()?;
+            w.done()?;
+            Ok(Change::Rename { name, to, if_exists })
+        })();
+        return Ok(renamed.map_or_else(|_| Stmt::Invalid("ALTER INDEX [IF EXISTS] name RENAME TO new_name (an index has nothing else to change: nothing is built for it)".into()), ddl));
     }
-    if let Some(c) = ALTER.captures(first) {
-        return ddl(Change::Rename { name: crate::seq::object_of(&c[2]), to: crate::seq::object_of(&c[3]), if_exists: c.get(1).is_some() });
-    }
-    if ALTERED.is_match(first) {
-        return Some(Stmt::Invalid("ALTER INDEX [IF EXISTS] name RENAME TO new_name (an index has nothing else to change: nothing is built for it)".into()));
-    }
-    if DROP.is_match(first) {
-        return Some(match Parser::parse_sql(&GenericDialect {}, sql).map(|mut s| s.pop()) {
-            Ok(Some(ast::Statement::Drop { object_type: ast::ObjectType::Index, names, if_exists, .. })) => {
-                return ddl(Change::Drop { names: names.iter().map(crate::text::object).collect(), if_exists })
-            }
-            _ => Stmt::Invalid("DROP INDEX [IF EXISTS] name [, …]".into()),
-        });
-    }
-    None
+    let dropped = (|| -> Result<Change> {
+        let if_exists = if_exists(w)?;
+        let names = w.names()?;
+        let _ = w.is("cascade") || w.is("restrict");
+        if w.is("on") {
+            w.name()?; // (an index's name is its schema's, whichever table it is on)
+        }
+        w.done()?;
+        Ok(Change::Drop { names, if_exists })
+    })();
+    Ok(dropped.map_or_else(|_| Stmt::Invalid("DROP INDEX [IF EXISTS] name [, …]".into()), ddl))
 }
 
 /// What a `CREATE INDEX` says, checked as far as it can be without the table.

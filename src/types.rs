@@ -53,9 +53,11 @@ impl Enum {
     }
 }
 
-/// `CREATE TYPE … AS ENUM`, `ALTER TYPE`, `DROP TYPE`, or None for anything else.
-pub fn statement(sql: &str) -> Option<Stmt> {
-    crate::rules::types::change(sql).map(|r| match r {
+/// `CREATE [OR REPLACE] TYPE`, `ALTER TYPE` and `DROP TYPE`: the statements section's entries' reader (`core_statements.rs`,
+/// step 8 PR 8c2).
+pub(crate) fn read(w: &mut crate::words::Words) -> Result<Stmt> {
+    let verb = w.next().map(|v| v.word()).unwrap_or_default();
+    Ok(match crate::rules::types::read(&verb, w) {
         Ok(c) => Stmt::Ddl(vec![crate::ddl::Ddl::Type(c)]),
         Err(why) => Stmt::Invalid(why),
     })
