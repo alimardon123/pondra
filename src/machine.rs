@@ -99,7 +99,7 @@ pub fn installed() -> Mach {
 /// never ends it. Its memory line is the process's, as in every form (`oom::line`).
 pub fn hosted() -> bool { HOSTED.load(SeqCst) }
 
-/// This process is a host program's from now on (`node::host`, a library's first open).
+/// This process is a host program's from now on (`library::claim`, a library's first open).
 pub fn set_hosted() { HOSTED.store(true, SeqCst) }
 
 #[cfg(test)]

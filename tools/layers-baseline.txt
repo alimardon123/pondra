@@ -243,7 +243,6 @@ store -> ddl  1
 store -> ext  2
 store -> rules  1
 store -> served  1
-store -> spill  2
 store -> types  1
 store -> wasm32  15
 store -> write  1

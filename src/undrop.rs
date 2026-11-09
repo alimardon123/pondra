@@ -281,11 +281,11 @@ pub fn when(ms: u64) -> String {
 }
 
 /// The mark on the lake at `dir`, if it was dropped (None for a folder that isn't there).
-pub async fn lake_kept(dir: &str) -> Result<Option<KeptLake>> {
+pub async fn lake_kept(dir: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<Option<KeptLake>> {
     if (!dir.contains("://") && !std::path::Path::new(dir).is_dir()) || (crate::memory_lake::in_memory(dir) && !crate::memory_lake::memory_held(dir)) {
         return Ok(None); // (as `ddl::has_catalog`: asking a lake in memory that nothing here opened would make one)
     }
-    match crate::store::open_store(dir)?.1.get(&mark()).await {
+    match crate::store::open_store(dir, reaches)?.1.get(&mark()).await {
         Ok(got) => Ok(Some(serde_json::from_slice(&got.bytes().await?).with_context(|| format!("reading {dir}/{LAKE_MARK}"))?)),
         Err(object_store::Error::NotFound { .. }) => Ok(None),
         Err(e) => Err(anyhow::Error::new(e).context(format!("reading {dir}/{LAKE_MARK}"))),
@@ -294,39 +294,40 @@ pub async fn lake_kept(dir: &str) -> Result<Option<KeptLake>> {
 
 /// `DROP DATABASE`: the lake at `dir` marked dropped by `by`, kept for the default `ddl::KEEP_MS`. Refused while a
 /// process leads it, as its delete is (`ddl::unled`): its node is stopped first.
-pub async fn keep_lake(dir: &str, by: &str) -> Result<KeptLake> {
-    crate::ddl::unled(dir).await?;
+pub async fn keep_lake(dir: &str, by: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<KeptLake> {
+    crate::ddl::unled(dir, reaches).await?;
     let kept = KeptLake { at_ms: crate::log::now_ms(), keep_ms: crate::ddl::KEEP_MS, by: by.to_string() };
-    crate::store::open_store(dir)?.1.put(&mark(), serde_json::to_vec(&kept)?.into()).await.with_context(|| format!("marking {dir} dropped"))?;
+    crate::store::open_store(dir, reaches)?.1.put(&mark(), serde_json::to_vec(&kept)?.into()).await.with_context(|| format!("marking {dir} dropped"))?;
     Ok(kept)
 }
 
 /// `UNDROP DATABASE`: the mark taken off the lake at `dir`, a database again as it was.
-pub async fn unkeep_lake(dir: &str) -> Result<()> {
-    crate::store::open_store(dir)?.1.delete(&mark()).await.with_context(|| format!("taking {dir}'s drop back"))?;
+pub async fn unkeep_lake(dir: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<()> {
+    crate::store::open_store(dir, reaches)?.1.delete(&mark()).await.with_context(|| format!("taking {dir}'s drop back"))?;
     Ok(())
 }
 
-/// The dropped databases in `folder`: (name, where, its mark), by name.
-pub async fn lakes_kept(folder: &str) -> Result<Vec<(String, String, KeptLake)>> {
+/// The dropped databases in `folder` (reached as `reaches` say): (name, where, its mark), by name.
+pub async fn lakes_kept(folder: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<Vec<(String, String, KeptLake)>> {
     let mut out = vec![];
-    for (name, dir) in crate::ddl::lakes_found(folder).await? {
-        if let Some(k) = lake_kept(&dir).await? {
+    for (name, dir) in crate::ddl::lakes_found(folder, reaches).await? {
+        if let Some(k) = lake_kept(&dir, reaches).await? {
             out.push((name, dir, k));
         }
     }
     Ok(out)
 }
 
-/// `pondra serve`'s sweep: the dropped databases in `folder` whose time is up at `now`, deleted. The names let go.
+/// `pondra serve`'s sweep: the dropped databases in `folder` whose time is up at `now`, deleted. The names let go. (The
+/// server's own folder, reached as the environment says.)
 pub async fn sweep_lakes(folder: &str, now: u64) -> Vec<String> {
     let mut gone = vec![];
-    let kept = lakes_kept(folder).await.unwrap_or_else(|e| {
+    let kept = lakes_kept(folder, None).await.unwrap_or_else(|e| {
         eprintln!("listing the dropped databases in {folder}: {e:#}");
         vec![]
     });
     for (name, dir, _) in kept.into_iter().filter(|(_, _, k)| now >= k.until()) {
-        match crate::ddl::delete_lake(&dir).await {
+        match crate::ddl::delete_lake(&dir, None).await {
             Ok(()) => gone.push(name),
             Err(e) => eprintln!("letting dropped database {name} go ({dir}): {e:#}"),
         }
@@ -533,11 +534,11 @@ mod tests {
             other.cat.close().await.unwrap();
         }
         let names = |all: Vec<(String, String)>| all.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
-        assert_eq!(names(crate::ddl::lakes_in(folder.to_str().unwrap()).await.unwrap()), ["b", "c", "home"]);
-        let kept = keep_lake(&at("b"), "alice").await.unwrap();
-        assert_eq!(lake_kept(&at("b")).await.unwrap(), Some(kept.clone()));
-        assert_eq!(names(crate::ddl::lakes_in(folder.to_str().unwrap()).await.unwrap()), ["c", "home"], "a dropped one is no database");
-        let listed = lakes_kept(folder.to_str().unwrap()).await.unwrap();
+        assert_eq!(names(crate::ddl::lakes_in(folder.to_str().unwrap(), None).await.unwrap()), ["b", "c", "home"]);
+        let kept = keep_lake(&at("b"), "alice", None).await.unwrap();
+        assert_eq!(lake_kept(&at("b"), None).await.unwrap(), Some(kept.clone()));
+        assert_eq!(names(crate::ddl::lakes_in(folder.to_str().unwrap(), None).await.unwrap()), ["c", "home"], "a dropped one is no database");
+        let listed = lakes_kept(folder.to_str().unwrap(), None).await.unwrap();
         assert_eq!(listed.iter().map(|(n, _, k)| (n.as_str(), k.by.as_str())).collect::<Vec<_>>(), [("b", "alice")]);
         let refused = format!("{:#}", crate::ddl::attach(&home, "b", &at("b"), false, false).await.err().expect("refused"));
         assert!(refused.contains("UNDROP DATABASE b"), "{refused}");
@@ -545,20 +546,20 @@ mod tests {
         // (UNDROP DATABASE on a node serving one lake: the one beside it, attached again with its tables)
         let out = run(&home, "UNDROP DATABASE b").await.unwrap();
         assert_eq!(out["undropped"], true, "{out}");
-        assert_eq!(lake_kept(&at("b")).await.unwrap(), None);
+        assert_eq!(lake_kept(&at("b"), None).await.unwrap(), None);
         let back = home.attached.read().unwrap().iter().find(|(n, _)| n == "b").map(|(_, l)| l.clone()).expect("attached again");
         assert!(back.cat.get::<Value>(&crate::store::table_key("t")).await.unwrap().is_some(), "with its tables");
         let again = format!("{:#}", run(&home, "UNDROP DATABASE b").await.unwrap_err());
         assert!(again.contains("pondra.dropped"), "{again}");
         // (a new database under a dropped one's name lets it go, and says so)
-        keep_lake(&at("c"), "bob").await.unwrap();
-        let notice = crate::ddl::let_go(&at("c"), "c").await.unwrap().expect("let go");
+        keep_lake(&at("c"), "bob", None).await.unwrap();
+        let notice = crate::ddl::let_go(&at("c"), "c", None).await.unwrap().expect("let go");
         assert!(notice.contains("is let go"), "{notice}");
         assert!(!folder.join("c").exists(), "its folder deleted");
         // (and the sweep lets one go once its time is up)
         let d = Lake::open(&at("d"), true, false, crate::node_state::NodeState::unhosted()).await.unwrap();
         d.cat.close().await.unwrap();
-        let kept = keep_lake(&at("d"), "carol").await.unwrap();
+        let kept = keep_lake(&at("d"), "carol", None).await.unwrap();
         assert_eq!(sweep_lakes(folder.to_str().unwrap(), kept.until()).await, ["d"]);
         assert!(!folder.join("d").exists());
         home.cat.close().await.unwrap();
