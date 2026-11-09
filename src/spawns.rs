@@ -61,7 +61,7 @@ pub fn untracked<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static)
 }
 
 /// Start a loop that serves the node's statics (`per_node!`: its sessions' reaper, its Python pools', its sign-in keys'
-/// refresh, its Kafka groups' rebalance), whose callers have no node in hand: it is the statics' own, and ends as they are
+/// refresh), whose callers have no node in hand: it is the statics' own, and ends as they are
 /// set back (`reset::reset`, a node's stop's last step). It runs as nobody (no principal, not the node's: it reads no
 /// table), and its panic is its own.
 pub fn for_statics<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {

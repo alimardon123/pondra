@@ -57,6 +57,11 @@ pub enum Hook {
     /// At the start of a statement (sqlparser's `Dialect::parse_statement`), with the dialect, for a parse of its parts
     /// in which the other hooks read too.
     Statement(fn(&dyn Dialect, &mut Parser) -> Option<Result<Statement, ParserError>>),
+    /// After an expression (sqlparser's `Dialect::get_next_precedence` and `parse_infix`): `next` says whether the tokens
+    /// ahead are the hook's, and how tightly they bind, on sqlparser's scale (`Dialect::prec_value`: 1 takes the whole
+    /// expression before them); `read` reads them, after that expression. `settle` then makes each statement the tree
+    /// generic reads the form's stored text as, when the hook read part of it.
+    Infix { next: fn(&Parser) -> Option<u8>, read: fn(&mut Parser, &Expr) -> Option<Result<Expr, ParserError>>, settle: fn(&mut Statement) },
 }
 
 /// A pass: its name (`module.look`), its place (its run's phase, and its order in it: no two passes of a phase share
@@ -213,12 +218,9 @@ pub fn get() -> &'static Passes {
     crate::registry::get().section::<Passes>()
 }
 
-/// Whether a pass whose trigger didn't fire is run anyway, and its having something to do refused (`missed`): in a debug
-/// build, and in a node started with `PONDRA_TEST_PASSES` (the gates' runs).
-pub(crate) fn checked() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| cfg!(debug_assertions) || crate::env::is_set("PONDRA_TEST_PASSES"));
-    *ON
-}
+/// Whether a pass whose trigger didn't fire is run anyway, and its having something to do refused (`missed`):
+/// `env::front_checked`.
+pub(crate) fn checked() -> bool { crate::env::front_checked() }
 
 fn missed(p: &Pass, sql: &str) -> String {
     format!("passes: {} had something to do in a text its trigger missed (its words and marks are short of its look): {sql}", p.name)
@@ -526,6 +528,7 @@ pub(crate) mod tests {
                 (Phase::Parse, "friendly.lambda"),
                 (Phase::Parse, "friendly.pivot"),
                 (Phase::Parse, "friendly.unpivot"),
+                (Phase::Parse, "measures.as_measure"),
             ]
         );
     }

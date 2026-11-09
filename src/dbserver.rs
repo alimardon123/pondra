@@ -91,7 +91,7 @@ fn idle() -> Duration { crate::env::secs("PONDRA_DATABASE_IDLE_SECS") }
 /// Does `path` hold lakes rather than be one (`pondra serve data`: each a database)? Not when it
 /// holds one itself, or is new or empty (it becomes a lake).
 pub async fn holds_lakes(path: &str) -> anyhow::Result<bool> {
-    Ok(!is_lake(path).await? && !databases(path).await.is_empty())
+    Ok(!is_lake(path).await? && !crate::ddl::lakes_found(path, None).await.unwrap_or_default().is_empty()) // (dropped ones too: kept, they are still its)
 }
 
 /// Is there a lake at `dir` (a folder, or a bucket's prefix)? One being made counts: its first
@@ -158,6 +158,9 @@ impl Server {
             }
         }
         let dir = place(&self.folder, name);
+        if let Some(k) = crate::undrop::lake_kept(&dir, None).await? {
+            bail!("database \"{name}\" does not exist: it was dropped, and is kept until {} (UNDROP DATABASE {name} brings it back)", crate::undrop::when(k.until()));
+        }
         if !create && !is_lake(&dir).await? {
             bail!("database \"{name}\" does not exist (CREATE DATABASE {name})");
         }
@@ -222,12 +225,13 @@ impl Server {
         }
     }
 
-    /// `DROP DATABASE name`: its node stopped, its folder deleted (refused while another process
-    /// leads that lake).
-    async fn drop_db(&self, name: &str, if_exists: bool) -> Result<Value> {
+    /// `DROP DATABASE name` (by `by`): its node stopped, its folder kept as it was, marked dropped, for UNDROP DATABASE
+    /// to bring back until `sweep` lets it go (`undrop::LAKE_MARK`); with `purge`, deleted at once. Refused while another
+    /// process leads that lake.
+    async fn drop_db(&self, name: &str, if_exists: bool, purge: bool, by: &str) -> Result<Value> {
         crate::ddl::check(name)?;
         let dir = place(&self.folder, name);
-        if !is_lake(&dir).await? {
+        if !is_lake(&dir).await? || crate::undrop::lake_kept(&dir, None).await?.is_some() {
             anyhow::ensure!(if_exists, "database \"{name}\" does not exist");
             return Ok(j!({"database": name, "dropped": false}));
         }
@@ -235,8 +239,24 @@ impl Server {
             drop(n.child.stdin.take());
             let _ = tokio::time::timeout(Duration::from_secs(20), n.child.wait()).await;
         }
-        crate::ddl::delete_lake(&dir, None).await.with_context(|| format!("database {name}"))?; // (a bucket's prefix: every object under it)
-        Ok(j!({"database": name, "dropped": true}))
+        if purge {
+            crate::ddl::delete_lake(&dir, None).await.with_context(|| format!("database {name}"))?; // (a bucket's prefix: every object under it)
+            return Ok(j!({"database": name, "dropped": true}));
+        }
+        let kept = crate::undrop::keep_lake(&dir, by, None).await.with_context(|| format!("database {name}"))?;
+        Ok(j!({"database": name, "dropped": true, "kept_until": kept.until()}))
+    }
+
+    /// `UNDROP DATABASE name`: the mark taken off its folder, a database again as it was dropped; its node starts as
+    /// the next request for it comes.
+    async fn undrop_db(&self, name: &str) -> Result<Value> {
+        crate::ddl::check(name)?;
+        let dir = place(&self.folder, name);
+        if crate::undrop::lake_kept(&dir, None).await?.is_none() {
+            return Err(crate::codes::coded("3D000", format!("no dropped database {name} is kept (pondra.dropped lists those that are)")));
+        }
+        crate::undrop::unkeep_lake(&dir, None).await?;
+        Ok(j!({"database": name, "undropped": true, "dir": dir}))
     }
 }
 
@@ -253,7 +273,10 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
     let server: Shared = Arc::new(Server { folder: folder.clone(), addr: addr.clone(), default, options, auth, nodes: Default::default(), starting: Default::default(), tasks });
     let s = server.clone();
     server.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
-        loop {
+        for round in 0u64.. {
+            if round % 60 == 0 {
+                crate::undrop::sweep_lakes(&s.folder, crate::log::now_ms()).await; // (every ten minutes: the dropped databases whose time is up)
+            }
             tokio::time::sleep(Duration::from_secs(10)).await;
             s.reap().await;
         }
@@ -280,6 +303,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
         .route("/console/{*file}", get(crate::console::file))
         .route("/databases", get(list).post(create))
         .route("/databases/{name}", axum::routing::delete(drop_db))
+        .route("/databases/{name}/undrop", axum::routing::post(undrop_db))
         .route("/db/{name}", any(|State(s): State<Shared>, Path(name): Path<String>, req: Request| async move { route(&s, &name, "/", req).await }))
         .route("/db/{name}/{*rest}", any(|State(s): State<Shared>, Path((name, rest)): Path<(String, String)>, req: Request| async move { route(&s, &name, &format!("/{rest}"), req).await }))
         .fallback(|State(s): State<Shared>, req: Request| async move {
@@ -338,7 +362,20 @@ async fn drop_db(State(s): State<Shared>, Path(name): Path<String>, req: Request
         return (StatusCode::UNAUTHORIZED, "DROP DATABASE needs an admin token").into_response();
     }
     let if_exists = req.uri().query().is_some_and(|q| q.contains("if_exists=true"));
-    match s.drop_db(&name.to_lowercase(), if_exists).await {
+    let purge = req.uri().query().is_some_and(|q| q.contains("purge=true"));
+    // (who dropped it, as the node it came through names its user: `pondra.dropped` shows it)
+    let by = url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes()).find(|(k, _)| k == "by").map(|(_, v)| v.to_string()).unwrap_or_default();
+    match s.drop_db(&name.to_lowercase(), if_exists, purge, &by).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn undrop_db(State(s): State<Shared>, Path(name): Path<String>, req: Request) -> Response {
+    if role(&s, req.headers()) < Role::Admin {
+        return (StatusCode::UNAUTHORIZED, "UNDROP DATABASE needs an admin token").into_response();
+    }
+    match s.undrop_db(&name.to_lowercase()).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => error(StatusCode::BAD_REQUEST, e),
     }

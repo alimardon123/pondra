@@ -515,19 +515,8 @@ fn comprehends(p: &mut Parser) -> bool {
     is
 }
 
-/// `template`, read by GenericDialect, with each `$_n` the nth of `parts`, as it stands (`expander::around` groups them).
-fn templated(template: &str, parts: &[Expr]) -> Expr {
-    let mut e = crate::expander::parse_expr(template).expect("a template that parses");
-    let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
-        if let Expr::Value(ValueWithSpan { value: Value::Placeholder(p), .. }) = x {
-            if let Some(part) = p.strip_prefix("$_").and_then(|n| n.parse::<usize>().ok()).and_then(|n| parts.get(n.wrapping_sub(1))) {
-                *x = part.clone();
-            }
-        }
-        ControlFlow::<()>::Continue(())
-    });
-    e
-}
+/// `template`, read by GenericDialect, with each `$_n` the nth of `parts` as it stands (`expander::filled`).
+fn templated(template: &str, parts: &[Expr]) -> Expr { crate::expander::filled(template, parts, |e| e).expect("a template that parses") }
 
 /// DuckDB's `a ASOF [LEFT] JOIN b ON a.k = b.k AND a.t >= b.t`, marked for `asof::as_of`, which
 /// takes the inequality for Snowflake's MATCH_CONDITION (and keeps a row with no match only for

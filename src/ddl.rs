@@ -281,7 +281,7 @@ pub enum Ddl {
     // (the wire op keeps the old word: a node of the last release sends it to the leader)
     #[serde(rename = "deploy")]
     Apply { claim: bool, after: u64, record: Vec<u8> }, // an apply's entry: its claim, its record, a migration done (`apply::keep`, ADR-047 §4)
-    DropDatabase { name: String, if_exists: bool }, // a folder of databases' (`dbserver.rs`): its node stopped, its folder deleted (ADR-030)
+    DropDatabase { name: String, if_exists: bool, #[serde(default, skip_serializing_if = "std::ops::Not::not")] purge: bool }, // a folder of databases' (`dbserver.rs`): its node stopped, its folder kept to be undropped (`undrop::LAKE_MARK`), or deleted with PURGE (ADR-030)
     AlterColumn { table: String, column: String, change: Change }, // ALTER TABLE … RENAME/DROP/ALTER COLUMN (ADR-022)
     RenameTable { name: String, to: String }, // ALTER TABLE | VIEW … RENAME TO (ADR-030)
     Swap { name: String, with: String }, // ALTER TABLE … SWAP WITH … (write-audit-publish)
@@ -297,7 +297,7 @@ pub enum Ddl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         connection: Option<String>, // (`ATTACH shop`: a connection's tables, its url, type and options read from it)
     }, // another engine's tables (`ext.rs`)
-    DropSecret { name: String, if_exists: bool },
+    DropSecret { name: String, if_exists: bool, #[serde(default, skip_serializing_if = "std::ops::Not::not")] purge: bool }, // (PURGE: not kept, and the copies earlier drops kept go too)
     FetchExtension { name: String, from: String, version: Option<String> }, // INSTALL name FROM 'file or URL': the node that got it reads the file, then sends the record (`extension.rs`)
     InstallExtension { name: String, record: crate::extension::Installed }, // the record of an extension, kept by the leader (ADR-075 §6: `extension.rs`)
     UninstallExtension { name: String, if_exists: bool }, // UNINSTALL name: the leader drops its record (`extension.rs`)
@@ -514,15 +514,18 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
                 return Err(crate::codes::coded("2BP01", format!("schema {name} isn't empty ({}): drop them first, or DROP SCHEMA {name} CASCADE", [&views[..], &tables[..], &routines[..]].concat().join(", "))));
             }
             // (each kept in its own record, and named in the schema's, so UNDROP SCHEMA brings them back with it)
-            let (mut with, mut keep_ms) = (vec![], KEEP_MS);
+            let (mut with, mut lost, mut keep_ms) = (vec![], vec![], KEEP_MS);
             for r in &routines {
                 let kind = lake.cat.get::<crate::expander::Routine>(&crate::routines::key(r)).await?.map(|r| r.kind_name());
                 crate::routines::drop(lake, r, true).await?;
                 with.extend(kind.map(|k| (k.to_string(), r.clone())));
             }
             for v in &views {
-                let (_, kind) = drop_view(lake, v, true, true).await?; // (a topic's view isn't kept)
-                with.extend(kind.map(|k| (k.to_string(), v.clone())));
+                match drop_view(lake, v, true, true).await? {
+                    (_, Some(kind)) => with.push((kind.to_string(), v.clone())),
+                    (out, None) if out["dropped"] == true => lost.push(j!({"kind": "view", "name": v, "why": "a topic's view isn't kept (its offsets would start over): make it again from its topic"})),
+                    _ => {}
+                }
             }
             for t in tables.iter().filter(|t| !views.iter().any(|v| *t == v || **t == format!("{v}_final"))) {
                 let meta = lake.cat.get::<TableMeta>(&table_key(t)).await?;
@@ -532,12 +535,18 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
                     with.push(("table".to_string(), t.clone()));
                 }
             }
-            let kept = crate::undrop::aside_with(lake, "schema", &name, &[schema_key(&name)], with, keep_ms).await?;
+            let mut kept = crate::undrop::kept_as_long(lake, &with, keep_ms).await?; // (its views and routines as long as it)
+            kept.extend(crate::undrop::aside_with(lake, "schema", &name, &[schema_key(&name)], with, lost.clone(), keep_ms).await?);
             lake.cat.commit(kept, &[schema_key(&name)]).await?;
-            Ok(j!({"schema": name, "dropped": true}))
+            let mut out = j!({"schema": name, "dropped": true});
+            if !lost.is_empty() {
+                out["not_kept"] = j!(lost); // (what UNDROP SCHEMA won't bring back, named by both)
+            }
+            Ok(out)
         }
         Ddl::DropTable { name, if_exists, purge, made_by } => drop_table(lake, &name, if_exists, purge, made_by.as_deref()).await,
         Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?, scope).await,
+        Ddl::UndropKept { kind, name } if kind == "database" => undrop_database(lake, &name.to_lowercase(), scope).await,
         Ddl::UndropKept { kind, name } => crate::undrop::undrop(lake, &kind, &crate::undrop::named(lake, &kind, &name).await?, scope).await,
         Ddl::Clone { name, from } => clone(lake, &new_name(lake, &name).await?, &from).await,
         Ddl::CreateView { name, sql, replace, facts, text } => create_view(lake, &name, sql, replace, false, facts, text, scope).await,
@@ -603,12 +612,16 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
                 true => {
                     let dir = full(&dir)?;
                     crate::ext::reach(lake, &dir, true, endpoint.as_deref()).await?; // (its key and its server, before it is opened)
+                    dropped_here(&dir, &name, Some(&lake.node.reaches)).await?; // (read with that key: this node's own may not reach its bucket)
                     if !has_catalog(&dir, Some(&lake.node.reaches)).await? {
                         return Err(crate::codes::coded("58P01", format!("{dir} holds no lake: a READ_ONLY attachment reads one that is there")));
                     }
                     (dir, false)
                 }
-                false => lake_dir(&dir, &lake.node).await?,
+                false => {
+                    dropped_here(&full(&dir)?, &name, Some(&lake.node.reaches)).await?;
+                    lake_dir(&dir, &lake.node).await?
+                }
             };
             lake.cat.commit(vec![(attachment_key(&name), json(&Attachment { dir: dir.clone(), read_only, endpoint }))], &[]).await?;
             Ok(match (created, read_only) {
@@ -630,12 +643,17 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
         Ddl::CreateDatabase { name, if_not_exists, dir, clone: None } => {
             database_name(&name)?;
             let dir = dir.unwrap_or_else(|| beside(&lake.url, &name));
+            let gone = let_go(&full(&dir)?, &name, Some(&lake.node.reaches)).await?; // (a dropped one there, kept to be undropped: a new one takes its place)
             if has_catalog(&full(&dir)?, Some(&lake.node.reaches)).await? {
                 ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name})");
             }
-            Box::pin(apply(lake, Ddl::Attach { name, dir, read_only: false, endpoint: None }, scope)).await
+            let mut out = Box::pin(apply(lake, Ddl::Attach { name, dir, read_only: false, endpoint: None }, scope)).await?;
+            if let Some(n) = gone {
+                out["notice"] = n.into();
+            }
+            Ok(out)
         }
-        Ddl::DropDatabase { name, if_exists } => {
+        Ddl::DropDatabase { name, if_exists, purge } => {
             ensure!(name != lake_name(lake), "this is database {name}: drop it from another one");
             // (a branch's pins in its bases go with it; a base goes only after its branches: ADR-047)
             let target = lake.attached.read().unwrap().iter().find(|(n, _)| *n == name).map(|(_, l)| l.clone());
@@ -646,30 +664,50 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
                 bases = now.cat.get::<crate::branch::Bases>(crate::branch::BASES).await?;
                 branches = now.cat.scan::<crate::branch::Pin>("pn/", "pn0").await?.into_iter().map(|(_, p)| p.lake).collect();
             }
-            ensure!(branches.is_empty(), "{name} has branches ({}): drop them first", branches.join(", "));
+            if !branches.is_empty() {
+                // (a branch dropped and kept to be undropped reads its base's files until its time is up)
+                let mut named = vec![];
+                for b in &branches {
+                    named.push(match crate::undrop::lake_kept(b, Some(&lake.node.reaches)).await? {
+                        Some(k) => format!("{b}, dropped and kept until {}", crate::undrop::when(k.until())),
+                        None => b.clone(),
+                    });
+                }
+                bail!("{name} has branches ({}): drop them first; a dropped one reads {name}'s files until its time is up", named.join("; "));
+            }
             if target.is_none() && if_exists && !crate::env::is_set("PONDRA_SERVER_URL") {
                 return Ok(j!({"database": name, "dropped": false, "notice": format!("database \"{name}\" does not exist, skipping")}));
             }
+            // (kept to be undropped, its folder as it was, under a mark: `undrop::LAKE_MARK`. A branch's pins in its
+            // bases stay as long, so their files do: its base's sweep lets them go once its folder is gone)
+            let by = crate::auth::name();
             let dropped = match (crate::env::get("PONDRA_SERVER_URL"), &bases, &target) {
                 (Some(server), ..) => {
-                    let r = crate::dial::call(&server, crate::dial::Call::delete(format!("/databases/{name}?if_exists={if_exists}"))).await?;
-                    let (ok, text) = (r.ok(), r.text().await?);
-                    ensure!(ok, "{text}");
-                    serde_json::from_str(&text)?
+                    let query = format!("if_exists={if_exists}&purge={purge}&by={}", url::form_urlencoded::byte_serialize(by.as_bytes()).collect::<String>());
+                    databases_call(&lake.node, &server, true, format!("/databases/{name}?{query}")).await?
+                }
+                (None, Some(_), Some(t)) if purge => {
+                    delete_lake(&t.url, Some(&lake.node.reaches)).await?; // (its own objects alone: its bases' files are theirs)
+                    j!({"database": name, "dropped": true})
                 }
                 (None, Some(_), Some(t)) => {
-                    // A branch: its own objects alone are its (its bases' files are theirs).
-                    delete_lake(&t.url, Some(&lake.node.reaches)).await?;
-                    if lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_some() {
-                        lake.cat.commit(vec![], &[attachment_key(&name)]).await?;
-                    }
-                    j!({"database": name, "dropped": true})
+                    let kept = crate::undrop::keep_lake(&t.url, &by, Some(&lake.node.reaches)).await?;
+                    j!({"database": name, "dropped": true, "kept_until": kept.until()})
                 }
                 _ => bail!("DROP DATABASE drops a branch (CREATE DATABASE … CLONE) or one of the databases `pondra serve <folder>` serves, folder and all; on a node serving one lake, DETACH {name} (its folder stays)"),
             };
+            // (its attachment kept with it: UNDROP DATABASE puts it back)
+            let attachment = [attachment_key(&name)];
+            if lake.cat.get::<Attachment>(&attachment[0]).await?.is_some() {
+                let kept = match dropped["kept_until"].is_u64() {
+                    true => crate::undrop::aside(lake, "database", &name, &attachment).await?,
+                    false => vec![],
+                };
+                lake.cat.commit(kept, &attachment).await?;
+            }
             lake.attached.write().unwrap().retain(|(n, _)| *n != name); // (its tables are gone from here too)
-            if let Some(b) = bases {
-                crate::branch::release(lake, &b).await;
+            if let (Some(b), None) = (bases, dropped["kept_until"].as_u64()) {
+                crate::branch::release(lake, &b).await; // (deleted: with PURGE, or by a server of an older release)
             }
             Ok(dropped)
         }
@@ -680,7 +718,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
         Ddl::CreateRoutine { name, routine, replace } => crate::routines::create(lake, &name, routine, replace).await,
         Ddl::DropRoutine { name, if_exists } => crate::routines::drop(lake, &name, if_exists).await,
         Ddl::CreateSecret { name, params, replace, if_not_exists } => crate::ext::create(lake, &name, params, replace, if_not_exists).await,
-        Ddl::DropSecret { name, if_exists } => crate::ext::drop(lake, &name, if_exists).await,
+        Ddl::DropSecret { name, if_exists, purge } => crate::ext::drop(lake, &name, if_exists, purge).await,
         Ddl::InstallExtension { name, record } => crate::extension::install(lake, &name, record).await,
         Ddl::UninstallExtension { name, if_exists } => crate::extension::uninstall(lake, &name, if_exists).await,
         Ddl::FetchExtension { name, .. } => anyhow::bail!("INSTALL {name} FROM is read by the node the statement reached, not the leader"),
@@ -772,13 +810,83 @@ pub fn full(dir: &str) -> Result<String> {
     })
 }
 
-/// Delete a lake no process leads (`DROP DATABASE`): its folder, or every object under its prefix, reached as `reaches`
-/// say (the asking node's: `store::open_store`).
-pub async fn delete_lake(dir: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<()> {
+/// Refused while a process leads the lake at `dir` (reached as `reaches` say, the asking node's: `store::open_store`):
+/// what deletes it, or marks it dropped, stops that process first.
+pub async fn unled(dir: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<()> {
     let store = crate::store::open_store(dir, reaches)?.1;
     if let Some(t) = crate::terms::latest(&store).await? {
-        ensure!(!crate::terms::alive(&store, &t).await, "another process leads the lake at {dir} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
+        ensure!(!crate::terms::alive(&store, &t, None).await, "another process leads the lake at {dir} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
     }
+    Ok(())
+}
+
+/// Refused when the lake at `dir` is a dropped database's, kept to be undropped: it is no database until then. (A mark
+/// that can't be read is no refusal: the open that follows says what is wrong with the place.)
+async fn dropped_here(dir: &str, name: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<()> {
+    if let Some(k) = crate::undrop::lake_kept(dir, reaches).await.ok().flatten() {
+        let until = crate::undrop::when(k.until());
+        return Err(crate::codes::coded("3D000", format!("database {name} ({dir}) was dropped, and is kept until {until}: UNDROP DATABASE {name} brings it back")));
+    }
+    Ok(())
+}
+
+/// A new database made where a dropped one is kept (`undrop::LAKE_MARK`): that one is let go, its folder deleted, and
+/// the words that say so (the CREATE's notice).
+pub async fn let_go(dir: &str, name: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<Option<String>> {
+    let Some(k) = crate::undrop::lake_kept(dir, reaches).await? else { return Ok(None) };
+    delete_lake(dir, reaches).await?;
+    Ok(Some(format!("database {name} dropped at {}, kept until {}, is let go: this one takes its name", crate::undrop::when(k.at_ms), crate::undrop::when(k.until()))))
+}
+
+/// A call to the server that serves this folder's databases (`DROP DATABASE`, a DELETE; `UNDROP DATABASE`, a POST): its
+/// answer, or its refusal as the error.
+async fn databases_call(node: &crate::node_state::NodeState, server: &str, delete: bool, path: String) -> Result<Value> {
+    use crate::dial::{call, Call};
+    let r = call(node, server, if delete { Call::delete(path) } else { Call::post(path, Vec::new()) }).await?;
+    let (ok, text) = (r.ok(), r.text().await?);
+    ensure!(ok, "{text}");
+    Ok(serde_json::from_str(&text)?)
+}
+
+/// `UNDROP DATABASE name` (an admin's): the database dropped under `name` beside this one, back as it was, and attached
+/// here again. On a server it asks the server (`dbserver::undrop_db`), whose folder holds them.
+async fn undrop_database(lake: &Lake, name: &str, scope: &crate::rights::Scope) -> Result<Value> {
+    ensure!(scope.whole(), crate::codes::coded("42501", format!("permission denied: UNDROP DATABASE {name} needs an admin")));
+    database_name(name)?;
+    let dir = match crate::env::get("PONDRA_SERVER_URL") {
+        Some(server) => {
+            let answer = databases_call(&lake.node, &server, false, format!("/databases/{name}/undrop")).await?;
+            full(answer["dir"].as_str().context("the server's answer names no folder")?)?
+        }
+        None => {
+            // (where its attachment, kept with it, says; else beside this one, where a branch is made)
+            let kept = crate::undrop::newest(lake, "database", name).await?;
+            let at = kept.and_then(|k| k.records.into_iter().find(|(k, _)| *k == attachment_key(name)).and_then(|(_, a)| a["dir"].as_str().map(String::from)));
+            let dir = full(&at.unwrap_or_else(|| beside(&lake.url, name)))?;
+            if crate::undrop::lake_kept(&dir, Some(&lake.node.reaches)).await?.is_none() {
+                return Err(crate::codes::coded("3D000", format!("no dropped database {name} is kept beside this one (pondra.dropped lists those that are)")));
+            }
+            crate::undrop::unkeep_lake(&dir, Some(&lake.node.reaches)).await?;
+            dir
+        }
+    };
+    // (attached here again: by its record, kept with it when it had one, else as the shell finds its siblings)
+    let follow = !lake.node.life.one_off();
+    if crate::undrop::has(lake, "database", name).await? {
+        Box::pin(crate::undrop::undrop(lake, "database", name, scope)).await?;
+        sync(lake, follow).await?;
+    }
+    if !lake.attached.read().unwrap().iter().any(|(n, _)| n == name) {
+        attach(lake, name, &dir, follow, false).await?;
+    }
+    Ok(j!({"database": name, "undropped": true, "dir": dir}))
+}
+
+/// Delete a lake no process leads (a dropped database's time up, or a branch half made): its folder, or every object
+/// under its prefix, reached as `reaches` say (the asking node's: `store::open_store`).
+pub async fn delete_lake(dir: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<()> {
+    unled(dir, reaches).await?;
+    let store = crate::store::open_store(dir, reaches)?.1;
     match dir.contains("://") {
         false => std::fs::remove_dir_all(dir).with_context(|| format!("deleting {dir}"))?,
         true => {
@@ -803,6 +911,17 @@ pub async fn has_catalog(dir: &str, reaches: Option<&crate::reaches::Reaches>) -
 /// one, by name (ADR-030, ADR-032: a folder of databases, the shell's lakes side by side). A bucket is reached as
 /// `reaches` say (the asking node's: `store::open_store`).
 pub async fn lakes_in(folder: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<Vec<(String, String)>> {
+    let mut out = vec![];
+    for (name, dir) in lakes_found(folder, reaches).await? {
+        if crate::undrop::lake_kept(&dir, reaches).await?.is_none() {
+            out.push((name, dir)); // (a dropped one, kept to be undropped, is no database: `undrop::LAKE_MARK`)
+        }
+    }
+    Ok(out)
+}
+
+/// `lakes_in`'s, the dropped ones too.
+pub async fn lakes_found(folder: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<Vec<(String, String)>> {
     let folder = folder.trim_end_matches('/');
     let names: Vec<String> = match folder.contains("://") {
         false => std::fs::read_dir(folder).into_iter().flatten().flatten().filter(|e| e.path().join("catalog").is_dir())
@@ -830,14 +949,23 @@ pub async fn lakes_in(folder: &str, reaches: Option<&crate::reaches::Reaches>) -
 /// Lake `name` in the folder (or prefix) this lake's is in.
 pub fn beside(url: &str, name: &str) -> String {
     match url.contains("://") {
-        true => format!("{}/{name}", url.trim_end_matches('/').rsplit_once('/').map_or(url, |(p, _)| p)),
+        true => format!("{}/{name}", folder_of(url)),
         false => std::path::Path::new(url).parent().unwrap_or(std::path::Path::new(".")).join(name).to_string_lossy().to_string(),
+    }
+}
+
+/// The folder (or prefix) the lake at `url` is in: where the databases beside it are.
+pub fn folder_of(url: &str) -> String {
+    match url.contains("://") {
+        true => url.trim_end_matches('/').rsplit_once('/').map_or(url, |(p, _)| p).to_string(),
+        false => std::path::Path::new(url).parent().unwrap_or(std::path::Path::new(".")).to_string_lossy().to_string(),
     }
 }
 
 /// Attach lake `dir` as `name` here, and return it. A node (`follow`) keeps it fresh from its catalog, until it
 /// is detached; `live` opens it to follow its leader's commit stream too (`--attach`: for good, `node::attach`).
 pub async fn attach(home: &Lake, name: &str, dir: &str, follow: bool, live: bool) -> Result<Arc<Lake>> {
+    dropped_here(dir, name, Some(&home.node.reaches)).await?;
     let other = Lake::open(dir, false, live, home.node.clone()).await?;
     let node = home.node.clone();
     if follow {
@@ -939,6 +1067,16 @@ pub async fn sync(lake: &Lake, follow: bool) -> Result<()> {
                 eprintln!("attaching {name} ({}): {e:#}", a.dir);
                 continue;
             }
+        }
+        if crate::undrop::lake_kept(&a.dir, Some(&lake.node.reaches)).await.ok().flatten().is_some() {
+            // (a database dropped, kept to be undropped: not one until it is, said once; read with its key, above)
+            let seen = (lake.url.clone(), format!("{key}={} dropped", a.dir));
+            let mut refused = REFUSED.lock().unwrap();
+            if !refused.contains(&seen) {
+                eprintln!("not attaching {name}: {} was dropped, and is kept to be undropped (UNDROP DATABASE {name})", a.dir);
+                refused.push(seen);
+            }
+            continue;
         }
         match attach(lake, name, &a.dir, follow, false).await {
             Ok(_) => FROM_SQL.lock().unwrap().push((lake.url.clone(), name.to_string())),
@@ -1205,7 +1343,79 @@ pub(crate) async fn no_followers(lake: &Lake, name: &str, why: &str) -> Result<(
 pub(crate) fn keeps(name: &str, meta: &TableMeta, purge: bool) -> bool { meta.retention_secs.map_or(KEEP_MS, |s| s * 1000) > 0 && !purge && !crate::sys::hidden(name) }
 
 /// DDL's own records beside the kinds' (`records`).
-pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "dt/", owner: "ddl", holds: "a dropped table, kept while it can be undropped (dt/name/at)" }];
+pub const PREFIXES: &[crate::records::Prefix] = &[
+    crate::records::Prefix { prefix: "dt/", owner: "ddl", holds: "a dropped table, kept while it can be undropped (dt/name/at)" },
+    crate::records::Prefix { prefix: FOLDER_USES, owner: "ddl", holds: "a folder a table uses: its own, a clone's share, a dropped one's kept (fu/folder/entry)" },
+];
+
+/// Where the folders tables use are recorded: `fu/{folder}/{entry}`, the entry `t/{name}` or `dt/{name}/{at}`.
+pub(crate) const FOLDER_USES: &str = "fu/";
+
+/// The folders each table entry uses (redesign step 5, piece 10c), kept with the entries by the catalog
+/// (`store::CatalogHook`): a live table's own folder and its shares, and a dropped one's kept to be undropped (its own, its
+/// sources', its changed rows' old versions'). So a new table's folder check reads one folder's records, not every table.
+pub fn folder_hook() -> crate::store::CatalogHook {
+    crate::store::CatalogHook { name: "folders", reads: &["t/", "dt/"], records: FOLDER_USES, derive: folder_records }
+}
+
+/// `entry`'s folder records: `fu/{folder}/{entry}`, its use as the value (`own`, `shares`, `kept`). One folder a table uses
+/// twice is one record, the first use's.
+fn folder_records(entry: &str, value: &[u8]) -> Vec<(String, Vec<u8>)> {
+    #[derive(Deserialize)]
+    struct Places {
+        #[serde(default)]
+        folder: Option<String>,
+        #[serde(default)]
+        shares: Vec<String>,
+    }
+    #[derive(Deserialize)]
+    struct Kept {
+        meta: Places,
+        #[serde(default)]
+        deleted: Option<Places>,
+    }
+    let uses: Vec<(String, &str)> = if let Some(name) = entry.strip_prefix("t/") {
+        let Ok(p) = serde_json::from_slice::<Places>(value) else { return vec![] };
+        std::iter::once((p.folder.unwrap_or_else(|| name.to_string()), "own")).chain(p.shares.into_iter().map(|f| (f, "shares"))).collect()
+    } else if let Some(rest) = entry.strip_prefix("dt/") {
+        let name = rest.rsplit_once('/').map_or(rest, |(n, _)| n);
+        let Ok(d) = serde_json::from_slice::<Kept>(value) else { return vec![] };
+        let deleted = d.deleted.map(|m| m.folder.unwrap_or_else(|| crate::sys::deleted(name)));
+        std::iter::once(d.meta.folder.unwrap_or_else(|| name.to_string())).chain(d.meta.shares).chain(deleted).map(|f| (f, "kept")).collect()
+    } else {
+        return vec![];
+    };
+    let mut out: Vec<(String, Vec<u8>)> = vec![];
+    for (folder, how) in uses {
+        let key = format!("{FOLDER_USES}{}/{entry}", folder_part(&folder));
+        if !out.iter().any(|(k, _)| *k == key) {
+            out.push((key, json(&how)));
+        }
+    }
+    out
+}
+
+/// A folder's name as one part of a record's key: `/` and `%` escaped, so one folder's records never start another's.
+fn folder_part(folder: &str) -> String { folder.replace('%', "%25").replace('/', "%2F") }
+
+/// The tables that use `folder`, and how: its records where the catalog keeps them (`folder_hook`), else from every table
+/// (a lake a guest leads: `pondra sql`).
+pub async fn folder_used(lake: &Lake, folder: &str) -> Result<Vec<(String, Use)>> {
+    if !lake.cat.records_kept() {
+        return Ok(folder_users(lake).await?.remove(folder).unwrap_or_default());
+    }
+    let from = format!("{FOLDER_USES}{}/", folder_part(folder));
+    let to = format!("{FOLDER_USES}{}0", folder_part(folder));
+    Ok(lake.cat.scan::<String>(&from, &to).await?.into_iter().map(|(k, how)| {
+        let entry = &k[from.len()..];
+        let name = match (entry.strip_prefix("t/"), entry.strip_prefix("dt/")) {
+            (Some(n), _) => n,
+            (_, Some(rest)) => rest.rsplit_once('/').map_or(rest, |(n, _)| n),
+            _ => entry,
+        };
+        (name.to_string(), match how.as_str() { "own" => Use::Own, "shares" => Use::Shares, _ => Use::Kept })
+    }).collect())
+}
 
 /// A table's entries set aside as a drop sets them (leader, under the lock): kept to be undropped when `kept`, as `dt/` with
 /// its changed rows' old versions; taken out of every share (`shares::tables_moved`). The caller's commit deletes the table's own
@@ -1498,11 +1708,23 @@ async fn exchange(lake: &Lake, a: &str, b: &str) -> Result<()> {
 /// renamed table keeps its folder, a dropped one while it can be undropped): then `name__2`, `name__3`… (characters a bucket's paths
 /// take as they are).
 pub async fn free_folder(lake: &Lake, name: &str) -> Result<Option<String>> {
-    let users = folder_users(lake).await?;
-    Ok(match users.contains_key(name) {
-        false => None,
-        true => (2..).map(|i| format!("{name}__{i}")).find(|f| !users.contains_key(f)),
-    })
+    if !lake.cat.records_kept() {
+        let users = folder_users(lake).await?; // (every table, once)
+        return Ok(match users.contains_key(name) {
+            false => None,
+            true => (2..).map(|i| format!("{name}__{i}")).find(|f| !users.contains_key(f)),
+        });
+    }
+    if folder_used(lake, name).await?.is_empty() {
+        return Ok(None);
+    }
+    for i in 2.. {
+        let f = format!("{name}__{i}");
+        if folder_used(lake, &f).await?.is_empty() {
+            return Ok(Some(f));
+        }
+    }
+    unreachable!("a free folder is found")
 }
 
 /// How a table uses a folder under `data/` (`folder_users`).
@@ -1539,8 +1761,8 @@ pub async fn folder_users(lake: &Lake) -> Result<std::collections::BTreeMap<Stri
 /// statement is about): each table's Delta log and Iceberg metadata would be written in one place. `ALTER TABLE … RENAME`
 /// keeps a folder, so `t` renamed and `t` undropped share one.
 pub async fn publishes_alone(lake: &Lake, name: &str, folder: &str, except: &[&str]) -> Result<()> {
-    let users = folder_users(lake).await?;
-    if let Some((other, _)) = users.get(folder).into_iter().flatten().find(|(o, u)| *u == Use::Own && !except.contains(&o.as_str())) {
+    let users = folder_used(lake, folder).await?;
+    if let Some((other, _)) = users.iter().find(|(o, u)| *u == Use::Own && !except.contains(&o.as_str())) {
         let why = format!("{name} can't be published: its folder ({folder}) is {other}'s too, and two tables can't publish in one folder (CREATE TABLE … AS SELECT * FROM {name} copies it into a folder of its own)");
         return Err(crate::codes::coded("55000", why)); // object_not_in_prerequisite_state
     }
@@ -2189,7 +2411,7 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool, keep: bool) -> Resu
         let gone: Vec<String> = [crate::feeds::feed_key(name), table_key(name)].into_iter().chain(offsets.iter().cloned()).collect();
         let (unshared, from) = crate::shares::tables_moved(lake, &[(name, None)]).await?;
         lake.cat.commit(unshared, &gone).await?;
-        crate::log::forget_producers(offsets.into_iter().map(|k| k[2..].to_string())); // (its offsets: made again, it starts over)
+        crate::log::forget_producers(lake, offsets.into_iter().map(|k| k[2..].to_string())); // (its offsets: made again, it starts over)
         return Ok((left_shares(j!({"view": name, "dropped": true}), from), None));
     }
     if let Some(v) = lake.cat.get::<StoredView>(&query_key(name)).await? {
@@ -2234,7 +2456,7 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool, keep: bool) -> Resu
     for published in &copies {
         published.delete(lake).await;
     }
-    crate::log::forget_producers(producers); // (a view made again under this name starts over)
+    crate::log::forget_producers(lake, producers); // (a view made again under this name starts over)
     crate::views::forget(lake);
     Ok((left_shares(j!({"view": shown, "dropped": true}), from), keep.then_some("materialized view")))
 }
@@ -2249,7 +2471,7 @@ async fn detach_view(lake: &Lake, name: &str) -> Result<Value> {
         let offsets = lake.cat.scan::<u64>(&crate::store::producer_key(&format!("feed:{name}:")), &crate::store::producer_key(&format!("feed:{name};"))).await?;
         let gone: Vec<String> = std::iter::once(crate::feeds::feed_key(name)).chain(offsets.iter().map(|(k, _)| k.clone())).collect();
         lake.cat.commit(vec![], &gone).await?;
-        crate::log::forget_producers(offsets.into_iter().map(|(k, _)| k[2..].to_string())); // (`p/…`: a feed made again starts over)
+        crate::log::forget_producers(lake, offsets.into_iter().map(|(k, _)| k[2..].to_string())); // (`p/…`: a feed made again starts over)
         return Ok(j!({"view": name, "detached": true, "table": name}));
     }
     ensure!(lake.cat.get::<crate::views::View>(&crate::views::view_key(&crate::once::open(name))).await?.is_none(),
@@ -2265,7 +2487,7 @@ async fn detach_view(lake: &Lake, name: &str) -> Result<Value> {
         gone.extend(crate::matches::tables(name).iter().map(|t| table_key(t))); // (a MATCH_RECOGNIZE's held and resume rows: its table stays)
     }
     lake.cat.commit(vec![], &gone).await?;
-    crate::log::forget_producers(producers);
+    crate::log::forget_producers(lake, producers);
     crate::views::forget(lake);
     Ok(j!({"view": name, "detached": true, "table": name}))
 }

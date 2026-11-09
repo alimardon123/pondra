@@ -71,8 +71,9 @@ changes is changed in the view, and a row that no longer matches leaves it (see
 A grouped view takes the aggregates you would write by hand: `count`, `sum`, `avg`, `min`, `max`,
 `stddev` and `variance` (and their `_samp` and `_pop` forms), `bool_and` and `bool_or`, any
 expression over them, `HAVING`, and `ORDER BY … LIMIT`. Its table keeps running totals as rows
-arrive (sums, counts, and a variance's moments), and each read works the answers out from them, so
-they are as current as the rows:
+arrive (sums, counts, and for an average or a variance the same running state the query itself
+keeps), and each read works the answers out from them, so they are as current as the rows and
+answer to the last digit as the query would:
 
 ```sql
 CREATE MATERIALIZED VIEW habits AS

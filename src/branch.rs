@@ -229,6 +229,7 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
     let away = lake.node.reaches.of(&base); // (a base on another server: its key and its leader's URL, ADR-058)
     let dir = crate::ddl::full(&dir.unwrap_or_else(|| crate::ddl::beside(&lake.url, name)))?;
     ensure!(same_kind(&dir, &base), "a branch lives where its base does: {base} is {}", if crate::store::served(&base) { "a node's lake" } else if base.contains("://") { "in a bucket" } else { "a folder on this machine" });
+    let gone = crate::ddl::let_go(&dir, name, Some(&lake.node.reaches)).await?; // (a dropped one there, kept to be undropped: this one takes its place)
     if crate::ddl::has_catalog(&dir, Some(&lake.node.reaches)).await? {
         ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name} CLONE {})", of.from);
         return Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None }, &crate::auth::Principal::node().scope)).await; // (an ATTACH plans nothing)
@@ -287,7 +288,11 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
         }
     };
     let attached = Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None }, &crate::auth::Principal::node().scope)).await?;
-    Ok(j!({"database": name, "cloned": of.from, "tables": made["tables"], "dir": attached["dir"]}))
+    let mut out = j!({"database": name, "cloned": of.from, "tables": made["tables"], "dir": attached["dir"]});
+    if let Some(n) = gone {
+        out["notice"] = n.into();
+    }
+    Ok(out)
 }
 
 /// The schemas a clone takes: the ones it names, within what its base's pin lets this caller clone (a
@@ -475,7 +480,7 @@ async fn user_door(lake: &Lake, d: &mut Ddl, a: &crate::rights::Scope) -> Result
         ensure!(dir.is_none(), crate::codes::coded("42501", "permission denied: a branch made with CLONE lives beside the database it is made on; LOCATION is a superuser's choice"));
         return clone_as(lake, of, a);
     }
-    if let Ddl::DropDatabase { name, if_exists } = d {
+    if let Ddl::DropDatabase { name, if_exists, .. } = d {
         return drop_as(lake, name.as_str(), *if_exists).await;
     }
     may(lake, d).await
@@ -512,7 +517,7 @@ async fn drop_as(lake: &Lake, name: &str, if_exists: bool) -> Result<()> {
     // (attached here, or beside this lake on its server, not yet attached to this node)
     let attached = lake.attached.read().unwrap().iter().find(|(n, _)| *n == name).map(|(_, l)| l.url.clone());
     let url = attached.unwrap_or_else(|| crate::ddl::beside(&lake.url, name));
-    if !crate::ddl::has_catalog(&url, Some(&lake.node.reaches)).await? {
+    if !crate::ddl::has_catalog(&url, Some(&lake.node.reaches)).await? || crate::undrop::lake_kept(&url, Some(&lake.node.reaches)).await?.is_some() {
         ensure!(if_exists, "no database {name}");
         return Ok(());
     }
@@ -535,6 +540,12 @@ async fn stamp(lake: &Lake, d: &mut Ddl) -> Result<()> {
     Ok(())
 }
 
+/// Branches as readers of the lake they are made from (`pins`): their pins hold its files, a pin on lease lapses
+/// (`lapse`), and a pin whose branch is gone goes (`sweep`).
+pub fn readers() -> crate::pins::Pin {
+    crate::pins::Pin { name: "branches", held: |l| Box::pin(pins(l)), lapse: Some(|l| Box::pin(lapse(l))), sweep: Some(|l| Box::pin(sweep(l))) }
+}
+
 /// The pins clean-up keeps files for: the oldest and the newest (None: no branch reads this lake).
 pub async fn pins(lake: &Lake) -> Result<Option<(u64, u64)>> {
     let all = lake.cat.scan::<Pin>("pn/", "pn0").await?;
@@ -544,10 +555,17 @@ pub async fn pins(lake: &Lake) -> Result<Option<(u64, u64)>> {
 /// Hourly, on a base's leader: a pin whose branch is gone (its lake deleted without a DROP
 /// DATABASE here) goes too. An hour's grace: a pin is taken just before its branch is made. These are
 /// the pins of branches on this lake's own storage, the only ones it can look at; a pin on lease (a
-/// branch on another server) goes by `lapse`.
+/// branch on another server) goes by `lapse`. A branch dropped and kept to be undropped
+/// (`undrop::LAKE_MARK`) keeps its pin, so the files it reads, until its time is up: then it is deleted, and its pin goes.
 pub async fn sweep(lake: &Lake) -> Result<()> {
     let now = crate::log::now_ms();
     for (key, p) in lake.cat.scan::<Pin>("pn/", "pn0").await? {
+        if crate::undrop::lake_kept(&p.lake, Some(&lake.node.reaches)).await.ok().flatten().is_some_and(|k| now >= k.until()) {
+            if let Err(e) = crate::ddl::delete_lake(&p.lake, Some(&lake.node.reaches)).await {
+                eprintln!("letting dropped branch {} go: {e:#}", p.lake);
+                continue;
+            }
+        }
         if p.at_ms + 3_600_000 < now && !crate::ddl::has_catalog(&p.lake, Some(&lake.node.reaches)).await.unwrap_or(true) {
             lake.cat.commit(vec![], &[key]).await?;
         }
@@ -760,11 +778,11 @@ fn listed(meta: &mut TableMeta, id: &str) {
     (meta.garbage, meta.garbage_deletes, meta.replaced, meta.shares, meta.publish) = Default::default();
 }
 
-/// The base's workspace files (not their kept versions), to copy.
+/// The base's workspace files (not their kept versions, nor the notes of deleted ones, whose versions aren't copied), to copy.
 async fn workspace(base: &Lake) -> Result<Vec<String>> {
     use futures::TryStreamExt;
     let all: Vec<_> = base.store.list(Some(&object_store::path::Path::from("files"))).try_collect().await?;
-    Ok(all.into_iter().map(|o| o.location.to_string()).filter(|p| !p.starts_with("files/.versions/")).collect())
+    Ok(all.into_iter().map(|o| o.location.to_string()).filter(|p| ![crate::files::VERSIONS, crate::files::DELETED].iter().any(|d| p.starts_with(d))).collect())
 }
 
 async fn copy(from: &Lake, to: &Lake, path: String) -> Result<()> {
@@ -947,7 +965,7 @@ pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::syn
     }
     lake.cat.commit(puts, &[]).await?;
     crate::views::forget(lake); // (the sequencer's views as they are now: invariant 77)
-    crate::log::forget_producers(fills);
+    crate::log::forget_producers(lake, fills);
     Ok(j!({"refreshed": all, "from": me.base}))
 }
 

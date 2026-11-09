@@ -6,7 +6,7 @@
 use crate::connections::{key, ConnectionType, ConnectionTypes, Definition, Holds, SECRET, URL};
 use crate::objects::{Kind, Kinds, OnClone};
 use crate::registry::BuiltIn;
-use crate::statements::{Parsed, Right, Run, Statement, Statements};
+use crate::statements::{Parsed, Read, Right, Run, Statement, Statements};
 use crate::store::{json, Lake};
 use crate::codes::coded;
 use anyhow::Result;
@@ -49,10 +49,10 @@ const KIND: Kind = Kind {
 };
 
 const MADE: &str = "makes a connection: CREATE [OR REPLACE] CONNECTION [IF NOT EXISTS] name TYPE t [WITH (option = value, …)]";
-const CREATE: Statement = Statement { words: &["CREATE", "CONNECTION"], parse: made, run: Run::Leader(make), right: Right::Admin, needs: &[], about: MADE, extension: "connections" };
-const CREATE_OR_REPLACE: Statement = Statement { words: &["CREATE", "OR", "REPLACE", "CONNECTION"], parse: made, run: Run::Leader(make), right: Right::Admin, needs: &[], about: MADE, extension: "connections" };
-const ALTER: Statement = Statement { words: &["ALTER", "CONNECTION"], parse: altered, run: Run::Leader(change), right: Right::Admin, needs: &[], about: "changes a connection: ALTER CONNECTION [IF EXISTS] name SET (option = value, …) | RESET (option, …) | RENAME TO new_name", extension: "connections" };
-const DROP: Statement = Statement { words: &["DROP", "CONNECTION"], parse: dropped, run: Run::Leader(remove), right: Right::Admin, needs: &[], about: "drops a connection: DROP CONNECTION [IF EXISTS] name", extension: "connections" };
+const CREATE: Statement = Statement { words: &["CREATE", "CONNECTION"], read: Read::Text(made), run: Run::Leader(make), right: Right::Admin, needs: &[], about: MADE, extension: "connections" };
+const CREATE_OR_REPLACE: Statement = Statement { words: &["CREATE", "OR", "REPLACE", "CONNECTION"], read: Read::Text(made), run: Run::Leader(make), right: Right::Admin, needs: &[], about: MADE, extension: "connections" };
+const ALTER: Statement = Statement { words: &["ALTER", "CONNECTION"], read: Read::Text(altered), run: Run::Leader(change), right: Right::Admin, needs: &[], about: "changes a connection: ALTER CONNECTION [IF EXISTS] name SET (option = value, …) | RESET (option, …) | RENAME TO new_name", extension: "connections" };
+const DROP: Statement = Statement { words: &["DROP", "CONNECTION"], read: Read::Text(dropped), run: Run::Leader(remove), right: Right::Admin, needs: &[], about: "drops a connection: DROP CONNECTION [IF EXISTS] name", extension: "connections" };
 
 /// The types for files Pondra reaches today: buckets, a folder, and another node's served store. A type for tables or
 /// messages is its own extension's entry (`delta`, `iceberg`, `kafka`, `share`), so ATTACH and CREATE CONNECTION list the

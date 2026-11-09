@@ -134,7 +134,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         }).transpose()?;
         schema(&columns)?; // validate types
         ensure!(columns.iter().all(|(c, _)| !crate::text::NAMES.contains(&c.as_str()) && c != "_old_version"), "{} are system columns: every table has them (`SELECT _row_id, * FROM t`)", crate::text::NAMES.join(", "));
-        ensure!(merge.values().all(|f| ["sum", "count", "min", "max", crate::finish::MOMENTS].contains(&f.as_str())), "MERGE: sum, count, min or max"); // (moments: a view's variance, `finish.rs`; an ALTER of its table sends them back)
+        ensure!(merge.values().all(|f| ["sum", "count", "min", "max"].contains(&f.as_str()) || crate::finish::parts(f)), "MERGE: sum, count, min or max"); // (moments: a view's variance, `finish.rs`; an ALTER of its table sends them back)
         ensure!(merge.is_empty() || !key.is_empty(), "MERGE needs a key: a merge table combines the rows of each key");
         ensure!(merge.keys().all(|c| columns.iter().any(|(n, _)| n == c)), "MERGE: columns of the table");
         if let Some((c, _)) = columns.iter().find(|(c, _)| !merge.is_empty() && !key.contains(c) && !merge.contains_key(c)) {
@@ -315,6 +315,7 @@ pub enum Stmt {
     TempView(String, String, bool, bool),                  // CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] name AS query: the session's (`temp.rs`)
     TempSecret(String, std::collections::BTreeMap<String, String>, bool, bool), // CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…): the session's, in memory (`temp.rs`)
     TempRoutine(String, Box<crate::expander::Routine>, bool, bool), // CREATE [OR REPLACE] TEMP MACRO | FUNCTION [IF NOT EXISTS] name …: the session's (`temp.rs`)
+    UndropFile(String),                                   // UNDROP FILE 'path': a deleted file back from its versions (`files::undrop`)
 }
 
 impl Stmt {
@@ -362,7 +363,7 @@ impl Stmt {
         match self {
             Stmt::Create(c) => object(&c.name),
             Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) | Stmt::CopyInto(t, ..) => t.clone(),
-            Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) => String::new(),
+            Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::UndropFile(_) => String::new(),
             Stmt::TempView(v, ..) | Stmt::TempSecret(v, ..) | Stmt::TempRoutine(v, ..) => v.clone(),
             Stmt::Merge(m) => m.target.clone(),
         }
@@ -695,27 +696,8 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if matches!(head.as_str(), "export" | "import") && PORTABLE.is_match(first_word(sql)) {
         return Some(Stmt::Invalid("EXPORT DATABASE and IMPORT DATABASE are not supported yet: BACKUP DATABASE TO 'place' copies a database (RESTORE DATABASE name FROM 'place' brings it back), and COPY t TO 'dir/t.parquet' (FORMAT parquet) writes a table's rows".into()));
     }
-    // `UNDROP <kind> name` (Snowflake's, Databricks'): what was dropped last under that name, back (ADR-043; a definition's:
-    // `undrop.rs`). The kinds are those whose verbs the registry lists UNDROP among (`objects::Kind`), so a kind that keeps
-    // its drops is undropped with no edit here.
     if head == "undrop" {
-        static UNDROP: std::sync::LazyLock<(regex::Regex, String)> = std::sync::LazyLock::new(|| {
-            let mut kinds: Vec<&str> = crate::objects::all_kinds().filter(|k| k.verbs.contains(&"UNDROP")).map(|k| k.name).collect();
-            kinds.sort_by_key(|k| std::cmp::Reverse(k.len())); // ("table function" before "table")
-            let words = kinds.iter().map(|k| k.replace(' ', r"\s+")).collect::<Vec<_>>().join("|");
-            let re = regex::Regex::new(&format!(r#"(?is)^\s*UNDROP\s+({words})\s+([\w."-]+)\s*;?\s*$"#)).expect("a regex");
-            kinds.sort();
-            (re, kinds.iter().map(|k| k.to_uppercase()).collect::<Vec<_>>().join(", "))
-        });
-        let (re, kinds) = &*UNDROP;
-        let Some(c) = re.captures(first_word(sql)) else {
-            return Some(Stmt::Invalid(format!("UNDROP <kind> name brings back what was dropped last under the name, for these kinds: {kinds} (pondra.dropped lists what can come back)")));
-        };
-        let kind = c[1].split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-        return Some(Stmt::Ddl(vec![match kind.as_str() {
-            "table" => Ddl::Undrop { name: name(&c[2]) },
-            _ => Ddl::UndropKept { kind, name: name(&c[2]) },
-        }]));
+        return Some(undrop(first_word(sql)));
     }
     // DuckDB's CREATE MACRO … IF NOT EXISTS (the parser takes only OR REPLACE): read without it, kept unless one is there.
     static MACRO_QUIET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+(OR\s+REPLACE\s+)?(TEMP\s+|TEMPORARY\s+)?MACRO\s+)IF\s+NOT\s+EXISTS\s+").expect("a regex"));
@@ -741,7 +723,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Ok(sql) => sql,
         Err(e) => return Some(Stmt::of_error(&e, format!("{e:#}"))),
     };
-    let parsed = crate::parsed::read(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (as the front reads it, parsed once for its looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
+    let parsed = crate::parsed::read(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql).map(crate::parsed::signed_all))); // (as the front reads it, parsed once for its looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
     let parsed = match parsed {
         Ok(mut s) => s.pop()?,
         Err(_) => return None,
@@ -872,7 +854,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             ast::ObjectType::Schema => Some(Ddl::DropSchema { name, if_exists, cascade }),
             ast::ObjectType::Table => Some(Ddl::DropTable { name, if_exists, purge, made_by: None }),
             ast::ObjectType::View | ast::ObjectType::MaterializedView => Some(Ddl::DropView { name, if_exists }),
-            ast::ObjectType::Database => Some(Ddl::DropDatabase { name: name.to_lowercase(), if_exists }),
+            ast::ObjectType::Database => Some(Ddl::DropDatabase { name: name.to_lowercase(), if_exists, purge }),
             _ => None,
         }).collect::<Option<Vec<_>>>()?),
         Statement::CreateView(v) if v.materialized => {
@@ -1029,7 +1011,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
 /// Create a table (or change it: a spec sent again) from any node: the leader does it.
 pub async fn define(app: &crate::app::App, name: &str, spec: &str) -> Result<Value> {
     let out: Value = match app.seq {
-        None => post(&app.members.leader().addr, &Request::Table(name.into(), spec.into())).await?, // (the leader's refusal, by name)
+        None => post(&app.lake.node, &app.members.leader().addr, &Request::Table(name.into(), spec.into())).await?, // (the leader's refusal, by name)
         Some(_) => {
             let _guard = app.lock.lock().await;
             create_table(&app.lake, name, spec).await?
@@ -1174,7 +1156,7 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             ensure!(deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
-        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) => unreachable!("not a row write here"),
+        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) | Stmt::UndropFile(_) => unreachable!("not a row write here"),
     }
 }
 
@@ -1261,6 +1243,60 @@ fn distinct_names(q: &mut ast::Query) {
 pub fn checkpoint(sql: &str) -> bool {
     let code: String = sql.lines().map(|l| l.split("--").next().unwrap_or("")).collect::<Vec<_>>().join(" "); // (comments aside)
     code.trim().trim_end_matches(';').trim().eq_ignore_ascii_case("checkpoint")
+}
+
+/// `UNDROP <kind> name` (Snowflake's, Databricks'): what was dropped last under that name, back (ADR-043; a definition's:
+/// `undrop.rs`), and `UNDROP FILE 'path'`: a deleted file's newest version, back (`files::undrop`). The kinds are those
+/// whose verbs the registry lists UNDROP among (`objects::Kind`), so a kind that keeps its drops is undropped with no edit
+/// here. Any other is refused by name: Databricks' `WITH ID` and volumes, a kind whose drop is final (dropping one is how
+/// access is cut), and a kind whose drops aren't kept yet.
+fn undrop(sql: &str) -> Stmt {
+    use std::sync::LazyLock;
+    // (the kinds kept: `UNDROP <kind> name` read; the kinds a DROP takes, to name the one asked; the kept kinds, listed)
+    static WORDS: LazyLock<(regex::Regex, regex::Regex, String)> = LazyLock::new(|| {
+        let kinds = |undrops: bool| {
+            let mut ks: Vec<&str> = crate::objects::all_kinds().filter(|k| k.verbs.contains(&"DROP") && (!undrops || k.verbs.contains(&"UNDROP"))).map(|k| k.name).collect();
+            ks.sort_by_key(|k| std::cmp::Reverse(k.len())); // ("table function" before "table")
+            ks.iter().map(|k| k.replace(' ', r"\s+")).collect::<Vec<_>>().join("|")
+        };
+        let mut listed: Vec<String> = crate::objects::all_kinds().filter(|k| k.verbs.contains(&"UNDROP")).map(|k| k.name.to_uppercase()).collect();
+        listed.sort();
+        let re = |p: String| regex::Regex::new(&p).expect("a regex");
+        (
+            re(format!(r#"(?is)^\s*UNDROP\s+({})\s+([\w."-]+)\s*;?\s*$"#, kinds(true))),
+            re(format!(r"(?is)^\s*UNDROP\s+({}|\w+)\b(.*)$", kinds(false))),
+            listed.join(", "),
+        )
+    });
+    static FILE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*UNDROP\s+FILE\s+'((?:[^']|'')*)'\s*;?\s*$").expect("a regex"));
+    static WITH_ID: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)\bWITH\s+ID\b").expect("a regex"));
+    let (kept, named, kinds) = &*WORDS;
+    if let Some(c) = kept.captures(sql) {
+        let (kind, name) = (c[1].split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase(), crate::text::object_of(&c[2]));
+        return Stmt::Ddl(vec![match kind.as_str() {
+            "table" => crate::ddl::Ddl::Undrop { name },
+            _ => crate::ddl::Ddl::UndropKept { kind, name },
+        }]);
+    }
+    if let Some(c) = FILE.captures(sql) {
+        return Stmt::UndropFile(c[1].replace("''", "'"));
+    }
+    let (kind, rest) = named.captures(sql).map_or((String::new(), String::new()), |c| (c[1].split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase(), c[2].to_string()));
+    let word = kind.to_uppercase();
+    let what = format!("UNDROP <kind> name brings back what was dropped last under the name, for {kinds}, and UNDROP FILE 'path' a deleted file (pondra.dropped lists what can come back, with the UNDROP for each)");
+    const VOLUME: &str = "is Databricks': here a volume's files are the lake's own (files/), and UNDROP FILE 'path' brings back one deleted (pondra.dropped lists them)";
+    let foreign = |why: String| Stmt::Refused("0A000", why);
+    let registry = crate::objects::kind(&kind);
+    match kind.as_str() {
+        "volume" if WITH_ID.is_match(&rest) => foreign(format!("UNDROP VOLUME … WITH ID {VOLUME}")),
+        "volume" => foreign(format!("UNDROP VOLUME {VOLUME}")),
+        _ if WITH_ID.is_match(&rest) => foreign(format!("UNDROP {word} … WITH ID is Databricks': UNDROP {word} name brings back the newest dropped under that name, and to reach an earlier one, rename what came back and run it again (pondra.dropped lists each, with the UNDROP that brings it back)")),
+        "user" | "role" | "identity provider" | "share" | "recipient" => foreign(format!("a dropped {kind} stays dropped, as dropping one is how access is cut: CREATE {word} makes one again")),
+        "file" => Stmt::Refused("42601", "UNDROP FILE 'path': the deleted file's path in quotes, as pondra.dropped lists it".into()),
+        _ if registry.is_some_and(|k| k.verbs.contains(&"UNDROP")) => Stmt::Refused("42601", format!("UNDROP {word} name: the {kind} dropped last under that name, back (pondra.dropped lists those kept)")),
+        _ if registry.is_some() => foreign(format!("UNDROP {word} is not supported yet: {what}")),
+        _ => Stmt::Refused("42601", what),
+    }
 }
 
 /// Does a write to this table go through the log? Keyed tables' do (new versions), and so does
@@ -1413,7 +1449,7 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
         return Ok(None);
     }
     // (out of memory, once more frugally: the first try's files are never recorded, and the orphan sweep takes them)
-    let (columns, files) = crate::query::frugally(ctx, |ctx| async move {
+    let (columns, files) = crate::query::frugally(&lake.node, ctx, |ctx| async move {
         in_order(&ctx);
         let df = crate::engine::sql(&ctx, &crate::sys::planned(query)?).await?;
         write_rows(lake, &ctx, table, df, stamp).await
@@ -1535,9 +1571,7 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
     let live: Vec<(String, String)> = meta.live().map(|(s, _, t)| (s.to_string(), t.to_string())).collect(); // (dropped columns aren't written)
     let listed = |c: &[(String, String)]| c.iter().map(|(n, t)| format!("{} {}", meta.name_of(n), crate::objects::sql_type(t))).collect::<Vec<_>>().join(", ");
     if types(&live) != types(&f.columns) {
-        // (40001, as a move's: a column added, dropped or retyped while they were written, so they are written again. The
-        // words say so too, since a node that sent them reads the code from them)
-        return Err(crate::codes::coded("40001", format!("could not serialize the INSERT into {}: its rows' columns ({}) aren't the table's ({}), in order and type, since it changed while they were written. Run it again", f.table, listed(&f.columns), listed(&live))));
+        return Err(unplaced(&f.table, &f.columns, listed(&f.columns), listed(&live)));
     }
     ensure!(f.placed.is_none_or(|placed| meta.places(placed)), crate::log::moved(&f.table)); // (a move the node hadn't seen: `log::placed_for`)
     let rows: u64 = f.files.iter().map(|f| f.rows).sum();
@@ -1546,6 +1580,18 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
         Some(_) => j!({"rows": rows}),
         None => j!({"duplicate": true}),
     })
+}
+
+/// What `record` says of rows whose columns (`given`, as their node typed them) aren't the table's. 40001, as a move's, when
+/// the table can have changed under them: a column added, dropped or retyped while they were written, so they are written
+/// again (the words say so too, since a node that sent them reads the code from them). But a type this node doesn't read
+/// is no move: the node that wrote them names types otherwise (another version), and run again its INSERT would be
+/// refused the same way forever, so it is XX000, which no client runs again.
+fn unplaced(table: &str, given: &[(String, String)], theirs: String, ours: String) -> anyhow::Error {
+    match given.iter().find(|(_, t)| crate::answer::dtype(t).is_err()) {
+        Some((_, t)) => crate::codes::coded("XX000", format!("the INSERT into {table} was written by a node that names a type {t}, which the leader doesn't read: its rows' columns ({theirs}) aren't the table's ({ours}). Nodes of two versions write together: upgrade them alike")),
+        None => crate::codes::coded("40001", format!("could not serialize the INSERT into {table}: its rows' columns ({theirs}) aren't the table's ({ours}), in order and type, since it changed while they were written. Run it again")),
+    }
 }
 
 /// What `record` says of files written with their rows' system columns once something follows
@@ -1696,7 +1742,7 @@ pub async fn seen_here(app: &crate::app::App) {
         return; // (a joined page's member: its node keeps the records, and answers its writes once its own view holds them)
     }
     let leader = &app.members.leader().addr;
-    let ask = |path: &'static str| async move { crate::dial::call(leader, crate::dial::Call::get(path).timeout(std::time::Duration::from_secs(2))).await };
+    let ask = |path: &'static str| async move { crate::dial::call(&app.lake.node, leader, crate::dial::Call::get(path).timeout(std::time::Duration::from_secs(2))).await };
     let cap = std::time::Duration::from_secs(5);
     let Ok(r) = ask("/cluster/committed").await else { return };
     match r.status {
@@ -1854,6 +1900,9 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     } else {
         ensure!(!app.members.reader(), "read-only node"); // (above a view of a folder's write: a reader writes no file either)
     }
+    if let Stmt::UndropFile(path) = &stmt {
+        return crate::files::undrop(&app.lake, path).await; // (the lake's files: a writer's, and a `.py` an admin's, `rights::asks`)
+    }
     if let Some((query, to, options)) = crate::ext::view_write(&app.lake, &stmt, scope).await? {
         let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.members.nodes(), app.members.me(), scope).await?; // (a view of a folder: a new file in it)
         return Ok(j!({"rows": out["copied"]}));
@@ -1933,7 +1982,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files, scope).await?;
         let Some(o) = other else {
             crate::dial::signed(lake).await; // (the nodes' key, before a user's change goes to the leader)
-            return post_as(&app.members.leader().addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
+            return post_as(&lake.node, &app.members.leader().addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
         };
         let out = deliver(&o.url, Some(Request::Change(sql, job.clone(), sent)), &job, false, &lake.node).await?;
         seen_there(&o, Some(producer_key(&format!("sql:{job}")))).await;
@@ -1975,10 +2024,10 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     // it changes, so a change worked out from a snapshot can't overwrite a commit that landed meanwhile. Its producer is
     // the job, so a retry of it is a duplicate. A MERGE gets here only when `changes` took it as a one-row upsert of one
     // key (`point_upsert`, which asked the same question): the other MERGEs and the UNIQUE tables never do.
-    // A plain INSERT into a table whose key is checked (`constraints::key_checked`) is one too: its key must be new, and its
+    // A plain INSERT into a table whose key is checked (`TableMeta::key_checked`) is one too: its key must be new, and its
     // locks make two nodes' INSERTs of one new key wait for each other (`txn::autocommit_as`).
     let keyed = meta.as_ref().is_some_and(|m| !m.key.is_empty());
-    let key_insert = matches!(stmt, Stmt::Insert(..)) && stored.as_ref().is_some_and(|m| crate::constraints::key_checked(m));
+    let key_insert = matches!(stmt, Stmt::Insert(..)) && stored.as_ref().is_some_and(|m| m.key_checked());
     if (keyed && matches!(stmt, Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_))) || key_insert {
         return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job, scope))).await;
     }
@@ -2077,7 +2126,7 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
     let next = std::sync::atomic::AtomicU64::new(0);
     // (out of memory, once more frugally, as a node's INSERT … SELECT runs (`write_files`); but only while nothing is staged: a
     // staged file holds some of the first try's rows, and is never overwritten)
-    let names = crate::query::frugally(&ctx, |ctx| {
+    let names = crate::query::frugally(&app.lake.node, &ctx, |ctx| {
         let (order, dir, next) = (&order, &dir, &next);
         async move {
             if next.load(std::sync::atomic::Ordering::Relaxed) > 0 {
@@ -2113,7 +2162,7 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
     };
     let call = crate::dial::Call::json(format!("/insert/{}?job={stage}&staged=1", percent_encoding::utf8_percent_encode(table, percent_encoding::NON_ALPHANUMERIC)), &j!({"columns": names, "files": files, "placed": placed}))?;
     // (the page's own dial, with its own sign-in: a node's carries the nodes' key)
-    let reply = crate::dial::Dial::call(&crate::dial::Joined { node: joined.node(), auth: joined.auth() }, joined.node(), call).await?;
+    let reply = crate::dial::Dial::call(&crate::dial::Joined { node: joined.node(), auth: joined.auth() }, &app.lake.node, joined.node(), call).await?;
     if reply.ok() {
         return reply.json().await;
     }
@@ -2448,7 +2497,7 @@ async fn ddl_listed(app: &crate::app::App, ddls: Vec<crate::ddl::Ddl>, job: &str
             _ if app.members.by_inbox() => through_bucket_one(lake, Stmt::Ddl(vec![d.clone()]), job, files, scope).await?,
             _ => match &app.seq {
                 Some(seq) => ddl_here(lake, seq, &app.lock, d.clone(), scope).await?,
-                None => post(&app.members.leader().addr, &Request::Ddl(d.clone())).await?,
+                None => post(&app.lake.node, &app.members.leader().addr, &Request::Ddl(d.clone())).await?,
             },
         };
         app.settle(&d).await?;
@@ -2522,40 +2571,40 @@ pub async fn through_bucket(dir: &str, req: Request, node: &Arc<NodeState>) -> R
 /// nothing to record (`lead_only`): the lake is led for the moment, and its inbox answered.
 async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool, node: &Arc<NodeState>) -> Result<Value> {
     if let Some(r) = node.reaches.of(dir).filter(|r| r.read_only) {
-        return across(dir, &r, req, &node.reaches).await; // (a lake on another server: ADR-058)
+        return across(dir, &r, req, node).await; // (a lake on another server: ADR-058)
     }
     let store = crate::store::counted(open_store(dir, Some(&node.reaches))?.1, &node.metrics); // (its requests the node's: `Counted`)
     loop {
-        match holder(&store).await? {
+        match holder(&store, Some(&node.claims)).await? {
             // (another `pondra sql` is recording: wait)
-            Holder::Recording(t) => wait_for(&store, &t).await,
+            Holder::Recording(t) => wait_for(&store, &t, Some(&node.claims)).await,
             Holder::Led(t) => {
                 let Some(r) = &req else {
                     // (the lake is led, so its inbox is answered: unless its leader elsewhere doesn't mark itself when rung)
-                    if crate::terms::deaf(&store, &t).await {
+                    if crate::terms::deaf(&store, &t, Some(&node.claims)).await {
                         continue;
                     }
                     return Ok(j!({"duplicate": true}));
                 };
                 // (test hook PONDRA_NO_DIRECT: act as if the leader were out of reach; `through_bucket` never goes over HTTP)
                 let direct = !crate::env::is_set("PONDRA_NO_DIRECT") && BUCKET.try_with(|_| ()).is_err();
-                match if direct { Some(post(&t.addr, r).await) } else { None } {
+                match if direct { Some(post(node, &t.addr, r).await) } else { None } {
                     Some(Ok(v)) => return summary(matches!(r, Request::Flush(_)), v),
                     Some(Err(e)) if !crate::dial::unreached(&e) => return Err(e),
                     _ => {} // this machine can't reach the leader: through the bucket
                 }
-                if let Some(v) = crate::inbox::send(&store, r, None, Some(&t)).await? {
+                if let Some(v) = crate::inbox::send(&store, r, None, Some(&t), Some(&node.claims)).await? {
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }
             Holder::Free(_) if !one_off => {
                 let Some(r) = &req else { return Ok(j!({"duplicate": true})) };
-                if let Some(v) = crate::inbox::send(&store, r, Some((dir, node)), None).await? {
+                if let Some(v) = crate::inbox::send(&store, r, Some((dir, node)), None, Some(&node.claims)).await? {
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }
             Holder::Free(t) => {
-                let Some(term) = claim(&store, t.map_or(1, |t| t.n + 1), "").await? else { continue };
+                let Some(term) = claim(&store, t.map_or(1, |t| t.n + 1), "", &node.claims).await? else { continue };
                 return match lead(dir, &store, term.n, &mut req, node).await {
                     // Another one-off writer took the catalog while this one was leading (both
                     // found the lake idle). Start over with the same job: whoever wins records it
@@ -2605,7 +2654,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
             // (an INSERT's keys are looked at below, after `sent`, as before: `Load`)
             let how = if matches!(stmt, Stmt::Insert(..)) { crate::rules::How::Load } else { crate::rules::How::Change };
             let rows = rows_of(query, target, &rules, table, &sql, None, files, how, scope).await?; // (a DEFAULT's sequence is the attached lake's)
-            if let Some(s) = stored.as_ref().filter(|s| matches!(stmt, Stmt::Insert(..)) && crate::constraints::key_checked(s)) {
+            if let Some(s) = stored.as_ref().filter(|s| matches!(stmt, Stmt::Insert(..)) && s.key_checked()) {
                 if sent(target, job).await? {
                     return Ok(None); // (a retry: `deliver` answers it as a duplicate)
                 }
@@ -2635,10 +2684,10 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
 /// records them with their lineage instead (the inbox, or no leader yet).
 pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
     let t = latest(&lake.store).await.ok()??;
-    if t.addr.is_empty() || !alive(&lake.store, &t).await || crate::env::is_set("PONDRA_NO_DIRECT") {
+    if t.addr.is_empty() || !alive(&lake.store, &t, Some(&lake.node.claims)).await || crate::env::is_set("PONDRA_NO_DIRECT") {
         return None;
     }
-    crate::log::To::Leader(t.addr).reserve().await.ok()
+    crate::log::To::leader(lake, t.addr).reserve().await.ok()
 }
 
 /// Send a request to the leader over HTTP.
@@ -2665,7 +2714,7 @@ pub(crate) fn read_only_refused(dir: &str) -> anyhow::Error {
 /// A lake on another server, read here with a read-only key (ADR-058): nothing here writes its
 /// bucket (no inbox, no term claimed), and only a branch's pin goes to its leader, at its
 /// ENDPOINT, with the pondra secret's token or the branch's own key.
-async fn across(dir: &str, r: &crate::reaches::Reach, req: Option<Request>, reaches: &crate::reaches::Reaches) -> Result<Value> {
+async fn across(dir: &str, r: &crate::reaches::Reach, req: Option<Request>, node: &NodeState) -> Result<Value> {
     let Some(req @ Request::Ddl(crate::ddl::Ddl::Pin { .. } | crate::ddl::Ddl::Unpin { .. })) = req else {
         return Err(read_only_refused(dir));
     };
@@ -2677,16 +2726,16 @@ async fn across(dir: &str, r: &crate::reaches::Reach, req: Option<Request>, reac
     let at = match &r.endpoint {
         Some(e) => e.trim_end_matches('/').to_string(),
         None => {
-            let store = open_store(dir, Some(reaches))?.1; // (with its read-only key: `r`, the node's for it)
+            let store = open_store(dir, Some(&node.reaches))?.1; // (with its read-only key: `r`, the node's for it)
             match latest(&store).await? {
-                Some(t) if !t.addr.is_empty() && alive(&store, &t).await => crate::dial::url(&t.addr),
+                Some(t) if !t.addr.is_empty() && alive(&store, &t, Some(&node.claims)).await => crate::dial::url(&t.addr),
                 _ => bail!("nobody leads {dir}"),
             }
         }
     };
     let (path, body) = req.http()?;
     let call = crate::dial::Call::post(path, body).as_json().bearer(token);
-    let res = crate::dial::call(&at, call).await
+    let res = crate::dial::call(node, &at, call).await
         .with_context(|| format!("{dir}'s leader doesn't answer at {at}: a branch is pinned while its base's server is up"))?;
     if !res.ok() {
         bail!("{dir}'s leader at {at}: {}", res.text().await?);
@@ -2694,11 +2743,11 @@ async fn across(dir: &str, r: &crate::reaches::Reach, req: Option<Request>, reac
     Ok(res.json().await?)
 }
 
-pub async fn post(addr: &str, r: &Request) -> Result<Value> { post_as(addr, r, None).await }
+pub async fn post(node: &NodeState, addr: &str, r: &Request) -> Result<Value> { post_as(node, addr, r, None).await }
 
 /// `post`, naming the user a change is for to this lake's own leader, which runs it as them
 /// (`auth::AS_USER`). Never to another lake's: it has users of its own.
-async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value> {
+async fn post_as(node: &NodeState, addr: &str, r: &Request, user: Option<String>) -> Result<Value> {
     let (path, body) = r.http()?;
     let mut call = crate::dial::Call::post(path, body).as_json();
     if let Ok(k) = BEARER.try_with(|k| k.clone()) {
@@ -2707,7 +2756,7 @@ async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value>
     if let Some(user) = user {
         call = call.as_user(user);
     }
-    let res = crate::dial::call(addr, call).await?;
+    let res = crate::dial::call(node, addr, call).await?;
     if res.status == 401 {
         bail!("the leader at {addr} asks for a sign-in: set PONDRA_TOKEN to one of the lake's tokens ({})", res.text().await?);
     }
@@ -2775,7 +2824,7 @@ async fn lead(dir: &str, store: &Store, term: u64, req: &mut Option<Request>, no
     let marks = crate::terms::mark_every(&node.tasks, store.clone(), term);
     let out = led(dir, term, req, node).await;
     marks.abort(); // (its mark stops before the term is let go, so no mark lands after it)
-    release(store, term).await; // the next writer or node doesn't have to wait
+    release(store, term, &node.claims).await; // the next writer or node doesn't have to wait
     out
 }
 
@@ -2801,6 +2850,48 @@ async fn led(dir: &str, term: u64, req: &mut Option<Request>, node: &Arc<NodeSta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rows whose columns aren't the table's: 40001 where the table can have moved under them, and XX000, never run again,
+    /// where their node names a type the leader doesn't read (11-08 audit L14).
+    #[test]
+    fn rows_unplaced_are_run_again_only_after_a_move() {
+        let col = |n: &str, t: &str| (n.to_string(), t.to_string());
+        let moved = unplaced("t", &[col("a", "Int64")], "a bigint".into(), "a bigint, b text".into());
+        assert_eq!(crate::codes::of(&moved), "40001", "{moved}");
+        assert!(moved.to_string().ends_with("Run it again"), "{moved}");
+        let other = unplaced("t", &[col("a", "Int64"), col("b", "Utf9")], "a bigint, b Utf9".into(), "a bigint, b text".into());
+        assert_eq!(crate::codes::of(&other), "XX000", "{other}");
+        assert!(!other.to_string().contains("Run it again") && other.to_string().contains("Utf9"), "{other}");
+    }
+
+    #[test]
+    fn undrop_reads_a_table_and_a_file_and_refuses_another_kind_by_name() {
+        assert!(matches!(parse("UNDROP TABLE sales.orders"), Some(Stmt::Ddl(d)) if matches!(&d[..], [crate::ddl::Ddl::Undrop { name }] if name == "sales.orders")));
+        assert!(matches!(parse("-- back\nundrop file 'it''s/a.txt';"), Some(Stmt::UndropFile(p)) if p == "it's/a.txt"));
+        // (a writer's, as DELETE /files is; code a node runs, an admin's)
+        let asked = |sql: &str| crate::rights::asks(&parse(sql).expect("a statement")).1;
+        assert!(matches!(asked("UNDROP FILE 'notes/a.txt'")[..], [crate::rights::Action::Write]));
+        assert!(matches!(asked("UNDROP FILE 'jobs/Load.PY/'")[..], [crate::rights::Action::RunCode]));
+        let said = |sql: &str| match parse(sql) {
+            Some(Stmt::Refused(code, why)) => (code, why),
+            _ => panic!("{sql}: not refused"),
+        };
+        let (code, why) = said("UNDROP TABLE WITH ID '6f1e2c'");
+        assert_eq!(code, "0A000");
+        assert!(why.starts_with("UNDROP TABLE … WITH ID is Databricks': UNDROP TABLE name brings back the newest"), "{why}");
+        assert!(said("UNDROP VOLUME WITH ID '6f1e2c'").1.contains("UNDROP FILE 'path' brings back one deleted"));
+        assert!(said("UNDROP VOLUME main.raw.landing").1.starts_with("UNDROP VOLUME is Databricks': here a volume's files are the lake's own"));
+        let (code, why) = said("UNDROP  SEQUENCE ids");
+        assert_eq!(code, "0A000");
+        assert!(why.starts_with("UNDROP SEQUENCE is not supported yet: UNDROP <kind> name brings back what was dropped last under the name, for ") && why.contains("EXTERNAL TABLE, FUNCTION,") && why.contains(", VIEW, and UNDROP FILE 'path' a deleted file"), "{why}");
+        assert_eq!(said("UNDROP VIEW").0, "42601", "a kind kept, with no name");
+        assert_eq!(said("UNDROP INDEX by_day").0, "0A000", "a kind whose drops aren't kept yet, as the registry lists it");
+        assert_eq!(said("undrop user ann").1, "a dropped user stays dropped, as dropping one is how access is cut: CREATE USER makes one again");
+        assert_eq!(said("UNDROP IDENTITY PROVIDER okta").1, "a dropped identity provider stays dropped, as dropping one is how access is cut: CREATE IDENTITY PROVIDER makes one again");
+        assert_eq!(said("UNDROP FILE photos/a.png").0, "42601", "a path is quoted");
+        assert_eq!(said("UNDROP TABLE").0, "42601");
+        assert_eq!(said("UNDROP everything").0, "42601");
+    }
 
     #[test]
     fn a_query_is_a_write_only_as_select_into() {
@@ -2873,5 +2964,20 @@ mod tests {
         lake.cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    /// The texts the core keeps of a tree read back as they mean with a minus before a minus (`parsed::signed`): on main
+    /// before, `INSERT INTO w SELECT id, - -k FROM t` kept `SELECT id, --k FROM t` (`SELECT id,`), a view's query the
+    /// same, and the UPDATE a node sends its leader read as none.
+    #[test]
+    fn a_minus_before_a_minus_is_kept_as_it_means() {
+        use crate::ddl::Ddl;
+        let Some(Stmt::Insert(t, q)) = parse("INSERT INTO w SELECT id, - -k FROM t") else { panic!("an INSERT") };
+        assert_eq!((t.as_str(), q.as_str()), ("w", "SELECT id, -(-k) FROM t"));
+        let Some(Stmt::Ddl(d)) = parse("CREATE VIEW v AS SELECT id, - -k AS m FROM t") else { panic!("a view") };
+        assert!(matches!(&d[..], [Ddl::CreateView { sql, .. }] if sql == "SELECT id, -(-k) AS m FROM t"), "{}", serde_json::to_string(&d).unwrap_or_default());
+        let Some(Stmt::Update(t, set, cond)) = parse("UPDATE w SET b = - -a WHERE - -a > 0") else { panic!("an UPDATE") };
+        assert_eq!(t, "w");
+        assert_eq!(format!("{set:?} {cond:?}").matches("-(-a)").count(), 2, "{set:?} {cond:?}");
     }
 }

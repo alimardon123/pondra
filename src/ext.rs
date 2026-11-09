@@ -704,6 +704,12 @@ pub fn blob_with(store: Arc<dyn object_store::ObjectStore>) {
     let _ = BLOB.set(store);
 }
 
+/// The KMS key a bucket's writes are encrypted with: its secret's own (`given`), else the environment's for the lake's own
+/// bucket on the credential chain (`lakes`), and none for any other bucket.
+fn kms_key(given: Option<String>, lakes: bool, from_env: impl FnOnce() -> Option<String>) -> Option<String> {
+    given.or_else(|| lakes.then(from_env).flatten())
+}
+
 /// A store for a bucket, container or host, with a secret's settings or the environment's.
 pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: For) -> Result<Arc<dyn object_store::ObjectStore>> {
     use object_store::{aws::{AmazonS3Builder, AmazonS3ConfigKey}, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder, http::HttpBuilder};
@@ -736,13 +742,9 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
         if let Some(r) = get("region") {
             b = b.with_region(r);
         }
-        // (a customer's KMS key: each object written is encrypted with it, SSE-KMS. Without one the bucket still
-        // encrypts at rest, with its own keys. From the environment `AWS_SSE_KMS_KEY_ID` alone is enough: on its own
-        // it would be ignored, short of `AWS_SERVER_SIDE_ENCRYPTION`)
-        let from_env = || chain.then(|| std::env::var("AWS_SSE_KMS_KEY_ID").ok()).flatten().filter(|_| std::env::var_os("AWS_SERVER_SIDE_ENCRYPTION").is_none());
-        if let Some(k) = get("kms_key_id").or_else(from_env) {
-            b = b.with_sse_kms_encryption(k);
-        }
+        // (a customer's KMS key: each object written is encrypted with it, SSE-KMS. A secret's own, or for the lake's
+        // bucket on the credential chain the environment's: never another bucket's, `store::sse_kms_from_env`)
+        b = crate::store::with_kms(b, kms_key(get("kms_key_id"), lake && chain, crate::store::sse_kms_from_env));
         match (get("key_id"), get("secret")) {
             (Some(k), Some(s)) => b = b.with_access_key_id(k).with_secret_access_key(s),
             _ if !chain => b = b.with_skip_signature(true), // (a secret without keys: a public bucket)
@@ -1121,7 +1123,7 @@ fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
 }
 
 /// `CREATE [OR REPLACE] [PERSISTENT] SECRET [IF NOT EXISTS] name (TYPE t, KEY value, …)` and
-/// `DROP SECRET [IF EXISTS] name`, parsed here: a value is a string, a word or a number.
+/// `DROP SECRET [IF EXISTS] name [PURGE]`, parsed here: a value is a string, a word or a number.
 pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     use crate::ddl::Ddl;
     use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
@@ -1144,7 +1146,7 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
         }
         let if_exists = p.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
         return match p.parse_identifier() {
-            Ok(n) => Some(crate::write::Stmt::Ddl(vec![Ddl::DropSecret { name: n.value.to_lowercase(), if_exists }])),
+            Ok(n) => Some(crate::write::Stmt::Ddl(vec![Ddl::DropSecret { name: n.value.to_lowercase(), if_exists, purge: p.parse_keyword(Keyword::PURGE) }])),
             Err(e) => invalid(format!("DROP SECRET name: {e}")),
         };
     }
@@ -1506,13 +1508,24 @@ pub async fn create(lake: &Lake, name: &str, params: BTreeMap<String, String>, r
     Ok(serde_json::json!({"secret": name}))
 }
 
-pub async fn drop(lake: &Lake, name: &str, if_exists: bool) -> Result<serde_json::Value> {
-    if lake.cat.get::<Secret>(&secret_key(name)).await?.is_none() {
+/// `DROP SECRET name`: kept sealed, to be undropped. With PURGE, kept nowhere: the copies that earlier drops of the name
+/// kept go in the same commit, so a key that leaked leaves the lake's bucket (a dropped name with PURGE lets those go).
+pub async fn drop(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Result<serde_json::Value> {
+    let kept = if purge { crate::undrop::kept_keys(lake, "secret", name).await? } else { vec![] };
+    let here = lake.cat.get::<Secret>(&secret_key(name)).await?.is_some();
+    if !here && kept.is_empty() {
         ensure!(if_exists, "no secret {name}");
-        return Ok(serde_json::json!({"secret": name, "dropped": false}));
     }
-    lake.cat.commit(crate::undrop::aside(lake, "secret", name, &[secret_key(name)]).await?, &[secret_key(name)]).await?; // (kept sealed, to be undropped)
-    Ok(serde_json::json!({"secret": name, "dropped": true}))
+    let puts = if here && !purge { crate::undrop::aside(lake, "secret", name, &[secret_key(name)]).await? } else { vec![] };
+    let gone: Vec<String> = kept.iter().cloned().chain(here.then(|| secret_key(name))).collect();
+    if !gone.is_empty() {
+        lake.cat.commit(puts, &gone).await?;
+    }
+    let mut out = serde_json::json!({"secret": name, "dropped": here});
+    if purge {
+        out["purged"] = kept.len().into(); // (the copies kept from earlier drops, let go)
+    }
+    Ok(out)
 }
 
 /// The lake's secrets, and the session's temporary ones (which win, by name).
@@ -1918,6 +1931,26 @@ mod tests {
         assert!(!said[1].contains("x-amz-server-side-encryption"), "no key, no header: {}", said[1]);
         assert!(kind("s3")?.0.contains(&"kms_key_id") && kind("r2")?.0.contains(&"kms_key_id"), "a secret takes it");
         Ok(())
+    }
+
+    /// The environment's KMS key is the lake's own bucket's, and its alone (11-09 audit H2): the lake's tables, catalog and
+    /// backups are written with it, and a bucket the chain reaches otherwise, maybe another account's, is sent only a key
+    /// its own secret names.
+    #[test]
+    fn the_environments_kms_key_is_the_lakes_bucket_alone() {
+        use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+        let key = |k: &str| k.parse::<AmazonS3ConfigKey>().unwrap(); // (its encryption keys' type isn't object_store's to name)
+        let lakes = "arn:aws:kms:eu-west-1:111122223333:key/lake";
+        let env = || Some(lakes.to_string());
+        assert_eq!(kms_key(None, true, env).as_deref(), Some(lakes), "the lake's bucket on the chain");
+        assert_eq!(kms_key(None, false, env), None, "another bucket on the chain");
+        assert_eq!(kms_key(Some("own".into()), true, env).as_deref(), Some("own"), "a secret's own key first");
+        assert_eq!(kms_key(Some("own".into()), false, env).as_deref(), Some("own"));
+        let b = crate::store::with_kms(AmazonS3Builder::new(), env());
+        assert_eq!(b.get_config_value(&key("aws_server_side_encryption")).as_deref(), Some("aws:kms"));
+        assert_eq!(b.get_config_value(&key("aws_sse_kms_key_id")).as_deref(), Some(lakes));
+        let none = crate::store::with_kms(AmazonS3Builder::new(), None);
+        assert_eq!(none.get_config_value(&key("aws_sse_kms_key_id")), None);
     }
 
     #[test]

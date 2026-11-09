@@ -18,6 +18,9 @@ pub struct NodeState {
     /// The clients its calls out are made with, by whom each goes to: its process's host's (`net::install`), or its own.
     #[cfg(feature = "lake")]
     pub net: std::sync::Arc<dyn crate::net::Net>,
+    /// How it calls its lake's other nodes (`Calls`).
+    #[cfg(feature = "lake")]
+    pub calls: Calls,
     /// The space it spills into past its memory: its process's host's (`scratch::install`), or this machine's folders.
     #[cfg(feature = "lake")]
     pub scratch: std::sync::Arc<dyn crate::scratch::Scratch>,
@@ -38,6 +41,8 @@ pub struct NodeState {
     /// A short id of its own, random, made with it: what tells its files in its process's space from another node's
     /// here, which would name them alike (a shuffle's folders: `spill::dir`).
     pub id: String,
+    /// Its claims' lock files (`Claims`), which its lifecycle may hold too (a restart says in them that it is coming back).
+    pub claims: Arc<Claims>,
     /// When its start began: what `PONDRA_TRACE_START`'s times count from (`trace`).
     began: datafusion::common::instant::Instant,
     /// What it started, which its stop ends (`spawns::Tasks`): every task says whose work it is.
@@ -59,9 +64,14 @@ impl NodeState {
     /// A node's state on a machine of its own (the sim's member: one with little memory, say).
     pub fn on(life: Life, machine: crate::machine::Mach) -> Arc<NodeState> { NodeState::make(life, machine, crate::settings::Values::now()) }
 
-    fn make(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values) -> Arc<NodeState> {
+    /// A node's state whose claims its lifecycle holds too (`node::Native`: a restart says in them that it is coming back).
+    pub fn claiming(life: Life, settings: crate::settings::Values, claims: Arc<Claims>) -> Arc<NodeState> { NodeState::made(life, crate::machine::installed(), settings, claims) }
+
+    fn make(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values) -> Arc<NodeState> { NodeState::made(life, machine, settings, Default::default()) }
+
+    fn made(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values, claims: Arc<Claims>) -> Arc<NodeState> {
         let reaches = crate::reaches::Reaches::inherited(settings.get(crate::reaches::REACH_VAR));
-        Arc::new(NodeState { reaches, #[cfg(feature = "lake")] tasks: crate::spawns::Tasks::new(life.clone()), life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), began: datafusion::common::instant::Instant::now() })
+        Arc::new(NodeState { reaches, #[cfg(feature = "lake")] tasks: crate::spawns::Tasks::new(life.clone()), life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).
@@ -74,6 +84,32 @@ impl NodeState {
             eprintln!("start: {what} {:.2} s", self.began.elapsed().as_secs_f64());
         }
     }
+}
+
+/// How a node calls its lake's other nodes (`cluster::http`): the key they call each other with when no admin token is set
+/// (`users::node_key`, known once its lake is open: `dial::set_node_key`), and the client made with its token (`token`),
+/// made again when the token changes.
+#[cfg(feature = "lake")]
+#[derive(Default)]
+pub struct Calls {
+    pub(crate) key: std::sync::RwLock<Option<String>>,
+    #[cfg(feature = "doors")]
+    pub(crate) client: Mutex<Option<(Option<String>, reqwest::Client)>>,
+}
+
+/// This process's own token for calls between nodes: `PONDRA_TOKEN` (a `pondra sql` writer's), else `PONDRA_ADMIN_TOKEN` (a
+/// node's), else `PONDRA_NODE_KEY`. (A variable set empty is no token, as `env::get` takes it: compose passes an unset one on
+/// empty, and "Bearer " sent in place of the nodes' key left a follower unable to reach its leader)
+#[cfg(feature = "lake")]
+pub fn process_token() -> Option<String> {
+    crate::env::get("PONDRA_TOKEN").or_else(|| crate::env::get("PONDRA_ADMIN_TOKEN")).or_else(|| crate::env::get("PONDRA_NODE_KEY"))
+}
+
+#[cfg(feature = "lake")]
+impl NodeState {
+    /// The token this node calls its lake's other nodes with: this process's own (`process_token`), else its lake's key for
+    /// its nodes, once known.
+    pub fn token(&self) -> Option<String> { process_token().or_else(|| self.calls.key.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()) }
 }
 
 /// The HTTP door's state, in order: not opened, serving, closing (its streams end and its answers go out), closed.
@@ -245,6 +281,17 @@ impl Idle {
     /// When the last use began or ended ([`Idle::now`]'s count); 0 until the first.
     #[cfg_attr(not(feature = "doors"), allow(dead_code))]
     pub(crate) fn last(&self) -> u64 { self.uses.last.load(SeqCst) }
+}
+
+/// The lock files of the terms a node claimed (`terms::claim`), or took back after a restart (`cluster::relock`): each locked
+/// until the term is let go (`terms::release`), the node stops (`clear`), or the process ends, however it ends: the OS lets
+/// go at whichever comes first. Keyed by term number. (A node holds one claim per term number: one lake at a time.)
+#[derive(Default)]
+pub struct Claims(pub(crate) Mutex<std::collections::BTreeMap<u64, (std::path::PathBuf, std::fs::File)>>);
+
+impl Claims {
+    /// Let go of every claim's lock (the node stops). The files stay, for the next claimer to see it ended.
+    pub fn clear(&self) { self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear() }
 }
 
 /// Held while a use lasts (`Idle::begin`).

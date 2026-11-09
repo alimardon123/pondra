@@ -448,7 +448,7 @@ async fn submit(lake: &Lake, op: Op) -> Result<Ack> {
         None => {
             // (`pondra sql` without a node: the leader that is there, if any)
             let t = crate::terms::latest(&lake.store).await?.filter(|t| !t.addr.is_empty()).context("a sequence's values come from the lake's leader, and none is running: start a node (pondra serve)")?;
-            crate::log::To::Leader(t.addr)
+            crate::log::To::leader(lake, t.addr)
         }
     };
     to.sequence(op).await
@@ -474,7 +474,7 @@ const MOST: u64 = 1 << 20;
 pub async fn next(lake: &Lake, name: &str, n: usize) -> Result<Vec<i64>> {
     let (name, s) = find(lake, name).await?.ok_or_else(|| crate::codes::coded("42P01", format!("relation \"{name}\" does not exist (CREATE SEQUENCE {name})")))?;
     gone_with(lake, &name, &s).await?;
-    may_write(&name)?;
+    may_move(lake, &name, &s, false).await?;
     let base = (shape(&s.declared)?.cache as u64).max(if lake.to.get().is_some() { FIRST } else { 1 });
     let mut blocks = lake.sequences.lock().await; // (one refill at a time: the others wait for it)
     let b = blocks.entry(name.clone()).or_default();
@@ -509,18 +509,46 @@ pub async fn next(lake: &Lake, name: &str, n: usize) -> Result<Vec<i64>> {
 async fn set(lake: &Lake, name: &str, value: i64, called: bool) -> Result<i64> {
     let (name, s) = find(lake, name).await?.ok_or_else(|| crate::codes::coded("42P01", format!("relation \"{name}\" does not exist")))?;
     gone_with(lake, &name, &s).await?;
-    may_write(&name)?;
+    may_move(lake, &name, &s, true).await?;
     submit(lake, Op::Set { name: name.clone(), value, called }).await?;
     lake.sequences.lock().await.remove(&name);
     Ok(value)
 }
 
-/// A sequence moves for a writer only: a read token's queries never take its values.
-fn may_write(name: &str) -> Result<()> {
-    match crate::auth::current() {
-        Some(p) if p.scope.whole() && p.role < crate::auth::Role::Write => bail!("permission denied for sequence {name}: nextval and setval are a writer's"),
-        _ => Ok(()),
+/// A sequence moves for a writer only (11-09 audit H1): a token of role Write or more, a superuser, or a user who may
+/// INSERT or UPDATE a table that takes values from it (`takers`), and UPDATE one for `setval` (`set`), which can make
+/// later rows take values already taken, as Postgres asks UPDATE on the sequence for it. A user granted only SELECT, a
+/// read token, and work that lost its caller never move one; the node's own work does (`auth::as_node`).
+async fn may_move(lake: &Lake, name: &str, s: &Sequence, set: bool) -> Result<()> {
+    use crate::rights::{Action, Object};
+    let call = if set { "setval" } else { "nextval" };
+    let refused = |why: &str| crate::codes::coded("42501", format!("permission denied for sequence {name}: {call} is {why}"));
+    let p = match crate::auth::current() {
+        Some(p) => p,
+        None if crate::auth::node_work() => return Ok(()),
+        None => return Err(refused("a writer's, and no one asks")),
+    };
+    if p.scope.whole() {
+        return match p.role >= crate::auth::Role::Write {
+            true => Ok(()),
+            false => Err(refused("a writer's: this token reads only")),
+        };
     }
+    let asks: &[Action] = if set { &[Action::Update] } else { &[Action::Insert, Action::Update] };
+    let may = |t: &str| asks.iter().any(|a| crate::rights::may(&p, *a, Object::Table(t)).is_ok());
+    let owner = s.owned.as_deref().and_then(|o| o.rsplit_once('.')).map(|(t, _)| t);
+    if owner.is_some_and(may) || takers(lake, name).await?.iter().any(|t| may(t)) {
+        return Ok(());
+    }
+    let grant = if set { "UPDATE" } else { "INSERT or UPDATE" };
+    Err(refused(&format!("for whoever may {grant} a table that takes values from it")))
+}
+
+/// The tables a sequence's values go into: one whose identity column it numbers, or whose default takes from it
+/// (`nextval('name')`), as the catalog names them.
+async fn takers(lake: &Lake, name: &str) -> Result<Vec<String>> {
+    let takes = |c: &crate::store::Col| c.identity.as_ref().is_some_and(|i| i.sequence == name) || c.default.as_ref().is_some_and(|e| named(e).iter().any(|n| n == name));
+    Ok(lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(_, m)| m.list().columns.iter().any(takes)).map(|(k, _)| k[2..].to_string()).collect())
 }
 
 /// `nextval`, `currval` and `setval` in a query's session. `currval` is the session's: the last

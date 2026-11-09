@@ -558,10 +558,10 @@ impl Page {
         }
         let credential = crate::auth::Credential::of_header(request_header(headers, "authorization")); // (`auth::Credential`)
         let token = credential.token();
-        let session = crate::temp::of(&header_map(headers))?;
+        let who = lake_principal(); // (as the page's requests run: `lake_sql`)
+        let session = crate::temp::of(&header_map(headers), &who.name)?;
         let format_query = format.map(|f| format!("format={f}")).unwrap_or_default();
         let lent = crate::auth::lent_vars(token);
-        let who = lake_principal(); // (as the page's requests run: `lake_sql`)
         match joined {
             true => crate::statement::scoped(session, lent, Box::pin(joined_part(&paged.app.lake, sql, format_query, paged.superuser(), &who.scope))).await,
             false => Ok(match crate::statement::scoped(session, lent, Box::pin(part_of(&paged.app.lake, sql, format_query, &who.scope))).await? {
@@ -640,8 +640,8 @@ impl Page {
         let who = lake_principal();
         let format = p.format.clone();
         let asked = map.clone(); // (a stop fails the session the statement ran in: the headers name it, `failed_for_memory`)
-        let scope = who.scope.clone();
-        let said = match crate::panics::work(&paged.app.lake.node, true, crate::auth::WHO.scope(who, Box::pin(crate::statement::sql(paged.app.clone(), p, crate::auth::Role::Admin, scope, map, body)))).await {
+        let by = who.clone();
+        let said = match crate::panics::work(&paged.app.lake.node, true, crate::auth::WHO.scope(who, Box::pin(crate::statement::sql(paged.app.clone(), p, crate::auth::Role::Admin, by, map, body)))).await {
             Ok(said) => said,
             Err(words) => {
                 if words == crate::oom::OOM || words == crate::oom::PAGE_OOM {
