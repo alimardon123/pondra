@@ -25,6 +25,7 @@ lists base
 registry base
 settings base
 text base
+words base
 walk base
 
 # platform
