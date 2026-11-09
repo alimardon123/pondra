@@ -76,19 +76,7 @@ pub struct Attachment {
     pub endpoint: Option<String>, // (its server's URL, where its leader is asked for a pin)
 }
 
-/// What a schema, table or view may be called: letters, digits, `_` and `-`. A dot separates the
-/// parts of a name; quotes, slashes and spaces would get in the way of paths and SQL.
-pub fn check(part: &str) -> Result<()> {
-    let ok = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
-    if !part.is_empty() && part.chars().all(ok) {
-        return Ok(());
-    }
-    // (a table's name is its folder's name, and Windows refuses a quote or a slash in a file name: the
-    // name to write is the same one with each such character as `_`)
-    let fixed: String = part.chars().map(|c| if ok(c) { c } else { '_' }).collect();
-    let hint = if fixed.is_empty() { String::new() } else { format!(": a table's name is its folder's, and Windows refuses \" and / in file names; name it {fixed}") };
-    Err(crate::codes::coded("42602", format!("'{part}': names are letters, digits, _ and - (a dot separates schema and table){hint}")))
-}
+pub use crate::naming::{check, lake_name}; // (the catalog's: a lake's objects' names are its folders')
 
 /// What a database may be called: `check`'s, and not a name starting with `_`. Those are the server's own: its `_pondra`
 /// folder (and the workspace there, ADR-054) sits beside the databases, so a database's folder must not take one.
@@ -98,20 +86,6 @@ pub fn database_name(name: &str) -> Result<()> {
         true => Err(crate::codes::coded("42602", format!("'{name}': names starting with _ are the server's own (its _pondra folder), so name the database without the _"))),
         false => Ok(()),
     }
-}
-
-/// This lake's own name in three-part names: its folder's (or prefix's) last part (`mylake` of
-/// `D:\data\mylake` too), and `memory` for a lake held in this process's memory, as DuckDB names its own.
-pub fn lake_name(lake: &Lake) -> String {
-    name_of(&lake.url)
-}
-
-/// `lake_name` of a lake at `url`. A lake in memory is `memory://<id>`, whose id would show in every name and error.
-fn name_of(url: &str) -> String {
-    if crate::memory_lake::in_memory(url) {
-        return "memory".into();
-    }
-    url.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("lake").to_lowercase()
 }
 
 /// A table or view of a lake or one attached to it, as `pondra.tables`, the shell's `.tables` and
@@ -2501,15 +2475,6 @@ fn reads(lake: &Lake, sql: &str, t: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A lake's name is its folder's or prefix's last part, in lower case; a lake in memory is `memory`, not its id.
-    #[test]
-    fn a_lakes_name_is_its_folders_and_memory_for_one_in_memory() {
-        assert_eq!(name_of("/data/MyLake/"), "mylake");
-        assert_eq!(name_of("D:\\data\\mylake"), "mylake");
-        assert_eq!(name_of("s3://bucket/shop"), "shop");
-        assert_eq!(name_of("memory://2965062e0e8442ce87cf27d8a2c4f13e"), "memory");
-    }
 
     /// A failed `CREATE TABLE … AS SELECT` drops only the table its own job made: the leader checks `made_by` under the lake's
     /// lock, so another statement's table under the name stays, and the job's own table goes.

@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use datafusion::common::instant::Instant;
 use std::time::Duration;
 
-pub const TABLE: &str = "pondra$history"; // (commits only to it are quiet: `store::RECORDS`)
+pub const TABLE: &str = crate::records::HISTORY; // (commits only to it are quiet: `store::quiet`)
 
 /// What a statement's work noted while it ran: what it answered, where, and how.
 #[derive(Default)]

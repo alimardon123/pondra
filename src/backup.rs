@@ -20,8 +20,8 @@ use serde_json::{json as j, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
 
-/// The catalog entry that makes a lake a backup.
-pub const KEY: &str = "bk";
+/// The catalog entry that makes a lake a backup (the catalog's rule for one: `frozen.rs`).
+pub use crate::frozen::KEY;
 
 /// A backup's record in the catalog (`records`).
 pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: KEY, owner: "backup", holds: "the mark that makes a lake a backup" }];
@@ -81,33 +81,11 @@ pub struct Take {
 /// a branch's bases and a backup's entry, an apply under way, the pins others hold in it, and what
 /// it published to Delta and Iceberg (a restored lake publishes anew).
 fn own(k: &str) -> bool {
-    matches!(k, "c" | "n" | "b" | "m" | "format" | "dl" | KEY | crate::users::KEYS | crate::store::QUIET | crate::branch::BASES)
+    matches!(k, "c" | "n" | "b" | "m" | "format" | "dl" | KEY | crate::records::LAKE_KEYS | crate::store::QUIET | crate::branch::BASES)
         || ["pn/", "x/", "i/"].iter().any(|p| k.starts_with(p))
 }
 
-tokio::task_local! {
-    /// Set while a run commits: the one writer a backup takes everything from.
-    static RUN: ();
-}
-
-/// Is this lake a backup? (Read as it opens, and set by its first run.)
-pub fn frozen(lake: &Lake) -> bool { lake.cat.frozen.load(std::sync::atomic::Ordering::Relaxed) }
-
-/// Whether a backup's catalog takes a commit of these keys (`Catalog::write`): a run's, anything;
-/// otherwise only what a backup keeps of its own: the pins a clone of it holds, its own keys, its
-/// format and its members.
-pub fn may_write<'a>(mut keys: impl Iterator<Item = &'a String>) -> bool {
-    RUN.try_with(|_| ()).is_ok() || keys.all(|k| k.starts_with("pn/") || matches!(k.as_str(), crate::users::KEYS | "format" | "m"))
-}
-
-/// What every door says to a write to a backup (25006: read-only).
-pub fn refused(url: Option<&str>) -> anyhow::Error {
-    let (it, from) = match url {
-        Some(u) => (u.to_string(), format!("'{u}'")),
-        None => ("this database".to_string(), "'<its place>'".to_string()),
-    };
-    crate::codes::coded("25006", format!("{it} is a backup, so it is read-only: read it, CLONE it where it is attached, or restore it as a database of its own (RESTORE DATABASE name FROM {from}). Only its next BACKUP DATABASE … TO writes it"))
-}
+pub use crate::frozen::{frozen, may_write, refused};
 
 /// What a backup's leader still takes: a run, pins (a clone of it, a backup of it), and a backup of
 /// it somewhere else.
@@ -439,7 +417,7 @@ pub async fn take(lake: &Lake, t: Take) -> Result<Value> {
     puts.push((KEY.into(), json(&b)));
     let deletes: Vec<String> = mine.keys().filter(|k| !own(k) && !cat.contains_key(*k)).cloned().collect();
     lake.cat.start_after(commit).await;
-    RUN.scope((), lake.cat.commit(puts, &deletes)).await?;
+    crate::frozen::run(lake.cat.commit(puts, &deletes)).await?;
     lake.cat.frozen.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = target.delete(&running).await;
     // What the retention let go, after the commit that stopped naming it. (A run stopped half way
