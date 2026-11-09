@@ -158,6 +158,7 @@ pub fn set_schema(sql: &str) -> Option<String> {
 /// as their values. `skip` names what is not a table (a client's frames). Text with nothing to
 /// change comes back as it came.
 pub async fn door(lake: &Lake, sql: &str, skip: &HashSet<String>) -> Result<String> {
+    crate::dialect_stmts::hint_refused(sql)?; // (MySQL's `/*! … */`: the path prints the text back without it, 11-07 audit M2)
     let sql = &crate::pg_json::text(sql); // (`doc ->> 'a' = 'x'`, `doc ? 'a'`: Postgres's JSON operators grouped and read as Postgres does)
     if crate::temp::current().is_none() && (is_use(sql) || set_schema(sql).is_some()) {
         return Err(coded("0A000", crate::set::NO_SESSION)); // (Flight SQL and MCP hold no session: refused by name, at once)
@@ -448,7 +449,10 @@ static HEADS: LazyLock<Vec<Head>> = LazyLock::new(|| heads(&[
     (r"show\s+create\s+task", Fam::Task, false),
     (r"summarize", Fam::Relation, false),
     (r"restore\s+table", Fam::Relation, false),
-    (r"undrop\s+(?:table|view|materialized\s+view)", Fam::Relation, false),
+    (r"undrop\s+(?:function|procedure|macro|table\s+function)", Fam::Routine, false), // (before UNDROP TABLE: the first that matches places it)
+    (r"undrop\s+(?:table|view|materialized\s+view|external\s+table)", Fam::Relation, false),
+    (r"undrop\s+task", Fam::Task, false),
+    (r"undrop\s+type", Fam::Type, false),
     (r"alter\s+materialized\s+view", Fam::Relation, false),
     (r"alter\s+sequence", Fam::Relation, false),
     (r"refresh\s+materialized\s+view(?:\s+concurrently)?", Fam::Relation, false),

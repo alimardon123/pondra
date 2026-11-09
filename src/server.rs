@@ -58,7 +58,7 @@ pub fn router(app: App) -> Router {
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
         .route("/live", get(crate::live::live).post(crate::live::live))
-        .route("/sessions/{id}", axum::routing::delete(|State(app): State<App>, Path(id): Path<String>| async move { Json(j!({"ended": crate::temp::sessions(&app.lake).is_some_and(|at| at.end(&crate::temp::id(&id)))})) }))
+        .route("/sessions/{id}", axum::routing::delete(|State(app): State<App>, Path(id): Path<String>, who: Option<axum::Extension<crate::auth::Principal>>| async move { Json(j!({"ended": crate::temp::sessions(&app.lake).is_some_and(|at| at.end(&crate::temp::id(&who.map(|w| w.0.name).unwrap_or_default(), &id)))})) }))
         .route("/sessions/{id}/python", get(session_python).delete(session_python).post(session_python))
         .route("/python", get(list_pythons).put(choose_python))
         .route("/python/format", post(format_python))
@@ -185,8 +185,8 @@ async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result
 /// `GET /sessions/{id}/python`: the variables a session's Python holds, as the console's panel
 /// lists them (none, if it has none yet); `DELETE`: stop it (its variables go; the session's
 /// temporary tables stay), as a notebook's kernel is restarted. An admin's, as Python is.
-async fn session_python(method: axum::http::Method, Path(id): Path<String>, role: axum::Extension<crate::auth::Role>) -> Result<Json<Value>, E> {
-    let id = crate::temp::id(&id); // (as the client's requests name it: its user's)
+async fn session_python(method: axum::http::Method, Path(id): Path<String>, role: axum::Extension<crate::auth::Role>, who: Option<axum::Extension<crate::auth::Principal>>) -> Result<Json<Value>, E> {
+    let id = crate::temp::id(&who.map(|w| w.0.name).unwrap_or_default(), &id); // (as the client's requests name it: its user's)
     if *role < crate::auth::Role::Admin {
         return Err(E(crate::codes::coded("42501", "a session's Python is an admin's, as DO is")));
     }
@@ -858,10 +858,11 @@ struct AppendParams {
 }
 
 /// Body: NDJSON rows, or an Arrow IPC stream (content-type application/vnd.apache.arrow.stream).
-async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
-    let start = std::time::Instant::now();
+async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, who: Option<axum::Extension<crate::auth::Principal>>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
+    let who = who.map_or_else(|| crate::auth::Principal::of(crate::auth::Role::None), |w| w.0);
+    let (start, scope) = (std::time::Instant::now(), who.scope.clone());
     let (out, unseen) = crate::rights::noting(append_rows(&app, &name, p, headers, body)).await;
-    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.to_string()), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
+    crate::audit::rows(&app, &who, "/append", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -919,7 +920,7 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
         }
     })
     .await;
-    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
+    crate::audit::rows(&app, &who, "/insert", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -1167,7 +1168,7 @@ async fn sql(State(app): State<App>, Query(p): Query<crate::statement::SqlParams
     let format = p.format.clone(); // (an answer handed to the door in pieces is sent in this format)
     let node = app.lake.node.clone(); // (an answer in pieces is in flight until its last piece is read: `pieces`)
     let sessions = crate::temp::sessions(&app.lake); // (the node's: whether the session holds anything here, `held_session`)
-    let said = crate::statement::sql(app, p, role.0, who.0.scope, headers, body).await;
+    let said = crate::statement::sql(app, p, role.0, who.0, headers, body).await;
     let mut r = match said.reply {
         Ok(crate::statement::Reply::Rendered(r)) => respond(r, format.as_deref(), &node),
         Ok(crate::statement::Reply::Done(v)) => Json(v).into_response(),
@@ -1215,7 +1216,7 @@ async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extensi
         Some("capture") => Verb::Capture,
         _ => Verb::Apply,
     };
-    let who = crate::routines::Who { role: role.0, files: crate::statement::owner(&app.lake, &app.auth, &headers), depth: 0, scope: who.0.scope };
+    let who = crate::routines::Who::signed(who.0, role.0, crate::statement::owner(&app.lake, &app.auth, &headers));
     Ok(Json(crate::apply::ask(&app, verb, ask, who).await?))
 }
 
@@ -1352,7 +1353,7 @@ async fn stats(State(app): State<App>, who: Option<axum::Extension<crate::auth::
     let members = &app.members;
     let role = if members.reader() { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
     let mut s = j!({"lake": crate::ddl::lake_name(&app.lake), "role": role, "leader": members.leader().addr, "term": members.leader().n, "nodes": members.nodes(),
-                    "hwm": *app.lake.hwm.borrow(), "shard_runs": crate::tasks::SHARD_RUNS.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(),
+                    "hwm": *app.lake.hwm.borrow(), "shard_runs": app.lake.state::<crate::tasks::Kept>().map_or(0, |k| k.shard_runs.load(std::sync::atomic::Ordering::Relaxed)), "python_workers": crate::python::workers(),
                     "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
     s["version"] = j!(crate::format::VERSION);
     s["owner"] = j!(crate::statement::owner(&app.lake, &app.auth, &headers)); // (asked with its key: is this the node the asker started? `local()` on a port another node holds)
@@ -1404,8 +1405,12 @@ pub struct E(anyhow::Error);
 impl<T: Into<anyhow::Error>> From<T> for E {
     fn from(e: T) -> Self { E(e.into()) }
 }
+impl E {
+    /// The words its caller is told (`codes::told`), so the audit log says what the client was told.
+    fn told(&self, scope: &crate::rights::Scope) -> String { crate::codes::told(&self.0, scope.shows_code()) }
+}
 impl std::fmt::Display for E {
-    // (the words a client is sent, so the audit log says what the client was told: `ext::said`)
+    // (as told a client not shown code: `ext::said`)
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", crate::ext::said(&self.0)) }
 }
 impl IntoResponse for E {

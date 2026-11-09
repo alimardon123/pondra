@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from layers import strip_comments  # noqa: E402
 
 KINDS = {
-    "reads": (re.compile(r"\b(?:rights::scope|auth::current)\(\)"), {"auth.rs", "rights.rs"}),
+    "reads": (re.compile(r"\b(?:rights::scope|auth::current)\b"), {"auth.rs", "rights.rs"}),  # (a call, or the function passed as a value)
     "node": (re.compile(r"\b(?:as_node|panics::own)\(|\bPrincipal::node\(\)"), {"auth.rs", "panics.rs"}),
     "whole": (re.compile(r"\bScope::everything\(\)"), {"rights.rs"}),
 }
@@ -92,13 +92,29 @@ def load():
     return base
 
 
+def notes():
+    """The baseline's own words, which --write-baseline keeps: its comment lines after the first, and each count's note
+    (`reads python.rs 1  # why it stays`)."""
+    head, of = [], {}
+    for i, line in enumerate(open(BASELINE) if os.path.exists(BASELINE) else []):
+        body, _, note = line.rstrip("\n").partition("#")
+        if body.strip() and note.strip():
+            kind, rel, _ = body.split()
+            of[(kind, rel)] = note.strip()
+        elif not body.strip() and i:
+            head.append(line.rstrip("\n"))
+    return head, of
+
+
 def main():
     now = counts()
     if "--write-baseline" in sys.argv:
+        head, of = notes()
         with open(BASELINE, "w") as f:
             f.write("# tools/scope_check.py's counts on main: each may only fall (`--write-baseline` after one does).\n")
+            f.writelines(f"{line}\n" for line in head)
             for (kind, rel), n in sorted(now.items()):
-                f.write(f"{kind} {rel} {n}\n")
+                f.write(f"{kind} {rel} {n}" + (f"  # {of[(kind, rel)]}" if (kind, rel) in of else "") + "\n")
         print(f"wrote {len(now)} counts to {os.path.relpath(BASELINE, ROOT)}")
         return
     totals = Counter()
