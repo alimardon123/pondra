@@ -10,6 +10,7 @@ codes base
 column base
 dialect base
 env base
+grouping base
 lifecycle base
 machine base
 net base
@@ -17,6 +18,7 @@ scratch base
 node_state base
 ledger base
 reaches base
+buckets base
 memo base
 metrics base
 parsed base
@@ -248,6 +250,7 @@ ci hosts
 cli hosts
 dbserver hosts
 drain hosts
+hosted hosts
 idle hosts
 lib hosts
 library hosts

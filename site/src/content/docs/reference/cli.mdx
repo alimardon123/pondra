@@ -187,6 +187,8 @@ each database's node, on this machine only, doesn't.
 | `--retain-secs N` | `60` | how long to keep consumed log segments and replaced files before deleting them |
 | `--changelog-secs N` | `0` | keep the log this many seconds as a change feed: `/watch/{table}?after=N` and Kafka consumers can replay every change since then. `0`: only `--retain-secs` |
 | `--publish FORMATS` | none | open formats new tables are also published in, for engines that do not know Pondra: `delta`, `iceberg` or `delta,iceberg`. A table can set its own with `publish` |
+| `--default-table-format F` | `pondra` | the table format a new table is made in when its `CREATE TABLE` names none: `pondra` (`iceberg` comes with the lake's own Iceberg tables). A session's `SET default_table_format` comes first |
+| `--default-file-format F` | `parquet` | the file format a new table's files are written in when its `CREATE TABLE` names none. A session's `SET default_file_format` comes first |
 
 ### Memory and cache
 

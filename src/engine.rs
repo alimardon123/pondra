@@ -174,6 +174,10 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add::<crate::once::Buckets>();
             states.add::<crate::routines::Kept>();
             states.add::<crate::learned::Kept>();
+            states.add::<crate::users::SignIns>();
+            states.add::<crate::users::Turns>();
+            states.add::<crate::temp::Sessions>();
+            states.add::<crate::auth::Guesses>();
         }
         #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)
         for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::undrop::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,

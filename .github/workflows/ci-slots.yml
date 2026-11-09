@@ -1,9 +1,11 @@
 name: ci slots
 
-# At most three pull requests' CI at once (two from 2026-10-03, four from 2026-10-11, two again from
+# At most six pull requests' CI at once (two from 2026-10-03, four from 2026-10-11, two again from
 # 2026-10-16, since the account's runners are shared with the owner's other work, three from
-# 2026-10-17 on GitHub Pro's 40 jobs). The repository variable CI_SLOTS says how many, three when it
-# isn't set, and build.yml's plan and tools/train.py read the same: a pull request's run waits while
+# 2026-10-17 on GitHub Pro's 40 jobs, six from 2026-11-09, when the owner's other work stopped using
+# them: a PR's or the train's run keeps 5 to 6 jobs going on average, 16 in its first minutes, and
+# main's build 4.5, so six runs and main's come to about 38 of the 40). The repository variable
+# CI_SLOTS says how many, six when it isn't set, and build.yml's plan and tools/train.py read the same: a pull request's run waits while
 # that many others are going. It builds nothing and fails its `waiting for a CI slot` check, holding
 # no runner. Whenever a pull request's build run
 # or the train's (train.yml: one run for the pull requests it merged, which takes a slot too) ends,
@@ -39,7 +41,7 @@ jobs:
     timeout-minutes: 5
     env:
       GH_TOKEN: ${{ github.token }}
-      SLOTS: ${{ vars.CI_SLOTS || 3 }}
+      SLOTS: ${{ vars.CI_SLOTS || 6 }}
     steps:
       - run: |
           r=$GITHUB_REPOSITORY

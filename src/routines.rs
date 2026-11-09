@@ -53,18 +53,18 @@ pub fn of_macro(args: &Option<Vec<ast::MacroArg>>, def: &ast::MacroDefinition) -
 }
 
 /// A SQL function's body with its JSON operators grouped as Postgres groups them: the rule a view's query gets from
-/// `path::door` before it is stored (`pg_json::text`). It is done where the routine is read, so the routine a statement
+/// `path::door` before it is stored (`grouping::text`). It is done where the routine is read, so the routine a statement
 /// carries (`ddl` waits for it to be kept) is the one kept. A query's body is grouped as text; an expression's
-/// (`RETURN d ->> 'a' = '1'`, which the parser reads as `d ->> ('a' = '1')`) as one (`pg_json::expression`). A
+/// (`RETURN d ->> 'a' = '1'`, which the parser reads as `d ->> ('a' = '1')`) as one (`grouping::expression`). A
 /// procedure's body isn't: its statements go through the door as they run. Python's code is its own.
 pub fn grouped(mut r: Routine) -> Routine {
     if r.kind == Kind::Procedure || r.python() {
         return r;
     }
     if is_query(&r.body) {
-        r.body = crate::pg_json::text(&r.body).into_owned();
+        r.body = crate::grouping::text(&r.body).into_owned();
     } else {
-        r.body = crate::pg_json::expression(&r.body).into_owned();
+        r.body = crate::grouping::expression(&r.body).into_owned();
     }
     r
 }
@@ -1285,7 +1285,7 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
         "do" => "DO LANGUAGE python (a console's Python cell) runs Python on the node".to_string(),
         _ => format!("{name} is a Python procedure"),
     })?;
-    let lease = crate::auth::lend(who.role, who.files); // (ends when this does)
+    let lease = crate::auth::lend(&app.lake, who.role, who.files); // (ends when this does)
     let url = format!("http://{}", app.members.me().replace("0.0.0.0", "127.0.0.1"));
     let json: Vec<bool> = r.params.iter().map(|p| crate::text::is_json_type(p.ty.as_deref())).collect();
     let head = j!({"op": "call", "name": name, "body": r.body, "entry": r.with.entry, "params": names(r), "json": json, "url": url, "token": lease.0, "depth": who.depth, "job": job});

@@ -23,8 +23,7 @@ use anyhow::Result;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 /// A cursor statement, read.
 pub enum Cmd {
@@ -41,7 +40,7 @@ pub enum Answer {
     Done(crate::answer::Kind, Option<u64>),
 }
 
-struct Cursor {
+pub(crate) struct Cursor {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
     batch: usize,        // the batch the next row is in
@@ -49,10 +48,6 @@ struct Cursor {
     txn: Option<String>, // the transaction it was declared in (None: WITH HOLD)
     bytes: usize,        // what its answer holds in memory, counted as pages.rs counts an answer
 }
-
-crate::per_node!(
-    /// Each session's cursors, by name. A session with none has no entry.
-    static CURSORS: Mutex<HashMap<String, HashMap<String, Cursor>>> = Mutex::new(HashMap::new()));
 
 const NO_SESSION: &str = "a cursor is a session's: a Postgres connection's, or an HTTP client's (send x-pondra-session: <id>)";
 
@@ -141,10 +136,6 @@ fn unsupported(what: &str) -> anyhow::Error { coded("0A000", format!("{what}: no
 
 fn missing(name: &str) -> anyhow::Error { coded("34000", format!("cursor \"{name}\" does not exist")) }
 
-/// The current session's key. A session with none has the empty key, which no cursor is declared
-/// under, so its cursor statements find nothing.
-fn session() -> String { crate::temp::current().unwrap_or_default() }
-
 /// Runs a cursor statement in the current session, as `role` (signed in, as a query is).
 pub async fn run(app: &App, cmd: Cmd, role: Role, scope: &crate::rights::Scope) -> Result<Answer> {
     if role < Role::Read {
@@ -161,12 +152,13 @@ pub async fn run(app: &App, cmd: Cmd, role: Role, scope: &crate::rights::Scope) 
 
 /// `DECLARE`: the query runs now, as the caller, and its answer is kept under the name.
 async fn declare_as(app: &App, name: &str, hold: bool, query: &str, scope: &crate::rights::Scope) -> Result<Answer> {
-    let session = crate::temp::current().ok_or_else(|| coded("0A000", NO_SESSION))?;
+    let node = crate::temp::here().ok_or_else(|| coded("0A000", NO_SESSION))?; // (its session, and its node's cursors)
+    let session = node.name.clone();
     let in_txn = match hold {
         true => None,
         false => Some(txn::id().ok_or_else(|| coded("25P01", "DECLARE CURSOR can only be used in transaction blocks"))?),
     };
-    free(&session, name)?; // (before the query runs: a name taken is answered at once)
+    free(&node, name)?; // (before the query runs: a name taken is answered at once)
     let batches = app.query(query, None, scope).await?;
     let schema = match batches.first() {
         Some(b) => b.schema(),
@@ -174,8 +166,8 @@ async fn declare_as(app: &App, name: &str, hold: bool, query: &str, scope: &crat
     };
     let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&app.lake, query, scope).await); // (its uuids, for the Postgres port)
     let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-    let mut all = CURSORS.lock().unwrap(); // (the budget is checked under the lock the insert takes: two DECLAREs can't both pass it)
-    let held: usize = all.values().flat_map(|cs| cs.values()).map(|c| c.bytes).sum();
+    let mut all = node.at.cursors.lock().unwrap(); // (the budget is checked under the lock the insert takes: two DECLAREs can't both pass it)
+    let held: usize = all.values().flat_map(|cs| cs.values()).map(|c| c.bytes).sum(); // (the node's cursors, all sessions')
     if held + bytes > budget() {
         return Err(refused(held, bytes));
     }
@@ -220,8 +212,8 @@ async fn planned(app: &App, query: &str, scope: &crate::rights::Scope) -> Result
     Ok(Arc::new(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow().clone()))
 }
 
-fn free(session: &str, name: &str) -> Result<()> {
-    match CURSORS.lock().unwrap().get(session).is_some_and(|cs| cs.contains_key(name)) {
+fn free(node: &crate::temp::Named, name: &str) -> Result<()> {
+    match node.at.cursors.lock().unwrap().get(&node.name).is_some_and(|cs| cs.contains_key(name)) {
         true => Err(taken(name)),
         false => Ok(()),
     }
@@ -231,8 +223,9 @@ fn taken(name: &str) -> anyhow::Error { coded("42P03", format!("cursor \"{name}\
 
 /// `FETCH` and `MOVE` (`moving`: no rows sent, the count moved): the next rows, and the position past them.
 fn fetch(name: &str, rows: Option<usize>, moving: bool) -> Result<Answer> {
-    let mut all = CURSORS.lock().unwrap();
-    let c = all.get_mut(&session()).and_then(|cs| cs.get_mut(name)).ok_or_else(|| missing(name))?;
+    let node = crate::temp::here().ok_or_else(|| missing(name))?; // (no session here: it has no cursors)
+    let mut all = node.at.cursors.lock().unwrap();
+    let c = all.get_mut(&node.name).and_then(|cs| cs.get_mut(name)).ok_or_else(|| missing(name))?;
     let batches = c.take(rows);
     if moving {
         return Ok(Answer::Done(crate::answer::Kind::new("MOVE"), Some(batches.iter().map(|b| b.num_rows() as u64).sum())));
@@ -267,14 +260,20 @@ impl Cursor {
 
 /// `CLOSE name` or `CLOSE ALL`.
 fn close_as(name: Option<String>) -> Result<Answer> {
-    let mut all = CURSORS.lock().unwrap();
+    let Some(node) = crate::temp::here() else {
+        return match name {
+            None => Ok(Answer::Done(crate::answer::Kind::new("CLOSE CURSOR ALL"), None)), // (no session here: no cursors to close)
+            Some(name) => Err(missing(&name)),
+        };
+    };
+    let mut all = node.at.cursors.lock().unwrap();
     match name {
         None => {
-            all.remove(&session());
+            all.remove(&node.name);
             Ok(Answer::Done(crate::answer::Kind::new("CLOSE CURSOR ALL"), None))
         }
         Some(name) => {
-            let closed = all.get_mut(&session()).and_then(|cs| cs.remove(&name));
+            let closed = all.get_mut(&node.name).and_then(|cs| cs.remove(&name));
             closed.map(|_| Answer::Done(crate::answer::Kind::new("CLOSE CURSOR"), None)).ok_or_else(|| missing(&name))
         }
     }
@@ -285,13 +284,13 @@ fn close_as(name: Option<String>) -> Result<Answer> {
 /// COMMIT or ROLLBACK, so their answers' memory goes at once.
 pub fn sweep() {
     let now = txn::id(); // (taken before the lock: txn.rs has its own)
-    let s = session();
-    let mut all = CURSORS.lock().unwrap();
-    if all.get_mut(&s).is_some_and(|cs| {
+    let Some(node) = crate::temp::here() else { return }; // (no session here: no cursors to sweep)
+    let mut all = node.at.cursors.lock().unwrap();
+    if all.get_mut(&node.name).is_some_and(|cs| {
         cs.retain(|_, c| c.txn.is_none() || c.txn == now);
         cs.is_empty()
     }) {
-        all.remove(&s);
+        all.remove(&node.name);
     }
 }
 
@@ -300,10 +299,27 @@ pub fn sweep() {
 pub fn columns(cmd: &Cmd) -> Result<Option<SchemaRef>> {
     let Cmd::Fetch { name, .. } = cmd else { return Ok(None) };
     sweep();
-    let all = CURSORS.lock().unwrap();
-    let c = all.get(&session()).and_then(|cs| cs.get(name)).ok_or_else(|| missing(name))?;
+    let node = crate::temp::here().ok_or_else(|| missing(name))?;
+    let all = node.at.cursors.lock().unwrap();
+    let c = all.get(&node.name).and_then(|cs| cs.get(name)).ok_or_else(|| missing(name))?;
     Ok(Some(c.schema.clone()))
 }
 
-/// A session ended: its cursors go with it.
-pub fn end(session: &str) { CURSORS.lock().unwrap().remove(session); }
+/// A session ended: its cursors go with it, out of `at` (its node's sessions).
+pub fn end(at: &crate::temp::Sessions, session: &str) { at.cursors.lock().unwrap().remove(session); }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_nodes_keep_their_cursors_apart() {
+        let (a, b) = (Arc::new(crate::temp::Sessions::default()), Arc::new(crate::temp::Sessions::default()));
+        let cursor = Cursor { schema: Arc::new(datafusion::arrow::datatypes::Schema::empty()), batches: vec![], batch: 0, row: 0, txn: None, bytes: 0 };
+        a.cursors.lock().unwrap().entry("ann~c".to_string()).or_default().insert("c".to_string(), cursor);
+        assert!(a.cursors.lock().unwrap().contains_key("ann~c"), "a holds ann's cursor");
+        assert!(!b.cursors.lock().unwrap().contains_key("ann~c"), "b counts apart: no cursor there");
+        end(&a, "ann~c");
+        assert!(!a.cursors.lock().unwrap().contains_key("ann~c"), "ann's session ended: its cursors are gone from a");
+    }
+}

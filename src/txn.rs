@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use datafusion::common::instant::Instant;
 use std::time::Duration;
 
@@ -233,14 +233,13 @@ struct Mark {
     reads: BTreeMap<String, Reads>,
 }
 
-/// Every session's transaction, and whether the upkeep loop runs (`upkeep`): one lock for all of it.
+/// Every session's transaction, and whether the upkeep loop runs (`upkeep`): one lock for all of it. A node's sessions
+/// hold it (`temp::Sessions::book`).
 #[derive(Default)]
-struct Book {
+pub(crate) struct Book {
     txns: HashMap<String, Txn>,
     upkeep: bool,
 }
-
-crate::per_node!(static BOOK: Mutex<Book> = Default::default());
 
 tokio::task_local! {
     /// Set by `at_once` around the statements that run at once in an open transaction (DDL, and the two steps of
@@ -268,25 +267,31 @@ const MERGE_TABLE: &str = "is a merge table: its rows add up as they're read, so
 
 // ---------------------------------------------------------------- the book
 
-/// The open transaction of session `s`, with the book locked for `f` (None: the session has none open).
+/// The open transaction of session `s` in `at`'s book, with the book locked for `f` (None: the session has none open).
+fn at_in<R>(at: &crate::temp::Sessions, s: &str, f: impl FnOnce(&mut Txn) -> R) -> Option<R> {
+    at.book.lock().unwrap().txns.get_mut(s).filter(|t| t.state == State::Open).map(f)
+}
+
+/// The open transaction of session `s` at the request's node (`temp::here`), with the book locked for `f` (None: the
+/// session has none open, or there is no request).
 fn at<R>(s: &str, f: impl FnOnce(&mut Txn) -> R) -> Option<R> {
-    BOOK.lock().unwrap().txns.get_mut(s).filter(|t| t.state == State::Open).map(f)
+    crate::temp::here().and_then(|n| at_in(&n.at, s, f))
 }
 
 /// `at` for the current session.
 fn with_txn<R>(f: impl FnOnce(&mut Txn) -> R) -> Option<R> { at(&crate::temp::current()?, f) }
 
 /// Is session `s`'s transaction ended by the idle timeout, with no transaction word since?
-fn ended(s: &str) -> bool { BOOK.lock().unwrap().txns.get(s).is_some_and(|t| t.state != State::Open) }
+fn ended(s: &str) -> bool { crate::temp::here().is_some_and(|n| n.at.book.lock().unwrap().txns.get(s).is_some_and(|t| t.state != State::Open)) }
 
 /// The session's open transaction's snapshot, if it has one: every read in it is as of then.
 pub fn snapshot() -> Option<u64> { with_txn(|t| t.snapshot) }
 
 /// Is a transaction open in this session, ended by the idle timeout or not? Its statements go through `gate`.
-pub fn open() -> bool { crate::temp::current().is_some_and(|s| held(&s)) }
+pub fn open() -> bool { crate::temp::here().is_some_and(|n| held(&n.at, &n.name)) }
 
-/// Does the session have a transaction in the book (open, or ended)? Keeps its temporary tables.
-pub fn held(session: &str) -> bool { BOOK.lock().unwrap().txns.contains_key(session) }
+/// Does the session have a transaction in `at`'s book (open, or ended)? Keeps its temporary tables.
+pub fn held(at: &crate::temp::Sessions, session: &str) -> bool { at.book.lock().unwrap().txns.contains_key(session) }
 
 /// The current session's open transaction's id, if it has one (a cursor without HOLD lives as long as it).
 pub fn id() -> Option<String> { with_txn(|t| t.id.clone()) }
@@ -312,13 +317,16 @@ pub fn shown(name: &str) -> Option<String> {
     })
 }
 
-/// A session ended (its connection closed), or its transaction is over: it is removed, and its locks let go.
-pub fn end(session: &str) {
-    let gone = BOOK.lock().unwrap().txns.remove(session);
+/// A session ended (its connection closed), or its transaction is over: it is removed from `at`'s book, and its locks let go.
+pub fn end(at: &crate::temp::Sessions, session: &str) {
+    let gone = at.book.lock().unwrap().txns.remove(session);
     if let Some(t) = gone {
         release_txn(&t);
     }
 }
+
+/// The book's transaction of session `s`, removed (`commit`).
+fn take(at: &crate::temp::Sessions, s: &str) -> Option<Txn> { at.book.lock().unwrap().txns.remove(s) }
 
 /// A statement failed in this session's transaction: it is failed now (25P02 for the ones that follow).
 pub fn failed(message: &str) {
@@ -352,7 +360,7 @@ fn writable(word: &str) -> Result<()> {
 
 /// Did Flight SQL's BeginTransaction begin session `s`'s transaction (open, or ended by the idle timeout)? Its end is the
 /// protocol's: `command` refuses the transaction words in it.
-fn protocol_owned(s: &str) -> bool { BOOK.lock().unwrap().txns.get(s).is_some_and(|t| t.protocol) }
+fn protocol_owned(s: &str) -> bool { crate::temp::here().is_some_and(|n| n.at.book.lock().unwrap().txns.get(s).is_some_and(|t| t.protocol)) }
 
 /// `BEGIN`, `COMMIT` or `ROLLBACK` (`control`), or a savepoint word, for the current session. Its answer: the command's
 /// tag (a failed transaction's COMMIT is a ROLLBACK, as in Postgres), and a warning, if any. A transaction Flight SQL began
@@ -388,16 +396,17 @@ pub async fn protocol(app: &crate::app::App, word: &str) -> Result<(&'static str
 
 /// The transaction word `word` for session `s` (`command`, `protocol`): an idle end first, then the word.
 async fn word_in(app: &crate::app::App, s: &str, word: &str, sql: &str) -> Result<(&'static str, Option<String>)> {
+    let at = crate::temp::here().context(NO_SESSION)?.at; // (the request's node's sessions: its transactions)
     // (an idle end: a COMMIT must not say its writes landed; a transaction word ends the refusal)
     if ended(s) {
         if word == "COMMIT" {
-            end(s);
+            end(&at, s);
             return Err(idle_commit());
         }
         if !matches!(word, "ROLLBACK" | "BEGIN") {
             return Err(idle_ended());
         }
-        end(s);
+        end(&at, s);
         if word == "ROLLBACK" {
             return Ok(("ROLLBACK", None));
         }
@@ -407,7 +416,7 @@ async fn word_in(app: &crate::app::App, s: &str, word: &str, sql: &str) -> Resul
         "SAVEPOINT" => savepoint(s, sql),
         "RELEASE" => release_savepoint(s, sql),
         "ROLLBACK TO" => rollback_to(s, sql),
-        "ROLLBACK" => match BOOK.lock().unwrap().txns.remove(s) {
+        "ROLLBACK" => match at.book.lock().unwrap().txns.remove(s) {
             Some(t) => {
                 release_txn(&t);
                 Ok(("ROLLBACK", None))
@@ -511,9 +520,11 @@ fn begin(app: &crate::app::App, s: &str, sql: &str, protocol: bool) -> Result<(&
 
 /// Opens a transaction for session `s` (false: it has one). Its snapshot is taken at its first statement (as Postgres
 /// takes it: `gate`), so this is a placeholder until then. Starts the upkeep loop if none runs. Its id is new each time; a
-/// `job` names its commit instead (`alone`). `protocol`: Flight SQL began it (`protocol`).
+/// `job` names its commit instead (`alone`). `protocol`: Flight SQL began it (`protocol`). The transaction is in the app's
+/// node's sessions (none: it doesn't start, as there is no book to keep it in).
 fn start(app: &crate::app::App, s: &str, level: Level, read_only: bool, job: Option<String>, protocol: bool) -> bool {
-    let mut book = BOOK.lock().unwrap();
+    let Some(at) = crate::temp::sessions(&app.lake) else { return false };
+    let mut book = at.book.lock().unwrap();
     if book.txns.contains_key(s) {
         return false;
     }
@@ -526,7 +537,7 @@ fn start(app: &crate::app::App, s: &str, level: Level, read_only: bool, job: Opt
     book.txns.insert(s.to_string(), txn);
     if !book.upkeep {
         book.upkeep = true;
-        app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, upkeep());
+        app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, upkeep(Arc::downgrade(&at)));
     }
     true
 }
@@ -595,17 +606,17 @@ fn default_read_only() -> bool {
 /// A statement in progress in a session's transaction (`next`): while it lives, the transaction isn't idle, and when it
 /// ends the idle time starts again. It names the transaction it began in, so a statement that outlived its transaction
 /// doesn't count against the next one.
-pub struct Busy(Option<(String, String)>);
+pub struct Busy(Option<(Arc<crate::temp::Sessions>, String, String)>);
 
 impl Busy {
     /// The transaction this statement began in, if one was open (`began`).
-    pub fn id(&self) -> Option<String> { self.0.as_ref().map(|(_, id)| id.clone()) }
+    pub fn id(&self) -> Option<String> { self.0.as_ref().map(|(_, _, id)| id.clone()) }
 }
 
 impl Drop for Busy {
     fn drop(&mut self) {
-        let Some((s, id)) = self.0.take() else { return };
-        at(&s, |t| {
+        let Some((at, s, id)) = self.0.take() else { return };
+        at_in(&at, &s, |t| {
             if t.id == id {
                 t.busy -= 1;
                 t.used = Instant::now();
@@ -617,14 +628,14 @@ impl Drop for Busy {
 /// Before each statement, at each door (ADR-067 §1, §2): the gate (`gate`). The statement runs while the guard it returns
 /// lives: a transaction with a statement in progress isn't idle, even while that statement waits for a lock.
 pub async fn next(app: &crate::app::App, sql: &str) -> Result<Busy> {
-    let busy = Busy(crate::temp::current().and_then(|s| {
+    let busy = Busy(crate::temp::here().and_then(|n| {
         let leader = leader_of(app);
-        at(&s, |t| {
+        let id = at_in(&n.at, &n.name, |t| {
             t.busy += 1;
             t.leader = leader;
             t.id.clone()
-        })
-        .map(|id| (s, id))
+        })?;
+        Some((n.at, n.name, id))
     }));
     gate(&app.lake, sql)?;
     Ok(busy)
@@ -646,13 +657,11 @@ fn ended_since() -> anyhow::Error { crate::codes::coded("25000", "the transactio
 /// at BEGIN). Words are read only where they decide something.
 pub fn gate(lake: &Lake, sql: &str) -> Result<()> {
     let Some(s) = crate::temp::current() else { return Ok(()) };
-    let mut book = BOOK.lock().unwrap();
+    let Some(at) = crate::temp::sessions(lake) else { return unopened(sql) };
+    let mut book = at.book.lock().unwrap();
     let Some(t) = book.txns.get_mut(&s) else {
         drop(book);
-        return match default_read_only().then(|| write_word(sql)).flatten() {
-            Some(w) => Err(read_only(&w)),
-            None => Ok(()),
-        };
+        return unopened(sql);
     };
     if t.state != State::Open {
         return Err(idle_ended());
@@ -669,6 +678,14 @@ pub fn gate(lake: &Lake, sql: &str) -> Result<()> {
     Ok(())
 }
 
+/// A statement in a session with no transaction open: a write is refused under `default_transaction_read_only`.
+fn unopened(sql: &str) -> Result<()> {
+    match default_read_only().then(|| write_word(sql)).flatten() {
+        Some(w) => Err(read_only(&w)),
+        None => Ok(()),
+    }
+}
+
 /// The words Postgres names a statement by in its errors and notices (25006, the DDL notice), for a parsed statement.
 fn word_of(stmt: &Stmt) -> &'static str {
     use crate::ddl::Ddl;
@@ -680,7 +697,7 @@ fn word_of(stmt: &Stmt) -> &'static str {
         Stmt::Delete(..) => "DELETE",
         Stmt::Merge(_) => "MERGE",
         Stmt::AddColumn(..) | Stmt::SetOptions(..) => "ALTER TABLE",
-        Stmt::CopyTo(..) | Stmt::CopyInto(..) => "COPY",
+        Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::Theirs => "COPY",
         Stmt::UndropFile(_) => "UNDROP FILE",
         Stmt::Ddl(ds) => match ds.first() {
             Some(Ddl::DropTable { .. }) => "DROP TABLE",
@@ -714,21 +731,25 @@ pub fn mark_locked() {
     with_txn(|t| t.locked = true);
 }
 
-/// Every transaction's row locks, marked as let go: the node is stopping, and they go to their leaders (`locks::release_all`).
-pub fn unlock_all() -> Vec<Place> {
-    BOOK.lock().unwrap().txns.values_mut().filter(|t| t.locked).map(|t| { t.locked = false; place(t) }).collect()
+/// Every transaction's row locks in `at`'s book, marked as let go: the node is stopping, and they go to their leaders
+/// (`locks::release_all`).
+pub fn unlock_all(at: &crate::temp::Sessions) -> Vec<Place> {
+    at.book.lock().unwrap().txns.values_mut().filter(|t| t.locked).map(|t| { t.locked = false; place(t) }).collect()
 }
 
 /// Every third of a lock's lease, and a quarter of the idle limit (at most every 30 s): transactions idle for
 /// `PONDRA_TXN_IDLE_SECS` end, ended ones older than `ENDED_FOR` are forgotten, and the locks of the rest are renewed, so a
 /// session idle in its transaction keeps them while it lives (ADR-067 §4: a lease is for a node that died, not for an idle
-/// session). Once the book is empty, this stops, under the book's lock (`start` starts it again under the same lock).
-async fn upkeep() {
+/// session). Once the book is empty, this stops, under the book's lock (`start` starts it again under the same lock). It
+/// holds the node's sessions by a weak handle, and no strong one across a tick's sleep: once they are gone (the lake
+/// stopped), this stops too.
+async fn upkeep(sessions: std::sync::Weak<crate::temp::Sessions>) {
     loop {
         let tick = (crate::locks::lease() / 3).min(idle_limit() / 4).min(Duration::from_secs(30)).max(Duration::from_millis(10));
         tokio::time::sleep(tick).await;
+        let Some(at) = sessions.upgrade() else { return };
         let (gone, holding, done) = {
-            let mut book = BOOK.lock().unwrap();
+            let mut book = at.book.lock().unwrap();
             let idle = idle_limit();
             // (a statement in progress, a wait for a lock included, makes a transaction busy, not idle)
             let mut gone = vec![];
@@ -747,6 +768,7 @@ async fn upkeep() {
             }
             (gone, holding, done)
         };
+        drop(at);
         gone.into_iter().for_each(crate::locks::release_place);
         crate::locks::renew_places(holding);
         if done {
@@ -1238,9 +1260,9 @@ fn drop_rows(new: &mut [RecordBatch], mine: &HashSet<i64>, mut by: Option<&mut B
 /// Keeps a statement's writes in its transaction. A statement that outlived its transaction (the id it captured is not the
 /// open one's) is refused (25000), never written into the next one (ADR-067 §1).
 fn keep(table: &str, key: &[String], old: Vec<RecordBatch>, new: Vec<RecordBatch>, at: u64, keys: Option<Keys>, id: &str) -> Result<()> {
-    let s = crate::temp::current().context(NO_SESSION)?;
-    let mut book = BOOK.lock().unwrap();
-    let t = book.txns.get_mut(&s).filter(|t| t.state == State::Open).context("no transaction in progress")?;
+    let n = crate::temp::here().context(NO_SESSION)?; // (the request's node's sessions: its transactions)
+    let mut book = n.at.book.lock().unwrap();
+    let t = book.txns.get_mut(&n.name).filter(|t| t.state == State::Open).context("no transaction in progress")?;
     if t.id != id {
         return Err(ended_since());
     }
@@ -1626,7 +1648,8 @@ fn unipc(s: &str) -> Result<Vec<RecordBatch>> {
 /// whatever the answer. A failed send lets go too, and the lease covers a send that never arrived.
 /// COMMIT: the tag and warning Postgres gives, and what the leader answered (`duplicate`: a job's commit sent again).
 async fn commit(app: &crate::app::App, s: &str) -> Result<(&'static str, Option<String>, Value)> {
-    let Some(t) = BOOK.lock().unwrap().txns.remove(s) else { return Ok(("COMMIT", Some(crate::rules::txn::NONE_OPEN.into()), j!({}))) };
+    let taken = crate::temp::sessions(&app.lake).and_then(|at| take(&at, s));
+    let Some(t) = taken else { return Ok(("COMMIT", Some(crate::rules::txn::NONE_OPEN.into()), j!({}))) };
     if t.failed.is_some() {
         release_txn(&t);
         return Ok(("ROLLBACK", None, j!({})));
@@ -1694,7 +1717,7 @@ where
     Fut: Future<Output = Result<T>>,
 {
     leader_needed(app)?;
-    let caller = crate::temp::SESSION.try_with(|s| s.clone()).ok().flatten();
+    let caller = crate::temp::current();
     let s = caller.clone().unwrap_or_else(|| crate::temp::of_script("")); // (a session of its own, which no client names)
     let job = job.map(|j| as_job(&j));
     let run = async {
@@ -1704,11 +1727,13 @@ where
             start(app, &s, Level::Committed, false, job.clone(), false);
             let out = {
                 // (a busy mark while the body runs: the idle upkeep must not end the transaction mid-statement)
-                let _busy = Busy(at(&s, |t| {
-                    t.busy += 1;
-                    t.id.clone()
-                })
-                .map(|id| (s.clone(), id)));
+                let _busy = Busy(crate::temp::sessions(&app.lake).and_then(|at| {
+                    let id = at_in(&at, &s, |t| {
+                        t.busy += 1;
+                        t.id.clone()
+                    })?;
+                    Some((at, s.clone(), id))
+                }));
                 body().await?
             };
             let sent = match commit(app, &s).await {
@@ -1725,11 +1750,13 @@ where
             }
         }
     };
-    let out = crate::temp::SESSION.scope(Some(s.clone()), run).await;
-    match caller {
-        Some(_) => end(&s), // (refused before its COMMIT: rolled back, the session kept)
-        None => {
-            crate::temp::end(&s);
+    let out = crate::temp::SESSION.scope(crate::temp::named(&app.lake, Some(s.clone())), run).await;
+    if let Some(at) = crate::temp::sessions(&app.lake) {
+        match caller {
+            Some(_) => end(&at, &s), // (refused before its COMMIT: rolled back, the session kept)
+            None => {
+                at.end(&s);
+            }
         }
     }
     out
@@ -2136,6 +2163,23 @@ mod tests {
         drop_rows(&mut kept2, &HashSet::from([-7i64]), Some(&mut by2)).expect("dropped rows");
         assert!(by2.rows.is_none(), "a key with another of its own rows: made again");
         assert_eq!(v_of(by2.own(&text(1, "a"), &kept2)), Some(Some(11)), "the other row of its own");
+    }
+
+    /// Two nodes in one process keep their transactions apart: a session of one name in a transaction at one node is in
+    /// none at the other, and ending it at one leaves the other's.
+    #[test]
+    fn two_nodes_keep_their_transactions_apart() {
+        let (a, b) = (std::sync::Arc::new(crate::temp::Sessions::default()), std::sync::Arc::new(crate::temp::Sessions::default()));
+        let txn = || Txn {
+            id: "t".into(), job: None, lake: "a".into(), level: Level::Committed, read_only: false, snapshot: 0, ran: false, leader: None,
+            protocol: false, locked: false, state: State::Open, tables: BTreeMap::new(), by_key: BTreeMap::new(), reads: BTreeMap::new(),
+            marks: vec![], failed: None, used: Instant::now(), busy: 0, next: -1,
+        };
+        a.book.lock().unwrap().txns.insert("ann~t".into(), txn());
+        assert!(held(&a, "ann~t") && !held(&b, "ann~t"), "in a's book alone");
+        b.book.lock().unwrap().txns.insert("ann~t".into(), txn());
+        end(&a, "ann~t");
+        assert!(!held(&a, "ann~t") && held(&b, "ann~t"), "ended at a, b's stays");
     }
 
     #[test]

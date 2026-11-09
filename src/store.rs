@@ -13,10 +13,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::disk_manager::{DiskManager, DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::spill_file::{SpillFile, TempFileFactory};
-use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
-use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
-use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
-use object_store::ClientConfigKey;
+use object_store::aws::AmazonS3Builder;
 #[cfg(not(target_arch = "wasm32"))]
 use object_store::local::LocalFileSystem;
 use object_store::{path::Path, prefix::PrefixStore, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
@@ -1528,6 +1525,7 @@ pub fn default_publish() -> Vec<String> {
 
 const TAIL_BYTES: usize = 256 << 20; // decoded log segments kept in memory, per node
 const AHEAD: u64 = 256; // replicated acks: commits acknowledged before the bucket has them, at most
+const SLOW_COMMIT: Duration = Duration::from_secs(2); // a commit waiting this long is named (`Lake::commits`)
 
 const RECENT: Duration = Duration::from_secs(30); // replayed to (re)connecting followers…
 const RECENT_BYTES: usize = 64 << 20; // …within this much memory (past it, a reconnecting
@@ -2045,18 +2043,17 @@ pub fn open_store(url: &str, reaches: Option<&crate::reaches::Reaches>) -> Resul
         let held = crate::memory_lake::store(&url);
         return Ok((url.clone(), held.clone(), Some((url, held)))); // (DataFusion reads its files at their URLs, as a bucket's)
     }
-    #[cfg(feature = "doors")]
     if served(url) {
-        // (the store is the node that holds the lake's, read through its door: `served.rs`; nothing is connected yet)
+        // (the store is the node that holds the lake's, read through its door: `served.rs`, as the hosts add it; nothing is
+        // connected yet)
+        let Some(door) = crate::buckets::get().served else {
+            anyhow::bail!("{url}: this form reads no lake through a node's door (pondra://): open its bucket or folder instead");
+        };
         let at = url.trim_start_matches("pondra://").trim_end_matches('/');
         anyhow::ensure!(!at.is_empty() && !at.contains('/'), "{url}: a node serves one lake, named by pondra://host:port alone");
         let url = format!("pondra://{at}");
-        let store: Store = Arc::new(crate::served::Served::new(at));
+        let store: Store = door(at);
         return Ok((url.clone(), store.clone(), Some((url, store)))); // (the lake and its bucket are one, as in memory)
-    }
-    #[cfg(not(feature = "doors"))]
-    if served(url) {
-        anyhow::bail!("{url}: this form reads no lake through a node's door (pondra://): open its bucket or folder instead");
     }
     if place(url)? == Place::Folder {
         return folder(url);
@@ -2066,17 +2063,8 @@ pub fn open_store(url: &str, reaches: Option<&crate::reaches::Reaches>) -> Resul
     let root = format!("{scheme}://{bucket}");
     let reach = reaches.and_then(|r| r.of(url));
     let params = reach.as_ref().and_then(|r| r.params.as_ref());
-    // Idle connections are dropped after 15 s rather than reused: through proxies and NATs that
-    // silently forget idle connections, a reused one hung a PUT for the full 30 s timeout on R2.
-    let (idle, after) = (ClientConfigKey::PoolIdleTimeout, "15s");
-    // Every request to the bucket takes a turn of its budget, retries too (`budget.rs`, C5).
-    let turns = || crate::budget::Budget::of(&root);
-    let mut whole: Store = match (params, scheme) {
-        (Some(_), _) => crate::ext::build(&url::Url::parse(&root)?, params, crate::ext::For::Lake)?,
-        (None, "s3") => Arc::new(with_kms(AmazonS3Builder::from_env(), sse_kms_from_env()).with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
-        (None, "gs") => Arc::new(GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket).with_config(GoogleConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
-        (None, _) => Arc::new(MicrosoftAzureBuilder::from_env().with_url(&root).with_config(AzureConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
-    };
+    let Some(open) = crate::buckets::get().open else { anyhow::bail!("{url}: this form opens no lake in a {scheme}:// bucket") };
+    let mut whole: Store = open(&crate::buckets::At { scheme, bucket, root: &root }, params)?; // (the platform's: `hosted::bucket`)
     if reach.as_ref().is_some_and(|r| r.read_only) {
         whole = Arc::new(ReadOnly(whole, url.trim_end_matches('/').to_string())); // (before the prefix: the lake's store and the bucket's refuse alike)
     }
@@ -2382,7 +2370,8 @@ impl Lake {
         let disk = bucket.as_ref().filter(|_| !memory).and_then(|_| disk_tier(&url, &store, &node));
         let mut cached_store = None;
         if let Some((bucket_url, held)) = bucket.as_ref().filter(|_| memory) {
-            rt.register_object_store(&url::Url::parse(bucket_url)?, Arc::new(crate::bridge::Bridge(held.clone()))); // (in memory already: read as it is)
+            let read = crate::buckets::get().reader.context("this form gives DataFusion no reader of a lake in memory")?;
+            rt.register_object_store(&url::Url::parse(bucket_url)?, read(held.clone())); // (in memory already: read as it is)
         } else if let Some((bucket_url, s3)) = bucket {
             let prefix = url.trim_start_matches(&bucket_url).trim_start_matches('/').to_string();
             let cached = Arc::new(crate::cache::CachedStore::new(s3, cache_mb() << 20, disk.clone().map(|d| (d, prefix.clone())), &prefix));
@@ -2464,6 +2453,7 @@ impl Lake {
                 lake.cat.send(Frame::Durable(id));
             }
         });
+        let mut said: Option<Instant> = None; // (when a slow commit was last named: one a second at most)
         while let Some((handle, d, done, sent)) = writes.recv().await {
             let Some(lake) = me.upgrade() else { return };
             let cat = &lake.cat;
@@ -2476,6 +2466,7 @@ impl Lake {
             // (At most AHEAD commits are acknowledged ahead of the bucket: if it stalls, acks wait
             // for it, so what a failover has to recover — and could lose — stays bounded.)
             let close = *cat.durable.borrow() + AHEAD >= d.id;
+            let mut by = "its followers";
             loop {
                 if need > 0 && close && cat.holders(d.id) >= need {
                     break;
@@ -2486,10 +2477,17 @@ impl Lake {
                             eprintln!("catalog commit failed: {e}");
                             life.restart("a catalog commit failed", &[]);
                         }
+                        by = "the bucket";
                         break;
                     }
                     _ = acked.changed() => {}
                 }
+            }
+            // (every write's ack waits for its commit, in order: one slow here is a stall of all the
+            // writes behind it, named once a second at most, the bucket's slow request beside it: `budget::Gate::slow`)
+            if t.elapsed() >= SLOW_COMMIT && said.is_none_or(|s| s.elapsed() >= Duration::from_secs(1)) {
+                eprintln!("a commit waited {:.1} s for {by} (commit {}): the writes behind it waited with it", t.elapsed().as_secs_f64(), d.id);
+                said = Some(Instant::now());
             }
             let t = cat.stage("durable", t);
             if need == 0 {
@@ -2741,7 +2739,9 @@ impl Lake {
         if self.bases.read().unwrap().contains_key(id) {
             return Ok(());
         }
-        crate::budget::share(url); // (its objects read with a share of the bucket's turns: prod's own nodes come first)
+        if let Some(share) = crate::buckets::get().share {
+            share(url); // (its objects read with a share of the bucket's turns: prod's own nodes come first)
+        }
         match (bucket_url(url), &self.cached) {
             (Some(bucket), Some(ours)) if bucket_url(&self.url).as_ref() == Some(&bucket) => ours.add_lake(url[bucket.len()..].trim_start_matches('/')),
             (Some(bucket), _) => {
@@ -4382,7 +4382,7 @@ pub fn partitions_of(memory: usize) -> usize {
 pub fn node_partitions(node: &NodeState) -> usize { partitions_of(node_memory(node)) }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The engine gives every lake its sessions and the memory watch (`EngineHooks`), and Delta and Iceberg say which of
@@ -5004,7 +5004,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-joined-{}", uuid::Uuid::new_v4()));
         let folder = dir.to_str().unwrap().to_string();
         let writer = Lake::open(&folder, true, false, crate::node_state::NodeState::unhosted()).await?;
-        crate::write::create_table(&writer, "t", r#"{"columns": [["a", "Int64"]]}"#).await?;
+        writer.cat.commit(vec![(table_key("t"), json(&TableMeta::with_columns(vec![("a".into(), "Int64".into())])))], &[]).await?;
         let copied = writer.cat.kv.scan(b"".to_vec()..vec![0xff], false).await?;
         assert!(copied.contains_key(&table_key("t")), "the writer's catalog holds its table");
 
@@ -5322,7 +5322,7 @@ mod tests {
 
     /// The parse and size measures' wide entry: 500 columns, renames, drops, a moved order, NOT NULLs, defaults, held
     /// types and 200 files.
-    fn wide_entry() -> TableMeta {
+    pub(crate) fn wide_entry() -> TableMeta {
         let mut m = TableMeta::made(Made {
             columns: (0..500).map(|i| (format!("column_{i}"), if i % 3 == 0 { "Int64" } else { "Utf8" }.to_string())).collect(),
             names: (0..500).step_by(10).map(|i| (format!("column_{i}"), format!("renamed_{i}"))).collect(),
@@ -5339,7 +5339,7 @@ mod tests {
     }
 
     /// Their 2,000 small entries: 1 to 8 columns, some renamed, some with a column dropped.
-    fn small_entries() -> Vec<TableMeta> {
+    pub(crate) fn small_entries() -> Vec<TableMeta> {
         (0..2000u64)
             .map(|i| {
                 let n = 1 + (i % 8) as usize;
@@ -5487,7 +5487,8 @@ mod tests {
     /// What the entry's own column helpers cost (redesign 1b, piece 7a's before and after: from the fields by stored name
     /// to the list): each on an entry read as format 6's list, asked again ("warm") and first after the read ("first",
     /// the read's own cost taken off). The wide table and the 2,000 small ones of `entry_parse_time`. A measure, not a
-    /// check: `cargo test --release --lib column_helpers_time -- --ignored --nocapture`.
+    /// check: `cargo test --release --lib column_helpers_time -- --ignored --nocapture` (the engine's helpers of a column,
+    /// `types::shown` and `default_sql`, are measured the same way in `rules::rows`).
     #[test]
     #[ignore]
     fn column_helpers_time() {
@@ -5500,14 +5501,12 @@ mod tests {
                 })
                 .fold(f64::MAX, f64::min)
         };
-        let helpers: [(&str, fn(&TableMeta) -> usize); 13] = [
+        let helpers: [(&str, fn(&TableMeta) -> usize); 11] = [
             ("columns()", |m| m.columns().map(|(c, t)| c.len() + t.len()).sum()),
             ("described()", |m| m.described().columns().len()),
             ("schema()", |m| m.schema().unwrap().fields().len()),
             ("read_schema()", |m| m.read_schema().unwrap().fields().len()),
             ("table_sql()", |m| crate::objects::table_sql("t", m).len()),
-            ("types::shown(), each column", |m| m.list().columns.iter().filter_map(|c| m.col(c.stored_name())).map(|c| crate::types::shown(c).len()).sum()),
-            ("default_sql(), each column", |m| m.live().filter_map(|(_, n, _)| crate::rules::rows::default_sql(m, n)).count()),
             ("logical()", |m| m.logical().columns().len()),
             ("to_rules()", |m| m.to_rules().unwrap().columns.len()),
             ("sql_columns()", |m| m.sql_columns().len()),
@@ -5774,7 +5773,7 @@ mod tests {
 
     /// The entries of every release's lake since 0.22, as each release wrote them (`keep_old_entries`): a line each,
     /// `{"release", "key", "entry"}`.
-    const OLD_ENTRIES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/old-entries.jsonl");
+    pub(crate) const OLD_ENTRIES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/old-entries.jsonl");
 
     /// Keeps every table entry (`t/`) and dropped table's record (`dt/`) of each release's lake since 0.22 as it wrote
     /// them, for `old_entries_read_as_before`: `python3 tools/upgrade_check.py lakes --work DIR`, then
@@ -5825,7 +5824,7 @@ mod tests {
             let at = format!("{v} {k}");
             let metas = match k.starts_with("dt/") {
                 true => {
-                    let _: crate::ddl::Dropped = serde_json::from_value(l["entry"].clone()).expect(&at);
+                    // (and the record reads as a dropped table's: `ddl::tests::old_dropped_records_read_as_before`)
                     [Some(&l["entry"]["meta"]), l["entry"].get("deleted").filter(|d| !d.is_null())].into_iter().flatten().collect()
                 }
                 false => vec![&l["entry"]],

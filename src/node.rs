@@ -329,6 +329,9 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     let log = (!reader).then(|| Arc::new(log::Log::start(lake.clone(), Duration::from_millis(s.flush_ms), to)));
     lake.node.trace("the sequencer");
     python::init(s.python.clone());
+    if s.auth.on() {
+        lake.node.tokens.store(true, std::sync::atomic::Ordering::Relaxed); // (this node's doors take tokens: `auth::tokens_on`)
+    }
     let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone(), tables: Default::default(), log_pass: Default::default() };
     if let Some(ledger) = lake.ledger() {
         ledger.charge("answers", Arc::downgrade(&app.results) as std::sync::Weak<dyn crate::ledger::Charged>); // (the remembered answers: `/metrics`' `cache_bytes`)
