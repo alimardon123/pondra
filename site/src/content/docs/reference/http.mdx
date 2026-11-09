@@ -334,6 +334,10 @@ console's Workspace shows them and edits them in place.
   `files()` doesn't list): the newest 50 for 90 days (`PONDRA_FILE_VERSIONS`,
   `PONDRA_FILE_VERSIONS_DAYS`), files up to 64 MB. A deleted file keeps its versions, so it can be
   restored. The console's **Versions…** shows what changed and restores one.
+- **A deleted file is listed** in [`pondra.dropped`](/pondra/sql/system-tables/#dropped-objects-and-deleted-files)
+  (kind `file`), with when and by whom it was deleted, and `UNDROP FILE 'notes/a.txt'` makes its
+  newest version the file again: a writer's, as `DELETE` is (a `.py` an admin's). It is refused
+  while a file is at the path (`42710`), and when no version of it is kept (`42704`).
 
 Read them from SQL with `files()` and `file_read()`, see [functions](/pondra/sql/functions/#files).
 
@@ -481,7 +485,8 @@ pondra_role{role="leader"} 1
 | any other path | as on a node | the default database's (`--default`) |
 | `GET /databases` | read | the databases: `[{"name", "running", "default"}]` |
 | `POST /databases` | admin | make one: `{"name": "hr"}`, as `CREATE DATABASE hr`; `400` with the reason if it can't |
-| `DELETE /databases/{name}` | admin | drop one, folder and all, as `DROP DATABASE`; `?if_exists=true` is quiet about one that isn't there. `400` with the reason if it can't |
+| `DELETE /databases/{name}` | admin | drop one, as `DROP DATABASE`: its folder is kept as it was for 7 days, under a mark (`pondra.dropped` lists it); `?purge=true` deletes it at once, as `DROP DATABASE … PURGE`; `?if_exists=true` is quiet about one that isn't there. `400` with the reason if it can't |
+| `POST /databases/{name}/undrop` | admin | bring a dropped one back, as `UNDROP DATABASE`: its mark taken off, served again. `400` with the reason if it can't (none kept under the name) |
 | `GET /console/…` | none | the console's files and settings, as on a node. `GET /` lists every database |
 
 A database's node starts when its first request comes. If it can't start, the request answers `404`
