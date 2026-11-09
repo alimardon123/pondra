@@ -208,7 +208,7 @@ impl Cluster {
     pub fn keep_alive(self: Arc<Self>, store: Store, lake: &str) {
         let marked = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
         let (me, m) = (self.clone(), marked.clone());
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             // (the claim marked it a moment ago: C5, a key at most once a second. A term taken back after a
             // restart was last marked before the restart, so it is marked a second in, not ten: invariant 17's
             // 30 s count from that mark)
@@ -236,7 +236,7 @@ impl Cluster {
             }
         });
         let bucket = crate::store::bucket_url(lake);
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             let mut cut = false;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -257,7 +257,7 @@ impl Cluster {
     /// Follower loop: heartbeat the leader; if it's gone for `LEASE`, claim the next term. `untaken`: its lake's bell for a
     /// flush the leader didn't take (`log::Kept::untaken`).
     pub fn follow(self: Arc<Self>, store: Store, untaken: Arc<tokio::sync::Notify>) {
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             let mut reached: Option<Instant> = None; // (since when we reach the bucket the leader says it can't)
             let mut missed = false; // (the last beat went unanswered)
             loop {
@@ -335,7 +335,7 @@ impl Cluster {
     /// Read-only nodes: no heartbeat, no vote, no takeover. They only notice when leadership
     /// moves, and restart to follow the new leader's commit stream (see `mirror`).
     pub fn watch_leader(self: Arc<Self>, store: Store, streamed: bool, down: Arc<std::sync::atomic::AtomicBool>) {
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             let mut gone = 0;
             loop {
                 // While the leader's commit stream is down, look for a new leader every second
@@ -454,7 +454,7 @@ fn inboxed(t: Term, may_lead: bool, node: Arc<crate::node_state::NodeState>) -> 
 /// answers loses its term to its followers (`follow`), and this node starts again.
 pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
     lake.caught.send_replace(false);
-    crate::panics::spawn(async move {
+    crate::spawns::spawn(async move {
         let (since, mut said) = (tokio::time::Instant::now(), 0);
         // (its last commit; a leader older than this one tells only its log's end, which a table's commit doesn't move)
         let ask = |path: &str| {
@@ -527,7 +527,7 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     let (held, mut to_ack) = tokio::sync::watch::channel((0u64, 0u64, 0u64)); // term, first, last
     let l = leader.clone();
     let node = lake.node.clone();
-    crate::panics::spawn(async move {
+    crate::spawns::spawn(async move {
         while to_ack.changed().await.is_ok() {
             let (term, first, upto) = *to_ack.borrow_and_update();
             let url = crate::tls::url(&format!("{l}/cluster/ack?from={me}&term={term}&first={first}&upto={upto}"));
@@ -570,7 +570,7 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
             }
         })
     };
-    crate::panics::spawn(members::follow(Arc::downgrade(&lake), open, frame, move || down.store(true, std::sync::atomic::Ordering::Relaxed), true));
+    crate::spawns::spawn(members::follow(Arc::downgrade(&lake), open, frame, move || down.store(true, std::sync::atomic::Ordering::Relaxed), true));
 }
 
 /// A client (a connection pool) for calls between nodes, sending `token` (none: unsigned) and who calls (ADR-039).

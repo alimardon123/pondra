@@ -307,6 +307,7 @@
   "POST /apply",
   "POST /capture",
   "POST /databases",
+  "POST /databases/{name}/undrop",
   "POST /delta-sharing/shares/{share}/schemas/{schema}/tables/{table}/query",
   "POST /files/{*path}",
   "POST /functions/{name}",

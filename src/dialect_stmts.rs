@@ -6,7 +6,8 @@
 //!
 //! A statement is matched by its words as tokens, so a string or a comment holding them is not:
 //! - Snowflake's and Spark's `DESCRIBE TABLE t`; Spark's `EXPLAIN EXTENDED`, Snowflake's `EXPLAIN USING TEXT`, MySQL's
-//!   `EXPLAIN FORMAT=JSON`; MySQL's, Snowflake's and Spark's `SHOW TABLES LIKE … / IN … / FROM …`;
+//!   `EXPLAIN FORMAT=JSON`; MySQL's, Snowflake's and Spark's `SHOW TABLES LIKE … / IN … / FROM …`; Databricks'
+//!   `SHOW TABLES DROPPED` and `SHOW VOLUMES …`, and Snowflake's `SHOW TABLES HISTORY` (Pondra's `pondra.dropped`);
 //! - SQL Server's `CREATE [NON]CLUSTERED INDEX`, `SET NOCOUNT ON` and its kind, `DECLARE @x`,
 //!   `CROSS APPLY` and `OUTER APPLY`, and `[name]` quoting (also of a `PIVOT`'s values, `IN ([paid], …)`);
 //! - MySQL's `SET @x = …`, `PREPARE p FROM '…'`, `DELETE t FROM t JOIN …`, `UPDATE t JOIN … SET …`, `REPLACE INTO`,
@@ -72,6 +73,7 @@ fn refusal(sql: &str) -> Option<String> {
     static LOOK: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(concat!(
             r"(?is)\b(?:desc|describe)\s+table\b|\bexplain\s+(?:extended|formatted|codegen|cost|using|format\s*=)|\bshow\s+(?:full\s+)?tables\s+(?:like|in|from)\b",
+            r"|\bshow\s+(?:terse\s+)?\w+\s+(?:dropped|history)\b|\bshow\s+volumes\b",
             r"|\b(?:non)?clustered\b|\bset\s+(?:@|\w+\s+(?:on|off)\b|identity_insert\b|statistics\b)|\bprepare\s+\w+\s+from\b|\bdeclare\s+@|\bdeclare\b[^;]*\bdefault\b",
             r"|\bdelete\s+\w+\s+from\b|\bupdate\b[^;]*\bjoin\b[^;]*\bset\b|\balter\s+table\b[^;]*\b(?:change|modify)\b|\b(?:cross|outer)\s+apply\b",
             r"|\]\s*\.|\.\s*\[|\[dbo\]|\b(?:from|join|into|update|table)\s+\[",
@@ -264,7 +266,19 @@ fn statement(s: &[Token]) -> Option<String> {
             }
         }
         "SHOW" => {
-            let at = if is(1, "FULL") { 2 } else { 1 };
+            let at = if is(1, "FULL") || is(1, "TERSE") { 2 } else { 1 };
+            // (Databricks' `SHOW TABLES DROPPED` and volumes, Snowflake's `SHOW TABLES HISTORY`: what a DROP keeps is listed
+            // in pondra.dropped, and UNDROP brings it back)
+            let kinds = w(at).unwrap_or_default();
+            let whose = if is(at + 1, "DROPPED") || kinds == "VOLUMES" { "Databricks'" } else { "Snowflake's" };
+            if kinds == "VOLUMES" {
+                let what = if is(at + 1, "DROPPED") { "SHOW VOLUMES DROPPED" } else { "SHOW VOLUMES" };
+                return Some(format!("{what} is {whose}: here a volume's files are the lake's own (files/), SELECT * FROM files() lists them, and SELECT * FROM pondra.dropped WHERE kind = 'file' those deleted, with the UNDROP FILE that brings each back"));
+            }
+            if is(at + 1, "DROPPED") || is(at + 1, "HISTORY") {
+                let how = w(at + 1).unwrap_or_default();
+                return Some(format!("SHOW {kinds} {how} is {whose}: SELECT * FROM pondra.dropped lists what a DROP keeps, with the UNDROP that brings each back"));
+            }
             let by = w(at + 1).filter(|_| is(at, "TABLES")).filter(|b| ["LIKE", "IN", "FROM"].contains(&b.as_str()))?;
             Some(format!("SHOW TABLES {by} … is MySQL's, Snowflake's and Spark's: SHOW TABLES lists them all, and SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE 'ord%' picks"))
         }
@@ -333,6 +347,11 @@ mod tests {
         assert!(said("explain format=json select 1").starts_with("EXPLAIN FORMAT=JSON is MySQL's: write EXPLAIN FORMAT pgjson query"));
         assert!(said("SHOW TABLES LIKE 'ORD%' IN SCHEMA PUBLIC").contains("information_schema.tables"));
         assert!(said("SHOW TABLES IN default LIKE 'orders*'").starts_with("SHOW TABLES IN …"));
+        assert_eq!(said("SHOW TABLES DROPPED IN sales"), "SHOW TABLES DROPPED is Databricks': SELECT * FROM pondra.dropped lists what a DROP keeps, with the UNDROP that brings each back");
+        assert!(said("show terse tables history in schema sales").starts_with("SHOW TABLES HISTORY is Snowflake's: SELECT * FROM pondra.dropped"));
+        assert!(said("SHOW SCHEMAS HISTORY").starts_with("SHOW SCHEMAS HISTORY is Snowflake's"));
+        assert!(said("SHOW VOLUMES DROPPED IN main.raw").starts_with("SHOW VOLUMES DROPPED is Databricks': here a volume's files are the lake's own (files/)"));
+        assert!(said("SHOW VOLUMES IN main.raw").contains("SELECT * FROM pondra.dropped WHERE kind = 'file'"));
         assert!(said("CREATE NONCLUSTERED INDEX ix ON t (a) INCLUDE (b)").starts_with("NONCLUSTERED INDEX is SQL Server's"));
         assert!(said("SET NOCOUNT ON").starts_with("SET NOCOUNT is SQL Server's"));
         assert_eq!(said("SET @min_amount := 50"), "SET @min_amount is MySQL's for a variable: here a variable is $min_amount = …, and $min_amount reads it");
@@ -402,7 +421,7 @@ mod tests {
     #[test]
     fn pondras_own_statements_are_left_as_they_are() {
         for sql in [
-            "DESCRIBE customers", "DESC customers", "EXPLAIN VERBOSE SELECT 1", "EXPLAIN FORMAT tree SELECT 1", "SHOW TABLES", "CREATE OR REPLACE VIEW v AS SELECT 1", "CREATE OR ALTER TABLE t (a INT)",
+            "DESCRIBE customers", "DESC customers", "EXPLAIN VERBOSE SELECT 1", "EXPLAIN FORMAT tree SELECT 1", "SHOW TABLES", "SHOW search_path", "SELECT 'show tables dropped' AS s", "CREATE OR REPLACE VIEW v AS SELECT 1", "CREATE OR ALTER TABLE t (a INT)",
             "CREATE UNIQUE INDEX i ON t (a)", "SET search_path = s", "SET TIME ZONE 'UTC'", "PREPARE p AS SELECT $1", "DECLARE $x = 5", "DECLARE $n BIGINT DEFAULT 3", "DECLARE PARAMETER $top BIGINT DEFAULT 3", "DECLARE c CURSOR FOR SELECT 1",
             "DECLARE c NO SCROLL CURSOR WITH HOLD FOR SELECT x DEFAULT FROM t", "DELETE FROM t USING o WHERE t.id = o.id", "UPDATE t SET a = 1 FROM o WHERE t.id = o.id",
             "UPDATE t SET a = (SELECT b FROM o JOIN p ON o.k = p.k LIMIT 1)", "ALTER TABLE t ALTER COLUMN change TYPE INT", "ALTER TABLE t RENAME COLUMN modify TO m",
