@@ -606,7 +606,7 @@ pub fn writer<L: Send + Sync + 'static>(app: &App, table: &'static str, make: cr
 
 /// A lake's log writers (its state, `lake_state.rs`: the history, the audit log, the run log): each one's task, and
 /// whether its node is stopping (`end_writers`). A writer holds its lake until it ends: its node's stop ends it, or a
-/// stop with no drain aborts it (`panics::abort_all`).
+/// stop with no drain aborts it (`spawns::abort_all`).
 pub struct Writers {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     ending: tokio::sync::watch::Sender<bool>,
