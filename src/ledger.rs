@@ -644,31 +644,43 @@ pub trait Holds: Send + Sync {
     fn capped(&self) -> bool { false }
 }
 
+/// A list of what holds room on a spill disk. Each is held weakly, so one that goes leaves it, and counted as it is now,
+/// so a look sees all of it once.
+#[derive(Default)]
+pub struct Room(Mutex<Vec<Weak<dyn Holds>>>);
+
+impl Room {
+    fn holds(&self, h: &Arc<dyn Holds>) { self.0.lock().unwrap_or_else(PoisonError::into_inner).push(Arc::downgrade(h)) }
+
+    fn room(&self) -> Vec<(Arc<dyn Holds>, u64)> {
+        let holders: Vec<Arc<dyn Holds>> = {
+            let mut room = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            room.retain(|h| h.strong_count() > 0);
+            room.iter().filter_map(Weak::upgrade).collect()
+        };
+        holders.into_iter().map(|h| { let held = h.held(); (h, held) }).collect() // (read after the lock is let go: a count may walk a folder)
+    }
+
+    fn others_hold(&self, me: &dyn Holds) -> u64 {
+        self.room().iter().filter(|(h, _)| !std::ptr::addr_eq(Arc::as_ptr(h), me as *const dyn Holds)).map(|(_, held)| held).sum()
+    }
+}
+
 // (the process's spill disk, one list of what holds room on it: a shuffle's pieces (`spill::Shuffles`), each lake's query
-// spills (`store::Spills`' disk manager), the lakes in memory (`memory_lake::Spilled`). Each is held weakly, so one that
-// goes leaves it, and counted as it is now, so a look sees all of it once)
-static ROOM: Mutex<Vec<Weak<dyn Holds>>> = Mutex::new(Vec::new());
+// spills (`store::Spills`' disk manager), the lakes in memory (`memory_lake::Spilled`))
+static ROOM: Room = Room(Mutex::new(Vec::new()));
 
 /// `h` holds room on the process's spill disk from now on, for as long as it lives.
-pub fn holds(h: &Arc<dyn Holds>) { ROOM.lock().unwrap_or_else(PoisonError::into_inner).push(Arc::downgrade(h)) }
+pub fn holds(h: &Arc<dyn Holds>) { ROOM.holds(h) }
 
 /// What holds room on the spill disk now, the gone ones dropped: each with what it holds (`Holds::held`, read once).
-pub fn room() -> Vec<(Arc<dyn Holds>, u64)> {
-    let holders: Vec<Arc<dyn Holds>> = {
-        let mut room = ROOM.lock().unwrap_or_else(PoisonError::into_inner);
-        room.retain(|h| h.strong_count() > 0);
-        room.iter().filter_map(Weak::upgrade).collect()
-    };
-    holders.into_iter().map(|h| { let held = h.held(); (h, held) }).collect() // (read after the lock is let go: a count may walk a folder)
-}
+pub fn room() -> Vec<(Arc<dyn Holds>, u64)> { ROOM.room() }
 
 /// The bytes everything holds on the spill disk now.
 pub fn room_held() -> u64 { room().iter().map(|(_, held)| held).sum() }
 
 /// The bytes everything but `me` holds on the spill disk now (`me` reads its own count, which changes as it reserves).
-pub fn others_hold(me: &dyn Holds) -> u64 {
-    room().iter().filter(|(h, _)| !std::ptr::addr_eq(Arc::as_ptr(h), me as *const dyn Holds)).map(|(_, held)| held).sum()
-}
+pub fn others_hold(me: &dyn Holds) -> u64 { ROOM.others_hold(me) }
 
 /// One lake's pool of query memory: `FairSpillPool`'s rules over the lake's share of its ledger's line (`Ledger`).
 #[derive(Debug)]
@@ -919,25 +931,28 @@ mod tests {
     use super::*;
 
     /// The spill disk is one list of what holds room on it: each holder counted as it is now, `others_hold` everything
-    /// but the one asking, and a holder that goes leaves the list. (Other tests' holders share the list: the sizes here
-    /// are past what any of them spills.)
+    /// but the one asking, and a holder that goes leaves the list. (A list of the test's own: the process's is every
+    /// test's, and a cap a test sets counts what is on it.)
     #[test]
     fn the_spill_disk_is_one_list_of_what_holds_room_on_it() {
         struct Fixed(u64);
         impl Holds for Fixed {
             fn held(&self) -> u64 { self.0 }
         }
+        let list = Room::default();
         let (big, small): (Arc<dyn Holds>, Arc<dyn Holds>) = (Arc::new(Fixed(5 << 40)), Arc::new(Fixed(7)));
-        holds(&big);
-        holds(&small);
-        let on = |h: &Arc<dyn Holds>| room().iter().any(|(r, n)| Arc::ptr_eq(r, h) && *n == h.held());
+        list.holds(&big);
+        list.holds(&small);
+        let room_held = || list.room().iter().map(|(_, held)| held).sum::<u64>();
+        let others_hold = |me: &dyn Holds| list.others_hold(me);
+        let on = |h: &Arc<dyn Holds>| list.room().iter().any(|(r, n)| Arc::ptr_eq(r, h) && *n == h.held());
         assert!(on(&big) && on(&small), "both are on the list, with what they hold");
         assert!(!big.capped() && !small.capped(), "they take no cap: with only such on the list (a page's lakes in memory), nothing looks at a disk");
-        assert!(room_held() >= (5 << 40) + 7);
-        assert!(others_hold(&*small) >= 5 << 40, "the small one sees the big one");
-        assert!(others_hold(&*big) < 5 << 40, "the big one doesn't count itself");
+        assert_eq!(room_held(), (5 << 40) + 7);
+        assert_eq!(others_hold(&*small), 5 << 40, "the small one sees the big one");
+        assert_eq!(others_hold(&*big), 7, "the big one doesn't count itself");
         drop(big);
-        assert!(others_hold(&*small) < 5 << 40, "a holder that goes leaves the list");
+        assert_eq!(others_hold(&*small), 0, "a holder that goes leaves the list");
         assert!(on(&small));
     }
 

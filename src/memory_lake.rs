@@ -323,6 +323,19 @@ impl Inner {
     #[cfg(not(test))]
     fn setting(&self) -> Option<f64> { crate::store::spill_gb() }
 
+    /// What the process's other holders keep on its spill disk (`ledger::others_hold`). A test's cap counts its lake
+    /// alone: the process's list holds the other tests' lakes, run at once.
+    #[cfg(test)]
+    fn others(&self) -> u64 {
+        match self.cap {
+            Some(_) => 0,
+            None => crate::ledger::others_hold(&*self.spilled),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn others(&self) -> u64 { crate::ledger::others_hold(&*self.spilled) }
+
     /// Adds `bytes` to what is reserved for spills in flight, if they fit; else says why not. The one check for
     /// `reserve` and `Reserved::grow`. Under the setting, everything this process spills must stay within it: the
     /// others' bytes (`ledger::others_hold`) and the lakes' (`on_disk` and `reserved`). Without it, the bytes in flight
@@ -335,7 +348,7 @@ impl Inner {
             return Err(format!("the disk a lake in memory spills to has {} MB free, and a lake keeps {} MB", free >> 20, keep >> 20));
         }
         let gb = self.setting();
-        let others = gb.map_or(0, |_| crate::ledger::others_hold(&*self.spilled)); // (the queries' and the shuffles' spills count under the setting only)
+        let others = gb.map_or(0, |_| self.others()); // (the queries' and the shuffles' spills count under the setting only)
         let fits = |reserved: u64| {
             let room = crate::machine::process().space(&disk.space.dir).map(|(free, total)| (free.saturating_sub(reserved), total));
             crate::store::piece_fits(gb, others + self.spilled.on_disk.load(SeqCst) + reserved, bytes, room)
@@ -345,7 +358,7 @@ impl Inner {
             .fetch_update(SeqCst, SeqCst, |reserved| fits(reserved).then_some(reserved + bytes))
             .map(|_| ())
             .map_err(|_| match gb {
-                Some(gb) => format!("this process's spills may take {:.1} MB of disk and hold {} MB there", gb * 1024.0, (crate::ledger::others_hold(&*self.spilled) + self.spilled.total()) >> 20),
+                Some(gb) => format!("this process's spills may take {:.1} MB of disk and hold {} MB there", gb * 1024.0, (self.others() + self.spilled.total()) >> 20),
                 None => format!("the disk a lake in memory spills to has no room for {} MB more beside the spills in flight", bytes >> 20),
             })
     }

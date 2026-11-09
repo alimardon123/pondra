@@ -28,6 +28,7 @@ pub static DELTA: crate::registry::BuiltIn = crate::registry::BuiltIn {
         r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES);
         r.section_mut::<crate::records::Prefixes>().add(crate::delta::PREFIXES);
         r.section_mut::<crate::lake_state::Registered>().add::<Logs>();
+        r.section_mut::<crate::lake_state::Registered>().add::<crate::delta::Publishing>(); // (its publishing's turn, and what it last published)
     },
 };
 
