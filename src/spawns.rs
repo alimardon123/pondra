@@ -4,8 +4,8 @@
 //! queries' runtime the same ([`Tasks::aside`]). A node's stop ends them all ([`Tasks::abort_all`], ADR-061 §4). Also here:
 //! the memory watch's thread ([`alone`]), a close the stop must not cut ([`untracked`]) and the runtimes ([`runtime`]).
 //! Every floor starts its tasks here, so it is the base's. The requests' half (a door's panic answered as an error, the
-//! memory watch's stops) is `panics.rs`'s, in the engine. ([`spawn`], [`task`] and [`abort_all`] are the process's list
-//! that the loops with no node in hand still use: step 5 piece 7b's second half moves them to the node's.)
+//! memory watch's stops) is `panics.rs`'s, in the engine. A loop that serves the node's statics, with no node in hand, is
+//! theirs ([`for_statics`]): it ends as they are set back.
 use futures::FutureExt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -13,7 +13,7 @@ use std::panic::AssertUnwindSafe;
 /// Start a loop that must keep its pace whatever the queries do (the memory watch) on a thread of its own: on the
 /// node's runtime, a query's partitions busy on every core held its timer back past the moment it had to look (the
 /// hot memory-line check passed its line now and then). It is the process's, not a node's (`oom::Watch`): no node's
-/// stop ends it, as [`task`]'s are ended.
+/// stop ends it, as a node's [`Tasks`] are ended.
 pub fn alone<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -53,40 +53,26 @@ pub fn runtime() -> tokio::runtime::Builder {
     b
 }
 
-/// Start a loop the node can't do without: if it panics, the node stops.
-pub fn spawn<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
-    tracked(tokio::spawn(async move {
-        match AssertUnwindSafe(f).catch_unwind().await {
-            Ok(v) => v,
-            Err(p) => {
-                // (a library's node restarting in place unwinds the task that asked for it, and its supervisor has been told
-                // already: that is no stop. Otherwise the node stops; in a library `stop` returns and the panic unwinds on)
-                if p.downcast_ref::<crate::lifecycle::Restarting>().is_none() {
-                    crate::stop_node(format!("a panic in the node's own work: {}", said(&*p)));
-                }
-                std::panic::resume_unwind(p)
-            }
-        }
-    }))
-}
-
-/// Start a task of the node's whose panic is its own (a connection's, work beside a request): what
-/// `tokio::spawn` was, but ended with the node (`tools/per_node_check.py` fails a `tokio::spawn`).
-pub fn task<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
-    tracked(tokio::spawn(f))
-}
-
-/// Start a task the node's stop must not end (`abort_all`), which ends by itself: a catalog's close, or a guest's open that
-/// closes after (`node.rs`). Cut midway, a close leaves its flush half done and an open its reader's poller running for
-/// ever. Anything else starts with [`spawn`] or [`task`].
+/// Start a task the node's stop must not end (its list's `abort_all`), which ends by itself: a catalog's close, or a guest's
+/// open that closes after (`node.rs`). Cut midway, a close leaves its flush half done and an open its reader's poller
+/// running for ever.
 pub fn untracked<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
     tokio::spawn(f)
 }
 
-// What this node started (`spawn`, `task`, `aside`), so a node stopped in a process ends it all
-// (ADR-061 §4): the runtime outlives the node, and a loop left on it would go on writing its lake.
-crate::per_node!(static STARTED: std::sync::Mutex<Started> = std::sync::Mutex::new(Started { tasks: Vec::new(), prune_at: 0 }));
+/// Start a loop that serves the node's statics (`per_node!`: its sessions' reaper, its Python pools', its sign-in keys'
+/// refresh, its Kafka groups' rebalance), whose callers have no node in hand: it is the statics' own, and ends as they are
+/// set back (`reset::reset`, a node's stop's last step). It runs as nobody (no principal, not the node's: it reads no
+/// table), and its panic is its own.
+pub fn for_statics<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
+    let t = tokio::spawn(f);
+    STATICS.lock().unwrap_or_else(|e| e.into_inner()).track(t.abort_handle());
+    t
+}
 
+crate::per_node!(static STATICS: std::sync::Mutex<Started> = Default::default(); clear = |s| s.lock().unwrap_or_else(|e| e.into_inner()).end());
+
+/// What a list started and hasn't seen end (a node's [`Tasks`], the statics' loops).
 #[derive(Default)]
 struct Started {
     tasks: Vec<tokio::task::AbortHandle>,
@@ -95,28 +81,27 @@ struct Started {
     prune_at: usize,
 }
 
-fn tracked<T>(t: tokio::task::JoinHandle<T>) -> tokio::task::JoinHandle<T> {
-    let mut started = STARTED.lock().unwrap_or_else(|e| e.into_inner());
-    if started.tasks.len() >= started.prune_at {
-        started.tasks.retain(|h| !h.is_finished());
-        started.prune_at = 64.max(2 * started.tasks.len());
-    }
-    started.tasks.push(t.abort_handle());
-    t
-}
-
-/// Ends every task this node started (`Node::stop`, before its catalog closes and its term is given
-/// back: a keep-alive left running would mark it alive again), but the one asking.
-/// (On a page a task has no id, and the one asking is the page's own call, not a task: every one ends.)
-pub fn abort_all() {
-    #[cfg(not(target_arch = "wasm32"))]
-    let me = tokio::task::try_id();
-    for t in std::mem::take(&mut STARTED.lock().unwrap_or_else(|e| e.into_inner()).tasks) {
-        #[cfg(not(target_arch = "wasm32"))]
-        if Some(t.id()) == me {
-            continue;
+impl Started {
+    fn track(&mut self, t: tokio::task::AbortHandle) {
+        if self.tasks.len() >= self.prune_at {
+            self.tasks.retain(|h| !h.is_finished());
+            self.prune_at = 64.max(2 * self.tasks.len());
         }
-        t.abort();
+        self.tasks.push(t);
+    }
+
+    /// Ends every one but the task asking. (On a page a task has no id, and the one asking is the page's own call, not a
+    /// task: every one ends.)
+    fn end(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let me = tokio::task::try_id();
+        for t in std::mem::take(&mut self.tasks) {
+            #[cfg(not(target_arch = "wasm32"))]
+            if Some(t.id()) == me {
+                continue;
+            }
+            t.abort();
+        }
     }
 }
 
@@ -163,9 +148,11 @@ pub trait Carry: Send + 'static {
 
 /// What a node started, so its stop ends it all (ADR-061 §4: the runtime outlives the node, and a loop left on it would go
 /// on writing its lake). Its two ways to start a task say whose work it is, and the compiler checks every site says one.
+/// A clone is the same list (a loop that starts tasks of its own keeps one).
+#[derive(Clone)]
 pub struct Tasks {
     life: crate::lifecycle::Life, // (what a vital panic stops: the node's host's, or a page's member)
-    started: std::sync::Mutex<Started>,
+    started: std::sync::Arc<std::sync::Mutex<Started>>,
 }
 
 impl Tasks {
@@ -211,29 +198,13 @@ impl Tasks {
     }
 
     fn track<T>(&self, t: tokio::task::JoinHandle<T>) -> tokio::task::JoinHandle<T> {
-        let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
-        if started.tasks.len() >= started.prune_at {
-            started.tasks.retain(|h| !h.is_finished());
-            started.prune_at = 64.max(2 * started.tasks.len());
-        }
-        started.tasks.push(t.abort_handle());
+        self.started.lock().unwrap_or_else(|e| e.into_inner()).track(t.abort_handle());
         t
     }
 
     /// Ends every task this node started, but the one asking (`Node::stop`, before its catalog closes and its term is
-    /// given back: a keep-alive left running would mark it alive again). (On a page a task has no id, and the one asking
-    /// is the page's own call, not a task: every one ends.)
-    pub fn abort_all(&self) {
-        #[cfg(not(target_arch = "wasm32"))]
-        let me = tokio::task::try_id();
-        for t in std::mem::take(&mut self.started.lock().unwrap_or_else(|e| e.into_inner()).tasks) {
-            #[cfg(not(target_arch = "wasm32"))]
-            if Some(t.id()) == me {
-                continue;
-            }
-            t.abort();
-        }
-    }
+    /// given back: a keep-alive left running would mark it alive again).
+    pub fn abort_all(&self) { self.started.lock().unwrap_or_else(|e| e.into_inner()).end() }
 }
 
 /// The node's own work, as a [`Carry`] ([`Tasks::aside`] of a view's run): [`as_node`].

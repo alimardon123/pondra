@@ -102,7 +102,7 @@ struct Broker {
 
 /// Answer Kafka clients on `addr`; tell them to come back to `advertise` (host:port).
 pub async fn serve(app: App, addr: String, advertise: String) -> Result<()> {
-    let mut doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Kafka).await?; // (TLS too: `tls.rs`)
+    let mut doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Kafka, &app.lake.node.tasks, crate::auth::Door).await?; // (TLS too: `tls.rs`)
     let (host, port) = advertise.rsplit_once(':').ok_or_else(|| anyhow!("--kafka-advertise is host:port"))?;
     let id = (advertise.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) & 0x7fff_ffff) as i32; // stable per address
     let me = Arc::new(Broker { id, host: host.into(), port: port.parse()? });
@@ -1278,7 +1278,7 @@ impl Group {
         (self.joining, self.synced, self.round) = (true, false, self.round + 1);
         self.members.values_mut().for_each(|m| m.joined = false);
         let (group, round, start) = (group.to_string(), self.round, std::time::Instant::now());
-        crate::spawns::task(async move {
+        crate::spawns::for_statics(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 let mut groups = GROUPS.lock().unwrap();

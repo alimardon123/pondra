@@ -285,10 +285,6 @@ mod rules;
 /// their function sets in this order, each seeing the ones before it, and
 /// where two name one function the later one's stays: Spark's first, so Pondra's own and Postgres's stay where Spark
 /// has the name too; MATCH_RECOGNIZE's after the ones its DEFINEs may call.
-/// A vital task's panic (`spawns::spawn`) stops the node with its host's stop (`node::stop`). The base's spawns name no
-/// host, so the crate's root joins the two, as it joins the registry to the extensions (`built_in`).
-#[cfg(feature = "lake")]
-pub(crate) fn stop_node(why: String) { node::stop(why) }
 
 pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
     static BUILT_IN: &[&dyn registry::Extension] = &[

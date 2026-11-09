@@ -670,7 +670,7 @@ pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) 
     let node = crate::node_state::NodeState::new(life.clone());
     let here = node.clone(); // (what a failed open ends: the tasks it started, `end_page`)
     let store = crate::store::counted(crate::memory_lake::store(&url), &node.metrics); // (its term's claims and marks the page's: `Counted`)
-    let lead = if owned { crate::members::Alone::lead_owned(&store).await } else { crate::members::Alone::lead(&store).await };
+    let lead = if owned { crate::members::Alone::lead_owned(&store, &node.tasks).await } else { crate::members::Alone::lead(&store, &node.tasks).await };
     let (alone, marks) = match lead {
         Ok(led) => led,
         Err(e) => {
@@ -709,7 +709,6 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
         follow.abort(); // (the node's stream ends as the page closes, not at the node's next commit)
     }
     node.tasks.abort_all();
-    crate::spawns::abort_all(); // (what is still started on the process's list: step 5 piece 7b's second half moves it)
     if let Some(lake) = lake {
         let _ = lake.cat.close().await;
     }
@@ -878,8 +877,9 @@ mod tests {
     /// sweep would read every table inside a statement's count). The returned mark is aborted by the caller.
     async fn lake_app() -> (crate::app::App, tokio::task::JoinHandle<()>) {
         let url = format!("memory://catalog-counts-{}", uuid::Uuid::new_v4().simple());
-        let (alone, marks) = crate::members::Alone::lead(&crate::memory_lake::store(&url)).await.unwrap();
-        let lake = crate::store::Lake::open(&url, true, false, super::native(true)).await.unwrap(); // (a guest's: `node::start_app` starts no loops)
+        let node = super::native(true);
+        let (alone, marks) = crate::members::Alone::lead(&crate::memory_lake::store(&url), &node.tasks).await.unwrap();
+        let lake = crate::store::Lake::open(&url, true, false, node).await.unwrap(); // (a guest's: `node::start_app` starts no loops)
         let app = super::start_app(lake, alone, None, &super::Start::default()).await.unwrap();
         (app, marks)
     }

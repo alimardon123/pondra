@@ -184,8 +184,8 @@ pub async fn mark_alive(store: &Store, n: u64) -> Result<()> {
 
 /// The leader of term `n` marks it alive every 10 s, and whenever the bell rings (`listen`), until the task ends
 /// (`write::lead`, a backup taken here, and a guest that leads: the node's stop ends it with its other tasks, before it gives its term back).
-pub fn mark_every(store: Store, n: u64) -> tokio::task::JoinHandle<()> {
-    crate::spawns::task(async move {
+pub fn mark_every(tasks: &crate::spawns::Tasks, store: Store, n: u64) -> tokio::task::JoinHandle<()> {
+    tasks.spawn_node(crate::spawns::Vital::Own, async move {
         let (mut due, mut bell) = (Instant::now() + Duration::from_secs(10), None);
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -468,7 +468,8 @@ mod tests {
         let store: Store = Arc::new(object_store::memory::InMemory::new());
         let t = elsewhere(9_001, true);
         mark_alive(&store, 9_001).await.unwrap();
-        let marks = mark_every(store.clone(), 9_001); // (its first look counts as a ring: a mark a second in)
+        let node = crate::node_state::NodeState::unhosted();
+        let marks = mark_every(&node.tasks, store.clone(), 9_001); // (its first look counts as a ring: a mark a second in)
         assert!(!deaf(&store, &t).await);
         assert!(alive(&store, &t).await);
         let rang = (tokio::time::Instant::now(), bell(&store).await);
