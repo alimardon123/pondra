@@ -307,6 +307,8 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         #[cfg(feature = "lake")]
         &apply::PROJECT,
         #[cfg(feature = "lake")]
+        &sso::SSO,
+        #[cfg(feature = "lake")]
         &udf::UDF,
         #[cfg(feature = "lake")]
         &pyfn::PYTHON,

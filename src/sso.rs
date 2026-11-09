@@ -215,7 +215,7 @@ pub async fn create(lake: &Lake, name: String, p: Provider, replace: bool, if_no
     let mut puts = vec![(key(&name), json(&p))];
     puts.extend(crate::users::signed_mark(lake).await?);
     lake.cat.commit(puts, &[]).await?;
-    forget();
+    forget(lake);
     remember(&p.issuer, Ok(found));
     let mut out = j!({"identity_provider": name, "issuer": p.issuer, "keys": keys});
     if open {
@@ -231,29 +231,38 @@ pub async fn drop(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
         return Ok(j!({"identity_provider": name, "dropped": false}));
     }
     lake.cat.commit(vec![], &[key(name)]).await?;
-    forget();
+    forget(lake);
     Ok(j!({"identity_provider": name, "dropped": true}))
 }
 
 /// What this node worked out from the providers goes at once (elsewhere, within `users::fresh`'s second).
-fn forget() {
-    ALL.lock().unwrap().clear();
-    crate::users::forget();
+fn forget(lake: &Lake) {
+    if let Ok(p) = lake.state::<Providers>() {
+        *p.0.lock().unwrap() = None;
+    }
+    crate::users::forget(lake);
 }
 
-crate::per_node!(
-    /// The lake's providers as of a catalog version (`users::fresh`): every sign-in by token reads them.
-    static ALL: Mutex<HashMap<String, (Option<u64>, Instant, Arc<Vec<(String, Provider)>>)>> = Default::default());
+/// The lake's identity providers as of a catalog version (`users::fresh`): every sign-in by token reads them.
+#[derive(Default)]
+pub struct Providers(Mutex<Option<(Option<u64>, Instant, Arc<Vec<(String, Provider)>>)>>);
+impl crate::lake_state::LakeState for Providers { const NAME: &'static str = "sso"; const ABOUT: &'static str = "its identity providers, as of a catalog version"; fn make() -> Self { Providers::default() } }
+
+/// Identity providers (ADR-074): the lake's providers are a state of the lake (`Providers`).
+pub static SSO: crate::registry::BuiltIn = crate::registry::BuiltIn { name: "sso", requires: &[], register: |r| r.section_mut::<crate::lake_state::Registered>().add::<Providers>() };
 
 /// The lake's providers, by name.
 pub async fn all(lake: &Lake) -> Result<Arc<Vec<(String, Provider)>>> {
     let version = lake.cat.version();
-    if let Some(c) = ALL.lock().unwrap().get(&lake.url).filter(|c| crate::users::fresh(lake, version, c.0, c.1)) {
-        return Ok(c.2.clone());
+    let providers = lake.state::<Providers>().ok(); // (none: no cache, the providers are read each time)
+    if let Some(c) = providers.as_ref().and_then(|p| p.0.lock().unwrap().clone()).filter(|c| crate::users::fresh(lake, version, c.0, c.1)) {
+        return Ok(c.2);
     }
     let found: Vec<(String, Provider)> = lake.cat.scan::<Provider>("ip/", "ip0").await?.into_iter().map(|(k, p)| (k[3..].to_string(), p)).collect();
     let found = Arc::new(found);
-    ALL.lock().unwrap().insert(lake.url.clone(), (version, Instant::now(), found.clone()));
+    if let Some(p) = &providers {
+        *p.0.lock().unwrap() = Some((version, Instant::now(), found.clone()));
+    }
     Ok(found)
 }
 
