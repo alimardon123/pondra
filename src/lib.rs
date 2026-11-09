@@ -108,6 +108,7 @@ mod pg_trace;
 pub mod pg_bytea;
 mod lifted;
 mod one_row;
+mod set_all;
 mod optimize;
 mod or_ranges;
 mod zeros_in;
@@ -149,6 +150,8 @@ mod table_record;
 #[cfg(feature = "lake")] mod auth;
 #[cfg(feature = "lake")] mod rights; // (what a principal may do, decided in one place: step 6)
 #[cfg(feature = "lake")] mod budget;
+#[cfg(feature = "lake")] mod buckets; // (what opens a lake's bucket: the hosts fill it, `hosted`)
+#[cfg(feature = "lake")] mod hosted;
 #[cfg(feature = "lake")] mod byte_range;
 #[cfg(feature = "lake")] mod cache;
 #[cfg(feature = "lake")] mod catalogs;
@@ -243,6 +246,7 @@ mod table_record;
 #[cfg(feature = "doors")] mod project;
 #[cfg(feature = "lake")] mod protect;
 #[cfg(feature = "lake")] mod query;
+#[cfg(feature = "lake")] mod readings;
 #[cfg(feature = "lake")] mod read_iceberg;
 #[cfg(feature = "lake")] mod ranges;
 #[cfg(feature = "lake")] mod pyfn;
@@ -333,6 +337,8 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &udf::UDF,
         #[cfg(feature = "lake")]
         &pyfn::PYTHON,
+        #[cfg(feature = "lake")]
+        &hosted::HOSTED,
     ];
     BUILT_IN
 }

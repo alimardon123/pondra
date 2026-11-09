@@ -282,7 +282,7 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, by: Option<
     if app.members.cut_off() {
         return Err(E::refusal("57P03", crate::members::CUT_OFF_SAYS.into())); // (cannot_connect_now: every door's clients retry elsewhere)
     }
-    let (class, start, quota) = (class(sql), Instant::now(), crate::users::quota());
+    let (class, start, quota) = (class(sql), Instant::now(), crate::users::quota(&app.lake));
     let mut stopped = Stopped(Some((app, by, class, sql, start)));
     let ((out, note), unseen) = crate::rights::noting(crate::history::noted(crate::ext::rooted(&app.lake.url, INSIDE.scope((), crate::authored::door(sql, async {
         let _turn = quota.turn().await.map_err(|m| E::refusal("53000", m))?; // (insufficient_resources)

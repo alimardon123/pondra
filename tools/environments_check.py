@@ -194,6 +194,13 @@ def environments_check(bin, work, port, root):
                 return v
             time.sleep(0.5)
 
+    def same(what, got, want):
+        """`got == want`; when not, the run's log says what differs first (these checks compare whole answers)."""
+        if got != want:
+            first = [(i, g, w) for i, (g, w) in enumerate(zip(got, want)) if g != w][:3]
+            print(f"{what}: {len(got)} rows, {len(want)} wanted; the first that differ (index, got, wanted): {first}", file=sys.stderr)
+        return got == want
+
     checks = {}
     # prod: files merged and purged, rows still in the log, changed rows, a keyed table, a view, a task,
     # a secret and a workspace file.
@@ -234,15 +241,18 @@ def environments_check(bin, work, port, root):
         len([k for k in keys(dev_dir) if "/cluster/term/" in k]) == 1
     checks["CREATE DATABASE dev CLONE prod copies no file (the log tail and the workspace only)"] = \
         len(copied) == 0 and len(keys(dev_dir)) > 0 and len(parquet(prod_dir)) == files_before
-    checks["prod reads dev at once: every row as prod had it, ids and versions too (the log tail too)"] = \
-        until(lambda: rows(prod, every.replace("sales.orders", "dev.sales.orders")) == before) is True \
-        and rows(prod, keyed.replace(" k ", " dev.k ")) == before_k and rows(prod, "SELECT odd, n, s FROM dev.sales.totals ORDER BY odd") == totals
+    at_once = until(lambda: rows(prod, every.replace("sales.orders", "dev.sales.orders")) == before) is True
+    if not at_once:
+        same("prod's read of dev.sales.orders", rows(prod, every.replace("sales.orders", "dev.sales.orders")), before)
+    checks["prod reads dev at once: every row as prod had it, ids and versions too (the log tail too)"] = at_once \
+        and same("prod's read of dev.k", rows(prod, keyed.replace(" k ", " dev.k ")), before_k) \
+        and same("prod's read of dev.sales.totals", rows(prod, "SELECT odd, n, s FROM dev.sales.totals ORDER BY odd"), totals)
     listed = [(r["name"], r.get("base"), r["branches"]) for r in q("SELECT name, base, branches FROM pondra.databases ORDER BY name")]  # (a NULL is left out)
     checks["pondra.databases names dev's base, and prod's branch"] = listed == [("dev", "prod", 0), ("prod", None, 1)]
 
     # dev's own node: its writes are its own; what reaches the outside starts suspended.
     dev = Node(bin, dev_dir, port + 1, work, "--retain-secs", "1", env=env).start()
-    checks["dev answers as prod did, from its own node"] = rows(dev, every) == before and rows(dev, keyed) == before_k
+    checks["dev answers as prod did, from its own node"] = same("dev's sales.orders", rows(dev, every), before) and same("dev's k", rows(dev, keyed), before_k)
     shared = "SELECT (SELECT count(*) FROM pondra.shares) AS shares, (SELECT count(*) FROM pondra.recipients) AS recipients"
     checks["dev's task starts suspended, and no secret, share or recipient came with it"] = rows(dev, "SELECT name, state FROM pondra.tasks") == [("nightly", "suspended")] \
         and rows(dev, "SELECT count(*) FROM secrets()") == [(0,)] and rows(prod, "SELECT count(*) FROM secrets()") == [(1,)] \
@@ -297,7 +307,8 @@ def environments_check(bin, work, port, root):
     dev.stop()
     dev = Node(bin, dev_dir, port + 1, work, "--retain-secs", "1", env=env).start()  # (nothing of prod's files in its memory)
     checks["while prod merges, purges, drops and lets its past go, dev's files stay: dev answers as before after a restart"] = \
-        rows(dev, every) == dev_rows and rows(dev, keyed) == before_k + [(rows(dev, "SELECT _row_id FROM k WHERE id = 4")[0][0], 4, "dev")]
+        same("dev's sales.orders after a restart", rows(dev, every), dev_rows) \
+        and same("dev's k after a restart", rows(dev, keyed), before_k + [(rows(dev, "SELECT _row_id FROM k WHERE id = 4")[0][0], 4, "dev")])
 
     # REFRESH: a table and what follows it, as prod has it now (its log tail too); dev's own rows of
     # it go; what dev writes after is newer (an upsert wins, row ids stay unique).

@@ -1562,10 +1562,12 @@ pub async fn session_for(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
 /// statement did before `named_records`: the oracle its test checks against).
 async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>, scan: bool, scope: &crate::rights::Scope) -> Result<SessionContext> {
     use crate::text::{mentions, split, PUBLIC};
+    let reading = lake.state::<crate::readings::Readings>()?.begin(); // (from before its catalog is read: the files it lists stay while it reads, `readings.rs`)
     lake.caught_up().await?; // (a node that just started: not from an older catalog than its leader's)
     let upto = upto.or_else(crate::txn::snapshot); // (in a transaction: as of its snapshot, its writes over it)
     use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
     let ctx = crate::set::apply(lake.session()).await?; // (the session's `SET datafusion.…`)
+    ctx.state_ref().write().config_mut().set_extension(Arc::new(reading)); // (held by the session, and by every task planned from it)
     scope.onto(&ctx); // (whose it is, for everything planned in it: `Scope::of_session`)
     crate::udf::register(lake, &ctx).await?; // the lake's own functions (`POST /functions/…`)
     crate::pyfn::register(lake, &ctx).await?; // …and its Python functions (`CREATE FUNCTION … LANGUAGE python`)

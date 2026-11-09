@@ -13,10 +13,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::disk_manager::{DiskManager, DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::spill_file::{SpillFile, TempFileFactory};
-use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
-use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
-use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
-use object_store::ClientConfigKey;
+use object_store::aws::AmazonS3Builder;
 #[cfg(not(target_arch = "wasm32"))]
 use object_store::local::LocalFileSystem;
 use object_store::{path::Path, prefix::PrefixStore, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
@@ -1508,12 +1505,16 @@ pub fn client_until(job: &str) -> Option<u64> {
     (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| digits.parse().unwrap_or(u64::MAX))
 }
 
-/// The retry window (`job_kept`): twice the lease (`locks::lease`, PONDRA_LOCK_LEASE_SECS, 60 s by
-/// default), and at least a minute, so 120 s by default. It has no setting of its own.
+/// The retry window (`job_kept`): twice the lease (`lock_lease`, 60 s by default), and at least a minute, so 120 s by
+/// default. It has no setting of its own.
 pub fn retry_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| 2 * crate::locks::lease().as_secs().max(60) * 1000)
+    *MS.get_or_init(|| 2 * lock_lease().as_secs().max(60) * 1000)
 }
+
+/// How long a row lock is held without its holder saying it still holds it (`PONDRA_LOCK_LEASE_SECS`, ADR-067): the
+/// locks' lease (`locks::lease`), and the base of the retry window (`retry_ms`).
+pub fn lock_lease() -> std::time::Duration { crate::env::secs("PONDRA_LOCK_LEASE_SECS") }
 pub fn data_key(seg: u64) -> String { format!("d/{seg:020}") } // small segments live inside the catalog
 pub fn json<T: Serialize>(v: &T) -> Vec<u8> { serde_json::to_vec(v).expect("serializable") }
 
@@ -1827,6 +1828,40 @@ impl crate::registry::Section for OpenHooks {
     }
 }
 
+/// What the engine gives every lake, registered by it (`engine::ENGINE`): a lake's sessions (`session`, with every
+/// function set: `engine::session`), what a page's sessions add (`on_a_page`: `in_task::planned`), and the memory watch's
+/// lines and wake (`roots`, `wake`: `oom.rs`). With none (a registry without the engine), a session is DataFusion's own,
+/// no line is known, and nothing is woken.
+#[derive(Default)]
+pub struct EngineHooks {
+    pub session: Option<fn(datafusion::prelude::SessionConfig, Arc<RuntimeEnv>) -> datafusion::prelude::SessionContext>,
+    pub on_a_page: Option<fn(datafusion::prelude::SessionContext) -> datafusion::prelude::SessionContext>,
+    pub roots: Option<fn() -> (Option<usize>, Option<usize>)>,
+    pub wake: Option<fn()>,
+}
+
+impl crate::registry::Section for EngineHooks {
+    const NAME: &'static str = "engine hooks";
+}
+
+fn engine() -> Option<&'static EngineHooks> { crate::registry::get().find::<EngineHooks>() }
+
+/// Open-format files an extension publishes in a lake (Delta's logs, Iceberg's metadata): written, never read, so no
+/// disk keeps them (`Lake::put`) and the orphan sweep leaves them (`tier::sweep`). Each extension adds its own.
+#[derive(Default)]
+pub struct Published(Vec<(&'static str, fn(&str) -> bool)>);
+
+impl Published {
+    pub fn add(&mut self, name: &'static str, is: fn(&str) -> bool) { self.0.push((name, is)) }
+}
+
+impl crate::registry::Section for Published {
+    const NAME: &'static str = "published files";
+}
+
+/// Is this one of a lake's published open-format files (`Published`)?
+pub fn published(path: &str) -> bool { crate::registry::get().find::<Published>().is_some_and(|p| p.0.iter().any(|(_, is)| is(path))) }
+
 /// `_base/<id>/rest` as (id, rest): a branch's path to a file of its base, which the lake reads there (`Lake::full`,
 /// ADR-047; `branch::rebase` makes one).
 pub fn base_path(path: &str) -> Option<(&str, &str)> { path.strip_prefix("_base/")?.split_once('/') }
@@ -1911,8 +1946,9 @@ fn root_line() -> usize {
     }
 }
 
-/// The memory watch's lines for the process (`oom::roots`): its trim line, and a third of its memory where no stop line watches it.
-fn roots() -> (Option<usize>, Option<usize>) { crate::oom::roots() }
+/// The memory watch's lines for the process (`oom::roots`, through `EngineHooks`): its trim line, and a third of its memory
+/// where no stop line watches it.
+fn roots() -> (Option<usize>, Option<usize>) { engine().and_then(|e| e.roots).map_or((None, None), |roots| roots()) }
 
 /// The process's whole line, for every node's queries and caches together (`ledger::Root`): the memory watch's trim line
 /// (`oom::trim_line`, of the machine's memory or `PONDRA_MEMORY_MAX_GB`), or none (`usize::MAX`) where it isn't known.
@@ -2006,18 +2042,17 @@ pub fn open_store(url: &str, reaches: Option<&crate::reaches::Reaches>) -> Resul
         let held = crate::memory_lake::store(&url);
         return Ok((url.clone(), held.clone(), Some((url, held)))); // (DataFusion reads its files at their URLs, as a bucket's)
     }
-    #[cfg(feature = "doors")]
     if served(url) {
-        // (the store is the node that holds the lake's, read through its door: `served.rs`; nothing is connected yet)
+        // (the store is the node that holds the lake's, read through its door: `served.rs`, as the hosts add it; nothing is
+        // connected yet)
+        let Some(door) = crate::buckets::get().served else {
+            anyhow::bail!("{url}: this form reads no lake through a node's door (pondra://): open its bucket or folder instead");
+        };
         let at = url.trim_start_matches("pondra://").trim_end_matches('/');
         anyhow::ensure!(!at.is_empty() && !at.contains('/'), "{url}: a node serves one lake, named by pondra://host:port alone");
         let url = format!("pondra://{at}");
-        let store: Store = Arc::new(crate::served::Served::new(at));
+        let store: Store = door(at);
         return Ok((url.clone(), store.clone(), Some((url, store)))); // (the lake and its bucket are one, as in memory)
-    }
-    #[cfg(not(feature = "doors"))]
-    if served(url) {
-        anyhow::bail!("{url}: this form reads no lake through a node's door (pondra://): open its bucket or folder instead");
     }
     if place(url)? == Place::Folder {
         return folder(url);
@@ -2027,17 +2062,8 @@ pub fn open_store(url: &str, reaches: Option<&crate::reaches::Reaches>) -> Resul
     let root = format!("{scheme}://{bucket}");
     let reach = reaches.and_then(|r| r.of(url));
     let params = reach.as_ref().and_then(|r| r.params.as_ref());
-    // Idle connections are dropped after 15 s rather than reused: through proxies and NATs that
-    // silently forget idle connections, a reused one hung a PUT for the full 30 s timeout on R2.
-    let (idle, after) = (ClientConfigKey::PoolIdleTimeout, "15s");
-    // Every request to the bucket takes a turn of its budget, retries too (`budget.rs`, C5).
-    let turns = || crate::budget::Budget::of(&root);
-    let mut whole: Store = match (params, scheme) {
-        (Some(_), _) => crate::ext::build(&url::Url::parse(&root)?, params, crate::ext::For::Lake)?,
-        (None, "s3") => Arc::new(with_kms(AmazonS3Builder::from_env(), sse_kms_from_env()).with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
-        (None, "gs") => Arc::new(GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket).with_config(GoogleConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
-        (None, _) => Arc::new(MicrosoftAzureBuilder::from_env().with_url(&root).with_config(AzureConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
-    };
+    let Some(open) = crate::buckets::get().open else { anyhow::bail!("{url}: this form opens no lake in a {scheme}:// bucket") };
+    let mut whole: Store = open(&crate::buckets::At { scheme, bucket, root: &root }, params)?; // (the platform's: `hosted::bucket`)
     if reach.as_ref().is_some_and(|r| r.read_only) {
         whole = Arc::new(ReadOnly(whole, url.trim_end_matches('/').to_string())); // (before the prefix: the lake's store and the bucket's refuse alike)
     }
@@ -2343,7 +2369,8 @@ impl Lake {
         let disk = bucket.as_ref().filter(|_| !memory).and_then(|_| disk_tier(&url, &store, &node));
         let mut cached_store = None;
         if let Some((bucket_url, held)) = bucket.as_ref().filter(|_| memory) {
-            rt.register_object_store(&url::Url::parse(bucket_url)?, Arc::new(crate::bridge::Bridge(held.clone()))); // (in memory already: read as it is)
+            let read = crate::buckets::get().reader.context("this form gives DataFusion no reader of a lake in memory")?;
+            rt.register_object_store(&url::Url::parse(bucket_url)?, read(held.clone())); // (in memory already: read as it is)
         } else if let Some((bucket_url, s3)) = bucket {
             let prefix = url.trim_start_matches(&bucket_url).trim_start_matches('/').to_string();
             let cached = Arc::new(crate::cache::CachedStore::new(s3, cache_mb() << 20, disk.clone().map(|d| (d, prefix.clone())), &prefix));
@@ -2391,7 +2418,9 @@ impl Lake {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
         ledger.charge("files", Arc::downgrade(&crate::cache::outside())); // (the process's, of files outside the lakes)
-        crate::oom::wake();
+        if let Some(wake) = engine().and_then(|e| e.wake) {
+            wake(); // (the memory watch, `oom::wake`)
+        }
         for (_, opens) in &crate::registry::get().section::<OpenHooks>().0 {
             opens(&lake).await?; // (a branch's bases, so its files listed there are read: ADR-047)
         }
@@ -2617,15 +2646,21 @@ impl Lake {
     pub fn partitions(&self) -> usize { node_partitions(&self.node) }
 
     /// A session made from nothing, with everything every query's session has: every function set in the registry
-    /// (`engine::session`). On a page every plan it makes runs its partitions in the page's task, as the page's own
-    /// session's do (`in_task::planned`): a page has no runtime to start a partition's task on, and a plan of one
+    /// (`EngineHooks::session`). On a page every plan it makes runs its partitions in the page's task, as the page's own
+    /// session's do (`EngineHooks::on_a_page`): a page has no runtime to start a partition's task on, and a plan of one
     /// partition still merges more than one below it. Plans made by hand from it (`fresh.rs`) are planned by it too.
     pub(crate) fn made(&self, partitions: usize) -> datafusion::prelude::SessionContext {
         let config = datafusion::prelude::SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::naming::lake_name(self), crate::text::PUBLIC);
         let config = config.with_extension(Arc::new(crate::env::NodeMemory(node_memory(&self.node)))); // (what sizes itself by it: `env::NodeMemory`)
-        let ctx = crate::engine::session(config, self.rt.clone());
+        let ctx = match engine().and_then(|e| e.session) {
+            Some(session) => session(config, self.rt.clone()),
+            None => datafusion::prelude::SessionContext::new_with_config_rt(config, self.rt.clone()),
+        };
         #[cfg(target_arch = "wasm32")]
-        let ctx = crate::in_task::planned(ctx);
+        let ctx = match engine().and_then(|e| e.on_a_page) {
+            Some(planned) => planned(ctx),
+            None => ctx,
+        };
         ctx
     }
 
@@ -2694,7 +2729,9 @@ impl Lake {
         if self.bases.read().unwrap().contains_key(id) {
             return Ok(());
         }
-        crate::budget::share(url); // (its objects read with a share of the bucket's turns: prod's own nodes come first)
+        if let Some(share) = crate::buckets::get().share {
+            share(url); // (its objects read with a share of the bucket's turns: prod's own nodes come first)
+        }
         match (bucket_url(url), &self.cached) {
             (Some(bucket), Some(ours)) if bucket_url(&self.url).as_ref() == Some(&bucket) => ours.add_lake(url[bucket.len()..].trim_start_matches('/')),
             (Some(bucket), _) => {
@@ -2739,7 +2776,7 @@ impl Lake {
         let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
         let bytes: Bytes = bytes.into(); // (a `Vec` or `Bytes` as it is: a page's 232 MB file was held twice while it was put)
         self.store.put_opts(&Path::from(path), bytes.clone().into(), opts).await?;
-        if let (Some(disk), false) = (&self.disk, crate::delta::open_format(path) || replaceable(path)) {
+        if let (Some(disk), false) = (&self.disk, published(path) || replaceable(path)) {
             disk.put(path, &bytes); // what a node writes, it keeps
         }
         Ok(())
@@ -4337,6 +4374,17 @@ pub fn node_partitions(node: &NodeState) -> usize { partitions_of(node_memory(no
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine gives every lake its sessions and the memory watch (`EngineHooks`), and Delta and Iceberg say which of
+    /// a lake's files they publish (`Published`): the catalog names none of them.
+    #[test]
+    fn the_engine_and_the_extensions_give_a_lake_what_it_doesnt_name() {
+        let e = engine().expect("the engine registers its hooks");
+        assert!(e.session.is_some() && e.on_a_page.is_some() && e.roots.is_some() && e.wake.is_some());
+        assert!(published("data/t/_delta_log/00000000000000000000.json"), "Delta's log");
+        assert!(published("data/t/metadata/v1.metadata.json"), "Iceberg's metadata");
+        assert!(!published("data/t/part-0.parquet") && !published("files/notes.csv") && !published("log/00000000000000000001"));
+    }
 
     /// A parsed entry keeps a copy of its raw bytes, never a slice of the buffer they came in: a follower's come in its
     /// leader's stream frames, and a kept slice would hold the frame's whole buffer while the entry lives (the 11-07 soak

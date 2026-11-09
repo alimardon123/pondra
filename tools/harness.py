@@ -1145,6 +1145,7 @@ def outside():
     [n.kill() for n in nodes]
     sim.kill()
     server.shutdown()
+    server.server_close()
     shutil.rmtree(web, ignore_errors=True)
     print(json.dumps(checks, indent=1, ensure_ascii=False))
     if not all(checks.values()):
@@ -1378,6 +1379,7 @@ def catalogs():
             p.kill()
         if proxy:
             proxy.shutdown()
+            proxy.server_close()
         shutil.rmtree(here, ignore_errors=True)
     ok = all(checks.values())
     print(json.dumps({"catalogs": checks, "ok": ok}, indent=1, ensure_ascii=False))
@@ -7323,6 +7325,7 @@ def writes():
     twice = load_catalog("twice", type="rest", uri=f"http://127.0.0.1:{A.port + 9}", **io).load_table("default.events")
     twice.append(rows(5000, 5010))
     proxy.shutdown()
+    proxy.server_close()  # (its socket too: shutdown() only stops serve_forever, and `objects` starts a node on this port)
     checks["a commit sent twice (a retry after a lost answer) is applied once"] = q("SELECT count(*) AS n FROM events WHERE id >= 5000") == [{"n": 10}]
     cat.load_table("default.sales").append(pa.table({"region": ["eu", "us", "eu"], "amount": [1.0, 2.0, 3.0]}))
     view = until(lambda: q("SELECT region, total FROM by_region ORDER BY region"), [{"region": "eu", "total": 4.0}, {"region": "us", "total": 2.0}], 15)
@@ -11689,6 +11692,7 @@ def secrets():
     without = _raises_text(lambda: adm(read))
     checks["PONDRA_KMS_COMMAND wraps a data key (kms:…); without it, it doesn't open"] = by_kms == [[{"cur": "EUR"}, {"cur": "GBP"}], True] and "PONDRA_KMS_COMMAND" in without
     web.shutdown()
+    web.server_close()
     node.kill()
     kept, keys_info = _lake_keys()
     checks.update(kept)
@@ -11994,6 +11998,7 @@ def sealed():
     for n in nodes:
         n.kill()
     web.shutdown()
+    web.server_close()
     ok = all(checks.values())
     print(json.dumps({"sealed": checks, "ok": ok, "info": info}, indent=1, default=str))
     return ok
@@ -13199,6 +13204,7 @@ def reached():
         "no secret covers" in str(narrow[1]) and narrow[3] == [{"k": "here"}]
     node.kill()
     web.shutdown()
+    web.server_close()
     shutil.rmtree(here, ignore_errors=True)
     ok = all(checks.values())
     print(json.dumps({"reached": checks, "ok": ok, **({} if ok else {"info": info})}, indent=1, default=str))
@@ -26967,6 +26973,7 @@ def friendly():
     checks["INSTALL httpfs over Postgres: its notice reaches the client (a row or a NOTICE)"] = any(said("httpfs", "install") in t for t in told)
     checks["INSTALL spatial over Postgres: refused by name, SQLSTATE 0A000"] = refused == "0A000"
     files.shutdown()
+    files.server_close()
     shutil.rmtree(pq_dir, ignore_errors=True)
     # the docs name the built-in names extension.rs has, each one (sql/index.mdx)
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")

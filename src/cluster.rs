@@ -31,6 +31,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const STARTUP: Duration = Duration::from_secs(30); // a new leader may need this long to open the catalog
+
+/// What a node says to its leader beside its release, as headers: the oldest start of its running statements
+/// (`readings.rs`), which its host knows and this module doesn't name.
+pub type Said = Arc<dyn Fn() -> Vec<(&'static str, String)> + Send + Sync>;
 const CUT_OFF: Duration = Duration::from_secs(15); // a leader that hasn't reached the bucket this long steps aside
 pub const CUT_OFF_HEADER: &str = "x-pondra-cut-off"; // (a heartbeat's answer from a leader cut off)
 
@@ -255,8 +259,8 @@ impl Cluster {
     }
 
     /// Follower loop: heartbeat the leader; if it's gone for `LEASE`, claim the next term. `untaken`: its lake's bell for a
-    /// flush the leader didn't take (`log::Kept::untaken`).
-    pub fn follow(self: Arc<Self>, store: Store, untaken: Arc<tokio::sync::Notify>, node: &crate::node_state::NodeState) {
+    /// flush the leader didn't take (`log::Kept::untaken`). Each beat says `said`'s headers too.
+    pub fn follow(self: Arc<Self>, store: Store, untaken: Arc<tokio::sync::Notify>, said: Said, node: &crate::node_state::NodeState) {
         node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             let mut reached: Option<Instant> = None; // (since when we reach the bucket the leader says it can't)
             let mut missed = false; // (the last beat went unanswered)
@@ -272,7 +276,7 @@ impl Cluster {
                     _ = untaken.notified(), if self.leader_ok() => {}
                 }
                 let url = crate::tls::url(&format!("{}/cluster/beat?from={}", self.leader.addr, self.addr));
-                let answer = http(&self.node).post(url).timeout(Duration::from_secs(2)).send().await;
+                let answer = said().into_iter().fold(http(&self.node).post(url), |r, (k, v)| r.header(k, v)).timeout(Duration::from_secs(2)).send().await;
                 missed = !answer.as_ref().is_ok_and(|r| r.status().is_success() || r.headers().contains_key(CUT_OFF_HEADER)); // (a leader cut off answers: its branch below keeps its pace)
                 if self.may_lead && answer.as_ref().is_ok_and(|r| r.headers().contains_key(CUT_OFF_HEADER)) {
                     // The leader says it can't reach the bucket: no lease to wait out, no peer to
@@ -333,16 +337,23 @@ impl Cluster {
     }
 
     /// Read-only nodes: no heartbeat, no vote, no takeover. They only notice when leadership
-    /// moves, and restart to follow the new leader's commit stream (see `mirror`).
-    pub fn watch_leader(self: Arc<Self>, store: Store, streamed: bool, down: Arc<std::sync::atomic::AtomicBool>, node: &crate::node_state::NodeState) {
+    /// moves, and restart to follow the new leader's commit stream (see `mirror`). What `said` says is told the leader
+    /// each second while there is any, and once more when it stops: the leader keeps it as a follower's from its beat.
+    pub fn watch_leader(self: Arc<Self>, store: Store, streamed: bool, down: Arc<std::sync::atomic::AtomicBool>, said: Said, node: &crate::node_state::NodeState) {
         node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
-            let mut gone = 0;
+            let (mut gone, mut told) = (0, false);
             loop {
                 // While the leader's commit stream is down, look for a new leader every second
                 // (it is elected within the lease), not every fifteen: the reads are fresh again
                 // about as soon as the followers' are. (A few bucket reads a second, only then.)
                 for _ in 0..15 {
                     tokio::time::sleep(Duration::from_secs(1)).await;
+                    let now = said();
+                    if !now.is_empty() || told {
+                        told = !now.is_empty();
+                        let url = crate::tls::url(&format!("{}/cluster/said?from={}", self.leader.addr, self.addr));
+                        let _ = now.into_iter().fold(http(&self.node).post(url), |r, (k, v)| r.header(k, v)).timeout(Duration::from_secs(2)).send().await; // (missed: said again next second)
+                    }
                     if down.load(std::sync::atomic::Ordering::Relaxed) && matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
                         self.node.life.restart("another leads", &[]);
                     }

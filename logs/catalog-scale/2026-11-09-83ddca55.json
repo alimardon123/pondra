@@ -1,0 +1,250 @@
+{
+ "what": "tools/bench/catalog_scale.py on a folder, one 4-core container, 11-09: run 1 grows one lake to 1k, 5k, 10k, 20k and 50k tables; run 2 grows another to 50k and 100k. A commit's reads and writes over 10/5 at 50k were a background pass inside the window (the script now waits on writes too).",
+ "runs": [
+  {
+   "bin": "main 83ddca55 (release build)",
+   "lake": "folder",
+   "steps": [
+    {
+     "tables": 1000,
+     "tables_made_per_s": 255.7,
+     "metrics_scrape_reads": 0,
+     "leader_idle_reads_per_s": 1493.2,
+     "commit_insert": {
+      "reads": 10,
+      "writes": 5,
+      "p50_ms": 3.22
+     },
+     "select": {
+      "reads": 111,
+      "writes": 0,
+      "p50_ms": 3.22
+     },
+     "commit_create": {
+      "reads": 8,
+      "writes": 2,
+      "p50_ms": 4.13
+     },
+     "leader_rss_mb": 221.5,
+     "leader_lookup": {
+      "p50_ms": 0.103,
+      "p99_ms": 0.179
+     },
+     "follower_start_s": 0.2261485269991681,
+     "follower_first_query_ms": 3.3,
+     "follower_rss_mb": 137.2,
+     "follower_lookup": {
+      "p50_ms": 0.12,
+      "p99_ms": 0.245
+     }
+    },
+    {
+     "tables": 5000,
+     "tables_made_per_s": 238.1,
+     "metrics_scrape_reads": 0,
+     "leader_idle_reads_per_s": 1528.8,
+     "commit_insert": {
+      "reads": 10,
+      "writes": 5,
+      "p50_ms": 4.76
+     },
+     "select": {
+      "reads": 307,
+      "writes": 0,
+      "p50_ms": 3.84
+     },
+     "commit_create": {
+      "reads": 8,
+      "writes": 2,
+      "p50_ms": 5.07
+     },
+     "leader_rss_mb": 316.8,
+     "leader_lookup": {
+      "p50_ms": 0.104,
+      "p99_ms": 0.187
+     },
+     "follower_start_s": 1.0326685039908625,
+     "follower_first_query_ms": 4.5,
+     "follower_rss_mb": 172.4,
+     "follower_lookup": {
+      "p50_ms": 0.098,
+      "p99_ms": 0.199
+     }
+    },
+    {
+     "tables": 10000,
+     "tables_made_per_s": 255.5,
+     "metrics_scrape_reads": 0,
+     "leader_idle_reads_per_s": 2458.0,
+     "commit_insert": {
+      "reads": 10,
+      "writes": 5,
+      "p50_ms": 4.11
+     },
+     "select": {
+      "reads": 3,
+      "writes": 0,
+      "p50_ms": 3.95
+     },
+     "commit_create": {
+      "reads": 8,
+      "writes": 2,
+      "p50_ms": 6.27
+     },
+     "leader_rss_mb": 395.4,
+     "leader_lookup": {
+      "p50_ms": 0.101,
+      "p99_ms": 0.182
+     },
+     "follower_start_s": 1.5894273509911727,
+     "follower_first_query_ms": 3.9,
+     "follower_rss_mb": 210.4,
+     "follower_lookup": {
+      "p50_ms": 0.096,
+      "p99_ms": 0.157
+     }
+    },
+    {
+     "tables": 20000,
+     "tables_made_per_s": 229.5,
+     "metrics_scrape_reads": 0,
+     "leader_idle_reads_per_s": 464.4,
+     "commit_insert": {
+      "reads": 10,
+      "writes": 5,
+      "p50_ms": 4.67
+     },
+     "select": {
+      "reads": 476,
+      "writes": 0,
+      "p50_ms": 4.29
+     },
+     "commit_create": {
+      "reads": 8,
+      "writes": 2,
+      "p50_ms": 5.22
+     },
+     "leader_rss_mb": 495.6,
+     "leader_lookup": {
+      "p50_ms": 0.113,
+      "p99_ms": 0.206
+     },
+     "follower_start_s": 2.476939890999347,
+     "follower_first_query_ms": 4.4,
+     "follower_rss_mb": 251.0,
+     "follower_lookup": {
+      "p50_ms": 0.107,
+      "p99_ms": 0.441
+     }
+    },
+    {
+     "tables": 50000,
+     "tables_made_per_s": 192.8,
+     "metrics_scrape_reads": 0,
+     "leader_idle_reads_per_s": 3.4,
+     "commit_insert": {
+      "reads": 57,
+      "writes": 99,
+      "p50_ms": 5.11
+     },
+     "select": {
+      "reads": 3,
+      "writes": 0,
+      "p50_ms": 4.3
+     },
+     "commit_create": {
+      "reads": 8,
+      "writes": 2,
+      "p50_ms": 4.5
+     },
+     "leader_rss_mb": 606.2,
+     "leader_lookup": {
+      "p50_ms": 0.103,
+      "p99_ms": 0.232
+     },
+     "follower_start_s": 10.157468698002049,
+     "follower_first_query_ms": 2.8,
+     "follower_rss_mb": 326.0,
+     "follower_lookup": {
+      "p50_ms": 0.114,
+      "p99_ms": 0.159
+     }
+    }
+   ],
+   "version": "pondra 0.34.0"
+  },
+  {
+   "bin": "main 83ddca55 (release build)",
+   "lake": "folder",
+   "steps": [
+    {
+     "tables": 50000,
+     "tables_made_per_s": 210.4,
+     "metrics_scrape_reads": 0,
+     "leader_idle_reads_per_s": 3.0,
+     "commit_insert": {
+      "reads": 106,
+      "writes": 197,
+      "p50_ms": 5.86
+     },
+     "select": {
+      "reads": 3,
+      "writes": 0,
+      "p50_ms": 3.46
+     },
+     "commit_create": {
+      "reads": 8,
+      "writes": 2,
+      "p50_ms": 5.61
+     },
+     "leader_rss_mb": 596.2,
+     "leader_lookup": {
+      "p50_ms": 0.101,
+      "p99_ms": 0.18
+     },
+     "follower_start_s": 11.137669674004428,
+     "follower_first_query_ms": 4.2,
+     "follower_rss_mb": 281.3,
+     "follower_lookup": {
+      "p50_ms": 0.109,
+      "p99_ms": 0.171
+     }
+    },
+    {
+     "tables": 100000,
+     "tables_made_per_s": 67.5,
+     "metrics_scrape_reads": 0,
+     "leader_idle_reads_per_s": 22008.6,
+     "commit_insert": {
+      "reads": 10,
+      "writes": 5,
+      "p50_ms": 4.31
+     },
+     "select": {
+      "reads": 3,
+      "writes": 0,
+      "p50_ms": 2.82
+     },
+     "commit_create": {
+      "reads": 8,
+      "writes": 2,
+      "p50_ms": 4.56
+     },
+     "leader_rss_mb": 1395.7,
+     "leader_lookup": {
+      "p50_ms": 0.106,
+      "p99_ms": 0.294
+     },
+     "follower_start_s": 12.865376355999615,
+     "follower_first_query_ms": 7.0,
+     "follower_rss_mb": 266.0,
+     "follower_lookup": {
+      "p50_ms": 0.28,
+      "p99_ms": 0.857
+     }
+    }
+   ],
+   "version": "pondra 0.34.0"
+  }
+ ]
+}
