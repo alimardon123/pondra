@@ -10,7 +10,8 @@
 //! a projection of columns between the two joins, which the rule looks through (`optimize::flatten_through`).
 //!
 //! It groups first where the grouping it saves hashes several strings a row: two text columns or more, or grouping sets
-//! (ROLLUP, CUBE). By one short text column the extra grouping costs what it saves (TPC-DS q05 was 8% slower).
+//! (ROLLUP, CUBE). By one short text column the extra grouping costs what it saves (TPC-DS q05 was 8% slower). And it
+//! groups the rest by one key the dimensions join on: by two (q47's item and store), its groups are nearly its rows.
 //!
 //! The rule takes an aggregate over a tree of inner joins and splits its inputs in two:
 //! - the dimensions: whole tables (no filter, or only one that names no column), joined to the rest by equalities
@@ -180,6 +181,11 @@ fn eager(a: &Aggregate) -> Result<Option<LogicalPlan>> {
             }
             _ => return Ok(None),
         }
+    }
+    // By two keys or more (q47's sales by their item and their store, and the month): the first grouping's groups are
+    // nearly as many as its rows, and grouping first only adds a grouping (q47 at SF10: 0.61 → 0.74 s).
+    if by.iter().collect::<std::collections::HashSet<_>>().len() > 1 {
+        return Ok(None);
     }
     by.extend(grouped.iter().filter(|c| owner(c).is_some_and(|i| !dims[i])).map(|c| (*c).clone()));
     let mut seen = std::collections::HashSet::new();
@@ -407,8 +413,9 @@ mod tests {
 
     /// A filtered dimension cuts the rows its join keeps: grouping them all first would be work the join saves.
     /// DISTINCT inside an aggregate can't be combined, a DISTINCT of rows has no aggregate to tell its two groupings
-    /// apart, one text column costs about what grouping first does, nothing is grouped first where nothing is text, and a
-    /// BIGINT's average is taken as the query wrote it (its sums could pass 64 bits).
+    /// apart, one text column costs about what grouping first does, nothing is grouped first where nothing is text, a
+    /// BIGINT's average is taken as the query wrote it (its sums could pass 64 bits), and the sales aren't grouped by two
+    /// keys first (an item's and another dimension's: nearly a group a row).
     #[tokio::test]
     async fn left_as_it_was() -> Result<()> {
         let ctx = session(true).await?;
@@ -419,6 +426,8 @@ mod tests {
             "SELECT brand, sales.day, sum(qty) FROM sales, item WHERE sales.item = item.id GROUP BY brand, sales.day",
             "SELECT year, sum(price) FROM sales, day WHERE sales.day = day.id GROUP BY year",
             "SELECT brand, class, avg(sales.day) FROM sales, item WHERE sales.item = item.id GROUP BY brand, class",
+            "SELECT item.brand, other.class, sum(qty) FROM sales, item, item AS other WHERE sales.item = item.id AND sales.day = other.id \
+             GROUP BY item.brand, other.class",
         ] {
             let (_, plan) = answer(&ctx, sql).await?;
             assert!(!plan.contains("__eager"), "{sql}: {plan}");
