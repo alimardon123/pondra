@@ -246,6 +246,10 @@ fn lambda_words(p: &mut Parser) -> Option<Result<Expr, datafusion::sql::sqlparse
     if !matches!(&p.peek_token_ref().token, Token::Word(w) if w.keyword == Keyword::LAMBDA) {
         return None;
     }
+    let before_lambda = match p.index() {
+        0 => Token::EOF,
+        _ => p.get_current_token().token.clone(), // (the token read last: `(` or `,` before a function's argument)
+    };
     let mut params = match p.maybe_parse(|p| {
         p.expect_keyword_is(Keyword::LAMBDA)?;
         let params = p.parse_comma_separated(|p| p.parse_identifier())?;
@@ -261,7 +265,15 @@ fn lambda_words(p: &mut Parser) -> Option<Result<Expr, datafusion::sql::sqlparse
         _ => Expr::Tuple(params.into_iter().map(Expr::Identifier).collect()),
     };
     let arrow = GenericDialect {}.prec_value(Precedence::PgOther);
-    Some(p.parse_subexpr(arrow).map(|body| Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::Arrow, right: Box::new(body) }))
+    Some(p.parse_subexpr(arrow).map(|body| {
+        let lambda = Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::Arrow, right: Box::new(body) };
+        // (outside a function's argument the arrow is grouped, so the tree prints as itself, as `text_kept` keeps it:
+        // `a + (x -> x)` and `x -> (y -> x + y)`, where `a + x -> x` would read `(a + x) -> x`)
+        match matches!(before_lambda, Token::LParen | Token::Comma) {
+            true => lambda,
+            false => Expr::Nested(Box::new(lambda)),
+        }
+    }))
 }
 
 /// A list comprehension, `[expr FOR x IN list IF cond]`, read by the fallback dialect (`dialect.rs`) as
