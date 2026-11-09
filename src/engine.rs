@@ -177,6 +177,10 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         }
         #[cfg(feature = "lake")]
         r.section_mut::<crate::records::Rights>().add(crate::users::RIGHTS);
+        #[cfg(feature = "lake")] // (who still reads a lake's old files: `pins`)
+        r.section_mut::<crate::pins::Pins>().add(crate::branch::readers());
+        #[cfg(feature = "lake")] // (what the catalog keeps with its entries: the folders each table uses)
+        r.section_mut::<crate::store::CatalogHooks>().add(crate::ddl::folder_hook());
         #[cfg(feature = "lake")] // (what the log's commits call: a view's rows, derived as its sources' are packed)
         r.section_mut::<crate::log::CommitHooks>().add(crate::views::hook());
     },
@@ -230,7 +234,8 @@ fn own(mut ctx: SessionContext) -> SessionContext {
     crate::string_agg::register(&ctx); // string_agg: one group's string held to a share of the query memory
     crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
     crate::dialect_fns::register(&ctx); // safe_divide(a, b): BigQuery's, typed by its arguments
-    crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
+    crate::finish::register(&ctx); // pondra_moments(x): what a view kept for a variance (made before format 7)
+    crate::fvar::register_parts(&ctx); // pondra_mean_parts(x), pondra_var_parts(x): what a view keeps for an average and a variance
     crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
     // `pg_bytea` gives Postgres's bytea functions, `byte_length` among them (DataFusion's other byte functions, sha256
     // and md5, take BINARY as they are); substr is below.
@@ -464,7 +469,10 @@ pub async fn planned(ctx: &SessionContext, sql: &str) -> anyhow::Result<LogicalP
 /// statements are compared, not their plans: DataFusion's planner gives one statement plans that differ run to run where
 /// no answer does (the columns an ORDER BY adds below its projection come out of a hash set, in either order).
 fn datafusions_parse(state: &datafusion::execution::SessionState, sql: &str, kept: &datafusion::sql::parser::Statement) -> anyhow::Result<()> {
-    let theirs = state.sql_to_statement(sql, &state.config().options().sql_parser.dialect);
+    let mut theirs = state.sql_to_statement(sql, &state.config().options().sql_parser.dialect);
+    if let Ok(datafusion::sql::parser::Statement::Statement(s)) = &mut theirs {
+        crate::parsed::signed(s.as_mut()); // (as the front's parse has it: `parsed::signed`)
+    }
     anyhow::ensure!(theirs.as_ref().is_ok_and(|t| t == kept), "one parse: the front's parse of the text is not DataFusion's, for {sql}\nthe front's: {kept}\nDataFusion's: {theirs:?}");
     Ok(())
 }

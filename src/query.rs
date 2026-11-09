@@ -1211,7 +1211,7 @@ pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<Me
     };
     let first = enc.step(Some(&piece))?;
     let done = ended.clone();
-    crate::panics::aside(async move {
+    crate::spawns::aside(async move {
         let _held = held;
         let written = match write_all(&mut enc, &tx, parts).await {
             Ok(_) => step_to(&mut enc, &tx, None).await,
@@ -1778,7 +1778,7 @@ pub fn retrying(ctx: &SessionContext) -> bool {
 /// `CREATE TABLE … AS` and `INSERT … SELECT` (`write::write_files`) and a node's share of one (`spmd::insert_share`),
 /// and `COPY … TO` a file or a Delta or Iceberg table (`copy::copy_to`). Not a Kafka topic (records sent are sent),
 /// and not the shares of a spread query or COPY: when one fails, the coordinator runs it again from its own node.
-pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(ctx: &SessionContext, work: impl Fn(SessionContext) -> F) -> Result<T> {
+pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(node: &crate::node_state::NodeState, ctx: &SessionContext, work: impl Fn(SessionContext) -> F) -> Result<T> {
     let (mut one_part, mut stopped) = (false, false);
     match crate::panics::first_try(work(ctx.clone()), |r| matches!(r, Err(e) if exhausted(e) && handed().is_none())).await {
         Ok(Err(e)) if exhausted(&e) && handed().is_none() => one_part = merging_a_sort(&e),
@@ -1786,7 +1786,7 @@ pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(ctx: &Sessi
         Err(crate::panics::Stopped::Again) if handed().is_none() => stopped = true, // (the watch stopped the first try, and its memory has gone)
         Err(_) => {
             // (stopped on its first try and not run again: its memory stayed over the line, or half its answer was sent)
-            crate::panics::stopped_for_memory(); // (on the request's node)
+            crate::metrics::add(&node.metrics.stopped_for_memory, 1); // (on its node: a request's, or a view's rerun outside any, 11-09 audit L9)
             anyhow::bail!(crate::oom::OOM)
         }
     }
@@ -2208,7 +2208,7 @@ mod tests {
         for (what, parts) in [("SortPreservingMergeExec[0]", 1), ("ExternalSorterMerge[1]", 1), ("HashJoinInput[2]", 4)] {
             let ctx = SessionContext::new_with_config(datafusion::prelude::SessionConfig::new().with_target_partitions(4));
             let tries = std::sync::Mutex::new(vec![]);
-            let out = frugally(&ctx, |c| {
+            let out = frugally(&crate::node_state::NodeState::unhosted(), &ctx, |c| {
                 let mut tries = tries.lock().expect("the tries");
                 tries.push((c.state().config().target_partitions(), retrying(&c)));
                 let first = tries.len() == 1;

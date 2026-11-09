@@ -31,7 +31,9 @@ use std::time::Duration;
 /// provider's tokens for nobody's and, with no other user, the lake for one nobody signs in to.
 /// 6: a table's columns kept as one list, each column with its facts (`store::Stored`, redesign 1b,
 /// piece 6b), which a node from before can't read (`LISTS`).
-pub const FORMAT: u32 = 6;
+/// 7: a materialized view that keeps an average or a variance as its query's own state (`fvar::MEAN_PARTS`, 11-09 audit
+/// M11), which a node from before has no function to merge.
+pub const FORMAT: u32 = 7;
 
 /// The format whose tables keep their columns as one list (`store::Stored`). A lake moves to it by itself: its leader raises
 /// it once every node knows it (`raise`), and a form that leads a lake in memory or a folder alone as it opens (`alone`). The commit sets the
@@ -196,7 +198,7 @@ impl Drop for Streamed {
 /// read it. A migration, when a format needs one, goes in the commit that sets it.
 pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>) {
     use std::sync::atomic::Ordering::Relaxed;
-    crate::panics::spawn(async move {
+    crate::spawns::spawn(async move {
         let mut marked = false;
         if lake.format.made {
             lake.format.ready.store(known() + 2, Relaxed);
@@ -263,7 +265,7 @@ fn moves_alone(url: &str, made: bool) -> bool {
 /// unless this node was cut off while the others agreed, `raise`, or it started on such a lake
 /// before its catalog view held the format: it holds it once caught up, invariant 197.)
 pub fn watch(lake: Arc<Lake>) {
-    crate::panics::spawn(async move {
+    crate::spawns::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             if let Err(e) = check(&lake.cat, &lake.url, false).await {

@@ -2,9 +2,12 @@
 //! `bool_and` and `bool_or`, expressions over aggregates (`sum(a) / count(*)`, `round(avg(x), 2)`),
 //! a window function over the groups, `HAVING`, `ORDER BY` and `LIMIT`.
 //!
-//! The view's table keeps what adds up as rows arrive, one column each: counts, sums, mins, maxes
-//! and moments (`pondra_moments`: a count and the values' sums and squares taken from a shift, so
-//! a variance stays exact where plain sums of squares would cancel). The GROUP
+//! The view's table keeps what adds up as rows arrive, one column each: counts, sums, mins, maxes,
+//! and for an average or a variance the query's own state (`fvar::MEAN_PARTS`, `VAR_PARTS`), so the
+//! view answers as its query does, digit for digit. Where the lake can't take that yet (a node of
+//! the cluster from before format 7), and in a view made before, an average keeps a sum and a count
+//! and a variance its moments (`pondra_moments`: a count and the values' sums and squares taken
+//! from a shift, so a variance stays exact where plain sums of squares would cancel). The GROUP
 //! BY view machinery already keeps such a table, from every node, in the same commit as the rows,
 //! and takes back a changed row's part. Its answers are a SELECT over those columns
 //! (`TableMeta::finish`), worked out as it is read (`query::table_view`): one projection more.
@@ -41,14 +44,17 @@ pub struct Split {
     pub partial: String,
     /// Its answers are ordered or cut (ORDER BY, LIMIT).
     pub ordered: bool,
+    /// It keeps an average or a variance as its query's own state (`split`'s `parts`).
+    pub parts: bool,
     finish: ast::Query,
 }
 
 /// `sql` split, when it needs a last step: an aggregate kept as more than itself (avg, …), an
 /// expression over aggregates, a GROUP BY expression it doesn't SELECT, HAVING, ORDER BY or LIMIT.
-/// `names` are its columns as planned, `aggregates` the session's aggregate functions. `None`: the
-/// query is kept as it is (or isn't one this can split, and `views::merges` says why).
-pub fn split(sql: &str, names: &[String], aggregates: &HashSet<String>) -> Result<Option<Split>> {
+/// `names` are its columns as planned, `aggregates` the session's aggregate functions; `parts`: an
+/// average or a variance is kept as its query's own state (the lake's format 7, `fvar::PARTS_FORMAT`).
+/// `None`: the query is kept as it is (or isn't one this can split, and `views::merges` says why).
+pub fn split(sql: &str, names: &[String], aggregates: &HashSet<String>, parts: bool) -> Result<Option<Split>> {
     let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Ok(None) };
     let (Some(ast::Statement::Query(q)), true) = (stmts.pop(), stmts.is_empty()) else { return Ok(None) };
     let ast::SetExpr::Select(s) = q.body.as_ref() else { return Ok(None) };
@@ -98,7 +104,7 @@ pub fn split(sql: &str, names: &[String], aggregates: &HashSet<String>) -> Resul
         bail!("SELECT DISTINCT … GROUP BY: the GROUP BY gives each group once already");
     }
     // The finish: every aggregate a column (or columns) of the partial table, everything else as written.
-    let mut parts = Parts::default();
+    let mut parts = Parts { parts, ..Parts::default() };
     let mut finish_of = |e: &ast::Expr| -> Result<ast::Expr> {
         let mut e = e.clone();
         let mut failed = None;
@@ -156,7 +162,8 @@ pub fn split(sql: &str, names: &[String], aggregates: &HashSet<String>) -> Resul
     (fs.projection, fs.selection, fs.qualify, fs.named_window) = (out, having, qualify, s.named_window.clone());
     (finish.order_by, finish.limit_clause, finish.fetch) = (order_by, q.limit_clause.clone(), q.fetch.clone());
     let ordered = q.order_by.is_some() || q.limit_clause.is_some() || q.fetch.is_some();
-    Ok(Some(Split { partial: partial.to_string(), ordered, finish }))
+    let parts = parts.columns.iter().any(|(_, _, kind)| [crate::fvar::MEAN_PARTS, crate::fvar::VAR_PARTS].contains(kind));
+    Ok(Some(Split { partial: partial.to_string(), ordered, parts, finish }))
 }
 
 impl Split {
@@ -200,10 +207,12 @@ pub async fn finished(aux: &datafusion::prelude::SessionContext, current: datafu
 /// The finish's stand-in for `sum / count` until the sum's type is known (`Split::finish`).
 const AVG: &str = "pondra_avg";
 
-/// The partial table's columns: what each adds up (`count(x)`, …), its name and its merge kind.
+/// The partial table's columns: what each adds up (`count(x)`, …), its name and its merge kind; `parts`: an average
+/// or a variance as its query's own state (`split`).
 #[derive(Default)]
 struct Parts {
     columns: Vec<(ast::Expr, String, &'static str)>,
+    parts: bool,
 }
 
 impl Parts {
@@ -240,6 +249,22 @@ impl Parts {
             "count" | "sum" | "min" | "max" => col(self.column(ast::Expr::Function(f.clone()), kind(&fname))),
             "bool_and" => col(self.column(renamed("min"), "min")),
             "bool_or" => col(self.column(renamed("max"), "max")),
+            // (the query's own state, answered as the query answers it; in parentheses, so `avg(a) / avg(b)` divides by
+            // the whole second average, 11-06 audit H3)
+            "avg" | "mean" if self.parts => {
+                let m = self.column(renamed(crate::fvar::MEAN_PARTS), crate::fvar::MEAN_PARTS);
+                crate::expander::grouped(expr(&format!("pondra_parts_answer(\"{m}\", 'avg')"))?)
+            }
+            "var" | "var_samp" | "var_sample" | "variance" | "var_pop" | "var_population" | "stddev" | "stddev_samp" | "std" | "stddev_pop" if self.parts => {
+                let m = self.column(renamed(crate::fvar::VAR_PARTS), crate::fvar::VAR_PARTS);
+                let answer = match (fname.starts_with("std"), fname.ends_with("pop") || fname.ends_with("population")) {
+                    (false, false) => "var_samp",
+                    (false, true) => "var_pop",
+                    (true, false) => "stddev_samp",
+                    (true, true) => "stddev_pop",
+                };
+                crate::expander::grouped(expr(&format!("pondra_parts_answer(\"{m}\", '{answer}')"))?)
+            }
             "avg" | "mean" => {
                 let (s, n) = (self.column(renamed("sum"), "sum"), self.column(renamed("count"), "count"));
                 expr(&format!("{AVG}(\"{s}\", \"{n}\")"))?
@@ -307,6 +332,10 @@ fn parse_query(sql: &str) -> Result<ast::Query> {
 /// results it combines them, so it is both what a view's partial rows hold and how they merge. A
 /// NULL is passed over, as `var` does.
 pub const MOMENTS: &str = "pondra_moments";
+
+/// Does a view's column of merge kind `f` keep parts that add up, taken back negated: a variance's moments, or an average's
+/// or a variance's own state (`fvar::MEAN_PARTS`, `VAR_PARTS`)?
+pub fn parts(f: &str) -> bool { [MOMENTS, crate::fvar::MEAN_PARTS, crate::fvar::VAR_PARTS].contains(&f) }
 
 /// Adds `pondra_moments` to a session.
 pub fn register(ctx: &datafusion::prelude::SessionContext) {
@@ -419,7 +448,7 @@ mod tests {
     fn split_of(sql: &str, names: &[&str]) -> Option<(String, String)> {
         let aggregates: HashSet<String> = ["count", "sum", "min", "max", "avg", "stddev", "var_pop", "bool_and", "median"].map(String::from).into();
         let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
-        split(sql, &names, &aggregates).unwrap().map(|s| (s.partial.clone(), s.finish(|c| c == "__sum_1", &[])))
+        split(sql, &names, &aggregates, false).unwrap().map(|s| (s.partial.clone(), s.finish(|c| c == "__sum_1", &[])))
     }
 
     #[test]
@@ -441,7 +470,7 @@ mod tests {
         // `CAST(s AS DOUBLE) / NULLIF(n, 0)` made it 13 / 2 / 8 / 2; `100 / avg(b)` 25, and `avg(a)::int` 6)
         let aggregates: HashSet<String> = ["count", "sum", "avg"].map(String::from).into();
         let names: Vec<String> = ["k", "r", "h", "i"].map(String::from).into();
-        let s = split("SELECT k, avg(a) / avg(b) AS r, 100 / avg(b) AS h, avg(a)::int + 1 AS i FROM t GROUP BY k", &names, &aggregates).unwrap().unwrap();
+        let s = split("SELECT k, avg(a) / avg(b) AS r, 100 / avg(b) AS h, avg(a)::int + 1 AS i FROM t GROUP BY k", &names, &aggregates, false).unwrap().unwrap();
         let ctx = datafusion::prelude::SessionContext::new();
         ctx.sql("CREATE TABLE t AS SELECT * FROM (VALUES (1, 4, 2), (1, 9, 6)) AS v(k, a, b)").await.unwrap().collect().await.unwrap();
         ctx.register_table(PARTIAL, ctx.sql(&s.partial).await.unwrap().into_view()).unwrap();
@@ -451,6 +480,26 @@ mod tests {
         use datafusion::arrow::array::AsArray;
         let got: Vec<f64> = (0..3).map(|c| b.column(c).as_primitive::<datafusion::arrow::datatypes::Float64Type>().value(0)).collect();
         assert_eq!(got, [1.625, 25.0, 7.0], "{finish}");
+    }
+
+    #[tokio::test]
+    async fn a_view_keeps_the_querys_own_averages_and_variances() {
+        // (11-09 audit M11: the partial is the state the query itself keeps, finished as the query finishes it, so a view
+        // answers to the last digit as its query does: here sums whose low digits a plain sum of squares loses)
+        let aggregates: HashSet<String> = ["count", "sum", "avg", "stddev", "var_pop"].map(String::from).into();
+        let names: Vec<String> = ["k", "a", "r", "s", "v", "d"].map(String::from).into();
+        let sql = "SELECT k, avg(i) AS a, avg(x) / avg(i) AS r, stddev(x) AS s, var_pop(i) AS v, avg(d) AS d FROM t GROUP BY k";
+        let s = split(sql, &names, &aggregates, true).unwrap().unwrap();
+        assert!(s.parts, "{}", s.partial);
+        assert_eq!(s.partial, "SELECT k AS \"k\", pondra_mean_parts(i) AS \"__mean_parts_1\", pondra_mean_parts(x) AS \"__mean_parts_2\", \
+            pondra_var_parts(x) AS \"__var_parts_3\", pondra_var_parts(i) AS \"__var_parts_4\", pondra_mean_parts(d) AS \"__mean_parts_5\", count(*) AS \"__count\" FROM t GROUP BY 1");
+        let ctx = crate::engine::session(datafusion::prelude::SessionConfig::new(), Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()));
+        ctx.sql("CREATE TABLE t AS SELECT k, CAST(i AS INT) AS i, 1.0e9 + x AS x, CAST(d AS DECIMAL(10, 2)) AS d \
+                 FROM (VALUES (1, 4, 0.1, 0.10), (1, 9, 0.2, 0.25), (1, 2, 0.3, 0.05), (2, 7, 0.4, 1.05)) AS v(k, i, x, d)").await.unwrap().collect().await.unwrap();
+        ctx.register_table(PARTIAL, ctx.sql(&s.partial).await.unwrap().into_view()).unwrap();
+        let finish = s.finish(|_| false, &[]);
+        let show = |q: String| { let ctx = ctx.clone(); async move { datafusion::arrow::util::pretty::pretty_format_batches(&ctx.sql(&q).await.unwrap().collect().await.unwrap()).unwrap().to_string() } };
+        assert_eq!(show(format!("{finish} ORDER BY k")).await, show(format!("{sql} ORDER BY k")).await, "{finish}");
     }
 
     #[test]
@@ -466,9 +515,9 @@ mod tests {
         assert_eq!(partial, "SELECT region AS \"region\", count(*) AS \"__count\" FROM t GROUP BY 1");
         assert_eq!(finish, "SELECT upper(region) AS \"r\", \"__count\" AS \"n\" FROM __partial");
         let aggregates: HashSet<String> = ["count", "median"].map(String::from).into();
-        let e = split("SELECT k, median(x) AS m FROM t GROUP BY k", &["k".into(), "m".into()], &aggregates).err().unwrap().to_string();
+        let e = split("SELECT k, median(x) AS m FROM t GROUP BY k", &["k".into(), "m".into()], &aggregates, true).err().unwrap().to_string();
         assert!(e.contains("median() needs every row"), "{e}");
-        assert!(split("SELECT k, count(DISTINCT x) AS m, avg(x) FROM t GROUP BY k", &["k".into(), "m".into(), "a".into()], &aggregates).is_err());
+        assert!(split("SELECT k, count(DISTINCT x) AS m, avg(x) FROM t GROUP BY k", &["k".into(), "m".into(), "a".into()], &aggregates, true).is_err());
     }
 
     #[test]

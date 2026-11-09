@@ -100,9 +100,9 @@ pub fn reads_only(stmt: &crate::write::Stmt) -> bool {
     matches!(stmt, Stmt::CopyTo(..)) || matches!(stmt, Stmt::Ddl(ds) if ds.iter().all(|d| matches!(d, Ddl::BackupDatabase { .. })))
 }
 
-/// A backup's leader, in place of a tiering round: its tables never change, so only its clones'
-/// pins are kept as a lake keeps them, hourly: one on lease that wasn't renewed goes, and one whose
-/// clone is gone (`branch::lapse`, `sweep`).
+/// A backup's leader, in place of a tiering round: its tables never change, so only its readers
+/// (its clones' pins) are kept as a lake keeps them, hourly: one on lease that wasn't renewed goes, and one whose
+/// clone is gone (`pins::lapse`, `sweep`).
 pub async fn tend(lake: &Lake) -> Result<()> {
     crate::per_node!(static LOOKED: std::sync::Mutex<u64> = std::sync::Mutex::new(0));
     let now = crate::log::now_ms();
@@ -113,8 +113,8 @@ pub async fn tend(lake: &Lake) -> Result<()> {
         }
         *looked = now;
     }
-    crate::branch::lapse(lake).await?;
-    crate::branch::sweep(lake).await
+    crate::pins::lapse(lake).await?;
+    crate::pins::sweep(lake).await
 }
 
 // ---------------------------------------------------------------- the statements
@@ -396,7 +396,7 @@ pub async fn take(lake: &Lake, t: Take) -> Result<Value> {
     let known: BTreeSet<String> = b.garbage.iter().map(|(p, _)| p.clone()).collect();
     b.garbage.extend(have.keys().filter(|p| !names.contains(p) && !known.contains(*p)).map(|p| (p.clone(), ms)));
     let keep_ms = b.retention_days * DAY_MS;
-    let pins = crate::branch::pins(lake).await?;
+    let pins = crate::pins::held(lake).await?; // (what a reader of it still reads: a clone's files)
     let (gone, garbage): (Vec<_>, Vec<_>) = b.garbage.drain(..).partition(|(_, at)| ms >= at + keep_ms && pins.is_none_or(|p| *at < p.0));
     b.garbage = garbage;
     let (old, runs): (Vec<Run>, Vec<Run>) = b.runs.drain(..).partition(|r| ms >= r.ms + keep_ms && pins.is_none_or(|p| r.ms < p.0));

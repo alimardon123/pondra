@@ -134,7 +134,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         }).transpose()?;
         schema(&columns)?; // validate types
         ensure!(columns.iter().all(|(c, _)| !crate::text::NAMES.contains(&c.as_str()) && c != "_old_version"), "{} are system columns: every table has them (`SELECT _row_id, * FROM t`)", crate::text::NAMES.join(", "));
-        ensure!(merge.values().all(|f| ["sum", "count", "min", "max", crate::finish::MOMENTS].contains(&f.as_str())), "MERGE: sum, count, min or max"); // (moments: a view's variance, `finish.rs`; an ALTER of its table sends them back)
+        ensure!(merge.values().all(|f| ["sum", "count", "min", "max"].contains(&f.as_str()) || crate::finish::parts(f)), "MERGE: sum, count, min or max"); // (moments: a view's variance, `finish.rs`; an ALTER of its table sends them back)
         ensure!(merge.is_empty() || !key.is_empty(), "MERGE needs a key: a merge table combines the rows of each key");
         ensure!(merge.keys().all(|c| columns.iter().any(|(n, _)| n == c)), "MERGE: columns of the table");
         if let Some((c, _)) = columns.iter().find(|(c, _)| !merge.is_empty() && !key.contains(c) && !merge.contains_key(c)) {
@@ -723,7 +723,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Ok(sql) => sql,
         Err(e) => return Some(Stmt::of_error(&e, format!("{e:#}"))),
     };
-    let parsed = crate::parsed::read(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (as the front reads it, parsed once for its looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
+    let parsed = crate::parsed::read(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql).map(crate::parsed::signed_all))); // (as the front reads it, parsed once for its looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
     let parsed = match parsed {
         Ok(mut s) => s.pop()?,
         Err(_) => return None,
@@ -1449,7 +1449,7 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
         return Ok(None);
     }
     // (out of memory, once more frugally: the first try's files are never recorded, and the orphan sweep takes them)
-    let (columns, files) = crate::query::frugally(ctx, |ctx| async move {
+    let (columns, files) = crate::query::frugally(&lake.node, ctx, |ctx| async move {
         in_order(&ctx);
         let df = crate::engine::sql(&ctx, &crate::sys::planned(query)?).await?;
         write_rows(lake, &ctx, table, df, stamp).await
@@ -1838,7 +1838,7 @@ impl Drop for Undo {
         let Some((app, name, job, scope)) = self.0.take() else { return };
         // (carried: the drop runs as the caller that was stopped, with its sign-in and session, which tokio still
         // holds while a future is dropped)
-        crate::panics::task(crate::auth::carried(async move {
+        crate::spawns::task(crate::auth::carried(async move {
             if let Err(e) = Box::pin(on_node_as(&app, made_drop(&name, &job), None, false, &scope)).await {
                 eprintln!("left {name} as it is: the drop after its CREATE TABLE … AS, which stopped before it answered, didn't answer: {e:#}");
             }
@@ -2125,7 +2125,7 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
     let next = std::sync::atomic::AtomicU64::new(0);
     // (out of memory, once more frugally, as a node's INSERT … SELECT runs (`write_files`); but only while nothing is staged: a
     // staged file holds some of the first try's rows, and is never overwritten)
-    let names = crate::query::frugally(&ctx, |ctx| {
+    let names = crate::query::frugally(&app.lake.node, &ctx, |ctx| {
         let (order, dir, next) = (&order, &dir, &next);
         async move {
             if next.load(std::sync::atomic::Ordering::Relaxed) > 0 {
@@ -2963,5 +2963,20 @@ mod tests {
         lake.cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    /// The texts the core keeps of a tree read back as they mean with a minus before a minus (`parsed::signed`): on main
+    /// before, `INSERT INTO w SELECT id, - -k FROM t` kept `SELECT id, --k FROM t` (`SELECT id,`), a view's query the
+    /// same, and the UPDATE a node sends its leader read as none.
+    #[test]
+    fn a_minus_before_a_minus_is_kept_as_it_means() {
+        use crate::ddl::Ddl;
+        let Some(Stmt::Insert(t, q)) = parse("INSERT INTO w SELECT id, - -k FROM t") else { panic!("an INSERT") };
+        assert_eq!((t.as_str(), q.as_str()), ("w", "SELECT id, -(-k) FROM t"));
+        let Some(Stmt::Ddl(d)) = parse("CREATE VIEW v AS SELECT id, - -k AS m FROM t") else { panic!("a view") };
+        assert!(matches!(&d[..], [Ddl::CreateView { sql, .. }] if sql == "SELECT id, -(-k) AS m FROM t"), "{}", serde_json::to_string(&d).unwrap_or_default());
+        let Some(Stmt::Update(t, set, cond)) = parse("UPDATE w SET b = - -a WHERE - -a > 0") else { panic!("an UPDATE") };
+        assert_eq!(t, "w");
+        assert_eq!(format!("{set:?} {cond:?}").matches("-(-a)").count(), 2, "{set:?} {cond:?}");
     }
 }

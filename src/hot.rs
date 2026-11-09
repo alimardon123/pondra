@@ -280,7 +280,7 @@ impl Hot {
             missing
         };
         let hot = self.clone();
-        crate::panics::spawn(async move {
+        crate::spawns::spawn(async move {
             let _ = gate.await; // (the scan's query is over: its plan was dropped)
             let _slot = hot.slot.acquire().await;
             // (the room now, not when the scan asked: its query is over, and the next may hold what it left)
