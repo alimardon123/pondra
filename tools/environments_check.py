@@ -219,6 +219,8 @@ def environments_check(bin, work, port, root):
     q("CREATE RECIPIENT acme_corp")
     q("GRANT SELECT ON SHARE acme TO RECIPIENT acme_corp")
     prod.call("PUT", "/files/etl/orders.sql", "SELECT count(*) FROM sales.orders")
+    prod.call("PUT", "/files/etl/old.sql", "SELECT 1")
+    prod.call("DELETE", "/files/etl/old.sql")  # (deleted: its versions stay prod's, and a branch takes neither them nor its note)
     every = "SELECT _row_id, _version, id, amount FROM sales.orders ORDER BY id"
     keyed = "SELECT _row_id, id, v FROM k ORDER BY id"
     before, before_k, totals = rows(prod, every), rows(prod, keyed), rows(prod, "SELECT odd, n, s FROM sales.totals ORDER BY odd")
@@ -245,7 +247,9 @@ def environments_check(bin, work, port, root):
     checks["dev's task starts suspended, and no secret, share or recipient came with it"] = rows(dev, "SELECT name, state FROM pondra.tasks") == [("nightly", "suspended")] \
         and rows(dev, "SELECT count(*) FROM secrets()") == [(0,)] and rows(prod, "SELECT count(*) FROM secrets()") == [(1,)] \
         and rows(dev, shared) == [(0, 0)] and rows(prod, shared) == [(1, 1)]
-    checks["dev has prod's workspace files"] = dev.get("/files/etl/orders.sql") == b"SELECT count(*) FROM sales.orders"
+    deleted = "SELECT name FROM pondra.dropped WHERE kind = 'file'"
+    checks["dev has prod's workspace files, and none prod deleted: pondra.dropped lists those in prod alone"] = \
+        dev.get("/files/etl/orders.sql") == b"SELECT count(*) FROM sales.orders" and rows(dev, deleted) == [] and rows(prod, deleted) == [("etl/old.sql",)]
     # A task dev makes waits for RESUME too (an apply's, say); one it resumed stays started when made again.
     dev.q("CREATE TASK hourly SCHEDULE '1 hour' AS INSERT INTO k VALUES (98, 'dev')")
     made_suspended = rows(dev, "SELECT name, state FROM pondra.tasks ORDER BY name")

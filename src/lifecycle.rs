@@ -41,7 +41,7 @@ pub trait Lifecycle: Send + Sync {
     fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>>;
 }
 
-/// What a node restarting in place unwinds with ([`Lifecycle::restart`]): `panics::spawn` lets it go, and `panics::door`
+/// What a node restarting in place unwinds with ([`Lifecycle::restart`]): `spawns::spawn` lets it go, and `panics::door`
 /// answers the request 57P03, as a node catching up does.
 #[derive(Debug)]
 pub struct Restarting(pub String);

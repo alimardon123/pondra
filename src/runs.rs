@@ -818,7 +818,7 @@ pub fn schedule(app: App) {
                 running.lock().unwrap().insert(name.clone());
                 let (app, name, task) = (app.clone(), name.clone(), task.clone());
                 let ran = Ran(running.clone(), name.clone()); // (let go even if the tick panics: else it never ran again here)
-                crate::panics::task(async move {
+                crate::spawns::task(async move {
                     // (as the task's owner, an asked run only when the owner asked: `Tick::as_owner`; the node's own work, which
                     // no request asked for: `auth::as_node`)
                     crate::auth::as_node(crate::ext::scope(as_owner, run_tick(&app, &name, &task, tick))).await;
@@ -1144,8 +1144,9 @@ pub fn mentioned(sql: &str) -> bool {
     ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.shares", "pondra.recipients", "pondra.audit", "pondra.history", "pondra.loads", "pondra.learned", "pondra.flows", "pondra.expectations", "pondra.rejects", "pondra.variables", "pondra.dropped", "pondra.objects", "pondra.parts", "pondra.databases", "pondra.applies"].iter().any(|t| s.contains(t))
 }
 
-/// `pondra.routines`, `pondra.tasks` and `pondra.tables`, as they are now. `sql`: the statement that reads them (the
-/// databases dropped beside this one are listed only for one that names `pondra.dropped`: it lists their folder).
+/// `pondra.routines`, `pondra.tasks`, `pondra.tables` and `pondra.dropped`, as they are now. `sql`: the statement that reads
+/// them (the databases dropped beside this one and the lake's deleted files are listed only for one that names
+/// `pondra.dropped`: finding them lists their folder and the files' notes).
 pub async fn tables(lake: &Lake, scope: &crate::rights::Scope, sql: &str) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
     use datafusion::datasource::MemTable;
     let all = crate::routines::listed(lake).await?;
@@ -1207,8 +1208,8 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope, sql: &str) -> Res
         ("key", l(&|o| o.meta.as_ref().filter(|m| !m.key.is_empty()).map(|m| m.key.join(", ")))),
         ("definition", l(&|o| o.sql.clone())),
     ])?;
-    // (what UNDROP can still bring back: dropped tables (ADR-043), and dropped definitions (`undrop.rs`), each with the
-    // statement that does it. A relation is listed to whoever may read one of its name; any other definition to the whole.)
+    // (what UNDROP can still bring back: dropped tables (ADR-043), dropped definitions (`undrop.rs`) and deleted files, each
+    // with the statement that does it. A relation is listed to whoever may read one of its name; anything else to the whole.)
     struct Gone {
         name: String,
         kind: String,
@@ -1228,6 +1229,8 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope, sql: &str) -> Res
     if sql.to_lowercase().contains("pondra.dropped") {
         let beside = crate::undrop::lakes_kept(&crate::ddl::folder_of(&lake.url)).await.unwrap_or_default(); // (a folder that won't list: none)
         gone.extend(beside.into_iter().map(|(name, _, k)| Gone { kind: "database".into(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
+        // (deleted files a version of which is kept (`files::deleted`): a file has no rows, and its bytes are its newest version's)
+        gone.extend(crate::files::deleted(lake).await?.into_iter().map(|f| Gone { kind: "file".into(), at_ms: f.at_ms, until: f.kept_until(), rows: None, bytes: Some(f.bytes), by: f.by, name: f.path }));
     }
     let relation = |kind: &str| crate::objects::kind(kind).is_some_and(|k| k.family == "relation");
     gone.retain(|g| scope.sees(if relation(&g.kind) { crate::rights::Object::Table(&g.name) } else { crate::rights::Object::Lake }));

@@ -365,25 +365,35 @@ Both are worked out for each statement, so they are never a remembered answer. T
 `db.find(text, kind=…)` ([Python](/pondra/reference/python/), [JavaScript](/pondra/reference/javascript/)),
 and agents the [MCP](/pondra/reference/mcp/) tool `find`.
 
-## Dropped tables
+## Dropped objects and deleted files
 
-`pondra.dropped` lists the dropped tables that `UNDROP TABLE` can still bring back. A table is kept
-for 7 days after it is dropped, or for its [`retention`](/pondra/sql/table-options/).
+`pondra.dropped` lists what a drop keeps that can still come back, each with the statement that
+brings it back: the dropped tables and views you may read, and, for a token or user who sees the
+whole lake, the other dropped definitions (functions, macros, procedures, tasks, types, secrets,
+connections) and the deleted [files](/pondra/reference/http/#files) that keep a version. A table is
+kept for 7 days after it is dropped, or for its [`retention`](/pondra/sql/table-options/); a
+definition for 7 days; a deleted file for `PONDRA_FILE_VERSIONS_DAYS`, as its versions are.
 
 | Column | Meaning |
 |---|---|
-| `name` | its name; a name dropped twice has a row for each, and `UNDROP` takes the newest |
-| `dropped_at` | when it was dropped |
-| `kept_until` | when it goes for good, and its files with it |
-| `rows_in_files` | its rows (every row went to its files when it was dropped) |
-| `bytes_in_files` | the same, in bytes |
+| `name` | its name, or a file's path under `files/`; a name dropped twice has a row for each, and `UNDROP` takes the newest |
+| `dropped_at` | when it was dropped or deleted |
+| `kept_until` | when it goes for good, and a table's files with it |
+| `rows_in_files` | a table's rows (every row went to its files when it was dropped); null for anything else |
+| `bytes_in_files` | a table's bytes, or a deleted file's newest version's; null for a definition |
+| `kind` | `table`, `view`, `function`, … as `pondra.objects` names it, or `file` |
+| `dropped_by` | who dropped or deleted it |
+| `undrop` | the statement that brings it back: `UNDROP TABLE sales.orders`, `UNDROP FILE 'notes/a.txt'` |
 
 ```sql
 CREATE TABLE scratch (a BIGINT) WITH (retention = '2 hours');
 DROP TABLE scratch;
-SELECT name, kept_until - dropped_at AS kept FROM pondra.dropped WHERE name = 'scratch';
+SELECT name, kept_until - dropped_at AS kept, undrop FROM pondra.dropped WHERE kind = 'table' AND name = 'scratch';
 DROP TABLE IF EXISTS scratch;
 ```
+
+Databricks' `SHOW TABLES DROPPED`, `SHOW VOLUMES …` and `UNDROP … WITH ID`, and Snowflake's
+`SHOW TABLES HISTORY`, are refused with these words to write instead.
 
 ## Flows and expectations
 
