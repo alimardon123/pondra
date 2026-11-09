@@ -158,7 +158,7 @@ fn sql_name(app: &crate::app::App, parts: &[String], lake: &std::sync::Arc<Lake>
 /// A statement for the catalog's table changes, run as the caller (DDL: an admin's). `drops_namespace`: the namespace DELETE route, whose
 /// 2BP01 is a namespace that isn't empty.
 async fn as_caller(app: &crate::app::App, who: &crate::auth::Principal, sql: &str, drops_namespace: bool) -> Result<(), Refusal> {
-    let (shows, who) = (who.scope.shows_code(), crate::routines::Who { role: who.role, files: false, depth: 0, scope: who.scope.clone() });
+    let (shows, who) = (who.scope.shows_code(), crate::routines::Who::signed(who.clone(), who.role, false));
     Box::pin(crate::routines::one(app, sql, who, None)).await.map(|_| ()).map_err(|e| exception(crate::codes::of(&e), crate::codes::told(&e, shows), drops_namespace))
 }
 

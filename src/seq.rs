@@ -448,7 +448,7 @@ async fn submit(lake: &Lake, op: Op) -> Result<Ack> {
         None => {
             // (`pondra sql` without a node: the leader that is there, if any)
             let t = crate::terms::latest(&lake.store).await?.filter(|t| !t.addr.is_empty()).context("a sequence's values come from the lake's leader, and none is running: start a node (pondra serve)")?;
-            crate::log::To::Leader(t.addr)
+            crate::log::To::leader(lake, t.addr)
         }
     };
     to.sequence(op).await

@@ -431,19 +431,31 @@ pub async fn drop(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
     Ok(j!({r.what(): name, "dropped": true}))
 }
 
+/// What a lake keeps for its functions and procedures (invariant 301): them by name, as of the catalog's version they
+/// were read at (`listed`).
+#[derive(Default)]
+pub struct Kept(Mutex<Option<(u64, Arc<HashMap<String, Routine>>)>>);
+
+impl crate::lake_state::LakeState for Kept {
+    const NAME: &'static str = "routines";
+    const ABOUT: &'static str = "its functions, macros and procedures by name, as of the catalog's version they were read at";
+    fn make() -> Self {
+        Kept::default()
+    }
+}
+
 /// This lake's functions and procedures, by name: read again only after a commit (every query asks).
 pub async fn listed(lake: &Lake) -> Result<Arc<HashMap<String, Routine>>> {
-    type Seen = Mutex<HashMap<String, (u64, Arc<HashMap<String, Routine>>)>>;
-    crate::per_node!(static SEEN: Seen = Default::default());
+    let kept = lake.state::<Kept>()?;
     let version = lake.cat.version();
-    if let (Some(v), Some((at, all))) = (version, SEEN.lock().unwrap().get(&lake.url)) {
+    if let (Some(v), Some((at, all))) = (version, &*kept.0.lock().unwrap()) {
         if *at == v {
             return Ok(all.clone());
         }
     }
     let all: Arc<HashMap<String, Routine>> = Arc::new(lake.cat.scan::<Routine>("r/", "r0").await?.into_iter().map(|(k, r)| (k[2..].to_string(), r)).collect());
     if let Some(v) = version {
-        SEEN.lock().unwrap().insert(lake.url.clone(), (v, all.clone()));
+        *kept.0.lock().unwrap() = Some((v, all.clone()));
     }
     Ok(all)
 }
@@ -756,13 +768,24 @@ impl Request {
 
 /// Who a statement runs for: the caller's rights (`files`: it may read files on this machine,
 /// `statement::owner`), what it plans for (`scope`: the principal's its door signed in, M8 piece 3b; step 8's session
-/// carries it), and how deep in procedures calling procedures it is.
+/// carries it), how deep in procedures calling procedures it is, and who did it (`by`: the principal its door signed in,
+/// whose name, door and address its stamps and log lines carry, M8 piece 3d; kept when an apply raises its role; none
+/// for the node's own work, a task's tick, which nobody signed in for).
 #[derive(Clone)]
 pub struct Who {
     pub role: Role,
     pub files: bool,
     pub depth: u32,
     pub scope: crate::rights::Scope,
+    pub by: Option<crate::auth::Principal>,
+}
+
+impl Who {
+    /// A first call, as `by`'s door signed it in: its scope, with the door's `role` for it and `files`.
+    pub fn signed(by: crate::auth::Principal, role: Role, files: bool) -> Who { Who { role, files, depth: 0, scope: by.scope.clone(), by: Some(by) } }
+
+    /// The name it is stamped with: its sign-in's (none: the node's own, "").
+    pub fn name(&self) -> &str { self.by.as_ref().map_or("", |p| p.name.as_str()) }
 }
 
 pub enum Outcome {
@@ -816,16 +839,17 @@ pub fn split(text: &str) -> Vec<String> {
 
 /// Run one statement here as the caller could have sent it (the audit log told: `audit.rs`).
 pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
+    let by = who.by.clone(); // (its log lines' and history's: `audit::statement`)
     if let Some(word) = crate::text::control(sql) {
         // BEGIN, COMMIT, ROLLBACK: the session's transaction (ADR-036 §5)
-        let (tag, warning) = crate::audit::statement(app, sql, Box::pin(crate::txn::command(app, word, sql))).await?; // (on the heap: procedures call procedures deep)
+        let (tag, warning) = crate::audit::statement(app, by.as_ref(), sql, Box::pin(crate::txn::command(app, word, sql))).await?; // (on the heap: procedures call procedures deep)
         warning.iter().for_each(|w| heard(&format!("WARNING: {w}")));
         return Ok(Outcome::Done(j!({"transaction": tag.to_lowercase()})));
     }
     let shows = who.scope.shows_code(); // (a failed transaction's words, as its caller is told them)
     // (the gate runs inside the audited statement, so a refusal there is audited and fails the transaction too: a write
     // in a READ ONLY one (25006) leaves it failed, and the next statement gets 25P02)
-    let out = crate::audit::statement(app, sql, Box::pin(async move {
+    let out = crate::audit::statement(app, by.as_ref(), sql, Box::pin(async move {
         let busy = crate::txn::next(app, sql).await?; // (a failed transaction takes nothing but its end; READ COMMITTED reads the newest commit; the guard keeps the transaction busy while this runs)
         crate::txn::began(busy.id(), one_or_locked(app, sql, who, job)).await // (the transaction it began in: a write that outlives it is refused, 25000)
     }))

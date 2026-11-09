@@ -115,8 +115,9 @@ pub trait Dial: Send + Sync {
     /// The URL `to` is reached at: a "host:port" as members name themselves, or a URL with its scheme, as given.
     fn url(&self, to: &str) -> String;
 
-    /// Sends `call` to `to`. An error only when no answer came; a refusal is a `Reply`.
-    fn call<'a>(&'a self, to: &'a str, call: Call) -> BoxFuture<'a, Result<Reply>>;
+    /// Sends `call` to `to`, from node `node`, which signs it with its key (`cluster::http`). An error only when no answer came;
+    /// a refusal is a `Reply`.
+    fn call<'a>(&'a self, node: &'a crate::node_state::NodeState, to: &'a str, call: Call) -> BoxFuture<'a, Result<Reply>>;
 
     /// Is `e` a call that got no answer (no connection, or none in time)?
     fn unreached(&self, e: &anyhow::Error) -> bool;
@@ -132,8 +133,8 @@ pub fn dial() -> &'static dyn Dial { &Paged }
 /// The URL `to` is reached at.
 pub fn url(to: &str) -> String { dial().url(to) }
 
-/// Sends `c` to `to` (see `Dial::call`).
-pub async fn call(to: &str, c: Call) -> Result<Reply> { dial().call(to, c).await }
+/// Sends `c` to `to` from node `node` (see `Dial::call`).
+pub async fn call(node: &crate::node_state::NodeState, to: &str, c: Call) -> Result<Reply> { dial().call(node, to, c).await }
 
 /// Is `e` a call that got no answer?
 pub fn unreached(e: &anyhow::Error) -> bool { dial().unreached(e) }
@@ -146,7 +147,7 @@ pub struct Paged;
 impl Dial for Paged {
     fn url(&self, to: &str) -> String { to.to_string() }
 
-    fn call<'a>(&'a self, to: &'a str, _: Call) -> BoxFuture<'a, Result<Reply>> {
+    fn call<'a>(&'a self, _: &'a crate::node_state::NodeState, to: &'a str, _: Call) -> BoxFuture<'a, Result<Reply>> {
         Box::pin(async move { Err(anyhow!("{to}: this form reaches no other member")) })
     }
 
@@ -166,7 +167,7 @@ pub struct Joined<'a> {
 impl Dial for Joined<'_> {
     fn url(&self, to: &str) -> String { to.to_string() }
 
-    fn call<'a>(&'a self, to: &'a str, c: Call) -> BoxFuture<'a, Result<Reply>> { Box::pin(page_call(self.node, self.auth, to, c)) }
+    fn call<'a>(&'a self, _: &'a crate::node_state::NodeState, to: &'a str, c: Call) -> BoxFuture<'a, Result<Reply>> { Box::pin(page_call(self.node, self.auth, to, c)) }
 
     fn unreached(&self, e: &anyhow::Error) -> bool { e.downcast_ref::<NoAnswer>().is_some() }
 }
@@ -213,17 +214,14 @@ async fn page_call(node: &str, auth: &str, to: &str, c: Call) -> Result<Reply> {
     Ok(Reply::new(status, sqlstate, failed, body.boxed()))
 }
 
-// The nodes' key: the key a lake's nodes call each other with when no admin token is set. It is the
-// node's, not the process's, so the next node in a process (another lake) is never sent it.
-crate::per_node!(static NODE_KEY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None));
-
-/// The key this node calls the others with: `PONDRA_NODE_KEY` as set, else the lake's own, once known.
-pub fn node_key() -> Option<String> {
-    crate::env::get("PONDRA_NODE_KEY").or_else(|| NODE_KEY.read().unwrap_or_else(|e| e.into_inner()).clone())
+/// The key node `node` calls the others with: `PONDRA_NODE_KEY` as set, else the lake's own, once known (`Calls`: the node's,
+/// not the process's, so the next node in a process (another lake) is never sent it).
+pub fn node_key(node: &crate::node_state::NodeState) -> Option<String> {
+    crate::env::get("PONDRA_NODE_KEY").or_else(|| node.calls.key.read().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 /// This node learned the lake's key for its nodes (`node.rs`).
-pub fn set_node_key(k: String) { *NODE_KEY.write().unwrap_or_else(|e| e.into_inner()) = Some(k); }
+pub fn set_node_key(node: &crate::node_state::NodeState, k: String) { *node.calls.key.write().unwrap_or_else(|e| e.into_inner()) = Some(k); }
 
 /// The nodes' key in hand before this node calls its leader for a caller (`write::on_node_as`): a
 /// follower that just started may sign a user in, its catalog holding the users, a moment before the
@@ -231,12 +229,12 @@ pub fn set_node_key(k: String) { *NODE_KEY.write().unwrap_or_else(|e| e.into_inn
 /// `harness.py guarded`, "a change a follower forwards…"). It waits 10 s at most, and not at all for a
 /// key sealed by a master key this node doesn't have: waiting won't help that one.
 pub async fn signed(lake: &crate::store::Lake) {
-    if crate::env::is_set("PONDRA_TOKEN") || crate::env::is_set("PONDRA_ADMIN_TOKEN") || node_key().is_some() {
+    if crate::env::is_set("PONDRA_TOKEN") || crate::env::is_set("PONDRA_ADMIN_TOKEN") || node_key(&lake.node).is_some() {
         return;
     }
     for _ in 0..40 {
         match crate::users::node_key(lake).await {
-            Ok(k) => return set_node_key(k),
+            Ok(k) => return set_node_key(&lake.node, k),
             Err(e) if format!("{e:#}").contains("master key") => return,
             Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
         }
@@ -253,12 +251,13 @@ mod tests {
     fn a_page_reaches_its_joined_node_alone_and_refuses_every_other_call_by_name() {
         // (a Tokio runtime, as the program's: a call's time limit is a Tokio timer)
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a runtime");
-        let e = rt.block_on(Paged.call("node-2:7000", Call::get("/cluster/visible"))).err().expect("the form's dial reaches no member");
+        let node = crate::node_state::NodeState::unhosted();
+        let e = rt.block_on(Paged.call(&node, "node-2:7000", Call::get("/cluster/visible"))).err().expect("the form's dial reaches no member");
         assert_eq!(e.to_string(), "node-2:7000: this form reaches no other member");
         assert!(!Paged.unreached(&e));
 
         let page = Joined { node: "https://n:7000", auth: "Bearer ps_test" };
-        let call = |to: &str, c: Call| rt.block_on(page.call(to, c));
+        let call = |to: &str, c: Call| rt.block_on(page.call(&node, to, c));
         let other = call("https://other:7000", Call::get("/cluster/visible")).err().expect("another member is refused");
         assert!(other.to_string().contains("reaches its node (https://n:7000) and no other member"), "{other:#}");
         let bare = call("https://n:7000/", Call::get("no-slash")).err().expect("a path starts with /");
@@ -269,7 +268,7 @@ mod tests {
         assert!(as_user.to_string().contains("own sign-in"), "{as_user:#}");
         // (a send to a port nothing listens on is no answer: `unreached`, which a member's retry relies on)
         let gone_page = Joined { node: "http://127.0.0.1:1", auth: "Bearer ps_test" };
-        let gone = rt.block_on(gone_page.call("http://127.0.0.1:1", Call::get("/cluster/visible").timeout(Duration::from_secs(5)))).err().expect("no node answers");
+        let gone = rt.block_on(gone_page.call(&node, "http://127.0.0.1:1", Call::get("/cluster/visible").timeout(Duration::from_secs(5)))).err().expect("no node answers");
         assert!(gone_page.unreached(&gone), "{gone:#}");
     }
 }

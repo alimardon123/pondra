@@ -34,6 +34,71 @@ fn inline_bytes() -> usize {
 const FLUSHES_IN_FLIGHT: usize = 4; // per node: object-store latency overlaps instead of adding up
 const COMMITS_IN_FLIGHT: usize = 4; // leader: catalog writes not yet committed
 
+/// A hook in the log's commits (designs/redesign/redesign.md, step 5 piece 6): a feature that keeps rows of its own in step
+/// with the rows the log takes registers one, and the log calls it without knowing whose it is. `views` registers a
+/// view's rows, derived as its sources' are packed and refused by its expectations.
+#[derive(Clone, Copy)]
+pub struct CommitHook {
+    pub name: &'static str,
+    /// The rows it adds to a flush, from the rows the flush carries by table (`new`) and each batch's producer (`by`).
+    pub derive: for<'a> fn(&'a Lake, &'a BTreeMap<String, Vec<RecordBatch>>, &'a BTreeMap<String, Vec<String>>) -> futures::future::BoxFuture<'a, Result<Vec<(String, RecordBatch)>>>,
+    /// Whether an error from `derive` refuses the rows it was given: a producer's write packed with others then fails
+    /// alone, and the others go again without it.
+    pub refused: fn(&anyhow::Error) -> bool,
+    /// As a commit starts, numbered `next`: what this commit's flushes owe it (`Owes`), and the records it puts with them.
+    pub commit: for<'a> fn(&'a Lake, u64) -> futures::future::BoxFuture<'a, Result<(Arc<dyn Owes>, Vec<(String, Vec<u8>)>)>>,
+    /// A leader starts on the lake: what the hook remembered of it is let go.
+    pub led: fn(&Lake),
+}
+
+/// What one commit's flushes owe a hook: a flush packed before the hook changed (a view made or dropped since) goes
+/// back to be packed again.
+pub trait Owes: Send + Sync {
+    /// The tables the hook derives rows for from `table`'s: a flush with rows for `table` must carry theirs.
+    fn owed(&self, table: &str) -> &[String];
+    /// Whether the hook derives rows for `table`: a flush's derived rows are each for one a hook derives.
+    fn derives(&self, table: &str) -> bool;
+}
+
+/// The registry's commit hooks, in the order their extensions add them.
+#[derive(Default)]
+pub struct CommitHooks(Vec<CommitHook>);
+
+impl crate::registry::Section for CommitHooks {
+    const NAME: &'static str = "commit hooks";
+    fn check(&self, _: &crate::registry::Registry) -> std::result::Result<(), String> {
+        match self.0.iter().enumerate().find(|(i, h)| self.0[..*i].iter().any(|o| o.name == h.name)) {
+            Some((_, h)) => Err(format!("{} twice", h.name)),
+            None => Ok(()),
+        }
+    }
+}
+
+impl CommitHooks {
+    pub fn add(&mut self, hook: CommitHook) {
+        self.0.push(hook);
+    }
+}
+
+/// This build's commit hooks (none in a build without an extension that adds one).
+fn hooks() -> &'static [CommitHook] {
+    crate::registry::get().find::<CommitHooks>().map_or(&[], |h| &h.0)
+}
+
+/// Every hook's rows for a flush carrying `new` (by `by`), in hook order.
+async fn derived(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>, by: &BTreeMap<String, Vec<String>>) -> Result<Vec<(String, RecordBatch)>> {
+    let mut out = vec![];
+    for h in hooks() {
+        out.extend((h.derive)(lake, new, by).await?);
+    }
+    Ok(out)
+}
+
+/// Whether a hook refuses the rows behind `e`.
+fn refused(e: &anyhow::Error) -> bool {
+    hooks().iter().any(|h| (h.refused)(e))
+}
+
 /// Who sent a batch: its producer and sequence number (and, optionally, the seq it expects to
 /// follow: a compare-and-swap that streaming tasks use).
 #[derive(Serialize, Deserialize, Clone)]
@@ -196,10 +261,15 @@ pub const SEQ_FROM_1: &str = "a producer's batches count from seq=1 (seq 0 would
 #[derive(Clone)]
 pub enum To {
     Local(Arc<Sequencer>),
-    Leader(String),
+    /// The leader's address, and its lake's bell for a flush the leader didn't take (`Kept::untaken`), and the node that sends
+    /// to it.
+    Leader(String, Arc<tokio::sync::Notify>, Arc<crate::node_state::NodeState>),
 }
 
 impl To {
+    /// The leader at `addr`, for lake `lake`'s flushes.
+    pub fn leader(lake: &Lake, addr: String) -> To { To::Leader(addr, lake.log.untaken.clone(), lake.node.clone()) }
+
     /// A commit number of its own, its time, and a block of row ids (`Sequencer::reserve`).
     pub async fn reserve(&self) -> Result<Reserved> { self.ask(Flush { reserve: 1, block: true, ..Default::default() }).await }
 
@@ -220,22 +290,10 @@ impl To {
     async fn outcome(&self, f: Flush) -> Result<Outcome> {
         Ok(match self {
             To::Local(seq) => seq.submit(f).await?,
-            To::Leader(addr) => led(addr, dial::call(addr, dial::Call::post("/cluster/commit", encode_flush(&f)?)).await.inspect_err(|_| untaken())?)?.checked()?.json().await?,
+            To::Leader(addr, untaken, node) => led(addr, dial::call(&node, addr, dial::Call::post("/cluster/commit", encode_flush(&f)?)).await.inspect_err(|_| untaken.notify_one())?)?.checked()?.json().await?,
         })
     }
 }
-
-// A follower's flush its leader didn't take: its follow loop (`cluster::Cluster::follow`) asks the leader at once, not at its
-// next beat. (Here, not in `cluster`, which this layer doesn't reach: the follow loop waits on it.)
-crate::per_node!(static UNTAKEN: tokio::sync::Notify = tokio::sync::Notify::new(); clear = |_| ());
-
-/// A flush this follower sent its leader went unanswered (the connection refused or closed): a drained leader's door is
-/// closing, and it steps down a moment later. Its follow loop asks it again now, then every tenth of a second.
-fn untaken() { UNTAKEN.notify_one() }
-
-/// Waits for a flush the leader didn't take (`untaken`), for the follow loop.
-#[cfg(feature = "doors")]
-pub async fn untaken_flush() { UNTAKEN.notified().await }
 
 /// The leader's answer to a flush, or the refusal of one that doesn't lead (421, `server::commit`): made before any
 /// sequencer took it, so its writes are refused as never run (57P03), and their clients send them again, to this node once
@@ -396,11 +454,11 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                     unanswered = false;
                     anyhow::Ok(outcome)
                 }
-                To::Leader(addr) => {
-                    let request = dial::call(addr, dial::Call::post("/cluster/commit", encode_flush(&f)?));
+                To::Leader(addr, untaken, node) => {
+                    let request = dial::call(&node, addr, dial::Call::post("/cluster/commit", encode_flush(&f)?));
                     drop(done.take()); // (sent in order; over HTTP they may still arrive out of order, rarely)
                     unanswered = true;
-                    let response = request.await.inspect_err(|_| untaken())?; // (its follow loop looks now: `cluster.rs`)
+                    let response = request.await.inspect_err(|_| untaken.notify_one())?; // (its follow loop looks now: `cluster.rs`)
                     // (a 4xx is the leader's refusal, made before its sequencer took the flush; a 5xx, or a body lost on the
                     // way, may come after it did, so the rows may still commit: lost, as a dropped reply is here)
                     unanswered = !(400..500).contains(&response.status);
@@ -436,15 +494,15 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                     let _ = a.ack.send(answered); // and go again with the rest
                 }
             }
-            Err(e) if crate::views::refused(&e) && pending.len() > 1 => {
-                // A row a view's expectation refuses fails its own write, not the others it was
+            Err(e) if refused(&e) && pending.len() > 1 => {
+                // A row a hook refuses (a view's expectation) fails its own write, not the others it was
                 // packed with: they go again without it.
                 let n = pending.len();
                 let mut kept = vec![];
                 for a in pending.drain(..) {
                     let rows = BTreeMap::from([(a.table.clone(), vec![a.batch.clone()])]);
-                    match crate::views::derive(lake, &rows, &BTreeMap::new()).await {
-                        Err(e) if crate::views::refused(&e) => drop(a.ack.send(Err(format!("{e:#}").into()))),
+                    match derived(lake, &rows, &BTreeMap::new()).await {
+                        Err(e) if refused(&e) => drop(a.ack.send(Err(format!("{e:#}").into()))),
                         _ => kept.push(a),
                     }
                 }
@@ -518,7 +576,7 @@ pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<Strin
         parts.push(Part { table: table.into(), off, len: data.len() as u64 - off, rows: batch.num_rows() as u64, src, placed });
         Ok(())
     };
-    // (each batch's producer, in its place: a view names the run its dropped rows came with, `views::derive`)
+    // (each batch's producer, in its place: a view names the run its dropped rows came with, its hook's `derive`)
     let mut by: BTreeMap<String, Vec<String>> = followed.iter().map(|(t, b)| (t.clone(), vec![followed_by.get(t).cloned().unwrap_or_default(); b.len()])).collect();
     let mut by_table = followed;
     let mut metas: BTreeMap<String, Option<Arc<TableMeta>>> = BTreeMap::new(); // (the log keeps columns under their stored names: ADR-022)
@@ -534,7 +592,7 @@ pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<Strin
         by_table.entry(a.table.clone()).or_default().push(a.batch.clone());
         by.entry(a.table.clone()).or_default().push(a.src.producer.clone());
     }
-    for (table, batch) in crate::views::derive(lake, &by_table, &by).await? {
+    for (table, batch) in derived(lake, &by_table, &by).await? {
         add(&table, &batch, None, None)?;
     }
     let mut f = Flush { parts, ..Default::default() };
@@ -616,7 +674,9 @@ impl Sequencer {
         // Row ids' blocks (ADR-029 §11): a counter of their own, which starts above every commit
         // number (the blocks before it had), and moves only as blocks are taken.
         let mut block: u64 = lake.cat.get("b").await?.unwrap_or(next);
-        crate::views::forget(&lake); // (the views as this leader finds them)
+        for h in hooks() {
+            (h.led)(&lake); // (the views as this leader finds them)
+        }
         for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
             let rows = crate::tier::backlog(&lake, meta.tiered, None).await?.get(&key[2..]).copied().unwrap_or(0);
             lake.backlog.fetch_add(rows, Ordering::Relaxed);
@@ -703,12 +763,19 @@ impl Sequencer {
     }
 }
 
-crate::per_node!(
-    /// Producers whose progress left the catalog (a view dropped: `emit:`, `join:`, `fill:`): the
-    /// sequencer forgets what it remembered of them, so a view made again under the name starts over.
-    static FORGOTTEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new()));
+/// What the log keeps for a lake between its commits (`Lake::log`).
+#[derive(Default)]
+pub struct Kept {
+    /// Producers whose progress left the catalog (a view dropped: `emit:`, `join:`, `fill:`): the lake's sequencer forgets
+    /// what it remembered of them, so a view made again under the name starts over (`forget_producers`).
+    forgotten: std::sync::Mutex<Vec<String>>,
+    /// A flush this lake's node sent its leader that the leader didn't take (the connection refused or closed: a drained
+    /// leader's door is closing, and it steps down a moment later). Its follow loop (`cluster.rs`) asks it again at once, then
+    /// every tenth of a second (`To::outcome`, `send`).
+    pub(crate) untaken: Arc<tokio::sync::Notify>,
+}
 
-pub fn forget_producers(names: impl IntoIterator<Item = String>) { FORGOTTEN.lock().unwrap().extend(names); }
+pub fn forget_producers(lake: &Lake, names: impl IntoIterator<Item = String>) { lake.log.forgotten.lock().unwrap().extend(names); }
 
 /// The family of expiry keys: `g/{due, 20 digits}/{producer}` → the seq that mark stood at when its
 /// commit kept it. Due its window (`store::kept_ms`), the mark goes if its producer's seq is still that
@@ -850,11 +917,15 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
     let (mut puts, mut seqs, mut replies) = (vec![], HashMap::<String, u64>::new(), vec![]);
     let mut lost: Vec<String> = vec![]; // (keys the filings of this commit delete: `Filing::gone`)
     let (mut inline, mut inline_parts) = (vec![], BTreeMap::<String, Vec<(u64, u64, u64)>>::new()); // all inline flushes: one segment
-    for p in std::mem::take(&mut *FORGOTTEN.lock().unwrap()) {
+    for p in std::mem::take(&mut *lake.log.forgotten.lock().unwrap()) {
         producers.forget(&p);
     }
-    let (views, blocks) = (crate::views::inline(lake).await?, *block);
-    puts.extend(crate::views::bound(lake, &views, *next)); // (views made since: their filling ends before this commit)
+    let (mut owes, blocks) = (vec![], *block);
+    for h in hooks() {
+        let (owed, put) = (h.commit)(lake, *next).await?; // (views made since: their filling ends before this commit)
+        owes.push(owed);
+        puts.extend(put);
+    }
     let mut takes = None; // (only numbers taken, sequences' blocks, row ids' blocks, a bulk write's commit: a commit no read sees)
     for (mut f, reply) in batch {
         if let Some(op) = f.sequence.take() {
@@ -877,12 +948,17 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
             continue;
         }
         // 0. A flush packed with other views than the ones its tables have now goes back to be
-        // packed again (`views::Inline`).
+        // packed again (each hook's `Owes`).
         let derived: std::collections::HashSet<&str> = f.parts.iter().filter(|p| p.src.is_none()).map(|p| p.table.as_str()).collect();
         let filed = f.filed.iter().filter(|x| !x.added.is_empty() || !x.removed.is_empty() || !x.deleted.is_empty()).map(|x| x.table.as_str()); // (a file commit's rows: its views derived theirs too)
         // (a view's own rows are owed to the views that follow it: a flow, ADR-036 §1)
-        let mut owed = f.parts.iter().filter(|p| p.rows > 0).map(|p| p.table.as_str()).chain(filed).flat_map(|t| views.by_source.get(t).into_iter().flatten());
-        if owed.any(|v| !derived.contains(v.as_str())) || derived.iter().any(|t| !views.tables.contains(*t)) {
+        let mut stale = derived.iter().any(|t| !owes.iter().any(|o| o.derives(t)));
+        for t in f.parts.iter().filter(|p| p.rows > 0).map(|p| p.table.as_str()).chain(filed) {
+            for o in &owes {
+                stale |= o.owed(t).iter().any(|v| !derived.contains(v.as_str()));
+            }
+        }
+        if stale {
             replies.push((reply, Outcome::Retry(vec![])));
             continue;
         }
@@ -1005,7 +1081,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
     let durable = lake.cat.write(puts, &dropped).await?;
     // (the job marks this commit deleted: forgotten once the delete is written, so the cache holds
     // them until then; `copy::entries`)
-    forget_producers(dropped.iter().filter_map(|k| k.strip_prefix("p/job:").map(|j| format!("job:{j}"))));
+    forget_producers(lake, dropped.iter().filter_map(|k| k.strip_prefix("p/job:").map(|j| format!("job:{j}"))));
     producers.remember(seqs);
     let (lake, ms, hwm) = (lake.clone(), ms.clone(), *next - 1);
     crate::panics::spawn(async move {
@@ -1196,6 +1272,21 @@ mod tests {
     use datafusion::arrow::datatypes::Int32Type;
     use datafusion::arrow::ipc::writer::StreamWriter;
 
+    /// The log calls its commit hooks and names none (step 5 piece 6): this build's views are one, and two of one name
+    /// stop the registry's build.
+    #[test]
+    fn commits_call_the_hooks_the_registry_has() {
+        assert_eq!(hooks().iter().map(|h| h.name).collect::<Vec<_>>(), ["views"], "the engine adds the views' hook, and nothing else adds one yet");
+        let twice = crate::registry::BuiltIn { name: "twice", requires: &[], register: |r| {
+            let hooks = r.section_mut::<CommitHooks>();
+            hooks.add(super::hooks()[0]); // (the views', as the engine added it)
+            hooks.add(super::hooks()[0]);
+        } };
+        let built = std::panic::catch_unwind(|| crate::registry::Registry::build(&[&twice]));
+        let why = built.err().and_then(|e| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+        assert!(why.contains("commit hooks section: views twice"), "{why}");
+    }
+
     /// A flush a node that doesn't lead refused (421: a leader killed and started again, back as a follower of the term
     /// another took) is refused to its writers as never run, which a client sends again (57P03), not as an answer lost.
     #[test]
@@ -1206,6 +1297,17 @@ mod tests {
         let refused = anyhow::Error::new(Refusal { why: format!("{e:#}"), lost: false }); // (as `send` gives it to each writer)
         assert_eq!((crate::codes::of(&e), crate::codes::of(&refused), unanswered(&refused)), ("57P03", "57P03", false), "{e:#}");
         assert!(led("127.0.0.1:8712", reply(200)).is_ok());
+    }
+
+    /// Two lakes in one process keep their forgets apart: a producer forgotten by one lake's view drop is not the other's.
+    #[tokio::test]
+    async fn a_forget_is_its_lakes_alone() -> Result<()> {
+        let open = || async { crate::store::Lake::open(&format!("memory://forget-{}", uuid::Uuid::new_v4().simple()), true, false, crate::node_state::NodeState::unhosted()).await };
+        let (a, b) = (open().await?, open().await?);
+        forget_producers(&a, ["job:x".to_string()]);
+        assert_eq!(a.log.forgotten.lock().unwrap().as_slice(), ["job:x"]);
+        assert!(b.log.forgotten.lock().unwrap().is_empty());
+        Ok(())
     }
 
     #[test]

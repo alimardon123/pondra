@@ -148,13 +148,28 @@ fn args_text(args: &RecordBatch) -> String {
 
 type Sent = (Line, Option<tokio::sync::oneshot::Sender<()>>);
 
-crate::per_node!(static WRITER: std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<Sent>>> = std::sync::RwLock::new(None));
+/// What a lake keeps for its runs (invariant 301): its run log's writer, made on the first line, and its tasks as of the
+/// catalog's version they were read at (`tasks`).
+#[derive(Default)]
+pub struct Kept {
+    writer: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Sent>>,
+    tasks: Mutex<Option<(u64, Arc<Vec<(String, Task)>>)>>,
+}
+
+impl crate::lake_state::LakeState for Kept {
+    const NAME: &'static str = "runs";
+    const ABOUT: &'static str = "its run log's writer, and its tasks as of the catalog's version they were read at";
+    fn make() -> Self {
+        Kept::default()
+    }
+}
 
 fn log(app: &App, line: Line, done: Option<tokio::sync::oneshot::Sender<()>>) {
     if app.log.is_none() || !app.members.keeps_records() {
         return; // (a read-only node writes nothing; a joined page's node keeps the records)
     }
-    let tx = crate::reset::Once::get_or(&*WRITER, || {
+    let Ok(kept) = app.lake.state::<Kept>() else { return };
+    let tx = kept.writer.get_or_init(|| {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         crate::history::keep(&app.lake, write(app.clone(), rx));
         tx
@@ -755,17 +770,16 @@ pub async fn drop_task(lake: &Lake, name: &str, if_exists: bool) -> Result<serde
 
 /// This lake's tasks, read again only after a commit.
 pub(crate) async fn tasks(lake: &Lake) -> Result<Arc<Vec<(String, Task)>>> {
-    crate::per_node!(static SEEN: Mutex<HashMap<String, (u64, Arc<Vec<(String, Task)>>)>> = Mutex::new(HashMap::new()));
-    let seen = &*SEEN;
+    let kept = lake.state::<Kept>()?;
     let version = lake.cat.version();
-    if let (Some(v), Some((at, all))) = (version, seen.lock().unwrap().get(&lake.url)) {
+    if let (Some(v), Some((at, all))) = (version, &*kept.tasks.lock().unwrap()) {
         if *at == v {
             return Ok(all.clone());
         }
     }
     let all = Arc::new(lake.cat.scan::<Task>("j/", "j0").await?.into_iter().map(|(k, t)| (k[2..].to_string(), t)).collect::<Vec<_>>());
     if let Some(v) = version {
-        seen.lock().unwrap().insert(lake.url.clone(), (v, all.clone()));
+        *kept.tasks.lock().unwrap() = Some((v, all.clone()));
     }
     Ok(all)
 }
@@ -831,7 +845,7 @@ impl Drop for Ran {
 /// try within `timeout`; then its line in the run log, then the tick marked done, with how it went.
 async fn run_tick(app: &App, name: &str, task: &Task, tick: Tick) {
     let job = format!("task:{name}:{}", tick.at);
-    let who = Who { role: Role::Admin, files: false, depth: 0, scope: crate::auth::Principal::node().scope }; // (the schedule's: the node's own)
+    let who = Who { by: None, ..Who::signed(crate::auth::Principal::node(), Role::Admin, false) }; // (the schedule's: the node's own, signed in by no one)
     let none = RecordBatch::new_empty(Arc::new(datafusion::arrow::datatypes::Schema::empty()));
     let id = format!("task-{name}-{}", tick.at); // (a tick run again after a failover is the same run: its row, ended)
     let run = CALLER.sync_scope("schedule".into(), || Run::start(app, name, Role::Admin, Some(&job), &none, Some(id)));

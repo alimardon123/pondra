@@ -156,6 +156,7 @@ pub(crate) fn hosting() -> bool { SUPERVISOR.lock().unwrap_or_else(PoisonError::
 pub struct Native {
     guest: bool,
     settings: crate::settings::Values, // (the node's, which the processes it starts are handed: `lead_elsewhere`)
+    claims: Arc<crate::node_state::Claims>, // (the node's: its restart says in them that it is coming back, `restart_with`)
 }
 
 /// A node's state as the code below the hosts sees it, with this host's lifecycle: a guest's when `guest`.
@@ -163,12 +164,13 @@ pub fn native(guest: bool) -> Arc<crate::node_state::NodeState> { native_with(gu
 
 /// `native`, the node starting with `settings` (`Options::settings`).
 pub(crate) fn native_with(guest: bool, settings: crate::settings::Values) -> Arc<crate::node_state::NodeState> {
-    crate::node_state::NodeState::starting(Arc::new(Native { guest, settings: settings.clone() }), settings)
+    let claims = Arc::<crate::node_state::Claims>::default();
+    crate::node_state::NodeState::claiming(Arc::new(Native { guest, settings: settings.clone(), claims: claims.clone() }), settings, claims)
 }
 
 impl crate::lifecycle::Lifecycle for Native {
     fn stop(&self, why: String) { stop(why) }
-    fn restart(&self, why: &str, carried: &[(&str, String)]) -> ! { restart_with(self.guest, why, carried) }
+    fn restart(&self, why: &str, carried: &[(&str, String)]) -> ! { restart_with(self.guest, &self.claims, why, carried) }
     /// (a library's host and a `pondra sql` guest's shell show only trouble, so there it is not said)
     fn say(&self, line: &str) {
         if !hosted() && !self.guest {
@@ -231,7 +233,7 @@ impl crate::lifecycle::Lifecycle for PageLife {
 /// task that asked unwinds, past the panic hook (a host's error reporting sees no panic for a takeover). In the
 /// program the same binary runs again (`run::exec_again`). On a page there is no program to run again, so a restart
 /// is a stop until the page decides otherwise (L2's answer in the design).
-fn restart_with(guest: bool, why: &str, carried: &[(&str, String)]) -> ! {
+fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carried: &[(&str, String)]) -> ! {
     if guest && crate::write::tries() >= 5 {
         eprintln!("gave up after 5 restarts: {why}"); // (a guest that is sent back five times is a statement that fails: it says why)
         crate::memory::leave();
@@ -242,7 +244,7 @@ fn restart_with(guest: bool, why: &str, carried: &[(&str, String)]) -> ! {
     // them for a moment, and nobody here may take that for our end: `gone_here`. A guest's don't: its
     // lock is let go by the exec, and counts as gone at once, so the next writer doesn't wait on it)
     if !guest {
-        if let Ok(held) = crate::terms::HELD.lock() {
+        if let Ok(held) = claims.0.lock() {
             held.values().for_each(|(_, f)| crate::terms::say(f, &format!("restarting {}", crate::log::now_ms())));
         }
     }
@@ -319,9 +321,9 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
         (true, Some(own)) => {
             // (the members are asked with the nodes' key: one that just restarted holds an
             // unsigned call until it has caught up, and it catches up from this leader)
-            if crate::dial::node_key().is_none() {
+            if crate::dial::node_key(&lake.node).is_none() {
                 if let Some(k) = users::node_key_made(&lake).await {
-                    crate::dial::set_node_key(k);
+                    crate::dial::set_node_key(&lake.node, k);
                 }
             }
             Some(replica::recover(&lake, &addr, term, Some(own)).await)
@@ -349,7 +351,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     let seq = if leader { Some(log::Sequencer::start(lake.clone(), pace).await?) } else { None };
     let to = match &seq {
         Some(s) => log::To::Local(s.clone()),
-        None => log::To::Leader(members.leader().addr.clone()),
+        None => log::To::leader(&lake, members.leader().addr.clone()),
     };
     let _ = lake.to.set(to.clone()); // (a follower's sequences' values: the leader's sequencer)
     let log = (!reader).then(|| Arc::new(log::Log::start(lake.clone(), Duration::from_millis(s.flush_ms), to)));
@@ -388,7 +390,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
                  Another token: pondra token --dir {dir}. Or set --admin-token on every node."),
             Ok(None) => {}
             Err(e) => {
-                terms::release(&lake.store, term).await; // (another node may lead it: not one with no first user)
+                terms::release(&lake.store, term, &lake.node.claims).await; // (another node may lead it: not one with no first user)
                 return Err(e.context("a node on the network with no token makes the lake's first user before it serves, and that failed: set --admin-token, or listen on 127.0.0.1"));
             }
         }
@@ -452,6 +454,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     }
     if lives {
         let l = app.lake.clone();
+        let node = app.lake.node.clone();
         let closing = app.lake.node.drain.closing();
         panics::own(async move {
             // (a follower's catalog shows the leader's keys once the leader has flushed them)
@@ -459,7 +462,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
             for _ in 0..600 {
                 match users::node_key(&l).await {
                     Ok(k) => {
-                        crate::dial::set_node_key(k); // (nodes call each other with it when no admin token is set: cluster::http)
+                        crate::dial::set_node_key(&node, k); // (nodes call each other with it when no admin token is set: cluster::http)
                         // (and a new one when a leader seals keys that were in the clear: `users::seal_keys`)
                         tokio::pin!(closing);
                         loop {
@@ -467,8 +470,8 @@ pub fn keep(app: &crate::app::App, s: &Start) {
                                 () = &mut closing => return,
                                 () = tokio::time::sleep(users::NODE_KEY_LOOK) => {}
                             }
-                            if let Some(k) = users::sealed_node_key(&l).await.filter(|k| crate::dial::node_key().as_deref() != Some(k)) {
-                                crate::dial::set_node_key(k);
+                            if let Some(k) = users::sealed_node_key(&l).await.filter(|k| crate::dial::node_key(&node).as_deref() != Some(k)) {
+                                crate::dial::set_node_key(&node, k);
                                 eprintln!("this node took the lake's new keys from the bucket");
                             }
                         }
@@ -669,7 +672,7 @@ pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) 
     }
     let node = crate::node_state::NodeState::new(life.clone());
     let store = crate::store::counted(crate::memory_lake::store(&url), &node.metrics); // (its term's claims and marks the page's: `Counted`)
-    let lead = if owned { crate::members::Alone::lead_owned(&store).await } else { crate::members::Alone::lead(&store).await };
+    let lead = if owned { crate::members::Alone::lead_owned(&store, &node.claims).await } else { crate::members::Alone::lead(&store, &node.claims).await };
     let (alone, marks) = match lead {
         Ok(led) => led,
         Err(e) => {
@@ -682,7 +685,7 @@ pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) 
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open(&url, true, false, node).await?;
+        let l = crate::store::Lake::open(&url, true, false, node.clone()).await?;
         lake = Some(l.clone());
         start_app(l, alone.clone(), None, &start).await
     }
@@ -693,7 +696,7 @@ pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) 
             Ok(Paged { app, url, term, marks, follow: None, ended: Default::default(), superuser: AtomicBool::new(false), life })
         }
         Err(e) => {
-            end_page(marks, None, lake, &store, term, &url).await; // (a failed open leaves nothing running)
+            end_page(marks, None, lake, &store, term, &url, &node.claims).await; // (a failed open leaves nothing running)
             Err(e)
         }
     }
@@ -702,7 +705,7 @@ pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) 
 /// Ends what `open_page` started, as a node's stop does (`node::run::Held::stop` and `Node::stop`): its term's marks, its
 /// loops, its catalog, its term, its lake in memory, and the module's per-node state, so another `open_page` starts
 /// afresh. `Paged::close` and a failed open both end this way.
-async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, lake: Option<Arc<crate::store::Lake>>, store: &crate::store::Store, term: u64, url: &str) {
+async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, lake: Option<Arc<crate::store::Lake>>, store: &crate::store::Store, term: u64, url: &str, claims: &crate::node_state::Claims) {
     marks.abort(); // (a dropped handle aborts nothing: its mark would land again after the release)
     if let Some(follow) = follow {
         follow.abort(); // (the node's stream ends as the page closes, not at the node's next commit)
@@ -712,9 +715,10 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
         let _ = lake.cat.close().await;
     }
     if term > 0 {
-        crate::terms::release(store, term).await; // (a joined page claimed no term: `open_joined`'s is 0, and its store takes no write)
+        crate::terms::release(store, term, claims).await; // (a joined page claimed no term: `open_joined`'s is 0, and its store takes no write)
     }
     crate::memory_lake::forget_memory(url);
+    claims.clear(); // (its claims' locks let go as it stops: `Claims`)
     crate::reset::reset();
     PAGED.store(false, SeqCst); // (last: the next `open_page` starts once the statics are set back)
 }
@@ -733,11 +737,12 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lif
     let node = node.trim_end_matches('/').to_string();
     let members: Arc<dyn Members> = Arc::new(crate::members::Joined::new(&node, auth)); // (the page's calls go to this node, with this sign-in: `dial::Joined`)
     let kv: Arc<dyn crate::kv::Kv> = Arc::new(crate::kv::remote::Remote::new(&node, auth));
+    let state = crate::node_state::NodeState::new(life.clone());
     let marks = crate::panics::task(async {}); // (a joined page claims no term, so it runs no mark: this task is finished)
     let start = Start::default();
     let mut lake = None;
     let made = async {
-        let l = crate::store::Lake::open_on(&url, true, kv, crate::node_state::NodeState::new(life.clone())).await?;
+        let l = crate::store::Lake::open_on(&url, true, kv, state.clone()).await?;
         lake = Some(l.clone());
         start_app(l, members, None, &start).await
     }
@@ -785,7 +790,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lif
             Ok(Paged { app, url, term: 0, marks, follow: Some(follow), ended, superuser: AtomicBool::new(superuser), life })
         }
         Err(e) => {
-            end_page(marks, None, lake, &store, 0, &url).await; // (a failed open leaves nothing running)
+            end_page(marks, None, lake, &store, 0, &url, &state.claims).await; // (a failed open leaves nothing running)
             Err(e)
         }
     }
@@ -842,7 +847,7 @@ impl Paged {
         let _ = tokio::time::timeout(Duration::from_secs(2), crate::page_records::flush(&app)).await; // (what the page's statements wait to go to its node: once, within 2 s)
         let lake = app.lake.clone();
         drop(app);
-        end_page(marks, follow, Some(lake.clone()), &lake.store, term, &url).await;
+        end_page(marks, follow, Some(lake.clone()), &lake.store, term, &url, &lake.node.claims).await;
     }
 }
 
@@ -875,8 +880,9 @@ mod tests {
     /// sweep would read every table inside a statement's count). The returned mark is aborted by the caller.
     async fn lake_app() -> (crate::app::App, tokio::task::JoinHandle<()>) {
         let url = format!("memory://catalog-counts-{}", uuid::Uuid::new_v4().simple());
-        let (alone, marks) = crate::members::Alone::lead(&crate::memory_lake::store(&url)).await.unwrap();
-        let lake = crate::store::Lake::open(&url, true, false, super::native(true)).await.unwrap(); // (a guest's: `node::start_app` starts no loops)
+        let node = super::native(true); // (a guest's: `node::start_app` starts no loops)
+        let (alone, marks) = crate::members::Alone::lead(&crate::memory_lake::store(&url), &node.claims).await.unwrap();
+        let lake = crate::store::Lake::open(&url, true, false, node).await.unwrap();
         let app = super::start_app(lake, alone, None, &super::Start::default()).await.unwrap();
         (app, marks)
     }

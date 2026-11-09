@@ -47,15 +47,15 @@ pub fn probe(bytes: usize) -> Vec<u8> {
 /// The slowest link from here to the other nodes (the longest round trip, the lowest rate): a
 /// shuffle waits for it. Measured every 10 minutes, or given (`PONDRA_LINK=ms,MB/s`); None when a
 /// node can't be measured.
-pub async fn slowest(nodes: &[String], me: &str) -> Option<Link> {
+pub async fn slowest(from: &crate::node_state::NodeState, nodes: &[String], me: &str) -> Option<Link> {
     if let Some((ms, mb)) = crate::env::get("PONDRA_LINK").and_then(|v| Some((v.split_once(',')?.0.parse::<f64>().ok()?, v.split_once(',')?.1.parse::<f64>().ok()?))) {
         return Some(Link { rtt: ms / 1e3, rate: mb * 1e6 }); // (`ms,MB/s`: a network known, or one to pretend)
     }
-    let links = futures::future::join_all(nodes.iter().filter(|n| *n != me).map(|n| link(n))).await;
+    let links = futures::future::join_all(nodes.iter().filter(|n| *n != me).map(|n| link(from, n))).await;
     links.into_iter().try_fold(Link { rtt: 0.0, rate: f64::MAX }, |a, l| Some(Link { rtt: a.rtt.max(l?.rtt), rate: a.rate.min(l?.rate) }))
 }
 
-async fn link(node: &str) -> Option<Link> {
+async fn link(from: &crate::node_state::NodeState, node: &str) -> Option<Link> {
     if let Some((l, at)) = LINKS.lock().unwrap().get(node) {
         if at.elapsed() < Duration::from_secs(600) {
             return Some(*l);
@@ -63,7 +63,7 @@ async fn link(node: &str) -> Option<Link> {
     }
     let get = |bytes: usize| async move {
         let t = Instant::now();
-        let r = crate::dial::call(node, crate::dial::Call::get(format!("/cluster/probe?bytes={bytes}")).timeout(Duration::from_secs(20))).await.ok()?;
+        let r = crate::dial::call(from, node, crate::dial::Call::get(format!("/cluster/probe?bytes={bytes}")).timeout(Duration::from_secs(20))).await.ok()?;
         let got = r.bytes().await.ok()?.len();
         (got == bytes).then(|| t.elapsed().as_secs_f64())
     };

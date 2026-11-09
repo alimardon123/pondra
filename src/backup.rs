@@ -258,7 +258,7 @@ async fn take_here(to: &str, t: Take, node: &std::sync::Arc<crate::node_state::N
     let term = crate::terms::claim_one_off(&store, |t| {
         ensure!(t.addr.is_empty(), "{to} is served by a node, which can't read a lake in this process's memory: back up somewhere else, or stop that node");
         Ok(())
-    })
+    }, &node.claims)
     .await?;
     let marks = Marks(crate::terms::mark_every(store.clone(), term.n)); // (it answers the bell, as its term says: `terms::deaf`)
     let out = match Lake::open(to, true, false, node.clone()).await {
@@ -273,7 +273,7 @@ async fn take_here(to: &str, t: Take, node: &std::sync::Arc<crate::node_state::N
         Err(e) => Ok(Err(e)),
     };
     drop(marks); // (its mark stops before the term is let go, so no mark lands after it)
-    crate::terms::release(&store, term.n).await;
+    crate::terms::release(&store, term.n, &node.claims).await;
     match out {
         Ok(run) => run,
         Err(panic) => std::panic::resume_unwind(panic),

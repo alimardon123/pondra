@@ -676,7 +676,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
             let dropped = match (crate::env::get("PONDRA_SERVER_URL"), &bases, &target) {
                 (Some(server), ..) => {
                     let query = format!("if_exists={if_exists}&purge={purge}&by={}", url::form_urlencoded::byte_serialize(by.as_bytes()).collect::<String>());
-                    databases_call(&server, true, format!("/databases/{name}?{query}")).await?
+                    databases_call(&lake.node, &server, true, format!("/databases/{name}?{query}")).await?
                 }
                 (None, Some(_), Some(t)) if purge => {
                     delete_lake(&t.url).await?; // (its own objects alone: its bases' files are theirs)
@@ -806,7 +806,7 @@ pub fn full(dir: &str) -> Result<String> {
 pub async fn unled(dir: &str) -> Result<()> {
     let store = crate::store::open_store(dir)?.1;
     if let Some(t) = crate::terms::latest(&store).await? {
-        ensure!(!crate::terms::alive(&store, &t).await, "another process leads the lake at {dir} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
+        ensure!(!crate::terms::alive(&store, &t, None).await, "another process leads the lake at {dir} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
     }
     Ok(())
 }
@@ -831,9 +831,9 @@ pub async fn let_go(dir: &str, name: &str) -> Result<Option<String>> {
 
 /// A call to the server that serves this folder's databases (`DROP DATABASE`, a DELETE; `UNDROP DATABASE`, a POST): its
 /// answer, or its refusal as the error.
-async fn databases_call(server: &str, delete: bool, path: String) -> Result<Value> {
+async fn databases_call(node: &crate::node_state::NodeState, server: &str, delete: bool, path: String) -> Result<Value> {
     use crate::dial::{call, Call};
-    let r = call(server, if delete { Call::delete(path) } else { Call::post(path, Vec::new()) }).await?;
+    let r = call(node, server, if delete { Call::delete(path) } else { Call::post(path, Vec::new()) }).await?;
     let (ok, text) = (r.ok(), r.text().await?);
     ensure!(ok, "{text}");
     Ok(serde_json::from_str(&text)?)
@@ -846,7 +846,7 @@ async fn undrop_database(lake: &Lake, name: &str, scope: &crate::rights::Scope) 
     database_name(name)?;
     let dir = match crate::env::get("PONDRA_SERVER_URL") {
         Some(server) => {
-            let answer = databases_call(&server, false, format!("/databases/{name}/undrop")).await?;
+            let answer = databases_call(&lake.node, &server, false, format!("/databases/{name}/undrop")).await?;
             full(answer["dir"].as_str().context("the server's answer names no folder")?)?
         }
         None => {
@@ -2315,7 +2315,7 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool, keep: bool) -> Resu
         let gone: Vec<String> = [crate::feeds::feed_key(name), table_key(name)].into_iter().chain(offsets.iter().cloned()).collect();
         let (unshared, from) = crate::shares::tables_moved(lake, &[(name, None)]).await?;
         lake.cat.commit(unshared, &gone).await?;
-        crate::log::forget_producers(offsets.into_iter().map(|k| k[2..].to_string())); // (its offsets: made again, it starts over)
+        crate::log::forget_producers(lake, offsets.into_iter().map(|k| k[2..].to_string())); // (its offsets: made again, it starts over)
         return Ok((left_shares(j!({"view": name, "dropped": true}), from), None));
     }
     if let Some(v) = lake.cat.get::<StoredView>(&query_key(name)).await? {
@@ -2360,7 +2360,7 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool, keep: bool) -> Resu
     for published in &copies {
         published.delete(lake).await;
     }
-    crate::log::forget_producers(producers); // (a view made again under this name starts over)
+    crate::log::forget_producers(lake, producers); // (a view made again under this name starts over)
     crate::views::forget(lake);
     Ok((left_shares(j!({"view": shown, "dropped": true}), from), keep.then_some("materialized view")))
 }
@@ -2375,7 +2375,7 @@ async fn detach_view(lake: &Lake, name: &str) -> Result<Value> {
         let offsets = lake.cat.scan::<u64>(&crate::store::producer_key(&format!("feed:{name}:")), &crate::store::producer_key(&format!("feed:{name};"))).await?;
         let gone: Vec<String> = std::iter::once(crate::feeds::feed_key(name)).chain(offsets.iter().map(|(k, _)| k.clone())).collect();
         lake.cat.commit(vec![], &gone).await?;
-        crate::log::forget_producers(offsets.into_iter().map(|(k, _)| k[2..].to_string())); // (`p/…`: a feed made again starts over)
+        crate::log::forget_producers(lake, offsets.into_iter().map(|(k, _)| k[2..].to_string())); // (`p/…`: a feed made again starts over)
         return Ok(j!({"view": name, "detached": true, "table": name}));
     }
     ensure!(lake.cat.get::<crate::views::View>(&crate::views::view_key(&crate::once::open(name))).await?.is_none(),
@@ -2391,7 +2391,7 @@ async fn detach_view(lake: &Lake, name: &str) -> Result<Value> {
         gone.extend(crate::matches::tables(name).iter().map(|t| table_key(t))); // (a MATCH_RECOGNIZE's held and resume rows: its table stays)
     }
     lake.cat.commit(vec![], &gone).await?;
-    crate::log::forget_producers(producers);
+    crate::log::forget_producers(lake, producers);
     crate::views::forget(lake);
     Ok(j!({"view": name, "detached": true, "table": name}))
 }
