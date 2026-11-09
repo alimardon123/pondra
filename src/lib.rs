@@ -149,6 +149,8 @@ mod table_record;
 #[cfg(feature = "lake")] mod auth;
 #[cfg(feature = "lake")] mod rights; // (what a principal may do, decided in one place: step 6)
 #[cfg(feature = "lake")] mod budget;
+#[cfg(feature = "lake")] mod buckets; // (what opens a lake's bucket: the hosts fill it, `hosted`)
+#[cfg(feature = "lake")] mod hosted;
 #[cfg(feature = "lake")] mod byte_range;
 #[cfg(feature = "lake")] mod cache;
 #[cfg(feature = "lake")] mod catalogs;
@@ -327,6 +329,8 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &udf::UDF,
         #[cfg(feature = "lake")]
         &pyfn::PYTHON,
+        #[cfg(feature = "lake")]
+        &hosted::HOSTED,
     ];
     BUILT_IN
 }

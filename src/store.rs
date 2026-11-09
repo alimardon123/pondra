@@ -13,10 +13,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::disk_manager::{DiskManager, DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::spill_file::{SpillFile, TempFileFactory};
-use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
-use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
-use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
-use object_store::ClientConfigKey;
+use object_store::aws::AmazonS3Builder;
 #[cfg(not(target_arch = "wasm32"))]
 use object_store::local::LocalFileSystem;
 use object_store::{path::Path, prefix::PrefixStore, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
@@ -2006,18 +2003,17 @@ pub fn open_store(url: &str, reaches: Option<&crate::reaches::Reaches>) -> Resul
         let held = crate::memory_lake::store(&url);
         return Ok((url.clone(), held.clone(), Some((url, held)))); // (DataFusion reads its files at their URLs, as a bucket's)
     }
-    #[cfg(feature = "doors")]
     if served(url) {
-        // (the store is the node that holds the lake's, read through its door: `served.rs`; nothing is connected yet)
+        // (the store is the node that holds the lake's, read through its door: `served.rs`, as the hosts add it; nothing is
+        // connected yet)
+        let Some(door) = crate::buckets::get().served else {
+            anyhow::bail!("{url}: this form reads no lake through a node's door (pondra://): open its bucket or folder instead");
+        };
         let at = url.trim_start_matches("pondra://").trim_end_matches('/');
         anyhow::ensure!(!at.is_empty() && !at.contains('/'), "{url}: a node serves one lake, named by pondra://host:port alone");
         let url = format!("pondra://{at}");
-        let store: Store = Arc::new(crate::served::Served::new(at));
+        let store: Store = door(at);
         return Ok((url.clone(), store.clone(), Some((url, store)))); // (the lake and its bucket are one, as in memory)
-    }
-    #[cfg(not(feature = "doors"))]
-    if served(url) {
-        anyhow::bail!("{url}: this form reads no lake through a node's door (pondra://): open its bucket or folder instead");
     }
     if place(url)? == Place::Folder {
         return folder(url);
@@ -2027,17 +2023,8 @@ pub fn open_store(url: &str, reaches: Option<&crate::reaches::Reaches>) -> Resul
     let root = format!("{scheme}://{bucket}");
     let reach = reaches.and_then(|r| r.of(url));
     let params = reach.as_ref().and_then(|r| r.params.as_ref());
-    // Idle connections are dropped after 15 s rather than reused: through proxies and NATs that
-    // silently forget idle connections, a reused one hung a PUT for the full 30 s timeout on R2.
-    let (idle, after) = (ClientConfigKey::PoolIdleTimeout, "15s");
-    // Every request to the bucket takes a turn of its budget, retries too (`budget.rs`, C5).
-    let turns = || crate::budget::Budget::of(&root);
-    let mut whole: Store = match (params, scheme) {
-        (Some(_), _) => crate::ext::build(&url::Url::parse(&root)?, params, crate::ext::For::Lake)?,
-        (None, "s3") => Arc::new(with_kms(AmazonS3Builder::from_env(), sse_kms_from_env()).with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
-        (None, "gs") => Arc::new(GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket).with_config(GoogleConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
-        (None, _) => Arc::new(MicrosoftAzureBuilder::from_env().with_url(&root).with_config(AzureConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
-    };
+    let Some(open) = crate::buckets::get().open else { anyhow::bail!("{url}: this form opens no lake in a {scheme}:// bucket") };
+    let mut whole: Store = open(&crate::buckets::At { scheme, bucket, root: &root }, params)?; // (the platform's: `hosted::bucket`)
     if reach.as_ref().is_some_and(|r| r.read_only) {
         whole = Arc::new(ReadOnly(whole, url.trim_end_matches('/').to_string())); // (before the prefix: the lake's store and the bucket's refuse alike)
     }
@@ -2343,7 +2330,8 @@ impl Lake {
         let disk = bucket.as_ref().filter(|_| !memory).and_then(|_| disk_tier(&url, &store, &node));
         let mut cached_store = None;
         if let Some((bucket_url, held)) = bucket.as_ref().filter(|_| memory) {
-            rt.register_object_store(&url::Url::parse(bucket_url)?, Arc::new(crate::bridge::Bridge(held.clone()))); // (in memory already: read as it is)
+            let read = crate::buckets::get().reader.context("this form gives DataFusion no reader of a lake in memory")?;
+            rt.register_object_store(&url::Url::parse(bucket_url)?, read(held.clone())); // (in memory already: read as it is)
         } else if let Some((bucket_url, s3)) = bucket {
             let prefix = url.trim_start_matches(&bucket_url).trim_start_matches('/').to_string();
             let cached = Arc::new(crate::cache::CachedStore::new(s3, cache_mb() << 20, disk.clone().map(|d| (d, prefix.clone())), &prefix));
@@ -2694,7 +2682,9 @@ impl Lake {
         if self.bases.read().unwrap().contains_key(id) {
             return Ok(());
         }
-        crate::budget::share(url); // (its objects read with a share of the bucket's turns: prod's own nodes come first)
+        if let Some(share) = crate::buckets::get().share {
+            share(url); // (its objects read with a share of the bucket's turns: prod's own nodes come first)
+        }
         match (bucket_url(url), &self.cached) {
             (Some(bucket), Some(ours)) if bucket_url(&self.url).as_ref() == Some(&bucket) => ours.add_lake(url[bucket.len()..].trim_start_matches('/')),
             (Some(bucket), _) => {

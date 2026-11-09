@@ -17,6 +17,7 @@ scratch base
 node_state base
 ledger base
 reaches base
+buckets base
 memo base
 metrics base
 parsed base
@@ -245,6 +246,7 @@ ci hosts
 cli hosts
 dbserver hosts
 drain hosts
+hosted hosts
 idle hosts
 lib hosts
 library hosts
