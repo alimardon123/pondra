@@ -886,7 +886,7 @@ impl Step for Block {
             let out = match out {
                 Err(e) => match self.handlers.iter().find(|(w, _)| catches(w, crate::codes::of(&e))) {
                     Some((_, handler)) => {
-                        let (code, said) = (crate::codes::of(&e), crate::ext::said(&e));
+                        let (code, said) = (crate::codes::of(&e), crate::codes::told(&e, r.who.scope.shows_code()));
                         r.at = at;
                         for (name, value) in [("error", said.clone()), ("sqlstate", code.to_string())] {
                             r.keep(name);

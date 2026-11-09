@@ -48,12 +48,12 @@ pub async fn stored<T>(f: impl std::future::Future<Output = T>) -> T { STORED.sc
 /// The session a request names (`x-pondra-session`), or that of the caller whose procedure sent it. A name
 /// that isn't 8 to 128 letters, digits, - or _ is refused and says so: it is never ignored, which would leave
 /// the request in no session at all.
-pub fn of(home: &crate::store::Lake, headers: &http::HeaderMap) -> anyhow::Result<Option<String>> {
+pub fn of(home: &crate::store::Lake, headers: &http::HeaderMap, user: &str) -> anyhow::Result<Option<String>> {
     let named = match headers.get("x-pondra-session") {
         None => None,
         Some(v) => Some(name(v)?),
     };
-    Ok(crate::auth::lent_session(home, crate::auth::Credential::of_headers(headers).token()).or(named.map(|n| id(&n)))) // (a procedure's own client names one: its caller's wins)
+    Ok(crate::auth::lent_session(home, crate::auth::Credential::of_headers(headers).token()).or(named.map(|n| id(user, &n)))) // (a procedure's own client names one: its caller's wins)
 }
 
 /// A session name `x-pondra-session` carries (see `of`): the name, or the reason it is refused (22023).
@@ -71,13 +71,13 @@ fn name(v: &http::HeaderValue) -> anyhow::Result<String> {
     Ok(s.to_string())
 }
 
-/// The session a client's id names: its user's (another who names the same id has a session of its own).
-pub fn id(id: &str) -> String { format!("{}~{id}", crate::auth::current().map(|p| p.name).unwrap_or_default()) }
+/// The session a client's id names: its user's, `user` (another who names the same id has a session of its own).
+pub fn id(user: &str, id: &str) -> String { format!("{user}~{id}") }
 
 pub fn current() -> Option<String> { SESSION.try_with(|s| s.as_ref().map(|n| n.name.clone())).ok().flatten() }
 
-/// A session for one script sent without one (`#`: no client names it so).
-pub fn of_script() -> String { format!("{}#script-{}", crate::auth::current().map(|p| p.name).unwrap_or_default(), uuid::Uuid::new_v4()) }
+/// A session for one script `user` sent without one (`#`: no client names it so).
+pub fn of_script(user: &str) -> String { format!("{user}#script-{}", uuid::Uuid::new_v4()) }
 
 /// The current session's temporary tables (name, definition) and views (name, SQL), as Postgres's
 /// catalog lists them (`pg_catalog.rs`).

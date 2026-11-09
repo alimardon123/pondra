@@ -54,9 +54,19 @@ pub fn producers(name: &str, task: &Task) -> Vec<String> {
     }
 }
 
-crate::per_node!(
-    /// The task shards this node has run, for `/stats`.
-    pub(crate) static SHARD_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
+/// What a lake keeps for its streaming tasks (invariant 301): the shards of them this node has run, for `/stats`.
+#[derive(Default)]
+pub struct Kept {
+    pub(crate) shard_runs: std::sync::atomic::AtomicU64,
+}
+
+impl crate::lake_state::LakeState for Kept {
+    const NAME: &'static str = "tasks";
+    const ABOUT: &'static str = "how many shards of its streaming tasks this node has run, for /stats";
+    fn make() -> Self {
+        Kept::default()
+    }
+}
 
 /// Run this node's shards of every task over whatever arrived since each shard's last run.
 pub async fn run_all(lake: &Lake, members: &dyn Members, log: &Log) -> Result<()> {
@@ -73,7 +83,9 @@ pub async fn run_all(lake: &Lake, members: &dyn Members, log: &Log) -> Result<()
                 continue; // nothing new for this task: no run, no commit
             }
             let batch = target_rows(lake, &task, &run(lake, &task, s as u32, rows).await?).await?;
-            SHARD_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(kept) = lake.state::<Kept>() {
+                kept.shard_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let src = Src { producer, seq: hwm, prev: Some(done) }; // output + progress, if progress is still `done`
             runs.push(log.append(task.target.clone(), src, batch));
         }
