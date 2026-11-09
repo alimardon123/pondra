@@ -296,6 +296,15 @@ pub fn holds_secrets() -> bool {
     all.get(&n.name).is_some_and(|x| !x.secrets.is_empty())
 }
 
+/// `DISCARD TEMP`: the session's temporary tables, views, functions and secrets go, as Postgres's drops its temporary
+/// schema; its settings and the rest stay (`set::discard`).
+pub fn discard_temporary(session: &str) -> Result<()> {
+    with(session, true, |x| {
+        (x.tables.clear(), x.views.clear(), x.routines.clear(), x.secrets.clear());
+        Ok(())
+    })
+}
+
 /// The lake's functions with the current session's own over them (`CREATE TEMP MACRO`): what the front expands in a
 /// statement's own text (`host.rs`; a lake function's body calls the lake's, `front::Routines`). Without any, or
 /// while a stored view is read (`stored`), the lake's as they are.

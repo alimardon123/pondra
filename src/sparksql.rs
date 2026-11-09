@@ -1,12 +1,12 @@
-//! Spark SQL where PySpark code sends it (H8, round 31), a language of the registry's (`LANGUAGE`): `spark_sql('…')` in
-//! a FROM is that query read with Spark's grammar and turned into Pondra's SQL where SQL comes in (`languages::inline`, from
-//! the door, `routines::bind` and the front), so what is built on it (a frame's steps, a join, a
-//! view) is Pondra's SQL as everywhere else. What it turns: `"text"` (a string in Spark),
-//! `a DIV b`, `<=>`, `!`, `RLIKE`, `LATERAL VIEW [OUTER] explode(…)` and `explode` itself, and the
-//! functions both have with Spark's answers (`floor` a BIGINT, `substring`, `round`, …): Spark's
-//! own, registered in every session as `spark_floor`, … (`SPARK`), so DataFusion's answers
-//! never change outside it (invariant 190). A cast to an integer cuts its fraction toward zero, as Spark
-//! does (`pondra_truncate`: Pondra's own casts round it). Backticks are names in Pondra's SQL too.
+//! Spark SQL where PySpark code sends it (H8, round 31), a language of the registry's (`LANGUAGE`). A session's statements
+//! in it (`SET language = 'spark'`), and `spark_sql('…')` in a FROM, are read with Spark's grammar and turned into Pondra's
+//! SQL as they come in (`statement::in_language`, `languages::inline`), so what is built on them (a frame's steps, a join, a view)
+//! is Pondra's SQL as everywhere else, and one text answers the same either way. What it turns: `"text"` (a string in
+//! Spark), `a / b` (always fractional, `spark_divide`), `a DIV b`, `<=>`, `!`, `RLIKE`, `LATERAL VIEW [OUTER] explode(…)` and
+//! `explode` itself, and the functions both have with Spark's answers (`floor` a BIGINT, `substring`, `round`, …): Spark's
+//! own, registered in every session as `spark_floor`, … (`SPARK`), so DataFusion's answers never change outside it
+//! (invariant 190). A cast to an integer cuts its fraction toward zero, as Spark does (`pondra_truncate`: Pondra's own
+//! casts round it). Backticks are names in Pondra's SQL too.
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::sql::sqlparser::ast::{self, BinaryOperator, CastKind, DataType, Expr, FunctionArguments, SelectItem, SetExpr, TableFactor, UnaryOperator, VisitorMut};
 use datafusion::sql::sqlparser::dialect::{GenericDialect, SparkSqlDialect};
@@ -129,6 +129,8 @@ fn turn(e: &mut Expr, names: &HashMap<String, String>) -> Result<Option<Expr>> {
             };
             Some(expr(&format!("{cast}(pondra_truncate({x}) AS {data_type})"))?)
         }
+        // (Spark's `/` is always fractional, and two DECIMALs have Spark's places: `spark_divide`, `divide.rs`)
+        Expr::BinaryOp { left, op: BinaryOperator::Divide, right } => Some(expr(&format!("{}({left}, {right})", crate::divide::SPARK_NAME))?),
         Expr::BinaryOp { left, op: BinaryOperator::Spaceship, right } => Some(expr(&format!("({left}) IS NOT DISTINCT FROM ({right})"))?),
         Expr::RLike { negated, expr: x, pattern, .. } => Some(expr(&format!("{}regexp_like({x}, {pattern})", if *negated { "NOT " } else { "" }))?),
         Expr::Substring { expr: x, substring_from, substring_for, .. } => match spark("substring") {
@@ -243,6 +245,7 @@ mod tests {
         assert_eq!(q(r#"SELECT "a", `b c` FROM t WHERE !x AND y <=> 1"#), r#"SELECT 'a' AS "a", `b c` FROM t WHERE NOT x AND (y) IS NOT DISTINCT FROM (1)"#);
         assert_eq!(q("SELECT explode(xs) FROM t"), r#"SELECT unnest(xs) AS "col" FROM t"#);
         assert_eq!(q("SELECT a DIV 2 AS h FROM t"), "SELECT CAST(pondra_truncate((a) / (2)) AS BIGINT) AS h FROM t");
+        assert_eq!(q("SELECT a / 2, CAST(a / b AS INT) AS i FROM t"), r#"SELECT spark_divide(a, 2) AS "a / 2", CAST(pondra_truncate(spark_divide(a, b)) AS INT) AS i FROM t"#); // (its column keeps the name Pondra's gave it)
         assert_eq!(q("SELECT CAST(a AS INT) AS i, a::BIGINT AS j, TRY_CAST(a AS SMALLINT) AS k, CAST(a AS DOUBLE) AS d, CAST(a AS STRING) AS s FROM t"),
             "SELECT CAST(pondra_truncate(a) AS INT) AS i, CAST(pondra_truncate(a) AS BIGINT) AS j, TRY_CAST(pondra_truncate(a) AS SMALLINT) AS k, CAST(a AS DOUBLE) AS d, CAST(a AS STRING) AS s FROM t");
         assert_eq!(q("SELECT floor(d) AS f, CEIL(d) FROM t"), r#"SELECT spark_floor(d) AS f, spark_ceil(d) AS "CEIL(d)" FROM t"#);
@@ -257,13 +260,13 @@ mod tests {
     }
 
     /// A statement in Spark SQL is planned from its tree printed (`languages::inline` prints the statement it is in, and
-    /// from step 8's PR 7b a Spark session's statements go on so until PR 9 hands the tree over), so each query's tree prints
-    /// as a text that means it: one that reads back as that tree, or reads as itself again (Pondra reads what it prints:
-    /// `unnest` as its UNNEST, `user` as its USER), or is the statement as written, token for token (a form Pondra's other
-    /// readers take). Of every Spark text the repository sends (harness.py's, spark_check.py's, the docs' and the client's
-    /// `spark.sql(…)` and `spark_sql('…')`), TPC-H's queries, and every other text of its SQL that Spark's grammar reads
-    /// (`passes::tests::texts`), each statement as a request's are split (`routines::split`). A sign's sign printed `--` once,
-    /// a comment that ate the rest of its line.
+    /// from step 8's PR 7b a Spark session's statements go on so until PR 9 hands the tree over), so each tree a session or
+    /// `spark_sql('…')` prints, prints as a text that means it: one that reads back as that tree, or reads as itself again
+    /// (Pondra reads what it prints: `unnest` as its UNNEST, `user` as its USER), or is the statement as written, token for
+    /// token (a form Pondra's other readers take). Of every Spark text the repository sends (harness.py's, spark_check.py's,
+    /// the docs' and the client's `spark.sql(…)` and `spark_sql('…')`), TPC-H's queries, and every other text of its SQL that
+    /// Spark's grammar reads (`passes::tests::texts`), each statement as a request's are split (`routines::split`). A sign's
+    /// sign printed `--` once, a comment that ate the rest of its line.
     #[test]
     fn a_spark_tree_prints_as_its_text() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -299,7 +302,9 @@ mod tests {
         for t in spark.iter().cloned().chain(crate::passes::tests::texts("")) {
             for one in crate::routines::split(&t) {
                 let Ok(stmts) = super::statements(&one) else { continue }; // (refused, by Spark's grammar or the turn)
-                for s in stmts.into_iter().filter(|s| matches!(s, super::ast::Statement::Query(_))) {
+                // (a query is what `spark_sql('…')` takes; a session prints each statement but Pondra's own, read as written)
+                let printed_here = |s: &super::ast::Statement| matches!(s, super::ast::Statement::Query(_)) || !crate::statement::pondra_s_own(one.trim());
+                for s in stmts.into_iter().filter(printed_here) {
                     trees += 1;
                     let printed = s.to_string();
                     let reads = crate::parsed::generic(&printed).is_ok_and(|back| back == [s.clone()] || back.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(";\n") == printed);
@@ -310,6 +315,6 @@ mod tests {
                 }
             }
         }
-        assert!(differ.is_empty(), "{} of {trees} queries print as a text that means otherwise, the first: {:#?}", differ.len(), &differ[..differ.len().min(8)]);
+        assert!(differ.is_empty(), "{} of {trees} trees print as a text that means otherwise, the first: {:#?}", differ.len(), &differ[..differ.len().min(8)]);
     }
 }

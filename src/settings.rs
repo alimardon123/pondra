@@ -234,6 +234,7 @@ pub const CORE: &[Setting] = &[
     test("PONDRA_KEEP_PARQUET", Text, No),
     node("PONDRA_KMS_COMMAND", Text, No),
     test("PONDRA_LATE_ROWS", Text, No),
+    node("PONDRA_LANGUAGE", Text, No),
     node("PONDRA_LAUNCHER", Path, No),
     node("PONDRA_LEARN", Bool, No),
     node("PONDRA_LEARN_MS", Ms, Is("100")),

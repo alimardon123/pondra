@@ -54,7 +54,10 @@ pub enum Answer<O> {
 }
 
 /// Runs one statement a door was sent, for `who`, as `how` asks, and gives its answer as `wire` encodes it.
-pub async fn run<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire: &W) -> Result<Answer<W::Own>> {
+pub async fn run<W: Wire>(app: &App, mut req: Request, how: How<'_>, who: Who, wire: &W) -> Result<Answer<W::Own>> {
+    if let Some(sql) = in_language(crate::set::language(), &req.sql)? {
+        req.sql = sql; // (the session's language read once, as the request arrives: what follows reads Pondra's SQL)
+    }
     if let Some(seg) = how.after {
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
@@ -85,6 +88,48 @@ pub async fn run<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire:
         Outcome::Rows(batches) => Answer::Rows(batches),
         Outcome::Done(v) => Answer::Done(v),
     })
+}
+
+/// A request's text in a language (`languages.rs`, the session's: `set::language`) as Pondra's SQL: each statement read
+/// by the language's parse and printed (`text::text_kept`, so the front takes its tree and doesn't parse the print). A
+/// text the language's grammar refuses is refused in its words (42601). Pondra's own statements are read as written in
+/// every language (`pondra_s_own`). None: Pondra's SQL already, or the cluster's own call (`auth::operator`), which is.
+/// Not a routine's or a task's body, kept as Pondra's SQL: those run as they are (`routines::one`).
+pub(crate) fn in_language(name: &str, sql: &str) -> Result<Option<String>> {
+    let Some(l) = crate::languages::get().named(name).filter(|l| !std::ptr::eq(*l, &crate::parsed::LANGUAGE)) else { return Ok(None) };
+    if crate::auth::operator() {
+        return Ok(None);
+    }
+    let mut read = false;
+    let mut out = vec![];
+    for one in routines::split(sql) {
+        let one = one.trim();
+        if pondra_s_own(one) {
+            out.push(one.to_string());
+            continue;
+        }
+        read = true;
+        out.push(match (l.parse)(one) {
+            Ok(stmts) => crate::text::text_kept(stmts),
+            Err(e) if e.downcast_ref::<datafusion::sql::sqlparser::parser::ParserError>().is_some() => return Err(crate::codes::coded("42601", format!("{e:#}"))),
+            Err(e) => return Err(e),
+        });
+    }
+    Ok(read.then(|| out.join(";\n")))
+}
+
+/// `sql` in the session's language (`set::language`) as Pondra's SQL (`in_language`): what `run` takes, and what a door's
+/// look before the run reads (Flight plans a query's schema from it).
+pub(crate) fn as_pondra(sql: &str) -> Result<Cow<'_, str>> {
+    Ok(in_language(crate::set::language(), sql)?.map_or(Cow::Borrowed(sql), Cow::Owned))
+}
+
+/// Pondra's own statements, read as written whatever language a session's SQL is in: a session's (SET, SHOW, RESET,
+/// PREPARE, DISCARD, USE, …, a `$variable`'s), a transaction's, a cursor's (DECLARE … CURSOR, FETCH, MOVE, CLOSE),
+/// CHECKPOINT, and the statements section's (`statements::claims`: COPY, ATTACH, CREATE SEQUENCE, …).
+pub(crate) fn pondra_s_own(one: &str) -> bool {
+    crate::set::is(one) || crate::text::head(one).eq_ignore_ascii_case("show") || crate::text::control(one).is_some() || crate::vars::change(one).is_some()
+        || crate::cursors::of(one).is_some() || crate::write::checkpoint(one) || crate::statements::claims(one)
 }
 
 /// The text as sent, when it is one statement that is no variable's change and no script: the first half of the test
@@ -364,4 +409,26 @@ fn answer(batches: &[RecordBatch], p: &SqlParams, lake: &crate::store::Lake) -> 
 fn big(batches: &[RecordBatch]) -> bool {
     let mut counted = datafusion::common::utils::memory::RecordBatchMemoryCounter::new(); // (as `query::collect` counts it)
     batches.iter().map(|b| counted.count_batch(b)).sum::<usize>() >= crate::query::stream_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_language;
+
+    /// A Spark session's request is Pondra's SQL once read: each statement by Spark's grammar and turned, Pondra's own
+    /// as written, a text Spark's grammar refuses in its words (42601), and Pondra's SQL as it is.
+    #[test]
+    fn a_request_is_read_in_its_language() {
+        let read = |sql: &str| in_language("spark", sql).unwrap();
+        assert_eq!(read(r#"SELECT "x" AS s, 7 / 2 AS h FROM t"#).as_deref(), Some("SELECT 'x' AS s, spark_divide(7, 2) AS h FROM t"));
+        assert_eq!(read("SET language = 'pondra'; SELECT `a b` FROM t; CHECKPOINT").as_deref(), Some("SET language = 'pondra';\nSELECT `a b` FROM t;\nCHECKPOINT"));
+        for own in ["SHOW language", "RESET language", "BEGIN", "COMMIT", "CHECKPOINT", "$n = 1", "CREATE SEQUENCE s", "COPY t TO 'x.csv'", "DISCARD ALL", r#"DECLARE c CURSOR WITH HOLD FOR SELECT "x""#, "FETCH 1 FROM c", "CLOSE ALL"] {
+            assert_eq!(read(own), None, "{own}: Pondra's own, as written");
+        }
+        assert_eq!(in_language("pondra", r#"SELECT "x" FROM t"#).unwrap(), None);
+        assert_eq!(in_language(" Databricks ", "SELECT 1 / 2").unwrap().as_deref(), Some(r#"SELECT spark_divide(1, 2) AS "1 / 2""#)); // (its column named as Pondra's SQL names it)
+        let refused = in_language("spark", "FROM t SELECT a").unwrap_err();
+        assert_eq!(crate::codes::of(&refused), "42601", "{refused:#}");
+        assert!(format!("{refused:#}").starts_with("Spark SQL: "), "{refused:#}");
+    }
 }

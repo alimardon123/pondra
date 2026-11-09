@@ -132,6 +132,7 @@ A query is spread over the nodes of a cluster when that is cheaper than running 
 | `PONDRA_SPILL_MB` | `64` | rows a shuffle holds in memory before they go to disk |
 | `PONDRA_LINK` | measured | the network between nodes as `ms,MB/s` (`0.5,1000`), instead of measuring it every 10 minutes |
 | `PONDRA_JOIN_ORDER` | `2` | how much cheaper a new join order must look before it is taken. `0` turns join reordering off |
+| `PONDRA_LANGUAGE` | `pondra` | the language a session's statements are written in until it sets its own (`SET language = …`): `pondra`, Pondra's SQL, or `spark`, Spark SQL. `datafusion.sql_parser.dialect=spark` in `PONDRA_SQL_OPTIONS` names Spark SQL too. The Postgres port's sessions read Pondra's SQL whatever it says, until one sets its own |
 | `PONDRA_SQL_OPTIONS` | none | DataFusion settings, `key=value` separated by commas, applied after Pondra's own defaults |
 
 ## Stopping

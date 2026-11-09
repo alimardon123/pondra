@@ -1,5 +1,5 @@
 //! A session's settings and prepared statements (round 31): `SET name = value`, `SET TIME ZONE`,
-//! `RESET name | ALL`, `PREPARE name AS …`, `EXECUTE name(…)` and `DEALLOCATE name | ALL`, as in
+//! `RESET name | ALL`, `PREPARE name AS …`, `EXECUTE name(…)`, `DEALLOCATE name | ALL` and `DISCARD`, as in
 //! Postgres. A session is a Postgres connection, or a client's `x-pondra-session` (`temp.rs`).
 //!
 //! - A `datafusion.*` name is one of DataFusion's options (`datafusion.execution.time_zone`,
@@ -25,7 +25,7 @@ pub const NO_SESSION: &str = "a setting or a prepared statement is a session's: 
 /// Is this one of the statements kept here? (`USE`, too: the session's search path, `path.rs`.)
 pub fn is(sql: &str) -> bool {
     let word = crate::text::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_uppercase();
-    (matches!(word.as_str(), "SET" | "RESET" | "PREPARE" | "EXECUTE" | "EXEC" | "DEALLOCATE" | "ANALYZE" | "ANALYSE" | "REFRESH" | "USE")
+    (matches!(word.as_str(), "SET" | "RESET" | "PREPARE" | "EXECUTE" | "EXEC" | "DEALLOCATE" | "DISCARD" | "ANALYZE" | "ANALYSE" | "REFRESH" | "USE")
         && crate::runs::execute_of(sql).is_none()) // (EXECUTE TASK: the leader's)
         || crate::extension::is(sql) // (DuckDB's INSTALL, FORCE INSTALL and LOAD, and Pondra's: `extension.rs`)
 }
@@ -62,7 +62,7 @@ pub enum Done {
     Run(String),        // an `EXECUTE`: this statement, run as if sent
 }
 
-/// Carry out a `SET`, `RESET`, `PREPARE`, `EXECUTE` or `DEALLOCATE` for the current session. `scope`: the asker's, whom a
+/// Carry out a `SET`, `RESET`, `PREPARE`, `EXECUTE`, `DEALLOCATE` or `DISCARD` for the current session. `scope`: the asker's, whom a
 /// PREPARE's query plans for (the rest plan nothing).
 pub async fn statement(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Result<Done> {
     if let Some(said) = crate::extension::statement(lake, sql).await {
@@ -144,7 +144,8 @@ pub async fn statement(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> 
             if let Some(n) = name.as_deref().filter(|n| n.starts_with("datafusion.") && !n.starts_with("datafusion.runtime.")) {
                 datafusion::config::ConfigField::reset(&mut datafusion::config::ConfigOptions::new(), n)?; // (a name DataFusion has)
             }
-            crate::temp::with(&session()?, false, |s| Ok(match &name {
+            crate::temp::with(&session()?, false, |s| Ok(match name.as_deref() {
+                Some(DIALECT) => drop([DIALECT, "language"].map(|n| s.settings.remove(n))), // (the dialect's setting names the language too)
                 Some(n) => drop(s.settings.remove(n)),
                 None => s.settings.clear(),
             }))?;
@@ -179,10 +180,35 @@ pub async fn statement(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> 
                 "all" => Ok(s.prepared.clear()),
                 _ => s.prepared.remove(&name).map(drop).ok_or_else(|| crate::codes::coded("26000", format!("Prepared statement '{name}' does not exist"))),
             })?;
-            Done::Said(Kind::new("DEALLOCATE"))
+            Done::Said(Kind::new(if name == "all" { "DEALLOCATE ALL" } else { "DEALLOCATE" })) // (Postgres's tags: psycopg forgets its own prepared statements at DEALLOCATE ALL's)
+        }
+        Statement::Discard { object_type } => {
+            discard(&session()?, object_type)?;
+            Done::Said(Kind::new(format!("DISCARD {object_type}")))
         }
         _ => bail!("not a setting or a prepared statement (SET name = value or SHOW name for a setting, PREPARE name AS … for a statement)"),
     })
+}
+
+/// `DISCARD`, as Postgres's. `ALL` is what a pooler sends before it hands a connection to another client (PgBouncer's
+/// reset), and is Postgres's CLOSE ALL, SET SESSION AUTHORIZATION DEFAULT, RESET ALL, DEALLOCATE ALL, UNLISTEN *,
+/// pg_advisory_unlock_all(), DISCARD PLANS, TEMP and SEQUENCES. A session here has of those its cursors, settings (the
+/// language among them), prepared statements, temporary objects and sequences' currval, and its `$variables` beside:
+/// all go, as `Sessions::end` ends a session. It has no role but its sign-in's (SET ROLE and SET SESSION AUTHORIZATION are
+/// refused), no LISTEN and no advisory lock yet: each, once there is one, goes here too. The statements the protocol
+/// prepared (a Parse's) are pgwire's, and the Postgres port drops them after DISCARD ALL and DEALLOCATE (`pg::forgets`).
+fn discard(session: &str, what: ast::DiscardObject) -> Result<()> {
+    let Some(at) = crate::temp::here().map(|n| n.at) else { bail!("no session here") };
+    match what {
+        ast::DiscardObject::ALL if crate::txn::held(&at, session) => {
+            bail!(crate::codes::coded("25001", "DISCARD ALL cannot run inside a transaction block (COMMIT or ROLLBACK first)"))
+        }
+        ast::DiscardObject::ALL => drop(at.end(session)),
+        ast::DiscardObject::TEMP => crate::temp::discard_temporary(session)?,
+        ast::DiscardObject::SEQUENCES => crate::temp::with(session, false, |s| Ok(s.currval.clear()))?,
+        ast::DiscardObject::PLANS => {} // (a session keeps no plan: each statement is planned as it runs)
+    }
+    Ok(())
 }
 
 /// A setting's name as kept: lower case, Postgres's `timezone` as DataFusion's.
@@ -190,7 +216,6 @@ fn name(n: &str) -> String {
     match n.to_lowercase().as_str() {
         "timezone" | "time.zone" | "time zone" => "datafusion.execution.time_zone".into(),
         "threads" | "worker_threads" => "datafusion.execution.target_partitions".into(), // (DuckDB's: how many parts a query runs in at once)
-        "language" => DIALECT.into(), // (the session's language, kept as DataFusion's parse of it until step 8's PR 7b: `dialect_of`)
         n => n.into(),
     }
 }
@@ -247,11 +272,22 @@ fn one_way(n: &str, value: &str) -> Option<(&'static str, String)> {
 }
 
 fn set(session: &str, variable: &str, value: String) -> Result<()> {
-    let n = name(variable);
-    let value = match variable.trim().eq_ignore_ascii_case("language") {
-        true => dialect_of(&value)?,
-        false => value,
+    let mut n = name(variable);
+    // (the session's language, `languages.rs`: by its name, or by DataFusion's dialect where that names one (`spark`). A
+    // language picks the parse, so DataFusion's dialect is then generic, the one its print is read in; another dialect
+    // (`mysql`, until step 8's PR 9) is Pondra's SQL read so)
+    let value = if n == "language" {
+        language_named(&value)?
+    } else if let Some(l) = (n == DIALECT).then(|| crate::languages::get().named(&value)).flatten() {
+        n = "language".into();
+        l.name.to_string()
+    } else {
+        value
     };
+    if n == "language" || n == DIALECT {
+        let other = if n == "language" { DIALECT } else { "language" };
+        crate::temp::with(session, false, |s| Ok(drop(s.settings.remove(other))))?;
+    }
     if let Some(v) = n.strip_prefix('@') {
         return Err(crate::codes::coded("0A000", crate::dialect_stmts::user_variable(v)));
     }
@@ -286,66 +322,53 @@ pub fn any() -> bool {
     crate::temp::current().is_some_and(|s| crate::temp::with(&s, false, |s| Ok(s.settings.keys().any(|k| k.starts_with("datafusion.")))).unwrap_or(false))
 }
 
-/// A query's session with the current session's settings of DataFusion's. In Spark's dialect
-/// (`datafusion.sql_parser.dialect = 'spark'` or `'databricks'`), Spark's functions over
-/// DataFusion's of the same names too (`floor` of a DOUBLE is a BIGINT, `substring` counts from
-/// the end, …), and Spark's `EXTRACT` and `SUBSTRING`.
+/// A query's session with the current session's settings of DataFusion's. (Spark SQL's meaning is in the statement
+/// itself, its functions and casts turned as it arrives: `sparksql.rs`, `statement::in_language`.)
 pub async fn apply(ctx: SessionContext) -> Result<SessionContext> {
     let kept = crate::temp::current().map(|s| crate::temp::with(&s, false, |s| Ok(s.settings.iter().filter(|(k, _)| k.starts_with("datafusion.")).map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>())));
     for (variable, value) in kept.transpose()?.unwrap_or_default() {
         ctx.execute_logical_plan(LogicalPlan::Statement(Plan::SetVariable(SetVariable { variable, value }))).await?; // (as DataFusion sets one: functions that read it told)
     }
-    use datafusion::common::config::Dialect;
-    if !matches!(ctx.state().config().options().sql_parser.dialect, Dialect::Spark | Dialect::Databricks) {
-        return Ok(ctx);
-    }
-    // DataFusion's of a name Spark has go, aliases and all: a session rebuilt later (files read by
-    // URL, a query's copy) registers what is left in no set order, and must find Spark's alone. One
-    // whose alias is Spark's name goes too (`array_has`, also `array_contains`): kept, it answered
-    // for Spark's `array_contains` in some sessions and not others.
-    let (scalar, aggregate) = (datafusion_spark::all_default_scalar_functions(), datafusion_spark::all_default_aggregate_functions());
-    let names: std::collections::HashSet<String> = scalar.iter().map(|f| (f.name(), f.aliases())).chain(aggregate.iter().map(|f| (f.name(), f.aliases())))
-        .flat_map(|(n, a)| std::iter::once(n.to_string()).chain(a.iter().cloned())).collect();
-    let mut spark = datafusion::execution::SessionStateBuilder::new_from_existing(ctx.state());
-    spark.expr_planners().get_or_insert_with(Vec::new).insert(0, std::sync::Arc::new(datafusion_spark::planner::SparkFunctionPlanner));
-    let fns = spark.scalar_functions().get_or_insert_with(Vec::new);
-    fns.retain(|f| !names.contains(f.name()) && !f.aliases().iter().any(|a| names.contains(a)));
-    fns.extend(scalar);
-    let fns = spark.aggregate_functions().get_or_insert_with(Vec::new);
-    fns.retain(|f| !names.contains(f.name()) && !f.aliases().iter().any(|a| names.contains(a)));
-    fns.extend(aggregate);
-    Ok(SessionContext::new_with_state(spark.build()))
+    Ok(ctx)
 }
 
 const DIALECT: &str = "datafusion.sql_parser.dialect";
 
-/// DataFusion's SQL dialect the session set (or the node: `PONDRA_SQL_OPTIONS`).
-fn dialect_set() -> Option<String> {
-    let session = crate::temp::current().and_then(|s| crate::temp::with(&s, false, |s| Ok(s.settings.get(DIALECT).cloned())).ok().flatten());
-    session.or_else(|| crate::env::get("PONDRA_SQL_OPTIONS")?.split(',').find_map(|kv| Some(kv.trim().split_once('=').filter(|(k, _)| *k == DIALECT)?.1.to_string())))
+/// The node's DataFusion dialect (`PONDRA_SQL_OPTIONS`).
+fn node_dialect() -> Option<String> {
+    crate::env::get("PONDRA_SQL_OPTIONS")?.split(',').find_map(|kv| Some(kv.trim().split_once('=').filter(|(k, _)| *k == DIALECT)?.1.trim().to_string()))
 }
 
-/// The SQL dialect the session set (or the node: `PONDRA_SQL_OPTIONS`), for a statement the
-/// generic parser doesn't take (DuckDB's `STRUCT(a INT)`, …).
+/// The SQL dialect the session set (or the node: `PONDRA_SQL_OPTIONS`), for a statement the generic parser doesn't take
+/// (DuckDB's `STRUCT(a INT)`, …). A dialect that names a language (`spark`) is the language's, read as the statement
+/// arrives (`language`), and none here.
 pub fn dialect() -> Option<Box<dyn datafusion::sql::sqlparser::dialect::Dialect>> {
-    datafusion::sql::sqlparser::dialect::dialect_from_str(dialect_set()?)
+    let session = crate::temp::current().and_then(|s| crate::temp::peek(&s, |x| x.settings.get(DIALECT).cloned()));
+    let d = session.or_else(node_dialect).filter(|d| crate::languages::get().named(d).is_none())?;
+    datafusion::sql::sqlparser::dialect::dialect_from_str(d)
 }
 
-/// The session's language (`languages.rs`): `SET language = 'spark'` (or DataFusion's dialect `spark` or `databricks`,
-/// which names it too), else the node's (`PONDRA_SQL_OPTIONS`), else Pondra's SQL.
+/// The language the session's statements are written in (`languages.rs`): its own `SET language` (or the dialect's
+/// setting that names one), else the node's (`PONDRA_LANGUAGE`, or `PONDRA_SQL_OPTIONS`'s dialect where that names one),
+/// else Pondra's SQL.
 pub fn language() -> &'static str {
-    dialect_set().and_then(|d| crate::languages::get().named(&d)).map_or(crate::parsed::LANGUAGE.name, |l| l.name)
+    let named = |n: String| crate::languages::get().named(&n).map(|l| l.name);
+    own_language().or_else(|| crate::env::get("PONDRA_LANGUAGE").and_then(named)).or_else(|| node_dialect().and_then(named)).unwrap_or(crate::parsed::LANGUAGE.name)
 }
 
-/// The language `SET language` names, as it is kept until step 8's PR 7b moves a session onto its language's parse:
-/// DataFusion's parse of it, which for Pondra's SQL is DataFusion's generic and for another language DataFusion's of its
-/// name (`spark`). A name no language has is refused, naming those there are.
-fn dialect_of(value: &str) -> Result<String> {
+/// The language the session itself set (`SET language`, or the dialect's setting that names one), not the node's.
+pub fn own_language() -> Option<&'static str> {
+    let session = crate::temp::current().and_then(|s| crate::temp::peek(&s, |x| x.settings.get("language").cloned()))?;
+    crate::languages::get().named(&session).map(|l| l.name)
+}
+
+/// The language `SET language` names, by its name: one no language has is refused, naming those there are.
+fn language_named(value: &str) -> Result<String> {
     let languages = crate::languages::get();
-    let Some(l) = languages.named(value) else {
-        return Err(crate::codes::coded("22023", format!("invalid value for parameter \"language\": \"{value}\" (the languages are {})", languages.listed())));
-    };
-    Ok((if std::ptr::eq(l, &crate::parsed::LANGUAGE) { "generic" } else { l.name }).to_string())
+    match languages.named(value) {
+        Some(l) => Ok(l.name.to_string()),
+        None => Err(crate::codes::coded("22023", format!("invalid value for parameter \"language\": \"{value}\" (the languages are {})", languages.listed()))),
+    }
 }
 
 /// `SHOW name` of a Postgres setting the session keeps: one row, its column named as the setting,
@@ -398,5 +421,58 @@ impl VisitorMut for Arguments {
             None => Expr::Nested(Box::new(value)),
         };
         ControlFlow::Continue(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session's language is its own (`SET language`, or the dialect's setting that names one), else the node's, else
+    /// Pondra's SQL; a dialect that names none is DataFusion's, read in Pondra's SQL, and the two never stand together.
+    #[tokio::test]
+    async fn a_session_s_language_is_its_own_or_pondra_s_sql() {
+        let (s, at) = (crate::temp::of_script(""), std::sync::Arc::new(crate::temp::Sessions::default()));
+        crate::temp::SESSION.sync_scope(Some(crate::temp::Named { name: s.clone(), at: at.clone() }), || {
+            assert_eq!((language(), own_language()), ("pondra", None));
+            set(&s, "language", " Spark".into()).unwrap();
+            assert_eq!((language(), own_language()), ("spark", Some("spark")));
+            set(&s, DIALECT, "mysql".into()).unwrap();
+            assert_eq!((language(), dialect().is_some()), ("pondra", true), "another dialect: Pondra's SQL read so");
+            set(&s, DIALECT, "databricks".into()).unwrap();
+            assert_eq!((language(), dialect().is_none()), ("spark", true), "a dialect that names a language is the language's alone");
+            set(&s, "LANGUAGE", "pondra".into()).unwrap();
+            assert_eq!((language(), own_language()), ("pondra", Some("pondra")));
+            let refused = set(&s, "language", "cobol".into()).unwrap_err();
+            assert_eq!(crate::codes::of(&refused), "22023");
+            assert!(refused.to_string().contains("(the languages are pondra (Pondra's SQL) or spark (Spark SQL))"), "{refused}");
+        });
+        at.end(&s);
+    }
+
+    #[tokio::test]
+    async fn discard_is_a_sessions() {
+        let (s, at) = (crate::temp::of_script(""), std::sync::Arc::new(crate::temp::Sessions::default()));
+        crate::temp::SESSION.sync_scope(Some(crate::temp::Named { name: s.clone(), at: at.clone() }), || {
+            let kept = |f: fn(&crate::temp::Session) -> bool| crate::temp::peek(&s, |x| Some(f(x))).unwrap_or(false);
+            let fill = || {
+                set(&s, "language", "spark".into()).unwrap();
+                crate::temp::with(&s, false, |x| Ok(x.currval.insert("s".into(), 1))).unwrap();
+            };
+            fill();
+            discard(&s, ast::DiscardObject::SEQUENCES).unwrap();
+            assert!(kept(|x| x.currval.is_empty() && !x.settings.is_empty()), "SEQUENCES: currval alone");
+            discard(&s, ast::DiscardObject::PLANS).unwrap();
+            discard(&s, ast::DiscardObject::TEMP).unwrap();
+            assert_eq!(own_language(), Some("spark"), "PLANS and TEMP keep the settings");
+            fill();
+            discard(&s, ast::DiscardObject::ALL).unwrap();
+            assert_eq!((own_language(), kept(|x| !x.currval.is_empty())), (None, false), "ALL: the session starts again");
+        });
+        at.end(&s);
+        for form in ["DISCARD ALL", "discard temp;", "/* a pooler's */ DISCARD  ALL"] {
+            assert!(is(form), "{form}");
+        }
+        assert!(!is("-- DISCARD ALL\nSELECT 1"));
     }
 }

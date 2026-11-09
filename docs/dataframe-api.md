@@ -164,7 +164,8 @@ top.explain()            # Pondra's plan, and whether it would spread
 
 A frame's `cast` to an integer type drops the fraction toward zero, as Polars and PySpark do (2.7 is 2, -2.7 is -2).
 SQL's `CAST` rounds it, as Postgres and DuckDB do (2.7 is 3). A session in Spark SQL (`SET language = 'spark'`, or
-`datafusion.sql_parser.dialect = 'spark'`) and `spark_sql('…')` truncate too, as Spark does (`casts.rs`).
+`datafusion.sql_parser.dialect = 'spark'`) and `spark_sql('…')` truncate too, as Spark does: each cast to an integer
+arrives as a cast of `pondra_truncate(x)` (`sparksql.rs`).
 
 Writes and streams are the same verbs SQL has, so they keep SQL's guarantees (the leader
 records them; a job id makes a retry a no-op):

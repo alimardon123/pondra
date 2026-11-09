@@ -27,6 +27,7 @@ fn add(ctx: SessionContext) -> SessionContext {
     let more = spark_functions();
     more.scalar.iter().chain(&more.shared).for_each(|f| { ctx.register_udf(f.clone()); });
     more.aggregate.iter().for_each(|f| { ctx.register_udaf(f.clone()); });
+    ctx.register_udf(crate::divide::spark().as_ref().clone()); // (Spark SQL's `/`, as the turn writes it)
     ctx
 }
 

@@ -60,6 +60,9 @@ pub fn config(mut config: SessionConfig) -> SessionConfig {
     // q47 and q65 skip now, 2-4% faster. `logs/round36/partial-aggregation.json`. A spread query's stages keep DataFusion's
     // 80%, `spmd::stage_ctx`)
     for (k, v) in defaults.split(',').chain(user.split(',')).filter_map(|kv| kv.trim().split_once('=')) {
+        if k.trim() == "datafusion.sql_parser.dialect" && crate::languages::get().named(v).is_some() {
+            continue; // (`spark`: the node's language, whose statements are read as they arrive, `set::language`; DataFusion reads their print)
+        }
         config = config.set_str(k, v);
     }
     // (a page's spill is written uncompressed: arrow-ipc 59 writes a compressed buffer's length as a `usize`, 4 bytes on
@@ -3144,7 +3147,7 @@ mod tests {
 
     /// A DECIMAL quotient keeps 16 places, rounded, as Postgres's (`divide::Quotients`): `71 / 3.0` was 23.6666, cut, as a
     /// DECIMAL(25, 4), and TPC-DS q83's shares, three divisions deep, were wrong from their ninth digit. Names, NULLs, a
-    /// zero divisor, GROUP BY, UNION, a recursive CTE, SAFE_DIVIDE and Spark's dialect, and an integer's `/` left as it was.
+    /// zero divisor, GROUP BY, UNION, a recursive CTE, SAFE_DIVIDE and Spark SQL's `/`, and an integer's `/` left as it was.
     #[tokio::test]
     async fn a_decimal_quotient_keeps_16_places_rounded() {
         use datafusion::arrow::array::{Int64Array, RecordBatch};
@@ -3195,10 +3198,14 @@ mod tests {
             assert!(!rows.is_empty(), "{sql}: {types:?}");
         }
         assert_eq!(answer(&ctx, "SELECT k, sum(cr / 3.0) AS s FROM q GROUP BY k ORDER BY k").await.1[0][1].as_deref(), Some("12.3333333333333333"));
-        let spark = session();
-        spark.sql("SET datafusion.sql_parser.dialect = 'Spark'").await.unwrap();
-        let (types, rows) = answer(&spark, "SELECT 71 / 3.0 AS q").await;
-        assert_eq!((types[0].as_str(), rows[0][0].as_deref()), ("q: Decimal128(27, 6)", Some("23.666667")), "Spark's type, rounded");
+        // (Spark SQL's `/`, as `sparksql.rs` writes it: two DECIMALs with Spark's type, rounded; anything else fractional)
+        ctx.register_udf(crate::divide::spark().as_ref().clone());
+        let sql = "SELECT spark_divide(71, 3.0) AS q, spark_divide(CAST(10.00 AS DECIMAL(10, 2)), 3) AS p, spark_divide(7, 2) AS h, spark_divide(cr, 2) AS c FROM q ORDER BY k";
+        let (types, rows) = answer(&ctx, sql).await;
+        assert_eq!(types, ["q: Decimal128(9, 6)", "p: Decimal128(14, 6)", "h: Float64", "c: Float64"], "Spark's types: a whole literal a DECIMAL of its digits");
+        assert_eq!(rows, vec![some(&["23.666667", "3.333333", "3.5", "18.5"]), some(&["23.666667", "3.333333", "3.5", "0.5"])]);
+        let zero = ctx.sql("SELECT spark_divide(7, 0)").await.unwrap().collect().await;
+        assert!(zero.is_err_and(|e| e.to_string().contains("Divide by zero")), "a zero divisor is refused, as Spark's ANSI `/` refuses it");
     }
 
     /// A number with an exponent is a whole decimal (`WholeLiterals`): a cast of `1e15` to a float is

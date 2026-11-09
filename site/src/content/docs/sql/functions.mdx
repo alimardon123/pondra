@@ -56,8 +56,9 @@ pondra  spark  f   s
 ```
 
 To make the plain names Spark's for a whole session, make Spark SQL its language. `SET language = 'spark'`
-(or `SET datafusion.sql_parser.dialect = 'spark'`, as a Spark client may send it) changes `floor`, `substring` and
-`EXTRACT` in that session. Here the day of the week counts Sunday as 1, not 0:
+(or `SET datafusion.sql_parser.dialect = 'spark'`, as a Spark client may send it) makes `floor`, `substring`,
+`EXTRACT` and `/` Spark's in that session: its statements are read as `spark_sql('…')` reads its query. Here the day
+of the week counts Sunday as 1, not 0:
 
 ```sql
 SET language = 'spark';
