@@ -1449,7 +1449,7 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
         return Ok(None);
     }
     // (out of memory, once more frugally: the first try's files are never recorded, and the orphan sweep takes them)
-    let (columns, files) = crate::query::frugally(ctx, |ctx| async move {
+    let (columns, files) = crate::query::frugally(&lake.node, ctx, |ctx| async move {
         in_order(&ctx);
         let df = crate::engine::sql(&ctx, &crate::sys::planned(query)?).await?;
         write_rows(lake, &ctx, table, df, stamp).await
@@ -2125,7 +2125,7 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
     let next = std::sync::atomic::AtomicU64::new(0);
     // (out of memory, once more frugally, as a node's INSERT … SELECT runs (`write_files`); but only while nothing is staged: a
     // staged file holds some of the first try's rows, and is never overwritten)
-    let names = crate::query::frugally(&ctx, |ctx| {
+    let names = crate::query::frugally(&app.lake.node, &ctx, |ctx| {
         let (order, dir, next) = (&order, &dir, &next);
         async move {
             if next.load(std::sync::atomic::Ordering::Relaxed) > 0 {

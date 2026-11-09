@@ -502,7 +502,7 @@ pub struct Running {
     /// How to stop the first try it is in (`panics::first_try`), which a frugal session can try again: the watch
     /// stops that rather than the request.
     pub first_try: Option<futures::future::AbortHandle>,
-    /// Its node's counters, which count a stop of it (`panics::stop_one`, `panics::stopped_for_memory`).
+    /// Its node's counters, which count a stop of it (`panics::stop_one`; a stop not run again counts on its node in `query::frugally`).
     pub metrics: Arc<crate::metrics::Metrics>,
 }
 
