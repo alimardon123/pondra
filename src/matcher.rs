@@ -479,8 +479,9 @@ enum Acc {
     Count(i64),
     /// A sum: None until a value is taken (a sum over no value is NULL).
     Sum(Option<Num>),
-    /// An average: the f64 sum of its values (bits) and their number.
-    Avg(u64, i64),
+    /// An average: the sum of its values with its rounding error (`fsum::add`, as bits) and their number, divided as the
+    /// query's `avg` divides (`fvar::double_mean`, 11-09 audit M11).
+    Avg(u64, u64, i64),
     /// A min or max: None until a value is taken.
     Extreme(Option<ScalarValue>),
     /// MATCH_NUMBER(), which keeps nothing.
@@ -679,7 +680,7 @@ fn start_state(plan: &Plan) -> State {
             SlotSpec::Agg { fun, .. } => match fun.as_str() {
                 "count" => Acc::Count(0),
                 "sum" => Acc::Sum(None),
-                "avg" => Acc::Avg(0f64.to_bits(), 0),
+                "avg" => Acc::Avg(0f64.to_bits(), 0f64.to_bits(), 0),
                 _ => Acc::Extreme(None),
             },
             SlotSpec::MatchNumber { .. } => Acc::Unit,
@@ -1292,10 +1293,11 @@ impl Acc {
                         *total = Some(num_add(*total, &v)?);
                     }
                 }
-                ("avg", Acc::Avg(sum, n)) => {
+                ("avg", Acc::Avg(hi, lo, n)) => {
                     if let Some(ScalarValue::Float64(Some(x))) = value_at(part, *value, i, &DataType::Float64)? {
-                        *sum = (f64::from_bits(*sum) + x).to_bits();
-                        *n += 1;
+                        let (mut h, mut l) = (f64::from_bits(*hi), f64::from_bits(*lo));
+                        fsum::add(&mut h, &mut l, x);
+                        (*hi, *lo, *n) = (h.to_bits(), l.to_bits(), *n + 1);
                     }
                 }
                 (name @ ("min" | "max"), Acc::Extreme(best)) => {
@@ -1346,10 +1348,7 @@ impl Acc {
             (_, Acc::Count(c)) => ScalarValue::Int64(Some(*c)),
             (_, Acc::Sum(None)) => null,
             (_, Acc::Sum(Some(x))) => x.scalar(&types.result)?,
-            (_, Acc::Avg(sum, n)) => ScalarValue::Float64(match *n {
-                0 => None,
-                n => Some(f64::from_bits(*sum) / n as f64),
-            }),
+            (_, Acc::Avg(hi, lo, n)) => ScalarValue::Float64(crate::fvar::double_mean(f64::from_bits(*hi), f64::from_bits(*lo), *n)),
             (_, Acc::Extreme(Some(v))) => v.clone(),
             (_, Acc::Extreme(None)) => null,
             _ => bail!("MATCH_RECOGNIZE: a DEFINE's state doesn't match its slot"),
@@ -1794,6 +1793,8 @@ pub static MATCH_RECOGNIZE: crate::registry::BuiltIn = crate::registry::BuiltIn 
             ctx
         });
         crate::pattern::passes().into_iter().for_each(|p| r.section_mut::<crate::passes::Passes>().add(p));
+        #[cfg(feature = "lake")] // (what a lake keeps for its matches views: `matches::Kept`)
+        r.section_mut::<crate::lake_state::Registered>().add::<crate::matches::Kept>();
     },
 };
 

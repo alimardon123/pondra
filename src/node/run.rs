@@ -112,7 +112,9 @@ impl Held {
             }
         }
         if let Some((store, n)) = term {
-            terms::step_down(store, *n).await;
+            if let Some(node) = self.node.get() {
+                terms::step_down(store, *n, &node.claims).await; // (the node's claims: `Claims`)
+            }
             tr("term");
         }
     }
@@ -211,9 +213,6 @@ impl Node {
         let store = store::counted(store::open_store(&dir)?.1, &here.metrics); // (its terms, marks and members' requests the node's: `Counted`)
         let tr = |what: &str| here.trace(what); // (timed from this start: `NodeState::trace`)
         let addr = advertise.unwrap_or_else(|| listen.clone()); // (how others reach it: its cluster name)
-        if lives {
-            sharing::set_endpoint(&addr); // (where a recipient's profile points: `sharing.rs`)
-        }
         if let Some(at) = dir.strip_prefix("pondra://") {
             // (a lake whose node is away, or not up yet: wait for it, as a follower waits for its leader; a guest waits 10 s at most)
             let at = at.trim_end_matches('/');
@@ -230,8 +229,8 @@ impl Node {
         // the bucket, and the start waits for the later of them, not for both in turn)
         let mut beside = Beside::start(&dir, guest, &here);
         let cluster = match guest {
-            None => cluster::Cluster::join(&store, &addr, start.reader, !store::served(&dir), serve_store, here.life.clone()).await?,
-            Some(g) => cluster::Cluster::guest(&store, g, !store::served(&dir), here.life.clone()).await.map_err(|e| e.context(dir.clone()))?,
+            None => cluster::Cluster::join(&store, &addr, start.reader, !store::served(&dir), serve_store, here.clone()).await?,
+            Some(g) => cluster::Cluster::guest(&store, g, !store::served(&dir), here.clone()).await.map_err(|e| e.context(dir.clone()))?,
         };
         // (a guest that reads is a reader from here on: no log, whose history and audit lines would go to a leader it doesn't have)
         let reader = start.reader || cluster.reader;
@@ -273,7 +272,7 @@ impl Node {
             // nor hold the term; and a restart would find the same place again)
             Err(e) if e.downcast_ref::<format::Newer>().is_some() || crate::memory_lake::torn(&e) => {
                 if leader {
-                    terms::release(&store, cluster.leader.n).await;
+                    terms::release(&store, cluster.leader.n, &here.claims).await;
                 }
                 return Err(e);
             }
@@ -294,6 +293,9 @@ impl Node {
             lake => lake?,
         };
         let _ = held.lake.set(lake.clone()); // (a stop from here on makes the lake durable first: `Held::stop`)
+        if lives {
+            sharing::set_endpoint(&lake, &addr); // (where a recipient's profile points: `sharing.rs`)
+        }
         if (guest == Some(Guest::Reads) || cluster.by_inbox()) && !streamed {
             let _ = held.detach.set(()); // (a reader owes nothing: its close is let go, `Held::stop`; an inbox guest's writes are answered before it)
         }
@@ -347,14 +349,15 @@ impl Node {
                 }
                 cluster::catch_up(lake.clone(), store.clone(), cluster.leader.clone()); // (answers wait until this node holds what the leader had; a view that replays the WAL has it)
             }
+            let down = Arc::new(std::sync::atomic::AtomicBool::new(false)); // (is the leader's commit stream down: the mirror says, a reader's watch reads)
             if lives {
                 match reader {
-                    false => cluster.clone().follow(store, &here),
-                    true => cluster.clone().watch_leader(store, streamed, &here), // a reader never votes or leads
+                    false => cluster.clone().follow(store, lake.log.untaken.clone(), &here),
+                    true => cluster.clone().watch_leader(store, streamed, down.clone(), &here), // a reader never votes or leads
                 }
             }
             if streamed {
-                cluster::mirror(lake.clone(), cluster.leader.addr.clone(), addr.clone(), replica);
+                cluster::mirror(lake.clone(), cluster.leader.addr.clone(), addr.clone(), replica, down.clone());
                 if !lives {
                     // (a guest synced the lakes attached in SQL once, in `start_app`, from a view that skips the WAL, and
                     // syncs no more: an ATTACH its leader made in the last few seconds wasn't there yet, and `pondra sql`
@@ -463,6 +466,9 @@ impl Node {
             Ok(node) => Ok(node),
             Err(e) => {
                 held.stop().await;
+                if let Some(node) = held.node.get() {
+                    node.claims.clear(); // (its claims' locks let go as it stops: `Claims`)
+                }
                 reset::reset();
                 Err(e)
             }
@@ -478,6 +484,9 @@ impl Node {
             history::end_writers(lake).await;
         }
         self.held.stop().await;
+        if let Some(node) = self.held.node.get() {
+            node.claims.clear(); // (its claims' locks let go as it stops: `Claims`)
+        }
         reset::reset();
     }
 }
@@ -506,12 +515,12 @@ pub(crate) async fn attach(home: &store::Lake, spec: &str, me: &str, follow: boo
     ddl::database_name(name)?; // (the names the catalog attached keep working; a new `--attach _x=` is refused)
     let leader = crate::terms::latest(&crate::store::open_store(dir)?.1).await?.map(|t| t.addr).filter(|a| !a.is_empty());
     let live = match (&leader, follow) {
-        (Some(a), true) => crate::dial::call(a, crate::dial::Call::get("/cluster/leader").timeout(Duration::from_secs(2))).await.is_ok(),
+        (Some(a), true) => crate::dial::call(&home.node, a, crate::dial::Call::get("/cluster/leader").timeout(Duration::from_secs(2))).await.is_ok(),
         _ => false,
     };
     let other = ddl::attach(home, name, dir, follow, live).await?;
     if let (true, Some(a)) = (live, leader) {
-        cluster::mirror(other, a, me.to_string(), None);
+        cluster::mirror(other, a, me.to_string(), None, Default::default()); // (its own flag: an attached lake's stream says nothing of the home lake's leader)
     }
     Ok(())
 }

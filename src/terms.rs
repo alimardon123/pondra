@@ -10,8 +10,9 @@ use object_store::{path::Path, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use datafusion::common::instant::Instant;
+use crate::node_state::Claims;
 use std::time::Duration;
 
 pub(crate) const LEASE: Duration = Duration::from_secs(5);
@@ -25,7 +26,7 @@ const KEEP: u64 = 16; // (the newest terms whose leadership records a lake keeps
 pub struct Term {
     pub n: u64,
     pub addr: String, // the leader of this term
-    /// The claim's lock file on the machine that claimed it (`HELD`), or empty (older releases, or a
+    /// The claim's lock file on the machine that claimed it (`Claims`), or empty (older releases, or a
     /// temp folder that couldn't take one): 32 hex characters, never a path.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lock: String,
@@ -70,7 +71,7 @@ pub async fn latest(store: &Store) -> Result<Option<Term>> {
 
 /// Try to become leader of term `n`: put-if-absent, so at most one node succeeds. (`addr` is
 /// empty for a `pondra sql` INSERT recording its files: nothing to follow, just wait for it.)
-pub async fn claim(store: &Store, n: u64, addr: &str) -> Result<Option<Term>> {
+pub async fn claim(store: &Store, n: u64, addr: &str, claims: &Claims) -> Result<Option<Term>> {
     // (its id goes into the record: a process here can tell when we're gone; none reaches a lake in our memory)
     let lock = if crate::memory_lake::held_in_memory(store) { None } else { new_lock() };
     let bell = answers_bell(addr, crate::env::value("PONDRA_REPLICAS"));
@@ -96,7 +97,7 @@ pub async fn claim(store: &Store, n: u64, addr: &str) -> Result<Option<Term>> {
                 return Ok(None);
             }
             if let Some(held) = lock {
-                HELD.lock().unwrap().insert(n, held);
+                claims.0.lock().unwrap().insert(n, held);
             }
             // (capped: a bucket that stalls can't hold the claim; the next claim prunes what this one didn't)
             let _ = tokio::time::timeout(Duration::from_secs(10), prune(store, n, &listed)).await;
@@ -116,15 +117,15 @@ pub async fn claim(store: &Store, n: u64, addr: &str) -> Result<Option<Term>> {
 /// The term a one-off writer claims: the next term with no address, once the lake has no holder (`holder`). While it is
 /// held, `live` decides: an `Err` refuses (no claim is made), and an `Ok` waits for the holder (`wait_for`) and looks
 /// again. (A backup waits for another one-off writer this way; a page's lake alone refuses one, `members::Alone::lead`.)
-pub async fn claim_one_off(store: &Store, live: impl Fn(&Term) -> Result<()>) -> Result<Term> {
+pub async fn claim_one_off(store: &Store, live: impl Fn(&Term) -> Result<()>, claims: &Claims) -> Result<Term> {
     loop {
-        match holder(store).await? {
+        match holder(store, Some(claims)).await? {
             Holder::Led(t) | Holder::Recording(t) => {
                 live(&t)?;
-                wait_for(store, &t).await;
+                wait_for(store, &t, Some(claims)).await;
             }
             Holder::Free(t) => {
-                if let Some(term) = claim(store, t.map_or(1, |t| t.n + 1), "").await? {
+                if let Some(term) = claim(store, t.map_or(1, |t| t.n + 1), "", claims).await? {
                     return Ok(term);
                 }
             }
@@ -135,9 +136,9 @@ pub async fn claim_one_off(store: &Store, live: impl Fn(&Term) -> Result<()>) ->
 /// The term a page takes at once on a store its caller holds alone: the next term over the newest, alive or not (`claim_one_off`
 /// waits for a live one). Only a store no other process writes may take one, a kept page's folder under its Web Lock, where the
 /// newest term's holder is gone. The old term's records stay until the next `claim` trims them.
-pub async fn claim_owned(store: &Store) -> Result<Term> {
+pub async fn claim_owned(store: &Store, claims: &Claims) -> Result<Term> {
     loop {
-        if let Some(term) = claim(store, latest(store).await?.map_or(1, |t| t.n + 1), "").await? {
+        if let Some(term) = claim(store, latest(store).await?.map_or(1, |t| t.n + 1), "", claims).await? {
             return Ok(term);
         }
     }
@@ -205,11 +206,12 @@ pub(crate) async fn listen(store: &Store, heard: &mut Option<Option<(chrono::Dat
     heard.replace(bell.clone()) != Some(bell)
 }
 
-crate::per_node!(
-    /// What this process heard of claimers on other machines (`deaf`): None, one that didn't mark its term when rung (gone,
-    /// whatever its mark says: `alive`); Some, when one last did (it isn't rung again for `RUNG_AGAIN`). Keyed by the
-    /// store, the term and its lock file's id.
-    static RUNG: Mutex<BTreeMap<(String, u64, String), Option<Instant>>> = Mutex::new(BTreeMap::new()));
+/// What this process heard of claimers on other machines (`deaf`): None, one that didn't mark its term when rung (gone,
+/// whatever its mark says: `alive`); Some, when one last did (it isn't rung again for `RUNG_AGAIN`). Keyed by the
+/// store, the term and its lock file's id. The process's, not a node's: what is heard of a claimer elsewhere is the same
+/// for any node here, and the CLI's `alive` reads it too; an answer older than `RUNG_AGAIN` is let go as one is written,
+/// so it doesn't grow with each term.
+static RUNG: Mutex<BTreeMap<(String, u64, String), Option<Instant>>> = Mutex::new(BTreeMap::new());
 
 /// A claimer that answered its bell isn't rung again by `deaf` for this long: its mark, every 10 s, says it is alive
 /// meanwhile, and goes stale in 30 s if it isn't. (A waiter or a follower outside the cluster's network rings this often,
@@ -230,12 +232,12 @@ impl Ear {
     /// Ring the inbox's bell (`id` its body), and watch whether term `t`'s claimer marks itself after it. None when its
     /// answer can't tell (see `deaf`), or the bucket refused the ring (the claimer may hear nothing new); the bell rings
     /// anyway, for the request just left in the inbox (`inbox::send`).
-    pub async fn ring(store: &Store, t: Option<&Term>, id: &str) -> Option<Ear> { Ear::rung(store, t, id, true).await }
+    pub async fn ring(store: &Store, t: Option<&Term>, id: &str, claims: Option<&Claims>) -> Option<Ear> { Ear::rung(store, t, id, true, claims).await }
 
     /// `ring`; `always` false rings only when there is an answer to watch for (`deaf`).
-    async fn rung(store: &Store, t: Option<&Term>, id: &str, always: bool) -> Option<Ear> {
+    async fn rung(store: &Store, t: Option<&Term>, id: &str, always: bool, claims: Option<&Claims>) -> Option<Ear> {
         let watch = match t {
-            Some(t) => Ear::before(store, t).await,
+            Some(t) => Ear::before(store, t, claims).await,
             None => None,
         };
         if watch.is_none() && !always {
@@ -246,12 +248,13 @@ impl Ear {
         Some(Ear { key, mark, before, rang: tokio::time::Instant::now() })
     }
 
-    async fn before(store: &Store, t: &Term) -> Option<((String, u64, String), Path, (chrono::DateTime<chrono::Utc>, Option<String>))> {
+    async fn before(store: &Store, t: &Term, claims: Option<&Claims>) -> Option<((String, u64, String), Path, (chrono::DateTime<chrono::Utc>, Option<String>))> {
         // (its own claim, or one made on this machine by this user: the lock file decides, `gone_here`. A lake in this
         // process's memory has no claimer elsewhere)
-        let here = HELD.lock().unwrap().contains_key(&t.n) || lock_path(t).is_some_and(|p| p.exists()) || crate::memory_lake::held_in_memory(store);
+        let held = claims.is_some_and(|c| c.0.lock().unwrap().contains_key(&t.n));
+        let here = held || lock_path(t).is_some_and(|p| p.exists()) || crate::memory_lake::held_in_memory(store);
         let key = rung_key(store, t);
-        let lately = RUNG.lock().unwrap().get(&key).copied().flatten().is_some_and(|at| at.elapsed() < RUNG_AGAIN);
+        let lately = RUNG.lock().unwrap_or_else(PoisonError::into_inner).get(&key).copied().flatten().is_some_and(|at| at.elapsed() < RUNG_AGAIN);
         if !t.bell || here || lately {
             return None;
         }
@@ -272,7 +275,9 @@ impl Ear {
             false if self.rang.elapsed() < HEARD => return None,
             false => true,
         };
-        RUNG.lock().unwrap().insert(self.key.clone(), (!gone).then(Instant::now));
+        let mut rung = RUNG.lock().unwrap_or_else(PoisonError::into_inner);
+        rung.retain(|_, at| at.is_none_or(|at| at.elapsed() < RUNG_AGAIN)); // (an old answer is let go as one is written; a `None` stays)
+        rung.insert(self.key.clone(), (!gone).then(Instant::now));
         Some(gone)
     }
 }
@@ -282,8 +287,8 @@ impl Ear {
 /// so from then on, here (invariant 17). False at once where its answer can't tell: an older release's claimer
 /// (`Term::bell`), one on this machine (`gone_here` decides), or one that answered in the last `RUNG_AGAIN`: then the bell
 /// isn't rung. False too when the bucket refused the ring.
-pub async fn deaf(store: &Store, t: &Term) -> bool {
-    let Some(ear) = Ear::rung(store, Some(t), &uuid::Uuid::new_v4().to_string(), false).await else { return false };
+pub async fn deaf(store: &Store, t: &Term, claims: Option<&Claims>) -> bool {
+    let Some(ear) = Ear::rung(store, Some(t), &uuid::Uuid::new_v4().to_string(), false, claims).await else { return false };
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if let Some(gone) = ear.gone(store).await {
@@ -296,20 +301,20 @@ pub async fn deaf(store: &Store, t: &Term) -> bool {
 /// looks again. A holder that doesn't answer its bell (`deaf`) is gone, and `alive` says so from then on, so the wait is
 /// over at once and the next look claims the lake. Each writer that waits for a one-off writer waits this way
 /// (`Cluster::join`, `Cluster::guest`, `write::deliver`, `claim_one_off`), so a killed one is passed in about 5 s.
-pub(crate) async fn wait_for(store: &Store, t: &Term) {
-    if !deaf(store, t).await {
+pub(crate) async fn wait_for(store: &Store, t: &Term, claims: Option<&Claims>) {
+    if !deaf(store, t, claims).await {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
 /// `deaf` said so of term `t`'s claimer, in this process.
-fn deaf_here(store: &Store, t: &Term) -> bool { RUNG.lock().unwrap().get(&rung_key(store, t)).is_some_and(Option::is_none) }
+fn deaf_here(store: &Store, t: &Term) -> bool { RUNG.lock().unwrap_or_else(PoisonError::into_inner).get(&rung_key(store, t)).is_some_and(Option::is_none) }
 
 /// Is the holder of term `t` alive? A claim made on this machine is alive while its process holds
 /// its lock file; anywhere else, it is alive if it marked itself alive in the last 30 s, and didn't
 /// leave its bell unanswered when this process rang it (`deaf`).
-pub async fn alive(store: &Store, t: &Term) -> bool {
-    if gone_here(t) || deaf_here(store, t) {
+pub async fn alive(store: &Store, t: &Term, claims: Option<&Claims>) -> bool {
+    if gone_here(t, claims) || deaf_here(store, t) {
         return false; // a claimer on this machine that ended can't be alive, whatever its mark says; nor one elsewhere that didn't answer
     }
     match store.head(&Path::from(format!("cluster/alive/{:020}", t.n))).await {
@@ -322,18 +327,11 @@ pub async fn alive(store: &Store, t: &Term) -> bool {
 
 /// A one-off writer is done: whoever comes next doesn't wait for its mark to go stale, nor for its
 /// lock file to be let go.
-pub async fn release(store: &Store, n: u64) {
+pub async fn release(store: &Store, n: u64, claims: &Claims) {
     let _ = store.delete(&Path::from(format!("cluster/alive/{n:020}"))).await;
-    let held = HELD.lock().unwrap().remove(&n);
+    let held = claims.0.lock().unwrap().remove(&n);
     discard(held);
 }
-
-crate::per_node!(
-    /// The lock files of the terms this node claimed (or took back after a restart), each locked until
-    /// the term is let go (`release`), the node's state is dropped as it stops (`reset`), or the process
-    /// ends, however it ends: the OS lets go at whichever comes first. Keyed by term number. (A node
-    /// holds one claim per term number: one lake at a time.)
-    pub(crate) static HELD: Mutex<BTreeMap<u64, (PathBuf, std::fs::File)>> = Mutex::new(BTreeMap::new()));
 
 /// This user's folder of claim lock files, in the temp folder: per user on macOS and Windows, and
 /// named by the user's id on Linux, where `/tmp` is shared. Made 0700, and used only while it is
@@ -411,10 +409,10 @@ pub(crate) fn say(f: &std::fs::File, what: &str) {
 /// it, and it didn't say it was restarting in the last 30 s (an exec lets go of the lock, and so does
 /// a restart on Windows: the claimer is coming back, so it isn't gone). A claim made on another
 /// machine, or by another user, has no file here: its mark decides, as invariant 17 asks.
-pub(crate) fn gone_here(t: &Term) -> bool {
+pub(crate) fn gone_here(t: &Term, claims: Option<&Claims>) -> bool {
     let Some(path) = lock_path(t) else { return false };
-    if HELD.lock().unwrap().contains_key(&t.n) {
-        return false; // this very process holds it
+    if claims.is_some_and(|c| c.0.lock().unwrap().contains_key(&t.n)) {
+        return false; // this very process holds it (its node's claims)
     }
     let Ok(mut f) = open_lock(&path) else { return false };
     if f.try_lock().is_err() {
@@ -436,9 +434,9 @@ pub(crate) enum Holder {
 }
 
 /// The lake's holder now (`Holder`).
-pub(crate) async fn holder(store: &Store) -> Result<Holder> {
+pub(crate) async fn holder(store: &Store, claims: Option<&Claims>) -> Result<Holder> {
     Ok(match latest(store).await? {
-        Some(t) if alive(store, &t).await => match t.addr.is_empty() {
+        Some(t) if alive(store, &t, claims).await => match t.addr.is_empty() {
             true => Holder::Recording(t),
             false => Holder::Led(t),
         },
@@ -448,9 +446,9 @@ pub(crate) async fn holder(store: &Store) -> Result<Holder> {
 
 /// The leader of term `n` stops, drained (`drain.rs`): it says so (`cluster/left/{n}`), so its
 /// followers take over at once instead of waiting out the lease, then releases its term.
-pub async fn step_down(store: &Store, n: u64) {
+pub async fn step_down(store: &Store, n: u64, claims: &Claims) {
     let _ = store.put_opts(&Path::from(format!("cluster/left/{n:020}")), Vec::<u8>::new().into(), PutOptions { mode: PutMode::Create, ..Default::default() }).await;
-    release(store, n).await;
+    release(store, n, claims).await;
 }
 
 /// Has the leader of term `n` stepped down?
@@ -466,14 +464,14 @@ mod tests {
     #[tokio::test]
     async fn a_claimer_that_marks_when_rung_is_alive() {
         let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let node = crate::node_state::NodeState::unhosted();
         let t = elsewhere(9_001, true);
         mark_alive(&store, 9_001).await.unwrap();
-        let node = crate::node_state::NodeState::unhosted();
         let marks = mark_every(&node.tasks, store.clone(), 9_001); // (its first look counts as a ring: a mark a second in)
-        assert!(!deaf(&store, &t).await);
-        assert!(alive(&store, &t).await);
+        assert!(!deaf(&store, &t, Some(&node.claims)).await);
+        assert!(alive(&store, &t, Some(&node.claims)).await);
         let rang = (tokio::time::Instant::now(), bell(&store).await);
-        assert!(!deaf(&store, &t).await, "answered a moment ago: not rung again");
+        assert!(!deaf(&store, &t, Some(&node.claims)).await, "answered a moment ago: not rung again");
         assert!(rang.0.elapsed() < Duration::from_millis(100));
         assert_eq!(bell(&store).await, rang.1, "the bell isn't rung");
         marks.abort();
@@ -492,18 +490,19 @@ mod tests {
     #[tokio::test]
     async fn a_claimer_that_doesnt_mark_when_rung_is_gone() {
         let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let node = crate::node_state::NodeState::unhosted();
         let t = elsewhere(9_002, true);
         mark_alive(&store, 9_002).await.unwrap(); // (fresh: its process was killed a moment after)
-        assert!(alive(&store, &t).await);
+        assert!(alive(&store, &t, Some(&node.claims)).await);
         let rang = tokio::time::Instant::now();
-        assert!(deaf(&store, &t).await);
+        assert!(deaf(&store, &t, Some(&node.claims)).await);
         assert!(rang.elapsed() >= HEARD);
-        assert!(!alive(&store, &t).await, "gone, whatever its mark says");
+        assert!(!alive(&store, &t, Some(&node.claims)).await, "gone, whatever its mark says");
         // (an older release's claimer doesn't answer the bell: its mark alone decides)
         let old = elsewhere(9_003, false);
         mark_alive(&store, 9_003).await.unwrap();
         let rung = bell(&store).await;
-        assert!(!deaf(&store, &old).await && alive(&store, &old).await);
+        assert!(!deaf(&store, &old, Some(&node.claims)).await && alive(&store, &old, Some(&node.claims)).await);
         assert_eq!(bell(&store).await, rung, "nothing to watch for: no ring");
         assert!(marked_before(&store, 9_003).await.is_some_and(|d| d < Duration::from_secs(30)), "9,002's mark, a moment ago");
         assert!(marked_before(&store, 9_002).await.is_none(), "no term before it was marked");
@@ -512,24 +511,26 @@ mod tests {
     #[tokio::test]
     async fn a_one_off_writer_passes_a_recorder_that_doesnt_answer_its_bell() {
         let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let node = crate::node_state::NodeState::unhosted();
         let killed = Term { n: 9_004, addr: String::new(), lock: String::new(), bell: true };
         store.put(&Path::from(format!("cluster/term/{:020}", 9_004)), serde_json::to_vec(&killed).unwrap().into()).await.unwrap();
         mark_alive(&store, 9_004).await.unwrap(); // (fresh: its process was killed a moment after, and nothing marks it again)
         let waited = tokio::time::Instant::now();
-        let won = claim_one_off(&store, |_| Ok(())).await.unwrap();
+        let won = claim_one_off(&store, |_| Ok(()), &node.claims).await.unwrap();
         assert_eq!(won.n, 9_005, "the killed recorder's term is passed");
         assert!(waited.elapsed() < Duration::from_secs(10), "passed within 10 s");
-        release(&store, 9_005).await;
+        release(&store, 9_005, &node.claims).await;
     }
 
     #[tokio::test]
     async fn a_one_off_writer_refused_by_a_live_holder_claims_nothing() {
         let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let node = crate::node_state::NodeState::unhosted();
         let recording = Term { n: 9_006, addr: String::new(), lock: String::new(), bell: true };
         store.put(&Path::from(format!("cluster/term/{:020}", 9_006)), serde_json::to_vec(&recording).unwrap().into()).await.unwrap();
         mark_alive(&store, 9_006).await.unwrap();
         let asked = tokio::time::Instant::now();
-        let refused = claim_one_off(&store, |_| Err(anyhow::anyhow!("a live recorder"))).await;
+        let refused = claim_one_off(&store, |_| Err(anyhow::anyhow!("a live recorder")), &node.claims).await;
         assert!(refused.is_err(), "live says no: refused");
         assert!(asked.elapsed() < Duration::from_millis(500), "refused at once, not after a wait");
         assert_eq!(latest(&store).await.unwrap().map(|t| t.n), Some(9_006), "no term was claimed");
@@ -543,8 +544,28 @@ mod tests {
         out
     }
 
+    /// Two nodes in one process lead two lakes at the same term number: one's release lets go of its own claim alone (one
+    /// map for the process, keyed by the term's number, let go of the other's lock too, and its lake looked ended here).
+    #[tokio::test]
+    async fn two_nodes_claims_at_one_term_keep_apart() {
+        if lock_dir().is_none() {
+            return; // (no folder for lock files here: nothing to tell apart)
+        }
+        let (a, b) = (crate::node_state::NodeState::unhosted(), crate::node_state::NodeState::unhosted());
+        let folder = || crate::store::open_store(&std::env::temp_dir().join(format!("pondra-claims-{}", uuid::Uuid::new_v4().simple())).to_string_lossy()).unwrap().1;
+        let (lake_a, lake_b) = (folder(), folder());
+        let ta = claim(&lake_a, 1, "", &a.claims).await.unwrap().expect("lake a's first term");
+        claim(&lake_b, 1, "", &b.claims).await.unwrap().expect("lake b's first term");
+        release(&lake_b, 1, &b.claims).await;
+        assert!(a.claims.0.lock().unwrap().contains_key(&1), "a's claim is a's still");
+        assert!(!b.claims.0.lock().unwrap().contains_key(&1), "b's is gone");
+        assert!(!gone_here(&ta, None), "lake a's claimer still holds its lock file");
+        release(&lake_a, 1, &a.claims).await;
+    }
+
     #[tokio::test]
     async fn a_claim_keeps_the_newest_sixteen_once_the_lake_has_more_than_thirty_two() {
+        let node = crate::node_state::NodeState::unhosted();
         let dir = std::env::temp_dir().join(format!("pondra-prune-{}", uuid::Uuid::new_v4().simple()));
         let folder = crate::store::open_store(&dir.to_string_lossy()).unwrap().1;
         let url = format!("memory://prune-{}", uuid::Uuid::new_v4().simple());
@@ -560,7 +581,7 @@ mod tests {
                 store.put(&Path::from(format!("cluster/left/{n:020}")), Vec::<u8>::new().into()).await.unwrap();
             }
             assert_eq!(numbers(&store, "cluster/term").await.len(), 40);
-            let won = claim(&store, 41, "").await.unwrap().expect("term 41 is none's");
+            let won = claim(&store, 41, "", &node.claims).await.unwrap().expect("term 41 is none's");
             assert_eq!(won.n, 41);
             // (41 is more than 32: the claim's own listing deletes what is below the newest 16, before it returns)
             let (want, kept_left) = ((26..=41).collect::<Vec<u64>>(), vec![30u64]);
@@ -568,7 +589,7 @@ mod tests {
             assert_eq!(numbers(&store, "cluster/alive").await, want, "the crashed term's mark is gone with its term");
             assert_eq!(numbers(&store, "cluster/left").await, kept_left, "the stepped-down terms below the newest 16 are gone");
             assert_eq!(latest(&store).await.unwrap().map(|t| t.n), Some(41), "latest answers the newest");
-            release(&store, 41).await;
+            release(&store, 41, &node.claims).await;
         }
         crate::memory_lake::forget_memory(&url);
         std::fs::remove_dir_all(&dir).ok();
@@ -585,21 +606,23 @@ mod tests {
             }
             store
         }
+        let node = crate::node_state::NodeState::unhosted();
         let empty: Store = Arc::new(object_store::memory::InMemory::new());
-        assert!(matches!(holder(&empty).await.unwrap(), Holder::Free(None)), "no term: free");
-        assert!(matches!(holder(&with_term(4, "10.0.0.1:9000", true).await).await.unwrap(), Holder::Led(t) if t.n == 4), "alive with an address: led");
-        assert!(matches!(holder(&with_term(5, "", true).await).await.unwrap(), Holder::Recording(t) if t.n == 5), "alive with none: recording");
-        assert!(matches!(holder(&with_term(6, "10.0.0.1:9000", false).await).await.unwrap(), Holder::Free(Some(t)) if t.n == 6), "not marked: free, numbered from it");
+        assert!(matches!(holder(&empty, Some(&node.claims)).await.unwrap(), Holder::Free(None)), "no term: free");
+        assert!(matches!(holder(&with_term(4, "10.0.0.1:9000", true).await, Some(&node.claims)).await.unwrap(), Holder::Led(t) if t.n == 4), "alive with an address: led");
+        assert!(matches!(holder(&with_term(5, "", true).await, Some(&node.claims)).await.unwrap(), Holder::Recording(t) if t.n == 5), "alive with none: recording");
+        assert!(matches!(holder(&with_term(6, "10.0.0.1:9000", false).await, Some(&node.claims)).await.unwrap(), Holder::Free(Some(t)) if t.n == 6), "not marked: free, numbered from it");
     }
 
     #[tokio::test]
     async fn a_claim_behind_a_newer_term_steps_aside() {
         let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let node = crate::node_state::NodeState::unhosted();
         for n in 30..=50u64 {
             let term = Term { n, addr: String::new(), lock: String::new(), bell: false };
             store.put(&Path::from(format!("cluster/term/{n:020}")), serde_json::to_vec(&term).unwrap().into()).await.unwrap();
         }
-        assert!(claim(&store, 20, "").await.unwrap().is_none(), "term 50 is newer: a claim of 20 steps aside");
+        assert!(claim(&store, 20, "", &node.claims).await.unwrap().is_none(), "term 50 is newer: a claim of 20 steps aside");
         assert_eq!(latest(&store).await.unwrap().map(|t| t.n), Some(50), "latest stays the newest");
         assert!(numbers(&store, "cluster/alive").await.is_empty(), "a claim that steps aside marks nothing alive");
     }

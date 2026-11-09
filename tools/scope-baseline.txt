@@ -20,6 +20,7 @@ node history.rs 2
 node hot.rs 1
 node iceberg_rest.rs 1
 node inbox.rs 2
+node kafka.rs 1
 node kv/slate.rs 3
 node learned.rs 2
 node library.rs 1
@@ -42,14 +43,14 @@ node users.rs 2
 node views.rs 9
 node write.rs 1
 reads app.rs 1
-reads apply.rs 5
-reads audit.rs 3
+reads apply.rs 4
+reads audit.rs 1
 reads branch.rs 7
 reads change.rs 1
 reads ext.rs 4
 reads extension.rs 1
 reads files.rs 1
-reads history.rs 2
+reads history.rs 1
 reads path.rs 1
 reads protect.rs 1
 reads python.rs 1  # (python::ask: a Python function's error, its lines cut, raised in DataFusion's batches, where only the task carries its caller)
@@ -57,7 +58,6 @@ reads routines.rs 1
 reads rules/rows.rs 1
 reads seq.rs 1
 reads serve.rs 1
-reads temp.rs 2
 reads users.rs 3
 reads views.rs 1
 whole apply.rs 1

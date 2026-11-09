@@ -13,6 +13,8 @@
 //!   deleted keeps them. `GET /files/<path>?versions` lists them, `?version=<id>` reads one, and
 //!   `POST /files/<path>?restore=<id>` makes one the file again. A notebook saved before, as
 //!   `notebooks/<name>/<time>.ipynb`, has those as versions of `notebooks/<name>.ipynb`.
+//! * A deleted file is listed in `pondra.dropped` (kind `file`) while a version of it is kept, with
+//!   when and by whom it was deleted, and `UNDROP FILE 'path'` brings its newest version back.
 //!
 //! Bytes are `BINARY` columns: `byte_length`, `sha256`, `md5`, `encode(…, 'base64')`, `decode`
 //! and `substr` (`engine.rs`: DataFusion's own takes only text) work on them.
@@ -88,8 +90,8 @@ impl TableProvider for Files {
         let mut list = self.lake.store.list(Some(&object_store::path::Path::from(self.prefix.as_str())));
         while let Some(o) = list.next().await {
             let o = o.map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
-            if [VERSIONS, APPLIES].iter().any(|d| o.location.as_ref().starts_with(d) && !self.prefix.starts_with(d)) {
-                continue; // (files' versions: `?versions` lists them; what each apply ran: `apply.rs`)
+            if [VERSIONS, APPLIES, DELETED].iter().any(|d| o.location.as_ref().starts_with(d) && !self.prefix.starts_with(d)) {
+                continue; // (files' versions: `?versions` lists them; what each apply ran: `apply.rs`; deleted files' notes: `pondra.dropped`)
             }
             paths.push(o.location.to_string());
             sizes.push(o.size as i64);
@@ -159,12 +161,13 @@ impl AsyncScalarUDFImpl for FileRead {
 /// checks below decide on it, so `files//.versions/x` is `files/.versions/x`.
 fn stored_name(path: &str) -> String { String::from(object_store::path::Path::from(path)) }
 
-/// Refuses a path a door may not write, restore or remove: a file's versions and each apply's files are kept by
-/// Pondra (`keep`, `apply::keep_files`). Case-blind, as a disk that ignores case keeps `.Versions` as `.versions`.
+/// Refuses a path a door may not write, restore or remove: a file's versions, each apply's files and deleted files'
+/// notes are kept by Pondra (`keep`, `apply::keep_files`, `note_deleted`). Case-blind, as a disk that ignores case
+/// keeps `.Versions` as `.versions`.
 fn refuse_kept(path: &str) -> anyhow::Result<()> {
     let name = stored_name(path).to_ascii_lowercase();
-    match name.starts_with(VERSIONS) || name.starts_with(APPLIES) {
-        true => Err(crate::codes::coded("42501", format!("{path}: a file's versions and each apply's files are kept by Pondra: name the file itself"))),
+    match [VERSIONS, APPLIES, DELETED].iter().any(|d| name.starts_with(d)) {
+        true => Err(crate::codes::coded("42501", format!("{path}: a file's versions, each apply's files and deleted files' notes are kept by Pondra: name the file itself"))),
         false => Ok(()),
     }
 }
@@ -253,7 +256,12 @@ pub async fn remove(lake: &Lake, path: &str) -> anyhow::Result<Filed> {
     let path = under_files(path)?;
     refuse_kept(&path)?;
     match lake.remove_file(&path).await {
-        Ok(()) => Ok(Filed::json(serde_json::json!({"removed": path}))),
+        Ok(()) => {
+            if let Err(e) = note_deleted(lake, &path).await {
+                eprintln!("{path}: deleted, but when and by whom not noted: {e:#}"); // (UNDROP FILE still brings it back)
+            }
+            Ok(Filed::json(serde_json::json!({"removed": path})))
+        }
         Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) => {
             Ok(Filed::text(404, lake_files::not_found(&path)))
         }
@@ -282,14 +290,16 @@ pub async fn keep(lake: &Lake, path: &str, bytes: &bytes::Bytes) -> anyhow::Resu
     if bytes.len() > KEPT_MB << 20 || path.starts_with(VERSIONS) {
         return Ok(());
     }
-    let who = crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "node".into());
-    let who: String = who.chars().map(|c| if c.is_ascii_alphanumeric() || "_.-".contains(c) { c } else { '_' }).collect();
+    let who = who();
     let now = crate::log::now_ms();
+    let mut kept = None;
     for ms in now..now + 8 {
-        match lake.put(&format!("{}{ms:013}.{who}", kept_at(path)), bytes.clone()).await { // (the saved bytes shared, not copied)
+        let id = format!("{ms:013}.{who}");
+        match lake.put(&format!("{}{id}", kept_at(path)), bytes.clone()).await { // (the saved bytes shared, not copied)
             Err(e) if format!("{e:#}").contains("already exists") => continue, // (two saves in one millisecond: the next)
             done => {
                 done?;
+                kept = Some(id);
                 break;
             }
         }
@@ -300,8 +310,19 @@ pub async fn keep(lake: &Lake, path: &str, bytes: &bytes::Bytes) -> anyhow::Resu
         if let Err(e) = prune(&lake, &path).await {
             eprintln!("{path}: its oldest versions not let go: {e:#}");
         }
+        if let Some(kept) = kept {
+            if let Err(e) = forget_deleted(&lake, &path, &kept).await {
+                eprintln!("{path}: saved again, but its deletion's note not let go: {e:#}"); // (`deleted` passes a file that is there by)
+            }
+        }
     });
     Ok(())
+}
+
+/// Whoever the request is, as a version's name holds it (the node's own work: `node`).
+fn who() -> String {
+    let who = crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "node".into());
+    who.chars().map(|c| if c.is_ascii_alphanumeric() || "_.-".contains(c) { c } else { '_' }).collect()
 }
 
 /// One version: its id (`<ms>.<who>`, or a notebook's earlier save by its path), when, by whom, size.
@@ -357,4 +378,182 @@ async fn prune(lake: &Lake, path: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- deleted files (UNDROP FILE)
+
+/// A deleted file's note: `<DELETED><path>/<its newest version's id>`, holding when it was deleted, by whom and that
+/// version's size (`note_deleted`). Only a deleted file has one, so `pondra.dropped` lists this folder and not the
+/// lake's files; a save lets its file's notes go (`forget_deleted`). A note is named by the version it would bring
+/// back, so letting go of an earlier one never lets go of a later deletion's.
+pub const DELETED: &str = "files/.deleted/";
+
+/// Where `path`'s deletion notes are kept.
+fn noted_at(path: &str) -> String { format!("{DELETED}{}/", path.trim_start_matches("files/")) }
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Deletion {
+    at: u64,
+    by: String,
+    bytes: u64, // (its newest version's, the note's name)
+}
+
+/// Note when `path` was deleted and by whom, when it keeps a version (a file kept nowhere can't come back).
+async fn note_deleted(lake: &Lake, path: &str) -> anyhow::Result<()> {
+    use object_store::ObjectStoreExt;
+    let Some(newest) = versions(lake, path).await?.into_iter().find(|v| !v.id.contains('/')) else { return Ok(()) };
+    let note = serde_json::to_vec(&Deletion { at: crate::log::now_ms(), by: who(), bytes: newest.bytes })?;
+    lake.store.put(&object_store::path::Path::from(format!("{}{}", noted_at(path), newest.id)), bytes::Bytes::from(note).into()).await?;
+    Ok(())
+}
+
+/// `path` is a file again, from the version `kept`: its notes from before it go. One named by a later version is a
+/// later deletion's, so it stays.
+async fn forget_deleted(lake: &Lake, path: &str, kept: &str) -> anyhow::Result<()> {
+    use object_store::ObjectStoreExt;
+    let at = object_store::path::Path::from(noted_at(path));
+    for m in lake.store.list(Some(&at)).try_collect::<Vec<_>>().await? {
+        let id = m.location.as_ref().strip_prefix(at.as_ref()).and_then(|r| r.strip_prefix('/')).filter(|id| !id.contains('/')); // (not a file's under it)
+        if id.is_some_and(|id| id < kept) {
+            match lake.store.delete(&m.location).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A deleted file a version of which is kept: `pondra.dropped` lists it, and `UNDROP FILE` brings it back.
+pub struct Deleted {
+    pub path: String, // (under `files/`, as `PUT /files/<path>` named it)
+    pub at_ms: u64,
+    pub by: String,
+    pub bytes: u64, // (its newest version's, which UNDROP FILE brings back)
+}
+
+impl Deleted {
+    /// When its versions may be let go: `PONDRA_FILE_VERSIONS_DAYS` after it was deleted.
+    pub fn kept_until(&self) -> u64 { self.at_ms + crate::env::value::<u64>("PONDRA_FILE_VERSIONS_DAYS") * 86_400_000 }
+}
+
+/// Every file deleted with a note, by path: one listing of the notes, then each one's file looked for and its note
+/// read, 16 at a time. A file that is there again is passed by; so is a note that doesn't read (UNDROP FILE still
+/// brings its file back).
+pub async fn deleted(lake: &Lake) -> anyhow::Result<Vec<Deleted>> {
+    let mut newest: std::collections::BTreeMap<String, (String, object_store::path::Path)> = std::collections::BTreeMap::new(); // (path: its latest note's id and place)
+    for m in lake.store.list(Some(&object_store::path::Path::from(DELETED))).try_collect::<Vec<_>>().await? {
+        let Some((path, id)) = m.location.as_ref().strip_prefix(DELETED).and_then(|r| r.rsplit_once('/')) else { continue };
+        let path = percent_encoding::percent_decode_str(path).decode_utf8_lossy().into_owned(); // (as it was named: the store's spelling escapes some characters)
+        match newest.get(&path) {
+            Some((was, _)) if was.as_str() >= id => {}
+            _ => {
+                newest.insert(path, (id.to_string(), m.location.clone()));
+            }
+        }
+    }
+    let read = |(path, (_, at)): (String, (String, object_store::path::Path))| async move {
+        use object_store::ObjectStoreExt;
+        let file = format!("files/{path}");
+        let (there, note) = futures::join!(lake.version(&file), async { lake.store.get(&at).await?.bytes().await });
+        if there.is_ok() {
+            return None;
+        }
+        let note: Deletion = match note.map_err(anyhow::Error::from).and_then(|b| Ok(serde_json::from_slice(&b)?)) {
+            Ok(note) => note,
+            Err(e) => {
+                eprintln!("{path}: its deletion's note doesn't read: {e:#}");
+                return None;
+            }
+        };
+        Some(Deleted { path, at_ms: note.at, by: note.by, bytes: note.bytes })
+    };
+    let mut out: Vec<Deleted> = futures::stream::iter(newest).map(read).buffer_unordered(16).filter_map(|d| async { d }).collect().await;
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// `UNDROP FILE 'path'`: a deleted file's newest version made the file again (kept as its newest save, as `?restore=`
+/// keeps one), and its deletion's note let go. Refused while a file is there (42710), and when no version of it is
+/// kept (42704). Who may is the statement's rights' (`rights::asks`: a writer's, and a `.py`, code a node runs, an admin's).
+pub async fn undrop(lake: &Lake, path: &str) -> anyhow::Result<serde_json::Value> {
+    let path = under_files(path)?;
+    refuse_kept(&path)?;
+    let named = path.trim_start_matches("files/").to_string();
+    let there = || crate::codes::coded("42710", format!("{named} is there: UNDROP FILE brings back a deleted file. GET /files/{named}?versions lists its versions, and POST /files/{named}?restore=<id> makes one the file"));
+    if lake.version(&path).await.is_ok() {
+        return Err(there());
+    }
+    let Some(newest) = versions(lake, &path).await?.into_iter().next() else {
+        return Err(crate::codes::coded("42704", format!("no deleted file {named} is kept (pondra.dropped lists those that are)")));
+    };
+    let bytes = version(lake, &path, &newest.id).await?;
+    match lake.put(&path, bytes.clone()).await {
+        Err(e) if format!("{e:#}").contains("already exists") => return Err(there()), // (saved since it was looked for)
+        done => done?,
+    }
+    keep(lake, &path, &bytes).await?;
+    use object_store::ObjectStoreExt;
+    match lake.store.delete(&object_store::path::Path::from(format!("{}{}", noted_at(&path), newest.id))).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+        Err(e) => eprintln!("{path}: back, but its deletion's note not let go: {e}"), // (`deleted` passes a file that is there by)
+    }
+    Ok(serde_json::json!({"undropped": named, "version": newest.id, "bytes": bytes.len()}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `path` saved with `bytes`, kept as a version as `put` keeps each save (who may save is its door's).
+    async fn save(lake: &Lake, path: &str, bytes: &'static [u8]) {
+        use object_store::ObjectStoreExt;
+        let (at, bytes) = (format!("files/{path}"), bytes::Bytes::from_static(bytes));
+        lake.store.put(&object_store::path::Path::from(at.as_str()), bytes.clone().into()).await.unwrap();
+        keep(lake, &at, &bytes).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_deleted_file_is_listed_until_undrop_file_brings_its_newest_version_back() {
+        let lake = Lake::open(&format!("memory://undrop-{}", uuid::Uuid::new_v4().simple()), true, false, crate::node_state::NodeState::unhosted()).await.unwrap();
+        save(&lake, "notes/a.txt", b"one").await;
+        save(&lake, "notes/a.txt", b"second").await;
+        save(&lake, "b.txt", b"b").await;
+        assert!(deleted(&lake).await.unwrap().is_empty(), "a file that is there is no deleted one");
+        let code = |e: anyhow::Error| crate::codes::of(&e).to_string();
+        assert_eq!(undrop(&lake, "notes/a.txt").await.map_err(code).unwrap_err(), "42710", "refused while the file is there");
+
+        remove(&lake, "notes/a.txt").await.unwrap();
+        let gone = deleted(&lake).await.unwrap();
+        assert_eq!(gone.iter().map(|d| (d.path.as_str(), d.bytes, d.by.as_str())).collect::<Vec<_>>(), [("notes/a.txt", 6, "node")]);
+        assert_eq!(gone[0].kept_until(), gone[0].at_ms + 90 * 86_400_000);
+
+        let back = undrop(&lake, "/files/notes/a.txt").await.unwrap();
+        assert_eq!((back["undropped"].as_str(), back["bytes"].as_u64()), (Some("notes/a.txt"), Some(6)));
+        assert_eq!(&lake.file("files/notes/a.txt").await.unwrap().0[..], b"second", "its newest version, back");
+        assert!(deleted(&lake).await.unwrap().is_empty());
+        assert_eq!(versions(&lake, "files/notes/a.txt").await.unwrap().len(), 3, "kept as its newest save too");
+
+        assert_eq!(undrop(&lake, "never.txt").await.map_err(code).unwrap_err(), "42704");
+        assert_eq!(undrop(&lake, ".versions/notes/a.txt").await.map_err(code).unwrap_err(), "42501", "a version is Pondra's, not a file");
+        assert_eq!(undrop(&lake, ".deleted/notes/a.txt").await.map_err(code).unwrap_err(), "42501", "and so is a note");
+        // (deleted again and saved again: the save lets its note go, after it answers)
+        let second = versions(&lake, "files/notes/a.txt").await.unwrap().remove(1).id;
+        remove(&lake, "notes/a.txt").await.unwrap();
+        let noted = || async { lake.store.list(Some(&object_store::path::Path::from(DELETED))).try_collect::<Vec<_>>().await.unwrap().len() };
+        assert_eq!(noted().await, 1);
+        save(&lake, "notes/a.txt", b"third").await;
+        for _ in 0..200 {
+            if noted().await == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(noted().await, 0, "a save lets its file's notes go");
+        // (a note named by a later version than a save kept is a later deletion's: it stays)
+        remove(&lake, "notes/a.txt").await.unwrap();
+        forget_deleted(&lake, "files/notes/a.txt", &second).await.unwrap();
+        let gone = deleted(&lake).await.unwrap();
+        assert_eq!((gone.len(), gone[0].bytes), (1, 5), "the later deletion's note, of the third version (5 bytes)");
+    }
 }

@@ -56,7 +56,16 @@ as Delta keeps a table's old files (a day, Snowflake's, until 2026-11-08). `'0 s
   (rows written while it was dropped are counted), and it follows new writes from there. The UNDROP
   answers once the view is filled, as its CREATE does. Keeping its old rows and its place in its
   sources instead would leave it behind them by what it missed. Only a DROP keeps one: a view
-  replaced by CREATE OR REPLACE isn't kept, nor is a view a topic feeds. Databases and files come next.
+  replaced by CREATE OR REPLACE isn't kept, nor is a view a topic feeds.
+- A dropped database keeps its folder as it was, for the default 7 days, under a mark at its root
+  (`dropped.json`: when, until when, by whom). It is no database meanwhile: it isn't listed, and
+  opening or attaching it is refused, saying how to bring it back. `UNDROP DATABASE d` takes the
+  mark off, and `pondra.dropped` lists it with that statement. A bucket can't rename a folder, so
+  a new database under its name doesn't wait or copy: it lets the kept one go, and its CREATE says
+  so. Then `pondra serve`'s sweep deletes the folder, as does a branch's base's hourly one, whose
+  pin keeps the files the branch reads until then. An older release reads no mark and serves the
+  database again; nothing of it is lost. `DROP DATABASE d PURGE` deletes it at once, as a drop
+  did before. Files come next.
 
 **3. `t AT (VERSION => n | TIMESTAMP => t | OFFSET => -s)` reads an append table as it was**
 (`past.rs`). It needs no history in the catalog, because the rows carry it. The table as of `n` is:

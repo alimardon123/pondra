@@ -31,7 +31,9 @@ use std::time::Duration;
 /// provider's tokens for nobody's and, with no other user, the lake for one nobody signs in to.
 /// 6: a table's columns kept as one list, each column with its facts (`store::Stored`, redesign 1b,
 /// piece 6b), which a node from before can't read (`LISTS`).
-pub const FORMAT: u32 = 6;
+/// 7: a materialized view that keeps an average or a variance as its query's own state (`fvar::MEAN_PARTS`, 11-09 audit
+/// M11), which a node from before has no function to merge.
+pub const FORMAT: u32 = 7;
 
 /// The format whose tables keep their columns as one list (`store::Stored`). A lake moves to it by itself: its leader raises
 /// it once every node knows it (`raise`), and a form that leads a lake in memory or a folder alone as it opens (`alone`). The commit sets the

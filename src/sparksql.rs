@@ -103,7 +103,7 @@ fn spark_text(t: &TableFactor) -> Option<Result<String>> {
 
 /// A Spark SQL query as Pondra's.
 pub fn query(text: &str) -> Result<ast::Query> {
-    let mut stmts = Parser::parse_sql(&SparkSqlDialect {}, text).context("Spark SQL")?;
+    let mut stmts = crate::parsed::signed_all(Parser::parse_sql(&SparkSqlDialect {}, text).context("Spark SQL")?);
     ensure!(stmts.len() == 1, "spark_sql takes one query, not {}", stmts.len());
     let ast::Statement::Query(mut q) = stmts.remove(0) else { bail!("spark_sql takes a query (SELECT, WITH, VALUES): other statements are Pondra's SQL") };
     let mut t = Turn { names: &spark_functions().names };

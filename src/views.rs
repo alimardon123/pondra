@@ -118,19 +118,7 @@ impl OnViolation {
     }
 }
 
-/// History kept per key (SCD type 2, ADR-036 §8): `WITH (history = 'id', sequence_by = 'ts'
-/// [, delete_when = 'op = ''D'''])`. The view keeps every version of each key as it arrives (an
-/// append view: writers on any node need no coordination); a read gives each version its
-/// `__start_at` (its `sequence_by`) and `__end_at` (the next version's, NULL for the current one),
-/// worked out then, so versions that arrive out of order still make the right history. A version
-/// `delete_when` holds for ends its key's history and isn't shown (`__delete`).
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct History {
-    pub key: Vec<String>,
-    pub sequence_by: String,
-    #[serde(default)]
-    pub deletes: bool,
-}
+pub use crate::table_record::History;
 
 /// A history view's table as it is read: its versions, each with `__start_at` and `__end_at`.
 pub async fn history_view(ctx: &datafusion::prelude::SessionContext, base: std::sync::Arc<dyn datafusion::catalog::TableProvider>, h: &History, sys: bool) -> Result<std::sync::Arc<dyn datafusion::catalog::TableProvider>> {
@@ -764,7 +752,7 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
             true => format!("{source} runs its query again"),
             false => format!("{source} follows {k}, which runs its query again"),
         };
-        let subtracts = !merge.is_empty() && alone(&plan, true) && merge.values().all(|f| ["sum", "count", crate::finish::MOMENTS].contains(&f.as_str())) && merge.values().any(|f| f == "count");
+        let subtracts = !merge.is_empty() && alone(&plan, true) && merge.values().all(|f| ["sum", "count"].contains(&f.as_str()) || crate::finish::parts(f)) && merge.values().any(|f| f == "count");
         if !(ids || subtracts) && plain && refresh.is_none() {
             let why = format!("{again}, replacing its rows, and only a view row by row or of sums and counts takes them back");
             return match fits {
@@ -845,7 +833,12 @@ async fn finished(lake: &Lake, ctx: &datafusion::prelude::SessionContext, sql: &
     use datafusion::arrow::datatypes::DataType;
     let names: Vec<String> = plan.schema().fields().iter().map(|f| f.name().clone()).collect();
     let aggregates = ctx.state().aggregate_functions().keys().cloned().collect();
-    let Some(split) = crate::finish::split(sql, &names, &aggregates)? else { return Ok(None) };
+    let Some(mut split) = crate::finish::split(sql, &names, &aggregates, true)? else { return Ok(None) };
+    // (an average or a variance kept as its query's own state needs the lake's format 7, which a node from before can't
+    // merge: while one runs, the view keeps a sum and a count, or moments, as before, and answers as views did then)
+    if split.parts && crate::format::require(lake, crate::fvar::PARTS_FORMAT, "a materialized view that keeps avg, var or stddev as its query's own state").await.is_err() {
+        split = crate::finish::split(sql, &names, &aggregates, false)?.context("the view's query, split again")?;
+    }
     let planned = crate::sys::planned(&split.partial)?;
     let partial = crate::engine::sql(&session_for(lake, &planned, "", None, scope).await?, &planned).await?.logical_plan().clone();
     let schema = std::sync::Arc::new(crate::query::run_schema(ctx, &partial)?.as_arrow().clone());
@@ -892,7 +885,7 @@ async fn expectations(lake: &Lake, name: &str, source: &str, planned: &str, meta
 }
 
 /// Was this error a row refused by a CHECK or an expectation?
-pub fn refused(e: &anyhow::Error) -> bool { e.chain().any(|c| c.is::<crate::codes::Violation>()) }
+fn refused(e: &anyhow::Error) -> bool { e.chain().any(|c| c.is::<crate::codes::Violation>()) }
 
 /// A row-by-row view's rows taken back (`{view}$deleted`), less those its expectations never let
 /// in: a view that adds them up must not take back what it never had.
@@ -1488,7 +1481,7 @@ pub(crate) async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Res
             _ if meta.merge.is_empty() && !v.ids => Some("isn't row by row over the table alone (a join, DISTINCT, …), or was made before Pondra 0.19"),
             _ if meta.merge.is_empty() => None,
             _ if !alone(&plan(lake, &v).await?, true) => Some("reads other tables too"),
-            _ if meta.merge.values().any(|f| !["sum", "count", crate::finish::MOMENTS].contains(&f.as_str())) => Some("keeps a min or max"),
+            _ if meta.merge.values().any(|f| !["sum", "count"].contains(&f.as_str()) && !crate::finish::parts(f)) => Some("keeps a min or max"),
             _ if !meta.merge.values().any(|f| f == "count") => Some("has no count(*) to drop the groups a change empties: make it again with count(*) among its columns, or WITH (refresh = 'by key')"),
             _ if meta.columns().any(|(c, t)| meta.merge.contains_key(c) && t.starts_with("UInt")) => Some("adds up an unsigned column (it can't subtract)"),
             _ => None,
@@ -1547,7 +1540,7 @@ pub(crate) fn alone(p: &LogicalPlan, grouped: bool) -> bool {
 /// `runs` names each batch of `new` (same table, same place): its producer, whose job it names (`rejects::run`).
 /// A view that drops rows works out each run's rows on their own, so each reject names its own; any
 /// other view takes a table's new rows at once, as it did, and its rows name the runs it had.
-pub async fn derive(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>, runs: &BTreeMap<String, Vec<String>>) -> Result<Vec<(String, RecordBatch)>> {
+async fn derive(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>, runs: &BTreeMap<String, Vec<String>>) -> Result<Vec<(String, RecordBatch)>> {
     let (mut out, mut made) = (vec![], BTreeMap::<String, Vec<(RecordBatch, String)>>::new());
     let fed = |t: &str| -> Option<Vec<(RecordBatch, String)>> {
         let named = runs.get(t);
@@ -1627,7 +1620,7 @@ fn in_order(views: Vec<(String, View)>) -> Vec<(String, View)> {
 }
 
 /// The views whose rows are derived as flushes are packed (`derive`): the sequencer holds every
-/// flush to them (`log::commit`). A flush carrying rows of a table such views follow must carry a
+/// flush to them (`log::commit`, through `hook`). A flush carrying rows of a table such views follow must carry a
 /// part for each (empty if it derived none), and none for a view it doesn't know: else its node
 /// packs it again, with the views as they are now. So a view made (or dropped) mid-stream never
 /// misses a flush's rows or gets them from a flush packed without it. Kept in the leader's
@@ -1674,9 +1667,9 @@ pub async fn inline(lake: &Lake) -> Result<std::sync::Arc<Inline>> {
     Ok(i)
 }
 
-/// Sequencer: where the fillings of views made since the last commit end (this commit's puts):
+/// At each commit (`commit_hook`): where the fillings of views made since the last commit end (this commit's puts):
 /// every row before `next` is theirs to fill; every flush from this commit on derives their rows.
-pub fn bound(lake: &Lake, inline: &Inline, next: u64) -> Vec<(String, Vec<u8>)> {
+fn bound(lake: &Lake, inline: &Inline, next: u64) -> Vec<(String, Vec<u8>)> {
     let kept = lake.state::<Kept>().ok();
     let mut puts = vec![];
     for (t, v) in &inline.unbounded {
@@ -1695,6 +1688,33 @@ pub fn bound(lake: &Lake, inline: &Inline, next: u64) -> Vec<(String, Vec<u8>)> 
         }
     }
     puts
+}
+
+/// The log's hook for views (`log::CommitHooks`, which the engine adds it to): their rows derived as their sources' are
+/// packed, refused by their expectations, and each commit's flushes held to the views as they are as it starts.
+pub fn hook() -> crate::log::CommitHook {
+    crate::log::CommitHook { name: "views", derive: derive_hook, refused, commit: commit_hook, led: forget }
+}
+
+fn derive_hook<'a>(lake: &'a Lake, new: &'a BTreeMap<String, Vec<RecordBatch>>, by: &'a BTreeMap<String, Vec<String>>) -> futures::future::BoxFuture<'a, Result<Vec<(String, RecordBatch)>>> {
+    Box::pin(derive(lake, new, by))
+}
+
+fn commit_hook(lake: &Lake, next: u64) -> futures::future::BoxFuture<'_, Result<(Arc<dyn crate::log::Owes>, Vec<(String, Vec<u8>)>)>> {
+    Box::pin(async move {
+        let held = inline(lake).await?;
+        let puts = bound(lake, &held, next);
+        Ok((held as Arc<dyn crate::log::Owes>, puts))
+    })
+}
+
+impl crate::log::Owes for Inline {
+    fn owed(&self, table: &str) -> &[String] {
+        self.by_source.get(table).map_or(&[], |v| v.as_slice())
+    }
+    fn derives(&self, table: &str) -> bool {
+        self.tables.contains(table)
+    }
 }
 
 /// A view still filling from its source's rows, if one follows `table` (changes of it wait).
@@ -1851,6 +1871,7 @@ fn negated(b: &RecordBatch, meta: &TableMeta) -> Result<RecordBatch> {
     let columns = b.schema().fields().iter().zip(b.columns()).map(|(f, c)| match meta.merge.get(f.name()).map(String::as_str) {
         Some("sum" | "count") => Ok(datafusion::arrow::compute::kernels::numeric::neg(c)?),
         Some(crate::finish::MOMENTS) => crate::finish::negated(c),
+        Some(f) if crate::finish::parts(f) => crate::fvar::negated_parts(c),
         _ => Ok(c.clone()),
     }).collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(b.schema(), columns)?)
@@ -1913,6 +1934,8 @@ fn merges(plan: &LogicalPlan, up: Option<(&str, &TableMeta)>) -> Result<(Vec<Str
             "min" => "min",
             "max" => "max",
             crate::finish::MOMENTS => crate::finish::MOMENTS, // (a variance's: `finish.rs`)
+            crate::fvar::MEAN_PARTS => crate::fvar::MEAN_PARTS, // (an average's and a variance's: the query's own state)
+            crate::fvar::VAR_PARTS => crate::fvar::VAR_PARTS,
             other => bail!("{other}() can't be combined from partial results here: a view keeps count, sum, avg, min, max, stddev, variance, bool_and and bool_or, grouped by plain expressions"),
         };
         if let Some((source, up)) = up {

@@ -10487,7 +10487,8 @@ def viewtext():
     HTTP and from the Postgres port; on a second node; after a restart), and a column moved (`ALTER … ALTER COLUMN c
     FIRST`) takes its comments along, `ORDER BY 2` renumbered, a materialized view's rows kept. Made again another way, a
     view shows its new text (or its query as it reads); one whose text can't be kept (a list of column names) says so
-    and shows its query as it reads. A string holding `--` is no comment; a view calling a macro keeps its text too."""
+    and shows its query as it reads. A string holding `--` is no comment; a view calling a macro keeps its text too. A
+    minus before a minus (`- -k`) means one in a view, an INSERT … SELECT and an UPDATE, as in a query."""
     import psycopg
     lake = new_lake()
     nodes = [Node(lake, A.port, tier_secs=0.3, pg=f"127.0.0.1:{A.port + 10}").start(), Node(lake, A.port + 1, tier_secs=0.3).start()]
@@ -10497,6 +10498,18 @@ def viewtext():
     shown = lambda kind, v, port=A.port: q(f"SHOW CREATE {kind} {v}", port)[0]["definition"]
     line = lambda text, part: next((l for l in text.split("\n") if part in l), None)
     checks, info = {}, {}
+    # (sqlparser prints `- -k` as `--k`, a comment to the line's end: the texts the core keeps of a tree, a view's query and
+    # an INSERT's, were cut short, and an UPDATE's leader read none, until each parse put the operand in parentheses,
+    # `parsed::signed`)
+    q("CREATE TABLE neg (id BIGINT, k BIGINT)")
+    q("INSERT INTO neg VALUES (1, 3)")
+    q("CREATE TABLE negw (a BIGINT, b BIGINT)")
+    made = [_raises_text(lambda: q("CREATE VIEW negv AS SELECT id, - -k AS m FROM neg")), _raises_text(lambda: q("INSERT INTO negw SELECT id, - -k FROM neg")),
+            _raises_text(lambda: q("UPDATE negw SET b = - -b + 1 WHERE - -a = 1"))]
+    info["a minus before a minus"] = made
+    checks["a minus before a minus (`- -k`) means one in a view, an INSERT … SELECT and an UPDATE, as in a query"] = made == [""] * 3 \
+        and _try(lambda: q("SELECT * FROM negv")) == [{"id": 1, "m": 3}] and _try(lambda: q("SELECT * FROM negw")) == [{"a": 1, "b": 4}] \
+        and q("SELECT - -k AS m FROM neg") == [{"m": 3}]
 
     q("CREATE TABLE s (g BIGINT, x BIGINT, y BIGINT)")
     q("INSERT INTO s VALUES (1, 10, 100), (1, 11, 110), (2, 20, 200)")
@@ -10646,8 +10659,8 @@ def server():
     """`pondra serve <folder>` (ADR-030, ADR-032): three lakes in a folder (with --s3, under a bucket's
     prefix), served as databases —
     found as such, or named so (`--lakes`). psql and HTTP reach each by name, and queries join
-    across them; the console is at `/`; CREATE DATABASE makes one and DROP DATABASE drops one; a
-    database idle for PONDRA_DATABASE_IDLE_SECS stops, and starts again when next used; each
+    across them; the console is at `/`; CREATE DATABASE makes one, and DROP DATABASE keeps one to be
+    undropped (PURGE deletes it); a database idle for PONDRA_DATABASE_IDLE_SECS stops, and starts again when next used; each
     database's node gets `pondra serve`'s options; a connection open (or a request in flight)
     keeps its database's node running; another node joins a database's cluster through
     the server; the server killed and started again serves the same databases; each database signs
@@ -10690,9 +10703,16 @@ def server():
     call(port, "POST", "/db/hr/sql", b"CREATE TABLE people AS SELECT 1 AS id")  # (a new database's first write: its node starts, takes the lease, writes)
     first_write = round(time.time() - t0, 1)
     missing = _raises_text(lambda: pq("nope", "SELECT 1"))
-    pq("sales", "DROP DATABASE crm")
-    checks["CREATE DATABASE makes one, DROP DATABASE drops it, folder and all; an unknown one is said so"] = "hr" in running() and "crm" not in running() \
-        and not lake_objects(folder, "crm/") and 'database "nope" does not exist' in missing
+    pq("sales", "DROP DATABASE crm")  # (kept to be undropped: its folder stays, marked, and it is out of every listing)
+    checks["CREATE DATABASE makes one, and an unknown one is said so"] = "hr" in running() and 'database "nope" does not exist' in missing
+    checks["DROP DATABASE keeps crm: out of the listing, its folder kept with dropped.json, pondra.dropped says it can be undropped, and opening it is refused saying so"] = \
+        "crm" not in running() and "crm/dropped.json" in lake_objects(folder, "crm/") \
+        and pq("sales", "SELECT kind, undrop FROM pondra.dropped WHERE name = 'crm'") == [("database", "UNDROP DATABASE crm")] \
+        and "UNDROP DATABASE crm" in _raises_text(lambda: pq("crm", "SELECT 1"))
+    pq("sales", "UNDROP DATABASE crm")
+    checks["UNDROP DATABASE brings crm back: served again, its rows as they were, listed"] = pq("crm", "SELECT count(*) FROM customers") == [(2,)] and "crm" in running()
+    pq("sales", "DROP DATABASE crm PURGE")  # (deleted at once: later checks expect it gone)
+    checks["DROP DATABASE crm PURGE deletes its folder at once"] = not lake_objects(folder, "crm/")
     idle = until(lambda: sum(running().values()), 0, 30)
     checks["idle databases stop, and start again when used"] = idle == 0 and pq("hr", "SELECT count(*) FROM people") == [(1,)]
     with psycopg.connect(dsn("hr"), autocommit=True) as held:  # (open past the idle time: its node stays)
@@ -21899,7 +21919,9 @@ def registry():
     info["kv"] = kv + [show("table", "kv")]
     checks["a keyed table: a column added, its _deleted its own (never in its definition), DELETE still works"] = kv[0].get("altered") == ["+ w"] \
         and kv[1].get("unchanged") is True and "_deleted" not in show("table", "kv") and q("SELECT k, w FROM kv ORDER BY k") == [{"k": 2}, {"k": 3, "w": 3}]
-    # Branches (ADR-047) are made again by their clone: DROP DATABASE deletes one, so no ATTACH would find it
+    # Branches (ADR-047) are made again by their clone: a plain DROP DATABASE keeps one to be undropped, and the
+    # CREATE … LOCATION … CLONE below, at the same place, lets the kept folder go (`ddl::let_go`) and takes its pin
+    # over (the pin's key is the branch's id), so no ATTACH meets it and no folder is left behind
     here = q("SELECT name FROM pondra.databases")[0]["name"]
     dev_at, slim_at = f"{lake}-dev", f"{lake}-slim"
     LAKES.extend([dev_at, slim_at])
@@ -22669,6 +22691,19 @@ def listings():
     checks["a procedure's MCP tool is described by its COMMENT ON; its body's first line only to one who may see its code (11-08 audit L9)"] = \
         all(isinstance(d, dict) for d in described.values()) and "Says hello" in described["ann"]["told"] and "Says hello" in described["boss"]["told"] \
         and "the body's own line" not in described["ann"]["noted"] and "the body's own line" in described["boss"]["noted"]
+    # (11-09 audit H1: a sequence moves for a writer of a table that takes values from it. ann, granted INSERT on tickets,
+    # numbers its rows and may take its sequence's next value, but sets it back nowhere, and moves ticket_no, which no
+    # table of ann's takes from, at no door)
+    for q in ["CREATE TABLE tickets (id SERIAL, v TEXT)", "GRANT INSERT ON tickets TO ann"]:
+        ask(boss, q)
+    calls = {"INSERT": "INSERT INTO tickets (v) VALUES ('a')", "nextval": "SELECT nextval('tickets_id_seq') AS n", "setval": "SELECT setval('tickets_id_seq', 1) AS n",
+             "nextval, another": "SELECT nextval('ticket_no') AS n", "setval, another": "SELECT setval('ticket_no', 1) AS n"}
+    seqs = {door: {k: ask_(q, True) for k, q in calls.items()} for door, ask_ in doors.items() if door in ("HTTP", "Postgres", "MCP")}
+    unseen["H1"] = seqs
+    went = lambda v: v == "answered" or (v.startswith("200") and not re.search(r'isError"\s*:\s*true', v) and "permission denied" not in v)
+    stopped = lambda v: "permission denied for sequence" in v
+    checks["a sequence moves for a writer of a table that takes from it: ann, granted only INSERT on tickets, numbers its rows and takes its next value, but sets none and moves no other sequence, at every door (11-09 audit H1)"] = \
+        all(went(d["INSERT"]) and went(d["nextval"]) and stopped(d["setval"]) and stopped(d["nextval, another"]) and stopped(d["setval, another"]) for d in seqs.values())
     info["unseen"] = unseen
     node.kill()
     ok = all(checks.values())

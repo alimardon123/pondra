@@ -262,22 +262,32 @@ impl Dues {
     }
 }
 
-crate::per_node!(static DUES: Mutex<HashMap<String, Dues>> = Default::default());
+/// What a lake keeps for its matches views (invariant 301), by `{view}|{id}` (`dkey`): each one's dues and the cut points
+/// its catch-up has still ahead.
+#[derive(Default)]
+pub struct Kept {
+    dues: Mutex<HashMap<String, Dues>>,
+    /// Each view's cut points still ahead (`cut_points`): a catch-up works them out once and its steps take them in turn.
+    cuts: Mutex<HashMap<String, Vec<(i64, bool)>>>,
+}
 
-crate::per_node!(
-    /// Each view's cut points still ahead (`cut_points`), by `{lake}|{view}|{id}`: a catch-up works them out once and its
-    /// steps take them in turn.
-    static CUTS: Mutex<HashMap<String, Vec<(i64, bool)>>> = Mutex::new(HashMap::new()));
+impl crate::lake_state::LakeState for Kept {
+    const NAME: &'static str = "matches";
+    const ABOUT: &'static str = "each matches view's keys by the time their live thread is due, and the cut points its catch-up has still ahead";
+    fn make() -> Self {
+        Kept::default()
+    }
+}
 
-/// The key of a matches view's per-node state (`DUES`, `CUTS`): its lake, its name and its id (one made again is another).
-fn dkey(lake: &Lake, view: &str, m: &Matches) -> String { format!("{}|{view}|{}", lake.url, m.id) }
+/// The key of a matches view's state (`Kept`): its name and its id (one made again is another).
+fn dkey(view: &str, m: &Matches) -> String { format!("{view}|{}", m.id) }
 
-/// The per-node state of the matches views `views` (`emit_all`'s scan) no longer has: their dues and cut points.
+/// The state of the matches views `views` (`emit_all`'s scan) no longer has: their dues and cut points.
 pub(crate) fn forget(lake: &Lake, views: &[(String, View)]) {
-    let live: std::collections::HashSet<String> = views.iter().filter_map(|(k, v)| v.matches.as_ref().map(|m| dkey(lake, &k[2..], m))).collect();
-    let ours = format!("{}|", lake.url);
-    DUES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| !k.starts_with(&ours) || live.contains(k));
-    CUTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| !k.starts_with(&ours) || live.contains(k));
+    let Ok(memo) = lake.state::<Kept>() else { return };
+    let live: std::collections::HashSet<String> = views.iter().filter_map(|(k, v)| v.matches.as_ref().map(|m| dkey(&k[2..], m))).collect();
+    memo.dues.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| live.contains(k));
+    memo.cuts.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| live.contains(k));
 }
 
 /// A catch-up's steps run back to back for this long, then go on next round, so the leader's other views emit too.
@@ -324,8 +334,8 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     let t = ident(m.time.as_str());
 
     // The dues: each key's live thread's due time, from the whole of `$resume`, once (a leader's first run).
-    let dkey = dkey(lake, view, m);
-    let mut dues = DUES.lock().unwrap().remove(&dkey).unwrap_or_default();
+    let (memo, dkey) = (lake.state::<Kept>()?, dkey(view, m));
+    let mut dues = memo.dues.lock().unwrap().remove(&dkey).unwrap_or_default();
     if m.within && !dues.loaded {
         dues.load(&resume_map(&read_state(lake, &resume_name, at, None).await?, &part)?);
     }
@@ -336,10 +346,10 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     let sctx = session_for(lake, &read, "", Some(at), &crate::auth::Principal::node().scope).await?;
     let table = sctx.table(table_ref(&v.source)).await?;
     let w_mark = w;
-    let mut points = CUTS.lock().unwrap().remove(&dkey).unwrap_or_default();
+    let mut points = memo.cuts.lock().unwrap().remove(&dkey).unwrap_or_default();
     let w = next_cut(&mut points, &table, &m.time, &time_type, w0, w_mark, most_rows()).await?;
     if !points.is_empty() {
-        CUTS.lock().unwrap().insert(dkey.clone(), points);
+        memo.cuts.lock().unwrap().insert(dkey.clone(), points);
     }
     let s_batches: Vec<RecordBatch> = table.clone().filter(span(&t, &time_type, w0, w)?)?.collect().await?;
 
@@ -373,10 +383,10 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     if n_s == 0 && due.is_empty() && late == 0 {
         let short = w < w_mark;
         if short {
-            CUTS.lock().unwrap().remove(&dkey); // (a cached point left (W0, W] empty: the next step works its points out again)
+            memo.cuts.lock().unwrap().remove(&dkey); // (a cached point left (W0, W] empty: the next step works its points out again)
         }
         if m.within {
-            DUES.lock().unwrap().insert(dkey, dues);
+            memo.dues.lock().unwrap().insert(dkey, dues);
         }
         return Ok(short); // (nothing new and nothing late: no run, no commit; a short step goes on from W0 at once)
     }
@@ -493,7 +503,7 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
                 for (key, mk) in &markers {
                     dues.set(key, mk.due);
                 }
-                DUES.lock().unwrap().insert(dkey, dues); // (after a commit: the dues are as the writes say)
+                memo.dues.lock().unwrap().insert(dkey, dues); // (after a commit: the dues are as the writes say)
             }
             Ok(w < w_mark) // (a step short of the watermark: the next one reads on from the time it decided up to)
         }
@@ -988,19 +998,20 @@ mod tests {
             let live: View = lake.cat.get(&crate::views::view_key("dips")).await?.context("the view")?;
             let m = live.matches.clone().context("a matches view")?;
             let gone = Matches { id: "gone".into(), ..m.clone() };
-            let (live_key, gone_key, elsewhere) = (dkey(&lake, "dips", &m), dkey(&lake, "gone", &gone), "elsewhere|dips|1".to_string());
-            for k in [&live_key, &gone_key, &elsewhere] {
-                DUES.lock().unwrap().insert(k.clone(), Dues::default());
-                CUTS.lock().unwrap().insert(k.clone(), vec![(1, true)]);
+            let (live_key, gone_key) = (dkey("dips", &m), dkey("gone", &gone));
+            let memo = lake.state::<Kept>()?;
+            for k in [&live_key, &gone_key] {
+                memo.dues.lock().unwrap().insert(k.clone(), Dues::default());
+                memo.cuts.lock().unwrap().insert(k.clone(), vec![(1, true)]);
             }
             forget(&lake, &lake.cat.scan::<View>("v/", "v0").await?);
             {
-                let dues = DUES.lock().unwrap();
-                assert!(dues.contains_key(&live_key) && !dues.contains_key(&gone_key) && dues.contains_key(&elsewhere), "dues");
+                let dues = memo.dues.lock().unwrap();
+                assert!(dues.contains_key(&live_key) && !dues.contains_key(&gone_key), "dues");
             }
             {
-                let cuts = CUTS.lock().unwrap();
-                assert!(cuts.contains_key(&live_key) && !cuts.contains_key(&gone_key) && cuts.contains_key(&elsewhere), "cut points");
+                let cuts = memo.cuts.lock().unwrap();
+                assert!(cuts.contains_key(&live_key) && !cuts.contains_key(&gone_key), "cut points");
             }
             lake.cat.close().await?;
             let _ = std::fs::remove_dir_all(&dir);

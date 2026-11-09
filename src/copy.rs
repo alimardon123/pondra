@@ -80,7 +80,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
         // (one job for both tries: a first try the memory watch stopped while its commit was in flight may have committed, and
         // its retry then finds that commit by the job and answers it a duplicate, rather than appending the rows again)
         let job = uuid::Uuid::new_v4().to_string();
-        return crate::query::frugally(&ctx, |ctx| {
+        return crate::query::frugally(&lake.node, &ctx, |ctx| {
             let (query, format, job) = (&query, &format, &job);
             async move {
                 let df = crate::engine::sql(&ctx, query).await?;
@@ -131,7 +131,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     }
     let ctx = crate::query::session_for(lake, &query, "", None, scope).await?; // (made once: a try that runs out of memory retries on a copy of it)
     let stopped = std::sync::Mutex::new(HashSet::new()); // (the writes of the tries stopped: `write_of`)
-    let rows = crate::query::frugally(&ctx, |ctx| {
+    let rows = crate::query::frugally(&lake.node, &ctx, |ctx| {
         let (query, target, kept, stopped) = (&query, &target, &kept, &stopped);
         async move {
             if crate::query::retrying(&ctx) && target.folder() {
@@ -875,7 +875,7 @@ async fn expire(app: &App, known: &BTreeMap<String, Entry>) -> Result<()> {
     let _guard = app.lock.lock().await;
     let deletes: Vec<String> = old.iter().flat_map(|(k, e)| [(*k).clone(), producer_key(&format!("job:{}", e.job))]).collect();
     app.lake.cat.commit(vec![(QUIET.into(), json(&true))], &deletes).await?;
-    forget_producers(old.iter().map(|(_, e)| format!("job:{}", e.job)));
+    forget_producers(&app.lake, old.iter().map(|(_, e)| format!("job:{}", e.job)));
     Ok(())
 }
 
@@ -890,7 +890,7 @@ pub async fn gone(lake: &Lake, folders: &[String]) -> Result<Vec<String>> {
             jobs.push(format!("job:{}", e.job));
         }
     }
-    forget_producers(jobs);
+    forget_producers(lake, jobs);
     Ok(keys)
 }
 

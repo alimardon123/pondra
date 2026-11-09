@@ -129,7 +129,7 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
     // Whether it pays (`guard.rs`), unless it is to spread anyway: the slowest link, what it reads.
     let guard = match force {
         true => None,
-        false => match crate::guard::slowest(nodes, me).await {
+        false => match crate::guard::slowest(&lake.node, nodes, me).await {
             Some(link) => Some((link, reads(lake, &tables).await?)),
             None => return Ok(refused("a node's link can't be measured")),
         },
@@ -249,8 +249,8 @@ async fn writers<'a>(lake: &Lake, nodes: &'a [String], me: &str, sql: &str) -> R
 }
 
 /// A share sent to the node that writes it (`/cluster/{what}`), and its answer.
-async fn ask<A: Serialize, R: serde::de::DeserializeOwned>(node: &str, what: &str, body: &A) -> Result<R> {
-    let res = crate::dial::call(node, crate::dial::Call::json(format!("/cluster/{what}"), body)?).await?;
+async fn ask<A: Serialize, R: serde::de::DeserializeOwned>(from: &NodeState, node: &str, what: &str, body: &A) -> Result<R> {
+    let res = crate::dial::call(from, node, crate::dial::Call::json(format!("/cluster/{what}"), body)?).await?;
     ensure!(res.ok(), "{node}: {}", res.text().await?);
     Ok(res.json::<R>().await?)
 }
@@ -263,7 +263,7 @@ pub async fn copy(lake: &Lake, nodes: &[String], me: &str, sql: &str, target: &c
     let runs = shares.iter().map(|(node, s)| async move {
         match *node == me {
             true => copy_share(lake, s, target).await,
-            false => ask(node, "copy", &(s, target)).await,
+            false => ask(&lake.node, node, "copy", &(s, target)).await,
         }
     });
     Ok(Some(futures::future::join_all(runs).await.into_iter().sum::<Result<u64>>()?))
@@ -272,7 +272,7 @@ pub async fn copy(lake: &Lake, nodes: &[String], me: &str, sql: &str, target: &c
 /// This node's share of a `COPY … TO`, written: how many rows.
 pub async fn copy_share(lake: &Lake, s: &Slice, target: &crate::copy::Target) -> Result<u64> {
     crate::ext::register(lake, &target.to).await?;
-    crate::learned::given(&s.learned, crate::ext::scope(true, async {
+    crate::learned::given(lake, &s.learned, crate::ext::scope(true, async {
         crate::ext::prime(lake, &s.ext).await?;
         crate::copy::write(shared(lake, s).await?.1, target).await
     }))
@@ -295,7 +295,7 @@ pub async fn insert(lake: &Lake, nodes: &[String], me: &str, sql: &str, table: &
     let runs = shares.iter().zip(stamps).map(|((node, s), stamp)| async move {
         match *node == me {
             true => insert_share(lake, s, table, stamp).await,
-            false => ask(node, "insert", &(s, table, stamp)).await,
+            false => ask(&lake.node, node, "insert", &(s, table, stamp)).await,
         }
     });
     let written = futures::future::join_all(runs).await.into_iter().collect::<Result<Vec<_>>>()?;
@@ -309,11 +309,11 @@ pub type Columns = Vec<(String, String)>;
 
 /// This node's share of an `INSERT`, written into the table's folder: its files.
 pub async fn insert_share(lake: &Lake, s: &Slice, table: &str, stamp: Option<crate::log::Reserved>) -> Result<(Columns, Vec<DataFile>)> {
-    crate::learned::given(&s.learned, crate::ext::scope(true, async {
+    crate::learned::given(lake, &s.learned, crate::ext::scope(true, async {
         crate::ext::prime(lake, &s.ext).await?;
         let (ctx, _) = shared(lake, s).await?;
         // (out of memory, once more frugally, as `write::write_files` does: this share's files are never recorded by the first try)
-        crate::query::frugally(&ctx, |ctx| async move {
+        crate::query::frugally(&lake.node, &ctx, |ctx| async move {
             crate::write::in_order(&ctx); // (planned again, its partitions writing in the order rows come)
             let df = crate::engine::sql(&ctx, &s.sql).await?;
             crate::write::write_rows(lake, &ctx, table, df, stamp).await
@@ -462,7 +462,7 @@ async fn timed<T>(what: impl Into<String>, node: &str, f: impl std::future::Futu
 /// Another node's share, streamed onto this node's disk piece by piece: the plan's shape first,
 /// then how many buckets follow, then each bucket's piece count and its pieces, node `here`'s (this one's).
 async fn remote(node: &str, s: &Slice, here: &NodeState) -> Result<(String, Vec<Spill>)> {
-    let res = crate::dial::call(node, crate::dial::Call::json("/cluster/stage", s)?).await?;
+    let res = crate::dial::call(here, node, crate::dial::Call::json("/cluster/stage", s)?).await?;
     if !res.ok() {
         // (the node's SQLSTATE is kept, as the leader's is for a follower's write: a step out of disk (53100) is told
         // apart from one that failed, and is not run again)
@@ -502,7 +502,7 @@ pub fn reply(shape: &str, parts: Vec<Spill>, done: Option<crate::spill::Gone>) -
 /// The physical plan of the slice's query, its tables standing for just their parts.
 async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn ExecutionPlan>)> {
     // Files outside the lake as the coordinator listed them; it checked who may read them.
-    crate::learned::given(&s.learned, crate::ext::scope(true, async { crate::ext::prime(lake, &s.ext).await.and(Ok(planned(lake, s).await?)) })).await
+    crate::learned::given(lake, &s.learned, crate::ext::scope(true, async { crate::ext::prime(lake, &s.ext).await.and(Ok(planned(lake, s).await?)) })).await
 }
 
 async fn planned(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn ExecutionPlan>)> {
@@ -631,7 +631,7 @@ async fn shuffle(lake: &Lake, nodes: &[String], me: &str, sql: &str, tables: &[S
 /// let them go now. `run` calls it for every shuffle that fails, with that shuffle's own id.
 async fn abandon(lake: &Lake, nodes: &[String], me: &str, id: &str) {
     forget(lake, id);
-    let asks = nodes.iter().filter(|n| *n != me).map(|n| crate::dial::call(n, crate::dial::Call::get(format!("/cluster/shuffle?id={id}&exchange=0&to=0&drop=true"))));
+    let asks = nodes.iter().filter(|n| *n != me).map(|n| crate::dial::call(&lake.node, n, crate::dial::Call::get(format!("/cluster/shuffle?id={id}&exchange=0&to=0&drop=true"))));
     futures::future::join_all(asks).await;
 }
 
@@ -1252,6 +1252,16 @@ fn shape(p: &Arc<dyn ExecutionPlan>) -> String {
         "AggregateExec" | "HashJoinExec" | "AsOfJoinExec" | "SortMergeJoinExec" | "SortExec" | "SortExec(TopK)" | "BoundedWindowAggExec" => displayable(p.as_ref()).one_line().to_string(),
         name => name.to_string(),
     };
+    // (an aggregate's partial state crosses the nodes in its own layout, which a release may change while its plan's line
+    // stays the same: avg's and var's over DOUBLE and small integers did, 11-09 audit M12. In a cluster mid-upgrade the
+    // shapes then differ, and the query runs on one node, ADR-039)
+    let what = match p.downcast_ref::<datafusion::physical_plan::aggregates::AggregateExec>() {
+        Some(a) => {
+            let states = a.aggr_expr().iter().map(|e| e.state_fields().map(|fs| fs.iter().map(|f| f.data_type().to_string()).collect::<Vec<_>>().join(" "))).collect::<datafusion::common::Result<Vec<_>>>();
+            format!("{} states=[{}]", what.trim_end(), states.map_or_else(|e| e.to_string(), |s| s.join(", ")))
+        }
+        None => what,
+    };
     // (a subquery's answer, shown in the line, may differ in its last digit from node to node)
     let what = what.split("scalar_subquery(").enumerate().map(|(i, part)| if i == 0 { part } else { part.split_once(')').map_or(part, |(_, rest)| rest) }).collect::<Vec<_>>().join("scalar_subquery()");
     // (an aggregate's ordering_mode follows from the orders and constants below it, which depend on
@@ -1472,7 +1482,7 @@ async fn fetch(job: &Job, id: &str, from: &str, local: bool, k: usize, to: usize
         return Ok(one(kept(job, k, to)?, part));
     }
     let only = part.map(|q| format!("&part={q}")).unwrap_or_default();
-    let res = crate::dial::call(from, crate::dial::Call::get(format!("/cluster/shuffle?id={id}&exchange={k}&to={to}{only}"))).await?;
+    let res = crate::dial::call(&job.node, from, crate::dial::Call::get(format!("/cluster/shuffle?id={id}&exchange={k}&to={to}{only}"))).await?;
     ensure!(res.ok(), "{from}: {}", res.text().await?);
     let name = format!("in-{k}{r}-{to}-{}{}", from.replace(':', "_"), part.map(|q| format!("-p{q}")).unwrap_or_default());
     Ok(read_reply(res, id, &name, &job.node).await?.1)
@@ -1697,5 +1707,21 @@ mod tests {
         assert_eq!(share(&stage_ctx(&one)), 0.8);
         let set = crate::optimize::config(SessionConfig::new()).set_str("datafusion.execution.skip_partial_aggregation_probe_ratio_threshold", "0.5");
         assert_eq!(share(&stage_ctx(&SessionContext::new_with_config(set))), 0.5);
+    }
+
+    /// The shape every node must plan alike holds each aggregate's partial state: the same line with another layout (a
+    /// release that changed avg's over small integers, 11-09 audit M12) is another shape.
+    #[tokio::test]
+    async fn a_shape_holds_its_aggregates_states() -> Result<()> {
+        let ctx = crate::engine::session(SessionConfig::new().with_target_partitions(2), Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()));
+        ctx.sql("CREATE TABLE t AS SELECT v % 3 AS g, (v % 10)::INT AS i, (v * 1.5)::DOUBLE AS d FROM generate_series(1, 100) AS s(v)").await?.collect().await?;
+        let shaped = |sql: &'static str| {
+            let ctx = ctx.clone();
+            async move { anyhow::Ok(shape(&ctx.sql(sql).await?.create_physical_plan().await?)) }
+        };
+        let (small, double) = (shaped("SELECT g, avg(i) FROM t GROUP BY g").await?, shaped("SELECT g, avg(d) FROM t GROUP BY g").await?);
+        assert!(small.contains("states=[Int64 Decimal128(38, 0)]"), "small integers' exact sum: {small}");
+        assert!(double.contains("states=[Int64 Float64 Float64]"), "a DOUBLE's sum and its error: {double}");
+        Ok(())
     }
 }

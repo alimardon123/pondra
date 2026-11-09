@@ -54,22 +54,22 @@ impl Alone {
     /// Lead the lake on `store` alone: the next term with no address, claimed while no live term is ahead of it
     /// (`terms::claim_one_off`). The term is marked alive every 10 s by the returned task (`terms::mark_every`): the
     /// form aborts that task, and calls `terms::release` at its end.
-    pub async fn lead(store: &Store, tasks: &crate::spawns::Tasks) -> Result<(Arc<Alone>, JoinHandle<()>)> {
+    pub async fn lead(store: &Store, node: &crate::node_state::NodeState) -> Result<(Arc<Alone>, JoinHandle<()>)> {
         // (a live term refuses at once: nothing here waits for another leader to finish)
         let term = terms::claim_one_off(store, |t| {
             if t.addr.is_empty() {
                 bail!("this lake is being written by a one-off writer (a backup, or another form alone): wait for it to finish, or lead another lake")
             }
             bail!("this lake is led by the node at {}, which this process can't lead beside: stop that node, or lead another lake", t.addr)
-        })
+        }, &node.claims)
         .await?;
-        Ok(led(store, term, tasks))
+        Ok(led(store, term, &node.tasks))
     }
 
     /// Lead the lake on `store` alone, at once: the next term over the newest, alive or not (`terms::claim_owned`). Only for a
     /// store no other process writes (a kept page's folder, under its Web Lock). Its term is marked and released as `lead`'s.
-    pub async fn lead_owned(store: &Store, tasks: &crate::spawns::Tasks) -> Result<(Arc<Alone>, JoinHandle<()>)> {
-        Ok(led(store, terms::claim_owned(store).await?, tasks))
+    pub async fn lead_owned(store: &Store, node: &crate::node_state::NodeState) -> Result<(Arc<Alone>, JoinHandle<()>)> {
+        Ok(led(store, terms::claim_owned(store, &node.claims).await?, &node.tasks))
     }
 
     /// One that claims nothing (a store with no create-if-absent put): term 0, its own leader.
@@ -314,15 +314,16 @@ mod tests {
     #[tokio::test]
     async fn one_alone_leads_a_lake_until_it_lets_go() {
         let url = format!("memory://members-{}", uuid::Uuid::new_v4().simple());
-        let (store, node) = (crate::memory_lake::store(&url), crate::node_state::NodeState::unhosted());
-        let (first, marks) = Alone::lead(&store, &node.tasks).await.unwrap();
+        let store = crate::memory_lake::store(&url);
+        let node = crate::node_state::NodeState::unhosted();
+        let (first, marks) = Alone::lead(&store, &node).await.unwrap();
         assert_eq!(first.leader().n, 1);
         let asked = Instant::now();
-        assert!(Alone::lead(&store, &node.tasks).await.is_err(), "a second is refused while the first lives");
+        assert!(Alone::lead(&store, &node).await.is_err(), "a second is refused while the first lives");
         assert!(asked.elapsed() < Duration::from_secs(1), "the refusal waits for nothing");
         marks.abort(); // (a dropped handle aborts nothing: its mark would land again after the release)
-        terms::release(&store, 1).await;
-        let (second, marks) = Alone::lead(&store, &node.tasks).await.unwrap();
+        terms::release(&store, 1, &node.claims).await;
+        let (second, marks) = Alone::lead(&store, &node).await.unwrap();
         assert_eq!(second.leader().n, 2, "let go, the next claim is the next term");
         marks.abort();
         crate::memory_lake::forget_memory(&url);

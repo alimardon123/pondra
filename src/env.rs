@@ -216,6 +216,14 @@ pub fn is_set(name: &str) -> bool {
     get(name).is_some()
 }
 
+/// Whether the front's own checks run (`parsed::checked`: a tree kept is its text's parse; `passes::checked`: a pass whose
+/// trigger didn't fire has nothing to do): in a debug build, and in a node started with `PONDRA_TEST_CHECKS` (the gates'
+/// runs: DataFusion's SQL tests, TPC-H, TPC-DS, the random queries, the harness). One switch for both, read once.
+pub fn front_checked() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| cfg!(debug_assertions) || is_set("PONDRA_TEST_CHECKS"));
+    *ON
+}
+
 /// What the process was handed and given (the given last, which wins), for the Pondra processes it starts with an
 /// environment (a folder of lakes' databases, the program run again to rejoin): as their environment, they read what it
 /// reads. One started with a line takes its node's (`settings::Line`).

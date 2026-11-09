@@ -148,13 +148,28 @@ fn args_text(args: &RecordBatch) -> String {
 
 type Sent = (Line, Option<tokio::sync::oneshot::Sender<()>>);
 
-crate::per_node!(static WRITER: std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<Sent>>> = std::sync::RwLock::new(None));
+/// What a lake keeps for its runs (invariant 301): its run log's writer, made on the first line, and its tasks as of the
+/// catalog's version they were read at (`tasks`).
+#[derive(Default)]
+pub struct Kept {
+    writer: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Sent>>,
+    tasks: Mutex<Option<(u64, Arc<Vec<(String, Task)>>)>>,
+}
+
+impl crate::lake_state::LakeState for Kept {
+    const NAME: &'static str = "runs";
+    const ABOUT: &'static str = "its run log's writer, and its tasks as of the catalog's version they were read at";
+    fn make() -> Self {
+        Kept::default()
+    }
+}
 
 fn log(app: &App, line: Line, done: Option<tokio::sync::oneshot::Sender<()>>) {
     if app.log.is_none() || !app.members.keeps_records() {
         return; // (a read-only node writes nothing; a joined page's node keeps the records)
     }
-    let tx = crate::reset::Once::get_or(&*WRITER, || {
+    let Ok(kept) = app.lake.state::<Kept>() else { return };
+    let tx = kept.writer.get_or_init(|| {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         crate::history::keep(&app.lake, write(app.clone(), rx));
         tx
@@ -465,6 +480,16 @@ fn signed(lake: &Lake, what: &str) -> Option<String> {
     Some(crate::text::hex(&crate::crypto::hmac_sha256(key.as_bytes(), format!("{}\x1f{what}", lake.url).as_bytes())))
 }
 
+/// A dropped task's records (`undrop::Kept`) without its owner's marks, its own and its last tick's: undropped by anyone
+/// but the owner (`ext::owner`), it runs as a task they made would, as no one's, never in the owner's scope (`as_owner`).
+pub(crate) fn unmark(records: &mut [(String, serde_json::Value)]) {
+    for (_, v) in records.iter_mut().filter(|(k, _)| k.starts_with("j/") || k.starts_with("jt/")) {
+        if let Some(o) = v.as_object_mut() {
+            o.remove("owner");
+        }
+    }
+}
+
 /// Is `mark` `what` signed by this process's owner (`signed`)? Compared in constant time.
 fn owners(lake: &Lake, mark: Option<&str>, what: &str) -> bool { mark.zip(signed(lake, what)).is_some_and(|(m, s)| crate::crypto::same(m.as_bytes(), s.as_bytes())) }
 
@@ -756,17 +781,16 @@ pub async fn drop_task(lake: &Lake, name: &str, if_exists: bool) -> Result<serde
 
 /// This lake's tasks, read again only after a commit.
 pub(crate) async fn tasks(lake: &Lake) -> Result<Arc<Vec<(String, Task)>>> {
-    crate::per_node!(static SEEN: Mutex<HashMap<String, (u64, Arc<Vec<(String, Task)>>)>> = Mutex::new(HashMap::new()));
-    let seen = &*SEEN;
+    let kept = lake.state::<Kept>()?;
     let version = lake.cat.version();
-    if let (Some(v), Some((at, all))) = (version, seen.lock().unwrap().get(&lake.url)) {
+    if let (Some(v), Some((at, all))) = (version, &*kept.tasks.lock().unwrap()) {
         if *at == v {
             return Ok(all.clone());
         }
     }
     let all = Arc::new(lake.cat.scan::<Task>("j/", "j0").await?.into_iter().map(|(k, t)| (k[2..].to_string(), t)).collect::<Vec<_>>());
     if let Some(v) = version {
-        seen.lock().unwrap().insert(lake.url.clone(), (v, all.clone()));
+        *kept.tasks.lock().unwrap() = Some((v, all.clone()));
     }
     Ok(all)
 }
@@ -834,7 +858,7 @@ impl Drop for Ran {
 /// try within `timeout`; then its line in the run log, then the tick marked done, with how it went.
 async fn run_tick(app: &App, name: &str, task: &Task, tick: Tick) {
     let job = format!("task:{name}:{}", tick.at);
-    let who = Who { role: Role::Admin, files: false, depth: 0, scope: crate::auth::Principal::node().scope }; // (the schedule's: the node's own)
+    let who = Who { by: None, ..Who::signed(crate::auth::Principal::node(), Role::Admin, false) }; // (the schedule's: the node's own, signed in by no one)
     let none = RecordBatch::new_empty(Arc::new(datafusion::arrow::datatypes::Schema::empty()));
     let id = format!("task-{name}-{}", tick.at); // (a tick run again after a failover is the same run: its row, ended)
     let run = CALLER.sync_scope("schedule".into(), || Run::start(app, name, Role::Admin, Some(&job), &none, Some(id)));
@@ -1133,8 +1157,10 @@ pub fn mentioned(sql: &str) -> bool {
     ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.shares", "pondra.recipients", "pondra.audit", "pondra.history", "pondra.loads", "pondra.learned", "pondra.flows", "pondra.expectations", "pondra.rejects", "pondra.variables", "pondra.dropped", "pondra.objects", "pondra.parts", "pondra.databases", "pondra.applies"].iter().any(|t| s.contains(t))
 }
 
-/// `pondra.routines`, `pondra.tasks` and `pondra.tables`, as they are now.
-pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
+/// `pondra.routines`, `pondra.tasks`, `pondra.tables` and `pondra.dropped`, as they are now. `sql`: the statement that reads
+/// them (the databases dropped beside this one and the lake's deleted files are listed only for one that names
+/// `pondra.dropped`: finding them lists their folder and the files' notes).
+pub async fn tables(lake: &Lake, scope: &crate::rights::Scope, sql: &str) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
     use datafusion::datasource::MemTable;
     let all = crate::routines::listed(lake).await?;
     let mut names: Vec<&String> = all.keys().collect();
@@ -1195,8 +1221,8 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'
         ("key", l(&|o| o.meta.as_ref().filter(|m| !m.key.is_empty()).map(|m| m.key.join(", ")))),
         ("definition", l(&|o| o.sql.clone())),
     ])?;
-    // (what UNDROP can still bring back: dropped tables (ADR-043), and dropped definitions (`undrop.rs`), each with the
-    // statement that does it. A relation is listed to whoever may read one of its name; any other definition to the whole.)
+    // (what UNDROP can still bring back: dropped tables (ADR-043), dropped definitions (`undrop.rs`) and deleted files, each
+    // with the statement that does it. A relation is listed to whoever may read one of its name; anything else to the whole.)
     struct Gone {
         name: String,
         kind: String,
@@ -1211,7 +1237,14 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'
         bytes: Some(d.meta.files.iter().map(|f| f.bytes).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.bytes)),
         kind: "table".into(), at_ms: d.at_ms, until: d.at_ms + d.keep_ms, by: d.by, name,
     }).collect();
-    gone.extend(crate::undrop::all(lake).await?.into_iter().map(|(name, k)| Gone { kind: k.kind.clone(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
+    // (a database's own record keeps only its attachment here: its folder's mark is what lists it, `undrop::LAKE_MARK`)
+    gone.extend(crate::undrop::all(lake).await?.into_iter().filter(|(_, k)| k.kind != "database").map(|(name, k)| Gone { kind: k.kind.clone(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
+    if sql.to_lowercase().contains("pondra.dropped") {
+        let beside = crate::undrop::lakes_kept(&crate::ddl::folder_of(&lake.url)).await.unwrap_or_default(); // (a folder that won't list: none)
+        gone.extend(beside.into_iter().map(|(name, _, k)| Gone { kind: "database".into(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
+        // (deleted files a version of which is kept (`files::deleted`): a file has no rows, and its bytes are its newest version's)
+        gone.extend(crate::files::deleted(lake).await?.into_iter().map(|f| Gone { kind: "file".into(), at_ms: f.at_ms, until: f.kept_until(), rows: None, bytes: Some(f.bytes), by: f.by, name: f.path }));
+    }
     let relation = |kind: &str| crate::objects::kind(kind).is_some_and(|k| k.family == "relation");
     gone.retain(|g| scope.sees(if relation(&g.kind) { crate::rights::Object::Table(&g.name) } else { crate::rights::Object::Lake }));
     let g = |f: &dyn Fn(&Gone) -> Option<u64>| Arc::new(gone.iter().map(|d| f(d).map(|n| n as i64)).collect::<Int64Array>()) as ArrayRef;
@@ -1367,6 +1400,28 @@ mod tests {
         let mut edited = scheduled.clone();
         edited.result = Some("42".into());
         assert!(!edited.as_owner(&lake, "owned", &owned), "a tick whose result changed after it was signed is no one's");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_undropped_task_is_the_owners_only_when_the_owner_undrops_it() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-undrop-owner-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let _ = lake.owner_key.set("k1".into());
+        let scope = crate::rights::Scope::everything();
+        for (by_owner, name) in [(true, "mine"), (false, "taken")] {
+            let task = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), ..Default::default() };
+            crate::ext::scope(true, create_task(&lake, name, task, false)).await?;
+            let mut tick = Tick { at: 1, ..Default::default() };
+            tick.owner = signed(&lake, &tick.what(name));
+            lake.cat.commit(vec![(tick_key(name), json(&tick))], &[]).await?;
+            crate::ext::scope(true, drop_task(&lake, name, false)).await?; // (the owner drops it)
+            crate::ext::scope(by_owner, crate::undrop::undrop(&lake, "task", name, &scope)).await?;
+            let task = lake.cat.get::<Task>(&task_key(name)).await?.context("the task is back")?;
+            let tick = lake.cat.get::<Tick>(&tick_key(name)).await?.context("its tick is back")?;
+            assert_eq!(tick.as_owner(&lake, name, &task), by_owner, "{name}: the owner's again only when the owner undropped it");
+            assert_eq!(task.owner.is_some() && tick.owner.is_some(), by_owner, "{name}: another's UNDROP keeps no mark");
+        }
         Ok(())
     }
 
