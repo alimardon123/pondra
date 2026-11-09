@@ -88,23 +88,23 @@ pub async fn live(State(app): State<App>, Query(p): Query<Params>, who: Option<a
                 None => h.remove("x-pondra-session"),
             };
             let one = serde_json::to_vec(&serde_json::json!({"sql": q.sql, "params": q.params})).unwrap_or_default();
-            let tag = format!("\"id\":{},", serde_json::Value::from(q.id));
+            let (tag, shows) = (format!("\"id\":{},", serde_json::Value::from(q.id)), who.scope.shows_code());
             all.push(match watch(&app, &who, &h, None, "application/json", &one, every, tag.clone()).await {
                 Ok(w) => lines(w).boxed(),
-                Err(e) => futures::stream::once(async move { Ok(error(e, &tag)) }).boxed(),
+                Err(e) => futures::stream::once(async move { Ok(error(e, &tag, shows)) }).boxed(),
             });
         }
         return ([("content-type", "application/x-ndjson")], Body::from_stream(app.lake.node.drain.endless(futures::stream::select_all(all).take_until(revoked)))).into_response();
     }
     match watch(&app, &who, &headers, p.sql.as_deref(), &kind, &body, every, String::new()).await {
         Ok(w) => ([("content-type", "application/x-ndjson")], Body::from_stream(app.lake.node.drain.endless(lines(w).take_until(revoked)))).into_response(),
-        Err(e) => (axum::http::StatusCode::BAD_REQUEST, crate::ext::said(&e)).into_response(),
+        Err(e) => (axum::http::StatusCode::BAD_REQUEST, crate::codes::told(&e, who.scope.shows_code())).into_response(),
     }
 }
 
 /// A live query made ready: its SQL prepared, the tables it reads found, as its session and caller.
 async fn watch(app: &App, who: &crate::auth::Principal, headers: &axum::http::HeaderMap, sql: Option<&str>, kind: &str, body: &[u8], every: Duration, tag: String) -> anyhow::Result<Watch> {
-    let session = crate::temp::of(headers)?;
+    let session = crate::temp::of(headers, &who.name)?;
     crate::temp::SESSION.scope(session.clone(), async {
         let req = match sql {
             Some(sql) => crate::routines::Request::read("", sql.as_bytes())?,
@@ -139,7 +139,7 @@ fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::
             }
             let print = match print(&mut w).await {
                 Ok(p) => p,
-                Err(e) => return Some((Ok(error(e, &w.tag)), None)),
+                Err(e) => return Some((Ok(error(e, &w.tag, w.who.scope.shows_code())), None)),
             };
             if w.print == Some(print) {
                 continue; // (commits to other tables)
@@ -156,7 +156,7 @@ fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::
             let rows = crate::temp::SESSION.scope(w.session.clone(), crate::auth::WHO.scope(who, w.app.query(&w.sql, None, &scope))).await.and_then(|b| crate::answer::render(&b, None, &|rows| crate::pages::keep(&w.app.lake, rows)));
             let rows = match rows {
                 Ok(r) => r,
-                Err(e) => return Some((Ok(error(e, &w.tag)), None)),
+                Err(e) => return Some((Ok(error(e, &w.tag, scope.shows_code())), None)),
             };
             let hash = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), &rows);
             if w.answer == Some(hash) {
@@ -171,7 +171,8 @@ fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::
 
 fn header(headers: &axum::http::HeaderMap) -> Option<String> { headers.get("authorization").and_then(|v| v.to_str().ok()).map(String::from) }
 
-fn error(e: anyhow::Error, tag: &str) -> bytes::Bytes { format!("{{{tag}\"error\":{}}}\n", serde_json::Value::from(crate::ext::said(&e))).into() }
+/// A live query's error line, worded for its caller (`codes::told`): `shows`, whether it is shown code.
+fn error(e: anyhow::Error, tag: &str, shows: bool) -> bytes::Bytes { format!("{{{tag}\"error\":{}}}\n", serde_json::Value::from(crate::codes::told(&e, shows))).into() }
 
 /// The tables `sql` reads here (itself and through its views, the session's too) and the attached
 /// lakes it names.

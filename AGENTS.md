@@ -119,7 +119,7 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
           counts in the query memory: invariant 414); keys_below.rs (a join's keys cut the rows an aggregate under it
-          groups: invariant 437); reuse.rs (a subplan that appears more than once alike runs once: invariant 477); eager.rs (a grouping by a dimension's text columns groups the big table by its keys first: invariant 478); or_ranges.rs (an OR of ranges of one column that meet as one
+          groups: invariant 437); reuse.rs (a subplan that appears more than once alike runs once: invariant 477); eager.rs (a grouping by a dimension's text columns groups the big table by its keys first: invariant 478); undrop.rs (a dropped definition kept, and UNDROP for each kind: invariant 479); or_ranges.rs (an OR of ranges of one column that meet as one
           range: invariant 438); zeros_in.rs (a float IN list's zero, a CASE's and NULLIF's, answer as `=` does: invariant 448); round 35 served.rs (a lake's store over HTTP:
           pondra://host:port, ADR-072 §8, invariant 299); replace.rs (CREATE OR REPLACE TABLE: a staged table filled, then put
           in the old one's place in one commit: invariant 425); round 36 statement.rs (one statement's
@@ -795,14 +795,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    new type. Delta readers learn renamed columns from column mapping declared as the
    `columnMapping` table feature (reader 3), never reader version 2 alone: delta-rs's pyarrow
    reader ignored version 2 and read renamed columns as null (`harness.py columns`).
-76. **The sequencer holds every flush to the inline views** (`log::commit`, `views::Inline`): a
+76. **The sequencer holds every flush to the inline views** (`log::commit`, `views::Inline` as the views' `log::Owes`): a
    flush with rows of a table views follow carries a part for each (empty if none derived), and no
    part for a view the table doesn't have; otherwise it goes back to be packed again. A view's
    filling ends at the first commit that holds flushes to it, written in that commit
    (`views::bound`); the fill covers `_version ≤ upto`, as of `upto`. `harness.py fills`: with the
    check off, all 12 checks fail. Making a view waits for its fill, which commits: a crash there
    drops the call, and asking again (the same view) is the answer — `harness.py crash`'s setup
-   does, or CI fails now and then.
+   does, or CI fails now and then. The log names no view: the views are a commit hook
+   (`log::CommitHooks`, `views::hook`, added by the engine), and the log calls each hook's `derive`, `refused`,
+   `commit` (the `Owes` above, and the fills' ends) and `led`. Anything else that keeps rows in step with a commit is
+   another hook, not a call from the log (`log`'s tests: "commits call the hooks the registry has").
 77. **The inline views the sequencer holds flushes to are reloaded after every view made or
    dropped** (`views::forget`), and a cache that changed meanwhile is never overwritten with an
    older one (`views::bound` checks it's the same). A stale set refuses every flush of the new
@@ -3220,6 +3223,22 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    joins it reorders) and runs just after the join order. At SF10 in process against main: TPC-DS q22 3.46 -> 0.42 s,
    q86 0.079 -> 0.070, q23 1.89 -> 1.80; every other TPC-H and TPC-DS plan as it was; the same answers.
    `cargo test --lib eager::`
+479. **A dropped definition is kept, and comes back with UNDROP as a table does** (`undrop.rs`, ADR-043 §2b). A drop of
+   a view, an external table, a function, macro or procedure, a task (with its last tick), a type, a secret (still
+   sealed) or a connection puts its records as they were, with the comments on it and its columns, in one
+   `dk/{family}/{name}/{ms}` record in the drop's own commit. `UNDROP <kind> name` puts the newest back, for the kinds
+   whose registry verbs list UNDROP (`objects::Kind`, read by `write::parse`); it is refused while anything of the
+   family has the name, and needs the right that kind's DROP needs (`statements::undrops_entry`: an admin's for a
+   connection). `UNDROP TABLE` brings back a kept external table when no table is kept. Each is kept for the default
+   7 days (`ddl::KEEP_MS`), let go by `tier::expire`; `pondra.dropped` lists it (kind, dropped_by, undrop) to whoever
+   may read a relation of its name, any other kind to the whole. `dk/` is no page's and no branch's. A schema's drop,
+   CASCADE too, keeps the schema in one record naming what went with it (`Kept::with`: its tables, views and routines,
+   each in its own record), kept as long as the longest kept of them; `UNDROP SCHEMA` brings it back, then each of them
+   still kept (tables, then routines, then what reads them), and its answer names any that isn't (`left`). A
+   materialized view is kept as the statement that makes it again (`Kept::made`, `objects::materialized_sql`): UNDROP
+   runs it for the asker, so its rows are its sources' as they are then, and it follows new writes from there. Its
+   UNDROP (its schema's too) answers once it is filled, as its CREATE does (`ddl::settle`). Only a DROP keeps one: a view
+   replaced, or one refused as it was made, isn't kept (`drop_view`'s `keep`), nor is a topic's view. `cargo test --lib undrop::`
 
 ```bash
 cargo build --release

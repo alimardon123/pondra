@@ -213,12 +213,9 @@ pub fn get() -> &'static Passes {
     crate::registry::get().section::<Passes>()
 }
 
-/// Whether a pass whose trigger didn't fire is run anyway, and its having something to do refused (`missed`): in a debug
-/// build, and in a node started with `PONDRA_TEST_PASSES` (the gates' runs).
-pub(crate) fn checked() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| cfg!(debug_assertions) || crate::env::is_set("PONDRA_TEST_PASSES"));
-    *ON
-}
+/// Whether a pass whose trigger didn't fire is run anyway, and its having something to do refused (`missed`):
+/// `env::front_checked`.
+pub(crate) fn checked() -> bool { crate::env::front_checked() }
 
 fn missed(p: &Pass, sql: &str) -> String {
     format!("passes: {} had something to do in a text its trigger missed (its words and marks are short of its look): {sql}", p.name)
@@ -290,7 +287,7 @@ impl Matcher {
             }
             let hit = match kind {
                 Kind::Word => !(m.start() > 0 && word(m.start() - 1)) && !word(m.end()),
-                Kind::Mark => follows(b, m.end(), rest),
+                Kind::Mark => follows(sql, m.end(), rest),
             };
             if hit {
                 fired |= bits;
@@ -300,17 +297,16 @@ impl Matcher {
     }
 }
 
-/// Whether `rest`'s pieces follow `at` in `b`, in a row, with any whitespace before each (case aside).
-fn follows(b: &[u8], mut at: usize, rest: &[&str]) -> bool {
+/// Whether `rest`'s pieces follow `at` in `sql`, in a row, with any whitespace before each (case aside): whitespace as
+/// the looks' `\s` reads it, U+00A0 too, so a trigger stays a superset of its look (11-08 audit L12).
+fn follows(sql: &str, mut at: usize, rest: &[&str]) -> bool {
     for piece in rest {
-        while b.get(at).is_some_and(|c| c.is_ascii_whitespace()) {
-            at += 1;
-        }
-        let p = piece.as_bytes();
-        if !b.get(at..at + p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p)) {
+        let tail = sql.get(at..).unwrap_or("");
+        at += tail.len() - tail.trim_start().len();
+        if !sql.get(at..at + piece.len()).is_some_and(|s| s.eq_ignore_ascii_case(piece)) {
             return false;
         }
-        at += p.len();
+        at += piece.len();
     }
     true
 }
@@ -335,7 +331,7 @@ pub(crate) mod tests {
 
     /// A word triggers where it stands whole, ASCII case aside, and `_` and digits are a word's: `my_pivot` and `pivot2`
     /// aren't `pivot`; anything not ASCII stands between words, so the trigger stays a superset of a look's `\b`. A mark
-    /// triggers anywhere, its pieces with any whitespace between them.
+    /// triggers anywhere, its pieces with any whitespace between them, Unicode's too.
     #[test]
     fn a_trigger_is_a_whole_word_or_a_mark() {
         let mut s = Passes::default();
@@ -349,6 +345,7 @@ pub(crate) mod tests {
         assert_eq!(fired("SELECT épivot"), [0, 2], "not ASCII: a boundary");
         assert_eq!(fired("SELECT (x) .a, (y).b"), [1]);
         assert_eq!(fired("SELECT (x)\n\t. a"), [1]);
+        assert_eq!(fired("SELECT (x)\u{A0}.a, (y)\u{2003}. b"), [1], "whitespace as `\\s` reads it: U+00A0 too (11-08 audit L12)");
         assert_eq!(fired("SELECT (x) , .5"), Vec::<usize>::new());
         assert_eq!(fired("SELECT x::INT"), [1]);
         assert_eq!(fired("SELECT \u{17F}ample"), [0, 1, 2], "Unicode's case folding: every pass");
