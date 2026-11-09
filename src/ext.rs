@@ -1122,11 +1122,9 @@ fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
     })
 }
 
-/// `CREATE [OR REPLACE] [PERSISTENT] SECRET [IF NOT EXISTS] name (TYPE t, KEY value, …)` and
-/// `DROP SECRET [IF EXISTS] name [PURGE]`, parsed here: a value is a string, a word or a number.
+/// `COPY … INTO`, Pondra's `COPY` forms and `ATTACH … (TYPE …)`, parsed here, or None for any other statement.
 pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
-    use crate::ddl::Ddl;
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser};
     if let Some(load) = copy_into_statement(&mut Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?) {
         return Some(load);
     }
@@ -1135,10 +1133,20 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
         return Some(copy);
     }
     let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
-    let invalid = |e: String| Some(crate::write::Stmt::Invalid(e));
     if p.parse_keyword(Keyword::ATTACH) {
         return attach_statement(&mut p);
     }
+    None
+}
+
+/// `CREATE [OR REPLACE] [PERSISTENT | TEMP] SECRET [IF NOT EXISTS] name (TYPE t, KEY value, …)` and `DROP [PERSISTENT |
+/// TEMPORARY] SECRET [IF EXISTS] name [PURGE]`, parsed here: a value is a string, a word or a number. The statements section's
+/// SECRET entries read with it (`core_statements.rs`); None: no SECRET statement.
+pub fn secret(sql: &str) -> Option<crate::write::Stmt> {
+    use crate::ddl::Ddl;
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
+    let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
+    let invalid = |e: String| Some(crate::write::Stmt::Invalid(e));
     if p.parse_keyword(Keyword::DROP) {
         let _ = p.parse_one_of_keywords(&[Keyword::PERSISTENT, Keyword::TEMPORARY]);
         if !p.parse_keyword(Keyword::SECRET) {

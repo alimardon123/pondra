@@ -142,20 +142,18 @@ pub const CORE: &str = "core";
 /// match on sqlparser's tree), after a CREATE's `OR REPLACE`, `TEMP` or `TEMPORARY`: an extension's entry may not begin
 /// with one, so no extension takes a core statement over with longer words. Each goes as its whole family becomes a core
 /// entry (PR 8b-8d), which the same check covers (`ALTER DATABASE`, USER, ROLE, TOKEN, SHARE, RECIPIENT, IDENTITY
-/// PROVIDER, SEQUENCE, COMMENT, TYPE and INDEX have; every `CREATE OR ALTER` is the core's entry's).
+/// PROVIDER, SEQUENCE, COMMENT, TYPE, INDEX, SECRET, TASK, CREATE FUNCTION | PROCEDURE and DROP MACRO have; every
+/// `CREATE OR ALTER` is the core's entry's).
 const CORE_WORDS: &[&[&str]] = &[
     &["SELECT"], &["WITH"], &["VALUES"], &["TABLE"], &["FROM"], &["INSERT"], &["UPDATE"], &["DELETE"], &["MERGE"], &["TRUNCATE"],
     &["GRANT"], &["REVOKE"], &["COPY"], &["ATTACH"], &["DETACH"], &["UNDROP"], &["BACKUP"], &["RESTORE"],
     &["INSTALL"], &["LOAD"], &["UNINSTALL"], &["CALL"], &["DO"], &["SET"], &["RESET"], &["SHOW"], &["DESCRIBE"], &["USE"],
     &["EXPLAIN"], &["BEGIN"], &["START"], &["COMMIT"], &["ROLLBACK"], &["END"], &["CHECKPOINT"], &["EXPORT"], &["IMPORT"],
     &["CREATE", "TABLE"], &["CREATE", "EXTERNAL"], &["CREATE", "VIEW"], &["CREATE", "MATERIALIZED"], &["CREATE", "SCHEMA"],
-    &["CREATE", "DATABASE"], &["CREATE", "FUNCTION"], &["CREATE", "PROCEDURE"], &["CREATE", "MACRO"], &["CREATE", "TASK"],
-    &["CREATE", "PIPELINE"], &["CREATE", "SECRET"], &["CREATE", "PERSISTENT"],
+    &["CREATE", "DATABASE"], &["CREATE", "MACRO"], &["CREATE", "PIPELINE"],
     &["ALTER", "TABLE"], &["ALTER", "VIEW"], &["ALTER", "MATERIALIZED"], &["ALTER", "SCHEMA"],
-    &["ALTER", "TASK"],
     &["DROP", "TABLE"], &["DROP", "VIEW"], &["DROP", "MATERIALIZED"], &["DROP", "SCHEMA"], &["DROP", "DATABASE"],
-    &["DROP", "FUNCTION"], &["DROP", "PROCEDURE"], &["DROP", "MACRO"], &["DROP", "TASK"],
-    &["DROP", "SECRET"], &["DROP", "PERSISTENT"], &["DROP", "TEMPORARY"],
+    &["DROP", "FUNCTION"], &["DROP", "PROCEDURE"], &["DROP", "TEMPORARY"],
 ];
 
 /// `words` without a CREATE's `OR REPLACE`, `TEMP` or `TEMPORARY` after its first word. (`OR ALTER` stays: the core's

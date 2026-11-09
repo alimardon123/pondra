@@ -82,6 +82,30 @@ static ENTRIES: &[Statement] = &[
     entry(&["CREATE", "OR", "REPLACE", "TYPE"], crate::types::read, "refused: a type's columns keep their labels"),
     entry(&["ALTER", "TYPE"], crate::types::read, "an enum's new label (ADD VALUE) or its name"),
     entry(&["DROP", "TYPE"], crate::types::read, "drops types"),
+    entry(&["CREATE", "SECRET"], secret, "a secret: what reading a place takes (CREATE SECRET s (TYPE s3, KEY_ID '…', SECRET '…'))"),
+    entry(&["CREATE", "OR", "REPLACE", "SECRET"], secret, "a secret, in place of one of its name"),
+    entry(&["CREATE", "PERSISTENT", "SECRET"], secret, "a secret, the lake's (as every secret not TEMP is)"),
+    entry(&["CREATE", "OR", "REPLACE", "PERSISTENT", "SECRET"], secret, "a secret, in place of one of its name"),
+    entry(&["CREATE", "TEMP", "SECRET"], secret, "a secret of the session's, in memory"),
+    entry(&["CREATE", "TEMPORARY", "SECRET"], secret, "a secret of the session's, in memory"),
+    entry(&["CREATE", "OR", "REPLACE", "TEMP", "SECRET"], secret, "a secret of the session's, in place of one of its name"),
+    entry(&["CREATE", "OR", "REPLACE", "TEMPORARY", "SECRET"], secret, "a secret of the session's, in place of one of its name"),
+    entry(&["DROP", "SECRET"], secret, "drops a secret"),
+    entry(&["DROP", "PERSISTENT", "SECRET"], secret, "drops a secret"),
+    entry(&["DROP", "TEMPORARY", "SECRET"], secret, "drops a secret"),
+    entry(&["CREATE", "FUNCTION"], routine, "a function: SQL, or Python (LANGUAGE python)"),
+    entry(&["CREATE", "OR", "REPLACE", "FUNCTION"], routine, "a function, in place of one of its name"),
+    entry(&["CREATE", "TEMP", "FUNCTION"], routine, "a function of the session's"),
+    entry(&["CREATE", "TEMPORARY", "FUNCTION"], routine, "a function of the session's"),
+    entry(&["CREATE", "OR", "REPLACE", "TEMP", "FUNCTION"], routine, "a function of the session's, in place of one of its name"),
+    entry(&["CREATE", "OR", "REPLACE", "TEMPORARY", "FUNCTION"], routine, "a function of the session's, in place of one of its name"),
+    entry(&["CREATE", "PROCEDURE"], routine, "a procedure: statements run in order, or Python"),
+    entry(&["CREATE", "OR", "REPLACE", "PROCEDURE"], routine, "a procedure, in place of one of its name"),
+    entry(&["CREATE", "TASK"], routine, "a task: a statement run on a schedule (ADR-045)"),
+    entry(&["CREATE", "OR", "REPLACE", "TASK"], routine, "a task, in place of one of its name"),
+    entry(&["ALTER", "TASK"], routine, "suspends or resumes a task"),
+    entry(&["DROP", "TASK"], routine, "drops a task"),
+    entry(&["DROP", "MACRO"], routine, "drops a macro (DuckDB's DROP MACRO [TABLE])"),
 ];
 
 /// A reader's own words for a form written wrong, after what it found: what a statement of the form is.
@@ -361,6 +385,27 @@ fn or_alter(w: &mut Words) -> Result<Stmt> {
     })
 }
 
+/// SECRET's statements, by ext's walk of their text (`ext::secret`), which reads each value as a string, a word or a number.
+fn secret(w: &mut Words) -> Result<Stmt> {
+    match crate::ext::secret(w.sql()) {
+        Some(s) => Ok(s),
+        None => bail!("{}", unread(w.sql(), "CREATE SECRET name (TYPE s3, KEY_ID '…', SECRET '…', SCOPE 's3://bucket') or DROP SECRET name")),
+    }
+}
+
+/// The routines' and the tasks' statements, by routines' walk of their text (`routines::statement`): a function's or
+/// procedure's body is read as Postgres and DuckDB write it.
+fn routine(w: &mut Words) -> Result<Stmt> {
+    match crate::routines::statement(w.sql()) {
+        Some(s) => Ok(s),
+        None if w.peek_word().as_deref() == Some("alter") => bail!("ALTER TASK name SUSPEND | RESUME"),
+        None => bail!("{}", unread(w.sql(), "CREATE [OR REPLACE] FUNCTION | PROCEDURE | TASK name …, DROP TASK | MACRO name")),
+    }
+}
+
+/// Why a walk found no statement in a text its entry's words begin: the parser's words, or the form.
+fn unread(sql: &str, form: &str) -> String { crate::parsed::generic(sql).err().map_or_else(|| form.to_string(), |e| e.to_string()) }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,7 +415,7 @@ mod tests {
     #[test]
     fn the_core_entries_on_stand_ins_are_counted() {
         let s = crate::registry::get().section::<Statements>();
-        assert_eq!((ENTRIES.len(), s.stand_ins()), (50, 62), "the core's 50, the sharing extension's 8 and the identity providers' 4");
+        assert_eq!((ENTRIES.len(), s.stand_ins()), (74, 86), "the core's 74, the sharing extension's 8 and the identity providers' 4");
     }
 
     /// COMMENT ON and CREATE OR ALTER, as `write::parse` reads them (each was `objects::statement`'s).

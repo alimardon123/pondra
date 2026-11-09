@@ -541,10 +541,15 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         return Some(s);
     }
     if let Some(s) = kinds.then(|| crate::ext::statement(sql)).flatten() {
-        return Some(s); // (CREATE SECRET: values of any kind; DROP SECRET)
+        return Some(s); // (COPY … INTO, Pondra's COPY forms, ATTACH … (TYPE …))
     }
-    if let Some(s) = kinds.then(|| crate::routines::statement(sql)).flatten() {
-        return Some(s); // (CREATE FUNCTION and PROCEDURE as Postgres writes them, CREATE TASK, DROP TASK, DROP MACRO)
+    #[cfg(test)]
+    if let Some(s) = kinds.then(|| was::secret(sql)).flatten() {
+        return Some(s); // (CREATE and DROP SECRET: the statements section's entries)
+    }
+    #[cfg(test)]
+    if let Some(s) = kinds.then(|| was::routines(sql)).flatten() {
+        return Some(s); // (CREATE FUNCTION and PROCEDURE as Postgres writes them, CREATE, ALTER and DROP TASK, DROP MACRO: entries)
     }
     #[cfg(test)]
     if let Some(s) = kinds.then(|| was::objects(sql)).flatten() {
@@ -2810,6 +2815,12 @@ pub(crate) mod was {
     /// `objects::statement`, where `parse` read it.
     pub(super) fn objects(sql: &str) -> Option<Stmt> { old().then(|| crate::objects::statement(sql)).flatten() }
 
+    /// `ext::secret`, where `parse` read it (in `ext::statement`).
+    pub(super) fn secret(sql: &str) -> Option<Stmt> { old().then(|| crate::ext::secret(sql)).flatten() }
+
+    /// `routines::statement`, where `parse` read it.
+    pub(super) fn routines(sql: &str) -> Option<Stmt> { old().then(|| crate::routines::statement(sql)).flatten() }
+
     /// `index::statement`, where `parse` read it.
     pub(super) fn index(sql: &str) -> Option<Stmt> { old().then(|| crate::index::statement(sql)).flatten() }
 
@@ -3038,6 +3049,14 @@ pub(crate) mod was {
             "CREATE UNIQUE INDEX ON visits (lower(path))", "CREATE INDEX clicks_lower_page ON clicks USING brin (lower(page)) WHERE page IS NOT NULL", "CREATE INDEX ON",
             "ALTER INDEX visits_page_idx RENAME TO visits_path", "ALTER INDEX IF EXISTS s.i RENAME TO s.j", "ALTER INDEX i SET TABLESPACE x", "DROP INDEX IF EXISTS a, b CASCADE",
             "DROP INDEX", "drop index i;",
+            "CREATE SECRET s (TYPE s3, KEY_ID 'k', SECRET 'x')", "create or replace temp secret s (type s3)", "CREATE PERSISTENT SECRET IF NOT EXISTS s (TYPE s3, REGION eu, PORT 9000)",
+            "CREATE OR REPLACE SECRET IF NOT EXISTS s (TYPE s3)", "CREATE SECRET s TYPE s3", "CREATE SECRET (TYPE s3)", "CREATE SECRET s (TYPE s3, KEY_ID)", "DROP SECRET IF EXISTS s",
+            "DROP PERSISTENT SECRET s", "DROP TEMPORARY SECRET s", "DROP SECRET",
+            "CREATE FUNCTION f(x INT) RETURNS INT RETURN x + 1", "CREATE OR REPLACE TEMP FUNCTION g(a INT) RETURNS INT LANGUAGE sql AS $$ SELECT a $$",
+            "CREATE FUNCTION IF NOT EXISTS h(x INT) RETURNS INT RETURN x", "CREATE OR REPLACE FUNCTION IF NOT EXISTS h(x INT) RETURNS INT RETURN x", "CREATE FUNCTION f",
+            "CREATE PROCEDURE p() AS BEGIN SELECT 1; END", "CREATE OR REPLACE PROCEDURE p() LANGUAGE python AS $$ pass $$",
+            "CREATE TASK t SCHEDULE '1 hour' AS INSERT INTO a SELECT 1", "CREATE TASK t", "ALTER TASK t SUSPEND", "alter task s.t resume;", "ALTER TASK t STOP",
+            "DROP TASK IF EXISTS t", "DROP MACRO TABLE IF EXISTS m", "drop macro m", "DROP MACRO",
         ] {
             assert_eq!(shown(&super::parse(sql)), shown(&was(sql)), "{sql}");
             assert!(crate::statements::moved(sql), "{sql}: an entry's");
@@ -3049,6 +3068,7 @@ pub(crate) mod was {
             ("ALTER VIEW v RENAME w", "expected TO near w (ALTER [MATERIALIZED] VIEW v RENAME TO w)"),
             ("ALTER MATERIALIZED VIEW m DETACH now", "unexpected words near now (ALTER MATERIALIZED VIEW v DETACH)"),
             ("CREATE TABLE c CLONE", "expected a name at the end (CREATE TABLE c [SHALLOW] CLONE t)"),
+            ("ALTER TASK", "ALTER TASK name SUSPEND | RESUME"),
             ("CREATE DATABASE b CLONE a WITH (schemas = s)", "expected ( near s (CREATE DATABASE b [LOCATION 'dir'] [CLONE a [WITH (schemas = (x, y))] [WITH NO DATA]])"),
         ] {
             assert_eq!(shown(&super::parse(sql)), format!("invalid {said}"), "{sql}");
