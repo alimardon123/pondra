@@ -1518,6 +1518,7 @@ pub fn default_publish() -> Vec<String> {
 
 const TAIL_BYTES: usize = 256 << 20; // decoded log segments kept in memory, per node
 const AHEAD: u64 = 256; // replicated acks: commits acknowledged before the bucket has them, at most
+const SLOW_COMMIT: Duration = Duration::from_secs(2); // a commit waiting this long is named (`Lake::commits`)
 
 const RECENT: Duration = Duration::from_secs(30); // replayed to (re)connecting followers…
 const RECENT_BYTES: usize = 64 << 20; // …within this much memory (past it, a reconnecting
@@ -2416,6 +2417,7 @@ impl Lake {
                 lake.cat.send(Frame::Durable(id));
             }
         });
+        let mut said: Option<Instant> = None; // (when a slow commit was last named: one a second at most)
         while let Some((handle, d, done, sent)) = writes.recv().await {
             let Some(lake) = me.upgrade() else { return };
             let cat = &lake.cat;
@@ -2428,6 +2430,7 @@ impl Lake {
             // (At most AHEAD commits are acknowledged ahead of the bucket: if it stalls, acks wait
             // for it, so what a failover has to recover — and could lose — stays bounded.)
             let close = *cat.durable.borrow() + AHEAD >= d.id;
+            let mut by = "its followers";
             loop {
                 if need > 0 && close && cat.holders(d.id) >= need {
                     break;
@@ -2438,10 +2441,17 @@ impl Lake {
                             eprintln!("catalog commit failed: {e}");
                             life.restart("a catalog commit failed", &[]);
                         }
+                        by = "the bucket";
                         break;
                     }
                     _ = acked.changed() => {}
                 }
+            }
+            // (every write's ack waits for its commit, in order: one slow here is a stall of all the
+            // writes behind it, named once a second at most, the bucket's slow request beside it: `budget::Gate::slow`)
+            if t.elapsed() >= SLOW_COMMIT && said.is_none_or(|s| s.elapsed() >= Duration::from_secs(1)) {
+                eprintln!("a commit waited {:.1} s for {by} (commit {}): the writes behind it waited with it", t.elapsed().as_secs_f64(), d.id);
+                said = Some(Instant::now());
             }
             let t = cat.stage("durable", t);
             if need == 0 {
