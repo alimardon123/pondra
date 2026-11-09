@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use datafusion::common::instant::Instant;
 use std::time::Duration;
 
-pub const TABLE: &str = "pondra$history"; // (commits only to it are quiet: `store::RECORDS`)
+pub const TABLE: &str = crate::records::HISTORY; // (commits only to it are quiet: `store::quiet`)
 
 /// What a statement's work noted while it ran: what it answered, where, and how.
 #[derive(Default)]
@@ -622,7 +622,7 @@ impl crate::lake_state::LakeState for Writers {
 /// Starts one of `lake`'s log writers, kept for `end_writers`: the node's own work (`auth::as_node`), whoever's lines
 /// it writes.
 pub(crate) fn keep(lake: &Lake, run: impl std::future::Future<Output = ()> + Send + 'static) {
-    kept(lake, crate::panics::own(run));
+    kept(lake, lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, run));
 }
 
 /// `keep`'s part that isn't its task's: one copy for every writer.

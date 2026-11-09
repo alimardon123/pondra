@@ -279,10 +279,11 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, by: crate::aut
     // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
     let go = crate::query::HELD.scope(Default::default(), scoped(named, vars.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(statement)))));
     // (`guard` gave this request its principal and its apply flag, outside this handler: a request whose answer is
-    // handed over runs on after it, and its history and audit still need who asked, so `auth::carried` takes WHO here)
+    // handed over runs on after it, and its history and audit still need who asked: the rest runs aside as its caller,
+    // `auth::caller`)
     let applying = crate::protect::APPLYING.try_with(|_| ()).is_ok();
     let applied = async move { if applying { crate::protect::APPLYING.scope((), go).await } else { go.await } };
-    let mut go = Box::pin(crate::query::traced(crate::auth::carried(crate::routines::with_notices(crate::python::holder(vars.is_some(), applied))))); // (a lent token's code holds a slot: what it calls takes none; boxed: a statement's future is big; traced with PONDRA_TRACE_QUERY)
+    let mut go = Box::pin(crate::query::traced(crate::routines::with_notices(crate::python::holder(vars.is_some(), applied)))); // (a lent token's code holds a slot: what it calls takes none; boxed: a statement's future is big; traced with PONDRA_TRACE_QUERY)
     let (out, heard) = tokio::select! {
         biased;
         done = &mut go => done,
@@ -290,7 +291,7 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, by: crate::aut
             // Its answer goes in pieces as its plan makes them (`query::send_rest`): the rest of the request, the
             // pieces and the statement's end, is polled on the queries' runtime while its client reads; the plan's
             // partition tasks stay where the prefix spawned them. The node may still stop it for memory (`oom.rs`).
-            crate::spawns::aside(crate::panics::work(&node, true, go));
+            node.tasks.aside(crate::auth::caller(), crate::panics::work(&node, true, go));
             return Said { reply: Ok(Reply::Rendered(Rendered::Pieces(h))), heard: vec![], session };
         }
     };
@@ -354,7 +355,7 @@ fn answer(batches: &[RecordBatch], p: &SqlParams, lake: &crate::store::Lake) -> 
     let keep = |b: &[RecordBatch]| crate::pages::keep(lake, b); // (a typed answer's rows, kept by its lake for their later pages)
     match (p.format.as_deref(), p.rows) {
         (Some("typed"), Some(n)) => Ok(Rendered::Whole(crate::answer::typed(batches, n.clamp(1, crate::answer::MOST), &keep)?.into())),
-        (format, _) if crate::answer::streams(format) && big(batches) => Ok(Rendered::Pieces(crate::query::hand_out(batches.to_vec(), format, crate::query::take_held())?)),
+        (format, _) if crate::answer::streams(format) && big(batches) => Ok(Rendered::Pieces(crate::query::hand_out(batches.to_vec(), format, crate::query::take_held(), &lake.node)?)),
         (format, _) => Ok(Rendered::Whole(crate::answer::render(batches, format, &keep)?)),
     }
 }
