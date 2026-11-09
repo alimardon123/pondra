@@ -149,8 +149,10 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
     let mut who = crate::auth::Principal { epoch, ..crate::auth::Principal::of(if app.open().await { Role::Admin } else { Role::None }) }.at("kafka", from);
     let mut said = (who.role > Role::None).then_some(Said::Open); // (how it signed in, to check again: `again`)
     while let Ok(size) = rd.read_i32().await {
-        if let Some(s) = said.as_ref().filter(|_| who.stale(&app.lake)) {
-            who = again(&app, s).await.at("kafka", from);
+        if let Some(s) = said.as_ref() {
+            if let Some(now) = who.again(&app, || again(&app, s)).await {
+                who = now.unwrap_or_else(|_| crate::auth::Principal::of(Role::None)).at("kafka", from); // (signed out: its next request is refused)
+            }
         }
         let most = if who.role == Role::None { 1 << 20 } else { 128 << 20 }; // (before signing in: ApiVersions, SASL and Metadata, all small)
         ensure!((0..=most).contains(&size), "request of {size} bytes");
@@ -178,22 +180,21 @@ enum Said {
     Bearer(String),
 }
 
-/// Who a connection that signed in (`was`) is now, checked again at its next request once who may do what changed or its
-/// credential ended (`Principal::stale`; 11-02 audit H3): its user dropped, made no superuser or its grants taken back,
-/// its password changed, its token or session expired, and it is nobody, so its next fetch or produce ends the
+/// Whoever a connection that signed in as `said` says signs in now, asked at its next request once who may do what changed
+/// or its credential ended (`Principal::again`; 11-02 audit H3): its user dropped, made no superuser or its grants taken
+/// back, its password changed, its token or session expired, and it is nobody, so its next fetch or produce ends the
 /// connection; signed in at an open node, once the node is open no more. (A password is hashed at most once a minute:
 /// `users::password_ok` remembers it.)
-async fn again(app: &App, said: &Said) -> crate::auth::Principal {
-    let epoch = app.lake.cat.rights_version(); // (before it is asked again, as at sign-in)
+async fn again(app: &App, said: &Said) -> std::result::Result<crate::auth::Principal, String> {
     let now = match said {
         Said::Open => app.open().await.then(|| crate::auth::Principal::of(Role::Admin)),
         Said::Plain(user, password) => crate::users::sign_in(&app.lake, &app.auth, user, password).await,
         Said::Bearer(token) => crate::users::who(&app.lake, &app.auth, &crate::auth::Credential::Token(token.clone())).await,
     };
-    match now {
-        Some(p) => crate::auth::Principal { epoch: p.epoch.max(epoch), ..p },
-        None => crate::auth::Principal::of(Role::None),
-    }
+    now.ok_or_else(|| match said {
+        Said::Open => "the lake now signs its users in (CREATE USER, or a token): connect again and sign in".to_string(),
+        _ => "it can't sign in any more (dropped, NOLOGIN, its password changed, or its token revoked or ended)".to_string(),
+    })
 }
 
 async fn request(app: &App, me: &Broker, who: &mut crate::auth::Principal, said: &mut Option<Said>, peer: &crate::tls::Peer, buf: Bytes) -> Result<Reply> {
@@ -847,22 +848,63 @@ fn write_sent(out: &mut Vec<u8>, v: &Value, sent: Option<&RawValue>) -> Result<(
 /// microseconds, a BYTEA base64. Each such value becomes what the column takes: a decimal's digits, a
 /// time in the column's own unit, a binary in hex (as the JSON reader reads it). The rest is kept as sent
 /// (a `ZonedTimestamp` is already text, a `Date` days). The rows are the struct's own fields, or, in
-/// Debezium's envelope, `before`'s and `after`'s.
+/// Debezium's envelope, `before`'s and `after`'s; a value inside a column is typed as its own field or item is
+/// (`fit`).
 fn typed(schema: &Value, v: &mut Value, target: &Schema) -> Result<()> {
     let (Some(fields), Some(row)) = (schema.get("fields").and_then(Value::as_array), v.as_object_mut()) else { return Ok(()) };
     for f in fields {
         let Some(name) = f.get("field").and_then(Value::as_str) else { continue };
         let Some(x) = row.get_mut(name).filter(|x| !x.is_null()) else { continue };
-        let logical = f.get("name").and_then(Value::as_str).unwrap_or_default();
-        if f.get("type").and_then(Value::as_str) == Some("struct") && logical != "io.debezium.data.VariableScaleDecimal" {
-            if matches!(name, "before" | "after") {
-                typed(f, x, target)?;
-            }
+        if record(f) && matches!(name, "before" | "after") {
+            typed(f, x, target)?; // (Debezium's envelope: its rows are the table's)
             continue;
         }
         if let Ok(c) = target.field_with_name(name) {
-            *x = connect_value(f, logical, x, c.data_type()).map_err(|e| anyhow!("column {name}: {e}"))?;
+            fit(f, x, c.data_type()).map_err(|e| anyhow!("column {name}: {e}"))?;
         }
+    }
+    Ok(())
+}
+
+/// Is `f` a Connect struct of fields: not a value Debezium sends as one (`VariableScaleDecimal`)?
+fn record(f: &Value) -> bool {
+    f.get("type").and_then(Value::as_str) == Some("struct") && f.get("name").and_then(Value::as_str) != Some("io.debezium.data.VariableScaleDecimal")
+}
+
+/// `x`, sent as Connect's schema `f` says, as a value of `ty` takes it: a struct's fields, an array's items and a map's
+/// values each as its own (an `ARRAY<TIMESTAMP>` of milliseconds, a Decimal inside a struct: 11-09 audit M5), any other
+/// value by its logical type (`connect_value`). A struct into a column that isn't one is kept as sent.
+fn fit(f: &Value, x: &mut Value, ty: &DataType) -> Result<()> {
+    if x.is_null() {
+        return Ok(());
+    }
+    match (f.get("type").and_then(Value::as_str), ty) {
+        (Some("struct"), DataType::Struct(columns)) if record(f) => {
+            let (Some(fields), Some(o)) = (f.get("fields").and_then(Value::as_array), x.as_object_mut()) else { return Ok(()) };
+            for g in fields {
+                let Some(name) = g.get("field").and_then(Value::as_str) else { continue };
+                if let (Some(y), Some((_, c))) = (o.get_mut(name), columns.find(name)) {
+                    fit(g, y, c.data_type()).map_err(|e| anyhow!("field {name}: {e}"))?;
+                }
+            }
+        }
+        (Some("array"), DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) | DataType::ListView(item) | DataType::LargeListView(item)) => {
+            let (Some(items), Some(a)) = (f.get("items"), x.as_array_mut()) else { return Ok(()) };
+            for y in a {
+                fit(items, y, item.data_type())?;
+            }
+        }
+        (Some("map"), DataType::Map(entries, _)) => {
+            // (a map of text keys is a JSON object; one of other keys, a list of pairs, is kept as sent)
+            let (Some(values), Some(o), DataType::Struct(kv)) = (f.get("values"), x.as_object_mut(), entries.data_type()) else { return Ok(()) };
+            let Some(value) = kv.get(1) else { return Ok(()) };
+            for y in o.values_mut() {
+                fit(values, y, value.data_type())?;
+            }
+        }
+        (Some("array" | "map"), _) => {} // (into a column that isn't one: as sent)
+        (Some("struct"), _) if record(f) => {}
+        _ => *x = connect_value(f, f.get("name").and_then(Value::as_str).unwrap_or_default(), x, ty)?,
     }
     Ok(())
 }
@@ -1826,6 +1868,52 @@ mod tests {
         let mut line = vec![];
         write_row(&mut line, &serde_json::json!({"a": [1500.0], "s": {"t": [0.1, "a"], "x": 1500.0}}), Some(r#"{"s": {"x": 1.5e3, "t": [1e-1, "a"]}, "a": [1.5e3]}"#)).unwrap();
         assert_eq!(String::from_utf8(line).unwrap(), r#"{"a":[1.5e3],"s":{"t":[1e-1,"a"],"x":1.5e3}}"#, "at every depth");
+    }
+
+    /// A value inside a column is typed as its own field or item says (11-09 audit M5): an `ARRAY<TIMESTAMP>` of Connect's
+    /// milliseconds or Debezium's nanoseconds, a Decimal, a time and a struct inside a struct, a map's values. As sent,
+    /// the JSON reader took milliseconds for the column's microseconds, with nothing said.
+    #[test]
+    fn nested_values_are_typed_as_their_own_fields_and_items() {
+        use datafusion::arrow::array::{Array, AsArray};
+        use datafusion::arrow::datatypes::{Field, Fields, TimeUnit, TimestampMicrosecondType};
+        let micros = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let inner = Fields::from(vec![Field::new("t", DataType::Time64(TimeUnit::Nanosecond), true)]);
+        let s = Fields::from(vec![Field::new("amount", DataType::Decimal128(10, 2), true), Field::new("at", micros.clone(), true), Field::new("inner", DataType::Struct(inner), true)]);
+        let entries = Field::new("entries", DataType::Struct(Fields::from(vec![Field::new("key", DataType::Utf8, false), Field::new("value", micros.clone(), true)])), false);
+        let target = Schema::new(vec![
+            Field::new("ts", DataType::List(Arc::new(Field::new("item", micros.clone(), true))), true),
+            Field::new("ns", DataType::List(Arc::new(Field::new("item", micros.clone(), true))), true),
+            Field::new("s", DataType::Struct(s), true),
+            Field::new("m", DataType::Map(Arc::new(entries), false), true),
+            Field::new("j", DataType::Utf8, true),
+        ]);
+        let stamp = serde_json::json!({"type": "int64", "name": "org.apache.kafka.connect.data.Timestamp"});
+        let schema = serde_json::json!({"type": "struct", "fields": [
+            {"type": "array", "items": stamp, "field": "ts"},
+            {"type": "array", "items": {"type": "int64", "name": "io.debezium.time.NanoTimestamp"}, "field": "ns"},
+            {"type": "struct", "fields": [
+                {"type": "bytes", "name": "org.apache.kafka.connect.data.Decimal", "parameters": {"scale": "2"}, "field": "amount"},
+                {"type": "int64", "name": "org.apache.kafka.connect.data.Timestamp", "field": "at"},
+                {"type": "struct", "fields": [{"type": "int32", "name": "io.debezium.time.Time", "field": "t"}], "field": "inner"}], "field": "s"},
+            {"type": "map", "keys": {"type": "string"}, "values": stamp, "field": "m"},
+            {"type": "array", "items": stamp, "field": "j"}]});
+        let sent = serde_json::json!({"ts": [1788256800123i64, null], "ns": [1788256800123456789i64], "s": {"amount": "BBo=", "at": 1788256800123i64, "inner": {"t": 45296789}},
+            "m": {"a": 1788256800123i64}, "j": [1788256800123i64]});
+        let mut row = sent.clone();
+        typed(&schema, &mut row, &target).unwrap();
+        assert_eq!(row, serde_json::json!({"ts": [1788256800123000i64, null], "ns": [1788256800123456i64],
+            "s": {"amount": "10.50", "at": 1788256800123000i64, "inner": {"t": 45296789000000i64}}, "m": {"a": 1788256800123000i64}, "j": [1788256800123i64]}),
+            "each as its own; an array into a column that isn't one, as sent");
+        // (read as the topic's rows are: the instant sent, 2026-09-01 10:00:00.123; as sent, 1970-01-21)
+        let read = |v: &Value| crate::json_rows::from_json(format!("{}\n", serde_json::json!({"ts": v["ts"]})).as_bytes(), &Arc::new(Schema::new(vec![target.field(0).clone()]))).unwrap();
+        let first = |b: RecordBatch| b.column(0).as_list::<i32>().value(0).as_primitive::<TimestampMicrosecondType>().value(0);
+        assert_eq!(first(read(&row)), 1788256800123000);
+        assert_eq!(first(read(&sent)), 1788256800123, "as sent: milliseconds read as microseconds");
+        assert!(read(&row).column(0).as_list::<i32>().value(0).is_null(1));
+        // A Decimal inside a struct that isn't base64 is refused, as at the top.
+        let mut bad = serde_json::json!({"s": {"amount": "not base64!"}});
+        assert!(typed(&schema, &mut bad, &target).unwrap_err().to_string().contains("column s: field amount"));
     }
 
     #[test]

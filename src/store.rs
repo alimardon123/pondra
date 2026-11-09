@@ -5,7 +5,7 @@
 //! moment it is durable, and they lay those changes over their own (slightly behind) view of the
 //! catalog: every node sees a commit within milliseconds, while the bucket stays the source of truth.
 use anyhow::{bail, Context, Result};
-use crate::{finish::Finish, seq::Identity, types::Enum}; // (catalog uses engine: counted once each, tools/layers.py)
+use crate::table_record::{Enum, Finish, Identity};
 use bytes::Bytes;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -1480,7 +1480,7 @@ pub fn kept_ms(producer: &str, now: u64) -> u64 {
 /// - any other `auto-…` id: the clients' own ids (`log::auto_job`, an older client's `auto-{producer}-{n}`, and the
 ///   Python client's `producer=`, which is the user's own name, so an `auto-` name a user picks lands here too): the
 ///   retry window, whatever follows the prefix;
-/// - any other job: a name a client chose, which is kept for the named window (`copy::retention_ms`).
+/// - any other job: a name a client chose, which is kept for the named window (`retention_ms`).
 fn job_kept(job: &str, now: u64) -> u64 {
     if let Some(until_s) = client_until(job) {
         let left = until_s.saturating_mul(1000).saturating_sub(now);
@@ -1489,7 +1489,14 @@ fn job_kept(job: &str, now: u64) -> u64 {
     if job.starts_with("auto-") {
         return retry_ms();
     }
-    crate::copy::retention_ms()
+    retention_ms()
+}
+
+/// How long a named job's mark is kept (`job_kept`), and so a file's load record (`copy::Load`, whose job is named):
+/// Snowflake's 64 days of load metadata. `PONDRA_LOAD_RETENTION_SECS` shortens it, for tests; it is read once.
+pub fn retention_ms() -> u64 {
+    static NAMED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NAMED.get_or_init(|| crate::env::secs("PONDRA_LOAD_RETENTION_SECS").as_millis() as u64)
 }
 
 /// The most a mark is kept for its client's deadline (`job_kept`): a day.
@@ -1611,7 +1618,7 @@ pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
 /// The cap is the free space when the first spill makes the disk, less the room a lake keeps, or the
 /// setting in GB; it is looked at again as queries start (`spill_room`). `0` turns spilling off: a
 /// query that needs it is refused (53200). A negative setting is no setting.
-fn spill_disk(scratch: &dyn crate::scratch::Scratch) -> DiskManagerBuilder { spill_disk_merging(scratch, spill_fan_in().unwrap_or_else(|| merge_files(partitions()))) }
+fn spill_disk(scratch: &dyn crate::scratch::Scratch, partitions: usize) -> DiskManagerBuilder { spill_disk_merging(scratch, spill_fan_in().unwrap_or_else(|| merge_files(partitions))) }
 
 /// `spill_disk` on `scratch` (a lake's node's, `NodeState::scratch`), its merges reading at most `fan_in` spilled runs at once.
 fn spill_disk_merging(scratch: &dyn crate::scratch::Scratch, fan_in: usize) -> DiskManagerBuilder {
@@ -1653,14 +1660,16 @@ fn merge_fan_in(memory: usize, partitions: usize) -> usize { (memory / partition
 
 /// `ctx` with the spill disk of the sorts that feed a window (their merges read `merge_fan_in` runs at once) in place of
 /// the lake's; the pool, the caches and the stores as they are. `held::HeldInExec` runs its input on it. The disk is made
-/// once for the process, as its spill folder is; spills off, or a disk that can't be made, leave `ctx` as it is.
+/// once for the process for each fan-in, as its spill folder is, which the node's memory for queries gives
+/// (`env::NodeMemory`); spills off, or a disk that can't be made, leave `ctx` as it is.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn window_sorts(ctx: Arc<datafusion::execution::TaskContext>) -> Arc<datafusion::execution::TaskContext> {
-    static DISK: std::sync::OnceLock<Option<Arc<DiskManager>>> = std::sync::OnceLock::new();
-    let disk = DISK.get_or_init(|| {
-        let fan_in = spill_fan_in().unwrap_or_else(|| merge_fan_in(memory_limit(), partitions()));
+    static DISKS: Mutex<BTreeMap<usize, Option<Arc<DiskManager>>>> = Mutex::new(BTreeMap::new());
+    let memory = crate::env::node_memory_of(ctx.session_config(), memory_limit);
+    let fan_in = spill_fan_in().unwrap_or_else(|| merge_fan_in(memory, partitions_of(memory)));
+    let disk = DISKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(fan_in).or_insert_with(|| {
         (spill_gb() != Some(0.0)).then(|| spill_disk_merging(crate::scratch::process(), fan_in).build().ok().map(Arc::new)).flatten()
-    });
+    }).clone();
     let Some(disk) = disk else { return ctx };
     let built = RuntimeEnvBuilder { disk_manager: Some(disk.clone()), ..RuntimeEnvBuilder::from_runtime_env(&ctx.runtime_env()) }.build_arc();
     let Ok(rt) = built else { return ctx };
@@ -1905,8 +1914,8 @@ pub fn memory_limit() -> usize {
 
 /// The process's line for every node's queries together (`ledger::Root`): its whole line (`root_whole`) where there is one,
 /// else 4 GiB; on a page, its device's line's trim line, as a node's is (`env::page_line_share`). A node's own `PONDRA_MEMORY_GB` is its
-/// budget on it (`memory_limit`), never the process's. Where no stop line watches the process (a host's, whose memory is the
-/// host's, or `PONDRA_MEMORY_MAX_GB=0`), the queries keep a third of the machine's memory at most (`oom::roots`).
+/// budget on it (`memory_limit`), never the process's. Where no stop line watches the process (`PONDRA_MEMORY_MAX_GB=0`), the
+/// queries keep a third of the machine's memory at most (`oom::roots`).
 fn root_line() -> usize {
     #[cfg(target_arch = "wasm32")]
     return crate::env::page_line_share(crate::machine::process().line());
@@ -1936,16 +1945,25 @@ pub(crate) fn ledgers() -> Vec<Arc<crate::ledger::Ledger>> {
 /// shares, made with the node's first lake on the process's root (`ledger::root`). The budget is the node's own
 /// `PONDRA_MEMORY_GB` (`NodeState::settings`, as it started) where it is set, its queries and caches together; else the
 /// root's lines. Past the whole line a grow takes cache bytes back, and a spiller they don't make room for spills.
-fn lake_pool(node: &NodeState) -> Arc<crate::ledger::LakePool> {
-    let budget = node.line.get_or_init(|| {
+fn lake_pool(node: &NodeState) -> Arc<crate::ledger::LakePool> { budget(node).pool() }
+
+/// The node's budget of the process's memory, made with its first lake's pool (`lake_pool`) or its first look at its
+/// memory (`node_memory`).
+fn budget(node: &NodeState) -> &Arc<crate::ledger::Ledger> {
+    node.line.get_or_init(|| {
         let root = crate::ledger::root(root_line(), root_whole());
         match node.settings.gib("PONDRA_MEMORY_GB") { // (the node's own budget, as it started: two nodes in a process may differ)
             Some(set) => crate::ledger::Ledger::on(&root, set, set),
             None => crate::ledger::Ledger::on(&root, root.line(), root.whole()),
         }
-    });
-    budget.pool()
+    })
 }
+
+/// How much memory a node's queries may use: its budget's line (`budget`: its own `PONDRA_MEMORY_GB` as it started, else
+/// the process's line), which what sizes itself by the queries' memory goes by where the node is at hand (11-09 audit
+/// M9): its hot columns on a page, its lakes' sessions (`env::NodeMemory`) and partitions (`partitions_of`).
+/// `memory_limit` is the process's, for a reader with no node.
+pub fn node_memory(node: &NodeState) -> usize { budget(node).line() }
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
 
@@ -2382,7 +2400,7 @@ impl Lake {
         use datafusion::execution::cache::cache_manager::{CacheManagerConfig, DEFAULT_FILE_STATISTICS_MEMORY_LIMIT, DEFAULT_METADATA_CACHE_LIMIT};
         let kept = (Arc::new(Footers::new(DEFAULT_METADATA_CACHE_LIMIT).with_name("DefaultFileMetadataCache")), Arc::new(FileStatistics::new(DEFAULT_FILE_STATISTICS_MEMORY_LIMIT).with_name("DefaultFileStatisticsCache")));
         let caches = CacheManagerConfig::default().with_list_files_cache_limit(0).with_file_metadata_cache(Some(kept.0.clone())).with_file_statistics_cache(Some(kept.1.clone()));
-        let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).with_cache_manager(caches).with_disk_manager_builder(spill_disk(node.scratch.as_ref())).build_arc()?;
+        let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).with_cache_manager(caches).with_disk_manager_builder(spill_disk(node.scratch.as_ref(), node_partitions(&node))).build_arc()?;
         let disk = bucket.as_ref().filter(|_| !memory).and_then(|_| disk_tier(&url, &store, &node));
         let mut cached_store = None;
         if let Some((bucket_url, held)) = bucket.as_ref().filter(|_| memory) {
@@ -2429,7 +2447,7 @@ impl Lake {
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::frozen::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
         let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), kept, disk, manifests: crate::manifest::kept(), format, log: Default::default(), states: Default::default(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), node });
-        lake.states.open(crate::registry::get(), &crate::lake_state::Opening { memory, ram: lake.node.machine.ram() }); // (the caches every query reads, charged next among the lake's own)
+        lake.states.open(crate::registry::get(), &crate::lake_state::Opening { memory, ram: lake.node.machine.ram(), queries: node_memory(&lake.node) }); // (the caches every query reads, charged next among the lake's own)
         for (name, cache) in lake.caches() {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
@@ -2656,12 +2674,16 @@ impl Lake {
         Ok(())
     }
 
+    /// How many partitions a query of this lake runs in: its node's (`partitions_of` its memory, `node_memory`).
+    pub fn partitions(&self) -> usize { node_partitions(&self.node) }
+
     /// A session made from nothing, with everything every query's session has: every function set in the registry
     /// (`engine::session`). On a page every plan it makes runs its partitions in the page's task, as the page's own
     /// session's do (`in_task::planned`): a page has no runtime to start a partition's task on, and a plan of one
     /// partition still merges more than one below it. Plans made by hand from it (`fresh.rs`) are planned by it too.
     pub(crate) fn made(&self, partitions: usize) -> datafusion::prelude::SessionContext {
         let config = datafusion::prelude::SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::naming::lake_name(self), crate::text::PUBLIC);
+        let config = config.with_extension(Arc::new(crate::env::NodeMemory(node_memory(&self.node)))); // (what sizes itself by it: `env::NodeMemory`)
         let ctx = crate::engine::session(config, self.rt.clone());
         #[cfg(target_arch = "wasm32")]
         let ctx = crate::in_task::planned(ctx);
@@ -2672,7 +2694,7 @@ impl Lake {
     pub fn memory(&self) -> (usize, usize) {
         match self.ledger() {
             Some(ledger) => (ledger.reserved(), ledger.line()),
-            None => (self.rt.memory_pool.reserved(), memory_limit()),
+            None => (self.rt.memory_pool.reserved(), node_memory(&self.node)),
         }
     }
 
@@ -4354,18 +4376,24 @@ pub fn crash_rolled(point: &str) -> bool {
 /// spmd.rs), and at most one per 24 MB of query memory. Each partition's sort keeps 10 MB aside to
 /// merge what it spilled (DataFusion's default); on 4 cores with 50 MB the reserves took the
 /// budget and the merge above them failed, and smaller reserves can't merge at all.
-pub fn partitions() -> usize {
-    static PARTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); // (every session asks: the cores are read from the cgroup's files)
-    *PARTS.get_or_init(|| {
-        #[cfg(target_arch = "wasm32")]
-        return 1; // (a page has one thread and no runtime to start a partition's task on: `in_task.rs`)
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let cores = crate::env::parse("PONDRA_CORES").unwrap_or_else(crate::env::cores);
-            cores.min(memory_limit() / (24 << 20)).max(2)
-        }
-    })
+/// This is of `memory` for queries: a lake's are its node's (`Lake::partitions`, of `node_memory`), and a reader with no
+/// node takes the process's (`memory_limit`).
+pub fn partitions_of(memory: usize) -> usize {
+    #[cfg(target_arch = "wasm32")]
+    return {
+        let _ = memory;
+        1 // (a page has one thread and no runtime to start a partition's task on: `in_task.rs`)
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); // (every session asks: the cores are read from the cgroup's files)
+        let cores = *CORES.get_or_init(|| crate::env::parse("PONDRA_CORES").unwrap_or_else(crate::env::cores));
+        cores.min(memory / (24 << 20)).max(2)
+    }
 }
+
+/// A node's partitions: `partitions_of` its memory for queries (`node_memory`).
+pub fn node_partitions(node: &NodeState) -> usize { partitions_of(node_memory(node)) }
 
 #[cfg(test)]
 mod tests {
@@ -4872,6 +4900,26 @@ mod tests {
         assert!(Arc::ptr_eq(&budget(&one), &a), "a node's lakes share the budget its first one made");
     }
 
+    /// What sizes itself by the queries' memory goes by its node's, not the process's (11-09 audit M9): a lake of a node
+    /// given 0.25 GB reads that line, its sessions carry it (`env::NodeMemory`) in its partitions, and its `string_agg`
+    /// refuses a group of 10 MB, past an eighth of a partition's share of it, which the process's memory would hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lake_goes_by_its_nodes_memory_not_the_processes() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-node-memory-{}", uuid::Uuid::new_v4()));
+        let node = crate::node_state::NodeState::starting(crate::lifecycle::unhosted(), crate::settings::Values::of(&[("PONDRA_MEMORY_GB", "0.25")]));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, node.clone()).await?;
+        assert_eq!((node_memory(&node), lake.memory().1), (1 << 28, 1 << 28), "the node's own line");
+        let ctx = lake.session();
+        assert_eq!(crate::env::node_memory_of(ctx.state_ref().read().config(), || 0), 1 << 28, "its sessions carry it");
+        assert_eq!((lake.partitions(), ctx.state_ref().read().config().target_partitions()), (partitions_of(1 << 28), partitions_of(1 << 28)));
+        let long = "SELECT length(string_agg(repeat('x', 1000), ',')) AS n FROM generate_series(1, 10000)";
+        let e = match ctx.sql(long).await { Ok(df) => df.collect().await.map(|_| ()), Err(e) => Err(e) }.expect_err("a group past the node's cap").to_string();
+        assert!(e.contains("one group's string_agg passed"), "{e}");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// A lake's caches are charged to its line as it opens, so the node's memory watch takes memory back from them all:
     /// here the tables' tails, after the hot columns and the lookups' row groups, which hold nothing yet.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5059,7 +5107,7 @@ mod tests {
         if spill_gb() == Some(0.0) {
             return; // (spilling is off: there is no spill disk to make)
         }
-        let m = Arc::new(spill_disk(crate::scratch::process()).build().expect("a spill disk"));
+        let m = Arc::new(spill_disk(crate::scratch::process(), partitions_of(memory_limit())).build().expect("a spill disk"));
         assert!(m.temp_dir_paths().is_empty(), "no directory before a spill");
         assert!(m.tmp_files_enabled());
         let f = m.create_tmp_file("a test").expect("a spill file");

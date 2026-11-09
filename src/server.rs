@@ -687,7 +687,7 @@ async fn records(State(app): State<App>, headers: axum::http::HeaderMap, who: Op
 /// change, and a stream whose rights don't move costs no catalog read or password check (11-08 audit M7; 11-01 H4, 11-02 H3
 /// and 11-03 H1 before). `who` is the caller its door signed in, given now, since the stream is polled after the request. A
 /// node, a token and the program that started this node never end.
-pub(crate) fn until_revoked(app: App, who: Option<crate::auth::Principal>, operator: bool, header: Option<String>, still: impl Fn(&crate::auth::Principal) -> bool + Send + 'static) -> impl std::future::Future<Output = ()> + Send + 'static {
+pub(crate) fn until_revoked(app: App, who: Option<crate::auth::Principal>, operator: bool, header: Option<String>, still: impl Fn(&crate::auth::Principal) -> bool + Send + Sync + 'static) -> impl std::future::Future<Output = ()> + Send + 'static {
     async move {
         if operator || who.as_ref().is_some_and(|w| w.operator) {
             return futures::future::pending().await;
@@ -695,18 +695,22 @@ pub(crate) fn until_revoked(app: App, who: Option<crate::auth::Principal>, opera
         let mut who = who.unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None)); // (nothing signed: asked once the rights move)
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            if !who.stale(&app.lake) {
-                continue;
-            }
-            let epoch = app.lake.cat.rights_version(); // (before it is asked again, as at sign-in: a change meanwhile is seen next time)
-            let signed = match &header {
-                Some(h) => crate::users::who(&app.lake, &app.auth, &crate::auth::Credential::of_header(Some(h))).await.filter(|p| still(p)),
-                None => None,
-            };
-            who = match signed {
-                Some(p) => crate::auth::Principal { epoch: p.epoch.max(epoch), ..p },
-                None if app.open().await => crate::auth::Principal { epoch, ..who }, // (an open node's anyone, until it signs its users in)
-                None => return,
+            let now = who.again(&app, || async {
+                let signed = match &header {
+                    Some(h) => crate::users::who(&app.lake, &app.auth, &crate::auth::Credential::of_header(Some(h))).await,
+                    None => None,
+                };
+                match signed {
+                    Some(p) if still(&p) => Ok(p),
+                    _ if app.open().await => Ok(who.clone()), // (an open node's anyone, until it signs its users in)
+                    Some(_) => Err("it may no longer have this answer (a grant taken back, or a superuser no more)".to_string()),
+                    None => Err("it can't sign in any more (dropped, NOLOGIN, its password changed, or its token revoked or ended)".to_string()),
+                }
+            });
+            who = match now.await {
+                None => continue,
+                Some(Ok(p)) => p,
+                Some(Err(_)) => return,
             };
         }
     }
