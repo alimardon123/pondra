@@ -455,6 +455,29 @@ quota: ann's statements run at most 1 s (STATEMENT_TIMEOUT); this one was stoppe
 A write stopped this way may still land if it was already committing, as with Postgres's
 `statement_timeout` on a remote commit.
 
+A role's options reach its members, and the tightest wins: a member runs at most the fewest
+statements at once, each for the shortest time, that it, a role it holds or `public` sets, so
+nothing a member sets lifts a role's (each member's statements are counted on their own). One more
+option makes a role an agent's guardrail: **`READ ONLY`**, which reads and writes nothing to the
+lake, whatever it is granted, at every door. Its session's temporary tables and `$variables` still
+work, and a `CALL` runs, each of its statements checked as the caller's. `READ WRITE` takes it back.
+
+```python
+admin.sql("CREATE ROLE agent READ ONLY MAX_QUERIES 4")
+admin.sql("GRANT INSERT ON notes TO ann")
+admin.sql("GRANT agent TO ann")
+print(attempt_as(ann, "INSERT INTO notes VALUES (3, 'third')"))
+print(attempt_as(ann, "SELECT count(*) AS n FROM notes"))
+admin.sql("REVOKE agent FROM ann")
+print(attempt_as(ann, "INSERT INTO notes VALUES (3, 'third')"))
+```
+
+```text
+permission denied: ann is READ ONLY (an option of its own or of a role it holds), so it may not write
+ran
+ran
+```
+
 ## The audit log
 
 **`pondra.audit`** says who did what, through which door and from where, and what came of it.
@@ -481,6 +504,7 @@ for row in admin.sql("""SELECT "user", door, class, statement, outcome FROM pond
 {'user': 'ann', 'door': 'http', 'class': 'write', 'statement': "INSERT INTO notes VALUES (2, 'second')", 'outcome': 'refused'}
 {'user': 'admin', 'door': 'http', 'class': 'role', 'statement': "CREATE TOKEN nightly FOR USER ann EXPIRES IN '***'", 'outcome': 'ok'}
 {'user': 'admin', 'door': 'http', 'class': 'role', 'statement': "ALTER USER ann MAX_QUERIES 2 STATEMENT_TIMEOUT '***'", 'outcome': 'ok'}
+{'user': 'ann', 'door': 'http', 'class': 'write', 'statement': "INSERT INTO notes VALUES (3, 'third')", 'outcome': 'refused'}
 ```
 
 Each row also has the time (`at`), the address it came from (`from`), the error (`message`), how

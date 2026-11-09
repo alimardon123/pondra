@@ -939,8 +939,8 @@ offer …`); a later 1.x keeps offering these, so a file built for this one keep
 
 | Statement | Syntax |
 |---|---|
-| Make a user or a role | `CREATE USER [IF NOT EXISTS] name [WITH] [PASSWORD 'at least 8'] [SUPERUSER] [MAX_QUERIES n] [STATEMENT_TIMEOUT '5 minutes']`, `CREATE ROLE name` |
-| Change one | `ALTER USER name [WITH] PASSWORD '…' \| SUPERUSER \| NOSUPERUSER \| MAX_QUERIES n \| STATEMENT_TIMEOUT '…'` (`0`: no limit); `ALTER ROLE` takes the same words |
+| Make a user or a role | `CREATE USER [IF NOT EXISTS] name [WITH] [PASSWORD 'at least 8'] [SUPERUSER] [MAX_QUERIES n] [STATEMENT_TIMEOUT '5 minutes'] [READ ONLY]`, `CREATE ROLE name [WITH] [MAX_QUERIES n] [STATEMENT_TIMEOUT '…'] [READ ONLY]` (each option once, in any order) |
+| Change one | `ALTER USER name [WITH] PASSWORD '…' \| SUPERUSER \| NOSUPERUSER \| MAX_QUERIES n \| STATEMENT_TIMEOUT '…' \| READ ONLY \| READ WRITE` (`0`: no limit); `ALTER ROLE` takes the same words |
 | Drop one | `DROP USER [IF EXISTS] name`, `DROP ROLE [IF EXISTS] name` |
 | Grant | `GRANT SELECT [(col, …)] \| INSERT \| UPDATE \| DELETE \| ALL [PRIVILEGES] ON [TABLE] t \| SCHEMA s \| ALL TABLES [IN SCHEMA s] TO name, …` (Snowflake's `TO ROLE name` is the same) |
 | Grant some rows | `GRANT SELECT [(col, …)] ON [TABLE] t TO name, … WHERE condition`: only the rows where `condition` holds, over the table's own columns, literals, immutable functions and `current_user`, the reader; `GRANT UPDATE` or `DELETE … WHERE condition`: the rows a writer changes, and an UPDATE's new versions; `GRANT INSERT … WHERE condition`: the rows it may add; `GRANT ALL … WHERE condition`: the four ([rows](/pondra/guides/security/#a-grants-rows)) |
@@ -964,7 +964,8 @@ DROP ROLE analysts;
 
 `public` is every user: `GRANT SELECT ON t TO public`. A grant on a schema covers its tables made later
 too. Only a superuser (or the admin token) runs these. `MAX_QUERIES` and `STATEMENT_TIMEOUT` are a user's
-[quota](/pondra/guides/security/#quotas) on each node. See [security](/pondra/guides/security/#users-roles-and-grants).
+[quota](/pondra/guides/security/#quotas) on each node, and `READ ONLY` keeps it from writing; a role's reach its members, the
+tightest winning. See [security](/pondra/guides/security/#users-roles-and-grants).
 
 ```bash
 pondra sql --dir scratch "CREATE TABLE t (a BIGINT, region VARCHAR)"
