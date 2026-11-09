@@ -695,10 +695,27 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if matches!(head.as_str(), "export" | "import") && PORTABLE.is_match(first_word(sql)) {
         return Some(Stmt::Invalid("EXPORT DATABASE and IMPORT DATABASE are not supported yet: BACKUP DATABASE TO 'place' copies a database (RESTORE DATABASE name FROM 'place' brings it back), and COPY t TO 'dir/t.parquet' (FORMAT parquet) writes a table's rows".into()));
     }
-    // `UNDROP TABLE t` (Snowflake's, Databricks'): the table dropped last under that name, back (ADR-043).
-    static UNDROP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*UNDROP\s+TABLE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = (head == "undrop").then(|| UNDROP.captures(first_word(sql))).flatten() {
-        return Some(Stmt::Ddl(vec![Ddl::Undrop { name: name(&c[1]) }]));
+    // `UNDROP <kind> name` (Snowflake's, Databricks'): what was dropped last under that name, back (ADR-043; a definition's:
+    // `undrop.rs`). The kinds are those whose verbs the registry lists UNDROP among (`objects::Kind`), so a kind that keeps
+    // its drops is undropped with no edit here.
+    if head == "undrop" {
+        static UNDROP: std::sync::LazyLock<(regex::Regex, String)> = std::sync::LazyLock::new(|| {
+            let mut kinds: Vec<&str> = crate::objects::all_kinds().filter(|k| k.verbs.contains(&"UNDROP")).map(|k| k.name).collect();
+            kinds.sort_by_key(|k| std::cmp::Reverse(k.len())); // ("table function" before "table")
+            let words = kinds.iter().map(|k| k.replace(' ', r"\s+")).collect::<Vec<_>>().join("|");
+            let re = regex::Regex::new(&format!(r#"(?is)^\s*UNDROP\s+({words})\s+([\w."-]+)\s*;?\s*$"#)).expect("a regex");
+            kinds.sort();
+            (re, kinds.iter().map(|k| k.to_uppercase()).collect::<Vec<_>>().join(", "))
+        });
+        let (re, kinds) = &*UNDROP;
+        let Some(c) = re.captures(first_word(sql)) else {
+            return Some(Stmt::Invalid(format!("UNDROP <kind> name brings back what was dropped last under the name, for these kinds: {kinds} (pondra.dropped lists what can come back)")));
+        };
+        let kind = c[1].split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        return Some(Stmt::Ddl(vec![match kind.as_str() {
+            "table" => Ddl::Undrop { name: name(&c[2]) },
+            _ => Ddl::UndropKept { kind, name: name(&c[2]) },
+        }]));
     }
     // DuckDB's CREATE MACRO … IF NOT EXISTS (the parser takes only OR REPLACE): read without it, kept unless one is there.
     static MACRO_QUIET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+(OR\s+REPLACE\s+)?(TEMP\s+|TEMPORARY\s+)?MACRO\s+)IF\s+NOT\s+EXISTS\s+").expect("a regex"));
@@ -724,7 +741,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Ok(sql) => sql,
         Err(e) => return Some(Stmt::of_error(&e, format!("{e:#}"))),
     };
-    let parsed = crate::parsed::generic(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (parsed once for the front's looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
+    let parsed = crate::parsed::read(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (as the front reads it, parsed once for its looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
     let parsed = match parsed {
         Ok(mut s) => s.pop()?,
         Err(_) => return None,
@@ -2792,6 +2809,9 @@ mod tests {
         assert!(parse("select * into temp t2 from t").is_some());
         assert!(matches!(parse("SELECT 1; DELETE FROM t"), Some(Stmt::Delete(..))), "several statements are read as before: the last");
         assert!(parse("SELECT 'into' AS w").is_none(), "INTO in a string: read, and no write");
+        // (read as the front reads it: a write with DuckDB's forms in it is one, at Flight's door too, 11-08 audit M3)
+        assert!(matches!(parse("INSERT INTO t SELECT [x FOR x IN l] FROM s"), Some(Stmt::Insert(..))));
+        assert!(matches!(parse("UPDATE t SET l = list_transform(l, LAMBDA x: x + 1)"), Some(Stmt::Update(..))));
     }
     use datafusion::arrow::array::Float64Array;
     use datafusion::arrow::datatypes::{Field, Schema};

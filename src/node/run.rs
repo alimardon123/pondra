@@ -463,7 +463,9 @@ impl Node {
     /// (`Held::stop`), and its statics are set back (`reset`), so the next node in this process
     /// starts as in a process of its own (ADR-061 §3, invariant 301).
     pub async fn stop(self) {
-        history::end_writers().await;
+        if let Some(lake) = self.held.lake.get() {
+            history::end_writers(lake).await;
+        }
         self.held.stop().await;
         reset::reset();
     }

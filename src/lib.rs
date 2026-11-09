@@ -170,6 +170,7 @@ mod rules;
 #[cfg(feature = "lake")] mod hot;
 #[cfg(feature = "lake")] mod index;
 #[cfg(feature = "lake")] mod types;
+#[cfg(feature = "lake")] mod undrop;
 #[cfg(feature = "lake")] mod constraints;
 #[cfg(feature = "lake")] mod layout;
 #[cfg(feature = "lake")] mod learned;

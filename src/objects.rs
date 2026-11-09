@@ -91,8 +91,8 @@ pub struct Pattern {
     pub also: &'static [&'static str],
 }
 
-const RELATION: &[&str] = &["CREATE", "CREATE OR ALTER", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"];
-const ROUTINE: &[&str] = &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON", "SHOW CREATE"];
+const RELATION: &[&str] = &["CREATE", "CREATE OR ALTER", "CREATE OR REPLACE", "ALTER", "DROP", "UNDROP", "COMMENT ON", "SHOW CREATE"];
+const ROUTINE: &[&str] = &["CREATE", "CREATE OR REPLACE", "DROP", "UNDROP", "COMMENT ON", "SHOW CREATE"];
 const READ: &[&str] = &["SELECT"];
 const ROWS: &[&str] = &["SELECT", "INSERT", "UPDATE", "DELETE"];
 /// A project's refusal for shares and recipients (apply.rs says it): each environment's, so a
@@ -104,16 +104,16 @@ static CORE_KINDS: &[Kind] = &[
     Kind { name: "table", family: "relation", verbs: &["CREATE", "CREATE OR ALTER", "CREATE OR REPLACE", "ALTER", "DROP", "UNDROP", "CLONE", "COMMENT ON", "SHOW CREATE"], prefix: "t/", privileges: ROWS, on_clone: OnClone::Pin, project: None, order: 5, secret: false, about: "rows in the lake's files and log, queried and changed with SQL", also: &["relation"], shown: None },
     Kind { name: "view", family: "relation", verbs: RELATION, prefix: "q/", privileges: READ, on_clone: OnClone::Copy, project: None, order: 7, secret: false, about: "a stored query with a name, run where it is used", also: &["virtual table"], shown: None },
     Kind { name: "materialized view", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "v/", privileges: READ, on_clone: OnClone::Copy, project: None, order: 7, secret: false, about: "a query's result kept current as its tables change, read like a table", also: &["dynamic table", "live table", "continuous query"], shown: None },
-    Kind { name: "external table", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON"], prefix: "q/", privileges: READ, on_clone: OnClone::Copy, project: None, order: 7, secret: false, about: "a view of files outside the lake, read in place where they are", also: &["foreign table"], shown: None },
+    Kind { name: "external table", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "UNDROP", "COMMENT ON"], prefix: "q/", privileges: READ, on_clone: OnClone::Copy, project: None, order: 7, secret: false, about: "a view of files outside the lake, read in place where they are", also: &["foreign table"], shown: None },
     Kind { name: "sequence", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "sq/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 4, secret: false, about: "numbers handed out one at a time, never twice (`nextval`)", also: &["serial", "auto increment"], shown: None },
     Kind { name: "index", family: "relation", verbs: &["CREATE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "ix/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 6, secret: false, about: "a named set of a table's columns, kept as a definition: nothing is built", also: &[], shown: None },
-    Kind { name: "type", family: "type", verbs: &["CREATE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "ty/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 4, secret: false, about: "a named set of labels a column may hold", also: &["enum"], shown: None },
+    Kind { name: "type", family: "type", verbs: &["CREATE", "ALTER", "DROP", "UNDROP", "COMMENT ON", "SHOW CREATE"], prefix: "ty/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 4, secret: false, about: "a named set of labels a column may hold", also: &["enum"], shown: None },
     Kind { name: "function", family: "routine", verbs: ROUTINE, prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 6, secret: false, about: "a named computation, in SQL or Python, run per row, per batch or in a query", also: &["UDF", "user-defined function"], shown: None },
     Kind { name: "macro", family: "routine", verbs: ROUTINE, prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 6, secret: false, about: "a named SQL expression or query, expanded where it is written", also: &["SQL macro"], shown: None },
     Kind { name: "table function", family: "routine", verbs: ROUTINE, prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 6, secret: false, about: "a function that returns the rows of a table, used where a table is named", also: &["UDTF"], shown: None },
-    Kind { name: "procedure", family: "routine", verbs: &["CREATE", "CREATE OR REPLACE", "CALL", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 8, secret: false, about: "a named piece of work, run with CALL as its caller", also: &["stored procedure"], shown: None },
-    Kind { name: "task", family: "task", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "EXECUTE", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "j/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 9, secret: false, about: "a statement run on a schedule, or after other tasks (AFTER)", also: &["job", "schedule", "cron"], shown: None },
-    Kind { name: "secret", family: "secret", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON"], prefix: "e/", privileges: &["USAGE"], on_clone: OnClone::Leave, project: None, order: 3, secret: true, about: "credentials sealed in the lake, handed to a procedure and never shown", also: &["credential"], shown: None },
+    Kind { name: "procedure", family: "routine", verbs: &["CREATE", "CREATE OR REPLACE", "CALL", "DROP", "UNDROP", "COMMENT ON", "SHOW CREATE"], prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 8, secret: false, about: "a named piece of work, run with CALL as its caller", also: &["stored procedure"], shown: None },
+    Kind { name: "task", family: "task", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "EXECUTE", "DROP", "UNDROP", "COMMENT ON", "SHOW CREATE"], prefix: "j/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 9, secret: false, about: "a statement run on a schedule, or after other tasks (AFTER)", also: &["job", "schedule", "cron"], shown: None },
+    Kind { name: "secret", family: "secret", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "UNDROP", "COMMENT ON"], prefix: "e/", privileges: &["USAGE"], on_clone: OnClone::Leave, project: None, order: 3, secret: true, about: "credentials sealed in the lake, handed to a procedure and never shown", also: &["credential"], shown: None },
     Kind { name: "user", family: "user", verbs: &["CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "COMMENT ON"], prefix: "u/", privileges: &[], on_clone: OnClone::Copy, project: Some("users are each environment's: a project makes roles (CREATE ROLE analyst), and an environment's admin grants them (GRANT analyst TO ann)"), order: 0, secret: true, about: "a person who signs in, with a password or token, and grants", also: &["login"], shown: None },
     Kind { name: "role", family: "user", verbs: &["CREATE", "DROP", "GRANT", "REVOKE", "COMMENT ON", "SHOW CREATE"], prefix: "u/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 2, secret: false, about: "a group of grants, given to users", also: &["group"], shown: None },
     Kind { name: "database", family: "database", verbs: &["CREATE", "CLONE", "ATTACH", "DETACH", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "a/", privileges: &["CLONE"], on_clone: OnClone::Copy, project: Some("a database is each environment's: an attached lake or catalog goes in pondra.toml ([env.prod] attach.events = { type = \"kafka\", url = \"…\" })"), order: 0, secret: false, about: "another lake this one reads, attached by name, or a branch cloned from one", also: &["catalog", "lake", "workspace"], shown: None },
@@ -393,7 +393,6 @@ fn types<'a>(lake: &'a Lake, _scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Obje
 
 fn routines<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Object>>> {
     Box::pin(async move {
-        use crate::expander::Kind as R;
         let here = crate::ddl::lake_name(lake);
         let mut out = vec![];
         for (name, l) in lakes(lake).await {
@@ -402,13 +401,7 @@ fn routines<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Ob
             names.sort();
             out.extend(names.into_iter().map(|n| {
                 let r = &all[n];
-                let kind = match (r.kind, r.what()) {
-                    (R::Procedure, _) => "procedure",
-                    (_, "macro") => "macro",
-                    (R::Table, _) => "table function",
-                    _ => "function",
-                };
-                Object::new(kind, &name, n, (name == here && scope.shows_code()).then(|| routine_sql(&name_sql(n), r)))
+                Object::new(r.kind_name(), &name, n, (name == here && scope.shows_code()).then(|| routine_sql(&name_sql(n), r)))
             }));
         }
         Ok(out)
@@ -1343,7 +1336,7 @@ mod tests {
         for k in ["ns/s", "q/v", "v/m", "sq/s", "ix/i", "ty/t", "r/f", "j/nightly", "ip/okta", "f/fn", "cm/relation/t", "cm/database/d"] {
             assert!(readable(k), "{k} is read by a page");
         }
-        for k in ["a/lake", "z/auth", "u/ali", "e/key", "sh/share", "sr/recipient", "bs", "pn/x", "cm/user/ali", "cm/secret/k", "cm/share/s", "cm/recipient/r", "cm/column/t/c", "x/t/1", "dt/t/1", "dl", "m", "k/job", "quiet", ""] {
+        for k in ["a/lake", "z/auth", "u/ali", "e/key", "sh/share", "sr/recipient", "bs", "pn/x", "cm/user/ali", "cm/secret/k", "cm/share/s", "cm/recipient/r", "cm/column/t/c", "x/t/1", "dt/t/1", "dk/relation/v/1", "dk/secret/k/1", "dl", "m", "k/job", "quiet", ""] {
             assert!(!readable(k), "{k} is never a page's");
         }
     }

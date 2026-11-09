@@ -156,7 +156,7 @@ fn log(app: &App, line: Line, done: Option<tokio::sync::oneshot::Sender<()>>) {
     }
     let tx = crate::reset::Once::get_or(&*WRITER, || {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        crate::history::keep(write(app.clone(), rx));
+        crate::history::keep(&app.lake, write(app.clone(), rx));
         tx
     });
     let _ = tx.send((line, done));
@@ -201,8 +201,8 @@ pub async fn wait(app: &App, id: &str, scope: &crate::rights::Scope) -> Result<(
 async fn write(app: App, mut rx: tokio::sync::mpsc::UnboundedReceiver<Sent>) {
     let producer = format!("runs-{}", new_id());
     let (mut seq, mut made) = (0, false);
-    while let Some((first, done)) = crate::history::next(&mut rx).await {
-        if !crate::history::ending() {
+    while let Some((first, done)) = crate::history::next(&app.lake, &mut rx).await {
+        if !crate::history::ending(&app.lake) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let (mut lines, mut dones) = (vec![first], vec![done]);
@@ -743,7 +743,9 @@ pub async fn drop_task(lake: &Lake, name: &str, if_exists: bool) -> Result<serde
         if let Some((f, _)) = tasks(lake).await?.iter().find(|(_, t)| t.after.contains(&name)) {
             bail!("task {f} runs after {name}: drop {f} first, or make it again without it");
         }
-        lake.cat.commit(vec![], &[task_key(&name), tick_key(&name)]).await?;
+        // (kept to be undropped with its last tick: back, it runs as a resumed task does, from where it was)
+        let keys = [task_key(&name), tick_key(&name)];
+        lake.cat.commit(crate::undrop::aside(lake, "task", &name, &keys).await?, &keys).await?;
     }
     if streaming {
         crate::tasks::drop_task(lake, &name).await?;
@@ -1190,17 +1192,37 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'
         ("key", l(&|o| o.meta.as_ref().filter(|m| !m.key.is_empty()).map(|m| m.key.join(", ")))),
         ("definition", l(&|o| o.sql.clone())),
     ])?;
-    // (dropped tables that UNDROP TABLE can still bring back: ADR-043)
-    let mut gone = crate::ddl::dropped(lake).await?;
-    gone.retain(|(n, _)| scope.sees(crate::rights::Object::Table(n)));
-    let g = |f: &dyn Fn(&crate::ddl::Dropped) -> u64| Arc::new(gone.iter().map(|(_, d)| Some(f(d) as i64)).collect::<Int64Array>()) as ArrayRef;
-    let when = |f: &dyn Fn(&crate::ddl::Dropped) -> u64| Arc::new(gone.iter().map(|(_, d)| Some(f(d) as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef;
+    // (what UNDROP can still bring back: dropped tables (ADR-043), and dropped definitions (`undrop.rs`), each with the
+    // statement that does it. A relation is listed to whoever may read one of its name; any other definition to the whole.)
+    struct Gone {
+        name: String,
+        kind: String,
+        at_ms: u64,
+        until: u64,
+        rows: Option<u64>,
+        bytes: Option<u64>,
+        by: String,
+    }
+    let mut gone: Vec<Gone> = crate::ddl::dropped(lake).await?.into_iter().map(|(name, d)| Gone {
+        rows: Some(d.meta.files.iter().map(|f| f.rows).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.rows)),
+        bytes: Some(d.meta.files.iter().map(|f| f.bytes).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.bytes)),
+        kind: "table".into(), at_ms: d.at_ms, until: d.at_ms + d.keep_ms, by: d.by, name,
+    }).collect();
+    gone.extend(crate::undrop::all(lake).await?.into_iter().map(|(name, k)| Gone { kind: k.kind.clone(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
+    let relation = |kind: &str| crate::objects::kind(kind).is_some_and(|k| k.family == "relation");
+    gone.retain(|g| scope.sees(if relation(&g.kind) { crate::rights::Object::Table(&g.name) } else { crate::rights::Object::Lake }));
+    let g = |f: &dyn Fn(&Gone) -> Option<u64>| Arc::new(gone.iter().map(|d| f(d).map(|n| n as i64)).collect::<Int64Array>()) as ArrayRef;
+    let when = |f: &dyn Fn(&Gone) -> u64| Arc::new(gone.iter().map(|d| Some(f(d) as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef;
+    let text = |f: &dyn Fn(&Gone) -> Option<String>| Arc::new(gone.iter().map(f).collect::<StringArray>()) as ArrayRef;
     let dropped = RecordBatch::try_from_iter(vec![
-        ("name", Arc::new(gone.iter().map(|(n, _)| Some(n.clone())).collect::<StringArray>()) as ArrayRef),
+        ("name", text(&|d| Some(d.name.clone()))),
         ("dropped_at", when(&|d| d.at_ms)),
-        ("kept_until", when(&|d| d.at_ms + d.keep_ms)),
-        ("rows_in_files", g(&|d| d.meta.files.iter().map(|f| f.rows).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.rows))),
-        ("bytes_in_files", g(&|d| d.meta.files.iter().map(|f| f.bytes).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.bytes))),
+        ("kept_until", when(&|d| d.until)),
+        ("rows_in_files", g(&|d| d.rows)),
+        ("bytes_in_files", g(&|d| d.bytes)),
+        ("kind", text(&|d| Some(d.kind.clone()))),
+        ("dropped_by", text(&|d| Some(d.by.clone()).filter(|b| !b.is_empty()))),
+        ("undrop", text(&|d| Some(crate::undrop::statement(&d.kind, &d.name)))),
     ])?;
     Ok(vec![("routines", mem(routines)?), ("tasks", mem(tasks)?), ("tables", mem(listed)?), ("dropped", mem(dropped)?), ("databases", mem(crate::branch::databases(lake).await?)?), ("applies", mem(crate::apply::table(lake).await?)?)])
 }
