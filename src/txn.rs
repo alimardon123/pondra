@@ -1692,7 +1692,7 @@ where
     Fut: Future<Output = Result<T>>,
 {
     leader_needed(app)?;
-    let caller = crate::temp::SESSION.try_with(|s| s.clone()).ok().flatten();
+    let caller = crate::temp::current();
     let s = caller.clone().unwrap_or_else(crate::temp::of_script);
     let job = job.map(|j| as_job(&j));
     let run = async {
@@ -1723,11 +1723,13 @@ where
             }
         }
     };
-    let out = crate::temp::SESSION.scope(Some(s.clone()), run).await;
+    let out = crate::temp::SESSION.scope(crate::temp::named(&app.lake, Some(s.clone())), run).await;
     match caller {
         Some(_) => end(&s), // (refused before its COMMIT: rolled back, the session kept)
         None => {
-            crate::temp::end(&s);
+            if let Some(at) = crate::temp::sessions(&app.lake) {
+                at.end(&s);
+            }
         }
     }
     out

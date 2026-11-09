@@ -526,7 +526,7 @@ fn may_write(name: &str) -> Result<()> {
 /// `nextval`, `currval` and `setval` in a query's session. `currval` is the session's: the last
 /// value its `nextval` gave.
 pub fn register(ctx: &SessionContext, lake: Arc<Lake>) {
-    let session = crate::temp::current();
+    let session = crate::temp::here();
     ctx.register_udf(AsyncScalarUDF::new(Arc::new(Counter { lake: lake.clone(), setval: false, session: session.clone(), signature: Signature::string(1, Volatility::Volatile) })).into_scalar_udf());
     ctx.register_udf(AsyncScalarUDF::new(Arc::new(Current { lake: lake.clone(), session: session.clone(), signature: Signature::string(1, Volatility::Volatile) })).into_scalar_udf());
     ctx.register_udf(AsyncScalarUDF::new(Arc::new(Counter { lake, setval: true, session: session.clone(), signature: Signature::variadic_any(Volatility::Volatile) })).into_scalar_udf());
@@ -537,7 +537,7 @@ pub fn register(ctx: &SessionContext, lake: Arc<Lake>) {
 #[derive(Debug)]
 struct Current {
     lake: Arc<Lake>,
-    session: Option<String>,
+    session: Option<crate::temp::Named>,
     signature: Signature,
 }
 
@@ -559,7 +559,7 @@ impl ScalarUDFImpl for Current {
 #[async_trait::async_trait]
 impl AsyncScalarUDFImpl for Current {
     async fn invoke_async_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
-        let Some(session) = crate::temp::current().or(self.session.clone()) else { return exec_err!("currval is a session's: a Postgres connection's, or a client's (x-pondra-session)") };
+        let Some(session) = crate::temp::here().or(self.session.clone()) else { return exec_err!("currval is a session's: a Postgres connection's, or a client's (x-pondra-session)") };
         let names = args.args[0].to_array(args.number_rows)?;
         let names = datafusion::arrow::compute::cast(&names, &DataType::Utf8)?;
         let names = names.as_string::<i32>();
@@ -568,7 +568,7 @@ impl AsyncScalarUDFImpl for Current {
         for i in 0..names.len() {
             let name = names.value(i).to_lowercase();
             check_current(&self.lake, &object_of(&name)).await.map_err(err)?;
-            let got = crate::temp::with(&session, false, |x| Ok(x.currval.get(&name).copied())).ok().flatten();
+            let got = session.at.with(&session.name, false, |x| Ok(x.currval.get(&name).copied())).ok().flatten();
             match got {
                 Some(v) => out.push(v),
                 None => return exec_err!("currval of sequence \"{name}\" is not yet defined in this session"),
@@ -583,7 +583,7 @@ impl AsyncScalarUDFImpl for Current {
 struct Counter {
     lake: Arc<Lake>,
     setval: bool,
-    session: Option<String>,
+    session: Option<crate::temp::Named>,
     signature: Signature,
 }
 
@@ -611,7 +611,7 @@ impl AsyncScalarUDFImpl for Counter {
         let err = |e: anyhow::Error| datafusion::error::DataFusionError::External(e.into());
         let names = text(0)?;
         let names = names.as_string::<i32>();
-        let session = crate::temp::current().or(self.session.clone()); // (currval is the session's)
+        let session = crate::temp::here().or(self.session.clone()); // (currval is the session's)
         if !self.setval {
             // (rows of one name, the usual, take their values in one go)
             let mut out = vec![None; rows]; // (a NULL name, a NULL value)

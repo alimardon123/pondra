@@ -35,8 +35,8 @@ use datafusion::common::instant::Instant;
 use std::time::Duration;
 
 tokio::task_local! {
-    /// The session a request belongs to, if any.
-    pub static SESSION: Option<String>;
+    /// The session a request belongs to, if any, and its node's sessions.
+    pub static SESSION: Option<Named>;
     /// While a stored view's query is read (`stored`).
     static STORED: bool;
 }
@@ -74,7 +74,7 @@ fn name(v: &http::HeaderValue) -> anyhow::Result<String> {
 /// The session a client's id names: its user's (another who names the same id has a session of its own).
 pub fn id(id: &str) -> String { format!("{}~{id}", crate::auth::current().map(|p| p.name).unwrap_or_default()) }
 
-pub fn current() -> Option<String> { SESSION.try_with(|s| s.clone()).ok().flatten() }
+pub fn current() -> Option<String> { SESSION.try_with(|s| s.as_ref().map(|n| n.name.clone())).ok().flatten() }
 
 /// A session for one script sent without one (`#`: no client names it so).
 pub fn of_script() -> String { format!("{}#script-{}", crate::auth::current().map(|p| p.name).unwrap_or_default(), uuid::Uuid::new_v4()) }
@@ -82,9 +82,9 @@ pub fn of_script() -> String { format!("{}#script-{}", crate::auth::current().ma
 /// The current session's temporary tables (name, definition) and views (name, SQL), as Postgres's
 /// catalog lists them (`pg_catalog.rs`).
 pub fn listed() -> (Vec<(String, TableMeta)>, Vec<(String, String)>) {
-    let Some(s) = current() else { return Default::default() };
-    let all = SESSIONS.lock().unwrap();
-    let Some(x) = all.get(&s) else { return Default::default() };
+    let Some(n) = here() else { return Default::default() };
+    let all = n.at.all.lock().unwrap();
+    let Some(x) = all.get(&n.name) else { return Default::default() };
     (x.tables.iter().map(|(n, t)| (n.clone(), t.meta.clone())).collect(), x.views.iter().map(|(n, v)| (n.clone(), v.clone())).collect())
 }
 
@@ -133,36 +133,122 @@ pub struct Session {
     version: u64, // changes so far (`live.rs` watches them)
 }
 
-crate::per_node!(static SESSIONS: Mutex<HashMap<String, Session>> = Default::default());
-static CHANGES: LazyLock<tokio::sync::watch::Sender<u64>> = LazyLock::new(|| tokio::sync::watch::channel(0).0);
-
-/// Any session's temporary tables or views changed (`live.rs` waits on it).
-pub fn changes() -> tokio::sync::watch::Receiver<u64> { CHANGES.subscribe() }
-
-/// How many changes a session's temporary tables and views have had.
-pub fn version(session: Option<&str>) -> u64 { session.and_then(|s| SESSIONS.lock().unwrap().get(s).map(|x| x.version)).unwrap_or(0) }
-
-/// A session's tables, views and settings, made on first use; its changes counted.
-pub fn with<T>(session: &str, change: bool, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
-    let mut all = SESSIONS.lock().unwrap();
-    let first = all.is_empty();
-    let x = all.entry(session.to_string()).or_default();
-    x.used = Some(Instant::now());
-    let out = f(x)?;
-    if change {
-        x.version += 1;
-        CHANGES.send_modify(|v| *v += 1);
-    }
-    if first {
-        crate::panics::spawn(reap()); // (only while there are sessions)
-    }
-    Ok(out)
+/// A node's sessions, a state of its home lake (they were the process's): each one's temporary tables, views and
+/// settings (`Session`), as `with` makes them, and a count of their changes (`changes`). `reap` ends the idle ones.
+pub struct Sessions {
+    all: Mutex<HashMap<String, Session>>,
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
-/// Looks at a session's state without making it: a session that doesn't exist is None, and nothing is kept for it
-/// (a read of a setting must not start a session, as `with` does).
+impl Default for Sessions {
+    fn default() -> Self { Sessions { all: Default::default(), changes: tokio::sync::watch::channel(0).0 } }
+}
+
+impl crate::lake_state::LakeState for Sessions {
+    const NAME: &'static str = "sessions";
+    const ABOUT: &'static str = "its sessions' temporary tables, views and settings (a node's, at its home lake)";
+    fn make() -> Self { Sessions::default() }
+}
+
+/// The session a request belongs to: its name, and the sessions of the node it talks to.
+#[derive(Clone)]
+pub struct Named {
+    pub name: String,
+    pub at: Arc<Sessions>,
+}
+
+impl std::fmt::Debug for Named {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("Named").field("name", &self.name).finish_non_exhaustive() }
+}
+
+/// The node's sessions: a state of its home lake `home` (None only in a build that keeps none).
+pub fn sessions(home: &crate::store::Lake) -> Option<Arc<Sessions>> { home.state::<Sessions>().ok() }
+
+/// The session `name` of the node whose home lake is `home`, for a request's task-local (`SESSION`).
+pub fn named(home: &crate::store::Lake, name: Option<String>) -> Option<Named> { Some(Named { name: name?, at: sessions(home)? }) }
+
+/// The current request's session and its node's sessions (`SESSION`).
+pub fn here() -> Option<Named> { SESSION.try_with(Clone::clone).ok().flatten() }
+
+/// A session's tables, views and settings, made on first use; its changes counted (in the request's node's sessions).
+pub fn with<T>(session: &str, change: bool, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
+    here().context("no session here")?.at.with(session, change, f)
+}
+
+/// Looks at a session's state without making it (in the request's node's sessions): a session that doesn't exist is None,
+/// and nothing is kept for it (a read of a setting must not start a session, as `with` does).
 pub fn peek<T>(session: &str, f: impl FnOnce(&Session) -> Option<T>) -> Option<T> {
-    SESSIONS.lock().unwrap().get(session).and_then(f)
+    here()?.at.peek(session, f)
+}
+
+impl Sessions {
+    /// How many changes a session's temporary tables and views have had.
+    pub fn version(&self, session: Option<&str>) -> u64 { session.and_then(|s| self.all.lock().unwrap().get(s).map(|x| x.version)).unwrap_or(0) }
+
+    /// A session's tables, views and settings, made on first use; its changes counted.
+    pub fn with<T>(self: &Arc<Self>, session: &str, change: bool, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
+        let mut all = self.all.lock().unwrap();
+        let first = all.is_empty();
+        let x = all.entry(session.to_string()).or_default();
+        x.used = Some(Instant::now());
+        let out = f(x)?;
+        if change {
+            x.version += 1;
+            self.changes.send_modify(|v| *v += 1);
+        }
+        if first {
+            crate::panics::spawn(reap(Arc::downgrade(self))); // (only while there are sessions)
+        }
+        Ok(out)
+    }
+
+    /// Looks at a session's state without making it: a session that doesn't exist is None, and nothing is kept for it
+    /// (a read of a setting must not start a session, as `with` does).
+    pub fn peek<T>(&self, session: &str, f: impl FnOnce(&Session) -> Option<T>) -> Option<T> {
+        self.all.lock().unwrap().get(session).and_then(f)
+    }
+
+    /// Does this node hold the session: made, used within the idle time, and not ended? One that has
+    /// gone idle ends here, as `reap` would end it (its transaction rolled back).
+    pub fn live(&self, session: &str) -> bool {
+        let fresh = self.all.lock().unwrap().get(session).is_some_and(|x| x.used.is_some_and(|u| u.elapsed() < idle()));
+        if !fresh {
+            self.end(session);
+        }
+        fresh
+    }
+
+    /// The session was used just now: its idle time starts again.
+    pub fn touch(&self, session: &str) {
+        if let Some(x) = self.all.lock().unwrap().get_mut(session) {
+            x.used = Some(Instant::now());
+        }
+    }
+
+    /// Does this node hold anything of the session's (temporary tables or views, settings,
+    /// variables, prepared statements, a transaction, its Python)? A client that fails over between
+    /// nodes keeps to this one while it does: `POST /sql` says so (`x-pondra-session: held`).
+    pub fn holds(&self, session: &str) -> bool {
+        let kept = self.all.lock().unwrap().get(session).is_some_and(|x| {
+            !(x.tables.is_empty() && x.views.is_empty() && x.routines.is_empty() && x.secrets.is_empty() && x.settings.is_empty() && x.prepared.is_empty() && x.variables.is_empty())
+        });
+        kept || crate::txn::held(session) || crate::python::held(session)
+    }
+
+    /// End a session: its temporary tables and views are gone, and its Python (`python::ask_session`).
+    pub fn end(&self, session: &str) -> bool {
+        crate::txn::end(session); // (its transaction, if open: rolled back)
+        crate::cursors::end(session); // (its cursors go with it: `cursors.rs`)
+        let python = crate::python::end_session(session); // (its Python's variables too)
+        let gone = self.all.lock().unwrap().remove(session).is_some() || python;
+        if gone {
+            self.changes.send_modify(|v| *v += 1);
+        }
+        gone
+    }
+
+    /// Any of its sessions' temporary tables or views changed (`live.rs` waits on it).
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> { self.changes.subscribe() }
 }
 
 /// How long a session may sit unused (`PONDRA_SESSION_IDLE_SECS`, 3600).
@@ -171,70 +257,35 @@ fn idle() -> Duration {
 }
 
 /// Sessions idle for `PONDRA_SESSION_IDLE_SECS` end, as `end` ends them (a transaction rolled back,
-/// its Python and temporary tables gone); once there are none, this stops.
-async fn reap() {
+/// its Python and temporary tables gone); once there are none, this stops. It holds the node's sessions by a weak
+/// handle: once the lake's are gone (it stopped), this stops too.
+async fn reap(at: std::sync::Weak<Sessions>) {
     loop {
         tokio::time::sleep(idle().min(Duration::from_secs(60))).await;
-        let stale: Vec<String> = SESSIONS.lock().unwrap().iter().filter(|(_, x)| !x.used.is_some_and(|u| u.elapsed() < idle())).map(|(s, _)| s.clone()).collect();
+        let Some(at) = at.upgrade() else { return };
+        let stale: Vec<String> = at.all.lock().unwrap().iter().filter(|(_, x)| !x.used.is_some_and(|u| u.elapsed() < idle())).map(|(s, _)| s.clone()).collect();
         for session in &stale {
-            end(session);
+            at.end(session);
         }
-        if SESSIONS.lock().unwrap().is_empty() {
+        if at.all.lock().unwrap().is_empty() {
             return;
         }
     }
 }
 
-/// Does this node hold the session: made, used within the idle time, and not ended? One that has
-/// gone idle ends here, as `reap` would end it (its transaction rolled back).
-pub fn live(session: &str) -> bool {
-    let fresh = SESSIONS.lock().unwrap().get(session).is_some_and(|x| x.used.is_some_and(|u| u.elapsed() < idle()));
-    if !fresh {
-        end(session);
-    }
-    fresh
-}
-
-/// The session was used just now: its idle time starts again.
-pub fn touch(session: &str) {
-    if let Some(x) = SESSIONS.lock().unwrap().get_mut(session) {
-        x.used = Some(Instant::now());
-    }
-}
-
-/// Does this node hold anything of the session's (temporary tables or views, settings,
-/// variables, prepared statements, a transaction, its Python)? A client that fails over between
-/// nodes keeps to this one while it does: `POST /sql` says so (`x-pondra-session: held`).
-pub fn holds(session: &str) -> bool {
-    let kept = SESSIONS.lock().unwrap().get(session).is_some_and(|x| {
-        !(x.tables.is_empty() && x.views.is_empty() && x.routines.is_empty() && x.secrets.is_empty() && x.settings.is_empty() && x.prepared.is_empty() && x.variables.is_empty())
-    });
-    kept || crate::txn::held(session) || crate::python::held(session)
-}
-
 /// The current session's temporary secrets (`CREATE TEMPORARY SECRET`), by name.
 pub fn secrets() -> Vec<(String, crate::ext::Secret)> {
-    let Some(s) = current() else { return vec![] };
-    SESSIONS.lock().unwrap().get(&s).map(|x| x.secrets.iter().map(|(n, v)| (n.clone(), v.clone())).collect()).unwrap_or_default()
+    let Some(n) = here() else { return vec![] };
+    let all = n.at.all.lock().unwrap();
+    all.get(&n.name).map(|x| x.secrets.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default()
 }
 
 /// Does the session hold temporary secrets? Its queries then run on its node alone: the other nodes
 /// don't have them, and would read its files with secrets of their own, or none (S6, S37).
 pub fn holds_secrets() -> bool {
-    let Some(s) = current() else { return false };
-    SESSIONS.lock().unwrap().get(&s).is_some_and(|x| !x.secrets.is_empty())
-}
-
-/// End a session: its temporary tables and views are gone, and its Python (`python::ask_session`).
-pub fn end(session: &str) -> bool {
-    crate::txn::end(session); // (its transaction, if open: rolled back)
-    crate::cursors::end(session); // (its cursors go with it: `cursors.rs`)
-    let python = crate::python::end_session(session); // (its Python's variables too)
-    let gone = SESSIONS.lock().unwrap().remove(session).is_some() || python;
-    if gone {
-        CHANGES.send_modify(|v| *v += 1);
-    }
-    gone
+    let Some(n) = here() else { return false };
+    let all = n.at.all.lock().unwrap();
+    all.get(&n.name).is_some_and(|x| !x.secrets.is_empty())
 }
 
 /// The lake's functions with the current session's own over them (`CREATE TEMP MACRO`): what the front expands in a
@@ -270,25 +321,29 @@ fn calls(text: &str, f: &str) -> bool {
 
 /// Does `sql` read one of this session's temporary tables or views?
 pub fn mentioned(sql: &str) -> bool {
-    let Some(s) = current() else { return false };
-    SESSIONS.lock().unwrap().get(&s).is_some_and(|x| x.tables.keys().chain(x.views.keys()).any(|n| mentions(sql, n)))
+    let Some(n) = here() else { return false };
+    let all = n.at.all.lock().unwrap();
+    all.get(&n.name).is_some_and(|x| x.tables.keys().chain(x.views.keys()).any(|t| mentions(sql, t)))
 }
 
 fn has(session: &str, name: &str, table: bool) -> bool {
-    SESSIONS.lock().unwrap().get(session).is_some_and(|x| if table { x.tables.contains_key(name) } else { x.views.contains_key(name) })
+    let Some(n) = here() else { return false };
+    let all = n.at.all.lock().unwrap();
+    all.get(session).is_some_and(|x| if table { x.tables.contains_key(name) } else { x.views.contains_key(name) })
 }
 
 /// Is this statement about the session's own tables and views? (Any role may keep those.)
 pub fn own(stmt: &Stmt) -> bool {
-    let Some(s) = current() else { return false };
+    let Some(n) = here() else { return false };
+    let s = n.name.clone();
     match stmt {
         Stmt::Create(c) => c.temporary,
         Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) => true,
         Stmt::Ddl(d) => !d.is_empty() && d.iter().all(|d| match d {
             Ddl::DropTable { name, made_by: None, .. } => has(&s, name, true), // (a failed CREATE TABLE … AS's drop is the lake's table, never a session's)
             Ddl::DropView { name, .. } => has(&s, name, false),
-            Ddl::DropSecret { name, .. } => SESSIONS.lock().unwrap().get(&s).is_some_and(|x| x.secrets.contains_key(name)),
-            Ddl::DropRoutine { name, .. } => SESSIONS.lock().unwrap().get(&s).is_some_and(|x| x.routines.contains_key(name)), // (the session's, over the lake's of the name)
+            Ddl::DropSecret { name, .. } => n.at.all.lock().unwrap().get(&s).is_some_and(|x| x.secrets.contains_key(name)),
+            Ddl::DropRoutine { name, .. } => n.at.all.lock().unwrap().get(&s).is_some_and(|x| x.routines.contains_key(name)), // (the session's, over the lake's of the name)
             _ => false,
         }),
         Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) => has(&s, t, true),
@@ -306,10 +361,10 @@ pub fn columns_of(name: &str) -> Option<Vec<(String, Option<String>)>> {
 /// The session's temporary tables `text` names, as tables of `ctx` (over the lake's of the same
 /// name), with their system columns if `text` names one.
 pub fn register(ctx: &SessionContext, text: &str) -> Result<()> {
-    let Some(s) = current() else { return Ok(()) };
+    let Some(n) = here() else { return Ok(()) };
     let sys = crate::sys::mentioned(text);
-    let mut all = SESSIONS.lock().unwrap();
-    let Some(x) = all.get_mut(&s) else { return Ok(()) };
+    let mut all = n.at.all.lock().unwrap();
+    let Some(x) = all.get_mut(&n.name) else { return Ok(()) };
     x.used = Some(Instant::now());
     for (name, t) in x.tables.iter().filter(|(n, _)| mentions(text, n)) {
         let keep: Vec<usize> = (0..t.meta.columns().len() + if sys { crate::text::NAMES.len() } else { 0 }).collect();
@@ -320,7 +375,7 @@ pub fn register(ctx: &SessionContext, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// The session's temporary views `sql` names, and those they name. They are copied out of `SESSIONS` and looked for after
+/// The session's temporary views `sql` names, and those they name. They are copied out of the sessions and looked for after
 /// it is let go, so one session's query never holds every other session's statements up.
 pub fn views(sql: &str) -> Vec<(String, String)> {
     let Some(views) = current().and_then(|s| peek(&s, |x| (!x.views.is_empty()).then(|| x.views.clone()))) else { return vec![] };
@@ -363,7 +418,14 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool, scope: &crate::right
         Stmt::TempRoutine(name, r, replace, quiet) => {
             let s = session.context(NO_SESSION_FN)?;
             ensure!(!name.contains('.'), "{name}: a temporary function's name has no schema (it is the session's)");
-            let (what, had) = (r.what(), SESSIONS.lock().unwrap().get(&s).is_some_and(|x| x.routines.contains_key(name)));
+            let what = r.what();
+            let had = match here() {
+                Some(n) => {
+                    let all = n.at.all.lock().unwrap();
+                    all.get(&s).is_some_and(|x| x.routines.contains_key(name))
+                }
+                None => false,
+            };
             if *quiet && had {
                 return Ok(Some(j!({what: name, "temporary": true, "exists": true}))); // (IF NOT EXISTS)
             }
@@ -466,7 +528,8 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool, scope: &c
 
 /// `INSERT INTO name [(columns)] query`.
 async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query: &str, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
-    let (meta, rules) = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| (t.meta.clone(), t.rules.clone())).with_context(|| format!("no temporary table {name}"))?;
+    let h = here().context("no session here")?;
+    let (meta, rules) = h.at.all.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| (t.meta.clone(), t.rules.clone())).with_context(|| format!("no temporary table {name}"))?;
     let query = match names {
         Some(n) => {
             let all = crate::rules::rows::row_columns(meta.columns().map(|(c, _)| c.to_string()), n);
@@ -485,7 +548,8 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
 
 /// UPDATE, DELETE or MERGE: what changes, worked out as for a lake table, shaped for the table's rules, applied here.
 async fn change(app: &App, s: &str, name: &str, stmt: &Stmt, scope: &crate::rights::Scope) -> Result<Value> {
-    let (meta, rules) = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| (t.meta.clone(), t.rules.clone())).with_context(|| format!("no temporary table {name}"))?; // (its key: an ON CONFLICT without a column list is on it)
+    let h = here().context("no session here")?;
+    let (meta, rules) = h.at.all.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| (t.meta.clone(), t.rules.clone())).with_context(|| format!("no temporary table {name}"))?; // (its key: an ON CONFLICT without a column list is on it)
     let (old, new) = crate::change::rows_of(&app.lake, name, &meta, &rules, stmt, app.lake.visible(), scope).await?;
     let count = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
     let inserted: usize = new.iter().map(|b| b.column_by_name(crate::text::ROW_ID).map_or(b.num_rows(), |c| c.null_count())).sum();
@@ -506,13 +570,14 @@ async fn change(app: &App, s: &str, name: &str, stmt: &Stmt, scope: &crate::righ
 /// place only if the table is still as it was read, else made again from what it is now.
 fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<crate::rules::Shaped>) -> Result<()> {
     static BUDGET: LazyLock<usize> = LazyLock::new(|| crate::env::value::<usize>("PONDRA_TEMP_MB") << 20);
+    let h = here().context("no session here")?;
     loop {
         let (meta, rules, old, next, version) = with(s, false, |x| {
             let t = x.tables.get(name).with_context(|| format!("no temporary table {name}"))?;
             Ok((t.meta.clone(), t.rules.clone(), t.rows.clone(), t.next, t.version))
         })?;
         let (rows, next) = changed(&meta, &rules, name, &old, &gone, &new, next, version + 1)?;
-        let others: usize = SESSIONS.lock().unwrap().iter().flat_map(|(k, x)| x.tables.iter().filter(move |(n, _)| k != s || *n != name)).map(|(_, t)| t.bytes()).sum();
+        let others: usize = h.at.all.lock().unwrap().iter().flat_map(|(k, x)| x.tables.iter().filter(move |(n, _)| k != s || *n != name)).map(|(_, t)| t.bytes()).sum();
         let bytes: usize = rows.iter().map(|b| b.get_array_memory_size()).sum();
         ensure!(others + bytes <= *BUDGET, "temporary tables on this node would hold {} MB, past PONDRA_TEMP_MB ({} MB): a lake table holds more", (others + bytes) >> 20, *BUDGET >> 20);
         let put = with(s, true, |x| {
@@ -612,12 +677,31 @@ pub fn settings_dir() -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
 
+    /// The session `s` of the node `at`, for a request's task-local.
+    fn named(at: &Arc<Sessions>, s: &str) -> Option<Named> { Some(Named { name: s.into(), at: at.clone() }) }
+
+    /// Two nodes in one process keep their sessions apart: a session of one name made at one is not the other's, its
+    /// changes are counted there alone, and ending it at one leaves the other's.
+    #[tokio::test]
+    async fn two_nodes_keep_their_sessions_apart() {
+        let (a, b) = (Arc::new(Sessions::default()), Arc::new(Sessions::default()));
+        let s = "ann~two-nodes";
+        a.with(s, true, |x| Ok(x.settings.insert("search_path".into(), "a".into()))).unwrap();
+        assert!(a.holds(s) && !b.holds(s), "made at a alone");
+        assert_eq!((a.version(Some(s)), b.version(Some(s))), (1, 0), "its change is a's");
+        b.with(s, false, |x| Ok(x.settings.insert("search_path".into(), "b".into()))).unwrap();
+        let seen = |at: &Arc<Sessions>| SESSION.sync_scope(named(at, s), || peek(s, |x| x.settings.get("search_path").cloned()));
+        assert_eq!((seen(&a), seen(&b)), (Some("a".into()), Some("b".into())), "each scope reads its own node's");
+        assert!(a.end(s) && !a.holds(s) && b.holds(s), "ending it at a leaves b's");
+    }
+
     #[test]
     fn a_temporary_function_is_the_sessions_and_called_by_its_name() {
         let s = "unit-temp-routines";
+        let at = Arc::new(Sessions::default());
         let r = crate::routines::of_macro(&None, &ast::MacroDefinition::Expr(crate::expander::parse_expr("41 + 1").unwrap()));
-        SESSIONS.lock().unwrap().entry(s.to_string()).or_default().routines.insert("answer".to_string(), r);
-        SESSION.sync_scope(Some(s.to_string()), || {
+        at.all.lock().unwrap().entry(s.to_string()).or_default().routines.insert("answer".to_string(), r);
+        SESSION.sync_scope(named(&at, s), || {
             assert_eq!(called("SELECT answer() AS a").as_deref(), Some("answer"));
             assert_eq!(called("SELECT ANSWER ( ) FROM t").as_deref(), Some("answer"), "any case, spaced");
             assert_eq!(called("SELECT answer FROM t"), None, "a column of the name isn't a call");
@@ -625,23 +709,24 @@ mod tests {
             assert_eq!(routine_names(), ["answer"]);
             assert!(routines(Arc::new(HashMap::new())).contains_key("answer"), "over the lake's");
         });
-        assert_eq!(SESSION.sync_scope(Some("unit-temp-other".to_string()), || called("SELECT answer()")), None, "another session has none");
-        SESSIONS.lock().unwrap().remove(s);
+        assert_eq!(SESSION.sync_scope(named(&at, "unit-temp-other"), || called("SELECT answer()")), None, "another session has none");
+        at.all.lock().unwrap().remove(s);
     }
 
     #[test]
     fn a_temporary_table_keeps_its_types_for_its_writes_and_its_shape() {
         // (the session's state is set directly: `with` starts the reaper, which needs a runtime a plain test doesn't have)
         let s = "unit-temp-types";
+        let at = Arc::new(Sessions::default());
         let meta = { let mut entry = TableMeta::made(crate::store::Made { columns: vec![("u".into(), "Utf8".into()), ("v".into(), "Utf8".into()), ("n".into(), "Int64".into())], sql_types: std::collections::BTreeMap::from([("u".to_string(), "uuid".to_string()), ("v".to_string(), "varchar(3)".to_string())]), ..Default::default() }); entry.ids = true; entry };
         let table = Table { rules: Arc::new(meta.to_rules().unwrap()), meta, rows: vec![], next: 1, version: 0 };
-        SESSIONS.lock().unwrap().entry(s.to_string()).or_default().tables.insert("tt".to_string(), table);
-        SESSION.sync_scope(Some(s.to_string()), || {
+        at.all.lock().unwrap().entry(s.to_string()).or_default().tables.insert("tt".to_string(), table);
+        SESSION.sync_scope(named(&at, s), || {
             assert_eq!(columns_of("tt"), Some(vec![("u".to_string(), Some("uuid".to_string())), ("v".to_string(), Some("varchar(3)".to_string())), ("n".to_string(), None)]));
             assert_eq!(columns_of("other"), None, "a name with no temporary table of the session's is left to the lake");
             assert_eq!(made("tt"), Some(("table", "CREATE TEMPORARY TABLE tt (\n  u UUID,\n  v VARCHAR(3),\n  n BIGINT\n)".to_string())), "SHOW CREATE gives each column's own type");
         });
-        SESSIONS.lock().unwrap().remove(s);
+        at.all.lock().unwrap().remove(s);
     }
 
     /// The tests' host: CHECKs planned in the node's base session, and no DEFAULT to fill.
@@ -666,34 +751,36 @@ mod tests {
     async fn a_temporary_table_refuses_what_its_not_null_and_checks_refuse() {
         // (its writes are shaped as a lake table's are: `rules::shape` checks each batch before `apply` puts it in place)
         let s = "unit-temp-checks";
+        let at = Arc::new(Sessions::default());
         let meta = { let mut entry = TableMeta::made(crate::store::Made { columns: vec![("a".into(), "Int32".into()), ("c".into(), "Int32".into())], not_null: vec!["a".into()], ..Default::default() }); entry.checks = vec![("tt_c_check".into(), "c > 0".into())]; entry.ids = true; entry };
         let rules = Arc::new(meta.to_rules().unwrap());
-        SESSIONS.lock().unwrap().entry(s.to_string()).or_default().tables.insert("tt".to_string(), Table { rules: rules.clone(), meta, rows: vec![], next: 1, version: 0 });
+        at.all.lock().unwrap().entry(s.to_string()).or_default().tables.insert("tt".to_string(), Table { rules: rules.clone(), meta, rows: vec![], next: 1, version: 0 });
         let null_a = crate::rules::shape(&rules, "tt", crate::rules::Rows::Whole(ac_batch(vec![None], vec![1])), crate::rules::How::Change, &Checks).await.err().expect("a NULL in NOT NULL");
         assert!(format!("{null_a:#}").contains("tt.a is NOT NULL"), "{null_a:#}");
         let bad_c = crate::rules::shape(&rules, "tt", crate::rules::Rows::Whole(ac_batch(vec![Some(1)], vec![-5])), crate::rules::How::Change, &Checks).await.err().expect("a CHECK");
         assert!(format!("{bad_c:#}").contains("violates check constraint \"tt_c_check\""), "{bad_c:#}");
         let good = crate::rules::shape(&rules, "tt", crate::rules::Rows::Whole(ac_batch(vec![Some(1), Some(2)], vec![5, 6])), crate::rules::How::Change, &Checks).await.unwrap();
-        apply(s, "tt", HashSet::new(), vec![good]).unwrap();
-        let kept: usize = SESSIONS.lock().unwrap()[s].tables["tt"].rows.iter().map(|b| b.num_rows()).sum();
+        SESSION.sync_scope(named(&at, s), || apply(s, "tt", HashSet::new(), vec![good])).unwrap();
+        let kept: usize = at.all.lock().unwrap()[s].tables["tt"].rows.iter().map(|b| b.num_rows()).sum();
         assert_eq!(kept, 2, "the refused writes left nothing; the good rows are there");
-        SESSIONS.lock().unwrap().remove(s);
+        at.all.lock().unwrap().remove(s);
     }
 
     #[tokio::test]
     async fn rows_shaped_for_another_definition_are_checked_again() {
         // (rows shaped for a definition the table no longer has are checked again, as the log checks its rows: R9)
         let s = "unit-temp-redefined";
+        let at = Arc::new(Sessions::default());
         let meta = { let mut entry = TableMeta::made(crate::store::Made { columns: vec![("a".into(), "Int32".into()), ("c".into(), "Int32".into())], not_null: vec!["a".into()], ..Default::default() }); entry.checks = vec![("tt_c_check".into(), "c > 0".into())]; entry.ids = true; entry };
         let mut loose = meta.clone();
         loose.checks.clear();
         let shaped = crate::rules::shape(&Arc::new(loose.to_rules().unwrap()), "tt", crate::rules::Rows::Whole(ac_batch(vec![Some(1)], vec![-5])), crate::rules::How::Change, &Checks).await.unwrap();
-        SESSIONS.lock().unwrap().entry(s.to_string()).or_default().tables.insert("tt".to_string(), Table { rules: Arc::new(meta.to_rules().unwrap()), meta, rows: vec![], next: 1, version: 0 });
-        let refused = apply(s, "tt", HashSet::new(), vec![shaped]).unwrap_err();
+        at.all.lock().unwrap().entry(s.to_string()).or_default().tables.insert("tt".to_string(), Table { rules: Arc::new(meta.to_rules().unwrap()), meta, rows: vec![], next: 1, version: 0 });
+        let refused = SESSION.sync_scope(named(&at, s), || apply(s, "tt", HashSet::new(), vec![shaped])).unwrap_err();
         assert!(format!("{refused:#}").contains("violates check constraint \"tt_c_check\""), "{refused:#}");
-        let kept: usize = SESSIONS.lock().unwrap()[s].tables["tt"].rows.iter().map(|b| b.num_rows()).sum();
+        let kept: usize = at.all.lock().unwrap()[s].tables["tt"].rows.iter().map(|b| b.num_rows()).sum();
         assert_eq!(kept, 0, "nothing is kept");
-        SESSIONS.lock().unwrap().remove(s);
+        at.all.lock().unwrap().remove(s);
     }
 }
 

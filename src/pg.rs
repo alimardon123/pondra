@@ -58,11 +58,14 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
         let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: cancels.clone() };
         let pg = Arc::new(Pg(backend, Arc::new(startup), cancel.clone()));
         let used = app.lake.node.idle.begin(); // (an open connection is a use of the node: `idle.rs`)
+        let home = crate::temp::sessions(&app.lake); // (the node's sessions, which this connection's ends in)
         crate::panics::task(async move {
             let _used = used;
             let _ = socket.set_nodelay(true);
             let _ = pgwire::tokio::process_socket(socket, tls, pg).await;
-            crate::temp::end(&session);
+            if let Some(at) = &home {
+                at.end(&session);
+            }
         });
     }
 }
@@ -164,7 +167,7 @@ impl Startup {
                 let sql = format!("USE DATABASE {}", crate::objects::ident(&db));
                 let who = self.backend.who();
                 let into = crate::set::statement(lake, &sql, &who.scope);
-                crate::temp::SESSION.scope(Some(self.backend.session.clone()), crate::auth::WHO.scope(who.clone(), into)).await.map_err(said)?;
+                crate::temp::SESSION.scope(self.backend.named(), crate::auth::WHO.scope(who.clone(), into)).await.map_err(said)?;
             }
         }
         finish(client, &self.cancels).await
@@ -419,6 +422,9 @@ fn worded(e: anyhow::Error, shows_code: bool) -> PgWireError {
 fn plain(e: anyhow::Error) -> PgWireError { worded(e, false) }
 
 impl Backend {
+    /// This connection's session, with its node's sessions (the scope its statements run in: `temp::SESSION`).
+    fn named(&self) -> Option<crate::temp::Named> { crate::temp::named(&self.app.lake, Some(self.session.clone())) }
+
     /// Run one statement the way `POST /sql` does, for a client whose role comes from its user name.
     async fn run(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
         crate::dialect_stmts::refused(sql).map_err(self.err())?; // (as every door refuses them: `dialect_stmts.rs`)
@@ -581,7 +587,7 @@ impl Backend {
         let (u, q, f) = (user.to_string(), sql.to_string(), format.clone());
         let who = self.signed().await?;
         let run = async move {
-            let session = Some(me.session.clone());
+            let session = me.named();
             crate::routines::with_notices(crate::temp::SESSION.scope(session, crate::auth::WHO.scope(who, me.caught(&u, &q, &f)))).await
         };
         let (out, heard) = crate::panics::work(&self.app.lake.node, true, Box::pin(run)).await.unwrap_or_else(|m| (Err(self.err()(anyhow::anyhow!(m))), vec![])); // (stoppable for memory: `oom.rs`)
@@ -680,7 +686,7 @@ impl Backend {
             Err(PgWireError::UserError(e)) if e.message == crate::oom::OOM => crate::oom::OOM,
             _ => return,
         };
-        crate::temp::SESSION.sync_scope(Some(self.session.clone()), || crate::txn::failed(why));
+        crate::temp::SESSION.sync_scope(self.named(), || crate::txn::failed(why));
     }
 
     /// `COPY … TO STDOUT`: the rows, one COPY message each.
@@ -1618,7 +1624,7 @@ impl SimpleQueryHandler for Backend {
         let mut out = vec![];
         for q in crate::routines::split(query).iter().map(|q| q.trim()) {
             out.push(match Copy::of(q) {
-                Some(Ok(c)) if !c.to => crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.signed().await?, self.copy_in(client, &user, c))).await?,
+                Some(Ok(c)) if !c.to => crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(self.signed().await?, self.copy_in(client, &user, c))).await?,
                 _ => self.told(client, &user, q, &Format::UnifiedText).await?,
             });
         }
@@ -1663,7 +1669,7 @@ impl ExtendedQueryHandler for Backend {
     {
         if let Some(name) = message.name.clone().filter(|_| message.target_type == TARGET_TYPE_BYTE_PORTAL) {
             if client.portal_store().get_portal(&name).is_none() {
-                crate::temp::SESSION.sync_scope(Some(self.session.clone()), || cursor_portal(&*client, name));
+                crate::temp::SESSION.sync_scope(self.named(), || cursor_portal(&*client, name));
             }
         }
         self._on_describe(&mut Corked::new(client), message).await
@@ -1715,15 +1721,15 @@ impl ExtendedQueryHandler for Backend {
         let user = client.metadata().get("user").cloned().unwrap_or_default();
         let statement = &portal.statement.statement;
         if let Some(Ok(c)) = Copy::of(&statement.sql).filter(|c| c.as_ref().is_ok_and(|c| !c.to)) {
-            return crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.signed().await?, self.copy_in(client, &user, c))).await;
+            return crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(self.signed().await?, self.copy_in(client, &user, c))).await;
         }
         let who = self.signed().await?; // (a key lookup's and a plan's types, of what it may read: as whoever signed in)
-        let inferred = crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(who, self.types(statement))).await;
+        let inferred = crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(who, self.types(statement))).await;
         let out = self.told(client, &user, &bind(portal, inferred)?, &portal.result_column_format).await?;
         match statement.answered(&out, &portal.result_column_format) {
             Ok(()) => Ok(out),
             Err(e) => {
-                crate::temp::SESSION.sync_scope(Some(self.session.clone()), || crate::txn::failed(&e.to_string())); // (as any error fails a transaction: `caught`)
+                crate::temp::SESSION.sync_scope(self.named(), || crate::txn::failed(&e.to_string())); // (as any error fails a transaction: `caught`)
                 Err(e)
             }
         }
@@ -1740,7 +1746,7 @@ impl ExtendedQueryHandler for Backend {
             Err(e) => return self.noted(&stmt.statement.sql, Err(e)).await,
         };
         let described = async { Ok(DescribeStatementResponse::new(self.types(&stmt.statement).await.to_vec(), self.describe(&sql, &stmt.statement.sql, &Format::UnifiedText).await?.0)) };
-        let out = crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(who, described)).await; // (its temporary tables too)
+        let out = crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(who, described)).await; // (its temporary tables too)
         self.noted(&stmt.statement.sql, out).await
     }
 
@@ -1764,7 +1770,7 @@ impl ExtendedQueryHandler for Backend {
             statement.keep(columns);
             Ok(DescribePortalResponse::new(fields))
         };
-        let out = crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(who, described)).await; // (as whoever signed in, as above)
+        let out = crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(who, described)).await; // (as whoever signed in, as above)
         self.noted(&sent, out).await
     }
 }
@@ -1776,7 +1782,7 @@ impl Backend {
     async fn noted<T>(&self, sql: &str, out: PgWireResult<T>) -> PgWireResult<T> {
         let Err(e) = out else { return out };
         let failed = crate::audit::statement(&self.app, sql, async { Err::<T, _>(e) });
-        crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.who(), failed)).await
+        crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(self.who(), failed)).await
     }
 
     /// A statement's `param_types`, worked out once (`Prepared`).

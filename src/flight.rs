@@ -448,7 +448,7 @@ fn rows_of(w: Worded, got: Answer<Encoded>) -> Result<Vec<RecordBatch>, Status> 
 async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<&[u8]>, descriptor: FlightDescriptor) -> Result<Response<FlightInfo>, Status> {
     let pool = app.lake.rt.memory_pool.clone();
     let (app, sql, w) = (app.clone(), sql.to_string(), Worded::of(&who.scope));
-    let batches = worked(w, app.lake.node.clone(), txn, async move {
+    let batches = worked(w, app.lake.node.clone(), crate::temp::sessions(&app.lake), txn, async move {
         let req = crate::routines::Request { sql, ..Default::default() };
         let how = How { job: None, spread: None, after: None, stale: None };
         rows_of(w, statement::run(&app, req, how, who, &FlightWire).await.map_err(w.err())?)
@@ -492,9 +492,9 @@ async fn answer(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown
 /// caller (`auth::carried`, which a spawned task would lose), and through `panics::work`, where the memory
 /// watch (`oom.rs`) may stop a query that grew the node, and a long one moves to the queries' runtime
 /// (invariant 231). A statement the node stopped for memory fails its transaction, as on HTTP and Postgres.
-async fn worked<T: Send + 'static>(w: Worded, node: Arc<crate::node_state::NodeState>, txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>> + Send + 'static) -> Result<T, Status> {
+async fn worked<T: Send + 'static>(w: Worded, node: Arc<crate::node_state::NodeState>, at: Option<Arc<crate::temp::Sessions>>, txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>> + Send + 'static) -> Result<T, Status> {
     prune_kept(); // (every Flight call that runs work lets go of the kept answers that expired, not only a script's)
-    let session = txn.map(in_txn).transpose()?;
+    let session = txn.map(in_txn).transpose()?.and_then(|s| at.map(|at| crate::temp::Named { name: s, at }));
     let failing = session.clone();
     let f = crate::auth::carried(in_session(session, f));
     match crate::panics::work(&node, true, f).await {
@@ -520,12 +520,12 @@ enum Sent {
 /// A statement's answer as Flight data. Its work (`f`, which runs in `query::PIECES`, so a query may hand its answer to the
 /// stream in pieces as its plan makes them) is `worked` as every statement is, and the answer is then its whole form
 /// (`whole`, or `sent_as_kept` for the bytes the results cache keeps) or its pieces (`piece_stream`).
-async fn answered<F>(w: Worded, node: Arc<crate::node_state::NodeState>, txn: Option<&[u8]>, f: F) -> Result<Out<FlightData>, Status>
+async fn answered<F>(w: Worded, node: Arc<crate::node_state::NodeState>, at: Option<Arc<crate::temp::Sessions>>, txn: Option<&[u8]>, f: F) -> Result<Out<FlightData>, Status>
 where
     F: std::future::Future<Output = Result<Flown, Status>> + Send + 'static,
 {
     let held = node.clone(); // (the body's count, and the rest of the statement's, are this node's)
-    let sent = worked(w, node, txn, async move {
+    let sent = worked(w, node, at, txn, async move {
         let (hand, mut handed) = tokio::sync::oneshot::channel();
         // (`worked` gives this future its transaction's session and who asked, once for the statement. When its answer is handed
         // over, the rest runs aside: then those two go on it, and only then, as an HTTP request's do)
@@ -688,12 +688,12 @@ fn in_txn(id: &[u8]) -> Result<String, Status> {
 /// `f`, in the session of the transaction the call names, if it names one: its reads see the
 /// transaction's snapshot and its own writes, as a POST /sql statement sent with its session does.
 /// Without a transaction id, `f` runs as it always has.
-async fn within<T>(txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>>) -> Result<T, Status> {
-    in_session(txn.map(in_txn).transpose()?, f).await
+async fn within<T>(at: Option<Arc<crate::temp::Sessions>>, txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>>) -> Result<T, Status> {
+    in_session(txn.map(in_txn).transpose()?.and_then(|s| at.map(|at| crate::temp::Named { name: s, at })), f).await
 }
 
 /// `f` in a transaction's session, when there is one (`within` and `worked` both).
-async fn in_session<F: std::future::Future>(session: Option<String>, f: F) -> F::Output {
+async fn in_session<F: std::future::Future>(session: Option<crate::temp::Named>, f: F) -> F::Output {
     match session {
         Some(s) => crate::temp::SESSION.scope(Some(s), f).await,
         None => f.await,
@@ -967,15 +967,15 @@ impl FlightSqlService for Sql {
         if crate::write::parse(&q.query).is_some() {
             // A write sent as a query (DB-API's `execute`): done now; the ticket reads back the count.
             let (app, sql) = (self.0.clone(), q.query.clone());
-            let rows = worked(w, app.lake.node.clone(), txn, async move { write(&app, who, &sql).await }).await?;
+            let rows = worked(w, app.lake.node.clone(), crate::temp::sessions(&app.lake), txn, async move { write(&app, who, &sql).await }).await?;
             let ticket = TicketStatementQuery { statement_handle: format!("rows:{rows}").into_bytes().into() };
             return info(w, &crate::answer::arrow_schema(&rows_schema()), ticket.as_any().encode_to_vec(), req.into_inner());
         }
         // A query is planned here and run by its ticket; a script (several statements) can't be planned, so it runs now, as a CALL does.
-        let Some((_, one)) = within(txn, async { statement::plain_of(&self.0, &q.query, &who.scope).await.map_err(w.err()) }).await? else {
+        let Some((_, one)) = within(crate::temp::sessions(&self.0.lake), txn, async { statement::plain_of(&self.0, &q.query, &who.scope).await.map_err(w.err()) }).await? else {
             return kept(&self.0, &q.query, who, txn, req.into_inner()).await;
         };
-        let schema = within(txn, async { planned(&self.0, &one, &who.scope).await.map_err(w.err()) }).await?;
+        let schema = within(crate::temp::sessions(&self.0.lake), txn, async { planned(&self.0, &one, &who.scope).await.map_err(w.err()) }).await?;
         let ticket = TicketStatementQuery { statement_handle: handle(&q.query, txn).into() };
         info(w, &schema, ticket.as_any().encode_to_vec(), req.into_inner())
     }
@@ -987,15 +987,17 @@ impl FlightSqlService for Sql {
         let app = self.0.clone();
         let who = crate::routines::Who { role, files: false, depth: 0, scope: caller(&req).scope };
         // (boxed: a statement's future is large, and each layer of `answered`'s and `worked`'s would copy it by value)
-        Ok(Response::new(answered(w, app.lake.node.clone(), txn, Box::pin(async move { answer(&app, &sql, who).await })).await?))
+        Ok(Response::new(answered(w, app.lake.node.clone(), crate::temp::sessions(&app.lake), txn, Box::pin(async move { answer(&app, &sql, who).await })).await?))
     }
 
     async fn do_action_begin_transaction(&self, _: ActionBeginTransactionRequest, req: Request<Action>) -> Result<ActionBeginTransactionResult, Status> {
         allowed(&self.0, &req, Role::Read)?;
         let w = worded(&req);
         let id = format!("fl-{}", uuid::Uuid::new_v4().simple()); // (the client's handle; its session is the caller's own, named by it)
-        crate::temp::with(&crate::temp::id(&id), false, |_| Ok(())).map_err(w.err())?; // (held as a session: an idle one ends, its transaction rolled back, as `temp::reap` does)
-        crate::temp::SESSION.scope(Some(crate::temp::id(&id)), crate::txn::protocol(&self.0, "BEGIN")).await.map_err(w.err())?;
+        if let Some(at) = crate::temp::sessions(&self.0.lake) {
+            at.with(&crate::temp::id(&id), false, |_| Ok(())).map_err(w.err())?; // (held as a session: an idle one ends, its transaction rolled back, as `temp::reap` does)
+        }
+        crate::temp::SESSION.scope(crate::temp::named(&self.0.lake, Some(crate::temp::id(&id))), crate::txn::protocol(&self.0, "BEGIN")).await.map_err(w.err())?;
         Ok(ActionBeginTransactionResult { transaction_id: id.into_bytes().into() })
     }
 
@@ -1009,8 +1011,12 @@ impl FlightSqlService for Sql {
         let session = in_txn(&q.transaction_id)?;
         // (no statement text: COMMIT and ROLLBACK take none, only BEGIN's modes do)
         let (app, w) = (self.0.clone(), worded(&req));
-        let out = worked(w, app.lake.node.clone(), Some(&q.transaction_id[..]), async move { crate::txn::protocol(&app, word).await.map_err(w.err()) }).await;
-        crate::temp::end(&session); // (the session ends with its transaction, committed or not)
+        let home = crate::temp::sessions(&app.lake);
+        let out = worked(w, app.lake.node.clone(), home.clone(), Some(&q.transaction_id[..]), async move { crate::txn::protocol(&app, word).await.map_err(w.err()) }).await;
+        // (the session ends with its transaction, committed or not)
+        if let Some(at) = &home {
+            at.end(&session);
+        }
         let (tag, _) = out?;
         if word == "COMMIT" && tag == "ROLLBACK" {
             // (a failed transaction's COMMIT rolls back, as in Postgres: a client must learn it did not commit)
@@ -1023,7 +1029,7 @@ impl FlightSqlService for Sql {
         let role = allowed(&self.0, &req, Role::Write)?;
         let (app, sql) = (self.0.clone(), cmd.query.clone());
         let who = crate::routines::Who { role, files: false, depth: 0, scope: caller(&req).scope };
-        worked(Worded::of(&who.scope), app.lake.node.clone(), cmd.transaction_id.as_deref(), async move { write(&app, who, &sql).await }).await
+        worked(Worded::of(&who.scope), app.lake.node.clone(), crate::temp::sessions(&app.lake), cmd.transaction_id.as_deref(), async move { write(&app, who, &sql).await }).await
     }
 
     async fn do_put_statement_ingest(&self, cmd: CommandStatementIngest, req: Request<PeekableFlightDataStream>) -> Result<i64, Status> {
@@ -1262,7 +1268,7 @@ impl FlightService for Door {
                 (Some(sql), _) => {
                     let app = app.clone();
                     let who = crate::routines::Who { role, files: false, depth: 0, scope: signed.scope };
-                    Ok(Response::new(answered(w, app.lake.node.clone(), None, Box::pin(async move { query(&app, &sql, who).await })).await?))
+                    Ok(Response::new(answered(w, app.lake.node.clone(), crate::temp::sessions(&app.lake), None, Box::pin(async move { query(&app, &sql, who).await })).await?))
                 }
                 (None, Some(table)) => {
                     let name = crate::auth::catalog_name(&table);

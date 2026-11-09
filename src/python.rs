@@ -557,7 +557,7 @@ pub async fn ask(packages: &str, kind: Use, head: Value, parts: Vec<Vec<u8>>, li
 
 /// A session's Python: its cells — the console's, and DO blocks a client sends in a session — run
 /// on one worker kept for it, in one namespace, so each sees what the cells before it made, as a
-/// notebook's kernel does. One cell runs at a time. It ends with its session (`temp::end`), after
+/// notebook's kernel does. One cell runs at a time. It ends with its session (`temp::Sessions::end`), after
 /// `PONDRA_SESSION_IDLE_SECS` idle (3600), or past its memory (`PONDRA_WORKER_MB`); the next cell
 /// then starts a new one, empty, and says so.
 struct Kernel {

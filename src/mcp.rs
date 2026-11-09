@@ -36,16 +36,20 @@ pub async fn handle(State(app): State<App>, Extension(who): Extension<crate::aut
     // the idle time, not ended): otherwise 404, and the client initializes again (the Streamable HTTP
     // spec). A request with no session header is stateless, as before.
     if let (Some(s), false) = (&session, method == "initialize") {
-        if !crate::temp::live(s) {
+        if !crate::temp::sessions(&app.lake).is_some_and(|at| at.live(s)) {
             return gone(&id);
         }
-        crate::temp::touch(s);
+        if let Some(at) = crate::temp::sessions(&app.lake) {
+            at.touch(s);
+        }
     }
     let mut minted = None; // (`initialize` gives the client its session)
     let result = match method {
         "initialize" => {
             let raw = format!("mcp-{}", uuid::Uuid::new_v4().simple());
-            let _ = crate::temp::with(&crate::temp::id(&raw), false, |_| Ok(())); // (held from now: idle ends it, `reap`)
+            if let Some(at) = crate::temp::sessions(&app.lake) {
+                let _ = at.with(&crate::temp::id(&raw), false, |_| Ok(())); // (held from now: idle ends it, `reap`)
+            }
             minted = Some(raw);
             json!({
                 "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
@@ -60,7 +64,7 @@ pub async fn handle(State(app): State<App>, Extension(who): Extension<crate::aut
             let all = [tools().as_array().cloned().unwrap_or_default(), crate::find::mcp_tools(), procedures(&app, &who.scope).await].concat();
             json!({"tools": all})
         }
-        "tools/call" => match crate::temp::SESSION.scope(session, call(&app, &who, params)).await {
+        "tools/call" => match crate::temp::SESSION.scope(crate::temp::named(&app.lake, session), call(&app, &who, params)).await {
             Ok(result) => result,
             Err(error) => return Json(json!({"jsonrpc": "2.0", "id": id, "error": error})).into_response(), // (no such tool: a protocol error)
         },
@@ -97,10 +101,12 @@ fn valid(id: &str) -> bool {
 
 /// `DELETE /mcp` with its `Mcp-Session-Id`: the session ends, its transaction rolled back and its
 /// temporary tables gone, as an MCP client does when it closes. One this node doesn't hold is 404.
-pub async fn end(headers: HeaderMap) -> Response {
+pub async fn end(State(app): State<App>, headers: HeaderMap) -> Response {
     match named(&headers) {
-        Ok(Some(session)) if crate::temp::live(&session) => {
-            crate::temp::end(&session);
+        Ok(Some(session)) if crate::temp::sessions(&app.lake).is_some_and(|at| at.live(&session)) => {
+            if let Some(at) = crate::temp::sessions(&app.lake) {
+                at.end(&session);
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(Some(_)) => gone(&Value::Null),
@@ -355,10 +361,14 @@ async fn run(app: &App, who: &crate::auth::Principal, sql: &str, job: Option<Str
     let (params, views) = (HashMap::new(), HashMap::new());
     let go = crate::routines::script(app, sql, &params, &views, who, job);
     let out = match &own {
-        Some(s) => crate::temp::SESSION.scope(Some(s.clone()), go).await,
+        Some(s) => crate::temp::SESSION.scope(crate::temp::named(&app.lake, Some(s.clone())), go).await,
         None => go.await,
     };
-    own.inspect(|s| _ = crate::temp::end(s));
+    own.inspect(|s| {
+        if let Some(at) = crate::temp::sessions(&app.lake) {
+            at.end(s);
+        }
+    });
     out
 }
 

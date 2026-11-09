@@ -58,7 +58,7 @@ pub fn router(app: App) -> Router {
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
         .route("/live", get(crate::live::live).post(crate::live::live))
-        .route("/sessions/{id}", axum::routing::delete(|Path(id): Path<String>| async move { Json(j!({"ended": crate::temp::end(&crate::temp::id(&id))})) }))
+        .route("/sessions/{id}", axum::routing::delete(|State(app): State<App>, Path(id): Path<String>| async move { Json(j!({"ended": crate::temp::sessions(&app.lake).is_some_and(|at| at.end(&crate::temp::id(&id)))})) }))
         .route("/sessions/{id}/python", get(session_python).delete(session_python).post(session_python))
         .route("/python", get(list_pythons).put(choose_python))
         .route("/python/format", post(format_python))
@@ -427,7 +427,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         Ok(r) => told_to(shows_code, r),
         Err(m) => {
             if let (true, Some((who, headers))) = (m == crate::oom::OOM, asked) {
-                crate::statement::failed_for_memory(who, &headers); // (the node stopped the statement: its transaction fails, as an error's does)
+                crate::statement::failed_for_memory(who, &headers, &app.lake); // (the node stopped the statement: its transaction fails, as an error's does)
             }
             E(anyhow::anyhow!(m)).into_response() // (and the node stays up)
         }
@@ -1166,22 +1166,23 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
 async fn sql(State(app): State<App>, Query(p): Query<crate::statement::SqlParams>, role: axum::Extension<crate::auth::Role>, who: axum::Extension<crate::auth::Principal>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let format = p.format.clone(); // (an answer handed to the door in pieces is sent in this format)
     let node = app.lake.node.clone(); // (an answer in pieces is in flight until its last piece is read: `pieces`)
+    let sessions = crate::temp::sessions(&app.lake); // (the node's: whether the session holds anything here, `held_session`)
     let said = crate::statement::sql(app, p, role.0, who.0.scope, headers, body).await;
     let mut r = match said.reply {
         Ok(crate::statement::Reply::Rendered(r)) => respond(r, format.as_deref(), &node),
         Ok(crate::statement::Reply::Done(v)) => Json(v).into_response(),
         Err(e) => E::from(e).into_response(),
     };
-    r = held_session(r, said.session.as_deref());
+    r = held_session(r, said.session.as_deref(), sessions.as_deref());
     if let Some(h) = crate::statement::notices(&said.heard).and_then(|t| axum::http::HeaderValue::from_str(&t).ok()) {
         r.headers_mut().insert("x-pondra-notices", h);
     }
     r
 }
 
-/// The header that keeps a client to this node while its session holds temporary tables (`temp::holds`).
-fn held_session(mut r: Response, session: Option<&str>) -> Response {
-    if session.is_some_and(crate::temp::holds) {
+/// The header that keeps a client to this node while its session holds temporary tables (`temp::Sessions::holds`).
+fn held_session(mut r: Response, session: Option<&str>, at: Option<&crate::temp::Sessions>) -> Response {
+    if session.is_some_and(|s| at.is_some_and(|at| at.holds(s))) {
         let (name, value) = crate::statement::HELD_SESSION;
         r.headers_mut().insert(name, axum::http::HeaderValue::from_static(value)); // (a client keeps to this node meanwhile)
     }

@@ -115,6 +115,7 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add::<crate::spmd::Shuffles>();
             states.add::<crate::users::SignIns>();
             states.add::<crate::users::Turns>();
+            states.add::<crate::temp::Sessions>();
             states.add::<crate::auth::Guesses>();
         }
         #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)

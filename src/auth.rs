@@ -100,7 +100,7 @@ pub fn holder() -> String { current().map_or_else(|| "node".to_string(), |p| for
 /// same user (its grants) and session. A spawned task keeps no task-local, and with no principal a
 /// started procedure ran with its role's every right, past the user's grants.
 pub fn carried<F: std::future::Future>(f: F) -> impl std::future::Future<Output = F::Output> {
-    let (who, node, session) = (current(), node_work(), crate::temp::current());
+    let (who, node, session) = (current(), node_work(), crate::temp::here());
     async move {
         let f = crate::temp::SESSION.scope(session, f);
         match who {
