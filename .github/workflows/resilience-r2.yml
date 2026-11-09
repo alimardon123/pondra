@@ -45,8 +45,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - name: boto3 (to delete the lakes)
-        run: pip install boto3
+      - name: boto3 (to delete the lakes) and pyarrow (the storage part's outside glob writes its files)
+        run: pip install --no-compile -r <(grep -iE '^(boto3|pyarrow)' tools/requirements.txt)
       - name: This commit's Linux binary (the build workflow's)
         run: |
           bash tools/ci_artifact.sh linux-x64 "$SHA"

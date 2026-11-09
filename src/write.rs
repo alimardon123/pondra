@@ -134,7 +134,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         }).transpose()?;
         schema(&columns)?; // validate types
         ensure!(columns.iter().all(|(c, _)| !crate::text::NAMES.contains(&c.as_str()) && c != "_old_version"), "{} are system columns: every table has them (`SELECT _row_id, * FROM t`)", crate::text::NAMES.join(", "));
-        ensure!(merge.values().all(|f| ["sum", "count", "min", "max", crate::finish::MOMENTS].contains(&f.as_str())), "MERGE: sum, count, min or max"); // (moments: a view's variance, `finish.rs`; an ALTER of its table sends them back)
+        ensure!(merge.values().all(|f| ["sum", "count", "min", "max"].contains(&f.as_str()) || crate::finish::parts(f)), "MERGE: sum, count, min or max"); // (moments: a view's variance, `finish.rs`; an ALTER of its table sends them back)
         ensure!(merge.is_empty() || !key.is_empty(), "MERGE needs a key: a merge table combines the rows of each key");
         ensure!(merge.keys().all(|c| columns.iter().any(|(n, _)| n == c)), "MERGE: columns of the table");
         if let Some((c, _)) = columns.iter().find(|(c, _)| !merge.is_empty() && !key.contains(c) && !merge.contains_key(c)) {
@@ -315,6 +315,7 @@ pub enum Stmt {
     TempView(String, String, bool, bool),                  // CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] name AS query: the session's (`temp.rs`)
     TempSecret(String, std::collections::BTreeMap<String, String>, bool, bool), // CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…): the session's, in memory (`temp.rs`)
     TempRoutine(String, Box<crate::expander::Routine>, bool, bool), // CREATE [OR REPLACE] TEMP MACRO | FUNCTION [IF NOT EXISTS] name …: the session's (`temp.rs`)
+    UndropFile(String),                                   // UNDROP FILE 'path': a deleted file back from its versions (`files::undrop`)
 }
 
 impl Stmt {
@@ -362,7 +363,7 @@ impl Stmt {
         match self {
             Stmt::Create(c) => object(&c.name),
             Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) | Stmt::CopyInto(t, ..) => t.clone(),
-            Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) => String::new(),
+            Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::UndropFile(_) => String::new(),
             Stmt::TempView(v, ..) | Stmt::TempSecret(v, ..) | Stmt::TempRoutine(v, ..) => v.clone(),
             Stmt::Merge(m) => m.target.clone(),
         }
@@ -695,27 +696,8 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if matches!(head.as_str(), "export" | "import") && PORTABLE.is_match(first_word(sql)) {
         return Some(Stmt::Invalid("EXPORT DATABASE and IMPORT DATABASE are not supported yet: BACKUP DATABASE TO 'place' copies a database (RESTORE DATABASE name FROM 'place' brings it back), and COPY t TO 'dir/t.parquet' (FORMAT parquet) writes a table's rows".into()));
     }
-    // `UNDROP <kind> name` (Snowflake's, Databricks'): what was dropped last under that name, back (ADR-043; a definition's:
-    // `undrop.rs`). The kinds are those whose verbs the registry lists UNDROP among (`objects::Kind`), so a kind that keeps
-    // its drops is undropped with no edit here.
     if head == "undrop" {
-        static UNDROP: std::sync::LazyLock<(regex::Regex, String)> = std::sync::LazyLock::new(|| {
-            let mut kinds: Vec<&str> = crate::objects::all_kinds().filter(|k| k.verbs.contains(&"UNDROP")).map(|k| k.name).collect();
-            kinds.sort_by_key(|k| std::cmp::Reverse(k.len())); // ("table function" before "table")
-            let words = kinds.iter().map(|k| k.replace(' ', r"\s+")).collect::<Vec<_>>().join("|");
-            let re = regex::Regex::new(&format!(r#"(?is)^\s*UNDROP\s+({words})\s+([\w."-]+)\s*;?\s*$"#)).expect("a regex");
-            kinds.sort();
-            (re, kinds.iter().map(|k| k.to_uppercase()).collect::<Vec<_>>().join(", "))
-        });
-        let (re, kinds) = &*UNDROP;
-        let Some(c) = re.captures(first_word(sql)) else {
-            return Some(Stmt::Invalid(format!("UNDROP <kind> name brings back what was dropped last under the name, for these kinds: {kinds} (pondra.dropped lists what can come back)")));
-        };
-        let kind = c[1].split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-        return Some(Stmt::Ddl(vec![match kind.as_str() {
-            "table" => Ddl::Undrop { name: name(&c[2]) },
-            _ => Ddl::UndropKept { kind, name: name(&c[2]) },
-        }]));
+        return Some(undrop(first_word(sql)));
     }
     // DuckDB's CREATE MACRO … IF NOT EXISTS (the parser takes only OR REPLACE): read without it, kept unless one is there.
     static MACRO_QUIET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+(OR\s+REPLACE\s+)?(TEMP\s+|TEMPORARY\s+)?MACRO\s+)IF\s+NOT\s+EXISTS\s+").expect("a regex"));
@@ -741,7 +723,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Ok(sql) => sql,
         Err(e) => return Some(Stmt::of_error(&e, format!("{e:#}"))),
     };
-    let parsed = crate::parsed::read(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (as the front reads it, parsed once for its looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
+    let parsed = crate::parsed::read(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql).map(crate::parsed::signed_all))); // (as the front reads it, parsed once for its looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
     let parsed = match parsed {
         Ok(mut s) => s.pop()?,
         Err(_) => return None,
@@ -1174,7 +1156,7 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             ensure!(deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
-        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) => unreachable!("not a row write here"),
+        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) | Stmt::UndropFile(_) => unreachable!("not a row write here"),
     }
 }
 
@@ -1261,6 +1243,60 @@ fn distinct_names(q: &mut ast::Query) {
 pub fn checkpoint(sql: &str) -> bool {
     let code: String = sql.lines().map(|l| l.split("--").next().unwrap_or("")).collect::<Vec<_>>().join(" "); // (comments aside)
     code.trim().trim_end_matches(';').trim().eq_ignore_ascii_case("checkpoint")
+}
+
+/// `UNDROP <kind> name` (Snowflake's, Databricks'): what was dropped last under that name, back (ADR-043; a definition's:
+/// `undrop.rs`), and `UNDROP FILE 'path'`: a deleted file's newest version, back (`files::undrop`). The kinds are those
+/// whose verbs the registry lists UNDROP among (`objects::Kind`), so a kind that keeps its drops is undropped with no edit
+/// here. Any other is refused by name: Databricks' `WITH ID` and volumes, a kind whose drop is final (dropping one is how
+/// access is cut), and a kind whose drops aren't kept yet.
+fn undrop(sql: &str) -> Stmt {
+    use std::sync::LazyLock;
+    // (the kinds kept: `UNDROP <kind> name` read; the kinds a DROP takes, to name the one asked; the kept kinds, listed)
+    static WORDS: LazyLock<(regex::Regex, regex::Regex, String)> = LazyLock::new(|| {
+        let kinds = |undrops: bool| {
+            let mut ks: Vec<&str> = crate::objects::all_kinds().filter(|k| k.verbs.contains(&"DROP") && (!undrops || k.verbs.contains(&"UNDROP"))).map(|k| k.name).collect();
+            ks.sort_by_key(|k| std::cmp::Reverse(k.len())); // ("table function" before "table")
+            ks.iter().map(|k| k.replace(' ', r"\s+")).collect::<Vec<_>>().join("|")
+        };
+        let mut listed: Vec<String> = crate::objects::all_kinds().filter(|k| k.verbs.contains(&"UNDROP")).map(|k| k.name.to_uppercase()).collect();
+        listed.sort();
+        let re = |p: String| regex::Regex::new(&p).expect("a regex");
+        (
+            re(format!(r#"(?is)^\s*UNDROP\s+({})\s+([\w."-]+)\s*;?\s*$"#, kinds(true))),
+            re(format!(r"(?is)^\s*UNDROP\s+({}|\w+)\b(.*)$", kinds(false))),
+            listed.join(", "),
+        )
+    });
+    static FILE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*UNDROP\s+FILE\s+'((?:[^']|'')*)'\s*;?\s*$").expect("a regex"));
+    static WITH_ID: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)\bWITH\s+ID\b").expect("a regex"));
+    let (kept, named, kinds) = &*WORDS;
+    if let Some(c) = kept.captures(sql) {
+        let (kind, name) = (c[1].split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase(), crate::text::object_of(&c[2]));
+        return Stmt::Ddl(vec![match kind.as_str() {
+            "table" => crate::ddl::Ddl::Undrop { name },
+            _ => crate::ddl::Ddl::UndropKept { kind, name },
+        }]);
+    }
+    if let Some(c) = FILE.captures(sql) {
+        return Stmt::UndropFile(c[1].replace("''", "'"));
+    }
+    let (kind, rest) = named.captures(sql).map_or((String::new(), String::new()), |c| (c[1].split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase(), c[2].to_string()));
+    let word = kind.to_uppercase();
+    let what = format!("UNDROP <kind> name brings back what was dropped last under the name, for {kinds}, and UNDROP FILE 'path' a deleted file (pondra.dropped lists what can come back, with the UNDROP for each)");
+    const VOLUME: &str = "is Databricks': here a volume's files are the lake's own (files/), and UNDROP FILE 'path' brings back one deleted (pondra.dropped lists them)";
+    let foreign = |why: String| Stmt::Refused("0A000", why);
+    let registry = crate::objects::kind(&kind);
+    match kind.as_str() {
+        "volume" if WITH_ID.is_match(&rest) => foreign(format!("UNDROP VOLUME … WITH ID {VOLUME}")),
+        "volume" => foreign(format!("UNDROP VOLUME {VOLUME}")),
+        _ if WITH_ID.is_match(&rest) => foreign(format!("UNDROP {word} … WITH ID is Databricks': UNDROP {word} name brings back the newest dropped under that name, and to reach an earlier one, rename what came back and run it again (pondra.dropped lists each, with the UNDROP that brings it back)")),
+        "user" | "role" | "identity provider" | "share" | "recipient" => foreign(format!("a dropped {kind} stays dropped, as dropping one is how access is cut: CREATE {word} makes one again")),
+        "file" => Stmt::Refused("42601", "UNDROP FILE 'path': the deleted file's path in quotes, as pondra.dropped lists it".into()),
+        _ if registry.is_some_and(|k| k.verbs.contains(&"UNDROP")) => Stmt::Refused("42601", format!("UNDROP {word} name: the {kind} dropped last under that name, back (pondra.dropped lists those kept)")),
+        _ if registry.is_some() => foreign(format!("UNDROP {word} is not supported yet: {what}")),
+        _ => Stmt::Refused("42601", what),
+    }
 }
 
 /// Does a write to this table go through the log? Keyed tables' do (new versions), and so does
@@ -1413,7 +1449,7 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
         return Ok(None);
     }
     // (out of memory, once more frugally: the first try's files are never recorded, and the orphan sweep takes them)
-    let (columns, files) = crate::query::frugally(ctx, |ctx| async move {
+    let (columns, files) = crate::query::frugally(&lake.node, ctx, |ctx| async move {
         in_order(&ctx);
         let df = crate::engine::sql(&ctx, &crate::sys::planned(query)?).await?;
         write_rows(lake, &ctx, table, df, stamp).await
@@ -1802,7 +1838,7 @@ impl Drop for Undo {
         let Some((app, name, job, scope)) = self.0.take() else { return };
         // (carried: the drop runs as the caller that was stopped, with its sign-in and session, which tokio still
         // holds while a future is dropped)
-        crate::panics::task(crate::auth::carried(async move {
+        crate::spawns::task(crate::auth::carried(async move {
             if let Err(e) = Box::pin(on_node_as(&app, made_drop(&name, &job), None, false, &scope)).await {
                 eprintln!("left {name} as it is: the drop after its CREATE TABLE … AS, which stopped before it answered, didn't answer: {e:#}");
             }
@@ -1862,6 +1898,9 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         not_by_inbox(&stmt)?;
     } else {
         ensure!(!app.members.reader(), "read-only node"); // (above a view of a folder's write: a reader writes no file either)
+    }
+    if let Stmt::UndropFile(path) = &stmt {
+        return crate::files::undrop(&app.lake, path).await; // (the lake's files: a writer's, and a `.py` an admin's, `rights::asks`)
     }
     if let Some((query, to, options)) = crate::ext::view_write(&app.lake, &stmt, scope).await? {
         let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.members.nodes(), app.members.me(), scope).await?; // (a view of a folder: a new file in it)
@@ -1984,10 +2023,10 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     // it changes, so a change worked out from a snapshot can't overwrite a commit that landed meanwhile. Its producer is
     // the job, so a retry of it is a duplicate. A MERGE gets here only when `changes` took it as a one-row upsert of one
     // key (`point_upsert`, which asked the same question): the other MERGEs and the UNIQUE tables never do.
-    // A plain INSERT into a table whose key is checked (`constraints::key_checked`) is one too: its key must be new, and its
+    // A plain INSERT into a table whose key is checked (`TableMeta::key_checked`) is one too: its key must be new, and its
     // locks make two nodes' INSERTs of one new key wait for each other (`txn::autocommit_as`).
     let keyed = meta.as_ref().is_some_and(|m| !m.key.is_empty());
-    let key_insert = matches!(stmt, Stmt::Insert(..)) && stored.as_ref().is_some_and(|m| crate::constraints::key_checked(m));
+    let key_insert = matches!(stmt, Stmt::Insert(..)) && stored.as_ref().is_some_and(|m| m.key_checked());
     if (keyed && matches!(stmt, Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_))) || key_insert {
         return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job, scope))).await;
     }
@@ -2086,7 +2125,7 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
     let next = std::sync::atomic::AtomicU64::new(0);
     // (out of memory, once more frugally, as a node's INSERT … SELECT runs (`write_files`); but only while nothing is staged: a
     // staged file holds some of the first try's rows, and is never overwritten)
-    let names = crate::query::frugally(&ctx, |ctx| {
+    let names = crate::query::frugally(&app.lake.node, &ctx, |ctx| {
         let (order, dir, next) = (&order, &dir, &next);
         async move {
             if next.load(std::sync::atomic::Ordering::Relaxed) > 0 {
@@ -2614,7 +2653,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
             // (an INSERT's keys are looked at below, after `sent`, as before: `Load`)
             let how = if matches!(stmt, Stmt::Insert(..)) { crate::rules::How::Load } else { crate::rules::How::Change };
             let rows = rows_of(query, target, &rules, table, &sql, None, files, how, scope).await?; // (a DEFAULT's sequence is the attached lake's)
-            if let Some(s) = stored.as_ref().filter(|s| matches!(stmt, Stmt::Insert(..)) && crate::constraints::key_checked(s)) {
+            if let Some(s) = stored.as_ref().filter(|s| matches!(stmt, Stmt::Insert(..)) && s.key_checked()) {
                 if sent(target, job).await? {
                     return Ok(None); // (a retry: `deliver` answers it as a duplicate)
                 }
@@ -2825,6 +2864,35 @@ mod tests {
     }
 
     #[test]
+    fn undrop_reads_a_table_and_a_file_and_refuses_another_kind_by_name() {
+        assert!(matches!(parse("UNDROP TABLE sales.orders"), Some(Stmt::Ddl(d)) if matches!(&d[..], [crate::ddl::Ddl::Undrop { name }] if name == "sales.orders")));
+        assert!(matches!(parse("-- back\nundrop file 'it''s/a.txt';"), Some(Stmt::UndropFile(p)) if p == "it's/a.txt"));
+        // (a writer's, as DELETE /files is; code a node runs, an admin's)
+        let asked = |sql: &str| crate::rights::asks(&parse(sql).expect("a statement")).1;
+        assert!(matches!(asked("UNDROP FILE 'notes/a.txt'")[..], [crate::rights::Action::Write]));
+        assert!(matches!(asked("UNDROP FILE 'jobs/Load.PY/'")[..], [crate::rights::Action::RunCode]));
+        let said = |sql: &str| match parse(sql) {
+            Some(Stmt::Refused(code, why)) => (code, why),
+            _ => panic!("{sql}: not refused"),
+        };
+        let (code, why) = said("UNDROP TABLE WITH ID '6f1e2c'");
+        assert_eq!(code, "0A000");
+        assert!(why.starts_with("UNDROP TABLE … WITH ID is Databricks': UNDROP TABLE name brings back the newest"), "{why}");
+        assert!(said("UNDROP VOLUME WITH ID '6f1e2c'").1.contains("UNDROP FILE 'path' brings back one deleted"));
+        assert!(said("UNDROP VOLUME main.raw.landing").1.starts_with("UNDROP VOLUME is Databricks': here a volume's files are the lake's own"));
+        let (code, why) = said("UNDROP  SEQUENCE ids");
+        assert_eq!(code, "0A000");
+        assert!(why.starts_with("UNDROP SEQUENCE is not supported yet: UNDROP <kind> name brings back what was dropped last under the name, for ") && why.contains("EXTERNAL TABLE, FUNCTION,") && why.contains(", VIEW, and UNDROP FILE 'path' a deleted file"), "{why}");
+        assert_eq!(said("UNDROP VIEW").0, "42601", "a kind kept, with no name");
+        assert_eq!(said("UNDROP INDEX by_day").0, "0A000", "a kind whose drops aren't kept yet, as the registry lists it");
+        assert_eq!(said("undrop user ann").1, "a dropped user stays dropped, as dropping one is how access is cut: CREATE USER makes one again");
+        assert_eq!(said("UNDROP IDENTITY PROVIDER okta").1, "a dropped identity provider stays dropped, as dropping one is how access is cut: CREATE IDENTITY PROVIDER makes one again");
+        assert_eq!(said("UNDROP FILE photos/a.png").0, "42601", "a path is quoted");
+        assert_eq!(said("UNDROP TABLE").0, "42601");
+        assert_eq!(said("UNDROP everything").0, "42601");
+    }
+
+    #[test]
     fn a_query_is_a_write_only_as_select_into() {
         assert!(parse("SELECT 1").is_none(), "a query: no write, unparsed");
         assert!(parse("select a, b from t where k = 1;").is_none());
@@ -2895,5 +2963,20 @@ mod tests {
         lake.cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    /// The texts the core keeps of a tree read back as they mean with a minus before a minus (`parsed::signed`): on main
+    /// before, `INSERT INTO w SELECT id, - -k FROM t` kept `SELECT id, --k FROM t` (`SELECT id,`), a view's query the
+    /// same, and the UPDATE a node sends its leader read as none.
+    #[test]
+    fn a_minus_before_a_minus_is_kept_as_it_means() {
+        use crate::ddl::Ddl;
+        let Some(Stmt::Insert(t, q)) = parse("INSERT INTO w SELECT id, - -k FROM t") else { panic!("an INSERT") };
+        assert_eq!((t.as_str(), q.as_str()), ("w", "SELECT id, -(-k) FROM t"));
+        let Some(Stmt::Ddl(d)) = parse("CREATE VIEW v AS SELECT id, - -k AS m FROM t") else { panic!("a view") };
+        assert!(matches!(&d[..], [Ddl::CreateView { sql, .. }] if sql == "SELECT id, -(-k) AS m FROM t"), "{}", serde_json::to_string(&d).unwrap_or_default());
+        let Some(Stmt::Update(t, set, cond)) = parse("UPDATE w SET b = - -a WHERE - -a > 0") else { panic!("an UPDATE") };
+        assert_eq!(t, "w");
+        assert_eq!(format!("{set:?} {cond:?}").matches("-(-a)").count(), 2, "{set:?} {cond:?}");
     }
 }

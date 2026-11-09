@@ -240,7 +240,7 @@ impl App {
             let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
             crate::explain::prepare(&ctx, query); // (each operator's expected rows: `explain::expected`)
             let peak = &crate::query::peak_pool(&ctx); // (this statement's own memory pool: the peak its cost reports; the closure below runs again on a retry)
-            let out = crate::query::frugally(&ctx, |ctx| async move {
+            let out = crate::query::frugally(&self.lake.node, &ctx, |ctx| async move {
                 let df = crate::engine::sql(&ctx, query).await?;
                 crate::query::mark("parsed to logical plan");
                 let (state, logical) = df.into_parts();
@@ -547,7 +547,7 @@ impl App {
             static OFFSET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bAT\s*\(\s*OFFSET\s*=>").expect("a regex"));
             let text = &format!("{text} {}", crate::past_names::spelled(text));
             let q = text.to_lowercase();
-            (q.contains("offset") && OFFSET.is_match(text)) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "session_user", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.flows", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since; a view's failing runs, `pondra.flows`' `error`, commit nothing)
+            (q.contains("offset") && OFFSET.is_match(text)) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "session_user", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.flows", "pondra.variables", "pondra.find", "pondra.parts", "pondra.dropped", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since, and `pondra.dropped` those deleted; a view's failing runs, `pondra.flows`' `error`, commit nothing)
         };
         let volatile = asks(query) || crate::pg_catalog::asked(query) // (Postgres's catalog: another answer to the same text)
             || crate::temp::mentioned(query) || crate::temp::called(query).is_some() // (the session's temporary tables change without a commit, and its functions are its own)

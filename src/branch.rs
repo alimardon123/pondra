@@ -540,6 +540,12 @@ async fn stamp(lake: &Lake, d: &mut Ddl) -> Result<()> {
     Ok(())
 }
 
+/// Branches as readers of the lake they are made from (`pins`): their pins hold its files, a pin on lease lapses
+/// (`lapse`), and a pin whose branch is gone goes (`sweep`).
+pub fn readers() -> crate::pins::Pin {
+    crate::pins::Pin { name: "branches", held: |l| Box::pin(pins(l)), lapse: Some(|l| Box::pin(lapse(l))), sweep: Some(|l| Box::pin(sweep(l))) }
+}
+
 /// The pins clean-up keeps files for: the oldest and the newest (None: no branch reads this lake).
 pub async fn pins(lake: &Lake) -> Result<Option<(u64, u64)>> {
     let all = lake.cat.scan::<Pin>("pn/", "pn0").await?;
@@ -772,11 +778,11 @@ fn listed(meta: &mut TableMeta, id: &str) {
     (meta.garbage, meta.garbage_deletes, meta.replaced, meta.shares, meta.publish) = Default::default();
 }
 
-/// The base's workspace files (not their kept versions), to copy.
+/// The base's workspace files (not their kept versions, nor the notes of deleted ones, whose versions aren't copied), to copy.
 async fn workspace(base: &Lake) -> Result<Vec<String>> {
     use futures::TryStreamExt;
     let all: Vec<_> = base.store.list(Some(&object_store::path::Path::from("files"))).try_collect().await?;
-    Ok(all.into_iter().map(|o| o.location.to_string()).filter(|p| !p.starts_with("files/.versions/")).collect())
+    Ok(all.into_iter().map(|o| o.location.to_string()).filter(|p| ![crate::files::VERSIONS, crate::files::DELETED].iter().any(|d| p.starts_with(d))).collect())
 }
 
 async fn copy(from: &Lake, to: &Lake, path: String) -> Result<()> {
