@@ -700,7 +700,7 @@ struct Kept {
     facts: Arc<Facts>,
 }
 
-/// Versions kept at once, and the manifests' bytes they may hold together, per node (`cache_bytes{cache="facts"}`).
+/// Versions kept at once, and the manifests' bytes they may hold together, per lake (`cache_bytes{cache="facts"}`).
 const FACTS_ENTRIES: usize = 256;
 const FACTS_BYTES: usize = 64 << 20;
 
@@ -726,28 +726,38 @@ impl FactsMemo {
     }
 }
 
-crate::per_node!(static FACTS: Arc<std::sync::Mutex<FactsMemo>> = Default::default(); clear = |m| *m.lock().unwrap_or_else(|e| e.into_inner()) = FactsMemo::default());
+/// The planning facts a lake's queries worked out (its state, `lake_state.rs`), as its line counts them
+/// (`cache_bytes{cache="facts"}`): the least recently planned versions give their manifests back first.
+pub struct FactsKept(std::sync::Mutex<FactsMemo>);
 
-/// The planning facts, as the node's line counts them (`cache_bytes{cache="facts"}`): the least recently planned versions
-/// give their manifests back first.
-pub fn facts_kept() -> Arc<dyn crate::ledger::Charged> { FACTS.clone() }
+impl crate::lake_state::LakeState for FactsKept {
+    const NAME: &'static str = "facts";
+    const ABOUT: &'static str = "the planning facts of its append tables' versions its queries planned, by version";
 
-impl crate::ledger::Charged for std::sync::Mutex<FactsMemo> {
-    fn held(&self) -> usize { self.lock().unwrap_or_else(|e| e.into_inner()).by_key.bytes() }
+    fn make() -> Self { FactsKept(Default::default()) }
 
-    fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(self, |m| &mut m.by_key, bytes) }
+    fn cache(self: Arc<Self>) -> Option<Arc<dyn crate::ledger::Charged>> { Some(self) }
+}
+
+impl crate::ledger::Charged for FactsKept {
+    fn held(&self) -> usize { self.0.lock().unwrap_or_else(|e| e.into_inner()).by_key.bytes() }
+
+    fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(&self.0, |m| &mut m.by_key, bytes) }
 
     fn gives_back(&self) -> bool { true }
 }
 
-/// An append table version's `Facts` as its queries plan it, kept per version of its entry (`FactsMemo`): a table that has
-/// not changed is planned from the same facts by every query.
+/// An append table version's `Facts` as its queries plan it, kept per version of its entry (`FactsMemo`) in its lake's
+/// state: a table that has not changed is planned from the same facts by every query.
 pub async fn facts(lake: &Lake, meta: &Arc<TableMeta>, sys: bool) -> Result<Arc<Facts>> {
-    if let Some(facts) = FACTS.lock().unwrap().get(meta, sys) {
+    let kept = lake.state::<FactsKept>().ok();
+    if let Some(facts) = kept.as_ref().and_then(|k| k.0.lock().unwrap_or_else(|e| e.into_inner()).get(meta, sys)) {
         return Ok(facts);
     }
     let facts = Arc::new(facts_once(lake, meta, sys).await?);
-    FACTS.lock().unwrap().put(meta, sys, &facts);
+    if let Some(k) = kept {
+        k.0.lock().unwrap_or_else(|e| e.into_inner()).put(meta, sys, &facts);
+    }
     Ok(facts)
 }
 
@@ -1757,7 +1767,7 @@ pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(ctx: &Sessi
         Err(crate::panics::Stopped::Again) if handed().is_none() => stopped = true, // (the watch stopped the first try, and its memory has gone)
         Err(_) => {
             // (stopped on its first try and not run again: its memory stayed over the line, or half its answer was sent)
-            crate::metrics::add(&crate::metrics::STOPPED_FOR_MEMORY, 1);
+            crate::panics::stopped_for_memory(); // (on the request's node)
             anyhow::bail!(crate::oom::OOM)
         }
     }

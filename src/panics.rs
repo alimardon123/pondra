@@ -38,11 +38,11 @@ async fn caught<T>(busy: crate::node_state::Busy, f: impl Future<Output = T>) ->
 /// watch loop, so it watches each poll of one instead (`oom::polled`), and answers its own [`crate::oom::PAGE_OOM`].
 /// Any other request is not wrapped, and runs where it came in or on the queries' runtime, as the others do.
 pub fn work<T: Send + 'static>(node: &crate::node_state::NodeState, stoppable: bool, f: impl Future<Output = T> + Send + 'static) -> impl Future<Output = Result<T, String>> + Send + 'static {
-    worked(node.drain.busy(), stoppable, f) // (counted as it comes, as `door` counts it)
+    worked(node.drain.busy(), node.metrics.clone(), stoppable, f) // (counted as it comes, as `door` counts it)
 }
 
 /// `work`, with its place in its node's count of requests in flight already taken.
-async fn worked<T: Send + 'static>(busy: crate::node_state::Busy, stoppable: bool, f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
+async fn worked<T: Send + 'static>(busy: crate::node_state::Busy, metrics: std::sync::Arc<crate::metrics::Metrics>, stoppable: bool, f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
     use futures::future::{Aborted, Either};
     use std::sync::atomic::Ordering::Relaxed;
     // (a page's one thread runs no watch loop beside a request, so each poll of a stoppable one is watched: `oom::polled`)
@@ -87,7 +87,7 @@ async fn worked<T: Send + 'static>(busy: crate::node_state::Busy, stoppable: boo
     let long = {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         let long = running.first_key_value().is_some_and(|(_, r)| r.since.elapsed() >= LONG);
-        running.insert(id, crate::oom::Running { since: Instant::now(), noted: crate::oom::seen(), stop: handle, stopped: false, resting: false, used, left: None, first_try: None });
+        running.insert(id, crate::oom::Running { since: Instant::now(), noted: crate::oom::seen(), stop: handle, stopped: false, resting: false, used, left: None, first_try: None, metrics });
         long
     };
     crate::oom::wake(); // (the watch looks now, once this request is in RUNNING: it may be one to stop)
@@ -237,7 +237,17 @@ pub(crate) fn stop_one(now: Instant, margin: usize) -> Option<bool> {
     if let Some(stop) = &r.stop {
         stop.abort(); // (its next poll finds it aborted: the future is dropped there)
     }
+    crate::metrics::add(&r.metrics.stopped_for_memory, 1); // (a query answered 53200, on its node: a first try's stop isn't one)
     Some(false)
+}
+
+/// Counts a stop that the request this task's work is part of doesn't come back from (`query::frugally`: its first try
+/// stopped and not run again) on the request's node, whose counters its entry holds. Outside a request, nothing.
+pub(crate) fn stopped_for_memory() {
+    let Ok(id) = REQUEST.try_with(|id| *id) else { return };
+    if let Some(r) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
+        crate::metrics::add(&r.metrics.stopped_for_memory, 1);
+    }
 }
 
 /// Start work of the leader's own that reads and writes as queries do (a view running its query
@@ -399,8 +409,8 @@ mod tests {
     // keeps the others'; the entries are this test's own, with no stop, so no other test can stop them)
     #[test]
     fn a_request_that_started_unread_takes_the_watchs_next_reading() {
-        let unread = crate::oom::Running { since: Instant::now(), noted: usize::MAX, stop: None, stopped: false, resting: false, used: None, left: None, first_try: None };
-        let read = crate::oom::Running { since: Instant::now(), noted: 5, stop: None, stopped: false, resting: false, used: None, left: None, first_try: None };
+        let unread = crate::oom::Running { since: Instant::now(), noted: usize::MAX, stop: None, stopped: false, resting: false, used: None, left: None, first_try: None, metrics: Default::default() };
+        let read = crate::oom::Running { since: Instant::now(), noted: 5, stop: None, stopped: false, resting: false, used: None, left: None, first_try: None, metrics: Default::default() };
         RUNNING.lock().unwrap().insert(u64::MAX - 1, unread);
         RUNNING.lock().unwrap().insert(u64::MAX, read);
         note(7 << 20);

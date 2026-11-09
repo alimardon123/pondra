@@ -83,7 +83,6 @@ git -> crypto  1
 git -> fetch  1
 guard -> dial  2
 held -> wasm32  1
-history -> reset  1
 host -> git  1
 host -> measures  1
 host -> pg_trace  1
@@ -147,7 +146,7 @@ objects -> branch  2
 objects -> constraints  1
 objects -> ddl  32
 objects -> engine  1
-objects -> expander  3
+objects -> expander  2
 objects -> ext  3
 objects -> extension  1
 objects -> facts  1
@@ -275,7 +274,7 @@ store -> in_task  1
 store -> locks  1
 store -> oom  2
 store -> panics  4
-store -> query  5
+store -> query  4
 store -> rules  14
 store -> seq  3
 store -> serve  2

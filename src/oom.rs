@@ -269,9 +269,6 @@ fn watch() {
                 if due(last_stop, felt, line, now) {
                     let mb = |bytes: usize| bytes >> 20;
                     if let Some(first) = crate::panics::stop_one(now, line / 10) {
-                        if !first {
-                            crate::metrics::add(&crate::metrics::STOPPED_FOR_MEMORY, 1); // (a query answered 53200: a first try's stop isn't one)
-                        }
                         let again = if first { "'s first try (it runs again frugally)" } else { "" };
                         eprintln!("stopped a query{again}: the node held {} MB, its line {} MB (PONDRA_MEMORY_MAX_GB)", mb(felt), mb(line));
                         last_stop = Some(now);
@@ -505,6 +502,8 @@ pub struct Running {
     /// How to stop the first try it is in (`panics::first_try`), which a frugal session can try again: the watch
     /// stops that rather than the request.
     pub first_try: Option<futures::future::AbortHandle>,
+    /// Its node's counters, which count a stop of it (`panics::stop_one`, `panics::stopped_for_memory`).
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl Running {
@@ -567,7 +566,7 @@ mod tests {
     }
 
     fn req(since: Instant, noted: usize) -> Running {
-        Running { since, noted, stop: Some(futures::future::AbortHandle::new_pair().0), stopped: false, resting: false, used: None, left: None, first_try: None }
+        Running { since, noted, stop: Some(futures::future::AbortHandle::new_pair().0), stopped: false, resting: false, used: None, left: None, first_try: None, metrics: Default::default() }
     }
 
     // A request that has allocated `used` bytes so far (its meter's counter).
