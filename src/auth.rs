@@ -58,6 +58,31 @@ impl Principal {
         self.epoch != lake.cat.rights_version() || self.until.is_some_and(|u| u <= crate::log::now_ms())
     }
 
+    /// Who this is now, for a session or stream that outlives a change of who may do what: every door asks it before its
+    /// next piece of work (Flight's DoPut at each batch, HTTP's streams each second, Postgres at each statement, Kafka at
+    /// each request; 11-09 audit M6). None while it is current (`stale`, a version compare) or never ends (the operator).
+    /// Else whoever `sign_in` signs in now, the door's own way, at this one's door and address, with the rights version
+    /// read before it was asked, so a change meanwhile is seen next time; or why it signs in no more, kept in the audit
+    /// log (a user's: nothing signed in, nothing kept), and worded to it by `signed_out`.
+    pub async fn again<F: std::future::Future<Output = std::result::Result<Principal, String>>>(&self, app: &crate::app::App, sign_in: impl FnOnce() -> F) -> Option<std::result::Result<Principal, String>> {
+        if self.operator || !self.stale(&app.lake) {
+            return None;
+        }
+        let epoch = app.lake.cat.rights_version(); // (before it is asked, as at sign-in)
+        Some(match sign_in().await {
+            Ok(p) => Ok(Principal { epoch: p.epoch.max(epoch), ..p.at(self.door, self.from) }),
+            Err(why) => {
+                if !self.name.is_empty() {
+                    crate::audit::refused(app, &self.name, self.door, self.from, "sign in again", &why).await;
+                }
+                Err(why)
+            }
+        })
+    }
+
+    /// `again`'s refusal, as every door words it (SQLSTATE 28000).
+    pub fn signed_out(&self, why: &str) -> String { format!("user \"{}\" is signed out: {why}", self.name) }
+
     /// A token's (one of the nodes', or their key), or the program's that started the node: its
     /// role over everything, this lake's and the lakes attached to it.
     pub fn token(role: Role) -> Principal { Principal { operator: true, ..Principal::of(role) } }
@@ -138,6 +163,7 @@ impl crate::spawns::Carry for Carried {
 
 /// A door's connection, as a task it starts (`spawns::Tasks::spawn_as`): no principal of its own, since each request
 /// on it sets the one it signed in as (`WHO`), and work outside one sees nothing.
+#[derive(Clone, Copy)]
 pub struct Door;
 
 impl crate::spawns::Carry for Door {

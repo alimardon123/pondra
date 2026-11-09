@@ -12,22 +12,36 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlan, Volatility};
 use datafusion::physical_plan::{execution_plan::*, memory::MemoryStream, ExecutionPlan, Partitioning, PlanProperties, PhysicalExpr};
 use datafusion::prelude::SessionContext;
+use crate::ledger::{ByteLru, Charged};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-type Plan = (Arc<dyn ExecutionPlan>, Arc<TaskContext>);
+type Plan = (Arc<dyn ExecutionPlan>, Arc<TaskContext>, usize); // (and about the memory it holds: `bytes_of`)
 
 /// What a lake keeps for its flushes (invariant 301): each query's plans over a flush's new rows, kept to run again
-/// (`keep`), by `{kind}\0{sql}\0{columns}\0{parts}\0{functions}`.
-#[derive(Default)]
-pub struct Plans(Mutex<BTreeMap<String, Vec<Plan>>>);
+/// (`keep`), by `{kind}\0{sql}\0{columns}\0{parts}\0{functions}`. A cache on the lake's line (`cache`): at most 512 keys
+/// and `MOST` bytes, the least recently used going first, and the memory watch takes it back as it takes the others.
+pub struct Plans(Mutex<ByteLru<String, Vec<Plan>>>);
+
+/// The most the kept plans hold, a lake's: some 1,000 plans (`SELECT sum(x)`'s is charged 34 KB, most of it its task's table
+/// of functions).
+const MOST: usize = 32 << 20;
 
 impl crate::lake_state::LakeState for Plans {
     const NAME: &'static str = "fresh";
     const ABOUT: &'static str = "the plans of its views' and feeds' queries over a flush's new rows, kept to run again";
     fn make() -> Self {
-        Plans::default()
+        Plans(Mutex::new(ByteLru::new(MOST).with_count(512)))
     }
+    fn cache(self: Arc<Self>) -> Option<Arc<dyn Charged>> {
+        Some(self)
+    }
+}
+
+impl Charged for Plans {
+    fn held(&self) -> usize { self.0.held() }
+    fn give_back(&self, bytes: usize) -> usize { self.0.give_back(bytes) }
+    fn gives_back(&self) -> bool { true }
 }
 
 /// `sql` with table `source` standing for just `rows` (as columns `s`), `prepare` given its logical
@@ -35,17 +49,17 @@ impl crate::lake_state::LakeState for Plans {
 /// table it reads, or a function that may answer otherwise next time (`now()`), plans it afresh.
 pub async fn run(lake: &Lake, source: &str, s: SchemaRef, rows: &[RecordBatch], sql: &str, kind: &str, prepare: impl FnOnce(LogicalPlan) -> Result<LogicalPlan>) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     let rows = rows.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?;
-    let parts = if rows.iter().map(|b| b.num_rows()).sum::<usize>() < 1 << 17 { 1 } else { crate::store::partitions() }; // (a flush's rows: one; a view's filling: every core)
+    let parts = if rows.iter().map(|b| b.num_rows()).sum::<usize>() < 1 << 17 { 1 } else { lake.partitions() }; // (a flush's rows: one; a view's filling: every core)
     let functions = lake.cat.scan_raw("f/", "f0").await?; // (a function replaced is planned again)
     let (plans, key) = (lake.state::<Plans>()?, format!("{kind}\0{sql}\0{:?}\0{parts}\0{:x}", s.fields(), fingerprint(&functions)));
     // (a kept plan is taken out while it runs, so two runs at once never share its operators' state, a window's held
     // rows among it: a run that finds none plans afresh. Taken out here, not cloned: the lock is not held while it runs)
     let taken = plans.0.lock().unwrap().get_mut(&key).and_then(Vec::pop);
-    if let Some((plan, task)) = taken {
+    if let Some((plan, task, bytes)) = taken {
         let renewed = renew(&plan, &rows)?;
         let schema = renewed.schema();
         let out = datafusion::physical_plan::collect(renewed, task.clone()).await?;
-        keep(&plans, key, (plan, task)); // (the plan taken out, not the copy that ran: that one holds these rows; a run that failed keeps none)
+        keep(&plans, key, (plan, task, bytes)); // (the plan taken out, not the copy that ran: that one holds these rows; a run that failed keeps none)
         return Ok((schema, out));
     }
     // (planned as the node's own work: a view's, a task's or a feed's rows, which read what its definition reads, whoever
@@ -68,22 +82,43 @@ pub async fn run(lake: &Lake, source: &str, s: SchemaRef, rows: &[RecordBatch], 
     let out = datafusion::physical_plan::collect(physical.clone(), task.clone()).await?;
     if alone && steady(&plan) {
         // (kept only now that its run succeeded: the copy kept shares the windows' state with `physical`, which ran)
-        keep(&plans, key, (renew(&physical, &[])?, kept_task(&task))); // (holding none of these rows, nor its lake)
+        let (plan, task) = (renew(&physical, &[])?, kept_task(&task)); // (holding none of these rows, nor its lake)
+        let bytes = bytes_of(&plan, &task);
+        keep(&plans, key, (plan, task, bytes));
     }
     Ok((physical.schema(), out))
 }
 
 /// Keeps a plan for the next run of its key, at most 8 a key (writes packed side by side each find one, and plan
-/// nothing); every key is dropped past 512 (views dropped and fillings leave theirs: a bound, not a policy).
+/// nothing), charged what its plans hold. (A plan taken out to run leaves its key's charge as it was until it is kept
+/// again: a moment's count too high, never too low.)
 fn keep(plans: &Plans, key: String, kept: Plan) {
-    let mut plans = plans.0.lock().unwrap();
-    if !plans.contains_key(&key) && plans.len() >= 512 {
-        plans.clear();
-    }
-    let of_key = plans.entry(key).or_default();
-    if of_key.len() < 8 {
-        of_key.push(kept);
-    }
+    let gone = {
+        let mut plans = plans.0.lock().unwrap();
+        let mut of_key = plans.pop(&key).unwrap_or_default();
+        if of_key.len() < 8 {
+            of_key.push(kept);
+        }
+        let bytes = key.len() + of_key.iter().map(|(_, _, b)| b).sum::<usize>();
+        plans.put(key, of_key, bytes)
+    };
+    drop(gone); // (the plans that left, let go of after the lock is)
+}
+
+/// About the memory a kept plan holds, to charge it (`Plans`), as `ledger::json_bytes` does for JSON: each operator's own
+/// struct and 128 bytes for each of its columns and expressions, and its task's settings and table of functions. Neither
+/// exact nor costly: one walk over the plan, when it is first kept.
+fn bytes_of(plan: &Arc<dyn ExecutionPlan>, task: &TaskContext) -> usize {
+    let mut bytes = 4096 + 64 * task.scalar_functions().len();
+    let _ = plan.apply(|p| {
+        bytes += std::mem::size_of_val(p.as_ref()) + 128 * p.schema().fields().len();
+        p.apply_expressions(&mut |_| {
+            bytes += 128;
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(TreeNodeRecursion::Continue)
+    });
+    bytes
 }
 
 /// `task` as a kept plan runs in it: with only the functions that always answer alike. One that may answer otherwise can
@@ -186,8 +221,8 @@ mod tests {
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
-    /// A plan kept for a lake's flushes is its lake's state, and the lake still goes with its last handle: what is kept
-    /// holds none of the functions that hold their lake (`kept_task`).
+    /// A plan kept for a lake's flushes is its lake's state, charged to its line, and the lake still goes with its last
+    /// handle: what is kept holds none of the functions that hold their lake (`kept_task`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_kept_plan_keeps_not_its_lake() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-fresh-{}", uuid::Uuid::new_v4()));
@@ -197,6 +232,8 @@ mod tests {
         let (_, out) = crate::auth::as_node(run(&lake, "t", s.clone(), &rows, "SELECT sum(x) AS n FROM t", "", Ok)).await?;
         assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         assert_eq!(lake.state::<Plans>()?.0.lock().unwrap().len(), 1, "the plan is kept");
+        let charged = lake.ledger().map(|l| l.held_by_name()).unwrap_or_default();
+        assert!(charged.iter().any(|(name, bytes)| *name == "fresh" && *bytes > 4096), "the kept plan is charged to the lake's line: {charged:?}");
         lake.cat.close().await?;
         let gone = Arc::downgrade(&lake);
         drop(lake);

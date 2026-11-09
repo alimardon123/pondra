@@ -4,16 +4,19 @@
 //! grouping), where DuckDB took 0.51 s in all. Grouped by `inv_item_sk` first, the 26.5 M rows are 102,000 groups, and
 //! the names join those (by hand at SF10: 3.70 → 0.42 s; the rule: 3.46 → 0.42 s). TPC-DS q11's `year_total` groups
 //! store sales by a customer's seven text columns and the year: by `ss_customer_sk` and the year first, by hand, 3.32 →
-//! 1.32 s; q04 4.48 → 1.99 s. The rule doesn't reach those yet: what they sum is an expression a projection works out
-//! between the grouping and its joins, and only a projection of columns as they are is looked through.
+//! 1.32 s; q04 4.48 → 1.99 s. Their customer table holds a condition that names no column: `'s' = 's'`, what is left of
+//! the outer query's `sale_type = 's'` once it is pushed through the UNION ALL's tag. Such a condition keeps every row or
+//! none, so the table is as whole as one without it. And the join order joins it to its sales below the date's join, with
+//! a projection of columns between the two joins, which the rule looks through (`optimize::flatten_through`).
 //!
 //! It groups first where the grouping it saves hashes several strings a row: two text columns or more, or grouping sets
-//! (ROLLUP, CUBE). By one short text column the extra grouping costs what it saves (TPC-DS q05 was 8% slower).
+//! (ROLLUP, CUBE). By one short text column the extra grouping costs what it saves (TPC-DS q05 was 8% slower). And it
+//! groups the rest by one key the dimensions join on: by two (q47's item and store), its groups are nearly its rows.
 //!
 //! The rule takes an aggregate over a tree of inner joins and splits its inputs in two:
-//! - the dimensions: whole tables (no filter), joined to the rest by equalities only, that give the grouping at least
-//!   one text column and no aggregate an argument. A filtered table would cut the rows the join keeps, and grouping
-//!   them all first would be work the join saves.
+//! - the dimensions: whole tables (no filter, or only one that names no column), joined to the rest by equalities
+//!   only, that give the grouping at least one text column and no aggregate an argument. A filtered table would cut the
+//!   rows the join keeps, and grouping them all first would be work the join saves.
 //! - the rest, which give every argument.
 //!
 //! The rest is grouped first by the columns the dimensions join on and the columns of its own the grouping names, all
@@ -124,7 +127,7 @@ fn eager(a: &Aggregate) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     }
     let (mut leaves, mut keys, mut filters) = (vec![], vec![], vec![]);
-    crate::optimize::flatten(input, equality, &mut leaves, &mut keys, &mut filters);
+    crate::optimize::flatten_through(input, equality, &mut leaves, &mut keys, &mut filters);
     let schema = input.schema();
     let Some(parts) = a.aggr_expr.iter().map(|e| part(e, schema)).collect::<Result<Option<Vec<Part>>>>()? else { return Ok(None) };
     let args: Vec<&Column> = parts.iter().flat_map(|p| p.arg().column_refs()).collect();
@@ -178,6 +181,11 @@ fn eager(a: &Aggregate) -> Result<Option<LogicalPlan>> {
             }
             _ => return Ok(None),
         }
+    }
+    // By two keys or more (q47's sales by their item and their store, and the month): the first grouping's groups are
+    // nearly as many as its rows, and grouping first only adds a grouping (q47 at SF10: 0.61 → 0.74 s).
+    if by.iter().collect::<std::collections::HashSet<_>>().len() > 1 {
+        return Ok(None);
     }
     by.extend(grouped.iter().filter(|c| owner(c).is_some_and(|i| !dims[i])).map(|c| (*c).clone()));
     let mut seen = std::collections::HashSet::new();
@@ -262,11 +270,14 @@ fn joined(mut inputs: Vec<LogicalPlan>, keys: &[(Expr, Expr)], equality: NullEqu
     Ok(Some(left))
 }
 
-/// Is `p` a whole table: a scan with no filter and no limit?
+/// Is `p` a whole table: a scan with no filter and no limit? A condition that names no column, and isn't drawn again for
+/// each row, keeps every row or none (`'s' = 's'`: a UNION ALL's tag, with a filter on it pushed through).
 fn whole(p: &LogicalPlan) -> bool {
+    let constant = |e: &Expr| !e.any_column_refs() && !e.is_volatile();
     match p {
-        LogicalPlan::TableScan(s) => s.filters.is_empty() && s.fetch.is_none(),
+        LogicalPlan::TableScan(s) => s.filters.iter().all(constant) && s.fetch.is_none(),
         LogicalPlan::SubqueryAlias(s) => whole(&s.input),
+        LogicalPlan::Filter(f) => constant(&f.predicate) && whole(&f.input),
         _ => false,
     }
 }
@@ -360,10 +371,51 @@ mod tests {
         Ok(())
     }
 
+    /// A projection of columns between two joins (the customer joined to its sales, below the date's join: TPC-DS q04's
+    /// order) ends the tree a join order takes apart, and not the one this rule makes again from its leaves.
+    #[test]
+    fn the_leaves_of_joins_with_columns_between() -> Result<()> {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::logical_expr::{col, table_scan, LogicalPlanBuilder};
+        let t = |name: &str, cols: &[&str]| table_scan(Some(name), &Schema::new(cols.iter().map(|c| Field::new(*c, DataType::Int64, true)).collect::<Vec<_>>()), None)?.build();
+        let bought = LogicalPlanBuilder::from(t("c", &["c_sk", "c_name"])?)
+            .join(t("s", &["s_c", "s_d", "s_x"])?, JoinType::Inner, (vec!["c.c_sk"], vec!["s.s_c"]), None)?
+            .project([col("c.c_name"), col("s.s_d"), col("s.s_x")])?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(bought).join(t("d", &["d_sk", "d_year"])?, JoinType::Inner, (vec!["s.s_d"], vec!["d.d_sk"]), None)?.build()?;
+        let LogicalPlan::Join(top) = &plan else { unreachable!("a join") };
+        let (mut leaves, mut keys, mut filters) = (vec![], vec![], vec![]);
+        crate::optimize::flatten(&plan, top.null_equality, &mut leaves, &mut keys, &mut filters);
+        assert_eq!((leaves.len(), keys.len()), (2, 1), "a projection between the joins ends the tree");
+        let (mut leaves, mut keys, mut filters) = (vec![], vec![], vec![]);
+        crate::optimize::flatten_through(&plan, top.null_equality, &mut leaves, &mut keys, &mut filters);
+        assert_eq!((leaves.len(), keys.len()), (3, 2), "through it: the customers, their sales and the dates, by both keys");
+        Ok(())
+    }
+
+    /// A UNION ALL's branches tagged by a literal, and a filter on the tag outside them (TPC-DS q04's and q11's
+    /// `year_total`): the condition pushed onto the dimension, the table named first, names no column (`'s' = 's'`), so
+    /// the dimension is still whole, its sales are grouped first, and the answers are as they were.
+    #[tokio::test]
+    async fn through_a_tags_condition() -> Result<()> {
+        let (with, without) = (session(true).await?, session(false).await?);
+        let sql = "WITH totals AS (\
+                   SELECT brand, class, year, sum(price) AS total, 's' AS kind FROM item, sales, day \
+                   WHERE sales.item = item.id AND sales.day = day.id GROUP BY brand, class, year \
+                   UNION ALL SELECT brand, class, year, sum(qty) AS total, 'w' AS kind FROM item, sales, day \
+                   WHERE sales.item = item.id AND sales.day = day.id GROUP BY brand, class, year) \
+                   SELECT brand, class, total FROM totals WHERE kind = 's' AND year = 2001 ORDER BY brand, class";
+        let (got, plan) = answer(&with, sql).await?;
+        assert!(plan.contains("__eager_0"), "{plan}");
+        assert_eq!(got, answer(&without, sql).await?.0);
+        Ok(())
+    }
+
     /// A filtered dimension cuts the rows its join keeps: grouping them all first would be work the join saves.
     /// DISTINCT inside an aggregate can't be combined, a DISTINCT of rows has no aggregate to tell its two groupings
-    /// apart, one text column costs about what grouping first does, nothing is grouped first where nothing is text, and a
-    /// BIGINT's average is taken as the query wrote it (its sums could pass 64 bits).
+    /// apart, one text column costs about what grouping first does, nothing is grouped first where nothing is text, a
+    /// BIGINT's average is taken as the query wrote it (its sums could pass 64 bits), and the sales aren't grouped by two
+    /// keys first (an item's and another dimension's: nearly a group a row).
     #[tokio::test]
     async fn left_as_it_was() -> Result<()> {
         let ctx = session(true).await?;
@@ -374,6 +426,8 @@ mod tests {
             "SELECT brand, sales.day, sum(qty) FROM sales, item WHERE sales.item = item.id GROUP BY brand, sales.day",
             "SELECT year, sum(price) FROM sales, day WHERE sales.day = day.id GROUP BY year",
             "SELECT brand, class, avg(sales.day) FROM sales, item WHERE sales.item = item.id GROUP BY brand, class",
+            "SELECT item.brand, other.class, sum(qty) FROM sales, item, item AS other WHERE sales.item = item.id AND sales.day = other.id \
+             GROUP BY item.brand, other.class",
         ] {
             let (_, plan) = answer(&ctx, sql).await?;
             assert!(!plan.contains("__eager"), "{sql}: {plan}");

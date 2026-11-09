@@ -6,7 +6,9 @@ What a request may see is its principal's scope, read today from the task it run
 passes the asker's scope to planning as an argument, so each of these places is one to go. This counts them in src/
 (outside `#[cfg(test)] mod`s, comments and strings), by file:
 
-  reads  a read of the task's caller: `rights::scope()` or `auth::current()` outside auth.rs and rights.rs
+  reads  a read of the task's caller: `rights::scope()` or `auth::current()` outside auth.rs and rights.rs, and a call of
+         rights.rs's two that read it for theirs, `may_here(` (may the request being served…) and `rights::said` (its
+         planning error as it is told it), outside rights.rs (11-09 audit M4)
   node   a place that runs work as the node's own: `as_node(`, `spawn_node(` or `spawns::Node` (a task of the node's
          own, `spawns::Tasks`), or that plans or lists as the node's own, `Principal::node()` (a view's run, the lake's
          own definitions a column's move rewrites, a count over every row), outside auth.rs and spawns.rs, which define
@@ -31,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from layers import strip_comments  # noqa: E402
 
 KINDS = {
-    "reads": (re.compile(r"\b(?:rights::scope|auth::current)\b"), {"auth.rs", "rights.rs"}),  # (a call, or the function passed as a value)
+    "reads": (re.compile(r"\b(?:rights::scope|auth::current|rights::said)\b|\bmay_here\("), {"auth.rs", "rights.rs"}),  # (a call, or the function passed as a value)
     "node": (re.compile(r"\b(?:as_node|spawn_node)\(|\bspawns::Node\b|\bPrincipal::node\(\)"), {"auth.rs", "spawns.rs"}),
     "whole": (re.compile(r"\bScope::everything\(\)"), {"rights.rs"}),
 }

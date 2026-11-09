@@ -51,7 +51,7 @@ pub fn is_on(o: &ConfigOptions) -> bool {
 
 /// A frugal session's hash joins of one partition, as sort-merge joins. DataFusion's planner makes a join a sort-merge
 /// join (`prefer_hash_join` off, `query::frugal`) only over more than one partition, so a page's retry (one partition,
-/// `store::partitions`) or one after `SET threads = 1` held its join's build side again, and was refused again
+/// `store::partitions_of`) or one after `SET threads = 1` held its join's build side again, and was refused again
 /// ("Failed to allocate … for HashJoinInput"). Placed right after `JoinSelection`, so `EnsureRequirements` sorts each side
 /// by the keys, and those sorts spill. Not over more partitions, where the planner made them already; and not a
 /// null-aware join (`NOT IN`), which DataFusion keeps a hash join for its answers, or one a sort-merge join can't take.

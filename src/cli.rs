@@ -343,7 +343,7 @@ pub(crate) async fn stopped(stdin: bool) {
     tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = closed => {} }
 }
 
-/// `pondra serve`'s node failed (`node::stop`, which said why): it is stopped, `stop` (a leader's term given back, so
+/// `pondra serve`'s node failed (`Lifecycle::stop`, which said why): it is stopped, `stop` (a leader's term given back, so
 /// the next node leads at once, invariant 210), within 30 s as a library's host bounds it, and the process ends with 1.
 async fn failed_stop(stop: impl std::future::Future<Output = ()>) -> ! {
     if tokio::time::timeout(std::time::Duration::from_secs(30), stop).await.is_err() {
@@ -463,7 +463,6 @@ fn mistyped(word: &str, c: &str) -> bool {
 async fn run() -> anyhow::Result<()> {
     let matches = command().get_matches();
     let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.format(&mut command()).exit());
-    store::inherit(); // (a lake led for a moment, reached as the process that asked reaches it)
     let Some(cmd) = cli.cmd else {
         let given = cli.lake.is_some();
         let lake = crate::memory_lake::place(&cli.lake.unwrap_or_else(|| "lake".into())); // (`pondra :memory:`: a lake in the node's memory)
@@ -559,11 +558,11 @@ async fn run() -> anyhow::Result<()> {
             // (`--idle-exit`: once nobody has used the node for that long and it has nothing left to do, it stops as on
             // SIGTERM: `idle.rs`)
             let quiet = env::secs("PONDRA_IDLE_EXIT_SECS");
-            let mut moves = node::mover(); // (a lake moving to another place: `memory::set_location`)
-            // (the node's own work failing, `node::stop`: the node is stopped as on SIGTERM but with no drain, as a library's
+            // (the host of every node this serve starts: a lake moving to another place, `memory::set_location`, and the
+            // node's own work failing, `Lifecycle::stop`: the node is stopped as on SIGTERM but with no drain, as a library's
             // host stops it, so a leader gives up its term and the next node leads at once; then the process ends with 1)
-            let mut failures = node::supervise();
-            let mut options = node::Options { dir, listen: addr, advertise, start: node::Start { reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, python, auth }, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest: None, settings: crate::settings::Values::now(), move_failed: None };
+            let (host, node::Told { events: mut failures, mut moves }) = node::Host::new();
+            let mut options = node::Options { dir, listen: addr, advertise, start: node::Start { reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, python, auth }, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest: None, settings: crate::settings::Values::now(), move_failed: None, host: Some(host) };
             loop {
                 let held = Arc::new(node::Held::default()); // (what the start takes, given back by a stop: `node.rs`)
                 let mut node = tokio::select! {
@@ -668,7 +667,7 @@ async fn run() -> anyhow::Result<()> {
             // moment, as a one-off write does, tiers the log, writes the catalog down, and ends, so a lake no node
             // serves can be kept tidy by a scheduled `pondra sql --dir … CHECKPOINT`)
             let dir = crate::memory_lake::place(&dir);
-            let store = store::open_store(&dir)?.1;
+            let store = store::open_store(&dir, None)?.1;
             match terms::latest(&store).await? {
                 Some(t) if !t.addr.is_empty() && terms::alive(&store, &t, None).await => {
                     println!("{}", crate::net::process().client(crate::net::Policy::Cluster).post(crate::tls::url(&format!("{}/sql", t.addr))).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)

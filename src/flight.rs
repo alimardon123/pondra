@@ -48,7 +48,7 @@ type Out<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     // (a message up to 1 GiB, as HTTP takes a batch, but only from a caller `Gate` has signed in)
     let service = FlightServiceServer::new(Door(Sql(app.clone()))).max_decoding_message_size(1 << 30).max_encoding_message_size(1 << 30);
-    let doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Flight).await?; // (TLS too: `tls.rs`)
+    let doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Flight, &app.lake.node.tasks, crate::auth::Door).await?; // (TLS too: `tls.rs`)
     // (it closes with the HTTP door, gracefully: the answers being written go out whole, and the node's stop waits for its
     // connections to close, `Drain::serving`, as an answer's last messages may still be in one when its stream has ended)
     let (_serving, closing) = (app.lake.node.drain.serving(), app.lake.node.drain.closing());
@@ -117,22 +117,17 @@ struct Again {
     peer: Option<Peer>,
 }
 
-/// `again`'s caller now, if `who` is stale: signed in again, with the rights version read before (so a change meanwhile
-/// is seen at the next batch), or refused, 28000, once it no longer signs in. None while `who` is current, or a token's.
+/// `again`'s caller now, if `who` is stale (`Principal::again`): signed in again as the call first was, or refused, 28000,
+/// once it no longer signs in. None while `who` is current, or a token's.
 async fn signed_again(app: &App, who: &crate::auth::Principal, again: &Again) -> Option<Result<crate::auth::Principal, Status>> {
-    if who.operator || !who.stale(&app.lake) {
-        return None;
-    }
-    let epoch = app.lake.cat.rights_version();
-    Some(match sign_in(app, again.credential.clone(), again.sent, again.peer).await {
-        Ok(p) if p.role > Role::None => Ok(crate::auth::Principal { epoch: p.epoch.max(epoch), ..p }),
-        // (signed in before, so whatever stops it now ends its session, as Postgres says it: `pg::signed_again`)
-        _ => {
-            let why = "it can't sign in any more (dropped, NOLOGIN, its password changed, or its token revoked or ended)";
-            crate::audit::refused(app, &who.name, "flight", who.from, "sign in again", why).await;
-            Err(refused("28000", format!("user \"{}\" is signed out: {why}", who.name)))
+    let now = who.again(app, || async {
+        match sign_in(app, again.credential.clone(), again.sent, again.peer).await {
+            Ok(p) if p.role > Role::None => Ok(p),
+            // (signed in before, so whatever stops it now ends its session, as Postgres says it: `pg::signed`)
+            _ => Err("it can't sign in any more (dropped, NOLOGIN, its password changed, or its token revoked or ended)".to_string()),
         }
-    })
+    });
+    Some(now.await?.map_err(|why| refused("28000", who.signed_out(&why))))
 }
 
 /// The gRPC status of a SQLSTATE (Flight SQL's errors), by its kind (`codes::kind`).
