@@ -588,22 +588,26 @@ pub fn client(token: Option<String>) -> reqwest::Client {
 
 /// The client node `node` calls its lake's other nodes with: its token (`NodeState::token`: this process's, else its lake's
 /// own key for its nodes, known once the lake is open: the client is made again then). Kept on the node (`Calls`).
-pub fn http(node: &crate::node_state::NodeState) -> reqwest::Client { held(&node.calls.client, node.token()) }
+pub fn http(node: &crate::node_state::NodeState) -> reqwest::Client { held(&node.calls.client, node.token(), |t| for_nodes(node.net.as_ref(), t)) }
 
-/// The client `kept` holds if it was made with `token`, else one made with it now and kept.
-pub fn held(kept: &std::sync::Mutex<Option<(Option<String>, reqwest::Client)>>, token: Option<String>) -> reqwest::Client {
+/// The client `kept` holds if it was made with `token`, else one `make` makes with it now, kept.
+pub fn held(kept: &std::sync::Mutex<Option<(Option<String>, reqwest::Client)>>, token: Option<String>, make: impl FnOnce(Option<String>) -> reqwest::Client) -> reqwest::Client {
     let mut kept = kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((_, c)) = kept.as_ref().filter(|(t, _)| *t == token) {
         return c.clone();
     }
-    let made = client(token.clone());
+    let made = make(token.clone());
     *kept = Some((token, made.clone()));
     made
 }
 
+/// A client for the lake's nodes signed with `token`, made by `net` (`net::Net::nodes`), else as a native host makes one
+/// (`client`): the calls between nodes go through the form's `Net` (audit 11-09 L5).
+pub fn for_nodes(net: &dyn crate::net::Net, token: Option<String>) -> reqwest::Client { net.nodes(token.as_deref()).unwrap_or_else(|| client(token)) }
+
 /// A client with this process's own token (`node_state::process_token`) and no node's key, for a call no node makes: a store's
 /// door's (`served.rs`, whose link is made at its first request, before any lake's key is known).
-pub fn process_http() -> reqwest::Client { client(crate::node_state::process_token()) }
+pub fn process_http() -> reqwest::Client { for_nodes(crate::net::process(), crate::node_state::process_token()) }
 
 /// The node's dial: HTTP between nodes, signed by the calling node's token (`http`).
 pub struct Http;
@@ -691,5 +695,34 @@ fn relock(t: &Term, node: &Arc<crate::node_state::NodeState>) {
             });
         }
         Err(_) => {} // the mark still covers it
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    /// A form's `Net` that makes the nodes' clients itself, counting each it makes and the token it was given.
+    #[derive(Default)]
+    struct Own(Mutex<Vec<Option<String>>>);
+
+    impl crate::net::Net for Own {
+        fn client(&self, _: crate::net::Policy) -> reqwest::Client { reqwest::Client::new() }
+        fn nodes(&self, token: Option<&str>) -> Option<reqwest::Client> {
+            self.0.lock().unwrap().push(token.map(str::to_string));
+            Some(reqwest::Client::new())
+        }
+    }
+
+    /// The calls between nodes go through the form's `Net` (audit 11-09 L5): it makes their client, signed with the node's
+    /// token, once a token, and again when the token changes.
+    #[test]
+    fn the_nodes_client_is_made_by_the_forms_net() {
+        let net = Own::default();
+        let kept = Mutex::new(None);
+        for token in ["the-lakes-key", "the-lakes-key", "an-admin-token"] {
+            super::held(&kept, Some(token.to_string()), |t| super::for_nodes(&net, t));
+        }
+        assert_eq!(*net.0.lock().unwrap(), [Some("the-lakes-key".to_string()), Some("an-admin-token".to_string())]);
     }
 }

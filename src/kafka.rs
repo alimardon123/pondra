@@ -22,7 +22,6 @@
 use crate::auth::Role;
 use crate::log::{Ack, Src};
 use crate::answer::schema;
-use crate::reset::Once;
 use crate::app::App;
 use crate::store::{seg_key, table_key, Segment, TableMeta};
 use crate::kafka_wire::{MOST, decompress, Rd, put_str, put_nstr, put_len, put_varint, crc32c};
@@ -106,7 +105,7 @@ pub async fn serve(app: App, addr: String, advertise: String) -> Result<()> {
     let (host, port) = advertise.rsplit_once(':').ok_or_else(|| anyhow!("--kafka-advertise is host:port"))?;
     let id = (advertise.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) & 0x7fff_ffff) as i32; // stable per address
     let me = Arc::new(Broker { id, host: host.into(), port: port.parse()? });
-    ME.set_once(serde_json::json!({"id": me.id, "host": me.host, "port": me.port}));
+    let _ = app.lake.state::<Brokers>()?.me.set(serde_json::json!({"id": me.id, "host": me.host, "port": me.port})); // (the first `--kafka` door says who this node is)
     while let Some((socket, _)) = doors.next().await {
         if app.lake.node.drain.draining() {
             continue; // (a node stopping takes no new client: the socket closes, and the client tries another broker)
@@ -288,7 +287,7 @@ async fn metadata(app: &App, me: &Broker, ver: i16, r: &mut Rd, who: &crate::aut
     if ver >= 3 {
         w.put_i32(0);
     }
-    let brokers = brokers(app, me).await;
+    let brokers = brokers(app, me).await?;
     w.put_i32(brokers.len() as i32);
     for (id, host, port) in &brokers {
         w.put_i32(*id);
@@ -1224,10 +1223,23 @@ fn now_ms() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX
 // (`kafka-group:{group}:{topic}` = offset + 1), written through the log like any append, so they
 // survive a change of leader (members then just join again).
 
-crate::per_node!(static GROUPS: std::sync::Mutex<std::collections::HashMap<String, Group>> = Default::default());
-crate::per_node!(static ME: std::sync::RwLock<Option<Value>> = std::sync::RwLock::new(None)); // this node's broker, for `/cluster/kafka`
-crate::per_node!(static PEERS: std::sync::Mutex<std::collections::HashMap<String, Value>> = Default::default()); // other live nodes' brokers, by node address (`brokers`)
-crate::per_node!(static COORDINATOR: std::sync::RwLock<Option<(i32, String, i32)>> = std::sync::RwLock::new(None));
+/// What a lake keeps for its Kafka door (invariant 301): the consumer groups its leader coordinates, this node's broker
+/// (for `/cluster/kafka`), the other live nodes' (`brokers`), and the leader's (`find_coordinator`).
+#[derive(Default)]
+pub struct Brokers {
+    groups: std::sync::Mutex<HashMap<String, Group>>,
+    me: std::sync::OnceLock<Value>,
+    peers: std::sync::Mutex<HashMap<String, Value>>, // (by node address)
+    coordinator: std::sync::OnceLock<(i32, String, i32)>,
+}
+
+impl crate::lake_state::LakeState for Brokers {
+    const NAME: &'static str = "kafka";
+    const ABOUT: &'static str = "its Kafka door's consumer groups, and this node's broker, the other live nodes' and the leader's";
+    fn make() -> Self {
+        Brokers::default()
+    }
+}
 
 const COORDINATOR_NOT_AVAILABLE: i16 = 15;
 const NOT_COORDINATOR: i16 = 16;
@@ -1235,8 +1247,8 @@ const ILLEGAL_GENERATION: i16 = 22;
 const UNKNOWN_MEMBER_ID: i16 = 25;
 const REBALANCE_IN_PROGRESS: i16 = 27;
 
-/// This node as a Kafka broker (the leader's is where followers send group requests).
-pub fn me() -> Value { ME.current().unwrap_or(Value::Null) }
+/// This node as a Kafka broker (the leader's is where followers send group requests): `null` without `--kafka`.
+pub fn me(lake: &crate::store::Lake) -> Value { lake.state::<Brokers>().ok().and_then(|b| b.me.get().cloned()).unwrap_or(Value::Null) }
 
 #[derive(Default)]
 struct Group {
@@ -1271,17 +1283,17 @@ struct Joined {
 
 impl Group {
     /// Start a rebalance: everyone must join again (they learn it from their heartbeats).
-    fn rebalance(&mut self, group: &str, timeout: Duration) {
+    fn rebalance(&mut self, kept: &Arc<Brokers>, group: &str, timeout: Duration) {
         if self.joining {
             return;
         }
         (self.joining, self.synced, self.round) = (true, false, self.round + 1);
         self.members.values_mut().for_each(|m| m.joined = false);
-        let (group, round, start) = (group.to_string(), self.round, std::time::Instant::now());
+        let (kept, group, round, start) = (kept.clone(), group.to_string(), self.round, std::time::Instant::now());
         crate::spawns::task(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                let mut groups = GROUPS.lock().unwrap();
+                let mut groups = kept.groups.lock().unwrap();
                 let Some(g) = groups.get_mut(&group).filter(|g| g.round == round && g.joining) else { return };
                 g.members.retain(|_, m| m.joined || m.seen.elapsed() < m.session); // (silent ones drop out)
                 g.complete(start.elapsed() > timeout);
@@ -1311,11 +1323,11 @@ impl Group {
     }
 
     /// Drop members silent past their session timeout; someone leaving means a new generation.
-    fn expire(&mut self, group: &str) {
+    fn expire(&mut self, kept: &Arc<Brokers>, group: &str) {
         let before = self.members.len();
         self.members.retain(|_, m| m.seen.elapsed() < m.session);
         if self.members.len() < before && !self.members.is_empty() {
-            self.rebalance(group, Duration::from_secs(30));
+            self.rebalance(kept, group, Duration::from_secs(30));
         }
     }
 
@@ -1336,12 +1348,12 @@ async fn find_coordinator(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Resul
     let transactions = ver >= 1 && r.i8()? == 1;
     let coordinator = match app.seq.is_some() {
         true => Some((me.id, me.host.clone(), me.port)),
-        false => match COORDINATOR.current() {
+        false => match app.lake.state::<Brokers>()?.coordinator.get().cloned() {
             Some(c) => Some(c),
             None => {
                 let found = leader_broker(app).await.ok();
                 if let Some(c) = &found {
-                    COORDINATOR.set_once(c.clone());
+                    let _ = app.lake.state::<Brokers>()?.coordinator.set(c.clone());
                 }
                 found
             }
@@ -1368,10 +1380,11 @@ async fn find_coordinator(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Resul
 /// request left the group waiting for an answer that never came, and it never joined. Each
 /// node's broker is asked of it once (`/cluster/kafka`, `null` for a node without `--kafka`)
 /// and forgotten when it leaves the live members.
-async fn brokers(app: &App, me: &Broker) -> Vec<(i32, String, i32)> {
+async fn brokers(app: &App, me: &Broker) -> Result<Vec<(i32, String, i32)>> {
+    let kept = app.lake.state::<Brokers>()?;
     let nodes = app.members.nodes();
     let known = {
-        let mut peers = PEERS.lock().unwrap();
+        let mut peers = kept.peers.lock().unwrap();
         peers.retain(|node, _| nodes.contains(node));
         peers.clone()
     };
@@ -1383,7 +1396,7 @@ async fn brokers(app: &App, me: &Broker) -> Vec<(i32, String, i32)> {
         })
     });
     let found = futures::future::join_all(asked).await;
-    let mut peers = PEERS.lock().unwrap();
+    let mut peers = kept.peers.lock().unwrap();
     peers.extend(found.into_iter().filter_map(|(node, b)| Some((node, b?))));
     let mut all = vec![(me.id, me.host.clone(), me.port)];
     for b in peers.values() {
@@ -1394,7 +1407,7 @@ async fn brokers(app: &App, me: &Broker) -> Vec<(i32, String, i32)> {
         }
     }
     all.sort();
-    all
+    Ok(all)
 }
 
 async fn leader_broker(app: &App) -> Result<(i32, String, i32)> {
@@ -1435,17 +1448,18 @@ async fn join_group(app: &App, ver: i16, r: &mut Rd) -> Result<BoxFuture<'static
     if app.seq.is_none() {
         return Ok(async move { answer(Joined { error: NOT_COORDINATOR, ..Default::default() }) }.boxed());
     }
+    let kept = app.lake.state::<Brokers>()?;
     let rx = {
-        let mut groups = GROUPS.lock().unwrap();
+        let mut groups = kept.groups.lock().unwrap();
         let g = groups.entry(group.clone()).or_default();
-        g.expire(&group);
+        g.expire(&kept, &group);
         if !member.is_empty() && !g.members.contains_key(&member) {
             return Ok(async move { answer(Joined { error: UNKNOWN_MEMBER_ID, member, ..Default::default() }) }.boxed());
         }
         let id = if member.is_empty() { format!("pondra-{}", uuid::Uuid::new_v4()) } else { member };
         let m = g.members.entry(id.clone()).or_insert(Member { protocols: vec![], session, seen: std::time::Instant::now(), joined: false, assignment: Bytes::new() });
         (m.protocols, m.session, m.seen) = (protocols, session, std::time::Instant::now());
-        g.rebalance(&group, rebalance);
+        g.rebalance(&kept, &group, rebalance);
         g.members.get_mut(&id).expect("just added").joined = true;
         let (tx, rx) = tokio::sync::oneshot::channel();
         g.joins.push((id, tx));
@@ -1474,7 +1488,8 @@ async fn sync_group(app: &App, ver: i16, r: &mut Rd) -> Result<BoxFuture<'static
     if app.seq.is_none() {
         return Ok(async move { answer(NOT_COORDINATOR, Bytes::new()) }.boxed());
     }
-    let mut groups = GROUPS.lock().unwrap();
+    let kept = app.lake.state::<Brokers>()?;
+    let mut groups = kept.groups.lock().unwrap();
     let g = groups.entry(group).or_default();
     let error = g.check(&member, generation);
     if error != 0 {
@@ -1512,9 +1527,10 @@ fn heartbeat(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     let error = match app.seq.is_some() {
         false => NOT_COORDINATOR,
         true => {
-            let mut groups = GROUPS.lock().unwrap();
+            let kept = app.lake.state::<Brokers>()?;
+            let mut groups = kept.groups.lock().unwrap();
             let g = groups.entry(group.clone()).or_default();
-            g.expire(&group);
+            g.expire(&kept, &group);
             if let Some(m) = g.members.get_mut(&member) {
                 m.seen = std::time::Instant::now();
             }
@@ -1540,12 +1556,13 @@ fn leave_group(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
         false => vec![r.str()?],
     };
     if app.seq.is_some() {
-        let mut groups = GROUPS.lock().unwrap();
+        let kept = app.lake.state::<Brokers>()?;
+        let mut groups = kept.groups.lock().unwrap();
         let g = groups.entry(group.clone()).or_default();
         let before = g.members.len();
         g.members.retain(|id, _| !leaving.contains(id));
         if g.members.len() < before && !g.members.is_empty() {
-            g.rebalance(&group, Duration::from_secs(30));
+            g.rebalance(&kept, &group, Duration::from_secs(30));
         }
     }
     let mut w = vec![];
@@ -1579,7 +1596,7 @@ async fn offset_commit(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     let error = match (app.seq.is_some(), generation) {
         (false, _) => NOT_COORDINATOR,
         (true, g) if g < 0 => 0, // a consumer outside any generation (it assigns partitions itself)
-        (true, g) => GROUPS.lock().unwrap().get(&group).map_or(UNKNOWN_MEMBER_ID, |grp| grp.check(&member, g)),
+        (true, g) => app.lake.state::<Brokers>()?.groups.lock().unwrap().get(&group).map_or(UNKNOWN_MEMBER_ID, |grp| grp.check(&member, g)),
     };
     let mut w = vec![];
     if ver >= 3 {

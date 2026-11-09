@@ -10,7 +10,6 @@
 //! Delta's (`responseformat=delta`): never handed out as files that would show deleted rows.
 use crate::byte_range;
 use crate::read_delta::Log;
-use crate::reset::Once;
 use crate::app::App;
 use crate::shares::{Share, Shared};
 use crate::sharing_client::endpoint;
@@ -25,9 +24,13 @@ use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------- where it is
 
-/// This node's address as where recipients reach the door, unless `PONDRA_SHARING_URL` names another
+/// This node's address as where recipients reach the lake's door, unless `PONDRA_SHARING_URL` names another
 /// (`sharing_client::endpoint`).
-pub fn set_endpoint(addr: &str) { crate::sharing_client::ENDPOINT.set_once(crate::tls::url(&format!("{}/delta-sharing", addr.trim_end_matches('/')))); }
+pub fn set_endpoint(lake: &crate::store::Lake, addr: &str) {
+    if let Ok(at) = lake.state::<crate::sharing_client::Endpoint>() {
+        let _ = at.0.set(crate::tls::url(&format!("{}/delta-sharing", addr.trim_end_matches('/'))));
+    }
+}
 
 pub fn routes() -> Router<App> {
     let t = "/delta-sharing/shares/{share}/schemas/{schema}/tables/{table}";
@@ -331,8 +334,8 @@ async fn files(app: &App, c: &Caller, t: &Shared, folder: &str, log: &Log, delta
         keys.push(key);
         kept.push(add);
     }
-    quota(&c.name, keys.len())?;
-    let (links, until) = crate::vend::links(&app.lake, &endpoint(), &keys, &c.name).await.map_err(internal)?;
+    quota(&app.lake, &c.name, keys.len())?;
+    let (links, until) = crate::vend::links(&app.lake, &endpoint(&app.lake), &keys, &c.name).await.map_err(internal)?;
     Ok(kept.into_iter().zip(links).map(|(add, url)| {
         let id = crate::users::sha256(add["path"].as_str().unwrap_or_default())[..32].to_string();
         match delta {
@@ -356,14 +359,26 @@ async fn partitions(app: &App, t: &Shared) -> anyhow::Result<HashMap<String, Str
     Ok(all.into_iter().map(|f| (f.path, f.part)).collect())
 }
 
+/// What a lake keeps for its door's recipients (invariant 301): the links each was given this minute, by recipient (`quota`).
+#[derive(Default)]
+pub struct Used(Mutex<HashMap<String, (u64, usize)>>);
+
+impl crate::lake_state::LakeState for Used {
+    const NAME: &'static str = "sharing";
+    const ABOUT: &'static str = "the links its Delta Sharing door gave each recipient this minute";
+    fn make() -> Self {
+        Used::default()
+    }
+}
+
 /// At most `PONDRA_SHARE_FILES_PER_MINUTE` (10,000) links a minute for each recipient, on each
 /// node: their reads are GETs on the lake's bucket that no node's request budget sees (principle 7).
-fn quota(who: &str, n: usize) -> Result<(), Fail> {
-    crate::per_node!(static USED: Mutex<Option<HashMap<String, (u64, usize)>>> = Mutex::new(None));
+fn quota(lake: &crate::store::Lake, who: &str, n: usize) -> Result<(), Fail> {
     let most: usize = crate::env::value("PONDRA_SHARE_FILES_PER_MINUTE");
     let minute = crate::log::now_ms() / 60_000;
-    let mut used = USED.lock().unwrap();
-    let e = used.get_or_insert_default().entry(who.to_string()).or_insert((minute, 0));
+    let kept = lake.state::<Used>().map_err(internal)?;
+    let mut used = kept.0.lock().unwrap();
+    let e = used.entry(who.to_string()).or_insert((minute, 0));
     if e.0 != minute {
         *e = (minute, 0);
     }

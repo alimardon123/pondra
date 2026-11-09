@@ -214,9 +214,6 @@ impl Node {
         let store = store::counted(store::open_store(&dir)?.1, &here.metrics); // (its terms, marks and members' requests the node's: `Counted`)
         let tr = |what: &str| here.trace(what); // (timed from this start: `NodeState::trace`)
         let addr = advertise.unwrap_or_else(|| listen.clone()); // (how others reach it: its cluster name)
-        if lives {
-            sharing::set_endpoint(&addr); // (where a recipient's profile points: `sharing.rs`)
-        }
         if let Some(at) = dir.strip_prefix("pondra://") {
             // (a lake whose node is away, or not up yet: wait for it, as a follower waits for its leader; a guest waits 10 s at most)
             let at = at.trim_end_matches('/');
@@ -297,6 +294,9 @@ impl Node {
             lake => lake?,
         };
         let _ = held.lake.set(lake.clone()); // (a stop from here on makes the lake durable first: `Held::stop`)
+        if lives {
+            sharing::set_endpoint(&lake, &addr); // (where a recipient's profile points: `sharing.rs`)
+        }
         if (guest == Some(Guest::Reads) || cluster.by_inbox()) && !streamed {
             let _ = held.detach.set(()); // (a reader owes nothing: its close is let go, `Held::stop`; an inbox guest's writes are answered before it)
         }
