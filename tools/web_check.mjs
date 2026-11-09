@@ -45,7 +45,9 @@ const sizes = args.includes('--sizes');
 // lake keeps a dropped view, routine, task, type, secret or connection and brings it back, as every form's does.
 // 9.216 → 9.222 MB: UNDROP of a schema dropped with CASCADE and of a materialized view (6.2 KB over main's 9,214,326 at
 // 3d5a4f49, measured on CI): a page's lake brings back a schema with what it held, and a view made again from its query.
-const BROTLI_BUDGET = 9_222_000;
+// 9.222 → 9.233 MB: a dropped database kept in its folder and UNDROP DATABASE (10.8 KB over main's 9,221,388 at the train's
+// 42557954757, measured on CI): the page builds the same ddl as every form, a database's drop and undrop with it.
+const BROTLI_BUDGET = 9_233_000;
 // The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
 const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows
