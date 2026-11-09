@@ -163,6 +163,7 @@ spill engine
 spmd engine
 statement engine
 statements engine
+core_statements engine
 connections catalog
 string_agg engine
 sys engine

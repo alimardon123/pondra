@@ -5,7 +5,7 @@
 use anyhow::{bail, Result};
 
 /// A statement's tokens, last first (`next` takes the one after those taken).
-pub(crate) struct Words(pub(crate) Vec<W>);
+pub struct Words(pub(crate) Vec<W>);
 
 #[derive(Clone, Debug)]
 pub(crate) enum W {
@@ -40,6 +40,7 @@ impl Words {
                 Token::RParen => W::Sym(')'),
                 Token::Period => W::Sym('.'),
                 Token::Eq => W::Sym('='),
+                Token::RArrow => W::Sym('⇒'), // (`=>`)
                 Token::SemiColon => continue,
                 _ => W::Sym('?'),
             });
@@ -58,6 +59,9 @@ impl Words {
         yes
     }
     pub(crate) fn expect(&mut self, w: &str) -> Result<()> { if self.is(w) { Ok(()) } else { bail!("expected {} {}", w.to_uppercase(), self.near()) } }
+    /// These words, in order (`["not", "exists"]`).
+    pub(crate) fn expect_all(&mut self, words: &[&str]) -> Result<()> { words.iter().try_for_each(|w| self.expect(w)) }
+    pub(crate) fn expect_sym(&mut self, c: char) -> Result<()> { if self.sym(c) { Ok(()) } else { bail!("expected {c} {}", self.near()) } }
     pub(crate) fn sym(&mut self, c: char) -> bool {
         let yes = matches!(self.0.last(), Some(W::Sym(s)) if *s == c);
         if yes {
@@ -71,6 +75,15 @@ impl Words {
             Some(W::Word(w, _)) | Some(W::Str(w)) | Some(W::Num(w)) => format!("near {w}"),
             Some(W::Sym(c)) => format!("near {c}"),
         }
+    }
+    /// One part of a name: `a`, `"A"`.
+    pub(crate) fn part(&mut self) -> Result<String> {
+        if let Some(W::Word(..)) = self.0.last() {
+            if let Some(W::Word(w, _)) = self.0.pop() {
+                return Ok(w);
+            }
+        }
+        bail!("expected a name {}", self.near())
     }
     /// A name: `a`, `"A"`, or dotted (`s.t`, `lake.s.t`).
     pub(crate) fn name(&mut self) -> Result<String> {

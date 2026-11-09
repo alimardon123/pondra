@@ -429,7 +429,10 @@ pub(crate) mod tests {
 
     /// The repository's SQL: string literals that start as a statement does in src/ and tools/harness.py, the records of
     /// tests/forms/*.slt, the docs' sql blocks, TPC-H's queries and the texts recorded from Postgres (tools/pg16).
-    pub(crate) fn corpus() -> Vec<String> {
+    pub(crate) fn corpus() -> Vec<String> { texts("") }
+
+    /// The corpus, with the texts that start with these words too (`|backup|restore`).
+    pub(crate) fn texts(more: &str) -> Vec<String> {
         use std::collections::BTreeSet;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
@@ -448,7 +451,7 @@ pub(crate) mod tests {
             }
             out
         };
-        let starts = regex::Regex::new(r"(?is)^\s*(?:--[^\n]*\n\s*)*(?:select|with|from|create|insert|update|delete|alter|drop|show|explain|pivot|unpivot|set|describe|desc|call|copy|summarize|values|table|merge|grant|revoke|pragma|upsert|replace|declare|prepare|execute|begin|comment|listen|notify|step|wait|parallel|use|attach|refresh|install|load)\b").unwrap();
+        let starts = regex::Regex::new(&format!(r"(?is)^\s*(?:--[^\n]*\n\s*)*(?:select|with|from|create|insert|update|delete|alter|drop|show|explain|pivot|unpivot|set|describe|desc|call|copy|summarize|values|table|merge|grant|revoke|pragma|upsert|replace|declare|prepare|execute|begin|comment|listen|notify|step|wait|parallel|use|attach|refresh|install|load{more})\b")).unwrap();
         let strings = regex::Regex::new(r#"(?s)r#"(.*?)"[#]|"""(.*?)"""|"((?:[^"\\\n]|\\.)*)""#).unwrap();
         let unescape = |s: &str| s.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"").replace("\\'", "'").replace("\\\\", "\\");
         let mut out = BTreeSet::new();
