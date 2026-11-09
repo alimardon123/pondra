@@ -4382,7 +4382,7 @@ pub fn partitions_of(memory: usize) -> usize {
 pub fn node_partitions(node: &NodeState) -> usize { partitions_of(node_memory(node)) }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The engine gives every lake its sessions and the memory watch (`EngineHooks`), and Delta and Iceberg say which of
@@ -5004,7 +5004,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-joined-{}", uuid::Uuid::new_v4()));
         let folder = dir.to_str().unwrap().to_string();
         let writer = Lake::open(&folder, true, false, crate::node_state::NodeState::unhosted()).await?;
-        crate::write::create_table(&writer, "t", r#"{"columns": [["a", "Int64"]]}"#).await?;
+        writer.cat.commit(vec![(table_key("t"), json(&TableMeta::with_columns(vec![("a".into(), "Int64".into())])))], &[]).await?;
         let copied = writer.cat.kv.scan(b"".to_vec()..vec![0xff], false).await?;
         assert!(copied.contains_key(&table_key("t")), "the writer's catalog holds its table");
 
@@ -5322,7 +5322,7 @@ mod tests {
 
     /// The parse and size measures' wide entry: 500 columns, renames, drops, a moved order, NOT NULLs, defaults, held
     /// types and 200 files.
-    fn wide_entry() -> TableMeta {
+    pub(crate) fn wide_entry() -> TableMeta {
         let mut m = TableMeta::made(Made {
             columns: (0..500).map(|i| (format!("column_{i}"), if i % 3 == 0 { "Int64" } else { "Utf8" }.to_string())).collect(),
             names: (0..500).step_by(10).map(|i| (format!("column_{i}"), format!("renamed_{i}"))).collect(),
@@ -5339,7 +5339,7 @@ mod tests {
     }
 
     /// Their 2,000 small entries: 1 to 8 columns, some renamed, some with a column dropped.
-    fn small_entries() -> Vec<TableMeta> {
+    pub(crate) fn small_entries() -> Vec<TableMeta> {
         (0..2000u64)
             .map(|i| {
                 let n = 1 + (i % 8) as usize;
@@ -5487,7 +5487,8 @@ mod tests {
     /// What the entry's own column helpers cost (redesign 1b, piece 7a's before and after: from the fields by stored name
     /// to the list): each on an entry read as format 6's list, asked again ("warm") and first after the read ("first",
     /// the read's own cost taken off). The wide table and the 2,000 small ones of `entry_parse_time`. A measure, not a
-    /// check: `cargo test --release --lib column_helpers_time -- --ignored --nocapture`.
+    /// check: `cargo test --release --lib column_helpers_time -- --ignored --nocapture` (the engine's helpers of a column,
+    /// `types::shown` and `default_sql`, are measured the same way in `rules::rows`).
     #[test]
     #[ignore]
     fn column_helpers_time() {
@@ -5500,14 +5501,12 @@ mod tests {
                 })
                 .fold(f64::MAX, f64::min)
         };
-        let helpers: [(&str, fn(&TableMeta) -> usize); 13] = [
+        let helpers: [(&str, fn(&TableMeta) -> usize); 11] = [
             ("columns()", |m| m.columns().map(|(c, t)| c.len() + t.len()).sum()),
             ("described()", |m| m.described().columns().len()),
             ("schema()", |m| m.schema().unwrap().fields().len()),
             ("read_schema()", |m| m.read_schema().unwrap().fields().len()),
             ("table_sql()", |m| crate::objects::table_sql("t", m).len()),
-            ("types::shown(), each column", |m| m.list().columns.iter().filter_map(|c| m.col(c.stored_name())).map(|c| crate::types::shown(c).len()).sum()),
-            ("default_sql(), each column", |m| m.live().filter_map(|(_, n, _)| crate::rules::rows::default_sql(m, n)).count()),
             ("logical()", |m| m.logical().columns().len()),
             ("to_rules()", |m| m.to_rules().unwrap().columns.len()),
             ("sql_columns()", |m| m.sql_columns().len()),
@@ -5774,7 +5773,7 @@ mod tests {
 
     /// The entries of every release's lake since 0.22, as each release wrote them (`keep_old_entries`): a line each,
     /// `{"release", "key", "entry"}`.
-    const OLD_ENTRIES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/old-entries.jsonl");
+    pub(crate) const OLD_ENTRIES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/old-entries.jsonl");
 
     /// Keeps every table entry (`t/`) and dropped table's record (`dt/`) of each release's lake since 0.22 as it wrote
     /// them, for `old_entries_read_as_before`: `python3 tools/upgrade_check.py lakes --work DIR`, then
@@ -5825,7 +5824,7 @@ mod tests {
             let at = format!("{v} {k}");
             let metas = match k.starts_with("dt/") {
                 true => {
-                    let _: crate::ddl::Dropped = serde_json::from_value(l["entry"].clone()).expect(&at);
+                    // (and the record reads as a dropped table's: `ddl::tests::old_dropped_records_read_as_before`)
                     [Some(&l["entry"]["meta"]), l["entry"].get("deleted").filter(|d| !d.is_null())].into_iter().flatten().collect()
                 }
                 false => vec![&l["entry"]],
