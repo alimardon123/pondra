@@ -152,6 +152,7 @@ mod table_record;
 #[cfg(feature = "lake")] mod records; // (the catalog's record scheme: every prefix, and whose it is)
 #[cfg(feature = "lake")] mod auth;
 #[cfg(feature = "lake")] mod rights; // (what a principal may do, decided in one place: step 6)
+#[cfg(feature = "lake")] mod row_filter; // (a grant's filter on its rows: checked when set, filled in for its reader)
 #[cfg(feature = "lake")] mod budget;
 #[cfg(feature = "lake")] mod buckets; // (what opens a lake's bucket: the hosts fill it, `hosted`)
 #[cfg(feature = "lake")] mod hosted;

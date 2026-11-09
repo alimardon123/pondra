@@ -2154,7 +2154,7 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("pondra-probe-{}", uuid::Uuid::new_v4()));
             let lake = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
             crate::write::create_table(&lake, "t", r#"{"columns": [["k", "Int64"], ["v", "Int64"]]}"#).await?;
-            let ann = Scope::granted(Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec!["v".into()] }])));
+            let ann = Scope::granted(Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec!["v".into()], rows: None }])));
             let scans = |p: &LogicalPlan| p.exists(|n| Ok(matches!(n, LogicalPlan::TableScan(_)))).unwrap();
             let probes = ["SELECT * FROM t LIMIT 0", "SELECT * FROM t WHERE 1 = 0", "SELECT k FROM t WHERE false", "SELECT * FROM t a JOIN t b ON FALSE",
                 "SELECT * FROM t JOIN (SELECT 1 AS x WHERE false) e ON true", "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM t u LIMIT 0)"];
