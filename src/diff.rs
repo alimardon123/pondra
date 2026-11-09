@@ -30,19 +30,38 @@ use datafusion::common::ScalarValue;
 use datafusion::sql::sqlparser::ast::{self, Expr, Statement, TableFactor, Value, VisitorMut};
 use std::ops::ControlFlow;
 
-/// The front's pass of this module (`passes.rs`): a call to `pondra.diff` means the tree has something to rewrite.
+/// The front's pass of this module (`passes.rs`): a call to `pondra.diff` or `pondra.diff_steps` means the tree has
+/// something to rewrite.
 pub(crate) fn pass() -> crate::passes::Pass {
     crate::passes::Pass { name: "diff.diffs", order: 40, words: vec![], marks: vec![&["pondra", ".", "diff"]], run: crate::passes::Run::Wants(mentioned) }
 }
 
 fn mentioned(sql: &str) -> bool {
-    static CALL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bpondra\s*\.\s*diff\b").expect("a regex"));
+    static CALL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bpondra\s*\.\s*diff(_steps)?\b").expect("a regex"));
     CALL.is_match(sql)
+}
+
+/// Which of this module's functions a call is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Asked {
+    /// `pondra.diff`: the rows that differ.
+    Rows,
+    /// `pondra.diff_steps`: which step moved them (`diff_steps.rs`).
+    Steps,
+}
+
+impl Asked {
+    fn name(self) -> &'static str {
+        match self {
+            Asked::Rows => "pondra.diff",
+            Asked::Steps => "pondra.diff_steps",
+        }
+    }
 }
 
 /// One side of a diff: a table's or a view's name, or a query.
 #[derive(Clone, Debug, PartialEq)]
-enum Side {
+pub(crate) enum Side {
     Name(String),
     Query(String),
 }
@@ -57,7 +76,7 @@ impl Side {
     }
 
     /// How an error names it.
-    fn shown(&self) -> String {
+    pub(crate) fn shown(&self) -> String {
         match self {
             Side::Name(n) => n.clone(),
             Side::Query(q) if q.chars().count() > 40 => format!("({}…)", q.chars().take(40).collect::<String>()),
@@ -68,11 +87,11 @@ impl Side {
 
 /// A call's arguments: its two sides, the key's columns when `key =>` names them, and the database `data =>` names.
 #[derive(Clone, Debug, PartialEq)]
-struct Call {
-    a: Side,
-    b: Side,
+pub(crate) struct Call {
+    pub(crate) a: Side,
+    pub(crate) b: Side,
     key: Option<Vec<String>>,
-    data: Option<String>,
+    pub(crate) data: Option<String>,
 }
 
 /// How a call's two sides are matched.
@@ -86,7 +105,8 @@ enum Match {
     Whole,
 }
 
-/// Each `pondra.diff(a, b)` in `stmts` as the query that answers it, innermost first (a side's query may diff too).
+/// Each `pondra.diff(a, b)` and `pondra.diff_steps(a, b)` in `stmts` as the query that answers it, innermost first (a
+/// side's query may diff too).
 /// Whether there was one.
 pub async fn rewrite<H: Host>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
     let mut any = false;
@@ -97,8 +117,12 @@ pub async fn rewrite<H: Host>(host: &H, stmts: &mut [Statement]) -> Result<bool>
                 return Err(e);
             }
         }
-        let Some(call) = first.found else { return Ok(any) };
-        let answer = crate::expander::parse_query(&Box::pin(answer_of(host, &call)).await?)?; // (its sides are asked through the front again)
+        let Some((asked, call)) = first.found else { return Ok(any) };
+        let text = match asked {
+            Asked::Rows => Box::pin(answer_of(host, &call)).await?, // (its sides are asked through the front again)
+            Asked::Steps => Box::pin(crate::diff_steps::answer_of(host, &call)).await?,
+        };
+        let answer = crate::expander::parse_query(&text)?;
         let mut put = Put { answer: Some(answer) };
         for s in stmts.iter_mut() {
             if let ControlFlow::Break(e) = crate::walk::visit_mut(s, &mut put) {
@@ -109,25 +133,26 @@ pub async fn rewrite<H: Host>(host: &H, stmts: &mut [Statement]) -> Result<bool>
     }
 }
 
-/// Whether a table factor is a call to `pondra.diff`.
-fn is_diff(t: &TableFactor) -> bool { matches!(t, TableFactor::Table { name, args: Some(_), .. } if crate::text::object(name).eq_ignore_ascii_case("pondra.diff")) }
+/// Which of this module's functions a table factor calls, if it calls one.
+fn asked(t: &TableFactor) -> Option<Asked> {
+    let TableFactor::Table { name, args: Some(_), .. } = t else { return None };
+    [Asked::Rows, Asked::Steps].into_iter().find(|a| crate::text::object(name).eq_ignore_ascii_case(a.name()))
+}
 
-/// The first call to `pondra.diff` in the walk's order (a call's sides before it), with its sides.
+/// The first call to `pondra.diff` or `pondra.diff_steps` in the walk's order (a call's sides before it), with its sides.
 struct First {
-    found: Option<Call>,
+    found: Option<(Asked, Call)>,
 }
 
 impl VisitorMut for First {
     type Break = anyhow::Error;
 
     fn post_visit_table_factor(&mut self, t: &mut TableFactor) -> ControlFlow<Self::Break> {
-        if self.found.is_some() || !is_diff(t) {
-            return ControlFlow::Continue(());
-        }
+        let Some(asked) = asked(t).filter(|_| self.found.is_none()) else { return ControlFlow::Continue(()) };
         let TableFactor::Table { args: Some(args), .. } = t else { return ControlFlow::Continue(()) };
-        match call(&args.args) {
+        match call(asked, &args.args) {
             Ok(s) => {
-                self.found = Some(s);
+                self.found = Some((asked, s));
                 ControlFlow::Continue(())
             }
             Err(e) => ControlFlow::Break(e),
@@ -144,7 +169,7 @@ impl VisitorMut for Put {
     type Break = anyhow::Error;
 
     fn post_visit_table_factor(&mut self, t: &mut TableFactor) -> ControlFlow<Self::Break> {
-        if !is_diff(t) {
+        if asked(t).is_none() {
             return ControlFlow::Continue(());
         }
         let Some(answer) = self.answer.take() else { return ControlFlow::Continue(()) };
@@ -154,16 +179,21 @@ impl VisitorMut for Put {
     }
 }
 
-/// A call's arguments: two sides, each a string naming a table or a view, or a query; `key => 'c1, c2'`; and
-/// `data => 'db'`.
-fn call(args: &[ast::FunctionArg]) -> Result<Call> {
+/// A call's arguments: two sides, each a string naming a table or a view, or a query; `key => 'c1, c2'` (`pondra.diff`'s);
+/// and `data => 'db'`.
+fn call(asked: Asked, args: &[ast::FunctionArg]) -> Result<Call> {
     static NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"^[\w"$]+(\.[\w"$]+){0,2}$"#).expect("a regex"));
     static DATABASE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"^([\w$-]+|"[^"]+")$"#).expect("a regex"));
-    const FORM: &str = "pondra.diff takes two sides, each a table's or a view's name or a query, a key and a database to read: pondra.diff('prod.sales.orders', 'dev.sales.orders' [, key => 'id'] [, data => 'dev'])";
-    let a = crate::text::args("pondra.diff", args)?;
+    let form = match asked {
+        Asked::Rows => "pondra.diff takes two sides, each a table's or a view's name or a query, a key and a database to read: pondra.diff('prod.sales.orders', 'dev.sales.orders' [, key => 'id'] [, data => 'dev'])",
+        Asked::Steps => "pondra.diff_steps takes two sides, each a view's name or a query, and a database to read: pondra.diff_steps('prod.sales.daily', 'dev.sales.daily' [, data => 'dev'])",
+    };
+    let what = asked.name();
+    let a = crate::text::args(what, args)?;
     let (mut key, mut data) = (None, None);
     for (n, e) in &a.named {
         match (n.to_ascii_lowercase().as_str(), e) {
+            ("key", _) if asked == Asked::Steps => return Err(crate::codes::coded("42883", format!("{what} has no argument key (its steps are matched by name): {form}"))),
             ("key", Expr::Value(v)) if matches!(&v.value, Value::SingleQuotedString(_)) => {
                 let Value::SingleQuotedString(k) = &v.value else { unreachable!() };
                 key = Some(names(k).ok_or_else(|| crate::codes::coded("22023", format!("pondra.diff's key => names the key's columns: key => 'id, day', not '{k}'")))?);
@@ -173,23 +203,23 @@ fn call(args: &[ast::FunctionArg]) -> Result<Call> {
                 let Value::SingleQuotedString(d) = &v.value else { unreachable!() };
                 data = Some(d.trim().to_string());
             }
-            ("data", _) => return Err(crate::codes::coded("22023", format!("pondra.diff's data => names one database whose tables both sides read: data => 'dev', not {e}"))),
-            _ => return Err(crate::codes::coded("42883", format!("pondra.diff has no argument {n}: {FORM}"))), // (as Postgres names a call it has no function for)
+            ("data", _) => return Err(crate::codes::coded("22023", format!("{what}'s data => names one database whose tables both sides read: data => 'dev', not {e}"))),
+            _ => return Err(crate::codes::coded("42883", format!("{what} has no argument {n}: {form}"))), // (as Postgres names a call it has no function for)
         }
     }
     let side = |e: &Expr| -> Result<Side> {
         match e {
             Expr::Value(v) => match &v.value {
                 Value::SingleQuotedString(s) if NAME.is_match(s.trim()) => Ok(Side::Name(s.trim().to_string())),
-                _ => Err(crate::codes::coded("42883", format!("{FORM}, not {e}"))),
+                _ => Err(crate::codes::coded("42883", format!("{form}, not {e}"))),
             },
             Expr::Subquery(q) => Ok(Side::Query(q.to_string())),
-            _ => Err(crate::codes::coded("42883", format!("{FORM}, not {e}"))),
+            _ => Err(crate::codes::coded("42883", format!("{form}, not {e}"))),
         }
     };
     match a.given[..] {
         [x, y] => Ok(Call { a: side(x)?, b: side(y)?, key, data }),
-        _ => Err(crate::codes::coded("42883", FORM)),
+        _ => Err(crate::codes::coded("42883", form)),
     }
 }
 
@@ -293,7 +323,7 @@ async fn own<H: Host>(host: &H, side: &Side) -> Result<Side> {
 /// `dev.v`), the name it is attached by, which its own lake's name needn't be.
 pub(crate) fn database_of(name: &str) -> String { crate::text::parts(name).into_iter().next().unwrap_or_default() }
 
-async fn relation_of<H: Host>(host: &H, side: &Side) -> Option<Relation<H>> {
+pub(crate) async fn relation_of<H: Host>(host: &H, side: &Side) -> Option<Relation<H>> {
     match side {
         Side::Name(n) => host.relation(n).await,
         Side::Query(_) => None,
@@ -528,7 +558,7 @@ mod tests {
             let q = crate::expander::parse_query(sql).unwrap();
             let ast::SetExpr::Select(s) = *q.body else { panic!() };
             let TableFactor::Table { args: Some(args), .. } = &s.from[0].relation else { panic!() };
-            call(&args.args)
+            call(asked(&s.from[0].relation).unwrap(), &args.args)
         };
         assert_eq!(parsed("SELECT * FROM pondra.diff('prod.sales.orders', (SELECT 1 AS a))").unwrap(), Call { a: Side::Name("prod.sales.orders".into()), b: Side::Query("SELECT 1 AS a".into()), key: None, data: None });
         assert_eq!(parsed("SELECT * FROM pondra.diff('prod.v', 'dev.v', data => 'dev')").unwrap().data.as_deref(), Some("dev"));
@@ -542,6 +572,11 @@ mod tests {
         assert_eq!(crate::codes::of(&parsed("SELECT * FROM pondra.diff('a', 'b', key => 1)").unwrap_err()), "22023");
         assert!(parsed("SELECT * FROM pondra.diff('a; DROP TABLE t', 'b')").is_err());
         assert!(parsed("SELECT * FROM pondra.diff('a')").is_err());
+        assert_eq!(parsed("SELECT * FROM PONDRA.Diff_Steps('prod.v', 'dev.v', data => 'dev')").unwrap().data.as_deref(), Some("dev"));
+        let keyed = parsed("SELECT * FROM pondra.diff_steps('a', 'b', key => 'id')").unwrap_err();
+        assert!(crate::codes::of(&keyed) == "42883" && keyed.to_string().contains("pondra.diff_steps has no argument key"), "{keyed}");
+        assert!(parsed("SELECT * FROM pondra.diff_steps('a')").unwrap_err().to_string().contains("pondra.diff_steps takes two sides"));
+        assert!(mentioned("SELECT * FROM pondra . diff_steps('a', 'b')") && mentioned("SELECT * FROM pondra.diff('a', 'b')") && !mentioned("SELECT pondra.diffs"));
         assert_eq!(names(r#"a, "b,c", "say ""hi""""#), Some(vec!["a".to_string(), "b,c".to_string(), r#"say "hi""#.to_string()]));
         assert_eq!(names(r#""open"#), None);
         assert_eq!(name_parts(r#"prod."Sales".orders"#), Some(vec!["prod".to_string(), "Sales".to_string(), "orders".to_string()]));
