@@ -22691,6 +22691,19 @@ def listings():
     checks["a procedure's MCP tool is described by its COMMENT ON; its body's first line only to one who may see its code (11-08 audit L9)"] = \
         all(isinstance(d, dict) for d in described.values()) and "Says hello" in described["ann"]["told"] and "Says hello" in described["boss"]["told"] \
         and "the body's own line" not in described["ann"]["noted"] and "the body's own line" in described["boss"]["noted"]
+    # (11-09 audit H1: a sequence moves for a writer of a table that takes values from it. ann, granted INSERT on tickets,
+    # numbers its rows and may take its sequence's next value, but sets it back nowhere, and moves ticket_no, which no
+    # table of ann's takes from, at no door)
+    for q in ["CREATE TABLE tickets (id SERIAL, v TEXT)", "GRANT INSERT ON tickets TO ann"]:
+        ask(boss, q)
+    calls = {"INSERT": "INSERT INTO tickets (v) VALUES ('a')", "nextval": "SELECT nextval('tickets_id_seq') AS n", "setval": "SELECT setval('tickets_id_seq', 1) AS n",
+             "nextval, another": "SELECT nextval('ticket_no') AS n", "setval, another": "SELECT setval('ticket_no', 1) AS n"}
+    seqs = {door: {k: ask_(q, True) for k, q in calls.items()} for door, ask_ in doors.items() if door in ("HTTP", "Postgres", "MCP")}
+    unseen["H1"] = seqs
+    went = lambda v: v == "answered" or (v.startswith("200") and not re.search(r'isError"\s*:\s*true', v) and "permission denied" not in v)
+    stopped = lambda v: "permission denied for sequence" in v
+    checks["a sequence moves for a writer of a table that takes from it: ann, granted only INSERT on tickets, numbers its rows and takes its next value, but sets none and moves no other sequence, at every door (11-09 audit H1)"] = \
+        all(went(d["INSERT"]) and went(d["nextval"]) and stopped(d["setval"]) and stopped(d["nextval, another"]) and stopped(d["setval, another"]) for d in seqs.values())
     info["unseen"] = unseen
     node.kill()
     ok = all(checks.values())
