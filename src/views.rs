@@ -892,7 +892,7 @@ async fn expectations(lake: &Lake, name: &str, source: &str, planned: &str, meta
 }
 
 /// Was this error a row refused by a CHECK or an expectation?
-pub fn refused(e: &anyhow::Error) -> bool { e.chain().any(|c| c.is::<crate::codes::Violation>()) }
+fn refused(e: &anyhow::Error) -> bool { e.chain().any(|c| c.is::<crate::codes::Violation>()) }
 
 /// A row-by-row view's rows taken back (`{view}$deleted`), less those its expectations never let
 /// in: a view that adds them up must not take back what it never had.
@@ -1547,7 +1547,7 @@ pub(crate) fn alone(p: &LogicalPlan, grouped: bool) -> bool {
 /// `runs` names each batch of `new` (same table, same place): its producer, whose job it names (`rejects::run`).
 /// A view that drops rows works out each run's rows on their own, so each reject names its own; any
 /// other view takes a table's new rows at once, as it did, and its rows name the runs it had.
-pub async fn derive(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>, runs: &BTreeMap<String, Vec<String>>) -> Result<Vec<(String, RecordBatch)>> {
+async fn derive(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>, runs: &BTreeMap<String, Vec<String>>) -> Result<Vec<(String, RecordBatch)>> {
     let (mut out, mut made) = (vec![], BTreeMap::<String, Vec<(RecordBatch, String)>>::new());
     let fed = |t: &str| -> Option<Vec<(RecordBatch, String)>> {
         let named = runs.get(t);
@@ -1627,7 +1627,7 @@ fn in_order(views: Vec<(String, View)>) -> Vec<(String, View)> {
 }
 
 /// The views whose rows are derived as flushes are packed (`derive`): the sequencer holds every
-/// flush to them (`log::commit`). A flush carrying rows of a table such views follow must carry a
+/// flush to them (`log::commit`, through `hook`). A flush carrying rows of a table such views follow must carry a
 /// part for each (empty if it derived none), and none for a view it doesn't know: else its node
 /// packs it again, with the views as they are now. So a view made (or dropped) mid-stream never
 /// misses a flush's rows or gets them from a flush packed without it. Kept in the leader's
@@ -1674,9 +1674,9 @@ pub async fn inline(lake: &Lake) -> Result<std::sync::Arc<Inline>> {
     Ok(i)
 }
 
-/// Sequencer: where the fillings of views made since the last commit end (this commit's puts):
+/// At each commit (`commit_hook`): where the fillings of views made since the last commit end (this commit's puts):
 /// every row before `next` is theirs to fill; every flush from this commit on derives their rows.
-pub fn bound(lake: &Lake, inline: &Inline, next: u64) -> Vec<(String, Vec<u8>)> {
+fn bound(lake: &Lake, inline: &Inline, next: u64) -> Vec<(String, Vec<u8>)> {
     let kept = lake.state::<Kept>().ok();
     let mut puts = vec![];
     for (t, v) in &inline.unbounded {
@@ -1695,6 +1695,33 @@ pub fn bound(lake: &Lake, inline: &Inline, next: u64) -> Vec<(String, Vec<u8>)> 
         }
     }
     puts
+}
+
+/// The log's hook for views (`log::CommitHooks`, which the engine adds it to): their rows derived as their sources' are
+/// packed, refused by their expectations, and each commit's flushes held to the views as they are as it starts.
+pub fn hook() -> crate::log::CommitHook {
+    crate::log::CommitHook { name: "views", derive: derive_hook, refused, commit: commit_hook, led: forget }
+}
+
+fn derive_hook<'a>(lake: &'a Lake, new: &'a BTreeMap<String, Vec<RecordBatch>>, by: &'a BTreeMap<String, Vec<String>>) -> futures::future::BoxFuture<'a, Result<Vec<(String, RecordBatch)>>> {
+    Box::pin(derive(lake, new, by))
+}
+
+fn commit_hook(lake: &Lake, next: u64) -> futures::future::BoxFuture<'_, Result<(Arc<dyn crate::log::Owes>, Vec<(String, Vec<u8>)>)>> {
+    Box::pin(async move {
+        let held = inline(lake).await?;
+        let puts = bound(lake, &held, next);
+        Ok((held as Arc<dyn crate::log::Owes>, puts))
+    })
+}
+
+impl crate::log::Owes for Inline {
+    fn owed(&self, table: &str) -> &[String] {
+        self.by_source.get(table).map_or(&[], |v| v.as_slice())
+    }
+    fn derives(&self, table: &str) -> bool {
+        self.tables.contains(table)
+    }
 }
 
 /// A view still filling from its source's rows, if one follows `table` (changes of it wait).

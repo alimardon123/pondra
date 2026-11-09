@@ -10,6 +10,7 @@
 //! (`objects::readable`), and a branch never takes one.
 use crate::store::{json, Lake};
 use anyhow::{Context, Result};
+use object_store::ObjectStoreExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 
@@ -108,6 +109,9 @@ async fn copies(lake: &Lake, kind: &str, name: &str) -> Result<Vec<(String, Kept
 /// Is a copy of `name`, of `kind`, kept?
 pub async fn has(lake: &Lake, kind: &str, name: &str) -> Result<bool> { Ok(!copies(lake, kind, name).await?.is_empty()) }
 
+/// The copy of `name`, of `kind`, that UNDROP would bring back: the newest.
+pub async fn newest(lake: &Lake, kind: &str, name: &str) -> Result<Option<Kept>> { Ok(copies(lake, kind, name).await?.pop().map(|(_, k)| k)) }
+
 /// `UNDROP <kind> name`: the copy of `name` dropped last, back as it was, the comments on it too. One kept as the
 /// statement that makes it is made again, planned for `scope` (the asker's, as its CREATE would be).
 pub async fn undrop(lake: &Lake, kind: &str, name: &str, scope: &crate::rights::Scope) -> Result<Value> {
@@ -203,8 +207,98 @@ pub async fn expired(lake: &Lake, now: u64) -> Result<Vec<String>> {
     Ok(lake.cat.scan::<Times>(PREFIX, "dk0").await?.into_iter().filter(|(_, t)| now >= t.at_ms.saturating_add(t.keep_ms)).map(|(k, _)| k).collect())
 }
 
-/// The statement that brings it back, as `pondra.dropped` says it.
-pub fn statement(kind: &str, name: &str) -> String { format!("UNDROP {} {}", kind.to_uppercase(), crate::objects::name_sql(name)) }
+/// The statement that brings it back, as `pondra.dropped` says it: a deleted file's names its path, in quotes.
+pub fn statement(kind: &str, name: &str) -> String {
+    match kind {
+        "file" => format!("UNDROP FILE '{}'", name.replace('\'', "''")),
+        _ => format!("UNDROP {} {}", kind.to_uppercase(), crate::objects::name_sql(name)),
+    }
+}
+
+// A dropped database: its folder stays as it was, under a mark at its root (`LAKE_MARK`), out of every listing of
+// databases (`ddl::lakes_in`) and refused to every open by name, until UNDROP DATABASE takes the mark off, or a new
+// database takes its name (it is let go then, and that CREATE says so), or its time is up: `pondra serve`'s sweep
+// (`sweep_lakes`) deletes it then, and for a branch its base's hourly one too (`branch::sweep`), whose pin keeps the
+// base's files for it until then. The mark is the truth, so every node of a server sees it. An older release reads no
+// mark: it serves such a database again as if it weren't dropped, and nothing of it is lost.
+
+/// The mark a dropped database's folder holds at its root.
+pub const LAKE_MARK: &str = "dropped.json";
+
+/// What a dropped database's mark says.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct KeptLake {
+    pub at_ms: u64,
+    pub keep_ms: u64,
+    /// Who dropped it (`auth::name`).
+    pub by: String,
+}
+
+impl KeptLake {
+    /// When it is let go (ms since the epoch).
+    pub fn until(&self) -> u64 { self.at_ms.saturating_add(self.keep_ms) }
+}
+
+fn mark() -> object_store::path::Path { object_store::path::Path::from(LAKE_MARK) }
+
+/// A time (ms since the epoch) as a message says it.
+pub fn when(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64).map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default()
+}
+
+/// The mark on the lake at `dir`, if it was dropped (None for a folder that isn't there).
+pub async fn lake_kept(dir: &str) -> Result<Option<KeptLake>> {
+    if (!dir.contains("://") && !std::path::Path::new(dir).is_dir()) || (crate::memory_lake::in_memory(dir) && !crate::memory_lake::memory_held(dir)) {
+        return Ok(None); // (as `ddl::has_catalog`: asking a lake in memory that nothing here opened would make one)
+    }
+    match crate::store::open_store(dir)?.1.get(&mark()).await {
+        Ok(got) => Ok(Some(serde_json::from_slice(&got.bytes().await?).with_context(|| format!("reading {dir}/{LAKE_MARK}"))?)),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("reading {dir}/{LAKE_MARK}"))),
+    }
+}
+
+/// `DROP DATABASE`: the lake at `dir` marked dropped by `by`, kept for the default `ddl::KEEP_MS`. Refused while a
+/// process leads it, as its delete is (`ddl::unled`): its node is stopped first.
+pub async fn keep_lake(dir: &str, by: &str) -> Result<KeptLake> {
+    crate::ddl::unled(dir).await?;
+    let kept = KeptLake { at_ms: crate::log::now_ms(), keep_ms: crate::ddl::KEEP_MS, by: by.to_string() };
+    crate::store::open_store(dir)?.1.put(&mark(), serde_json::to_vec(&kept)?.into()).await.with_context(|| format!("marking {dir} dropped"))?;
+    Ok(kept)
+}
+
+/// `UNDROP DATABASE`: the mark taken off the lake at `dir`, a database again as it was.
+pub async fn unkeep_lake(dir: &str) -> Result<()> {
+    crate::store::open_store(dir)?.1.delete(&mark()).await.with_context(|| format!("taking {dir}'s drop back"))?;
+    Ok(())
+}
+
+/// The dropped databases in `folder`: (name, where, its mark), by name.
+pub async fn lakes_kept(folder: &str) -> Result<Vec<(String, String, KeptLake)>> {
+    let mut out = vec![];
+    for (name, dir) in crate::ddl::lakes_found(folder).await? {
+        if let Some(k) = lake_kept(&dir).await? {
+            out.push((name, dir, k));
+        }
+    }
+    Ok(out)
+}
+
+/// `pondra serve`'s sweep: the dropped databases in `folder` whose time is up at `now`, deleted. The names let go.
+pub async fn sweep_lakes(folder: &str, now: u64) -> Vec<String> {
+    let mut gone = vec![];
+    let kept = lakes_kept(folder).await.unwrap_or_else(|e| {
+        eprintln!("listing the dropped databases in {folder}: {e:#}");
+        vec![]
+    });
+    for (name, dir, _) in kept.into_iter().filter(|(_, _, k)| now >= k.until()) {
+        match crate::ddl::delete_lake(&dir).await {
+            Ok(()) => gone.push(name),
+            Err(e) => eprintln!("letting dropped database {name} go ({dir}): {e:#}"),
+        }
+    }
+    gone
+}
 
 #[cfg(test)]
 mod tests {
@@ -344,6 +438,52 @@ mod tests {
         assert!(all(&lake).await.unwrap().is_empty(), "a view replaced isn't kept: only a DROP keeps one");
     }
 
+    /// A dropped database stays as it was in its folder, under its mark: out of the listing of databases and refused an
+    /// attach, until UNDROP DATABASE takes the mark off and attaches it again; a new database of its name lets it go, and so
+    /// does the sweep once its time is up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_database_stays_in_its_folder_until_undropped_or_let_go() {
+        let folder = std::env::temp_dir().join(format!("pondra-kept-lakes-{}", uuid::Uuid::new_v4().simple()));
+        let at = |n: &str| folder.join(n).to_string_lossy().to_string();
+        let home = Lake::open(&at("home"), true, false, crate::node_state::NodeState::unhosted()).await.unwrap();
+        for n in ["b", "c"] {
+            let other = Lake::open(&at(n), true, false, crate::node_state::NodeState::unhosted()).await.unwrap();
+            crate::write::create_table(&other, "t", r#"{"columns": [["a", "Int64"]]}"#).await.unwrap();
+            other.cat.close().await.unwrap();
+        }
+        let names = |all: Vec<(String, String)>| all.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+        assert_eq!(names(crate::ddl::lakes_in(folder.to_str().unwrap()).await.unwrap()), ["b", "c", "home"]);
+        let kept = keep_lake(&at("b"), "alice").await.unwrap();
+        assert_eq!(lake_kept(&at("b")).await.unwrap(), Some(kept.clone()));
+        assert_eq!(names(crate::ddl::lakes_in(folder.to_str().unwrap()).await.unwrap()), ["c", "home"], "a dropped one is no database");
+        let listed = lakes_kept(folder.to_str().unwrap()).await.unwrap();
+        assert_eq!(listed.iter().map(|(n, _, k)| (n.as_str(), k.by.as_str())).collect::<Vec<_>>(), [("b", "alice")]);
+        let refused = format!("{:#}", crate::ddl::attach(&home, "b", &at("b"), false, false).await.err().expect("refused"));
+        assert!(refused.contains("UNDROP DATABASE b"), "{refused}");
+        assert!(sweep_lakes(folder.to_str().unwrap(), kept.until() - 1).await.is_empty(), "kept until its time is up");
+        // (UNDROP DATABASE on a node serving one lake: the one beside it, attached again with its tables)
+        let out = run(&home, "UNDROP DATABASE b").await.unwrap();
+        assert_eq!(out["undropped"], true, "{out}");
+        assert_eq!(lake_kept(&at("b")).await.unwrap(), None);
+        let back = home.attached.read().unwrap().iter().find(|(n, _)| n == "b").map(|(_, l)| l.clone()).expect("attached again");
+        assert!(back.cat.get::<Value>(&crate::store::table_key("t")).await.unwrap().is_some(), "with its tables");
+        let again = format!("{:#}", run(&home, "UNDROP DATABASE b").await.unwrap_err());
+        assert!(again.contains("pondra.dropped"), "{again}");
+        // (a new database under a dropped one's name lets it go, and says so)
+        keep_lake(&at("c"), "bob").await.unwrap();
+        let notice = crate::ddl::let_go(&at("c"), "c").await.unwrap().expect("let go");
+        assert!(notice.contains("is let go"), "{notice}");
+        assert!(!folder.join("c").exists(), "its folder deleted");
+        // (and the sweep lets one go once its time is up)
+        let d = Lake::open(&at("d"), true, false, crate::node_state::NodeState::unhosted()).await.unwrap();
+        d.cat.close().await.unwrap();
+        let kept = keep_lake(&at("d"), "carol").await.unwrap();
+        assert_eq!(sweep_lakes(folder.to_str().unwrap(), kept.until()).await, ["d"]);
+        assert!(!folder.join("d").exists());
+        home.cat.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
     /// UNDROP reads each kind whose verbs list it, the longest words first, and names those kinds for any other.
     #[test]
     fn undrop_reads_each_kind_that_keeps_its_drops() {
@@ -353,10 +493,12 @@ mod tests {
             assert!(matches!(parse(sql), Some(Stmt::Ddl(ds)) if matches!(&ds[..], [Ddl::UndropKept { kind: k, .. }] if k == kind)), "{sql}");
         }
         assert!(matches!(parse("UNDROP TABLE t"), Some(Stmt::Ddl(ds)) if matches!(&ds[..], [Ddl::Undrop { name }] if name == "t")));
-        assert!(matches!(parse("UNDROP SCHEMA s"), Some(Stmt::Ddl(ds)) if matches!(&ds[..], [Ddl::UndropKept { kind, .. }] if kind == "schema")));
-        match parse("UNDROP DATABASE d") {
-            Some(Stmt::Invalid(e)) => assert!(e.contains("EXTERNAL TABLE, FUNCTION") && e.contains("SCHEMA") && e.contains("pondra.dropped"), "{e}"),
-            _ => panic!("UNDROP DATABASE: refused, naming the kinds"),
+        for (sql, kind) in [("UNDROP SCHEMA s", "schema"), ("UNDROP DATABASE d", "database")] {
+            assert!(matches!(parse(sql), Some(Stmt::Ddl(ds)) if matches!(&ds[..], [Ddl::UndropKept { kind: k, .. }] if k == kind)), "{sql}");
+        }
+        match parse("UNDROP SEQUENCE s") {
+            Some(Stmt::Refused("0A000", e)) => assert!(e.contains("EXTERNAL TABLE, FUNCTION") && e.contains("DATABASE") && e.contains("SCHEMA") && e.contains("pondra.dropped"), "{e}"),
+            _ => panic!("UNDROP SEQUENCE: refused, naming the kinds"),
         }
     }
 

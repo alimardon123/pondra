@@ -449,7 +449,7 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
         for _ in 0..r.len()? {
             let (index, records) = (r.i32()?, r.nbytes()?.unwrap_or_default());
             // (each partition's records are a load, with its line in the audit log as its outcome comes: `writer::Load`)
-            let mut load = crate::writer::Load::new(app, Some(who.clone()), "Kafka produce", &name);
+            let mut load = crate::writer::Load::new(app, who.clone(), "Kafka produce", &name);
             let outcome = match (&meta, &rules, index) {
                 _ if may.is_err() => {
                     load.end(may.clone().err());
@@ -1376,7 +1376,7 @@ async fn brokers(app: &App, me: &Broker) -> Vec<(i32, String, i32)> {
         peers.clone()
     };
     let asked = nodes.iter().filter(|n| **n != app.members.me() && !known.contains_key(*n)).map(|n| async move {
-        let answer = crate::dial::call(n, crate::dial::Call::get("/cluster/kafka").timeout(Duration::from_millis(500))).await;
+        let answer = crate::dial::call(&app.lake.node, n, crate::dial::Call::get("/cluster/kafka").timeout(Duration::from_millis(500))).await;
         (n.clone(), match answer.and_then(crate::dial::Reply::checked) {
             Ok(r) => r.json::<Value>().await.ok(),
             Err(_) => None, // (not cached: asked again next time)
@@ -1398,7 +1398,7 @@ async fn brokers(app: &App, me: &Broker) -> Vec<(i32, String, i32)> {
 }
 
 async fn leader_broker(app: &App) -> Result<(i32, String, i32)> {
-    let b: Value = crate::dial::call(&app.members.leader().addr, crate::dial::Call::get("/cluster/kafka")).await?.checked()?.json().await?;
+    let b: Value = crate::dial::call(&app.lake.node, &app.members.leader().addr, crate::dial::Call::get("/cluster/kafka")).await?.checked()?.json().await?;
     Ok((b["id"].as_i64().ok_or_else(|| anyhow!("the leader doesn't speak Kafka"))? as i32, b["host"].as_str().unwrap_or_default().into(), b["port"].as_i64().unwrap_or(-1) as i32))
 }
 

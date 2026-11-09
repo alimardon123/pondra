@@ -268,14 +268,14 @@ impl App {
             }
             Ok((out, false))
         };
-        let (out, planned) = crate::learned::planning(query, run).await; // (planned with what runs learned, as its runs so far say)
+        let (out, planned) = crate::learned::planning(&self.lake, query, run).await; // (planned with what runs learned, as its runs so far say)
         add(&m.queries, 1);
         add(&m.query_us, start.elapsed().as_micros() as u64);
         match out {
             Ok((batches, spread)) => {
                 let handed = crate::query::handed(); // (rows sent in pieces: the batches went to the door, which holds none here)
                 if handed.is_none() {
-                    crate::learned::ran(query, planned, start.elapsed()); // (never worse: facts that made it slower twice are set aside)
+                    crate::learned::ran(&self.lake, query, planned, start.elapsed()); // (never worse: facts that made it slower twice are set aside)
                 }
                 add(&m.spread, spread as u64);
                 crate::history::rows(handed.unwrap_or_else(|| batches.iter().map(|b| b.num_rows() as u64).sum()));
@@ -292,7 +292,7 @@ impl App {
     /// Record an INSERT's files: here on the leader, or forwarded to it.
     pub async fn record_files(&self, f: crate::write::Files) -> anyhow::Result<Value> {
         let Some(seq) = &self.seq else {
-            let r = crate::dial::call(&self.members.leader().addr, crate::dial::Call::json("/cluster/files", &f)?).await?;
+            let r = crate::dial::call(&self.lake.node, &self.members.leader().addr, crate::dial::Call::json("/cluster/files", &f)?).await?;
             anyhow::ensure!(r.ok(), "leader: {}", r.text().await?);
             return Ok(r.json().await?);
         };
@@ -302,7 +302,7 @@ impl App {
 
     /// Another engine's append (`iceberg_rest::update`), recorded by the leader under the lake's lock.
     pub async fn record_iceberg(&self, c: Vec<crate::iceberg::Commit>) -> anyhow::Result<Value> {
-        let Some(seq) = &self.seq else { return crate::write::post(&self.members.leader().addr, &crate::write::Request::Iceberg(c)).await };
+        let Some(seq) = &self.seq else { return crate::write::post(&self.lake.node, &self.members.leader().addr, &crate::write::Request::Iceberg(c)).await };
         let _guard = self.lock.lock().await;
         let nodes = if self.members.nodes().is_empty() { vec![self.members.me().to_string()] } else { self.members.nodes() };
         crate::iceberg::record(&self.lake, seq, c, &nodes, self.members.me(), self.retain_ms).await
@@ -312,7 +312,7 @@ impl App {
     pub fn to(&self) -> crate::log::To {
         match &self.seq {
             Some(seq) => crate::log::To::Local(seq.clone()),
-            None => crate::log::To::Leader(self.members.leader().addr.clone()),
+            None => crate::log::To::leader(&self.lake, self.members.leader().addr.clone()),
         }
     }
 
@@ -399,7 +399,7 @@ impl App {
     /// work: a follower asks it).
     pub async fn checkpoint(&self) -> anyhow::Result<Value> {
         if self.seq.is_none() {
-            let r = crate::dial::call(&self.members.leader().addr, crate::dial::Call::post("/sql", "CHECKPOINT")).await?;
+            let r = crate::dial::call(&self.lake.node, &self.members.leader().addr, crate::dial::Call::post("/sql", "CHECKPOINT")).await?;
             anyhow::ensure!(r.ok(), "the leader: {}", r.text().await?);
             return Ok(r.json().await?);
         }
@@ -547,7 +547,7 @@ impl App {
             static OFFSET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bAT\s*\(\s*OFFSET\s*=>").expect("a regex"));
             let text = &format!("{text} {}", crate::past_names::spelled(text));
             let q = text.to_lowercase();
-            (q.contains("offset") && OFFSET.is_match(text)) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "session_user", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.flows", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since; a view's failing runs, `pondra.flows`' `error`, commit nothing)
+            (q.contains("offset") && OFFSET.is_match(text)) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "session_user", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.flows", "pondra.variables", "pondra.find", "pondra.parts", "pondra.dropped", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since, and `pondra.dropped` those deleted; a view's failing runs, `pondra.flows`' `error`, commit nothing)
         };
         let volatile = asks(query) || crate::pg_catalog::asked(query) // (Postgres's catalog: another answer to the same text)
             || crate::temp::mentioned(query) || crate::temp::called(query).is_some() // (the session's temporary tables change without a commit, and its functions are its own)
