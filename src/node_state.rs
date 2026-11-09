@@ -47,6 +47,9 @@ pub struct NodeState {
     pub tokens: std::sync::atomic::AtomicBool,
     /// When its start began: what `PONDRA_TRACE_START`'s times count from (`trace`).
     began: datafusion::common::instant::Instant,
+    /// What it started, which its stop ends (`spawns::Tasks`): every task says whose work it is.
+    #[cfg(feature = "lake")]
+    pub tasks: crate::spawns::Tasks,
 }
 
 impl NodeState {
@@ -66,7 +69,7 @@ impl NodeState {
     fn make(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values) -> Arc<NodeState> { NodeState::made(life, machine, settings, Default::default()) }
 
     fn made(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values, claims: Arc<Claims>) -> Arc<NodeState> {
-        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, tokens: Default::default(), began: datafusion::common::instant::Instant::now() })
+        Arc::new(NodeState { #[cfg(feature = "lake")] tasks: crate::spawns::Tasks::new(life.clone()), life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, tokens: Default::default(), began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).

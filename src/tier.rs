@@ -846,25 +846,8 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     let pending = backlog(lake, tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(hwm), Some(hwm)).await?;
     let idle: Vec<bool> = tables.iter().map(|(k, m)| m.tiered < hwm && !pending.contains_key(&k[2..])).collect();
     tables.iter_mut().zip(&idle).filter(|(_, idle)| **idle).for_each(|((_, m), _)| m.tiered = hwm);
-    let mut floor = tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(0);
-    for (key, task) in lake.cat.scan::<crate::tasks::Task>("k/", "k0").await? {
-        for producer in crate::tasks::producers(&key[2..], &task) {
-            let done = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
-            let unread = lake.cat.segments(&seg_key(done + 1), &seg_key(floor + 1)).await?.iter().any(|(_, s)| s.rows_of(&task.source) > 0);
-            if done < floor && unread {
-                floor = done; // the task still has to read these (tasks skip runs with nothing new)
-            }
-        }
-    }
-    // (a view that runs its query again learns from the log what changed since its last run, and a
-    // view kept by key reads what other engines' commits took out of its source there)
-    for (key, v) in lake.cat.scan::<crate::views::View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.rerun.is_some()) {
-        let done = lake.cat.get(&producer_key(&crate::rerun::producer(&key[2..]))).await?.unwrap_or(0);
-        let follows = crate::rerun::follows(&v);
-        if done < floor && lake.cat.segments(&seg_key(done + 1), &seg_key(floor + 1)).await?.iter().any(|(_, s)| follows.iter().any(|t| crate::rerun::moved(s, t))) {
-            floor = done;
-        }
-    }
+    // (and below it, what a reader of the log still reads: a task, a view run again, a consumer group: `pins::floor`)
+    let floor = crate::pins::floor(lake, tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(0)).await?;
     // Only segments that were ALREADY below the floor `grace_ms` ago: a query that read a table's
     // metadata just before it was tiered may still be reading them.
     let rounds = lake.state::<Rounds>()?;
@@ -887,9 +870,9 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
         Some((_, s)) => Some(s.ts_ms),
         None => lake.cat.segments(&seg_key(floor + 1), &seg_key(floor + 1001)).await?.first().map(|(_, s)| s.ts_ms),
     };
-    // Files live when a branch was made stay while its pin does (ADR-047).
-    crate::branch::lapse(lake).await?; // (pins on lease not renewed: before the files they kept are counted)
-    let pins = crate::branch::pins(lake).await?;
+    // Files live when a reader started stay while it reads (`pins`: a branch made, ADR-047).
+    crate::pins::lapse(lake).await?; // (readers that stopped saying so, a pin on lease not renewed: before the files they kept are counted)
+    let pins = crate::pins::held(lake).await?;
     let files_cutoff = next.map_or(cutoff, |ts| cutoff.min(ts)).min(pins.map_or(u64::MAX, |p| p.0));
     let mut dead: Vec<String> = segs.iter().filter(|(_, s)| !s.path.is_empty()).map(|(_, s)| s.path.clone()).collect();
     let mut deletes: Vec<String> = segs.iter().map(|(k, _)| k.clone()).collect();
@@ -898,7 +881,7 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     #[derive(serde::Deserialize)]
     struct Kept { at_ms: u64, keep_ms: u64, meta: TableMeta }
     let now = crate::log::now_ms();
-    // (one dropped since a branch was made stays: the branch may read its files)
+    // (one dropped since a reader started stays: a branch may read its files)
     let dropped = lake.cat.scan::<Kept>("dt/", "dt0").await?;
     let expired = |d: &Kept| now >= d.at_ms + d.keep_ms && pins.is_none_or(|p| d.at_ms < p.0);
     deletes.extend(dropped.iter().filter(|(_, d)| expired(d)).map(|(k, _)| k.clone()));
@@ -966,10 +949,10 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
         return Ok(());
     }
     rounds.swept.lock().unwrap().0 = now;
-    crate::branch::sweep(lake).await?; // (pins of branches gone)
-    // An object that was there when a branch was made may be one of its files (a table dropped
-    // since, purged): it stays while that branch's pin does (ADR-047).
-    let pinned = crate::branch::pins(lake).await?.map_or(0, |p| p.1) as i64;
+    crate::pins::sweep(lake).await?; // (readers gone: the pins of branches deleted)
+    // An object that was there when a reader started may be one of its files (a branch's, of a table dropped
+    // since, purged): it stays while that reader reads (`pins`, ADR-047).
+    let pinned = crate::pins::held(lake).await?.map_or(0, |p| p.1) as i64;
     use object_store::path::Path;
     // A joined page's staged files (`stage/<slug>/<job>/`, taken by their INSERT as it runs: `server::insert_staged`) go a job
     // folder at a time, once its newest file is an hour old: a page that never sent its INSERT. Never a file at a time, so a long
