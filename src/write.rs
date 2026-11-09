@@ -1254,7 +1254,7 @@ pub async fn rows_of(lake: &Lake, home: &Lake, t: &Arc<crate::rules::Table>, nam
             shaped(home, t, name, planned(&ctx, &t.schema, sql).await?, how).await?
         }
     };
-    if let Some(f) = scope.rows("insert", name).filter(|_| std::ptr::eq(lake, home)) {
+    if let Some(f) = scope.rows(&crate::rights::Privilege::Insert, name).filter(|_| std::ptr::eq(lake, home)) {
         crate::row_filter::holds(&lake.session_with(1), name, std::slice::from_ref(rows.rows()), &f, "INSERT").await?;
     }
     Ok(rows)
@@ -1902,7 +1902,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     // A table of an attached lake: the work runs here, that lake's leader records it.
     let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
     if let Some(other) = other {
-        if crate::rights::asks(&stmt).1.iter().filter_map(|a| a.privilege()).any(|p| by.scope.rows_named(p, &crate::auth::catalog_name(&stmt.table())).is_some()) {
+        if crate::rights::asks(&stmt).1.iter().filter_map(|a| a.privilege()).any(|p| by.scope.rows_named(&p, &crate::auth::catalog_name(&stmt.table())).is_some()) {
             return Err(crate::codes::coded("0A000", format!("{} is another database's: its rows are written there, so a filter on them in a grant here isn't checked: write them with a grant there", stmt.table())));
         }
         crate::users::across_write(&other, &attached_as(&stmt), &table, &stmt, &by.scope).await?; // (that lake's own sign-in)
@@ -1950,7 +1950,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     }
     // (an INSERT a filter on the rows its writer may insert holds: its rows are worked out here, so each is checked, `rows_of`:
     // never written as files, kept as a file's row groups, or spread over the nodes unread)
-    let held = matches!(stmt, Stmt::Insert(..)) && by.scope.rows("insert", &table).is_some();
+    let held = matches!(stmt, Stmt::Insert(..)) && by.scope.rows(&crate::rights::Privilege::Insert, &table).is_some();
     let sql = match (&meta, &stmt) {
         (Some(m), _) if through_log(m, &stmt) || crate::returning::asked() || held => {
             // A resend whose job's mark is still kept is answered as the duplicate it is, before its statement runs again (the

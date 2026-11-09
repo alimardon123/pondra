@@ -324,7 +324,7 @@ fn relations<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<O
             // (a column a user may not read is not shown by name either: a definition names every column, so a
             // user granted only some of them gets none)
             let catalog = if o.lake == here { local.clone() } else { format!("{}.{local}", o.lake) };
-            let partial = (if o.lake == here { scope.columns(&catalog) } else { scope.named("select", &catalog) }) != Some(None); // (another lake's: the grants naming it)
+            let partial = (if o.lake == here { scope.columns(&catalog) } else { scope.columns_named(&catalog) }) != Some(None); // (another lake's: the grants naming it)
             let def = match o.kind {
                 "table" => o.meta.as_ref().map(|m| table_sql(&named, m)),
                 "view" => o.sql.as_ref().map(|s| {

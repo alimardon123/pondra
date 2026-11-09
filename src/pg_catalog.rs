@@ -410,13 +410,13 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool, scope: &cra
     if !scope.whole() {
         // (a lake attached here, under `USE`, is read by the grants naming its tables, `l.t`, as its reads are: 11-09 audit L1)
         let granted = |table: String| match attached {
-            Some(db) => scope.named("select", &format!("{db}.{table}")),
+            Some(db) => scope.columns_named(&format!("{db}.{table}")),
             None => scope.columns(&table),
         };
         // (a table a grant's filter on its rows reads in part: its count and size are its hidden rows' too, so unknown)
         let filtered = |table: String| match attached {
-            Some(db) => scope.rows_named("select", &format!("{db}.{table}")).is_some(),
-            None => scope.rows("select", &table).is_some(),
+            Some(db) => scope.rows_named(&crate::rights::Privilege::Select, &format!("{db}.{table}")).is_some(),
+            None => scope.rows(&crate::rights::Privilege::Select, &table).is_some(),
         };
         for r in rels.iter_mut().filter(|r| r.kind != 'v' && filtered(crate::text::join(&r.schema, &r.name))) {
             (r.rows, r.bytes) = (None, 0);
@@ -1027,7 +1027,7 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
     // table granted twice is one row. Routines have no privileges here.
     let (mut tables_granted, mut columns_granted) = (BTreeSet::new(), BTreeSet::new()); // (grantee, schema, table, privilege or column)
     for m in &l.members {
-        for g in m.grants.iter().filter(|g| ["select", "insert", "update", "delete"].contains(&g.privilege.as_str())) {
+        for g in m.grants.iter().filter(|g| g.privilege.of_tables()) {
             let relations: Vec<&Rel> = match &g.on {
                 On::Table(t) => {
                     let (schema, table) = crate::text::split(t);
@@ -1039,7 +1039,7 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
             };
             for r in relations.into_iter().filter(|r| r.schema != TEMP) {
                 if g.columns.is_empty() {
-                    tables_granted.insert((m.name.clone(), r.schema.clone(), r.name.clone(), g.privilege.to_uppercase()));
+                    tables_granted.insert((m.name.clone(), r.schema.clone(), r.name.clone(), g.privilege.to_string()));
                 } else {
                     columns_granted.extend(g.columns.iter().map(|c| (m.name.clone(), r.schema.clone(), r.name.clone(), c.clone())));
                 }

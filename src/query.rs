@@ -483,7 +483,7 @@ fn guarded(scope: &crate::rights::Scope, name: &str, t: Arc<dyn TableProvider>, 
         }
         return None;
     }
-    let rows = scope.rows("select", name).map(|sql| crate::row_scan::Rows { sql, told: scope.shows_code() });
+    let rows = scope.rows(&crate::rights::Privilege::Select, name).map(|sql| crate::row_scan::Rows { sql, told: scope.shows_code() });
     Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: None, shown: false, asked: asked.clone(), rows }))
 }
 
@@ -493,7 +493,7 @@ fn across(scope: &crate::rights::Scope, name: &str, t: Arc<dyn TableProvider>, l
     let columns = match locked {
         Some(_) => None,
         None if scope.whole() => return Some(t),
-        None => scope.named("select", name),
+        None => scope.columns_named(name),
     };
     if columns.is_none() && (listing || locked.is_none() && !scope.knows_named(name)) {
         if !listing {
@@ -501,7 +501,7 @@ fn across(scope: &crate::rights::Scope, name: &str, t: Arc<dyn TableProvider>, l
         }
         return None; // (as `guarded`: a table it doesn't know is there isn't, for it)
     }
-    let rows = scope.rows_named("select", name).map(|sql| crate::row_scan::Rows { sql, told: scope.shows_code() });
+    let rows = scope.rows_named(&crate::rights::Privilege::Select, name).map(|sql| crate::row_scan::Rows { sql, told: scope.shows_code() });
     Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: locked.clone(), shown: false, asked: asked.clone(), rows }))
 }
 

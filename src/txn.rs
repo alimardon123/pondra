@@ -1068,7 +1068,7 @@ pub async fn refuse_change(lake: &Lake, name: &str, meta: &TableMeta, stmt: &Stm
 /// table's rows holds (a grant's, step 6 piece 5b) could add to the rows of a key it may not read, so its INSERT is
 /// refused. Asked by a transaction's INSERT (`statement`) and by one outside a transaction (`write::on_node_listed`).
 pub fn merges_unseen(name: &str, meta: &TableMeta, scope: &crate::rights::Scope) -> Result<()> {
-    if !meta.merge.is_empty() && scope.rows("select", name).is_some() {
+    if !meta.merge.is_empty() && scope.rows(&crate::rights::Privilege::Select, name).is_some() {
         return Err(crate::codes::coded("42501", format!("permission denied: {name} is a merge table, whose rows add up by key as they're read, and a filter on its rows in a grant shows this user some of them only: a row it inserts could add to a key's it can't read")));
     }
     Ok(())

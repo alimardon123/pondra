@@ -404,7 +404,7 @@ fn allowed(secrets: &[(String, Secret)], u: &str, scope: &crate::rights::Scope) 
 /// lend: the caller needs no USAGE on it.
 pub(crate) fn through(u: &str, privilege: &str, scope: &crate::rights::Scope) -> Result<()> {
     let name = crate::connections::named_in(u).unwrap_or_default();
-    ensure!(owner() || scope.may_use("connection", name, privilege),
+    ensure!(owner() || scope.may_use("connection", name, &crate::rights::Privilege::of(privilege)),
         crate::codes::coded("42501", format!("'@{name}/…': {privilege} on connection {name} isn't granted to this user (an admin grants it: GRANT {privilege} ON CONNECTION {name} TO …)")));
     Ok(())
 }
