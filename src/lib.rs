@@ -108,6 +108,7 @@ mod pg_trace;
 pub mod pg_bytea;
 mod lifted;
 mod one_row;
+mod set_all;
 mod optimize;
 mod or_ranges;
 mod zeros_in;
