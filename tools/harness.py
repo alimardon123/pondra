@@ -16507,10 +16507,12 @@ def waits():
         first == [(1,)] and waited_q and got_q["code"] == "ok"
 
     # Two workers, one on each node, take jobs with SELECT … LIMIT 1 FOR UPDATE, across tiered files: every job is
-    # taken once and all 40 are done.
-    sql(LP, "CREATE TABLE jobs (id BIGINT PRIMARY KEY, status VARCHAR)")
+    # taken once and all 40 are done. (On the first lake's nodes, with the default lease and idle end. Under the 2 s
+    # ones above, a busy runner can stall a worker's transaction past them, and a lock lost that way is refused at
+    # COMMIT with 40001, as the lease's own checks say: a follower's worker got that once in CI.)
+    sql(A.port, "CREATE TABLE jobs (id BIGINT PRIMARY KEY, status VARCHAR)")
     for lo in range(1, 41, 10):
-        sql(LP, f"INSERT INTO jobs SELECT value, 'new' FROM range({lo}, {lo + 10})")
+        sql(A.port, f"INSERT INTO jobs SELECT value, 'new' FROM range({lo}, {lo + 10})")
         time.sleep(0.7)  # (the leader tiers between the inserts: several files)
     taken, worker_errors = {"a": [], "b": []}, []
     def worker(name, port):
@@ -16527,11 +16529,11 @@ def waits():
                 taken[name].append(row[0])
         except Exception as e:  # (a worker that fails says so: the check below fails, rather than the other one finishing alone)
             worker_errors.append(f"{name}: {e}")
-    ws = [threading.Thread(target=worker, args=(n, p)) for n, p in (("a", LP + 100), ("b", FP + 100))]
+    ws = [threading.Thread(target=worker, args=(n, p)) for n, p in (("a", pga), ("b", pgb))]
     [w.start() for w in ws]
     [w.join(300) for w in ws]
     checks["two workers on two nodes take jobs with SELECT … LIMIT 1 FOR UPDATE across tiered files: each job taken once, all 40 done"] = \
-        sorted(taken["a"] + taken["b"]) == list(range(1, 41)) and sql(LP, "SELECT count(*) AS n FROM jobs WHERE status = 'done'")[0]["n"] == 40 and not worker_errors
+        sorted(taken["a"] + taken["b"]) == list(range(1, 41)) and sql(A.port, "SELECT count(*) AS n FROM jobs WHERE status = 'done'")[0]["n"] == 40 and not worker_errors
     info["job_workers_errors"] = worker_errors
 
     # INSERT, then an UPDATE that waits for another commit on its row: it commits, without 40001.
