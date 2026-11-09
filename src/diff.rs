@@ -13,11 +13,17 @@
 //! - Any other two match whole, as multisets: a row of b's that a lacks, or has fewer copies of, is an insert (once for
 //!   each copy more), and one of a's that b lacks a delete. They have no update rows.
 //!
+//! `data => 'db'` (Trellis T1c) runs both sides' definitions over `db`'s tables, in one statement, so only the code moves
+//! rows: a view's stored query, or a query side, with its own database's tables named in `db` and the views it reads
+//! inlined, each read the same way (`over`, `redirect.rs`). A table side reads `db`'s table of its name, and two tables are refused
+//! (`0A000`: a table has no definition to run).
+//!
 //! The front reads it on the parsed tree (`rewrite`): each call becomes the query that answers it, a subquery in its place,
 //! so a view it names is expanded as any other. Each side's columns come from planning it (`Host::ask`, nothing run). The
 //! two must have the same columns, each of one type on both (`42804` names the first that differs); the answer has b's,
 //! in b's order.
-use crate::front::Host;
+use crate::front::{Host, Relation};
+use crate::redirect::{part, redirect, temporary};
 use anyhow::Result;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::ScalarValue;
@@ -60,12 +66,13 @@ impl Side {
     }
 }
 
-/// A call's arguments: its two sides, and the key's columns when `key =>` names them.
+/// A call's arguments: its two sides, the key's columns when `key =>` names them, and the database `data =>` names.
 #[derive(Clone, Debug, PartialEq)]
 struct Call {
     a: Side,
     b: Side,
     key: Option<Vec<String>>,
+    data: Option<String>,
 }
 
 /// How a call's two sides are matched.
@@ -147,12 +154,14 @@ impl VisitorMut for Put {
     }
 }
 
-/// A call's arguments: two sides, each a string naming a table or a view, or a query; and `key => 'c1, c2'`.
+/// A call's arguments: two sides, each a string naming a table or a view, or a query; `key => 'c1, c2'`; and
+/// `data => 'db'`.
 fn call(args: &[ast::FunctionArg]) -> Result<Call> {
     static NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"^[\w"$]+(\.[\w"$]+){0,2}$"#).expect("a regex"));
-    const FORM: &str = "pondra.diff takes two sides, each a table's or a view's name or a query, and a key: pondra.diff('prod.sales.orders', 'dev.sales.orders' [, key => 'id'])";
+    static DATABASE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"^([\w$-]+|"[^"]+")$"#).expect("a regex"));
+    const FORM: &str = "pondra.diff takes two sides, each a table's or a view's name or a query, a key and a database to read: pondra.diff('prod.sales.orders', 'dev.sales.orders' [, key => 'id'] [, data => 'dev'])";
     let a = crate::text::args("pondra.diff", args)?;
-    let mut key = None;
+    let (mut key, mut data) = (None, None);
     for (n, e) in &a.named {
         match (n.to_ascii_lowercase().as_str(), e) {
             ("key", Expr::Value(v)) if matches!(&v.value, Value::SingleQuotedString(_)) => {
@@ -160,6 +169,11 @@ fn call(args: &[ast::FunctionArg]) -> Result<Call> {
                 key = Some(names(k).ok_or_else(|| crate::codes::coded("22023", format!("pondra.diff's key => names the key's columns: key => 'id, day', not '{k}'")))?);
             }
             ("key", _) => return Err(crate::codes::coded("22023", format!("pondra.diff's key => names the key's columns as text: key => 'id, day', not {e}"))),
+            ("data", Expr::Value(v)) if matches!(&v.value, Value::SingleQuotedString(d) if DATABASE.is_match(d.trim())) => {
+                let Value::SingleQuotedString(d) = &v.value else { unreachable!() };
+                data = Some(d.trim().to_string());
+            }
+            ("data", _) => return Err(crate::codes::coded("22023", format!("pondra.diff's data => names one database whose tables both sides read: data => 'dev', not {e}"))),
             _ => return Err(crate::codes::coded("42883", format!("pondra.diff has no argument {n}: {FORM}"))), // (as Postgres names a call it has no function for)
         }
     }
@@ -174,7 +188,7 @@ fn call(args: &[ast::FunctionArg]) -> Result<Call> {
         }
     };
     match a.given[..] {
-        [x, y] => Ok(Call { a: side(x)?, b: side(y)?, key }),
+        [x, y] => Ok(Call { a: side(x)?, b: side(y)?, key, data }),
         _ => Err(crate::codes::coded("42883", FORM)),
     }
 }
@@ -215,17 +229,23 @@ async fn columns_of<H: Host>(host: &H, side: &Side) -> Result<(Vec<(String, Data
 
 /// The query that answers `pondra.diff(a, b)`.
 async fn answer_of<H: Host>(host: &H, call: &Call) -> Result<String> {
-    let (a, b) = (&call.a, &call.b);
+    // (what each side runs: as named, or over `data =>`'s tables; a key is the one each name declares, either way)
+    let (named_a, named_b) = (&call.a, &call.b);
+    let (ran_a, ran_b) = match &call.data {
+        Some(db) => sides_over(host, named_a, named_b, db).await?,
+        None => (own(host, named_a).await?, own(host, named_b).await?),
+    };
+    let (a, b) = (&ran_a, &ran_b);
     let ((of_a, rows_a), (of_b, rows_b)) = (columns_of(host, a).await?, columns_of(host, b).await?);
-    let cols = alike(a, &of_a, b, &of_b)?;
+    let cols = alike(named_a, &of_a, named_b, &of_b)?; // (an error names each side as the call does)
     let how = match &call.key {
         None if rows_a && rows_b => Match::Rows,
         given => {
-            let (kept_a, kept_b) = (declared(host, a).await?, declared(host, b).await?);
+            let (kept_a, kept_b) = (declared(host, named_a).await?, declared(host, named_b).await?);
             let key = match (given, &kept_a, &kept_b) {
                 (Some(k), _, _) => Some(k.clone()),
                 (None, Some((x, _)), Some((y, _))) if x != y => {
-                    return Err(crate::codes::coded("42P10", format!("pondra.diff matches rows by one key, and {}'s is ({}) and {}'s ({}): key => '{}' picks one", a.shown(), x.join(", "), b.shown(), y.join(", "), y.join(", "))));
+                    return Err(crate::codes::coded("42P10", format!("pondra.diff matches rows by one key, and {}'s is ({}) and {}'s ({}): key => '{}' picks one", named_a.shown(), x.join(", "), named_b.shown(), y.join(", "), y.join(", "))));
                 }
                 (None, Some((x, _)), _) | (None, None, Some((x, _))) => Some(x.clone()),
                 (None, None, None) => None,
@@ -236,9 +256,9 @@ async fn answer_of<H: Host>(host: &H, call: &Call) -> Result<String> {
                         return Err(crate::codes::coded("42703", format!("pondra.diff's key: {c} is not a column of the two sides ({})", cols.join(", "))));
                     }
                     // (a side whose engine keeps this key holds each value once already: the other is counted)
-                    for (side, kept) in [(a, &kept_a), (b, &kept_b)] {
+                    for (side, named, kept) in [(a, named_a, &kept_a), (b, named_b, &kept_b)] {
                         if !matches!(kept, Some((k, true)) if *k == key) {
-                            once_each(host, side, &key).await?;
+                            once_each(host, side, named, &key).await?;
                         }
                     }
                     Match::Key(key)
@@ -248,6 +268,56 @@ async fn answer_of<H: Host>(host: &H, call: &Call) -> Result<String> {
         }
     };
     Ok(answer(&a.from(), &b.from(), &cols, &how))
+}
+
+/// The two sides as they read over `db`'s tables (`data => 'db'`). Two tables are refused: neither has a definition to run.
+async fn sides_over<H: Host>(host: &H, a: &Side, b: &Side, db: &str) -> Result<(Side, Side)> {
+    let table = |r: &Option<Relation<H>>| matches!(r, Some(Relation::Columns(_)));
+    let (ra, rb) = (relation_of(host, a).await, relation_of(host, b).await);
+    if table(&ra) && table(&rb) {
+        return Err(crate::codes::coded("0A000", format!("pondra.diff's data => runs two sides' definitions over {db}'s tables, and {} and {} are tables, which have none: name a view or a query, or leave data => out", a.shown(), b.shown())));
+    }
+    Ok((over(host, a, ra, db).await?, over(host, b, rb, db).await?))
+}
+
+/// A side as it reads with no `data =>`: another database's view as its query, its names read in that database (the
+/// front expands this database's views alone); anything else as named.
+async fn own<H: Host>(host: &H, side: &Side) -> Result<Side> {
+    Ok(match (side, relation_of(host, side).await) {
+        (Side::Name(n), Some(Relation::View { sql, lake: Some(other) })) => Side::Query(redirect(&*other, sql, database_of(n), 0).await?),
+        _ => side.clone(),
+    })
+}
+
+/// The database another database's object is named in here: its name's first part (`dev` of `dev.sales.v` and of
+/// `dev.v`), the name it is attached by, which its own lake's name needn't be.
+pub(crate) fn database_of(name: &str) -> String { crate::text::parts(name).into_iter().next().unwrap_or_default() }
+
+async fn relation_of<H: Host>(host: &H, side: &Side) -> Option<Relation<H>> {
+    match side {
+        Side::Name(n) => host.relation(n).await,
+        Side::Query(_) => None,
+    }
+}
+
+/// One side over `db`'s tables: a view's stored query or a query side, read by `redirect`; a table, `db`'s of its name
+/// (a session's temporary table, no database's, as it is).
+async fn over<H: Host>(host: &H, side: &Side, relation: Option<Relation<H>>, db: &str) -> Result<Side> {
+    Ok(match (side, relation) {
+        (Side::Name(n), Some(Relation::Columns(_))) if temporary(n) => side.clone(),
+        (Side::Name(n), Some(Relation::Columns(_))) => {
+            let (schema, table) = match &crate::text::parts(n)[..] {
+                [.., s, t] => (s.clone(), t.clone()),
+                [t] => (crate::text::PUBLIC.to_string(), t.clone()),
+                [] => return Ok(side.clone()),
+            };
+            Side::Name(ast::ObjectName::from(vec![part(&crate::text::database(db)), part(&schema), part(&table)]).to_string())
+        }
+        (Side::Name(_), Some(Relation::View { sql, lake: Some(other) })) => Side::Query(redirect(&*other, sql, db.to_string(), 0).await?),
+        (Side::Name(_), Some(Relation::View { sql, lake: None })) => Side::Query(redirect(host, sql, db.to_string(), 0).await?),
+        (Side::Query(q), _) => Side::Query(redirect(host, q.clone(), db.to_string(), 0).await?),
+        (Side::Name(_), None) => side.clone(), // (not a relation here: the planner says what it is)
+    })
 }
 
 /// A side's declared key, when it is a table's or a view's name: its PRIMARY KEY's columns (a table's key, or a fact
@@ -275,8 +345,9 @@ async fn declared<H: Host>(host: &H, side: &Side) -> Result<Option<(Vec<String>,
 fn name_parts(name: &str) -> Option<Vec<String>> { names(&name.replace('.', ",")).filter(|p| p.len() <= 3) }
 
 /// Refuses a side that holds one key's values on more than one row (`21000`, Postgres's for more rows than one where
-/// one was meant), naming the first: a keyed match pairs one row of a side with one of the other.
-async fn once_each<H: Host>(host: &H, side: &Side, key: &[String]) -> Result<()> {
+/// one was meant), naming the first and the side as the call names it: a keyed match pairs one row of a side with one of
+/// the other.
+async fn once_each<H: Host>(host: &H, side: &Side, named: &Side, key: &[String]) -> Result<()> {
     let k = key.iter().map(|c| ast::Ident::with_quote('"', c).to_string()).collect::<Vec<_>>().join(", ");
     let batches = host.collect(host.ask(&format!("SELECT {k} FROM {} x GROUP BY {k} HAVING count(*) > 1 LIMIT 1", side.from())).await?).await?;
     let Some(b) = batches.iter().find(|b| b.num_rows() > 0) else { return Ok(()) };
@@ -288,7 +359,7 @@ async fn once_each<H: Host>(host: &H, side: &Side, key: &[String]) -> Result<()>
             _ => format!("{c} = {v}"),
         });
     }
-    Err(crate::codes::coded("21000", format!("pondra.diff matches rows by their key ({}), and {} holds {} on more than one row: key => names columns that tell its rows apart", key.join(", "), side.shown(), shown.join(", "))))
+    Err(crate::codes::coded("21000", format!("pondra.diff matches rows by their key ({}), and {} holds {} on more than one row: key => names columns that tell its rows apart", key.join(", "), named.shown(), shown.join(", "))))
 }
 
 /// b's columns, when a has the same ones of the same types: else `42804`, naming the first that differs, in b's order
@@ -459,7 +530,12 @@ mod tests {
             let TableFactor::Table { args: Some(args), .. } = &s.from[0].relation else { panic!() };
             call(&args.args)
         };
-        assert_eq!(parsed("SELECT * FROM pondra.diff('prod.sales.orders', (SELECT 1 AS a))").unwrap(), Call { a: Side::Name("prod.sales.orders".into()), b: Side::Query("SELECT 1 AS a".into()), key: None });
+        assert_eq!(parsed("SELECT * FROM pondra.diff('prod.sales.orders', (SELECT 1 AS a))").unwrap(), Call { a: Side::Name("prod.sales.orders".into()), b: Side::Query("SELECT 1 AS a".into()), key: None, data: None });
+        assert_eq!(parsed("SELECT * FROM pondra.diff('prod.v', 'dev.v', data => 'dev')").unwrap().data.as_deref(), Some("dev"));
+        assert_eq!(parsed(r#"SELECT * FROM pondra.diff('prod.v', 'dev.v', data => '"Dev"')"#).unwrap().data.as_deref(), Some(r#""Dev""#));
+        for bad in ["data => ''", "data => 'a.b'", "data => 1", "data => 'x; DROP TABLE t'"] {
+            assert_eq!(crate::codes::of(&parsed(&format!("SELECT * FROM pondra.diff('a', 'b', {bad})")).unwrap_err()), "22023", "{bad}");
+        }
         assert_eq!(parsed(r#"SELECT * FROM pondra.diff('a', 'b', key => 'id, "Day"')"#).unwrap().key, Some(vec!["id".to_string(), "Day".to_string()]));
         assert!(parsed("SELECT * FROM pondra.diff('a', 'b', keys => 'id')").unwrap_err().to_string().contains("no argument keys"));
         assert_eq!(crate::codes::of(&parsed("SELECT * FROM pondra.diff('a', 'b', key => 'id,')").unwrap_err()), "22023");
