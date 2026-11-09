@@ -49,47 +49,92 @@ static STORED: LazyLock<regex::Regex> =
 pub(crate) static CALL_TEXT: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:measure|agg|aggregate)\s*\(").expect("a regex"));
 
-// The text: `AS MEASURE name` is stored as `AS "pondra_measure:name"`, and back again for display.
+// The text: `AS MEASURE name`, read by the fallback dialect as the alias `AS "pondra_measure:name"` (step 8, PR 3d), and
+// back again for display.
 
-/// Turns `expr AS MEASURE name` into the stored form; only tokens are looked at, so strings and comments are left alone.
-pub fn text(sql: &str) -> Cow<'_, str> {
-    // (every statement passes here: looked for without copying the text)
-    if !sql.as_bytes().windows(7).any(|w| w.eq_ignore_ascii_case(b"measure")) {
-        return Cow::Borrowed(sql);
-    }
-    let Some(tokens) = crate::text::tokens(sql) else { return Cow::Borrowed(sql) };
-    let edits: Vec<(usize, usize, String)> = tokens.solid().windows(3).filter_map(measure_edit).collect();
-    if edits.is_empty() {
-        return Cow::Borrowed(sql);
-    }
-    let (mut out, mut from) = (String::new(), 0);
-    for (start, end, with) in edits {
-        out.push_str(&sql[from..start]);
-        out.push_str(&with);
-        from = end;
-    }
-    out.push_str(&sql[from..]);
-    Cow::Owned(out)
+/// The semantic layer's built-in extension (`crate::built_in`, after the engine's): its passes, `AS MEASURE` today
+/// (semantic-layer-plan's `semantic`).
+pub static SEMANTIC: crate::registry::BuiltIn = crate::registry::BuiltIn {
+    name: "semantic",
+    requires: &["engine"],
+    register: |r| passes().into_iter().for_each(|p| r.section_mut::<crate::passes::Passes>().add(p)),
+};
+
+/// The passes measures add: `expr AS MEASURE name`, a hook of the fallback dialect (`dialect.rs`), so only a text
+/// GenericDialect refuses meets it, and strings and comments are the tokenizer's.
+pub(crate) fn passes() -> Vec<crate::passes::Pass> {
+    use crate::passes::{Hook, Parse, Pass, Run};
+    vec![Pass {
+        name: "measures.as_measure",
+        order: 50,
+        words: vec!["measure"],
+        marks: vec![],
+        run: Run::Parse(Parse {
+            claims: "as measure",
+            reads: &["SELECT sum(x) AS MEASURE revenue FROM t", "SELECT region, sum(x) / count(*) AS MEASURE \"Per Order\" FROM t", "CREATE VIEW v AS SELECT d, sum(x) AS MEASURE m FROM t"],
+            hook: Hook::Infix { next: |p| measure_name(p).map(|_| 1), read: as_measure, settle: aliased },
+        }),
+    }]
 }
 
-/// The edit (byte range and text) for an `AS MEASURE name` whose three tokens are `words`, if it is one.
-fn measure_edit(words: &[crate::text::Solid]) -> Option<(usize, usize, String)> {
-    let [a, m, n] = words else { return None };
+/// The name after the tokens ahead, if they are `AS MEASURE name`: as written when quoted, in lower case when bare (a
+/// bare word that ends a name, `FROM`, is none).
+fn measure_name(parser: &Parser) -> Option<String> {
+    let [a, m, n] = parser.peek_tokens_ref::<3>().map(|t| &t.token);
+    let plain = |t: &Token, w: &str| matches!(t, Token::Word(x) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w));
     if !plain(a, "as") || !plain(m, "measure") {
         return None;
     }
-    let name = match n.token {
-        Token::Word(w) if w.quote_style.is_some() => w.value.clone(),
-        Token::Word(w) if !listed_in(ENDS_A_NAME, &w.value.to_lowercase()) => w.value.to_lowercase(),
-        _ => return None,
-    };
-    let (start, end) = (m.start, n.end);
-    Some((start, end, format!("\"{MARK}{}\"", name.replace('"', "\"\""))))
+    match n {
+        Token::Word(w) if w.quote_style.is_some() => Some(w.value.clone()),
+        Token::Word(w) if !listed_in(ENDS_A_NAME, &w.value.to_lowercase()) => Some(w.value.to_lowercase()),
+        _ => None,
+    }
 }
 
-/// Whether a token is the unquoted word `w`, in any case.
-fn plain(t: &crate::text::Solid, w: &str) -> bool {
-    matches!(&t.token, Token::Word(x) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w))
+/// `expr AS MEASURE name`, after `expr`: the expression named `"pondra_measure:name"`, which `aliased` makes the select
+/// item's alias.
+fn as_measure(parser: &mut Parser, expr: &Expr) -> Option<Result<Expr, datafusion::sql::sqlparser::parser::ParserError>> {
+    let name = measure_name(parser)?;
+    for _ in 0..3 {
+        parser.next_token();
+    }
+    Some(Ok(Expr::Named { expr: Box::new(expr.clone()), name: ast::Ident::with_quote('"', format!("{MARK}{name}")) }))
+}
+
+/// Each select item `expr AS MEASURE name`, read as a named expression, made the alias generic reads its stored text as
+/// (`expr AS "pondra_measure:name"`), so the stored text and the tree kept for it are one.
+fn aliased(s: &mut Statement) {
+    struct Aliased;
+    impl VisitorMut for Aliased {
+        type Break = ();
+        fn pre_visit_select(&mut self, select: &mut ast::Select) -> ControlFlow<()> {
+            for item in &mut select.projection {
+                let SelectItem::UnnamedExpr(Expr::Named { expr, name }) = item else { continue };
+                if name.value.starts_with(MARK) {
+                    let (expr, alias) = ((**expr).clone(), name.clone());
+                    *item = SelectItem::ExprWithAlias { expr, alias };
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let _ = crate::walk::visit_mut(s, &mut Aliased);
+}
+
+/// Does a statement hold a measure, an alias `"pondra_measure:…"` in a SELECT?
+pub(crate) fn marked(stmts: &[Statement]) -> bool {
+    struct Marked;
+    impl ast::Visitor for Marked {
+        type Break = ();
+        fn pre_visit_select(&mut self, select: &ast::Select) -> ControlFlow<()> {
+            match select.projection.iter().any(|i| matches!(i, SelectItem::ExprWithAlias { alias, .. } if alias.value.starts_with(MARK))) {
+                true => ControlFlow::Break(()),
+                false => ControlFlow::Continue(()),
+            }
+        }
+    }
+    stmts.iter().any(|s| crate::walk::visit(s, &mut Marked).is_break())
 }
 
 /// The reverse, for showing a stored view: `AS "pondra_measure:name"` reads `AS MEASURE name`.
@@ -1011,7 +1056,7 @@ mod tests {
     const SALES: &str = "SELECT o.ordered_at::date AS day, c.region, sum(o.amount) AS MEASURE revenue, count(DISTINCT o.customer_id) AS MEASURE customers, revenue / customers AS MEASURE per_customer FROM orders o LEFT JOIN customers c ON o.customer_id = c.id";
 
     fn sales() -> Arc<Definition> {
-        Arc::new(Definition::parse(&text(SALES)).expect("parses").expect("has measures"))
+        Arc::new(Definition::parse(&stored(SALES)).expect("parses").expect("has measures"))
     }
 
     /// Rewrites statements where `sales` is the only view with measures and the lake's functions are `routine`.
@@ -1029,9 +1074,9 @@ mod tests {
     #[test]
     fn a_qualified_column_names_its_dimension() {
         // (`user` after the dot is read as a call of the function `user`: still the column's name)
-        let d = Definition::parse(&text("SELECT e.user, e.region, sum(e.amount) AS MEASURE total FROM events e")).expect("parses").expect("has measures");
+        let d = Definition::parse(&stored("SELECT e.user, e.region, sum(e.amount) AS MEASURE total FROM events e")).expect("parses").expect("has measures");
         assert_eq!(d.dimensions.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["user", "region"]);
-        assert!(Definition::parse(&text("SELECT e.x + 1, sum(e.amount) AS MEASURE total FROM events e")).is_err());
+        assert!(Definition::parse(&stored("SELECT e.x + 1, sum(e.amount) AS MEASURE total FROM events e")).is_err());
     }
 
     #[test]
@@ -1051,33 +1096,50 @@ mod tests {
 
     /// The shape check, on a view as the user writes it.
     fn shaped(sql: &str) -> Result<()> {
-        let stmts = Parser::parse_sql(&GenericDialect {}, &text(sql))?;
+        let stmts = crate::parsed::read(sql)?;
         let [Statement::Query(query)] = stmts.as_slice() else { bail!("one query") };
         shape(&Definition::of(query)?.ok_or_else(|| anyhow!("no measure"))?, query)
     }
 
+    /// A view's text as it is stored: read as the front reads it, with the fallback dialect's `AS MEASURE name`, printed.
+    fn stored(sql: &str) -> String { crate::parsed::read(sql).expect("reads").iter().map(|s| s.to_string()).collect::<Vec<_>>().join("; ") }
+
+    /// `AS MEASURE name` reads as the tree generic reads its stored text as (each measure an alias `"pondra_measure:name"`),
+    /// in a view, a subquery, beside another hook's form and an alias named measure, so the kept tree is the stored text's.
     #[test]
-    fn text_stores_each_measure_under_its_alias() {
-        for (sql, stored) in [
+    fn a_measure_reads_as_its_stored_text() {
+        for (sql, kept) in [
             ("SELECT sum(x) AS MEASURE revenue FROM t", "SELECT sum(x) AS \"pondra_measure:revenue\" FROM t"),
             ("SELECT sum(x) AS MEASURE \"Revenue\" FROM t", "SELECT sum(x) AS \"pondra_measure:Revenue\" FROM t"),
-            ("SELECT sum(x) AS MEASURE a, count(*) AS MEASURE b FROM t", "SELECT sum(x) AS \"pondra_measure:a\", count(*) AS \"pondra_measure:b\" FROM t"),
+            ("SELECT sum(x) AS MEASURE a, count(*) AS MEASURE B FROM t", "SELECT sum(x) AS \"pondra_measure:a\", count(*) AS \"pondra_measure:b\" FROM t"),
+            ("SELECT d, sum(x) - 1 AS MEASURE m, NOT bool_or(y) AS MEASURE n, CASE WHEN a THEN 1 END AS MEASURE c FROM t", "SELECT d, sum(x) - 1 AS \"pondra_measure:m\", NOT bool_or(y) AS \"pondra_measure:n\", CASE WHEN a THEN 1 END AS \"pondra_measure:c\" FROM t"),
+            ("CREATE VIEW v AS SELECT d, sum(x) AS MEASURE m, m / count(*) AS MEASURE per FROM t", "CREATE VIEW v AS SELECT d, sum(x) AS \"pondra_measure:m\", m / count(*) AS \"pondra_measure:per\" FROM t"),
+            ("SELECT * FROM (SELECT sum(x) AS MEASURE m FROM t) AS s", "SELECT * FROM (SELECT sum(x) AS \"pondra_measure:m\" FROM t) AS s"),
+            ("SELECT x AS measure, sum(y) AS MEASURE m, 'a as measure b' AS s FROM t", "SELECT x AS measure, sum(y) AS \"pondra_measure:m\", 'a as measure b' AS s FROM t"),
+            ("SELECT [v FOR v IN l] AS l2, sum(y) AS MEASURE m FROM t", "SELECT array_transform((l), v -> (v)) AS l2, sum(y) AS \"pondra_measure:m\" FROM t"),
         ] {
-            assert_eq!(&*text(sql), stored, "{sql}");
+            let (read, used) = crate::dialect::parse(sql);
+            assert_eq!(read.as_ref().map_err(|e| e.to_string()), Ok(&Parser::parse_sql(&GenericDialect {}, kept).expect("generic reads the stored text")), "{sql}");
+            assert!(used.contains(&"measures.as_measure"), "{sql}: {used:?}");
+            assert_eq!(stored(sql), kept, "{sql}");
         }
     }
 
+    /// Generic reads an alias named measure, and the words in a string or a comment: no hook meets them, and no measure.
     #[test]
-    fn text_leaves_aliases_strings_and_comments_alone() {
-        for sql in ["SELECT x AS measure FROM t", "SELECT x AS measure, y FROM t", "SELECT 'x as measure foo' AS s FROM t", "SELECT 1 AS n -- as measure bar\nFROM t"] {
-            assert!(matches!(text(sql), Cow::Borrowed(_)), "{sql}");
+    fn an_alias_named_measure_is_an_alias() {
+        for sql in ["SELECT x AS measure FROM t", "SELECT x AS measure, y FROM t", "SELECT x AS MEASURE FROM t WHERE y", "SELECT 'x as measure foo' AS s FROM t", "SELECT 1 AS n -- as measure bar\nFROM t"] {
+            assert!(crate::parsed::generic(sql).is_ok(), "{sql}");
+            assert!(!marked(&crate::parsed::read(sql).unwrap()), "{sql}");
         }
+        // (a measure where no select item is: refused, as the stored text would be)
+        assert!(crate::parsed::read("SELECT a FROM t WHERE x AS MEASURE m").is_ok_and(|s| !marked(&s)));
     }
 
     #[test]
     fn written_shows_a_measure_again() {
-        let stored = text("SELECT sum(x) AS MEASURE revenue, y AS MEASURE \"Per Day\" FROM t");
-        assert_eq!(&*written(&stored), "SELECT sum(x) AS MEASURE revenue, y AS MEASURE \"Per Day\" FROM t");
+        let kept = stored("SELECT sum(x) AS MEASURE revenue, y AS MEASURE \"Per Day\" FROM t");
+        assert_eq!(&*written(&kept), "SELECT sum(x) AS MEASURE revenue, y AS MEASURE \"Per Day\" FROM t");
     }
 
     #[test]
@@ -1208,7 +1270,7 @@ mod tests {
         joins_checked(&sales(), &by_id).expect("the join is onto the key");
 
         let on_name = "SELECT o.region AS region, sum(o.amount) AS MEASURE revenue FROM orders o LEFT JOIN customers c ON o.name = c.name";
-        let d = Definition::parse(&text(on_name)).expect("parses").expect("has measures");
+        let d = Definition::parse(&stored(on_name)).expect("parses").expect("has measures");
         let err = joins_checked(&d, &by_id).expect_err("not a key").to_string();
         assert!(err.contains("not on a key"), "{err}");
 

@@ -25,7 +25,9 @@ lists base
 registry base
 settings base
 text base
+words base
 walk base
+spawns base
 
 # platform
 bridge platform
