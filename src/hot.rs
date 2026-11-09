@@ -124,9 +124,9 @@ impl crate::lake_state::LakeState for Hot {
     const NAME: &'static str = "hot";
     const ABOUT: &'static str = "decoded columns of the files queries read lately";
 
-    fn make() -> Self { Hot::new(false, None) } // (a lake that didn't open: its query memory's quarter, as a page's)
+    fn make() -> Self { Hot::new(false, None, crate::store::memory_limit()) } // (a lake that didn't open: the process's query memory's quarter, as a page's)
 
-    fn make_as_it_opens(opening: &crate::lake_state::Opening) -> Self { Hot::new(opening.memory, opening.ram) }
+    fn make_as_it_opens(opening: &crate::lake_state::Opening) -> Self { Hot::new(opening.memory, opening.ram, opening.queries) }
 
     fn cache(self: Arc<Self>) -> Option<Arc<dyn crate::ledger::Charged>> { Some(self) }
 
@@ -153,14 +153,14 @@ impl crate::ledger::Charged for Hot {
 impl Hot {
     /// The cache of a lake: `memory` for a lake held in memory. Its budget is half of the machine's memory, inside the line
     /// it shares with the queries, which take its bytes back as they grow (`room_for`, `ledger::Ledger`); see the module's doc.
-    /// (A page, whose machine's memory isn't read, keeps its query memory's: all of it for a lake held in memory.) `ram`
-    /// is the memory of its node's machine (`Machine::ram`).
-    pub fn new(memory: bool, ram: Option<usize>) -> Hot {
+    /// (A page, whose machine's memory isn't read, keeps its node's query memory's, `queries`: all of it for a lake held in
+    /// memory.) `ram` is the memory of its node's machine (`Machine::ram`).
+    pub fn new(memory: bool, ram: Option<usize>, queries: usize) -> Hot {
         let gb = crate::env::parse::<f64>("PONDRA_HOT_GB");
         let max = gb.map(|g| (g * (1u64 << 30) as f64) as usize).unwrap_or_else(|| match (ram, memory) {
             (Some(ram), _) => ram / 2,
-            (None, true) => crate::store::memory_limit(),
-            (None, false) => crate::store::memory_limit() / 4,
+            (None, true) => queries,
+            (None, false) => queries / 4,
         });
         Hot { max, own: gb.is_some(), memory, state: Default::default(), slot: tokio::sync::Semaphore::new(1) }
     }

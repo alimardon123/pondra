@@ -95,8 +95,8 @@ pub fn installed() -> Mach {
     }
 }
 
-/// Whether this process is a host program's (a library's, from its first open): its memory and its process are the
-/// host's, so a node draws no memory line of its own (`oom::line`) and never ends the process.
+/// Whether this process is a host program's (a library's, from its first open): its process is the host's, so a node
+/// never ends it. Its memory line is the process's, as in every form (`oom::line`).
 pub fn hosted() -> bool { HOSTED.load(SeqCst) }
 
 /// This process is a host program's from now on (`node::host`, a library's first open).

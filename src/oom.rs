@@ -71,16 +71,17 @@ static WATCH: Watch = Watch {
     started: std::sync::Once::new(),
 };
 
-/// The node's memory line in bytes: `PONDRA_MEMORY_MAX_GB`, else 85% of the machine's or container's
-/// memory. None when it is 0 (off), or in a host's process, where the memory is the host's.
+/// The process's memory line in bytes: `PONDRA_MEMORY_MAX_GB`, else 85% of the machine's or container's memory, in every
+/// form, a host's process too (11-08 audit H3). None when it is 0 (off). A host's memory is the host's as well as ours,
+/// but past the line the OS ends the process, host and all, where the watch could have stopped the query that grew it:
+/// it stops only a query that grew the process by a tenth of the line itself (`pick`), and that query's first try runs
+/// once more holding less, as on a node. (With no line there, a query grew to the queries' line, 72% of the host's
+/// memory, beside what the host held and what the reservations don't count, with nothing to stop it.)
 pub fn line() -> Option<usize> {
     // (a page's line is its device's, and it has one only where its memory is read: `Machine::resident`, a page's `Device`)
     if cfg!(target_arch = "wasm32") {
         let device = crate::machine::process();
         return device.resident().and_then(|_| line_on(device.line()));
-    }
-    if crate::machine::hosted() {
-        return None;
     }
     crate::env::memory_line(crate::machine::process().ram().map(|ram| (ram as f64 * 0.85) as usize))
 }
@@ -151,17 +152,17 @@ pub(crate) async fn come_back(_: usize) -> bool {
     true
 }
 
-/// The resident memory past which the hot columns are given back, before a query is stopped (`of_line`). With no line (a host's process, or `PONDRA_MEMORY_MAX_GB=0`), 85% of the
-/// line the machine would have (85% of its memory): the host's memory isn't ours to stop queries for,
-/// but our own cache is ours to drop.
+/// The resident memory past which the hot columns are given back, before a query is stopped (`of_line`). With no line
+/// (`PONDRA_MEMORY_MAX_GB=0`), that of the line the machine would have (85% of its memory): no query is stopped then, but
+/// our own caches are still ours to drop.
 pub fn trim_line() -> Option<usize> {
     line().or_else(|| Some(crate::machine::process().ram()? / 20 * 17)).map(of_line)
 }
 
 /// The process's lines for its queries and caches (`store::root_line`, `ledger::Root`): the trim line (`trim_line`), and
-/// where no stop line watches the process (`line`: a host's, or `PONDRA_MEMORY_MAX_GB=0`) a third of the machine's memory,
-/// the most its queries hold together: nothing stops what can't spill short of the machine's memory there, and the memory
-/// is the host's (11-08 audit H3; a third was every process's before #643).
+/// where no stop line watches the process (`line`: `PONDRA_MEMORY_MAX_GB=0`) a third of the machine's memory, the most its
+/// queries hold together: nothing stops what can't spill short of the machine's memory there (11-08 audit H3, whose rest
+/// gives a host's process the stop line; a third was every process's before #643).
 pub fn roots() -> (Option<usize>, Option<usize>) {
     let third = line().is_none().then(|| crate::machine::process().ram().map(|ram| ram / 3)).flatten();
     (trim_line(), third)
@@ -215,7 +216,7 @@ fn watch() {
     if crate::machine::process().resident().is_none() {
         return;
     }
-    let line = line(); // (None in a host's process: there the watch only gives the cache back)
+    let line = line(); // (None when it is off: the watch then only gives the caches back)
     WATCH.watching.store(true, Relaxed);
     crate::spawns::alone(async move {
         let mut last_stop = None; // when the last stop was made: it holds the watch (`pending`)

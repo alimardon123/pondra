@@ -20,19 +20,26 @@ use datafusion::logical_expr::{Accumulator, AggregateUDF, AggregateUDFImpl, Docu
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 
-/// Replaces `string_agg` in a session.
+/// Replaces `string_agg` in a session, capped by the memory its node has for queries (`env::NodeMemory`).
 pub fn register(ctx: &SessionContext) {
-    ctx.register_udaf(AggregateUDF::from(Capped::default()));
+    let cap = cap(ctx.state_ref().read().config());
+    ctx.register_udaf(AggregateUDF::from(Capped(StringAgg::default(), cap)));
 }
 
-/// How long one group's string may grow, in bytes: an eighth of a partition's share of the query memory, as it takes up to
-/// three times its length while it grows and its length again as the answer, in a partial aggregate and a final one at
-/// once. A build with no lake has no pool to share.
-fn cap() -> usize {
+/// How long one group's string may grow in a session of `config`, in bytes: an eighth of a partition's share of its node's
+/// memory for queries (11-09 audit M9), as it takes up to three times its length while it grows and its length again as
+/// the answer, in a partial aggregate and a final one at once. A build with no lake has no pool to share.
+fn cap(config: &datafusion::prelude::SessionConfig) -> usize {
     #[cfg(feature = "lake")]
-    return (crate::store::memory_limit() / crate::store::partitions().max(1) / 8).max(1 << 20);
+    return {
+        let memory = crate::env::node_memory_of(config, crate::store::memory_limit);
+        (memory / crate::store::partitions_of(memory).max(1) / 8).max(1 << 20)
+    };
     #[cfg(not(feature = "lake"))]
-    usize::MAX
+    {
+        let _ = config;
+        usize::MAX
+    }
 }
 
 /// What a query whose group passed `cap` answers ("out of memory": 53200 at every door, `codes::by_words`).
@@ -44,8 +51,9 @@ fn refused(cap: usize) -> DataFusionError {
     ))
 }
 
-#[derive(Debug, Default, PartialEq, Eq, Hash)]
-struct Capped(StringAgg);
+/// DataFusion's `string_agg`, and the cap of its session (`cap`).
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Capped(StringAgg, usize);
 
 impl AggregateUDFImpl for Capped {
     fn name(&self) -> &str { self.0.name() }
@@ -55,17 +63,17 @@ impl AggregateUDFImpl for Capped {
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> { self.0.state_fields(args) }
 
     fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        Ok(Box::new(One { inner: self.0.accumulator(args)?, cap: cap() }))
+        Ok(Box::new(One { inner: self.0.accumulator(args)?, cap: self.1 }))
     }
 
     fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool { self.0.groups_accumulator_supported(args) }
 
     fn create_groups_accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn GroupsAccumulator>> {
-        Ok(Box::new(Groups::new(self.0.create_groups_accumulator(args)?, cap())))
+        Ok(Box::new(Groups::new(self.0.create_groups_accumulator(args)?, self.1)))
     }
 
     // (DataFusion's reversed `string_agg` is its own, uncapped: this one, reversed, is this one)
-    fn reverse_expr(&self) -> ReversedUDAF { ReversedUDAF::Reversed(Arc::new(AggregateUDF::from(Capped::default()))) }
+    fn reverse_expr(&self) -> ReversedUDAF { ReversedUDAF::Reversed(Arc::new(AggregateUDF::from(Capped(StringAgg::default(), self.1)))) }
     fn order_sensitivity(&self) -> AggregateOrderSensitivity { self.0.order_sensitivity() }
     fn documentation(&self) -> Option<&Documentation> { self.0.documentation() }
 }
@@ -223,6 +231,11 @@ mod tests {
 
     #[test]
     fn its_cap_is_an_eighth_of_a_partitions_share() {
-        assert!(cap() >= 1 << 20);
+        use datafusion::prelude::SessionConfig;
+        assert!(cap(&SessionConfig::new()) >= 1 << 20, "a session of no lake's: the process's memory");
+        // (a node's own memory, as its lake's sessions carry it: 400 MB over its partitions, at most one per 24 MB)
+        let node = SessionConfig::new().with_extension(Arc::new(crate::env::NodeMemory(400 << 20)));
+        let parts = crate::store::partitions_of(400 << 20);
+        assert_eq!(cap(&node), ((400 << 20) / parts / 8).max(1 << 20), "the node's, not the process's");
     }
 }

@@ -184,7 +184,7 @@ async fn steps() {
     // next page on the same store opens at once, not after that mark goes stale (`members::Alone::lead` claims and marks it).
     let kept: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let old = pondra::node_state::NodeState::unhosted(); // (the old page's node, which holds its term's claim)
-    let (_, marks) = pondra::members::Alone::lead(&kept, &old.claims).await.expect("step 6: a page's term is claimed and marked alive");
+    let (_, marks) = pondra::members::Alone::lead(&kept, &old).await.expect("step 6: a page's term is claimed and marked alive");
     marks.abort(); // (the page never closed: its term is not released, and its last mark is fresh)
     let started = std::time::Instant::now();
     let mut page = Page::open_lake(&Options { store: Some(kept.clone()), ..Default::default() }).await.expect("step 6: a page opens on the store its old page left alive");
