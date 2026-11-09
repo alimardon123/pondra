@@ -381,7 +381,7 @@ impl Served {
         self.made
             .get_or_init(|| {
                 let base = Url::parse(&crate::tls::url(&format!("{}/cluster/store", self.at))).map_err(|e| e.to_string())?;
-                Ok(Link { at: self.at.clone(), base, client: crate::budget::client(&format!("pondra://{}", self.at), crate::cluster::http()) })
+                Ok(Link { at: self.at.clone(), base, client: crate::budget::client(&format!("pondra://{}", self.at), crate::cluster::process_http()) })
             })
             .clone()
     }
