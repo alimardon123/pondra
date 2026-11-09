@@ -104,7 +104,7 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             passes.add(p);
         }
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "functions", columns: FUNCTION_COLUMNS, rows: functions });
-        #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: the answers kept for their doors' pages, a joined page's unsent statements and a node's count of them, and its file stores and catalogs' tokens)
+        #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: the answers kept for their doors' pages, a joined page's unsent statements and a node's count of them, its file stores and catalogs' tokens, and the shuffles its node takes part in)
         {
             let states = r.section_mut::<crate::lake_state::Registered>();
             states.add::<crate::pages::Pages>();
@@ -112,9 +112,11 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add::<crate::page_records::Counted>();
             states.add::<crate::ext::Stores>();
             states.add::<crate::ext::Tokens>();
+            states.add::<crate::spmd::Shuffles>();
             states.add::<crate::history::History>();
             states.add::<crate::history::Writers>();
             states.add::<crate::query::FactsKept>();
+            states.add::<crate::views::Kept>();
         }
         #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)
         for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::undrop::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,
@@ -172,7 +174,7 @@ fn own(mut ctx: SessionContext) -> SessionContext {
     crate::asof::register(&ctx); // (ASOF JOIN's marker)
     crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
     crate::fvar::register(&ctx); // var, stddev (and avg, below) over DOUBLE: the same answer in any order
-    crate::avg::register(&ctx); // avg(DECIMAL): rounded at its last place
+    crate::avg::register(&ctx); // avg(DECIMAL): as sum / count answers it
     crate::string_agg::register(&ctx); // string_agg: one group's string held to a share of the query memory
     crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
     crate::one_row::register(&ctx); // pondra_one_row(s): a scalar subquery's one row, or 21000
@@ -567,7 +569,7 @@ mod tests {
             ("SELECT pmod(-7, 3)", "2"),
             ("SELECT sum(x) FROM (VALUES (CAST('1e16' AS DOUBLE)), (CAST('1' AS DOUBLE)), (CAST('-1e16' AS DOUBLE))) t(x)", "1.0"), // (a plain sum gives 0)
             ("SELECT byte_length(X'010203')", "3"),
-            ("SELECT avg(x) FROM (VALUES (CAST(1 AS DECIMAL(10,2))), (2), (2)) t(x)", "1.666667"),
+            ("SELECT avg(x) FROM (VALUES (CAST(1 AS DECIMAL(10,2))), (2), (2)) t(x)", "1.66666667"), // (as sum(x) / count(x) answers it: a DECIMAL(22, 2)'s sum leaves room for 8 places)
             ("SELECT '{\"a\": 7}' ->> 'a'", "7"),
             ("SELECT encode(substring(X'0102030405' FROM 2 FOR 2), 'hex')", "0203"),
             ("SELECT arrow_typeof(NULL || NULL)", "Utf8"), // (text, as Postgres reads `unknown || unknown`: DataFusion refused it)

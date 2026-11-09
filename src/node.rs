@@ -521,7 +521,8 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     }
     // Finished shuffles are forgotten here, and what they spilled deleted.
     if lives {
-        every(Duration::from_secs(30), || async { spmd::gc(); Ok(()) });
+        let l = lake.clone();
+        every(Duration::from_secs(30), move || { let l = l.clone(); async move { spmd::gc(&l); Ok(()) } });
     }
     if leader && lives {
         // The leader's SSD tier learns of objects other nodes wrote from its own commits (and its hot
