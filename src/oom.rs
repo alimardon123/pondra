@@ -158,6 +158,15 @@ pub fn trim_line() -> Option<usize> {
     line().or_else(|| Some(crate::machine::process().ram()? / 20 * 17)).map(of_line)
 }
 
+/// The process's lines for its queries and caches (`store::root_line`, `ledger::Root`): the trim line (`trim_line`), and
+/// where no stop line watches the process (`line`: a host's, or `PONDRA_MEMORY_MAX_GB=0`) a third of the machine's memory,
+/// the most its queries hold together: nothing stops what can't spill short of the machine's memory there, and the memory
+/// is the host's (11-08 audit H3; a third was every process's before #643).
+pub fn roots() -> (Option<usize>, Option<usize>) {
+    let third = line().is_none().then(|| crate::machine::process().ram().map(|ram| ram / 3)).flatten();
+    (trim_line(), third)
+}
+
 /// The trim line under a memory line (`env::of_line`): a page's query share is the same (`env::page_line_share`).
 fn of_line(line: usize) -> usize {
     crate::env::of_line(line)
