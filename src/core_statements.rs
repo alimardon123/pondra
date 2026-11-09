@@ -309,5 +309,12 @@ mod tests {
             Some(Stmt::Ddl(d)) => assert!(matches!(&d[..], [Ddl::SetLocation { database, to }] if database == "pondra-ab12" && to == "/x")),
             _ => panic!("ALTER DATABASE pondra-ab12 SET LOCATION: read"),
         }
+        // (a name slot takes one written so too: the entry found is CLONE's, before its reader reads the name)
+        assert!(Words::of("dev-2 CLONE").is_some_and(|w| w.begins(&["*", "CLONE"])) && Words::of("s.pondra-ab12 X").is_some_and(|w| w.begins(&["*", "X"])));
+        assert!(!Words::of("dev - 2 CLONE").is_some_and(|w| w.begins(&["*", "CLONE"])));
+        match crate::write::parse("CREATE DATABASE dev-2 CLONE pondra-ab12") {
+            Some(Stmt::Ddl(d)) => assert!(matches!(&d[..], [Ddl::CreateDatabase { name, clone: Some(_), .. }] if name == "dev-2")),
+            _ => panic!("CREATE DATABASE dev-2 CLONE pondra-ab12: read"),
+        }
     }
 }

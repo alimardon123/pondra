@@ -65,31 +65,40 @@ impl Words {
         let i = starts.len() - self.0.len() + k; // (its place among all the statement's words)
         i > 0 && i < starts.len() && starts[i] == ends[i - 1]
     }
-    /// A name that may be written as one word with `-` in it, as a lake's name is its folder's (`pondra-ab12`): the next
-    /// part (`part`), and the words, numbers and `-` written right after it with no space or comment between. A quoted
-    /// part is the whole name, and a `-` ends none.
-    pub(crate) fn joined(&mut self) -> Result<String> {
-        let quoted = matches!(self.0.last(), Some(W::Word(_, true)));
-        let mut name = self.part()?;
+    /// The word `k` after the next (0: the next).
+    fn ahead(&self, k: usize) -> Option<&W> { self.0.len().checked_sub(k + 1).map(|i| &self.0[i]) }
+    /// A name that may be written as one word with `-` in it, as a lake's name is its folder's (`pondra-ab12`), beginning
+    /// at the word `k` after the next: its first part (`part`), and the words, numbers and `-` written right after it with
+    /// no space or comment between; its text, and how many words it is. A quoted part is the whole name, and a `-` ends none.
+    fn joined_at(&self, k: usize) -> Option<(String, usize)> {
+        let (mut name, quoted) = match self.ahead(k)? {
+            W::Word(w, quoted) => (w.clone(), *quoted),
+            _ => return None,
+        };
         let piece = |w: Option<&W>| match w {
             Some(W::Word(w, false)) => Some(w.clone()),
             Some(W::Num(n)) if n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => Some(n.clone()),
             _ => None,
         };
-        while !quoted && self.tight(0) {
-            let n = self.0.len();
-            let dash = matches!(self.0.last(), Some(W::Sym('-'))) && self.tight(1);
-            if let Some(p) = piece(self.0.last()) {
+        let mut n = 1;
+        while !quoted && self.tight(k + n) {
+            if let Some(p) = piece(self.ahead(k + n)) {
                 name.push_str(&p); // (a word after a number, as the tokenizer splits `1a2b`)
-                self.0.pop();
-            } else if let (true, Some(p)) = (dash, n.checked_sub(2).and_then(|k| piece(self.0.get(k)))) {
+                n += 1;
+            } else if let (Some(W::Sym('-')), true, Some(p)) = (self.ahead(k + n), self.tight(k + n + 1), piece(self.ahead(k + n + 1))) {
                 name.push('-');
                 name.push_str(&p);
-                self.0.truncate(n - 2);
+                n += 2;
             } else {
                 break;
             }
         }
+        Some((name, n))
+    }
+    /// The next name, as `joined_at` reads one (taken).
+    pub(crate) fn joined(&mut self) -> Result<String> {
+        let Some((name, n)) = self.joined_at(0) else { bail!("expected a name {}", self.near()) };
+        self.0.truncate(self.0.len() - n);
         Ok(name)
     }
     pub(crate) fn peek_word(&self) -> Option<String> { self.0.last().map(|w| w.word()) }
@@ -156,21 +165,23 @@ impl Words {
         }
     }
     /// Whether the words still to take begin with `pattern`'s, a statement entry's upper-cased words (`statements`):
-    /// each is an unquoted word, in any case, and `*` a name (`a`, `"A"`, `s.t`). Takes none.
+    /// each is an unquoted word, in any case, and `*` a name (`a`, `"A"`, `s.t`, or written with `-` as a lake's folder
+    /// names it, `pondra-ab12`: `joined`). Takes none.
     pub(crate) fn begins(&self, pattern: &[&str]) -> bool {
-        let mut at = self.0.iter().rev().peekable();
+        let mut k = 0;
         for p in pattern {
             if *p == "*" {
                 loop {
-                    if !matches!(at.next(), Some(W::Word(..))) {
-                        return false;
-                    }
-                    if !matches!(at.peek(), Some(W::Sym('.'))) {
+                    let Some((_, n)) = self.joined_at(k) else { return false };
+                    k += n;
+                    if !matches!(self.ahead(k), Some(W::Sym('.'))) {
                         break;
                     }
-                    at.next();
+                    k += 1;
                 }
-            } else if !matches!(at.next(), Some(W::Word(w, false)) if w.eq_ignore_ascii_case(p)) {
+            } else if matches!(self.ahead(k), Some(W::Word(w, false)) if w.eq_ignore_ascii_case(p)) {
+                k += 1;
+            } else {
                 return false;
             }
         }
