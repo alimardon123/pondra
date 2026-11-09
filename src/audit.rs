@@ -17,7 +17,6 @@ use anyhow::Result;
 use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use futures::{Stream, StreamExt};
 use std::future::Future;
-use crate::reset::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use datafusion::common::instant::Instant;
@@ -344,9 +343,10 @@ pub async fn refused_by(app: &App, user: &str, door: &'static str, from: Option<
     if !on() {
         return;
     }
+    let Ok(audit) = app.lake.state::<Audit>() else { return };
     let known = !user.is_empty() && app.lake.cat.get::<crate::users::User>(&crate::users::user_key(user)).await.ok().flatten().is_some();
     let now = crate::log::now_ms();
-    let (written, uncounted) = knocked((!known).then_some(client), now);
+    let (written, uncounted) = knocked(&audit, (!known).then_some(client), now);
     for (range, since, n) in uncounted {
         let since = chrono::DateTime::from_timestamp_millis(since as i64).map(|t| t.to_rfc3339()).unwrap_or_default();
         let message = format!("{n} more refusals naming no user of the lake from {range} in the minute from {since} weren't written one by one");
@@ -371,7 +371,18 @@ struct Knocks {
     swept: u64,                                                  // (when the minutes that ended were last counted out)
 }
 
-crate::per_node!(static KNOCKED: std::sync::Mutex<Knocks> = std::sync::Mutex::new(Knocks::default()));
+/// What the audit log keeps for its lake: the writer of its rows, and the refusals it counted by client (`knocked`).
+#[derive(Default)]
+pub struct Audit {
+    knocked: std::sync::Mutex<Knocks>,
+    writer: RwLock<Option<tokio::sync::mpsc::UnboundedSender<Line>>>,
+}
+
+impl crate::lake_state::LakeState for Audit {
+    const NAME: &'static str = "audit";
+    const ABOUT: &'static str = "its audit log's writer, and the refusals it counted by client";
+    fn make() -> Self { Audit::default() }
+}
 
 /// The range a client's refusals are counted under: its address, an IPv6 one's /64 (what a network hands one machine).
 fn range(ip: std::net::IpAddr) -> std::net::IpAddr {
@@ -384,9 +395,9 @@ fn range(ip: std::net::IpAddr) -> std::net::IpAddr {
 /// Is a refusal at `now_ms` written: Some(false) yes, Some(true) yes and the last one written this minute, None no. Only
 /// those naming no user of the lake are counted (`client` Some: its address, None when the door can't tell, counted under 0.0.0.0).
 /// With it, the minutes that ended with refusals not written: (range, its minute's start, how many).
-fn knocked(client: Option<Option<std::net::IpAddr>>, now_ms: u64) -> (Option<bool>, Vec<(String, u64, u32)>) {
+fn knocked(audit: &Audit, client: Option<Option<std::net::IpAddr>>, now_ms: u64) -> (Option<bool>, Vec<(String, u64, u32)>) {
     let Some(client) = client else { return (Some(false), vec![]) };
-    let mut k = KNOCKED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut k = audit.knocked.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut ended = vec![];
     let shown = |ip: &std::net::IpAddr| if ip.is_ipv6() { format!("{ip}/64") } else { ip.to_string() };
     if now_ms.saturating_sub(k.swept) >= 60_000 || k.by.len() >= CLIENTS {
@@ -455,13 +466,16 @@ fn log(app: &App, class: &'static str, statement: String, outcome: &'static str,
     write(app, Line { at: crate::log::now_ms(), user, door, from, class, statement, outcome, message, ms });
 }
 
-crate::per_node!(static WRITER: RwLock<Option<tokio::sync::mpsc::UnboundedSender<Line>>> = RwLock::new(None));
-
 fn write(app: &App, line: Line) {
     if app.log.is_none() || !app.members.keeps_records() {
         return; // (a read-only node writes nothing: its own log says it; a joined page's node keeps the records)
     }
-    let tx = WRITER.get_or(|| crate::history::writer(app, TABLE, crate::ddl::Ddl::AuditLog, Duration::from_millis(50), batch));
+    let Ok(audit) = app.lake.state::<Audit>() else { return };
+    let current = audit.writer.read().unwrap_or_else(|e| e.into_inner()).clone(); // (taken out before the write lock: no lock is held twice)
+    let tx = match current {
+        Some(tx) => tx,
+        None => audit.writer.write().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| crate::history::writer(app, TABLE, crate::ddl::Ddl::AuditLog, Duration::from_millis(50), batch)).clone(),
+    };
     let _ = tx.send(line);
 }
 
@@ -564,22 +578,23 @@ mod tests {
 
     #[test]
     fn a_client_has_its_refusals_naming_no_user_written_up_to_sixty_a_minute_and_the_rest_counted() {
+        let audit = Audit::default();
         let (ip, other) = (Some("203.0.113.7".parse().unwrap()), Some("203.0.113.8".parse().unwrap()));
-        let said: Vec<_> = (0..KNOCKS + 5).map(|_| knocked(Some(ip), 1_000).0).collect();
+        let said: Vec<_> = (0..KNOCKS + 5).map(|_| knocked(&audit, Some(ip), 1_000).0).collect();
         assert!(said[..KNOCKS as usize - 1].iter().all(|s| *s == Some(false)), "the first 59 written");
         assert_eq!(said[KNOCKS as usize - 1], Some(true), "the 60th written, saying the rest are counted");
         assert!(said[KNOCKS as usize..].iter().all(Option::is_none), "the rest of the minute not written");
-        assert_eq!(knocked(Some(other), 1_000).0, Some(false), "another client counts apart");
-        assert_eq!(knocked(None, 1_000).0, Some(false), "one that names a user is always written");
-        let (written, counted) = knocked(Some(ip), 61_000);
+        assert_eq!(knocked(&audit, Some(other), 1_000).0, Some(false), "another client counts apart");
+        assert_eq!(knocked(&audit, None, 1_000).0, Some(false), "one that names a user is always written");
+        let (written, counted) = knocked(&audit, Some(ip), 61_000);
         assert_eq!(written, Some(false), "a new minute, written again");
         assert_eq!(counted, vec![("203.0.113.7".to_string(), 1_000, 5)], "the minute that ended: a count of the 5 not written");
         let v6 = |s: &str| Some(s.parse().unwrap());
         for _ in 0..KNOCKS {
-            knocked(Some(v6("2001:db8:0:1::1")), 1_000);
+            knocked(&audit, Some(v6("2001:db8:0:1::1")), 1_000);
         }
-        assert_eq!(knocked(Some(v6("2001:db8:0:1:ffff::2")), 1_000).0, None, "an IPv6 client's /64 counts as one");
-        assert_eq!(knocked(Some(v6("2001:db8:0:2::1")), 1_000).0, Some(false), "the next /64 apart");
+        assert_eq!(knocked(&audit, Some(v6("2001:db8:0:1:ffff::2")), 1_000).0, None, "an IPv6 client's /64 counts as one");
+        assert_eq!(knocked(&audit, Some(v6("2001:db8:0:2::1")), 1_000).0, Some(false), "the next /64 apart");
     }
 
     #[tokio::test]

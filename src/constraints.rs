@@ -23,7 +23,7 @@ use datafusion::arrow::array::{Array, RecordBatch};
 use datafusion::sql::sqlparser::ast;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 pub use crate::rules::keys::absent;
 // (the statement-side parts: `rules/create.rs`)
@@ -335,14 +335,17 @@ pub fn without_column(m: &mut TableMeta, stored: &str) { m.constraints.retain(|c
 
 // ---------------------------------------------------------------- the loading doors
 
-crate::per_node!(
-    /// Each lake's lock, as its node's `App` holds it: `change::run` takes that lock for every change of
-    /// the lake, so a checked append takes it too. `server::router` lends it (`share_lock`), keyed by the
-    /// lake itself, so a checked append finds its own lake's lock and never another's. (A process serves
-    /// one lake today; keyed anyway, so two lakes could not share one lock.) Weak, so a lake that is gone
-    /// drops out of the list.
-    static LOCKS: std::sync::Mutex<Vec<(Weak<Lake>, Arc<tokio::sync::Mutex<()>>)>> = std::sync::Mutex::new(Vec::new())
-);
+/// The lock every change of a lake takes, as its node's `App` holds it: `change::run` takes that lock for every change
+/// of the lake, so a checked append takes it too. `server::router` lends it (`share_lock`). The lake keeps its own
+/// lock, so two lakes in one process never share one.
+#[derive(Default)]
+pub struct ChangeLock(std::sync::Mutex<Option<Arc<tokio::sync::Mutex<()>>>>);
+
+impl crate::lake_state::LakeState for ChangeLock {
+    const NAME: &'static str = "change_lock";
+    const ABOUT: &'static str = "the lock every change of it takes, lent by its node's App (a checked append takes it too)";
+    fn make() -> Self { ChangeLock::default() }
+}
 
 /// This node's checked appends, one at a time: each is answered before the next is sent, so a
 /// producer's pipelined batches reach the leader in the order they were queued (invariant 29).
@@ -350,15 +353,15 @@ static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Lend `lake` its node's lock (`server::router` does, with its app's lock of that same lake).
 pub fn share_lock(lake: &Arc<Lake>, lock: Arc<tokio::sync::Mutex<()>>) {
-    let mut all = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
-    all.retain(|(l, _)| l.strong_count() > 0);
-    all.push((Arc::downgrade(lake), lock));
+    if let Ok(c) = lake.state::<ChangeLock>() {
+        *c.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(lock);
+    }
 }
 
 /// The lock lent for this lake, if its node's router has been made.
 fn lock_of(lake: &Arc<Lake>) -> Option<Arc<tokio::sync::Mutex<()>>> {
-    let all = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
-    let found = all.iter().find(|(l, _)| Weak::ptr_eq(l, &Arc::downgrade(lake))).map(|(_, m)| m.clone());
+    let c = lake.state::<ChangeLock>().ok()?;
+    let found = c.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
     found
 }
 
