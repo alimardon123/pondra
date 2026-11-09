@@ -127,8 +127,14 @@ async fn databases(folder: &str) -> Vec<String> {
     }
 }
 
-/// A port nobody listens on (the OS picks it).
-fn free_port() -> Result<u16> { Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port()) }
+/// Two ports nobody listens on, not the same one (the OS picks them, and both are held until both are known).
+fn free_ports() -> Result<(u16, u16)> {
+    let (a, b) = (std::net::TcpListener::bind("127.0.0.1:0")?, std::net::TcpListener::bind("127.0.0.1:0")?);
+    Ok((a.local_addr()?.port(), b.local_addr()?.port()))
+}
+
+/// Whether another socket holds `port` now: a listener, or a connection out that was given it.
+fn taken(port: u16) -> bool { std::net::TcpListener::bind(("127.0.0.1", port)).is_err() }
 
 impl Server {
     /// The database a request without `/db/` means.
@@ -164,10 +170,32 @@ impl Server {
         if !create && !is_lake(&dir).await? {
             bail!("database \"{name}\" does not exist (CREATE DATABASE {name})");
         }
-        let (http, pg) = (free_port()?, free_port()?);
+        // (a port picked here is free until the node binds it, and another process may take it meanwhile: a
+        // connection out is given a port from the same range. A node that stops as it starts while one of its
+        // ports is taken is started again on two others.)
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let (http, pg) = free_ports()?;
+            match self.start(name, &dir, http, pg).await? {
+                Some(child) => {
+                    let activity = Arc::new(Activity { busy: Default::default(), last: std::sync::Mutex::new(Instant::now()) });
+                    let busy = Busy::new(&activity);
+                    self.nodes.lock().await.insert(name.to_string(), Node { http, pg, child, activity });
+                    return Ok((http, pg, busy));
+                }
+                None if attempt < 3 => eprintln!("the node of database {name} couldn't listen on port {http} or {pg}, which another process took: starting it again"),
+                None => bail!("the node of database {name} couldn't listen on port {http} or {pg} three times: another process took them"),
+            }
+        }
+    }
+
+    /// Start database `name`'s node on these ports and wait for it to answer. None: it stopped as it started while
+    /// one of them is taken (`node` starts it again on others).
+    async fn start(&self, name: &str, dir: &str, http: u16, pg: u16) -> Result<Option<tokio::process::Child>> {
         let exe = std::env::current_exe()?;
         let mut cmd = tokio::process::Command::new(exe);
-        cmd.args(["serve", "--dir", &dir, "--addr", &format!("127.0.0.1:{http}"), "--pg", &format!("127.0.0.1:{pg}"), "--attach-found", &self.folder,
+        cmd.args(["serve", "--dir", dir, "--addr", &format!("127.0.0.1:{http}"), "--pg", &format!("127.0.0.1:{pg}"), "--attach-found", &self.folder,
                   "--advertise", &format!("{}/db/{name}", self.addr), "--stop-with-stdin"]);
         if let Some(p) = &self.options.python {
             cmd.args(["--python", p]);
@@ -190,6 +218,9 @@ impl Server {
         let started = Instant::now();
         loop {
             if let Some(status) = child.try_wait()? {
+                if taken(http) || taken(pg) {
+                    return Ok(None);
+                }
                 bail!("the node of database {name} stopped as it started ({status})");
             }
             let up = crate::net::process().client(crate::net::Policy::Local).get(format!("http://127.0.0.1:{http}/stats")).timeout(Duration::from_secs(1)).send().await.is_ok_and(|r| r.status().is_success());
@@ -199,10 +230,7 @@ impl Server {
             anyhow::ensure!(started.elapsed() < Duration::from_secs(120), "the node of database {name} didn't start in two minutes");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let activity = Arc::new(Activity { busy: Default::default(), last: std::sync::Mutex::new(Instant::now()) });
-        let busy = Busy::new(&activity);
-        self.nodes.lock().await.insert(name.to_string(), Node { http, pg, child, activity });
-        Ok((http, pg, busy))
+        Ok(Some(child))
     }
 
     /// Stop the nodes nobody used lately, once they have nothing left to tier.
@@ -507,4 +535,21 @@ async fn postgres(s: &Server, tcp: tokio::net::TcpStream) -> Result<()> {
     node.write_all(&startup).await?;
     tokio::io::copy_bidirectional(&mut client, &mut node).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_nodes_two_ports_are_free_and_told_apart_from_taken_ones() {
+        let (a, b) = super::free_ports().unwrap();
+        assert_ne!(a, b);
+        assert!(!super::taken(a) && !super::taken(b));
+        let held = std::net::TcpListener::bind(("127.0.0.1", a)).unwrap();
+        assert!(super::taken(a), "a listener holds it");
+        #[cfg(target_os = "linux")]
+        {
+            let out = std::net::TcpStream::connect(held.local_addr().unwrap()).unwrap();
+            assert!(super::taken(out.local_addr().unwrap().port()), "a connection out holds the port it was given");
+        }
+    }
 }
