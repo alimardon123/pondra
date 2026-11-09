@@ -112,7 +112,7 @@ pub async fn serve(app: App, addr: String, advertise: String) -> Result<()> {
             continue; // (a node stopping takes no new client: the socket closes, and the client tries another broker)
         }
         let (app, me, used) = (app.clone(), me.clone(), app.lake.node.idle.begin()); // (an open connection is a use of the node: `idle.rs`)
-        crate::panics::task(async move {
+        crate::spawns::task(async move {
             let _used = used;
             conn(app, me, socket).await.map_err(|e| eprintln!("kafka client: {e:#}"))
         });
@@ -136,7 +136,7 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
     let from = Some(peer.addr);
     let (mut rd, mut wr) = tokio::io::split(socket);
     let (tx, mut rx) = mpsc::channel::<(Reply, Option<crate::node_state::Busy>)>(64);
-    let writer = crate::panics::task(async move {
+    let writer = crate::spawns::task(async move {
         while let Some((reply, busy)) = rx.recv().await {
             if let Some(frame) = reply.await {
                 wr.write_all(&frame).await?;
@@ -1277,7 +1277,7 @@ impl Group {
         (self.joining, self.synced, self.round) = (true, false, self.round + 1);
         self.members.values_mut().for_each(|m| m.joined = false);
         let (group, round, start) = (group.to_string(), self.round, std::time::Instant::now());
-        crate::panics::task(async move {
+        crate::spawns::task(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 let mut groups = GROUPS.lock().unwrap();

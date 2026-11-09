@@ -26,6 +26,7 @@ registry base
 settings base
 text base
 walk base
+spawns base
 
 # platform
 bridge platform
