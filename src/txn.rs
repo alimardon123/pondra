@@ -1673,10 +1673,10 @@ pub async fn committed(lake: &Lake, job: &str, table: &str) -> Result<bool> {
 /// returned, and they still land in one commit. A COMMIT refused with 40001 runs it again, three times at most, since nothing
 /// has been answered yet (as Postgres works an UPDATE out again on the newest version of a row it waited for). A job names the
 /// transaction's commit, so its commit sent again is a duplicate.
-pub async fn alone(app: &crate::app::App, sql: &str, job: Option<String>, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
+pub async fn alone(app: &crate::app::App, sql: &str, job: Option<String>, files: bool, by: &crate::auth::Principal) -> Result<Value> {
     let out = as_one(app, job, move || async move {
         let stmt = crate::write::parse(sql).context("not a write")?;
-        Box::pin(crate::write::on_node_as(app, stmt, None, files, scope)).await // (refused: the session's end rolls it back)
+        Box::pin(crate::write::on_node_as(app, stmt, None, files, by)).await // (refused: the session's end rolls it back)
     })
     .await?;
     Ok(out.unwrap_or_else(|| j!({"duplicate": true})))

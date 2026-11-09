@@ -395,7 +395,7 @@ mod tests {
         match crate::write::parse(sql) {
             Some(Stmt::Ddl(ds)) => {
                 for d in ds {
-                    let e = crate::ddl::apply(lake, d, &crate::auth::Principal::node().scope).await.map_err(|e| (crate::codes::of(&e).to_string(), format!("{e:#}")))?;
+                    let e = crate::ddl::apply(lake, d, &crate::auth::Principal::node()).await.map_err(|e| (crate::codes::of(&e).to_string(), format!("{e:#}")))?;
                     out.push(e);
                 }
                 Ok(out)
@@ -433,7 +433,7 @@ mod tests {
             assert_eq!(shown("drop_zone", &lake.cat.get::<Value>(&key("drop_zone")).await?.expect("kept")), "CREATE CONNECTION drop_zone TYPE s3 WITH (url = 's3://bucket/later')");
             assert_eq!(code(run(&lake, "ALTER CONNECTION drop_zone RESET (url)").await).0, "22023", "url is required");
             // (a comment follows a rename, and goes with a drop: `objects::follow`)
-            crate::objects::apply(&lake, crate::objects::Op::Comment { kind: "connection".into(), name: "drop_zone".into(), text: Some("the partner's drop".into()), if_exists: false }, &crate::auth::Principal::node().scope).await?;
+            crate::objects::apply(&lake, crate::objects::Op::Comment { kind: "connection".into(), name: "drop_zone".into(), text: Some("the partner's drop".into()), if_exists: false }, &crate::auth::Principal::node().scope, &|_| Box::pin(async { anyhow::bail!("a comment changes no column") })).await?;
             run(&lake, "ALTER CONNECTION drop_zone RENAME TO landing").await.unwrap();
             assert!(lake.cat.get::<Value>(&key("drop_zone")).await?.is_none());
             let o = crate::objects::list(&lake, &crate::auth::Principal::node().scope).await?.into_iter().find(|o| o.kind == "connection").expect("listed");

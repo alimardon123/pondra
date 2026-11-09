@@ -345,7 +345,7 @@ mod tests {
 
     /// Statements through the core's one path: `write::parse`, then the leader's `ddl::apply`, as the operator's.
     async fn run(lake: &Lake, sql: &str) -> Result<Value> {
-        let node = crate::auth::Principal::node().scope;
+        let node = crate::auth::Principal::node();
         let mut out = Value::Null;
         match crate::write::parse(sql) {
             Some(crate::write::Stmt::Ddl(ds)) => {

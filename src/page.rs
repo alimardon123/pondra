@@ -681,9 +681,9 @@ impl Page {
         let lake = &paged.app.lake;
         let done = crate::auth::WHO.scope(lake_principal(), Box::pin(async move {
             match method {
-                "PUT" => crate::files::put(lake, name, if_match, body, lake_principal().role).await,
+                "PUT" => crate::files::put(lake, name, if_match, body, &lake_principal()).await,
                 "GET" => crate::files::get(lake, name, &q).await,
-                "POST" => crate::files::restore(lake, name, &q).await,
+                "POST" => crate::files::restore(lake, name, &q, &lake_principal()).await,
                 _ => crate::files::remove(lake, name).await, // (DELETE)
             }
         })).await;

@@ -1046,7 +1046,7 @@ impl FlightSqlService for Sql {
             (true, Ok(IfThere::Replace), _) => {
                 crate::rights::may(&who, crate::rights::Action::Define, crate::rights::Object::Table(&table)).map_err(|e| w.denied(e))?; // (replacing it)
                 let drop = crate::write::parse(&format!("DROP TABLE {}", crate::write::sql_name(&table))).ok_or_else(|| refused("XX000", "DROP TABLE"))?;
-                crate::write::on_node(&self.0, drop, None, &who.scope).await.map_err(w.err())?;
+                crate::write::on_node(&self.0, drop, None, &who).await.map_err(w.err())?;
                 exists = false;
             }
             (false, _, Ok(IfNot::Fail)) => return Err(refused("42P01", format!("no table {table} (mode append): create it first, or use create_append"))),

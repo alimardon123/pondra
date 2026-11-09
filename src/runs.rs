@@ -246,7 +246,7 @@ async fn write(app: App, mut rx: tokio::sync::mpsc::UnboundedReceiver<Sent>) {
 
 async fn append(app: &App, producer: &str, seq: u64, lines: &[Line], made: &mut bool) -> Result<()> {
     if !*made && app.lake.cat.get::<TableMeta>(&table_key(TABLE)).await?.is_none() {
-        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::RunLog]), None, false, &crate::auth::Principal::node().scope).await?; // (the run log's table: the node's own)
+        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::RunLog]), None, false, &crate::auth::Principal::node()).await?; // (the run log's table: the node's own)
     }
     *made = true;
     let schema = crate::answer::schema(&columns())?;
@@ -679,7 +679,7 @@ pub async fn execute(app: &App, name: String, args: Vec<(String, String)>, who: 
     if let Some(task) = task {
         params = values(app, &task, params, &who.scope).await;
     }
-    Ok(Outcome::Done(crate::write::on_node_as(app, asked(params), None, who.files, &who.scope).await?))
+    Ok(Outcome::Done(crate::write::on_node_as(app, asked(params), None, who.files, &who.asker()).await?))
 }
 
 /// Leader: claim a tick now for `EXECUTE TASK` (the scheduler runs it, and what follows it).

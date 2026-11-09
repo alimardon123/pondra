@@ -177,7 +177,8 @@ fn refuse_kept(path: &str) -> anyhow::Result<()> {
 /// unless `if_match` names the version `GET` gave: then it is replaced, if nobody replaced it meanwhile
 /// (412 if so; ADR-034). Each save is kept as a version too (`keep`, ADR-035 §8). A `.py` is an admin's to save,
 /// and a path Pondra keeps is refused. Both doors call it.
-pub async fn put(lake: &Lake, path: &str, if_match: Option<&str>, body: bytes::Bytes, role: crate::auth::Role) -> anyhow::Result<Filed> {
+pub async fn put(lake: &Lake, path: &str, if_match: Option<&str>, body: bytes::Bytes, by: &crate::auth::Principal) -> anyhow::Result<Filed> {
+    let role = by.role;
     let (path, bytes) = (under_files(path)?, body.len());
     refuse_kept(&path)?;
     // (the HTTP door's gate (`Auth::needed`) asks the same of the raw path; this asks it of the name the store keeps, so the
@@ -195,7 +196,7 @@ pub async fn put(lake: &Lake, path: &str, if_match: Option<&str>, body: bytes::B
     };
     match done {
         Ok(version) => {
-            if let Err(e) = keep(lake, &path, &body).await {
+            if let Err(e) = keep(lake, &path, &body, &by.name).await {
                 eprintln!("{path}: saved, but not kept as a version: {e:#}");
             }
             let etag = Some(version.clone()); // (the version written, as GET's `etag`: the next save's `If-Match`)
@@ -234,7 +235,7 @@ pub async fn get(lake: &Lake, path: &str, q: &std::collections::HashMap<String, 
 
 /// `POST /files/<path>?restore=<id>`: that version made the file again (itself kept as the newest). Without
 /// `restore` it is refused by name. Both doors call it.
-pub async fn restore(lake: &Lake, path: &str, q: &std::collections::HashMap<String, String>) -> anyhow::Result<Filed> {
+pub async fn restore(lake: &Lake, path: &str, q: &std::collections::HashMap<String, String>, by: &crate::auth::Principal) -> anyhow::Result<Filed> {
     let path = under_files(path)?;
     refuse_kept(&path)?;
     let id = q.get("restore").ok_or_else(|| anyhow::anyhow!("POST /files/<path>?restore=<a version's id> (GET ?versions lists them)"))?;
@@ -246,7 +247,7 @@ pub async fn restore(lake: &Lake, path: &str, q: &std::collections::HashMap<Stri
             lake.version(&path).await?
         }
     };
-    keep(lake, &path, &bytes).await?;
+    keep(lake, &path, &bytes, &by.name).await?;
     Ok(Filed::json(serde_json::json!({"path": path, "version": now, "restored": id})))
 }
 
@@ -285,12 +286,12 @@ fn saved_before(path: &str) -> Option<String> {
     Some(format!("files/notebooks/{name}/"))
 }
 
-/// Keep this save of `path` as a version, by whoever made it; then let the oldest go.
-pub async fn keep(lake: &Lake, path: &str, bytes: &bytes::Bytes) -> anyhow::Result<()> {
+/// Keep this save of `path` as a version, by whoever made it (`by`, a name; none: the node's own); then let the oldest go.
+pub async fn keep(lake: &Lake, path: &str, bytes: &bytes::Bytes, by: &str) -> anyhow::Result<()> {
     if bytes.len() > KEPT_MB << 20 || path.starts_with(VERSIONS) {
         return Ok(());
     }
-    let who = who();
+    let who = who(by);
     let now = crate::log::now_ms();
     let mut kept = None;
     for ms in now..now + 8 {
@@ -319,9 +320,9 @@ pub async fn keep(lake: &Lake, path: &str, bytes: &bytes::Bytes) -> anyhow::Resu
     Ok(())
 }
 
-/// Whoever the request is, as a version's name holds it (the node's own work: `node`).
-fn who() -> String {
-    let who = crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "node".into());
+/// A name as a version's name holds it (none: the node's own work, `node`).
+fn who(by: &str) -> String {
+    let who = if by.is_empty() { "node" } else { by };
     who.chars().map(|c| if c.is_ascii_alphanumeric() || "_.-".contains(c) { c } else { '_' }).collect()
 }
 
@@ -402,7 +403,7 @@ struct Deletion {
 async fn note_deleted(lake: &Lake, path: &str) -> anyhow::Result<()> {
     use object_store::ObjectStoreExt;
     let Some(newest) = versions(lake, path).await?.into_iter().find(|v| !v.id.contains('/')) else { return Ok(()) };
-    let note = serde_json::to_vec(&Deletion { at: crate::log::now_ms(), by: who(), bytes: newest.bytes })?;
+    let note = serde_json::to_vec(&Deletion { at: crate::log::now_ms(), by: who(&crate::auth::current().map(|p| p.name).unwrap_or_default()), bytes: newest.bytes })?;
     lake.store.put(&object_store::path::Path::from(format!("{}{}", noted_at(path), newest.id)), bytes::Bytes::from(note).into()).await?;
     Ok(())
 }

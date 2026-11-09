@@ -246,11 +246,11 @@ pub async fn capture(app: &App, ask: &apply::Ask, who: Who) -> Result<serde_json
     }
     if !migrations.is_empty() {
         let admin = apply::admin_for(&who, applier);
-        let scope = &admin.as_ref().map_or_else(|| who.scope.clone(), |me| me.scope.clone()); // (whom they are recorded as, below)
+        let by = &admin.as_ref().map_or_else(|| who.asker(), |me| me.clone()); // (whom they are recorded as, below)
         let record = async {
             for file in &migrations {
                 let entry = j!({"migration": apply::migration_key(&v.p.name, file)});
-                crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: 0, record: json(&entry) }]), None, false, scope).await?;
+                crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: 0, record: json(&entry) }]), None, false, by).await?;
             }
             Ok::<(), anyhow::Error>(())
         };
