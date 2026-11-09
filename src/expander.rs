@@ -83,6 +83,16 @@ impl Routine {
         }
     }
 
+    /// Its kind, as the registry names it (`objects::Kind`): a procedure, a macro, a table function or a function.
+    pub fn kind_name(&self) -> &'static str {
+        match (self.kind, self.what()) {
+            (Kind::Procedure, _) => "procedure",
+            (_, "macro") => "macro",
+            (Kind::Table, _) => "table function",
+            _ => "function",
+        }
+    }
+
     /// Does a query calling it give the same answer every time (so it may be remembered)?
     pub fn cacheable(&self) -> bool { !self.python() || matches!(self.with.volatility.as_deref(), Some("immutable" | "stable")) }
 }
@@ -775,14 +785,17 @@ pub(crate) fn grouped(e: Expr) -> Expr {
     }
 }
 
-/// `template` with `$_1`, `$_2`, … replaced by `parts` (as `cast`).
-fn around(template: &str, parts: Vec<Expr>) -> Result<Expr> {
+/// `template` with `$_1`, `$_2`, … replaced by `parts` (as `cast`), each `grouped`.
+fn around(template: &str, parts: Vec<Expr>) -> Result<Expr> { filled(template, &parts, grouped) }
+
+/// `template`, read by GenericDialect, with each `$_n` the nth of `parts` as `each` gives it (`grouped` here; as it stands
+/// for `friendly::templated`, whose template says where the parentheses go). A part may stand in more than one place.
+pub(crate) fn filled(template: &str, parts: &[Expr], each: fn(Expr) -> Expr) -> Result<Expr> {
     let mut e = parse_expr(template)?;
-    let mut parts: Vec<Option<Expr>> = parts.into_iter().map(Some).collect();
     let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
         if let Expr::Value(ast::ValueWithSpan { value: ast::Value::Placeholder(p), .. }) = x {
-            if let Some(part) = p.strip_prefix("$_").and_then(|n| n.parse::<usize>().ok()).and_then(|n| parts.get_mut(n.wrapping_sub(1))).and_then(Option::take) {
-                *x = grouped(part);
+            if let Some(part) = p.strip_prefix("$_").and_then(|n| n.parse::<usize>().ok()).and_then(|n| parts.get(n.wrapping_sub(1))) {
+                *x = each(part.clone());
             }
         }
         ControlFlow::<()>::Continue(())

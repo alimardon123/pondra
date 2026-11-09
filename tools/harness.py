@@ -3963,8 +3963,9 @@ def sums():
     """sum(DOUBLE) is the true sum rounded once, whatever order its rows are added in (`fsum.rs`):
     equal to Python's math.fsum, grouped or not, over files and the log tail, on every node. With
     DataFusion's own sum, [1e16, 1, -1e16] added up to 0, and TPC-H q15, which compares a sum with
-    the max of the same sums, found its row only some of the time. avg over a DECIMAL is rounded at
-    its last place (`avg.rs`), as Python's Decimal rounds it: DataFusion's cut the rest off."""
+    the max of the same sums, found its row only some of the time. avg over a DECIMAL answers as
+    sum / count does (`avg.rs`): its type, and its places rounded half away from zero, as Python's
+    Decimal rounds them."""
     import math
     from decimal import Decimal, ROUND_HALF_UP
     lake = new_lake()
@@ -3987,14 +3988,16 @@ def sums():
     tie_rows = [(1, "0.01")] + [(1, "0")] * 31 + [(2, "-0.01")] + [(2, "0")] * 31 + [(3, "0.01"), (3, "0.01"), (3, "0")] + [(4, None)]
     call(A.port, "POST", "/append/ties?producer=t&seq=1", "".join(json.dumps({"k": k, "c": c}) + "\n" for k, c in tie_rows).encode())
     total = math.fsum(v for vs in want.values() for v in vs)
-    places = lambda cs: str((sum(cs) / len(cs)).quantize(Decimal("0.000001"), ROUND_HALF_UP))
+    places = lambda cs, at="1e-15": str((sum(cs) / len(cs)).quantize(Decimal(at), ROUND_HALF_UP))  # (a DECIMAL(15, 2)'s average: 15 places)
     averages = [(q("SELECT CAST(avg(c) AS VARCHAR) AS a FROM m", n.port)[0]["a"], {r["k"]: r["a"] for r in q("SELECT k, CAST(avg(c) AS VARCHAR) AS a FROM m GROUP BY k", n.port)})
                 for n in nodes for _ in range(2)]
     spread = {r["k"]: r["a"] for r in call(A.port, "POST", "/sql?spread=1", b"SELECT k, CAST(avg(c) AS VARCHAR) AS a FROM m GROUP BY k")}
     avg_over = {r["k"]: r["a"] for r in q("SELECT DISTINCT k, CAST(avg(c) OVER (PARTITION BY k) AS VARCHAR) AS a FROM m")}
     avg_sliding = q("SELECT i, c, CAST(avg(c) OVER (ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS VARCHAR) AS a FROM m WHERE k = 0 ORDER BY i")
-    tied = {r["k"]: r.get("a") for r in q("SELECT k, CAST(avg(c) AS VARCHAR) AS a FROM ties GROUP BY k")}
-    tied_distinct = {r["k"]: r.get("d") for r in q("SELECT k, CAST(avg(DISTINCT c) AS VARCHAR) AS d FROM ties GROUP BY k")}
+    quotients = {r["k"]: r["a"] for r in q("SELECT k, CAST(sum(c) / count(c) AS VARCHAR) AS a FROM m GROUP BY k")}
+    wide = "CAST(c AS DECIMAL(38, 2))"  # (6 places: the ties below fall at the sixth)
+    tied = {r["k"]: r.get("a") for r in q(f"SELECT k, CAST(avg({wide}) AS VARCHAR) AS a FROM ties GROUP BY k")}
+    tied_distinct = {r["k"]: r.get("d") for r in q(f"SELECT k, CAST(avg(DISTINCT {wide}) AS VARCHAR) AS d FROM ties GROUP BY k")}
     avg_type = q("SELECT arrow_typeof(avg(c)) AS t FROM m")[0] | q("SELECT arrow_typeof(avg(CAST(c AS DECIMAL(38, 2)))) AS wide FROM m")[0]
     q("CREATE MATERIALIZED VIEW c_avg AS SELECT k, avg(c) AS a FROM m GROUP BY k")  # (finished from its sum and count)
     viewed = {r["k"]: r["a"] for r in q("SELECT k, CAST(a AS VARCHAR) AS a FROM c_avg")}
@@ -4014,20 +4017,20 @@ def sums():
         "a sliding window takes values back out": all(math.isclose(r["s"], math.fsum(x["v"] for x in sliding[max(0, j - 2):j + 1]), rel_tol=1e-9, abs_tol=1e-6) for j, r in enumerate(sliding)),
         "integers, decimals and DISTINCT keep DataFusion's sum; FILTER works": types["i"] == "Int64" and types["d"].startswith("Decimal128(22, 2)") and types["v"] == types["dv"] == "Float64"
                                                                               and types["f"] == math.fsum(want[3]) and types.get("none") is None,
-        "avg(DECIMAL) rounded at its last place == Python's Decimal, whole and per group, on every node, spread and in a materialized view":
+        "avg(DECIMAL) == sum / count == Python's Decimal, whole and per group, on every node, spread and in a materialized view":
             all(a == places([c for cs in cents.values() for c in cs]) and g == {k: places(cs) for k, cs in cents.items()} for a, g in averages)
-            and spread == avg_over == viewed == {k: places(cs) for k, cs in cents.items()},
-        "…in a sliding window, DISTINCT, ties away from zero, and its type DataFusion's":
-            all(r["a"] == places([Decimal(x["c"]) for x in avg_sliding[max(0, j - 2):j + 1]]) for j, r in enumerate(avg_sliding))
+            and spread == avg_over == viewed == quotients == {k: places(cs) for k, cs in cents.items()},
+        "…in a sliding window, DISTINCT, ties away from zero, and its type sum / count's":
+            all(r["a"] == places([Decimal(str(x["c"])) for x in avg_sliding[max(0, j - 2):j + 1]]) for j, r in enumerate(avg_sliding))
             and tied == {1: "0.000313", 2: "-0.000313", 3: "0.006667", 4: None} and tied_distinct == {1: "0.005000", 2: "-0.005000", 3: "0.005000", 4: None}
-            and avg_type == {"t": "Decimal128(19, 6)", "wide": "Decimal128(38, 6)"},
+            and avg_type == {"t": "Decimal128(38, 15)", "wide": "Decimal128(38, 6)"},
     }
     ok = all(checks.values())
     print(json.dumps({"sums": checks, "ok": ok}, indent=1))
     if not ok:
         print(total, every[0][0], edge, big, types, averages[0][0], tied, tied_distinct, avg_type, avg_sliding[:4])
         sys.exit(1)
-    return "sum(DOUBLE): the true sum rounded once in any order (== math.fsum), grouped, windowed, on every node; NULLs, overflow, sliding windows and other types as before; avg(DECIMAL) rounded at its last place"
+    return "sum(DOUBLE): the true sum rounded once in any order (== math.fsum), grouped, windowed, on every node; NULLs, overflow, sliding windows and other types as before; avg(DECIMAL) as sum / count answers it"
 
 
 def schemas():
@@ -10906,6 +10909,69 @@ def first():
 
 # ---------------------------------------------------------------- round 29, part 2 (ADR-035)
 
+def _users_every_door_errors(checks, port, passwords):
+    """The same Python procedure's error, trips_py()'s, through every door that answers a routine's error, each worded
+    for the caller its door signed in, never for the task's (M8 3d-1, S27): HTTP /sql, Postgres, Flight, MCP, a script's
+    handler ($error), an apply's test (POST /test) and a live query (/live: a SELECT, so a Python function's, trips_fn's).
+    ann's names line 3 without its text; boss's, an admin's, quotes it. Run after users()'s S27 checks: it uses the
+    procedure trips_py() and the function trips_fn() made there. `passwords` maps (ann, boss) to theirs."""
+    import base64, psycopg, adbc_driver_flightsql.dbapi as adbc
+    ann, boss = passwords
+    basic = lambda u: "Basic " + base64.b64encode(f"{u}:{passwords[u]}".encode()).decode()
+    trips, grouped = "CALL trips_py()", "SELECT item, sum(trips_fn(id)) AS s FROM sales.orders GROUP BY item"
+
+    def text(f):
+        try:
+            out = f()
+            return out.decode(errors="replace") if isinstance(out, bytes) else json.dumps(out, default=str)
+        except Exception as e:
+            return str(e)
+
+    def http_(u, body, path="/sql", kind=None):
+        return call(port, "POST", path, body.encode(), headers={"Authorization": basic(u)} | ({"content-type": kind} if kind else {}))
+
+    def pg(u):
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={port + 10} user={u} password={passwords[u]} dbname=lake", connect_timeout=10, autocommit=True) as c:
+                return json.dumps(c.execute(trips).fetchall(), default=str)
+        except psycopg.Error as e:
+            return " ".join(str(x) for x in (e, e.diag.message_detail, e.diag.message_hint) if x)
+
+    def flight(u):  # (Flight SQL, as ADBC sends a statement: a CALL is a write sent as a query)
+        with adbc.connect(f"grpc://127.0.0.1:{port + 30}", db_kwargs={"username": u, "password": passwords[u]}, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(trips)
+            return json.dumps(cur.fetchall(), default=str)
+
+    token = {u: call(port, "POST", "/sql", f"CREATE TOKEN doors_{u} FOR USER {u}".encode(), headers={"Authorization": basic(boss)})["token"] for u in (ann, boss)}
+
+    def mcp(u):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "write", "arguments": {"sql": trips}}}).encode()
+        return call(port, "POST", "/mcp", body, headers={"Authorization": f"Bearer {token[u]}", "content-type": "application/json"})["result"]["content"][0]["text"]
+
+    def live(u):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        try:
+            c.request("POST", "/live", json.dumps({"sql": grouped}).encode(), {"Authorization": basic(u), "content-type": "application/json"})
+            r = c.getresponse()
+            if r.status != 200:
+                return f"{r.status}: {r.read()[:3000]!r}"
+            while (line := r.readline()) and not line.strip():
+                pass  # (a line now and then: a client gone is noticed)
+            return line.decode(errors="replace")
+        finally:
+            c.close()
+
+    project = json.dumps({"files": {"pondra.toml": '[project]\nname = "doors"\n', "tests/trips.sql": trips + "\n"}})
+    doors = {"HTTP /sql": lambda u: http_(u, trips), "Postgres": pg, "Flight": flight, "MCP": mcp,
+             "a script's handler": lambda u: http_(u, f"BEGIN {trips}; EXCEPTION WHEN OTHERS THEN SELECT $error AS e; END"),
+             "an apply's test": lambda u: http_(u, project, "/test", "application/json"), "a live query": live}
+    said = {door: {u: text(lambda: f(u)) for u in (ann, boss)} for door, f in doors.items()}
+    marker = {door: "hidden_marker_f" if door == "a live query" else "hidden_marker_p" for door in doors}
+    cut = {door: "line 3" in s[ann] and marker[door] not in s[ann] and marker[door] in s[boss] for door, s in said.items()}
+    checks["one Python routine's error through every door is worded for its door's caller: ann's names line 3 without its text, boss's quotes it, at HTTP, Postgres, Flight, MCP, a script's handler, an apply's test and a live query (M8, S27)"] = \
+        all(cut.values())
+    return {door: {u: t[:600] for u, t in s.items()} for door, s in said.items() if not cut[door]}  # (what a door that failed said)
+
 def _users_mcp_errors(checks, port, admin, names):
     """MCP words a failed call's error as every door does (`ext::said`): ann, granted some tables, reads a
     failed CALL's or a Python function's error without a routine's code (S27), and a file's name as SQL names
@@ -11094,6 +11160,7 @@ def users():
         and "line 3" in str(failed["py"]) and "hidden_marker_p" not in str(failed["py"]) and "hidden_marker_p" in str(failed["py_boss"]) \
         and "line 3" in str(failed["fn"]) and "hidden_marker_f" not in str(failed["fn"]) and "hidden_marker_f" in str(failed["fn_boss"])
     _users_mcp_errors(checks, A.port, boss, ("ann", "boss"))
+    shown_info["every door"] = _users_every_door_errors(checks, A.port, {"ann": "ann-password-1", "boss": "boss-password-1"})
     # Tokens and sessions
     tok = as_(A.port, boss, "CREATE TOKEN ci FOR USER svc")
     short = as_(A.port, boss, "CREATE TOKEN brief FOR USER svc EXPIRES IN '1 second'")

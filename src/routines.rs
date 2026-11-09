@@ -427,23 +427,35 @@ pub async fn drop(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
         ensure!(if_exists, "no function or procedure {name}");
         return Ok(j!({"dropped": false}));
     };
-    lake.cat.commit(vec![], &[key(&name)]).await?;
+    lake.cat.commit(crate::undrop::aside(lake, r.kind_name(), &name, &[key(&name)]).await?, &[key(&name)]).await?; // (kept to be undropped)
     Ok(j!({r.what(): name, "dropped": true}))
+}
+
+/// What a lake keeps for its functions and procedures (invariant 301): them by name, as of the catalog's version they
+/// were read at (`listed`).
+#[derive(Default)]
+pub struct Kept(Mutex<Option<(u64, Arc<HashMap<String, Routine>>)>>);
+
+impl crate::lake_state::LakeState for Kept {
+    const NAME: &'static str = "routines";
+    const ABOUT: &'static str = "its functions, macros and procedures by name, as of the catalog's version they were read at";
+    fn make() -> Self {
+        Kept::default()
+    }
 }
 
 /// This lake's functions and procedures, by name: read again only after a commit (every query asks).
 pub async fn listed(lake: &Lake) -> Result<Arc<HashMap<String, Routine>>> {
-    type Seen = Mutex<HashMap<String, (u64, Arc<HashMap<String, Routine>>)>>;
-    crate::per_node!(static SEEN: Seen = Default::default());
+    let kept = lake.state::<Kept>()?;
     let version = lake.cat.version();
-    if let (Some(v), Some((at, all))) = (version, SEEN.lock().unwrap().get(&lake.url)) {
+    if let (Some(v), Some((at, all))) = (version, &*kept.0.lock().unwrap()) {
         if *at == v {
             return Ok(all.clone());
         }
     }
     let all: Arc<HashMap<String, Routine>> = Arc::new(lake.cat.scan::<Routine>("r/", "r0").await?.into_iter().map(|(k, r)| (k[2..].to_string(), r)).collect());
     if let Some(v) = version {
-        SEEN.lock().unwrap().insert(lake.url.clone(), (v, all.clone()));
+        *kept.0.lock().unwrap() = Some((v, all.clone()));
     }
     Ok(all)
 }
@@ -494,9 +506,10 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
         let moment = one.strip_prefix("SELECT ").and_then(|m| m.strip_suffix(" AS __moment")).context("a RESTORE's moment")?;
         return Ok(format!("{head}{moment}"));
     }
+    crate::dialect_stmts::hint_refused(sql)?; // (MySQL's `/*! … */`: binding prints the text back without it, 11-07 audit M2)
     let sql = &crate::sparksql::inline(sql)?; // (a parameter of Spark SQL's is in its text: bound once it is Pondra's)
     let sql = &crate::past_names::syntax(sql); // (`t AT (VERSION => $v)`)
-    let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
+    let mut stmts = crate::parsed::read(sql)?; // (as the front reads it: `[x * $k FOR x IN l]`, `LAMBDA x: x * $k`)
     let values = params.iter().map(|(k, v)| Ok((k.clone(), literal(v)?))).collect::<Result<HashMap<_, _>>>()?;
     let bound = |p: &str| numbered || p.trim_start_matches('$').starts_with(|c: char| c.is_alphabetic() || c == '_');
     named_as_written(&mut stmts, |e| {
@@ -610,7 +623,6 @@ fn quote(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
 /// The current session's search path is written in first (`path.rs`), so every door, a task's body
 /// and a spread query see full names. Stored SQL is read with `expand_stored` instead.
 pub async fn expand(lake: &Lake, sql: &str, scope: &Scope) -> Result<String> {
-    crate::dialect_stmts::hint_refused(sql)?; // (MySQL's `/*! … */`, before the path prints the text back without it: 11-07 audit M2)
     let sql = crate::path::door(lake, sql, &std::collections::HashSet::new()).await?;
     Ok(crate::path::currents(lake, &crate::front::expand(&crate::host::Asking::of(lake, scope), &sql, &HashMap::new()).await?)) // (a macro's `current_*`: its caller's, as `prepare`)
 }
@@ -756,13 +768,24 @@ impl Request {
 
 /// Who a statement runs for: the caller's rights (`files`: it may read files on this machine,
 /// `statement::owner`), what it plans for (`scope`: the principal's its door signed in, M8 piece 3b; step 8's session
-/// carries it), and how deep in procedures calling procedures it is.
+/// carries it), how deep in procedures calling procedures it is, and who did it (`by`: the principal its door signed in,
+/// whose name, door and address its stamps and log lines carry, M8 piece 3d; kept when an apply raises its role; none
+/// for the node's own work, a task's tick, which nobody signed in for).
 #[derive(Clone)]
 pub struct Who {
     pub role: Role,
     pub files: bool,
     pub depth: u32,
     pub scope: crate::rights::Scope,
+    pub by: Option<crate::auth::Principal>,
+}
+
+impl Who {
+    /// A first call, as `by`'s door signed it in: its scope, with the door's `role` for it and `files`.
+    pub fn signed(by: crate::auth::Principal, role: Role, files: bool) -> Who { Who { role, files, depth: 0, scope: by.scope.clone(), by: Some(by) } }
+
+    /// The name it is stamped with: its sign-in's (none: the node's own, "").
+    pub fn name(&self) -> &str { self.by.as_ref().map_or("", |p| p.name.as_str()) }
 }
 
 pub enum Outcome {
@@ -816,21 +839,23 @@ pub fn split(text: &str) -> Vec<String> {
 
 /// Run one statement here as the caller could have sent it (the audit log told: `audit.rs`).
 pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
+    let by = who.by.clone(); // (its log lines' and history's: `audit::statement`)
     if let Some(word) = crate::text::control(sql) {
         // BEGIN, COMMIT, ROLLBACK: the session's transaction (ADR-036 §5)
-        let (tag, warning) = crate::audit::statement(app, sql, Box::pin(crate::txn::command(app, word, sql))).await?; // (on the heap: procedures call procedures deep)
+        let (tag, warning) = crate::audit::statement(app, by.as_ref(), sql, Box::pin(crate::txn::command(app, word, sql))).await?; // (on the heap: procedures call procedures deep)
         warning.iter().for_each(|w| heard(&format!("WARNING: {w}")));
         return Ok(Outcome::Done(j!({"transaction": tag.to_lowercase()})));
     }
+    let shows = who.scope.shows_code(); // (a failed transaction's words, as its caller is told them)
     // (the gate runs inside the audited statement, so a refusal there is audited and fails the transaction too: a write
     // in a READ ONLY one (25006) leaves it failed, and the next statement gets 25P02)
-    let out = crate::audit::statement(app, sql, Box::pin(async move {
+    let out = crate::audit::statement(app, by.as_ref(), sql, Box::pin(async move {
         let busy = crate::txn::next(app, sql).await?; // (a failed transaction takes nothing but its end; READ COMMITTED reads the newest commit; the guard keeps the transaction busy while this runs)
         crate::txn::began(busy.id(), one_or_locked(app, sql, who, job)).await // (the transaction it began in: a write that outlives it is refused, 25000)
     }))
     .await;
     if let Err(e) = &out {
-        crate::txn::failed(&crate::ext::said(e)); // (in a transaction: it fails with the statement)
+        crate::txn::failed(&crate::codes::told(e, shows)); // (in a transaction: it fails with the statement)
     }
     out
 }
@@ -1471,6 +1496,23 @@ mod tests {
         let refused = |sql: &str| args("f", &call(sql)).err().map(|e| e.to_string()).unwrap_or_default();
         assert!(refused("f(day => 1, 2)").contains("by position come before those by name"));
         assert!(refused("f(day => 1, DAY => 2)").contains("day given twice"));
+    }
+
+    /// The binder reads a text as the front reads it (`parsed::read`), so a `$name` inside DuckDB's forms that only the
+    /// fallback dialect reads is bound (11-08 audit M3), and a text with MySQL's `/*! … */` is refused where binding would
+    /// print it back without the comment (11-08 audit M1).
+    #[test]
+    fn the_binder_reads_what_the_front_reads() {
+        let k = HashMap::from([("k".to_string(), serde_json::json!(2))]);
+        for (sql, reads) in [
+            ("SELECT [x * $k FOR x IN l] AS v FROM t", "SELECT array_transform((l), x -> (x * (2))) AS v FROM t"),
+            ("SELECT list_transform(l, LAMBDA x: x * $k) AS v FROM t", "SELECT list_transform(l, x -> x * (2)) AS v FROM t"), // (a value bound in parentheses, as `literal` writes it)
+        ] {
+            let bound = bind(sql, &k).unwrap();
+            assert_eq!(crate::parsed::generic(&bound), crate::parsed::generic(reads), "{sql} bound as {bound}");
+        }
+        let e = bind("SELECT /*! 1 + */ $k AS x", &k).unwrap_err();
+        assert_eq!(crate::codes::of(&e), "0A000", "{e:#}");
     }
 
     #[test]
