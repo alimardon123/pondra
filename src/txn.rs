@@ -526,7 +526,7 @@ fn start(app: &crate::app::App, s: &str, level: Level, read_only: bool, job: Opt
     book.txns.insert(s.to_string(), txn);
     if !book.upkeep {
         book.upkeep = true;
-        crate::spawns::spawn(upkeep());
+        app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, upkeep());
     }
     true
 }
@@ -1066,7 +1066,7 @@ pub async fn statement(app: &crate::app::App, stmt: &Stmt, files: bool, scope: &
     let (old, new, at, keys) = match insert {
         Some(query) => {
             let (rows, at, keys) = insert_rows(&l, &stored, &query, snapshot, files).await?;
-            if crate::constraints::key_checked(&stored) {
+            if stored.key_checked() {
                 // A plain INSERT's keys are checked at the statement, where Postgres checks them, so a SAVEPOINT can roll the
                 // refusal back: a key this transaction's own rows hold is refused, one it took away is free (`ByKey`), and the
                 // rest are looked up in the table as it is now. COMMIT checks them again (`write_changes`).
