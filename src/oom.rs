@@ -200,7 +200,7 @@ fn give_back(bytes: usize) -> usize {
 
 /// Starts the process's watch (`Watch`), when the process can say how much memory it holds and the caches can be given
 /// back (`trim_line`): at the first node's start, once a process. The line is checked only where there is one (a node's
-/// own process). It runs on a thread of its own (`panics::alone`) for as long as the process: a node that stops ends its
+/// own process). It runs on a thread of its own (`spawns::alone`) for as long as the process: a node that stops ends its
 /// own loops, not the process's watch, which then reads the caches and requests of the nodes still running (none: it
 /// waits, and looks every 30 s).
 pub fn start() {
@@ -223,7 +223,7 @@ fn watch() {
     }
     let line = line(); // (None in a host's process: there the watch only gives the cache back)
     WATCH.watching.store(true, Relaxed);
-    crate::panics::alone(async move {
+    crate::spawns::alone(async move {
         let mut last_stop = None; // when the last stop was made: it holds the watch (`pending`)
         let mut said = false; // the line for this stretch over the line, said once
         loop {
