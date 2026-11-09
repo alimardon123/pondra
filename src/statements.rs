@@ -56,9 +56,22 @@ pub(crate) fn role(ds: &[crate::ddl::Ddl]) -> crate::auth::Role {
         crate::ddl::Ddl::Entry { words, .. } => match right(words) {
             Some(Right::Admin) | None => crate::auth::Role::Admin,
         },
+        crate::ddl::Ddl::UndropKept { kind, .. } => match right(&dropping(kind)) {
+            Some(Right::Admin) | None => crate::auth::Role::Admin,
+        },
         _ => crate::auth::Role::Admin,
     };
     ds.iter().map(of).fold(crate::auth::Role::None, |most, r| if r > most { r } else { most })
+}
+
+/// The words of the statement that drops a `kind`.
+fn dropping(kind: &str) -> String { format!("DROP {}", kind.to_uppercase()) }
+
+/// Is `d` an UNDROP of a kind an extension's statement drops (`DROP CONNECTION`)? It needs the right that DROP needed
+/// (`role`), as every UNDROP does.
+pub(crate) fn undrops_entry(d: &crate::ddl::Ddl) -> bool {
+    let statements = crate::registry::get().find::<Statements>();
+    matches!(d, crate::ddl::Ddl::UndropKept { kind, .. } if statements.and_then(|s| s.named(&dropping(kind))).is_some())
 }
 
 /// Something a form offers or lacks (docs/forms.json's forms), from the facts a node has today; step 2's lifecycle facts

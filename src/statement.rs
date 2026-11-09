@@ -63,13 +63,13 @@ pub async fn run<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire:
         if let Some((sent, one)) = plain_of(app, &req.sql, &who.scope).await? {
             if !crate::txn::open() {
                 crate::query::mark("request read and checked");
-                return audit::statement(app, &sent, query(app, &one, &how, who.files, &who.scope, wire)).await; // (the audit log and history keep it as it was sent)
+                return audit::statement(app, who.by.as_ref(), &sent, query(app, &one, &how, who.files, &who.scope, wire)).await; // (the audit log and history keep it as it was sent)
             }
         }
     }
     // A script sent without a session is one of its own while it runs: its SET, PREPARE, BEGIN
     // and temporary tables last to its end.
-    let own = (temp::current().is_none() && routines::split(&req.sql).len() > 1).then(temp::of_script);
+    let own = (temp::current().is_none() && routines::split(&req.sql).len() > 1).then(|| temp::of_script(who.name()));
     let tables = Arc::new(req.tables);
     let script = crate::query::SENT.scope(tables, routines::script(app, &req.sql, &req.params, &req.views, who, how.job.map(str::to_string)));
     let out = match &own {
@@ -198,7 +198,7 @@ pub const HELD_SESSION: (&str, &str) = ("x-pondra-session", "held");
 /// A statement the node stopped for memory fails its session's transaction, as an error does (`txn::failed`): the session is
 /// found as `sql` finds it, for the caller that asked. Each door that stops one calls it (HTTP's `guard`, a page's `lake_sql`).
 pub fn failed_for_memory(who: crate::auth::Principal, headers: &http::HeaderMap, lake: &crate::store::Lake) {
-    let session = crate::auth::WHO.sync_scope(who, || crate::temp::of(lake, headers)).ok().flatten();
+    let session = crate::temp::of(lake, headers, &who.name).ok().flatten();
     if let Some(s) = session {
         crate::temp::SESSION.sync_scope(crate::temp::named(lake, Some(s)), || crate::txn::failed(crate::oom::OOM));
     }
@@ -258,12 +258,12 @@ pub(crate) async fn scoped<F: std::future::Future>(session: Option<crate::temp::
     crate::vars::within(vars, temp::SESSION.scope(session, f)).await
 }
 
-/// One `/sql` request (its query, its headers, its body), for `role`, planned for `scope` (its principal's), with every
+/// One `/sql` request (its query, its headers, its body), for `role`, planned for `by`, the principal its door signed in, with every
 /// step a `/sql` takes around `statement::run` (the session, the owner's files, …): server.rs's `sql`, moved.
-pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, scope: crate::rights::Scope, headers: http::HeaderMap, body: Bytes) -> Said {
+pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, by: crate::auth::Principal, headers: http::HeaderMap, body: Bytes) -> Said {
     let files = owner(&app.lake, &app.auth, &headers); // (the program that started this node: its files, and URLs no secret covers)
     let node = app.lake.node.clone(); // (its rest, run on after the answer is handed over, is still in flight: `panics::work`)
-    let session = match crate::temp::of(&app.lake, &headers) { // (its temporary tables: `temp.rs`)
+    let session = match crate::temp::of(&app.lake, &headers, &by.name) { // (its temporary tables: `temp.rs`)
         Ok(session) => session,
         Err(e) => return Said { reply: Err(e), heard: vec![], session: None }, // (a session name that isn't one: refused, saying what one is)
     };
@@ -275,7 +275,7 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, scope: crate::
     };
     let vars = crate::auth::lent_vars(&app.lake, crate::auth::Credential::of_headers(&headers).token()); // (Python code a run lent a connection to: the run's variables)
     let (hand, mut handed) = tokio::sync::oneshot::channel(); // (the door's end of an answer in pieces: `query::Pieces`)
-    let statement = crate::query::PIECES.scope(crate::query::Pieces::new(hand), sql_as(app, p, role, scope, headers, body));
+    let statement = crate::query::PIECES.scope(crate::query::Pieces::new(hand), sql_as(app, p, role, by, headers, body));
     // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
     let go = crate::query::HELD.scope(Default::default(), scoped(named, vars.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(statement)))));
     // (`guard` gave this request its principal and its apply flag, outside this handler: a request whose answer is
@@ -301,13 +301,13 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, scope: crate::
 }
 
 /// `sql`'s statement, as HTTP asks it: its text as its content type says (`routines::Request`), how it asks (`How`), and who.
-async fn sql_as(app: App, p: SqlParams, role: crate::auth::Role, scope: crate::rights::Scope, headers: http::HeaderMap, body: Bytes) -> anyhow::Result<Reply> {
+async fn sql_as(app: App, p: SqlParams, role: crate::auth::Role, by: crate::auth::Principal, headers: http::HeaderMap, body: Bytes) -> anyhow::Result<Reply> {
     let kind = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
     let req = crate::routines::Request::read(kind, &body)?;
     // (a Python procedure's own calls, through the token lent to it; anyone else's is a first call)
     let lent = crate::auth::lent(&app.lake, crate::auth::Credential::of_headers(&headers).token()).is_some();
     let depth = headers.get("x-pondra-depth").filter(|_| lent).and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0);
-    let who = Who { role, files: owner(&app.lake, &app.auth, &headers), depth, scope };
+    let who = Who { depth, ..Who::signed(by, role, owner(&app.lake, &app.auth, &headers)) };
     let how = How { job: p.job.as_deref(), spread: p.spread.as_deref(), after: p.after, stale: p.stale_ms.map(Duration::from_millis) };
     Ok(match crate::statement::run(&app, req, how, who, &HttpWire(&p, &app.lake)).await? {
         Answer::Kept(body) => Reply::Rendered(Rendered::Whole(body)),

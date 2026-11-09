@@ -232,7 +232,7 @@ pub async fn table(ctx: &datafusion::prelude::SessionContext, history: Arc<dyn d
 /// conditions (`about`), and the share of the table's rows it keeps.
 pub type Given = Vec<(String, String, f64)>;
 
-/// This node's copy of the facts: (table, conditions) → (when last seen, µs; the share kept). Read
+/// The lake's copy of the facts here: (table, conditions) → (when last seen, µs; the share kept). Read
 /// from the history again, its newer rows only, at most every 10 s and only while queries are planned:
 /// nothing runs when nothing asks.
 #[derive(Default)]
@@ -245,11 +245,27 @@ struct Known {
     reading: bool,
 }
 
-crate::per_node!(static KNOWN: RwLock<Known> = Default::default());
 const KEPT: usize = 20_000; // (facts at most: a few MB)
 
-fn known() -> std::sync::RwLockReadGuard<'static, Known> { KNOWN.read().unwrap_or_else(|e| e.into_inner()) }
-fn known_mut() -> std::sync::RwLockWriteGuard<'static, Known> { KNOWN.write().unwrap_or_else(|e| e.into_inner()) }
+/// What a lake keeps of what its runs learned (invariant 301): its copy of the facts (`Known`), and each query's runs with
+/// them (`Runs`, by `key`). A query planned with them carries it (`Planning`): the optimizer's rules have no lake.
+pub struct Kept {
+    known: RwLock<Known>,
+    runs: Mutex<lru::LruCache<u64, Runs>>,
+}
+
+impl crate::lake_state::LakeState for Kept {
+    const NAME: &'static str = "learned";
+    const ABOUT: &'static str = "the share of its tables' rows each filter kept, as its runs measured it, and how its queries ran planned with them";
+    fn make() -> Self {
+        Kept { known: Default::default(), runs: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())) }
+    }
+}
+
+impl Kept {
+    fn known(&self) -> std::sync::RwLockReadGuard<'_, Known> { self.known.read().unwrap_or_else(|e| e.into_inner()) }
+    fn known_mut(&self) -> std::sync::RwLockWriteGuard<'_, Known> { self.known.write().unwrap_or_else(|e| e.into_inner()) }
+}
 
 /// Whether the planner uses this node's facts (`PONDRA_LEARN=on`; by default they are learned and
 /// kept, not used).
@@ -258,10 +274,12 @@ fn on() -> bool {
     *ON
 }
 
-/// The lake whose history this node's facts are read from: its own, once open (`main.rs`).
+/// The lake whose history its facts are read from: itself, once open (`node::start_app`). (Weak: its state is its own.)
 pub fn start(lake: &Arc<crate::store::Lake>) {
-    let mut k = known_mut();
-    (k.lake, k.name) = (Arc::downgrade(lake), crate::ddl::lake_name(lake));
+    if let Ok(kept) = lake.state::<Kept>() {
+        let mut k = kept.known_mut();
+        (k.lake, k.name) = (Arc::downgrade(lake), crate::ddl::lake_name(lake));
+    }
 }
 
 /// A table's name as the history keeps it (`ddl::local`): `public.t` is `t`, this lake's `l.s.t` is
@@ -296,13 +314,14 @@ fn trim(k: &mut Known) {
 }
 
 /// What a run here just found (`history::planned`): known here at once, before its history row is
-/// written and read back.
+/// written and read back. (A run planned outside `planning` and `given` is known once its row is read.)
 pub fn note(facts: &[Fact]) {
     if facts.is_empty() || !on() {
         return;
     }
+    let Ok(kept) = PLAN.try_with(|p| p.kept.clone()) else { return };
     let at = crate::log::now_us() as i64;
-    let mut k = known_mut();
+    let mut k = kept.known_mut();
     for f in facts {
         keep(&mut k, at, f);
     }
@@ -313,6 +332,7 @@ pub fn note(facts: &[Fact]) {
 /// own, as its runs so far say (`verdict`, decided at its first fact). `used`: whether any was;
 /// `held`: whether some applied and were held back, to measure the bar.
 struct Planning {
+    kept: Arc<Kept>,
     given: Option<HashMap<(String, String), f64>>,
     sql: Box<str>,
     verdict: OnceLock<Verdict>,
@@ -323,7 +343,7 @@ struct Planning {
 impl Planning {
     /// Whether this query uses this node's facts; the first time a fact applies, it is decided.
     fn uses(&self) -> bool {
-        match *self.verdict.get_or_init(|| verdict(&self.sql)) {
+        match *self.verdict.get_or_init(|| self.kept.verdict(&self.sql)) {
             Verdict::Use => true,
             Verdict::Bar => {
                 self.held.store(true, Ordering::Relaxed);
@@ -359,13 +379,16 @@ tokio::task_local! {
 /// `f`, a query a door asked for, planned with this node's facts as its runs so far say (`ran`);
 /// and how. A plan made outside it uses none.
 /// (not `async`, as `ext::listing`: its future would hold `f` twice)
-pub fn planning<F: std::future::Future>(sql: &str, f: F) -> impl std::future::Future<Output = (F::Output, Planned)> {
+pub fn planning<F: std::future::Future>(lake: &crate::store::Lake, sql: &str, f: F) -> impl std::future::Future<Output = (F::Output, Planned)> {
+    planning_in(if on() { lake.state::<Kept>().ok() } else { None }, sql, f)
+}
+
+/// `planning` with its lake's facts, or none (`PONDRA_LEARN` not on).
+fn planning_in<F: std::future::Future>(kept: Option<Arc<Kept>>, sql: &str, f: F) -> impl std::future::Future<Output = (F::Output, Planned)> {
     use futures::{future::Either, FutureExt};
-    if !on() {
-        return Either::Left(f.map(|out| (out, Planned::Plain)));
-    }
+    let Some(kept) = kept else { return Either::Left(f.map(|out| (out, Planned::Plain))) };
     let used = Arc::new(AtomicBool::new(false));
-    let plan = Arc::new(Planning { given: None, sql: sql.into(), verdict: OnceLock::new(), used: used.clone(), held: AtomicBool::new(false) });
+    let plan = Arc::new(Planning { kept, given: None, sql: sql.into(), verdict: OnceLock::new(), used: used.clone(), held: AtomicBool::new(false) });
     Either::Right(PLAN.scope(plan.clone(), f).map(move |out| {
         let planned = match (plan.held.load(Ordering::Relaxed), used.load(Ordering::Relaxed)) {
             (true, _) => Planned::Bar,
@@ -378,10 +401,17 @@ pub fn planning<F: std::future::Future>(sql: &str, f: F) -> impl std::future::Fu
 
 /// `f`, a spread query's slice, planned with the facts its coordinator planned with and no others, so
 /// every node plans alike (invariant 27). On the coordinator, its query hears whether they were used.
-pub async fn given<F: std::future::Future>(facts: &Given, f: F) -> F::Output {
+pub async fn given<F: std::future::Future>(lake: &crate::store::Lake, facts: &Given, f: F) -> F::Output {
+    match lake.state::<Kept>() {
+        Ok(kept) => given_in(kept, facts, f).await,
+        Err(_) => f.await, // (a build with no such state: no facts, as outside `planning`)
+    }
+}
+
+async fn given_in<F: std::future::Future>(kept: Arc<Kept>, facts: &Given, f: F) -> F::Output {
     let used = PLAN.try_with(|p| p.used.clone()).unwrap_or_default();
     let given = facts.iter().map(|(t, a, s)| ((t.clone(), a.clone()), *s)).collect();
-    let plan = Planning { given: Some(given), sql: "".into(), verdict: OnceLock::from(Verdict::Use), used, held: AtomicBool::new(false) };
+    let plan = Planning { kept, given: Some(given), sql: "".into(), verdict: OnceLock::from(Verdict::Use), used, held: AtomicBool::new(false) };
     PLAN.scope(Arc::new(plan), f).await
 }
 
@@ -389,7 +419,7 @@ pub async fn given<F: std::future::Future>(facts: &Given, f: F) -> F::Output {
 /// outside `planning`, or when held back.
 pub fn of(tables: &[String]) -> Given {
     let Ok(plan) = PLAN.try_with(Arc::clone) else { return vec![] };
-    let k = known();
+    let k = plan.kept.known();
     let tables: std::collections::HashSet<String> = tables.iter().map(|t| local(t, &k.name)).collect();
     let mut out: Given = match &plan.given {
         Some(g) => g.iter().filter(|((t, _), _)| tables.contains(t)).map(|((t, a), s)| (t.clone(), a.clone(), *s)).collect(),
@@ -408,13 +438,13 @@ pub fn share(table: &TableReference, predicate: &Expr) -> Option<f64> {
     let plan = PLAN.try_with(Arc::clone).ok()?;
     let about = about(predicate)?;
     let found = match &plan.given {
-        Some(g) => g.get(&(local(&name(table), &known().name), about)).copied(),
+        Some(g) => g.get(&(local(&name(table), &plan.kept.known().name), about)).copied(),
         None => {
             let found = {
-                let k = known();
+                let k = plan.kept.known();
                 k.facts.get(&(local(&name(table), &k.name), about)).map(|f| f.1)
             };
-            refresh();
+            refresh(&plan.kept);
             found.filter(|_| plan.uses())
         }
     };
@@ -425,12 +455,12 @@ pub fn share(table: &TableReference, predicate: &Expr) -> Option<f64> {
 }
 
 /// Read the history's newer facts, in the background, when the copy is 10 s old or was never read.
-fn refresh() {
-    if known().read.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(10)) {
+fn refresh(kept: &Arc<Kept>) {
+    if kept.known().read.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(10)) {
         return;
     }
     let (lake, since) = {
-        let mut k = known_mut();
+        let mut k = kept.known_mut();
         if k.reading {
             return;
         }
@@ -439,23 +469,23 @@ fn refresh() {
         (lake, k.newest)
     };
     /// Done reading, however it ended.
-    struct Done;
+    struct Done(Arc<Kept>);
     impl Drop for Done {
         fn drop(&mut self) {
-            let mut k = known_mut();
+            let mut k = self.0.known_mut();
             (k.reading, k.read) = (false, Some(datafusion::common::instant::Instant::now()));
         }
     }
-    let done = Done;
+    let done = Done(kept.clone());
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
     crate::panics::task(crate::auth::as_node(async move { // (the node's own work: every row of the history, `read`)
-        let _done = done;
+        let done = done; // (held to its end: its drop marks the read done, however it ended)
         // (rows reach the history a second or so after their runs, in any order: a minute back again)
         match read(&lake, since.saturating_sub(60_000_000)).await {
             Ok(rows) => {
-                let mut k = known_mut();
+                let mut k = done.0.known_mut();
                 for (at, f) in &rows {
                     k.newest = k.newest.max(*at);
                     keep(&mut k, *at, f);
@@ -499,7 +529,6 @@ struct Runs {
     aside: bool,
 }
 
-crate::per_node!(static RUNS: Mutex<lru::LruCache<u64, Runs>> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
 
 /// A query by its words, without its comments and spacing: asked again with a note in a comment (as
 /// tools and dashboards do), it is the same query. Its literals stay: other values filter otherwise.
@@ -528,29 +557,37 @@ fn key(sql: &str) -> (u64, bool) {
     (h.finish(), explain && !analyze)
 }
 
-/// How a query is planned, as its runs so far say (decided when a fact first applies to it).
-fn verdict(sql: &str) -> Verdict {
-    let (k, _) = key(sql);
-    match RUNS.lock().unwrap_or_else(|e| e.into_inner()).peek(&k) {
-        Some(r) if r.aside => Verdict::Aside,
-        Some(r) if r.measure => Verdict::Bar,
-        _ => Verdict::Use,
+impl Kept {
+    /// How a query is planned, as its runs so far say (decided when a fact first applies to it).
+    fn verdict(&self, sql: &str) -> Verdict {
+        let (k, _) = key(sql);
+        match self.runs.lock().unwrap_or_else(|e| e.into_inner()).peek(&k) {
+            Some(r) if r.aside => Verdict::Aside,
+            Some(r) if r.measure => Verdict::Bar,
+            _ => Verdict::Use,
+        }
     }
 }
 
 /// A query a door asked for ran in `took`, planned as `planning` said. Its 1st, 2nd, 4th, 8th… run
 /// with facts has the next one measure the bar (a few runs as before, ever fewer); each run with them
 /// is held to the best of those.
-pub fn ran(sql: &str, planned: Planned, took: std::time::Duration) {
+pub fn ran(lake: &crate::store::Lake, sql: &str, planned: Planned, took: std::time::Duration) {
     if planned == Planned::Plain {
         return; // (nothing applied: nothing to hold to anything)
     }
+    if let Ok(kept) = lake.state::<Kept>() {
+        ran_in(&kept, sql, planned, took);
+    }
+}
+
+fn ran_in(kept: &Kept, sql: &str, planned: Planned, took: std::time::Duration) {
     let took = took.as_secs_f64();
     let (k, explain) = key(sql);
     if explain {
         return; // (planned, not run)
     }
-    let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut runs = kept.runs.lock().unwrap_or_else(|e| e.into_inner());
     let r = runs.get_or_insert_mut(k, Runs::default);
     if planned == Planned::Bar {
         (r.bar, r.measure) = (Some(r.bar.map_or(took, |b| b.min(took))), false);
@@ -603,6 +640,9 @@ mod tests {
         let q = "SELECT 'a query of this test only' -- run 1";
         let again = "SELECT  'a query of this test only'  -- run 2";
         let ms = std::time::Duration::from_millis;
+        let kept = <Kept as crate::lake_state::LakeState>::make();
+        let verdict = |sql: &str| kept.verdict(sql);
+        let ran = |sql: &str, planned, took| ran_in(&kept, sql, planned, took);
         assert_eq!(verdict(q), Verdict::Use, "nothing known: its facts used");
         ran(q, Planned::Used, ms(300)); // (cold)
         assert_eq!(verdict(again), Verdict::Bar, "the next run measures the bar, whatever its comment");
@@ -632,11 +672,12 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let paris = col("country").eq(lit("FR")).and(col("city").eq(lit("Paris")));
         let t = TableReference::bare("customers");
+        let kept = Arc::new(<Kept as crate::lake_state::LakeState>::make());
         assert_eq!(share(&t, &paris), None, "no query being planned");
         let sent: Given = vec![("customers".into(), about(&paris).unwrap(), 0.01)];
-        let (got, planned) = rt.block_on(planning("SELECT 'a slice of this test'", given(&sent, async { share(&t, &paris) })));
+        let (got, planned) = rt.block_on(planning_in(on().then(|| kept.clone()), "SELECT 'a slice of this test'", given_in(kept.clone(), &sent, async { share(&t, &paris) })));
         // (a slice uses the facts sent whatever this node's switch; its query hears of it only when on)
         assert_eq!((got, planned), (Some(0.01), if on() { Planned::Used } else { Planned::Plain }));
-        assert_eq!(rt.block_on(given(&vec![], async { share(&t, &paris) })), None, "none sent: none used");
+        assert_eq!(rt.block_on(given_in(kept.clone(), &vec![], async { share(&t, &paris) })), None, "none sent: none used");
     }
 }

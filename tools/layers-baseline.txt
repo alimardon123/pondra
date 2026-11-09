@@ -82,7 +82,6 @@ git -> crypto  1
 git -> fetch  1
 guard -> dial  2
 held -> wasm32  1
-history -> reset  1
 host -> git  1
 host -> measures  1
 host -> pg_trace  1
@@ -125,7 +124,6 @@ log -> rules  4
 log -> seq  6
 log -> sys  5
 log -> tier  1
-log -> views  7
 log -> wasm32  4
 machine -> wasm32  2
 manifest -> branch  4
@@ -146,7 +144,7 @@ objects -> branch  2
 objects -> constraints  1
 objects -> ddl  32
 objects -> engine  1
-objects -> expander  3
+objects -> expander  2
 objects -> ext  3
 objects -> extension  1
 objects -> facts  1
@@ -212,7 +210,6 @@ rules -> pg_json  1
 rules -> pg_json_make  6
 runs -> apply  1
 runs -> crypto  2
-runs -> reset  1
 scan -> wasm32  2
 serve -> pg_casts  1
 serve -> pg_types  2
@@ -273,7 +270,7 @@ store -> in_task  1
 store -> locks  1
 store -> oom  2
 store -> panics  4
-store -> query  5
+store -> query  4
 store -> rules  14
 store -> seq  3
 store -> serve  2
@@ -305,7 +302,6 @@ views -> matches  4
 views -> measures  1
 views -> pattern  1
 views -> pg_json  1
-views -> reset  1
 with_writes -> pg_types  2
 workspace -> python  4
 write -> crypto  1

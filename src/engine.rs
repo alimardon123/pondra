@@ -104,7 +104,7 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             passes.add(p);
         }
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "functions", columns: FUNCTION_COLUMNS, rows: functions });
-        #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: the answers kept for their doors' pages, a joined page's unsent statements and a node's count of them, its file stores and catalogs' tokens, and the shuffles its node takes part in)
+        #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: each says what its state holds, `LakeState::ABOUT`)
         {
             let states = r.section_mut::<crate::lake_state::Registered>();
             states.add::<crate::pages::Pages>();
@@ -113,6 +113,17 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add::<crate::ext::Stores>();
             states.add::<crate::ext::Tokens>();
             states.add::<crate::spmd::Shuffles>();
+            states.add::<crate::history::History>();
+            states.add::<crate::history::Writers>();
+            states.add::<crate::query::FactsKept>();
+            states.add::<crate::views::Kept>();
+            states.add::<crate::rerun::Kept>();
+            states.add::<crate::runs::Kept>();
+            states.add::<crate::tasks::Kept>();
+            states.add::<crate::fresh::Plans>();
+            states.add::<crate::once::Buckets>();
+            states.add::<crate::routines::Kept>();
+            states.add::<crate::learned::Kept>();
             states.add::<crate::users::SignIns>();
             states.add::<crate::users::Turns>();
             states.add::<crate::temp::Sessions>();
@@ -128,15 +139,16 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add::<crate::locks::Tables>();
             states.add::<crate::serve::PointPlans>();
             states.add::<crate::serve::TailKeys>();
-            states.add::<crate::query::PlanFacts>();
         }
         #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)
-        for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,
+        for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::undrop::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,
                   crate::runs::PREFIXES, crate::tasks::PREFIXES, crate::users::PREFIXES, crate::views::PREFIXES] {
             r.section_mut::<crate::records::Prefixes>().add(p);
         }
         #[cfg(feature = "lake")]
         r.section_mut::<crate::records::Rights>().add(crate::users::RIGHTS);
+        #[cfg(feature = "lake")] // (what the log's commits call: a view's rows, derived as its sources' are packed)
+        r.section_mut::<crate::log::CommitHooks>().add(crate::views::hook());
     },
 };
 
@@ -184,10 +196,9 @@ fn own(mut ctx: SessionContext) -> SessionContext {
     crate::asof::register(&ctx); // (ASOF JOIN's marker)
     crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
     crate::fvar::register(&ctx); // var, stddev (and avg, below) over DOUBLE: the same answer in any order
-    crate::avg::register(&ctx); // avg(DECIMAL): rounded at its last place
+    crate::avg::register(&ctx); // avg(DECIMAL): as sum / count answers it
     crate::string_agg::register(&ctx); // string_agg: one group's string held to a share of the query memory
     crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
-    crate::one_row::register(&ctx); // pondra_one_row(s): a scalar subquery's one row, or 21000
     crate::dialect_fns::register(&ctx); // safe_divide(a, b): BigQuery's, typed by its arguments
     crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
     crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
@@ -579,7 +590,7 @@ mod tests {
             ("SELECT pmod(-7, 3)", "2"),
             ("SELECT sum(x) FROM (VALUES (CAST('1e16' AS DOUBLE)), (CAST('1' AS DOUBLE)), (CAST('-1e16' AS DOUBLE))) t(x)", "1.0"), // (a plain sum gives 0)
             ("SELECT byte_length(X'010203')", "3"),
-            ("SELECT avg(x) FROM (VALUES (CAST(1 AS DECIMAL(10,2))), (2), (2)) t(x)", "1.666667"),
+            ("SELECT avg(x) FROM (VALUES (CAST(1 AS DECIMAL(10,2))), (2), (2)) t(x)", "1.66666667"), // (as sum(x) / count(x) answers it: a DECIMAL(22, 2)'s sum leaves room for 8 places)
             ("SELECT '{\"a\": 7}' ->> 'a'", "7"),
             ("SELECT encode(substring(X'0102030405' FROM 2 FOR 2), 'hex')", "0203"),
             ("SELECT arrow_typeof(NULL || NULL)", "Utf8"), // (text, as Postgres reads `unknown || unknown`: DataFusion refused it)

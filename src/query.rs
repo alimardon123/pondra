@@ -726,36 +726,38 @@ impl FactsMemo {
     }
 }
 
-/// A lake's planning facts (`FactsMemo`), as its line counts them (`cache_bytes{cache="facts"}`): the least recently
-/// planned versions give their manifests back first.
-pub struct PlanFacts(Arc<std::sync::Mutex<FactsMemo>>);
+/// The planning facts a lake's queries worked out (its state, `lake_state.rs`), as its line counts them
+/// (`cache_bytes{cache="facts"}`): the least recently planned versions give their manifests back first.
+pub struct FactsKept(std::sync::Mutex<FactsMemo>);
 
-impl crate::lake_state::LakeState for PlanFacts {
+impl crate::lake_state::LakeState for FactsKept {
     const NAME: &'static str = "facts";
-    const ABOUT: &'static str = "each append table version's facts as its queries plan it: its manifests, statistics and schema";
+    const ABOUT: &'static str = "the planning facts of its append tables' versions its queries planned, by version";
 
-    fn make() -> Self { PlanFacts(Default::default()) }
+    fn make() -> Self { FactsKept(Default::default()) }
 
-    fn cache(self: Arc<Self>) -> Option<Arc<dyn crate::ledger::Charged>> { Some(self.0.clone()) }
+    fn cache(self: Arc<Self>) -> Option<Arc<dyn crate::ledger::Charged>> { Some(self) }
 }
 
-impl crate::ledger::Charged for std::sync::Mutex<FactsMemo> {
-    fn held(&self) -> usize { self.lock().unwrap_or_else(|e| e.into_inner()).by_key.bytes() }
+impl crate::ledger::Charged for FactsKept {
+    fn held(&self) -> usize { self.0.lock().unwrap_or_else(|e| e.into_inner()).by_key.bytes() }
 
-    fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(self, |m| &mut m.by_key, bytes) }
+    fn give_back(&self, bytes: usize) -> usize { crate::ledger::give_back_from(&self.0, |m| &mut m.by_key, bytes) }
 
     fn gives_back(&self) -> bool { true }
 }
 
-/// An append table version's `Facts` as its queries plan it, kept per version of its entry (`FactsMemo`): a table that has
-/// not changed is planned from the same facts by every query.
+/// An append table version's `Facts` as its queries plan it, kept per version of its entry (`FactsMemo`) in its lake's
+/// state: a table that has not changed is planned from the same facts by every query.
 pub async fn facts(lake: &Lake, meta: &Arc<TableMeta>, sys: bool) -> Result<Arc<Facts>> {
-    let kept = lake.state::<PlanFacts>()?;
-    if let Some(facts) = kept.0.lock().unwrap().get(meta, sys) {
+    let kept = lake.state::<FactsKept>().ok();
+    if let Some(facts) = kept.as_ref().and_then(|k| k.0.lock().unwrap_or_else(|e| e.into_inner()).get(meta, sys)) {
         return Ok(facts);
     }
     let facts = Arc::new(facts_once(lake, meta, sys).await?);
-    kept.0.lock().unwrap().put(meta, sys, &facts);
+    if let Some(k) = kept {
+        k.0.lock().unwrap_or_else(|e| e.into_inner()).put(meta, sys, &facts);
+    }
     Ok(facts)
 }
 
@@ -927,8 +929,11 @@ pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool, keep_deleted:
         _ => String::new(), // (two or more cluster_by columns: a Hilbert curve's order, `tier::latest`)
     };
     if !meta.merge.is_empty() {
-        let cols = meta.columns().map(|(c, _)| match meta.merge.get(c).map(String::as_str) {
+        let cols = meta.columns().map(|(c, t)| match meta.merge.get(c).map(String::as_str) {
             Some("count") => format!("sum({}) AS {}", q(c), q(c)), // (partial counts add up)
+            // (a DECIMAL's partial sums add up in the type the table keeps: DataFusion's sum of them is ten digits wider,
+            // so a view's sum would take its type, and its average its places, from how many files it has)
+            Some("sum") if t.starts_with("Decimal") => format!("arrow_cast(sum({}), '{t}') AS {}", q(c), q(c)),
             Some(f) => format!("{f}({}) AS {}", q(c), q(c)),
             None => q(c),
         });
@@ -1896,6 +1901,27 @@ pub fn first_table(sql: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A view's partial DECIMAL sums add up in the type its table keeps, however many files and log rows it has: its sum
+    /// keeps that type, and its average (`pondra_avg_of`) the query's places (11-08 audit M2; the train's `sums` found a
+    /// view's average at 6 places once its rows were in more than one file).
+    #[tokio::test]
+    async fn a_views_merged_decimal_sum_keeps_its_type() -> anyhow::Result<()> {
+        use super::*;
+        use crate::store::TableMeta;
+        let mut meta = TableMeta::with_columns(vec![("k".into(), "Int64".into()), ("__sum_1".into(), "Decimal128(25, 2)".into()), ("__count_2".into(), "Int64".into())]);
+        meta.key = vec!["k".into()];
+        meta.merge = [("__sum_1".to_string(), "sum".to_string()), ("__count_2".to_string(), "count".to_string())].into_iter().collect();
+        let ctx = crate::engine::session(datafusion::prelude::SessionConfig::new(), Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()));
+        ctx.sql("CREATE TABLE raw AS SELECT * FROM (VALUES (1, CAST(1.00 AS DECIMAL(25, 2)), 1), (1, CAST(4.00 AS DECIMAL(25, 2)), 2), (2, CAST(5.55 AS DECIMAL(25, 2)), 1)) AS t(k, \"__sum_1\", \"__count_2\")").await?.collect().await?;
+        let merged = ctx.sql(&latest_sql(&meta, "raw", true, false)).await?;
+        assert_eq!(merged.schema().field_with_name(None, "__sum_1")?.data_type().to_string(), "Decimal128(25, 2)");
+        ctx.register_table("merged", merged.into_view())?;
+        let out = ctx.sql("SELECT k, CAST(pondra_avg_of(\"__sum_1\", \"__count_2\") AS VARCHAR) AS a FROM merged ORDER BY k").await?.collect().await?;
+        let a = |r: usize| datafusion::arrow::util::display::array_value_to_string(out[0].column(1), r);
+        assert_eq!((a(0)?, a(1)?), ("1.666666666666667".into(), "5.550000000000000".into()), "the query's 15 places, as avg of a DECIMAL(15, 2)");
+        Ok(())
+    }
 
     /// A statement reads the tables and views it names, as DataFusion's parse refers to them (`named_records`), and plans
     /// as it did when every table was scanned and its words matched (`session_reading`'s scan, the oracle): over schemas,

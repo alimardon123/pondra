@@ -695,10 +695,27 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if matches!(head.as_str(), "export" | "import") && PORTABLE.is_match(first_word(sql)) {
         return Some(Stmt::Invalid("EXPORT DATABASE and IMPORT DATABASE are not supported yet: BACKUP DATABASE TO 'place' copies a database (RESTORE DATABASE name FROM 'place' brings it back), and COPY t TO 'dir/t.parquet' (FORMAT parquet) writes a table's rows".into()));
     }
-    // `UNDROP TABLE t` (Snowflake's, Databricks'): the table dropped last under that name, back (ADR-043).
-    static UNDROP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*UNDROP\s+TABLE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = (head == "undrop").then(|| UNDROP.captures(first_word(sql))).flatten() {
-        return Some(Stmt::Ddl(vec![Ddl::Undrop { name: name(&c[1]) }]));
+    // `UNDROP <kind> name` (Snowflake's, Databricks'): what was dropped last under that name, back (ADR-043; a definition's:
+    // `undrop.rs`). The kinds are those whose verbs the registry lists UNDROP among (`objects::Kind`), so a kind that keeps
+    // its drops is undropped with no edit here.
+    if head == "undrop" {
+        static UNDROP: std::sync::LazyLock<(regex::Regex, String)> = std::sync::LazyLock::new(|| {
+            let mut kinds: Vec<&str> = crate::objects::all_kinds().filter(|k| k.verbs.contains(&"UNDROP")).map(|k| k.name).collect();
+            kinds.sort_by_key(|k| std::cmp::Reverse(k.len())); // ("table function" before "table")
+            let words = kinds.iter().map(|k| k.replace(' ', r"\s+")).collect::<Vec<_>>().join("|");
+            let re = regex::Regex::new(&format!(r#"(?is)^\s*UNDROP\s+({words})\s+([\w."-]+)\s*;?\s*$"#)).expect("a regex");
+            kinds.sort();
+            (re, kinds.iter().map(|k| k.to_uppercase()).collect::<Vec<_>>().join(", "))
+        });
+        let (re, kinds) = &*UNDROP;
+        let Some(c) = re.captures(first_word(sql)) else {
+            return Some(Stmt::Invalid(format!("UNDROP <kind> name brings back what was dropped last under the name, for these kinds: {kinds} (pondra.dropped lists what can come back)")));
+        };
+        let kind = c[1].split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        return Some(Stmt::Ddl(vec![match kind.as_str() {
+            "table" => Ddl::Undrop { name: name(&c[2]) },
+            _ => Ddl::UndropKept { kind, name: name(&c[2]) },
+        }]));
     }
     // DuckDB's CREATE MACRO … IF NOT EXISTS (the parser takes only OR REPLACE): read without it, kept unless one is there.
     static MACRO_QUIET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+(OR\s+REPLACE\s+)?(TEMP\s+|TEMPORARY\s+)?MACRO\s+)IF\s+NOT\s+EXISTS\s+").expect("a regex"));
@@ -724,7 +741,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Ok(sql) => sql,
         Err(e) => return Some(Stmt::of_error(&e, format!("{e:#}"))),
     };
-    let parsed = crate::parsed::generic(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (parsed once for the front's looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
+    let parsed = crate::parsed::read(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (as the front reads it, parsed once for its looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
     let parsed = match parsed {
         Ok(mut s) => s.pop()?,
         Err(_) => return None,
@@ -1518,9 +1535,7 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
     let live: Vec<(String, String)> = meta.live().map(|(s, _, t)| (s.to_string(), t.to_string())).collect(); // (dropped columns aren't written)
     let listed = |c: &[(String, String)]| c.iter().map(|(n, t)| format!("{} {}", meta.name_of(n), crate::objects::sql_type(t))).collect::<Vec<_>>().join(", ");
     if types(&live) != types(&f.columns) {
-        // (40001, as a move's: a column added, dropped or retyped while they were written, so they are written again. The
-        // words say so too, since a node that sent them reads the code from them)
-        return Err(crate::codes::coded("40001", format!("could not serialize the INSERT into {}: its rows' columns ({}) aren't the table's ({}), in order and type, since it changed while they were written. Run it again", f.table, listed(&f.columns), listed(&live))));
+        return Err(unplaced(&f.table, &f.columns, listed(&f.columns), listed(&live)));
     }
     ensure!(f.placed.is_none_or(|placed| meta.places(placed)), crate::log::moved(&f.table)); // (a move the node hadn't seen: `log::placed_for`)
     let rows: u64 = f.files.iter().map(|f| f.rows).sum();
@@ -1529,6 +1544,18 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
         Some(_) => j!({"rows": rows}),
         None => j!({"duplicate": true}),
     })
+}
+
+/// What `record` says of rows whose columns (`given`, as their node typed them) aren't the table's. 40001, as a move's, when
+/// the table can have changed under them: a column added, dropped or retyped while they were written, so they are written
+/// again (the words say so too, since a node that sent them reads the code from them). But a type this node doesn't read
+/// is no move: the node that wrote them names types otherwise (another version), and run again its INSERT would be
+/// refused the same way forever, so it is XX000, which no client runs again.
+fn unplaced(table: &str, given: &[(String, String)], theirs: String, ours: String) -> anyhow::Error {
+    match given.iter().find(|(_, t)| crate::answer::dtype(t).is_err()) {
+        Some((_, t)) => crate::codes::coded("XX000", format!("the INSERT into {table} was written by a node that names a type {t}, which the leader doesn't read: its rows' columns ({theirs}) aren't the table's ({ours}). Nodes of two versions write together: upgrade them alike")),
+        None => crate::codes::coded("40001", format!("could not serialize the INSERT into {table}: its rows' columns ({theirs}) aren't the table's ({ours}), in order and type, since it changed while they were written. Run it again")),
+    }
 }
 
 /// What `record` says of files written with their rows' system columns once something follows
@@ -2784,6 +2811,19 @@ async fn led(dir: &str, term: u64, req: &mut Option<Request>, node: &Arc<NodeSta
 mod tests {
     use super::*;
 
+    /// Rows whose columns aren't the table's: 40001 where the table can have moved under them, and XX000, never run again,
+    /// where their node names a type the leader doesn't read (11-08 audit L14).
+    #[test]
+    fn rows_unplaced_are_run_again_only_after_a_move() {
+        let col = |n: &str, t: &str| (n.to_string(), t.to_string());
+        let moved = unplaced("t", &[col("a", "Int64")], "a bigint".into(), "a bigint, b text".into());
+        assert_eq!(crate::codes::of(&moved), "40001", "{moved}");
+        assert!(moved.to_string().ends_with("Run it again"), "{moved}");
+        let other = unplaced("t", &[col("a", "Int64"), col("b", "Utf9")], "a bigint, b Utf9".into(), "a bigint, b text".into());
+        assert_eq!(crate::codes::of(&other), "XX000", "{other}");
+        assert!(!other.to_string().contains("Run it again") && other.to_string().contains("Utf9"), "{other}");
+    }
+
     #[test]
     fn a_query_is_a_write_only_as_select_into() {
         assert!(parse("SELECT 1").is_none(), "a query: no write, unparsed");
@@ -2792,6 +2832,9 @@ mod tests {
         assert!(parse("select * into temp t2 from t").is_some());
         assert!(matches!(parse("SELECT 1; DELETE FROM t"), Some(Stmt::Delete(..))), "several statements are read as before: the last");
         assert!(parse("SELECT 'into' AS w").is_none(), "INTO in a string: read, and no write");
+        // (read as the front reads it: a write with DuckDB's forms in it is one, at Flight's door too, 11-08 audit M3)
+        assert!(matches!(parse("INSERT INTO t SELECT [x FOR x IN l] FROM s"), Some(Stmt::Insert(..))));
+        assert!(matches!(parse("UPDATE t SET l = list_transform(l, LAMBDA x: x + 1)"), Some(Stmt::Update(..))));
     }
     use datafusion::arrow::array::Float64Array;
     use datafusion::arrow::datatypes::{Field, Schema};

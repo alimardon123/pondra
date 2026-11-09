@@ -34,6 +34,30 @@ as Delta keeps a table's old files (a day, Snowflake's, until 2026-11-08). `'0 s
   away when it is dropped, and published again when it comes back.
 - `pondra.dropped` lists what can still come back.
 
+**2b. Every definition is kept too (2026-11-08, reviews/undrop-every-kind-2026-11-08.md).**
+
+- A drop of a view, an external table, a function, macro or procedure, a task, a type, a secret or
+  a connection moves its records, as they were, to one `dk/{family}/{name}/{ms}` record in the
+  drop's own commit (`undrop.rs`), with the comments on it. A task keeps its last tick; a secret
+  stays sealed.
+- `UNDROP VIEW v`, `UNDROP FUNCTION f`, `UNDROP TASK t`, and so on for each kind whose verbs list
+  UNDROP, put the newest back under the table's rules: refused while the name is taken (rename or
+  drop that, then undrop again to reach an older copy), with the right the kind's DROP needs.
+- A definition holds no rows, so it is kept for the default 7 days. `tier::expire` lets it go.
+- `pondra.dropped` lists it with its `kind`, `dropped_by`, and the `undrop` statement that brings
+  it back.
+- `DROP SCHEMA s CASCADE` keeps the schema in one record that names what went with it: its tables,
+  views and routines, each kept in its own. It is kept as long as the longest kept of them, and
+  never less than 7 days. `UNDROP SCHEMA s` brings the schema back, then each of them still kept,
+  tables first; its answer names any that couldn't come back. Until then `UNDROP TABLE s.t` waits
+  for its schema.
+- A materialized view is kept as the statement that makes it again, with its comment. `UNDROP
+  MATERIALIZED VIEW v` runs it, so its rows are worked out again from its sources as they are then
+  (rows written while it was dropped are counted), and it follows new writes from there. The UNDROP
+  answers once the view is filled, as its CREATE does. Keeping its old rows and its place in its
+  sources instead would leave it behind them by what it missed. Only a DROP keeps one: a view
+  replaced by CREATE OR REPLACE isn't kept, nor is a view a topic feeds. Databases and files come next.
+
 **3. `t AT (VERSION => n | TIMESTAMP => t | OFFSET => -s)` reads an append table as it was**
 (`past.rs`). It needs no history in the catalog, because the rows carry it. The table as of `n` is:
 
