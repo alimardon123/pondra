@@ -2,8 +2,8 @@
 //! with its signals and standard input around it; a library will start and stop one in its own process.
 //! A guest (`Options::guest`) is a node a program starts for its own statements: it answers them and ends.
 //!
-//! This file is the lake half: what a node is made of that a page has too (`stop`, the moves' state), a host's state
-//! (`hosted`, `host`, the supervisor's events), and what a node does when it must stop or start again (`Native`, the
+//! This file is the lake half: what a node is made of that a page has too (`stop`), the host it runs under (`Host`: the
+//! supervisor's events and the lake's moves, `hosted`), and what a node does when it must stop or start again (`Native`, the
 //! `Lifecycle` every lake it opens is handed), the program's own path (`exe`) and the lead of a lake nobody leads
 //! (`lead_once`).
 //! The doors half is `node/run.rs`.
@@ -43,57 +43,62 @@ impl Default for Start {
 }
 
 /// The node stops, for good, with this reason, when its own work can't go on (a vital loop's panic, the catalog's
-/// compactor, a lake a newer Pondra wrote). Where a host supervises the node, it is told (`failed`) and this returns:
-/// it stops the node as it stops it on a close, so a leader makes what it committed durable, checkpoints its catalog
-/// and gives up its term, and the next node leads at once (invariant 210). A library's host then stays; `pondra serve`
-/// then ends with status 1 (`cli.rs`). Elsewhere (a guest, a command of the command line's) the process ends here with
-/// status 1, as a supervisor expects of a stop and with no core: what it made goes first (an exit runs no destructor).
-pub(crate) fn stop(why: String) {
-    if hosted() || supervised() {
-        return failed(why);
-    }
+/// compactor, a lake a newer Pondra wrote). Where a host supervises the node, it is told (`Event::Failed`) and this
+/// returns: it stops the node as it stops it on a close, so a leader makes what it committed durable, checkpoints its
+/// catalog and gives up its term, and the next node leads at once (invariant 210). A library's host then stays; `pondra
+/// serve` then ends with status 1 (`cli.rs`). A node with no host in a library's process (a command's own) only says
+/// why: the process is the host program's. Elsewhere (a guest, a command of the command line's) the process ends here
+/// with status 1, as a supervisor expects of a stop and with no core: what it made goes first (an exit runs no destructor).
+fn stop(why: String, host: Option<&Host>) {
     eprintln!("stopping: {why}");
-    crate::memory::leave();
-    std::process::exit(1)
+    match host {
+        Some(h) if !h.events.is_closed() => drop(h.events.send(Event::Failed(why))),
+        _ if hosted() => {}
+        _ => {
+            crate::memory::leave();
+            std::process::exit(1)
+        }
+    }
 }
 
-/// A lake moving to another place (`memory::set_location`): the host stops the node, settles the lake's
-/// objects there (`memory::settle`) and starts the node again on `to`. `copied` is what the first pass copied.
-pub struct Move {
-    pub from: String,
-    pub to: String,
-    pub copied: crate::memory::Copied,
+/// A node's host: what it is told when the node's own work fails or must start again (`Event`), and where the node's
+/// lake moves go (`memory::set_location`). A library's supervisor and `pondra serve` each make one (`Host::new`) and give
+/// it to every node they start (`Options::host`): it outlives each node, as the host does. A node with none (a guest, a
+/// command's own, a test's) stops its process on a failure, and can't move its lake.
+#[derive(Clone)]
+pub struct Host {
+    events: mpsc::UnboundedSender<Event>,
+    moves: mpsc::UnboundedSender<crate::lifecycle::Move>,
 }
 
-/// Where a lake's moves go: the host of the node open now, which took them with `mover`. Not `per_node!`:
-/// a host outlives each node it starts (the program's, a library's supervisor's).
-static MOVER: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Move>>> = std::sync::Mutex::new(None);
-
-/// The host's end of the moves: taken once, before it starts its node.
-pub fn mover() -> tokio::sync::mpsc::UnboundedReceiver<Move> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    *MOVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
-    rx
+#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a library's and `pondra serve`'s, the doors half's)
+/// The host's ends of what its nodes tell it: their failures, restarts and the close (`events`), and their lakes'
+/// moves (`moves`). A dropped end tells each node that its host is gone: it stops its process, and can't move.
+pub struct Told {
+    pub(crate) events: mpsc::UnboundedReceiver<Event>,
+    pub(crate) moves: mpsc::UnboundedReceiver<crate::lifecycle::Move>,
 }
 
-/// Can this node's lake be moved: a host took `mover` and is still there?
-pub fn movable() -> bool { MOVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().is_some_and(|s| !s.is_closed()) }
+impl Host {
+    /// A host, and its ends of what the nodes it starts tell it.
+    pub fn new() -> (Host, Told) {
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let (moves, moves_rx) = mpsc::unbounded_channel();
+        (Host { events, moves }, Told { events: events_rx, moves: moves_rx })
+    }
 
-/// Hands a move to the host, which answers for it once the node has begun to stop.
-pub fn move_lake(m: Move) -> anyhow::Result<()> {
-    let sent = MOVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().map(|s| s.send(m).is_ok()).unwrap_or(false);
-    anyhow::ensure!(sent, "this node can't move its lake: it was started without a host that restarts it");
-    Ok(())
+    /// Tells the host `e` (a library's close, which is the host's own).
+    #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's close sends it)
+    pub(crate) fn tell(&self, e: Event) { let _ = self.events.send(e); }
+
+    /// Can a lake move: is the host still there to stop the node and start it on the target?
+    fn movable(&self) -> bool { !self.moves.is_closed() }
 }
 
-/// Where a node's restarts and failures are sent: the supervisor of the node open now, if any (a library's, `host`, or
-/// `pondra serve`'s, `supervise`). One node is open at a time in a process.
-static SUPERVISOR: Mutex<Option<mpsc::UnboundedSender<Event>>> = Mutex::new(None);
-
-/// Is this process a library's (`host`), not the program's?
+/// Is this process a library's (`library::Opened::open`), not the program's?
 pub fn hosted() -> bool { crate::machine::hosted() }
 
-/// What a node's supervisor is told: a restart or a failure from the node's own work, or the close of the node
+/// What a node's host is told: a restart or a failure from the node's own work, or the close of the node
 /// (a library's `Opened`).
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's supervisor is the doors half's)
 pub(crate) enum Event {
@@ -105,72 +110,28 @@ pub(crate) enum Event {
     Close,
 }
 
-pub(crate) fn send(e: Event) {
-    if let Some(s) = SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
-        let _ = s.send(e);
-    }
-}
-
-/// The node's supervisor is told it stops with this reason (a vital loop's panic, the compactor, a lake that moved past
-/// this build). A library's then answers every request with it until the node is opened again; `pondra serve`'s ends.
-pub fn failed(why: String) {
-    eprintln!("stopping: {why}");
-    send(Event::Failed(why));
-}
-
-/// Puts a library's node under `tx`, the supervisor's end of its events, and says `hosted` from now on. Refused while a
-/// node is open in this process.
-#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's open calls it)
-pub(crate) fn host(tx: mpsc::UnboundedSender<Event>) -> anyhow::Result<()> {
-    {
-        let mut s = SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner);
-        anyhow::ensure!(s.is_none(), "a node is open in this process already: close it first (one at a time)");
-        *s = Some(tx);
-    }
-    crate::machine::set_hosted(); // (what the process is, from its first library's open: it outlives each node)
-    Ok(())
-}
-
-/// `pondra serve`'s end of its nodes' failures (`stop`), taken once, before it starts its first node. Not `host`: the
-/// process is still the program's (`hosted` stays false), so a restart still runs the program again.
-#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the command line's serve takes it)
-pub(crate) fn supervise() -> mpsc::UnboundedReceiver<Event> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    *SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx);
-    rx
-}
-
-/// Is a supervisor told of this process's node's failures (`host`, `supervise`)?
-fn supervised() -> bool { SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|s| !s.is_closed()) }
-
-/// Takes the supervisor back: the library's node is closed, or its open failed.
-#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's close calls it)
-pub(crate) fn unhost() { SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).take(); }
-
-/// Is a node open in this process as a library's? (`host` refuses a second one.)
-#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's open of a lake from JSON asks it first)
-pub(crate) fn hosting() -> bool { SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).is_some() }
-
 /// The lifecycle of a node in this process (`lifecycle::Lifecycle`): the program's, a library's (`hosted`) or a page's.
 /// A guest's (`Options::guest`) ends with its statement. Every lake the node opens, and its member, is handed it.
 pub struct Native {
     guest: bool,
     settings: crate::settings::Values, // (the node's, which the processes it starts are handed: `lead_elsewhere`)
+    host: Option<Host>, // (who is told of its failures and restarts, and takes its lake's moves: `Options::host`)
     claims: Arc<crate::node_state::Claims>, // (the node's: its restart says in them that it is coming back, `restart_with`)
 }
 
 /// A node's state as the code below the hosts sees it, with this host's lifecycle: a guest's when `guest`.
-pub fn native(guest: bool) -> Arc<crate::node_state::NodeState> { native_with(guest, crate::settings::Values::now()) }
+/// It has no host: a failure ends the process (in a library's, it is only said), and its lake can't move.
+pub fn native(guest: bool) -> Arc<crate::node_state::NodeState> { native_with(guest, crate::settings::Values::now(), None) }
 
-/// `native`, the node starting with `settings` (`Options::settings`).
-pub(crate) fn native_with(guest: bool, settings: crate::settings::Values) -> Arc<crate::node_state::NodeState> {
+/// `native`, the node starting with `settings` (`Options::settings`) under `host` (`Options::host`).
+pub(crate) fn native_with(guest: bool, settings: crate::settings::Values, host: Option<Host>) -> Arc<crate::node_state::NodeState> {
     let claims = Arc::<crate::node_state::Claims>::default();
-    crate::node_state::NodeState::claiming(Arc::new(Native { guest, settings: settings.clone(), claims: claims.clone() }), settings, claims)
+    crate::node_state::NodeState::claiming(Arc::new(Native { guest, settings: settings.clone(), host, claims: claims.clone() }), settings, claims)
 }
 
 impl crate::lifecycle::Lifecycle for Native {
-    fn stop(&self, why: String) { stop(why) }
-    fn restart(&self, why: &str, carried: &[(&str, String)]) -> ! { restart_with(self.guest, &self.claims, why, carried) }
+    fn stop(&self, why: String) { stop(why, self.host.as_ref()) }
+    fn restart(&self, why: &str, carried: &[(&str, String)]) -> ! { restart_with(self.guest, &self.claims, why, carried, self.host.as_ref()) }
     /// (a library's host and a `pondra sql` guest's shell show only trouble, so there it is not said)
     fn say(&self, line: &str) {
         if !hosted() && !self.guest {
@@ -180,7 +141,13 @@ impl crate::lifecycle::Lifecycle for Native {
     fn one_off(&self) -> bool { self.guest }
     fn owns_process(&self) -> bool { !hosted() }
     fn program(&self) -> anyhow::Result<PathBuf> { exe() }
-    fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir, &self.settings)) }
+    fn lead_elsewhere<'a>(&'a self, dir: &'a str, reaches: &'a crate::reaches::Reaches) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir, &self.settings, reaches)) }
+    fn movable(&self) -> bool { self.host.as_ref().is_some_and(Host::movable) }
+    fn move_lake(&self, m: crate::lifecycle::Move) -> anyhow::Result<()> {
+        let sent = self.host.as_ref().is_some_and(|h| h.moves.send(m).is_ok());
+        anyhow::ensure!(sent, crate::lifecycle::NO_MOVE);
+        Ok(())
+    }
 }
 
 /// A page's lifecycle (redesign §8): what ends is the page's member, never its worker. A stop ends the member, which
@@ -222,7 +189,7 @@ impl crate::lifecycle::Lifecycle for PageLife {
     fn one_off(&self) -> bool { false }
     fn owns_process(&self) -> bool { true } // (the page's worker is its own: no host shares it)
     fn program(&self) -> anyhow::Result<PathBuf> { anyhow::bail!("a page has no pondra program to start") }
-    fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+    fn lead_elsewhere<'a>(&'a self, dir: &'a str, _: &'a crate::reaches::Reaches) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move { anyhow::bail!("a page leads its own lake only, not {dir}") })
     }
 }
@@ -233,7 +200,7 @@ impl crate::lifecycle::Lifecycle for PageLife {
 /// task that asked unwinds, past the panic hook (a host's error reporting sees no panic for a takeover). In the
 /// program the same binary runs again (`run::exec_again`). On a page there is no program to run again, so a restart
 /// is a stop until the page decides otherwise (L2's answer in the design).
-fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carried: &[(&str, String)]) -> ! {
+fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carried: &[(&str, String)], host: Option<&Host>) -> ! {
     if guest && crate::write::tries() >= 5 {
         eprintln!("gave up after 5 restarts: {why}"); // (a guest that is sent back five times is a statement that fails: it says why)
         crate::memory::leave();
@@ -249,7 +216,9 @@ fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carr
         }
     }
     if hosted() {
-        send(Event::Restart(why.to_string())); // (in place: a library's host keeps its process)
+        if let Some(h) = host {
+            h.tell(Event::Restart(why.to_string())); // (in place: a library's host keeps its process)
+        }
         std::panic::resume_unwind(Box::new(Restarting(why.to_string())))
     }
     #[cfg(feature = "doors")]
@@ -257,7 +226,7 @@ fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carr
     #[cfg(not(feature = "doors"))]
     {
         let _ = carried; // (a page carries nothing: nothing runs again)
-        stop(format!("{why}")); // (a page: a restart is a stop, until the page decides otherwise)
+        stop(format!("{why}"), host); // (a page: a restart is a stop, until the page decides otherwise)
         unreachable!("stop ends an unhosted process")
     }
 }
@@ -282,15 +251,15 @@ pub fn exe() -> anyhow::Result<PathBuf> {
 /// A node never leads another lake itself: that lake's catalog writer would outlive the moment in the node, and a
 /// later leader of it would fence it out.
 #[cfg(feature = "doors")]
-pub async fn lead_once(dir: &str, values: &crate::settings::Values) -> anyhow::Result<()> {
+pub async fn lead_once(dir: &str, values: &crate::settings::Values, reaches: &crate::reaches::Reaches) -> anyhow::Result<()> {
     // (another process would lead a lake of its own memory, gone when it ends)
     anyhow::ensure!(!crate::memory_lake::in_memory(dir), "{dir} is in a process's memory, where a lake is made by opening it (pondra.open(), pondra :memory:) and led by that process alone: attach or make a database in a folder or a bucket");
-    run::lead_once(dir, values).await
+    run::lead_once(dir, values, reaches).await
 }
 
 /// A page starts no process, so it leads no lake but its own.
 #[cfg(not(feature = "doors"))]
-pub async fn lead_once(_dir: &str, _values: &crate::settings::Values) -> anyhow::Result<()> {
+pub async fn lead_once(_dir: &str, _values: &crate::settings::Values, _reaches: &crate::reaches::Reaches) -> anyhow::Result<()> {
     Err(crate::codes::coded("0A000", "a page leads no lake: a browser starts no processes (a node leads one in a process of its own)"))
 }
 
@@ -883,6 +852,27 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// A node's host is its own value, handed to it (`Options::host`), not the process's: the node tells it of a failure
+    /// and hands it a move while it is there, and can't move once it is gone. A node with none can't move.
+    #[test]
+    fn a_nodes_host_is_told_of_its_failure_and_takes_its_moves() {
+        use crate::lifecycle::{Lifecycle, Move, NO_MOVE};
+        let to = |to: &str| Move { from: "memory://a".into(), to: to.into(), copied: Default::default() };
+        let (host, mut told) = super::Host::new();
+        let node = super::Native { guest: false, settings: crate::settings::Values::now(), host: Some(host), claims: Default::default() };
+        assert!(node.movable());
+        node.move_lake(to("/tmp/b")).unwrap();
+        assert_eq!(told.moves.try_recv().map(|m| m.to).ok().as_deref(), Some("/tmp/b"));
+        node.stop("the test's own".into()); // (told, and returns: the host stops the node)
+        assert!(matches!(told.events.try_recv(), Ok(super::Event::Failed(why)) if why == "the test's own"));
+        drop(told); // (the host is gone)
+        assert!(!node.movable());
+        assert_eq!(node.move_lake(to("/tmp/c")).unwrap_err().to_string(), NO_MOVE);
+        let alone = super::Native { guest: false, settings: crate::settings::Values::now(), host: None, claims: Default::default() };
+        assert!(!alone.movable());
+        assert_eq!(alone.move_lake(to("/tmp/d")).unwrap_err().to_string(), NO_MOVE);
+    }
+
     /// A lake of its own, with its own node, led alone and run as a guest's (`pondra sql`'s) is: its statements go through
     /// `on_node`, as the leader's doors send them, and no loop of the leader's runs beside them (a tiering round's minute
     /// sweep would read every table inside a statement's count). The returned mark is aborted by the caller.
@@ -1035,7 +1025,7 @@ mod tests {
         assert_eq!(code, "57P03");
         assert!(words.contains("a test's restart"), "{words}");
         assert!(restarted.program().is_err() && !restarted.one_off() && restarted.owns_process());
-        let elsewhere = futures::executor::block_on(restarted.lead_elsewhere("s3://b/l")).expect_err("a page leads its own lake only");
+        let elsewhere = futures::executor::block_on(restarted.lead_elsewhere("s3://b/l", &Default::default())).expect_err("a page leads its own lake only");
         assert!(elsewhere.to_string().contains("s3://b/l"), "{elsewhere}");
     }
 }

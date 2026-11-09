@@ -29,7 +29,24 @@ fn piece() -> usize {
 /// name their buckets the same way: without it they would write over each other's rows (invariant 30). Being the
 /// process's, no other user can read the rows, and nothing sweeps a job while its process lives. Err when the process
 /// has no spill folder.
-pub fn dir(job: &str, here: &NodeState) -> std::io::Result<PathBuf> { Ok(shuffles()?.join(format!("{job}-{}", here.id))) }
+pub fn dir(job: &str, here: &NodeState) -> std::io::Result<PathBuf> {
+    std::sync::LazyLock::force(&SHUFFLES); // (on the spill disk's room list from the first shuffle that writes)
+    Ok(shuffles()?.join(format!("{job}-{}", here.id)))
+}
+
+/// What a shuffle's pieces hold on the spill disk: every node's in this process (`ledger::room`).
+struct Shuffles;
+
+impl crate::ledger::Holds for Shuffles {
+    fn held(&self) -> u64 { held() }
+}
+
+// (the process's shuffle folder is one, every node's under it: it is on the spill disk's room list once)
+static SHUFFLES: std::sync::LazyLock<Arc<dyn crate::ledger::Holds>> = std::sync::LazyLock::new(|| {
+    let shuffles: Arc<dyn crate::ledger::Holds> = Arc::new(Shuffles);
+    crate::ledger::holds(&shuffles);
+    shuffles
+});
 
 /// The `shuffle` folder itself, every node's here.
 fn shuffles() -> std::io::Result<PathBuf> { Ok(crate::store::spill_folder()?.join("shuffle")) }
@@ -253,8 +270,8 @@ pub fn clear(job: &str, here: &NodeState) {
     }
 }
 
-/// Bytes under this process's shuffle scratch, every node's here (what the process holds: `store::others_held`).
-pub fn held() -> u64 { shuffles().map(|base| walk(&base)).unwrap_or(0) }
+/// Bytes under this process's shuffle scratch, every node's here (what the process holds: `Shuffles`).
+fn held() -> u64 { shuffles().map(|base| walk(&base)).unwrap_or(0) }
 
 /// Bytes under node `here`'s shuffle scratch, its jobs' folders alone (for `/metrics`).
 pub fn held_by(here: &NodeState) -> u64 {
