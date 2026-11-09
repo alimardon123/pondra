@@ -143,7 +143,9 @@ def per_commit(port, statement, base):
         r1, w1 = records(port)
         tries.append((r1 - r0 - base[0], w1 - w0 - base[1], took))
         time.sleep(0.2)
-    best = min(tries, key=lambda t: (t[0] + t[1], t[2]))  # (the try with the fewest records: the least a background pass added)
+    # (the try with the fewest records: the least a background pass added. A commit also carries the sequencer's
+    # expiry of producers' marks that fell due, up to 10,000 a commit (`log.rs` `settle`): after a grow, each try has some)
+    best = min(tries, key=lambda t: (t[0] + t[1], t[2]))
     return {"reads": max(0, int(best[0])), "writes": max(0, int(best[1])), "p50_ms": round(statistics.median(t[2] for t in tries) * 1000, 2)}
 
 
