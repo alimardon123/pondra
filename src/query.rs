@@ -1195,7 +1195,7 @@ pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<Me
     };
     let first = enc.step(Some(&piece))?;
     let done = ended.clone();
-    crate::panics::aside(async move {
+    crate::spawns::aside(async move {
         let _held = held;
         let written = match write_all(&mut enc, &tx, parts).await {
             Ok(_) => step_to(&mut enc, &tx, None).await,
@@ -1606,7 +1606,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
         // (`pondra.runs`, `pondra.routines`, `pondra.tasks`, the lists; a lake's own schema called pondra is one made before 0.80, which wins as it did: 0.80 refuses a new one, 42939)
         use datafusion::catalog::SchemaProvider;
         let system = Arc::new(MemorySchemaProvider::new());
-        for (name, table) in crate::runs::tables(lake, scope).await?.into_iter().chain(crate::users::tables(lake, scope).await?).chain(crate::objects::tables(lake, &text, scope).await?).chain(crate::copy::tables(lake, &text, scope).await?).chain(crate::lists::tables(&text)?) {
+        for (name, table) in crate::runs::tables(lake, scope, &text).await?.into_iter().chain(crate::users::tables(lake, scope).await?).chain(crate::objects::tables(lake, &text, scope).await?).chain(crate::copy::tables(lake, &text, scope).await?).chain(crate::lists::tables(&text)?) {
             system.register_table(name.into(), table)?;
         }
         let runs = match lake.cat.meta(&crate::store::table_key(crate::runs::TABLE)).await? {
