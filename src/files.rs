@@ -295,7 +295,8 @@ pub async fn keep(lake: &Lake, path: &str, bytes: &bytes::Bytes) -> anyhow::Resu
         }
     }
     let (lake, path) = (lake.arc(), path.to_string());
-    crate::spawns::spawn(async move {
+    let node = lake.node.clone();
+    node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
         if let Err(e) = prune(&lake, &path).await {
             eprintln!("{path}: its oldest versions not let go: {e:#}");
         }

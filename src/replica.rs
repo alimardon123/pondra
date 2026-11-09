@@ -207,7 +207,8 @@ pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefi
 /// (with everything it helped commit in the bucket) before it leaves the list, so a new leader
 /// always knows everyone it has to ask.
 pub fn members(lake: Arc<Lake>, members: Arc<dyn Members>) {
-    crate::spawns::spawn(async move {
+    let node = lake.node.clone();
+    node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let live: Vec<String> = members.nodes().into_iter().filter(|n| *n != members.me()).collect();

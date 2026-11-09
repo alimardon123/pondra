@@ -524,7 +524,7 @@ fn start(app: &crate::app::App, s: &str, level: Level, read_only: bool, job: Opt
     book.txns.insert(s.to_string(), txn);
     if !book.upkeep {
         book.upkeep = true;
-        crate::spawns::spawn(upkeep());
+        app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, upkeep());
     }
     true
 }

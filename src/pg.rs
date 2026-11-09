@@ -58,7 +58,7 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
         let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: cancels.clone() };
         let pg = Arc::new(Pg(backend, Arc::new(startup), cancel.clone()));
         let used = app.lake.node.idle.begin(); // (an open connection is a use of the node: `idle.rs`)
-        crate::spawns::task(async move {
+        app.lake.node.tasks.spawn_as(crate::auth::Door, async move {
             let _used = used;
             let _ = socket.set_nodelay(true);
             let _ = pgwire::tokio::process_socket(socket, tls, pg).await;

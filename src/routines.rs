@@ -1185,14 +1185,16 @@ fn start<'a>(app: &'a App, name: &'a str, args: &'a [FunctionArg], column: &'a s
         if crate::workspace::is_run(name) {
             let args = args.to_vec();
             crate::workspace::arguments(app, &args, &who.scope).await?; // (its mistakes: said now, not only in the log)
-            crate::spawns::task(crate::auth::carried(async move {
+            let node = app2.lake.node.clone();
+            node.tasks.spawn_as(crate::auth::caller(), async move {
                 let _ = Box::pin(crate::workspace::run(&app2, &args, who, job, Some(id2))).await;
-            }));
+            });
         } else {
             let (local, r, row) = Box::pin(prepared(app, name, args, who.clone())).await?;
-            crate::spawns::task(crate::auth::carried(async move {
+            let node = app2.lake.node.clone();
+            node.tasks.spawn_as(crate::auth::caller(), async move {
                 let _ = Box::pin(run(&app2, local, r, row, who, job, Some(id2))).await; // (its outcome: the run log's)
-            }));
+            });
         }
         let ids = datafusion::arrow::array::StringArray::from(vec![id]);
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![datafusion::arrow::datatypes::Field::new(column, datafusion::arrow::datatypes::DataType::Utf8, false)]));

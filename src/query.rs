@@ -1182,7 +1182,7 @@ async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan:
 /// An answer already whole, sent in pieces as `send_rest` sends a plan's (`statement::answer`): its first piece is written
 /// now, the rest on the queries' runtime as its client reads them. `held`'s memory goes when the last piece is written,
 /// or when the client goes (the body that holds the pieces counts the request for a node told to stop: `server::pieces`).
-pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<MemoryReservation>) -> Result<Handed> {
+pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<MemoryReservation>, node: &crate::node_state::NodeState) -> Result<Handed> {
     let mut enc = crate::answer::Encoding::new(format);
     let mut parts: std::collections::VecDeque<RecordBatch> = crate::answer::pieces(batches.into_iter().map(|b| enc.lean(b))).into();
     let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1195,7 +1195,7 @@ pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<Me
     };
     let first = enc.step(Some(&piece))?;
     let done = ended.clone();
-    crate::spawns::aside(async move {
+    node.tasks.aside(crate::auth::caller(), async move {
         let _held = held;
         let written = match write_all(&mut enc, &tx, parts).await {
             Ok(_) => step_to(&mut enc, &tx, None).await,

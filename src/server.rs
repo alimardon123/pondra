@@ -1015,7 +1015,8 @@ impl Unstage {
 impl Drop for Unstage {
     fn drop(&mut self) {
         if let Some((lake, dir)) = self.0.take() {
-            crate::spawns::spawn(async move { unstage(&lake, &dir).await });
+            let node = lake.node.clone();
+            node.tasks.spawn_node(crate::spawns::Vital::Stop, async move { unstage(&lake, &dir).await });
         }
     }
 }

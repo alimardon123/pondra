@@ -205,10 +205,10 @@ impl Cluster {
     /// over (the bucket was down for everyone). Meanwhile, if another node is there to lead, it
     /// turns requests away (`cut_off`: `server::guard`, `audit::statement`): it can't commit, and
     /// what it reads may be stale.
-    pub fn keep_alive(self: Arc<Self>, store: Store, lake: &str) {
+    pub fn keep_alive(self: Arc<Self>, store: Store, lake: &str, node: &crate::node_state::NodeState) {
         let marked = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
         let (me, m) = (self.clone(), marked.clone());
-        crate::spawns::spawn(async move {
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             // (the claim marked it a moment ago: C5, a key at most once a second. A term taken back after a
             // restart was last marked before the restart, so it is marked a second in, not ten: invariant 17's
             // 30 s count from that mark)
@@ -236,7 +236,7 @@ impl Cluster {
             }
         });
         let bucket = crate::store::bucket_url(lake);
-        crate::spawns::spawn(async move {
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             let mut cut = false;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -255,8 +255,8 @@ impl Cluster {
     }
 
     /// Follower loop: heartbeat the leader; if it's gone for `LEASE`, claim the next term.
-    pub fn follow(self: Arc<Self>, store: Store) {
-        crate::spawns::spawn(async move {
+    pub fn follow(self: Arc<Self>, store: Store, node: &crate::node_state::NodeState) {
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             let mut reached: Option<Instant> = None; // (since when we reach the bucket the leader says it can't)
             let mut missed = false; // (the last beat went unanswered)
             loop {
@@ -333,8 +333,8 @@ impl Cluster {
 
     /// Read-only nodes: no heartbeat, no vote, no takeover. They only notice when leadership
     /// moves, and restart to follow the new leader's commit stream (see `mirror`).
-    pub fn watch_leader(self: Arc<Self>, store: Store, streamed: bool) {
-        crate::spawns::spawn(async move {
+    pub fn watch_leader(self: Arc<Self>, store: Store, streamed: bool, node: &crate::node_state::NodeState) {
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             let mut gone = 0;
             loop {
                 // While the leader's commit stream is down, look for a new leader every second
@@ -453,7 +453,8 @@ fn inboxed(t: Term, may_lead: bool, life: Life) -> Arc<Cluster> {
 /// answers loses its term to its followers (`follow`), and this node starts again.
 pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
     lake.caught.send_replace(false);
-    crate::spawns::spawn(async move {
+    let node = lake.node.clone();
+    node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
         let (since, mut said) = (tokio::time::Instant::now(), 0);
         // (its last commit; a leader older than this one tells only its log's end, which a table's commit doesn't move)
         let ask = |path: &str| {
@@ -527,7 +528,7 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     // Acks, coalesced: however many changes arrive meanwhile, one request says "up to here".
     let (held, mut to_ack) = tokio::sync::watch::channel((0u64, 0u64, 0u64)); // term, first, last
     let l = leader.clone();
-    crate::spawns::spawn(async move {
+    lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
         while to_ack.changed().await.is_ok() {
             let (term, first, upto) = *to_ack.borrow_and_update();
             let url = crate::tls::url(&format!("{l}/cluster/ack?from={me}&term={term}&first={first}&upto={upto}"));
@@ -566,7 +567,7 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
             }
         })
     };
-    crate::spawns::spawn(members::follow(Arc::downgrade(&lake), open, frame, || STREAM_DOWN.store(true, std::sync::atomic::Ordering::Relaxed), true));
+    lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, members::follow(Arc::downgrade(&lake), open, frame, || STREAM_DOWN.store(true, std::sync::atomic::Ordering::Relaxed), true));
 }
 
 /// One HTTP client (connection pool) for all node-to-node traffic. It carries this process's
