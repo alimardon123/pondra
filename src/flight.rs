@@ -373,7 +373,7 @@ async fn query(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown,
     let req = crate::routines::Request { sql: sql.to_string(), ..Default::default() };
     let how = How { job: None, spread: None, after: None, stale: None };
     let w = Worded::of(&who.scope);
-    let got = statement::run(app, req, how, who.clone(), &FlightWire).await.map_err(w.err())?;
+    let got = crate::auth::reading(statement::run(app, req, how, who.clone(), &FlightWire)).await.map_err(w.err())?; // (nothing it runs moves a sequence: a view's nextval neither)
     if matches!(got, Answer::Sent) {
         return Ok(Flown::Batches(Arc::new(Schema::empty()), vec![]));
     }

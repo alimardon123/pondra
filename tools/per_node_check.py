@@ -61,7 +61,6 @@ PROCESS = {
     "constraints.rs:TURN": LOCK,
     "defaults.rs:BASE": "the functions every session has, with no tables, for CHECK, DEFAULT and expectation expressions: nothing of a lake (what registers one gets a copy)",
     "dbserver.rs:KEY": "the key a lakes server gives its databases' nodes (`client_key`): one a process, made once",
-    "delta.rs:ONE": LOCK,
     "ledger.rs:ROOTS": "the process's memory, every node's budget held on it (redesign step 2, review change 4): one root for the sizes its machine and settings gave, so one in any process but a test's",
     "library.rs:OPEN": "whether a library's node is open in the process: one at a time, since a halt resets every node's statics (`reset::reset`)",
     "library.rs:R": "a library's runtime, kept for the next open: its threads are the process's, as the queries' runtime's are",
