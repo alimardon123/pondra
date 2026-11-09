@@ -104,6 +104,7 @@ mod pg_oids;
 mod pg_casts;
 mod pg_trace;
 pub mod pg_bytea;
+mod lifted;
 mod one_row;
 mod optimize;
 mod or_ranges;
