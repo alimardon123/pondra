@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use datafusion::common::instant::Instant;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -535,12 +535,12 @@ const ANSWERS: [&str; 4] = ["40P01", "55P03", "40001", "57P01"];
 /// granted at. A refusal keeps the leader's SQLSTATE. A lock wait is bounded: the leader answers within
 /// the wait the request names (what is left of the `lock_timeout`); a leader that doesn't answer in time
 /// (a lost request, a partition) is asked again, and the place it may have left is replaced, not doubled
-/// (`Table::ask`). The node that waits (`node`) ends its waits at once when it stops (57P01); a release or a renewal is
-/// told by no node in particular (`tell`), and is asked once, whatever any drain says.
-pub async fn ask(addr: &str, r: &Req, node: Option<&NodeState>) -> Result<u64> {
+/// (`Table::ask`). `node` calls the leader. A take ends its waits at once when its node stops (57P01); a release or a
+/// renewal (`tell`) is asked once, whatever its node's drain says: a stopping node's releases end the others' waits.
+pub async fn ask(node: &NodeState, addr: &str, r: &Req) -> Result<u64> {
     if r.release || r.renew {
         // (asked once: a release or a renewal that doesn't land is the lease's to end, and the next renewal says it again)
-        return match post_within(addr, r, lease(), node).await? {
+        return match post_within(node, addr, r, lease(), false).await? {
             Some(at) => Ok(at),
             None => Err(anyhow::anyhow!("the leader at {addr} didn't answer a lock request in time")),
         };
@@ -555,16 +555,17 @@ pub async fn ask(addr: &str, r: &Req, node: Option<&NodeState>) -> Result<u64> {
         let mut req = r.clone();
         req.wait_ms = left.map(|l| l.as_millis() as u64);
         let limit = left.map_or(lease(), |l| l + MARGIN);
-        match post_within(addr, &req, limit, node).await? {
+        match post_within(node, addr, &req, limit, true).await? {
             Some(at) => return Ok(at),
             None => continue, // (no answer in time: asked again)
         }
     }
 }
 
-/// One request to the leader, `None` if it didn't answer within `limit`. A stopping `node` stops waiting for it.
-async fn post_within(addr: &str, req: &Req, limit: Duration, node: Option<&NodeState>) -> Result<Option<u64>> {
-    let call = tokio::time::timeout(limit, send(addr, req));
+/// One request to the leader from `node`, `None` if it didn't answer within `limit`. With `stops`, a stopping `node` stops
+/// waiting for it.
+async fn post_within(node: &NodeState, addr: &str, req: &Req, limit: Duration, stops: bool) -> Result<Option<u64>> {
+    let call = tokio::time::timeout(limit, send(node, addr, req));
     tokio::pin!(call);
     loop {
         tokio::select! {
@@ -573,7 +574,7 @@ async fn post_within(addr: &str, req: &Req, limit: Duration, node: Option<&NodeS
                 Err(_) => None,
             }),
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                if node.is_some_and(|n| n.drain.draining()) {
+                if stops && node.drain.draining() {
                     return Err(coded("57P01", "this node is stopping: its lock waits end, and its transaction with them"));
                 }
             }
@@ -581,8 +582,8 @@ async fn post_within(addr: &str, req: &Req, limit: Duration, node: Option<&NodeS
     }
 }
 
-async fn send(addr: &str, r: &Req) -> Result<u64> {
-    let res = crate::dial::call(addr, crate::dial::Call::json("/cluster/lock", r)?).await?;
+async fn send(node: &NodeState, addr: &str, r: &Req) -> Result<u64> {
+    let res = crate::dial::call(node, addr, crate::dial::Call::json("/cluster/lock", r)?).await?;
     if !res.ok() {
         let code = res.sqlstate.as_deref().and_then(|c| ANSWERS.iter().find(|a| **a == c).copied());
         let text = res.text().await?;
@@ -596,8 +597,12 @@ async fn send(addr: &str, r: &Req) -> Result<u64> {
 
 // ---------------------------------------------------------------- the writers' side (ADR-067 §3–§7)
 
+/// The leader that keeps a follower's row locks: its address, and the node that took them, which calls it (a `Weak`: a
+/// node that is gone calls no one, and the leases end its locks).
+pub type Leader = (String, Weak<NodeState>);
+
 /// A transaction's or a statement's place on the leader: its lake's url, its leader (None: this node), and its owner.
-pub type Place = (String, Option<String>, String);
+pub type Place = (String, Option<Leader>, String);
 
 /// What a write takes its locks as (`passes`): its owner (a transaction's id, or an autocommitted write's), and the
 /// settings it was asked with. `txn`: a transaction's (its COMMIT or ROLLBACK lets the locks go); else an autocommitted
@@ -678,7 +683,7 @@ pub async fn take_on(app: &crate::app::App, owner: &str, resources: &[String], w
         take(&app.lake.node, &app.lake.url, owner, resources, wait, flight).await?;
         return Ok(app.lake.visible());
     }
-    let at = ask(&app.members.leader().addr, &Req::take(owner, resources, wait, flight), Some(&app.lake.node)).await?;
+    let at = ask(&app.lake.node, &app.members.leader().addr, &Req::take(owner, resources, wait, flight)).await?;
     wait_visible(&app.lake, at).await?;
     Ok(at)
 }
@@ -727,31 +732,35 @@ pub fn resources(table: &str, keys: &[Vec<String>]) -> Vec<String> {
 pub fn release_place((lake, leader, owner): Place) {
     match leader {
         None => release(&lake, &owner),
-        Some(addr) => tell(&addr, &Req::let_go(&owner)),
+        Some(leader) => tell(leader, Req::let_go(&owner)),
     }
 }
 
-/// Sends a lock request to the leader at `addr` without waiting for its answer.
-fn tell(addr: &str, req: &Req) {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let (addr, req) = (addr.to_string(), req.clone());
+/// Sends a lock request to `leader` without waiting for its answer, if the node that calls it is still here.
+fn tell((addr, from): Leader, req: Req) {
+    if let (Ok(handle), Some(node)) = (tokio::runtime::Handle::try_current(), from.upgrade()) {
         handle.spawn(async move {
-            let _ = ask(&addr, &req, None).await;
+            let _ = ask(&node, &addr, &req).await;
         });
     }
 }
 
 /// Renews the leases of the transactions that hold locks: here for a lake this node leads, else one request to its leader
-/// carrying all of that leader's (`Req::renewal`).
+/// carrying all of that leader's (`Req::renewal`), sent by a node of that lake that is still here.
 pub fn renew_places(holding: Vec<Place>) {
-    let mut by_place: BTreeMap<(String, Option<String>), Vec<String>> = BTreeMap::new();
+    let mut by_place: BTreeMap<(String, Option<String>), (Weak<NodeState>, Vec<String>)> = BTreeMap::new();
     for (lake, leader, id) in holding {
-        by_place.entry((lake, leader)).or_default().push(id);
+        let (addr, from) = leader.map_or((None, Weak::new()), |(a, from)| (Some(a), from));
+        let place = by_place.entry((lake, addr)).or_default();
+        if place.0.strong_count() == 0 {
+            place.0 = from;
+        }
+        place.1.push(id);
     }
-    for ((lake, leader), owners) in by_place {
+    for ((lake, leader), (from, owners)) in by_place {
         match leader {
             None => renew(&lake, &owners),
-            Some(addr) => tell(&addr, &Req::renewal(owners)),
+            Some(addr) => tell((addr, from), Req::renewal(owners)),
         }
     }
 }

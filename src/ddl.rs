@@ -652,7 +652,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
             }
             let dropped = match (crate::env::get("PONDRA_SERVER_URL"), &bases, &target) {
                 (Some(server), ..) => {
-                    let r = crate::dial::call(&server, crate::dial::Call::delete(format!("/databases/{name}?if_exists={if_exists}"))).await?;
+                    let r = crate::dial::call(&lake.node, &server, crate::dial::Call::delete(format!("/databases/{name}?if_exists={if_exists}"))).await?;
                     let (ok, text) = (r.ok(), r.text().await?);
                     ensure!(ok, "{text}");
                     serde_json::from_str(&text)?
@@ -776,7 +776,7 @@ pub fn full(dir: &str) -> Result<String> {
 pub async fn delete_lake(dir: &str) -> Result<()> {
     let store = crate::store::open_store(dir)?.1;
     if let Some(t) = crate::terms::latest(&store).await? {
-        ensure!(!crate::terms::alive(&store, &t).await, "another process leads the lake at {dir} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
+        ensure!(!crate::terms::alive(&store, &t, None).await, "another process leads the lake at {dir} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
     }
     match dir.contains("://") {
         false => std::fs::remove_dir_all(dir).with_context(|| format!("deleting {dir}"))?,
