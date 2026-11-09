@@ -1004,7 +1004,7 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
         let objects: Vec<object_store::ObjectMeta> = lake.store.list(Some(&at)).try_collect().await?;
         for o in objects {
             let old = now as i64 - o.last_modified.timestamp_millis() > DAY as i64;
-            if old && o.last_modified.timestamp_millis() > pinned && !used.has(o.location.as_ref()) && !crate::delta::open_format(o.location.as_ref()) {
+            if old && o.last_modified.timestamp_millis() > pinned && !used.has(o.location.as_ref()) && !crate::store::published(o.location.as_ref()) {
                 let _ = object_store::ObjectStoreExt::delete(&lake.store, &o.location).await; // (by the listed path itself)
             }
         }

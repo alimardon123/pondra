@@ -546,17 +546,21 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(s) = kinds.then(|| crate::routines::statement(sql)).flatten() {
         return Some(s); // (CREATE FUNCTION and PROCEDURE as Postgres writes them, CREATE TASK, DROP TASK, DROP MACRO)
     }
-    if let Some(s) = kinds.then(|| crate::objects::statement(sql)).flatten() {
-        return Some(s); // (COMMENT ON, CREATE OR ALTER TABLE | VIEW: the registry's)
+    #[cfg(test)]
+    if let Some(s) = kinds.then(|| was::objects(sql)).flatten() {
+        return Some(s); // (COMMENT ON, CREATE OR ALTER TABLE | VIEW: the statements section's entries)
     }
-    if let Some(s) = kinds.then(|| crate::seq::statement(sql)).flatten() {
-        return Some(s); // (CREATE, ALTER, DROP SEQUENCE)
+    #[cfg(test)]
+    if let Some(s) = kinds.then(|| was::seq(sql)).flatten() {
+        return Some(s); // (CREATE, ALTER, DROP SEQUENCE: the statements section's entries)
     }
-    if let Some(s) = kinds.then(|| crate::index::statement(sql)).flatten() {
-        return Some(s); // (CREATE, ALTER, DROP INDEX)
+    #[cfg(test)]
+    if let Some(s) = kinds.then(|| was::index(sql)).flatten() {
+        return Some(s); // (CREATE, ALTER, DROP INDEX: the statements section's entries)
     }
-    if let Some(s) = kinds.then(|| crate::types::statement(sql)).flatten() {
-        return Some(s); // (CREATE TYPE … AS ENUM, ALTER and DROP TYPE)
+    #[cfg(test)]
+    if let Some(s) = kinds.then(|| was::types(sql)).flatten() {
+        return Some(s); // (CREATE TYPE … AS ENUM, ALTER and DROP TYPE: the statements section's entries)
     }
     if let Some(s) = (head == "alter").then(|| placed(sql)).flatten() {
         return Some(s); // (ALTER TABLE t ALTER COLUMN c FIRST | AFTER b)
@@ -2800,6 +2804,18 @@ pub(crate) mod was {
     /// Row 6, `sso::statement`, where `parse` read it.
     pub(super) fn sso(sql: &str) -> Option<Stmt> { old().then(|| crate::sso::statement(sql)).flatten() }
 
+    /// `seq::statement`, where `parse` read it.
+    pub(super) fn seq(sql: &str) -> Option<Stmt> { old().then(|| crate::seq::statement(sql)).flatten() }
+
+    /// `objects::statement`, where `parse` read it.
+    pub(super) fn objects(sql: &str) -> Option<Stmt> { old().then(|| crate::objects::statement(sql)).flatten() }
+
+    /// `index::statement`, where `parse` read it.
+    pub(super) fn index(sql: &str) -> Option<Stmt> { old().then(|| crate::index::statement(sql)).flatten() }
+
+    /// `types::statement`, where `parse` read it.
+    pub(super) fn types(sql: &str) -> Option<Stmt> { old().then(|| crate::types::statement(sql)).flatten() }
+
     /// Row 4, where `parse` read it.
     pub(super) fn no_replace(sql: &str) -> Option<Stmt> {
         if !old() {
@@ -2952,8 +2968,17 @@ pub(crate) mod was {
         let placeholder = regex::Regex::new(r"\{[\w:?#]*\}").expect("a regex"); // (a format string's `{}`: no SQL)
         let texts = crate::passes::tests::texts("|backup|restore|export|import|undrop");
         // (texts the replaced readers misread, each refused now by its family's reader: a CLONE of no table, which the
-        // parser read as a table of no columns)
-        let misread = [("CREATE TABLE c CLONE", "invalid expected a name at the end (CREATE TABLE c [SHALLOW] CLONE t)")];
+        // parser read as a table of no columns; and harness.py's words for its checks, which the old DROP TYPE regex took
+        // as names of types to drop)
+        let misread = [
+            ("CREATE TABLE c CLONE", "invalid expected a name at the end (CREATE TABLE c [SHALLOW] CLONE t)"),
+            ("DROP TYPE … CASCADE drops a type no column uses (a plain DROP after finds none, 404)", "invalid DROP TYPE [IF EXISTS] name [, …] [CASCADE | RESTRICT]"),
+            // (and 8c's: DROP TYPE's form and two names with no comma, which its regex took as names to drop; and an
+            // enum's label that is a bare word, a string now as in Postgres and DuckDB)
+            ("DROP TYPE [IF EXISTS] name [, …] [CASCADE | RESTRICT]", "invalid DROP TYPE [IF EXISTS] name [, …] [CASCADE | RESTRICT]"),
+            ("DROP TYPE a b", "invalid DROP TYPE [IF EXISTS] name [, …] [CASCADE | RESTRICT]"),
+            ("CREATE TYPE mood AS ENUM (happy)", "invalid CREATE TYPE [IF NOT EXISTS] name AS ENUM ('label', …): enums are the types kept (a composite, a range or another type's alias isn't)"),
+        ];
         let (mut same, mut core, mut refused_now, mut differ) = (0, 0, vec![], vec![]);
         for sql in texts.iter().filter(|t| one(t) && !placeholder.is_match(t)) {
             let (now, then) = (shown(&super::parse(sql)), shown(&was(sql)));
@@ -2997,6 +3022,22 @@ pub(crate) mod was {
             "CREATE OR REPLACE SHARE s", "create or replace recipient r", "CREATE IDENTITY PROVIDER p (ISSUER 'https://x', CLIENT_ID 'c')",
             "CREATE OR REPLACE IDENTITY PROVIDER p (ISSUER 'https://x')", "ALTER IDENTITY PROVIDER p (LABEL 'x')", "DROP IDENTITY PROVIDER IF EXISTS p",
             "DROP IDENTITY PROVIDER",
+            "CREATE SEQUENCE s", "CREATE SEQUENCE IF NOT EXISTS s.q START WITH -5 INCREMENT BY -1 MINVALUE -100 MAXVALUE -1", "create or replace sequence \"S\" as smallint cycle",
+            "CREATE OR REPLACE SEQUENCE IF NOT EXISTS s", "CREATE TEMP SEQUENCE s", "CREATE SEQUENCE s START x", "CREATE SEQUENCE s OWNED BY t.c", "CREATE SEQUENCE s MINVALUE 10 MAXVALUE 1",
+            "ALTER SEQUENCE s RESTART", "ALTER SEQUENCE IF EXISTS s RESTART WITH 7 INCREMENT 2", "ALTER SEQUENCE s RENAME TO t", "ALTER SEQUENCE s", "ALTER SEQUENCE s RENAME TO t u",
+            "DROP SEQUENCE s", "DROP SEQUENCE IF EXISTS a, b.c CASCADE", "DROP SEQUENCE", "drop sequence s;",
+            "COMMENT ON TABLE sales.Orders IS 'one row per order'", "comment if exists on materialized view v is null",
+            "COMMENT ON COLUMN t.\"Amount\" IS $$in euros$$", "COMMENT ON IDENTITY PROVIDER p IS ''", "COMMENT ON TABLE t IS 42",
+            "COMMENT ON TABLE t", "COMMENT ON TABLE t IS 'x' extra", "COMMENT ON VIEW /* the view */ v IS 'x';",
+            "CREATE OR ALTER TABLE t (a BIGINT) CLUSTER BY (a)", "create or alter view v as select 1", "CREATE OR ALTER TABLE t AS SELECT 1",
+            "CREATE OR ALTER MATERIALIZED VIEW v AS SELECT 1", "CREATE OR ALTER FUNCTION f() RETURNS INT AS 'select 1'", "CREATE OR ALTER TABLE t ",
+            "CREATE TYPE mood AS ENUM ('sad', 'it''s', 'ok')", "create type if not exists s.\"Mood\" as enum ()", "CREATE OR REPLACE TYPE m AS ENUM ('a')",
+            "CREATE TYPE c AS (a INT)", "CREATE TYPE r AS RANGE (subtype = int4)", "CREATE TYPE m AS ENUM ('a') extra", "ALTER TYPE mood ADD VALUE IF NOT EXISTS 'meh' AFTER 'ok'",
+            "ALTER TYPE mood RENAME TO feeling_t", "ALTER TYPE mood RENAME VALUE 'a' TO 'b'", "ALTER TYPE mood DROP VALUE 'a'", "ALTER TYPE", "DROP TYPE IF EXISTS a, b CASCADE",
+            "drop type s.mood restrict;", "CREATE INDEX IF NOT EXISTS by_id ON orders (id)", "CREATE INDEX ON visits USING hnsw (path)", "CREATE UNIQUE INDEX u ON t (a)",
+            "CREATE UNIQUE INDEX ON visits (lower(path))", "CREATE INDEX clicks_lower_page ON clicks USING brin (lower(page)) WHERE page IS NOT NULL", "CREATE INDEX ON",
+            "ALTER INDEX visits_page_idx RENAME TO visits_path", "ALTER INDEX IF EXISTS s.i RENAME TO s.j", "ALTER INDEX i SET TABLESPACE x", "DROP INDEX IF EXISTS a, b CASCADE",
+            "DROP INDEX", "drop index i;",
         ] {
             assert_eq!(shown(&super::parse(sql)), shown(&was(sql)), "{sql}");
             assert!(crate::statements::moved(sql), "{sql}: an entry's");
