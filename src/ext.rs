@@ -1601,10 +1601,9 @@ fn open_with(key: &[u8], sealed: &str) -> Option<Vec<u8>> {
     crate::crypto::open(key, nonce.try_into().ok()?, &mut data).ok().map(|p| p.to_vec())
 }
 
-crate::per_node!(
-    /// Data keys unwrapped so far (by their wrapped form): a query using a secret again doesn't ask the
-    /// key service again.
-    static UNWRAPPED: std::sync::Mutex<HashMap<String, Vec<u8>>> = Default::default());
+/// Data keys unwrapped so far (by their wrapped form): a query using a secret again doesn't ask the
+/// key service again.
+static UNWRAPPED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<u8>>>> = std::sync::LazyLock::new(Default::default);
 
 /// A data key wrapped by the master key: by `PONDRA_KMS_COMMAND wrap` (a key service: its key never
 /// leaves it), or sealed with the local master key (`PONDRA_SECRET_KEY`, else the admin token's, else
@@ -1619,14 +1618,14 @@ fn wrap_key(key: &[u8]) -> Result<String> {
 /// A data key, unwrapped: by the key service for `kms:…`; else by the master key, or one of the others
 /// that may have wrapped it (`masters`) while keys move to a new one (`rewrap`).
 fn unwrap_key(wrapped: &str) -> Result<Vec<u8>> {
-    if let Some(k) = UNWRAPPED.lock().unwrap().get(wrapped) {
+    if let Some(k) = UNWRAPPED.lock().unwrap_or_else(|e| e.into_inner()).get(wrapped) {
         return Ok(k.clone());
     }
     let key = match wrapped.strip_prefix("kms:") {
         Some(w) => B64.decode(kms_run(&kms().context("this secret's key was wrapped by a key service: set PONDRA_KMS_COMMAND")?, "unwrap", w)?)?,
         None => masters()?.iter().find_map(|m| open_with(m, wrapped)).context("its key was wrapped by another master key: set the PONDRA_SECRET_KEY or PONDRA_ADMIN_TOKEN it was sealed with (or the old one as PONDRA_SECRET_KEY_PREVIOUS / PONDRA_ADMIN_TOKEN_PREVIOUS)")?,
     };
-    UNWRAPPED.lock().unwrap().insert(wrapped.to_string(), key.clone());
+    UNWRAPPED.lock().unwrap_or_else(|e| e.into_inner()).insert(wrapped.to_string(), key.clone());
     Ok(key)
 }
 
@@ -1700,7 +1699,7 @@ fn master() -> Result<[u8; 32]> {
     if let Some(k) = crate::env::get("PONDRA_SECRET_KEY") {
         if k.chars().count() < 16 {
             // (as the admin token's: the key opens what the bucket holds sealed, so whoever reads the bucket can try short ones offline)
-            crate::per_node!(static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("PONDRA_SECRET_KEY is short: it guards the lake's keys and secrets (use 32 random characters or more)");
             }
@@ -1741,10 +1740,10 @@ fn masters() -> Result<Vec<[u8; 32]>> {
 }
 
 /// The master key an admin token makes: PBKDF2 over the token, so a short token can't be guessed
-/// offline from what the bucket holds (the keys sealed by it). Worked out once a node per token.
+/// offline from what the bucket holds (the keys sealed by it). Worked out once a process per token.
 fn admin_key(token: &str) -> [u8; 32] {
-    crate::per_node!(static KEYS: Mutex<HashMap<String, [u8; 32]>> = Mutex::new(HashMap::new()));
-    if let Some(k) = KEYS.lock().unwrap().get(token) {
+    static KEYS: std::sync::LazyLock<Mutex<HashMap<String, [u8; 32]>>> = std::sync::LazyLock::new(Default::default);
+    if let Some(k) = KEYS.lock().unwrap_or_else(|e| e.into_inner()).get(token) {
         return *k;
     }
     if token.chars().count() < 16 {
@@ -1753,7 +1752,7 @@ fn admin_key(token: &str) -> [u8; 32] {
     let mut key = [0u8; 32];
     let rounds = std::num::NonZeroU32::new(100_000).expect("non-zero");
     crate::crypto::pbkdf2_sha256(rounds, b"pondra: the master key from the admin token", token.as_bytes(), &mut key);
-    KEYS.lock().unwrap().insert(token.to_string(), key);
+    KEYS.lock().unwrap_or_else(|e| e.into_inner()).insert(token.to_string(), key);
     key
 }
 
