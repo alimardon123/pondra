@@ -640,6 +640,8 @@ pub trait Holds: Send + Sync {
     fn held(&self) -> u64;
     /// The most it may hold from now on (a query spill disk's cap: `store::spill_room`). Nothing, for one with no cap of its own.
     fn cap(&self, _bytes: u64) {}
+    /// Whether it takes a cap (`cap`): a query spill disk does, a shuffle's pieces and the lakes in memory don't.
+    fn capped(&self) -> bool { false }
 }
 
 // (the process's spill disk, one list of what holds room on it: a shuffle's pieces (`spill::Shuffles`), each lake's query
@@ -930,6 +932,7 @@ mod tests {
         holds(&small);
         let on = |h: &Arc<dyn Holds>| room().iter().any(|(r, n)| Arc::ptr_eq(r, h) && *n == h.held());
         assert!(on(&big) && on(&small), "both are on the list, with what they hold");
+        assert!(!big.capped() && !small.capped(), "they take no cap: with only such on the list (a page's lakes in memory), nothing looks at a disk");
         assert!(room_held() >= (5 << 40) + 7);
         assert!(others_hold(&*small) >= 5 << 40, "the small one sees the big one");
         assert!(others_hold(&*big) < 5 << 40, "the big one doesn't count itself");

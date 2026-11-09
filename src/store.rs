@@ -1718,6 +1718,7 @@ fn gb_bytes(gb: f64) -> u64 { (gb * (1u64 << 30) as f64) as u64 }
 impl crate::ledger::Holds for DiskManager {
     fn held(&self) -> u64 { self.used_disk_space() }
     fn cap(&self, bytes: u64) { let _ = self.set_max_temp_directory_size(bytes); } // (a disabled manager refuses: none is on the list)
+    fn capped(&self) -> bool { true }
 }
 
 /// The cap of one disk manager that holds `used` bytes of spills, given the setting and what shuffles hold
@@ -1738,8 +1739,8 @@ fn room_cap(gb: Option<f64>, used: u64, shuffled: u64, disk: Option<(u64, u64)>)
 /// could take twice it: audit 11-01 M13.)
 fn set_room(gb: Option<f64>) {
     let room = crate::ledger::room();
-    if room.is_empty() {
-        return; // (nothing spilled yet, so nothing to size and no disk to look at: a page never spills to one)
+    if !room.iter().any(|(holder, _)| holder.capped()) {
+        return; // (no query spill disk made yet, so nothing to size and no disk to look at: a page never makes one, though its lakes in memory are on the list)
     }
     let disk = crate::machine::process().space(&crate::scratch::spill_base()); // (the disk the folder is, or would be on: not made here, the first spill makes it)
     let all: u64 = room.iter().map(|(_, held)| held).sum();
@@ -5031,6 +5032,7 @@ mod tests {
         let manager = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![folder.to_path_buf()])).with_max_temp_directory_size(0).build().expect("a disk manager");
         let manager = Arc::new(manager);
         crate::ledger::holds(&(manager.clone() as Arc<dyn crate::ledger::Holds>));
+        assert!(crate::ledger::Holds::capped(&*manager), "a query spill disk takes a cap: with one on the list, the disk is looked at");
         set_room(None);
         let cap = manager.max_temp_directory_size();
         assert!(cap >= manager.used_disk_space() + (1 << 20), "a cap of {cap} with the disk's room");
