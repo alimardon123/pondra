@@ -400,7 +400,7 @@ mod tests {
         assert_eq!(s.stand_ins(), 2);
         static CORE_THINGS: BuiltIn = BuiltIn { name: CORE, requires: &[], register: |r| r.section_mut::<Statements>().add(&CORE_OK) };
         let r = Registry::build(&[&CORE_THINGS, &THINGS]);
-        assert!(matches!(matched_in(&r, "keep /* its words */ core x", |_| true), Some(Stmt::Invalid(e)) if e == "a thing"), "the core's reader gives the statement");
+        assert!(matches!(matched_in(&r, "keep /* its words */ core x"), Some(Stmt::Invalid(e)) if e == "a thing"), "the core's reader gives the statement");
     }
 
     #[test]

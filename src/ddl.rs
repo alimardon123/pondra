@@ -1050,8 +1050,8 @@ pub async fn sync(lake: &Lake, follow: bool) -> Result<()> {
         }
         if crate::undrop::lake_kept(&a.dir, Some(&lake.node.reaches)).await.ok().flatten().is_some() {
             // (a database dropped, kept to be undropped: not one until it is, said once; read with its key, above)
-            let seen = (lake.url.clone(), format!("{key}={} dropped", a.dir));
-            let mut refused = REFUSED.lock().unwrap();
+            let seen = format!("{key}={} dropped", a.dir);
+            let mut refused = ours.refused.lock().unwrap();
             if !refused.contains(&seen) {
                 eprintln!("not attaching {name}: {} was dropped, and is kept to be undropped (UNDROP DATABASE {name})", a.dir);
                 refused.push(seen);
