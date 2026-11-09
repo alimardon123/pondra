@@ -872,7 +872,7 @@ SELECT taxed(100) AS t;
 | Write a topic | `COPY (SELECT …) TO 'kafka://brokers/topic' (FORMAT json, KEY col)` |
 | Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| pondra \| git \| generic, KEY value, …, SCOPE 'url')`; `TYPE pondra, TOKEN '…', SCOPE 'https://…'` is how a lake attached `READ_ONLY` asks its own server's leader to pin a branch; `TYPE git, TOKEN '…', SCOPE 'https://github.com/acme'` is a person's token for [Git folders](/pondra/guides/git/), sent only to the repositories its `SCOPE` covers and never used to read files |
 | A session's own | `CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…)`: in the node's memory for this session only, used before the lake's |
-| Drop a secret | `DROP [TEMPORARY] SECRET [IF EXISTS] name` |
+| Drop a secret | `DROP [TEMPORARY] SECRET [IF EXISTS] name [PURGE]`: kept sealed for 7 days for `UNDROP SECRET name`; `PURGE` keeps nothing and lets go of the copies earlier drops of the name kept, for a key that leaked |
 | Install an extension | `[FORCE] INSTALL name FROM 'path or URL' [VERSION 'v']`: a WebAssembly component, kept in the lake by its SHA-256; `VERSION` must be the one the file says |
 | List and drop extensions | `SHOW EXTENSIONS [LIKE 'pattern']` (or `SELECT * FROM extensions()`), `UNINSTALL [IF EXISTS] name` |
 

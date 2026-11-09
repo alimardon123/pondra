@@ -72,18 +72,16 @@ impl Principal {
 tokio::task_local! {
     /// The principal of the request being served.
     pub static WHO: Principal;
-    /// Set around the node's own work, which no request asked for (`as_node`: a task's tick).
-    static NODE: ();
 }
 
 /// `f` as the node's own work (`Principal::node`): with no principal set, `rights::may` decides what it asks as an admin
 /// token's, and `rights::scope` is whole. Work with neither is refused and sees nothing, so work a request starts and loses
 /// its caller (spawned without `carried`) gets no rights. Each loop of the node's says so where it starts: a spawned task
 /// keeps no task-local (`tools/scope_check.py` counts them).
-pub async fn as_node<F: std::future::Future>(f: F) -> F::Output { NODE.scope((), f).await }
+pub async fn as_node<F: std::future::Future>(f: F) -> F::Output { crate::spawns::as_node(f).await }
 
 /// Is this the node's own work (`as_node`)?
-pub fn node_work() -> bool { NODE.try_with(|_| ()).is_ok() }
+pub fn node_work() -> bool { crate::spawns::node_work() }
 
 /// The principal of the request being served (None: no door set one: this process's own work).
 pub fn current() -> Option<Principal> { WHO.try_with(|p| p.clone()).ok() }
@@ -100,7 +98,7 @@ pub fn holder() -> String { current().map_or_else(|| "node".to_string(), |p| for
 /// same user (its grants) and session. A spawned task keeps no task-local, and with no principal a
 /// started procedure ran with its role's every right, past the user's grants.
 pub fn carried<F: std::future::Future>(f: F) -> impl std::future::Future<Output = F::Output> {
-    let (who, node, session) = (current(), node_work(), crate::temp::here());
+    let Carried { who, node, session } = caller();
     async move {
         let f = crate::temp::SESSION.scope(session, f);
         match who {
@@ -108,6 +106,46 @@ pub fn carried<F: std::future::Future>(f: F) -> impl std::future::Future<Output 
             None if node => as_node(f).await,
             None => f.await,
         }
+    }
+}
+
+/// The request being served, as work it starts and doesn't wait for carries it (`spawns::Tasks::spawn_as`): its
+/// principal, whether it is the node's own work, and its session, as [`carried`] keeps them.
+pub struct Carried {
+    who: Option<Principal>,
+    node: bool,
+    session: Option<crate::temp::Named>,
+}
+
+/// The caller now, to carry into work it starts ([`Carried`]).
+pub fn caller() -> Carried { Carried { who: current(), node: node_work(), session: crate::temp::here() } }
+
+impl crate::spawns::Carry for Carried {
+    fn carry<F: std::future::Future + Send + 'static>(self, f: F) -> impl std::future::Future<Output = F::Output> + Send + 'static
+    where
+        F::Output: Send,
+    {
+        async move {
+            let f = crate::temp::SESSION.scope(self.session, f);
+            match self.who {
+                Some(p) => WHO.scope(p, f).await,
+                None if self.node => as_node(f).await,
+                None => f.await,
+            }
+        }
+    }
+}
+
+/// A door's connection, as a task it starts (`spawns::Tasks::spawn_as`): no principal of its own, since each request
+/// on it sets the one it signed in as (`WHO`), and work outside one sees nothing.
+pub struct Door;
+
+impl crate::spawns::Carry for Door {
+    fn carry<F: std::future::Future + Send + 'static>(self, f: F) -> impl std::future::Future<Output = F::Output> + Send + 'static
+    where
+        F::Output: Send,
+    {
+        f
     }
 }
 
