@@ -600,17 +600,20 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
             }
             ensure!(!lake.attached.read().unwrap().iter().any(|(n, _)| *n == name), "{name} is attached already (--attach, or found beside this lake by the shell)");
             ensure!(full(&dir)? != lake.url, "{dir} is this lake");
-            dropped_here(&full(&dir)?, &name).await?;
             let (dir, created) = match read_only {
                 true => {
                     let dir = full(&dir)?;
                     crate::ext::reach(lake, &dir, true, endpoint.as_deref()).await?; // (its key and its server, before it is opened)
+                    dropped_here(&dir, &name).await?; // (read with that key: this node's own may not reach its bucket)
                     if !has_catalog(&dir).await? {
                         return Err(crate::codes::coded("58P01", format!("{dir} holds no lake: a READ_ONLY attachment reads one that is there")));
                     }
                     (dir, false)
                 }
-                false => lake_dir(&dir, &*lake.node.life).await?,
+                false => {
+                    dropped_here(&full(&dir)?, &name).await?;
+                    lake_dir(&dir, &*lake.node.life).await?
+                }
             };
             lake.cat.commit(vec![(attachment_key(&name), json(&Attachment { dir: dir.clone(), read_only, endpoint }))], &[]).await?;
             Ok(match (created, read_only) {
@@ -1047,8 +1050,14 @@ pub async fn sync(lake: &Lake, follow: bool) -> Result<()> {
             }
             continue;
         }
+        if a.read_only {
+            if let Err(e) = crate::ext::reach(lake, &a.dir, true, a.endpoint.as_deref()).await {
+                eprintln!("attaching {name} ({}): {e:#}", a.dir);
+                continue;
+            }
+        }
         if crate::undrop::lake_kept(&a.dir).await.ok().flatten().is_some() {
-            // (a database dropped, kept to be undropped: not one until it is, said once)
+            // (a database dropped, kept to be undropped: not one until it is, said once; read with its key, above)
             let seen = (lake.url.clone(), format!("{key}={} dropped", a.dir));
             let mut refused = REFUSED.lock().unwrap();
             if !refused.contains(&seen) {
@@ -1056,12 +1065,6 @@ pub async fn sync(lake: &Lake, follow: bool) -> Result<()> {
                 refused.push(seen);
             }
             continue;
-        }
-        if a.read_only {
-            if let Err(e) = crate::ext::reach(lake, &a.dir, true, a.endpoint.as_deref()).await {
-                eprintln!("attaching {name} ({}): {e:#}", a.dir);
-                continue;
-            }
         }
         match attach(lake, name, &a.dir, follow, false).await {
             Ok(_) => FROM_SQL.lock().unwrap().push((lake.url.clone(), name.to_string())),
