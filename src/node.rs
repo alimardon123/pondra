@@ -603,7 +603,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         });
     }
     if lives {
-        store::serving(); // (the catalog's compactor and garbage collector start now: C5)
+        app.lake.node.serving.send_replace(true); // (the catalog's compactor and garbage collector start now: C5)
     }
     crate::oom::start(); // (the memory line: a query that grows the node past it is stopped, not the node: `oom.rs`)
     if lives {

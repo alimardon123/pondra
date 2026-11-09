@@ -544,7 +544,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str, scope: &cra
     let append = meta.key.is_empty();
     ensure!(meta.ids || !append, "{table} was made before Pondra 0.19, and its rows have no row ids, which UPDATE, DELETE and MERGE need: copy it once (CREATE TABLE t2 AS SELECT * FROM {table}) and change the copy");
     // (ADR-067 §7: autocommitted appends to this table land before this change reads it, or after it: never between)
-    let _gate = crate::locks::close(&lake.url, std::slice::from_ref(&table)).await?;
+    let _gate = crate::locks::close(lake, std::slice::from_ref(&table)).await?;
     let upto = lake.visible(); // (one snapshot for every query below: the lock keeps its files)
     let point = match &stmt {
         crate::write::Stmt::Update(_, set, Some(cond)) if !append => crate::txn::point_change(lake, &table, &stored, None, set, cond).await?, // (one key: no planning, ADR-036 §6)

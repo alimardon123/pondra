@@ -2292,7 +2292,6 @@ impl Lake {
 
     /// `open_polled` and `open_on`: a reader's catalog is `given` when one is, else `kv::reader` on the lake's store.
     async fn open_with(url: &str, writer: bool, streamed: bool, poll: Duration, given: Option<Arc<dyn Kv>>, node: Arc<NodeState>) -> Result<Arc<Lake>> {
-        let life = node.life.clone();
         let (url, store, bucket) = open_store(url)?;
         // (what the lake reads and writes, counted into its node's metrics: `Counted`)
         let (store, bucket) = (counted(store, &node.metrics), bucket.map(|(root, whole)| (root, counted(whole, &node.metrics))));
@@ -2326,7 +2325,7 @@ impl Lake {
             Ok::<_, anyhow::Error>(match writer {
                 true => {
                     let t0 = datafusion::common::instant::Instant::now();
-                    let kv = kv::writer(store.clone(), cache_dir, local, life.clone()).await?;
+                    let kv = kv::writer(store.clone(), cache_dir, local, node.clone()).await?;
                     trace_since("the catalog's writer open", t0);
                     Catalog::writer(kv, t0, &node).await?
                 }
@@ -3243,13 +3242,6 @@ pub fn trace_since(what: &str, since: datafusion::common::instant::Instant) {
         eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
     }
 }
-
-crate::per_node!(
-    /// Has the node begun to serve? (Then the catalog's upkeep starts: `kv::slate`.)
-    pub(crate) static SERVING: watch::Sender<bool> = watch::Sender::new(false));
-
-/// The node serves now (`main.rs`).
-pub fn serving() { SERVING.send_replace(true); }
 
 /// DataFusion's caches of Parquet footers and of files' statistics (`Lake::kept`).
 type Footers = datafusion::execution::cache::default_cache::DefaultCache<object_store_df::path::Path, datafusion::execution::cache::cache_manager::CachedFileMetadataEntry>;
@@ -4428,7 +4420,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-closed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
-        let cat = Catalog::writer(kv::writer(store, None, true, crate::lifecycle::unhosted()).await?, Instant::now(), &NodeState::unhosted()).await?;
+        let cat = Catalog::writer(kv::writer(store, None, true, NodeState::unhosted()).await?, Instant::now(), &NodeState::unhosted()).await?;
         let _ = cat.write(vec![("t/a".into(), b"1".to_vec())], &[]).await?;
         cat.close().await?;
         assert!(cat.write(vec![("t/b".into(), b"2".to_vec())], &[]).await.is_err());
@@ -4464,7 +4456,8 @@ mod tests {
         for (dir, life) in dirs.iter().zip(&lives) {
             std::fs::create_dir_all(dir)?;
             let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(dir)?));
-            cats.push(Catalog::writer(kv::writer(store, None, true, life.clone()).await?, Instant::now(), &NodeState::new(life.clone())).await?);
+            let node = NodeState::new(life.clone());
+            cats.push(Catalog::writer(kv::writer(store, None, true, node.clone()).await?, Instant::now(), &node).await?);
         }
         cats[0].kv.close().await?; // (closed under the catalog, as a fence closes it: not by its own node's stop)
         let fenced = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(cats[0].write(vec![("t/a".into(), b"1".to_vec())], &[]))).await;
@@ -4562,7 +4555,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-parsed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
-        let cat = Catalog::writer(kv::writer(store, None, true, crate::lifecycle::unhosted()).await?, Instant::now(), &NodeState::unhosted()).await?;
+        let cat = Catalog::writer(kv::writer(store, None, true, NodeState::unhosted()).await?, Instant::now(), &NodeState::unhosted()).await?;
         let entry = |folder: &str| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&TableMeta { folder: Some(folder.to_string()), ..Default::default() })?)) };
         let raw = entry("x")?;
         let first = cat.parsed("t/a", &raw)?;
@@ -4600,7 +4593,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-segments-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
-        let cat = Catalog::writer(kv::writer(store, None, true, crate::lifecycle::unhosted()).await?, Instant::now(), &NodeState::unhosted()).await?;
+        let cat = Catalog::writer(kv::writer(store, None, true, NodeState::unhosted()).await?, Instant::now(), &NodeState::unhosted()).await?;
         let seg = |n: u64, rows: u64| -> Result<Bytes> {
             let parts = ["pgbench_accounts", "pgbench_tellers", "pgbench_branches", "pgbench_history"].map(|t| (t.to_string(), vec![(n, 300, rows)]));
             Ok(Bytes::from(serde_json::to_vec(&Segment { path: String::new(), parts: parts.into_iter().collect(), ts_ms: n, files: BTreeMap::new() })?))
@@ -4645,7 +4638,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-recent-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir)?);
-        let cat = Catalog::writer(kv::writer(store, None, true, crate::lifecycle::unhosted()).await?, Instant::now(), &NodeState::unhosted()).await?;
+        let cat = Catalog::writer(kv::writer(store, None, true, NodeState::unhosted()).await?, Instant::now(), &NodeState::unhosted()).await?;
         let change = |id: u64, key: String, bytes: &'static [u8]| Frame::Change(Arc::new(Delta { id, puts: vec![(key, Bytes::from_static(bytes))], deletes: vec![] }));
         cat.send(change(1, data_key(1), b"rows"));
         assert_eq!(cat.recent_inline(&data_key(1)).as_deref(), Some(&b"rows"[..]));

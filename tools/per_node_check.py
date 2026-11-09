@@ -132,6 +132,7 @@ PROCESS = {
     "memory_lake.rs:COUNTED": "the counted opens of the lakes in this process's memory, which `held_in_memory` knows as their lake's store: weak both, as long as `MEMORY` holds the lake, and no node's (an open outlives no lake)",
     "terms.rs:RUNG": "what this process heard of claimers on other machines, keyed by the store, the term and its lock: the same for any node here (the CLI's `alive` reads it too); answers older than `RUNG_AGAIN` are let go as one is written",
     "parsed.rs:LAST": "the parses of the last few statements' SQL: a function of the text (a tree kept is its text's parse), the same for any lake here",
+    "panics.rs:RUNNING": "the requests running in this process: its one memory watch stops the one that grew the process's memory, whatever its node (`oom.rs`), and a long one sends the ones after it to the process's queries' runtime",
     "vend.rs:MADE": "each bucket's URL signer, made from the process's environment's credentials (as `from_env` reads them): the same for any lake here",
     "text.rs:TOKENS": "the tokens of the last few statements' SQL: a pure function of the text, the same for any lake here",
     "memory_lake.rs:PROCESS": "the spill disk is the machine's: every lake in memory in this process counts its bytes on disk in one count (a lake that goes gives its bytes back in its drop)",

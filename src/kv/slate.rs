@@ -24,6 +24,7 @@ pub(crate) struct Writer {
     upkeep: Upkeep,
     blocks: [Blocks; 2],
     flush_now: bool, // a local lake's writer: each write's WAL flushed at once (`write`)
+    node: Arc<crate::node_state::NodeState>, // (its `serving` says the upkeep may start: `compact`)
 }
 
 /// A follower's view of the bucket: SlateDB's reader, which follows the manifest and never writes.
@@ -36,7 +37,8 @@ impl Writer {
     /// The catalog as its leader opens it: the bucket's `catalog` database for writing, with its block caches and its
     /// compactor and garbage collector, started once the node serves. `local`: a folder, where each write's WAL is
     /// flushed at once.
-    pub(crate) async fn open(store: Store, cache_dir: Option<PathBuf>, local: bool, life: crate::lifecycle::Life) -> Result<Writer, Error> {
+    pub(crate) async fn open(store: Store, cache_dir: Option<PathBuf>, local: bool, node: Arc<crate::node_state::NodeState>) -> Result<Writer, Error> {
+        let life = node.life.clone();
         // Poll object storage rarely when idle (that's an idle writer's request bill), but often
         // enough that compaction keeps up with the checkpoints. A one-off writer (a guest that leads) lives for
         // its statement, and runs the compactor only when it tidies (`App::tidy_one_off`, a CHECKPOINT), and waits
@@ -71,8 +73,8 @@ impl Writer {
         let flushed = slatedb::BlockCachePolicy::default().with_flush_targets(&[slatedb::CacheTarget::Index, slatedb::CacheTarget::Filters]);
         let (cache, blocks) = caches();
         let db = Db::builder("catalog", store.clone()).with_settings(settings).with_db_cache(cache).with_block_cache_policy(flushed).build().await?;
-        let upkeep = upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local, life);
-        Ok(Writer { db, upkeep, blocks, flush_now: local })
+        let upkeep = upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local, life, node.serving.subscribe());
+        Ok(Writer { db, upkeep, blocks, flush_now: local, node })
     }
 }
 
@@ -139,7 +141,7 @@ impl Kv for Writer {
     }
 
     async fn compact(&self, below: usize, cap: Duration) -> Result<(), Error> {
-        crate::store::serving(); // (the upkeep starts now: `upkeep`)
+        self.node.serving.send_replace(true); // (the upkeep starts now: `upkeep`)
         let deadline = tokio::time::Instant::now() + cap;
         while tokio::time::Instant::now() < deadline {
             self.db.refresh_manifest().await?; // (the compactor's work is in the manifest it wrote)
@@ -265,7 +267,7 @@ impl slatedb::db_cache::DbCache for Blocks {
 /// The catalog's compactor and garbage collector, as SlateDB runs them beside a writer, started
 /// once the node serves (or after 10 s: a `pondra sql` writer never does), so a cold start waits
 /// for neither (C5). A failure in either stops the node, as one in the writer would.
-fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions, local: bool, life: crate::lifecycle::Life) -> Upkeep {
+fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions, local: bool, life: crate::lifecycle::Life, serving: tokio::sync::watch::Receiver<bool>) -> Upkeep {
     let compactor = slatedb::CompactorBuilder::new("catalog", store.clone()).with_options(compactor).build();
     let gc = slatedb::GarbageCollectorBuilder::new("catalog", store.clone()).with_options(gc).build();
     let (c, g, once) = (compactor.clone(), gc.clone(), gc.clone());
@@ -274,7 +276,8 @@ fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions
         Box::pin(async move { gc.run_gc_once().await })
     });
     let started = crate::panics::spawn(async move {
-        let _ = tokio::time::timeout(Duration::from_secs(10), crate::store::SERVING.subscribe().wait_for(|s| *s)).await;
+        let mut serving = serving;
+        let _ = tokio::time::timeout(Duration::from_secs(10), serving.wait_for(|s| *s)).await;
         if local {
             crate::panics::task(unpin(store));
         }

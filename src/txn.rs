@@ -205,7 +205,7 @@ enum State {
 struct Txn {
     id: String,             // (also the owner of its locks on the leader)
     job: Option<String>,    // what names its commit, when a job does (`alone`): sent again, it is a duplicate
-    lake: String,           // the lake's url: where its locks are
+    lake: std::sync::Weak<Lake>, // the lake whose locks are its: a `Weak`, so a transaction keeps no lake alive
     level: Level,
     read_only: bool,
     snapshot: u64,          // the commit a statement reads at (REPEATABLE READ: the one BEGIN saw)
@@ -530,7 +530,7 @@ fn start(app: &crate::app::App, s: &str, level: Level, read_only: bool, job: Opt
     }
     let id = uuid::Uuid::new_v4().simple().to_string(); // (fresh each time: a leader refuses locks to an id that ended)
     let txn = Txn {
-        id, job, lake: app.lake.url.clone(), level, read_only, snapshot: app.lake.visible(), ran: false, leader: leader_of(app), protocol,
+        id, job, lake: Arc::downgrade(&app.lake), level, read_only, snapshot: app.lake.visible(), ran: false, leader: leader_of(app), protocol,
         locked: false, state: State::Open, tables: BTreeMap::new(), by_key: BTreeMap::new(), reads: BTreeMap::new(), marks: vec![], failed: None,
         used: Instant::now(), busy: 0, next: -1,
     };
@@ -1115,7 +1115,7 @@ pub async fn statement(app: &crate::app::App, stmt: &Stmt, files: bool, scope: &
 pub async fn autocommit(app: &crate::app::App, stmt: &Stmt, job: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let owner = format!("auto-{}", uuid::Uuid::new_v4().simple());
     let taken = AtomicBool::new(false);
-    let mut hold = Hold::new((app.lake.url.clone(), leader_of(app), owner.clone()));
+    let mut hold = Hold::new((Arc::downgrade(&app.lake), leader_of(app), owner.clone()));
     let out = autocommit_as(app, stmt, job, &owner, &taken, &mut hold, scope).await;
     // (after its append's answer, or its refusal: its locks go only if it took any, and a dropped statement's went on the drop)
     hold.finish(taken.load(Ordering::SeqCst));
@@ -1768,12 +1768,12 @@ pub async fn commit_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio:
     let out = {
         let _guard = lock.lock().await;
         // (ADR-067 §7: autocommitted appends to these tables land before this commit reads them, or after it: never between)
-        match crate::locks::close(&lake.url, &tables).await {
+        match crate::locks::close(lake, &tables).await {
             Ok(_gate) => write_changes(lake, seq, c).await,
             Err(e) => Err(e),
         }
     };
-    crate::locks::release(&lake.url, &id); // (the transaction is over here, and its locks with it: ADR-067 §4)
+    crate::locks::release(lake, &id); // (the transaction is over here, and its locks with it: ADR-067 §4)
     out
 }
 
@@ -2169,7 +2169,7 @@ mod tests {
     fn two_nodes_keep_their_transactions_apart() {
         let (a, b) = (std::sync::Arc::new(crate::temp::Sessions::default()), std::sync::Arc::new(crate::temp::Sessions::default()));
         let txn = || Txn {
-            id: "t".into(), job: None, lake: "a".into(), level: Level::Committed, read_only: false, snapshot: 0, ran: false, leader: None,
+            id: "t".into(), job: None, lake: std::sync::Weak::new(), level: Level::Committed, read_only: false, snapshot: 0, ran: false, leader: None,
             protocol: false, locked: false, state: State::Open, tables: BTreeMap::new(), by_key: BTreeMap::new(), reads: BTreeMap::new(),
             marks: vec![], failed: None, used: Instant::now(), busy: 0, next: -1,
         };

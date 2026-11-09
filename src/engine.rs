@@ -125,6 +125,7 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add::<crate::ddl::Attached>();
             states.add::<crate::audit::Audit>();
             states.add::<crate::constraints::ChangeLock>();
+            states.add::<crate::locks::Tables>();
             states.add::<crate::serve::PointPlans>();
             states.add::<crate::serve::TailKeys>();
             states.add::<crate::query::PlanFacts>();

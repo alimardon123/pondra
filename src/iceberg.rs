@@ -1028,7 +1028,7 @@ pub async fn record(lake: &Lake, seq: &crate::log::Sequencer, commits: Vec<Commi
         }
     }
     let taken: Vec<String> = todo.iter().filter(|c| !c.removed.is_empty() || !c.deleted.is_empty() || !c.deletes.is_empty() || !c.equality.is_empty()).map(|c| c.table.clone()).collect();
-    let _gate = crate::locks::close(&lake.url, &taken).await?; // (rows and files it takes out: no autocommitted write lands in them meanwhile, ADR-067 §7)
+    let _gate = crate::locks::close(lake, &taken).await?; // (rows and files it takes out: no autocommitted write lands in them meanwhile, ADR-067 §7)
     if let Some(c) = todo.iter().find(|c| c.rows.is_some()) {
         anyhow::ensure!(todo.len() == 1, "{REFUSED}: a transaction with keyed table {}: its changes go through the log, a table at a time", c.table);
         check(lake, c).await?;

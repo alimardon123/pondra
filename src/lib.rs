@@ -312,6 +312,10 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &udf::UDF,
         #[cfg(feature = "lake")]
         &pyfn::PYTHON,
+        #[cfg(feature = "lake")]
+        &extension::EXT_HOST,
+        #[cfg(feature = "doors")]
+        &flight::FLIGHT,
     ];
     BUILT_IN
 }

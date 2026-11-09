@@ -81,10 +81,10 @@ impl Need {
     }
 }
 
-/// Whether this node offers `need`.
-fn offered(need: Need) -> bool {
+/// Whether the lake's node offers `need`: a port to listen on is its own, once it serves (`NodeState::serving`).
+fn offered(lake: &Lake, need: Need) -> bool {
     match need {
-        Need::Listening => *crate::store::SERVING.borrow(),
+        Need::Listening => *lake.node.serving.borrow(),
         Need::Network => true,
     }
 }
@@ -120,16 +120,13 @@ impl Statements {
 /// `sql` as one of the extensions' statements, for `write::parse`: what the leader carries out, or why it is refused.
 /// None: it is none of theirs.
 pub(crate) fn matched(sql: &str) -> Option<crate::write::Stmt> {
-    matched_in(crate::registry::get(), sql, offered)
+    matched_in(crate::registry::get(), sql)
 }
 
-fn matched_in(r: &Registry, sql: &str, offered: fn(Need) -> bool) -> Option<crate::write::Stmt> {
+fn matched_in(r: &Registry, sql: &str) -> Option<crate::write::Stmt> {
     use crate::write::Stmt;
     let s = r.find::<Statements>()?.of(sql)?;
     let words = s.words.join(" ");
-    if let Some(need) = s.needs.iter().find(|n| !offered(**n)) {
-        return Some(Stmt::Refused("0A000", format!("{words} needs {}", need.word())));
-    }
     Some(match (s.parse)(sql) {
         Ok(Parsed { object, tree }) => match s.run {
             Run::Leader(_) => Stmt::Ddl(vec![crate::ddl::Ddl::Entry { words, object, tree }]),
@@ -146,6 +143,10 @@ pub(crate) async fn carry_out(lake: &Lake, words: &str, tree: Value) -> Result<V
 async fn carry_out_in(r: &Registry, lake: &Lake, words: &str, tree: Value) -> Result<Value> {
     // (a node of another build sent it: its extensions aren't all this one's)
     let s = r.find::<Statements>().and_then(|s| s.named(words)).with_context(|| format!("{words}: this node's build has no extension that adds it"))?;
+    // (the leader's lake's node: a statement that needs a port is refused where the node that would serve it is)
+    if let Some(need) = s.needs.iter().find(|n| !offered(lake, **n)) {
+        return Err(crate::codes::coded("0A000", format!("{words} needs {}", need.word())));
+    }
     match s.run {
         Run::Leader(f) => f(lake, tree).await,
     }
@@ -193,14 +194,13 @@ mod tests {
     #[tokio::test]
     async fn an_extensions_statement_is_found_by_its_words_and_carried_out() -> Result<()> {
         let r = Registry::build(&[&THINGS]);
-        let every = |_: Need| true;
-        let (words, object, tree) = entry(matched_in(&r, "/* a */ make thing Box;", every)).context("found")?;
+        let (words, object, tree) = entry(matched_in(&r, "/* a */ make thing Box;")).context("found")?;
         assert_eq!((words.as_str(), object.as_str()), ("MAKE THING", "box"));
-        let (words, ..) = entry(matched_in(&r, "-- the longer words win\nMAKE BIG THING crate", every)).context("found")?;
+        let (words, ..) = entry(matched_in(&r, "-- the longer words win\nMAKE BIG THING crate")).context("found")?;
         assert_eq!(words, "MAKE BIG THING");
-        assert!(matched_in(&r, "MAKE THINGS x", every).is_none(), "a word is whole");
-        assert!(matched_in(&r, "SELECT 1", every).is_none());
-        assert!(matches!(matched_in(&r, "MAKE THING", every), Some(Stmt::Invalid(e)) if e == "MAKE THING name"), "its parser's refusal is the answer");
+        assert!(matched_in(&r, "MAKE THINGS x").is_none(), "a word is whole");
+        assert!(matched_in(&r, "SELECT 1").is_none());
+        assert!(matches!(matched_in(&r, "MAKE THING"), Some(Stmt::Invalid(e)) if e == "MAKE THING name"), "its parser's refusal is the answer");
         let url = format!("memory://statements-{}", uuid::Uuid::new_v4().simple());
         let lake = Lake::open(&url, true, false, crate::node_state::NodeState::unhosted()).await?;
         assert_eq!(carry_out_in(&r, &lake, &words, tree).await?, json!({"made": "box", "big": false}));
@@ -209,15 +209,17 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn a_form_without_a_statements_need_refuses_it_by_name() {
+    #[tokio::test]
+    async fn a_statement_that_needs_a_port_is_refused_where_the_lake_has_none() -> Result<()> {
         let r = Registry::build(&[&THINGS]);
-        let page = |n: Need| n == Need::Network;
-        match matched_in(&r, "SERVE THING x", page) {
-            Some(Stmt::Refused("0A000", e)) => assert!(e.starts_with("SERVE THING needs a port to listen on, which this node doesn't have"), "{e}"),
-            _ => panic!("refused"),
-        }
-        assert!(entry(matched_in(&r, "MAKE THING x", page)).is_some(), "a statement that needs nothing runs on every form");
+        let (words, _, tree) = entry(matched_in(&r, "SERVE THING x")).context("found")?;
+        let url = format!("memory://statements-{}", uuid::Uuid::new_v4().simple());
+        let lake = Lake::open(&url, true, false, crate::node_state::NodeState::unhosted()).await?;
+        let e = carry_out_in(&r, &lake, &words, tree.clone()).await.unwrap_err();
+        assert!(e.to_string().starts_with("SERVE THING needs a port to listen on, which this node doesn't have"), "{e}");
+        lake.node.serving.send_replace(true);
+        assert_eq!(carry_out_in(&r, &lake, &words, tree).await?, json!({"made": "x", "big": false}));
+        Ok(())
     }
 
     #[test]

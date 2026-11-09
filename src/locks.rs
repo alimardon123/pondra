@@ -314,7 +314,16 @@ impl Table {
 
 // ---------------------------------------------------------------- the lakes' tables
 
-crate::per_node!(static TABLES: Mutex<HashMap<String, Arc<Mutex<Table>>>> = Default::default());
+/// A lake's row locks: its leader's table, one per lake (`table`). A lake that goes takes its locks with it.
+pub struct Tables(Arc<Mutex<Table>>);
+
+impl crate::lake_state::LakeState for Tables {
+    const NAME: &'static str = "row_locks";
+    const ABOUT: &'static str = "the row locks the lake's leader holds, by owner, each with its lease";
+    fn make() -> Self {
+        Tables(Arc::new(Mutex::new(Table::new(lease()))))
+    }
+}
 
 /// How long a holder's lock lasts without a request from it (`PONDRA_LOCK_LEASE_SECS`, 60). A transaction
 /// renews its locks every third of it (`txn::upkeep`), so an idle session keeps them while it lives.
@@ -322,26 +331,25 @@ pub fn lease() -> Duration {
     crate::env::secs("PONDRA_LOCK_LEASE_SECS")
 }
 
-fn table(lake: &str) -> Arc<Mutex<Table>> {
-    TABLES.lock().unwrap().entry(lake.to_string()).or_insert_with(|| Arc::new(Mutex::new(Table::new(lease())))).clone()
+fn table(lake: &Lake) -> Result<Arc<Mutex<Table>>> {
+    Ok(lake.state::<Tables>()?.0.clone())
 }
 
 /// The locks a lake's leader holds now (lapsed ones dropped first): `/stats`' `row_locks`.
-pub fn count(url: &str) -> usize {
-    let t = TABLES.lock().unwrap().get(url).cloned();
-    t.map_or(0, |t| {
+pub fn count(lake: &Lake) -> usize {
+    table(lake).map_or(0, |t| {
         let mut t = t.lock().unwrap();
         t.sweep(Instant::now());
         t.locks.len()
     })
 }
 
-/// Takes `keys` for `owner` on the lake at `lake` (its url), waiting at most `wait` for each (None:
+/// Takes `keys` for `owner` on `lake`, waiting at most `wait` for each (None:
 /// as long as it takes; zero: NOWAIT, a held key is refused at once). Keys are taken in order, so
 /// writers taking the same keys don't cross. With `flight` (an autocommitted write's table), the owner
 /// then registers as appending to it (`Table::enter`): the writers that close the table wait for its append.
-pub async fn take(node: &NodeState, lake: &str, owner: &str, keys: &[String], wait: Option<Duration>, flight: Option<&str>) -> Result<()> {
-    let t = table(lake);
+pub async fn take(node: &NodeState, lake: &Lake, owner: &str, keys: &[String], wait: Option<Duration>, flight: Option<&str>) -> Result<()> {
+    let t = table(lake)?;
     let mut keys = keys.to_vec();
     keys.sort();
     keys.dedup();
@@ -400,11 +408,10 @@ async fn enter(node: &NodeState, t: &Arc<Mutex<Table>>, owner: &str, table: &str
     }
 }
 
-/// Moves the leases of what each of `owners` holds on the lake at `url` (`Table::renew`): what an
-/// asking would do for them, from a session that is idle in its transaction.
-pub fn renew(url: &str, owners: &[String]) {
-    let t = TABLES.lock().unwrap().get(url).cloned();
-    if let Some(t) = t {
+/// Moves the leases of what each of `owners` holds on `lake` (`Table::renew`): what an asking would do for them, from
+/// a session that is idle in its transaction.
+pub fn renew(lake: &Lake, owners: &[String]) {
+    if let Ok(t) = table(lake) {
         let now = Instant::now();
         let mut t = t.lock().unwrap();
         owners.iter().for_each(|o| t.renew(o, now));
@@ -461,10 +468,9 @@ async fn wait_for(node: &NodeState, t: &Arc<Mutex<Table>>, owner: &str, key: &st
     }
 }
 
-/// Lets go of every lock `owner` holds on the lake (`url`), and of its place in any queue.
-pub fn release(url: &str, owner: &str) {
-    let t = TABLES.lock().unwrap().get(url).cloned();
-    if let Some(t) = t {
+/// Lets go of every lock `owner` holds on `lake`, and of its place in any queue.
+pub fn release(lake: &Lake, owner: &str) {
+    if let Ok(t) = table(lake) {
         t.lock().unwrap().release(owner, Instant::now());
     }
 }
@@ -519,11 +525,11 @@ impl Req {
 /// the requester waits for before it reads the rows it locked.
 pub async fn serve(lake: &Lake, r: Req) -> Result<u64> {
     if r.release {
-        release(&lake.url, &r.owner);
+        release(lake, &r.owner);
     } else if r.renew {
-        renew(&lake.url, &r.owners);
+        renew(lake, &r.owners);
     } else {
-        take(&lake.node, &lake.url, &r.owner, &r.keys, r.wait_ms.map(Duration::from_millis), r.flight.as_deref()).await?;
+        take(&lake.node, lake, &r.owner, &r.keys, r.wait_ms.map(Duration::from_millis), r.flight.as_deref()).await?;
     }
     Ok(lake.visible())
 }
@@ -601,8 +607,9 @@ async fn send(node: &NodeState, addr: &str, r: &Req) -> Result<u64> {
 /// node that is gone calls no one, and the leases end its locks).
 pub type Leader = (String, Weak<NodeState>);
 
-/// A transaction's or a statement's place on the leader: its lake's url, its leader (None: this node), and its owner.
-pub type Place = (String, Option<Leader>, String);
+/// A transaction's or a statement's place on the leader: its lake (a `Weak`: a lake that is gone has no locks to let go), its
+/// leader (None: this node), and its owner.
+pub type Place = (Weak<Lake>, Option<Leader>, String);
 
 /// What a write takes its locks as (`passes`): its owner (a transaction's id, or an autocommitted write's), and the
 /// settings it was asked with. `txn`: a transaction's (its COMMIT or ROLLBACK lets the locks go); else an autocommitted
@@ -680,7 +687,7 @@ where
 /// appending to that table, in the same request.
 pub async fn take_on(app: &crate::app::App, owner: &str, resources: &[String], wait: Option<Duration>, flight: Option<&str>) -> Result<u64> {
     if app.seq.is_some() {
-        take(&app.lake.node, &app.lake.url, owner, resources, wait, flight).await?;
+        take(&app.lake.node, &app.lake, owner, resources, wait, flight).await?;
         return Ok(app.lake.visible());
     }
     let at = ask(&app.lake.node, &app.members.leader().addr, &Req::take(owner, resources, wait, flight)).await?;
@@ -731,7 +738,11 @@ pub fn resources(table: &str, keys: &[Vec<String>]) -> Vec<String> {
 /// covers a request that never arrives: ADR-067 §4). Its leader refuses a request from the owner that comes later.
 pub fn release_place((lake, leader, owner): Place) {
     match leader {
-        None => release(&lake, &owner),
+        None => {
+            if let Some(lake) = lake.upgrade() {
+                release(&lake, &owner);
+            }
+        }
         Some(leader) => tell(leader, Req::let_go(&owner)),
     }
 }
@@ -748,18 +759,23 @@ fn tell((addr, from): Leader, req: Req) {
 /// Renews the leases of the transactions that hold locks: here for a lake this node leads, else one request to its leader
 /// carrying all of that leader's (`Req::renewal`), sent by a node of that lake that is still here.
 pub fn renew_places(holding: Vec<Place>) {
-    let mut by_place: BTreeMap<(String, Option<String>), (Weak<NodeState>, Vec<String>)> = BTreeMap::new();
+    let mut by_place: BTreeMap<(String, Option<String>), (Weak<NodeState>, Weak<Lake>, Vec<String>)> = BTreeMap::new();
     for (lake, leader, id) in holding {
+        let Some(l) = lake.upgrade() else { continue }; // (its lake is gone: its locks went with it)
         let (addr, from) = leader.map_or((None, Weak::new()), |(a, from)| (Some(a), from));
-        let place = by_place.entry((lake, addr)).or_default();
+        let place = by_place.entry((l.url.clone(), addr)).or_insert_with(|| (Weak::new(), lake.clone(), vec![]));
         if place.0.strong_count() == 0 {
             place.0 = from;
         }
-        place.1.push(id);
+        place.2.push(id);
     }
-    for ((lake, leader), (from, owners)) in by_place {
+    for ((_, leader), (from, lake, owners)) in by_place {
         match leader {
-            None => renew(&lake, &owners),
+            None => {
+                if let Some(lake) = lake.upgrade() {
+                    renew(&lake, &owners);
+                }
+            }
             Some(addr) => tell((addr, from), Req::renewal(owners)),
         }
     }
@@ -843,8 +859,8 @@ static NO_GATE: LazyLock<bool> = LazyLock::new(|| crate::env::is_set("PONDRA_TES
 /// the gate until the commit is made: dropping it opens the tables again. An appender whose lease lapses (60 s) no longer
 /// holds the gate. The wait is `GATE_WAIT` at most: the closer holds the lake's lock meanwhile, and an append whose answer
 /// was lost keeps its table busy to its lease, so past that the writer is refused (40001) and the lake goes on.
-pub async fn close(url: &str, tables: &[String]) -> Result<Gate> {
-    let t = table(url);
+pub async fn close(lake: &Lake, tables: &[String]) -> Result<Gate> {
+    let t = table(lake)?;
     if *NO_GATE {
         return Ok(Gate { t, tables: vec![] });
     }
@@ -1024,7 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn nowait_refuses_a_held_key_at_once() {
-        let lake = format!("test-locks-{}", uuid::Uuid::new_v4());
+        let lake = Lake::open(&format!("memory://test-locks-{}", uuid::Uuid::new_v4()), true, false, NodeState::unhosted()).await.expect("a lake");
         take(&crate::node_state::NodeState::unhosted(), &lake, "A", &["k".to_string()], None, None).await.expect("A takes k");
         let t0 = Instant::now();
         let err = take(&crate::node_state::NodeState::unhosted(), &lake, "B", &["k".to_string()], Some(Duration::ZERO), None).await.expect_err("B is refused, not waited for");
@@ -1037,7 +1053,7 @@ mod tests {
 
     #[tokio::test]
     async fn take_waits_for_the_holder_and_times_out_with_55p03() {
-        let lake = format!("test-locks-{}", uuid::Uuid::new_v4());
+        let lake = Lake::open(&format!("memory://test-locks-{}", uuid::Uuid::new_v4()), true, false, NodeState::unhosted()).await.expect("a lake");
         take(&crate::node_state::NodeState::unhosted(), &lake, "A", &["k".to_string()], None, None).await.expect("A takes k");
         let err = take(&crate::node_state::NodeState::unhosted(), &lake, "B", &["k".to_string()], Some(Duration::from_millis(120)), None).await.expect_err("B times out");
         assert_eq!(crate::codes::of(&err), "55P03");
@@ -1053,7 +1069,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_waiter_whose_future_is_dropped_leaves_the_queue() {
-        let lake = format!("test-locks-{}", uuid::Uuid::new_v4());
+        let lake = Lake::open(&format!("memory://test-locks-{}", uuid::Uuid::new_v4()), true, false, NodeState::unhosted()).await.expect("a lake");
         take(&crate::node_state::NodeState::unhosted(), &lake, "A", &["k".to_string()], None, None).await.expect("A takes k");
         let gone = tokio::spawn({
             let lake = lake.clone();
@@ -1107,7 +1123,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_closer_waits_for_the_appends_in_flight() {
-        let lake = format!("test-locks-{}", uuid::Uuid::new_v4());
+        let lake = Lake::open(&format!("memory://test-locks-{}", uuid::Uuid::new_v4()), true, false, NodeState::unhosted()).await.expect("a lake");
         take(&crate::node_state::NodeState::unhosted(), &lake, "A", &[], None, Some("x")).await.expect("A is appending to x");
         let closer = tokio::spawn({
             let lake = lake.clone();
@@ -1122,7 +1138,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_appender_waits_at_the_gate_until_it_is_dropped() {
-        let lake = format!("test-locks-{}", uuid::Uuid::new_v4());
+        let lake = Lake::open(&format!("memory://test-locks-{}", uuid::Uuid::new_v4()), true, false, NodeState::unhosted()).await.expect("a lake");
         let gate = close(&lake, &["x".to_string()]).await.expect("no appender: the gate is closed at once");
         let waiting = tokio::spawn({
             let lake = lake.clone();
@@ -1163,18 +1179,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_dropped_before_its_append_lets_its_locks_go() {
-        let lake = format!("test-locks-{}", uuid::Uuid::new_v4());
+        let lake = Lake::open(&format!("memory://test-locks-{}", uuid::Uuid::new_v4()), true, false, NodeState::unhosted()).await.expect("a lake");
         take(&crate::node_state::NodeState::unhosted(), &lake, "A", &["k".to_string()], None, None).await.expect("A takes k");
-        drop(Hold::new((lake.clone(), None, "A".to_string()))); // (its statement failed before the append was sent)
+        drop(Hold::new((Arc::downgrade(&lake), None, "A".to_string()))); // (its statement failed before the append was sent)
         take(&crate::node_state::NodeState::unhosted(), &lake, "B", &["k".to_string()], Some(Duration::ZERO), None).await.expect("B takes k at once: A's locks went with its drop");
         release(&lake, "B");
     }
 
     #[tokio::test]
     async fn a_sent_append_keeps_its_locks_until_its_answer() {
-        let lake = format!("test-locks-{}", uuid::Uuid::new_v4());
+        let lake = Lake::open(&format!("memory://test-locks-{}", uuid::Uuid::new_v4()), true, false, NodeState::unhosted()).await.expect("a lake");
         take(&crate::node_state::NodeState::unhosted(), &lake, "A", &["k".to_string()], None, None).await.expect("A takes k");
-        let mut hold = Hold::new((lake.clone(), None, "A".to_string()));
+        let mut hold = Hold::new((Arc::downgrade(&lake), None, "A".to_string()));
         hold.sending();
         let refused = take(&crate::node_state::NodeState::unhosted(), &lake, "B", &["k".to_string()], Some(Duration::ZERO), None).await.expect_err("B is refused: A's append may still land");
         assert_eq!(crate::codes::of(&refused), "55P03");
@@ -1185,9 +1201,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_append_whose_answer_was_lost_keeps_its_locks_to_the_lease() {
-        let lake = format!("test-locks-{}", uuid::Uuid::new_v4());
+        let lake = Lake::open(&format!("memory://test-locks-{}", uuid::Uuid::new_v4()), true, false, NodeState::unhosted()).await.expect("a lake");
         take(&crate::node_state::NodeState::unhosted(), &lake, "A", &["k".to_string()], None, Some("x")).await.expect("A takes k, appending to x");
-        let mut hold = Hold::new((lake.clone(), None, "A".to_string()));
+        let mut hold = Hold::new((Arc::downgrade(&lake), None, "A".to_string()));
         hold.sending();
         hold.lost(); // (the request failed in transit: the leader may still commit it)
         hold.finish(true);
@@ -1200,7 +1216,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!closer.is_finished(), "a closer waits for A's lost append too, while its lease lasts");
         // (the lease's end: nothing renews A's locks once `finish` has run, so its lease lapses and both let go)
-        table(&lake).lock().unwrap().leases.insert("A".to_string(), Instant::now());
+        table(&lake).expect("its table").lock().unwrap().leases.insert("A".to_string(), Instant::now());
         drop(closer.await.expect("the task").expect("the gate"));
         take(&crate::node_state::NodeState::unhosted(), &lake, "B", &["k".to_string()], Some(Duration::ZERO), None).await.expect("B takes k once A's lease lapsed");
         release(&lake, "B");

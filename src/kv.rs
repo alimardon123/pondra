@@ -16,8 +16,8 @@ pub(crate) mod remote;
 
 /// The catalog's store as its leader opens it: SlateDB's writer on a node.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) async fn writer(store: crate::store::Store, cache_dir: Option<std::path::PathBuf>, local: bool, life: crate::lifecycle::Life) -> Result<Arc<dyn Kv>, Error> {
-    Ok(Arc::new(slate::Writer::open(store, cache_dir, local, life).await?))
+pub(crate) async fn writer(store: crate::store::Store, cache_dir: Option<std::path::PathBuf>, local: bool, node: Arc<crate::node_state::NodeState>) -> Result<Arc<dyn Kv>, Error> {
+    Ok(Arc::new(slate::Writer::open(store, cache_dir, local, node).await?))
 }
 
 /// The catalog's store as a follower or a reader opens it: SlateDB's reader on a node.
@@ -28,7 +28,7 @@ pub(crate) async fn reader(store: crate::store::Store, streamed: bool, cache_dir
 
 /// The catalog's store as its leader opens it on a page: a `page::Log` in the lake's own store (designs/page-same-core.md P2).
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn writer(store: crate::store::Store, _: Option<std::path::PathBuf>, _: bool, _: crate::lifecycle::Life) -> Result<Arc<dyn Kv>, Error> {
+pub(crate) async fn writer(store: crate::store::Store, _: Option<std::path::PathBuf>, _: bool, _: Arc<crate::node_state::NodeState>) -> Result<Arc<dyn Kv>, Error> {
     Ok(Arc::new(page::Log::writer(store).await?))
 }
 

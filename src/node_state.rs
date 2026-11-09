@@ -45,6 +45,9 @@ pub struct NodeState {
     pub claims: Arc<Claims>,
     /// Its doors take tokens (`auth::Auth::on`): then nothing it serves is open, attached lakes included (`users::across`).
     pub tokens: std::sync::atomic::AtomicBool,
+    /// Has it begun to serve (`node::serve`): then its lakes' catalog upkeep starts (`kv::slate`), and a statement that needs a
+    /// port to listen on is offered (`statements`).
+    pub serving: tokio::sync::watch::Sender<bool>,
     /// When its start began: what `PONDRA_TRACE_START`'s times count from (`trace`).
     began: datafusion::common::instant::Instant,
 }
@@ -66,7 +69,7 @@ impl NodeState {
     fn make(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values) -> Arc<NodeState> { NodeState::made(life, machine, settings, Default::default()) }
 
     fn made(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values, claims: Arc<Claims>) -> Arc<NodeState> {
-        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, tokens: Default::default(), began: datafusion::common::instant::Instant::now() })
+        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, tokens: Default::default(), serving: tokio::sync::watch::Sender::new(false), began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).
