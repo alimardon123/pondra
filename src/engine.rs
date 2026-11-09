@@ -125,6 +125,8 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         }
         #[cfg(feature = "lake")]
         r.section_mut::<crate::records::Rights>().add(crate::users::RIGHTS);
+        #[cfg(feature = "lake")] // (what the log's commits call: a view's rows, derived as its sources' are packed)
+        r.section_mut::<crate::log::CommitHooks>().add(crate::views::hook());
     },
 };
 
