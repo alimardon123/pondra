@@ -19,6 +19,8 @@ pub static KAFKA: crate::registry::BuiltIn = crate::registry::BuiltIn {
     register: |r| {
         r.section_mut::<crate::connections::ConnectionTypes>().add(&TOPICS);
         r.section_mut::<crate::records::Prefixes>().add(crate::feeds::PREFIXES);
+        #[cfg(feature = "doors")] // (the lake's own Kafka door: its consumer groups read the log, `pins`)
+        r.section_mut::<crate::pins::Pins>().add(crate::kafka::readers());
     },
 };
 

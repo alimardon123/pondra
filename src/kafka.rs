@@ -1565,6 +1565,32 @@ fn leave_group(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
 
 fn offsets_key(group: &str, topic: &str) -> String { format!("kafka-group:{group}:{topic}") }
 
+/// The consumer groups as readers of the log (`pins`): a group behind keeps the segments with its topic's records it
+/// hasn't read, up to `PONDRA_KAFKA_GROUP_DAYS` old, so a consumer that stops and comes back reads every record it
+/// missed. Older ones go with retention, as Kafka's would (`fetch` then starts at the oldest segment kept).
+pub fn readers() -> crate::pins::Pin {
+    crate::pins::Pin { name: "consumer groups", held: |_| Box::pin(async { Ok(None) }), lapse: None, sweep: None, floor: Some(|l, f| Box::pin(groups_floor(l, f))) }
+}
+
+async fn groups_floor(lake: &crate::store::Lake, mut floor: u64) -> Result<u64> {
+    let days: u64 = crate::env::value("PONDRA_KAFKA_GROUP_DAYS");
+    let since = crate::log::now_ms().saturating_sub(days.saturating_mul(86_400_000));
+    let from = crate::store::producer_key("kafka-group:"); // (every group's marks: `offsets_key`)
+    for (key, next) in lake.cat.scan::<u64>(&from, &crate::store::producer_key("kafka-group;")).await? {
+        let Some((_, topic)) = key[from.len()..].rsplit_once(':') else { continue };
+        // (the mark is the committed offset, the next record's, plus one: its segment and what follows are unread)
+        let done = (next.saturating_sub(1) >> crate::log::ORD_BITS).saturating_sub(1);
+        if done >= floor {
+            continue;
+        }
+        let segments = lake.cat.segments(&seg_key(done + 1), &seg_key(floor + 1)).await?;
+        if let Some((k, _)) = segments.iter().find(|(_, s)| s.ts_ms >= since && s.rows_of(topic) > 0) {
+            floor = floor.min(k[2..].parse::<u64>()?.saturating_sub(1));
+        }
+    }
+    Ok(floor)
+}
+
 /// Committed offsets become a producer's progress: an empty append that only moves its seq
 /// (so a commit never moves an offset back).
 async fn offset_commit(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
