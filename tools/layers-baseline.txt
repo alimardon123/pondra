@@ -235,11 +235,7 @@ sso_flow -> crypto  2
 sso_flow -> tls  1
 statement -> pg_catalog  1
 statement -> python  1
-store -> ddl  1
-store -> rules  1
-store -> types  1
 store -> wasm32  15
-store -> write  1
 store_wire -> store  1
 terms -> wasm32  1
 text -> pg_json_make  1

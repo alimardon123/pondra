@@ -30,11 +30,13 @@ struct Gate {
     answered: AtomicU64, // when the store last answered, but for a server error (ms): `answered`
     most: usize,
     peak: AtomicUsize, // the most turns out at once so far (`/metrics`)
+    said: AtomicU64,     // when a slow request was last named on stderr (ms: `slow`)
+    unsaid: AtomicUsize, // slow requests since, not named
 }
 
 impl Gate {
     fn new(start: usize) -> Gate {
-        Gate { turns: Semaphore::new(start), cap: AtomicUsize::new(start), owed: AtomicUsize::new(0), calm: AtomicUsize::new(0), shrunk: AtomicU64::new(0), answered: AtomicU64::new(0), most: start * 4, peak: AtomicUsize::new(0) }
+        Gate { turns: Semaphore::new(start), cap: AtomicUsize::new(start), owed: AtomicUsize::new(0), calm: AtomicUsize::new(0), shrunk: AtomicU64::new(0), answered: AtomicU64::new(0), most: start * 4, peak: AtomicUsize::new(0), said: AtomicU64::new(0), unsaid: AtomicUsize::new(0) }
     }
 
     /// Wait for a turn.
@@ -85,12 +87,45 @@ impl Gate {
         }
     }
 
+    /// A request that took `SLOW` or longer, its retries apart, named on stderr: one a second at most, with how many
+    /// more there were since. A write's ack waits for its commit's request (`Lake::commits`), so this is what a stall
+    /// of the writes is told by: the soak's 12.9 s with no node moved (11-09) left nothing to say which request it was.
+    fn slow(&self, root: &str, method: &str, path: &str, took: std::time::Duration, answer: &Result<HttpResponse, HttpError>, now: u64) {
+        if took < SLOW {
+            return;
+        }
+        let last = self.said.load(Relaxed);
+        if now.saturating_sub(last) < 1000 || self.said.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+            self.unsaid.fetch_add(1, Relaxed);
+            return;
+        }
+        let more = match self.unsaid.swap(0, Relaxed) {
+            0 => String::new(),
+            n => format!("; {n} more since"),
+        };
+        let how = match answer {
+            Ok(r) => r.status().as_u16().to_string(),
+            Err(e) => format!("no answer: {e}"),
+        };
+        eprintln!("a bucket request took {:.1} s: {method} {} ({how}{more})", took.as_secs_f64(), key(root, path));
+    }
+
     /// A turn handed back: kept, or taken back if owed.
     fn hand_back(&self, turn: tokio::sync::SemaphorePermit<'_>) {
         if self.owed.try_update(Relaxed, Relaxed, |o| o.checked_sub(1)).is_ok() {
             turn.forget();
         }
     }
+}
+
+/// How long a request may take before it is named (`Gate::slow`): ten times a commit's usual round trip to R2.
+const SLOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A request's object as the lake names it: its path, without the bucket's name a path-style request starts with.
+fn key<'a>(root: &str, path: &'a str) -> &'a str {
+    let bucket = root.split_once("://").map_or(root, |(_, b)| b);
+    let path = path.trim_start_matches('/');
+    path.strip_prefix(bucket).and_then(|p| p.strip_prefix('/')).unwrap_or(path)
 }
 
 /// The HTTP layer of a bucket's store: object_store's own client, with the bucket's turns.
@@ -203,10 +238,14 @@ impl HttpService for Turns {
         };
         let gate = if urgent { &self.urgent } else { &self.gate };
         let turn = gate.take().await;
+        let (method, path) = (req.method().to_string(), req.uri().path().to_string());
+        let began = datafusion::common::instant::Instant::now(); // (web-time in a page)
         let answer = self.inner.execute(req).await;
+        let now = crate::log::now_ms();
+        gate.slow(&self.root, &method, &path, began.elapsed(), &answer, now);
         gate.heard(&answer);
         if answer.as_ref().is_ok_and(|r| !matches!(r.status().as_u16(), 500 | 502 | 504)) {
-            self.gate.answered.store(crate::log::now_ms(), Relaxed);
+            self.gate.answered.store(now, Relaxed);
         }
         gate.hand_back(turn);
         if let (Some(s), Some(t)) = (&share, lent) {
@@ -232,6 +271,23 @@ mod tests {
             g.calm();
         }
         assert_eq!((g.cap.load(Relaxed), g.turns.available_permits()), (33, 33));
+    }
+
+    #[test]
+    fn a_slow_request_is_named_once_a_second_without_its_bucket() {
+        assert_eq!(key("s3://b", "/b/lakes/prod/catalog/wal/00000000000000000012.sst"), "lakes/prod/catalog/wal/00000000000000000012.sst"); // (path-style)
+        assert_eq!(key("s3://b", "/lakes/prod/n"), "lakes/prod/n"); // (virtual-hosted)
+        assert_eq!(key("s3://b", "/bucket2/x"), "bucket2/x"); // (another name that starts alike stays whole)
+        let g = Gate::new(4);
+        let gone: Result<HttpResponse, HttpError> = Err(HttpError::new(object_store::client::HttpErrorKind::Timeout, std::io::Error::other("timed out")));
+        g.slow("s3://b", "PUT", "/b/w", SLOW / 2, &gone, 5_000); // (quick: not named, not counted)
+        assert_eq!((g.said.load(Relaxed), g.unsaid.load(Relaxed)), (0, 0));
+        g.slow("s3://b", "PUT", "/b/w", SLOW, &gone, 5_000);
+        assert_eq!(g.said.load(Relaxed), 5_000);
+        g.slow("s3://b", "PUT", "/b/w", SLOW * 3, &gone, 5_900); // (within the second: counted for the next line)
+        assert_eq!((g.said.load(Relaxed), g.unsaid.load(Relaxed)), (5_000, 1));
+        g.slow("s3://b", "PUT", "/b/w", SLOW, &gone, 6_000); // (a second on: named, with the one before it)
+        assert_eq!((g.said.load(Relaxed), g.unsaid.load(Relaxed)), (6_000, 0));
     }
 
     #[test]

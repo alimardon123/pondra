@@ -2479,6 +2479,20 @@ fn reads(lake: &Lake, sql: &str, t: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A dropped table's record every release since 0.22 wrote (`store::tests::keep_old_entries`, its `dt/` entries) reads as
+    /// one, as it did; the entries it holds read as before in `store::tests::old_entries_read_as_before`.
+    #[test]
+    fn old_dropped_records_read_as_before() {
+        let text = std::fs::read_to_string(crate::store::tests::OLD_ENTRIES).expect("the old entries");
+        for line in text.lines() {
+            let l: serde_json::Value = serde_json::from_str(line).unwrap();
+            let (v, k) = (l["release"].as_str().unwrap(), l["key"].as_str().unwrap());
+            if k.starts_with("dt/") {
+                let _: Dropped = serde_json::from_value(l["entry"].clone()).unwrap_or_else(|e| panic!("{v} {k}: {e}"));
+            }
+        }
+    }
+
     /// A failed `CREATE TABLE … AS SELECT` drops only the table its own job made: the leader checks `made_by` under the lake's
     /// lock, so another statement's table under the name stays, and the job's own table goes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
