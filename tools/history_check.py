@@ -177,6 +177,36 @@ def history_check(bin, work, port):
         "dv exists" in taken and newest == [(2,)] and older and older[0][2] == "kept with it" and shown("dx") != []
     print(f"(definitions kept and undropped: {came_back})", file=sys.stderr)
 
+    # A schema dropped with CASCADE is kept with its tables, views and macros in one record; UNDROP SCHEMA brings them all back.
+    q("CREATE SCHEMA sales")
+    q("CREATE TABLE sales.orders (id BIGINT, v VARCHAR)")
+    q("INSERT INTO sales.orders SELECT x, 'o' FROM generate_series(1, 100) AS s(x)")
+    tier()
+    q("INSERT INTO sales.orders VALUES (101, 'log'), (102, 'log')")  # (left in the log)
+    q("CREATE VIEW sales.big AS SELECT * FROM sales.orders WHERE id > 50")
+    q("CREATE MACRO sales.twice(x) AS x * 2")
+    before = rows("SELECT count(*), max(id) FROM sales.orders")
+    big = rows("SELECT count(*) FROM sales.big")
+    q("DROP SCHEMA sales CASCADE")
+    gone = refused("SELECT count(*) FROM sales.orders")
+    early = refused("UNDROP TABLE sales.orders")
+    listed = rows("SELECT kind, undrop FROM pondra.dropped WHERE name = 'sales'")
+    q(listed[0][1] if listed else "UNDROP SCHEMA sales")
+    after = rows("SELECT count(*), max(id) FROM sales.orders")
+    big_after = rows("SELECT count(*) FROM sales.big")
+    twice = rows("SELECT sales.twice(21)")
+    checks["DROP SCHEMA … CASCADE keeps the schema with its tables, views and macros; UNDROP SCHEMA brings them all back "
+           "(rows in the log too), and UNDROP TABLE waits for its schema"] = \
+        bool(gone) and bool(early) and listed == [("schema", "UNDROP SCHEMA sales")] and after == before == [(102, 102)] \
+        and big_after == big == [(52,)] and twice == [(42,)]
+    q("DROP SCHEMA sales CASCADE")
+    q("CREATE SCHEMA sales")
+    taken = refused("UNDROP SCHEMA sales")  # (the schema is there: refused)
+    q("DROP SCHEMA sales")
+    q("UNDROP SCHEMA sales")  # (the newest record: the empty schema)
+    newest = rows("SELECT count(*) FROM pondra.dropped WHERE name = 'sales'")  # (the older one, with the tables, is still kept)
+    checks["UNDROP SCHEMA is refused while the schema is there, and brings back the newest"] = "exists" in taken and newest == [(1,)]
+
     # AT: every state the table was in, by its commit and by its time, against what it was then.
     q("CREATE TABLE h (id BIGINT, v VARCHAR)")
     states = []

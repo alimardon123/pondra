@@ -45,8 +45,12 @@ as Delta keeps a table's old files (a day, Snowflake's, until 2026-11-08). `'0 s
   drop that, then undrop again to reach an older copy), with the right the kind's DROP needs.
 - A definition holds no rows, so it is kept for the default 7 days. `tier::expire` lets it go.
 - `pondra.dropped` lists it with its `kind`, `dropped_by`, and the `undrop` statement that brings
-  it back. Schemas with CASCADE, materialized views, databases and files come next, each as one
-  record.
+  it back.
+- `DROP SCHEMA s CASCADE` keeps the schema in one record that names what went with it: its tables,
+  views and routines, each kept in its own. It is kept as long as the longest kept of them, and
+  never less than 7 days. `UNDROP SCHEMA s` brings the schema back, then each of them still kept,
+  tables first; its answer names any that couldn't come back. Until then `UNDROP TABLE s.t` waits
+  for its schema. Materialized views, databases and files come next.
 
 **3. `t AT (VERSION => n | TIMESTAMP => t | OFFSET => -s)` reads an append table as it was**
 (`past.rs`). It needs no history in the catalog, because the rows carry it. The table as of `n` is:

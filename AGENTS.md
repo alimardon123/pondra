@@ -3228,8 +3228,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    family has the name, and needs the right that kind's DROP needs (`statements::undrops_entry`: an admin's for a
    connection). `UNDROP TABLE` brings back a kept external table when no table is kept. Each is kept for the default
    7 days (`ddl::KEEP_MS`), let go by `tier::expire`; `pondra.dropped` lists it (kind, dropped_by, undrop) to whoever
-   may read a relation of its name, any other kind to the whole. `dk/` is no page's and no branch's.
-   `cargo test --lib undrop::`
+   may read a relation of its name, any other kind to the whole. `dk/` is no page's and no branch's. A schema's drop,
+   CASCADE too, keeps the schema in one record naming what went with it (`Kept::with`: its tables, views and routines,
+   each in its own record), kept as long as the longest kept of them; `UNDROP SCHEMA` brings it back, then each of them
+   still kept, tables first, and its answer names any that isn't (`left`). `cargo test --lib undrop::`
 
 ```bash
 cargo build --release

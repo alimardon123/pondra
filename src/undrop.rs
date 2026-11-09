@@ -30,6 +30,10 @@ pub struct Kept {
     pub by: String,
     /// Its records as the drop found them: its own, and the comments on it and on its columns.
     pub records: Vec<(String, Value)>,
+    /// What its drop took with it, as (kind, name), each kept in its own record (a table's `dt/`): a schema's tables, views
+    /// and routines, dropped with CASCADE. UNDROP brings them back with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub with: Vec<(String, String)>,
 }
 
 impl Kept {
@@ -53,6 +57,12 @@ fn family(kind: &str) -> Result<&'static str> {
 /// The puts that keep `name`, of `kind`, as `keys` hold it now, with the comments on it: they go in the drop's own commit.
 /// A key that holds nothing is left out.
 pub async fn aside(lake: &Lake, kind: &str, name: &str, keys: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
+    aside_with(lake, kind, name, keys, vec![], crate::ddl::KEEP_MS).await
+}
+
+/// The same, for a drop that took `with` along (kept for `keep_ms`: as long as the longest kept of them, and never less
+/// than the default).
+pub async fn aside_with(lake: &Lake, kind: &str, name: &str, keys: &[String], with: Vec<(String, String)>, keep_ms: u64) -> Result<Vec<(String, Vec<u8>)>> {
     let family = family(kind)?;
     let mut records = vec![];
     for k in keys.iter().cloned().chain([format!("cm/{family}/{name}")]) {
@@ -66,7 +76,7 @@ pub async fn aside(lake: &Lake, kind: &str, name: &str, keys: &[String]) -> Resu
     // (later than the name's last kept copy, so two drops in one millisecond keep two)
     let last = lake.cat.scan::<Times>(&format!("{PREFIX}{family}/{name}/"), &format!("{PREFIX}{family}/{name}0")).await?.last().map(|(_, t)| t.at_ms);
     let at_ms = crate::log::now_ms().max(last.map_or(0, |l| l + 1));
-    let kept = Kept { at_ms, keep_ms: crate::ddl::KEEP_MS, kind: kind.to_string(), by: crate::auth::name(), records };
+    let kept = Kept { at_ms, keep_ms: keep_ms.max(crate::ddl::KEEP_MS), kind: kind.to_string(), by: crate::auth::name(), records, with };
     Ok(vec![(key(family, name, at_ms), json(&kept))])
 }
 
@@ -113,7 +123,32 @@ pub async fn undrop(lake: &Lake, kind: &str, name: &str) -> Result<Value> {
     let shown = kept.kind.clone();
     let puts = kept.records.into_iter().map(|(k, v)| (k, json(&v))).collect();
     lake.cat.commit(puts, &[at]).await?;
-    Ok(j!({shown: name, "undropped": true}))
+    let mut out = j!({shown: name, "undropped": true});
+    if !kept.with.is_empty() {
+        let (back, left) = members(lake, &kept.with).await;
+        out["with"] = j!(back);
+        if !left.is_empty() {
+            out["left"] = j!(left);
+        }
+    }
+    Ok(out)
+}
+
+/// What a drop took along, brought back after it, the last dropped first (a schema's tables before its views): each that
+/// is still kept, and why each other one isn't back (its time was up, or its name is taken).
+async fn members(lake: &Lake, with: &[(String, String)]) -> (Vec<String>, Vec<Value>) {
+    let (mut back, mut left) = (vec![], vec![]);
+    for (kind, name) in with.iter().rev() {
+        let out = match kind.as_str() {
+            "table" => Box::pin(crate::ddl::undrop(lake, name)).await, // (boxed: UNDROP TABLE may bring back a kept external table)
+            _ => Box::pin(undrop(lake, kind, name)).await,
+        };
+        match out {
+            Ok(_) => back.push(format!("{kind} {name}")),
+            Err(e) => left.push(j!({"kind": kind, "name": name, "why": format!("{e:#}")})),
+        }
+    }
+    (back, left)
 }
 
 /// The name UNDROP `kind` reads `name` as: placed in its schema, which must be there, for a kind that has schemas (a
@@ -224,6 +259,36 @@ mod tests {
         assert!(format!("{:#}", run(&lake, "UNDROP VIEW v").await.unwrap_err()).contains("v exists"));
     }
 
+    /// A schema dropped with CASCADE is kept with what it held, and UNDROP SCHEMA brings all of it back. Until then UNDROP
+    /// of a name in it is refused: the schema is not there. (Its tables, which a leader sends to files first, are
+    /// `tools/history_check.py`'s.)
+    #[tokio::test]
+    async fn a_schema_dropped_with_cascade_comes_back_with_what_it_held() {
+        let lake = lake().await;
+        run(&lake, "CREATE SCHEMA s").await.unwrap();
+        run(&lake, "CREATE VIEW s.v AS SELECT 1 AS a").await.unwrap();
+        run(&lake, "CREATE MACRO s.m(x) AS x + 1").await.unwrap();
+        run(&lake, "COMMENT ON SCHEMA s IS 'sales'").await.unwrap();
+        let view_was: Value = lake.cat.get("q/s.v").await.unwrap().unwrap();
+        let macro_was: Value = lake.cat.get("r/s.m").await.unwrap().unwrap();
+        run(&lake, "DROP SCHEMA s CASCADE").await.unwrap();
+        assert!(lake.cat.get::<Value>("ns/s").await.unwrap().is_none(), "the schema is dropped");
+        assert!(lake.cat.get::<Value>("q/s.v").await.unwrap().is_none(), "its view is dropped");
+        assert!(lake.cat.get::<Value>("r/s.m").await.unwrap().is_none(), "its macro is dropped");
+        let early = format!("{:#}", run(&lake, "UNDROP VIEW s.v").await.unwrap_err());
+        assert!(early.contains("no schema s"), "{early}");
+        let out = run(&lake, "UNDROP SCHEMA s").await.unwrap();
+        assert_eq!(out["undropped"], true, "{out}");
+        let with: Vec<&str> = out["with"].as_array().unwrap().iter().map(|w| w.as_str().unwrap()).collect();
+        assert_eq!(with, ["view s.v", "macro s.m"], "the last dropped first");
+        assert!(out.get("left").is_none(), "{out}");
+        assert!(lake.cat.get::<Value>("ns/s").await.unwrap().is_some(), "the schema is back");
+        assert_eq!(lake.cat.get::<Value>("q/s.v").await.unwrap(), Some(view_was), "its view is back as it was");
+        assert_eq!(lake.cat.get::<Value>("r/s.m").await.unwrap(), Some(macro_was), "its macro is back as it was");
+        assert_eq!(lake.cat.get::<String>("cm/schema/s").await.unwrap().as_deref(), Some("sales"), "with its comment");
+        assert!(all(&lake).await.unwrap().is_empty(), "no kept record is left");
+    }
+
     /// UNDROP reads each kind whose verbs list it, the longest words first, and names those kinds for any other.
     #[test]
     fn undrop_reads_each_kind_that_keeps_its_drops() {
@@ -233,9 +298,10 @@ mod tests {
             assert!(matches!(parse(sql), Some(Stmt::Ddl(ds)) if matches!(&ds[..], [Ddl::UndropKept { kind: k, .. }] if k == kind)), "{sql}");
         }
         assert!(matches!(parse("UNDROP TABLE t"), Some(Stmt::Ddl(ds)) if matches!(&ds[..], [Ddl::Undrop { name }] if name == "t")));
-        match parse("UNDROP SCHEMA s") {
-            Some(Stmt::Invalid(e)) => assert!(e.contains("EXTERNAL TABLE, FUNCTION") && e.contains("pondra.dropped"), "{e}"),
-            _ => panic!("UNDROP SCHEMA: refused, naming the kinds"),
+        assert!(matches!(parse("UNDROP SCHEMA s"), Some(Stmt::Ddl(ds)) if matches!(&ds[..], [Ddl::UndropKept { kind, .. }] if kind == "schema")));
+        match parse("UNDROP DATABASE d") {
+            Some(Stmt::Invalid(e)) => assert!(e.contains("EXTERNAL TABLE, FUNCTION") && e.contains("SCHEMA") && e.contains("pondra.dropped"), "{e}"),
+            _ => panic!("UNDROP DATABASE: refused, naming the kinds"),
         }
     }
 

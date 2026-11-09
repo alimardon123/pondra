@@ -513,16 +513,28 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
                 // (dependent_objects_still_exist, as Postgres answers it: Iceberg REST's NamespaceNotEmptyException reads the code)
                 return Err(crate::codes::coded("2BP01", format!("schema {name} isn't empty ({}): drop them first, or DROP SCHEMA {name} CASCADE", [&views[..], &tables[..], &routines[..]].concat().join(", "))));
             }
+            // (each kept in its own record, and named in the schema's, so UNDROP SCHEMA brings them back with it)
+            let (mut with, mut keep_ms) = (vec![], KEEP_MS);
             for r in &routines {
+                let kind = lake.cat.get::<crate::expander::Routine>(&crate::routines::key(r)).await?.map(|r| r.kind_name());
                 crate::routines::drop(lake, r, true).await?;
+                with.extend(kind.map(|k| (k.to_string(), r.clone())));
             }
             for v in &views {
+                let kind = lake.cat.get::<StoredView>(&query_key(v)).await?.map(|s| if s.external { "external table" } else { "view" }); // (a materialized view's: not kept yet)
                 drop_view(lake, v, true).await?;
+                with.extend(kind.map(|k| (k.to_string(), v.clone())));
             }
             for t in tables.iter().filter(|t| !views.iter().any(|v| *t == v || **t == format!("{v}_final"))) {
+                let meta = lake.cat.get::<TableMeta>(&table_key(t)).await?;
                 drop_table(lake, t, true, false, None).await?;
+                if let Some(m) = meta.filter(|m| keeps(t, m, false)) {
+                    keep_ms = keep_ms.max(m.retention_secs.map_or(KEEP_MS, |s| s * 1000));
+                    with.push(("table".to_string(), t.clone()));
+                }
             }
-            lake.cat.commit(vec![], &[schema_key(&name)]).await?;
+            let kept = crate::undrop::aside_with(lake, "schema", &name, &[schema_key(&name)], with, keep_ms).await?;
+            lake.cat.commit(kept, &[schema_key(&name)]).await?;
             Ok(j!({"schema": name, "dropped": true}))
         }
         Ddl::DropTable { name, if_exists, purge, made_by } => drop_table(lake, &name, if_exists, purge, made_by.as_deref()).await,
@@ -1232,7 +1244,7 @@ pub fn retention(text: &str) -> Result<u64> {
 /// `UNDROP TABLE t`: the table dropped last under that name, back as it was. It reads the log from
 /// now on (its rows went to files when it was dropped; the log since may hold another table's of
 /// its name). Refused while something else has the name: rename that first.
-async fn undrop(lake: &Lake, name: &str) -> Result<Value> {
+pub(crate) async fn undrop(lake: &Lake, name: &str) -> Result<Value> {
     let taken = lake.cat.get::<TableMeta>(&table_key(name)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(name)).await?.is_some()
         || lake.cat.get::<Value>(&crate::views::view_key(name)).await?.is_some();
     if taken {
