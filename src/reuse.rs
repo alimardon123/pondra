@@ -32,6 +32,7 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_plan::async_func::AsyncFuncExec;
 use datafusion::physical_plan::buffer::BufferExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::empty::EmptyExec;
@@ -159,10 +160,9 @@ fn source(leaf: &Arc<dyn ExecutionPlan>) -> String {
 /// groups at its top or gives a small part of what it reads, as its statistics say (`SHARE`)?
 fn worth(p: &Arc<dyn ExecutionPlan>) -> Result<bool> {
     let text = key(p);
-    // (a filter learned as the query runs is one use's own; a random value is drawn at each run; a recursive query's
-    // working table changes between its rounds)
+    // (a filter learned as the query runs is one use's own; a recursive query's working table changes between its rounds)
     // (and a scalar subquery's answer is filled in where it is used)
-    if ["DynamicFilter", "random(", "uuid(", "WorkTable", "ReuseExec", "scalar_subquery("].iter().any(|s| text.contains(s)) {
+    if ["DynamicFilter", "WorkTable", "ReuseExec", "scalar_subquery("].iter().any(|s| text.contains(s)) || answers_otherwise(p)? {
         return Ok(false);
     }
     if !p.exists(|n| Ok(["Aggregate", "Join", "Window"].iter().any(|s| n.name().contains(s))))? {
@@ -173,6 +173,28 @@ fn worth(p: &Arc<dyn ExecutionPlan>) -> Result<bool> {
     }
     let read = leaves(p).into_iter().map(|l| rows(&l)).try_fold(0usize, |most, n| n.map(|n| most.max(n)));
     Ok(matches!((rows(p), read), (Some(out), Some(read)) if read > 0 && out.saturating_mul(SHARE) <= read))
+}
+
+/// Does `p` call what may answer otherwise at each run (11-09 audit H3): a function its signature says is volatile
+/// (`random()`, `uuidv7()`, `clock_timestamp()`, an extension's or a user's), an aggregate one, or an async one (a
+/// sequence's `nextval`, a file's read, Python, AI), which DataFusion runs in its own node and its expression tree
+/// doesn't show? Postgres runs a view named twice twice, so two uses draw two values; held once, they'd draw one.
+fn answers_otherwise(p: &Arc<dyn ExecutionPlan>) -> Result<bool> {
+    use datafusion::logical_expr::Volatility;
+    p.exists(|n| {
+        if n.is::<AsyncFuncExec>() {
+            return Ok(true);
+        }
+        if n.downcast_ref::<AggregateExec>().is_some_and(|a| a.aggr_expr().iter().any(|e| e.fun().signature().volatility == Volatility::Volatile)) {
+            return Ok(true);
+        }
+        let mut found = false;
+        n.apply_expressions(&mut |e| {
+            found = datafusion::physical_expr_common::physical_expr::is_volatile(e);
+            Ok(if found { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
+        })?;
+        Ok(found)
+    })
 }
 
 /// The rows `p` gives, as its statistics say.
@@ -532,6 +554,44 @@ mod tests {
         assert!(!plan.contains("ReuseExec"), "{plan}");
         assert_eq!(once, twice);
         assert_eq!(answer(&ctx, TWICE).await?.0, once, "a second run");
+        Ok(())
+    }
+
+    /// A subplan that calls what may answer otherwise at each run is run at each use, as Postgres runs a view named twice
+    /// (11-09 audit H3): any function whose signature is volatile, not only the names `random(` and `uuid(` once listed,
+    /// and in an aggregate's argument too. Two uses draw two values each row.
+    #[tokio::test]
+    async fn what_answers_otherwise_runs_at_each_use() -> Result<()> {
+        use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
+        let ctx = session(Arc::new(RuntimeEnv::default()), true).await?;
+        let drawn = Arc::new(AtomicUsize::new(0));
+        let next = drawn.clone();
+        let draw = move |_: &[ColumnarValue]| Ok(ColumnarValue::Scalar(datafusion::common::ScalarValue::Int64(Some(next.fetch_add(1, Relaxed) as i64))));
+        ctx.register_udf(create_udf("draw", vec![], datafusion::arrow::datatypes::DataType::Int64, Volatility::Volatile, Arc::new(draw)));
+        let twice = |t: &str| format!("WITH t AS ({t}) SELECT count(*) AS n, count(*) FILTER (WHERE a.id = b.id) AS same FROM t a JOIN t b ON a.item = b.item");
+        // (what a ReuseExec holds: the lines below it, more indented)
+        let held = |plan: &str| {
+            let lines: Vec<&str> = plan.lines().collect();
+            let depth = |l: &str| l.len() - l.trim_start().len();
+            let mut under = String::new();
+            for (i, l) in lines.iter().enumerate().filter(|(_, l)| l.trim_start().starts_with("ReuseExec")) {
+                lines[i + 1..].iter().take_while(|m| depth(m) > depth(l)).for_each(|m| under += m);
+            }
+            under
+        };
+        for (t, differ) in [
+            ("SELECT draw() AS id, item, sum(amount) AS total FROM sales GROUP BY item", true), // (above a grouping that may be held)
+            ("SELECT item, max(amount + draw()) AS id FROM sales GROUP BY item", true),         // (in an aggregate's argument)
+            ("SELECT item, sum(amount) AS id FROM sales WHERE amount > draw() GROUP BY item", false), // (in a filter below it)
+            ("SELECT random() AS id, item, sum(amount) AS total FROM sales GROUP BY item", true),
+        ] {
+            let (got, plan) = answer(&ctx, &twice(t)).await?;
+            assert!(!held(&plan).contains("draw()") && !held(&plan).contains("random()"), "{t}: {plan}");
+            assert!(!differ || got.contains("| 1000 | 0    |"), "{t}: every row's two ids differ: {got}\n{plan}");
+        }
+        // (the control: what answers alike at each run is held)
+        let (_, plan) = answer(&ctx, &twice("SELECT item AS id, item, sum(amount) AS total FROM sales GROUP BY item")).await?;
+        assert!(plan.contains("ReuseExec: uses=2"), "{plan}");
         Ok(())
     }
 
