@@ -35,6 +35,9 @@ pub struct NodeState {
     /// Its budget of the process's memory (`ledger::Ledger` on the process's `ledger::Root`): the line its lakes' queries
     /// and caches share, made as its first lake opens (`store::lake_pool`).
     pub(crate) line: std::sync::OnceLock<Arc<crate::ledger::Ledger>>,
+    /// A short id of its own, random, made with it: what tells its files in its process's space from another node's
+    /// here, which would name them alike (a shuffle's folders: `spill::dir`).
+    pub id: String,
     /// When its start began: what `PONDRA_TRACE_START`'s times count from (`trace`).
     began: datafusion::common::instant::Instant,
 }
@@ -51,7 +54,7 @@ impl NodeState {
     pub fn on(life: Life, machine: crate::machine::Mach) -> Arc<NodeState> { NodeState::make(life, machine, crate::settings::Values::now()) }
 
     fn make(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values) -> Arc<NodeState> {
-        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), began: datafusion::common::instant::Instant::now() })
+        Arc::new(NodeState { life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).

@@ -244,7 +244,6 @@ sharing_client -> byte_range  1
 sharing_client -> fetch  4
 sharing_client -> read_delta  1
 sharing_client -> reset  1
-spill -> reset  1
 spmd -> dial  9
 sso -> crypto  6
 sso -> fetch  1

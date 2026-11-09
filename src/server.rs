@@ -595,7 +595,7 @@ async fn commit(State(app): State<App>, body: Bytes) -> Result<Json<crate::log::
 /// This node's share of a distributed query, sent a piece at a time (a big share is on disk).
 async fn stage(State(app): State<App>, Json(slice): Json<crate::spmd::Slice>) -> Result<Response, E> {
     let (shape, parts) = crate::spmd::stage(&app.lake, &slice).await?;
-    let done = slice.shuffle.is_none().then(|| crate::spill::Gone(slice.id.clone()));
+    let done = slice.shuffle.is_none().then(|| crate::spill::Gone(slice.id.clone(), app.lake.node.clone()));
     Ok(Body::from_stream(crate::spmd::reply(&shape, parts, done)).into_response())
 }
 
@@ -621,12 +621,12 @@ struct BucketParams {
 }
 
 /// A shuffle bucket this node keeps for another node (see `spmd.rs`).
-async fn bucket(Query(p): Query<BucketParams>) -> Result<Response, E> {
+async fn bucket(State(app): State<App>, Query(p): Query<BucketParams>) -> Result<Response, E> {
     if p.drop {
-        crate::spmd::forget(&p.id);
+        crate::spmd::forget(&app.lake, &p.id);
         return Ok(Body::empty().into_response());
     }
-    let buckets = crate::spmd::bucket(&p.id, p.exchange, p.to, p.part)?;
+    let buckets = crate::spmd::bucket(&app.lake, &p.id, p.exchange, p.to, p.part)?;
     Ok(Body::from_stream(crate::spmd::reply("", buckets, None)).into_response()) // (a piece at a time: a big bucket is on disk)
 }
 
@@ -856,10 +856,10 @@ struct AppendParams {
 }
 
 /// Body: NDJSON rows, or an Arrow IPC stream (content-type application/vnd.apache.arrow.stream).
-async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
-    let start = std::time::Instant::now();
+async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, who: Option<axum::Extension<crate::auth::Principal>>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
+    let (start, scope) = (std::time::Instant::now(), scope_of(who));
     let (out, unseen) = crate::rights::noting(append_rows(&app, &name, p, headers, body)).await;
-    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.to_string()), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
+    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -917,7 +917,7 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
         }
     })
     .await;
-    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
+    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
 
@@ -1401,8 +1401,12 @@ pub struct E(anyhow::Error);
 impl<T: Into<anyhow::Error>> From<T> for E {
     fn from(e: T) -> Self { E(e.into()) }
 }
+impl E {
+    /// The words its caller is told (`codes::told`), so the audit log says what the client was told.
+    fn told(&self, scope: &crate::rights::Scope) -> String { crate::codes::told(&self.0, scope.shows_code()) }
+}
 impl std::fmt::Display for E {
-    // (the words a client is sent, so the audit log says what the client was told: `ext::said`)
+    // (as told a client not shown code: `ext::said`)
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", crate::ext::said(&self.0)) }
 }
 impl IntoResponse for E {

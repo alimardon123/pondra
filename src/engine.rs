@@ -104,7 +104,7 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             passes.add(p);
         }
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "functions", columns: FUNCTION_COLUMNS, rows: functions });
-        #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: the answers kept for their doors' pages, a joined page's unsent statements and a node's count of them, and its file stores and catalogs' tokens)
+        #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: the answers kept for their doors' pages, a joined page's unsent statements and a node's count of them, its file stores and catalogs' tokens, and the shuffles its node takes part in)
         {
             let states = r.section_mut::<crate::lake_state::Registered>();
             states.add::<crate::pages::Pages>();
@@ -112,6 +112,7 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add::<crate::page_records::Counted>();
             states.add::<crate::ext::Stores>();
             states.add::<crate::ext::Tokens>();
+            states.add::<crate::spmd::Shuffles>();
             states.add::<crate::history::History>();
             states.add::<crate::history::Writers>();
             states.add::<crate::query::FactsKept>();
