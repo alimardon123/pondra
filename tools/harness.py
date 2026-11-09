@@ -10643,8 +10643,8 @@ def server():
     """`pondra serve <folder>` (ADR-030, ADR-032): three lakes in a folder (with --s3, under a bucket's
     prefix), served as databases —
     found as such, or named so (`--lakes`). psql and HTTP reach each by name, and queries join
-    across them; the console is at `/`; CREATE DATABASE makes one and DROP DATABASE drops one; a
-    database idle for PONDRA_DATABASE_IDLE_SECS stops, and starts again when next used; each
+    across them; the console is at `/`; CREATE DATABASE makes one, and DROP DATABASE keeps one to be
+    undropped (PURGE deletes it); a database idle for PONDRA_DATABASE_IDLE_SECS stops, and starts again when next used; each
     database's node gets `pondra serve`'s options; a connection open (or a request in flight)
     keeps its database's node running; another node joins a database's cluster through
     the server; the server killed and started again serves the same databases; each database signs
@@ -10687,9 +10687,16 @@ def server():
     call(port, "POST", "/db/hr/sql", b"CREATE TABLE people AS SELECT 1 AS id")  # (a new database's first write: its node starts, takes the lease, writes)
     first_write = round(time.time() - t0, 1)
     missing = _raises_text(lambda: pq("nope", "SELECT 1"))
-    pq("sales", "DROP DATABASE crm")
-    checks["CREATE DATABASE makes one, DROP DATABASE drops it, folder and all; an unknown one is said so"] = "hr" in running() and "crm" not in running() \
-        and not lake_objects(folder, "crm/") and 'database "nope" does not exist' in missing
+    pq("sales", "DROP DATABASE crm")  # (kept to be undropped: its folder stays, marked, and it is out of every listing)
+    checks["CREATE DATABASE makes one, and an unknown one is said so"] = "hr" in running() and 'database "nope" does not exist' in missing
+    checks["DROP DATABASE keeps crm: out of the listing, its folder kept with dropped.json, pondra.dropped says it can be undropped, and opening it is refused saying so"] = \
+        "crm" not in running() and "crm/dropped.json" in lake_objects(folder, "crm/") \
+        and pq("sales", "SELECT kind, undrop FROM pondra.dropped WHERE name = 'crm'") == [("database", "UNDROP DATABASE crm")] \
+        and "UNDROP DATABASE crm" in _raises_text(lambda: pq("crm", "SELECT 1"))
+    pq("sales", "UNDROP DATABASE crm")
+    checks["UNDROP DATABASE brings crm back: served again, its rows as they were, listed"] = pq("crm", "SELECT count(*) FROM customers") == [(2,)] and "crm" in running()
+    pq("sales", "DROP DATABASE crm PURGE")  # (deleted at once: later checks expect it gone)
+    checks["DROP DATABASE crm PURGE deletes its folder at once"] = not lake_objects(folder, "crm/")
     idle = until(lambda: sum(running().values()), 0, 30)
     checks["idle databases stop, and start again when used"] = idle == 0 and pq("hr", "SELECT count(*) FROM people") == [(1,)]
     with psycopg.connect(dsn("hr"), autocommit=True) as held:  # (open past the idle time: its node stays)
@@ -21832,7 +21839,9 @@ def registry():
     info["kv"] = kv + [show("table", "kv")]
     checks["a keyed table: a column added, its _deleted its own (never in its definition), DELETE still works"] = kv[0].get("altered") == ["+ w"] \
         and kv[1].get("unchanged") is True and "_deleted" not in show("table", "kv") and q("SELECT k, w FROM kv ORDER BY k") == [{"k": 2}, {"k": 3, "w": 3}]
-    # Branches (ADR-047) are made again by their clone: DROP DATABASE deletes one, so no ATTACH would find it
+    # Branches (ADR-047) are made again by their clone: a plain DROP DATABASE keeps one to be undropped, and the
+    # CREATE … LOCATION … CLONE below, at the same place, lets the kept folder go (`ddl::let_go`) and takes its pin
+    # over (the pin's key is the branch's id), so no ATTACH meets it and no folder is left behind
     here = q("SELECT name FROM pondra.databases")[0]["name"]
     dev_at, slim_at = f"{lake}-dev", f"{lake}-slim"
     LAKES.extend([dev_at, slim_at])
