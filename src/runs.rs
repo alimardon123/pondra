@@ -1144,8 +1144,9 @@ pub fn mentioned(sql: &str) -> bool {
     ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.shares", "pondra.recipients", "pondra.audit", "pondra.history", "pondra.loads", "pondra.learned", "pondra.flows", "pondra.expectations", "pondra.rejects", "pondra.variables", "pondra.dropped", "pondra.objects", "pondra.parts", "pondra.databases", "pondra.applies"].iter().any(|t| s.contains(t))
 }
 
-/// `pondra.routines`, `pondra.tasks` and `pondra.tables`, as they are now.
-pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
+/// `pondra.routines`, `pondra.tasks` and `pondra.tables`, as they are now. `sql`: the statement that reads them (the
+/// databases dropped beside this one are listed only for one that names `pondra.dropped`: it lists their folder).
+pub async fn tables(lake: &Lake, scope: &crate::rights::Scope, sql: &str) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
     use datafusion::datasource::MemTable;
     let all = crate::routines::listed(lake).await?;
     let mut names: Vec<&String> = all.keys().collect();
@@ -1222,7 +1223,12 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'
         bytes: Some(d.meta.files.iter().map(|f| f.bytes).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.bytes)),
         kind: "table".into(), at_ms: d.at_ms, until: d.at_ms + d.keep_ms, by: d.by, name,
     }).collect();
-    gone.extend(crate::undrop::all(lake).await?.into_iter().map(|(name, k)| Gone { kind: k.kind.clone(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
+    // (a database's own record keeps only its attachment here: its folder's mark is what lists it, `undrop::LAKE_MARK`)
+    gone.extend(crate::undrop::all(lake).await?.into_iter().filter(|(_, k)| k.kind != "database").map(|(name, k)| Gone { kind: k.kind.clone(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
+    if sql.to_lowercase().contains("pondra.dropped") {
+        let beside = crate::undrop::lakes_kept(&crate::ddl::folder_of(&lake.url)).await.unwrap_or_default(); // (a folder that won't list: none)
+        gone.extend(beside.into_iter().map(|(name, _, k)| Gone { kind: "database".into(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
+    }
     let relation = |kind: &str| crate::objects::kind(kind).is_some_and(|k| k.family == "relation");
     gone.retain(|g| scope.sees(if relation(&g.kind) { crate::rights::Object::Table(&g.name) } else { crate::rights::Object::Lake }));
     let g = |f: &dyn Fn(&Gone) -> Option<u64>| Arc::new(gone.iter().map(|d| f(d).map(|n| n as i64)).collect::<Int64Array>()) as ArrayRef;

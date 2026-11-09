@@ -37,7 +37,7 @@ crypto -> wasm32  4
 cursors -> pg_types  2
 ddl -> apply  1
 ddl -> delta  7
-ddl -> dial  2
+ddl -> dial  1
 ddl -> extension  3
 ddl -> feeds  9
 ddl -> matches  2
