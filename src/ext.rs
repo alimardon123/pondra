@@ -2044,7 +2044,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-own-stage-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let stage = format!("{}/stage", lake.url.trim_end_matches('/'));
-        let ali = crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Write, scope: crate::rights::Scope::everything(), door: "http", from: None, operator: false, epoch: 0, until: None };
+        let ali = crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Write, scope: crate::rights::Scope::everything(), door: "http", from: None, operator: false, epoch: 0, until: None, reads: false };
         assert!(!own_stage(&lake, &format!("{stage}/616c69/j1/*.parquet")), "with no sign-in, none");
         crate::auth::WHO
             .scope(ali, async {

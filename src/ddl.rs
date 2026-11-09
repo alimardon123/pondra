@@ -2516,7 +2516,7 @@ mod tests {
         let fill = made.fill.clone().map(|f| crate::views::Fill { upto: Some(0), ..f }); // (as the sequencer sets it: `views::bound`)
         lake.cat.commit(vec![(crate::views::view_key("v"), json(&crate::views::View { fill, ..made }))], &[]).await?;
         let mover = crate::rights::Scope::granted(std::sync::Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec![] }])));
-        let at_a_door = crate::auth::Principal { name: "mover".into(), role: crate::auth::Role::Read, scope: mover.clone(), door: "test", from: None, operator: false, epoch: 0, until: None };
+        let at_a_door = crate::auth::Principal { name: "mover".into(), role: crate::auth::Role::Read, scope: mover.clone(), door: "test", from: None, operator: false, epoch: 0, until: None, reads: false };
         let stmt = crate::write::parse("ALTER TABLE t ALTER COLUMN b FIRST").expect("an ALTER");
         let refused = crate::auth::WHO.scope(at_a_door, async { crate::rights::may_run(crate::auth::Role::Read, &stmt) }).await.expect_err("a SELECT-only mover is refused at a door");
         assert!(refused.to_string().contains("it needs an admin token, or a superuser"), "{refused}");

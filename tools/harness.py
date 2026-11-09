@@ -22817,6 +22817,15 @@ def listings():
         all("permission denied" in a and not a.startswith("columns") for a in probed.values())
     checks["the probe of v, which ann may read, answers no rows at every door, and Postgres's Describe names v only (11-09 audit M1)"] = \
         all("permission denied" not in a and not a.startswith(("4", "5")) and '"isError":true' not in a.replace(" ", "") for a in own.values()) and own["Postgres Describe"] == "columns v"
+    # (and a door that reads only, MCP's query tool or a Flight ticket, moves none for anyone, wherever the call is: a view's
+    # query holds a nextval the statement's text doesn't. HTTP, which writes, still numbers through the view for ann)
+    for q in ["CREATE VIEW next_ticket AS SELECT nextval('tickets_id_seq') AS n", "GRANT SELECT ON next_ticket TO ann"]:
+        ask(boss, q)
+    through = {door: doors[door]("SELECT n FROM next_ticket", False) for door in ("Flight SQL", "MCP", "HTTP")}
+    unseen["H1, read doors"] = through
+    reads_only = lambda v: "read-only transaction" in v and "nextval" in v
+    checks["a door that reads only, MCP's query tool and a Flight ticket, moves no sequence through a view's query either; HTTP still does for ann, a writer of tickets (11-09 audit H1)"] = \
+        reads_only(through["Flight SQL"]) and reads_only(through["MCP"]) and went(through["HTTP"])
     info["unseen"] = unseen
     node.kill()
     ok = all(checks.values())
