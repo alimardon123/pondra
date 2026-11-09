@@ -39,7 +39,8 @@ const lake = args.includes('--lake')
   : resolve(dirname(fileURLToPath(import.meta.url)), '../web/lake');
 const sizes = args.includes('--sizes');
 // How the line below moves: the module's brotli stays the gate, with at least 3 KB of room above main, since a change of
-// layout alone moves it by 1-2 KB; and the line moves down only with cuts measured in the module's own wasm bytes.
+// layout alone moves it by 1-2 KB (once by 62 KB, 11-09); and the line moves down only with cuts measured in the
+// module's own wasm bytes.
 // The most a page may download (`--sizes`: the module at brotli 11, as a server sends it), designs/page-same-core.md P4. It
 // moves down with each cut, never up without a reason in the commit that moves it. 9.2 → 9.206 MB: eager aggregation
 // (`eager.rs`, 6.2 KB), a rule every form's planner runs (TPC-DS q22 3.46 → 0.42 s), the room above main kept as it was.
@@ -55,7 +56,11 @@ const sizes = args.includes('--sizes');
 // 9.2305 → 9.2442 MB: a dropped database kept in its folder and UNDROP DATABASE (13.7 KB over main's 9,224,889 at
 // caedf432: 9,238,567 at f0045f19, measured on CI), the room above main kept as it was: the page builds the same ddl as
 // every form, a database's drop and undrop with it.
-const BROTLI_BUDGET = 9_244_200;
+// 9.2442 → 9.3099 MB: the module's code order, not its code. #709 into main's bb80824c (eb0efea, measured on CI): its wasm
+// 128 B and its gzip 193 B over main's, its brotli 62.5 KB over (9,305,835): brotli's 4 MB window finds fewer matches
+// when the same code lands in another order. #716 lands at the same 9.306 MB with 4.2 KB of wasm of its own.
+// (Here: #716's 9,306,734 at its merge into bb80824c, the room above main kept as it was.)
+const BROTLI_BUDGET = 9_309_900;
 // The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
 const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows
