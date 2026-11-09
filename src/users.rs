@@ -1383,7 +1383,7 @@ pub(crate) fn fresh(lake: &Lake, now: Option<u64>, then: Option<u64>, at: datafu
 /// databases attach each other). A user granted some tables needs a grant naming the other lake's
 /// table besides (`Access::named`).
 pub async fn across(other: &Lake, ns: &str) -> Result<()> {
-    if let Some(r) = crate::store::reach_of(&other.url).filter(|r| r.read_only) {
+    if let Some(r) = other.node.reaches.of(&other.url).filter(|r| r.read_only) {
         return read_only(&r, ns);
     }
     if crate::auth::operator() || !(crate::auth::tokens_on(&other.node) || any(other).await) {
@@ -1395,7 +1395,7 @@ pub async fn across(other: &Lake, ns: &str) -> Result<()> {
 /// A lake on another server, attached READ_ONLY (ADR-058): its users sign in there, and its bucket
 /// key reads all of it whoever asks, so here it is read by whoever may use that key's secret (a
 /// user granted USAGE on it), and by tokens, as files under a secret's scope are.
-fn read_only(r: &crate::store::Reach, ns: &str) -> Result<()> {
+fn read_only(r: &crate::reaches::Reach, ns: &str) -> Result<()> {
     let scope = crate::rights::scope();
     if scope.whole() {
         return Ok(());

@@ -7,6 +7,8 @@
 //! 3. ATTACH of a lake nobody leads needs the pondra program, which a host's process doesn't have: the
 //!    error says so by name (invariant 62).
 //! 4. A second node can't open while one is open: refused by name, and the first keeps running.
+//! 5. A query that grows the host's process past its memory line (`PONDRA_MEMORY_MAX_GB`) is stopped with 53200, not
+//!    the host (11-08 audit H3), and the node answers after.
 #![cfg(feature = "server")]
 #![recursion_limit = "256"] // (as the program's: a node's futures are deep)
 use pondra::library::{Opened, State};
@@ -158,6 +160,8 @@ fn a_library_node_takes_over_recovers_and_refuses_by_name() {
 }
 
 fn run() {
+    // (the process's memory line, for check 5: the watch reads it once, at the first node's start)
+    std::env::set_var("PONDRA_MEMORY_MAX_GB", "1");
     let at = At::new();
     let dir = std::env::temp_dir().join(format!("pondra-library-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -165,6 +169,7 @@ fn run() {
     stops_on_a_panic(&at, &dir);
     let open = attach_needs_the_program(&at, &dir);
     one_at_a_time(open, &dir);
+    stops_a_query_not_the_host(&at, &dir);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -298,4 +303,25 @@ fn one_at_a_time(open: Opened, dir: &Path) {
     assert!(text.contains("close it first"), "the refusal says to close the open node first: {text}");
     assert_eq!(open.state(), State::Running, "the first node is still running after the refusal");
     open.close();
+}
+
+/// 5. A query the pool can't see grow (`array_agg` over 30M values in three groups holds them outside the query memory)
+/// grows the host's process past its line of 1 GB: the watch stops it, and its frugal second try, with 53200, as on a
+/// node, where the OS would have ended the host (11-08 audit H3). The process stays under 1.5 GB, and the node answers
+/// after.
+fn stops_a_query_not_the_host(at: &At, dir: &Path) {
+    let lake = dir.join("five").display().to_string();
+    let addr = free_addr();
+    let url = format!("http://{addr}");
+    let node = Opened::open(Options::local(&lake, &addr)).expect("a node opens");
+    let aggregate = "SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, 30000000) GROUP BY 1";
+    let r = at.send_within(&url, aggregate, Duration::from_secs(600));
+    assert_eq!((r.status, r.code.as_str()), (503, "53200"), "the query is stopped for memory: {} {}", r.label(), r.body);
+    let peak = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:"))?.split_whitespace().nth(1)?.parse::<u64>().ok());
+    if let Some(kb) = peak {
+        assert!(kb < 3 << 19, "the process peaked under 1.5 GB: {} MB", kb >> 10);
+    }
+    let after = poll(30, || (at.send(&url, "SELECT 1 AS one").status == 200).then_some(()));
+    assert!(after.is_some(), "the node answers after the stop");
+    node.close();
 }

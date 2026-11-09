@@ -1240,7 +1240,7 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope, sql: &str) -> Res
     // (a database's own record keeps only its attachment here: its folder's mark is what lists it, `undrop::LAKE_MARK`)
     gone.extend(crate::undrop::all(lake).await?.into_iter().filter(|(_, k)| k.kind != "database").map(|(name, k)| Gone { kind: k.kind.clone(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
     if sql.to_lowercase().contains("pondra.dropped") {
-        let beside = crate::undrop::lakes_kept(&crate::ddl::folder_of(&lake.url)).await.unwrap_or_default(); // (a folder that won't list: none)
+        let beside = crate::undrop::lakes_kept(&crate::ddl::folder_of(&lake.url), Some(&lake.node.reaches)).await.unwrap_or_default(); // (a folder that won't list: none)
         gone.extend(beside.into_iter().map(|(name, _, k)| Gone { kind: "database".into(), at_ms: k.at_ms, until: k.until(), rows: None, bytes: None, by: k.by, name }));
         // (deleted files a version of which is kept (`files::deleted`): a file has no rows, and its bytes are its newest version's)
         gone.extend(crate::files::deleted(lake).await?.into_iter().map(|f| Gone { kind: "file".into(), at_ms: f.at_ms, until: f.kept_until(), rows: None, bytes: Some(f.bytes), by: f.by, name: f.path }));

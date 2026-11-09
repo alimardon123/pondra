@@ -41,14 +41,7 @@ pub struct Type {
     pub labels: Vec<String>,
 }
 
-/// An enum column, as its table keeps it: the labels it takes, and the type it is of (none for
-/// `ENUM('a', 'b')` written in the column).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Enum {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub of: Option<String>,
-    pub labels: Vec<String>,
-}
+pub use crate::table_record::Enum;
 
 impl Enum {
     /// The column's type as SQL writes it: its type's name, or `ENUM('a', 'b')`.

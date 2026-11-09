@@ -7,7 +7,6 @@
 use crate::text::{ident, object};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::sql::sqlparser::ast;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use super::{Column, Table};
@@ -125,18 +124,7 @@ fn deferred(c: &Option<ast::ConstraintCharacteristics>) -> Result<()> {
 
 // ---------------------------------------------------------------- identity columns (`seq.rs`)
 
-/// One option as written (`INCREMENT BY 2`, `NO MAXVALUE`, `AS integer`); a later one of a kind wins.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Opt {
-    As(String),
-    Increment(i64),
-    Min(Option<i64>),
-    Max(Option<i64>),
-    Start(i64),
-    Cache(i64),
-    Cycle(bool),
-}
+pub use crate::table_record::{Identity, Opt};
 
 impl Opt {
     pub fn rank(&self) -> usize { [matches!(self, Opt::As(_)), matches!(self, Opt::Increment(_)), matches!(self, Opt::Min(_)), matches!(self, Opt::Max(_)), matches!(self, Opt::Start(_)), matches!(self, Opt::Cache(_)), matches!(self, Opt::Cycle(_))].iter().position(|m| *m).unwrap_or(0) }
@@ -293,16 +281,6 @@ pub fn in_order(sql: &str) -> Option<String> {
         Err(_) => c[0].to_string(), // (the parser says what's wrong)
     });
     (out != sql).then(|| out.into_owned())
-}
-
-/// An identity column, as its table keeps it (its column's `identity`, `store::Col`).
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-pub struct Identity {
-    pub always: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub declared: Vec<Opt>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub sequence: String,
 }
 
 impl Identity {

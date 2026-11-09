@@ -2570,10 +2570,10 @@ pub async fn through_bucket(dir: &str, req: Request, node: &Arc<NodeState>) -> R
 /// sql` process, which ends right after), or, from a node, in a `pondra sql` of its own. `req` None is
 /// nothing to record (`lead_only`): the lake is led for the moment, and its inbox answered.
 async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool, node: &Arc<NodeState>) -> Result<Value> {
-    if let Some(r) = crate::store::reach_of(dir).filter(|r| r.read_only) {
+    if let Some(r) = node.reaches.of(dir).filter(|r| r.read_only) {
         return across(dir, &r, req, node).await; // (a lake on another server: ADR-058)
     }
-    let store = crate::store::counted(open_store(dir)?.1, &node.metrics); // (its requests the node's: `Counted`)
+    let store = crate::store::counted(open_store(dir, Some(&node.reaches))?.1, &node.metrics); // (its requests the node's: `Counted`)
     loop {
         match holder(&store, Some(&node.claims)).await? {
             // (another `pondra sql` is recording: wait)
@@ -2714,7 +2714,7 @@ pub(crate) fn read_only_refused(dir: &str) -> anyhow::Error {
 /// A lake on another server, read here with a read-only key (ADR-058): nothing here writes its
 /// bucket (no inbox, no term claimed), and only a branch's pin goes to its leader, at its
 /// ENDPOINT, with the pondra secret's token or the branch's own key.
-async fn across(dir: &str, r: &crate::store::Reach, req: Option<Request>, node: &NodeState) -> Result<Value> {
+async fn across(dir: &str, r: &crate::reaches::Reach, req: Option<Request>, node: &NodeState) -> Result<Value> {
     let Some(req @ Request::Ddl(crate::ddl::Ddl::Pin { .. } | crate::ddl::Ddl::Unpin { .. })) = req else {
         return Err(read_only_refused(dir));
     };
@@ -2726,7 +2726,7 @@ async fn across(dir: &str, r: &crate::store::Reach, req: Option<Request>, node: 
     let at = match &r.endpoint {
         Some(e) => e.trim_end_matches('/').to_string(),
         None => {
-            let store = open_store(dir)?.1;
+            let store = open_store(dir, Some(&node.reaches))?.1; // (with its read-only key: `r`, the node's for it)
             match latest(&store).await? {
                 Some(t) if !t.addr.is_empty() && alive(&store, &t, Some(&node.claims)).await => crate::dial::url(&t.addr),
                 _ => bail!("nobody leads {dir}"),
@@ -2821,7 +2821,7 @@ pub(crate) fn start_over(why: &str, job: &str, life: &dyn Lifecycle) -> ! {
 /// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go, however it ends.
 /// `req` None records nothing (`lead_only`); it is taken once the lake is ours (left for another leader if it isn't).
 async fn lead(dir: &str, store: &Store, term: u64, req: &mut Option<Request>, node: &Arc<NodeState>) -> Result<Value> {
-    let marks = crate::terms::mark_every(store.clone(), term);
+    let marks = crate::terms::mark_every(&node.tasks, store.clone(), term);
     let out = led(dir, term, req, node).await;
     marks.abort(); // (its mark stops before the term is let go, so no mark lands after it)
     release(store, term, &node.claims).await; // the next writer or node doesn't have to wait
