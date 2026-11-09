@@ -65,6 +65,7 @@ replica catalog
 scan catalog
 sketch catalog
 store catalog
+pins catalog
 table_record catalog
 terms catalog
 files catalog
