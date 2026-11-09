@@ -121,6 +121,7 @@ fn ddl_touches(d: &Ddl) -> Vec<Touch> {
     let object = |n: &str| vec![Touch::Object(n.to_string())];
     match d {
         Ddl::UndropKept { kind, name } if kind == "schema" => vec![Touch::Schema(name.clone())],
+        Ddl::UndropKept { kind, .. } if kind == "database" => vec![], // (as a CREATE DATABASE: it changes nothing here)
         Ddl::DropTable { name, .. } | Ddl::Undrop { name } | Ddl::UndropKept { name, .. } | Ddl::Clone { name, .. } | Ddl::CreateView { name, .. } | Ddl::CreateExternal { name, .. }
         | Ddl::CreateMaterialized { name, .. } | Ddl::DropView { name, .. } | Ddl::Attach { name, .. } | Ddl::Detach { name, .. } | Ddl::CreateRoutine { name, .. }
         | Ddl::DropRoutine { name, .. } | Ddl::CreateSecret { name, .. } | Ddl::AttachOutside { name, .. } | Ddl::DropSecret { name, .. } | Ddl::CreateTask { name, .. }
