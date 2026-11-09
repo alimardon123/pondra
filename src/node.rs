@@ -16,7 +16,9 @@ use tokio::sync::mpsc;
 use crate::members::Members;
 
 #[cfg(feature = "doors")] mod run;
+#[cfg(feature = "doors")] pub(crate) mod kept;
 #[cfg(feature = "doors")] pub use run::{Node, Options};
+#[cfg(feature = "doors")] pub use kept::State;
 #[cfg(feature = "doors")] pub(crate) use run::{request, Held};
 
 pub use crate::lifecycle::{Guest, Restarting};
@@ -64,11 +66,16 @@ fn stop(why: String, host: Option<&Host>) {
 /// A node's host: what it is told when the node's own work fails or must start again (`Event`), and where the node's
 /// lake moves go (`memory::set_location`). A library's supervisor and `pondra serve` each make one (`Host::new`) and give
 /// it to every node they start (`Options::host`): it outlives each node, as the host does. A node with none (a guest, a
-/// command's own, a test's) stops its process on a failure, and can't move its lake.
+/// command's own, a test's) stops its process on a failure, and can't move its lake. A folder of lakes' server keeps
+/// each of its databases' nodes in its own process (`Host::beside`).
 #[derive(Clone)]
 pub struct Host {
     events: mpsc::UnboundedSender<Event>,
     moves: mpsc::UnboundedSender<crate::lifecycle::Move>,
+    /// Does the host keep the node in its process beside others, and reach it there (each database of `pondra serve
+    /// <folder>`, `dbserver.rs`)? Then the node binds no port of its own (`Options::database`), a restart is in place, as a
+    /// library's is, and the process isn't the node's: the host and its other nodes go on.
+    beside: bool,
 }
 
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a library's and `pondra serve`'s, the doors half's)
@@ -84,8 +91,21 @@ impl Host {
     pub fn new() -> (Host, Told) {
         let (events, events_rx) = mpsc::unbounded_channel();
         let (moves, moves_rx) = mpsc::unbounded_channel();
-        (Host { events, moves }, Told { events: events_rx, moves: moves_rx })
+        (Host { events, moves, beside: false }, Told { events: events_rx, moves: moves_rx })
     }
+
+    /// A host that keeps its node in its process beside others (`beside`), and its end of what the node tells it. Its
+    /// node's lake can't move: a database is its folder's (its end of the moves is let go of at once).
+    #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a lakes server's: the doors half's)
+    pub(crate) fn beside() -> (Host, Told) {
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let (moves, _) = mpsc::unbounded_channel();
+        let (_, moves_rx) = mpsc::unbounded_channel();
+        (Host { events, moves, beside: true }, Told { events: events_rx, moves: moves_rx })
+    }
+
+    /// Does it keep its node in its process beside others (`Host::beside`)?
+    pub(crate) fn keeps_beside(&self) -> bool { self.beside }
 
     /// Tells the host `e` (a library's close, which is the host's own).
     #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's close sends it)
@@ -139,7 +159,7 @@ impl crate::lifecycle::Lifecycle for Native {
         }
     }
     fn one_off(&self) -> bool { self.guest }
-    fn owns_process(&self) -> bool { !hosted() }
+    fn owns_process(&self) -> bool { !hosted() && !self.host.as_ref().is_some_and(Host::keeps_beside) }
     fn program(&self) -> anyhow::Result<PathBuf> { exe() }
     fn lead_elsewhere<'a>(&'a self, dir: &'a str, reaches: &'a crate::reaches::Reaches) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir, &self.settings, reaches)) }
     fn movable(&self) -> bool { self.host.as_ref().is_some_and(Host::movable) }
@@ -215,9 +235,9 @@ fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carr
             held.values().for_each(|(_, f)| crate::terms::say(f, &format!("restarting {}", crate::log::now_ms())));
         }
     }
-    if hosted() {
+    if hosted() || host.is_some_and(Host::keeps_beside) {
         if let Some(h) = host {
-            h.tell(Event::Restart(why.to_string())); // (in place: a library's host keeps its process)
+            h.tell(Event::Restart(why.to_string())); // (in place: a library's host keeps its process, a lakes server its other databases)
         }
         std::panic::resume_unwind(Box::new(Restarting(why.to_string())))
     }

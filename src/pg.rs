@@ -41,28 +41,68 @@ use std::sync::Arc;
 /// Accept Postgres clients on `addr`.
 pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let tls = crate::tls::pg(); // (sslmode=require: `tls.rs`)
-    let parser = Arc::new(Parser);
-    // One registry of connections for the server: a cancel request finds its connection's key here.
-    let cancels = Arc::new(ConnectionManager::new());
-    let cancel = Arc::new(DefaultCancelHandler::new(cancels.clone()));
+    let door = Door::new(app);
     loop {
         let (socket, _) = listener.accept().await?;
-        if app.lake.node.drain.draining() {
-            continue; // (stopping: a new connection goes to another node, `drain.rs`)
+        door.take(socket);
+    }
+}
+
+/// A node's Postgres door: what each connection to it is handed, whether it came to the node's own port (`serve`) or a
+/// host that keeps the node in its process passed it on (a lakes server's database, `dbserver.rs`). Its connections share
+/// one registry, where a cancel request finds its connection by its key.
+pub struct Door {
+    app: App,
+    tls: Option<tokio_rustls::TlsAcceptor>, // (sslmode=require: `tls.rs`)
+    parser: Arc<Parser>,
+    cancels: Arc<ConnectionManager>,
+    cancel: Arc<DefaultCancelHandler>,
+}
+
+impl Door {
+    pub fn new(app: App) -> Door {
+        let cancels = Arc::new(ConnectionManager::new());
+        Door { app, tls: crate::tls::pg(), parser: Arc::new(Parser), cancel: Arc::new(DefaultCancelHandler::new(cancels.clone())), cancels }
+    }
+
+    /// A new connection's handlers, and its session: a connection is a session, whose temporary tables end with it
+    /// (`temp.rs`). None while the node drains: a new connection goes to another node (`drain.rs`).
+    fn handlers(&self) -> Option<(Arc<Pg>, String)> {
+        if self.app.lake.node.drain.draining() {
+            return None;
         }
-        let tls = tls.clone();
-        // A connection is a session: its temporary tables end with it (`temp.rs`).
-        let session = format!("pg-{}", uuid::Uuid::new_v4().simple());
-        let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), again: Default::default(), copy: Default::default(), me: me.clone() });
-        let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: cancels.clone() };
-        let pg = Arc::new(Pg(backend, Arc::new(startup), cancel.clone()));
-        let used = app.lake.node.idle.begin(); // (an open connection is a use of the node: `idle.rs`)
-        let home = crate::temp::sessions(&app.lake); // (the node's sessions, which this connection's ends in)
-        app.lake.node.tasks.spawn_as(crate::auth::Door, async move {
-            let _used = used;
+        let (app, session) = (&self.app, format!("pg-{}", uuid::Uuid::new_v4().simple()));
+        let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: self.parser.clone(), session: session.clone(), who: Default::default(), again: Default::default(), copy: Default::default(), me: me.clone() });
+        let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: self.cancels.clone() };
+        Some((Arc::new(Pg(backend, Arc::new(startup), self.cancel.clone())), session))
+    }
+
+    /// A connection to the node's own port, served on a task of the node's.
+    pub fn take(&self, socket: tokio::net::TcpStream) {
+        let Some((pg, session)) = self.handlers() else { return };
+        let tls = self.tls.clone();
+        self.serve_one(session, async move {
             let _ = socket.set_nodelay(true);
             let _ = pgwire::tokio::process_socket(socket, tls, pg).await;
+        });
+    }
+
+    /// A connection its host passed on in this process, its startup message not read yet: the host ended the client's TLS
+    /// and checked it was allowed, as it does a connection to the node's own port (`dbserver.rs`).
+    #[cfg(unix)]
+    pub fn take_passed(&self, socket: tokio::net::UnixStream) {
+        let Some((pg, session)) = self.handlers() else { return };
+        self.serve_one(session, async move {
+            let _ = pgwire::tokio::process_socket_unix(socket, pg).await;
+        });
+    }
+
+    fn serve_one(&self, session: String, served: impl std::future::Future<Output = ()> + Send + 'static) {
+        let used = self.app.lake.node.idle.begin(); // (an open connection is a use of the node: `idle.rs`)
+        let home = crate::temp::sessions(&self.app.lake); // (the node's sessions, which this connection's ends in)
+        self.app.lake.node.tasks.spawn_as(crate::auth::Door, async move {
+            let _used = used;
+            served.await;
             if let Some(at) = &home {
                 at.end(&session);
             }
