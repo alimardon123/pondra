@@ -167,26 +167,7 @@ pub fn holds(dead: &[(i64, i64)], stats: &crate::manifest::Stats) -> bool {
     }
 }
 
-/// A block of row ids reserved from the leader: `(block << 32) + n`, n counting up. A node takes a
-/// new block when one runs out (or after a restart: ids are never reused).
-#[derive(Default)]
-pub struct Ids(std::sync::Mutex<Option<(u64, u64)>>); // (block, next n)
-
-impl Ids {
-    /// `rows` consecutive ids, if the block has them (else None: reserve a block first).
-    pub fn take(&self, rows: u64) -> Option<i64> {
-        let mut b = self.0.lock().unwrap();
-        let (block, next) = (*b)?;
-        if next + rows > 1 << 32 {
-            *b = None;
-            return None;
-        }
-        *b = Some((block, next + rows));
-        Some(((block << 32) + next) as i64)
-    }
-
-    pub fn refill(&self, block: u64) { *self.0.lock().unwrap() = Some((block, 0)); }
-}
+// (A process's block of row ids is the catalog's, `store::Ids`: the log stamps a commit's rows with them.)
 
 /// A bulk INSERT's rows with their system columns: ids from `first` on, the commit number and
 /// time the writer reserved (`log::To::reserve`).

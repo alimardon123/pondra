@@ -467,6 +467,17 @@ pub struct Block {
     at: Option<Instant>,
 }
 
+/// The sequences' blocks this node hands out on a lake (`next`), by sequence: a lake's state.
+#[derive(Default)]
+pub struct Blocks(tokio::sync::Mutex<HashMap<String, Block>>);
+
+impl crate::lake_state::LakeState for Blocks {
+    const NAME: &'static str = "sequence_blocks";
+    const ABOUT: &'static str = "the sequences' values this node hands out, a block of each reserved from the leader";
+
+    fn make() -> Self { Blocks::default() }
+}
+
 const FIRST: u64 = 32; // a node's first block (CACHE asks for more)
 const MOST: u64 = 1 << 20;
 
@@ -476,7 +487,8 @@ pub async fn next(lake: &Lake, name: &str, n: usize) -> Result<Vec<i64>> {
     gone_with(lake, &name, &s).await?;
     may_write(&name)?;
     let base = (shape(&s.declared)?.cache as u64).max(if lake.to.get().is_some() { FIRST } else { 1 });
-    let mut blocks = lake.sequences.lock().await; // (one refill at a time: the others wait for it)
+    let blocks = lake.state::<Blocks>()?;
+    let mut blocks = blocks.0.lock().await; // (one refill at a time: the others wait for it)
     let b = blocks.entry(name.clone()).or_default();
     if b.version < s.version {
         *b = Block::default(); // (made again, changed or set since)
@@ -511,7 +523,7 @@ async fn set(lake: &Lake, name: &str, value: i64, called: bool) -> Result<i64> {
     gone_with(lake, &name, &s).await?;
     may_write(&name)?;
     submit(lake, Op::Set { name: name.clone(), value, called }).await?;
-    lake.sequences.lock().await.remove(&name);
+    lake.state::<Blocks>()?.0.lock().await.remove(&name);
     Ok(value)
 }
 
