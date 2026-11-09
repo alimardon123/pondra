@@ -28680,7 +28680,8 @@ def publishing():
     left out of that format, and the statement says so; and nothing of theirs is written as Delta or
     Iceberg (a finished view's partial rows were, before). Then the files' ranges: the formats carry
     each file's min and max and NULLs, so every reader (Pondra, DuckDB, delta-rs, PyIceberg) answers
-    a filter as the model does, and a reader skips the files a filter rules out."""
+    a filter as the model does, and a reader skips the files a filter rules out. And the Iceberg view lists only the
+    snapshots whose files are still there: none from before a merge that let files go."""
     import urllib.request
     lake = new_lake()
     node = Node(lake, A.port, tier_secs=0.5, publish="delta,iceberg").start()
@@ -28855,6 +28856,40 @@ def publishing():
         checks["a node reading the table's folder skips the 3 files a filter on id rules out (pondra_files_skipped_total)"] = one == [{"n": 1}] and skipped >= 3
         print(f"publishing: files skipped by read_delta WHERE id = 30: {skipped:g}")
         reader.kill()
+        # The history the Iceberg view lists is the history it can serve (I1, the 11-09 Iceberg review): a merge lets small
+        # files go, deleted after --retain-secs (0 here), so the snapshots from before it, which name them, aren't listed, nor
+        # their metadata files; once the files let go are gone, every snapshot listed reads by its id.
+        hist_lake = new_lake()
+        hist = Node(hist_lake, A.port + 5, tier_secs=0.5, retain_secs=0).start()
+        try:
+            sql(A.port + 5, "CREATE TABLE h (id BIGINT) WITH (publish = 'iceberg')")
+            for k in range(10):  # (a file each: small files merge eight at a time, `tier::class`)
+                sql(A.port + 5, f"INSERT INTO h VALUES ({k})")
+                sql(A.port + 5, "CHECKPOINT")
+            hist_table = lambda: StaticTable.from_metadata(open_check.iceberg_metadata(hist_lake, "h"), properties=open_check.iceberg_props(hist_lake))
+            in_h = lambda p: p[p.index("data/h/"):]
+            def parquet_in_h():  # every Parquet object in the table's folder, at any depth
+                if hist_lake.startswith("s3://"):
+                    return {k for k in lake_objects(hist_lake, "data/h/") if k.endswith(".parquet")}
+                return {in_h(os.path.join(d, f)) for d, _, fs in os.walk(os.path.join(hist_lake, "data", "h")) for f in fs if f.endswith(".parquet")}
+            def named_by_listed():  # the data files the snapshots listed name, each read by its id
+                t = hist_table()
+                return {in_h(f.file.file_path) for s in t.metadata.snapshots for f in t.scan(snapshot_id=s.snapshot_id).plan_files()}
+            sql(A.port + 5, "CREATE TABLE tick (n BIGINT)")
+            def settled():  # (merged, and the small files let go then deleted: only the files the snapshots listed name are left)
+                sql(A.port + 5, "INSERT INTO tick VALUES (1)")  # (retention runs in tiering rounds, which an idle lake doesn't run)
+                return len(parquet_in_h()) < 10 and parquet_in_h() == named_by_listed()
+            merged = until(lambda: _try(settled), True, 90)
+            t = hist_table()
+            first = min(s.sequence_number for s in t.metadata.snapshots)
+            reads = [_try(lambda s=s: t.scan(snapshot_id=s.snapshot_id).to_arrow().num_rows) for s in t.metadata.snapshots]
+            checks["a merge lets small files go: the Iceberg view lists the snapshots from it on, each read by its id once those files are gone (--retain-secs 0)"] = \
+                merged is True and first > 1 and all(r is not None for r in reads) and t.scan().to_arrow().num_rows == 10
+            checks["…and its metadata log names only those snapshots' metadata"] = all(int(e.metadata_file.rsplit("/v", 1)[1].split(".")[0]) >= first for e in t.metadata.metadata_log)
+            if not all(checks.values()):
+                print(f"publishing: history: merged {merged}, first listed {first}, reads {reads}, on disk {sorted(parquet_in_h())}")
+        finally:
+            hist.kill()
     finally:
         node.kill()
     for name, good in checks.items():
