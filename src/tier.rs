@@ -1556,7 +1556,8 @@ mod tests {
         let briefs = || async { anyhow::Ok(lake.cat.scan::<TableMeta>("t/", "t0").await?.iter().map(|(k, m)| (k[2..].to_string(), Brief::of(m))).collect::<Tables>()) };
         expire_with(&lake, 0, &briefs().await?).await?; // (the first round sweeps for orphans, an hour's: every table's entry)
         let from = lake.visible();
-        let seg = Segment { parts: BTreeMap::from([("t0".to_string(), vec![(0, 0, 1)])]), ..Default::default() };
+        // (written now: a replaced file stays while a segment kept from before it was let go may name it)
+        let seg = Segment { parts: BTreeMap::from([("t0".to_string(), vec![(0, 0, 1)])]), ts_ms: crate::log::now_ms(), ..Default::default() };
         lake.cat.commit(vec![(seg_key(from + 1), json(&seg))], &[]).await?;
         lake.advance(from + 1);
         let mut t5 = lake.cat.get::<TableMeta>(&table_key("t5")).await?.unwrap();
