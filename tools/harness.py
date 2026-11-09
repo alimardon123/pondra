@@ -21088,7 +21088,7 @@ def jsons():
 
     def in_where():
         """The operators in a WHERE clause find the rows they name, over HTTP and the port, with no parentheses: `doc #>> '{c,d}'
-        IS NULL` is `(doc #>> '{c,d}') IS NULL`, as Postgres 16 groups it (path::door's text, `pg_json::text`)."""
+        IS NULL` is `(doc #>> '{c,d}') IS NULL`, as Postgres 16 groups it (path::door's text, `grouping::text`)."""
         http = [r["id"] for r in q("SELECT id FROM jp WHERE t ?| ARRAY['zz','c'] AND doc #>> '{c,d}' IS NULL ORDER BY id")]
         port = [r[0] for r in pg_rows("SELECT id FROM jp WHERE doc @> '{\"a\": \"x\"}' AND t #>> '{b,0}' = '1' ORDER BY id")]
         info["WHERE with the operators: rows over HTTP, then the port"] = [http, port]
@@ -21311,7 +21311,7 @@ def jsons():
 
 def _jsons_w2(check, url, q, info):
     """Brief W2 (PR #131). The Postgres port types a statement's columns from the text its JSON operators read (`pg_trace::one`
-    runs `pg_json::text` first), so `doc ? 'a'`, `?|`, `?&` and `@>` send doc as jsonb (3802) under Postgres's name for it; and
+    runs `grouping::text` first), so `doc ? 'a'`, `?|`, `?&` and `@>` send doc as jsonb (3802) under Postgres's name for it; and
     COPY … TO STDOUT types its columns as RowDescription does, so a binary COPY sends a jsonb's version byte and a uuid's 16
     bytes. Every expected answer is Postgres 16's on the same rows (a scratch database, dropped after): the rows, the column
     names and type codes, and the three COPY streams, header and trailer included."""
@@ -27185,7 +27185,7 @@ def dialects():
     FLOOR = {"postgres": 42, "duckdb": 35, "snowflake": 18, "spark": 13, "mysql": 21, "bigquery": 23, "sqlserver": 17}
     XX000 = 0  # (refusals that are internal errors: lower it as they get codes, never raise it)
     lake = new_lake()
-    node = Node(lake, A.port).start()
+    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}").start()
     q = lambda s: sql(A.port, s)
     checks, info = {}, {}
     # Columns named as the system's are: an append table and a keyed one, three rows each, then every kind of change.
@@ -27254,6 +27254,21 @@ def dialects():
            "with a $name": hinted("SELECT /*! 1 + */ 2 AS x, $k AS k", "dialects-hint-var")}
     info["a /*! … */ comment"] = got
     checks["a /*! … */ comment is refused (0A000) over HTTP after USE and with a $name, as it is without (11-07 audit M2)"] = all(st == "0A000" for _, st, _ in got.values())
+    # IS [NOT] DISTINCT FROM's right side ends where Postgres and DuckDB end it (`grouping::text`). sqlparser's generic
+    # dialect read `a IS DISTINCT FROM b OR c` as `a IS DISTINCT FROM (b OR c)`: with booleans a wrong answer, and no error
+    # ([3, 4] and [3, 4] here). Over HTTP, the port and a view's stored text.
+    import psycopg
+    q("CREATE TABLE dfg (id INT, a BOOLEAN, b BOOLEAN, c BOOLEAN)")
+    q("INSERT INTO dfg VALUES (1, true, false, true), (2, true, true, false), (3, NULL, NULL, true), (4, false, NULL, false)")
+    loose = {"a IS DISTINCT FROM b OR c": [1, 3, 4], "a IS NOT DISTINCT FROM b AND c": [3]}  # (DuckDB 2.0's rows)
+    q("CREATE VIEW dfv AS SELECT id FROM dfg WHERE a IS DISTINCT FROM b OR c")
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as conn:
+        got = {w: {"http": [r["id"] for r in q(f"SELECT id FROM dfg WHERE {w} ORDER BY id")],
+                   "port": [r[0] for r in conn.execute(f"SELECT id FROM dfg WHERE {w} ORDER BY id").fetchall()]} for w in loose}
+    got["the view"] = [r["id"] for r in q("SELECT id FROM dfv ORDER BY id")]
+    info["IS DISTINCT FROM before AND and OR"] = got
+    checks["IS [NOT] DISTINCT FROM before AND or OR compares only what Postgres compares: DuckDB 2.0's rows over HTTP, the port and a view"] = \
+        all(got[w] == {"http": want, "port": want} for w, want in loose.items()) and got["the view"] == [1, 3, 4]
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"dialects": checks, "ok": ok, "info": info}, indent=1, default=str))

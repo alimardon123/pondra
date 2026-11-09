@@ -301,11 +301,11 @@ fn quoted(s: &str) -> ast::Ident { ast::Ident::with_quote('"', s) }
 
 /// `sql` parsed as one statement, read as SQL comes in: Postgres's JSON operators first (`doc ? 'a'`, `doc ?& …`,
 /// `doc @> …`), which the generic dialect can't parse, so every column traced here (Describe, the answer's names,
-/// stored views) is the one the statement runs with (`pg_json::text`, borrowed when it has no such operator); then as
+/// stored views) is the one the statement runs with (`grouping::text`, borrowed when it has no such operator); then as
 /// the front reads it (`parsed::read`), so a form the fallback dialect's hooks read (a list comprehension, a lambda) is
 /// a statement here too, and RETURNING and a WITH that writes are found in it (11-09 audit L11).
 pub(crate) fn one(sql: &str) -> Option<Statement> {
-    let mut parsed = crate::parsed::read(&crate::pg_json::text(sql)).ok()?;
+    let mut parsed = crate::parsed::read(&crate::grouping::text(sql)).ok()?;
     (parsed.len() == 1).then(|| parsed.pop()).flatten()
 }
 
