@@ -463,7 +463,7 @@ async fn commit(app: &crate::app::App, lake: &std::sync::Arc<Lake>, commits: Vec
         match (raw.contains(CONFLICT), raw.contains(REFUSED)) {
             (true, _) => {
                 let lake = lake.clone();
-                crate::panics::task(async move { futures::future::join_all(files.iter().map(|f| lake.delete(f))).await }); // (never recorded)
+                crate::spawns::task(async move { futures::future::join_all(files.iter().map(|f| lake.delete(f))).await }); // (never recorded)
                 conflict(e)
             }
             (_, true) => bad(e),

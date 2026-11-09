@@ -526,7 +526,7 @@ fn start(app: &crate::app::App, s: &str, level: Level, read_only: bool, job: Opt
     book.txns.insert(s.to_string(), txn);
     if !book.upkeep {
         book.upkeep = true;
-        crate::panics::spawn(upkeep());
+        crate::spawns::spawn(upkeep());
     }
     true
 }
@@ -681,6 +681,7 @@ fn word_of(stmt: &Stmt) -> &'static str {
         Stmt::Merge(_) => "MERGE",
         Stmt::AddColumn(..) | Stmt::SetOptions(..) => "ALTER TABLE",
         Stmt::CopyTo(..) | Stmt::CopyInto(..) => "COPY",
+        Stmt::UndropFile(_) => "UNDROP FILE",
         Stmt::Ddl(ds) => match ds.first() {
             Some(Ddl::DropTable { .. }) => "DROP TABLE",
             Some(Ddl::DropView { .. }) => "DROP VIEW",
