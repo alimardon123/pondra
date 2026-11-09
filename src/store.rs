@@ -2669,7 +2669,10 @@ impl Lake {
             None => datafusion::prelude::SessionContext::new_with_config_rt(config, self.rt.clone()),
         };
         #[cfg(target_arch = "wasm32")]
-        let ctx = engine().and_then(|e| e.on_a_page).map_or(ctx, |planned| planned(ctx));
+        let ctx = match engine().and_then(|e| e.on_a_page) {
+            Some(planned) => planned(ctx),
+            None => ctx,
+        };
         ctx
     }
 
