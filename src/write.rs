@@ -2637,7 +2637,7 @@ pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
     if t.addr.is_empty() || !alive(&lake.store, &t).await || crate::env::is_set("PONDRA_NO_DIRECT") {
         return None;
     }
-    crate::log::To::Leader(t.addr).reserve().await.ok()
+    crate::log::To::leader(lake, t.addr).reserve().await.ok()
 }
 
 /// Send a request to the leader over HTTP.

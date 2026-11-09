@@ -261,10 +261,14 @@ pub const SEQ_FROM_1: &str = "a producer's batches count from seq=1 (seq 0 would
 #[derive(Clone)]
 pub enum To {
     Local(Arc<Sequencer>),
-    Leader(String),
+    /// The leader's address, and its lake's bell for a flush the leader didn't take (`Kept::untaken`).
+    Leader(String, Arc<tokio::sync::Notify>),
 }
 
 impl To {
+    /// The leader at `addr`, for lake `lake`'s flushes.
+    pub fn leader(lake: &Lake, addr: String) -> To { To::Leader(addr, lake.log.untaken.clone()) }
+
     /// A commit number of its own, its time, and a block of row ids (`Sequencer::reserve`).
     pub async fn reserve(&self) -> Result<Reserved> { self.ask(Flush { reserve: 1, block: true, ..Default::default() }).await }
 
@@ -285,22 +289,10 @@ impl To {
     async fn outcome(&self, f: Flush) -> Result<Outcome> {
         Ok(match self {
             To::Local(seq) => seq.submit(f).await?,
-            To::Leader(addr) => led(addr, dial::call(addr, dial::Call::post("/cluster/commit", encode_flush(&f)?)).await.inspect_err(|_| untaken())?)?.checked()?.json().await?,
+            To::Leader(addr, untaken) => led(addr, dial::call(addr, dial::Call::post("/cluster/commit", encode_flush(&f)?)).await.inspect_err(|_| untaken.notify_one())?)?.checked()?.json().await?,
         })
     }
 }
-
-// A follower's flush its leader didn't take: its follow loop (`cluster::Cluster::follow`) asks the leader at once, not at its
-// next beat. (Here, not in `cluster`, which this layer doesn't reach: the follow loop waits on it.)
-crate::per_node!(static UNTAKEN: tokio::sync::Notify = tokio::sync::Notify::new(); clear = |_| ());
-
-/// A flush this follower sent its leader went unanswered (the connection refused or closed): a drained leader's door is
-/// closing, and it steps down a moment later. Its follow loop asks it again now, then every tenth of a second.
-fn untaken() { UNTAKEN.notify_one() }
-
-/// Waits for a flush the leader didn't take (`untaken`), for the follow loop.
-#[cfg(feature = "doors")]
-pub async fn untaken_flush() { UNTAKEN.notified().await }
 
 /// The leader's answer to a flush, or the refusal of one that doesn't lead (421, `server::commit`): made before any
 /// sequencer took it, so its writes are refused as never run (57P03), and their clients send them again, to this node once
@@ -461,11 +453,11 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                     unanswered = false;
                     anyhow::Ok(outcome)
                 }
-                To::Leader(addr) => {
+                To::Leader(addr, untaken) => {
                     let request = dial::call(addr, dial::Call::post("/cluster/commit", encode_flush(&f)?));
                     drop(done.take()); // (sent in order; over HTTP they may still arrive out of order, rarely)
                     unanswered = true;
-                    let response = request.await.inspect_err(|_| untaken())?; // (its follow loop looks now: `cluster.rs`)
+                    let response = request.await.inspect_err(|_| untaken.notify_one())?; // (its follow loop looks now: `cluster.rs`)
                     // (a 4xx is the leader's refusal, made before its sequencer took the flush; a 5xx, or a body lost on the
                     // way, may come after it did, so the rows may still commit: lost, as a dropped reply is here)
                     unanswered = !(400..500).contains(&response.status);
@@ -770,12 +762,19 @@ impl Sequencer {
     }
 }
 
-crate::per_node!(
-    /// Producers whose progress left the catalog (a view dropped: `emit:`, `join:`, `fill:`): the
-    /// sequencer forgets what it remembered of them, so a view made again under the name starts over.
-    static FORGOTTEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new()));
+/// What the log keeps for a lake between its commits (`Lake::log`).
+#[derive(Default)]
+pub struct Kept {
+    /// Producers whose progress left the catalog (a view dropped: `emit:`, `join:`, `fill:`): the lake's sequencer forgets
+    /// what it remembered of them, so a view made again under the name starts over (`forget_producers`).
+    forgotten: std::sync::Mutex<Vec<String>>,
+    /// A flush this lake's node sent its leader that the leader didn't take (the connection refused or closed: a drained
+    /// leader's door is closing, and it steps down a moment later). Its follow loop (`cluster.rs`) asks it again at once, then
+    /// every tenth of a second (`To::outcome`, `send`).
+    pub(crate) untaken: Arc<tokio::sync::Notify>,
+}
 
-pub fn forget_producers(names: impl IntoIterator<Item = String>) { FORGOTTEN.lock().unwrap().extend(names); }
+pub fn forget_producers(lake: &Lake, names: impl IntoIterator<Item = String>) { lake.log.forgotten.lock().unwrap().extend(names); }
 
 /// The family of expiry keys: `g/{due, 20 digits}/{producer}` → the seq that mark stood at when its
 /// commit kept it. Due its window (`store::kept_ms`), the mark goes if its producer's seq is still that
@@ -917,7 +916,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
     let (mut puts, mut seqs, mut replies) = (vec![], HashMap::<String, u64>::new(), vec![]);
     let mut lost: Vec<String> = vec![]; // (keys the filings of this commit delete: `Filing::gone`)
     let (mut inline, mut inline_parts) = (vec![], BTreeMap::<String, Vec<(u64, u64, u64)>>::new()); // all inline flushes: one segment
-    for p in std::mem::take(&mut *FORGOTTEN.lock().unwrap()) {
+    for p in std::mem::take(&mut *lake.log.forgotten.lock().unwrap()) {
         producers.forget(&p);
     }
     let (mut owes, blocks) = (vec![], *block);
@@ -1081,7 +1080,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
     let durable = lake.cat.write(puts, &dropped).await?;
     // (the job marks this commit deleted: forgotten once the delete is written, so the cache holds
     // them until then; `copy::entries`)
-    forget_producers(dropped.iter().filter_map(|k| k.strip_prefix("p/job:").map(|j| format!("job:{j}"))));
+    forget_producers(lake, dropped.iter().filter_map(|k| k.strip_prefix("p/job:").map(|j| format!("job:{j}"))));
     producers.remember(seqs);
     let (lake, ms, hwm) = (lake.clone(), ms.clone(), *next - 1);
     crate::panics::spawn(async move {
@@ -1297,6 +1296,17 @@ mod tests {
         let refused = anyhow::Error::new(Refusal { why: format!("{e:#}"), lost: false }); // (as `send` gives it to each writer)
         assert_eq!((crate::codes::of(&e), crate::codes::of(&refused), unanswered(&refused)), ("57P03", "57P03", false), "{e:#}");
         assert!(led("127.0.0.1:8712", reply(200)).is_ok());
+    }
+
+    /// Two lakes in one process keep their forgets apart: a producer forgotten by one lake's view drop is not the other's.
+    #[tokio::test]
+    async fn a_forget_is_its_lakes_alone() -> Result<()> {
+        let open = || async { crate::store::Lake::open(&format!("memory://forget-{}", uuid::Uuid::new_v4().simple()), true, false, crate::node_state::NodeState::unhosted()).await };
+        let (a, b) = (open().await?, open().await?);
+        forget_producers(&a, ["job:x".to_string()]);
+        assert_eq!(a.log.forgotten.lock().unwrap().as_slice(), ["job:x"]);
+        assert!(b.log.forgotten.lock().unwrap().is_empty());
+        Ok(())
     }
 
     #[test]
