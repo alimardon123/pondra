@@ -21,7 +21,6 @@
 //!   the gap. A row that falls inside a session already emitted is late, and left out.
 use crate::codes::coded;
 use crate::query::{first_table, over, session_for};
-use crate::reset::Once as _;
 use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -1082,20 +1081,41 @@ struct Runs {
     failed: Failures,
 }
 
-crate::per_node!(static RUNS: std::sync::Mutex<std::collections::HashMap<(String, String), Runs>> = Default::default());
+/// What a lake's views keep (its state, `lake_state.rs`): each view's runs here (`turn`), the slots their background runs
+/// take (`slot`), its tables' newest event times (`newest_parts`, `watermark`), and its inline views as its sequencer holds
+/// flushes to them (`inline`).
+#[derive(Default)]
+pub struct Kept {
+    runs: std::sync::Mutex<std::collections::HashMap<String, Runs>>, // (by view)
+    slots: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>>,
+    seen: std::sync::Mutex<std::collections::HashMap<String, (u64, BTreeMap<String, i64>)>>, // (by `table|time`)
+    since: std::sync::Mutex<std::collections::HashMap<String, (i64, u64)>>, // (by `table|time|part`)
+    inline: std::sync::Mutex<Option<std::sync::Arc<Inline>>>,
+    bounded: std::sync::Mutex<Vec<String>>, // (the fills its sequencer set `upto` for)
+}
+
+impl crate::lake_state::LakeState for Kept {
+    const NAME: &'static str = "views";
+    const ABOUT: &'static str = "its views' runs here and the slots they take, its tables' newest event times for their watermarks, and its inline views as its sequencer holds flushes to them";
+
+    fn make() -> Self {
+        Kept::default()
+    }
+}
 
 /// A view's turn to run here, given back by `ended` when its run ends (or by `drop`, when it stops unfinished).
 struct Turn {
-    key: (String, String),
+    runs: std::sync::Arc<Kept>,
+    view: String,
     what: &'static str,
     done: bool,
 }
 
-/// `key`'s turn to run for the view `of` (`identity`), if it has none running and its backoff is over; the run is then its
-/// own. A view made again under the name has another identity: it starts afresh, once the old one's run has ended.
-fn turn_of(key: (String, String), of: &str, what: &'static str) -> Option<Turn> {
-    let mut runs = RUNS.lock().unwrap();
-    let run = runs.entry(key.clone()).or_default();
+/// `view`'s turn to run in `kept` for the view `of` (`identity`), if it has none running and its backoff is over; the run is
+/// then its own. A view made again under the name has another identity: it starts afresh, once the old one's run has ended.
+fn turn_of(kept: &std::sync::Arc<Kept>, view: &str, of: &str, what: &'static str) -> Option<Turn> {
+    let mut runs = kept.runs.lock().unwrap();
+    let run = runs.entry(view.to_string()).or_default();
     if run.of != of {
         if run.running {
             return None; // (the old view's run is still going: the new one waits for it to end)
@@ -1106,47 +1126,49 @@ fn turn_of(key: (String, String), of: &str, what: &'static str) -> Option<Turn> 
         return None;
     }
     run.running = true;
-    Some(Turn { key, what, done: false })
+    Some(Turn { runs: kept.clone(), view: view.to_string(), what, done: false })
 }
 
 /// The turn of view `view` on `lake` to run, as `turn_of`.
 fn turn(lake: &Lake, view: &str, of: &str, what: &'static str) -> Option<Turn> {
-    turn_of((lake.url.clone(), view.to_string()), of, what)
+    turn_of(&lake.state::<Kept>().ok()?, view, of, what)
 }
 
-/// Ends `key`'s run: its failures noted (`what` starts the log line), and the next run not before its backoff.
-fn record(key: &(String, String), what: &str, error: Option<String>) {
-    let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner()); // (it runs in a Drop: a poisoned lock is used as it is)
-    let Some(run) = runs.get_mut(key) else { return }; // (its node stopped: its state is gone)
-    run.running = false;
-    run.failed.note(&format!("{what} {}", key.1), error);
-    run.after = (run.failed.failures > 0).then(|| datafusion::common::instant::Instant::now() + run.failed.backoff());
+impl Kept {
+    /// Ends `view`'s run: its failures noted (`what` starts the log line), and the next run not before its backoff.
+    fn record(&self, view: &str, what: &str, error: Option<String>) {
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner()); // (it runs in a Drop: a poisoned lock is used as it is)
+        let Some(run) = runs.get_mut(view) else { return }; // (the view was dropped meanwhile: its runs are forgotten)
+        run.running = false;
+        run.failed.note(&format!("{what} {view}"), error);
+        run.after = (run.failed.failures > 0).then(|| datafusion::common::instant::Instant::now() + run.failed.backoff());
+    }
+
+    /// Why `view`'s runs keep failing, if they do (two in a row), for the view `of`.
+    fn failing(&self, view: &str, of: &str) -> Option<String> {
+        self.runs.lock().unwrap().get(view).filter(|run| run.of == of).and_then(|run| run.failed.failing())
+    }
 }
 
 impl Turn {
     /// The run ended with `out`.
     fn ended(mut self, out: &Result<()>) {
         self.done = true;
-        record(&self.key, self.what, out.as_ref().err().map(|e| format!("{e:#}")));
+        self.runs.record(&self.view, self.what, out.as_ref().err().map(|e| format!("{e:#}")));
     }
 }
 
 impl Drop for Turn {
     fn drop(&mut self) {
         if !self.done {
-            record(&self.key, self.what, Some("its run stopped unfinished (a panic, or its node stopped)".into()));
+            self.runs.record(&self.view, self.what, Some("its run stopped unfinished (a panic, or its node stopped)".into()));
         }
     }
 }
 
-/// Why `key`'s runs keep failing, if they do (two in a row), for the view `of`.
-fn failing_of(key: &(String, String), of: &str) -> Option<String> {
-    RUNS.lock().unwrap().get(key).filter(|run| run.of == of).and_then(|run| run.failed.failing())
-}
-
 /// Whether `view`'s runs (as `failing`) have kept failing for longer than `hold`.
 fn failing_longer_than(lake: &Lake, view: &str, of: &str, hold: std::time::Duration) -> bool {
-    RUNS.lock().unwrap().get(&(lake.url.clone(), view.to_string())).is_some_and(|run| run.of == of && run.failed.failing_longer_than(hold))
+    lake.state::<Kept>().is_ok_and(|k| k.runs.lock().unwrap().get(view).is_some_and(|run| run.of == of && run.failed.failing_longer_than(hold)))
 }
 
 /// How long a filling that keeps failing holds its keyed source's tiering back (`fill_end`): failures that pass, such as a
@@ -1163,7 +1185,7 @@ pub(crate) fn identity(v: &View) -> &str {
 
 /// Why view `view`'s runs on `lake` keep failing, if they do: `pondra.flows`' `error`. `of`: the view's `identity`.
 pub fn failing(lake: &Lake, view: &str, of: &str) -> Option<String> {
-    failing_of(&(lake.url.clone(), view.to_string()), of)
+    lake.state::<Kept>().ok()?.failing(view, of)
 }
 
 /// Forgets the runs of views `lake` no longer has: `views` is every view it scans now (stream joins' too, so they are kept
@@ -1171,17 +1193,17 @@ pub fn failing(lake: &Lake, view: &str, of: &str) -> Option<String> {
 /// `turn_of` sees that its identity differs.
 fn forget_runs(lake: &Lake, views: &[(String, View)]) {
     let names: std::collections::HashSet<&str> = views.iter().map(|(k, _)| &k[2..]).collect();
-    RUNS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(url, name), _| url != &lake.url || names.contains(name.as_str()));
+    if let Ok(k) = lake.state::<Kept>() {
+        k.runs.lock().unwrap_or_else(|e| e.into_inner()).retain(|name, _| names.contains(name.as_str()));
+    }
 }
 
-crate::per_node!(
-    /// How many background view runs go at once on a node (`PONDRA_VIEW_RUNS`; half its cores, at least 2), rerun's
-    /// included. Taken inside a run's own task (a Semaphore is first come first served: every view gets its turn).
-    static SLOTS: std::sync::RwLock<Option<std::sync::Arc<tokio::sync::Semaphore>>> = Default::default());
-
-/// A slot for one background view run: waits until one is free.
-pub(crate) async fn slot() -> tokio::sync::OwnedSemaphorePermit {
-    let slots = SLOTS.get_or(|| std::sync::Arc::new(tokio::sync::Semaphore::new(crate::env::value::<usize>("PONDRA_VIEW_RUNS").max(1))));
+/// A slot for one of `lake`'s background view runs: waits until one is free. As many go at once as `PONDRA_VIEW_RUNS` says
+/// (half its node's cores, at least 2), rerun's included. Taken inside a run's own task (a Semaphore is first come first
+/// served: every view gets its turn).
+pub(crate) async fn slot(lake: &Lake) -> tokio::sync::OwnedSemaphorePermit {
+    let made = || std::sync::Arc::new(tokio::sync::Semaphore::new(crate::env::value::<usize>("PONDRA_VIEW_RUNS").max(1)));
+    let slots = lake.state::<Kept>().map(|k| k.slots.get_or_init(made).clone()).unwrap_or_else(|_| made());
     slots.acquire_owned().await.expect("never closed")
 }
 
@@ -1213,7 +1235,7 @@ where
     let (lake, name) = (lake.clone(), name.to_string());
     // (a view's run is the node's own work, as its refresh is, whoever reads it after: `auth::as_node`)
     crate::panics::aside(crate::auth::as_node(async move {
-        let _slot = slot().await;
+        let _slot = slot(&lake).await;
         let out = match lake.cat.get::<View>(&view_key(&name)).await {
             Ok(Some(v)) => bounded(run(lake.clone(), name.clone(), v)).await,
             Ok(None) => Ok(()),
@@ -1263,13 +1285,12 @@ fn part_of(_producer: Option<&str>) -> &'static str { "" }
 async fn newest_parts(lake: &Lake, table: &str, time: &str) -> Result<BTreeMap<String, i64>> {
     use datafusion::arrow::{array::AsArray, compute::{cast, max}, datatypes::{DataType, TimeUnit, TimestampMicrosecondType}};
     use datafusion::common::ScalarValue;
-    use std::sync::Mutex;
-    crate::per_node!(static SEEN: Mutex<std::collections::HashMap<String, (u64, BTreeMap<String, i64>)>> = Default::default());
-    let key = format!("{}|{table}|{time}", lake.url);
+    let kept = lake.state::<Kept>()?;
+    let key = format!("{table}|{time}");
     let meta: TableMeta = lake.cat.get(&table_key(table)).await?.with_context(|| format!("no table {table}"))?;
     let stored = meta.stored(time).unwrap_or(time).to_string(); // (files' ranges know it by its stored name: ADR-022)
     let upto = lake.visible();
-    let (mut seen, mut parts) = SEEN.lock().unwrap().get(&key).cloned().unwrap_or((0, BTreeMap::new()));
+    let (mut seen, mut parts) = kept.seen.lock().unwrap().get(&key).cloned().unwrap_or((0, BTreeMap::new()));
     let us = DataType::Timestamp(TimeUnit::Microsecond, None);
     let part = part_of(None);
     if seen < meta.tiered {
@@ -1294,7 +1315,7 @@ async fn newest_parts(lake: &Lake, table: &str, time: &str) -> Result<BTreeMap<S
         seen = upto;
     }
     // (views run side by side: the state that read further is kept, and its parts with it)
-    let mut known = SEEN.lock().unwrap();
+    let mut known = kept.seen.lock().unwrap();
     let kept = known.entry(key).or_insert((seen, parts.clone()));
     if seen > kept.0 {
         *kept = (seen, parts);
@@ -1323,13 +1344,12 @@ fn least_of(parts: &BTreeMap<String, i64>, lateness_secs: u64, idle_secs: Option
 /// batch counted as late. With several parts (`part_of`), each part's newest time less the lateness,
 /// moved on by `idle` as above, and the least of them (`least_of`).
 pub(crate) async fn watermark(lake: &Lake, table: &str, time: &str, lateness_secs: u64, idle_secs: Option<u64>) -> Result<Option<i64>> {
-    use std::sync::Mutex;
-    crate::per_node!(static SINCE: Mutex<std::collections::HashMap<String, (i64, u64)>> = Default::default());
+    let kept = lake.state::<Kept>()?;
     let parts = newest_parts(lake, table, time).await?;
     let now = crate::log::now_ms();
     Ok(least_of(&parts, lateness_secs, idle_secs, |part, newest| {
-        let mut seen = SINCE.lock().unwrap();
-        let e = seen.entry(format!("{}|{table}|{time}|{part}", lake.url)).or_insert((newest, now));
+        let mut seen = kept.since.lock().unwrap();
+        let e = seen.entry(format!("{table}|{time}|{part}")).or_insert((newest, now));
         if newest > e.0 {
             *e = (newest, now);
         }
@@ -1618,15 +1638,17 @@ pub struct Inline {
     pub unbounded: Vec<(String, View)>,                             // views whose filling doesn't end yet
 }
 
-crate::per_node!(static INLINE: std::sync::Mutex<BTreeMap<String, std::sync::Arc<Inline>>> = std::sync::Mutex::new(BTreeMap::new()));
-crate::per_node!(static BOUNDED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new())); // (fills this process set `upto` for)
-
-pub fn forget(lake: &Lake) { INLINE.lock().unwrap().remove(&lake.url); }
+pub fn forget(lake: &Lake) {
+    if let Ok(k) = lake.state::<Kept>() {
+        *k.inline.lock().unwrap() = None;
+    }
+}
 
 /// The inline views, as the sequencer holds flushes to them.
 pub async fn inline(lake: &Lake) -> Result<std::sync::Arc<Inline>> {
-    if let Some(i) = INLINE.lock().unwrap().get(&lake.url) {
-        return Ok(i.clone());
+    let kept = lake.state::<Kept>()?;
+    if let Some(i) = kept.inline.lock().unwrap().clone() {
+        return Ok(i);
     }
     let mut i = Inline::default();
     for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
@@ -1642,29 +1664,34 @@ pub async fn inline(lake: &Lake) -> Result<std::sync::Arc<Inline>> {
         if v.expect.iter().any(|e| e.on != OnViolation::Keep) {
             i.tables.insert(crate::rejects::TABLE.into()); // (the rows they drop: `derive`)
         }
-        if v.fill.as_ref().is_some_and(|f| f.upto.is_none() && !BOUNDED.lock().unwrap().contains(&f.id)) {
+        if v.fill.as_ref().is_some_and(|f| f.upto.is_none() && !kept.bounded.lock().unwrap().contains(&f.id)) {
             i.unbounded.push((t, v));
         }
     }
     let i = std::sync::Arc::new(i);
-    INLINE.lock().unwrap().insert(lake.url.clone(), i.clone());
+    *kept.inline.lock().unwrap() = Some(i.clone());
     Ok(i)
 }
 
 /// Sequencer: where the fillings of views made since the last commit end (this commit's puts):
 /// every row before `next` is theirs to fill; every flush from this commit on derives their rows.
 pub fn bound(lake: &Lake, inline: &Inline, next: u64) -> Vec<(String, Vec<u8>)> {
+    let kept = lake.state::<Kept>().ok();
     let mut puts = vec![];
     for (t, v) in &inline.unbounded {
         let fill = v.fill.clone().map(|f| Fill { upto: Some(next - 1), ..f });
-        BOUNDED.lock().unwrap().extend(fill.iter().map(|f| f.id.clone()));
+        if let Some(k) = &kept {
+            k.bounded.lock().unwrap().extend(fill.iter().map(|f| f.id.clone()));
+        }
         puts.push((view_key(t), json(&View { fill, ..v.clone() })));
     }
-    let mut cache = INLINE.lock().unwrap();
-    if !puts.is_empty() && cache.get(&lake.url).is_some_and(|c| std::ptr::eq(c.as_ref(), inline)) {
-        // (unless a view was made or dropped meanwhile: then the next commit reads them all again)
-        let bounded = Inline { by_source: inline.by_source.clone(), tables: inline.tables.clone(), unbounded: vec![] };
-        cache.insert(lake.url.clone(), std::sync::Arc::new(bounded));
+    if let Some(k) = kept.filter(|_| !puts.is_empty()) {
+        let mut cache = k.inline.lock().unwrap();
+        if cache.as_ref().is_some_and(|c| std::ptr::eq(c.as_ref(), inline)) {
+            // (unless a view was made or dropped meanwhile: then the next commit reads them all again)
+            let bounded = Inline { by_source: inline.by_source.clone(), tables: inline.tables.clone(), unbounded: vec![] };
+            *cache = Some(std::sync::Arc::new(bounded));
+        }
     }
     puts
 }
@@ -2267,34 +2294,36 @@ mod tests {
 
     #[tokio::test]
     async fn a_views_runs_take_turns_back_off_and_forget_a_run_that_stopped() {
-        let key = ("test-lake-runs".to_string(), "registry_a".to_string());
-        let t = turn_of(key.clone(), "", "emission of").expect("its first turn");
-        assert!(turn_of(key.clone(), "", "emission of").is_none(), "one run at a time");
+        let kept = std::sync::Arc::new(Kept::default());
+        let key = "registry_a";
+        let t = turn_of(&kept, key, "", "emission of").expect("its first turn");
+        assert!(turn_of(&kept, key, "", "emission of").is_none(), "one run at a time");
         t.ended(&Err(anyhow::anyhow!("boom")));
-        assert!(turn_of(key.clone(), "", "emission of").is_none(), "after a failure, its backoff");
-        assert_eq!(failing_of(&key, ""), None, "one failure is not yet failing");
-        RUNS.lock().unwrap().get_mut(&key).unwrap().after = Some(datafusion::common::instant::Instant::now());
-        let t = turn_of(key.clone(), "", "emission of").expect("its backoff is over");
+        assert!(turn_of(&kept, key, "", "emission of").is_none(), "after a failure, its backoff");
+        assert_eq!(kept.failing(key, ""), None, "one failure is not yet failing");
+        kept.runs.lock().unwrap().get_mut(key).unwrap().after = Some(datafusion::common::instant::Instant::now());
+        let t = turn_of(&kept, key, "", "emission of").expect("its backoff is over");
         t.ended(&Err(anyhow::anyhow!("boom")));
-        assert_eq!(failing_of(&key, "").as_deref(), Some("boom"));
-        RUNS.lock().unwrap().get_mut(&key).unwrap().after = None;
-        drop(turn_of(key.clone(), "", "emission of").expect("a turn"));
-        assert!(RUNS.lock().unwrap().get(&key).is_some_and(|r| !r.running), "a turn dropped unfinished is given back");
+        assert_eq!(kept.failing(key, "").as_deref(), Some("boom"));
+        kept.runs.lock().unwrap().get_mut(key).unwrap().after = None;
+        drop(turn_of(&kept, key, "", "emission of").expect("a turn"));
+        assert!(kept.runs.lock().unwrap().get(key).is_some_and(|r| !r.running), "a turn dropped unfinished is given back");
     }
 
     #[tokio::test]
     async fn a_view_made_again_under_its_name_starts_afresh() {
-        let key = ("test-lake-again".to_string(), "registry_again".to_string());
-        let t = turn_of(key.clone(), "a", "emission of").expect("a's first turn");
-        assert!(turn_of(key.clone(), "b", "emission of").is_none(), "while a's run is going, b's waits for it to end");
+        let kept = std::sync::Arc::new(Kept::default());
+        let key = "registry_again";
+        let t = turn_of(&kept, key, "a", "emission of").expect("a's first turn");
+        assert!(turn_of(&kept, key, "b", "emission of").is_none(), "while a's run is going, b's waits for it to end");
         t.ended(&Err(anyhow::anyhow!("boom")));
-        RUNS.lock().unwrap().get_mut(&key).unwrap().after = Some(datafusion::common::instant::Instant::now());
-        let t = turn_of(key.clone(), "a", "emission of").expect("a's backoff is over");
+        kept.runs.lock().unwrap().get_mut(key).unwrap().after = Some(datafusion::common::instant::Instant::now());
+        let t = turn_of(&kept, key, "a", "emission of").expect("a's backoff is over");
         t.ended(&Err(anyhow::anyhow!("boom")));
-        assert_eq!(failing_of(&key, "a").as_deref(), Some("boom"));
-        assert_eq!(failing_of(&key, "b"), None, "a's failures are not b's");
-        let t = turn_of(key.clone(), "b", "emission of").expect("b's first turn: no backoff of a's");
-        assert_eq!(failing_of(&key, "a"), None, "a is gone: its failures went with it");
+        assert_eq!(kept.failing(key, "a").as_deref(), Some("boom"));
+        assert_eq!(kept.failing(key, "b"), None, "a's failures are not b's");
+        let t = turn_of(&kept, key, "b", "emission of").expect("b's first turn: no backoff of a's");
+        assert_eq!(kept.failing(key, "a"), None, "a is gone: its failures went with it");
         t.ended(&Ok(()));
     }
 
