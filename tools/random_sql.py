@@ -5,6 +5,7 @@ agree; and each query split by a random condition `p` into `WHERE p`, `WHERE NOT
 `WHERE p IS NULL` must give back its rows exactly (ternary logic partitioning), on Pondra alone.
 
   random_sql.py [--queries 100000] [--secs 600] [--seed 1] [--nodes 3] [--out logs/round31/random.json]
+  random_sql.py --texts 3000 [--seed 1]   (the texts alone, for the print check in `parsed.rs`)
 
 Exits 1 on a wrong answer (DuckDB's, the three nodes' or the partitions' differ), a node that stopped, or a
 known difference (`KNOWN`) past its date, and 0 otherwise: a query only Pondra refuses is listed (`kind:
@@ -139,9 +140,18 @@ def pondra(port, sql, spread=False):
 
 
 def main():
-    import duckdb
     rnd = random.Random(A.seed)
     g = Gen(rnd)
+    if A.texts:  # (the queries' texts alone, a JSON string a line: `parsed::tests::random_queries_print_as_they_mean`)
+        made = 0
+        while made < A.texts:
+            tables, _ = g.tables()
+            for _ in range(min(A.every, A.texts - made)):
+                head, tail, cols = g.query(tables)
+                print(json.dumps(head + (f" WHERE {g.pred(cols)}" if rnd.random() < 0.5 else "") + tail))
+                made += 1
+        return 0
+    import duckdb
     harness.A = argparse.Namespace(s3=False, keep=False, port=A.port)
     stats = {"queries": 0, "agree": 0, "both_refused": 0, "pondra_refused": 0, "duckdb_refused": 0, "partitions_checked": 0, "spread_checked": 0}
     for k in KNOWN:  # (each entry whole: an id, a matcher that compiles, its evidence, a real date)
@@ -252,5 +262,6 @@ if __name__ == "__main__":
     ap.add_argument("--nodes", type=int, default=3)
     ap.add_argument("--port", type=int, default=9400)
     ap.add_argument("--out")
+    ap.add_argument("--texts", type=int, default=0, help="print this many queries' texts, one a line as JSON, and run none")
     A = ap.parse_args()
     main()

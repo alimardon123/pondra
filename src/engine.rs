@@ -421,7 +421,10 @@ pub async fn planned(ctx: &SessionContext, sql: &str) -> anyhow::Result<LogicalP
 /// statements are compared, not their plans: DataFusion's planner gives one statement plans that differ run to run where
 /// no answer does (the columns an ORDER BY adds below its projection come out of a hash set, in either order).
 fn datafusions_parse(state: &datafusion::execution::SessionState, sql: &str, kept: &datafusion::sql::parser::Statement) -> anyhow::Result<()> {
-    let theirs = state.sql_to_statement(sql, &state.config().options().sql_parser.dialect);
+    let mut theirs = state.sql_to_statement(sql, &state.config().options().sql_parser.dialect);
+    if let Ok(datafusion::sql::parser::Statement::Statement(s)) = &mut theirs {
+        crate::parsed::signed(s.as_mut()); // (as the front's parse has it: `parsed::signed`)
+    }
     anyhow::ensure!(theirs.as_ref().is_ok_and(|t| t == kept), "one parse: the front's parse of the text is not DataFusion's, for {sql}\nthe front's: {kept}\nDataFusion's: {theirs:?}");
     Ok(())
 }

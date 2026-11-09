@@ -723,7 +723,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Ok(sql) => sql,
         Err(e) => return Some(Stmt::of_error(&e, format!("{e:#}"))),
     };
-    let parsed = crate::parsed::read(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (as the front reads it, parsed once for its looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
+    let parsed = crate::parsed::read(sql).or_else(|e| crate::set::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql).map(crate::parsed::signed_all))); // (as the front reads it, parsed once for its looks, `parsed.rs`; DuckDB's STRUCT(a INT), …: the session's dialect)
     let parsed = match parsed {
         Ok(mut s) => s.pop()?,
         Err(_) => return None,
@@ -2963,5 +2963,20 @@ mod tests {
         lake.cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    /// The texts the core keeps of a tree read back as they mean with a minus before a minus (`parsed::signed`): on main
+    /// before, `INSERT INTO w SELECT id, - -k FROM t` kept `SELECT id, --k FROM t` (`SELECT id,`), a view's query the
+    /// same, and the UPDATE a node sends its leader read as none.
+    #[test]
+    fn a_minus_before_a_minus_is_kept_as_it_means() {
+        use crate::ddl::Ddl;
+        let Some(Stmt::Insert(t, q)) = parse("INSERT INTO w SELECT id, - -k FROM t") else { panic!("an INSERT") };
+        assert_eq!((t.as_str(), q.as_str()), ("w", "SELECT id, -(-k) FROM t"));
+        let Some(Stmt::Ddl(d)) = parse("CREATE VIEW v AS SELECT id, - -k AS m FROM t") else { panic!("a view") };
+        assert!(matches!(&d[..], [Ddl::CreateView { sql, .. }] if sql == "SELECT id, -(-k) AS m FROM t"), "{}", serde_json::to_string(&d).unwrap_or_default());
+        let Some(Stmt::Update(t, set, cond)) = parse("UPDATE w SET b = - -a WHERE - -a > 0") else { panic!("an UPDATE") };
+        assert_eq!(t, "w");
+        assert_eq!(format!("{set:?} {cond:?}").matches("-(-a)").count(), 2, "{set:?} {cond:?}");
     }
 }

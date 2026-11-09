@@ -10487,7 +10487,8 @@ def viewtext():
     HTTP and from the Postgres port; on a second node; after a restart), and a column moved (`ALTER … ALTER COLUMN c
     FIRST`) takes its comments along, `ORDER BY 2` renumbered, a materialized view's rows kept. Made again another way, a
     view shows its new text (or its query as it reads); one whose text can't be kept (a list of column names) says so
-    and shows its query as it reads. A string holding `--` is no comment; a view calling a macro keeps its text too."""
+    and shows its query as it reads. A string holding `--` is no comment; a view calling a macro keeps its text too. A
+    minus before a minus (`- -k`) means one in a view, an INSERT … SELECT and an UPDATE, as in a query."""
     import psycopg
     lake = new_lake()
     nodes = [Node(lake, A.port, tier_secs=0.3, pg=f"127.0.0.1:{A.port + 10}").start(), Node(lake, A.port + 1, tier_secs=0.3).start()]
@@ -10497,6 +10498,18 @@ def viewtext():
     shown = lambda kind, v, port=A.port: q(f"SHOW CREATE {kind} {v}", port)[0]["definition"]
     line = lambda text, part: next((l for l in text.split("\n") if part in l), None)
     checks, info = {}, {}
+    # (sqlparser prints `- -k` as `--k`, a comment to the line's end: the texts the core keeps of a tree, a view's query and
+    # an INSERT's, were cut short, and an UPDATE's leader read none, until each parse put the operand in parentheses,
+    # `parsed::signed`)
+    q("CREATE TABLE neg (id BIGINT, k BIGINT)")
+    q("INSERT INTO neg VALUES (1, 3)")
+    q("CREATE TABLE negw (a BIGINT, b BIGINT)")
+    made = [_raises_text(lambda: q("CREATE VIEW negv AS SELECT id, - -k AS m FROM neg")), _raises_text(lambda: q("INSERT INTO negw SELECT id, - -k FROM neg")),
+            _raises_text(lambda: q("UPDATE negw SET b = - -b + 1 WHERE - -a = 1"))]
+    info["a minus before a minus"] = made
+    checks["a minus before a minus (`- -k`) means one in a view, an INSERT … SELECT and an UPDATE, as in a query"] = made == [""] * 3 \
+        and _try(lambda: q("SELECT * FROM negv")) == [{"id": 1, "m": 3}] and _try(lambda: q("SELECT * FROM negw")) == [{"a": 1, "b": 4}] \
+        and q("SELECT - -k AS m FROM neg") == [{"m": 3}]
 
     q("CREATE TABLE s (g BIGINT, x BIGINT, y BIGINT)")
     q("INSERT INTO s VALUES (1, 10, 100), (1, 11, 110), (2, 20, 200)")
