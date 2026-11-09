@@ -149,8 +149,10 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
     let mut who = crate::auth::Principal { epoch, ..crate::auth::Principal::of(if app.open().await { Role::Admin } else { Role::None }) }.at("kafka", from);
     let mut said = (who.role > Role::None).then_some(Said::Open); // (how it signed in, to check again: `again`)
     while let Ok(size) = rd.read_i32().await {
-        if let Some(s) = said.as_ref().filter(|_| who.stale(&app.lake)) {
-            who = again(&app, s).await.at("kafka", from);
+        if let Some(s) = said.as_ref() {
+            if let Some(now) = who.again(&app, || again(&app, s)).await {
+                who = now.unwrap_or_else(|_| crate::auth::Principal::of(Role::None)).at("kafka", from); // (signed out: its next request is refused)
+            }
         }
         let most = if who.role == Role::None { 1 << 20 } else { 128 << 20 }; // (before signing in: ApiVersions, SASL and Metadata, all small)
         ensure!((0..=most).contains(&size), "request of {size} bytes");
@@ -178,22 +180,21 @@ enum Said {
     Bearer(String),
 }
 
-/// Who a connection that signed in (`was`) is now, checked again at its next request once who may do what changed or its
-/// credential ended (`Principal::stale`; 11-02 audit H3): its user dropped, made no superuser or its grants taken back,
-/// its password changed, its token or session expired, and it is nobody, so its next fetch or produce ends the
+/// Whoever a connection that signed in as `said` says signs in now, asked at its next request once who may do what changed
+/// or its credential ended (`Principal::again`; 11-02 audit H3): its user dropped, made no superuser or its grants taken
+/// back, its password changed, its token or session expired, and it is nobody, so its next fetch or produce ends the
 /// connection; signed in at an open node, once the node is open no more. (A password is hashed at most once a minute:
 /// `users::password_ok` remembers it.)
-async fn again(app: &App, said: &Said) -> crate::auth::Principal {
-    let epoch = app.lake.cat.rights_version(); // (before it is asked again, as at sign-in)
+async fn again(app: &App, said: &Said) -> std::result::Result<crate::auth::Principal, String> {
     let now = match said {
         Said::Open => app.open().await.then(|| crate::auth::Principal::of(Role::Admin)),
         Said::Plain(user, password) => crate::users::sign_in(&app.lake, &app.auth, user, password).await,
         Said::Bearer(token) => crate::users::who(&app.lake, &app.auth, &crate::auth::Credential::Token(token.clone())).await,
     };
-    match now {
-        Some(p) => crate::auth::Principal { epoch: p.epoch.max(epoch), ..p },
-        None => crate::auth::Principal::of(Role::None),
-    }
+    now.ok_or_else(|| match said {
+        Said::Open => "the lake now signs its users in (CREATE USER, or a token): connect again and sign in".to_string(),
+        _ => "it can't sign in any more (dropped, NOLOGIN, its password changed, or its token revoked or ended)".to_string(),
+    })
 }
 
 async fn request(app: &App, me: &Broker, who: &mut crate::auth::Principal, said: &mut Option<Said>, peer: &crate::tls::Peer, buf: Bytes) -> Result<Reply> {
