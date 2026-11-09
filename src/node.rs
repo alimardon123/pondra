@@ -868,6 +868,58 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// A lake of its own, with its own node, led alone and run as a guest's (`pondra sql`'s) is: its statements go through
+    /// `on_node`, as the leader's doors send them, and no loop of the leader's runs beside them (a tiering round's minute
+    /// sweep would read every table inside a statement's count). The returned mark is aborted by the caller.
+    async fn lake_app() -> (crate::app::App, tokio::task::JoinHandle<()>) {
+        let url = format!("memory://catalog-counts-{}", uuid::Uuid::new_v4().simple());
+        let (alone, marks) = crate::members::Alone::lead(&crate::memory_lake::store(&url)).await.unwrap();
+        let lake = crate::store::Lake::open(&url, true, false, super::native(true)).await.unwrap(); // (a guest's: `node::start_app` starts no loops)
+        let app = super::start_app(lake, alone, None, &super::Start::default()).await.unwrap();
+        (app, marks)
+    }
+
+    /// The write-set rule (designs/redesign/redesign.md §4, step 5 piece 10e): a statement reads and writes the catalog
+    /// records of what it names, not of every table. Among 2,000 tables, each reads and writes fewer than 50. (Here, with
+    /// the node: a test in `write` may not start one, a floor below.)
+    #[tokio::test]
+    async fn a_statement_reads_and_writes_only_its_write_set() {
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let (lake, counts) = (app.lake.clone(), app.lake.node.metrics.clone()); // (this lake's own counters: its node's)
+            let spec = r#"{"columns": [["id", "Int64"], ["a", "Int64"]]}"#;
+            for i in 0..2000 {
+                crate::write::create_table(&lake, &format!("t{i}"), spec).await.unwrap();
+            }
+            let scope = crate::auth::Principal::node().scope;
+            // (a new table's folder check, `ddl::free_folder`, still reads every table once: piece 10c brings CREATE TABLE
+            // and CTAS under 50 too. Until then they may read no more than that once)
+            let (within, one_scan) = (50, 2_000 + 50);
+            let statements = [
+                ("INSERT", "INSERT INTO t0 VALUES (1, 1)", within),
+                ("UPDATE", "UPDATE t0 SET a = 2 WHERE id = 1", within),
+                ("DELETE", "DELETE FROM t0 WHERE id = 1", within),
+                ("CREATE VIEW", "CREATE VIEW v0 AS SELECT * FROM t0", within),
+                ("DROP TABLE", "DROP TABLE t1", within),
+                ("ALTER TABLE RENAME TO", "ALTER TABLE t2 RENAME TO t2b", within),
+                ("CREATE TABLE", "CREATE TABLE n0 (a BIGINT)", one_scan),
+                ("CREATE TABLE AS SELECT", "CREATE TABLE c0 AS SELECT * FROM t0", one_scan),
+            ];
+            for (what, sql, most) in statements {
+                let stmt = crate::write::parse(sql).unwrap_or_else(|| panic!("{sql}: not a statement"));
+                let (reads0, writes0) = (counts.catalog_reads.load(std::sync::atomic::Ordering::Relaxed), counts.catalog_writes.load(std::sync::atomic::Ordering::Relaxed));
+                crate::write::on_node(&app, stmt, None, &scope).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                let reads = counts.catalog_reads.load(std::sync::atomic::Ordering::Relaxed) - reads0;
+                let writes = counts.catalog_writes.load(std::sync::atomic::Ordering::Relaxed) - writes0;
+                eprintln!("{what}: read {reads}, wrote {writes}"); // (the numbers, with --nocapture)
+                assert!(reads < most && writes < 50, "{what} ({sql}) read {reads} and wrote {writes} catalog records of 2,000 tables; under {most} and 50");
+            }
+            marks.abort(); // (a dropped handle aborts nothing: its mark would land again after the lake is gone)
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
     #[test]
     fn a_claimed_page_refuses_a_second_claim_by_55006() {
         super::claim_page().expect("the first claim is taken");
