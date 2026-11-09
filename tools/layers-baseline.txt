@@ -246,16 +246,12 @@ store -> delta  1
 store -> engine  1
 store -> ext  2
 store -> finish  1
-store -> hot  2
 store -> in_task  1
 store -> locks  1
 store -> oom  2
-store -> query  2
 store -> rules  1
-store -> seq  2
-store -> serve  2
+store -> seq  1
 store -> served  1
-store -> sys  1
 store -> types  2
 store -> wasm32  15
 store -> write  1

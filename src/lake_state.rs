@@ -10,7 +10,9 @@
 //!    who is asking: that goes with the session.
 //! 3. When the lake goes, its states stop (`LakeState::stop`), the last made first.
 //! 4. A state that is a cache is charged to the lake's line as it is made, and gives memory back when the line needs it
-//!    (`LakeState::cache`).
+//!    (`LakeState::cache`). A cache every query reads (the lookups' row groups, the tables' tails) is made as its lake
+//!    opens instead (`Registered::add_at_open`, `States::open`), so the lake charges its caches in one order: the order
+//!    they give memory back in (`Lake::caches`).
 use crate::ledger::{Charged, Ledger};
 use crate::registry::{Registry, Section};
 use std::any::{Any, TypeId};
@@ -24,6 +26,23 @@ pub trait LakeState: Any + Send + Sync + Sized {
     const ABOUT: &'static str;
     /// A new one, for a lake that asks for it the first time.
     fn make() -> Self;
+
+    /// A new one, made as its lake opens (`Registered::add_at_open`), sized by what the lake says of itself: `make`'s, by
+    /// default.
+    fn make_as_it_opens(opening: &Opening) -> Self {
+        let _ = opening;
+        Self::make()
+    }
+
+    /// Does it keep what files hold, so the lake tells it of files a merge let go of (`files_gone`)? No, by default.
+    fn keeps_files(&self) -> bool {
+        false
+    }
+
+    /// The lake's merges let go of these files (path, bytes): what it keeps of them goes. Nothing, by default.
+    fn files_gone(&self, files: &[(String, u64)]) {
+        let _ = files;
+    }
     /// Its lake goes: anything it must end ends here. Nothing, by default.
     fn stop(&self) {}
     /// It as a cache the lake's line charges, when it is one: the line counts what it holds and takes memory back from it.
@@ -38,6 +57,20 @@ pub struct Entry {
     #[cfg_attr(not(test), allow(dead_code))] // (step 12's generated docs list every state with it)
     pub about: &'static str,
     id: TypeId,
+    /// Made as its lake opens (`add_at_open`): how.
+    at_open: Option<Maker>,
+}
+
+/// A new state as its lake opens, and it as a cache when it is one (`made_as_it_opens`).
+type Maker = fn(&Opening) -> (Arc<dyn Kept>, Option<Arc<dyn Charged>>);
+
+/// What a lake says of itself as it opens, to the states it makes then (`LakeState::make_as_it_opens`): its caches are
+/// sized by it.
+pub struct Opening {
+    /// A lake held in this process's memory (`memory://`).
+    pub memory: bool,
+    /// Its node's machine's memory, when it is known (`Machine::ram`).
+    pub ram: Option<usize>,
 }
 
 /// The registry's section of a lake's states: every one a lake may keep, as its extensions add them (`add`).
@@ -47,7 +80,13 @@ pub struct Registered(Vec<Entry>);
 impl Registered {
     /// A state a lake may keep.
     pub fn add<P: LakeState>(&mut self) {
-        self.push(Entry { name: P::NAME, about: P::ABOUT, id: TypeId::of::<P>() });
+        self.push(Entry { name: P::NAME, about: P::ABOUT, id: TypeId::of::<P>(), at_open: None });
+    }
+
+    /// A state each lake makes as it opens (`States::open`), in the order they are added: a cache every query reads,
+    /// which the lake charges among its own caches, in their order (`Lake::caches`).
+    pub fn add_at_open<P: LakeState>(&mut self) {
+        self.push(Entry { name: P::NAME, about: P::ABOUT, id: TypeId::of::<P>(), at_open: Some(made_as_it_opens::<P>) });
     }
 
     #[inline(never)] // (one copy for every state, as `States::get_any`)
@@ -85,17 +124,29 @@ pub struct States(Mutex<Vec<Made>>);
 
 struct Made {
     id: TypeId,
+    name: &'static str,
     state: Arc<dyn Kept>,
+    cache: Option<Arc<dyn Charged>>,
 }
 
-/// A state as `States` keeps it: one `stop` for every state's type, through its vtable.
+/// A state as `States` keeps it: one `stop` (and one each of the files' hooks) for every state's type, through its vtable.
 trait Kept: Any + Send + Sync {
     fn stop_kept(&self);
+    fn keeps_files_kept(&self) -> bool;
+    fn files_gone_kept(&self, files: &[(String, u64)]);
 }
 
 impl<P: LakeState> Kept for P {
     fn stop_kept(&self) {
         self.stop()
+    }
+
+    fn keeps_files_kept(&self) -> bool {
+        self.keeps_files()
+    }
+
+    fn files_gone_kept(&self, files: &[(String, u64)]) {
+        self.files_gone(files)
     }
 }
 
@@ -121,17 +172,54 @@ impl States {
         }
         anyhow::ensure!(r.find::<Registered>().is_some_and(|k| k.has(id)), "{name} is no state a lake keeps: the extension that owns it adds it to the registry's lake_state section (`lake_state::Registered::add`)");
         let (state, cache) = made();
-        if let (Some(line), Some(cache)) = (line, cache) {
-            line.charge(name, Arc::downgrade(&cache)); // (weak: it goes with its lake)
+        if let (Some(line), Some(cache)) = (line, &cache) {
+            line.charge(name, Arc::downgrade(cache)); // (weak: it goes with its lake)
         }
-        all.push(Made { id, state: state.clone() });
+        all.push(Made { id, name, state: state.clone(), cache });
         Ok(state)
+    }
+
+    /// Makes the states each lake makes as it opens (`Registered::add_at_open`), in the section's order. They aren't
+    /// charged here: the lake charges them among its own caches, in its order (`Lake::caches`).
+    pub fn open(&self, r: &Registry, opening: &Opening) {
+        let mut all = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        for k in r.find::<Registered>().map_or(&[][..], |k| &k.0) {
+            if let (Some(made), false) = (k.at_open, all.iter().any(|m| m.id == k.id)) {
+                let (state, cache) = made(opening);
+                all.push(Made { id: k.id, name: k.name, state, cache });
+            }
+        }
+    }
+
+    /// Does any of the states keep what files hold (`LakeState::keeps_files`)?
+    pub fn keep_files(&self) -> bool {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|m| m.state.keeps_files_kept())
+    }
+
+    /// The lake's merges let go of these files: each state that keeps what files hold forgets them (`LakeState::files_gone`).
+    pub fn files_gone(&self, files: &[(String, u64)]) {
+        let all: Vec<Arc<dyn Kept>> = self.0.lock().unwrap_or_else(PoisonError::into_inner).iter().filter(|m| m.state.keeps_files_kept()).map(|m| m.state.clone()).collect();
+        for state in all {
+            state.files_gone_kept(files); // (outside the lock: a state's own lock is taken there)
+        }
+    }
+
+    /// The states that are caches, by name, in the order they were made: those made as the lake opened first.
+    pub fn caches(&self) -> Vec<(&'static str, Arc<dyn Charged>)> {
+        let all = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        all.iter().filter_map(|m| Some((m.name, m.cache.clone()?))).collect()
     }
 }
 
 /// A new `P` for `States`, and it as a cache when it is one.
 fn made<P: LakeState>() -> (Arc<dyn Kept>, Option<Arc<dyn Charged>>) {
     let state = Arc::new(P::make());
+    (state.clone(), state.cache())
+}
+
+/// `made`, as the lake opens (`LakeState::make_as_it_opens`).
+fn made_as_it_opens<P: LakeState>(opening: &Opening) -> (Arc<dyn Kept>, Option<Arc<dyn Charged>>) {
+    let state = Arc::new(P::make_as_it_opens(opening));
     (state.clone(), state.cache())
 }
 
@@ -226,6 +314,45 @@ mod tests {
         drop((held, a));
         assert_eq!(*STOPPED.lock().unwrap(), ["other", "held"], "the last made stops first");
         assert_eq!(line.held(), 0, "a lake's cache goes with it");
+    }
+
+    #[derive(Default)]
+    struct Opened(Mutex<usize>);
+    impl LakeState for Opened {
+        const NAME: &'static str = "opened";
+        const ABOUT: &'static str = "bytes held, made as its lake opens, for a test";
+        fn make() -> Self {
+            Opened::default()
+        }
+        fn cache(self: Arc<Self>) -> Option<Arc<dyn Charged>> {
+            Some(self)
+        }
+    }
+    impl Charged for Opened {
+        fn held(&self) -> usize {
+            *self.0.lock().unwrap()
+        }
+        fn give_back(&self, _: usize) -> usize {
+            0
+        }
+    }
+
+    /// A state added to be made as its lake opens is made by `open` and listed among the lake's caches, but not charged
+    /// there (the lake charges its caches in its own order), and is made once.
+    #[test]
+    fn a_state_made_as_its_lake_opens_is_listed_among_its_caches() {
+        let r = Registry::build(&[&BuiltIn { name: "test", requires: &[], register: |r| r.section_mut::<Registered>().add_at_open::<Opened>() }]);
+        let line = Ledger::new(1 << 20, 1 << 20);
+        let a = States::default();
+        assert!(a.caches().is_empty(), "nothing made yet");
+        let opening = Opening { memory: false, ram: None };
+        a.open(&r, &opening);
+        assert_eq!(a.caches().iter().map(|(name, _)| *name).collect::<Vec<_>>(), ["opened"], "made as the lake opens");
+        let opened = a.get_in::<Opened>(&r, Some(&line)).unwrap();
+        *opened.0.lock().unwrap() = 4096;
+        assert_eq!(line.held(), 0, "not charged as it is made: the lake charges it");
+        a.open(&r, &opening);
+        assert!(Arc::ptr_eq(&opened, &a.get_in::<Opened>(&r, None).unwrap()) && a.caches().len() == 1, "made once");
     }
 
     /// Two states of one type, or of one name, are refused as the registry is built.
