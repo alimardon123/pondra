@@ -1170,7 +1170,79 @@ pub(crate) async fn no_followers(lake: &Lake, name: &str, why: &str) -> Result<(
 pub(crate) fn keeps(name: &str, meta: &TableMeta, purge: bool) -> bool { meta.retention_secs.map_or(KEEP_MS, |s| s * 1000) > 0 && !purge && !crate::sys::hidden(name) }
 
 /// DDL's own records beside the kinds' (`records`).
-pub const PREFIXES: &[crate::records::Prefix] = &[crate::records::Prefix { prefix: "dt/", owner: "ddl", holds: "a dropped table, kept while it can be undropped (dt/name/at)" }];
+pub const PREFIXES: &[crate::records::Prefix] = &[
+    crate::records::Prefix { prefix: "dt/", owner: "ddl", holds: "a dropped table, kept while it can be undropped (dt/name/at)" },
+    crate::records::Prefix { prefix: FOLDER_USES, owner: "ddl", holds: "a folder a table uses: its own, a clone's share, a dropped one's kept (fu/folder/entry)" },
+];
+
+/// Where the folders tables use are recorded: `fu/{folder}/{entry}`, the entry `t/{name}` or `dt/{name}/{at}`.
+pub(crate) const FOLDER_USES: &str = "fu/";
+
+/// The folders each table entry uses (redesign step 5, piece 10c), kept with the entries by the catalog
+/// (`store::CatalogHook`): a live table's own folder and its shares, and a dropped one's kept to be undropped (its own, its
+/// sources', its changed rows' old versions'). So a new table's folder check reads one folder's records, not every table.
+pub fn folder_hook() -> crate::store::CatalogHook {
+    crate::store::CatalogHook { name: "folders", reads: &["t/", "dt/"], records: FOLDER_USES, derive: folder_records }
+}
+
+/// `entry`'s folder records: `fu/{folder}/{entry}`, its use as the value (`own`, `shares`, `kept`). One folder a table uses
+/// twice is one record, the first use's.
+fn folder_records(entry: &str, value: &[u8]) -> Vec<(String, Vec<u8>)> {
+    #[derive(Deserialize)]
+    struct Places {
+        #[serde(default)]
+        folder: Option<String>,
+        #[serde(default)]
+        shares: Vec<String>,
+    }
+    #[derive(Deserialize)]
+    struct Kept {
+        meta: Places,
+        #[serde(default)]
+        deleted: Option<Places>,
+    }
+    let uses: Vec<(String, &str)> = if let Some(name) = entry.strip_prefix("t/") {
+        let Ok(p) = serde_json::from_slice::<Places>(value) else { return vec![] };
+        std::iter::once((p.folder.unwrap_or_else(|| name.to_string()), "own")).chain(p.shares.into_iter().map(|f| (f, "shares"))).collect()
+    } else if let Some(rest) = entry.strip_prefix("dt/") {
+        let name = rest.rsplit_once('/').map_or(rest, |(n, _)| n);
+        let Ok(d) = serde_json::from_slice::<Kept>(value) else { return vec![] };
+        let deleted = d.deleted.map(|m| m.folder.unwrap_or_else(|| crate::sys::deleted(name)));
+        std::iter::once(d.meta.folder.unwrap_or_else(|| name.to_string())).chain(d.meta.shares).chain(deleted).map(|f| (f, "kept")).collect()
+    } else {
+        return vec![];
+    };
+    let mut out: Vec<(String, Vec<u8>)> = vec![];
+    for (folder, how) in uses {
+        let key = format!("{FOLDER_USES}{}/{entry}", folder_part(&folder));
+        if !out.iter().any(|(k, _)| *k == key) {
+            out.push((key, json(&how)));
+        }
+    }
+    out
+}
+
+/// A folder's name as one part of a record's key: `/` and `%` escaped, so one folder's records never start another's.
+fn folder_part(folder: &str) -> String { folder.replace('%', "%25").replace('/', "%2F") }
+
+/// The tables that use `folder`, and how: its records where the catalog keeps them (`folder_hook`), else from every table
+/// (a lake a guest leads: `pondra sql`).
+pub async fn folder_used(lake: &Lake, folder: &str) -> Result<Vec<(String, Use)>> {
+    if !lake.cat.records_kept() {
+        return Ok(folder_users(lake).await?.remove(folder).unwrap_or_default());
+    }
+    let from = format!("{FOLDER_USES}{}/", folder_part(folder));
+    let to = format!("{FOLDER_USES}{}0", folder_part(folder));
+    Ok(lake.cat.scan::<String>(&from, &to).await?.into_iter().map(|(k, how)| {
+        let entry = &k[from.len()..];
+        let name = match (entry.strip_prefix("t/"), entry.strip_prefix("dt/")) {
+            (Some(n), _) => n,
+            (_, Some(rest)) => rest.rsplit_once('/').map_or(rest, |(n, _)| n),
+            _ => entry,
+        };
+        (name.to_string(), match how.as_str() { "own" => Use::Own, "shares" => Use::Shares, _ => Use::Kept })
+    }).collect())
+}
 
 /// A table's entries set aside as a drop sets them (leader, under the lock): kept to be undropped when `kept`, as `dt/` with
 /// its changed rows' old versions; taken out of every share (`shares::tables_moved`). The caller's commit deletes the table's own
@@ -1463,11 +1535,23 @@ async fn exchange(lake: &Lake, a: &str, b: &str) -> Result<()> {
 /// renamed table keeps its folder, a dropped one while it can be undropped): then `name__2`, `name__3`… (characters a bucket's paths
 /// take as they are).
 pub async fn free_folder(lake: &Lake, name: &str) -> Result<Option<String>> {
-    let users = folder_users(lake).await?;
-    Ok(match users.contains_key(name) {
-        false => None,
-        true => (2..).map(|i| format!("{name}__{i}")).find(|f| !users.contains_key(f)),
-    })
+    if !lake.cat.records_kept() {
+        let users = folder_users(lake).await?; // (every table, once)
+        return Ok(match users.contains_key(name) {
+            false => None,
+            true => (2..).map(|i| format!("{name}__{i}")).find(|f| !users.contains_key(f)),
+        });
+    }
+    if folder_used(lake, name).await?.is_empty() {
+        return Ok(None);
+    }
+    for i in 2.. {
+        let f = format!("{name}__{i}");
+        if folder_used(lake, &f).await?.is_empty() {
+            return Ok(Some(f));
+        }
+    }
+    unreachable!("a free folder is found")
 }
 
 /// How a table uses a folder under `data/` (`folder_users`).
@@ -1504,8 +1588,8 @@ pub async fn folder_users(lake: &Lake) -> Result<std::collections::BTreeMap<Stri
 /// statement is about): each table's Delta log and Iceberg metadata would be written in one place. `ALTER TABLE … RENAME`
 /// keeps a folder, so `t` renamed and `t` undropped share one.
 pub async fn publishes_alone(lake: &Lake, name: &str, folder: &str, except: &[&str]) -> Result<()> {
-    let users = folder_users(lake).await?;
-    if let Some((other, _)) = users.get(folder).into_iter().flatten().find(|(o, u)| *u == Use::Own && !except.contains(&o.as_str())) {
+    let users = folder_used(lake, folder).await?;
+    if let Some((other, _)) = users.iter().find(|(o, u)| *u == Use::Own && !except.contains(&o.as_str())) {
         let why = format!("{name} can't be published: its folder ({folder}) is {other}'s too, and two tables can't publish in one folder (CREATE TABLE … AS SELECT * FROM {name} copies it into a folder of its own)");
         return Err(crate::codes::coded("55000", why)); // object_not_in_prerequisite_state
     }

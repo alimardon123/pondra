@@ -346,6 +346,9 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     lake.node.trace("followers' changes recovered");
     let lock: Arc<tokio::sync::Mutex<()>> = Default::default(); // (the lake's: everything that rewrites table metadata)
     let pace = (s.tier_secs > 0.0).then(|| log::Pace { rows: s.backlog, lock: lock.clone() }); // rows waiting to be tiered
+    if leader && lives {
+        lake.cat.keep_records().await?; // (its catalog hooks' records made whole, then kept by every write: a guest's statement reads past them)
+    }
     let seq = if leader { Some(log::Sequencer::start(lake.clone(), pace).await?) } else { None };
     let to = match &seq {
         Some(s) => log::To::Local(s.clone()),
@@ -893,9 +896,10 @@ mod tests {
                 crate::write::create_table(&lake, &format!("t{i}"), spec).await.unwrap();
             }
             let scope = crate::auth::Principal::node().scope;
-            // (a new table's folder check, `ddl::free_folder`, still reads every table once: piece 10c brings CREATE TABLE
-            // and CTAS under 50 too. Until then they may read no more than that once)
-            let (within, one_scan) = (50, 2_000 + 50);
+            // (as a living leader does at its start: the catalog's records of the folders tables use made whole, then kept
+            // by each write, so a new table's folder check reads its folder's alone: piece 10c)
+            lake.cat.keep_records().await.unwrap();
+            let within = 50;
             let statements = [
                 ("INSERT", "INSERT INTO t0 VALUES (1, 1)", within),
                 ("UPDATE", "UPDATE t0 SET a = 2 WHERE id = 1", within),
@@ -903,8 +907,8 @@ mod tests {
                 ("CREATE VIEW", "CREATE VIEW v0 AS SELECT * FROM t0", within),
                 ("DROP TABLE", "DROP TABLE t1", within),
                 ("ALTER TABLE RENAME TO", "ALTER TABLE t2 RENAME TO t2b", within),
-                ("CREATE TABLE", "CREATE TABLE n0 (a BIGINT)", one_scan),
-                ("CREATE TABLE AS SELECT", "CREATE TABLE c0 AS SELECT * FROM t0", one_scan),
+                ("CREATE TABLE", "CREATE TABLE n0 (a BIGINT)", within),
+                ("CREATE TABLE AS SELECT", "CREATE TABLE c0 AS SELECT * FROM t0", within),
             ];
             for (what, sql, most) in statements {
                 let stmt = crate::write::parse(sql).unwrap_or_else(|| panic!("{sql}: not a statement"));
@@ -916,6 +920,66 @@ mod tests {
                 assert!(reads < most && writes < 50, "{what} ({sql}) read {reads} and wrote {writes} catalog records of 2,000 tables; under {most} and 50");
             }
             marks.abort(); // (a dropped handle aborts nothing: its mark would land again after the lake is gone)
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
+    /// The folder records the catalog keeps (`ddl::folder_hook`, step 5 piece 10c) say what every table says
+    /// (`ddl::folder_users`) after each statement that moves a folder's use: a rename (the folder stays), a new table under
+    /// the old name (`a__2`), a drop (kept), an undrop, a clone (a share), a clone's source dropped, a purge. A leader's start
+    /// makes them whole for a table made before they were kept. (Here, with the node: a rename and a drop need the leader's
+    /// sequencer.)
+    #[tokio::test]
+    async fn the_folder_records_say_what_every_table_says() {
+        use crate::ddl::{folder_used, folder_users, free_folder, Use, FOLDER_USES};
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let lake = app.lake.clone();
+            let by = |uses: &mut Vec<(String, Use)>| uses.sort_by_key(|(n, u)| (n.clone(), format!("{u:?}")));
+            let says = |lake: std::sync::Arc<crate::store::Lake>, step: &'static str| async move {
+                let mut every = folder_users(&lake).await.unwrap();
+                let recorded: std::collections::BTreeSet<String> = lake.cat.scan::<String>(FOLDER_USES, "fu0").await.unwrap().into_iter()
+                    .map(|(k, _)| k[FOLDER_USES.len()..].split_once('/').unwrap().0.replace("%2F", "/").replace("%25", "%")).collect();
+                assert!(recorded.iter().all(|f| every.contains_key(f)), "{step}: a record of a folder no table uses: {recorded:?} {:?}", every.keys().collect::<Vec<_>>());
+                for (folder, uses) in every.iter_mut() {
+                    let mut kept = folder_used(&lake, folder).await.unwrap();
+                    by(uses);
+                    by(&mut kept);
+                    assert_eq!(&kept, uses, "{step}: folder {folder}");
+                }
+            };
+            let scope = crate::auth::Principal::node().scope;
+            let run = |sql: &'static str| {
+                let (app, scope) = (app.clone(), scope.clone());
+                async move {
+                    let stmt = crate::write::parse(sql).unwrap_or_else(|| panic!("{sql}: not a statement"));
+                    crate::write::on_node(&app, stmt, None, &scope).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                }
+            };
+            run("CREATE TABLE a (x BIGINT)").await; // (before they are kept: a guest's start keeps none)
+            assert!(!lake.cat.records_kept());
+            lake.cat.keep_records().await.unwrap();
+            assert!(lake.cat.records_kept());
+            says(lake.clone(), "made whole at the start").await;
+            for (step, sql) in [
+                ("a second table", "CREATE TABLE b (x BIGINT)"),
+                ("a rename", "ALTER TABLE a RENAME TO a2"),
+                ("a new table under the old name", "CREATE TABLE a (x BIGINT)"),
+                ("a drop", "DROP TABLE b"),
+                ("an undrop", "UNDROP TABLE b"),
+                ("a clone", "CREATE TABLE c CLONE a2"),
+                ("a clone's source dropped", "DROP TABLE a2"),
+                ("a purge", "DROP TABLE b PURGE"),
+            ] {
+                run(sql).await;
+                says(lake.clone(), step).await;
+            }
+            let a = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("a")).await.unwrap().unwrap();
+            assert_eq!(a.folder.as_deref(), Some("a__2"), "the renamed table keeps folder a: the new one takes the next");
+            assert_eq!(free_folder(&lake, "a").await.unwrap().as_deref(), Some("a__3"), "a, kept for the dropped a2, and a__2 are used");
+            assert_eq!(free_folder(&lake, "d").await.unwrap(), None);
+            marks.abort();
             crate::memory_lake::forget_memory(&lake.url);
         })
         .await

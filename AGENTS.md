@@ -1592,7 +1592,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `undrop`, ADR-043). Its log rows go to files first (the log moves on). Its entries, and its
    `{t}$deleted`'s, move to `dt/{name}/{ms}` in one commit. While one is kept, its folder is taken
    (`ddl::free_folder`) and its files are in use for the orphan sweep (`tier::collect_orphans`).
-   `UNDROP` reads the log from its end (invariant 50). `tools/history_check.py`.
+   `UNDROP` reads the log from its end (invariant 50). `tools/history_check.py`. Which tables use a
+   folder is kept as records, `fu/{folder}/{entry}`, by a catalog hook (`ddl::folder_hook`,
+   `store::CatalogHooks`): each write of a `t/` or `dt/` entry writes them in its commit, and a living
+   leader makes them whole at its start (`Catalog::keep_records`; a release without them may have led
+   meanwhile, so no format raise). Readers take them only once that is durable (`records_kept`), else
+   read every table (`ddl::folder_used`). `node`'s tests: "the folder records say what every table says".
 217. **`t AT (…)` reads only a past the table still holds, or says so** (`past.rs`, `tier::settle`).
    A purge drops `{t}$deleted` files only past the table's retention, and moves
    `TableMeta::past_from` to the newest it dropped. A moment before that, or before the table was
