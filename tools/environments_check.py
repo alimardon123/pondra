@@ -3,7 +3,7 @@
 its writes are its own; prod keeps the files it reads while it lives, through merges, purges and
 retention; `pondra.diff` tells their rows apart; `ALTER DATABASE dev REFRESH [t]` brings a table
 (a view: the tables it reads; none named: all) and what follows it up to prod's present; a branch of
-a branch; `DROP DATABASE` lets go. A base that signs in on its own (a user, no token shared with the
+a branch; `DROP DATABASE … PURGE` lets go (a plain DROP keeps it to be undropped, pins and all). A base that signs in on its own (a user, no token shared with the
 branch): its branch's REFRESH and unpin go by the branch's own key, and a clone's REFRESH stays within
 the schemas it took (`signed_in_check`). Who makes a branch and who may drop it: `owners_check` (a user
 with CLONE branches a database and owns the branch; only its owner, or an admin, drops it).
@@ -351,9 +351,21 @@ def environments_check(bin, work, port, root):
     checks["refused by name: a clone of a database not here, a branch where its base isn't (a bucket, a disk)"] = \
         "no database" in refused(prod, "CREATE DATABASE x CLONE nowhere") and "lives where its base does" in refused(prod, f"CREATE DATABASE y LOCATION '{elsewhere}' CLONE prod")
 
-    # DROP DATABASE lets go: prod's replaced files go once nothing pins them.
+    # A plain DROP DATABASE of a branch keeps its folder (marked dropped) and prod's pin for it, so the files it reads
+    # stay; UNDROP DATABASE brings it back, readable. PURGE, below, is what lets it go at once.
+    pins = lambda: rows(prod, "SELECT branches FROM pondra.databases WHERE name = 'prod'")
+    pinned = pins()
+    q("DROP DATABASE sales_only")
+    kept = any(k.endswith("dropped.json") for k in keys(os.path.join(root, "sales_only")))
+    kept_pins = pins() == pinned
+    out_of_reach = refused(prod, "SELECT count(*) FROM sales_only.sales.orders") != ""
+    q("UNDROP DATABASE sales_only")
+    checks["DROP DATABASE of a branch keeps its folder (dropped.json) and prod's pin for it; out of reach until UNDROP DATABASE brings it back, readable"] = \
+        kept and kept_pins and out_of_reach and rows(prod, "SELECT count(*) FROM sales_only.sales.orders") == rows(prod, "SELECT count(*) FROM sales.orders")
+
+    # DROP DATABASE … PURGE lets go: prod's replaced files go once nothing pins them.
     for name in ["dev2", "dev", "sales_only", "fixtures"]:
-        q(f"DROP DATABASE {name}")
+        q(f"DROP DATABASE {name} PURGE")
     held = len(parquet(prod_dir))
 
     def let_go():
@@ -365,7 +377,7 @@ def environments_check(bin, work, port, root):
         prod.post("/tier")
         if let_go():
             break
-    checks["DROP DATABASE: the branches' folders go, prod's pins with them, and prod lets the files they held go"] = let_go()
+    checks["DROP DATABASE … PURGE: the branches' folders go, prod's pins with them, and prod lets the files they held go"] = let_go()
     checks["prod answers as it should after it all"] = rows(prod, "SELECT count(*) FROM sales.orders") == [(len([r for r in before if r[2] <= 900]) + 1,)]
     checks["(cloned in {:.1f} s)".format(took)] = True
     return checks
@@ -547,7 +559,7 @@ def across_check(bin, work, port):
         dana = {"Authorization": "Basic " + base64.b64encode(b"dana:dana-password-1").decode()}
         made_dana = raw(port + 1, "POST", "/sql", "CREATE DATABASE dana CLONE prod", dana)[0]
         owner_dana = rows(dev, "SELECT owner FROM pondra.databases WHERE name = 'dana'")
-        dropped_dana = raw(port + 1, "POST", "/sql", "DROP DATABASE dana", dana)[0]
+        dropped_dana = raw(port + 1, "POST", "/sql", "DROP DATABASE dana PURGE", dana)[0]  # (PURGE: its pin on prod goes too, as the counts below expect)
         checks["a user of dev granted CLONE ON DATABASE prod (attached) branches it on dev, and owns it"] = \
             made_dana == 200 and owner_dana == [("dana",)] and dropped_dana == 200
         dev.q("CREATE DATABASE ali CLONE prod")
@@ -628,8 +640,8 @@ def across_check(bin, work, port):
         checks["a CLONE user's branch takes no LOCATION: it lives beside its base"] = status != 200 and "LOCATION" in text and not keys(outside)
 
         ali.stop()
-        dev.q("DROP DATABASE ali")
-        checks["DROP DATABASE ali on dev: its folder goes from acme-dev, and prod shows no branch left"] = \
+        dev.q("DROP DATABASE ali PURGE")
+        checks["DROP DATABASE ali PURGE on dev: its folder goes from acme-dev, and prod shows no branch left"] = \
             not keys(ali_lake) and until(lambda: rows(prod, "SELECT branches FROM pondra.databases WHERE name = 'prod'") == [(0,)]) is True
         dev.q("CREATE DATABASE bob CLONE prod")
         held = rows(prod, "SELECT branches FROM pondra.databases WHERE name = 'prod'") == [(1,)]
@@ -1053,7 +1065,7 @@ def sealed_later_check(bin, work, port, root):
         dev.q("ALTER DATABASE kdev REFRESH t")
         refreshed = rows(dev, "SELECT x FROM t ORDER BY x") == [(1,), (2,)]
         dev.stop()
-        prod.q("DROP DATABASE kdev")
+        prod.q("DROP DATABASE kdev PURGE")
         released = until(lambda: rows(prod, "SELECT branches FROM pondra.databases WHERE name = 'kprod'") == [(0,)], 30)
         checks["a branch whose key was kept in the clear (no shared master key) has it sealed when its own leader starts with one, and REFRESH and DROP still go by it"] = \
             clear and sealed is True and refreshed and released is True
