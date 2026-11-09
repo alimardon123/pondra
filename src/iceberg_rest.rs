@@ -75,7 +75,7 @@ async fn space(app: &crate::app::App, ns: &str, scope: &crate::rights::Scope) ->
     let parts: Vec<&str> = ns.split('\u{1f}').collect();
     let found = spaces(app).await.into_iter().find(|(p, _, _)| *p == parts).ok_or_else(|| missing(&format!("namespace {}", parts.join(".")), "NoSuchNamespaceException"))?;
     if !std::sync::Arc::ptr_eq(&found.1, &app.lake) {
-        crate::users::across(&found.1, &found.0[0]).await.map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
+        crate::users::across(&found.1, &found.0[0], scope).await.map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
         if !scope.whole() {
             return Err(refused(403, "ForbiddenException", format!("permission denied: {} is another database: its tables are read through it (the database {})", found.0[0], found.0[0])));
         }
@@ -88,7 +88,7 @@ async fn space(app: &crate::app::App, ns: &str, scope: &crate::rights::Scope) ->
 async fn namespaces(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(who): axum::Extension<crate::auth::Principal>) -> axum::Json<Value> {
     let mut seen = vec![];
     for (parts, lake, _) in spaces(&app).await {
-        if std::sync::Arc::ptr_eq(&lake, &app.lake) || (who.scope.whole() && crate::users::across(&lake, &parts[0]).await.is_ok()) {
+        if std::sync::Arc::ptr_eq(&lake, &app.lake) || (who.scope.whole() && crate::users::across(&lake, &parts[0], &who.scope).await.is_ok()) {
             seen.push(parts);
         }
     }

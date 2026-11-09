@@ -26,10 +26,10 @@ const FILE_BYTES: usize = 128 << 20; // (a file this big is closed, and another 
 pub async fn insert(lake: &Lake, table: &str, name: &str, names: Option<Vec<String>>, query: &str, job: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let spec = crate::ext_names::spec(table).context("not another engine's table")?;
     crate::ext::check(lake, &spec).await?; // (written by whoever may read it: a secret covering it, or the node's owner)
-    let rows = Rows::Insert { name: name.to_string(), names, query: query.to_string(), scope: scope.clone() };
+    let rows = Rows::Insert { name: name.to_string(), names, query: query.to_string() };
     match spec.format.as_str() {
-        "delta" => delta(lake, spec.urls[0].trim_end_matches('/'), rows, job, false).await,
-        "iceberg" => iceberg(lake, &spec, rows, job, false).await,
+        "delta" => delta(lake, spec.urls[0].trim_end_matches('/'), rows, job, false, scope).await,
+        "iceberg" => iceberg(lake, &spec, rows, job, false, scope).await,
         f => bail!("INSERT into {f} files: into a table attached as delta or iceberg"),
     }
 }
@@ -41,22 +41,22 @@ pub async fn insert(lake: &Lake, table: &str, name: &str, names: Option<Vec<Stri
 /// where it is sent (`write::run`, `columns`), planned for the INSERT's asker.
 pub enum Rows {
     Planned(datafusion::prelude::DataFrame),
-    Insert { name: String, names: Option<Vec<String>>, query: String, scope: crate::rights::Scope },
+    Insert { name: String, names: Option<Vec<String>>, query: String },
 }
 
 impl Rows {
     /// The rows, as a query of the table's columns in its order (`columns`, as SQL names them).
-    async fn frame(self, lake: &Lake, columns: &[String]) -> Result<datafusion::prelude::DataFrame> {
-        let (name, names, query, scope) = match self {
+    async fn frame(self, lake: &Lake, columns: &[String], scope: &crate::rights::Scope) -> Result<datafusion::prelude::DataFrame> {
+        let (name, names, query) = match self {
             Rows::Planned(df) => return Ok(df),
-            Rows::Insert { name, names, query, scope } => (name, names, query, scope),
+            Rows::Insert { name, names, query } => (name, names, query),
         };
         let query = match names {
-            Some(names) => crate::rules::rows::rows_for(&name, columns, &names, &query, &|_| None)?,
+            Some(names) => crate::rules::rows::rows_for(&name, columns, &names, &query, &|_| None, scope)?,
             None => query,
         };
-        let query = crate::routines::expand(lake, &query, &scope).await?;
-        crate::engine::sql(&crate::query::session_for(lake, &query, "", None, &scope).await?, &query).await
+        let query = crate::routines::expand(lake, &query, scope).await?;
+        crate::engine::sql(&crate::query::session_for(lake, &query, "", None, scope).await?, &query).await
     }
 }
 
@@ -84,7 +84,7 @@ const DELTA_WRITES: &[&str] = &["appendOnly", "invariants", "checkConstraints", 
 /// replaced), as a folder of files does. Polars' `write_delta` and Spark's `format("delta")`. `job` names the commit, so a
 /// try of the same statement again finds it and answers a duplicate (`query::frugally`'s retry).
 #[allow(clippy::too_many_arguments)]
-pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, df: datafusion::prelude::DataFrame, to: &str, format: &str, append: bool, overwrite: bool, job: &str) -> Result<Value> {
+pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, df: datafusion::prelude::DataFrame, to: &str, format: &str, append: bool, overwrite: bool, job: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let root = crate::ddl::full(to)?; // (a folder named relatively: from where the node runs; Iceberg's location is absolute)
     let root = root.as_str();
     let (store, dir) = crate::ext::store(lake, &format!("{root}/")).await?;
@@ -118,13 +118,13 @@ pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, 
     }
     let replace = table && overwrite;
     match format {
-        "delta" => delta(lake, root, Rows::Planned(df), job, replace).await,
-        _ => iceberg(lake, &crate::ext_names::Spec { urls: vec![root.to_string()], format: format.into(), options: Default::default() }, Rows::Planned(df), job, replace).await,
+        "delta" => delta(lake, root, Rows::Planned(df), job, replace, scope).await,
+        _ => iceberg(lake, &crate::ext_names::Spec { urls: vec![root.to_string()], format: format.into(), options: Default::default() }, Rows::Planned(df), job, replace, scope).await,
     }
 }
 
 /// Rows into a Delta table: added, or (`replace`) instead of its rows.
-async fn delta(lake: &Lake, root: &str, rows: Rows, job: &str, replace: bool) -> Result<Value> {
+async fn delta(lake: &Lake, root: &str, rows: Rows, job: &str, replace: bool, scope: &crate::rights::Scope) -> Result<Value> {
     let app = format!("pondra:{job}");
     let log = read_delta::replay(lake, root, None).await?;
     if let Some(&v) = log.txns.get(&app) {
@@ -132,7 +132,7 @@ async fn delta(lake: &Lake, root: &str, rows: Rows, job: &str, replace: bool) ->
     }
     delta_writable(root, &log)?;
     let (columns, partitions, mapped) = read_delta::schema(root, &log.metadata)?;
-    let df = rows.frame(lake, &columns.iter().map(|(_, l, _)| l.clone()).collect::<Vec<_>>()).await?; // (by logical name)
+    let df = rows.frame(lake, &columns.iter().map(|(_, l, _)| l.clone()).collect::<Vec<_>>(), scope).await?; // (by logical name)
     let fields = read_delta_fields(&log.metadata)?;
     let not_null = delta_not_null(&log.metadata)?;
     let types: HashMap<String, Value> = serde_json::from_str::<Value>(log.metadata["schemaString"].as_str().context("no schema")?)?["fields"].as_array().into_iter().flatten()
@@ -502,16 +502,17 @@ pub async fn put_new(lake: &Lake, url: &str, body: Vec<u8>) -> Result<bool> {
 /// the snapshot's manifests and it, and the next metadata — a new file beside the last (put if
 /// absent), or the REST catalog's commit (the current snapshot asserted).
 /// …`replace`: the snapshot holds only the new files (an overwrite).
-pub async fn iceberg(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &str, replace: bool) -> Result<Value> {
+pub async fn iceberg(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &str, replace: bool, scope: &crate::rights::Scope) -> Result<Value> {
     let url = spec.urls[0].trim_end_matches('/');
     let (at, meta, d) = crate::read_iceberg::current(lake, url, &spec.options).await?;
-    crate::catalogs::within(d, written(lake, spec, rows, job, replace, at, meta)).await
+    crate::catalogs::within(d, written(lake, spec, rows, job, replace, at, meta, scope)).await
 }
 
 /// Write a table's files and commit their snapshot, on top of its current metadata (`at`, `meta`),
 /// as often as another writer's commit makes it wait. Run where the catalog's credentials for the
 /// table's location are in scope (`iceberg`).
-async fn written(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &str, replace: bool, mut at: String, mut meta: Value) -> Result<Value> {
+#[allow(clippy::too_many_arguments)]
+async fn written(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &str, replace: bool, mut at: String, mut meta: Value, scope: &crate::rights::Scope) -> Result<Value> {
     let url = spec.urls[0].trim_end_matches('/');
     let rest = spec.options.contains_key("namespace");
     if let Some(s) = done(&meta, job) {
@@ -523,7 +524,7 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, rows: Rows, job: &s
     // (named by the table's metadata, wherever it likes: written only where the caller may write, as its files are read)
     crate::ext::check_urls(lake, &[format!("{location}/data/").as_str(), format!("{location}/metadata/").as_str()]).await?;
     let (schema_json, columns) = crate::read_iceberg::schema_of(&meta)?;
-    let df = rows.frame(lake, &columns.iter().map(|(n, ..)| n.clone()).collect::<Vec<_>>()).await?;
+    let df = rows.frame(lake, &columns.iter().map(|(n, ..)| n.clone()).collect::<Vec<_>>(), scope).await?;
     let required: Vec<Option<String>> = columns.iter().map(|(n, ..)| schema_json["fields"].as_array().into_iter().flatten().any(|f| f["name"] == n.as_str() && f["required"] == true).then(|| n.clone())).collect();
     // (a required column is written as Parquet's required, as Iceberg's writers write it: `Fit` has refused any NULL in it)
     let target: Vec<Field> = columns.iter().zip(&required).map(|((n, id, t), r)| Field::new(n, t.clone(), r.is_none()).with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into())).collect();

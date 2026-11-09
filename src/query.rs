@@ -1658,7 +1658,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
         if !listing && !mentions(&text, &ns) {
             continue;
         }
-        let locked = crate::users::across(&other, &ns).await.err().map(|e| e.to_string()); // (its own sign-in: `users::across`)
+        let locked = crate::users::across(&other, &ns, scope).await.err().map(|e| e.to_string()); // (its own sign-in: `users::across`)
         let catalog = Arc::new(MemoryCatalogProvider::new());
         for s in crate::ddl::schemas(&other).await? {
             catalog.register_schema(&s, Arc::new(MemorySchemaProvider::new()))?;

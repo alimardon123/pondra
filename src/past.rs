@@ -49,7 +49,7 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
     ensure!(if attached { scope.knows_named(&named) } else { scope.knows(&named) }, "no table {t}");
     let upto = match &other {
         Some(o) => {
-            crate::users::across(o, t.split('.').next().unwrap_or_default()).await?; // (a lake that signs in on its own: refused, as its plain reads are)
+            crate::users::across(o, t.split('.').next().unwrap_or_default(), scope).await?; // (a lake that signs in on its own: refused, as its plain reads are)
             o.cat.settle().await?;
             Some(o.visible())
         }

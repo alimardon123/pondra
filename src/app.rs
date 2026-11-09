@@ -552,7 +552,7 @@ impl App {
             crate::query::stored_views(&self.lake, sql, false, scope).await.ok()?.iter().for_each(|(_, v)| text.push_str(&format!(" {v}")));
         }
         for (name, other) in self.lake.attached.read().unwrap().iter().filter(|(n, _)| crate::text::mentions(&text, n)) {
-            (name, other.cat.version()?, crate::auth::operator()).hash(&mut h); // (whoever runs the nodes may read what a user may not: `users::across`)
+            (name, other.cat.version()?, scope.operator()).hash(&mut h); // (whoever runs the nodes may read what a user may not: `users::across`, which reads the same scope)
         }
         Some(h.finish())
     }

@@ -1038,15 +1038,15 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
 /// `INSERT INTO t (b, a) …` as an INSERT of whole rows: the columns it names from its query, by
 /// position, the others NULL (`_deleted` left for `rows` to fill), in the table's order. `VALUES`
 /// stay `VALUES`, so they still go through the log.
-pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str) -> Result<String> {
+pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str, scope: &crate::rights::Scope) -> Result<String> {
     let (other, name) = crate::ddl::resolve(lake, table).await?;
     let meta = other.as_deref().unwrap_or(lake).cat.meta(&table_key(&name)).await?.with_context(|| format!("no table {table}"))?; // (as parsed: `Catalog::parsed`)
-    whole_rows_of(lake, table, &meta, names, query).await
+    whole_rows_of(lake, table, &meta, names, query, scope).await
 }
 
 /// `whole_rows` for a table whose stored meta the caller holds (`meta`, as `lake` stores it, under the name `table` the
 /// statement gives): a one-row upsert's proposed row is worked out here once, before its locks (`txn::upsert_point`).
-pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, names: &[String], query: &str) -> Result<String> {
+pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, names: &[String], query: &str, scope: &crate::rights::Scope) -> Result<String> {
     let columns = crate::rules::rows::row_columns(meta.logical_columns().into_iter().map(|(c, _)| c), names);
     let order = crate::rules::rows::row_columns(meta.sql_order(), names); // (SQL's order: what a row without a column list gives, first to last)
     let names = if names.is_empty() { implicit(&order, crate::rules::rows::rows_width(query)) } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: the columns its rows give)
@@ -1054,11 +1054,11 @@ pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, na
     if meta.list().columns.iter().filter_map(|c| c.default.as_ref()).any(|d| crate::seq::calls(d)) && crate::rules::rows::plain_values(query).is_some() {
         // (`nextval` in rows of VALUES: taken here, in the rows' order: `seq::taken`)
         let used = std::cell::RefCell::new(vec![]);
-        crate::rules::rows::rows_for(table, &columns, names, query, &|c| default(c).inspect(|d| used.borrow_mut().push(d.clone())))?;
+        crate::rules::rows::rows_for(table, &columns, names, query, &|c| default(c).inspect(|d| used.borrow_mut().push(d.clone())), scope)?;
         let taken = std::cell::RefCell::new(crate::seq::taken(lake, &used.into_inner()).await?);
-        return crate::rules::rows::rows_for(table, &columns, names, query, &|c| default(c).map(|d| crate::seq::put(&d, &mut taken.borrow_mut())));
+        return crate::rules::rows::rows_for(table, &columns, names, query, &|c| default(c).map(|d| crate::seq::put(&d, &mut taken.borrow_mut())), scope);
     }
-    crate::rules::rows::rows_for(table, &columns, names, query, &default)
+    crate::rules::rows::rows_for(table, &columns, names, query, &default, scope)
 }
 
 /// A plain INSERT (no column list) into a table that moved a column (`TableMeta::set_order`), as the INSERT that names the
@@ -1793,9 +1793,9 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         Stmt::InsertInto(t, names, query) => match crate::ext::outside_target(&app.lake, &t).await? {
             // (another engine's table: its writer places the list in the schema it writes by, `write_outside::Rows`; a guest's,
             // sent through the inbox, is placed here: the columns the list leaves out are NULL, as its format keeps no DEFAULT)
-            Some(target) if inbox => Stmt::Insert(t.clone(), crate::rules::rows::rows_for(&t, &crate::write_outside::columns(&app.lake, &target).await?, &names, &query, &|_| None)?),
+            Some(target) if inbox => Stmt::Insert(t.clone(), crate::rules::rows::rows_for(&t, &crate::write_outside::columns(&app.lake, &target).await?, &names, &query, &|_| None, &by.scope)?),
             Some(_) => Stmt::InsertInto(t, names, query),
-            None => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
+            None => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query, &by.scope).await?),
         },
         Stmt::Insert(t, query) => {
             if !is_there(&app.lake, &t).await? {
@@ -2367,7 +2367,7 @@ async fn ddl_listed(app: &crate::app::App, ddls: Vec<crate::ddl::Ddl>, job: &str
     for mut d in ddls {
         crate::branch::door(lake, &mut d, by).await?;
         out = match &d {
-            crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. } => crate::backup::statement(lake, lock, d.clone()).await?,
+            crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. } => crate::backup::statement(lake, lock, d.clone(), &by.scope).await?,
             crate::ddl::Ddl::FetchExtension { .. } => crate::extension::fetch(lake, lock, d.clone(), &by.name).await?,
             _ if app.members.by_inbox() => through_bucket_one(lake, Stmt::Ddl(vec![d.clone()]), job, files, &by.scope).await?,
             _ => match &app.seq {
@@ -2572,7 +2572,7 @@ pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>
     match d {
         crate::ddl::Ddl::Refresh { database, tables } => crate::branch::refresh(lake, seq, lock, database, tables, by).await,
         crate::ddl::Ddl::SetLocation { database, to } => crate::memory::set_location(lake, &database, &to).await, // (copies outside the lake's lock: `memory.rs`)
-        d @ (crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. }) => crate::backup::statement(lake, Some(lock), d).await, // (a request the leader takes: its own owner, beside its lock)
+        d @ (crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. }) => crate::backup::statement(lake, Some(lock), d, &by.scope).await, // (a request the leader takes: its own owner, beside its lock)
         d => {
             let _guard = lock.lock().await;
             crate::ddl::apply(lake, d, by).await

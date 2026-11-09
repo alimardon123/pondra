@@ -106,7 +106,7 @@ pub async fn listed_for(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec
     let mut all = vec![];
     let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().clone();
     for (catalog, l) in std::iter::once((lake_name(lake), lake.arc())).chain(attached) {
-        if catalog != lake_name(lake) && crate::users::across(&l, &catalog).await.is_err() {
+        if catalog != lake_name(lake) && crate::users::across(&l, &catalog, scope).await.is_err() {
             continue; // (another database that signs in on its own: not even its tables' names)
         }
         // (a materialized view of any kind: windows, sessions and joins keep more than its SQL)

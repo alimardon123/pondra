@@ -123,9 +123,9 @@ pub async fn tend(lake: &Lake) -> Result<()> {
 /// owner of that node decides the places on its own disk. `lock` is the leader's lock when this node
 /// leads: a run takes long, and only a pin and an attachment take the lock, for a moment. Without it,
 /// the pin and the attachment go to the leader as DDL.
-pub async fn statement(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl) -> Result<Value> {
+pub async fn statement(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl, scope: &crate::rights::Scope) -> Result<Value> {
     match d {
-        Ddl::BackupDatabase { database, to, retention_days } => backup(lake, lock, database.as_deref(), &to, retention_days).await,
+        Ddl::BackupDatabase { database, to, retention_days } => backup(lake, lock, database.as_deref(), &to, retention_days, scope).await,
         Ddl::RestoreDatabase { name, from, dir, at } => {
             crate::ddl::attachable(lake, &name, true).await?; // (before anything is copied)
             crate::ext::owners_only(&from, format!("RESTORE … FROM {from}: a path on the server's own disk, which only the node's owner restores from (the `pondra` shell, `pondra sql`, `connect()` of a lake): restore from a bucket (s3://, gs://, az://)"))?;
@@ -170,14 +170,14 @@ pub(crate) fn apart(lake: &Lake, to: &str) -> Result<()> {
 
 /// `BACKUP DATABASE [name] TO 'url'`: the database pinned (by its leader: this one, or an attached
 /// database's), the run asked of the backup's leader, the pin let go.
-async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Option<&str>, to: &str, retention_days: Option<u64>) -> Result<Value> {
+async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Option<&str>, to: &str, retention_days: Option<u64>, scope: &crate::rights::Scope) -> Result<Value> {
     let source = match database.map(crate::text::database) {
         None => lake.arc(),
         Some(n) if n == crate::ddl::lake_name(lake) => lake.arc(),
         Some(n) => {
             let other = lake.attached.read().unwrap().iter().find(|(a, _)| *a == n).map(|(_, l)| l.clone());
             let other = other.with_context(|| format!("no database {n} here: a backup is of this database or one attached to it"))?;
-            crate::users::across(&other, &n).await?; // (another database's own sign-in: invariant 240)
+            crate::users::across(&other, &n, scope).await?; // (another database's own sign-in: invariant 240)
             other
         }
     };

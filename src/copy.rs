@@ -85,7 +85,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
             async move {
                 let df = crate::engine::sql(&ctx, query).await?;
                 // (a new table's first version is put before its rows, so a try that ran out of memory left an empty table: its retry adds to it)
-                crate::write_outside::copy_table(lake, &ctx, df, to, format, append || crate::query::retrying(&ctx), overwrite, job).await
+                crate::write_outside::copy_table(lake, &ctx, df, to, format, append || crate::query::retrying(&ctx), overwrite, job, scope).await
             }
         }).await; // (a table, not files: ADR-028)
     }

@@ -250,7 +250,7 @@ fn sql_type(m: &TableMeta, column: &str, t: &str) -> String { m.col(column).map_
 async fn list(app: &App, scope: &crate::rights::Scope) -> Result<Value> {
     let mut tables = vec![];
     for (prefix, lake) in lakes(app) {
-        if !prefix.is_empty() && crate::users::across(&lake, prefix.trim_end_matches('.')).await.is_err() {
+        if !prefix.is_empty() && crate::users::across(&lake, prefix.trim_end_matches('.'), scope).await.is_err() {
             continue; // (another database that signs in on its own: not even its names, as `pondra.tables`)
         }
         let views = lake.cat.scan::<View>("v/", "v0").await?;
@@ -406,7 +406,7 @@ async fn changes(app: &App, who: &crate::auth::Principal, table: &str, after: Op
     let (name, prefix, lake) = found.ok_or_else(|| crate::codes::coded("42P01", format!("no table {table}")))?;
     crate::rights::may(who, crate::rights::Action::SelectAll, crate::rights::Object::Table(table))?; // (a user's: every column of the rows, as `/watch` and Kafka need, before anything is read)
     if !prefix.is_empty() {
-        crate::users::across(&lake, prefix.trim_end_matches('.')).await?; // (an attached lake that signs in on its own: its own sign-in, as queries use)
+        crate::users::across(&lake, prefix.trim_end_matches('.'), &who.scope).await?; // (an attached lake that signs in on its own: its own sign-in, as queries use)
     }
     if lake.cat.meta(&crate::store::table_key(&name)).await?.is_none() {
         return Err(crate::codes::coded("42P01", format!("no table {table}")));

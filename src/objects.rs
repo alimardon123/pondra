@@ -260,12 +260,12 @@ pub async fn list(lake: &Lake, scope: &Scope) -> Result<Vec<Object>> {
     }
     // (a user limited by grants sees no secret, and none of an extension's objects until step 6's `may` says which)
     if scope.whole() {
-        all.extend(defined(lake).await?);
+        all.extend(defined(lake, scope).await?);
     } else {
         all.retain(|o| o.kind != "secret");
     }
     let mut notes = HashMap::new();
-    for (name, l) in lakes(lake).await {
+    for (name, l) in lakes(lake, scope).await {
         let cm: BTreeMap<String, String> = l.cat.scan::<String>("cm/", "cm0").await?.into_iter().map(|(k, v)| (k[3..].to_string(), v)).collect();
         notes.insert(name, cm);
     }
@@ -275,13 +275,13 @@ pub async fn list(lake: &Lake, scope: &Scope) -> Result<Vec<Object>> {
     Ok(all)
 }
 
-/// This lake and the lakes attached to it that the caller may use, by name: one that signs in on
+/// This lake and the lakes attached to it that `scope` may use, by name: one that signs in on
 /// its own is listed only for whoever runs the nodes (invariant 240), as its tables are read.
-pub(crate) async fn lakes(lake: &Lake) -> Vec<(String, Arc<Lake>)> {
+pub(crate) async fn lakes(lake: &Lake, scope: &Scope) -> Vec<(String, Arc<Lake>)> {
     let mut all = vec![(crate::ddl::lake_name(lake), lake.arc())];
     let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().clone();
     for (name, l) in attached {
-        if crate::users::across(&l, &name).await.is_ok() {
+        if crate::users::across(&l, &name, scope).await.is_ok() {
             all.push((name, l));
         }
     }
@@ -290,11 +290,11 @@ pub(crate) async fn lakes(lake: &Lake) -> Vec<(String, Arc<Lake>)> {
 
 /// Schemas of this lake and those attached. (An attached lake's schemas, routines and tasks are made
 /// by a node of that lake: their statements are shown there.)
-fn schemas<'a>(lake: &'a Lake, _scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Object>>> {
+fn schemas<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Object>>> {
     Box::pin(async move {
         let here = crate::ddl::lake_name(lake);
         let mut all = vec![];
-        for (name, l) in lakes(lake).await {
+        for (name, l) in lakes(lake, scope).await {
             for s in crate::ddl::schemas(&l).await? {
                 let def = (s != PUBLIC && name == here).then(|| format!("CREATE SCHEMA {}", ident(&s)));
                 all.push(Object::new("schema", &name, &s, def));
@@ -308,7 +308,7 @@ fn relations<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<O
     Box::pin(async move {
         let mut views = HashMap::new();
         let mut facts = HashMap::new(); // (a stored view's key facts, shown in its definition: ADR-065 §2, and its query as written)
-        for (name, l) in lakes(lake).await {
+        for (name, l) in lakes(lake, scope).await {
             for (k, v) in l.cat.scan::<crate::views::View>("v/", "v0").await? {
                 views.insert((name.clone(), k[2..].to_string()), v);
             }
@@ -342,11 +342,11 @@ fn relations<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<O
 }
 
 /// Sequences of this lake and those attached; an identity column's is its table's, not listed.
-fn sequences<'a>(lake: &'a Lake, _scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Object>>> {
+fn sequences<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Object>>> {
     Box::pin(async move {
         let here = crate::ddl::lake_name(lake);
         let mut all = vec![];
-        for (name, l) in lakes(lake).await {
+        for (name, l) in lakes(lake, scope).await {
             for (k, s) in l.cat.scan::<crate::seq::Sequence>("sq/", "sq0").await?.into_iter().filter(|(_, s)| s.owned.is_none()) {
                 let named = if name == here { name_sql(&k[3..]) } else { format!("{}.{}", ident(&name), name_sql(&k[3..])) };
                 all.push(Object::new("sequence", &name, &k[3..], Some(crate::seq::create_sql(&named, &s))));
@@ -361,7 +361,7 @@ fn indexes<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Obj
     Box::pin(async move {
         let here = crate::ddl::lake_name(lake);
         let mut all = vec![];
-        for (name, l) in lakes(lake).await {
+        for (name, l) in lakes(lake, scope).await {
             for (k, i) in l.cat.scan::<crate::index::Index>("ix/", "ix0").await? {
                 if !(if name == here { scope.sees(crate::rights::Object::Table(&i.table)) } else { scope.sees_named(&format!("{name}.{}", i.table)) }) {
                     continue;
@@ -377,11 +377,11 @@ fn indexes<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Obj
 }
 
 /// Types of this lake and those attached (`types.rs`: enums), each in its schema.
-fn types<'a>(lake: &'a Lake, _scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Object>>> {
+fn types<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Object>>> {
     Box::pin(async move {
         let here = crate::ddl::lake_name(lake);
         let mut all = vec![];
-        for (name, l) in lakes(lake).await {
+        for (name, l) in lakes(lake, scope).await {
             for (k, t) in l.cat.scan::<crate::types::Type>("ty/", "ty0").await? {
                 let named = if name == here { name_sql(&k[3..]) } else { format!("{}.{}", ident(&name), name_sql(&k[3..])) };
                 all.push(Object::new("type", &name, &k[3..], Some(crate::types::create_sql(&named, &t))));
@@ -395,7 +395,7 @@ fn routines<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Ob
     Box::pin(async move {
         let here = crate::ddl::lake_name(lake);
         let mut out = vec![];
-        for (name, l) in lakes(lake).await {
+        for (name, l) in lakes(lake, scope).await {
             let all = crate::routines::listed(&l).await?;
             let mut names: Vec<&String> = all.keys().collect();
             names.sort();
@@ -412,7 +412,7 @@ fn tasks<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Objec
     Box::pin(async move {
         let here = crate::ddl::lake_name(lake);
         let mut out = vec![];
-        for (name, l) in lakes(lake).await {
+        for (name, l) in lakes(lake, scope).await {
             for (k, t) in l.cat.scan::<crate::runs::Task>("j/", "j0").await? {
                 out.push(Object::new("task", &name, &k[2..], (name == here && scope.shows_code()).then(|| task_sql(&name_sql(&k[2..]), &t))));
             }
@@ -421,10 +421,10 @@ fn tasks<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Objec
     })
 }
 
-fn secrets<'a>(lake: &'a Lake, _scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Object>>> {
+fn secrets<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Object>>> {
     Box::pin(async move {
         let mut out = vec![]; // (their names and scopes are an admin's to see: `list` keeps them from a limited user)
-        for (name, l) in lakes(lake).await {
+        for (name, l) in lakes(lake, scope).await {
             out.extend(crate::ext::list(&l).await?.into_iter().map(|(n, _)| Object::new("secret", &name, &n, None))); // (values are never shown)
         }
         Ok(out)
@@ -433,8 +433,8 @@ fn secrets<'a>(lake: &'a Lake, _scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Ob
 
 /// The objects of every kind an extension adds (`Kind::shown`), from the definitions kept under its prefix: this lake's
 /// with the statement that makes each again, an attached lake's by name (a node of that lake shows its statements).
-async fn defined(lake: &Lake) -> Result<Vec<Object>> {
-    let all = lakes(lake).await; // (this lake first)
+async fn defined(lake: &Lake, scope: &Scope) -> Result<Vec<Object>> {
+    let all = lakes(lake, scope).await; // (this lake first)
     let mut out = vec![];
     for k in all_kinds().filter(|k| k.shown.is_some()) {
         let end = format!("{}0", k.prefix.trim_end_matches('/')); // (`cn/` to `cn0`: every key under the prefix)
@@ -451,10 +451,10 @@ async fn defined(lake: &Lake) -> Result<Vec<Object>> {
 }
 
 /// Installed extensions of this lake and those attached (`extension.rs`): by name, their records are read with `SHOW EXTENSIONS`.
-fn extensions<'a>(lake: &'a Lake, _scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Object>>> {
+fn extensions<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<Object>>> {
     Box::pin(async move {
         let mut out = vec![];
-        for (name, l) in lakes(lake).await {
+        for (name, l) in lakes(lake, scope).await {
             out.extend(crate::extension::listed(&l).await?.into_iter().map(|(n, _)| Object::new("extension", &name, &n, None)));
         }
         Ok(out)

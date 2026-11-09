@@ -952,7 +952,7 @@ async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String, scop
     let query = crate::routines::expand(&app.lake, &query, scope).await?;
     // (a table that moved a column: the query's columns fill SQL's first ones, as an INSERT's do: `write::in_sql_order`)
     let query = match app.lake.table_meta_if(name).await? {
-        Some(m) if m.moved() => crate::write::whole_rows_of(&app.lake, name, &m, &crate::write::filled(&app.lake, &m, name, &query, scope).await?, &query).await?,
+        Some(m) if m.moved() => crate::write::whole_rows_of(&app.lake, name, &m, &crate::write::filled(&app.lake, &m, name, &query, scope).await?, &query, scope).await?,
         _ => query,
     };
     let ctx = crate::query::session_for(&app.lake, &query, "", None, scope).await?;
