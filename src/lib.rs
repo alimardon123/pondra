@@ -244,6 +244,7 @@ mod table_record;
 #[cfg(feature = "doors")] mod project;
 #[cfg(feature = "lake")] mod protect;
 #[cfg(feature = "lake")] mod query;
+#[cfg(feature = "lake")] mod readings;
 #[cfg(feature = "lake")] mod read_iceberg;
 #[cfg(feature = "lake")] mod ranges;
 #[cfg(feature = "lake")] mod pyfn;

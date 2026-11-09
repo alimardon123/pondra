@@ -103,6 +103,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/job", post(job))
         .route("/cluster/probe", get(|Query(p): Query<HashMap<String, usize>>| async move { crate::guard::probe(p.get("bytes").copied().unwrap_or(0)) }))
         .route("/cluster/beat", post(beat))
+        .route("/cluster/said", post(said)) // (a read-only node's running statements: `cluster::Cluster::say`)
         .nest_service("/cluster/store", crate::served::door_for(app.lake.store.clone(), crate::cluster::of(&app).is_some_and(|c| c.serves_store))) // (a lake's store, for nodes on other machines: ADR-072 §8)
         .nest_service("/store", crate::served::files_door(app.lake.store.clone())) // (a page's reads of the lake's files and log: an admin's sign-in, `Auth::needed`)
         .route("/cluster/ack", post(ack))
@@ -574,7 +575,13 @@ async fn beat(State(app): State<App>, Query(p): Query<BeatParams>, headers: axum
     }
     let cut_off = || (StatusCode::SERVICE_UNAVAILABLE, [(crate::cluster::CUT_OFF_HEADER, "1")]).into_response(); // (its followers take over at once)
     let Some(node) = crate::cluster::of(&app) else { return Err(StatusCode::NOT_FOUND.into_response()) };
+    let _ = crate::readings::heard(&app.lake, &p.from, &headers); // (the oldest of its running statements: their files stay)
     node.beat(p.from, crate::format::said(&headers)).map(Json).ok_or_else(cut_off)
+}
+
+/// What a read-only node, which doesn't beat, says of its running statements (`readings::heard`).
+async fn said(State(app): State<App>, Query(p): Query<BeatParams>, headers: axum::http::HeaderMap) -> Result<(), E> {
+    Ok(crate::readings::heard(&app.lake, &p.from, &headers)?)
 }
 
 /// A follower's flush, to be sequenced (leader only). A node that doesn't lead refuses it as misdirected (421) before any
