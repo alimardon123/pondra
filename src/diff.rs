@@ -41,6 +41,20 @@ fn mentioned(sql: &str) -> bool {
     CALL.is_match(sql)
 }
 
+/// The front's tree pass (`front::Trees`): each `pondra.diff` and `pondra.diff_steps` call as the query that answers it,
+/// whose views the expander's pass then expands.
+pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "diff.calls", order: 10, run: tree } }
+
+fn tree<'a>(front: &'a (dyn crate::front::Front + 'static), stmts: &'a mut [Statement], facts: &'a crate::front::Facts<'_>) -> futures::future::BoxFuture<'a, Result<bool>> {
+    Box::pin(async move {
+        let done = rewrite(front, stmts).await?;
+        if done {
+            facts.expand();
+        }
+        Ok(done)
+    })
+}
+
 /// Which of this module's functions a call is.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Asked {
@@ -108,7 +122,7 @@ enum Match {
 /// Each `pondra.diff(a, b)` and `pondra.diff_steps(a, b)` in `stmts` as the query that answers it, innermost first (a
 /// side's query may diff too).
 /// Whether there was one.
-pub async fn rewrite<H: Host>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
+pub async fn rewrite<H: Host + ?Sized>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
     let mut any = false;
     loop {
         let mut first = First { found: None };
@@ -245,7 +259,7 @@ fn names(list: &str) -> Option<Vec<String>> {
 
 /// A side's columns, with their types, as `SELECT *` gives them, and whether it is a table whose rows keep their
 /// `_row_id` and `_version` (a name a query can read both of).
-async fn columns_of<H: Host>(host: &H, side: &Side) -> Result<(Vec<(String, DataType)>, bool)> {
+async fn columns_of<H: Host + ?Sized>(host: &H, side: &Side) -> Result<(Vec<(String, DataType)>, bool)> {
     let fields = |df: &datafusion::prelude::DataFrame| df.schema().fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect::<Vec<_>>();
     if let Side::Name(n) = side {
         if let Ok(df) = host.ask(&format!("SELECT *, _row_id, _version FROM {n} LIMIT 0")).await {
@@ -258,7 +272,7 @@ async fn columns_of<H: Host>(host: &H, side: &Side) -> Result<(Vec<(String, Data
 }
 
 /// The query that answers `pondra.diff(a, b)`.
-async fn answer_of<H: Host>(host: &H, call: &Call) -> Result<String> {
+async fn answer_of<H: Host + ?Sized>(host: &H, call: &Call) -> Result<String> {
     // (what each side runs: as named, or over `data =>`'s tables; a key is the one each name declares, either way)
     let (named_a, named_b) = (&call.a, &call.b);
     let (ran_a, ran_b) = match &call.data {
@@ -301,7 +315,7 @@ async fn answer_of<H: Host>(host: &H, call: &Call) -> Result<String> {
 }
 
 /// The two sides as they read over `db`'s tables (`data => 'db'`). Two tables are refused: neither has a definition to run.
-async fn sides_over<H: Host>(host: &H, a: &Side, b: &Side, db: &str) -> Result<(Side, Side)> {
+async fn sides_over<H: Host + ?Sized>(host: &H, a: &Side, b: &Side, db: &str) -> Result<(Side, Side)> {
     let table = |r: &Option<Relation<H>>| matches!(r, Some(Relation::Columns(_)));
     let (ra, rb) = (relation_of(host, a).await, relation_of(host, b).await);
     if table(&ra) && table(&rb) {
@@ -314,7 +328,7 @@ async fn sides_over<H: Host>(host: &H, a: &Side, b: &Side, db: &str) -> Result<(
 /// `dev.v`), the name it is attached by, which its own lake's name needn't be.
 pub(crate) fn database_of(name: &str) -> String { crate::text::parts(name).into_iter().next().unwrap_or_default() }
 
-pub(crate) async fn relation_of<H: Host>(host: &H, side: &Side) -> Option<Relation<H>> {
+pub(crate) async fn relation_of<H: Host + ?Sized>(host: &H, side: &Side) -> Option<Relation<H>> {
     match side {
         Side::Name(n) => host.relation(n).await,
         Side::Query(_) => None,
@@ -323,7 +337,7 @@ pub(crate) async fn relation_of<H: Host>(host: &H, side: &Side) -> Option<Relati
 
 /// One side over `db`'s tables: a view's stored query or a query side, read by `redirect`; a table, `db`'s of its name
 /// (a session's temporary table, no database's, as it is).
-async fn over<H: Host>(host: &H, side: &Side, relation: Option<Relation<H>>, db: &str) -> Result<Side> {
+async fn over<H: Host + ?Sized>(host: &H, side: &Side, relation: Option<Relation<H>>, db: &str) -> Result<Side> {
     Ok(match (side, relation) {
         (Side::Name(n), Some(Relation::Columns(_))) if temporary(n) => side.clone(),
         (Side::Name(n), Some(Relation::Columns(_))) => {
@@ -343,7 +357,7 @@ async fn over<H: Host>(host: &H, side: &Side, relation: Option<Relation<H>>, db:
 
 /// A side's declared key, when it is a table's or a view's name: its PRIMARY KEY's columns (a table's key, or a fact
 /// said NOT ENFORCED), and whether the engine keeps it. Read from `pondra.parts`, which lists every database's objects.
-async fn declared<H: Host>(host: &H, side: &Side) -> Result<Option<(Vec<String>, bool)>> {
+async fn declared<H: Host + ?Sized>(host: &H, side: &Side) -> Result<Option<(Vec<String>, bool)>> {
     let Side::Name(n) = side else { return Ok(None) };
     let Some(parts) = name_parts(n) else { return Ok(None) };
     let text = |s: &String| Value::SingleQuotedString(s.clone()).to_string();
@@ -368,7 +382,7 @@ fn name_parts(name: &str) -> Option<Vec<String>> { names(&name.replace('.', ",")
 /// Refuses a side that holds one key's values on more than one row (`21000`, Postgres's for more rows than one where
 /// one was meant), naming the first and the side as the call names it: a keyed match pairs one row of a side with one of
 /// the other.
-async fn once_each<H: Host>(host: &H, side: &Side, named: &Side, key: &[String]) -> Result<()> {
+async fn once_each<H: Host + ?Sized>(host: &H, side: &Side, named: &Side, key: &[String]) -> Result<()> {
     let k = key.iter().map(|c| ast::Ident::with_quote('"', c).to_string()).collect::<Vec<_>>().join(", ");
     let batches = host.collect(host.ask(&format!("SELECT {k} FROM {} x GROUP BY {k} HAVING count(*) > 1 LIMIT 1", side.from())).await?).await?;
     let Some(b) = batches.iter().find(|b| b.num_rows() > 0) else { return Ok(()) };

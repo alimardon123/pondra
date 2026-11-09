@@ -134,6 +134,12 @@ impl VisitorMut for Casts {
     }
 }
 
+/// The front's tree pass (`front::Trees`): JSON's set functions, uuid and json casts, `pg_typeof`, a lateral
+/// `generate_series`, array literals and an enum's casts as text (`rewrite`).
+pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "pg_casts.rewrite", order: 50, run: tree } }
+
+fn tree<'a>(front: &'a (dyn crate::front::Front + 'static), stmts: &'a mut [Statement], _: &'a crate::front::Facts<'_>) -> futures::future::BoxFuture<'a, Result<bool>> { Box::pin(rewrite(front, stmts)) }
+
 /// Where SQL comes in: a cast to an enum type is a cast to text (a literal one of its labels, or
 /// refused as Postgres refuses it), and `enum_range(NULL::t)`, `enum_first`, `enum_last` its
 /// labels. A cast to `uuid` is the uuid written the one way a column holds it: a literal at once
@@ -141,7 +147,7 @@ impl VisitorMut for Casts {
 /// true)`, NULL for what isn't one). A string compared with a uuid or written into one is read as one, and
 /// `pg_typeof(x)` of one is 'uuid' (`pg_trace::rewrite`), before the casts it may read are written out.
 /// Whether anything changed.
-pub(crate) async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
+pub(crate) async fn rewrite<H: crate::front::Host + ?Sized>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
     let mut read = false;
     for s in stmts.iter_mut() {
         // (a bare name of a JSON call's rows is its value unless a relation has a column of that name: the catalog is asked

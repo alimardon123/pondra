@@ -71,9 +71,7 @@ flight -> server  1
 flight -> sso  3
 flight -> tls  4
 friendly -> pg_bytea  5
-front -> measures  5
-front -> pattern  2
-front -> pg_casts  1
+front -> measures  3
 front -> pg_trace  1
 git -> crypto  1
 git -> fetch  1

@@ -136,6 +136,10 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         for p in [crate::kept::pass(), crate::dialect_stmts::pass(), crate::diff::pass(), crate::past_names::pass(), crate::text::types_pass()].into_iter().chain(crate::friendly::passes()) {
             passes.add(p);
         }
+        let trees = r.section_mut::<crate::front::Trees>(); // (the core's tree passes: `pondra.diff`, the expander, DuckDB's forms)
+        for p in [crate::diff::tree_pass(), crate::expander::tree_pass(), crate::friendly::tree_pass()] {
+            trees.add(p);
+        }
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "functions", columns: FUNCTION_COLUMNS, rows: functions });
         #[cfg(feature = "lake")] // (the functions of the lake a session queries: `Lake::session_with`)
         {

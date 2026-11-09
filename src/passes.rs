@@ -7,8 +7,8 @@
 //! (in a string or a comment too), and its marks, each a run of symbols or letters anywhere. A pass whose trigger is not in
 //! a text must have nothing to do there; the corpus test and the check (`checked`) hold every pass to that.
 //!
-//! The tree passes (`pattern::rewrite`, `pg_casts::rewrite`, `friendly::rewrite`, the measures) are still named in
-//! `front::expand`: they take the host, whose futures aren't boxed yet (step 8's PR 9 brings them here).
+//! The tree passes (`pondra.diff`, the measures, the expander, MATCH_RECOGNIZE, Postgres's casts, DuckDB's forms) are the
+//! registry's too, in their own section (`front::Trees`, step 8's PR 9b): they take the host, which lives a floor above.
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use datafusion::sql::sqlparser::ast::{Expr, Statement};
 use datafusion::sql::sqlparser::dialect::Dialect;

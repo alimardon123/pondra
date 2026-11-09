@@ -63,6 +63,13 @@ pub fn wanted(sql: &str) -> bool {
     WORD.is_match(sql)
 }
 
+/// The front's tree pass (`front::Trees`): MATCH_RECOGNIZE as SQL around one window, where the text has one.
+pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "pattern.rewrite", order: 40, run: tree } }
+
+fn tree<'a>(front: &'a (dyn crate::front::Front + 'static), stmts: &'a mut [Statement], facts: &'a crate::front::Facts<'_>) -> futures::future::BoxFuture<'a, Result<bool>> {
+    Box::pin(async move { Ok(wanted(facts.sql) && rewrite(front, stmts).await?) })
+}
+
 /// `sql` as the parser reads it, with three rewrites. FINAL and RUNNING before a call are wrapped as calls that parse
 /// (`FINAL last(x)` is `pondra_final(last(x))`; the rewrite takes the wrapper away, since ONE ROW PER MATCH reads at the
 /// last row, where both agree). Each PATTERN is written as one quoted name that holds its text in hex, because sqlparser
@@ -445,7 +452,7 @@ fn close_of(sql: &str, code: &[bool], open: usize) -> Option<usize> {
 
 /// Every `MATCH_RECOGNIZE` in `stmts`, as the derived table it stands for; whether any was. A stored view keeps its
 /// clause (it is read again, as its functions are), and so does a macro (expanded where it is called).
-pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
+pub async fn rewrite<H: crate::front::Host + ?Sized>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
     let kept = |s: &Statement| matches!(s, Statement::CreateMacro { .. } | Statement::CreateView(CreateView { materialized: false, .. }));
     let mut scan = Scan::default();
     for s in stmts.iter().filter(|s| !kept(s)) {
@@ -467,7 +474,7 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
 /// The lake inputs' columns, by the input's name: a lake table's rows that have `_row_id` are tied on their ORDER BY in
 /// that order, so every run finds the same matches (a CTE of the same name is not the table), and a measure named like
 /// one of the columns is refused. An input that isn't a lake table has no entry, so DataFusion's own errors stand.
-async fn lake_columns<H: crate::front::Host>(host: &H, scan: &Scan) -> Result<HashMap<String, Vec<String>>> {
+async fn lake_columns<H: crate::front::Host + ?Sized>(host: &H, scan: &Scan) -> Result<HashMap<String, Vec<String>>> {
     let lake = host.name();
     let mut local = BTreeSet::new();
     let mut named = vec![];
@@ -488,7 +495,7 @@ async fn lake_columns<H: crate::front::Host>(host: &H, scan: &Scan) -> Result<Ha
 
 /// The lake columns `open` takes for `sql` (an EMIT FINAL view's query): its inputs' columns, read from `host` as `rewrite`
 /// reads them. Asked first, so the session's functions are passed to `open` after this await.
-pub async fn open_columns<H: crate::front::Host>(host: &H, sql: &str) -> Result<HashMap<String, Vec<String>>> {
+pub async fn open_columns<H: crate::front::Host + ?Sized>(host: &H, sql: &str) -> Result<HashMap<String, Vec<String>>> {
     let mut scan = Scan::default();
     {
         let query = crate::expander::parse_query(&text(sql))?;
