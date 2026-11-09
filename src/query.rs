@@ -1665,9 +1665,12 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
         let entries = other.cat.scan_raw("t/", "t0").await?;
         other.cat.settle().await?; // (as this lake's own, above)
         let upto = Some(other.visible()); // (one end for its tables too, as this lake's above)
+        // (its views the statement names, their names read in it: the tables they read are named then, below)
+        let theirs = their_views(&other, &ns, &text, listing, scope).await?;
+        let read = theirs.iter().fold(text.clone(), |t, (_, s)| format!("{t} {s}"));
         for (key, raw) in entries {
             let name = &key[2..];
-            if crate::sys::hidden(name) || !(listing || mentions(&text, name)) {
+            if crate::sys::hidden(name) || !(listing || mentions(&read, name)) {
                 continue;
             }
             let meta = other.cat.parsed(&key, &raw)?;
@@ -1679,7 +1682,22 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
             }
             catalog.schema(s).expect("registered").register_table(t.to_string(), view)?;
         }
-        ctx.register_catalog(ns, catalog);
+        ctx.register_catalog(ns.clone(), catalog.clone());
+        for (name, sql) in theirs {
+            // (planned over its tables, now registered; refused as its tables are, by the grants naming it)
+            let df = match self::sql(&ctx, &crate::sys::planned(&sql)?).await {
+                Ok(df) => df,
+                Err(_) if listing => continue, // (a listing shows what it can, as of this lake's own views)
+                Err(e) => return Err(e.context(format!("{ns}.{name}"))),
+            };
+            let view: Arc<dyn TableProvider> = Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext_names::readable(&sql))));
+            let Some(view) = across(scope, &format!("{ns}.{name}"), view, listing, &locked, &asked) else { continue };
+            let (s, t) = split(&name);
+            if old && s == PUBLIC {
+                default.schema(&ns).expect("registered").register_table(t.to_string(), view.clone())?;
+            }
+            catalog.schema(s).expect("registered").register_table(t.to_string(), view)?;
+        }
     }
     if (crate::runs::mentioned(&text) || !crate::lists::mentioned(&text).is_empty()) && default.schema("pondra").is_none() {
         // (`pondra.runs`, `pondra.routines`, `pondra.tasks`, the lists; a lake's own schema called pondra is one made before 0.80, which wins as it did: 0.80 refuses a new one, 42939)
@@ -1895,6 +1913,24 @@ pub async fn stored_views(lake: &Lake, sql: &str, listing: bool, scope: &crate::
             views.push((k[2..].to_string(), sql));
         }
     }
+}
+
+/// The stored views of `other`, attached as `ns`, that `text` names (every one, for a listing), by their names in it, each
+/// as the query it reads there: its macros expanded as its own lake's views are (`stored_views`), its tables named in
+/// `ns` and the views of `other` it reads inlined (`redirect.rs`). So `ns.sales.v` reads as `sales.v` does in `other`.
+async fn their_views(other: &Lake, ns: &str, text: &str, listing: bool, scope: &crate::rights::Scope) -> Result<Vec<(String, String)>> {
+    let host = crate::host::Asking::of(other, scope);
+    let mut out = vec![];
+    for (key, raw) in other.cat.scan_raw("q/", "q0").await? {
+        let name = &key[2..];
+        if !(listing || crate::text::mentions(text, name)) {
+            continue;
+        }
+        let v: crate::ddl::StoredView = serde_json::from_slice(&raw)?;
+        let sql = crate::routines::expand_stored(other, &v.sql, scope).await?;
+        out.push((name.to_string(), crate::redirect::redirect(&host, sql, ns.to_string(), 0).await?));
+    }
+    Ok(out)
 }
 
 /// Stored views over the tables `ctx` has now — again, if they are there already: a node's shares
