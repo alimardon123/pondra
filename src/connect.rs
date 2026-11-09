@@ -36,7 +36,7 @@ pub static CONNECTIONS: BuiltIn = BuiltIn {
 const KIND: Kind = Kind {
     name: "connection",
     family: "connection",
-    verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"],
+    verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "DROP", "UNDROP", "COMMENT ON", "SHOW CREATE"],
     prefix: crate::connections::PREFIX,
     privileges: &["READ", "WRITE"],
     on_clone: OnClone::Copy, // (a branch keeps the definition; its secret is the branch's own, made there)
@@ -375,7 +375,7 @@ fn remove<'a>(lake: &'a Lake, tree: Value) -> BoxFuture<'a, Result<Value>> {
             return Ok(j!({"connection": d.name, "dropped": false}));
         }
         not_attached(lake, &d.name, &format!("DROP CONNECTION {}", d.name)).await?;
-        lake.cat.commit(vec![], &[key(&d.name)]).await?;
+        lake.cat.commit(crate::undrop::aside(lake, "connection", &d.name, &[key(&d.name)]).await?, &[key(&d.name)]).await?; // (kept to be undropped)
         Ok(j!({"connection": d.name, "dropped": true}))
     })
 }

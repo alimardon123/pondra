@@ -272,7 +272,7 @@ pub async fn copy(lake: &Lake, nodes: &[String], me: &str, sql: &str, target: &c
 /// This node's share of a `COPY … TO`, written: how many rows.
 pub async fn copy_share(lake: &Lake, s: &Slice, target: &crate::copy::Target) -> Result<u64> {
     crate::ext::register(lake, &target.to).await?;
-    crate::learned::given(&s.learned, crate::ext::scope(true, async {
+    crate::learned::given(lake, &s.learned, crate::ext::scope(true, async {
         crate::ext::prime(lake, &s.ext).await?;
         crate::copy::write(shared(lake, s).await?.1, target).await
     }))
@@ -309,7 +309,7 @@ pub type Columns = Vec<(String, String)>;
 
 /// This node's share of an `INSERT`, written into the table's folder: its files.
 pub async fn insert_share(lake: &Lake, s: &Slice, table: &str, stamp: Option<crate::log::Reserved>) -> Result<(Columns, Vec<DataFile>)> {
-    crate::learned::given(&s.learned, crate::ext::scope(true, async {
+    crate::learned::given(lake, &s.learned, crate::ext::scope(true, async {
         crate::ext::prime(lake, &s.ext).await?;
         let (ctx, _) = shared(lake, s).await?;
         // (out of memory, once more frugally, as `write::write_files` does: this share's files are never recorded by the first try)
@@ -502,7 +502,7 @@ pub fn reply(shape: &str, parts: Vec<Spill>, done: Option<crate::spill::Gone>) -
 /// The physical plan of the slice's query, its tables standing for just their parts.
 async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn ExecutionPlan>)> {
     // Files outside the lake as the coordinator listed them; it checked who may read them.
-    crate::learned::given(&s.learned, crate::ext::scope(true, async { crate::ext::prime(lake, &s.ext).await.and(Ok(planned(lake, s).await?)) })).await
+    crate::learned::given(lake, &s.learned, crate::ext::scope(true, async { crate::ext::prime(lake, &s.ext).await.and(Ok(planned(lake, s).await?)) })).await
 }
 
 async fn planned(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn ExecutionPlan>)> {

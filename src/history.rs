@@ -27,8 +27,7 @@ use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, ListBuilder, 
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::source::DataSourceExec;
-use crate::reset::Once;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use datafusion::common::instant::Instant;
 use std::time::Duration;
 
@@ -321,62 +320,94 @@ struct Line {
 /// A statement a door ran has ended (`audit::statement`): its row, and a line in the node's log
 /// when it was slow. A joined page keeps no rows: its statement goes to its node (`page_records::add`), which
 /// keeps the row with the sign-in's name (`page_ended`).
-pub fn ended(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note) {
+pub fn ended(app: &App, by: Option<&crate::auth::Principal>, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note) {
     if !app.members.keeps_records() {
         return crate::page_records::add(&app.lake, sql, outcome, error, took);
     }
-    record(app, class, sql, outcome, error, took, note, false)
+    record(app, by, class, sql, outcome, error, took, note, false)
 }
 
 /// A joined page's statement, as its node keeps it (`page_records::record`, under the sign-in's name): the row `ended`
 /// keeps, with no line in the node's log for a slow one, and counted against the rate limit whatever its outcome.
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the node's half: `server::records`)
-pub(crate) fn page_ended(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration) {
-    record(app, class, sql, outcome, error, took, Note::default(), true)
+pub(crate) fn page_ended(app: &App, by: &crate::auth::Principal, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration) {
+    record(app, Some(by), class, sql, outcome, error, took, Note::default(), true)
 }
 
-fn record(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note, page: bool) {
+/// A row, as `by` did it (none: the node).
+#[allow(clippy::too_many_arguments)]
+fn record(app: &App, by: Option<&crate::auth::Principal>, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note, page: bool) {
     if !on() || app.log.is_none() || !app.members.keeps_records() {
         return; // (a read-only node writes nothing)
     }
+    let Ok(history) = app.lake.state::<History>() else { return };
     let slow = took >= slow();
-    if (page || !slow && outcome == "ok" && note.learned.is_empty()) && skipped() {
+    if (page || !slow && outcome == "ok" && note.learned.is_empty()) && history.skipped() {
         return; // (counted: nothing else to do, on the path of every statement)
     }
-    let who = crate::auth::current();
-    let (user, door, from) = who.map_or((String::new(), "node", None), |p| (p.name, p.door, p.from.map(|a| a.to_string())));
+    let (user, door, from) = by.map_or((String::new(), "node", None), |p| (p.name.clone(), p.door, p.from.map(|a| a.to_string())));
     let statement = crate::audit::redacted(sql, class);
     if slow && !page {
         // (a library's host or a `pondra sql` guest doesn't print it: `Lifecycle::say`. It is in pondra.history)
         app.lake.node.life.say(&format!("slow statement: {} ms, {user} by {door}{}: {}", took.as_millis(), note.nodes.map(|n| format!(" on {n} nodes")).unwrap_or_default(), cut(statement.replace('\n', " "), 300)));
     }
     let line = Line { at: crate::log::now_ms(), id: crate::runs::new_id(), user, door, from, session: crate::temp::current(), class, statement, sql: sql.to_string(), outcome, error, ms: took.as_millis() as i64, note };
-    let tx = WRITER.get_or(|| writer(app, TABLE, crate::ddl::Ddl::HistoryLog, Duration::from_secs(1), batch));
+    let tx = history.writer.get_or_init(|| writer(app, TABLE, crate::ddl::Ddl::HistoryLog, Duration::from_secs(1), batch));
     let _ = tx.send(line);
 }
 
-/// Past this second's rate: this statement is counted, not written. The first statement of a
-/// second after one that skipped some writes a row saying how many.
-fn skipped() -> bool {
-    crate::per_node!(static SECOND: Mutex<(u64, u64, u64)> = Mutex::new((0, 0, 0))); // (the second, rows written in it, statements skipped in it)
-    let now = crate::log::now_ms() / 1000;
-    let mut s = SECOND.lock().unwrap();
-    if s.0 != now {
-        let skipped = std::mem::replace(&mut *s, (now, 0, 0)).2;
-        if let Some(tx) = WRITER.current().filter(|_| skipped > 0) {
-            let statement = format!("({skipped} more statements that second, not written: PONDRA_HISTORY_RATE)");
-            let _ = tx.send(Line { at: crate::log::now_ms(), id: crate::runs::new_id(), user: String::new(), door: "node", from: None, session: None, class: "skipped", statement, sql: String::new(), outcome: "ok", error: None, ms: 0, note: Note { rows: Some(skipped), ..Default::default() } });
-        }
-    }
-    let full = s.1 >= rate();
-    match full {
-        true => s.2 += 1,
-        false => s.1 += 1,
-    }
-    full
+/// What a lake's history keeps (its state, `lake_state.rs`): the writer its rows go to, made with its first row; this
+/// second's count, past which a statement is counted and not written (`PONDRA_HISTORY_RATE`); and the relations of the
+/// statements' shapes it saw (`relations_by`).
+pub struct History {
+    writer: OnceLock<tokio::sync::mpsc::UnboundedSender<Line>>,
+    second: Mutex<(u64, u64, u64)>, // (the second, rows written in it, statements skipped in it)
+    seen: Mutex<lru::LruCache<String, Option<Vec<String>>>>,
 }
 
-crate::per_node!(static WRITER: RwLock<Option<tokio::sync::mpsc::UnboundedSender<Line>>> = RwLock::new(None));
+impl crate::lake_state::LakeState for History {
+    const NAME: &'static str = "history";
+    const ABOUT: &'static str = "the writer of its pondra.history rows, this second's count of them, and the relations its statements' shapes name";
+
+    fn make() -> Self {
+        History { writer: OnceLock::new(), second: Mutex::new((0, 0, 0)), seen: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(1024).expect("non-zero"))) }
+    }
+}
+
+impl History {
+    /// Past this second's rate: this statement is counted, not written. The first statement of a
+    /// second after one that skipped some writes a row saying how many.
+    fn skipped(&self) -> bool {
+        let now = crate::log::now_ms() / 1000;
+        let mut s = self.second.lock().unwrap_or_else(|e| e.into_inner());
+        if s.0 != now {
+            let skipped = std::mem::replace(&mut *s, (now, 0, 0)).2;
+            if let Some(tx) = self.writer.get().filter(|_| skipped > 0) {
+                let statement = format!("({skipped} more statements that second, not written: PONDRA_HISTORY_RATE)");
+                let _ = tx.send(Line { at: crate::log::now_ms(), id: crate::runs::new_id(), user: String::new(), door: "node", from: None, session: None, class: "skipped", statement, sql: String::new(), outcome: "ok", error: None, ms: 0, note: Note { rows: Some(skipped), ..Default::default() } });
+            }
+        }
+        let full = s.1 >= rate();
+        match full {
+            true => s.2 += 1,
+            false => s.1 += 1,
+        }
+        full
+    }
+
+    /// `relations`, kept by the statement's shape (`prints`): statements of one shape name the same relations (a shape
+    /// keeps every name and every string as written), so a statement run again with other numbers isn't parsed again.
+    /// Without a shape, or with a long one, parsed.
+    fn relations_by(&self, shape: Option<&str>, sql: &str) -> Option<Vec<String>> {
+        let Some(shape) = shape.filter(|s| s.len() <= 4096) else { return relations(sql) }; // (1,024 kept shapes: at most 4 MB)
+        if let Some(r) = self.seen.lock().unwrap_or_else(|e| e.into_inner()).get(shape) {
+            return r.clone();
+        }
+        let r = relations(sql);
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).put(shape.to_string(), r.clone());
+        r
+    }
+}
 
 /// The history's columns. The cost of a read: `cpu_ms` is its operators' compute time, and `bytes_read` the bytes
 /// read from files (its Parquet scans; rows still in the log and hot columns held in memory count none). `peak_memory`
@@ -464,6 +495,11 @@ fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
 fn touched(app: &App, lines: &[Line], prints: &[Option<(String, String)>]) -> [ArrayRef; 2] {
     let (mut reads, mut writes) = (ListBuilder::new(StringBuilder::new()), ListBuilder::new(StringBuilder::new()));
     let local = |n: &String| crate::ddl::local(&app.lake, n).unwrap_or_else(|| n.clone());
+    let history = app.lake.state::<History>().ok();
+    let relations_by = |shape: Option<&str>, sql: &str| match &history {
+        Some(h) => h.relations_by(shape, sql),
+        None => relations(sql),
+    };
     for (l, print) in lines.iter().zip(prints) {
         let w = if matches!(l.class, "write" | "ddl") {
             l.note.wrote.clone().unwrap_or_else(|| Wrote::of(crate::write::parse(&l.sql).as_ref())) // (the door's parse, else this one)
@@ -488,21 +524,6 @@ fn touched(app: &App, lines: &[Line], prints: &[Option<(String, String)>]) -> [A
         }
     }
     [Arc::new(reads.finish()), Arc::new(writes.finish())]
-}
-
-/// `relations`, kept by the statement's shape (`prints`): statements of one shape name the same relations (a shape keeps
-/// every name and every string as written), so a statement run again with other numbers isn't parsed again. Without a
-/// shape, or with a long one, parsed.
-fn relations_by(shape: Option<&str>, sql: &str) -> Option<Vec<String>> {
-    type Seen = lru::LruCache<String, Option<Vec<String>>>;
-    crate::per_node!(static SEEN: Mutex<Seen> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(1024).expect("non-zero"))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
-    let Some(shape) = shape.filter(|s| s.len() <= 4096) else { return relations(sql) }; // (1,024 kept shapes: at most 4 MB)
-    if let Some(r) = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get(shape) {
-        return r.clone();
-    }
-    let r = relations(sql);
-    SEEN.lock().unwrap_or_else(|e| e.into_inner()).put(shape.to_string(), r.clone());
-    r
 }
 
 /// Every relation one statement names, anywhere in it, once each, CTE names left out (as
@@ -542,15 +563,14 @@ fn relations(sql: &str) -> Option<Vec<String>> {
 pub fn writer<L: Send + Sync + 'static>(app: &App, table: &'static str, make: crate::ddl::Ddl, every: Duration, batch: fn(&App, &[L]) -> Result<RecordBatch>) -> tokio::sync::mpsc::UnboundedSender<L> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<L>();
     let app = app.clone();
-    keep(async move {
+    keep(&app.lake.clone(), async move {
         let producer = format!("{}-{}", table.trim_start_matches("pondra$"), crate::runs::new_id());
         let (mut seq, mut made) = (0, false);
-        while let Some(first) = next(&mut rx).await {
-            if !ending() {
-                let mut stop = ENDING.subscribe();
+        while let Some(first) = next(&app.lake, &mut rx).await {
+            if !ending(&app.lake) {
                 tokio::select! {
                     _ = tokio::time::sleep(every) => {}
-                    _ = async { drop(stop.wait_for(|e| *e).await) } => {} // (a node stopping writes what it has at once: a close waited out the second)
+                    _ = stopping(&app.lake) => {} // (a node stopping writes what it has at once: a close waited out the second)
                 }
             }
             let mut lines = vec![first];
@@ -584,40 +604,76 @@ pub fn writer<L: Send + Sync + 'static>(app: &App, table: &'static str, make: cr
     tx
 }
 
-// This node's log writers (history, the audit log, the run log): each one's task, and whether its
-// node is stopping (`end_writers`).
-crate::per_node!(static WRITERS: Mutex<Vec<tokio::task::JoinHandle<()>>> = Mutex::new(Vec::new()));
-crate::per_node!(static ENDING: tokio::sync::watch::Sender<bool> = tokio::sync::watch::channel(false).0);
+/// A lake's log writers (its state, `lake_state.rs`: the history, the audit log, the run log): each one's task, and
+/// whether its node is stopping (`end_writers`). A writer holds its lake until it ends: its node's stop ends it, or a
+/// stop with no drain aborts it (`panics::abort_all`).
+pub struct Writers {
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    ending: tokio::sync::watch::Sender<bool>,
+}
 
-/// Starts one of this node's log writers, kept for `end_writers`: the node's own work (`auth::as_node`), whoever's lines
+impl crate::lake_state::LakeState for Writers {
+    const NAME: &'static str = "log_writers";
+    const ABOUT: &'static str = "the tasks that write its node's own tables (pondra.history, the audit log, the run log), and whether its node is stopping";
+
+    fn make() -> Self { Writers { tasks: Mutex::new(Vec::new()), ending: tokio::sync::watch::channel(false).0 } }
+}
+
+/// Starts one of `lake`'s log writers, kept for `end_writers`: the node's own work (`auth::as_node`), whoever's lines
 /// it writes.
-pub(crate) fn keep(run: impl std::future::Future<Output = ()> + Send + 'static) {
-    let task = crate::panics::own(run);
-    WRITERS.lock().unwrap().push(task);
+pub(crate) fn keep(lake: &Lake, run: impl std::future::Future<Output = ()> + Send + 'static) {
+    kept(lake, crate::panics::own(run));
+}
+
+/// `keep`'s part that isn't its task's: one copy for every writer.
+fn kept(lake: &Lake, task: tokio::task::JoinHandle<()>) {
+    if let Ok(w) = lake.state::<Writers>() {
+        w.tasks.lock().unwrap_or_else(|e| e.into_inner()).push(task);
+    }
 }
 
 /// A log writer's next line: None once its node is stopping and every line sent before is taken.
-pub(crate) async fn next<L>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<L>) -> Option<L> {
-    let mut ending = ENDING.subscribe();
+pub(crate) async fn next<L>(lake: &Lake, rx: &mut tokio::sync::mpsc::UnboundedReceiver<L>) -> Option<L> {
+    let mut ending = watching(lake);
     tokio::select! {
         biased;
         line = rx.recv() => return line,
-        _ = async { drop(ending.wait_for(|e| *e).await) } => {} // (its guard isn't Send: dropped here)
+        _ = stopped(&mut ending) => {}
     }
     rx.close(); // (what was sent before stays to be taken; nothing more comes)
     rx.recv().await
 }
 
-/// Is this node stopping (a log writer writes what it has at once, without waiting for more)?
-pub(crate) fn ending() -> bool {
-    *ENDING.borrow()
+/// Is `lake`'s node stopping (a log writer writes what it has at once, without waiting for more)?
+pub(crate) fn ending(lake: &Lake) -> bool {
+    lake.state::<Writers>().is_ok_and(|w| *w.ending.borrow())
 }
 
-/// Writes what this node's log writers were sent, then ends them: `Node::stop`, while the node still
+/// Waits until `lake`'s node is stopping.
+async fn stopping(lake: &Lake) {
+    stopped(&mut watching(lake)).await
+}
+
+/// What says when `lake`'s node is stopping: a writer waits on it holding no more of its lake than it did.
+fn watching(lake: &Lake) -> Option<tokio::sync::watch::Receiver<bool>> {
+    lake.state::<Writers>().ok().map(|w| w.ending.subscribe())
+}
+
+/// Waits until `ending` says its node is stopping: never, with nothing to say it.
+async fn stopped(ending: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match ending {
+        Some(e) => drop(e.wait_for(|e| *e).await), // (its guard isn't Send: dropped here)
+        None => std::future::pending().await,
+    }
+}
+
+/// Writes what `lake`'s log writers were sent, then ends them: `Node::stop`, while the node still
 /// leads, since their rows go through the log. 5 s at most; what is left then is lost, as at a kill.
-pub(crate) async fn end_writers() {
-    ENDING.send_replace(true);
-    let all = std::mem::take(&mut *WRITERS.lock().unwrap());
+pub(crate) async fn end_writers(lake: &Lake) {
+    let Ok(w) = lake.state::<Writers>() else { return };
+    w.ending.send_replace(true);
+    let all = std::mem::take(&mut *w.tasks.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(w);
     let _ = tokio::time::timeout(Duration::from_secs(5), futures::future::join_all(all)).await;
 }
 
@@ -643,12 +699,16 @@ mod tests {
 
     #[test]
     fn a_statements_relations_are_kept_by_its_shape() {
+        use crate::lake_state::LakeState as _;
+        let history = History::make();
+        let relations_by = |shape: Option<&str>, sql: &str| history.relations_by(shape, sql);
         let shape = |sql: &str| prints(sql).map(|(_, shape)| shape);
         let fingerprint = |sql: &str| prints(sql).map(|(print, _)| print);
         let (a, b) = ("SELECT * FROM t JOIN s.u ON t.k = u.k WHERE t.v = 1", "select * from T join s.u on t.k = u.k where t.v = 22");
         assert_eq!(shape(a), shape(b), "the same statement but for its numbers");
         assert_eq!(relations_by(shape(a).as_deref(), a), Some(vec!["t".to_string(), "s.u".to_string()]));
         assert_eq!(relations_by(shape(b).as_deref(), b), relations(b), "kept, and the same as parsed");
+        assert_eq!(history.seen.lock().unwrap().len(), 1, "one shape, kept once");
         // (a string can name what's read: one fingerprint, two shapes)
         let (f, g) = ("SELECT * FROM 'a.parquet' WHERE v = 1", "SELECT * FROM 'b.parquet' WHERE v = 2");
         assert_eq!(fingerprint(f), fingerprint(g));
