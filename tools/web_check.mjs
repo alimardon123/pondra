@@ -55,7 +55,9 @@ const sizes = args.includes('--sizes');
 // 9.2305 → 9.2442 MB: a dropped database kept in its folder and UNDROP DATABASE (13.7 KB over main's 9,224,889 at
 // caedf432: 9,238,567 at f0045f19, measured on CI), the room above main kept as it was: the page builds the same ddl as
 // every form, a database's drop and undrop with it.
-const BROTLI_BUDGET = 9_244_200;
+// 9.2442 → 9.2475 MB: a lake's Kafka door, Kafka clients and sharing door keep their state as the lake's (step 2, PR 12c:
+// 1.2 KB over main's 9,243,289 at bb80824c, 9,244,454 measured on CI), and the room above main back to 3 KB, as above.
+const BROTLI_BUDGET = 9_247_500;
 // The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
 const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows
