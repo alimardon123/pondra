@@ -25,6 +25,7 @@ lists base
 registry base
 settings base
 text base
+words base
 walk base
 spawns base
 
@@ -64,6 +65,7 @@ replica catalog
 scan catalog
 sketch catalog
 store catalog
+table_record catalog
 terms catalog
 files catalog
 

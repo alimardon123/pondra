@@ -12,7 +12,7 @@
 //! log, so a recipient sees what Delta's readers see — deletion vectors, renamed columns, purged
 //! changes — and nothing that isn't durable yet (invariant 16).
 use crate::store::{json, table_key, Lake, TableMeta};
-use crate::users::{Words, W};
+use crate::words::{Words, W};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine};
 use serde::{Deserialize, Serialize};

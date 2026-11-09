@@ -6,7 +6,7 @@
 //! user made here, or anyone when the provider says so, with the roles its roles claim names
 //! (invariant 410; `users::claimed`).
 use crate::store::{json, Lake};
-use crate::users::{Words, W};
+use crate::words::{Words, W};
 use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine};
 use serde::{Deserialize, Serialize};
