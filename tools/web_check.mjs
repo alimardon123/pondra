@@ -47,10 +47,10 @@ const sizes = args.includes('--sizes');
 // 3d5a4f49, measured on CI): a page's lake brings back a schema with what it held, and a view made again from its query.
 // 9.222 → 9.2255 MB: avg of a DECIMAL as sum / count (`avg.rs`, 3.2 KB over main's 9,214,186 at 366b20c8, measured on
 // CI): a page's average answers as its sum over its count does, in type and digits, as every form's does.
-// 9.2255 → 9.2365 MB: a dropped database kept in its folder and UNDROP DATABASE (10.8 KB over main's 9,221,388 at the
-// train's 42557954757, measured on CI; main is 9,224,889 at caedf432): the page builds the same ddl as every form, a
-// database's drop and undrop with it.
-const BROTLI_BUDGET = 9_236_500;
+// 9.2255 → 9.2386 MB: a dropped database kept in its folder and UNDROP DATABASE (13.7 KB over main's 9,224,889 at
+// caedf432: 9,238,567 at f0045f19, measured on CI): the page builds the same ddl as every form, a database's drop and
+// undrop with it.
+const BROTLI_BUDGET = 9_238_600;
 // The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
 const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows
