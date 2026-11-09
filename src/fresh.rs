@@ -126,7 +126,8 @@ fn bytes_of(plan: &Arc<dyn ExecutionPlan>, task: &TaskContext) -> usize {
 /// lake would keep itself. (A kept plan calls none of them: `steady`.)
 fn kept_task(task: &TaskContext) -> Arc<TaskContext> {
     let scalar = task.scalar_functions().iter().filter(|(_, f)| f.signature().volatility == Volatility::Immutable).map(|(k, f)| (k.clone(), f.clone())).collect();
-    Arc::new(TaskContext::new(task.task_id(), task.session_id(), task.session_config().clone(), scalar, task.higher_order_functions().clone(),
+    let config = task.session_config().clone().with_extension(Arc::new(crate::readings::Reading::none())); // (it reads a flush's rows, no file: its statement's reading ends with it)
+    Arc::new(TaskContext::new(task.task_id(), task.session_id(), config, scalar, task.higher_order_functions().clone(),
                               task.aggregate_functions().clone(), task.window_functions().clone(), task.runtime_env()))
 }
 

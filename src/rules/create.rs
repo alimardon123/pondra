@@ -210,9 +210,11 @@ pub fn options(given: &[ast::SequenceOptions]) -> Result<Vec<Opt>> {
 
 /// A sequence's options as Postgres takes them, in any order (`START 10 INCREMENT 5`, `INCREMENT BY
 /// 5 START WITH 10`), checked; with `alter`, `RESTART [[WITH] n]` too.
-pub fn parse_options(text: &str, alter: bool) -> Result<(Vec<Opt>, Option<Option<i64>>)> {
+pub fn parse_options(text: &str, alter: bool) -> Result<(Vec<Opt>, Option<Option<i64>>)> { options_in(text.split_whitespace().map(str::to_uppercase).collect(), alter) }
+
+/// `parse_options` of the options' words, upper-cased, one a word (`["START", "WITH", "-5"]`).
+pub fn options_in(words: Vec<String>, alter: bool) -> Result<(Vec<Opt>, Option<Option<i64>>)> {
     const USAGE: &str = "[AS smallint | integer | bigint] [INCREMENT [BY] n] [MINVALUE n | NO MINVALUE] [MAXVALUE n | NO MAXVALUE] [START [WITH] n] [CACHE n] [[NO] CYCLE]";
-    let words: Vec<String> = text.split_whitespace().map(str::to_uppercase).collect();
     let (mut out, mut restart, mut i) = (vec![], None, 0);
     let number = |i: usize| -> Result<i64> {
         let w = words.get(i).with_context(|| format!("a number after {}", words[i - 1]))?;

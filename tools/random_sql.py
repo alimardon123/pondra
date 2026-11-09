@@ -15,7 +15,9 @@ counted under the entry's id instead. The nightly job (fuzz.yml) runs it with se
 The tables are made afresh each `--every` queries (a few hundred rows of integers, decimals,
 doubles, text, booleans and dates, NULLs and repeats among them). The queries keep to SQL both
 engines mean the same by: no integer division or modulo, explicit NULLS FIRST/LAST, no functions
-whose names or edges differ. A disagreement is kept with its query and both answers.
+whose names or edges differ. One query in six is a set operation of two (UNION, INTERSECT or EXCEPT, ALL or
+not), drawn apart from the rest so a seed's other queries stay as they were. A disagreement is kept with its query and
+both answers.
 """
 import argparse, datetime, decimal, io, json, os, random, re, sys, time
 
@@ -121,6 +123,15 @@ class Gen:
         return f"SELECT {distinct}{', '.join(exprs)} FROM {src}", "", cols
 
 
+class Sets(Gen):
+    """One query in six a set operation of two (UNION, INTERSECT or EXCEPT, with ALL or not): ALL counts each row's
+    copies, which DataFusion's own INTERSECT ALL and EXCEPT ALL didn't (`set_all.rs`)."""
+
+    def op(self):
+        r = self.r
+        return r.choice(["UNION", "INTERSECT", "EXCEPT"]) + r.choice(["", " ALL"]) if r.random() < 1 / 6 else None
+
+
 def value(v):
     if isinstance(v, (decimal.Decimal, float, int)) and not isinstance(v, bool):
         return round(float(v), 6)
@@ -153,7 +164,8 @@ def main():
         return 0
     import duckdb
     harness.A = argparse.Namespace(s3=False, keep=False, port=A.port)
-    stats = {"queries": 0, "agree": 0, "both_refused": 0, "pondra_refused": 0, "duckdb_refused": 0, "partitions_checked": 0, "spread_checked": 0}
+    sets = Sets(random.Random(f"sets {A.seed}"))  # (its own draws: each seed's other queries are as they were)
+    stats = {"queries": 0, "sets": 0, "agree": 0, "both_refused": 0, "pondra_refused": 0, "duckdb_refused": 0, "partitions_checked": 0, "spread_checked": 0}
     for k in KNOWN:  # (each entry whole: an id, a matcher that compiles, its evidence, a real date)
         assert {"id", "match", "evidence", "expires"} <= k.keys() and k["evidence"], k
         re.compile(k["match"]), datetime.date.fromisoformat(k["expires"])
@@ -180,6 +192,9 @@ def main():
                 head, tail, cols = g.query(tables)
                 where = f" WHERE {g.pred(cols)}" if rnd.random() < 0.5 else ""
                 sql = head + where + tail
+                if (op := sets.op()) is not None:  # (a set operation: the query, then the same one with another WHERE)
+                    sql = f"({sql}) {op} ({head} WHERE {sets.pred(cols)}{tail})"
+                    stats["sets"] += 1
                 stats["queries"] += 1
                 try:
                     theirs = duck.execute(sql).fetchall()
@@ -218,7 +233,7 @@ def main():
                         continue
                     if bag(spread) != bag(mine):
                         found.append({"kind": "wrong", "tables": made, "oracle": "three nodes", "sql": sql, "one": str(bag(mine)[:5])[:400], "three": str(bag(spread)[:5])[:400]})
-                if not tail and "DISTINCT" not in head:  # (ternary logic partitioning: a plain query's rows, split three ways)
+                if not tail and "DISTINCT" not in head and not sql.startswith("("):  # (ternary logic partitioning: a plain query's rows, split three ways)
                     p = g.pred(cols)
                     glue = " AND " if where else " WHERE "
                     try:

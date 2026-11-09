@@ -111,7 +111,7 @@ const fn entry(words: &'static [&'static str], about: &'static str) -> crate::st
 }
 
 fn read(w: &mut Words) -> Result<crate::write::Stmt> {
-    Ok(match parse(std::mem::replace(w, Words::default())) {
+    Ok(match parse(std::mem::take(w)) {
         Ok(c) => crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Users(c)]),
         Err(e) => crate::write::Stmt::Invalid(format!("{e:#}")),
     })
