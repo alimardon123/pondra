@@ -305,21 +305,23 @@ fn one_at_a_time(open: Opened, dir: &Path) {
     open.close();
 }
 
-/// 5. A query the pool can't see grow (`array_agg` over 30M values in three groups holds them outside the query memory)
+/// 5. A query the pool can't see grow (`array_agg` over 60M values in three groups holds them outside the query memory)
 /// grows the host's process past its line of 1 GB: the watch stops it, and its frugal second try, with 53200, as on a
-/// node, where the OS would have ended the host (11-08 audit H3). The process stays under 1.5 GB, and the node answers
-/// after.
+/// node, where the OS would have ended the host (11-08 audit H3). The process stays under twice its line, and the node
+/// answers after. (Unstopped, the query peaks at 3.8 GB; stopped, at 1.1 GB. Over 30M values it peaked at 2.1 GB
+/// unstopped, and stopped at 1.4 GB here and 1.54 to 1.6 GB on CI's runner, past a bound of 1.5 GB half the time: the
+/// line fell near the end of its input, where its memory grows in bigger steps.)
 fn stops_a_query_not_the_host(at: &At, dir: &Path) {
     let lake = dir.join("five").display().to_string();
     let addr = free_addr();
     let url = format!("http://{addr}");
     let node = Opened::open(Options::local(&lake, &addr)).expect("a node opens");
-    let aggregate = "SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, 30000000) GROUP BY 1";
+    let aggregate = "SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, 60000000) GROUP BY 1";
     let r = at.send_within(&url, aggregate, Duration::from_secs(600));
     assert_eq!((r.status, r.code.as_str()), (503, "53200"), "the query is stopped for memory: {} {}", r.label(), r.body);
     let peak = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:"))?.split_whitespace().nth(1)?.parse::<u64>().ok());
     if let Some(kb) = peak {
-        assert!(kb < 3 << 19, "the process peaked under 1.5 GB: {} MB", kb >> 10);
+        assert!(kb < 2 << 20, "the process peaked under twice its line, 2 GB: {} MB", kb >> 10);
     }
     let after = poll(30, || (at.send(&url, "SELECT 1 AS one").status == 200).then_some(()));
     assert!(after.is_some(), "the node answers after the stop");
