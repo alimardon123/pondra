@@ -2357,7 +2357,7 @@ impl Lake {
         for (name, cache) in lake.caches() {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
-        ledger.charge("facts", Arc::downgrade(&crate::query::facts_kept())); // (the node's, charged once whatever lakes it opens)
+        lake.state::<crate::query::PlanFacts>()?; // (its planning facts, charged to its line as they are made: `Lake::state`)
         ledger.charge("files", Arc::downgrade(&crate::cache::outside())); // (the process's, of files outside the lakes)
         crate::oom::wake();
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)

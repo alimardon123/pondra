@@ -700,7 +700,7 @@ struct Kept {
     facts: Arc<Facts>,
 }
 
-/// Versions kept at once, and the manifests' bytes they may hold together, per node (`cache_bytes{cache="facts"}`).
+/// Versions kept at once, and the manifests' bytes they may hold together, per lake (`cache_bytes{cache="facts"}`).
 const FACTS_ENTRIES: usize = 256;
 const FACTS_BYTES: usize = 64 << 20;
 
@@ -726,11 +726,18 @@ impl FactsMemo {
     }
 }
 
-crate::per_node!(static FACTS: Arc<std::sync::Mutex<FactsMemo>> = Default::default(); clear = |m| *m.lock().unwrap_or_else(|e| e.into_inner()) = FactsMemo::default());
+/// A lake's planning facts (`FactsMemo`), as its line counts them (`cache_bytes{cache="facts"}`): the least recently
+/// planned versions give their manifests back first.
+pub struct PlanFacts(Arc<std::sync::Mutex<FactsMemo>>);
 
-/// The planning facts, as the node's line counts them (`cache_bytes{cache="facts"}`): the least recently planned versions
-/// give their manifests back first.
-pub fn facts_kept() -> Arc<dyn crate::ledger::Charged> { FACTS.clone() }
+impl crate::lake_state::LakeState for PlanFacts {
+    const NAME: &'static str = "facts";
+    const ABOUT: &'static str = "each append table version's facts as its queries plan it: its manifests, statistics and schema";
+
+    fn make() -> Self { PlanFacts(Default::default()) }
+
+    fn cache(self: Arc<Self>) -> Option<Arc<dyn crate::ledger::Charged>> { Some(self.0.clone()) }
+}
 
 impl crate::ledger::Charged for std::sync::Mutex<FactsMemo> {
     fn held(&self) -> usize { self.lock().unwrap_or_else(|e| e.into_inner()).by_key.bytes() }
@@ -743,11 +750,12 @@ impl crate::ledger::Charged for std::sync::Mutex<FactsMemo> {
 /// An append table version's `Facts` as its queries plan it, kept per version of its entry (`FactsMemo`): a table that has
 /// not changed is planned from the same facts by every query.
 pub async fn facts(lake: &Lake, meta: &Arc<TableMeta>, sys: bool) -> Result<Arc<Facts>> {
-    if let Some(facts) = FACTS.lock().unwrap().get(meta, sys) {
+    let kept = lake.state::<PlanFacts>()?;
+    if let Some(facts) = kept.0.lock().unwrap().get(meta, sys) {
         return Ok(facts);
     }
     let facts = Arc::new(facts_once(lake, meta, sys).await?);
-    FACTS.lock().unwrap().put(meta, sys, &facts);
+    kept.0.lock().unwrap().put(meta, sys, &facts);
     Ok(facts)
 }
 

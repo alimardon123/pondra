@@ -125,6 +125,9 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add::<crate::ddl::Attached>();
             states.add::<crate::audit::Audit>();
             states.add::<crate::constraints::ChangeLock>();
+            states.add::<crate::serve::PointPlans>();
+            states.add::<crate::serve::TailKeys>();
+            states.add::<crate::query::PlanFacts>();
         }
         #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)
         for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,
