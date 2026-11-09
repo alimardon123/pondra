@@ -91,7 +91,7 @@ pub fn parse<T: FromStr>(name: &str) -> Option<T> {
 
 /// The cores this process has, as its machine says (`Machine::cores`: its cgroup's, as the standard library reads them,
 /// else 2; 1 on a page, which has one thread). Every count of threads, turns or partitions starts from it (`PONDRA_CORES`
-/// is the query planner's own, `store::partitions`).
+/// is the query planner's own, `store::partitions_of`).
 pub fn cores() -> usize { crate::machine::process().cores() }
 
 /// A setting read as a `T`, else its default in the table (`settings.rs`): one that isn't set, or doesn't read as a `T`.
@@ -160,6 +160,18 @@ pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
 /// spills. This is the process's, for a reader with no node at hand: a node's budget reads its own (`store::lake_pool`).
 pub fn memory_whole() -> Option<usize> {
     gib("PONDRA_MEMORY_GB")
+}
+
+/// A node's memory for queries (`store::node_memory`), as its lake's sessions carry it (`Lake::made`: an extension of their
+/// config), for what sizes its own memory by it with no reservation of its statement's to go by: `string_agg`'s longest
+/// string, MATCH_RECOGNIZE's kept rows, the merges of a window's sorts (11-09 audit M9). A session of no lake's has none,
+/// and goes by the process's (`store::memory_limit`).
+#[derive(Debug, Clone, Copy)]
+pub struct NodeMemory(pub usize);
+
+/// What the node of `config`'s session has for queries (`NodeMemory`), else `process`'s answer.
+pub fn node_memory_of(config: &datafusion::prelude::SessionConfig, process: impl FnOnce() -> usize) -> usize {
+    config.get_extension::<NodeMemory>().map_or_else(process, |m| m.0)
 }
 
 /// What a refusal tells a user to raise for a query's memory: a page's query pool (`memory_gb`), else a node's (`--memory-gb`).

@@ -385,11 +385,14 @@ pub struct Doors {
 }
 
 impl Doors {
-    pub async fn bind(addr: &str, door: Door) -> Result<Doors> {
+    /// Listen on `addr`: the accept loop on `tasks` (the node's, or the database server's), and each connection's handshake
+    /// there as `conn` (a door's connection, `auth::Door`).
+    pub async fn bind(addr: &str, door: Door, tasks: &crate::spawns::Tasks, conn: impl crate::spawns::Carry + Copy) -> Result<Doors> {
         let listener = TcpListener::bind(addr).await.with_context(|| format!("listening on {addr}"))?;
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let local = listener.local_addr()?;
-        crate::spawns::spawn(async move {
+        let handshakes = tasks.clone();
+        tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             loop {
                 let tcp = match listener.accept().await {
                     Ok((tcp, _)) => tcp,
@@ -399,7 +402,7 @@ impl Doors {
                     }
                 };
                 let tx = tx.clone();
-                crate::spawns::task(async move {
+                handshakes.spawn_as(conn, async move {
                     if let Ok(c) = accept(tcp, door).await {
                         let _ = tx.send(c).await;
                     }

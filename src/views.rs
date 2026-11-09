@@ -214,9 +214,11 @@ pub fn shown(sql: &str) -> String { crate::pattern::shown(&crate::measures::writ
 /// that keep rows out, so a user granted only the view is not shown them, as a routine's code is not (S27).
 pub fn code_for_caller<T>(text: impl FnOnce() -> T) -> Option<T> { crate::rights::scope().shows_code().then(text) }
 
-/// The producers a view's rows are written under (what goes when it is dropped or detached).
+/// The producers a view's rows are written under (what goes when it is dropped or detached): its filling's counts and
+/// rejects too (`fill_one`), or a view made again under the name would have them refused as the earlier one's, sent again.
 pub fn producers(name: &str) -> Vec<String> {
     let mut p: Vec<String> = ["emit", "join", "fill"].iter().map(|p| format!("{p}:{name}")).collect();
+    p.extend(["expect", "rejects"].map(|kept| format!("fill:{name}:{kept}")));
     p.extend([crate::rerun::producer(name), format!("{}:deleted", crate::rerun::producer(name))]);
     p.extend(crate::matches::producers(name));
     p
@@ -948,7 +950,7 @@ fn expected(view: &str, v: &View, rows: RecordBatch, filling: bool, run: &str) -
     let left: Vec<bool> = keep.iter().map(|k| !k).collect();
     let reasons: Vec<(&str, String)> = why.iter().flatten().map(|e| (e.name.as_str(), format!("CHECK ({})", e.check))).collect();
     let reasons: Vec<(&str, &str)> = reasons.iter().map(|(r, c)| (*r, c.as_str())).collect();
-    let rejected = crate::rejects::keep(v.shown(view), run, &reasons, &datafusion::arrow::compute::filter_record_batch(&rows, &left.into())?)?;
+    let rejected = crate::rejects::keep(v.shown(view), v.fill.as_ref().map_or("", |f| f.id.as_str()), run, &reasons, &datafusion::arrow::compute::filter_record_batch(&rows, &left.into())?)?;
     let kept = datafusion::arrow::compute::filter_record_batch(&rows, &keep.into())?;
     Ok((kept, Some(counts), Some(rejected)))
 }
@@ -1558,14 +1560,20 @@ async fn derive(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>, runs: &BT
         }
         let meta: TableMeta = lake.cat.get(&table_key(&target)).await?.context("view without table")?;
         // (a view made before `pondra$rejects` was keeps them once the table is there: `rejects::made`)
-        let keeps = v.expect.iter().any(|e| e.on != OnViolation::Keep) && lake.cat.meta(&table_key(crate::rejects::TABLE)).await?.is_some();
+        let takes = match v.expect.iter().any(|e| e.on != OnViolation::Keep) {
+            true => crate::rejects::takes(lake).await?,
+            false => None,
+        };
+        let keeps = takes.is_some();
         let mut parts = vec![];
         for rows in rows {
             for (run, rows) in by_run(rows, keeps) {
                 let (kept, failed, rejected) = expected(&target, &v, view_rows(lake, &v, &meta, &rows, false).await?, false, &run)?;
                 parts.push((target.clone(), kept, run.clone()));
                 parts.extend(failed.map(|f| (EXPECTED.to_string(), f, String::new())));
-                parts.extend(rejected.filter(|_| keeps).map(|r| (crate::rejects::TABLE.to_string(), r, String::new())));
+                if let (Some(r), Some(with_id)) = (rejected, takes) {
+                    parts.push((crate::rejects::TABLE.to_string(), crate::rejects::as_taken(r, with_id)?, String::new()));
+                }
                 if let Some(o) = &v.once {
                     parts.extend(crate::once::late(lake, &target, &v, o, &rows).await?.map(|l| (EXPECTED.to_string(), l, String::new()))); // (rows for groups already kept)
                 }
@@ -1815,8 +1823,8 @@ async fn fill_one(lake: &Lake, log: &crate::log::Log, name: &str, v: &View, upto
         log.append(EXPECTED.into(), crate::log::Src { producer: format!("{producer}:expect"), seq: 1, prev: None }, failed).await?; // (once, as the filling is)
     }
     if let Some(rejected) = rejected.filter(|r| r.num_rows() > 0) {
-        if lake.cat.meta(&table_key(crate::rejects::TABLE)).await?.is_some() {
-            log.append(crate::rejects::TABLE.into(), crate::log::Src { producer: format!("{producer}:rejects"), seq: 1, prev: None }, rejected).await?;
+        if let Some(with_id) = crate::rejects::takes(lake).await? {
+            log.append(crate::rejects::TABLE.into(), crate::log::Src { producer: format!("{producer}:rejects"), seq: 1, prev: None }, crate::rejects::as_taken(rejected, with_id)?).await?;
         }
     }
     log.append(name.to_string(), crate::log::Src { producer, seq: 1, prev: None }, out).await?;
@@ -2203,7 +2211,7 @@ mod tests {
     fn a_dropped_row_is_kept_naming_its_first_rule_and_its_run() -> Result<()> {
         use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
         let e = |name: &str, check: &str, on| Expect { name: name.into(), check: check.into(), on };
-        let v = View { source: "t".into(), sql: String::new(), emit: None, sessions: None, ids: false, join: None, fill: None, once: None, written: None, rerun: None, matches: None, from: vec![], authored: None,
+        let v = View { source: "t".into(), sql: String::new(), emit: None, sessions: None, ids: false, join: None, fill: Some(Fill { id: "f1".into(), upto: None }), once: None, written: None, rerun: None, matches: None, from: vec![], authored: None,
             expect: vec![e("positive", "amount > 0", OnViolation::Drop), e("small", "amount < 10", OnViolation::Drop), e("seen", "amount <> 5", OnViolation::Keep)] };
         let rows = RecordBatch::try_from_iter(vec![("id", Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef), ("amount", Arc::new(Int64Array::from(vec![-1, 5, 50, 2])) as ArrayRef)])?;
         let (kept, counts, rejected) = expected("v", &v, rows.clone(), false, "load-1")?;
@@ -2217,6 +2225,7 @@ mod tests {
         assert_eq!(text(&rejected, "reason"), ["CHECK (amount > 0)", "CHECK (amount < 10)"]);
         assert_eq!(text(&rejected, "row"), [r#"{"id":1,"amount":-1}"#, r#"{"id":3,"amount":50}"#]);
         assert_eq!(text(&rejected, "run"), ["load-1", "load-1"]);
+        assert_eq!(text(&rejected, "view_id"), ["f1", "f1"], "the view's own, by its id: none of an earlier one of its name");
         let both = RecordBatch::try_from_iter(vec![("id", Arc::new(Int64Array::from(vec![9])) as ArrayRef), ("amount", Arc::new(Int64Array::from(vec![-20])) as ArrayRef)])?;
         let (_, _, rejected) = expected("v", &v, both, false, "")?;
         assert_eq!(text(&rejected.unwrap(), "rule"), ["positive"], "a row that broke two rules names the first");

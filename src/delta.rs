@@ -52,6 +52,23 @@ struct Published {
     rows: (u64, u64),
 }
 
+/// What a lake keeps of its publishing (invariant 301): its rounds take turns (`one`), and each table's metadata as it was
+/// last published, by its key (`seen`), so a table that hasn't changed since is skipped without loading its manifests.
+/// Two lakes in one process publish apart: a table of one is never taken as seen by the other's.
+#[derive(Default)]
+pub struct Publishing {
+    one: tokio::sync::Mutex<()>,
+    seen: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl crate::lake_state::LakeState for Publishing {
+    const NAME: &'static str = "published";
+    const ABOUT: &'static str = "its tables' metadata as last published in Delta and Iceberg, and its publishing's turn";
+    fn make() -> Self {
+        Publishing::default()
+    }
+}
+
 /// Every table in every format it's published in at once (each is an object-store write or
 /// two), then one catalog write that records what was published. One round at a time, each
 /// starting from the last one's recorded state: a tiering round and a `CHECKPOINT` publishing at
@@ -60,11 +77,10 @@ pub async fn publish_all(lake: &Lake) -> Result<()> { publish_named(lake, &[]).a
 
 /// `publish_all`, and the version of `named`'s table carries that engine's snapshot id (ADR-028).
 pub async fn publish_named(lake: &Lake, named: &[crate::iceberg::Named<'_>]) -> Result<()> {
-    static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _one = ONE.lock().await;
+    let kept = lake.state::<Publishing>()?;
+    let _one = kept.one.lock().await;
     lake.cat.wait_durable(lake.cat.committed()).await; // (replicated acks: publish only what's in the bucket)
-    // A table whose metadata is as last published is skipped without loading its manifests.
-    crate::per_node!(static SEEN: std::sync::Mutex<std::collections::HashMap<String, u64>> = Default::default());
+    // A table whose metadata is as last published is skipped without loading its manifests (`Publishing::seen`).
     let print = |meta: &TableMeta| std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), json(meta));
     // Only tables committed since the last call can have changed (`Catalog::written`), and a table that failed to publish
     // is put back for the next: every table is read at the first call and once a sweep (`tier::SWEEP`). A reader reads
@@ -95,7 +111,7 @@ pub async fn publish_named(lake: &Lake, named: &[crate::iceberg::Named<'_>]) -> 
     };
     // (a staged table of a CREATE OR REPLACE TABLE is published once it has taken the old table's place: `replace::replace`)
     let tables: Vec<_> = tables.into_iter().filter(|(key, _)| crate::sys::staged_for(&key[2..]).is_none()).collect();
-    let changed: Vec<_> = tables.iter().filter(|(key, meta)| named.iter().any(|n| key[2..] == *n.table) || SEEN.lock().unwrap().get(key) != Some(&print(meta))).collect();
+    let changed: Vec<_> = tables.iter().filter(|(key, meta)| named.iter().any(|n| key[2..] == *n.table) || kept.seen.lock().unwrap().get(key) != Some(&print(meta))).collect();
     // Each table's formats publish at once (Delta's PUTs must not add to Iceberg's freshness every
     // round: `freshness.py --s3`), and the table's puts extend together only if all its formats
     // succeed. One table that fails (a bucket error, a schema it can't yet publish) is named and
@@ -134,7 +150,7 @@ pub async fn publish_named(lake: &Lake, named: &[crate::iceberg::Named<'_>]) -> 
             return Err(e);
         }
     }
-    SEEN.lock().unwrap().extend(seen); // (only the tables that published: a failed one retries next round)
+    kept.seen.lock().unwrap().extend(seen); // (only the tables that published: a failed one retries next round)
     if written.is_some() {
         lake.cat.again("publish", again);
     }
@@ -259,8 +275,8 @@ pub async fn unpublish(lake: &Lake, table: &str, format: &str) -> Result<()> {
     Ok(())
 }
 
-/// Delta logs and Iceberg metadata: open-format files Pondra writes but never reads.
-pub fn open_format(path: &str) -> bool { path.contains("/_delta_log/") || path.contains("/metadata/") }
+/// Delta's logs: open-format files Pondra writes but never reads (`store::Published`).
+pub fn delta_log(path: &str) -> bool { path.contains("/_delta_log/") }
 
 /// A Decimal128(p, s) column's precision and scale.
 pub fn decimal(t: &str) -> Option<(u8, i8)> {

@@ -45,6 +45,8 @@ mod words;
 // The memory ledger: the one byte-bounded cache every bounded cache of the node uses (`ByteLru`).
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its caches are the lake's)
 mod ledger;
+// How a node reaches lakes on other servers (`Reaches`, kept with the node): read as each store opens.
+pub mod reaches;
 // What an engine or an extension module keeps for one lake, by its type (invariant 301): `Lake::state`.
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (a lake holds them)
 mod lake_state;
@@ -106,6 +108,7 @@ mod pg_trace;
 pub mod pg_bytea;
 mod lifted;
 mod one_row;
+mod set_all;
 mod optimize;
 mod or_ranges;
 mod zeros_in;
@@ -241,6 +244,7 @@ mod table_record;
 #[cfg(feature = "doors")] mod project;
 #[cfg(feature = "lake")] mod protect;
 #[cfg(feature = "lake")] mod query;
+#[cfg(feature = "lake")] mod readings;
 #[cfg(feature = "lake")] mod read_iceberg;
 #[cfg(feature = "lake")] mod ranges;
 #[cfg(feature = "lake")] mod pyfn;
@@ -281,6 +285,8 @@ mod table_record;
 #[cfg(feature = "lake")] mod write;
 // The registry's statements section: a statement an extension adds, read by `write::parse` at one place.
 #[cfg(feature = "lake")] pub mod statements;
+// The core's statement families in that section, each read from its words (step 8, PR 8).
+#[cfg(feature = "lake")] mod core_statements;
 // The registry's connection types section, and the `connections` extension that adds the kind and its statements.
 #[cfg(feature = "lake")] pub mod connections;
 #[cfg(feature = "lake")] mod connect;
@@ -294,16 +300,14 @@ mod table_record;
 /// their function sets in this order, each seeing the ones before it, and
 /// where two name one function the later one's stays: Spark's first, so Pondra's own and Postgres's stay where Spark
 /// has the name too; MATCH_RECOGNIZE's after the ones its DEFINEs may call. The semantic layer's adds `AS MEASURE`.
-/// A vital task's panic (`spawns::spawn`) stops the node with its host's stop (`node::stop`). The base's spawns name no
-/// host, so the crate's root joins the two, as it joins the registry to the extensions (`built_in`).
-#[cfg(feature = "lake")]
-pub(crate) fn stop_node(why: String) { node::stop(why) }
 
 pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
     static BUILT_IN: &[&dyn registry::Extension] = &[
         &settings::SETTINGS,
         #[cfg(feature = "lake")]
         &objects::CATALOG,
+        #[cfg(feature = "lake")]
+        &core_statements::CORE_STATEMENTS,
         #[cfg(feature = "lake")]
         &connect::CONNECTIONS,
         #[cfg(feature = "lake")]
@@ -314,6 +318,8 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &kafka_client::KAFKA,
         #[cfg(feature = "lake")]
         &sharing_client::SHARING,
+        #[cfg(feature = "lake")]
+        &sso::SSO,
         &sparksql::SPARK,
         &engine::ENGINE,
         #[cfg(feature = "lake")]
@@ -325,8 +331,6 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &ai::AI,
         #[cfg(feature = "lake")]
         &apply::PROJECT,
-        #[cfg(feature = "lake")]
-        &sso::SSO,
         #[cfg(feature = "lake")]
         &udf::UDF,
         #[cfg(feature = "lake")]

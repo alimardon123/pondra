@@ -844,7 +844,9 @@ static KIND_WORDS: LazyLock<String> = LazyLock::new(|| {
     words.iter().map(|w| w.replace(' ', r"\s+")).collect::<Vec<_>>().join("|")
 });
 
-/// `COMMENT ON …`, `CREATE OR ALTER TABLE | VIEW …`, or None for anything else.
+/// `COMMENT ON …`, `CREATE OR ALTER TABLE | VIEW …`, or None for anything else: as `write::parse` read them before they
+/// were the statements section's entries (`write::was`).
+#[cfg(test)]
 pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     use crate::write::Stmt;
     static COMMENT: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(&format!(r"(?is)^\s*comment\s+(if\s+exists\s+)?on\s+({})\s+(.*)$", *KIND_WORDS)).expect("a regex"));
@@ -875,7 +877,7 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
 }
 
 /// `name IS 'text' | NULL`: the name as SQL resolves it, and the text (None: no comment).
-fn comment_of(rest: &str) -> Result<(String, Option<String>)> {
+pub(crate) fn comment_of(rest: &str) -> Result<(String, Option<String>)> {
     let mut p = Parser::new(&GenericDialect {}).try_with_sql(rest)?;
     let name = crate::text::object(&p.parse_object_name(false)?);
     p.expect_keyword_is(Keyword::IS)?;
@@ -1074,7 +1076,7 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str, scope: &Scope) -> Result<V
     ensure!(checks == old.checks, "{table}'s CHECK constraints can't change yet");
     let constraints: Vec<crate::constraints::Constraint> = serde_json::from_value(s["constraints"].clone()).unwrap_or_default();
     ensure!(constraints == old.constraints, "{table}'s UNIQUE, PRIMARY KEY and FOREIGN KEY constraints change with ALTER TABLE {table} ADD | DROP CONSTRAINT");
-    let enums: BTreeMap<String, crate::types::Enum> = serde_json::from_value(s["enums"].clone()).unwrap_or_default();
+    let enums: BTreeMap<String, crate::table_record::Enum> = serde_json::from_value(s["enums"].clone()).unwrap_or_default();
     if let Some((c, _)) = was.iter().find(|(c, _)| enums.get(c) != old.col(c).and_then(|h| h.labels.as_ref())) {
         bail!("{table}.{c}: a column's enum can't change here (a type takes a new label with ALTER TYPE … ADD VALUE)");
     }
@@ -1287,23 +1289,9 @@ pub async fn listed(lake: &crate::store::Lake, scope: &Scope) -> anyhow::Result<
 mod tests {
     use super::*;
 
+    /// (COMMENT ON's and CREATE OR ALTER's statements: `core_statements.rs`'s tests)
     #[test]
-    fn statements_and_names() {
-        let ddl = |s: &str| match statement(s) {
-            Some(crate::write::Stmt::Ddl(d)) => serde_json::to_value(&d[0]).unwrap(),
-            Some(crate::write::Stmt::Invalid(e) | crate::write::Stmt::Refused(_, e)) => j!({"error": e}),
-            _ => j!(null),
-        };
-        assert_eq!(ddl("COMMENT ON TABLE sales.Orders IS 'one row per order'")["text"], "one row per order");
-        assert_eq!(ddl("comment on materialized view v is null")["kind"], "materialized view");
-        assert_eq!((ddl("COMMENT ON SHARE acme IS 'for Acme'")["kind"].clone(), ddl("comment on recipient acme_corp is null")["kind"].clone()), (j!("share"), j!("recipient")));
-        assert_eq!(ddl("COMMENT IF EXISTS ON COLUMN t.\"Amount\" IS $$in euros$$")["name"], "t.Amount");
-        assert_eq!(ddl("COMMENT ON TASK nightly IS ''")["text"], j!(null));
-        assert!(ddl("COMMENT ON TABLE t IS 42")["error"].is_string());
-        assert_eq!(ddl("CREATE OR ALTER TABLE t (a BIGINT) CLUSTER BY (a)")["do"], "or_alter_table");
-        assert!(ddl("CREATE OR ALTER TABLE t AS SELECT 1")["error"].is_string());
-        assert!(ddl("CREATE OR ALTER MATERIALIZED VIEW v AS SELECT 1")["error"].as_str().unwrap().contains("CREATE OR REPLACE MATERIALIZED VIEW"));
-        assert_eq!(ddl("SELECT 1"), j!(null));
+    fn names() {
         assert_eq!((ident("orders"), ident("Orders"), ident("order"), ident("2nd")), ("orders".into(), "\"Orders\"".into(), "\"order\"".into(), "\"2nd\"".into()));
         assert_eq!((span(7200), span(86400 * 7), span(90), sql_type("Timestamp(Microsecond, None)"), sql_type("Float32[]")), ("2 hours".into(), "7 days".into(), "90 seconds".into(), "TIMESTAMP".into(), "REAL[]".into()));
     }

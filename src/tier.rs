@@ -1018,7 +1018,7 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
         let objects: Vec<object_store::ObjectMeta> = lake.store.list(Some(&at)).try_collect().await?;
         for o in objects {
             let old = now as i64 - o.last_modified.timestamp_millis() > DAY as i64;
-            if old && o.last_modified.timestamp_millis() > pinned && !used.has(o.location.as_ref()) && !crate::delta::open_format(o.location.as_ref()) {
+            if old && o.last_modified.timestamp_millis() > pinned && !used.has(o.location.as_ref()) && !crate::store::published(o.location.as_ref()) {
                 let _ = object_store::ObjectStoreExt::delete(&lake.store, &o.location).await; // (by the listed path itself)
             }
         }
@@ -1103,7 +1103,7 @@ use crate::answer::storable;
 pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys: &[String], stats: bool) -> Result<Option<DataFile>> {
     let Some(first) = batches.iter().find(|b| b.num_rows() > 0) else { return Ok(None) };
     let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
-    let hot = lake.hot.columns(meta.as_ref().map_or(table, |m| m.folder(table)), &first.schema());
+    let hot = lake.hot().columns(meta.as_ref().map_or(table, |m| m.folder(table)), &first.schema());
     let mut file = Encoding::new(meta.as_ref(), first, keys, stats, hot)?;
     let batches = batches.to_vec();
     let file = blocking(move || {
@@ -1212,7 +1212,8 @@ impl Encoding {
         lake.put(&path, buf).await?;
         maybe_crash("after_parquet_put", &*lake.node.life);
         if !hot.is_empty() {
-            let (cache, room, held) = (lake.hot.clone(), lake.hot.room_for(lake), path.clone());
+            let cache = lake.hot();
+            let (room, held) = (cache.room_for(lake), path.clone());
             blocking(move || Ok(cache.put(&held, &hot, kept, room))).await?;
         }
         Ok(DataFile { path, ..file })
@@ -1287,7 +1288,7 @@ pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBa
             Some(file) => file,
             None => {
                 // (a file's hot columns are the table's held ones when it is opened)
-                let hot = lake.hot.columns(meta.as_ref().map_or(table, |m| m.folder(table)), &b.schema());
+                let hot = lake.hot().columns(meta.as_ref().map_or(table, |m| m.folder(table)), &b.schema());
                 Encoding::new(meta.as_ref(), &b, keys, stats, hot)?
             }
         };

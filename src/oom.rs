@@ -71,16 +71,17 @@ static WATCH: Watch = Watch {
     started: std::sync::Once::new(),
 };
 
-/// The node's memory line in bytes: `PONDRA_MEMORY_MAX_GB`, else 85% of the machine's or container's
-/// memory. None when it is 0 (off), or in a host's process, where the memory is the host's.
+/// The process's memory line in bytes: `PONDRA_MEMORY_MAX_GB`, else 85% of the machine's or container's memory, in every
+/// form, a host's process too (11-08 audit H3). None when it is 0 (off). A host's memory is the host's as well as ours,
+/// but past the line the OS ends the process, host and all, where the watch could have stopped the query that grew it:
+/// it stops only a query that grew the process by a tenth of the line itself (`pick`), and that query's first try runs
+/// once more holding less, as on a node. (With no line there, a query grew to the queries' line, 72% of the host's
+/// memory, beside what the host held and what the reservations don't count, with nothing to stop it.)
 pub fn line() -> Option<usize> {
     // (a page's line is its device's, and it has one only where its memory is read: `Machine::resident`, a page's `Device`)
     if cfg!(target_arch = "wasm32") {
         let device = crate::machine::process();
         return device.resident().and_then(|_| line_on(device.line()));
-    }
-    if crate::machine::hosted() {
-        return None;
     }
     crate::env::memory_line(crate::machine::process().ram().map(|ram| (ram as f64 * 0.85) as usize))
 }
@@ -151,17 +152,17 @@ pub(crate) async fn come_back(_: usize) -> bool {
     true
 }
 
-/// The resident memory past which the hot columns are given back, before a query is stopped (`of_line`). With no line (a host's process, or `PONDRA_MEMORY_MAX_GB=0`), 85% of the
-/// line the machine would have (85% of its memory): the host's memory isn't ours to stop queries for,
-/// but our own cache is ours to drop.
+/// The resident memory past which the hot columns are given back, before a query is stopped (`of_line`). With no line
+/// (`PONDRA_MEMORY_MAX_GB=0`), that of the line the machine would have (85% of its memory): no query is stopped then, but
+/// our own caches are still ours to drop.
 pub fn trim_line() -> Option<usize> {
     line().or_else(|| Some(crate::machine::process().ram()? / 20 * 17)).map(of_line)
 }
 
 /// The process's lines for its queries and caches (`store::root_line`, `ledger::Root`): the trim line (`trim_line`), and
-/// where no stop line watches the process (`line`: a host's, or `PONDRA_MEMORY_MAX_GB=0`) a third of the machine's memory,
-/// the most its queries hold together: nothing stops what can't spill short of the machine's memory there, and the memory
-/// is the host's (11-08 audit H3; a third was every process's before #643).
+/// where no stop line watches the process (`line`: `PONDRA_MEMORY_MAX_GB=0`) a third of the machine's memory, the most its
+/// queries hold together: nothing stops what can't spill short of the machine's memory there (11-08 audit H3, whose rest
+/// gives a host's process the stop line; a third was every process's before #643).
 pub fn roots() -> (Option<usize>, Option<usize>) {
     let third = line().is_none().then(|| crate::machine::process().ram().map(|ram| ram / 3)).flatten();
     (trim_line(), third)
@@ -183,28 +184,13 @@ pub fn wake() {
     WATCH.wake.notify_one()
 }
 
-/// Takes about `bytes` back from the caches of every node in the process (`ledger::budgets`, `Ledger::give_back_kind`), and says how many bytes came back. The
-/// watch gives them back past [`trim_line`], before it stops any query. A lake opened outside a node (`pondra sql`,
-/// `pondra catalog`, `pondra backup`) holds its caches to their own budgets alone, since no watch runs in its process.
-/// A kind at a time across the nodes' budgets, so a budget's ranges never go before another's hot columns (11-06 audit L7).
+/// Takes about `bytes` back from the caches of every node in the process (`ledger::budgets`), and says how many bytes came
+/// back: in the one order a grow takes them from other nodes in too (`ledger::give_back_across`: a kind at a time, the
+/// node holding the most of it first). The watch gives them back past [`trim_line`], before it stops any query. A lake
+/// opened outside a node (`pondra catalog`, `pondra backup`) holds its caches to their own budgets alone, since no watch
+/// runs in its process.
 fn give_back(bytes: usize) -> usize {
-    let ledgers = crate::store::ledgers();
-    let mut kinds: Vec<&'static str> = vec![];
-    for kind in ledgers.iter().flat_map(|ledger| ledger.kinds()) {
-        if !kinds.contains(&kind) {
-            kinds.push(kind);
-        }
-    }
-    let mut freed = 0;
-    for kind in kinds {
-        for ledger in &ledgers {
-            if freed >= bytes {
-                return freed;
-            }
-            freed += ledger.give_back_kind(kind, bytes - freed);
-        }
-    }
-    freed
+    crate::ledger::give_back_across(&crate::store::ledgers(), bytes, false)
 }
 
 /// Starts the process's watch (`Watch`), when the process can say how much memory it holds and the caches can be given
@@ -230,7 +216,7 @@ fn watch() {
     if crate::machine::process().resident().is_none() {
         return;
     }
-    let line = line(); // (None in a host's process: there the watch only gives the cache back)
+    let line = line(); // (None when it is off: the watch then only gives the caches back)
     WATCH.watching.store(true, Relaxed);
     crate::spawns::alone(async move {
         let mut last_stop = None; // when the last stop was made: it holds the watch (`pending`)

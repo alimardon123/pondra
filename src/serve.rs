@@ -43,6 +43,22 @@ impl Groups {
     pub fn new(max: usize) -> Self { Groups { rows: Mutex::new(ByteLru::new(max)), footers: Default::default() } }
 }
 
+/// A lake's row groups for lookups, made as it opens (`lake_state::Registered::add_at_open`): its caches give memory back
+/// in the order it lists them (`Lake::caches`), and every lookup reads them.
+impl crate::lake_state::LakeState for Groups {
+    const NAME: &'static str = "lookups";
+    const ABOUT: &'static str = "decoded row groups and Parquet footers of the files key lookups read";
+
+    fn make() -> Self { Groups::new(crate::store::cache_mb() << 19) }
+
+    fn cache(self: Arc<Self>) -> Option<Arc<dyn Charged>> { Some(self) }
+}
+
+impl Lake {
+    /// This lake's row groups for lookups (`Groups`).
+    pub fn groups(&self) -> Arc<Groups> { self.state::<Groups>().expect("the engine keeps a lake's lookups (`engine::ENGINE`)") }
+}
+
 /// The newest row of `key` (comma-separated values, in key order) in upsert table `meta`, if it
 /// exists, isn't deleted and isn't past the table's TTL. Table metadata first, then the log: one consistent snapshot.
 pub async fn lookup(lake: &Lake, table: &str, meta: &TableMeta, key: &str) -> Result<Option<RecordBatch>> {
@@ -537,11 +553,11 @@ fn may_hold(stats: Option<&Statistics>, key: &ScalarValue) -> bool {
 
 /// A file's Parquet footer, read once per node (files never change).
 async fn footer(lake: &Lake, f: &DataFile) -> Result<ArrowReaderMetadata> {
-    if let Some(m) = lake.groups.footers.lock().unwrap().get(&f.path) {
+    if let Some(m) = lake.groups().footers.lock().unwrap().get(&f.path) {
         return Ok(m.clone());
     }
     let m = ArrowReaderMetadata::load_async(&mut reader(lake, f)?, ArrowReaderOptions::new()).await?;
-    lake.groups.footers.lock().unwrap().insert(f.path.clone(), m.clone());
+    lake.groups().footers.lock().unwrap().insert(f.path.clone(), m.clone());
     Ok(m)
 }
 
@@ -549,7 +565,7 @@ async fn footer(lake: &Lake, f: &DataFile) -> Result<ArrowReaderMetadata> {
 /// and whether it is sorted by column `key` (files are written sorted by key; older ones may not be).
 async fn row_group(lake: &Lake, f: &DataFile, footer: &ArrowReaderMetadata, g: usize, key: &str) -> Result<(RecordBatch, bool)> {
     let id = (f.path.clone(), g);
-    if let Some(b) = lake.groups.rows.lock().unwrap().get(&id) {
+    if let Some(b) = lake.groups().rows.lock().unwrap().get(&id) {
         return Ok(b.clone());
     }
     let rows = footer.metadata().row_group(g).num_rows() as usize;
@@ -560,7 +576,7 @@ async fn row_group(lake: &Lake, f: &DataFile, footer: &ArrowReaderMetadata, g: u
     let n = col.len();
     let sorted = n < 2 || lt_eq(&col.slice(0, n - 1), &col.slice(1, n - 1))?.true_count() == n - 1;
     let bytes = batch.get_array_memory_size();
-    let left = lake.groups.rows.lock().unwrap().put(id, (batch.clone(), sorted), bytes);
+    let left = lake.groups().rows.lock().unwrap().put(id, (batch.clone(), sorted), bytes);
     drop(left); // (let go of outside the lock)
     Ok((batch, sorted))
 }

@@ -33,11 +33,12 @@ pub struct Disk {
     store: Arc<dyn object_store::ObjectStore>,       // the lake (for background fetches)
     busy: Mutex<HashSet<String>>,                     // fetches in flight
     slots: Arc<tokio::sync::Semaphore>,
+    node: Arc<crate::node_state::NodeState>,          // whose fetches they are: its stop ends them
 }
 
 impl Disk {
     /// Open (and index) the tier; what an earlier run left there is still good.
-    pub fn open(dir: PathBuf, max: u64, store: Arc<dyn object_store::ObjectStore>) -> std::io::Result<Arc<Disk>> {
+    pub fn open(dir: PathBuf, max: u64, store: Arc<dyn object_store::ObjectStore>, node: Arc<crate::node_state::NodeState>) -> std::io::Result<Arc<Disk>> {
         std::fs::create_dir_all(&dir)?;
         let mut found = vec![];
         let mut todo = vec![dir.clone()];
@@ -53,7 +54,7 @@ impl Disk {
         }
         found.sort(); // oldest first, so they are evicted first
         let index = Mutex::new(ByteLru::new(usize::try_from(max).unwrap_or(usize::MAX)));
-        let disk = Disk { dir, max, index, store, busy: Default::default(), slots: Arc::new(tokio::sync::Semaphore::new(4)) };
+        let disk = Disk { dir, max, index, store, busy: Default::default(), slots: Arc::new(tokio::sync::Semaphore::new(4)), node };
         found.into_iter().for_each(|(_, key, len)| disk.index_put(key, len));
         Ok(Arc::new(disk))
     }
@@ -90,7 +91,7 @@ impl Disk {
             return;
         }
         let disk = self.clone();
-        crate::spawns::spawn(async move {
+        self.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             let _slot = disk.slots.clone().acquire_owned().await;
             let path = object_store::path::Path::from(key.as_str());
             if let Ok(r) = disk.store.get_opts(&path, Default::default()).await {

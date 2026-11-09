@@ -185,8 +185,8 @@ pub async fn mark_alive(store: &Store, n: u64) -> Result<()> {
 
 /// The leader of term `n` marks it alive every 10 s, and whenever the bell rings (`listen`), until the task ends
 /// (`write::lead`, a backup taken here, and a guest that leads: the node's stop ends it with its other tasks, before it gives its term back).
-pub fn mark_every(store: Store, n: u64) -> tokio::task::JoinHandle<()> {
-    crate::spawns::task(async move {
+pub fn mark_every(tasks: &crate::spawns::Tasks, store: Store, n: u64) -> tokio::task::JoinHandle<()> {
+    tasks.spawn_node(crate::spawns::Vital::Own, async move {
         let (mut due, mut bell) = (Instant::now() + Duration::from_secs(10), None);
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -467,7 +467,7 @@ mod tests {
         let node = crate::node_state::NodeState::unhosted();
         let t = elsewhere(9_001, true);
         mark_alive(&store, 9_001).await.unwrap();
-        let marks = mark_every(store.clone(), 9_001); // (its first look counts as a ring: a mark a second in)
+        let marks = mark_every(&node.tasks, store.clone(), 9_001); // (its first look counts as a ring: a mark a second in)
         assert!(!deaf(&store, &t, Some(&node.claims)).await);
         assert!(alive(&store, &t, Some(&node.claims)).await);
         let rang = (tokio::time::Instant::now(), bell(&store).await);
@@ -552,7 +552,7 @@ mod tests {
             return; // (no folder for lock files here: nothing to tell apart)
         }
         let (a, b) = (crate::node_state::NodeState::unhosted(), crate::node_state::NodeState::unhosted());
-        let folder = || crate::store::open_store(&std::env::temp_dir().join(format!("pondra-claims-{}", uuid::Uuid::new_v4().simple())).to_string_lossy()).unwrap().1;
+        let folder = || crate::store::open_store(&std::env::temp_dir().join(format!("pondra-claims-{}", uuid::Uuid::new_v4().simple())).to_string_lossy(), None).unwrap().1;
         let (lake_a, lake_b) = (folder(), folder());
         let ta = claim(&lake_a, 1, "", &a.claims).await.unwrap().expect("lake a's first term");
         claim(&lake_b, 1, "", &b.claims).await.unwrap().expect("lake b's first term");
@@ -567,7 +567,7 @@ mod tests {
     async fn a_claim_keeps_the_newest_sixteen_once_the_lake_has_more_than_thirty_two() {
         let node = crate::node_state::NodeState::unhosted();
         let dir = std::env::temp_dir().join(format!("pondra-prune-{}", uuid::Uuid::new_v4().simple()));
-        let folder = crate::store::open_store(&dir.to_string_lossy()).unwrap().1;
+        let folder = crate::store::open_store(&dir.to_string_lossy(), None).unwrap().1;
         let url = format!("memory://prune-{}", uuid::Uuid::new_v4().simple());
         let memory = crate::memory_lake::store(&url);
         for store in [folder.clone(), memory.clone()] {

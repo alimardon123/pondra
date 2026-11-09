@@ -1149,16 +1149,16 @@ fn budgets(longest: Option<usize>, n: usize, most: usize) -> (usize, usize) {
     }
 }
 
-/// The most rows of matches a partition's search keeps past its n, by their memory: a quarter of the queries' memory
-/// (`PONDRA_MEMORY_GB`), in memberships (`Mem`), shared by the partitions a statement searches at once (one a core). A
-/// window function has no reservation of its statement's to charge them to, so this caps them instead: `PATTERN (a b{999})
-/// AFTER MATCH SKIP TO NEXT ROW` over a million rows would keep a billion (11-01 audit M14), and on 8 cores a quarter
-/// each was twice the queries' memory (11-02 M3). `KEEP` at least.
-fn kept_most() -> usize {
+/// The most rows of matches a partition's search keeps past its n, by their memory, in a session of `config`: a quarter
+/// of its node's memory for queries (`env::NodeMemory`, 11-09 audit M9), in memberships (`Mem`), shared by the partitions
+/// a statement searches at once (one a core). A window function has no reservation of its statement's to charge them to,
+/// so this caps them instead: `PATTERN (a b{999}) AFTER MATCH SKIP TO NEXT ROW` over a million rows would keep a billion
+/// (11-01 audit M14), and on 8 cores a quarter each was twice the queries' memory (11-02 M3). `KEEP` at least.
+fn kept_most(config: &datafusion::prelude::SessionConfig) -> usize {
     #[cfg(feature = "lake")]
-    let memory = crate::store::memory_limit();
+    let memory = crate::env::node_memory_of(config, crate::store::memory_limit);
     #[cfg(not(feature = "lake"))]
-    let memory = crate::env::query_memory(|| 1 << 30);
+    let memory = crate::env::node_memory_of(config, || crate::env::query_memory(|| 1 << 30));
     (memory / 4 / crate::env::cores().max(1) / size_of::<Mem>()).max(KEEP)
 }
 
@@ -1446,7 +1446,7 @@ impl Evaluator {
         let columns = values
             .get(first + plan.rows..first + plan.rows + plan.values)
             .context("MATCH_RECOGNIZE: the glue's value columns are missing")?;
-        let (keep, reads) = budgets(plan.longest, n, kept_most());
+        let (keep, reads) = budgets(plan.longest, n, self.planner.kept);
         let part = Part {
             cond: &cond,
             within: within.as_ref(),
@@ -1505,6 +1505,7 @@ impl Evaluator {
 /// one that lands first is kept (`remember`).
 struct Planner {
     base: Arc<SessionState>,
+    kept: usize, // (the most rows of matches a partition's search keeps, in its session: `kept_most`)
     plans: Mutex<HashMap<String, Arc<Plan>>>,
     cache: Mutex<HashMap<(String, Vec<DataType>), Arc<Planned>>>,
 }
@@ -1517,7 +1518,7 @@ impl std::fmt::Debug for Planner {
 
 impl Planner {
     fn new(base: Arc<SessionState>) -> Planner {
-        Planner { base, plans: Mutex::new(HashMap::new()), cache: Mutex::new(HashMap::new()) }
+        Planner { kept: kept_most(base.config()), base, plans: Mutex::new(HashMap::new()), cache: Mutex::new(HashMap::new()) }
     }
 
     /// The plan of a spec, compiled once: from the cache when it is there.
@@ -2353,7 +2354,10 @@ mod tests {
         // (11-01 audit M14: a b{999} over a million rows would keep a billion rows of matches; its memory caps them, KEEP at least)
         assert_eq!(budgets(Some(1_000), 1_000_000, 20_000_000).0, 20_000_000);
         assert_eq!(budgets(Some(1_000), 1_000_000, 1_000).0, super::KEEP);
-        assert!(kept_most() >= super::KEEP);
+        assert!(kept_most(&datafusion::prelude::SessionConfig::new()) >= super::KEEP);
+        // (a node's own memory, as its lake's sessions carry it: a quarter of it over the cores)
+        let node = datafusion::prelude::SessionConfig::new().with_extension(Arc::new(crate::env::NodeMemory(1 << 30)));
+        assert_eq!(kept_most(&node), ((1usize << 30) / 4 / crate::env::cores().max(1) / size_of::<Mem>()).max(super::KEEP));
     }
 
     #[test]

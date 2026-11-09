@@ -33,6 +33,7 @@ pub struct Metrics {
     pub wire: AtomicU64,           // bytes other nodes sent this node, compressed as sent (shuffles, gathered results)
     pub wait_us: AtomicU64,        // time this node's steps waited for other nodes' buckets
     pub stopped_for_memory: AtomicU64, // queries the node stopped because it was nearly out of memory (`oom.rs`)
+    pub readings_past_a_day: AtomicU64, // statements still reading a day on, which hold its lake's old files no longer (`readings::CAP`)
     /// Background loops that fail without failing a request, by `JOBS`: counted here, so a stall that otherwise shows only
     /// on stderr is visible in `/metrics` and `/stats`.
     failed: [AtomicU64; JOBS.len()],
@@ -141,9 +142,10 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("shuffle_wait_seconds_total", "counter", "time this node's steps waited for other nodes' buckets", &one(get(&m.wait_us) / 1e6));
     let (reserved, limit) = app.lake.memory();
     metric("queries_stopped_for_memory_total", "counter", "queries stopped (answered 53200) because the node was nearly out of memory (PONDRA_MEMORY_MAX_GB); a first try stopped and run again frugally is not counted, one that can't be run again is", &one(get(&m.stopped_for_memory)));
+    metric("readings_past_a_day_total", "counter", "statements still reading a day after they began, whose files expiry no longer keeps: a session kept by mistake, or a query a day long", &one(get(&m.readings_past_a_day)));
     metric("memory_limit_bytes", "gauge", "query memory limit (spills beyond it)", &one(limit as f64));
     metric("memory_reserved_bytes", "gauge", "query memory in use", &one(reserved as f64));
-    let (hot, hot_max, loading) = app.lake.hot.usage();
+    let (hot, hot_max, loading) = app.lake.hot().usage();
     metric("hot_bytes", "gauge", "decoded columns kept in memory (hot.rs)", &one(hot as f64));
     metric("hot_limit_bytes", "gauge", "the most the hot columns may hold (PONDRA_HOT_GB)", &one(hot_max as f64));
     metric("hot_loading_files", "gauge", "files whose columns are being decoded into memory, or wait to be", &one(loading as f64));

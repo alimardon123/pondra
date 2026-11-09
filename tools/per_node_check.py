@@ -16,8 +16,9 @@ channel in its type: a table of constants, or a setting read once) need neither.
 here by file, line and name, saying what to do. `--list` prints every static and how it passes.
 
 Two more ways a node outlives its stop fail here too: a task started with `tokio::spawn` (or on a
-runtime's handle) outside `spawns.rs`, which `Node::stop` can't end (start it with `spawns::spawn`
-or `spawns::task`), and `std::env::set_var` anywhere (the environment is the process's: the next
+runtime's handle) outside `spawns.rs`, which `Node::stop` can't end (start it on the node's list,
+`Tasks::spawn_node` or `Tasks::spawn_as`, or with `spawns::for_statics` for a loop of the node's
+statics), and `std::env::set_var` anywhere (the environment is the process's: the next
 node and every child process would read it, and beside a library's host it is a data race).
 
 And a page builds every module but the doors' (ADR-072): std's `Instant` and `SystemTime::now` panic
@@ -65,11 +66,10 @@ PROCESS = {
     "console.rs:PAGE": "the console's page, built into the binary",
     "console.rs:SERVER": "the server's page, built into the binary",
     "constraints.rs:TURN": LOCK,
-    "copy.rs:MS": SETTING + " (PONDRA_LOAD_RETENTION_SECS)",
     "defaults.rs:BASE": "the functions every session has, with no tables, for CHECK, DEFAULT and expectation expressions: nothing of a lake (what registers one gets a copy)",
     "dbserver.rs:KEY": "the key a lakes server gives its databases' nodes (`client_key`): one a process, made once",
-    "delta.rs:ONE": LOCK,
     "ledger.rs:ROOTS": "the process's memory, every node's budget held on it (redesign step 2, review change 4): one root for the sizes its machine and settings gave, so one in any process but a test's",
+    "library.rs:OPEN": "whether a library's node is open in the process: one at a time, since a halt resets every node's statics (`reset::reset`)",
     "library.rs:R": "a library's runtime, kept for the next open: its threads are the process's, as the queries' runtime's are",
     "env.rs:GIVEN": "what the process was given (open's options, the command line's flags): fixed by its first open (ADR-061 §8)",
     "env.rs:HANDED": "what the Pondra process that started this one handed it (`settings::Line`), read once before anything: where its environment's would be",
@@ -97,9 +97,7 @@ PROCESS = {
     "net.rs:UNINSTALLED": "the clients of a process whose host installed none (`net::process`): only their keep-alive sockets",
     "scratch.rs:INSTALLED": "the process's spill space, installed once by its host as its machine is; a node holds it (`NodeState::scratch`)",
     "scratch.rs:UNINSTALLED": "this machine's folders, for a process whose host installed no space (`scratch::process`): no state of its own",
-    "node.rs:MOVER": "the host's end of a lake's moves (`node::mover`): taken by each host before its node starts, so it outlives the node it starts; a stopped host's receiver closes it",
     "node.rs:PAGED": "a page's member is open in this process (`node::open_page`): plain, not per_node!, since reset() would set it back before the other statics, and a page opened in that gap would have them cleared under it; end_page sets it back last",
-    "node.rs:SUPERVISOR": "the supervisor of the node open now, which outlives each start of that node (a restart in place)",
     "oom.rs:WATCH": "the process's memory watch (redesign step 2): what it read last, whether it waits or runs, and its wake, for the memory of the whole process; started once at the first node's start, it lives as long as the process",
     "optimize.rs:NEXT": COUNTER,
     "origins.rs:ORIGINS": SETTING + " (PONDRA_WEB_ORIGINS)",
@@ -143,18 +141,20 @@ PROCESS = {
     "sso.rs:KEYS": "each identity provider's published keys, by its issuer's url: public, and the same for any node here",
     "sso.rs:FETCHING": "one fetch at a time of an issuer's keys, by its url: the same for any node here",
     "store.rs:MS": SETTING + " (PONDRA_LOCK_LEASE_SECS: the retry window, `store::retry_ms`)",
+    "store.rs:NAMED": SETTING + " (PONDRA_LOAD_RETENTION_SECS: a named job's window, `store::retention_ms`)",
     "store.rs:ONE": LOCK,
     "store.rs:UPDATES": LOCK,
-    "store.rs:PARTS": SETTING + " (PONDRA_CORES, --memory-gb)",
+    "store.rs:CORES": SETTING + " (PONDRA_CORES, else the cgroup's cores): the machine's, which every node's partitions are of, by its own memory (`partitions_of`)",
     "store.rs:SAID": "a warning said once a process: the cache folder under the temp dir is the machine's, so it fails the same for every lake (`cache_base`)",
     "store.rs:SPILLS": "the process's own spill folder, made by the first spill and held until the program ends: `memory::leave` removes it then, or where it can't (Windows, lock open) the next process's sweep does (scratch::sweep)",
-    "store.rs:SPILLERS": "the spill disk is the machine's: every lake's spills in this process share its room (held weakly, a lake's goes with it)",
+    "ledger.rs:ROOM": "the spill disk is the machine's: everything this process spills (shuffles, each lake's query spills, the lakes in memory) shares its room (held weakly, a lake's goes with it)",
+    "spill.rs:SHUFFLES": "the process's shuffle folder, every node's under it, on the spill disk's room list once",
     "store.rs:START": "the clock the spill disk's last look is measured from: the disk is the machine's",
     "store.rs:LOOKED": "when the spill disk was last looked at: the disk is the machine's, so one look serves every lake",
     "extension.rs:PARTS": "extensions' parts loaded in this process, by their file's SHA-256: a part holds no lake's state and its file never changes under its hash, so one serves every node",
     "extension.rs:TURNS": "the extension calls running in this process, against one a core: the cores are the machine's, so every node in a process shares one count (each call gives its turn back as it ends)",
     "wasm.rs:ENGINE": "Wasmtime's engine, the process's compiler: compiled code is shared by every node in a process, and holds no node's state",
-    "store.rs:DISK": "the window sorts' spill disk (`window_sorts`, invariant 423), made once from settings read once (PONDRA_SPILL_FAN_IN, --memory-gb, PONDRA_CORES, PONDRA_SPILL_GB): the disk is the machine's, as SPILLERS says",
+    "store.rs:DISKS": "the window sorts' spill disks (`window_sorts`, invariant 423), one for each merge fan-in (PONDRA_SPILL_FAN_IN, else of the node's memory for queries: 4 to 64, so at most 61), made once: the disk is the machine's, as ledger.rs's ROOM says, and holds no node's state",
     "functions.rs:FUNCTIONS": "Spark's functions, made against a session with nothing of a lake",
     "registry.rs:REGISTRY": "the build's extensions, registered once from `crate::built_in` and never changed after: the same for every node, and no section holds a node's state",
     "tier.rs:SLOTS": SETTING + " (tiering's slots, sized by --memory-gb)",
@@ -304,7 +304,7 @@ def leaks():
             for n, line in enumerate(text.split("\n"), 1):
                 code = line.split("//", 1)[0]
                 if SPAWN.search(code):
-                    bad.append(f"src/{rel}:{n}: a task Node::stop can't end: start it with crate::spawns::task (or spawns::spawn for a loop the node can't do without)")
+                    bad.append(f"src/{rel}:{n}: a task Node::stop can't end: start it on the node's list (node.tasks.spawn_node, or spawn_as for a request's work), or with crate::spawns::for_statics for a loop of the node's statics")
                 if "set_var(" in code:
                     bad.append(f"src/{rel}:{n}: the environment is the process's, not the node's: give a setting with crate::env::give, keep a node's state in a per_node! static, or pass a child process its environment with Command::env")
     return bad
