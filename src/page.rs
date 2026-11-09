@@ -956,7 +956,7 @@ impl Drop for Page {
         #[cfg(not(target_arch = "wasm32"))]
         let runtime = tokio::runtime::Handle::try_current().is_ok();
         if runtime {
-            crate::panics::untracked(closing); // (untracked: `close` calls `abort_all`, which would cut a tracked task)
+            crate::spawns::untracked(closing); // (untracked: `close` calls `abort_all`, which would cut a tracked task)
         }
     }
 }

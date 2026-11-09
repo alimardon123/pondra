@@ -16,8 +16,8 @@ channel in its type: a table of constants, or a setting read once) need neither.
 here by file, line and name, saying what to do. `--list` prints every static and how it passes.
 
 Two more ways a node outlives its stop fail here too: a task started with `tokio::spawn` (or on a
-runtime's handle) outside `panics.rs`, which `Node::stop` can't end (start it with `panics::spawn`
-or `panics::task`), and `std::env::set_var` anywhere (the environment is the process's: the next
+runtime's handle) outside `spawns.rs`, which `Node::stop` can't end (start it with `spawns::spawn`
+or `spawns::task`), and `std::env::set_var` anywhere (the environment is the process's: the next
 node and every child process would read it, and beside a library's host it is a data race).
 
 And a page builds every module but the doors' (ADR-072): std's `Instant` and `SystemTime::now` panic
@@ -104,7 +104,7 @@ PROCESS = {
     "optimize.rs:NEXT": COUNTER,
     "origins.rs:ORIGINS": SETTING + " (PONDRA_WEB_ORIGINS)",
     "panics.rs:NEXT": COUNTER,
-    "panics.rs:R": "the queries' runtime and the memory watch's, one each a process (ADR-061 §4): the node's tasks on the queries' end with the node, the runtimes don't, and the watch is the process's (oom.rs:WATCH)",
+    "spawns.rs:R": "the queries' runtime and the memory watch's, one each a process (ADR-061 §4): the node's tasks on the queries' end with the node, the runtimes don't, and the watch is the process's (oom.rs:WATCH)",
     "path.rs:HEADS": "regexes and constants",
     "path.rs:LATE": "regexes and constants",
     "pg_bytea.rs:STRPOS": "a function's definition (strpos, position and instr over bytea and text), the same for every lake",
@@ -295,7 +295,7 @@ def leaks():
     bad = []
     for base, _, files in os.walk(SRC):
         for f in sorted(files):
-            if not f.endswith(".rs") or f == "panics.rs":
+            if not f.endswith(".rs") or f == "spawns.rs":
                 continue
             path = os.path.join(base, f)
             text = tests_cut(open(path, encoding="utf-8").read())
@@ -303,7 +303,7 @@ def leaks():
             for n, line in enumerate(text.split("\n"), 1):
                 code = line.split("//", 1)[0]
                 if SPAWN.search(code):
-                    bad.append(f"src/{rel}:{n}: a task Node::stop can't end: start it with crate::panics::task (or panics::spawn for a loop the node can't do without)")
+                    bad.append(f"src/{rel}:{n}: a task Node::stop can't end: start it with crate::spawns::task (or spawns::spawn for a loop the node can't do without)")
                 if "set_var(" in code:
                     bad.append(f"src/{rel}:{n}: the environment is the process's, not the node's: give a setting with crate::env::give, keep a node's state in a per_node! static, or pass a child process its environment with Command::env")
     return bad

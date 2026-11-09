@@ -1018,7 +1018,7 @@ impl Unstage {
 impl Drop for Unstage {
     fn drop(&mut self) {
         if let Some((lake, dir)) = self.0.take() {
-            crate::panics::spawn(async move { unstage(&lake, &dir).await });
+            crate::spawns::spawn(async move { unstage(&lake, &dir).await });
         }
     }
 }

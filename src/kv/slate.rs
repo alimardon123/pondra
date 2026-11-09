@@ -127,7 +127,7 @@ impl Kv for Writer {
             // millisecond for it. On a disk a write is a file whichever way; a bucket keeps the tick,
             // which lets writes made together share one PUT.)
             let db = self.db.clone();
-            crate::panics::task(async move { let _ = db.flush_with_options(FlushOptions { flush_type: FlushType::Wal }).await; }); // (a node stopped in a process ends it: ADR-061)
+            crate::spawns::task(async move { let _ = db.flush_with_options(FlushOptions { flush_type: FlushType::Wal }).await; }); // (a node stopped in a process ends it: ADR-061)
         }
         Ok(handle)
     }
@@ -275,11 +275,11 @@ fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions
         let gc = once.clone();
         Box::pin(async move { gc.run_gc_once().await })
     });
-    let started = crate::panics::spawn(async move {
+    let started = crate::spawns::spawn(async move {
         let mut serving = serving;
         let _ = tokio::time::timeout(Duration::from_secs(10), serving.wait_for(|s| *s)).await;
         if local {
-            crate::panics::task(unpin(store));
+            crate::spawns::task(unpin(store));
         }
         // (`try_join`, not `join`: the collector never ends, so `join` waited for it and never saw the compactor stop.
         // The first failure of either one ends the wait here, and it takes the failure path below)
