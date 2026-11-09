@@ -39,7 +39,8 @@ const lake = args.includes('--lake')
   : resolve(dirname(fileURLToPath(import.meta.url)), '../web/lake');
 const sizes = args.includes('--sizes');
 // How the line below moves: the module's brotli stays the gate, with at least 3 KB of room above main, since a change of
-// layout alone moves it by 1-2 KB; and the line moves down only with cuts measured in the module's own wasm bytes.
+// layout alone moves it by 1-2 KB (once by 62 KB, 11-09); and the line moves down only with cuts measured in the
+// module's own wasm bytes.
 // The most a page may download (`--sizes`: the module at brotli 11, as a server sends it), designs/page-same-core.md P4. It
 // moves down with each cut, never up without a reason in the commit that moves it. 9.2 → 9.206 MB: eager aggregation
 // (`eager.rs`, 6.2 KB), a rule every form's planner runs (TPC-DS q22 3.46 → 0.42 s), the room above main kept as it was.
@@ -58,7 +59,16 @@ const sizes = args.includes('--sizes');
 // 9.2442 → 9.2517 MB: UNDROP FILE (UNDROP for every kind, files): a page's lake lists a deleted file in `pondra.dropped`
 // and brings it back, as every form's does (5.3 KB over main's 9,228,372 at ed42156e, measured on CI), and the room
 // above main back to 3 KB, which the moves since had left at 0.9 KB (main's 9,243,289 at bb80824c).
-const BROTLI_BUDGET = 9_251_700;
+// 9.2517 → 9.3115 MB: the module's code order, not its code. #709 into main's bb80824c (eb0efea, measured on CI): its wasm
+// 128 B and its gzip 193 B over main's, its brotli 62.5 KB over (9,305,835): brotli's 4 MB window finds fewer matches
+// when the same code lands in another order. #716 lands at the same 9.306 MB with 4.2 KB of wasm of its own.
+// (On main's 9,245,764 at ff11c95b, with that order: about 9,308,400, the room above it 3 KB.)
+// 9.3115 → 9.3155 MB: the catalog's hooks and the folder records (`store::CatalogHook`, `ddl::folder_hook`, 4.0 KB over
+// main's 9,224,889 at caedf432: 9,228,850 at 7490f43b, measured on CI), the room above main kept at 3 KB: a page's
+// CREATE TABLE reads one folder's records, not every table, as every form's does.
+// 9.3155 → 9.3167 MB: a lake's Kafka door, Kafka clients and sharing door keep their state as the lake's (step 2, PR 12c:
+// 1.2 KB over main's 9,243,289 at bb80824c, 9,244,454 measured on CI), the room above main kept as it was.
+const BROTLI_BUDGET = 9_316_700;
 // The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
 const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows

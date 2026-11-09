@@ -305,7 +305,7 @@ pub async fn keep(lake: &Lake, path: &str, bytes: &bytes::Bytes) -> anyhow::Resu
         }
     }
     let (lake, path) = (lake.arc(), path.to_string());
-    crate::panics::spawn(async move {
+    crate::spawns::spawn(async move {
         if let Err(e) = prune(&lake, &path).await {
             eprintln!("{path}: its oldest versions not let go: {e:#}");
         }

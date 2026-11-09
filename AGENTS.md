@@ -1330,9 +1330,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 177. **A password is kept as SCRAM's verifier, a token as its hash, a secret sealed by a key the master
    key wraps** (`users.rs`, `ext.rs`): the catalog gives none of them away, and nothing is written in
    the clear. `harness.py users`, `harness.py secrets`.
-178. **A request can't stop a node; the node's own work still can** (`panics.rs`): panics unwind.
-   Start every loop the node can't do without with `panics::spawn` (a panic in it aborts the
-   process, as before); a request's work runs in `panics::door` (HTTP's guard, each Postgres
+178. **A request can't stop a node; the node's own work still can** (`panics.rs`, `spawns.rs`): panics unwind.
+   Start every loop the node can't do without with `spawns::spawn` (a panic in it stops the
+   node, as before), on whichever floor it is: the spawns are the base's, and the crate's root joins a vital panic to
+   the host's stop (`stop_node`); a request's work runs in `panics::door` (HTTP's guard, each Postgres
    statement) or in its connection's own task (Kafka, Flight). Never `panic = "abort"` again; never
    a plain `tokio::spawn` for a loop that commits, tiers or follows. `harness.py safety`,
    `tools/fuzz_doors.py`.
@@ -1595,7 +1596,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `undrop`, ADR-043). Its log rows go to files first (the log moves on). Its entries, and its
    `{t}$deleted`'s, move to `dt/{name}/{ms}` in one commit. While one is kept, its folder is taken
    (`ddl::free_folder`) and its files are in use for the orphan sweep (`tier::collect_orphans`).
-   `UNDROP` reads the log from its end (invariant 50). `tools/history_check.py`.
+   `UNDROP` reads the log from its end (invariant 50). `tools/history_check.py`. Which tables use a
+   folder is kept as records, `fu/{folder}/{entry}`, by a catalog hook (`ddl::folder_hook`,
+   `store::CatalogHooks`): each write of a `t/` or `dt/` entry writes them in its commit, and a living
+   leader makes them whole at its start (`Catalog::keep_records`; a release without them may have led
+   meanwhile, so no format raise). Readers take them only once that is durable (`records_kept`), else
+   read every table (`ddl::folder_used`). `node`'s tests: "the folder records say what every table says".
 217. **`t AT (…)` reads only a past the table still holds, or says so** (`past.rs`, `tier::settle`).
    A purge drops `{t}$deleted` files only past the table's retention, and moves
    `TableMeta::past_from` to the newest it dropped. A moment before that, or before the table was
@@ -2011,7 +2017,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    project's table or view, and of its role's grants, are refused by name", "the cluster's own door
    refuses it too…", "a superuser without APPLY can't apply a protected database; ci's apply
    changes it".
-267. **A node keeps few blocking threads** (`panics::runtime`, both runtimes): at most four a core (16
+267. **A node keeps few blocking threads** (`spawns::runtime`, both runtimes): at most four a core (16
    at least, `PONDRA_BLOCKING_THREADS`), each gone after a second idle. On a local lake every file
    read and write is a blocking task. Under small steady commits they came often enough that no
    thread ever sat idle a second, so the pool kept the most it had ever needed (about 90 on 4
@@ -2152,11 +2158,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    through changes, three nodes and a restart; "a key not selected (a window's too)", "a join not on
    the windows' key", "a keyed table joined".
 285. **A view's run does its work before the lake's lock and away from the writes, and goes early only once its
-   tables are still** (`rerun::run`, `turn`, `panics::aside`): a run works out its rows, reads the view's rows as
+   tables are still** (`rerun::run`, `turn`, `spawns::aside`): a run works out its rows, reads the view's rows as
    they are and compares them before it takes the lock; under it they stand when the view's table has the same
    columns and no commit has changed it since (only its own runs write it), else they are read and compared again
    there. So the lock is held for the commit: at 2M Nexmark events q18's run held it 1.9 s, every other view's
-   waiting, and 0.4 s now. Runs start on the queries' runtime (`panics::aside`, as invariant 231's requests): on
+   waiting, and 0.4 s now. Runs start on the queries' runtime (`spawns::aside`, as invariant 231's requests): on
    the node's, a writer's acks beside eight busy views were 19–22 ms against 5–6 ms alone. A view runs again after
    twice its work (ten times for a run of its whole query); once what it reads has been still a second since a
    change its last run didn't see, it runs then, if its runs still take at most half the time, once a wait, and
@@ -2305,7 +2311,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 300. **A node is started and stopped as an object, and a stop at any point gives back what it took**
    (`node/run.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
    serves, it drains, makes what it committed durable, checkpoints, ends what it started
-   (`panics::abort_all`), closes its catalog and steps down. Stopped while it starts, it gives its
+   (`spawns::abort_all`), closes its catalog and steps down. Stopped while it starts, it gives its
    term back without the durable wait. Either way the next node on the lake leads at once. A write
    that meets the catalog its own stop closed fails, and is never taken for a fence
    (`Catalog::fenced`): restarting there led the term again, and the followers waited out the lease
@@ -2316,7 +2322,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 
 301. **A node stopped in a process leaves nothing of itself in it** (`reset.rs`, ADR-061 §3): every
    static that holds a node's or a lake's state is `per_node!`, set back by `reset()` when
-   `Node::stop` ends; its writers end first, its Python workers stop, and what `panics::spawn`
+   `Node::stop` ends; its writers end first, its Python workers stop, and what `spawns::spawn`
    started is aborted. A gauge whose guards count themselves down (`metrics::RUNNING`, `WAITING`)
    stays the process's, and the drain counts each node's requests on a counter of that node's own
    (`node_state::Drain`, which every lake is handed: `Lake.node`), as failed sign-ins are counted
@@ -2325,7 +2331,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and the collector `close` stops too): a lake
    opened for a moment (a branch's base, a lake detached) read its manifest four times a second for
    the life of the process. `tools/per_node_check.py` fails a static that is neither `per_node!` nor
-   in its list of what outlives a node, with the reason, and a `tokio::spawn` outside `panics.rs`.
+   in its list of what outlives a node, with the reason, and a `tokio::spawn` outside `spawns.rs`.
    `tests/node_twice.rs`: lake B after lake A in one process has none of A's users, tables, history,
    counters, format or hot columns, and three more opens leave no threads, files or tasks behind
    (the runtime's alive tasks: with the compactor and collector left running, 13 then 19).
@@ -2361,7 +2367,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 303. **A node in a library never takes its host's process down** (`library.rs`, ADR-061 §5): what the
    program does by exec, abort or exit, a library does to the node alone. Its `Lifecycle::restart`
    (`node::Native`) halts the node and starts it again in place (its lock file says
-   `restarting`, then a `Restarting` unwind that `panics::spawn` lets go and a door answers as 57P03);
+   `restarting`, then a `Restarting` unwind that `spawns::spawn` lets go and a door answers as 57P03);
    a vital loop's panic, the catalog's compactor failing and a lake newer than the build stop the
    node with the reason (`node::failed`), and every request is then 57P03 with it until it is
    opened again. A supervisor thread restarts it after 0.5, 1, 2, 4 and 8 s, and gives up after five

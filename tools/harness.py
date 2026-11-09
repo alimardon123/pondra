@@ -1858,7 +1858,7 @@ def pace():
     """Writes keep their pace while many clients query (`panics::work`): a writer's appends, a
     request at a time, alone and then beside 64 clients each asking an aggregate over 2 million
     rows. On one runtime its acks waited behind the queries' tasks (20-50 times as long). Then
-    beside eight views running their queries again over what it writes (`panics::aside`)."""
+    beside eight views running their queries again over what it writes (`spawns::aside`)."""
     lake = new_lake()
     node = Node(lake, A.port).start()
     q = lambda s: sql(A.port, s)
@@ -1896,7 +1896,7 @@ def pace():
     [r.join(60) for r in readers]
     # Views that run their queries again over what the writer writes, each as often as its pace lets
     # it (kept by key, every group touched by every write: each run reads every row): the leader's
-    # own work, on the queries' runtime too (`panics::aside`).
+    # own work, on the queries' runtime too (`spawns::aside`).
     for i in range(8):
         q(f"CREATE MATERIALIZED VIEW busy{i} AS SELECT id % 50 + {i} AS k, median(id) AS m, count(DISTINCT s) AS d FROM w GROUP BY 1")
     time.sleep(2)
@@ -1923,7 +1923,7 @@ def memory():
     with no reader. On a local lake each file read and write is a blocking task, often enough that
     tokio's pool kept every thread it had started (about 90 on 4 cores), each with its own heap: a
     node grew 180 → 920 MB in ten minutes at this pace while what it held stayed at 80–90 MB. Four
-    blocking threads a core, 16 at least (`panics::runtime`), slowed that; `PONDRA_BLOCKING_THREADS=512`
+    blocking threads a core, 16 at least (`spawns::runtime`), slowed that; `PONDRA_BLOCKING_THREADS=512`
     fails the threads' check. mimalloc still kept what the node freed (190 → 310 MB from the second
     minute to the fourth); jemalloc, the program's allocator on Linux (`main.rs`), gives it back and
     levels off at 120–130 MB by the third, and mimalloc fails the memory check. Its own memory is
@@ -10487,7 +10487,8 @@ def viewtext():
     HTTP and from the Postgres port; on a second node; after a restart), and a column moved (`ALTER … ALTER COLUMN c
     FIRST`) takes its comments along, `ORDER BY 2` renumbered, a materialized view's rows kept. Made again another way, a
     view shows its new text (or its query as it reads); one whose text can't be kept (a list of column names) says so
-    and shows its query as it reads. A string holding `--` is no comment; a view calling a macro keeps its text too."""
+    and shows its query as it reads. A string holding `--` is no comment; a view calling a macro keeps its text too. A
+    minus before a minus (`- -k`) means one in a view, an INSERT … SELECT and an UPDATE, as in a query."""
     import psycopg
     lake = new_lake()
     nodes = [Node(lake, A.port, tier_secs=0.3, pg=f"127.0.0.1:{A.port + 10}").start(), Node(lake, A.port + 1, tier_secs=0.3).start()]
@@ -10497,6 +10498,18 @@ def viewtext():
     shown = lambda kind, v, port=A.port: q(f"SHOW CREATE {kind} {v}", port)[0]["definition"]
     line = lambda text, part: next((l for l in text.split("\n") if part in l), None)
     checks, info = {}, {}
+    # (sqlparser prints `- -k` as `--k`, a comment to the line's end: the texts the core keeps of a tree, a view's query and
+    # an INSERT's, were cut short, and an UPDATE's leader read none, until each parse put the operand in parentheses,
+    # `parsed::signed`)
+    q("CREATE TABLE neg (id BIGINT, k BIGINT)")
+    q("INSERT INTO neg VALUES (1, 3)")
+    q("CREATE TABLE negw (a BIGINT, b BIGINT)")
+    made = [_raises_text(lambda: q("CREATE VIEW negv AS SELECT id, - -k AS m FROM neg")), _raises_text(lambda: q("INSERT INTO negw SELECT id, - -k FROM neg")),
+            _raises_text(lambda: q("UPDATE negw SET b = - -b + 1 WHERE - -a = 1"))]
+    info["a minus before a minus"] = made
+    checks["a minus before a minus (`- -k`) means one in a view, an INSERT … SELECT and an UPDATE, as in a query"] = made == [""] * 3 \
+        and _try(lambda: q("SELECT * FROM negv")) == [{"id": 1, "m": 3}] and _try(lambda: q("SELECT * FROM negw")) == [{"a": 1, "b": 4}] \
+        and q("SELECT - -k AS m FROM neg") == [{"m": 3}]
 
     q("CREATE TABLE s (g BIGINT, x BIGINT, y BIGINT)")
     q("INSERT INTO s VALUES (1, 10, 100), (1, 11, 110), (2, 20, 200)")
@@ -22678,6 +22691,19 @@ def listings():
     checks["a procedure's MCP tool is described by its COMMENT ON; its body's first line only to one who may see its code (11-08 audit L9)"] = \
         all(isinstance(d, dict) for d in described.values()) and "Says hello" in described["ann"]["told"] and "Says hello" in described["boss"]["told"] \
         and "the body's own line" not in described["ann"]["noted"] and "the body's own line" in described["boss"]["noted"]
+    # (11-09 audit H1: a sequence moves for a writer of a table that takes values from it. ann, granted INSERT on tickets,
+    # numbers its rows and may take its sequence's next value, but sets it back nowhere, and moves ticket_no, which no
+    # table of ann's takes from, at no door)
+    for q in ["CREATE TABLE tickets (id SERIAL, v TEXT)", "GRANT INSERT ON tickets TO ann"]:
+        ask(boss, q)
+    calls = {"INSERT": "INSERT INTO tickets (v) VALUES ('a')", "nextval": "SELECT nextval('tickets_id_seq') AS n", "setval": "SELECT setval('tickets_id_seq', 1) AS n",
+             "nextval, another": "SELECT nextval('ticket_no') AS n", "setval, another": "SELECT setval('ticket_no', 1) AS n"}
+    seqs = {door: {k: ask_(q, True) for k, q in calls.items()} for door, ask_ in doors.items() if door in ("HTTP", "Postgres", "MCP")}
+    unseen["H1"] = seqs
+    went = lambda v: v == "answered" or (v.startswith("200") and not re.search(r'isError"\s*:\s*true', v) and "permission denied" not in v)
+    stopped = lambda v: "permission denied for sequence" in v
+    checks["a sequence moves for a writer of a table that takes from it: ann, granted only INSERT on tickets, numbers its rows and takes its next value, but sets none and moves no other sequence, at every door (11-09 audit H1)"] = \
+        all(went(d["INSERT"]) and went(d["nextval"]) and stopped(d["setval"]) and stopped(d["nextval, another"]) and stopped(d["setval, another"]) for d in seqs.values())
     info["unseen"] = unseen
     node.kill()
     ok = all(checks.values())
