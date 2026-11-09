@@ -1325,14 +1325,15 @@ fn pg_duration(v: &str) -> Option<std::time::Duration> {
     (micros > 0).then(|| std::time::Duration::from_micros(micros))
 }
 
-pub fn quota(lake: &Lake) -> Quota {
-    let p = crate::auth::current();
+/// The quota a statement runs under for `by`, its asker (`audit::statement`'s): its session's timeout, and its user's own
+/// limits (none for a scope that is whole, or no sign-in), its turns counted by `lake`'s node.
+pub fn quota(lake: &Lake, by: Option<&crate::auth::Principal>) -> Quota {
     // (a session that set `statement_timeout` keeps its own, 0 included; one that set none gets the node's default)
     let session = match crate::set::shown("statement_timeout") {
         Some(v) => pg_duration(&v),
         None => crate::env::get("PONDRA_STATEMENT_TIMEOUT").and_then(|v| pg_duration(&v)),
     };
-    let Some((user, limits)) = p.and_then(|p| Some((p.name, p.scope.limits()?))) else { return Quota { turns: None, timeout: session, user: String::new(), by_session: session.is_some() } };
+    let Some((user, limits)) = by.and_then(|p| Some((p.name.clone(), p.scope.limits()?))) else { return Quota { turns: None, timeout: session, user: String::new(), by_session: session.is_some() } };
     let most = limits.max_queries.map(u64::from).or_else(|| crate::env::parse::<u64>("PONDRA_USER_QUERIES")).filter(|n| *n > 0).map(|n| n.min(10_000) as u32);
     let timeout = limits.timeout_secs.map(std::time::Duration::from_secs).or_else(|| crate::env::secs_given("PONDRA_USER_TIMEOUT")).filter(|t| !t.is_zero());
     // (the shorter of the session's and the user's is in force)
@@ -1402,11 +1403,10 @@ fn read_only(r: &crate::reaches::Reach, ns: &str) -> Result<()> {
     }
 }
 
-/// The same for a write to `table` of that lake (its name there), and, for a user granted some
-/// tables, a grant naming it for each privilege the write needs.
-pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::write::Stmt) -> Result<()> {
+/// The same for a write to `table` of that lake (its name there), and, for a `scope` granted some
+/// tables (the writer's), a grant naming it for each privilege the write needs.
+pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::write::Stmt, scope: &crate::rights::Scope) -> Result<()> {
     across(other, ns).await?;
-    let scope = crate::rights::scope();
     let (table, privileges) = (format!("{ns}.{table}"), crate::rights::asks(stmt).1.into_iter().filter_map(crate::rights::Action::privilege).collect::<Vec<_>>());
     match privileges.iter().find(|p| scope.named(p, &table).is_none()) {
         Some(p) => bail!("permission denied: {} on {table}, another database's table: GRANT {} ON {table} TO … (ON ALL TABLES and ON SCHEMA are this database's)", p.to_uppercase(), p.to_uppercase()),

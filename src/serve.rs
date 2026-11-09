@@ -146,8 +146,7 @@ impl Point {
 /// per catalog version, for everyone. Not per `visible()`, which only the log's segments move: an `ALTER TABLE` or a
 /// tiering round left a kept `Point` with the table's old columns and files. A node whose catalog has no version (a
 /// follower between seeds) works it out each time.
-pub async fn point(lake: &Lake, sql: &str) -> Result<Option<Arc<Point>>> {
-    let scope = crate::rights::scope();
+pub async fn point(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Result<Option<Arc<Point>>> {
     Ok(worked_out(lake, sql).await?.filter(|p| scope.reads(&p.table, p.names.iter().chain(&p.meta.key).map(String::as_str))))
 }
 
@@ -318,8 +317,8 @@ pub fn key_where(meta: &TableMeta, cond: &str) -> Option<Vec<String>> {
 
 /// A SQL point query answered like `/lookup` (`Point`): its rows as JSON, or `None` for any other
 /// query (it runs as SQL).
-pub async fn point_sql(lake: &Lake, sql: &str) -> Result<Option<Vec<u8>>> {
-    let Some(p) = point(lake, sql).await? else { return Ok(None) };
+pub async fn point_sql(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Result<Option<Vec<u8>>> {
+    let Some(p) = point(lake, sql, scope).await? else { return Ok(None) };
     let Some(row) = p.rows(lake).await? else { return Ok(None) };
     Ok(Some(crate::answer::json([&row])?))
 }

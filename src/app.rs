@@ -190,9 +190,7 @@ impl App {
     /// the query is planned, here. So does a view that says `current_schema()` read under a path of
     /// the session's own: the other nodes read it with no session, as its reader's path says. And
     /// so do a session's queries while it holds temporary secrets, which only this node has.
-    pub async fn here_only(&self, query: &str) -> bool { self.here_only_for(query, &crate::rights::scope()).await }
-
-    /// `here_only`, for a query planned for `scope`.
+    /// `here_only_for`, for a query planned for `scope`.
     pub async fn here_only_for(&self, query: &str, scope: &crate::rights::Scope) -> bool {
         crate::query::sent() || crate::temp::mentioned(query) || crate::temp::called(query).is_some() || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::set::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query, scope).await || !scope.whole()
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await)

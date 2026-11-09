@@ -601,16 +601,16 @@ pub async fn export(lake: &Lake) -> Result<BTreeMap<String, String>> {
 /// `GET /export`: this database as a project's files. It holds every routine's code, task's statement and grant,
 /// so only whoever is shown code gets it (S27: `pondra diff` and `pondra export` as an admin, APPLY or CLONE ON
 /// DATABASE); an attached database is `export_attached`'s.
-pub async fn export_here(lake: &Lake) -> Result<BTreeMap<String, String>> {
-    ensure!(crate::rights::scope().shows_code(), "permission denied: this database's export (its routines' code, tasks and grants) is an admin's, or needs APPLY or CLONE on it");
+pub async fn export_here(lake: &Lake, scope: &crate::rights::Scope) -> Result<BTreeMap<String, String>> {
+    ensure!(scope.shows_code(), "permission denied: this database's export (its routines' code, tasks and grants) is an admin's, or needs APPLY or CLONE on it");
     export(lake).await
 }
 
 /// `GET /export?database=prod`: a database attached here, as a project's files. `pondra diff` compares a branch
 /// with its base this way when the base is on another server (ADR-058). Its objects are what a clone of it holds,
 /// so CLONE on it is enough.
-pub async fn export_attached(lake: &Lake, name: &str) -> Result<BTreeMap<String, String>> {
-    ensure!(crate::rights::scope().clones_of(name), "permission denied: {name}'s objects are read here with CLONE on it (GRANT CLONE ON DATABASE {name} TO …)");
+pub async fn export_attached(lake: &Lake, name: &str, scope: &crate::rights::Scope) -> Result<BTreeMap<String, String>> {
+    ensure!(scope.clones_of(name), "permission denied: {name}'s objects are read here with CLONE on it (GRANT CLONE ON DATABASE {name} TO …)");
     let other = lake.attached.read().unwrap().iter().find(|(n, _)| n == name).map(|(_, l)| l.clone());
     let other = other.ok_or_else(|| crate::codes::coded("3D000", format!("database \"{name}\" isn't attached here")))?;
     export(&other).await
@@ -1045,7 +1045,7 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta, scope: &crate::r
 
 /// `POST /apply`: the plan, the apply, or the tests alone, of the project sent.
 pub async fn ask(app: &App, verb: Verb, ask: Ask, who: Who) -> Result<Value> {
-    let applier = applier();
+    let applier = applier(&who.scope);
     if verb == Verb::Apply {
         authorize(app, who.clone(), applier).await?;
     }
@@ -1074,7 +1074,7 @@ pub async fn ask(app: &App, verb: Verb, ask: Ask, who: Who) -> Result<Value> {
 }
 
 /// Whether the caller holds APPLY on this database (a user granted it: `rights::Scope::applies`).
-pub(crate) fn applier() -> bool { crate::rights::scope().applies() }
+pub(crate) fn applier(scope: &crate::rights::Scope) -> bool { scope.applies() }
 
 /// Who may apply. On a database that isn't protected: an admin, or an APPLY holder. On a protected one
 /// (`protect.rs`): an APPLY holder, whoever runs the nodes (their tokens, their key, the program that
@@ -1127,7 +1127,7 @@ async fn making(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, applie
 /// The admin an APPLY holder below admin acts as for an apply's statements, and for the migrations `capture`
 /// records as run: making the project true takes an admin's statements, and the record keeps who asked.
 pub(crate) fn admin_for(who: &Who, applier: bool) -> Option<crate::auth::Principal> {
-    crate::auth::current().filter(|_| applier && who.role < crate::auth::Role::Admin).map(|me| crate::auth::Principal { role: crate::auth::Role::Admin, scope: crate::rights::Scope::everything(), operator: false, ..me })
+    who.by.clone().filter(|_| applier && who.role < crate::auth::Role::Admin).map(|me| crate::auth::Principal { role: crate::auth::Role::Admin, scope: crate::rights::Scope::everything(), operator: false, ..me })
 }
 
 /// The claim, the apply's statements (`statements`), and its record's end (`making`'s span).

@@ -415,13 +415,13 @@ pub fn views(sql: &str) -> Vec<(String, String)> {
 }
 
 /// A statement about the session's temporary tables or views, carried out here (None: not one).
-pub async fn statement(app: &App, stmt: &Stmt, files: bool, scope: &crate::rights::Scope) -> Result<Option<Value>> {
+pub async fn statement(app: &App, stmt: &Stmt, files: bool, by: &crate::auth::Principal) -> Result<Option<Value>> {
     let session = current();
     match stmt {
         Stmt::Create(c) if c.temporary => {
             // (in an open transaction it runs at once too, as DDL does: `txn::temp_at_once` refuses REPEATABLE READ and says so)
             let note = crate::txn::temp_at_once()?;
-            let out = create(app, &session.context(NO_SESSION)?, c, files, scope).await?;
+            let out = create(app, &session.context(NO_SESSION)?, c, files, &by.scope).await?;
             if let (Some(n), false) = (note, out["unchanged"] == true) {
                 crate::routines::heard(&n); // (IF NOT EXISTS left it as it was: nothing ran)
             }
@@ -434,8 +434,8 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool, scope: &crate::right
                 return Ok(Some(j!({"view": name, "temporary": true, "exists": true}))); // (IF NOT EXISTS)
             }
             ensure!(*replace || !has(&s, name, false), "temporary view {name} exists (CREATE OR REPLACE TEMP VIEW replaces it)");
-            let expanded = crate::routines::expand_temp_view(&app.lake, sql, scope).await.with_context(|| format!("temporary view {name}"))?; // (as it is read: its functions' bodies in their places, `query.rs`)
-            crate::engine::sql(&crate::query::session_for(&app.lake, &expanded, "", None, scope).await?, &crate::sys::planned(&expanded)?).await.with_context(|| format!("temporary view {name}"))?; // (it plans)
+            let expanded = crate::routines::expand_temp_view(&app.lake, sql, &by.scope).await.with_context(|| format!("temporary view {name}"))?; // (as it is read: its functions' bodies in their places, `query.rs`)
+            crate::engine::sql(&crate::query::session_for(&app.lake, &expanded, "", None, &by.scope).await?, &crate::sys::planned(&expanded)?).await.with_context(|| format!("temporary view {name}"))?; // (it plans)
             with(&s, true, |x| Ok(x.views.insert(name.clone(), sql.clone())))?;
             return Ok(Some(j!({"view": name, "temporary": true})));
         }
@@ -460,7 +460,7 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool, scope: &crate::right
         }
         Stmt::TempSecret(name, params, replace, quiet) => {
             let s = session.context("a temporary secret is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>, 8 to 128 letters, digits, - or _)")?;
-            let secret = crate::ext::temporary(name, params.clone())?;
+            let secret = crate::ext::temporary(name, params.clone(), by)?;
             let kept = with(&s, true, |x| {
                 if *quiet && x.secrets.contains_key(name) {
                     return Ok(false); // (IF NOT EXISTS)
@@ -503,9 +503,9 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool, scope: &crate::right
     }
     let s = session.context(NO_SESSION)?;
     Ok(Some(match stmt {
-        Stmt::Insert(t, q) => insert(app, &s, t, None, q, files, scope).await?,
-        Stmt::InsertInto(t, names, q) => insert(app, &s, t, Some(names), q, files, scope).await?,
-        _ => change(app, &s, &stmt.table(), stmt, scope).await?,
+        Stmt::Insert(t, q) => insert(app, &s, t, None, q, files, &by.scope).await?,
+        Stmt::InsertInto(t, names, q) => insert(app, &s, t, Some(names), q, files, &by.scope).await?,
+        _ => change(app, &s, &stmt.table(), stmt, &by.scope).await?,
     }))
 }
 
