@@ -252,13 +252,13 @@ pub async fn restore(lake: &Lake, path: &str, q: &std::collections::HashMap<Stri
 }
 
 /// `DELETE /files/<path>`: that object gone (a writer's, as `PUT`); its versions stay. A path no file is at:
-/// 404. Both doors call it.
-pub async fn remove(lake: &Lake, path: &str) -> anyhow::Result<Filed> {
+/// 404. Both doors call it; `by` (a name) deleted it.
+pub async fn remove(lake: &Lake, path: &str, by: &str) -> anyhow::Result<Filed> {
     let path = under_files(path)?;
     refuse_kept(&path)?;
     match lake.remove_file(&path).await {
         Ok(()) => {
-            if let Err(e) = note_deleted(lake, &path).await {
+            if let Err(e) = note_deleted(lake, &path, by).await {
                 eprintln!("{path}: deleted, but when and by whom not noted: {e:#}"); // (UNDROP FILE still brings it back)
             }
             Ok(Filed::json(serde_json::json!({"removed": path})))
@@ -399,11 +399,11 @@ struct Deletion {
     bytes: u64, // (its newest version's, the note's name)
 }
 
-/// Note when `path` was deleted and by whom, when it keeps a version (a file kept nowhere can't come back).
-async fn note_deleted(lake: &Lake, path: &str) -> anyhow::Result<()> {
+/// Note when `path` was deleted and by whom (`by`), when it keeps a version (a file kept nowhere can't come back).
+async fn note_deleted(lake: &Lake, path: &str, by: &str) -> anyhow::Result<()> {
     use object_store::ObjectStoreExt;
     let Some(newest) = versions(lake, path).await?.into_iter().find(|v| !v.id.contains('/')) else { return Ok(()) };
-    let note = serde_json::to_vec(&Deletion { at: crate::log::now_ms(), by: who(&crate::auth::current().map(|p| p.name).unwrap_or_default()), bytes: newest.bytes })?;
+    let note = serde_json::to_vec(&Deletion { at: crate::log::now_ms(), by: who(by), bytes: newest.bytes })?;
     lake.store.put(&object_store::path::Path::from(format!("{}{}", noted_at(path), newest.id)), bytes::Bytes::from(note).into()).await?;
     Ok(())
 }
@@ -476,8 +476,9 @@ pub async fn deleted(lake: &Lake) -> anyhow::Result<Vec<Deleted>> {
 
 /// `UNDROP FILE 'path'`: a deleted file's newest version made the file again (kept as its newest save, as `?restore=`
 /// keeps one), and its deletion's note let go. Refused while a file is there (42710), and when no version of it is
-/// kept (42704). Who may is the statement's rights' (`rights::asks`: a writer's, and a `.py`, code a node runs, an admin's).
-pub async fn undrop(lake: &Lake, path: &str) -> anyhow::Result<serde_json::Value> {
+/// kept (42704). Who may is the statement's rights' (`rights::asks`: a writer's, and a `.py`, code a node runs, an admin's);
+/// the version kept is `by`'s save (a name).
+pub async fn undrop(lake: &Lake, path: &str, by: &str) -> anyhow::Result<serde_json::Value> {
     let path = under_files(path)?;
     refuse_kept(&path)?;
     let named = path.trim_start_matches("files/").to_string();
@@ -493,7 +494,7 @@ pub async fn undrop(lake: &Lake, path: &str) -> anyhow::Result<serde_json::Value
         Err(e) if format!("{e:#}").contains("already exists") => return Err(there()), // (saved since it was looked for)
         done => done?,
     }
-    keep(lake, &path, &bytes).await?;
+    keep(lake, &path, &bytes, by).await?;
     use object_store::ObjectStoreExt;
     match lake.store.delete(&object_store::path::Path::from(format!("{}{}", noted_at(&path), newest.id))).await {
         Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
@@ -511,7 +512,7 @@ mod tests {
         use object_store::ObjectStoreExt;
         let (at, bytes) = (format!("files/{path}"), bytes::Bytes::from_static(bytes));
         lake.store.put(&object_store::path::Path::from(at.as_str()), bytes.clone().into()).await.unwrap();
-        keep(lake, &at, &bytes).await.unwrap();
+        keep(lake, &at, &bytes, "tester").await.unwrap();
     }
 
     #[tokio::test]
@@ -522,25 +523,26 @@ mod tests {
         save(&lake, "b.txt", b"b").await;
         assert!(deleted(&lake).await.unwrap().is_empty(), "a file that is there is no deleted one");
         let code = |e: anyhow::Error| crate::codes::of(&e).to_string();
-        assert_eq!(undrop(&lake, "notes/a.txt").await.map_err(code).unwrap_err(), "42710", "refused while the file is there");
+        let by = ""; // (the node's own: `who`)
+        assert_eq!(undrop(&lake, "notes/a.txt", by).await.map_err(code).unwrap_err(), "42710", "refused while the file is there");
 
-        remove(&lake, "notes/a.txt").await.unwrap();
+        remove(&lake, "notes/a.txt", by).await.unwrap();
         let gone = deleted(&lake).await.unwrap();
         assert_eq!(gone.iter().map(|d| (d.path.as_str(), d.bytes, d.by.as_str())).collect::<Vec<_>>(), [("notes/a.txt", 6, "node")]);
         assert_eq!(gone[0].kept_until(), gone[0].at_ms + 90 * 86_400_000);
 
-        let back = undrop(&lake, "/files/notes/a.txt").await.unwrap();
+        let back = undrop(&lake, "/files/notes/a.txt", by).await.unwrap();
         assert_eq!((back["undropped"].as_str(), back["bytes"].as_u64()), (Some("notes/a.txt"), Some(6)));
         assert_eq!(&lake.file("files/notes/a.txt").await.unwrap().0[..], b"second", "its newest version, back");
         assert!(deleted(&lake).await.unwrap().is_empty());
         assert_eq!(versions(&lake, "files/notes/a.txt").await.unwrap().len(), 3, "kept as its newest save too");
 
-        assert_eq!(undrop(&lake, "never.txt").await.map_err(code).unwrap_err(), "42704");
-        assert_eq!(undrop(&lake, ".versions/notes/a.txt").await.map_err(code).unwrap_err(), "42501", "a version is Pondra's, not a file");
-        assert_eq!(undrop(&lake, ".deleted/notes/a.txt").await.map_err(code).unwrap_err(), "42501", "and so is a note");
+        assert_eq!(undrop(&lake, "never.txt", by).await.map_err(code).unwrap_err(), "42704");
+        assert_eq!(undrop(&lake, ".versions/notes/a.txt", by).await.map_err(code).unwrap_err(), "42501", "a version is Pondra's, not a file");
+        assert_eq!(undrop(&lake, ".deleted/notes/a.txt", by).await.map_err(code).unwrap_err(), "42501", "and so is a note");
         // (deleted again and saved again: the save lets its note go, after it answers)
         let second = versions(&lake, "files/notes/a.txt").await.unwrap().remove(1).id;
-        remove(&lake, "notes/a.txt").await.unwrap();
+        remove(&lake, "notes/a.txt", by).await.unwrap();
         let noted = || async { lake.store.list(Some(&object_store::path::Path::from(DELETED))).try_collect::<Vec<_>>().await.unwrap().len() };
         assert_eq!(noted().await, 1);
         save(&lake, "notes/a.txt", b"third").await;
@@ -552,7 +554,7 @@ mod tests {
         }
         assert_eq!(noted().await, 0, "a save lets its file's notes go");
         // (a note named by a later version than a save kept is a later deletion's: it stays)
-        remove(&lake, "notes/a.txt").await.unwrap();
+        remove(&lake, "notes/a.txt", by).await.unwrap();
         forget_deleted(&lake, "files/notes/a.txt", &second).await.unwrap();
         let gone = deleted(&lake).await.unwrap();
         assert_eq!((gone.len(), gone[0].bytes), (1, 5), "the later deletion's note, of the third version (5 bytes)");

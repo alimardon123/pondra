@@ -1827,7 +1827,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         ensure!(!app.members.reader(), "read-only node"); // (above a view of a folder's write: a reader writes no file either)
     }
     if let Stmt::UndropFile(path) = &stmt {
-        return crate::files::undrop(&app.lake, path).await; // (the lake's files: a writer's, and a `.py` an admin's, `rights::asks`)
+        return crate::files::undrop(&app.lake, path, &by.name).await; // (the lake's files: a writer's, and a `.py` an admin's, `rights::asks`)
     }
     if let Some((query, to, options)) = crate::ext::view_write(&app.lake, &stmt, &by.scope).await? {
         let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.members.nodes(), app.members.me(), &by.scope).await?; // (a view of a folder: a new file in it)

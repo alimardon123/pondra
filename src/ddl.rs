@@ -523,9 +523,9 @@ async fn carry_out(lake: &Lake, d: Ddl, by: &crate::auth::Principal) -> Result<V
             Ok(out)
         }
         Ddl::DropTable { name, if_exists, purge, made_by } => drop_table(lake, &name, if_exists, purge, made_by.as_deref()).await,
-        Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?, scope).await,
-        Ddl::UndropKept { kind, name } if kind == "database" => undrop_database(lake, &name.to_lowercase(), &by.scope).await,
-        Ddl::UndropKept { kind, name } => crate::undrop::undrop(lake, &kind, &crate::undrop::named(lake, &kind, &name).await?, scope).await,
+        Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?, by).await,
+        Ddl::UndropKept { kind, name } if kind == "database" => undrop_database(lake, &name.to_lowercase(), by).await,
+        Ddl::UndropKept { kind, name } => crate::undrop::undrop(lake, &kind, &crate::undrop::named(lake, &kind, &name).await?, by).await,
         Ddl::Clone { name, from } => clone(lake, &new_name(lake, &name).await?, &from).await,
         Ddl::CreateView { name, sql, replace, facts, text } => create_view(lake, &name, sql, replace, false, facts, text, &by.scope).await,
         Ddl::CreateExternal { name, sql, replace, if_not_exists } => {
@@ -828,8 +828,8 @@ async fn databases_call(node: &crate::node_state::NodeState, server: &str, delet
 
 /// `UNDROP DATABASE name` (an admin's): the database dropped under `name` beside this one, back as it was, and attached
 /// here again. On a server it asks the server (`dbserver::undrop_db`), whose folder holds them.
-async fn undrop_database(lake: &Lake, name: &str, scope: &crate::rights::Scope) -> Result<Value> {
-    ensure!(scope.whole(), crate::codes::coded("42501", format!("permission denied: UNDROP DATABASE {name} needs an admin")));
+async fn undrop_database(lake: &Lake, name: &str, by: &crate::auth::Principal) -> Result<Value> {
+    ensure!(by.scope.whole(), crate::codes::coded("42501", format!("permission denied: UNDROP DATABASE {name} needs an admin")));
     database_name(name)?;
     let dir = match crate::env::get("PONDRA_SERVER_URL") {
         Some(server) => {
@@ -851,7 +851,7 @@ async fn undrop_database(lake: &Lake, name: &str, scope: &crate::rights::Scope) 
     // (attached here again: by its record, kept with it when it had one, else as the shell finds its siblings)
     let follow = !lake.node.life.one_off();
     if crate::undrop::has(lake, "database", name).await? {
-        Box::pin(crate::undrop::undrop(lake, "database", name, scope)).await?;
+        Box::pin(crate::undrop::undrop(lake, "database", name, by)).await?;
         sync(lake, follow).await?;
     }
     if !lake.attached.read().unwrap().iter().any(|(n, _)| n == name) {
@@ -1455,7 +1455,7 @@ pub fn retention(text: &str) -> Result<u64> {
 /// `UNDROP TABLE t`: the table dropped last under that name, back as it was. It reads the log from
 /// now on (its rows went to files when it was dropped; the log since may hold another table's of
 /// its name). Refused while something else has the name: rename that first.
-pub(crate) async fn undrop(lake: &Lake, name: &str, scope: &crate::rights::Scope) -> Result<Value> {
+pub(crate) async fn undrop(lake: &Lake, name: &str, by: &crate::auth::Principal) -> Result<Value> {
     let taken = lake.cat.get::<TableMeta>(&table_key(name)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(name)).await?.is_some()
         || lake.cat.get::<Value>(&crate::views::view_key(name)).await?.is_some();
     if taken {
@@ -1464,7 +1464,7 @@ pub(crate) async fn undrop(lake: &Lake, name: &str, scope: &crate::rights::Scope
     let mut kept: Vec<(String, Dropped)> = lake.cat.scan::<Dropped>(&format!("dt/{name}/"), &format!("dt/{name}0")).await?;
     let Some((key, d)) = kept.pop() else {
         if crate::undrop::has(lake, "external table", name).await? {
-            return Box::pin(crate::undrop::undrop(lake, "external table", name, scope)).await; // (DROP TABLE drops one too)
+            return Box::pin(crate::undrop::undrop(lake, "external table", name, by)).await; // (DROP TABLE drops one too)
         }
         return Err(crate::codes::coded("42P01", format!("no dropped table {name} is kept (pondra.dropped lists those that are)")));
     };

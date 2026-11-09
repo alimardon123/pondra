@@ -1408,7 +1408,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-undrop-owner-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let _ = lake.owner_key.set("k1".into());
-        let scope = crate::rights::Scope::everything();
+        let node = crate::auth::Principal::node();
         for (by_owner, name) in [(true, "mine"), (false, "taken")] {
             let task = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), ..Default::default() };
             crate::ext::scope(true, create_task(&lake, name, task, false)).await?;
@@ -1416,7 +1416,7 @@ mod tests {
             tick.owner = signed(&lake, &tick.what(name));
             lake.cat.commit(vec![(tick_key(name), json(&tick))], &[]).await?;
             crate::ext::scope(true, drop_task(&lake, name, false)).await?; // (the owner drops it)
-            crate::ext::scope(by_owner, crate::undrop::undrop(&lake, "task", name, &scope)).await?;
+            crate::ext::scope(by_owner, crate::undrop::undrop(&lake, "task", name, &node)).await?;
             let task = lake.cat.get::<Task>(&task_key(name)).await?.context("the task is back")?;
             let tick = lake.cat.get::<Tick>(&tick_key(name)).await?.context("its tick is back")?;
             assert_eq!(tick.as_owner(&lake, name, &task), by_owner, "{name}: the owner's again only when the owner undropped it");

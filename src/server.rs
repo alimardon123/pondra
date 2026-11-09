@@ -177,8 +177,8 @@ async fn restore_file(State(app): State<App>, Path(path): Path<String>, who: Opt
 }
 
 /// `DELETE /files/<path>`: that object gone (a writer's, as `PUT`); its versions stay. A path no file is at: 404.
-async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result<Response, E> {
-    Ok(filed(crate::files::remove(&app.lake, &path).await?))
+async fn delete_file(State(app): State<App>, Path(path): Path<String>, who: Option<axum::Extension<crate::auth::Principal>>) -> Result<Response, E> {
+    Ok(filed(crate::files::remove(&app.lake, &path, &signed_of(who).name).await?))
 }
 
 /// `GET /sessions/{id}/python`: the variables a session's Python holds, as the console's panel

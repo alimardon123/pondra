@@ -684,7 +684,7 @@ impl Page {
                 "PUT" => crate::files::put(lake, name, if_match, body, &lake_principal()).await,
                 "GET" => crate::files::get(lake, name, &q).await,
                 "POST" => crate::files::restore(lake, name, &q, &lake_principal()).await,
-                _ => crate::files::remove(lake, name).await, // (DELETE)
+                _ => crate::files::remove(lake, name, &lake_principal().name).await, // (DELETE)
             }
         })).await;
         match done {
