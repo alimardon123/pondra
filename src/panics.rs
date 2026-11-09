@@ -241,15 +241,6 @@ pub(crate) fn stop_one(now: Instant, margin: usize) -> Option<bool> {
     Some(false)
 }
 
-/// Counts a stop that the request this task's work is part of doesn't come back from (`query::frugally`: its first try
-/// stopped and not run again) on the request's node, whose counters its entry holds. Outside a request, nothing.
-pub(crate) fn stopped_for_memory() {
-    let Ok(id) = REQUEST.try_with(|id| *id) else { return };
-    if let Some(r) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
-        crate::metrics::add(&r.metrics.stopped_for_memory, 1);
-    }
-}
-
 /// Start work of the leader's own that reads and writes as queries do (a view running its query
 /// again) on the queries' runtime: appends and commits never wait behind it (invariant 231). A panic
 /// in it is that work's alone, as a request's is.

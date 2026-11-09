@@ -2018,7 +2018,7 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     let turns = || crate::budget::Budget::of(&root);
     let mut whole: Store = match (params, scheme) {
         (Some(_), _) => crate::ext::build(&url::Url::parse(&root)?, params, crate::ext::For::Lake)?,
-        (None, "s3") => Arc::new(AmazonS3Builder::from_env().with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
+        (None, "s3") => Arc::new(with_kms(AmazonS3Builder::from_env(), sse_kms_from_env()).with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
         (None, "gs") => Arc::new(GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket).with_config(GoogleConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
         (None, _) => Arc::new(MicrosoftAzureBuilder::from_env().with_url(&root).with_config(AzureConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
     };
@@ -2029,6 +2029,23 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     // (the bucket's client, which scans and the SSD tier's misses go through, is counted apart:
     // each request goes through one of the two)
     Ok((url.trim_end_matches('/').to_string(), store, Some((root, whole))))
+}
+
+/// The customer's KMS key for the lake's own bucket, from the environment (`AWS_SSE_KMS_KEY_ID`): each object the lake
+/// writes there (its tables, its catalog, its backups) is encrypted with it, SSE-KMS. Without one the bucket still encrypts
+/// at rest, with its own keys. On its own object_store would ignore the variable, short of `AWS_SERVER_SIDE_ENCRYPTION`,
+/// which then says it all (`from_env` reads both). Only the lake's buckets take it (`ext::build`'s `For::Lake`): a bucket
+/// reached otherwise, maybe another account's, is sent a key only its own secret names (`kms_key_id`).
+pub(crate) fn sse_kms_from_env() -> Option<String> {
+    std::env::var("AWS_SSE_KMS_KEY_ID").ok().filter(|k| !k.is_empty() && std::env::var_os("AWS_SERVER_SIDE_ENCRYPTION").is_none())
+}
+
+/// `b` encrypting what it writes with `key`, when there is one (`sse_kms_from_env`, or a secret's `kms_key_id`).
+pub(crate) fn with_kms(b: AmazonS3Builder, key: Option<String>) -> AmazonS3Builder {
+    match key {
+        Some(k) => b.with_sse_kms_encryption(k),
+        None => b,
+    }
 }
 
 /// A folder's store, made if it isn't there.

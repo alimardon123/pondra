@@ -313,7 +313,7 @@ pub async fn insert_share(lake: &Lake, s: &Slice, table: &str, stamp: Option<cra
         crate::ext::prime(lake, &s.ext).await?;
         let (ctx, _) = shared(lake, s).await?;
         // (out of memory, once more frugally, as `write::write_files` does: this share's files are never recorded by the first try)
-        crate::query::frugally(&ctx, |ctx| async move {
+        crate::query::frugally(&lake.node, &ctx, |ctx| async move {
             crate::write::in_order(&ctx); // (planned again, its partitions writing in the order rows come)
             let df = crate::engine::sql(&ctx, &s.sql).await?;
             crate::write::write_rows(lake, &ctx, table, df, stamp).await
