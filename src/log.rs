@@ -34,6 +34,70 @@ fn inline_bytes() -> usize {
 const FLUSHES_IN_FLIGHT: usize = 4; // per node: object-store latency overlaps instead of adding up
 const COMMITS_IN_FLIGHT: usize = 4; // leader: catalog writes not yet committed
 
+/// A hook in the log's commits (designs/redesign/redesign.md, step 5 piece 6): a feature that keeps rows of its own in step
+/// with the rows the log takes registers one, and the log calls it without knowing whose it is. `views` registers a
+/// view's rows, derived as its sources' are packed and refused by its expectations.
+pub struct CommitHook {
+    pub name: &'static str,
+    /// The rows it adds to a flush, from the rows the flush carries by table (`new`) and each batch's producer (`by`).
+    pub derive: for<'a> fn(&'a Lake, &'a BTreeMap<String, Vec<RecordBatch>>, &'a BTreeMap<String, Vec<String>>) -> futures::future::BoxFuture<'a, Result<Vec<(String, RecordBatch)>>>,
+    /// Whether an error from `derive` refuses the rows it was given: a producer's write packed with others then fails
+    /// alone, and the others go again without it.
+    pub refused: fn(&anyhow::Error) -> bool,
+    /// As a commit starts, numbered `next`: what this commit's flushes owe it (`Owes`), and the records it puts with them.
+    pub commit: for<'a> fn(&'a Lake, u64) -> futures::future::BoxFuture<'a, Result<(Arc<dyn Owes>, Vec<(String, Vec<u8>)>)>>,
+    /// A leader starts on the lake: what the hook remembered of it is let go.
+    pub led: fn(&Lake),
+}
+
+/// What one commit's flushes owe a hook: a flush packed before the hook changed (a view made or dropped since) goes
+/// back to be packed again.
+pub trait Owes: Send + Sync {
+    /// The tables the hook derives rows for from `table`'s: a flush with rows for `table` must carry theirs.
+    fn owed(&self, table: &str) -> &[String];
+    /// Whether the hook derives rows for `table`: a flush's derived rows are each for one a hook derives.
+    fn derives(&self, table: &str) -> bool;
+}
+
+/// The registry's commit hooks, in the order their extensions add them.
+#[derive(Default)]
+pub struct CommitHooks(Vec<CommitHook>);
+
+impl crate::registry::Section for CommitHooks {
+    const NAME: &'static str = "commit hooks";
+    fn check(&self, _: &crate::registry::Registry) -> std::result::Result<(), String> {
+        match self.0.iter().enumerate().find(|(i, h)| self.0[..*i].iter().any(|o| o.name == h.name)) {
+            Some((_, h)) => Err(format!("{} twice", h.name)),
+            None => Ok(()),
+        }
+    }
+}
+
+impl CommitHooks {
+    pub fn add(&mut self, hook: CommitHook) {
+        self.0.push(hook);
+    }
+}
+
+/// This build's commit hooks (none in a build without an extension that adds one).
+fn hooks() -> &'static [CommitHook] {
+    crate::registry::get().find::<CommitHooks>().map_or(&[], |h| &h.0)
+}
+
+/// Every hook's rows for a flush carrying `new` (by `by`), in hook order.
+async fn derived(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>, by: &BTreeMap<String, Vec<String>>) -> Result<Vec<(String, RecordBatch)>> {
+    let mut out = vec![];
+    for h in hooks() {
+        out.extend((h.derive)(lake, new, by).await?);
+    }
+    Ok(out)
+}
+
+/// Whether a hook refuses the rows behind `e`.
+fn refused(e: &anyhow::Error) -> bool {
+    hooks().iter().any(|h| (h.refused)(e))
+}
+
 /// Who sent a batch: its producer and sequence number (and, optionally, the seq it expects to
 /// follow: a compare-and-swap that streaming tasks use).
 #[derive(Serialize, Deserialize, Clone)]
@@ -436,15 +500,15 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                     let _ = a.ack.send(answered); // and go again with the rest
                 }
             }
-            Err(e) if crate::views::refused(&e) && pending.len() > 1 => {
-                // A row a view's expectation refuses fails its own write, not the others it was
+            Err(e) if refused(&e) && pending.len() > 1 => {
+                // A row a hook refuses (a view's expectation) fails its own write, not the others it was
                 // packed with: they go again without it.
                 let n = pending.len();
                 let mut kept = vec![];
                 for a in pending.drain(..) {
                     let rows = BTreeMap::from([(a.table.clone(), vec![a.batch.clone()])]);
-                    match crate::views::derive(lake, &rows, &BTreeMap::new()).await {
-                        Err(e) if crate::views::refused(&e) => drop(a.ack.send(Err(format!("{e:#}").into()))),
+                    match derived(lake, &rows, &BTreeMap::new()).await {
+                        Err(e) if refused(&e) => drop(a.ack.send(Err(format!("{e:#}").into()))),
                         _ => kept.push(a),
                     }
                 }
@@ -518,7 +582,7 @@ pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<Strin
         parts.push(Part { table: table.into(), off, len: data.len() as u64 - off, rows: batch.num_rows() as u64, src, placed });
         Ok(())
     };
-    // (each batch's producer, in its place: a view names the run its dropped rows came with, `views::derive`)
+    // (each batch's producer, in its place: a view names the run its dropped rows came with, its hook's `derive`)
     let mut by: BTreeMap<String, Vec<String>> = followed.iter().map(|(t, b)| (t.clone(), vec![followed_by.get(t).cloned().unwrap_or_default(); b.len()])).collect();
     let mut by_table = followed;
     let mut metas: BTreeMap<String, Option<Arc<TableMeta>>> = BTreeMap::new(); // (the log keeps columns under their stored names: ADR-022)
@@ -534,7 +598,7 @@ pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<Strin
         by_table.entry(a.table.clone()).or_default().push(a.batch.clone());
         by.entry(a.table.clone()).or_default().push(a.src.producer.clone());
     }
-    for (table, batch) in crate::views::derive(lake, &by_table, &by).await? {
+    for (table, batch) in derived(lake, &by_table, &by).await? {
         add(&table, &batch, None, None)?;
     }
     let mut f = Flush { parts, ..Default::default() };
@@ -616,7 +680,9 @@ impl Sequencer {
         // Row ids' blocks (ADR-029 §11): a counter of their own, which starts above every commit
         // number (the blocks before it had), and moves only as blocks are taken.
         let mut block: u64 = lake.cat.get("b").await?.unwrap_or(next);
-        crate::views::forget(&lake); // (the views as this leader finds them)
+        for h in hooks() {
+            (h.led)(&lake); // (the views as this leader finds them)
+        }
         for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
             let rows = crate::tier::backlog(&lake, meta.tiered, None).await?.get(&key[2..]).copied().unwrap_or(0);
             lake.backlog.fetch_add(rows, Ordering::Relaxed);
@@ -853,8 +919,12 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
     for p in std::mem::take(&mut *FORGOTTEN.lock().unwrap()) {
         producers.forget(&p);
     }
-    let (views, blocks) = (crate::views::inline(lake).await?, *block);
-    puts.extend(crate::views::bound(lake, &views, *next)); // (views made since: their filling ends before this commit)
+    let (mut owes, blocks) = (vec![], *block);
+    for h in hooks() {
+        let (owed, put) = (h.commit)(lake, *next).await?; // (views made since: their filling ends before this commit)
+        owes.push(owed);
+        puts.extend(put);
+    }
     let mut takes = None; // (only numbers taken, sequences' blocks, row ids' blocks, a bulk write's commit: a commit no read sees)
     for (mut f, reply) in batch {
         if let Some(op) = f.sequence.take() {
@@ -877,12 +947,17 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
             continue;
         }
         // 0. A flush packed with other views than the ones its tables have now goes back to be
-        // packed again (`views::Inline`).
+        // packed again (each hook's `Owes`).
         let derived: std::collections::HashSet<&str> = f.parts.iter().filter(|p| p.src.is_none()).map(|p| p.table.as_str()).collect();
         let filed = f.filed.iter().filter(|x| !x.added.is_empty() || !x.removed.is_empty() || !x.deleted.is_empty()).map(|x| x.table.as_str()); // (a file commit's rows: its views derived theirs too)
         // (a view's own rows are owed to the views that follow it: a flow, ADR-036 §1)
-        let mut owed = f.parts.iter().filter(|p| p.rows > 0).map(|p| p.table.as_str()).chain(filed).flat_map(|t| views.by_source.get(t).into_iter().flatten());
-        if owed.any(|v| !derived.contains(v.as_str())) || derived.iter().any(|t| !views.tables.contains(*t)) {
+        let mut stale = derived.iter().any(|t| !owes.iter().any(|o| o.derives(t)));
+        for t in f.parts.iter().filter(|p| p.rows > 0).map(|p| p.table.as_str()).chain(filed) {
+            for o in &owes {
+                stale |= o.owed(t).iter().any(|v| !derived.contains(v.as_str()));
+            }
+        }
+        if stale {
             replies.push((reply, Outcome::Retry(vec![])));
             continue;
         }
@@ -1195,6 +1270,21 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, DictionaryArray, Int64Array, StringArray};
     use datafusion::arrow::datatypes::Int32Type;
     use datafusion::arrow::ipc::writer::StreamWriter;
+
+    /// The log calls its commit hooks and names none (step 5 piece 6): this build's views are one, and two of one name
+    /// stop the registry's build.
+    #[test]
+    fn commits_call_the_hooks_the_registry_has() {
+        assert_eq!(hooks().iter().map(|h| h.name).collect::<Vec<_>>(), ["views"], "the engine adds the views' hook, and nothing else adds one yet");
+        let twice = crate::registry::BuiltIn { name: "twice", requires: &[], register: |r| {
+            let hooks = r.section_mut::<CommitHooks>();
+            hooks.add(crate::views::hook());
+            hooks.add(crate::views::hook());
+        } };
+        let built = std::panic::catch_unwind(|| crate::registry::Registry::build(&[&twice]));
+        let why = built.err().and_then(|e| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+        assert!(why.contains("commit hooks section: views twice"), "{why}");
+    }
 
     /// A flush a node that doesn't lead refused (421: a leader killed and started again, back as a follower of the term
     /// another took) is refused to its writers as never run, which a client sends again (57P03), not as an answer lost.

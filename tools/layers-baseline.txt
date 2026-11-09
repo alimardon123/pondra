@@ -125,7 +125,6 @@ log -> rules  4
 log -> seq  6
 log -> sys  5
 log -> tier  1
-log -> views  7
 log -> wasm32  4
 machine -> wasm32  2
 manifest -> branch  4
