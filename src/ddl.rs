@@ -938,9 +938,10 @@ pub fn folder_of(url: &str) -> String {
 pub async fn attach(home: &Lake, name: &str, dir: &str, follow: bool, live: bool) -> Result<Arc<Lake>> {
     dropped_here(dir, name).await?;
     let other = Lake::open(dir, false, live, home.node.clone()).await?;
+    let node = home.node.clone();
     if follow {
         let (home, weak) = (Arc::downgrade(&home.arc()), Arc::downgrade(&other));
-        crate::spawns::spawn(async move {
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 let (Some(home), Some(other)) = (home.upgrade(), weak.upgrade()) else { return }; // (detached)

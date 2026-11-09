@@ -1838,11 +1838,12 @@ impl Drop for Undo {
         let Some((app, name, job, scope)) = self.0.take() else { return };
         // (carried: the drop runs as the caller that was stopped, with its sign-in and session, which tokio still
         // holds while a future is dropped)
-        crate::spawns::task(crate::auth::carried(async move {
+        let node = app.lake.node.clone();
+        node.tasks.spawn_as(crate::auth::caller(), async move {
             if let Err(e) = Box::pin(on_node_as(&app, made_drop(&name, &job), None, false, &scope)).await {
                 eprintln!("left {name} as it is: the drop after its CREATE TABLE … AS, which stopped before it answered, didn't answer: {e:#}");
             }
-        }));
+        });
     }
 }
 
@@ -2598,7 +2599,7 @@ async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool, 
             }
             Holder::Free(_) if !one_off => {
                 let Some(r) = &req else { return Ok(j!({"duplicate": true})) };
-                if let Some(v) = crate::inbox::send(&store, r, Some((dir, &node.life)), None, Some(&node.claims)).await? {
+                if let Some(v) = crate::inbox::send(&store, r, Some((dir, node)), None, Some(&node.claims)).await? {
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }

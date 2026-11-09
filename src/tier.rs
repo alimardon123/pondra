@@ -832,25 +832,8 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     let pending = backlog(lake, tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(hwm), Some(hwm)).await?;
     let idle: Vec<bool> = tables.iter().map(|(k, m)| m.tiered < hwm && !pending.contains_key(&k[2..])).collect();
     tables.iter_mut().zip(&idle).filter(|(_, idle)| **idle).for_each(|((_, m), _)| m.tiered = hwm);
-    let mut floor = tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(0);
-    for (key, task) in lake.cat.scan::<crate::tasks::Task>("k/", "k0").await? {
-        for producer in crate::tasks::producers(&key[2..], &task) {
-            let done = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
-            let unread = lake.cat.segments(&seg_key(done + 1), &seg_key(floor + 1)).await?.iter().any(|(_, s)| s.rows_of(&task.source) > 0);
-            if done < floor && unread {
-                floor = done; // the task still has to read these (tasks skip runs with nothing new)
-            }
-        }
-    }
-    // (a view that runs its query again learns from the log what changed since its last run, and a
-    // view kept by key reads what other engines' commits took out of its source there)
-    for (key, v) in lake.cat.scan::<crate::views::View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.rerun.is_some()) {
-        let done = lake.cat.get(&producer_key(&crate::rerun::producer(&key[2..]))).await?.unwrap_or(0);
-        let follows = crate::rerun::follows(&v);
-        if done < floor && lake.cat.segments(&seg_key(done + 1), &seg_key(floor + 1)).await?.iter().any(|(_, s)| follows.iter().any(|t| crate::rerun::moved(s, t))) {
-            floor = done;
-        }
-    }
+    // (and below it, what a reader of the log still reads: a task, a view run again, a consumer group: `pins::floor`)
+    let floor = crate::pins::floor(lake, tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(0)).await?;
     // Only segments that were ALREADY below the floor `grace_ms` ago: a query that read a table's
     // metadata just before it was tiered may still be reading them.
     crate::per_node!(static FLOORS: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> = std::sync::Mutex::new(std::collections::VecDeque::new()));
