@@ -2269,7 +2269,7 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool, keep: bool) -> Resu
         let gone: Vec<String> = [crate::feeds::feed_key(name), table_key(name)].into_iter().chain(offsets.iter().cloned()).collect();
         let (unshared, from) = crate::shares::tables_moved(lake, &[(name, None)]).await?;
         lake.cat.commit(unshared, &gone).await?;
-        crate::log::forget_producers(offsets.into_iter().map(|k| k[2..].to_string())); // (its offsets: made again, it starts over)
+        crate::log::forget_producers(lake, offsets.into_iter().map(|k| k[2..].to_string())); // (its offsets: made again, it starts over)
         return Ok((left_shares(j!({"view": name, "dropped": true}), from), None));
     }
     if let Some(v) = lake.cat.get::<StoredView>(&query_key(name)).await? {
@@ -2314,7 +2314,7 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool, keep: bool) -> Resu
     for published in &copies {
         published.delete(lake).await;
     }
-    crate::log::forget_producers(producers); // (a view made again under this name starts over)
+    crate::log::forget_producers(lake, producers); // (a view made again under this name starts over)
     crate::views::forget(lake);
     Ok((left_shares(j!({"view": shown, "dropped": true}), from), keep.then_some("materialized view")))
 }
@@ -2329,7 +2329,7 @@ async fn detach_view(lake: &Lake, name: &str) -> Result<Value> {
         let offsets = lake.cat.scan::<u64>(&crate::store::producer_key(&format!("feed:{name}:")), &crate::store::producer_key(&format!("feed:{name};"))).await?;
         let gone: Vec<String> = std::iter::once(crate::feeds::feed_key(name)).chain(offsets.iter().map(|(k, _)| k.clone())).collect();
         lake.cat.commit(vec![], &gone).await?;
-        crate::log::forget_producers(offsets.into_iter().map(|(k, _)| k[2..].to_string())); // (`p/…`: a feed made again starts over)
+        crate::log::forget_producers(lake, offsets.into_iter().map(|(k, _)| k[2..].to_string())); // (`p/…`: a feed made again starts over)
         return Ok(j!({"view": name, "detached": true, "table": name}));
     }
     ensure!(lake.cat.get::<crate::views::View>(&crate::views::view_key(&crate::once::open(name))).await?.is_none(),
@@ -2345,7 +2345,7 @@ async fn detach_view(lake: &Lake, name: &str) -> Result<Value> {
         gone.extend(crate::matches::tables(name).iter().map(|t| table_key(t))); // (a MATCH_RECOGNIZE's held and resume rows: its table stays)
     }
     lake.cat.commit(vec![], &gone).await?;
-    crate::log::forget_producers(producers);
+    crate::log::forget_producers(lake, producers);
     crate::views::forget(lake);
     Ok(j!({"view": name, "detached": true, "table": name}))
 }

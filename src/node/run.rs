@@ -339,14 +339,15 @@ impl Node {
                 }
                 cluster::catch_up(lake.clone(), store.clone(), cluster.leader.clone()); // (answers wait until this node holds what the leader had; a view that replays the WAL has it)
             }
+            let down = Arc::new(std::sync::atomic::AtomicBool::new(false)); // (is the leader's commit stream down: the mirror says, a reader's watch reads)
             if lives {
                 match reader {
-                    false => cluster.clone().follow(store),
-                    true => cluster.clone().watch_leader(store, streamed), // a reader never votes or leads
+                    false => cluster.clone().follow(store, lake.log.untaken.clone()),
+                    true => cluster.clone().watch_leader(store, streamed, down.clone()), // a reader never votes or leads
                 }
             }
             if streamed {
-                cluster::mirror(lake.clone(), cluster.leader.addr.clone(), addr.clone(), replica);
+                cluster::mirror(lake.clone(), cluster.leader.addr.clone(), addr.clone(), replica, down.clone());
                 if !lives {
                     // (a guest synced the lakes attached in SQL once, in `start_app`, from a view that skips the WAL, and
                     // syncs no more: an ATTACH its leader made in the last few seconds wasn't there yet, and `pondra sql`
@@ -499,7 +500,7 @@ pub(crate) async fn attach(home: &store::Lake, spec: &str, me: &str, follow: boo
     };
     let other = ddl::attach(home, name, dir, follow, live).await?;
     if let (true, Some(a)) = (live, leader) {
-        cluster::mirror(other, a, me.to_string(), None);
+        cluster::mirror(other, a, me.to_string(), None, Default::default()); // (its own flag: an attached lake's stream says nothing of the home lake's leader)
     }
     Ok(())
 }

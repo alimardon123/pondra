@@ -104,7 +104,7 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             passes.add(p);
         }
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "functions", columns: FUNCTION_COLUMNS, rows: functions });
-        #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: the answers kept for their doors' pages, a joined page's unsent statements and a node's count of them, its file stores and catalogs' tokens, and the shuffles its node takes part in)
+        #[cfg(feature = "lake")] // (what a lake keeps for the engine's modules, `lake_state.rs`: each says what its state holds, `LakeState::ABOUT`)
         {
             let states = r.section_mut::<crate::lake_state::Registered>();
             states.add::<crate::pages::Pages>();
@@ -117,6 +117,11 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add::<crate::history::Writers>();
             states.add::<crate::query::FactsKept>();
             states.add::<crate::views::Kept>();
+            states.add::<crate::rerun::Kept>();
+            states.add::<crate::runs::Kept>();
+            states.add::<crate::tasks::Kept>();
+            states.add::<crate::fresh::Plans>();
+            states.add::<crate::once::Buckets>();
         }
         #[cfg(feature = "lake")] // (the engine floor's catalog records: `records`)
         for p in [crate::backup::PREFIXES, crate::branch::PREFIXES, crate::copy::PREFIXES, crate::ddl::PREFIXES, crate::undrop::PREFIXES, crate::ext::PREFIXES, crate::protect::PREFIXES,
@@ -127,6 +132,8 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         r.section_mut::<crate::records::Rights>().add(crate::users::RIGHTS);
         #[cfg(feature = "lake")] // (what the catalog keeps with its entries: the folders each table uses)
         r.section_mut::<crate::store::CatalogHooks>().add(crate::ddl::folder_hook());
+        #[cfg(feature = "lake")] // (what the log's commits call: a view's rows, derived as its sources' are packed)
+        r.section_mut::<crate::log::CommitHooks>().add(crate::views::hook());
     },
 };
 

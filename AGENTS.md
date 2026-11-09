@@ -795,14 +795,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    new type. Delta readers learn renamed columns from column mapping declared as the
    `columnMapping` table feature (reader 3), never reader version 2 alone: delta-rs's pyarrow
    reader ignored version 2 and read renamed columns as null (`harness.py columns`).
-76. **The sequencer holds every flush to the inline views** (`log::commit`, `views::Inline`): a
+76. **The sequencer holds every flush to the inline views** (`log::commit`, `views::Inline` as the views' `log::Owes`): a
    flush with rows of a table views follow carries a part for each (empty if none derived), and no
    part for a view the table doesn't have; otherwise it goes back to be packed again. A view's
    filling ends at the first commit that holds flushes to it, written in that commit
    (`views::bound`); the fill covers `_version ≤ upto`, as of `upto`. `harness.py fills`: with the
    check off, all 12 checks fail. Making a view waits for its fill, which commits: a crash there
    drops the call, and asking again (the same view) is the answer — `harness.py crash`'s setup
-   does, or CI fails now and then.
+   does, or CI fails now and then. The log names no view: the views are a commit hook
+   (`log::CommitHooks`, `views::hook`, added by the engine), and the log calls each hook's `derive`, `refused`,
+   `commit` (the `Owes` above, and the fills' ends) and `led`. Anything else that keeps rows in step with a commit is
+   another hook, not a call from the log (`log`'s tests: "commits call the hooks the registry has").
 77. **The inline views the sequencer holds flushes to are reloaded after every view made or
    dropped** (`views::forget`), and a cache that changed meanwhile is never overwritten with an
    older one (`views::bound` checks it's the same). A stale set refuses every flush of the new

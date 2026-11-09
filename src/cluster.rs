@@ -19,7 +19,7 @@
 //!   a second or two (`listen`), and one that doesn't answer in `HEARD` is gone (`deaf`); but not a
 //!   replicating leader, whose followers hold acknowledged changes: its mark alone decides. A leader
 //!   killed and started again takes the next term: only its own restart takes its term back.
-use crate::log::{now_ms, untaken_flush};
+use crate::log::now_ms;
 use crate::members::{self, Members};
 use crate::lifecycle::{Guest, Life};
 use crate::replica::ReplicaLog;
@@ -254,8 +254,9 @@ impl Cluster {
         });
     }
 
-    /// Follower loop: heartbeat the leader; if it's gone for `LEASE`, claim the next term.
-    pub fn follow(self: Arc<Self>, store: Store) {
+    /// Follower loop: heartbeat the leader; if it's gone for `LEASE`, claim the next term. `untaken`: its lake's bell for a
+    /// flush the leader didn't take (`log::Kept::untaken`).
+    pub fn follow(self: Arc<Self>, store: Store, untaken: Arc<tokio::sync::Notify>) {
         crate::panics::spawn(async move {
             let mut reached: Option<Instant> = None; // (since when we reach the bucket the leader says it can't)
             let mut missed = false; // (the last beat went unanswered)
@@ -263,12 +264,12 @@ impl Cluster {
                 // A drained leader closes its door, then steps down (`node::run::Held::stop`): its followers take over
                 // then, not at their next beat up to a second on (invariant 210). So a beat unanswered is asked again
                 // every tenth of a second while the leader's lease lasts, and a flush the leader didn't take
-                // (`log::untaken_flush`) asks at once. Each look asks the bucket one HEAD (`stepped_down`). Past the lease,
+                // (`log::Kept::untaken`) asks at once. Each look asks the bucket one HEAD (`stepped_down`). Past the lease,
                 // once a second again: a takeover's own questions (a peer, the bucket's newest term) are never asked faster.
                 let pause = if missed && self.leader_ok() { Duration::from_millis(100) } else { Duration::from_secs(1) };
                 tokio::select! {
                     _ = tokio::time::sleep(pause) => {}
-                    _ = untaken_flush(), if self.leader_ok() => {}
+                    _ = untaken.notified(), if self.leader_ok() => {}
                 }
                 let url = crate::tls::url(&format!("{}/cluster/beat?from={}", self.leader.addr, self.addr));
                 let answer = http().post(url).timeout(Duration::from_secs(2)).send().await;
@@ -333,7 +334,7 @@ impl Cluster {
 
     /// Read-only nodes: no heartbeat, no vote, no takeover. They only notice when leadership
     /// moves, and restart to follow the new leader's commit stream (see `mirror`).
-    pub fn watch_leader(self: Arc<Self>, store: Store, streamed: bool) {
+    pub fn watch_leader(self: Arc<Self>, store: Store, streamed: bool, down: Arc<std::sync::atomic::AtomicBool>) {
         crate::panics::spawn(async move {
             let mut gone = 0;
             loop {
@@ -342,7 +343,7 @@ impl Cluster {
                 // about as soon as the followers' are. (A few bucket reads a second, only then.)
                 for _ in 0..15 {
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    if STREAM_DOWN.load(std::sync::atomic::Ordering::Relaxed) && matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
+                    if down.load(std::sync::atomic::Ordering::Relaxed) && matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
                         self.life.restart("another leads", &[]);
                     }
                 }
@@ -515,15 +516,12 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
     });
 }
 
-crate::per_node!(
-    /// Is the leader's commit stream down (`mirror`)? A read-only node then looks for a new leader.
-    static STREAM_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
-
 /// Follower or read-only node: follow the leader's commit stream (see `store.rs`). If it breaks,
 /// reconnect; meanwhile our own catalog view keeps us correct, just a little behind. A follower
 /// (`replica`) of a leader that replicates commits also keeps every change on local disk and
-/// says so: that is what lets the leader acknowledge a write before the bucket has it.
-pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<ReplicaLog>>) {
+/// says so: that is what lets the leader acknowledge a write before the bucket has it. `down` says whether the leader's
+/// commit stream is down (`watch_leader` reads it: a read-only node then looks for a new leader).
+pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<ReplicaLog>>, down: Arc<std::sync::atomic::AtomicBool>) {
     // Acks, coalesced: however many changes arrive meanwhile, one request says "up to here".
     let (held, mut to_ack) = tokio::sync::watch::channel((0u64, 0u64, 0u64)); // term, first, last
     let l = leader.clone();
@@ -554,19 +552,21 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
         (Frame::Durable(upto), log) => log.iter().for_each(|log| log.prune(*upto)),
         (Frame::Committed(_), _) => {}
     };
+    let down_open = down.clone(); // (the stream's: `open` says it is up)
     let open = move || -> futures::future::BoxFuture<'static, std::result::Result<crate::fetch::Response, members::Open>> {
         let url = crate::tls::url(&format!("{leader}/cluster/log"));
+        let down = down_open.clone();
         Box::pin(async move {
             match crate::fetch::send(http().get(url)).await.and_then(crate::fetch::Response::error_for_status) {
                 Ok(r) => {
-                    STREAM_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
+                    down.store(false, std::sync::atomic::Ordering::Relaxed);
                     Ok(r)
                 }
                 Err(_) => Err(members::Open::Retry),
             }
         })
     };
-    crate::panics::spawn(members::follow(Arc::downgrade(&lake), open, frame, || STREAM_DOWN.store(true, std::sync::atomic::Ordering::Relaxed), true));
+    crate::panics::spawn(members::follow(Arc::downgrade(&lake), open, frame, move || down.store(true, std::sync::atomic::Ordering::Relaxed), true));
 }
 
 /// One HTTP client (connection pool) for all node-to-node traffic. It carries this process's
