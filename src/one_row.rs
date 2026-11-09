@@ -176,11 +176,10 @@ fn written_in(e: Expr, by: &HashMap<Column, Expr>) -> Result<Expr> {
     .data()
 }
 
-/// `pondra_one_row`, built for each plan that needs it (one per session as well, for plans that name it: `register`).
+/// `pondra_one_row`, built for each plan that needs it. Not registered in any session, as `pondra_divide` isn't: no SQL
+/// names it (a plan goes to another node as its text, planned there again), and a name would be a function users could
+/// call.
 fn udf() -> Arc<ScalarUDF> { Arc::new(ScalarUDF::new_from_impl(Pick { signature: Signature::any(1, Volatility::Immutable) })) }
-
-/// Registers `pondra_one_row` in a session (`engine.rs`), for plans that name it.
-pub fn register(ctx: &datafusion::prelude::SessionContext) { ctx.register_udf(udf().as_ref().clone()); }
 
 /// `pondra_one_row(s)`: `s`'s value, a struct of a subquery's count and first value (`counted`); NULL when it is NULL (no
 /// row matched); 21000 when its count is more than one.
@@ -258,6 +257,17 @@ mod tests {
     /// A subquery that reads the outer row and isn't aggregated answers each row's one value, NULL where none matched,
     /// in a select list, a WHERE and inside an expression; a value the outer WHERE leaves out may match many and raises
     /// nothing.
+    /// `pondra_one_row` is the rule's, as `pondra_divide` is: no session knows it by name, so no user calls it.
+    #[tokio::test]
+    async fn no_session_names_its_functions() {
+        use datafusion::execution::FunctionRegistry;
+        let ctx = session().await;
+        for name in ["pondra_one_row", crate::divide::NAME] {
+            assert!(ctx.udf(name).is_err(), "{name} is in the session");
+            assert!(ctx.sql(&format!("SELECT {name}(1)")).await.is_err(), "{name} is called by name");
+        }
+    }
+
     #[tokio::test]
     async fn a_subquery_of_the_outer_row_gives_its_one_row() {
         let ctx = session().await;
