@@ -10906,6 +10906,69 @@ def first():
 
 # ---------------------------------------------------------------- round 29, part 2 (ADR-035)
 
+def _users_every_door_errors(checks, port, passwords):
+    """The same Python procedure's error, trips_py()'s, through every door that answers a routine's error, each worded
+    for the caller its door signed in, never for the task's (M8 3d-1, S27): HTTP /sql, Postgres, Flight, MCP, a script's
+    handler ($error), an apply's test (POST /test) and a live query (/live: a SELECT, so a Python function's, trips_fn's).
+    ann's names line 3 without its text; boss's, an admin's, quotes it. Run after users()'s S27 checks: it uses the
+    procedure trips_py() and the function trips_fn() made there. `passwords` maps (ann, boss) to theirs."""
+    import base64, psycopg, adbc_driver_flightsql.dbapi as adbc
+    ann, boss = passwords
+    basic = lambda u: "Basic " + base64.b64encode(f"{u}:{passwords[u]}".encode()).decode()
+    trips, grouped = "CALL trips_py()", "SELECT item, sum(trips_fn(id)) AS s FROM sales.orders GROUP BY item"
+
+    def text(f):
+        try:
+            out = f()
+            return out.decode(errors="replace") if isinstance(out, bytes) else json.dumps(out, default=str)
+        except Exception as e:
+            return str(e)
+
+    def http_(u, body, path="/sql", kind=None):
+        return call(port, "POST", path, body.encode(), headers={"Authorization": basic(u)} | ({"content-type": kind} if kind else {}))
+
+    def pg(u):
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={port + 10} user={u} password={passwords[u]} dbname=lake", connect_timeout=10, autocommit=True) as c:
+                return json.dumps(c.execute(trips).fetchall(), default=str)
+        except psycopg.Error as e:
+            return " ".join(str(x) for x in (e, e.diag.message_detail, e.diag.message_hint) if x)
+
+    def flight(u):  # (Flight SQL, as ADBC sends a statement: a CALL is a write sent as a query)
+        with adbc.connect(f"grpc://127.0.0.1:{port + 30}", db_kwargs={"username": u, "password": passwords[u]}, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(trips)
+            return json.dumps(cur.fetchall(), default=str)
+
+    token = {u: call(port, "POST", "/sql", f"CREATE TOKEN doors_{u} FOR USER {u}".encode(), headers={"Authorization": basic(boss)})["token"] for u in (ann, boss)}
+
+    def mcp(u):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "write", "arguments": {"sql": trips}}}).encode()
+        return call(port, "POST", "/mcp", body, headers={"Authorization": f"Bearer {token[u]}", "content-type": "application/json"})["result"]["content"][0]["text"]
+
+    def live(u):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        try:
+            c.request("POST", "/live", json.dumps({"sql": grouped}).encode(), {"Authorization": basic(u), "content-type": "application/json"})
+            r = c.getresponse()
+            if r.status != 200:
+                return f"{r.status}: {r.read()[:3000]!r}"
+            while (line := r.readline()) and not line.strip():
+                pass  # (a line now and then: a client gone is noticed)
+            return line.decode(errors="replace")
+        finally:
+            c.close()
+
+    project = json.dumps({"files": {"pondra.toml": '[project]\nname = "doors"\n', "tests/trips.sql": trips + "\n"}})
+    doors = {"HTTP /sql": lambda u: http_(u, trips), "Postgres": pg, "Flight": flight, "MCP": mcp,
+             "a script's handler": lambda u: http_(u, f"BEGIN {trips}; EXCEPTION WHEN OTHERS THEN SELECT $error AS e; END"),
+             "an apply's test": lambda u: http_(u, project, "/test", "application/json"), "a live query": live}
+    said = {door: {u: text(lambda: f(u)) for u in (ann, boss)} for door, f in doors.items()}
+    marker = {door: "hidden_marker_f" if door == "a live query" else "hidden_marker_p" for door in doors}
+    cut = {door: "line 3" in s[ann] and marker[door] not in s[ann] and marker[door] in s[boss] for door, s in said.items()}
+    checks["one Python routine's error through every door is worded for its door's caller: ann's names line 3 without its text, boss's quotes it, at HTTP, Postgres, Flight, MCP, a script's handler, an apply's test and a live query (M8, S27)"] = \
+        all(cut.values())
+    return {door: {u: t[:600] for u, t in s.items()} for door, s in said.items() if not cut[door]}  # (what a door that failed said)
+
 def _users_mcp_errors(checks, port, admin, names):
     """MCP words a failed call's error as every door does (`ext::said`): ann, granted some tables, reads a
     failed CALL's or a Python function's error without a routine's code (S27), and a file's name as SQL names
@@ -11094,6 +11157,7 @@ def users():
         and "line 3" in str(failed["py"]) and "hidden_marker_p" not in str(failed["py"]) and "hidden_marker_p" in str(failed["py_boss"]) \
         and "line 3" in str(failed["fn"]) and "hidden_marker_f" not in str(failed["fn"]) and "hidden_marker_f" in str(failed["fn_boss"])
     _users_mcp_errors(checks, A.port, boss, ("ann", "boss"))
+    shown_info["every door"] = _users_every_door_errors(checks, A.port, {"ann": "ann-password-1", "boss": "boss-password-1"})
     # Tokens and sessions
     tok = as_(A.port, boss, "CREATE TOKEN ci FOR USER svc")
     short = as_(A.port, boss, "CREATE TOKEN brief FOR USER svc EXPIRES IN '1 second'")

@@ -47,7 +47,12 @@ pub struct Registered(Vec<Entry>);
 impl Registered {
     /// A state a lake may keep.
     pub fn add<P: LakeState>(&mut self) {
-        self.0.push(Entry { name: P::NAME, about: P::ABOUT, id: TypeId::of::<P>() });
+        self.push(Entry { name: P::NAME, about: P::ABOUT, id: TypeId::of::<P>() });
+    }
+
+    #[inline(never)] // (one copy for every state, as `States::get_any`)
+    fn push(&mut self, entry: Entry) {
+        self.0.push(entry);
     }
 
     /// Every state, as it was added.
@@ -56,8 +61,8 @@ impl Registered {
         &self.0
     }
 
-    fn has<P: LakeState>(&self) -> bool {
-        self.0.iter().any(|k| k.id == TypeId::of::<P>())
+    fn has(&self, id: TypeId) -> bool {
+        self.0.iter().any(|k| k.id == id)
     }
 }
 
@@ -80,37 +85,61 @@ pub struct States(Mutex<Vec<Made>>);
 
 struct Made {
     id: TypeId,
-    state: Arc<dyn Any + Send + Sync>,
-    stop: fn(&(dyn Any + Send + Sync)),
+    state: Arc<dyn Kept>,
+}
+
+/// A state as `States` keeps it: one `stop` for every state's type, through its vtable.
+trait Kept: Any + Send + Sync {
+    fn stop_kept(&self);
+}
+
+impl<P: LakeState> Kept for P {
+    fn stop_kept(&self) {
+        self.stop()
+    }
 }
 
 impl States {
     /// The lake's `P`, made the first time and charged to `line` when it is a cache. Refused when no extension of this
     /// build registered `P`.
+    #[inline(always)] // (one copy a state: `get_in`'s)
     pub fn get<P: LakeState>(&self, line: Option<&Arc<Ledger>>) -> anyhow::Result<Arc<P>> {
         self.get_in(crate::registry::get(), line)
     }
 
+    /// Each state's own code is this and its `made`, and all the rest is `get_any`'s, one copy for every state: the
+    /// page downloads each copy, and every module's statics come to be states (invariant 301).
     fn get_in<P: LakeState>(&self, r: &Registry, line: Option<&Arc<Ledger>>) -> anyhow::Result<Arc<P>> {
-        let mut made = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(m) = made.iter().find(|m| m.id == TypeId::of::<P>()) {
-            return Ok(m.state.clone().downcast::<P>().expect("a state is kept under its own type"));
+        let state: Arc<dyn Any + Send + Sync> = self.get_any(r, TypeId::of::<P>(), P::NAME, line, made::<P>)?;
+        Ok(state.downcast::<P>().unwrap_or_else(|_| unreachable!("a state is kept under its own type")))
+    }
+
+    fn get_any(&self, r: &Registry, id: TypeId, name: &'static str, line: Option<&Arc<Ledger>>, made: fn() -> (Arc<dyn Kept>, Option<Arc<dyn Charged>>)) -> anyhow::Result<Arc<dyn Kept>> {
+        let mut all = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(m) = all.iter().find(|m| m.id == id) {
+            return Ok(m.state.clone());
         }
-        anyhow::ensure!(r.find::<Registered>().is_some_and(Registered::has::<P>), "{} is no state a lake keeps: the extension that owns it adds it to the registry's lake_state section (`lake_state::Registered::add`)", P::NAME);
-        let state = Arc::new(P::make());
-        if let (Some(line), Some(cache)) = (line, state.clone().cache()) {
-            line.charge(P::NAME, Arc::downgrade(&cache)); // (weak: it goes with its lake)
+        anyhow::ensure!(r.find::<Registered>().is_some_and(|k| k.has(id)), "{name} is no state a lake keeps: the extension that owns it adds it to the registry's lake_state section (`lake_state::Registered::add`)");
+        let (state, cache) = made();
+        if let (Some(line), Some(cache)) = (line, cache) {
+            line.charge(name, Arc::downgrade(&cache)); // (weak: it goes with its lake)
         }
-        made.push(Made { id: TypeId::of::<P>(), state: state.clone(), stop: |p| p.downcast_ref::<P>().expect("its own type").stop() });
+        all.push(Made { id, state: state.clone() });
         Ok(state)
     }
+}
+
+/// A new `P` for `States`, and it as a cache when it is one.
+fn made<P: LakeState>() -> (Arc<dyn Kept>, Option<Arc<dyn Charged>>) {
+    let state = Arc::new(P::make());
+    (state.clone(), state.cache())
 }
 
 impl Drop for States {
     fn drop(&mut self) {
         let made = std::mem::take(self.0.get_mut().unwrap_or_else(PoisonError::into_inner));
         for m in made.into_iter().rev() {
-            (m.stop)(&*m.state); // (the last made first: one made later may lean on one made before it)
+            m.state.stop_kept(); // (the last made first: one made later may lean on one made before it)
         }
     }
 }
