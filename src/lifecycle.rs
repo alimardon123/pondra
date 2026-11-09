@@ -37,8 +37,9 @@ pub trait Lifecycle: Send + Sync {
     fn program(&self) -> anyhow::Result<PathBuf>;
 
     /// Leads the lake at `dir` for a moment, making it if nothing is there yet, in a process of its own: for a lake nobody
-    /// leads, and for a writer whose leader is gone (`inbox::send`).
-    fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>>;
+    /// leads, and for a writer whose leader is gone (`inbox::send`). The process reaches other places as the node does
+    /// (`reaches`, the node's: `NodeState::reaches`).
+    fn lead_elsewhere<'a>(&'a self, dir: &'a str, reaches: &'a crate::reaches::Reaches) -> futures::future::BoxFuture<'a, anyhow::Result<()>>;
 
     /// Can the node's lake move to another place (`memory::set_location`): is there a host that stops the node, settles
     /// the lake there and starts the node on it? None but a library's or `pondra serve`'s node can.
@@ -104,7 +105,7 @@ impl Lifecycle for Unhosted {
     fn program(&self) -> anyhow::Result<PathBuf> {
         anyhow::bail!("a lake opened with no node around it starts no helpers")
     }
-    fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+    fn lead_elsewhere<'a>(&'a self, dir: &'a str, _: &'a crate::reaches::Reaches) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move { anyhow::bail!("a lake opened with no node around it leads no other lake ({dir})") })
     }
 }

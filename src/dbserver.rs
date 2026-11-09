@@ -104,7 +104,7 @@ pub async fn is_lake(dir: &str) -> Result<bool> {
         // other, and a node started at the same moment looked in between)
         return Ok(d.join("catalog").is_dir() || d.join("cluster").is_dir());
     }
-    let store = crate::store::open_store(dir)?.1;
+    let store = crate::store::open_store(dir, None)?.1; // (the database server's own folder or bucket, as the environment reaches it)
     for prefix in ["catalog", "cluster/term"] {
         if futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from(prefix)))).await.transpose()?.is_some() {
             return Ok(true);
@@ -118,7 +118,7 @@ fn place(folder: &str, name: &str) -> String { format!("{}/{name}", folder.trim_
 
 /// The lakes in the folder: its subfolders that hold one, by name.
 async fn databases(folder: &str) -> Vec<String> {
-    match crate::ddl::lakes_in(folder).await {
+    match crate::ddl::lakes_in(folder, None).await {
         Ok(all) => all.into_iter().map(|(n, _)| n).collect(),
         Err(e) => {
             eprintln!("listing the databases in {folder}: {e:#}");
@@ -235,7 +235,7 @@ impl Server {
             drop(n.child.stdin.take());
             let _ = tokio::time::timeout(Duration::from_secs(20), n.child.wait()).await;
         }
-        crate::ddl::delete_lake(&dir).await.with_context(|| format!("database {name}"))?; // (a bucket's prefix: every object under it)
+        crate::ddl::delete_lake(&dir, None).await.with_context(|| format!("database {name}"))?; // (a bucket's prefix: every object under it)
         Ok(j!({"database": name, "dropped": true}))
     }
 }

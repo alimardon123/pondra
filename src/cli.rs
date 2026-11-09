@@ -463,7 +463,6 @@ fn mistyped(word: &str, c: &str) -> bool {
 async fn run() -> anyhow::Result<()> {
     let matches = command().get_matches();
     let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.format(&mut command()).exit());
-    store::inherit(); // (a lake led for a moment, reached as the process that asked reaches it)
     let Some(cmd) = cli.cmd else {
         let given = cli.lake.is_some();
         let lake = crate::memory_lake::place(&cli.lake.unwrap_or_else(|| "lake".into())); // (`pondra :memory:`: a lake in the node's memory)
@@ -668,7 +667,7 @@ async fn run() -> anyhow::Result<()> {
             // moment, as a one-off write does, tiers the log, writes the catalog down, and ends, so a lake no node
             // serves can be kept tidy by a scheduled `pondra sql --dir … CHECKPOINT`)
             let dir = crate::memory_lake::place(&dir);
-            let store = store::open_store(&dir)?.1;
+            let store = store::open_store(&dir, None)?.1;
             match terms::latest(&store).await? {
                 Some(t) if !t.addr.is_empty() && terms::alive(&store, &t).await => {
                     println!("{}", crate::net::process().client(crate::net::Policy::Cluster).post(crate::tls::url(&format!("{}/sql", t.addr))).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)

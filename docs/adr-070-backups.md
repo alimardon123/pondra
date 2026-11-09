@@ -81,7 +81,7 @@ copying the file. `DEEP CLONE` is the shape that fits Pondra: it already has the
    node, not server-side: a backup's point is often another bucket or provider. A place there is
    reached with the bucket secret whose `SCOPE` covers it (`ext::reach_place`), else the environment's
    credentials; a `pondra lead` the node starts for the backup reaches it the same way
-   (`store::REACH_VAR`).
+   (`reaches::REACH_VAR`, from the node's own `NodeState::reaches`).
 9. **Before an upgrade, a backup.** The upgrade guide's first step for a release that raises the
    lake's format is `BACKUP DATABASE TO …` with the release still running. A backup keeps the format
    its runs were written at, so the release being left can still serve it if the upgrade goes wrong

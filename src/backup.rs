@@ -203,14 +203,14 @@ async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Op
             other
         }
     };
-    ensure!(crate::store::reach_of(&source.url).is_none(), "{} is on another server: back it up from there", source.url);
+    ensure!(source.node.reaches.of(&source.url).is_none(), "{} is on another server: back it up from there", source.url);
     ensure!(retention_days.is_none_or(|d| d > 0), "retention_days is at least 1");
     let to = crate::ddl::full(to)?;
     crate::ext::owners_only(&to, format!("BACKUP … TO {to}: a path on the server's own disk, which only the node's owner backs up into (the `pondra` shell, `pondra sql`, `connect()` of a lake): back up to a bucket (s3://, gs://, az://)"))?;
     apart(lake, &to)?;
     crate::ext::reach_place(lake, &to).await?; // (another bucket or provider: the secret whose SCOPE covers it)
-    let fresh = empty(&to).await?; // (nothing there yet: this run makes the lake)
-    ensure!(fresh || crate::ddl::has_catalog(&to).await?, "{to} holds other things: back up into a new place (or an empty folder)");
+    let fresh = empty(&to, Some(&lake.node.reaches)).await?; // (nothing there yet: this run makes the lake)
+    ensure!(fresh || crate::ddl::has_catalog(&to, Some(&lake.node.reaches)).await?, "{to} holds other things: back up into a new place (or an empty folder)");
     let pin = format!("{to}#backup");
     let take = Take { source: source.url.clone(), pin: pin.clone(), retention_days, restore: false, at: None, fresh };
     // (this lake pinned here, under its lock where this node leads it: its leader may be this process alone, a `pondra sql`
@@ -253,7 +253,7 @@ async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Op
 /// writer is closed on every path, a panic's too, so no writer of another lake stays in this node for that
 /// lake's next leader to fence.
 async fn take_here(to: &str, t: Take, node: &std::sync::Arc<crate::node_state::NodeState>) -> Result<Value> {
-    let store = crate::store::counted(crate::store::open_store(to)?.1, &node.metrics); // (its requests the node's: `Counted`)
+    let store = crate::store::counted(crate::store::open_store(to, Some(&node.reaches))?.1, &node.metrics); // (its requests the node's: `Counted`)
     // (a term none holds, or that another one-off writer holds: waited for; a node serving the backup refuses)
     let term = crate::terms::claim_one_off(&store, |t| {
         ensure!(t.addr.is_empty(), "{to} is served by a node, which can't read a lake in this process's memory: back up somewhere else, or stop that node");
@@ -301,13 +301,14 @@ async fn take_led(lake: &Lake, t: Take, term: u64) -> Result<Value> {
 /// storage that this machine may only read can be restored.
 pub async fn restore(from: &str, to: &str, at: Option<u64>, node: &std::sync::Arc<crate::node_state::NodeState>) -> Result<Value> {
     let (from, to) = (crate::ddl::full(from)?, crate::ddl::full(to)?);
-    ensure!(crate::ddl::has_catalog(&from).await?, "{from} holds no lake");
-    ensure!(!crate::ddl::has_catalog(&to).await?, "a lake is at {to} already: restore into a new place");
-    ensure!(empty(&to).await?, "{to} holds other things: restore into a new place (or an empty folder)");
+    let reaches = Some(&node.reaches); // (a place another bucket's secret covers: `ext::reach_place`)
+    ensure!(crate::ddl::has_catalog(&from, reaches).await?, "{from} holds no lake");
+    ensure!(!crate::ddl::has_catalog(&to, reaches).await?, "a lake is at {to} already: restore into a new place");
+    ensure!(empty(&to, reaches).await?, "{to} holds other things: restore into a new place (or an empty folder)");
     let take = Take { source: from, pin: String::new(), retention_days: None, restore: true, at, fresh: true }; // (checked empty above)
     let out = Box::pin(crate::write::send(&to, Request::Ddl(Ddl::Backup(take)), node)).await;
     if out.is_err() {
-        let _ = crate::ddl::delete_lake(&to).await; // (nothing half made stays)
+        let _ = crate::ddl::delete_lake(&to, reaches).await; // (nothing half made stays)
     }
     out
 }
@@ -320,13 +321,13 @@ fn carried(cat: &BTreeMap<String, Bytes>) -> Vec<(String, Vec<u8>)> {
     cat.iter().filter(|(k, _)| !own(k)).map(|(k, v)| (k.clone(), v.to_vec())).collect()
 }
 
-/// Nothing at `dir` yet (a restore that fails takes away what it made there, and only that).
-pub(crate) async fn empty(dir: &str) -> Result<bool> {
+/// Nothing at `dir` yet (a restore that fails takes away what it made there, and only that), reached as `reaches` say.
+pub(crate) async fn empty(dir: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<bool> {
     if !dir.contains("://") {
         let path = std::path::Path::new(dir);
         return Ok(!path.exists() || std::fs::read_dir(path)?.next().is_none());
     }
-    let store = crate::store::open_store(dir)?.1;
+    let store = crate::store::open_store(dir, reaches)?.1;
     Ok(store.list(None).next().await.transpose()?.is_none())
 }
 

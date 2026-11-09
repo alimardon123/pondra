@@ -35,8 +35,8 @@ pub async fn send(store: &Store, r: &Request, wake: Option<(&str, &crate::node_s
     store.put(&req, body.into()).await?;
     let mut ear = crate::terms::Ear::ring(store, holder, &id.to_string()).await;
     let woke = wake.map(|(dir, node)| {
-        let (dir, life) = (dir.to_string(), node.life.clone());
-        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move { life.lead_elsewhere(&dir).await })
+        let (dir, life, reaches) = (dir.to_string(), node.life.clone(), node.reaches.clone());
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move { life.lead_elsewhere(&dir, &reaches).await })
     });
     for tick in 1.. {
         tokio::time::sleep(Duration::from_millis(500)).await;

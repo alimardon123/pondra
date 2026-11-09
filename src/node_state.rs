@@ -43,6 +43,9 @@ pub struct NodeState {
     /// What it started, which its stop ends (`spawns::Tasks`): every task says whose work it is.
     #[cfg(feature = "lake")]
     pub tasks: crate::spawns::Tasks,
+    /// How it reaches lakes on other servers, as the statements that named them said (`reaches::Reaches`): each store it
+    /// opens reads its own (`store::open_store`). It starts with what its starter handed it (`PONDRA_REACH`).
+    pub reaches: crate::reaches::Reaches,
 }
 
 impl NodeState {
@@ -57,7 +60,8 @@ impl NodeState {
     pub fn on(life: Life, machine: crate::machine::Mach) -> Arc<NodeState> { NodeState::make(life, machine, crate::settings::Values::now()) }
 
     fn make(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values) -> Arc<NodeState> {
-        Arc::new(NodeState { #[cfg(feature = "lake")] tasks: crate::spawns::Tasks::new(life.clone()), life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), began: datafusion::common::instant::Instant::now() })
+        let reaches = crate::reaches::Reaches::inherited(settings.get(crate::reaches::REACH_VAR));
+        Arc::new(NodeState { reaches, #[cfg(feature = "lake")] tasks: crate::spawns::Tasks::new(life.clone()), life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).

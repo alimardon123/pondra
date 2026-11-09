@@ -211,7 +211,7 @@ impl Node {
         crate::served::checked(&dir, start.reader, start.auth.admin_set(), serve_store)?; // (who may serve or open a store: `served.rs`)
         crate::origins::check()?; // (a page's origins that aren't origins stop the node here, before it joins or serves: `origins.rs`)
         let owner = start.auth.owner_key().map(str::to_string); // (what `ask` signs with)
-        let store = store::counted(store::open_store(&dir)?.1, &here.metrics); // (its terms, marks and members' requests the node's: `Counted`)
+        let store = store::counted(store::open_store(&dir, Some(&here.reaches))?.1, &here.metrics); // (its terms, marks and members' requests the node's: `Counted`)
         let tr = |what: &str| here.trace(what); // (timed from this start: `NodeState::trace`)
         let addr = advertise.unwrap_or_else(|| listen.clone()); // (how others reach it: its cluster name)
         if lives {
@@ -226,7 +226,7 @@ impl Node {
             }
         }
         // (a guest that writes can't lead a lake read through another server: refused by name, as `write::deliver` refuses it)
-        if guest == Some(Guest::Writes) && store::reach_of(&dir).is_some_and(|r| r.read_only) {
+        if guest == Some(Guest::Writes) && here.reaches.of(&dir).is_some_and(|r| r.read_only) {
             return Err(crate::write::read_only_refused(&dir));
         }
         // (a guest that reads begins its lake's open here, beside the term look: the look and the open are each requests to
@@ -507,7 +507,7 @@ pub(crate) fn request(method: &str, path: &str, headers: &[(String, String)], bo
 pub(crate) async fn attach(home: &store::Lake, spec: &str, me: &str, follow: bool) -> anyhow::Result<()> {
     let (name, dir) = spec.split_once('=').ok_or_else(|| anyhow::anyhow!("--attach takes name=dir"))?;
     ddl::database_name(name)?; // (the names the catalog attached keep working; a new `--attach _x=` is refused)
-    let leader = crate::terms::latest(&crate::store::open_store(dir)?.1).await?.map(|t| t.addr).filter(|a| !a.is_empty());
+    let leader = crate::terms::latest(&crate::store::open_store(dir, Some(&home.node.reaches))?.1).await?.map(|t| t.addr).filter(|a| !a.is_empty());
     let live = match (&leader, follow) {
         (Some(a), true) => crate::dial::call(a, crate::dial::Call::get("/cluster/leader").timeout(Duration::from_secs(2))).await.is_ok(),
         _ => false,
@@ -552,12 +552,13 @@ pub(crate) fn exec_again(guest: bool, carried: &[(&str, String)]) -> ! {
 }
 
 /// Leads the lake at `dir` in a `pondra lead` process of its own, which answers the lake's inbox and ends
-/// (`node::lead_once` says why it is not the node itself). It is handed the node's `values` (`settings::Line`).
-pub(crate) async fn lead_once(dir: &str, values: &crate::settings::Values) -> anyhow::Result<()> {
+/// (`node::lead_once` says why it is not the node itself). It is handed the node's `values` (`settings::Line`) and the
+/// places it reaches (`reaches`).
+pub(crate) async fn lead_once(dir: &str, values: &crate::settings::Values, reaches: &crate::reaches::Reaches) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut cmd = tokio::process::Command::new(crate::node::exe()?);
     cmd.args(["lead", "--dir", dir]).env_remove("PONDRA_JOB").env_remove("PONDRA_TRIES").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-    let line = crate::settings::Line::of(values).with(crate::store::REACH_VAR, crate::store::reaches()).hand(cmd.as_std_mut()); // (and the keys this node reaches other places with)
+    let line = crate::settings::Line::of(values).with(crate::reaches::REACH_VAR, reaches.handed()).hand(cmd.as_std_mut()); // (and the keys this node reaches other places with)
     let mut child = cmd.spawn()?;
     let mut input = child.stdin.take().expect("a pipe");
     let _ = input.write_all(line.as_bytes()).await; // (one that ended at once says why on its stderr, below)

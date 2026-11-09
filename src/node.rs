@@ -139,7 +139,7 @@ impl crate::lifecycle::Lifecycle for Native {
     fn one_off(&self) -> bool { self.guest }
     fn owns_process(&self) -> bool { !hosted() }
     fn program(&self) -> anyhow::Result<PathBuf> { exe() }
-    fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir, &self.settings)) }
+    fn lead_elsewhere<'a>(&'a self, dir: &'a str, reaches: &'a crate::reaches::Reaches) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir, &self.settings, reaches)) }
     fn movable(&self) -> bool { self.host.as_ref().is_some_and(Host::movable) }
     fn move_lake(&self, m: crate::lifecycle::Move) -> anyhow::Result<()> {
         let sent = self.host.as_ref().is_some_and(|h| h.moves.send(m).is_ok());
@@ -187,7 +187,7 @@ impl crate::lifecycle::Lifecycle for PageLife {
     fn one_off(&self) -> bool { false }
     fn owns_process(&self) -> bool { true } // (the page's worker is its own: no host shares it)
     fn program(&self) -> anyhow::Result<PathBuf> { anyhow::bail!("a page has no pondra program to start") }
-    fn lead_elsewhere<'a>(&'a self, dir: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+    fn lead_elsewhere<'a>(&'a self, dir: &'a str, _: &'a crate::reaches::Reaches) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move { anyhow::bail!("a page leads its own lake only, not {dir}") })
     }
 }
@@ -249,15 +249,15 @@ pub fn exe() -> anyhow::Result<PathBuf> {
 /// A node never leads another lake itself: that lake's catalog writer would outlive the moment in the node, and a
 /// later leader of it would fence it out.
 #[cfg(feature = "doors")]
-pub async fn lead_once(dir: &str, values: &crate::settings::Values) -> anyhow::Result<()> {
+pub async fn lead_once(dir: &str, values: &crate::settings::Values, reaches: &crate::reaches::Reaches) -> anyhow::Result<()> {
     // (another process would lead a lake of its own memory, gone when it ends)
     anyhow::ensure!(!crate::memory_lake::in_memory(dir), "{dir} is in a process's memory, where a lake is made by opening it (pondra.open(), pondra :memory:) and led by that process alone: attach or make a database in a folder or a bucket");
-    run::lead_once(dir, values).await
+    run::lead_once(dir, values, reaches).await
 }
 
 /// A page starts no process, so it leads no lake but its own.
 #[cfg(not(feature = "doors"))]
-pub async fn lead_once(_dir: &str, _values: &crate::settings::Values) -> anyhow::Result<()> {
+pub async fn lead_once(_dir: &str, _values: &crate::settings::Values, _reaches: &crate::reaches::Reaches) -> anyhow::Result<()> {
     Err(crate::codes::coded("0A000", "a page leads no lake: a browser starts no processes (a node leads one in a process of its own)"))
 }
 
@@ -950,7 +950,7 @@ mod tests {
         assert_eq!(code, "57P03");
         assert!(words.contains("a test's restart"), "{words}");
         assert!(restarted.program().is_err() && !restarted.one_off() && restarted.owns_process());
-        let elsewhere = futures::executor::block_on(restarted.lead_elsewhere("s3://b/l")).expect_err("a page leads its own lake only");
+        let elsewhere = futures::executor::block_on(restarted.lead_elsewhere("s3://b/l", &Default::default())).expect_err("a page leads its own lake only");
         assert!(elsewhere.to_string().contains("s3://b/l"), "{elsewhere}");
     }
 }

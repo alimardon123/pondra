@@ -42,6 +42,8 @@ pub mod text;
 // The memory ledger: the one byte-bounded cache every bounded cache of the node uses (`ByteLru`).
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its caches are the lake's)
 mod ledger;
+// How a node reaches lakes on other servers (`Reaches`, kept with the node): read as each store opens.
+pub mod reaches;
 // What an engine or an extension module keeps for one lake, by its type (invariant 301): `Lake::state`.
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (a lake holds them)
 mod lake_state;

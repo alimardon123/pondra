@@ -972,30 +972,29 @@ fn pondra_token(secrets: &[(String, Secret)], endpoint: &str) -> Result<Option<S
     Ok(open(name, secret)?.get("token").cloned())
 }
 
-/// Say how this process reaches the lake at `dir` on another server (`store::Reach`): with the
-/// bucket secret among `secrets` covering it, and its leader at `endpoint` with the pondra secret
-/// covering that.
-pub fn reach_with(secrets: &[(String, Secret)], dir: &str, read_only: bool, endpoint: Option<&str>) -> Result<()> {
-    reach_by(covering(secrets, dir), secrets, dir, read_only, endpoint)
+/// Say how a node reaches the lake at `dir` on another server (`reaches::Reach`, kept in its `reaches`): with the
+/// bucket secret among `secrets` covering it, and its leader at `endpoint` with the pondra secret covering that.
+pub fn reach_with(reaches: &crate::reaches::Reaches, secrets: &[(String, Secret)], dir: &str, read_only: bool, endpoint: Option<&str>) -> Result<()> {
+    reach_by(reaches, covering(secrets, dir), secrets, dir, read_only, endpoint)
 }
 
 /// A branch's base on another server (`branch::load`, `make`), read with the key lent to the branch
 /// for it (`lent`): the one use of a lent key, and only for the base's own folder.
-pub fn reach_base(secrets: &[(String, Secret)], dir: &str, endpoint: Option<&str>) -> Result<()> {
-    reach_by(scoped(secrets.iter().filter(|(_, s)| s.lent), dir), secrets, dir, true, endpoint)
+pub fn reach_base(reaches: &crate::reaches::Reaches, secrets: &[(String, Secret)], dir: &str, endpoint: Option<&str>) -> Result<()> {
+    reach_by(reaches, scoped(secrets.iter().filter(|(_, s)| s.lent), dir), secrets, dir, true, endpoint)
 }
 
-fn reach_by(hit: Option<(String, Secret)>, secrets: &[(String, Secret)], dir: &str, read_only: bool, endpoint: Option<&str>) -> Result<()> {
+fn reach_by(reaches: &crate::reaches::Reaches, hit: Option<(String, Secret)>, secrets: &[(String, Secret)], dir: &str, read_only: bool, endpoint: Option<&str>) -> Result<()> {
     let params = hit.as_ref().map(|(n, s)| open(n, s)).transpose()?;
     let token = endpoint.map(|e| pondra_token(secrets, e)).transpose()?.flatten();
     let secret = hit.map(|(n, _)| n);
-    crate::store::reach_by(dir, crate::store::Reach { read_only, params, endpoint: endpoint.map(str::to_string), token, secret });
+    reaches.by(dir, crate::reaches::Reach { read_only, params, endpoint: endpoint.map(str::to_string), token, secret });
     Ok(())
 }
 
-/// The same, with this lake's secrets.
+/// The same, with this lake's secrets, for its node.
 pub async fn reach(lake: &Lake, dir: &str, read_only: bool, endpoint: Option<&str>) -> Result<()> {
-    reach_with(&list(lake).await?, dir, read_only, endpoint)
+    reach_with(&lake.node.reaches, &list(lake).await?, dir, read_only, endpoint)
 }
 
 /// A place this lake copies itself to or from (a backup's, a restore's: ADR-070), reached with the
@@ -1004,7 +1003,7 @@ pub async fn reach(lake: &Lake, dir: &str, read_only: bool, endpoint: Option<&st
 pub async fn reach_place(lake: &Lake, dir: &str) -> Result<()> {
     let secrets = list(lake).await?;
     if let Some(hit) = covering(&secrets, dir) {
-        reach_by(Some(hit), &secrets, dir, false, None)?;
+        reach_by(&lake.node.reaches, Some(hit), &secrets, dir, false, None)?;
     }
     Ok(())
 }

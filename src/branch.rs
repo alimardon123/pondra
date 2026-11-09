@@ -201,7 +201,7 @@ pub async fn load(lake: &Lake) -> Result<()> {
         };
         for (id, base) in b.lakes {
             if base.read_only {
-                crate::ext::reach_base(&secrets, &base.url, base.endpoint.as_deref())?;
+                crate::ext::reach_base(&lake.node.reaches, &secrets, &base.url, base.endpoint.as_deref())?;
             }
             lake.add_base(&id, &base.url)?;
         }
@@ -226,10 +226,10 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
     crate::ddl::database_name(name)?;
     crate::ddl::not_system(name, "give the branch another name")?; // (before anything is copied)
     let (base, inherited) = base(lake, &of.from).await?;
-    let away = crate::store::reach_of(&base); // (a base on another server: its key and its leader's URL, ADR-058)
+    let away = lake.node.reaches.of(&base); // (a base on another server: its key and its leader's URL, ADR-058)
     let dir = crate::ddl::full(&dir.unwrap_or_else(|| crate::ddl::beside(&lake.url, name)))?;
     ensure!(same_kind(&dir, &base), "a branch lives where its base does: {base} is {}", if crate::store::served(&base) { "a node's lake" } else if base.contains("://") { "in a bucket" } else { "a folder on this machine" });
-    if crate::ddl::has_catalog(&dir).await? {
+    if crate::ddl::has_catalog(&dir, Some(&lake.node.reaches)).await? {
         ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name} CLONE {})", of.from);
         return Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None }, &crate::auth::Principal::node().scope)).await; // (an ATTACH plans nothing)
     }
@@ -279,7 +279,7 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
         Ok(v) => v,
         Err(e) => {
             // (nothing half made stays: the lake made for it, and the pins)
-            let _ = crate::ddl::delete_lake(&dir).await;
+            let _ = crate::ddl::delete_lake(&dir, Some(&lake.node.reaches)).await;
             for (b, key) in pinned {
                 let _ = unpin_in(lake, &b, &dir, key.as_deref()).await;
             }
@@ -512,7 +512,7 @@ async fn drop_as(lake: &Lake, name: &str, if_exists: bool) -> Result<()> {
     // (attached here, or beside this lake on its server, not yet attached to this node)
     let attached = lake.attached.read().unwrap().iter().find(|(n, _)| *n == name).map(|(_, l)| l.url.clone());
     let url = attached.unwrap_or_else(|| crate::ddl::beside(&lake.url, name));
-    if !crate::ddl::has_catalog(&url).await? {
+    if !crate::ddl::has_catalog(&url, Some(&lake.node.reaches)).await? {
         ensure!(if_exists, "no database {name}");
         return Ok(());
     }
@@ -548,7 +548,7 @@ pub async fn pins(lake: &Lake) -> Result<Option<(u64, u64)>> {
 pub async fn sweep(lake: &Lake) -> Result<()> {
     let now = crate::log::now_ms();
     for (key, p) in lake.cat.scan::<Pin>("pn/", "pn0").await? {
-        if p.at_ms + 3_600_000 < now && !crate::ddl::has_catalog(&p.lake).await.unwrap_or(true) {
+        if p.at_ms + 3_600_000 < now && !crate::ddl::has_catalog(&p.lake, Some(&lake.node.reaches)).await.unwrap_or(true) {
             lake.cat.commit(vec![], &[key]).await?;
         }
     }
@@ -626,7 +626,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     }
     ensure!(lake.cat.scan_raw("t/", "t0").await?.is_empty(), "{} holds tables: a branch is made into a new database", lake.url);
     for b in m.lakes.values().filter(|b| b.read_only) {
-        crate::ext::reach_base(&m.secrets, &b.url, b.endpoint.as_deref())?; // (its key and its leader, before it is read)
+        crate::ext::reach_base(&lake.node.reaches, &m.secrets, &b.url, b.endpoint.as_deref())?; // (its key and its leader, before it is read)
     }
     let base = Lake::open(&m.base, false, false, lake.node.clone()).await.with_context(|| format!("opening {}", m.base))?;
     let id = id_of(&m.base);

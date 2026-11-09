@@ -1914,60 +1914,14 @@ impl Tail {
     }
 }
 
-/// How this process reaches a lake on another server (ADR-058): the settings of the bucket key it
-/// is read with (a secret's, `ext::build`; None: the environment's), whether nothing here may write
-/// it, and where its leader is asked (a URL, with a TYPE pondra secret's token).
-#[derive(Clone, Default, Debug, Serialize, Deserialize)]
-pub struct Reach {
-    pub read_only: bool,
-    pub params: Option<BTreeMap<String, String>>,
-    pub endpoint: Option<String>,
-    pub token: Option<String>,
-    pub secret: Option<String>, // (the bucket secret's name: who may use it reads the lake here, `users::across`)
-}
-
-crate::per_node!(static REACH: std::sync::RwLock<BTreeMap<String, Reach>> = std::sync::RwLock::new(BTreeMap::new()));
-
-/// Say how `url` (a lake) is reached. Asked again (an attachment and a branch of it in one
-/// process), what the new one leaves out is kept, and read-only stays read-only.
-pub fn reach_by(url: &str, r: Reach) {
-    let mut all = REACH.write().unwrap();
-    let old = all.remove(url.trim_end_matches('/')).unwrap_or_default();
-    let read_only = old.read_only || r.read_only;
-    all.insert(url.trim_end_matches('/').to_string(), Reach { read_only, params: r.params.or(old.params), endpoint: r.endpoint.or(old.endpoint), token: r.token.or(old.token), secret: r.secret.or(old.secret) });
-}
-
-/// What this process knows of how to reach other places, for a process it starts to lead one of them
-/// for a moment (`node::lead_once`): it holds the same keys, so a backup in another bucket is written
-/// with the secret that reaches it (ADR-070).
-pub const REACH_VAR: &str = "PONDRA_REACH";
-
-pub fn reaches() -> String { serde_json::to_string(&*REACH.read().unwrap()).unwrap_or_default() }
-
-/// The places the process that started this one could reach (`REACH_VAR`), as it reached them.
-pub fn inherit() {
-    let Some(text) = crate::env::get(REACH_VAR) else { return };
-    match serde_json::from_str::<BTreeMap<String, Reach>>(&text) {
-        Ok(all) => all.into_iter().for_each(|(url, r)| reach_by(&url, r)),
-        Err(e) => eprintln!("{REACH_VAR}: {e}"),
-    }
-}
-
-/// How `url`, or a lake it is in, is reached (the longest registered prefix: `url` itself, or a
-/// path under it).
-pub fn reach_of(url: &str) -> Option<Reach> {
-    let url = url.trim_end_matches('/');
-    let all = REACH.read().unwrap();
-    all.iter().filter(|(k, _)| url.strip_prefix(k.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/')))
-        .max_by_key(|(k, _)| k.len()).map(|(_, r)| r.clone())
-}
-
 /// Open a lake's object store. For a bucket (`s3://`, `gs://`, `az://`, `abfss://`), also returns
 /// the bucket-level client that query scans use (DataFusion addresses objects by their full path
 /// in the bucket). Credentials and endpoints come from the environment, as each cloud's own tools
 /// read them: `AWS_*` (`AWS_ENDPOINT` for R2 and MinIO), `GOOGLE_*`, `AZURE_*`. A lake on another
-/// server is read with the key its attachment names (`reach_of`), and a read-only one refuses writes.
-pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
+/// server is read with the key its attachment names (`reaches`: the node's, `NodeState::reaches`), and a read-only one
+/// refuses writes. With no `reaches` (a place no statement named: a folder, a lake's own bucket before any node opened it),
+/// a bucket is read as the environment says.
+pub fn open_store(url: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<(String, Store, Option<(String, Store)>)> {
     if in_memory(url) {
         let url = url.trim_end_matches('/').to_string();
         let held = crate::memory_lake::store(&url);
@@ -1992,7 +1946,7 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     let (scheme, rest) = url.split_once("://").filter(|(s, _)| BUCKETS.contains(s)).expect("(a bucket: `place` refused any other URL)");
     let (bucket, prefix) = rest.trim_end_matches('/').split_once('/').unwrap_or((rest, ""));
     let root = format!("{scheme}://{bucket}");
-    let reach = reach_of(url);
+    let reach = reaches.and_then(|r| r.of(url));
     let params = reach.as_ref().and_then(|r| r.params.as_ref());
     // Idle connections are dropped after 15 s rather than reused: through proxies and NATs that
     // silently forget idle connections, a reused one hung a PUT for the full 30 s timeout on R2.
@@ -2275,7 +2229,7 @@ impl Lake {
 
     /// `open_polled` and `open_on`: a reader's catalog is `given` when one is, else `kv::reader` on the lake's store.
     async fn open_with(url: &str, writer: bool, streamed: bool, poll: Duration, given: Option<Arc<dyn Kv>>, node: Arc<NodeState>) -> Result<Arc<Lake>> {
-        let (url, store, bucket) = open_store(url)?;
+        let (url, store, bucket) = open_store(url, Some(&node.reaches))?;
         // (what the lake reads and writes, counted into its node's metrics: `Counted`)
         let (store, bucket) = (counted(store, &node.metrics), bucket.map(|(root, whole)| (root, counted(whole, &node.metrics))));
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
@@ -2661,7 +2615,7 @@ impl Lake {
         match (bucket_url(url), &self.cached) {
             (Some(bucket), Some(ours)) if bucket_url(&self.url).as_ref() == Some(&bucket) => ours.add_lake(url[bucket.len()..].trim_start_matches('/')),
             (Some(bucket), _) => {
-                if let Ok((_, _, Some((root, whole)))) = open_store(url) {
+                if let Ok((_, _, Some((root, whole)))) = open_store(url, Some(&self.node.reaches)) {
                     let prefix = url[root.len()..].trim_start_matches('/').to_string();
                     let whole = counted(whole, &self.node.metrics);
                     self.rt.register_object_store(&url::Url::parse(&bucket)?, Arc::new(crate::cache::CachedStore::new(whole, cache_mb() << 20, None, &prefix)));
@@ -2681,7 +2635,7 @@ impl Lake {
             None => anyhow::bail!("no base {id} in this branch"),
         };
         anyhow::ensure!(url.contains("://") || std::path::Path::new(&url).exists(), "this branch's base {url} is gone");
-        let store = counted(open_store(&url)?.1, &self.node.metrics);
+        let store = counted(open_store(&url, Some(&self.node.reaches))?.1, &self.node.metrics);
         if let Some(b) = self.bases.write().unwrap().get_mut(id) {
             b.1 = Some(store.clone());
         }
@@ -4254,7 +4208,7 @@ mod tests {
         assert_eq!(place("pondra://h:1").unwrap(), Place::Served);
         for url in ["https://../../x", "file:///a", "r2://b"] {
             assert_eq!(crate::codes::of(&place(url).unwrap_err()), "22023", "{url} is no place a lake can be");
-            assert!(open_store(url).is_err(), "{url} is refused before a folder is made of it");
+            assert!(open_store(url, None).is_err(), "{url} is refused before a folder is made of it");
         }
     }
 
@@ -4436,7 +4390,7 @@ mod tests {
             fn one_off(&self) -> bool { false }
             fn owns_process(&self) -> bool { false }
             fn program(&self) -> anyhow::Result<std::path::PathBuf> { anyhow::bail!("a test starts no helpers") }
-            fn lead_elsewhere<'a>(&'a self, _: &'a str) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+            fn lead_elsewhere<'a>(&'a self, _: &'a str, _: &'a crate::reaches::Reaches) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
                 Box::pin(async { anyhow::bail!("a test leads no other lake") })
             }
         }

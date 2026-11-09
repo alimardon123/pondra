@@ -53,9 +53,9 @@ pub async fn set_location(lake: &Lake, database: &str, to: &str) -> anyhow::Resu
     crate::ext::owners_only(&to, format!("ALTER DATABASE … SET LOCATION {to}: a path on the server's own disk, which only the node's owner moves a lake into (the `pondra` shell, `pondra sql`, `connect()` of a lake): move it to a bucket (s3://, gs://, az://)"))?; // (the asker's context: `ddl_here` runs in the request)
     crate::backup::apart(lake, &to)?;
     crate::ext::reach_place(lake, &to).await?; // (a bucket: the secret whose scope covers it)
-    let dest = crate::store::counted(crate::store::open_store(&to)?.1, &lake.node.metrics); // (its requests the node's: `Counted`)
+    let dest = crate::store::counted(crate::store::open_store(&to, Some(&lake.node.reaches))?.1, &lake.node.metrics); // (its requests the node's: `Counted`)
     refuse_torn(&dest, &to).await?; // (a move that didn't finish there: named, before the place is called holding other things)
-    anyhow::ensure!(crate::backup::empty(&to).await?, "{to} holds other things: move into a new place (or an empty folder)");
+    anyhow::ensure!(crate::backup::empty(&to, Some(&lake.node.reaches)).await?, "{to} holds other things: move into a new place (or an empty folder)");
     let metas: Vec<ObjectMeta> = lake.store.list(None).try_collect().await.context("listing the lake")?; // (before the mark: a failure here leaves the place as it was)
     // The mark goes first of the copies, alone (`Create`: a mark already there is another move's). From here on,
     // whatever stops this move leaves a place refused by name, never a copy that looks like a lake.
@@ -182,7 +182,7 @@ fn prune_empty(dir: &FsPath) {
 /// taken away there, and the lake in memory let go.
 pub async fn settle(m: &crate::lifecycle::Move) -> anyhow::Result<()> {
     let from = crate::memory_lake::held(&m.from).context("the lake to move is no longer in memory")?;
-    let dest = crate::store::open_store(&m.to)?.1;
+    let dest = crate::store::open_store(&m.to, None)?.1; // (the node is stopped: its place is reached as the environment says, as its next start reaches it)
     if let Err(e) = settle_into(&from, &dest, m).await {
         // (a failed second pass leaves the lake in memory, whole, and nothing of the move at the target: or its
         // mark, when the target can't be cleared either, which refuses the place by name)
@@ -250,7 +250,7 @@ mod tests {
     /// A folder of this test's, not made yet (`open_store` makes it), and its store: a move's target.
     fn target(name: &str) -> (PathBuf, Store) {
         let folder = std::env::temp_dir().join(format!("pondra-move-{name}-{}", uuid::Uuid::new_v4().simple()));
-        let (_, store, _) = crate::store::open_store(folder.to_str().unwrap()).unwrap();
+        let (_, store, _) = crate::store::open_store(folder.to_str().unwrap(), None).unwrap();
         (folder, store)
     }
 
