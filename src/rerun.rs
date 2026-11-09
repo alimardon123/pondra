@@ -453,7 +453,7 @@ fn group_keys(plan: &LogicalPlan) -> Vec<String> {
 /// What the rows alone can't keep: the first aggregate that needs every row of its group
 /// (`median`, a DISTINCT, an ordered `string_agg`, …), as "median() needs every row of a group".
 pub fn needs(plan: &LogicalPlan) -> Option<String> {
-    const KEPT: [&str; 13] = ["count", "sum", "min", "max", "avg", "stddev", "stddev_pop", "var", "var_pop", "variance", "bool_and", "bool_or", crate::finish::MOMENTS];
+    const KEPT: [&str; 15] = ["count", "sum", "min", "max", "avg", "stddev", "stddev_pop", "var", "var_pop", "variance", "bool_and", "bool_or", crate::finish::MOMENTS, crate::fvar::MEAN_PARTS, crate::fvar::VAR_PARTS];
     let mut found = None;
     let _ = plan.apply_with_subqueries(|node| {
         if let LogicalPlan::Aggregate(a) = node {

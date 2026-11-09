@@ -36,6 +36,15 @@ pub fn register(ctx: &SessionContext) {
 
 static AVG_OF: std::sync::LazyLock<Arc<ScalarUDF>> = std::sync::LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(AvgOf(Signature::any(2, Volatility::Immutable)))));
 
+/// The type of the average of a DECIMAL whose sum `avg` keeps in `sum` (`quotient_of`): a view's (`fvar::PartsAnswer`).
+pub(crate) fn decimal_mean_type(sum: &DataType) -> Option<DataType> { quotient_of(sum) }
+
+/// Each DECIMAL sum over its count into `to`, as `avg` divides it (`Quotient`): a view's averages (`fvar::PartsAnswer`).
+pub(crate) fn decimal_means(sums: &ArrayRef, counts: &ArrayRef, to: &DataType) -> Result<ArrayRef> {
+    let &DataType::Decimal128(_, s) = sums.data_type() else { return exec_err!("an average's kept sum is a DECIMAL, not {}", sums.data_type()) };
+    Quotient::new(s, to)?.each(sums, counts)
+}
+
 /// `pondra_avg_of(sum, count)`: an average from a sum and a count kept apart, as `avg` answers it (`AvgOf`).
 pub(crate) fn avg_of(sum: datafusion::logical_expr::Expr, count: datafusion::logical_expr::Expr) -> datafusion::logical_expr::Expr {
     datafusion::logical_expr::Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(AVG_OF.clone(), vec![sum, count]))

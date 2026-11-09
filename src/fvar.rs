@@ -215,9 +215,10 @@ impl Moments {
         (self.s2, self.e2) = (self.s2 * DOWN * DOWN, self.e2 * DOWN * DOWN);
     }
 
-    /// Another part's moments added in, in this one's scale.
+    /// Another part's moments added in, in this one's scale. A part with no values is passed over; one whose count came
+    /// to 0 with sums left (a view's change: an UPDATE's new value in, its old one out, `PARTS`) is not.
     fn merge(&mut self, o: &Moments) {
-        if o.n == 0 {
+        if o.n == 0 && o.s1 == 0.0 && o.e1 == 0.0 && o.s2 == 0.0 && o.e2 == 0.0 {
             return;
         }
         if o.big && !self.big {
@@ -606,6 +607,10 @@ fn wide_split(s: i128) -> (f64, f64) {
 #[inline(never)]
 fn wide_double(x: i128) -> f64 { x as f64 }
 
+/// The average of `n` DOUBLEs whose sum is `hi` with the error `lo` (`fsum::add`), as `avg` of them answers it
+/// (`Moments::answer`): None for none. The matcher's DEFINE avg (`matcher.rs`).
+pub(crate) fn double_mean(hi: f64, lo: f64, n: i64) -> Option<f64> { (n > 0).then(|| quotient(hi, error_of(hi, lo), n as f64)) }
+
 /// The average of `n` whole numbers whose exact sum is `s`, as `avg` of them answers it (`whole_answer`): None for none.
 pub(crate) fn whole_mean(s: i128, n: i64) -> Option<f64> { whole_answer(Of::Mean, n, s, 0) }
 
@@ -906,6 +911,263 @@ const EXACT: DataType = DataType::Decimal128(38, 0);
 
 fn exact(sums: Vec<i128>) -> ArrayRef { Arc::new(Decimal128Array::from(sums).with_data_type(EXACT)) }
 
+// A materialized view's averages and variances (`finish.rs`, 11-09 audit M11): the query's own state, as one column.
+
+/// `pondra_mean_parts(x)` and `pondra_var_parts(x)`: what a materialized view keeps of `avg(x)` and of `var(x)` or
+/// `stddev(x)`, as one struct column: the query's own state (`state_fields`), so a view answers as its query does, digit
+/// for digit, however its rows came in. Over its own results it combines them, so it is both what a view's partial rows
+/// hold and how they merge (`query::latest_sql`); a change's old rows are taken back with their counts and sums negated
+/// (`negated_parts`), and a part whose count came to 0 still holds what it changed. Its layout is its argument's: whole
+/// numbers' exact sums (`Wholes`); a DECIMAL's average, its sum at its scale as `avg` keeps it (`avg.rs`); and every
+/// other number's as a DOUBLE's (`Moments`). `pondra_parts_answer(parts, 'avg' | 'var_samp' | 'var_pop' |
+/// 'stddev_samp' | 'stddev_pop')` answers from them.
+pub const MEAN_PARTS: &str = "pondra_mean_parts";
+pub const VAR_PARTS: &str = "pondra_var_parts";
+const PARTS_ANSWER: &str = "pondra_parts_answer";
+
+/// The lake's format from which a view keeps its averages and variances so (`format.rs`): a node from before can't merge them.
+pub const PARTS_FORMAT: u32 = 7;
+
+/// How a view's parts are kept, by its argument's type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Layout {
+    /// As a DOUBLE's state (`state_of`).
+    Doubles,
+    /// Whole numbers' count and exact sums.
+    Wholes,
+    /// A DECIMAL's count and sum, in the type `avg` keeps it (`sum`'s: ten digits more, 38 at most).
+    Decimal(u8, i8),
+}
+
+/// The field a layout's struct is told by.
+const WHOLE: &str = "whole";
+const DECIMAL: &str = "decimal";
+
+fn layout_of(of: Of, t: &DataType) -> Result<Layout> {
+    Ok(match t {
+        DataType::Struct(fields) if fields.iter().any(|f| f.name() == WHOLE) => Layout::Wholes,
+        DataType::Struct(fields) => match fields.iter().find(|f| f.name() == DECIMAL).map(|f| f.data_type()) {
+            Some(&DataType::Decimal128(p, s)) => Layout::Decimal(p, s),
+            _ => Layout::Doubles,
+        },
+        DataType::Null => Layout::Doubles,
+        t if is_whole(t) => Layout::Wholes,
+        &DataType::Decimal128(p, s) if of == Of::Mean => Layout::Decimal((p + 10).min(38), s),
+        t if t.is_numeric() => Layout::Doubles,
+        t => return datafusion::common::plan_err!("{} takes numbers, not {t}", if of == Of::Mean { MEAN_PARTS } else { VAR_PARTS }),
+    })
+}
+
+/// A layout's fields: the query's state columns (`state_fields`), named plainly, in their order.
+fn parts_fields(of: Of, layout: Layout) -> datafusion::arrow::datatypes::Fields {
+    let f = |name: &str, t: DataType| Field::new(name, t, true);
+    let fields = match (layout, of) {
+        (Layout::Wholes, Of::Mean) => vec![f("count", DataType::Int64), f(WHOLE, EXACT)],
+        (Layout::Wholes, _) => vec![f("count", DataType::Int64), f(WHOLE, EXACT), f("squares", EXACT)],
+        (Layout::Decimal(p, s), _) => vec![f("count", DataType::Int64), f(DECIMAL, DataType::Decimal128(p, s))],
+        (Layout::Doubles, Of::Mean) => vec![f("count", DataType::Int64), f("sum", DataType::Float64), f("sum error", DataType::Float64)],
+        (Layout::Doubles, _) => vec![
+            f("count", DataType::Int64),
+            f("scaled", DataType::Boolean),
+            f("sum", DataType::Float64),
+            f("sum error", DataType::Float64),
+            f("squares", DataType::Float64),
+            f("squares error", DataType::Float64),
+            f("alike", DataType::Float64),
+        ],
+    };
+    fields.into()
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Parts {
+    of: Of,
+    signature: Signature,
+}
+
+impl AggregateUDFImpl for Parts {
+    fn name(&self) -> &str { if self.of == Of::Mean { MEAN_PARTS } else { VAR_PARTS } }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, types: &[DataType]) -> Result<DataType> { Ok(DataType::Struct(parts_fields(self.of, layout_of(self.of, &types[0])?))) }
+
+    fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        let t = args.expr_fields[0].data_type();
+        Ok(Box::new(PartsOf { of: self.of, layout: layout_of(self.of, t)?, merging: matches!(t, DataType::Struct(_)), m: Moments::default(), n: 0, s1: 0, s2: 0 }))
+    }
+
+    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        let layout = layout_of(self.of, args.input_fields[0].data_type())?;
+        Ok(parts_fields(self.of, layout).iter().map(|f| Arc::new(Field::new(format_state_name(args.name, f.name()), f.data_type().clone(), true))).collect())
+    }
+}
+
+/// One group's parts: a DOUBLE's moments (`m`), or whole numbers' or a DECIMAL's count and exact sums.
+#[derive(Debug)]
+struct PartsOf {
+    of: Of,
+    layout: Layout,
+    /// Fed its own results (a view's rows merged), not values.
+    merging: bool,
+    m: Moments,
+    n: i64,
+    s1: i128,
+    s2: i128,
+}
+
+impl PartsOf {
+    /// Parts given as columns (a struct's, or the state's), row by row; a NULL row is none.
+    fn merge(&mut self, columns: &[ArrayRef], valid: Option<&datafusion::arrow::buffer::NullBuffer>) {
+        let n = columns[0].as_primitive::<Int64Type>();
+        let exact = |c: usize, i: usize| { let a = columns[c].as_primitive::<Decimal128Type>(); if a.is_valid(i) { a.value(i) } else { 0 } };
+        for i in (0..n.len()).filter(|&i| valid.is_none_or(|v| v.is_valid(i)) && n.is_valid(i)) {
+            match self.layout {
+                Layout::Doubles => self.m.merge(&moments_at(self.of, columns, i)),
+                Layout::Wholes | Layout::Decimal(..) => {
+                    self.n += n.value(i);
+                    self.s1 = self.s1.wrapping_add(exact(1, i)); // (wrapping, as `sum` and `avg`'s kept sum do)
+                    if self.layout == Layout::Wholes && self.of != Of::Mean {
+                        self.s2 = self.s2.wrapping_add(exact(2, i));
+                    }
+                }
+            }
+        }
+    }
+
+    fn columns(&self) -> Vec<ArrayRef> {
+        match self.layout {
+            Layout::Doubles => state_of(self.of, &[self.m]),
+            Layout::Wholes => {
+                let mut c: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![self.n])), exact(vec![self.s1])];
+                if self.of != Of::Mean {
+                    c.push(exact(vec![self.s2]));
+                }
+                c
+            }
+            Layout::Decimal(p, s) => vec![Arc::new(Int64Array::from(vec![self.n])), Arc::new(Decimal128Array::from(vec![self.s1]).with_data_type(DataType::Decimal128(p, s)))],
+        }
+    }
+}
+
+impl Accumulator for PartsOf {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        let v = &values[0];
+        if self.merging {
+            let s = v.as_struct();
+            self.merge(s.columns(), s.nulls());
+            return Ok(());
+        }
+        match self.layout {
+            Layout::Doubles => {
+                let squares = self.of != Of::Mean;
+                for x in cast(v, &DataType::Float64)?.as_primitive::<Float64Type>().iter().flatten() {
+                    self.m.put(x, squares);
+                }
+            }
+            Layout::Wholes => {
+                for x in cast(v, &DataType::Int64)?.as_primitive::<Int64Type>().iter().flatten() {
+                    let x = i128::from(x);
+                    (self.n, self.s1, self.s2) = (self.n + 1, self.s1 + x, self.s2 + x * x);
+                }
+            }
+            Layout::Decimal(..) => {
+                for x in v.as_primitive::<Decimal128Type>().iter().flatten() {
+                    (self.n, self.s1) = (self.n + 1, self.s1.wrapping_add(x));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        self.merge(states, None);
+        Ok(())
+    }
+
+    fn state(&mut self) -> Result<Vec<ScalarValue>> { self.columns().iter().map(|c| ScalarValue::try_from_array(c, 0)).collect() }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        let s = datafusion::arrow::array::StructArray::new(parts_fields(self.of, self.layout), self.columns(), None);
+        Ok(ScalarValue::Struct(Arc::new(s)))
+    }
+
+    fn size(&self) -> usize { size_of::<Self>() }
+}
+
+/// A view's parts taken back (a change's old rows, `views::negated`): their counts and sums negated, the rest kept (a
+/// scale, the one value all of them are).
+pub fn negated_parts(a: &ArrayRef) -> anyhow::Result<ArrayRef> {
+    let s = a.as_struct();
+    let neg = |c: &ArrayRef| datafusion::arrow::compute::kernels::numeric::neg(c);
+    let columns = s.fields().iter().zip(s.columns()).map(|(f, c)| match f.name().as_str() {
+        "scaled" | "alike" => Ok(c.clone()),
+        _ => neg(c),
+    }).collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(datafusion::arrow::array::StructArray::new(s.fields().clone(), columns, s.nulls().cloned())))
+}
+
+/// What `pondra_parts_answer` works out: an average, or a variance or standard deviation.
+fn answer_of(kind: &str) -> Option<Of> {
+    Some(match kind {
+        "avg" => Of::Mean,
+        "var_samp" => Of::Var { sample: true, root: false },
+        "var_pop" => Of::Var { sample: false, root: false },
+        "stddev_samp" => Of::Var { sample: true, root: true },
+        "stddev_pop" => Of::Var { sample: false, root: true },
+        _ => return None,
+    })
+}
+
+/// `pondra_parts_answer(parts, kind)`: a view's answer from its parts (`MEAN_PARTS`, `VAR_PARTS`), as the query's: a
+/// DOUBLE's from its moments (`Moments::answer`), whole numbers' from their exact sums (`whole_answer`), and a DECIMAL's
+/// average as `avg` divides it (`avg::decimal_means`), in its type.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct PartsAnswer(Signature);
+
+impl datafusion::logical_expr::ScalarUDFImpl for PartsAnswer {
+    fn name(&self) -> &str { PARTS_ANSWER }
+    fn signature(&self) -> &Signature { &self.0 }
+
+    fn return_type(&self, types: &[DataType]) -> Result<DataType> {
+        match layout_of(Of::Mean, &types[0])? {
+            Layout::Decimal(p, s) => crate::avg::decimal_mean_type(&DataType::Decimal128(p, s)).ok_or_else(|| datafusion::common::plan_datafusion_err!("{PARTS_ANSWER}: no average of DECIMAL({p}, {s})")),
+            _ => Ok(DataType::Float64),
+        }
+    }
+
+    fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> Result<datafusion::logical_expr::ColumnarValue> {
+        use datafusion::logical_expr::ColumnarValue;
+        let ColumnarValue::Scalar(ScalarValue::Utf8(Some(kind))) = &args.args[1] else { return internal_err!("{PARTS_ANSWER} takes what to answer as text") };
+        let Some(of) = answer_of(kind) else { return internal_err!("{PARTS_ANSWER}: no answer {kind}") };
+        let parts = args.args[0].to_array(args.number_rows)?;
+        let s = parts.as_struct();
+        let layout = layout_of(of, parts.data_type())?;
+        let n = s.column(0).as_primitive::<Int64Type>();
+        let row = |i: usize| s.is_valid(i) && n.is_valid(i);
+        let out: ArrayRef = match layout {
+            Layout::Decimal(..) => crate::avg::decimal_means(s.column(1), s.column(0), args.return_field.data_type())?,
+            Layout::Wholes => {
+                let exact = |c: usize, i: usize| s.columns().get(c).map_or(0, |a| a.as_primitive::<Decimal128Type>().value(i));
+                Arc::new((0..s.len()).map(|i| row(i).then(|| whole_answer(of, n.value(i), exact(1, i), exact(2, i))).flatten()).collect::<Float64Array>())
+            }
+            Layout::Doubles => {
+                let state = if of == Of::Mean { Of::Mean } else { Of::Var { sample: true, root: false } }; // (what the state holds: a mean's, or a variance's)
+                Arc::new((0..s.len()).map(|i| row(i).then(|| moments_at(state, s.columns(), i).answer(of)).flatten()).collect::<Float64Array>())
+            }
+        };
+        Ok(ColumnarValue::Array(out))
+    }
+}
+
+/// Adds `pondra_mean_parts`, `pondra_var_parts` and `pondra_parts_answer` to a session.
+pub fn register_parts(ctx: &SessionContext) {
+    use datafusion::logical_expr::{ScalarUDF, Volatility};
+    for of in [Of::Mean, Of::Var { sample: true, root: false }] {
+        ctx.register_udaf(AggregateUDF::from(Parts { of, signature: Signature::any(1, Volatility::Immutable) }));
+    }
+    ctx.register_udf(ScalarUDF::new_from_impl(PartsAnswer(Signature::any(2, Volatility::Immutable))));
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,6 +1368,57 @@ mod tests {
 
     /// Integers of 32 bits or fewer go in as they are, no CAST in the plan, and answer exactly; DISTINCT, a frame that
     /// slides, a BIGINT and a NULL answer as before.
+    /// A view's parts (`MEAN_PARTS`, `VAR_PARTS`), made of its rows a part at a time, an UPDATE's change among them (its
+    /// new rows in, its old ones out: a count of 0 that still changes the sums) and merged, answer what the query answers
+    /// over the rows as they are, digit for digit: DOUBLEs, small integers, BIGINTs, DECIMALs, and a group of one value.
+    #[tokio::test]
+    async fn a_views_parts_answer_as_its_query_does() -> Result<()> {
+        use datafusion::arrow::record_batch::RecordBatch;
+        let ctx = crate::engine::session(SessionConfig::new().with_target_partitions(4), Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()));
+        let rows = |from: &str, d: &str| format!(
+            "SELECT v, v % 3 AS g, {d} AS d, (v % 1000)::INT AS i, v * 1000003 AS b, CAST(v AS DECIMAL(12, 2)) / 7 AS m, CAST(v % 3 AS DOUBLE) / 10 AS c FROM {from}");
+        let (base, changed) = ("(1.0e9 + CAST(v AS DOUBLE) / 3)", "(CASE WHEN v <= 30 THEN 2.0e9 - CAST(v AS DOUBLE) / 7 ELSE 1.0e9 + CAST(v AS DOUBLE) / 3 END)");
+        for (t, d) in [("w", base), ("now", changed)] {
+            ctx.sql(&format!("CREATE TABLE {t} AS {}", rows("generate_series(1, 3000) AS t(v)", d))).await?.collect().await?;
+        }
+        let parts = |of: &str| format!(
+            "SELECT g, pondra_mean_parts(d) AS md, pondra_var_parts(d) AS vd, pondra_mean_parts(i) AS mi, pondra_var_parts(i) AS vi, \
+             pondra_mean_parts(b) AS mb, pondra_var_parts(b) AS vb, pondra_mean_parts(m) AS mm, pondra_var_parts(m) AS vm, pondra_var_parts(c) AS vc FROM ({of}) GROUP BY g");
+        let batches = |sql: String| { let ctx = ctx.clone(); async move { ctx.sql(&sql).await?.collect().await } };
+        let mut kept: Vec<RecordBatch> = vec![];
+        for p in ["v <= 1000", "v > 1000 AND v <= 2200", "v > 2200"] {
+            kept.extend(batches(parts(&format!("SELECT * FROM w WHERE {p}"))).await?);
+        }
+        let merged = |t: &str| format!("SELECT g, pondra_mean_parts(md) AS md, pondra_var_parts(vd) AS vd, pondra_mean_parts(mi) AS mi, pondra_var_parts(vi) AS vi, \
+             pondra_mean_parts(mb) AS mb, pondra_var_parts(vb) AS vb, pondra_mean_parts(mm) AS mm, pondra_var_parts(vm) AS vm, pondra_var_parts(vc) AS vc FROM {t} GROUP BY g");
+        // (the change: its rows' new values in, and their old ones taken back, negated as a view takes them back, merged
+        // into one part a group: a count of 0)
+        let mut change = batches(parts("SELECT * FROM now WHERE v <= 30")).await?;
+        for b in &batches(parts("SELECT * FROM w WHERE v <= 30")).await? {
+            let columns = b.columns().iter().enumerate().map(|(i, c)| if i == 0 { Ok(c.clone()) } else { negated_parts(c) }).collect::<anyhow::Result<Vec<_>>>().map_err(|e| datafusion::common::DataFusionError::External(e.into()))?;
+            change.push(RecordBatch::try_new(b.schema(), columns)?);
+        }
+        let schema = change[0].schema();
+        ctx.register_batch("change_parts", datafusion::arrow::compute::concat_batches(&schema, &change)?)?;
+        let change = batches(merged("change_parts")).await?;
+        let counts: Vec<i64> = change.iter().flat_map(|b| b.column(2).as_struct().column(0).as_primitive::<Int64Type>().values().to_vec()).collect();
+        assert!(counts.len() == 3 && counts.iter().all(|&n| n == 0), "the change's parts count none: {counts:?}");
+        kept.extend(change);
+        ctx.register_batch("kept_parts", datafusion::arrow::compute::concat_batches(&schema, &kept)?)?;
+        let merged = merged("kept_parts");
+        let view = format!(
+            "SELECT g, pondra_parts_answer(md, 'avg') AS a, pondra_parts_answer(vd, 'var_samp') AS b, pondra_parts_answer(vd, 'stddev_pop') AS c, \
+             pondra_parts_answer(mi, 'avg') AS d, pondra_parts_answer(vi, 'var_pop') AS e, pondra_parts_answer(mb, 'avg') AS f, pondra_parts_answer(vb, 'stddev_samp') AS h, \
+             pondra_parts_answer(mm, 'avg') AS j, arrow_typeof(pondra_parts_answer(mm, 'avg')) AS k, pondra_parts_answer(vm, 'var_samp') AS l, pondra_parts_answer(vc, 'var_samp') AS o \
+             FROM ({merged}) ORDER BY g");
+        let query = "SELECT g, avg(d) AS a, var_samp(d) AS b, stddev_pop(d) AS c, avg(i) AS d, var_pop(i) AS e, avg(b) AS f, stddev_samp(b) AS h, \
+                     avg(m) AS j, arrow_typeof(avg(m)) AS k, var_samp(m) AS l, var_samp(c) AS o FROM now GROUP BY g ORDER BY g";
+        let (got, want) = (pretty_format_batches(&batches(view).await?)?.to_string(), pretty_format_batches(&batches(query.into()).await?)?.to_string());
+        assert_eq!(got, want);
+        assert!(want.contains("| 0.0 |") || want.contains("| 0   |") || want.contains(" 0.0 "), "a group of one value: 0\n{want}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sql_takes_small_integers_as_they_are() -> Result<()> {
         let ctx = crate::engine::session(SessionConfig::new().with_target_partitions(4), Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()));
