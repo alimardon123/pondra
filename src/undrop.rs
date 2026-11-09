@@ -207,8 +207,13 @@ pub async fn expired(lake: &Lake, now: u64) -> Result<Vec<String>> {
     Ok(lake.cat.scan::<Times>(PREFIX, "dk0").await?.into_iter().filter(|(_, t)| now >= t.at_ms.saturating_add(t.keep_ms)).map(|(k, _)| k).collect())
 }
 
-/// The statement that brings it back, as `pondra.dropped` says it.
-pub fn statement(kind: &str, name: &str) -> String { format!("UNDROP {} {}", kind.to_uppercase(), crate::objects::name_sql(name)) }
+/// The statement that brings it back, as `pondra.dropped` says it: a deleted file's names its path, in quotes.
+pub fn statement(kind: &str, name: &str) -> String {
+    match kind {
+        "file" => format!("UNDROP FILE '{}'", name.replace('\'', "''")),
+        _ => format!("UNDROP {} {}", kind.to_uppercase(), crate::objects::name_sql(name)),
+    }
+}
 
 // A dropped database: its folder stays as it was, under a mark at its root (`LAKE_MARK`), out of every listing of
 // databases (`ddl::lakes_in`) and refused to every open by name, until UNDROP DATABASE takes the mark off, or a new
@@ -492,7 +497,7 @@ mod tests {
             assert!(matches!(parse(sql), Some(Stmt::Ddl(ds)) if matches!(&ds[..], [Ddl::UndropKept { kind: k, .. }] if k == kind)), "{sql}");
         }
         match parse("UNDROP SEQUENCE s") {
-            Some(Stmt::Invalid(e)) => assert!(e.contains("EXTERNAL TABLE, FUNCTION") && e.contains("DATABASE") && e.contains("SCHEMA") && e.contains("pondra.dropped"), "{e}"),
+            Some(Stmt::Refused("0A000", e)) => assert!(e.contains("EXTERNAL TABLE, FUNCTION") && e.contains("DATABASE") && e.contains("SCHEMA") && e.contains("pondra.dropped"), "{e}"),
             _ => panic!("UNDROP SEQUENCE: refused, naming the kinds"),
         }
     }

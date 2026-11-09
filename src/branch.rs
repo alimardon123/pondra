@@ -772,11 +772,11 @@ fn listed(meta: &mut TableMeta, id: &str) {
     (meta.garbage, meta.garbage_deletes, meta.replaced, meta.shares, meta.publish) = Default::default();
 }
 
-/// The base's workspace files (not their kept versions), to copy.
+/// The base's workspace files (not their kept versions, nor the notes of deleted ones, whose versions aren't copied), to copy.
 async fn workspace(base: &Lake) -> Result<Vec<String>> {
     use futures::TryStreamExt;
     let all: Vec<_> = base.store.list(Some(&object_store::path::Path::from("files"))).try_collect().await?;
-    Ok(all.into_iter().map(|o| o.location.to_string()).filter(|p| !p.starts_with("files/.versions/")).collect())
+    Ok(all.into_iter().map(|o| o.location.to_string()).filter(|p| ![crate::files::VERSIONS, crate::files::DELETED].iter().any(|d| p.starts_with(d))).collect())
 }
 
 async fn copy(from: &Lake, to: &Lake, path: String) -> Result<()> {

@@ -393,6 +393,8 @@ pub fn asks(stmt: &Stmt) -> (String, Vec<Action>) {
         Stmt::Ddl(ds) if ds.iter().any(|d| matches!(d, crate::ddl::Ddl::Entry { .. }) || crate::statements::undrops_entry(d)) => (String::new(), Action::of_role(crate::statements::role(ds)).into_iter().collect()),
         Stmt::Ddl(_) => (String::new(), vec![Action::Define]),
         Stmt::CopyTo(..) => (String::new(), vec![Action::Export]),
+        // (as DELETE /files took it: a writer's, and a `.py`, code a node runs, an admin's)
+        Stmt::UndropFile(p) => (String::new(), vec![if crate::auth::py_name(p) { Action::RunCode } else { Action::Write }]),
         // (a statement written wrong, or a temporary object of another session's: its own answer says why)
         _ => (String::new(), vec![]),
     }
