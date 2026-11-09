@@ -297,7 +297,7 @@ pub enum Ddl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         connection: Option<String>, // (`ATTACH shop`: a connection's tables, its url, type and options read from it)
     }, // another engine's tables (`ext.rs`)
-    DropSecret { name: String, if_exists: bool },
+    DropSecret { name: String, if_exists: bool, #[serde(default, skip_serializing_if = "std::ops::Not::not")] purge: bool }, // (PURGE: not kept, and the copies earlier drops kept go too)
     FetchExtension { name: String, from: String, version: Option<String> }, // INSTALL name FROM 'file or URL': the node that got it reads the file, then sends the record (`extension.rs`)
     InstallExtension { name: String, record: crate::extension::Installed }, // the record of an extension, kept by the leader (ADR-075 §6: `extension.rs`)
     UninstallExtension { name: String, if_exists: bool }, // UNINSTALL name: the leader drops its record (`extension.rs`)
@@ -514,15 +514,18 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
                 return Err(crate::codes::coded("2BP01", format!("schema {name} isn't empty ({}): drop them first, or DROP SCHEMA {name} CASCADE", [&views[..], &tables[..], &routines[..]].concat().join(", "))));
             }
             // (each kept in its own record, and named in the schema's, so UNDROP SCHEMA brings them back with it)
-            let (mut with, mut keep_ms) = (vec![], KEEP_MS);
+            let (mut with, mut lost, mut keep_ms) = (vec![], vec![], KEEP_MS);
             for r in &routines {
                 let kind = lake.cat.get::<crate::expander::Routine>(&crate::routines::key(r)).await?.map(|r| r.kind_name());
                 crate::routines::drop(lake, r, true).await?;
                 with.extend(kind.map(|k| (k.to_string(), r.clone())));
             }
             for v in &views {
-                let (_, kind) = drop_view(lake, v, true, true).await?; // (a topic's view isn't kept)
-                with.extend(kind.map(|k| (k.to_string(), v.clone())));
+                match drop_view(lake, v, true, true).await? {
+                    (_, Some(kind)) => with.push((kind.to_string(), v.clone())),
+                    (out, None) if out["dropped"] == true => lost.push(j!({"kind": "view", "name": v, "why": "a topic's view isn't kept (its offsets would start over): make it again from its topic"})),
+                    _ => {}
+                }
             }
             for t in tables.iter().filter(|t| !views.iter().any(|v| *t == v || **t == format!("{v}_final"))) {
                 let meta = lake.cat.get::<TableMeta>(&table_key(t)).await?;
@@ -532,9 +535,14 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
                     with.push(("table".to_string(), t.clone()));
                 }
             }
-            let kept = crate::undrop::aside_with(lake, "schema", &name, &[schema_key(&name)], with, keep_ms).await?;
+            let mut kept = crate::undrop::kept_as_long(lake, &with, keep_ms).await?; // (its views and routines as long as it)
+            kept.extend(crate::undrop::aside_with(lake, "schema", &name, &[schema_key(&name)], with, lost.clone(), keep_ms).await?);
             lake.cat.commit(kept, &[schema_key(&name)]).await?;
-            Ok(j!({"schema": name, "dropped": true}))
+            let mut out = j!({"schema": name, "dropped": true});
+            if !lost.is_empty() {
+                out["not_kept"] = j!(lost); // (what UNDROP SCHEMA won't bring back, named by both)
+            }
+            Ok(out)
         }
         Ddl::DropTable { name, if_exists, purge, made_by } => drop_table(lake, &name, if_exists, purge, made_by.as_deref()).await,
         Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?, scope).await,
@@ -710,7 +718,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
         Ddl::CreateRoutine { name, routine, replace } => crate::routines::create(lake, &name, routine, replace).await,
         Ddl::DropRoutine { name, if_exists } => crate::routines::drop(lake, &name, if_exists).await,
         Ddl::CreateSecret { name, params, replace, if_not_exists } => crate::ext::create(lake, &name, params, replace, if_not_exists).await,
-        Ddl::DropSecret { name, if_exists } => crate::ext::drop(lake, &name, if_exists).await,
+        Ddl::DropSecret { name, if_exists, purge } => crate::ext::drop(lake, &name, if_exists, purge).await,
         Ddl::InstallExtension { name, record } => crate::extension::install(lake, &name, record).await,
         Ddl::UninstallExtension { name, if_exists } => crate::extension::uninstall(lake, &name, if_exists).await,
         Ddl::FetchExtension { name, .. } => anyhow::bail!("INSTALL {name} FROM is read by the node the statement reached, not the leader"),
