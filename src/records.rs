@@ -20,6 +20,16 @@ pub struct Prefix {
     pub holds: &'static str,
 }
 
+/// The lake's own keys: sessions' signing key, and the nodes' key (`users::KEYS`, whose they are). The catalog reads the
+/// name: a commit of them alone is quiet (`store::quiet`), and a backup keeps its own (`frozen::may_write`).
+pub const LAKE_KEYS: &str = "z/auth";
+
+/// The node's own records, which its writer appends (`history::writer`) and no remembered answer reads: the statements'
+/// history and the audit log (`history::TABLE`, `audit::TABLE`, whose they are). The catalog reads their names: a commit
+/// only to them is quiet (`store::quiet`).
+pub const HISTORY: &str = "pondra$history";
+pub const AUDIT: &str = "pondra$audit";
+
 /// Where an installed extension's records go: `ex/<extension>/…`.
 pub const EXTENSIONS: &str = "ex/";
 

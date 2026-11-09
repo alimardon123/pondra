@@ -13,7 +13,6 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::disk_manager::{DiskManager, DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::spill_file::{SpillFile, TempFileFactory};
-use datafusion::prelude::{SessionConfig, SessionContext};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
@@ -1808,6 +1807,36 @@ fn no_room(bytes: u64, gb: Option<f64>) -> anyhow::Error {
     crate::codes::coded("53100", format!("The shuffle needed {more:.1} MB more on disk than there is room for. {way}"))
 }
 
+/// What a feature does as each lake opens, once its caches are charged and before its writes start (`Lake::open`): a
+/// branch opens its bases, so the files it lists there are read (`branch::load`, ADR-047). The feature registers it, and
+/// the lake doesn't know whose it is.
+#[derive(Default)]
+pub struct OpenHooks(Vec<(&'static str, OpenHook)>);
+
+/// One of `OpenHooks`: the lake as it opens.
+pub type OpenHook = for<'a> fn(&'a Lake) -> futures::future::BoxFuture<'a, Result<()>>;
+
+impl OpenHooks {
+    pub fn add(&mut self, name: &'static str, hook: OpenHook) {
+        self.0.push((name, hook));
+    }
+}
+
+impl crate::registry::Section for OpenHooks {
+    const NAME: &'static str = "open hooks";
+
+    fn check(&self, _: &crate::registry::Registry) -> std::result::Result<(), String> {
+        match self.0.iter().enumerate().find(|(i, (name, _))| self.0[..*i].iter().any(|(n, _)| n == name)) {
+            Some((_, (name, _))) => Err(format!("two open hooks are named {name}")),
+            None => Ok(()),
+        }
+    }
+}
+
+/// `_base/<id>/rest` as (id, rest): a branch's path to a file of its base, which the lake reads there (`Lake::full`,
+/// ADR-047; `branch::rebase` makes one).
+pub fn base_path(path: &str) -> Option<(&str, &str)> { path.strip_prefix("_base/")?.split_once('/') }
+
 pub struct Lake {
     pub url: String, // absolute local dir or "s3://bucket/prefix" (gs://, az://, abfss:// too; memory://id in this process)
     pub store: Store,
@@ -1833,7 +1862,7 @@ pub struct Lake {
     pub owner_key: std::sync::OnceLock<String>, // the key of the program that started this process's node on the lake (`Auth::owner_key`): what its owner's tasks are signed with (`runs::signed`)
     pub sequences: tokio::sync::Mutex<HashMap<String, crate::seq::Block>>, // the sequences' values this node hands out (`seq::next`)
     bases: std::sync::RwLock<BTreeMap<String, (String, Option<Store>)>>, // a branch's bases (ADR-047): id -> place, and its store once read
-    sessions: Mutex<std::collections::HashMap<usize, datafusion::execution::SessionState>>, // (`session_with`'s, made once a partition count)
+    pub(crate) sessions: Mutex<std::collections::HashMap<usize, datafusion::execution::SessionState>>, // (`engine.rs`'s `Lake::session_with`'s, made once a partition count)
     me: std::sync::Weak<Lake>,
     /// The node it is open in, or the program or test that opened it (`node_state.rs`): its lifecycle, which its catalog's
     /// fence and its vital loops' failures stop or restart, and its doors' drain.
@@ -2381,16 +2410,19 @@ impl Lake {
         let cat = cat?;
         let format = crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
+        cat.frozen.store(cat.get::<serde_json::Value>(crate::frozen::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
         let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Arc::new(Mutex::new(crate::query::tails())), kept, disk, groups: Arc::new(crate::serve::Groups::new(cache_mb() << 19)), hot: Arc::new(crate::hot::Hot::new(memory, node.machine.ram())), manifests: crate::manifest::kept(), format, log: Default::default(), states: Default::default(), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone(), node });
         for (name, cache) in lake.caches() {
             ledger.charge(name, Arc::downgrade(&cache)); // (they give memory back when the node needs it: the one watch takes it, `oom.rs`)
         }
         ledger.charge("files", Arc::downgrade(&crate::cache::outside())); // (the process's, of files outside the lakes)
         crate::oom::wake();
-        crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
+        for (_, opens) in &crate::registry::get().section::<OpenHooks>().0 {
+            opens(&lake).await?; // (a branch's bases, so its files listed there are read: ADR-047)
+        }
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
-            crate::spawns::spawn(Lake::commits(Arc::downgrade(&lake), writes, lake.node.life.clone())); // (weak: a lake opened in a process goes when its last handle does)
+            let (weak, n) = (Arc::downgrade(&lake), lake.node.clone());
+            lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move { Lake::commits(weak, writes, n.life.clone(), &n).await }); // (weak: a lake opened in a process goes when its last handle does)
         }
         Ok(lake)
     }
@@ -2402,10 +2434,10 @@ impl Lake {
     /// us out) has an unknown outcome: restart and rejoin; the restart reloads the state.
     /// Both loops hold the lake weakly: the writes' sender is the lake's own (`Catalog::writes`), so
     /// a strong hold would keep a lake opened in a process (a backup taken in it) for ever.
-    async fn commits(me: std::sync::Weak<Self>, mut writes: mpsc::UnboundedReceiver<Write>, life: Life) {
+    async fn commits(me: std::sync::Weak<Self>, mut writes: mpsc::UnboundedReceiver<Write>, life: Life, node: &crate::node_state::NodeState) {
         let (to_bucket, mut in_bucket) = mpsc::unbounded_channel::<(Arc<dyn Written>, u64)>();
         let (lake, lives) = (me.clone(), life.clone());
-        crate::spawns::spawn(async move {
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             while let Some((handle, id)) = in_bucket.recv().await {
                 if let Err(e) = handle.durable().await {
                     eprintln!("catalog commit failed: {e}");
@@ -2588,8 +2620,8 @@ impl Lake {
     /// runtime too: a query here reads its files).
     pub fn attach(&self, name: &str, other: Arc<Lake>) -> Result<()> {
         let name = &name.to_lowercase(); // (as SQL reads an unquoted name)
-        crate::ddl::check(name)?;
-        anyhow::ensure!(*name != crate::ddl::lake_name(self), "this lake is called {name} already: attach the other under another name");
+        crate::naming::check(name)?;
+        anyhow::ensure!(*name != crate::naming::lake_name(self), "this lake is called {name} already: attach the other under another name");
         match (bucket_url(&other.url), &self.cached) {
             (Some(bucket), Some(ours)) if bucket_url(&self.url).as_ref() == Some(&bucket) => ours.add_lake(other.url[bucket.len()..].trim_start_matches('/')), // (one bucket: our reader, its files cached too)
             (Some(bucket), _) => {
@@ -2606,33 +2638,12 @@ impl Lake {
         Ok(())
     }
 
-    /// A fresh SQL session on the shared runtime (`partitions()` of them).
-    pub fn session(&self) -> SessionContext {
-        self.session_with(partitions())
-    }
-
-    /// A session with a fixed number of partitions: 1 for point lookups, where splitting the work
-    /// costs more than it saves and many queries run at once. Its functions, planners and rules
-    /// are the same for every query, so they are made once (`made`) and copied; each copy gets
-    /// catalogs of its own, so the tables a query registers are its alone.
-    pub fn session_with(&self, partitions: usize) -> SessionContext {
-        spill_room(); // (the spill disk's room as it is now: `Spills` looked at it once, when the first spill made the disk)
-        let state = self.sessions.lock().unwrap().entry(partitions).or_insert_with(|| self.made(partitions).state()).clone();
-        let catalog = datafusion::execution::SessionStateDefaults::default_catalog(state.config(), state.table_factories(), state.runtime_env());
-        let ctx = crate::engine::with_catalog(state, Arc::new(catalog));
-        crate::files::register(&ctx, self.arc()); // files('…'), file_read(path) (here, not in what is kept: the lake would keep itself)
-        crate::seq::register(&ctx, self.arc()); // nextval, currval, setval
-        crate::ext::register_secrets(&ctx, self.arc()); // secrets()
-        crate::extension::register(&ctx, self.arc()); // extensions() (SHOW EXTENSIONS)
-        ctx
-    }
-
     /// A session made from nothing, with everything every query's session has: every function set in the registry
     /// (`engine::session`). On a page every plan it makes runs its partitions in the page's task, as the page's own
     /// session's do (`in_task::planned`): a page has no runtime to start a partition's task on, and a plan of one
     /// partition still merges more than one below it. Plans made by hand from it (`fresh.rs`) are planned by it too.
-    fn made(&self, partitions: usize) -> SessionContext {
-        let config = SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::text::PUBLIC);
+    pub(crate) fn made(&self, partitions: usize) -> datafusion::prelude::SessionContext {
+        let config = datafusion::prelude::SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::naming::lake_name(self), crate::text::PUBLIC);
         let ctx = crate::engine::session(config, self.rt.clone());
         #[cfg(target_arch = "wasm32")]
         let ctx = crate::in_task::planned(ctx);
@@ -2689,7 +2700,7 @@ impl Lake {
         if path.contains("://") {
             return path.to_string(); // (a file outside the lake: `ext.rs`)
         }
-        if let Some((id, rest)) = crate::branch::split(path) {
+        if let Some((id, rest)) = base_path(path) {
             if let Some((url, _)) = self.bases.read().unwrap().get(id) {
                 return format!("{url}/{rest}"); // (a branch's file in its base: ADR-047)
             }
@@ -2743,7 +2754,7 @@ impl Lake {
     /// Write an object only if it does not exist yet: data is never overwritten.
     pub async fn put(&self, path: &str, bytes: impl Into<Bytes>) -> Result<()> {
         if self.cat.frozen.load(Relaxed) {
-            return Err(crate::backup::refused(Some(&self.url))); // (a backup's objects are its runs': ADR-070)
+            return Err(crate::frozen::refused(Some(&self.url))); // (a backup's objects are its runs': ADR-070)
         }
         let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
         let bytes: Bytes = bytes.into(); // (a `Vec` or `Bytes` as it is: a page's 232 MB file was held twice while it was put)
@@ -2763,7 +2774,7 @@ impl Lake {
                 return Ok(bytes.into());
             }
         }
-        let bytes = match crate::branch::split(path) {
+        let bytes = match base_path(path) {
             Some((id, rest)) => self.base_store(id)?.get(&Path::from(rest)).await?.bytes().await?, // (a branch's base's: ADR-047)
             None => self.store.get(&Path::from(path)).await?.bytes().await?,
         };
@@ -2776,7 +2787,7 @@ impl Lake {
     /// Where `path` is read whole, past the caches: this lake's bucket, or a branch's base's (a
     /// backup copies through it, a piece at a time).
     pub fn reader(&self, path: &str) -> Result<(Store, Path)> {
-        Ok(match crate::branch::split(path) {
+        Ok(match base_path(path) {
             Some((id, rest)) => (self.base_store(id)?, Path::from(rest)),
             None => (self.store.clone(), Path::from(path)),
         })
@@ -2799,7 +2810,7 @@ impl Lake {
     pub async fn replace(&self, path: &str, bytes: impl Into<Bytes>, expect: &str) -> Result<String> {
         anyhow::ensure!(replaceable(path), "only the lake's files (files/…) are replaced");
         if self.cat.frozen.load(Relaxed) {
-            return Err(crate::backup::refused(Some(&self.url))); // (ADR-070)
+            return Err(crate::frozen::refused(Some(&self.url))); // (ADR-070)
         }
         static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()); // (a store with no conditional put: this node's saves one at a time)
         let _one = ONE.lock().await;
@@ -2833,7 +2844,7 @@ impl Lake {
     pub async fn remove_file(&self, path: &str) -> Result<()> {
         anyhow::ensure!(replaceable(path), "only the lake's files (files/…) are removed this way");
         if self.cat.frozen.load(Relaxed) {
-            return Err(crate::backup::refused(Some(&self.url))); // (ADR-070)
+            return Err(crate::frozen::refused(Some(&self.url))); // (ADR-070)
         }
         self.store.head(&Path::from(path)).await?; // (not there: an error that says so)
         self.store.delete(&Path::from(path)).await?;
@@ -2872,40 +2883,6 @@ impl Lake {
             c.keep(table, n, rows.clone());
         }
         Ok(rows)
-    }
-
-    /// Rows of `table` a file commit gives the log's readers (`Segment::files`): its files' rows as
-    /// they were then, with their system columns (stored names), from the `from`-th on and `rows`
-    /// of them at most; `removed`: the rows of the files it took out.
-    pub async fn filed_rows(&self, seg: &Segment, table: &str, removed: bool, from: u64, rows: u64) -> Result<Vec<RecordBatch>> {
-        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
-        let meta = crate::sys::with_sys(&meta);
-        let schema = meta.schema()?;
-        let (ctx, end, mut at, mut out) = (self.session(), from.saturating_add(rows), 0u64, vec![]);
-        for f in if removed { &filed.removed } else { &filed.added } {
-            let (lo, hi) = (at.max(from), (at + f.rows).min(end));
-            if lo < hi {
-                out.extend(crate::lake_scan::file_rows(self, &ctx, f, &meta, &schema, crate::lake_scan::Pick::Range(lo - at, hi - at)).await?.collect().await?);
-            }
-            at += f.rows;
-            if at >= end {
-                break;
-            }
-        }
-        out.iter().map(|b| crate::query::conform(b, &schema)).collect()
-    }
-
-    /// Rows of `table` a file commit deleted by position (`Filed::deleted`), with their system
-    /// columns (stored names): each file's rows at the places its new deletes name.
-    pub async fn deleted_rows(&self, seg: &Segment, table: &str) -> Result<Vec<RecordBatch>> {
-        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
-        let meta = crate::sys::with_sys(&meta);
-        let schema = meta.schema()?;
-        let mut out = vec![];
-        for (f, deletes) in &filed.deleted {
-            out.extend(crate::adopt::rows_deleted(self, &meta, f, deletes, &schema).await?);
-        }
-        out.iter().map(|b| crate::query::conform(b, &schema)).collect()
     }
 
     pub async fn delete(&self, path: &str) {
@@ -3156,7 +3133,7 @@ fn moves_rights(marks: Option<&crate::records::Rights>, d: &Delta) -> bool {
 
 /// The node's own records, which its writer appends (`history::writer`) and no remembered answer
 /// reads (`App::remembers`): the statements' history and the audit log.
-const RECORDS: [&str; 2] = [crate::history::TABLE, crate::audit::TABLE];
+const RECORDS: [&str; 2] = [crate::records::HISTORY, crate::records::AUDIT];
 
 /// A commit no remembered answer depends on (`Catalog::version`): only the records' rows, their
 /// producers' progress and their tables' entries (`history.rs`, every second on every node; the
@@ -3179,7 +3156,7 @@ fn quiet(d: &Delta) -> bool {
     let hex = |id: &str| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit());
     let expiry = |k: &str| k.starts_with(crate::log::EXPIRY);
     let unread = |k: &str| {
-        k == crate::users::KEYS
+        k == crate::records::LAKE_KEYS
             || RECORDS.iter().any(|t| k.strip_prefix("t/") == Some(t) || k.strip_prefix("p/").and_then(|p| p.strip_prefix(t.trim_start_matches("pondra$"))).and_then(|p| p.strip_prefix('-')).is_some_and(hex))
     };
     let marked = d.puts.iter().any(|(k, _)| k == QUIET);
@@ -3324,7 +3301,7 @@ impl Catalog {
     async fn writer(kv: Arc<dyn Kv>, since: Instant, node: &NodeState) -> Result<Self> {
         let mut cat = Self::new(kv, node);
         if traced_commits() {
-            Stages::sample_lag(Arc::downgrade(&cat.stages)); // (a leader's commits are what it times)
+            Stages::sample_lag(Arc::downgrade(&cat.stages), node); // (a leader's commits are what it times)
         }
         cat.replicas = crate::env::value("PONDRA_REPLICAS");
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
@@ -4081,8 +4058,8 @@ impl Catalog {
     pub async fn write(&self, puts: Vec<(String, Vec<u8>)>, deletes: &[String]) -> Result<oneshot::Receiver<()>> {
         let (true, Some(writes)) = (self.kv.is_writer(), &self.writes) else { bail!("read-only node") };
         crate::metrics::add(&self.metrics.catalog_writes, (puts.len() + deletes.len()) as u64); // (records put or deleted)
-        if self.frozen.load(Relaxed) && !crate::backup::may_write(puts.iter().map(|(k, _)| k).chain(deletes)) {
-            return Err(crate::backup::refused(None)); // (whatever door a write came through: ADR-070)
+        if self.frozen.load(Relaxed) && !crate::frozen::may_write(puts.iter().map(|(k, _)| k).chain(deletes)) {
+            return Err(crate::frozen::refused(None)); // (whatever door a write came through: ADR-070)
         }
         let t0 = Instant::now();
         let puts = listed(self, puts).await?;
@@ -4293,8 +4270,8 @@ impl Stages {
     }
 
     /// How late a 10 ms sleep wakes, as the `lag` stage, while the catalog is (weak: it ends with it).
-    fn sample_lag(stages: Weak<Stages>) {
-        crate::spawns::spawn(async move {
+    fn sample_lag(stages: Weak<Stages>, node: &crate::node_state::NodeState) {
+        node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             loop {
                 let t = Instant::now();
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4484,14 +4461,14 @@ mod tests {
         let id = "0123456789abcdef0123456789abcdef";
         let seg = |table: &str| serde_json::json!({"path": "", "parts": {table: [[0, 10, 1]]}, "ts_ms": 1}).to_string();
         let quiet_of = |puts: &[(&str, &str)]| quiet(&Delta { id: 9, puts: puts.iter().map(|(k, v)| (k.to_string(), Bytes::from(v.to_string()))).collect(), deletes: vec![] });
-        let audit = seg(crate::audit::TABLE);
-        let (history, user) = (seg(crate::history::TABLE), seg("r_t"));
+        let audit = seg(crate::records::AUDIT);
+        let (history, user) = (seg(crate::records::HISTORY), seg("r_t"));
         let (audit_p, history_p) = (format!("p/audit-{id}"), format!("p/history-{id}"));
         assert!(quiet_of(&[("t/pondra$audit", "{}"), ("c", "9")]), "the audit log's table made");
         assert!(quiet_of(&[("d/3", "x"), ("s/3", &audit), (&audit_p, "1"), ("n", "4"), ("c", "9")]), "the audit log's rows");
         assert!(quiet_of(&[("d/4", "x"), ("s/4", &history), (&history_p, "1"), ("n", "5"), ("c", "9")]), "the history's rows");
         assert!(quiet_of(&[("n", "4"), ("b", "2"), (QUIET, "true"), ("c", "9")]), "a row-id block taken");
-        assert!(quiet_of(&[(crate::users::KEYS, "{}"), ("c", "9")]), "the lake's own keys");
+        assert!(quiet_of(&[(crate::records::LAKE_KEYS, "{}"), ("c", "9")]), "the lake's own keys");
         assert!(!quiet_of(&[("n", "4"), ("b", "2"), ("c", "9")]), "unmarked numbers are loud");
         assert!(!quiet_of(&[("t/r_t", "{}"), ("c", "9")]), "a table's entry");
         assert!(!quiet_of(&[("d/3", "x"), ("s/3", &user), ("p/sql:1", "1"), ("n", "4"), ("c", "9")]), "a table's rows");

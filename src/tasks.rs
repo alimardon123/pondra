@@ -54,6 +54,22 @@ pub fn producers(name: &str, task: &Task) -> Vec<String> {
     }
 }
 
+/// The streaming tasks as readers of the log (`pins`): the segments a task's shard still has to read stay (tasks skip runs
+/// with nothing new, so one with nothing new holds nothing back).
+pub fn readers() -> crate::pins::Pin {
+    crate::pins::Pin { name: "tasks", held: |_| Box::pin(async { Ok(None) }), lapse: None, sweep: None, floor: Some(|l, f| Box::pin(floor(l, f))) }
+}
+
+async fn floor(lake: &Lake, mut floor: u64) -> Result<u64> {
+    for (key, task) in lake.cat.scan::<Task>("k/", "k0").await? {
+        for producer in producers(&key[2..], &task) {
+            let done = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
+            floor = crate::pins::behind(lake, done, floor, |s| s.rows_of(&task.source) > 0).await?;
+        }
+    }
+    Ok(floor)
+}
+
 /// What a lake keeps for its streaming tasks (invariant 301): the shards of them this node has run, for `/stats`.
 #[derive(Default)]
 pub struct Kept {

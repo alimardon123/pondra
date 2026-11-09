@@ -1182,7 +1182,7 @@ async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan:
 /// An answer already whole, sent in pieces as `send_rest` sends a plan's (`statement::answer`): its first piece is written
 /// now, the rest on the queries' runtime as its client reads them. `held`'s memory goes when the last piece is written,
 /// or when the client goes (the body that holds the pieces counts the request for a node told to stop: `server::pieces`).
-pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<MemoryReservation>) -> Result<Handed> {
+pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<MemoryReservation>, node: &crate::node_state::NodeState) -> Result<Handed> {
     let mut enc = crate::answer::Encoding::new(format);
     let mut parts: std::collections::VecDeque<RecordBatch> = crate::answer::pieces(batches.into_iter().map(|b| enc.lean(b))).into();
     let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1195,7 +1195,7 @@ pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<Me
     };
     let first = enc.step(Some(&piece))?;
     let done = ended.clone();
-    crate::spawns::aside(async move {
+    node.tasks.aside(crate::auth::caller(), async move {
         let _held = held;
         let written = match write_all(&mut enc, &tx, parts).await {
             Ok(_) => step_to(&mut enc, &tx, None).await,
@@ -1896,6 +1896,44 @@ pub fn first_table(sql: &str) -> Result<String> {
     match &Parser::parse_sql(&GenericDialect {}, sql)?[..] {
         [Statement::Query(q)] => first(q).ok_or_else(|| anyhow::anyhow!("a view is one SELECT … FROM <table> …")),
         _ => bail!("a view is one SELECT … FROM <table> …"),
+    }
+}
+
+/// The rows a file commit gave or took, as the log's readers (feeds, CDC, Kafka) read them: worked out by a query of the
+/// commit's files, so the engine's, not the catalog's that keeps the lake.
+impl Lake {
+    /// Rows of `table` a file commit gives the log's readers (`Segment::files`): its files' rows as
+    /// they were then, with their system columns (stored names), from the `from`-th on and `rows`
+    /// of them at most; `removed`: the rows of the files it took out.
+    pub async fn filed_rows(&self, seg: &Segment, table: &str, removed: bool, from: u64, rows: u64) -> Result<Vec<RecordBatch>> {
+        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
+        let meta = crate::sys::with_sys(&meta);
+        let schema = meta.schema()?;
+        let (ctx, end, mut at, mut out) = (self.session(), from.saturating_add(rows), 0u64, vec![]);
+        for f in if removed { &filed.removed } else { &filed.added } {
+            let (lo, hi) = (at.max(from), (at + f.rows).min(end));
+            if lo < hi {
+                out.extend(crate::lake_scan::file_rows(self, &ctx, f, &meta, &schema, crate::lake_scan::Pick::Range(lo - at, hi - at)).await?.collect().await?);
+            }
+            at += f.rows;
+            if at >= end {
+                break;
+            }
+        }
+        out.iter().map(|b| conform(b, &schema)).collect()
+    }
+
+    /// Rows of `table` a file commit deleted by position (`Filed::deleted`), with their system
+    /// columns (stored names): each file's rows at the places its new deletes name.
+    pub async fn deleted_rows(&self, seg: &Segment, table: &str) -> Result<Vec<RecordBatch>> {
+        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
+        let meta = crate::sys::with_sys(&meta);
+        let schema = meta.schema()?;
+        let mut out = vec![];
+        for (f, deletes) in &filed.deleted {
+            out.extend(crate::adopt::rows_deleted(self, &meta, f, deletes, &schema).await?);
+        }
+        out.iter().map(|b| conform(b, &schema)).collect()
     }
 }
 

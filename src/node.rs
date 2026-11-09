@@ -7,7 +7,7 @@
 //! `Lifecycle` every lake it opens is handed), the program's own path (`exe`) and the lead of a lake nobody leads
 //! (`lead_once`).
 //! The doors half is `node/run.rs`.
-use crate::{app, backup, branch, ddl, ext, feeds, format, learned, log, panics, python, replica, runs, spmd, store, terms, users, views};
+use crate::{app, backup, branch, ddl, ext, feeds, format, learned, log, python, replica, runs, spmd, store, terms, users, views};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, atomic::{AtomicBool, Ordering::SeqCst}};
@@ -310,9 +310,9 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     ddl::sync(&l, lives).await?;
     lake.node.trace("attachments synced");
     if lives {
-        every(Duration::from_secs(1), move || { let l = l.clone(); async move { ddl::sync(&l, true).await } });
+        every(&lake.node, Duration::from_secs(1), move || { let l = l.clone(); async move { ddl::sync(&l, true).await } });
         let l = lake.clone();
-        crate::spawns::task(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
+        lake.node.tasks.spawn_node(crate::spawns::Vital::Own, async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
     }
     // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
     // a new leader first commits what they hold from the previous one.
@@ -414,7 +414,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     let lake = app.lake.clone();
     if leader && lives {
         let (l, c, tokens) = (app.lake.clone(), app.members.clone(), app.auth.on()); // (beside serving, not before it: C5)
-        panics::own(async move {
+        app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             let made = users::kept(&l).await == "none";
             match users::make_keys(&l).await {
                 Err(e) => eprintln!("the lake's keys (sessions', the nodes'): {e:#}"), // (sessions' signing key, and the nodes' own: `users.rs`)
@@ -450,7 +450,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
             }
         });
         let (l, c) = (app.lake.clone(), app.members.clone());
-        panics::own(async move {
+        app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             // (a branch's pins in bases on other servers, renewed while it is used here: `branch::lapse`)
             while c.is_leader() {
                 branch::renew(&l).await;
@@ -462,7 +462,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         let l = app.lake.clone();
         let node = app.lake.node.clone();
         let closing = app.lake.node.drain.closing();
-        panics::own(async move {
+        app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             // (a follower's catalog shows the leader's keys once the leader has flushed them)
             let mut said = false;
             for _ in 0..600 {
@@ -501,7 +501,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         // Iceberg tables here at once: `iceberg::Published::location`. Only then: the pass loads every
         // published table's manifests, and a lake that stayed where it was has nothing new for it)
         let (a, l) = (app.clone(), lake.clone());
-        crate::spawns::task(crate::auth::as_node(async move {
+        lake.node.tasks.spawn_node(crate::spawns::Vital::Own, async move {
             if !crate::iceberg::elsewhere(&l).await {
                 return;
             }
@@ -509,14 +509,14 @@ pub fn keep(app: &crate::app::App, s: &Start) {
             if let Err(e) = crate::delta::publish_all(&l).await {
                 eprintln!("publishing at start: {e:#}");
             }
-        }));
+        });
     }
     if lives && app.log.is_some() {
         feeds::start(app.clone()); // (other clusters' topics feeding views: none, no work)
     }
     if let (true, Some(seq), Some(log)) = (lives, &app.seq, &app.log) {
         let (lake, log, seq, lock) = (lake.clone(), log.clone(), seq.clone(), app.lock.clone()); // windows, sessions and matches past the watermark, emitted once
-        panics::own(async move {
+        app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 if let Err(e) = views::emit_all(&lake, &log, &seq, &lock).await {
@@ -528,13 +528,13 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     // Finished shuffles are forgotten here, and what they spilled deleted.
     if lives {
         let l = lake.clone();
-        every(Duration::from_secs(30), move || { let l = l.clone(); async move { spmd::gc(&l); Ok(()) } });
+        every(&app.lake.node, Duration::from_secs(30), move || { let l = l.clone(); async move { spmd::gc(&l); Ok(()) } });
     }
     if leader && lives {
         // The leader's SSD tier learns of objects other nodes wrote from its own commits (and its hot
         // columns of the files they replaced).
         let l = lake.clone();
-        panics::own(async move {
+        app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             let (_, mut commits) = l.cat.subscribe();
             loop {
                 match commits.recv().await {
@@ -554,7 +554,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         // round's own commit, so what it waits past is the version the round left.
         if s.tier_secs > 0.0 {
             let (a, mut hwm, period) = (app.clone(), lake.hwm.subscribe(), Duration::from_secs_f64(s.tier_secs));
-            panics::own(async move {
+            app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
                 loop {
                     let (start, before) = (tokio::time::Instant::now(), *hwm.borrow_and_update());
                     let failed = a.tier_all(0).await.inspect_err(|e| eprintln!("background job failed: {e:#}")).is_err();
@@ -573,13 +573,13 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         }
         // …and any table as soon as a million rows wait in the log (bounds memory and read cost).
         let a = app.clone();
-        every(if s.tier_secs == 0.0 { Duration::ZERO } else { Duration::from_secs(1) }, move || { let a = a.clone(); async move { a.tier_all(1_000_000).await.map(|_| ()) } });
+        every(&app.lake.node, if s.tier_secs == 0.0 { Duration::ZERO } else { Duration::from_secs(1) }, move || { let a = a.clone(); async move { a.tier_all(1_000_000).await.map(|_| ()) } });
         // Persist the catalog's memtable every few seconds when something changed, so a
         // restart (or a new leader, reader or `pondra sql`) replays only a few seconds of
         // catalog WAL. Not more often: each is a level-0 file that SlateDB's compactor
         // has to keep up with, and writes stall when too many pile up.
         let l = lake.clone();
-        every(Duration::from_secs(5), move || { let l = l.clone(); async move { l.cat.checkpoint().await } });
+        every(&app.lake.node, Duration::from_secs(5), move || { let l = l.clone(); async move { l.cat.checkpoint().await } });
         if lake.cat.replicas > 1 {
             replica::members(lake.clone(), app.members.clone());
         }
@@ -592,12 +592,12 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         // How far our own catalog view is: all a reader has, and a follower's fallback.
         if lives {
             let l = lake.clone();
-            every(Duration::from_millis(250), move || { let l = l.clone(); async move { l.refresh().await } });
+            every(&app.lake.node, Duration::from_millis(250), move || { let l = l.clone(); async move { l.refresh().await } });
         }
     }
     if !reader && lives {
         let (a, max_wait) = (app.clone(), Duration::from_millis(s.task_ms));
-        panics::own(async move {
+        app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
             let mut commits = a.lake.hwm.subscribe();
             loop {
                 let _ = tokio::time::timeout(max_wait, commits.changed()).await; // new rows, or time's up
@@ -616,7 +616,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         runs::mark_stopped(app.clone()); // (runs whose node stopped under them: `stopped`)
         if leader {
             let l = app.lake.clone(); // (what it inherited, replayed from the WAL, into every node's view)
-            crate::spawns::task(async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
+            lake.node.tasks.spawn_node(crate::spawns::Vital::Own, async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
         }
     }
 }
@@ -677,6 +677,7 @@ pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) 
         crate::memory_lake::give(&url, given); // (a kept page's objects stay in its folder when the page closes: `end_page` forgets the URL only)
     }
     let node = crate::node_state::NodeState::new(life.clone());
+    let here = node.clone(); // (what a failed open ends: the tasks it started, `end_page`)
     let store = crate::store::counted(crate::memory_lake::store(&url), &node.metrics); // (its term's claims and marks the page's: `Counted`)
     let lead = if owned { crate::members::Alone::lead_owned(&store, &node.claims).await } else { crate::members::Alone::lead(&store, &node.claims).await };
     let (alone, marks) = match lead {
@@ -702,7 +703,7 @@ pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) 
             Ok(Paged { app, url, term, marks, follow: None, ended: Default::default(), superuser: AtomicBool::new(false), life })
         }
         Err(e) => {
-            end_page(marks, None, lake, &store, term, &url, &node.claims).await; // (a failed open leaves nothing running)
+            end_page(marks, None, lake, &here, &store, term, &url).await; // (a failed open leaves nothing running)
             Err(e)
         }
     }
@@ -711,12 +712,14 @@ pub async fn open_page(store: Option<crate::store::Store>, life: Arc<PageLife>) 
 /// Ends what `open_page` started, as a node's stop does (`node::run::Held::stop` and `Node::stop`): its term's marks, its
 /// loops, its catalog, its term, its lake in memory, and the module's per-node state, so another `open_page` starts
 /// afresh. `Paged::close` and a failed open both end this way.
-async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, lake: Option<Arc<crate::store::Lake>>, store: &crate::store::Store, term: u64, url: &str, claims: &crate::node_state::Claims) {
+async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, lake: Option<Arc<crate::store::Lake>>, node: &crate::node_state::NodeState, store: &crate::store::Store, term: u64, url: &str) {
+    let claims = &node.claims;
     marks.abort(); // (a dropped handle aborts nothing: its mark would land again after the release)
     if let Some(follow) = follow {
         follow.abort(); // (the node's stream ends as the page closes, not at the node's next commit)
     }
-    crate::spawns::abort_all();
+    node.tasks.abort_all();
+    crate::spawns::abort_all(); // (what is still started on the process's list: step 5 piece 7b's second half moves it)
     if let Some(lake) = lake {
         let _ = lake.cat.close().await;
     }
@@ -743,12 +746,12 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lif
     let node = node.trim_end_matches('/').to_string();
     let members: Arc<dyn Members> = Arc::new(crate::members::Joined::new(&node, auth)); // (the page's calls go to this node, with this sign-in: `dial::Joined`)
     let kv: Arc<dyn crate::kv::Kv> = Arc::new(crate::kv::remote::Remote::new(&node, auth));
-    let state = crate::node_state::NodeState::new(life.clone());
-    let marks = crate::spawns::task(async {}); // (a joined page claims no term, so it runs no mark: this task is finished)
+    let marks = crate::spawns::untracked(async {}); // (a joined page claims no term, so it runs no mark: this task is finished)
     let start = Start::default();
     let mut lake = None;
+    let here = crate::node_state::NodeState::new(life.clone()); // (what a failed open ends: the tasks it started, `end_page`)
     let made = async {
-        let l = crate::store::Lake::open_on(&url, true, kv, state.clone()).await?;
+        let l = crate::store::Lake::open_on(&url, true, kv, here.clone()).await?;
         lake = Some(l.clone());
         start_app(l, members, None, &start).await
     }
@@ -778,9 +781,9 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lif
                     }
                 })
             };
-            let follow = crate::spawns::spawn(crate::members::follow(following, open, |_, _| {}, || {}, false)); // (a page relays nothing: its node's feed is its stream)
-            crate::spawns::spawn(crate::page_records::run(&app)); // (the page's own statements go to this node each second: `abort_all` ends it)
-            crate::spawns::spawn(async move {
+            let follow = app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, crate::members::follow(following, open, |_, _| {}, || {}, false)); // (a page relays nothing: its node's feed is its stream)
+            app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, crate::page_records::run(&app)); // (the page's own statements go to this node each second: `abort_all` ends it)
+            app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     let Some(live) = refreshing.upgrade().filter(|_| !refreshed.load(SeqCst)) else { return };
@@ -796,7 +799,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lif
             Ok(Paged { app, url, term: 0, marks, follow: Some(follow), ended, superuser: AtomicBool::new(superuser), life })
         }
         Err(e) => {
-            end_page(marks, None, lake, &store, 0, &url, &state.claims).await; // (a failed open leaves nothing running)
+            end_page(marks, None, lake, &here, &store, 0, &url).await; // (a failed open leaves nothing running)
             Err(e)
         }
     }
@@ -853,13 +856,13 @@ impl Paged {
         let _ = tokio::time::timeout(Duration::from_secs(2), crate::page_records::flush(&app)).await; // (what the page's statements wait to go to its node: once, within 2 s)
         let lake = app.lake.clone();
         drop(app);
-        end_page(marks, follow, Some(lake.clone()), &lake.store, term, &url, &lake.node.claims).await;
+        end_page(marks, follow, Some(lake.clone()), &lake.node, &lake.store, term, &url).await;
     }
 }
 
 /// Run `job` forever, starting every `period` (right away if a run took longer; a zero period
 /// disables it).
-fn every<F, Fut>(period: Duration, job: F)
+fn every<F, Fut>(node: &crate::node_state::NodeState, period: Duration, job: F)
 where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>> + Send,
@@ -867,7 +870,7 @@ where
     if period.is_zero() {
         return;
     }
-    panics::own(async move {
+    node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
         let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
