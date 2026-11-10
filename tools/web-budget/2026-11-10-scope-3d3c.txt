@@ -1,0 +1,7 @@
++3100
+
+M8 piece 3d-3c (#785, step 6): an INSERT's column error, the checks on attached lakes and an external file's store take
+the scope of whoever asks, passed as an argument through about 40 functions, the page's lake among them. Measured on
+CI: the module's brotli 9,316,753 (wasm 59,161,049) against 9,316,279 (wasm 59,152,914) on main with #780, so 474 B
+of brotli (8.1 KB of wasm) for the argument; the rest brings the room above the module back to 3 KB (it was 0.4 KB
+above main's, under the README's 3 KB).
