@@ -846,12 +846,13 @@ pub struct Producers {
     clock: fn() -> u64, // (`now_ms`; a test's own)
     next_check: u64,    // when an expiry key it knows of is due (u64::MAX: none; 0: not looked yet)
     tended: u64,        // its last upkeep (`tend`)
+    unsaved: bool,      // the pass finished with nothing to write: the next commit carries its state (`keyed`)
 }
 
 impl Producers {
     async fn start(lake: &Lake, clock: fn() -> u64) -> Result<Producers> {
         let pass = lake.cat.get::<Pass>(OLD_MARKS).await?.unwrap_or(Pass::Cursor("p/".into()));
-        Ok(Producers { last: HashMap::new(), started: clock(), pass, clock, next_check: 0, tended: 0 })
+        Ok(Producers { last: HashMap::new(), started: clock(), pass, clock, next_check: 0, tended: 0, unsaved: false })
     }
 
     fn now(&self) -> u64 { (self.clock)() }
@@ -871,7 +872,8 @@ impl Producers {
     }
 
     /// What a commit does with producers' marks, `seqs` being the marks it commits (`store::kept_ms`): each gets an
-    /// expiry key, due its window from now. Only those: what is due goes in an upkeep commit of its own (`settle`).
+    /// expiry key, due its window from now. Only those: what is due goes in an upkeep commit of its own (`settle`). The
+    /// old marks' pass that found nothing has its state saved here, with the commit, once.
     fn keyed(&mut self, seqs: &HashMap<String, u64>) -> Vec<(String, Vec<u8>)> {
         let now = self.now();
         let mut puts = vec![];
@@ -882,7 +884,16 @@ impl Producers {
                 self.next_check = self.next_check.min(now + kept);
             }
         }
+        if std::mem::take(&mut self.unsaved) {
+            puts.push((OLD_MARKS.into(), json(&self.pass)));
+        }
         puts
+    }
+
+    /// A lake that takes no commit of the sequencer's (a backup's, `frozen`): no upkeep until it starts again, and a look
+    /// once a minute at most while expiry keys exist (the backup's copies of its source's).
+    fn rest(&mut self) {
+        (self.pass, self.next_check, self.tended, self.unsaved) = (Pass::Done, u64::MAX, self.now(), false);
     }
 
     /// Whether the upkeep (`tend`) has work at `now`: the old marks' pass still going, or an expiry key due (or, once a
@@ -916,7 +927,9 @@ impl Producers {
     ///    made later, so the mark goes at the pass key's time. Only a resend past its window reaches it.
     /// 2. the old marks' pass: the next PER_COMMIT `p/` keys after the cursor get an expiry key due their
     ///    window from now, so marks from before this code expire by the same rule. The cursor goes in the
-    ///    same commit, and a new sequencer resumes from it.
+    ///    same commit, and a new sequencer resumes from it. A pass that found no key and has nothing else to
+    ///    write leaves its state to the next commit (`keyed`): a lake nobody writes to gets no commit of the
+    ///    sequencer's (`backup::own`: a backup's first run takes a place that holds only a new lake's keys).
     /// Returns the puts, and the keys to delete.
     async fn settle(&mut self, lake: &Lake) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>)> {
         let now = self.now();
@@ -965,7 +978,10 @@ impl Producers {
             Some((last, _)) if page.len() == PER_COMMIT => Pass::Cursor(last.clone()),
             _ => Pass::Done,
         };
-        puts.push((OLD_MARKS.into(), json(&self.pass)));
+        match page.is_empty() && puts.is_empty() && dropped.is_empty() {
+            true => self.unsaved = true,
+            false => puts.push((OLD_MARKS.into(), json(&self.pass))),
+        }
         Ok((puts, dropped))
     }
 }
@@ -975,6 +991,10 @@ impl Producers {
 /// 267 writes in one INSERT's commit after 100,000 tables were made: step 5, piece 10g).
 /// Returns what fires once its commit is (None: nothing to write); the sequencer doesn't wait for it.
 async fn tend(lake: &Lake, producers: &mut Producers) -> Result<Option<oneshot::Receiver<()>>> {
+    if crate::frozen::frozen(lake) {
+        producers.rest(); // (a backup takes none of its sequencer's commits: `commit`)
+        return Ok(None);
+    }
     let (mut puts, dropped) = producers.settle(lake).await?;
     if puts.is_empty() && dropped.is_empty() {
         return Ok(None);
@@ -1768,6 +1788,38 @@ mod tests {
         assert_eq!(mark(&lake, "sql:auto-py-old").await, Some(1), "still inside it");
         s.tend(50_000 + retry_ms()).await;
         assert_eq!(mark(&lake, "sql:auto-py-old").await, None, "past it, the due mark goes");
+        done(lake, dir).await
+    }
+
+    /// A lake nobody writes to gets no commit of its sequencer's: the old marks' pass that found nothing leaves its state
+    /// to the first commit (a backup's first run takes a place that holds only a new lake's keys, `backup::own`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lake_nobody_writes_to_gets_no_upkeep_commit() -> Result<()> {
+        let (dir, lake) = fresh().await?;
+        let mut s = Seq::start(&lake, 0).await?;
+        assert_eq!(s.tend(0).await, 0, "the pass found nothing");
+        assert_eq!(s.tend(retry_ms() + 1).await, 0, "nor is anything due");
+        assert_eq!(lake.cat.get::<serde_json::Value>(OLD_MARKS).await?, None, "nothing written");
+        s.send(retry_ms() + 2, &[("sql:auto-py-a-1", 1)]).await;
+        assert_eq!(lake.cat.get::<serde_json::Value>(OLD_MARKS).await?, Some(serde_json::json!("Done")), "the first commit carries the pass's state");
+        let mut again = Seq::start(&lake, retry_ms() + 3).await?; // (a new leader: the pass is done)
+        assert_eq!(again.tend(retry_ms() + 3).await, 0, "the mark isn't keyed a second time");
+        done(lake, dir).await
+    }
+
+    /// A backup's lake (`frozen`) takes no commit of its sequencer's, so its upkeep writes nothing, its marks due or not,
+    /// and isn't due again for a minute: no write refused over and over, no loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_backups_upkeep_writes_nothing() -> Result<()> {
+        let (dir, lake) = fresh().await?;
+        let mut s = Seq::start(&lake, 0).await?;
+        s.tend(0).await;
+        s.send(1, &[("sql:auto-py-a-1", 1)]).await;
+        lake.cat.frozen.store(true, std::sync::atomic::Ordering::Relaxed);
+        let now = retry_ms() + 10;
+        assert_eq!(s.tend(now).await, 0, "nothing written");
+        assert_eq!(mark(&lake, "sql:auto-py-a-1").await, Some(1), "the due mark stays");
+        assert!(s.producers.wait(now, true).is_some_and(|ms| ms >= RECHECK), "a look again in a minute: {:?}", s.producers.wait(now, true));
         done(lake, dir).await
     }
 
