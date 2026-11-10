@@ -187,8 +187,8 @@ fn parsed(r: &Returning) -> Result<Stmt> {
 /// (`write::changes`; a one-row upsert of one key is not one), as a transaction of its own (`txn::alone`).
 async fn write(app: &App, r: &Returning, table: &str, stmt: Stmt, job: Option<String>, files: bool, by: &crate::auth::Principal) -> Result<Value> {
     let leaders = match &stmt {
-        Stmt::InsertInto(t, ..) => crate::write::changes(&app.lake, &Stmt::Insert(t.clone(), String::new())).await?, // (its columns don't decide it)
-        s => crate::write::changes(&app.lake, s).await?,
+        Stmt::InsertInto(t, ..) => crate::write::changes(&app.lake, &Stmt::Insert(t.clone(), String::new()), &by.scope).await?, // (its columns don't decide it)
+        s => crate::write::changes(&app.lake, s, &by.scope).await?,
     };
     if leaders.is_some() && !crate::txn::open() {
         if let Some(j) = &job {

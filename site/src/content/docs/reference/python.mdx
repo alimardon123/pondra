@@ -18,7 +18,7 @@ db = pondra.connect("http://localhost:8080")
 
 | Call | Meaning |
 |---|---|
-| `pondra.connect(target=None, token=None, **options)` | the one way in: a connection to the lake or node `target` names, with its node in this process when it is a lake (below) |
+| `pondra.connect(target=None, token=None, *, settings=None, **options)` | the one way in: a connection to the lake or node `target` names, with its node in this process when it is a lake (below) |
 | `pondra.current()` | the connection `pondra.sql` and its kin use |
 | `pondra.binary()` | the path of the `pondra` executable: `$PONDRA_BIN`, the one pip installed, or the one on `PATH` |
 
@@ -39,6 +39,11 @@ db = pondra.connect("http://localhost:8080")
 A process holds one such node at a time. The same lake connected again is another connection to that node.
 Another lake connected while one is open gets a node of its own beside the process. A node stops with the
 last connection to it, or when Python exits; a folder's or a bucket's lake stays.
+
+`settings` are the connection's own session's, set by name as it opens, as `SET name = 'value'` sets them:
+`pondra.connect("lake", settings={"default_file_format": "parquet"})`. A value `SET` refuses closes the
+connection and is raised. The [settings](/pondra/sql/statements/#settings-and-prepared-statements) a
+session may set are the statements page's; `options` are the node's.
 
 `pondra.local()` and `pondra.open()` still work, with a warning, until 1.0.
 

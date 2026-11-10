@@ -3342,8 +3342,8 @@ impl Catalog {
         // checkpoint: right after the node serves, `main.rs`)
         // The leader too reads the catalog from memory: everything committed, nothing in flight.
         let life = cat.life.clone();
-        let mut all = cat.kv.scan(b"".to_vec()..b"d/".to_vec(), false).await.map_err(|e| fatal(e, &*life))?;
-        all.extend(cat.kv.scan(b"d0".to_vec()..vec![0xff], false).await.map_err(|e| fatal(e, &*life))?);
+        let mut all = cat.kv.scan_whole(b"".to_vec()..b"d/".to_vec()).await.map_err(|e| fatal(e, &*life))?;
+        all.extend(cat.kv.scan_whole(b"d0".to_vec()..vec![0xff]).await.map_err(|e| fatal(e, &*life))?);
         trace_since("the catalog in memory", since);
         let overlay = cat.overlay.get_mut().unwrap();
         for (k, v) in all {
@@ -3600,8 +3600,8 @@ impl Catalog {
         }
         let _pin = self.pin(); // (the streamed changes after `before` stay while we read)
         let before = self.view_now().await?;
-        let mut all = self.kv.scan(b"".to_vec()..b"d/".to_vec(), false).await?;
-        all.extend(self.kv.scan(b"d0".to_vec()..vec![0xff], false).await?);
+        let mut all = self.kv.scan_whole(b"".to_vec()..b"d/".to_vec()).await?;
+        all.extend(self.kv.scan_whole(b"d0".to_vec()..vec![0xff]).await?);
         let after = self.view_now().await?;
         let n = all.get("n").map_or(Ok(1), |v| serde_json::from_slice(v))?;
         let mut o = self.overlay.lock().unwrap();
@@ -4154,11 +4154,11 @@ impl Catalog {
         for h in hooks {
             let mut all: BTreeMap<String, Vec<u8>> = BTreeMap::new();
             for p in h.reads {
-                for (k, v) in self.kv.scan(range_of(p), false).await.map_err(|e| self.fenced(e))? {
+                for (k, v) in self.kv.scan_whole(range_of(p)).await.map_err(|e| self.fenced(e))? {
                     all.extend((h.derive)(&k, &v));
                 }
             }
-            let held = self.kv.scan(range_of(h.records), false).await.map_err(|e| self.fenced(e))?;
+            let held = self.kv.scan_whole(range_of(h.records)).await.map_err(|e| self.fenced(e))?;
             deletes.extend(held.keys().filter(|k| !all.contains_key(*k)).cloned());
             puts.extend(all.into_iter().filter(|(k, v)| held.get(k).is_none_or(|b| b.as_ref() != v.as_slice())).map(|(k, v)| (k, Bytes::from(v))));
         }
@@ -5011,6 +5011,47 @@ pub(crate) mod tests {
         let reader = Lake::open_on(&folder, false, Arc::new(Given(copied)), crate::node_state::NodeState::unhosted()).await?;
         let tables = reader.cat.scan::<TableMeta>("t/", "t0").await?;
         assert_eq!(tables.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec![table_key("t").as_str()]);
+
+        reader.cat.close().await?;
+        writer.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A read of the whole catalog (`Kv::scan_whole`: a node's catalog in memory as it starts) reads in large pieces,
+    /// several at a time, and finds what a plain scan finds: over several flushed files, with entries changed and
+    /// deleted in later ones, on the writer and on a follower that seeds from it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_whole_read_finds_what_a_scan_finds() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-whole-{}", uuid::Uuid::new_v4()));
+        let writer = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let value = |i: usize, round: usize| format!("{{\"round\":{round},\"pad\":\"{}\"}}", "x".repeat(700 + i % 300)).into_bytes();
+        let mut model = BTreeMap::new(); // (what the entries should be)
+        for round in 0..4 {
+            // (each round a flushed file of its own: the later ones change a third of the entries and delete a tenth)
+            let puts: Vec<_> = (0..3000).filter(|i| round == 0 || i % 3 == round % 3).map(|i| (format!("t/w{i:05}"), value(i, round))).collect();
+            let deletes: Vec<String> = (0..3000).filter(|i| round > 0 && i % 10 == round).map(|i| format!("t/w{i:05}")).collect();
+            model.extend(puts.iter().map(|(k, v)| (k.clone(), Bytes::from(v.clone()))));
+            for k in &deletes {
+                model.remove(k);
+            }
+            writer.cat.commit(puts, &deletes).await?;
+            writer.cat.checkpoint().await?;
+        }
+        let ours = |all: BTreeMap<String, Bytes>| all.into_iter().filter(|(k, _)| k.starts_with("t/w")).collect::<BTreeMap<_, _>>();
+        let all = || b"".to_vec()..vec![0xff];
+        let scanned = writer.cat.kv.scan(all(), false).await?;
+        assert_eq!(writer.cat.kv.scan_whole(all()).await?, scanned, "the writer's whole read");
+        let entries = ours(scanned);
+        assert_eq!(entries, model, "each entry as its last change left it");
+
+        let reader = Lake::open(dir.to_str().unwrap(), false, true, crate::node_state::NodeState::unhosted()).await?;
+        assert!(reader.cat.mirror.load(Relaxed), "a streamed reader holds the whole catalog once it opens");
+        let viewed = reader.cat.kv.scan(all(), false).await?;
+        assert_eq!(reader.cat.kv.scan_whole(all()).await?, viewed, "the follower's whole read");
+        let seeded: BTreeMap<String, Bytes> = reader.cat.overlay.lock().unwrap().iter().filter_map(|(k, (_, v))| v.clone().map(|v| (k.clone(), v))).collect();
+        assert_eq!(seeded, viewed.into_iter().filter(|(k, _)| !k.starts_with("d/")).collect::<BTreeMap<_, _>>(), "what the follower seeded is its view");
+        assert_eq!(ours(seeded), entries, "and the writer's entries");
 
         reader.cat.close().await?;
         writer.cat.close().await?;

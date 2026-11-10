@@ -209,10 +209,10 @@ impl View {
 /// (`measures::written`, `pattern::shown`): what every door that shows a definition shows.
 pub fn shown(sql: &str) -> String { crate::pattern::shown(&crate::measures::written(sql)).into_owned() }
 
-/// What a caller may see of a view's query, or of a name or expression taken from it: `text`, for a caller who may see
+/// What a caller may see of a view's query, or of a name or expression taken from it: `text`, for a caller whose `scope` may see
 /// code (`rights::Scope::shows_code`), and nothing for any other user. A view's query names the tables under it and the filters
 /// that keep rows out, so a user granted only the view is not shown them, as a routine's code is not (S27).
-pub fn code_for_caller<T>(text: impl FnOnce() -> T) -> Option<T> { crate::rights::scope().shows_code().then(text) }
+pub fn code_for_caller<T>(scope: &crate::rights::Scope, text: impl FnOnce() -> T) -> Option<T> { scope.shows_code().then(text) }
 
 /// The producers a view's rows are written under (what goes when it is dropped or detached): its filling's counts and
 /// rejects too (`fill_one`), or a view made again under the name would have them refused as the earlier one's, sent again.
@@ -2176,22 +2176,22 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>, scope: &crate::rights
     };
     let flows = RecordBatch::try_from_iter(vec![
         ("name", s(&|_, (n, v)| Some(v.shown(n).to_string()))),
-        ("follows", s(&|_, (_, v)| code_for_caller(|| v.join.as_ref().map_or_else(|| crate::rerun::follows(v).join(", "), |j| j.tables.join(", "))))),
+        ("follows", s(&|_, (_, v)| code_for_caller(scope, || v.join.as_ref().map_or_else(|| crate::rerun::follows(v).join(", "), |j| j.tables.join(", "))))),
         ("kind", s(&|i, _| Some(kinds[i].to_string()))),
         ("refresh", s(&|_, (_, v)| Some(v.rerun.as_ref().map_or("incremental", |r| if r.full.is_some() { "full" } else { "by key" }).to_string()))),
         ("reason", s(&|_, (_, v)| v.rerun.as_ref().map(|b| b.reason.clone()))),
-        ("reads", s(&|_, (_, v)| code_for_caller(|| reads(v)).flatten())),
+        ("reads", s(&|_, (_, v)| code_for_caller(scope, || reads(v)).flatten())),
         ("expectations", std::sync::Arc::new(views.iter().map(|(_, v)| v.expect.len() as i64).collect::<Int64Array>())),
         ("late_rows", std::sync::Arc::new(views.iter().map(|(_, v)| (v.once.is_some() || v.matches.is_some()).then(|| late(v))).collect::<Int64Array>())),
-        ("error", s(&|_, (n, v)| code_for_caller(|| if v.rerun.is_some() { crate::rerun::failing(lake, n, identity(v)) } else { failing(lake, n, identity(v)) }).flatten())), // (an error names tables and keys: S27)
-        ("definition", s(&|_, (_, v)| code_for_caller(|| shown(v.query())))),
+        ("error", s(&|_, (n, v)| code_for_caller(scope, || if v.rerun.is_some() { crate::rerun::failing(lake, n, identity(v)) } else { failing(lake, n, identity(v)) }).flatten())), // (an error names tables and keys: S27)
+        ("definition", s(&|_, (_, v)| code_for_caller(scope, || shown(v.query())))),
     ])?;
     let all: Vec<(&String, &View, &Expect)> = views.iter().flat_map(|(n, v)| v.expect.iter().map(move |e| (n, v, e))).collect();
     let e = |f: &dyn Fn(&(&String, &View, &Expect)) -> String| std::sync::Arc::new(all.iter().map(|x| Some(f(x))).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
     let expectations = RecordBatch::try_from_iter(vec![
         ("view", e(&|(n, _, _)| n.to_string())),
         ("expectation", e(&|(_, _, x)| x.name.clone())),
-        ("condition", std::sync::Arc::new(all.iter().map(|(_, _, x)| code_for_caller(|| x.check.clone())).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef),
+        ("condition", std::sync::Arc::new(all.iter().map(|(_, _, x)| code_for_caller(scope, || x.check.clone())).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef),
         ("on_violation", e(&|(_, _, x)| x.on.word().to_string())),
         ("failed_rows", std::sync::Arc::new(all.iter().map(|(_, v, x)| failed.get(&(v.fill.as_ref().map_or(String::new(), |f| f.id.clone()), x.name.clone())).copied().unwrap_or(0)).collect::<Int64Array>())),
     ])?;
@@ -2202,7 +2202,7 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>, scope: &crate::rights
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{Principal, Role, WHO};
+    use crate::auth::{Principal, Role};
 
     /// A view's expectations leave rows out, and each is kept as a reject (`rejects::keep`) naming the first rule that left
     /// it out, its condition and the run; one that keeps its rows counts them and keeps no reject. A view that drops rows
@@ -2274,13 +2274,13 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn a_view_query_is_shown_to_a_caller_who_may_see_code_only() {
+    #[test]
+    fn a_view_query_is_shown_to_a_caller_who_may_see_code_only() {
         // a user granted tables (no APPLY, no CLONE) is shown no view's query; an admin is shown it
         let reader = Principal { scope: crate::rights::Scope::granted(Default::default()), ..Principal::of(Role::Read) };
-        let query = |who: Principal| WHO.scope(who, async { code_for_caller(|| "SELECT id FROM t WHERE region = 'EU'".to_string()) });
-        assert_eq!(query(reader).await, None);
-        assert_eq!(query(Principal::of(Role::Admin)).await.as_deref(), Some("SELECT id FROM t WHERE region = 'EU'"));
+        let query = |who: Principal| code_for_caller(&who.scope, || "SELECT id FROM t WHERE region = 'EU'".to_string());
+        assert_eq!(query(reader), None);
+        assert_eq!(query(Principal::of(Role::Admin)).as_deref(), Some("SELECT id FROM t WHERE region = 'EU'"));
     }
 
     #[test]
