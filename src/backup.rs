@@ -142,7 +142,7 @@ pub async fn statement(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Dd
             match lock {
                 Some(lock) => {
                     let _guard = lock.lock().await;
-                    crate::ddl::apply(lake, attach, &crate::auth::Principal::node().scope).await?; // (the node's own: it attaches what it restored)
+                    crate::ddl::apply(lake, attach, &crate::auth::Principal::node()).await?; // (the node's own: it attaches what it restored)
                 }
                 None => {
                     Box::pin(crate::write::send(&lake.url, Request::Ddl(attach), &lake.node)).await?; // (the leader attaches it, under its lock; boxed: `send` leads back here)
@@ -198,7 +198,7 @@ async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Op
         match lock.filter(|_| here) {
             Some(lock) => {
                 let _guard = lock.lock().await;
-                crate::ddl::apply(lake, d, &crate::auth::Principal::node().scope).await // (a pin: the node's own, as a leader takes it)
+                crate::ddl::apply(lake, d, &crate::auth::Principal::node()).await // (a pin: the node's own, as a leader takes it)
             }
             None => Box::pin(crate::write::send(&source.url, Request::Ddl(d), &lake.node)).await,
         }

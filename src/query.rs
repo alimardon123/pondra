@@ -735,10 +735,15 @@ async fn view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Arc<TableMet
     if let Some(facts) = facts {
         return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta, facts, manifests: None, upto, at: upto, share: None, range: None, own: Default::default() }));
     }
-    let df = raw(lake, ctx, name, &meta, upto).await?;
+    let (tail, files) = sources(lake, ctx, name, &meta, upto).await?;
+    let logged = tail.is_some(); // (rows in the log after its files: the mark of a table with none stays where it was, `tier::expire`)
+    let df = match tail.into_iter().chain(files).reduce(|a, b| a.union(b).expect("same schema")) {
+        Some(df) => df,
+        None => empty(ctx, &meta)?,
+    };
     let aux = lake.session();
     aux.register_table("__raw", df.into_view())?;
-    let current = aux.sql(&current_sql(&meta, "__raw", upto.unwrap_or(lake.visible()))).await?;
+    let current = aux.sql(&current_sql(&meta, "__raw", logged)).await?;
     match &meta.finish {
         None => Ok(current.into_view()),
         Some(f) => crate::finish::finished(&aux, current, f).await, // (avg, HAVING, …: worked out as it is read)
@@ -1038,8 +1043,8 @@ pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool, keep_deleted:
 /// The current rows of a keyed table, over `raw_table`. When the source already holds one row
 /// per key — a single file, with nothing in the log after it — the "newest wins" window (or the
 /// merge GROUP BY) is skipped, so reads of a compacted table cost a plain scan.
-pub fn current_sql(meta: &TableMeta, raw_table: &str, upto: u64) -> String {
-    if meta.files.len() > 1 || upto != meta.tiered {
+pub fn current_sql(meta: &TableMeta, raw_table: &str, logged: bool) -> String {
+    if meta.files.len() > 1 || logged {
         return latest_sql(meta, raw_table, false, false);
     }
     let cols = meta.columns().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
@@ -2089,13 +2094,13 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("pondra-named-{}", uuid::Uuid::new_v4()));
             let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
             let node = &crate::auth::Principal::node().scope;
-            apply(&lake, Ddl::CreateSchema { name: "s".into(), if_not_exists: false }, &crate::auth::Principal::node().scope).await?;
+            apply(&lake, Ddl::CreateSchema { name: "s".into(), if_not_exists: false }, &crate::auth::Principal::node()).await?;
             for t in ["a", "b", "s.c", "MiXed", "x-y", "unused", "a$new-0123abcd"] {
                 crate::write::create_table(&lake, t, r#"{"columns": [["x", "Int64"]]}"#).await?;
             }
             let view = |name: &str, sql: &str| Ddl::CreateView { name: name.into(), sql: sql.into(), replace: false, facts: None, text: None };
-            apply(&lake, view("v", "SELECT x FROM a"), &crate::auth::Principal::node().scope).await?;
-            apply(&lake, view("w", "SELECT v.x FROM v JOIN b ON v.x = b.x"), &crate::auth::Principal::node().scope).await?;
+            apply(&lake, view("v", "SELECT x FROM a"), &crate::auth::Principal::node()).await?;
+            apply(&lake, view("w", "SELECT v.x FROM v JOIN b ON v.x = b.x"), &crate::auth::Principal::node()).await?;
             let registered = |ctx: &SessionContext| -> std::collections::BTreeSet<String> {
                 let c = ctx.catalog(&crate::ddl::lake_name(&lake)).expect("the lake's catalog");
                 c.schema_names().into_iter().filter(|s| s != "information_schema").flat_map(|s| {

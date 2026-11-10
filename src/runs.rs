@@ -246,7 +246,7 @@ async fn write(app: App, mut rx: tokio::sync::mpsc::UnboundedReceiver<Sent>) {
 
 async fn append(app: &App, producer: &str, seq: u64, lines: &[Line], made: &mut bool) -> Result<()> {
     if !*made && app.lake.cat.get::<TableMeta>(&table_key(TABLE)).await?.is_none() {
-        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::RunLog]), None, false, &crate::auth::Principal::node().scope).await?; // (the run log's table: the node's own)
+        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::RunLog]), None, false, &crate::auth::Principal::node()).await?; // (the run log's table: the node's own)
     }
     *made = true;
     let schema = crate::answer::schema(&columns())?;
@@ -679,7 +679,7 @@ pub async fn execute(app: &App, name: String, args: Vec<(String, String)>, who: 
     if let Some(task) = task {
         params = values(app, &task, params, &who.scope).await;
     }
-    Ok(Outcome::Done(crate::write::on_node_as(app, asked(params), None, who.files, &who.scope).await?))
+    Ok(Outcome::Done(crate::write::on_node_as(app, asked(params), None, who.files, &who.asker()).await?))
 }
 
 /// Leader: claim a tick now for `EXECUTE TASK` (the scheduler runs it, and what follows it).
@@ -1408,7 +1408,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-undrop-owner-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let _ = lake.owner_key.set("k1".into());
-        let scope = crate::rights::Scope::everything();
+        let node = crate::auth::Principal::node();
         for (by_owner, name) in [(true, "mine"), (false, "taken")] {
             let task = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), ..Default::default() };
             crate::ext::scope(true, create_task(&lake, name, task, false)).await?;
@@ -1416,7 +1416,7 @@ mod tests {
             tick.owner = signed(&lake, &tick.what(name));
             lake.cat.commit(vec![(tick_key(name), json(&tick))], &[]).await?;
             crate::ext::scope(true, drop_task(&lake, name, false)).await?; // (the owner drops it)
-            crate::ext::scope(by_owner, crate::undrop::undrop(&lake, "task", name, &scope)).await?;
+            crate::ext::scope(by_owner, crate::undrop::undrop(&lake, "task", name, &node)).await?;
             let task = lake.cat.get::<Task>(&task_key(name)).await?.context("the task is back")?;
             let tick = lake.cat.get::<Tick>(&tick_key(name)).await?.context("its tick is back")?;
             assert_eq!(tick.as_owner(&lake, name, &task), by_owner, "{name}: the owner's again only when the owner undropped it");

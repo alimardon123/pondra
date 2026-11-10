@@ -679,8 +679,12 @@ impl Sequencer {
         for h in hooks() {
             (h.led)(&lake); // (the views as this leader finds them)
         }
-        for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
-            let rows = crate::tier::backlog(&lake, meta.tiered, None).await?.get(&key[2..]).copied().unwrap_or(0);
+        {
+            // (each table's rows after its own mark, in one pass over the log: an idle table's mark stays, `tier::expire`)
+            let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
+            let marks: std::collections::BTreeMap<&str, u64> = tables.iter().map(|(k, m)| (&k[2..], m.tiered)).collect();
+            let from = marks.values().copied().min().unwrap_or(u64::MAX - 1);
+            let rows: u64 = crate::tier::waiting(&lake, from, None, |t| Some(marks.get(t).copied().unwrap_or(u64::MAX))).await?.values().sum();
             lake.backlog.fetch_add(rows, Ordering::Relaxed);
         }
         let (tx, mut rx) = mpsc::channel::<(Flush, oneshot::Sender<Outcome>)>(10_000);

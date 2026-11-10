@@ -57,12 +57,13 @@ fn plain(t: &DataType) -> DataType {
 }
 
 /// Python functions, as an extension: what a lake keeps for them (`Answered`, the lake's state for them: `lake_state.rs`).
-pub static PYTHON: crate::registry::BuiltIn = crate::registry::BuiltIn { name: "python", requires: &[], register: |r| r.section_mut::<crate::lake_state::Registered>().add::<Answered>() };
+pub static PYTHON: crate::registry::BuiltIn = crate::registry::BuiltIn { name: "python", requires: &[], register: |r| { let states = r.section_mut::<crate::lake_state::Registered>(); states.add::<Answered>(); states.add::<crate::python::Workers>(); } };
 
 /// Register the lake's Python functions in a session (on every node: they are in the catalog).
 pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
     let all = crate::routines::listed(lake).await?;
     let answers = lake.state::<Answered>()?; // (made at the lake's first session, so its line shows it from then on)
+    let workers = crate::python::at(lake)?; // (its lake's Python workers)
     for (name, r) in all.iter().filter(|(_, r)| r.python() && r.kind != Kind::Procedure) {
         let mut args = vec![];
         for p in &r.params {
@@ -78,7 +79,7 @@ pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
                 for (c, t) in crate::expander::columns_of(r.returns.as_deref().unwrap_or_default())? {
                     fields.push(Field::new(c, arrow_of(&t).await?, true));
                 }
-                ctx.register_udtf(name, Arc::new(TableFn { name: name.clone(), routine, args, schema: Arc::new(Schema::new(fields)), answers: answers.clone() }));
+                ctx.register_udtf(name, Arc::new(TableFn { name: name.clone(), routine, args, schema: Arc::new(Schema::new(fields)), answers: answers.clone(), workers: workers.clone() }));
             }
             _ => {
                 let returns = arrow_of(r.returns.as_deref().context("RETURNS")?).await?;
@@ -87,7 +88,7 @@ pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
                     false => Signature::new(TypeSignature::Any(args.len()), Volatility::Volatile),
                 };
                 let signature = if args.is_empty() { Signature::nullary(Volatility::Volatile) } else { signature };
-                ctx.register_udf(AsyncScalarUDF::new(Arc::new(Function { name: name.clone(), routine, returns, signature, answers: answers.clone() })).into_scalar_udf());
+                ctx.register_udf(AsyncScalarUDF::new(Arc::new(Function { name: name.clone(), routine, returns, signature, answers: answers.clone(), workers: workers.clone() })).into_scalar_udf());
             }
         }
     }
@@ -102,12 +103,12 @@ fn head(name: &str, r: &Routine, table: bool) -> serde_json::Value {
 }
 
 /// Rows through a worker: the arguments' batch out, the answer back (as `out`'s columns).
-async fn ask(name: &str, r: &Routine, table: bool, args: RecordBatch, out: SchemaRef) -> Result<Vec<RecordBatch>> {
+async fn ask(workers: &crate::python::Workers, name: &str, r: &Routine, table: bool, args: RecordBatch, out: SchemaRef) -> Result<Vec<RecordBatch>> {
     crate::python::ready(&format!("{name} is a Python function"))?;
     let limit = std::time::Duration::try_from_secs_f64(r.with.timeout.unwrap_or(60.0)).unwrap_or(std::time::Duration::from_secs(60));
     let parts = vec![crate::answer::ipc(&[args])?, crate::answer::ipc(&[RecordBatch::new_empty(out)])?];
     let mut log = |n: String| eprintln!("function {name}: {n}");
-    let (_, parts) = crate::python::ask(&r.with.packages, crate::python::Use::Function, head(name, r, table), parts, Some(limit), &mut log).await.with_context(|| name.to_string())?;
+    let (_, parts) = crate::python::ask_on(workers, &r.with.packages, crate::python::Use::Function, head(name, r, table), parts, Some(limit), &mut log).await.with_context(|| name.to_string())?;
     crate::query::read_ipc(parts.first().context("no rows back")?)
 }
 
@@ -124,6 +125,7 @@ struct Function {
     returns: DataType,
     signature: Signature,
     answers: Arc<Answered>, // (its lake's)
+    workers: Arc<crate::python::Workers>, // (its lake's)
 }
 
 impl PartialEq for Function {
@@ -173,7 +175,7 @@ impl AsyncScalarUDFImpl for Function {
             let column = match missing.is_empty() {
                 true => datafusion::arrow::array::new_empty_array(&self.returns),
                 false => {
-                    let answers = ask(&self.name, &self.routine, false, batch(&self.routine, arrays, missing.len())?, out.clone()).await?;
+                    let answers = ask(&self.workers, &self.name, &self.routine, false, batch(&self.routine, arrays, missing.len())?, out.clone()).await?;
                     datafusion::arrow::compute::concat(&answers.iter().map(|b| b.column(0).as_ref()).collect::<Vec<_>>())?
                 }
             };
@@ -243,6 +245,7 @@ struct TableFn {
     args: Vec<Option<DataType>>,
     schema: SchemaRef,
     answers: Arc<Answered>, // (its lake's)
+    workers: Arc<crate::python::Workers>, // (its lake's)
 }
 
 impl TableFunctionImpl for TableFn {
@@ -260,7 +263,7 @@ impl TableFunctionImpl for TableFn {
                 _ => v,
             });
         }
-        Ok(Arc::new(Called { name: self.name.clone(), routine: self.routine.clone(), values, schema: self.schema.clone(), answers: self.answers.clone() }))
+        Ok(Arc::new(Called { name: self.name.clone(), routine: self.routine.clone(), values, schema: self.schema.clone(), answers: self.answers.clone(), workers: self.workers.clone() }))
     }
 }
 
@@ -271,6 +274,7 @@ struct Called {
     values: Vec<ScalarValue>,
     schema: SchemaRef,
     answers: Arc<Answered>,
+    workers: Arc<crate::python::Workers>, // (its lake's)
 }
 
 #[async_trait::async_trait]
@@ -288,7 +292,7 @@ impl TableProvider for Called {
             if let Some(rows) = key.as_ref().and_then(|k| self.answers.0.lock().unwrap().rows(k)) {
                 return anyhow::Ok(rows);
             }
-            let rows = ask(&self.name, &self.routine, true, batch(&self.routine, arrays, 1)?, self.schema.clone()).await?;
+            let rows = ask(&self.workers, &self.name, &self.routine, true, batch(&self.routine, arrays, 1)?, self.schema.clone()).await?;
             if let (Some(k), Some(secs)) = (key, self.routine.with.cache) {
                 self.answers.0.lock().unwrap().keep(k, Kept::Rows(rows.clone()), secs);
             }

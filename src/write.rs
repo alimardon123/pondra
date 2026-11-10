@@ -1489,15 +1489,15 @@ pub async fn stamp(lake: &Lake, table: &str, to: Option<&crate::log::To>) -> Res
 // ---------------------------------------------------------------- on a node
 
 /// `POST /sql` with a write statement: this node does the work; the leader records it.
-pub async fn on_node(app: &crate::app::App, stmt: Stmt, job: Option<String>, scope: &crate::rights::Scope) -> Result<Value> { on_node_as(app, stmt, job, false, scope).await }
+pub async fn on_node(app: &crate::app::App, stmt: Stmt, job: Option<String>, by: &crate::auth::Principal) -> Result<Value> { on_node_as(app, stmt, job, false, by).await }
 
 /// `on_node`; `files`: its SQL may read files on this machine (`FROM 'jan.csv'`: the shell's own
 /// node, `statement::owner`).
 #[inline(never)] // (its work on the heap, made here: `App::query_as`)
-pub fn on_node_as<'a>(app: &'a crate::app::App, stmt: Stmt, job: Option<String>, files: bool, scope: &'a crate::rights::Scope) -> futures::future::BoxFuture<'a, Result<Value>> {
+pub fn on_node_as<'a>(app: &'a crate::app::App, stmt: Stmt, job: Option<String>, files: bool, by: &'a crate::auth::Principal) -> futures::future::BoxFuture<'a, Result<Value>> {
     Box::pin(async move {
         app.lake.caught_up().await?; // (a node that just started: not against an older catalog than its leader's)
-        let out = crate::ext::listing(on_node_listed(app, stmt, job, files, scope)).await?; // (files outside the lake: listed once a statement)
+        let out = crate::ext::listing(on_node_listed(app, stmt, job, files, by)).await?; // (files outside the lake: listed once a statement)
         seen_here(app).await;
         Ok(out)
     })
@@ -1577,14 +1577,14 @@ where
 
 /// `create_as` on a node: each of its statements runs here, as the caller (`on_node_as`). A request stopped before its steps
 /// answer drops the table it made (`Undo`: the memory watch stops a request by dropping its future, `oom.rs`).
-async fn create_on_node(app: &crate::app::App, c: &ast::CreateTable, job: &str, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
-    let (app_run, job_run, scope_run) = (app.clone(), job.to_string(), scope.clone());
+async fn create_on_node(app: &crate::app::App, c: &ast::CreateTable, job: &str, files: bool, by: &crate::auth::Principal) -> Result<Value> {
+    let (app_run, job_run, by_run) = (app.clone(), job.to_string(), by.clone());
     let run = move |s: Stmt| -> futures::future::BoxFuture<'static, Result<Value>> {
-        let (app, job, scope) = (app_run.clone(), job_run.clone(), scope_run.clone());
-        Box::pin(async move { on_node_as(&app, s, Some(job), files, &scope).await })
+        let (app, job, by) = (app_run.clone(), job_run.clone(), by_run.clone());
+        Box::pin(async move { on_node_as(&app, s, Some(job), files, &by).await })
     };
     let mut undo = Undo(None);
-    let out = create_as(run, &app.lake, c, job, files, &mut |table: &str| undo.0 = Some((app.clone(), table.to_string(), job.to_string(), scope.clone())), scope).await;
+    let out = create_as(run, &app.lake, c, job, files, &mut |table: &str| undo.0 = Some((app.clone(), table.to_string(), job.to_string(), by.clone())), &by.scope).await;
     undo.0 = None; // (answered, or refused: whatever it made is dropped by now, or is the statement's answer)
     out
 }
@@ -1706,51 +1706,51 @@ fn raced(if_not_exists: bool, name: &str, out: Result<Value>) -> Result<Value> {
 
 /// The table a `CREATE TABLE … AS SELECT` made, dropped if its request ends before the INSERT answers: the
 /// memory watch stops a request by dropping its future (`oom.rs`), so the code after the INSERT never runs.
-struct Undo(Option<(crate::app::App, String, String, crate::rights::Scope)>); // (app, table, job, the statement's scope)
+struct Undo(Option<(crate::app::App, String, String, crate::auth::Principal)>); // (app, table, job, the statement's asker)
 
 impl Drop for Undo {
     fn drop(&mut self) {
-        let Some((app, name, job, scope)) = self.0.take() else { return };
+        let Some((app, name, job, by)) = self.0.take() else { return };
         // (carried: the drop runs as the caller that was stopped, with its sign-in and session, which tokio still
         // holds while a future is dropped)
         let node = app.lake.node.clone();
         node.tasks.spawn_as(crate::auth::caller(), async move {
-            if let Err(e) = Box::pin(on_node_as(&app, made_drop(&name, &job), None, false, &scope)).await {
+            if let Err(e) = Box::pin(on_node_as(&app, made_drop(&name, &job), None, false, &by)).await {
                 eprintln!("left {name} as it is: the drop after its CREATE TABLE … AS, which stopped before it answered, didn't answer: {e:#}");
             }
         });
     }
 }
 
-async fn on_node_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
-    let stmt = crate::protect::door(&app.lake, stmt).await?; // (a project's objects in a protected database: an apply's only)
-    if let Some(out) = crate::temp::statement(app, &stmt, files, scope).await? {
+async fn on_node_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool, by: &crate::auth::Principal) -> Result<Value> {
+    let stmt = crate::protect::door(&app.lake, stmt, &by.name).await?; // (a project's objects in a protected database: an apply's only)
+    if let Some(out) = crate::temp::statement(app, &stmt, files, &by.scope).await? {
         return Ok(out); // (the session's own tables and views: on this node, in memory; a temporary table has no identity column)
     }
-    let (stmt, placed) = in_sql_order(&app.lake, stmt, scope).await?; // (an INSERT without a column list, into a table that moved a column)
-    crate::log::placed_as(placed, listed_in_order(app, stmt, job, files, scope)).await
+    let (stmt, placed) = in_sql_order(&app.lake, stmt, &by.scope).await?; // (an INSERT without a column list, into a table that moved a column)
+    crate::log::placed_as(placed, listed_in_order(app, stmt, job, files, by)).await
 }
 
-async fn listed_in_order(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
+async fn listed_in_order(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool, by: &crate::auth::Principal) -> Result<Value> {
     identity(&app.lake, &stmt).await?; // (every SQL write's identity, before the DDL and transaction splits: autocommit and transactions both meet it)
     // DDL in an open transaction runs at once, as a commit of its own (ADR-067 §7); the notice follows its success. A
     // CREATE TABLE … AS's steps run at once too (`at_once`), so they are not kept.
     if let Some(note) = Box::pin(crate::txn::ddl_at_once(app, &stmt)).await? {
-        let out = Box::pin(crate::txn::at_once(run_listed(app, stmt, job, files, scope))).await?;
+        let out = Box::pin(crate::txn::at_once(run_listed(app, stmt, job, files, by))).await?;
         if out["exists"] != true && out["unchanged"] != true {
             crate::routines::heard(&note); // (IF NOT EXISTS left the table as it was: nothing ran)
         }
         return Ok(out);
     }
-    if let Some(out) = Box::pin(crate::txn::statement(app, &stmt, files, scope)).await? {
+    if let Some(out) = Box::pin(crate::txn::statement(app, &stmt, files, &by.scope)).await? {
         return Ok(out); // (in a transaction: kept until COMMIT, ADR-036 §5)
     }
-    run_listed(app, stmt, job, files, scope).await
+    run_listed(app, stmt, job, files, by).await
 }
 
 /// A statement once the session's own tables and its transaction have had their turn (`on_node_listed`): written here
 /// or by the leader.
-async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
+async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool, by: &crate::auth::Principal) -> Result<Value> {
     if let Stmt::Invalid(why) = stmt {
         bail!(why);
     }
@@ -1763,7 +1763,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     }
     // (COPY … TO reads the lake and writes no lake: a reader may export, as Postgres's read-only transactions allow it)
     if let Stmt::CopyTo(query, to, options) = &stmt {
-        return crate::copy::copy_to(&app.lake, query, to, options, &app.members.nodes(), app.members.me(), scope).await; // (files outside the lake: from here, or every node its share)
+        return crate::copy::copy_to(&app.lake, query, to, options, &app.members.nodes(), app.members.me(), &by.scope).await; // (files outside the lake: from here, or every node its share)
     }
     let named = job.is_some(); // (a job a client sent: its retry may be a duplicate already committed)
     let (lake, job) = (&app.lake, job.unwrap_or_else(crate::log::auto_job));
@@ -1776,17 +1776,17 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         ensure!(!app.members.reader(), "read-only node"); // (above a view of a folder's write: a reader writes no file either)
     }
     if let Stmt::UndropFile(path) = &stmt {
-        return crate::files::undrop(&app.lake, path).await; // (the lake's files: a writer's, and a `.py` an admin's, `rights::asks`)
+        return crate::files::undrop(&app.lake, path, &by.name).await; // (the lake's files: a writer's, and a `.py` an admin's, `rights::asks`)
     }
-    if let Some((query, to, options)) = crate::ext::view_write(&app.lake, &stmt, scope).await? {
-        let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.members.nodes(), app.members.me(), scope).await?; // (a view of a folder: a new file in it)
+    if let Some((query, to, options)) = crate::ext::view_write(&app.lake, &stmt, &by.scope).await? {
+        let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.members.nodes(), app.members.me(), &by.scope).await?; // (a view of a folder: a new file in it)
         return Ok(j!({"rows": out["copied"]}));
     }
     // A joined page's query INSERT is staged (`stage_insert`): its rows are written here as the page's own files, and its node writes
     // and checks them as it checks any INSERT. Before `whole_rows`, which would run the table's defaults and sequences here.
     if !app.members.keeps_records() {
         if let Some((table, names, query)) = staging(&stmt) {
-            return stage_insert(app, table, names, query, &job, files, scope).await;
+            return stage_insert(app, table, names, query, &job, files, &by.scope).await;
         }
     }
     let stmt = match stmt {
@@ -1809,13 +1809,13 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         s => s,
     };
     if let Stmt::Ddl(ddls) = stmt {
-        return ddl_listed(app, ddls, &job, files, scope).await;
+        return ddl_listed(app, ddls, &job, files, by).await;
     }
     if inbox {
-        return by_inbox(app, stmt, &job, files, scope).await;
+        return by_inbox(app, stmt, &job, files, &by.scope).await;
     }
     if let Stmt::CopyInto(table, from, options) = &stmt {
-        return crate::copy::copy_into(app, table, from, options, scope).await; // (files into a table, each once a version)
+        return crate::copy::copy_into(app, table, from, options, by).await; // (files into a table, each once a version)
     }
     let open = |ctx: SessionContext| if files { crate::engine::with_files(ctx) } else { ctx };
     // CREATE TABLE … AS SELECT, and OR REPLACE: the steps `create_as` takes, on this node.
@@ -1824,7 +1824,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
             return Ok(out);
         }
         if c.query.is_some() || c.or_replace {
-            return Box::pin(create_on_node(app, c, &job, files, scope)).await;
+            return Box::pin(create_on_node(app, c, &job, files, by)).await;
         }
     }
     // Another engine's table, attached (`ATTACH … (TYPE delta | iceberg)`): its next version,
@@ -1835,7 +1835,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
             Stmt::InsertInto(_, names, query) => (Some(names.clone()), query),
             _ => bail!("{}: another engine's table takes INSERTs from Pondra (UPDATE, DELETE and MERGE: not yet)", stmt.table()),
         };
-        return crate::write_outside::insert(lake, &target, &stmt.table(), names, query, &job, scope).await;
+        return crate::write_outside::insert(lake, &target, &stmt.table(), names, query, &job, &by.scope).await;
     }
     // (an UPDATE's, DELETE's or MERGE's target reaches here named as its files already: it read
     // "no table" with a quoted path)
@@ -1848,13 +1848,13 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         let (other, local) = crate::ddl::resolve(lake, &stmt.table()).await?;
         if let (None, Some(seq)) = (&other, &app.seq) {
             let _guard = app.lock.lock().await;
-            return crate::change::FILES.scope(files, crate::change::run(lake, seq, &sql, &job, scope)).await;
+            return crate::change::FILES.scope(files, crate::change::run(lake, seq, &sql, &job, &by.scope)).await;
         }
         if let Some(o) = &other {
             crate::users::across_write(o, &attached_as(&stmt), &local, &stmt).await?; // (that lake's own sign-in)
         }
         let target = other.clone().unwrap_or_else(|| lake.arc());
-        let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files, scope).await?;
+        let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files, &by.scope).await?;
         let Some(o) = other else {
             crate::dial::signed(lake).await; // (the nodes' key, before a user's change goes to the leader)
             return post_as(&lake.node, &app.members.leader().addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
@@ -1867,7 +1867,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
     if let Some(other) = other {
         crate::users::across_write(&other, &attached_as(&stmt), &table, &stmt).await?; // (that lake's own sign-in)
-        let req = prepare(lake, &other, &table, &stmt, &job, files, scope).await?;
+        let req = prepare(lake, &other, &table, &stmt, &job, files, &by.scope).await?;
         let mark = req.as_ref().and_then(|r| request_mark(r, &job));
         let out = deliver(&other.url, req, &job, false, &lake.node).await;
         if out.is_ok() {
@@ -1881,7 +1881,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     let stmt = stmt.on(table.clone());
     match &stmt {
         Stmt::Create(c) => {
-            let spec = made_by_job(create_spec(c, lake, files, scope).await?, &job)?; // (a plain CREATE TABLE is its statement's too)
+            let spec = made_by_job(create_spec(c, lake, files, &by.scope).await?, &job)?; // (a plain CREATE TABLE is its statement's too)
             return raced(c.if_not_exists, &object(&c.name), define(app, &table, &spec).await);
         }
         Stmt::Define(_, spec) => return define(app, &table, spec).await,
@@ -1904,7 +1904,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     let keyed = meta.as_ref().is_some_and(|m| !m.key.is_empty());
     let key_insert = matches!(stmt, Stmt::Insert(..)) && stored.as_ref().is_some_and(|m| m.key_checked());
     if (keyed && matches!(stmt, Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_))) || key_insert {
-        return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job, scope))).await;
+        return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job, &by.scope))).await;
     }
     let sql = match (&meta, &stmt) {
         (Some(m), _) if through_log(m, &stmt) || crate::returning::asked() => {
@@ -1922,9 +1922,9 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
             let f = match crate::keep_load::kept(lake, lake, &table, query, &job, stored.as_ref(), stamped).await {
                 Some(f) => Some(f),
                 None => {
-                    match everywhere(app, &table, query, &job, stamped, &to, files || meta.is_none(), scope).await? {
+                    match everywhere(app, &table, query, &job, stamped, &to, files || meta.is_none(), &by.scope).await? {
                         Some(f) => f,
-                        None => write_files(lake, &open(session_for(lake, query, "", None, scope).await?), &table, query, &job, stamped).await?,
+                        None => write_files(lake, &open(session_for(lake, query, "", None, &by.scope).await?), &table, query, &job, stamped).await?,
                     }
                 }
             };
@@ -1932,7 +1932,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
             return match app.record_files(f).await {
                 Err(e) if format!("{e:#}").contains(AGAIN) => {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await; // (this node sees the view by then: without them)
-                    Box::pin(on_node_as(app, Stmt::Insert(table, query.clone()), Some(format!("{job}-again")), files, scope)).await
+                    Box::pin(on_node_as(app, Stmt::Insert(table, query.clone()), Some(format!("{job}-again")), files, by)).await
                 }
                 other => other,
             };
@@ -1944,7 +1944,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     // while the table is the one they were shaped for)
     let rules = stored.as_ref().expect("a table").rules()?;
     let how = if matches!(stmt, Stmt::Insert(..)) { crate::rules::How::Insert } else { crate::rules::How::Change };
-    let rows = rows_of(lake, lake, &rules, &table, &sql, None, files, how, scope).await?;
+    let rows = rows_of(lake, lake, &rules, &table, &sql, None, files, how, &by.scope).await?;
     crate::returning::wrote(&[], std::slice::from_ref(rows.rows()));
     let n = rows.rows().num_rows();
     let ack = app.log()?.append_shaped(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, rows).await?;
@@ -2272,7 +2272,7 @@ impl Request {
 /// Leader: record one request (from the inbox, or a `pondra sql` leading for a moment). What it plans is the node's own
 /// (`Principal::node()`): a guest's request through the inbox, which its own node planned for its asker, or the program's.
 pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request) -> Result<Value> {
-    let scope = &crate::auth::Principal::node().scope;
+    let by = &crate::auth::Principal::node();
     if crate::backup::frozen(lake) && !crate::backup::allowed(&req) {
         return Err(crate::backup::refused(Some(&lake.url))); // (a backup takes its runs and its clones' pins: ADR-070)
     }
@@ -2286,10 +2286,10 @@ pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request
             let _guard = lock.lock().await;
             create_table(lake, &name, &spec).await
         }
-        Request::Ddl(d) => ddl_here(lake, seq, lock, d, scope).await,
+        Request::Ddl(d) => ddl_here(lake, seq, lock, d, by).await,
         Request::Change(sql, job, sent) => {
             let _guard = lock.lock().await;
-            crate::query::SENT.scope(Arc::new(crate::change::unpack(&sent)?), crate::change::run(lake, seq, &sql, &job, scope)).await
+            crate::query::SENT.scope(Arc::new(crate::change::unpack(&sent)?), crate::change::run(lake, seq, &sql, &job, &by.scope)).await
         }
         Request::Txn(c) => crate::txn::commit_here(lake, seq, lock, c).await, // (it takes the lock)
         Request::Iceberg(c) => {
@@ -2361,17 +2361,17 @@ fn not_by_inbox(stmt: &Stmt) -> Result<()> {
 /// the leader's machine. The rest is carried out here when this node leads, else posted to the leader, or sent through the
 /// bucket's inbox (`through_bucket_one`). Each is settled before the next (ATTACH, DETACH: here at once; a materialized
 /// view: filled, `App::settle`), and its notice told here (carried out on the leader, perhaps over HTTP).
-async fn ddl_listed(app: &crate::app::App, ddls: Vec<crate::ddl::Ddl>, job: &str, files: bool, scope: &crate::rights::Scope) -> Result<Value> {
+async fn ddl_listed(app: &crate::app::App, ddls: Vec<crate::ddl::Ddl>, job: &str, files: bool, by: &crate::auth::Principal) -> Result<Value> {
     let (lake, lock) = (&app.lake, app.seq.is_some().then_some(&*app.lock));
     let mut out = j!({});
     for mut d in ddls {
-        crate::branch::door(lake, &mut d).await?;
+        crate::branch::door(lake, &mut d, by).await?;
         out = match &d {
             crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. } => crate::backup::statement(lake, lock, d.clone()).await?,
-            crate::ddl::Ddl::FetchExtension { .. } => crate::extension::fetch(lake, lock, d.clone()).await?,
-            _ if app.members.by_inbox() => through_bucket_one(lake, Stmt::Ddl(vec![d.clone()]), job, files, scope).await?,
+            crate::ddl::Ddl::FetchExtension { .. } => crate::extension::fetch(lake, lock, d.clone(), &by.name).await?,
+            _ if app.members.by_inbox() => through_bucket_one(lake, Stmt::Ddl(vec![d.clone()]), job, files, &by.scope).await?,
             _ => match &app.seq {
-                Some(seq) => ddl_here(lake, seq, &app.lock, d.clone(), scope).await?,
+                Some(seq) => ddl_here(lake, seq, &app.lock, d.clone(), by).await?,
                 None => post(&app.lake.node, &app.members.leader().addr, &Request::Ddl(d.clone())).await?,
             },
         };
@@ -2568,14 +2568,14 @@ pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
 /// Send a request to the leader over HTTP.
 /// A DDL statement on the leader, under the lake's lock; REFRESH takes it itself, once it has read
 /// its base (`branch::refresh`).
-pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>, d: crate::ddl::Ddl, scope: &crate::rights::Scope) -> Result<Value> {
+pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>, d: crate::ddl::Ddl, by: &crate::auth::Principal) -> Result<Value> {
     match d {
-        crate::ddl::Ddl::Refresh { database, tables } => crate::branch::refresh(lake, seq, lock, database, tables).await,
+        crate::ddl::Ddl::Refresh { database, tables } => crate::branch::refresh(lake, seq, lock, database, tables, by).await,
         crate::ddl::Ddl::SetLocation { database, to } => crate::memory::set_location(lake, &database, &to).await, // (copies outside the lake's lock: `memory.rs`)
         d @ (crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. }) => crate::backup::statement(lake, Some(lock), d).await, // (a request the leader takes: its own owner, beside its lock)
         d => {
             let _guard = lock.lock().await;
-            crate::ddl::apply(lake, d, scope).await
+            crate::ddl::apply(lake, d, by).await
         }
     }
 }
