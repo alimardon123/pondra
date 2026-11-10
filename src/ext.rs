@@ -270,18 +270,18 @@ pub fn said(e: &anyhow::Error) -> String { crate::codes::told(e, false) }
 pub fn local(table: &str) -> bool { spec(table).is_some_and(|s| s.format == "share" || s.urls.iter().any(|u| scheme(u).is_none_or(|s| s == "file"))) } // (a share's links: as its node got them)
 
 /// A table by name: this lake's, or the files an `ext:` name reads (checked: see `check`).
-pub async fn meta(lake: &Lake, table: &str) -> Result<Option<TableMeta>> {
+pub async fn meta(lake: &Lake, table: &str, scope: &crate::rights::Scope) -> Result<Option<TableMeta>> {
     if !is(table) {
         return lake.cat.meta(&crate::store::table_key(table)).await.map(|m| m.map(Arc::unwrap_or_clone));
     }
     let spec = for_caller(lake, spec(table).context("not a table of files")?)?;
-    check(lake, &spec).await?;
+    check(lake, &spec, scope).await?;
     if let Ok(Some(m)) = LISTED.try_with(|l| l.borrow().tables.get(table).cloned()) {
         return Ok(Some(m));
     }
     let m = match retyped_meta(&spec).await? {
         Some(m) => m,
-        None => resolve(lake, &spec).await?,
+        None => resolve(lake, &spec, scope).await?,
     };
     keep(table, &m);
     Ok(Some(m))
@@ -290,23 +290,23 @@ pub async fn meta(lake: &Lake, table: &str) -> Result<Option<TableMeta>> {
 fn keep(table: &str, m: &TableMeta) { _ = LISTED.try_with(|l| l.borrow_mut().tables.insert(table.to_string(), m.clone())); }
 
 /// The coordinator's list of the tables of files among `tables`, for its slices.
-pub async fn of(lake: &Lake, tables: &[String]) -> Result<Vec<(String, TableMeta)>> {
+pub async fn of(lake: &Lake, tables: &[String], scope: &crate::rights::Scope) -> Result<Vec<(String, TableMeta)>> {
     let (mut out, files) = (vec![], tables.iter().filter(|t| is(t)).cloned().collect::<Vec<_>>());
     for t in files {
-        let m = meta(lake, &t).await?.expect("files");
+        let m = meta(lake, &t, scope).await?.expect("files");
         out.push((t, m));
     }
     Ok(out)
 }
 
 /// A node's share of a spread query: its coordinator's list, and the stores to read them through.
-pub async fn prime(lake: &Lake, tables: &[(String, TableMeta)]) -> Result<()> {
+pub async fn prime(lake: &Lake, tables: &[(String, TableMeta)], scope: &crate::rights::Scope) -> Result<()> {
     for (t, m) in tables {
         for u in m.ext.as_ref().map(|s| s.urls.clone()).unwrap_or_default() {
-            OWNER.scope(true, register(lake, &u)).await?;
+            OWNER.scope(true, register(lake, &u, scope)).await?;
         }
         if let Some(s) = m.ext.as_ref().filter(|s| s.format == "iceberg" && s.options.contains_key("namespace")) {
-            OWNER.scope(true, crate::catalogs::prime(lake, s, m)).await?;
+            OWNER.scope(true, crate::catalogs::prime(lake, s, m, scope)).await?;
         }
         keep(t, m);
     }
@@ -330,18 +330,18 @@ fn for_caller(lake: &Lake, spec: Spec) -> Result<Spec> {
 /// May this caller read these files? A path on this machine: only the program that started the
 /// node. A URL: with the secret whose scope covers it (an admin made it: the grant), or, if none
 /// does, only that program again, with the node's own credentials.
-pub async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
+pub async fn check(lake: &Lake, spec: &Spec, scope: &crate::rights::Scope) -> Result<()> {
     spec.urls.iter().try_for_each(|u| off_page(u))?;
-    if reads_any_url() || spec.urls.iter().all(|u| own_file(lake, u) || own_stage(lake, u)) {
+    if reads_any_url() || spec.urls.iter().all(|u| own_file(lake, u) || own_stage(lake, u, scope)) {
         return Ok(()); // (the lake's own files, or the caller's own staged rows: whoever reads the lake reads them, as GET /files/… does)
     }
     if let (Some(name), [url]) = (spec.options.get("catalog"), &spec.urls[..]) {
-        if crate::catalogs::signed(lake, name, url).await? {
+        if crate::catalogs::signed(lake, name, url, scope).await? {
             return Ok(()); // (an AWS catalog: whoever may use its attachment's secret)
         }
     }
     let secrets = list(lake).await?;
-    spec.urls.iter().try_for_each(|u| allowed(&secrets, u))
+    spec.urls.iter().try_for_each(|u| allowed(&secrets, u, scope))
 }
 
 /// Is `u` in the lake's own files (`PUT /files/…`, `files()`)? Written out whole, with no `..`. `leaves` also takes
@@ -354,23 +354,23 @@ fn own_file(lake: &Lake, u: &str) -> bool {
 
 /// Is `u` in the caller's own staged rows (`stage/<its slug>/`, `auth::page_creates`): the folder a joined page stages its
 /// INSERT's files in, which only its own user's staged INSERT reads (`server::insert_staged`)? Nobody else's slug is read, and
-/// no `..` either. A caller with no slug reads none.
-fn own_stage(lake: &Lake, u: &str) -> bool {
-    let Some(me) = crate::auth::current().and_then(|p| crate::auth::slug(&p)) else { return false };
+/// no `..` either. A caller with no slug reads none (`Scope::slug`).
+fn own_stage(lake: &Lake, u: &str, scope: &crate::rights::Scope) -> bool {
+    let Some(me) = scope.slug() else { return false };
     let area = format!("{}/stage/{me}/", lake.url.trim_end_matches('/'));
     u.starts_with(&area) && !crate::lake_files::leaves(&u[area.len()..])
 }
 
 /// May the caller read `url`, a file a catalog named (a REST table's metadata), as `check` asks of a
 /// spec's own URLs? A catalog that vouches for its files' credentials is asked nothing here.
-pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
-    check_urls(lake, &[url]).await
+pub async fn check_url(lake: &Lake, url: &str, scope: &crate::rights::Scope) -> Result<()> {
+    check_urls(lake, &[url], scope).await
 }
 
 /// May the caller read `urls`, files a table's own metadata names by their whole URL (an Iceberg table's manifest list and
 /// manifests, a Delta checkpoint's sidecars), before the node reads them with its own credentials? Asked as `check_url`
 /// asks, with the secrets read once. A file under the location a catalog vouched for (`catalogs::scoped`) needs none.
-pub async fn check_urls(lake: &Lake, urls: &[&str]) -> Result<()> {
+pub async fn check_urls(lake: &Lake, urls: &[&str], scope: &crate::rights::Scope) -> Result<()> {
     urls.iter().try_for_each(|u| off_page(u))?; // (as `check` does: before anything is listed, for the owner too)
     if reads_any_url() {
         return Ok(());
@@ -380,17 +380,17 @@ pub async fn check_urls(lake: &Lake, urls: &[&str]) -> Result<()> {
         return Ok(());
     }
     let secrets = list(lake).await?;
-    asked.into_iter().try_for_each(|u| allowed(&secrets, u))
+    asked.into_iter().try_for_each(|u| allowed(&secrets, u, scope))
 }
 
-fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
+fn allowed(secrets: &[(String, Secret)], u: &str, scope: &crate::rights::Scope) -> Result<()> {
     off_page(u)?;
     if crate::connections::named_in(u).is_some() {
-        return through(u, "READ");
+        return through(u, "READ", scope);
     }
     match scheme(u).filter(|s| *s != "file") {
         None => return Err(crate::codes::coded("42501", format!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): read it there, or from a bucket (s3://, gs://, az://, https://)"))),
-        Some(_) => match covering(secrets, u) {
+        Some(_) => match covering(secrets, u, scope) {
             None => return Err(crate::codes::coded("42501", uncovered(u))),
             Some((_, s)) if s.temporary && !s.trusted => crate::net::check(&url::Url::parse(u)?)?, // (`register` holds its store to the public internet)
             Some(_) => {}
@@ -402,9 +402,9 @@ fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
 /// May the caller use the connection `u` is read or written through (`cn://drop/…`, `'@drop/…'`) for `privilege`, READ or
 /// WRITE? Granted to it, a role of its or public; a token's and a superuser's, always. Its secret is the connection's to
 /// lend: the caller needs no USAGE on it.
-pub(crate) fn through(u: &str, privilege: &str) -> Result<()> {
+pub(crate) fn through(u: &str, privilege: &str, scope: &crate::rights::Scope) -> Result<()> {
     let name = crate::connections::named_in(u).unwrap_or_default();
-    ensure!(owner() || crate::rights::scope().may_use("connection", name, privilege),
+    ensure!(owner() || scope.may_use("connection", name, privilege),
         crate::codes::coded("42501", format!("'@{name}/…': {privilege} on connection {name} isn't granted to this user (an admin grants it: GRANT {privilege} ON CONNECTION {name} TO …)")));
     Ok(())
 }
@@ -412,7 +412,7 @@ pub(crate) fn through(u: &str, privilege: &str) -> Result<()> {
 /// Another engine's table names its files wherever it likes (Iceberg's by their whole URL):
 /// each must be one this caller may read, as the table is. A folder under `vouched` (a catalog's
 /// table's location, whose credentials its catalog vouched for) needs no secret.
-async fn check_files(lake: &Lake, m: &TableMeta, vouched: Option<&str>) -> Result<()> {
+async fn check_files(lake: &Lake, m: &TableMeta, vouched: Option<&str>, scope: &crate::rights::Scope) -> Result<()> {
     if reads_any_url() {
         return Ok(());
     }
@@ -430,7 +430,7 @@ async fn check_files(lake: &Lake, m: &TableMeta, vouched: Option<&str>) -> Resul
     folders.dedup();
     // (a data folder the client put in the lake's files is the lake's, as its files are: `own_file` says so, and only
     // a name that stays in `files/` passes it, so a table there reads as a page reads it)
-    folders.into_iter().filter(|d| !own_file(lake, &format!("{d}/"))).try_for_each(|d| allowed(&secrets, &format!("{d}/")))
+    folders.into_iter().filter(|d| !own_file(lake, &format!("{d}/"))).try_for_each(|d| allowed(&secrets, &format!("{d}/"), scope))
 }
 
 /// What to do about a URL no secret covers: the statement that would, for its store.
@@ -480,16 +480,16 @@ async fn retyped_meta(spec: &Spec) -> Result<Option<TableMeta>> {
 }
 
 /// The files, their schema, and (Parquet) each file's rows and column ranges from its footer.
-async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
+async fn resolve(lake: &Lake, spec: &Spec, scope: &crate::rights::Scope) -> Result<TableMeta> {
     match spec.format.as_str() {
-        "kafka" => return Ok({ let mut entry = crate::kafka_client::resolve(lake, &spec.urls[0]).await?; entry.ext = Some(spec.clone()); entry }),
-        "share" => return Ok({ let mut entry = crate::sharing_client::read(lake, spec).await?; entry.ext = Some(spec.clone()); entry }), // (its files' links are the provider's: ADR-046)
+        "kafka" => return Ok({ let mut entry = crate::kafka_client::resolve(lake, &spec.urls[0], scope).await?; entry.ext = Some(spec.clone()); entry }),
+        "share" => return Ok({ let mut entry = crate::sharing_client::read(lake, spec, scope).await?; entry.ext = Some(spec.clone()); entry }), // (its files' links are the provider's: ADR-046)
         "delta" | "iceberg" => {
             let (mut m, d) = match spec.format.as_str() {
-                "delta" => (table_meta(crate::read_delta::resolve(lake, &crate::ddl::full(&spec.urls[0])?, crate::ext_names::version(spec)?).await?), None), // (a folder named relatively: from where the node runs)
-                _ => crate::read_iceberg::resolve(lake, &spec.urls[0], &spec.options).await?,
+                "delta" => (table_meta(crate::read_delta::resolve(&crate::ext::Asking { lake, scope }, &crate::ddl::full(&spec.urls[0])?, crate::ext_names::version(spec)?).await?), None), // (a folder named relatively: from where the node runs)
+                _ => crate::read_iceberg::resolve(lake, &spec.urls[0], &spec.options, scope).await?,
             };
-            check_files(lake, &m, d.as_ref().map(|d| d.prefix.as_str())).await?;
+            check_files(lake, &m, d.as_ref().map(|d| d.prefix.as_str()), scope).await?;
             if let Some(d) = &d {
                 crate::catalogs::rehome(d, &mut m); // (its files are read through the table's own delegated store)
             }
@@ -512,7 +512,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
         None => vec![],
     };
     for u in &spec.urls {
-        register(lake, u).await?;
+        register(lake, u, scope).await?;
     }
     let undeclared = declared.is_none();
     let (columns, files) = crate::ext_names::files_table(&state, spec, declared, &hive_types, types_of(spec).await?.as_deref(), |u| undeclared.then(|| crate::codes::coded("42P01", format!("no file matches {}", shown(lake, u))))).await?; // (declared: none yet is an empty table)
@@ -522,11 +522,11 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
 /// The files a spec's path names, as `resolve` lists them (a glob, or a folder's files of the
 /// format): each one's full URL and its listing (its e-tag, size and time), sorted by name. Checked
 /// as a table's files are: a path of this machine only for the program that started the node.
-pub(crate) async fn objects(lake: &Lake, spec: &Spec) -> Result<Vec<(String, object_store_df::ObjectMeta)>> {
+pub(crate) async fn objects(lake: &Lake, spec: &Spec, scope: &crate::rights::Scope) -> Result<Vec<(String, object_store_df::ObjectMeta)>> {
     let spec = for_caller(lake, spec.clone())?;
-    check(lake, &spec).await?;
+    check(lake, &spec, scope).await?;
     let u = &spec.urls[0];
-    register(lake, u).await?;
+    register(lake, u, scope).await?;
     let state = lake.session().state();
     let first = Spec { urls: vec![u.clone()], ..spec.clone() };
     let found = listed(&state, &first, |_| None).await?;
@@ -536,12 +536,12 @@ pub(crate) async fn objects(lake: &Lake, spec: &Spec) -> Result<Vec<(String, obj
 /// The rows of `files` of an `ext:` table, as `schema`: DataFusion's own readers, without the hot
 /// columns (outside the lake, a file may change under the same name). Parquet and the other files
 /// are read by `ext_names::read`, the reader a page shares.
-pub async fn read(lake: &Lake, ctx: &datafusion::prelude::SessionContext, files: &[&DataFile], schema: &datafusion::arrow::datatypes::SchemaRef, spec: &Spec, table: Option<&crate::scan::Table>) -> Result<datafusion::prelude::DataFrame> {
+pub async fn read(lake: &Lake, ctx: &datafusion::prelude::SessionContext, files: &[&DataFile], schema: &datafusion::arrow::datatypes::SchemaRef, spec: &Spec, table: Option<&crate::scan::Table>, scope: &crate::rights::Scope) -> Result<datafusion::prelude::DataFrame> {
     if ["delta", "iceberg", "share"].contains(&spec.format.as_str()) {
         return crate::scan::read(ctx, files, schema, table).await; // (another engine's table, or a share: its partition values, its deletes)
     }
     if spec.format == "kafka" {
-        return crate::kafka_client::read(lake, ctx, files, schema).await; // (a topic)
+        return crate::kafka_client::read(lake, ctx, files, schema, scope).await; // (a topic)
     }
     crate::ext_names::read(ctx, files, schema, spec).await
 }
@@ -556,7 +556,7 @@ fn root(url: &str) -> Option<String> {
 
 /// DataFusion reads `url` through a store for its bucket, made with the secret covering it (or,
 /// for the node's owner, the node's own credentials). The lake's own bucket keeps its store.
-pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
+pub(crate) async fn register(lake: &Lake, url: &str, scope: &crate::rights::Scope) -> Result<()> {
     if is_blob(url) {
         return register_blob(lake, url).await; // (before any secret is listed or covers it)
     }
@@ -570,7 +570,7 @@ pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
         return Ok(()); // (a lake's bucket: its store, the SSD tier's)
     }
     let secrets = list(lake).await?;
-    let secret = covering(&secrets, url);
+    let secret = covering(&secrets, url, scope);
     let made_with = secret.as_ref().map_or("the node's own".to_string(), |(n, s)| format!("{n}:{}", s.sealed));
     let stores = lake.state::<Stores>()?;
     if stores.with(&root).as_ref() == Some(&made_with) {
@@ -656,23 +656,34 @@ async fn register_blob(lake: &Lake, url: &str) -> Result<()> {
 async fn register_blob(_: &Lake, url: &str) -> Result<()> { off_page(url) }
 
 /// The store `url` is read through (made as `register` makes it), and its path there.
-pub async fn store(lake: &Lake, url: &str) -> Result<(Arc<dyn object_store_df::ObjectStore>, object_store_df::path::Path)> {
+pub async fn store(lake: &Lake, url: &str, scope: &crate::rights::Scope) -> Result<(Arc<dyn object_store_df::ObjectStore>, object_store_df::path::Path)> {
     if let Some(found) = crate::catalogs::scoped(url) { return Ok(found); } // (a catalog's table's location, while it is read or written: its delegated store)
-    register(lake, url).await?;
+    register(lake, url, scope).await?;
     let u = ListingTableUrl::parse(url)?;
     Ok((lake.rt.object_store(&u)?, u.prefix().clone()))
 }
 
-/// A node reads another engine's files through its lake's stores and its own session (`reach.rs`).
-impl crate::reach::Reach for Lake {
+/// A node reads another engine's files through its lake's stores and its own session (`reach.rs`), for whoever asks: each
+/// file is the asker's to read (`scope`), as the table's own files are (`store`, `check_urls`).
+pub struct Asking<'a> {
+    pub lake: &'a Lake,
+    pub scope: &'a crate::rights::Scope,
+}
+
+impl crate::reach::Reach for Asking<'_> {
     fn store(&self, url: &str) -> impl std::future::Future<Output = Result<(Arc<dyn object_store_df::ObjectStore>, object_store_df::path::Path)>> + Send {
-        store(self, url)
+        store(self.lake, url, self.scope)
     }
-    fn session(&self) -> datafusion::prelude::SessionContext { Lake::session(self) }
-    fn named(&self, urls: &[&str]) -> impl std::future::Future<Output = Result<()>> + Send {
-        check_urls(self, urls)
+    fn session(&self) -> datafusion::prelude::SessionContext { Lake::session(self.lake) }
+    fn named(&self, urls: &[&str]) -> impl std::future::Future<Output = Result<()>> + Send { check_urls(self.lake, urls, self.scope) }
+    fn state<P: crate::lake_state::LakeState>(&self) -> Option<Arc<P>> { Lake::state::<P>(self.lake).ok() }
+}
+
+impl crate::keep_load::Source for Asking<'_> {
+    fn listed(&self, name: &str) -> impl std::future::Future<Output = Result<Option<TableMeta>>> + Send { meta(self.lake, name, self.scope) }
+    fn store(&self, url: &str) -> impl std::future::Future<Output = Result<(Arc<dyn object_store_df::ObjectStore>, object_store_df::path::Path)>> + Send {
+        store(self.lake, url, self.scope)
     }
-    fn state<P: crate::lake_state::LakeState>(&self) -> Option<Arc<P>> { Lake::state::<P>(self).ok() }
 }
 
 /// A table read from another engine's log, as a node's table (its columns, names and files; the rest is the
@@ -851,11 +862,11 @@ pub async fn attached_over(lake: &Lake, name: &str) -> Result<Vec<String>> {
 
 /// Leader: `ATTACH shop [AS name]`, a connection's tables as a database: checked as ATTACH 'url' … (TYPE t, …) is, with the
 /// connection's type, url and options, and read through the connection from then on (`attached`).
-pub async fn attach_connection(lake: &Lake, name: &str, connection: &str) -> Result<serde_json::Value> {
+pub async fn attach_connection(lake: &Lake, name: &str, connection: &str, scope: &crate::rights::Scope) -> Result<serde_json::Value> {
     let d: crate::connections::Definition = lake.cat.get(&crate::connections::key(connection)).await?
         .ok_or_else(|| crate::codes::coded("42704", format!("no connection {connection}: ATTACH {connection} attaches a connection's tables (CREATE CONNECTION {connection} TYPE delta WITH (url = '…'))")))?;
     let (url, options) = of_connection(&d);
-    attach_as(lake, name, &url, &d.ty, options, Some(connection)).await
+    attach_as(lake, name, &url, &d.ty, options, Some(connection), scope).await
 }
 
 /// Is this attached as another engine's tables?
@@ -871,11 +882,11 @@ pub async fn outside_target(lake: &Lake, name: &str) -> Result<Option<String>> {
 }
 
 /// Leader: keep an attachment of another engine's tables.
-pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>) -> Result<serde_json::Value> {
-    attach_as(lake, name, url, kind, options, None).await
+pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>, scope: &crate::rights::Scope) -> Result<serde_json::Value> {
+    attach_as(lake, name, url, kind, options, None, scope).await
 }
 
-async fn attach_as(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>, connection: Option<&str>) -> Result<serde_json::Value> {
+async fn attach_as(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>, connection: Option<&str>, scope: &crate::rights::Scope) -> Result<serde_json::Value> {
     crate::ddl::check(name)?;
     // (its TYPE and its options are a connection type's, from the registry: ATTACH and CREATE CONNECTION list the same ones)
     use crate::connections::attached as attachable;
@@ -894,7 +905,7 @@ async fn attach_as(lake: &Lake, name: &str, url: &str, kind: &str, options: BTre
     }));
     let mut options = options;
     if kind == "share" {
-        options = crate::sharing_client::accept(lake, name, url, options).await?; // (its token kept as a secret)
+        options = crate::sharing_client::accept(lake, name, url, options, scope).await?; // (its token kept as a secret)
     }
     if let Some(k) = options.keys().find(|k| !t.options.iter().any(|o| o.name != "url" && o.name == k.as_str())) {
         let known: Vec<&str> = t.option_names().into_iter().filter(|o| *o != "url").collect();
@@ -910,7 +921,7 @@ async fn attach_as(lake: &Lake, name: &str, url: &str, kind: &str, options: BTre
     if let Some(t) = options.get("endpoint_type").cloned() {
         crate::catalogs::service(&t)?; // (one it doesn't know: refused by name, before its secret is asked for)
         let secret = options.get("secret").cloned().with_context(|| format!("ATTACH … (TYPE iceberg, ENDPOINT_TYPE {t}) needs SECRET name: a TYPE s3 secret with the AWS keys"))?;
-        let keys = crate::catalogs::aws_keys(lake, &secret).await?;
+        let keys = crate::catalogs::aws_keys(lake, &secret, scope).await?;
         let at = crate::catalogs::aws_endpoint(&t, &crate::catalogs::region(url, &keys)?)?;
         options.entry("endpoint".to_string()).or_insert(at);
     }
@@ -920,7 +931,7 @@ async fn attach_as(lake: &Lake, name: &str, url: &str, kind: &str, options: BTre
     if let Some(secret) = options.get("secret").filter(|_| !options.contains_key("endpoint_type")) {
         let at = options.get("endpoint").unwrap_or(&url.to_string()).clone();
         let found = list(lake).await?.into_iter().find(|(n, _)| n == secret).with_context(|| format!("no secret {secret}"))?;
-        ensure!(covering(&[found.clone()], &at).is_some(), "secret {secret}'s SCOPE doesn't cover {at} (CREATE OR REPLACE SECRET {secret} (…, SCOPE '{at}'))");
+        ensure!(covering(&[found.clone()], &at, scope).is_some(), "secret {secret}'s SCOPE doesn't cover {at} (CREATE OR REPLACE SECRET {secret} (…, SCOPE '{at}'))");
     }
     let a = Attached { kind: kind.into(), url: url.trim_end_matches('/').into(), options, connection: connection.map(str::to_string) };
     if let Some(had) = lake.cat.get::<Attached>(&attached_key(name)).await? {
@@ -943,15 +954,15 @@ pub async fn detach(lake: &Lake, name: &str) -> Result<bool> {
 }
 
 /// The settings of the secret covering `url`, for a client of the service it names (Kafka).
-pub async fn secret_for(lake: &Lake, url: &str) -> Result<Option<BTreeMap<String, String>>> {
-    covering(&list(lake).await?, url).map(|(n, s)| open(&n, &s)).transpose()
+pub async fn secret_for(lake: &Lake, url: &str, scope: &crate::rights::Scope) -> Result<Option<BTreeMap<String, String>>> {
+    covering(&list(lake).await?, url, scope).map(|(n, s)| open(&n, &s)).transpose()
 }
 
 /// How the node reaches `url`, a service a statement names (a REST catalog's endpoint, its token server), for this
 /// caller (`net::for_endpoint`): inside the node's network for the program that started it, on a page (`reads_any_url`),
 /// and through a secret an admin made (`inside`); through a reader's own temporary secret, the public internet alone.
-pub(crate) async fn reach_service(lake: &Lake, url: &str) -> Result<crate::net::Policy> {
-    let inside = reads_any_url() || covering(&list(lake).await?, url).is_some_and(|(_, s)| inside(&s));
+pub(crate) async fn reach_service(lake: &Lake, url: &str, scope: &crate::rights::Scope) -> Result<crate::net::Policy> {
+    let inside = reads_any_url() || covering(&list(lake).await?, url, scope).is_some_and(|(_, s)| inside(&s));
     crate::net::for_endpoint(&url::Url::parse(url).with_context(|| url.to_string())?, inside)
 }
 
@@ -959,15 +970,15 @@ pub(crate) async fn reach_service(lake: &Lake, url: &str) -> Result<crate::net::
 fn inside(s: &Secret) -> bool { !s.temporary || s.trusted }
 
 /// A recipient's token for a Delta Sharing server, from the secret of TYPE share covering it.
-pub async fn share_token(lake: &Lake, endpoint: &str) -> Result<Option<String>> {
+pub async fn share_token(lake: &Lake, endpoint: &str, scope: &crate::rights::Scope) -> Result<Option<String>> {
     let all: Vec<(String, Secret)> = list(lake).await?.into_iter().filter(|(_, s)| s.kind == "share").collect();
-    let Some((name, secret)) = covering(&all, endpoint) else { return Ok(None) };
+    let Some((name, secret)) = covering(&all, endpoint, scope) else { return Ok(None) };
     Ok(open(&name, &secret)?.get("token").cloned())
 }
 
 /// The token a Pondra server's leader is asked with (ADR-058), from the TYPE pondra secret covering it.
-fn pondra_token(secrets: &[(String, Secret)], endpoint: &str) -> Result<Option<String>> {
-    let found = secrets.iter().filter(|(n, x)| x.kind == "pondra" && usable(n, x))
+fn pondra_token(secrets: &[(String, Secret)], endpoint: &str, scope: &crate::rights::Scope) -> Result<Option<String>> {
+    let found = secrets.iter().filter(|(n, x)| x.kind == "pondra" && usable(n, x, scope))
         .filter(|(_, x)| x.scope.as_deref().is_none_or(|p| within(endpoint, p)))
         .max_by_key(|(_, x)| x.scope.as_ref().map_or(0, |p| p.len() + 1));
     let Some((name, secret)) = found else { return Ok(None) };
@@ -976,36 +987,36 @@ fn pondra_token(secrets: &[(String, Secret)], endpoint: &str) -> Result<Option<S
 
 /// Say how a node reaches the lake at `dir` on another server (`reaches::Reach`, kept in its `reaches`): with the
 /// bucket secret among `secrets` covering it, and its leader at `endpoint` with the pondra secret covering that.
-pub fn reach_with(reaches: &crate::reaches::Reaches, secrets: &[(String, Secret)], dir: &str, read_only: bool, endpoint: Option<&str>) -> Result<()> {
-    reach_by(reaches, covering(secrets, dir), secrets, dir, read_only, endpoint)
+pub fn reach_with(reaches: &crate::reaches::Reaches, secrets: &[(String, Secret)], dir: &str, read_only: bool, endpoint: Option<&str>, scope: &crate::rights::Scope) -> Result<()> {
+    reach_by(reaches, covering(secrets, dir, scope), secrets, dir, read_only, endpoint, scope)
 }
 
 /// A branch's base on another server (`branch::load`, `make`), read with the key lent to the branch
 /// for it (`lent`): the one use of a lent key, and only for the base's own folder.
-pub fn reach_base(reaches: &crate::reaches::Reaches, secrets: &[(String, Secret)], dir: &str, endpoint: Option<&str>) -> Result<()> {
-    reach_by(reaches, scoped(secrets.iter().filter(|(_, s)| s.lent), dir), secrets, dir, true, endpoint)
+pub fn reach_base(reaches: &crate::reaches::Reaches, secrets: &[(String, Secret)], dir: &str, endpoint: Option<&str>, scope: &crate::rights::Scope) -> Result<()> {
+    reach_by(reaches, scoped(secrets.iter().filter(|(_, s)| s.lent), dir), secrets, dir, true, endpoint, scope)
 }
 
-fn reach_by(reaches: &crate::reaches::Reaches, hit: Option<(String, Secret)>, secrets: &[(String, Secret)], dir: &str, read_only: bool, endpoint: Option<&str>) -> Result<()> {
+fn reach_by(reaches: &crate::reaches::Reaches, hit: Option<(String, Secret)>, secrets: &[(String, Secret)], dir: &str, read_only: bool, endpoint: Option<&str>, scope: &crate::rights::Scope) -> Result<()> {
     let params = hit.as_ref().map(|(n, s)| open(n, s)).transpose()?;
-    let token = endpoint.map(|e| pondra_token(secrets, e)).transpose()?.flatten();
+    let token = endpoint.map(|e| pondra_token(secrets, e, scope)).transpose()?.flatten();
     let secret = hit.map(|(n, _)| n);
     reaches.by(dir, crate::reaches::Reach { read_only, params, endpoint: endpoint.map(str::to_string), token, secret });
     Ok(())
 }
 
 /// The same, with this lake's secrets, for its node.
-pub async fn reach(lake: &Lake, dir: &str, read_only: bool, endpoint: Option<&str>) -> Result<()> {
-    reach_with(&lake.node.reaches, &list(lake).await?, dir, read_only, endpoint)
+pub async fn reach(lake: &Lake, dir: &str, read_only: bool, endpoint: Option<&str>, scope: &crate::rights::Scope) -> Result<()> {
+    reach_with(&lake.node.reaches, &list(lake).await?, dir, read_only, endpoint, scope)
 }
 
 /// A place this lake copies itself to or from (a backup's, a restore's: ADR-070), reached with the
 /// bucket secret whose SCOPE covers it when one does, else with the environment's credentials. (Only
 /// on a hit: a place registered with none would hide a key a broader place was registered with.)
-pub async fn reach_place(lake: &Lake, dir: &str) -> Result<()> {
+pub async fn reach_place(lake: &Lake, dir: &str, scope: &crate::rights::Scope) -> Result<()> {
     let secrets = list(lake).await?;
-    if let Some(hit) = covering(&secrets, dir) {
-        reach_by(&lake.node.reaches, Some(hit), &secrets, dir, false, None)?;
+    if let Some(hit) = covering(&secrets, dir, scope) {
+        reach_by(&lake.node.reaches, Some(hit), &secrets, dir, false, None, scope)?;
     }
     Ok(())
 }
@@ -1028,8 +1039,8 @@ pub async fn lent(lake: &Lake, urls: &[String]) -> Result<Vec<(String, Secret)>>
 
 /// The bearer token for a REST catalog, from the secret covering it: its TOKEN, or one its
 /// CLIENT_ID and CLIENT_SECRET get (OAuth's client credentials), kept until it expires.
-pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
-    let Some((name, secret)) = covering(&list(lake).await?, url).filter(|(_, s)| s.kind == "iceberg") else { return Ok(None) };
+pub async fn rest_token(lake: &Lake, url: &str, scope: &crate::rights::Scope) -> Result<Option<String>> {
+    let Some((name, secret)) = covering(&list(lake).await?, url, scope).filter(|(_, s)| s.kind == "iceberg") else { return Ok(None) };
     let p = open(&name, &secret)?;
     if let Some(t) = p.get("token") {
         return Ok(Some(t.clone()));
@@ -1580,14 +1591,14 @@ pub async fn list(lake: &Lake) -> Result<Vec<(String, Secret)>> {
     Ok(all)
 }
 
-/// May the request being served use this secret? Its own temporary one, or one a user is granted
+/// May `scope` (the request being served's) use this secret? Its own temporary one, or one a user is granted
 /// USAGE on (`GRANT USAGE ON SECRET`); a token's or a superuser's, any but a key lent to read a base.
-pub(crate) fn usable(name: &str, s: &Secret) -> bool { !s.lent && (s.temporary || crate::rights::scope().secret(name)) }
+pub(crate) fn usable(name: &str, s: &Secret, scope: &crate::rights::Scope) -> bool { !s.lent && (s.temporary || scope.secret(name)) }
 
 /// The secret for a URL: the longest scope that is a prefix of it (no scope: every URL of its
 /// type's schemes).
-pub(crate) fn covering(secrets: &[(String, Secret)], url: &str) -> Option<(String, Secret)> {
-    scoped(secrets.iter().filter(|(n, x)| usable(n, x)), url)
+pub(crate) fn covering(secrets: &[(String, Secret)], url: &str, scope: &crate::rights::Scope) -> Option<(String, Secret)> {
+    scoped(secrets.iter().filter(|(n, x)| usable(n, x, scope)), url)
 }
 
 /// The same among `secrets`, whoever asks.
@@ -1606,9 +1617,9 @@ fn within(url: &str, scope: &str) -> bool {
 
 /// A secret's values by its name, for a procedure's code (`server::secret`): its settings, and
 /// `type` and `scope`.
-pub async fn reveal(lake: &Lake, name: &str) -> Result<BTreeMap<String, String>> {
+pub async fn reveal(lake: &Lake, name: &str, scope: &crate::rights::Scope) -> Result<BTreeMap<String, String>> {
     let (name, s) = list(lake).await?.into_iter().find(|(n, _)| n == name).with_context(|| format!("no secret {name} (CREATE SECRET {name} (TYPE generic, …))"))?;
-    ensure!(usable(&name, &s), "permission denied: USAGE on secret {name} (GRANT USAGE ON SECRET {name} TO …)");
+    ensure!(usable(&name, &s, scope), "permission denied: USAGE on secret {name} (GRANT USAGE ON SECRET {name} TO …)");
     let mut values = open(&name, &s)?;
     values.entry("type".into()).or_insert(s.kind.clone());
     Ok(values)
@@ -2054,7 +2065,7 @@ mod tests {
         for _ in 0..2 {
             let dir = std::env::temp_dir().join(format!("pondra-two-stores-{}", uuid::Uuid::new_v4()));
             let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
-            register(&lake, url).await?;
+            register(&lake, url, &crate::rights::Scope::everything()).await?;
             assert!(lake.rt.object_store(&ListingTableUrl::parse(url)?).is_ok(), "the store is in this lake's runtime");
             assert_eq!(lake.state::<Stores>()?.with("https://example.com").as_deref(), Some("the node's own"));
             lakes.push((lake, dir));
@@ -2083,14 +2094,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-own-stage-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         let stage = format!("{}/stage", lake.url.trim_end_matches('/'));
-        let ali = crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Write, scope: crate::rights::Scope::everything(), door: "http", from: None, operator: false, epoch: 0, until: None, reads: false };
-        assert!(!own_stage(&lake, &format!("{stage}/616c69/j1/*.parquet")), "with no sign-in, none");
+        let ali = crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Write, scope: crate::rights::Scope::everything(), door: "http", from: None, operator: false, epoch: 0, until: None, reads: false }.asking();
+        let scope = ali.scope.clone();
+        assert!(!own_stage(&lake, &format!("{stage}/616c69/j1/*.parquet"), &crate::rights::Scope::nothing()), "with no sign-in, none");
         crate::auth::WHO
             .scope(ali, async {
-                assert!(own_stage(&lake, &format!("{stage}/616c69/j1/*.parquet")), "the caller's own staged rows");
-                assert!(!own_stage(&lake, &format!("{stage}/626f62/j1/*.parquet")), "another user's slug");
-                assert!(!own_stage(&lake, &format!("{stage}/616c69/%2E%2E/%2E%2E/files/x.parquet")), "an escaped .. reaches past the slug");
-                assert!(!own_stage(&lake, &format!("{stage}/616c69/../../files/x.parquet")), "a plain .. reaches past the slug");
+                assert!(own_stage(&lake, &format!("{stage}/616c69/j1/*.parquet"), &scope), "the caller's own staged rows");
+                assert!(!own_stage(&lake, &format!("{stage}/626f62/j1/*.parquet"), &scope), "another user's slug");
+                assert!(!own_stage(&lake, &format!("{stage}/616c69/%2E%2E/%2E%2E/files/x.parquet"), &scope), "an escaped .. reaches past the slug");
+                assert!(!own_stage(&lake, &format!("{stage}/616c69/../../files/x.parquet"), &scope), "a plain .. reaches past the slug");
                 assert!(!own_file(&lake, &format!("{stage}/616c69/j1/*.parquet")), "not the lake's files");
             })
             .await;
@@ -2181,7 +2193,7 @@ mod tests {
         assert!(scope(true, async { located("blob:https://o/6f1c") }).await.is_err(), "a LOCATION, as the owner");
         assert!(scope(false, async { located("blob:https://o/6f1c") }).await.is_err(), "a LOCATION, as a client");
         for owner in [true, false] {
-            let listed = scope(owner, check_urls(&lake, &["blob:https://o/6f1c"])).await.unwrap_err();
+            let listed = scope(owner, check_urls(&lake, &["blob:https://o/6f1c"], &crate::rights::Scope::everything())).await.unwrap_err();
             assert_eq!(crate::codes::of(&listed), "0A000", "check_urls as owner {owner}: {listed}");
         }
         let scoped = BTreeMap::from([("type".to_string(), "s3".to_string()), ("scope".to_string(), "blob:https://o/".to_string())]);

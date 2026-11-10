@@ -542,9 +542,9 @@ impl crate::lake_state::LakeState for Clients {
 }
 
 /// A client of the cluster at `url`, with the secret covering it (kept: its connections too).
-pub async fn client(lake: &crate::store::Lake, url: &str) -> Result<Arc<Client>> {
+pub async fn client(lake: &crate::store::Lake, url: &str, scope: &crate::rights::Scope) -> Result<Arc<Client>> {
     let (brokers, _) = parse(url)?;
-    let secret = crate::ext::secret_for(lake, url).await?;
+    let secret = crate::ext::secret_for(lake, url, scope).await?;
     let key = format!("{brokers}|{}", secret.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()).unwrap_or_default());
     let kept = lake.state::<Clients>()?;
     if let Some(c) = kept.0.lock().unwrap().get(&key) {
@@ -565,9 +565,9 @@ pub fn columns() -> Vec<(String, String)> {
 /// A topic as a table of what it holds now: a "file" per partition with records, its offsets
 /// from the earliest kept to the last stable one (`#partition:from-to`), statistics by
 /// partition and offset (so a filter on them skips partitions).
-pub async fn resolve(lake: &crate::store::Lake, url: &str) -> Result<crate::store::TableMeta> {
+pub async fn resolve(lake: &crate::store::Lake, url: &str, scope: &crate::rights::Scope) -> Result<crate::store::TableMeta> {
     let (_, topic) = parse(url)?;
-    let c = client(lake, url).await?;
+    let c = client(lake, url, scope).await?;
     let mut files = vec![];
     for (p, leader) in c.partitions(&topic).await? {
         let (from, to) = (c.offset(&leader, &topic, p, -2).await?, c.offset(&leader, &topic, p, -1).await?);
@@ -583,14 +583,14 @@ pub async fn resolve(lake: &crate::store::Lake, url: &str) -> Result<crate::stor
 
 /// The records of these partitions' ranges, read as the query asks for them (a LIMIT stops
 /// fetching).
-pub async fn read(lake: &crate::store::Lake, ctx: &datafusion::prelude::SessionContext, files: &[&crate::store::DataFile], schema: &datafusion::arrow::datatypes::SchemaRef) -> Result<datafusion::prelude::DataFrame> {
+pub async fn read(lake: &crate::store::Lake, ctx: &datafusion::prelude::SessionContext, files: &[&crate::store::DataFile], schema: &datafusion::arrow::datatypes::SchemaRef, scope: &crate::rights::Scope) -> Result<datafusion::prelude::DataFrame> {
     let mut parts: Vec<Arc<dyn datafusion::physical_plan::streaming::PartitionStream>> = vec![];
     for f in files {
         let (url, range) = f.path.split_once('#').context("a topic's partition")?;
         let (p, offsets) = range.split_once(':').context("a partition's offsets")?;
         let (from, to) = offsets.split_once('-').context("a partition's offsets")?;
         let (_, topic) = parse(url)?;
-        let c = client(lake, url).await?;
+        let c = client(lake, url, scope).await?;
         let p: i32 = p.parse()?;
         let leader = c.partitions(&topic).await?.into_iter().find(|(i, _)| *i == p).map(|(_, l)| l).with_context(|| format!("{topic}[{p}] is gone"))?;
         parts.push(Arc::new(Range { client: c, leader, topic, partition: p, from: from.parse()?, to: to.parse()?, schema: schema.clone() }));
@@ -678,13 +678,13 @@ pub fn batch(schema: &datafusion::arrow::datatypes::SchemaRef, p: i32, recs: &[R
 /// the partition, as Kafka's own producers pick it; without a key, spread over the partitions).
 /// Written by an idempotent producer, every in-sync replica acknowledging: a retry inside the
 /// statement never writes a row twice.
-pub async fn copy_to(lake: &crate::store::Lake, df: datafusion::prelude::DataFrame, to: &str, options: &BTreeMap<String, String>) -> Result<serde_json::Value> {
+pub async fn copy_to(lake: &crate::store::Lake, df: datafusion::prelude::DataFrame, to: &str, options: &BTreeMap<String, String>, scope: &crate::rights::Scope) -> Result<serde_json::Value> {
     use datafusion::arrow::array::{Array, AsArray};
     use futures::StreamExt;
     let (_, topic) = parse(to)?;
     let format = options.get("format").map(|f| f.to_lowercase()).unwrap_or_else(|| "json".into());
     ensure!(["json", "raw"].contains(&format.as_str()), "COPY … TO a topic as {format}: json or raw");
-    let c = client(lake, to).await?;
+    let c = client(lake, to, scope).await?;
     let parts = c.partitions_or_new(&topic, true).await?;
     let names: Vec<String> = df.schema().fields().iter().map(|f| f.name().clone()).collect();
     let key_at = match options.get("key") {
