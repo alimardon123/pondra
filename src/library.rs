@@ -301,7 +301,7 @@ fn halt(held: &Held, node: Option<Node>) {
     drop(node);
 }
 
-async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<Mutex<Option<axum::Router>>>, told: crate::node::Told, first: std::sync::mpsc::Sender<Result<(), String>>) {
+pub(crate) async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<Mutex<Option<axum::Router>>>, told: crate::node::Told, first: std::sync::mpsc::Sender<Result<(), String>>) {
     let crate::node::Told { mut events, mut moves } = told; // (its nodes': their failures, restarts and the close; their lakes' moves)
     // (the router is there exactly while the node runs: a request at any other time is told why)
     let set = |s: State| {

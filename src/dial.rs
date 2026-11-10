@@ -188,6 +188,14 @@ impl Dial for Joined<'_> {
     fn unreached(&self, e: &anyhow::Error) -> bool { e.downcast_ref::<NoAnswer>().is_some() }
 }
 
+/// The error of a call that got no answer (`Dial::unreached` says so of it): the sim's (`sim::net`).
+#[cfg(all(feature = "doors", any(test, feature = "sim")))]
+pub(crate) fn no_answer(why: String) -> anyhow::Error { anyhow::Error::new(NoAnswer(why)) }
+
+/// Is `e` a call that got no answer (`no_answer`)?
+#[cfg(all(feature = "doors", any(test, feature = "sim")))]
+pub(crate) fn is_no_answer(e: &anyhow::Error) -> bool { e.downcast_ref::<NoAnswer>().is_some() }
+
 /// A call a page sent that got no answer: its send failed, or it ran past its time limit (`Paged::unreached`).
 #[derive(Debug)]
 struct NoAnswer(String);

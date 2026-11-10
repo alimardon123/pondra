@@ -16,6 +16,8 @@ pub mod lifecycle;
 pub mod machine;
 // The one clock: what time it is and how long since, which a test's paused time moves too (the sim, redesign step 3).
 pub mod clock;
+// The sim (redesign step 3): a cluster's members in one process, on a test's paused time, with faults placed on purpose.
+#[cfg(all(feature = "doors", any(test, feature = "sim")))] pub mod sim;
 // How a node's calls out reach the network: one client factory, with the policy named by whom a call goes to.
 #[cfg(feature = "lake")] pub mod net;
 // Space of this process's own on this machine's disk: the folders its spills go to.

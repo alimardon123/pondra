@@ -121,12 +121,12 @@ pub struct Native {
 
 /// A node's state as the code below the hosts sees it, with this host's lifecycle: a guest's when `guest`.
 /// It has no host: a failure ends the process (in a library's, it is only said), and its lake can't move.
-pub fn native(guest: bool) -> Arc<crate::node_state::NodeState> { native_with(guest, crate::settings::Values::now(), None) }
+pub fn native(guest: bool) -> Arc<crate::node_state::NodeState> { native_with(guest, crate::settings::Values::now(), None, &Default::default()) }
 
 /// `native`, the node starting with `settings` (`Options::settings`) under `host` (`Options::host`).
-pub(crate) fn native_with(guest: bool, settings: crate::settings::Values, host: Option<Host>) -> Arc<crate::node_state::NodeState> {
+pub(crate) fn native_with(guest: bool, settings: crate::settings::Values, host: Option<Host>, given: &crate::node_state::Given) -> Arc<crate::node_state::NodeState> {
     let claims = Arc::<crate::node_state::Claims>::default();
-    crate::node_state::NodeState::claiming(Arc::new(Native { guest, settings: settings.clone(), host, claims: claims.clone() }), settings, claims)
+    crate::node_state::NodeState::claiming(Arc::new(Native { guest, settings: settings.clone(), host, claims: claims.clone() }), settings, claims, given)
 }
 
 impl crate::lifecycle::Lifecycle for Native {

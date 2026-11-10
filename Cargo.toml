@@ -31,7 +31,7 @@ doors = ["lake", "dep:axum", "dep:clap", "dep:mimalloc", "dep:pgwire", "dep:wind
 heap-profile = ["tikv-jemallocator?/profiling", "tikv-jemallocator?/stats"]
 # The sim (redesign step 3): a test's cluster in one process, on tokio's paused time, which the core's wall clock follows
 # too (`clock.rs`). The library's own tests have it without asking (`cfg(test)`).
-sim = ["lake"]
+sim = ["server"]
 
 [workspace]
 members = ["capi", "launcher"] # (pondra_lib, the C ABI, and the launcher that loads it: `cargo build --workspace` builds them with the program, into one folder; a plain build at the root builds the program alone)

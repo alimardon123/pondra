@@ -9,6 +9,26 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 
+/// Where a node stops on purpose (`Given::stops`): true for a point (`store::maybe_crash`'s names) it stops at now.
+pub type Stops = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// What a host gives the node it starts beside what its process has: none for a native host (`Given::default()`), and for
+/// the sim's member (`sim::Cluster`) how it reaches the others, where it stops on purpose, whom to tell each start's state
+/// to, and that it listens on no port (the sim's network reaches its router).
+#[derive(Clone, Default)]
+pub struct Given {
+    #[cfg(feature = "lake")]
+    pub dial: Option<Arc<dyn crate::calls::Dial>>,
+    pub stops: Option<Stops>,
+    pub started: Option<Arc<dyn Fn(&Arc<NodeState>) + Send + Sync>>,
+    pub no_port: bool,
+}
+
+impl NodeState {
+    /// Does it stop at `point` now, as its host gave (`Given::stops`)?
+    pub fn stops_at(&self, point: &str) -> bool { self.stops.as_ref().is_some_and(|s| s(point)) }
+}
+
 /// A node's lifecycle and its doors' state, shared by every lake it opens.
 pub struct NodeState {
     /// What its host does when it must stop or start again.
@@ -25,6 +45,8 @@ pub struct NodeState {
     /// sim's, which reaches the members in its process.
     #[cfg(feature = "lake")]
     pub dial: std::sync::Arc<dyn crate::dial::Dial>,
+    /// Where it stops on purpose, as its host gave (`Given::stops`: the sim's member), beside `PONDRA_CRASH`'s points.
+    pub(crate) stops: Option<Stops>,
     /// The space it spills into past its memory: its process's host's (`scratch::install`), or this machine's folders.
     #[cfg(feature = "lake")]
     pub scratch: std::sync::Arc<dyn crate::scratch::Scratch>,
@@ -73,14 +95,15 @@ impl NodeState {
     /// A node's state on a machine of its own (the sim's member: one with little memory, say).
     pub fn on(life: Life, machine: crate::machine::Mach) -> Arc<NodeState> { NodeState::make(life, machine, crate::settings::Values::now()) }
 
-    /// A node's state whose claims its lifecycle holds too (`node::Native`: a restart says in them that it is coming back).
-    pub fn claiming(life: Life, settings: crate::settings::Values, claims: Arc<Claims>) -> Arc<NodeState> { NodeState::made(life, crate::machine::installed(), settings, claims) }
+    /// A node's state whose claims its lifecycle holds too (`node::Native`: a restart says in them that it is coming back), with
+    /// what its host gave it (`Given`).
+    pub fn claiming(life: Life, settings: crate::settings::Values, claims: Arc<Claims>, given: &Given) -> Arc<NodeState> { NodeState::made(life, crate::machine::installed(), settings, claims, given) }
 
-    fn make(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values) -> Arc<NodeState> { NodeState::made(life, machine, settings, Default::default()) }
+    fn make(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values) -> Arc<NodeState> { NodeState::made(life, machine, settings, Default::default(), &Given::default()) }
 
-    fn made(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values, claims: Arc<Claims>) -> Arc<NodeState> {
+    fn made(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values, claims: Arc<Claims>, given: &Given) -> Arc<NodeState> {
         let reaches = crate::reaches::Reaches::inherited(settings.get(crate::reaches::REACH_VAR));
-        Arc::new(NodeState { reaches, #[cfg(feature = "lake")] tasks: crate::spawns::Tasks::new(life.clone()), life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] dial: crate::dial::native(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, tokens: Default::default(), serving: tokio::sync::watch::Sender::new(false), began: datafusion::common::instant::Instant::now() })
+        Arc::new(NodeState { reaches, #[cfg(feature = "lake")] tasks: crate::spawns::Tasks::new(life.clone()), life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] dial: given.dial.clone().unwrap_or_else(crate::dial::native), stops: given.stops.clone(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, tokens: Default::default(), serving: tokio::sync::watch::Sender::new(false), began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).
