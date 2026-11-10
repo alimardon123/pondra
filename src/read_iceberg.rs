@@ -365,24 +365,8 @@ fn by_count(v: &Value) -> HashMap<i64, i64> {
 /// A bound in Iceberg's single-value form as a file's range bound (text), or None where it can't
 /// bound: floats (NaN), and types not ordered here.
 fn bound(b: &[u8], t: &DataType) -> Option<String> {
-    let le8 = || Some(i64::from_le_bytes(b.get(..8)?.try_into().ok()?));
-    let le4 = || Some(i32::from_le_bytes(b.get(..4)?.try_into().ok()?));
-    let v = match t {
-        DataType::Boolean => ScalarValue::Boolean(Some(*b.first()? != 0)),
-        DataType::Int32 => ScalarValue::Int32(Some(le4()?)),
-        DataType::Int64 => ScalarValue::Int64(Some(le8()?)),
-        DataType::Date32 => ScalarValue::Date32(Some(le4()?)),
-        DataType::Timestamp(TimeUnit::Microsecond, tz) => ScalarValue::TimestampMicrosecond(Some(le8()?), tz.clone()),
-        DataType::Timestamp(TimeUnit::Nanosecond, tz) => ScalarValue::TimestampNanosecond(Some(le8()?), tz.clone()),
-        DataType::Utf8 => ScalarValue::Utf8(Some(String::from_utf8(b.to_vec()).ok()?)),
-        DataType::Decimal128(p, s) => {
-            let mut full = [if b.first()? & 0x80 != 0 { 0xff } else { 0 }; 16];
-            full[16 - b.len().min(16)..].copy_from_slice(&b[b.len().saturating_sub(16)..]);
-            ScalarValue::Decimal128(Some(i128::from_be_bytes(full)), *p, *s)
-        }
-        _ => return None,
-    };
-    crate::manifest::text(&v)
+    // (not a float's: Iceberg's bounds leave NaN out, and a NaN row must not be pruned away)
+    crate::manifest::text(&crate::bounds::decode(b, t).filter(|_| !t.is_floating())?)
 }
 
 /// Might a position-delete file hold rows of `path`? (Its bounds on `file_path`, if it has them.)

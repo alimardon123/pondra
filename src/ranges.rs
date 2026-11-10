@@ -12,7 +12,8 @@
 //! Each node reads the files that overlap its range and keeps the rows inside it (NULLs go to
 //! the first range), so the ranges split a table exactly whatever its files hold. They are only
 //! chosen where that is cheap: few files read by two nodes, and the nodes about even.
-use crate::manifest::{Manifest, Stats};
+use crate::bounds::Ranged;
+use crate::manifest::Manifest;
 use crate::spmd::Part;
 use crate::store::{DataFile, Lake, TableMeta};
 use anyhow::{Context, Result};
@@ -63,8 +64,8 @@ impl Piece {
     fn bytes(&self) -> u64 {
         match self { Piece::File(f) => f.bytes, Piece::Sealed(m) => m.bytes }.max(1)
     }
-    fn stats(&self) -> &Stats {
-        match self { Piece::File(f) => &f.stats, Piece::Sealed(m) => &m.stats }
+    fn ranged(&self) -> &dyn Ranged {
+        match self { Piece::File(f) => f, Piece::Sealed(m) => m }
     }
     /// Whether it may hold a NULL in `column` (not knowing counts as yes).
     fn nulls(&self, column: &str) -> bool {
@@ -99,10 +100,9 @@ async fn pieces(lake: &Lake, meta: &TableMeta, n: usize) -> Result<Vec<Piece>> {
 
 /// Every piece with its range of `column` (None if any piece has none: its rows could be anywhere).
 fn spans(pieces: &[Piece], column: &str, t: &DataType) -> Option<Vec<Span>> {
-    let parse = |s: &String| ScalarValue::try_from_string(s.clone(), t).ok();
     let mut out: Vec<Span> = pieces.iter().map(|p| {
-        let (lo, hi) = p.stats().get(column)?;
-        Some(Span { piece: p.clone(), lo: parse(lo)?, hi: parse(hi)?, nulls: p.nulls(column) })
+        let (lo, hi) = p.ranged().range(column, t)?;
+        Some(Span { piece: p.clone(), lo, hi, nulls: p.nulls(column) })
     }).collect::<Option<_>>()?;
     out.sort_by(|a, b| a.lo.partial_cmp(&b.lo).unwrap_or(Ordering::Equal));
     Some(out)

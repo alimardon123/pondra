@@ -322,16 +322,16 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
     // The files that can hold an old row: by their `_row_id` and `_version` ranges.
     let mut dead = dead(lake, &gone, after, upto).await?;
     dead.sort_unstable();
-    let holds = |s: &crate::manifest::Stats| crate::sys::holds(&dead, s);
+    let holds = |r: &dyn crate::bounds::Ranged| crate::sys::holds(&dead, r);
     let (list, mut sealed, mut hit) = (crate::manifest::list(lake, &meta).await?, vec![], vec![]);
-    for (i, m) in list.iter().enumerate().filter(|(_, m)| holds(&m.stats)) {
-        let files: Vec<DataFile> = crate::manifest::files(lake, m).await?.into_iter().filter(|f| holds(&f.stats)).collect();
+    for (i, m) in list.iter().enumerate().filter(|(_, m)| holds(*m)) {
+        let files: Vec<DataFile> = crate::manifest::files(lake, m).await?.into_iter().filter(|f| holds(f)).collect();
         if !files.is_empty() {
             sealed.push(i);
             hit.extend(files);
         }
     }
-    hit.extend(meta.files.iter().filter(|f| holds(&f.stats)).cloned());
+    hit.extend(meta.files.iter().filter(|f| holds(*f)).cloned());
     if !hit.is_empty() {
         crate::manifest::unseal(lake, table, &mut meta, list, &sealed).await?; // (a sealed file's record changes: it comes back inline)
         // A job per partition (a delete file holds one, as Iceberg asks), of bounded size.
@@ -365,17 +365,18 @@ fn settle(meta: &mut TableMeta, dmeta: &mut TableMeta, now: u64, retain_ms: u64)
     let Some(i) = meta.purges.iter().rposition(|p| now - p.1 >= retain_ms) else { return false };
     let settled = meta.purges[i].0 as i64;
     let kept = now.saturating_sub(meta.retention_secs.map_or(crate::ddl::KEEP_MS, |s| s * 1000)) as i64 * 1000;
-    let version = |s: &crate::manifest::Stats| s.get(crate::text::VERSION).and_then(|(_, hi)| hi.parse::<i64>().ok());
-    let newest = |s: &crate::manifest::Stats| match datafusion::common::ScalarValue::try_from_string(s.get(crate::text::UPDATED)?.1.clone(), &crate::sys::time()) {
-        Ok(datafusion::common::ScalarValue::TimestampMicrosecond(Some(us), _)) => Some(us),
+    use crate::bounds::Ranged;
+    let version = |f: &DataFile| f.longs(crate::text::VERSION).map(|(_, hi)| hi);
+    let newest = |f: &DataFile| match f.end(crate::text::UPDATED, &crate::sys::time(), true) {
+        Some(datafusion::common::ScalarValue::TimestampMicrosecond(Some(us), _)) => Some(us),
         _ => None,
     };
-    let done: Vec<DataFile> = dmeta.files.iter().filter(|f| version(&f.stats).is_some_and(|hi| hi <= settled) && newest(&f.stats).is_some_and(|us| us < kept)).cloned().collect();
+    let done: Vec<DataFile> = dmeta.files.iter().filter(|f| version(f).is_some_and(|hi| hi <= settled) && newest(f).is_some_and(|us| us < kept)).cloned().collect();
     if i == 0 && done.is_empty() {
         return false;
     }
     meta.purges.drain(..i);
-    if let (Some(v), Some(us)) = (done.iter().filter_map(|f| version(&f.stats)).max(), done.iter().filter_map(|f| newest(&f.stats)).max()) {
+    if let (Some(v), Some(us)) = (done.iter().filter_map(version).max(), done.iter().filter_map(newest).max()) {
         meta.past_from = Some(meta.past_from.unwrap_or_default().max((v as u64, us as u64 / 1000)));
     }
     replace(dmeta, &done, vec![]);

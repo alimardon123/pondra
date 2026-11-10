@@ -49,6 +49,7 @@ store_wire platform
 tls platform
 
 # catalog: objects, commits, the log, files and their formats, the lake format
+bounds catalog
 cache catalog
 data_file catalog
 format catalog

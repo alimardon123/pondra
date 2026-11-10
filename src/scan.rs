@@ -150,8 +150,7 @@ pub(crate) fn statistics(f: &crate::data_file::DataFile, rows: u64, counted: boo
     let n = rows.saturating_sub(deleted as u64) as usize;
     (s.num_rows, s.total_byte_size) = (if plain && counted { Exact(n) } else { Inexact(n) }, Inexact(f.bytes as usize));
     for (field, c) in schema.fields().iter().zip(s.column_statistics.iter_mut()).filter(|_| plain) {
-        let parse = |v: &String| ScalarValue::try_from_string(v.clone(), field.data_type()).ok();
-        if let Some((Some(lo), Some(hi))) = f.stats.get(field.name()).map(|(lo, hi)| (parse(lo), parse(hi))) {
+        if let Some((lo, hi)) = crate::bounds::Ranged::range(f, field.name(), field.data_type()) {
             (c.min_value, c.max_value) = (Inexact(lo), Inexact(hi));
         }
     }

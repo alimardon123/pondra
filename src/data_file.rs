@@ -36,6 +36,10 @@ pub struct DataFile {
     /// Append tables: each column's min and max, so queries skip files without opening them.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub stats: crate::data_file::Stats,
+    /// The same, typed (`bounds.rs`): what a file written in a lake of format 8 keeps instead. Read with
+    /// `bounds::Ranged`, which takes these, else `stats`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub bounds: crate::bounds::Bounds,
     /// Partitioned tables: the one partition value this file holds.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub part: String,
