@@ -43,7 +43,7 @@ fn mentioned(sql: &str) -> bool {
 
 /// The front's tree pass (`front::Trees`): each `pondra.diff` and `pondra.diff_steps` call as the query that answers it,
 /// whose views the expander's pass then expands.
-pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "diff.calls", order: 10, run: tree } }
+pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "diff.calls", order: 10, looks: &["diff.diffs"], run: tree } }
 
 fn tree<'a>(front: &'a (dyn crate::front::Front + 'static), stmts: &'a mut [Statement], facts: &'a crate::front::Facts<'_>) -> futures::future::BoxFuture<'a, Result<bool>> {
     Box::pin(async move {

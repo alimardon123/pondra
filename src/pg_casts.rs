@@ -136,7 +136,7 @@ impl VisitorMut for Casts {
 
 /// The front's tree pass (`front::Trees`): JSON's set functions, uuid and json casts, `pg_typeof`, a lateral
 /// `generate_series`, array literals and an enum's casts as text (`rewrite`).
-pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "pg_casts.rewrite", order: 50, run: tree } }
+pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "pg_casts.rewrite", order: 50, looks: &["text.names_a_type"], run: tree } }
 
 fn tree<'a>(front: &'a (dyn crate::front::Front + 'static), stmts: &'a mut [Statement], _: &'a crate::front::Facts<'_>) -> futures::future::BoxFuture<'a, Result<bool>> { Box::pin(rewrite(front, stmts)) }
 

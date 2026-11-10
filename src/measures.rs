@@ -948,7 +948,7 @@ impl VisitorMut for Leftover<'_> {
 
 /// The front's tree pass (`front::Trees`): the measures a statement reads, at its own grain (ADR-065 §3), before the
 /// expander's pass expands what they put in (a view's FROM, its macros).
-pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "measures.rewrite", order: 20, run: tree } }
+pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "measures.rewrite", order: 20, looks: &[], run: tree } }
 
 fn tree<'a>(_: &'a (dyn crate::front::Front + 'static), stmts: &'a mut [Statement], facts: &'a crate::front::Facts<'_>) -> futures::future::BoxFuture<'a, Result<bool>> {
     Box::pin(async move {

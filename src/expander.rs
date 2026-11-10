@@ -727,7 +727,7 @@ const LARGEST: usize = 100_000;
 /// The front's tree pass (`front::Trees`): the macros, functions and views a statement calls or names, a FROM first and
 /// an attached catalog's names, expanded, when the front found one (`Facts::expands`). A view's or a function's own
 /// statements (CREATE VIEW, MACRO, FUNCTION) keep their text.
-pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "expander.expand", order: 30, run: tree } }
+pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "expander.expand", order: 30, looks: &[], run: tree } }
 
 fn tree<'a>(front: &'a (dyn crate::front::Front + 'static), stmts: &'a mut [Statement], facts: &'a crate::front::Facts<'_>) -> futures::future::BoxFuture<'a, Result<bool>> {
     Box::pin(async move {

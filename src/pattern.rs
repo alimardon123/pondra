@@ -64,7 +64,7 @@ pub fn wanted(sql: &str) -> bool {
 }
 
 /// The front's tree pass (`front::Trees`): MATCH_RECOGNIZE as SQL around one window, where the text has one.
-pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "pattern.rewrite", order: 40, run: tree } }
+pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "pattern.rewrite", order: 40, looks: &["pattern.wanted"], run: tree } }
 
 fn tree<'a>(front: &'a (dyn crate::front::Front + 'static), stmts: &'a mut [Statement], facts: &'a crate::front::Facts<'_>) -> futures::future::BoxFuture<'a, Result<bool>> {
     Box::pin(async move { Ok(wanted(facts.sql) && rewrite(front, stmts).await?) })

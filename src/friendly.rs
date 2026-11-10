@@ -733,7 +733,7 @@ struct Level {
 }
 
 /// The front's tree pass (`front::Trees`): DuckDB's and Snowflake's forms (`rewrite`), last.
-pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "friendly.rewrite", order: 60, run: tree } }
+pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "friendly.rewrite", order: 60, looks: &["friendly.forms", "friendly.marked", "friendly.aliases"], run: tree } }
 
 fn tree<'a>(front: &'a (dyn crate::front::Front + 'static), stmts: &'a mut [Statement], _: &'a crate::front::Facts<'_>) -> futures::future::BoxFuture<'a, Result<bool>> { Box::pin(rewrite(front, stmts)) }
 

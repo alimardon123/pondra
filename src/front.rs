@@ -13,7 +13,7 @@ use futures::future::BoxFuture;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// What the front asks of where it runs. Asked once a statement, or once a name, never once a batch. The front runs the
 /// core passes itself (the host's own statements, the measures, DuckDB's and Snowflake's forms), so every host answers
@@ -166,6 +166,10 @@ pub type TreeRun = for<'a, 'f> fn(&'a (dyn Front + 'static), &'a mut [Statement]
 pub struct TreePass {
     pub name: &'static str,
     pub order: u16,
+    /// The `Wants` passes (`passes.rs`) whose looks find what it rewrites in a text. While the tree is still the text's
+    /// (no pass before it changed it, and nothing is expanded into it), it runs only when one of them has something to
+    /// do there. None: it runs on every tree, and asks `Facts` itself.
+    pub looks: &'static [&'static str],
     pub run: TreeRun,
 }
 
@@ -175,10 +179,21 @@ pub struct TreePass {
 #[derive(Default)]
 pub struct Trees {
     all: Vec<TreePass>,
+    /// Each pass's looks as the passes section's bits (`Passes::wants_mask`); None for a pass that runs on every tree.
+    masks: OnceLock<Vec<Option<u128>>>,
 }
 
 impl crate::registry::Section for Trees {
     const NAME: &'static str = "tree passes";
+
+    /// Each look a pass names is a `Wants` pass of the build.
+    fn check(&self, r: &crate::registry::Registry) -> std::result::Result<(), String> {
+        let passes = r.find::<crate::passes::Passes>();
+        match self.all.iter().find(|p| !p.looks.is_empty() && passes.and_then(|s| s.wants_mask(p.looks)).is_none()) {
+            Some(p) => Err(format!("tree pass {}: a look it names ({}) is no Wants pass of this build", p.name, p.looks.join(", "))),
+            None => Ok(()),
+        }
+    }
 }
 
 impl Trees {
@@ -195,6 +210,15 @@ impl Trees {
     /// The passes, in the order the front runs them.
     pub fn all(&self) -> &[TreePass] {
         &self.all
+    }
+
+    /// The looks of the pass at `i`, as the build's passes section's bits; None for one that runs on every tree.
+    fn looks(&self, i: usize) -> Option<u128> {
+        let masks = self.masks.get_or_init(|| {
+            let passes = crate::passes::get();
+            self.all.iter().map(|p| if p.looks.is_empty() { None } else { passes.wants_mask(p.looks) }).collect()
+        });
+        masks[i]
     }
 }
 
@@ -228,7 +252,8 @@ pub async fn expand<H: Host + 'static>(host: &H, sql: &str, views: &HashMap<Stri
     let as_written = || Ok(crate::expander::named_apart(sql).unwrap_or_else(|| sql.to_string()));
     let measure_views = Host::measure_views(host, sql).await?;
     let measured = crate::measures::wanted(sql, &measure_views); // (a view with measures read, or a measure named)
-    if !expands && !measured && !passes.wants(sql)? { // (a tree pass's look: friendly's forms, MATCH_RECOGNIZE, a type of one's own)
+    let mut wants = passes.wants(sql);
+    if !expands && !measured && !wants.any()? { // (a tree pass's look: friendly's forms, MATCH_RECOGNIZE, a type of one's own)
         return as_written();
     }
     // (read as Pondra's SQL, the core's language, `parsed::pondra`: parsed once for the front's looks, a text generic refuses
@@ -247,8 +272,19 @@ pub async fn expand<H: Host + 'static>(host: &H, sql: &str, views: &HashMap<Stri
     // (the registry's tree passes, in order (`Trees`): `pondra.diff`, the measures at the query's own grain (ADR-065 §3),
     // the expander, MATCH_RECOGNIZE as SQL around one window, Postgres's casts and JSON set functions, DuckDB's and
     // Snowflake's forms; each asks the host as a `Front`)
-    let mut changed = read_apart;
-    for pass in trees().all() {
+    let mut changed = facts.read_apart; // (a tree the fallback read is printed whatever the passes do)
+    let trees = trees();
+    for (i, pass) in trees.all().iter().enumerate() {
+        // (while the tree is still the text's, a pass runs only where one of its looks finds something in the text)
+        if !(changed || facts.expands() || trees.looks(i).map_or(Ok(true), |m| wants.any_of(m))?) {
+            if crate::passes::checked() {
+                // (checked, it runs anyway on a copy, and must find nothing either: else its looks are short of what it does)
+                let mut copy = stmts.clone();
+                let found = (pass.run)(host as &dyn Front, &mut copy, &facts).await?;
+                anyhow::ensure!(!found, "tree pass {} rewrote a text its looks ({}) found nothing in: {sql}", pass.name, pass.looks.join(", "));
+            }
+            continue;
+        }
         changed |= (pass.run)(host as &dyn Front, &mut stmts, &facts).await?;
     }
     if !changed {
@@ -270,12 +306,40 @@ mod tests {
         let names: Vec<&str> = trees().all().iter().map(|p| p.name).collect();
         assert_eq!(names, ["diff.calls", "measures.rewrite", "expander.expand", "pattern.rewrite", "pg_casts.rewrite", "friendly.rewrite"]);
         let mut t = Trees::default();
-        t.add(TreePass { name: "b", order: 2, run: none });
-        t.add(TreePass { name: "a", order: 1, run: none });
+        t.add(TreePass { name: "b", order: 2, looks: &[], run: none });
+        t.add(TreePass { name: "a", order: 1, looks: &[], run: none });
         assert_eq!(t.all().iter().map(|p| p.name).collect::<Vec<_>>(), ["a", "b"], "in their order, not as added");
-        let order = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.add(TreePass { name: "c", order: 1, run: none }))).unwrap_err();
+        let order = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.add(TreePass { name: "c", order: 1, looks: &[], run: none }))).unwrap_err();
         assert_eq!(order.downcast_ref::<String>().map(String::as_str), Some("tree passes a and c both take order 1"));
-        let name = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.add(TreePass { name: "a", order: 3, run: none }))).unwrap_err();
+        let name = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.add(TreePass { name: "a", order: 3, looks: &[], run: none }))).unwrap_err();
         assert_eq!(name.downcast_ref::<String>().map(String::as_str), Some("two tree passes are named a"));
+        // (a look is a Wants pass of the build: not a text pass, not a name there is none of)
+        use crate::registry::Section;
+        assert_eq!(trees().check(crate::registry::get()), Ok(()));
+        for looks in [&["friendly.text"][..], &["friendly.forms", "nope"]] {
+            let mut t = Trees::default();
+            t.add(TreePass { name: "x", order: 1, looks, run: none });
+            assert_eq!(t.check(crate::registry::get()), Err(format!("tree pass x: a look it names ({}) is no Wants pass of this build", looks.join(", "))));
+        }
+    }
+
+    #[test]
+    fn a_tree_pass_runs_where_its_looks_find_something() {
+        let passes = crate::passes::get();
+        let mask = |names: &[&str]| passes.wants_mask(names).expect("Wants passes");
+        let (friendly, types, diff) = (mask(&["friendly.forms", "friendly.marked", "friendly.aliases"]), mask(&["text.names_a_type"]), mask(&["diff.diffs"]));
+        // (DuckDB's max_by and ORDER BY ALL: friendly's, and no type, string or diff for the others)
+        let mut w = passes.wants("SELECT g, max_by(s, id) AS last FROM t WHERE id > 3 GROUP BY g ORDER BY ALL");
+        assert!(w.any().unwrap());
+        assert!(w.any_of(friendly).unwrap());
+        assert!(!w.any_of(types).unwrap() && !w.any_of(diff).unwrap());
+        // (a cast to uuid: Postgres's casts', not friendly's)
+        let mut w = passes.wants("SELECT id FROM t WHERE u = '6ecd8c99-4036-403d-bf84-cf8400f67836'::uuid");
+        assert!(w.any().unwrap() && w.any_of(types).unwrap() && !w.any_of(friendly).unwrap());
+        let mut w = passes.wants("SELECT * FROM pondra.diff('a', 'b')");
+        assert!(w.any().unwrap() && w.any_of(diff).unwrap() && !w.any_of(friendly).unwrap());
+        // (a plain query: none)
+        let mut w = passes.wants("SELECT g, count(*) FROM t GROUP BY g");
+        assert!(!w.any().unwrap() && !w.any_of(friendly | types | diff).unwrap());
     }
 }
