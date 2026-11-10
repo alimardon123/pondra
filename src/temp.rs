@@ -146,6 +146,8 @@ pub struct Sessions {
     pub(crate) leases: Mutex<HashMap<String, crate::auth::Lent>>,
     /// Who keeps something of its sessions' (`Keeps`): weak, gone with them.
     keepers: Mutex<Vec<std::sync::Weak<dyn Keeps>>>,
+    /// Its reaper (`reap`), while there are sessions: it ends as they go.
+    loops: crate::spawns::Loops,
 }
 
 /// What an extension keeps for a node's sessions (a session's own Python: `python::Workers`): asked whether it holds a
@@ -158,7 +160,7 @@ pub trait Keeps: Send + Sync {
 
 impl Default for Sessions {
     fn default() -> Self {
-        Sessions { all: Default::default(), changes: tokio::sync::watch::channel(0).0, book: Default::default(), cursors: Default::default(), leases: Default::default(), keepers: Default::default() }
+        Sessions { all: Default::default(), changes: tokio::sync::watch::channel(0).0, book: Default::default(), cursors: Default::default(), leases: Default::default(), keepers: Default::default(), loops: Default::default() }
     }
 }
 
@@ -215,7 +217,7 @@ impl Sessions {
             self.changes.send_modify(|v| *v += 1);
         }
         if first {
-            crate::spawns::for_statics(reap(Arc::downgrade(self))); // (only while there are sessions)
+            self.loops.spawn(reap(Arc::downgrade(self))); // (only while there are sessions)
         }
         Ok(out)
     }

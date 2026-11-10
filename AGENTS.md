@@ -71,7 +71,7 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           `cli.rs` is the command line (its subcommands and what each starts) and `main.rs` sets the
           allocator and calls it (ADR-061); `node.rs` is a node's lake half (`stop`, `say`, the host's state) and
           `node/run.rs` a node started and stopped as an object,
-          `reset.rs` (`per_node!`: a node's statics set back when it stops) and `env.rs` every
+          `lake_state.rs` (a lake's state, which goes with it: no node's state is a static) and `env.rs` every
           setting, from one table (ADR-061 step 2); `library.rs` a node in a host's process (its
           supervisor, restarts in place, requests to its router; ADR-061); round 25 added
           live.rs (live queries) and temp.rs (a session's temporary tables and views); round 31 vars.rs
@@ -2319,18 +2319,19 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    its term back…" and "a node stopped while it starts gives its term back too" (both ready in
    under 5 s; a kept term makes the next node wait out the 30 s lease).
 
-301. **A node stopped in a process leaves nothing of itself in it** (`reset.rs`, ADR-061 §3): every
-   static that holds a node's or a lake's state is `per_node!`, set back by `reset()` when
-   `Node::stop` ends; its writers end first, its Python workers stop, and what its list
-   (`NodeState::tasks`) started is aborted, and the loops of its statics as they are set back (`spawns::for_statics`). A gauge whose guards count themselves down (`metrics::RUNNING`, `WAITING`)
+301. **A node stopped in a process leaves nothing of itself in it** (ADR-061 §3, redesign step 2): no
+   static holds a node's or a lake's state. A lake's is its `LakeState`s (`lake.state::<T>()`) and a
+   node's its `NodeState`, which go with them; at `Node::stop` its writers end first, what its list
+   (`NodeState::tasks`) started is aborted, and a loop that serves a state (a sessions' reaper, a lake's
+   Python's) is on that state's `spawns::Loops`, ended as it goes. A gauge whose guards count themselves down (`metrics::RUNNING`, `WAITING`)
    stays the process's, and the drain counts each node's requests on a counter of that node's own
    (`node_state::Drain`, which every lake is handed: `Lake.node`), as failed sign-ins are counted
    per node (`auth::Guesses`). SlateDB's tasks outlive its handles, so a catalog let go closes what
    SlateDB runs for it (`Drop for Catalog`: a reader's polling, a writer's flushing, the compactor
    and the collector `close` stops too): a lake
    opened for a moment (a branch's base, a lake detached) read its manifest four times a second for
-   the life of the process. `tools/per_node_check.py` fails a static that is neither `per_node!` nor
-   in its list of what outlives a node, with the reason, and a `tokio::spawn` outside `spawns.rs`.
+   the life of the process. `tools/per_node_check.py` fails a static that isn't in its list of what
+   outlives a node, with the reason, and a `tokio::spawn` outside `spawns.rs`.
    `tests/node_twice.rs`: lake B after lake A in one process has none of A's users, tables, history,
    counters, format or hot columns, and three more opens leave no threads, files or tasks behind
    (the runtime's alive tasks: with the compactor and collector left running, 13 then 19).
@@ -3268,7 +3269,7 @@ python3 tools/harness.py sso_flow     # the browser's and pondra login's way in 
 python3 tools/harness.py sso_pg         # psql 18's sign-in through a provider (POSTGRES 'oauth', OAUTHBEARER): told where it is, a token in, refusals, one way a connection
 python3 tools/harness.py keycloak       # single sign-on against a real Keycloak (PONDRA_KEYCLOAK): tokens at every door, realm roles, the console's flow, pondra login, psql 18
 python3 tools/node_check.py             # a node stopped once it serves, or while it starts, gives its term back: the next leads at once
-python3 tools/per_node_check.py         # every static per_node! or said to outlive a node; no task Node::stop can't end; settings only through env.rs
+python3 tools/per_node_check.py         # every static said to outlive a node; no task Node::stop can't end; settings only through env.rs
 python3 tools/size_check.py --bin <pondra> --platform linux-x64   # the shipped program within its budget (tools/size-budget.txt): its bytes and its gzip download; more raises the budget there, saying why
 cargo test --release --test node_twice  # two lakes in one process, one after the other: nothing of the first in the second
 cargo test --release --test node_library       # a node in process: restarts in place, a vital loop's panic answered as 57P03, opened again

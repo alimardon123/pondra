@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// The lakes held in this process's memory, by place: every open of one here is the same store until
 /// `forget_memory`, so a node that restarts in place finds its lake as it left it. Nothing of one is
-/// on disk, and no other process reaches it. (Not `per_node!`: a restart in place resets those.)
+/// on disk, and no other process reaches it. (The process's, not a node's: a restart in place keeps its lake.)
 static MEMORY: std::sync::LazyLock<Mutex<HashMap<String, Store>>> = std::sync::LazyLock::new(Default::default);
 
 /// What the lakes in memory hold on disk: the bytes of every lake's files and log that spilled (`on_disk`), and the
@@ -76,8 +76,8 @@ pub fn memory_held(url: &str) -> bool { MEMORY.lock().unwrap_or_else(PoisonError
 
 /// The counted opens of the lakes held here (`store::counted`), each with the store it counts the requests of: an open
 /// is its node's, so it is a store of its own, and `held_in_memory` knows it as its lake's by this list. Weak both, so
-/// neither stays for it: an entry goes once either has gone. (Not `per_node!`, as `MEMORY` isn't: an open outlives no
-/// lake here, and a restart in place keeps its lake.)
+/// neither stays for it: an entry goes once either has gone. (The process's, as `MEMORY` is: an open outlives no lake
+/// here, and a restart in place keeps its lake.)
 static COUNTED: std::sync::LazyLock<Mutex<Vec<(std::sync::Weak<dyn object_store::ObjectStore>, std::sync::Weak<dyn object_store::ObjectStore>)>>> = std::sync::LazyLock::new(Default::default);
 
 /// `open`, which counts the requests of `store`, is that store still: a lake held in memory's, if it is one.
