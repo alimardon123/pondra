@@ -602,7 +602,8 @@ one script's (statements sent together over HTTP).
   `'databricks'` names Spark SQL too, and so does `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`).
   Another language is refused (`22023`), naming those there are. The node's default is
   [`PONDRA_LANGUAGE`](/pondra/reference/environment/).
-  - A request's statements are all read in the language its session has as the request arrives.
+  - A request's statements are read in turn, each in the language its session has when it comes to it: after a
+    `SET language` in the same request, the statements that follow are read in that language.
   - Pondra's own statements read as written in any language: `SET`, `SHOW`, `RESET`, `PREPARE`, `DISCARD`, transactions, cursors,
     `CHECKPOINT`, and the statements of their own words (`COPY`, `ATTACH`, `CREATE SEQUENCE`, `CREATE USER`, …).
   - A text Spark's grammar refuses is refused in its words (`42601`), DuckDB's forms (`FROM t SELECT …`) among them.

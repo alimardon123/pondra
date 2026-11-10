@@ -1683,9 +1683,8 @@ impl SimpleQueryHandler for Backend {
     {
         let user = client.metadata().get("user").cloned().unwrap_or_default();
         let mut out = vec![];
-        let language = self.language(); // (the message's statements are all read in the language the session has as it comes)
         for q in crate::routines::split(query).iter().map(|q| q.trim()) {
-            let q = &self.in_language(language, q)?;
+            let q = &self.in_language(self.language(), q)?; // (each read in the language the session has when it comes to it: a SET language before it counts)
             out.push(match Copy::of(q) {
                 Some(Ok(c)) if !c.to => crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(self.signed().await?, self.copy_in(client, &user, c))).await?,
                 _ => self.told(client, &user, q, &Format::UnifiedText).await?,

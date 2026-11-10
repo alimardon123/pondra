@@ -436,8 +436,41 @@ pub fn dialect() -> Option<Box<dyn datafusion::sql::sqlparser::dialect::Dialect>
 /// setting that names one), else the node's (`PONDRA_LANGUAGE`, or `PONDRA_SQL_OPTIONS`'s dialect where that names one),
 /// else Pondra's SQL.
 pub fn language() -> &'static str {
+    own_language().unwrap_or_else(node_language)
+}
+
+/// The node's language, a session's when it sets none: `PONDRA_LANGUAGE`, or `PONDRA_SQL_OPTIONS`'s dialect where that
+/// names one, else Pondra's SQL.
+pub fn node_language() -> &'static str {
     let named = |n: String| crate::languages::get().named(&n).map(|l| l.name);
-    own_language().or_else(|| crate::env::get("PONDRA_LANGUAGE").and_then(named)).or_else(|| node_dialect().and_then(named)).unwrap_or(crate::parsed::LANGUAGE.name)
+    crate::env::get("PONDRA_LANGUAGE").and_then(named).or_else(|| node_dialect().and_then(named)).unwrap_or(crate::parsed::LANGUAGE.name)
+}
+
+/// What a statement does to the session's language, as `statement` does it: `Some(Some(name))` when it sets one (by
+/// `language`, or by DataFusion's dialect where that names one), `Some(None)` when it lets the session's own go (RESET
+/// language or ALL, DISCARD ALL, a dialect that names none), `None` when it doesn't touch it. A request's statements
+/// after it are read in the language it leaves (`statement::in_language`), as each would be sent on its own.
+pub(crate) fn language_change(one: &str) -> Option<Option<String>> {
+    let head = crate::text::head(one);
+    if !["set", "reset", "discard"].iter().any(|h| head.eq_ignore_ascii_case(h)) {
+        return None;
+    }
+    let mut parsed = Parser::parse_sql(&GenericDialect {}, one).ok()?;
+    let assigned = |n: &str, value: String| match name(n).as_str() {
+        "language" => Some(Some(value)),
+        DIALECT => Some(crate::languages::get().named(&value).map(|l| l.name.to_string())),
+        _ => None,
+    };
+    match (parsed.len(), parsed.pop()?) {
+        (1, Statement::Set(Set::SingleAssignment { variable, values, .. })) => assigned(&variable.to_string(), values.iter().map(text).collect::<Result<Vec<_>>>().ok()?.join(", ")),
+        (1, Statement::Set(Set::MultipleAssignments { assignments })) => assignments.iter().filter_map(|a| assigned(&a.name.to_string(), text(&a.value).ok()?)).last(),
+        (1, Statement::Reset(r)) => match r.reset {
+            Reset::ALL => Some(None),
+            Reset::ConfigurationParameter(n) => matches!(name(&n.to_string()).as_str(), "language" | DIALECT).then_some(None),
+        },
+        (1, Statement::Discard { object_type: ast::DiscardObject::ALL }) => Some(None),
+        _ => None,
+    }
 }
 
 /// The language the session itself set (`SET language`, or the dialect's setting that names one), not the node's.

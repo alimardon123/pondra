@@ -90,24 +90,38 @@ pub async fn run<W: Wire>(app: &App, mut req: Request, how: How<'_>, who: Who, w
     })
 }
 
-/// A request's text in a language (`languages.rs`, the session's: `set::language`) as Pondra's SQL: each statement read
-/// by the language's parse and printed (`text::text_kept`, so the front takes its tree and doesn't parse the print). A
-/// text the language's grammar refuses is refused in its words (42601). Pondra's own statements are read as written in
-/// every language (`pondra_s_own`). None: Pondra's SQL already, or the cluster's own call (`auth::operator`), which is.
+/// A request's text in a language (`languages.rs`, the session's as it arrives: `set::language`) as Pondra's SQL: each
+/// statement read by the language's parse and printed (`text::text_kept`, so the front takes its tree and doesn't parse
+/// the print). A statement that sets the session's language (`set::language_change`) has the statements after it read
+/// in that one, as each would be sent on its own; one that lets the session's own go, in the node's (`set::node_language`).
+/// A text the language's grammar refuses is refused in its words (42601). Pondra's own statements are read as written in
+/// every language (`pondra_s_own`). None: Pondra's SQL throughout, or the cluster's own call (`auth::operator`), which is.
 /// Not a routine's or a task's body, kept as Pondra's SQL: those run as they are (`routines::one`).
 pub(crate) fn in_language(name: &str, sql: &str) -> Result<Option<String>> {
-    let Some(l) = crate::languages::get().named(name).filter(|l| !std::ptr::eq(*l, &crate::parsed::LANGUAGE)) else { return Ok(None) };
-    if crate::auth::operator() {
-        return Ok(None);
+    let languages = crate::languages::get();
+    let other = |name: &str| languages.named(name).filter(|l| !std::ptr::eq(*l, &crate::parsed::LANGUAGE));
+    let mut language = other(name);
+    if (language.is_none() && !sql.contains(';')) || crate::auth::operator() {
+        return Ok(None); // (one statement in Pondra's SQL: as written)
     }
     let mut read = false;
     let mut out = vec![];
     for one in routines::split(sql) {
         let one = one.trim();
         if pondra_s_own(one) {
+            if let Some(to) = crate::set::language_change(one) {
+                language = match to.as_deref() {
+                    Some(name) => other(name),
+                    None => other(crate::set::node_language()),
+                };
+            }
             out.push(one.to_string());
             continue;
         }
+        let Some(l) = language else {
+            out.push(one.to_string());
+            continue;
+        };
         read = true;
         out.push(match (l.parse)(one) {
             Ok(stmts) => crate::text::text_kept(stmts),
@@ -421,7 +435,13 @@ mod tests {
     fn a_request_is_read_in_its_language() {
         let read = |sql: &str| in_language("spark", sql).unwrap();
         assert_eq!(read(r#"SELECT "x" AS s, 7 / 2 AS h FROM t"#).as_deref(), Some("SELECT 'x' AS s, spark_divide(7, 2) AS h FROM t"));
-        assert_eq!(read("SET language = 'pondra'; SELECT `a b` FROM t; CHECKPOINT").as_deref(), Some("SET language = 'pondra';\nSELECT `a b` FROM t;\nCHECKPOINT"));
+        // (a statement that sets the language: the request's statements after it are read in the one it leaves)
+        assert_eq!(read(r#"SELECT "x"; SET language = 'pondra'; SELECT "x"; CHECKPOINT"#).as_deref(), Some("SELECT 'x' AS \"x\";\nSET language = 'pondra';\nSELECT \"x\";\nCHECKPOINT"));
+        assert_eq!(in_language("pondra", r#"SET language = 'spark'; SELECT "x""#).unwrap().as_deref(), Some("SET language = 'spark';\nSELECT 'x' AS \"x\""));
+        assert_eq!(in_language("pondra", r#"SET datafusion.sql_parser.dialect = 'databricks'; SELECT "x"; RESET ALL; SELECT "x""#).unwrap().as_deref(), Some("SET datafusion.sql_parser.dialect = 'databricks';\nSELECT 'x' AS \"x\";\nRESET ALL;\nSELECT \"x\""));
+        assert_eq!(read(r#"SET datafusion.sql_parser.dialect = 'mysql'; SELECT "x""#), None, "a dialect that names no language: the node's, Pondra's SQL");
+        assert_eq!(read(r#"DISCARD ALL; SELECT "x""#), None);
+        assert_eq!(in_language("pondra", r#"SET search_path = s; SELECT "x""#).unwrap(), None, "another setting: as written");
         for own in ["SHOW language", "RESET language", "BEGIN", "COMMIT", "CHECKPOINT", "$n = 1", "CREATE SEQUENCE s", "COPY t TO 'x.csv'", "DISCARD ALL", r#"DECLARE c CURSOR WITH HOLD FOR SELECT "x""#, "FETCH 1 FROM c", "CLOSE ALL"] {
             assert_eq!(read(own), None, "{own}: Pondra's own, as written");
         }
