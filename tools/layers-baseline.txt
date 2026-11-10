@@ -93,7 +93,6 @@ kafka_client -> crypto  7
 kafka_client -> wasm32  2
 keep_load -> adopt  1
 keep_load -> expander  1
-keep_load -> ext  1
 keep_load -> ext_names  2
 keep_load -> tier  1
 keep_load -> write  1

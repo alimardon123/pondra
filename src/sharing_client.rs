@@ -59,7 +59,7 @@ pub fn endpoint(lake: &crate::store::Lake) -> String {
 /// Leader, `ATTACH '<profile>' AS name (TYPE share)`: the token kept as a secret of TYPE share
 /// (`share_<name>`, sealed like every secret), and the share it reads (the only one it may, unless
 /// `SHARE 's'` says which). A profile sent is an invite; attaching it accepts it.
-pub async fn accept(lake: &crate::store::Lake, name: &str, url: &str, mut options: std::collections::BTreeMap<String, String>) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+pub async fn accept(lake: &crate::store::Lake, name: &str, url: &str, mut options: std::collections::BTreeMap<String, String>, scope: &crate::rights::Scope) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
     use anyhow::{ensure, Context};
     ensure!(url.starts_with("http://") || url.starts_with("https://"), "ATTACH '<the share's profile, as JSON>' AS {name} (TYPE share), or ATTACH 'https://…/delta-sharing' AS {name} (TYPE share, TOKEN '…')");
     let endpoint = url.trim_end_matches('/');
@@ -67,7 +67,7 @@ pub async fn accept(lake: &crate::store::Lake, name: &str, url: &str, mut option
         let params = [("type", "share"), ("token", token.as_str()), ("scope", endpoint)].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         crate::ext::create(lake, &format!("share_{name}"), params, true, false).await?;
     }
-    let token = crate::ext::share_token(lake, endpoint).await?.with_context(|| format!("no token for {endpoint}: ATTACH '<the share's profile>' AS {name} (TYPE share), or add TOKEN '…'"))?;
+    let token = crate::ext::share_token(lake, endpoint, scope).await?.with_context(|| format!("no token for {endpoint}: ATTACH '<the share's profile>' AS {name} (TYPE share), or add TOKEN '…'"))?;
     let r = crate::fetch::send(crate::net::timeout(lake.node.net.client(OWN).get(format!("{endpoint}/shares")).bearer_auth(&token), std::time::Duration::from_secs(15))).await.with_context(|| format!("reaching {endpoint}"))?;
     ensure!(!r.status().is_redirection(), "{endpoint} sent its shares' list off its own address: a provider's own calls stay on it");
     let (status, body) = (r.status(), r.json::<Value>().await.unwrap_or_default());
@@ -86,11 +86,11 @@ pub async fn accept(lake: &crate::store::Lake, name: &str, url: &str, mut option
 /// A shared table, as a table of files: the provider's answer for its newest version (or the
 /// spec's `version`), each file read through its link (`share://`), deletion vectors and renamed
 /// columns as Delta's readers take them (`read_delta::table`).
-pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> anyhow::Result<crate::store::TableMeta> {
+pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec, scope: &crate::rights::Scope) -> anyhow::Result<crate::store::TableMeta> {
     use anyhow::{ensure, Context};
     let endpoint = spec.urls[0].trim_end_matches('/');
     let o = |k: &str| spec.options.get(k).map(String::as_str).unwrap_or_default();
-    let token = crate::ext::share_token(lake, endpoint).await?.with_context(|| format!("no token for {endpoint} (a secret of TYPE share whose SCOPE covers it)"))?;
+    let token = crate::ext::share_token(lake, endpoint, scope).await?.with_context(|| format!("no token for {endpoint} (a secret of TYPE share whose SCOPE covers it)"))?;
     let mut ask = j!({});
     if let Some(v) = spec.options.get("version") {
         ask["version"] = j!(v.parse::<i64>().with_context(|| format!("version is a number, not {v}"))?);
@@ -112,7 +112,7 @@ pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> a
     // the `Public` policy)
     let origin = url::Url::parse(endpoint).ok().map(|u| u.origin());
     let secrets = crate::ext::list(lake).await?;
-    let named = |u: &str| crate::ext::covering(&secrets, u).is_some_and(|(_, s)| s.scope.is_some() && (!s.temporary || s.trusted));
+    let named = |u: &str| crate::ext::covering(&secrets, u, scope).is_some_and(|(_, s)| s.scope.is_some() && (!s.temporary || s.trusted));
     let link = |u: &str| -> anyhow::Result<String> {
         let at = url::Url::parse(u).with_context(|| format!("{endpoint}: a link that isn't a URL"))?;
         let own = origin.as_ref().is_some_and(|o| o.is_tuple() && *o == at.origin()) || named(u);

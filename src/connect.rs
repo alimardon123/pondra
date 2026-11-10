@@ -490,16 +490,16 @@ mod tests {
         assert_eq!(crate::connections::place("@drop_zone"), Some("cn://drop_zone/".into()));
         assert_eq!(crate::connections::place("@/x"), None);
         // (its store: the folder, then the one its url is changed to)
-        let (store, path) = crate::ext::store(&lake, "cn://drop_zone/in/a.csv").await?;
+        let (store, path) = crate::ext::store(&lake, "cn://drop_zone/in/a.csv", &crate::rights::Scope::everything()).await?;
         store.put(&path, bytes::Bytes::from_static(b"a\n1\n").into()).await?;
         assert_eq!(std::fs::read_to_string(drop.join("in/a.csv"))?, "a\n1\n");
         run(&lake, &format!("ALTER CONNECTION drop_zone SET (url = '{}')", later.display())).await.unwrap();
-        let (store, path) = crate::ext::store(&lake, "cn://drop_zone/b.csv").await?;
+        let (store, path) = crate::ext::store(&lake, "cn://drop_zone/b.csv", &crate::rights::Scope::everything()).await?;
         store.put(&path, bytes::Bytes::from_static(b"b").into()).await?;
         assert!(later.join("b.csv").exists() && !drop.join("b.csv").exists());
         let refused = |url: &'static str| {
             let lake = lake.clone();
-            async move { crate::ext::store(&lake, url).await.map(|_| ()).unwrap_err() }
+            async move { crate::ext::store(&lake, url, &crate::rights::Scope::everything()).await.map(|_| ()).unwrap_err() }
         };
         let e = refused("cn://nope/x.csv").await;
         assert_eq!((crate::codes::of(&e), e.to_string().starts_with("no connection nope")), ("42704", true));
@@ -511,7 +511,8 @@ mod tests {
             let lake = lake.clone();
             async move {
                 let ana = crate::users::principal(&lake, "ana").await.unwrap();
-                crate::auth::WHO.scope(ana, async { crate::ext::through("cn://drop_zone/a.csv", privilege) }).await
+                let scope = ana.scope.clone();
+                crate::auth::WHO.scope(ana, async { crate::ext::through("cn://drop_zone/a.csv", privilege, &scope) }).await
             }
         };
         let e = may("READ").await.unwrap_err();

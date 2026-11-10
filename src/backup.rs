@@ -133,9 +133,9 @@ pub async fn tend(lake: &Lake) -> Result<()> {
 /// owner of that node decides the places on its own disk. `lock` is the leader's lock when this node
 /// leads: a run takes long, and only a pin and an attachment take the lock, for a moment. Without it,
 /// the pin and the attachment go to the leader as DDL.
-pub async fn statement(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl) -> Result<Value> {
+pub async fn statement(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl, scope: &crate::rights::Scope) -> Result<Value> {
     match d {
-        Ddl::BackupDatabase { database, to, retention_days } => backup(lake, lock, database.as_deref(), &to, retention_days).await,
+        Ddl::BackupDatabase { database, to, retention_days } => backup(lake, lock, database.as_deref(), &to, retention_days, scope).await,
         Ddl::RestoreDatabase { name, from, dir, at } => {
             crate::ddl::attachable(lake, &name, true).await?; // (before anything is copied)
             crate::ext::owners_only(&from, format!("RESTORE … FROM {from}: a path on the server's own disk, which only the node's owner restores from (the `pondra` shell, `pondra sql`, `connect()` of a lake): restore from a bucket (s3://, gs://, az://)"))?;
@@ -145,7 +145,7 @@ pub async fn statement(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Dd
             let to = crate::ddl::full(&dir.unwrap_or_else(|| crate::ddl::beside(&lake.url, &name)))?;
             apart(lake, &to)?;
             for place in [&crate::ddl::full(&from)?, &to] {
-                crate::ext::reach_place(lake, place).await?; // (a backup in another bucket: the secret that reaches it)
+                crate::ext::reach_place(lake, place, scope).await?; // (a backup in another bucket: the secret that reaches it)
             }
             let mut out = restore(&from, &to, at, &lake.node).await?;
             let attach = Ddl::Attach { name: name.clone(), dir: to, read_only: false, endpoint: None };
@@ -180,14 +180,14 @@ pub(crate) fn apart(lake: &Lake, to: &str) -> Result<()> {
 
 /// `BACKUP DATABASE [name] TO 'url'`: the database pinned (by its leader: this one, or an attached
 /// database's), the run asked of the backup's leader, the pin let go.
-async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Option<&str>, to: &str, retention_days: Option<u64>) -> Result<Value> {
+async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Option<&str>, to: &str, retention_days: Option<u64>, scope: &crate::rights::Scope) -> Result<Value> {
     let source = match database.map(crate::text::database) {
         None => lake.arc(),
         Some(n) if n == crate::ddl::lake_name(lake) => lake.arc(),
         Some(n) => {
             let other = lake.attached.read().unwrap().iter().find(|(a, _)| *a == n).map(|(_, l)| l.clone());
             let other = other.with_context(|| format!("no database {n} here: a backup is of this database or one attached to it"))?;
-            crate::users::across(&other, &n).await?; // (another database's own sign-in: invariant 240)
+            crate::users::across(&other, &n, scope).await?; // (another database's own sign-in: invariant 240)
             other
         }
     };
@@ -196,7 +196,7 @@ async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Op
     let to = crate::ddl::full(to)?;
     crate::ext::owners_only(&to, format!("BACKUP … TO {to}: a path on the server's own disk, which only the node's owner backs up into (the `pondra` shell, `pondra sql`, `connect()` of a lake): back up to a bucket (s3://, gs://, az://)"))?;
     apart(lake, &to)?;
-    crate::ext::reach_place(lake, &to).await?; // (another bucket or provider: the secret whose SCOPE covers it)
+    crate::ext::reach_place(lake, &to, scope).await?; // (another bucket or provider: the secret whose SCOPE covers it)
     let fresh = empty(&to, Some(&lake.node.reaches)).await?; // (nothing there yet: this run makes the lake)
     ensure!(fresh || crate::ddl::has_catalog(&to, Some(&lake.node.reaches)).await?, "{to} holds other things: back up into a new place (or an empty folder)");
     let pin = format!("{to}#backup");

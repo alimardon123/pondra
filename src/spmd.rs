@@ -121,16 +121,16 @@ pub enum How {
 }
 
 /// Run `sql` across `nodes` (this node is `me`), or None if it should just run here.
-pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bool) -> Result<Option<Vec<RecordBatch>>> {
+pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bool, scope: &crate::rights::Scope) -> Result<Option<Vec<RecordBatch>>> {
     if nodes.len() < 2 {
         return Ok(None);
     }
-    let Some(Main { tables, ext, main, meta }) = sliced(lake, nodes.len(), sql, force).await? else { return Ok(None) };
+    let Some(Main { tables, ext, main, meta }) = sliced(lake, nodes.len(), sql, force, scope).await? else { return Ok(None) };
     // Whether it pays (`guard.rs`), unless it is to spread anyway: the slowest link, what it reads.
     let guard = match force {
         true => None,
         false => match crate::guard::slowest(lake, nodes, me).await {
-            Some(link) => Some((link, reads(lake, &tables).await?)),
+            Some(link) => Some((link, reads(lake, &tables, scope).await?)),
             None => return Ok(refused("a node's link can't be measured")),
         },
     };
@@ -138,10 +138,10 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
     let parts = deal(lake, &meta, &main, nodes.len()).await?;
     let id = uuid::Uuid::new_v4().to_string(); // (the folder every node spills this query's results into)
     let learned = crate::learned::of(&tables); // (the facts this plan uses, sent to every node: `learned.rs`)
-    let (whole, upto) = (whole(lake, &tables, &[&main]).await?, lake.visible());
+    let (whole, upto) = (whole(lake, &tables, &[&main], scope).await?, lake.visible());
     let slice = |parts| Slice { sql: sql.into(), parts, shuffle: None, id: id.clone(), whole: whole.clone(), upto, partitions: lake.partitions(), ext: ext.clone(), learned: learned.clone() };
     let slices: Vec<Slice> = parts.into_iter().map(|p| slice(vec![p])).collect();
-    let (ctx, plan) = plan(lake, &slices[mine]).await?;
+    let (ctx, plan) = plan(lake, &slices[mine], scope).await?;
     // Gather when everything below the plan's first gather splits over the nodes as it is (each
     // node's share of the main table, the others whole); shuffle when it takes exchanges.
     let cut = find_cut(&plan).filter(|c| {
@@ -149,7 +149,7 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
         !hashed(c) && spread(&c.children()[0], &mut exchanges) == Some(Spread::Split) && exchanges.is_empty()
     });
     let Some(cut) = cut else {
-        return match shuffle(lake, nodes, me, sql, &tables, &main, guard).await? {
+        return match shuffle(lake, nodes, me, sql, &tables, &main, guard, scope).await? {
             Some(rows) => Ok(Some(rows)),
             None => Ok(refused("no split of its plan is correct, or pays")),
         };
@@ -173,7 +173,7 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
     let ours = timed("its share", me, drain(&mine_now, stage_ctx(&ctx), &id, "here", &lake.node));
     let tail = async {
         let (after, upto) = tail.parts[0].tail.expect("tail");
-        match upto > after { true => timed("the log tail", me, stage(lake, &tail)).await.map(|(_, parts)| parts), false => Ok(vec![]) } // no log tail: nothing to do
+        match upto > after { true => timed("the log tail", me, stage(lake, &tail, scope)).await.map(|(_, parts)| parts), false => Ok(vec![]) } // no log tail: nothing to do
     };
     let gathered = async {
         let (mut parts, ours, tail) = futures::future::try_join3(futures::future::try_join_all(runs), ours, tail).await?;
@@ -199,15 +199,15 @@ struct Main {
 /// them) nor a history view's (each version's `__end_at` is the next version's, in any file).
 fn sliceable(m: &TableMeta) -> bool { m.key.is_empty() && m.history.is_none() }
 
-async fn sliced(lake: &Lake, nodes: usize, sql: &str, force: bool) -> Result<Option<Main>> {
+async fn sliced(lake: &Lake, nodes: usize, sql: &str, force: bool, scope: &crate::rights::Scope) -> Result<Option<Main>> {
     let Some(tables) = read(lake, sql).await? else { return Ok(refused("not a single query")) };
     if tables.iter().any(|t| crate::ext::local(t)) {
         return Ok(refused("it reads files on this machine"));
     }
-    let ext = crate::ext::of(lake, &tables).await?; // (tables of files outside the lake, listed once: every node reads these)
+    let ext = crate::ext::of(lake, &tables, scope).await?; // (tables of files outside the lake, listed once: every node reads these)
     let mut main: Option<(String, TableMeta, u64)> = None;
     for t in &tables {
-        let Some(meta) = crate::ext::meta(lake, t).await?.filter(sliceable) else { continue };
+        let Some(meta) = crate::ext::meta(lake, t, scope).await?.filter(sliceable) else { continue };
         let bytes = size(&meta).1;
         if main.as_ref().is_none_or(|m| bytes > m.2) {
             main = Some((t.clone(), meta, bytes));
@@ -226,18 +226,18 @@ async fn sliced(lake: &Lake, nodes: usize, sql: &str, force: bool) -> Result<Opt
 /// nothing to combine or order: each node writes its own share, this one its share and the log
 /// tail. Every node writing pays however slow the links are: only counts and files' entries cross
 /// them. None: it is written from here.
-async fn writers<'a>(lake: &Lake, nodes: &'a [String], me: &str, sql: &str) -> Result<Option<Vec<(&'a str, Slice)>>> {
+async fn writers<'a>(lake: &Lake, nodes: &'a [String], me: &str, sql: &str, scope: &crate::rights::Scope) -> Result<Option<Vec<(&'a str, Slice)>>> {
     if nodes.len() < 2 {
         return Ok(refused("one node"));
     }
-    let Some(Main { tables, ext, main, meta }) = sliced(lake, nodes.len(), sql, false).await? else { return Ok(None) };
+    let Some(Main { tables, ext, main, meta }) = sliced(lake, nodes.len(), sql, false, scope).await? else { return Ok(None) };
     let mine = nodes.iter().position(|n| n == me).context("not a member")?;
     let id = uuid::Uuid::new_v4().to_string();
     let learned = crate::learned::of(&tables); // (the facts this plan uses, sent to every node: `learned.rs`)
-    let (whole, upto) = (whole(lake, &tables, &[&main]).await?, lake.visible());
+    let (whole, upto) = (whole(lake, &tables, &[&main], scope).await?, lake.visible());
     let slice = |parts| Slice { sql: sql.into(), parts, shuffle: None, id: id.clone(), whole: whole.clone(), upto, partitions: lake.partitions(), ext: ext.clone(), learned: learned.clone() };
     let mut shares: Vec<(&str, Slice)> = nodes.iter().map(String::as_str).zip(deal(lake, &meta, &main, nodes.len()).await?.into_iter().map(|p| slice(vec![p]))).collect();
-    let (_, plan) = plan(lake, &shares[mine].1).await?;
+    let (_, plan) = plan(lake, &shares[mine].1, scope).await?;
     let mut exchanges = vec![];
     if plan.name().starts_with("Sort") || plan.name() == "LeanExec" || spread(&plan, &mut exchanges) != Some(Spread::Split) || !exchanges.is_empty() {
         return Ok(refused("its rows don't split over the nodes as they are"));
@@ -258,11 +258,11 @@ async fn ask<A: Serialize, R: serde::de::DeserializeOwned>(from: &NodeState, nod
 /// `COPY … TO` a folder across the nodes (`copy.rs`): each writes its share's files. Every share
 /// runs to its end, whatever happens to the others: a failed COPY's files are then all written,
 /// and can be taken away. None: it is written from here.
-pub async fn copy(lake: &Lake, nodes: &[String], me: &str, sql: &str, target: &crate::copy::Target) -> Result<Option<u64>> {
-    let Some(shares) = writers(lake, nodes, me, sql).await? else { return Ok(None) };
+pub async fn copy(lake: &Lake, nodes: &[String], me: &str, sql: &str, target: &crate::copy::Target, scope: &crate::rights::Scope) -> Result<Option<u64>> {
+    let Some(shares) = writers(lake, nodes, me, sql, scope).await? else { return Ok(None) };
     let runs = shares.iter().map(|(node, s)| async move {
         match *node == me {
-            true => copy_share(lake, s, target).await,
+            true => copy_share(lake, s, target, scope).await,
             false => ask(&lake.node, node, "copy", &(s, target)).await,
         }
     });
@@ -270,11 +270,11 @@ pub async fn copy(lake: &Lake, nodes: &[String], me: &str, sql: &str, target: &c
 }
 
 /// This node's share of a `COPY … TO`, written: how many rows.
-pub async fn copy_share(lake: &Lake, s: &Slice, target: &crate::copy::Target) -> Result<u64> {
-    crate::ext::register(lake, &target.to).await?;
+pub async fn copy_share(lake: &Lake, s: &Slice, target: &crate::copy::Target, scope: &crate::rights::Scope) -> Result<u64> {
+    crate::ext::register(lake, &target.to, scope).await?;
     crate::learned::given(lake, &s.learned, crate::ext::scope(true, async {
-        crate::ext::prime(lake, &s.ext).await?;
-        crate::copy::write(shared(lake, s).await?.1, target).await
+        crate::ext::prime(lake, &s.ext, scope).await?;
+        crate::copy::write(shared(lake, s, scope).await?.1, target).await
     }))
     .await
 }
@@ -283,8 +283,8 @@ pub async fn copy_share(lake: &Lake, s: &Slice, target: &crate::copy::Target) ->
 /// writes its share's Parquet files into the table's folder, under the one commit `stamp` reserved
 /// and a block of row ids of its own, and the leader records them all in one commit. None: it is
 /// written from here.
-pub async fn insert(lake: &Lake, nodes: &[String], me: &str, sql: &str, table: &str, stamp: Option<(crate::log::Reserved, &crate::log::To)>) -> Result<Option<(Columns, Vec<DataFile>)>> {
-    let Some(shares) = writers(lake, nodes, me, sql).await? else { return Ok(None) };
+pub async fn insert(lake: &Lake, nodes: &[String], me: &str, sql: &str, table: &str, stamp: Option<(crate::log::Reserved, &crate::log::To)>, scope: &crate::rights::Scope) -> Result<Option<(Columns, Vec<DataFile>)>> {
+    let Some(shares) = writers(lake, nodes, me, sql, scope).await? else { return Ok(None) };
     let mut stamps = vec![];
     for i in 0..shares.len() {
         stamps.push(match stamp {
@@ -294,7 +294,7 @@ pub async fn insert(lake: &Lake, nodes: &[String], me: &str, sql: &str, table: &
     }
     let runs = shares.iter().zip(stamps).map(|((node, s), stamp)| async move {
         match *node == me {
-            true => insert_share(lake, s, table, stamp).await,
+            true => insert_share(lake, s, table, stamp, scope).await,
             false => ask(&lake.node, node, "insert", &(s, table, stamp)).await,
         }
     });
@@ -308,10 +308,10 @@ pub async fn insert(lake: &Lake, nodes: &[String], me: &str, sql: &str, table: &
 pub type Columns = Vec<(String, String)>;
 
 /// This node's share of an `INSERT`, written into the table's folder: its files.
-pub async fn insert_share(lake: &Lake, s: &Slice, table: &str, stamp: Option<crate::log::Reserved>) -> Result<(Columns, Vec<DataFile>)> {
+pub async fn insert_share(lake: &Lake, s: &Slice, table: &str, stamp: Option<crate::log::Reserved>, scope: &crate::rights::Scope) -> Result<(Columns, Vec<DataFile>)> {
     crate::learned::given(lake, &s.learned, crate::ext::scope(true, async {
-        crate::ext::prime(lake, &s.ext).await?;
-        let (ctx, _) = shared(lake, s).await?;
+        crate::ext::prime(lake, &s.ext, scope).await?;
+        let (ctx, _) = shared(lake, s, scope).await?;
         // (out of memory, once more frugally, as `write::write_files` does: this share's files are never recorded by the first try)
         crate::query::frugally(&lake.node, &ctx, |ctx| async move {
             crate::write::in_order(&ctx); // (planned again, its partitions writing in the order rows come)
@@ -341,10 +341,10 @@ async fn finish(ctx: &SessionContext, plan: &Arc<dyn ExecutionPlan>, cut: Option
 }
 
 /// The tables of this lake a query reads that aren't sliced, as this node sees them now.
-async fn whole(lake: &Lake, tables: &[String], sliced: &[&str]) -> Result<Vec<(String, TableMeta)>> {
+async fn whole(lake: &Lake, tables: &[String], sliced: &[&str], scope: &crate::rights::Scope) -> Result<Vec<(String, TableMeta)>> {
     let mut out = vec![];
     for t in tables.iter().filter(|t| !sliced.contains(&t.as_str())) {
-        if let Some(meta) = crate::ext::meta(lake, t).await? {
+        if let Some(meta) = crate::ext::meta(lake, t, scope).await? {
             out.push((t.clone(), meta));
         }
     }
@@ -352,18 +352,18 @@ async fn whole(lake: &Lake, tables: &[String], sliced: &[&str]) -> Result<Vec<(S
 }
 
 /// The bytes of the tables a query reads (`guard.rs`: what a query's time goes with).
-pub async fn reads(lake: &Lake, tables: &[String]) -> Result<u64> {
+pub async fn reads(lake: &Lake, tables: &[String], scope: &crate::rights::Scope) -> Result<u64> {
     let mut bytes = 0;
     for t in tables {
-        bytes += crate::ext::meta(lake, t).await?.map_or(0, |m| size(&m).1);
+        bytes += crate::ext::meta(lake, t, scope).await?.map_or(0, |m| size(&m).1);
     }
     Ok(bytes)
 }
 
 /// What `sql` reads, in bytes (0 if it isn't one query).
-pub async fn reads_sql(lake: &Lake, sql: &str) -> Result<u64> {
+pub async fn reads_sql(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Result<u64> {
     match read(lake, sql).await? {
-        Some(tables) => reads(lake, &tables).await,
+        Some(tables) => reads(lake, &tables, scope).await,
         None => Ok(0),
     }
 }
@@ -409,11 +409,11 @@ async fn deal(lake: &Lake, meta: &TableMeta, table: &str, n: usize) -> Result<Ve
 
 /// This node's part of a query: a gather's partial result, or a shuffle step (with the plan's
 /// shape, which every node must agree on). One list of batches per partition, order kept.
-pub async fn stage(lake: &Lake, s: &Slice) -> Result<(String, Vec<Spill>)> {
+pub async fn stage(lake: &Lake, s: &Slice, scope: &crate::rights::Scope) -> Result<(String, Vec<Spill>)> {
     if let Some(sh) = &s.shuffle {
-        return step(lake, s, sh).await;
+        return step(lake, s, sh, scope).await;
     }
-    let (ctx, plan) = plan(lake, s).await?;
+    let (ctx, plan) = plan(lake, s, scope).await?;
     let cut = find_cut(&plan).context("no single-stage plan")?;
     Ok((String::new(), drain(&cut.children()[0].clone(), stage_ctx(&ctx), &s.job(), "out", &lake.node).await?))
 }
@@ -500,18 +500,18 @@ pub fn reply(shape: &str, parts: Vec<Spill>, done: Option<crate::spill::Gone>) -
 }
 
 /// The physical plan of the slice's query, its tables standing for just their parts.
-async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn ExecutionPlan>)> {
+async fn plan(lake: &Lake, s: &Slice, scope: &crate::rights::Scope) -> Result<(SessionContext, Arc<dyn ExecutionPlan>)> {
     // Files outside the lake as the coordinator listed them; it checked who may read them.
-    crate::learned::given(lake, &s.learned, crate::ext::scope(true, async { crate::ext::prime(lake, &s.ext).await.and(Ok(planned(lake, s).await?)) })).await
+    crate::learned::given(lake, &s.learned, crate::ext::scope(true, async { crate::ext::prime(lake, &s.ext, scope).await.and(Ok(planned(lake, s, scope).await?)) })).await
 }
 
-async fn planned(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn ExecutionPlan>)> {
-    let (ctx, df) = shared(lake, s).await?;
+async fn planned(lake: &Lake, s: &Slice, scope: &crate::rights::Scope) -> Result<(SessionContext, Arc<dyn ExecutionPlan>)> {
+    let (ctx, df) = shared(lake, s, scope).await?;
     Ok((ctx, df.create_physical_plan().await?))
 }
 
 /// The slice's query, its tables standing for just their parts.
-async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::prelude::DataFrame)> {
+async fn shared(lake: &Lake, s: &Slice, scope: &crate::rights::Scope) -> Result<(SessionContext, datafusion::prelude::DataFrame)> {
     // (as the node's own: a query spreads only when its caller sees everything, `App::here_only_for`)
     let node = &crate::auth::Principal::node().scope;
     let ctx = session_for(lake, &s.sql, "", None, node).await?;
@@ -528,7 +528,7 @@ async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::p
     {
         for (t, meta) in &s.whole {
             let meta = Arc::new(sys(meta.clone()));
-            let mut inner = crate::query::named(&ctx, crate::query::table_view_once(lake, &ctx, t, meta.clone(), Some(s.upto)).await?, &meta, deleted)?;
+            let mut inner = crate::query::named(&ctx, crate::query::table_view_once(lake, &ctx, t, meta.clone(), Some(s.upto), scope).await?, &meta, deleted)?;
             if let Some(h) = &meta.history {
                 inner = crate::views::history_view(&ctx, inner, h, sys_cols).await?; // (as `session_for` reads it)
             }
@@ -559,7 +559,7 @@ async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::p
         // The whole table's facts (its schema, manifests, ranges and statistics), not this slice's: every node has to plan
         // the query alike. A table of the lake is the catalog's entry (kept per version); an ext table's is made here.
         let whole: Arc<TableMeta> = match crate::ext_names::is(&p.table) {
-            true => Arc::new(crate::ext::meta(lake, &p.table).await?.context("no table")?),
+            true => Arc::new(crate::ext::meta(lake, &p.table, scope).await?.context("no table")?),
             false => lake.cat.meta(&table_key(&p.table)).await?.context("no table")?,
         };
         let facts = match crate::ext_names::is(&p.table) {
@@ -574,7 +574,7 @@ async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::p
         let purges = if p.purged > 0 { vec![(p.purged, 0)] } else { vec![] };
         // (a range's column is a stored name, as the files and the slice's scan know it: `ranges::named`)
         let meta = Arc::new({ let mut entry = (*base).clone(); entry.files = p.files.clone(); entry.tiered = after; entry.purges = purges; entry });
-        let pruned = Pruned { lake: lake.arc(), name: p.table.clone(), meta: meta.clone(), facts, manifests: Some(p.manifests.clone()), upto: Some(upto), at: Some(s.upto), share, range: p.range.clone(), own: Default::default() };
+        let pruned = Pruned { lake: lake.arc(), name: p.table.clone(), meta: meta.clone(), facts, manifests: Some(p.manifests.clone()), upto: Some(upto), at: Some(s.upto), share, range: p.range.clone(), own: Default::default(), scope: scope.clone() };
         let table = crate::query::named(&ctx, Arc::new(pruned), &meta, deleted)?;
         ctx.deregister_table(table_ref(&p.table))?;
         ctx.register_table(table_ref(&p.table), table)?;
@@ -605,11 +605,11 @@ fn hashed(p: &Arc<dyn ExecutionPlan>) -> bool { p.name() == "RepartitionExec" &&
 /// Run `sql` as a shuffle, or None if its plan can't be split that way. A node that drops out is
 /// left out and the shuffle runs again (its buckets went with it, so there is nothing to resume);
 /// with too few nodes left for that, the query runs here instead.
-async fn shuffle(lake: &Lake, nodes: &[String], me: &str, sql: &str, tables: &[String], main: &str, guard: Option<(crate::guard::Link, u64)>) -> Result<Option<Vec<RecordBatch>>> {
+async fn shuffle(lake: &Lake, nodes: &[String], me: &str, sql: &str, tables: &[String], main: &str, guard: Option<(crate::guard::Link, u64)>, scope: &crate::rights::Scope) -> Result<Option<Vec<RecordBatch>>> {
     let mut live: Vec<String> = nodes.to_vec();
     for _ in 0..3 {
         let mine = live.iter().position(|n| n == me).context("not a member")?;
-        let out = spread_once(lake, &live, mine, sql, tables, main, guard).await;
+        let out = spread_once(lake, &live, mine, sql, tables, main, guard, scope).await;
         let Err(e) = out else { return out };
         // (this node failing its own step, or too few nodes left: the query runs here instead)
         let Some(dead) = e.downcast_ref::<Dead>().map(|d| d.node).filter(|&d| live.len() > 2 && d != mine) else {
@@ -637,15 +637,15 @@ async fn abandon(lake: &Lake, nodes: &[String], me: &str, id: &str) {
 
 /// One attempt, planned each way in turn (`How`) until one splits correctly — and pays (`guard`:
 /// the ways after it move more). Keyed tables, and tables of attached lakes, are always read whole.
-async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tables: &[String], main: &str, guard: Option<(crate::guard::Link, u64)>) -> Result<Option<Vec<RecordBatch>>> {
-    let ext = crate::ext::of(lake, tables).await?;
+async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tables: &[String], main: &str, guard: Option<(crate::guard::Link, u64)>, scope: &crate::rights::Scope) -> Result<Option<Vec<RecordBatch>>> {
+    let ext = crate::ext::of(lake, tables, scope).await?;
     let learned = crate::learned::of(tables);
     for how in [How::Ranged, How::Broadcast, How::Partitioned, How::Sliced] {
         let upto = lake.visible();
         // Its append tables (the biggest first), as of now.
         let mut appends: Vec<(String, TableMeta)> = vec![];
         for t in tables {
-            if let Some(meta) = crate::ext::meta(lake, t).await?.filter(sliceable) {
+            if let Some(meta) = crate::ext::meta(lake, t, scope).await?.filter(sliceable) {
                 appends.insert(if t == main { 0 } else { appends.len() }, (t.clone(), meta));
             }
         }
@@ -676,9 +676,9 @@ async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tabl
             }
         }
         let sliced: Vec<&str> = slices[mine].parts.iter().map(|p| p.table.as_str()).collect();
-        let whole = whole(lake, tables, &sliced).await?;
+        let whole = whole(lake, tables, &sliced, scope).await?;
         slices.iter_mut().for_each(|s| s.whole = whole.clone());
-        if let Some(job) = Job::open(lake, &slices[mine]).await? {
+        if let Some(job) = Job::open(lake, &slices[mine], scope).await? {
             if guard.is_some_and(|(link, read)| !job.pays(lake, sql, link, read, nodes.len())) {
                 forget(lake, &job.id);
                 return Ok(refused("it wouldn't pay"));
@@ -687,14 +687,14 @@ async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tabl
                 let over = job.exchanges.iter().map(|x| displayable(x.plan.as_ref()).one_line().to_string().trim().to_string()).collect::<Vec<_>>();
                 eprintln!("spread: shuffled {how:?}{}: {over:?}", scheme.map(|s| format!(", by ranges of {:?}", s.columns)).unwrap_or_default());
             }
-            return run(lake, nodes, mine, &slices, job).await.map(Some); // (step 0 here uses this plan)
+            return run(lake, nodes, mine, &slices, job, scope).await.map(Some); // (step 0 here uses this plan)
         }
     }
     Ok(None)
 }
 
 /// Every step of a shuffle on every node, then the coordinator's finish.
-async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: Arc<Job>) -> Result<Vec<RecordBatch>> {
+async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: Arc<Job>, scope: &crate::rights::Scope) -> Result<Vec<RecordBatch>> {
     let id = slices[mine].shuffle.as_ref().expect("a shuffle").id.clone();
     let run = async {
         let (mut last, mut sizes): (Vec<Spill>, HashMap<usize, Vec<Vec<Vec<u64>>>>) = (vec![], HashMap::new());
@@ -707,7 +707,7 @@ async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: 
                 (sh.step, sh.splits) = (step, splits.clone());
                 async move {
                     let once = async |s: &Slice| match i == mine {
-                        true => timed(format!("step {step}"), node, stage(lake, s)).await,
+                        true => timed(format!("step {step}"), node, stage(lake, s, scope)).await,
                         false => timed(format!("step {step}"), node, remote(node, s, &lake.node)).await,
                     };
                     // A step is the same work every time (the buckets it reads are kept until the
@@ -862,8 +862,8 @@ pub fn gc(lake: &Lake) {
 
 impl Job {
     /// Plan the slice's query; None if it can't be split into shuffle stages.
-    async fn open(lake: &Lake, s: &Slice) -> Result<Option<Arc<Job>>> {
-        let (ctx, plan) = plan(lake, s).await?;
+    async fn open(lake: &Lake, s: &Slice, scope: &crate::rights::Scope) -> Result<Option<Arc<Job>>> {
+        let (ctx, plan) = plan(lake, s, scope).await?;
         let (plan, hoisted) = hoist(plan)?;
         let plan = by_key(plan, ctx.state().config().target_partitions())?;
         // The subqueries first: their exchanges are the job's first steps, and every step after
@@ -1285,7 +1285,7 @@ fn fails_once(sh: &Shuffle, var: &str) -> Result<()> {
 
 /// One step of a shuffle on this node: the stage below exchange `step` (or, after the last
 /// exchange, the last stage), over the buckets for this node of the exchanges right below it.
-async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill>)> {
+async fn step(lake: &Lake, s: &Slice, sh: &Shuffle, scope: &crate::rights::Scope) -> Result<(String, Vec<Spill>)> {
     let open = held(lake, |held| {
         ensure!(!held.dropped.contains_key(&sh.id), "shuffle abandoned");
         Ok(held.jobs.get(&sh.id).cloned())
@@ -1295,10 +1295,10 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
         // (a test's race: two opens at once, as a retry beside a first try still planning makes them; the second's
         // answer, or its error, is not used)
         (None, 0) if crate::env::is_set("PONDRA_DEBUG_OPEN_TWICE") => {
-            let (first, _second) = futures::join!(Job::open(lake, s), Job::open(lake, s));
+            let (first, _second) = futures::join!(Job::open(lake, s, scope), Job::open(lake, s, scope));
             first?.context("can't shuffle this plan here")?
         }
-        (None, 0) => Job::open(lake, s).await?.context("can't shuffle this plan here")?,
+        (None, 0) => Job::open(lake, s, scope).await?.context("can't shuffle this plan here")?,
         (None, _) => bail!("shuffle expired"),
     };
     // The subqueries whose exchanges are done are answered first, here as on every node.

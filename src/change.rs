@@ -504,7 +504,7 @@ async fn session(lake: &Lake, sql: &str, upto: u64, scope: &crate::rights::Scope
 /// `txn::upsert_point` for a one-row upsert, before its locks, and `merge`. `meta` is the table as SQL names it, `rules` its
 /// rules, `given` the columns the rows give (`Upsert::given`).
 pub(crate) async fn proposed_rows(lake: &Lake, name: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, given: &[String], query: &str, at: u64, scope: &crate::rights::Scope) -> Result<RecordBatch> {
-    let sql = crate::write::whole_rows_of(lake, name, meta, given, query).await?;
+    let sql = crate::write::whole_rows_of(lake, name, meta, given, query, scope).await?;
     let files = FILES.try_with(|f| *f).unwrap_or(false); // (as the planned MERGE reads its files: `session`)
     Ok(crate::write::rows_of(lake, lake, rules, name, &sql, Some(at), files, crate::rules::How::Load, scope).await?.into_rows())
 }
@@ -559,7 +559,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str, scope: &cra
         (Some(p), _) => p,
         (None, crate::write::Stmt::Insert(_, query)) => (vec![], vec![inserted(lake, &table, &stored, query, upto, scope).await?]),
         (None, crate::write::Stmt::InsertInto(t, names, query)) => {
-            let query = crate::write::whole_rows(lake, t, names, query).await?;
+            let query = crate::write::whole_rows(lake, t, names, query, scope).await?;
             (vec![], vec![inserted(lake, &table, &stored, &query, upto, scope).await?])
         }
         (None, _) => rows_of(lake, &table, &meta, &stored.rules()?, &stmt, upto, scope).await?,
