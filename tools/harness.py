@@ -8942,14 +8942,18 @@ def history():
         basic = lambda u, p: {"Authorization": "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()}
         ann, boss = basic("ann", "ann-password-1"), basic("boss", "boss-password-1")
         q("CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")  # (then everyone signs in)
-        for s in ["CREATE USER ann PASSWORD 'ann-password-1'", "GRANT SELECT ON t TO ann"]:
+        cy = basic("cy", "cy-password-1")
+        for s in ["CREATE USER ann PASSWORD 'ann-password-1'", "GRANT SELECT ON t TO ann", "CREATE USER cy PASSWORD 'cy-password-1'", "GRANT SELECT ON t TO cy"]:
             q(s, headers=boss)
         q("SELECT count(*) AS n FROM t -- h-ann", headers=ann)
+        q("SELECT count(*) AS n FROM t -- h-cy", headers=cy)
         time.sleep(2.5)
         mine = q("SELECT DISTINCT \"user\" FROM pondra.history", headers=ann)
+        theirs = q("SELECT DISTINCT \"user\" FROM pondra.history", headers=cy)  # (the same text, under the same grants: the same cache key, `Scope::key`)
         everyone = q("SELECT DISTINCT \"user\" FROM pondra.history", headers=boss)
-        seen["users"] = {"ann sees": mine, "boss sees": everyone}
+        seen["users"] = {"ann sees": mine, "cy sees": theirs, "boss sees": everyone}
         checks["an admin reads every row, a user their own"] = mine == [{"user": "ann"}] and len(everyone) > 1
+        checks["two users with the same grants read their own rows (never one kept answer)"] = mine == [{"user": "ann"}] and theirs == [{"user": "cy"}]
     finally:
         for n in (a, b, c):
             n.kill()

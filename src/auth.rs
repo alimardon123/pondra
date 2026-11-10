@@ -45,7 +45,17 @@ impl Principal {
             Role::None => crate::rights::Scope::nothing(),
             _ => crate::rights::Scope::everything(),
         };
-        Principal { name: name.into(), role, scope, door: "node", from: None, operator: false, epoch: 0, until: None, reads: false }
+        Principal { name: name.into(), role, scope, door: "node", from: None, operator: false, epoch: 0, until: None, reads: false }.asking()
+    }
+
+    /// The same, its scope told whom it is for (`rights::Scope::asked_by`): its name, whether its role is admin, and
+    /// whether it runs the nodes. Planning asks the session's scope that (`pondra.history`'s rows, `pondra.audit`:
+    /// `Scope::superuser`), never the task. `of` (and so `node`), `at` (a door's sign-in) and `users::principal_with` make
+    /// it so; whatever changes a principal's name, role or operator after asks again (`token`, `apply::admin_for`'s raised
+    /// admin), or its scope stays its old asker's.
+    pub fn asking(mut self) -> Principal {
+        self.scope = self.scope.asked_by(&self);
+        self
     }
 
     /// The node's own work's (`as_node`: what no request asked for, a task's tick, a view's refresh, the history's
@@ -88,12 +98,12 @@ impl Principal {
 
     /// A token's (one of the nodes', or their key), or the program's that started the node: its
     /// role over everything, this lake's and the lakes attached to it.
-    pub fn token(role: Role) -> Principal { Principal { operator: true, ..Principal::of(role) } }
+    pub fn token(role: Role) -> Principal { Principal { operator: true, ..Principal::of(role) }.asking() }
 
-    /// The same, as come in by `door` from `from`.
+    /// The same, as come in by `door` from `from`: as signed in there, so its scope asks as it (`asking`).
     pub fn at(mut self, door: &'static str, from: Option<std::net::SocketAddr>) -> Principal {
         (self.door, self.from) = (door, from);
-        self
+        self.asking()
     }
 }
 

@@ -189,7 +189,7 @@ pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusa
     if crate::sys::hidden(&table) && action == Action::SelectAll && !superuser {
         return Err(Refusal::new(format!("permission denied: {table} is Pondra's own, and its rows stream to a superuser only")));
     }
-    let (Some(a), Some(privilege)) = (&who.scope.0, action.privilege()) else { return Ok(()) };
+    let (Some(a), Some(privilege)) = (&who.scope.access, action.privilege()) else { return Ok(()) };
     let granted = match action {
         Action::SelectAll => a.columns(privilege, &table) == Some(None),
         _ => a.may(privilege, &table),
@@ -261,9 +261,22 @@ pub fn may_run(role: Role, stmt: &Stmt) -> anyhow::Result<()> {
 /// superuser, an open node, the node's own work), what a user's grants name, or nothing (whoever isn't signed in, and work
 /// no one asked for). Listings ask `sees`, planning asks `columns`, the key lookup asks `reads`, the results cache keeps an
 /// answer under `key`, and nothing outside this module reads a user's grants. There is no default: each scope is made as
-/// one of these, by name.
+/// one of these, by name. It also says who it is for, as far as planning asks (`superuser`, `asker`: M8 piece 3d-3b), which
+/// only a principal tells it (`Principal::asking`).
 #[derive(Clone)]
-pub struct Scope(Option<std::sync::Arc<crate::users::Access>>);
+pub struct Scope {
+    access: Option<std::sync::Arc<crate::users::Access>>,
+    asker: Option<std::sync::Arc<Asker>>, // (None: made without a principal, which names no one and is no superuser's)
+}
+
+/// Who a scope is for, as planning asks it (`pondra.history`'s rows, `pondra.audit`): its principal's name, whether that
+/// principal is an admin, and whether it runs the nodes. Set only from a principal (`Scope::asked_by`), never made of loose
+/// values.
+struct Asker {
+    name: String,
+    admin: bool,    // (its role is Admin: with a whole scope, a superuser's, `Scope::superuser`)
+    operator: bool, // (whoever runs the nodes: `Principal::operator`, `Scope::operator`)
+}
 
 /// The scope of the request being served: its principal's (`Principal::scope`), or the node's own work's (`auth::as_node`:
 /// `Principal::node`'s, whole). Work with neither sees nothing (M8): work a request started and lost its caller on the way
@@ -279,15 +292,15 @@ pub fn scope() -> Scope {
 impl Scope {
     /// Everything, this lake's and the lakes attached to it: a token's, a superuser's, an open node's, and the node's own
     /// work's (`auth::Principal::node`). `tools/scope_check.py` counts where one is made.
-    pub fn everything() -> Scope { Scope(None) }
+    pub fn everything() -> Scope { Scope { access: None, asker: None } }
 
     /// Nothing: no table, column, name or code. Whoever isn't signed in (`Principal::of(Role::None)`), and work with no
     /// caller that isn't the node's own (`scope`).
-    pub fn nothing() -> Scope { Scope(Some(std::sync::Arc::new(Default::default()))) }
+    pub fn nothing() -> Scope { Scope { access: Some(std::sync::Arc::new(Default::default())), asker: None } }
 
     /// What a user who isn't a superuser may see: what `access` grants it (`users::principal_with` makes it once, as the
     /// principal is made).
-    pub fn granted(access: std::sync::Arc<crate::users::Access>) -> Scope { Scope(Some(access)) }
+    pub fn granted(access: std::sync::Arc<crate::users::Access>) -> Scope { Scope { access: Some(access), asker: None } }
 
     /// The scope a planning session was made for (`query::session_for`): the session carries it to everything planned in it
     /// (a `SessionConfig` extension), so no planning reads the task's caller. A session made without one sees nothing: it
@@ -302,15 +315,33 @@ impl Scope {
     }
 
     /// A user's own quota (`users::quota`); None: whole, which has none.
-    pub fn limits(&self) -> Option<crate::users::Limits> { self.0.as_ref().map(|a| a.limits) }
+    pub fn limits(&self) -> Option<crate::users::Limits> { self.access.as_ref().map(|a| a.limits) }
 
     /// Everything: no grants narrow it.
-    pub fn whole(&self) -> bool { self.0.is_none() }
+    pub fn whole(&self) -> bool { self.access.is_none() }
+
+    /// The same scope, for `p` (`Principal::asking`): its name, whether it is an admin, and whether it runs the nodes, for
+    /// planning to ask (`superuser`, `asker`, `operator`). The only way a scope learns who it is for.
+    pub(crate) fn asked_by(&self, p: &Principal) -> Scope {
+        Scope { access: self.access.clone(), asker: Some(std::sync::Arc::new(Asker { name: p.name.clone(), admin: p.role == Role::Admin, operator: p.operator })) }
+    }
+
+    /// Is it a superuser's (`pondra.audit`, every row of `pondra.history`)? Whole, and its principal an admin. Never whole
+    /// alone: a read token's is whole too, and a scope made without a principal is no one's.
+    pub fn superuser(&self) -> bool { self.whole() && self.asker.as_ref().is_some_and(|a| a.admin) }
+
+    /// The name of whom it is for (its principal's: "" for nobody's), or None for a scope made without a principal.
+    pub fn asker(&self) -> Option<&str> { self.asker.as_ref().map(|a| a.name.as_str()) }
+
+    /// Is it for whoever runs the nodes (one of their tokens, their key, the program that started this one:
+    /// `Principal::operator`)? A scope made without a principal is not.
+    pub fn operator(&self) -> bool { self.asker.as_ref().is_some_and(|a| a.operator) }
 
     /// What an answer kept for it is kept under, beside its text (`App::remembers`, the Postgres port's too): what it
     /// holds, its grants and its names, never who holds it. So a GRANT or a REVOKE makes another key, and no answer made
-    /// under other grants is ever given; "" when whole, as every token's and superuser's answers are kept today.
-    pub fn key(&self) -> &str { self.0.as_ref().map_or("", |a| a.key()) }
+    /// under other grants is ever given; "" when whole, as every token's and superuser's answers are kept today. Whom it is
+    /// for isn't in it: what answers by that (`pondra.history`, `pondra.audit`) is never kept (`App::remembers`).
+    pub fn key(&self) -> &str { self.access.as_ref().map_or("", |a| a.key()) }
 
     /// May it read these columns of `table` (as the catalog names it)? A key lookup asks before it answers without
     /// planning (`serve::point`), as `query::Guarded` asks of a plan's scan: every column it returns and its key's.
@@ -325,7 +356,7 @@ impl Scope {
     /// Does it see `object`? A table or view (as the catalog names it, `l.t` for another lake's) when it may read any of
     /// its columns (SELECT, S27); the lake's own records (its users, identity providers, shares) when it is whole.
     pub fn sees(&self, object: Object) -> bool {
-        match (&self.0, object) {
+        match (&self.access, object) {
             (None, _) => true,
             (Some(a), Object::Table(t)) => a.may("select", t),
             (Some(_), Object::Lake) => false,
@@ -334,47 +365,47 @@ impl Scope {
 
     /// The same, for a table or view of another lake attached here (`l.t`, `l.s.t`): only grants naming it count, as its
     /// reads ask (`named`). ON ALL TABLES and ON SCHEMA are this lake's, so they show none of another's.
-    pub fn sees_named(&self, table: &str) -> bool { self.0.as_ref().is_none_or(|a| a.named("select", table).is_some()) }
+    pub fn sees_named(&self, table: &str) -> bool { self.access.as_ref().is_none_or(|a| a.named("select", table).is_some()) }
 
     /// Does it know `table` (as the catalog names it) is there? Whole, or holding any privilege on it (SELECT, INSERT,
     /// UPDATE or DELETE, on it, its schema or the lake). A table it doesn't know is answered as one that isn't there,
     /// 42P01, at every door: planning finds no such table, and `may` says "no table", so no answer tells it the table
     /// exists, nor its columns. One it knows but may not read or write is refused, 42501.
-    pub fn knows(&self, table: &str) -> bool { self.0.as_ref().is_none_or(|a| a.knows(table)) }
+    pub fn knows(&self, table: &str) -> bool { self.access.as_ref().is_none_or(|a| a.knows(table)) }
 
     /// The same, for a table of another lake attached here (`l.t`, `l.s.t`): only grants naming it count (`named`).
-    pub fn knows_named(&self, table: &str) -> bool { self.0.as_ref().is_none_or(|a| a.knows_named(table)) }
+    pub fn knows_named(&self, table: &str) -> bool { self.access.as_ref().is_none_or(|a| a.knows_named(table)) }
 
     /// The columns of `table` (as the catalog names it) it reads: None, none; Some(None), every column; Some(these).
-    pub fn columns(&self, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.0.as_ref().map_or(Some(None), |a| a.columns("select", table)) }
+    pub fn columns(&self, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.access.as_ref().map_or(Some(None), |a| a.columns("select", table)) }
 
     /// The same, for a table of another lake attached here (`l.t`, `l.s.t`): only grants naming it count; ON ALL TABLES
     /// and ON SCHEMA are this lake's. `privilege` as `Action::privilege` names it.
-    pub fn named(&self, privilege: &str, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.0.as_ref().map_or(Some(None), |a| a.named(privilege, table)) }
+    pub fn named(&self, privilege: &str, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.access.as_ref().map_or(Some(None), |a| a.named(privilege, table)) }
 
     /// May it use the secret `name` (GRANT USAGE ON SECRET)?
-    pub fn secret(&self, name: &str) -> bool { self.0.as_ref().is_none_or(|a| a.secret(name)) }
+    pub fn secret(&self, name: &str) -> bool { self.access.as_ref().is_none_or(|a| a.secret(name)) }
 
     /// May it use the object `name` of an extension's `kind` for `privilege` (`READ` on a connection)? Whole: always.
-    pub fn may_use(&self, kind: &str, name: &str, privilege: &str) -> bool { self.0.as_ref().is_none_or(|a| a.may_use(kind, name, privilege)) }
+    pub fn may_use(&self, kind: &str, name: &str, privilege: &str) -> bool { self.access.as_ref().is_none_or(|a| a.may_use(kind, name, privilege)) }
 
     /// The schemas a user granted CLONE may branch (ADR-058): None, no CLONE grant (and a whole scope, which needs none);
     /// Some(none), every schema (CLONE ON DATABASE); Some(these), CLONE ON SCHEMA.
-    pub fn clones(&self) -> Option<Vec<String>> { self.0.as_ref().and_then(|a| a.clones()) }
+    pub fn clones(&self) -> Option<Vec<String>> { self.access.as_ref().and_then(|a| a.clones()) }
 
     /// May it branch `db`, a database attached here, through its attachment (GRANT CLONE ON DATABASE db)?
-    pub fn clones_of(&self, db: &str) -> bool { self.0.as_ref().is_none_or(|a| a.clones_of(db)) }
+    pub fn clones_of(&self, db: &str) -> bool { self.access.as_ref().is_none_or(|a| a.clones_of(db)) }
 
     /// Is it a user granted APPLY on this database (`apply::applier`)? A whole scope applies by its role instead: false.
-    pub fn applies(&self) -> bool { self.0.as_ref().is_some_and(|a| a.applies()) }
+    pub fn applies(&self) -> bool { self.access.as_ref().is_some_and(|a| a.applies()) }
 
     /// Is it shown routines' code, tasks' statements and views' queries (S27): a token, a superuser, an open node,
     /// and a user who could hold them anyway (APPLY deploys them, CLONE ON DATABASE copies them into a branch it
     /// owns)? A user granted some tables is shown their names and parameters only.
-    pub fn shows_code(&self) -> bool { self.0.as_ref().is_none_or(|a| a.applies() || a.clones().is_some_and(|s| s.is_empty())) }
+    pub fn shows_code(&self) -> bool { self.access.as_ref().is_none_or(|a| a.applies() || a.clones().is_some_and(|s| s.is_empty())) }
 
     /// The names whose grants it has: a user's own, its roles' and public's. None: whole.
-    pub fn names(&self) -> Option<&std::collections::HashSet<String>> { self.0.as_ref().map(|a| &a.names) }
+    pub fn names(&self) -> Option<&std::collections::HashSet<String>> { self.access.as_ref().map(|a| &a.names) }
 }
 
 /// The table a write changes (as the catalog names it; empty: the lake's) and what it asks to do to it.

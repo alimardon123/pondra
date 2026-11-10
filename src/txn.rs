@@ -980,10 +980,10 @@ fn inserted_row(meta: &TableMeta, proposed: &RecordBatch) -> Result<RecordBatch>
 /// The rows an UPDATE, DELETE or MERGE changes, with the commit they were read at and the keys they lock: one key's by the
 /// serving path's point read when the statement is an UPDATE of one key (`point`), else by planning (`changing`). The new
 /// versions meet the table's NOT NULL and DEFAULT (invariant 130).
-async fn change(l: &Locks<'_>, stored: &Arc<TableMeta>, stmt: &Stmt, snapshot: u64) -> Result<Changed> {
+async fn change(l: &Locks<'_>, stored: &Arc<TableMeta>, stmt: &Stmt, snapshot: u64, scope: &crate::rights::Scope) -> Result<Changed> {
     let rules = stored.rules()?;
     if let Stmt::Merge(m) = stmt {
-        if let Some(p) = m.point_upsert(l.name, stored) {
+        if let Some(p) = m.point_upsert(l.name, stored, scope) {
             if let Some(c) = upsert_point(l, stored, &rules, m, &p, snapshot).await? {
                 return Ok(c); // (its new rows come shaped: `upsert_point`)
             }
@@ -1098,7 +1098,7 @@ pub async fn statement(app: &crate::app::App, stmt: &Stmt, files: bool, scope: &
             }
             (vec![], vec![rows.into_rows()], at, keys)
         }
-        None => change(&l, &stored, stmt, snapshot).await?,
+        None => change(&l, &stored, stmt, snapshot, scope).await?,
     };
     crate::returning::wrote(&old, &new);
     let out = tally(&old, &new);
@@ -1148,7 +1148,7 @@ async fn autocommit_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &st
         }
     }
     let l = Locks { app, name: &name, meta: &meta, owner: owner.to_string(), txn: false, locking: true, committed: true, wait: lock_wait(), taken, scope };
-    let (old, new, _, _) = change(&l, &stored, stmt, lake.visible()).await?;
+    let (old, new, _, _) = change(&l, &stored, stmt, lake.visible(), scope).await?;
     if upsert {
         if old.iter().any(|b| b.num_rows() > 0) {
             crate::views::can_follow(lake, &name, false).await?;
@@ -2051,13 +2051,13 @@ fn joined(alias: &str, row: &RecordBatch, proposed: &RecordBatch) -> Result<(Rec
 /// In a transaction, a key lookup (`serve::Point`) answered from the transaction's own version of the row or the snapshot's,
 /// without planning, with the lookup (its columns' types: the Postgres port's answer, as outside a transaction). None: not
 /// one, or the row changed since the snapshot (SQL reads it as of then).
-pub async fn point_read(lake: &Lake, sql: &str) -> Result<Option<(Vec<RecordBatch>, Arc<crate::serve::Point>)>> {
+pub async fn point_read(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Result<Option<(Vec<RecordBatch>, Arc<crate::serve::Point>)>> {
     let Some(snapshot) = snapshot() else { return Ok(None) };
     // (a locking read takes its locks first, and is planned over the rows it locked: `lock_reads`)
     if crate::temp::mentioned(sql) || LOCKING.is_match(sql) {
         return Ok(None);
     }
-    let Some(p) = crate::serve::point(lake, sql.trim().trim_end_matches(';')).await? else { return Ok(None) };
+    let Some(p) = crate::serve::point(lake, sql.trim().trim_end_matches(';'), scope).await? else { return Ok(None) };
     let Some(key) = p.key.iter().cloned().collect::<Option<Vec<String>>>() else { return Ok(None) };
     let Ok(key) = key_text(&p.meta, &key) else { return Ok(None) }; // (a key the text can't say: SQL answers it)
     let schema = p.schema()?;

@@ -282,7 +282,7 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, by: Option<
     if app.members.cut_off() {
         return Err(E::refusal("57P03", crate::members::CUT_OFF_SAYS.into())); // (cannot_connect_now: every door's clients retry elsewhere)
     }
-    let (class, start, quota) = (class(sql), Instant::now(), crate::users::quota(&app.lake));
+    let (class, start, quota) = (class(sql), Instant::now(), crate::users::quota(&app.lake, by));
     let mut stopped = Stopped(Some((app, by, class, sql, start)));
     let ((out, note), unseen) = crate::rights::noting(crate::history::noted(crate::ext::rooted(&app.lake.url, INSIDE.scope((), crate::authored::door(sql, async {
         let _turn = quota.turn().await.map_err(|m| E::refusal("53000", m))?; // (insufficient_resources)
@@ -484,13 +484,13 @@ fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(crate::answer::schema(&columns())?, arrays)?)
 }
 
-/// Is `sql` about the audit log, and may the caller read it (a superuser)?
-pub fn check(sql: &str) -> Result<bool> {
+/// Is `sql` about the audit log, and may `scope` read it (the planning session's: a superuser's, `Scope::superuser`)? A
+/// scope made without a principal is no one's, and is refused.
+pub fn check(sql: &str, scope: &crate::rights::Scope) -> Result<bool> {
     if !sql.to_lowercase().contains("pondra.audit") {
         return Ok(false);
     }
-    let superuser = crate::auth::current().is_none_or(|p| p.superuser());
-    anyhow::ensure!(superuser, "permission denied: pondra.audit is the superusers'");
+    anyhow::ensure!(scope.superuser(), "permission denied: pondra.audit is the superusers'");
     Ok(true)
 }
 
