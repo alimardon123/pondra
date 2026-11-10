@@ -360,7 +360,10 @@ print(ann.sql("SELECT id FROM regional ORDER BY id").rows())
 - A stream of the whole table (Kafka, `/watch`, `/lookup`, Flight's log, another engine through the Iceberg catalog)
   is refused to a reader a filter holds, saying to read it with SELECT.
 - A writer a filter holds changes only rows it reads: an UPDATE, DELETE or MERGE leaves a hidden row as it is, and
-  an insert of a key a hidden row holds is refused as any taken key is (23505), so that row isn't replaced. A load
+  a MERGE's insert of a key a hidden row holds is refused as any taken key is (23505), so that row isn't replaced. An
+  upsert's key a hidden row holds conflicts as in Postgres: `ON CONFLICT DO NOTHING` skips that row, and `DO UPDATE`
+  is refused (42501), whatever its `WHERE` (Postgres tries the `WHERE` on the hidden row first; Pondra never runs a
+  writer's expression on a row it can't read). A load
   whose rows replace their keys' rows (COPY, Flight or Kafka into a keyed table) is refused to them, naming SQL's ways,
   and so is an INSERT into a merge table, whose rows add up by key as they're read.
 - UPDATE's and DELETE's own filters (`GRANT UPDATE ON t TO r WHERE condition`) say which rows a writer changes: its

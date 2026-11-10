@@ -584,7 +584,8 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str, scope: &cra
     // the key alone, comparing it in the key's own type, inserts only rows whose key no row holds, so nothing is looked up;
     // a MERGE's must still differ from each other (an upsert's keep their own rule: `Upsert::merge` keeps a key's first row, or refuses 21000).
     // A writer a filter on the table's rows holds matched only the rows it reads: its new keys are looked up in every row, so a
-    // key a row it doesn't read holds is refused (23505), as a plain INSERT's is, and that row isn't replaced.
+    // MERGE's insert of a key a row it doesn't read holds is refused (23505), as a plain INSERT's is, and that row isn't
+    // replaced. (An upsert's such rows were skipped or refused already: `merge`'s `unseen`.)
     let read_whole = scope.rows(&Privilege::Select, &table).is_none();
     let plain = match &stmt {
         crate::write::Stmt::Insert(..) | crate::write::Stmt::InsertInto(..) => true,
@@ -710,10 +711,12 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
     let merge_stmt = m.sql.trim_start().get(..5).is_some_and(|w| w.eq_ignore_ascii_case("MERGE")); // (an UPDATE … FROM keeps its message)
     let built;
     let mut proposed = None;
+    let mut conflict = None; // (an upsert's conflict columns: `unseen` below)
     let m = match &m.upsert {
         Some(u) => {
             let given = u.given(meta, &m.target)?; // (its width and conflict columns are checked before its rows are worked out)
             let on = u.on_columns(meta, &m.target)?;
+            conflict = Some(on.clone());
             let mut rows = proposed_rows(lake, table, meta, rules, &given, &u.query, upto, scope).await?;
             // (one row of VALUES, an ORM's upsert, can't repeat a key: its rows aren't looked at for one)
             if !crate::rules::rows::one_row(&u.query) && crate::rules::keys::twice(&rows, &on, &[])?.is_some() {
@@ -743,6 +746,13 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
             bail!("{what}: a row of {table} matches more than one source row");
         }
     }
+    // An upsert whose writer a filter on the table's rows holds matched only the rows it reads. A key a row it doesn't read holds
+    // conflicts all the same, as Postgres's does (its unique index sees every row): DO NOTHING skips that row, and DO UPDATE is
+    // refused 42501, as Postgres refuses a conflict's row its policy hides. (Postgres first tries the DO UPDATE's WHERE on that
+    // row, and skips it if the WHERE doesn't hold; Pondra never runs a writer's expression on a row the writer can't read, so it
+    // refuses whatever the WHERE.)
+    let unseen = conflict.filter(|_| scope.rows(&Privilege::Select, table).is_some());
+    let updates = m.clauses.iter().any(|c| matches!(c.action, Action::Update(_)));
     let clauses = async {
         let (mut old, mut new) = (vec![], vec![]);
         for (i, c) in m.clauses.iter().enumerate() {
@@ -778,7 +788,11 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
                     ensure!(given.iter().all(|c| meta.columns().any(|(n, _)| n == c)), "MERGE: INSERT names the table's own columns");
                     // (a column the clause leaves out takes its default, as `select_as` gives it: NULL with none)
                     let values: Vec<String> = meta.columns().map(|(c, _)| given.iter().position(|g| g == c).map_or("DEFAULT".into(), |i| values[i].clone())).collect();
-                    select_as(lake, meta, None, Some(&values), &rest, upto, &a, scope).await?
+                    let (o, n) = select_as(lake, meta, None, Some(&values), &rest, upto, &a, scope).await?;
+                    match &unseen {
+                        Some(on) => (o, not_unseen(lake, table, n, on, updates, upto).await?),
+                        None => (o, n),
+                    }
                 }
             };
             old.extend(o);
@@ -790,6 +804,20 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
         Some(rows) => PROPOSED.scope(Arc::new(rows), clauses).await,
         None => clauses.await,
     }
+}
+
+/// The rows an upsert inserts (`rows`, which match no row its writer reads on `on`) but those a row the writer doesn't read holds
+/// the conflict key of: DO NOTHING skips them; DO UPDATE (`updates`) is refused 42501 for one (`merge`'s `unseen`).
+async fn not_unseen(lake: &Lake, table: &str, rows: Vec<RecordBatch>, on: &[String], updates: bool, upto: u64) -> Result<Vec<RecordBatch>> {
+    let mut kept = vec![];
+    for b in rows {
+        let held = crate::constraints::held_of(lake, table, &b, on, upto).await?;
+        if held.true_count() > 0 && updates {
+            return Err(crate::codes::coded("42501", format!("a row of {table} you can't read (a filter on its rows in your grant) holds a key these rows give: ON CONFLICT DO UPDATE can't update it")));
+        }
+        kept.push(datafusion::arrow::compute::filter_record_batch(&b, &datafusion::arrow::compute::not(&held)?)?);
+    }
+    Ok(kept)
 }
 
 /// The change as one commit: new versions and new rows into the table; the old versions into
