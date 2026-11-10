@@ -2,7 +2,7 @@
 //! their handlers and the answers they give. What a commit means and how the leader records it is
 //! `iceberg.rs`'s, a lake module; this one is axum's, so it is a doors module.
 
-use crate::iceberg::{instead, loaded, prepare, requirements, Commit, Published, CONFLICT, REFUSED};
+use crate::iceberg::{instead, loaded, prepare, requirements, rollback, Commit, Published, CONFLICT, REFUSED};
 use crate::store::Lake;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -395,6 +395,23 @@ async fn update(axum::extract::State(app): axum::extract::State<crate::app::App>
     let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException"))?;
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the commit: {e}")))?;
     instead(&name, &asked).map_err(door)?;
+    if let Some(to) = rollback(&current["metadata"], &asked) {
+        let (id, ms) = to.map_err(door)?;
+        requirements(&current["metadata"], &asked).map_err(door)?;
+        if current["metadata"]["current-snapshot-id"].as_i64() == Some(id) {
+            return Ok(axum::Json(current)); // (main is there already)
+        }
+        let target = sql_name(&app, &parts, &lake, &schema, &table);
+        // (to the end of that millisecond: a snapshot's time is when it was published, at or after its commit, which
+        // Pondra keeps to the microsecond)
+        let us = ms * 1000 + 999;
+        let restore = format!("RESTORE TABLE {target} TO TIMESTAMP AS OF to_timestamp_micros({us})");
+        // (as the host reads it: RESTORE is a MERGE from the table AT (…), `past.rs`)
+        let asking = crate::host::Asking::of(&lake, &who.scope);
+        let merge = crate::front::expand(&asking, &restore, &std::collections::HashMap::new()).await.map_err(|e| bad(crate::ext::said(&e)))?;
+        as_caller(&app, &who, &merge, false).await?;
+        return published(&lake, &name, &current, true).await;
+    }
     let updates = asked["updates"].as_array().cloned().unwrap_or_default();
     let alters = |a: &str| ["add-schema", "set-properties", "remove-properties"].contains(&a);
     if updates.iter().any(|u| alters(u["action"].as_str().unwrap_or_default())) && !updates.iter().any(|u| u["action"] == "add-snapshot") {
@@ -408,19 +425,25 @@ async fn update(axum::extract::State(app): axum::extract::State<crate::app::App>
         for s in &sql {
             as_caller(&app, &who, s, false).await?;
         }
-        let version = current["metadata"]["last-sequence-number"].as_u64().unwrap_or(0);
-        for _ in 0..200 {
-            match loaded(&lake, &name).await {
-                Ok(v) if sql.is_empty() || v["metadata"]["last-sequence-number"].as_u64().unwrap_or(0) > version => return Ok(axum::Json(v)),
-                _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await, // (published on the leader: this node sees it a moment later)
-            }
-        }
-        return loaded(&lake, &name).await.map(axum::Json).map_err(|e| bad(crate::ext::said(&e)));
+        return published(&lake, &name, &current, !sql.is_empty()).await;
     }
     match prepare(&lake, &name, &current, &asked).await.map_err(door)? {
         Some(c) => commit(&app, &lake, vec![c]).await.map(axum::Json),
         None => Ok(axum::Json(current)), // (this commit is in already: a retry, answered as it was)
     }
+}
+
+/// The table as the catalog answers it once a change made with Pondra's SQL is published (on the leader: this node sees
+/// it a moment later), or as it is after ten seconds; `changed`: false, at once.
+async fn published(lake: &Lake, name: &str, current: &Value, changed: bool) -> Reply {
+    let version = current["metadata"]["last-sequence-number"].as_u64().unwrap_or(0);
+    for _ in 0..200 {
+        match loaded(lake, name).await {
+            Ok(v) if !changed || v["metadata"]["last-sequence-number"].as_u64().unwrap_or(0) > version => return Ok(axum::Json(v)),
+            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+    loaded(lake, name).await.map(axum::Json).map_err(|e| bad(crate::ext::said(&e)))
 }
 
 /// `POST /v1/transactions/commit`: another engine's changes to several tables of a database, as

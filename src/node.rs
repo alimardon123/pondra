@@ -319,6 +319,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     let pace = (s.tier_secs > 0.0).then(|| log::Pace { rows: s.backlog, lock: lock.clone() }); // rows waiting to be tiered
     if leader && lives {
         lake.cat.keep_records().await?; // (its catalog hooks' records made whole, then kept by every write: a guest's statement reads past them)
+        lake.node.trace("the catalog's records kept");
     }
     let seq = if leader { Some(log::Sequencer::start(lake.clone(), pace).await?) } else { None };
     let to = match &seq {

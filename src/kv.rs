@@ -46,6 +46,10 @@ pub(crate) trait Kv: crate::ledger::Charged {
     async fn get(&self, key: &str, remote: bool) -> Result<Option<Bytes>, Error>;
     /// The keys in `range`, in order, with their values; `remote` as for `get`.
     async fn scan(&self, range: std::ops::Range<Vec<u8>>, remote: bool) -> Result<BTreeMap<String, Bytes>, Error>;
+    /// The keys in `range` as `scan` reads them, for a read of most of the store at once (a node's catalog in memory as
+    /// it starts, `Catalog::seed`, and the records kept with its entries, `Catalog::keep_records`): read in large pieces,
+    /// several at a time, where `scan` reads a block a request.
+    async fn scan_whole(&self, range: std::ops::Range<Vec<u8>>) -> Result<BTreeMap<String, Bytes>, Error> { self.scan(range, false).await }
     /// Does this store take writes (a leader's), or only read (a follower's view of the bucket)?
     fn is_writer(&self) -> bool;
     /// One atomic batch: the puts, then the deletes (a key both put and deleted ends deleted). The returned handle
