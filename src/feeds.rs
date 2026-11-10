@@ -53,6 +53,7 @@ pub fn start(app: App) {
     let node = app.lake.node.clone();
     node.tasks.spawn_node(crate::spawns::Vital::Stop, async move { // (the node's own work, its shards' too)
         let mut running: HashMap<(String, i32), tokio::task::JoinHandle<()>> = HashMap::new();
+        let node = crate::auth::Principal::node().scope; // (whom its topics are read for)
         let mut hwm = app.lake.hwm.subscribe();
         loop {
             let _ = tokio::time::timeout(Duration::from_secs(5), hwm.changed()).await; // (catalog changes, and now and then for nodes coming and going)
@@ -76,7 +77,7 @@ pub fn start(app: App) {
                     Some(s) => s.urls[0].clone(),
                     None => continue,
                 };
-                let parts = match partitions(&app.lake, &url).await {
+                let parts = match partitions(&app.lake, &url, &node).await {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("feed {view}: {e:#}");
@@ -100,9 +101,9 @@ pub fn start(app: App) {
                 if running.contains_key(&(view.clone(), p)) {
                     continue;
                 }
-                let (a, v) = (app.clone(), view.clone());
+                let (a, v, node) = (app.clone(), view.clone(), node.clone());
                 running.insert((view, p), app.lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
-                    if let Err(e) = shard(a, v.clone(), p).await {
+                    if let Err(e) = shard(a, v.clone(), p, &node).await {
                         eprintln!("feed {v}[{p}]: {e:#}");
                         tokio::time::sleep(Duration::from_secs(2)).await; // (then the loop starts it again)
                     }
@@ -112,18 +113,18 @@ pub fn start(app: App) {
     });
 }
 
-async fn partitions(lake: &Lake, url: &str) -> Result<Vec<i32>> {
+async fn partitions(lake: &Lake, url: &str, scope: &crate::rights::Scope) -> Result<Vec<i32>> {
     let (_, topic) = crate::kafka_client::parse(url)?;
-    Ok(crate::kafka_client::client(lake, url).await?.partitions(&topic).await?.into_iter().map(|(p, _)| p).collect())
+    Ok(crate::kafka_client::client(lake, url, scope).await?.partitions(&topic).await?.into_iter().map(|(p, _)| p).collect())
 }
 
 /// One partition of a feed, for as long as this node runs it.
-async fn shard(app: App, view: String, p: i32) -> Result<()> {
+async fn shard(app: App, view: String, p: i32, scope: &crate::rights::Scope) -> Result<()> {
     let lake = app.lake.clone();
     let feed: Feed = lake.cat.get(&feed_key(&view)).await?.context("the feed is gone")?;
     let url = crate::ext_names::spec(&feed.topic).context("a feed's topic")?.urls[0].clone();
     let (_, topic) = crate::kafka_client::parse(&url)?;
-    let client = crate::kafka_client::client(&lake, &url).await?;
+    let client = crate::kafka_client::client(&lake, &url, scope).await?;
     let producer = format!("feed:{view}:{p}");
     let schema = crate::answer::schema(&crate::kafka_client::columns())?;
     let mut leader = String::new();

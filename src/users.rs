@@ -1372,17 +1372,17 @@ pub(crate) fn fresh(lake: &Lake, now: Option<u64>, then: Option<u64>, at: datafu
     (lake.cat.is_writer() && now.is_some() && now == then) || at.elapsed() < std::time::Duration::from_secs(1)
 }
 
-/// May the request being served read or write the tables of `other`, a lake attached here as `ns`?
+/// May the request being served (its `scope`) read or write the tables of `other`, a lake attached here as `ns`?
 /// Refused, saying why, when that lake has a sign-in of its own (a user who signs in, or the node's
-/// tokens) and the request isn't from whoever runs the nodes (`auth::operator`): a user signed in
+/// tokens) and the request isn't from whoever runs the nodes (`scope.operator()`): a user signed in
 /// here is nobody there, and a database nothing locks opens nothing of another (the lake server's
 /// databases attach each other). A user granted some tables needs a grant naming the other lake's
 /// table besides (`Access::named`).
-pub async fn across(other: &Lake, ns: &str) -> Result<()> {
+pub async fn across(other: &Lake, ns: &str, scope: &crate::rights::Scope) -> Result<()> {
     if let Some(r) = other.node.reaches.of(&other.url).filter(|r| r.read_only) {
-        return read_only(&r, ns);
+        return read_only(&r, ns, scope);
     }
-    if crate::auth::operator() || !(crate::auth::tokens_on(&other.node) || any(other).await) {
+    if scope.operator() || !(crate::auth::tokens_on(&other.node) || any(other).await) {
         return Ok(());
     }
     bail!("permission denied: {ns} signs in on its own: its tables are read and written through it (the database {ns}), or with one of the nodes' tokens")
@@ -1391,8 +1391,7 @@ pub async fn across(other: &Lake, ns: &str) -> Result<()> {
 /// A lake on another server, attached READ_ONLY (ADR-058): its users sign in there, and its bucket
 /// key reads all of it whoever asks, so here it is read by whoever may use that key's secret (a
 /// user granted USAGE on it), and by tokens, as files under a secret's scope are.
-fn read_only(r: &crate::reaches::Reach, ns: &str) -> Result<()> {
-    let scope = crate::rights::scope();
+fn read_only(r: &crate::reaches::Reach, ns: &str, scope: &crate::rights::Scope) -> Result<()> {
     if scope.whole() {
         return Ok(());
     }
@@ -1406,7 +1405,7 @@ fn read_only(r: &crate::reaches::Reach, ns: &str) -> Result<()> {
 /// The same for a write to `table` of that lake (its name there), and, for a `scope` granted some
 /// tables (the writer's), a grant naming it for each privilege the write needs.
 pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::write::Stmt, scope: &crate::rights::Scope) -> Result<()> {
-    across(other, ns).await?;
+    across(other, ns, scope).await?;
     let (table, privileges) = (format!("{ns}.{table}"), crate::rights::asks(stmt).1.into_iter().filter_map(crate::rights::Action::privilege).collect::<Vec<_>>());
     match privileges.iter().find(|p| scope.named(p, &table).is_none()) {
         Some(p) => bail!("permission denied: {} on {table}, another database's table: GRANT {} ON {table} TO … (ON ALL TABLES and ON SCHEMA are this database's)", p.to_uppercase(), p.to_uppercase()),
