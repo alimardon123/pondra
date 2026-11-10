@@ -221,7 +221,8 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
         return Ok(None);
     }
     if st.uuid.is_empty() {
-        st.uuid = uuid::Uuid::new_v4().to_string();
+        // (a table another engine's staged create made keeps the uuid it was given: the job that made it, `iceberg_rest::made`)
+        st.uuid = meta.made_by.as_deref().and_then(|j| j.strip_prefix(MADE)).map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
     }
     let (dir, now, mut v) = (metadata_dir(meta.folder(table)), crate::log::now_ms(), st.version + 1);
     // (a version already there was written by an attempt that crashed before recording it: it's
@@ -752,6 +753,9 @@ pub struct Commit {
 impl Commit {
     fn job(&self) -> String { format!("iceberg:{}:{}", self.table, self.snapshot) }
 }
+
+/// The job of a table another engine's staged create made, before the uuid it gave it (`publish`).
+pub(crate) const MADE: &str = "iceberg-create:";
 
 /// The leader's answer when the table changed since the writer read it: 409, so it retries.
 pub const CONFLICT: &str = "the table changed since the writer read it";
