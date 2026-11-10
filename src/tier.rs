@@ -852,8 +852,10 @@ pub fn metric_lines(tables: &Tables, per_table: bool) -> [Vec<(String, f64)>; 4]
 }
 
 /// How often a leader's rounds read every table again (`refresh`, `delta::publish_named`): between sweeps they read only
-/// the tables committed since their last round, so a table a round missed waits at most this.
-pub const SWEEP: std::time::Duration = std::time::Duration::from_secs(60);
+/// the tables committed since their last round, so a table a round missed waits at most this. Every commit names its
+/// tables to them (`Catalog::written`), and a gap or a new snapshot reads every table at once: the sweep is only the net
+/// under that. Once a minute it read 1,700 entries a second on an idle leader of 100,000 tables.
+pub const SWEEP: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// A sweep reads this many tables' entries at a time.
 const SWEEP_PAGE: usize = 1000;
@@ -970,7 +972,10 @@ pub async fn expire_with(lake: &Lake, grace_ms: u64, briefs: &Tables, pass: Opti
     // commit's files are read from them by the log's readers (a task behind, `/watch?after=`).
     let next = match kept.first() {
         Some((_, s)) => Some(s.ts_ms),
-        None => lake.cat.segments(&seg_key(floor + 1), &seg_key(floor + 1001)).await?.first().map(|(_, s)| s.ts_ms),
+        None => match lake.cat.scan_page(&seg_key(floor + 1), "s0", 1, |_| true).await?.0.first() { // (the first above it: one record)
+            Some((_, raw)) => Some(serde_json::from_slice::<Segment>(raw)?.ts_ms),
+            None => None,
+        },
     };
     // Files live when a reader started stay while it reads (`pins`: a branch made, ADR-047).
     crate::pins::lapse(lake).await?; // (readers that stopped saying so, a pin on lease not renewed: before the files they kept are counted)
