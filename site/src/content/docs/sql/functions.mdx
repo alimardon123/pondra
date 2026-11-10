@@ -97,6 +97,19 @@ keeps its braces. `->>` answers text: a string without its quotes, and `NULL` fo
 The operators bind as Postgres binds them, so a comparison needs no parentheses:
 `WHERE doc ->> 'status' = 'open'` reads as `(doc ->> 'status') = 'open'`.
 
+A `JSON` or `JSONB` value reads by the same path a `STRUCT`, a `MAP` or a list does: `doc['key']` and `doc.key` are
+`doc -> 'key'`, `doc[0]` is `doc -> 0`, and they chain. Each step answers JSON, as `->` does, so end with `->>` to read
+a value as text. An array's positions count from 0, as `->` and Postgres's `jsonb` subscripts count; a list's count from
+1, as Postgres's arrays and DuckDB's lists do.
+
+```sql
+CREATE TABLE tickets (id BIGINT, doc JSONB, tags VARCHAR[]);
+INSERT INTO tickets VALUES (1, '{"customer": {"name": "ann"}, "items": [{"sku": "A1"}, {"sku": "B7"}]}', ['urgent', 'web']);
+
+SELECT doc.customer.name, doc['items'][1]['sku'], doc.items[0] ->> 'sku' AS first_sku, tags[1] AS first_tag
+FROM tickets;
+```
+
 The same operators are functions under Postgres's own names, so SQL written for Postgres runs as it is:
 
 | Operator | Function |
@@ -179,7 +192,7 @@ The functions below read the same documents. Each takes the document, then a pat
 ```sql
 CREATE TABLE events (id BIGINT, payload VARCHAR);
 INSERT INTO events VALUES
-  (1, '{"user": {"name": "ann"}, "amount": 4.5, "tags": ["a", "b"]}'),
+  (1, '{"customer": {"name": "ann"}, "amount": 4.5, "tags": ["a", "b"]}'),
   (2, '{"user": {"name": "bo"}, "amount": 2.0, "tags": []}');
 
 SELECT id,
