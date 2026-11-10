@@ -8,7 +8,7 @@ use crate::buckets::{At, Store};
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::{GetOptions, GetResult, ListResult, ObjectMeta, ObjectStore, PutOptions, PutPayload, PutResult};
+use object_store::{GetOptions, GetResult, ListResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutOptions, PutPayload, PutResult};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -71,13 +71,13 @@ impl std::fmt::Display for Faulty {
 }
 
 /// The error a call that failed, or lost its answer, gives: what a bucket's timeout or 500 gives.
-fn failed(op: Op, at: &dyn std::fmt::Display, verdict: Verdict) -> object_store::Error {
+fn failed(op: Op, at: &(dyn std::fmt::Display + Sync), verdict: Verdict) -> object_store::Error {
     object_store::Error::Generic { store: "sim", source: format!("{op:?} {at}: {verdict:?} (the sim's faults)").into() }
 }
 
 impl Faulty {
     /// Runs `call` as the member's faults say: not at all (it fails), or done and its answer lost, or as it comes.
-    async fn run<T>(&self, op: Op, at: &dyn std::fmt::Display, call: impl std::future::Future<Output = object_store::Result<T>>) -> object_store::Result<T> {
+    async fn run<T>(&self, op: Op, at: &(dyn std::fmt::Display + Sync), call: impl std::future::Future<Output = object_store::Result<T>>) -> object_store::Result<T> {
         match self.faults.meet(op, at).await {
             Verdict::Fail => Err(failed(op, at, Verdict::Fail)),
             Verdict::Lose => {

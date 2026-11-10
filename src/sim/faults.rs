@@ -121,7 +121,7 @@ impl Faults {
 
     /// What a call of kind `op` (to `what`) meets: it waits while the member is frozen, then as long as the dice say up to
     /// its odds' `slow`; then it goes, fails, or goes and loses its answer.
-    pub async fn meet(&self, op: Op, what: &dyn std::fmt::Display) -> Verdict {
+    pub async fn meet(&self, op: Op, what: &(dyn std::fmt::Display + Sync)) -> Verdict {
         let mut frozen = self.frozen.subscribe();
         let _ = frozen.wait_for(|f| !f).await; // (the sender lives as long as these faults)
         if self.cut.load(SeqCst) {
