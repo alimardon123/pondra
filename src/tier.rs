@@ -672,7 +672,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job, scope: &crate:
                 }
             };
             let (ord, part) = (files.iter().map(|f| f.ord).max().unwrap_or(0), files[0].part.clone());
-            let mut merged = write_stream(lake, &table, rows, 4_000_000, &keys, meta.key.is_empty(), None).await?;
+            let mut merged = write_stream(lake, &table, rows, 4_000_000, &keys, None).await?;
             merged.iter_mut().for_each(|f| (f.ord, f.part) = (ord, part.clone()));
             return Ok(merged);
         }
@@ -688,7 +688,7 @@ async fn write_parts(lake: &Lake, table: &str, meta: &TableMeta, batches: Vec<Re
     };
     let mut files = vec![];
     for (part, batches) in parts {
-        if let Some(f) = write_file(lake, table, &batches, keys, meta.key.is_empty()).await? {
+        if let Some(f) = write_file(lake, table, &batches, keys).await? {
             files.push(DataFile { ord, whole, part, ..f });
         }
     }
@@ -1224,12 +1224,13 @@ pub(crate) fn codec() -> Compression {
 
 use crate::answer::storable;
 
-/// One Parquet file of these rows; with `stats`, it carries its columns' min/max (append tables).
-pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys: &[String], stats: bool) -> Result<Option<DataFile>> {
+/// One Parquet file of these rows, which carries its columns' min and max: an append table's, and a keyed table's, whose
+/// reads skip a file by them (`hot::HotFiles`, `scan::Files`).
+pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys: &[String]) -> Result<Option<DataFile>> {
     let Some(first) = batches.iter().find(|b| b.num_rows() > 0) else { return Ok(None) };
     let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
     let hot = lake.hot().columns(meta.as_ref().map_or(table, |m| m.folder(table)), &first.schema());
-    let mut file = Encoding::new(meta.as_ref(), first, keys, stats, hot)?;
+    let mut file = Encoding::new(meta.as_ref(), first, keys, hot)?;
     let batches = batches.to_vec();
     let file = blocking(move || {
         batches.iter().try_for_each(|b| file.write(b))?;
@@ -1264,7 +1265,8 @@ struct Encoding {
     ids: datafusion::arrow::datatypes::SchemaRef,
     rows: usize,
     sys: bool,
-    seen: Option<(crate::manifest::Seen, crate::sketch::Sketches)>, // (`stats`: append tables)
+    seen: crate::manifest::Seen, // (its columns' min and max: an append table's files and a keyed table's both)
+    sketches: Option<crate::sketch::Sketches>, // (an append table's: a keyed file's would count a key's old versions too)
     hot: Vec<(usize, FieldRef)>,
     kept: Vec<Vec<ArrayRef>>,
     kept_bytes: usize,
@@ -1273,19 +1275,20 @@ struct Encoding {
 impl Encoding {
     /// A file of rows like `first`'s (it isn't written yet). `hot` are the table's columns held here
     /// (`hot::Hot::columns`): a file whose rows lack one of them keeps none, and `load` reads it later.
-    fn new(meta: Option<&TableMeta>, first: &RecordBatch, keys: &[String], stats: bool, hot: Vec<FieldRef>) -> Result<Self> {
+    fn new(meta: Option<&TableMeta>, first: &RecordBatch, keys: &[String], hot: Vec<FieldRef>) -> Result<Self> {
         let ids = field_ids(meta, &storable(&first.slice(0, 0))?.schema());
-        let seen = stats.then(|| (crate::manifest::Seen::new(first.schema()), crate::sketch::Sketches::new(&first.schema())));
+        let seen = crate::manifest::Seen::new(first.schema());
+        let sketches = meta.is_none_or(|m| m.key.is_empty()).then(|| crate::sketch::Sketches::new(&first.schema()));
         let schema = first.schema();
         let at = |f: FieldRef| Some((schema.index_of(f.name()).ok()?, f));
         let hot: Vec<(usize, FieldRef)> = hot.into_iter().map(at).collect::<Option<_>>().unwrap_or_default();
         let kept = vec![vec![]; hot.len()];
-        Ok(Encoding { w: writer(ids.clone(), keys)?, ids, rows: 0, sys: schema.index_of(crate::text::ROW_ID).is_ok(), seen, hot, kept, kept_bytes: 0 })
+        Ok(Encoding { w: writer(ids.clone(), keys)?, ids, rows: 0, sys: schema.index_of(crate::text::ROW_ID).is_ok(), seen, sketches, hot, kept, kept_bytes: 0 })
     }
 
     fn write(&mut self, b: &RecordBatch) -> Result<()> {
-        if let Some((seen, sketches)) = &mut self.seen {
-            seen.add(b)?;
+        self.seen.add(b)?;
+        if let Some(sketches) = &mut self.sketches {
             sketches.add(b);
         }
         self.keep(b);
@@ -1316,13 +1319,10 @@ impl Encoding {
 
     /// The file's bytes, finished, and its entry but for where it goes.
     fn finish(self) -> Result<(Vec<u8>, DataFile)> {
-        let Encoding { mut w, rows, sys, seen, .. } = self;
+        let Encoding { mut w, rows, sys, mut seen, sketches, .. } = self;
         let footer = w.finish()?; // (its statistics: the file's min and max, without a second pass)
         let buf = std::mem::take(w.inner_mut());
-        let (stats, nulls, sketch) = match seen {
-            Some((mut seen, sketches)) => (seen.stats(&footer), Some(seen.nulls()), sketches.done()),
-            None => Default::default(),
-        };
+        let (stats, nulls, sketch) = (seen.stats(&footer), Some(seen.nulls()), sketches.map(|s| s.done()).unwrap_or_default());
         let bytes = buf.len() as u64;
         Ok((buf, DataFile { rows: rows as u64, bytes, stats, nulls, sketch, sys, ..Default::default() }))
     }
@@ -1375,9 +1375,9 @@ fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::Sc
 /// SELECT, a merge), a batch at a time as the rows come. A partitioned table's rows are split a
 /// million at a time instead (each part held whole until it is written), so each file holds one
 /// partition's (invariant 26).
-pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, max_rows: usize, keys: &[String], stats: bool, partition: Option<&str>) -> Result<Vec<DataFile>> {
+pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, max_rows: usize, keys: &[String], partition: Option<&str>) -> Result<Vec<DataFile>> {
     if let Some(spec) = partition {
-        return write_parts_of(lake, table, stream, max_rows.min(1_000_000), keys, stats, spec).await;
+        return write_parts_of(lake, table, stream, max_rows.min(1_000_000), keys, spec).await;
     }
     let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
     let (mut files, mut open) = (vec![], None::<Encoding>);
@@ -1414,7 +1414,7 @@ pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBa
             None => {
                 // (a file's hot columns are the table's held ones when it is opened)
                 let hot = lake.hot().columns(meta.as_ref().map_or(table, |m| m.folder(table)), &b.schema());
-                Encoding::new(meta.as_ref(), &b, keys, stats, hot)?
+                Encoding::new(meta.as_ref(), &b, keys, hot)?
             }
         };
         writing = Some(blocking(move || file.write(&b).map(|_| file)));
@@ -1426,7 +1426,7 @@ pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBa
 }
 
 /// `write_stream` for a partitioned table: `chunk` rows at a time, split by partition value.
-async fn write_parts_of(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, chunk: usize, keys: &[String], stats: bool, spec: &str) -> Result<Vec<DataFile>> {
+async fn write_parts_of(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, chunk: usize, keys: &[String], spec: &str) -> Result<Vec<DataFile>> {
     let (mut files, mut pending, mut n) = (vec![], vec![], 0);
     loop {
         let batch = stream.next().await.transpose()?;
@@ -1437,7 +1437,7 @@ async fn write_parts_of(lake: &Lake, table: &str, mut stream: SendableRecordBatc
         }
         if n >= chunk || (end && n > 0) {
             for (part, batches) in split(spec, std::mem::take(&mut pending)).await? {
-                files.extend(write_file(lake, table, &batches, keys, stats).await?.map(|f| DataFile { part, ..f }));
+                files.extend(write_file(lake, table, &batches, keys).await?.map(|f| DataFile { part, ..f }));
             }
             n = 0;
         }
@@ -1487,7 +1487,7 @@ mod tests {
             RecordBatch::try_new(schema.clone(), columns).unwrap()
         };
         let batches: Vec<RecordBatch> = [0, 300_000, 600_000].into_iter().map(batch).collect();
-        let mut file = Encoding::new(None, &batches[0], &["i".to_string()], true, vec![]).unwrap();
+        let mut file = Encoding::new(None, &batches[0], &["i".to_string()], vec![]).unwrap();
         batches.iter().try_for_each(|b| file.write(b)).unwrap();
         let (buf, entry) = file.finish().unwrap();
         let groups = SerializedFileReader::new(bytes::Bytes::from(buf)).unwrap().metadata().num_row_groups();
@@ -1724,7 +1724,7 @@ mod tests {
         };
         let dir = std::env::temp_dir().join(format!("pondra-streamed-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
-        let files = write_stream(&lake, "t", stream(false), 2500, &[], true, None).await?;
+        let files = write_stream(&lake, "t", stream(false), 2500, &[], None).await?;
         assert_eq!(files.iter().map(|f| f.rows).collect::<Vec<_>>(), [3000, 3000, 3000, 1000]);
         for (k, f) in files.iter().enumerate() {
             let (lo, hi) = (k as i64 * 3000, (k as i64 * 3000 + 2999).min(9999));
@@ -1733,7 +1733,7 @@ mod tests {
         let parquet = |d: &std::path::Path| walk(d).into_iter().filter(|p| p.extension().is_some_and(|e| e == "parquet")).count();
         let before = parquet(&dir);
         assert_eq!(before, 4);
-        let Err(err) = write_stream(&lake, "u", stream(true), 2500, &[], true, None).await else { panic!("the stream's error") };
+        let Err(err) = write_stream(&lake, "u", stream(true), 2500, &[], None).await else { panic!("the stream's error") };
         assert!(format!("{err:#}").contains("the query stopped"), "{err:#}");
         assert_eq!(parquet(&dir), before + 3, "the files filled before the error are put; the one under way is not");
         lake.cat.close().await?;
