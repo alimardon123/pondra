@@ -17,7 +17,8 @@ b. "a lake opened, written, closed and opened again in this process: its rows"
 c. "connect() while a node is open here: the same lake another connection to it (sessions apart, one closed and
    the other still answering), another lake and another memory lake a node each beside this process, a URL a
    connection; local() and open() warn that they go at 1.0"
-d. "a misspelt setting is refused naming the nearest"
+d. "a misspelt setting is refused naming the nearest; a session's settings (`settings=`) are SET as it opens, and one SET
+   refuses refuses the open by name"
 e. "a setting changed on a later open is refused naming it"
 f. "50 opens and closes leave no threads or open files, and each close takes under 100 ms" (Linux)
 g. "a fork's child: its parent's connection refused by name, connect() there a node beside it; the parent still
@@ -253,10 +254,18 @@ def child_second():
 
 
 def child_misspelt():
+    import pondra
     scratch = tempfile.mkdtemp(prefix="inprocess-check-")
-    message = refusal(os.path.join(scratch, "lake"), memory_gbb=2)
-    shutil.rmtree(scratch, ignore_errors=True)
-    return {"message": message}
+    lake = os.path.join(scratch, "lake")
+    try:
+        message = refusal(lake, memory_gbb=2)
+        refused = refusal(lake, settings={"default_table_format": "iceberg"})
+        db = pondra.connect(lake, settings={"default_file_format": "PARQUET", "application_name": "check's"})
+        shown = [list(db.sql(f"SHOW {n}").rows()[0].values())[0] for n in ("default_file_format", "application_name")]
+        db.close()
+        return {"message": message, "refused": refused, "shown": shown}
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def child_changed():
@@ -502,6 +511,9 @@ def judge_second(f):
 def judge_misspelt(f):
     message = f["message"]
     yield message is not None and "memory_gbb isn't a setting (did you mean memory_gb?)" in message, f"a misspelt setting: {message or 'accepted'}"
+    refused = f["refused"]
+    yield refused is not None and "WITH (publish = 'iceberg')" in refused, f"settings= with a value SET refuses: {refused or 'accepted'}"
+    yield f["shown"] == ["parquet", "check's"], f"settings= SETs the session's, as it opens: SHOW gives {f['shown']}"
 
 
 def judge_changed(f):
@@ -639,7 +651,7 @@ CHECKS = [  # (child, label, judge)
     ("calls", "every call through the library, none over the port: a live query, a watch, a big answer; Ctrl-C stops a long query and its work", judge_calls),
     ("reopen", "a lake opened, written, closed and opened again in this process: its rows", judge_reopen),
     ("second", "connect() while a node is open here: the same lake another connection, another lake (or memory) a node beside; local() and open() warn", judge_second),
-    ("misspelt", "a misspelt setting is refused naming the nearest", judge_misspelt),
+    ("misspelt", "a misspelt setting is refused naming the nearest; settings= SETs the session's, one SET refuses refused", judge_misspelt),
     ("changed", "a setting changed on a later open is refused naming it", judge_changed),
     ("cycles", "50 opens and closes leave no threads or open files", judge_cycles),
     ("quiet", "a node in a library prints nothing while all goes well, every statement slow (slow_ms=1)", judge_quiet),

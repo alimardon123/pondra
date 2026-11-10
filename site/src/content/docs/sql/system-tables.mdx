@@ -467,9 +467,10 @@ says what each one does.
 | `variable` | its name in the environment: `PONDRA_MEMORY_GB` (and `--memory-gb` where `pondra serve` has the flag) |
 | `type` | what it takes: `bool`, `switch` (on when set to anything), `int`, `float`, a number in its unit (`secs`, `ms`, `hours`, `days`, `kb`, `mb`, `gb`), `text`, `list` (comma-separated), `path`, `paths`, `url` or `secret` (never shown) |
 | `default_value` | what it is when unset, worked out on this machine where it depends on it (the cores, the memory); null when nothing is |
-| `scope` | where it holds: `node` (the process) for now |
+| `scope` | where it holds: `node` (each node's own) or `process` (every node in one process takes the same) |
 | `change` | when it may change: `start` (fixed when the node starts) for now |
 | `who` | who sets it: `node` (an option, a flag or the environment), `command` (`pondra sql` and the project commands read it) or `starter` (set by the program that starts a node) |
+| `session` | true where a session may set it too, by its name, over its node's value: `SET default_table_format = 'pondra'` (see [settings](/pondra/sql/statements/#settings-and-prepared-statements)) |
 
 ```sql
 SELECT variable, type, default_value FROM pondra.settings WHERE name LIKE 'memory%';

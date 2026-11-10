@@ -174,6 +174,51 @@ fn params() -> DefaultServerParameterProvider {
     params
 }
 
+/// The settings a client sent at startup, for its session, in the order Postgres sets them: its `options`' (`PGOPTIONS`),
+/// then `application_name`. (The database is `ready`'s; the other startup parameters drivers send are left as before.)
+fn startup_settings(sent: &std::collections::HashMap<String, String>) -> Result<Vec<(String, String)>, String> {
+    let mut settings = sent.get("options").map(|o| startup_options(o)).transpose()?.unwrap_or_default();
+    settings.extend(sent.get("application_name").map(|v| ("application_name".to_string(), v.clone())));
+    Ok(settings)
+}
+
+/// A startup's `options` as Postgres reads them: words split at white space (a backslash keeps the character after it, a
+/// space among them), each setting `-c name=value`, `-cname=value` or `--name=value`, a `-` in a name read as `_`. Anything
+/// else is refused in Postgres's words (42601, and the connection with it).
+fn startup_options(options: &str) -> Result<Vec<(String, String)>, String> {
+    let (mut words, mut word, mut escaped) = (Vec::new(), None::<String>, false);
+    for c in options.chars() {
+        if !escaped && c.is_ascii_whitespace() {
+            words.extend(word.take());
+            continue;
+        }
+        let w = word.get_or_insert_with(String::new);
+        if !escaped && c == '\\' {
+            escaped = true;
+        } else {
+            w.push(c);
+            escaped = false;
+        }
+    }
+    words.extend(word);
+    let mut words = words.into_iter();
+    let mut settings = Vec::new();
+    while let Some(w) = words.next() {
+        let (flag, setting) = match w.as_str() {
+            "-c" => ("-c ", words.next().ok_or("-c requires a value")?),
+            _ if w.starts_with("--") => ("--", w[2..].to_string()),
+            _ if w.starts_with("-c") => ("-c ", w[2..].to_string()),
+            _ => return Err(format!("invalid command-line argument for server process: {w}")),
+        };
+        match setting.split_once('=') {
+            Some((name, value)) if !name.is_empty() => settings.push((name.replace('-', "_"), value.to_string())),
+            Some(_) => return Err(format!("invalid command-line argument for server process: {w}")),
+            None => return Err(format!("{flag}{setting} requires a value")),
+        }
+    }
+    Ok(settings)
+}
+
 /// A sign-in refused outright: FATAL, SQLSTATE 28000, with why (the connection ends with it).
 fn fatal(why: String) -> PgWireError { PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28000".into(), why))) }
 
@@ -198,17 +243,22 @@ impl Startup {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let lake = &self.backend.app.lake;
+        let said = |e: anyhow::Error| {
+            let (_, code, words) = crate::codes::answer(&e, false);
+            PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), code.into(), words)))
+        };
         if let Some(db) = client.metadata().get("database").cloned().filter(|d| !d.is_empty() && *d != crate::ddl::lake_name(lake)) {
-            let said = |e: anyhow::Error| {
-                let (_, code, words) = crate::codes::answer(&e, false);
-                PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), code.into(), words)))
-            };
             if crate::ddl::database(lake, &db).await.map_err(said)?.is_some() {
                 let sql = format!("USE DATABASE {}", crate::objects::ident(&db));
                 let who = self.backend.who();
                 let into = crate::set::statement(lake, &sql, &who.scope);
                 crate::temp::SESSION.scope(self.backend.named(), crate::auth::WHO.scope(who.clone(), into)).await.map_err(said)?;
             }
+        }
+        let settings = startup_settings(client.metadata()).map_err(|why| PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "42601".into(), why))))?;
+        if !settings.is_empty() {
+            let set = async { crate::set::at_start(&settings) };
+            crate::temp::SESSION.scope(self.backend.named(), crate::auth::WHO.scope(self.backend.who(), set)).await.map_err(said)?;
         }
         finish(client, &self.cancels).await
     }
@@ -2131,6 +2181,24 @@ mod tests {
         assert_eq!(typed("SELECT $2::BIGINT + $1", 2), [Type::INT8, Type::TEXT]);
         assert_eq!(typed("SELECT $1 + $2", 2), [Type::UNKNOWN, Type::UNKNOWN]);
         assert_eq!(typed("SELECT $1 + 1 + abalance * $2", 2), [Type::INT4, Type::UNKNOWN]);
+    }
+
+    /// A startup's `options` are read as Postgres reads them: `-c name=value` in its three spellings, backslashes keeping a
+    /// space, a `-` in a name read as `_`; anything else refused in Postgres's words. `application_name` is set after them.
+    #[test]
+    fn startup_options_are_read_as_postgres_reads_them() {
+        let pairs = |o: &str| startup_options(o).map(|v| v.into_iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>());
+        assert_eq!(pairs("-c default_file_format=parquet  -cdefault-table-format=pondra --search-path=crm,public").unwrap(),
+            ["default_file_format=parquet", "default_table_format=pondra", "search_path=crm,public"]);
+        assert_eq!(pairs(r"-c application_name=my\ app\\x").unwrap(), [r"application_name=my app\x"]);
+        assert_eq!(pairs("  ").unwrap(), Vec::<String>::new());
+        assert_eq!(pairs("-c").unwrap_err(), "-c requires a value");
+        assert_eq!(pairs("-c work_mem").unwrap_err(), "-c work_mem requires a value");
+        assert_eq!(pairs("--x").unwrap_err(), "--x requires a value");
+        assert_eq!(pairs("-B 100").unwrap_err(), "invalid command-line argument for server process: -B");
+        assert_eq!(pairs("endpoint=ep-1").unwrap_err(), "invalid command-line argument for server process: endpoint=ep-1");
+        let sent = std::collections::HashMap::from([("options".to_string(), "-c timezone=UTC".to_string()), ("application_name".to_string(), "psql".to_string()), ("client_encoding".to_string(), "UTF8".to_string())]);
+        assert_eq!(startup_settings(&sent).unwrap(), [("timezone".to_string(), "UTC".to_string()), ("application_name".to_string(), "psql".to_string())]);
     }
 
     /// A statement that doesn't parse as one, or has no arithmetic on a parameter, leaves every type as it was.

@@ -25,6 +25,21 @@ pub(crate) async fn replacing<F>(run: &F, lake: &Lake, c: &ast::CreateTable, nam
 where
     F: Fn(Stmt) -> futures::future::BoxFuture<'static, Result<Value>>,
 {
+    let fill = |staged: String| -> futures::future::BoxFuture<'static, Option<Result<Value>>> {
+        let insert = c.query.as_ref().map(|q| run(Stmt::Insert(staged, q.to_string())));
+        Box::pin(async move { Some(insert?.await) })
+    };
+    replacing_with(run, lake, c, name, job, files, armed, scope, fill).await
+}
+
+/// …its rows put in the staged table by `fill` (none: no rows, as a replace without a query): another engine's files
+/// (`iceberg_rest`, a replace through the Iceberg catalog), or the statement's query (`replacing`).
+#[allow(clippy::too_many_arguments)] // (a replace's steps, as `replacing` takes them, and how its rows go in)
+pub(crate) async fn replacing_with<F, G>(run: &F, lake: &Lake, c: &ast::CreateTable, name: &str, job: &str, files: bool, armed: &mut (dyn FnMut(&str) + Send), scope: &crate::rights::Scope, fill: G) -> Result<Value>
+where
+    F: Fn(Stmt) -> futures::future::BoxFuture<'static, Result<Value>>,
+    G: FnOnce(String) -> futures::future::BoxFuture<'static, Option<Result<Value>>>,
+{
     if crate::ddl::resolve(lake, name).await?.0.is_some() {
         return Err(crate::codes::coded("0A000", format!("CREATE OR REPLACE TABLE {name}: another database's table is replaced from a node of that database")));
     }
@@ -37,8 +52,8 @@ where
     let spec = made_by_job(create_spec(c, lake, files, scope).await?, job)?;
     let mut out = run(Stmt::Define(staged.clone(), spec)).await.map_err(|e| named(e, &staged, name))?;
     armed(&staged);
-    if let Some(q) = &c.query {
-        let inserted = run(Stmt::Insert(staged.clone(), q.to_string())).await.map_err(|e| named(e, &staged, name));
+    if let Some(inserted) = fill(staged.clone()).await {
+        let inserted = inserted.map_err(|e| named(e, &staged, name));
         let rows = match inserted {
             Ok(v) if v["duplicate"] == true && !existed => {
                 Err(anyhow::anyhow!("{name}: this statement's rows were written before, into a table that was let go, so they can't be written again: run the statement again with a new job"))

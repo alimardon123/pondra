@@ -350,7 +350,14 @@ where marked.
   from the properties), drop and rename (within a namespace), each as the SQL statement run as the
   caller, so DDL needs an admin token as in SQL. A create answers the table's first published
   version. Struct, map, uuid, time and fixed columns, specs by bucket or truncate or of two
-  fields, descending orders and staged creates are refused by name.
+  fields and descending orders are refused by name. A staged create (a table made with its first
+  commit: Spark's `CREATE TABLE … AS SELECT`, PyIceberg's `create_table_transaction`) is answered
+  with the table as it will be (the field ids Pondra gives its columns, its folder) and nothing
+  made; its commit runs the `CREATE TABLE`, then takes the engine's files as an append's are, and
+  drops the table again if they can't be taken (2026-11-10). A replace (Spark's `REPLACE TABLE`
+  and `CREATE OR REPLACE TABLE … AS SELECT`, which take main's ref away first) is Pondra's
+  `CREATE OR REPLACE TABLE` of what it makes current: its staged table takes the engine's files,
+  then takes the table's place in one commit, keeping its uuid (2026-11-10).
 - **The id fix (§11):** row-id blocks come from their own counter (catalog key `b`, starting at the
   commit number the first time, so no block before it is reused); a node's block lasts it 2^32
   rows, and a bulk `INSERT` takes one. A log row's place (`_ord`, a Kafka offset) is now its

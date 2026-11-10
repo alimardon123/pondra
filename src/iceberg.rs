@@ -221,7 +221,8 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
         return Ok(None);
     }
     if st.uuid.is_empty() {
-        st.uuid = uuid::Uuid::new_v4().to_string();
+        // (a table another engine's staged create made keeps the uuid it was given: the job that made it, `iceberg_rest::made`)
+        st.uuid = meta.made_by.as_deref().and_then(|j| j.strip_prefix(MADE)).map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
     }
     let (dir, now, mut v) = (metadata_dir(meta.folder(table)), crate::log::now_ms(), st.version + 1);
     // (a version already there was written by an attempt that crashed before recording it: it's
@@ -753,6 +754,9 @@ impl Commit {
     fn job(&self) -> String { format!("iceberg:{}:{}", self.table, self.snapshot) }
 }
 
+/// The job of a table another engine's staged create made, before the uuid it gave it (`publish`).
+pub(crate) const MADE: &str = "iceberg-create:";
+
 /// The leader's answer when the table changed since the writer read it: 409, so it retries.
 pub const CONFLICT: &str = "the table changed since the writer read it";
 /// …and when a commit's deletes are files of values (equality deletes), which an append table takes
@@ -793,7 +797,7 @@ pub(crate) fn instead(table: &str, asked: &Value) -> Result<(), Refusal> {
     let updates = asked["updates"].as_array().map(Vec::as_slice).unwrap_or_default();
     let asks = |actions: &[&str]| updates.iter().find(|u| actions.iter().any(|a| u["action"] == *a));
     if updates.iter().any(|u| u["action"] == "remove-snapshot-ref" && u["ref-name"] == "main") {
-        return Err(bad(format!("a replace of the table (Spark's REPLACE TABLE, CREATE OR REPLACE TABLE … AS SELECT): in Pondra, CREATE OR REPLACE TABLE {table} … with its SQL")));
+        return Err(bad(format!("a replace of {table} in a transaction of several tables: commit it on its own, which Pondra takes as its CREATE OR REPLACE TABLE {table}"))); // (on its own: `iceberg_rest::replaced`)
     }
     if asks(&["remove-snapshots"]).is_some() {
         return Err(bad(format!("an expiry of {table}'s snapshots (Spark's expire_snapshots): Pondra lets a table's past go itself, once the lake's retention passes (pondra serve --retain-secs), and its Iceberg metadata lists only the snapshots still kept")));
@@ -808,7 +812,11 @@ pub(crate) fn instead(table: &str, asked: &Value) -> Result<(), Refusal> {
 /// with it refused), checked against the table as published, its files' footers read (or its
 /// rows written as the table's own files) and the files its deletes name read. None: it is in
 /// already.
-pub(crate) async fn prepare(lake: &Lake, name: &str, current: &Value, asked: &Value) -> Result<Option<Commit>, Refusal> {
+pub(crate) async fn prepare(lake: &Lake, name: &str, current: &Value, asked: &Value) -> Result<Option<Commit>, Refusal> { prepare_as(lake, name, current, asked, true).await }
+
+/// …`as_written`: false, the files' rows copied into the table's own files even where they could be its as written (a
+/// replace whose files' field ids aren't the new table's: the copy reads them by name).
+pub(crate) async fn prepare_as(lake: &Lake, name: &str, current: &Value, asked: &Value, as_written: bool) -> Result<Option<Commit>, Refusal> {
     let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(name)).await.ok().flatten().ok_or_else(|| bad(format!("no table {name}")))?;
     let mut c = parse(lake, name, &current["metadata"], asked).await?;
     // (a user's: taking rows out asks DELETE, and a keyed table's rows replace their keys', UPDATE: S11)
@@ -831,7 +839,7 @@ pub(crate) async fn prepare(lake: &Lake, name: &str, current: &Value, asked: &Va
         return Err(bad(format!("{name} has a renamed or dropped column, so other engines append to it; change its rows with Pondra's SQL (DELETE, UPDATE, MERGE)")));
     }
     c.deleted = deleted(lake, &c.deletes).await.map_err(|e| bad(format!("{REFUSED}: {}", crate::ext::said(&e))))?;
-    if (!c.incoming.is_empty() || changes) && crate::adopt::fits_as_written(&meta) {
+    if (!c.incoming.is_empty() || changes) && as_written && crate::adopt::fits_as_written(&meta) {
         crate::adopt::footers(lake, name, &meta, &mut c.incoming).await.map_err(|e| bad(format!("{REFUSED}: {}", crate::ext::said(&e))))?;
         c.adopt = true;
     } else if !c.incoming.is_empty() {
@@ -1158,8 +1166,9 @@ pub async fn record(lake: &Lake, seq: &crate::log::Sequencer, commits: Vec<Commi
         }
     }
     Ok(match todo.last() {
-        Some(c) => loaded(lake, &c.table).await?,
-        None => Value::Null,
+        // (a replace's staged table is published once it takes the table's place: the door answers then)
+        Some(c) if crate::sys::staged_for(&c.table).is_none() => loaded(lake, &c.table).await?,
+        _ => Value::Null,
     })
 }
 
@@ -1220,7 +1229,7 @@ mod tests {
         assert!(lets_go(&set(&["a", "b"]), &set(&["b"])), "a file taken out whole");
     }
 
-    /// A replace of the table, an expiry of snapshots and a change of partitioning are answered with Pondra's way; an
+    /// A replace in a transaction of several tables, an expiry of snapshots and a change of partitioning are answered with Pondra's way; an
     /// append, or a branch's ref, goes on to `parse`.
     #[test]
     fn what_pondras_sql_does_another_way_is_refused_naming_it() {

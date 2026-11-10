@@ -681,8 +681,13 @@ impl Sequencer {
         }
         {
             // (each table's rows after its own mark, in one pass over the log: an idle table's mark stays, `tier::expire`)
-            let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
-            let marks: std::collections::BTreeMap<&str, u64> = tables.iter().map(|(k, m)| (&k[2..], m.tiered)).collect();
+            // Of each entry only its mark (`TableMeta::tiered`): a whole entry's parse, at 100,000 tables, was most of the count.
+            #[derive(Deserialize)]
+            struct Mark {
+                tiered: u64,
+            }
+            let entries = lake.cat.scan_raw("t/", "t0").await?;
+            let marks = entries.iter().map(|(k, v)| Ok((&k[2..], serde_json::from_slice::<Mark>(v)?.tiered))).collect::<Result<BTreeMap<&str, u64>>>()?;
             let from = marks.values().copied().min().unwrap_or(u64::MAX - 1);
             let rows: u64 = crate::tier::waiting(&lake, from, None, |t| Some(marks.get(t).copied().unwrap_or(u64::MAX))).await?.values().sum();
             lake.backlog.fetch_add(rows, Ordering::Relaxed);
@@ -1889,6 +1894,35 @@ mod tests {
         s.tend(1).await;
         assert_eq!(lake.cat.tallies().map(|t| t.1), Some(PER_COMMIT + 1), "the rest keyed, each once");
         assert_eq!(lake.cat.get::<serde_json::Value>(OLD_MARKS).await?, Some(serde_json::json!("Done")));
+        done(lake, dir).await
+    }
+
+    /// A leader's start counts the rows still to tier (`lake.backlog`, which backpressure waits on): each table's rows in
+    /// the log after its own mark, read from its entry's mark alone. A table with no entry (dropped) counts none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_leaders_start_counts_each_tables_rows_after_its_mark() -> Result<()> {
+        let (dir, lake) = fresh().await?;
+        let entry = |tiered: u64| {
+            let mut m = TableMeta::default();
+            m.tiered = tiered;
+            json(&m)
+        };
+        let seg = |parts: &[(&str, u64)]| json(&Segment { path: "x".into(), parts: parts.iter().map(|(t, rows)| (t.to_string(), vec![(0, 1, *rows)])).collect(), ts_ms: 1, ..Default::default() });
+        let puts = vec![
+            (table_key("a"), entry(2)), // (its files hold the log to segment 2)
+            (table_key("b"), entry(0)),
+            (seg_key(1), seg(&[("a", 10)])),
+            (seg_key(2), seg(&[("a", 5), ("b", 7), ("gone", 100)])),
+            (seg_key(3), seg(&[("b", 3)])),
+            (seg_key(4), seg(&[("a", 2)])),
+            ("n".to_string(), json(&5u64)),
+        ];
+        lake.cat.commit(puts, &[]).await?;
+        let marks: Vec<u64> = lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(_, m)| m.tiered).collect();
+        assert_eq!(marks, [2, 0], "the entries' marks, parsed whole");
+        let leads = Sequencer::start(lake.clone(), None).await?;
+        assert_eq!(lake.backlog.load(Ordering::Relaxed), 2 + 7 + 3, "a's after segment 2, all of b's, none of the dropped table's");
+        drop(leads);
         done(lake, dir).await
     }
 }

@@ -100,6 +100,8 @@ pub struct Setting {
     pub change: Change,
     /// `pondra serve` takes it as a flag too (`--memory-gb`).
     pub flag: Option<Flag>,
+    /// A session may set it too, by its name (`SET default_table_format = …`), over the node's value (`set.rs`).
+    pub session: bool,
 }
 
 /// A node setting's flag of `pondra serve`, named as the setting is (`--memory-gb` for `memory_gb`). One given on the command line
@@ -148,6 +150,10 @@ impl Setting {
     /// The same setting, read by what the process has one of (`Scope::Process`): every node in it takes the same value.
     pub const fn process(self) -> Setting { Setting { scope: Scope::Process, ..self } }
 
+    /// The same setting, which a session may set by its name over the node's value (`SET default_table_format = …`), and
+    /// is set from it until one does.
+    pub const fn session(self) -> Setting { Setting { session: true, ..self } }
+
     /// Its flag's help shows this default.
     pub const fn shows(self, default: &'static str) -> Setting {
         match self.flag {
@@ -158,7 +164,7 @@ impl Setting {
 }
 
 pub const fn of(var: &'static str, who: Who, kind: Kind, unset: Unset) -> Setting {
-    Setting { var, who, kind, unset, scope: Scope::Node, change: Change::Start, flag: None }
+    Setting { var, who, kind, unset, scope: Scope::Node, change: Change::Start, flag: None, session: false }
 }
 pub const fn node(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Node, kind, unset) }
 pub const fn command(var: &'static str, kind: Kind, unset: Unset) -> Setting { of(var, Who::Command, kind, unset) }
@@ -213,10 +219,10 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_DEBUG_SPREAD", Switch, No),
     node("PONDRA_DEFAULT_FILE_FORMAT", Text, Is("parquet")).flag("default-table-format", "The file format a new table's files are \
         written in when its CREATE TABLE names none (also PONDRA_DEFAULT_FILE_FORMAT; default: parquet). A session's \
-        `SET default_file_format` comes first.").shows("parquet"),
+        `SET default_file_format` comes first.").shows("parquet").session(),
     node("PONDRA_DEFAULT_TABLE_FORMAT", Text, Is("pondra")).flag("publish", "The table format a new table is made in when its \
         CREATE TABLE names none (`USING`): `pondra` (also PONDRA_DEFAULT_TABLE_FORMAT; default: pondra; `iceberg` comes with this \
-        lake's own Iceberg tables). A session's `SET default_table_format` comes first. A table keeps the format it was made in.").shows("pondra"),
+        lake's own Iceberg tables). A session's `SET default_table_format` comes first. A table keeps the format it was made in.").shows("pondra").session(),
     node("PONDRA_DRAIN_GRACE_SECS", Secs, Is("0")),
     node("PONDRA_DRAIN_SECS", Secs, Is("30")),
     node("PONDRA_EXTENSION_FILE_MB", Mb, Is("64")),
@@ -372,10 +378,11 @@ pub static SETTINGS: crate::registry::BuiltIn = crate::registry::BuiltIn {
 };
 
 /// `pondra.settings`' columns: each name in the environment and as an option, what it takes, what it is when unset here
-/// (worked out on this machine, where it is), where it holds, when it may change and who it is for.
+/// (worked out on this machine, where it is), where it holds, when it may change, who it is for, and whether a session may
+/// set it too.
 const COLUMNS: &[(&str, crate::lists::Cell)] = {
-    use crate::lists::Cell::Text;
-    &[("name", Text), ("variable", Text), ("type", Text), ("default_value", Text), ("scope", Text), ("change", Text), ("who", Text)]
+    use crate::lists::Cell::{Flag, Text};
+    &[("name", Text), ("variable", Text), ("type", Text), ("default_value", Text), ("scope", Text), ("change", Text), ("who", Text), ("session", Flag)]
 };
 
 /// One row per setting, a test's hooks left out as the docs leave them out. Each word is its variant's name in lower case.
@@ -383,6 +390,7 @@ fn rows(r: &crate::registry::Registry) -> Vec<serde_json::Value> {
     let word = |d: &dyn std::fmt::Debug| format!("{d:?}").to_lowercase();
     r.section::<Settings>().all.iter().filter(|s| s.who != Who::Test).map(|s| serde_json::json!({
         "name": s.name(), "variable": s.var, "type": word(&s.kind), "default_value": s.default(), "scope": word(&s.scope), "change": word(&s.change), "who": word(&s.who),
+        "session": s.session,
     })).collect()
 }
 

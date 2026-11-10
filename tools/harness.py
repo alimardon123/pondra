@@ -7288,7 +7288,8 @@ def writes():
     file recorded where it wrote it: ADR-029), and its snapshot is found under its id; two writers
     at once, one retrying on 409, each applied once; a commit sent twice applied once; a view and
     the Delta copy follow; an attached lake's table; Pondra itself writing to another Pondra's;
-    a rollback taken as Pondra's RESTORE; refused by name: a keyed table, files outside the table's
+    a rollback taken as Pondra's RESTORE, a staged create as its CREATE TABLE and a replace as its
+    CREATE OR REPLACE TABLE (and that statement through a follower); refused by name: a keyed table, files outside the table's
     folder, an expiry of snapshots and a change of partitioning, each naming Pondra's way. (`adopted`: what round 27
     added; `rewrites`: round 28's deletes, overwrites and schema changes.)"""
     import deltalake, glob as g, http.server, pyarrow as pa
@@ -7376,6 +7377,51 @@ def writes():
     seen = until(lambda: _try(lambda: cat.load_table("default.back").scan().to_arrow().num_rows), 10, 30)
     checks["a rollback through the catalog is Pondra's RESTORE to that snapshot's time: the table, and the engine's next read, as they were then"] = \
         back == [{"n": 10, "top": 9}] and seen == 10
+    # (a table made with its first commit, Spark's CREATE TABLE … AS SELECT: Pondra's CREATE TABLE, then the engine's files
+    # taken as an append's are)
+    txn = cat.create_table_transaction("default.made", pa.schema([("id", pa.int64()), ("tag", pa.string())]))
+    txn.append(pa.table({"id": pa.array(range(5), pa.int64()), "tag": pa.array(list("abcde"))}))
+    txn.commit_transaction()
+    made = q("SELECT count(*) AS n, max(id) AS top, string_agg(tag, '' ORDER BY id) AS tags FROM made")
+    seen = until(lambda: _try(lambda: cat.load_table("default.made").scan().to_arrow().num_rows), 5, 30)
+    checks["a table made with its first commit (a staged create: Spark's CREATE TABLE … AS SELECT) is Pondra's CREATE TABLE with the engine's rows"] = \
+        made == [{"n": 5, "top": 4, "tags": "abcde"}] and seen == 5
+    # (a replace through the catalog, Spark's CREATE OR REPLACE TABLE … AS SELECT: Pondra's CREATE OR REPLACE TABLE, the
+    # engine's files the new table's. PyIceberg has no replace, so its transaction's commit goes as Iceberg's replace sends
+    # one: main's ref taken away first, only the uuid required; the snapshot's own files are the new table's rows)
+    from pyiceberg.table.update import RemoveSnapshotRefUpdate
+    from pyiceberg.types import DoubleType
+
+    def as_replace(tbl, build):
+        real = cat.commit_table
+        cat.commit_table = lambda table, requirements, updates: real(table, tuple(r for r in requirements if r.type == "assert-table-uuid"), (RemoveSnapshotRefUpdate(ref_name="main"),) + tuple(updates))
+        try:
+            with tbl.transaction() as tx:
+                build(tx)
+        finally:
+            cat.commit_table = real
+    q("CREATE TABLE swapped (id BIGINT, name VARCHAR) WITH (publish = 'iceberg')")
+    until(lambda: _try(lambda: cat.load_table("default.swapped")) is not None, True, 30)
+    ts = cat.load_table("default.swapped")
+    ts.append(pa.table({"id": pa.array(range(10), pa.int64()), "name": pa.array([f"n{i}" for i in range(10)])}))
+    ts = cat.load_table("default.swapped")
+    as_replace(ts, lambda tx: tx.append(pa.table({"id": pa.array(range(100, 105), pa.int64()), "name": pa.array(list("abcde"))})))
+    same = q("SELECT count(*) AS n, min(id) AS lo, string_agg(name, '' ORDER BY id) AS names FROM swapped")
+    after = cat.load_table("default.swapped")
+    seen = until(lambda: _try(lambda: cat.load_table("default.swapped").scan().to_arrow().num_rows), 5, 30)
+    checks["a replace through the catalog (Spark's CREATE OR REPLACE TABLE … AS SELECT) is Pondra's CREATE OR REPLACE TABLE: the engine's rows, the same uuid"] = \
+        same == [{"n": 5, "lo": 100, "names": "abcde"}] and seen == 5 and after.metadata.table_uuid == ts.metadata.table_uuid
+
+    def reshaped(tx):
+        tx.update_schema().delete_column("name").add_column("score", DoubleType()).commit()
+        tx.append(pa.table({"id": pa.array([7, 8], pa.int64()), "score": pa.array([0.5, 1.5])}))
+    as_replace(after, reshaped)
+    shaped = q("SELECT * FROM swapped ORDER BY id")
+    read = until(lambda: _try(lambda: sorted(cat.load_table("default.swapped").scan().to_arrow().to_pylist(), key=lambda r: r["id"])), [{"id": 7, "score": 0.5}, {"id": 8, "score": 1.5}], 30)
+    checks["…and one that changes the columns: the new table's, its rows read by name (their field ids aren't Pondra's), in Pondra and in the engine"] = \
+        shaped == [{"id": 7, "score": 0.5}, {"id": 8, "score": 1.5}] and read == [{"id": 7, "score": 0.5}, {"id": 8, "score": 1.5}]
+    q("CREATE OR REPLACE TABLE swapped AS SELECT 3 AS id", port=A.port + 1)  # (Pondra's own, on a follower: its staged table made by the leader for it)
+    checks["CREATE OR REPLACE TABLE through a follower"] = until(lambda: q("SELECT * FROM swapped", port=A.port + 1), [{"id": 3}], 30) == [{"id": 3}]
     checks["refused by name: " + (", ".join(refused) or "(on R2, nothing to try)")] = all(said[k] in v for k, v in refused.items()) \
         and (outside is None or os.path.exists(outside)) and q("SELECT count(*) AS n FROM events WHERE id < 10") == [{"n": 2}]
     [x.kill() for x in (a, b, o, c)]

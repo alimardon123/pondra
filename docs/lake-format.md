@@ -268,14 +268,23 @@ Rules for outside readers:
   - On R2, PyIceberg writes its files with its fsspec file IO (`"py-io-impl":
     "pyiceberg.io.fsspec.FsspecFileIO"`, `pip install s3fs`); pyarrow's multipart upload is
     refused there.
+  - A table made with its first commit (a staged create: Spark's `CREATE TABLE … AS SELECT`,
+    PyIceberg's `create_table_transaction`) is Pondra's `CREATE TABLE` from the schema, spec,
+    order and properties it commits, then its files taken as an append's are; if they can't be
+    taken, the table is dropped again. It keeps the uuid the engine was given.
   - A rollback through the catalog (Spark's `rollback_to_snapshot`, PyIceberg's
     `manage_snapshots`) is taken as Pondra's `RESTORE TABLE … TO TIMESTAMP AS OF` that snapshot's
     time: the table as it was then, which includes any rows committed by then that its files didn't
     hold yet (the view follows tier rounds).
-  - An expiry of snapshots, a replace of the table or a change of its partitioning is refused,
-    naming Pondra's way: the lake's retention (`--retain-secs`), `CREATE OR REPLACE TABLE`, the
-    `PARTITION BY` it was made with. Another engine's compaction is refused too: Pondra merges its
-    tables' files itself.
+  - A replace of the table (Spark's `REPLACE TABLE`, `CREATE OR REPLACE TABLE … AS SELECT`) is
+    Pondra's `CREATE OR REPLACE TABLE` of the schema, spec, order and properties it makes current,
+    its new table filled with the engine's files before it takes the table's place in one commit;
+    the old one is set aside as a drop sets it, so `UNDROP TABLE` brings it back. It keeps the
+    table's uuid. Files whose field ids aren't the ones Pondra gives the new table's columns are
+    copied by column name.
+  - An expiry of snapshots or a change of partitioning is refused, naming Pondra's way: the lake's
+    retention (`--retain-secs`), the `PARTITION BY` it was made with. Another engine's compaction
+    is refused too: Pondra merges its tables' files itself.
   - Today the node reads an appended file's rows and writes them into the table again.
     ADR-029 (proposed) would take the files as written and only commit them.
 - **Latest version, plus the history still there:** the Iceberg metadata lists the snapshots from
