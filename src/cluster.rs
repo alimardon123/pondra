@@ -19,6 +19,7 @@
 //!   a second or two (`listen`), and one that doesn't answer in `HEARD` is gone (`deaf`); but not a
 //!   replicating leader, whose followers hold acknowledged changes: its mark alone decides. A leader
 //!   killed and started again takes the next term: only its own restart takes its term back.
+use crate::dial::Call;
 use crate::log::now_ms;
 use crate::members::{self, Members};
 use crate::lifecycle::Guest;
@@ -275,10 +276,10 @@ impl Cluster {
                     _ = tokio::time::sleep(pause) => {}
                     _ = untaken.notified(), if self.leader_ok() => {}
                 }
-                let url = crate::tls::url(&format!("{}/cluster/beat?from={}", self.leader.addr, self.addr));
-                let answer = said().into_iter().fold(http(&self.node).post(url), |r, (k, v)| r.header(k, v)).timeout(Duration::from_secs(2)).send().await;
-                missed = !answer.as_ref().is_ok_and(|r| r.status().is_success() || r.headers().contains_key(CUT_OFF_HEADER)); // (a leader cut off answers: its branch below keeps its pace)
-                if self.may_lead && answer.as_ref().is_ok_and(|r| r.headers().contains_key(CUT_OFF_HEADER)) {
+                let beat = said().into_iter().fold(Call::post(format!("/cluster/beat?from={}", self.addr), bytes::Bytes::new()), |c, (k, v)| c.header(k, v));
+                let answer = crate::dial::call(&self.node, &self.leader.addr, beat.timeout(Duration::from_secs(2))).await;
+                missed = !answer.as_ref().is_ok_and(|r| r.ok() || r.headers.contains_key(CUT_OFF_HEADER)); // (a leader cut off answers: its branch below keeps its pace)
+                if self.may_lead && answer.as_ref().is_ok_and(|r| r.headers.contains_key(CUT_OFF_HEADER)) {
                     // The leader says it can't reach the bucket: no lease to wait out, no peer to
                     // ask. Take the next term once this node has reached the bucket for a few
                     // seconds (claiming needs it): if the bucket was down for everyone, the leader
@@ -296,7 +297,7 @@ impl Cluster {
                     continue;
                 }
                 reached = None;
-                match answer.and_then(|r| r.error_for_status()) {
+                match answer.and_then(crate::dial::Reply::checked) {
                     Ok(r) => {
                         let (term, nodes): (u64, Vec<String>) = r.json().await.unwrap_or_default();
                         if term != self.leader.n {
@@ -351,8 +352,8 @@ impl Cluster {
                     let now = said();
                     if !now.is_empty() || told {
                         told = !now.is_empty();
-                        let url = crate::tls::url(&format!("{}/cluster/said?from={}", self.leader.addr, self.addr));
-                        let _ = now.into_iter().fold(http(&self.node).post(url), |r, (k, v)| r.header(k, v)).timeout(Duration::from_secs(2)).send().await; // (missed: said again next second)
+                        let told = now.into_iter().fold(Call::post(format!("/cluster/said?from={}", self.addr), bytes::Bytes::new()), |c, (k, v)| c.header(k, v));
+                        let _ = crate::dial::call(&self.node, &self.leader.addr, told.timeout(Duration::from_secs(2))).await; // (missed: said again next second)
                     }
                     if down.load(std::sync::atomic::Ordering::Relaxed) && matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
                         self.node.life.restart("another leads", &[]);
@@ -376,7 +377,7 @@ impl Cluster {
     async fn peer_sees_leader(&self) -> bool {
         let peers = self.view.lock().unwrap().clone(); // the last member list we were given
         for peer in peers.iter().filter(|p| **p != self.addr && **p != self.leader.addr) {
-            let ok = http(&self.node).get(crate::tls::url(&format!("{peer}/cluster/leader"))).timeout(Duration::from_secs(1)).send().await;
+            let ok = crate::dial::call(&self.node, peer, Call::get("/cluster/leader").timeout(Duration::from_secs(1))).await;
             if let Ok(r) = ok {
                 if r.json::<(u64, bool)>().await.is_ok_and(|(term, ok)| ok && term == self.leader.n) {
                     return true;
@@ -428,7 +429,7 @@ pub fn of(app: &crate::app::App) -> Option<&Cluster> { app.members.as_any().down
 
 /// Does term `t`'s leader answer from here, as its leader?
 async fn answers(t: &Term, node: &crate::node_state::NodeState) -> bool {
-    let r = http(node).get(crate::tls::url(&format!("{}/cluster/leader", t.addr))).timeout(Duration::from_secs(2)).send().await;
+    let r = crate::dial::call(node, &t.addr, Call::get("/cluster/leader").timeout(Duration::from_secs(2))).await;
     match r {
         Ok(r) => r.json::<(u64, bool)>().await.is_ok_and(|(term, _)| term == t.n),
         Err(_) => false,
@@ -469,10 +470,15 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
     node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
         let (since, mut said) = (tokio::time::Instant::now(), 0);
         // (its last commit; a leader older than this one tells only its log's end, which a table's commit doesn't move)
-        let ask = |path: &str| {
-            let url = crate::tls::url(&format!("{}{path}", leader.addr));
-            let node = lake.node.clone();
-            async move { http(&node).get(&url).timeout(Duration::from_secs(2)).send().await?.error_for_status()?.json::<u64>().await }
+        let ask = |path: &'static str| {
+            let (node, leader) = (lake.node.clone(), leader.addr.clone());
+            async move {
+                let r = crate::dial::call(&node, &leader, Call::get(path).timeout(Duration::from_secs(2))).await.map_err(|_| None)?;
+                match r.ok() {
+                    true => r.json::<u64>().await.map_err(|_| None),
+                    false => Err(Some(r.status)),
+                }
+            }
         };
         let upto = loop {
             // (only a leader that has no such route is asked for its log's end: one that refused this node, before it had
@@ -480,7 +486,7 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
             // was open to anyone. CI's run 41359432087, attempt 2)
             match ask("/cluster/committed").await {
                 Ok(c) => break Some((true, c)),
-                Err(e) if e.status() == Some(reqwest::StatusCode::NOT_FOUND) => {
+                Err(Some(404)) => {
                     if let Ok(upto) = ask("/cluster/visible").await {
                         break Some((false, upto));
                     }
@@ -542,8 +548,8 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     lake.node.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
         while to_ack.changed().await.is_ok() {
             let (term, first, upto) = *to_ack.borrow_and_update();
-            let url = crate::tls::url(&format!("{l}/cluster/ack?from={me}&term={term}&first={first}&upto={upto}"));
-            let _ = http(&node).post(url).timeout(Duration::from_secs(2)).send().await;
+            let ack = Call::post(format!("/cluster/ack?from={me}&term={term}&first={first}&upto={upto}"), bytes::Bytes::new());
+            let _ = crate::dial::call(&node, &l, ack.timeout(Duration::from_secs(2))).await;
         }
     });
     // The stream is read by `members::follow`, which a joined page reads the same way. What is this node's alone (its replica
@@ -568,12 +574,10 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     };
     let down_open = down.clone(); // (the stream's: `open` says it is up)
     let node_open = lake.node.clone();
-    let open = move || -> futures::future::BoxFuture<'static, std::result::Result<crate::fetch::Response, members::Open>> {
-        let url = crate::tls::url(&format!("{leader}/cluster/log"));
-        let down = down_open.clone();
-        let node = node_open.clone();
+    let open = move || -> futures::future::BoxFuture<'static, std::result::Result<crate::dial::Reply, members::Open>> {
+        let (down, node, leader) = (down_open.clone(), node_open.clone(), leader.clone());
         Box::pin(async move {
-            match crate::fetch::send(http(&node).get(url)).await.and_then(crate::fetch::Response::error_for_status) {
+            match crate::dial::call(&node, &leader, Call::get("/cluster/log")).await.and_then(crate::dial::Reply::checked) {
                 Ok(r) => {
                     down.store(false, std::sync::atomic::Ordering::Relaxed);
                     Ok(r)
@@ -661,12 +665,16 @@ async fn send_call(node: &crate::node_state::NodeState, url: String, c: crate::d
     if let Some(user) = c.user {
         req = req.header(crate::auth::AS_USER, user);
     }
+    for (k, v) in c.headers {
+        req = req.header(k, v);
+    }
     let res = req.send().await?;
     let status = res.status().as_u16();
     let sqlstate = res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).map(str::to_string);
     let failed = res.error_for_status_ref().err().map(anyhow::Error::from);
+    let headers = res.headers().clone();
     let body = futures::TryStreamExt::map_err(res.bytes_stream(), anyhow::Error::from);
-    Ok(Reply::new(status, sqlstate, failed, futures::StreamExt::boxed(body)))
+    Ok(Reply::new(status, sqlstate, failed, futures::StreamExt::boxed(body)).with_headers(headers))
 }
 
 /// Is this node coming back to its own term `t` after its own restart (an exec, Windows' new process,

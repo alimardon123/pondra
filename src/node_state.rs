@@ -21,6 +21,10 @@ pub struct NodeState {
     /// How it calls its lake's other nodes (`Calls`).
     #[cfg(feature = "lake")]
     pub calls: Calls,
+    /// How it reaches another member, or another lake's leader: its host's dial (`dial::native`: HTTP, or a page's), or the
+    /// sim's, which reaches the members in its process.
+    #[cfg(feature = "lake")]
+    pub dial: std::sync::Arc<dyn crate::dial::Dial>,
     /// The space it spills into past its memory: its process's host's (`scratch::install`), or this machine's folders.
     #[cfg(feature = "lake")]
     pub scratch: std::sync::Arc<dyn crate::scratch::Scratch>,
@@ -76,7 +80,7 @@ impl NodeState {
 
     fn made(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values, claims: Arc<Claims>) -> Arc<NodeState> {
         let reaches = crate::reaches::Reaches::inherited(settings.get(crate::reaches::REACH_VAR));
-        Arc::new(NodeState { reaches, #[cfg(feature = "lake")] tasks: crate::spawns::Tasks::new(life.clone()), life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, tokens: Default::default(), serving: tokio::sync::watch::Sender::new(false), began: datafusion::common::instant::Instant::now() })
+        Arc::new(NodeState { reaches, #[cfg(feature = "lake")] tasks: crate::spawns::Tasks::new(life.clone()), life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] dial: crate::dial::native(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, tokens: Default::default(), serving: tokio::sync::watch::Sender::new(false), began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).
