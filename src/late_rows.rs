@@ -382,7 +382,7 @@ mod tests {
         let path = dir.join("d.parquet");
         let schema = write(&path, 0, 600);
         let (size, key) = (std::fs::metadata(&path)?.len(), path.to_str().unwrap().trim_start_matches('/').to_string());
-        let file = |deleted: Vec<u64>, range| crate::scan::File { key: key.clone(), size, rows: 600, partition: vec![], deleted: Some(Arc::new(deleted)), range, only: None, stats: Arc::new(Statistics::new_unknown(&schema)) };
+        let file = |deleted: Vec<u64>, range| crate::scan::File { key: key.clone(), size, rows: 600, partition: vec![], deleted: Some(Arc::new(deleted)), range, only: None, stats: Arc::new(Statistics::new_unknown(&schema)), modified: None };
         let files = || crate::scan::Files { store: ObjectStoreUrl::local_filesystem(), file_schema: schema.clone(), partition: vec![], files: vec![file((0..600).step_by(3).collect(), Some((100, 500)))], adapter: None, row: None };
         let (late, plain) = (session(true), session(false));
         for ctx in [&late, &plain] {
