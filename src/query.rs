@@ -251,8 +251,8 @@ impl Lake {
 }
 
 /// All rows of a table (files ∪ tail up to `upto`); upsert tables carry `_ord` (0 for files).
-pub async fn raw(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<DataFrame> {
-    let (tail, files) = sources(lake, ctx, name, meta, upto).await?;
+pub async fn raw(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>, scope: &crate::rights::Scope) -> Result<DataFrame> {
+    let (tail, files) = sources(lake, ctx, name, meta, upto, scope).await?;
     Ok(match tail.into_iter().chain(files).reduce(|a, b| a.union(b).expect("same schema")) {
         Some(df) => df,
         None => empty(ctx, meta)?,
@@ -267,21 +267,21 @@ pub async fn raw(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta
 /// `at`: the commit the whole query reads as of, up to which `{t}$deleted` is read — a slice of a
 /// spread query may read none of the table's log itself (`upto` 0), but its files hold rows
 /// changed since.
-async fn current(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>, at: Option<u64>) -> Result<DataFrame> {
+async fn current(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>, at: Option<u64>, scope: &crate::rights::Scope) -> Result<DataFrame> {
     use crate::sys::with_sys;
     use crate::text::{ROW_ID, VERSION};
     let upto = upto.or(Some(lake.visible()));
     let at = at.or(upto); // (as of one commit: a change writes both. `at.or` of the `upto` given, None,
     // read every old row while the table's own were read to `visible`: a reader whose view is behind
     // its catalog's entries lost a changed row, `harness.py attached`)
-    let dead = dead(lake, ctx, name, meta, at).await?;
+    let dead = dead(lake, ctx, name, meta, at, scope).await?;
     if dead.is_empty() {
-        return raw(lake, ctx, name, meta, upto).await;
+        return raw(lake, ctx, name, meta, upto, scope).await;
     }
     let (touched, clean): (Vec<DataFile>, Vec<DataFile>) = meta.files.iter().cloned().partition(|f| crate::sys::holds(&dead, &f.stats));
     let meta = with_sys(meta);
-    let clean = raw(lake, ctx, name, &{ let mut entry = meta.clone(); entry.files = clean; entry }, Some(meta.tiered)).await?; // (the log goes with the touched files)
-    let touched = raw(lake, ctx, name, &{ let mut entry = meta; entry.files = touched; entry }, upto).await?;
+    let clean = raw(lake, ctx, name, &{ let mut entry = meta.clone(); entry.files = clean; entry }, Some(meta.tiered), scope).await?; // (the log goes with the touched files)
+    let touched = raw(lake, ctx, name, &{ let mut entry = meta; entry.files = touched; entry }, upto, scope).await?;
     let (ids, versions): (Vec<i64>, Vec<i64>) = dead.into_iter().unzip();
     let s = Arc::new(Schema::new(vec![Field::new("__id", DataType::Int64, false), Field::new("__v", DataType::Int64, false)]));
     let gone = ctx.read_batch(RecordBatch::try_new(s, vec![Arc::new(Int64Array::from(ids)), Arc::new(Int64Array::from(versions))])?)?;
@@ -290,7 +290,7 @@ async fn current(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta
 
 /// A changed table's old rows (`_row_id`, `_version`), sorted, from the changes after its last
 /// purge up to commit `at` (`{t}$deleted`'s files may be newer than the query's snapshot).
-async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, at: Option<u64>) -> Result<Vec<(i64, i64)>> {
+async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, at: Option<u64>, scope: &crate::rights::Scope) -> Result<Vec<(i64, i64)>> {
     use crate::sys::with_sys;
     use crate::text::{ROW_ID, VERSION};
     use datafusion::arrow::array::AsArray;
@@ -301,7 +301,7 @@ async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, a
     let files = crate::manifest::pruned(lake, &dmeta, None, &[within.clone()], &dmeta.schema()?).await?;
     let dmeta = { let mut entry = dmeta; entry.files = files; entry.sealed = None; entry };
     let mut out = vec![];
-    for b in raw(lake, ctx, &deleted, &dmeta, at).await?.filter(within)?.select(vec![col(ROW_ID), col("_old_version")])?.collect().await? {
+    for b in raw(lake, ctx, &deleted, &dmeta, at, scope).await?.filter(within)?.select(vec![col(ROW_ID), col("_old_version")])?.collect().await? {
         let (ids, versions) = (b.column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>(), b.column(1).as_primitive::<datafusion::arrow::datatypes::Int64Type>());
         out.extend(ids.iter().zip(versions.iter()).filter_map(|(i, v)| Some((i?, v?))));
     }
@@ -313,10 +313,10 @@ async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, a
 /// Upsert tables get one read per generation of files, newest first, and `_ord` on every row: a
 /// newer file's rows above an older one's, and log rows (`log::ord`) above both.
 /// Other tables read all their files as one (merge tables combine rows in any order).
-pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<(Option<DataFrame>, Vec<DataFrame>)> {
+pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>, scope: &crate::rights::Scope) -> Result<(Option<DataFrame>, Vec<DataFrame>)> {
     if let Some(spec) = &meta.ext {
         let files = meta.files.iter().collect::<Vec<_>>(); // (files outside the lake: no log, no hot columns)
-        return Ok((None, if files.is_empty() { vec![] } else { vec![crate::ext::read(lake, ctx, &files, &meta.read_schema()?, spec, meta.outside.as_ref()).await?] }));
+        return Ok((None, if files.is_empty() { vec![] } else { vec![crate::ext::read(lake, ctx, &files, &meta.read_schema()?, spec, meta.outside.as_ref(), scope).await?] }));
     }
     let (schema, keyed, upsert) = (meta.read_schema()?, !meta.key.is_empty(), !meta.key.is_empty() && meta.merge.is_empty());
     let mut files = vec![];
@@ -416,8 +416,8 @@ fn empty(ctx: &SessionContext, meta: &TableMeta) -> Result<DataFrame> {
 /// rows whose key no newer source has — an anti-join against the newer keys, which are usually
 /// few (the log tail and recent files) — and only the log tail is deduplicated itself. A table
 /// that is one compacted file reads as that file.
-async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<Arc<dyn TableProvider>> {
-    let (tail, files) = sources(lake, ctx, name, meta, upto).await?;
+async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>, scope: &crate::rights::Scope) -> Result<Arc<dyn TableProvider>> {
+    let (tail, files) = sources(lake, ctx, name, meta, upto, scope).await?;
     let (mut names, aux) = (vec![], lake.session()); // (the parts live in their own context: SHOW TABLES lists only tables)
     if let Some(t) = tail {
         aux.register_table("__tail", t.into_view())?;
@@ -705,37 +705,37 @@ pub fn names_deleted(text: &str) -> bool { text.to_lowercase().split(|c: char| !
 /// A table as its users see it: append tables as files + log; keyed tables their current rows.
 /// `sys`: with its system columns (`sys::with_sys`). `upto`: the log only that far (a distributed query reads every
 /// node's copy at one snapshot).
-pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Arc<TableMeta>, sys: bool, upto: Option<u64>) -> Result<Arc<dyn TableProvider>> {
+pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Arc<TableMeta>, sys: bool, upto: Option<u64>, scope: &crate::rights::Scope) -> Result<Arc<dyn TableProvider>> {
     let facts = match meta.key.is_empty() {
         true => Some(facts(lake, meta, sys).await?), // (kept for every query that plans this version of the table)
         false => None,
     };
-    view(lake, ctx, name, meta, sys, facts, upto).await
+    view(lake, ctx, name, meta, sys, facts, upto, scope).await
 }
 
 /// `table_view` for a meta that is not the catalog's, or not one a query keeps (an ext table's, a copy made for the
 /// call): its facts are worked out for this call and not kept.
-pub async fn table_view_once(lake: &Lake, ctx: &SessionContext, name: &str, meta: Arc<TableMeta>, upto: Option<u64>) -> Result<Arc<dyn TableProvider>> {
+pub async fn table_view_once(lake: &Lake, ctx: &SessionContext, name: &str, meta: Arc<TableMeta>, upto: Option<u64>, scope: &crate::rights::Scope) -> Result<Arc<dyn TableProvider>> {
     let facts = match meta.key.is_empty() {
         true => Some(Arc::new(facts_once(lake, &meta, false).await?)),
         false => None,
     };
-    view(lake, ctx, name, &meta, false, facts, upto).await
+    view(lake, ctx, name, &meta, false, facts, upto, scope).await
 }
 
 /// A table's view, over its facts (an append table's; none for a keyed one).
-async fn view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Arc<TableMeta>, sys: bool, facts: Option<Arc<Facts>>, upto: Option<u64>) -> Result<Arc<dyn TableProvider>> {
+async fn view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Arc<TableMeta>, sys: bool, facts: Option<Arc<Facts>>, upto: Option<u64>, scope: &crate::rights::Scope) -> Result<Arc<dyn TableProvider>> {
     let meta = match sys {
         true => Arc::new(crate::sys::with_sys(meta)), // (a copy only when the query names system columns)
         false => meta.clone(),
     };
     if !meta.key.is_empty() && meta.merge.is_empty() && meta.order.is_none() {
-        return upsert_view(lake, ctx, name, &meta, upto).await; // (by event time: every source's rows grouped by key, below)
+        return upsert_view(lake, ctx, name, &meta, upto, scope).await; // (by event time: every source's rows grouped by key, below)
     }
     if let Some(facts) = facts {
-        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta, facts, manifests: None, upto, at: upto, share: None, range: None, own: Default::default() }));
+        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta, facts, manifests: None, upto, at: upto, share: None, range: None, own: Default::default(), scope: scope.clone() }));
     }
-    let (tail, files) = sources(lake, ctx, name, &meta, upto).await?;
+    let (tail, files) = sources(lake, ctx, name, &meta, upto, scope).await?;
     let logged = tail.is_some(); // (rows in the log after its files: the mark of a table with none stays where it was, `tier::expire`)
     let df = match tail.into_iter().chain(files).reduce(|a, b| a.union(b).expect("same schema")) {
         Some(df) => df,
@@ -897,6 +897,7 @@ pub struct Pruned {
     pub share: Option<(u64, u64)>, // a distributed query's slice of it, and the whole table's (rows, bytes)
     pub range: Option<crate::ranges::Range>, // a distributed query's slice by a key's range: only its rows
     pub own: std::sync::OnceLock<(datafusion::common::Statistics, Arc<std::collections::HashMap<String, crate::hot::Known>>)>, // a slice's own, worked out once (`sized`)
+    pub scope: crate::rights::Scope, // whom it is planned for: the external files a scan reads are theirs to read (`ext`)
 }
 
 impl std::fmt::Debug for Pruned {
@@ -918,7 +919,7 @@ impl Pruned {
     }
 
     /// Any other table's rows, planned as a query of their own.
-    async fn planned(&self, meta: &TableMeta, range: Option<Expr>, projection: &[usize], upto: Option<u64>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    async fn planned(&self, meta: &TableMeta, range: Option<Expr>, projection: &[usize], upto: Option<u64>, scope: &crate::rights::Scope) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let e = |e: anyhow::Error| datafusion::error::DataFusionError::External(e.into());
         let ctx = self.lake.session();
         if meta.changed {
@@ -927,8 +928,8 @@ impl Pruned {
             ctx.state_ref().write().config_mut().options_mut().set("datafusion.optimizer.enable_dynamic_filter_pushdown", "false").map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
         }
         let df = match meta.changed {
-            true => current(&self.lake, &ctx, &self.name, meta, upto, self.at).await.map_err(e)?,
-            false => raw(&self.lake, &ctx, &self.name, meta, upto).await.map_err(e)?,
+            true => current(&self.lake, &ctx, &self.name, meta, upto, self.at, scope).await.map_err(e)?,
+            false => raw(&self.lake, &ctx, &self.name, meta, upto, scope).await.map_err(e)?,
         };
         let df = match range {
             Some(r) => df.filter(r)?, // (reaches the Parquet reader: row groups outside it are skipped)
@@ -984,7 +985,7 @@ impl TableProvider for Pruned {
             }
             false => {
                 let meta = { let mut entry = (*self.meta).clone(); entry.files = files; entry.sealed = None; entry.changed = changed; entry };
-                self.planned(&meta, range, projection.unwrap_or(&all), upto).await?
+                self.planned(&meta, range, projection.unwrap_or(&all), upto, &self.scope).await?
             }
         };
         let Some((rows, bytes)) = self.share else { return Ok(plan) };
@@ -1619,7 +1620,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
         if name != except && (staged || !crate::sys::hidden(name) && (listing || named_only || mentions(&text, name))) {
             let meta = lake.cat.parsed(&key, &raw)?; // (only the tables it names: decoding every one was half of a small query's time)
             let touched = crate::txn::touched(name);
-            let view = table_view(lake, &ctx, name, &meta, touched || named_sys, upto).await?;
+            let view = table_view(lake, &ctx, name, &meta, touched || named_sys, upto, scope).await?;
             let mut t = named(&ctx, view, &meta, names_deleted(&text))?;
             if touched {
                 t = crate::txn::overlaid(&ctx, name, &meta.sql_key(), t, crate::sys::mentioned(&text))?;
@@ -1636,14 +1637,14 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
         }
     }
     let (names, direct) = (crate::ext_names::names(&text), crate::ext_names::names(sql));
-    let metas = futures::future::join_all(names.iter().map(|n| crate::ext::meta(lake, n))).await; // (listed at once)
+    let metas = futures::future::join_all(names.iter().map(|n| crate::ext::meta(lake, n, scope))).await; // (listed at once)
     for (name, meta) in names.into_iter().zip(metas) {
         let meta = match meta {
             Ok(m) => Arc::new(m.expect("files")), // (files anywhere: `ext.rs`)
             Err(_) if listing && !direct.contains(&name) => continue, // (a view's files this caller can't read, or that are gone: a listing shows the rest)
             Err(e) => return Err(e),
         };
-        let view = table_view_once(lake, &ctx, &name, meta.clone(), upto).await?;
+        let view = table_view_once(lake, &ctx, &name, meta.clone(), upto, scope).await?;
         ctx.register_table(datafusion::common::TableReference::bare(name.clone()), named(&ctx, view, &meta, false)?)?; // (another engine's names for its columns)
     }
     for name in crate::past_names::names(&text) {
@@ -1658,7 +1659,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
         if !listing && !mentions(&text, &ns) {
             continue;
         }
-        let locked = crate::users::across(&other, &ns).await.err().map(|e| e.to_string()); // (its own sign-in: `users::across`)
+        let locked = crate::users::across(&other, &ns, scope).await.err().map(|e| e.to_string()); // (its own sign-in: `users::across`)
         let catalog = Arc::new(MemoryCatalogProvider::new());
         for s in crate::ddl::schemas(&other).await? {
             catalog.register_schema(&s, Arc::new(MemorySchemaProvider::new()))?;
@@ -1679,7 +1680,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
                 continue;
             }
             let meta = other.cat.parsed(&key, &raw)?;
-            let view = named(&ctx, table_view(&other, &ctx, name, &meta, named_sys, upto).await?, &meta, names_deleted(&text))?;
+            let view = named(&ctx, table_view(&other, &ctx, name, &meta, named_sys, upto, scope).await?, &meta, names_deleted(&text))?;
             let Some(view) = across(scope, &format!("{ns}.{name}"), view, listing, &locked, &asked) else { continue };
             let (s, t) = split(name);
             if old && s == PUBLIC {
@@ -1712,14 +1713,14 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
             system.register_table(name.into(), table)?;
         }
         let runs = match lake.cat.meta(&crate::store::table_key(crate::runs::TABLE)).await? {
-            Some(meta) => named(&ctx, table_view(lake, &ctx, crate::runs::TABLE, &meta, named_sys, upto).await?, &meta, false)?,
+            Some(meta) => named(&ctx, table_view(lake, &ctx, crate::runs::TABLE, &meta, named_sys, upto, scope).await?, &meta, false)?,
             None => crate::runs::no_runs()?,
         };
         system.register_table("runs".into(), runs)?;
         if crate::audit::check(&text, scope)? {
             // (a superuser's only: `audit.rs`)
             let audit = match lake.cat.meta(&crate::store::table_key(crate::audit::TABLE)).await? {
-                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::audit::TABLE, &meta, named_sys, upto).await?, &meta, false)?,
+                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::audit::TABLE, &meta, named_sys, upto, scope).await?, &meta, false)?,
                 None => crate::audit::empty()?,
             };
             system.register_table("audit".into(), audit)?;
@@ -1727,7 +1728,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
         if text.to_lowercase().contains("pondra.history") || text.to_lowercase().contains("pondra.learned") {
             // (every statement's row: an admin's all, anyone else's their own: `history.rs`; what they learned, `learned.rs`)
             let history = match lake.cat.meta(&crate::store::table_key(crate::history::TABLE)).await? {
-                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::history::TABLE, &meta, named_sys, upto).await?, &meta, false)?,
+                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::history::TABLE, &meta, named_sys, upto, scope).await?, &meta, false)?,
                 None => crate::history::empty()?,
             };
             let history = crate::history::visible(&ctx, history, scope)?;
@@ -1739,7 +1740,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
         if text.to_lowercase().contains("pondra.flows") || text.to_lowercase().contains("pondra.expectations") {
             // (a materialized view's flow and its expectations: `views::system`)
             let counts = match lake.cat.meta(&crate::store::table_key(crate::views::EXPECTED)).await? {
-                Some(meta) => ctx.read_table(table_view(lake, &ctx, crate::views::EXPECTED, &meta, false, upto).await?)?.collect().await?,
+                Some(meta) => ctx.read_table(table_view(lake, &ctx, crate::views::EXPECTED, &meta, false, upto, scope).await?)?.collect().await?,
                 None => vec![],
             };
             for (name, table) in crate::views::system(lake, counts, scope).await? {

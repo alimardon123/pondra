@@ -233,7 +233,7 @@ impl App {
             let nodes = if spread == Some("0") || self.here_only_for(query, scope).await { vec![] } else { self.members.nodes() };
             // (boxed, and only with nodes to spread over: its future is 300 KB, which every query on one node carried)
             let spread_out = match nodes.len() > 1 {
-                true => Box::pin(crate::spmd::query(&self.lake, &nodes, self.members.me(), query, spread == Some("1"))).await,
+                true => Box::pin(crate::spmd::query(&self.lake, &nodes, self.members.me(), query, spread == Some("1"), scope)).await,
                 false => Ok(None),
             };
             match spread_out {
@@ -272,7 +272,7 @@ impl App {
             let took = here.elapsed(); // (an answer handed in pieces: its time includes the client's reading, so it says nothing)
             if self.members.nodes().len() > 1 && crate::query::handed().is_none() {
                 let bytes = match took >= Duration::from_millis(20) {
-                    true => crate::spmd::reads_sql(&self.lake, query).await.unwrap_or(0),
+                    true => crate::spmd::reads_sql(&self.lake, query, scope).await.unwrap_or(0),
                     false => 0,
                 };
                 crate::guard::ran_here(&self.lake, query, bytes, took);
@@ -572,7 +572,7 @@ impl App {
             crate::query::stored_views(&self.lake, sql, false, scope).await.ok()?.iter().for_each(|(_, v)| text.push_str(&format!(" {v}")));
         }
         for (name, other) in self.lake.attached.read().unwrap().iter().filter(|(n, _)| crate::text::mentions(&text, n)) {
-            (name, other.cat.version()?, crate::auth::operator()).hash(&mut h); // (whoever runs the nodes may read what a user may not: `users::across`)
+            (name, other.cat.version()?, scope.operator()).hash(&mut h); // (whoever runs the nodes may read what a user may not: `users::across`, which reads the same scope)
         }
         Some(h.finish())
     }

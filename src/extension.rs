@@ -273,14 +273,14 @@ fn key(name: &str) -> String { format!("xt/{name}") }
 /// through the store of the secret that covers it), checked, and kept under its hash, so any node can read it; then the record
 /// goes to the leader: under this node's lock when it leads, else sent to it, as `backup::statement` sends its attach.
 #[cfg(feature = "lake")]
-pub async fn fetch(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl, by: &str) -> Result<serde_json::Value> {
+pub async fn fetch(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl, by: &str, scope: &crate::rights::Scope) -> Result<serde_json::Value> {
     let Ddl::FetchExtension { name, from, version } = d else { anyhow::bail!("only INSTALL … FROM is read on the node") };
     if cfg!(target_arch = "wasm32") {
         return Err(coded("0A000", format!("{name}: extensions in the page come after 1.0 (X3 in the plan)")));
     }
     unsigned_allowed(&name)?;
     let max = crate::env::value::<u64>("PONDRA_EXTENSION_FILE_MB") * (1 << 20);
-    let bytes = bytes_of(lake, &from, max).await?;
+    let bytes = bytes_of(lake, &from, max, scope).await?;
     let record = keep(lake, &name, &from, version, bytes, by).await?;
     let install = Ddl::InstallExtension { name, record };
     match lock {
@@ -342,9 +342,9 @@ fn described(part: &crate::wasm::Loaded) -> Vec<Described> {
 }
 
 #[cfg(feature = "lake")]
-async fn bytes_of(lake: &Lake, from: &str, max: u64) -> Result<Vec<u8>> {
+async fn bytes_of(lake: &Lake, from: &str, max: u64, scope: &crate::rights::Scope) -> Result<Vec<u8>> {
     use object_store_df::ObjectStoreExt as _;
-    crate::ext::check_url(lake, from).await?;
+    crate::ext::check_url(lake, from, scope).await?;
     let too_big = |size: u64| coded("54000", format!("{} is {} MB: a Pondra extension's file is at most {} MB (PONDRA_EXTENSION_FILE_MB)", file_of(from), size >> 20, max >> 20));
     if crate::ext::on_disk(from) {
         let path = from.strip_prefix("file://").unwrap_or(from);
@@ -354,7 +354,7 @@ async fn bytes_of(lake: &Lake, from: &str, max: u64) -> Result<Vec<u8>> {
         }
         return Ok(std::fs::read(path).with_context(|| format!("reading {from}"))?);
     }
-    let (store, at) = crate::ext::store(lake, from).await?;
+    let (store, at) = crate::ext::store(lake, from, scope).await?;
     let got = store.get(&at).await?;
     if got.meta.size > max {
         return Err(too_big(got.meta.size));
