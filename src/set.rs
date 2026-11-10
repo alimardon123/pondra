@@ -317,6 +317,11 @@ fn defaults_kept(n: String, value: String) -> Result<(String, String)> {
         "default_file_format" => Ok((n, taken(&FILE, &value)?)),
         "default_table_access_method" if default || value.trim().eq_ignore_ascii_case("heap") => Ok((TABLE.name.into(), if default { "default".into() } else { "pondra".into() })),
         "default_table_access_method" => Err(crate::codes::coded("22023", format!("default_table_access_method = '{value}': a table here is kept in Pondra's own format (heap); SET default_table_format names another"))),
+        // (a bare name is a table's own, live; `default_` is what new tables copy: the names point at each other)
+        "table_format" | "file_format" => {
+            let (d, own) = if n == "table_format" { (&TABLE, "named by its CREATE TABLE's USING") } else { (&FILE, "set with the table") };
+            Err(crate::codes::coded("42704", format!("unrecognized configuration parameter \"{n}\": a table's {} is its own, {own}; SET {} = '{}' sets the one new tables take", d.what, d.name, d.takes[0])))
+        }
         _ => Ok((n, value)),
     }
 }
@@ -326,6 +331,14 @@ fn defaults_kept(n: String, value: String) -> Result<(String, String)> {
 fn default_shown(n: &str) -> Option<String> {
     let d = [&TABLE, &FILE].into_iter().find(|d| d.name == n)?;
     resolved(d, None, crate::env::get(d.var).as_deref()).ok().map(|(v, _)| v)
+}
+
+/// The settings a client sent as its session started, set for the current session as `SET name = 'value'` sets each, in
+/// order: a Postgres client's startup `options` (`-c name=value`) and `application_name`, as Postgres sets them. A value
+/// `SET` refuses is refused here with its code, and the connection with it.
+pub fn at_start(settings: &[(String, String)]) -> Result<()> {
+    let session = crate::temp::current().context(NO_SESSION)?;
+    settings.iter().try_for_each(|(n, v)| set(&session, n, v.clone()))
 }
 
 fn set(session: &str, variable: &str, value: String) -> Result<()> {
@@ -478,6 +491,9 @@ mod tests {
         assert_eq!(kept("default_table_access_method", "heap").unwrap(), ("default_table_format".into(), "pondra".into()));
         let e = kept("default_table_access_method", "columnar").unwrap_err();
         assert!(crate::codes::of(&e) == "22023" && e.to_string().contains("SET default_table_format"), "{e}");
+        let e = kept("file_format", "parquet").unwrap_err();
+        assert!(crate::codes::of(&e) == "42704" && e.to_string().contains("SET default_file_format = 'parquet' sets the one new tables take"), "{e}");
+        assert!(kept("table_format", "pondra").unwrap_err().to_string().contains("named by its CREATE TABLE's USING; SET default_table_format"));
         assert_eq!(kept("search_path", "crm").unwrap(), ("search_path".into(), "crm".into()), "any other setting is kept as given");
 
         assert_eq!(resolved(&TABLE, Some("pondra".into()), Some("nope")).unwrap(), ("pondra".into(), Source::Session), "the session's first");
@@ -489,5 +505,16 @@ mod tests {
         assert_eq!(default_shown("search_path"), None);
         let flag = crate::settings::find(TABLE.var).and_then(|s| s.flag.map(|_| s.default()));
         assert_eq!(flag, Some(Some("pondra".into())), "pondra serve --default-table-format");
+    }
+
+    /// The settings a session may set over its node's are the registry's rows that say so (`pondra.settings`' `session`): the
+    /// defaults kept here, each by its name.
+    #[test]
+    fn the_settings_a_session_sets_over_its_nodes_are_the_registrys() {
+        let mut rows: Vec<(String, &str)> = crate::settings::all().iter().filter(|s| s.session).map(|s| (s.name(), s.var)).collect();
+        rows.sort();
+        let mut kept: Vec<(String, &str)> = [&TABLE, &FILE].iter().map(|d| (d.name.to_string(), d.var)).collect();
+        kept.sort();
+        assert_eq!(rows, kept);
     }
 }
