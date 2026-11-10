@@ -184,7 +184,8 @@ pub fn rebase_file(f: &mut crate::store::DataFile, id: &str) {
 }
 
 /// Lake::open: the bases a branch reads, so its paths resolve (`Lake::full`, `Lake::object`). A base
-/// on another server is read with the bucket key its branch keeps (ADR-058).
+/// on another server is read with the bucket key its branch keeps (ADR-058), as the node's own work: the branch's maker
+/// was asked for it when the branch was made (`make`), and the lake is opened once for whoever asks next.
 pub async fn load(lake: &Lake) -> Result<()> {
     if let Some(b) = lake.cat.get::<Bases>(BASES).await? {
         // (a backup keeps its bases' files as its own, under `data/_bases` (`backup::place`): one whose catalog names a base
@@ -201,7 +202,7 @@ pub async fn load(lake: &Lake) -> Result<()> {
         };
         for (id, base) in b.lakes {
             if base.read_only {
-                crate::ext::reach_base(&lake.node.reaches, &secrets, &base.url, base.endpoint.as_deref())?;
+                crate::ext::reach_base(&lake.node.reaches, &secrets, &base.url, base.endpoint.as_deref(), &crate::auth::Principal::node().scope)?;
             }
             lake.add_base(&id, &base.url)?;
         }
@@ -428,11 +429,11 @@ pub async fn keyed(lake: &Lake, d: &Ddl, key: &str) -> Result<()> {
     Ok(())
 }
 
-/// May the request being served clone from, or refresh, another database attached here?
+/// May the request being served (its `scope`) clone from, or refresh, another database attached here?
 /// (`users::across`: one that signs in on its own is cloned through its own sign-in, on its own
 /// node, or with the nodes' tokens.) Checked where the statement comes in: the leader it goes
 /// to runs it as the node. A branch's own REFRESH goes by its key (`keyed`).
-pub async fn may(lake: &Lake, d: &Ddl) -> Result<()> {
+pub async fn may(lake: &Lake, d: &Ddl, scope: &crate::rights::Scope) -> Result<()> {
     let name = match d {
         Ddl::CreateDatabase { clone: Some(of), .. } => crate::text::database(&of.from),
         Ddl::Refresh { database: Some(db), .. } => db.clone(),
@@ -440,7 +441,7 @@ pub async fn may(lake: &Lake, d: &Ddl) -> Result<()> {
     };
     let other = lake.attached.read().unwrap().iter().find(|(n, _)| *n == name).map(|(_, l)| l.clone());
     match other {
-        Some(o) if name != crate::ddl::lake_name(lake) => crate::users::across(&o, &name).await,
+        Some(o) if name != crate::ddl::lake_name(lake) => crate::users::across(&o, &name, scope).await,
         _ => Ok(()),
     }
 }
@@ -452,7 +453,7 @@ pub async fn may(lake: &Lake, d: &Ddl) -> Result<()> {
 pub async fn door(lake: &Lake, d: &mut Ddl, asker: &crate::auth::Principal) -> Result<()> {
     places(d)?;
     match asker.scope.whole() {
-        true => may(lake, d).await?,
+        true => may(lake, d, &asker.scope).await?,
         false => user_door(lake, d, asker).await?,
     }
     stamp(lake, d, &asker.name).await
@@ -482,7 +483,7 @@ async fn user_door(lake: &Lake, d: &mut Ddl, asker: &crate::auth::Principal) -> 
     if let Ddl::DropDatabase { name, if_exists, .. } = d {
         return drop_as(lake, name.as_str(), *if_exists, &asker.name).await;
     }
-    may(lake, d).await
+    may(lake, d, &asker.scope).await
 }
 
 /// A branch of a database, made by a user with CLONE: on this database, as its grants let it (every
@@ -633,14 +634,14 @@ pub async fn seal_keys(lake: &Lake) -> Result<()> {
 /// its own branches), the base's files listed where they are, its log tail copied, and the
 /// counters (commits, segments, row ids) carried on, so rows keep their `_row_id` and `_version`
 /// and what the branch writes numbers after them.
-pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
+pub async fn make(lake: &Lake, m: Make, scope: &crate::rights::Scope) -> Result<Value> {
     if let Some(b) = lake.cat.get::<Bases>(BASES).await? {
         ensure!(b.base == m.base, "{} is a branch of {} already", lake.url, b.base);
         return Ok(j!({"branch": lake.url, "of": m.base, "unchanged": true})); // (asked again: done)
     }
     ensure!(lake.cat.scan_raw("t/", "t0").await?.is_empty(), "{} holds tables: a branch is made into a new database", lake.url);
     for b in m.lakes.values().filter(|b| b.read_only) {
-        crate::ext::reach_base(&lake.node.reaches, &m.secrets, &b.url, b.endpoint.as_deref())?; // (its key and its leader, before it is read)
+        crate::ext::reach_base(&lake.node.reaches, &m.secrets, &b.url, b.endpoint.as_deref(), scope)?; // (its key and its leader, before it is read)
     }
     let base = Lake::open(&m.base, false, false, lake.node.clone()).await.with_context(|| format!("opening {}", m.base))?;
     let id = id_of(&m.base);
@@ -918,7 +919,7 @@ pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::syn
     for t in &all {
         let mut meta: TableMeta = serde_json::from_slice(&snap[&table_key(t)]).with_context(|| t.clone())?;
         let tail = match meta.tiered < end {
-            true => crate::tier::fold_into(&base, lake, t, &meta, meta.tiered, end).await?,
+            true => crate::tier::fold_into(&base, lake, t, &meta, meta.tiered, end, &asker.scope).await?,
             false => vec![],
         };
         listed(&mut meta, &id);

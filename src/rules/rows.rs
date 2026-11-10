@@ -124,11 +124,11 @@ pub(crate) fn says_default(q: &ast::Query) -> bool { matches!(q.body.as_ref(), a
 
 /// `INSERT INTO table (names) query` as a query of all its `columns`, in order (`whole_rows`; a
 /// temporary table's too, `temp.rs`).
-pub fn rows_for(table: &str, columns: &[String], names: &[String], query: &str, default: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+pub fn rows_for(table: &str, columns: &[String], names: &[String], query: &str, default: &dyn Fn(&str) -> Option<String>, scope: &crate::rights::Scope) -> Result<String> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
     if let Some(n) = names.iter().find(|n| !columns.contains(n)) {
         // (its columns, unless the scope is a user's with grants: they may be ones it may not read, which no answer names)
-        let listed = if crate::rights::scope().whole() { format!(" (its columns: {})", columns.join(", ")) } else { String::new() };
+        let listed = if scope.whole() { format!(" (its columns: {})", columns.join(", ")) } else { String::new() };
         return Err(crate::codes::coded("42703", format!("column \"{n}\" of relation \"{table}\" does not exist{listed}")));
     }
     if let Some((_, n)) = names.iter().enumerate().find(|(i, n)| names[..*i].contains(n)) {
@@ -265,9 +265,9 @@ mod tests {
     fn a_column_named_wrong_or_twice_is_refused_with_postgres_codes() {
         let columns: Vec<String> = ["a", "b"].iter().map(|n| n.to_string()).collect();
         let none = |_: &str| None;
-        let unknown = rows_for("t", &columns, &["nope".to_string()], "VALUES (1)", &none).unwrap_err();
+        let unknown = rows_for("t", &columns, &["nope".to_string()], "VALUES (1)", &none, &crate::rights::Scope::everything()).unwrap_err();
         assert_eq!((crate::codes::of(&unknown), unknown.to_string().starts_with("column \"nope\" of relation \"t\" does not exist")), ("42703", true));
-        let twice = rows_for("t", &columns, &["a".to_string(), "a".to_string()], "VALUES (1, 2)", &none).unwrap_err();
+        let twice = rows_for("t", &columns, &["a".to_string(), "a".to_string()], "VALUES (1, 2)", &none, &crate::rights::Scope::everything()).unwrap_err();
         assert_eq!(crate::codes::of(&twice), "42701");
     }
 }

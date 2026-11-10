@@ -46,7 +46,7 @@ pub async fn parts(lake: &Lake, objects: &[Object], scope: &crate::rights::Scope
 /// Each object's parts, read from its own lake (`lakes`: this one and those attached that the
 /// caller may use). Each lake's routines are listed once.
 async fn parts_of(lake: &Lake, objects: &[Object], scope: &crate::rights::Scope) -> Result<Vec<PartRow>> {
-    let lakes: HashMap<String, Arc<Lake>> = lakes(lake).await.into_iter().collect();
+    let lakes: HashMap<String, Arc<Lake>> = lakes(lake, scope).await.into_iter().collect();
     let here = crate::ddl::lake_name(lake);
     let mut routines = HashMap::new();
     let mut out = vec![];
