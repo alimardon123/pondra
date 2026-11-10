@@ -588,14 +588,12 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     }
 }
 
-/// Is a page's member open in this process (`open_page`)? Set when one opens, and set back by `end_page` as its last step,
-/// after `reset()`: a waiting `open_page` takes it only once every other static is set back. Not `per_node!`, since `reset()`
-/// would set it back before the rest are, and a page opened in that gap would have them cleared under it.
+/// Is a page's member open in this process (`open_page`)? Set when one opens, and set back by `end_page` as its last step:
+/// a waiting `open_page` takes it only once the member before has let go of everything (its tasks, its catalog, its term).
 static PAGED: AtomicBool = AtomicBool::new(false);
 
-/// Is a live `page::Page` holding this module's page (`claim_page`)? Set by the claim, set back by `unclaim_page`. Not
-/// `per_node!`: a freed page's member closes in the background, and its `reset()` would set back the claim of the page made
-/// after it.
+/// Is a live `page::Page` holding this module's page (`claim_page`)? Set by the claim, set back by `unclaim_page` alone: a
+/// freed page's member closes in the background, after the page made after it may have claimed it.
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Claims this module's page for a `page::Page` (`Page::claim`), refused 55006 while a live page holds it.
@@ -694,8 +692,7 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
     }
     crate::memory_lake::forget_memory(url);
     claims.clear(); // (its claims' locks let go as it stops: `Claims`)
-    crate::reset::reset();
-    PAGED.store(false, SeqCst); // (last: the next `open_page` starts once the statics are set back)
+    PAGED.store(false, SeqCst); // (last: the next `open_page` starts once this one has let go of everything)
 }
 
 /// Opens a joined page's member (`Paged`): a read-only follower of the lake the cluster at `node` leads (designs/
