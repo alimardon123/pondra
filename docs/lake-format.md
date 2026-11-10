@@ -276,10 +276,15 @@ Rules for outside readers:
     `manage_snapshots`) is taken as Pondra's `RESTORE TABLE … TO TIMESTAMP AS OF` that snapshot's
     time: the table as it was then, which includes any rows committed by then that its files didn't
     hold yet (the view follows tier rounds).
-  - An expiry of snapshots, a replace of the table or a change of its partitioning is refused,
-    naming Pondra's way: the lake's retention (`--retain-secs`), `CREATE OR REPLACE TABLE`, the
-    `PARTITION BY` it was made with. Another engine's compaction is refused too: Pondra merges its
-    tables' files itself.
+  - A replace of the table (Spark's `REPLACE TABLE`, `CREATE OR REPLACE TABLE … AS SELECT`) is
+    Pondra's `CREATE OR REPLACE TABLE` of the schema, spec, order and properties it makes current,
+    its new table filled with the engine's files before it takes the table's place in one commit;
+    the old one is set aside as a drop sets it, so `UNDROP TABLE` brings it back. It keeps the
+    table's uuid. Files whose field ids aren't the ones Pondra gives the new table's columns are
+    copied by column name.
+  - An expiry of snapshots or a change of partitioning is refused, naming Pondra's way: the lake's
+    retention (`--retain-secs`), the `PARTITION BY` it was made with. Another engine's compaction
+    is refused too: Pondra merges its tables' files itself.
   - Today the node reads an appended file's rows and writes them into the table again.
     ADR-029 (proposed) would take the files as written and only commit them.
 - **Latest version, plus the history still there:** the Iceberg metadata lists the snapshots from

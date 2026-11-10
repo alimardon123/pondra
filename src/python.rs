@@ -265,6 +265,7 @@ struct Pool {
     procedures: Arc<Semaphore>,
     busy: AtomicUsize,
     reaping: AtomicBool,
+    loops: crate::spawns::Loops, // (its reaper: `reap`)
 }
 
 /// How many times this machine's Python was chosen (`choose`): each lake's workers start again on a new one at their next use.
@@ -279,6 +280,7 @@ pub struct Workers {
     kernels: Mutex<HashMap<String, (Slot, Instant)>>,
     chosen: std::sync::atomic::AtomicU64, // (the `CHOICE` its workers started on)
     joined: std::sync::atomic::AtomicBool, // (told its node's sessions it keeps theirs: `temp::Keeps`)
+    loops: crate::spawns::Loops, // (its sessions' workers' reaper: `reap_kernels`)
 }
 
 impl crate::lake_state::LakeState for Workers {
@@ -333,7 +335,7 @@ async fn pool(w: &Workers, packages: &str) -> Result<Arc<Pool>> {
         false => Some(install(&key).await?),
     };
     let procedures = crate::env::value::<u64>("PONDRA_PROCEDURES").max(1) as usize;
-    let fresh = Arc::new(Pool { path, idle: Mutex::new(vec![]), functions: Arc::new(Semaphore::new(crate::env::cores())), procedures: Arc::new(Semaphore::new(procedures)), busy: AtomicUsize::new(0), reaping: AtomicBool::new(false) });
+    let fresh = Arc::new(Pool { path, idle: Mutex::new(vec![]), functions: Arc::new(Semaphore::new(crate::env::cores())), procedures: Arc::new(Semaphore::new(procedures)), busy: AtomicUsize::new(0), reaping: AtomicBool::new(false), loops: Default::default() });
     Ok(w.pools.lock().unwrap().entry(key).or_insert(fresh).clone())
 }
 
@@ -409,7 +411,7 @@ impl Pool {
         lent.worker = Some(spawn(self.path.as_deref()).await?);
         let _idle = self.idle.lock().unwrap(); // (the reaper decides to stop under this lock)
         if !self.reaping.swap(true, Ordering::SeqCst) {
-            crate::spawns::for_statics(reap(self.clone()));
+            self.loops.spawn(reap(Arc::downgrade(self)));
         }
         Ok(lent)
     }
@@ -432,7 +434,8 @@ async fn spawn(path: Option<&str>) -> Result<Worker> {
     let said = Arc::new(Mutex::new(VecDeque::new()));
     if let Some(err) = child.stderr.take() {
         let said = said.clone();
-        crate::spawns::for_statics(async move {
+        crate::spawns::untracked(async move {
+            // (it ends with its worker: a worker let go is killed, and its pipe closes)
             // Read to its end whatever it writes (bytes that aren't UTF-8, a line with no end): a
             // reader that stopped would leave its pipe full, and the worker stuck writing to it.
             let (mut err, mut line) = (BufReader::new(err), Vec::new());
@@ -498,10 +501,11 @@ impl Lent {
 }
 
 /// Stop the workers idle for a minute (`PONDRA_WORKER_IDLE_SECS`); done when none is left.
-async fn reap(pool: Arc<Pool>) {
+async fn reap(pool: std::sync::Weak<Pool>) {
     let idle = crate::env::secs("PONDRA_WORKER_IDLE_SECS");
     loop {
         tokio::time::sleep(Duration::from_secs(2).min(idle)).await;
+        let Some(pool) = pool.upgrade() else { return }; // (its lake went)
         let mut ws = pool.idle.lock().unwrap();
         ws.retain(|w| w.idle_since.elapsed() < idle);
         if ws.is_empty() && pool.busy.load(Ordering::SeqCst) == 0 {
@@ -667,7 +671,7 @@ async fn ask_session_on(w: &Arc<Workers>, session: &str, head: Value, parts: Vec
     let slot = {
         let mut all = w.kernels.lock().unwrap();
         if all.is_empty() {
-            crate::spawns::for_statics(reap_kernels(Arc::downgrade(w))); // (only while there are some)
+            w.loops.spawn(reap_kernels(Arc::downgrade(w))); // (only while there are some)
         }
         let e = all.entry(session.to_string()).or_insert_with(|| (Slot::default(), Instant::now()));
         e.1 = Instant::now();
