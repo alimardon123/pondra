@@ -687,6 +687,7 @@ impl Sequencer {
             let rows: u64 = crate::tier::waiting(&lake, from, None, |t| Some(marks.get(t).copied().unwrap_or(u64::MAX))).await?.values().sum();
             lake.backlog.fetch_add(rows, Ordering::Relaxed);
         }
+        lake.node.trace("the log's backlog counted");
         let (tx, mut rx) = mpsc::channel::<(Flush, oneshot::Sender<Outcome>)>(10_000);
         let commit_ms = Arc::new(Mutex::new(vec![]));
         let ms = commit_ms.clone();
