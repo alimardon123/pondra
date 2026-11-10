@@ -600,7 +600,7 @@ impl Backend {
         }
         if let Some(r) = crate::returning::of(&sql) {
             // INSERT, UPDATE or DELETE … RETURNING: the rows it wrote, under its command's tag (`INSERT 0 3`)
-            let b = Box::pin(crate::returning::run(&self.app, &r, role, false, &self.who().scope, None)).await.map_err(self.err())?;
+            let b = Box::pin(crate::returning::run(&self.app, &r, role, false, &self.who(), None)).await.map_err(self.err())?;
             let schema = crate::pg_types::typed(&b.schema(), &crate::pg_types::columns(&self.app.lake, &bound, &self.who().scope).await);
             let mut answer = rows(&schema, vec![b], format)?;
             answer.command_tag = r.kind().prefix();
@@ -610,7 +610,7 @@ impl Backend {
             crate::history::parsed(&stmt); // (the history writer takes its table from here: `history::touched`)
             crate::rights::may_run(role, &stmt).map_err(self.err())?;
             let kind = stmt.kind(&sql);
-            let v = crate::write::on_node(&self.app, stmt, None, &self.who().scope).await.map_err(self.err())?;
+            let v = crate::write::on_node(&self.app, stmt, None, &self.who()).await.map_err(self.err())?;
             return Ok(Response::Execution(tag(&kind, Some(v["rows"].as_u64().unwrap_or(0)))));
         }
         let catalog = crate::pg_catalog::wanted(&sql);

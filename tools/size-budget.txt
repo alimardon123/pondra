@@ -11,4 +11,10 @@ linux-x64 159500000 57300000
 # shipped program. A pull request that changes the lock file builds the dist profile and is held to linux-x64; when it
 # raises that line it raises this one too, by about twice the bytes, or the next pull request fails for them.
 # 11-07, at 0fcfb55: the program 318,296,952 bytes, its download 91,923,509 (the train's build, run 42354370150).
-linux-x64-release 324700000 93800000
+# 11-09, #757 (M8 3d-2b, the write path takes its asker): 326,391,248 bytes, its download 94,595,236 (the train's run
+# 42712684275), on main's 323,083,128 (e7e503d8, run 42699092527): main's own growth since 11-07 had left 1.6 MB of the 2%.
+# The bytes buy no new code: built here side by side, the program's symbols grow 1.7 MB, spread over every async function
+# of ddl.rs (each 10-20% larger, most of them unchanged) and sqlparser's derived Eq and Hash, where the 16 codegen units
+# now inline differently; nothing is added that main lacks. The shipped program (one codegen unit) stays held by linux-x64.
+# Again about 2% for growth.
+linux-x64-release 332900000 96500000

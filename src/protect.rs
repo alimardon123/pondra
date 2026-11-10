@@ -53,20 +53,21 @@ pub async fn set(lake: &Lake, database: &str, on: bool, by: &str) -> Result<Valu
     Ok(j!({"database": database, "protected": on}))
 }
 
-/// Who a protection change is made by, when the statement doesn't say (`pondra.databases`).
-pub fn stamp(d: &mut Ddl) {
+/// Who a protection change is made by, when the statement doesn't say (`pondra.databases`): `asker`, the name of who
+/// sends it (none: the node's own, "admin").
+pub fn stamp(d: &mut Ddl, asker: &str) {
     if let Ddl::Protect { by, .. } = d {
         if by.is_empty() {
-            *by = crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "admin".into());
+            *by = if asker.is_empty() { "admin".into() } else { asker.to_string() };
         }
     }
 }
 
 /// Where a statement comes in (`write::on_node_listed`): stamps a protection change with who makes
-/// it, and refuses a change to a project's object in a protected database.
-pub async fn door(lake: &Lake, mut stmt: Stmt) -> Result<Stmt> {
+/// it (`asker`, its sender's name), and refuses a change to a project's object in a protected database.
+pub async fn door(lake: &Lake, mut stmt: Stmt, asker: &str) -> Result<Stmt> {
     if let Stmt::Ddl(ds) = &mut stmt {
-        ds.iter_mut().for_each(stamp);
+        ds.iter_mut().for_each(|d| stamp(d, asker));
     }
     for t in touched(&stmt) {
         check(lake, t).await?;

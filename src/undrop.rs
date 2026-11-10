@@ -134,8 +134,8 @@ pub async fn has(lake: &Lake, kind: &str, name: &str) -> Result<bool> { Ok(!copi
 pub async fn newest(lake: &Lake, kind: &str, name: &str) -> Result<Option<Kept>> { Ok(copies(lake, kind, name).await?.pop().map(|(_, k)| k)) }
 
 /// `UNDROP <kind> name`: the copy of `name` dropped last, back as it was, the comments on it too. One kept as the
-/// statement that makes it is made again, planned for `scope` (the asker's, as its CREATE would be).
-pub async fn undrop(lake: &Lake, kind: &str, name: &str, scope: &crate::rights::Scope) -> Result<Value> {
+/// statement that makes it is made again, by `by` (the asker, as its CREATE would be).
+pub async fn undrop(lake: &Lake, kind: &str, name: &str, by: &crate::auth::Principal) -> Result<Value> {
     let family = family(kind)?;
     let word = kind.to_uppercase();
     let relation = family == "relation";
@@ -168,7 +168,7 @@ pub async fn undrop(lake: &Lake, kind: &str, name: &str, scope: &crate::rights::
             anyhow::bail!("{name}'s definition doesn't read back as a statement: {}", kept.made);
         };
         for d in ds {
-            Box::pin(crate::ddl::apply(lake, d, scope)).await.with_context(|| format!("making {kind} {name} again"))?;
+            Box::pin(crate::ddl::apply(lake, d, by)).await.with_context(|| format!("making {kind} {name} again"))?;
         }
     }
     let puts = kept.records.into_iter().map(|(k, v)| (k, json(&v))).collect();
@@ -176,7 +176,7 @@ pub async fn undrop(lake: &Lake, kind: &str, name: &str, scope: &crate::rights::
     let mut out = j!({shown: name, "undropped": true});
     let mut left = kept.lost;
     if !kept.with.is_empty() {
-        let (back, more) = members(lake, &kept.with, scope).await;
+        let (back, more) = members(lake, &kept.with, by).await;
         out["with"] = j!(back);
         left.extend(more);
     }
@@ -190,7 +190,7 @@ pub async fn undrop(lake: &Lake, kind: &str, name: &str, scope: &crate::rights::
 /// a materialized view made again from its query), in rounds, so one that reads another of them (a materialized view of
 /// the schema's view) comes back once that one has; a round that brings none back ends it. Each that is still kept comes
 /// back, and the answer says why each other one isn't (its time was up, or its name is taken).
-async fn members(lake: &Lake, with: &[(String, String)], scope: &crate::rights::Scope) -> (Vec<String>, Vec<Value>) {
+async fn members(lake: &Lake, with: &[(String, String)], by: &crate::auth::Principal) -> (Vec<String>, Vec<Value>) {
     let mut back = vec![];
     let mut with: Vec<&(String, String)> = with.iter().collect();
     with.sort_by_key(|(kind, _)| match kind.as_str() {
@@ -203,8 +203,8 @@ async fn members(lake: &Lake, with: &[(String, String)], scope: &crate::rights::
         for m in with {
             let (kind, name) = m;
             let out = match kind.as_str() {
-                "table" => Box::pin(crate::ddl::undrop(lake, name, scope)).await, // (boxed: UNDROP TABLE may bring back a kept external table)
-                _ => Box::pin(undrop(lake, kind, name, scope)).await,
+                "table" => Box::pin(crate::ddl::undrop(lake, name, by)).await, // (boxed: UNDROP TABLE may bring back a kept external table)
+                _ => Box::pin(undrop(lake, kind, name, by)).await,
             };
             match out {
                 Ok(_) => back.push(format!("{kind} {name}")),
@@ -345,7 +345,7 @@ mod tests {
 
     /// Statements through the core's one path: `write::parse`, then the leader's `ddl::apply`, as the operator's.
     async fn run(lake: &Lake, sql: &str) -> Result<Value> {
-        let node = crate::auth::Principal::node().scope;
+        let node = crate::auth::Principal::node();
         let mut out = Value::Null;
         match crate::write::parse(sql) {
             Some(crate::write::Stmt::Ddl(ds)) => {
