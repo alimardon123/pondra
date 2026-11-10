@@ -67,8 +67,8 @@ pub(crate) struct Held {
 }
 
 impl Held {
-    /// Ends every task the node started but the one asking (`NodeState::tasks`). The loops of its statics end as they are
-    /// set back, last (`spawns::for_statics`, `reset::reset`).
+    /// Ends every task the node started but the one asking (`NodeState::tasks`). The loops of its states end as they go,
+    /// with its lake (`spawns::Loops`).
     pub(crate) fn abort_tasks(&self) {
         if let Some(node) = self.node.get() {
             node.tasks.abort_all();
@@ -482,7 +482,6 @@ impl Node {
                 if let Some(node) = held.node.get() {
                     node.claims.clear(); // (its claims' locks let go as it stops: `Claims`)
                 }
-                reset::reset();
                 Err(e)
             }
         }
@@ -490,7 +489,7 @@ impl Node {
 
     /// Stops the node, once the program drained it (`drain.rs`): its log writers write what they
     /// were sent (through the log, so while it still leads), it gives back what it holds
-    /// (`Held::stop`), and its statics are set back (`reset`), so the next node in this process
+    /// (`Held::stop`), and its state goes with it (its lake's and its own: nothing of it is in a static), so the next node in this process
     /// starts as in a process of its own (ADR-061 §3, invariant 301).
     pub async fn stop(self) {
         if let Some(lake) = self.held.lake.get() {
@@ -500,7 +499,6 @@ impl Node {
         if let Some(node) = self.held.node.get() {
             node.claims.clear(); // (its claims' locks let go as it stops: `Claims`)
         }
-        reset::reset();
     }
 }
 
