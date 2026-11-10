@@ -1090,7 +1090,8 @@ fn in_place_of(scan: &LogicalPlan, rows: &LogicalPlan) -> Result<LogicalPlan> {
 /// `{source}$deleted`, and the rows file commits took out.
 async fn changed(lake: &Lake, source: &str, after: u64, upto: u64) -> Result<DataFrame> {
     let meta: TableMeta = lake.cat.get(&table_key(source)).await?.with_context(|| format!("no table {source}"))?;
-    let ctx = session_for(lake, &format!("SELECT {VERSION} FROM {}", crate::write::sql_name(source)), "", Some(upto), &crate::auth::Principal::node().scope).await?;
+    let node = crate::auth::Principal::node().scope; // (the node's own work)
+    let ctx = session_for(lake, &format!("SELECT {VERSION} FROM {}", crate::write::sql_name(source)), "", Some(upto), &node).await?;
     let within = |df: DataFrame| df.filter(ident(VERSION).gt(lit(after as i64)).and(ident(VERSION).lt_eq(lit(upto as i64))));
     let new = within(ctx.table(table_ref(source)).await?)?;
     let columns: Vec<(String, DataType)> = meta.logical_columns().iter().map(|(c, _)| Ok((c.clone(), new.schema().field_with_unqualified_name(c)?.data_type().clone()))).collect::<Result<_>>()?;
@@ -1104,7 +1105,7 @@ async fn changed(lake: &Lake, source: &str, after: u64, upto: u64) -> Result<Dat
     let mut all = pick(new)?;
     let gone = crate::sys::deleted(source);
     if let (true, Some(dmeta)) = (meta.changed, lake.cat.get::<TableMeta>(&table_key(&gone)).await?) {
-        let t = crate::query::table_view_once(lake, &ctx, &gone, Arc::new(crate::sys::with_sys(&dmeta)), Some(upto)).await?;
+        let t = crate::query::table_view_once(lake, &ctx, &gone, Arc::new(crate::sys::with_sys(&dmeta)), Some(upto), &node).await?;
         all = all.union(pick(within(ctx.read_table(crate::query::named(&ctx, t, &dmeta, false)?)?)?)?)?;
     }
     let out = crate::change::taken_out(lake, source, after, Some(upto)).await?;

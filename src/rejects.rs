@@ -112,7 +112,7 @@ pub fn keep(object: &str, view: &str, run: &str, why: &[(&str, &str)], rows: &Re
 pub async fn shown(lake: &Lake, ctx: &SessionContext, upto: Option<u64>, scope: &crate::rights::Scope) -> Result<Arc<dyn TableProvider>> {
     use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     let Some(meta) = lake.cat.meta(&table_key(TABLE)).await? else { return empty() };
-    let rows = crate::query::named(ctx, crate::query::table_view(lake, ctx, TABLE, &meta, false, upto).await?, &meta, false)?;
+    let rows = crate::query::named(ctx, crate::query::table_view(lake, ctx, TABLE, &meta, false, upto, scope).await?, &meta, false)?;
     let now = crate::log::now_us() as i64;
     let (mut objects, mut ids, mut since) = (vec![], vec![], vec![]);
     for (key, v) in lake.cat.scan::<crate::views::View>("v/", "v0").await? {
