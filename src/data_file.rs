@@ -64,6 +64,11 @@ pub struct DataFile {
     /// How many of its rows those delete (a file mostly deleted is rewritten: `tier::maintain`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub deleted: u64,
+    /// A file outside the lake: its listing's time (nanoseconds), which its reads open it with, so the footer
+    /// cached at planning (by that time and its size) is the one each read finds. None: a lake file, which never
+    /// changes under its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<i64>,
 }
 
 fn is_zero(n: &u64) -> bool { *n == 0 }
