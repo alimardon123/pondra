@@ -1384,7 +1384,7 @@ async fn stats(State(app): State<App>, who: Option<axum::Extension<crate::auth::
     if let (true, Some(node)) = (members.is_leader(), crate::cluster::of(&app)) {
         s["releases"] = j!(node.releases()); // (each live node's: a rolling upgrade's progress)
     }
-    s["row_locks"] = j!(crate::locks::count(&app.lake.url)); // (ADR-067 §3: the row locks this lake's leader holds now)
+    s["row_locks"] = j!(crate::locks::count(&app.lake)); // (ADR-067 §3: the row locks this lake's leader holds now)
     if let Some(seq) = &app.seq {
         s["untiered_rows"] = j!(app.lake.backlog.load(std::sync::atomic::Ordering::Relaxed));
         let mut ms = seq.commit_ms.lock().unwrap().clone();

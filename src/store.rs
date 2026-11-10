@@ -3286,13 +3286,6 @@ pub fn trace_since(what: &str, since: datafusion::common::instant::Instant) {
     }
 }
 
-crate::per_node!(
-    /// Has the node begun to serve? (Then the catalog's upkeep starts: `kv::slate`.)
-    pub(crate) static SERVING: watch::Sender<bool> = watch::Sender::new(false));
-
-/// The node serves now (`main.rs`).
-pub fn serving() { SERVING.send_replace(true); }
-
 /// DataFusion's caches of Parquet footers and of files' statistics (`Lake::kept`).
 type Footers = datafusion::execution::cache::default_cache::DefaultCache<object_store_df::path::Path, datafusion::execution::cache::cache_manager::CachedFileMetadataEntry>;
 type FileStatistics = datafusion::execution::cache::default_cache::DefaultCache<datafusion::execution::cache::TableScopedPath, datafusion::execution::cache::cache_manager::CachedFileMetadata>;

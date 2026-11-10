@@ -7,7 +7,6 @@ app -> delta  3
 app -> dial  4
 app -> iceberg  2
 app -> pg_catalog  3
-audit -> reset  1
 auth -> crypto  2
 auth -> origins  1
 auth -> wasm32  2

@@ -107,8 +107,8 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     R.get_or_init(|| crate::spawns::runtime().thread_name("pondra").build().expect("a runtime"))
 }
 
-/// Is a node open in this process as a library's? `Opened::open` claims it and its close lets it go. One at a time: a
-/// halt resets every node's statics (`reset::reset`), and the machine and network the first start installs are the process's.
+/// Is a node open in this process as a library's? `Opened::open` claims it and its close lets it go. One at a time: the
+/// machine and network the first start installs are the process's.
 static OPEN: AtomicBool = AtomicBool::new(false);
 
 const ONE_AT_A_TIME: &str = "a node is open in this process already: close it first (one at a time)";
@@ -293,13 +293,12 @@ impl Drop for Opened {
     fn drop(&mut self) { self.close(); }
 }
 
-/// The node in place: what exec does to a process. Its tasks end, its statics (its term's lock file,
-/// whose file says "restarting", its Python workers) are let go, and its lake with them; nothing waits
+/// The node in place: what exec does to a process. Its tasks end, its state (its term's lock file,
+/// whose file says "restarting", its Python workers) is let go, and its lake with it; nothing waits
 /// on the bucket, and the term isn't given back: a fenced or cut-off node has nothing to make durable.
 fn halt(held: &Held, node: Option<Node>) {
     held.abort_tasks();
     drop(node);
-    crate::reset::reset();
 }
 
 async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<Mutex<Option<axum::Router>>>, told: crate::node::Told, first: std::sync::mpsc::Sender<Result<(), String>>) {

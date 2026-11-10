@@ -156,37 +156,45 @@ async fn worked_out(lake: &Lake, sql: &str) -> Result<Option<Arc<Point>>> {
         return Ok(None); // (most statements: no parse)
     }
     let Some(now) = lake.cat.version() else { return Ok(point_of(lake, sql).await?.map(Arc::new)) };
-    let key = (lake.url.clone(), sql.to_string());
-    if let Some((v, p)) = POINTS.lock().unwrap().get(&key) {
+    let plans = lake.state::<PointPlans>()?;
+    if let Some((v, p)) = plans.0.lock().unwrap().get(sql) {
         if *v == now {
             return Ok(p.clone());
         }
     }
     let p = point_of(lake, sql).await?.map(Arc::new);
-    let bytes = 64 + key.0.len() + key.1.len() + p.as_ref().map_or(0, |p| p.bytes());
-    let left = POINTS.lock().unwrap().put(key, (now, p.clone()), bytes);
+    let bytes = 64 + sql.len() + p.as_ref().map_or(0, |p| p.bytes());
+    let left = plans.0.lock().unwrap().put(sql.to_string(), (now, p.clone()), bytes);
     drop(left); // (after the lock)
     Ok(p)
 }
 
-type Points = ByteLru<(String, String), (u64, Option<Arc<Point>>)>;
-crate::per_node!(
-    /// The statements `point` worked out, by lake and statement, with the catalog version each was worked out at: the
-    /// newest 4096, each charged its statement and plan to the node's line, which takes them back when it needs the
-    /// memory (`points`).
-    static POINTS: Arc<Mutex<Points>> = Arc::new(Mutex::new(ByteLru::new(usize::MAX).with_count(4096))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+/// The statements `point` worked out on a lake, by statement, with the catalog version each was worked out at: the
+/// newest 4096, each charged its statement and plan to the lake's line, which takes them back when it needs the memory
+/// (`cache_bytes{cache="point_plans"}`).
+pub struct PointPlans(Arc<Mutex<ByteLru<String, (u64, Option<Arc<Point>>)>>>);
 
-/// The statements worked out as point queries, as the node's line counts them (`cache_bytes{cache="point_plans"}`).
-pub fn points() -> Arc<dyn Charged> { POINTS.clone() }
+impl crate::lake_state::LakeState for PointPlans {
+    const NAME: &'static str = "point_plans";
+    const ABOUT: &'static str = "the statements worked out as point queries, with the catalog version each was worked out at";
 
-type Tails = ByteLru<(String, String), Arc<Mutex<Tail>>>;
-crate::per_node!(
-    /// Each table's `Tail`, by lake and table: the newest 16 tables', each charged its index to the node's line, which
-    /// takes them back when it needs the memory (`tail_keys`).
-    static TAILS: Arc<Mutex<Tails>> = Arc::new(Mutex::new(ByteLru::new(usize::MAX).with_count(16))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+    fn make() -> Self { PointPlans(Arc::new(Mutex::new(ByteLru::new(usize::MAX).with_count(4096)))) }
 
-/// The log tails' keys `newest_in_log` indexes, as the node's line counts them (`cache_bytes{cache="tail_keys"}`).
-pub fn tail_keys() -> Arc<dyn Charged> { TAILS.clone() }
+    fn cache(self: Arc<Self>) -> Option<Arc<dyn Charged>> { Some(self.0.clone()) }
+}
+
+/// Each of a lake's tables' `Tail`, by table: the newest 16 tables', each charged its index to the lake's line, which
+/// takes them back when it needs the memory (`cache_bytes{cache="tail_keys"}`).
+pub struct TailKeys(Arc<Mutex<ByteLru<String, Arc<Mutex<Tail>>>>>);
+
+impl crate::lake_state::LakeState for TailKeys {
+    const NAME: &'static str = "tail_keys";
+    const ABOUT: &'static str = "each table's rows in the log since its files, indexed by key for lookups";
+
+    fn make() -> Self { TailKeys(Arc::new(Mutex::new(ByteLru::new(usize::MAX).with_count(16)))) }
+
+    fn cache(self: Arc<Self>) -> Option<Arc<dyn Charged>> { Some(self.0.clone()) }
+}
 
 async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
     use datafusion::sql::sqlparser::ast::*;
@@ -362,9 +370,10 @@ fn hashes(batch: &RecordBatch, keys: &[(&str, ScalarValue)]) -> Result<Vec<u64>>
 /// The log tail's newest row of the key, with the commit that wrote it and when (`Tail`).
 async fn newest_in_log(lake: &Lake, table: &str, meta: &TableMeta, keys: &[(&str, ScalarValue)]) -> Result<Option<(RecordBatch, u64, u64)>> {
     let types: Vec<_> = keys.iter().map(|(_, v)| v.data_type()).collect();
-    let id = (lake.url.clone(), table.to_string());
+    let id = table.to_string();
+    let tails = lake.state::<TailKeys>()?;
     let tail = {
-        let mut all = TAILS.lock().unwrap();
+        let mut all = tails.0.lock().unwrap();
         match all.get(&id).filter(|t| matches!(&*t.lock().unwrap(), t if t.tiered == meta.tiered && t.types == types)) {
             Some(t) => t.clone(),
             None => {
@@ -419,7 +428,7 @@ async fn newest_in_log(lake: &Lake, table: &str, meta: &TableMeta, keys: &[(&str
     // (its new size charged, after its own lock: the cache's is taken before a tail's. Unless the line took it back
     // meanwhile, or another lookup put a newer one: then it isn't kept)
     if let Some(bytes) = grown {
-        let mut all = TAILS.lock().unwrap();
+        let mut all = tails.0.lock().unwrap();
         let left = match all.peek(&id).is_some_and(|t| Arc::ptr_eq(t, &tail)) {
             true => all.put(id, tail.clone(), bytes),
             false => vec![],
@@ -633,6 +642,27 @@ mod tests {
                       "SELECT \"Name\" FROM kv WHERE id = 1", "SELECT _deleted FROM kv WHERE id = 1", "SELECT name || 'x' AS n FROM kv WHERE id = 1", "SELECT kv.* FROM kv WHERE id = 1"] {
             assert_eq!(read(other), None, "{other}");
         }
+    }
+
+    /// Each lake keeps its own point plans (step 2): a statement worked out on one lake of a process is not another's,
+    /// and it is charged to its own lake's line.
+    #[tokio::test]
+    async fn each_lake_keeps_its_own_point_plans() -> anyhow::Result<()> {
+        let dirs = [0, 1].map(|_| std::env::temp_dir().join(format!("pondra-two-points-{}", uuid::Uuid::new_v4())));
+        let a = Lake::open(dirs[0].to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let b = Lake::open(dirs[1].to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let (plans_a, plans_b) = (a.state::<PointPlans>()?, b.state::<PointPlans>()?);
+        assert!(Arc::ptr_eq(&plans_a, &a.state::<PointPlans>()?) && !Arc::ptr_eq(&plans_a, &plans_b), "one a lake, its own");
+        let sql = "SELECT v FROM kv WHERE k = 1";
+        let _ = plans_a.0.lock().unwrap().put(sql.to_string(), (1, None), 100);
+        assert!(plans_b.0.lock().unwrap().get(sql).is_none(), "lake b has lake a's plan");
+        assert!(a.cached_bytes().contains(&("point_plans", 100)), "on lake a's line: {:?}", a.cached_bytes());
+        assert!(!Arc::ptr_eq(&a.state::<TailKeys>()?.0, &b.state::<TailKeys>()?.0), "each lake its own tails' keys");
+        for (lake, dir) in [a, b].into_iter().zip(&dirs) {
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        Ok(())
     }
 
     #[test]

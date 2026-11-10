@@ -120,10 +120,10 @@ impl Need {
     }
 }
 
-/// Whether this node offers `need`.
-fn offered(need: Need) -> bool {
+/// Whether the lake's node offers `need`: a port to listen on is its own, once it serves (`NodeState::serving`).
+fn offered(lake: &Lake, need: Need) -> bool {
     match need {
-        Need::Listening => *crate::store::SERVING.borrow(),
+        Need::Listening => *lake.node.serving.borrow(),
         Need::Network => true,
     }
 }
@@ -238,16 +238,13 @@ impl Statements {
 /// `sql` as one of the section's statements, for `write::parse`: what it says (an extension's, for the leader to carry
 /// out; the core's, as `write::Stmt`), or why it is refused. None: it is none of theirs.
 pub(crate) fn matched(sql: &str) -> Option<crate::write::Stmt> {
-    matched_in(crate::registry::get(), sql, offered)
+    matched_in(crate::registry::get(), sql)
 }
 
-fn matched_in(r: &Registry, sql: &str, offered: fn(Need) -> bool) -> Option<crate::write::Stmt> {
+fn matched_in(r: &Registry, sql: &str) -> Option<crate::write::Stmt> {
     use crate::write::Stmt;
     let (s, mut said) = r.find::<Statements>()?.of(sql)?;
     let words = s.words.join(" ");
-    if let Some(need) = s.needs.iter().find(|n| !offered(**n)) {
-        return Some(Stmt::Refused("0A000", format!("{words} needs {}", need.word())));
-    }
     let read = match s.read {
         Read::Text(read) => read(sql).map(|Parsed { object, tree }| Stmt::Ddl(vec![crate::ddl::Ddl::Entry { words, object, tree }])),
         Read::Core(read) => read(&mut said),
@@ -267,6 +264,10 @@ pub(crate) async fn carry_out(lake: &Lake, words: &str, tree: Value) -> Result<V
 async fn carry_out_in(r: &Registry, lake: &Lake, words: &str, tree: Value) -> Result<Value> {
     // (a node of another build sent it: its extensions aren't all this one's)
     let s = r.find::<Statements>().and_then(|s| s.named(words)).with_context(|| format!("{words}: this node's build has no extension that adds it"))?;
+    // (the leader's lake's node: a statement that needs a port is refused where the node that would serve it is)
+    if let Some(need) = s.needs.iter().find(|n| !offered(lake, **n)) {
+        return Err(crate::codes::coded("0A000", format!("{words} needs {}", need.word())));
+    }
     match s.run {
         Run::Leader(f) => f(lake, tree).await,
         Run::Stmt => anyhow::bail!("{words} is the core's: it is carried out as the statement its reader gives"),
@@ -319,34 +320,33 @@ mod tests {
     #[tokio::test]
     async fn an_extensions_statement_is_found_by_its_words_and_carried_out() -> Result<()> {
         let r = Registry::build(&[&THINGS]);
-        let every = |_: Need| true;
-        let (words, object, tree) = entry(matched_in(&r, "/* a */ make thing Box;", every)).context("found")?;
+        let (words, object, tree) = entry(matched_in(&r, "/* a */ make thing Box;")).context("found")?;
         assert_eq!((words.as_str(), object.as_str()), ("MAKE THING", "box"));
-        let (words, ..) = entry(matched_in(&r, "-- the longer words win\nMAKE BIG THING crate", every)).context("found")?;
+        let (words, ..) = entry(matched_in(&r, "-- the longer words win\nMAKE BIG THING crate")).context("found")?;
         assert_eq!(words, "MAKE BIG THING");
-        assert!(matched_in(&r, "MAKE THINGS x", every).is_none(), "a word is whole");
-        assert_eq!(entry(matched_in(&r, "MAKE/* a */THING t", every)).context("found")?.0, "MAKE THING", "a first word ends where the tokenizer ends it");
-        assert!(matched_in(&r, "MAKER THING x", every).is_none(), "and is whole");
+        assert!(matched_in(&r, "MAKE THINGS x").is_none(), "a word is whole");
+        assert_eq!(entry(matched_in(&r, "MAKE/* a */THING t")).context("found")?.0, "MAKE THING", "a first word ends where the tokenizer ends it");
+        assert!(matched_in(&r, "MAKER THING x").is_none(), "and is whole");
         // (words are tokens: a comment between them, a name where the words hold `*`, quoted or dotted)
-        assert_eq!(entry(matched_in(&r, "make /* a */ big\n thing x", every)).context("found")?.0, "MAKE BIG THING");
+        assert_eq!(entry(matched_in(&r, "make /* a */ big\n thing x")).context("found")?.0, "MAKE BIG THING");
         for sql in ["MAKE box COPY", "make s.\"Box\" copy", "MAKE lake.s.t COPY now"] {
-            assert_eq!(entry(matched_in(&r, sql, every)).with_context(|| sql.to_string())?.0, "MAKE * COPY", "{sql}");
+            assert_eq!(entry(matched_in(&r, sql)).with_context(|| sql.to_string())?.0, "MAKE * COPY", "{sql}");
         }
-        assert!(matched_in(&r, "MAKE COPY", every).is_none(), "`*` is a name");
-        assert!(matched_in(&r, "MAKE 'box' COPY", every).is_none(), "a string is no name");
+        assert!(matched_in(&r, "MAKE COPY").is_none(), "`*` is a name");
+        assert!(matched_in(&r, "MAKE 'box' COPY").is_none(), "a string is no name");
         // (a word an entry beside it spells there is that entry's, as a keyword is: MAKE BIG …, never a thing named big)
-        assert!(matched_in(&r, "MAKE big COPY", every).is_none(), "BIG is MAKE BIG THING's word, not a name");
-        assert_eq!(entry(matched_in(&r, "MAKE \"big\" COPY", every)).context("found")?.0, "MAKE * COPY", "quoted, it is a name");
-        assert_eq!(entry(matched_in(&r, "MAKE bigger COPY", every)).context("found")?.0, "MAKE * COPY", "a word is whole");
+        assert!(matched_in(&r, "MAKE big COPY").is_none(), "BIG is MAKE BIG THING's word, not a name");
+        assert_eq!(entry(matched_in(&r, "MAKE \"big\" COPY")).context("found")?.0, "MAKE * COPY", "quoted, it is a name");
+        assert_eq!(entry(matched_in(&r, "MAKE bigger COPY")).context("found")?.0, "MAKE * COPY", "a word is whole");
         // (two names, each one whole name: dotted, quoted, both)
         for sql in ["MAKE s.t INTO \"a b\".c NOW", "make \"a b\".c into lake.s.t now;", "MAKE box INTO \"Other\" /* now */ NOW"] {
-            assert_eq!(entry(matched_in(&r, sql, every)).with_context(|| sql.to_string())?.0, "MAKE * INTO * NOW", "{sql}");
+            assert_eq!(entry(matched_in(&r, sql)).with_context(|| sql.to_string())?.0, "MAKE * INTO * NOW", "{sql}");
         }
         for sql in ["MAKE s.t INTO a b NOW", "MAKE s.t INTO NOW", "MAKE s.t INTO 'c' NOW", "MAKE INTO c NOW"] {
-            assert!(matched_in(&r, sql, every).is_none(), "{sql}: a name is one name");
+            assert!(matched_in(&r, sql).is_none(), "{sql}: a name is one name");
         }
-        assert!(matched_in(&r, "SELECT 1", every).is_none());
-        assert!(matches!(matched_in(&r, "MAKE THING", every), Some(Stmt::Invalid(e)) if e == "MAKE THING name"), "its parser's refusal is the answer");
+        assert!(matched_in(&r, "SELECT 1").is_none());
+        assert!(matches!(matched_in(&r, "MAKE THING"), Some(Stmt::Invalid(e)) if e == "MAKE THING name"), "its parser's refusal is the answer");
         let url = format!("memory://statements-{}", uuid::Uuid::new_v4().simple());
         let lake = Lake::open(&url, true, false, crate::node_state::NodeState::unhosted()).await?;
         assert_eq!(carry_out_in(&r, &lake, &words, tree).await?, json!({"made": "box", "big": false}));
@@ -355,15 +355,17 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn a_form_without_a_statements_need_refuses_it_by_name() {
+    #[tokio::test]
+    async fn a_statement_that_needs_a_port_is_refused_where_the_lake_has_none() -> Result<()> {
         let r = Registry::build(&[&THINGS]);
-        let page = |n: Need| n == Need::Network;
-        match matched_in(&r, "SERVE THING x", page) {
-            Some(Stmt::Refused("0A000", e)) => assert!(e.starts_with("SERVE THING needs a port to listen on, which this node doesn't have"), "{e}"),
-            _ => panic!("refused"),
-        }
-        assert!(entry(matched_in(&r, "MAKE THING x", page)).is_some(), "a statement that needs nothing runs on every form");
+        let (words, _, tree) = entry(matched_in(&r, "SERVE THING x")).context("found")?;
+        let url = format!("memory://statements-{}", uuid::Uuid::new_v4().simple());
+        let lake = Lake::open(&url, true, false, crate::node_state::NodeState::unhosted()).await?;
+        let e = carry_out_in(&r, &lake, &words, tree.clone()).await.unwrap_err();
+        assert!(e.to_string().starts_with("SERVE THING needs a port to listen on, which this node doesn't have"), "{e}");
+        lake.node.serving.send_replace(true);
+        assert_eq!(carry_out_in(&r, &lake, &words, tree).await?, json!({"made": "x", "big": false}));
+        Ok(())
     }
 
     /// An extension's statement has words of its own: none begins as one the core reads, whether the core reads it as
@@ -411,7 +413,7 @@ mod tests {
         assert_eq!(s.stand_ins(), 2);
         static CORE_THINGS: BuiltIn = BuiltIn { name: CORE, requires: &[], register: |r| r.section_mut::<Statements>().add(&CORE_OK) };
         let r = Registry::build(&[&CORE_THINGS, &THINGS]);
-        assert!(matches!(matched_in(&r, "keep /* its words */ core x", |_| true), Some(Stmt::Invalid(e)) if e == "a thing"), "the core's reader gives the statement");
+        assert!(matches!(matched_in(&r, "keep /* its words */ core x"), Some(Stmt::Invalid(e)) if e == "a thing"), "the core's reader gives the statement");
     }
 
     /// An entry holds at most two names, never first and never side by side: two names together are one statement's words

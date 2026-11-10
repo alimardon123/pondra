@@ -41,9 +41,9 @@ pub async fn links(lake: &Lake, base: &str, keys: &[String], who: &str) -> Resul
 
 /// The bucket's signer, made once from the environment's credentials (as the lake's store is).
 fn signer(scheme: &str, bucket: &str) -> Result<Arc<dyn Signer>> {
-    crate::per_node!(static MADE: Mutex<HashMap<String, Arc<dyn Signer>>> = Default::default());
+    static MADE: std::sync::LazyLock<Mutex<HashMap<String, Arc<dyn Signer>>>> = std::sync::LazyLock::new(Default::default); // (the environment's credentials: the process's)
     let at = format!("{scheme}://{bucket}");
-    if let Some(s) = MADE.lock().unwrap().get(&at) {
+    if let Some(s) = MADE.lock().unwrap_or_else(|e| e.into_inner()).get(&at) {
         return Ok(s.clone());
     }
     use object_store::{aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder};
@@ -52,7 +52,7 @@ fn signer(scheme: &str, bucket: &str) -> Result<Arc<dyn Signer>> {
         "gs" => Arc::new(GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket).build()?),
         _ => Arc::new(MicrosoftAzureBuilder::from_env().with_url(&at).build()?),
     };
-    MADE.lock().unwrap().insert(at, s.clone());
+    MADE.lock().unwrap_or_else(|e| e.into_inner()).insert(at, s.clone());
     Ok(s)
 }
 
