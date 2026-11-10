@@ -4290,7 +4290,7 @@ impl Stages {
             return now;
         }
         let mut s = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ms = now.saturating_duration_since(since).as_secs_f64() * 1e3;
+        let ms = now.duration_since(since).as_secs_f64() * 1e3;
         match s.1.iter_mut().find(|(n, _)| *n == stage) {
             Some((_, v)) => v.push(ms),
             None => s.1.push((stage, vec![ms])),
