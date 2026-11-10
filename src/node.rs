@@ -727,17 +727,18 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lif
                 joined.set_slug(slug);
             }
             let (following, refreshing) = (Arc::downgrade(&app.lake), Arc::downgrade(&app.lake));
-            let (http, auth) = (app.lake.node.net.client(crate::net::Policy::ENDPOINT), auth.to_string()); // (the join's sign-in alone: no token of ours)
+            let (from, auth) = (app.lake.node.clone(), auth.to_string()); // (the join's sign-in alone, no token of ours: `dial::Joined`)
             let ended = Arc::new(AtomicBool::new(false)); // (the sign-in ended: neither loop asks again)
             let (said, refreshed) = (ended.clone(), ended.clone());
-            let open = move || -> futures::future::BoxFuture<'static, Result<crate::fetch::Response, crate::members::Open>> {
-                let (http, url, auth, said) = (http.clone(), format!("{node}/cluster/log"), auth.clone(), said.clone());
+            let open = move || -> futures::future::BoxFuture<'static, Result<crate::dial::Reply, crate::members::Open>> {
+                let (from, node, auth, said) = (from.clone(), node.clone(), auth.clone(), said.clone());
                 Box::pin(async move {
-                    match crate::fetch::send(http.get(url).header(reqwest::header::AUTHORIZATION, auth)).await {
-                        Ok(r) if r.status().is_success() => Ok(r),
+                    let page = crate::dial::Joined { node: &node, auth: &auth };
+                    match crate::dial::Dial::call(&page, &from, &node, crate::dial::Call::get("/cluster/log")).await {
+                        Ok(r) if r.ok() => Ok(r),
                         // (the sign-in ended: the stream is not followed again)
-                        Ok(r) if matches!(r.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) => {
-                            eprintln!("this page's sign-in at its node ended ({}): it no longer follows the lake", r.status());
+                        Ok(r) if matches!(r.status, 401 | 403) => {
+                            eprintln!("this page's sign-in at its node ended ({}): it no longer follows the lake", r.status);
                             said.store(true, SeqCst);
                             Err(crate::members::Open::Stop)
                         }

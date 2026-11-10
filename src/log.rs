@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -1357,22 +1357,11 @@ pub fn decode_part(ipc: &[u8]) -> Result<Vec<RecordBatch>> {
     }).collect()
 }
 
-/// Milliseconds since the Unix epoch: the machine's clock on a node, the browser's on a page.
-pub fn now_ms() -> u64 {
-    now_us() / 1000
-}
+/// Milliseconds since the Unix epoch: the machine's clock on a node, the browser's on a page (`clock::wall_ms`).
+pub fn now_ms() -> u64 { crate::clock::wall_ms() }
 
-/// Microseconds since the Unix epoch.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn now_us() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64
-}
-
-/// (a page's clock counts whole milliseconds)
-#[cfg(target_arch = "wasm32")]
-pub fn now_us() -> u64 {
-    tokio::clock::now_ms() * 1000
-}
+/// Microseconds since the Unix epoch (`clock::wall_us`).
+pub fn now_us() -> u64 { crate::clock::wall_us() }
 
 #[cfg(test)]
 mod tests {
