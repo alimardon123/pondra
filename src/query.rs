@@ -1595,7 +1595,9 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
     lake.caught_up().await?; // (a node that just started: not from an older catalog than its leader's)
     let upto = upto.or_else(crate::txn::snapshot); // (in a transaction: as of its snapshot, its writes over it)
     use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
-    let ctx = crate::set::apply(lake.session()).await?; // (the session's `SET datafusion.…`)
+    // (a principal under `MAX_MEMORY`: its statements' memory through its own pool over the lake's, `users::capped_session`)
+    let session = crate::users::capped_session(lake, scope).unwrap_or_else(|| lake.session());
+    let ctx = crate::set::apply(session).await?; // (the session's `SET datafusion.…`)
     ctx.state_ref().write().config_mut().set_extension(Arc::new(reading)); // (held by the session, and by every task planned from it)
     scope.onto(&ctx); // (whose it is, for everything planned in it: `Scope::of_session`)
     crate::udf::register(lake, &ctx).await?; // the lake's own functions (`POST /functions/…`)
@@ -1903,7 +1905,7 @@ pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(node: &crat
     let mut state = ctx.state(); // (it copies the options: `frugal` changes only the copy's)
     if stopped {
         // (the pool never refused the first try, so the retry holds half its room: else it grows as far, and is stopped again)
-        let pool = crate::ledger::Halved::new(state.runtime_env().memory_pool.clone());
+        let pool = crate::ledger::Capped::halved(state.runtime_env().memory_pool.clone());
         let rt = RuntimeEnvBuilder::from_runtime_env(state.runtime_env()).with_memory_pool(pool).build_arc()?;
         state = datafusion::execution::SessionStateBuilder::new_from_existing(state).with_runtime_env(rt).build();
     }

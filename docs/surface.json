@@ -1529,6 +1529,7 @@
    "statement_timeout Utf8",
    "read_only Boolean",
    "max_rows Int64",
+   "max_memory Utf8",
    "created Timestamp(\u00b5s, \"UTC\")"
   ],
   "pondra.variables": [
