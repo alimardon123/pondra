@@ -118,8 +118,10 @@ async fn apart<T>(f: impl Future<Output = Result<T, String>>, _: &mut Option<tok
     f.await
 }
 
-// The requests running through [`work`], by id (ids grow with time, so the first is the oldest).
-crate::per_node!(static RUNNING: std::sync::Mutex<std::collections::BTreeMap<u64, crate::oom::Running>> = Default::default());
+// The requests running through [`work`] in this process, by id (ids grow with time, so the first is the oldest): every
+// node's, as the process has one memory watch, which stops the one that grew its memory whatever node it is on (`oom.rs`),
+// and one queries' runtime, which a long one of any node sends the ones after it to (each says its node's counters).
+static RUNNING: std::sync::Mutex<std::collections::BTreeMap<u64, crate::oom::Running>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Is a request running through [`work`]: the watch has something to look at (`oom::start` waits on it).
 pub(crate) fn running() -> bool {

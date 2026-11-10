@@ -12,6 +12,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// When a lake's retention last ran (`App::retain`: every 10 s at most).
+#[derive(Default)]
+pub struct Retention {
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl crate::lake_state::LakeState for Retention {
+    const NAME: &'static str = "retention";
+    const ABOUT: &'static str = "when its retention last ran (every 10 s at most)";
+    fn make() -> Self { Retention::default() }
+}
+
 #[derive(Clone)]
 pub struct App {
     pub lake: Arc<Lake>,
@@ -327,12 +339,12 @@ impl App {
     /// path to fresh Delta versions. A round with nothing to tier runs it too, so the log an idle lake kept goes (its
     /// first read of a table with an old mark read every segment kept since: 15,400 records at 20,000 tables).
     async fn retain(&self) -> anyhow::Result<()> {
-        crate::per_node!(static EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
+        let retention = self.lake.state::<Retention>()?;
         let now = crate::log::now_ms();
-        if now - EXPIRED.load(std::sync::atomic::Ordering::Relaxed) < 10_000 {
+        if now - retention.last.load(std::sync::atomic::Ordering::Relaxed) < 10_000 {
             return Ok(());
         }
-        EXPIRED.store(now, std::sync::atomic::Ordering::Relaxed);
+        retention.last.store(now, std::sync::atomic::Ordering::Relaxed);
         crate::tier::refresh(&self.lake, &self.tables).await?; // (the round's briefs, as of now: what it tiered and merged)
         let briefs = self.tables.lock().await.clone();
         crate::tier::expire_with(&self.lake, self.retain_ms, &briefs, Some(&mut *self.log_pass.lock().await)).await

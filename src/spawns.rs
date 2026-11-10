@@ -4,8 +4,8 @@
 //! queries' runtime the same ([`Tasks::aside`]). A node's stop ends them all ([`Tasks::abort_all`], ADR-061 §4). Also here:
 //! the memory watch's thread ([`alone`]), a close the stop must not cut ([`untracked`]) and the runtimes ([`runtime`]).
 //! Every floor starts its tasks here, so it is the base's. The requests' half (a door's panic answered as an error, the
-//! memory watch's stops) is `panics.rs`'s, in the engine. A loop that serves the node's statics, with no node in hand, is
-//! theirs ([`for_statics`]): it ends as they are set back.
+//! memory watch's stops) is `panics.rs`'s, in the engine. A loop that serves a node's or a lake's state, with no node in
+//! hand, is that state's ([`Loops`]): it ends as the state goes.
 use futures::FutureExt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -55,24 +55,32 @@ pub fn runtime() -> tokio::runtime::Builder {
 
 /// Start a task the node's stop must not end (its list's `abort_all`), which ends by itself: a catalog's close, or a guest's
 /// open that closes after (`node.rs`). Cut midway, a close leaves its flush half done and an open its reader's poller
-/// running for ever.
+/// running for ever. (Also one that ends by itself, soon, and serves no node: a Python worker's error reader, which ends
+/// as its worker does, or a provider's keys fetched once.)
 pub fn untracked<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
     tokio::spawn(f)
 }
 
-/// Start a loop that serves the node's statics (`per_node!`: its sessions' reaper, its Python pools', its sign-in keys'
-/// refresh), whose callers have no node in hand: it is the statics' own, and ends as they are
-/// set back (`reset::reset`, a node's stop's last step). It runs as nobody (no principal, not the node's: it reads no
-/// table), and its panic is its own.
-pub fn for_statics<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
-    let t = tokio::spawn(f);
-    STATICS.lock().unwrap_or_else(|e| e.into_inner()).track(t.abort_handle());
-    t
+/// The loops that serve a state with no node in hand (a node's sessions' reaper, a lake's Python's), kept by that state
+/// and ended as it goes (`Drop`), as a node's tasks end with its stop: the lake goes with its node, and its states with
+/// it. A loop holds its state weakly (a strong hold would keep it, and the loop, for ever). Each runs as nobody (no
+/// principal, not the node's: it reads no table), and its panic is its own.
+#[derive(Default)]
+pub struct Loops(std::sync::Mutex<Started>);
+
+impl Loops {
+    /// Starts `f`, ended when this list goes, if it hasn't ended by itself.
+    pub fn spawn<T: Send + 'static>(&self, f: impl Future<Output = T> + Send + 'static) {
+        let t = tokio::spawn(f);
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).track(t.abort_handle());
+    }
 }
 
-crate::per_node!(static STATICS: std::sync::Mutex<Started> = Default::default(); clear = |s| s.lock().unwrap_or_else(|e| e.into_inner()).end());
+impl Drop for Loops {
+    fn drop(&mut self) { self.0.get_mut().unwrap_or_else(|e| e.into_inner()).end() }
+}
 
-/// What a list started and hasn't seen end (a node's [`Tasks`], the statics' loops).
+/// What a list started and hasn't seen end (a node's [`Tasks`], a state's [`Loops`]).
 #[derive(Default)]
 struct Started {
     tasks: Vec<tokio::task::AbortHandle>,
