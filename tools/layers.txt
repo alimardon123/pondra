@@ -132,6 +132,7 @@ lifted engine
 literals engine
 locks engine
 median engine
+morsels engine
 multiply engine
 once engine
 one_row engine
