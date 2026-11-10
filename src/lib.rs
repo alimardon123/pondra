@@ -25,7 +25,6 @@ pub mod registry;
 pub mod settings;
 // A section read as a table: every `pondra.*` list the registry gives (`pondra.settings`, `pondra.kinds`, …).
 pub mod lists;
-pub mod reset;
 pub mod fsum;
 pub mod fvar;
 pub mod avg;
@@ -343,6 +342,8 @@ pub(crate) fn built_in() -> &'static [&'static dyn registry::Extension] {
         &pyfn::PYTHON,
         #[cfg(feature = "lake")]
         &hosted::HOSTED,
+        #[cfg(feature = "doors")]
+        &flight::FLIGHT,
     ];
     BUILT_IN
 }

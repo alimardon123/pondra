@@ -96,13 +96,22 @@ async fn own(lake: &Lake, sql: &str, scope: &Scope) -> Result<Own> {
 
 // The lake's views with measures: what `measure_views` answers.
 
+/// The lake's views with measures, as of a catalog version (`own_measure_views`).
+#[derive(Default)]
+pub struct MeasureViews(Mutex<Option<(u64, Arc<HashMap<String, Arc<Definition>>>)>>);
+
+impl crate::lake_state::LakeState for MeasureViews {
+    const NAME: &'static str = "measure_views";
+    const ABOUT: &'static str = "its measure views, as of a catalog version";
+    fn make() -> Self { MeasureViews::default() }
+}
+
 /// The views with measures a lake holds, by local name (`sales`, or `crm.sales`). Read again only after a commit, as
 /// `routines::listed` is: every query asks.
 async fn own_measure_views(lake: &Lake) -> Result<Arc<HashMap<String, Arc<Definition>>>> {
-    type Seen = Mutex<HashMap<String, (u64, Arc<HashMap<String, Arc<Definition>>>)>>;
-    crate::per_node!(static SEEN: Seen = Default::default());
+    let seen = lake.state::<MeasureViews>()?;
     let version = lake.cat.version();
-    if let (Some(v), Some((at, all))) = (version, SEEN.lock().unwrap().get(&lake.url)) {
+    if let (Some(v), Some((at, all))) = (version, seen.0.lock().unwrap().as_ref()) {
         if *at == v {
             return Ok(all.clone());
         }
@@ -117,7 +126,7 @@ async fn own_measure_views(lake: &Lake) -> Result<Arc<HashMap<String, Arc<Defini
     }
     let all = Arc::new(out);
     if let Some(v) = version {
-        SEEN.lock().unwrap().insert(lake.url.clone(), (v, all.clone()));
+        *seen.0.lock().unwrap() = Some((v, all.clone()));
     }
     Ok(all)
 }

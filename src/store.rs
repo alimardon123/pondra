@@ -3286,13 +3286,6 @@ pub fn trace_since(what: &str, since: datafusion::common::instant::Instant) {
     }
 }
 
-crate::per_node!(
-    /// Has the node begun to serve? (Then the catalog's upkeep starts: `kv::slate`.)
-    pub(crate) static SERVING: watch::Sender<bool> = watch::Sender::new(false));
-
-/// The node serves now (`main.rs`).
-pub fn serving() { SERVING.send_replace(true); }
-
 /// DataFusion's caches of Parquet footers and of files' statistics (`Lake::kept`).
 type Footers = datafusion::execution::cache::default_cache::DefaultCache<object_store_df::path::Path, datafusion::execution::cache::cache_manager::CachedFileMetadataEntry>;
 type FileStatistics = datafusion::execution::cache::default_cache::DefaultCache<datafusion::execution::cache::TableScopedPath, datafusion::execution::cache::cache_manager::CachedFileMetadata>;
@@ -4154,11 +4147,11 @@ impl Catalog {
         for h in hooks {
             let mut all: BTreeMap<String, Vec<u8>> = BTreeMap::new();
             for p in h.reads {
-                for (k, v) in self.kv.scan_whole(range_of(p)).await.map_err(|e| self.fenced(e))? {
+                for (k, v) in self.entries_under(p, *id).await? {
                     all.extend((h.derive)(&k, &v));
                 }
             }
-            let held = self.kv.scan_whole(range_of(h.records)).await.map_err(|e| self.fenced(e))?;
+            let held = self.entries_under(h.records, *id).await?;
             deletes.extend(held.keys().filter(|k| !all.contains_key(*k)).cloned());
             puts.extend(all.into_iter().filter(|(k, v)| held.get(k).is_none_or(|b| b.as_ref() != v.as_slice())).map(|(k, v)| (k, Bytes::from(v))));
         }
@@ -4175,6 +4168,24 @@ impl Catalog {
         }
         self.whole.store(true, Relaxed);
         Ok(())
+    }
+
+    /// Every entry under `prefix`, for `keep_records` under the write order's lock (`next`: the next write's number): from
+    /// the catalog in memory when it holds every write before that (a leader's, `open`: a write is in it before it is
+    /// `durable`), else from the store. At 100,000 tables the store's two reads were most of the records' time.
+    async fn entries_under(&self, prefix: &str, next: u64) -> Result<BTreeMap<String, Bytes>> {
+        if self.in_memory(prefix, next) {
+            let end = format!("{}0", prefix.strip_suffix('/').unwrap_or(prefix)); // (as `range_of`)
+            let o = self.overlay.lock().unwrap();
+            return Ok(o.range(prefix.to_string()..end).filter_map(|(k, (_, v))| Some((k.clone(), v.clone()?))).collect());
+        }
+        self.kv.scan_whole(range_of(prefix)).await.map_err(|e| self.fenced(e))
+    }
+
+    /// Does the catalog in memory hold every entry under `prefix` as of every write before `next` (`entries_under`)? Not
+    /// inline data, which a leader reads from its store.
+    fn in_memory(&self, prefix: &str, next: u64) -> bool {
+        self.mirror.load(Relaxed) && !prefix.starts_with("d/") && *self.durable.borrow() + 1 >= next
     }
 
     /// Are the catalog hooks' records whole and durable here (`keep_records`), so a reader may take them for the entries
@@ -5055,6 +5066,53 @@ pub(crate) mod tests {
 
         reader.cat.close().await?;
         writer.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A leader makes its catalog hooks' records whole from its catalog in memory (`keep_records`, `entries_under`): what
+    /// it reads there is what its store holds, every write before included, and the records it keeps are those the
+    /// store's entries make, a record no entry makes any more gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_leader_keeps_its_records_from_its_catalog_in_memory() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-kept-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let hooks = catalog_hooks();
+        assert!(!hooks.is_empty(), "the engine's folder records (`ddl::folder_hook`)");
+        let entry = |i: usize| serde_json::json!({"folder": format!("f{}", i % 700), "shares": if i % 5 == 0 { vec![format!("s{i}")] } else { vec![] }}).to_string().into_bytes();
+        for round in 0..3 {
+            // (each round a flushed file of its own: the later ones move a third of the tables and drop an eleventh)
+            let mut puts: Vec<_> = (0..2000).filter(|i| round == 0 || i % 3 == round).map(|i| (format!("t/k{i:05}"), entry(i + round))).collect();
+            let deletes: Vec<String> = (0..2000).filter(|i| round > 0 && i % 11 == round).map(|i| format!("t/k{i:05}")).collect();
+            if round == 1 {
+                puts.push(("dt/gone/7".to_string(), br#"{"meta": {"folder": "kept"}, "deleted": {}}"#.to_vec())); // (a dropped table, kept)
+                puts.extend(hooks.iter().map(|h| (format!("{}stale/t/old", h.records), b"\"own\"".to_vec()))); // (no entry makes it now)
+            }
+            lake.cat.commit(puts, &deletes).await?;
+            lake.cat.checkpoint().await?;
+        }
+        let next = *lake.cat.order.lock().await;
+        lake.cat.durable.subscribe().wait_for(|d| *d + 1 >= next).await?; // (a write is acknowledged a moment before `durable` says so)
+        for p in hooks.iter().flat_map(|h| h.reads.iter().copied().chain([h.records])) {
+            assert!(lake.cat.in_memory(p, next), "{p}: a leader reads it in memory, every write before in it");
+            assert_eq!(lake.cat.entries_under(p, next).await?, lake.cat.kv.scan_whole(range_of(p)).await?, "{p}: in memory as in the store");
+        }
+        assert!(!lake.cat.in_memory("d/", next), "inline data isn't in a leader's memory");
+        assert!(!lake.cat.in_memory("t/", next + 1), "nor a write it hasn't committed");
+
+        lake.cat.keep_records().await?;
+        for h in hooks {
+            let mut want = BTreeMap::new();
+            for p in h.reads {
+                for (k, v) in lake.cat.kv.scan(range_of(p), false).await? {
+                    want.extend((h.derive)(&k, &v));
+                }
+            }
+            let kept: BTreeMap<String, Vec<u8>> = lake.cat.kv.scan(range_of(h.records), false).await?.into_iter().map(|(k, v)| (k, v.to_vec())).collect();
+            assert!(want.len() > 1500, "{}: {} records", h.name, want.len());
+            assert_eq!(kept, want, "{}: the records the store's entries make", h.name);
+        }
+        lake.cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

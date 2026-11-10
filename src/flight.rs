@@ -438,12 +438,13 @@ fn rows_of(w: Worded, got: Answer<Encoded>) -> Result<Vec<RecordBatch>, Status> 
 }
 
 /// A script, a CALL or a write with RETURNING, as a statement's info: run now, as every door runs a statement, and its
-/// answer kept for the ticket to read back (`kept:`, `KEPT`, until `KEPT_FOR`). The answer counts in the query memory while
+/// answer kept for the ticket to read back (`kept:`, `Kept`, until `KEPT_FOR`). The answer counts in the query memory while
 /// it is kept. The info's schema is the answer's.
 async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<String>, descriptor: FlightDescriptor) -> Result<Response<FlightInfo>, Status> {
     let pool = app.lake.rt.memory_pool.clone();
     let (app, sql, w) = (app.clone(), sql.to_string(), Worded::of(&who.scope));
-    let batches = worked(w, app.lake.node.clone(), crate::temp::named(&app.lake, txn), async move {
+    let lake = app.lake.clone(); // (the answer is kept in this lake: its ticket is read at this lake's doors)
+    let batches = worked(w, lake.clone(), crate::temp::named(&app.lake, txn), async move {
         let req = crate::routines::Request { sql, ..Default::default() };
         let how = How { job: None, spread: None, after: None, stale: None };
         rows_of(w, statement::run(&app, req, how, who, &FlightWire).await.map_err(w.err())?)
@@ -453,7 +454,8 @@ async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<Strin
     // (a read token's script could keep answers that no ticket reads: counted here, they are bounded by the query memory)
     let reserved = crate::query::kept_memory(&pool, &batches).ok_or_else(|| w.status(crate::query::too_big(crate::query::room_of(&pool))))?;
     let id = uuid::Uuid::new_v4().simple().to_string();
-    KEPT.lock().unwrap().insert(id.clone(), (batches, std::time::Instant::now(), reserved));
+    let answers = lake.state::<Kept>().map_err(w.err())?;
+    answers.0.lock().unwrap().insert(id.clone(), (batches, std::time::Instant::now(), reserved));
     let ticket = TicketStatementQuery { statement_handle: format!("kept:{id}").into_bytes().into() };
     info(w, &schema, ticket.as_any().encode_to_vec(), descriptor)
 }
@@ -472,7 +474,9 @@ fn rows_schema() -> Schema { Schema::new(vec![Field::new("rows", DataType::Int64
 async fn answer(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown, Status> {
     if let Some(id) = sql.strip_prefix("kept:") {
         // (the entry's memory goes with it: the batches stream out from here, as a query's answer does once it is returned)
-        let Some((batches, _, _)) = KEPT.lock().unwrap().remove(id) else { return Err(refused("34000", "that answer was read already, or is gone")) };
+        // (another lake's answers are not this lake's: a ticket read at its door finds none)
+        let taken = app.lake.state::<Kept>().ok().and_then(|answers| answers.0.lock().unwrap().remove(id));
+        let Some((batches, _, _)) = taken else { return Err(refused("34000", "that answer was read already, or is gone")) };
         return Ok(Flown::Batches(Arc::new(first_announced(&batches)), batches));
     }
     if let Some(n) = sql.strip_prefix("rows:").and_then(|n| n.parse::<i64>().ok()) {
@@ -487,11 +491,13 @@ async fn answer(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown
 /// caller (`auth::carried`, which a spawned task would lose), and through `panics::work`, where the memory
 /// watch (`oom.rs`) may stop a query that grew the node, and a long one moves to the queries' runtime
 /// (invariant 231). A statement the node stopped for memory fails its transaction, as on HTTP and Postgres.
-async fn worked<T: Send + 'static>(w: Worded, node: Arc<crate::node_state::NodeState>, session: Option<crate::temp::Named>, f: impl std::future::Future<Output = Result<T, Status>> + Send + 'static) -> Result<T, Status> {
-    prune_kept(); // (every Flight call that runs work lets go of the kept answers that expired, not only a script's)
+async fn worked<T: Send + 'static>(w: Worded, lake: Arc<crate::store::Lake>, session: Option<crate::temp::Named>, f: impl std::future::Future<Output = Result<T, Status>> + Send + 'static) -> Result<T, Status> {
+    if let Ok(answers) = lake.state::<Kept>() {
+        prune_kept(&answers); // (every Flight call that runs work lets go of the kept answers that expired, not only a script's)
+    }
     let failing = session.clone();
     let f = crate::auth::carried(in_session(session, f));
-    match crate::panics::work(&node, true, f).await {
+    match crate::panics::work(&lake.node, true, f).await {
         Ok(out) => out,
         Err(m) => {
             if m == crate::oom::OOM {
@@ -514,12 +520,12 @@ enum Sent {
 /// A statement's answer as Flight data. Its work (`f`, which runs in `query::PIECES`, so a query may hand its answer to the
 /// stream in pieces as its plan makes them) is `worked` as every statement is, and the answer is then its whole form
 /// (`whole`, or `sent_as_kept` for the bytes the results cache keeps) or its pieces (`piece_stream`).
-async fn answered<F>(w: Worded, node: Arc<crate::node_state::NodeState>, session: Option<crate::temp::Named>, f: F) -> Result<Out<FlightData>, Status>
+async fn answered<F>(w: Worded, lake: Arc<crate::store::Lake>, session: Option<crate::temp::Named>, f: F) -> Result<Out<FlightData>, Status>
 where
     F: std::future::Future<Output = Result<Flown, Status>> + Send + 'static,
 {
-    let held = node.clone(); // (the body's count, and the rest of the statement's, are this node's)
-    let sent = worked(w, node, session, async move {
+    let held = lake.node.clone(); // (the body's count, and the rest of the statement's, are this node's)
+    let sent = worked(w, lake, session, async move {
         let (hand, mut handed) = tokio::sync::oneshot::channel();
         // (`worked` gives this future its transaction's session and who asked, once for the statement. When its answer is handed
         // over, the rest runs aside: then those two go on it, and only then, as an HTTP request's do)
@@ -627,17 +633,26 @@ fn piece_stream(w: Worded, h: crate::query::Handed, busy: crate::node_state::Bus
     }
 }
 
-crate::per_node!(
-    /// A script's or CALL's answer, run when its flight was asked for, until its ticket reads it (`KEPT_FOR`), with the
-    /// query memory its batches hold while it is kept.
-    static KEPT: std::sync::Mutex<std::collections::HashMap<String, (Vec<RecordBatch>, std::time::Instant, MemoryReservation)>> = Default::default());
+/// A script's or CALL's answer, run when its flight was asked for, until its ticket reads it (`KEPT_FOR`), with the query
+/// memory its batches hold while it is kept. One lake's: a ticket read at another lake's door finds none (`answer`).
+#[derive(Default)]
+pub struct Kept(std::sync::Mutex<std::collections::HashMap<String, (Vec<RecordBatch>, std::time::Instant, MemoryReservation)>>);
+
+impl crate::lake_state::LakeState for Kept {
+    const NAME: &'static str = "flight_answers";
+    const ABOUT: &'static str = "the answers of scripts and CALLs, kept for their Flight tickets to read until they expire";
+    fn make() -> Self { Kept::default() }
+}
+
+/// Flight, as a door: what its lakes keep (`Kept`).
+pub static FLIGHT: crate::registry::BuiltIn = crate::registry::BuiltIn { name: "flight", requires: &[], register: |r| r.section_mut::<crate::lake_state::Registered>().add::<Kept>() };
 
 /// How long a kept answer waits for its ticket to read it.
 const KEPT_FOR: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Lets go of the kept answers older than `KEPT_FOR`, and with them their memory. `worked` calls it, so every Flight call that
 /// runs work does.
-fn prune_kept() { KEPT.lock().unwrap().retain(|_, (_, at, _)| at.elapsed() < KEPT_FOR); }
+fn prune_kept(answers: &Kept) { answers.0.lock().unwrap().retain(|_, (_, at, _)| at.elapsed() < KEPT_FOR); }
 
 /// A write sent as SQL: a CREATE, INSERT, UPDATE, DELETE or ALTER (or a CALL). Returns the rows written. It runs as every
 /// door runs a statement (`statement::run`): its `$name`s bound from the session (a Flight transaction's `DECLARE $x` is
@@ -959,7 +974,7 @@ impl FlightSqlService for Sql {
         if crate::write::parse(&read).is_some() {
             // A write sent as a query (DB-API's `execute`): done now; the ticket reads back the count.
             let (app, sql) = (self.0.clone(), q.query.clone());
-            let rows = worked(w, app.lake.node.clone(), crate::temp::named(&app.lake, session), async move { write(&app, who, &sql).await }).await?;
+            let rows = worked(w, app.lake.clone(), crate::temp::named(&app.lake, session), async move { write(&app, who, &sql).await }).await?;
             let ticket = TicketStatementQuery { statement_handle: format!("rows:{rows}").into_bytes().into() };
             return info(w, &crate::answer::arrow_schema(&rows_schema()), ticket.as_any().encode_to_vec(), req.into_inner());
         }
@@ -980,7 +995,7 @@ impl FlightSqlService for Sql {
         let who = crate::routines::Who::signed(caller(&req), role, false);
         let session = in_txn(crate::temp::sessions(&self.0.lake).as_deref(), who.name(), txn)?;
         // (boxed: a statement's future is large, and each layer of `answered`'s and `worked`'s would copy it by value)
-        Ok(Response::new(answered(w, app.lake.node.clone(), crate::temp::named(&app.lake, session), Box::pin(async move { answer(&app, &sql, who).await })).await?))
+        Ok(Response::new(answered(w, app.lake.clone(), crate::temp::named(&app.lake, session), Box::pin(async move { answer(&app, &sql, who).await })).await?))
     }
 
     async fn do_action_begin_transaction(&self, _: ActionBeginTransactionRequest, req: Request<Action>) -> Result<ActionBeginTransactionResult, Status> {
@@ -1006,7 +1021,7 @@ impl FlightSqlService for Sql {
         // (no statement text: COMMIT and ROLLBACK take none, only BEGIN's modes do)
         let (app, w) = (self.0.clone(), worded(&req));
         let home = crate::temp::named(&app.lake, Some(session));
-        let out = worked(w, app.lake.node.clone(), home.clone(), async move { crate::txn::protocol(&app, word).await.map_err(w.err()) }).await;
+        let out = worked(w, app.lake.clone(), home.clone(), async move { crate::txn::protocol(&app, word).await.map_err(w.err()) }).await;
         // (the session ends with its transaction, committed or not)
         if let Some(n) = &home {
             n.at.end(&n.name);
@@ -1024,7 +1039,7 @@ impl FlightSqlService for Sql {
         let (app, sql) = (self.0.clone(), cmd.query.clone());
         let who = crate::routines::Who::signed(caller(&req), role, false);
         let session = in_txn(crate::temp::sessions(&app.lake).as_deref(), who.name(), cmd.transaction_id.as_deref())?;
-        worked(Worded::of(&who.scope), app.lake.node.clone(), crate::temp::named(&app.lake, session), async move { write(&app, who, &sql).await }).await
+        worked(Worded::of(&who.scope), app.lake.clone(), crate::temp::named(&app.lake, session), async move { write(&app, who, &sql).await }).await
     }
 
     async fn do_put_statement_ingest(&self, cmd: CommandStatementIngest, req: Request<PeekableFlightDataStream>) -> Result<i64, Status> {
@@ -1263,7 +1278,7 @@ impl FlightService for Door {
                 (Some(sql), _) => {
                     let app = app.clone();
                     let who = crate::routines::Who::signed(signed, role, false);
-                    Ok(Response::new(answered(w, app.lake.node.clone(), None, Box::pin(async move { query(&app, &sql, who).await })).await?))
+                    Ok(Response::new(answered(w, app.lake.clone(), None, Box::pin(async move { query(&app, &sql, who).await })).await?))
                 }
                 (None, Some(table)) => {
                     let name = crate::auth::catalog_name(&table);
