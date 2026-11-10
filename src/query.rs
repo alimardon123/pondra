@@ -1698,7 +1698,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
             None => crate::runs::no_runs()?,
         };
         system.register_table("runs".into(), runs)?;
-        if crate::audit::check(&text)? {
+        if crate::audit::check(&text, scope)? {
             // (a superuser's only: `audit.rs`)
             let audit = match lake.cat.meta(&crate::store::table_key(crate::audit::TABLE)).await? {
                 Some(meta) => named(&ctx, table_view(lake, &ctx, crate::audit::TABLE, &meta, named_sys, upto).await?, &meta, false)?,
@@ -1712,7 +1712,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
                 Some(meta) => named(&ctx, table_view(lake, &ctx, crate::history::TABLE, &meta, named_sys, upto).await?, &meta, false)?,
                 None => crate::history::empty()?,
             };
-            let history = crate::history::visible(&ctx, history)?;
+            let history = crate::history::visible(&ctx, history, scope)?;
             if text.to_lowercase().contains("pondra.learned") {
                 system.register_table("learned".into(), crate::learned::table(&ctx, history.clone()).await?)?;
             }

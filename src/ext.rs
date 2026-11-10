@@ -1519,8 +1519,8 @@ fn made(name: &str, mut params: BTreeMap<String, String>) -> Result<Secret> {
 /// admin or the node's owner reads with its own keys, on the public internet: not with the node's
 /// credentials (S37), not a topic (its brokers name others to connect to), and not an address of
 /// the node's own network (`net::Policy::Public`, S6).
-pub fn temporary(name: &str, params: BTreeMap<String, String>) -> Result<Secret> {
-    let trusted = owner() || crate::auth::current().is_none_or(|p| p.role >= crate::auth::Role::Admin);
+pub fn temporary(name: &str, params: BTreeMap<String, String>, by: &crate::auth::Principal) -> Result<Secret> {
+    let trusted = owner() || by.role >= crate::auth::Role::Admin;
     if !trusted {
         let chain = params.get("provider").is_some_and(|p| p.eq_ignore_ascii_case("credential_chain"));
         ensure!(!chain, "PROVIDER credential_chain reads with the node's own credentials, which only an admin lends: CREATE SECRET {name} (…, PROVIDER credential_chain, SCOPE '…') and GRANT USAGE ON SECRET {name}");

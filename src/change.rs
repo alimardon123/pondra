@@ -324,14 +324,14 @@ impl Merge {
     /// name, with the key in it, as wide as the statement's columns; and a SET of columns the table has, but not the key,
     /// `_deleted` or a system name. INSERT OR REPLACE's empty SET is every given column but the key's, as its rows give
     /// them; a SET that is empty then is DO NOTHING.
-    pub fn point_upsert(&self, name: &str, stored: &TableMeta) -> Option<PointUpsert> {
+    pub fn point_upsert(&self, name: &str, stored: &TableMeta, scope: &crate::rights::Scope) -> Option<PointUpsert> {
         let u = self.upsert.as_ref()?;
         if self.alias().eq_ignore_ascii_case("excluded") {
             return None; // (`txn::joined` names the old row by the alias: a name the proposed row's `excluded` can't share)
         }
         let plain = |c: &str| c != "_deleted" && !crate::text::NAMES.contains(&c) && stored.columns().any(|(n, _)| n == c);
         let distinct = |cs: &[String]| cs.iter().enumerate().all(|(i, c)| !cs[..i].contains(c));
-        if !crate::txn::point_table(name, stored) || stored.ttl.is_some() || !stored.ids || crate::constraints::checked(stored) || !crate::rights::scope().whole() {
+        if !crate::txn::point_table(name, stored) || stored.ttl.is_some() || !stored.ids || crate::constraints::checked(stored) || !scope.whole() {
             return None;
         }
         let width = u.row?;
