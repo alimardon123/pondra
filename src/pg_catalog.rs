@@ -297,13 +297,14 @@ const CATALOG: &[(&str, u32)] = &[("pg_class", 1259), ("pg_namespace", 2615), ("
 /// The rows each table holds in the log and not yet in its files. Tiering takes them within seconds,
 /// but until then a table filled a moment ago would read as empty to a tool that sizes tables by
 /// `n_live_tup` or `reltuples` (Metabase's sync leaves such a table's estimate out). An estimate:
-/// past `FAR` segments of log (tiering stalled) it counts the files alone.
+/// of the log, the last `FAR` segments (tiering stalled: the rows before them aren't counted).
 async fn log_rows(lake: &Lake, metas: &[(String, TableMeta)]) -> Result<BTreeMap<String, u64>> {
     const FAR: u64 = 100_000;
     let mut out = BTreeMap::new();
     let shown = metas.iter().filter(|(k, _)| !crate::sys::hidden(&k[2..]));
     let (Some(from), to) = (shown.clone().map(|(_, m)| m.tiered).min(), lake.visible()) else { return Ok(out) };
-    if from >= to || to - from > FAR {
+    let from = from.max(to.saturating_sub(FAR)); // (an idle table's mark stays where it was, `tier::expire`: the log after it holds none of its rows)
+    if from >= to {
         return Ok(out);
     }
     let segs = lake.cat.segments(&crate::store::seg_key(from + 1), &crate::store::seg_key(to + 1)).await?;

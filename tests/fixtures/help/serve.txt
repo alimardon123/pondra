@@ -92,6 +92,16 @@ Options:
           
           [default: ""]
 
+      --default-table-format <DEFAULT_TABLE_FORMAT>
+          The table format a new table is made in when its CREATE TABLE names none (`USING`): `pondra` (also PONDRA_DEFAULT_TABLE_FORMAT; default: pondra; `iceberg` comes with this lake's own Iceberg tables). A session's `SET default_table_format` comes first. A table keeps the format it was made in
+          
+          [default: pondra]
+
+      --default-file-format <DEFAULT_FILE_FORMAT>
+          The file format a new table's files are written in when its CREATE TABLE names none (also PONDRA_DEFAULT_FILE_FORMAT; default: parquet). A session's `SET default_file_format` comes first
+          
+          [default: parquet]
+
       --pg <PG>
           Also speak the Postgres wire protocol here (e.g. 0.0.0.0:5432): psql, drivers, BI tools
 

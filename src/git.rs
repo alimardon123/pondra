@@ -363,28 +363,28 @@ fn values(rows: &[[String; 4]]) -> String {
 
 // ---------------------------------------------------------------- writing the folder
 
-/// Keep a save as a version (`files::keep`): one that can't be kept is said, not failed.
-async fn kept(lake: &Lake, path: &str, bytes: &bytes::Bytes) {
-    if let Err(e) = crate::files::keep(lake, path, bytes).await {
+/// Keep a save as a version (`files::keep`), by `by` (the caller's name): one that can't be kept is said, not failed.
+async fn kept(lake: &Lake, path: &str, bytes: &bytes::Bytes, by: &str) {
+    if let Err(e) = crate::files::keep(lake, path, bytes, by).await {
         eprintln!("{path}: saved, but not kept as a version: {e:#}");
     }
 }
 
 /// Save a workspace file as `PUT /files` does: over its version when it exists, kept as a version.
-async fn save(lake: &Lake, path: &str, bytes: Vec<u8>) -> Result<()> {
+async fn save(lake: &Lake, path: &str, bytes: Vec<u8>, by: &str) -> Result<()> {
     let bytes = bytes::Bytes::from(bytes); // (shared by the save and its version, not copied for each)
     match lake.version(path).await {
         Ok(v) => lake.replace(path, bytes.clone(), &v).await.map(drop)?,
         Err(e) if missing(&e) => lake.put(path, bytes.clone()).await?,
         Err(e) => return Err(e),
     }
-    kept(lake, path, &bytes).await;
+    kept(lake, path, &bytes, by).await;
     Ok(())
 }
 
 /// Save the record over the version it was read at (`read_at`), so two commits of one folder at
 /// once can't both record. The first record of a folder is made new (`None`).
-async fn save_record(lake: &Lake, folder: &str, record: &Record, read_at: Option<&str>) -> Result<()> {
+async fn save_record(lake: &Lake, folder: &str, record: &Record, read_at: Option<&str>, by: &str) -> Result<()> {
     let path = format!("{folder}/{RECORD}");
     let bytes = bytes::Bytes::from(serde_json::to_vec_pretty(record)?);
     let written = match read_at {
@@ -395,19 +395,19 @@ async fn save_record(lake: &Lake, folder: &str, record: &Record, read_at: Option
         ensure!(!e.is::<Changed>(), "{folder} changed while it was committed: try again");
     }
     written?;
-    kept(lake, &path, &bytes).await;
+    kept(lake, &path, &bytes, by).await;
     Ok(())
 }
 
 /// Make the folder's files match `to`, given it matched `from`: the files that differ are written,
 /// those `to` lacks are removed. A repository's own record is refused, never written over.
-async fn move_files(lake: &Lake, host: &dyn Host, folder: &str, from: &BTreeMap<String, String>, to: &BTreeMap<String, String>) -> Result<()> {
+async fn move_files(lake: &Lake, host: &dyn Host, folder: &str, from: &BTreeMap<String, String>, to: &BTreeMap<String, String>, by: &str) -> Result<()> {
     ensure!(!to.contains_key(RECORD), "the repository has a file named {RECORD}: the folder's own record");
     if let Some(p) = to.keys().find(|p| !clean(p)) {
         bail!("the repository names a file outside its folder: {p}");
     }
     for (path, id) in to.iter().filter(|(p, id)| from.get(*p) != Some(*id)) {
-        save(lake, &format!("{folder}/{path}"), host.blob(id.as_str()).await?).await?;
+        save(lake, &format!("{folder}/{path}"), host.blob(id.as_str()).await?, by).await?;
     }
     for path in from.keys().filter(|p| !to.contains_key(*p)) {
         match lake.remove_file(&format!("{folder}/{path}")).await {
@@ -491,28 +491,28 @@ pub async fn call(app: &App, name: &str, args: &[FunctionArg], who: Who) -> Resu
     let (lake, secret) = (&app.lake, text(&v, "secret"));
     Ok(match verb {
         "git_status" => Outcome::Rows(vec![batch(&status(lake, &folder).await?)?]),
-        "git_checkout" => Outcome::Done(checkout(lake, &folder, &v, secret).await?),
-        "git_commit" => Outcome::Done(commit(lake, &folder, &v, secret).await?),
-        "git_pull" => Outcome::Done(pull(lake, &folder, secret).await?),
+        "git_checkout" => Outcome::Done(checkout(lake, &folder, &v, secret, who.name()).await?),
+        "git_commit" => Outcome::Done(commit(lake, &folder, &v, secret, who.name()).await?),
+        "git_pull" => Outcome::Done(pull(lake, &folder, secret, who.name()).await?),
         _ => Outcome::Done(pull_request(lake, &folder, &v, secret).await?),
     })
 }
 
 /// `git_checkout`: the first checkout of a folder, or (a Git folder) its switch to another branch.
-async fn checkout(lake: &Lake, folder: &str, v: &Value, secret: Option<String>) -> Result<Value> {
+async fn checkout(lake: &Lake, folder: &str, v: &Value, secret: Option<String>, by: &str) -> Result<Value> {
     let repository = text(v, "repository").map(|r| normal(&r));
     let branch = text(v, "branch");
     if let Some(b) = &branch {
         ensure!(branch_ok(b), "{b}: a branch's name is letters, digits and - _ . /");
     }
     match record_of(lake, folder).await? {
-        None => first(lake, folder, repository, branch, secret).await,
-        Some((record, read_at)) => switch(lake, folder, record, &read_at, repository, branch, secret).await,
+        None => first(lake, folder, repository, branch, secret, by).await,
+        Some((record, read_at)) => switch(lake, folder, record, &read_at, repository, branch, secret, by).await,
     }
 }
 
 /// The first checkout: the branch's files, then the record (written last).
-async fn first(lake: &Lake, folder: &str, repository: Option<String>, branch: Option<String>, secret: Option<String>) -> Result<Value> {
+async fn first(lake: &Lake, folder: &str, repository: Option<String>, branch: Option<String>, secret: Option<String>, by: &str) -> Result<Value> {
     let repository = repository.context("the first checkout names its repository: git_checkout('sales', repository => 'https://github.com/acme/sales')")?;
     ensure!(listed(lake, folder).await?.is_empty(), "{folder} holds files already: check a repository out into an empty folder");
     let host = host_for(lake, &repository, secret.as_deref()).await?;
@@ -522,17 +522,17 @@ async fn first(lake: &Lake, folder: &str, repository: Option<String>, branch: Op
     };
     let commit = host.head(&branch).await?.with_context(|| format!("{repository} has no branch {branch}"))?;
     let files = host.files(&commit).await?;
-    move_files(lake, host.as_ref(), folder, &BTreeMap::new(), &files).await?;
+    move_files(lake, host.as_ref(), folder, &BTreeMap::new(), &files, by).await?;
     let n = files.len();
     let record = Record { repository: repository.clone(), branch: branch.clone(), commit: commit.clone(), files };
-    save_record(lake, folder, &record, None).await?;
+    save_record(lake, folder, &record, None, by).await?;
     Ok(json!({"folder": folder, "repository": repository, "branch": branch, "commit": commit, "files": n}))
 }
 
 /// A Git folder's checkout: the same branch answers unchanged; another repository is refused; another
 /// branch is checked out over the folder (refused with local changes), or made at the record's commit
 /// when the repository lacks it, the local changes carried over as `git switch -c` does.
-async fn switch(lake: &Lake, folder: &str, mut record: Record, read_at: &str, repository: Option<String>, branch: Option<String>, secret: Option<String>) -> Result<Value> {
+async fn switch(lake: &Lake, folder: &str, mut record: Record, read_at: &str, repository: Option<String>, branch: Option<String>, secret: Option<String>, by: &str) -> Result<Value> {
     if let Some(r) = &repository {
         ensure!(*r == record.repository, "{folder} is a Git folder of {}: check {r} out into another folder", record.repository);
     }
@@ -546,7 +546,7 @@ async fn switch(lake: &Lake, folder: &str, mut record: Record, read_at: &str, re
             let local = changes(&record.files, &ids_of(lake, folder).await?);
             ensure!(local.is_empty(), "{folder} has changes not committed: {}: git_commit them or put them back first", names(&local));
             let files = host.files(&commit).await?;
-            move_files(lake, host.as_ref(), folder, &record.files, &files).await?;
+            move_files(lake, host.as_ref(), folder, &record.files, &files, by).await?;
             record.files = files;
             record.commit = commit;
             false
@@ -557,13 +557,13 @@ async fn switch(lake: &Lake, folder: &str, mut record: Record, read_at: &str, re
         }
     };
     record.branch = branch;
-    save_record(lake, folder, &record, Some(read_at)).await?;
+    save_record(lake, folder, &record, Some(read_at), by).await?;
     Ok(json!({"folder": folder, "repository": record.repository, "branch": record.branch, "commit": record.commit, "files": record.files.len(), "made": made}))
 }
 
 /// `git_commit`: the folder's local changes (or only `paths`) on top of the record's commit, moved
 /// onto the branch, fast-forward only. The record then holds the new commit and the committed paths' ids.
-async fn commit(lake: &Lake, folder: &str, v: &Value, secret: Option<String>) -> Result<Value> {
+async fn commit(lake: &Lake, folder: &str, v: &Value, secret: Option<String>, by: &str) -> Result<Value> {
     let message = text(v, "message").context("git_commit('sales', 'what changed'): the message")?;
     let (mut record, read_at) = need_record(lake, folder).await?;
     let local = changes(&record.files, &ids_of(lake, folder).await?);
@@ -598,13 +598,13 @@ async fn commit(lake: &Lake, folder: &str, v: &Value, secret: Option<String>) ->
         };
     }
     record.commit = commit.clone();
-    save_record(lake, folder, &record, Some(&read_at)).await?;
+    save_record(lake, folder, &record, Some(&read_at), by).await?;
     Ok(json!({"commit": commit, "files": blobs.len()}))
 }
 
 /// `git_pull`: the branch's new commits written into the folder. A path changed both here and on the
 /// branch (to different things) is refused by name, and nothing changes.
-async fn pull(lake: &Lake, folder: &str, secret: Option<String>) -> Result<Value> {
+async fn pull(lake: &Lake, folder: &str, secret: Option<String>, by: &str) -> Result<Value> {
     let (mut record, read_at) = need_record(lake, folder).await?;
     let host = host_for(lake, &record.repository, secret.as_deref()).await?;
     let head = host.head(&record.branch).await?.with_context(|| format!("{} has no branch {}", record.repository, record.branch))?;
@@ -625,10 +625,10 @@ async fn pull(lake: &Lake, folder: &str, secret: Option<String>) -> Result<Value
         }
     }
     ensure!(clash.is_empty(), "changed here and on {}: {}: commit or undo one side, then pull", record.branch, clash.join(", "));
-    move_files(lake, host.as_ref(), folder, &record.files, &theirs).await?;
+    move_files(lake, host.as_ref(), folder, &record.files, &theirs, by).await?;
     record.files = theirs;
     record.commit = head.clone();
-    save_record(lake, folder, &record, Some(&read_at)).await?;
+    save_record(lake, folder, &record, Some(&read_at), by).await?;
     Ok(json!({"pulled": pulled, "commit": head}))
 }
 

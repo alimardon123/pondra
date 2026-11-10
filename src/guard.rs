@@ -32,8 +32,30 @@ const WIRE: f64 = 3.0; // Arrow as a shuffle sends it (ZSTD) is about a third of
 /// at 17–54 ms apart, some 20 round trips; in one data centre that is a few milliseconds.
 const ROUND_TRIPS: f64 = 20.0;
 
-crate::per_node!(static LINKS: Mutex<HashMap<String, (Link, Instant)>> = Default::default());
-crate::per_node!(static HERE: Mutex<Option<f64>> = Mutex::new(None)); // bytes of tables read per second, one node
+/// What a lake's node has seen of its links and its queries' times: whether spreading a query pays.
+pub struct Seen {
+    links: Mutex<HashMap<String, (Link, Instant)>>,
+    here: Mutex<Option<f64>>, // bytes of tables read per second, one node
+    took: Times,
+    spread_took: Times,
+}
+
+impl Default for Seen {
+    fn default() -> Self {
+        Seen {
+            links: Default::default(),
+            here: Mutex::new(None),
+            took: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())),
+            spread_took: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())),
+        }
+    }
+}
+
+impl crate::lake_state::LakeState for Seen {
+    const NAME: &'static str = "guard";
+    const ABOUT: &'static str = "the links to the other nodes it measured and how long its queries took, here and spread";
+    fn make() -> Self { Seen::default() }
+}
 
 /// The body of `GET /cluster/probe?bytes=n`: bytes that don't compress (a link's measure).
 pub fn probe(bytes: usize) -> Vec<u8> {
@@ -47,23 +69,24 @@ pub fn probe(bytes: usize) -> Vec<u8> {
 /// The slowest link from here to the other nodes (the longest round trip, the lowest rate): a
 /// shuffle waits for it. Measured every 10 minutes, or given (`PONDRA_LINK=ms,MB/s`); None when a
 /// node can't be measured.
-pub async fn slowest(from: &crate::node_state::NodeState, nodes: &[String], me: &str) -> Option<Link> {
+pub async fn slowest(lake: &crate::store::Lake, nodes: &[String], me: &str) -> Option<Link> {
     if let Some((ms, mb)) = crate::env::get("PONDRA_LINK").and_then(|v| Some((v.split_once(',')?.0.parse::<f64>().ok()?, v.split_once(',')?.1.parse::<f64>().ok()?))) {
         return Some(Link { rtt: ms / 1e3, rate: mb * 1e6 }); // (`ms,MB/s`: a network known, or one to pretend)
     }
-    let links = futures::future::join_all(nodes.iter().filter(|n| *n != me).map(|n| link(from, n))).await;
+    let links = futures::future::join_all(nodes.iter().filter(|n| *n != me).map(|n| link(lake, n))).await;
     links.into_iter().try_fold(Link { rtt: 0.0, rate: f64::MAX }, |a, l| Some(Link { rtt: a.rtt.max(l?.rtt), rate: a.rate.min(l?.rate) }))
 }
 
-async fn link(from: &crate::node_state::NodeState, node: &str) -> Option<Link> {
-    if let Some((l, at)) = LINKS.lock().unwrap().get(node) {
+async fn link(lake: &crate::store::Lake, node: &str) -> Option<Link> {
+    let Ok(seen) = lake.state::<Seen>() else { return None };
+    if let Some((l, at)) = seen.links.lock().unwrap().get(node) {
         if at.elapsed() < Duration::from_secs(600) {
             return Some(*l);
         }
     }
     let get = |bytes: usize| async move {
         let t = Instant::now();
-        let r = crate::dial::call(from, node, crate::dial::Call::get(format!("/cluster/probe?bytes={bytes}")).timeout(Duration::from_secs(20))).await.ok()?;
+        let r = crate::dial::call(&lake.node, node, crate::dial::Call::get(format!("/cluster/probe?bytes={bytes}")).timeout(Duration::from_secs(20))).await.ok()?;
         let got = r.bytes().await.ok()?.len();
         (got == bytes).then(|| t.elapsed().as_secs_f64())
     };
@@ -73,30 +96,32 @@ async fn link(from: &crate::node_state::NodeState, node: &str) -> Option<Link> {
     }
     let rate = PROBE as f64 / (get(PROBE).await? - rtt).max(1e-4);
     let l = Link { rtt, rate };
-    LINKS.lock().unwrap().insert(node.to_string(), (l, Instant::now()));
+    seen.links.lock().unwrap().insert(node.to_string(), (l, Instant::now()));
     Some(l)
 }
 
 /// Query `sql`, which read tables of `bytes`, took `took` here: how long it takes (asked again),
 /// and the rate queries go at on one node (anything else).
-pub fn ran_here(sql: &str, bytes: u64, took: Duration) {
-    note(&TOOK, sql, took);
+pub fn ran_here(lake: &crate::store::Lake, sql: &str, bytes: u64, took: Duration) {
+    let Ok(seen) = lake.state::<Seen>() else { return };
+    note(&seen.took, sql, took);
     if bytes < 1 << 20 {
         return; // (too small to say anything about the rate)
     }
     let rate = bytes as f64 / took.as_secs_f64();
-    let mut here = HERE.lock().unwrap();
+    let mut here = seen.here.lock().unwrap();
     *here = Some(here.map_or(rate, |r| 0.7 * r + 0.3 * rate));
 }
 
 /// Query `sql` took `took` spread over the nodes.
-pub fn ran_spread(sql: &str, took: Duration) { note(&SPREAD_TOOK, sql, took) }
+pub fn ran_spread(lake: &crate::store::Lake, sql: &str, took: Duration) {
+    let Ok(seen) = lake.state::<Seen>() else { return };
+    note(&seen.spread_took, sql, took)
+}
 
 /// A query's last three times, one way. A busy machine makes a run slower, never faster, so the
 /// best of them is what that way costs: one slow run doesn't turn the choice.
 type Times = Mutex<lru::LruCache<u64, Vec<f64>>>;
-crate::per_node!(static TOOK: Times = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
-crate::per_node!(static SPREAD_TOOK: Times = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
 
 fn note(times: &Times, sql: &str, took: Duration) {
     let mut all = times.lock().unwrap();
@@ -113,8 +138,8 @@ fn best(times: &Times, sql: &str) -> Option<f64> { times.lock().unwrap().get(&ke
 /// nodes' first sight of the query (their caches cold, the links just measured), so one alone
 /// says spreading is slower only if a second agrees: one slow first run kept a query on one node
 /// for good (the cluster bench's q1: 2.1 s spread the first time, 1.0 s after, so back to 2.4 s).
-fn spread_runs(sql: &str) -> (Option<f64>, usize) {
-    let mut all = SPREAD_TOOK.lock().unwrap();
+fn spread_runs(seen: &Seen, sql: &str) -> (Option<f64>, usize) {
+    let mut all = seen.spread_took.lock().unwrap();
     all.get(&key(sql)).map_or((None, 0), |t| (t.iter().copied().reduce(f64::min), t.len()))
 }
 
@@ -129,10 +154,11 @@ fn key(sql: &str) -> u64 {
 /// Does spreading query `sql` pay: moving `moved` bytes (as they are in memory) in `steps` steps
 /// over `link`, to share out a query over tables of `bytes` among `n` nodes? No if nothing has run
 /// here yet.
-pub fn pays(sql: &str, link: Link, moved: u64, steps: usize, bytes: u64, n: usize) -> bool {
-    let known = best(&TOOK, sql);
+pub fn pays(lake: &crate::store::Lake, sql: &str, link: Link, moved: u64, steps: usize, bytes: u64, n: usize) -> bool {
+    let Ok(seen) = lake.state::<Seen>() else { return false };
+    let known = best(&seen.took, sql);
     let learned = !crate::env::is_set("PONDRA_LINK"); // (a network pretended: the model alone)
-    if let (Some(here), (Some(spread), runs), true) = (known, spread_runs(sql), learned) {
+    if let (Some(here), (Some(spread), runs), true) = (known, spread_runs(&seen, sql), learned) {
         if spread < here || runs >= 2 {
             if crate::env::is_set("PONDRA_DEBUG_SPREAD") {
                 eprintln!("spread: ran both ways, here {here:.3}s, spread {spread:.3}s ({runs} runs)");
@@ -140,7 +166,7 @@ pub fn pays(sql: &str, link: Link, moved: u64, steps: usize, bytes: u64, n: usiz
             return spread < here; // (it ran both ways: no need to guess)
         }
     }
-    let Some(here) = known.or_else(|| HERE.lock().unwrap().map(|rate| bytes as f64 / rate)) else { return false };
+    let Some(here) = known.or_else(|| seen.here.lock().unwrap().map(|rate| bytes as f64 / rate)) else { return false };
     let saved = here * (1.0 - 1.0 / n as f64);
     let cost = link.rtt * (2.0 + ROUND_TRIPS * steps as f64) + moved as f64 / WIRE / link.rate;
     if crate::env::is_set("PONDRA_DEBUG_SPREAD") {
@@ -159,4 +185,26 @@ pub fn bytes_out(plan: &Arc<dyn ExecutionPlan>) -> Option<u64> {
     }
     let width: usize = plan.schema().fields().iter().map(|f| f.data_type().primitive_width().unwrap_or(24)).sum();
     s.num_rows.get_value().map(|rows| (rows * width) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn two_lakes_keep_their_query_times_apart() -> anyhow::Result<()> {
+        let dir_a = std::env::temp_dir().join(format!("pondra-two-guards-{}", uuid::Uuid::new_v4()));
+        let dir_b = std::env::temp_dir().join(format!("pondra-two-guards-{}", uuid::Uuid::new_v4()));
+        let a = crate::store::Lake::open(dir_a.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let b = crate::store::Lake::open(dir_b.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        ran_here(&a, "select 1", 0, Duration::from_millis(50));
+        let (seen_a, seen_b) = (a.state::<Seen>()?, b.state::<Seen>()?);
+        assert!(best(&seen_a.took, "select 1").is_some(), "lake a forgot its query's time");
+        assert!(best(&seen_b.took, "select 1").is_none(), "lake b knows a query it never ran");
+        a.cat.close().await?;
+        b.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        Ok(())
+    }
 }
