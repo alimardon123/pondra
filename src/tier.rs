@@ -1318,14 +1318,14 @@ impl Encoding {
     /// Its size so far, encoded.
     fn bytes(&self) -> usize { self.w.bytes_written() + self.w.in_progress_size() }
 
-    /// The file's bytes, finished, and its entry but for where it goes.
-    fn finish(self) -> Result<(Vec<u8>, DataFile)> {
+    /// The file's bytes, finished, and its entry but for where it goes: its ranges typed in a lake of format 8 (`typed`).
+    fn finish(self, typed: bool) -> Result<(Vec<u8>, DataFile)> {
         let Encoding { mut w, rows, sys, mut seen, sketches, .. } = self;
         let footer = w.finish()?; // (its statistics: the file's min and max, without a second pass)
         let buf = std::mem::take(w.inner_mut());
-        let (stats, nulls, sketch) = (seen.stats(&footer), Some(seen.nulls()), sketches.map(|s| s.done()).unwrap_or_default());
+        let ((stats, bounds), nulls, sketch) = (crate::bounds::kept(&seen.ranges(&footer), typed), Some(seen.nulls()), sketches.map(|s| s.done()).unwrap_or_default());
         let bytes = buf.len() as u64;
-        Ok((buf, DataFile { rows: rows as u64, bytes, stats, nulls, sketch, sys, ..Default::default() }))
+        Ok((buf, DataFile { rows: rows as u64, bytes, stats, bounds, nulls, sketch, sys, ..Default::default() }))
     }
 
     /// The file finished and put in the table's folder, and its hot columns held there (a table whose
@@ -1333,7 +1333,8 @@ impl Encoding {
     async fn put(mut self, lake: &Lake, table: &str, meta: Option<&TableMeta>) -> Result<DataFile> {
         let hot: Vec<FieldRef> = self.hot.iter().map(|(_, f)| f.clone()).collect();
         let kept = std::mem::take(&mut self.kept);
-        let (buf, file) = blocking(move || self.finish()).await?;
+        let typed = crate::format::typed(lake).await?;
+        let (buf, file) = blocking(move || self.finish(typed)).await?;
         let path = format!("data/{}/{}.parquet", meta.map_or(table, |m| m.folder(table)), uuid::Uuid::new_v4());
         lake.put(&path, buf).await?;
         maybe_crash("after_parquet_put", &*lake.node.life);
@@ -1490,16 +1491,23 @@ mod tests {
         let batches: Vec<RecordBatch> = [0, 300_000, 600_000].into_iter().map(batch).collect();
         let mut file = Encoding::new(None, &batches[0], &["i".to_string()], vec![]).unwrap();
         batches.iter().try_for_each(|b| file.write(b)).unwrap();
-        let (buf, entry) = file.finish().unwrap();
+        let typed = Encoding::new(None, &batches[0], &["i".to_string()], vec![]).unwrap();
+        let (_, typed) = batches.iter().try_fold(typed, |mut t, b| t.write(b).map(|_| t)).and_then(|t| t.finish(true)).unwrap();
+        let (buf, entry) = file.finish(false).unwrap();
         let groups = SerializedFileReader::new(bytes::Bytes::from(buf)).unwrap().metadata().num_row_groups();
         assert!(groups >= 3, "{groups} row groups");
         assert_eq!(entry.rows, 900_000);
+        assert!(entry.bounds.is_empty() && typed.stats.is_empty(), "text below format 8, typed at it");
         for (i, f) in schema.fields().iter().enumerate() {
             let cols: Vec<ArrayRef> = batches.iter().map(|b| b.column(i).clone()).collect();
             let rows = crate::sketch::min_max(&cols).and_then(|(lo, hi)| Some((crate::manifest::text(&lo)?, crate::manifest::text(&hi)?)));
             assert_eq!(entry.stats.get(f.name()), rows.as_ref(), "{}", f.name());
+            let parse = |s: &String| datafusion::common::ScalarValue::try_from_string(s.clone(), f.data_type()).unwrap();
+            let want = rows.as_ref().map(|(lo, hi)| (parse(lo), parse(hi)));
+            let got = crate::bounds::Ranged::range(&typed, f.name(), f.data_type());
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{}, typed", f.name()); // (as text: a NaN is not equal to itself)
         }
-        assert!(!entry.stats.contains_key("long"));
+        assert!(!entry.stats.contains_key("long") && !typed.bounds.contains_key("long"));
         assert_eq!(entry.nulls, Some(vec!["i".to_string()]));
     }
 

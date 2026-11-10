@@ -15,7 +15,7 @@ rows, written through the log with today's timestamps, sit next to them. So:
 - the table's catalog entry, which every commit to it rewrites, must stay small;
 - tiering commits and INSERTs must take as long as before.
 """
-import argparse, json, os, statistics, sys, time, uuid
+import argparse, base64, json, os, statistics, struct, sys, time, uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness
@@ -37,6 +37,11 @@ def metrics(port):
 
 def iso(secs):
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(secs))
+
+
+def typed(fmt, *values):  # a range in Iceberg's single-value form, as a file keeps it at format 8 (`bounds.rs`)
+    one = lambda v: base64.b64encode(v.encode() if isinstance(v, str) else struct.pack(fmt, v)).decode()
+    return [one(v) for v in values]
 
 
 def timed(f, n=5):
@@ -95,8 +100,13 @@ def main():
         files = []
         for i in range(n, min(n + batch, A.files)):
             lo = T2000 + int(i * per)
-            files.append({"path": f"data/events/fake-{i:07d}.parquet", "rows": 10_000_000, "bytes": 1 << 30,
-                          "stats": {"id": [str(-10**12 - (i + 1) * 10**7), str(-10**12 - i * 10**7 - 1)], "ts": [iso(lo), iso(lo + int(per))], "v": ["0", "100"], "name": ["a", "z"]}})
+            f = {"path": f"data/events/fake-{i:07d}.parquet", "rows": 10_000_000, "bytes": 1 << 30}
+            ids = (-10**12 - (i + 1) * 10**7, -10**12 - i * 10**7 - 1)
+            if A.typed:  # (as a lake at format 8 keeps them)
+                f["bounds"] = {"id": typed("<q", *ids), "ts": typed("<q", lo * 10**6, (lo + int(per)) * 10**6), "v": typed("<d", 0.0, 100.0), "name": typed("", "a", "z")}
+            else:
+                f["stats"] = {"id": [str(ids[0]), str(ids[1])], "ts": [iso(lo), iso(lo + int(per))], "v": ["0", "100"], "name": ["a", "z"]}
+            files.append(f)
         s = time.time()
         call(port, "POST", "/cluster/files", json.dumps({"table": "events", "job": uuid.uuid4().hex, "columns": columns, "files": files}).encode(), timeout=600, headers={"content-type": "application/json"})
         record_ms.append((time.time() - s) * 1000)
@@ -170,6 +180,7 @@ if __name__ == "__main__":
     ap.add_argument("--files", type=int, default=1_000_000)
     ap.add_argument("--s3", action="store_true")
     ap.add_argument("--publish", action="store_true", help="also publish the table as Delta and Iceberg")
+    ap.add_argument("--typed", action="store_true", help="the fake files' ranges typed, as a lake at format 8 keeps them, not as text")
     ap.add_argument("--port", type=int, default=8095)
     A = ap.parse_args()
     harness.A = A

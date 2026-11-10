@@ -153,9 +153,10 @@ async fn copy_one(target: &Lake, folder: &str, schema: Arc<Schema>, job: Job, sy
     let held = MemoryConsumer::new("a Parquet load's copy").register(&target.rt.memory_pool);
     held.grow(2 * (cut.bytes.end - cut.bytes.start) as usize);
     let piece = store.get_range(&location, cut.bytes.clone()).await?;
+    let typed = crate::format::typed(target).await?;
     let (bytes, file) = tier::blocking(move || {
         let kept = keep_parquet::copy(&md, &schema, &cut, piece, Some(sys))?;
-        entry(kept)
+        entry(kept, typed)
     })
     .await?;
     let path = format!("data/{folder}/{}.parquet", uuid::Uuid::new_v4());
@@ -169,7 +170,7 @@ async fn copy_one(target: &Lake, folder: &str, schema: Arc<Schema>, job: Job, sy
 /// hint, so strings are Utf8 as a written file's are: every value is decoded (a string that isn't UTF-8 is refused), and
 /// what its footer and page index say of its rows is checked against them (`Claims`), since a reader skips rows by
 /// them. Any of that failing is an error, and the load is written as today.
-fn entry(kept: Kept) -> Result<(Bytes, DataFile)> {
+fn entry(kept: Kept, typed: bool) -> Result<(Bytes, DataFile)> {
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(kept.bytes.clone(), options)?;
     let mut claims = Claims::new(builder.metadata(), builder.schema())?;
@@ -185,10 +186,12 @@ fn entry(kept: Kept) -> Result<(Bytes, DataFile)> {
     }
     claims.done()?;
     ensure!(rows == kept.rows, "the copy reads {rows} rows, its footer says {}", kept.rows);
+    let (stats, bounds) = crate::bounds::kept(&seen.ranges(&kept.footer), typed);
     let file = DataFile {
         rows,
         bytes: kept.bytes.len() as u64,
-        stats: seen.stats(&kept.footer),
+        stats,
+        bounds,
         nulls: Some(seen.nulls()),
         sketch: sketches.done(),
         sys: schema.index_of(ROW_ID).is_ok(),
@@ -543,13 +546,15 @@ mod tests {
             w.write(b).unwrap();
         }
         let footer = w.finish().unwrap();
-        let want = (seen.stats(&footer), seen.nulls(), sketches.done());
+        let want = (seen.ranges(&footer), seen.nulls(), sketches.done());
         let bytes = Bytes::from(std::mem::take(w.inner_mut()));
-        let (_, got) = entry(Kept { bytes: bytes.clone(), footer, rows: 3000 }).unwrap();
+        let (_, typed) = entry(Kept { bytes: bytes.clone(), footer: footer.clone(), rows: 3000 }, true).unwrap();
+        assert_eq!((&typed.stats, &typed.bounds), (&Default::default(), &crate::bounds::kept(&want.0, true).1), "typed ranges, in a lake of format 8");
+        let (_, got) = entry(Kept { bytes: bytes.clone(), footer, rows: 3000 }, false).unwrap();
         assert_eq!(got.rows, 3000);
         assert_eq!(got.bytes, bytes.len() as u64);
         assert!(!got.sys, "a file of no system columns");
-        assert_eq!(got.stats, want.0, "ranges");
+        assert_eq!((got.stats, got.bounds), crate::bounds::kept(&want.0, false), "ranges");
         assert_eq!(got.nulls, Some(want.1), "NULLs");
         assert_eq!(got.sketch, want.2, "sketches");
     }

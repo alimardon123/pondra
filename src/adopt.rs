@@ -40,7 +40,7 @@ async fn footer(lake: &Lake, ctx: &datafusion::prelude::SessionContext, table: &
     let rows = md.file_metadata().num_rows() as u64;
     ensure!(rows == f.rows, "{}: its manifest says {} rows, the file holds {rows}", f.path, f.rows);
     let schema = datafusion::parquet::arrow::parquet_to_arrow_schema(md.file_metadata().schema_descr(), md.file_metadata().key_value_metadata())?;
-    let (mut stats, mut nulls) = (crate::manifest::Stats::new(), vec![]);
+    let (mut ranges, mut nulls) = (crate::bounds::Values::new(), vec![]);
     let list = meta.column_list();
     for col in list.stored_order() {
         let (stored, name, want) = (&col.stored, col.name.as_str(), crate::answer::dtype(&col.dtype)?);
@@ -58,18 +58,16 @@ async fn footer(lake: &Lake, ctx: &datafusion::prelude::SessionContext, table: &
         if !known || held > 0 {
             nulls.push(stored.clone());
         }
-        if stats.len() < 32 && !want.is_floating() {
-            if let Some((lo, hi)) = crate::manifest::from_footer(&md, &schema, field.name()) {
-                if let (Some(lo), Some(hi)) = (crate::manifest::text(&lo), crate::manifest::text(&hi)) {
-                    stats.insert(stored.clone(), (lo, hi));
-                }
+        if ranges.len() < 32 && !want.is_floating() {
+            if let Some(range) = crate::manifest::from_footer(&md, &schema, field.name()).filter(|(lo, hi)| !lo.is_null() && !hi.is_null()) {
+                ranges.insert(stored.clone(), range);
             }
         }
     }
     if let Some(spec) = &meta.partition {
         f.part = partition(&md, &schema, meta, spec, &f.path, rows).await?;
     }
-    (f.stats, f.nulls) = (stats, Some(nulls));
+    ((f.stats, f.bounds), f.nulls) = (crate::bounds::kept(&ranges, crate::format::typed(lake).await?), Some(nulls));
     Ok(f)
 }
 
@@ -426,15 +424,16 @@ async fn with_ids(lake: &Lake, seq: &crate::log::Sequencer, files: &[DataFile]) 
 }
 
 /// The system columns' ranges a file's lineage gives (a purge finds changed rows by them).
-pub fn system_stats(l: &Lineage, rows: u64) -> Vec<(String, (String, String))> {
+pub fn system_stats(l: &Lineage, rows: u64) -> crate::bounds::Values {
     let at = ScalarValue::TimestampMicrosecond(Some(l.ms as i64 * 1000), Some("UTC".into()));
-    let text = |v: &ScalarValue| crate::manifest::text(v).unwrap_or_default();
-    let (at, version) = (text(&at), l.version.to_string());
-    let last = l.first + rows.saturating_sub(1) as i64;
-    vec![
-        (crate::text::ROW_ID.into(), (l.first.to_string(), last.to_string())),
-        (crate::text::VERSION.into(), (version.clone(), version)),
-        (crate::text::CREATED.into(), (at.clone(), at.clone())),
-        (crate::text::UPDATED.into(), (at.clone(), at)),
+    let (version, last) = (ScalarValue::Int64(Some(l.version as i64)), l.first + rows.saturating_sub(1) as i64);
+    [
+        (crate::text::ROW_ID, (ScalarValue::Int64(Some(l.first)), ScalarValue::Int64(Some(last)))),
+        (crate::text::VERSION, (version.clone(), version)),
+        (crate::text::CREATED, (at.clone(), at.clone())),
+        (crate::text::UPDATED, (at.clone(), at)),
     ]
+    .into_iter()
+    .map(|(c, r)| (c.to_string(), r))
+    .collect()
 }

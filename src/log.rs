@@ -1226,7 +1226,10 @@ fn stamp_file(d: &mut DataFile, seg: u64, ms: u64) {
     d.ord = seg;
     if let Some(l) = d.lineage.as_mut().filter(|l| l.version == 0) {
         (l.version, l.ms) = (seg, ms);
-        d.stats.extend(crate::adopt::system_stats(l, d.rows));
+        // (in the form the file keeps its other ranges: typed only where the lake already is, format 8)
+        let (stats, bounds) = crate::bounds::kept(&crate::adopt::system_stats(l, d.rows), !d.bounds.is_empty());
+        d.stats.extend(stats);
+        d.bounds.extend(bounds);
     }
 }
 
