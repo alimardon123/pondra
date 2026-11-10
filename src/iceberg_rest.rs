@@ -157,9 +157,12 @@ fn sql_name(app: &crate::app::App, parts: &[String], lake: &std::sync::Arc<Lake>
 
 /// A statement for the catalog's table changes, run as the caller (DDL: an admin's). `drops_namespace`: the namespace DELETE route, whose
 /// 2BP01 is a namespace that isn't empty.
-async fn as_caller(app: &crate::app::App, who: &crate::auth::Principal, sql: &str, drops_namespace: bool) -> Result<(), Refusal> {
+async fn as_caller(app: &crate::app::App, who: &crate::auth::Principal, sql: &str, drops_namespace: bool) -> Result<(), Refusal> { as_job(app, who, sql, drops_namespace, None).await }
+
+/// …as a job: a table it makes is the job's (`made_by`).
+async fn as_job(app: &crate::app::App, who: &crate::auth::Principal, sql: &str, drops_namespace: bool, job: Option<String>) -> Result<(), Refusal> {
     let (shows, who) = (who.scope.shows_code(), crate::routines::Who::signed(who.clone(), who.role, false));
-    Box::pin(crate::routines::one(app, sql, who, None)).await.map(|_| ()).map_err(|e| exception(crate::codes::of(&e), crate::codes::told(&e, shows), drops_namespace))
+    Box::pin(crate::routines::one(app, sql, who, job)).await.map(|_| ()).map_err(|e| exception(crate::codes::of(&e), crate::codes::told(&e, shows), drops_namespace))
 }
 
 /// An error as the Iceberg REST catalog answers it: its exception by the error's SQLSTATE (`codes::kind`), the message as
@@ -187,8 +190,17 @@ async fn create(axum::extract::State(app): axum::extract::State<crate::app::App>
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the table: {e}")))?;
     let table = asked["name"].as_str().filter(|n| !n.is_empty()).ok_or_else(|| bad("a table without its name".into()))?;
     let sql = create_sql(&sql_name(&app, &parts, &lake, &schema, table), &asked).map_err(|e| bad(crate::ext::said(&e)))?;
-    as_caller(&app, &who, &sql, false).await?;
     let name = crate::text::join(&schema, table);
+    if asked["stage-create"].as_bool().unwrap_or(false) {
+        // (a table made with its first commit, Spark's CREATE TABLE … AS SELECT: nothing made yet, the table as it will be
+        // answered, so the engine writes its files where the table's go; its commit makes it, `made`)
+        if loaded(&lake, &name).await.is_ok() {
+            return Err(refused(409, "AlreadyExistsException", format!("table {}.{table} exists", ns.replace('\u{1f}', "."))));
+        }
+        let folder = crate::ddl::free_folder(&lake, &name).await.map_err(|e| bad(crate::ext::said(&e)))?.unwrap_or_else(|| name.clone()); // (as CREATE TABLE picks it)
+        return Ok(axum::Json(json!({"metadata": staged(&lake.full(&format!("data/{folder}")), &asked), "config": {}})));
+    }
+    as_caller(&app, &who, &sql, false).await?;
     for _ in 0..600 {
         if let Ok(v) = loaded(&lake, &name).await {
             return Ok(axum::Json(v)); // (its first version: published by the leader's next round)
@@ -196,6 +208,91 @@ async fn create(axum::extract::State(app): axum::extract::State<crate::app::App>
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     Err(refused(500, "ServiceUnavailableException", format!("{name} was made, and isn't published yet: load it again")))
+}
+
+/// A staged create's table as the catalog answers it before it is made (`create`): the request's schema with the field ids
+/// Pondra's table will give it (its columns 1…n in order, a list's elements after them: `iceberg::fields`), its partition
+/// spec and write order on those ids, no snapshot. The engine writes its files with these ids, so they read as the table's.
+fn staged(location: &str, asked: &Value) -> Value {
+    let fields = asked["schema"]["fields"].as_array().cloned().unwrap_or_default();
+    let n = fields.len() as i64;
+    let ids: std::collections::HashMap<i64, i64> = fields.iter().enumerate().filter_map(|(i, f)| Some((f["id"].as_i64()?, i as i64 + 1))).collect();
+    let id = |v: &Value| v.as_i64().and_then(|i| ids.get(&i)).copied().map_or(Value::Null, Value::from);
+    let fields: Vec<Value> = fields.into_iter().enumerate().map(|(i, mut f)| {
+        let own = i as i64 + 1;
+        f["id"] = own.into();
+        if f["type"]["type"] == "list" {
+            f["type"]["element-id"] = (n + own).into();
+        }
+        f
+    }).collect();
+    let last = fields.iter().map(|f| f["type"]["element-id"].as_i64().unwrap_or(0).max(f["id"].as_i64().unwrap_or(0))).max().unwrap_or(0);
+    let keys: Vec<Value> = asked["schema"]["identifier-field-ids"].as_array().into_iter().flatten().map(id).collect();
+    let spec: Vec<Value> = asked["partition-spec"]["fields"].as_array().into_iter().flatten().enumerate()
+        .map(|(i, f)| json!({"source-id": id(&f["source-id"]), "field-id": 1000 + i as i64, "name": f["name"], "transform": f["transform"]})).collect();
+    let order: Vec<Value> = asked["write-order"]["fields"].as_array().into_iter().flatten().map(|f| { let mut f = f.clone(); f["source-id"] = id(&f["source-id"]); f }).collect();
+    let mut orders = vec![json!({"order-id": 0, "fields": []})];
+    if !order.is_empty() {
+        orders.push(json!({"order-id": 1, "fields": order}));
+    }
+    json!({
+        "format-version": 2, "table-uuid": uuid::Uuid::new_v4().to_string(), "location": location,
+        "last-sequence-number": 0, "last-updated-ms": crate::log::now_ms(), "last-column-id": last,
+        "current-schema-id": 0, "schemas": [{"type": "struct", "schema-id": 0, "fields": fields, "identifier-field-ids": keys}],
+        "default-spec-id": 0, "partition-specs": [{"spec-id": 0, "fields": spec}], "last-partition-id": 999 + spec.len() as i64,
+        "default-sort-order-id": orders.len() - 1, "sort-orders": orders,
+        "properties": if asked["properties"].is_object() { asked["properties"].clone() } else { json!({}) },
+        "current-snapshot-id": -1, "refs": {}, "snapshots": [], "snapshot-log": [], "metadata-log": [],
+    })
+}
+
+/// A staged create's commit (its requirement `assert-create`), as the table request it makes: the schema, partition spec
+/// and write order it made current, and its properties.
+fn staged_request(table: &str, asked: &Value) -> Value {
+    let updates = asked["updates"].as_array().cloned().unwrap_or_default();
+    let last = |action: &str, key: &str| updates.iter().rev().find(|u| u["action"] == action).map(|u| u[key].clone()).unwrap_or(Value::Null);
+    let mut properties = serde_json::Map::new();
+    for u in updates.iter().filter(|u| u["action"] == "set-properties") {
+        properties.extend(u["updates"].as_object().cloned().unwrap_or_default());
+    }
+    json!({"name": table, "schema": last("add-schema", "schema"), "partition-spec": last("add-spec", "spec"), "write-order": last("add-sort-order", "sort-order"), "properties": properties})
+}
+
+/// The uuid a staged create's commit gives its table (`assign-uuid`: the one its staged answer had).
+fn assigned(asked: &Value) -> Option<&str> { asked["updates"].as_array()?.iter().find(|u| u["action"] == "assign-uuid")?["uuid"].as_str() }
+
+/// A staged create's commit (Spark's CREATE TABLE … AS SELECT, PyIceberg's `create_table_transaction`): the table made by
+/// Pondra's CREATE TABLE from what the commit makes current, then the engine's files taken as an append's are (as they
+/// were written, when they fit the table: no copy). If they can't be, the table is dropped again, so the statement
+/// leaves nothing.
+async fn made(app: &crate::app::App, who: &crate::auth::Principal, target: &str, lake: &std::sync::Arc<Lake>, name: &str, table: &str, asked: &Value, retried: bool) -> Reply {
+    if !retried {
+        // (made as the job its uuid names, so the table keeps the uuid the engine was given: `iceberg::publish`)
+        let sql = create_sql(target, &staged_request(table, asked)).map_err(|e| bad(crate::ext::said(&e)))?;
+        as_job(app, who, &sql, false, assigned(asked).map(|u| format!("{}{u}", crate::iceberg::MADE))).await?;
+    }
+    let mut current = None;
+    for _ in 0..600 {
+        if let Ok(v) = loaded(lake, name).await {
+            current = Some(v); // (its first version: published by the leader's next round)
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let current = current.ok_or_else(|| refused(500, "ServiceUnavailableException", format!("{name} was made, and isn't published yet: commit again")))?;
+    let data: Vec<Value> = asked["updates"].as_array().into_iter().flatten().filter(|u| ["add-snapshot", "set-snapshot-ref"].contains(&u["action"].as_str().unwrap_or_default())).cloned().collect();
+    if data.is_empty() {
+        return Ok(axum::Json(current));
+    }
+    let taken = match prepare(lake, name, &current, &json!({"requirements": [], "updates": data})).await.map_err(door) {
+        Ok(Some(c)) => commit(app, lake, vec![c]).await,
+        Ok(None) => Ok(current),
+        Err(e) => Err(e),
+    };
+    if taken.is_err() && !retried {
+        let _ = as_caller(app, who, &format!("DROP TABLE {target}"), false).await; // (all or nothing, as a CREATE TABLE … AS SELECT)
+    }
+    taken.map(axum::Json)
 }
 
 /// An Iceberg field's type as Pondra's SQL says it.
@@ -227,7 +324,6 @@ fn sql_type(t: &Value) -> Result<String> {
 /// A catalog's table request as `CREATE TABLE` (`create`).
 fn create_sql(name: &str, asked: &Value) -> Result<String> {
     use anyhow::bail;
-    anyhow::ensure!(!asked["stage-create"].as_bool().unwrap_or(false), "a staged create (a table made with its first commit): not yet; make it, then append");
     let fields = asked["schema"]["fields"].as_array().context("a table without its schema's fields")?;
     let q = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
     let by_id = |id: &Value| fields.iter().find(|f| f["id"] == *id).and_then(|f| f["name"].as_str()).with_context(|| format!("no field {id} in the schema"));
@@ -392,8 +488,17 @@ async fn update(axum::extract::State(app): axum::extract::State<crate::app::App>
     let (parts, lake, schema) = space(&app, &ns, &who.scope).await?;
     let name = crate::text::join(&schema, &table);
     crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name)).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), false))?;
-    let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException"))?;
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the commit: {e}")))?;
+    let creates = asked["requirements"].as_array().into_iter().flatten().any(|r| r["type"] == "assert-create");
+    let current = match loaded(&lake, &name).await {
+        // (a staged create's commit sent again, its table made: its files still to take, or taken once)
+        Ok(current) if creates && assigned(&asked).is_some_and(|u| current["metadata"]["table-uuid"] == u) => {
+            return made(&app, &who, &sql_name(&app, &parts, &lake, &schema, &table), &lake, &name, &table, &asked, true).await;
+        }
+        Ok(current) => current,
+        Err(_) if creates => return made(&app, &who, &sql_name(&app, &parts, &lake, &schema, &table), &lake, &name, &table, &asked, false).await,
+        Err(_) => return Err(missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException")),
+    };
     instead(&name, &asked).map_err(door)?;
     let updates = asked["updates"].as_array().cloned().unwrap_or_default();
     let alters = |a: &str| ["add-schema", "set-properties", "remove-properties"].contains(&a);

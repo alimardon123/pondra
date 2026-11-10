@@ -7364,6 +7364,15 @@ def writes():
     refused["an expiry of snapshots"] = _raises_text(lambda: t.maintenance.expire_snapshots().by_id(first).commit())
     refused["a change of partitioning"] = _raises_text(lambda: t.update_spec().add_identity("name").commit())
     said = {"files outside the table's folder": "data folder", "a rollback": "RESTORE TABLE", "an expiry of snapshots": "--retain-secs", "a change of partitioning": "PARTITION BY"}
+    # (a table made with its first commit, Spark's CREATE TABLE … AS SELECT: Pondra's CREATE TABLE, then the engine's files
+    # taken as an append's are)
+    txn = cat.create_table_transaction("default.made", pa.schema([("id", pa.int64()), ("tag", pa.string())]))
+    txn.append(pa.table({"id": pa.array(range(5), pa.int64()), "tag": pa.array(list("abcde"))}))
+    txn.commit_transaction()
+    made = q("SELECT count(*) AS n, max(id) AS top, string_agg(tag, '' ORDER BY id) AS tags FROM made")
+    seen = until(lambda: _try(lambda: cat.load_table("default.made").scan().to_arrow().num_rows), 5, 30)
+    checks["a table made with its first commit (a staged create: Spark's CREATE TABLE … AS SELECT) is Pondra's CREATE TABLE with the engine's rows"] = \
+        made == [{"n": 5, "top": 4, "tags": "abcde"}] and seen == 5
     checks["refused by name: " + (", ".join(refused) or "(on R2, nothing to try)")] = all(said[k] in v for k, v in refused.items()) \
         and (outside is None or os.path.exists(outside)) and q("SELECT count(*) AS n FROM events WHERE id < 10") == [{"n": 2}]
     [x.kill() for x in (a, b, o, c)]
