@@ -28,7 +28,8 @@ use crate::terms::{alive, claim, deaf, gone_here, holder, latest, listen, lock_d
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use crate::clock::Instant;
+use std::time::Duration;
 
 const STARTUP: Duration = Duration::from_secs(30); // a new leader may need this long to open the catalog
 

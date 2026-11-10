@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 use tokio::sync::oneshot;
 

@@ -14,6 +14,8 @@ pub mod env;
 // What a node's host does when the node must stop or start again, and what the code below it may ask of its form.
 pub mod lifecycle;
 pub mod machine;
+// The one clock: what time it is and how long since, which a test's paused time moves too (the sim, redesign step 3).
+pub mod clock;
 // How a node's calls out reach the network: one client factory, with the policy named by whom a call goes to.
 #[cfg(feature = "lake")] pub mod net;
 // Space of this process's own on this machine's disk: the folders its spills go to.

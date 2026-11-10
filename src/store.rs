@@ -24,7 +24,7 @@ use crate::node_state::NodeState;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, Weak};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -2385,7 +2385,7 @@ impl Lake {
         let opening = async {
             Ok::<_, anyhow::Error>(match writer {
                 true => {
-                    let t0 = datafusion::common::instant::Instant::now();
+                    let t0 = Instant::now();
                     let kv = kv::writer(store.clone(), cache_dir, local, node.clone()).await?;
                     trace_since("the catalog's writer open", t0);
                     Catalog::writer(kv, t0, &node).await?
@@ -3280,7 +3280,7 @@ fn field(f: &mut Bytes) -> Result<Bytes> {
 }
 
 /// A start's line (`NodeState::trace`), timed from `since`: the catalog's open times its own steps.
-pub fn trace_since(what: &str, since: datafusion::common::instant::Instant) {
+pub fn trace_since(what: &str, since: Instant) {
     if crate::env::is_set("PONDRA_TRACE_START") {
         eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
     }

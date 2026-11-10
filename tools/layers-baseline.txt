@@ -16,6 +16,7 @@ budget -> log  2
 cache -> bridge  10
 catalogs -> crypto  2
 catalogs -> fetch  1
+clock -> wasm32  4
 cluster -> app  1
 cluster -> auth  1
 cluster -> format  2
@@ -114,7 +115,7 @@ log -> rules  4
 log -> seq  6
 log -> sys  5
 log -> tier  1
-log -> wasm32  4
+log -> wasm32  2
 machine -> wasm32  2
 manifest -> branch  4
 manifest -> crypto  1

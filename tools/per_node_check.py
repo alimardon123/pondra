@@ -21,8 +21,9 @@ state), and `std::env::set_var` anywhere (the environment is the process's: the 
 node and every child process would read it, and beside a library's host it is a data race).
 
 And a page builds every module but the doors' (ADR-072): std's `Instant` and `SystemTime::now` panic
-there, so those modules read the time through DataFusion's `Instant` (std's own on a node) and
-`log::now_us` or `now_ms`, and a std clock in one fails (CLOCKS below names a file that may, and why).
+there, so those modules read the time through `crate::clock` (its `Instant`, tokio's, which a test's paused
+time moves too, and `wall_us` or `wall_ms`, which `log::now_us` and `now_ms` call), and a std clock in one
+fails (CLOCKS below names a file that may, and why).
 
 And every setting goes through `env.rs` (ADR-061 §8): a `PONDRA_*` name read with `std::env`
 anywhere else fails (by its text, or a constant that names it), so does a `"PONDRA_…"` name the table (`settings.rs`) doesn't list, and a name the table
@@ -186,7 +187,7 @@ STATIC = re.compile(r"\bstatic\s+(?:mut\s+)?([A-Z_][A-Z0-9_]*)\s*:")
 
 # Files a page builds that may read std's clock, each with why.
 CLOCKS = {
-    "log.rs": "now_us itself: the machine's clock on a node (a page's is the browser's, tokio::clock)",
+    "clock.rs": "the one clock itself: the machine's on a node (a page's is the browser's, tokio::clock), ahead by what paused time passed in a test",
 }
 STD_CLOCK = re.compile(r"\bstd::time::(?:Instant|SystemTime)\b|\bstd::time::\{[^}]*\b(?:Instant|SystemTime)\b|(?<![\w:])SystemTime::now\(")
 
@@ -368,7 +369,7 @@ def clocks():
             continue
         for n, line in enumerate(tests_cut(text).split("\n"), 1):
             if STD_CLOCK.search(line.split("//", 1)[0]):
-                bad.append(f"src/{rel}:{n}: std's clock panics on a page: use datafusion::common::instant::Instant (std's own on a node) or crate::log::now_us / now_ms (or add the file to CLOCKS in tools/per_node_check.py with why)")
+                bad.append(f"src/{rel}:{n}: std's clock panics on a page: use crate::clock::Instant (tokio's: std's on a node, paused in a test) or crate::clock::wall_us / wall_ms (or add the file to CLOCKS in tools/per_node_check.py with why)")
     return bad
 
 
