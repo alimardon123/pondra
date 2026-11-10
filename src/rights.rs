@@ -337,6 +337,12 @@ impl Scope {
     /// `Principal::operator`)? A scope made without a principal is not.
     pub fn operator(&self) -> bool { self.asker.as_ref().is_some_and(|a| a.operator) }
 
+    /// The folder name its principal stages a joined page's rows under (`auth::slug`, as `auth::page_creates` checks): none
+    /// for whoever runs the nodes, for a nameless one, and for a scope made without a principal.
+    pub fn slug(&self) -> Option<String> {
+        self.asker.as_ref().filter(|a| !a.operator && !a.name.is_empty()).map(|a| crate::text::hex(a.name.as_bytes()))
+    }
+
     /// What an answer kept for it is kept under, beside its text (`App::remembers`, the Postgres port's too): what it
     /// holds, its grants and its names, never who holds it. So a GRANT or a REVOKE makes another key, and no answer made
     /// under other grants is ever given; "" when whole, as every token's and superuser's answers are kept today. Whom it is

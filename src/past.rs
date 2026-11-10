@@ -49,7 +49,7 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
     ensure!(if attached { scope.knows_named(&named) } else { scope.knows(&named) }, "no table {t}");
     let upto = match &other {
         Some(o) => {
-            crate::users::across(o, t.split('.').next().unwrap_or_default()).await?; // (a lake that signs in on its own: refused, as its plain reads are)
+            crate::users::across(o, t.split('.').next().unwrap_or_default(), scope).await?; // (a lake that signs in on its own: refused, as its plain reads are)
             o.cat.settle().await?;
             Some(o.visible())
         }
@@ -88,7 +88,7 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
     let user: Vec<Expr> = meta.columns().map(|(c, _)| ident(c)).collect();
     let shown = |more: Vec<Expr>| user.iter().cloned().chain(more).collect::<Vec<_>>();
     let system = || if sys { [ROW_ID, VERSION, CREATED, UPDATED].map(col).to_vec() } else { vec![] };
-    let rows = ctx.read_table(crate::query::table_view(lake, ctx, &local, &meta, true, upto).await?)?;
+    let rows = ctx.read_table(crate::query::table_view(lake, ctx, &local, &meta, true, upto, scope).await?)?;
     let made = match at {
         At::Version(n) => col(VERSION).lt_eq(lit(n)),
         At::Time(us) => col(UPDATED).lt_eq(ts(us)),
@@ -100,7 +100,7 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
         false => None,
     };
     if let Some(dmeta) = dmeta {
-        let d = ctx.read_table(crate::query::table_view(lake, ctx, &deleted, &dmeta, true, upto).await?)?;
+        let d = ctx.read_table(crate::query::table_view(lake, ctx, &deleted, &dmeta, true, upto, scope).await?)?;
         let old = match at {
             At::Version(n) => d.clone().filter(col("_old_version").lt_eq(lit(n)).and(col(VERSION).gt(lit(n))))?,
             At::Time(us) => {
