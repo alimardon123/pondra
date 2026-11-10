@@ -343,6 +343,11 @@ fn defaults_kept(n: String, value: String) -> Result<(String, String)> {
         "default_file_format" => Ok((n, taken(&FILE, &value)?)),
         "default_table_access_method" if default || value.trim().eq_ignore_ascii_case("heap") => Ok((TABLE.name.into(), if default { "default".into() } else { "pondra".into() })),
         "default_table_access_method" => Err(crate::codes::coded("22023", format!("default_table_access_method = '{value}': a table here is kept in Pondra's own format (heap); SET default_table_format names another"))),
+        // (a bare name is a table's own, live; `default_` is what new tables copy: the names point at each other)
+        "table_format" | "file_format" => {
+            let (d, own) = if n == "table_format" { (&TABLE, "named by its CREATE TABLE's USING") } else { (&FILE, "set with the table") };
+            Err(crate::codes::coded("42704", format!("unrecognized configuration parameter \"{n}\": a table's {} is its own, {own}; SET {} = '{}' sets the one new tables take", d.what, d.name, d.takes[0])))
+        }
         _ => Ok((n, value)),
     }
 }
@@ -352,6 +357,14 @@ fn defaults_kept(n: String, value: String) -> Result<(String, String)> {
 fn default_shown(n: &str) -> Option<String> {
     let d = [&TABLE, &FILE].into_iter().find(|d| d.name == n)?;
     resolved(d, None, crate::env::get(d.var).as_deref()).ok().map(|(v, _)| v)
+}
+
+/// The settings a client sent as its session started, set for the current session as `SET name = 'value'` sets each, in
+/// order: a Postgres client's startup `options` (`-c name=value`) and `application_name`, as Postgres sets them. A value
+/// `SET` refuses is refused here with its code, and the connection with it.
+pub fn at_start(settings: &[(String, String)]) -> Result<()> {
+    let session = crate::temp::current().context(NO_SESSION)?;
+    settings.iter().try_for_each(|(n, v)| set(&session, n, v.clone()))
 }
 
 fn set(session: &str, variable: &str, value: String) -> Result<()> {
@@ -436,8 +449,41 @@ pub fn dialect() -> Option<Box<dyn datafusion::sql::sqlparser::dialect::Dialect>
 /// setting that names one), else the node's (`PONDRA_LANGUAGE`, or `PONDRA_SQL_OPTIONS`'s dialect where that names one),
 /// else Pondra's SQL.
 pub fn language() -> &'static str {
+    own_language().unwrap_or_else(node_language)
+}
+
+/// The node's language, a session's when it sets none: `PONDRA_LANGUAGE`, or `PONDRA_SQL_OPTIONS`'s dialect where that
+/// names one, else Pondra's SQL.
+pub fn node_language() -> &'static str {
     let named = |n: String| crate::languages::get().named(&n).map(|l| l.name);
-    own_language().or_else(|| crate::env::get("PONDRA_LANGUAGE").and_then(named)).or_else(|| node_dialect().and_then(named)).unwrap_or(crate::parsed::LANGUAGE.name)
+    crate::env::get("PONDRA_LANGUAGE").and_then(named).or_else(|| node_dialect().and_then(named)).unwrap_or(crate::parsed::LANGUAGE.name)
+}
+
+/// What a statement does to the session's language, as `statement` does it: `Some(Some(name))` when it sets one (by
+/// `language`, or by DataFusion's dialect where that names one), `Some(None)` when it lets the session's own go (RESET
+/// language or ALL, DISCARD ALL, a dialect that names none), `None` when it doesn't touch it. A request's statements
+/// after it are read in the language it leaves (`statement::in_language`), as each would be sent on its own.
+pub(crate) fn language_change(one: &str) -> Option<Option<String>> {
+    let head = crate::text::head(one);
+    if !["set", "reset", "discard"].iter().any(|h| head.eq_ignore_ascii_case(h)) {
+        return None;
+    }
+    let mut parsed = Parser::parse_sql(&GenericDialect {}, one).ok()?;
+    let assigned = |n: &str, value: String| match name(n).as_str() {
+        "language" => Some(Some(value)),
+        DIALECT => Some(crate::languages::get().named(&value).map(|l| l.name.to_string())),
+        _ => None,
+    };
+    match (parsed.len(), parsed.pop()?) {
+        (1, Statement::Set(Set::SingleAssignment { variable, values, .. })) => assigned(&variable.to_string(), values.iter().map(text).collect::<Result<Vec<_>>>().ok()?.join(", ")),
+        (1, Statement::Set(Set::MultipleAssignments { assignments })) => assignments.iter().filter_map(|a| assigned(&a.name.to_string(), text(&a.value).ok()?)).last(),
+        (1, Statement::Reset(r)) => match r.reset {
+            Reset::ALL => Some(None),
+            Reset::ConfigurationParameter(n) => matches!(name(&n.to_string()).as_str(), "language" | DIALECT).then_some(None),
+        },
+        (1, Statement::Discard { object_type: ast::DiscardObject::ALL }) => Some(None),
+        _ => None,
+    }
 }
 
 /// The language the session itself set (`SET language`, or the dialect's setting that names one), not the node's.
@@ -531,6 +577,9 @@ mod tests {
         assert_eq!(kept("default_table_access_method", "heap").unwrap(), ("default_table_format".into(), "pondra".into()));
         let e = kept("default_table_access_method", "columnar").unwrap_err();
         assert!(crate::codes::of(&e) == "22023" && e.to_string().contains("SET default_table_format"), "{e}");
+        let e = kept("file_format", "parquet").unwrap_err();
+        assert!(crate::codes::of(&e) == "42704" && e.to_string().contains("SET default_file_format = 'parquet' sets the one new tables take"), "{e}");
+        assert!(kept("table_format", "pondra").unwrap_err().to_string().contains("named by its CREATE TABLE's USING; SET default_table_format"));
         assert_eq!(kept("search_path", "crm").unwrap(), ("search_path".into(), "crm".into()), "any other setting is kept as given");
 
         assert_eq!(resolved(&TABLE, Some("pondra".into()), Some("nope")).unwrap(), ("pondra".into(), Source::Session), "the session's first");
@@ -590,5 +639,16 @@ mod tests {
             assert!(is(form), "{form}");
         }
         assert!(!is("-- DISCARD ALL\nSELECT 1"));
+    }
+
+    /// The settings a session may set over its node's are the registry's rows that say so (`pondra.settings`' `session`): the
+    /// defaults kept here, each by its name.
+    #[test]
+    fn the_settings_a_session_sets_over_its_nodes_are_the_registrys() {
+        let mut rows: Vec<(String, &str)> = crate::settings::all().iter().filter(|s| s.session).map(|s| (s.name(), s.var)).collect();
+        rows.sort();
+        let mut kept: Vec<(String, &str)> = [&TABLE, &FILE].iter().map(|d| (d.name.to_string(), d.var)).collect();
+        kept.sort();
+        assert_eq!(rows, kept);
     }
 }

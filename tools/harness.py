@@ -7289,8 +7289,8 @@ def writes():
     file recorded where it wrote it: ADR-029), and its snapshot is found under its id; two writers
     at once, one retrying on 409, each applied once; a commit sent twice applied once; a view and
     the Delta copy follow; an attached lake's table; Pondra itself writing to another Pondra's;
-    refused by name: a keyed table, files outside the table's folder, and a rollback, an expiry of
-    snapshots and a change of partitioning, each naming Pondra's way. (`adopted`: what round 27
+    a rollback taken as Pondra's RESTORE; refused by name: a keyed table, files outside the table's
+    folder, an expiry of snapshots and a change of partitioning, each naming Pondra's way. (`adopted`: what round 27
     added; `rewrites`: round 28's deletes, overwrites and schema changes.)"""
     import deltalake, glob as g, http.server, pyarrow as pa
     from pyiceberg.catalog import load_catalog
@@ -7361,10 +7361,31 @@ def writes():
     # (what Pondra's SQL does another way, named: the Iceberg review's I6)
     t = cat.load_table("default.events")
     first = t.metadata.snapshots[0].snapshot_id  # (the oldest listed: the current one's ancestor)
-    refused["a rollback"] = _raises_text(lambda: t.manage_snapshots().rollback_to_snapshot(first).commit())
     refused["an expiry of snapshots"] = _raises_text(lambda: t.maintenance.expire_snapshots().by_id(first).commit())
     refused["a change of partitioning"] = _raises_text(lambda: t.update_spec().add_identity("name").commit())
-    said = {"files outside the table's folder": "data folder", "a rollback": "RESTORE TABLE", "an expiry of snapshots": "--retain-secs", "a change of partitioning": "PARTITION BY"}
+    said = {"files outside the table's folder": "data folder", "an expiry of snapshots": "--retain-secs", "a change of partitioning": "PARTITION BY"}
+    # (a rollback is taken: Pondra's RESTORE to that snapshot's time, I6. Every row here comes through the catalog, each
+    # append published as it commits, so the table then is that snapshot's rows exactly)
+    q("CREATE TABLE back (id BIGINT) WITH (publish = 'iceberg')")
+    until(lambda: _try(lambda: cat.load_table("default.back")) is not None, True, 30)
+    tb, ids = cat.load_table("default.back"), lambda lo, hi: pa.table({"id": pa.array(range(lo, hi), pa.int64())})
+    tb.append(ids(0, 10))
+    kept = tb.current_snapshot().snapshot_id
+    tb.append(ids(10, 30))
+    tb.manage_snapshots().rollback_to_snapshot(kept).commit()
+    back = q("SELECT count(*) AS n, max(id) AS top FROM back")
+    seen = until(lambda: _try(lambda: cat.load_table("default.back").scan().to_arrow().num_rows), 10, 30)
+    checks["a rollback through the catalog is Pondra's RESTORE to that snapshot's time: the table, and the engine's next read, as they were then"] = \
+        back == [{"n": 10, "top": 9}] and seen == 10
+    # (a table made with its first commit, Spark's CREATE TABLE … AS SELECT: Pondra's CREATE TABLE, then the engine's files
+    # taken as an append's are)
+    txn = cat.create_table_transaction("default.made", pa.schema([("id", pa.int64()), ("tag", pa.string())]))
+    txn.append(pa.table({"id": pa.array(range(5), pa.int64()), "tag": pa.array(list("abcde"))}))
+    txn.commit_transaction()
+    made = q("SELECT count(*) AS n, max(id) AS top, string_agg(tag, '' ORDER BY id) AS tags FROM made")
+    seen = until(lambda: _try(lambda: cat.load_table("default.made").scan().to_arrow().num_rows), 5, 30)
+    checks["a table made with its first commit (a staged create: Spark's CREATE TABLE … AS SELECT) is Pondra's CREATE TABLE with the engine's rows"] = \
+        made == [{"n": 5, "top": 4, "tags": "abcde"}] and seen == 5
     checks["refused by name: " + (", ".join(refused) or "(on R2, nothing to try)")] = all(said[k] in v for k, v in refused.items()) \
         and (outside is None or os.path.exists(outside)) and q("SELECT count(*) AS n FROM events WHERE id < 10") == [{"n": 2}]
     [x.kill() for x in (a, b, o, c)]
@@ -8922,14 +8943,18 @@ def history():
         basic = lambda u, p: {"Authorization": "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()}
         ann, boss = basic("ann", "ann-password-1"), basic("boss", "boss-password-1")
         q("CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")  # (then everyone signs in)
-        for s in ["CREATE USER ann PASSWORD 'ann-password-1'", "GRANT SELECT ON t TO ann"]:
+        cy = basic("cy", "cy-password-1")
+        for s in ["CREATE USER ann PASSWORD 'ann-password-1'", "GRANT SELECT ON t TO ann", "CREATE USER cy PASSWORD 'cy-password-1'", "GRANT SELECT ON t TO cy"]:
             q(s, headers=boss)
         q("SELECT count(*) AS n FROM t -- h-ann", headers=ann)
+        q("SELECT count(*) AS n FROM t -- h-cy", headers=cy)
         time.sleep(2.5)
         mine = q("SELECT DISTINCT \"user\" FROM pondra.history", headers=ann)
+        theirs = q("SELECT DISTINCT \"user\" FROM pondra.history", headers=cy)  # (the same text, under the same grants: the same cache key, `Scope::key`)
         everyone = q("SELECT DISTINCT \"user\" FROM pondra.history", headers=boss)
-        seen["users"] = {"ann sees": mine, "boss sees": everyone}
+        seen["users"] = {"ann sees": mine, "cy sees": theirs, "boss sees": everyone}
         checks["an admin reads every row, a user their own"] = mine == [{"user": "ann"}] and len(everyone) > 1
+        checks["two users with the same grants read their own rows (never one kept answer)"] = mine == [{"user": "ann"}] and theirs == [{"user": "cy"}]
     finally:
         for n in (a, b, c):
             n.kill()
