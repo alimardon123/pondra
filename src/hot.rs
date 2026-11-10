@@ -819,7 +819,7 @@ impl TableProvider for HotFiles {
         let files: Vec<&DataFile> = match deletes || filters.is_empty() {
             true => self.files.iter().collect(),
             false => {
-                let keep = crate::manifest::keep(&self.files.iter().map(|f| &f.stats).collect::<Vec<_>>(), filters, &self.schema);
+                let keep = crate::manifest::keep(&self.files.iter().map(|f| f as &dyn crate::bounds::Ranged).collect::<Vec<_>>(), filters, &self.schema);
                 let kept: Vec<&DataFile> = self.files.iter().zip(keep).filter_map(|(f, k)| k.then_some(f)).collect();
                 crate::metrics::add(&self.lake.node.metrics.files_skipped, (self.files.len() - kept.len()) as u64);
                 kept

@@ -33,6 +33,10 @@ pub const SEAL: usize = 64; // …then all but the newest this many are sealed
 const BIG: u64 = 4096; // files per manifest at most; smaller manifests are merged, 16 at a time
 
 pub use crate::data_file::{text, Stats};
+use crate::bounds::Ranged;
+
+/// Column -> its (min, max), typed: what a query's planning knows of a table's values (`ranges`).
+pub type Values = BTreeMap<String, (ScalarValue, ScalarValue)>;
 
 /// A manifest's entry in the table's list: where it is, what it holds, its columns' ranges.
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -41,7 +45,10 @@ pub struct Manifest {
     pub files: u64,
     pub rows: u64,
     pub bytes: u64,
-    pub stats: Stats,
+    pub stats: Stats, // (always written: a node from before format 8 needs it)
+    /// The same, typed (`bounds.rs`), as its files keep them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bounds: crate::bounds::Bounds,
     /// The columns any of its files holds a NULL in (None: some file doesn't say).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nulls: Option<Vec<String>>,
@@ -135,37 +142,33 @@ pub fn orderable(t: &DataType) -> bool {
 
 /// The ranges covering a table's whole contents: its manifests' and its files'. What a query's
 /// planning knows about the values in each column (`query::facts`, kept once per version of the table).
-pub fn ranges(manifests: &[Manifest], files: &[DataFile], schema: &SchemaRef) -> Stats {
-    let parts: Vec<&Stats> = manifests.iter().map(|m| &m.stats).chain(files.iter().map(|f| &f.stats)).collect();
+pub fn ranges(manifests: &[Manifest], files: &[DataFile], schema: &SchemaRef) -> Values {
+    let parts: Vec<&dyn Ranged> = manifests.iter().map(|m| m as &dyn Ranged).chain(files.iter().map(|f| f as &dyn Ranged)).collect();
     union(&parts, schema)
 }
 
 /// The ranges covering all of `parts` (a column missing from any of them has no range).
-fn union(parts: &[&Stats], schema: &SchemaRef) -> Stats {
-    let Some(first) = parts.first() else { return Stats::new() };
-    let mut out = Stats::new();
-    for (col, _) in first.iter() {
-        let Ok(f) = schema.field_with_name(col) else { continue };
-        let parse = |s: &String| ScalarValue::try_from_string(s.clone(), f.data_type()).ok();
-        let ranges: Option<Vec<(ScalarValue, ScalarValue)>> = parts.iter().map(|s| s.get(col).and_then(|(a, b)| Some((parse(a)?, parse(b)?)))).collect();
-        let Some(ranges) = ranges else { continue };
+fn union(parts: &[&dyn Ranged], schema: &SchemaRef) -> Values {
+    let mut out = Values::new();
+    for f in schema.fields().iter().filter(|_| !parts.is_empty()) {
+        let Some(ranges) = parts.iter().map(|p| p.range(f.name(), f.data_type())).collect::<Option<Vec<_>>>() else { continue };
         let lo = ranges.iter().map(|r| &r.0).min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let hi = ranges.iter().map(|r| &r.1).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        if let (Some(lo), Some(hi)) = (lo.and_then(text), hi.and_then(text)) {
-            out.insert(col.clone(), (lo, hi));
+        if let (Some(lo), Some(hi)) = (lo, hi) {
+            out.insert(f.name().clone(), (lo.clone(), hi.clone()));
         }
     }
     out
 }
 
-/// Which of the containers (files or manifests, by their stats) can hold rows matching all of
-/// `filters`. Anything the stats can't decide is kept.
-pub fn keep(stats: &[&Stats], filters: &[Expr], schema: &SchemaRef) -> Vec<bool> {
-    crate::scan::may_match(&View { stats, schema }, filters, schema)
+/// Which of the containers (files or manifests, by their ranges) can hold rows matching all of
+/// `filters`. Anything the ranges can't decide is kept.
+pub fn keep(parts: &[&dyn Ranged], filters: &[Expr], schema: &SchemaRef) -> Vec<bool> {
+    crate::scan::may_match(&View { parts, schema }, filters, schema)
 }
 
 struct View<'a> {
-    stats: &'a [&'a Stats],
+    parts: &'a [&'a dyn Ranged],
     schema: &'a SchemaRef,
 }
 
@@ -173,15 +176,14 @@ impl View<'_> {
     fn values(&self, c: &Column, max: bool) -> Option<ArrayRef> {
         let t = self.schema.field_with_name(&c.name).ok()?.data_type().clone();
         let null = ScalarValue::try_from(&t).ok()?;
-        let v = self.stats.iter().map(|s| s.get(&c.name).and_then(|(lo, hi)| ScalarValue::try_from_string(if max { hi } else { lo }.clone(), &t).ok()).unwrap_or(null.clone()));
-        ScalarValue::iter_to_array(v).ok()
+        ScalarValue::iter_to_array(self.parts.iter().map(|p| p.end(&c.name, &t, max).unwrap_or(null.clone()))).ok()
     }
 }
 
 impl PruningStatistics for View<'_> {
     fn min_values(&self, c: &Column) -> Option<ArrayRef> { self.values(c, false) }
     fn max_values(&self, c: &Column) -> Option<ArrayRef> { self.values(c, true) }
-    fn num_containers(&self) -> usize { self.stats.len() }
+    fn num_containers(&self) -> usize { self.parts.len() }
     fn null_counts(&self, _: &Column) -> Option<ArrayRef> { None }
     fn row_counts(&self) -> Option<ArrayRef> { None }
     fn contained(&self, _: &Column, _: &HashSet<ScalarValue>) -> Option<BooleanArray> { None }
@@ -242,12 +244,12 @@ pub async fn pruned(lake: &Lake, meta: &TableMeta, manifests: Option<&[Manifest]
             &owned
         }
     };
-    let kept = keep(&listed.iter().map(|m| &m.stats).collect::<Vec<_>>(), filters, schema);
+    let kept = keep(&listed.iter().map(|m| m as &dyn Ranged).collect::<Vec<_>>(), filters, schema);
     let wanted: Vec<&Manifest> = listed.iter().zip(kept).filter(|(_, k)| *k).map(|(m, _)| m).collect();
     let loads: Vec<_> = wanted.into_iter().map(|m| files(lake, m)).collect();
     let loaded: Vec<DataFile> = futures::StreamExt::buffered(futures::stream::iter(loads), 32).try_collect::<Vec<Vec<DataFile>>>().await?.into_iter().flatten().collect();
     // (the entry's own files are judged where they are: only those kept are copied)
-    let kept = keep(&loaded.iter().chain(&meta.files).map(|f| &f.stats).collect::<Vec<_>>(), filters, schema);
+    let kept = keep(&loaded.iter().chain(&meta.files).map(|f| f as &dyn Ranged).collect::<Vec<_>>(), filters, schema);
     let (from_lists, from_entry) = kept.split_at(loaded.len());
     let mut files: Vec<DataFile> = loaded.into_iter().zip(from_lists).filter(|(_, k)| **k).map(|(f, _)| f).collect();
     files.extend(meta.files.iter().zip(from_entry).filter(|(_, k)| **k).map(|(f, _)| f.clone()));
@@ -272,9 +274,10 @@ async fn write(lake: &Lake, dir: &str, files: &[DataFile], schema: &SchemaRef) -
 }
 
 fn summary(path: String, files: &[DataFile], schema: &SchemaRef) -> Manifest {
-    let stats = union(&files.iter().map(|f| &f.stats).collect::<Vec<_>>(), schema);
+    let typed = union(&files.iter().map(|f| f as &dyn Ranged).collect::<Vec<_>>(), schema);
+    let stats = typed.iter().filter_map(|(c, (lo, hi))| Some((c.clone(), (text(lo)?, text(hi)?)))).collect();
     let nulls = files.iter().map(|f| f.nulls.clone()).collect::<Option<Vec<_>>>().map(|n| n.concat().into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect());
-    Manifest { path, files: files.len() as u64, rows: files.iter().map(|f| f.rows).sum(), bytes: files.iter().map(|f| f.bytes).sum(), stats, nulls }
+    Manifest { path, files: files.len() as u64, rows: files.iter().map(|f| f.rows).sum(), bytes: files.iter().map(|f| f.bytes).sum(), stats, nulls, ..Default::default() }
 }
 
 /// Leader, in `tier::maintain`: seal the oldest inline files once there are too many, and merge
