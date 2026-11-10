@@ -100,14 +100,24 @@ pub fn reads_only(stmt: &crate::write::Stmt) -> bool {
     matches!(stmt, Stmt::CopyTo(..)) || matches!(stmt, Stmt::Ddl(ds) if ds.iter().all(|d| matches!(d, Ddl::BackupDatabase { .. })))
 }
 
+/// When a backup's pins were last looked at (`tend`, hourly).
+#[derive(Default)]
+pub struct Tended(std::sync::Mutex<u64>);
+
+impl crate::lake_state::LakeState for Tended {
+    const NAME: &'static str = "backups";
+    const ABOUT: &'static str = "when its backups' pins were last looked at (hourly)";
+    fn make() -> Self { Tended::default() }
+}
+
 /// A backup's leader, in place of a tiering round: its tables never change, so only its readers
 /// (its clones' pins) are kept as a lake keeps them, hourly: one on lease that wasn't renewed goes, and one whose
 /// clone is gone (`pins::lapse`, `sweep`).
 pub async fn tend(lake: &Lake) -> Result<()> {
-    crate::per_node!(static LOOKED: std::sync::Mutex<u64> = std::sync::Mutex::new(0));
+    let tended = lake.state::<Tended>()?;
     let now = crate::log::now_ms();
     {
-        let mut looked = LOOKED.lock().unwrap();
+        let mut looked = tended.0.lock().unwrap();
         if *looked + 3_600_000 > now {
             return Ok(());
         }

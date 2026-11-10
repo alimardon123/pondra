@@ -17,9 +17,9 @@ pub(crate) const LONGEST: usize = 64 << 10;
 
 type Parsed = Arc<Result<Vec<Statement>, ParserError>>;
 
-// (the last texts and what they parsed to: a per-node static, so a node's stop lets them go. An interim, as `text::TOKENS`
-// is: step 8's statement context carries the parse instead)
-crate::per_node!(static LAST: Mutex<VecDeque<(String, Parsed)>> = Mutex::new(VecDeque::new()));
+// (the last texts and what they parsed to: a function of the text (a tree kept, `keep`, is its text's parse), so the
+// process's, the same for any lake here. An interim, as `text::TOKENS` is: step 8's statement context carries the parse instead)
+static LAST: std::sync::LazyLock<Mutex<VecDeque<(String, Parsed)>>> = std::sync::LazyLock::new(Default::default);
 
 /// `sql` parsed as `Parser::parse_sql(&GenericDialect {}, sql)` parses it, the same statements or the same error, but
 /// for `signed`'s parentheses. Under the one-parse check (`checked`) each query is held to its print: it reads back as

@@ -743,21 +743,33 @@ pub fn files(catalog: &std::collections::BTreeMap<String, bytes::Bytes>) -> Vec<
     records.filter_map(|(k, v)| Some((k.strip_prefix("xt/")?, serde_json::from_slice::<Installed>(v).ok()?))).map(|(name, r)| file_key(name, &r.version, &r.sha256)).collect()
 }
 
+/// The installed extensions as the catalog last read them, with the catalog version they were read at: one lake, one entry
+/// (`listed`).
+#[cfg(feature = "lake")]
+#[derive(Default)]
+pub struct Listed(std::sync::Mutex<Option<(u64, Arc<Vec<(String, Installed)>>)>>);
+
+#[cfg(feature = "lake")]
+impl crate::lake_state::LakeState for Listed {
+    const NAME: &'static str = "extensions_listed";
+    const ABOUT: &'static str = "the installed extensions, as the catalog last read them";
+    fn make() -> Self { Listed::default() }
+}
+
 /// The installed extensions with their records, by name: read again only after a commit, as `routines::listed` is (every
 /// query asks, some twice).
 #[cfg(feature = "lake")]
 pub async fn listed(lake: &Lake) -> Result<Vec<(String, Installed)>> {
-    type Seen = std::sync::Mutex<std::collections::HashMap<String, (u64, Arc<Vec<(String, Installed)>>)>>;
-    crate::per_node!(static SEEN: Seen = Default::default());
+    let seen = lake.state::<Listed>()?;
     let version = lake.cat.version();
-    if let (Some(v), Some((at, all))) = (version, SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&lake.url)) {
+    if let (Some(v), Some((at, all))) = (version, seen.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref()) {
         if *at == v {
             return Ok(all.to_vec());
         }
     }
     let all: Arc<Vec<(String, Installed)>> = Arc::new(lake.cat.scan::<Installed>("xt/", "xt0").await?.into_iter().map(|(k, v)| (k["xt/".len()..].to_string(), v)).collect());
     if let Some(v) = version {
-        SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(lake.url.clone(), (v, all.clone()));
+        *seen.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((v, all.clone()));
     }
     Ok(all.to_vec())
 }
@@ -780,12 +792,16 @@ fn file_of(from: &str) -> String {
     from.split(['?', '#']).next().unwrap_or(from).rsplit('/').next().unwrap_or(from).to_string()
 }
 
-/// The host of installed extensions (`ext_host`), as an extension: it gives each lake's sessions `extensions()`.
+/// The host of installed extensions (`ext_host`), as an extension: it gives each lake's sessions `extensions()`, and the
+/// lake keeps what `listed` read (`Listed`).
 #[cfg(feature = "lake")]
 pub static EXT_HOST: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "ext_host",
     requires: &["engine"],
-    register: |r| r.section_mut::<crate::engine::LakeFunctions>().add("extensions", register),
+    register: |r| {
+        r.section_mut::<crate::engine::LakeFunctions>().add("extensions", register);
+        r.section_mut::<crate::lake_state::Registered>().add::<Listed>();
+    },
 };
 
 /// `extensions()`: each extension's name, version, file's hash and size, where it came from, who installed it and when, and

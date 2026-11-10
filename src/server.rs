@@ -855,8 +855,11 @@ async fn replica(State(app): State<App>, Query(p): Query<AckParams>) -> Result<V
 /// Body: a table's definition (see `write::TableSpec`): `[["user","Utf8"],…]`, or
 /// `{"columns": [...], "key": ["user"], "merge": {...}, "publish": [...], "cluster_by": [...]}`.
 async fn create_table(State(app): State<App>, Path(name): Path<String>, headers: HeaderMap, body: String) -> Result<Json<Value>, E> {
-    if crate::sys::hidden(&name) {
-        return Err(E(anyhow::anyhow!("{name} is written by Pondra alone"))); // (a replace's staged table is the leader's own: `write::create_as`)
+    // (a hidden table is Pondra's own; a replace's staged table is made here by the node its statement runs on, a follower too
+    // (`replace::replacing_with`), under the name its job gives it (`sys::staged`), and by no other)
+    let staged = crate::sys::staged_for(&name).is_some_and(|t| serde_json::from_str::<Value>(&body).ok().and_then(|s| s["made_by"].as_str().map(|job| crate::sys::staged(t, job) == name)).unwrap_or(false));
+    if crate::sys::hidden(&name) && !staged {
+        return Err(E(anyhow::anyhow!("{name} is written by Pondra alone")));
     }
     if !cluster_call(&app, &headers) {
         crate::protect::check_table(&app.lake, &name).await?; // (it may add columns to a project's table)
@@ -1390,7 +1393,7 @@ async fn stats(State(app): State<App>, who: Option<axum::Extension<crate::auth::
     if let (true, Some(node)) = (members.is_leader(), crate::cluster::of(&app)) {
         s["releases"] = j!(node.releases()); // (each live node's: a rolling upgrade's progress)
     }
-    s["row_locks"] = j!(crate::locks::count(&app.lake.url)); // (ADR-067 §3: the row locks this lake's leader holds now)
+    s["row_locks"] = j!(crate::locks::count(&app.lake)); // (ADR-067 §3: the row locks this lake's leader holds now)
     if let Some(seq) = &app.seq {
         s["untiered_rows"] = j!(app.lake.backlog.load(std::sync::atomic::Ordering::Relaxed));
         let mut ms = seq.commit_ms.lock().unwrap().clone();

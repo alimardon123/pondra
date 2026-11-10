@@ -27,6 +27,7 @@ pub static ICEBERG: crate::registry::BuiltIn = crate::registry::BuiltIn {
         r.section_mut::<crate::records::Prefixes>().add(crate::iceberg::PREFIXES);
         r.section_mut::<crate::store::Published>().add("iceberg metadata", crate::iceberg::metadata_file); // (written, never read: `store::published`)
         r.section_mut::<crate::lake_state::Registered>().add::<crate::read_iceberg::Manifests>();
+        r.section_mut::<crate::lake_state::Registered>().add::<crate::catalogs::Stores>();
     },
 };
 
@@ -185,7 +186,7 @@ impl Rest {
         let id = crate::text::hex(&crate::crypto::sha256(format!("{url}\n{}\n{}\n{location}", options["namespace"], options["table"]).as_bytes())[..12]);
         let made = crate::text::hex(&crate::crypto::sha256(serde_json::to_vec(&params)?.as_slice()));
         let root = format!("delegated://{id}");
-        let store = stored(&root, &made, || Ok(Arc::new(crate::cache::CachedStore::files(crate::ext::build(&url::Url::parse(&bucket)?, Some(&params), crate::ext::For::Files)?))))?;
+        let store = stored(lake, &root, &made, || Ok(Arc::new(crate::cache::CachedStore::files(crate::ext::build(&url::Url::parse(&bucket)?, Some(&params), crate::ext::For::Files)?))))?;
         lake.rt.register_object_store(&url::Url::parse(&root)?, store.clone());
         Ok(Some(Delegated { prefix: format!("s3://{}{}", u.host_str().unwrap_or_default(), u.path()), bucket, root, store }))
     }
@@ -200,18 +201,27 @@ pub struct Delegated {
     store: Arc<dyn object_store_df::ObjectStore>,
 }
 
+/// The object stores a lake made for its Iceberg catalogs' delegated roots, by root, with the credentials each was made from.
+#[derive(Default)]
+pub struct Stores(Mutex<HashMap<String, (String, Arc<dyn object_store_df::ObjectStore>)>>);
+
+impl crate::lake_state::LakeState for Stores {
+    const NAME: &'static str = "iceberg_stores";
+    const ABOUT: &'static str = "the stores it made for its Iceberg catalogs' roots, with the credentials each was made from";
+    fn make() -> Self { Stores::default() }
+}
+
 /// The stores made for delegated roots, by root, with what they were made from: made again only
 /// when the credentials change (a store keeps what it read of each file's version).
-fn stored(root: &str, made: &str, make: impl FnOnce() -> Result<Arc<dyn object_store_df::ObjectStore>>) -> Result<Arc<dyn object_store_df::ObjectStore>> {
-    type Made = HashMap<String, (String, Arc<dyn object_store_df::ObjectStore>)>;
-    crate::per_node!(static MADE: Mutex<Option<Made>> = Mutex::new(None));
-    if let Some((m, s)) = MADE.lock().unwrap().get_or_insert_default().get(root) {
+fn stored(lake: &Lake, root: &str, made: &str, make: impl FnOnce() -> Result<Arc<dyn object_store_df::ObjectStore>>) -> Result<Arc<dyn object_store_df::ObjectStore>> {
+    let stores = lake.state::<Stores>()?;
+    if let Some((m, s)) = stores.0.lock().unwrap().get(root) {
         if m == made {
             return Ok(s.clone());
         }
     }
     let s = make()?;
-    MADE.lock().unwrap().get_or_insert_default().insert(root.to_string(), (made.to_string(), s.clone()));
+    stores.0.lock().unwrap().insert(root.to_string(), (made.to_string(), s.clone()));
     Ok(s)
 }
 

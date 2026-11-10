@@ -3,13 +3,12 @@
 
   per_node_check.py [--list]
 
-One process may start a node, stop it and start another on another lake (`pondra.open`). So every
-static in `src/` (outside `#[cfg(test)]`) that can change once made must be one of:
-
-- `per_node!`: the node's own, set back by `reset::reset()` when it stops (an atomic one starts at
-  0 or false, which is what it is set back to);
-- in PROCESS below, with the reason it outlives a node (a setting, fixed by the first open as
-  ADR-061 §8 decides; the process's runtime; a lock that holds nothing).
+One process may start a node, stop it and start another on another lake (`pondra.open`), or run several
+at once. So a node's state is never a static: it is its lake's (a `LakeState`, `lake.state::<T>()`) or its
+node's (`NodeState`), and goes with them (redesign step 2; `per_node!` and `reset.rs`, which set statics back
+at a node's stop, are gone). Every static in `src/` (outside `#[cfg(test)]`) that can change once made must
+be in PROCESS below, with the reason it outlives a node (a setting, fixed by the first open as ADR-061 §8
+decides; the process's runtime; a lock that holds nothing; what the machine has one of).
 
 A regex, a `task_local!` key and a value nothing can change once made (no lock, atomic, cell or
 channel in its type: a table of constants, or a setting read once) need neither. Anything else fails
@@ -17,8 +16,8 @@ here by file, line and name, saying what to do. `--list` prints every static and
 
 Two more ways a node outlives its stop fail here too: a task started with `tokio::spawn` (or on a
 runtime's handle) outside `spawns.rs`, which `Node::stop` can't end (start it on the node's list,
-`Tasks::spawn_node` or `Tasks::spawn_as`, or with `spawns::for_statics` for a loop of the node's
-statics), and `std::env::set_var` anywhere (the environment is the process's: the next
+`Tasks::spawn_node` or `Tasks::spawn_as`, or on a state's `spawns::Loops` for a loop that serves that
+state), and `std::env::set_var` anywhere (the environment is the process's: the next
 node and every child process would read it, and beside a library's host it is a data race).
 
 And a page builds every module but the doors' (ADR-072): std's `Instant` and `SystemTime::now` panic
@@ -69,7 +68,7 @@ PROCESS = {
     "defaults.rs:BASE": "the functions every session has, with no tables, for CHECK, DEFAULT and expectation expressions: nothing of a lake (what registers one gets a copy)",
     "dbserver.rs:KEY": "the key a lakes server gives its databases' nodes (`client_key`): one a process, made once",
     "ledger.rs:ROOTS": "the process's memory, every node's budget held on it (redesign step 2, review change 4): one root for the sizes its machine and settings gave, so one in any process but a test's",
-    "library.rs:OPEN": "whether a library's node is open in the process: one at a time, since a halt resets every node's statics (`reset::reset`)",
+    "library.rs:OPEN": "whether a library's node is open in the process: one at a time, since the machine and network its first start installs are the process's",
     "library.rs:R": "a library's runtime, kept for the next open: its threads are the process's, as the queries' runtime's are",
     "env.rs:GIVEN": "what the process was given (open's options, the command line's flags): fixed by its first open (ADR-061 §8)",
     "env.rs:HANDED": "what the Pondra process that started this one handed it (`settings::Line`), read once before anything: where its environment's would be",
@@ -90,14 +89,14 @@ PROCESS = {
     "main.rs:ALLOC": "the allocator: one a process, the program's (ADR-061 §1)",
     "metrics.rs:RUNNING": "a gauge of the process's queries running now: a stopped node's last ones count themselves down (set back to 0, it would wrap)",
     "metrics.rs:WAITING": "a gauge of the process's queries waiting for a turn, as RUNNING",
-    "node.rs:CLAIMED": "a live page holds the module's page (`node::claim_page`, `page::Page::claim`): plain, not per_node!, since a freed page's member closes in the background, and its reset() would give back the claim of the page made after it",
+    "node.rs:CLAIMED": "a live page holds the module's page (`node::claim_page`, `page::Page::claim`): the module's one page, which unclaim_page alone gives back (a freed page's member closes in the background, after the next page may have claimed it)",
     "machine.rs:HOSTED": "what the process is: a library's, from its first open (ADR-061 §5)",
     "machine.rs:INSTALLED": "the process's machine, installed once by its host as its allocator is chosen once; a node holds it (`NodeState::machine`)",
     "net.rs:INSTALLED": "the process's clients by policy, installed once by its host as its machine is; a node holds them (`NodeState::net`)",
     "net.rs:UNINSTALLED": "the clients of a process whose host installed none (`net::process`): only their keep-alive sockets",
     "scratch.rs:INSTALLED": "the process's spill space, installed once by its host as its machine is; a node holds it (`NodeState::scratch`)",
     "scratch.rs:UNINSTALLED": "this machine's folders, for a process whose host installed no space (`scratch::process`): no state of its own",
-    "node.rs:PAGED": "a page's member is open in this process (`node::open_page`): plain, not per_node!, since reset() would set it back before the other statics, and a page opened in that gap would have them cleared under it; end_page sets it back last",
+    "node.rs:PAGED": "a page's member is open in this process (`node::open_page`): the module's one member, which end_page sets back last, once the one before has let go of everything",
     "oom.rs:WATCH": "the process's memory watch (redesign step 2): what it read last, whether it waits or runs, and its wake, for the memory of the whole process; started once at the first node's start, it lives as long as the process",
     "optimize.rs:NEXT": COUNTER,
     "origins.rs:ORIGINS": SETTING + " (PONDRA_WEB_ORIGINS)",
@@ -121,7 +120,6 @@ PROCESS = {
     "avg.rs:AVG_OF": "a function's definition (pondra_avg_of), the same for every lake",
     "multiply.rs:MULTIPLY": "a function's definition (pondra_multiply), the same for every lake",
     "divide.rs:DIVIDE": "a function's definitions (pondra_divide, Postgres's places and Spark's), the same for every lake",
-    "reset.rs:USED": "what reset() sets back: every per-node static used since the process started",
     "runs.rs:WAKE": SIGNAL,
     "runs.rs:WRITTEN": SIGNAL,
     "app.rs:TURNS": SETTING + " (PONDRA_QUERIES, PONDRA_QUEUE_SECS; a stopped node's last queries give their turns back to it)",
@@ -130,6 +128,9 @@ PROCESS = {
     "memory_lake.rs:MEMORY": "the lakes held in this process's memory: a node restarting in place finds its own; the library's close lets it go (`forget_memory`), and the program's end (`memory::leave`) empties the map",
     "memory_lake.rs:COUNTED": "the counted opens of the lakes in this process's memory, which `held_in_memory` knows as their lake's store: weak both, as long as `MEMORY` holds the lake, and no node's (an open outlives no lake)",
     "terms.rs:RUNG": "what this process heard of claimers on other machines, keyed by the store, the term and its lock: the same for any node here (the CLI's `alive` reads it too); answers older than `RUNG_AGAIN` are let go as one is written",
+    "parsed.rs:LAST": "the parses of the last few statements' SQL: a function of the text (a tree kept is its text's parse), the same for any lake here",
+    "panics.rs:RUNNING": "the requests running in this process: its one memory watch stops the one that grew the process's memory, whatever its node (`oom.rs`), and a long one sends the ones after it to the process's queries' runtime",
+    "vend.rs:MADE": "each bucket's URL signer, made from the process's environment's credentials (as `from_env` reads them): the same for any lake here",
     "text.rs:TOKENS": "the tokens of the last few statements' SQL: a pure function of the text, the same for any lake here",
     "memory_lake.rs:PROCESS": "the spill disk is the machine's: every lake in memory in this process counts its bytes on disk in one count (a lake that goes gives its bytes back in its drop)",
     "oom.rs:POINTERS": "a thread's own allocation counters (jemalloc's), found once a thread: they belong to the thread, not to a node",
@@ -272,11 +273,7 @@ def verdict(rel, name, ty, how, value):
     """How a static passes, or None: what it must be."""
     key = f"{rel.rsplit('/', 1)[-1]}:{name}"
     if how == "per_node":
-        if key in PROCESS:
-            return None, "declared per_node!, so not the process's: take it out of PROCESS in tools/per_node_check.py"
-        if re.match(r"(?:std::sync::atomic::)?Atomic", ty) and not re.search(r"::new\(\s*(0|false)\s*\)", value):
-            return None, "a per_node! atomic starts at 0 or false (what reset() sets it back to)"
-        return "per_node", None
+        return None, "per_node! is gone (redesign step 2): keep a lake's state in a LakeState (lake.state::<T>()) or a node's in NodeState"
     if how == "task_local":
         return "a task_local key", None
     if REGEX.match(ty):
@@ -285,7 +282,7 @@ def verdict(rel, name, ty, how, value):
         return f"PROCESS: {PROCESS[key]}", None
     if ty.startswith("&") or set(re.findall(r"[A-Za-z_]\w*", ty)) <= PLAIN:
         return "nothing changes it once made", None
-    return None, "a node's state? declare it with per_node!; or add it to PROCESS in tools/per_node_check.py with why it outlives a node"
+    return None, "a node's state? keep it in its lake (a LakeState, lake.state::<T>()) or its node (NodeState); or add it to PROCESS in tools/per_node_check.py with why it outlives a node"
 
 
 def leaks():
@@ -301,9 +298,9 @@ def leaks():
             for n, line in enumerate(text.split("\n"), 1):
                 code = line.split("//", 1)[0]
                 if SPAWN.search(code):
-                    bad.append(f"src/{rel}:{n}: a task Node::stop can't end: start it on the node's list (node.tasks.spawn_node, or spawn_as for a request's work), or with crate::spawns::for_statics for a loop of the node's statics")
+                    bad.append(f"src/{rel}:{n}: a task Node::stop can't end: start it on the node's list (node.tasks.spawn_node, or spawn_as for a request's work), or on a state's crate::spawns::Loops for a loop that serves that state")
                 if "set_var(" in code:
-                    bad.append(f"src/{rel}:{n}: the environment is the process's, not the node's: give a setting with crate::env::give, keep a node's state in a per_node! static, or pass a child process its environment with Command::env")
+                    bad.append(f"src/{rel}:{n}: the environment is the process's, not the node's: give a setting with crate::env::give, keep a node's state in its lake or its NodeState, or pass a child process its environment with Command::env")
     return bad
 
 

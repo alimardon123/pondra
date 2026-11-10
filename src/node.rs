@@ -336,14 +336,12 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone(), tables: Default::default(), log_pass: Default::default() };
     if let Some(ledger) = lake.ledger() {
         ledger.charge("answers", Arc::downgrade(&app.results) as std::sync::Weak<dyn crate::ledger::Charged>); // (the remembered answers: `/metrics`' `cache_bytes`)
-        // (the node's caches of what the lake's own floor doesn't reach, charged once whatever lakes it opens: what lookups
-        // keep (the statements worked out as point queries and the log tails' keys))
-        for (name, cache) in [("point_plans", crate::serve::points()), ("tail_keys", crate::serve::tail_keys())] {
-            ledger.charge(name, Arc::downgrade(&cache));
-        }
-        // (the lake's state its doors use, made as it starts, so `/metrics` names it before its first use: the answers kept
-        // for their pages, its functions' answers, the logs and manifests of the Delta and Iceberg tables it reads, and its
-        // queries' planning facts; each is charged to the lake's line as it is made, `Lake::state`)
+        // (the lake's state its doors use, made as it starts, so `/metrics` names it before its first use: what lookups
+        // keep (the statements worked out as point queries and the log tails' keys), the answers kept for their pages, its
+        // functions' answers, the logs and manifests of the Delta and Iceberg tables it reads, and its queries' planning
+        // facts; each is charged to the lake's line as it is made, `Lake::state`)
+        lake.state::<crate::serve::PointPlans>()?;
+        lake.state::<crate::serve::TailKeys>()?;
         lake.state::<crate::pages::Pages>()?;
         lake.state::<crate::pyfn::Answered>()?;
         lake.state::<crate::read_delta::Logs>()?;
@@ -579,7 +577,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
         });
     }
     if lives {
-        store::serving(); // (the catalog's compactor and garbage collector start now: C5)
+        app.lake.node.serving.send_replace(true); // (the catalog's compactor and garbage collector start now: C5)
     }
     crate::oom::start(); // (the memory line: a query that grows the node past it is stopped, not the node: `oom.rs`)
     if lives {
@@ -591,14 +589,12 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     }
 }
 
-/// Is a page's member open in this process (`open_page`)? Set when one opens, and set back by `end_page` as its last step,
-/// after `reset()`: a waiting `open_page` takes it only once every other static is set back. Not `per_node!`, since `reset()`
-/// would set it back before the rest are, and a page opened in that gap would have them cleared under it.
+/// Is a page's member open in this process (`open_page`)? Set when one opens, and set back by `end_page` as its last step:
+/// a waiting `open_page` takes it only once the member before has let go of everything (its tasks, its catalog, its term).
 static PAGED: AtomicBool = AtomicBool::new(false);
 
-/// Is a live `page::Page` holding this module's page (`claim_page`)? Set by the claim, set back by `unclaim_page`. Not
-/// `per_node!`: a freed page's member closes in the background, and its `reset()` would set back the claim of the page made
-/// after it.
+/// Is a live `page::Page` holding this module's page (`claim_page`)? Set by the claim, set back by `unclaim_page` alone: a
+/// freed page's member closes in the background, after the page made after it may have claimed it.
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Claims this module's page for a `page::Page` (`Page::claim`), refused 55006 while a live page holds it.
@@ -697,8 +693,7 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task
     }
     crate::memory_lake::forget_memory(url);
     claims.clear(); // (its claims' locks let go as it stops: `Claims`)
-    crate::reset::reset();
-    PAGED.store(false, SeqCst); // (last: the next `open_page` starts once the statics are set back)
+    PAGED.store(false, SeqCst); // (last: the next `open_page` starts once this one has let go of everything)
 }
 
 /// Opens a joined page's member (`Paged`): a read-only follower of the lake the cluster at `node` leads (designs/
