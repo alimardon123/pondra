@@ -23,14 +23,60 @@ use std::collections::BTreeMap;
 
 /// Rows per table in log segments (after, upto] (`None`: to the end), from segment metadata only.
 pub async fn backlog(lake: &Lake, after: u64, upto: Option<u64>) -> Result<BTreeMap<String, u64>> {
+    waiting(lake, after, upto, |_| None).await
+}
+
+/// `backlog`, each table's from its own mark (`mark`: its `tiered`, the segment its files hold the log to): the rows
+/// still to tier. A table's rows at or below its mark are in its files already, so a table whose mark is above `after`
+/// isn't counted for them; one with no mark counts from `after`.
+pub async fn waiting(lake: &Lake, after: u64, upto: Option<u64>, mark: impl Fn(&str) -> Option<u64>) -> Result<BTreeMap<String, u64>> {
     let mut rows = BTreeMap::new();
     let end = upto.map_or("s0".to_string(), |u| seg_key(u + 1));
-    for (_, seg) in lake.cat.segments(&seg_key(after + 1), &end).await? {
-        for (table, parts) in &seg.parts {
+    for (key, seg) in lake.cat.segments(&seg_key(after + 1), &end).await? {
+        let n = key[2..].parse::<u64>()?;
+        for (table, parts) in seg.parts.iter().filter(|(t, _)| mark(t).is_none_or(|m| n > m)) {
             *rows.entry(table.clone()).or_default() += parts.iter().map(|p| p.2).sum::<u64>();
         }
     }
     Ok(rows)
+}
+
+/// What the last `LogPass::waiting` pass found, so the next reads only the log after it: an idle table keeps an old mark
+/// (`expire`), and reading the log from the least mark every round read every segment kept since (65,000 records
+/// every 5 s on an idle lake of 20,000 tables: step 5, piece 10f-2).
+#[derive(Default)]
+pub struct LogPass {
+    through: Option<u64>,                          // the segments counted, up to here
+    marks: std::collections::HashMap<String, u64>, // the tables with no rows to tier after their mark through there, at that mark
+    held: BTreeMap<String, u64>,                   // tables with rows the briefs didn't know yet, at their entry's mark (`expire_with`)
+}
+
+impl LogPass {
+    /// `waiting` for the tables as `briefs` know them, up to segment `upto`. A table with none through the last pass,
+    /// at a mark no later than its own now, has none there still: the pass reads from where the last left off, and
+    /// from the least mark of the others (one new, or with rows, or whose mark went back: undropped).
+    pub async fn waiting(&mut self, lake: &Lake, briefs: &Tables, upto: u64) -> Result<BTreeMap<String, u64>> {
+        self.held.retain(|n, _| !briefs.contains_key(n));
+        let quiet = |n: &str, b: &Brief| self.marks.get(n).is_some_and(|m| *m <= b.tiered);
+        let from = briefs.iter().filter(|(n, b)| !quiet(n, b)).map(|(_, b)| b.tiered).chain(self.held.values().copied())
+            .fold(self.through.unwrap_or(u64::MAX).min(upto), u64::min);
+        let rows = waiting(lake, from, Some(upto), |t| briefs.get(t).map(|b| b.tiered)).await?;
+        self.marks.retain(|n, _| briefs.contains_key(n) && !rows.contains_key(n));
+        for (name, b) in briefs.iter().filter(|(n, _)| !rows.contains_key(*n)) {
+            match self.marks.get_mut(name) {
+                Some(m) => *m = b.tiered,
+                None => _ = self.marks.insert(name.clone(), b.tiered),
+            }
+        }
+        self.through = Some(upto);
+        Ok(rows)
+    }
+
+    /// Tables with rows that the briefs of the pass didn't know, at their entries' marks: the next passes read from
+    /// there until the briefs know them (`expire_with` holds the log's floor at them meanwhile).
+    pub fn hold(&mut self, held: BTreeMap<String, u64>) {
+        self.held = held;
+    }
 }
 
 /// Tier one table's log up to segment `hwm`, at most ~4M rows at a time (bounded memory; the
@@ -248,7 +294,16 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
     use crate::text::VERSION;
     let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await?.filter(|m| m.changed && m.key.is_empty()) else { return Ok(false) };
     let Some(mut dmeta) = lake.cat.get::<TableMeta>(&table_key(&deleted(table))).await? else { return Ok(false) };
-    let (after, upto, now) = (meta.purged(), meta.tiered.min(dmeta.tiered), crate::log::now_ms());
+    // The changes whose old rows are all in files and whose tombstones are too: up to `{t}$deleted`'s mark, when the
+    // table has no rows in the log before it (an idle table's mark stays where it was: `expire`), else to its own.
+    let (after, now) = (meta.purged(), crate::log::now_ms());
+    let upto = match meta.tiered < dmeta.tiered && after < dmeta.tiered {
+        true => match waiting(lake, meta.tiered, Some(dmeta.tiered), |t| Some(if t == table { meta.tiered } else { u64::MAX })).await?.get(table) {
+            Some(rows) if *rows > 0 => meta.tiered,
+            _ => dmeta.tiered,
+        },
+        false => meta.tiered.min(dmeta.tiered),
+    };
     let within = datafusion::prelude::col(VERSION).between(datafusion::prelude::lit(after as i64 + 1), datafusion::prelude::lit(upto as i64));
     let gone = match upto > after {
         true => crate::manifest::pruned(lake, &dmeta, None, &[within], &with_sys(&dmeta).schema()?).await?,
@@ -448,6 +503,20 @@ fn replace(meta: &mut TableMeta, old: &[DataFile], new: Vec<DataFile>) {
     meta.files.extend(new.into_iter().map(|f| DataFile { sketch: Default::default(), ..f })); // (rows the table's sketches already saw)
 }
 
+/// A lake's tiering rounds: where the next round of jobs starts, the floors seen lately, and the orphan sweep's progress.
+#[derive(Default)]
+pub struct Rounds {
+    next: AtomicUsize,
+    floors: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>,
+    swept: std::sync::Mutex<(u64, std::collections::HashMap<String, u64>)>,
+}
+
+impl crate::lake_state::LakeState for Rounds {
+    const NAME: &'static str = "tier";
+    const ABOUT: &'static str = "its tiering rounds: the next node a job goes to, the floors of the last minutes, and what the orphan sweep looked at";
+    fn make() -> Self { Rounds::default() }
+}
+
 /// Data work the leader deals out. It names its inputs exactly (the table as the leader sees
 /// it), so a node whose catalog view lags can't work from an older file list.
 #[derive(Serialize, Deserialize)]
@@ -476,7 +545,7 @@ enum Kind {
 /// commits nothing, so what its other jobs wrote goes at once: left to the orphan sweep (a day
 /// on), a disk the lake had filled filled again with the files of the rounds that failed on it.
 async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result<Vec<DataFile>> {
-    crate::per_node!(static NEXT: AtomicUsize = AtomicUsize::new(0));
+    let rounds = lake.state::<Rounds>()?;
     let paths = |f: &DataFile| std::iter::once(f.path.clone()).chain(f.delete_files().cloned()).collect::<Vec<_>>();
     // (a `Positions` job hands its files back with a delete file more: never theirs to delete)
     let given: std::collections::HashSet<String> = jobs.iter().flat_map(|j| match &j.kind {
@@ -484,7 +553,7 @@ async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result
         Kind::Fold { .. } | Kind::Compact { .. } => vec![],
     }).collect();
     let runs = jobs.into_iter().map(|job| {
-        let node = &nodes[NEXT.fetch_add(1, Relaxed) % nodes.len()];
+        let node = &nodes[rounds.next.fetch_add(1, Relaxed) % nodes.len()];
         async move {
             if node == me {
                 return run_job(lake, job).await;
@@ -720,8 +789,14 @@ pub struct Brief {
     pub tiered: u64,
     /// Files to merge or seal: 8 or more, or one that is a tenth or more deleted rows (`maintain` rewrites them).
     pub untidy: bool,
-    /// Changed rows that may wait in its files (`purge` says whether it's time).
+    /// An append table whose rows changed (`TableMeta::changed`): its changed rows may wait in its files, from the
+    /// commits after `purged` (`purge` says whether it's time), and its purges settle (`tier::settle`): the first lets go
+    /// once the second is `retain_ms` old (`settles`: the second's time), and `{t}$deleted`'s files the first covered go
+    /// once the table's retention has passed since it (`kept_until`), its past then kept from them on.
     pub changed: bool,
+    pub purged: u64,
+    pub settles: Option<u64>,
+    pub kept_until: Option<u64>,
     /// Its Parquet files: those its entry lists, and those in its manifests (`TableMeta::sealed`).
     pub inline: u64,
     pub sealed: u64,
@@ -730,6 +805,11 @@ pub struct Brief {
     pub bytes: u64,
     /// The size of its entry: what every commit to it writes.
     pub entry: u64,
+    /// When the oldest of its replaced files was let go (`TableMeta::garbage`, `garbage_deletes`): retention reads the
+    /// entry once that is past the grace (`expire`), and no other.
+    pub garbage: Option<u64>,
+    /// It shares a folder with a clone (`TableMeta::shares`): files there go only by the orphan sweep.
+    pub shares: bool,
 }
 
 impl Brief {
@@ -739,12 +819,17 @@ impl Brief {
         Brief {
             tiered: m.tiered,
             untidy: m.files.len() >= 8 || heavy,
-            changed: m.changed && m.purged() < m.tiered,
+            changed: m.changed && m.key.is_empty(),
+            purged: m.purged(),
+            settles: m.purges.get(1).map(|p| p.1),
+            kept_until: m.purges.first().map(|p| p.1 + m.retention_secs.map_or(crate::ddl::KEEP_MS, |s| s * 1000)),
             inline: m.files.len() as u64,
             sealed,
             rows: rows + m.files.iter().map(|f| f.rows).sum::<u64>(),
             bytes: bytes + m.files.iter().map(|f| f.bytes).sum::<u64>(),
             entry: json(m).len() as u64,
+            garbage: m.garbage.iter().chain(&m.garbage_deletes).map(|(_, ts)| *ts).min(),
+            shares: !m.shares.is_empty(),
         }
     }
 }
@@ -822,23 +907,54 @@ pub async fn refresh(lake: &Lake, tables: &tokio::sync::Mutex<Tables>) -> Result
 /// Retention: drop log segments that every table and every streaming task has consumed, and
 /// files replaced by compaction, once older than `grace_ms` (readers holding an older snapshot
 /// may still use them). Catalog first, then the objects: a crash leaves only unreferenced objects.
+/// Over every table's entry: `expire_with` over a round's briefs reads only those with garbage due.
 pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
+    let tables: Tables = lake.cat.scan::<TableMeta>("t/", "t0").await?.iter().map(|(k, m)| (k[2..].to_string(), Brief::of(m))).collect();
+    expire_with(lake, grace_ms, &tables, None).await
+}
+
+/// `expire`, over the tables as a round knows them (`tier::refresh`): their marks hold the log, and of their entries it
+/// reads those with replaced files past the grace, the staged ones, and the ones sharing a folder when some table has
+/// garbage due. Every table's entry only when a kept drop expired (the folders still in use). A round's reads and
+/// writes follow what is due, not the number of tables (step 5, piece 10f), and of the log what its last pass didn't read.
+pub async fn expire_with(lake: &Lake, grace_ms: u64, briefs: &Tables, pass: Option<&mut LogPass>) -> Result<()> {
     let cutoff = crate::log::now_ms().saturating_sub(grace_ms);
-    let mut tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
-    crate::replace::drop_stale_staged(lake, &mut tables).await?; // (a staged table a node left: let go, and not read below)
-    // A table with nothing new in the log moves its mark to the end of it here (tiering skips it,
-    // rather than commit nothing), so an idle table doesn't hold retention back.
+    // (a staged table a node left: let go, and not read below. Its name says it is one: `sys::staged_for`)
+    let mut staged = vec![];
+    for name in briefs.keys().filter(|n| crate::sys::staged_for(n).is_some()) {
+        if let Some(m) = lake.cat.get::<TableMeta>(&table_key(name)).await? {
+            staged.push((table_key(name), m));
+        }
+    }
+    let was: Vec<String> = staged.iter().map(|(k, _)| k[2..].to_string()).collect();
+    crate::replace::drop_stale_staged(lake, &mut staged).await?;
+    let let_gone: std::collections::HashSet<&str> = was.iter().map(String::as_str).filter(|n| !staged.iter().any(|(k, _)| &k[2..] == *n)).collect();
+    let tables: Vec<(&str, &Brief)> = briefs.iter().map(|(n, b)| (n.as_str(), b)).filter(|(n, _)| !let_gone.contains(n)).collect();
+    // The log's floor is the least mark of the tables with rows still to tier. A table with none holds nothing back, and
+    // its mark stays where it is: moving every such table's mark to the log's end wrote every table's entry after any
+    // write to one (100,000 entries a round at 100,000 tables: step 5, piece 10f). Its readers find no rows of it in the
+    // segments after its mark (`query::tail_segments` skips them), and the ones below the floor go.
+    // (the log as far as the round's last pass read it: `LogPass`. None: from the least mark)
     let hwm = lake.visible();
-    let pending = backlog(lake, tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(hwm), Some(hwm)).await?;
-    let idle: Vec<bool> = tables.iter().map(|(k, m)| m.tiered < hwm && !pending.contains_key(&k[2..])).collect();
-    tables.iter_mut().zip(&idle).filter(|(_, idle)| **idle).for_each(|((_, m), _)| m.tiered = hwm);
+    let mut fresh = LogPass::default();
+    let pass = pass.unwrap_or(&mut fresh);
+    let pending = pass.waiting(lake, briefs, hwm).await?;
+    let mut held = tables.iter().filter(|(n, _)| pending.contains_key(*n)).map(|(_, b)| b.tiered).min().unwrap_or(hwm);
+    let mut unknown = BTreeMap::new();
+    for name in pending.keys().filter(|n| !briefs.contains_key(n.as_str())) {
+        if let Some(m) = lake.cat.get::<TableMeta>(&table_key(name)).await? {
+            held = held.min(m.tiered); // (a table the briefs don't know yet, made since they were read: it holds its rows too)
+            unknown.insert(name.clone(), m.tiered);
+        }
+    }
+    pass.hold(unknown);
     // (and below it, what a reader of the log still reads: a task, a view run again, a consumer group: `pins::floor`)
-    let floor = crate::pins::floor(lake, tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(0)).await?;
+    let floor = crate::pins::floor(lake, held).await?;
     // Only segments that were ALREADY below the floor `grace_ms` ago: a query that read a table's
     // metadata just before it was tiered may still be reading them.
-    crate::per_node!(static FLOORS: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> = std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let rounds = lake.state::<Rounds>()?;
     let floor = {
-        let mut floors = FLOORS.lock().unwrap();
+        let mut floors = rounds.floors.lock().unwrap();
         floors.push_back((crate::log::now_ms(), floor));
         while floors.len() > 1 && floors[1].0 <= cutoff {
             floors.pop_front();
@@ -872,24 +988,42 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     let expired = |d: &Kept| now >= d.at_ms + d.keep_ms && pins.is_none_or(|p| d.at_ms < p.0);
     deletes.extend(dropped.iter().filter(|(_, d)| expired(d)).map(|(k, _)| k.clone()));
     deletes.extend(crate::undrop::expired(lake, now).await?); // (dropped definitions: no files, so no branch holds them)
-    // The loads of a folder let go (copy.rs) with its last table: one no live table or kept drop uses.
+    // The loads of a folder let go (copy.rs) with its last table: one no live table or kept drop uses. (Every table's
+    // entry, for the folders in use: only when a kept drop expired.)
     let folder = |k: &str, m: &TableMeta| m.folder.clone().unwrap_or_else(|| k[3..].rsplit_once('/').map_or(k[3..].to_string(), |(n, _)| n.to_string()));
-    let used: std::collections::HashSet<String> = tables.iter().map(|(k, m)| m.folder(&k[2..]).to_string()).chain(dropped.iter().filter(|(_, d)| !expired(d)).map(|(k, d)| folder(k, &d.meta))).collect();
-    let mut let_go: Vec<String> = dropped.iter().filter(|(_, d)| expired(d)).map(|(k, d)| folder(k, &d.meta)).filter(|f| !used.contains(f)).collect();
-    let_go.sort();
-    let_go.dedup();
-    deletes.extend(crate::copy::gone(lake, &let_go).await?);
+    if dropped.iter().any(|(_, d)| expired(d)) {
+        let live = lake.cat.scan::<TableMeta>("t/", "t0").await?;
+        let used: std::collections::HashSet<String> = live.iter().filter(|(k, _)| !let_gone.contains(&k[2..])).map(|(k, m)| m.folder(&k[2..]).to_string()).chain(dropped.iter().filter(|(_, d)| !expired(d)).map(|(k, d)| folder(k, &d.meta))).collect();
+        let mut let_go: Vec<String> = dropped.iter().filter(|(_, d)| expired(d)).map(|(k, d)| folder(k, &d.meta)).filter(|f| !used.contains(f)).collect();
+        let_go.sort();
+        let_go.dedup();
+        deletes.extend(crate::copy::gone(lake, &let_go).await?);
+    }
+    // The tables with replaced files past the grace (their briefs say when the oldest was let go), read fresh.
+    let mut due = vec![];
+    for (name, _) in tables.iter().filter(|(_, b)| b.garbage.is_some_and(|ts| ts < files_cutoff)) {
+        if let Some(m) = lake.cat.get::<TableMeta>(&table_key(name)).await? {
+            due.push((table_key(name), m));
+        }
+    }
     // A folder a clone shares (ADR-043): files there go only by the orphan sweep, which counts
-    // every table listing them, never as one table's garbage.
-    let mut shared: std::collections::HashSet<String> = tables.iter().flat_map(|(_, m)| m.shares.iter().map(|f| format!("data/{f}/"))).collect();
-    for (_, d) in crate::ddl::dropped(lake).await? {
-        shared.extend(d.meta.shares.iter().chain(d.deleted.iter().flat_map(|m| &m.shares)).map(|f| format!("data/{f}/")));
+    // every table listing them, never as one table's garbage. (Read when some garbage is due.)
+    let mut shared: std::collections::HashSet<String> = Default::default();
+    if !due.is_empty() {
+        for (name, _) in tables.iter().filter(|(_, b)| b.shares) {
+            if let Some(m) = lake.cat.get::<TableMeta>(&table_key(name)).await? {
+                shared.extend(m.shares.iter().map(|f| format!("data/{f}/")));
+            }
+        }
+        for (_, d) in crate::ddl::dropped(lake).await? {
+            shared.extend(d.meta.shares.iter().chain(d.deleted.iter().flat_map(|m| &m.shares)).map(|f| format!("data/{f}/")));
+        }
     }
     let mut puts = vec![];
-    for ((key, mut meta), idle) in tables.into_iter().zip(idle) {
+    for (key, mut meta) in due {
         let (old, keep): (Vec<_>, Vec<_>) = meta.garbage.drain(..).partition(|(_, ts)| *ts < files_cutoff);
         let (deletes, kept): (Vec<_>, Vec<_>) = meta.garbage_deletes.drain(..).partition(|(_, ts)| *ts < files_cutoff);
-        if !old.is_empty() || !deletes.is_empty() || idle {
+        if !old.is_empty() || !deletes.is_empty() {
             let named = if deletes.is_empty() { Default::default() } else { named_deletes(lake, &meta).await? };
             dead.extend(old.into_iter().chain(deletes).map(|(p, _)| p).filter(|p| !named.contains(p) && !shared.iter().any(|f| p.starts_with(f))));
             (meta.garbage, meta.garbage_deletes) = (keep, kept);
@@ -929,12 +1063,12 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     use futures::TryStreamExt;
     const HOUR: u64 = 3_600_000;
     const DAY: u64 = 24 * HOUR;
-    crate::per_node!(static SWEPT: std::sync::Mutex<(u64, std::collections::HashMap<String, u64>)> = Default::default());
+    let rounds = lake.state::<Rounds>()?;
     let now = crate::log::now_ms();
-    if now - SWEPT.lock().unwrap().0 < HOUR {
+    if now - rounds.swept.lock().unwrap().0 < HOUR {
         return Ok(());
     }
-    SWEPT.lock().unwrap().0 = now;
+    rounds.swept.lock().unwrap().0 = now;
     crate::pins::sweep(lake).await?; // (readers gone: the pins of branches deleted)
     // An object that was there when a reader started may be one of its files (a branch's, of a table dropped
     // since, purged): it stays while that reader reads (`pins`, ADR-047).
@@ -970,7 +1104,7 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     let gone = listed.common_prefixes.iter().map(|p| p.to_string()).filter(|p| !folders.contains_key(p));
     let parts: Vec<String> = std::iter::once("log".to_string()).chain(folders.keys().cloned()).chain(gone).collect();
     let due: Vec<String> = {
-        let swept = &SWEPT.lock().unwrap().1;
+        let swept = &rounds.swept.lock().unwrap().1;
         let mut due: Vec<(u64, String)> = parts.iter().map(|p| (swept.get(p).copied().unwrap_or(0), p.clone())).filter(|(at, _)| now - at >= DAY).collect();
         due.sort();
         due.into_iter().take(parts.len().div_ceil(24).max(1)).map(|(_, p)| p).collect()
@@ -1008,7 +1142,7 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
                 let _ = object_store::ObjectStoreExt::delete(&lake.store, &o.location).await; // (by the listed path itself)
             }
         }
-        SWEPT.lock().unwrap().1.insert(part, now);
+        rounds.swept.lock().unwrap().1.insert(part, now);
     }
     Ok(())
 }
@@ -1414,6 +1548,155 @@ mod tests {
         assert_eq!(lake.cat.written("tier", SWEEP), Some(["a".to_string()].into()));
         assert_eq!(lake.cat.written("tier", std::time::Duration::ZERO), None, "a sweep is due");
         assert_eq!(lake.cat.written("other", SWEEP), None, "a round's first call reads every table");
+        lake.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Retention follows the write set (step 5, piece 10f): among 300 tables, rows in the log for one hold the log's floor
+    /// at that table's mark, and an idle table holds nothing and isn't written. Once the one is tiered, its segments go,
+    /// though every other table's mark is still where it was.
+    #[tokio::test]
+    async fn retention_writes_none_of_the_idle_tables_and_they_hold_no_segment() -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dir = std::env::temp_dir().join(format!("pondra-idle-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        for i in 0..300 {
+            crate::write::create_table(&lake, &format!("t{i}"), r#"{"columns": [["x", "Int64"]]}"#).await?;
+        }
+        let from = lake.visible();
+        for n in from + 1..=from + 3 {
+            // (three log segments, each a row of t0's: inline, its rows' bytes not needed here)
+            let seg = Segment { parts: BTreeMap::from([("t0".to_string(), vec![(0, 0, 1)])]), ..Default::default() };
+            lake.cat.commit(vec![(seg_key(n), json(&seg))], &[]).await?;
+            lake.advance(n);
+        }
+        let mark = |t: &'static str| {
+            let lake = &lake;
+            async move { lake.cat.get::<TableMeta>(&table_key(t)).await.unwrap().unwrap().tiered }
+        };
+        let segments = || async { lake.cat.segments(&seg_key(from + 1), "s0").await.unwrap().len() };
+        let writes = || lake.node.metrics.catalog_writes.load(Relaxed);
+        let before = writes();
+        expire(&lake, 0).await?;
+        assert!(writes() - before < 50, "retention wrote {} records among 300 tables", writes() - before);
+        assert_eq!((mark("t0").await, mark("t1").await, mark("t299").await), (from, from, from), "no mark moved");
+        assert_eq!(segments().await, 3, "t0's rows hold its segments");
+        // (t0 tiered: its files hold the log to the end)
+        let mut t0 = lake.cat.get::<TableMeta>(&table_key("t0")).await?.unwrap();
+        t0.tiered = from + 3;
+        lake.cat.commit(vec![(table_key("t0"), json(&t0))], &[]).await?;
+        assert!(waiting(&lake, from, None, |t| (t == "t0").then_some(from + 3)).await?.is_empty(), "t0's rows are below its mark");
+        let before = writes();
+        expire(&lake, 0).await?;
+        expire(&lake, 0).await?; // (a floor counts once it has held for the grace: here none)
+        assert!(writes() - before < 50, "retention wrote {} records among 300 tables", writes() - before);
+        assert_eq!(segments().await, 0, "no table has rows waiting: every segment goes, the idle tables' old marks hold none");
+        assert_eq!(mark("t1").await, from, "an idle table's mark stays");
+        lake.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A round's retention over its briefs (`expire_with`) reads and writes what is due, not every table: among 1,000, a
+    /// table with rows in the log costs it the log's segments, and one with replaced files past the grace its own entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retention_over_the_rounds_briefs_reads_only_what_is_due() -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dir = std::env::temp_dir().join(format!("pondra-briefs-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        for i in 0..1000 {
+            crate::write::create_table(&lake, &format!("t{i}"), r#"{"columns": [["x", "Int64"]]}"#).await?;
+        }
+        let briefs = || async { anyhow::Ok(lake.cat.scan::<TableMeta>("t/", "t0").await?.iter().map(|(k, m)| (k[2..].to_string(), Brief::of(m))).collect::<Tables>()) };
+        expire_with(&lake, 0, &briefs().await?, None).await?; // (the first round sweeps for orphans, an hour's: every table's entry)
+        let from = lake.visible();
+        // (written now: a replaced file stays while a segment kept from before it was let go may name it)
+        let seg = Segment { parts: BTreeMap::from([("t0".to_string(), vec![(0, 0, 1)])]), ts_ms: crate::log::now_ms(), ..Default::default() };
+        lake.cat.commit(vec![(seg_key(from + 1), json(&seg))], &[]).await?;
+        lake.advance(from + 1);
+        let mut t5 = lake.cat.get::<TableMeta>(&table_key("t5")).await?.unwrap();
+        t5.garbage = vec![("data/t5/gone.parquet".into(), 1)]; // (let go long ago: past any grace)
+        lake.cat.commit(vec![(table_key("t5"), json(&t5))], &[]).await?;
+        let briefs = briefs().await?;
+        let (reads, writes) = (|| lake.node.metrics.catalog_reads.load(Relaxed), || lake.node.metrics.catalog_writes.load(Relaxed));
+        let (r, w) = (reads(), writes());
+        expire_with(&lake, 0, &briefs, None).await?;
+        let (r, w) = (reads() - r, writes() - w);
+        assert!(r < 50 && w < 50, "retention read {r} and wrote {w} records among 1,000 tables");
+        assert!(lake.cat.get::<TableMeta>(&table_key("t5")).await?.unwrap().garbage.is_empty(), "t5's replaced file went");
+        assert_eq!(lake.cat.segments(&seg_key(from + 1), "s0").await?.len(), 1, "t0's rows hold their segment");
+        lake.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A round's pass over the log (`LogPass::waiting`) reads what the last one didn't: idle tables' old marks cost no read
+    /// of the segments kept since. A table new to the briefs, or whose mark went back (undropped), is read from its
+    /// mark, and so is one the briefs don't know yet while it is held (`expire_with`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rounds_pass_reads_the_log_from_where_the_last_left_off() -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dir = std::env::temp_dir().join(format!("pondra-seen-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let base = lake.visible();
+        // (100 segments, a row of `a` and of `b` in each, and of `new` in the 20th, of `u` in the 30th)
+        let mut puts = vec![];
+        for i in 1..=100u64 {
+            let mut parts = BTreeMap::from([("a".to_string(), vec![(0, 0, 1)]), ("b".to_string(), vec![(0, 0, 1)])]);
+            match i {
+                20 => _ = parts.insert("new".into(), vec![(0, 0, 1)]),
+                30 => _ = parts.insert("u".into(), vec![(0, 0, 1)]),
+                _ => {}
+            }
+            puts.push((seg_key(base + i), json(&Segment { parts, ts_ms: crate::log::now_ms(), ..Default::default() })));
+        }
+        lake.cat.commit(puts, &[]).await?;
+        lake.advance(base + 100);
+        let brief = |tiered| Brief { tiered, ..Default::default() };
+        let reads = || lake.node.metrics.catalog_reads.load(Relaxed);
+        let mut seen = LogPass::default();
+        let pass = async |seen: &mut LogPass, briefs: &Tables, upto: u64| {
+            let r = reads();
+            let rows = seen.waiting(&lake, briefs, upto).await?;
+            anyhow::Ok((rows, reads() - r))
+        };
+        // The first pass reads from the least mark: `a`'s rows wait, `b`'s are in its files.
+        let mut briefs = Tables::from([("a".to_string(), brief(base)), ("b".to_string(), brief(base + 100))]);
+        let (rows, read) = pass(&mut seen, &briefs, base + 100).await?;
+        assert_eq!((rows.get("a"), rows.get("b")), (Some(&100), None));
+        assert!(read >= 100, "the first pass read {read} records");
+        // `a` tiered: read from its mark once more, then not at all.
+        briefs.insert("a".into(), brief(base + 100));
+        let (rows, read) = pass(&mut seen, &briefs, base + 100).await?;
+        assert!(!rows.contains_key("a") && !rows.contains_key("b") && read < 5, "{rows:?}, {read} records read");
+        let (rows, read) = pass(&mut seen, &briefs, base + 100).await?;
+        assert!(!rows.contains_key("a") && read < 5, "an idle pass read {read} records");
+        // A new segment: only it is read.
+        let seg = Segment { parts: BTreeMap::from([("a".to_string(), vec![(0, 0, 1)])]), ts_ms: crate::log::now_ms(), ..Default::default() };
+        lake.cat.commit(vec![(seg_key(base + 101), json(&seg))], &[]).await?;
+        lake.advance(base + 101);
+        let (rows, read) = pass(&mut seen, &briefs, base + 101).await?;
+        assert_eq!((rows.get("a"), rows.get("b")), (Some(&1), None));
+        assert!(read < 5, "a pass over one new segment read {read} records");
+        // `b` undropped at an older mark, `new` made with one: each read from its own.
+        briefs.insert("b".into(), brief(base + 40));
+        briefs.insert("new".into(), brief(base + 10));
+        let (rows, _) = pass(&mut seen, &briefs, base + 101).await?;
+        assert_eq!((rows.get("a"), rows.get("b"), rows.get("new")), (Some(&1), Some(&60), Some(&1)));
+        // All tiered: idle again. `u`, which the briefs don't know, held at its mark: read from there until they do.
+        for t in ["a", "b", "new"] {
+            briefs.insert(t.into(), brief(base + 101));
+        }
+        pass(&mut seen, &briefs, base + 101).await?;
+        let (rows, read) = pass(&mut seen, &briefs, base + 101).await?;
+        assert!(rows.is_empty() && read < 5, "{rows:?}, {read} records read");
+        seen.hold(BTreeMap::from([("u".to_string(), base + 25)]));
+        let (rows, _) = pass(&mut seen, &briefs, base + 101).await?;
+        assert_eq!(rows.get("u"), Some(&1), "a held table is read from its mark");
+        briefs.insert("u".into(), brief(base + 30));
+        let (rows, _) = pass(&mut seen, &briefs, base + 101).await?;
+        assert_eq!(rows.get("u"), None, "its rows are in its files");
         lake.cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())

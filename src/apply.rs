@@ -1096,9 +1096,9 @@ async fn apply(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, applier
     let record = making(app, p, plan, ask, who.clone(), applier).await?;
     let protects = p.protect && !crate::protect::protected(&app.lake).await?;
     if protects {
-        let scope = who.scope.clone();
+        let by = who.asker();
         let protect = crate::ddl::Ddl::Protect { database: crate::ddl::lake_name(&app.lake), on: true, by: caller(who) };
-        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![protect]), None, false, &scope).await?;
+        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![protect]), None, false, &by).await?;
     }
     let mut out = j!({"apply": record.n, "status": record.status, "steps": record.steps, "tests": record.tests, "ok": record.status == "ok"});
     if protects {
@@ -1132,9 +1132,9 @@ pub(crate) fn admin_for(who: &Who, applier: bool) -> Option<crate::auth::Princip
 
 /// The claim, the apply's statements (`statements`), and its record's end (`making`'s span).
 async fn claim_to_record(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who) -> Result<Record> {
-    let scope = &who.scope.clone();
+    let by = &who.asker();
     let mut record = Record { project: p.name.clone(), env: ask.env.clone(), commit: ask.commit.clone(), who: caller(who.clone()), started_ms: crate::log::now_ms(), status: "running".into(), new: plan.new, ..Default::default() };
-    let claimed = crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: true, after: plan.after, record: json(&record) }]), None, false, scope).await?;
+    let claimed = crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: true, after: plan.after, record: json(&record) }]), None, false, by).await?;
     // (the leader's answer keeps `keep`'s old key, "deploy": see there)
     record.n = claimed["deploy"].as_u64().context("an apply number")?;
     keep_files(&app.lake, record.n, &ask.files).await?;
@@ -1143,10 +1143,10 @@ async fn claim_to_record(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Wh
     alive.abort();
     if let Err(e) = &out {
         record.status = "failed".into();
-        record.error = Some(crate::codes::told(e, scope.shows_code()));
+        record.error = Some(crate::codes::told(e, by.scope.shows_code()));
     }
     record.ended_ms = Some(crate::log::now_ms());
-    crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: record.n, record: json(&record) }]), None, false, scope).await?;
+    crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: record.n, record: json(&record) }]), None, false, by).await?;
     out?;
     Ok(record)
 }
@@ -1184,7 +1184,7 @@ async fn statements(app: &App, p: &Project, plan: &Plan, record: &mut Record, wh
             _ => "ran",
         };
         if m.kind == "migration" {
-            crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: record.n, record: json(&j!({"migration": migration_key(&p.name, &m.name)})) }]), None, false, &who.scope).await?;
+            crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: record.n, record: json(&j!({"migration": migration_key(&p.name, &m.name)})) }]), None, false, &who.asker()).await?;
         }
         record.steps.push(j!({"mark": m.mark, "kind": m.kind, "name": m.name, "what": what}));
     }
@@ -1259,7 +1259,7 @@ async fn beat(app: App, n: u64) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         let alive = Record { n, status: "alive".into(), started_ms: crate::log::now_ms(), ..Default::default() };
-        let _ = crate::write::on_node_as(&app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: n, record: json(&alive) }]), None, false, &crate::auth::Principal::node().scope).await; // (its heartbeat: the node's own record)
+        let _ = crate::write::on_node_as(&app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: n, record: json(&alive) }]), None, false, &crate::auth::Principal::node()).await; // (its heartbeat: the node's own record)
     }
 }
 

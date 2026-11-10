@@ -211,6 +211,12 @@ pub const CORE: &[Setting] = &[
     node("PONDRA_DEBUG_OPEN_TWICE", Switch, No),
     node("PONDRA_DEBUG_PG", Switch, No),
     node("PONDRA_DEBUG_SPREAD", Switch, No),
+    node("PONDRA_DEFAULT_FILE_FORMAT", Text, Is("parquet")).flag("default-table-format", "The file format a new table's files are \
+        written in when its CREATE TABLE names none (also PONDRA_DEFAULT_FILE_FORMAT; default: parquet). A session's \
+        `SET default_file_format` comes first.").shows("parquet"),
+    node("PONDRA_DEFAULT_TABLE_FORMAT", Text, Is("pondra")).flag("publish", "The table format a new table is made in when its \
+        CREATE TABLE names none (`USING`): `pondra` (also PONDRA_DEFAULT_TABLE_FORMAT; default: pondra; `iceberg` comes with this \
+        lake's own Iceberg tables). A session's `SET default_table_format` comes first. A table keeps the format it was made in.").shows("pondra"),
     node("PONDRA_DRAIN_GRACE_SECS", Secs, Is("0")),
     node("PONDRA_DRAIN_SECS", Secs, Is("30")),
     node("PONDRA_EXTENSION_FILE_MB", Mb, Is("64")),
