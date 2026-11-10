@@ -668,6 +668,9 @@ impl Page {
         if let Some(notices) = crate::statement::notices(&said.heard) {
             answer = answer.with("x-pondra-notices", notices);
         }
+        if let Some(n) = crate::answer::cut_heard(&said.heard) {
+            answer = answer.with("x-pondra-cut", n.to_string()); // (as HTTP says it: `server::sql`)
+        }
         answer
     }
 
