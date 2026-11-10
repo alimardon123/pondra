@@ -325,7 +325,7 @@ pub struct Entry {
 /// is written after the commit that records its rows, follows the rows' folder through renames,
 /// swaps and drops, and goes with its job mark after the retention window, when a file older than
 /// that isn't loaded again unless FORCE. `harness.py loads`.
-pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap<String, String>, scope: &crate::rights::Scope) -> Result<serde_json::Value> {
+pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap<String, String>, by: &crate::auth::Principal) -> Result<serde_json::Value> {
     let lake = &app.lake;
     if let Some(k) = options.keys().find(|k| !LOAD_KNOWN.contains(&k.as_str())) {
         bail!("COPY INTO has no option {k}: {} (the reader's options, as read_csv takes them)", LOAD_KNOWN.join(", "));
@@ -340,7 +340,7 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
     };
     ensure!(meta.key.is_empty(), "{table} is a keyed table: INSERT INTO {table} SELECT … FROM '…' upserts each run");
     let folder = meta.folder(&name).to_string();
-    let (shown, positional, pieces) = plan(lake, from, options, scope).await?;
+    let (shown, positional, pieces) = plan(lake, from, options, &by.scope).await?;
     let known: BTreeMap<String, Entry> = lake.cat.scan::<Entry>(&format!("ld/{folder}/"), &format!("ld/{folder}0")).await?.into_iter().collect();
     if app.seq.is_some() {
         expire(app, &known).await?; // (the leader keeps the records as far as the retention: the next statement finds them gone)
@@ -355,7 +355,7 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
         if !force && (done || old) {
             continue;
         }
-        let (given, names) = columns_of(lake, &p.query, positional, &cols, table, &p.url, scope).await?;
+        let (given, names) = columns_of(lake, &p.query, positional, &cols, table, &p.url, &by.scope).await?;
         if names.is_empty() {
             // (a file with no rows: an empty one, or of blank lines, reads no columns; nothing is written or recorded for it)
             loaded.push(serde_json::json!({"file": p.url, "version": p.version, "rows": 0}));
@@ -369,7 +369,7 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
                 if types.is_empty() {
                     p.query
                 } else {
-                    crate::routines::expand(lake, &reader_query(format, &p.url, reader, &types), scope).await?
+                    crate::routines::expand(lake, &reader_query(format, &p.url, reader, &types), &by.scope).await?
                 }
             }
             _ => p.query,
@@ -378,10 +378,10 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
         // (a headerless CSV's columns fill the table's by this node's order, which the leader checks: a node that hadn't seen a
         // move yet would fill the old one, as an INSERT without a column list would, `log::placed_for`: 11-07 audit M1)
         let placed = positional.then(|| (name.clone(), meta.placed()));
-        let insert = crate::write::on_node_as(app, Stmt::InsertInto(table.to_string(), names, query.clone()), Some(job_of(&load)), owner(), scope);
+        let insert = crate::write::on_node_as(app, Stmt::InsertInto(table.to_string(), names, query.clone()), Some(job_of(&load)), owner(), by);
         let out = match crate::log::placed_as(placed, insert).await {
             Ok(out) => out,
-            Err(e) => return Err(refused_at(lake, &query, &p.url, p.dialect, e, scope).await),
+            Err(e) => return Err(refused_at(lake, &query, &p.url, p.dialect, e, &by.scope).await),
         };
         if let Some(rows) = out["rows"].as_u64() {
             loaded.push(serde_json::json!({"file": p.url, "version": p.version, "rows": rows}));

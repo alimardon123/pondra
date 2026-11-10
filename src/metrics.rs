@@ -129,10 +129,10 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("background_failures_total", "counter", "background jobs (tiering, publishing, emission, tasks, checkpoints) that failed; a rising count is a stall to look at", &m.failures().iter().map(|(k, n)| (format!("{{job=\"{k}\"}}"), *n as f64)).collect::<Vec<_>>());
     let turns = crate::budget::turns();
     let at = |b: &str, l: &str| format!("{{bucket=\"{}\",lake=\"{}\"}}", label(b), label(l)); // (a path's `"` or `\` escaped, 11-09 audit L7)
-    metric("bucket_turns", "gauge", "requests this node may have at once at a bucket, or at another lake in it it reads (a branch's base: a quarter)", &turns.iter().map(|(b, l, n, _)| (at(b, l), *n as f64)).collect::<Vec<_>>());
+    metric("bucket_turns", "gauge", "requests this process may have at once at a bucket (every lake in it shares them), or at another lake in it it reads (a branch's base: a quarter)", &turns.iter().map(|(b, l, n, _)| (at(b, l), *n as f64)).collect::<Vec<_>>());
     metric("bucket_turns_most", "gauge", "the most requests it had at once there so far", &turns.iter().map(|(b, l, _, m)| (at(b, l), *m as f64)).collect::<Vec<_>>());
     let ai = [("answered", &crate::ai::CALLS), ("failed", &crate::ai::FAILED), ("retried", &crate::ai::RETRIED)].map(|(r, c)| (format!("{{result=\"{r}\"}}"), get(c)));
-    metric("ai_requests_total", "counter", "requests ai_complete and ai_embed made to the model's endpoint: answered, failed for good (their rows NULL), tried again", &ai);
+    metric("ai_requests_total", "counter", "requests ai_complete and ai_embed made to the model's endpoint from this process: answered, failed for good (their rows NULL), tried again", &ai);
     metric("shuffle_spilled_bytes_total", "counter", "shuffle rows written to this node's disk", &one(get(&m.spilled)));
     metric("shuffle_disk_bytes", "gauge", "shuffle buckets on this node's disk now", &one(crate::spill::held_by(&app.lake.node) as f64));
     metric("shuffle_skew", "gauge", "worst bucket vs the average one in a shuffle here (1 = even)", &one(get(&m.skew) / 100.0));

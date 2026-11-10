@@ -185,6 +185,42 @@ mod tests {
         Parser::new(&GenericDialect {}).try_with_sql(s).unwrap().parse_query().unwrap()
     }
 
+    /// What the engine's helpers of a column cost on an entry read as format 6's list (`store::tests::column_helpers_time`
+    /// measures the entry's own the same way): asked again ("warm") and first after the read ("first", the read's own cost
+    /// taken off), on the wide table and the 2,000 small ones. A measure, not a check:
+    /// `cargo test --release --lib engine_column_helpers_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn engine_column_helpers_time() {
+        use crate::store::{json, tests::{small_entries, wide_entry}, TableMeta};
+        let best = |rounds: u32, f: &mut dyn FnMut()| {
+            (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    (0..rounds).for_each(|_| f());
+                    t.elapsed().as_nanos() as f64 / rounds as f64 / 1000.0
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        let helpers: [(&str, fn(&TableMeta) -> usize); 2] = [
+            ("types::shown(), each column", |m| m.list().columns.iter().filter_map(|c| m.col(c.stored_name())).map(|c| crate::types::shown(c).len()).sum()),
+            ("default_sql(), each column", |m| m.live().filter_map(|(_, n, _)| default_sql(m, n)).count()),
+        ];
+        let (wide, small) = (json(&wide_entry().as_list()), small_entries().iter().map(|m| json(&m.clone().as_list())).collect::<Vec<_>>());
+        for (what, raws, rounds) in [("wide", vec![wide], 2000), ("small", small, 20)] {
+            let read = || raws.iter().map(|r| serde_json::from_slice::<TableMeta>(r).unwrap()).collect::<Vec<_>>();
+            let n = raws.len() as f64;
+            let decode = best(rounds, &mut || { std::hint::black_box(read()); }) / n;
+            for (helper, f) in helpers {
+                let first = best(rounds, &mut || { std::hint::black_box(read().iter().map(f).sum::<usize>()); }) / n - decode;
+                let entries = read();
+                entries.iter().for_each(|m| _ = f(m));
+                let warm = best(rounds, &mut || { std::hint::black_box(entries.iter().map(f).sum::<usize>()); }) / n;
+                println!("{what}, {helper}: {warm:.2} µs warm, {first:.2} µs first, an entry, best of 5");
+            }
+        }
+    }
+
     #[test]
     fn the_implicit_column_list_is_the_first_the_values_give() {
         assert_eq!(rows_width("VALUES (1, 2), (3, 4)"), Some(2));

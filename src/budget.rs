@@ -1,13 +1,13 @@
-//! One request budget per node and bucket (C5). Every request to a bucket — retries included, for
+//! One request budget per process and bucket (C5). Every request to a bucket — retries included, for
 //! it sits in the HTTP layer object_store calls — takes a turn here: at most `cap` at once. When
 //! the store says slow down (503, 429), `cap` halves (once a second at most); each run of `cap`
 //! answers without one adds a turn back. AIMD, as TCP and the AWS SDK's adaptive retries do. So
-//! any code may fan out as wide as it likes, and the node still backs off within a second of the
+//! any code may fan out as wide as it likes, and the process still backs off within a second of the
 //! store asking. `PONDRA_BUCKET_REQUESTS` (256) is where `cap` starts, and the most it grows to
 //! is four times that.
 //!
 //! A branch's reads of its base's objects (ADR-047) take a turn of a share too: a quarter of the
-//! node's turns, halving when the store asks as the bucket's do. A database cloned from prod then
+//! bucket's turns, halving when the store asks as the bucket's do. A database cloned from prod then
 //! never reads prod's files as hard as prod's own nodes may, on one server or another.
 //!
 //! A claimer's mark and the inbox's bell (`urgent`) take turns of their own, a few: a node whose
@@ -30,11 +30,13 @@ struct Gate {
     answered: AtomicU64, // when the store last answered, but for a server error (ms): `answered`
     most: usize,
     peak: AtomicUsize, // the most turns out at once so far (`/metrics`)
+    said: AtomicU64,     // when a slow request was last named on stderr (ms: `slow`)
+    unsaid: AtomicUsize, // slow requests since, not named
 }
 
 impl Gate {
     fn new(start: usize) -> Gate {
-        Gate { turns: Semaphore::new(start), cap: AtomicUsize::new(start), owed: AtomicUsize::new(0), calm: AtomicUsize::new(0), shrunk: AtomicU64::new(0), answered: AtomicU64::new(0), most: start * 4, peak: AtomicUsize::new(0) }
+        Gate { turns: Semaphore::new(start), cap: AtomicUsize::new(start), owed: AtomicUsize::new(0), calm: AtomicUsize::new(0), shrunk: AtomicU64::new(0), answered: AtomicU64::new(0), most: start * 4, peak: AtomicUsize::new(0), said: AtomicU64::new(0), unsaid: AtomicUsize::new(0) }
     }
 
     /// Wait for a turn.
@@ -85,12 +87,45 @@ impl Gate {
         }
     }
 
+    /// A request that took `SLOW` or longer, its retries apart, named on stderr: one a second at most, with how many
+    /// more there were since. A write's ack waits for its commit's request (`Lake::commits`), so this is what a stall
+    /// of the writes is told by: the soak's 12.9 s with no node moved (11-09) left nothing to say which request it was.
+    fn slow(&self, root: &str, method: &str, path: &str, took: std::time::Duration, answer: &Result<HttpResponse, HttpError>, now: u64) {
+        if took < SLOW {
+            return;
+        }
+        let last = self.said.load(Relaxed);
+        if now.saturating_sub(last) < 1000 || self.said.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+            self.unsaid.fetch_add(1, Relaxed);
+            return;
+        }
+        let more = match self.unsaid.swap(0, Relaxed) {
+            0 => String::new(),
+            n => format!("; {n} more since"),
+        };
+        let how = match answer {
+            Ok(r) => r.status().as_u16().to_string(),
+            Err(e) => format!("no answer: {e}"),
+        };
+        eprintln!("a bucket request took {:.1} s: {method} {} ({how}{more})", took.as_secs_f64(), key(root, path));
+    }
+
     /// A turn handed back: kept, or taken back if owed.
     fn hand_back(&self, turn: tokio::sync::SemaphorePermit<'_>) {
         if self.owed.try_update(Relaxed, Relaxed, |o| o.checked_sub(1)).is_ok() {
             turn.forget();
         }
     }
+}
+
+/// How long a request may take before it is named (`Gate::slow`): ten times a commit's usual round trip to R2.
+const SLOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A request's object as the lake names it: its path, without the bucket's name a path-style request starts with.
+fn key<'a>(root: &str, path: &'a str) -> &'a str {
+    let bucket = root.split_once("://").map_or(root, |(_, b)| b);
+    let path = path.trim_start_matches('/');
+    path.strip_prefix(bucket).and_then(|p| p.strip_prefix('/')).unwrap_or(path)
 }
 
 /// The HTTP layer of a bucket's store: object_store's own client, with the bucket's turns.
@@ -102,11 +137,10 @@ pub struct Budget {
     inner: ReqwestConnector,
 }
 
-crate::per_node!(static GATES: Mutex<HashMap<String, Arc<Gate>>> = Default::default());
-crate::per_node!(static URGENT: Mutex<HashMap<String, Arc<Gate>>> = Default::default());
-crate::per_node!(
-    /// Each bucket's shares: the path of another lake in it (`a/b`), and its turns.
-    static SHARES: Mutex<HashMap<String, Vec<(String, Arc<Gate>)>>> = Default::default());
+static GATES: std::sync::LazyLock<Mutex<HashMap<String, Arc<Gate>>>> = std::sync::LazyLock::new(Default::default);
+static URGENT: std::sync::LazyLock<Mutex<HashMap<String, Arc<Gate>>>> = std::sync::LazyLock::new(Default::default);
+/// Each bucket's shares: the path of another lake in it (`a/b`), and its turns.
+static SHARES: std::sync::LazyLock<Mutex<HashMap<String, Vec<(String, Arc<Gate>)>>>> = std::sync::LazyLock::new(Default::default);
 
 /// Where a node's turns of a bucket start (`PONDRA_BUCKET_REQUESTS`).
 fn start() -> usize { crate::env::value::<usize>("PONDRA_BUCKET_REQUESTS").max(4) }
@@ -122,7 +156,7 @@ fn split(url: &str) -> Option<(String, String)> {
 /// ADR-047). A lake at a bucket's root has no path to tell its requests by: none.
 pub fn share(url: &str) {
     let Some((root, path)) = split(url) else { return };
-    let mut shares = SHARES.lock().unwrap();
+    let mut shares = SHARES.lock().unwrap_or_else(|e| e.into_inner());
     let list = shares.entry(root).or_default();
     if !list.iter().any(|(p, _)| *p == path) {
         list.push((path, Arc::new(Gate::new((start() / 4).max(1)))));
@@ -133,7 +167,7 @@ pub fn share(url: &str) {
 /// S3, R2, GCS and Azure with an endpoint) or virtual-hosted (`/a/b/…`). Database names are SQL
 /// names, so their paths need no percent-encoding to compare.
 fn shared(root: &str, path: &str) -> Option<Arc<Gate>> {
-    let shares = SHARES.lock().unwrap();
+    let shares = SHARES.lock().unwrap_or_else(|e| e.into_inner());
     let bucket = root.split_once("://").map_or(root, |(_, b)| b);
     let under = |p: &str| path.strip_prefix('/').is_some_and(|rest| rest.strip_prefix(p).or_else(|| rest.strip_prefix(&format!("{bucket}/{p}"))).is_some_and(|r| r.starts_with('/')));
     shares.get(root)?.iter().find(|(p, _)| under(p)).map(|(_, g)| g.clone())
@@ -142,8 +176,8 @@ fn shared(root: &str, path: &str) -> Option<Arc<Gate>> {
 /// Every bucket's and share's turns now and the most out at once (`/metrics`): (bucket, lake path
 /// or "", turns, most).
 pub fn turns() -> Vec<(String, String, usize, usize)> {
-    let mut out: Vec<_> = GATES.lock().unwrap().iter().map(|(r, g)| (r.clone(), String::new(), g.cap.load(Relaxed), g.peak.load(Relaxed))).collect();
-    for (r, list) in SHARES.lock().unwrap().iter() {
+    let mut out: Vec<_> = GATES.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(r, g)| (r.clone(), String::new(), g.cap.load(Relaxed), g.peak.load(Relaxed))).collect();
+    for (r, list) in SHARES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         out.extend(list.iter().map(|(p, g)| (r.clone(), p.clone(), g.cap.load(Relaxed), g.peak.load(Relaxed))));
     }
     out.sort();
@@ -151,11 +185,11 @@ pub fn turns() -> Vec<(String, String, usize, usize)> {
 }
 
 /// The gate of the store at `root`: one per node, whatever opens it.
-fn gate(root: &str) -> Arc<Gate> { GATES.lock().unwrap().entry(root.to_string()).or_insert_with(|| Arc::new(Gate::new(start()))).clone() }
+fn gate(root: &str) -> Arc<Gate> { GATES.lock().unwrap_or_else(|e| e.into_inner()).entry(root.to_string()).or_insert_with(|| Arc::new(Gate::new(start()))).clone() }
 
 /// The turns of the store at `root` that say who is alive: a claimer's mark (`cluster/alive/…`) and the inbox's bell,
 /// rung and listened to (`terms::listen`), at most two requests a second a lake. Four, whatever the store asks.
-fn urgent_gate(root: &str) -> Arc<Gate> { URGENT.lock().unwrap().entry(root.to_string()).or_insert_with(|| Arc::new(Gate::new(4))).clone() }
+fn urgent_gate(root: &str) -> Arc<Gate> { URGENT.lock().unwrap_or_else(|e| e.into_inner()).entry(root.to_string()).or_insert_with(|| Arc::new(Gate::new(4))).clone() }
 
 /// Is this request one that says who is alive (`urgent_gate`)? Its path is the key's, under the bucket's name or not.
 fn urgent(path: &str) -> bool { path.contains("/cluster/alive/") || path.ends_with("/inbox/bell") }
@@ -175,7 +209,7 @@ pub fn client(root: &str, inner: reqwest::Client) -> HttpClient {
 /// When the bucket at `root` last answered this node with anything but a server error (ms; 0:
 /// never): slow or asking to slow down, it is still there (`cluster::keep_alive`).
 pub fn answered(root: &str) -> u64 {
-    GATES.lock().unwrap().get(root).map_or(0, |g| g.answered.load(Relaxed))
+    GATES.lock().unwrap_or_else(|e| e.into_inner()).get(root).map_or(0, |g| g.answered.load(Relaxed))
 }
 
 impl HttpConnector for Budget {
@@ -204,10 +238,14 @@ impl HttpService for Turns {
         };
         let gate = if urgent { &self.urgent } else { &self.gate };
         let turn = gate.take().await;
+        let (method, path) = (req.method().to_string(), req.uri().path().to_string());
+        let began = datafusion::common::instant::Instant::now(); // (web-time in a page)
         let answer = self.inner.execute(req).await;
+        let now = crate::log::now_ms();
+        gate.slow(&self.root, &method, &path, began.elapsed(), &answer, now);
         gate.heard(&answer);
         if answer.as_ref().is_ok_and(|r| !matches!(r.status().as_u16(), 500 | 502 | 504)) {
-            self.gate.answered.store(crate::log::now_ms(), Relaxed);
+            self.gate.answered.store(now, Relaxed);
         }
         gate.hand_back(turn);
         if let (Some(s), Some(t)) = (&share, lent) {
@@ -236,6 +274,23 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_request_is_named_once_a_second_without_its_bucket() {
+        assert_eq!(key("s3://b", "/b/lakes/prod/catalog/wal/00000000000000000012.sst"), "lakes/prod/catalog/wal/00000000000000000012.sst"); // (path-style)
+        assert_eq!(key("s3://b", "/lakes/prod/n"), "lakes/prod/n"); // (virtual-hosted)
+        assert_eq!(key("s3://b", "/bucket2/x"), "bucket2/x"); // (another name that starts alike stays whole)
+        let g = Gate::new(4);
+        let gone: Result<HttpResponse, HttpError> = Err(HttpError::new(object_store::client::HttpErrorKind::Timeout, std::io::Error::other("timed out")));
+        g.slow("s3://b", "PUT", "/b/w", SLOW / 2, &gone, 5_000); // (quick: not named, not counted)
+        assert_eq!((g.said.load(Relaxed), g.unsaid.load(Relaxed)), (0, 0));
+        g.slow("s3://b", "PUT", "/b/w", SLOW, &gone, 5_000);
+        assert_eq!(g.said.load(Relaxed), 5_000);
+        g.slow("s3://b", "PUT", "/b/w", SLOW * 3, &gone, 5_900); // (within the second: counted for the next line)
+        assert_eq!((g.said.load(Relaxed), g.unsaid.load(Relaxed)), (5_000, 1));
+        g.slow("s3://b", "PUT", "/b/w", SLOW, &gone, 6_000); // (a second on: named, with the one before it)
+        assert_eq!((g.said.load(Relaxed), g.unsaid.load(Relaxed)), (6_000, 0));
+    }
+
+    #[test]
     fn who_is_alive_takes_turns_of_its_own() {
         assert!(urgent("/b/lakes/prod/cluster/alive/00000000000000000003")); // (path-style)
         assert!(urgent("/cluster/alive/00000000000000000003")); // (virtual-hosted, a lake at the bucket's root)
@@ -251,7 +306,7 @@ mod tests {
     fn a_base_takes_a_share() {
         share("s3://shares-test/lakes/prod");
         share("s3://shares-test/lakes/prod/"); // (once)
-        assert_eq!(SHARES.lock().unwrap()["s3://shares-test"].len(), 1);
+        assert_eq!(SHARES.lock().unwrap_or_else(|e| e.into_inner())["s3://shares-test"].len(), 1);
         let cap = |p: &str| shared("s3://shares-test", p).map(|g| g.cap.load(Relaxed));
         assert_eq!(cap("/shares-test/lakes/prod/data/t/a.parquet"), Some((start() / 4).max(1))); // (path-style)
         assert!(cap("/lakes/prod/data/t/a.parquet").is_some()); // (virtual-hosted)
@@ -259,6 +314,6 @@ mod tests {
         assert_eq!(cap("/shares-test/lakes/dev/data/lakes/prod/a.parquet"), None); // (the branch's own, whatever its tables are called)
         assert!(shared("s3://other", "/other/lakes/prod/a").is_none()); // (another bucket)
         share("s3://shares-test"); // (a bucket's root: nothing to tell it by)
-        assert_eq!(SHARES.lock().unwrap()["s3://shares-test"].len(), 1);
+        assert_eq!(SHARES.lock().unwrap_or_else(|e| e.into_inner())["s3://shares-test"].len(), 1);
     }
 }

@@ -3,7 +3,7 @@
 //! and call into it.
 use crate::log::{Log, Sequencer};
 use crate::store::*;
-use crate::tier::{expire, tier_table};
+use crate::tier::tier_table;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use serde_json::{json as j, Value};
@@ -24,6 +24,7 @@ pub struct App {
     pub replica: Option<Arc<crate::replica::ReplicaLog>>, // what this follower holds for the leader
     pub auth: Arc<crate::auth::Auth>,
     pub tables: Arc<tokio::sync::Mutex<crate::tier::Tables>>, // what this node knows of each table: for the leader's tiering rounds and /metrics (`tier::refresh`)
+    pub log_pass: Arc<tokio::sync::Mutex<crate::tier::LogPass>>, // the log as far as the leader's last round read it (`tier::LogPass`)
 }
 
 /// Recent query results. By default a result is reused only at exactly the catalog version it
@@ -227,7 +228,7 @@ impl App {
             };
             match spread_out {
                 Ok(Some(batches)) => {
-                    crate::guard::ran_spread(query, start.elapsed());
+                    crate::guard::ran_spread(&self.lake, query, start.elapsed());
                     crate::history::spread(nodes.len());
                     return Ok((batches, true));
                 }
@@ -264,7 +265,7 @@ impl App {
                     true => crate::spmd::reads_sql(&self.lake, query).await.unwrap_or(0),
                     false => 0,
                 };
-                crate::guard::ran_here(query, bytes, took);
+                crate::guard::ran_here(&self.lake, query, bytes, took);
             }
             Ok((out, false))
         };
@@ -335,8 +336,12 @@ impl App {
         let _tiering = self.seq.as_ref().map(|s| s.tiering()); // (writers paused by backpressure stay paused: `log::Pace`)
         let start = datafusion::common::instant::Instant::now();
         let hwm = *self.lake.hwm.borrow();
-        let from = self.tables.lock().await.values().map(|b| b.tiered).min().unwrap_or(hwm);
-        let backlog = crate::tier::backlog(&self.lake, from, None).await?;
+        let backlog = {
+            // (each table's rows after its own mark: an idle table keeps an old one, `tier::expire`. Of the log, what the
+            // last round's pass didn't read: `tier::LogPass`)
+            let tables = self.tables.lock().await;
+            self.log_pass.lock().await.waiting(&self.lake, &tables, hwm).await?
+        };
         let nodes = if self.members.nodes().is_empty() { vec![self.members.me().to_string()] } else { self.members.nodes() };
         let (busy, untidy, changed) = {
             let tables = self.tables.lock().await;
@@ -346,8 +351,19 @@ impl App {
             // Tables with files to merge or seal, busy or not (bulk INSERTs don't go through the log).
             let untidy = tables.iter().filter(|(t, b)| b.untidy && !busy.contains(*t)).map(|(t, _)| t.clone());
             let untidy: Vec<String> = busy.iter().cloned().chain(untidy).collect();
-            // (tables whose changed rows may wait in files: `tier::purge` says whether it's time)
-            let changed: Vec<String> = tables.iter().filter(|(_, b)| b.changed).map(|(t, _)| t.clone()).collect();
+            // (tables whose changed rows may wait in files: `tier::purge` says whether it's time. Those whose tombstones were
+            // tiered since their last purge, or are this round; one whose purges settle (`tier::Brief::settles`), or whose
+            // purged tombstones' files are past its retention while it has some (`kept_until`). Not every changed table every
+            // round: an idle one's mark stays, `tier::expire`)
+            let now = crate::log::now_ms();
+            let due = |t: &str, b: &crate::tier::Brief| {
+                let d = tables.get(&crate::sys::deleted(t));
+                busy.contains(&crate::sys::deleted(t))
+                    || d.is_some_and(|d| b.purged < d.tiered)
+                    || b.settles.is_some_and(|at| now >= at + self.retain_ms)
+                    || b.kept_until.is_some_and(|at| now >= at) && d.is_some_and(|d| d.inline + d.sealed > 0)
+            };
+            let changed: Vec<String> = tables.iter().filter(|(t, b)| b.changed && due(t, b)).map(|(t, _)| t.clone()).collect();
             (busy, untidy, changed)
         };
         if untidy.is_empty() && changed.is_empty() {
@@ -384,7 +400,9 @@ impl App {
         let now = crate::log::now_ms();
         if now - EXPIRED.load(std::sync::atomic::Ordering::Relaxed) >= 10_000 {
             EXPIRED.store(now, std::sync::atomic::Ordering::Relaxed);
-            expire(&self.lake, self.retain_ms).await?;
+            crate::tier::refresh(&self.lake, &self.tables).await?; // (the round's briefs, as of now: what it tiered and merged)
+            let briefs = self.tables.lock().await.clone();
+            crate::tier::expire_with(&self.lake, self.retain_ms, &briefs, Some(&mut *self.log_pass.lock().await)).await?;
         }
         if start.elapsed() >= Duration::from_secs(5) {
             // one line when it drags
@@ -449,8 +467,12 @@ impl App {
             self.lake.cat.tidy(8, Duration::from_secs(60), true).await?;
         }
         let hwm = *self.lake.hwm.borrow();
-        let from = self.lake.cat.scan::<TableMeta>("t/", "t0").await?.iter().map(|(_, m)| m.tiered).min().unwrap_or(hwm);
-        if hwm.saturating_sub(from) < LONG_SEGMENTS && crate::tier::backlog(&self.lake, from, None).await?.values().sum::<u64>() < LONG_ROWS {
+        let tables = self.lake.cat.scan::<TableMeta>("t/", "t0").await?;
+        let marks: std::collections::BTreeMap<&str, u64> = tables.iter().map(|(k, m)| (&k[2..], m.tiered)).collect();
+        let waiting = crate::tier::waiting(&self.lake, marks.values().copied().min().unwrap_or(hwm), None, |t| marks.get(t).copied()).await?;
+        // (the log a reader replays: from the least mark of the tables with rows still to tier, as `tier::expire` holds it)
+        let from = marks.iter().filter(|(t, _)| waiting.contains_key(**t)).map(|(_, m)| *m).min().unwrap_or(hwm);
+        if hwm.saturating_sub(from) < LONG_SEGMENTS && waiting.values().sum::<u64>() < LONG_ROWS {
             return Ok(0);
         }
         self.tier_all(0).await

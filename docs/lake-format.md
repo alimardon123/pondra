@@ -268,6 +268,10 @@ Rules for outside readers:
   - On R2, PyIceberg writes its files with its fsspec file IO (`"py-io-impl":
     "pyiceberg.io.fsspec.FsspecFileIO"`, `pip install s3fs`); pyarrow's multipart upload is
     refused there.
+  - A rollback, an expiry of snapshots, a replace of the table or a change of its partitioning
+    through the catalog is refused, naming Pondra's way: `RESTORE TABLE`, the lake's retention
+    (`--retain-secs`), `CREATE OR REPLACE TABLE`, the `PARTITION BY` it was made with. Another
+    engine's compaction is refused too: Pondra merges its tables' files itself.
   - Today the node reads an appended file's rows and writes them into the table again.
     ADR-029 (proposed) would take the files as written and only commit them.
 - **Latest version, plus the history still there:** the Iceberg metadata lists the snapshots from
@@ -278,8 +282,9 @@ Rules for outside readers:
 - **Types:** Int32/64, Float32/64, Utf8, Boolean, Date32, Binary and Decimal128 in both formats;
   Int8/16 in Delta only. A table with any other column type isn't published in that format (yet).
 - **Keyed tables** are published when one file holds one row per key: after each compaction.
-- **No partitions** yet: engines prune with Parquet statistics and, for keyed and clustered
-  tables, bloom filters and sort order.
+- **Partitions:** a table's `PARTITION BY` (one column, as is, or a date or time column by a time
+  transform such as `day`) is published as its Iceberg spec. Engines also prune with Parquet
+  statistics and, for keyed and clustered tables, bloom filters and sort order.
 
 Plain Parquet readers can also read `data/<table>/*.parquet` directly. They see every file,
 including replaced ones in their grace period and, for keyed tables, older versions of a key.

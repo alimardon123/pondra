@@ -271,6 +271,89 @@ fn one_way(n: &str, value: &str) -> Option<(&'static str, String)> {
     (!kept.contains(&v.as_str())).then(|| (*code, format!("{n} = '{value}': {why}")))
 }
 
+/// The table formats a new table can be made in, and the file formats its files can be written in: what
+/// `default_table_format` and `default_file_format` take (I11). `iceberg` joins with this lake's own Iceberg tables (I9),
+/// and `delta` in 1.1; until then a table is published in them (`WITH (publish = …)`).
+pub const TABLE_FORMATS: &[&str] = &["pondra"];
+pub const FILE_FORMATS: &[&str] = &["parquet"];
+
+/// Where a new table's default format came from, nearest first (I11): its session's `SET`, its node's setting
+/// (`--default-table-format`), else Pondra's own. A schema's and a database's go between the session and the node, with
+/// their records (step 5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+    Session,
+    Node,
+    Pondra,
+}
+
+/// One of the defaults a CREATE TABLE that names no format takes: its session name, its node setting, what it takes.
+struct FormatDefault {
+    name: &'static str,
+    var: &'static str,
+    takes: &'static [&'static str],
+    what: &'static str,
+}
+
+const TABLE: FormatDefault = FormatDefault { name: "default_table_format", var: "PONDRA_DEFAULT_TABLE_FORMAT", takes: TABLE_FORMATS, what: "table format" };
+const FILE: FormatDefault = FormatDefault { name: "default_file_format", var: "PONDRA_DEFAULT_FILE_FORMAT", takes: FILE_FORMATS, what: "file format" };
+
+/// A new table's format when its CREATE TABLE names none, and where it came from (I11): what CREATE's planning reads
+/// (step 8, L1 and L6), as `SHOW default_table_format` does.
+#[allow(dead_code)] // (until step 8's CREATE reads it)
+pub fn table_format(lake: &Lake) -> Result<(String, Source)> { resolved(&TABLE, shown(TABLE.name), lake.node.settings.get(TABLE.var)) }
+
+/// A new table's file format when its CREATE TABLE names none (`WITH (file_format = …)`), and where it came from (I11).
+#[allow(dead_code)] // (until step 8's CREATE reads it)
+pub fn file_format(lake: &Lake) -> Result<(String, Source)> { resolved(&FILE, shown(FILE.name), lake.node.settings.get(FILE.var)) }
+
+/// The session's value (checked as it was set), else the node's (checked here: a setting is read as given), else Pondra's own.
+fn resolved(d: &FormatDefault, session: Option<String>, node: Option<&str>) -> Result<(String, Source)> {
+    if let Some(v) = session.filter(|v| !v.eq_ignore_ascii_case("default")) {
+        return Ok((v, Source::Session));
+    }
+    match node {
+        Some(v) => Ok((taken(d, v).with_context(|| format!("the node's {}", d.var))?, Source::Node)),
+        None => Ok((d.takes[0].to_string(), Source::Pondra)),
+    }
+}
+
+/// `value` as one of `d`'s formats, lower case, or why not: by name for a format that comes later.
+fn taken(d: &FormatDefault, value: &str) -> Result<String> {
+    let v = value.trim().to_ascii_lowercase();
+    if d.takes.contains(&v.as_str()) {
+        return Ok(v);
+    }
+    let later = |when: &str, publish: &str| crate::codes::coded("0A000", format!("{} = '{value}': this lake's own {publish} tables come {when}; until then a table is published as {publish} with WITH (publish = '{v}')", d.name));
+    Err(match (d.name, v.as_str()) {
+        ("default_table_format", "iceberg") => later("in 1.0", "Iceberg"),
+        ("default_table_format", "delta") => later("in 1.1", "Delta"),
+        _ => crate::codes::coded("22023", format!("invalid value for parameter \"{}\": \"{value}\": a {} here is {}", d.name, d.what, d.takes.join(" or "))),
+    })
+}
+
+/// The defaults' values as `SET` keeps them (I11): a format this build has (or `DEFAULT`, which leaves it to the node).
+/// Postgres's `default_table_access_method` is taken for its one value here, `heap`, which is Pondra's own format
+/// (`pg_dump` sets it before each table): it sets `default_table_format` to `pondra`.
+fn defaults_kept(n: String, value: String) -> Result<(String, String)> {
+    let default = value.trim().eq_ignore_ascii_case("default");
+    match n.as_str() {
+        "default_table_format" | "default_file_format" if default => Ok((n, "default".into())),
+        "default_table_format" => Ok((n, taken(&TABLE, &value)?)),
+        "default_file_format" => Ok((n, taken(&FILE, &value)?)),
+        "default_table_access_method" if default || value.trim().eq_ignore_ascii_case("heap") => Ok((TABLE.name.into(), if default { "default".into() } else { "pondra".into() })),
+        "default_table_access_method" => Err(crate::codes::coded("22023", format!("default_table_access_method = '{value}': a table here is kept in Pondra's own format (heap); SET default_table_format names another"))),
+        _ => Ok((n, value)),
+    }
+}
+
+/// `SHOW` of a default the session didn't set: the node's, else Pondra's own. (No lake here: the node's as the process
+/// was given it, `env::get`.)
+fn default_shown(n: &str) -> Option<String> {
+    let d = [&TABLE, &FILE].into_iter().find(|d| d.name == n)?;
+    resolved(d, None, crate::env::get(d.var).as_deref()).ok().map(|(v, _)| v)
+}
+
 fn set(session: &str, variable: &str, value: String) -> Result<()> {
     let mut n = name(variable);
     // (the session's language, `languages.rs`: by its name, or by DataFusion's dialect where that names one (`spark`). A
@@ -294,6 +377,7 @@ fn set(session: &str, variable: &str, value: String) -> Result<()> {
     if let Some((code, why)) = one_way(&n, &value) {
         return Err(crate::codes::coded(code, why));
     }
+    let (n, value) = defaults_kept(n, value)?;
     if let Some((_, how)) = THE_NODES.iter().find(|(name, _)| *name == n) {
         return Err(crate::codes::coded("55P02", format!("{n} is the node's, not a session's: {how}"))); // (cant_change_runtime_param)
     }
@@ -386,7 +470,7 @@ pub fn show(sql: &str) -> Option<String> {
     if name(&n).contains('.') {
         return None;
     }
-    let v = shown(&n).or_else(|| (n == "search_path").then(|| "public".to_string()))?;
+    let v = shown(&n).or_else(|| (n == "search_path").then(|| "public".to_string())).or_else(|| default_shown(&n))?;
     Some(format!("SELECT '{}' AS {n}", v.replace('\'', "''")))
 }
 
@@ -427,6 +511,38 @@ impl VisitorMut for Arguments {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A table's default formats (I11): SET keeps a format this build has, refuses one that comes later by name and any
+    /// other with the ones it has; pg_dump's `heap` is Pondra's own; the session's comes before the node's, which comes
+    /// before Pondra's own, and a node's bad value is refused naming its setting.
+    #[test]
+    fn a_new_tables_default_formats_are_kept_checked_and_resolved_nearest_first() {
+        let kept = |n: &str, v: &str| defaults_kept(n.into(), v.into());
+        assert_eq!(kept("default_table_format", "Pondra").unwrap(), ("default_table_format".into(), "pondra".into()));
+        assert_eq!(kept("default_file_format", " PARQUET ").unwrap(), ("default_file_format".into(), "parquet".into()));
+        assert_eq!(kept("default_table_format", "DEFAULT").unwrap().1, "default");
+        let e = kept("default_table_format", "iceberg").unwrap_err();
+        assert_eq!(crate::codes::of(&e), "0A000");
+        assert!(e.to_string().contains("Iceberg tables come in 1.0") && e.to_string().contains("WITH (publish = 'iceberg')"), "{e}");
+        assert!(kept("default_table_format", "delta").unwrap_err().to_string().contains("Delta tables come in 1.1"));
+        let e = kept("default_file_format", "orc").unwrap_err();
+        assert_eq!((crate::codes::of(&e), e.to_string()), ("22023", "invalid value for parameter \"default_file_format\": \"orc\": a file format here is parquet".into()));
+        // (pg_dump's `SET default_table_access_method = heap`: Pondra's own format; another access method names the setting)
+        assert_eq!(kept("default_table_access_method", "heap").unwrap(), ("default_table_format".into(), "pondra".into()));
+        let e = kept("default_table_access_method", "columnar").unwrap_err();
+        assert!(crate::codes::of(&e) == "22023" && e.to_string().contains("SET default_table_format"), "{e}");
+        assert_eq!(kept("search_path", "crm").unwrap(), ("search_path".into(), "crm".into()), "any other setting is kept as given");
+
+        assert_eq!(resolved(&TABLE, Some("pondra".into()), Some("nope")).unwrap(), ("pondra".into(), Source::Session), "the session's first");
+        assert_eq!(resolved(&TABLE, Some("default".into()), Some("POndra")).unwrap(), ("pondra".into(), Source::Node), "DEFAULT: the node's");
+        assert_eq!(resolved(&FILE, None, None).unwrap(), ("parquet".into(), Source::Pondra), "else Pondra's own");
+        let e = resolved(&TABLE, None, Some("hudi")).unwrap_err();
+        assert!(format!("{e:#}").starts_with("the node's PONDRA_DEFAULT_TABLE_FORMAT: invalid value"), "{e:#}");
+        assert_eq!(default_shown("default_table_format").as_deref(), Some("pondra"), "SHOW with nothing set: Pondra's own");
+        assert_eq!(default_shown("search_path"), None);
+        let flag = crate::settings::find(TABLE.var).and_then(|s| s.flag.map(|_| s.default()));
+        assert_eq!(flag, Some(Some("pondra".into())), "pondra serve --default-table-format");
+    }
 
     /// A session's language is its own (`SET language`, or the dialect's setting that names one), else the node's, else
     /// Pondra's SQL; a dialect that names none is DataFusion's, read in Pondra's SQL, and the two never stand together.

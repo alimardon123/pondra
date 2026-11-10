@@ -2,7 +2,7 @@
 //! their handlers and the answers they give. What a commit means and how the leader records it is
 //! `iceberg.rs`'s, a lake module; this one is axum's, so it is a doors module.
 
-use crate::iceberg::{loaded, prepare, requirements, Commit, Published, CONFLICT, REFUSED};
+use crate::iceberg::{instead, loaded, prepare, requirements, Commit, Published, CONFLICT, REFUSED};
 use crate::store::Lake;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -394,6 +394,7 @@ async fn update(axum::extract::State(app): axum::extract::State<crate::app::App>
     crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name)).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), false))?;
     let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException"))?;
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the commit: {e}")))?;
+    instead(&name, &asked).map_err(door)?;
     let updates = asked["updates"].as_array().cloned().unwrap_or_default();
     let alters = |a: &str| ["add-schema", "set-properties", "remove-properties"].contains(&a);
     if updates.iter().any(|u| alters(u["action"].as_str().unwrap_or_default())) && !updates.iter().any(|u| u["action"] == "add-snapshot") {
@@ -439,6 +440,7 @@ async fn transaction(axum::extract::State(app): axum::extract::State<crate::app:
         let name = crate::text::join(&schema, table);
         crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name)).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), false))?;
         let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.join(".")), "NoSuchTableException"))?;
+        instead(&name, change).map_err(door)?;
         if let Some(c) = prepare(&lake, &name, &current, change).await.map_err(door)? {
             commits.push(c);
         }
