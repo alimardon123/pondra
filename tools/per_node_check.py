@@ -34,6 +34,10 @@ generic over the visitor, so each walk is compiled again for every visitor type.
 trait, or a call of `visit_expressions`, `visit_expressions_mut`, `visit_relations`, `visit_relations_mut`,
 `visit_statements` or `visit_statements_mut` not through `walk::`, fails here by file and line.
 
+And every call between members goes through the calling node's dial (`dial::call`, `NodeState::dial`), so the sim's
+members reach each other in its process and none of their calls goes around it (redesign step 3, piece 3c): the nodes'
+HTTP client (`cluster::http`) is sent with in one place, `cluster::send_call` (the `Http` dial), and named nowhere else.
+
 Only the standard library; it reads the source, not a build.
 """
 import argparse, os, re, sys
@@ -405,6 +409,38 @@ def walks():
     return bad
 
 
+DIALED = re.compile(r"(?<!fn )(?<![\w:])http\((?:&|node\b)|\bcluster::http\(")
+
+
+def dialed():
+    """A call between members around the node's dial: the nodes' HTTP client used outside `cluster::send_call`."""
+    bad = []
+    for base, _, files in os.walk(SRC):
+        for f in sorted(files):
+            if not f.endswith(".rs"):
+                continue
+            path = os.path.join(base, f)
+            rel = os.path.relpath(path, SRC).replace(os.sep, "/")
+            text = tests_cut(open(path, encoding="utf-8").read())
+            # (cluster.rs's own `send_call`, the `Http` dial, is the one place that sends with it)
+            allowed = range(*span(text, "async fn send_call(")) if rel == "cluster.rs" else range(0)
+            for n, line in enumerate(text.split("\n"), 1):
+                if DIALED.search(line.split("//", 1)[0]) and n not in allowed:
+                    bad.append(f"src/{rel}:{n}: a call between members goes through the node's dial (crate::dial::call), not the nodes' HTTP client: the sim's members reach each other only by their dial")
+    return bad
+
+
+def span(text, start):
+    """The 1-based lines from `start`'s line through the end of its item (the next line that is a lone `}`)."""
+    at = text.find(start)
+    if at < 0:
+        return (0, 0)
+    first = text.count("\n", 0, at) + 1
+    lines = text.split("\n")
+    last = next((i for i in range(first, len(lines) + 1) if lines[i - 1] == "}"), len(lines))
+    return (first, last + 1)
+
+
 def poisoned(found):
     """A process's lock read with `.unwrap()`: a library's node restarting in place unwinds through
     whatever lock it holds (`Lifecycle::restart`), and the next start must still read it."""
@@ -433,7 +469,7 @@ def main():
         if not ok:
             bad.append(f"src/{rel}:{line} {name} ({ty}): {why}")
     stale = sorted(k for k in PROCESS if k not in keys)
-    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks() + settings() + clocks() + poisoned(found) + walks()
+    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks() + settings() + clocks() + poisoned(found) + walks() + dialed()
     bad += more
     for b in bad if not args.list else more:
         print(f"FAIL {b}")

@@ -1,6 +1,8 @@
 //! How lake code calls another member, or another lake's leader. Lake code reaches the others only
-//! through here: a node sends the call over HTTP (`cluster::Http`), and a build with no doors reaches
-//! only the node a page joined, over `fetch` with the page's sign-in (`Paged`), so the browser build names no socket and no door.
+//! through here, by the node's own dial (`NodeState::dial`, which its host gives it): a node sends the call over HTTP
+//! (`cluster::Http`), a build with no doors reaches only the node a page joined, over `fetch` with the page's sign-in
+//! (`Paged`, `Joined`), so the browser build names no socket and no door, and the sim's members call each other in its
+//! process (redesign step 3, piece 3c: l7-wip/step3-sim-plan.md).
 use anyhow::{anyhow, Context, Result};
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
@@ -30,11 +32,13 @@ pub struct Call {
     pub bearer: Option<String>,
     /// The user a change is for, sent to this lake's own leader only (`auth::AS_USER`).
     pub user: Option<String>,
+    /// Headers of its own (a follower's beat says what it holds: `cluster::said`).
+    pub headers: Vec<(String, String)>,
 }
 
 impl Call {
     fn new(verb: Verb, path: impl Into<String>, body: Option<Bytes>) -> Call {
-        Call { verb, path: path.into(), body, json: false, timeout: None, bearer: None, user: None }
+        Call { verb, path: path.into(), body, json: false, timeout: None, bearer: None, user: None, headers: vec![] }
     }
 
     /// `GET path`; a query string goes in `path`.
@@ -59,12 +63,20 @@ impl Call {
     pub fn bearer(self, key: String) -> Call { Call { bearer: Some(key), ..self } }
 
     pub fn as_user(self, user: String) -> Call { Call { user: Some(user), ..self } }
+
+    /// With header `name: value` too.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Call {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
 }
 
-/// A member's answer: its status and SQLSTATE, and its body as it comes.
+/// A member's answer: its status and SQLSTATE, its headers, and its body as it comes.
 pub struct Reply {
     pub status: u16,
     pub sqlstate: Option<String>,
+    /// Its headers (a leader cut off from the bucket says so in one: `cluster::CUT_OFF_HEADER`).
+    pub headers: http::HeaderMap,
     /// The transport's own error for an answer that isn't a success (`checked` returns it).
     failed: Option<anyhow::Error>,
     body: BoxStream<'static, Result<Bytes>>,
@@ -73,8 +85,11 @@ pub struct Reply {
 impl Reply {
     /// An answer as a transport made it: `failed` is its own error when the status isn't a success.
     pub fn new(status: u16, sqlstate: Option<String>, failed: Option<anyhow::Error>, body: BoxStream<'static, Result<Bytes>>) -> Reply {
-        Reply { status, sqlstate, failed, body }
+        Reply { status, sqlstate, headers: http::HeaderMap::new(), failed, body }
     }
+
+    /// The answer with `headers` as its own.
+    pub fn with_headers(self, headers: http::HeaderMap) -> Reply { Reply { headers, ..self } }
 
     /// Was the answer a success (2xx)?
     pub fn ok(&self) -> bool { (200..300).contains(&self.status) }
@@ -123,21 +138,22 @@ pub trait Dial: Send + Sync {
     fn unreached(&self, e: &anyhow::Error) -> bool;
 }
 
-/// The dial this build uses: a node's HTTP, or a page's (`Paged`) when it has no doors.
+/// The dial a node of this build has unless its host gives it another (`NodeState::dial`): HTTP, or a page's (`Paged`)
+/// when the build has no doors.
 #[cfg(feature = "doors")]
-pub fn dial() -> &'static dyn Dial { &crate::cluster::Http }
+pub fn native() -> std::sync::Arc<dyn Dial> { std::sync::Arc::new(crate::cluster::Http) }
 
 #[cfg(not(feature = "doors"))]
-pub fn dial() -> &'static dyn Dial { &Paged }
+pub fn native() -> std::sync::Arc<dyn Dial> { std::sync::Arc::new(Paged) }
 
-/// The URL `to` is reached at.
-pub fn url(to: &str) -> String { dial().url(to) }
+/// The URL `to` is reached at, by node `node`'s dial.
+pub fn url(node: &crate::node_state::NodeState, to: &str) -> String { node.dial.url(to) }
 
-/// Sends `c` to `to` from node `node` (see `Dial::call`).
-pub async fn call(node: &crate::node_state::NodeState, to: &str, c: Call) -> Result<Reply> { dial().call(node, to, c).await }
+/// Sends `c` to `to` from node `node`, by its dial (see `Dial::call`).
+pub async fn call(node: &crate::node_state::NodeState, to: &str, c: Call) -> Result<Reply> { node.dial.call(node, to, c).await }
 
-/// Is `e` a call that got no answer?
-pub fn unreached(e: &anyhow::Error) -> bool { dial().unreached(e) }
+/// Is `e` a call of node `node`'s that got no answer?
+pub fn unreached(node: &crate::node_state::NodeState, e: &anyhow::Error) -> bool { node.dial.unreached(e) }
 
 /// The dial of a build with no doors, which is a page's: it reaches no member, and says so by name. A joined page reaches its
 /// node with its own dial (`Joined`), from what its member holds (`members::Joined`), and no other way.
@@ -198,6 +214,9 @@ async fn page_call(node: &str, auth: &str, to: &str, c: Call) -> Result<Reply> {
     if c.json {
         req = req.header(reqwest::header::CONTENT_TYPE, "application/json");
     }
+    for (k, v) in &c.headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
     if let Some(body) = c.body {
         req = req.body(body);
     }
@@ -210,8 +229,9 @@ async fn page_call(node: &str, auth: &str, to: &str, c: Call) -> Result<Reply> {
     let status = answer.status().as_u16();
     let sqlstate = answer.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).map(str::to_string);
     let failed = answer.error_for_status_ref().map(anyhow::Error::from);
+    let headers = answer.headers().clone();
     let body = futures::TryStreamExt::map_err(answer.bytes_stream(), anyhow::Error::from);
-    Ok(Reply::new(status, sqlstate, failed, body.boxed()))
+    Ok(Reply::new(status, sqlstate, failed, body.boxed()).with_headers(headers))
 }
 
 /// The key node `node` calls the others with: `PONDRA_NODE_KEY` as set, else the lake's own, once known (`Calls`: the node's,
