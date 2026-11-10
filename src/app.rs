@@ -3,7 +3,7 @@
 //! and call into it.
 use crate::log::{Log, Sequencer};
 use crate::store::*;
-use crate::tier::{expire, tier_table};
+use crate::tier::tier_table;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use serde_json::{json as j, Value};
@@ -36,6 +36,7 @@ pub struct App {
     pub replica: Option<Arc<crate::replica::ReplicaLog>>, // what this follower holds for the leader
     pub auth: Arc<crate::auth::Auth>,
     pub tables: Arc<tokio::sync::Mutex<crate::tier::Tables>>, // what this node knows of each table: for the leader's tiering rounds and /metrics (`tier::refresh`)
+    pub log_pass: Arc<tokio::sync::Mutex<crate::tier::LogPass>>, // the log as far as the leader's last round read it (`tier::LogPass`)
 }
 
 /// Recent query results. By default a result is reused only at exactly the catalog version it
@@ -348,10 +349,10 @@ impl App {
         let start = datafusion::common::instant::Instant::now();
         let hwm = *self.lake.hwm.borrow();
         let backlog = {
-            // (each table's rows after its own mark: an idle table keeps an old one, `tier::expire`)
+            // (each table's rows after its own mark: an idle table keeps an old one, `tier::expire`. Of the log, what the
+            // last round's pass didn't read: `tier::LogPass`)
             let tables = self.tables.lock().await;
-            let from = tables.values().map(|b| b.tiered).min().unwrap_or(hwm);
-            crate::tier::waiting(&self.lake, from, None, |t| tables.get(t).map(|b| b.tiered)).await?
+            self.log_pass.lock().await.waiting(&self.lake, &tables, hwm).await?
         };
         let nodes = if self.members.nodes().is_empty() { vec![self.members.me().to_string()] } else { self.members.nodes() };
         let (busy, untidy, changed) = {
@@ -411,7 +412,9 @@ impl App {
         let now = crate::log::now_ms();
         if now - retention.last.load(std::sync::atomic::Ordering::Relaxed) >= 10_000 {
             retention.last.store(now, std::sync::atomic::Ordering::Relaxed);
-            expire(&self.lake, self.retain_ms).await?;
+            crate::tier::refresh(&self.lake, &self.tables).await?; // (the round's briefs, as of now: what it tiered and merged)
+            let briefs = self.tables.lock().await.clone();
+            crate::tier::expire_with(&self.lake, self.retain_ms, &briefs, Some(&mut *self.log_pass.lock().await)).await?;
         }
         if start.elapsed() >= Duration::from_secs(5) {
             // one line when it drags

@@ -368,11 +368,11 @@ fn in_another<'a>(lake: &Lake, d: &'a Ddl) -> Option<(&'static str, &'a str)> {
 }
 
 /// Leader: carry one out (under the lake's lock). Comments follow what it renames, and go with
-/// what it drops (`objects::follow`). `scope`: its asker's, whom a new definition's query is planned for (a view's, a
+/// what it drops (`objects::follow`). `by`: its asker, whom a new definition's query is planned for (a view's, a
 /// materialized view's, a task's); what the lake keeps already (the views a column's move reads) plans as the node's own.
-pub async fn apply(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<Value> {
+pub async fn apply(lake: &Lake, d: Ddl, by: &crate::auth::Principal) -> Result<Value> {
     let moves = crate::objects::moves(&d);
-    let out = carry_out(lake, d, scope).await?;
+    let out = carry_out(lake, d, by).await?;
     if moves {
         crate::objects::follow(lake, &out).await?;
         crate::index::follow(lake, &out).await?;
@@ -380,7 +380,11 @@ pub async fn apply(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
     Ok(out)
 }
 
-async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<Value> {
+/// `apply`, boxed, for what calls it back (`objects::Alter`): its type says the future is `Send`, which the compiler can't
+/// prove of a recursive one.
+fn apply_boxed<'a>(lake: &'a Lake, d: Ddl, by: &'a crate::auth::Principal) -> futures::future::BoxFuture<'a, Result<Value>> { Box::pin(apply(lake, d, by)) }
+
+async fn carry_out(lake: &Lake, d: Ddl, by: &crate::auth::Principal) -> Result<Value> {
     if let Some((what, name)) = in_another(lake, &d) {
         let db = name.split('.').next().unwrap_or_default();
         return Err(crate::codes::coded("0A000", format!("{what} {name}: {db} is an attached lake, whose tables, views and routines are made, dropped and changed from a node of that lake (from here, its rows are written and its tables made with CREATE TABLE)")));
@@ -423,7 +427,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
             if there {
                 return Ok(j!({"name": name, "exists": true}));
             }
-            Box::pin(apply(lake, *then, scope)).await
+            Box::pin(apply(lake, *then, by)).await
         }
         Ddl::Replacing { name, then } => {
             let here = new_name(lake, &name).await?;
@@ -436,7 +440,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
             if lake.cat.get::<Value>(&crate::views::view_key(&here)).await?.is_some() || lake.cat.get::<Value>(&once).await?.is_some() || lake.cat.get::<Value>(&crate::feeds::feed_key(&here)).await?.is_some() {
                 drop_view(lake, &name, true, false).await?; // (refused, saying so, while another view follows it; replaced, not kept)
             }
-            Box::pin(apply(lake, *then, scope)).await
+            Box::pin(apply(lake, *then, by)).await
         }
         Ddl::DetachView { name } => detach_view(lake, &new_name(lake, &name).await?).await,
         Ddl::PlaceViewColumn { view, column, place, materialized } => {
@@ -446,7 +450,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
                 true => place_materialized_column(lake, &name, &column, &place).await,
             }
         }
-        Ddl::Object(op) => crate::objects::apply(lake, op, scope).await,
+        Ddl::Object(op) => crate::objects::apply(lake, op, &by.scope, &|d| apply_boxed(lake, d, by)).await,
         Ddl::Entry { words, tree, .. } => crate::statements::carry_out(lake, &words, tree).await,
         Ddl::Sequence(c) => crate::seq::apply(lake, c).await,
         Ddl::Index(c) => crate::index::apply(lake, c).await,
@@ -460,7 +464,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
         Ddl::ViewFacts { view, if_exists, change } => {
             let (other, view) = resolve(lake, &view).await?;
             ensure!(other.is_none(), "{view} is an attached lake's: change its facts from a node of that lake");
-            crate::facts::apply(lake, &view, if_exists, change, scope).await
+            crate::facts::apply(lake, &view, if_exists, change, &by.scope).await
         }
         Ddl::CreateSchema { name, if_not_exists } => {
             check(&name)?;
@@ -519,11 +523,11 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
             Ok(out)
         }
         Ddl::DropTable { name, if_exists, purge, made_by } => drop_table(lake, &name, if_exists, purge, made_by.as_deref()).await,
-        Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?, scope).await,
-        Ddl::UndropKept { kind, name } if kind == "database" => undrop_database(lake, &name.to_lowercase(), scope).await,
-        Ddl::UndropKept { kind, name } => crate::undrop::undrop(lake, &kind, &crate::undrop::named(lake, &kind, &name).await?, scope).await,
+        Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?, by).await,
+        Ddl::UndropKept { kind, name } if kind == "database" => undrop_database(lake, &name.to_lowercase(), by).await,
+        Ddl::UndropKept { kind, name } => crate::undrop::undrop(lake, &kind, &crate::undrop::named(lake, &kind, &name).await?, by).await,
         Ddl::Clone { name, from } => clone(lake, &new_name(lake, &name).await?, &from).await,
-        Ddl::CreateView { name, sql, replace, facts, text } => create_view(lake, &name, sql, replace, false, facts, text, scope).await,
+        Ddl::CreateView { name, sql, replace, facts, text } => create_view(lake, &name, sql, replace, false, facts, text, &by.scope).await,
         Ddl::CreateExternal { name, sql, replace, if_not_exists } => {
             let name = new_name(lake, &name).await?;
             let taken = lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_some()
@@ -532,7 +536,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
                 return Ok(j!({"table": name, "unchanged": true}));
             }
             ensure!(replace || !taken, "{name} already exists (CREATE OR REPLACE EXTERNAL TABLE, or IF NOT EXISTS)");
-            create_view(lake, &name, sql, replace, true, None, None, scope).await
+            create_view(lake, &name, sql, replace, true, None, None, &by.scope).await
         }
         Ddl::CreateMaterialized { name, sql, mut options, text } => {
             let name = new_name(lake, &name).await?;
@@ -552,9 +556,9 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
             }
             ensure!(!crate::seq::calls(&sql), "a materialized view can't call nextval or setval: its rows are worked out again as its tables change, and would be numbered again (number the rows where they are written: an identity column, or DEFAULT nextval('s'))");
             ensure!(outside.is_empty(), "a materialized view follows the rows its tables take in, and files outside the lake take none: read them into a table (CREATE TABLE … AS, INSERT … SELECT) and follow that, or make a stored view (CREATE VIEW)");
-            crate::views::create(lake, &name, &sql, crate::views::options(&options)?, scope).await?;
+            crate::views::create(lake, &name, &sql, crate::views::options(&options)?, &by.scope).await?;
             let unwritten = match text {
-                Some(text) => !written_as(lake, &name, &text, &sql, scope).await? && crate::authored::commented(&text), // (its query as written, comments kept: `authored.rs`)
+                Some(text) => !written_as(lake, &name, &text, &sql, &by.scope).await? && crate::authored::commented(&text), // (its query as written, comments kept: `authored.rs`)
                 None => false,
             };
             crate::views::forget(lake); // (the sequencer holds flushes to it from its next commit)
@@ -604,9 +608,9 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
                 (false, false) => j!({"attached": name, "dir": dir}),
             })
         }
-        Ddl::CreateDatabase { name, if_not_exists, dir, clone: Some(of) } => crate::branch::create(lake, &name, if_not_exists, dir, of).await,
+        Ddl::CreateDatabase { name, if_not_exists, dir, clone: Some(of) } => crate::branch::create(lake, &name, if_not_exists, dir, of, by).await,
         Ddl::Branch(m) => crate::branch::make(lake, m).await,
-        Ddl::Pin { lake: branch, ms, lease } => crate::branch::pin(lake, &branch, ms, lease).await,
+        Ddl::Pin { lake: branch, ms, lease } => crate::branch::pin(lake, &branch, ms, lease, Some(by)).await,
         Ddl::Unpin { lake: branch } => crate::branch::unpin(lake, &branch).await,
         Ddl::Refresh { .. } => bail!("ALTER DATABASE … REFRESH is done by its database's leader (write::handle)"),
         Ddl::SetLocation { .. } => bail!("ALTER DATABASE … SET LOCATION is done by its database's leader (memory::set_location)"),
@@ -621,7 +625,7 @@ async fn carry_out(lake: &Lake, d: Ddl, scope: &crate::rights::Scope) -> Result<
             if has_catalog(&full(&dir)?, Some(&lake.node.reaches)).await? {
                 ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name})");
             }
-            let mut out = Box::pin(apply(lake, Ddl::Attach { name, dir, read_only: false, endpoint: None }, scope)).await?;
+            let mut out = Box::pin(apply(lake, Ddl::Attach { name, dir, read_only: false, endpoint: None }, by)).await?;
             if let Some(n) = gone {
                 out["notice"] = n.into();
             }
@@ -824,8 +828,8 @@ async fn databases_call(node: &crate::node_state::NodeState, server: &str, delet
 
 /// `UNDROP DATABASE name` (an admin's): the database dropped under `name` beside this one, back as it was, and attached
 /// here again. On a server it asks the server (`dbserver::undrop_db`), whose folder holds them.
-async fn undrop_database(lake: &Lake, name: &str, scope: &crate::rights::Scope) -> Result<Value> {
-    ensure!(scope.whole(), crate::codes::coded("42501", format!("permission denied: UNDROP DATABASE {name} needs an admin")));
+async fn undrop_database(lake: &Lake, name: &str, by: &crate::auth::Principal) -> Result<Value> {
+    ensure!(by.scope.whole(), crate::codes::coded("42501", format!("permission denied: UNDROP DATABASE {name} needs an admin")));
     database_name(name)?;
     let dir = match crate::env::get("PONDRA_SERVER_URL") {
         Some(server) => {
@@ -847,7 +851,7 @@ async fn undrop_database(lake: &Lake, name: &str, scope: &crate::rights::Scope) 
     // (attached here again: by its record, kept with it when it had one, else as the shell finds its siblings)
     let follow = !lake.node.life.one_off();
     if crate::undrop::has(lake, "database", name).await? {
-        Box::pin(crate::undrop::undrop(lake, "database", name, scope)).await?;
+        Box::pin(crate::undrop::undrop(lake, "database", name, by)).await?;
         sync(lake, follow).await?;
     }
     if !lake.attached.read().unwrap().iter().any(|(n, _)| n == name) {
@@ -1457,7 +1461,7 @@ pub fn retention(text: &str) -> Result<u64> {
 /// `UNDROP TABLE t`: the table dropped last under that name, back as it was. It reads the log from
 /// now on (its rows went to files when it was dropped; the log since may hold another table's of
 /// its name). Refused while something else has the name: rename that first.
-pub(crate) async fn undrop(lake: &Lake, name: &str, scope: &crate::rights::Scope) -> Result<Value> {
+pub(crate) async fn undrop(lake: &Lake, name: &str, by: &crate::auth::Principal) -> Result<Value> {
     let taken = lake.cat.get::<TableMeta>(&table_key(name)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(name)).await?.is_some()
         || lake.cat.get::<Value>(&crate::views::view_key(name)).await?.is_some();
     if taken {
@@ -1466,7 +1470,7 @@ pub(crate) async fn undrop(lake: &Lake, name: &str, scope: &crate::rights::Scope
     let mut kept: Vec<(String, Dropped)> = lake.cat.scan::<Dropped>(&format!("dt/{name}/"), &format!("dt/{name}0")).await?;
     let Some((key, d)) = kept.pop() else {
         if crate::undrop::has(lake, "external table", name).await? {
-            return Box::pin(crate::undrop::undrop(lake, "external table", name, scope)).await; // (DROP TABLE drops one too)
+            return Box::pin(crate::undrop::undrop(lake, "external table", name, by)).await; // (DROP TABLE drops one too)
         }
         return Err(crate::codes::coded("42P01", format!("no dropped table {name} is kept (pondra.dropped lists those that are)")));
     };
@@ -2507,10 +2511,10 @@ mod tests {
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
         crate::write::create_table(&lake, "t", r#"{"columns": [["a", "Int64"]], "made_by": "job-a"}"#).await?;
         let drop = |made_by: &str| Ddl::DropTable { name: "t".into(), if_exists: true, purge: true, made_by: Some(made_by.into()) };
-        let out = apply(&lake, drop("job-b"), &crate::auth::Principal::node().scope).await?;
+        let out = apply(&lake, drop("job-b"), &crate::auth::Principal::node()).await?;
         assert_eq!(out["dropped"], false, "{out}");
         assert!(lake.cat.get::<TableMeta>(&table_key("t")).await?.is_some(), "another job's table was dropped");
-        apply(&lake, drop("job-a"), &crate::auth::Principal::node().scope).await?;
+        apply(&lake, drop("job-a"), &crate::auth::Principal::node()).await?;
         assert!(lake.cat.get::<TableMeta>(&table_key("t")).await?.is_none(), "the job's own table was kept");
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
@@ -2529,7 +2533,7 @@ mod tests {
         use crate::users::{Access, Grant, On};
         let dir = std::env::temp_dir().join(format!("pondra-mover-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
-        let node = &crate::auth::Principal::node().scope;
+        let node = &crate::auth::Principal::node();
         crate::write::create_table(&lake, "t", r#"{"columns": [["a", "Int64"], ["b", "Int64"]]}"#).await?;
         crate::write::create_table(&lake, "s", r#"{"columns": [["c", "Utf8"]]}"#).await?;
         let view = |name: &str, sql: &str| Ddl::CreateView { name: name.into(), sql: sql.into(), replace: false, facts: None, text: None };
@@ -2541,16 +2545,16 @@ mod tests {
         let mover = crate::rights::Scope::granted(std::sync::Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec![] }])));
         let at_a_door = crate::auth::Principal { name: "mover".into(), role: crate::auth::Role::Read, scope: mover.clone(), door: "test", from: None, operator: false, epoch: 0, until: None, reads: false };
         let stmt = crate::write::parse("ALTER TABLE t ALTER COLUMN b FIRST").expect("an ALTER");
-        let refused = crate::auth::WHO.scope(at_a_door, async { crate::rights::may_run(crate::auth::Role::Read, &stmt) }).await.expect_err("a SELECT-only mover is refused at a door");
+        let refused = crate::auth::WHO.scope(at_a_door.clone(), async { crate::rights::may_run(crate::auth::Role::Read, &stmt) }).await.expect_err("a SELECT-only mover is refused at a door");
         assert!(refused.to_string().contains("it needs an admin token, or a superuser"), "{refused}");
-        let out = apply(&lake, Ddl::AlterColumn { table: "t".into(), column: "b".into(), change: Change::Place(Place::First) }, &mover).await?;
+        let out = apply(&lake, Ddl::AlterColumn { table: "t".into(), column: "b".into(), change: Change::Place(Place::First) }, &at_a_door).await?;
         assert_eq!(out, j!({"table": "t", "altered": {"column": "b", "place": "FIRST"}, "readers": ["materialized view v lists its columns in the new order, its rows kept"]}), "the move goes, names its reader, and answers no row");
         let v = lake.cat.get::<crate::views::View>(&crate::views::view_key("v")).await?.expect("v is kept");
         let names: Vec<String> = view_outputs(&lake, &v.sql).await?.into_iter().map(|(c, ..)| c).collect();
         assert_eq!(names, ["a", "b"], "v runs as it did, t read as it was: {}", v.sql);
         let t = lake.cat.get::<TableMeta>(&table_key("t")).await?.expect("t");
         assert_eq!(t.sql_names(), ["b", "a"], "t lists its columns in the new order");
-        let refused = format!("{:#}", apply(&lake, view("w", "SELECT * FROM s"), &mover).await.expect_err("the mover's own view of s plans for them"));
+        let refused = format!("{:#}", apply(&lake, view("w", "SELECT * FROM s"), &at_a_door).await.expect_err("the mover's own view of s plans for them"));
         assert!(refused.contains("not found") || refused.contains("no table"), "s isn't there, for the mover: {refused}");
         assert!(lake.cat.get_raw(&query_key("w")).await?.is_none(), "and no view w is made");
         lake.cat.close().await?;

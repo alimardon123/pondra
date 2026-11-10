@@ -150,8 +150,7 @@ async fn drop_function(State(app): State<App>, Path(name): Path<String>) -> Resu
 /// (`files::keep`, ADR-035 §8).
 async fn put_file(State(app): State<App>, Path(path): Path<String>, who: Option<axum::Extension<crate::auth::Principal>>, headers: HeaderMap, body: Bytes) -> Result<Response, E> {
     let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
-    let role = who.map_or(crate::auth::Role::None, |w| w.0.role);
-    Ok(filed(crate::files::put(&app.lake, &path, if_match, body, role).await?))
+    Ok(filed(crate::files::put(&app.lake, &path, if_match, body, &signed_of(who)).await?))
 }
 
 /// A `Filed` as the node's HTTP answer: its status, its content type and, when it is the file's bytes, its version as
@@ -174,13 +173,13 @@ async fn get_file(State(app): State<App>, Path(path): Path<String>, Query(q): Qu
 }
 
 /// `POST /files/<path>?restore=<id>`: that version made the file again (itself kept as the newest).
-async fn restore_file(State(app): State<App>, Path(path): Path<String>, Query(q): Query<HashMap<String, String>>) -> Result<Response, E> {
-    Ok(filed(crate::files::restore(&app.lake, &path, &q).await?))
+async fn restore_file(State(app): State<App>, Path(path): Path<String>, who: Option<axum::Extension<crate::auth::Principal>>, Query(q): Query<HashMap<String, String>>) -> Result<Response, E> {
+    Ok(filed(crate::files::restore(&app.lake, &path, &q, &signed_of(who)).await?))
 }
 
 /// `DELETE /files/<path>`: that object gone (a writer's, as `PUT`); its versions stay. A path no file is at: 404.
-async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result<Response, E> {
-    Ok(filed(crate::files::remove(&app.lake, &path).await?))
+async fn delete_file(State(app): State<App>, Path(path): Path<String>, who: Option<axum::Extension<crate::auth::Principal>>) -> Result<Response, E> {
+    Ok(filed(crate::files::remove(&app.lake, &path, &signed_of(who).name).await?))
 }
 
 /// `GET /sessions/{id}/python`: the variables a session's Python holds, as the console's panel
@@ -299,6 +298,8 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         }
         // (no role, and a whole scope: `ddl` lets nothing but its own pin through, and asks it no grant)
         let who = crate::auth::Principal { scope: crate::rights::Scope::everything(), ..crate::auth::Principal::of(crate::auth::Role::None) }.at("http", from);
+        req.extensions_mut().insert(who.role);
+        req.extensions_mut().insert(who.clone()); // (`ddl`'s asker, as for any sign-in: whole, so `branch::pin` takes its renewal as no CLONE grant's)
         return match crate::panics::door(&app.lake.node, crate::auth::WHO.scope(who, next.run(req))).await {
             Ok(r) => told_to(true, r), // (a whole scope is shown code)
             Err(m) => E(anyhow::anyhow!(m)).into_response(),
@@ -999,7 +1000,7 @@ async fn insert_staged(app: &App, name: &str, job: &str, body: &str, who: &crate
         (Some(p), Ok((None, table))) => Some((table, p)),
         _ => None,
     };
-    let out = crate::log::placed_as(placed, crate::write::on_node_as(app, stmt, Some(format!("staged:{slug}:{job}")), true, &who.scope)).await;
+    let out = crate::log::placed_as(placed, crate::write::on_node_as(app, stmt, Some(format!("staged:{slug}:{job}")), true, who)).await;
     unstage.now().await; // (before the answer, so a resend of the same job stages afresh)
     Ok(Json(out?))
 }
@@ -1048,6 +1049,9 @@ async fn unstage(lake: &crate::store::Lake, dir: &str) {
 /// Whom a request plans for: the principal its guard signed in (`guard`), or nobody when none did (it sees nothing).
 fn scope_of(who: Option<axum::Extension<crate::auth::Principal>>) -> crate::rights::Scope { who.map_or_else(crate::rights::Scope::nothing, |w| w.0.scope) }
 
+/// Who a request asks as: the principal it signed in, or nobody's (`Principal::of(Role::None)`, whose scope is nothing).
+fn signed_of(who: Option<axum::Extension<crate::auth::Principal>>) -> crate::auth::Principal { who.map_or_else(|| crate::auth::Principal::of(crate::auth::Role::None), |w| w.0) }
+
 /// Record an INSERT's files (from another node, or a `pondra sql` somewhere else).
 async fn files(State(app): State<App>, Json(f): Json<crate::write::Files>) -> Result<Json<Value>, E> {
     let meta = app.lake.cat.meta(&table_key(f.table())).await?;
@@ -1069,12 +1073,12 @@ async fn create_task(State(app): State<App>, Path(name): Path<String>, who: Opti
 /// window of column `w` once, final, to `{name}_final`; `?session=ts&gap_secs=30&lateness_secs=5`
 /// makes it a session view (`views.rs`): `CREATE MATERIALIZED VIEW … WITH (…)` in SQL.
 async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(options): Query<std::collections::BTreeMap<String, String>>, who: Option<axum::Extension<crate::auth::Principal>>, sql: String) -> Result<Json<Value>, E> {
-    let scope = scope_of(who);
-    let (text, sql) = (Some(sql.clone()), crate::routines::expand(&app.lake, &sql, &scope).await?); // (as they are now: ADR-023; as written, if it reads so: `authored.rs`)
+    let by = signed_of(who);
+    let (text, sql) = (Some(sql.clone()), crate::routines::expand(&app.lake, &sql, &by.scope).await?); // (as they are now: ADR-023; as written, if it reads so: `authored.rs`)
     let d = crate::ddl::Ddl::CreateMaterialized { name, sql, options, text };
     let out = {
         let _guard = app.lock.lock().await;
-        crate::ddl::apply(&app.lake, d.clone(), &scope).await?
+        crate::ddl::apply(&app.lake, d.clone(), &by).await?
     };
     app.settle(&d).await?; // (once it's filled from the rows already there)
     Ok(Json(out))
@@ -1103,7 +1107,7 @@ fn cluster_call(app: &App, headers: &HeaderMap) -> bool {
 /// branch's pin (ADR-058). A follower sends it to the leader, asked with the caller's own token.
 async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Extension<crate::auth::Role>>, who: Option<axum::Extension<crate::auth::Principal>>, Json(mut d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
     crate::backup::sent(&d)?;
-    let scope = &scope_of(who);
+    let by = &signed_of(who);
     let credential = crate::auth::Credential::of_headers(&headers);
     let key = credential.token().filter(|k| k.starts_with("pb_"));
     if let Some(key) = key {
@@ -1114,13 +1118,13 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
     if !cluster_call(&app, &headers) && key.is_none() {
         crate::protect::check_ddl(&app.lake, &d).await?;
     }
-    crate::protect::stamp(&mut d); // (who lifts a protection, when the statement doesn't say)
+    crate::protect::stamp(&mut d, &by.name); // (who lifts a protection, when the statement doesn't say)
     let out = match &app.seq {
-        Some(seq) => crate::write::ddl_here(&app.lake, seq, &app.lock, d.clone(), scope).await?,
+        Some(seq) => crate::write::ddl_here(&app.lake, seq, &app.lock, d.clone(), by).await?,
         None if !app.members.is_leader() => Box::pin(crate::write::send_as(&app.lake.url, crate::write::Request::Ddl(d.clone()), credential.token(), &app.lake.node)).await?, // (the leader makes it)
         None => {
             let _guard = app.lock.lock().await;
-            crate::ddl::apply(&app.lake, d.clone(), scope).await?
+            crate::ddl::apply(&app.lake, d.clone(), by).await?
         }
     };
     app.settle(&d).await?; // (ATTACH, CREATE DATABASE: the leader too at once, not in a second)

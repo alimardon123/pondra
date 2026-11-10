@@ -772,6 +772,24 @@ pub(crate) fn bad(message: String) -> Refusal { refused(400, "BadRequestExceptio
 
 pub(crate) fn conflict(message: String) -> Refusal { refused(409, "CommitFailedException", message) }
 
+/// A commit that asks what Pondra's SQL does another way, refused naming that way (the Iceberg review's I6): a replace
+/// of the table (Iceberg's replace drops main's ref first), an expiry of snapshots, a change of its partitioning. (A
+/// rollback, main set to an older snapshot alone, is `parse`'s; a compaction, a snapshot that does replace, too.)
+pub(crate) fn instead(table: &str, asked: &Value) -> Result<(), Refusal> {
+    let updates = asked["updates"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let asks = |actions: &[&str]| updates.iter().find(|u| actions.iter().any(|a| u["action"] == *a));
+    if updates.iter().any(|u| u["action"] == "remove-snapshot-ref" && u["ref-name"] == "main") {
+        return Err(bad(format!("a replace of the table (Spark's REPLACE TABLE, CREATE OR REPLACE TABLE … AS SELECT): in Pondra, CREATE OR REPLACE TABLE {table} … with its SQL")));
+    }
+    if asks(&["remove-snapshots"]).is_some() {
+        return Err(bad(format!("an expiry of {table}'s snapshots (Spark's expire_snapshots): Pondra lets a table's past go itself, once the lake's retention passes (pondra serve --retain-secs), and its Iceberg metadata lists only the snapshots still kept")));
+    }
+    if let Some(u) = asks(&["add-spec", "set-default-spec", "remove-partition-specs"]) {
+        return Err(bad(format!("a change of {table}'s partitioning ({}): a Pondra table keeps the PARTITION BY it was made with", u["action"].as_str().unwrap_or_default())));
+    }
+    Ok(())
+}
+
 /// A table's commit as the node that takes it gets it ready for the leader: parsed (a schema change
 /// with it refused), checked against the table as published, its files' footers read (or its
 /// rows written as the table's own files) and the files its deletes name read. None: it is in
@@ -906,6 +924,9 @@ async fn parse(lake: &Lake, table: &str, meta: &Value, asked: &Value) -> Result<
             a => return Err(bad(format!("{a}: a Pondra table changes through its SQL (ALTER TABLE), and other engines append to it and change its rows"))),
         }
     }
+    if let (true, Some(to)) = (snapshots.is_empty(), main) {
+        return Err(bad(format!("a rollback to snapshot {to} (main set to an older snapshot: Spark's rollback_to_snapshot, set_current_snapshot): Pondra brings back a table's past with its SQL, RESTORE TABLE {table} TO VERSION AS OF n (or TO TIMESTAMP AS OF …)")));
+    }
     let s = snapshots.last().cloned().ok_or_else(|| bad("a commit with no snapshot: other engines append to Pondra's tables and change their rows".into()))?;
     let id = s["snapshot-id"].as_i64().ok_or_else(|| bad("a snapshot without its snapshot-id".into()))?;
     if main != Some(id) {
@@ -929,7 +950,7 @@ async fn parse(lake: &Lake, table: &str, meta: &Value, asked: &Value) -> Result<
         }
         match s["summary"]["operation"].as_str().unwrap_or("append") {
             "append" | "overwrite" | "delete" => {}
-            "replace" => return Err(bad("another engine's compaction (a snapshot that does replace): Pondra merges its tables' files itself".into())),
+            "replace" => return Err(bad("another engine's compaction (a snapshot that does replace: Spark's rewrite_data_files, rewrite_manifests): Pondra merges its tables' files itself".into())),
             op => return Err(bad(format!("a snapshot that does {op}: not one Pondra takes (append, overwrite, delete)"))),
         }
         if !s["schema-id"].is_null() && s["schema-id"] != meta["current-schema-id"] {
@@ -1183,6 +1204,19 @@ mod tests {
         assert!(!lets_go(&set(&["a", "b"]), &set(&["a", "b", "c"])), "files sealed into a manifest, and one more");
         assert!(lets_go(&set(&["a", "b"]), &set(&["ab"])), "a merge");
         assert!(lets_go(&set(&["a", "b"]), &set(&["b"])), "a file taken out whole");
+    }
+
+    /// A replace of the table, an expiry of snapshots and a change of partitioning are answered with Pondra's way; an
+    /// append, or a branch's ref, goes on to `parse`.
+    #[test]
+    fn what_pondras_sql_does_another_way_is_refused_naming_it() {
+        let said = |updates: Value| instead("t", &json!({"updates": updates})).err().map(|(_, b)| b["error"]["message"].as_str().unwrap_or_default().to_string());
+        let replace = json!([{"action": "remove-snapshot-ref", "ref-name": "main"}, {"action": "set-current-schema", "schema-id": -1}, {"action": "set-default-spec", "spec-id": -1}]);
+        assert!(said(replace).is_some_and(|s| s.contains("CREATE OR REPLACE TABLE t")));
+        assert!(said(json!([{"action": "remove-snapshots", "snapshot-ids": [1]}])).is_some_and(|s| s.contains("--retain-secs")));
+        assert!(said(json!([{"action": "add-spec", "spec": {}}, {"action": "set-default-spec", "spec-id": -1}])).is_some_and(|s| s.contains("PARTITION BY") && s.contains("add-spec")));
+        assert_eq!(said(json!([{"action": "remove-snapshot-ref", "ref-name": "dev"}])), None);
+        assert_eq!(said(json!([{"action": "add-snapshot", "snapshot": {}}, {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": 1}])), None);
     }
 
     /// The metadata lists the snapshots from the last that let a file go, the newest always; with none such, all kept.

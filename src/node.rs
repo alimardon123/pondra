@@ -332,7 +332,7 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     if s.auth.on() {
         lake.node.tokens.store(true, std::sync::atomic::Ordering::Relaxed); // (this node's doors take tokens: `auth::tokens_on`)
     }
-    let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone(), tables: Default::default() };
+    let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone(), tables: Default::default(), log_pass: Default::default() };
     if let Some(ledger) = lake.ledger() {
         ledger.charge("answers", Arc::downgrade(&app.results) as std::sync::Weak<dyn crate::ledger::Charged>); // (the remembered answers: `/metrics`' `cache_bytes`)
         // (the lake's state its doors use, made as it starts, so `/metrics` names it before its first use: what lookups
@@ -898,7 +898,7 @@ mod tests {
             for i in 0..2000 {
                 crate::write::create_table(&lake, &format!("t{i}"), spec).await.unwrap();
             }
-            let scope = crate::auth::Principal::node().scope;
+            let node = crate::auth::Principal::node();
             // (as a living leader does at its start: the catalog's records of the folders tables use made whole, then kept
             // by each write, so a new table's folder check reads its folder's alone: piece 10c)
             lake.cat.keep_records().await.unwrap();
@@ -916,7 +916,7 @@ mod tests {
             for (what, sql, most) in statements {
                 let stmt = crate::write::parse(sql).unwrap_or_else(|| panic!("{sql}: not a statement"));
                 let (reads0, writes0) = (counts.catalog_reads.load(std::sync::atomic::Ordering::Relaxed), counts.catalog_writes.load(std::sync::atomic::Ordering::Relaxed));
-                crate::write::on_node(&app, stmt, None, &scope).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
                 let reads = counts.catalog_reads.load(std::sync::atomic::Ordering::Relaxed) - reads0;
                 let writes = counts.catalog_writes.load(std::sync::atomic::Ordering::Relaxed) - writes0;
                 eprintln!("{what}: read {reads}, wrote {writes}"); // (the numbers, with --nocapture)
@@ -952,12 +952,12 @@ mod tests {
                     assert_eq!(&kept, uses, "{step}: folder {folder}");
                 }
             };
-            let scope = crate::auth::Principal::node().scope;
+            let node = crate::auth::Principal::node();
             let run = |sql: &'static str| {
-                let (app, scope) = (app.clone(), scope.clone());
+                let (app, node) = (app.clone(), node.clone());
                 async move {
                     let stmt = crate::write::parse(sql).unwrap_or_else(|| panic!("{sql}: not a statement"));
-                    crate::write::on_node(&app, stmt, None, &scope).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                    crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
                 }
             };
             run("CREATE TABLE a (x BIGINT)").await; // (before they are kept: a guest's start keeps none)

@@ -7288,7 +7288,8 @@ def writes():
     file recorded where it wrote it: ADR-029), and its snapshot is found under its id; two writers
     at once, one retrying on 409, each applied once; a commit sent twice applied once; a view and
     the Delta copy follow; an attached lake's table; Pondra itself writing to another Pondra's;
-    refused by name: a keyed table, files outside the table's folder. (`adopted`: what round 27
+    refused by name: a keyed table, files outside the table's folder, and a rollback, an expiry of
+    snapshots and a change of partitioning, each naming Pondra's way. (`adopted`: what round 27
     added; `rewrites`: round 28's deletes, overwrites and schema changes.)"""
     import deltalake, glob as g, http.server, pyarrow as pa
     from pyiceberg.catalog import load_catalog
@@ -7356,7 +7357,13 @@ def writes():
         import pyarrow.parquet as pq
         pq.write_table(pa.table({"region": ["zz"], "amount": [9.0]}), outside)
         refused["files outside the table's folder"] = _raises_text(lambda: cat.load_table("default.sales").add_files([outside]))
-    said = {"files outside the table's folder": "data folder"}
+    # (what Pondra's SQL does another way, named: the Iceberg review's I6)
+    t = cat.load_table("default.events")
+    first = t.metadata.snapshots[0].snapshot_id  # (the oldest listed: the current one's ancestor)
+    refused["a rollback"] = _raises_text(lambda: t.manage_snapshots().rollback_to_snapshot(first).commit())
+    refused["an expiry of snapshots"] = _raises_text(lambda: t.maintenance.expire_snapshots().by_id(first).commit())
+    refused["a change of partitioning"] = _raises_text(lambda: t.update_spec().add_identity("name").commit())
+    said = {"files outside the table's folder": "data folder", "a rollback": "RESTORE TABLE", "an expiry of snapshots": "--retain-secs", "a change of partitioning": "PARTITION BY"}
     checks["refused by name: " + (", ".join(refused) or "(on R2, nothing to try)")] = all(said[k] in v for k, v in refused.items()) \
         and (outside is None or os.path.exists(outside)) and q("SELECT count(*) AS n FROM events WHERE id < 10") == [{"n": 2}]
     [x.kill() for x in (a, b, o, c)]
