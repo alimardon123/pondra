@@ -556,7 +556,7 @@ async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result
         let node = &nodes[rounds.next.fetch_add(1, Relaxed) % nodes.len()];
         async move {
             if node == me {
-                return run_job(lake, job).await;
+                return run_job(lake, job, &crate::auth::Principal::node().scope).await; // (the node's own work: a tiering round's)
             }
             let r = crate::dial::call(&lake.node, node, crate::dial::Call::json("/cluster/job", &job)?).await?;
             anyhow::ensure!(r.ok(), "job on {node}: {}", r.text().await?);
@@ -574,7 +574,7 @@ async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result
 }
 
 /// Do one job here; returns the Parquet files written.
-pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<DataFile>> {
+pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job, scope: &crate::rights::Scope) -> Result<Vec<DataFile>> {
     let meta = crate::sys::with_sys(&meta); // (files carry every row's system columns)
     // A job holds its rows and the Parquet file it is writing, so what a node runs at once is
     // bounded by the data behind them, not by their number: small merges go side by side, big
@@ -611,19 +611,19 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
         Kind::Fold { after, upto, rows } => {
             caught_up(lake, &table, after, upto, rows).await?;
             let part = { let mut entry = meta.clone(); entry.files = vec![]; entry.tiered = after; entry };
-            (latest(lake, &table, &part, upto, !first).await?, upto)
+            (latest(lake, &table, &part, upto, !first, scope).await?, upto)
         }
         Kind::Compact { upto, rows } => {
             anyhow::ensure!(!meta.key.is_empty(), "only keyed tables have versions to compact");
             caught_up(lake, &table, meta.tiered, upto, rows).await?;
-            (latest(lake, &table, &meta, upto, false).await?, upto)
+            (latest(lake, &table, &meta, upto, false, scope).await?, upto)
         }
         // Newer versions of some keys: one row per key over just these files, delete markers kept
         // (they still shadow the older files left out), as new as the newest of them.
         Kind::Squash { files } => {
             let ord = files.iter().map(|f| f.ord).max().unwrap_or(0);
             let part = { let mut entry = meta.clone(); entry.files = files; entry };
-            (latest(lake, &table, &part, meta.tiered, true).await?, ord)
+            (latest(lake, &table, &part, meta.tiered, true, scope).await?, ord)
         }
         // The places of the old versions these files hold, in one delete file.
         Kind::Positions { files, gone, after, upto } => {
@@ -698,11 +698,11 @@ async fn write_parts(lake: &Lake, table: &str, meta: &TableMeta, batches: Vec<Re
 /// What a fold job of `from`'s log segments (after, upto] writes, written as files of `to`: a
 /// branch's REFRESH takes its base's rows not yet in files so (`branch::refresh`), with their
 /// system columns; a keyed table's one row per key, delete markers kept.
-pub async fn fold_into(from: &Lake, to: &Lake, table: &str, meta: &TableMeta, after: u64, upto: u64) -> Result<Vec<DataFile>> {
+pub async fn fold_into(from: &Lake, to: &Lake, table: &str, meta: &TableMeta, after: u64, upto: u64, scope: &crate::rights::Scope) -> Result<Vec<DataFile>> {
     let meta = crate::sys::with_sys(meta);
     let (keys, batches) = match meta.key.is_empty() {
         true => (meta.cluster.clone(), crate::query::tail_of(from, table, after, Some(upto), false, true, false).await?),
-        false => (meta.key.clone(), latest(from, table, &{ let mut entry = meta.clone(); entry.files = vec![]; entry.tiered = after; entry }, upto, true).await?),
+        false => (meta.key.clone(), latest(from, table, &{ let mut entry = meta.clone(); entry.files = vec![]; entry.tiered = after; entry }, upto, true, scope).await?),
     };
     write_parts(to, table, &meta, batches, &keys, upto, false).await
 }
@@ -759,9 +759,9 @@ fn clustered(meta: &TableMeta, df: datafusion::prelude::DataFrame) -> Result<dat
 }
 
 /// One row per key: `meta`'s files plus the log up to `upto`, sorted by key.
-async fn latest(lake: &Lake, table: &str, meta: &TableMeta, upto: u64, keep_deleted: bool) -> Result<Vec<RecordBatch>> {
+async fn latest(lake: &Lake, table: &str, meta: &TableMeta, upto: u64, keep_deleted: bool, scope: &crate::rights::Scope) -> Result<Vec<RecordBatch>> {
     let ctx = lake.session();
-    ctx.register_table("__raw", raw(lake, &ctx, table, meta, Some(upto)).await?.into_view())?;
+    ctx.register_table("__raw", raw(lake, &ctx, table, meta, Some(upto), scope).await?.into_view())?;
     let rows = ctx.sql(&latest_sql(meta, "__raw", true, keep_deleted)).await?.collect().await?;
     if meta.cluster.len() > 1 { crate::hilbert::sort(&rows, &meta.cluster) } else { Ok(rows) }
 }

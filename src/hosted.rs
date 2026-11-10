@@ -4,6 +4,7 @@
 //!   budget (`budget.rs`, C5), with a secret's settings when its reach names one (`ext::build`); a node's door
 //!   (`pondra://`, `served.rs`); a branch's base's share of its bucket's turns; DataFusion's reader of a lake in memory
 //!   (`bridge.rs`).
+//! - The dial a node calls the others with (`calls::Dials`): HTTP between nodes, or a page's (`dial.rs`).
 use crate::buckets::{At, Store};
 use anyhow::Result;
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
@@ -25,6 +26,7 @@ pub static HOSTED: crate::registry::BuiltIn = crate::registry::BuiltIn {
         }
         b.share = Some(crate::budget::share);
         b.reader = Some(|s| Arc::new(crate::bridge::Bridge(s)) as Arc<dyn object_store_df::ObjectStore>);
+        r.section_mut::<crate::calls::Dials>().native = Some(crate::dial::native); // (HTTP between nodes, or a page's)
     },
 };
 
@@ -54,6 +56,7 @@ mod tests {
     fn the_hosts_give_the_lake_its_buckets() {
         let b = crate::buckets::get();
         assert!(b.open.is_some() && b.share.is_some() && b.reader.is_some());
+        assert!(crate::registry::get().section::<crate::calls::Dials>().native.is_some(), "and a node's dial");
         #[cfg(feature = "doors")]
         assert!(b.served.is_some());
     }

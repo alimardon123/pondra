@@ -40,7 +40,7 @@ pub type Copied = BTreeMap<String, Option<String>>;
 /// to a folder or a bucket and goes on there, the same node and port, its tasks running. Every check passes
 /// before anything is copied. Pass 1 copies the objects while the node still serves; then the host
 /// (`Lifecycle::move_lake`) stops the node, runs `settle`, and starts it again on the target.
-pub async fn set_location(lake: &Lake, database: &str, to: &str) -> anyhow::Result<serde_json::Value> {
+pub async fn set_location(lake: &Lake, database: &str, to: &str, scope: &crate::rights::Scope) -> anyhow::Result<serde_json::Value> {
     let this = crate::ddl::lake_name(lake);
     if !in_memory(&lake.url) {
         return Err(crate::codes::coded("0A000", "SET LOCATION moves a lake held in memory; a lake on disk or in a bucket moves with BACKUP DATABASE … TO and RESTORE DATABASE … FROM"));
@@ -52,7 +52,7 @@ pub async fn set_location(lake: &Lake, database: &str, to: &str) -> anyhow::Resu
     let to = crate::ddl::full(to)?;
     crate::ext::owners_only(&to, format!("ALTER DATABASE … SET LOCATION {to}: a path on the server's own disk, which only the node's owner moves a lake into (the `pondra` shell, `pondra sql`, `connect()` of a lake): move it to a bucket (s3://, gs://, az://)"))?; // (the asker's context: `ddl_here` runs in the request)
     crate::backup::apart(lake, &to)?;
-    crate::ext::reach_place(lake, &to).await?; // (a bucket: the secret whose scope covers it)
+    crate::ext::reach_place(lake, &to, scope).await?; // (a bucket: the secret whose scope covers it)
     let dest = crate::store::counted(crate::store::open_store(&to, Some(&lake.node.reaches))?.1, &lake.node.metrics); // (its requests the node's: `Counted`)
     refuse_torn(&dest, &to).await?; // (a move that didn't finish there: named, before the place is called holding other things)
     anyhow::ensure!(crate::backup::empty(&to, Some(&lake.node.reaches)).await?, "{to} holds other things: move into a new place (or an empty folder)");

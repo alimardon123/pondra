@@ -102,7 +102,7 @@ pub enum Open {
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a node's `cluster::mirror` calls it; a page's join will too)
 pub async fn follow(
     lake: Weak<Lake>,
-    open: impl Fn() -> BoxFuture<'static, Result<crate::dial::Reply, Open>> + Send,
+    open: impl Fn() -> BoxFuture<'static, Result<crate::calls::Reply, Open>> + Send,
     mut frame: impl FnMut(&Frame, &Lake) + Send,
     mut down: impl FnMut() + Send,
     resend: bool,

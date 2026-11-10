@@ -39,28 +39,28 @@ impl crate::ledger::Charged for Manifests {
 /// The table at `url` (a table's folder or a metadata file), at its current snapshot or the one
 /// asked for: `version` (of its metadata), `snapshot_from_id`, `snapshot_from_timestamp`.
 /// The credentials are the table's catalog's, when it vouches for them (`catalogs::Delegated`).
-pub async fn resolve(lake: &Lake, url: &str, options: &BTreeMap<String, String>) -> Result<(TableMeta, Option<crate::catalogs::Delegated>)> {
+pub async fn resolve(lake: &Lake, url: &str, options: &BTreeMap<String, String>, scope: &crate::rights::Scope) -> Result<(TableMeta, Option<crate::catalogs::Delegated>)> {
     let url = url.trim_end_matches('/');
     if options.contains_key("namespace") {
-        return rest(lake, url, options).await;
+        return rest(lake, url, options, scope).await;
     }
     let url = crate::ddl::full(url)?; // (a folder or file named relatively: from where the node runs)
     let url = url.as_str();
-    let (at, meta) = metadata(lake, url, options.get("version").map(String::as_str)).await?;
-    Ok((resolve_metadata(lake, url, &at, &meta, options).await?, None))
+    let (at, meta) = metadata(lake, url, options.get("version").map(String::as_str), scope).await?;
+    Ok((resolve_metadata(lake, url, &at, &meta, options, scope).await?, None))
 }
 
 /// A table's current metadata (and where it is): its newest metadata file, or its REST
 /// catalog's (for writing it: `write_outside`), and the credentials its catalog vouches for.
-pub async fn current(lake: &Lake, url: &str, options: &BTreeMap<String, String>) -> Result<(String, Value, Option<crate::catalogs::Delegated>)> {
+pub async fn current(lake: &Lake, url: &str, options: &BTreeMap<String, String>, scope: &crate::rights::Scope) -> Result<(String, Value, Option<crate::catalogs::Delegated>)> {
     match options.contains_key("namespace") {
         true => {
-            let r = crate::catalogs::open(lake, url, options).await?;
+            let r = crate::catalogs::open(lake, url, options, scope).await?;
             let (body, d) = r.load(lake, url, options).await?;
             Ok((body["metadata-location"].as_str().unwrap_or_default().to_string(), body["metadata"].clone(), d))
         }
         false => {
-            let (at, meta) = metadata(lake, url, None).await?;
+            let (at, meta) = metadata(lake, url, None, scope).await?;
             Ok((at, meta, None))
         }
     }
@@ -75,7 +75,7 @@ pub fn schema_of(meta: &Value) -> Result<(Value, Vec<(String, i64, DataType)>)> 
 
 /// Commit a folder's table's next metadata: the file after `at` (put if absent), then its
 /// version hint. False: another writer's is there.
-pub async fn commit_file(lake: &Lake, url: &str, at: &str, next: &Value) -> Result<bool> {
+pub async fn commit_file(lake: &Lake, url: &str, at: &str, next: &Value, scope: &crate::rights::Scope) -> Result<bool> {
     let name = at.rsplit('/').next().unwrap_or_default();
     let (hinted, number) = match name.strip_prefix('v') {
         Some(rest) => (true, rest.split('.').next().and_then(|n| n.parse::<i64>().ok())),
@@ -84,11 +84,11 @@ pub async fn commit_file(lake: &Lake, url: &str, at: &str, next: &Value) -> Resu
     let n = number.with_context(|| format!("{at}: which version is this metadata?"))? + 1;
     let file = if hinted { format!("v{n}.metadata.json") } else { format!("{n:05}-{}.metadata.json", uuid::Uuid::new_v4()) };
     let dir = &at[..at.len() - name.len()];
-    if !crate::write_outside::put_new(lake, &format!("{dir}{file}"), serde_json::to_vec_pretty(next)?).await? {
+    if !crate::write_outside::put_new(lake, &format!("{dir}{file}"), serde_json::to_vec_pretty(next)?, scope).await? {
         return Ok(false);
     }
     if hinted {
-        let (store, path) = crate::ext::store(lake, &format!("{dir}version-hint.text")).await?;
+        let (store, path) = crate::ext::store(lake, &format!("{dir}version-hint.text"), scope).await?;
         object_store_df::ObjectStoreExt::put(&store, &path, n.to_string().into_bytes().into()).await.with_context(|| format!("writing {url}'s version hint"))?;
     }
     Ok(true)
@@ -96,8 +96,8 @@ pub async fn commit_file(lake: &Lake, url: &str, at: &str, next: &Value) -> Resu
 
 /// Commit a snapshot through a REST catalog, asserting the one it follows. False: another
 /// writer's came first.
-pub async fn rest_commit(lake: &Lake, url: &str, options: &BTreeMap<String, String>, after: Option<i64>, snapshot: &Value) -> Result<bool> {
-    let r = crate::catalogs::open(lake, url, options).await?;
+pub async fn rest_commit(lake: &Lake, url: &str, options: &BTreeMap<String, String>, after: Option<i64>, snapshot: &Value, scope: &crate::rights::Scope) -> Result<bool> {
+    let r = crate::catalogs::open(lake, url, options, scope).await?;
     let body = serde_json::json!({
         "requirements": [{"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": after}],
         "updates": [{"action": "add-snapshot", "snapshot": snapshot}, {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": snapshot["snapshot-id"]}],
@@ -112,20 +112,20 @@ pub async fn rest_commit(lake: &Lake, url: &str, options: &BTreeMap<String, Stri
 
 /// A table of an Iceberg REST catalog at `url`: its metadata as the catalog gives it, and the
 /// credentials its files are reached with when the catalog vouches for them (`catalogs.rs`).
-async fn rest(lake: &Lake, url: &str, options: &BTreeMap<String, String>) -> Result<(TableMeta, Option<crate::catalogs::Delegated>)> {
-    let r = crate::catalogs::open(lake, url, options).await?;
+async fn rest(lake: &Lake, url: &str, options: &BTreeMap<String, String>, scope: &crate::rights::Scope) -> Result<(TableMeta, Option<crate::catalogs::Delegated>)> {
+    let r = crate::catalogs::open(lake, url, options, scope).await?;
     let (body, d) = r.load(lake, url, options).await?;
     let location = body["metadata-location"].as_str().unwrap_or(url).to_string();
     if d.is_none() {
-        crate::ext::check_url(lake, &location).await?; // (its files are the caller's to read, as a path's are)
+        crate::ext::check_url(lake, &location, scope).await?; // (its files are the caller's to read, as a path's are)
     }
-    let m = crate::catalogs::within(d.clone(), resolve_metadata(lake, body["metadata"]["location"].as_str().unwrap_or(url), &location, &body["metadata"], options)).await?;
+    let m = crate::catalogs::within(d.clone(), resolve_metadata(lake, body["metadata"]["location"].as_str().unwrap_or(url), &location, &body["metadata"], options, scope)).await?;
     Ok((m, d))
 }
 
 
 /// A table from its metadata (read from a file, or given by a REST catalog).
-pub async fn resolve_metadata(lake: &Lake, url: &str, at: &str, meta: &Value, options: &BTreeMap<String, String>) -> Result<TableMeta> {
+pub async fn resolve_metadata(lake: &Lake, url: &str, at: &str, meta: &Value, options: &BTreeMap<String, String>, scope: &crate::rights::Scope) -> Result<TableMeta> {
     let format = meta["format-version"].as_i64().unwrap_or(1);
     ensure!(format <= 3, "{at}: Iceberg format version {format}, which Pondra doesn't read yet (1 to 3)");
     let schema = current_schema(meta).with_context(|| format!("{at}: no current schema"))?;
@@ -142,14 +142,14 @@ pub async fn resolve_metadata(lake: &Lake, url: &str, at: &str, meta: &Value, op
     // read, as the table's files are, before the node reads it with its own credentials)
     let manifests: Vec<Value> = match snapshot["manifest-list"].as_str().map(place) {
         Some(list) => {
-            crate::ext::check_url(lake, &list).await?;
-            crate::avro::records(&crate::reach::get(lake, &list).await?)?
+            crate::ext::check_url(lake, &list, scope).await?;
+            crate::avro::records(&crate::reach::get(&crate::ext::Asking { lake, scope }, &list).await?)?
         }
         None => snapshot["manifests"].as_array().into_iter().flatten().map(|m| serde_json::json!({"manifest_path": m, "content": 0, "sequence_number": 0})).collect(), // (v1)
     };
     let paths = manifests.iter().map(|m| m["manifest_path"].as_str().map(place).context("a manifest without its path")).collect::<Result<Vec<_>>>()?;
-    crate::ext::check_urls(lake, &paths.iter().map(String::as_str).collect::<Vec<_>>()).await?;
-    let reads: Vec<_> = paths.into_iter().map(|p| manifest(lake, p)).collect();
+    crate::ext::check_urls(lake, &paths.iter().map(String::as_str).collect::<Vec<_>>(), scope).await?;
+    let reads: Vec<_> = paths.into_iter().map(|p| manifest(lake, p, scope)).collect();
     let entries: Vec<Arc<Vec<Value>>> = futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::buffered(futures::stream::iter(reads), 16)).await.into_iter().collect::<Result<_>>()?;
     let read: Vec<(&Value, Arc<Vec<Value>>)> = manifests.iter().zip(entries).collect();
     let (mut data, mut positions, mut equality) = (vec![], vec![], vec![]);
@@ -216,12 +216,12 @@ pub async fn resolve_metadata(lake: &Lake, url: &str, at: &str, meta: &Value, op
 }
 
 /// A manifest's entries (read once: a manifest never changes).
-async fn manifest(lake: &Lake, path: String) -> Result<Arc<Vec<Value>>> {
+async fn manifest(lake: &Lake, path: String, scope: &crate::rights::Scope) -> Result<Arc<Vec<Value>>> {
     let kept = lake.state::<Manifests>()?;
     if let Some(e) = kept.0.lock().unwrap_or_else(|e| e.into_inner()).get(&path).cloned() {
         return Ok(e);
     }
-    let e = Arc::new(crate::avro::records(&crate::reach::get(lake, &path).await?)?);
+    let e = Arc::new(crate::avro::records(&crate::reach::get(&crate::ext::Asking { lake, scope }, &path).await?)?);
     let bytes = e.iter().map(crate::ledger::json_bytes).sum();
     let left = kept.0.lock().unwrap_or_else(|e| e.into_inner()).put(path, e.clone(), bytes);
     drop(left); // (let go of outside the lock)
@@ -230,28 +230,28 @@ async fn manifest(lake: &Lake, path: String) -> Result<Arc<Vec<Value>>> {
 
 /// The metadata file: the one named, the one `version` names, the one `version-hint.text` names,
 /// or the newest in `metadata/`.
-pub async fn metadata(lake: &Lake, url: &str, version: Option<&str>) -> Result<(String, Value)> {
+pub async fn metadata(lake: &Lake, url: &str, version: Option<&str>, scope: &crate::rights::Scope) -> Result<(String, Value)> {
     let read = |at: String| async move {
-        let b = crate::reach::get(lake, &at).await?;
+        let b = crate::reach::get(&crate::ext::Asking { lake, scope }, &at).await?;
         let b = if at.ends_with(".gz") { let mut v = vec![]; std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&b[..]), &mut v)?; v.into() } else { b };
         anyhow::Ok((at, serde_json::from_slice::<Value>(&b)?))
     };
     if url.ends_with(".metadata.json") || url.ends_with(".metadata.json.gz") {
         return read(url.to_string()).await;
     }
-    let (store, dir) = crate::ext::store(lake, &format!("{url}/metadata/")).await?;
+    let (store, dir) = crate::ext::store(lake, &format!("{url}/metadata/"), scope).await?;
     let listed: Vec<String> = futures::TryStreamExt::try_collect::<Vec<_>>(futures::TryStreamExt::map_ok(store.list(Some(&dir)), |o| o.location.filename().unwrap_or_default().to_string())).await?;
     let number = |n: &str| -> Option<i64> { n.strip_prefix('v').unwrap_or(n).split(['.', '-']).next()?.parse().ok() };
     let files: Vec<&String> = listed.iter().filter(|n| n.ends_with(".metadata.json") || n.ends_with(".metadata.json.gz")).collect();
     let wanted = match version {
         Some(v) => Some(v.parse::<i64>().with_context(|| format!("version is a number, not {v}"))?),
         None if listed.iter().any(|n| n == "version-hint.text") => {
-            let hint = String::from_utf8(crate::reach::get(lake, &format!("{url}/metadata/version-hint.text")).await?.to_vec())?;
+            let hint = String::from_utf8(crate::reach::get(&crate::ext::Asking { lake, scope }, &format!("{url}/metadata/version-hint.text")).await?.to_vec())?;
             match hint.trim().parse::<i64>() {
                 Ok(v) => Some(v),
                 Err(_) => {
                     let at = format!("{url}/metadata/{}", hint.trim());
-                    crate::ext::check_url(lake, &at).await?; // (the hint names a file, which may be anywhere: `..`, or a whole URL in it)
+                    crate::ext::check_url(lake, &at, scope).await?; // (the hint names a file, which may be anywhere: `..`, or a whole URL in it)
                     return read(at).await;
                 }
             }
