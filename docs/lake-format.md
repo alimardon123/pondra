@@ -268,10 +268,14 @@ Rules for outside readers:
   - On R2, PyIceberg writes its files with its fsspec file IO (`"py-io-impl":
     "pyiceberg.io.fsspec.FsspecFileIO"`, `pip install s3fs`); pyarrow's multipart upload is
     refused there.
-  - A rollback, an expiry of snapshots, a replace of the table or a change of its partitioning
-    through the catalog is refused, naming Pondra's way: `RESTORE TABLE`, the lake's retention
-    (`--retain-secs`), `CREATE OR REPLACE TABLE`, the `PARTITION BY` it was made with. Another
-    engine's compaction is refused too: Pondra merges its tables' files itself.
+  - A rollback through the catalog (Spark's `rollback_to_snapshot`, PyIceberg's
+    `manage_snapshots`) is taken as Pondra's `RESTORE TABLE … TO TIMESTAMP AS OF` that snapshot's
+    time: the table as it was then, which includes any rows committed by then that its files didn't
+    hold yet (the view follows tier rounds).
+  - An expiry of snapshots, a replace of the table or a change of its partitioning is refused,
+    naming Pondra's way: the lake's retention (`--retain-secs`), `CREATE OR REPLACE TABLE`, the
+    `PARTITION BY` it was made with. Another engine's compaction is refused too: Pondra merges its
+    tables' files itself.
   - Today the node reads an appended file's rows and writes them into the table again.
     ADR-029 (proposed) would take the files as written and only commit them.
 - **Latest version, plus the history still there:** the Iceberg metadata lists the snapshots from

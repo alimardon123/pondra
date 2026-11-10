@@ -460,7 +460,7 @@ impl Backend {
         }
         let reader = self.who().role >= crate::auth::Role::Read;
         if reader && crate::txn::open() && crate::txn::gate(&self.app.lake, sql).is_ok() {
-            if let Some((b, p)) = crate::txn::point_read(&self.app.lake, sql).await.map_err(self.err())? {
+            if let Some((b, p)) = crate::txn::point_read(&self.app.lake, sql, &self.who().scope).await.map_err(self.err())? {
                 let schema = b.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
                 let schema = crate::pg_types::typed(&schema, &p.types().into()); // (its columns' types, as outside a transaction: no second parse)
                 return Ok(Response::Query(rows(&schema, b, format)?)); // (in a transaction: its own version, or its snapshot's)
@@ -469,7 +469,7 @@ impl Backend {
         if reader && !crate::txn::open() && !crate::temp::mentioned(sql) {
             // A key lookup: the serving path, before anything else (ADR-036 §6), as `/lookup` answers it (of what its caller may read).
             let t0 = std::time::Instant::now();
-            if let Some(p) = crate::serve::point(&self.app.lake, sql.trim().trim_end_matches(';')).await.map_err(self.err())? {
+            if let Some(p) = crate::serve::point(&self.app.lake, sql.trim().trim_end_matches(';'), &self.who().scope).await.map_err(self.err())? {
                 let t1 = t0.elapsed();
                 if let Some(b) = p.rows(&self.app.lake).await.map_err(self.err())? {
                     if trace() {
@@ -1803,7 +1803,7 @@ impl Backend {
 
     /// `param_types`, but for uuids (`pg_types`), which are text to the planner.
     async fn inferred(&self, sql: &str) -> Vec<Type> {
-        if let Ok(Some(p)) = crate::serve::point(&self.app.lake, sql).await {
+        if let Ok(Some(p)) = crate::serve::point(&self.app.lake, sql, &self.who().scope).await {
             return p.parameters(sql).iter().map(|t| pg_type(t, FieldFormat::Text).0).collect(); // (a key lookup's: its key's types, unplanned)
         }
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
@@ -1882,7 +1882,7 @@ impl Backend {
                 });
             }
         }
-        let point = crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.types().into()))); // (a key lookup's columns, unplanned, first)
+        let point = crate::serve::point(&self.app.lake, sql, &self.who().scope).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.types().into()))); // (a key lookup's columns, unplanned, first)
         if point.is_none() && (session_command(sql).is_some() || crate::set::is(sql) || crate::vars::change(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some() || crate::script::is(sql)) {
             return Ok((vec![], Columns::None)); // (a COPY's columns come with its data)
         }

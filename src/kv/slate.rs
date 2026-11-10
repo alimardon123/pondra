@@ -108,6 +108,10 @@ impl Kv for Writer {
         collect(it).await
     }
 
+    async fn scan_whole(&self, range: std::ops::Range<Vec<u8>>) -> Result<BTreeMap<String, Bytes>, Error> {
+        collect(self.db.scan_with_options(range, &whole()).await?).await
+    }
+
     fn is_writer(&self) -> bool {
         true
     }
@@ -180,6 +184,10 @@ impl Kv for Reader {
         collect(self.r.scan(range).await?).await
     }
 
+    async fn scan_whole(&self, range: std::ops::Range<Vec<u8>>) -> Result<BTreeMap<String, Bytes>, Error> {
+        collect(self.r.scan_with_options(range, &whole()).await?).await
+    }
+
     fn is_writer(&self) -> bool {
         false
     }
@@ -207,6 +215,16 @@ impl Written for WriteHandle {
     fn durable(&self) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move { self.await_durable().await.map_err(Error::from) })
     }
+}
+
+/// How a read of most of the catalog reads (`Kv::scan_whole`): a megabyte a request, four requests in flight, where a
+/// plain scan reads a block a request (4 KB), one at a time. Block by block, at 20,000 tables a follower took 1.7 s to
+/// start and a leader 2.8 s; this way 0.2 s and 0.4 s (redesign step 5, piece 12). Each file the read merges holds four
+/// pieces in flight at most.
+fn whole() -> ScanOptions {
+    const AHEAD: usize = 1 << 20;
+    const IN_FLIGHT: usize = 4;
+    ScanOptions::new().with_read_ahead_bytes(AHEAD).with_max_fetch_tasks(IN_FLIGHT)
 }
 
 /// All entries of a scan. The opening of the scan is SlateDB's error as it is (a closed store says so); an error

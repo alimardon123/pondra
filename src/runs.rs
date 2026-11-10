@@ -1260,7 +1260,7 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope, sql: &str) -> Res
         ("dropped_by", text(&|d| Some(d.by.clone()).filter(|b| !b.is_empty()))),
         ("undrop", text(&|d| Some(crate::undrop::statement(&d.kind, &d.name)))),
     ])?;
-    Ok(vec![("routines", mem(routines)?), ("tasks", mem(tasks)?), ("tables", mem(listed)?), ("dropped", mem(dropped)?), ("databases", mem(crate::branch::databases(lake).await?)?), ("applies", mem(crate::apply::table(lake).await?)?)])
+    Ok(vec![("routines", mem(routines)?), ("tasks", mem(tasks)?), ("tables", mem(listed)?), ("dropped", mem(dropped)?), ("databases", mem(crate::branch::databases(lake, scope).await?)?), ("applies", mem(crate::apply::table(lake).await?)?)])
 }
 
 /// `pondra.runs` before any run: no rows, its columns.

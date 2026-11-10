@@ -806,7 +806,7 @@ pub async fn release(lake: &Lake, bases: &Bases) {
 }
 
 /// `pondra.databases`: this database and the ones attached here, with what each was branched from.
-pub async fn databases(lake: &Lake) -> Result<datafusion::arrow::record_batch::RecordBatch> {
+pub async fn databases(lake: &Lake, scope: &crate::rights::Scope) -> Result<datafusion::arrow::record_batch::RecordBatch> {
     use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray, TimestampMicrosecondArray};
     use std::sync::Arc;
     let mut all = vec![(crate::ddl::lake_name(lake), lake.arc())];
@@ -830,7 +830,7 @@ pub async fn databases(lake: &Lake) -> Result<datafusion::arrow::record_batch::R
     let s = |f: &dyn Fn(&(String, String, Option<String>, Option<i64>, i64, Option<String>)) -> Option<String>| Arc::new(rows.iter().map(f).collect::<StringArray>()) as ArrayRef;
     Ok(datafusion::arrow::record_batch::RecordBatch::try_from_iter(vec![
         ("name", s(&|r| Some(r.0.clone()))),
-        ("location", s(&|r| crate::rights::scope().shows_code().then(|| r.1.clone()))), // (the server's folder is the operator's: a caller who may see code only)
+        ("location", s(&|r| scope.shows_code().then(|| r.1.clone()))), // (the server's folder is the operator's: a caller who may see code only)
         ("base", s(&|r| r.2.clone())),
         ("owner", s(&|r| r.5.clone())), // (the user who made a branch; none for an admin's branch and for a database that isn't one)
         ("branched_at", Arc::new(rows.iter().map(|r| r.3).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef),

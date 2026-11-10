@@ -944,7 +944,7 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
         crate::rights::may_run(who.role, &stmt)?;
         return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files, &who.asker()).await?));
     }
-    if let Some((rows, _)) = Box::pin(crate::txn::point_read(&app.lake, sql)).await? {
+    if let Some((rows, _)) = Box::pin(crate::txn::point_read(&app.lake, sql, &who.scope)).await? {
         return Ok(Outcome::Rows(rows)); // (a key lookup in a transaction: no planning)
     }
     Ok(Outcome::Rows(match who.files {
@@ -1183,6 +1183,7 @@ async fn run(app: &App, name: String, r: Routine, row: RecordBatch, who: Who, jo
         "do" => crate::runs::Run::begin(app, &name, who.role, job.as_deref(), serde_json::json!({"language": r.language, "code": r.body}).to_string(), id),
         _ => crate::runs::Run::start(app, &name, who.role, job.as_deref(), &row, id),
     };
+    let shows = who.scope.shows_code();
     let inner = Who { depth: who.depth + 1, ..who };
     let mut heard = vec![];
     let out = match (r.python(), name == "do") {
@@ -1195,7 +1196,7 @@ async fn run(app: &App, name: String, r: Routine, row: RecordBatch, who: Who, jo
             }
             let (given, views) = (HashMap::new(), HashMap::new());
             let go = crate::vars::own(values, script(app, &r.body, &given, &views, inner, job)); // (a procedure's variables are its own)
-            match name == "do" || crate::rights::scope().shows_code() {
+            match name == "do" || shows {
                 true => Box::pin(go).await,
                 false => Box::pin(crate::script::unshown(go)).await, // (its errors don't quote its code to this caller: S27)
             }
