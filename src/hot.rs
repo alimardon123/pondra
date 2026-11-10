@@ -812,9 +812,22 @@ impl TableProvider for HotFiles {
             None => self.schema.as_ref().clone(),
         });
         let deletes = self.meta.key.is_empty(); // (a keyed table's positions are older versions its own reads pass over)
+        // A keyed table's files are this scan's whole list: nothing prunes it before the merge on read (`query::upsert_view`),
+        // which a filter on any column but the key would get wrong. A filter this scan is given is its own, though, so a file
+        // whose ranges rule one out holds no row the scan would keep, whatever column it names: it goes unopened. (An append
+        // table's list comes pruned by the same ranges: `manifest::pruned`.)
+        let files: Vec<&DataFile> = match deletes || filters.is_empty() {
+            true => self.files.iter().collect(),
+            false => {
+                let keep = crate::manifest::keep(&self.files.iter().map(|f| &f.stats).collect::<Vec<_>>(), filters, &self.schema);
+                let kept: Vec<&DataFile> = self.files.iter().zip(keep).filter_map(|(f, k)| k.then_some(f)).collect();
+                crate::metrics::add(&self.lake.node.metrics.files_skipped, (self.files.len() - kept.len()) as u64);
+                kept
+            }
+        };
         let (mut held, mut cold) = (vec![], vec![]);
         let hot = self.lake.hot(); // (once a scan, not once a file)
-        for f in &self.files {
+        for f in files {
             // A scan of no columns reads no data: a plain file is its rows, from the catalog (no lookup, no load).
             if schema.fields().is_empty() && plain_file(f, deletes) {
                 held.push(Held::rows_only(f.rows));

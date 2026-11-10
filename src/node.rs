@@ -986,6 +986,64 @@ mod tests {
         .await
     }
 
+    /// A keyed table's files keep their columns' ranges (step 5 piece 11a), and its reads skip a file they rule out,
+    /// unopened, for a filter on any column: each part of the merge on read is filtered alone (`query::upsert_view`). The
+    /// answers stay whole: an update's newest version, in a file a filter on another column skips, still shadows the old
+    /// one that filter finds. (Here, with the node: an UPDATE needs the leader's sequencer, and files its tiering.)
+    #[tokio::test]
+    async fn a_keyed_tables_reads_skip_the_files_their_ranges_rule_out() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let lake = app.lake.clone();
+            let node = crate::auth::Principal::node();
+            let run = |sql: String| {
+                let (app, node) = (app.clone(), node.clone());
+                async move {
+                    let stmt = crate::write::parse(&sql).unwrap_or_else(|| panic!("{sql}: not a statement"));
+                    crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                }
+            };
+            run("CREATE TABLE k (id BIGINT, v BIGINT, PRIMARY KEY (id))".into()).await;
+            for (lo, hi) in [(1, 1000), (1001, 2000)] {
+                run(format!("INSERT INTO k SELECT value, value FROM range({lo}, {})", hi + 1)).await; // (v = id)
+                app.tier_all(0).await.unwrap();
+            }
+            run("UPDATE k SET v = -5 WHERE id = 5".into()).await;
+            app.tier_all(0).await.unwrap();
+            let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("k")).await.unwrap().unwrap();
+            assert_eq!(meta.files.len(), 3, "a file a round: {:?}", meta.files.iter().map(|f| (f.ord, &f.stats)).collect::<Vec<_>>());
+            let ranges = |f: &crate::store::DataFile| (f.stats.get("id").cloned(), f.stats.get("v").cloned());
+            let newest = meta.files.iter().max_by_key(|f| f.ord).unwrap();
+            assert_eq!(ranges(newest), (Some(("5".into(), "5".into())), Some(("-5".into(), "-5".into()))));
+            assert!(meta.files.iter().all(|f| f.sketch.is_empty()), "a keyed file's sketches would count a key's old versions");
+            let count = |sql: &'static str| {
+                let (app, node) = (app.clone(), node.clone());
+                async move {
+                    let skipped = || app.lake.node.metrics.files_skipped.load(std::sync::atomic::Ordering::Relaxed);
+                    let before = skipped();
+                    let b = app.query(sql, Some("0"), &node.scope).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                    (b[0].column(0).as_primitive::<Int64Type>().value(0), skipped() - before)
+                }
+            };
+            for (sql, rows, skips) in [
+                ("SELECT count(*) FROM k WHERE id = 1500", 1, true),     // (the two files of ids 1-1000 and of 5 unopened)
+                ("SELECT count(*) FROM k WHERE v = 5", 0, true),         // (id 5's old version, shadowed by a file it skips)
+                ("SELECT count(*) FROM k WHERE v = -5", 1, true),
+                ("SELECT count(*) FROM k WHERE v BETWEEN 1 AND 1000", 999, true),
+                ("SELECT count(*) FROM k", 2000, false),
+            ] {
+                let (n, skipped) = count(sql).await;
+                assert_eq!(n, rows, "{sql}");
+                assert_eq!(skipped > 0, skips, "{sql}: {skipped} files skipped");
+            }
+            marks.abort();
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
     #[test]
     fn a_claimed_page_refuses_a_second_claim_by_55006() {
         super::claim_page().expect("the first claim is taken");
