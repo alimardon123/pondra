@@ -190,9 +190,7 @@ impl App {
     /// the query is planned, here. So does a view that says `current_schema()` read under a path of
     /// the session's own: the other nodes read it with no session, as its reader's path says. And
     /// so do a session's queries while it holds temporary secrets, which only this node has.
-    pub async fn here_only(&self, query: &str) -> bool { self.here_only_for(query, &crate::rights::scope()).await }
-
-    /// `here_only`, for a query planned for `scope`.
+    /// `here_only_for`, for a query planned for `scope`.
     pub async fn here_only_for(&self, query: &str, scope: &crate::rights::Scope) -> bool {
         crate::query::sent() || crate::temp::mentioned(query) || crate::temp::called(query).is_some() || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::set::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query, scope).await || !scope.whole()
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await)
@@ -325,6 +323,21 @@ impl App {
         Ok((tables.len(), crate::tier::metric_lines(&tables, per_table)))
     }
 
+    /// Retention (`tier::expire_with`) over the round's briefs, every 10 s at most: plenty, and its deletes stay off the
+    /// path to fresh Delta versions. A round with nothing to tier runs it too, so the log an idle lake kept goes (its
+    /// first read of a table with an old mark read every segment kept since: 15,400 records at 20,000 tables).
+    async fn retain(&self) -> anyhow::Result<()> {
+        crate::per_node!(static EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
+        let now = crate::log::now_ms();
+        if now - EXPIRED.load(std::sync::atomic::Ordering::Relaxed) < 10_000 {
+            return Ok(());
+        }
+        EXPIRED.store(now, std::sync::atomic::Ordering::Relaxed);
+        crate::tier::refresh(&self.lake, &self.tables).await?; // (the round's briefs, as of now: what it tiered and merged)
+        let briefs = self.tables.lock().await.clone();
+        crate::tier::expire_with(&self.lake, self.retain_ms, &briefs, Some(&mut *self.log_pass.lock().await)).await
+    }
+
     /// Tier the tables with at least `min_rows` rows in the log (0: all of them), publish them
     /// for other engines, then expire what everything has consumed (leader).
     pub async fn tier_all(&self, min_rows: u64) -> anyhow::Result<u64> {
@@ -367,6 +380,7 @@ impl App {
             (busy, untidy, changed)
         };
         if untidy.is_empty() && changed.is_empty() {
+            self.retain().await?; // (on its own clock: what an idle lake's log and files hold goes too)
             return Ok(0); // (the pressure check, most of the time: don't hold the lock for nothing)
         }
         // Each table's work is its own: one that fails (rows its files can't hold, say) is named
@@ -395,15 +409,7 @@ impl App {
             }
         }
         let published = start.elapsed();
-        // Retention every 10 s is plenty, and keeps its deletes off the path to fresh Delta versions.
-        crate::per_node!(static EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
-        let now = crate::log::now_ms();
-        if now - EXPIRED.load(std::sync::atomic::Ordering::Relaxed) >= 10_000 {
-            EXPIRED.store(now, std::sync::atomic::Ordering::Relaxed);
-            crate::tier::refresh(&self.lake, &self.tables).await?; // (the round's briefs, as of now: what it tiered and merged)
-            let briefs = self.tables.lock().await.clone();
-            crate::tier::expire_with(&self.lake, self.retain_ms, &briefs, Some(&mut *self.log_pass.lock().await)).await?;
-        }
+        self.retain().await?;
         if start.elapsed() >= Duration::from_secs(5) {
             // one line when it drags
             let (publish, merges, expire) = (first_publish - tiered, published - first_publish, start.elapsed() - published);

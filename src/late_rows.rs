@@ -44,7 +44,10 @@ use std::sync::Arc;
 use crate::optimize::WIDE; // (the fewest columns a scan has for its top-N to read them late)
 /// The most rows a top-N keeps for them to be read again one by one: each costs a page of every column.
 const MOST: usize = 100;
-/// The files read at once for the rows: each holds a page of every column while it is read.
+/// The fewest files read at once for the rows; as many as the scan's partitions otherwise (`target_partitions`), as the
+/// wide scan it takes the place of would read them. Each holds a page of every column while it is read, no more than a
+/// partition of that scan holds of a row group, and on a bucket each is a few round trips: 100 files 4 at a time were 25
+/// rounds after the narrow scan (11-03 audit M5).
 const AT_ONCE: usize = 4;
 const ROW: &str = "__late_row";
 const FILE: &str = "__late_file";
@@ -266,7 +269,8 @@ async fn read_again(kept: SendableRecordBatchStream, wide: Arc<dyn ExecutionPlan
             .boxed(),
         );
     }
-    let read: Vec<Vec<RecordBatch>> = futures::stream::iter(reads).buffered(AT_ONCE).try_collect().await?;
+    let at_once = ctx.session_config().target_partitions().max(AT_ONCE);
+    let read: Vec<Vec<RecordBatch>> = futures::stream::iter(reads).buffered(at_once).try_collect().await?;
     let width = schema.fields().len();
     let mut batches: Vec<RecordBatch> = vec![];
     let mut at: HashMap<(&str, u64), (usize, usize)> = HashMap::new();
