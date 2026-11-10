@@ -45,17 +45,14 @@ node write.rs 1
 reads app.rs 1
 reads apply.rs 4
 reads audit.rs 1
-reads branch.rs 7
+reads branch.rs 1
 reads change.rs 1
 reads engine.rs 1
 reads ext.rs 4
-reads extension.rs 1
-reads files.rs 1
 reads history.rs 1
 reads iceberg.rs 1
 reads iceberg_rest.rs 3
 reads path.rs 1
-reads protect.rs 1
 reads python.rs 1  # (python::ask: a Python function's error, its lines cut, raised in DataFusion's batches, where only the task carries its caller)
 reads returning.rs 1
 reads routines.rs 1
