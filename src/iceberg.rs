@@ -221,7 +221,8 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
         return Ok(None);
     }
     if st.uuid.is_empty() {
-        st.uuid = uuid::Uuid::new_v4().to_string();
+        // (a table another engine's staged create made keeps the uuid it was given: the job that made it, `iceberg_rest::made`)
+        st.uuid = meta.made_by.as_deref().and_then(|j| j.strip_prefix(MADE)).map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
     }
     let (dir, now, mut v) = (metadata_dir(meta.folder(table)), crate::log::now_ms(), st.version + 1);
     // (a version already there was written by an attempt that crashed before recording it: it's
@@ -753,6 +754,9 @@ impl Commit {
     fn job(&self) -> String { format!("iceberg:{}:{}", self.table, self.snapshot) }
 }
 
+/// The job of a table another engine's staged create made, before the uuid it gave it (`publish`).
+pub(crate) const MADE: &str = "iceberg-create:";
+
 /// The leader's answer when the table changed since the writer read it: 409, so it retries.
 pub const CONFLICT: &str = "the table changed since the writer read it";
 /// …and when a commit's deletes are files of values (equality deletes), which an append table takes
@@ -771,6 +775,20 @@ pub(crate) fn refused(code: u16, kind: &str, message: String) -> Refusal {
 pub(crate) fn bad(message: String) -> Refusal { refused(400, "BadRequestException", message) }
 
 pub(crate) fn conflict(message: String) -> Refusal { refused(409, "CommitFailedException", message) }
+
+/// A rollback, main set to an older snapshot alone (Spark's `rollback_to_snapshot`, `set_current_snapshot`,
+/// `rollback_to_timestamp`; PyIceberg's `manage_snapshots`), as the snapshot and its time: the door takes it as Pondra's
+/// `RESTORE TABLE … TO TIMESTAMP AS OF` that time, the table as it was then (the Iceberg review's I6). None: the commit
+/// asks something else.
+pub(crate) fn rollback(meta: &Value, asked: &Value) -> Option<Result<(i64, i64), Refusal>> {
+    let [u] = asked["updates"].as_array()?.as_slice() else { return None };
+    if u["action"] != "set-snapshot-ref" || u["ref-name"] != "main" {
+        return None;
+    }
+    let to = u["snapshot-id"].as_i64()?;
+    let at = meta["snapshots"].as_array().into_iter().flatten().find(|s| s["snapshot-id"].as_i64() == Some(to)).and_then(|s| s["timestamp-ms"].as_i64());
+    Some(at.map(|ms| (to, ms)).ok_or_else(|| bad(format!("a rollback to snapshot {to}: not one the table lists (it lists those whose files are still there)"))))
+}
 
 /// A commit that asks what Pondra's SQL does another way, refused naming that way (the Iceberg review's I6): a replace
 /// of the table (Iceberg's replace drops main's ref first), an expiry of snapshots, a change of its partitioning. (A
@@ -925,7 +943,7 @@ async fn parse(lake: &Lake, table: &str, meta: &Value, asked: &Value) -> Result<
         }
     }
     if let (true, Some(to)) = (snapshots.is_empty(), main) {
-        return Err(bad(format!("a rollback to snapshot {to} (main set to an older snapshot: Spark's rollback_to_snapshot, set_current_snapshot): Pondra brings back a table's past with its SQL, RESTORE TABLE {table} TO VERSION AS OF n (or TO TIMESTAMP AS OF …)")));
+        return Err(bad(format!("a rollback to snapshot {to} in a transaction: Pondra takes a rollback on its own, as RESTORE TABLE {table} TO TIMESTAMP AS OF that snapshot's time (`rollback`), not with other changes")));
     }
     let s = snapshots.last().cloned().ok_or_else(|| bad("a commit with no snapshot: other engines append to Pondra's tables and change their rows".into()))?;
     let id = s["snapshot-id"].as_i64().ok_or_else(|| bad("a snapshot without its snapshot-id".into()))?;
@@ -1036,7 +1054,7 @@ pub(crate) fn requirements(meta: &Value, asked: &Value) -> Result<(), Refusal> {
             "assert-current-schema-id" => r["current-schema-id"] == meta["current-schema-id"],
             "assert-last-assigned-field-id" => r["last-assigned-field-id"] == meta["last-column-id"],
             "assert-ref-snapshot-id" => r["snapshot-id"] == meta["current-snapshot-id"],
-            k => return Err(bad(format!("requirement {k}: not one Pondra checks with a schema change"))),
+            k => return Err(bad(format!("requirement {k}: not one Pondra checks with this change"))),
         };
         if !ok {
             return Err(conflict(format!("{}: {CONFLICT}", r["type"])));

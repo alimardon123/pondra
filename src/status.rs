@@ -217,7 +217,7 @@ pub async fn status(app: &App, ask: &apply::Ask, who: Who) -> Result<serde_json:
 /// written here: the answer holds each file's text (null: removed), and the command line writes them. A renamed
 /// table or column gets a migration, recorded as run in this database, where it already is.
 pub async fn capture(app: &App, ask: &apply::Ask, who: Who) -> Result<serde_json::Value> {
-    let applier = apply::applier();
+    let applier = apply::applier(&who.scope);
     apply::authorize(app, who.clone(), applier).await?;
     let v = view(app, ask, who.clone()).await?;
     // A name chooses the lines it is the name of (a renamed table's old or new name).

@@ -990,7 +990,7 @@ def _module_of(f, lambda_name="udf"):
     return head + "\n".join(dict.fromkeys(imports)) + "\n" + "\n".join(consts) + "\n\n" + "\n\n".join(sources) + "\n"
 
 
-def connect(target=None, token=None, **options):
+def connect(target=None, token=None, *, settings=None, **options):
     """The one way in to Pondra. `target` is:
     - none, or `":memory:"` as DuckDB spells it: a new lake in this process's memory, gone at close();
     - a folder, or a bucket's URL (s3://, gs://, az://): that lake;
@@ -1002,13 +1002,35 @@ def connect(target=None, token=None, **options):
     `options` are its settings by name (`memory_gb=2` is PONDRA_MEMORY_GB). A process holds one such
     node, and the same lake connected again is another connection to it. Another lake connected while
     it is open gets a node of its own beside this process, which stops with it; so does every lake
-    where this install has no library. The node closes with `close()`, or when Python exits."""
+    where this install has no library. The node closes with `close()`, or when Python exits.
+    `settings` are the connection's session's, set by name as it opens, as `SET name = 'value'` sets
+    them (`settings={"default_file_format": "parquet"}`): a value SET refuses closes it and says why."""
     if target is not None and not isinstance(target, (list, tuple)):
         target = os.fspath(target)
     if isinstance(target, (list, tuple)) or (target or "").startswith(("http://", "https://")):
-        return Pondra(target, token, **options)
-    from . import inprocess
-    return inprocess.connect(target, token, **options)
+        db = Pondra(target, token, **options)
+    else:
+        from . import inprocess
+        db = inprocess.connect(target, token, **options)
+    return _session_settings(db, settings)
+
+
+_SETTING = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
+
+
+def _session_settings(db, settings):
+    """`connect(…, settings={…})`: each SET for the connection's session, in order. A name that isn't one, or a value
+    SET refuses, closes the connection and is raised."""
+    try:
+        for name, value in (settings or {}).items():
+            if not isinstance(name, str) or not _SETTING.fullmatch(name):
+                raise ValueError(f"settings: {name!r} isn't a setting's name (letters, digits and _, dotted: default_file_format, datafusion.execution.batch_size)")
+            text = "true" if value is True else "false" if value is False else str(value)
+            db.sql(f"SET {name} = '{text.replace(chr(39), chr(39) * 2)}'")
+    except BaseException:
+        db.close()
+        raise
+    return db
 
 
 def local(dir="lake", port=None, token=None, flags=(), timeout=120, python=True):

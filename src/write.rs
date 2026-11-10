@@ -1724,7 +1724,7 @@ impl Drop for Undo {
 
 async fn on_node_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool, by: &crate::auth::Principal) -> Result<Value> {
     let stmt = crate::protect::door(&app.lake, stmt, &by.name).await?; // (a project's objects in a protected database: an apply's only)
-    if let Some(out) = crate::temp::statement(app, &stmt, files, &by.scope).await? {
+    if let Some(out) = crate::temp::statement(app, &stmt, files, by).await? {
         return Ok(out); // (the session's own tables and views: on this node, in memory; a temporary table has no identity column)
     }
     let (stmt, placed) = in_sql_order(&app.lake, stmt, &by.scope).await?; // (an INSERT without a column list, into a table that moved a column)
@@ -1844,14 +1844,14 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     }
     // UPDATE and DELETE of an append table, and MERGE: the leader's (of the table's lake), from
     // one snapshot (`change.rs`). Another leader is sent what it can't read (ADR-028).
-    if let Some(sql) = changes(lake, &stmt).await? {
+    if let Some(sql) = changes(lake, &stmt, &by.scope).await? {
         let (other, local) = crate::ddl::resolve(lake, &stmt.table()).await?;
         if let (None, Some(seq)) = (&other, &app.seq) {
             let _guard = app.lock.lock().await;
             return crate::change::FILES.scope(files, crate::change::run(lake, seq, &sql, &job, &by.scope)).await;
         }
         if let Some(o) = &other {
-            crate::users::across_write(o, &attached_as(&stmt), &local, &stmt).await?; // (that lake's own sign-in)
+            crate::users::across_write(o, &attached_as(&stmt), &local, &stmt, &by.scope).await?; // (that lake's own sign-in)
         }
         let target = other.clone().unwrap_or_else(|| lake.arc());
         let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files, &by.scope).await?;
@@ -1866,7 +1866,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     // A table of an attached lake: the work runs here, that lake's leader records it.
     let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
     if let Some(other) = other {
-        crate::users::across_write(&other, &attached_as(&stmt), &table, &stmt).await?; // (that lake's own sign-in)
+        crate::users::across_write(&other, &attached_as(&stmt), &table, &stmt, &by.scope).await?; // (that lake's own sign-in)
         let req = prepare(lake, &other, &table, &stmt, &job, files, &by.scope).await?;
         let mark = req.as_ref().and_then(|r| request_mark(r, &job));
         let out = deliver(&other.url, req, &job, false, &lake.node).await;
@@ -2178,22 +2178,22 @@ pub(crate) async fn identity(lake: &Lake, stmt: &Stmt) -> Result<()> {
 /// The statement as the leader's to carry out (`change.rs`), if it is one: an UPDATE or DELETE of
 /// an append table, or a MERGE. None for a MERGE that is a one-row upsert of one key this database holds, which the node
 /// works out from the key's row (`txn::autocommit`, as `point_upsert` says).
-pub(crate) async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
+pub(crate) async fn changes(lake: &Lake, stmt: &Stmt, scope: &crate::rights::Scope) -> Result<Option<String>> {
     let (Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_) | Stmt::Insert(..)) = stmt else { return Ok(None) };
     let (other, table) = match crate::ddl::resolve(lake, &stmt.table()).await {
         Err(_) if matches!(stmt, Stmt::Insert(..)) => return Ok(None), // (an INSERT's own path names what it can't find, or finds an attached lake's)
         r => r?,
     };
-    changes_in(other.as_deref().unwrap_or(lake), other.is_none(), &table, stmt).await
+    changes_in(other.as_deref().unwrap_or(lake), other.is_none(), &table, stmt, scope).await
 }
 
 /// `changes`, of `table` as `lake` names it (`here`: this database's, not an attached one's). The statement keeps the
 /// name its own session gave it, which `lake` may not know: `dev.public.t`, after `USE dev`, is `public.t` to dev.
-async fn changes_in(lake: &Lake, here: bool, table: &str, stmt: &Stmt) -> Result<Option<String>> {
+async fn changes_in(lake: &Lake, here: bool, table: &str, stmt: &Stmt, scope: &crate::rights::Scope) -> Result<Option<String>> {
     let (Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_) | Stmt::Insert(..)) = stmt else { return Ok(None) };
     let meta = lake.cat.meta(&table_key(table)).await?;
     if let (Stmt::Merge(m), true, Some(stored)) = (stmt, here, &meta) {
-        if m.point_upsert(table, stored).is_some() {
+        if m.point_upsert(table, stored, scope).is_some() {
             return Ok(None);
         }
     }
@@ -2515,7 +2515,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
     if let Stmt::AddColumn(..) | Stmt::SetOptions(..) = stmt {
         return Ok(alter_spec(target, table, stmt).await?.map(|spec| Request::Table(table.into(), spec))); // (by its name there: ADD COLUMN under USE of a branch found no table)
     }
-    if let Some(sql) = changes_in(target, true, table, stmt).await? {
+    if let Some(sql) = changes_in(target, true, table, stmt, scope).await? {
         let (sql, sent) = crate::change::for_leader(query, target, &stmt.table(), table, &sql, files, scope).await?; // (files here: this machine's)
         return Ok(Some(Request::Change(sql, job.into(), sent)));
     }
