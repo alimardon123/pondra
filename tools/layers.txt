@@ -86,6 +86,7 @@ asof engine
 audit engine
 auth engine
 rights engine
+row_filter engine
 authored engine
 avg engine
 branch engine
