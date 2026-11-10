@@ -186,7 +186,7 @@ pub(crate) fn is_write(sql: &str) -> bool {
 /// remembered answer or the run. Postgres's door enters here too, with its own text and its own audit.
 pub(crate) async fn query<W: Wire>(app: &App, one: &str, how: &How<'_>, files: bool, scope: &crate::rights::Scope, wire: &W) -> Result<Answer<W::Own>> {
     if wire.takes_point_json() && !crate::temp::mentioned(one) {
-        if let Some(body) = crate::serve::point_sql(&app.lake, one).await? {
+        if let Some(body) = crate::serve::point_sql(&app.lake, one, scope).await? {
             return Ok(Answer::Kept(body.into())); // a key lookup: no planning (of the columns its caller may read: `serve::point`)
         }
     }

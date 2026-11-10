@@ -585,6 +585,20 @@ one script's (statements sent together over HTTP).
   it; they run on its node, and aren't answered from the results other queries left.
 - Any other name without a dot is Postgres's (`extra_float_digits`, `application_name`, …): kept,
   and shown by `SHOW`, since clients set many as they connect.
+- `default_table_format` and `default_file_format` are what a new table is made in when its `CREATE TABLE`
+  names none: today `pondra` and `parquet`. The session's comes first, then its node's
+  (`--default-table-format`, `--default-file-format`), then Pondra's own; `RESET default_table_format` leaves
+  it to the node again. A table keeps the format it was made in. `iceberg` is refused by name until this
+  lake's own Iceberg tables (1.0), and `delta` until 1.1: meanwhile `WITH (publish = 'iceberg')` publishes
+  a table in that format. `pg_dump`'s
+  `SET default_table_access_method = heap` is `pondra`. [`pondra.settings`](/pondra/sql/system-tables/#settings)
+  marks the node's settings a session may set over it (`session`). `table_format` and `file_format` are a
+  table's own, never a session's: `SET file_format` is refused, naming `default_file_format`.
+- A session's settings can be given as it starts. A Postgres client's startup `options`
+  (`PGOPTIONS='-c default_file_format=parquet' psql …`, or `options=-c name=value` in its connection string;
+  `--name=value` too) and its `application_name` are set as `SET` sets them, and a value `SET` refuses
+  refuses the connection, with its code. With Python,
+  `pondra.connect(target, settings={"default_file_format": "parquet"})` sets each as it opens.
 - `datafusion.runtime.*` (memory, spill folder, caches) is the node's, set as it starts with
   `--memory-gb` ([`PONDRA_MEMORY_GB`](/pondra/reference/environment/) and the other settings there),
   and refused here.
