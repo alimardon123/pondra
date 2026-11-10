@@ -17,7 +17,8 @@ struct Door {
     router: Arc<Mutex<Option<axum::Router>>>,
     faults: Arc<Faults>,
     answering: Mutex<Vec<tokio::task::AbortHandle>>,
-    /// The address its peers see a call from it come from.
+    /// The address its peers see a call from it come from: one of this machine's, as the harness's members are on one
+    /// machine, so the nodes' key in the clear is taken from it (`users::nodes_key`, `tls::Peer::own`).
     peer: std::net::SocketAddr,
 }
 
@@ -36,7 +37,7 @@ impl Net {
     /// Member `name` is reached at its name from now on: by `router` while it holds one, its calls meeting `faults`.
     pub fn join(&self, name: &str, router: Arc<Mutex<Option<axum::Router>>>, faults: Arc<Faults>) {
         let mut doors = lock(&self.doors);
-        let peer = std::net::SocketAddr::from(([10, 0, 0, doors.len() as u8 + 1], 7000));
+        let peer = std::net::SocketAddr::from(([127, 0, 0, doors.len() as u8 + 2], 7000));
         doors.insert(name.to_string(), Arc::new(Door { router, faults, answering: Default::default(), peer }));
     }
 
@@ -88,7 +89,7 @@ impl Net {
             return Err(none("its answer failed"));
         }
         let Some(router) = lock(&door.router).clone() else { return Err(none("it is starting, or stopped")) };
-        let from = mine.map_or(std::net::SocketAddr::from(([10, 0, 0, 0], 7000)), |d| d.peer);
+        let from = mine.map_or(std::net::SocketAddr::from(([127, 0, 0, 1], 7000)), |d| d.peer);
         let req = request(node, from, c.verb, &c.path, c.json, c.bearer, c.user, c.headers, c.body)?;
         let answered = crate::spawns::untracked(async move {
             use tower::ServiceExt;
@@ -106,7 +107,7 @@ impl Net {
         let status = res.status().as_u16();
         let sqlstate = res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).map(str::to_string);
         let headers = res.headers().clone();
-        let failed = (!res.status().is_success()).then(|| anyhow!("HTTP status {} for {to}{}", res.status(), shown));
+        let failed = (!res.status().is_success()).then(|| anyhow!("HTTP status {} for {shown}", res.status()));
         let body = res.into_body().into_data_stream().map_err(anyhow::Error::from).boxed();
         Ok(Reply::new(status, sqlstate, failed, body).with_headers(headers))
     }
@@ -148,7 +149,7 @@ fn request(
         req = req.header(k, v);
     }
     let mut req = req.body(axum::body::Body::from(body.unwrap_or_default()))?;
-    req.extensions_mut().insert(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, tls: false, signed: false, local: false }));
+    req.extensions_mut().insert(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, tls: false, signed: false, local: true }));
     Ok(req)
 }
 
