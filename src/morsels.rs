@@ -4,9 +4,9 @@
 //! but it cuts the files into only as many ranges as there are partitions, one each. A partition whose range holds more
 //! of the work then finishes last while the other cores wait: when a filter keeps a stretch of a file sorted by date,
 //! one range holds all of it. Cut into a few morsels a partition, a partition that gets free takes the next one, as
-//! DuckDB's and Velox's threads take row groups. At SF10 on 4 cores (interleaved runs): TPC-DS 83.0 s to 80.0 s, q72
-//! 1.02 to 0.55 s, q22 4.10 to 2.58 s, q99 0.37 to 0.15 s (each half idle before); TPC-H, whose dates are spread
-//! through its files, as it was.
+//! DuckDB's and Velox's threads take row groups. At SF10 on 4 cores (11-09, main 43359c6, interleaved runs): TPC-DS
+//! 83.0 s to 80.0 s, q72 1.02 to 0.55 s, q22 4.10 to 2.58 s, q99 0.37 to 0.15 s (each half idle before); TPC-H, whose
+//! dates are spread through its files, as it was.
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::Result;

@@ -1708,10 +1708,10 @@ fn bounds_whole(a: &AggregateExec) -> bool {
 /// sides by their keys, a table to a thread (`Partitioned`), past DataFusion's sizes:
 /// - a side to build of 4 million rows or more is hashed (DataFusion's own rows threshold, `config`, which it
 ///   reads only when a side's bytes are unknown), and one of a million or more unless the side it is probed with
-///   has 8 times its rows (`splits`): one thread builds a shared table, and a million rows take it longer than
-///   a shuffle of two sides of a size (TPC-H q9's 1.5 million orders, TPC-DS q97's full join of 2.9 and 5.8
-///   million), but not than a shuffle of a side 8 times bigger (TPC-DS q78's 2.9 million returns probed with
-///   28.8 million sales);
+///   is known to have 8 times its rows (`splits`): one thread builds a shared table, and a million rows take it
+///   longer than a shuffle of two sides of a size (TPC-H q9's 1.5 million orders, TPC-DS q97's full join of 2.9
+///   and 5.8 million), but not than a shuffle of a side 8 times bigger (TPC-DS q78's 2.9 million returns probed
+///   with 28.8 million sales);
 /// - a join whose rows are then grouped by its keys and nothing else is hashed by them when its side to
 ///   build has a sixteenth of its other side's rows or more: the grouping then needs no shuffle of its
 ///   own, and each thread groups its own keys (TPC-H q13 counts 150,000 customers' orders). With fewer
@@ -1725,11 +1725,12 @@ struct SharedBuilds;
 
 impl SharedBuilds {
     /// Whether a side to build of `build` rows is hashed rather than shared: from `most` rows always, and from a
-    /// quarter of it when the side it is probed with has fewer than 8 times its rows. At SF10 on 4 cores (128 MB and
-    /// 4 million rows against 32 MB and 1 million before, interleaved runs): TPC-DS 83.9 s to 77.7 s, q23 6.2 to 3.2 s, q78
-    /// 6.0 to 4.0, q64 2.7 to 1.9; TPC-H 19.9 to 19.6 s. Shared regardless of the other side, q97 and q75 ran 10-20% slower.
-    fn splits(build: usize, j: &HashJoinExec, most: usize) -> bool {
-        build >= most || (build >= most / 4 && !rows(j.right()).is_some_and(|probe| probe >= 8 * build))
+    /// quarter of it unless the side it is probed with is known to have `probe` rows, 8 times its own or more. At SF10
+    /// on 4 cores (11-09, main 43359c6; 128 MB and 4 million rows against 32 MB and 1 million before, interleaved runs):
+    /// TPC-DS 83.9 s to 77.7 s, q23 6.2 to 3.2 s, q78 6.0 to 4.0, q64 2.7 to 1.9; TPC-H 19.9 to 19.6 s. Shared
+    /// regardless of the other side, q97 and q75 ran 10-20% slower.
+    fn splits(build: usize, probe: Option<usize>, most: usize) -> bool {
+        build >= most || (build >= most / 4 && !probe.is_some_and(|probe| probe >= 8 * build))
     }
 }
 
@@ -1754,7 +1755,7 @@ impl PhysicalOptimizerRule for SharedBuilds {
                 };
             }
             match p.downcast_ref::<HashJoinExec>() {
-                Some(j) if hashable(j) && (rows(j.left()).is_some_and(|n| Self::splits(n, j, most)) || probed(j)) => Ok(Transformed::yes(partitioned(j)?)),
+                Some(j) if hashable(j) && (rows(j.left()).is_some_and(|n| Self::splits(n, rows(j.right()), most)) || probed(j)) => Ok(Transformed::yes(partitioned(j)?)),
                 _ => Ok(Transformed::no(p)),
             }
         })
@@ -1769,7 +1770,6 @@ impl PhysicalOptimizerRule for SharedBuilds {
         true
     }
 }
-
 
 /// `p` with the join it reads (through projections and filters) hashed by its keys, when `columns` of
 /// `p`'s rows are those keys and nothing else, and its sides aren't too far apart (`SharedBuilds`).
@@ -2785,6 +2785,18 @@ fn size(plan: &LogicalPlan) -> Option<Size> {
 mod tests {
     use super::*;
     use datafusion::prelude::{col, lit};
+
+    /// A side to build is hashed from 4 million rows, and from a million unless its probe side is known to have 8
+    /// times its rows.
+    #[test]
+    fn a_side_to_build_is_hashed_unless_its_probe_is_8_times_bigger() {
+        let most = 4 << 20;
+        assert!(SharedBuilds::splits(most, Some(100 * most), most), "4 million rows: always");
+        assert!(SharedBuilds::splits(2_000_000, None, most), "2 million, probe unknown");
+        assert!(!SharedBuilds::splits(2_000_000, Some(16_000_000), most), "2 million probed with 16 million: shared");
+        assert!(SharedBuilds::splits(2_000_000, Some(15_900_000), most), "2 million probed with 15.9 million");
+        assert!(!SharedBuilds::splits(900_000, None, most), "under a million: shared");
+    }
 
     /// A table's size: its rows, and each column's (name, distinct values, least, greatest).
     fn table(rows: u64, columns: &[(&str, u64, f64, f64)]) -> Size {
