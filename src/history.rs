@@ -677,13 +677,16 @@ pub(crate) async fn end_writers(lake: &Lake) {
     let _ = tokio::time::timeout(Duration::from_secs(5), futures::future::join_all(all)).await;
 }
 
-/// `pondra.history` as the caller may read it: every row for an admin, their own for anyone else.
-pub fn visible(ctx: &datafusion::prelude::SessionContext, table: Arc<dyn datafusion::catalog::TableProvider>) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
+/// `pondra.history` as `scope` may read it (the planning session's, `query::session_reading`): every row for a superuser's,
+/// its asker's own for any other (`Scope::asker`: "" is nobody's). A scope made without a principal names no one, and reads
+/// none of it: refused, never every row.
+pub fn visible(ctx: &datafusion::prelude::SessionContext, table: Arc<dyn datafusion::catalog::TableProvider>, scope: &crate::rights::Scope) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
     use datafusion::prelude::{col, lit};
-    match crate::auth::current().filter(|p| !p.superuser()) {
-        None => Ok(table),
-        Some(p) => Ok(ctx.read_table(table)?.filter(col("user").eq(lit(p.name)))?.into_view()),
+    if scope.superuser() {
+        return Ok(table);
     }
+    let Some(me) = scope.asker() else { anyhow::bail!("permission denied: pondra.history is read as who signed in, and this statement names no one") };
+    Ok(ctx.read_table(table)?.filter(col("user").eq(lit(me)))?.into_view())
 }
 
 /// `pondra.history` before its first row: the columns, no rows.
@@ -696,6 +699,43 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{Int64Array, RecordBatch};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    /// `pondra.history` and `pondra.audit` answer by whom the planning session's scope is for (M8 piece 3d-3b), never the
+    /// task. A scope made without a principal names no one and is no superuser's: both refuse it. A read token's scope is
+    /// whole and still no superuser's. Two users with the same grants (one cache key) read their own rows each.
+    #[tokio::test]
+    async fn history_and_audit_answer_by_whom_the_scope_is_for() -> Result<()> {
+        use crate::auth::{Principal, Role};
+        use crate::rights::Scope;
+        let ctx = datafusion::prelude::SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("user", DataType::Utf8, false)]));
+        let rows = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["ann", "bob", "bob", "reader", ""]))])?;
+        let table: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(datafusion::datasource::MemTable::try_new(schema, vec![vec![rows]])?);
+        let read = |scope: Scope| {
+            let (ctx, table) = (ctx.clone(), table.clone());
+            async move { anyhow::Ok(ctx.read_table(visible(&ctx, table, &scope)?)?.count().await?) }
+        };
+        let audit = |scope: Scope| crate::audit::check("SELECT * FROM pondra.audit", &scope);
+        for no_one in [Scope::everything(), Scope::granted(Default::default())] {
+            assert!(read(no_one.clone()).await.is_err(), "a scope made without a principal reads no history");
+            assert!(audit(no_one).is_err(), "and no audit");
+        }
+        let grants = Arc::new(crate::users::Access::default());
+        let user = |name: &str| Principal { name: name.into(), scope: Scope::granted(grants.clone()), ..Principal::of(Role::Read) }.asking();
+        let (ann, bob) = (user("ann"), user("bob"));
+        assert_eq!(ann.scope.key(), bob.scope.key(), "the same grants: one key");
+        assert_eq!((read(ann.scope.clone()).await?, read(bob.scope.clone()).await?), (1, 2), "each its own rows");
+        assert!(audit(ann.scope).is_err(), "a user reads no audit");
+        let reader = Principal::token(Role::Read);
+        assert!(reader.scope.whole() && audit(reader.scope.clone()).is_err(), "a read token's scope is whole, and no superuser's");
+        assert_eq!(read(reader.scope).await?, 1, "its own rows (its name's)");
+        assert_eq!(read(Principal::node().scope).await?, 5, "the node's own: every row");
+        assert!(audit(Principal::node().scope)?, "and the audit");
+        let raised = Principal { role: Role::Admin, scope: Scope::everything(), ..bob.clone() };
+        assert!(audit(raised.scope.clone()).is_err(), "a scope swapped in names no one until its principal asks again");
+        assert!(audit(raised.asking().scope)?, "an applier raised to admin (`apply::admin_for`) reads it, as it did");
+        Ok(())
+    }
 
     #[test]
     fn a_statements_relations_are_kept_by_its_shape() {

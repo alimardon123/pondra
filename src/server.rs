@@ -83,10 +83,11 @@ pub fn router(app: App) -> Router {
         .route("/test", post(apply))
         .route("/status", post(apply))
         .route("/capture", post(apply))
-        .route("/export", get(|State(app): State<App>, Query(q): Query<HashMap<String, String>>| async move {
+        .route("/export", get(|State(app): State<App>, Query(q): Query<HashMap<String, String>>, who: Option<axum::Extension<crate::auth::Principal>>| async move {
+            let scope = scope_of(who);
             Ok::<_, E>(Json(match q.get("database") {
-                Some(name) => crate::apply::export_attached(&app.lake, name).await?,
-                None => crate::apply::export_here(&app.lake).await?,
+                Some(name) => crate::apply::export_attached(&app.lake, name, &scope).await?,
+                None => crate::apply::export_here(&app.lake, &scope).await?,
             }))
         }))
         .route("/objects", get(|State(app): State<App>, who: Option<axum::Extension<crate::auth::Principal>>| async move { Ok::<_, E>(Json(crate::objects::listed(&app.lake, &scope_of(who)).await?)) }))

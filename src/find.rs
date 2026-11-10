@@ -171,7 +171,7 @@ async fn view_parts(session: Option<&SessionContext>, l: &Lake, o: &Object, here
     let mut out: Vec<PartRow> = columns.map(|(name, ty)| {
         let comment = comments.get(&name).cloned();
         match measures.get(&name) {
-            Some(e) => part(o, "measure", name, Some(ty), comment, crate::views::code_for_caller(|| e.clone())),
+            Some(e) => part(o, "measure", name, Some(ty), comment, crate::views::code_for_caller(scope, || e.clone())),
             None => part(o, "column", name, Some(ty), comment, None),
         }
     }).collect();
