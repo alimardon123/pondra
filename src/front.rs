@@ -9,7 +9,7 @@ use anyhow::Result;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::DataFrame;
 use datafusion::sql::sqlparser::ast::Statement;
-use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, parser::Parser};
+use datafusion::sql::sqlparser::ast;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -104,18 +104,9 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     if !expands && !measured && !passes.wants(sql)? { // (a tree pass's look: friendly's forms, MATCH_RECOGNIZE, a type of one's own)
         return as_written();
     }
-    // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
-    static LEADING_FROM: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*from\b").expect("a regex"));
-    // (parsed once for the front's looks, `parsed.rs`; a text generic refuses read with the fallback dialect's hooks)
-    let parsed = crate::parsed::read(sql).or_else(|e| match LEADING_FROM.is_match(sql) {
-        true => {
-            let all = format!("SELECT * {sql}");
-            Parser::parse_sql(&GenericDialect {}, &all).or_else(|_| crate::dialect::parse(&all).0).map_err(|_| e)
-        }
-        false => Err(e),
-    });
-    let mut stmts = match parsed {
+    // (read as Pondra's SQL, the core's language, `parsed::pondra`: parsed once for the front's looks, a text generic refuses
+    // read with the fallback dialect's hooks, and DuckDB's `FROM t WHERE …` as `SELECT * FROM t WHERE …`)
+    let mut stmts = match crate::parsed::pondra(sql) {
         Ok(stmts) => stmts,
         // (the fallback read further than generic did: its error, which DataFusion's parse of the text never gives)
         Err(e) if crate::parsed::generic(sql).err().is_some_and(|g| g != e) => return Err(datafusion::error::DataFusionError::SQL(Box::new(e), None).into()),

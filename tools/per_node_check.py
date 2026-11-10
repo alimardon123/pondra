@@ -119,7 +119,8 @@ PROCESS = {
     "casts.rs:WHOLE": "a function's definition (pondra_whole), the same for every lake",
     "avg.rs:AVG_OF": "a function's definition (pondra_avg_of), the same for every lake",
     "multiply.rs:MULTIPLY": "a function's definition (pondra_multiply), the same for every lake",
-    "divide.rs:DIVIDE": "a function's definitions (pondra_divide, Postgres's places and Spark's), the same for every lake",
+    "divide.rs:DIVIDE": "a function's definition (pondra_divide, Postgres's places), the same for every lake",
+    "divide.rs:SPARK_DIVIDE": "a function's definition (spark_divide, Spark SQL's `/`), the same for every lake",
     "runs.rs:WAKE": SIGNAL,
     "runs.rs:WRITTEN": SIGNAL,
     "app.rs:TURNS": SETTING + " (PONDRA_QUERIES, PONDRA_QUEUE_SECS; a stopped node's last queries give their turns back to it)",
@@ -169,7 +170,8 @@ PLAIN = {"std", "sync", "collections", "time", "path", "num", "borrow", "regex",
          "str", "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
          "i128", "isize", "f32", "f64", "Duration", "PathBuf", "Path", "Regex", "Value", "Bytes", "Cow",
          "NonZeroUsize", "static",
-         "crate", "registry", "BuiltIn"}  # (a built-in extension's `registry::BuiltIn`: its names and a function, nothing to change)
+         "crate", "registry", "BuiltIn",  # (a built-in extension's `registry::BuiltIn`: its names and a function, nothing to change)
+         "languages", "Language"}  # (a language of the registry's, `languages::Language`: its names and a function too)
 # Where a `"PONDRA_…"` name isn't a setting anything reads, by file, with the reason.
 NOT_READ = {
     "ci.rs": "GitHub secrets' names, which `pondra ci init` sets for a repository's workflows",

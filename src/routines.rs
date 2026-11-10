@@ -507,7 +507,7 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
         return Ok(format!("{head}{moment}"));
     }
     crate::dialect_stmts::hint_refused(sql)?; // (MySQL's `/*! … */`: binding prints the text back without it, 11-07 audit M2)
-    let sql = &crate::sparksql::inline(sql)?; // (a parameter of Spark SQL's is in its text: bound once it is Pondra's)
+    let sql = &crate::languages::inline(sql)?; // (a parameter of Spark SQL's is in its text: bound once it is Pondra's)
     let sql = &crate::past_names::syntax(sql); // (`t AT (VERSION => $v)`)
     let mut stmts = crate::parsed::read(sql)?; // (as the front reads it: `[x * $k FOR x IN l]`, `LAMBDA x: x * $k`)
     let values = params.iter().map(|(k, v)| Ok((k.clone(), literal(v)?))).collect::<Result<HashMap<_, _>>>()?;

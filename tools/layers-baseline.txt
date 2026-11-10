@@ -162,7 +162,6 @@ optimize -> wasm32  1
 page -> wasm32  3
 page_records -> dial  4
 panics -> wasm32  3
-path -> sparksql  1
 pg -> sso  6
 pg -> tls  6
 pg_json_sets -> measures  1
@@ -186,7 +185,6 @@ routines -> extension  3
 routines -> git  3
 routines -> pyfn  2
 routines -> python  8
-routines -> sparksql  1
 routines -> wasm32  2
 routines -> workspace  6
 rules -> pg_bytea  1
