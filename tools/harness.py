@@ -7376,6 +7376,15 @@ def writes():
     seen = until(lambda: _try(lambda: cat.load_table("default.back").scan().to_arrow().num_rows), 10, 30)
     checks["a rollback through the catalog is Pondra's RESTORE to that snapshot's time: the table, and the engine's next read, as they were then"] = \
         back == [{"n": 10, "top": 9}] and seen == 10
+    # (a table made with its first commit, Spark's CREATE TABLE … AS SELECT: Pondra's CREATE TABLE, then the engine's files
+    # taken as an append's are)
+    txn = cat.create_table_transaction("default.made", pa.schema([("id", pa.int64()), ("tag", pa.string())]))
+    txn.append(pa.table({"id": pa.array(range(5), pa.int64()), "tag": pa.array(list("abcde"))}))
+    txn.commit_transaction()
+    made = q("SELECT count(*) AS n, max(id) AS top, string_agg(tag, '' ORDER BY id) AS tags FROM made")
+    seen = until(lambda: _try(lambda: cat.load_table("default.made").scan().to_arrow().num_rows), 5, 30)
+    checks["a table made with its first commit (a staged create: Spark's CREATE TABLE … AS SELECT) is Pondra's CREATE TABLE with the engine's rows"] = \
+        made == [{"n": 5, "top": 4, "tags": "abcde"}] and seen == 5
     checks["refused by name: " + (", ".join(refused) or "(on R2, nothing to try)")] = all(said[k] in v for k, v in refused.items()) \
         and (outside is None or os.path.exists(outside)) and q("SELECT count(*) AS n FROM events WHERE id < 10") == [{"n": 2}]
     [x.kill() for x in (a, b, o, c)]
