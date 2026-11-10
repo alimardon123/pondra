@@ -170,6 +170,7 @@ mod table_record;
 #[cfg(feature = "lake")] mod apply;
 #[cfg(feature = "lake")] mod defaults;
 #[cfg(feature = "lake")] mod delta;
+#[cfg(feature = "lake")] pub mod calls;
 #[cfg(feature = "lake")] pub mod dial;
 #[cfg(feature = "lake")] mod ext;
 #[cfg(feature = "lake")] mod fetch;

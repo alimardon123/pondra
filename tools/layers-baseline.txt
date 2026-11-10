@@ -120,7 +120,6 @@ machine -> wasm32  2
 manifest -> branch  4
 manifest -> crypto  1
 manifest -> sys  1
-members -> fetch  1
 memory_lake -> wasm32  10
 metrics -> ai  3
 metrics -> app  1
