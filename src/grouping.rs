@@ -476,8 +476,8 @@ mod tests {
     /// was, so the front groups the tree it read (`front::expand`), in every form (11-10 audit H3).
     #[test]
     fn a_tree_the_fallback_read_is_regrouped() {
-        let sql = "FROM t SELECT a IS DISTINCT FROM b OR c";
-        assert!(matches!(text(sql), Cow::Borrowed(_)) && wanted(sql), "generic can't read it; the front's look can");
+        let sql = "SELECT [x FOR x IN l] AS d, a IS DISTINCT FROM b OR c FROM t";
+        assert!(crate::parsed::generic(sql).is_err() && matches!(text(sql), Cow::Borrowed(_)) && wanted(sql), "generic can't read it; the front's look can");
         let mut stmts = crate::parsed::read(sql).unwrap();
         assert!(regroup(&mut stmts));
         assert!(written(&stmts).contains("(a IS DISTINCT FROM b) OR c"), "{}", written(&stmts));

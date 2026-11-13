@@ -532,6 +532,7 @@ pub(crate) mod tests {
                 (Phase::Wants, "friendly.aliases"),
                 (Phase::Wants, "pattern.wanted"),
                 (Phase::Wants, "text.names_a_type"),
+                (Phase::Wants, "grouping.regroups"),
                 (Phase::Parse, "friendly.comprehension"),
                 (Phase::Parse, "friendly.lambda"),
                 (Phase::Parse, "friendly.pivot"),
