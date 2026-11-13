@@ -106,7 +106,7 @@ pub async fn listed_for(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec
     let mut all = vec![];
     let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().clone();
     for (catalog, l) in std::iter::once((lake_name(lake), lake.arc())).chain(attached) {
-        if catalog != lake_name(lake) && crate::users::across(&l, &catalog).await.is_err() {
+        if catalog != lake_name(lake) && crate::users::across(&l, &catalog, scope).await.is_err() {
             continue; // (another database that signs in on its own: not even its tables' names)
         }
         // (a materialized view of any kind: windows, sessions and joins keep more than its SQL)
@@ -589,7 +589,7 @@ async fn carry_out(lake: &Lake, d: Ddl, by: &crate::auth::Principal) -> Result<V
             let (dir, created) = match read_only {
                 true => {
                     let dir = full(&dir)?;
-                    crate::ext::reach(lake, &dir, true, endpoint.as_deref()).await?; // (its key and its server, before it is opened)
+                    crate::ext::reach(lake, &dir, true, endpoint.as_deref(), &by.scope).await?; // (its key and its server, before it is opened)
                     dropped_here(&dir, &name, Some(&lake.node.reaches)).await?; // (read with that key: this node's own may not reach its bucket)
                     if !has_catalog(&dir, Some(&lake.node.reaches)).await? {
                         return Err(crate::codes::coded("58P01", format!("{dir} holds no lake: a READ_ONLY attachment reads one that is there")));
@@ -609,7 +609,7 @@ async fn carry_out(lake: &Lake, d: Ddl, by: &crate::auth::Principal) -> Result<V
             })
         }
         Ddl::CreateDatabase { name, if_not_exists, dir, clone: Some(of) } => crate::branch::create(lake, &name, if_not_exists, dir, of, by).await,
-        Ddl::Branch(m) => crate::branch::make(lake, m).await,
+        Ddl::Branch(m) => crate::branch::make(lake, m, &by.scope).await,
         Ddl::Pin { lake: branch, ms, lease } => crate::branch::pin(lake, &branch, ms, lease, Some(by)).await,
         Ddl::Unpin { lake: branch } => crate::branch::unpin(lake, &branch).await,
         Ddl::Refresh { .. } => bail!("ALTER DATABASE … REFRESH is done by its database's leader (write::handle)"),
@@ -714,8 +714,8 @@ async fn carry_out(lake: &Lake, d: Ddl, by: &crate::auth::Principal) -> Result<V
             ensure!(!has_schema(lake, &name).await?, "a schema here is called {name}: attach under another name");
             ensure!(lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_none(), "{name} is an attached lake: attach under another name");
             match connection {
-                Some(c) => crate::ext::attach_connection(lake, &name, &c).await,
-                None => crate::ext::attach(lake, &name, &url, &kind, options).await,
+                Some(c) => crate::ext::attach_connection(lake, &name, &c, &by.scope).await,
+                None => crate::ext::attach(lake, &name, &url, &kind, options, &by.scope).await,
             }
         }
         Ddl::Detach { name, if_exists } => {
@@ -1047,7 +1047,7 @@ pub async fn sync(lake: &Lake, follow: bool) -> Result<()> {
             continue;
         }
         if a.read_only {
-            if let Err(e) = crate::ext::reach(lake, &a.dir, true, a.endpoint.as_deref()).await {
+            if let Err(e) = crate::ext::reach(lake, &a.dir, true, a.endpoint.as_deref(), &crate::auth::Principal::node().scope).await {
                 eprintln!("attaching {name} ({}): {e:#}", a.dir);
                 continue;
             }
@@ -2542,7 +2542,7 @@ mod tests {
         let made = lake.cat.get::<crate::views::View>(&crate::views::view_key("v")).await?.expect("v");
         let fill = made.fill.clone().map(|f| crate::views::Fill { upto: Some(0), ..f }); // (as the sequencer sets it: `views::bound`)
         lake.cat.commit(vec![(crate::views::view_key("v"), json(&crate::views::View { fill, ..made }))], &[]).await?;
-        let mover = crate::rights::Scope::granted(std::sync::Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec![] }])));
+        let mover = crate::rights::Scope::granted(std::sync::Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec![], rows: None }])));
         let at_a_door = crate::auth::Principal { name: "mover".into(), role: crate::auth::Role::Read, scope: mover.clone(), door: "test", from: None, operator: false, epoch: 0, until: None, reads: false };
         let stmt = crate::write::parse("ALTER TABLE t ALTER COLUMN b FIRST").expect("an ALTER");
         let refused = crate::auth::WHO.scope(at_a_door.clone(), async { crate::rights::may_run(crate::auth::Role::Read, &stmt) }).await.expect_err("a SELECT-only mover is refused at a door");

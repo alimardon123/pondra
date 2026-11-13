@@ -174,11 +174,13 @@ async fn all_tables(State(app): State<App>, c: Caller, Path(share): Path<String>
 
 /// The table's folder and its Delta log at a version (the newest if none).
 async fn log_of(app: &App, t: &Shared, version: Option<i64>) -> Result<(String, Arc<Log>), Fail> {
-    let lake: &crate::store::Lake = &app.lake; // (an `&Arc<Lake>` doesn't deref to the `&impl Reach` replay takes)
+    let lake: &crate::store::Lake = &app.lake;
+    // (a recipient is no one here: a share's tables are the lake's own, whose files its own store reads, no secret asked)
+    let reach = crate::ext::Asking { lake, scope: &crate::rights::Scope::nothing() };
     let meta = lake.cat.meta(&crate::store::table_key(&t.table)).await.map_err(internal)?.ok_or_else(|| missing(format!("{}.{} is gone from the lake", t.schema, t.name)))?;
     let folder = format!("data/{}", meta.folder(&t.table));
     let root = format!("{}/{folder}", lake.url.trim_end_matches('/'));
-    let log = crate::read_delta::replay(lake, &root, version).await.map_err(|e| match version {
+    let log = crate::read_delta::replay(&reach, &root, version).await.map_err(|e| match version {
         Some(v) => invalid(format!("{}.{} has no version {v} to read: {}", t.schema, t.name, crate::ext::said(&e))),
         None => Fail(StatusCode::SERVICE_UNAVAILABLE, "TEMPORARILY_UNAVAILABLE", format!("{}.{} isn't available to share yet; its newest rows are still being written to the open format, so try again shortly: {}", t.schema, t.name, crate::ext::said(&e))),
     })?;

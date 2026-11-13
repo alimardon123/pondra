@@ -75,7 +75,8 @@ spark.sql("SELECT user FROM top WHERE spent > 5 ORDER BY user").toPandas()
 `spark.sql` reads a query as Spark SQL does, so a job's SQL moves as it is: backticked names,
 strings in double quotes, `!`, `DIV`, `<=>`, `RLIKE`, `LATERAL VIEW [OUTER] explode(…)`, and Spark's
 functions where Spark and Pondra share a name and differ (`floor` and `ceil` give a `BIGINT`,
-`substring` counts a negative start from the end, `explode` names its column `col`).
+`substring` counts a negative start from the end, `explode` names its column `col`), a `/` that is always
+fractional (`7 / 2` is 3.5; two DECIMALs keep Spark's places), and a cast to an integer that cuts its fraction.
 
 ```python
 spark.sql("""
@@ -94,7 +95,9 @@ spark.sql("""
 
 It takes a query (`SELECT`, `WITH`, `VALUES`); writes and other statements are Pondra's SQL, as
 `spark.sql` sends them. In SQL from anywhere else, `spark_sql('…')` is a table of a query in Spark's
-grammar ([SQL](/pondra/sql/statements/#queries)).
+grammar ([SQL](/pondra/sql/statements/#queries)), and `SET language = 'spark'` reads all of a session's statements
+in it ([settings](/pondra/sql/statements/#settings-and-prepared-statements); an `INSERT` into an `INT` column
+rounds there: see [where it differs](/pondra/reference/pyspark/#where-it-differs-from-pyspark)).
 
 Windows and column functions are PySpark's:
 

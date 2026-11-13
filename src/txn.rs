@@ -37,7 +37,7 @@ use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 /// A table's changes in a transaction: rows it adds (new rows, whose `_row_id` is negative until the commit stamps
@@ -1071,7 +1071,7 @@ pub async fn statement(app: &crate::app::App, stmt: &Stmt, files: bool, scope: &
     let lake = &app.lake;
     let (table, insert) = match stmt {
         Stmt::Insert(t, q) => (t.clone(), Some(q.clone())),
-        Stmt::InsertInto(t, names, q) => (t.clone(), Some(crate::write::whole_rows(lake, t, names, q).await?)),
+        Stmt::InsertInto(t, names, q) => (t.clone(), Some(crate::write::whole_rows(lake, t, names, q, scope).await?)),
         Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_) => (stmt.table(), None),
         _ => return Err(crate::codes::coded("0A000", format!("{}: not in a transaction (yet): run it outside one", stmt.table()))),
     };

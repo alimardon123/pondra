@@ -38,7 +38,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -437,7 +437,8 @@ type Outcome = (i16, i64, Option<String>);
 async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) -> Result<BoxFuture<'static, Option<Vec<u8>>>> {
     r.nstr()?; // transactional id
     let acks = r.i16()?;
-    r.i32()?; // timeout
+    // (how long the producer waits for this answer: a batch whose answer was lost is sent again within it, `queue`)
+    let timeout = Duration::from_millis(r.i32()?.clamp(1_000, 120_000) as u64);
     let mut topics: Vec<(String, Vec<(i32, BoxFuture<'static, Outcome>)>)> = vec![];
     for _ in 0..r.len()? {
         let name = r.str()?;
@@ -458,7 +459,7 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
                         false => ready((UNKNOWN_TOPIC, -1, None)), // (one it doesn't know of: as one that isn't there, `metadata`)
                     }
                 }
-                (Some(meta), Some(Ok(rules)), 0) => queue(app, who, &name, meta, rules, &records).await,
+                (Some(meta), Some(Ok(rules)), 0) => queue(app, who, &name, meta, rules, &records, timeout).await,
                 (Some(_), Some(Err(e)), 0) => {
                     eprintln!("kafka: a record for {name} refused: {e:#}"); // (the table's rules don't make: its records are refused)
                     ready((INVALID_RECORD, -1, Some(crate::ext::said(e))))
@@ -507,7 +508,15 @@ fn ready(o: Outcome) -> BoxFuture<'static, Outcome> { async move { o }.boxed() }
 /// exactly-once: its (producer id, sequence) become a Pondra producer and seq, and `prev` makes
 /// a batch that overtook its predecessor go again once that one is in (OUT_OF_ORDER_SEQUENCE
 /// only if it never comes).
-async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Arc<TableMeta>, rules: &Arc<crate::rules::Table>, records: &[u8]) -> BoxFuture<'static, Outcome> {
+///
+/// Its answer is one the producer can act on: a batch is acknowledged, or refused, only once it is known to be in the
+/// table or known not to be. A batch whose answer was lost on its way back from the leader (`log::unanswered`: the
+/// leader may have committed it) goes again from here, as the same producer and seq, so it is in once at most, until
+/// it is answered or the request's `timeout` passes. Answered REQUEST_TIMED_OUT at once, the producer sent it again
+/// too, as the same seq and so once at most, unless it gave up on older records meanwhile: then it begins a new epoch
+/// and numbers what it still holds from 0 again (librdkafka's drain and bump), and a batch already in went in twice
+/// (#783's resilience run: records 13720 to 13724).
+async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Arc<TableMeta>, rules: &Arc<crate::rules::Table>, records: &[u8], timeout: Duration) -> BoxFuture<'static, Outcome> {
     let invalid = |e: anyhow::Error| {
         eprintln!("kafka: a record for {table} refused: {e:#}"); // (librdkafka shows only the code; this says why)
         ready((INVALID_RECORD, -1, Some(crate::ext::said(&e))))
@@ -560,12 +569,20 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Arc<
         }
     }
     let table = table.to_string();
+    let until = Instant::now() + timeout;
     async move {
         let mut first = None;
         for (ack, src, rows) in acks {
             // (overtaken on its way to the leader by the batch after it, it goes again: `Log::sent_again`.
             // Answered out of order, an idempotent producer stops for good: librdkafka's "sequence desynchronization")
-            let ack = log.sent_again(ack.await, &table, &src, &rows).await;
+            let mut ack = log.sent_again(ack.await, &table, &src, &rows).await;
+            // (an idempotent producer's batch whose answer was lost: again, until it is answered or its time is up)
+            let mut pause = Duration::from_millis(10);
+            while src.prev.is_some() && matches!(&ack, Err(e) if crate::log::unanswered(e)) && Instant::now() + pause < until {
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(Duration::from_secs(1));
+                ack = log.sent_again(log.append_shaped(table.clone(), src.clone(), rows.clone()).await, &table, &src, &rows).await;
+            }
             match ack {
                 Ok(Ack { conflict: true, .. }) => return (OUT_OF_ORDER_SEQUENCE, -1, None),
                 Ok(Ack { duplicate: true, .. }) => {} // a retry of a committed batch: success

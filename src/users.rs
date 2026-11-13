@@ -90,6 +90,10 @@ pub struct Grant {
     pub on: On,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>, // (SELECT on these only)
+    /// Its rows only: those where this condition holds (SQL over the table's columns, `row_filter::check`ed when it is set).
+    /// None, every row. Step 6 piece 5: only tests set one until its syntax comes, so every grant stored reads as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<String>,
 }
 
 impl Grant {
@@ -446,7 +450,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             for n in &to {
                 let mut u = grantee(lake, n).await?;
                 for p in &privileges {
-                    let g = Grant { privilege: p.clone(), on: on.clone(), columns: if p == "select" { columns.clone() } else { vec![] } };
+                    let g = Grant { privilege: p.clone(), on: on.clone(), columns: if p == "select" { columns.clone() } else { vec![] }, rows: None };
                     u.grants.retain(|x| !(x.privilege == g.privilege && x.on == g.on)); // (the newest grant of it stands: columns replaced)
                     u.grants.push(g);
                 }
@@ -1152,6 +1156,35 @@ impl Access {
         some.map(Some)
     }
     pub fn may(&self, privilege: &str, table: &str) -> bool { self.columns(privilege, table).is_some() }
+    /// The filters on the rows of `table` it may use for `privilege` (`Grant.rows`), its grants' that give it: None, every
+    /// row (one of them has none, or no grant gives it, which `columns` refuses); Some(these), the rows where any holds, as
+    /// Postgres's permissive policies join. `named`: a table of another lake attached here, which only grants naming it
+    /// give (`named`). Rows and columns join apart, as Postgres's column grants and policies do: the columns one grant
+    /// gives are read in the rows any gives.
+    pub fn rows(&self, privilege: &str, table: &str, named: bool) -> Option<Vec<&str>> {
+        let schema = crate::text::split(table).0;
+        let gives = |g: &Grant| match &g.on {
+            On::Table(t) => t == table,
+            On::Schema(s) => !named && s == schema,
+            On::Lake => !named,
+            _ => false,
+        };
+        let mut some: Option<Vec<&str>> = None;
+        for g in self.grants.iter().filter(|g| g.privilege == privilege && gives(g)) {
+            match &g.rows {
+                None => return None,
+                Some(r) => some.get_or_insert_with(Vec::new).push(r.as_str()),
+            }
+        }
+        some.map(|mut these| {
+            these.sort_unstable();
+            these.dedup();
+            these
+        })
+    }
+    /// Every filter on rows its grants hold, any privilege's, any table's (`rights::Scope::key`: what is filled in for its
+    /// reader is in the key).
+    pub(crate) fn filters(&self) -> impl Iterator<Item = &str> { self.grants.iter().filter_map(|g| g.rows.as_deref()) }
     /// Whether it holds any privilege on `table`: SELECT, INSERT, UPDATE or DELETE, on it, its schema or the lake.
     pub fn knows(&self, table: &str) -> bool { TABLE_PRIVILEGES.iter().any(|p| self.columns(p, table).is_some()) }
     /// The same, for a table of another lake attached here (`named`).
@@ -1372,17 +1405,17 @@ pub(crate) fn fresh(lake: &Lake, now: Option<u64>, then: Option<u64>, at: datafu
     (lake.cat.is_writer() && now.is_some() && now == then) || at.elapsed() < std::time::Duration::from_secs(1)
 }
 
-/// May the request being served read or write the tables of `other`, a lake attached here as `ns`?
+/// May the request being served (its `scope`) read or write the tables of `other`, a lake attached here as `ns`?
 /// Refused, saying why, when that lake has a sign-in of its own (a user who signs in, or the node's
-/// tokens) and the request isn't from whoever runs the nodes (`auth::operator`): a user signed in
+/// tokens) and the request isn't from whoever runs the nodes (`scope.operator()`): a user signed in
 /// here is nobody there, and a database nothing locks opens nothing of another (the lake server's
 /// databases attach each other). A user granted some tables needs a grant naming the other lake's
 /// table besides (`Access::named`).
-pub async fn across(other: &Lake, ns: &str) -> Result<()> {
+pub async fn across(other: &Lake, ns: &str, scope: &crate::rights::Scope) -> Result<()> {
     if let Some(r) = other.node.reaches.of(&other.url).filter(|r| r.read_only) {
-        return read_only(&r, ns);
+        return read_only(&r, ns, scope);
     }
-    if crate::auth::operator() || !(crate::auth::tokens_on(&other.node) || any(other).await) {
+    if scope.operator() || !(crate::auth::tokens_on(&other.node) || any(other).await) {
         return Ok(());
     }
     bail!("permission denied: {ns} signs in on its own: its tables are read and written through it (the database {ns}), or with one of the nodes' tokens")
@@ -1391,8 +1424,7 @@ pub async fn across(other: &Lake, ns: &str) -> Result<()> {
 /// A lake on another server, attached READ_ONLY (ADR-058): its users sign in there, and its bucket
 /// key reads all of it whoever asks, so here it is read by whoever may use that key's secret (a
 /// user granted USAGE on it), and by tokens, as files under a secret's scope are.
-fn read_only(r: &crate::reaches::Reach, ns: &str) -> Result<()> {
-    let scope = crate::rights::scope();
+fn read_only(r: &crate::reaches::Reach, ns: &str, scope: &crate::rights::Scope) -> Result<()> {
     if scope.whole() {
         return Ok(());
     }
@@ -1406,7 +1438,7 @@ fn read_only(r: &crate::reaches::Reach, ns: &str) -> Result<()> {
 /// The same for a write to `table` of that lake (its name there), and, for a `scope` granted some
 /// tables (the writer's), a grant naming it for each privilege the write needs.
 pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::write::Stmt, scope: &crate::rights::Scope) -> Result<()> {
-    across(other, ns).await?;
+    across(other, ns, scope).await?;
     let (table, privileges) = (format!("{ns}.{table}"), crate::rights::asks(stmt).1.into_iter().filter_map(crate::rights::Action::privilege).collect::<Vec<_>>());
     match privileges.iter().find(|p| scope.named(p, &table).is_none()) {
         Some(p) => bail!("permission denied: {} on {table}, another database's table: GRANT {} ON {table} TO … (ON ALL TABLES and ON SCHEMA are this database's)", p.to_uppercase(), p.to_uppercase()),

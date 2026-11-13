@@ -314,6 +314,15 @@ pub fn holds_secrets() -> bool {
     all.get(&n.name).is_some_and(|x| !x.secrets.is_empty())
 }
 
+/// `DISCARD TEMP`: the session's temporary tables, views, functions and secrets go, as Postgres's drops its temporary
+/// schema; its settings and the rest stay (`set::discard`).
+pub fn discard_temporary(session: &str) -> Result<()> {
+    with(session, true, |x| {
+        (x.tables.clear(), x.views.clear(), x.routines.clear(), x.secrets.clear());
+        Ok(())
+    })
+}
+
 /// The lake's functions with the current session's own over them (`CREATE TEMP MACRO`): what the front expands in a
 /// statement's own text (`host.rs`; a lake function's body calls the lake's, `front::Routines`). Without any, or
 /// while a stored view is read (`stored`), the lake's as they are.
@@ -560,7 +569,7 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
         Some(n) => {
             let all = crate::rules::rows::row_columns(meta.columns().map(|(c, _)| c.to_string()), n);
             let names = if n.is_empty() { crate::write::implicit(&all, crate::rules::rows::rows_width(query)) } else { n }; // (no names: `VALUES (1, DEFAULT)`, the columns its rows give)
-            crate::rules::rows::rows_for(name, &all, names, query, &|c: &str| crate::rules::rows::default_sql(&meta, c))? // (a column left out takes its DEFAULT)
+            crate::rules::rows::rows_for(name, &all, names, query, &|c: &str| crate::rules::rows::default_sql(&meta, c), scope)? // (a column left out takes its DEFAULT)
         }
         None => query.to_string(),
     };

@@ -6,7 +6,6 @@
 use crate::adopt::fits_as_written;
 use crate::answer;
 use crate::expander;
-use crate::ext;
 use crate::keep_parquet::{self, Cut, Kept, Limits, Sys};
 use crate::log::Reserved;
 use crate::manifest::Seen;
@@ -31,12 +30,20 @@ use object_store_df::path::Path;
 use object_store_df::{ObjectMeta, ObjectStore, ObjectStoreExt as _};
 use std::sync::Arc;
 
+/// Where a kept load's file is listed and read: for whoever asks, each file theirs to read (`ext::Asking`, the engine's).
+pub trait Source: Sync {
+    /// The file or files `name` (an `"ext:…"` name) lists, as a table of their own. None: no such file.
+    fn listed(&self, name: &str) -> impl std::future::Future<Output = Result<Option<TableMeta>>> + Send;
+    /// The store `url` is in, and the object's path there.
+    fn store(&self, url: &str) -> impl std::future::Future<Output = Result<(Arc<dyn ObjectStore>, Path)>> + Send;
+}
+
 /// The files of a `CREATE TABLE … AS FROM 'f.parquet'`'s INSERT into `table` (`job` made the table, `stored` is it):
 /// Some when every check holds (`attempt`), else None and the INSERT is written as today. An error before the
 /// commit is None too, and says why. `stamp` is the INSERT's (`write::stamp`): the kept files carry their rows'
 /// system columns, as a written file does, so they are plain files of the table.
-pub async fn kept(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str, stored: Option<&Arc<TableMeta>>, stamp: Option<Reserved>) -> Option<Files> {
-    match attempt(query, target, table, sql, job, stored, stamp).await {
+pub async fn kept(source: &impl Source, target: &Lake, table: &str, sql: &str, job: &str, stored: Option<&Arc<TableMeta>>, stamp: Option<Reserved>) -> Option<Files> {
+    match attempt(source, target, table, sql, job, stored, stamp).await {
         Ok(Ok(files)) => Some(files),
         Ok(Err(_reason)) => None,
         Err(e) => {
@@ -48,7 +55,7 @@ pub async fn kept(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str
 
 /// Keeps the files, or says why not (`Err`, in words). Each check comes before anything is copied, except the
 /// file's own: every file is planned from its footer first, so a reason in the last one copies nothing.
-async fn attempt(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str, stored: Option<&Arc<TableMeta>>, stamp: Option<Reserved>) -> Result<Result<Files, String>> {
+async fn attempt(source: &impl Source, target: &Lake, table: &str, sql: &str, job: &str, stored: Option<&Arc<TableMeta>>, stamp: Option<Reserved>) -> Result<Result<Files, String>> {
     if crate::env::get("PONDRA_KEEP_PARQUET").as_deref() == Some("0") {
         return Ok(Err("PONDRA_KEEP_PARQUET=0".into()));
     }
@@ -68,7 +75,7 @@ async fn attempt(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str,
     if spec.format != "parquet" || !spec.options.is_empty() {
         return Ok(Err("not a Parquet file with no options".into()));
     }
-    let Some(listed) = ext::meta(query, &name).await? else { return Ok(Err("no file".into())) };
+    let Some(listed) = source.listed(&name).await? else { return Ok(Err("no file".into())) };
     if listed.files.is_empty() {
         return Ok(Err("no file matches".into()));
     }
@@ -86,7 +93,7 @@ async fn attempt(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str,
     let shared = Limits { file: share, ..limits };
     let mut jobs = vec![];
     for f in &listed.files {
-        let (store, location) = ext::store(query, &f.path).await?;
+        let (store, location) = source.store(&f.path).await?;
         let object = ObjectMeta { location: location.clone(), last_modified: Default::default(), size: f.bytes, e_tag: None, version: None };
         let md = DFParquetMetadata::new(store.as_ref(), &object).with_page_index_policy(Some(PageIndexPolicy::Optional)).fetch_metadata().await.with_context(|| format!("{}: its Parquet footer", f.path))?;
         let cuts = match keep_parquet::plan(&md, &schema, &shared).or_else(|_| keep_parquet::plan(&md, &schema, &limits)) {

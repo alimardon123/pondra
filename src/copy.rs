@@ -57,16 +57,16 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
         false => ensure!(owner(), crate::codes::coded("42501", format!("COPY … TO {to}: a path on the server's own disk, which a client writes only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): write it there, or to a bucket (s3://, gs://, az://)"))),
         true => {
             match crate::connections::named_in(to) {
-                Some(_) => crate::ext::through(to, "WRITE")?, // ('@drop/out/': the connection's, which lends its secret)
-                None => ensure!(owner() || covering(&list(lake).await?, to).is_some(), crate::codes::coded("42501", uncovered(to))),
+                Some(_) => crate::ext::through(to, "WRITE", scope)?, // ('@drop/out/': the connection's, which lends its secret)
+                None => ensure!(owner() || covering(&list(lake).await?, to, scope).is_some(), crate::codes::coded("42501", uncovered(to))),
             }
-            register(lake, to).await?;
+            register(lake, to, scope).await?;
         }
     }
     let query = crate::routines::expand(lake, query, scope).await?; // (the files, macros and FROM-first queries it reads)
     if to.starts_with("kafka://") {
         let df = crate::engine::sql(&crate::query::session_for(lake, &query, "", None, scope).await?, &query).await?;
-        return crate::kafka_client::copy_to(lake, df, to, options).await; // (rows as records: a topic's; not retried, as records sent are sent)
+        return crate::kafka_client::copy_to(lake, df, to, options, scope).await; // (rows as records: a topic's; not retried, as records sent are sent)
     }
     ensure!(!options.contains_key("key"), "KEY is a Kafka topic's (COPY … TO 'kafka://brokers/topic')");
     let format = match options.get("format") {
@@ -85,7 +85,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
             async move {
                 let df = crate::engine::sql(&ctx, query).await?;
                 // (a new table's first version is put before its rows, so a try that ran out of memory left an empty table: its retry adds to it)
-                crate::write_outside::copy_table(lake, &ctx, df, to, format, append || crate::query::retrying(&ctx), overwrite, job).await
+                crate::write_outside::copy_table(lake, &ctx, df, to, format, append || crate::query::retrying(&ctx), overwrite, job, scope).await
             }
         }).await; // (a table, not files: ADR-028)
     }
@@ -116,9 +116,11 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
         } else {
             kept = there.into_iter().collect();
         }
-        // A folder from a big table, on remote storage: every node writes its own share's files.
-        if remote {
-            match crate::spmd::copy(lake, nodes, me, &query, &target).await {
+        // A folder from a big table, on remote storage: every node writes its own share's files. Not for a scope with
+        // grants, which is planned here only (`App::here_only_for`): a node plans its share as the node's own work, which
+        // reads every row and column (step 6 piece 5: before role options let a user export).
+        if remote && scope.whole() {
+            match crate::spmd::copy(lake, nodes, me, &query, &target, scope).await {
                 Ok(Some(rows)) => return Ok(serde_json::json!({"copied": rows, "to": to})),
                 Ok(None) => {}
                 Err(e) => {
@@ -436,7 +438,7 @@ async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>, sc
         }
     };
     let positional = query_of.as_ref().is_some_and(|(f, r)| f == "csv" && r.get("header").is_some_and(|h| h == "false"));
-    let listed = crate::ext::objects(lake, &spec).await?;
+    let listed = crate::ext::objects(lake, &spec, scope).await?;
     ensure!(!listed.is_empty(), crate::codes::coded("42P01", format!("no file matches {shown}")));
     let mut pieces = vec![];
     for (url, o) in listed {
@@ -544,7 +546,7 @@ async fn refused_at(lake: &Lake, query: &str, file: &str, dialect: Option<Dialec
     let text = format!("{r:#}");
     let Some((column, value)) = crate::casts::refused_cell(&text) else { return e };
     let line = match dialect {
-        Some(dialect) => line_of(lake, file, dialect, column, &value).await,
+        Some(dialect) => line_of(lake, file, dialect, column, &value, scope).await,
         None => None,
     };
     let place = match line {
@@ -561,11 +563,11 @@ async fn refused_at(lake: &Lake, query: &str, file: &str, dialect: Option<Dialec
 /// they stream from its store; the read stops there. The reader refuses the first such cell in file order (the same text
 /// is refused wherever it is), so this is the cell it refused. None for a file that starts with a compression's magic
 /// number (the reader doesn't read those), for bytes that can't be read, and for no such cell.
-async fn line_of(lake: &Lake, file: &str, dialect: Dialect, column: usize, value: &str) -> Option<u64> {
+async fn line_of(lake: &Lake, file: &str, dialect: Dialect, column: usize, value: &str, scope: &crate::rights::Scope) -> Option<u64> {
     if value.is_empty() {
         return None; // (an empty value is read as null, never refused)
     }
-    let (store, path) = crate::ext::store(lake, file).await.ok()?;
+    let (store, path) = crate::ext::store(lake, file, scope).await.ok()?;
     let mut chunks = object_store_df::ObjectStoreExt::get(&store, &path).await.ok()?.into_stream();
     let mut cells = Cells::new(dialect, column, value);
     let (mut head, mut checked) = (Vec::new(), false);

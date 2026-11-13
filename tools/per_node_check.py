@@ -21,8 +21,9 @@ state), and `std::env::set_var` anywhere (the environment is the process's: the 
 node and every child process would read it, and beside a library's host it is a data race).
 
 And a page builds every module but the doors' (ADR-072): std's `Instant` and `SystemTime::now` panic
-there, so those modules read the time through DataFusion's `Instant` (std's own on a node) and
-`log::now_us` or `now_ms`, and a std clock in one fails (CLOCKS below names a file that may, and why).
+there, so those modules read the time through `crate::clock` (its `Instant`, tokio's, which a test's paused
+time moves too, and `wall_us` or `wall_ms`, which `log::now_us` and `now_ms` call), and a std clock in one
+fails (CLOCKS below names a file that may, and why).
 
 And every setting goes through `env.rs` (ADR-061 §8): a `PONDRA_*` name read with `std::env`
 anywhere else fails (by its text, or a constant that names it), so does a `"PONDRA_…"` name the table (`settings.rs`) doesn't list, and a name the table
@@ -32,6 +33,10 @@ And every walk of the SQL tree goes through `crate::walk` (`src/walk.rs`): sqlpa
 generic over the visitor, so each walk is compiled again for every visitor type. Outside walk.rs, a `use` of either
 trait, or a call of `visit_expressions`, `visit_expressions_mut`, `visit_relations`, `visit_relations_mut`,
 `visit_statements` or `visit_statements_mut` not through `walk::`, fails here by file and line.
+
+And every call between members goes through the calling node's dial (`dial::call`, `NodeState::dial`), so the sim's
+members reach each other in its process and none of their calls goes around it (redesign step 3, piece 3c): the nodes'
+HTTP client (`cluster::http`) is sent with in one place, `cluster::send_call` (the `Http` dial), and named nowhere else.
 
 Only the standard library; it reads the source, not a build.
 """
@@ -119,7 +124,8 @@ PROCESS = {
     "casts.rs:WHOLE": "a function's definition (pondra_whole), the same for every lake",
     "avg.rs:AVG_OF": "a function's definition (pondra_avg_of), the same for every lake",
     "multiply.rs:MULTIPLY": "a function's definition (pondra_multiply), the same for every lake",
-    "divide.rs:DIVIDE": "a function's definitions (pondra_divide, Postgres's places and Spark's), the same for every lake",
+    "divide.rs:DIVIDE": "a function's definition (pondra_divide, Postgres's places), the same for every lake",
+    "divide.rs:SPARK_DIVIDE": "a function's definition (spark_divide, Spark SQL's `/`), the same for every lake",
     "runs.rs:WAKE": SIGNAL,
     "runs.rs:WRITTEN": SIGNAL,
     "app.rs:TURNS": SETTING + " (PONDRA_QUERIES, PONDRA_QUEUE_SECS; a stopped node's last queries give their turns back to it)",
@@ -169,7 +175,8 @@ PLAIN = {"std", "sync", "collections", "time", "path", "num", "borrow", "regex",
          "str", "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
          "i128", "isize", "f32", "f64", "Duration", "PathBuf", "Path", "Regex", "Value", "Bytes", "Cow",
          "NonZeroUsize", "static",
-         "crate", "registry", "BuiltIn"}  # (a built-in extension's `registry::BuiltIn`: its names and a function, nothing to change)
+         "crate", "registry", "BuiltIn",  # (a built-in extension's `registry::BuiltIn`: its names and a function, nothing to change)
+         "languages", "Language"}  # (a language of the registry's, `languages::Language`: its names and a function too)
 # Where a `"PONDRA_…"` name isn't a setting anything reads, by file, with the reason.
 NOT_READ = {
     "ci.rs": "GitHub secrets' names, which `pondra ci init` sets for a repository's workflows",
@@ -186,7 +193,7 @@ STATIC = re.compile(r"\bstatic\s+(?:mut\s+)?([A-Z_][A-Z0-9_]*)\s*:")
 
 # Files a page builds that may read std's clock, each with why.
 CLOCKS = {
-    "log.rs": "now_us itself: the machine's clock on a node (a page's is the browser's, tokio::clock)",
+    "clock.rs": "the one clock itself: the machine's on a node (a page's is the browser's, tokio::clock), ahead by what paused time passed in a test",
 }
 STD_CLOCK = re.compile(r"\bstd::time::(?:Instant|SystemTime)\b|\bstd::time::\{[^}]*\b(?:Instant|SystemTime)\b|(?<![\w:])SystemTime::now\(")
 
@@ -368,7 +375,7 @@ def clocks():
             continue
         for n, line in enumerate(tests_cut(text).split("\n"), 1):
             if STD_CLOCK.search(line.split("//", 1)[0]):
-                bad.append(f"src/{rel}:{n}: std's clock panics on a page: use datafusion::common::instant::Instant (std's own on a node) or crate::log::now_us / now_ms (or add the file to CLOCKS in tools/per_node_check.py with why)")
+                bad.append(f"src/{rel}:{n}: std's clock panics on a page: use crate::clock::Instant (tokio's: std's on a node, paused in a test) or crate::clock::wall_us / wall_ms (or add the file to CLOCKS in tools/per_node_check.py with why)")
     return bad
 
 
@@ -404,6 +411,38 @@ def walks():
     return bad
 
 
+DIALED = re.compile(r"(?<!fn )(?<![\w:])http\((?:&|node\b)|\bcluster::http\(")
+
+
+def dialed():
+    """A call between members around the node's dial: the nodes' HTTP client used outside `cluster::send_call`."""
+    bad = []
+    for base, _, files in os.walk(SRC):
+        for f in sorted(files):
+            if not f.endswith(".rs"):
+                continue
+            path = os.path.join(base, f)
+            rel = os.path.relpath(path, SRC).replace(os.sep, "/")
+            text = tests_cut(open(path, encoding="utf-8").read())
+            # (cluster.rs's own `send_call`, the `Http` dial, is the one place that sends with it)
+            allowed = range(*span(text, "async fn send_call(")) if rel == "cluster.rs" else range(0)
+            for n, line in enumerate(text.split("\n"), 1):
+                if DIALED.search(line.split("//", 1)[0]) and n not in allowed:
+                    bad.append(f"src/{rel}:{n}: a call between members goes through the node's dial (crate::dial::call), not the nodes' HTTP client: the sim's members reach each other only by their dial")
+    return bad
+
+
+def span(text, start):
+    """The 1-based lines from `start`'s line through the end of its item (the next line that is a lone `}`)."""
+    at = text.find(start)
+    if at < 0:
+        return (0, 0)
+    first = text.count("\n", 0, at) + 1
+    lines = text.split("\n")
+    last = next((i for i in range(first, len(lines) + 1) if lines[i - 1] == "}"), len(lines))
+    return (first, last + 1)
+
+
 def poisoned(found):
     """A process's lock read with `.unwrap()`: a library's node restarting in place unwinds through
     whatever lock it holds (`Lifecycle::restart`), and the next start must still read it."""
@@ -432,7 +471,7 @@ def main():
         if not ok:
             bad.append(f"src/{rel}:{line} {name} ({ty}): {why}")
     stale = sorted(k for k in PROCESS if k not in keys)
-    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks() + settings() + clocks() + poisoned(found) + walks()
+    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks() + settings() + clocks() + poisoned(found) + walks() + dialed()
     bad += more
     for b in bad if not args.list else more:
         print(f"FAIL {b}")

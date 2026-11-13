@@ -1038,15 +1038,15 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
 /// `INSERT INTO t (b, a) …` as an INSERT of whole rows: the columns it names from its query, by
 /// position, the others NULL (`_deleted` left for `rows` to fill), in the table's order. `VALUES`
 /// stay `VALUES`, so they still go through the log.
-pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str) -> Result<String> {
+pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str, scope: &crate::rights::Scope) -> Result<String> {
     let (other, name) = crate::ddl::resolve(lake, table).await?;
     let meta = other.as_deref().unwrap_or(lake).cat.meta(&table_key(&name)).await?.with_context(|| format!("no table {table}"))?; // (as parsed: `Catalog::parsed`)
-    whole_rows_of(lake, table, &meta, names, query).await
+    whole_rows_of(lake, table, &meta, names, query, scope).await
 }
 
 /// `whole_rows` for a table whose stored meta the caller holds (`meta`, as `lake` stores it, under the name `table` the
 /// statement gives): a one-row upsert's proposed row is worked out here once, before its locks (`txn::upsert_point`).
-pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, names: &[String], query: &str) -> Result<String> {
+pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, names: &[String], query: &str, scope: &crate::rights::Scope) -> Result<String> {
     let columns = crate::rules::rows::row_columns(meta.logical_columns().into_iter().map(|(c, _)| c), names);
     let order = crate::rules::rows::row_columns(meta.sql_order(), names); // (SQL's order: what a row without a column list gives, first to last)
     let names = if names.is_empty() { implicit(&order, crate::rules::rows::rows_width(query)) } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: the columns its rows give)
@@ -1054,11 +1054,11 @@ pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, na
     if meta.list().columns.iter().filter_map(|c| c.default.as_ref()).any(|d| crate::seq::calls(d)) && crate::rules::rows::plain_values(query).is_some() {
         // (`nextval` in rows of VALUES: taken here, in the rows' order: `seq::taken`)
         let used = std::cell::RefCell::new(vec![]);
-        crate::rules::rows::rows_for(table, &columns, names, query, &|c| default(c).inspect(|d| used.borrow_mut().push(d.clone())))?;
+        crate::rules::rows::rows_for(table, &columns, names, query, &|c| default(c).inspect(|d| used.borrow_mut().push(d.clone())), scope)?;
         let taken = std::cell::RefCell::new(crate::seq::taken(lake, &used.into_inner()).await?);
-        return crate::rules::rows::rows_for(table, &columns, names, query, &|c| default(c).map(|d| crate::seq::put(&d, &mut taken.borrow_mut())));
+        return crate::rules::rows::rows_for(table, &columns, names, query, &|c| default(c).map(|d| crate::seq::put(&d, &mut taken.borrow_mut())), scope);
     }
-    crate::rules::rows::rows_for(table, &columns, names, query, &default)
+    crate::rules::rows::rows_for(table, &columns, names, query, &default, scope)
 }
 
 /// A plain INSERT (no column list) into a table that moved a column (`TableMeta::set_order`), as the INSERT that names the
@@ -1793,9 +1793,9 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         Stmt::InsertInto(t, names, query) => match crate::ext::outside_target(&app.lake, &t).await? {
             // (another engine's table: its writer places the list in the schema it writes by, `write_outside::Rows`; a guest's,
             // sent through the inbox, is placed here: the columns the list leaves out are NULL, as its format keeps no DEFAULT)
-            Some(target) if inbox => Stmt::Insert(t.clone(), crate::rules::rows::rows_for(&t, &crate::write_outside::columns(&app.lake, &target).await?, &names, &query, &|_| None)?),
+            Some(target) if inbox => Stmt::Insert(t.clone(), crate::rules::rows::rows_for(&t, &crate::write_outside::columns(&app.lake, &target, &by.scope).await?, &names, &query, &|_| None, &by.scope)?),
             Some(_) => Stmt::InsertInto(t, names, query),
-            None => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
+            None => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query, &by.scope).await?),
         },
         Stmt::Insert(t, query) => {
             if !is_there(&app.lake, &t).await? {
@@ -1919,7 +1919,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
             // A CREATE TABLE … AS FROM a Parquet file keeps its row groups, or the rows are written as always (`keep_load`).
             let to = app.to();
             let stamped = stamp(lake, &table, Some(&to)).await?;
-            let f = match crate::keep_load::kept(lake, lake, &table, query, &job, stored.as_ref(), stamped).await {
+            let f = match crate::keep_load::kept(&crate::ext::Asking { lake, scope: &by.scope }, lake, &table, query, &job, stored.as_ref(), stamped).await {
                 Some(f) => Some(f),
                 None => {
                     match everywhere(app, &table, query, &job, stamped, &to, files || meta.is_none(), &by.scope).await? {
@@ -2131,7 +2131,7 @@ async fn everywhere(app: &crate::app::App, table: &str, query: &str, job: &str, 
     if recorded(&app.lake, job).await? {
         return Ok(Some(None));
     }
-    match crate::spmd::insert(&app.lake, &app.members.nodes(), app.members.me(), &query, table, stamp.map(|r| (r, to))).await {
+    match crate::spmd::insert(&app.lake, &app.members.nodes(), app.members.me(), &query, table, stamp.map(|r| (r, to)), scope).await {
         Ok(Some((columns, files))) => Ok(Some(Some(Files { table: table.into(), job: job.into(), columns, files, placed: crate::log::placed_for(table) }))),
         Ok(None) => Ok(None),
         Err(e) => {
@@ -2367,8 +2367,8 @@ async fn ddl_listed(app: &crate::app::App, ddls: Vec<crate::ddl::Ddl>, job: &str
     for mut d in ddls {
         crate::branch::door(lake, &mut d, by).await?;
         out = match &d {
-            crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. } => crate::backup::statement(lake, lock, d.clone()).await?,
-            crate::ddl::Ddl::FetchExtension { .. } => crate::extension::fetch(lake, lock, d.clone(), &by.name).await?,
+            crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. } => crate::backup::statement(lake, lock, d.clone(), &by.scope).await?,
+            crate::ddl::Ddl::FetchExtension { .. } => crate::extension::fetch(lake, lock, d.clone(), &by.name, &by.scope).await?,
             _ if app.members.by_inbox() => through_bucket_one(lake, Stmt::Ddl(vec![d.clone()]), job, files, &by.scope).await?,
             _ => match &app.seq {
                 Some(seq) => ddl_here(lake, seq, &app.lock, d.clone(), by).await?,
@@ -2465,7 +2465,7 @@ async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool, 
                 let direct = !crate::env::is_set("PONDRA_NO_DIRECT") && BUCKET.try_with(|_| ()).is_err();
                 match if direct { Some(post(node, &t.addr, r).await) } else { None } {
                     Some(Ok(v)) => return summary(matches!(r, Request::Flush(_)), v),
-                    Some(Err(e)) if !crate::dial::unreached(&e) => return Err(e),
+                    Some(Err(e)) if !crate::dial::unreached(node, &e) => return Err(e),
                     _ => {} // this machine can't reach the leader: through the bucket
                 }
                 if let Some(v) = crate::inbox::send(&store, r, None, Some(&t), Some(&node.claims)).await? {
@@ -2543,7 +2543,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
         }
         (_, Stmt::Insert(_, sql)) => {
             let stamped = stamp(target, table, None).await?;
-            if let Some(f) = crate::keep_load::kept(query, target, table, sql, job, stored.as_ref(), stamped).await {
+            if let Some(f) = crate::keep_load::kept(&crate::ext::Asking { lake: query, scope }, target, table, sql, job, stored.as_ref(), stamped).await {
                 return Ok(Some(Request::Files(f))); // (a Parquet file's row groups kept: `keep_load`)
             }
             let ctx = open(session_for(query, sql, "", None, scope).await?);
@@ -2571,8 +2571,8 @@ pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
 pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>, d: crate::ddl::Ddl, by: &crate::auth::Principal) -> Result<Value> {
     match d {
         crate::ddl::Ddl::Refresh { database, tables } => crate::branch::refresh(lake, seq, lock, database, tables, by).await,
-        crate::ddl::Ddl::SetLocation { database, to } => crate::memory::set_location(lake, &database, &to).await, // (copies outside the lake's lock: `memory.rs`)
-        d @ (crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. }) => crate::backup::statement(lake, Some(lock), d).await, // (a request the leader takes: its own owner, beside its lock)
+        crate::ddl::Ddl::SetLocation { database, to } => crate::memory::set_location(lake, &database, &to, &by.scope).await, // (copies outside the lake's lock: `memory.rs`)
+        d @ (crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. }) => crate::backup::statement(lake, Some(lock), d, &by.scope).await, // (a request the leader takes: its own owner, beside its lock)
         d => {
             let _guard = lock.lock().await;
             crate::ddl::apply(lake, d, by).await
@@ -2603,7 +2603,7 @@ async fn across(dir: &str, r: &crate::reaches::Reach, req: Option<Request>, node
         None => {
             let store = open_store(dir, Some(&node.reaches))?.1; // (with its read-only key: `r`, the node's for it)
             match latest(&store).await? {
-                Some(t) if !t.addr.is_empty() && alive(&store, &t, Some(&node.claims)).await => crate::dial::url(&t.addr),
+                Some(t) if !t.addr.is_empty() && alive(&store, &t, Some(&node.claims)).await => crate::dial::url(node, &t.addr),
                 _ => bail!("nobody leads {dir}"),
             }
         }

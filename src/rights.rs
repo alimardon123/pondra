@@ -194,6 +194,10 @@ pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusa
         Action::SelectAll => a.columns(privilege, &table) == Some(None),
         _ => a.may(privilege, &table),
     };
+    // (every column and every row: a table some of whose rows its grants hide is read with SELECT, which filters them)
+    if granted && action == Action::SelectAll && a.rows(privilege, &table, false).is_some() {
+        return Err(Refusal::new(format!("permission denied: {table} shows {} some of its rows only (a filter on its rows in a grant): read it with SELECT", who.name)));
+    }
     if granted {
         return Ok(());
     }
@@ -267,6 +271,7 @@ pub fn may_run(role: Role, stmt: &Stmt) -> anyhow::Result<()> {
 pub struct Scope {
     access: Option<std::sync::Arc<crate::users::Access>>,
     asker: Option<std::sync::Arc<Asker>>, // (None: made without a principal, which names no one and is no superuser's)
+    key: Option<std::sync::Arc<str>>, // (`key` when its grants filter rows: theirs with its reader filled in; None: `Access::key`)
 }
 
 /// Who a scope is for, as planning asks it (`pondra.history`'s rows, `pondra.audit`): its principal's name, whether that
@@ -292,15 +297,15 @@ pub fn scope() -> Scope {
 impl Scope {
     /// Everything, this lake's and the lakes attached to it: a token's, a superuser's, an open node's, and the node's own
     /// work's (`auth::Principal::node`). `tools/scope_check.py` counts where one is made.
-    pub fn everything() -> Scope { Scope { access: None, asker: None } }
+    pub fn everything() -> Scope { Scope { access: None, asker: None, key: None } }
 
     /// Nothing: no table, column, name or code. Whoever isn't signed in (`Principal::of(Role::None)`), and work with no
     /// caller that isn't the node's own (`scope`).
-    pub fn nothing() -> Scope { Scope { access: Some(std::sync::Arc::new(Default::default())), asker: None } }
+    pub fn nothing() -> Scope { Scope { access: Some(std::sync::Arc::new(Default::default())), asker: None, key: None } }
 
     /// What a user who isn't a superuser may see: what `access` grants it (`users::principal_with` makes it once, as the
     /// principal is made).
-    pub fn granted(access: std::sync::Arc<crate::users::Access>) -> Scope { Scope { access: Some(access), asker: None } }
+    pub fn granted(access: std::sync::Arc<crate::users::Access>) -> Scope { Scope { access: Some(access), asker: None, key: None } }
 
     /// The scope a planning session was made for (`query::session_for`): the session carries it to everything planned in it
     /// (a `SessionConfig` extension), so no planning reads the task's caller. A session made without one sees nothing: it
@@ -323,7 +328,15 @@ impl Scope {
     /// The same scope, for `p` (`Principal::asking`): its name, whether it is an admin, and whether it runs the nodes, for
     /// planning to ask (`superuser`, `asker`, `operator`). The only way a scope learns who it is for.
     pub(crate) fn asked_by(&self, p: &Principal) -> Scope {
-        Scope { access: self.access.clone(), asker: Some(std::sync::Arc::new(Asker { name: p.name.clone(), admin: p.role == Role::Admin, operator: p.operator })) }
+        let asker = Asker { name: p.name.clone(), admin: p.role == Role::Admin, operator: p.operator };
+        // (a filter that names its reader answers per reader: its filled-in text goes in the key, step 6 piece 5)
+        let key = self.access.as_ref().filter(|a| a.filters().next().is_some()).map(|a| {
+            let mut filled: Vec<String> = a.filters().map(|f| crate::row_filter::filled(f, Some(&asker.name))).collect();
+            filled.sort();
+            filled.dedup();
+            crate::users::sha256(&serde_json::to_string(&(a.key(), filled)).unwrap_or_default())[..32].into()
+        });
+        Scope { access: self.access.clone(), asker: Some(std::sync::Arc::new(asker)), key }
     }
 
     /// Is it a superuser's (`pondra.audit`, every row of `pondra.history`)? Whole, and its principal an admin. Never whole
@@ -337,15 +350,45 @@ impl Scope {
     /// `Principal::operator`)? A scope made without a principal is not.
     pub fn operator(&self) -> bool { self.asker.as_ref().is_some_and(|a| a.operator) }
 
+    /// The folder name its principal stages a joined page's rows under (`auth::slug`, as `auth::page_creates` checks): none
+    /// for whoever runs the nodes, for a nameless one, and for a scope made without a principal.
+    pub fn slug(&self) -> Option<String> {
+        self.asker.as_ref().filter(|a| !a.operator && !a.name.is_empty()).map(|a| crate::text::hex(a.name.as_bytes()))
+    }
+
     /// What an answer kept for it is kept under, beside its text (`App::remembers`, the Postgres port's too): what it
     /// holds, its grants and its names, never who holds it. So a GRANT or a REVOKE makes another key, and no answer made
     /// under other grants is ever given; "" when whole, as every token's and superuser's answers are kept today. Whom it is
     /// for isn't in it: what answers by that (`pondra.history`, `pondra.audit`) is never kept (`App::remembers`).
-    pub fn key(&self) -> &str { self.access.as_ref().map_or("", |a| a.key()) }
+    /// Where its grants filter rows, their filters filled in for its reader are in it too (step 6 piece 5), so a filter on
+    /// `current_user` keeps two readers' answers apart whatever else the key holds.
+    pub fn key(&self) -> &str { self.key.as_deref().unwrap_or_else(|| self.access.as_ref().map_or("", |a| a.key())) }
+
+    /// The rows of `table` (as the catalog names it) it may use for `privilege` (as `Action::privilege` names it), as one
+    /// SQL condition over the table's columns with its reader filled in (`row_filter::filled`): None, every row (whole,
+    /// or a grant with no filter). Its grants' filters join with OR. `query::Guarded` plans it (step 6 piece 5b).
+    pub fn rows(&self, privilege: &str, table: &str) -> Option<String> { self.rows_of(privilege, table, false) }
+
+    /// The same, for a table of another lake attached here (`l.t`, `l.s.t`): only grants naming it count (`named`).
+    pub fn rows_named(&self, privilege: &str, table: &str) -> Option<String> { self.rows_of(privilege, table, true) }
+
+    fn rows_of(&self, privilege: &str, table: &str, named: bool) -> Option<String> {
+        let filters = self.access.as_ref()?.rows(privilege, table, named)?;
+        let reader = self.asker.as_ref().map(|a| a.name.as_str());
+        let filled: Vec<String> = filters.iter().map(|f| crate::row_filter::filled(f, reader)).collect();
+        Some(match filled.as_slice() {
+            [one] => one.clone(),
+            many => many.iter().map(|f| format!("({f})")).collect::<Vec<_>>().join(" OR "),
+        })
+    }
 
     /// May it read these columns of `table` (as the catalog names it)? A key lookup asks before it answers without
     /// planning (`serve::point`), as `query::Guarded` asks of a plan's scan: every column it returns and its key's.
+    /// A table some of whose rows its grants hide (`rows`) is read only as planned, through `query::Guarded`, never by its key.
     pub fn reads<'a>(&self, table: &str, mut columns: impl Iterator<Item = &'a str>) -> bool {
+        if self.rows("select", table).is_some() {
+            return false;
+        }
         match self.columns(table) {
             None => false,
             Some(None) => true,
@@ -446,7 +489,7 @@ mod tests {
     use std::sync::Arc;
 
     fn user(grants: &[(&str, On, &[&str])]) -> Principal {
-        let grants = grants.iter().map(|(p, on, cols)| Grant { privilege: p.to_string(), on: on.clone(), columns: cols.iter().map(|c| c.to_string()).collect() }).collect();
+        let grants = grants.iter().map(|(p, on, cols)| Grant { privilege: p.to_string(), on: on.clone(), columns: cols.iter().map(|c| c.to_string()).collect(), rows: None }).collect();
         Principal { name: "ann".into(), scope: Scope::granted(Arc::new(Access::granted(grants))), ..Principal::of(Role::Read) }
     }
 
@@ -566,7 +609,7 @@ mod tests {
         assert_eq!(sees(&WHO.scope(Principal::token(Role::Read), async { scope() }).await), everything);
         assert_eq!(sees(&Principal::of(Role::None).scope), nothing, "nobody signed in");
         assert!(Principal::of(Role::Read).scope.whole() && Principal::of(Role::Admin).scope.whole());
-        let ann = Principal { name: "ann".into(), scope: Scope::granted(Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec![] }]))), ..Principal::of(Role::Read) };
+        let ann = Principal { name: "ann".into(), scope: Scope::granted(Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec![], rows: None }]))), ..Principal::of(Role::Read) };
         let node = crate::node_state::NodeState::unhosted();
         let (here, spawned, carried) = WHO
             .scope(ann, async { (scope(), node.tasks.aside(crate::auth::Door, async { scope() }).await.unwrap(), node.tasks.aside(crate::auth::caller(), async { scope() }).await.unwrap()) })
@@ -583,7 +626,7 @@ mod tests {
     #[test]
     fn a_scope_is_kept_by_what_it_holds() {
         let scope = |grants: &[(&str, On, &[&str])], names: &[&str]| {
-            let mut a = Access::granted(grants.iter().map(|(p, on, cols)| Grant { privilege: p.to_string(), on: on.clone(), columns: cols.iter().map(|c| c.to_string()).collect() }).collect());
+            let mut a = Access::granted(grants.iter().map(|(p, on, cols)| Grant { privilege: p.to_string(), on: on.clone(), columns: cols.iter().map(|c| c.to_string()).collect(), rows: None }).collect());
             a.names = names.iter().map(|n| n.to_string()).collect();
             Scope::granted(Arc::new(a))
         };
@@ -608,6 +651,45 @@ mod tests {
         let read = |s: &Scope, table: &str, cols: &[&str]| s.reads(table, cols.iter().copied());
         assert!(read(&ann, "t", &["a", "b"]) && read(&ann, "u", &["x", "y"]) && read(&Scope::everything(), "v", &["z"]));
         assert!(!read(&ann, "t", &["a", "c"]) && !read(&ann, "v", &[]), "a column not granted, or a table: SQL answers it, refusing");
+    }
+
+    /// A grant's filter on rows (step 6 piece 5): its grants' filters join with OR, one with none shows every row, and each
+    /// is filled in for its reader. A table some of whose rows are hidden is never read whole (`SelectAll`) nor by its key
+    /// (`reads`), and two readers of one filter on `current_user` keep their answers apart, with the same names and grants.
+    #[test]
+    fn a_filter_on_rows_is_its_readers() {
+        let grant = |p: &str, on: On, rows: Option<&str>| Grant { privilege: p.into(), on, columns: vec![], rows: rows.map(String::from) };
+        let t = || On::Table("t".into());
+        let access = |grants: Vec<Grant>| {
+            let mut a = Access::granted(grants);
+            a.names = ["ann", "public"].iter().map(|n| n.to_string()).collect();
+            Arc::new(a)
+        };
+        let as_ = |name: &str, a: &Arc<Access>| Principal { name: name.into(), scope: Scope::granted(a.clone()), ..Principal::of(Role::Read) }.asking();
+        let mine = access(vec![grant("select", t(), Some("owner = current_user")), grant("select", On::Schema("public".into()), Some("dept = 'x'")), grant("insert", t(), None)]);
+        let (ann, bob) = (as_("ann", &mine), as_("bob", &mine));
+        assert_eq!(ann.scope.rows("select", "t").as_deref(), Some("(dept = 'x') OR (owner = 'ann')"));
+        assert_eq!(bob.scope.rows("select", "t").as_deref(), Some("(dept = 'x') OR (owner = 'bob')"));
+        assert_eq!(ann.scope.rows("select", "u").as_deref(), Some("dept = 'x'"), "the schema's grant, for every table of it");
+        assert_eq!(ann.scope.rows("insert", "t"), None, "another privilege's grant, with no filter: every row");
+        assert_eq!(Scope::granted(mine.clone()).rows("select", "t").as_deref(), Some("(dept = 'x') OR (owner = NULL)"), "no reader: no one's rows");
+        assert_eq!(Principal::node().scope.rows("select", "t"), None);
+        let every = access(vec![grant("select", t(), Some("owner = current_user")), grant("select", On::Lake, None)]);
+        assert_eq!(as_("ann", &every).scope.rows("select", "t"), None, "one grant with no filter: every row");
+        let named = access(vec![grant("select", On::Table("l.t".into()), Some("n > 1")), grant("select", On::Lake, Some("n > 2"))]);
+        assert_eq!(as_("ann", &named).scope.rows_named("select", "l.t").as_deref(), Some("n > 1"), "another lake's table: only grants naming it");
+
+        assert_ne!(ann.scope.key(), bob.scope.key(), "one filter on current_user, the same grants and names: two keys");
+        assert_eq!(ann.scope.key(), as_("ann", &mine).scope.key());
+        let plain = access(vec![grant("select", t(), None)]);
+        assert_eq!(as_("ann", &plain).scope.key(), as_("bob", &plain).scope.key(), "no filter: the key is what the scope holds, as before");
+        assert_eq!(as_("ann", &plain).scope.key(), plain.key());
+
+        assert_eq!(said(may(&ann, Action::Select, Object::Table("t"))), "ok");
+        assert_eq!(said(may(&ann, Action::SelectAll, Object::Table("t"))), "permission denied: t shows ann some of its rows only (a filter on its rows in a grant): read it with SELECT");
+        assert_eq!(said(may(&as_("ann", &every), Action::SelectAll, Object::Table("t"))), "ok");
+        assert!(!ann.scope.reads("t", ["owner"].into_iter()), "a key lookup: SQL answers it, through its filter");
+        assert!(as_("ann", &plain).scope.reads("t", ["owner"].into_iter()));
     }
 
     /// A write asks of its table what SQL's own would, and rows written ask UPDATE and DELETE as they need them.

@@ -576,6 +576,8 @@ one script's (statements sent together over HTTP).
 | Prepare | `PREPARE p [(type, …)] AS statement`, with `$1`, `$2`, … where the values go |
 | Run | `EXECUTE p [(value, …)]` |
 | Forget | `DEALLOCATE [PREPARE] p`, `DEALLOCATE ALL` |
+| Start again | `DISCARD ALL`: the settings, prepared statements, variables, temporary tables, views and functions, sequences' `currval`, and cursors go (refused in a transaction, `25001`) |
+| Drop a part | `DISCARD TEMP` (the temporary tables, views and functions), `DISCARD SEQUENCES` (each sequence's `currval`), `DISCARD PLANS` (accepted: each statement is planned as it runs) |
 
 - A `datafusion.*` name is one of [DataFusion's options](https://datafusion.apache.org/user-guide/configs.html)
   (`datafusion.execution.time_zone`, `datafusion.execution.batch_size`,
@@ -600,14 +602,30 @@ one script's (statements sent together over HTTP).
 - `datafusion.runtime.*` (memory, spill folder, caches) is the node's, set as it starts with
   `--memory-gb` ([`PONDRA_MEMORY_GB`](/pondra/reference/environment/) and the other settings there),
   and refused here.
-- `COPY … FROM STDIN`, `COPY … TO STDOUT`, `DISCARD` and `CLOSE` are the Postgres port's: see
+- `COPY … FROM STDIN`, `COPY … TO STDOUT` and `CLOSE` are the Postgres port's: see
   [Postgres](/pondra/reference/postgres/). Over HTTP, the console and `pondra sql`, the two `COPY`s are refused
   (`0A000`) naming what to write there: the query as CSV (`POST /sql?format=csv`) or `COPY … TO 's3://…'`, and
   `COPY INTO t FROM 'path or URL'` or `POST /append/t`. So is Postgres's `COPY t FROM 'file'`, a file of its own
   server's: `COPY INTO t FROM 'path or URL'` loads one.
-- `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`) gives the session Spark's
-  functions where Spark and DataFusion share a name ([Spark's functions](/pondra/sql/functions/#sparks-functions)),
-  and `'duckdb'` takes DuckDB's `STRUCT(a INT)` in `CREATE TABLE`.
+- `SET language = 'spark'` makes Spark SQL the session's language: each statement it sends over HTTP, Flight SQL,
+  MCP or the console is read with Spark's grammar as it arrives, and means what it means in Spark: Spark's functions
+  where Spark and DataFusion share a name ([Spark's functions](/pondra/sql/functions/#sparks-functions)), a `/` that
+  is always fractional (`7 / 2` is 3.5; two DECIMALs keep Spark's places), and a cast to an integer that cuts its
+  fraction. It answers as `spark_sql('…')` does with the same query.
+  `SET language = 'pondra'` (or `RESET language`) gives Pondra's SQL back, and `SHOW language` shows which it is.
+  `'databricks'` names Spark SQL too, and so does `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`).
+  Another language is refused (`22023`), naming those there are. The node's default is
+  [`PONDRA_LANGUAGE`](/pondra/reference/environment/).
+  - A request's statements are read in turn, each in the language its session has when it comes to it: after a
+    `SET language` in the same request, the statements that follow are read in that language.
+  - Pondra's own statements read as written in any language: `SET`, `SHOW`, `RESET`, `PREPARE`, `DISCARD`, transactions, cursors,
+    `CHECKPOINT`, and the statements of their own words (`COPY`, `ATTACH`, `CREATE SEQUENCE`, `CREATE USER`, …).
+  - A text Spark's grammar refuses is refused in its words (`42601`), DuckDB's forms (`FROM t SELECT …`) among them.
+  - A routine's or a task's body is Pondra's SQL, and runs as it is.
+  - The Postgres port's sessions read Pondra's SQL, whatever the node's language, until one sets its own: it is the
+    SQL its clients' drivers write. A pooler's reset (`RESET ALL`, or PgBouncer's `DISCARD ALL`) gives it back, so
+    the next client of a pooled connection reads Pondra's SQL.
+- `datafusion.sql_parser.dialect = 'duckdb'` takes DuckDB's `STRUCT(a INT)` in `CREATE TABLE`.
 - A prepared statement can be a query or a write. `EXECUTE` puts its values where `$1`, `$2`, …
   were, each cast to the type `PREPARE` gave, and runs it as if it were sent.
 - `PREPARE` and [`EXECUTE IMMEDIATE`](#scripts) both bind values as `$1`, `$2`, …, never pasted into
@@ -1213,7 +1231,7 @@ text is the node's own, it is shown in code:
 | `CREATE STREAM s ON TABLE t`, `LATERAL FLATTEN(INPUT => …)` | Snowflake's, refused (`0A000`) naming Pondra's: `GET /watch/t?changes=true` follows a table's changes, and `unnest(…)` in the `FROM` |
 | `UPSERT INTO t …` | CockroachDB's, refused (`0A000`) naming Pondra's two upserts: `INSERT OR REPLACE INTO t …`, or `INSERT INTO t … ON CONFLICT (key) DO UPDATE SET …` |
 | `CREATE EXTENSION name` | refused (`0A000`), naming Pondra's way: `CREATE EXTENSION pg_trgm is Postgres's: a Pondra extension is installed from its file, INSTALL pg_trgm FROM 'path or URL', then LOAD pg_trgm` (for `uuid-ossp` and `pgcrypto`, the functions built in) |
-| `CREATE TRIGGER`, `LOCK TABLE`, `VACUUM`, `DISCARD ALL`, `CLOSE ALL` | not implemented over HTTP, the same message. The [Postgres port](/pondra/reference/postgres/) takes `DISCARD` and `CLOSE` and ignores them |
+| `CREATE TRIGGER`, `LOCK TABLE`, `VACUUM`, `CLOSE ALL` | not implemented over HTTP, the same message. The [Postgres port](/pondra/reference/postgres/) takes `CLOSE` and ignores it |
 | `ALTER TABLE t SET TBLPROPERTIES (k = v)` with a name not listed | refused, naming it: `k: ALTER TABLE … SET takes publish, cluster_by, ttl, order_by and retention, and other engines' properties (write.delete.mode = 'merge-on-read')` |
 | `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
 | `COPY … TO` a folder inside a lake | refused; a lake's files are its own |

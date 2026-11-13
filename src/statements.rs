@@ -235,6 +235,12 @@ impl Statements {
     }
 }
 
+/// Whether `sql` is one of the section's statements, by its words: Pondra's own, read so in every language
+/// (`statement::in_language`).
+pub(crate) fn claims(sql: &str) -> bool {
+    crate::registry::get().find::<Statements>().is_some_and(|s| s.of(sql).is_some())
+}
+
 /// `sql` as one of the section's statements, for `write::parse`: what it says (an extension's, for the leader to carry
 /// out; the core's, as `write::Stmt`), or why it is refused. None: it is none of theirs.
 pub(crate) fn matched(sql: &str) -> Option<crate::write::Stmt> {
