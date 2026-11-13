@@ -89,8 +89,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     if let Some(q) = crate::friendly::summarize(host, sql).await? {
         return Ok(q);
     }
-    // (then the text's passes, in order: `spark_sql('…')` as Pondra's SQL; `pondra.diff('prod.t', 'dev.t')`, ADR-047;
-    // `t AT (VERSION => n)`, ADR-043; `PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON; FINAL and RUNNING before a
+    // (then the text's passes, in order: `spark_sql('…')` as Pondra's SQL; `t AT (VERSION => n)`, ADR-043; `PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON; FINAL and RUNNING before a
     // measure, a subquery before MATCH_RECOGNIZE: each as SQL that parses)
     let sql: &str = &passes.text(sql)?.into_owned();
     let Routines { own: all, lake } = host.routines().await?;
@@ -114,6 +113,8 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     };
     // (a tree only the fallback dialect read, or the FROM-first reading: printed, as nothing after the front reads the text)
     let read_apart = crate::parsed::generic(sql).is_err();
+    // (`pondra.diff(a, b)`, ADR-047: each call as the query that answers it, whose views are expanded below as any other)
+    let expands = crate::diff::rewrite(host, &mut stmts).await? || expands;
     // (a view's `sum(x) AS MEASURE revenue`, which the fallback dialect reads as an alias, ADR-065 §3: `measures::passes`)
     let measured = measured || (read_apart && crate::measures::marked(&stmts));
     let name = host.name();

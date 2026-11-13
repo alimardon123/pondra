@@ -290,6 +290,15 @@ def environments_check(bin, work, port, root):
         rows(prod, "SELECT _change_type, count(*) FROM pondra.diff('sales.orders', 'dev.sales.orders') GROUP BY 1 ORDER BY 1")))
     checks["pondra.diff('sales.orders', 'dev.sales.orders'): one inserted, five changed, five deleted"] = diff is not None \
         and rows(prod, "SELECT id, amount FROM pondra.diff('sales.orders', 'dev.sales.orders') WHERE _change_type = 'update_postimage' ORDER BY id") == [(i, 0.0) for i in range(21, 26)]
+    checks["pondra.diff names the columns an update changed (_changed), and none on an insert or a delete"] = \
+        rows(prod, "SELECT _change_type, coalesce(array_to_string(_changed, ','), 'NULL') AS changed, count(*) AS n FROM pondra.diff('sales.orders', 'dev.sales.orders') GROUP BY 1, 2 ORDER BY 1") \
+        == [("delete", "NULL", 5), ("insert", "NULL", 1), ("update_postimage", "amount", 5), ("update_preimage", "amount", 5)]  # (a JSON row leaves out a NULL)
+    # (two queries match whole, as multisets: a changed row is its old one gone and its new one come)
+    of = lambda db: f"(SELECT id, amount FROM {db}sales.orders WHERE id BETWEEN 21 AND 30)"
+    checks["pondra.diff of two queries: the rows of each the other lacks, as inserts and deletes"] = \
+        rows(prod, f"SELECT _change_type, count(*) FROM pondra.diff({of('')}, {of('dev.')}) GROUP BY 1 ORDER BY 1") == [("delete", 10), ("insert", 5)]
+    said = refused(prod, "SELECT * FROM pondra.diff('sales.orders', (SELECT id FROM dev.sales.orders))")
+    checks["pondra.diff of two sides with other columns is refused naming the first (42804, a 400)"] = ": 400 " in said and "amount is a column of sales.orders" in said
 
     # prod moves on: every row changed (purged into position deletes, files a tenth deleted rewritten),
     # small files merged, a table dropped, retention of a second. dev still reads what it listed.

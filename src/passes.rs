@@ -523,13 +523,13 @@ pub(crate) mod tests {
                 (Phase::Refuse, "dialect_stmts.refused"),
                 (Phase::Refuse, "pattern.refused"),
                 (Phase::Text, "sparksql.inline"), // (a tree pass at PR 9: it parses the statement to walk it already)
-                (Phase::Text, "diff.diffs"),
                 (Phase::Text, "past_names.syntax"),
                 (Phase::Text, "friendly.text"),
                 (Phase::Text, "pattern.text"),
                 (Phase::Wants, "friendly.forms"),
                 (Phase::Wants, "friendly.marked"),
                 (Phase::Wants, "friendly.aliases"),
+                (Phase::Wants, "diff.diffs"), // (a tree pass since Trellis T1a: the parse reads a side that is a query)
                 (Phase::Wants, "pattern.wanted"),
                 (Phase::Wants, "text.names_a_type"),
                 (Phase::Parse, "friendly.comprehension"),
