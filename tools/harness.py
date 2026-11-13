@@ -10939,6 +10939,19 @@ def server():
     top = {"Authorization": "Basic " + base64.b64encode(b"top:top-password-1").decode()}
     checks["one of the nodes' tokens reads another database; a superuser of this one doesn't"] = until(lambda: _try(lambda: call(port + 3, "POST", "/sql", b"SELECT count(*) AS n FROM hr.people", headers=tk)), [{"n": 1}], 15) == [{"n": 1}] \
         and "hr signs in on its own" in _raises_text(lambda: call(port + 3, "POST", "/sql", b"SELECT count(*) AS n FROM hr.people", headers=top))
+    # (11-10 audit H1: the node's own work is not whoever runs the nodes, so a task made with a token, its tick the node's
+    # own, reads nothing of a database that signs in on its own; whoever made the task may be anyone)
+    call(port + 3, "POST", "/sql", b"CREATE TABLE copied (id BIGINT)", headers=tk)
+    call(port + 3, "POST", "/sql", b"CREATE TASK peek SCHEDULE '1 second' AS INSERT INTO copied SELECT id FROM hr.people", headers=tk)
+    peek = []
+    for _ in range(100):  # (a tick a second: its failed run within 30 s)
+        peek = _try(lambda: call(port + 3, "POST", "/sql", b"SELECT status, error FROM pondra.runs WHERE routine = 'peek' AND status = 'failed' LIMIT 1", headers=tk)) or []
+        if peek:
+            break
+        time.sleep(0.3)
+    call(port + 3, "POST", "/sql", b"DROP TASK peek", headers=tk)
+    checks["a task's tick is the node's own, not whoever runs the nodes: it reads nothing of a database that signs in on its own (11-10 audit H1)"] = \
+        bool(peek) and "hr signs in on its own" in str(peek[0]["error"]) and call(port + 3, "POST", "/sql", b"SELECT count(*) AS n FROM copied", headers=tk) == [{"n": 0}]
     tokened.kill()
     refused = subprocess.run([BIN, "serve", folder, "--addr", f"127.0.0.1:{port + 5}", "--flight", "127.0.0.1:1"], capture_output=True, text=True, timeout=30)
     checks["--flight is refused by name (a Flight port is one lake's)"] = refused.returncode != 0 and "one lake" in refused.stderr

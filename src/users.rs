@@ -1582,6 +1582,25 @@ mod tests {
 
     use super::*;
 
+    /// 11-10 audit H1: the node's own work (a task's tick, a view's refresh) is no one's who runs the nodes, so another
+    /// database that signs in on its own opens nothing to it; a token of the nodes' it opens, as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_nodes_own_work_opens_no_database_that_signs_in_on_its_own() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-across-{}", uuid::Uuid::new_v4()));
+        let other = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let node = crate::auth::Principal::node().scope;
+        let token = crate::auth::Principal::token(Role::Admin).scope;
+        assert!(across(&other, "b", &node).await.is_ok(), "a database nothing locks opens to the node's own work");
+        let verifier = Some(Verifier::with("ann-password-1", b"0123456789abcdef", 4096)); // (a user who signs in: `any`)
+        apply(&other, Change::Create { name: "ann".into(), login: true, if_not_exists: false, verifier, superuser: false, limits: Limits::default() }).await?;
+        let e = across(&other, "b", &node).await.expect_err("b has a user: the node's own work is nobody there");
+        assert!(e.to_string().contains("b signs in on its own"), "{e}");
+        assert!(across(&other, "b", &token).await.is_ok(), "a token of the nodes' opens it");
+        assert!(!node.operator() && node.whole() && node.superuser(), "whole and an admin's, but not the operator's");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_lakes_keep_their_users_access_apart() -> Result<()> {
         let mut lakes = vec![];
