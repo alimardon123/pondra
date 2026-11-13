@@ -143,6 +143,9 @@ def main():
     sql(port, f"EXPLAIN SELECT count(*) FROM events WHERE ts >= TIMESTAMP '{iso(day)}' AND ts < TIMESTAMP '{iso(day + DAY)}'")
     plan_ms = round((time.time() - s) * 1000, 1)
     m2 = metrics(port)
+    # The same plan again, its manifests cached: what pruning a day's few thousand files by their ranges costs.
+    warm = lambda i: sql(port, f"EXPLAIN SELECT count(*) FROM events WHERE ts >= TIMESTAMP '{iso(day + i)}' AND ts < TIMESTAMP '{iso(day + i + DAY)}'")
+    plan_warm_ms = timed(warm, 21)
     day_files = m2["pondra_files_scanned_total"] - m1["pondra_files_scanned_total"]
     # A restarted node: nothing cached.
     node.kill()
@@ -170,7 +173,7 @@ def main():
         "three nodes, manifests dealt out: same answer": was_spread and spread == expected(),
     }
     out = {"before": before, "added": added, "after": after, "today_scanned": scanned, "today_skipped": skipped,
-           "day_2010_files": day_files, "day_2010_plan_ms": plan_ms, "cold_query_ms": cold_ms, "three_nodes_ms": spread_ms, "checks": checks, "ok": all(checks.values())}
+           "day_2010_files": day_files, "day_2010_plan_ms": plan_ms, "day_2010_plan_warm_ms": plan_warm_ms, "cold_query_ms": cold_ms, "three_nodes_ms": spread_ms, "checks": checks, "ok": all(checks.values())}
     print(json.dumps(out, indent=1))
     sys.exit(0 if out["ok"] else 1)
 

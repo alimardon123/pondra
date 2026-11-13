@@ -35,8 +35,14 @@ impl Serialize for Bound {
 
 impl<'de> Deserialize<'de> for Bound {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        base64::engine::general_purpose::STANDARD.decode(s).map(Bound).map_err(serde::de::Error::custom)
+        // (decoded where it lies in the text, not copied out first: a manifest holds thousands)
+        struct Base64;
+        impl serde::de::Visitor<'_> for Base64 {
+            type Value = Bound;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("a bound in base64") }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Bound, E> { base64::engine::general_purpose::STANDARD.decode(s).map(Bound).map_err(E::custom) }
+        }
+        d.deserialize_str(Base64)
     }
 }
 
