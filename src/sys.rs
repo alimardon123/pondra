@@ -159,9 +159,8 @@ mod tests {
 
 /// Can a file (or manifest) with these column ranges hold one of the rows `dead` names — sorted
 /// (`_row_id`, `_version`) pairs? By its `_row_id` and `_version` ranges; yes if it has none.
-pub fn holds(dead: &[(i64, i64)], stats: &crate::manifest::Stats) -> bool {
-    let range = |c: &str| stats.get(c).and_then(|(lo, hi)| Some((lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?)));
-    match (range(ROW_ID), range(VERSION)) {
+pub fn holds(dead: &[(i64, i64)], ranged: &dyn crate::bounds::Ranged) -> bool {
+    match (ranged.longs(ROW_ID), ranged.longs(VERSION)) {
         (Some((lo, hi)), Some((vlo, vhi))) => dead[dead.partition_point(|d| d.0 < lo)..].iter().take_while(|d| d.0 <= hi).any(|d| (vlo..=vhi).contains(&d.1)),
         _ => true,
     }

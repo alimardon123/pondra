@@ -757,14 +757,10 @@ fn murmur3(data: &[u8]) -> u32 {
     h ^ (h >> 16)
 }
 
-/// A bound in Iceberg's single-value form (hex, as `avro.rs` writes bytes), or None.
+/// A bound in Iceberg's single-value form (`bounds::encode`; hex, as `avro.rs` writes bytes), or None: the types whose
+/// bounds are published.
 pub(crate) fn bound_bytes(v: &ScalarValue) -> Option<String> {
-    let b = match v {
-        ScalarValue::Int32(Some(x)) | ScalarValue::Date32(Some(x)) => x.to_le_bytes().to_vec(),
-        ScalarValue::Int64(Some(x)) | ScalarValue::TimestampMicrosecond(Some(x), _) => x.to_le_bytes().to_vec(),
-        ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.as_bytes().to_vec(),
-        ScalarValue::Boolean(Some(x)) => vec![*x as u8],
-        _ => return None,
-    };
-    Some(crate::text::hex(&b))
+    use ScalarValue as S;
+    let published = matches!(v, S::Int32(_) | S::Date32(_) | S::Int64(_) | S::TimestampMicrosecond(..) | S::Utf8(_) | S::Utf8View(_) | S::LargeUtf8(_) | S::Boolean(_));
+    Some(crate::text::hex(&crate::bounds::encode(v).filter(|_| published)?))
 }

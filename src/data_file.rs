@@ -36,6 +36,10 @@ pub struct DataFile {
     /// Append tables: each column's min and max, so queries skip files without opening them.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub stats: crate::data_file::Stats,
+    /// The same, typed (`bounds.rs`): what a file written in a lake of format 8 keeps instead. Read with
+    /// `bounds::Ranged`, which takes these, else `stats`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub bounds: crate::bounds::Bounds,
     /// Partitioned tables: the one partition value this file holds.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub part: String,
@@ -64,6 +68,11 @@ pub struct DataFile {
     /// How many of its rows those delete (a file mostly deleted is rewritten: `tier::maintain`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub deleted: u64,
+    /// A file outside the lake: its listing's time (nanoseconds), which its reads open it with, so the footer
+    /// cached at planning (by that time and its size) is the one each read finds. None: a lake file, which never
+    /// changes under its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<i64>,
 }
 
 fn is_zero(n: &u64) -> bool { *n == 0 }

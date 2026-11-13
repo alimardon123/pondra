@@ -302,7 +302,7 @@ async fn carry(lake: &Lake, table: &str, meta: &TableMeta, c: &FileCommit) -> Re
     }
     ids.sort_unstable();
     ids.dedup();
-    let range = |f: &DataFile| f.stats.get(crate::text::ROW_ID).and_then(|(lo, hi)| Some((lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?)));
+    let range = |f: &DataFile| crate::bounds::Ranged::longs(f, crate::text::ROW_ID);
     let mut found = 0;
     for f in live.iter().filter(|f| range(f).is_none_or(|(lo, hi)| lo <= ids[ids.len() - 1] && ids[0] <= hi)) {
         let gone: std::collections::HashSet<u64> = deleted_rows(lake, f).await?.into_iter().collect();
