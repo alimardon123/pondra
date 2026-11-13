@@ -747,17 +747,18 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lif
                 joined.set_slug(slug);
             }
             let (following, refreshing) = (Arc::downgrade(&app.lake), Arc::downgrade(&app.lake));
-            let (http, auth) = (app.lake.node.net.client(crate::net::Policy::ENDPOINT), auth.to_string()); // (the join's sign-in alone: no token of ours)
+            let (from, auth) = (app.lake.node.clone(), auth.to_string()); // (the join's sign-in alone, no token of ours: `dial::Joined`)
             let ended = Arc::new(AtomicBool::new(false)); // (the sign-in ended: neither loop asks again)
             let (said, refreshed) = (ended.clone(), ended.clone());
-            let open = move || -> futures::future::BoxFuture<'static, Result<crate::fetch::Response, crate::members::Open>> {
-                let (http, url, auth, said) = (http.clone(), format!("{node}/cluster/log"), auth.clone(), said.clone());
+            let open = move || -> futures::future::BoxFuture<'static, Result<crate::dial::Reply, crate::members::Open>> {
+                let (from, node, auth, said) = (from.clone(), node.clone(), auth.clone(), said.clone());
                 Box::pin(async move {
-                    match crate::fetch::send(http.get(url).header(reqwest::header::AUTHORIZATION, auth)).await {
-                        Ok(r) if r.status().is_success() => Ok(r),
+                    let page = crate::dial::Joined { node: &node, auth: &auth };
+                    match crate::dial::Dial::call(&page, &from, &node, crate::dial::Call::get("/cluster/log")).await {
+                        Ok(r) if r.ok() => Ok(r),
                         // (the sign-in ended: the stream is not followed again)
-                        Ok(r) if matches!(r.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) => {
-                            eprintln!("this page's sign-in at its node ended ({}): it no longer follows the lake", r.status());
+                        Ok(r) if matches!(r.status, 401 | 403) => {
+                            eprintln!("this page's sign-in at its node ended ({}): it no longer follows the lake", r.status);
                             said.store(true, SeqCst);
                             Err(crate::members::Open::Stop)
                         }
@@ -1000,6 +1001,64 @@ mod tests {
             assert_eq!(a.folder.as_deref(), Some("a__2"), "the renamed table keeps folder a: the new one takes the next");
             assert_eq!(free_folder(&lake, "a").await.unwrap().as_deref(), Some("a__3"), "a, kept for the dropped a2, and a__2 are used");
             assert_eq!(free_folder(&lake, "d").await.unwrap(), None);
+            marks.abort();
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
+    /// A keyed table's files keep their columns' ranges (step 5 piece 11a), and its reads skip a file they rule out,
+    /// unopened, for a filter on any column: each part of the merge on read is filtered alone (`query::upsert_view`). The
+    /// answers stay whole: an update's newest version, in a file a filter on another column skips, still shadows the old
+    /// one that filter finds. (Here, with the node: an UPDATE needs the leader's sequencer, and files its tiering.)
+    #[tokio::test]
+    async fn a_keyed_tables_reads_skip_the_files_their_ranges_rule_out() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let lake = app.lake.clone();
+            let node = crate::auth::Principal::node();
+            let run = |sql: String| {
+                let (app, node) = (app.clone(), node.clone());
+                async move {
+                    let stmt = crate::write::parse(&sql).unwrap_or_else(|| panic!("{sql}: not a statement"));
+                    crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                }
+            };
+            run("CREATE TABLE k (id BIGINT, v BIGINT, PRIMARY KEY (id))".into()).await;
+            for (lo, hi) in [(1, 1000), (1001, 2000)] {
+                run(format!("INSERT INTO k SELECT value, value FROM range({lo}, {})", hi + 1)).await; // (v = id)
+                app.tier_all(0).await.unwrap();
+            }
+            run("UPDATE k SET v = -5 WHERE id = 5".into()).await;
+            app.tier_all(0).await.unwrap();
+            let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("k")).await.unwrap().unwrap();
+            assert_eq!(meta.files.len(), 3, "a file a round: {:?}", meta.files.iter().map(|f| (f.ord, &f.stats)).collect::<Vec<_>>());
+            let ranges = |f: &crate::store::DataFile| (f.stats.get("id").cloned(), f.stats.get("v").cloned());
+            let newest = meta.files.iter().max_by_key(|f| f.ord).unwrap();
+            assert_eq!(ranges(newest), (Some(("5".into(), "5".into())), Some(("-5".into(), "-5".into()))));
+            assert!(meta.files.iter().all(|f| f.sketch.is_empty()), "a keyed file's sketches would count a key's old versions");
+            let count = |sql: &'static str| {
+                let (app, node) = (app.clone(), node.clone());
+                async move {
+                    let skipped = || app.lake.node.metrics.files_skipped.load(std::sync::atomic::Ordering::Relaxed);
+                    let before = skipped();
+                    let b = app.query(sql, Some("0"), &node.scope).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                    (b[0].column(0).as_primitive::<Int64Type>().value(0), skipped() - before)
+                }
+            };
+            for (sql, rows, skips) in [
+                ("SELECT count(*) FROM k WHERE id = 1500", 1, true),     // (the two files of ids 1-1000 and of 5 unopened)
+                ("SELECT count(*) FROM k WHERE v = 5", 0, true),         // (id 5's old version, shadowed by a file it skips)
+                ("SELECT count(*) FROM k WHERE v = -5", 1, true),
+                ("SELECT count(*) FROM k WHERE v BETWEEN 1 AND 1000", 999, true),
+                ("SELECT count(*) FROM k", 2000, false),
+            ] {
+                let (n, skipped) = count(sql).await;
+                assert_eq!(n, rows, "{sql}");
+                assert_eq!(skipped > 0, skips, "{sql}: {skipped} files skipped");
+            }
             marks.abort();
             crate::memory_lake::forget_memory(&lake.url);
         })

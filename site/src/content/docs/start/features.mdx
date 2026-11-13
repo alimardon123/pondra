@@ -686,10 +686,10 @@ SELECT fingerprint, count(*) AS runs, avg(ms) AS ms FROM pondra.history
 
 ### Session settings
 
-`SET datafusion.…` changes one of DataFusion's options for the session's queries, and each name and value is checked as it is set; here, Spark's dialect. [SQL statements](/pondra/sql/statements/#settings-and-prepared-statements)
+`SET datafusion.…` changes one of DataFusion's options for the session's queries, and each name and value is checked as it is set. `SET language = 'spark'` makes Spark SQL the session's language. [SQL statements](/pondra/sql/statements/#settings-and-prepared-statements)
 
 ```sql
-SET datafusion.sql_parser.dialect = 'spark';
+SET language = 'spark';
 SELECT floor(2.5) AS f, substring("Spark SQL", -3) AS s;
 ```
 

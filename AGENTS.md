@@ -3271,7 +3271,7 @@ python3 tools/harness.py sso_flow     # the browser's and pondra login's way in 
 python3 tools/harness.py sso_pg         # psql 18's sign-in through a provider (POSTGRES 'oauth', OAUTHBEARER): told where it is, a token in, refusals, one way a connection
 python3 tools/harness.py keycloak       # single sign-on against a real Keycloak (PONDRA_KEYCLOAK): tokens at every door, realm roles, the console's flow, pondra login, psql 18
 python3 tools/node_check.py             # a node stopped once it serves, or while it starts, gives its term back: the next leads at once
-python3 tools/per_node_check.py         # every static said to outlive a node; no task Node::stop can't end; settings only through env.rs
+python3 tools/per_node_check.py         # every static said to outlive a node; no task Node::stop can't end; settings only through env.rs; calls between members only through the node's dial
 python3 tools/size_check.py --bin <pondra> --platform linux-x64   # the shipped program within its budget (tools/size-budget.txt): its bytes and its gzip download; more raises the budget there, saying why
 cargo test --release --test node_twice  # two lakes in one process, one after the other: nothing of the first in the second
 cargo test --release --test node_library       # a node in process: restarts in place, a vital loop's panic answered as 57P03, opened again

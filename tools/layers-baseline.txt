@@ -16,6 +16,7 @@ budget -> log  2
 cache -> bridge  10
 catalogs -> crypto  2
 catalogs -> fetch  1
+clock -> wasm32  4
 cluster -> app  1
 cluster -> auth  1
 cluster -> format  2
@@ -113,12 +114,11 @@ log -> rules  4
 log -> seq  6
 log -> sys  5
 log -> tier  1
-log -> wasm32  4
+log -> wasm32  2
 machine -> wasm32  2
 manifest -> branch  4
 manifest -> crypto  1
 manifest -> sys  1
-members -> fetch  1
 memory_lake -> wasm32  10
 metrics -> ai  3
 metrics -> app  1
@@ -162,7 +162,6 @@ optimize -> wasm32  1
 page -> wasm32  3
 page_records -> dial  4
 panics -> wasm32  3
-path -> sparksql  1
 pg -> sso  6
 pg -> tls  6
 pg_json_sets -> measures  1
@@ -186,7 +185,6 @@ routines -> extension  3
 routines -> git  3
 routines -> pyfn  2
 routines -> python  8
-routines -> sparksql  1
 routines -> wasm32  2
 routines -> workspace  6
 rules -> pg_bytea  1

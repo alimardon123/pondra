@@ -2075,7 +2075,7 @@ mod tests {
     /// `crm`; `u` is a user in `analyst` with INSERT on `sales` and SELECT on its `region`; `pondra` is
     /// the lake's first user, listed once (as the bootstrap role).
     fn sample() -> Lakes {
-        let grant = |privilege: &str, on: On, columns: &[&str]| Grant { privilege: privilege.into(), on, columns: columns.iter().map(|c| c.to_string()).collect() };
+        let grant = |privilege: &str, on: On, columns: &[&str]| Grant { privilege: privilege.into(), on, columns: columns.iter().map(|c| c.to_string()).collect(), rows: None };
         let users = vec![
             ("u/pondra".to_string(), User { login: true, superuser: true, ..Default::default() }),
             ("u/analyst".to_string(), User { grants: vec![grant("select", On::Table("sales".into()), &[]), grant("select", On::Schema("crm".into()), &[])], ..Default::default() }),

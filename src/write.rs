@@ -1392,7 +1392,7 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
         None => Ok(rows),
     });
     // (files of up to 4M rows, as a merge writes them: `maintain` leaves them alone)
-    let writes = streams.collect::<Result<Vec<_>>>()?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 4_000_000, &[], true, partition.as_deref()));
+    let writes = streams.collect::<Result<Vec<_>>>()?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 4_000_000, &[], partition.as_deref()));
     Ok((columns, futures::future::try_join_all(writes).await?.concat()))
 }
 
@@ -2465,7 +2465,7 @@ async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool, 
                 let direct = !crate::env::is_set("PONDRA_NO_DIRECT") && BUCKET.try_with(|_| ()).is_err();
                 match if direct { Some(post(node, &t.addr, r).await) } else { None } {
                     Some(Ok(v)) => return summary(matches!(r, Request::Flush(_)), v),
-                    Some(Err(e)) if !crate::dial::unreached(&e) => return Err(e),
+                    Some(Err(e)) if !crate::dial::unreached(node, &e) => return Err(e),
                     _ => {} // this machine can't reach the leader: through the bucket
                 }
                 if let Some(v) = crate::inbox::send(&store, r, None, Some(&t), Some(&node.claims)).await? {
@@ -2603,7 +2603,7 @@ async fn across(dir: &str, r: &crate::reaches::Reach, req: Option<Request>, node
         None => {
             let store = open_store(dir, Some(&node.reaches))?.1; // (with its read-only key: `r`, the node's for it)
             match latest(&store).await? {
-                Some(t) if !t.addr.is_empty() && alive(&store, &t, Some(&node.claims)).await => crate::dial::url(&t.addr),
+                Some(t) if !t.addr.is_empty() && alive(&store, &t, Some(&node.claims)).await => crate::dial::url(node, &t.addr),
                 _ => bail!("nobody leads {dir}"),
             }
         }

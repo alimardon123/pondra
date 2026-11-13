@@ -130,7 +130,7 @@ pub async fn read(ctx: &datafusion::prelude::SessionContext, files: &[&crate::da
             (_, None) => (f.rows, !f.outside.as_ref().is_some_and(|o| o.guessed)),
         };
         let stats = Arc::new(statistics(f, rows, counted, gone.as_ref().map_or(0, |g| g.len()), table.is_none(), &file_schema));
-        out.push(File { key, size: f.bytes, rows, partition, deleted: gone, range: None, only: None, stats });
+        out.push(File { key, size: f.bytes, rows, partition, deleted: gone, range: None, only: None, stats, modified: f.modified });
     }
     let adapter = (!ids.is_empty()).then(|| Arc::new(ById { ids: ids.clone(), mapping: table.and_then(|t| t.name_mapping.as_deref()).map(name_mapping).unwrap_or_default() }) as _);
     let df = ctx.read_table(Arc::new(Files { store, file_schema, partition: partition_fields, files: out, adapter, row: None }))?;
@@ -150,8 +150,7 @@ pub(crate) fn statistics(f: &crate::data_file::DataFile, rows: u64, counted: boo
     let n = rows.saturating_sub(deleted as u64) as usize;
     (s.num_rows, s.total_byte_size) = (if plain && counted { Exact(n) } else { Inexact(n) }, Inexact(f.bytes as usize));
     for (field, c) in schema.fields().iter().zip(s.column_statistics.iter_mut()).filter(|_| plain) {
-        let parse = |v: &String| ScalarValue::try_from_string(v.clone(), field.data_type()).ok();
-        if let Some((Some(lo), Some(hi))) = f.stats.get(field.name()).map(|(lo, hi)| (parse(lo), parse(hi))) {
+        if let Some((lo, hi)) = crate::bounds::Ranged::range(f, field.name(), field.data_type()) {
             (c.min_value, c.max_value) = (Inexact(lo), Inexact(hi));
         }
     }
@@ -413,6 +412,7 @@ pub struct File {
     pub range: Option<(u64, u64)>,      // only its rows from .0 to (not including) .1
     pub only: Option<Arc<Vec<u64>>>,    // only its rows at these positions, sorted
     pub stats: Arc<datafusion::common::Statistics>, // (its file columns': partition values add theirs)
+    pub modified: Option<i64>, // its listing's time, nanoseconds (`DataFile::modified`); a lake file's none
 }
 
 #[async_trait::async_trait]
@@ -450,7 +450,8 @@ impl TableProvider for Files {
         for f in files {
             let mut pf = datafusion::datasource::listing::PartitionedFile::new_from_meta(datafusion::object_store::ObjectMeta {
                 location: datafusion::object_store::path::Path::parse(&f.key).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-                last_modified: Default::default(),
+                // (the time its footer was cached under at planning: a footer cached as of another time is read again)
+                last_modified: f.modified.map(chrono::DateTime::from_timestamp_nanos).unwrap_or_default(),
                 size: f.size,
                 e_tag: None,
                 version: None,
