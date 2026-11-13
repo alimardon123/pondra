@@ -1,7 +1,6 @@
 //! Who a lake's member is, and who leads it: what a lake's modules ask of the form they run in, instead of the node's
 //! cluster. A node answers with its `Cluster` (`cluster.rs`); a page, or a test, with `Alone`, its own leader and no
 //! peers (`page-same-core.md` §7.3). The terms themselves are in `terms.rs`.
-use crate::fetch;
 use crate::store::{Frame, Lake, Store};
 use crate::terms::{self, Term};
 use anyhow::{bail, Result};
@@ -103,7 +102,7 @@ pub enum Open {
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a node's `cluster::mirror` calls it; a page's join will too)
 pub async fn follow(
     lake: Weak<Lake>,
-    open: impl Fn() -> BoxFuture<'static, Result<fetch::Response, Open>> + Send,
+    open: impl Fn() -> BoxFuture<'static, Result<crate::calls::Reply, Open>> + Send,
     mut frame: impl FnMut(&Frame, &Lake) + Send,
     mut down: impl FnMut() + Send,
     resend: bool,
@@ -116,7 +115,7 @@ pub async fn follow(
         match open().await {
             Ok(r) => {
                 refused += 1;
-                let mut frames = Box::pin(frames(r.bytes_stream()));
+                let mut frames = Box::pin(frames(r.stream()));
                 let mut first = true; // (this connection's first frame: its node's own `Start`)
                 while let Some(Ok(f)) = frames.next().await {
                     refused = 0;
@@ -195,7 +194,7 @@ fn relays(f: &Frame, relayed: &mut Relayed) -> bool {
 /// parse, ends the stream with that error: `follow` reads it (a node's mirror, and a joined page's follow).
 pub fn frames<E>(chunks: impl Stream<Item = std::result::Result<bytes::Bytes, E>> + Send) -> impl Stream<Item = Result<Frame>> + Send
 where
-    E: std::error::Error + Send + Sync + 'static,
+    E: Into<anyhow::Error> + Send + 'static,
 {
     let chunks = Box::pin(chunks);
     futures::stream::try_unfold((chunks, bytes::BytesMut::new()), |(mut chunks, mut buf)| async move {
@@ -204,7 +203,7 @@ where
                 return anyhow::Ok(Some((f, (chunks, buf))));
             }
             match chunks.next().await {
-                Some(chunk) => buf.extend_from_slice(&chunk?),
+                Some(chunk) => buf.extend_from_slice(&chunk.map_err(Into::into)?),
                 None => return anyhow::Ok(None),
             }
         }

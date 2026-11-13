@@ -14,6 +14,8 @@ pub mod env;
 // What a node's host does when the node must stop or start again, and what the code below it may ask of its form.
 pub mod lifecycle;
 pub mod machine;
+// The one clock: what time it is and how long since, which a test's paused time moves too (the sim, redesign step 3).
+pub mod clock;
 // How a node's calls out reach the network: one client factory, with the policy named by whom a call goes to.
 #[cfg(feature = "lake")] pub mod net;
 // Space of this process's own on this machine's disk: the folders its spills go to.
@@ -121,8 +123,11 @@ mod held;
 mod keys_below;
 mod late_rows;
 mod eager;
+mod morsels;
 mod median;
 mod reuse;
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (a file's ranges, typed: a page reads files too)
+mod bounds;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
 mod data_file;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
@@ -154,6 +159,7 @@ mod table_record;
 #[cfg(feature = "lake")] mod records; // (the catalog's record scheme: every prefix, and whose it is)
 #[cfg(feature = "lake")] mod auth;
 #[cfg(feature = "lake")] mod rights; // (what a principal may do, decided in one place: step 6)
+#[cfg(feature = "lake")] mod row_filter; // (a grant's filter on its rows: checked when set, filled in for its reader)
 #[cfg(feature = "lake")] mod budget;
 #[cfg(feature = "lake")] mod buckets; // (what opens a lake's bucket: the hosts fill it, `hosted`)
 #[cfg(feature = "lake")] mod hosted;
@@ -171,6 +177,7 @@ mod table_record;
 #[cfg(feature = "lake")] mod apply;
 #[cfg(feature = "lake")] mod defaults;
 #[cfg(feature = "lake")] mod delta;
+#[cfg(feature = "lake")] pub mod calls;
 #[cfg(feature = "lake")] pub mod dial;
 #[cfg(feature = "lake")] mod ext;
 #[cfg(feature = "lake")] mod fetch;

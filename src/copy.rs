@@ -116,8 +116,10 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
         } else {
             kept = there.into_iter().collect();
         }
-        // A folder from a big table, on remote storage: every node writes its own share's files.
-        if remote {
+        // A folder from a big table, on remote storage: every node writes its own share's files. Not for a scope with
+        // grants, which is planned here only (`App::here_only_for`): a node plans its share as the node's own work, which
+        // reads every row and column (step 6 piece 5: before role options let a user export).
+        if remote && scope.whole() {
             match crate::spmd::copy(lake, nodes, me, &query, &target, scope).await {
                 Ok(Some(rows)) => return Ok(serde_json::json!({"copied": rows, "to": to})),
                 Ok(None) => {}
