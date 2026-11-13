@@ -29,6 +29,9 @@ doors = ["lake", "dep:axum", "dep:clap", "dep:mimalloc", "dep:pgwire", "dep:wind
 # heaps: soak.yml's `binary: heap`, read by tools/heap_report.py. Off unless asked: a node built
 # with it profiles nothing until `_RJEM_MALLOC_CONF` says `prof:true`.
 heap-profile = ["tikv-jemallocator?/profiling", "tikv-jemallocator?/stats"]
+# The sim (redesign step 3): a test's cluster in one process, on tokio's paused time, which the core's wall clock follows
+# too (`clock.rs`). The library's own tests have it without asking (`cfg(test)`).
+sim = ["lake"]
 
 [workspace]
 members = ["capi", "launcher"] # (pondra_lib, the C ABI, and the launcher that loads it: `cargo build --workspace` builds them with the program, into one folder; a plain build at the root builds the program alone)
@@ -86,7 +89,11 @@ object_store_df = { package = "object_store", version = "0.13", default-features
 glob = "0.3" # (a URL's glob: DataFusion splits only paths'; already built for it)
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1", features = ["sync", "rt"] } # (asof.rs's OnceCell in every build; `server` adds the rest: "tokio/full")
+# (asof.rs's OnceCell and clock.rs's `Instant` in every build; `server` adds the rest: "tokio/full". `test-util` lets a test
+# pause time, which the core's clock follows (`clock.rs`): in every build, so a node and its tests share one tokio and one
+# build of what depends on it. Nothing pauses a node's time, and until something does, tokio's `Instant::now` is std's
+# after one atomic load.)
+tokio = { version = "1", features = ["sync", "rt", "time", "test-util"] }
 # What a page can't build, though the lake names it: a page has its own catalog store (`kv`), seal and hashes (`crypto`),
 # memory reading and no gRPC or TLS sockets (designs/page-same-core.md §5). Each is still `lake`'s, in `[features]`.
 object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"], optional = true } # (files outside the lake too: ADR-026)

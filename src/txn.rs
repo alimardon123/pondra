@@ -37,7 +37,7 @@ use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 /// A table's changes in a transaction: rows it adds (new rows, whose `_row_id` is negative until the commit stamps

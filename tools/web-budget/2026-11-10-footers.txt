@@ -1,0 +1,3 @@
++2100
+The footer fix (#789: scan.rs, ext_names.rs, data_file.rs), measured on CI against main at 69396cd3 (#787): the wasm
+shrank, 59,157,555 to 59,153,513 bytes (-4,042), and its brotli grew, 9,316,413 to 9,318,458 bytes (+2,045): layout.
