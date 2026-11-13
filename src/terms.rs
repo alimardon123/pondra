@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use crate::node_state::Claims;
 use std::time::Duration;
 
@@ -461,7 +461,7 @@ mod tests {
 
     fn elsewhere(n: u64, bell: bool) -> Term { Term { n, addr: String::new(), lock: String::new(), bell } }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)] // (on paused time: its waits pass at once, on the clock `alive` and `deaf` read)
     async fn a_claimer_that_marks_when_rung_is_alive() {
         let store: Store = Arc::new(object_store::memory::InMemory::new());
         let node = crate::node_state::NodeState::unhosted();
@@ -487,7 +487,7 @@ mod tests {
         assert!(!answers_bell("10.0.0.1:8080", 2), "its followers hold acknowledged changes: its mark alone decides");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)] // (on paused time: its waits pass at once, on the clock `alive` and `deaf` read)
     async fn a_claimer_that_doesnt_mark_when_rung_is_gone() {
         let store: Store = Arc::new(object_store::memory::InMemory::new());
         let node = crate::node_state::NodeState::unhosted();
@@ -508,7 +508,7 @@ mod tests {
         assert!(marked_before(&store, 9_002).await.is_none(), "no term before it was marked");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)] // (on paused time: its waits pass at once, on the clock `alive` and `deaf` read)
     async fn a_one_off_writer_passes_a_recorder_that_doesnt_answer_its_bell() {
         let store: Store = Arc::new(object_store::memory::InMemory::new());
         let node = crate::node_state::NodeState::unhosted();

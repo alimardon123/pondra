@@ -1,143 +1,31 @@
 //! How lake code calls another member, or another lake's leader. Lake code reaches the others only
-//! through here: a node sends the call over HTTP (`cluster::Http`), and a build with no doors reaches
-//! only the node a page joined, over `fetch` with the page's sign-in (`Paged`), so the browser build names no socket and no door.
-use anyhow::{anyhow, Context, Result};
-use bytes::{Bytes, BytesMut};
+//! through here, by the node's own dial (`NodeState::dial`, which its host gives it): a node sends the call over HTTP
+//! (`cluster::Http`), a build with no doors reaches only the node a page joined, over `fetch` with the page's sign-in
+//! (`Paged`, `Joined`), so the browser build names no socket and no door, and the sim's members call each other in its
+//! process (redesign step 3, piece 3c: l7-wip/step3-sim-plan.md).
+use anyhow::{anyhow, Result};
 use futures::future::BoxFuture;
-use futures::stream::BoxStream;
 use futures::StreamExt;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 use std::time::Duration;
 
-/// The method a call makes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verb {
-    Get,
-    Post,
-    Delete,
-}
+pub use crate::calls::{Call, Dial, Reply, Verb};
 
-/// One request to a member: a path under its address, and what it carries.
-pub struct Call {
-    pub verb: Verb,
-    pub path: String,
-    pub body: Option<Bytes>,
-    /// Says the body is JSON (`Content-Type: application/json`).
-    pub json: bool,
-    pub timeout: Option<Duration>,
-    /// A key to send instead of the member's own (a branch's key, another server's).
-    pub bearer: Option<String>,
-    /// The user a change is for, sent to this lake's own leader only (`auth::AS_USER`).
-    pub user: Option<String>,
-}
-
-impl Call {
-    fn new(verb: Verb, path: impl Into<String>, body: Option<Bytes>) -> Call {
-        Call { verb, path: path.into(), body, json: false, timeout: None, bearer: None, user: None }
-    }
-
-    /// `GET path`; a query string goes in `path`.
-    pub fn get(path: impl Into<String>) -> Call { Call::new(Verb::Get, path, None) }
-
-    /// `DELETE path`.
-    pub fn delete(path: impl Into<String>) -> Call { Call::new(Verb::Delete, path, None) }
-
-    /// `POST path` with `body` as it is: no content type is said.
-    pub fn post(path: impl Into<String>, body: impl Into<Bytes>) -> Call { Call::new(Verb::Post, path, Some(body.into())) }
-
-    /// `POST path` with `b` encoded as JSON.
-    pub fn json<T: Serialize + ?Sized>(path: impl Into<String>, b: &T) -> Result<Call> {
-        Ok(Call { json: true, ..Call::post(path, serde_json::to_vec(b)?) })
-    }
-
-    /// Says the body is JSON, for a body that was encoded already.
-    pub fn as_json(self) -> Call { Call { json: true, ..self } }
-
-    pub fn timeout(self, d: Duration) -> Call { Call { timeout: Some(d), ..self } }
-
-    pub fn bearer(self, key: String) -> Call { Call { bearer: Some(key), ..self } }
-
-    pub fn as_user(self, user: String) -> Call { Call { user: Some(user), ..self } }
-}
-
-/// A member's answer: its status and SQLSTATE, and its body as it comes.
-pub struct Reply {
-    pub status: u16,
-    pub sqlstate: Option<String>,
-    /// The transport's own error for an answer that isn't a success (`checked` returns it).
-    failed: Option<anyhow::Error>,
-    body: BoxStream<'static, Result<Bytes>>,
-}
-
-impl Reply {
-    /// An answer as a transport made it: `failed` is its own error when the status isn't a success.
-    pub fn new(status: u16, sqlstate: Option<String>, failed: Option<anyhow::Error>, body: BoxStream<'static, Result<Bytes>>) -> Reply {
-        Reply { status, sqlstate, failed, body }
-    }
-
-    /// Was the answer a success (2xx)?
-    pub fn ok(&self) -> bool { (200..300).contains(&self.status) }
-
-    /// The answer itself, or the transport's error for a status that isn't a success.
-    pub fn checked(mut self) -> Result<Reply> {
-        match self.failed.take() {
-            Some(e) => Err(e),
-            None => Ok(self),
-        }
-    }
-
-    /// The whole body.
-    pub async fn bytes(self) -> Result<Bytes> {
-        let mut body = self.body;
-        let mut all = BytesMut::new();
-        while let Some(part) = body.next().await {
-            all.extend_from_slice(&part?);
-        }
-        Ok(all.freeze())
-    }
-
-    /// The whole body as text (a word a refusal says, read as UTF-8).
-    pub async fn text(self) -> Result<String> { Ok(String::from_utf8_lossy(&self.bytes().await?).into_owned()) }
-
-    /// The whole body as JSON.
-    pub async fn json<T: DeserializeOwned>(self) -> Result<T> {
-        let bytes = self.bytes().await.context("error decoding response body")?;
-        serde_json::from_slice(&bytes).context("error decoding response body")
-    }
-
-    /// The body a part at a time, as it arrives (a streamed reply).
-    pub fn stream(self) -> BoxStream<'static, Result<Bytes>> { self.body }
-}
-
-/// How a member reaches another member, or another lake's leader.
-pub trait Dial: Send + Sync {
-    /// The URL `to` is reached at: a "host:port" as members name themselves, or a URL with its scheme, as given.
-    fn url(&self, to: &str) -> String;
-
-    /// Sends `call` to `to`, from node `node`, which signs it with its key (`cluster::http`). An error only when no answer came;
-    /// a refusal is a `Reply`.
-    fn call<'a>(&'a self, node: &'a crate::node_state::NodeState, to: &'a str, call: Call) -> BoxFuture<'a, Result<Reply>>;
-
-    /// Is `e` a call that got no answer (no connection, or none in time)?
-    fn unreached(&self, e: &anyhow::Error) -> bool;
-}
-
-/// The dial this build uses: a node's HTTP, or a page's (`Paged`) when it has no doors.
+/// The dial a node of this build has unless its host gives it another (`NodeState::dial`): HTTP, or a page's (`Paged`)
+/// when the build has no doors. The hosts register it (`hosted`, `calls::Dials`).
 #[cfg(feature = "doors")]
-pub fn dial() -> &'static dyn Dial { &crate::cluster::Http }
+pub fn native() -> std::sync::Arc<dyn Dial> { std::sync::Arc::new(crate::cluster::Http) }
 
 #[cfg(not(feature = "doors"))]
-pub fn dial() -> &'static dyn Dial { &Paged }
+pub fn native() -> std::sync::Arc<dyn Dial> { std::sync::Arc::new(Paged) }
 
-/// The URL `to` is reached at.
-pub fn url(to: &str) -> String { dial().url(to) }
+/// The URL `to` is reached at, by node `node`'s dial.
+pub fn url(node: &crate::node_state::NodeState, to: &str) -> String { node.dial.url(to) }
 
-/// Sends `c` to `to` from node `node` (see `Dial::call`).
-pub async fn call(node: &crate::node_state::NodeState, to: &str, c: Call) -> Result<Reply> { dial().call(node, to, c).await }
+/// Sends `c` to `to` from node `node`, by its dial (see `Dial::call`).
+pub async fn call(node: &crate::node_state::NodeState, to: &str, c: Call) -> Result<Reply> { node.dial.call(node, to, c).await }
 
-/// Is `e` a call that got no answer?
-pub fn unreached(e: &anyhow::Error) -> bool { dial().unreached(e) }
+/// Is `e` a call of node `node`'s that got no answer?
+pub fn unreached(node: &crate::node_state::NodeState, e: &anyhow::Error) -> bool { node.dial.unreached(e) }
 
 /// The dial of a build with no doors, which is a page's: it reaches no member, and says so by name. A joined page reaches its
 /// node with its own dial (`Joined`), from what its member holds (`members::Joined`), and no other way.
@@ -198,6 +86,9 @@ async fn page_call(node: &str, auth: &str, to: &str, c: Call) -> Result<Reply> {
     if c.json {
         req = req.header(reqwest::header::CONTENT_TYPE, "application/json");
     }
+    for (k, v) in &c.headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
     if let Some(body) = c.body {
         req = req.body(body);
     }
@@ -210,8 +101,9 @@ async fn page_call(node: &str, auth: &str, to: &str, c: Call) -> Result<Reply> {
     let status = answer.status().as_u16();
     let sqlstate = answer.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).map(str::to_string);
     let failed = answer.error_for_status_ref().map(anyhow::Error::from);
+    let headers = answer.headers().clone();
     let body = futures::TryStreamExt::map_err(answer.bytes_stream(), anyhow::Error::from);
-    Ok(Reply::new(status, sqlstate, failed, body.boxed()))
+    Ok(Reply::new(status, sqlstate, failed, body.boxed()).with_headers(headers))
 }
 
 /// The key node `node` calls the others with: `PONDRA_NODE_KEY` as set, else the lake's own, once known (`Calls`: the node's,

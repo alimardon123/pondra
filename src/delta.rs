@@ -547,9 +547,8 @@ pub(crate) fn columns(meta: &TableMeta) -> Vec<Column> {
 /// formats publish these, so a file's bounds are the same in each.
 pub(crate) fn file_ranges(cols: &[Column], f: &DataFile) -> Vec<Range> {
     cols.iter().filter_map(|c| {
-        let (lo, hi) = f.stats.get(&c.name)?;
-        let parse = |s: &String| ScalarValue::try_from_string(s.clone(), &c.t).ok();
-        Some(Range { i: c.i, name: c.name.clone(), lo: parse(lo), hi: parse(hi), no_nulls: f.nulls.as_ref().is_some_and(|n| !n.contains(&c.name)) })
+        let (lo, hi) = crate::bounds::Ranged::range(f, &c.name, &c.t)?;
+        Some(Range { i: c.i, name: c.name.clone(), lo: Some(lo), hi: Some(hi), no_nulls: f.nulls.as_ref().is_some_and(|n| !n.contains(&c.name)) })
     }).collect()
 }
 
