@@ -157,12 +157,18 @@ impl Cluster {
         Ok((status, body.to_vec()))
     }
 
-    /// Member `m`'s role, as its `/stats` says (`leader`, `follower`, …), or None while it doesn't answer.
-    pub async fn role(&self, m: usize) -> Option<String> {
+    /// Member `m`'s `/stats`, or None while it doesn't answer.
+    pub async fn stats(&self, m: usize) -> Option<serde_json::Value> {
         let (status, body) = self.ask(m, "GET", "/stats", vec![]).await.ok()?;
-        let stats: serde_json::Value = serde_json::from_slice(&body).ok().filter(|_| status == 200)?;
-        stats["role"].as_str().map(str::to_string)
+        serde_json::from_slice(&body).ok().filter(|_| status == 200)
     }
+
+    /// Member `m`'s role, as its `/stats` says (`leader`, `follower`, …), or None while it doesn't answer.
+    pub async fn role(&self, m: usize) -> Option<String> { self.stats(m).await?["role"].as_str().map(str::to_string) }
+
+    /// The members member `m` knows of, as its `/stats` says: a follower's are its leader's last answer, so a follower
+    /// knows two or more once it has heard its leader.
+    pub async fn known(&self, m: usize) -> usize { self.stats(m).await.and_then(|s| s["nodes"].as_array().map(Vec::len)).unwrap_or(0) }
 
     /// Waits up to `within` on the sim's clock for `ready`, asked every 100 ms; past it, the error says the faults met.
     pub async fn until<F: std::future::Future<Output = bool>>(&self, what: &str, within: Duration, mut ready: impl FnMut() -> F) -> Result<Duration> {
